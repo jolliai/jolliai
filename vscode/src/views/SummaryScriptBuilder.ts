@@ -770,6 +770,26 @@ ${buildPrMessageScript()}
   }
   attachRegenerateSummaryDelegate();
 
+  // Empty-state "Generate memory" button (no stored summary). Distinct from
+  // Regenerate: there are no topics/recap to overwrite, so it skips the
+  // unsaved-edits guard and posts its own message. The host enforces the
+  // in-flight guard (regenerateInProgress) and drives the same
+  // summaryRegenerating / summaryRegenerated lifecycle to swap the result in.
+  function attachGenerateMemoryDelegate() {
+    var page = document.querySelector('.page');
+    if (!page) return;
+    page.addEventListener('click', function(e) {
+      var target = e.target;
+      if (!target || typeof target.closest !== 'function') return;
+      var btn = target.closest('#generateMemoryBtn');
+      if (!btn) return;
+      e.stopPropagation();
+      if (btn.disabled) return;
+      vscode.postMessage({ command: 'generateMemory' });
+    });
+  }
+  attachGenerateMemoryDelegate();
+
   // Toggle the page into / out of regenerating-readonly mode. CSS
   // (.page.regenerating-readonly button:not([data-foreign-safe])) takes
   // care of hiding every action button; the banner explains why. The

@@ -11,6 +11,14 @@ export interface SummaryErrorBannerOptions {
 	 * be a dead instruction.
 	 */
 	readonly readOnly?: boolean;
+	/**
+	 * True when the panel was opened for a commit that has NO stored summary
+	 * yet (the placeholder-open path). Renders the "Generate memory" variant
+	 * instead of the failure variant — a never-generated commit is not a
+	 * failed one, so the copy explains the empty state and offers to create a
+	 * summary from scratch. Takes precedence over the failure check.
+	 */
+	readonly needsGeneration?: boolean;
 }
 
 /**
@@ -36,6 +44,19 @@ export function buildSummaryErrorBanner(
 	summary: CommitSummary,
 	options: SummaryErrorBannerOptions = {},
 ): string {
+	if (options.needsGeneration) {
+		if (options.readOnly) {
+			return `<div class="summary-error-banner" role="status">
+  <span class="summary-error-banner-icon" aria-hidden="true">&#x2728;</span>
+  <span class="summary-error-banner-text">No memory has been generated for this commit yet. Open its home repository to generate one.</span>
+</div>`;
+		}
+		return `<div class="summary-error-banner" role="status">
+  <span class="summary-error-banner-icon" aria-hidden="true">&#x2728;</span>
+  <span class="summary-error-banner-text">No memory has been generated for this commit yet — this can happen if summarization was skipped or the AI service was unavailable. Generate one now.</span>
+  <button class="summary-error-banner-action" id="generateMemoryBtn" title="Generate a memory from the diff and any saved AI conversations">&#x2728; Generate memory</button>
+</div>`;
+	}
 	if (!isSummaryError(summary)) return "";
 	if (options.readOnly) {
 		return `<div class="summary-error-banner" role="status">

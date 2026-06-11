@@ -8,6 +8,17 @@ describe("SidebarScriptBuilder", () => {
 		expect(js.length).toBeGreaterThan(0);
 	});
 
+	it("emits the no-summary Generate affordance (recency-gated + command dispatch)", () => {
+		const js = buildSidebarScript();
+		// Inline + context-menu Generate both route to the one-click command.
+		expect(js).toContain("jollimemory.generateMemory");
+		// Recent commits show a passive 'Generating…' indicator; only stale
+		// (past the window) no-summary rows get the Generate button.
+		expect(js).toContain("GENERATING_WINDOW_MS");
+		expect(js).toContain("mem-generating");
+		expect(js).toContain("Generate memory");
+	});
+
 	it("output parses as valid JS — backtick / undeclared-symbol smoke test", () => {
 		// Regression for two bug classes that ship-tested but tests-passed:
 		//   1. Backtick trap: SidebarScriptBuilder warns about it in its

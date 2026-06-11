@@ -2079,6 +2079,29 @@ export class JolliMemoryBridge {
 		return regenerateSummary(summary, this.cwd, config, storage);
 	}
 
+	/**
+	 * Generates a summary for a commit by hash, bootstrapping a shell from git
+	 * metadata when no summary exists yet (or re-running an existing one). Same
+	 * read-storage threading as `regenerateSummary`; the caller persists the
+	 * result via `storeSummary`.
+	 */
+	async summarizeCommit(
+		commitHash: string,
+		config: import("../../cli/src/Types.js").LlmConfig,
+	): Promise<import("../../cli/src/core/Regenerator.js").RegenerateResult> {
+		const storage = await this.getReadStorage();
+		const { summarizeCommit } = await import("../../cli/src/core/Regenerator.js");
+		return summarizeCommit(commitHash, this.cwd, config, storage);
+	}
+
+	/** Reads git commit metadata (hash/message/author/date) for a single commit. */
+	async getCommitInfo(
+		commitHash: string,
+	): Promise<import("../../cli/src/Types.js").CommitInfo> {
+		const { getCommitInfo } = await import("../../cli/src/core/GitOps.js");
+		return getCommitInfo(commitHash, this.cwd);
+	}
+
 	/** Writes plan files (orphan-branch + Memory Bank visible MD). */
 	async storePlans(
 		planFiles: ReadonlyArray<{ slug: string; content: string }>,

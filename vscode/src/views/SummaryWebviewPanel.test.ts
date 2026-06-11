@@ -170,13 +170,15 @@ vi.mock("../../../cli/src/core/Summarizer.js", () => ({
 	translateToEnglish: mockTranslateToEnglish,
 }));
 
-const { mockRegenerateSummary, mockLoadRegenerateContext } = vi.hoisted(() => ({
+const { mockRegenerateSummary, mockSummarizeCommit, mockLoadRegenerateContext } = vi.hoisted(() => ({
 	mockRegenerateSummary: vi.fn(),
+	mockSummarizeCommit: vi.fn(),
 	mockLoadRegenerateContext: vi.fn(),
 }));
 
 vi.mock("../../../cli/src/core/Regenerator.js", () => ({
 	regenerateSummary: mockRegenerateSummary,
+	summarizeCommit: mockSummarizeCommit,
 }));
 
 vi.mock("../../../cli/src/core/RegenerateContext.js", () => ({
@@ -663,6 +665,9 @@ const stubBridge = {
 	),
 	regenerateSummary: vi.fn((summary: unknown, config: unknown) =>
 		mockRegenerateSummary(summary, workspaceRoot, config),
+	),
+	summarizeCommit: vi.fn((commitHash: unknown, config: unknown) =>
+		mockSummarizeCommit(commitHash, workspaceRoot, config),
 	),
 } as unknown as import("../JolliMemoryBridge.js").JolliMemoryBridge;
 const mainBranch = "main";
@@ -2404,6 +2409,63 @@ describe("SummaryWebviewPanel", () => {
 					command: "recapUpdated",
 					html: "",
 				});
+			});
+		});
+
+		// ── generateMemory (no-summary placeholder path) ────────────────────
+
+		describe("generateMemory", () => {
+			const stubUpdated = () =>
+				makeSummary({ topics: [], recap: "generated", commitMessage: "freshly generated" });
+
+			beforeEach(() => {
+				mockSummarizeCommit.mockReset();
+				withProgress.mockClear();
+				executeCommand.mockClear();
+				mockBuildTopicsSection.mockReturnValue('<div id="topicsSection">t</div>');
+				mockBuildRecapSection.mockReturnValue('<div id="recapSection">r</div>');
+			});
+
+			it("bootstraps via bridge.summarizeCommit, persists, refreshes history, and posts re-render", async () => {
+				mockSummarizeCommit.mockResolvedValue({ updated: stubUpdated(), result: {} as never });
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "generateMemory" });
+				await flushPromises();
+
+				// No "overwrite?" confirm — there is nothing to overwrite.
+				expect(showWarningMessage).not.toHaveBeenCalled();
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({ recap: "generated" }),
+					workspaceRoot,
+					true,
+				);
+				// Row must flip from "no memory" to a real memory.
+				expect(executeCommand).toHaveBeenCalledWith("jollimemory.refreshHistory");
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "summaryRegenerated" }),
+				);
+			});
+
+			it("does NOT generate for a foreign-repo panel (would write the wrong orphan branch)", async () => {
+				await SummaryWebviewPanel.show(
+					makeSummary(),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"memory",
+					"other-repo",
+					"https://github.com/other/repo.git",
+					null,
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "generateMemory" });
+				await flushPromises();
+
+				expect(mockSummarizeCommit).not.toHaveBeenCalled();
+				expect(mockStoreSummary).not.toHaveBeenCalled();
 			});
 		});
 

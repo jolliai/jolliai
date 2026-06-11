@@ -3152,6 +3152,12 @@ export function buildSidebarScript(): string {
     }, kids), item.tooltip || '');
   }
 
+  // Grace window after a commit during which a missing summary is treated as
+  // "still generating" (the post-commit worker holds a 5-min lock; generation
+  // itself is ~20-40s but can queue behind other commits). Past this, a
+  // missing summary is treated as genuinely absent and the row offers Generate.
+  var GENERATING_WINDOW_MS = 10 * 60 * 1000;
+
   function renderCommitRow(item, depth) {
     const hasMem = item.contextValue === 'commitWithMemory';
     // Children are pre-serialized by HistoryTreeProvider when CommitItem
@@ -3253,7 +3259,37 @@ export function buildSidebarScript(): string {
           );
       kids.push(el('span', { className: 'inline-actions' }, [inlineBtn]));
     } else {
-      kids.push(el('span', { className: 'inline-actions' }));
+      // No stored memory. A just-committed memory is summarized asynchronously
+      // (~20-40s), so within a short window show a passive "Generating…"
+      // indicator rather than an action. Once that window has passed the
+      // summary genuinely didn't land — offer a one-click Generate. Foreign
+      // rows are always memory-backed (never reach here), but guard anyway:
+      // generating writes the workspace orphan branch.
+      var committedMs = item.committedAt ? Date.parse(item.committedAt) : NaN;
+      var isPending = !isNaN(committedMs) && (Date.now() - committedMs) < GENERATING_WINDOW_MS;
+      if (isPending) {
+        kids.push(el('span', { className: 'inline-actions' }, [
+          el('span', { className: 'mem-generating', title: 'Memory is being generated…' }, [
+            el('i', { className: 'codicon codicon-loading codicon-modifier-spin' }),
+            el('span', { text: 'Generating…' }),
+          ]),
+        ]));
+      } else if (!isViewingForeign()) {
+        kids.push(el('span', { className: 'inline-actions' }, [
+          attachTextTip(
+            el('button', {
+              type: 'button',
+              className: 'iconbtn',
+              'data-inline': 'generate',
+              'data-id': item.id,
+              'aria-label': 'Generate memory',
+            }, [el('i', { className: 'codicon codicon-sparkle' })]),
+            'Generate memory',
+          ),
+        ]));
+      } else {
+        kids.push(el('span', { className: 'inline-actions' }));
+      }
     }
     // No title= attribute — hover content is rendered by the custom
     // .hover-card popup (renderHoverCard / showHoverCard) so the legacy
@@ -3596,6 +3632,13 @@ export function buildSidebarScript(): string {
         // for both workspace and foreign hashes.
         vscode.postMessage({ type: 'command', command: 'jollimemory.copyRecallPrompt', args: [id] });
       }
+      if (action === 'generate') {
+        // One-click generate for a workspace commit whose summary never
+        // landed. The command bootstraps from the hash, persists, refreshes
+        // the list, then opens the panel on the result. Only rendered on
+        // workspace rows, so it never targets a foreign repo's orphan branch.
+        vscode.postMessage({ type: 'command', command: 'jollimemory.generateMemory', args: [id] });
+      }
       if (action === 'open-reference') {
         vscode.postMessage({ type: 'branch:openReference', mapKey: id });
       }
@@ -3822,6 +3865,12 @@ export function buildSidebarScript(): string {
       const items = [];
       if (ctx === 'commitWithMemory') {
         items.push({ label: 'View Memory',      command: 'jollimemory.viewSummary',    args: [id] });
+        items.push({ separator: true });
+      } else if (!isViewingForeign()) {
+        // Workspace commit with no memory yet — offer to generate one.
+        // Skipped in foreign view: generating writes the workspace orphan
+        // branch, which would corrupt the foreign repo's memory identity.
+        items.push({ label: 'Generate memory', command: 'jollimemory.generateMemory', args: [id] });
         items.push({ separator: true });
       }
       items.push({ label: 'Copy Commit Hash', command: 'jollimemory.copyCommitHash', args: [id] });

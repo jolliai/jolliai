@@ -93,7 +93,7 @@ import { formatShortRelativeDate } from "./util/FormatUtils.js";
 import { isWorkerBusy } from "./util/LockUtils.js";
 import { initLogger, log } from "./util/Logger.js";
 import { StatusBarManager } from "./util/StatusBarManager.js";
-import { getWorkspaceRoot } from "./util/WorkspaceUtils.js";
+import { getWorkspaceRoot, loadGlobalConfig } from "./util/WorkspaceUtils.js";
 import { computeChangesBadge } from "./views/ChangesBadge.js";
 import { NoteEditorWebviewPanel } from "./views/NoteEditorWebviewPanel.js";
 import { SettingsWebviewPanel } from "./views/SettingsWebviewPanel.js";
@@ -206,6 +206,40 @@ function parseSummaryFrontmatter(
 	}
 	if (type !== "commit" || !commitHash) return null;
 	return { commitHash };
+}
+
+/**
+ * Builds a minimal placeholder summary for a commit that has no stored summary
+ * yet, so the detail panel can open in its "Generate memory" state instead of
+ * dead-ending. Pulls real commit metadata (message/author/date) for the title
+ * + header; falls back to the bare hash if the commit can't be read.
+ */
+async function buildPlaceholderSummary(
+	bridge: JolliMemoryBridge,
+	hash: string,
+): Promise<import("../../cli/src/Types.js").CommitSummary> {
+	let message = "";
+	let author = "";
+	let date = "";
+	try {
+		const info = await bridge.getCommitInfo(hash);
+		message = info.message;
+		author = info.author;
+		date = info.date;
+	} catch {
+		// Commit metadata unavailable (shallow clone / gone) — show the hash alone.
+	}
+	return {
+		version: 4,
+		commitHash: hash,
+		commitMessage: message,
+		commitAuthor: author,
+		commitDate: date,
+		branch: "",
+		generatedAt: new Date().toISOString(),
+		topics: [],
+		recap: "",
+	};
 }
 
 /**
@@ -2415,7 +2449,6 @@ export function activate(context: vscode.ExtensionContext): void {
 			async (item: CommitItem | string) => {
 				const hash = typeof item === "string" ? item : item.commit.hash;
 				const summary = await bridge.getSummary(hash);
-				if (!summary) return;
 				// Local commits also read from the Memory Bank folder layer so
 				// the detail-panel data path is uniform with foreign-repo
 				// panels (and with the user-visible KB tree). Falls back to
@@ -2423,8 +2456,12 @@ export function activate(context: vscode.ExtensionContext): void {
 				// uses bridge-default reads.
 				const readStorageResult =
 					await bridge.createReadStorageForCurrentRepo();
+				// No stored summary → open a placeholder panel in its
+				// "Generate memory" state instead of silently doing nothing.
+				// This is a local commit (workspace orphan branch is writable),
+				// so generating from here is safe.
 				await SummaryWebviewPanel.show(
-					summary,
+					summary ?? (await buildPlaceholderSummary(bridge, hash)),
 					context.extensionUri,
 					workspaceRoot,
 					bridge,
@@ -2433,6 +2470,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					null,
 					null,
 					readStorageResult?.storage ?? null,
+					!summary,
 				);
 			},
 		),
@@ -2445,7 +2483,6 @@ export function activate(context: vscode.ExtensionContext): void {
 			"jollimemory.viewMemorySummary",
 			async (item: MemoryItem | string) => {
 				const hash = typeof item === "string" ? item : item.entry.commitHash;
-				const shortHash = hash.substring(0, 7);
 				// Timeline view aggregates memories across every repo under the
 				// Memory Bank parent (see JolliMemoryBridge.listSummaryEntries),
 				// so a clicked row may belong to a non-current repo whose
@@ -2460,8 +2497,22 @@ export function activate(context: vscode.ExtensionContext): void {
 				const { summary, sourceRepoName, sourceRemoteUrl } =
 					await bridge.getSummaryAnyRepoWithSource(hash);
 				if (!summary) {
-					vscode.window.showInformationMessage(
-						`Jolli Memory: No summary found for commit ${shortHash}.`,
+					// Not found in any repo → treat as a local commit with no
+					// memory yet and open the placeholder panel offering to
+					// generate one, rather than dead-ending on a toast. (A
+					// genuinely foreign commit would have resolved above with a
+					// sourceRepoName, so reaching here means it's local.)
+					await SummaryWebviewPanel.show(
+						await buildPlaceholderSummary(bridge, hash),
+						context.extensionUri,
+						workspaceRoot,
+						bridge,
+						commitsStore.getMainBranch(),
+						"memory",
+						null,
+						null,
+						(await bridge.createReadStorageForCurrentRepo())?.storage ?? null,
+						true,
 					);
 					return;
 				}
@@ -2486,6 +2537,46 @@ export function activate(context: vscode.ExtensionContext): void {
 					sourceRemoteUrl,
 					readStorageResult?.storage ?? null,
 				);
+			},
+		),
+
+		// Generates a memory for a commit that has none yet — the one-click
+		// path from a "Generate memory" row affordance (sidebar) so the user
+		// doesn't have to open the panel first. Bootstraps from the commit hash
+		// via the Bridge, persists, refreshes the history list so the row flips
+		// to a real memory, then opens the panel on the result. Workspace-local
+		// only: generating writes the workspace orphan branch, so this command
+		// is never offered for foreign-repo rows.
+		vscode.commands.registerCommand(
+			"jollimemory.generateMemory",
+			async (item: CommitItem | MemoryItem | string) => {
+				const hash =
+					typeof item === "string"
+						? item
+						: "commit" in item
+							? item.commit.hash
+							: item.entry.commitHash;
+				const config = await loadGlobalConfig();
+				try {
+					await vscode.window.withProgress(
+						{
+							location: vscode.ProgressLocation.Notification,
+							title: "Generating memory…",
+							cancellable: false,
+						},
+						async () => {
+							const result = await bridge.summarizeCommit(hash, config);
+							await bridge.storeSummary(result.updated, true);
+						},
+					);
+				} catch (err) {
+					vscode.window.showErrorMessage(
+						`Jolli Memory: Could not generate memory — ${err instanceof Error ? err.message : String(err)}`,
+					);
+					return;
+				}
+				await vscode.commands.executeCommand("jollimemory.refreshHistory");
+				await vscode.commands.executeCommand("jollimemory.viewSummary", hash);
 			},
 		),
 

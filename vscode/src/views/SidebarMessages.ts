@@ -116,6 +116,13 @@ export interface SerializedTreeItem {
 	/** Commits panel only: whether this commit has an associated memory summary. */
 	readonly hasMemory?: boolean;
 	/**
+	 * Commits panel only: ISO 8601 commit date. Distinguishes a recently
+	 * committed memory still being generated asynchronously ("pending") from an
+	 * older commit whose summary never landed ("needs generation"), so the row
+	 * shows a passive "Generating…" indicator vs a Generate action.
+	 */
+	readonly committedAt?: string;
+	/**
 	 * Commits panel only: structured hover-card data, mirroring the Memories
 	 * panel's `MemoryItem.hover` so the webview can drive both rows through
 	 * the same `.hover-card` popover. Absent on file rows.

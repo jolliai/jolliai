@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommitSummary, LlmConfig, StoredTranscript } from "../Types.js";
 import * as GitOps from "./GitOps.js";
-import { regenerateSummary } from "./Regenerator.js";
+import { regenerateSummary, summarizeCommit } from "./Regenerator.js";
 import * as Summarizer from "./Summarizer.js";
 import * as SummaryStore from "./SummaryStore.js";
 import * as TranscriptReader from "./TranscriptReader.js";
@@ -16,6 +16,7 @@ vi.mock("./Summarizer.js", () => ({ generateSummary: vi.fn() }));
 vi.mock("./SummaryStore.js", async () => {
 	const actual = await vi.importActual<typeof import("./SummaryStore.js")>("./SummaryStore.js");
 	return {
+		getSummary: vi.fn(),
 		readTranscriptsForCommits: vi.fn(),
 		readReferenceFromBranch: vi.fn(),
 		readPlanFromBranch: vi.fn(),
@@ -26,7 +27,7 @@ vi.mock("./SummaryStore.js", async () => {
 		normalizeToV4: actual.normalizeToV4,
 	};
 });
-vi.mock("./GitOps.js", () => ({ getDiffContent: vi.fn() }));
+vi.mock("./GitOps.js", () => ({ getDiffContent: vi.fn(), getCommitInfo: vi.fn(), getCurrentBranch: vi.fn() }));
 vi.mock("./TranscriptReader.js", () => ({ buildMultiSessionContext: vi.fn() }));
 
 const config: LlmConfig = { apiKey: "k", model: "haiku" } as LlmConfig;
@@ -1596,5 +1597,58 @@ describe("regenerateSummary", () => {
 			// Only one block, leading with `<linear-issues>`.
 			expect(params.referenceBlocks?.startsWith("<linear-issues>")).toBe(true);
 		});
+	});
+});
+
+describe("summarizeCommit", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		vi.mocked(SummaryStore.readTranscriptsForCommits).mockResolvedValue(new Map());
+		vi.mocked(GitOps.getDiffContent).mockResolvedValue("DIFF");
+		vi.mocked(TranscriptReader.buildMultiSessionContext).mockReturnValue("CONV");
+		vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValue(null);
+		vi.mocked(SummaryStore.readPlanFromBranch).mockResolvedValue(null);
+		vi.mocked(SummaryStore.readNoteFromBranch).mockResolvedValue(null);
+		vi.mocked(Summarizer.generateSummary).mockResolvedValue(successResult);
+	});
+
+	it("bootstraps a shell from git metadata when no summary exists, then runs the LLM", async () => {
+		vi.mocked(SummaryStore.getSummary).mockResolvedValue(null);
+		vi.mocked(GitOps.getCommitInfo).mockResolvedValue({
+			hash: "deadbeefcafef00d",
+			message: "Add widget",
+			author: "tester",
+			date: "2026-06-01T00:00:00Z",
+		});
+		vi.mocked(GitOps.getCurrentBranch).mockResolvedValue("feature/x");
+
+		const { updated } = await summarizeCommit("deadbeefcafef00d", "/repo", config);
+
+		// Shell carried git metadata straight into the generateSummary call.
+		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+		expect(params.commitInfo).toEqual({
+			hash: "deadbeefcafef00d",
+			message: "Add widget",
+			author: "tester",
+			date: "2026-06-01T00:00:00Z",
+		});
+		// Result is a real summary with the freshly generated topics + branch.
+		expect(updated.commitHash).toBe("deadbeefcafef00d");
+		expect(updated.branch).toBe("feature/x");
+		expect(updated.topics).toEqual(successResult.topics);
+		expect(updated.summaryError).toBeUndefined();
+	});
+
+	it("delegates to the regenerate path (no git bootstrap) when a summary already exists", async () => {
+		vi.mocked(SummaryStore.getSummary).mockResolvedValue(baseSummary);
+
+		const { updated } = await summarizeCommit(baseSummary.commitHash, "/repo", config);
+
+		// Existing-summary branch never builds a shell from git.
+		expect(GitOps.getCommitInfo).not.toHaveBeenCalled();
+		expect(GitOps.getCurrentBranch).not.toHaveBeenCalled();
+		// Preserves identity + ticket while replacing topics — the regenerate contract.
+		expect(updated.commitHash).toBe(baseSummary.commitHash);
+		expect(updated.topics).toEqual(successResult.topics);
 	});
 });

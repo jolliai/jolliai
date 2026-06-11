@@ -349,6 +349,17 @@ export function buildSidebarCss(): string {
     color: var(--vscode-inputOption-activeForeground, var(--vscode-foreground));
     border-color: var(--vscode-inputOption-activeBorder, transparent);
   }
+  /* Passive "Generating…" indicator on a just-committed row whose summary is
+     still being produced asynchronously. Non-interactive (no button) — it
+     flips to a Generate action once the grace window passes. */
+  .mem-generating {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    opacity: 0.7;
+    color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+  }
 
   .tab-content {
     flex: 1;
