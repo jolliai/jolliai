@@ -168,6 +168,9 @@ export function buildSidebarHtml(
     </div>
     <div class="dropdown-menu hidden" id="breadcrumb-menu" role="menu"></div>
     <div class="tab-toolbar hidden" id="tab-toolbar"></div>
+    <!-- Last-conversation banner (Branch view only) — populated by the script,
+         shown above the scrolling content. Hidden on KB / Status overlays. -->
+    <div class="last-convo hidden" id="last-convo"></div>
     <div class="tab-content hidden" id="tab-content-kb"><p class="placeholder">Loading...</p></div>
     <div class="tab-content hidden" id="tab-content-branch"><p class="placeholder">Loading...</p></div>
     <div class="tab-content hidden" id="tab-content-status">

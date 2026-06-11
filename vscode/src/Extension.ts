@@ -2849,6 +2849,42 @@ export function activate(context: vscode.ExtensionContext): void {
 			},
 		),
 
+		// Continue (true resume) for a captured conversation — invoked from the
+		// last-conversation banner's Continue button. Only wired for Claude
+		// sessions: `claude --resume <sessionId>` reopens that exact session.
+		// Other sources have no resume mechanism, so the banner never shows
+		// Continue for them; the guard here is belt-and-suspenders.
+		vscode.commands.registerCommand(
+			"jollimemory.continueConversation",
+			(source: unknown, sessionId: unknown) => {
+				// `sendText` types into a real shell, so an unvalidated sessionId
+				// would be a command-injection sink (JSON.stringify does NOT
+				// neutralize $()/backticks). sessionId crosses the webview trust
+				// boundary (it originates from on-disk session metadata that an
+				// untrusted cloned repo could carry), so hard-restrict it to the
+				// UUID / hex-hash shape Claude session ids actually take —
+				// [0-9a-fA-F-] only — which makes shell metacharacters impossible.
+				if (
+					source !== "claude" ||
+					typeof sessionId !== "string" ||
+					!/^[0-9a-fA-F][0-9a-fA-F-]{7,63}$/.test(sessionId)
+				) {
+					vscode.window.showInformationMessage(
+						"Resume is only available for Claude Code sessions.",
+					);
+					return;
+				}
+				const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+				const terminal = vscode.window.createTerminal({
+					name: "Claude — resume",
+					cwd,
+				});
+				// Safe: sessionId is validated above to contain only [0-9a-fA-F-].
+				terminal.sendText(`claude --resume ${sessionId}`);
+				terminal.show();
+			},
+		),
+
 		// Settings — accessible via the gear icon in the STATUS panel title bar.
 		vscode.commands.registerCommand("jollimemory.openSettings", () => {
 			log.info("cmd", "openSettings invoked");

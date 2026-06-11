@@ -1362,28 +1362,36 @@ describe("SidebarScriptBuilder", () => {
 		// foreign-readonly mode because the whole Changes section is dropped
 		// above the predicate. Neither items.length nor `collapsed` may gate
 		// the push site.
-		it("pushes the button on the Changes section without gating on items.length or collapsed", () => {
+		it("renders Commit Memory unconditionally in the Working Memory card (not gated by items.length or collapsed)", () => {
 			const js = buildSidebarScript();
-			// Find the push site. Must match `s.id === 'changes'` but NOT
-			// include `!collapsed` (regression — collapsing Changes hid the
-			// group CTA) nor `s.items.length` (regression — empty Changes hid
-			// the discoverability affordance).
-			const renderSectionStart = js.indexOf("function renderSection");
-			expect(renderSectionStart).toBeGreaterThan(-1);
-			const renderSectionEnd = js.indexOf(
+			// Commit Memory now lives in the Working Memory card, which owns the
+			// cross-panel assembly (Conversations + Context + Changes) and the
+			// CTA together. It must be rendered unconditionally there — never
+			// gated on selection count or a collapsed section.
+			const wmStart = js.indexOf("function renderWorkingMemoryCard");
+			expect(wmStart).toBeGreaterThan(-1);
+			const wmEnd = js.indexOf(
 				"function ",
-				renderSectionStart + "function renderSection".length,
+				wmStart + "function renderWorkingMemoryCard".length,
 			);
-			const body = js.slice(renderSectionStart, renderSectionEnd);
-			expect(body).toMatch(
-				/if\s*\(\s*s\.id\s*===\s*'changes'\s*\)\s*\{\s*sectionKids\.push\(renderCommitMemoryButton\(\)\)/,
+			const wmBody = js.slice(wmStart, wmEnd);
+			expect(wmBody).toContain("renderCommitMemoryButton()");
+			expect(wmBody).not.toMatch(
+				/items\.length[\s\S]{0,80}renderCommitMemoryButton/,
 			);
-			// Defense-in-depth: neither old buggy predicate may reappear.
-			expect(body).not.toMatch(
-				/s\.items\.length\s*>\s*0[\s\S]{0,80}renderCommitMemoryButton/,
-			);
-			expect(body).not.toMatch(
+			expect(wmBody).not.toMatch(
 				/!collapsed[\s\S]{0,80}renderCommitMemoryButton/,
+			);
+			// Regression guard: the button must NOT be re-appended inside the
+			// Changes section (its old home) — that would double-render it.
+			const rsStart = js.indexOf("function renderSection");
+			const rsEnd = js.indexOf(
+				"function ",
+				rsStart + "function renderSection".length,
+			);
+			const rsBody = js.slice(rsStart, rsEnd);
+			expect(rsBody).not.toMatch(
+				/s\.id\s*===\s*'changes'[\s\S]{0,80}renderCommitMemoryButton/,
 			);
 		});
 
@@ -1469,7 +1477,28 @@ describe("SidebarScriptBuilder", () => {
 			);
 			const body = js.slice(renderBranchStart, renderBranchEnd);
 			expect(body).toMatch(/const foreign\s*=\s*isViewingForeign\(\)/);
-			expect(body).toMatch(/if\s*\(\s*!foreign\s*\)/);
+			// Foreign mode early-returns with only the Committed Memories list;
+			// the Working Memory card (Conversations + Context + Changes) is
+			// reached only on the non-foreign path below the guard.
+			expect(body).toMatch(/if\s*\(\s*foreign\s*\)/);
+		});
+
+		it("Committed Memories is NOT filtered to commitWithMemory — every branch commit shows (regression: async-summary commits were hidden)", () => {
+			const js = buildSidebarScript();
+			const renderBranchStart = js.indexOf("function renderBranch");
+			const renderBranchEnd = js.indexOf(
+				"function ",
+				renderBranchStart + "function renderBranch".length,
+			);
+			const body = js.slice(renderBranchStart, renderBranchEnd);
+			// The workspace-view commits section feeds straight from branchData.commits.
+			expect(body).toMatch(/items:\s*branchData\.commits/);
+			// And must NOT re-introduce the contextValue==='commitWithMemory' filter,
+			// which hid just-committed memories until their summary generated async.
+			// (Matches an actual .filter(...) call, not the explanatory comment.)
+			expect(body).not.toMatch(
+				/\.filter\([\s\S]*['"]commitWithMemory['"]/,
+			);
 		});
 	});
 

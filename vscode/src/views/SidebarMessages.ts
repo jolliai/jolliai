@@ -467,6 +467,28 @@ export type SidebarOutboundMsg =
 	  }
 	| {
 			/**
+			 * Working Memory card "Preview" button — opens the editable pop-out
+			 * (NextMemoryPreviewPanel) for what the next Commit Memory will capture.
+			 * Each item carries the id the host needs to toggle its exclusion via
+			 * the same apply* path the sidebar checkboxes use (files key off the
+			 * RELATIVE path; context off id + contextValue; conversations off
+			 * source + sessionId).
+			 */
+			readonly type: "branch:previewNextMemory";
+			readonly files: ReadonlyArray<{ readonly label: string; readonly relPath: string }>;
+			readonly conversations: ReadonlyArray<{
+				readonly title: string;
+				readonly source: string;
+				readonly sessionId: string;
+			}>;
+			readonly context: ReadonlyArray<{
+				readonly label: string;
+				readonly contextValue: string;
+				readonly id: string;
+			}>;
+	  }
+	| {
+			/**
 			 * Inline "discard" button on a Changes row. The host rebuilds a full
 			 * `FileItem` from these fields rather than running the command with a
 			 * bare id (which the command's `if (!item?.fileStatus) return;` guard

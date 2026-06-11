@@ -14,6 +14,7 @@ import { isTranscriptSource } from "../../../cli/src/Types.js";
 import type { ActiveSessionsProvider } from "../services/ActiveSessionsProvider.js";
 import { log } from "../util/Logger.js";
 import { ConversationDetailsPanel } from "./ConversationDetailsPanel.js";
+import { NextMemoryPreviewPanel } from "./NextMemoryPreviewPanel.js";
 import { SIDEBAR_EMPTY_STRINGS } from "./SidebarEmptyMessages.js";
 import { buildSidebarHtml } from "./SidebarHtmlBuilder.js";
 import type {
@@ -432,6 +433,16 @@ export class SidebarWebviewProvider
 				void this.handleReady();
 				return;
 			case "command":
+				// Trust boundary: `command` arrives from the webview. Restrict it to
+				// this extension's own command namespace so a compromised/spoofed
+				// webview message can never invoke arbitrary VS Code commands (e.g.
+				// workbench.action.* or another extension's command).
+				if (typeof msg.command !== "string" || !msg.command.startsWith("jollimemory.")) {
+					log.warn("SidebarWebviewProvider", "Rejected command outside jollimemory namespace", {
+						command: String(msg.command),
+					});
+					return;
+				}
 				if (msg.args && msg.args.length > 0) {
 					void this.deps.executeCommand(msg.command, ...msg.args);
 				} else {
@@ -518,6 +529,54 @@ export class SidebarWebviewProvider
 			case "branch:openCommit":
 				void this.deps.executeCommand("jollimemory.viewSummary", msg.hash);
 				return;
+			case "branch:previewNextMemory": {
+				// Display data + toggle ids from the webview; coerce defensively
+				// across the trust boundary, then open the editable preview pop-out.
+				const toStr = (v: unknown): string => (typeof v === "string" ? v : "");
+				const get = (o: unknown, k: string): string =>
+					toStr((o as Record<string, unknown> | null)?.[k]);
+				const files = Array.isArray(msg.files)
+					? msg.files.map((f) => ({ label: get(f, "label"), relPath: get(f, "relPath") }))
+					: [];
+				const conversations = Array.isArray(msg.conversations)
+					? msg.conversations.map((c) => ({
+							title: get(c, "title"),
+							source: get(c, "source"),
+							sessionId: get(c, "sessionId"),
+						}))
+					: [];
+				const context = Array.isArray(msg.context)
+					? msg.context.map((c) => ({
+							label: get(c, "label"),
+							contextValue: get(c, "contextValue"),
+							id: get(c, "id"),
+						}))
+					: [];
+				NextMemoryPreviewPanel.show({
+					files,
+					conversations,
+					context,
+					// Route an uncheck/recheck in the pop-out through the SAME apply*
+					// path the sidebar checkboxes use — which also refreshes the
+					// sidebar's Working Memory card, keeping the two surfaces in sync.
+					onExclude: (ex) => {
+						if (ex.kind === "file") {
+							this.deps.applyFileCheckbox?.(ex.relPath, ex.selected);
+						} else if (ex.kind === "conversation") {
+							if (isTranscriptSource(ex.source)) {
+								void this.deps.applyConversationCheckbox?.(ex.source, ex.sessionId, ex.selected);
+							}
+						} else if (ex.contextValue === "note") {
+							void this.deps.applyNoteCheckbox?.(ex.id, ex.selected);
+						} else if (ex.contextValue === "reference") {
+							void this.deps.applyReferenceCheckbox?.(ex.id, ex.selected);
+						} else {
+							void this.deps.applyPlanCheckbox?.(ex.id, ex.selected);
+						}
+					},
+				});
+				return;
+			}
 			case "branch:openConversation":
 				// Same sessionId reveals the existing panel; a different sessionId
 				// disposes the prior panel and opens a fresh one. The source-specific

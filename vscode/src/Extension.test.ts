@@ -404,6 +404,7 @@ const {
 	checkboxCallbacks,
 	visibilityCallbacks,
 	openExternal,
+	createTerminal,
 } = vi.hoisted(() => {
 	/** Stores callbacks keyed by tree view ID so tests can trigger checkbox events */
 	const checkboxCallbacks_ = new Map<
@@ -463,6 +464,11 @@ const {
 		checkboxCallbacks: checkboxCallbacks_,
 		visibilityCallbacks: visibilityCallbacks_,
 		openExternal: vi.fn().mockResolvedValue(true),
+		createTerminal: vi.fn(() => ({
+			sendText: vi.fn(),
+			show: vi.fn(),
+			dispose: vi.fn(),
+		})),
 	};
 });
 
@@ -532,6 +538,7 @@ vi.mock("vscode", () => ({
 		})),
 		registerFileDecorationProvider: vi.fn(() => ({ dispose: vi.fn() })),
 		registerUriHandler: vi.fn(() => ({ dispose: vi.fn() })),
+		createTerminal,
 		onDidChangeActiveTextEditor,
 		activeTextEditor: undefined,
 		// Pass-through Progress mock — runs the user's callback so commands that
@@ -7240,6 +7247,65 @@ describe("Extension", () => {
 			// handleError logs via the shared `log.error`; the test just verifies
 			// the callback didn't throw and an error was logged.
 			expect(error).toHaveBeenCalled();
+		});
+	});
+
+	describe("continueConversation command", () => {
+		it("resumes a Claude session in a terminal", () => {
+			const ctx = makeContext();
+			activate(ctx);
+			createTerminal.mockClear();
+			const handler = commandMap.get("jollimemory.continueConversation");
+			expect(handler).toBeDefined();
+			handler?.("claude", "0fc65422-d25d-41a1-a4f9-b143ffb3addd");
+			expect(createTerminal).toHaveBeenCalledTimes(1);
+			const term = createTerminal.mock.results[0].value as {
+				sendText: ReturnType<typeof vi.fn>;
+				show: ReturnType<typeof vi.fn>;
+			};
+			expect(term.sendText).toHaveBeenCalledWith(
+				"claude --resume 0fc65422-d25d-41a1-a4f9-b143ffb3addd",
+			);
+			expect(term.show).toHaveBeenCalled();
+		});
+
+		it("shows an info message for non-Claude sources (no terminal)", () => {
+			const ctx = makeContext();
+			activate(ctx);
+			createTerminal.mockClear();
+			showInformationMessage.mockClear();
+			commandMap.get("jollimemory.continueConversation")?.(
+				"codex",
+				"0fc65422-d25d-41a1-a4f9-b143ffb3addd",
+			);
+			expect(createTerminal).not.toHaveBeenCalled();
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Claude Code"),
+			);
+		});
+
+		it("rejects a sessionId with shell metacharacters (injection guard)", () => {
+			const ctx = makeContext();
+			activate(ctx);
+			createTerminal.mockClear();
+			showInformationMessage.mockClear();
+			// Would be a command-injection payload if it reached the shell.
+			commandMap.get("jollimemory.continueConversation")?.(
+				"claude",
+				"$(touch /tmp/pwned)",
+			);
+			expect(createTerminal).not.toHaveBeenCalled();
+			expect(showInformationMessage).toHaveBeenCalled();
+		});
+
+		it("guards an empty sessionId (no terminal, info message)", () => {
+			const ctx = makeContext();
+			activate(ctx);
+			createTerminal.mockClear();
+			showInformationMessage.mockClear();
+			commandMap.get("jollimemory.continueConversation")?.("claude", "");
+			expect(createTerminal).not.toHaveBeenCalled();
+			expect(showInformationMessage).toHaveBeenCalled();
 		});
 	});
 });

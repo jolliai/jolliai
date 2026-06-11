@@ -169,6 +169,17 @@ describe("SidebarWebviewProvider", () => {
 		expect(executeCommand).toHaveBeenCalledWith("jollimemory.openSettings");
 	});
 
+	it("rejects `command` outside the jollimemory namespace (no executeCommand)", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "command",
+			command: "workbench.action.terminal.sendSequence",
+			args: ["rm -rf"],
+		} as unknown as SidebarOutboundMsg);
+		expect(executeCommand).not.toHaveBeenCalled();
+	});
+
 	it("ignores malformed outbound messages without throwing", () => {
 		const view = makeMockView();
 		provider.resolveWebviewView(view as unknown as never);

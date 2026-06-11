@@ -184,6 +184,10 @@ export function buildSidebarScript(): string {
   // calls mountIn(statusEntries, ...) which replaceChildren()s its target;
   // mounting into the panel root would clobber the banner.
   const statusEntries = document.getElementById('status-entries');
+  // Branch-view chrome that lives OUTSIDE tab-content-branch (so it can sit
+  // above the scrolling list): the last-conversation banner. Populated by
+  // renderLastConvo(); hidden on KB/Status.
+  const lastConvoEl = document.getElementById('last-convo');
 
   // ---- Plain-text tooltip ----
   // Replaces the native title= tooltip on status rows and toolbar buttons. The
@@ -279,6 +283,11 @@ export function buildSidebarScript(): string {
       elBtn.classList.toggle('active', elBtn.getAttribute('data-tab') === tab);
     });
     Object.keys(tabContents).forEach(function(t) { tabContents[t].classList.toggle('hidden', t !== tab); });
+    // Branch-only chrome: hide when leaving Branch. On Branch, renderBranch()
+    // → renderLastConvo() decides the banner's visibility from the data.
+    if (tab !== 'branch') {
+      if (lastConvoEl) lastConvoEl.classList.add('hidden');
+    }
     renderToolbar();
     const incoming = tabContents[tab];
     if (incoming) incoming.scrollTop = state.scrollTops[tab] || 0;
@@ -2462,60 +2471,189 @@ export function buildSidebarScript(): string {
     return !!state.sectionsCollapsed[section];
   }
 
+  // Review-expander state for the Working Memory card. Client-side only —
+  // resets on reload. (Preview opens a separate pop-out panel, no card state.)
+  let wmReviewing = false;
+
   function renderBranch() {
     hideTextTip();
+    renderLastConvo();
     const container = tabContents.branch;
-    // Plans & Notes and Changes are workspace-local — they have no meaningful
-    // representation for a foreign repo/branch selection. Drop them entirely
-    // in foreign-readonly mode so the panel reduces to the Memories list.
     const foreign = isViewingForeign();
-    const sections = [];
-    if (!foreign) {
-      // failedSources is the list of TranscriptSource keys whose discoverer
-      // failed (threw or returned r.error) during the most recent aggregator
-      // pass. When non-empty, the section renders a small banner above the
-      // rows so the user understands "list incomplete", not "list truly empty".
-      const failedSources = branchData.conversationsFailedSources || [];
-      const conversationsWarning = failedSources.length > 0
-        ? 'Some sources unavailable (' + failedSources.join(', ') + '). List may be incomplete.'
-        : null;
-      sections.push({ id: 'conversations', title: 'CONVERSATIONS', items: branchData.conversations, emptyText: 'No active AI conversations in the last 2 days.', warning: conversationsWarning });
-      sections.push({ id: 'plans', title: 'Plans & Notes', items: branchData.plans, emptyText: STRINGS.plansEmpty || 'No plans or notes yet.' });
-      sections.push({ id: 'changes', title: 'Changes', items: branchData.changes, emptyText: STRINGS.changesEmpty || 'No changes.' });
-    }
-    // Section id stays 'commits' (back-compat: section-toggle state and CSS
-    // selectors key off it), but the user-facing title is now "Memories"
-    // because every selected row maps to — or will become — a Jolli memory.
-    //
-    // Data source switches with the breadcrumb selection:
-    //  - workspace view → branchData.commits (rich BranchCommit shape pushed
-    //    by host via branch:commitsData; supports checkboxes / squash / push).
-    //  - foreign view   → memoriesState.items filtered by selectedRepoName +
-    //    selectedBranchName, adapted to the display-item shape renderCommitRow
-    //    consumes. Host doesn't refetch commits on selection change (the bridge
-    //    only knows how to git-log workspace HEAD), so we re-derive locally
-    //    from the cross-repo summary index that's already loaded.
-    const commitsItems = foreign ? getForeignCommitItems() : branchData.commits;
-    // Foreign-mode banner — placed at the top of the Memories section body
-    // so the user sees an explicit in-panel signal that they are viewing
-    // another repo (the chrome-only foreign-readonly CSS class is silent on
-    // its own). Wording mirrors IntelliJ CommitsPanel.kt:722 so the two
-    // surfaces stay aligned. Uses sectionBanner (not warning) to keep the
-    // partial-data orange affordance free for the conversations failure case.
-    //
-    // The "(read-only)" suffix only renders when the repo itself is foreign;
-    // browsing another branch in the workspace repo drops the suffix because
-    // those branches are not actually read-only (the user could check them
-    // out). Both foreign-flavors get a "Switch back to current workspace"
-    // affordance so the user is never stranded after a breadcrumb pick.
     const repo = state.selectedRepoName || state.currentRepoName || '';
     const branch = state.selectedBranchName || state.branchName || '';
     const repoForeign = !!state.selectedRepoName && state.selectedRepoName !== state.currentRepoName;
-    const memoriesBanner = foreign && repo && branch
-      ? { text: 'Viewing memories from ' + repo + ' / ' + branch + (repoForeign ? ' (read-only)' : ''), showResetLink: true }
+
+    // Foreign repo/branch is read-only — there is nothing to commit, so the
+    // Working Memory card is dropped and the panel reduces to the Committed
+    // Memories list. Banner wording mirrors IntelliJ CommitsPanel.kt so the
+    // two surfaces stay aligned. "(read-only)" only when the repo itself is
+    // foreign (another branch in the workspace repo is checkout-able).
+    if (foreign) {
+      const memoriesBanner = repo && branch
+        ? { text: 'Viewing memories from ' + repo + ' / ' + branch + (repoForeign ? ' (read-only)' : ''), showResetLink: true }
+        : null;
+      mountIn(container, [renderSection({
+        id: 'commits', title: 'Committed Memories', items: getForeignCommitItems(),
+        emptyText: STRINGS.commitsEmpty || 'No memories yet.', sectionBanner: memoriesBanner,
+      })]);
+      return;
+    }
+
+    // Workspace view: Working Memory card (Conversations + Context + Changes
+    // behind the Review expander, with the live assembly sentence + Commit
+    // Memory) followed by the Committed Memories list.
+    const failedSources = branchData.conversationsFailedSources || [];
+    const conversationsWarning = failedSources.length > 0
+      ? 'Some sources unavailable (' + failedSources.join(', ') + '). List may be incomplete.'
       : null;
-    sections.push({ id: 'commits', title: 'Memories', items: commitsItems, emptyText: STRINGS.commitsEmpty || 'No memories yet.', sectionBanner: memoriesBanner });
-    mountIn(container, sections.map(renderSection));
+    const convSec = { id: 'conversations', title: 'CONVERSATIONS', items: branchData.conversations, emptyText: 'No active AI conversations in the last 2 days.', warning: conversationsWarning };
+    const ctxSec = { id: 'plans', title: 'Context', items: branchData.plans, emptyText: STRINGS.plansEmpty || 'No plans or notes yet.' };
+    const changeSec = { id: 'changes', title: 'Changes', items: branchData.changes, emptyText: STRINGS.changesEmpty || 'No changes.' };
+    // Section id stays 'commits' (back-compat: section-toggle state + CSS
+    // selectors key off it); user-facing title is "Committed Memories".
+    // Every item here is a real branch commit (sourced from the history
+    // provider) — memory-backed and code-only alike. We deliberately do NOT
+    // filter to contextValue==='commitWithMemory': summaries are generated
+    // asynchronously after commit, so filtering would hide a just-made commit
+    // until its summary lands (and code-only commits forever). Memory-backed
+    // rows still get the inline "View Memory" affordance via the per-row
+    // hasMem check. Uncommitted/in-progress work never appears here — it lives
+    // in the Working Memory card above.
+    const commitsSec = { id: 'commits', title: 'Committed Memories', items: branchData.commits || [], emptyText: STRINGS.commitsEmpty || 'No memories yet.' };
+
+    mountIn(container, [
+      renderWorkingMemoryCard(convSec, ctxSec, changeSec),
+      renderSection(commitsSec),
+    ]);
+  }
+
+  // Working Memory card: assembly sentence (live selection counts) + Commit
+  // Memory + a Review chevron that expands Conversations / Context / Changes.
+  // Those three reuse the existing renderSection, so every row behaviour —
+  // checkboxes, select-all, discard, add-menu — carries over unchanged.
+  function renderWorkingMemoryCard(convSec, ctxSec, changeSec) {
+    const convN = (branchData.conversations || []).filter(function(c) { return !!c.isSelected; }).length;
+    const ctxN = (branchData.plans || []).filter(function(c) { return !!c.isSelected; }).length;
+    const fileN = (branchData.changes || []).filter(function(c) { return !!c.isSelected; }).length;
+
+    const assembly = el('div', { className: 'wm-assembly' });
+    if (fileN === 0) {
+      assembly.appendChild(el('span', { className: 'wm-zero', text: 'No files selected — open Review to choose what to commit.' }));
+    } else {
+      assembly.appendChild(document.createTextNode('Commit Memory will commit '));
+      assembly.appendChild(el('b', { text: String(fileN) }));
+      assembly.appendChild(document.createTextNode(' file' + (fileN > 1 ? 's' : '')));
+      const attach = [];
+      if (convN > 0) attach.push(convN + ' conversation' + (convN > 1 ? 's' : ''));
+      if (ctxN > 0) attach.push(ctxN + ' context item' + (ctxN > 1 ? 's' : ''));
+      if (attach.length > 0) assembly.appendChild(document.createTextNode(' and attach ' + attach.join(' + ')));
+      assembly.appendChild(document.createTextNode('.'));
+    }
+
+    // CTA: Commit Memory (primary) + Preview, stacked full-width. Preview opens
+    // an editable pop-out (NextMemoryPreviewPanel) of the next memory — its
+    // include/exclude checkboxes route through the same apply* path as the card.
+    const previewBtn = el('button', {
+      type: 'button', className: 'wm-btn-secondary', 'data-action': 'wm-preview-open',
+    }, [el('span', { text: 'Preview memory' })]);
+    const cta = el('div', { className: 'wm-cta' }, [renderCommitMemoryButton(), previewBtn]);
+
+    const reviewBtn = el('button', {
+      type: 'button', className: 'wm-review', 'data-action': 'wm-review-toggle',
+      'aria-expanded': String(wmReviewing),
+    }, [
+      el('span', { className: 'twirl', text: '▸' }),
+      el('span', { text: 'Review conversations, context & files' }),
+    ]);
+    const reviewBody = el('div', { className: 'wm-review-body' }, [
+      renderSection(convSec), renderSection(ctxSec), renderSection(changeSec),
+    ]);
+
+    // One-line subtitle clarifying what Commit Memory does (mockup parity).
+    const ctaSub = el('div', { className: 'cta-sub', text: 'Commits your files and writes the memory.' });
+
+    const kids = [assembly, cta, ctaSub];
+    // Background AI-summary indicator — shows while the queue worker is mid-run
+    // (state.workerBusy is pushed by the host worker:busy message).
+    if (state.workerBusy) {
+      kids.push(el('div', { className: 'worker-row' }, [
+        el('i', { className: 'codicon codicon-loading codicon-modifier-spin' }),
+        el('span', { text: 'AI summary in progress…' }),
+      ]));
+    }
+    kids.push(reviewBtn, reviewBody);
+
+    return el('div', {
+      className: 'wm-card' + (wmReviewing ? ' reviewing' : ''),
+      'data-section': 'working-memory',
+    }, kids);
+  }
+
+  // Last-conversation banner (Branch view, workspace only): the most-recently
+  // updated AI session with "Show" (opens the conversation panel) and, for
+  // Claude sessions only, "Continue" (true resume via the claude CLI).
+  // Non-Claude sources have no resume mechanism, so they get Show only.
+  // Summarize-to-note is tracked in JOLLI-1722 (no command exists yet).
+  function renderLastConvo() {
+    if (!lastConvoEl) return;
+    const convos = branchData.conversations || [];
+    if (state.activeTab !== 'branch' || isViewingForeign() || convos.length === 0) {
+      lastConvoEl.replaceChildren();
+      lastConvoEl.classList.add('hidden');
+      return;
+    }
+    // Pick the most-recent conversation. Coerce an unparseable updatedAt to
+    // -Infinity so a row with a bad timestamp never wins over one with a real
+    // one (NaN comparisons are always false, which would otherwise pin latest
+    // to convos[0] regardless of the others).
+    var parseTs = function(v) { var t = Date.parse(v); return Number.isFinite(t) ? t : -Infinity; };
+    let latest = convos[0];
+    for (let i = 1; i < convos.length; i++) {
+      if (parseTs(convos[i].updatedAt) > parseTs(latest.updatedAt)) latest = convos[i];
+    }
+    const title = latest.title || '(untitled)';
+    const ts = Date.parse(latest.updatedAt);
+    const rel = Number.isFinite(ts) ? timeAgo(ts) : '';
+    const n = latest.messageCount || 0;
+    const sub = n + ' message' + (n === 1 ? '' : 's') + (rel ? ' · ' + rel : '');
+    const actions = [];
+    // Show opens the transcript — only meaningful when there are messages.
+    if (latest.messageCount && latest.messageCount > 0) {
+      const showBtn = el('button', { type: 'button' }, [el('span', { text: 'Show' })]);
+      showBtn.addEventListener('click', function() {
+        vscode.postMessage({
+          type: 'branch:openConversation',
+          sessionId: latest.sessionId,
+          source: latest.source,
+          transcriptPath: latest.transcriptPath,
+          title: title,
+        });
+      });
+      actions.push(showBtn);
+    }
+    // Continue (true resume) is Claude-only (claude --resume the session).
+    if (latest.source === 'claude') {
+      const continueBtn = el('button', { type: 'button', className: 'primary' }, [el('span', { text: 'Continue' })]);
+      continueBtn.addEventListener('click', function() {
+        vscode.postMessage({
+          type: 'command',
+          command: 'jollimemory.continueConversation',
+          args: [latest.source, latest.sessionId],
+        });
+      });
+      actions.push(continueBtn);
+    }
+    lastConvoEl.replaceChildren(
+      el('div', { className: 'lc-label', text: 'Last conversation' }),
+      el('div', { className: 'lc-head' }, [
+        el('span', { className: 'badge transcript-source-' + latest.source, text: providerLabel(latest.source) }),
+        el('span', { className: 'lc-title', text: title }),
+      ]),
+      el('div', { className: 'lc-sub', text: sub }),
+      el('div', { className: 'lc-actions' }, actions),
+    );
+    lastConvoEl.classList.remove('hidden');
   }
 
   // Adapts BranchMemoryItem → the minimal display-item shape renderCommitRow
@@ -2606,24 +2744,13 @@ export function buildSidebarScript(): string {
       }
       bodyKids.unshift(el('div', { className: 'foreign-banner' }, kids));
     }
-    // Primary CTA mounted as a SIBLING of .section-body so it survives the
-    // Changes section being collapsed. Commit Memory operates on the group
-    // (Plans + Changes + Commits selections together), so hiding it whenever
-    // the user folds Changes makes the cross-panel action unreachable. The
-    // header sparkle iconbtn is too easy to miss, and a labelled button
-    // mirrors the SCM "Commit" pattern users expect. Stays visible when
-    // Changes is empty (sits below the empty-state placeholder, disabled via
-    // renderCommitMemoryButton's selectedCount===0 guard). Foreign-readonly
-    // mode drops the Changes section entirely above, so the s.id==='changes'
-    // predicate already implicitly excludes foreign view — no extra check
-    // needed.
+    // Commit Memory is no longer appended here — it lives in the Working
+    // Memory card (renderWorkingMemoryCard), which owns the cross-panel
+    // assembly (Conversations + Context + Changes) and the CTA together.
     const sectionKids = [
       el('div', { className: 'section-header' }, headerKids),
       el('div', { className: 'section-body' }, bodyKids),
     ];
-    if (s.id === 'changes') {
-      sectionKids.push(renderCommitMemoryButton());
-    }
     return el('div', {
       className: 'collapsible-section' + (collapsed ? ' collapsed' : ''),
       'data-section': s.id,
@@ -3321,8 +3448,34 @@ export function buildSidebarScript(): string {
       e.stopPropagation();
       return;
     }
-    // Bottom-of-section Commit Memory CTA — not gated on .section-actions
-    // because it lives inside .section-body, not the header. Routes to the
+    // Working Memory card: the Review chevron expands the editable attached
+    // Conversations / Context / Changes. State is client-side; re-render.
+    const wmReview = e.target.closest('[data-action="wm-review-toggle"]');
+    if (wmReview) {
+      wmReviewing = !wmReviewing;
+      renderBranch();
+      e.stopPropagation();
+      return;
+    }
+    const wmPreview = e.target.closest('[data-action="wm-preview-open"]');
+    if (wmPreview) {
+      // Gather the currently-selected items WITH the ids the pop-out needs to
+      // toggle exclusion. Files key off the relative path (item.description,
+      // mirrored to data-rel-path); context off id + contextValue.
+      const files = (branchData.changes || [])
+        .filter(function(i) { return !!i.isSelected; })
+        .map(function(i) { return { label: String(i.label || ''), relPath: String(i.description || '') }; });
+      const conversations = (branchData.conversations || [])
+        .filter(function(i) { return !!i.isSelected; })
+        .map(function(i) { return { title: String(i.title || '(untitled)'), source: String(i.source || ''), sessionId: String(i.sessionId || '') }; });
+      const context = (branchData.plans || [])
+        .filter(function(i) { return !!i.isSelected; })
+        .map(function(i) { return { label: String(i.label || ''), contextValue: String(i.contextValue || ''), id: String(i.id || '') }; });
+      vscode.postMessage({ type: 'branch:previewNextMemory', files: files, conversations: conversations, context: context });
+      e.stopPropagation();
+      return;
+    }
+    // Commit Memory CTA — lives in the Working Memory card. Routes to the
     // same command as the header sparkle iconbtn.
     const commitMemoryBtn = e.target.closest('.commit-memory-btn[data-action="changes-commit-memory"]');
     if (commitMemoryBtn && !commitMemoryBtn.disabled) {
