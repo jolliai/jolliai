@@ -4,7 +4,8 @@
  * The post-commit Worker holds `.jolli/jollimemory/worker.lock` while running
  * the LLM summarization pipeline (~20-40s). These helpers let the extension and
  * command classes check the lock state to prevent race conditions
- * (Commit / Squash / Push are gated on it).
+ * (Commit / Squash are gated on it). Push is intentionally NOT gated: it only
+ * runs `git push` on the current branch and shares no state with the worker.
  *
  * Notes on the lock split:
  *   - `worker.lock` is the QueueWorker's "I'm draining the queue" marker; this

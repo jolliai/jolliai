@@ -163,6 +163,26 @@ describe("StatusBarManager", () => {
 			);
 		});
 
+		it("offline + failedCode=vault_locked + selfLocked → self-lock headline (dangling own lock)", () => {
+			// selfLocked=true means the lock is almost certainly held by THIS
+			// device's own previous failed round — the headline must say so
+			// rather than blaming an unknown peer. Exercises the
+			// `detail.selfLocked === true` true-branch in terminalCodeVisual.
+			const manager = new StatusBarManager();
+			manager.setSyncState("offline", {
+				failed: true,
+				failedCode: "vault_locked",
+				selfLocked: true,
+			});
+			expect(item.text).toBe("$(error) Personal Space busy");
+			expect((item.backgroundColor as { id: string }).id).toBe(
+				"statusBarItem.warningBackground",
+			);
+			expect(item.tooltip).toContain(
+				"Your previous sync failed and its backend lock is still releasing",
+			);
+		});
+
 		it("offline + failedCode=localfolder_invalid → 'Memory Bank folder invalid'", () => {
 			const manager = new StatusBarManager();
 			manager.setSyncState("offline", { failed: true, failedCode: "localfolder_invalid" });
@@ -185,6 +205,30 @@ describe("StatusBarManager", () => {
 		// a terminal SyncErrorCode, so there's no status-bar visual to
 		// test. Coverage for the defences themselves is in
 		// StageVault.test.ts and VaultSymlinkGuard.test.ts.
+
+		it.each([
+			"vault_mismatch",
+			"mint_failed",
+			"git_missing",
+			"clone_failed",
+			"fetch_failed",
+			"pull_failed",
+			"migration_failed",
+		] as const)(
+			"offline + failedCode=%s → generic 'Sync failed' + errorBackground",
+			(failedCode) => {
+				// These terminal codes all share the generic error visual via the
+				// fall-through case group in terminalCodeVisual. Each label is its
+				// own switch branch, so exercise them all to keep the mapping honest.
+				const manager = new StatusBarManager();
+				manager.setSyncState("offline", { failed: true, failedCode });
+				expect(item.text).toBe("$(error) Sync failed");
+				expect((item.backgroundColor as { id: string }).id).toBe(
+					"statusBarItem.errorBackground",
+				);
+				expect(item.tooltip).toContain("Memory Bank sync failed");
+			},
+		);
 
 		it("offline + an unrecognized failedCode falls back to generic 'Sync failed' (exhaustive-never runtime safety)", () => {
 			// The terminal-code switch has a compile-time `const _exhaustive:

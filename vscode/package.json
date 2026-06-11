@@ -159,8 +159,7 @@
 				"command": "jollimemory.pushBranch",
 				"title": "Push",
 				"icon": "$(cloud-upload)",
-				"category": "Jolli Memory",
-				"enablement": "!jollimemory.workerBusy"
+				"category": "Jolli Memory"
 			},
 			{
 				"command": "jollimemory.refreshHistory",
