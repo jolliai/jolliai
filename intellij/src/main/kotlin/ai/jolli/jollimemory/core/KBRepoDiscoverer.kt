@@ -69,6 +69,11 @@ object KBRepoDiscoverer {
     }
 
     private fun normalizeUrl(url: String): String {
-        return url.removeSuffix("/").removeSuffix(".git").lowercase()
+        // Fold SSH transports first (shared rule with KBPathResolver) so a
+        // config stored from an SSH clone still matches the https remote of
+        // the same repo — otherwise isCurrentRepo calls the current repo
+        // "foreign" while the resolver happily reuses its folder. The
+        // whole-string lowercase below already covers path-case differences.
+        return KBPathResolver.foldGitTransportToHttps(url).removeSuffix("/").removeSuffix(".git").lowercase()
     }
 }

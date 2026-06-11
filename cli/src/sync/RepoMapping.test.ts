@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	canonicalizeRepoMapping,
 	emptyMapping,
 	findRepoMappingConflicts,
 	loadRepoMapping,
@@ -14,8 +15,10 @@ import {
 	parseRepoMapping,
 	REPO_MAPPING_PATH,
 	type RepoMappingFile,
+	reconcileMappingAdditive,
 	resolveOrAssignFolder,
 	saveRepoMapping,
+	scanFolderIdentities,
 	serializeRepoMapping,
 } from "./RepoMapping.js";
 
@@ -177,6 +180,80 @@ describe("resolveOrAssignFolder", () => {
 	});
 });
 
+describe("canonicalizeRepoMapping", () => {
+	it("returns the same object with changed=false when every row is already canonical", () => {
+		const mapping: RepoMappingFile = {
+			version: 1,
+			mappings: [
+				{ repoIdentity: "https://github.com/jolliai/jolli", folder: "jolli" },
+				{ repoIdentity: "my-notes", folder: "my-notes" },
+				// Bare fallback identity ending in `.git` — must NOT be
+				// rewritten to `foo` (it never went through the URL
+				// normalizer at compute time).
+				{ repoIdentity: "foo.git", folder: "foo.git" },
+			],
+		};
+		const result = canonicalizeRepoMapping(mapping);
+		expect(result.changed).toBe(false);
+		expect(result.merged).toBe(mapping);
+	});
+
+	it("collapses SSH- and https-style rows of the same repo into one canonical row", () => {
+		// The exact duplicate observed in the field: one device's remote was
+		// SSH, another's https, both rounds appended their own row for the
+		// same repo + folder.
+		const mapping: RepoMappingFile = {
+			version: 1,
+			mappings: [
+				{ repoIdentity: "git@github.com:jolliai/jolli", folder: "jolli" },
+				{ repoIdentity: "https://github.com/jolliai/jolli", folder: "jolli" },
+			],
+		};
+		const result = canonicalizeRepoMapping(mapping);
+		expect(result.changed).toBe(true);
+		expect(result.merged.mappings).toEqual([{ repoIdentity: "https://github.com/jolliai/jolli", folder: "jolli" }]);
+		// The collapse also removes the bogus folder-collision warning.
+		expect(findRepoMappingConflicts(result.merged)).toHaveLength(0);
+	});
+
+	it("rewrites a lone legacy SSH row in place (changed=true)", () => {
+		const mapping: RepoMappingFile = {
+			version: 1,
+			mappings: [{ repoIdentity: "git@github.com:foo/bar", folder: "bar" }],
+		};
+		const result = canonicalizeRepoMapping(mapping);
+		expect(result.changed).toBe(true);
+		expect(result.merged.mappings).toEqual([{ repoIdentity: "https://github.com/foo/bar", folder: "bar" }]);
+	});
+
+	it("lets the later row win when collapsing rows that disagree on folder", () => {
+		const mapping: RepoMappingFile = {
+			version: 1,
+			mappings: [
+				{ repoIdentity: "git@github.com:foo/bar", folder: "bar" },
+				{ repoIdentity: "https://github.com/foo/bar", folder: "bar-2" },
+			],
+		};
+		const result = canonicalizeRepoMapping(mapping);
+		expect(result.merged.mappings).toEqual([{ repoIdentity: "https://github.com/foo/bar", folder: "bar-2" }]);
+	});
+
+	it("emits stable order (sorted by canonical repoIdentity)", () => {
+		const mapping: RepoMappingFile = {
+			version: 1,
+			mappings: [
+				{ repoIdentity: "https://github.com/z/z", folder: "z" },
+				{ repoIdentity: "git@github.com:a/a", folder: "a" },
+			],
+		};
+		const result = canonicalizeRepoMapping(mapping);
+		expect(result.merged.mappings.map((m) => m.repoIdentity)).toEqual([
+			"https://github.com/a/a",
+			"https://github.com/z/z",
+		]);
+	});
+});
+
 describe("mergeRepoMapping", () => {
 	it("returns the union when repoIdentities are disjoint", () => {
 		const local: RepoMappingFile = {
@@ -248,6 +325,20 @@ describe("mergeRepoMapping", () => {
 		expect(merged.mappings.map((m) => m.repoIdentity)).toEqual(["a", "b", "c"]);
 	});
 
+	it("folds an SSH-style row from an older client into this client's https row for the same repo", () => {
+		const local: RepoMappingFile = {
+			version: 1,
+			mappings: [{ repoIdentity: "https://github.com/jolliai/jolli", folder: "jolli" }],
+		};
+		const remote: RepoMappingFile = {
+			version: 1,
+			mappings: [{ repoIdentity: "git@github.com:jolliai/jolli", folder: "jolli" }],
+		};
+		const { merged, conflicts } = mergeRepoMapping(local, remote);
+		expect(merged.mappings).toEqual([{ repoIdentity: "https://github.com/jolliai/jolli", folder: "jolli" }]);
+		expect(conflicts).toHaveLength(0);
+	});
+
 	it("is idempotent — merging identical inputs returns the same shape and no conflicts", () => {
 		const m: RepoMappingFile = {
 			version: 1,
@@ -288,5 +379,122 @@ describe("findRepoMappingConflicts", () => {
 			folder: "shared",
 			identities: ["alpha", "beta"],
 		});
+	});
+});
+
+describe("scanFolderIdentities", () => {
+	async function writeFolder(name: string, config: Record<string, unknown> | null): Promise<void> {
+		const dir = join(tempDir, name, ".jolli");
+		await mkdir(dir, { recursive: true });
+		if (config !== null) {
+			await writeFile(join(dir, "config.json"), JSON.stringify(config));
+		}
+	}
+
+	it("derives identity per folder from its config, skipping dot dirs and config-less folders", async () => {
+		await writeFolder("jolliai", { remoteUrl: "https://github.com/jolliai/jolliai.git", repoName: "jolliai" });
+		await writeFolder("jolli", { remoteUrl: "git@github.com:jolliai/jolli.git", repoName: "jolli" });
+		// `.jolli` (vault metadata) and a bootstrap stash must be ignored.
+		await mkdir(join(tempDir, ".jolli"), { recursive: true });
+		await mkdir(join(tempDir, ".jolli-bootstrap-stash", ".jolli"), { recursive: true });
+		// A folder with no config.json is not a managed repo folder.
+		await mkdir(join(tempDir, "loose", ".jolli"), { recursive: true });
+		// A plain file at the root must be ignored (not a directory).
+		await writeFile(join(tempDir, "README.md"), "# vault");
+
+		const scanned = await scanFolderIdentities(tempDir);
+		expect(scanned.sort((a, b) => a.folder.localeCompare(b.folder))).toEqual([
+			// SCP-style config remoteUrl folds to the same https identity the
+			// live round computes, so the reconcile can't re-add style duplicates.
+			{ identity: "https://github.com/jolliai/jolli", folder: "jolli" },
+			{ identity: "https://github.com/jolliai/jolliai", folder: "jolliai" },
+		]);
+	});
+
+	it("falls back to repoName, and skips identity-less / unparseable configs", async () => {
+		await writeFolder("local-only", { repoName: "local-only" });
+		await writeFolder("stripped", { version: 1, sortOrder: "date" });
+		await writeFolder("broken", null);
+		await mkdir(join(tempDir, "broken", ".jolli"), { recursive: true });
+		await writeFile(join(tempDir, "broken", ".jolli", "config.json"), "{ not json");
+
+		const scanned = await scanFolderIdentities(tempDir);
+		expect(scanned).toEqual([{ identity: "local-only", folder: "local-only" }]);
+	});
+
+	it("returns [] when the root cannot be read", async () => {
+		expect(await scanFolderIdentities(join(tempDir, "does-not-exist"))).toEqual([]);
+	});
+});
+
+describe("reconcileMappingAdditive", () => {
+	it("adds a missing on-disk folder while preserving existing rows", () => {
+		// mb_test shape: repos.json has only jolliai, but jolli exists on disk.
+		const loaded: RepoMappingFile = {
+			version: 1,
+			mappings: [{ repoIdentity: "https://github.com/jolliai/jolliai", folder: "jolliai" }],
+		};
+		const { merged, changed } = reconcileMappingAdditive(loaded, [
+			{ identity: "https://github.com/jolliai/jolliai", folder: "jolliai" },
+			{ identity: "git@github.com:jolliai/jolli", folder: "jolli" },
+		]);
+		expect(changed).toBe(true);
+		expect(merged.mappings).toEqual([
+			{ repoIdentity: "git@github.com:jolliai/jolli", folder: "jolli" },
+			{ repoIdentity: "https://github.com/jolliai/jolliai", folder: "jolliai" },
+		]);
+	});
+
+	it("is idempotent — a second pass over the same disk is a no-op", () => {
+		const loaded: RepoMappingFile = {
+			version: 1,
+			mappings: [
+				{ repoIdentity: "git@github.com:jolliai/jolli", folder: "jolli" },
+				{ repoIdentity: "https://github.com/jolliai/jolliai", folder: "jolliai" },
+			],
+		};
+		const result = reconcileMappingAdditive(loaded, [
+			{ identity: "https://github.com/jolliai/jolliai", folder: "jolliai" },
+			{ identity: "git@github.com:jolliai/jolli", folder: "jolli" },
+		]);
+		expect(result.changed).toBe(false);
+		expect(result.merged).toBe(loaded);
+	});
+
+	it("never deletes a row whose folder is absent on this device", () => {
+		// repos.json carries a peer's repo; this device has only jolliai locally.
+		const loaded: RepoMappingFile = {
+			version: 1,
+			mappings: [
+				{ repoIdentity: "https://github.com/jolliai/jolliai", folder: "jolliai" },
+				{ repoIdentity: "https://github.com/peer/only", folder: "peer-only" },
+			],
+		};
+		const { merged, changed } = reconcileMappingAdditive(loaded, [
+			{ identity: "https://github.com/jolliai/jolliai", folder: "jolliai" },
+		]);
+		expect(changed).toBe(false);
+		expect(merged.mappings.map((m) => m.repoIdentity)).toContain("https://github.com/peer/only");
+	});
+
+	it("skips an identity backed by more than one local folder (migrate-to-fresh case)", () => {
+		// Old + new folders share one remoteUrl → one identity. Guessing a row
+		// could point repos.json at the stale folder; defer to the per-repo path.
+		const { merged, changed } = reconcileMappingAdditive(emptyMapping(), [
+			{ identity: "https://github.com/jolliai/jolli", folder: "jolli" },
+			{ identity: "https://github.com/jolliai/jolli", folder: "jolli-2" },
+		]);
+		expect(changed).toBe(false);
+		expect(merged.mappings).toEqual([]);
+	});
+
+	it("adds a single-folder identity even when another identity is ambiguous", () => {
+		const { merged, changed } = reconcileMappingAdditive(emptyMapping(), [
+			{ identity: "dup", folder: "a" },
+			{ identity: "dup", folder: "a-2" },
+			{ identity: "unique", folder: "u" },
+		]);
+		expect(changed).toBe(true);
+		expect(merged.mappings).toEqual([{ repoIdentity: "unique", folder: "u" }]);
 	});
 });

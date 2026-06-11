@@ -69,11 +69,14 @@ import { LegacyMigration } from "./LegacyMigration.js";
 import { isPerDeviceJsonPath, MemoryBankBootstrap } from "./MemoryBankBootstrap.js";
 import { clearPendingLock, readPendingLock, writePendingLock } from "./PendingLockStore.js";
 import {
+	canonicalizeRepoMapping,
 	findRepoMappingConflicts,
 	loadRepoMapping,
 	type RepoMappingConflict,
+	reconcileMappingAdditive,
 	resolveOrAssignFolder,
 	saveRepoMapping,
+	scanFolderIdentities,
 } from "./RepoMapping.js";
 import { stageVault } from "./StageVault.js";
 import { acquireSyncLock, refreshSyncLockMtime, releaseSyncLock } from "./SyncLock.js";
@@ -1072,7 +1075,23 @@ export class SyncEngine {
 		// merge step (`mergeRepoMappingDoc`) does the detection, this
 		// path catches both the freshly-merged file AND any stale
 		// collisions left over from before P2#3 landed.
-		const mapping = await loadRepoMapping(ctx.memoryBankRoot);
+		// Reconcile `repos.json` with the repo folders actually on disk BEFORE
+		// resolving this round's repo. Each round otherwise only writes its own
+		// repo's row, so a folder whose first-bind round never reached this step
+		// (e.g. an older client whose migration deadlocked before the mapping
+		// write) stays missing from `repos.json` forever — and no other repo's
+		// round will ever add it back. The reconcile is additive only (never
+		// deletes a cross-device/-clone row) and skips identities backed by >1
+		// local folder (deferred to the authoritative per-repo path below).
+		//
+		// Canonicalize first: rows written before SSH→https transport folding
+		// carry the SCP-style identity, and the live identity (already
+		// canonical) would not match them — the same repo would get a second
+		// row and a bogus folder-collision warning below.
+		const loadedMapping = await loadRepoMapping(ctx.memoryBankRoot);
+		const canon = canonicalizeRepoMapping(loadedMapping);
+		const reconcile = reconcileMappingAdditive(canon.merged, await scanFolderIdentities(ctx.memoryBankRoot));
+		const mapping = reconcile.merged;
 		const mappingConflicts = findRepoMappingConflicts(mapping);
 		if (mappingConflicts.length > 0) {
 			for (const c of mappingConflicts) {
@@ -1094,16 +1113,24 @@ export class SyncEngine {
 			authoritativeFolder: ctx.repoFolderName,
 		});
 		const effectiveCtx: RoundContext = { ...ctx, repoFolderName: resolved.folder };
-		if (resolved.updatedMapping !== null) {
-			await saveRepoMapping(effectiveCtx.memoryBankRoot, resolved.updatedMapping);
-			// One log line covers both "new mapping" and "rewrote diverged
-			// mapping" — the engine doesn't care which one happened, only
-			// that `repos.json` is now consistent with disk.
+		// Persist when the canonicalize pass collapsed legacy rows, the
+		// reconcile added on-disk folders, OR `resolveOrAssignFolder` changed
+		// this round's repo. `resolved` already carries the
+		// canonicalized+reconciled mapping (it was fed `mapping`), so its
+		// `updatedMapping` supersedes the earlier results when non-null.
+		if (canon.changed || reconcile.changed || resolved.updatedMapping !== null) {
+			await saveRepoMapping(effectiveCtx.memoryBankRoot, resolved.updatedMapping ?? mapping);
+			// One log line covers "new mapping", "rewrote diverged mapping",
+			// "collapsed legacy duplicate rows", and "reconciled missing
+			// on-disk folders" — the engine doesn't care which one happened,
+			// only that `repos.json` is now consistent with disk.
 			log.info(
-				"repos.json: persisted folder=%s for repoIdentity=%s (authoritative=%s)",
+				"repos.json: persisted folder=%s for repoIdentity=%s (authoritative=%s, canonicalized=%s, reconciled=%s)",
 				resolved.folder,
 				ctx.repoIdentity,
 				ctx.repoFolderName,
+				canon.changed,
+				reconcile.changed,
 			);
 		}
 

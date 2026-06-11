@@ -86,6 +86,21 @@ describe("KBRepoDiscoverer.discoverRepos", () => {
 		expect(repos[0]?.isCurrentRepo).toBe(true);
 	});
 
+	it("matches current repo across SSH/https transports of the same remote", () => {
+		// Config persisted from an SSH clone, current checkout uses https
+		// (and vice versa). Without transport folding the discoverer called
+		// the current repo "foreign" even though KBPathResolver.isSameRepo
+		// reuses its folder — breaking current-repo highlighting and
+		// createReadStorageForCurrentRepo.
+		initializeKBFolder(join(parent, "sshstored"), "sshstored", "git@github.com:user/repo.git");
+		const fromHttps = discoverRepos(null, "https://github.com/user/repo.git", parent);
+		expect(fromHttps[0]?.isCurrentRepo).toBe(true);
+
+		initializeKBFolder(join(parent, "httpsstored"), "httpsstored", "https://github.com/other/thing.git");
+		const fromSsh = discoverRepos(null, "ssh://git@github.com:22/other/thing", parent);
+		expect(fromSsh.find((r) => r.repoName === "httpsstored")?.isCurrentRepo).toBe(true);
+	});
+
 	it("falls back to repoName when remote URL is missing on either side", () => {
 		initializeKBFolder(join(parent, "name-match"), "name-match", null);
 		initializeKBFolder(join(parent, "other"), "other", null);

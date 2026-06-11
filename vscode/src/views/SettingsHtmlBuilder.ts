@@ -195,7 +195,10 @@ export function buildSettingsHtml(nonce: string): string {
         <span class="hint">Push this Memory Bank to your <strong>private</strong> Personal Space. Requires Jolli sign-in.</span>
       </div>
 
-      <div class="settings-row column" id="syncAutoGroup">
+      <!-- Hidden for now: auto-sync stays functional for repos that already
+           enabled it (the script round-trips the saved value), but the toggle
+           is not user-facing until the feature is ready to surface. -->
+      <div class="settings-row column hidden" id="syncAutoGroup">
         <label class="settings-toggle">
           <input type="checkbox" id="autoSyncEnabled" />
           Auto-sync to Personal Space

@@ -158,6 +158,52 @@ class KBPathResolverTest {
         }
 
         @Test
+        fun `reuses folder when stored SSH remote matches the https clone of the same repo`() {
+            // Same repo, different clone transport. Before transport folding the
+            // SSH and https forms compared unequal and the resolver split the
+            // Memory Bank into myrepo / myrepo-2.
+            createKBFolder("myrepo", "git@github.com:user/myrepo.git")
+
+            val resolved = KBPathResolver.resolve(
+                "myrepo",
+                "https://github.com/user/myrepo.git",
+                tempDir.toString(),
+            )
+            resolved shouldBe tempDir.resolve("myrepo")
+        }
+
+        @Test
+        fun `reuses folder when stored https remote matches the ssh clone of the same repo`() {
+            createKBFolder("myrepo", "https://github.com/user/myrepo.git")
+
+            val resolved = KBPathResolver.resolve(
+                "myrepo",
+                "ssh://git@github.com:22/user/myrepo.git",
+                tempDir.toString(),
+            )
+            resolved shouldBe tempDir.resolve("myrepo")
+        }
+
+        @Test
+        fun `treats default ssh port as identical but a non-default port as a different repo`() {
+            createKBFolder("myrepo", "ssh://git@host.example:2222/user/myrepo.git")
+
+            // Same non-default port → same repo, folder reused.
+            KBPathResolver.resolve(
+                "myrepo",
+                "ssh://git@host.example:2222/user/myrepo",
+                tempDir.toString(),
+            ) shouldBe tempDir.resolve("myrepo")
+
+            // Different port → distinct self-hosted forge, must NOT reuse.
+            KBPathResolver.resolve(
+                "myrepo",
+                "ssh://git@host.example:2223/user/myrepo",
+                tempDir.toString(),
+            ) shouldNotBe tempDir.resolve("myrepo")
+        }
+
+        @Test
         fun `local repos match by name when both have no remote`() {
             createKBFolder("localproject", null)
 

@@ -39,19 +39,11 @@
  */
 
 import { execGit } from "../../../cli/src/core/GitOps.js";
-
-/**
- * Hosts whose owner/repo path is case-insensitive on the wire — clones with
- * different casing all resolve to the same repo. Lower-casing the path on
- * these hosts is required to make the canonical URL a stable identity key.
- * Add new entries only after confirming the host actually treats the path
- * as case-insensitive (assuming wrong here merges distinct repos).
- */
-const CASE_INSENSITIVE_PATH_HOSTS: ReadonlySet<string> = new Set([
-	"github.com",
-	"gitlab.com",
-	"bitbucket.org",
-]);
+// Shared with the vault identity / folder-reuse canonicalizers in
+// cli/src/core/KBPathResolver.ts — one host list, so the server binding key
+// and the local identity comparers can never drift on which hosts get their
+// path case folded.
+import { CASE_INSENSITIVE_PATH_HOSTS } from "../../../cli/src/core/KBPathResolver.js";
 
 /** Returns the canonical, server-facing repo URL for the given workspace root. */
 export async function getCanonicalRepoUrl(
