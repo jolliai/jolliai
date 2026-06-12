@@ -302,6 +302,7 @@ const {
 		listReferences: vi.fn().mockResolvedValue([]),
 		openReferenceInBrowser: vi.fn().mockResolvedValue(undefined),
 		openReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
+		previewReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
 		removeReference: vi.fn().mockResolvedValue(undefined),
 	};
 
@@ -2009,6 +2010,7 @@ describe("Extension", () => {
 				mockBridge.listReferences.mockReset().mockResolvedValue([]);
 				mockBridge.openReferenceInBrowser.mockClear();
 				mockBridge.openReferenceMarkdown.mockClear();
+				mockBridge.previewReferenceMarkdown.mockClear();
 				mockBridge.removeReference.mockClear();
 				showWarningMessage.mockClear();
 			});
@@ -2107,6 +2109,33 @@ describe("Extension", () => {
 					expect.stringContaining("linear:ENG-missing"),
 				);
 				expect(mockBridge.openReferenceMarkdown).not.toHaveBeenCalled();
+			});
+
+			it("openReferenceForPreview: dispatches to bridge.previewReferenceMarkdown when mapKey resolves", async () => {
+				const info = {
+					mapKey: "github:owner/repo#42",
+					source: "github",
+				};
+				mockBridge.listReferences.mockResolvedValueOnce([info as never]);
+
+				const handler = getRegisteredCommand(
+					"jollimemory.openReferenceForPreview",
+				);
+				await handler("github:owner/repo#42");
+
+				expect(mockBridge.previewReferenceMarkdown).toHaveBeenCalledWith(info);
+			});
+
+			it("openReferenceForPreview: warns on miss without dispatching", async () => {
+				const handler = getRegisteredCommand(
+					"jollimemory.openReferenceForPreview",
+				);
+				await handler("linear:ENG-missing");
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("linear:ENG-missing"),
+				);
+				expect(mockBridge.previewReferenceMarkdown).not.toHaveBeenCalled();
 			});
 
 			it("ignoreReference: marks the entity ignored and refreshes plans", async () => {
@@ -7089,9 +7118,11 @@ describe("Extension", () => {
 		});
 
 		it("falls back to the orphan-branch snapshot when the plan has no filePath (I16)", async () => {
-			// Plan is in the snapshot but `filePath` is empty (committed-plan case
-			// where the source file path is intentionally blanked). The preview
-			// command must fall through to showPlanPreview rather than firing
+			// Plan is in the snapshot but `filePath` is empty. PlanService no
+			// longer blanks filePath for committed guard rows (they keep the
+			// on-disk path so Edit / Preview open the modified file), so this is
+			// a defensive registry-out-of-sync case. The preview command must
+			// fall through to showPlanPreview rather than firing
 			// markdown.showPreview against a missing local path. The signal is
 			// readPlanFromBranch being invoked, which only happens in the
 			// orphan-branch fallback.

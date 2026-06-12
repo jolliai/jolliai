@@ -10,6 +10,7 @@ const {
 	mockOpenExternal,
 	mockShowWarningMessage,
 	mockDeleteReferenceMarkdown,
+	mockExecuteCommand,
 } = vi.hoisted(() => ({
 	mockLoadPlansRegistry: vi.fn(),
 	mockLoadPlansRegistryWithStatus: vi.fn(),
@@ -20,6 +21,7 @@ const {
 	mockOpenExternal: vi.fn(),
 	mockShowWarningMessage: vi.fn(),
 	mockDeleteReferenceMarkdown: vi.fn(),
+	mockExecuteCommand: vi.fn(),
 }));
 
 // plans.lock passthrough — run the RMW body inline (no real lock file I/O on the
@@ -58,6 +60,7 @@ vi.mock("vscode", () => ({
 		file: vi.fn((p: string) => ({ toString: () => p })),
 	},
 	env: { openExternal: mockOpenExternal },
+	commands: { executeCommand: mockExecuteCommand },
 	window: {
 		showTextDocument: mockShowTextDocument,
 		showWarningMessage: mockShowWarningMessage,
@@ -76,6 +79,7 @@ import {
 	detectReferences,
 	openReferenceInBrowser,
 	openReferenceMarkdown,
+	previewReferenceMarkdown,
 	removeReference,
 } from "./ReferenceService.js";
 
@@ -621,5 +625,39 @@ describe("openReferenceMarkdown", () => {
 			sourceToolName: "y",
 		});
 		expect(mockShowTextDocument).toHaveBeenCalledOnce();
+	});
+});
+
+describe("previewReferenceMarkdown", () => {
+	it("opens the rendered markdown preview instead of a text editor", async () => {
+		mockExecuteCommand.mockResolvedValue(undefined);
+		mockShowTextDocument.mockClear();
+		await previewReferenceMarkdown({
+			kind: "reference",
+			source: "jira",
+			nativeId: "KAN-5",
+			mapKey: "jira:KAN-5",
+			title: "t",
+			url: "https://example.atlassian.net/browse/KAN-5",
+			sourcePath: "/repo/.jolli/jollimemory/references/jira/KAN-5.md",
+			branch: "main",
+			addedAt: "x",
+			updatedAt: "x",
+			lastModified: "x",
+			commitHash: null,
+			ignored: false,
+			sourceToolName: "y",
+		});
+		// Assert the preview targets the reference's own sourcePath, not just
+		// "some URI" — catches a regression that previews the wrong file. The
+		// mocked vscode.Uri.file stringifies back to the path it was given.
+		const previewCall = mockExecuteCommand.mock.calls.find(
+			(c) => c[0] === "markdown.showPreview",
+		);
+		expect(previewCall).toBeDefined();
+		expect((previewCall?.[1] as { toString(): string }).toString()).toBe(
+			"/repo/.jolli/jollimemory/references/jira/KAN-5.md",
+		);
+		expect(mockShowTextDocument).not.toHaveBeenCalled();
 	});
 });

@@ -51,6 +51,21 @@ describe("SidebarCssBuilder", () => {
 		expect(css).not.toContain(".kb-tag-memory");
 	});
 
+	it("declares the small iconbtn variant used by Plans & Notes inline actions", () => {
+		// Plans & Notes rows carry two trailing buttons (edit + remove); the
+		// --sm variant keeps them lighter than the default 24x22/14px iconbtn
+		// (the Memories rows' View Memory eye keeps the default size).
+		const css = buildSidebarCss();
+		expect(css).toMatch(/\.iconbtn--sm\s*{[^}]*width:\s*20px/);
+		expect(css).toMatch(/\.iconbtn--sm\s*{[^}]*height:\s*18px/);
+		expect(css).toMatch(/\.iconbtn--sm\s*{[^}]*font-size:\s*12px/);
+		// The glyph override is the part that actually shrinks the icon:
+		// codicon.css pins font: 16px on .codicon[class*='codicon-'] with
+		// higher specificity, so the button-level font-size alone never
+		// reaches the glyph.
+		expect(css).toMatch(/\.iconbtn--sm\s+\.codicon\s*{[^}]*font-size:\s*12px/);
+	});
+
 	it("bolds repo nodes (no longer has the dead repo-root banner styling)", () => {
 		// There's no Memory Bank header / banner row — repos sit at the top of
 		// the tree directly. The only surviving repo-level cue is

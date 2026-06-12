@@ -87,6 +87,7 @@ import {
 	detectReferences,
 	openReferenceInBrowser as openReferenceInBrowserImpl,
 	openReferenceMarkdown as openReferenceMarkdownImpl,
+	previewReferenceMarkdown as previewReferenceMarkdownImpl,
 	removeReference,
 } from "./core/ReferenceService.js";
 import {
@@ -2368,6 +2369,11 @@ export class JolliMemoryBridge {
 	/** Opens the per-reference markdown file in a VS Code editor tab. */
 	openReferenceMarkdown(info: ReferenceInfo): Promise<void> {
 		return openReferenceMarkdownImpl(info);
+	}
+
+	/** Opens the per-reference markdown file in the rendered markdown preview. */
+	previewReferenceMarkdown(info: ReferenceInfo): Promise<void> {
+		return previewReferenceMarkdownImpl(info);
 	}
 }
 

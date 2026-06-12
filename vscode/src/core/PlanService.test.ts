@@ -1075,9 +1075,12 @@ describe("PlanService", () => {
 
 			expect(plans).toHaveLength(1);
 			expect(plans[0].slug).toBe("modified-plan");
-			// Committed plan: filePath is empty, stat/title extraction skipped
-			expect(plans[0].filePath).toBe("");
-			expect(plans[0].lastModified).toBe("2025-06-01T00:00:00.000Z");
+			// Committed-then-modified guard: filePath keeps the on-disk path and
+			// title and lastModified reflect the file, so Edit / Preview open the
+			// same local content shown in the row — same contract as NoteService guards.
+			expect(plans[0].title).toBe("Modified Plan");
+			expect(plans[0].filePath).toBe(`${PLANS_DIR}/modified-plan.md`);
+			expect(plans[0].lastModified).toBe("2025-07-01T00:00:00.000Z");
 		});
 
 		it("filters out uncommitted plans whose source file has been deleted", async () => {

@@ -1118,18 +1118,45 @@ describe("SidebarScriptBuilder", () => {
 	describe("Plans & Notes / Changes context menus", () => {
 		it("Plans & Notes rows show 'Edit Plan' / 'Edit Note' depending on contextValue", () => {
 			const js = buildSidebarScript();
-			// ctx === 'note' picks editNote + 'Edit Note'; plan/plansItem fall through
-			// to editPlan + 'Edit Plan'. Both labels must appear in the bundled script.
+			// ctx === 'note' picks editNote + 'Edit Note'; plan picks
+			// editPlan + 'Edit Plan'. Both labels must appear in the bundled script.
 			expect(js).toContain("'Edit Plan'");
 			expect(js).toContain("'Edit Note'");
-			expect(js).toContain("'jollimemory.editPlan'");
 			expect(js).toContain("'jollimemory.editNote'");
+			expect(js).toContain("'jollimemory.editPlan'");
 		});
 
-		it("Plans & Notes context menu handler matches plan / plansItem / note contextValues", () => {
+		it("Plans & Notes context menu handler matches plan / note contextValues", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("ctx === 'plan' || ctx === 'note'");
+		});
+
+		it("plan / note context menus carry the unified Preview / Edit / Remove entries", () => {
+			const js = buildSidebarScript();
+			// Preview re-posts the row-click message (rawMessage), Edit and
+			// Remove go through the generic command bridge. The same 'Preview'
+			// and 'Remove' labels are shared with the reference menu.
+			expect(js).toContain("'Preview'");
+			expect(js).toContain("'jollimemory.removePlan'");
+			expect(js).toContain("'jollimemory.removeNote'");
+			expect(js).toMatch(
+				/\{ type: 'branch:openNote', noteId: id \}\s*:\s*\{ type: 'branch:openPlan', planId: id \}/,
+			);
+		});
+
+		it("reference context menu shows Preview / Edit Markdown / Open in Browser / Remove", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("'Edit Markdown'");
+			expect(js).toContain("'Open in Browser'");
+			expect(js).toMatch(/\{ type: 'branch:openReferencePreview',\s+mapKey: id \}/);
+			expect(js).toMatch(/\{ type: 'branch:openReferenceMarkdown',\s+mapKey: id \}/);
+			expect(js).toMatch(/\{ type: 'branch:ignoreReference',\s+mapKey: id \}/);
+		});
+
+		it("reference row click posts branch:openReferencePreview (click = preview, edit via menu)", () => {
 			const js = buildSidebarScript();
 			expect(js).toContain(
-				"ctx === 'plan' || ctx === 'plansItem' || ctx === 'note'",
+				"vscode.postMessage({ type: 'branch:openReferencePreview', mapKey: id });",
 			);
 		});
 
@@ -1902,6 +1929,37 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toMatch(
 				/ctx\s*===\s*'note'[\s\S]{0,150}ctx\s*===\s*'reference'/,
 			);
+		});
+
+		it("edit button (data-inline='edit') renders left of the trash button with the small variant", () => {
+			const js = buildSidebarScript();
+			const fnStart = js.indexOf("function renderPlanRow");
+			const fnEnd = js.indexOf("function renderConversationRow", fnStart);
+			const body = js.slice(fnStart, fnEnd);
+			// ✎ before 🗑 inside the row's inline-actions.
+			const editIdx = body.indexOf("'data-inline': 'edit'");
+			const removeIdx = body.indexOf("'data-inline': 'remove'");
+			expect(editIdx).toBeGreaterThan(-1);
+			expect(removeIdx).toBeGreaterThan(editIdx);
+			expect(body).toContain("codicon-edit");
+			// BOTH trailing buttons use the small variant so they stay visually
+			// subordinate to the Memories rows' View Memory eye — a single
+			// occurrence would mean one of the two silently lost it.
+			const smCount = body.split("iconbtn iconbtn--sm").length - 1;
+			expect(smCount).toBe(2);
+			// Tooltip mirrors the context menu's per-type edit labels.
+			expect(body).toContain("'Edit Markdown'");
+			expect(body).toContain("'Edit Note'");
+			expect(body).toContain("'Edit Plan'");
+		});
+
+		it("edit button click routes by row contextValue, mirroring the context menu's edit entry", () => {
+			const js = buildSidebarScript();
+			// Pin the ctx → target PAIRING, not just co-occurrence — a swapped
+			// ternary (note → editPlan) must fail these, so each regex requires
+			// the ctx check immediately before its own target.
+			expect(js).toMatch(/action\s*===\s*'edit'[\s\S]{0,400}ctx\s*===\s*'reference'[\s\S]{0,120}branch:openReferenceMarkdown/);
+			expect(js).toMatch(/action\s*===\s*'edit'[\s\S]{0,400}ctx\s*===\s*'note'\s*\?\s*'jollimemory\.editNote'\s*:\s*'jollimemory\.editPlan'/);
 		});
 	});
 

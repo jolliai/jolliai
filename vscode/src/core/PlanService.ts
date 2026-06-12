@@ -145,15 +145,19 @@ function toPlanInfo(entry: PlanEntry): PlanInfo | null {
 		return null;
 	}
 
-	const filePath = entry.commitHash === null ? entry.sourcePath : "";
+	// Keep the on-disk path for committed-then-modified guard rows too: the row
+	// is only visible because the source file changed after the commit, so Edit
+	// and Preview must open that local file — mirrors NoteService.toNoteInfo,
+	// which never blanks filePath for guard rows.
+	const filePath = entry.sourcePath;
 
 	let title = entry.title;
-	if (entry.commitHash === null && existsSync(entry.sourcePath)) {
+	if (existsSync(entry.sourcePath)) {
 		title = extractTitle(entry.sourcePath);
 	}
 
 	let lastModified = entry.updatedAt;
-	if (entry.commitHash === null && existsSync(entry.sourcePath)) {
+	if (existsSync(entry.sourcePath)) {
 		try {
 			lastModified = statSync(entry.sourcePath).mtime.toISOString();
 		} catch {

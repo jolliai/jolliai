@@ -2030,12 +2030,12 @@ export function buildSidebarScript(): string {
     // Description preview is intentionally not surfaced — see PlansTreeProvider
     // ReferenceItem comment for the rationale.
     kids.push(el('hr'));
-    // Single action row: Open in <Source>. The trash / open-markdown actions
-    // already live as inline buttons on the row itself (see renderPlanRow),
-    // so the card stays focused on jumping to the upstream record.
+    // Single action row: Open in <Source>. Remove lives as the row's inline
+    // 🗑 button and Preview / Edit Markdown in the context menu, so the card
+    // stays focused on jumping to the upstream record.
     const openLabel = SOURCE_TITLES[h.source]
       ? 'Open in ' + SOURCE_TITLES[h.source]
-      : 'Open in browser';
+      : 'Open in Browser';
     const openLink = attachTextTip(
       el('span', {
         className: 'hc-link',
@@ -2821,16 +2821,28 @@ export function buildSidebarScript(): string {
     if (item.description) {
       kids.push(el('span', { className: 'desc', text: item.description }));
     }
-    // Inline-actions: only the trash (remove) button. The edit button was
-    // dropped because the row click already opens the .md file for editing
-    // (see click delegation: ctx 'plan' → editPlan, ctx 'note' → editNote),
-    // so a separate edit affordance was redundant.
+    // Inline-actions: ✎ (edit) then 🗑 (remove). Row click stays preview-only;
+    // the inline ✎ mirrors the context menu's edit entry ('Edit Plan' /
+    // 'Edit Note' / 'Edit Markdown') as a faster affordance. Both buttons use
+    // the small iconbtn variant so the trailing icons read lighter than the
+    // Memories rows' View Memory eye instead of dominating the row.
+    const editLabel = isReference ? 'Edit Markdown' : isNote ? 'Edit Note' : 'Edit Plan';
     kids.push(
       el('span', { className: 'inline-actions' }, [
         attachTextTip(
           el('button', {
             type: 'button',
-            className: 'iconbtn',
+            className: 'iconbtn iconbtn--sm',
+            'data-inline': 'edit',
+            'data-id': item.id,
+            'aria-label': editLabel,
+          }, [el('i', { className: 'codicon codicon-edit' })]),
+          editLabel,
+        ),
+        attachTextTip(
+          el('button', {
+            type: 'button',
+            className: 'iconbtn iconbtn--sm',
             'data-inline': 'remove',
             'data-id': item.id,
             'aria-label': 'Remove',
@@ -3241,34 +3253,11 @@ export function buildSidebarScript(): string {
     }, kids), item.tooltip || '');
   }
 
-  function renderInlineButtons(item) {
-    const ctx = item.contextValue || '';
-    // Match contextValue strings emitted by PlansTreeProvider — common values are 'plan', 'note', 'plansItem'.
-    // Match contextValue strings emitted by FilesTreeProvider — common values are 'file', 'fileChange'.
-    // If real contextValue differs, this just returns null and falls through to plain row.
-    const isPlanLike = ctx === 'plan' || ctx === 'note' || ctx === 'plansItem';
-    const isFile = ctx === 'file' || ctx === 'fileChange';
-    const isReference = ctx === 'reference';
-    if (isPlanLike) {
-      return el('span', { className: 'inline-actions' }, [
-        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'edit', 'data-id': item.id, text: '✎' }), 'Edit'),
-        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'remove', 'data-id': item.id, text: '🗑' }), 'Remove'),
-      ]);
-    }
-    if (isReference) {
-      return el('span', { className: 'inline-actions' }, [
-        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'open-reference', 'data-id': item.id, text: '↗' }), 'Open in browser'),
-        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'ignore-reference', 'data-id': item.id, text: '🗑' }), 'Remove'),
-      ]);
-    }
-    if (isFile) {
-      return el('span', { className: 'inline-actions' }, [
-        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'discard', 'data-id': item.id, text: '↻' }), 'Discard'),
-      ]);
-    }
-    return null;
-  }
-
+  // Fallback renderer for sections without a dedicated row function. Every
+  // Branch-tab section has one (renderConversationRow / renderPlanRow /
+  // renderChangeRow / renderCommitRow), so this renders a plain row with no
+  // inline actions — the per-row buttons (🗑 remove, ↻ discard, …) all live
+  // in the dedicated renderers.
   function renderTreeItem(item, depth) {
     const kids = [
       el('span', { className: 'twirl' }),
@@ -3278,8 +3267,6 @@ export function buildSidebarScript(): string {
     if (item.description) {
       kids.push(el('span', { className: 'desc', text: item.description }));
     }
-    const inline = renderInlineButtons(item);
-    if (inline) kids.push(inline);
     return attachTextTip(el('div', {
       className: 'tree-node',
       'data-indent': String(depth),
@@ -3422,7 +3409,8 @@ export function buildSidebarScript(): string {
       return;
     }
 
-    // Inline buttons on tree nodes (edit, remove, discard).
+    // Inline buttons on tree nodes (edit, remove, discard, viewSummary,
+    // copy-recall).
     const inline = e.target.closest('[data-inline]');
     if (inline) {
       const action = inline.getAttribute('data-inline');
@@ -3430,8 +3418,15 @@ export function buildSidebarScript(): string {
       const row = inline.closest('.tree-node');
       const ctx = row ? row.getAttribute('data-context') : '';
       if (action === 'edit') {
-        const cmd = ctx === 'note' ? 'jollimemory.editNote' : 'jollimemory.editPlan';
-        vscode.postMessage({ type: 'command', command: cmd, args: [id] });
+        // Same three-way routing as the context menu's edit entry: reference
+        // markdown is host-resolved by mapKey (branch:openReferenceMarkdown),
+        // plan / note go through their editor commands.
+        if (ctx === 'reference') {
+          vscode.postMessage({ type: 'branch:openReferenceMarkdown', mapKey: id });
+        } else {
+          const cmd = ctx === 'note' ? 'jollimemory.editNote' : 'jollimemory.editPlan';
+          vscode.postMessage({ type: 'command', command: cmd, args: [id] });
+        }
       }
       if (action === 'remove') {
         // Plan / Note / Reference rows all share the trash button rendered by
@@ -3479,12 +3474,6 @@ export function buildSidebarScript(): string {
         // for both workspace and foreign hashes.
         vscode.postMessage({ type: 'command', command: 'jollimemory.copyRecallPrompt', args: [id] });
       }
-      if (action === 'open-reference') {
-        vscode.postMessage({ type: 'branch:openReference', mapKey: id });
-      }
-      if (action === 'ignore-reference') {
-        vscode.postMessage({ type: 'branch:ignoreReference', mapKey: id });
-      }
       e.stopPropagation();
       return;
     }
@@ -3500,18 +3489,21 @@ export function buildSidebarScript(): string {
     if (row) {
       const ctx = row.getAttribute('data-context');
       const id = row.getAttribute('data-id');
-      // Plan vs note dispatch: each TreeItem command differs in the
-      // extension (editPlan / editNote), and routing them through the
-      // wrong command treats the id as the wrong kind of identifier
-      // (note id ≠ plan slug → editPlan would 404 on noteId.md).
-      if (ctx === 'plan' || ctx === 'plansItem') {
+      // Plan vs note dispatch: the host preview commands differ
+      // (openPlanForPreview / openNoteForPreview), and routing them through
+      // the wrong message treats the id as the wrong kind of identifier
+      // (note id ≠ plan slug → the plan path would 404 on noteId.md).
+      if (ctx === 'plan') {
         vscode.postMessage({ type: 'branch:openPlan', planId: id });
       }
       if (ctx === 'note') {
         vscode.postMessage({ type: 'branch:openNote', noteId: id });
       }
       if (ctx === 'reference') {
-        vscode.postMessage({ type: 'branch:openReferenceMarkdown', mapKey: id });
+        // Row click previews the reference markdown — same click-equals-preview
+        // contract as plan / note rows. The editor path (openReferenceMarkdown)
+        // moved to the context menu's 'Edit Markdown'.
+        vscode.postMessage({ type: 'branch:openReferencePreview', mapKey: id });
       }
       if (ctx === 'file' || ctx === 'fileChange') {
         // Forward all three fields the openFileChange command needs.
@@ -3666,9 +3658,11 @@ export function buildSidebarScript(): string {
   // it everywhere and only show a custom menu when a recognised row is hit.
   // Empty area / unhandled rows (e.g. commitFile children) get nothing.
   //
-  //   - Plans & Notes rows ('plan' / 'plansItem' / 'note'):
-  //       single 'Edit Plan' or 'Edit Note' item — mirrors the inline ✎
-  //       button which dispatches editPlan / editNote based on contextValue.
+  //   - Plans & Notes rows ('plan' / 'note' / 'reference'):
+  //       unified Preview / Edit … / ─ / Remove menu. Preview re-posts the
+  //       same message the row click sends; Edit opens the source file in a
+  //       text editor; Remove mirrors the inline 🗑 button. Reference rows
+  //       additionally expose 'Open in Browser' for the upstream record.
   //   - Changes rows ('file' / 'fileChange'):
   //       single 'Discard Changes' item — routed through the same
   //       'branch:discardFile' message the inline discard button uses, so
@@ -3711,18 +3705,26 @@ export function buildSidebarScript(): string {
       showContextMenu(e.clientX, e.clientY, items);
       return;
     }
-    if (ctx === 'plan' || ctx === 'plansItem' || ctx === 'note') {
-      const cmd   = ctx === 'note' ? 'jollimemory.editNote' : 'jollimemory.editPlan';
-      const label = ctx === 'note' ? 'Edit Note' : 'Edit Plan';
+    if (ctx === 'plan' || ctx === 'note') {
+      const isNote = ctx === 'note';
       showContextMenu(e.clientX, e.clientY, [
-        { label: label, command: cmd, args: [id] },
+        { label: 'Preview',
+          rawMessage: isNote
+            ? { type: 'branch:openNote', noteId: id }
+            : { type: 'branch:openPlan', planId: id } },
+        { label: isNote ? 'Edit Note' : 'Edit Plan',
+          command: isNote ? 'jollimemory.editNote' : 'jollimemory.editPlan', args: [id] },
+        { separator: true },
+        { label: 'Remove',
+          command: isNote ? 'jollimemory.removeNote' : 'jollimemory.removePlan', args: [id] },
       ]);
       return;
     }
     if (ctx === 'reference') {
       showContextMenu(e.clientX, e.clientY, [
-        { label: 'Open in browser', rawMessage: { type: 'branch:openReference',         mapKey: id } },
-        { label: 'Open Markdown',   rawMessage: { type: 'branch:openReferenceMarkdown', mapKey: id } },
+        { label: 'Preview',         rawMessage: { type: 'branch:openReferencePreview',  mapKey: id } },
+        { label: 'Edit Markdown',   rawMessage: { type: 'branch:openReferenceMarkdown', mapKey: id } },
+        { label: 'Open in Browser', rawMessage: { type: 'branch:openReference',         mapKey: id } },
         { separator: true },
         { label: 'Remove',          rawMessage: { type: 'branch:ignoreReference',       mapKey: id } },
       ]);

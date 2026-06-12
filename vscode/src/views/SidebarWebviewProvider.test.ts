@@ -803,8 +803,8 @@ describe("SidebarWebviewProvider", () => {
 	});
 
 	it("forwards branch:openReferenceMarkdown via jollimemory.openReferenceMarkdown", () => {
-		// Context-menu "Open Markdown" path — opens the on-disk markdown copy
-		// rather than the browser URL.
+		// Context-menu "Edit Markdown" path — opens the on-disk markdown copy
+		// in a text editor rather than the browser URL.
 		const view = makeMockView();
 		const exec = vi.fn();
 		const provider = new SidebarWebviewProvider({
@@ -827,6 +827,34 @@ describe("SidebarWebviewProvider", () => {
 		expect(exec).toHaveBeenCalledWith(
 			"jollimemory.openReferenceMarkdown",
 			"jira:KAN-5",
+		);
+	});
+
+	it("forwards branch:openReferencePreview via jollimemory.openReferenceForPreview", () => {
+		// Sidebar row-click path — reference rows preview on click like
+		// plan/note rows; the editor path stays on branch:openReferenceMarkdown.
+		const view = makeMockView();
+		const exec = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: exec,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: { fsPath: "/mock", with: () => ({}) } as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "branch:openReferencePreview",
+			mapKey: "linear:PROJ-1528",
+		});
+		expect(exec).toHaveBeenCalledWith(
+			"jollimemory.openReferenceForPreview",
+			"linear:PROJ-1528",
 		);
 	});
 

@@ -352,6 +352,7 @@ vi.mock("./core/ReferenceService.js", () => ({
 	removeReference: vi.fn().mockResolvedValue(undefined),
 	openReferenceInBrowser: vi.fn().mockResolvedValue(true),
 	openReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
+	previewReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("./util/CommitMessageUtils.js", () => ({
@@ -3463,6 +3464,25 @@ describe("JolliMemoryBridge", () => {
 			await bridge.openReferenceMarkdown(info);
 
 			expect(openReferenceMarkdown).toHaveBeenCalledWith(info);
+		});
+
+		it("previewReferenceMarkdown() delegates to previewReferenceMarkdown impl", async () => {
+			const { previewReferenceMarkdown } = await import(
+				"./core/ReferenceService.js"
+			);
+			(previewReferenceMarkdown as ReturnType<typeof vi.fn>).mockResolvedValue(
+				undefined,
+			);
+			const info = {
+				kind: "reference",
+				source: "notion",
+				sourcePath: "/x.md",
+			} as unknown as Parameters<typeof bridge.previewReferenceMarkdown>[0];
+			const bridge = makeBridge();
+
+			await bridge.previewReferenceMarkdown(info);
+
+			expect(previewReferenceMarkdown).toHaveBeenCalledWith(info);
 		});
 	});
 
