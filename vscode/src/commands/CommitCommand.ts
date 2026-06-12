@@ -25,7 +25,7 @@ import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import type { CommitsStore } from "../stores/CommitsStore.js";
 import type { FilesStore } from "../stores/FilesStore.js";
 import type { StatusStore } from "../stores/StatusStore.js";
-import { isWorkerBusy } from "../util/LockUtils.js";
+import { isWorkerBlockingBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
 import type { StatusBarManager } from "../util/StatusBarManager.js";
 
@@ -70,8 +70,10 @@ export class CommitCommand {
 	 * Called when the user clicks [✦] in the Changes panel header.
 	 */
 	async execute(): Promise<void> {
-		// Guard: block while the post-commit Worker holds the lock
-		if (await isWorkerBusy(this.workspaceRoot)) {
+		// Guard: block while the post-commit Worker holds the lock for a summary
+		// run. The ingest phase (Memory Bank wiki update) is exempt — it never
+		// touches the commit pipeline, so committing during it is safe.
+		if (await isWorkerBlockingBusy(this.workspaceRoot)) {
 			vscode.window.showWarningMessage(
 				"Jolli Memory: AI summary is being generated. Please wait a moment.",
 			);

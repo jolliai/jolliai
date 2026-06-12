@@ -20,7 +20,7 @@ import type { CommitsStore } from "../stores/CommitsStore.js";
 import type { FilesStore } from "../stores/FilesStore.js";
 import type { StatusStore } from "../stores/StatusStore.js";
 import type { BranchCommit } from "../Types.js";
-import { isWorkerBusy } from "../util/LockUtils.js";
+import { isWorkerBlockingBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
 import type { StatusBarManager } from "../util/StatusBarManager.js";
 
@@ -55,8 +55,12 @@ export class SquashCommand {
 	 * Called when the user clicks [⊞ Squash] in the Branch History panel header.
 	 */
 	async execute(): Promise<void> {
-		// Guard: block while the post-commit Worker holds the lock
-		if (await isWorkerBusy(this.workspaceRoot)) {
+		// Guard: block while the post-commit Worker holds the lock for a summary
+		// run (squashing a commit mid-pipeline races the worker's history reads).
+		// The ingest phase (Memory Bank wiki update) is exempt — it never touches
+		// the code branch; a squash landed during it is enqueued and drained by
+		// the chain-spawned successor worker.
+		if (await isWorkerBlockingBusy(this.workspaceRoot)) {
 			vscode.window.showWarningMessage(
 				"Jolli Memory: AI summary is being generated. Please wait a moment.",
 			);

@@ -970,16 +970,48 @@ describe("SidebarScriptBuilder", () => {
 		it("disables changes-commit-ai while a background AI summary is in progress", () => {
 			const js = buildSidebarScript();
 			// Even with selected changes, the Commit-AI button must stay
-			// disabled when state.workerBusy is true — kicking off another
-			// LLM call while the queue worker is mid-flight risks racing
-			// the same provider / hitting rate limits. Discard stays
-			// available because it's purely local (no LLM).
+			// disabled during a summary run — kicking off another LLM call
+			// while the queue worker is mid-summary risks racing the same
+			// provider / hitting rate limits. The check is phase-aware
+			// (isWorkerBlocking), NOT raw state.workerBusy: the ingest phase
+			// (Memory Bank wiki update) must not block committing. Discard
+			// stays available because it's purely local (no LLM).
 			expect(js).toMatch(
-				/iconButton\('changes-commit-ai',[\s\S]*?disabled:\s*noneSelected\s*\|\|\s*state\.workerBusy/,
+				/iconButton\('changes-commit-ai',[\s\S]*?disabled:\s*noneSelected\s*\|\|\s*isWorkerBlocking\(\)/,
 			);
-			// Discard's disabled condition must NOT include workerBusy.
+			// Discard's disabled condition must NOT include the busy check.
 			expect(js).toMatch(
 				/iconButton\('changes-discard',[\s\S]*?disabled:\s*noneSelected\s*\}/,
+			);
+		});
+
+		it("disables commits-squash while a background AI summary is in progress", () => {
+			const js = buildSidebarScript();
+			// The squash button must mirror the SquashCommand handler gate and the
+			// jollimemory.workerBusy command enablement: disabled during a blocking
+			// worker run (ingest exempt via isWorkerBlocking), on top of the
+			// 2+-selected threshold. Without this, the button stays clickable
+			// mid-summary even though the handler refuses — UI/handler mismatch.
+			expect(js).toMatch(
+				/iconButton\('commits-squash',[\s\S]*?disabled:\s*selectedCount < 2\s*\|\|\s*isWorkerBlocking\(\)/,
+			);
+			// Push Branch is not worker-gated at all.
+			expect(js).toMatch(
+				/iconButton\('commits-push-branch', 'Push Branch',\s*'cloud-upload'\),/,
+			);
+		});
+
+		it("exempts the ingest phase from disabling commit actions", () => {
+			const js = buildSidebarScript();
+			// isWorkerBlocking is the single busy predicate for commit actions:
+			// busy in any phase except ingest.
+			expect(js).toContain(
+				"return state.workerBusy && state.workerPhase !== 'ingest';",
+			);
+			// Both commit entry points go through it: the Commit-AI icon button
+			// (asserted above) and the labelled Commit Memory button.
+			expect(js).toMatch(
+				/const disabled = selectedCount === 0 \|\| isWorkerBlocking\(\);/,
 			);
 		});
 	});
@@ -2089,5 +2121,20 @@ describe("SidebarScriptBuilder", () => {
 	it("handles the worker:phase message channel", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("case 'worker:phase'");
+	});
+
+	it("re-renders toolbar AND branch when worker:phase changes on the Branch tab", () => {
+		const js = buildSidebarScript();
+		// The phase drives the commit buttons' disabled state (ingest is exempt
+		// from blocking — isWorkerBlocking), so renderToolbar alone is not
+		// enough: section actions live in renderBranch.
+		const handlerStart = js.indexOf("case 'worker:phase'");
+		const handlerEnd = js.indexOf("case ", handlerStart + 1);
+		expect(handlerStart).toBeGreaterThan(-1);
+		const body = js.slice(handlerStart, handlerEnd);
+		// Idempotent: skip re-render when the phase did not change.
+		expect(body).toContain("if (state.workerPhase === nextPhase) break;");
+		expect(body).toContain("renderToolbar()");
+		expect(body).toContain("renderBranch()");
 	});
 });

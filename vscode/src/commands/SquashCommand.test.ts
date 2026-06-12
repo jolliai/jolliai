@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { isWorkerBusy } = vi.hoisted(() => ({
-	isWorkerBusy: vi.fn(),
+const { isWorkerBlockingBusy } = vi.hoisted(() => ({
+	isWorkerBlockingBusy: vi.fn(),
 }));
 
 const { info, warn, error, debug } = vi.hoisted(() => ({
@@ -89,7 +89,7 @@ vi.mock("vscode", () => ({
 }));
 
 vi.mock("../util/LockUtils.js", () => ({
-	isWorkerBusy,
+	isWorkerBlockingBusy,
 }));
 
 vi.mock("../util/Logger.js", () => ({
@@ -154,8 +154,8 @@ function makeDeps(selected = [makeCommit("cccc3333"), makeCommit("bbbb2222")]) {
 
 describe("SquashCommand", () => {
 	beforeEach(() => {
-		isWorkerBusy.mockReset();
-		isWorkerBusy.mockResolvedValue(false);
+		isWorkerBlockingBusy.mockReset();
+		isWorkerBlockingBusy.mockResolvedValue(false);
 		showWarningMessage.mockReset();
 		showErrorMessage.mockReset();
 		showInformationMessage.mockReset();
@@ -168,7 +168,7 @@ describe("SquashCommand", () => {
 	});
 
 	it("blocks while the worker is busy", async () => {
-		isWorkerBusy.mockResolvedValue(true);
+		isWorkerBlockingBusy.mockResolvedValue(true);
 		const deps = makeDeps();
 		const command = new SquashCommand(
 			deps.bridge as never,

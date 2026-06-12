@@ -707,10 +707,16 @@ export function buildSidebarScript(): string {
       case 'worker:phase': {
         // Per-phase label for the post-commit Worker. Independent of
         // worker:busy; only 'ingest' is surfaced today, anything else clears to
-        // the default summary label. Only the Branch tab reacts.
-        state.workerPhase = (msg.phase === 'ingest') ? 'ingest' : null;
+        // the default summary label. Only the Branch tab reacts. renderBranch
+        // runs too because the commit buttons' disabled state depends on the
+        // phase (ingest is exempt from blocking — see isWorkerBlocking), not
+        // just on worker:busy.
+        const nextPhase = (msg.phase === 'ingest') ? 'ingest' : null;
+        if (state.workerPhase === nextPhase) break;
+        state.workerPhase = nextPhase;
         if (state.activeTab === 'branch') {
           renderToolbar();
+          renderBranch();
         }
         break;
       }
@@ -2647,11 +2653,19 @@ export function buildSidebarScript(): string {
     }, sectionKids);
   }
 
+  function isWorkerBlocking() {
+    // Busy with a phase that must disable commit actions. The ingest phase
+    // (Memory Bank wiki update, ~80s+) is exempt: it never touches the commit
+    // pipeline, so commits landed during it are simply queued for the next
+    // worker. Mirrors isWorkerBlockingBusy in util/LockUtils.ts.
+    return state.workerBusy && state.workerPhase !== 'ingest';
+  }
+
   function renderCommitMemoryButton() {
     const selectedCount = branchData.changes.filter(function(c) {
       return !!c.isSelected;
     }).length;
-    const disabled = selectedCount === 0 || state.workerBusy;
+    const disabled = selectedCount === 0 || isWorkerBlocking();
     const btn = el('button', {
       type: 'button',
       className: 'commit-memory-btn',
@@ -2686,16 +2700,17 @@ export function buildSidebarScript(): string {
       // that threshold. Re-enables itself on the next branch:changesData
       // push (which always follows a checkbox toggle on the host side).
       // Commit-AI is also disabled while a background AI summary is in
-      // progress (state.workerBusy) — kicking off another LLM call while
-      // the queue worker is mid-flight risks racing the same provider /
-      // hitting rate limits. Discard is local-only so it stays available.
+      // progress (isWorkerBlocking) — kicking off another LLM call while
+      // the queue worker is mid-summary risks racing the same provider /
+      // hitting rate limits. The ingest phase is exempt (see isWorkerBlocking).
+      // Discard is local-only so it stays available.
       const selectedCount = branchData.changes.filter(function(c) {
         return !!c.isSelected;
       }).length;
       const noneSelected = selectedCount === 0;
       return [
         iconButton('changes-select-all', 'Select/Deselect All Files', 'check-all'),
-        iconButton('changes-commit-ai',  'Commit (AI message)',       'sparkle',  { disabled: noneSelected || state.workerBusy }),
+        iconButton('changes-commit-ai',  'Commit (AI message)',       'sparkle',  { disabled: noneSelected || isWorkerBlocking() }),
         iconButton('changes-discard',    'Discard Selected Changes',  'discard',  { disabled: noneSelected }),
       ];
     }
@@ -2710,6 +2725,10 @@ export function buildSidebarScript(): string {
         // button below that threshold; it auto-re-enables when the user picks
         // a 2nd commit because branch:commitsData triggers renderBranch which
         // rebuilds these section actions with a fresh selectedCount.
+        // Squash is also disabled while a blocking worker run is in progress
+        // (isWorkerBlocking, ingest exempt) so the button matches the
+        // SquashCommand handler gate and the jollimemory.workerBusy command
+        // enablement — same pairing as changes-commit-ai above.
         // Push Branch is also exposed in multi mode now that PushCommand
         // supports any commit count >= 1 — squashing remains a user choice,
         // not a precondition.
@@ -2718,7 +2737,7 @@ export function buildSidebarScript(): string {
         }).length;
         return [
           iconButton('commits-select-all', 'Select/Deselect All Commits', 'check-all'),
-          iconButton('commits-squash',     'Squash Selected',             'git-merge', { disabled: selectedCount < 2 }),
+          iconButton('commits-squash',     'Squash Selected',             'git-merge', { disabled: selectedCount < 2 || isWorkerBlocking() }),
           iconButton('commits-push-branch', 'Push Branch',                'cloud-upload'),
         ];
       }
