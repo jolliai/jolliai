@@ -10,8 +10,14 @@ import ai.jolli.jollimemory.core.MigrationState
 import ai.jolli.jollimemory.core.FolderStorage
 import ai.jolli.jollimemory.core.OrphanBranchStorage
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.JolliMemoryIcons
 import ai.jolli.jollimemory.bridge.GitOps
+import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
+import ai.jolli.jollimemory.sync.SyncActivation
+import ai.jolli.jollimemory.sync.SyncErrorCode
+import ai.jolli.jollimemory.sync.SyncState
+import ai.jolli.jollimemory.sync.SyncStatusDetail
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.intellij.icons.AllIcons
@@ -41,6 +47,7 @@ import com.intellij.openapi.vfs.newvfs.events.VFileMoveEvent
 import git4idea.repo.GitRepository
 import git4idea.repo.GitRepositoryChangeListener
 import com.intellij.ui.ColoredTreeCellRenderer
+import com.intellij.ui.JBColor
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.treeStructure.Tree
@@ -65,6 +72,7 @@ import javax.swing.JToggleButton
 import javax.swing.JTree
 import javax.swing.SwingConstants
 import javax.swing.SwingUtilities
+import javax.swing.Timer
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 import java.awt.CardLayout
@@ -107,7 +115,15 @@ class KBExplorerPanel(
     private var searchQuery: String = ""
 
     private val statusListener: () -> Unit
+    private val syncStateListener: (SyncState, SyncStatusDetail?) -> Unit
     private val busConnection: MessageBusConnection
+
+    /** Inline sync progress/result indicator, shown in the toolbar row next to the
+     *  view-toggle buttons. Mirrors the IDE status-bar widget so the user gets
+     *  immediate feedback after clicking "Sync to Personal Space". */
+    private val syncStatusLabel = JLabel().apply { isVisible = false }
+    /** Auto-clears the transient "Synced" message after a short delay. */
+    private var syncClearTimer: Timer? = null
 
     data class KBNodeData(
         val path: Path,
@@ -174,6 +190,30 @@ class KBExplorerPanel(
         }
         toolbar.add(btnReset)
         toolbar.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(4)))
+
+        // Sync to Personal Space — mirrors the cloud-upload button on VS Code's
+        // Memory Bank toolbar (vscode/src/views/SidebarScriptBuilder.ts), which
+        // fires the same `jollimemory.syncNow` flow. The button is deliberately
+        // independent of the auto-sync toggle: it is always shown, and the
+        // handler only points the user to sign-in when sync is dormant.
+        val btnSync = JButton(JolliMemoryIcons.CloudUpload).apply {
+            toolTipText = "Sync to Personal Space"
+            isBorderPainted = false
+            isFocusPainted = false
+            isContentAreaFilled = false
+            preferredSize = Dimension(JBUI.scale(22), JBUI.scale(22))
+            maximumSize = Dimension(JBUI.scale(22), JBUI.scale(22))
+            margin = JBUI.emptyInsets()
+            addActionListener {
+                ApplicationManager.getApplication().executeOnPooledThread { syncToPersonalSpace() }
+            }
+        }
+        toolbar.add(btnSync)
+        toolbar.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(4)))
+        // Inline sync status — same row as the Tree/Timeline toggle and the sync
+        // button. Hidden until the first sync state arrives.
+        toolbar.add(syncStatusLabel)
+        toolbar.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(4)))
         toolbar.add(searchField)
 
         contentPanel.add(treePanel, ViewMode.TREE.name)
@@ -186,6 +226,12 @@ class KBExplorerPanel(
 
         statusListener = { ApplicationManager.getApplication().executeOnPooledThread { refresh() } }
         service.addStatusListener(statusListener)
+
+        // Mirror sync state into the toolbar indicator (progress + result).
+        syncStateListener = { state, detail ->
+            SwingUtilities.invokeLater { updateSyncStatus(state, detail) }
+        }
+        service.addSyncStateListener(syncStateListener)
 
         // Watch KB parent directory for file changes across all repos
         busConnection = ApplicationManager.getApplication().messageBus.connect()
@@ -899,6 +945,110 @@ class KBExplorerPanel(
         }
     }
 
+    /**
+     * Manual "Sync to Personal Space" — IntelliJ port of the
+     * `jollimemory.syncNow` command (vscode/src/sync/SyncCommands.ts).
+     *
+     * Parity with VS Code's `runtime.ensureBuilt()` gate:
+     *   - Not signed in → the orchestrator can never be built, so point the
+     *     user at sign-in instead of silently doing nothing.
+     *   - Signed in but orchestrator not yet built (e.g. enabled after the
+     *     last reconcile) → lazy-build it via [SyncActivation.reconcileSync].
+     *   - Then route through [JolliMemoryService.requestManualSync], which
+     *     coalesces with any in-flight round.
+     */
+    private fun syncToPersonalSpace() {
+        JM.info("syncToPersonalSpace: button clicked")
+        if (!JolliAuthService.isSignedIn()) {
+            JM.info("syncToPersonalSpace: not signed in — prompting sign-in, aborting")
+            com.intellij.notification.Notifications.Bus.notify(
+                com.intellij.notification.Notification(
+                    "JolliMemory",
+                    "Sync to Personal Space",
+                    "Memory Bank sync needs a Jolli sign-in. Open Settings → Memory Bank and sign in to Jolli, then try again.",
+                    com.intellij.notification.NotificationType.INFORMATION,
+                ),
+                project,
+            )
+            return
+        }
+        JM.info("syncToPersonalSpace: signed in; isSyncBuilt=${service.isSyncBuilt()}")
+        if (!service.isSyncBuilt()) {
+            JM.info("syncToPersonalSpace: orchestrator not built — running reconcileSync to lazy-build")
+            SyncActivation.reconcileSync(project, service)
+            JM.info("syncToPersonalSpace: after reconcileSync, isSyncBuilt=${service.isSyncBuilt()}")
+        }
+        JM.info("syncToPersonalSpace: calling requestManualSync (orchestrator built=${service.isSyncBuilt()})")
+        service.requestManualSync()
+        JM.info("syncToPersonalSpace: requestManualSync returned")
+    }
+
+    /**
+     * Reflects a sync state change in the toolbar indicator. Runs on the EDT.
+     *
+     * Mirrors the IDE status-bar widget ([ai.jolli.jollimemory.sync.SyncStatusBarWidget]),
+     * which remains the canonical place for terminal errors. This inline copy gives
+     * immediate, in-panel feedback so the user does not have to hunt for the status bar:
+     * - SYNCING  → "⟳ Syncing…"
+     * - SYNCED   → "✓ Synced" (auto-clears after a few seconds)
+     * - CONFLICTS→ "⚠ N conflicts"
+     * - OFFLINE  → "✗ Sync failed" when a terminal error is present, otherwise hidden
+     */
+    private fun updateSyncStatus(state: SyncState, detail: SyncStatusDetail?) {
+        syncClearTimer?.stop()
+        syncClearTimer = null
+
+        when (state) {
+            SyncState.SYNCING -> {
+                syncStatusLabel.text = "⟳ Syncing…"
+                syncStatusLabel.foreground = JBColor.foreground()
+                syncStatusLabel.toolTipText = "Memory Bank sync in progress"
+                syncStatusLabel.isVisible = true
+            }
+            SyncState.SYNCED -> {
+                syncStatusLabel.text = "✓ Synced"
+                syncStatusLabel.foreground = JBColor(Color(0x59, 0xA8, 0x69), Color(0x5F, 0xB8, 0x65))
+                syncStatusLabel.toolTipText = "Memory Bank in sync"
+                syncStatusLabel.isVisible = true
+                // Transient success — fade out so the toolbar returns to its resting state.
+                syncClearTimer = Timer(4000) {
+                    syncStatusLabel.isVisible = false
+                    syncStatusLabel.text = ""
+                }.apply { isRepeats = false; start() }
+            }
+            SyncState.CONFLICTS -> {
+                val count = detail?.conflictCount
+                syncStatusLabel.text = if (count != null) "⚠ $count conflicts" else "⚠ Conflicts"
+                syncStatusLabel.foreground = JBColor(Color(0xC2, 0x8A, 0x00), Color(0xD6, 0xA0, 0x2E))
+                syncStatusLabel.toolTipText =
+                    if (count != null) "$count items need your attention" else "Conflicts need your attention"
+                syncStatusLabel.isVisible = true
+            }
+            SyncState.OFFLINE -> {
+                if (detail?.failed == true && detail.failedCode != null) {
+                    syncStatusLabel.text = failedText(detail.failedCode)
+                    syncStatusLabel.foreground = JBColor(Color(0xC7, 0x42, 0x2E), Color(0xD9, 0x5A, 0x4A))
+                    // The full error lives in the IDE status bar; tooltip carries the detail here too.
+                    syncStatusLabel.toolTipText = detail.lastError ?: "Memory Bank sync failed"
+                    syncStatusLabel.isVisible = true
+                } else {
+                    syncStatusLabel.isVisible = false
+                    syncStatusLabel.text = ""
+                }
+            }
+        }
+        syncStatusLabel.parent?.revalidate()
+        syncStatusLabel.parent?.repaint()
+    }
+
+    /** Short toolbar label for a terminal sync error; mirrors the status-bar widget. */
+    private fun failedText(code: SyncErrorCode): String = when (code) {
+        SyncErrorCode.VAULT_LOCKED -> "⚠ Personal Space busy"
+        SyncErrorCode.LOCALFOLDER_INVALID -> "✗ Folder invalid"
+        SyncErrorCode.PUSH_REJECTED -> "✗ Push rejected"
+        else -> "✗ Sync failed"
+    }
+
     // ── Timeline view ──────────────────────────────────────────────────────
 
     private fun buildTimeline() {
@@ -994,10 +1144,16 @@ class KBExplorerPanel(
     override fun dispose() {
         busConnection.disconnect()
         service.removeStatusListener(statusListener)
+        service.removeSyncStateListener(syncStateListener)
+        syncClearTimer?.stop()
+        syncClearTimer = null
     }
 
     companion object {
         private val LOG = Logger.getInstance(KBExplorerPanel::class.java)
+        // Lands in the shared <projectDir>/.jolli/jollimemory/debug.log so the
+        // manual-sync click path is observable alongside the sync-layer logs.
+        private val JM = ai.jolli.jollimemory.core.JmLogger.create("KBExplorerPanel")
     }
 
     // ── Tree cell renderer ─────────────────────────────────────────────────

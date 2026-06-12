@@ -10,12 +10,19 @@ import ai.jolli.jollimemory.core.KBPathResolver
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.StatusInfo
 import ai.jolli.jollimemory.core.StorageFactory
+import ai.jolli.jollimemory.sync.SyncEngine
+import ai.jolli.jollimemory.sync.SyncOrchestrator
+import ai.jolli.jollimemory.sync.SyncOrchestratorOpts
+import ai.jolli.jollimemory.sync.SyncState
+import ai.jolli.jollimemory.sync.SyncStatusBarWidget
+import ai.jolli.jollimemory.sync.SyncStatusDetail
 import ai.jolli.jollimemory.toolwindow.PanelRegistry
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.wm.WindowManager
 import git4idea.repo.GitRepository
 import git4idea.repo.GitRepositoryChangeListener
 import java.io.File
@@ -25,6 +32,7 @@ import java.nio.file.Path
 import java.nio.file.StandardWatchEventKinds
 import java.nio.file.WatchService
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicLong
 import javax.swing.Timer
 
 /**
@@ -55,6 +63,17 @@ class JolliMemoryService(private val project: Project) : Disposable {
     private var nioWatchService: WatchService? = null
     private var nioWatchThread: Thread? = null
 
+    // ── Sync orchestrator ────────────────────────────────────────────────
+    private var orchestrator: SyncOrchestrator? = null
+    private val lastSyncSuccessAtMs = AtomicLong(0)
+    @Volatile
+    private var syncState: SyncState? = null
+    @Volatile
+    private var syncDetail: SyncStatusDetail? = null
+    /** Listeners notified (on the EDT) whenever the sync state changes. Lets the
+     *  KB explorer toolbar mirror the status-bar widget's progress/error feedback. */
+    private val syncListeners = CopyOnWriteArrayList<(SyncState, SyncStatusDetail?) -> Unit>()
+
     /** Registry of panel references for action lookup (set by JolliMemoryToolWindowFactory). */
     var panelRegistry: PanelRegistry? = null
 
@@ -70,6 +89,18 @@ class JolliMemoryService(private val project: Project) : Disposable {
     }
     fun removeStatusListener(listener: () -> Unit) { listeners.remove(listener) }
     private fun notifyListeners() { listeners.forEach { it() } }
+
+    /**
+     * Adds a sync-state listener. If a sync state has already been observed,
+     * the listener is invoked immediately with it so late-registering panels
+     * reflect the current state.
+     */
+    fun addSyncStateListener(listener: (SyncState, SyncStatusDetail?) -> Unit) {
+        syncListeners.add(listener)
+        val s = syncState
+        if (s != null) listener(s, syncDetail)
+    }
+    fun removeSyncStateListener(listener: (SyncState, SyncStatusDetail?) -> Unit) { syncListeners.remove(listener) }
 
     /** Debug log of initialization steps. */
     var initLog: String = ""
@@ -694,11 +725,68 @@ val sb = StringBuilder()
     fun getGitOps(): GitOps? = git
     fun getInstallerDebug(): String = installer?.getDebugInfo() ?: "installer is null"
 
+    // ── Sync orchestrator lifecycle ──────────────────────────────────────
+
+    /**
+     * Start the sync orchestrator with the given engine and poll interval.
+     * Wires the orchestrator's state changes to the status bar widget.
+     */
+    fun startSync(engine: SyncEngine, cwd: String, pollIntervalSec: Int? = null) {
+        stopSync()
+        val widget = findSyncWidget()
+        val orch = SyncOrchestrator(SyncOrchestratorOpts(
+            engine = engine,
+            cwd = cwd,
+            pollIntervalSec = pollIntervalSec,
+            lastSuccessAtMs = lastSyncSuccessAtMs,
+            onStateChange = { state, detail ->
+                syncState = state
+                syncDetail = detail
+                ApplicationManager.getApplication().invokeLater {
+                    widget?.setSyncState(state, detail)
+                    syncListeners.forEach { it(state, detail) }
+                }
+            },
+        ))
+        orchestrator = orch
+        orch.start()
+    }
+
+    /** Stop the sync polling loop (orchestrator remains usable for manual sync). */
+    fun stopSync() {
+        orchestrator?.stop()
+    }
+
+    /** Trigger a manual sync round, coalescing with any in-flight round. */
+    fun requestManualSync() {
+        orchestrator?.requestManualSync()
+    }
+
+    /**
+     * Whether the sync orchestrator has been built yet. Mirrors the
+     * `runtime.ensureBuilt()` gate in `vscode/src/sync/SyncCommands.ts`: a
+     * manual-sync entry point should lazy-build the orchestrator (via
+     * [ai.jolli.jollimemory.sync.SyncActivation.reconcileSync]) when this
+     * returns `false` before calling [requestManualSync].
+     */
+    fun isSyncBuilt(): Boolean = orchestrator != null
+
+    /** Current sync state, or null if sync has never run. */
+    fun getSyncState(): SyncState? = syncState
+
+    private fun findSyncWidget(): SyncStatusBarWidget? {
+        val statusBar = WindowManager.getInstance().getStatusBar(project) ?: return null
+        return statusBar.getWidget(SyncStatusBarWidget.ID) as? SyncStatusBarWidget
+    }
+
     override fun dispose() {
+        orchestrator?.dispose()
+        orchestrator = null
         orphanRefDebounceTimer?.stop()
         nioWatchThread?.interrupt()
         try { nioWatchService?.close() } catch (_: Exception) { }
         listeners.clear()
+        syncListeners.clear()
     }
 }
 

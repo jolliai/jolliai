@@ -305,6 +305,14 @@ data class JolliMemoryConfig(
     val storageMode: String? = null,        // "orphan" | "dual-write" | "folder"
     /** When true, hooks are uninstalled and the plugin is paused without losing config. */
     val paused: Boolean? = null,
+    /** Whether auto-sync polling is enabled (default true). */
+    val autoSyncEnabled: Boolean? = null,
+    /** Poll interval in seconds for sync orchestrator. */
+    val syncPollIntervalSec: Int? = null,
+    /** Whether to sync transcripts to the vault. */
+    val syncTranscripts: Boolean? = null,
+    /** Custom local folder path for the memory bank root. */
+    val localFolder: String? = null,
 )
 
 /** Registry of all active sessions */

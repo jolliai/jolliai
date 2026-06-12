@@ -93,17 +93,21 @@ object JolliAuthService {
             SecureRandom().nextBytes(stateBytes)
             val state = stateBytes.joinToString("") { "%02x".format(it) }
             val callbackUrl = "http://localhost:$port/callback?state=$state"
-            // Only ask the server to mint a fresh Jolli API key when the user
-            // doesn't already have one — otherwise sign-in would overwrite a
-            // manually configured key (and a subsequent sign-out would then
-            // delete it). Mirrors the conditional in browserLogin() / VS Code
-            // openSignInPage().
+            // Ask the server to mint a fresh Jolli API key when the user has no
+            // key, OR when their existing key's embedded tenant differs from the
+            // tenant we're signing into. The cross-tenant case matters because
+            // the API key carries the tenant URL that sync/LLM routing use — a
+            // re-login against a different tenant must replace the key, else
+            // sync keeps routing to the old host. When the key already matches
+            // the target tenant we leave it untouched, so a plain re-auth never
+            // overwrites a manually configured key. Mirrors the CLI's
+            // shouldRequestFreshApiKey / VS Code openSignInPage().
             val existingApiKey = SessionTracker.loadConfig().jolliApiKey
             val loginUrl = buildLoginUrl(
                 jolliUrl = jolliUrl,
                 callbackUrl = callbackUrl,
                 clientVersion = JolliApiClient.pluginVersion,
-                generateApiKey = existingApiKey.isNullOrBlank(),
+                generateApiKey = JolliAuthUtils.shouldRequestFreshApiKey(existingApiKey, jolliUrl),
             )
             log.info("Login URL: %s", loginUrl)
 
@@ -218,7 +222,12 @@ object JolliAuthService {
     fun signOut() {
         val globalDir = SessionTracker.getGlobalConfigDir()
         val existing = SessionTracker.loadConfigFromDir(globalDir)
-        SessionTracker.saveConfigToDir(existing.copy(authToken = null), globalDir)
+        // Clear BOTH authToken AND jolliApiKey in a single write. The API key
+        // carries the tenant URL that sync/LLM routing extract via
+        // parseJolliApiKey, so leaving it behind would pin a later sign-in
+        // (into a different tenant) to the old tenant — sync would keep hitting
+        // the stale host. Mirrors VS Code's clearAuthCredentials.
+        SessionTracker.saveConfigToDir(existing.copy(authToken = null, jolliApiKey = null), globalDir)
         notifyAuthListeners()
     }
 

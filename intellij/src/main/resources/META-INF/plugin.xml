@@ -45,6 +45,11 @@
             id="JolliMemory"
             displayType="BALLOON"/>
 
+        <!-- Sync status bar widget -->
+        <statusBarWidgetFactory
+            id="JolliSyncStatus"
+            implementation="ai.jolli.jollimemory.sync.SyncStatusBarWidgetFactory"/>
+
         <!-- Settings page -->
         <projectConfigurable
             instance="ai.jolli.jollimemory.settings.JolliMemoryConfigurable"

@@ -49,4 +49,54 @@ object JolliAuthUtils {
 			)
 		}
 	}
+
+	/**
+	 * Sign-in helper: returns true when the upcoming login should ask the server
+	 * to mint a fresh Jolli API key. Mirrors the CLI's `shouldRequestFreshApiKey`.
+	 *
+	 * The rule:
+	 *   - No key on disk → request a fresh one (otherwise the user can't push).
+	 *   - Key on disk whose embedded tenant differs from `jolliUrl` → request a
+	 *     fresh one so a cross-tenant switch completes in a single sign-in. Without
+	 *     this, the callback returns no new key, the stale key stays on disk, and
+	 *     sync keeps routing to the old tenant via the key's embedded `meta.u`.
+	 *   - Otherwise (key matches the target tenant, or is undecodable legacy) →
+	 *     don't request a fresh one; a sign-in here is a re-auth, not a provision.
+	 */
+	fun shouldRequestFreshApiKey(existingKey: String?, jolliUrl: String): Boolean {
+		if (existingKey.isNullOrBlank()) return true
+		return !apiKeyMatchesTenant(existingKey, jolliUrl)
+	}
+
+	/**
+	 * True when [existingKey]'s embedded tenant (origin + first path segment)
+	 * matches [jolliUrl]. An undecodable key counts as a match — we can't prove
+	 * it's stale, and dropping a hand-typed key would surprise the user. Mirrors
+	 * the CLI's `apiKeyMatchesTenant`: origin compares case-insensitively (host is
+	 * case-insensitive per RFC 3986 §6.2.2.1) while the tenant slug compares
+	 * case-SENSITIVELY because it flows downstream verbatim as `x-tenant-slug`.
+	 */
+	private fun apiKeyMatchesTenant(existingKey: String, jolliUrl: String): Boolean {
+		val meta = JolliApiClient.parseJolliApiKey(existingKey) ?: return true
+		return try {
+			val fromKey = parseBaseUrl(meta.u)
+			val target = parseBaseUrl(jolliUrl)
+			fromKey.origin == target.origin && fromKey.tenantSlug == target.tenantSlug
+		} catch (_: Exception) {
+			true
+		}
+	}
+
+	private data class BaseUrlParts(val origin: String, val tenantSlug: String?)
+
+	private fun parseBaseUrl(url: String): BaseUrlParts {
+		val uri = URI.create(url)
+		val scheme = uri.scheme?.lowercase().orEmpty()
+		val authority = uri.authority?.lowercase().orEmpty()
+		val tenantSlug = (uri.path ?: "")
+			.trim('/')
+			.split("/")
+			.firstOrNull { it.isNotEmpty() }
+		return BaseUrlParts(origin = "$scheme://$authority", tenantSlug = tenantSlug)
+	}
 }

@@ -1,10 +1,16 @@
 package ai.jolli.jollimemory.actions
 
 import ai.jolli.jollimemory.JolliMemoryIcons
+import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.services.JolliAuthService
+import ai.jolli.jollimemory.services.JolliMemoryService
+import ai.jolli.jollimemory.sync.SyncActivation
 import com.intellij.ide.ActivityTracker
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.components.service
+import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.popup.JBPopupFactory
 import com.intellij.ui.components.JBLabel
 import com.intellij.util.ui.JBUI
@@ -28,6 +34,11 @@ import javax.swing.SwingUtilities
  */
 class CloudSyncAction : AnAction() {
 
+	private val log = JmLogger.create("CloudSyncAction")
+
+	/** Captured from the last [actionPerformed] for use in panel builders. */
+	private var lastProject: Project? = null
+
 	init {
 		JolliAuthService.addAuthListener {
 			ActivityTracker.getInstance().inc()
@@ -47,6 +58,7 @@ class CloudSyncAction : AnAction() {
 
 	override fun actionPerformed(e: AnActionEvent) {
 		val component = e.inputEvent?.component ?: return
+		lastProject = e.project
 		val signedIn = JolliAuthService.isSignedIn()
 
 		val panel = if (signedIn) buildSignedInPanel() else buildSignedOutPanel()
@@ -109,6 +121,10 @@ class CloudSyncAction : AnAction() {
 	}
 
 	private fun buildSignedInPanel(): JPanel {
+		val syncNowButton = JButton("Sync Now").apply {
+			alignmentX = Component.LEFT_ALIGNMENT
+			maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+		}
 		val signOutButton = JButton("Sign Out").apply {
 			alignmentX = Component.LEFT_ALIGNMENT
 			maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
@@ -125,7 +141,28 @@ class CloudSyncAction : AnAction() {
 				alignmentX = Component.LEFT_ALIGNMENT
 			})
 			add(Box.createVerticalStrut(8))
+			add(syncNowButton)
+			add(Box.createVerticalStrut(4))
 			add(signOutButton)
+		}
+
+		syncNowButton.addActionListener {
+			log.info("Sync Now button clicked")
+			val project = lastProject
+			SwingUtilities.getWindowAncestor(panel)?.dispose()
+			if (project != null) {
+				// Lazy-build the orchestrator if needed (parity with the KB toolbar
+				// "Sync to Personal Space" button) so a Sign-in-then-Sync without a
+				// reconcile in between still actually syncs — and the toolbar/status
+				// bar indicators get state changes to display.
+				ApplicationManager.getApplication().executeOnPooledThread {
+					val svc = project.service<JolliMemoryService>()
+					if (!svc.isSyncBuilt()) {
+						SyncActivation.reconcileSync(project, svc)
+					}
+					svc.requestManualSync()
+				}
+			}
 		}
 
 		signOutButton.addActionListener {
