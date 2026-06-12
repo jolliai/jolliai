@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { isWorkerBusy } = vi.hoisted(() => ({
-	isWorkerBusy: vi.fn(),
+const { isWorkerBlockingBusy } = vi.hoisted(() => ({
+	isWorkerBlockingBusy: vi.fn(),
 }));
 
 const { info, warn, error, debug } = vi.hoisted(() => ({
@@ -99,7 +99,7 @@ vi.mock("vscode", () => ({
 }));
 
 vi.mock("../util/LockUtils.js", () => ({
-	isWorkerBusy,
+	isWorkerBlockingBusy,
 }));
 
 vi.mock("../util/Logger.js", () => ({
@@ -173,8 +173,8 @@ function makeDeps() {
 
 describe("CommitCommand", () => {
 	beforeEach(() => {
-		isWorkerBusy.mockReset();
-		isWorkerBusy.mockResolvedValue(false);
+		isWorkerBlockingBusy.mockReset();
+		isWorkerBlockingBusy.mockResolvedValue(false);
 		showWarningMessage.mockReset();
 		showErrorMessage.mockReset();
 		showInformationMessage.mockReset();
@@ -187,7 +187,7 @@ describe("CommitCommand", () => {
 	});
 
 	it("stops immediately when the worker lock is held", async () => {
-		isWorkerBusy.mockResolvedValue(true);
+		isWorkerBlockingBusy.mockResolvedValue(true);
 		const deps = makeDeps();
 		const command = new CommitCommand(
 			deps.bridge as never,
