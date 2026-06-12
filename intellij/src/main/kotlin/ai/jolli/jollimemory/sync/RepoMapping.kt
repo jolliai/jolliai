@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.sync
 
+import ai.jolli.jollimemory.core.KBPathResolver
 import com.google.gson.Gson
 import com.google.gson.JsonSyntaxException
 
@@ -48,6 +49,34 @@ fun parseRepoMapping(raw: String): RepoMappingFile? {
 	}
 }
 
+/** Scheme-prefixed remote (`https://…`, `ssh://…`, `git://…`, `file://…`). */
+private val URL_LIKE_RE = Regex("^[A-Za-z][A-Za-z0-9+.-]*://")
+
+/** SCP-style remote (`user@host:path`) — the only scheme-less URL form git accepts. */
+private val SCP_LIKE_RE = Regex("^[^@/:]+@[^/:]+:.+$")
+
+/**
+ * Re-normalizes an already-persisted `repoIdentity` so style-duplicates left
+ * behind by other clients (e.g. the SCP form `git@github.com:owner/repo`) fold
+ * into this client's https-style identity for the same repo.
+ *
+ * Normalization is GATED to identities that are recognizably remote URLs
+ * (scheme-prefixed or SCP-style). Bare fallback identities — folder/repo names
+ * from the no-remote path — never went through transport folding at compute
+ * time, so re-normalizing them would desync the stored row from the live value
+ * (a remote-less repo named `foo.git` would have its `.git` stripped and start
+ * re-adding a duplicate every round, or collapse with a distinct repo `foo`).
+ *
+ * Port of `cli/src/sync/RepoIdentity.ts canonicalizeRepoIdentity` — kept in
+ * lockstep so both IDEs collapse the same SSH/https duplicates.
+ */
+internal fun canonicalizeRepoIdentity(identity: String): String {
+	if (!URL_LIKE_RE.containsMatchIn(identity) && !SCP_LIKE_RE.matches(identity)) return identity
+	// Fold SSH/SCP/git transports to https first, then apply the shared
+	// host/path/.git normalization used everywhere else in the sync layer.
+	return normalizeGitUrl(KBPathResolver.foldGitTransportToHttps(identity.trim()))
+}
+
 /** Serializes to canonical 2-space-indented JSON + trailing newline. */
 fun serializeRepoMapping(mapping: RepoMappingFile): String {
 	val gson = com.google.gson.GsonBuilder().setPrettyPrinting().create()
@@ -59,15 +88,22 @@ fun serializeRepoMapping(mapping: RepoMappingFile): String {
  * resolved last-write-wins favouring remote). Folder collisions across
  * different identities are detected but not renamed — both keep their
  * original claim, and the conflict is reported for UI surfacing.
+ *
+ * Rows from both sides are run through [canonicalizeRepoIdentity] as they
+ * enter the union, so an SSH-style row pushed by an older client folds into
+ * this client's https-style row for the same repo instead of surviving the
+ * merge as a duplicate (split Memory Bank / duplicate repo entries).
  */
 fun mergeRepoMapping(
 	local: RepoMappingFile,
 	remote: RepoMappingFile,
 ): MergeRepoMappingResult {
-	// First pass: union by repoIdentity (remote overrides).
+	// First pass: union by canonical repoIdentity (last-write-wins; remote overrides).
 	val byIdentity = LinkedHashMap<String, RepoMappingEntry>()
-	for (m in local.mappings) byIdentity[m.repoIdentity] = m
-	for (m in remote.mappings) byIdentity[m.repoIdentity] = m
+	for (m in local.mappings + remote.mappings) {
+		val identity = canonicalizeRepoIdentity(m.repoIdentity)
+		byIdentity[identity] = if (identity == m.repoIdentity) m else m.copy(repoIdentity = identity)
+	}
 
 	// Second pass: detect folder collisions across different identities.
 	val byFolder = mutableMapOf<String, MutableList<RepoMappingEntry>>()

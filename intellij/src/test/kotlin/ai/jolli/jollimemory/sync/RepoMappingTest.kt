@@ -75,4 +75,40 @@ class RepoMappingTest {
 		assertEquals("aaa", merged.mappings[0].repoIdentity)
 		assertEquals("zzz", merged.mappings[1].repoIdentity)
 	}
+
+	@Test
+	fun `mergeRepoMapping folds an SSH-style remote row into the https row for the same repo`() {
+		// Local stored its identity via https; another client pushed the SCP/SSH
+		// form. They are the same repo and must collapse to one row, not survive
+		// as a duplicate (split Memory Bank).
+		val local = RepoMappingFile(1, listOf(RepoMappingEntry("https://github.com/jolliai/jolli", "jolli")))
+		val remote = RepoMappingFile(1, listOf(RepoMappingEntry("git@github.com:jolliai/jolli", "jolli")))
+		val (merged, conflicts) = mergeRepoMapping(local, remote)
+		assertEquals(1, merged.mappings.size)
+		assertEquals("https://github.com/jolliai/jolli", merged.mappings[0].repoIdentity)
+		assertEquals("jolli", merged.mappings[0].folder)
+		assertTrue(conflicts.isEmpty())
+	}
+
+	@Test
+	fun `mergeRepoMapping leaves bare non-URL identities untouched`() {
+		// A remote-less fallback identity (folder/repo name) never went through
+		// transport folding at compute time, so it must NOT be re-normalized
+		// (e.g. `foo.git` must not have its suffix stripped into `foo`).
+		val local = RepoMappingFile(1, listOf(RepoMappingEntry("foo.git", "foo-git")))
+		val remote = RepoMappingFile(1, listOf(RepoMappingEntry("foo", "foo")))
+		val (merged, _) = mergeRepoMapping(local, remote)
+		assertEquals(2, merged.mappings.size)
+		assertEquals(setOf("foo", "foo.git"), merged.mappings.map { it.repoIdentity }.toSet())
+	}
+
+	@Test
+	fun `canonicalizeRepoIdentity folds SSH and SCP forms but preserves bare names`() {
+		assertEquals("https://github.com/jolliai/jolli", canonicalizeRepoIdentity("git@github.com:jolliai/jolli"))
+		assertEquals("https://github.com/jolliai/jolli", canonicalizeRepoIdentity("git@github.com:jolliai/jolli.git"))
+		assertEquals("https://github.com/jolliai/jolli", canonicalizeRepoIdentity("https://github.com/jolliai/jolli"))
+		// Bare identities are passed through verbatim (gating).
+		assertEquals("foo.git", canonicalizeRepoIdentity("foo.git"))
+		assertEquals("my-repo", canonicalizeRepoIdentity("my-repo"))
+	}
 }
