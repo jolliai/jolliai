@@ -349,6 +349,22 @@ export function buildSidebarCss(): string {
     color: var(--vscode-inputOption-activeForeground, var(--vscode-foreground));
     border-color: var(--vscode-inputOption-activeBorder, transparent);
   }
+  /* Small inline-row variant — Plans & Notes rows carry two trailing buttons
+     (✎ + 🗑), so the default 24x22/14px footprint reads heavier than the
+     single View Memory eye on Memories rows. 20x18/12px keeps both icons
+     visually subordinate to the row label while staying a comfortable click
+     target. The .codicon override is required: codicon.css pins font: 16px
+     directly on .codicon[class*='codicon-'] with (0,2,0) specificity, so a
+     font-size on the button alone never reaches the glyph (same reason
+     .tree-node .icon .codicon overrides it explicitly above). */
+  .iconbtn--sm {
+    width: 20px;
+    height: 18px;
+    font-size: 12px;
+  }
+  .iconbtn--sm .codicon {
+    font-size: 12px;
+  }
 
   .tab-content {
     flex: 1;

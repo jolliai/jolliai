@@ -428,6 +428,7 @@ export type SidebarOutboundMsg =
 	| { readonly type: "branch:openNote"; readonly noteId: string }
 	| { readonly type: "branch:openReference"; readonly mapKey: string }
 	| { readonly type: "branch:openReferenceMarkdown"; readonly mapKey: string }
+	| { readonly type: "branch:openReferencePreview"; readonly mapKey: string }
 	| { readonly type: "branch:ignoreReference"; readonly mapKey: string }
 	| {
 			readonly type: "branch:openChange";

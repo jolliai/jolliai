@@ -471,16 +471,16 @@ export class SidebarWebviewProvider
 				);
 				return;
 			case "branch:openPlan":
-				// Sidebar row-click → markdown preview, not editor. The ✎ inline
-				// button still goes through editPlan for actual editing.
+				// Sidebar row-click → markdown preview, not editor. Editing goes
+				// through the context menu's "Edit Plan" (editPlan).
 				void this.deps.executeCommand(
 					"jollimemory.openPlanForPreview",
 					msg.planId,
 				);
 				return;
 			case "branch:openNote":
-				// Sidebar row-click → markdown preview, not editor. The ✎ inline
-				// button still goes through editNote for actual editing. Differs
+				// Sidebar row-click → markdown preview, not editor. Editing goes
+				// through the context menu's "Edit Note" (editNote). Differs
 				// from `previewNote` (used by Summary) which is orphan-only.
 				void this.deps.executeCommand(
 					"jollimemory.openNoteForPreview",
@@ -496,6 +496,15 @@ export class SidebarWebviewProvider
 			case "branch:openReferenceMarkdown":
 				void this.deps.executeCommand(
 					"jollimemory.openReferenceMarkdown",
+					msg.mapKey,
+				);
+				return;
+			case "branch:openReferencePreview":
+				// Sidebar row-click → rendered markdown preview, matching the
+				// plan/note rows. "Edit Markdown" in the context menu keeps the
+				// editor path (branch:openReferenceMarkdown).
+				void this.deps.executeCommand(
+					"jollimemory.openReferenceForPreview",
 					msg.mapKey,
 				);
 				return;

@@ -156,10 +156,21 @@ export async function openReferenceInBrowser(info: ReferenceInfo): Promise<boole
 	return vscode.env.openExternal(uri);
 }
 
-/** Opens the per-reference markdown file in VS Code. */
+/** Opens the per-reference markdown file in a VS Code text editor (editable). */
 export async function openReferenceMarkdown(info: ReferenceInfo): Promise<void> {
 	const uri = vscode.Uri.file(info.sourcePath);
 	await vscode.window.showTextDocument(uri);
+}
+
+/**
+ * Opens the per-reference markdown file in the rendered markdown preview.
+ * Sidebar row-click path — mirrors openPlanForPreview / openNoteForPreview so
+ * every Plans & Notes row previews on click; editing goes through the
+ * context menu's "Edit Markdown" (openReferenceMarkdown).
+ */
+export async function previewReferenceMarkdown(info: ReferenceInfo): Promise<void> {
+	const uri = vscode.Uri.file(info.sourcePath);
+	await vscode.commands.executeCommand("markdown.showPreview", uri);
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────────────

@@ -2452,6 +2452,23 @@ export function activate(context: vscode.ExtensionContext): void {
 			},
 		),
 
+		// Sidebar row-click preview for references — same click-equals-preview
+		// contract as openPlanForPreview / openNoteForPreview. Editing the
+		// markdown goes through the context menu (openReferenceMarkdown).
+		vscode.commands.registerCommand(
+			"jollimemory.openReferenceForPreview",
+			async (itemOrKey: ReferenceItem | string) => {
+				const mapKey =
+					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.reference.mapKey;
+				log.info("cmd", `openReferenceForPreview: ${mapKey}`);
+				const info = await resolveReferenceForCommand(
+					mapKey,
+					"openReferenceForPreview",
+				);
+				if (info) await bridge.previewReferenceMarkdown(info);
+			},
+		),
+
 		vscode.commands.registerCommand(
 			"jollimemory.ignoreReference",
 			async (itemOrKey: ReferenceItem | string) => {
