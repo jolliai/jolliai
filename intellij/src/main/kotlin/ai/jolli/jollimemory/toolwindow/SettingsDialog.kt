@@ -74,6 +74,9 @@ class SettingsDialog(
     private val syncCardLayout = CardLayout()
     private val syncCardPanel = JPanel(syncCardLayout)
     private lateinit var signInForSyncButton: JButton
+    private val autoSyncCheckbox = JBCheckBox("Auto-sync to Personal Space", true)
+    private val syncTranscriptsCheckbox = JBCheckBox("Sync transcripts", false)
+    private val pollIntervalField = JBTextField()
 
     // ── Tab 3: Memory Bank ─────────────────────────────────────────────────
     private val kbPathField = TextFieldWithBrowseButton().apply {
@@ -410,6 +413,27 @@ class SettingsDialog(
         syncCardPanel.alignmentX = JComponent.LEFT_ALIGNMENT
         panel.add(syncCardPanel)
 
+        panel.add(Box.createVerticalStrut(12))
+        panel.add(javax.swing.JSeparator().apply { alignmentX = JComponent.LEFT_ALIGNMENT; maximumSize = Dimension(Int.MAX_VALUE, 1) })
+        panel.add(Box.createVerticalStrut(8))
+
+        autoSyncCheckbox.alignmentX = JComponent.LEFT_ALIGNMENT
+        panel.add(autoSyncCheckbox)
+        panel.add(Box.createVerticalStrut(4))
+
+        syncTranscriptsCheckbox.alignmentX = JComponent.LEFT_ALIGNMENT
+        panel.add(syncTranscriptsCheckbox)
+        panel.add(Box.createVerticalStrut(8))
+
+        pollIntervalField.apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+        }
+        panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
+            .addLabeledComponent(JBLabel("Poll interval (seconds):"), pollIntervalField, 1, false)
+            .addTooltip("How often to sync automatically. Leave blank for default (5 minutes).")
+            .panel))
+
         return wrapTabContent(panel)
     }
 
@@ -647,6 +671,9 @@ class SettingsDialog(
             knowledgeBasePath = kbPath,
             knowledgeBaseSort = kbSort,
             paused = if (pauseCheckbox.isSelected) true else null,
+            autoSyncEnabled = if (autoSyncCheckbox.isSelected) null else false,
+            syncTranscripts = if (syncTranscriptsCheckbox.isSelected) true else null,
+            syncPollIntervalSec = pollIntervalField.text.trim().toIntOrNull(),
         )
         SessionTracker.saveConfigToDir(config, configDir)
 
@@ -754,6 +781,11 @@ class SettingsDialog(
         }
         kbPathField.text = config.knowledgeBasePath ?: KBPathResolver.KB_PARENT.toString()
         kbSortCombo.selectedItem = config.knowledgeBaseSort ?: "date"
+
+        // Sync settings
+        autoSyncCheckbox.isSelected = config.autoSyncEnabled != false
+        syncTranscriptsCheckbox.isSelected = config.syncTranscripts == true
+        pollIntervalField.text = config.syncPollIntervalSec?.toString() ?: ""
 
         // Sync card states after all fields are populated
         syncProviderCard()

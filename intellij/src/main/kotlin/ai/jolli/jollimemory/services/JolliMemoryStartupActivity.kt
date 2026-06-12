@@ -1,8 +1,8 @@
 package ai.jolli.jollimemory.services
 
+import ai.jolli.jollimemory.core.JmLogger
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
-import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
 
@@ -15,10 +15,14 @@ import com.intellij.openapi.startup.ProjectActivity
  */
 class JolliMemoryStartupActivity : ProjectActivity {
 
-    private val log = Logger.getInstance(JolliMemoryStartupActivity::class.java)
+    private val log = JmLogger.create("StartupActivity")
 
     override suspend fun execute(project: Project) {
         val basePath = project.basePath ?: return
+        // Ensure JmLogger can write before any log calls in this class or downstream.
+        JmLogger.setLogDir(basePath)
+        JmLogger.setLogLevel(ai.jolli.jollimemory.core.LogLevel.debug)
+
         // .git is a directory in normal repos, but a file in worktrees
         val gitEntry = java.io.File(basePath, ".git")
         if (!gitEntry.exists()) {
@@ -39,5 +43,9 @@ class JolliMemoryStartupActivity : ProjectActivity {
         log.info("JolliMemory: initializing for project at $basePath")
         val service = project.getService(JolliMemoryService::class.java)
         service.initialize()
+
+        log.info("JolliMemory: activating sync for project at $basePath")
+        ai.jolli.jollimemory.sync.SyncActivation.activateSync(project, service)
+        log.info("JolliMemory: startup complete for project at $basePath")
     }
 }

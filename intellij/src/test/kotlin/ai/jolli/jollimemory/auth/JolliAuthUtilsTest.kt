@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.auth
 
+import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertDoesNotThrow
@@ -119,5 +120,68 @@ class JolliAuthUtilsTest {
             JolliAuthUtils.validateJolliApiKey("sk-other-abc123")
         }
         ex.message shouldContain "cannot be decoded"
+    }
+
+    // --- shouldRequestFreshApiKey tests ---
+
+    @Test
+    fun `shouldRequestFreshApiKey true when no existing key`() {
+        JolliAuthUtils.shouldRequestFreshApiKey(null, "https://jolli.ai") shouldBe true
+        JolliAuthUtils.shouldRequestFreshApiKey("", "https://jolli.ai") shouldBe true
+        JolliAuthUtils.shouldRequestFreshApiKey("   ", "https://jolli.ai") shouldBe true
+    }
+
+    @Test
+    fun `shouldRequestFreshApiKey false when key tenant matches target`() {
+        JolliAuthUtils.shouldRequestFreshApiKey(fakeKey("https://jolli.ai"), "https://jolli.ai") shouldBe false
+    }
+
+    @Test
+    fun `shouldRequestFreshApiKey true on cross-tenant switch`() {
+        // The bug this fixes: stale jolli.ai key, signing into jolli-local.me.
+        JolliAuthUtils.shouldRequestFreshApiKey(
+            fakeKey("https://jolli.ai"),
+            "https://jolli-local.me",
+        ) shouldBe true
+    }
+
+    @Test
+    fun `shouldRequestFreshApiKey origin compares case-insensitively`() {
+        JolliAuthUtils.shouldRequestFreshApiKey(
+            fakeKey("https://Jolli.AI"),
+            "https://jolli.ai",
+        ) shouldBe false
+    }
+
+    @Test
+    fun `shouldRequestFreshApiKey true when tenant slug differs`() {
+        JolliAuthUtils.shouldRequestFreshApiKey(
+            fakeKey("https://jolli-local.me/dev"),
+            "https://jolli-local.me/prod",
+        ) shouldBe true
+    }
+
+    @Test
+    fun `shouldRequestFreshApiKey false when tenant slug matches`() {
+        JolliAuthUtils.shouldRequestFreshApiKey(
+            fakeKey("https://jolli-local.me/prod"),
+            "https://jolli-local.me/prod",
+        ) shouldBe false
+    }
+
+    @Test
+    fun `shouldRequestFreshApiKey tenant slug compares case-sensitively`() {
+        // Slug flows downstream verbatim as x-tenant-slug, so a case variant is
+        // a different tenant — fail safe by requesting a fresh key.
+        JolliAuthUtils.shouldRequestFreshApiKey(
+            fakeKey("https://jolli-local.me/Acme"),
+            "https://jolli-local.me/acme",
+        ) shouldBe true
+    }
+
+    @Test
+    fun `shouldRequestFreshApiKey false for undecodable legacy key`() {
+        // Can't prove it's stale; don't surprise-drop a hand-typed key.
+        JolliAuthUtils.shouldRequestFreshApiKey("sk-jol-notbase64", "https://jolli.ai") shouldBe false
     }
 }

@@ -145,12 +145,16 @@ class JolliAuthServiceTest {
     }
 
     @Test
-    fun `signOut clears authToken but preserves jolliApiKey`() {
+    fun `signOut clears both authToken and jolliApiKey`() {
+        // The API key carries the tenant URL that sync/LLM routing extract via
+        // parseJolliApiKey. Leaving it behind pins a later sign-in (into a
+        // different tenant) to the old host. Clear both in one write — mirrors
+        // VS Code's clearAuthCredentials.
         mockkObject(SessionTracker)
         every { SessionTracker.getGlobalConfigDir() } returns "/fake/global"
         every { SessionTracker.loadConfigFromDir("/fake/global") } returns JolliMemoryConfig(
             authToken = "old-token",
-            jolliApiKey = "sk-jol-keep-me",
+            jolliApiKey = "sk-jol-stale-tenant",
         )
         val savedConfig = slot<JolliMemoryConfig>()
         every { SessionTracker.saveConfigToDir(capture(savedConfig), "/fake/global") } returns Unit
@@ -158,7 +162,27 @@ class JolliAuthServiceTest {
         JolliAuthService.signOut()
 
         savedConfig.captured.authToken shouldBe null
-        savedConfig.captured.jolliApiKey shouldBe "sk-jol-keep-me"
+        savedConfig.captured.jolliApiKey shouldBe null
+    }
+
+    @Test
+    fun `signOut preserves unrelated config fields`() {
+        // Only the auth credentials are cleared — model, provider, etc. survive.
+        mockkObject(SessionTracker)
+        every { SessionTracker.getGlobalConfigDir() } returns "/fake/global"
+        every { SessionTracker.loadConfigFromDir("/fake/global") } returns JolliMemoryConfig(
+            authToken = "old-token",
+            jolliApiKey = "sk-jol-stale",
+            aiProvider = "jolli",
+            storageMode = "dual-write",
+        )
+        val savedConfig = slot<JolliMemoryConfig>()
+        every { SessionTracker.saveConfigToDir(capture(savedConfig), "/fake/global") } returns Unit
+
+        JolliAuthService.signOut()
+
+        savedConfig.captured.aiProvider shouldBe "jolli"
+        savedConfig.captured.storageMode shouldBe "dual-write"
     }
 
     @Test

@@ -54,3 +54,6 @@ vscode/assets/codicons/
 
 # Local pre-PR review state (per-developer scratch)
 .claude/review-findings/
+
+# Personal notes
+notes.md
