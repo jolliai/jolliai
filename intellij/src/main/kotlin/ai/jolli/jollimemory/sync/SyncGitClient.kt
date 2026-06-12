@@ -572,9 +572,16 @@ class RealProcessRunner : ProcessRunner {
 
 			val process = pb.start()
 
-			// Read stdout on a separate thread to avoid pipe buffer deadlock.
+			// Drain BOTH stdout and stderr concurrently to avoid a pipe-buffer
+			// deadlock. A git command that fills either pipe (fetch/push/clone
+			// progress, or a large error dump) blocks on its write until the pipe is
+			// drained; reading stderr only after waitFor() could hang the child — and
+			// thus this call — until the (up to 10-minute) timeout fires.
 			val stdoutFuture = CompletableFuture.supplyAsync {
 				process.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+			}
+			val stderrFuture = CompletableFuture.supplyAsync {
+				process.errorStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
 			}
 
 			val timeout = timeoutMs ?: 600_000L // 10 min default for network ops
@@ -582,6 +589,7 @@ class RealProcessRunner : ProcessRunner {
 			if (!completed) {
 				process.destroyForcibly()
 				stdoutFuture.cancel(true)
+				stderrFuture.cancel(true)
 				return ExecResult(
 					stdout = "",
 					stderr = "git ${command.drop(1).joinToString(" ")} timed out after ${timeout}ms",
@@ -589,8 +597,8 @@ class RealProcessRunner : ProcessRunner {
 				)
 			}
 
-			val stderr = process.errorStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
 			val stdout = stdoutFuture.get(5, TimeUnit.SECONDS) ?: ""
+			val stderr = stderrFuture.get(5, TimeUnit.SECONDS) ?: ""
 
 			ExecResult(stdout = stdout, stderr = stderr, exitCode = process.exitValue())
 		} catch (e: Exception) {

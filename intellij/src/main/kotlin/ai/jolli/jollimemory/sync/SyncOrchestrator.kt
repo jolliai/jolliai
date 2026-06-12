@@ -78,7 +78,11 @@ class SyncOrchestrator(private val opts: SyncOrchestratorOpts) {
 			val gen = pollGeneration.incrementAndGet()
 
 			if (shouldFireEagerTick()) {
-				opts.timer.submit { tick("poll", null) }
+				// Pass the current generation (not null) so a stop() racing in
+				// between cancels this queued eager tick — matching the TS source.
+				// A null generation would make it an always-proceed manual tick,
+				// reintroducing an unwanted round after auto-sync is toggled off.
+				opts.timer.submit { tick("poll", gen) }
 			}
 
 			pollHandle = opts.timer.scheduleAtFixedRate(

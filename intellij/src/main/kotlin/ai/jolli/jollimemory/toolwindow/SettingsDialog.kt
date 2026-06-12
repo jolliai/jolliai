@@ -431,7 +431,7 @@ class SettingsDialog(
         }
         panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
             .addLabeledComponent(JBLabel("Poll interval (seconds):"), pollIntervalField, 1, false)
-            .addTooltip("How often to sync automatically. Leave blank for default (5 minutes).")
+            .addTooltip("How often to sync automatically. Leave blank for the default (90 minutes); shorter values are raised to the 90-minute minimum.")
             .panel))
 
         return wrapTabContent(panel)
