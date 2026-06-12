@@ -387,12 +387,12 @@ vi.mock("../services/PrCommentService.js", () => ({
 	wrapWithMarkers: (s: string) => `[MARKERS]${s}[/MARKERS]`,
 }));
 
-const { mockIsWorkerBusy } = vi.hoisted(() => ({
-	mockIsWorkerBusy: vi.fn().mockResolvedValue(false),
+const { mockIsWorkerBlockingBusy } = vi.hoisted(() => ({
+	mockIsWorkerBlockingBusy: vi.fn().mockResolvedValue(false),
 }));
 
 vi.mock("../util/LockUtils.js", () => ({
-	isWorkerBusy: mockIsWorkerBusy,
+	isWorkerBlockingBusy: mockIsWorkerBlockingBusy,
 }));
 
 const { mockLoadBranchSummaries } = vi.hoisted(() => ({
@@ -3877,7 +3877,7 @@ describe("SummaryWebviewPanel", () => {
 			});
 
 			it("worker-busy: shows warning + re-runs handleCheckPrStatus to reset the button", async () => {
-				mockIsWorkerBusy.mockResolvedValueOnce(true);
+				mockIsWorkerBlockingBusy.mockResolvedValueOnce(true);
 				const dispatch = await setupPanel();
 
 				dispatch({ command: "prepareCreatePr" });
@@ -4055,7 +4055,7 @@ describe("SummaryWebviewPanel", () => {
 			});
 
 			it("worker-busy: shows warning + re-runs handleCheckPrStatus to reset the button", async () => {
-				mockIsWorkerBusy.mockResolvedValueOnce(true);
+				mockIsWorkerBlockingBusy.mockResolvedValueOnce(true);
 				const dispatch = await setupPanel();
 
 				dispatch({ command: "prepareUpdatePr" });

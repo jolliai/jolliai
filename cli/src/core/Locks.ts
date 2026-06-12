@@ -90,13 +90,20 @@ function gitRevParseCommonDir(cwd: string): Promise<{ stdout: string; stderr: st
 export const WORKER_LOCK_FILE = "worker.lock";
 
 /**
- * Cosmetic, best-effort marker the QueueWorker writes while running a phase the
- * UI should label specially (currently only `ingest`). Lives next to
- * `worker.lock` in `<cwd>/.jolli/jollimemory/`. It is NOT a lock and carries no
- * mutual-exclusion role — the extension reads it only to pick a toolbar label.
- * Its lifetime is bound to `worker.lock` on the reader side: when the lock
- * disappears the phase is forced to null, so a stale marker left by a crashed
- * worker cannot mislead beyond the lock's own staleness window.
+ * Best-effort marker the QueueWorker writes while running a phase the UI
+ * treats specially (currently only `ingest`). Lives next to `worker.lock` in
+ * `<cwd>/.jolli/jollimemory/`. It is NOT a lock and carries no mutual-exclusion
+ * role, but it is more than cosmetic: the extension's worker-busy gates
+ * (`isWorkerBlockingBusy` in vscode LockUtils) exempt Commit/Squash from
+ * blocking while the marker reads `ingest`, so a wrongly-surviving marker
+ * under-protects. Three mechanisms bound its lifetime:
+ *   - reader side: the phase is ignored whenever `worker.lock` is gone/stale,
+ *     and an `ingest` marker whose own mtime is stale is treated as blocking
+ *     (the worker heartbeats the marker during a genuine ingest);
+ *   - writer side: each commit-typed queue entry clears a leftover marker
+ *     before processing (`clearLeftoverIngestMarker` in QueueWorker);
+ *   - acquisition: a fresh worker removes any crash-orphaned marker right
+ *     after taking `worker.lock`.
  */
 export const WORKER_PHASE_FILE = "worker-phase";
 export const ORPHAN_WRITE_LOCK_FILE = "orphan-write.lock";

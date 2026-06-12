@@ -186,6 +186,37 @@ describe("SquashCommand", () => {
 		);
 	});
 
+	it("re-checks the worker gate after the QuickPick and aborts when it turned busy", async () => {
+		// Click-time check passes (e.g. the worker was in the exempt ingest
+		// phase), but the same drain moves into a blocking summary run while
+		// the user reviews the QuickPick — the squash must not execute.
+		isWorkerBlockingBusy
+			.mockResolvedValueOnce(false)
+			.mockResolvedValueOnce(true);
+		const deps = makeDeps();
+		const command = new SquashCommand(
+			deps.bridge as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
+			deps.statusBar as never,
+			"/repo",
+		);
+		vi.spyOn(command as never, "showSquashQuickPick").mockResolvedValue({
+			item: { label: "$(git-merge) Squash" },
+			message: "feat: squash",
+		});
+
+		await command.execute();
+
+		expect(isWorkerBlockingBusy).toHaveBeenCalledTimes(2);
+		expect(deps.bridge.getStagedFilePaths).not.toHaveBeenCalled();
+		expect(deps.bridge.squashCommits).not.toHaveBeenCalled();
+		expect(showWarningMessage).toHaveBeenCalledWith(
+			"Jolli Memory: AI summary is being generated. Please wait a moment.",
+		);
+	});
+
 	it("warns when fewer than two commits are selected", async () => {
 		const deps = makeDeps([makeCommit("cccc3333")]);
 		const command = new SquashCommand(

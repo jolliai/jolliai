@@ -22,7 +22,13 @@
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 
-/** Lock timeout matches `LOCK_TIMEOUT_MS` in cli/src/core/Locks.ts (5 minutes). */
+/**
+ * Lock timeout matches `LOCK_TIMEOUT_MS` in cli/src/core/Locks.ts (5 minutes).
+ * Doubles as the freshness window for the `worker-phase` marker: the worker
+ * heartbeats both `worker.lock` and an active `ingest` marker every 60 s
+ * (WORKER_LOCK_REFRESH_INTERVAL_MS in QueueWorker), so the same 5× margin
+ * applies to both files.
+ */
 const LOCK_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
@@ -46,28 +52,39 @@ export async function isWorkerBusy(cwd: string): Promise<boolean> {
  * git actions (Commit / Squash). The topic-KB ingest phase is exempt: it only
  * reads already-stored summaries and renders the Memory Bank wiki, never the
  * code branch or the commit pipeline, so blocking commit/squash for its
- * ~80s+ duration is pure UX damage. Any git op landed during ingest is simply
- * enqueued and drained by the chain-spawned successor worker.
+ * ~80s+ duration is pure UX damage. Any git op landed during ingest is queued
+ * and drained right after the ingest entry — usually by the SAME worker, in
+ * the same lock hold (the drain loop re-dequeues between entries; a
+ * chain-spawned successor only covers ops that land after the drain exits).
+ * That is why callers with a long user interaction between the gate check and
+ * the actual git op (Commit/Squash: LLM message generation + QuickPick) must
+ * re-check this gate immediately before executing.
  *
- * The phase comes from the cosmetic `worker-phase` marker the QueueWorker
- * writes next to `worker.lock` (see WORKER_PHASE_FILE in cli/src/core/Locks.ts).
- * A missing/unreadable marker means the default summary phase → blocking.
+ * The phase comes from the `worker-phase` marker the QueueWorker writes next
+ * to `worker.lock` (see WORKER_PHASE_FILE in cli/src/core/Locks.ts). A
+ * missing/unreadable marker means the default summary phase → blocking. An
+ * `ingest` marker is honoured only while its mtime is fresh: the worker
+ * heartbeats the marker during a genuine ingest, so a stale one is residue
+ * from a failed cleanup and the run in progress may well be a blocking
+ * summary — treat it as such (fail-safe).
  */
 export async function isWorkerBlockingBusy(cwd: string): Promise<boolean> {
 	if (!(await isWorkerBusy(cwd))) {
 		return false;
 	}
-	return (await readWorkerPhase(cwd)) !== "ingest";
+	return !(await isFreshIngestPhase(cwd));
 }
 
-async function readWorkerPhase(cwd: string): Promise<string | null> {
+async function isFreshIngestPhase(cwd: string): Promise<boolean> {
+	const phasePath = join(cwd, ".jolli", "jollimemory", "worker-phase");
 	try {
-		const content = await readFile(
-			join(cwd, ".jolli", "jollimemory", "worker-phase"),
-			"utf-8",
-		);
-		return content.trim();
+		const content = await readFile(phasePath, "utf-8");
+		if (content.trim() !== "ingest") {
+			return false;
+		}
+		const phaseStat = await stat(phasePath);
+		return Date.now() - phaseStat.mtimeMs < LOCK_TIMEOUT_MS;
 	} catch {
-		return null;
+		return false;
 	}
 }
