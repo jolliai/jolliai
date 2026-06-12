@@ -2197,6 +2197,40 @@ describe("QueueWorker", () => {
 		});
 	});
 
+	describe("clearLeftoverIngestMarker", () => {
+		it("removes an ingest marker that a failed cleanup left behind", async () => {
+			const tmp = mkdtempSync(join(tmpdir(), "jolli-leftover-"));
+			mkdirSync(join(tmp, ".jolli", "jollimemory"), { recursive: true });
+			const phaseFile = join(tmp, ".jolli", "jollimemory", "worker-phase");
+			// Simulate the ingest `finally` rmSync having failed (e.g. Windows AV
+			// briefly holding the file): the marker still reads 'ingest' while the
+			// same drain is about to process a blocking summary entry.
+			writeFileSync(phaseFile, "ingest");
+
+			const { existsSync: realExistsSync } = await vi.importActual<typeof import("node:fs")>("node:fs");
+			vi.mocked(existsSync).mockImplementation(realExistsSync);
+
+			__test__.clearLeftoverIngestMarker(tmp);
+
+			// Gate readers must no longer see an exempt phase.
+			expect(realExistsSync(phaseFile)).toBe(false);
+
+			rmSync(tmp, { recursive: true, force: true });
+		});
+
+		it("is a no-op when no marker exists", async () => {
+			const tmp = mkdtempSync(join(tmpdir(), "jolli-leftover-"));
+			mkdirSync(join(tmp, ".jolli", "jollimemory"), { recursive: true });
+
+			const { existsSync: realExistsSync } = await vi.importActual<typeof import("node:fs")>("node:fs");
+			vi.mocked(existsSync).mockImplementation(realExistsSync);
+
+			expect(() => __test__.clearLeftoverIngestMarker(tmp)).not.toThrow();
+
+			rmSync(tmp, { recursive: true, force: true });
+		});
+	});
+
 	describe("runWorker — ingest dispatch", () => {
 		function makeIngestOp(triggeredBy: IngestOperation["triggeredBy"] = "post-merge"): IngestOperation {
 			return { type: "ingest", triggeredBy, createdAt: new Date().toISOString() };

@@ -66,7 +66,7 @@ describe("isWorkerBlockingBusy", () => {
 		await expect(isWorkerBlockingBusy("/repo")).resolves.toBe(true);
 	});
 
-	it("returns false when busy with the ingest phase", async () => {
+	it("returns false when busy with a fresh ingest phase", async () => {
 		readFile.mockResolvedValue("ingest");
 
 		await expect(isWorkerBlockingBusy("/repo")).resolves.toBe(false);
@@ -84,6 +84,37 @@ describe("isWorkerBlockingBusy", () => {
 
 	it("treats an unknown phase as blocking", async () => {
 		readFile.mockResolvedValue("something-else");
+
+		await expect(isWorkerBlockingBusy("/repo")).resolves.toBe(true);
+	});
+
+	it("treats a stale ingest marker as blocking", async () => {
+		// The worker heartbeats an active ingest marker every 60 s; a marker
+		// whose mtime fell past the 5-min window is residue from a failed
+		// cleanup — the run in progress may be a blocking summary.
+		readFile.mockResolvedValue("ingest");
+		stat.mockImplementation((path: string) =>
+			Promise.resolve({
+				mtimeMs: path.includes("worker-phase")
+					? new Date("2026-03-29T23:59:00.000Z").getTime()
+					: new Date("2026-03-30T00:04:00.000Z").getTime(),
+			}),
+		);
+
+		await expect(isWorkerBlockingBusy("/repo")).resolves.toBe(true);
+	});
+
+	it("treats an ingest marker whose stat fails as blocking", async () => {
+		// readFile succeeded but the marker vanished (or is unreadable) before
+		// the freshness stat — fail safe to blocking.
+		readFile.mockResolvedValue("ingest");
+		stat.mockImplementation((path: string) =>
+			path.includes("worker-phase")
+				? Promise.reject(new Error("ENOENT"))
+				: Promise.resolve({
+						mtimeMs: new Date("2026-03-30T00:04:00.000Z").getTime(),
+					}),
+		);
 
 		await expect(isWorkerBlockingBusy("/repo")).resolves.toBe(true);
 	});

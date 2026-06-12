@@ -1430,7 +1430,10 @@ export function activate(context: vscode.ExtensionContext): void {
 	// busy with any phase except ingest. The ingest phase (Memory Bank wiki
 	// update, ~80s+) never touches the commit pipeline or code-branch history,
 	// so commit/squash stay enabled during it — git ops landed mid-ingest are
-	// enqueued and drained by the chain-spawned successor worker. Display
+	// enqueued and drained right after the ingest entry, usually by the SAME
+	// worker in the same lock hold. That worker can move into a blocking
+	// summary run while the user is mid-flow, so the command handlers re-check
+	// the gate right before executing their git operations. Display
 	// surfaces (StatusStore.workerBusy → toolbar indicator) keep the raw busy
 	// flag so progress still shows during ingest.
 	// Local mirrors of the two watcher-fed inputs. Mirrored here (rather than

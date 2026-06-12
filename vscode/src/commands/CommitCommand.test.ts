@@ -206,6 +206,39 @@ describe("CommitCommand", () => {
 		expect(deps.bridge.generateCommitMessage).not.toHaveBeenCalled();
 	});
 
+	it("re-checks the worker gate after the QuickPick and restores the index when it turned busy", async () => {
+		// Click-time check passes (e.g. exempt ingest phase), but the same
+		// drain moves into a blocking summary run during message generation /
+		// QuickPick review — the commit (possibly an Amend rewriting HEAD)
+		// must not execute, and the user's index must be restored.
+		isWorkerBlockingBusy
+			.mockResolvedValueOnce(false)
+			.mockResolvedValueOnce(true);
+		const deps = makeDeps();
+		const command = new CommitCommand(
+			deps.bridge as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
+			deps.statusBar as never,
+			"/repo",
+		);
+		vi.spyOn(command as never, "showCommitQuickPick").mockResolvedValue({
+			item: { label: "$(check) Commit" },
+			message: "feat: generated",
+		});
+
+		await command.execute();
+
+		expect(isWorkerBlockingBusy).toHaveBeenCalledTimes(2);
+		expect(deps.bridge.commit).not.toHaveBeenCalled();
+		expect(deps.bridge.amendCommit).not.toHaveBeenCalled();
+		expect(deps.bridge.restoreIndexTree).toHaveBeenCalledWith("tree-sha");
+		expect(showWarningMessage).toHaveBeenCalledWith(
+			"Jolli Memory: AI summary is being generated. Please wait a moment.",
+		);
+	});
+
 	it("warns when nothing is selected", async () => {
 		const deps = makeDeps();
 		deps.filesStore.getSelectedFiles.mockReturnValue([]);

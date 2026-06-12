@@ -171,6 +171,21 @@ export class CommitCommand {
 			return;
 		}
 
+		// Re-check the worker gate: the click-time check at the top goes stale
+		// during message generation + QuickPick review. A drain that was in the
+		// exempt ingest phase at click time may since have moved on to a blocking
+		// summary entry, and the Amend actions rewrite HEAD under its reads
+		// (same Bug-3 race class as Squash). Restore the index like the cancel
+		// path so the user's staging state survives the abort.
+		if (await isWorkerBlockingBusy(this.workspaceRoot)) {
+			log.warn("commit", "Worker became busy during QuickPick — aborting");
+			vscode.window.showWarningMessage(
+				"Jolli Memory: AI summary is being generated. Please wait a moment.",
+			);
+			await this.restoreIndex(originalIndexTree);
+			return;
+		}
+
 		// Step 5: Re-stage selected files to capture any edits made during message
 		// generation or QuickPick review, then execute the selected action.
 		try {

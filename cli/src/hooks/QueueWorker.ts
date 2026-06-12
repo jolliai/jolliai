@@ -506,6 +506,32 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 }
 
 /**
+ * Second line of defense for the worker-phase marker. If the ingest `finally`
+ * cleanup failed (e.g. Windows AV briefly holding the file), the marker still
+ * reads `ingest` while this same drain processes blocking summary entries —
+ * and the extension's Commit/Squash gates would stay open during exactly the
+ * runs they must block. Retry the delete here; if the file is still
+ * undeletable, overwrite the content so readers see a blocking phase (any
+ * value other than `ingest` blocks). The reader-side mtime staleness check is
+ * the final backstop when both attempts fail.
+ */
+function clearLeftoverIngestMarker(cwd: string): void {
+	const phaseFile = join(getJolliMemoryDir(cwd), WORKER_PHASE_FILE);
+	if (!existsSync(phaseFile)) return;
+	try {
+		rmSync(phaseFile, { force: true });
+	} catch {
+		/* v8 ignore start -- needs an OS-level rm failure; the inner catch additionally needs a write failure */
+		try {
+			writeFileSync(phaseFile, "summary");
+		} catch (e) {
+			log.warn("leftover worker-phase marker could not be cleared or overwritten: %s", errMsg(e));
+		}
+		/* v8 ignore stop */
+	}
+}
+
+/**
  * Processes a single queue entry based on its type.
  * Called by runWorker() for each entry in the queue.
  */
@@ -519,25 +545,46 @@ async function processQueueEntry(
 	// No commit-hash or branch field; dispatch and return before commit-only code.
 	if (isIngestOperation(op)) {
 		log.info("Processing queue entry: type=ingest triggeredBy=%s", op.triggeredBy);
-		// Cosmetic phase marker so the VS Code toolbar shows "Updating Memory
-		// Bank…" instead of "AI summary in progress…" during the (potentially
-		// ~80s) topic-KB ingest. Best-effort: a write/delete failure must never
-		// break ingest, so both ends are wrapped and logged at debug only.
+		// Phase marker consumed by the extension's worker-busy gates (and the
+		// toolbar label): while it reads `ingest` AND is fresh, Commit/Squash
+		// stay enabled and the toolbar shows "Updating Memory Bank…". The write
+		// is best-effort — a failure only over-blocks (missing marker = blocking
+		// summary phase), never under-blocks.
 		const phaseFile = join(getJolliMemoryDir(cwd), WORKER_PHASE_FILE);
 		try {
 			writeFileSync(phaseFile, "ingest");
 		} catch (e) {
-			/* v8 ignore next -- best-effort cosmetic marker; write failure is non-fatal */
+			/* v8 ignore next -- best-effort marker; a write failure only over-blocks */
 			log.debug("worker-phase write skipped (non-fatal): %s", errMsg(e));
 		}
+		// Heartbeat: keep the marker's mtime fresh for the whole ingest. Readers
+		// treat a stale marker as blocking (fail-safe), so a long ingest needs
+		// this to stay exempt — and conversely an orphaned `ingest` marker (both
+		// the cleanup below and the per-entry guard failed) ages out instead of
+		// holding the gates open during a later summary run.
+		/* v8 ignore start -- timer callback never fires inside fast unit tests */
+		const phaseRefreshTimer = setInterval(() => {
+			try {
+				writeFileSync(phaseFile, "ingest");
+			} catch {
+				// Next tick retries; reader-side staleness covers persistent failure.
+			}
+		}, WORKER_LOCK_REFRESH_INTERVAL_MS);
+		/* v8 ignore stop */
 		try {
 			await runIngestFromQueue(op, cwd, storage);
 		} finally {
+			clearInterval(phaseRefreshTimer);
 			try {
 				rmSync(phaseFile, { force: true });
 			} catch (e) {
-				/* v8 ignore next -- best-effort cosmetic marker; cleanup failure is non-fatal */
-				log.debug("worker-phase cleanup skipped (non-fatal): %s", errMsg(e));
+				/* v8 ignore start -- needs an OS-level rm failure (e.g. Windows AV briefly holding the file) */
+				// A surviving `ingest` marker would keep the extension's gates open
+				// while this same drain moves on to blocking summary entries. Two
+				// backstops cover it: clearLeftoverIngestMarker before each
+				// commit-typed entry, and the reader-side mtime staleness check.
+				log.warn("worker-phase cleanup failed — relying on per-entry guard + staleness: %s", errMsg(e));
+				/* v8 ignore stop */
 			}
 		}
 		return;
@@ -545,6 +592,9 @@ async function processQueueEntry(
 
 	// At this point the only remaining operation is commit-typed (the GitOperation
 	// union is CommitGitOperation | IngestOperation, and ingest returned above).
+	// A summary run must present a blocking phase to the extension's gates, so
+	// clear any `ingest` marker a failed cleanup left behind before starting.
+	clearLeftoverIngestMarker(cwd);
 	const commitOp = op as CommitGitOperation;
 	log.info("Processing queue entry: type=%s hash=%s", commitOp.type, commitOp.commitHash.substring(0, 8));
 
@@ -2711,6 +2761,7 @@ export const __test__ = {
 	detectPlanSlugsFromRegistry,
 	detectUncommittedNoteIds,
 	hoistMetadataFromOldSummary,
+	clearLeftoverIngestMarker,
 	associatePlansWithCommit,
 	finalizeReferenceArchive,
 	executePipeline,

@@ -58,8 +58,11 @@ export class SquashCommand {
 		// Guard: block while the post-commit Worker holds the lock for a summary
 		// run (squashing a commit mid-pipeline races the worker's history reads).
 		// The ingest phase (Memory Bank wiki update) is exempt — it never touches
-		// the code branch; a squash landed during it is enqueued and drained by
-		// the chain-spawned successor worker.
+		// the code branch; a squash landed during it is enqueued and drained
+		// right after the ingest entry, usually by the SAME worker in the same
+		// lock hold. That worker can therefore move into a blocking summary run
+		// while the user is still mid-flow here, which is why the gate is
+		// re-checked after the QuickPick below.
 		if (await isWorkerBlockingBusy(this.workspaceRoot)) {
 			vscode.window.showWarningMessage(
 				"Jolli Memory: AI summary is being generated. Please wait a moment.",
@@ -130,6 +133,19 @@ export class SquashCommand {
 		const selectedAction = await this.showSquashQuickPick(squashMessage);
 		if (!selectedAction) {
 			log.info("squash", "QuickPick cancelled by user");
+			return;
+		}
+
+		// Re-check the worker gate: the click-time check at the top goes stale
+		// during LLM message generation + QuickPick review (seconds to minutes).
+		// A drain that was in the exempt ingest phase at click time may since
+		// have moved on to a blocking summary entry — rewriting history under
+		// its reads is exactly the Bug-3 race the gate exists to prevent.
+		if (await isWorkerBlockingBusy(this.workspaceRoot)) {
+			log.warn("squash", "Worker became busy during QuickPick — aborting");
+			vscode.window.showWarningMessage(
+				"Jolli Memory: AI summary is being generated. Please wait a moment.",
+			);
 			return;
 		}
 

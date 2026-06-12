@@ -178,6 +178,7 @@ vi.mock("../core/Locks.js", () => ({
 	refreshWorkerLockMtime: vi.fn(),
 	isWorkerLockHeld: vi.fn(),
 	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
+	WORKER_PHASE_FILE: "worker-phase",
 }));
 
 vi.mock("../core/SummaryStore.js", async (importOriginal) => {

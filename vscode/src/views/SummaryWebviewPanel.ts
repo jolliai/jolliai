@@ -77,7 +77,7 @@ import {
 	deriveRepoNameFromUrl,
 	getCanonicalRepoUrl,
 } from "../util/GitRemoteUtils.js";
-import { isWorkerBusy } from "../util/LockUtils.js";
+import { isWorkerBlockingBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
 import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
 import { BindingChooserWebviewPanel } from "./BindingChooserWebviewPanel.js";
@@ -1522,12 +1522,15 @@ export class SummaryWebviewPanel {
 		);
 	}
 
-	// Returns true when worker is busy: shows the toast and re-runs the
-	// status check so the click-time "Loading..." button gets rebuilt.
+	// Returns true when worker is busy with a blocking (summary) run: shows the
+	// toast and re-runs the status check so the click-time "Loading..." button
+	// gets rebuilt. The ingest phase is exempt, same as the Commit/Squash gates:
+	// PR creation reads already-stored orphan-branch summaries, which ingest
+	// never writes — blocking it for ingest's ~80s+ duration is pure UX damage.
 	private async handleWorkerBusyOrContinue(
 		postMessage: (msg: Record<string, unknown>) => void,
 	): Promise<boolean> {
-		if (!(await isWorkerBusy(this.workspaceRoot))) {
+		if (!(await isWorkerBlockingBusy(this.workspaceRoot))) {
 			return false;
 		}
 		vscode.window.showWarningMessage(
