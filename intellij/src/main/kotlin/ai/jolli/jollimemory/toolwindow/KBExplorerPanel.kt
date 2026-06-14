@@ -4,7 +4,9 @@ import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.KBDataCache
 import ai.jolli.jollimemory.core.KBPathResolver
 import ai.jolli.jollimemory.core.KBRepoDiscoverer
+import ai.jolli.jollimemory.core.IngestPipeline
 import ai.jolli.jollimemory.core.MetadataManager
+import ai.jolli.jollimemory.core.MultiRepoCompile
 import ai.jolli.jollimemory.core.MigrationEngine
 import ai.jolli.jollimemory.core.MigrationState
 import ai.jolli.jollimemory.core.FolderStorage
@@ -34,6 +36,10 @@ import com.intellij.openapi.fileChooser.FileChooser
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.fileTypes.FileTypeManager
+import com.intellij.notification.NotificationType
+import com.intellij.openapi.progress.ProgressIndicator
+import com.intellij.openapi.progress.ProgressManager
+import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.util.text.StringUtil
@@ -189,6 +195,22 @@ class KBExplorerPanel(
             }
         }
         toolbar.add(btnReset)
+        toolbar.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(4)))
+
+        // Build Knowledge Wiki — mirrors VS Code's "Build Knowledge Wiki" toolbar
+        // button (command jollimemory.compileNow): ingests pending sources into
+        // topic pages and regenerates the visible _wiki/ for every Memory Bank repo.
+        val btnBuildWiki = JButton(AllIcons.Actions.Compile).apply {
+            toolTipText = "Build Knowledge Wiki"
+            isBorderPainted = false
+            isFocusPainted = false
+            isContentAreaFilled = false
+            preferredSize = Dimension(JBUI.scale(22), JBUI.scale(22))
+            maximumSize = Dimension(JBUI.scale(22), JBUI.scale(22))
+            margin = JBUI.emptyInsets()
+            addActionListener { buildKnowledgeWiki() }
+        }
+        toolbar.add(btnBuildWiki)
         toolbar.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(4)))
 
         // Sync to Personal Space — mirrors the cloud-upload button on VS Code's
@@ -984,6 +1006,78 @@ class KBExplorerPanel(
     }
 
     /**
+     * Manual "Build Knowledge Wiki" — IntelliJ port of the VS Code
+     * `jollimemory.compileNow` command (vscode/src/CompileCommand.ts). Ingests
+     * pending sources into topic pages and regenerates the visible `_wiki/` for
+     * every Memory Bank repo, with a background progress task and a result toast.
+     */
+    private fun buildKnowledgeWiki() {
+        JM.info("buildKnowledgeWiki: button clicked")
+        val config = SessionTracker.loadConfig()
+        // Ingest is proxy-only (route/reconcile templates are backend-owned), so a Jolli
+        // sign-in is required — an Anthropic key alone can't drive the wiki build.
+        if (config.jolliApiKey.isNullOrBlank()) {
+            notifyWiki(
+                "Building the knowledge wiki requires a Jolli sign-in. Open Settings → Memory Bank and sign in to Jolli, then try again.",
+                NotificationType.INFORMATION,
+            )
+            return
+        }
+        if (wikiBuildInFlight) {
+            notifyWiki("Knowledge wiki build is already in progress.", NotificationType.INFORMATION)
+            return
+        }
+        wikiBuildInFlight = true
+
+        val parent = config.knowledgeBasePath?.let { Path.of(it) } ?: KBPathResolver.KB_PARENT
+        val llmConfig = IngestPipeline.LlmConfig(
+            apiKey = config.apiKey,
+            jolliApiKey = config.jolliApiKey,
+            model = config.model,
+            aiProvider = config.aiProvider,
+        )
+
+        ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Jolli Memory: Building knowledge wiki…", false) {
+            override fun run(indicator: ProgressIndicator) {
+                try {
+                    val result = MultiRepoCompile.compileAllRepos(
+                        parent, llmConfig,
+                        onProgress = { folder -> indicator.text = "Compiling $folder…" },
+                    )
+                    if (result.skipped) {
+                        notifyWiki(
+                            "Another knowledge wiki build is already running for this Memory Bank folder — skipped.",
+                            NotificationType.INFORMATION,
+                        )
+                    } else {
+                        val failedNote = if (result.failed > 0) " (${result.failed} failed)" else ""
+                        notifyWiki(
+                            "Knowledge wiki updated: ${result.totalIngested} source(s) across ${result.repos.size} repo(s)$failedNote.",
+                            NotificationType.INFORMATION,
+                        )
+                    }
+                    // External nio writes — refresh the VFS subtree so the KB tree picks up _wiki/.
+                    ApplicationManager.getApplication().invokeLater {
+                        LocalFileSystem.getInstance().refreshAndFindFileByNioFile(parent)?.refresh(true, true)
+                    }
+                } catch (e: Exception) {
+                    JM.warn("buildKnowledgeWiki failed: ${e.message}")
+                    notifyWiki("Knowledge wiki build failed: ${e.message}", NotificationType.ERROR)
+                } finally {
+                    wikiBuildInFlight = false
+                }
+            }
+        })
+    }
+
+    private fun notifyWiki(message: String, type: NotificationType) {
+        com.intellij.notification.Notifications.Bus.notify(
+            com.intellij.notification.Notification("JolliMemory", "Build Knowledge Wiki", message, type),
+            project,
+        )
+    }
+
+    /**
      * Reflects a sync state change in the toolbar indicator. Runs on the EDT.
      *
      * Mirrors the IDE status-bar widget ([ai.jolli.jollimemory.sync.SyncStatusBarWidget]),
@@ -1154,6 +1248,10 @@ class KBExplorerPanel(
         // Lands in the shared <projectDir>/.jolli/jollimemory/debug.log so the
         // manual-sync click path is observable alongside the sync-layer logs.
         private val JM = ai.jolli.jollimemory.core.JmLogger.create("KBExplorerPanel")
+
+        /** Process-wide guard: at most one knowledge-wiki build runs at a time. */
+        @Volatile
+        private var wikiBuildInFlight = false
     }
 
     // ── Tree cell renderer ─────────────────────────────────────────────────

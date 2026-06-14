@@ -3,6 +3,8 @@ package ai.jolli.jollimemory.hooks
 import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.core.*
 import ai.jolli.jollimemory.services.PlanService
+import ai.jolli.jollimemory.sync.VaultWriteLock
+import ai.jolli.jollimemory.sync.VaultWriteLockMode
 import java.io.File
 import java.time.Instant
 
@@ -364,8 +366,76 @@ object PostCommitHook {
             log.info("=== PostCommitHook worker finished successfully for %s ===", commitInfo.hash.take(8))
 
         } finally {
+            // Auto-ingest + re-render the wiki for this repo after summaries are
+            // written — covers the normal, squash, amend, and no-session paths
+            // (a no-op when nothing is pending). Failures here never fail the worker.
+            try {
+                runIngestAndRender(cwd, config)
+            } catch (e: Exception) {
+                log.warn("Post-commit ingest/render failed (non-fatal): %s", e.message)
+            }
             SessionTracker.releaseLock(cwd)
         }
+    }
+
+    /**
+     * Drains pending sources into topic pages and re-renders the visible `_wiki/`
+     * for the committed repo — the IntelliJ analog of the CLI QueueWorker's
+     * `runIngestFromQueue`, so a user's wiki stays fresh on every commit, not only
+     * when the "Build Knowledge Wiki" button is clicked.
+     *
+     * Credential-missing is a silent skip. Serialized against sync / the manual
+     * sweep on the shared vault-write lock (wait, then skip — the next commit retries).
+     */
+    private fun runIngestAndRender(cwd: String, config: JolliMemoryConfig) {
+        // Ingest is proxy-only (route/reconcile templates are backend-owned), so it
+        // needs a Jolli sign-in — silent skip otherwise (mirrors the CLI worker's
+        // credential-missing skip).
+        if (config.jolliApiKey.isNullOrBlank()) {
+            log.info("No Jolli sign-in — skipping post-commit wiki ingest (proxy-only)")
+            return
+        }
+
+        val repoName = KBPathResolver.extractRepoName(cwd)
+        val remoteUrl = KBPathResolver.getRemoteUrl(cwd)
+        val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
+        val storage = FolderStorage(kbRoot, MetadataManager(kbRoot.resolve(".jolli")))
+
+        val handle = VaultWriteLock.acquire(kbRoot.parent.toString(), VaultWriteLockMode.Wait(VaultWriteLock.DEFAULT_WAIT_MS))
+        if (handle == null) {
+            log.warn("vault-write lock busy — skipping post-commit ingest (next commit retries)")
+            return
+        }
+        try {
+            val llmConfig = IngestPipeline.LlmConfig(
+                apiKey = config.apiKey,
+                jolliApiKey = config.jolliApiKey,
+                model = config.model,
+                aiProvider = config.aiProvider,
+            )
+            ingestAndRenderRepo(kbRoot, storage, IngestPipeline.defaultLlmCaller(llmConfig), config.model)
+        } finally {
+            handle.release()
+        }
+    }
+
+    /**
+     * Lock-free core of [runIngestAndRender]: drains pending sources, then
+     * re-renders the visible wiki when new sources landed OR the wiki is gone
+     * (user deleted `_wiki/`) — mirroring the CLI worker's render condition.
+     * Returns whether a render happened. Internal for testing.
+     */
+    internal fun ingestAndRenderRepo(
+        kbRoot: java.nio.file.Path,
+        storage: StorageProvider,
+        llm: IngestPipeline.LlmCaller,
+        model: String?,
+    ): Boolean {
+        val drain = IngestPipeline.drainIngest(kbRoot, storage, llm, model)
+        log.info("Post-commit ingest: %d batch(es), %d source(s)", drain.batches, drain.ingested)
+        val shouldRender = drain.ingested > 0 || !storage.isTopicWikiPresent()
+        if (shouldRender) TopicWikiRenderer.renderTopicKBWiki(storage)
+        return shouldRender
     }
 
     private fun handleSquash(store: SummaryStore, pending: SquashPendingState, commitInfo: CommitInfo) {
