@@ -105,6 +105,121 @@ class FolderStorage(
         metadataManager.ensure()
     }
 
+    // ── Topic-KB wiki rendering (visible _wiki/ layer) ─────────────────────
+
+    /**
+     * Renders the visible wiki from topic-KB pages. Full rebuild (wipe + rewrite).
+     *
+     * Best-effort relative to the hidden JSON source of truth (`topics/<slug>.json`):
+     * the manifest+disk wipe happens before the rewrite, so a crash mid-render can
+     * leave `_wiki/` empty — recoverable, since the next ingest re-renders. The
+     * `_wiki/` layer is generated, never a source of truth.
+     */
+    override fun renderTopicWiki(pages: List<TopicPage>) {
+        val wikiDir = rootPath.resolve("_wiki")
+        wipeWikiArtifacts(wikiDir)
+        val ctx = buildWikiRenderContext()
+        Files.createDirectories(wikiDir)
+        val compiled = mutableListOf<CompiledTopic>()
+        for (page in pages) {
+            try {
+                val topic = topicPageToCompiledTopic(page)
+                compiled.add(topic)
+                val relPath = "_wiki/topic--${topic.stableSlug}.md"
+                val md = renderTopicImpl(topic, page.relatedBranches, page.lastUpdatedAt, ctx)
+                atomicWrite(rootPath.resolve(relPath), md)
+                metadataManager.updateManifest(ManifestEntry(
+                    path = relPath,
+                    fileId = "wiki-topic-${topic.stableSlug}",
+                    type = "wiki",
+                    fingerprint = sha256(md),
+                    source = ManifestSource(generatedAt = page.lastUpdatedAt),
+                    title = topic.title,
+                ))
+            } catch (e: Exception) {
+                log.warn("renderTopicWiki: failed to render topic %s: %s", page.stableSlug, e.message)
+            }
+        }
+        try {
+            val indexMd = renderTopicKBIndex(compiled, ctx)
+            val indexRel = "_wiki/_index.md"
+            atomicWrite(rootPath.resolve(indexRel), indexMd)
+            metadataManager.updateManifest(ManifestEntry(
+                path = indexRel,
+                fileId = "wiki-index",
+                type = "wiki",
+                fingerprint = sha256(indexMd),
+                source = ManifestSource(generatedAt = java.time.Instant.now().toString()),
+                title = "${ctx.repoName} Knowledge Wiki",
+            ))
+        } catch (e: Exception) {
+            log.warn("renderTopicWiki: failed to render index: %s", e.message)
+        }
+        log.info("Topic-KB wiki regenerated: %d topics under %s", pages.size, wikiDir.toString())
+    }
+
+    /**
+     * `_wiki/_index.md` is written on every successful render, so its presence is
+     * the cheap proxy for "the visible wiki exists" — lets ingest re-render a
+     * user-deleted `_wiki/` even when no new sources were ingested.
+     */
+    override fun isTopicWikiPresent(): Boolean =
+        rootPath.resolve("_wiki").resolve("_index.md").exists()
+
+    /**
+     * Wipes every `.md` under `<rootPath>/_wiki/` and unregisters all manifest rows
+     * of `type="wiki"`. First step of every wiki rebuild (merge is source of truth,
+     * no stale residue).
+     */
+    private fun wipeWikiArtifacts(wikiDir: Path) {
+        // Manifest unregister first — even if the disk wipe fails, the next scan
+        // treats orphan wiki markdown as user files (recoverable), not ghost rows.
+        metadataManager.unregisterFilesByType("wiki")
+
+        if (!Files.isDirectory(wikiDir)) return
+        try {
+            Files.list(wikiDir).use { stream ->
+                stream.filter { it.fileName.toString().endsWith(".md") }.forEach { entry ->
+                    try {
+                        Files.deleteIfExists(entry)
+                    } catch (e: Exception) {
+                        log.warn("wipeWikiArtifacts: failed to unlink %s: %s", entry.toString(), e.message)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            log.warn("wipeWikiArtifacts: failed to list %s: %s", wikiDir.toString(), e.message)
+        }
+    }
+
+    /**
+     * Builds the [WikiRenderContext] used by the wiki renderers. Lookups go through
+     * [MetadataManager] so renames / dirty manifest rows reflect the same source the
+     * visible layer was written from.
+     */
+    private fun buildWikiRenderContext(): WikiRenderContext {
+        val repoConfig = metadataManager.readConfig()
+        val branchByName = metadataManager.listBranchMappings().associate { it.branch to it.folder }
+
+        // Pre-index manifest by short commit hash so per-topic lookups don't rescan.
+        val manifest = metadataManager.readManifest()
+        val byShortHash = HashMap<String, ManifestEntry>()
+        for (entry in manifest.files) {
+            val hash = entry.source.commitHash
+            if (entry.type == "commit" && hash != null) {
+                byShortHash[hash.take(8)] = entry
+            }
+        }
+
+        return WikiRenderContext(
+            repoName = repoConfig.repoName ?: "Memory Bank",
+            // entry.path is relative to kbRoot; wiki links are relative to <kbRoot>/_wiki/.
+            resolveCommitVisiblePath = { hash8 -> byShortHash[hash8]?.let { "../${it.path}" } },
+            resolveBranchFolder = { branch -> branchByName[branch] },
+            resolveCommitMessage = { hash8 -> byShortHash[hash8]?.title },
+        )
+    }
+
     // ── Markdown generation ────────────────────────────────────────────────
 
     /**

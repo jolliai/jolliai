@@ -19,10 +19,16 @@ data class ManifestSource(
 data class ManifestEntry(
     val path: String,
     val fileId: String,
-    val type: String,            // "commit" | "plan" | "note"
+    // "commit" | "plan" | "note" | "wiki". "wiki" tags the generated
+    // <kbRoot>/_wiki/topic--<slug>.md and _index.md pages so MemoryBankScanner
+    // (which filters by manifest-path membership) excludes them from
+    // "user-written" classification.
+    val type: String,
     val fingerprint: String,
     val source: ManifestSource,
     val title: String? = null,   // human-readable display name (e.g. commit message)
+    /** ISO 8601 last-write time. Ordering key for plan/note in the topic-KB timeline fold. */
+    val updatedAt: String? = null,
 )
 
 /** .jolli/manifest.json — tracks AI-generated files in the KB folder */
