@@ -45,4 +45,11 @@ class DualWriteStorage(
             log.warn("Shadow ensure failed (folder storage): %s", e.message)
         }
     }
+
+    // The visible wiki lives only in the folder layer — delegate to the shadow.
+    override fun renderTopicWiki(pages: List<TopicPage>) {
+        shadow.renderTopicWiki(pages)
+    }
+
+    override fun isTopicWikiPresent(): Boolean = shadow.isTopicWikiPresent()
 }

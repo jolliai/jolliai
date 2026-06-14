@@ -67,6 +67,21 @@ class MetadataManager(private val jolliDir: Path) {
         log.info("Manifest updated: %s (%s)", entry.path, entry.type)
     }
 
+    /**
+     * Removes every manifest entry of [type]. Used by `FolderStorage.renderTopicWiki`
+     * to clear stale `type="wiki"` rows before re-emitting the wiki batch. Returns
+     * the number of entries removed.
+     */
+    fun unregisterFilesByType(type: String): Int {
+        val manifest = readManifest()
+        val kept = manifest.files.filter { it.type != type }
+        val removed = manifest.files.size - kept.size
+        if (removed == 0) return 0
+        atomicWrite(manifestPath, gson.toJson(manifest.copy(files = kept)))
+        log.info("Manifest unregistered %d entries of type=%s", removed, type)
+        return removed
+    }
+
     /** Removes a manifest entry by fileId. Returns true if an entry was removed. */
     fun removeFromManifest(fileId: String): Boolean {
         val manifest = readManifest()
@@ -138,6 +153,16 @@ class MetadataManager(private val jolliDir: Path) {
     /** Returns all branch mappings. */
     fun listBranchMappings(): List<BranchMapping> {
         return readBranches().mappings
+    }
+
+    /**
+     * Reverse of [resolveFolderForBranch]: maps a visible folder name back to its
+     * branch via branches.json, falling back to the folder name itself when no
+     * mapping exists (missing/renamed branches.json). Shared by MemoryBankScanner
+     * and FolderPlanNoteSource so both derive branch identically.
+     */
+    fun folderToBranch(folder: String): String {
+        return listBranchMappings().find { it.folder == folder }?.branch ?: folder
     }
 
     /** Reads the branches.json file. */
