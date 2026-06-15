@@ -522,10 +522,25 @@ tasks {
 
     test {
         useJUnitPlatform()
+        // Run test classes across several JVMs in parallel. The suite is ~1094 plain
+        // unit tests in one sequential JVM by default (~20 min); separate forks give
+        // full isolation (each fork has its own System.out and mockk global state, so
+        // the System.out-swapping and mockkStatic/mockkObject tests can't race), unlike
+        // in-JVM JUnit parallelism. Capped to avoid oversubscribing the IDE-sandbox JVMs.
+        // Partitioning captured output per fork (vs. one shared buffer) also avoids the
+        // Gradle "Could not write XML test results" failure that the serial run hit when a
+        // test emitted a NUL byte that is illegal in XML 1.0. Cuts a full run to ~5 min.
+        maxParallelForks = (Runtime.getRuntime().availableProcessors() / 2).coerceIn(1, 6)
         javaLauncher.set(
             project.the<JavaToolchainService>().launcherFor {
                 languageVersion.set(JavaLanguageVersion.of(21))
             }
         )
+        // Surface failures (and the full stack trace) in the console; pass `-i` for a
+        // live per-test ticker. Deliberately no "passed" event — 1094 lines is noise.
+        testLogging {
+            events("failed", "skipped")
+            exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+        }
     }
 }
