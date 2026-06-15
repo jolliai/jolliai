@@ -160,7 +160,7 @@ class StageVaultTest {
 		Files.writeString(target, "{}")
 		val link = tempDir.resolve("my-repo/.jolli/index.json")
 		Files.createDirectories(link.parent)
-		Files.createSymbolicLink(link, target)
+		createSymbolicLinkOrSkip(link, target)
 
 		val report = stageVault(client, tempDir.toString(), StageVaultOpts(syncTranscripts = true))
 		assertEquals(0, report.added)
