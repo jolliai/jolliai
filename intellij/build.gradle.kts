@@ -4,6 +4,7 @@ import java.util.zip.ZipOutputStream
 import java.util.zip.ZipEntry
 import java.io.ByteArrayOutputStream
 import java.io.FileOutputStream
+import java.util.concurrent.atomic.AtomicInteger
 
 plugins {
     id("java")
@@ -542,5 +543,29 @@ tasks {
             events("failed", "skipped")
             exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
         }
+        // Live progress without the per-test spam: a running counter aggregated across
+        // all forks (events land in the Gradle daemon, so the AtomicInteger is safe).
+        // Prints "… N tests done" every 50 tests on the console, AND mirrors the count to
+        // build/test-progress.txt so a backgrounded run can be polled (scripts/test-progress.sh).
+        // Gradle only flushes the per-class TEST-*.xml files at the end of the task, so that
+        // file — not the XML — is the source of truth for live progress.
+        val testProgress = AtomicInteger(0)
+        val progressFile = layout.buildDirectory.file("test-progress.txt").get().asFile
+        doFirst {
+            progressFile.parentFile.mkdirs()
+            progressFile.writeText("0")
+        }
+        afterTest(
+            org.gradle.kotlin.dsl.KotlinClosure2<TestDescriptor, TestResult, Unit>({ _, _ ->
+                val n = testProgress.incrementAndGet()
+                synchronized(testProgress) { progressFile.writeText(n.toString()) }
+                if (n % 50 == 0) logger.lifecycle("  … $n tests done")
+            }),
+        )
+        afterSuite(
+            org.gradle.kotlin.dsl.KotlinClosure2<TestDescriptor, TestResult, Unit>({ desc, _ ->
+                if (desc.parent == null) logger.lifecycle("  ✓ ${testProgress.get()} tests done")
+            }),
+        )
     }
 }
