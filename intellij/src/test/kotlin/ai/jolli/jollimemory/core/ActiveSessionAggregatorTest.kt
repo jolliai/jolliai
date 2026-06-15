@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.core
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
@@ -15,14 +16,32 @@ class ActiveSessionAggregatorTest {
 	@TempDir
 	lateinit var tempDir: File
 
+	/**
+	 * Isolated home so source discoverers that scan the user's home directory
+	 * (Codex's `~/.codex/sessions`, Gemini, OpenCode, …) see an empty tree
+	 * instead of the real machine's sessions. Without this, a developer with a
+	 * recent Codex session would have it leak into every aggregator assertion.
+	 */
+	@TempDir
+	lateinit var homeDir: File
+
 	private val cwd get() = tempDir.absolutePath
 
 	private val HOUR = 3_600_000L
 	private val DAY = 24 * HOUR
 
+	private var originalHome: String? = null
+
 	@BeforeEach
 	fun setUp() {
+		originalHome = System.getProperty("user.home")
+		System.setProperty("user.home", homeDir.absolutePath)
 		File(tempDir, ".jolli/jollimemory").mkdirs()
+	}
+
+	@AfterEach
+	fun tearDown() {
+		originalHome?.let { System.setProperty("user.home", it) }
 	}
 
 	private fun iso(offsetMs: Long): String =

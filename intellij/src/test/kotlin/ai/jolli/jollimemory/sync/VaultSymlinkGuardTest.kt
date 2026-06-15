@@ -53,7 +53,7 @@ class VaultSymlinkGuardTest {
 		Files.createDirectories(realTarget)
 		// Create a symlink inside the vault pointing outside.
 		val link = vault.resolve("evil-link")
-		Files.createSymbolicLink(link, realTarget)
+		createSymbolicLinkOrSkip(link, realTarget)
 		assertThrows(IllegalStateException::class.java) {
 			assertNoSymlinksInPath(
 				vault.toString(),
