@@ -10,6 +10,7 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
+import java.time.Instant
 import kotlin.io.path.exists
 import kotlin.io.path.isRegularFile
 
@@ -317,11 +318,16 @@ class FolderStorage(
         val fingerprint = sha256(markdown)
         metadataManager.updateManifest(ManifestEntry(
             path = relativePath,
-            fileId = "plan-$slug",
+            // `plan:<slug>` — colon-delimited to match the CLI contract
+            // (cli/src/core/FolderStorage.ts) and FolderPlanNoteSource.idFromFileId.
+            fileId = "plan:$slug",
             type = "plan",
             fingerprint = fingerprint,
             source = ManifestSource(branch = resolvedBranch),
             title = extractTitleFromMarkdown(content),
+            // Stable, content-travelling ordering key for the timeline fold; without
+            // it the reader falls back to local mtime, which diverges across sync/copy.
+            updatedAt = Instant.now().toString(),
         ))
 
         log.info("Plan markdown generated: %s", relativePath)
@@ -348,11 +354,16 @@ class FolderStorage(
         val fingerprint = sha256(markdown)
         metadataManager.updateManifest(ManifestEntry(
             path = relativePath,
-            fileId = "note-$slug",
+            // `note:<slug>` — colon-delimited to match the CLI contract
+            // (cli/src/core/FolderStorage.ts) and FolderPlanNoteSource.idFromFileId.
+            fileId = "note:$slug",
             type = "note",
             fingerprint = fingerprint,
             source = ManifestSource(branch = resolvedBranch),
             title = extractTitleFromMarkdown(content),
+            // Stable, content-travelling ordering key for the timeline fold; without
+            // it the reader falls back to local mtime, which diverges across sync/copy.
+            updatedAt = Instant.now().toString(),
         ))
 
         log.info("Note markdown generated: %s", relativePath)

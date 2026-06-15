@@ -61,6 +61,26 @@ class FolderPlanNoteSourceTest {
     }
 
     @Test
+    fun `tolerates legacy hyphen-prefixed fileIds and resolves the hidden source`() {
+        // Pre-fix IntelliJ writer emitted `plan-<slug>` / `note-<slug>` (hyphen),
+        // which the colon-only stripper left intact, breaking the hidden-path lookup.
+        metadataManager.updateManifest(
+            ManifestEntry(
+                path = "main/plan--legacy.md", fileId = "plan-legacy", type = "plan",
+                fingerprint = "fp", source = ManifestSource(branch = "main"),
+                title = "Legacy Plan", updatedAt = "2026-01-03T00:00:00Z",
+            ),
+        )
+        Files.createDirectories(kbRoot.resolve(".jolli/plans"))
+        Files.writeString(kbRoot.resolve(".jolli/plans/legacy.md"), "# Legacy body\n", StandardCharsets.UTF_8)
+
+        val refs = FolderPlanNoteSource.listFolderPlanNoteRefs(kbRoot)
+        refs shouldHaveSize 1
+        refs[0].id shouldBe "legacy"
+        FolderPlanNoteSource.loadFolderPlanNoteContent(kbRoot, refs[0]) shouldBe "# Legacy body\n"
+    }
+
+    @Test
     fun `ignores non plan-note manifest entries`() {
         metadataManager.updateManifest(
             ManifestEntry(

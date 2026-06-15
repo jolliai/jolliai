@@ -76,14 +76,19 @@ class AnthropicClient(private val apiKey: String) {
         return parseSseStream(response.body(), model)
     }
 
-    /** Accumulates an SSE message stream into a [MessageResponse]. */
-    private fun parseSseStream(lines: Stream<String>, fallbackModel: String): MessageResponse {
+    /** Accumulates an SSE message stream into a [MessageResponse]. Internal for direct testing. */
+    internal fun parseSseStream(lines: Stream<String>, fallbackModel: String): MessageResponse {
         val text = StringBuilder()
         var id = ""
         var model = fallbackModel
         var stopReason: String? = null
         var inputTokens = 0
         var outputTokens = 0
+        // A 200 response only means the stream opened; the API can still emit an
+        // `error` event mid-stream, or the connection can drop before the terminal
+        // `message_stop`. Track the terminal so we reject truncated streams instead
+        // of silently returning empty/partial text as a "successful" call.
+        var sawMessageStop = false
         lines.forEach { raw ->
             val line = raw.trim()
             if (!line.startsWith("data:")) return@forEach
@@ -95,6 +100,14 @@ class AnthropicClient(private val apiKey: String) {
                 return@forEach
             } ?: return@forEach
             when (ev.get("type")?.asString) {
+                "error" -> {
+                    val err = ev.getAsJsonObject("error")
+                    val errType = err?.get("type")?.takeIf { !it.isJsonNull }?.asString ?: "unknown"
+                    val errMsg = err?.get("message")?.takeIf { !it.isJsonNull }?.asString ?: json.take(200)
+                    log.error("Anthropic stream error event: %s — %s", errType, errMsg)
+                    throw RuntimeException("Anthropic stream error ($errType): $errMsg")
+                }
+                "message_stop" -> sawMessageStop = true
                 "message_start" -> ev.getAsJsonObject("message")?.let { msg ->
                     msg.get("id")?.takeIf { !it.isJsonNull }?.let { id = it.asString }
                     msg.get("model")?.takeIf { !it.isJsonNull }?.let { model = it.asString }
@@ -110,6 +123,10 @@ class AnthropicClient(private val apiKey: String) {
                     ev.getAsJsonObject("usage")?.get("output_tokens")?.takeIf { !it.isJsonNull }?.let { outputTokens = it.asInt }
                 }
             }
+        }
+        if (!sawMessageStop) {
+            log.error("Anthropic stream ended without message_stop (truncated); %d chars accumulated", text.length)
+            throw RuntimeException("Anthropic stream ended prematurely (no message_stop)")
         }
         return MessageResponse(
             id = id,
