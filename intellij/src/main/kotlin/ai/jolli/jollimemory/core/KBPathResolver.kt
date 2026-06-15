@@ -34,10 +34,14 @@ object KBPathResolver {
      * @param customPath User-configured custom path from JolliMemoryConfig, or null for default
      * @return The resolved KB root path
      */
+    /** Resolves the Memory Bank parent dir from an optional custom path. */
+    private fun resolveParent(customPath: String?): Path =
+        if (!customPath.isNullOrBlank()) Path.of(customPath) else KB_PARENT
+
     fun resolve(repoName: String, remoteUrl: String?, customPath: String? = null): Path {
         // Custom path is treated as parent directory (like ~/Documents/jolli/),
         // repoName is always appended to keep repos separated
-        val parent = if (!customPath.isNullOrBlank()) Path.of(customPath) else KB_PARENT
+        val parent = resolveParent(customPath)
         val basePath = parent.resolve(repoName)
 
         // Folder doesn't exist yet — use it
@@ -52,7 +56,7 @@ object KBPathResolver {
         }
 
         // Collision: different repo with same name — find next available suffix
-        return findAvailablePath(repoName, remoteUrl)
+        return findAvailablePath(parent, repoName, remoteUrl)
     }
 
     /**
@@ -70,6 +74,90 @@ object KBPathResolver {
             repoName = repoName,
         ))
         log.info("KB folder initialized: %s (remote=%s)", kbRoot, remoteUrl ?: "none")
+    }
+
+    /**
+     * Returns every existing KB folder (`<repo>` and `<repo>-2` … `<repo>-99`)
+     * under the Memory Bank parent whose `.jolli/config.json` identity matches
+     * this repo. Read-only.
+     *
+     * Used by the Migrate-to-Memory-Bank flow to fold a *pile* of duplicates in
+     * one pass: earlier buggy runs left several `<repo>-N` folders all sharing one
+     * identity, and archiving only one would clear them one-click-at-a-time. Only
+     * true identity matches are returned, so it is safe to feed to [archiveKBFolder].
+     * Port of the canonical TS `findRepoFolders`.
+     */
+    fun findRepoFolders(repoName: String, remoteUrl: String?, customPath: String? = null): List<Path> {
+        val parent = resolveParent(customPath)
+        val out = mutableListOf<Path>()
+        val base = parent.resolve(repoName)
+        if (Files.isDirectory(base)) {
+            val baseConfig = readKBConfig(base)
+            if (baseConfig != null && isSameRepo(baseConfig, remoteUrl, repoName)) out.add(base)
+        }
+        for (suffix in 2..99) {
+            val candidate = parent.resolve("$repoName-$suffix")
+            if (!Files.isDirectory(candidate)) continue
+            val config = readKBConfig(candidate)
+            if (config != null && isSameRepo(config, remoteUrl, repoName)) out.add(candidate)
+        }
+        return out
+    }
+
+    /**
+     * Returns the next unused `-N` KB path (or the bare `<repo>` when free) so the
+     * Migrate flow can build into a fresh folder and archive the prior ones.
+     * Port of the canonical TS `findFreshKBPath`.
+     */
+    fun findFreshKBPath(repoName: String, customPath: String? = null): Path {
+        val parent = resolveParent(customPath)
+        val basePath = parent.resolve(repoName)
+        if (!Files.isDirectory(basePath)) return basePath
+        for (suffix in 2..99) {
+            val candidate = parent.resolve("$repoName-$suffix")
+            if (!Files.isDirectory(candidate)) return candidate
+        }
+        return parent.resolve("$repoName-${System.currentTimeMillis()}")
+    }
+
+    /**
+     * Moves a KB repo folder out of the active Memory Bank area into the hidden,
+     * per-Memory-Bank archive dir `<parent>/.jolli/archive/<name>-<timestamp>/`.
+     *
+     * Replaces the old "archive = rewrite config.json identity in place" step,
+     * which left the folder visible in the IDE folder views AND still tracked by
+     * the vault git. The archive dir is hidden (leading dot → filtered by the IDE
+     * explorers) and unowned by the sync classifier, while staying inside the
+     * Memory Bank so it travels with `localFolder` and stays recoverable (the
+     * orphan branch remains the system of record).
+     *
+     * Returns the destination path, or null if [kbRoot] doesn't exist (nothing to
+     * archive) or the move fails — callers log and proceed, since a stale visible
+     * folder is a lesser evil than aborting a rebuild. Mirrors the canonical TS
+     * `archiveKBFolder`; both IDEs resolve folders in the same Memory Bank.
+     */
+    fun archiveKBFolder(kbRoot: Path, customPath: String? = null): Path? {
+        if (!Files.isDirectory(kbRoot)) return null
+        val parent = resolveParent(customPath)
+        val archiveDir = parent.resolve(".jolli").resolve("archive")
+        val name = kbRoot.fileName.toString()
+        // Timestamp keeps repeated archives distinct; the counter guards against
+        // same-millisecond collisions (rapid rebuilds).
+        var dest = archiveDir.resolve("$name-${System.currentTimeMillis()}")
+        var n = 2
+        while (Files.exists(dest) && n <= 99) {
+            dest = archiveDir.resolve("$name-${System.currentTimeMillis()}-$n")
+            n++
+        }
+        return try {
+            Files.createDirectories(archiveDir)
+            Files.move(kbRoot, dest)
+            log.info("Archived KB folder: %s → %s", kbRoot, dest)
+            dest
+        } catch (e: Exception) {
+            log.warn("Failed to archive KB folder %s: %s", kbRoot, e.message)
+            null
+        }
     }
 
     /**
@@ -194,20 +282,27 @@ object KBPathResolver {
         return ":$port"
     }
 
-    private fun findAvailablePath(repoName: String, remoteUrl: String?): Path {
+    private fun findAvailablePath(parent: Path, repoName: String, remoteUrl: String?): Path {
+        // Pass 1: reuse an existing folder that already belongs to this repo. Scan
+        // ALL suffixes first — a folder archived out of the ladder leaves a numbering
+        // hole, and stopping at that hole (claiming it fresh) while a higher-numbered
+        // folder already holds this repo is what spawned duplicate <repo>-N folders.
+        // Mirrors the TS findAvailablePathAndClaim two-pass fix.
+        var firstUnused: Path? = null
         for (suffix in 2..99) {
-            val candidate = KB_PARENT.resolve("$repoName-$suffix")
+            val candidate = parent.resolve("$repoName-$suffix")
             if (!Files.isDirectory(candidate)) {
-                return candidate
+                if (firstUnused == null) firstUnused = candidate
+                continue
             }
-            // Check if this suffixed folder belongs to the same repo
             val config = readKBConfig(candidate)
             if (config != null && isSameRepo(config, remoteUrl, repoName)) {
                 return candidate
             }
         }
-        // Extremely unlikely fallback
-        return KB_PARENT.resolve("$repoName-${System.currentTimeMillis()}")
+        // Pass 2: no existing folder for this repo — use the lowest free slot.
+        // The millis-suffixed name is the 99-collision safety net only.
+        return firstUnused ?: parent.resolve("$repoName-${System.currentTimeMillis()}")
     }
 
     private fun readKBConfig(kbRoot: Path): KBConfig? {

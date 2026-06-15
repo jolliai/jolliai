@@ -624,8 +624,9 @@ vi.mock("../../cli/src/core/SummaryStore.js", () => ({
 // and the rebuildKnowledgeBase command run with predictable, side-effect-free
 // stand-ins. Each test that exercises those paths overrides the relevant helper
 // via `vi.mocked(...).mockReturnValueOnce`.
-const { mockArchiveKBFolder } = vi.hoisted(() => ({
+const { mockArchiveKBFolder, mockFindRepoFolders } = vi.hoisted(() => ({
 	mockArchiveKBFolder: vi.fn(() => "/test/kb-parent/.jolli/archive/test-repo-123"),
+	mockFindRepoFolders: vi.fn(() => ["/test/kb"]),
 }));
 
 vi.mock("../../cli/src/core/KBPathResolver.js", () => ({
@@ -633,7 +634,7 @@ vi.mock("../../cli/src/core/KBPathResolver.js", () => ({
 	getRemoteUrl: vi.fn(() => null),
 	resolveKBPath: vi.fn(() => "/test/kb"),
 	resolveKbParent: vi.fn(() => "/test/kb-parent"),
-	peekKBPath: vi.fn(() => "/test/kb"),
+	findRepoFolders: mockFindRepoFolders,
 	findFreshKBPath: vi.fn(() => "/test/kb-2"),
 	initializeKBFolder: vi.fn(),
 	archiveKBFolder: mockArchiveKBFolder,
@@ -7299,6 +7300,8 @@ describe("Extension", () => {
 			mockArchiveKBFolder.mockReturnValue(
 				"/test/kb-parent/.jolli/archive/test-repo-123",
 			);
+			mockFindRepoFolders.mockReset();
+			mockFindRepoFolders.mockReturnValue(["/test/kb"]);
 		});
 
 		it("returns ok when rebuild migration completes", async () => {
@@ -7307,10 +7310,35 @@ describe("Extension", () => {
 			const result = (await handler()) as { ok: boolean; message: string };
 			expect(result.ok).toBe(true);
 			expect(result.message).toContain("memories migrated");
-			// Archive: the old folder (peekKBPath = "/test/kb") differs from the
-			// fresh one (findFreshKBPath = "/test/kb-2"), so it's MOVED into the
-			// hidden .jolli/archive/ rather than having its identity rewritten.
+			// Archive: every prior folder for this repo (findRepoFolders = ["/test/kb"])
+			// differs from the fresh one (findFreshKBPath = "/test/kb-2"), so it's MOVED
+			// into the hidden .jolli/archive/ rather than having its identity rewritten.
 			expect(mockArchiveKBFolder).toHaveBeenCalledWith("/test/kb", undefined);
+		});
+
+		it("folds a pile of duplicate folders in one Migrate (archives all but the fresh one)", async () => {
+			// Earlier buggy runs left several same-repo folders. findRepoFolders
+			// returns the whole pile; every one must be archived in a single click.
+			mockFindRepoFolders.mockReturnValueOnce(["/test/kb-3", "/test/kb-4", "/test/kb-5"]);
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.rebuildKnowledgeBase");
+			const result = (await handler()) as { ok: boolean; message: string };
+			expect(result.ok).toBe(true);
+			expect(mockArchiveKBFolder).toHaveBeenCalledWith("/test/kb-3", undefined);
+			expect(mockArchiveKBFolder).toHaveBeenCalledWith("/test/kb-4", undefined);
+			expect(mockArchiveKBFolder).toHaveBeenCalledWith("/test/kb-5", undefined);
+			expect(mockArchiveKBFolder).toHaveBeenCalledTimes(3);
+		});
+
+		it("never archives the freshly-created folder even if it appears in the list", async () => {
+			// Defensive: findFreshKBPath = "/test/kb-2"; if it somehow shows up in the
+			// stale list it must be skipped (the `stale !== newKbRoot` guard).
+			mockFindRepoFolders.mockReturnValueOnce(["/test/kb", "/test/kb-2"]);
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.rebuildKnowledgeBase");
+			await handler();
+			expect(mockArchiveKBFolder).toHaveBeenCalledWith("/test/kb", undefined);
+			expect(mockArchiveKBFolder).not.toHaveBeenCalledWith("/test/kb-2", undefined);
 		});
 
 		// Same successful-rebuild path, but with memoriesStore.hasFirstLoaded

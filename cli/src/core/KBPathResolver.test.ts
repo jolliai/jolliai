@@ -8,6 +8,7 @@ import {
 	assertValidLocalFolder,
 	extractRepoName,
 	findFreshKBPath,
+	findRepoFolders,
 	foldGitTransportToHttps,
 	getRemoteUrl,
 	InvalidLocalFolderError,
@@ -451,6 +452,81 @@ esac
 
 			const result = resolveKBPath("miss", "https://github.com/u/different.git", tempDir);
 			expect(result).toBe(join(tempDir, "miss-3"));
+		});
+	});
+
+	describe("archived numbering hole (duplicate-folder / Migrate archive-gate fix)", () => {
+		// Archiving a folder MOVES it out of the ladder, leaving a numbering hole
+		// (e.g. `repo-2` gone while `repo-3` remains). The selectors must not stop
+		// at the hole and ignore a higher-numbered folder that still holds the repo,
+		// or normal resolution spawns a fresh duplicate and the Migrate archive gate
+		// (oldKbRoot !== newKbRoot) collapses onto the same hole and never fires.
+
+		function seedHoleScenario(): string {
+			// base `repo` belongs to a different repo; `repo-2` is the hole (absent);
+			// `repo-3` is the canonical folder for our repo.
+			initializeKBFolder(join(tempDir, "repo"), "repo", "https://github.com/u/other.git");
+			const canonical = join(tempDir, "repo-3");
+			initializeKBFolder(canonical, "repo", "https://github.com/u/canonical.git");
+			return canonical;
+		}
+
+		it("resolveKBPath reuses the higher-numbered match instead of claiming the hole", () => {
+			const canonical = seedHoleScenario();
+			expect(resolveKBPath("repo", "https://github.com/u/canonical.git", tempDir)).toBe(canonical);
+			// The hole must NOT have been claimed as a side effect.
+			expect(existsSync(join(tempDir, "repo-2"))).toBe(false);
+		});
+
+		it("peekKBPath returns the real folder, not the hole", () => {
+			const canonical = seedHoleScenario();
+			expect(peekKBPath("repo", "https://github.com/u/canonical.git", tempDir)).toBe(canonical);
+		});
+
+		it("Migrate archive gate fires: peekKBPath (old) differs from findFreshKBPath (new)", () => {
+			seedHoleScenario();
+			const oldKbRoot = peekKBPath("repo", "https://github.com/u/canonical.git", tempDir);
+			const newKbRoot = findFreshKBPath("repo", tempDir);
+			expect(oldKbRoot).toBe(join(tempDir, "repo-3")); // current folder, not the hole
+			expect(newKbRoot).toBe(join(tempDir, "repo-2")); // fresh slot fills the hole
+			expect(oldKbRoot).not.toBe(newKbRoot); // gate fires → archiveKBFolder runs
+		});
+
+		it("findRepoFolders returns every same-repo folder (base + suffixes), skipping holes and other repos", () => {
+			const remote = "https://github.com/u/canonical.git";
+			// base belongs to a DIFFERENT repo → excluded.
+			initializeKBFolder(join(tempDir, "repo"), "repo", "https://github.com/u/other.git");
+			// repo-2 is a hole (absent) → skipped.
+			// repo-3, repo-4 are our repo → included.
+			initializeKBFolder(join(tempDir, "repo-3"), "repo", remote);
+			initializeKBFolder(join(tempDir, "repo-4"), "repo", remote);
+			// repo-5 is yet another repo → excluded.
+			initializeKBFolder(join(tempDir, "repo-5"), "repo", "https://github.com/u/third.git");
+
+			const found = findRepoFolders("repo", remote, tempDir);
+			expect(found.sort()).toEqual([join(tempDir, "repo-3"), join(tempDir, "repo-4")].sort());
+		});
+
+		it("findRepoFolders includes the base folder when it matches the repo", () => {
+			const remote = "https://github.com/u/canonical.git";
+			initializeKBFolder(join(tempDir, "repo"), "repo", remote);
+			initializeKBFolder(join(tempDir, "repo-2"), "repo", remote);
+
+			const found = findRepoFolders("repo", remote, tempDir);
+			expect(found.sort()).toEqual([join(tempDir, "repo"), join(tempDir, "repo-2")].sort());
+		});
+
+		it("prefers a same-repo match over an unclaimed stub at a lower suffix", () => {
+			initializeKBFolder(join(tempDir, "s"), "s", "https://github.com/u/other.git");
+			// s-2 is an unclaimed schema-default stub (no remoteUrl, no repoName).
+			const stub = join(tempDir, "s-2");
+			mkdirSync(join(stub, ".jolli"), { recursive: true });
+			writeFileSync(join(stub, ".jolli", "config.json"), JSON.stringify({ version: 1 }), "utf-8");
+			// s-3 is the real same-repo folder.
+			const canonical = join(tempDir, "s-3");
+			initializeKBFolder(canonical, "s", "https://github.com/u/canonical.git");
+
+			expect(resolveKBPath("s", "https://github.com/u/canonical.git", tempDir)).toBe(canonical);
 		});
 	});
 

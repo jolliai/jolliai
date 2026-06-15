@@ -823,13 +823,28 @@ class SettingsDialog(
                     val config = SessionTracker.loadConfig()
                     val repoName = KBPathResolver.extractRepoName(projectPath)
                     val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
-                    val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
+
+                    // Enumerate every folder that currently holds this repo BEFORE
+                    // creating the fresh one, so a pile of duplicates left by earlier
+                    // buggy runs is folded in a single Migrate. Build into a fresh -N
+                    // folder, then MOVE the prior ones into the hidden .jolli/archive/
+                    // (not an in-place identity rewrite, which left them visible and
+                    // still git-tracked). Mirrors the VS Code rebuildKnowledgeBase flow.
+                    val staleFolders = KBPathResolver.findRepoFolders(repoName, remoteUrl, config.knowledgeBasePath)
+                    val kbRoot = KBPathResolver.findFreshKBPath(repoName, config.knowledgeBasePath)
+                    KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
                     val mm = MetadataManager(kbRoot.resolve(".jolli"))
                     val folder = FolderStorage(kbRoot, mm)
                     folder.ensure()
 
                     val engine = MigrationEngine(orphan, folder, mm)
                     val result = engine.runMigration()
+
+                    // The fresh folder didn't exist when staleFolders was captured, so
+                    // it can't appear in the list; the guard is belt-and-suspenders.
+                    for (stale in staleFolders) {
+                        if (stale != kbRoot) KBPathResolver.archiveKBFolder(stale, config.knowledgeBasePath)
+                    }
 
                     if (result.status == "completed") {
                         Messages.showInfoMessage(project,
