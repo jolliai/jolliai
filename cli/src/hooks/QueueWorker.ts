@@ -1502,6 +1502,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 				{ fromRef: oldHash, toRef: op.commitHash },
 				{ commitType: "amend", commitSource },
 				op.createdAt,
+				op.branch,
 			);
 		} catch (err: unknown) {
 			log.error("Amend pipeline failed: %s", (err as Error).message);
@@ -2284,6 +2285,7 @@ async function handleAmendPipeline(
 	diffOverride?: { readonly fromRef: string; readonly toRef: string },
 	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
 	beforeTimestamp?: string,
+	branchHint?: string,
 ): Promise<void> {
 	// Load old summary (may not exist if the original commit had no LLM summary).
 	const oldSummary = await getSummary(oldHash, cwd);
@@ -2427,7 +2429,8 @@ async function handleAmendPipeline(
 
 	// Same registry-driven prompt assembly as executePipeline (see Stage 2 wiring).
 	/* v8 ignore start -- amend-pipeline prompt-block assembly mirrors executePipeline's Stage 2 path. The amend path is exercised via PostCommitHook.helpers tests but not the prompt-block content specifically; the helpers and shapes are covered by their own dedicated tests. */
-	const branchForBlocks = await getCurrentBranch(cwd);
+	// Prefer the captured branch over a live read for the same reason as executePipeline; see line 1529.
+	const branchForBlocks = branchHint ?? (await getCurrentBranch(cwd));
 	const [rawAmendPlanEntries, rawAmendNoteEntries, rawAmendReferenceEntries] = await Promise.all([
 		detectActivePlansForBranch(cwd, branchForBlocks),
 		detectActiveNotesForBranch(cwd, branchForBlocks),
@@ -2638,7 +2641,8 @@ async function handleAmendPipeline(
 	}
 
 	// ── No old summary AND non-trivial delta -> store delta as a fresh leaf ────
-	const branch = await getCurrentBranch(cwd);
+	// Prefer the captured branch over a live read for the same reason as executePipeline; see line 1529.
+	const branch = branchHint ?? (await getCurrentBranch(cwd));
 
 	// Associate plans/notes/references on the branch with this amend commit,
 	// mirroring executePipeline. Without this the fresh leaf silently drops
