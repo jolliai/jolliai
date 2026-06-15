@@ -215,5 +215,96 @@ class KBPathResolverTest {
             config.remoteUrl shouldBe null
             config.repoName shouldBe "localproject"
         }
+
+        @Test
+        fun `reuses a higher-numbered same-repo folder across an archived numbering hole`() {
+            // Archiving a folder leaves a numbering hole. base `repo` is a different
+            // repo, `repo-2` is the hole (absent), `repo-3` still holds our repo.
+            // resolve must reuse repo-3, not claim the repo-2 hole and spawn a duplicate.
+            createKBFolder("repo", "https://github.com/u/other.git")
+            val canonical = tempDir.resolve("repo-3")
+            KBPathResolver.initializeKBFolder(canonical, "repo", "https://github.com/u/canonical.git")
+
+            KBPathResolver.resolve(
+                "repo",
+                "https://github.com/u/canonical.git",
+                tempDir.toString(),
+            ) shouldBe canonical
+            // resolve must not have created the hole as a side effect.
+            Files.isDirectory(tempDir.resolve("repo-2")) shouldBe false
+        }
+
+        @Test
+        fun `claims the lowest free slot in the custom parent, not the global default`() {
+            // findAvailablePath must honor the custom parent (tempDir), not KB_PARENT.
+            createKBFolder("dup", "https://github.com/u/a.git")
+            val resolved = KBPathResolver.resolve(
+                "dup",
+                "https://github.com/u/b.git",
+                tempDir.toString(),
+            )
+            resolved shouldBe tempDir.resolve("dup-2")
+        }
+    }
+
+    // ── fold + archive (Migrate-to-Memory-Bank flow) ───────────────────────
+    @Nested
+    inner class FoldAndArchive {
+        @TempDir
+        lateinit var tempDir: Path
+
+        private fun seed(folderName: String, repoName: String, remoteUrl: String?): Path {
+            val kbRoot = tempDir.resolve(folderName)
+            KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
+            return kbRoot
+        }
+
+        @Test
+        fun `findRepoFolders returns all same-repo folders, skipping holes and other repos`() {
+            val remote = "https://github.com/u/canonical.git"
+            seed("repo", "repo", "https://github.com/u/other.git") // different repo → excluded
+            // repo-2 is a hole (absent) → skipped
+            seed("repo-3", "repo", remote)
+            seed("repo-4", "repo", remote)
+            seed("repo-5", "repo", "https://github.com/u/third.git") // different → excluded
+
+            val found = KBPathResolver.findRepoFolders("repo", remote, tempDir.toString())
+            found.toSet() shouldBe setOf(tempDir.resolve("repo-3"), tempDir.resolve("repo-4"))
+        }
+
+        @Test
+        fun `findRepoFolders includes the base folder when it matches`() {
+            val remote = "https://github.com/u/canonical.git"
+            seed("repo", "repo", remote)
+            seed("repo-2", "repo", remote)
+
+            val found = KBPathResolver.findRepoFolders("repo", remote, tempDir.toString())
+            found.toSet() shouldBe setOf(tempDir.resolve("repo"), tempDir.resolve("repo-2"))
+        }
+
+        @Test
+        fun `findFreshKBPath returns base when free, else the lowest hole`() {
+            KBPathResolver.findFreshKBPath("brand", tempDir.toString()) shouldBe tempDir.resolve("brand")
+            seed("brand", "brand", "https://github.com/u/a.git")
+            KBPathResolver.findFreshKBPath("brand", tempDir.toString()) shouldBe tempDir.resolve("brand-2")
+        }
+
+        @Test
+        fun `archiveKBFolder moves the folder into hidden jolli archive and removes the original`() {
+            val kbRoot = seed("repo-3", "repo", "https://github.com/u/a.git")
+
+            val dest = KBPathResolver.archiveKBFolder(kbRoot, tempDir.toString())
+
+            dest shouldNotBe null
+            Files.isDirectory(kbRoot) shouldBe false
+            Files.isDirectory(dest!!) shouldBe true
+            dest.toString() shouldContain tempDir.resolve(".jolli").resolve("archive").toString()
+            dest.fileName.toString().startsWith("repo-3-") shouldBe true
+        }
+
+        @Test
+        fun `archiveKBFolder returns null when the folder does not exist`() {
+            KBPathResolver.archiveKBFolder(tempDir.resolve("nope"), tempDir.toString()) shouldBe null
+        }
     }
 }

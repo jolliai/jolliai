@@ -140,14 +140,43 @@ export function peekKBPath(repoName: string, remoteUrl: string | null, customPat
 	if (existingConfig && isSameRepo(existingConfig, remoteUrl, repoName)) return basePath;
 	if (existingConfig && isUnclaimedStub(basePath, existingConfig)) return basePath;
 
+	// Mirror findAvailablePathAndClaim's selection without claiming: reuse an
+	// existing same-repo folder anywhere in the ladder before falling back to an
+	// unclaimed stub or the lowest free slot. Never stop at a numbering hole (left
+	// by an archived folder) and skip a higher-numbered folder that holds this
+	// repo — that is what made the Migrate archive gate target a phantom slot and
+	// spawn duplicate <repo>-N folders.
+	const scan = scanRepoSuffixes(parent, repoName, remoteUrl);
+	return scan.match ?? scan.stub ?? scan.firstUnused ?? join(parent, `${repoName}-${Date.now()}`);
+}
+
+/**
+ * Returns every existing KB folder (`<repo>` and `<repo>-2` … `<repo>-99`) under
+ * the Memory Bank parent whose `.jolli/config.json` identity matches this repo.
+ *
+ * Read-only. Used by the Migrate-to-Memory-Bank flow to fold a *pile* of
+ * duplicates in one pass: earlier buggy runs (the archive gate defeated by a
+ * numbering hole) left several `<repo>-N` folders all sharing one identity, and
+ * archiving only the single peeked folder would clear them one-click-at-a-time.
+ * Only true identity matches are returned — unclaimed stubs and folders for
+ * other repos are left untouched, so this is safe to feed straight to
+ * `archiveKBFolder`.
+ */
+export function findRepoFolders(repoName: string, remoteUrl: string | null, customPath?: string): string[] {
+	const parent = resolveKbParent(customPath);
+	const out: string[] = [];
+	const base = join(parent, repoName);
+	if (existsSync(base)) {
+		const baseConfig = readKBConfig(base);
+		if (baseConfig && isSameRepo(baseConfig, remoteUrl, repoName)) out.push(base);
+	}
 	for (let suffix = 2; suffix <= 99; suffix++) {
 		const candidate = join(parent, `${repoName}-${suffix}`);
-		if (!existsSync(candidate)) return candidate;
+		if (!existsSync(candidate)) continue;
 		const config = readKBConfig(candidate);
-		if (config && isSameRepo(config, remoteUrl, repoName)) return candidate;
-		if (config && isUnclaimedStub(candidate, config)) return candidate;
+		if (config && isSameRepo(config, remoteUrl, repoName)) out.push(candidate);
 	}
-	return join(parent, `${repoName}-${Date.now()}`);
+	return out;
 }
 
 /**
@@ -375,23 +404,51 @@ function nonDefaultPortSegment(port: string | undefined, schemeDefault: string):
 	return `:${port}`;
 }
 
-function findAvailablePathAndClaim(parent: string, repoName: string, remoteUrl: string | null): string {
+interface SuffixScan {
+	/** Existing `<repo>-N` folder that already belongs to this repo (reuse, no claim). */
+	match: string | null;
+	/** Lowest existing `<repo>-N` folder that is an unclaimed schema-default stub. */
+	stub: string | null;
+	/** Lowest `<repo>-N` slot that does not exist on disk. */
+	firstUnused: string | null;
+}
+
+/**
+ * Scans `<repo>-2` … `<repo>-99` ONCE and classifies them. The scan runs to
+ * completion (or until a same-repo match is found) precisely so an archived
+ * folder's numbering hole can't shadow a higher-numbered folder that still
+ * holds this repo — the bug behind duplicate `<repo>-N` folders and the
+ * defeated Migrate archive gate. Callers decide whether to reuse/adopt/claim.
+ */
+function scanRepoSuffixes(parent: string, repoName: string, remoteUrl: string | null): SuffixScan {
+	let match: string | null = null;
+	let stub: string | null = null;
+	let firstUnused: string | null = null;
 	for (let suffix = 2; suffix <= 99; suffix++) {
 		const candidate = join(parent, `${repoName}-${suffix}`);
 		if (!existsSync(candidate)) {
-			writeKBIdentity(candidate, repoName, remoteUrl);
-			return candidate;
+			if (firstUnused === null) firstUnused = candidate;
+			continue;
 		}
 		const config = readKBConfig(candidate);
-		if (config && isSameRepo(config, remoteUrl, repoName)) return candidate;
-		if (config && isUnclaimedStub(candidate, config)) {
-			writeKBIdentity(candidate, repoName, remoteUrl);
-			return candidate;
+		if (config && isSameRepo(config, remoteUrl, repoName)) {
+			match = candidate;
+			break;
 		}
+		if (config && stub === null && isUnclaimedStub(candidate, config)) stub = candidate;
 	}
-	const fallback = join(parent, `${repoName}-${Date.now()}`);
-	writeKBIdentity(fallback, repoName, remoteUrl);
-	return fallback;
+	return { match, stub, firstUnused };
+}
+
+function findAvailablePathAndClaim(parent: string, repoName: string, remoteUrl: string | null): string {
+	const scan = scanRepoSuffixes(parent, repoName, remoteUrl);
+	// Reuse an existing folder for this repo as-is — its identity is already correct.
+	if (scan.match) return scan.match;
+	// No same-repo folder: adopt an unclaimed stub if present, else claim the
+	// lowest free slot. A `Date.now()` name is the 99-collision safety net only.
+	const target = scan.stub ?? scan.firstUnused ?? join(parent, `${repoName}-${Date.now()}`);
+	writeKBIdentity(target, repoName, remoteUrl);
+	return target;
 }
 
 /**
