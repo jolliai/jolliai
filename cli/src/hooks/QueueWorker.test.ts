@@ -2212,6 +2212,94 @@ describe("QueueWorker", () => {
 		});
 	});
 
+	// The branch written onto summary.branch must come from the op captured at enqueue
+	// time (inside the git hook), NOT a live getCurrentBranch read during drain. Reading
+	// live mis-attributes the summary when the user has `git checkout`'d away between
+	// enqueue and drain (e.g. `git commit && git checkout main`). Live read survives only
+	// as a fallback for pre-0.99.x queue entries lacking op.branch.
+	describe("branch attribution (op.branch over live getCurrentBranch)", () => {
+		it("executePipeline writes op.branch, not the live branch", async () => {
+			const op = makeCommitOp({ commitHash: "abc12345def67890", branch: "feature/x" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+			// Simulate the user having switched to main after committing on feature/x.
+			vi.mocked(getCurrentBranch).mockResolvedValue("main");
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			expect(vi.mocked(storeSummary).mock.calls[0][0].branch).toBe("feature/x");
+		});
+
+		it("executePipeline falls back to live branch when op.branch is missing (pre-0.99.x entry)", async () => {
+			const op = makeCommitOp({ commitHash: "abc12345def67890" }); // no branch field
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+			vi.mocked(getCurrentBranch).mockResolvedValue("main");
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			expect(vi.mocked(storeSummary).mock.calls[0][0].branch).toBe("main");
+		});
+
+		it("amend fresh-leaf writes op.branch via branchHint, not the live branch", async () => {
+			const op = makeCommitOp({
+				type: "amend",
+				commitHash: "abc12345def67890",
+				branch: "feature/x",
+				sourceHashes: ["0123456789abcdef0123456789abcdef01234567"],
+			});
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+			vi.mocked(getCurrentBranch).mockResolvedValue("main");
+			// No old summary → fresh-leaf path (getSummary defaults to undefined).
+			// Non-trivial delta (>50 lines) so the trivial-amend short-circuit is skipped.
+			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 60, deletions: 1 });
+			// One uncommitted reference (registry-miss, tolerated) so the fresh-leaf
+			// reference-association path runs on op.branch too — references suffer the
+			// same mis-attribution as summary.branch.
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{ mapKey: "linear:GHOST-1", source: "linear", sourcePath: "/tmp/ghost.md" },
+			]);
+			vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {}, references: {} });
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			expect(vi.mocked(storeSummary).mock.calls[0][0].branch).toBe("feature/x");
+		});
+
+		it("amend fresh-leaf falls back to live branch when op.branch is missing", async () => {
+			const op = makeCommitOp({
+				type: "amend",
+				commitHash: "abc12345def67890",
+				sourceHashes: ["0123456789abcdef0123456789abcdef01234567"],
+			}); // no branch field
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+			vi.mocked(getCurrentBranch).mockResolvedValue("main");
+			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 60, deletions: 1 });
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			expect(vi.mocked(storeSummary).mock.calls[0][0].branch).toBe("main");
+		});
+	});
+
 	describe("buildWorkerStartupBanner", () => {
 		it("reports source=cli verbatim for the CLI surface (no path derivation)", () => {
 			expect(
