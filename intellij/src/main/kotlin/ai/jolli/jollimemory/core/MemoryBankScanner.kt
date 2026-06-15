@@ -39,6 +39,11 @@ object MemoryBankScanner {
     /** kbRoot subfolders that are never branch folders and must not be scanned. */
     private val SYSTEM_SUBDIRS = setOf(".jolli", "_wiki")
 
+    private data class FpCacheEntry(val mtimeMs: Long, val size: Long, val fingerprint: String)
+
+    /** Process-wide fingerprint memo keyed by absolute path, invalidated by mtime+size. */
+    private val fpCache = java.util.concurrent.ConcurrentHashMap<String, FpCacheEntry>()
+
     enum class UserKnowledgeScope { GLOBAL, REPO, BRANCH }
 
     data class UserKnowledgeFile(
@@ -150,20 +155,34 @@ object MemoryBankScanner {
                 if (manifestRelPath in manifestPaths) continue
             }
 
-            val content = try {
-                Files.readString(entry, StandardCharsets.UTF_8)
-            } catch (e: Exception) {
-                log.warn("Failed to read user file %s: %s", entry.toString(), e.message)
-                continue
+            // Fingerprint cache: collectAllSourceRefs runs once per ingest batch, and
+            // it only needs path/fingerprint/mtime (not content). Skip the read + sha256
+            // of files unchanged since the last scan (keyed by mtime+size). On a cache
+            // hit `content` is left empty — no caller consumes it here, and
+            // SourceContent.loadSourceContent reads the body fresh when reconcile needs it.
+            val mtimeMs = try { Files.getLastModifiedTime(entry).toMillis() } catch (_: Exception) { -1L }
+            val size = try { Files.size(entry) } catch (_: Exception) { -1L }
+            val absStr = entry.toString()
+            val cachedFp = fpCache[absStr]
+
+            val fingerprint: String
+            val content: String
+            if (cachedFp != null && mtimeMs != -1L && cachedFp.mtimeMs == mtimeMs && cachedFp.size == size) {
+                fingerprint = cachedFp.fingerprint
+                content = ""
+            } else {
+                content = try {
+                    Files.readString(entry, StandardCharsets.UTF_8)
+                } catch (e: Exception) {
+                    log.warn("Failed to read user file %s: %s", absStr, e.message)
+                    continue
+                }
+                fingerprint = FolderStorage.sha256(content)
+                if (mtimeMs != -1L && size != -1L) fpCache[absStr] = FpCacheEntry(mtimeMs, size, fingerprint)
             }
 
-            val fingerprint = FolderStorage.sha256(content)
             val localRelPath = localFolderRoot.relativize(entry).toString().replace('\\', '/')
-            val mtime = try {
-                Files.getLastModifiedTime(entry).toInstant().toString()
-            } catch (_: Exception) {
-                ""
-            }
+            val mtime = if (mtimeMs != -1L) java.time.Instant.ofEpochMilli(mtimeMs).toString() else ""
             out.add(
                 UserKnowledgeFile(
                     path = localRelPath,

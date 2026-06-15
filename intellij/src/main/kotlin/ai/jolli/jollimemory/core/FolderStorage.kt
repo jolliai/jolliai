@@ -123,6 +123,14 @@ class FolderStorage(
         val compiled = mutableListOf<CompiledTopic>()
         for (page in pages) {
             try {
+                // SECURITY: the slug is interpolated into the output path. Re-validate the
+                // page's own stableSlug (it comes from the file CONTENTS — a synced/planted
+                // topics/*.json could carry "../.." even when its lookup slug was safe), so a
+                // crafted page can't escape _wiki/ and overwrite arbitrary files on render.
+                if (!TopicPageStore.isSafeSlug(page.stableSlug)) {
+                    log.warn("renderTopicWiki: skipping page with unsafe stableSlug %s", page.stableSlug)
+                    continue
+                }
                 val topic = topicPageToCompiledTopic(page)
                 compiled.add(topic)
                 val relPath = "_wiki/topic--${topic.stableSlug}.md"
@@ -441,11 +449,17 @@ class FolderStorage(
 
     /** Writes content to a file atomically via temp file + move. */
     private fun atomicWrite(targetPath: Path, content: String) {
-        Files.createDirectories(targetPath.parent)
-        val tmp = Files.createTempFile(targetPath.parent, ".jolli-", ".tmp")
+        // SECURITY (defense-in-depth): never let a computed path escape the KB root,
+        // so a traversal slug/path that slips past a caller can't write outside it.
+        val normalized = targetPath.normalize()
+        require(normalized.startsWith(rootPath.normalize())) {
+            "Refusing to write outside the Memory Bank root: $normalized"
+        }
+        Files.createDirectories(normalized.parent)
+        val tmp = Files.createTempFile(normalized.parent, ".jolli-", ".tmp")
         try {
             Files.writeString(tmp, content, StandardCharsets.UTF_8)
-            Files.move(tmp, targetPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            Files.move(tmp, normalized, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
         } catch (e: Exception) {
             Files.deleteIfExists(tmp)
             throw e

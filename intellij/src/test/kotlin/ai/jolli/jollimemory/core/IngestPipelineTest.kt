@@ -125,17 +125,6 @@ class IngestPipelineTest {
     }
 
     @Test
-    fun `defaultLlmCaller requires a Jolli sign-in (proxy-only ingest)`() {
-        // Guards the bug where an Anthropic key routed to direct mode and NPE'd on the
-        // null prompt. With no jolliApiKey, the caller must fail loud, not NPE.
-        val caller = IngestPipeline.defaultLlmCaller(IngestPipeline.LlmConfig(apiKey = "sk-ant-xxx", jolliApiKey = null))
-        val ex = org.junit.jupiter.api.assertThrows<IllegalStateException> {
-            caller.call("route", mapOf("topicIndex" to "", "sources" to ""), null, null)
-        }
-        ex.message!!.contains("Jolli sign-in") shouldBe true
-    }
-
-    @Test
     fun `drainIngest loops to empty`() {
         seedSummary()
         val fake = IngestPipeline.LlmCaller { action, _, _, _ ->

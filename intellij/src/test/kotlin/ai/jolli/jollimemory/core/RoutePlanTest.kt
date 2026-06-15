@@ -52,6 +52,13 @@ class RoutePlanTest {
     }
 
     @Test
+    fun `fails loud on a fractional source index instead of truncating`() {
+        val plan = RoutePlanParser.parseRoutePlan("""{"updates":[{"stableSlug":"t","sourceIndexes":[1.5]}]}""", null, batch(3))
+        plan.error.shouldNotBeNull()
+        plan.assignments.isEmpty().shouldBeTrue()
+    }
+
+    @Test
     fun `drops entries with no valid refs`() {
         val plan = RoutePlanParser.parseRoutePlan("""{"updates":[{"stableSlug":"t","sourceIndexes":[]}]}""", null, batch(1))
         plan.error shouldBe null

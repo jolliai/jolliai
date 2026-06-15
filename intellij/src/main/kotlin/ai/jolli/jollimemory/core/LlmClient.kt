@@ -79,6 +79,17 @@ object LlmClient {
 
         log.info("LLM call: action=%s, source=%s", action, source)
 
+        // Direct (Anthropic) mode needs a caller-built prompt. A template-only action
+        // (proxy-style action+params, prompt=null) routed here would otherwise NPE on
+        // `prompt!!`; fail loud with a clear message instead — the real fix for callers
+        // like the wiki ingest, which have no local prompt template.
+        if ((source == CredentialSource.ANTHROPIC_CONFIG || source == CredentialSource.ANTHROPIC_ENV) && prompt == null) {
+            throw IllegalStateException(
+                "Direct-mode LLM call for action '$action' requires a prompt, but none was supplied " +
+                    "(no local template for this action — use proxy mode / Jolli sign-in).",
+            )
+        }
+
         val result = when (source) {
             CredentialSource.ANTHROPIC_CONFIG -> callDirect(prompt!!, apiKey!!, model, maxTokens)
             CredentialSource.ANTHROPIC_ENV -> callDirect(prompt!!, System.getenv("ANTHROPIC_API_KEY"), model, maxTokens)
@@ -86,6 +97,10 @@ object LlmClient {
         }
         return result.copy(source = source.wireValue)
     }
+
+    /** Above this `max_tokens`, use streaming: Anthropic refuses long non-streaming
+     *  requests and the non-streaming client timeout can't cover them. */
+    private const val STREAMING_THRESHOLD_TOKENS = 8192
 
     private fun callDirect(prompt: String, apiKey: String, model: String?, maxTokens: Int?): LlmCallResult {
         val resolvedModel = Summarizer.resolveModelId(model)
@@ -98,6 +113,7 @@ object LlmClient {
             maxTokens = resolvedMaxTokens,
             temperature = 0.0,
             messages = listOf(AnthropicClient.Message("user", prompt)),
+            stream = resolvedMaxTokens > STREAMING_THRESHOLD_TOKENS,
         )
 
         val elapsed = System.currentTimeMillis() - startTime

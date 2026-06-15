@@ -63,9 +63,13 @@ object RoutePlanParser {
             if (indexesEl != null && indexesEl.isJsonArray) {
                 for (idxEl in indexesEl.asJsonArray) {
                     val isNumber = idxEl.isJsonPrimitive && idxEl.asJsonPrimitive.isNumber
-                    val idx = if (isNumber) idxEl.asInt else -1
-                    if (!isNumber || idx < 0 || idx >= batch.size) {
-                        log.warn("route: out-of-range source index %s for topic %s — failing route", idxEl.toString(), slug)
+                    val asDouble = if (isNumber) idxEl.asDouble else Double.NaN
+                    val idx = asDouble.toInt()
+                    // Reject non-numbers, non-integers (e.g. 1.5 — asInt would silently
+                    // truncate to a valid-looking ordinal), and out-of-range: a miscounted
+                    // index means the ordinal→source mapping can't be trusted, so fail loud.
+                    if (!isNumber || asDouble != idx.toDouble() || idx < 0 || idx >= batch.size) {
+                        log.warn("route: invalid source index %s for topic %s — failing route", idxEl.toString(), slug)
                         malformedIndex = true
                         continue
                     }
