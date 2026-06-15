@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.core
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
@@ -20,9 +21,27 @@ class ActiveSessionAggregatorTest {
 	private val HOUR = 3_600_000L
 	private val DAY = 24 * HOUR
 
+	private var originalHome: String? = null
+
 	@BeforeEach
 	fun setUp() {
 		File(tempDir, ".jolli/jollimemory").mkdirs()
+		// Hermetic isolation. The aggregator fans out to the Codex / Cursor / OpenCode
+		// discoverers, which scan machine-global session dirs derived from `user.home`
+		// (~/.codex/sessions, ~/Library/Application Support/Cursor, ~/.local/share/opencode)
+		// — they ignore the `cwd` temp dir. Without this, real sessions on the developer's
+		// machine pollute the assertions (and opening the real SQLite DBs leaks JDBC
+		// threads onto the next test class). Point user.home at an empty temp dir so those
+		// sources find nothing; the assertions then see only the SessionTracker sessions
+		// this test registers. Mirrors CursorSupportTest / VscodeWorkspaceLocatorTest.
+		// (OpenCode also honors XDG_DATA_HOME; this assumes it is unset, as on CI.)
+		originalHome = System.getProperty("user.home")
+		System.setProperty("user.home", File(tempDir, "home").apply { mkdirs() }.absolutePath)
+	}
+
+	@AfterEach
+	fun tearDown() {
+		originalHome?.let { System.setProperty("user.home", it) } ?: System.clearProperty("user.home")
 	}
 
 	private fun iso(offsetMs: Long): String =
