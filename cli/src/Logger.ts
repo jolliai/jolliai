@@ -6,7 +6,7 @@
  * Uses a sequential write queue to guarantee log ordering in the file.
  */
 
-import { appendFile, stat, writeFile } from "node:fs/promises";
+import { appendFile, readdir, rename, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { LogLevel } from "./Types.js";
 
@@ -162,8 +162,80 @@ let writeQueue: Promise<void> = Promise.resolve();
  * does not exist (plugin not yet enabled), log writes are silently skipped.
  * The directory is created by `ensureJolliMemoryDir()` when enabling the plugin.
  */
-/** Maximum log file size in bytes before rotation (500KB). */
-const MAX_LOG_SIZE = 512 * 1024;
+/** Maximum log file size in bytes before rotation (2 MB). */
+const MAX_LOG_SIZE = 2 * 1024 * 1024;
+
+/** Most recent `debug_<timestamp>.log` archives to keep; older ones are pruned. */
+const MAX_LOG_BACKUPS = 10;
+
+/** Matches rotated archives `debug_<timestamp>.log` (NOT the live `debug.log`). */
+const LOG_ARCHIVE_RE = /^debug_.*\.log$/;
+
+/** Two-digit zero-pad for date/time components. */
+function pad2(n: number): string {
+	return String(n).padStart(2, "0");
+}
+
+/**
+ * Rotates the log by archiving the current file to `debug_<UTC timestamp>.log`
+ * and letting the caller's `appendFile` recreate a fresh `debug.log`. Full
+ * history is preserved across up to `MAX_LOG_BACKUPS` archives; older archives
+ * are pruned. Replaces the previous truncate-in-place scheme so no live content
+ * is ever discarded mid-file.
+ *
+ * Naming: `debug_YYYY-MM-DD_HH-mm-ss.log` (UTC, matching the log line timestamps;
+ * `:`/`.` avoided so the name is valid on Windows; fixed-width so a plain lexical
+ * sort is chronological). On the rare same-second collision a `_N` suffix is
+ * appended (e.g. `..._09-24-32_1.log`); `_` (0x5F) sorts after the `.` of `.log`,
+ * so a suffixed archive always sorts AFTER its un-suffixed base, preserving the
+ * lexical-sort-is-chronological property used by the prune step.
+ *
+ * Best-effort throughout: a failed `rename`, or a failed prune, is swallowed —
+ * `appendFile` still (re)creates `debug.log`, and pruning retries on the next
+ * rotation. There is no cross-process lock: two processes rotating within the
+ * same second could in principle pick the same name and have one `rename`
+ * overwrite the other's archive. That race is accepted (logging is best-effort);
+ * losing one rotated archive never affects correctness of the live log.
+ */
+async function rotateLog(dir: string, logPath: string): Promise<void> {
+	const now = new Date();
+	const stamp =
+		`${now.getUTCFullYear()}-${pad2(now.getUTCMonth() + 1)}-${pad2(now.getUTCDate())}` +
+		`_${pad2(now.getUTCHours())}-${pad2(now.getUTCMinutes())}-${pad2(now.getUTCSeconds())}`;
+
+	try {
+		let archive = join(dir, `debug_${stamp}.log`);
+		for (let suffix = 1; await pathExists(archive); suffix++) {
+			archive = join(dir, `debug_${stamp}_${suffix}.log`);
+		}
+		await rename(logPath, archive);
+	} catch {
+		// Source already rotated by another process, or rename failed — skip; the
+		// caller's appendFile will (re)create debug.log regardless.
+		return;
+	}
+
+	// Prune: keep only the `MAX_LOG_BACKUPS` most recent archives. Archive names
+	// sort lexicographically in chronological order, so the oldest are at the front.
+	try {
+		const archives = (await readdir(dir)).filter((f) => LOG_ARCHIVE_RE.test(f)).sort();
+		for (let i = 0; i < archives.length - MAX_LOG_BACKUPS; i++) {
+			await unlink(join(dir, archives[i])).catch(() => {});
+		}
+	} catch {
+		// readdir failed — non-fatal; the next rotation will prune again.
+	}
+}
+
+/** True if `p` exists (any stat-able entry); false on ENOENT or any stat error. */
+async function pathExists(p: string): Promise<boolean> {
+	try {
+		await stat(p);
+		return true;
+	} catch {
+		return false;
+	}
+}
 
 /**
  * Stable contract for callers that want to use Logger without producing
@@ -187,11 +259,14 @@ function enqueueLogWrite(line: string): void {
 			// This prevents creating .jolli/ in repos where Jolli Memory is not enabled.
 			await stat(dir);
 
-			// Rotate: truncate old content when file exceeds size limit
+			// Rotate: when the file exceeds the size limit, archive it to
+			// `debug_<timestamp>.log` and let the appendFile below recreate a fresh
+			// debug.log. Full history is preserved across up to MAX_LOG_BACKUPS
+			// archives (older ones pruned) — no live content is truncated.
 			try {
 				const fileStat = await stat(logPath);
 				if (fileStat.size > MAX_LOG_SIZE) {
-					await writeFile(logPath, `[log rotated at ${new Date().toISOString()}]\n`, "utf-8");
+					await rotateLog(dir, logPath);
 				}
 			} catch {
 				// File doesn't exist yet — that's fine, appendFile will create it
