@@ -160,11 +160,11 @@ Text snippets display their content inline in the Summary Webview; Markdown note
 
 ### Memory Bank sync (cross-device)
 
-Memory Bank **cloud sync** keeps your personal Memory Bank consistent across every device you sign in to. Turn it on from **Settings → Memory Bank → Enable Memory Bank cloud sync** (off by default for existing users; you can flip it any time).
+Memory Bank **cloud sync** keeps your personal Memory Bank consistent across every device you sign in to. It runs **on demand**: open **Settings → Memory Bank** and click **Sync to Personal Space Now** (or run `jolli sync-memory-bank` from the CLI). There is no background timer running by default.
 
 How it works:
 
-1. The plugin holds a long-lived sync engine that wakes up every 90 minutes (configurable via `syncPollIntervalSec`) **or** when you click **Sync to Personal Space Now** in Settings.
+1. Each time you trigger it, the bundled sync engine runs one round. Sync is a manual action — no background polling runs by default, and the old post-commit auto-trigger was removed to keep `git commit` instant.
 2. Each round mints a short-lived credential from Jolli, clones (first time) or fetches your private vault repo, mirrors the local Memory Bank folder into the vault tree, commits, and pushes. The vault repo is **private** and visible only to you.
 3. On the very first sync of a personal space that has Web-UI-only history, the plugin imports that legacy content into a `legacy/` subtree, pushes it, and tells Jolli to flip the space to git-backed. After that, every device sees the same git history.
 4. If two devices push concurrently and conflict, the engine resolves the four `.jolli/<aggregate>.json` files deterministically (no prompts); other content conflicts go through an AI merge (if you've configured an Anthropic key) and finally a manual binary pick.
@@ -192,6 +192,9 @@ Tab toolbar actions (when the Memory Bank tab is active):
 | **Search** (`$(search)`) | Full-text search across every branch and repo in the Memory Bank; press **Enter** with empty input or click **Clear Filter** (`$(close)`) to reset. |
 | **Tree / Timeline modes** | Toggle between **Tree** (folder hierarchy by repo / branch, the default — codicon `$(list-tree)`) and **Timeline** (chronological flat list by commit date — codicon `$(history)`). |
 | **Reset** | Re-detect repo identities and rebuild the tree from disk. |
+| **Build Knowledge Wiki** | Compile every repo in the Memory Bank into a topic-organized knowledge wiki (see below). |
+
+**Knowledge wiki** — **Build Knowledge Wiki** gathers the memories scattered across your commits and folds work on the same theme into per-topic pages, so a feature touched by ten commits reads as one evolving page instead of ten disconnected entries. A browsable `_wiki/` folder is written into your Memory Bank, and the same topic pages back the MCP server's search and decision-timeline tools. You rarely need to click it: after each commit the extension incrementally folds new memories into the wiki in the background; the button is for an immediate, repo-wide rebuild. Needs an API key (same as summary generation).
 
 **Per-memory context menu** (right-click any memory file in the tree):
 
@@ -277,6 +280,8 @@ Jolli Memory feeds prior development context back into your AI agent so it can p
 
 If the current branch has no memories, the command shows a catalog of branches that do, letting you pick one to recall. You can also pass a branch name or keyword as an argument (e.g. `/jolli-recall auth-refactor`).
 
+**Ask your agent directly (MCP server)** — when the extension enables a repo, it also registers a JolliMemory **MCP server** in that project's `.mcp.json`. The next time Claude Code starts, it can query your history conversationally — search past memories, recall a branch, trace how a decision evolved, and list which branches have memories — without you running any command. The `.mcp.json` entry is added to `.git/info/exclude` so it never gets committed (it points at a machine-local path). The server is bundled with the extension, so no separate CLI install is required.
+
 ---
 
 ## Configuration
@@ -300,9 +305,7 @@ Most settings live behind the gear icon on the **Status tab** toolbar. `authToke
 | `copilotEnabled` | boolean | auto-detect | Enable GitHub Copilot CLI **and** VS Code Copilot Chat session discovery (single shared switch) |
 | `localFolder` | string | — | Memory Bank folder root — every memory is dual-written here as Markdown alongside the orphan-branch copy. Set via Settings → Memory Bank → Browse…. |
 | `excludePatterns` | string[] | — | Glob patterns for hiding files from the Changes section in the Branch tab |
-| `syncEnabled` | boolean | `false` | Opt the Memory Bank into cloud sync to your Jolli Personal Space. Drives the long-lived sync engine and the status-bar indicator. Toggle via Settings → Memory Bank → **Enable Memory Bank cloud sync**. |
-| `syncTranscripts` | boolean | `false` | When sync is enabled, also mirror raw conversation transcripts (not just summaries) into the personal vault. Off by default so transcripts stay local unless you opt in. |
-| `syncPollIntervalSec` | integer | `5400` | Sync engine wake-up cadence in seconds. Floor is 5400 (90 min) — sync is heavy, and the **Sync to Personal Space Now** button covers urgent updates. |
+| `syncTranscripts` | boolean | `false` | When syncing, also mirror raw conversation transcripts (not just summaries) into the personal vault. Off by default so transcripts stay local unless you opt in. |
 | `dcoSignoff` | boolean | `false` | Append `Signed-off-by: <user.name> <user.email>` to commits created by **AI Commit**. Off by default; turn on if your project's CI gates merges on a DCO sign-off. Set via Settings → Others. |
 
 ---
