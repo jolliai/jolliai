@@ -1,6 +1,16 @@
 # Changelog
 
-<!-- Last synced commit: 8ce5671f | 2026-05-28 -->
+<!-- Last synced commit: ff0bd24d | 2026-06-15 -->
+
+## 0.99.3
+
+- **Build a knowledge wiki from your memories** — `jolli compile` gathers the work scattered across many commits and folds it into per-topic pages, building a knowledge base that keeps growing as you go and a browsable `_wiki/` folder in your Memory Bank. It updates on its own after each commit; `jolli compile --rebuild --cwd <dir>` rebuilds a repo's wiki from scratch.
+- **Let your AI agent look things up for you** — `jolli mcp` starts a small local server that Claude Code (and other MCP-aware agents) can talk to. Your agent can search the knowledge wiki's topics, recall everything done on a branch, and trace how a particular decision evolved — all from inside the chat, no copy-pasting. It's wired up automatically when you enable Jolli Memory.
+- **Faster memory search** — a local search index over the compiled wiki topics keeps the agent's keyword lookups quick. Run `jolli mcp --reindex` any time to rebuild it from scratch.
+- **More than just Linear** — issues and pages from **Jira, GitHub, and Notion** (not only Linear) are now picked up from your AI conversations and saved alongside each memory, from both Claude and Codex.
+- **The site generator is now a separate add-on** — `jolli new` / `build` / `dev` / `start` / `convert` moved into the `@jolli.ai/site-cli` plugin. Install it with `npm install -g @jolli.ai/site-cli`; `jolli --help` still lists the commands and shows the one-line install hint if it's missing.
+- **Update reminders** — the CLI now lets you know when a newer version is available.
+- Bug fixes
 
 ## 0.99.2
 
@@ -12,7 +22,7 @@
 - **`--arg-stdin` for agent skills** — `jolli recall` / `search` can read long arguments from stdin, so skills can pass multi-line input without quoting headaches.
 - **CLI plugins (experimental)** — `@jolli.ai/cli` can now load trusted plugin packages (from the `@jolli.ai/` npm scope) that add their own commands. Set `JOLLI_NO_PLUGINS=1` to turn it off. See [SECURITY.md](../SECURITY.md#operational-guidance).
 - **Narrower public API** — `@jolli.ai/cli` and `@jolli.ai/cli/api` are the only supported imports now; deep `dist/*` imports no longer resolve.
-- **More reliable cloud sync (behind the editor plugins)** — The bundled sync engine recovers on its own after an interrupted sync, only ever commits recognized Memory Bank files, and won't let a commit-time write collide with a sync in progress. The CLI doesn't run sync itself — see [`vscode/CHANGELOG.md`](../vscode/CHANGELOG.md).
+- **Memory Bank cross-device sync (new)** — A new bundled sync engine keeps your Memory Bank consistent across the devices you sign in to: it recovers on its own after an interrupted sync, only ever commits recognized Memory Bank files, and won't let a commit-time write collide with a sync in progress. Sync runs on demand — from the terminal with the new `jolli sync-memory-bank` command (handy when you don't keep an editor open, or in CI / scripts), or from the editor plugins' **Sync to Personal Space Now** button (see [`vscode/CHANGELOG.md`](../vscode/CHANGELOG.md)).
 - Bug fixes
 
 ## 0.99.1

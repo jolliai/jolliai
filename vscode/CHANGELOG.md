@@ -1,6 +1,16 @@
 # Changelog
 
-<!-- Last synced commit: 8ce5671f | 2026-05-28 -->
+<!-- Last synced commit: ff0bd24d | 2026-06-15 -->
+
+## 0.99.3
+
+- **Build a knowledge wiki from your memories** — a new **Build Knowledge Wiki** button on the Memory Bank panel gathers the work scattered across your commits and folds it into per-topic pages — a browsable knowledge base for everything you've built. It also refreshes on its own in the background after each commit.
+- **Let your AI agent look things up for you** — Jolli Memory now runs as a small server that Claude Code can talk to directly. Your agent can search those knowledge-wiki topics, recall everything done on a branch, and trace how a decision evolved — right from the chat. It's set up automatically when the extension is enabled in a repo.
+- **More than just Linear** — references from **Jira, GitHub, and Notion** (not only Linear) now show up in your memories, in PR descriptions, and in exports.
+- **Redesigned memory panel** — the commit memory view is reorganized to put the memory itself first: one bar at the top for **Create PR** and **Share in Jolli**, commit details tucked behind a **Details** toggle, and Plans / Notes / Source as tidy collapsible cards. When a commit has no tests yet, a new **Generate E2E + Create PR** shortcut does both in one step.
+- **Cleaner Plans, Notes & References** — clicking any row now opens a preview; **Edit** and **Remove** moved to a right-click menu, so all three lists behave the same way.
+- **"Push to Jolli" is now "Share in Jolli"** — the summary panel's cloud-publish button is relabeled **Share in Jolli**; behavior is unchanged, only the label was updated.
+- Bug fixes
 
 ## 0.99.2
 
@@ -11,10 +21,9 @@
 - **Linear issues in your memories** — When a conversation mentions a Linear issue, it shows up as its own section in the memory, in PR descriptions, and in exports.
 - **See which AI wrote each summary** — Every memory shows where it came from: **Anthropic** (your key), **Anthropic (env)**, or **Jolli**.
 - **Open memories from other repos** — Viewing a memory from another repo's folder in the **Memory Bank** tab now works just like a local one.
-- **More reliable cloud sync** — Your Memory Bank stays in sync across devices more dependably: a sync interrupted by a reload or crash recovers on its own, your vault is tied to one account so a different sign-in can't overwrite it, and conflicts resolve automatically when it's safe. The status bar shows synced / syncing / conflicts / offline.
+- **Memory Bank cross-device sync (new)** — Keep your Memory Bank consistent across every device you sign in to. Click **Sync to Personal Space Now** in **Settings → Memory Bank** to run a round (or `jolli sync-memory-bank` from the CLI). A sync interrupted by a reload or crash recovers on its own, your vault is tied to your account so a different sign-in can't overwrite it, conflicts resolve automatically when it's safe, and the status bar shows synced / syncing / conflicts / offline.
 - **Quick plan previews** — Hover a plan in **Plans & Notes** to see its title, source, last-updated time, and a snippet.
 - **Opt-in DCO sign-off on AI commits** — A new toggle in **Settings → Others** adds a `Signed-off-by` line to AI-generated commit messages so they pass projects that require it. Off by default.
-- **"Push to Jolli" is now "Share in Jolli"** — the summary panel's cloud-publish button is relabeled **Share in Jolli**. Behavior is unchanged; only the label was updated.
 - Bug fixes
 
 ## 0.99.1

@@ -15,6 +15,9 @@ Turns your AI coding sessions into structured development documentation attached
 - **Squash / amend / rebase safe** — a unified operation queue migrates or consolidates summaries when commits are rewritten, so memories are never lost.
 - **Session context recall** — `jolli recall` (or the `/jolli-recall` skill) loads complete branch history back into your AI agent so it can pick up where you left off. A lightweight briefing is also injected at the start of every Claude Code session.
 - **Cross-branch search** — `jolli search <keyword>` searches every branch's memories with a two-phase pipeline (catalog → full topic bodies).
+- **MCP server for AI agents** — `jolli mcp` exposes your history to Claude Code (and any MCP-aware agent) so it can search memories, recall a branch, and trace a decision's history without leaving the chat. Registered automatically on `jolli enable`.
+- **Knowledge wiki** — `jolli compile` folds the work scattered across many commits into per-topic pages and a browsable `_wiki/` folder in your Memory Bank, updated automatically after each commit.
+- **Issue & page references** — Linear, Jira, GitHub, and Notion items mentioned in your AI conversations are captured and attached to the relevant memory.
 - **Privacy-first** — transcripts and diff go straight to Anthropic (with your `apiKey`) or via the Jolli LLM proxy (in-memory, never persisted). Raw transcripts are never uploaded to Jolli Space.
 
 Jump to: [Jolli Memory](#jolli-memory) · [How It Works](#how-it-works) · [Installation](#installation) · [CLI Commands](#cli-commands) · [Session Context Recall](#session-context-recall) · [Configuration](#configuration) · [Privacy](#privacy)
@@ -22,6 +25,8 @@ Jump to: [Jolli Memory](#jolli-memory) · [How It Works](#how-it-works) · [Inst
 ## 2. Jolli Site — documentation site generation
 
 Turns a plain folder of Markdown files and OpenAPI specs into a polished documentation site with a single command. Designed for product or API documentation alongside your code.
+
+> **Ships as a separate plugin.** Site generation lives in the `@jolli.ai/site-cli` package, not the core CLI. Install it with `npm install -g @jolli.ai/site-cli` and the host CLI discovers it automatically. Until it's installed, `jolli --help` still lists the site commands and running one prints a short install hint.
 
 **What it does:**
 
@@ -112,6 +117,7 @@ Installs all hooks required for automatic summarization:
 - **Git post-rewrite hook** — migrates summaries on amend/rebase
 - **Git prepare-commit-msg hook** — detects squash operations
 - **Gemini AfterAgent hook** (if Gemini CLI detected) — tracks Gemini sessions
+- **MCP server registration** — adds the JolliMemory MCP server to your project's `.mcp.json` so Claude Code can query your memories (see [`jolli mcp`](#jolli-mcp))
 
 ```bash
 jolli enable
@@ -238,6 +244,37 @@ jolli search "windows path" --budget 8000 --format json
 
 Available flags: `--since` (ISO date or relative `7d`/`2w`/`1m`/`3y`; bad values are rejected with exit 1), `--hashes`, `--limit`, `--budget`, `--format` (`json` default; `text` for terminal-friendly output), `--output`, `--cwd`. There is **no `--branch` flag** — the catalog is scanned across every branch in the repo by design.
 
+### `jolli mcp`
+
+Starts a Model Context Protocol (MCP) server over stdio so AI agents can query your memories directly. It exposes four tools: **search** (full-text search over your historical decisions and implementations), **recall** (load a branch's complete context), **get_decision_timeline** (trace how one decision evolved across commits), and **list_branches** (catalog of branches that have memories).
+
+```bash
+# Start the server (normally launched by your agent, not by hand)
+jolli mcp
+
+# Rebuild the local search index from source and exit
+jolli mcp --reindex
+```
+
+`jolli enable` registers this server automatically in your project's `.mcp.json`, so Claude Code picks it up on its next start — no manual setup. The search index is a disposable local cache (never written to the orphan branch); `--reindex` forces a fresh rebuild if you ever want to clear it.
+
+### `jolli compile`
+
+Builds your **knowledge wiki**: it ingests the memories that have accumulated across your commits and folds work on the same theme into per-topic pages, so a feature touched by ten commits reads as one evolving page instead of ten disconnected entries. The canonical topic pages are stored alongside your other memories, and a browsable `_wiki/` folder is generated in your Memory Bank. These topic pages also back the MCP server's `search` and `get_decision_timeline` tools.
+
+```bash
+# Compile every repo under your Memory Bank folder (the default sweep)
+jolli compile
+
+# Compile just one repo
+jolli compile --cwd /path/to/repo
+
+# Discard a repo's wiki and replay every source from scratch
+jolli compile --cwd /path/to/repo --rebuild
+```
+
+You normally don't need to run this by hand — after each commit, Jolli Memory incrementally folds new sources into the wiki in the background (the editor extensions expose the same action as a **Build Knowledge Wiki** button). Running `jolli compile` is for an on-demand refresh or a full `--rebuild`. Requires an API key (same as summary generation).
+
 ### `jolli configure`
 
 Manages settings stored in `~/.jolli/jollimemory/config.json`. API keys are masked in the display output.
@@ -259,11 +296,21 @@ jolli configure --set excludePatterns=docs/**,*.log,node_modules
 jolli configure --remove jolliApiKey
 ```
 
-Supported keys: `apiKey`, `aiProvider`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `claudeEnabled`, `codexEnabled`, `geminiEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `localFolder`, `logLevel`, `excludePatterns`, `syncEnabled`, `syncTranscripts`, `syncPollIntervalSec`. `aiProvider` pins the summarization backend (`"anthropic"` or `"jolli"`); when omitted, the dispatcher falls back to the legacy precedence (`apiKey` > `ANTHROPIC_API_KEY` > `jolliApiKey`). `copilotEnabled` controls both GitHub Copilot CLI and VS Code Copilot Chat as a single switch. `localFolder` is the Memory Bank root on disk where every memory is dual-written. The `sync*` keys drive cloud sync (plugin-driven — see [Memory Bank cloud sync](#memory-bank-cloud-sync-plugin-driven) below); `--sync-enable` / `--sync-disable` are shortcuts for toggling `syncEnabled` without the long key form. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
+Supported keys: `apiKey`, `aiProvider`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `claudeEnabled`, `codexEnabled`, `geminiEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `localFolder`, `logLevel`, `excludePatterns`, `syncTranscripts`. `aiProvider` pins the summarization backend (`"anthropic"` or `"jolli"`); when omitted, the dispatcher falls back to the legacy precedence (`apiKey` > `ANTHROPIC_API_KEY` > `jolliApiKey`). `copilotEnabled` controls both GitHub Copilot CLI and VS Code Copilot Chat as a single switch. `localFolder` is the Memory Bank root on disk where every memory is dual-written. `syncTranscripts` opts raw transcripts into cloud sync — see [Memory Bank cloud sync](#memory-bank-cloud-sync) below; run a round on demand with `jolli sync-memory-bank`. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
 
-### Memory Bank cloud sync (plugin-driven)
+### Memory Bank cloud sync
 
-Memory Bank cloud sync keeps your personal Memory Bank consistent across every device you sign in to. A long-lived plugin process (currently VS Code only) holds a sync engine that mints credentials from Jolli, clones a private vault repo, mirrors your Memory Bank folder, and pushes on a polling cadence (default 90 min) or when you click **Sync to Personal Space Now** in Settings. The CLI bundles the same engine — `cli/src/sync/` compiles into `dist/Cli.js` and is inlined into the VS Code extension — but `@jolli.ai/cli` itself does **not** auto-trigger sync rounds today; you opt in by flipping `syncEnabled` and running the plugin.
+Memory Bank cloud sync keeps your personal Memory Bank consistent across every device you sign in to. The sync engine mints credentials from Jolli, clones a private vault repo, mirrors your Memory Bank folder, and pushes. **Sync is on-demand** — there is no background timer running by default. You trigger a round either way:
+
+```bash
+# Sync this repo's Memory Bank with your Personal Space (needs jolliApiKey — sign in with `jolli auth login`)
+jolli sync-memory-bank
+
+# Include raw transcripts in this round (overrides syncTranscripts=false)
+jolli sync-memory-bank --transcripts
+```
+
+…or, in the VS Code extension, click **Sync to Personal Space Now** in Settings. The CLI bundles the same engine (`cli/src/sync/` compiles into `dist/Cli.js` and is inlined into the VS Code extension). The only precondition is a valid `jolliApiKey`. Because the terminal has no diff viewer, the CLI **skips** conflicting files rather than prompting and prints their paths so you can resolve them in your editor.
 
 The vault is an implementation detail; the user-facing surface is an on/off toggle, a "Sync now" button, and a four-state status indicator (`synced` / `syncing` / `conflicts` / `offline`). Conflicts on the four `.jolli/<aggregate>.json` files (manifest, index, branches, catalog) auto-merge deterministically; other-file conflicts run through an AI merge (when `apiKey` is set) and finally a manual binary pick.
 
@@ -415,11 +462,11 @@ The [Jolli Memory VS Code Extension](https://marketplace.visualstudio.com/items?
 
 Starting in 0.99.2, `@jolli.ai/cli` can discover and load allow-listed plugin packages and let them register additional subcommands. Discovery is bounded: the CLI walks `node_modules/` directories upward from the current working directory, stopping at the nearest `.git` ancestor (or your home directory if none is found), and also consults the global npm root. The allow-list is fixed at the CLI level, so a malicious package cannot register itself merely by being on disk.
 
+The two shipping plugins are **`@jolli.ai/site-cli`** (the Jolli Site documentation generator) and **`@jolli.ai/space-cli`** (Jolli Space commands). Both are listed in `KNOWN_PLUGINS` in [`cli/src/KnownPlugins.ts`](https://github.com/jolliai/jolliai/blob/main/cli/src/KnownPlugins.ts), which is the source of truth for the allow-list.
+
 ```bash
 # Install (your existing jolli install is unchanged)
-# Replace <plugin> with an allow-listed package name — see KNOWN_PLUGINS
-# in cli/src/PluginLoader.ts for the current list.
-npm install -g <plugin>
+npm install -g @jolli.ai/site-cli      # or @jolli.ai/space-cli
 
 # Disable plugin loading entirely
 JOLLI_NO_PLUGINS=1 jolli <command>
@@ -472,7 +519,7 @@ Every entry on the `jollimemory/summaries/v3` orphan branch — and its mirror i
 
 ## Jolli Site — documentation from your content folder
 
-The CLI also includes a site generation surface that turns a plain folder of Markdown files and OpenAPI specs into a polished documentation site.
+Site generation turns a plain folder of Markdown files and OpenAPI specs into a polished documentation site. It ships as the separate **`@jolli.ai/site-cli`** plugin — install it with `npm install -g @jolli.ai/site-cli` and the host CLI discovers it automatically, making the commands below available. The commands appear in `jolli --help` either way; running one without the plugin installed prints a short install hint.
 
 ### `jolli new [folder-name]`
 
