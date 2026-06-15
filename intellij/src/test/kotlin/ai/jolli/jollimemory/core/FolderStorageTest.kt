@@ -236,6 +236,39 @@ class FolderStorageTest {
         }
 
         @Test
+        fun `plan write produces colon fileId and updatedAt the reader can round-trip`() {
+            storage.writeFiles(
+                listOf(FileWrite("plans/myplan.md", "# My Plan\nbody", branch = "main")),
+                "store plan",
+            )
+
+            val entry = metadataManager.readManifest().files.single { it.type == "plan" }
+            // P1: colon-delimited fileId (CLI contract), not the old `plan-<slug>` hyphen.
+            entry.fileId shouldBe "plan:myplan"
+            // P2a: updatedAt stamped so the timeline fold has a stable, travelling key.
+            entry.updatedAt shouldNotBe null
+
+            // End-to-end: the reader resolves the id and loads the hidden source body.
+            val refs = FolderPlanNoteSource.listFolderPlanNoteRefs(rootPath)
+            refs shouldHaveSize 1
+            refs[0].id shouldBe "myplan"
+            refs[0].timestamp shouldBe entry.updatedAt
+            FolderPlanNoteSource.loadFolderPlanNoteContent(rootPath, refs[0]) shouldContain "# My Plan"
+        }
+
+        @Test
+        fun `note write produces colon fileId and updatedAt`() {
+            storage.writeFiles(
+                listOf(FileWrite("notes/mynote.md", "# My Note\nbody", branch = "main")),
+                "store note",
+            )
+
+            val entry = metadataManager.readManifest().files.single { it.type == "note" }
+            entry.fileId shouldBe "note:mynote"
+            entry.updatedAt shouldNotBe null
+        }
+
+        @Test
         fun `non-summary files do not generate markdown`() {
             storage.writeFiles(
                 listOf(

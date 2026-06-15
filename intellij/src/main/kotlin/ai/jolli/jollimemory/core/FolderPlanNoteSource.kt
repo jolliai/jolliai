@@ -23,10 +23,13 @@ object FolderPlanNoteSource {
         val timestamp: String,
     )
 
-    /** fileId shapes: `plan:<slug>` / `note:<id>` (also tolerates `plan-<slug>` legacy). */
+    /** fileId shapes: `plan:<slug>` / `note:<id>` (also tolerates `plan-<slug>` / `note-<id>` legacy). */
     private fun idFromFileId(fileId: String): String {
         val colon = fileId.indexOf(":")
-        return if (colon == -1) fileId else fileId.substring(colon + 1)
+        if (colon != -1) return fileId.substring(colon + 1)
+        if (fileId.startsWith("plan-")) return fileId.removePrefix("plan-")
+        if (fileId.startsWith("note-")) return fileId.removePrefix("note-")
+        return fileId
     }
 
     private fun hiddenPath(kbRoot: Path, type: String, id: String): Path {

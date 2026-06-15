@@ -1026,12 +1026,10 @@ class KBExplorerPanel(
             )
             return
         }
-        if (wikiBuildInFlight) {
-            notifyWiki("Knowledge wiki build is already in progress.", NotificationType.INFORMATION)
-            return
-        }
-        wikiBuildInFlight = true
-
+        // Concurrency is guarded per-vault-root by the `VaultWriteLock` inside
+        // MultiRepoCompile (returns result.skipped, handled below). A process-wide
+        // in-memory flag was wrong here: it serialised unrelated projects pointing at
+        // different Memory Bank roots. The fail-fast lock is the single source of truth.
         val parent = config.knowledgeBasePath?.let { Path.of(it) } ?: KBPathResolver.KB_PARENT
         val llmConfig = IngestPipeline.LlmConfig(
             apiKey = config.apiKey,
@@ -1067,8 +1065,6 @@ class KBExplorerPanel(
                 } catch (e: Exception) {
                     JM.warn("buildKnowledgeWiki failed: ${e.message}")
                     notifyWiki("Knowledge wiki build failed: ${e.message}", NotificationType.ERROR)
-                } finally {
-                    wikiBuildInFlight = false
                 }
             }
         })
@@ -1252,10 +1248,6 @@ class KBExplorerPanel(
         // Lands in the shared <projectDir>/.jolli/jollimemory/debug.log so the
         // manual-sync click path is observable alongside the sync-layer logs.
         private val JM = ai.jolli.jollimemory.core.JmLogger.create("KBExplorerPanel")
-
-        /** Process-wide guard: at most one knowledge-wiki build runs at a time. */
-        @Volatile
-        private var wikiBuildInFlight = false
     }
 
     // ── Tree cell renderer ─────────────────────────────────────────────────

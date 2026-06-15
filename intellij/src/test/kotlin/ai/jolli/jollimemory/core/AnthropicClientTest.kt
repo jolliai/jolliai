@@ -1,9 +1,65 @@
 package ai.jolli.jollimemory.core
 
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 
 class AnthropicClientTest {
+
+    private fun sse(vararg events: String): java.util.stream.Stream<String> =
+        events.flatMap { listOf("data: $it", "") }.stream()
+
+    @Test
+    fun `parseSseStream accumulates a complete stream`() {
+        val client = AnthropicClient("test-key")
+        val response = client.parseSseStream(
+            sse(
+                """{"type":"message_start","message":{"id":"msg_1","model":"claude","usage":{"input_tokens":5}}}""",
+                """{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}""",
+                """{"type":"content_block_delta","delta":{"type":"text_delta","text":" world"}}""",
+                """{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}""",
+                """{"type":"message_stop"}""",
+            ),
+            "fallback-model",
+        )
+        response.id shouldBe "msg_1"
+        response.content.single().text shouldBe "Hello world"
+        response.usage.inputTokens shouldBe 5
+        response.usage.outputTokens shouldBe 2
+        response.stopReason shouldBe "end_turn"
+    }
+
+    @Test
+    fun `parseSseStream throws on a mid-stream error event`() {
+        val client = AnthropicClient("test-key")
+        val ex = assertThrows<RuntimeException> {
+            client.parseSseStream(
+                sse(
+                    """{"type":"message_start","message":{"id":"msg_1","model":"claude"}}""",
+                    """{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}""",
+                ),
+                "fallback-model",
+            )
+        }
+        ex.message shouldContain "overloaded_error"
+        ex.message shouldContain "Overloaded"
+    }
+
+    @Test
+    fun `parseSseStream throws when the stream ends without message_stop`() {
+        val client = AnthropicClient("test-key")
+        val ex = assertThrows<RuntimeException> {
+            client.parseSseStream(
+                sse(
+                    """{"type":"message_start","message":{"id":"msg_1","model":"claude"}}""",
+                    """{"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}""",
+                ),
+                "fallback-model",
+            )
+        }
+        ex.message shouldContain "prematurely"
+    }
 
     @Test
     fun `Message data class fields`() {
