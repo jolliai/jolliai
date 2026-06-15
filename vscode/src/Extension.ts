@@ -1637,6 +1637,7 @@ export function activate(context: vscode.ExtensionContext): void {
 						initializeKBFolder,
 						peekKBPath,
 						findFreshKBPath,
+						archiveKBFolder,
 					} = await import("../../cli/src/core/KBPathResolver.js");
 					const { MetadataManager } = await import(
 						"../../cli/src/core/MetadataManager.js"
@@ -1681,24 +1682,15 @@ export function activate(context: vscode.ExtensionContext): void {
 					const engine = new MigrationEngine(orphan, folder, newMm);
 					const result = await engine.runMigration();
 
-					// "Repoint": rewrite the old folder's identity so resolveKBPath()
-					// no longer reuses it. Content files are untouched.
+					// Archive the old folder by MOVING it into the hidden, per-Memory-
+					// Bank `.jolli/archive/` dir — not by rewriting its identity in
+					// place. The old identity-rewrite left the folder visible in both
+					// IDE folder views and still tracked by the vault git (so it kept
+					// syncing). `archiveKBFolder` relocates it where both explorers
+					// hide it (leading-dot dir) and the sync classifier treats it as
+					// unowned, while keeping it recoverable inside the Memory Bank.
 					if (oldKbRoot !== newKbRoot) {
-						try {
-							const oldMm = new MetadataManager(join(oldKbRoot, ".jolli"));
-							const oldCfg = oldMm.readConfig();
-							oldMm.saveConfig({
-								...oldCfg,
-								remoteUrl: undefined,
-								repoName: `${repoName}-archived-${Date.now()}`,
-							});
-						} catch (err) {
-							log.warn(
-								"rebuildKnowledgeBase",
-								`failed to archive old KB identity at ${oldKbRoot}`,
-								err,
-							);
-						}
+						archiveKBFolder(oldKbRoot, customKBPath);
 					}
 
 					// Rebuild's new folder lives under the SAME Memory Bank parent
