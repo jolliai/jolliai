@@ -4305,8 +4305,9 @@ describe("SummaryWebviewPanel", () => {
 				expect(statsMessages).toHaveLength(0);
 			});
 
-			it("excludes sessions from disabled sources in transcript stats", async () => {
-				// Disable claude and codex; only gemini is enabled
+			it("includes sessions from disabled sources in transcript stats (history is not gated by enable flags)", async () => {
+				// Disable claude and codex; only gemini is enabled. Archived history
+				// must still be counted in full — enable flags only gate future capture.
 				mockLoadConfig.mockResolvedValue({
 					claudeEnabled: false,
 					codexEnabled: false,
@@ -4355,18 +4356,23 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "loadTranscriptStats" });
 				await flushPromises();
 
-				// Claude (s1) and codex (cx1) sessions should be excluded; only gemini (g1) counted
+				// All three sessions counted regardless of disabled claude/codex.
 				expect(postMessage).toHaveBeenCalledWith(
 					expect.objectContaining({
 						command: "transcriptStatsLoaded",
-						totalEntries: 1,
-						sessionCounts: expect.objectContaining({ gemini: 1 }),
+						totalEntries: 4,
+						sessionCounts: expect.objectContaining({
+							claude: 1,
+							codex: 1,
+							gemini: 1,
+						}),
 					}),
 				);
 			});
 
-			it("excludes gemini sessions when geminiEnabled is false", async () => {
-				// Disable gemini while keeping claude and codex enabled
+			it("includes gemini sessions even when geminiEnabled is false", async () => {
+				// Disable gemini while keeping claude and codex enabled — gemini
+				// history is still counted.
 				mockLoadConfig.mockResolvedValue({
 					claudeEnabled: true,
 					codexEnabled: true,
@@ -4407,12 +4413,12 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "loadTranscriptStats" });
 				await flushPromises();
 
-				// Gemini session (g1) should be excluded; only claude session counted
+				// Both claude and gemini sessions counted despite gemini disabled.
 				expect(postMessage).toHaveBeenCalledWith(
 					expect.objectContaining({
 						command: "transcriptStatsLoaded",
-						totalEntries: 1,
-						sessionCounts: expect.objectContaining({ claude: 1 }),
+						totalEntries: 2,
+						sessionCounts: expect.objectContaining({ claude: 1, gemini: 1 }),
 					}),
 				);
 			});
@@ -4642,8 +4648,10 @@ describe("SummaryWebviewPanel", () => {
 				expect(loadingMessages).toHaveLength(0);
 			});
 
-			it("excludes sessions from disabled sources in loadAllTranscripts", async () => {
-				// Disable claude so claude-sourced sessions are filtered out
+			it("includes sessions from disabled sources in loadAllTranscripts (history is not gated by enable flags)", async () => {
+				// Disable claude — its archived sessions must STILL load, so the
+				// Manage modal shows them and Save All round-trips them. Filtering
+				// here was the visible half of a silent save-time data-loss bug.
 				mockLoadConfig.mockResolvedValue({
 					claudeEnabled: false,
 					codexEnabled: true,
@@ -4707,9 +4715,12 @@ describe("SummaryWebviewPanel", () => {
 				const payload = (loadedCall as Array<unknown>)[0] as {
 					entries: Array<{ source: string }>;
 				};
-				// Only codex entries should be present; claude entries filtered out
-				expect(payload.entries.every((e) => e.source === "codex")).toBe(true);
-				expect(payload.entries).toHaveLength(1);
+				// Both claude (disabled) and codex sessions present — nothing filtered.
+				expect(payload.entries).toHaveLength(2);
+				expect(payload.entries.map((e) => e.source).sort()).toEqual([
+					"claude",
+					"codex",
+				]);
 			});
 
 			it("loads all transcript entries and sends to webview", async () => {
@@ -4946,6 +4957,191 @@ describe("SummaryWebviewPanel", () => {
 				expect(postMessage).toHaveBeenCalledWith({
 					command: "transcriptsSaved",
 				});
+			});
+		});
+
+		// ── BUG 7 regression: history is not gated by enable flags ───────────
+		describe("saveAllTranscripts preserves disabled-source sessions (BUG 7)", () => {
+			type LoadedEntry = {
+				commitHash: string;
+				sessionId: string;
+				source: string;
+				transcriptPath: string;
+				originalIndex: number;
+				role: "human" | "assistant";
+				content: string;
+				timestamp: string;
+			};
+			type WrittenTranscript = {
+				hash: string;
+				data: {
+					sessions: Array<{
+						source: string;
+						entries: Array<{ content: string }>;
+					}>;
+				};
+			};
+
+			function loadedEntries(): Array<LoadedEntry> {
+				const call = postMessage.mock.calls.find(
+					(c) =>
+						(c[0] as { command: string }).command ===
+						"allTranscriptsLoaded",
+				);
+				return (call?.[0] as { entries: Array<LoadedEntry> }).entries;
+			}
+
+			it("round-trips a codex session through load→save even when codexEnabled is false", async () => {
+				mockLoadConfig.mockResolvedValue({
+					claudeEnabled: true,
+					codexEnabled: false,
+				});
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										transcriptPath: "/path/claude",
+										entries: [
+											{ role: "human" as const, content: "Claude Q" },
+										],
+									},
+									{
+										sessionId: "cx1",
+										source: "codex" as const,
+										transcriptPath: "/path/codex",
+										entries: [
+											{ role: "human" as const, content: "Codex Q" },
+										],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+
+				// 1) Load — the webview now receives BOTH claude and codex entries.
+				dispatch({ command: "loadAllTranscripts" });
+				await flushPromises();
+				const loaded = loadedEntries();
+				expect(loaded.map((e) => e.source).sort()).toEqual([
+					"claude",
+					"codex",
+				]);
+
+				// 2) User edits only the claude entry, leaves codex untouched, and
+				//    Save All round-trips the full set the webview holds.
+				const roundTripped = loaded.map((e) =>
+					e.source === "claude" ? { ...e, content: "Claude EDITED" } : e,
+				);
+				mockSaveTranscriptsBatch.mockClear();
+				dispatch({ command: "saveAllTranscripts", entries: roundTripped });
+				await flushPromises();
+
+				expect(mockSaveTranscriptsBatch).toHaveBeenCalledTimes(1);
+				const [writes, deletes] = mockSaveTranscriptsBatch.mock.calls[0] as [
+					Array<WrittenTranscript>,
+					Array<string>,
+				];
+				// abc123 is NOT deleted, and the codex session survives verbatim.
+				expect(deletes).not.toContain("abc123");
+				const write = writes.find((w) => w.hash === "abc123");
+				expect(write?.data.sessions.map((s) => s.source).sort()).toEqual([
+					"claude",
+					"codex",
+				]);
+				const codex = write?.data.sessions.find((s) => s.source === "codex");
+				expect(codex?.entries[0]?.content).toBe("Codex Q");
+			});
+
+			it("does not delete a transcript whose sessions are all from a disabled source", async () => {
+				// abc123 = claude only; def456 = codex only. Codex disabled, user
+				// edits the claude transcript and hits Save All. def456 must NOT be
+				// deleted just because every one of its sessions is codex.
+				mockLoadConfig.mockResolvedValue({
+					claudeEnabled: true,
+					codexEnabled: false,
+				});
+				mockGetTranscriptHashes.mockResolvedValue(
+					new Set(["abc123", "def456"]),
+				);
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										transcriptPath: "/path/claude",
+										entries: [
+											{ role: "human" as const, content: "Claude Q" },
+										],
+									},
+								],
+							},
+						],
+						[
+							"def456",
+							{
+								sessions: [
+									{
+										sessionId: "cx1",
+										source: "codex" as const,
+										transcriptPath: "/path/codex",
+										entries: [
+											{ role: "human" as const, content: "Codex Q" },
+										],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = makeSummary({
+					children: [makeSummary({ commitHash: "def456" })],
+				});
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadAllTranscripts" });
+				await flushPromises();
+				const roundTripped = loadedEntries().map((e) =>
+					e.source === "claude" ? { ...e, content: "Claude EDITED" } : e,
+				);
+				mockSaveTranscriptsBatch.mockClear();
+				dispatch({ command: "saveAllTranscripts", entries: roundTripped });
+				await flushPromises();
+
+				const [writes, deletes] = mockSaveTranscriptsBatch.mock.calls[0] as [
+					Array<WrittenTranscript>,
+					Array<string>,
+				];
+				expect(deletes).not.toContain("def456");
+				const def = writes.find((w) => w.hash === "def456");
+				expect(def?.data.sessions[0]?.source).toBe("codex");
+				expect(def?.data.sessions[0]?.entries[0]?.content).toBe("Codex Q");
 			});
 		});
 
@@ -8135,7 +8331,7 @@ describe("SummaryWebviewPanel", () => {
 		// ── openCodeEnabled: false ────────────────────────────────────────────────
 
 		describe("loadTranscriptStats: openCodeEnabled false", () => {
-			it("excludes opencode sessions when openCodeEnabled is false", async () => {
+			it("includes opencode sessions even when openCodeEnabled is false", async () => {
 				mockLoadConfig.mockResolvedValue({
 					claudeEnabled: true,
 					codexEnabled: true,
@@ -8180,12 +8376,15 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "loadTranscriptStats" });
 				await flushPromises();
 
-				// opencode session (oc1) should be excluded; only claude session counted
+				// Both claude and opencode (oc1) counted despite opencode disabled.
 				expect(postMessage).toHaveBeenCalledWith(
 					expect.objectContaining({
 						command: "transcriptStatsLoaded",
-						totalEntries: 1,
-						sessionCounts: expect.objectContaining({ claude: 1 }),
+						totalEntries: 3,
+						sessionCounts: expect.objectContaining({
+							claude: 1,
+							opencode: 1,
+						}),
 					}),
 				);
 			});
@@ -8194,7 +8393,7 @@ describe("SummaryWebviewPanel", () => {
 		// ── cursorEnabled: false ────────────────────────────────────────────────
 
 		describe("loadTranscriptStats: cursorEnabled false", () => {
-			it("excludes cursor sessions when cursorEnabled is false", async () => {
+			it("includes cursor sessions even when cursorEnabled is false", async () => {
 				mockLoadConfig.mockResolvedValue({
 					claudeEnabled: true,
 					codexEnabled: true,
@@ -8240,11 +8439,12 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "loadTranscriptStats" });
 				await flushPromises();
 
+				// Both claude and cursor (cur1) counted despite cursor disabled.
 				expect(postMessage).toHaveBeenCalledWith(
 					expect.objectContaining({
 						command: "transcriptStatsLoaded",
-						totalEntries: 1,
-						sessionCounts: expect.objectContaining({ claude: 1 }),
+						totalEntries: 3,
+						sessionCounts: expect.objectContaining({ claude: 1, cursor: 1 }),
 					}),
 				);
 			});
@@ -8299,7 +8499,7 @@ describe("SummaryWebviewPanel", () => {
 				);
 			});
 
-			it("excludes copilot sessions when copilotEnabled === false", async () => {
+			it("includes copilot sessions even when copilotEnabled === false", async () => {
 				mockLoadConfig.mockResolvedValue({
 					claudeEnabled: true,
 					copilotEnabled: false,
@@ -8342,12 +8542,12 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "loadTranscriptStats" });
 				await flushPromises();
 
-				// copilot session (cp1) should be excluded; only claude session counted
+				// Both claude and copilot (cp1) counted despite copilot disabled.
 				expect(postMessage).toHaveBeenCalledWith(
 					expect.objectContaining({
 						command: "transcriptStatsLoaded",
-						totalEntries: 1,
-						sessionCounts: expect.objectContaining({ claude: 1 }),
+						totalEntries: 3,
+						sessionCounts: expect.objectContaining({ claude: 1, copilot: 1 }),
 					}),
 				);
 			});
@@ -8398,7 +8598,7 @@ describe("SummaryWebviewPanel", () => {
 				);
 			});
 
-			it("excludes copilot-chat when copilotEnabled is false", async () => {
+			it("includes copilot-chat even when copilotEnabled is false", async () => {
 				mockLoadConfig.mockResolvedValue({
 					claudeEnabled: true,
 					copilotEnabled: false,
@@ -8441,18 +8641,21 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "loadTranscriptStats" });
 				await flushPromises();
 
-				// copilot-chat session (cc1) should be excluded; only claude session counted
+				// Both claude and copilot-chat (cc1) counted despite copilot disabled.
 				expect(postMessage).toHaveBeenCalledWith(
 					expect.objectContaining({
 						command: "transcriptStatsLoaded",
-						totalEntries: 1,
-						sessionCounts: expect.objectContaining({ claude: 1 }),
+						totalEntries: 3,
+						sessionCounts: expect.objectContaining({
+							claude: 1,
+							"copilot-chat": 1,
+						}),
 					}),
 				);
 				const lastCall = postMessage.mock.calls[
 					postMessage.mock.calls.length - 1
 				]?.[0] as { sessionCounts?: Record<string, number> } | undefined;
-				expect(lastCall?.sessionCounts).not.toHaveProperty("copilot-chat");
+				expect(lastCall?.sessionCounts).toHaveProperty("copilot-chat", 1);
 			});
 		});
 

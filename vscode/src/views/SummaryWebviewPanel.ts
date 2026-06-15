@@ -3416,32 +3416,6 @@ export class SummaryWebviewPanel {
 
 	// ─── Transcript handlers ─────────────────────────────────────────────────
 
-	/** Returns the set of integration source names that are currently enabled in config. */
-	private async getEnabledSources(): Promise<Set<string>> {
-		const config = await loadGlobalConfig();
-		const sources = new Set<string>();
-		if (config.claudeEnabled !== false) {
-			sources.add("claude");
-		}
-		if (config.codexEnabled !== false) {
-			sources.add("codex");
-		}
-		if (config.geminiEnabled !== false) {
-			sources.add("gemini");
-		}
-		if (config.openCodeEnabled !== false) {
-			sources.add("opencode");
-		}
-		if (config.cursorEnabled !== false) {
-			sources.add("cursor");
-		}
-		if (config.copilotEnabled !== false) {
-			sources.add("copilot");
-			sources.add("copilot-chat");
-		}
-		return sources;
-	}
-
 	/** Loads lightweight stats (session/entry counts by source) without sending full content. */
 	private async handleLoadTranscriptStats(): Promise<void> {
 		if (this.transcriptHashSet.size === 0) {
@@ -3456,18 +3430,18 @@ export class SummaryWebviewPanel {
 			: await this.bridge.readTranscriptsForCommits([
 					...this.transcriptHashSet,
 				]);
-		const enabledSources = await this.getEnabledSources();
 
-		// Deduplicate sessions by source:sessionId (same session may appear in multiple commit transcripts)
+		// Stats reflect the transcripts actually archived at commit time. They are
+		// NOT filtered by the current Settings enable flags: those flags govern
+		// whether a source is *captured going forward*, not whether already-archived
+		// history is shown. Filtering here under-counted disabled-source sessions and
+		// — paired with the save path — was the visible half of a silent data-loss bug.
 		const seen = new Set<string>();
 		let totalEntries = 0;
 		const sessionCounts: Record<string, number> = {};
 		for (const [, transcript] of transcriptMap) {
 			for (const session of transcript.sessions) {
 				const source = session.source ?? "claude";
-				if (!enabledSources.has(source)) {
-					continue;
-				}
 				const key = `${source}:${session.sessionId}`;
 				totalEntries += session.entries.length;
 				if (seen.has(key)) {
@@ -3502,8 +3476,13 @@ export class SummaryWebviewPanel {
 					this.foreignStorage,
 				)
 			: await this.bridge.readTranscriptsForCommits(hashesWithTranscripts);
-		const enabledSources = await this.getEnabledSources();
 
+		// Load every archived session regardless of the current Settings enable
+		// flags. Those flags only gate future capture; the transcripts here were
+		// already recorded at commit time. The Manage modal must show — and Save All
+		// must round-trip — all of them, or disabled-source sessions silently vanish
+		// on save (and whole transcripts get deleted when all their sessions are
+		// from a now-disabled source).
 		// Build tagged entries: each entry carries its commit hash, session info, and original index
 		const taggedEntries: Array<{
 			commitHash: string;
@@ -3519,15 +3498,12 @@ export class SummaryWebviewPanel {
 		for (const [commitHash, transcript] of transcriptMap) {
 			for (const session of transcript.sessions) {
 				const source = session.source ?? "claude";
-				if (!enabledSources.has(source)) {
-					continue;
-				}
 				for (let i = 0; i < session.entries.length; i++) {
 					const entry = session.entries[i];
 					taggedEntries.push({
 						commitHash,
 						sessionId: session.sessionId,
-						source: session.source ?? "claude",
+						source,
 						transcriptPath: session.transcriptPath ?? "",
 						originalIndex: i,
 						role: entry.role,
