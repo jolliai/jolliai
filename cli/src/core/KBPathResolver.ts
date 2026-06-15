@@ -96,8 +96,15 @@ export function resolveKBPath(repoName: string, remoteUrl: string | null, custom
 	const parent = resolveKbParent(customPath);
 	const basePath = join(parent, repoName);
 
-	// Case A: basePath is unused → claim it fresh.
+	// Case A: basePath is unused. Before claiming it fresh, scan the suffix
+	// ladder for a folder that already holds this repo — a prior Migrate may
+	// have archived the base and left the live data in `<repo>-N`. Reusing it
+	// keeps `resolveKBPath` in lockstep with `peekKBPath` and stops a fresh
+	// empty `<repo>` base from being spawned to shadow the real data folder
+	// (the "empty base reappears after every migrate" regression).
 	if (!existsSync(basePath)) {
+		const match = scanRepoSuffixes(parent, repoName, remoteUrl).match;
+		if (match) return match;
 		writeKBIdentity(basePath, repoName, remoteUrl);
 		return basePath;
 	}
@@ -134,7 +141,13 @@ export function peekKBPath(repoName: string, remoteUrl: string | null, customPat
 	const parent = resolveKbParent(customPath);
 	const basePath = join(parent, repoName);
 
-	if (!existsSync(basePath)) return basePath;
+	if (!existsSync(basePath)) {
+		// Mirror `resolveKBPath` Case A: the base slot is free, but a prior
+		// Migrate may have archived the base and left this repo's data in a
+		// suffixed folder. Resolve to that folder rather than a base path that
+		// doesn't exist yet, so peek and `resolveKBPath` agree.
+		return scanRepoSuffixes(parent, repoName, remoteUrl).match ?? basePath;
+	}
 
 	const existingConfig = readKBConfig(basePath);
 	if (existingConfig && isSameRepo(existingConfig, remoteUrl, repoName)) return basePath;

@@ -235,6 +235,28 @@ class KBPathResolverTest {
         }
 
         @Test
+        fun `reuses a suffixed data folder when the base slot is free (post-Migrate)`() {
+            // After a Migrate archives the base `<repo>` and leaves the live data in
+            // `<repo>-2`, the base slot is free. resolve must reuse repo-2 rather than
+            // claiming a fresh empty base that shadows it. Mirrors the canonical TS
+            // resolveKBPath Case A fix.
+            val remote = "https://github.com/u/canonical.git"
+            val data = tempDir.resolve("repo-2")
+            KBPathResolver.initializeKBFolder(data, "repo", remote)
+
+            KBPathResolver.resolve("repo", remote, tempDir.toString()) shouldBe data
+            Files.isDirectory(tempDir.resolve("repo")) shouldBe false
+        }
+
+        @Test
+        fun `still returns the base when a free base slot has only a different-repo suffix`() {
+            val remote = "https://github.com/u/canonical.git"
+            KBPathResolver.initializeKBFolder(tempDir.resolve("repo-2"), "repo", "https://github.com/u/other.git")
+
+            KBPathResolver.resolve("repo", remote, tempDir.toString()) shouldBe tempDir.resolve("repo")
+        }
+
+        @Test
         fun `claims the lowest free slot in the custom parent, not the global default`() {
             // findAvailablePath must honor the custom parent (tempDir), not KB_PARENT.
             createKBFolder("dup", "https://github.com/u/a.git")

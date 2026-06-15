@@ -1636,7 +1636,7 @@ export function activate(context: vscode.ExtensionContext): void {
 						getRemoteUrl,
 						initializeKBFolder,
 						findRepoFolders,
-						findFreshKBPath,
+						peekKBPath,
 						archiveKBFolder,
 					} = await import("../../cli/src/core/KBPathResolver.js");
 					const { MetadataManager } = await import(
@@ -1667,15 +1667,39 @@ export function activate(context: vscode.ExtensionContext): void {
 						};
 					}
 
-					// Enumerate EVERY folder that currently holds this repo BEFORE
-					// creating the fresh one. Earlier buggy runs (archive gate defeated
-					// by a numbering hole) could leave a pile of duplicates — `<repo>-3`,
-					// `-4`, `-5`, … all sharing one identity. Capturing them up front
-					// lets one Migrate fold the whole pile, instead of clearing one
-					// folder per click. The fresh folder doesn't exist yet, so it can
-					// never appear in this list.
+					// Enumerate EVERY folder that currently holds this repo, then
+					// archive the whole pile FIRST — the canonical base `<repo>` slot
+					// included. Earlier buggy runs (archive gate defeated by a numbering
+					// hole) could leave a pile of duplicates — `<repo>`, `-3`, `-4`, … all
+					// sharing one identity. Archiving up front frees the base slot so the
+					// migration below lands back on the canonical base name instead of
+					// climbing to an ever-higher `<repo>-N` (the user-visible "I keep
+					// getting jolliai-2, -3 …" symptom). Safe to archive before migrating:
+					// the migration SOURCE is the orphan branch (the system of record),
+					// not these folders, so a crash mid-migrate self-heals on the next
+					// activation, which re-migrates from the orphan branch into the now
+					// free base slot.
+					//
+					// `archiveKBFolder` MOVES each folder into the hidden, per-Memory-Bank
+					// `.jolli/archive/` dir rather than rewriting its identity in place.
+					// The old identity-rewrite left folders visible in both IDE folder
+					// views and still tracked by the vault git (so they kept syncing);
+					// the archive dir is hidden (leading-dot) and unowned by the sync
+					// classifier. Folding the whole pile to a single live folder also lets
+					// the sync layer self-heal `repos.json`: with one folder per identity,
+					// `resolveOrAssignFolder` repoints any stale row to the live folder on
+					// the next round (multi-folder identities are skipped by
+					// `reconcileMappingAdditive` precisely to avoid a mapping↔disk split,
+					// so we must NOT write `repos.json` from here).
 					const staleFolders = findRepoFolders(repoName, remoteUrl, customKBPath);
-					const newKbRoot = findFreshKBPath(repoName, customKBPath);
+					for (const stale of staleFolders) {
+						archiveKBFolder(stale, customKBPath);
+					}
+
+					// With the pile archived, the base slot is free again; `peekKBPath`
+					// resolves to it (falling back to a fresh `-N` only if some folder
+					// for this repo survived archiving). Claim it and migrate into it.
+					const newKbRoot = peekKBPath(repoName, remoteUrl, customKBPath);
 					initializeKBFolder(newKbRoot, repoName, remoteUrl);
 
 					const newMm = new MetadataManager(join(newKbRoot, ".jolli"));
@@ -1684,32 +1708,16 @@ export function activate(context: vscode.ExtensionContext): void {
 					const engine = new MigrationEngine(orphan, folder, newMm);
 					const result = await engine.runMigration();
 
-					// Archive every prior folder for this repo by MOVING it into the
-					// hidden, per-Memory-Bank `.jolli/archive/` dir — not by rewriting
-					// its identity in place. The old identity-rewrite left folders
-					// visible in both IDE folder views and still tracked by the vault
-					// git (so they kept syncing). `archiveKBFolder` relocates them where
-					// both explorers hide them (leading-dot dir) and the sync classifier
-					// treats them as unowned, while keeping them recoverable inside the
-					// Memory Bank. Folding the whole pile to a single live folder also
-					// lets the sync layer self-heal `repos.json`: with one folder per
-					// identity, `resolveOrAssignFolder` repoints any stale row to the
-					// live folder on the next round (multi-folder identities are skipped
-					// by `reconcileMappingAdditive` precisely to avoid a mapping↔disk
-					// split, so we must NOT write `repos.json` from here).
-					for (const stale of staleFolders) {
-						if (stale !== newKbRoot) archiveKBFolder(stale, customKBPath);
-					}
-
 					// Rebuild's new folder lives under the SAME Memory Bank parent
-					// as the previous one (e.g. <localFolder>/<repo>-2/), so
+					// as the previous one (the canonical <localFolder>/<repo>/ slot,
+					// re-created after the prior pile was archived), so
 					// refreshSidebarKbRoot would return moved=false and the KB tree
 					// would still point at the archived directory until a window
-					// reload. The per-repo kbRoot changed, even though the parent
-					// did not — refresh + cache-invalidate unconditionally after a
-					// successful rebuild so the tree picks up the new folder and
-					// the multi-repo Memories aggregate drops entries discovered
-					// against the now-archived identity.
+					// reload. The folder's contents were replaced even though its
+					// path did not change — refresh + cache-invalidate unconditionally
+					// after a successful rebuild so the tree picks up the rebuilt
+					// folder and the multi-repo Memories aggregate drops entries
+					// discovered against the now-archived identities.
 					await refreshSidebarKbRoot();
 					sidebarProvider.refreshKnowledgeBaseFolders();
 					bridge.invalidateEntriesCache();
