@@ -36,9 +36,11 @@ fun getVscodeUserDataDir(flavor: VscodeFlavor, home: String = System.getProperty
 		osName.contains("mac") ->
 			home + File.separator + "Library" + File.separator + "Application Support" + File.separator + flavor.dirName
 		osName.contains("win") -> {
-			// `cursor.appdata.override` is a test hook: Java cannot unset env vars, so tests
-			// that need to redirect away from the real %APPDATA% set this system property instead.
-			val appData = if (flavor == VscodeFlavor.Cursor) System.getProperty("cursor.appdata.override") else null
+			// `<flavor>.appdata.override` (e.g. `cursor.appdata.override`, `code.appdata.override`)
+			// is a per-flavor test hook: Java cannot unset env vars, so tests that need to
+			// redirect away from the real %APPDATA% set this system property instead. Production
+			// never sets it, so the real %APPDATA% (or the ~/AppData/Roaming fallback) is used.
+			val appData = System.getProperty("${flavor.dirName.lowercase()}.appdata.override")
 			(appData ?: System.getenv("APPDATA") ?: (home + File.separator + "AppData" + File.separator + "Roaming")) +
 				File.separator + flavor.dirName
 		}
