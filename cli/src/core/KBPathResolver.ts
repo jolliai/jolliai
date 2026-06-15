@@ -16,7 +16,7 @@
  * that forgot the follow-up wrote a phantom `{repo}-2`.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { createLogger } from "../Logger.js";
@@ -179,6 +179,50 @@ export function findFreshKBPath(repoName: string, customPath?: string): string {
 export function initializeKBFolder(kbRoot: string, repoName: string, remoteUrl: string | null): void {
 	writeKBIdentity(kbRoot, repoName, remoteUrl);
 	log.info("KB folder initialized: %s (remote=%s)", kbRoot, remoteUrl ?? "none");
+}
+
+/**
+ * Moves a KB repo folder out of the active Memory Bank area into the hidden,
+ * per-Memory-Bank archive dir `<parent>/.jolli/archive/<name>-<timestamp>/`.
+ *
+ * Replaces the old "archive = rewrite `config.json` identity in place" step,
+ * which left the folder both visible in the IDE folder views AND still tracked
+ * by the vault git (so it kept syncing to the server — verified: 138 tracked
+ * files under a supposedly-archived repo). The archive dir is hidden (leading
+ * dot → filtered by both the VS Code and IntelliJ explorers) and unowned by the
+ * sync classifier (`VaultPathClassifier` rejects leading-dot path segments → the
+ * next sync round `git rm --cached`s it). It stays *inside* the Memory Bank so it
+ * travels with `localFolder`, and the orphan branch remains the system of record
+ * for recovery.
+ *
+ * Returns the destination path, or `null` if `kbRoot` doesn't exist (nothing to
+ * archive) or the move fails — callers log and proceed, since a stale visible
+ * folder is a lesser evil than aborting a rebuild.
+ *
+ * The IntelliJ Kotlin port (`KBPathResolver.kt`) must mirror this — both IDEs
+ * resolve folders in the same Memory Bank and would otherwise disagree on where
+ * archives live.
+ */
+export function archiveKBFolder(kbRoot: string, customPath?: string): string | null {
+	if (!existsSync(kbRoot)) return null;
+	const parent = resolveKbParent(customPath);
+	const archiveDir = join(parent, ".jolli", "archive");
+	const name = basename(kbRoot);
+	// Timestamp keeps repeated archives of the same repo distinct; the counter
+	// guards against same-millisecond collisions (rapid rebuilds, fake clocks).
+	let dest = join(archiveDir, `${name}-${Date.now()}`);
+	for (let n = 2; existsSync(dest) && n <= 99; n++) {
+		dest = join(archiveDir, `${name}-${Date.now()}-${n}`);
+	}
+	try {
+		mkdirSync(archiveDir, { recursive: true });
+		renameSync(kbRoot, dest);
+		log.info("Archived KB folder: %s → %s", kbRoot, dest);
+		return dest;
+	} catch (err) {
+		log.warn("Failed to archive KB folder %s: %s", kbRoot, err instanceof Error ? err.message : String(err));
+		return null;
+	}
 }
 
 /**
