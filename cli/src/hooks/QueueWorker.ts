@@ -2669,13 +2669,22 @@ async function readAllTranscripts(
 		const source = session.source ?? "claude";
 
 		// Gemini, OpenCode, Cursor, and Copilot use dedicated readers (not JSONL line-based parsing).
-		// SQLite-backed readers (opencode/cursor/copilot) share the same failure modes —
-		// transient lock, corruption, schema drift, DB disappearing between scan and read.
-		// Wrap each in try/catch + `continue` so one bad session never abandons the rest of
-		// the batch. JSONL readers (gemini/claude) handle their per-line failures internally.
+		// Every reader is wrapped in try/catch + `continue` so one bad session never abandons the
+		// rest of the batch. SQLite-backed readers (opencode/cursor/copilot) fail on transient
+		// lock, corruption, schema drift, or DB disappearing between scan and read. The JSONL
+		// readers (gemini/claude) handle per-line corruption internally, but a missing or
+		// unreadable transcript file (ENOENT/EACCES) throws from the reader BEFORE any line is
+		// parsed — a real case when a session in sessions.json points at a transcript that was
+		// rotated or deleted. Left unguarded, that throw aborts the whole pipeline and the commit
+		// summary is silently dropped, so the claude/gemini branches are wrapped too.
 		let result: TranscriptReadResult;
 		if (source === "gemini") {
-			result = await readGeminiTranscript(session.transcriptPath, cursor, beforeTimestamp);
+			try {
+				result = await readGeminiTranscript(session.transcriptPath, cursor, beforeTimestamp);
+			} catch (error: unknown) {
+				log.error("Skipping Gemini session %s: %s", session.sessionId, (error as Error).message);
+				continue;
+			}
 		} else if (source === "opencode") {
 			try {
 				result = await readOpenCodeTranscript(session.transcriptPath, cursor, beforeTimestamp);
@@ -2705,7 +2714,17 @@ async function readAllTranscripts(
 				continue;
 			}
 		} else {
-			result = await readTranscript(session.transcriptPath, cursor, getParserForSource(source), beforeTimestamp);
+			try {
+				result = await readTranscript(
+					session.transcriptPath,
+					cursor,
+					getParserForSource(source),
+					beforeTimestamp,
+				);
+			} catch (error: unknown) {
+				log.error("Skipping %s session %s: %s", source, session.sessionId, (error as Error).message);
+				continue;
+			}
 		}
 		const endLine = result.newCursor.lineNumber;
 

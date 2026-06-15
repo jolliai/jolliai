@@ -147,6 +147,7 @@ import { loadOverlay, overlayPath, saveOverlay } from "../core/ConversationOverl
 import { readCopilotChatTranscript } from "../core/CopilotChatTranscriptReader.js";
 import { readCopilotTranscript } from "../core/CopilotTranscriptReader.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
+import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import { loadAllSessions, loadCursorForTranscript } from "../core/SessionTracker.js";
 import { readTranscript } from "../core/TranscriptReader.js";
@@ -267,13 +268,14 @@ describe("QueueWorker overlay path", () => {
 	// "skip this session, keep going" semantics) need a test where each
 	// reader throws so the surrounding pipeline still completes.
 	const readErrorCases: ReadonlyArray<{
-		readonly source: "opencode" | "cursor" | "copilot" | "copilot-chat";
+		readonly source: "opencode" | "cursor" | "copilot" | "copilot-chat" | "gemini";
 		readonly mock: ReturnType<typeof vi.fn>;
 	}> = [
 		{ source: "opencode", mock: vi.mocked(readOpenCodeTranscript) },
 		{ source: "cursor", mock: vi.mocked(readCursorTranscript) },
 		{ source: "copilot", mock: vi.mocked(readCopilotTranscript) },
 		{ source: "copilot-chat", mock: vi.mocked(readCopilotChatTranscript) },
+		{ source: "gemini", mock: vi.mocked(readGeminiTranscript) },
 	];
 	for (const { source, mock } of readErrorCases) {
 		it(`skips a ${source} session whose transcript reader throws`, async () => {
