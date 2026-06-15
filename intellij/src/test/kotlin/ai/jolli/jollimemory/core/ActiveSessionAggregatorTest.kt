@@ -16,6 +16,15 @@ class ActiveSessionAggregatorTest {
 	@TempDir
 	lateinit var tempDir: File
 
+	/**
+	 * Isolated home so source discoverers that scan the user's home directory
+	 * (Codex's `~/.codex/sessions`, Gemini, OpenCode, …) see an empty tree
+	 * instead of the real machine's sessions. Without this, a developer with a
+	 * recent Codex session would have it leak into every aggregator assertion.
+	 */
+	@TempDir
+	lateinit var homeDir: File
+
 	private val cwd get() = tempDir.absolutePath
 
 	private val HOUR = 3_600_000L
@@ -25,7 +34,6 @@ class ActiveSessionAggregatorTest {
 
 	@BeforeEach
 	fun setUp() {
-		File(tempDir, ".jolli/jollimemory").mkdirs()
 		// Hermetic isolation. The aggregator fans out to the Codex / Cursor / OpenCode
 		// discoverers, which scan machine-global session dirs derived from `user.home`
 		// (~/.codex/sessions, ~/Library/Application Support/Cursor, ~/.local/share/opencode)
@@ -36,7 +44,8 @@ class ActiveSessionAggregatorTest {
 		// this test registers. Mirrors CursorSupportTest / VscodeWorkspaceLocatorTest.
 		// (OpenCode also honors XDG_DATA_HOME; this assumes it is unset, as on CI.)
 		originalHome = System.getProperty("user.home")
-		System.setProperty("user.home", File(tempDir, "home").apply { mkdirs() }.absolutePath)
+		System.setProperty("user.home", homeDir.absolutePath)
+		File(tempDir, ".jolli/jollimemory").mkdirs()
 	}
 
 	@AfterEach
