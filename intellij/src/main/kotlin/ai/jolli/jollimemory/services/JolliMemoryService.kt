@@ -12,10 +12,12 @@ import ai.jolli.jollimemory.core.StatusInfo
 import ai.jolli.jollimemory.core.StorageFactory
 import ai.jolli.jollimemory.sync.SyncEngine
 import ai.jolli.jollimemory.sync.SyncOrchestrator
+import ai.jolli.jollimemory.sync.STATUS_AUTO_CLEAR_DELAY_MS
 import ai.jolli.jollimemory.sync.SyncOrchestratorOpts
 import ai.jolli.jollimemory.sync.SyncState
 import ai.jolli.jollimemory.sync.SyncStatusBarWidget
 import ai.jolli.jollimemory.sync.SyncStatusDetail
+import ai.jolli.jollimemory.sync.autoClearableSyncState
 import ai.jolli.jollimemory.toolwindow.PanelRegistry
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
@@ -23,6 +25,7 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.wm.WindowManager
+import com.intellij.util.concurrency.AppExecutorUtil
 import git4idea.repo.GitRepository
 import git4idea.repo.GitRepositoryChangeListener
 import java.io.File
@@ -32,6 +35,7 @@ import java.nio.file.Path
 import java.nio.file.StandardWatchEventKinds
 import java.nio.file.WatchService
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import javax.swing.Timer
 
@@ -70,6 +74,9 @@ class JolliMemoryService(private val project: Project) : Disposable {
     private var syncState: SyncState? = null
     @Volatile
     private var syncDetail: SyncStatusDetail? = null
+    /** Bumped on every sync-state change so a pending auto-clear can detect that
+     *  a newer state arrived and skip clobbering it. */
+    private val syncStateGen = AtomicLong(0)
     /** Listeners notified (on the EDT) whenever the sync state changes. Lets the
      *  KB explorer toolbar mirror the status-bar widget's progress/error feedback. */
     private val syncListeners = CopyOnWriteArrayList<(SyncState, SyncStatusDetail?) -> Unit>()
@@ -740,12 +747,14 @@ val sb = StringBuilder()
             pollIntervalSec = pollIntervalSec,
             lastSuccessAtMs = lastSyncSuccessAtMs,
             onStateChange = { state, detail ->
+                val gen = syncStateGen.incrementAndGet()
                 syncState = state
                 syncDetail = detail
                 ApplicationManager.getApplication().invokeLater {
                     widget?.setSyncState(state, detail)
                     syncListeners.forEach { it(state, detail) }
                 }
+                scheduleStatusAutoClear(state, gen)
             },
         ))
         orchestrator = orch
@@ -755,6 +764,52 @@ val sb = StringBuilder()
     /** Stop the sync polling loop (orchestrator remains usable for manual sync). */
     fun stopSync() {
         orchestrator?.stop()
+        // A terminal failure from the last round is sticky: the status bar only
+        // leaves OFFLINE on a subsequent *successful* round, which never comes
+        // once polling has stopped (sign-out, auto-sync disabled, restart). Reset
+        // it so a stale "✗ Sync failed" badge doesn't linger while no sync runs.
+        // Gated on "was actually a failure" so a healthy ✓ state is preserved
+        // across the stop()/start() restart dance. Widget + cached state +
+        // listeners are reset together, mirroring the onStateChange path.
+        if (syncState == SyncState.OFFLINE && syncDetail?.failed == true) {
+            syncStateGen.incrementAndGet()
+            syncState = SyncState.OFFLINE
+            syncDetail = null
+            val widget = findSyncWidget()
+            ApplicationManager.getApplication().invokeLater {
+                widget?.clearFailureStatus()
+                syncListeners.forEach { it(SyncState.OFFLINE, null) }
+            }
+        }
+    }
+
+    /**
+     * Auto-dismiss a finished sync status after [STATUS_AUTO_CLEAR_DELAY_MS] so
+     * the status bar and KB toolbar return to a neutral resting state instead of
+     * holding a stale badge. A failure is the worst offender — it otherwise
+     * lingers until the next round (up to 90 min away, or never once polling
+     * stops). SYNCING is skipped: it's an in-progress indicator that its own
+     * result replaces.
+     *
+     * The [gen] guard ensures a newer state (a fresh round starting inside the
+     * window, a sign-out clear, etc.) is never clobbered by a stale timer: if
+     * [syncStateGen] has moved on, the scheduled clear is a no-op. Widget +
+     * cached state + listeners are reset together, mirroring the onStateChange
+     * path so getSyncState() and late-registering panels stay consistent.
+     */
+    private fun scheduleStatusAutoClear(state: SyncState, gen: Long) {
+        if (!autoClearableSyncState(state)) return
+        AppExecutorUtil.getAppScheduledExecutorService().schedule({
+            if (syncStateGen.get() != gen) return@schedule
+            syncState = SyncState.OFFLINE
+            syncDetail = null
+            val widget = findSyncWidget()
+            ApplicationManager.getApplication().invokeLater {
+                if (syncStateGen.get() != gen) return@invokeLater
+                widget?.setSyncState(SyncState.OFFLINE, null)
+                syncListeners.forEach { it(SyncState.OFFLINE, null) }
+            }
+        }, STATUS_AUTO_CLEAR_DELAY_MS, TimeUnit.MILLISECONDS)
     }
 
     /** Trigger a manual sync round, coalescing with any in-flight round. */

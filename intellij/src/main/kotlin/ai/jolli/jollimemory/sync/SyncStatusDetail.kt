@@ -24,6 +24,22 @@ const val DEFAULT_POLL_SEC: Int = 90 * 60
 /** Default eager-tick threshold: 30 minutes. */
 const val DEFAULT_EAGER_TICK_MIN_ELAPSED_MS: Long = 30 * 60_000L
 
+/**
+ * How long a finished sync status badge stays on the status bar / toolbar
+ * before it auto-reverts to the neutral resting state. Keeps a stale badge —
+ * especially a failure — from lingering until the next round (up to 90 min
+ * away, or never once polling stops).
+ */
+const val STATUS_AUTO_CLEAR_DELAY_MS: Long = 3_000L
+
+/**
+ * Whether a [SyncState] should auto-dismiss to neutral after
+ * [STATUS_AUTO_CLEAR_DELAY_MS]. SYNCING is an in-progress indicator that its own
+ * result replaces, so it is never auto-cleared; every finished state (SYNCED /
+ * CONFLICTS / OFFLINE, including failures) is.
+ */
+fun autoClearableSyncState(state: SyncState): Boolean = state != SyncState.SYNCING
+
 /** Clamp a user-supplied poll interval to [MIN_POLL_SEC]..[MAX_POLL_SEC]. */
 fun clampPoll(value: Int?): Int {
 	if (value == null || value <= 0) return DEFAULT_POLL_SEC

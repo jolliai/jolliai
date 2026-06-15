@@ -67,6 +67,27 @@ class SyncStatusBarWidget(private val project: Project) : StatusBarWidget, Statu
 		statusBar?.updateWidget(ID)
 	}
 
+	/**
+	 * If the widget is currently showing a terminal sync FAILURE, reset it to
+	 * the neutral "Jolli Memory" display and return true. Healthy states
+	 * (SYNCED / SYNCING / CONFLICTS, or an already-neutral OFFLINE) are left
+	 * untouched and this returns false.
+	 *
+	 * Called when sync stops (sign-out, auto-sync disabled, orchestrator
+	 * restart). A failure is otherwise sticky — [setSyncState] only overwrites
+	 * OFFLINE on a later *successful* round, which never arrives once polling
+	 * has stopped — so a stale "✗ Sync failed" badge would linger on the status
+	 * bar with no sync actually running. Gating on "was a failure" keeps a
+	 * healthy ✓ badge across the stop()/start() restart dance.
+	 */
+	fun clearFailureStatus(): Boolean {
+		if (currentState == SyncState.OFFLINE && currentDetail?.failed == true) {
+			setSyncState(SyncState.OFFLINE, null)
+			return true
+		}
+		return false
+	}
+
 	// ── StatusBarWidget ──────────────────────────────────────────────────
 
 	override fun ID(): String = ID
