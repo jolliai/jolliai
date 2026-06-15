@@ -117,6 +117,8 @@ export async function scanCursorSessions(projectDir: string): Promise<CursorScan
 				try {
 					parsed = JSON.parse(row.value);
 				} catch {
+					// Unexpected/anomalous (Cursor writes valid JSON) — kept at warn as a corruption
+					// signal. It's rare, so it won't spam the way the routine placeholder rows below do.
 					log.warn("Skipping Cursor composer row %s: invalid JSON", row.key);
 					continue;
 				}
@@ -127,26 +129,29 @@ export async function scanCursorSessions(projectDir: string): Promise<CursorScan
 				// catch above never fires. Without this guard the `parsed.composerId` access below
 				// throws `Cannot read properties of null`, which escapes the loop and fails the
 				// entire scan (surfacing as "Some sources unavailable (cursor)" in the UI).
+				// Logged at debug, not warn: Cursor ships these placeholder/sentinel rows in every
+				// install, so skipping them is routine — surfacing it per-scan only spams the log.
 				if (parsed === null || typeof parsed !== "object") {
-					log.warn("Skipping Cursor composer row %s: value is not a JSON object", row.key);
+					log.debug("Skipping Cursor composer row %s: value is not a JSON object", row.key);
 					continue;
 				}
 				const composer = parsed as Record<string, unknown>;
 
 				const composerId = typeof composer.composerId === "string" ? composer.composerId : null;
 				if (composerId === null) {
+					// A composerData object without a string composerId is unexpected (schema drift),
+					// not a routine placeholder — kept at warn. Rare, so it won't spam.
 					log.warn("Skipping Cursor composer row %s: missing composerId", row.key);
 					continue;
 				}
 
 				const lastUpdatedAt = composer.lastUpdatedAt;
 
-				// Guard against schema drift: non-numeric timestamps.
+				// Guard against schema drift: non-numeric timestamps. An empty/never-used draft
+				// composer (e.g. a workspace anchor that was never run) has no lastUpdatedAt — that
+				// is routine, so it's logged at debug rather than warn to keep the log quiet.
 				if (typeof lastUpdatedAt !== "number" || !Number.isFinite(lastUpdatedAt)) {
-					// Only warn if this composer is an anchor — otherwise silently skip.
-					if (anchorSet.has(composerId)) {
-						log.warn("Skipping Cursor composer %s: non-finite lastUpdatedAt", composerId);
-					}
+					log.debug("Skipping Cursor composer %s: non-finite lastUpdatedAt", composerId);
 					continue;
 				}
 

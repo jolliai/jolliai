@@ -3,13 +3,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const fsMocks = vi.hoisted(() => ({
 	appendFile: vi.fn(),
 	stat: vi.fn(),
-	writeFile: vi.fn(),
+	rename: vi.fn(),
+	readdir: vi.fn(),
+	unlink: vi.fn(),
 }));
 
 vi.mock("node:fs/promises", () => ({
 	appendFile: fsMocks.appendFile,
 	stat: fsMocks.stat,
-	writeFile: fsMocks.writeFile,
+	rename: fsMocks.rename,
+	readdir: fsMocks.readdir,
+	unlink: fsMocks.unlink,
 }));
 
 import {
@@ -35,7 +39,9 @@ describe("Logger", () => {
 		vi.restoreAllMocks();
 		fsMocks.stat.mockReset();
 		fsMocks.appendFile.mockReset();
-		fsMocks.writeFile.mockReset();
+		fsMocks.rename.mockReset();
+		fsMocks.readdir.mockReset();
+		fsMocks.unlink.mockReset();
 		resetLogDir();
 		setSilentConsole(true);
 	});
@@ -178,34 +184,168 @@ describe("Logger", () => {
 
 			await new Promise((resolve) => setTimeout(resolve, 0));
 
-			// stat is called twice: once for the directory check, once for log rotation
+			// stat is called twice: once for the directory check, once for the rotation size check
 			expect(fsMocks.stat).toHaveBeenCalledTimes(2);
 			expect(fsMocks.appendFile).toHaveBeenCalledOnce();
 			expect(fsMocks.appendFile.mock.calls[0]?.[0]).toMatch(/debug\.log$/);
 			expect(fsMocks.appendFile.mock.calls[0]?.[1]).toContain("persist me");
 		});
 
-		it("should rotate log file when it exceeds size limit", async () => {
+		it("rotates: archives debug.log to debug_<timestamp>.log and keeps appending to a fresh file", async () => {
 			const envSpy = vi.spyOn(process, "env", "get");
-			// First stat call: directory exists; second stat call: file exceeds max size (512KB)
 			fsMocks.stat
 				.mockResolvedValueOnce({}) // directory check
-				.mockResolvedValueOnce({ size: 600_000 }); // file size > 512 * 1024
-			fsMocks.writeFile.mockResolvedValue(undefined);
+				.mockResolvedValueOnce({ size: 3 * 1024 * 1024 }) // logPath size > 2 MB → rotate
+				.mockRejectedValueOnce(new Error("ENOENT")); // archive name not taken
+			fsMocks.rename.mockResolvedValue(undefined);
+			fsMocks.readdir.mockResolvedValue(["debug_2026-06-15_09-24-32.log"]);
 			fsMocks.appendFile.mockResolvedValue(undefined);
 			envSpy.mockReturnValue({ ...process.env, VITEST: "" });
 			setLogDir("/tmp/project");
 
-			const logger = createLogger("TestMod");
-			logger.info("after rotation");
-
+			createLogger("TestMod").info("after rotation");
 			await new Promise((resolve) => setTimeout(resolve, 0));
 
-			// writeFile should be called for log rotation
-			expect(fsMocks.writeFile).toHaveBeenCalledOnce();
-			expect(fsMocks.writeFile.mock.calls[0]?.[0]).toMatch(/debug\.log$/);
-			expect(fsMocks.writeFile.mock.calls[0]?.[1]).toContain("[log rotated at");
-			// appendFile should also be called to write the new log line
+			// Renamed debug.log → debug_<UTC timestamp>.log (seconds precision, Windows-safe).
+			expect(fsMocks.rename).toHaveBeenCalledOnce();
+			const [from, to] = fsMocks.rename.mock.calls[0];
+			expect(from).toMatch(/debug\.log$/);
+			expect(to).toMatch(/debug_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.log$/);
+			// Fresh debug.log is recreated by the append.
+			expect(fsMocks.appendFile).toHaveBeenCalledOnce();
+			expect(fsMocks.appendFile.mock.calls[0]?.[0]).toMatch(/debug\.log$/);
+			// Only one archive present → nothing pruned.
+			expect(fsMocks.unlink).not.toHaveBeenCalled();
+		});
+
+		it("does NOT rotate (no rename) when under the size limit", async () => {
+			const envSpy = vi.spyOn(process, "env", "get");
+			fsMocks.stat
+				.mockResolvedValueOnce({}) // directory check
+				.mockResolvedValueOnce({ size: 600_000 }); // < 2 MB
+			fsMocks.appendFile.mockResolvedValue(undefined);
+			envSpy.mockReturnValue({ ...process.env, VITEST: "" });
+			setLogDir("/tmp/project");
+
+			createLogger("TestMod").info("no rotation");
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(fsMocks.rename).not.toHaveBeenCalled();
+			// Under the limit, the prune path is never entered either.
+			expect(fsMocks.readdir).not.toHaveBeenCalled();
+			expect(fsMocks.unlink).not.toHaveBeenCalled();
+			expect(fsMocks.appendFile).toHaveBeenCalledOnce();
+		});
+
+		it("prunes the oldest archives, keeping only the 10 most recent", async () => {
+			const envSpy = vi.spyOn(process, "env", "get");
+			fsMocks.stat
+				.mockResolvedValueOnce({}) // directory check
+				.mockResolvedValueOnce({ size: 3 * 1024 * 1024 }) // rotate
+				.mockRejectedValueOnce(new Error("ENOENT")); // archive name free
+			fsMocks.rename.mockResolvedValue(undefined);
+			// 12 archives in unsorted order; lexical sort = chronological.
+			const archives = [
+				"debug_2026-06-15_09-00-05.log",
+				"debug_2026-06-15_09-00-01.log", // oldest
+				"debug_2026-06-15_09-00-12.log",
+				"debug_2026-06-15_09-00-02.log", // 2nd oldest
+				"debug_2026-06-15_09-00-11.log",
+				"debug_2026-06-15_09-00-06.log",
+				"debug_2026-06-15_09-00-07.log",
+				"debug_2026-06-15_09-00-08.log",
+				"debug_2026-06-15_09-00-09.log",
+				"debug_2026-06-15_09-00-10.log",
+				"debug_2026-06-15_09-00-03.log",
+				"debug_2026-06-15_09-00-04.log",
+				"debug.log", // live file — must be ignored by the archive filter
+				"unrelated.txt",
+			];
+			fsMocks.readdir.mockResolvedValue(archives);
+			// First unlink rejects (another process already deleted it) — must be swallowed
+			// and not abort the remaining prune; second resolves.
+			fsMocks.unlink.mockRejectedValueOnce(new Error("ENOENT")).mockResolvedValue(undefined);
+			fsMocks.appendFile.mockResolvedValue(undefined);
+			envSpy.mockReturnValue({ ...process.env, VITEST: "" });
+			setLogDir("/tmp/project");
+
+			createLogger("TestMod").info("after rotation");
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			// 12 archives − keep 10 → delete the 2 oldest (by sorted name); a rejecting
+			// unlink is swallowed, so both deletions are still attempted.
+			expect(fsMocks.unlink).toHaveBeenCalledTimes(2);
+			const deleted = fsMocks.unlink.mock.calls.map((c) => c[0] as string);
+			expect(deleted[0]).toMatch(/debug_2026-06-15_09-00-01\.log$/);
+			expect(deleted[1]).toMatch(/debug_2026-06-15_09-00-02\.log$/);
+			// Never deletes the live log or unrelated files.
+			expect(deleted.some((p) => /[/\\]debug\.log$/.test(p))).toBe(false);
+			expect(deleted.some((p) => /unrelated\.txt$/.test(p))).toBe(false);
+		});
+
+		it("appends a _N suffix (sorting after the base) when an archive name is already taken", async () => {
+			const envSpy = vi.spyOn(process, "env", "get");
+			fsMocks.stat
+				.mockResolvedValueOnce({}) // directory check
+				.mockResolvedValueOnce({ size: 3 * 1024 * 1024 }) // rotate
+				.mockResolvedValueOnce({}) // base archive name EXISTS
+				.mockRejectedValueOnce(new Error("ENOENT")); // _1 variant is free
+			fsMocks.rename.mockResolvedValue(undefined);
+			fsMocks.readdir.mockResolvedValue([]);
+			fsMocks.appendFile.mockResolvedValue(undefined);
+			envSpy.mockReturnValue({ ...process.env, VITEST: "" });
+			setLogDir("/tmp/project");
+
+			createLogger("TestMod").info("after rotation");
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			const [, to] = fsMocks.rename.mock.calls[0];
+			// `_` (0x5F) > `.` (0x2E), so `..._09-24-32_1.log` sorts AFTER `..._09-24-32.log`.
+			expect(to).toMatch(/debug_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_1\.log$/);
+			// Pin the ordering invariant using the SAME comparator as the prune step (Array.sort).
+			const base = "debug_2026-06-15_09-24-32.log";
+			const collision = "debug_2026-06-15_09-24-32_1.log";
+			expect([collision, base].sort()).toEqual([base, collision]);
+		});
+
+		it("tolerates a rename failure (already rotated by another process) without throwing", async () => {
+			const envSpy = vi.spyOn(process, "env", "get");
+			fsMocks.stat
+				.mockResolvedValueOnce({}) // directory check
+				.mockResolvedValueOnce({ size: 3 * 1024 * 1024 }) // rotate
+				.mockRejectedValueOnce(new Error("ENOENT")); // archive name free
+			fsMocks.rename.mockRejectedValue(new Error("ENOENT")); // source already moved
+			fsMocks.appendFile.mockResolvedValue(undefined);
+			envSpy.mockReturnValue({ ...process.env, VITEST: "" });
+			setLogDir("/tmp/project");
+
+			createLogger("TestMod").info("after rotation");
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			// Rename attempted, failed, swallowed — prune skipped, append still recreates debug.log.
+			expect(fsMocks.rename).toHaveBeenCalledOnce();
+			expect(fsMocks.readdir).not.toHaveBeenCalled();
+			expect(fsMocks.appendFile).toHaveBeenCalledOnce();
+		});
+
+		it("tolerates a readdir failure during prune without throwing", async () => {
+			const envSpy = vi.spyOn(process, "env", "get");
+			fsMocks.stat
+				.mockResolvedValueOnce({}) // directory check
+				.mockResolvedValueOnce({ size: 3 * 1024 * 1024 }) // rotate
+				.mockRejectedValueOnce(new Error("ENOENT")); // archive name free
+			fsMocks.rename.mockResolvedValue(undefined); // archive succeeds
+			fsMocks.readdir.mockRejectedValue(new Error("EIO")); // prune listing fails
+			fsMocks.appendFile.mockResolvedValue(undefined);
+			envSpy.mockReturnValue({ ...process.env, VITEST: "" });
+			setLogDir("/tmp/project");
+
+			createLogger("TestMod").info("after rotation");
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			// Archive happened; prune listing failed but was swallowed; nothing deleted; append still ran.
+			expect(fsMocks.rename).toHaveBeenCalledOnce();
+			expect(fsMocks.unlink).not.toHaveBeenCalled();
 			expect(fsMocks.appendFile).toHaveBeenCalledOnce();
 		});
 
