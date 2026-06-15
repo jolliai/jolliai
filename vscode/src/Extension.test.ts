@@ -624,6 +624,10 @@ vi.mock("../../cli/src/core/SummaryStore.js", () => ({
 // and the rebuildKnowledgeBase command run with predictable, side-effect-free
 // stand-ins. Each test that exercises those paths overrides the relevant helper
 // via `vi.mocked(...).mockReturnValueOnce`.
+const { mockArchiveKBFolder } = vi.hoisted(() => ({
+	mockArchiveKBFolder: vi.fn(() => "/test/kb-parent/.jolli/archive/test-repo-123"),
+}));
+
 vi.mock("../../cli/src/core/KBPathResolver.js", () => ({
 	extractRepoName: vi.fn(() => "test-repo"),
 	getRemoteUrl: vi.fn(() => null),
@@ -632,6 +636,7 @@ vi.mock("../../cli/src/core/KBPathResolver.js", () => ({
 	peekKBPath: vi.fn(() => "/test/kb"),
 	findFreshKBPath: vi.fn(() => "/test/kb-2"),
 	initializeKBFolder: vi.fn(),
+	archiveKBFolder: mockArchiveKBFolder,
 }));
 
 const {
@@ -7290,6 +7295,10 @@ describe("Extension", () => {
 			mockMetadataManagerInstance.readConfig.mockReset();
 			mockMetadataManagerInstance.readConfig.mockReturnValue({});
 			mockMetadataManagerInstance.saveConfig.mockClear();
+			mockArchiveKBFolder.mockReset();
+			mockArchiveKBFolder.mockReturnValue(
+				"/test/kb-parent/.jolli/archive/test-repo-123",
+			);
 		});
 
 		it("returns ok when rebuild migration completes", async () => {
@@ -7298,8 +7307,10 @@ describe("Extension", () => {
 			const result = (await handler()) as { ok: boolean; message: string };
 			expect(result.ok).toBe(true);
 			expect(result.message).toContain("memories migrated");
-			// "Repoint": old KB identity is rewritten so resolveKBPath stops reusing it.
-			expect(mockMetadataManagerInstance.saveConfig).toHaveBeenCalled();
+			// Archive: the old folder (peekKBPath = "/test/kb") differs from the
+			// fresh one (findFreshKBPath = "/test/kb-2"), so it's MOVED into the
+			// hidden .jolli/archive/ rather than having its identity rewritten.
+			expect(mockArchiveKBFolder).toHaveBeenCalledWith("/test/kb", undefined);
 		});
 
 		// Same successful-rebuild path, but with memoriesStore.hasFirstLoaded
@@ -7339,10 +7350,10 @@ describe("Extension", () => {
 			expect(result.message).toContain("Rebuild partial");
 		});
 
-		it("warns but still completes when archiving the old KB identity throws", async () => {
-			mockMetadataManagerInstance.readConfig.mockImplementationOnce(() => {
-				throw new Error("read failed");
-			});
+		it("still completes when archiving the old folder fails (archiveKBFolder returns null)", async () => {
+			// archiveKBFolder swallows its own errors and returns null; the rebuild
+			// must still report success rather than aborting on a failed archive.
+			mockArchiveKBFolder.mockReturnValueOnce(null);
 			activate(makeContext());
 			const handler = getRegisteredCommand("jollimemory.rebuildKnowledgeBase");
 			const result = (await handler()) as { ok: boolean; message: string };

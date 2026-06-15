@@ -1,9 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	archiveKBFolder,
 	assertValidLocalFolder,
 	extractRepoName,
 	findFreshKBPath,
@@ -680,6 +681,52 @@ esac
 			expect(peeked).toBe(fresh);
 			expect(peeked).toBe(join(tempDir, "brand-new"));
 			expect(existsSync(peeked)).toBe(false);
+		});
+	});
+
+	describe("archiveKBFolder", () => {
+		const url = "https://github.com/user/myrepo.git";
+
+		it("moves the folder under <parent>/.jolli/archive/ and preserves content", () => {
+			const kbRoot = resolveKBPath("myrepo", url, tempDir);
+			writeFileSync(join(kbRoot, "marker.txt"), "hi");
+
+			const dest = archiveKBFolder(kbRoot, tempDir);
+
+			expect(dest).not.toBeNull();
+			expect(existsSync(kbRoot)).toBe(false); // original removed from active area
+			expect((dest as string).startsWith(join(tempDir, ".jolli", "archive"))).toBe(true);
+			expect(readFileSync(join(dest as string, "marker.txt"), "utf-8")).toBe("hi");
+		});
+
+		it("names the archive dir with the repo folder-name prefix", () => {
+			const kbRoot = resolveKBPath("myrepo", url, tempDir);
+			const dest = archiveKBFolder(kbRoot, tempDir) as string;
+			expect(basename(dest).startsWith("myrepo-")).toBe(true);
+		});
+
+		it("returns null when the folder does not exist (nothing to archive)", () => {
+			expect(archiveKBFolder(join(tempDir, "nope"), tempDir)).toBeNull();
+		});
+
+		it("keeps repeated archives of the same repo distinct (collision guard)", () => {
+			const first = resolveKBPath("myrepo", url, tempDir);
+			const destA = archiveKBFolder(first, tempDir) as string;
+			// Base name is free again now → resolve recreates it, then archive again.
+			const second = resolveKBPath("myrepo", url, tempDir);
+			const destB = archiveKBFolder(second, tempDir) as string;
+
+			expect(destA).not.toBe(destB);
+			expect(existsSync(destA)).toBe(true);
+			expect(existsSync(destB)).toBe(true);
+		});
+
+		it("frees the base name so a subsequent resolve reclaims it (no -N ladder)", () => {
+			const kbRoot = resolveKBPath("myrepo", url, tempDir);
+			expect(kbRoot).toBe(join(tempDir, "myrepo"));
+			archiveKBFolder(kbRoot, tempDir);
+			// With the old folder moved aside, the clean base name is available again.
+			expect(resolveKBPath("myrepo", url, tempDir)).toBe(join(tempDir, "myrepo"));
 		});
 	});
 });
