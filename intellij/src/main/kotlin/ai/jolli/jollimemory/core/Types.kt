@@ -313,6 +313,8 @@ data class JolliMemoryConfig(
     val syncTranscripts: Boolean? = null,
     /** Custom local folder path for the memory bank root. */
     val localFolder: String? = null,
+    /** Folder names (or `*`-glob patterns) under the Memory Bank root to skip when building the wiki. */
+    val compileExcludeFolders: List<String>? = null,
 )
 
 /** Registry of all active sessions */

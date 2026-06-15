@@ -51,10 +51,14 @@ object ProcessedSourceStore {
         )
     }
 
-    /** Rebuilds the bucket map in canonical `summary, plan, note, userfile` order. */
-    private fun canonicalBuckets(src: Map<String, List<String>>): Map<String, List<String>> {
+    /**
+     * Rebuilds the bucket map in canonical `summary, plan, note, userfile` order.
+     * [src] is nullable because Gson injects null into the non-null `processed` when
+     * the key is absent (matches the TS reader's `processed ?? {}`).
+     */
+    private fun canonicalBuckets(src: Map<String, List<String>>?): Map<String, List<String>> {
         val out = LinkedHashMap<String, List<String>>()
-        for (type in SourceType.ALL) out[type] = src[type] ?: emptyList()
+        for (type in SourceType.ALL) out[type] = src?.get(type) ?: emptyList()
         return out
     }
 }

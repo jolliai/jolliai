@@ -55,8 +55,13 @@ class MetadataManager(private val jolliDir: Path) {
     // ── Manifest ───────────────────────────────────────────────────────────
 
     /** Reads the manifest, returning an empty manifest if the file doesn't exist or is invalid. */
+    @Suppress("USELESS_ELVIS") // Gson injects null into the non-null `files` when the key is absent.
     fun readManifest(): Manifest {
-        return readJson(manifestPath, Manifest::class.java) ?: Manifest()
+        val manifest = readJson(manifestPath, Manifest::class.java) ?: return Manifest()
+        // A present-but-incomplete manifest.json (e.g. {"version":1} with no `files`)
+        // deserializes `files` to null despite the data-class default — coalesce here so
+        // every caller iterating `files` is safe.
+        return manifest.copy(files = manifest.files ?: emptyList())
     }
 
     /** Adds or updates a manifest entry (matched by fileId). */

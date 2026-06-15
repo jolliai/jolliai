@@ -1014,11 +1014,14 @@ class KBExplorerPanel(
     private fun buildKnowledgeWiki() {
         JM.info("buildKnowledgeWiki: button clicked")
         val config = SessionTracker.loadConfig()
-        // Ingest is proxy-only (route/reconcile templates are backend-owned), so a Jolli
-        // sign-in is required — an Anthropic key alone can't drive the wiki build.
-        if (config.jolliApiKey.isNullOrBlank()) {
+        // Either a Jolli sign-in (proxy mode) or an Anthropic key (direct mode, local
+        // prompt templates) can drive the wiki build.
+        val hasCredentials = !config.apiKey.isNullOrBlank() ||
+            !config.jolliApiKey.isNullOrBlank() ||
+            !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()
+        if (!hasCredentials) {
             notifyWiki(
-                "Building the knowledge wiki requires a Jolli sign-in. Open Settings → Memory Bank and sign in to Jolli, then try again.",
+                "Building the knowledge wiki needs an API key. Open Settings → Memory Bank to sign in or configure a key, then try again.",
                 NotificationType.INFORMATION,
             )
             return
@@ -1042,6 +1045,7 @@ class KBExplorerPanel(
                 try {
                     val result = MultiRepoCompile.compileAllRepos(
                         parent, llmConfig,
+                        excludeFolders = config.compileExcludeFolders ?: emptyList(),
                         onProgress = { folder -> indicator.text = "Compiling $folder…" },
                     )
                     if (result.skipped) {

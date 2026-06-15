@@ -388,11 +388,13 @@ object PostCommitHook {
      * sweep on the shared vault-write lock (wait, then skip — the next commit retries).
      */
     private fun runIngestAndRender(cwd: String, config: JolliMemoryConfig) {
-        // Ingest is proxy-only (route/reconcile templates are backend-owned), so it
-        // needs a Jolli sign-in — silent skip otherwise (mirrors the CLI worker's
-        // credential-missing skip).
-        if (config.jolliApiKey.isNullOrBlank()) {
-            log.info("No Jolli sign-in — skipping post-commit wiki ingest (proxy-only)")
+        // Either a Jolli sign-in (proxy) or an Anthropic key (direct) can drive ingest;
+        // silent skip when neither is present (mirrors the CLI worker).
+        val hasCredentials = !config.apiKey.isNullOrBlank() ||
+            !config.jolliApiKey.isNullOrBlank() ||
+            !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()
+        if (!hasCredentials) {
+            log.info("No LLM credentials configured — skipping post-commit wiki ingest")
             return
         }
 
@@ -401,7 +403,8 @@ object PostCommitHook {
         val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
         val storage = FolderStorage(kbRoot, MetadataManager(kbRoot.resolve(".jolli")))
 
-        val handle = VaultWriteLock.acquire(kbRoot.parent.toString(), VaultWriteLockMode.Wait(VaultWriteLock.DEFAULT_WAIT_MS))
+        val lockRoot = kbRoot.parent.toAbsolutePath().normalize().toString()
+        val handle = VaultWriteLock.acquire(lockRoot, VaultWriteLockMode.Wait(VaultWriteLock.DEFAULT_WAIT_MS))
         if (handle == null) {
             log.warn("vault-write lock busy — skipping post-commit ingest (next commit retries)")
             return

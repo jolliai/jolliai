@@ -53,7 +53,10 @@ object MultiRepoCompile {
         llm: IngestPipeline.LlmCaller = IngestPipeline.defaultLlmCaller(config),
         onProgress: (String) -> Unit = {},
     ): CompileAllResult {
-        val handle = VaultWriteLock.acquire(parent.toString(), VaultWriteLockMode.FailFast)
+        // Normalize the lock root to an absolute path so a relative localFolder config
+        // resolves to the same vault-write.lock key other writers (sync, CLI) use.
+        val lockRoot = parent.toAbsolutePath().normalize().toString()
+        val handle = VaultWriteLock.acquire(lockRoot, VaultWriteLockMode.FailFast)
             ?: run {
                 log.warn("Another vault writer is busy for %s — skipping this sweep", parent.toString())
                 return CompileAllResult(emptyList(), 0, 0, skipped = true)
@@ -101,10 +104,24 @@ object MultiRepoCompile {
         return Files.list(parent).use { stream ->
             stream
                 .filter { Files.isDirectory(it) }
-                .filter { it.name !in excludeFolders }
+                .filter { !it.name.startsWith(".") } // skip hidden dirs (e.g. .trash backups), matching the CLI
+                .filter { !matchesAny(it.name, excludeFolders) }
                 .filter { it.resolve(".jolli").resolve("index.json").isRegularFile() }
                 .sorted(compareBy { it.name })
                 .toList()
+        }
+    }
+
+    /**
+     * Minimal glob match: exact name, or `*` wildcards (e.g. `archive-*`). Mirrors
+     * the CLI `matchesAny` so `compileExcludeFolders` behaves identically.
+     */
+    private fun matchesAny(name: String, patterns: List<String>): Boolean = patterns.any { p ->
+        if (!p.contains("*")) {
+            p == name
+        } else {
+            val regex = p.split("*").joinToString(".*") { Regex.escape(it) }
+            Regex("^$regex$").matches(name)
         }
     }
 }

@@ -21,7 +21,7 @@ object TopicPageStore {
      * Slugs are LLM-generated upstream, so the store must reject path-traversal /
      * nesting itself. Safe = non-empty, no `/`, no `..`.
      */
-    private fun isSafeSlug(slug: String): Boolean =
+    internal fun isSafeSlug(slug: String): Boolean =
         slug.isNotEmpty() && !slug.contains("/") && !slug.contains("..")
 
     /** Reads a canonical topic page; missing, unparseable, or unsafe slug → null. */
@@ -32,8 +32,17 @@ object TopicPageStore {
         }
         val raw = storage.readFile("topics/$slug.json") ?: return null
         val page = TopicJson.parse(raw, TopicPage::class.java)
-        if (page == null) log.warn("Failed to parse topic page %s", slug)
-        return page
+        if (page == null) {
+            log.warn("Failed to parse topic page %s", slug)
+            return null
+        }
+        // Gson injects null into the non-null list fields when the keys are absent/null
+        // (corrupt or older-schema page); coalesce so render/compile never NPEs.
+        @Suppress("USELESS_ELVIS")
+        return page.copy(
+            relatedBranches = page.relatedBranches ?: emptyList(),
+            sourceRefs = page.sourceRefs ?: emptyList(),
+        )
     }
 
     /** Persists a canonical topic page. Throws on an unsafe slug. */

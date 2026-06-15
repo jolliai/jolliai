@@ -46,7 +46,27 @@ object FolderPlanNoteSource {
     private fun branchFromPath(meta: MetadataManager, path: String): String =
         meta.folderToBranch(path.split("/")[0])
 
+    private data class MetaCacheEntry(val mtimeMs: Long, val metas: List<PlanNoteMeta>)
+
+    /**
+     * Per-kbRoot memo of parsed plan/note metadata, invalidated by the manifest's
+     * mtime. A single ingest batch calls readMeta once per plan/note headline, each
+     * of which would otherwise re-read + re-parse the same manifest.json. Thread-safe
+     * for the reconcile fan-out (ConcurrentHashMap). Mirrors the CLI metaCache.
+     */
+    private val metaCache = java.util.concurrent.ConcurrentHashMap<String, MetaCacheEntry>()
+
     private fun readMeta(kbRoot: Path): List<PlanNoteMeta> {
+        val manifestPath = kbRoot.resolve(".jolli").resolve("manifest.json")
+        val mtimeMs = try {
+            Files.getLastModifiedTime(manifestPath).toMillis()
+        } catch (_: Exception) {
+            -1L
+        }
+        val key = kbRoot.toAbsolutePath().normalize().toString()
+        val cached = metaCache[key]
+        if (cached != null && mtimeMs != -1L && cached.mtimeMs == mtimeMs) return cached.metas
+
         val meta = MetadataManager(kbRoot.resolve(".jolli"))
         val out = mutableListOf<PlanNoteMeta>()
         for (e in meta.readManifest().files) {
@@ -56,6 +76,7 @@ object FolderPlanNoteSource {
             val timestamp = e.updatedAt ?: mtimeOrEmpty(hiddenPath(kbRoot, e.type, id))
             out.add(PlanNoteMeta(type = e.type, id = id, title = e.title ?: id, branch = branch, timestamp = timestamp))
         }
+        if (mtimeMs != -1L) metaCache[key] = MetaCacheEntry(mtimeMs, out)
         return out
     }
 

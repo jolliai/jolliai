@@ -22,8 +22,11 @@ object TopicIndexStore {
             log.warn("Failed to parse %s — treating as empty", INDEX_PATH)
             return emptyTopicIndex()
         }
-        // Normalize like the TS reader: keep schemaVersion 1, default topics to [].
-        return TopicIndex(schemaVersion = 1, topics = parsed.topics)
+        // Normalize like the TS reader (parsed.topics ?? []): Gson injects null into the
+        // non-null `topics` when the key is absent/null, so coalesce explicitly.
+        @Suppress("USELESS_ELVIS")
+        val topics = parsed.topics ?: emptyList()
+        return TopicIndex(schemaVersion = 1, topics = topics)
     }
 
     /** Persists the index via the provider. */

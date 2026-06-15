@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.core
 import io.kotest.matchers.booleans.shouldBeFalse
 import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.collections.shouldContainExactlyInAnyOrder
+import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -100,6 +101,62 @@ class TopicWikiRendererTest {
 
         val wikiEntries = metadataManager.readManifest().files.filter { it.type == "wiki" }
         wikiEntries.map { it.path }.shouldContainExactlyInAnyOrder("_wiki/topic--auth.md", "_wiki/_index.md")
+    }
+
+    @Test
+    fun `tolerates topic JSON with missing or null list fields without NPE`() {
+        // Simulates a corrupt / older-schema / partially-synced topics layer where Gson
+        // would otherwise inject null into the non-null List fields.
+        Files.createDirectories(rootPath.resolve(".jolli/topics"))
+        Files.writeString(
+            rootPath.resolve(".jolli/topics/index.json"),
+            """{"schemaVersion":1}""", // no "topics" key
+        )
+        Files.writeString(
+            rootPath.resolve(".jolli/topics/processed.json"),
+            """{"schemaVersion":1}""", // no "processed" key
+        )
+        Files.writeString(
+            rootPath.resolve(".jolli/topics/bare.json"),
+            """{"schemaVersion":1,"stableSlug":"bare","title":"Bare","content":"c","lastUpdatedAt":"t"}""", // no relatedBranches/sourceRefs
+        )
+
+        // Reads must coalesce nulls, not throw.
+        TopicIndexStore.readTopicIndex(storage).topics.shouldBe(emptyList())
+        ProcessedSourceStore.readProcessedSet(storage).processed[SourceType.SUMMARY] shouldBe emptyList()
+        val page = TopicPageStore.readTopicPage("bare", storage)!!
+        page.relatedBranches shouldBe emptyList()
+        page.sourceRefs shouldBe emptyList()
+
+        // And a full render over a null-list page must not NPE.
+        TopicIndexStore.saveTopicIndex(
+            TopicIndex(topics = listOf(TopicIndexEntry("bare", "Bare", "s", emptyList(), emptyList(), "t"))),
+            storage,
+        )
+        TopicWikiRenderer.renderTopicKBWiki(storage)
+        rootPath.resolve("_wiki/topic--bare.md").exists().shouldBeTrue()
+    }
+
+    @Test
+    fun `render rejects a path-traversal stableSlug and never writes outside the KB root`() {
+        // A planted/synced topics/legit.json whose CONTENT stableSlug escapes _wiki/.
+        val evil = "../../../../tmp/jolli-evil"
+        val page = TopicPage(stableSlug = evil, title = "Evil", content = "x", lastUpdatedAt = "t")
+        // Write the file directly under a safe lookup slug (bypassing saveTopicPage's guard).
+        Files.createDirectories(rootPath.resolve(".jolli/topics"))
+        Files.writeString(rootPath.resolve(".jolli/topics/legit.json"), com.google.gson.Gson().toJson(page))
+        TopicIndexStore.saveTopicIndex(
+            TopicIndex(topics = listOf(TopicIndexEntry("legit", "Evil", "s", emptyList(), emptyList(), "t"))),
+            storage,
+        )
+
+        TopicWikiRenderer.renderTopicKBWiki(storage) // must not throw out, must not escape
+
+        // Nothing written outside the KB root.
+        tempDir.resolve("tmp/jolli-evil.md").exists().shouldBeFalse()
+        rootPath.parent.resolve("jolli-evil.md").exists().shouldBeFalse()
+        // The malicious page was skipped; index still renders.
+        rootPath.resolve("_wiki/_index.md").exists().shouldBeTrue()
     }
 
     @Test

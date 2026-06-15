@@ -51,19 +51,16 @@ object IngestPipeline {
     }
 
     fun defaultLlmCaller(config: LlmConfig): LlmCaller = LlmCaller { action, params, model, maxTokens ->
-        // Ingest is PROXY-ONLY: the route/reconcile prompt templates are owned by the
-        // Jolli backend and are not bundled for direct-Anthropic mode. If we let
-        // callLlm fall through to direct mode (which it does whenever an Anthropic key
-        // is configured), callDirect(prompt!!) would NPE on the null prompt. Force the
-        // proxy path and fail loud with a clear message when there's no Jolli sign-in.
-        if (config.jolliApiKey.isNullOrBlank()) {
-            throw IllegalStateException("Knowledge wiki ingest requires a Jolli sign-in (proxy mode).")
-        }
+        // Works in BOTH modes: proxy mode uses action+params (backend owns the
+        // template); direct (Anthropic) mode uses the locally-rendered `prompt`.
+        // Supplying both lets the call succeed whichever credential callLlm selects,
+        // so a user with only an Anthropic key can still build the wiki.
         LlmClient.callLlm(
             action = action, params = params,
-            apiKey = null, // force proxy — never direct (no local ingest prompt template)
-            jolliApiKey = config.jolliApiKey,
-            model = model, maxTokens = maxTokens, prompt = null, aiProvider = "jolli",
+            apiKey = config.apiKey, jolliApiKey = config.jolliApiKey,
+            model = model, maxTokens = maxTokens,
+            prompt = PromptTemplates.render(action, params),
+            aiProvider = config.aiProvider,
         )
     }
 

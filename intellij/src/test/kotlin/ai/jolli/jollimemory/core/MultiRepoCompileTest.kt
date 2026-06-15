@@ -79,6 +79,24 @@ class MultiRepoCompileTest {
     }
 
     @Test
+    fun `discoverRepos skips hidden dot-prefixed directories`() {
+        seedRepo("repoA", "a1")
+        seedRepo(".trash", "t1") // a hidden backup dir with .jolli/index.json must be skipped
+        MultiRepoCompile.discoverRepos(parent).map { it.fileName.toString() } shouldContainExactly listOf("repoA")
+    }
+
+    @Test
+    fun `discoverRepos honours excludeFolders with exact names and glob patterns`() {
+        seedRepo("repoA", "a1")
+        seedRepo("archive-2024", "b1")
+        seedRepo("archive-old", "c1")
+        seedRepo("keep", "d1")
+        // Exact name + `*` glob.
+        MultiRepoCompile.discoverRepos(parent, excludeFolders = listOf("keep", "archive-*"))
+            .map { it.fileName.toString() } shouldContainExactly listOf("repoA")
+    }
+
+    @Test
     fun `compiles every repo and regenerates each wiki`() {
         val a = seedRepo("repoA", "a1")
         val b = seedRepo("repoB", "b1")
