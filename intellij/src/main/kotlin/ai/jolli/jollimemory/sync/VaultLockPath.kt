@@ -54,7 +54,10 @@ fun canonicaliseLocalFolder(s: String): String {
 	}
 
 	// Step 5 — collapse duplicate separators, trim trailing.
-	p = p.replace(Regex("[/\\\\]+"), File.separator)
+	// Use the lambda overload: a literal-string replacement of `\` (File.separator on
+	// Windows) is treated as an incomplete escape by Matcher and throws
+	// "character to be escaped is missing". The lambda's return is used verbatim.
+	p = Regex("[/\\\\]+").replace(p) { File.separator }
 	if (p.length > 1 && p.endsWith(File.separator)) {
 		p = p.dropLast(1)
 	}

@@ -88,9 +88,11 @@ class LockPrimitivesTest {
 	@Test
 	fun `acquireWithPoll times out on held lock`() {
 		val lockPath = tempDir.resolve("test.lock")
-		// Write a "held by another alive process" lock — use PID 1 which is
-		// always alive on most OSes.
-		Files.writeString(lockPath, "1")
+		// Write a lock held by a live process. Use this JVM's own PID — it is
+		// guaranteed alive on every OS, whereas PID 1 is alive on Unix (init/systemd)
+		// but not on Windows (ProcessHandle.of(1) is empty), where the lock would be
+		// reclaimed as stale and acquireWithPoll would wrongly succeed.
+		Files.writeString(lockPath, ProcessHandle.current().pid().toString())
 		assertFalse(LockPrimitives.acquireWithPoll(lockPath, 200, 50))
 	}
 

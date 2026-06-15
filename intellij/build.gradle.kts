@@ -51,6 +51,14 @@ dependencies {
 }
 
 intellijPlatform {
+    // This is a 100% Kotlin plugin: no .java sources and no GUI .form files, so the
+    // IntelliJ NotNull/form bytecode instrumentation has nothing to process. Disabling
+    // it skips the buggy `instrumentCode` Ant task, which in plugin 2.5.0 joins
+    // classpath/srcdir with ":" — fine on Linux/macOS (CI), but on Windows ":" is the
+    // drive separator, so it mis-parses absolute paths (e.g. C:\...\jdk\Packages) and
+    // fails with "... does not exist". The produced artifact is identical to CI's.
+    instrumentCode = false
+
     pluginConfiguration {
         id = "ai.jolli.jollimemory"
         name = "Jolli Memory"
@@ -537,6 +545,15 @@ tasks {
                 languageVersion.set(JavaLanguageVersion.of(21))
             }
         )
+        // IntelliJ auto-registers JUnit5 extensions (e.g. ThreadLeakTracker) whose
+        // afterEach initializes UIUtil → JBUIScale. On Windows the JRE-HiDPI code path
+        // lazily computes the system scale and logs an "Must be precomputed" error, which
+        // the platform's TestLogger escalates into a spurious test failure. Disabling
+        // JRE-HiDPI makes JBUIScale resolve to 1.0 without that path. Linux/CI never hits
+        // this (headless scale is already 1.0 there), so the flags are a harmless no-op
+        // elsewhere and keep the pure-logic unit tests green on Windows.
+        systemProperty("java.awt.headless", "true")
+        systemProperty("sun.java2d.uiScale.enabled", "false")
         // Surface failures (and the full stack trace) in the console; pass `-i` for a
         // live per-test ticker. Deliberately no "passed" event — 1094 lines is noise.
         testLogging {

@@ -13,15 +13,37 @@ import java.io.File
 class VscodeWorkspaceLocatorTest {
 
 	private var originalHome: String? = null
+	private var originalCursorOverride: String? = null
+	private var originalCodeOverride: String? = null
 
 	@BeforeEach
 	fun setup() {
 		originalHome = System.getProperty("user.home")
+		originalCursorOverride = System.getProperty("cursor.appdata.override")
+		originalCodeOverride = System.getProperty("code.appdata.override")
 	}
 
 	@AfterEach
 	fun teardown() {
 		originalHome?.let { System.setProperty("user.home", it) }
+		restoreOrClear("cursor.appdata.override", originalCursorOverride)
+		restoreOrClear("code.appdata.override", originalCodeOverride)
+	}
+
+	private fun restoreOrClear(key: String, original: String?) {
+		if (original != null) System.setProperty(key, original) else System.clearProperty(key)
+	}
+
+	/**
+	 * Points `user.home` at [home] and redirects every flavor's Windows %APPDATA%
+	 * lookup into `<home>/AppData/Roaming` (the layout [userDataDir] writes to).
+	 * On macOS/Linux the override system properties are ignored by production.
+	 */
+	private fun useHome(home: File) {
+		System.setProperty("user.home", home.absolutePath)
+		val appData = File(home, "AppData/Roaming").absolutePath
+		System.setProperty("cursor.appdata.override", appData)
+		System.setProperty("code.appdata.override", appData)
 	}
 
 	/** Returns the platform-correct user-data dir for a flavor under the given home. */
@@ -60,7 +82,7 @@ class VscodeWorkspaceLocatorTest {
 
 		@Test
 		fun `getVscodeUserDataDir returns flavor-specific path`(@TempDir tempHome: File) {
-			System.setProperty("user.home", tempHome.absolutePath)
+			useHome(tempHome)
 			val cursorDir = getVscodeUserDataDir(VscodeFlavor.Cursor)
 			val codeDir = getVscodeUserDataDir(VscodeFlavor.Code)
 			(cursorDir != codeDir) shouldBe true
@@ -107,13 +129,13 @@ class VscodeWorkspaceLocatorTest {
 
 		@Test
 		fun `returns null when workspaceStorage doesn't exist`(@TempDir tempHome: File) {
-			System.setProperty("user.home", tempHome.absolutePath)
+			useHome(tempHome)
 			findVscodeWorkspaceHash(VscodeFlavor.Code, tempHome.absolutePath).shouldBeNull()
 		}
 
 		@Test
 		fun `returns the hash whose workspace_json folder matches projectDir`(@TempDir tempHome: File, @TempDir projectDir: File) {
-			System.setProperty("user.home", tempHome.absolutePath)
+			useHome(tempHome)
 			val ws = setupWorkspaceStorage(tempHome, VscodeFlavor.Code)
 			val hashDir = File(ws, "abc123")
 			val folderUri = fileUri(projectDir) // file:/...
@@ -126,7 +148,7 @@ class VscodeWorkspaceLocatorTest {
 
 		@Test
 		fun `skips entries whose folder URI doesn't match`(@TempDir tempHome: File, @TempDir projectDir: File, @TempDir otherDir: File) {
-			System.setProperty("user.home", tempHome.absolutePath)
+			useHome(tempHome)
 			val ws = setupWorkspaceStorage(tempHome, VscodeFlavor.Code)
 			writeWorkspaceJson(File(ws, "wrong"), fileUri(otherDir))
 			writeWorkspaceJson(File(ws, "right"), fileUri(projectDir))
@@ -135,7 +157,7 @@ class VscodeWorkspaceLocatorTest {
 
 		@Test
 		fun `skips workspace_json with missing folder field`(@TempDir tempHome: File, @TempDir projectDir: File) {
-			System.setProperty("user.home", tempHome.absolutePath)
+			useHome(tempHome)
 			val ws = setupWorkspaceStorage(tempHome, VscodeFlavor.Code)
 			val badDir = File(ws, "bad").also { it.mkdirs() }
 			File(badDir, "workspace.json").writeText("""{"notFolder": "x"}""")
@@ -144,7 +166,7 @@ class VscodeWorkspaceLocatorTest {
 
 		@Test
 		fun `skips workspace_json with non-file URI`(@TempDir tempHome: File, @TempDir projectDir: File) {
-			System.setProperty("user.home", tempHome.absolutePath)
+			useHome(tempHome)
 			val ws = setupWorkspaceStorage(tempHome, VscodeFlavor.Code)
 			writeWorkspaceJson(File(ws, "remote"), "vscode-remote://ssh-host/foo")
 			findVscodeWorkspaceHash(VscodeFlavor.Code, projectDir.absolutePath).shouldBeNull()
@@ -152,7 +174,7 @@ class VscodeWorkspaceLocatorTest {
 
 		@Test
 		fun `Cursor and Code flavors search different roots`(@TempDir tempHome: File, @TempDir projectDir: File) {
-			System.setProperty("user.home", tempHome.absolutePath)
+			useHome(tempHome)
 			val cursorWs = setupWorkspaceStorage(tempHome, VscodeFlavor.Cursor)
 			writeWorkspaceJson(File(cursorWs, "cursor-only"), fileUri(projectDir))
 			// VS Code workspaceStorage left empty
