@@ -269,6 +269,45 @@ describe("discoverCursorSessions", () => {
 		expect(sessions).toEqual([]);
 	});
 
+	it("skips a composerData row whose value is the literal null without failing the whole scan", async () => {
+		// Regression: Cursor stores `composerData:empty-state-draft` with the JSON literal `null`.
+		// `JSON.parse("null")` returns null WITHOUT throwing, so the invalid-JSON catch never fires;
+		// the subsequent `parsed.composerId` access used to throw `Cannot read properties of null`,
+		// abort the scan, and surface as "Some sources unavailable (cursor)" in the UI — while also
+		// dropping every valid session in the same batch.
+		const userDir = join(tmpHome, "Library/Application Support/Cursor/User");
+		await mkdir(join(userDir, "globalStorage"), { recursive: true });
+		await mkdir(join(userDir, "workspaceStorage", "ws-00000000"), { recursive: true });
+		await writeFile(
+			join(userDir, "workspaceStorage", "ws-00000000", "workspace.json"),
+			JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }),
+		);
+
+		const wsDbPath = join(userDir, "workspaceStorage", "ws-00000000", "state.vscdb");
+		const wsDb = new DatabaseSync(wsDbPath);
+		for (const sql of CURSOR_DDL) wsDb.prepare(sql).run();
+		wsDb.close();
+
+		const globalDbPath = join(userDir, "globalStorage", "state.vscdb");
+		const globalDb = new DatabaseSync(globalDbPath);
+		for (const sql of CURSOR_DDL) globalDb.prepare(sql).run();
+		// The crashing sentinel row: a valid JSON document that is not an object.
+		globalDb
+			.prepare("INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)")
+			.run("composerData:empty-state-draft", "null");
+		// A non-null, non-object scalar — exercises the `typeof parsed !== "object"` arm of the guard.
+		globalDb.prepare("INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)").run("composerData:scalar", "42");
+		// A genuinely-valid composer that must still be returned despite the bad rows above.
+		globalDb
+			.prepare("INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)")
+			.run("composerData:good-1", JSON.stringify({ composerId: "good-1", lastUpdatedAt: Date.now() }));
+		globalDb.close();
+
+		const result = await scanCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
+		expect(result.error).toBeUndefined();
+		expect(result.sessions.map((s) => s.sessionId)).toEqual(["good-1"]);
+	});
+
 	it("skips composerData rows with non-finite lastUpdatedAt (anchor and non-anchor)", async () => {
 		const userDir = join(tmpHome, "Library/Application Support/Cursor/User");
 		await mkdir(join(userDir, "globalStorage"), { recursive: true });

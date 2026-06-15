@@ -113,21 +113,33 @@ export async function scanCursorSessions(projectDir: string): Promise<CursorScan
 				.all() as ReadonlyArray<{ key: string; value: string }>;
 
 			for (const row of rows) {
-				let parsed: Record<string, unknown>;
+				let parsed: unknown;
 				try {
-					parsed = JSON.parse(row.value) as Record<string, unknown>;
+					parsed = JSON.parse(row.value);
 				} catch {
 					log.warn("Skipping Cursor composer row %s: invalid JSON", row.key);
 					continue;
 				}
 
-				const composerId = typeof parsed.composerId === "string" ? parsed.composerId : null;
+				// `JSON.parse` only throws on syntactically invalid input. A row whose value is a
+				// valid JSON scalar — most notably the literal `null` that Cursor stores for the
+				// `composerData:empty-state-draft` sentinel row — parses without error, so the
+				// catch above never fires. Without this guard the `parsed.composerId` access below
+				// throws `Cannot read properties of null`, which escapes the loop and fails the
+				// entire scan (surfacing as "Some sources unavailable (cursor)" in the UI).
+				if (parsed === null || typeof parsed !== "object") {
+					log.warn("Skipping Cursor composer row %s: value is not a JSON object", row.key);
+					continue;
+				}
+				const composer = parsed as Record<string, unknown>;
+
+				const composerId = typeof composer.composerId === "string" ? composer.composerId : null;
 				if (composerId === null) {
 					log.warn("Skipping Cursor composer row %s: missing composerId", row.key);
 					continue;
 				}
 
-				const lastUpdatedAt = parsed.lastUpdatedAt;
+				const lastUpdatedAt = composer.lastUpdatedAt;
 
 				// Guard against schema drift: non-numeric timestamps.
 				if (typeof lastUpdatedAt !== "number" || !Number.isFinite(lastUpdatedAt)) {
@@ -152,7 +164,7 @@ export async function scanCursorSessions(projectDir: string): Promise<CursorScan
 				}
 				seenIds.add(composerId);
 
-				const nameRaw = typeof parsed.name === "string" ? parsed.name.trim() : "";
+				const nameRaw = typeof composer.name === "string" ? composer.name.trim() : "";
 				const title = nameRaw.length > 0 ? nameRaw : undefined;
 
 				out.push({

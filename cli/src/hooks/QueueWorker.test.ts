@@ -374,7 +374,7 @@ import { createStorage } from "../core/StorageFactory.js";
 import { generateSummary } from "../core/Summarizer.js";
 import { storeSummary } from "../core/SummaryStore.js";
 import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
-import { buildMultiSessionContext } from "../core/TranscriptReader.js";
+import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
 import { consumePendingWorkers, recordPendingWorker } from "../sync/PendingWorkers.js";
 import { acquireVaultWriteLock } from "../sync/VaultWriteLock.js";
 import type { CommitGitOperation, IngestOperation } from "../Types.js";
@@ -1572,6 +1572,66 @@ describe("QueueWorker", () => {
 			expect(discoverOpenCodeSessions).toHaveBeenCalledWith("/test/cwd");
 			// Pipeline completes normally
 			expect(storeSummary).toHaveBeenCalled();
+		});
+	});
+
+	describe("Claude integration — missing transcript file", () => {
+		it("skips a Claude session whose transcript file is unreadable and still summarizes the rest", async () => {
+			// Regression: a Claude session in sessions.json pointing at a transcript that was
+			// deleted/rotated makes readTranscript throw ENOENT. The claude branch in
+			// readAllTranscripts used to be unguarded, so that throw aborted the whole pipeline
+			// and the commit summary was silently dropped. The reader is now wrapped in
+			// try/catch + continue, so one dead transcript only skips its own session.
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/claude-missing.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadAllSessions).mockResolvedValue([
+				{
+					sessionId: "dead-1",
+					transcriptPath: "/Users/zf/.claude/projects/proj/dead-1.jsonl",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "claude",
+				},
+				{
+					sessionId: "live-1",
+					transcriptPath: "/Users/zf/.claude/projects/proj/live-1.jsonl",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "claude",
+				},
+			]);
+			vi.mocked(readTranscript).mockImplementation(async (transcriptPath: string) => {
+				if (transcriptPath.endsWith("dead-1.jsonl")) {
+					throw new Error(`Cannot read transcript: ${transcriptPath}`);
+				}
+				return {
+					entries: [{ role: "human", content: "Live context", timestamp: "2026-04-01T12:00:00.000Z" }],
+					newCursor: { transcriptPath, lineNumber: 1, updatedAt: "2026-04-01T12:00:00.000Z" },
+					totalLinesRead: 1,
+				};
+			});
+
+			await runWorker("/test/cwd");
+
+			// The throw from the dead transcript must not abort the run — the summary is still produced.
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			// The live session's cursor advanced; the dead session never produced a cursor write.
+			expect(saveCursor).toHaveBeenCalledWith(
+				expect.objectContaining({
+					transcriptPath: "/Users/zf/.claude/projects/proj/live-1.jsonl",
+					lineNumber: 1,
+				}),
+				"/test/cwd",
+			);
+			expect(saveCursor).not.toHaveBeenCalledWith(
+				expect.objectContaining({ transcriptPath: "/Users/zf/.claude/projects/proj/dead-1.jsonl" }),
+				"/test/cwd",
+			);
 		});
 	});
 
