@@ -635,7 +635,7 @@ vi.mock("../../cli/src/core/KBPathResolver.js", () => ({
 	resolveKBPath: vi.fn(() => "/test/kb"),
 	resolveKbParent: vi.fn(() => "/test/kb-parent"),
 	findRepoFolders: mockFindRepoFolders,
-	findFreshKBPath: vi.fn(() => "/test/kb-2"),
+	peekKBPath: vi.fn(() => "/test/kb"),
 	initializeKBFolder: vi.fn(),
 	archiveKBFolder: mockArchiveKBFolder,
 }));
@@ -7310,10 +7310,12 @@ describe("Extension", () => {
 			const result = (await handler()) as { ok: boolean; message: string };
 			expect(result.ok).toBe(true);
 			expect(result.message).toContain("memories migrated");
-			// Archive: every prior folder for this repo (findRepoFolders = ["/test/kb"])
-			// differs from the fresh one (findFreshKBPath = "/test/kb-2"), so it's MOVED
-			// into the hidden .jolli/archive/ rather than having its identity rewritten.
+			// Archive-first: every prior folder for this repo (findRepoFolders =
+			// ["/test/kb"]) is MOVED into the hidden .jolli/archive/ BEFORE migrating,
+			// freeing the base slot so migration lands back on the base name
+			// (peekKBPath = "/test/kb") rather than climbing to "/test/kb-N".
 			expect(mockArchiveKBFolder).toHaveBeenCalledWith("/test/kb", undefined);
+			expect(result.message).toContain("/test/kb");
 		});
 
 		it("folds a pile of duplicate folders in one Migrate (archives all but the fresh one)", async () => {
@@ -7330,15 +7332,19 @@ describe("Extension", () => {
 			expect(mockArchiveKBFolder).toHaveBeenCalledTimes(3);
 		});
 
-		it("never archives the freshly-created folder even if it appears in the list", async () => {
-			// Defensive: findFreshKBPath = "/test/kb-2"; if it somehow shows up in the
-			// stale list it must be skipped (the `stale !== newKbRoot` guard).
+		it("archives the whole pile — base slot included — then migrates back into the base name", async () => {
+			// Consolidation: every folder that held this repo, base `/test/kb`
+			// included, is archived FIRST so migration lands back on the canonical
+			// base name (peekKBPath = "/test/kb") instead of climbing to a `-N`.
 			mockFindRepoFolders.mockReturnValueOnce(["/test/kb", "/test/kb-2"]);
 			activate(makeContext());
 			const handler = getRegisteredCommand("jollimemory.rebuildKnowledgeBase");
-			await handler();
+			const result = (await handler()) as { ok: boolean; message: string };
+			expect(result.ok).toBe(true);
 			expect(mockArchiveKBFolder).toHaveBeenCalledWith("/test/kb", undefined);
-			expect(mockArchiveKBFolder).not.toHaveBeenCalledWith("/test/kb-2", undefined);
+			expect(mockArchiveKBFolder).toHaveBeenCalledWith("/test/kb-2", undefined);
+			expect(mockArchiveKBFolder).toHaveBeenCalledTimes(2);
+			expect(result.message).toContain("memories migrated to /test/kb");
 		});
 
 		// Same successful-rebuild path, but with memoriesStore.hasFirstLoaded

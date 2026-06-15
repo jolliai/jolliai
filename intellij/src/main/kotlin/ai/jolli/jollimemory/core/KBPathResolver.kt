@@ -44,9 +44,13 @@ object KBPathResolver {
         val parent = resolveParent(customPath)
         val basePath = parent.resolve(repoName)
 
-        // Folder doesn't exist yet — use it
+        // Folder doesn't exist yet. Before claiming it, scan the suffix ladder
+        // for a folder that already holds this repo — a prior Migrate may have
+        // archived the base and left the live data in `<repo>-N`. Reusing it
+        // stops a fresh empty `<repo>` base from shadowing the real data folder.
+        // Mirrors the canonical TS resolveKBPath Case A.
         if (!Files.isDirectory(basePath)) {
-            return basePath
+            return findSameRepoSuffix(parent, repoName, remoteUrl) ?: basePath
         }
 
         // Folder exists — check if it belongs to the same repo
@@ -280,6 +284,23 @@ object KBPathResolver {
     private fun nonDefaultPortSegment(port: String, schemeDefault: String): String {
         if (port.isEmpty() || port == schemeDefault) return ""
         return ":$port"
+    }
+
+    /**
+     * Scans `<repo>-2` … `<repo>-99` for a folder whose identity matches this
+     * repo, returning the first match or null. Used by [resolve] to reuse a
+     * suffixed data folder when the base slot is free (e.g. after a Migrate
+     * archived the base). Mirrors the same-repo match arm of the canonical TS
+     * `scanRepoSuffixes`.
+     */
+    private fun findSameRepoSuffix(parent: Path, repoName: String, remoteUrl: String?): Path? {
+        for (suffix in 2..99) {
+            val candidate = parent.resolve("$repoName-$suffix")
+            if (!Files.isDirectory(candidate)) continue
+            val config = readKBConfig(candidate)
+            if (config != null && isSameRepo(config, remoteUrl, repoName)) return candidate
+        }
+        return null
     }
 
     private fun findAvailablePath(parent: Path, repoName: String, remoteUrl: String?): Path {

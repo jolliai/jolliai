@@ -483,13 +483,13 @@ esac
 			expect(peekKBPath("repo", "https://github.com/u/canonical.git", tempDir)).toBe(canonical);
 		});
 
-		it("Migrate archive gate fires: peekKBPath (old) differs from findFreshKBPath (new)", () => {
+		it("peekKBPath resolves the real folder while findFreshKBPath fills the hole", () => {
 			seedHoleScenario();
-			const oldKbRoot = peekKBPath("repo", "https://github.com/u/canonical.git", tempDir);
-			const newKbRoot = findFreshKBPath("repo", tempDir);
-			expect(oldKbRoot).toBe(join(tempDir, "repo-3")); // current folder, not the hole
-			expect(newKbRoot).toBe(join(tempDir, "repo-2")); // fresh slot fills the hole
-			expect(oldKbRoot).not.toBe(newKbRoot); // gate fires → archiveKBFolder runs
+			const liveKbRoot = peekKBPath("repo", "https://github.com/u/canonical.git", tempDir);
+			const freshKbRoot = findFreshKBPath("repo", tempDir);
+			expect(liveKbRoot).toBe(join(tempDir, "repo-3")); // current folder, not the hole
+			expect(freshKbRoot).toBe(join(tempDir, "repo-2")); // fresh slot fills the hole
+			expect(liveKbRoot).not.toBe(freshKbRoot);
 		});
 
 		it("findRepoFolders returns every same-repo folder (base + suffixes), skipping holes and other repos", () => {
@@ -527,6 +527,38 @@ esac
 			initializeKBFolder(canonical, "s", "https://github.com/u/canonical.git");
 
 			expect(resolveKBPath("s", "https://github.com/u/canonical.git", tempDir)).toBe(canonical);
+		});
+	});
+
+	describe("base slot free but a suffixed folder holds the repo (post-Migrate)", () => {
+		// After a Migrate archives the base `<repo>` and lands the live data in
+		// `<repo>-N`, the base slot is FREE. resolveKBPath / peekKBPath must reuse
+		// the suffixed data folder rather than spawning a fresh empty `<repo>`
+		// base that shadows it — the "empty jolliai reappears after every migrate"
+		// regression.
+		const remote = "https://github.com/u/canonical.git";
+
+		it("resolveKBPath reuses the suffixed data folder instead of claiming a fresh empty base", () => {
+			const data = join(tempDir, "repo-2");
+			initializeKBFolder(data, "repo", remote);
+
+			expect(resolveKBPath("repo", remote, tempDir)).toBe(data);
+			// The empty base must NOT have been claimed as a side effect.
+			expect(existsSync(join(tempDir, "repo"))).toBe(false);
+		});
+
+		it("peekKBPath returns the suffixed data folder, not the absent base", () => {
+			const data = join(tempDir, "repo-2");
+			initializeKBFolder(data, "repo", remote);
+
+			expect(peekKBPath("repo", remote, tempDir)).toBe(data);
+		});
+
+		it("still claims the base fresh when the only suffixed folder is a different repo", () => {
+			initializeKBFolder(join(tempDir, "repo-2"), "repo", "https://github.com/u/other.git");
+
+			expect(resolveKBPath("repo", remote, tempDir)).toBe(join(tempDir, "repo"));
+			expect(peekKBPath("repo", remote, tempDir)).toBe(join(tempDir, "repo"));
 		});
 	});
 

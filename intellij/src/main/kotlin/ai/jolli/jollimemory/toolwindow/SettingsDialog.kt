@@ -824,14 +824,24 @@ class SettingsDialog(
                     val repoName = KBPathResolver.extractRepoName(projectPath)
                     val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
 
-                    // Enumerate every folder that currently holds this repo BEFORE
-                    // creating the fresh one, so a pile of duplicates left by earlier
-                    // buggy runs is folded in a single Migrate. Build into a fresh -N
-                    // folder, then MOVE the prior ones into the hidden .jolli/archive/
+                    // Enumerate every folder that currently holds this repo, then
+                    // archive the whole pile FIRST — the canonical base `<repo>` slot
+                    // included — so migration lands back on the base name instead of
+                    // climbing to an ever-higher `<repo>-N`. Safe to archive up front:
+                    // the migration SOURCE is the orphan branch (system of record), not
+                    // these folders, so a crash mid-migrate self-heals on the next
+                    // activation, which re-migrates into the now-free base slot.
+                    // archiveKBFolder MOVES each folder into the hidden .jolli/archive/
                     // (not an in-place identity rewrite, which left them visible and
                     // still git-tracked). Mirrors the VS Code rebuildKnowledgeBase flow.
                     val staleFolders = KBPathResolver.findRepoFolders(repoName, remoteUrl, config.knowledgeBasePath)
-                    val kbRoot = KBPathResolver.findFreshKBPath(repoName, config.knowledgeBasePath)
+                    for (stale in staleFolders) {
+                        KBPathResolver.archiveKBFolder(stale, config.knowledgeBasePath)
+                    }
+
+                    // With the pile archived, the base slot is free; resolve to it
+                    // (falling back to a fresh -N only if some folder survived archiving).
+                    val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
                     KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
                     val mm = MetadataManager(kbRoot.resolve(".jolli"))
                     val folder = FolderStorage(kbRoot, mm)
@@ -839,12 +849,6 @@ class SettingsDialog(
 
                     val engine = MigrationEngine(orphan, folder, mm)
                     val result = engine.runMigration()
-
-                    // The fresh folder didn't exist when staleFolders was captured, so
-                    // it can't appear in the list; the guard is belt-and-suspenders.
-                    for (stale in staleFolders) {
-                        if (stale != kbRoot) KBPathResolver.archiveKBFolder(stale, config.knowledgeBasePath)
-                    }
 
                     if (result.status == "completed") {
                         Messages.showInfoMessage(project,
