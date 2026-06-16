@@ -18,10 +18,15 @@ vi.mock("node:os", async () => {
 	return { ...actual, homedir: () => mockHomeDir.value };
 });
 
+import { symlinksSupported } from "../testUtils/symlinkSupport.js";
 import { type BackendClient, SyncBackendNetworkError } from "./BackendClient.js";
 import type { GitClient } from "./GitClient.js";
 import type { RoundContext } from "./SyncEngine.js";
 import { SyncEngine } from "./SyncEngine.js";
+
+// The symlinked-bucket cap test creates real symlinks, which require
+// SeCreateSymbolicLinkPrivilege on Windows; skip it on an unprivileged account.
+const itIfSymlinks = symlinksSupported ? it : it.skip;
 
 let tempDir: string;
 
@@ -3561,7 +3566,7 @@ describe("SyncEngine.runRound — stageVault canary unowned bucket", () => {
 		expect(result.canary?.unowned).toHaveLength(10);
 	});
 
-	it("caps the canary symlinked bucket at CANARY_PATH_CAP across multiple stage calls", async () => {
+	itIfSymlinks("caps the canary symlinked bucket at CANARY_PATH_CAP across multiple stage calls", async () => {
 		// Mirror of the unowned-cap test for the SYMLINKED bucket: real
 		// symlinks at classifier-OWNED locations are refused by stageVault's
 		// symlink guard and routed to `this.canary.symlinked`. With >10 such

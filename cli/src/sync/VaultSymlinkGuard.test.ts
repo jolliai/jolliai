@@ -2,7 +2,14 @@ import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { symlinksSupported } from "../testUtils/symlinkSupport.js";
 import { assertNoSymlinksInPath, assertNoSymlinksInPathSync, safeAtomicWriteSync } from "./VaultSymlinkGuard.js";
+
+// Creating symlinks requires SeCreateSymbolicLinkPrivilege on Windows
+// (admin / Developer Mode). On an unprivileged account symlinkSync throws
+// EPERM, so the guard's symlink-rejection paths can't be exercised — skip
+// rather than fail. Mirrors the IntelliJ createSymbolicLinkOrSkip helper.
+const itIfSymlinks = symlinksSupported ? it : it.skip;
 
 describe("assertNoSymlinksInPath", () => {
 	let vault: string;
@@ -31,7 +38,7 @@ describe("assertNoSymlinksInPath", () => {
 		).resolves.toBeUndefined();
 	});
 
-	it("rejects a symlink at the FIRST intermediate segment (repo folder)", async () => {
+	itIfSymlinks("rejects a symlink at the FIRST intermediate segment (repo folder)", async () => {
 		// Build a /tmp dir we control + a symlink at <vault>/evil → /tmp.
 		// Writing to <vault>/evil/anything would escape the vault entirely.
 		const escapeTarget = mkdtempSync(join(tmpdir(), "escape-"));
@@ -45,7 +52,7 @@ describe("assertNoSymlinksInPath", () => {
 		}
 	});
 
-	it("rejects a symlink at an INNER segment (the .jolli case from the threat model)", async () => {
+	itIfSymlinks("rejects a symlink at an INNER segment (the .jolli case from the threat model)", async () => {
 		// <vault>/myrepo/.jolli → some other directory. mkdirSync(...
 		// summaries) on that path would create the dir inside the symlink
 		// target — atomicWrite would then write+rename into the foreign
@@ -71,7 +78,7 @@ describe("assertNoSymlinksInPath", () => {
 		);
 	});
 
-	it("does NOT check the leaf (caller's O_NOFOLLOW handles that)", async () => {
+	itIfSymlinks("does NOT check the leaf (caller's O_NOFOLLOW handles that)", async () => {
 		// The leaf can be a symlink and the guard still passes — leaf
 		// protection is delegated to the caller's openSync(O_NOFOLLOW).
 		// This split exists so the per-write hot path doesn't double-stat.
@@ -120,7 +127,7 @@ describe("assertNoSymlinksInPathSync", () => {
 		expect(() => assertNoSymlinksInPathSync(vault, join(vault, "cold", "x", "y.json"))).not.toThrow();
 	});
 
-	it("rejects a symlink in the path chain", () => {
+	itIfSymlinks("rejects a symlink in the path chain", () => {
 		mkdirSync(join(vault, "myrepo"), { recursive: true });
 		const escapeTarget = mkdtempSync(join(tmpdir(), "escape-"));
 		try {
@@ -172,7 +179,7 @@ describe("safeAtomicWriteSync", () => {
 		expect(readFileSync(target).equals(buf)).toBe(true);
 	});
 
-	it("refuses to write through a symlinked path segment", () => {
+	itIfSymlinks("refuses to write through a symlinked path segment", () => {
 		mkdirSync(join(vault, "myrepo"), { recursive: true });
 		const escapeTarget = mkdtempSync(join(tmpdir(), "escape-"));
 		try {

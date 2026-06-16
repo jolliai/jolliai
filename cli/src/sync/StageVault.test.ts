@@ -2,9 +2,14 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { symlinksSupported } from "../testUtils/symlinkSupport.js";
 import type { GitClient } from "./GitClient.js";
 import type { PorcelainEntry } from "./PorcelainParser.js";
 import { stageVault } from "./StageVault.js";
+
+// symlinkSync needs SeCreateSymbolicLinkPrivilege on Windows; on a non-elevated
+// account it throws EPERM, so the symlink-defence cases are skipped there.
+const itIfSymlinks = symlinksSupported ? it : it.skip;
 
 /**
  * StageVault tests use a real (temp-dir) vault for the on-disk lstat
@@ -396,7 +401,7 @@ describe("stageVault — symlink defence (R10)", () => {
 		rmSync(vault, { recursive: true, force: true });
 	});
 
-	it("refuses to stage a path whose LEAF is a symlink (hostile placement at owned location)", async () => {
+	itIfSymlinks("refuses to stage a path whose LEAF is a symlink (hostile placement at owned location)", async () => {
 		// Attacker writes a symlink at <vault>/myrepo/.jolli/index.json →
 		// /etc/passwd. Classifier says `repo-index` (owned), so without the
 		// leaf check we'd `git add` it — leaking the target path string
@@ -412,25 +417,28 @@ describe("stageVault — symlink defence (R10)", () => {
 		expect(stageAdd).not.toHaveBeenCalled();
 	});
 
-	it("refuses to stage when an INTERMEDIATE path segment is a symlink (parent-segment traversal)", async () => {
-		// <vault>/myrepo/.jolli → /etc/. The classifier still says
-		// `repo-config` for myrepo/.jolli/config.json BUT staging it
-		// would let `git add` traverse the symlink. assertNoSymlinksInPath
-		// catches this.
-		mkdirSync(join(vault, "myrepo"), { recursive: true });
-		const escapeTarget = mkdtempSync(join(tmpdir(), "escape-"));
-		try {
-			writeFileSync(join(escapeTarget, "config.json"), "{}");
-			symlinkSync(escapeTarget, join(vault, "myrepo", ".jolli"), "dir");
+	itIfSymlinks(
+		"refuses to stage when an INTERMEDIATE path segment is a symlink (parent-segment traversal)",
+		async () => {
+			// <vault>/myrepo/.jolli → /etc/. The classifier still says
+			// `repo-config` for myrepo/.jolli/config.json BUT staging it
+			// would let `git add` traverse the symlink. assertNoSymlinksInPath
+			// catches this.
+			mkdirSync(join(vault, "myrepo"), { recursive: true });
+			const escapeTarget = mkdtempSync(join(tmpdir(), "escape-"));
+			try {
+				writeFileSync(join(escapeTarget, "config.json"), "{}");
+				symlinkSync(escapeTarget, join(vault, "myrepo", ".jolli"), "dir");
 
-			const { client, stageAdd } = makeClient([entry({ path: "myrepo/.jolli/config.json" })]);
-			const report = await stageVault(client as GitClient, vault, { syncTranscripts: true });
-			expect(report.symlinked).toContain("myrepo/.jolli/config.json");
-			expect(stageAdd).not.toHaveBeenCalled();
-		} finally {
-			rmSync(escapeTarget, { recursive: true, force: true });
-		}
-	});
+				const { client, stageAdd } = makeClient([entry({ path: "myrepo/.jolli/config.json" })]);
+				const report = await stageVault(client as GitClient, vault, { syncTranscripts: true });
+				expect(report.symlinked).toContain("myrepo/.jolli/config.json");
+				expect(stageAdd).not.toHaveBeenCalled();
+			} finally {
+				rmSync(escapeTarget, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("deletion of an owned path with a symlinked leaf still passes through (we're removing, not following)", async () => {
 		// `git rm` doesn't dereference; it just removes the index entry +

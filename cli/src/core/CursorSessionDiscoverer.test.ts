@@ -35,7 +35,12 @@ vi.mock("node:os", async (importOriginal) => {
 	return { ...original, homedir: mockHomedir, platform: mockPlatform };
 });
 
+import { symlinksSupported } from "../testUtils/symlinkSupport.js";
 import { discoverCursorSessions, scanCursorSessions } from "./CursorSessionDiscoverer.js";
+
+// The non-ENOENT-stat case is driven by a self-referential symlink (ELOOP).
+// symlink() throws EPERM on a non-elevated Windows account, so skip it there.
+const itIfSymlinks = symlinksSupported ? it : it.skip;
 
 const CURSOR_DDL = [
 	`CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)`,
@@ -466,7 +471,7 @@ describe("discoverCursorSessions", () => {
 	// gives a real `ELOOP` from `stat()` without requiring a filesystem-level
 	// mock — `isEnoent` correctly classifies this as non-ENOENT and we land
 	// in the warn arm.
-	it("warns and continues when workspace state.vscdb stat fails with a non-ENOENT error", async () => {
+	itIfSymlinks("warns and continues when workspace state.vscdb stat fails with a non-ENOENT error", async () => {
 		const fresh = Date.now() - 60 * 1000;
 		const userDir = join(tmpHome, "Library/Application Support/Cursor/User");
 		await mkdir(join(userDir, "globalStorage"), { recursive: true });
