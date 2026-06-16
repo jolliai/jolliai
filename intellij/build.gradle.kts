@@ -15,7 +15,7 @@ plugins {
 }
 
 group = "ai.jolli"
-version = "0.99.0"
+version = "0.99.1"
 
 repositories {
     mavenCentral()
@@ -149,6 +149,55 @@ intellijPlatform {
             </p>
         """.trimIndent()
         changeNotes = """
+            <h3>0.99.1</h3>
+
+            <h4>New Features</h4>
+            <ul>
+                <li><b>Active Conversations</b> &mdash; a new panel showing in-progress AI agent
+                    sessions live, with inline transcript editing, message counts, and the ability
+                    to hide sessions</li>
+                <li><b>Knowledge Wiki</b> &mdash; build a browsable topic wiki from your Memory Bank
+                    via an LLM ingest pipeline. Trigger it with the <b>Build Knowledge Wiki</b> button
+                    or let it auto-compile after each commit; supports both Anthropic and Jolli
+                    summarization providers</li>
+                <li><b>Full-text search &amp; MCP server</b> &mdash; search across all memories, plus
+                    an MCP server that exposes your memory to AI tools, with ingest-phase progress UI</li>
+                <li><b>Full vault sync pipeline</b> &mdash; sync your Memory Bank to your Jolli space
+                    with live UI feedback, a space-binding dialog, and binding-required (412) handling</li>
+                <li><b>Quick Recap</b> &mdash; generate, regenerate, and edit a branch recap section</li>
+                <li><b>Memory scope filter</b> &mdash; filter the Memories panel by scope; auto-refreshes
+                    on branch switch</li>
+                <li><b>Discard selected</b> &mdash; discard multiple selected files at once in the
+                    Changes panel</li>
+                <li><b>"Push to Jolli" is now "Share in Jolli"</b> &mdash; the cloud-publish button is
+                    relabeled across all surfaces. Behavior is unchanged; only the label was updated</li>
+            </ul>
+
+            <h4>UI</h4>
+            <ul>
+                <li><b>Tool window redesign</b> &mdash; breadcrumb navigation and foreign-mode support</li>
+                <li><b>Summary panel redesign</b> &mdash; realigned to match the VS Code layout</li>
+                <li><b>LLM provider attribution</b> &mdash; summary footers now show which provider
+                    generated the summary</li>
+            </ul>
+
+            <h4>Fixes &amp; Improvements</h4>
+            <ul>
+                <li>Fixed Jolli API key clearing not triggering the status indicator, and not saving
+                    as <code>null</code> when cleared</li>
+                <li>Fixed SSH/HTTPS remote mismatch that split Memory Banks and created duplicate repo
+                    entries; repo identity is now canonicalized on merge</li>
+                <li>Fixed Migrate-to-Memory-Bank creating duplicate repo folders; consolidated onto the
+                    base folder name</li>
+                <li>Auto-clear stale sync-status badges in the status bar</li>
+                <li>Windows: mark the <code>.jolli</code> directory as hidden, fix path-separator drift
+                    in the storage layer, and fix the build &amp; test suite</li>
+                <li>Fixed SQLite JDBC driver loading</li>
+                <li>Fixed a stderr deadlock and refined the sync poll interval</li>
+                <li>Fixed OnboardingPanel font rendering and added an API key help tooltip</li>
+                <li>Added <code>client_version</code> to OAuth login URLs</li>
+            </ul>
+
             <h3>0.99.0</h3>
 
             <h4>Memory Bank</h4>

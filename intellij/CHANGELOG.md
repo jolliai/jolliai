@@ -2,7 +2,34 @@
 
 ## 0.99.1
 
-- **"Push to Jolli" is now "Share in Jolli"** — the summary viewer's cloud-publish button is relabeled **Share in Jolli**. Behavior is unchanged; only the label was updated.
+### New Features
+
+- **Active Conversations** — a new panel showing in-progress AI agent sessions live, with inline transcript editing, message counts, and the ability to hide sessions
+- **Knowledge Wiki** — build a browsable topic wiki from your Memory Bank via an LLM ingest pipeline. Trigger it with the **Build Knowledge Wiki** button or let it auto-compile after each commit; supports both Anthropic and Jolli summarization providers
+- **Full-text search & MCP server** — search across all memories, plus an MCP server that exposes your memory to AI tools, with ingest-phase progress UI
+- **Full vault sync pipeline** — sync your Memory Bank to your Jolli space with live UI feedback, a space-binding dialog, and binding-required (412) handling
+- **Quick Recap** — generate, regenerate, and edit a branch recap section
+- **Memory scope filter** — filter the Memories panel by scope; auto-refreshes on branch switch
+- **Discard selected** — discard multiple selected files at once in the Changes panel
+- **"Push to Jolli" is now "Share in Jolli"** — the cloud-publish button is relabeled across all surfaces. Behavior is unchanged; only the label was updated
+
+### UI
+
+- **Tool window redesign** — breadcrumb navigation and foreign-mode support
+- **Summary panel redesign** — realigned to match the VS Code layout
+- **LLM provider attribution** — summary footers now show which provider generated the summary
+
+### Fixes & Improvements
+
+- Fixed Jolli API key clearing not triggering the status indicator, and not saving as `null` when cleared
+- Fixed SSH/HTTPS remote mismatch that split Memory Banks and created duplicate repo entries; repo identity is now canonicalized on merge
+- Fixed Migrate-to-Memory-Bank creating duplicate repo folders; consolidated onto the base folder name
+- Auto-clear stale sync-status badges in the status bar
+- Windows: mark the `.jolli` directory as hidden, fix path-separator drift in the storage layer, and fix the build & test suite
+- Fixed SQLite JDBC driver loading
+- Fixed a stderr deadlock and refined the sync poll interval
+- Fixed OnboardingPanel font rendering and added an API key help tooltip
+- Added `client_version` to OAuth login URLs
 
 ## 0.99.0
 
