@@ -5,6 +5,8 @@ import ai.jolli.jollimemory.core.E2eTestScenario
 import ai.jolli.jollimemory.core.PlanReference
 import ai.jolli.jollimemory.core.SummaryTree
 import ai.jolli.jollimemory.core.TopicCategory
+import ai.jolli.jollimemory.core.references.ReferenceCommitRef
+import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.ViewTopicWithDate
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.categoryClass
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.collectSortedTopics
@@ -85,7 +87,7 @@ ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions)}
 ${buildShipBar(summary)}
 ${buildMemoryPanel(summary, allTopics, topicsHtml, topicsTitle, topicsLabel)}
 ${buildE2ePanel(summary)}
-${buildAttachmentsPanel(summary.plans, planTranslateSet, sourceNodes)}
+${buildAttachmentsPanel(summary.plans, planTranslateSet, sourceNodes, summary.references)}
 ${buildPrivateDrawer(transcriptHashSet)}
 ${buildFooter(summary)}
 </div>
@@ -562,8 +564,9 @@ $listItems
         plans: List<PlanReference>?,
         planTranslateSet: Set<String>,
         sourceNodes: List<CommitSummary>,
+        references: List<ReferenceCommitRef>? = null,
     ): String {
-        val plansBody = buildPlansSection(plans, planTranslateSet)
+        val plansBody = buildPlansSection(plans, planTranslateSet, references)
         val sourceBody = buildSourceCommits(sourceNodes)
         val sourceCard = if (sourceBody.isNotEmpty()) """
   <div class="attach-card" id="sourceCard">
@@ -604,12 +607,65 @@ $listItems
 
     // ── Plans Section ─────────────────────────────────────────────────────
 
-    /** Builds the Plans section showing associated plan files. Always shown so users can associate plans. */
+    // ── Reference helpers ──────────────────────────────────────────────────
+
+    private val SOURCE_TITLES = mapOf(
+        SourceId.linear to "Linear",
+        SourceId.jira to "Jira",
+        SourceId.github to "GitHub",
+        SourceId.notion to "Notion",
+    )
+
+    private val SOURCE_ORDER = listOf(SourceId.linear, SourceId.jira, SourceId.github, SourceId.notion)
+
+    /** Strips the `<source>:` prefix from archivedKey for DOM id use. */
+    private fun stripSourcePrefix(archivedKey: String, source: SourceId): String {
+        val prefix = "${source.name}:"
+        return if (archivedKey.startsWith(prefix)) archivedKey.removePrefix(prefix) else archivedKey
+    }
+
+    /** Orders references by source (linear -> jira -> github -> notion), preserving within-source order. */
+    private fun referencesBySourceOrder(references: List<ReferenceCommitRef>): List<ReferenceCommitRef> {
+        val bySource = mutableMapOf<SourceId, MutableList<ReferenceCommitRef>>()
+        for (r in references) bySource.getOrPut(r.source) { mutableListOf() }.add(r)
+        return SOURCE_ORDER.flatMap { bySource[it] ?: emptyList() }
+    }
+
+    /** Renders a single reference row matching VS Code's buildReferenceRow. */
+    private fun buildReferenceRow(e: ReferenceCommitRef): String {
+        val sourceLabel = SOURCE_TITLES[e.source] ?: e.source.name
+        val domKey = stripSourcePrefix(e.archivedKey, e.source)
+        return """
+  <div class="plan-item" id="reference-${escAttr(e.source.name)}-${escAttr(domKey)}">
+    <div class="plan-header">
+      <a class="plan-title plan-title-link" href="#" title="Click to preview" data-action="previewReference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source.name)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}">${escHtml(e.nativeId)} &mdash; ${escHtml(e.title)}</a>
+      <span class="plan-header-actions">
+        <button class="topic-action-btn" title="Open in $sourceLabel" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source.name)}" data-reference-url="${escAttr(e.url)}" data-action="openReferenceExternal">&#x1F30D;</button>
+        <button class="topic-action-btn plan-edit-btn" title="Edit $sourceLabel snapshot" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source.name)}" data-action="loadReferenceContent">&#x270E;</button>
+        <button class="topic-action-btn plan-remove-btn" title="Remove $sourceLabel Reference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source.name)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}" data-action="removeReference">&#x1F5D1;</button>
+      </span>
+    </div>
+    <div class="plan-meta">${escHtml(e.nativeId)} ($sourceLabel)</div>
+    <div class="plan-edit-area">
+      <textarea class="plan-edit-textarea" data-reference-key="${escAttr(e.archivedKey)}" rows="20"></textarea>
+      <div class="plan-edit-actions">
+        <button class="action-btn" data-action="cancelReferenceEdit" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source.name)}">Cancel</button>
+        <button class="action-btn primary" data-action="saveReferenceEdit" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source.name)}">Save</button>
+      </div>
+    </div>
+  </div>"""
+    }
+
+    // ── Plans & References Section ───────────────────────────────────────
+
+    /** Builds the Plans section showing associated plan files and references. Always shown so users can associate plans. */
     private fun buildPlansSection(
         plans: List<PlanReference>?,
         planTranslateSet: Set<String>,
+        references: List<ReferenceCommitRef>? = null,
     ): String {
         val planList = plans ?: emptyList()
+        val refList = references ?: emptyList()
 
         val planItems = planList.joinToString("\n") { p ->
             val key = p.slug
@@ -639,8 +695,12 @@ $listItems
   </div>"""
         }
 
-        val sectionCount = if (planList.size > 1) """ <span class="section-count">${planList.size}</span>""" else ""
-        val body = if (planList.isNotEmpty()) planItems
+        val referenceItems = referencesBySourceOrder(refList).joinToString("\n") { buildReferenceRow(it) }
+        val allItems = planItems + referenceItems
+        val totalCount = planList.size + refList.size
+
+        val sectionCount = if (totalCount > 1) """ <span class="section-count">$totalCount</span>""" else ""
+        val body = if (allItems.isNotEmpty()) allItems
         else """<p class="e2e-placeholder">No plans associated with this commit yet.</p>"""
 
         return """

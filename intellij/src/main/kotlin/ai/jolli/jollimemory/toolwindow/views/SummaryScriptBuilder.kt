@@ -887,6 +887,30 @@ ${buildPrMessageScript()}
     }
   }
 
+  // ── Reference inline edit messages ──
+  if (msg.command === 'referenceContentLoaded' && msg.archivedKey && msg.source && msg.content !== undefined) {
+    var refSource = msg.source;
+    var bareKey = msg.archivedKey.startsWith(refSource + ':') ? msg.archivedKey.slice(refSource.length + 1) : msg.archivedKey;
+    var refEl = document.getElementById('reference-' + refSource + '-' + bareKey);
+    if (refEl) {
+      var refTextarea = refEl.querySelector('.plan-edit-textarea');
+      if (refTextarea) {
+        refTextarea.value = msg.content;
+        refEl.classList.add('editing');
+        refTextarea.focus();
+      }
+    }
+  }
+
+  if (msg.command === 'referenceSaved' && msg.archivedKey && msg.source) {
+    var refSource2 = msg.source;
+    var bareKey2 = msg.archivedKey.startsWith(refSource2 + ':') ? msg.archivedKey.slice(refSource2.length + 1) : msg.archivedKey;
+    var refEl2 = document.getElementById('reference-' + refSource2 + '-' + bareKey2);
+    if (refEl2) {
+      refEl2.classList.remove('editing');
+    }
+  }
+
   });
 
   // ── Plan actions: event delegation for data-action attributes ──
@@ -929,6 +953,51 @@ ${buildPrMessageScript()}
       case 'associatePlan':
         jmSend({ command: 'associatePlan' });
         break;
+
+      // ── Reference actions ──
+      case 'previewReference': {
+        e.preventDefault();
+        var refKey = target.getAttribute('data-reference-key') || '';
+        var refSource = target.getAttribute('data-reference-source') || '';
+        var refNativeId = target.getAttribute('data-reference-native-id') || '';
+        var refTitle = target.getAttribute('data-reference-title') || '';
+        jmSend({ command: 'previewReference', archivedKey: refKey, source: refSource, nativeId: refNativeId, title: refTitle });
+        break;
+      }
+      case 'openReferenceExternal': {
+        var refUrl = target.getAttribute('data-reference-url') || '';
+        jmSend({ command: 'openReferenceExternal', url: refUrl });
+        break;
+      }
+      case 'loadReferenceContent': {
+        var refKey2 = target.getAttribute('data-reference-key') || '';
+        var refSource2 = target.getAttribute('data-reference-source') || '';
+        jmSend({ command: 'loadReferenceContent', archivedKey: refKey2, source: refSource2 });
+        break;
+      }
+      case 'saveReferenceEdit': {
+        var refKey3 = target.getAttribute('data-reference-key') || '';
+        var refSource3 = target.getAttribute('data-reference-source') || '';
+        var refEl = document.querySelector('.plan-item .plan-edit-textarea[data-reference-key="' + refKey3 + '"]');
+        if (!refEl) break;
+        jmSend({ command: 'saveReferenceEdit', archivedKey: refKey3, source: refSource3, content: refEl.value });
+        break;
+      }
+      case 'cancelReferenceEdit': {
+        var refKey4 = target.getAttribute('data-reference-key') || '';
+        var refSource4 = target.getAttribute('data-reference-source') || '';
+        var refItem = document.getElementById('reference-' + refSource4 + '-' + refKey4.replace(refSource4 + ':', ''));
+        if (refItem) refItem.classList.remove('editing');
+        break;
+      }
+      case 'removeReference': {
+        var refKey5 = target.getAttribute('data-reference-key') || '';
+        var refSource5 = target.getAttribute('data-reference-source') || '';
+        var refNativeId2 = target.getAttribute('data-reference-native-id') || '';
+        var refTitle2 = target.getAttribute('data-reference-title') || '';
+        jmSend({ command: 'removeReference', archivedKey: refKey5, source: refSource5, nativeId: refNativeId2, title: refTitle2 });
+        break;
+      }
     }
   });
 

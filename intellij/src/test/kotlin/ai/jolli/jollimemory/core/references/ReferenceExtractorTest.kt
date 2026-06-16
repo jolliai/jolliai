@@ -148,10 +148,34 @@ class ReferenceExtractorTest {
 	inner class CodexSource {
 		@Test
 		fun `extracts from Codex transcript`(@TempDir dir: File) {
-			val lines = listOf(
-				"""{"timestamp":"2024-01-01T00:00:00Z","payload":{"type":"function_call","call_id":"c1","namespace":"mcp__codex_apps__linear","name":"_fetch"}}""",
-				"""{"timestamp":"2024-01-01T00:00:01Z","payload":{"type":"function_call_output","call_id":"c1","output":"[{\"type\":\"text\",\"text\":\"${LINEAR_PAYLOAD.replace("\"", "\\\"")}\"}]"}}""",
-			)
+			val gson = com.google.gson.Gson()
+			// Build fnCall line
+			val fnCallPayload = com.google.gson.JsonObject().apply {
+				addProperty("type", "function_call")
+				addProperty("call_id", "c1")
+				addProperty("namespace", "mcp__codex_apps__linear")
+				addProperty("name", "_fetch")
+			}
+			val fnCallRoot = com.google.gson.JsonObject().apply {
+				addProperty("timestamp", "2024-01-01T00:00:00Z")
+				add("payload", fnCallPayload)
+			}
+			// Build fnOutput line — Gson handles all escaping
+			val textObj = com.google.gson.JsonObject().apply {
+				addProperty("type", "text")
+				addProperty("text", LINEAR_PAYLOAD)
+			}
+			val content = com.google.gson.JsonArray().apply { add(textObj) }
+			val fnOutputPayload = com.google.gson.JsonObject().apply {
+				addProperty("type", "function_call_output")
+				addProperty("call_id", "c1")
+				addProperty("output", gson.toJson(content))
+			}
+			val fnOutputRoot = com.google.gson.JsonObject().apply {
+				addProperty("timestamp", "2024-01-01T00:00:01Z")
+				add("payload", fnOutputPayload)
+			}
+			val lines = listOf(gson.toJson(fnCallRoot), gson.toJson(fnOutputRoot))
 			val file = File(dir, "transcript.jsonl")
 			file.writeText(lines.joinToString("\n") + "\n")
 			val result = ReferenceExtractor.extractFromTranscript(

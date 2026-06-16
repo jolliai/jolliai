@@ -1,6 +1,8 @@
 package ai.jolli.jollimemory.core
 
 import ai.jolli.jollimemory.bridge.GitOps
+import ai.jolli.jollimemory.core.references.ReferenceStore
+import ai.jolli.jollimemory.core.references.SourceId
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import java.time.Instant
@@ -241,6 +243,41 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
     fun writePlanToBranch(slug: String, content: String, message: String) {
         val files = listOf(FileWrite("plans/$slug.md", content))
         storage.writeFiles(files, message)
+    }
+
+    // ── Reference storage (orphan branch) ────────────────────────────────
+
+    /**
+     * Build the orphan-branch path for a reference markdown file.
+     * Port of CLI's `orphanPathFor(source, archivedKey)`.
+     */
+    private fun orphanPathFor(source: SourceId, archivedKey: String): String {
+        val prefix = "${source.name}:"
+        val bareKey = if (archivedKey.startsWith(prefix)) archivedKey.removePrefix(prefix) else archivedKey
+        val sanitized = ReferenceStore.sanitizeNativeIdForPath(source, bareKey)
+        return "references/${source.name}/$sanitized.md"
+    }
+
+    /** Reads a reference's archived markdown from the orphan branch. */
+    fun readReferenceFromBranch(source: SourceId, archivedKey: String): String? {
+        return try {
+            storage.readFile(orphanPathFor(source, archivedKey))
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Writes a single reference markdown file to the orphan branch. */
+    fun writeReferenceFromBranch(source: SourceId, archivedKey: String, content: String, message: String) {
+        val files = listOf(FileWrite(orphanPathFor(source, archivedKey), content))
+        storage.writeFiles(files, message)
+    }
+
+    /** Batch write reference files to the orphan branch. */
+    fun storeReferences(files: List<FileWrite>, commitMessage: String) {
+        if (files.isEmpty()) return
+        storage.writeFiles(files, commitMessage)
+        log.info("Stored %d reference file(s)", files.size)
     }
 
     // ── Transcript storage ──────────────────────────────────────────────

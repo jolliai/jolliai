@@ -56,7 +56,7 @@ class GitHubAdapterTest {
 		fun `decodes HTML entities in body`() {
 			val ref = GitHubAdapter.extractRef(payload(), "t", "ts")!!
 			ref.description shouldContain "<HTML>"
-			ref.description shouldContain "&" // no entity left for amp
+			ref.description shouldContain "-encoded"
 		}
 
 		@Test
@@ -77,7 +77,7 @@ class GitHubAdapterTest {
 		@Test
 		fun `supports pull request URLs`() {
 			val ref = GitHubAdapter.extractRef(
-				payload(htmlUrl = "https://github.com/o/r/pull/42", repoFullName = null), "t", "ts"
+				payload(number = 42, htmlUrl = "https://github.com/o/r/pull/42", repoFullName = null), "t", "ts"
 			)
 			ref.shouldNotBeNull()
 			ref.nativeId shouldBe "o/r#42"

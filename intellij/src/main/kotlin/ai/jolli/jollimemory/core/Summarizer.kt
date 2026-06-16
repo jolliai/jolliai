@@ -46,10 +46,13 @@ object Summarizer {
         val model: String? = null,
         val jolliApiKey: String? = null,
         val aiProvider: String? = null,
+        /** Pre-rendered reference XML blocks. Injected between commit info and transcript. */
+        val referenceBlocks: String? = null,
     )
 
     /** Builds the full summarization prompt. */
-    fun buildSummarizationPrompt(conversation: String, diff: String, commitInfo: CommitInfo): String {
+    fun buildSummarizationPrompt(conversation: String, diff: String, commitInfo: CommitInfo, referenceBlocks: String = ""): String {
+        val referencesSection = if (referenceBlocks.isNotBlank()) "\n### Referenced Issues & Pages\n$referenceBlocks\n" else ""
         return """You are JolliMemory, an AI development process documentation tool. Your job is to analyze a development session (human-AI conversation + code changes) and produce a structured summary.
 
 ## Input
@@ -59,7 +62,7 @@ object Summarizer {
 - Message: ${commitInfo.message}
 - Author: ${commitInfo.author}
 - Date: ${commitInfo.date}
-
+$referencesSection
 ### Development Session Transcript (conversation context)
 $conversation
 
@@ -168,7 +171,7 @@ The developer added drag-handle reordering to the article sidebar: articles can 
             else -> "large"
         }
 
-        val prompt = buildSummarizationPrompt(params.conversation, params.diff, params.commitInfo)
+        val prompt = buildSummarizationPrompt(params.conversation, params.diff, params.commitInfo, params.referenceBlocks ?: "")
         val proxyParams = mapOf(
             "commitHash" to params.commitInfo.hash,
             "commitMessage" to params.commitInfo.message,
@@ -176,6 +179,7 @@ The developer added drag-handle reordering to the article sidebar: articles can 
             "commitDate" to params.commitInfo.date,
             "conversation" to params.conversation,
             "diff" to params.diff,
+            "references" to (params.referenceBlocks ?: ""),
         )
 
         val result = LlmClient.callLlm(
