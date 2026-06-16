@@ -106,7 +106,7 @@ class SkillInstaller(private val projectDir: String) {
     private fun resolvePluginVersion(): String {
         return try {
             val pluginId = com.intellij.openapi.extensions.PluginId.getId("ai.jolli.jollimemory")
-            val plugin = com.intellij.ide.plugins.PluginManager.getInstance().findEnabledPlugin(pluginId)
+            val plugin = com.intellij.ide.plugins.PluginManager.getPlugins().firstOrNull { it.pluginId == pluginId }
             plugin?.version ?: FALLBACK_VERSION
         } catch (_: Throwable) {
             // NoClassDefFoundError when running outside IntelliJ (tests, hooks JAR)

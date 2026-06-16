@@ -469,7 +469,7 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             val pluginId = com.intellij.openapi.extensions.PluginId.getId("ai.jolli.jollimemory")
             searchLog.appendLine("pluginId=$pluginId")
 
-            val plugin = com.intellij.ide.plugins.PluginManager.getInstance().findEnabledPlugin(pluginId)
+            val plugin = com.intellij.ide.plugins.PluginManager.getPlugins().firstOrNull { it.pluginId == pluginId }
             searchLog.appendLine("plugin=${plugin?.name} version=${plugin?.version}")
 
             val pluginPath = plugin?.pluginPath
