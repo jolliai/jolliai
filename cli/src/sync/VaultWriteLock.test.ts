@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LOCK_TIMEOUT_MS } from "../core/LockPrimitives.js";
+import { consumePendingWorkers, recordPendingWorker } from "./PendingWorkers.js";
 import { getVaultWriteLockPath } from "./VaultLockPath.js";
 import { acquireVaultWriteLock, isVaultWriteLockHeld, withVaultWriteLock } from "./VaultWriteLock.js";
 
@@ -189,6 +190,85 @@ describe("acquireVaultWriteLock", () => {
 				}),
 			).rejects.toThrow("body failed");
 			expect(await isVaultWriteLockHeld(vault)).toBe(false);
+		});
+	});
+
+	describe("withVaultWriteLock pending-worker wakeup on release", () => {
+		// Regression contract: a long compile/ingest holder serialised on
+		// vault-write.lock can starve a post-commit QueueWorker that times out
+		// waiting and records itself in the pending registry. Before this fix the
+		// compile's release did NOT drain the registry — only QueueWorker and
+		// SyncBootstrap did — so the timed-out worker's queue entry was orphaned
+		// until the repo's next commit/sync (the "amended commit's summary never
+		// generated" symptom). withVaultWriteLock must wake pending workers on
+		// release so EVERY holder closes the gap, not just the two that
+		// re-implemented the drain by hand.
+
+		it("wakes (and drains) pending workers recorded for this vault on release", async () => {
+			const waiterCwd = "/repo/blocked-waiter";
+			await recordPendingWorker(vault, waiterCwd);
+			const launched: string[] = [];
+
+			const result = await withVaultWriteLock(vault, "fail-fast", async () => "ok", {
+				launch: (cwd) => launched.push(cwd),
+			});
+
+			expect(result).toEqual({ ran: true, value: "ok" });
+			expect(launched).toEqual([waiterCwd]);
+			// Registry drained so the next release doesn't double-spawn.
+			expect(await consumePendingWorkers(vault)).toEqual([]);
+		});
+
+		it("wakes pending workers even when the body throws", async () => {
+			const waiterCwd = "/repo/blocked-waiter";
+			await recordPendingWorker(vault, waiterCwd);
+			const launched: string[] = [];
+
+			await expect(
+				withVaultWriteLock(
+					vault,
+					"fail-fast",
+					async () => {
+						throw new Error("body failed");
+					},
+					{ launch: (cwd) => launched.push(cwd) },
+				),
+			).rejects.toThrow("body failed");
+
+			expect(launched).toEqual([waiterCwd]);
+		});
+
+		it("does NOT wake or drain when the lock was not acquired (ran:false)", async () => {
+			const waiterCwd = "/repo/blocked-waiter";
+			await recordPendingWorker(vault, waiterCwd);
+			const launched: string[] = [];
+			const blocker = await acquireVaultWriteLock(vault, "fail-fast");
+
+			const result = await withVaultWriteLock(vault, "fail-fast", async () => "ok", {
+				launch: (cwd) => launched.push(cwd),
+			});
+
+			expect(result).toEqual({ ran: false });
+			// We never held the lock, so we are not the releaser — leave the
+			// registry for whoever actually releases.
+			expect(launched).toEqual([]);
+			expect(await consumePendingWorkers(vault)).toEqual([waiterCwd]);
+			await blocker?.release();
+		});
+
+		it("skips the holder's own cwd when selfCwd is supplied", async () => {
+			const ownCwd = "/repo/self";
+			const otherCwd = "/repo/other";
+			await recordPendingWorker(vault, ownCwd);
+			await recordPendingWorker(vault, otherCwd);
+			const launched: string[] = [];
+
+			await withVaultWriteLock(vault, "fail-fast", async () => undefined, {
+				launch: (cwd) => launched.push(cwd),
+				selfCwd: ownCwd,
+			});
+
+			expect(launched).toEqual([otherCwd]);
 		});
 	});
 

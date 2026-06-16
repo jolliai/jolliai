@@ -73,21 +73,35 @@ vi.mock("../core/Locks.js", () => ({
 // drain-queue test path stays focused on per-entry behaviour. A separate
 // QueueWorker.vaultLock test file exercises the lock acquisition / release
 // contract directly.
-vi.mock("../sync/VaultWriteLock.js", () => ({
-	acquireVaultWriteLock: vi.fn().mockResolvedValue({
-		release: vi.fn().mockResolvedValue(undefined),
-		refresh: vi.fn().mockResolvedValue(undefined),
-	}),
-	DEFAULT_VAULT_WRITE_WAIT_MS: 60_000,
-	isVaultWriteLockHeld: vi.fn(),
-}));
+vi.mock("../sync/VaultWriteLock.js", async (importOriginal) => {
+	// Keep the real `VaultWriteBusyError` so the unlocked-ingest guard's typed busy
+	// signal is the genuine class; only the lock acquisition is stubbed.
+	const actual = await importOriginal<typeof import("../sync/VaultWriteLock.js")>();
+	return {
+		...actual,
+		acquireVaultWriteLock: vi.fn().mockResolvedValue({
+			release: vi.fn().mockResolvedValue(undefined),
+			refresh: vi.fn().mockResolvedValue(undefined),
+		}),
+		// Used by the unlocked-ingest writeGuard. Passthrough: run the body, report ran.
+		withVaultWriteLock: vi.fn(async (_root: string, _mode: unknown, body: () => Promise<unknown>) => ({
+			ran: true,
+			value: await body(),
+		})),
+		DEFAULT_VAULT_WRITE_WAIT_MS: 60_000,
+		isVaultWriteLockHeld: vi.fn(),
+	};
+});
 
 // PendingWorkers cross-repo wakeup helpers. Mocked so tests can verify
 // QueueWorker records its cwd on lock acquisition failure (L295/309-314)
-// and skips itself when consuming on release (L425).
+// and delegates the on-release wakeup to `wakePendingWorkers`. The real
+// drain+launch+skip-self loop is exercised directly in PendingWorkers.test.ts;
+// here we only assert QueueWorker calls the helper with its own cwd as selfCwd.
 vi.mock("../sync/PendingWorkers.js", () => ({
 	recordPendingWorker: vi.fn().mockResolvedValue(undefined),
 	consumePendingWorkers: vi.fn().mockResolvedValue([]),
+	wakePendingWorkers: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../sync/SyncBootstrap.js", () => ({
@@ -375,7 +389,7 @@ import { generateSummary } from "../core/Summarizer.js";
 import { storeSummary } from "../core/SummaryStore.js";
 import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
-import { consumePendingWorkers, recordPendingWorker } from "../sync/PendingWorkers.js";
+import { recordPendingWorker, wakePendingWorkers } from "../sync/PendingWorkers.js";
 import { acquireVaultWriteLock } from "../sync/VaultWriteLock.js";
 import type { CommitGitOperation, IngestOperation } from "../Types.js";
 import { __test__, buildWorkerStartupBanner, launchWorker, runWorker } from "./QueueWorker.js";
@@ -485,13 +499,14 @@ describe("QueueWorker", () => {
 	});
 
 	describe("runWorker — vault-write.lock failure path", () => {
-		it("records pendingWorker and returns early when vault lock acquisition fails", async () => {
-			// Pins QueueWorker.ts L295 (vaultLock === null branch) and
-			// L309-314 (recordPendingWorker call + early return). When the
-			// vault-write.lock is held by another writer, the worker must
-			// record its cwd so the next release re-spawns it, then exit
-			// without touching the queue.
-			vi.mocked(acquireVaultWriteLock).mockResolvedValueOnce(null);
+		it("records pendingWorker and returns early when vault lock stays busy through the retry", async () => {
+			// Pins the vaultLock === null branch: recordPendingWorker call +
+			// post-record fail-fast retry + early return. When the
+			// vault-write.lock is held by another writer that is STILL holding
+			// it on the retry, the worker must record its cwd so the next
+			// release re-spawns it, then exit without touching the queue.
+			// Both the wait-mode acquire and the fail-fast retry miss.
+			vi.mocked(acquireVaultWriteLock).mockResolvedValueOnce(null).mockResolvedValueOnce(null);
 
 			await runWorker("/test/cwd-locked");
 
@@ -499,30 +514,52 @@ describe("QueueWorker", () => {
 			// release can wake us up.
 			expect(recordPendingWorker).toHaveBeenCalledTimes(1);
 			expect(recordPendingWorker).toHaveBeenCalledWith(expect.any(String), "/test/cwd-locked");
+			// Two acquisition attempts: the wait-mode acquire, then the
+			// post-record fail-fast retry (the lost-wakeup guard).
+			expect(acquireVaultWriteLock).toHaveBeenCalledTimes(2);
 			// And we MUST NOT have done any queue work.
 			expect(dequeueAllGitOperations).not.toHaveBeenCalled();
 			expect(acquireWorkerLock).not.toHaveBeenCalled();
 		});
 
-		it("consumePendingWorkers wakes other pending cwds but skips self on release", async () => {
-			// Pins the `pendingCwd !== cwd` guard on QueueWorker.ts L425 —
-			// when our own cwd is recorded as pending (e.g. we raced with
-			// ourselves), we must not infinitely re-spawn. Other cwds get
-			// `launchWorker` invoked.
-			vi.mocked(consumePendingWorkers).mockResolvedValueOnce(["/test/cwd", "/other/cwd"]);
+		it("proceeds when the holder releases during the pending-record gap (lost-wakeup guard)", async () => {
+			// Pins the lost-wakeup guard: the wait-mode acquire times out, we
+			// record our pending entry, and the holder happens to release in
+			// the gap between our timeout and the record landing. Its
+			// consumePendingWorkers may have run against an empty registry and
+			// will never re-spawn us — so the post-record fail-fast retry must
+			// grab the now-free lock and PROCEED to drain the queue rather than
+			// stranding the entry until this repo's next commit.
+			vi.mocked(acquireVaultWriteLock)
+				.mockResolvedValueOnce(null) // wait-mode acquire times out
+				.mockResolvedValueOnce({
+					release: vi.fn().mockResolvedValue(undefined),
+					refresh: vi.fn().mockResolvedValue(undefined),
+				}); // fail-fast retry succeeds — holder released in the gap
+
+			await runWorker("/test/cwd-retry");
+
+			// Intent was recorded before the retry (so any concurrent releaser
+			// would also see it), but this run grabbed the lock itself.
+			expect(recordPendingWorker).toHaveBeenCalledTimes(1);
+			expect(acquireVaultWriteLock).toHaveBeenCalledTimes(2);
+			// Crucially: we proceeded past the vault lock and did real work
+			// instead of returning early.
+			expect(acquireWorkerLock).toHaveBeenCalled();
+		});
+
+		it("delegates the on-release wakeup to wakePendingWorkers with its own cwd as selfCwd", async () => {
+			// QueueWorker no longer hand-rolls the drain+launch+skip-self loop;
+			// it delegates to the shared `wakePendingWorkers`, passing its own cwd
+			// as `selfCwd` so the helper won't re-spawn this very worker (which
+			// already chain-spawns for itself at the end of the drain). The actual
+			// skip-self + launch behaviour is exercised against the REAL helper in
+			// PendingWorkers.test.ts — here we only pin the delegation contract.
 			vi.mocked(dequeueAllGitOperations).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
-			// launchWorker refuses to spawn when the worker bundle is missing;
-			// satisfy its existence probe (and only that one) so the wake-up
-			// spawn for /other/cwd goes through.
-			vi.mocked(existsSync).mockImplementation((path) => String(path).endsWith("QueueWorker.js"));
 
 			await runWorker("/test/cwd");
 
-			expect(consumePendingWorkers).toHaveBeenCalledTimes(1);
-			// `launchWorker` is `v8 ignore`d (calls `spawn`), so we verify the
-			// observable side: `spawn` was invoked exactly once (for /other/cwd,
-			// not /test/cwd).
-			expect(vi.mocked(spawn)).toHaveBeenCalledTimes(1);
+			expect(wakePendingWorkers).toHaveBeenCalledWith(expect.any(String), expect.any(Function), "/test/cwd");
 		});
 	});
 
@@ -2333,7 +2370,7 @@ describe("QueueWorker", () => {
 				return { batches: 1, ingested: 2, outcome: "OK", topicFailures: [] };
 			});
 
-			await __test__.processQueueEntry(makeIngestOp("post-merge"), tmp, storageWithWiki(true), false);
+			await __test__.runIngestEntry(makeIngestOp("post-merge"), tmp, storageWithWiki(true));
 
 			expect(phaseSeenDuringIngest).toBe("ingest");
 			expect(existsSync(phaseFile)).toBe(false);
@@ -2353,7 +2390,7 @@ describe("QueueWorker", () => {
 			vi.mocked(drainIngest).mockRejectedValue(new Error("boom"));
 
 			await expect(
-				__test__.processQueueEntry(makeIngestOp("post-merge"), tmp, storageWithWiki(true), false),
+				__test__.runIngestEntry(makeIngestOp("post-merge"), tmp, storageWithWiki(true)),
 			).rejects.toThrow("boom");
 
 			expect(existsSync(phaseFile)).toBe(false);
@@ -2374,6 +2411,84 @@ describe("QueueWorker", () => {
 
 			expect(vi.mocked(drainIngest)).toHaveBeenCalledOnce();
 			expect(vi.mocked(renderTopicKBWiki)).toHaveBeenCalledOnce();
+		});
+
+		it("releases the entry-level vault-write.lock before running the ingest LLM phase", async () => {
+			// A dequeued ingest op must NOT be processed under the worker's entry-level
+			// vault-write.lock: the long reconcile phase would otherwise block every
+			// later commit-summary worker. The entry lock is released first; ingest's
+			// own per-write guard re-acquires it briefly per page.
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			const order: string[] = [];
+			const release = vi.fn(async () => {
+				order.push("release");
+			});
+			vi.mocked(acquireVaultWriteLock).mockResolvedValue({
+				release,
+				refresh: vi.fn().mockResolvedValue(undefined),
+			});
+			vi.mocked(drainIngest).mockImplementation(async () => {
+				order.push("drainIngest");
+				return { batches: 1, ingested: 1, outcome: "OK", topicFailures: [] };
+			});
+
+			const op = makeIngestOp("post-merge");
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
+				.mockResolvedValueOnce([]);
+
+			await runWorker("/test/cwd");
+
+			expect(order).toEqual(["release", "drainIngest"]);
+		});
+
+		it("holds worker.lock THROUGH the ingest LLM phase, releasing it only after the drain", async () => {
+			// Direction-A guarantee: vault-write.lock is dropped before ingest (so
+			// cross-repo summary workers proceed) but the per-repo worker.lock stays
+			// held across the whole ingest. That serialises same-repo workers, so no
+			// concurrent summary run can clear the `ingest` worker-phase marker and no
+			// second ingest can race this one. Hence: drainIngest runs BEFORE
+			// releaseWorkerLock, while vault release happens BEFORE drainIngest.
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			const order: string[] = [];
+			vi.mocked(acquireVaultWriteLock).mockResolvedValue({
+				release: vi.fn(async () => {
+					order.push("vault-release");
+				}),
+				refresh: vi.fn().mockResolvedValue(undefined),
+			});
+			vi.mocked(releaseWorkerLock).mockImplementation(async () => {
+				order.push("worker-release");
+			});
+			vi.mocked(drainIngest).mockImplementation(async () => {
+				order.push("drainIngest");
+				return { batches: 1, ingested: 1, outcome: "OK", topicFailures: [] };
+			});
+
+			const op = makeIngestOp("post-merge");
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
+				.mockResolvedValueOnce([]);
+
+			await runWorker("/test/cwd");
+
+			expect(order).toEqual(["vault-release", "drainIngest", "worker-release"]);
+		});
+
+		it("passes a per-write guard to drainIngest and renderTopicKBWiki so ingest writes self-lock", async () => {
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 2, outcome: "OK", topicFailures: [] });
+
+			const op = makeIngestOp("post-merge");
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
+				.mockResolvedValueOnce([]);
+
+			await runWorker("/test/cwd");
+
+			const drainOpts = vi.mocked(drainIngest).mock.calls[0]?.[2];
+			expect(typeof drainOpts?.writeGuard).toBe("function");
+			expect(typeof vi.mocked(renderTopicKBWiki).mock.calls[0]?.[2]).toBe("function");
 		});
 
 		it("skips drainIngest when no API key is configured", async () => {

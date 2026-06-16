@@ -67,18 +67,10 @@ export function registerCompileCommand(opts: CompileCommandOpts): vscode.Disposa
 						onProgress: (message) => progress.report({ message }),
 					}),
 			);
-			if (result.skipped) {
-				// Lock contended: a background worker / sync / another compile holds the
-				// vault-write lock. Nothing ran — don't report a "0 source(s)" success.
-				await vscode.window.showInformationMessage(
-					"Another knowledge wiki build is already running for this Memory Bank folder — skipped.",
-				);
-			} else {
-				const failedNote = result.failed ? ` (${result.failed} failed)` : "";
-				await vscode.window.showInformationMessage(
-					`Knowledge wiki updated: ${result.totalIngested} source(s) across ${result.repos.length} repo(s)${failedNote}.`,
-				);
-			}
+			const failedNote = result.failed ? ` (${result.failed} failed)` : "";
+			await vscode.window.showInformationMessage(
+				`Knowledge wiki updated: ${result.totalIngested} source(s) across ${result.repos.length} repo(s)${failedNote}.`,
+			);
 		} catch (err) {
 			await vscode.window.showErrorMessage(
 				`Knowledge wiki build failed: ${err instanceof Error ? err.message : String(err)}`,

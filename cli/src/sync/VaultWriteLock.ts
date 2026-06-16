@@ -91,6 +91,7 @@ import {
 	tryAcquireOnce,
 } from "../core/LockPrimitives.js";
 import { createLogger } from "../Logger.js";
+import { wakePendingWorkers } from "./PendingWorkers.js";
 import { getVaultWriteLockPath } from "./VaultLockPath.js";
 
 const log = createLogger("Sync:VaultWriteLock");
@@ -115,6 +116,25 @@ export const DEFAULT_PULL_LOCK_WAIT_MS = 10_000;
 
 /** Poll interval while waiting for the lock. */
 export const DEFAULT_VAULT_WRITE_POLL_MS = 100;
+
+/**
+ * Thrown by a `writeGuard` wrapper when its `withVaultWriteLock` call returns
+ * `{ ran: false }` — i.e. a concurrent vault writer (background QueueWorker,
+ * sync, or another compile) held `vault-write.lock` for the whole wait budget.
+ *
+ * A distinct type (rather than a bare `Error`) lets callers tell a transient,
+ * user-actionable "busy — try again shortly" state apart from a real write
+ * failure (disk, corruption) and react differently. The `jolli compile` CLI
+ * uses this to turn a busy lock on its *prerequisite* writes into a clean
+ * retry-later exit instead of an uncaught stack trace, while a genuine write
+ * error still propagates.
+ */
+export class VaultWriteBusyError extends Error {
+	constructor(message = "could not acquire vault-write.lock within budget") {
+		super(message);
+		this.name = "VaultWriteBusyError";
+	}
+}
 
 /**
  * `acquireVaultWriteLock` mode discriminator.
@@ -198,6 +218,27 @@ export async function acquireVaultWriteLock(
 export const VAULT_WRITE_LOCK_REFRESH_INTERVAL_MS = 60_000;
 
 /**
+ * Optional pending-worker wakeup wired into `withVaultWriteLock`'s release.
+ *
+ * Production holders MUST pass this so a QueueWorker that timed out waiting on
+ * the lock (and recorded itself in the per-vault pending registry) gets
+ * re-spawned the moment this holder releases. Omitting it re-opens the
+ * orphaned-queue-entry bug — the symptom that a long compile/ingest leaves an
+ * amended commit's summary stranded because nothing drains the registry on the
+ * compile's release. The drain is keyed off the SAME `vaultRoot` the lock is,
+ * so no extra path needs threading.
+ *
+ *   - `launch` — injected `launchWorker` (lives in `hooks/QueueWorker.ts`,
+ *     varies by host) so this sync-layer helper need not import it.
+ *   - `selfCwd` — skip waking this cwd (QueueWorker passes its own cwd because
+ *     it chain-spawns for itself separately; compile holders omit it).
+ */
+export interface VaultWriteLockReleaseHook {
+	readonly launch: (cwd: string) => void;
+	readonly selfCwd?: string;
+}
+
+/**
  * Acquire `vault-write.lock`, run `body` while holding it (heartbeating the
  * mtime so the stale-reclaimer can't steal it during a long drain), then
  * release — on success, throw, OR early return. The compile paths
@@ -208,11 +249,18 @@ export const VAULT_WRITE_LOCK_REFRESH_INTERVAL_MS = 60_000;
  * Returns `{ ran: true, value }` when the lock was acquired and the body ran,
  * or `{ ran: false }` when the lock was busy (fail-fast miss / wait timeout).
  * Re-throws whatever `body` throws after releasing the lock.
+ *
+ * When `releaseHook` is supplied, pending workers that timed out waiting for
+ * this lock are woken on release (success, throw, AND early-return paths — but
+ * NOT the `ran:false` path, since we never held the lock there and are not the
+ * releaser). This is what makes `withVaultWriteLock` close the cross-holder
+ * wakeup gap instead of each caller re-implementing the drain.
  */
 export async function withVaultWriteLock<T>(
 	vaultRoot: string,
 	mode: VaultWriteLockMode,
 	body: () => Promise<T>,
+	releaseHook?: VaultWriteLockReleaseHook,
 ): Promise<{ ran: true; value: T } | { ran: false }> {
 	const handle = await acquireVaultWriteLock(vaultRoot, mode);
 	if (handle === null) return { ran: false };
@@ -230,6 +278,11 @@ export async function withVaultWriteLock<T>(
 	} finally {
 		clearInterval(refreshTimer);
 		await handle.release();
+		// Wake AFTER release so a re-spawned worker can immediately acquire the
+		// freed lock rather than racing us through another timeout.
+		if (releaseHook !== undefined) {
+			await wakePendingWorkers(vaultRoot, releaseHook.launch, releaseHook.selfCwd);
+		}
 	}
 }
 

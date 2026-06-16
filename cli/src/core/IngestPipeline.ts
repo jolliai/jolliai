@@ -5,7 +5,8 @@
  * drainIngest loops to empty. Canonical layer only; visible render is sub-project 3.
  */
 
-import { createLogger } from "../Logger.js";
+import { createLogger, errMsg } from "../Logger.js";
+import { VaultWriteBusyError } from "../sync/VaultWriteLock.js";
 import type { IngestOperation, LlmConfig } from "../Types.js";
 import { mapWithConcurrency } from "./Concurrency.js";
 import { INGEST_CODES, type IngestCode } from "./IngestErrors.js";
@@ -46,6 +47,17 @@ export interface IngestOptions {
 	readonly readStorage?: StorageProvider;
 	/** Tags the telemetry record written by drainIngest. Defaults to "manual". */
 	readonly triggeredBy?: IngestOperation["triggeredBy"];
+	/**
+	 * Wraps each persistence call (topic-page / index / processed-set write) so the
+	 * caller can serialise it under a lock and release between writes. The LLM
+	 * route + reconcile phase runs OUTSIDE this guard. ALL production callers — the
+	 * `jolli compile` paths (`compileSingleRepo` / `compileAllRepos`) AND the
+	 * QueueWorker post-commit path — pass a guard that acquires `vault-write.lock`
+	 * PER WRITE (releasing between writes) so a long ingest never blocks
+	 * commit-summary generation, throwing `VaultWriteBusyError` on a busy miss (see
+	 * `cli/src/sync/VaultWriteLock.ts`). Defaults to identity for unit tests only.
+	 */
+	readonly writeGuard?: (fn: () => Promise<void>) => Promise<void>;
 }
 
 export interface IngestResult {
@@ -108,7 +120,16 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 
 	// -- Reconcile: parallel LLM phase (pure) -> serial apply phase (writes) ---
 	type ReconcileOutcome =
-		| { kind: "ok"; slug: string; page: TopicPage; indexEntry: TopicIndexEntry }
+		// `before` is the page snapshot read pre-LLM (null for a new topic); the guarded
+		// write compares it against a fresh read to detect a concurrent rewrite (RMW).
+		| {
+				kind: "ok";
+				slug: string;
+				page: TopicPage;
+				indexEntry: TopicIndexEntry;
+				before: TopicPage | null;
+				refs: readonly SourceRef[];
+		  }
 		| { kind: "failed"; slug: string; refs: SourceRef[]; code: IngestCode };
 
 	const assignments = [...plan.assignments];
@@ -177,7 +198,7 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 				sourceRefs,
 				lastUpdatedAt: nowIso,
 			};
-			return { kind: "ok", slug, page, indexEntry };
+			return { kind: "ok", slug, page, indexEntry, before: current, refs: assignment.refs };
 		},
 		// A task that throws (the reconcile LLM call failed — network/abort/transport/
 		// unexpected) degrades to a held CALL failure rather than aborting the whole
@@ -190,11 +211,16 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 		},
 	);
 
-	// -- Serial apply phase (side effects; orphan-branch writes never race) ----
+	// -- Classify outcomes (pure, lock-free) -----------------------------------
 	const failedRefs = new Set<SourceRef>();
-	const touchedSlugs: string[] = [];
+	const okOutcomes: Array<{
+		slug: string;
+		page: TopicPage;
+		indexEntry: TopicIndexEntry;
+		before: TopicPage | null;
+		refs: readonly SourceRef[];
+	}> = [];
 	const topicFailures: { slug: string; code: IngestCode }[] = [];
-	const nextIndex: TopicIndex = { schemaVersion: 1, topics: [...index.topics] };
 	let reconcileCalls = 0;
 	for (const outcome of outcomes) {
 		// `ok` always issued a reconcile LLM call; a `failed` issued one unless it
@@ -203,24 +229,97 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 		const issuedCall = outcome.kind === "ok" || outcome.code !== INGEST_CODES.NO_SOURCE_CONTENT;
 		if (issuedCall) reconcileCalls++;
 		if (outcome.kind === "ok") {
-			await saveTopicPage(outcome.page, cwd);
-			upsertIndexEntry(nextIndex, outcome.indexEntry);
-			touchedSlugs.push(outcome.slug);
+			okOutcomes.push({
+				slug: outcome.slug,
+				page: outcome.page,
+				indexEntry: outcome.indexEntry,
+				before: outcome.before,
+				refs: outcome.refs,
+			});
 		} else {
 			for (const ref of outcome.refs) failedRefs.add(ref);
 			topicFailures.push({ slug: outcome.slug, code: outcome.code });
 		}
 	}
+	// -- Guarded write phase ---------------------------------------------------
+	// `writeGuard` is the seam where every production caller (QueueWorker AND the
+	// `jolli compile` paths) hangs the per-write `vault-write.lock` (acquire →
+	// write → release) so a long ingest never holds the lock across the reconcile
+	// LLM phase and never blocks commit-summary generation. Default is identity for
+	// unit tests only.
+	//
+	// Optimistic concurrency: between the lock-free reconcile read and this guarded
+	// write a sync pull (or a concurrent drain) may have rewritten the page. We
+	// re-read it INSIDE the guard and compare to the `before` snapshot reconcile
+	// used; on divergence the reconciled body is stale, so we HOLD the source (skip
+	// the write) instead of clobbering the newer content. A writeGuard throw (lock
+	// not acquired in budget) is treated identically — hold this page, keep going.
+	// Both land as PAGE_WRITE_CONFLICT and feed `failedRefs`.
+	//
+	// Each page is persisted ATOMICALLY with its index entry, inside ONE guarded
+	// section. A separate index write (an independent later lock acquisition) could
+	// fail to acquire the lock AFTER the page persisted, orphaning the page — on
+	// disk but absent from the index — which the next drain re-routes as a brand-new
+	// topic, whose guarded re-read then finds the orphan page and holds the source
+	// forever (recoverable only by `--rebuild`). The index is re-read FRESH inside
+	// the guard (RMW) so a concurrent index change is merged, not clobbered. The
+	// processed-set is written last (also a fresh-read RMW) once every targeted page
+	// has persisted.
+	const writeGuard = opts?.writeGuard ?? ((fn: () => Promise<void>) => fn());
+	const written: typeof okOutcomes = [];
+	for (const o of okOutcomes) {
+		let held = false;
+		// Default to the benign conflict code; a real (non-busy) write fault below
+		// overrides it with PAGE_WRITE_ERROR so it isn't masked as contention.
+		let heldCode: IngestCode = INGEST_CODES.PAGE_WRITE_CONFLICT;
+		try {
+			await writeGuard(async () => {
+				const live = await readTopicPage(o.slug, cwd, readStorage);
+				if (!samePage(live, o.before)) {
+					log.warn(
+						"Topic %s changed under us during the lock-free LLM phase -- holding sources, not clobbering",
+						o.slug,
+					);
+					held = true;
+					return;
+				}
+				await saveTopicPage(o.page, cwd);
+				// Same guarded section as the page write: a page never lands without
+				// its index entry. RMW onto a fresh index read so a concurrent index
+				// change (sync pull / another drain) is preserved, not clobbered.
+				const freshIndex = await readTopicIndex(cwd, readStorage);
+				const mergedIndex: TopicIndex = { schemaVersion: 1, topics: [...freshIndex.topics] };
+				upsertIndexEntry(mergedIndex, o.indexEntry);
+				await saveTopicIndex(mergedIndex, cwd);
+			});
+		} catch (e) {
+			held = true;
+			if (e instanceof VaultWriteBusyError) {
+				// Lock busy in budget — benign, retried next drain (PAGE_WRITE_CONFLICT).
+				log.warn("Topic %s page write could not acquire vault-write.lock in budget -- holding sources", o.slug);
+			} else {
+				// A real I/O / serialisation / plumbing fault, NOT lock contention. Hold
+				// the source so the batch continues, but surface it as an ERROR (not a
+				// benign conflict) so it isn't silently retried forever and unflagged.
+				heldCode = INGEST_CODES.PAGE_WRITE_ERROR;
+				log.error("Topic %s page write FAILED (not lock contention) -- holding sources: %s", o.slug, errMsg(e));
+			}
+		}
+		if (held) {
+			for (const ref of o.refs) failedRefs.add(ref);
+			topicFailures.push({ slug: o.slug, code: heldCode });
+		} else {
+			written.push(o);
+		}
+	}
+	const touchedSlugs = written.map((o) => o.slug);
 
-	// Only persist the index when at least one page changed.
-	if (touchedSlugs.length > 0) await saveTopicIndex(nextIndex, cwd);
-
-	// -- Mark: a source is processed iff every topic it targeted succeeded -----
-	// A failed page adds ALL its assigned refs to `failedRefs`, so a source that
-	// targeted any failed page is held back; a source routed nowhere is simply done.
+	// -- Mark set: a source is processed iff every topic it targeted succeeded -
+	// A failed (or held) page adds ALL its assigned refs to `failedRefs`, so a source
+	// that targeted any such page is held back; a source routed nowhere is simply done.
+	// Computed AFTER the page writes so page-write conflicts are reflected here too.
 	const routedRefs = new Set<SourceRef>();
 	for (const [, assignment] of plan.assignments) for (const ref of assignment.refs) routedRefs.add(ref);
-
 	const succeeded: SourceRef[] = [];
 	for (const ref of batch) {
 		if (failedRefs.has(ref)) continue;
@@ -229,7 +328,27 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 		}
 		succeeded.push(ref); // either fully routed-and-reconciled, or routed nowhere (un-filed) -- both are "done"
 	}
-	if (succeeded.length > 0) await saveProcessedSet(addProcessed(processed, succeeded), cwd);
+
+	// Processed-set: its own guarded RMW, AFTER every page+index write. A guard
+	// failure here is hold-and-continue (NOT a batch abort): the sources stay
+	// pending and are retried next drain. Because each page was written atomically
+	// with its index entry above, that retry takes the UPDATE path (topic already
+	// indexed), the unchanged re-read passes, and the write self-heals — so a missed
+	// processed-set write never strands a source the way a missed index write would.
+	if (succeeded.length > 0) {
+		try {
+			await writeGuard(async () => {
+				const fresh = await readProcessedSet(cwd, readStorage);
+				await saveProcessedSet(addProcessed(fresh, succeeded), cwd);
+			});
+		} catch (e) {
+			log.error(
+				"Processed-set write could not acquire the write lock -- %d source(s) stay pending for the next drain: %s",
+				succeeded.length,
+				(e as Error).message,
+			);
+		}
+	}
 
 	return {
 		ingested: succeeded.length,
@@ -280,6 +399,23 @@ export async function drainIngest(
 			break;
 		}
 		if (r.done) break;
+		// No forward progress this batch: every targeted page was held (sustained
+		// vault-write.lock contention, a real write fault, or a deterministic
+		// reconcile failure). `ingested === 0` means no source was marked processed,
+		// so the next batch would re-route the IDENTICAL pending slice — re-billing
+		// the route + reconcile LLM phase for zero gain. Stop and let the next
+		// trigger (post-commit re-enqueue / successor worker / user re-run) retry.
+		// The iteration guard below remains a backstop for the pathological case
+		// where each batch DOES make progress yet never drains.
+		if (r.ingested === 0) {
+			outcome = r.topicFailures[0]?.code ?? INGEST_CODES.PAGE_WRITE_CONFLICT;
+			log.warn(
+				"drainIngest made no progress this batch (%d source(s) held, outcome=%s) -- stopping; next trigger retries",
+				r.pendingCount,
+				outcome,
+			);
+			break;
+		}
 	}
 	if (batches >= maxIterations) {
 		log.error("drainIngest hit iteration guard (%d) -- pipeline not draining, stopping", maxIterations);
@@ -305,6 +441,24 @@ export async function drainIngest(
 function formatIndexForRoute(index: TopicIndex): string {
 	if (index.topics.length === 0) return "(none yet)";
 	return index.topics.map((t) => `- ${t.stableSlug} -- ${t.title}: ${t.summary}`).join("\n");
+}
+
+/**
+ * Optimistic-concurrency check for the guarded page write: did the on-disk page
+ * change since reconcile read it? `lastUpdatedAt` is bumped on every reconcile so
+ * it alone flags a concurrent writer; `content` is compared too as a belt-and-braces
+ * guard. Both `null`/absent (a new topic still absent) counts as unchanged. A
+ * new topic that now exists, or an existing page whose body or timestamp moved,
+ * counts as changed. Under the identity writeGuard (unit tests only) nothing can
+ * change between read and write, so this is always `true` there; under the real
+ * per-write guard every production caller now passes, a concurrent commit-summary
+ * worker or sync pull CAN move the page, so this legitimately returns `false`.
+ */
+function samePage(a: TopicPage | null | undefined, b: TopicPage | null | undefined): boolean {
+	const aAbsent = a == null;
+	const bAbsent = b == null;
+	if (aAbsent || bAbsent) return aAbsent && bAbsent;
+	return a.lastUpdatedAt === b.lastUpdatedAt && a.content === b.content;
 }
 
 function upsertIndexEntry(index: TopicIndex, entry: TopicIndexEntry): void {

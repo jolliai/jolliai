@@ -1571,6 +1571,30 @@ describe("SidebarScriptBuilder", () => {
 			expect(window).toContain("'branch:openCommit'");
 		});
 
+		it("workspace commitWithMemory row click also posts kb:openMemory (not the silent commit slot)", () => {
+			// Regression: a workspace memory whose summary lives under a
+			// pre-amend hash (commit was amended) had its branch-tab row become
+			// unclickable — branch:openCommit → viewSummary → single-hash
+			// getSummary missed and silently returned. commitWithMemory rows
+			// must route to kb:openMemory regardless of foreign vs workspace so
+			// the cross-hash/cross-repo lookup (alias-resolving + "No summary
+			// found" feedback) runs instead of the silent commit-slot lookup.
+			const js = buildSidebarScript();
+			const ctxBlockIdx = js.indexOf(
+				"ctx === 'commit' || ctx === 'commitWithMemory'",
+			);
+			expect(ctxBlockIdx).toBeGreaterThan(-1);
+			const window = js.slice(ctxBlockIdx, ctxBlockIdx + 1200);
+			// The dispatch predicate must trigger kb:openMemory for
+			// commitWithMemory rows OR foreign mode — i.e. not gated on
+			// isViewingForeign() alone (which left workspace memory rows on the
+			// silent path).
+			expect(window).toMatch(/ctx === 'commitWithMemory' \|\| isViewingForeign\(\)/);
+			expect(window).toContain("'kb:openMemory'");
+			// Plain commit rows still keep the commit slot.
+			expect(window).toContain("'branch:openCommit'");
+		});
+
 		it("inline viewSummary button routes through viewMemorySummary in foreign mode", () => {
 			const js = buildSidebarScript();
 			// Find the inline-action `viewSummary` branch inside the Branch tab

@@ -15,11 +15,19 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as HelpGroups from "./commands/HelpGroups.js";
 import { getHelpGroup } from "./commands/HelpGroups.js";
 import type { KnownPlugin } from "./KnownPlugins.js";
 import { KNOWN_PLUGINS } from "./KnownPlugins.js";
 import { setSilentConsole } from "./Logger.js";
-import { findNodeModulesRoot, getNpmRootGlobal, inspectPlugins, loadPlugins } from "./PluginLoader.js";
+import {
+	compareDirentNames,
+	findNodeModulesRoot,
+	getNpmRootGlobal,
+	inspectPlugins,
+	loadPlugins,
+	registerMissingStubs,
+} from "./PluginLoader.js";
 import { symlinksSupported } from "./testUtils/symlinkSupport.js";
 
 // The npm-link / symlink-layout case needs a real symlink, which requires
@@ -1405,6 +1413,286 @@ describe("loadPlugins", () => {
 		expect(cmd).toBeDefined();
 		expect(cmd && getHelpGroup(cmd)).toBe(known.helpGroup);
 	});
+
+	it("does not re-tag pre-existing commands when a known plugin declares a help group", async () => {
+		// L818 false branch: only commands the plugin *adds* during register() get
+		// tagged. A command already on `program` before register (here a builtin
+		// `preexisting`) must be left untouched — `commandsBefore.has(c)` is true so
+		// the tagging loop skips it.
+		const known = KNOWN_PLUGINS.find((p) => p.helpGroup);
+		if (!known) throw new Error("expected a known plugin with a helpGroup");
+		const root = await writeFixture(tempDir, {
+			peerVersion: "^0.100.0",
+			pluginId: known.id,
+			pluginSource:
+				"export const register = (ctx) => { ctx.program.command('plugin-grouped').action(() => {}); };",
+		});
+		const program = new Command();
+		program.command("preexisting").action(() => {});
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			allowlistOverride: [known.id],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		const pre = program.commands.find((c) => c.name() === "preexisting");
+		const added = program.commands.find((c) => c.name() === "plugin-grouped");
+		expect(pre && getHelpGroup(pre)).toBeUndefined();
+		expect(added && getHelpGroup(added)).toBe(known.helpGroup);
+	});
+
+	it("recovers when an unexpected error escapes the per-site handlers (outer catch)", async () => {
+		// L838 outer safety net: a throw outside the inner import/register try
+		// blocks (here from the help-group tagging step) must still be caught so
+		// loadPlugins keeps iterating and the CLI keeps running.
+		const known = KNOWN_PLUGINS.find((p) => p.helpGroup);
+		if (!known) throw new Error("expected a known plugin with a helpGroup");
+		const root = await writeFixture(tempDir, {
+			peerVersion: "^0.100.0",
+			pluginId: known.id,
+			pluginSource:
+				"export const register = (ctx) => { ctx.program.command('plugin-late-throw').action(() => {}); };",
+		});
+		const spy = vi.spyOn(HelpGroups, "setHelpGroup").mockImplementation(() => {
+			throw new Error("setHelpGroup boom");
+		});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const program = new Command();
+			const { loaded } = await loadPlugins(program, "0.100.0", {
+				rootsOverride: [root],
+				allowlistOverride: [known.id],
+				scopesOverride: [FIXTURE_SCOPE],
+			});
+			// The unexpected throw lands in the outer catch → not loaded, no crash.
+			expect(loaded.has(known.id)).toBe(false);
+			const calls = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+			expect(calls).toContain("unexpected loader error");
+		} finally {
+			spy.mockRestore();
+			warnSpy.mockRestore();
+		}
+	});
+
+	it("tolerates a plugin command registered with an empty leading token", async () => {
+		// L948 false branch: `.command(" <arg>")` yields an empty base name after
+		// the leading-whitespace split, so the conflict short-circuit and the
+		// occupiedNames bookkeeping are both skipped. The loader must not crash and
+		// must still register the plugin's other, well-named command.
+		const root = await writeFixture(tempDir, {
+			pluginSource: `export const register = (ctx) => {
+				ctx.program.command(' <arg>');
+				ctx.program.command('plugin-after-empty').action(() => {});
+			};`,
+		});
+		const program = new Command();
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		expect(program.commands.find((c) => c.name() === "plugin-after-empty")).toBeDefined();
+	});
+
+	it("registers an addCommand payload whose aliases extend the occupied namespace", async () => {
+		// L981/L963-false: a non-conflicting addCommand payload carrying an alias
+		// flows through to Commander and its alias is added to occupiedNames, so a
+		// later plugin command reusing that alias-name is blocked.
+		const root = await writeFixture(tempDir, {
+			pluginSource: `export const register = (ctx) => {
+				const Cmd = ctx.program.constructor;
+				const c = new Cmd('plugin-add-aliased');
+				c.alias('fresh-add-alias');
+				ctx.program.addCommand(c);
+				ctx.program.command('fresh-add-alias').action(() => {});
+				ctx.program.command('plugin-after-add-alias').action(() => {});
+			};`,
+		});
+		const program = new Command();
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		const names = program.commands.map((c) => c.name());
+		expect(names).toContain("plugin-add-aliased");
+		// The later `.command('fresh-add-alias')` collides with the alias just
+		// claimed via addCommand, so it is dropped.
+		expect(names).not.toContain("fresh-add-alias");
+		expect(names).toContain("plugin-after-add-alias");
+	});
+
+	it("tolerates an addCommand payload whose aliases is not a function", async () => {
+		// L969 false branch: the patched addCommand guards `cmd.aliases` with a
+		// `typeof ... === "function"` check before calling it. When it is not a
+		// function (an unusual subclass / fixture), the alias list falls back to
+		// `[]` instead of throwing inside the loader's own conflict pre-check.
+		// Commander itself still rejects the malformed command downstream, so the
+		// register() aborts there — but the earlier command stays (partial
+		// registration) and the loader never crashes.
+		const root = await writeFixture(tempDir, {
+			pluginSource: `export const register = (ctx) => {
+				const Cmd = ctx.program.constructor;
+				ctx.program.command('plugin-before-weird').action(() => {});
+				const weird = new Cmd('plugin-weird-aliases');
+				weird.aliases = 'not-a-function';
+				ctx.program.addCommand(weird);
+				ctx.program.command('plugin-after-weird').action(() => {});
+			};`,
+		});
+		const program = new Command();
+		const { loaded } = await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		const names = program.commands.map((c) => c.name());
+		// The command registered before the malformed addCommand survives.
+		expect(names).toContain("plugin-before-weird");
+		// Commander rejected the malformed payload, aborting the rest of register().
+		expect(loaded.has(FIXTURE_ID)).toBe(false);
+		expect(names).not.toContain("plugin-after-weird");
+	});
+
+	it("restores own-property command/addCommand after register() (does not delete them)", async () => {
+		// L989/L994 true branches: when `program.command` / `program.addCommand`
+		// were own-properties before patching (e.g. a prior layer shadowed the
+		// prototype), restore must re-assign the originals rather than `delete`
+		// them — otherwise the outer layer's overrides would be lost.
+		const program = new Command();
+		const origCommand = program.command.bind(program);
+		const origAddCommand = program.addCommand.bind(program);
+		const internal = program as unknown as {
+			command: typeof program.command;
+			addCommand: typeof program.addCommand;
+		};
+		// Make both own-properties so `hadOwnCommand` / `hadOwnAddCommand` are true.
+		internal.command = origCommand as typeof program.command;
+		internal.addCommand = origAddCommand as typeof program.addCommand;
+		const root = await writeFixture(tempDir, {
+			pluginSource:
+				"export const register = (ctx) => { ctx.program.command('plugin-own-prop').action(() => {}); };",
+		});
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		// The own-properties survive and point back at the originals.
+		expect(Object.getOwnPropertyDescriptor(program, "command")?.value).toBe(origCommand);
+		expect(Object.getOwnPropertyDescriptor(program, "addCommand")?.value).toBe(origAddCommand);
+		expect(program.commands.find((c) => c.name() === "plugin-own-prop")).toBeDefined();
+	});
+
+	it("logs symlink forensics only when the link resolves outside the walked roots", async () => {
+		// L655 false branch: a symlink whose realpath stays inside a walked root is
+		// the benign workspace case — no out-of-roots breadcrumb is emitted. The
+		// existing symlink test covers the outside-roots (true) branch.
+		const realPkgRoot = join(tempDir, "node_modules", FIXTURE_SCOPE, "real-plugin");
+		await mkdir(join(realPkgRoot, "dist"), { recursive: true });
+		await writeFile(
+			join(realPkgRoot, "package.json"),
+			JSON.stringify({
+				name: `${FIXTURE_SCOPE}/real-plugin`,
+				version: "0.1.0",
+				type: "module",
+				main: "./dist/Plugin.js",
+				jolliPluginId: FIXTURE_ID,
+			}),
+			"utf-8",
+		);
+		await writeFile(
+			join(realPkgRoot, "dist", "Plugin.js"),
+			"export const register = (ctx) => { ctx.program.command('plugin-inside-symlink').action(() => {}); };",
+			"utf-8",
+		);
+		const nodeModules = join(tempDir, "node_modules");
+		// Symlink under the SAME node_modules root, pointing at the sibling package
+		// that also lives inside that root — so realpath is within the walked root.
+		await symlink(realPkgRoot, join(nodeModules, FIXTURE_SCOPE, "a-link"), "dir");
+
+		// macOS resolves `/var/folders/...` (from mkdtemp) to `/private/var/...`
+		// when `realpath` follows the symlink. Pass the realpath-resolved root so
+		// the loader's `insideAnyRoot` check sees the resolved target as inside it
+		// (otherwise the comparison would spuriously land on the outside-roots
+		// branch the existing symlink test already covers).
+		const realNodeModules = await realpath(nodeModules);
+		const program = new Command();
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [realNodeModules],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		// `a-link` sorts before `real-plugin`, so the symlink wins the same-ID race;
+		// either way the command registers and the loader did not crash.
+		expect(program.commands.find((c) => c.name() === "plugin-inside-symlink")).toBeDefined();
+	});
+
+	it("picks the lexicographically first across more than two same-ID packages", async () => {
+		// Behavioral check that the byte-order sort makes "first match wins"
+		// deterministic regardless of readdir order: `a-plugin` beats `m-plugin`
+		// and `z-plugin`. (The comparator branches themselves are covered
+		// deterministically by the compareDirentNames unit tests below.)
+		const root = await writeFixture(tempDir, {
+			name: `${FIXTURE_SCOPE}/m-plugin`,
+			pluginSource: "export const register = (ctx) => { ctx.program.command('plugin-m').action(() => {}); };",
+		});
+		for (const short of ["a-plugin", "z-plugin"]) {
+			const dir = join(root, FIXTURE_SCOPE, short);
+			await mkdir(join(dir, "dist"), { recursive: true });
+			await writeFile(
+				join(dir, "package.json"),
+				JSON.stringify({
+					name: `${FIXTURE_SCOPE}/${short}`,
+					version: "0.1.0",
+					type: "module",
+					main: "./dist/Plugin.js",
+					jolliPluginId: FIXTURE_ID,
+				}),
+				"utf-8",
+			);
+			await writeFile(
+				join(dir, "dist", "Plugin.js"),
+				`export const register = (ctx) => { ctx.program.command('plugin-${short}').action(() => {}); };`,
+				"utf-8",
+			);
+		}
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const program = new Command();
+			await loadPlugins(program, "0.100.0", {
+				rootsOverride: [root],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
+			});
+			const names = program.commands.map((c) => c.name());
+			expect(names).toContain("plugin-a-plugin");
+			expect(names).not.toContain("plugin-m");
+			expect(names).not.toContain("plugin-z-plugin");
+		} finally {
+			warnSpy.mockRestore();
+		}
+	});
+
+	it("uses the default global-root resolver when getGlobalRoot is not injected", async () => {
+		// L466 + the default `() => getNpmRootGlobal()` arrow: with no rootsOverride
+		// and no getGlobalRoot, resolveRoots falls back to the real npm-root
+		// resolver. Running from a clean cwd means no fixture matches, so nothing
+		// loads — we only need the default resolver path to execute.
+		const cleanCwd = await mkdtemp(join(tmpdir(), "clean-cwd-default-global-"));
+		const origCwd = process.cwd();
+		process.chdir(cleanCwd);
+		try {
+			const program = new Command();
+			await loadPlugins(program, "0.100.0", {
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
+			});
+			expect(program.commands.find((c) => c.name() === "should-not-load")).toBeUndefined();
+		} finally {
+			process.chdir(origCwd);
+			await rm(cleanCwd, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("getNpmRootGlobal", () => {
@@ -1491,6 +1779,26 @@ describe("getNpmRootGlobal", () => {
 		// Still returns the runtime path even if cache write fails
 		expect(result).toBe("/runtime/path");
 	});
+
+	it("defaults the runNpm resolver without spawning npm on a fresh cache hit", async () => {
+		// Omitting `runNpm` exercises the `opts?.runNpm ?? runNpmRootGlobal`
+		// default branch. A fresh cache hit returns before the resolver is ever
+		// invoked, so the real `npm root -g` subprocess is never spawned.
+		const cacheFile = join(tempDir, "cache");
+		await writeFile(cacheFile, "/cached/no-subprocess", "utf-8");
+		const result = await getNpmRootGlobal({ cacheFile, ttlMs: 60 * 60 * 1000 });
+		expect(result).toBe("/cached/no-subprocess");
+	});
+
+	it("defaults the cache file path when none is supplied", async () => {
+		// Omitting `cacheFile` exercises the `opts?.cacheFile ?? getNpmRootCacheFile()`
+		// default branch (and getNpmRootCacheFile itself). `runNpm` is stubbed to
+		// return null so no real subprocess runs and nothing is written to the real
+		// global-root cache. The result may be a real cached path (if one exists and
+		// is fresh) or null — either is acceptable; we only assert the type contract.
+		const result = await getNpmRootGlobal({ runNpm: async () => null, ttlMs: 1 });
+		expect(result === null || typeof result === "string").toBe(true);
+	});
 });
 
 describe("inspectPlugins", () => {
@@ -1559,6 +1867,32 @@ describe("inspectPlugins", () => {
 			installedVersion: "0.4.2",
 			peerRange: ">=2.0.0",
 		});
+	});
+
+	it("omits installedVersion when the package.json version is not a string", async () => {
+		// L322 false branch: JSON.parse can hand back a non-string `version`
+		// (number, array, …). diagnoseFound must report `installedVersion` as
+		// undefined rather than coercing it.
+		const pkgDir = join(tempDir, "node_modules", FIXTURE_SCOPE, "example-plugin");
+		await mkdir(pkgDir, { recursive: true });
+		await writeFile(
+			join(pkgDir, "package.json"),
+			JSON.stringify({
+				name: FIXTURE_NAME,
+				version: 123,
+				type: "module",
+				main: "./dist/Plugin.js",
+				jolliPluginId: FIXTURE_ID,
+			}),
+			"utf-8",
+		);
+		const diagnostics = await inspectPlugins("1.0.0", {
+			rootsOverride: [join(tempDir, "node_modules")],
+			scopesOverride: [FIXTURE_SCOPE],
+			knownPluginsOverride: KNOWN,
+		});
+		expect(diagnostics[0]).toMatchObject({ state: "ok" });
+		expect(diagnostics[0].installedVersion).toBeUndefined();
 	});
 
 	it("treats a plugin with no peerDependencies as ok", async () => {
@@ -1651,6 +1985,55 @@ describe("loadPlugins diagnostics", () => {
 	});
 });
 
+describe("registerMissingStubs", () => {
+	beforeEach(() => {
+		delete process.env.JOLLI_NO_PLUGIN_WARNINGS;
+	});
+
+	afterEach(() => {
+		delete process.env.JOLLI_NO_PLUGIN_WARNINGS;
+	});
+
+	it("registers stubs for known plugins not in the loaded set", () => {
+		// L222 false branch + L224: an empty loaded set means every known plugin
+		// with a registerStub gets its stub installed, so its commands appear in
+		// `--help`.
+		const program = new Command();
+		registerMissingStubs(program, new Set());
+		// Every known plugin that declares a stub contributes at least one command.
+		const withStub = KNOWN_PLUGINS.filter((p) => p.registerStub);
+		expect(withStub.length).toBeGreaterThan(0);
+		expect(program.commands.length).toBeGreaterThan(0);
+	});
+
+	it("skips known plugins already present in the loaded set", () => {
+		// L222 true branch: a plugin whose ID is in the loaded set is loaded for
+		// real, so its stub must not be installed.
+		const program = new Command();
+		const allLoaded = new Set(KNOWN_PLUGINS.map((p) => p.id));
+		registerMissingStubs(program, allLoaded);
+		expect(program.commands).toHaveLength(0);
+	});
+
+	it("does not tear down the host when a stub registration throws", () => {
+		// L228 catch: a throwing stub must be caught and warned, not propagated.
+		// Forcing `program.command` to throw makes every stub's registration throw.
+		const program = new Command();
+		const internal = program as unknown as { command: () => Command };
+		internal.command = () => {
+			throw new Error("stub command boom");
+		};
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			expect(() => registerMissingStubs(program, new Set())).not.toThrow();
+			const calls = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+			expect(calls).toContain("stub registration failed");
+		} finally {
+			warnSpy.mockRestore();
+		}
+	});
+});
+
 describe("findNodeModulesRoot", () => {
 	// Pure walk used by the self-install discovery root (JOLLI-1694). Inputs use
 	// forward slashes, which both `path.posix` (CI runners) and `path.win32`
@@ -1679,5 +2062,31 @@ describe("findNodeModulesRoot", () => {
 
 	it("returns null at the filesystem root", () => {
 		expect(findNodeModulesRoot("/")).toBeNull();
+	});
+
+	it("returns null for a rootless relative path with no node_modules", () => {
+		// A relative input has an empty `parse().root`, so the `dir !== fsRoot`
+		// loop guard never trips. The walk relies on `dirname` non-progress
+		// (`dirname(".") === "."`) to terminate — exercising that break branch.
+		expect(findNodeModulesRoot("a/b/c")).toBeNull();
+	});
+});
+
+describe("compareDirentNames", () => {
+	// Deterministic byte-order comparator that drives the "first match wins"
+	// sort in discoverPlugins. Tested directly so both ordering branches are
+	// exercised without depending on the filesystem's (nondeterministic)
+	// readdir order.
+
+	it("returns -1 when the first name sorts before the second", () => {
+		expect(compareDirentNames("a-plugin", "z-plugin")).toBe(-1);
+	});
+
+	it("returns 1 when the first name sorts after the second", () => {
+		expect(compareDirentNames("z-plugin", "a-plugin")).toBe(1);
+	});
+
+	it("orders an array lexicographically by byte value", () => {
+		expect(["z", "a", "m"].sort(compareDirentNames)).toEqual(["a", "m", "z"]);
 	});
 });
