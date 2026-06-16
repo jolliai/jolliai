@@ -79,6 +79,11 @@
                     class="ai.jolli.jollimemory.actions.AddNoteAction"
                     text="Add Note"
                     description="Add a markdown file or text snippet note"/>
+            <action id="JolliMemory.SelectAllReferences"
+                    class="ai.jolli.jollimemory.actions.SelectAllReferencesAction"
+                    text="Select/Deselect All References"
+                    description="Toggle selection of all references"
+                    icon="AllIcons.Actions.Selectall"/>
             <action id="JolliMemory.RefreshPlans"
                     class="ai.jolli.jollimemory.actions.RefreshPlansAction"
                     text="Refresh"

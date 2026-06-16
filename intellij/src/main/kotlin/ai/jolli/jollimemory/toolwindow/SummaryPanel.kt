@@ -13,6 +13,7 @@ import ai.jolli.jollimemory.core.SummaryStore
 import ai.jolli.jollimemory.core.SummaryTree
 import ai.jolli.jollimemory.core.TopicUpdates
 import ai.jolli.jollimemory.core.TranscriptEntry
+import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliApiClient
 import ai.jolli.jollimemory.services.JolliMemoryService
 import ai.jolli.jollimemory.services.PlanService
@@ -217,7 +218,7 @@ class SummaryPanel(
         "pushToJolli", "editTopic", "deleteTopic", "generateE2eTest", "editE2eTest",
         "deleteE2eTest", "savePlan", "removePlan", "translatePlan", "associatePlan",
         "createPrDirect", "createPrWithE2e", "createPr", "updatePr", "saveAllTranscripts", "deleteAllTranscripts",
-        "generateRecap", "editRecap",
+        "generateRecap", "editRecap", "saveReferenceEdit", "removeReference",
     )
 
     private fun dispatchWebviewMessage(json: JsonObject) {
@@ -252,6 +253,11 @@ class SummaryPanel(
                 "deleteAllTranscripts" -> handleDeleteAllTranscripts()
                 "generateRecap" -> handleGenerateRecap()
                 "editRecap" -> handleEditRecap(json.get("recap").asString)
+                "previewReference" -> handlePreviewReference(json.get("archivedKey").asString, json.get("source").asString, json.get("nativeId")?.asString ?: "", json.get("title")?.asString ?: "")
+                "openReferenceExternal" -> handleOpenReferenceExternal(json.get("url").asString)
+                "loadReferenceContent" -> handleLoadReferenceContent(json.get("archivedKey").asString, json.get("source").asString)
+                "saveReferenceEdit" -> handleSaveReferenceEdit(json.get("archivedKey").asString, json.get("source").asString, json.get("content").asString)
+                "removeReference" -> handleRemoveReference(json.get("archivedKey").asString, json.get("source").asString, json.get("nativeId")?.asString ?: "", json.get("title")?.asString ?: "")
                 else -> LOG.debug("Unknown webview command: $command")
             }
         } catch (e: Exception) {
@@ -647,6 +653,92 @@ class SummaryPanel(
                 store.storeSummary(updatedSummary, force = true)
                 currentSummary = updatedSummary
                 PlanService.unassociatePlanFromCommit(slug, cwd)
+                ApplicationManager.getApplication().invokeLater { refreshHtml() }
+            }
+        }
+    }
+
+    // ── Reference handlers ──────────────────────────────────────────────
+
+    private fun parseSourceId(source: String): SourceId? {
+        return try { SourceId.valueOf(source) } catch (_: Exception) { null }
+    }
+
+    private fun handlePreviewReference(archivedKey: String, source: String, nativeId: String, title: String) {
+        val sourceId = parseSourceId(source) ?: return
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val content = store.readReferenceFromBranch(sourceId, archivedKey)
+            if (content == null) {
+                ApplicationManager.getApplication().invokeLater {
+                    Messages.showErrorDialog(project, "Could not read reference \"$nativeId\" from storage.", "Load Reference Failed")
+                }
+                return@executeOnPooledThread
+            }
+            ApplicationManager.getApplication().invokeLater {
+                val displayTitle = "$nativeId — $title"
+                val tmpFile = java.io.File.createTempFile("jm-ref-", ".md")
+                tmpFile.writeText(content)
+                tmpFile.deleteOnExit()
+                val vf = com.intellij.openapi.vfs.LocalFileSystem.getInstance().refreshAndFindFileByIoFile(tmpFile)
+                if (vf != null) {
+                    com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).openFile(vf, true)
+                }
+            }
+        }
+    }
+
+    private fun handleOpenReferenceExternal(url: String) {
+        try {
+            val uri = java.net.URI(url)
+            val scheme = uri.scheme?.lowercase()
+            if (scheme != "http" && scheme != "https") {
+                ApplicationManager.getApplication().invokeLater {
+                    Messages.showWarningDialog(project, "Only http(s) URLs can be opened.", "Invalid URL")
+                }
+                return
+            }
+            BrowserUtil.browse(uri)
+        } catch (e: Exception) {
+            ApplicationManager.getApplication().invokeLater {
+                Messages.showErrorDialog(project, "Could not open URL: ${e.message}", "Error")
+            }
+        }
+    }
+
+    private fun handleLoadReferenceContent(archivedKey: String, source: String) {
+        val sourceId = parseSourceId(source) ?: return
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val content = store.readReferenceFromBranch(sourceId, archivedKey)
+            ApplicationManager.getApplication().invokeLater {
+                if (content == null) {
+                    Messages.showErrorDialog(project, "Could not read reference from storage.", "Load Reference Failed")
+                } else {
+                    postToWebview("referenceContentLoaded", mapOf("archivedKey" to archivedKey, "source" to source, "content" to content))
+                }
+            }
+        }
+    }
+
+    private fun handleSaveReferenceEdit(archivedKey: String, source: String, content: String) {
+        val sourceId = parseSourceId(source) ?: return
+        ApplicationManager.getApplication().executeOnPooledThread {
+            store.writeReferenceFromBranch(sourceId, archivedKey, content, "Edit reference $archivedKey")
+            ApplicationManager.getApplication().invokeLater {
+                postToWebview("referenceSaved", mapOf("archivedKey" to archivedKey, "source" to source))
+            }
+        }
+    }
+
+    private fun handleRemoveReference(archivedKey: String, source: String, nativeId: String, title: String) {
+        ApplicationManager.getApplication().invokeLater {
+            val displayName = if (nativeId.isNotBlank()) "$nativeId — $title" else title
+            val choice = Messages.showYesNoDialog(project, "The reference will no longer be associated with this commit.", "Remove reference \"$displayName\"?", "Remove", "Cancel", Messages.getWarningIcon())
+            if (choice != Messages.YES) return@invokeLater
+            ApplicationManager.getApplication().executeOnPooledThread {
+                val updatedRefs = (currentSummary.references ?: emptyList()).filter { it.archivedKey != archivedKey }
+                val updatedSummary = currentSummary.copy(references = updatedRefs.takeIf { it.isNotEmpty() })
+                store.storeSummary(updatedSummary, force = true)
+                currentSummary = updatedSummary
                 ApplicationManager.getApplication().invokeLater { refreshHtml() }
             }
         }

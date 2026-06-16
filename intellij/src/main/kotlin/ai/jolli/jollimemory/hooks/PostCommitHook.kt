@@ -2,6 +2,7 @@ package ai.jolli.jollimemory.hooks
 
 import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.core.*
+import ai.jolli.jollimemory.core.references.PromptRenderer
 import ai.jolli.jollimemory.core.references.ReferenceCommitRef
 import ai.jolli.jollimemory.core.references.ReferenceStore
 import ai.jolli.jollimemory.core.references.SourceId
@@ -268,6 +269,17 @@ object PostCommitHook {
                 return
             }
 
+            // 7b. Assemble reference blocks for prompt injection
+            val registry = SessionTracker.loadPlansRegistry(cwd)
+            val exclusions = CommitSelectionStore.readExclusions(cwd)
+            val referenceBlocks = PromptRenderer.assembleReferenceBlocks(
+                registry.references ?: emptyMap(),
+                exclusions.references,
+            )
+            if (referenceBlocks.isNotEmpty()) {
+                log.info("Reference blocks assembled: %d chars", referenceBlocks.length)
+            }
+
             log.info("Step 8: Calling LLM for summary generation (conversation=%d chars)", conversation.length)
             val summaryResult = Summarizer.generateSummary(Summarizer.SummarizeParams(
                 conversation = conversation,
@@ -280,6 +292,7 @@ object PostCommitHook {
                 model = config.model,
                 jolliApiKey = config.jolliApiKey,
                 aiProvider = config.aiProvider,
+                referenceBlocks = referenceBlocks.takeIf { it.isNotBlank() },
             ))
             log.info("Step 8: LLM call completed, topics=%d, recap=%s", summaryResult.topics?.size ?: 0, if (summaryResult.recap != null) "${summaryResult.recap!!.length} chars" else "null")
 

@@ -1,26 +1,71 @@
 package ai.jolli.jollimemory.core.references
 
+import com.google.gson.Gson
+import com.google.gson.JsonArray
+import com.google.gson.JsonObject
 import io.kotest.matchers.shouldBe
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 
 class CodexEnvelopeParserTest {
 
+	private val gson = Gson()
 	private val adapters = listOf(LinearAdapter, JiraAdapter, GitHubAdapter, NotionAdapter)
 
-	private fun fnCall(namespace: String, name: String, callId: String, timestamp: String = "2024-01-01T00:00:00Z"): String =
-		"""{"timestamp":"$timestamp","payload":{"type":"function_call","call_id":"$callId","namespace":"$namespace","name":"$name"}}"""
+	private fun fnCall(namespace: String, name: String, callId: String, timestamp: String = "2024-01-01T00:00:00Z"): String {
+		val payload = JsonObject().apply {
+			addProperty("type", "function_call")
+			addProperty("call_id", callId)
+			addProperty("namespace", namespace)
+			addProperty("name", name)
+		}
+		val root = JsonObject().apply {
+			addProperty("timestamp", timestamp)
+			add("payload", payload)
+		}
+		return gson.toJson(root)
+	}
 
 	private fun fnOutput(callId: String, inner: String, timestamp: String = "2024-01-01T00:00:01Z", prefix: String = ""): String {
-		val wrapped = """[{"type":"text","text":"${inner.replace("\"", "\\\"")}"}]"""
-		val output = if (prefix.isEmpty()) wrapped else "$prefix\nOutput:\n$wrapped"
-		val escaped = output.replace("\"", "\\\"").replace("\n", "\\n")
-		return """{"timestamp":"$timestamp","payload":{"type":"function_call_output","call_id":"$callId","output":"$escaped"}}"""
+		val textObj = JsonObject().apply {
+			addProperty("type", "text")
+			addProperty("text", inner)
+		}
+		val content = JsonArray().apply { add(textObj) }
+		val outputStr = gson.toJson(content)
+		val fullOutput = if (prefix.isEmpty()) outputStr else "$prefix\nOutput:\n$outputStr"
+		val payload = JsonObject().apply {
+			addProperty("type", "function_call_output")
+			addProperty("call_id", callId)
+			addProperty("output", fullOutput)
+		}
+		val root = JsonObject().apply {
+			addProperty("timestamp", timestamp)
+			add("payload", payload)
+		}
+		return gson.toJson(root)
 	}
 
 	private fun toolCallEnd(tool: String, callId: String?, inner: String, timestamp: String = "2024-01-01T00:00:01Z"): String {
-		val callIdField = if (callId != null) """"call_id":"$callId",""" else ""
-		return """{"timestamp":"$timestamp","payload":{"type":"mcp_tool_call_end",$callIdField"invocation":{"tool":"$tool"},"result":{"Ok":{"content":[{"type":"text","text":"${inner.replace("\"", "\\\"")}"}]}}}}"""
+		val textObj = JsonObject().apply {
+			addProperty("type", "text")
+			addProperty("text", inner)
+		}
+		val content = JsonArray().apply { add(textObj) }
+		val ok = JsonObject().apply { add("content", content) }
+		val result = JsonObject().apply { add("Ok", ok) }
+		val invocation = JsonObject().apply { addProperty("tool", tool) }
+		val payload = JsonObject().apply {
+			addProperty("type", "mcp_tool_call_end")
+			if (callId != null) addProperty("call_id", callId)
+			add("invocation", invocation)
+			add("result", result)
+		}
+		val root = JsonObject().apply {
+			addProperty("timestamp", timestamp)
+			add("payload", payload)
+		}
+		return gson.toJson(root)
 	}
 
 	private val LINEAR = """{"id":"PROJ-7","title":"Test","url":"https://linear.app/x/issue/PROJ-7","status":"Todo"}"""
@@ -91,11 +136,26 @@ class CodexEnvelopeParserTest {
 
 	@Nested
 	inner class ShellCommands {
+		private fun shellFnCall(callId: String, command: String): String {
+			val argsObj = JsonObject().apply { addProperty("command", command) }
+			val payload = JsonObject().apply {
+				addProperty("type", "function_call")
+				addProperty("call_id", callId)
+				addProperty("name", "shell_command")
+				addProperty("arguments", gson.toJson(argsObj))
+			}
+			val root = JsonObject().apply {
+				addProperty("timestamp", "2024-01-01T00:00:00Z")
+				add("payload", payload)
+			}
+			return gson.toJson(root)
+		}
+
 		@Test
 		fun `pairs shell_command with output`() {
-			val shellCall = """{"timestamp":"2024-01-01T00:00:00Z","payload":{"type":"function_call","call_id":"s1","name":"shell_command","arguments":"{\"command\":\"gh issue view 42 --repo o/r --json title,body\"}"}}"""
 			val ghPayload = """{"number":42,"title":"Fix","html_url":"https://github.com/o/r/issues/42","state":"open","repository":{"full_name":"o/r"}}"""
-			val shellOutput = """{"timestamp":"2024-01-01T00:00:01Z","payload":{"type":"function_call_output","call_id":"s1","output":"Exit code: 0\nOutput:\n[{\"type\":\"text\",\"text\":\"${ghPayload.replace("\"", "\\\"")}\"}]"}}"""
+			val shellCall = shellFnCall("s1", "gh issue view 42 --repo o/r --json title,body")
+			val shellOutput = fnOutput("s1", ghPayload, prefix = "Exit code: 0")
 			val lines = listOf(shellCall, shellOutput)
 			val result = CodexEnvelopeParser.parse(lines, ExtractOptions(), adapters)
 			result.results.size shouldBe 1
@@ -104,9 +164,17 @@ class CodexEnvelopeParserTest {
 
 		@Test
 		fun `skips non-zero exit code`() {
-			val shellCall = """{"timestamp":"2024-01-01T00:00:00Z","payload":{"type":"function_call","call_id":"s1","name":"shell_command","arguments":"{\"command\":\"gh issue view 42 --repo o/r --json title\"}"}}"""
-			val shellOutput = """{"timestamp":"2024-01-01T00:00:01Z","payload":{"type":"function_call_output","call_id":"s1","output":"Exit code: 1\nOutput:\nerror"}}"""
-			val lines = listOf(shellCall, shellOutput)
+			val shellCall = shellFnCall("s1", "gh issue view 42 --repo o/r --json title")
+			val payload = JsonObject().apply {
+				addProperty("type", "function_call_output")
+				addProperty("call_id", "s1")
+				addProperty("output", "Exit code: 1\nOutput:\nerror")
+			}
+			val root = JsonObject().apply {
+				addProperty("timestamp", "2024-01-01T00:00:01Z")
+				add("payload", payload)
+			}
+			val lines = listOf(shellCall, gson.toJson(root))
 			val result = CodexEnvelopeParser.parse(lines, ExtractOptions(), adapters)
 			result.results.size shouldBe 0
 		}
