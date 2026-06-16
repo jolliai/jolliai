@@ -61,8 +61,15 @@ Old content
 
             val content = skillFile.readText()
             content shouldContain "Every commit deserves a Memory"
-            // Should have the new version (dev in test context), not the old one
-            content shouldContain "jolli-skill-version: dev"
+            // Should have the current version (resolved from the baked-in
+            // /jollimemory-plugin-version.txt resource, the same source
+            // SkillInstaller reads), not the old one. Derive the expected value
+            // the same way so this stays correct across version bumps.
+            val expectedVersion = SkillInstaller::class.java
+                .getResourceAsStream("/jollimemory-plugin-version.txt")
+                ?.bufferedReader(Charsets.UTF_8)?.use { it.readText().trim() }
+                ?.takeUnless { it.isEmpty() || it.contains("\${") } ?: "dev"
+            content shouldContain "jolli-skill-version: $expectedVersion"
         }
 
         @Test
