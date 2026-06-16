@@ -2,6 +2,9 @@ package ai.jolli.jollimemory.hooks
 
 import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.core.*
+import ai.jolli.jollimemory.core.references.ReferenceCommitRef
+import ai.jolli.jollimemory.core.references.ReferenceStore
+import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.PlanService
 import ai.jolli.jollimemory.sync.VaultWriteLock
 import ai.jolli.jollimemory.sync.VaultWriteLockMode
@@ -330,6 +333,51 @@ object PostCommitHook {
                 log.info("Plan progress: evaluated %d/%d plan(s)", planProgressArtifacts.size, planRefs.size)
             }
 
+            // 8c. Detect uncommitted references, archive to orphan branch
+            val referenceCommitRefs = mutableListOf<ReferenceCommitRef>()
+            val referenceFilesToStore = mutableListOf<FileWrite>()
+            val referenceCommitted = mutableListOf<Triple<String, String, String>>() // mapKey, sourcePath, updatedAt
+
+            val uncommittedRefResult = detectUncommittedReferences(cwd)
+            if (uncommittedRefResult.isNotEmpty()) {
+                log.info("Detected %d uncommitted reference(s)", uncommittedRefResult.size)
+                val shortHash = commitInfo.hash.substring(0, 8)
+
+                for ((mapKey, entry) in uncommittedRefResult) {
+                    val rawContent = ReferenceStore.readMarkdownFileContent(entry.sourcePath)
+                    if (rawContent == null) {
+                        log.warn("Reference archive: cannot read markdown for %s at %s — skipping", mapKey, entry.sourcePath)
+                        continue
+                    }
+
+                    val fullRef = ReferenceStore.readReferenceMarkdown(entry.sourcePath)
+                    if (fullRef == null) {
+                        log.warn("Reference archive: %s unparseable — skipping", mapKey)
+                        continue
+                    }
+
+                    val archivedKey = "$mapKey-$shortHash"
+                    val source = entry.source
+                    val sanitizedBareKey = ReferenceStore.sanitizeNativeIdForPath(source, archivedKey.removePrefix("${source.name}:"))
+                    val orphanPath = "references/${source.name}/$sanitizedBareKey.md"
+
+                    referenceCommitRefs.add(ReferenceCommitRef(
+                        archivedKey = archivedKey,
+                        source = source,
+                        nativeId = entry.nativeId,
+                        title = entry.title,
+                        url = entry.url,
+                        fields = fullRef.fields?.takeIf { it.isNotEmpty() },
+                        referencedAt = fullRef.referencedAt,
+                        sourceToolName = entry.sourceToolName,
+                    ))
+                    referenceFilesToStore.add(FileWrite(orphanPath, rawContent))
+                    referenceCommitted.add(Triple(mapKey, entry.sourcePath, entry.updatedAt))
+
+                    log.info("Reference snapshot captured: %s → %s", mapKey, archivedKey)
+                }
+            }
+
             // 9. Build and store CommitSummary
             val branch = git.getCurrentBranch() ?: "unknown"
             val commitType = detectCommitType()
@@ -351,6 +399,7 @@ object PostCommitHook {
                 ticketId = summaryResult.ticketId,
                 recap = summaryResult.recap,
                 plans = planRefs.takeIf { it.isNotEmpty() },
+                references = referenceCommitRefs.takeIf { it.isNotEmpty() },
             )
 
             // Store transcript data alongside summary
@@ -362,7 +411,17 @@ object PostCommitHook {
             log.info("StoredTranscript: %d session(s) total", storedSessions.size)
 
             log.info("Step 9: Calling store.storeSummary for %s (branch=%s)", commitInfo.hash.take(8), branch)
-            store.storeSummary(summary, force = force, transcript = storedTranscript, planProgress = planProgressArtifacts.takeIf { it.isNotEmpty() })
+            store.storeSummary(
+                summary, force = force, transcript = storedTranscript,
+                planProgress = planProgressArtifacts.takeIf { it.isNotEmpty() },
+                referenceFiles = referenceFilesToStore.takeIf { it.isNotEmpty() },
+            )
+
+            // Finalize: delete archived references from plans.json + local markdown
+            // (only if updatedAt matches — a re-upsert during this window preserves the fresh row)
+            if (referenceCommitted.isNotEmpty()) {
+                finalizeReferenceArchive(referenceCommitted, cwd)
+            }
             log.info("=== PostCommitHook worker finished successfully for %s ===", commitInfo.hash.take(8))
 
         } finally {
@@ -501,6 +560,45 @@ object PostCommitHook {
             }
         }
         return DiffStats(files, ins, del)
+    }
+
+    /** Returns all entries from plans.json.references (every entry is uncommitted). */
+    private fun detectUncommittedReferences(cwd: String): Map<String, ai.jolli.jollimemory.core.references.ReferenceEntry> {
+        val registry = SessionTracker.loadPlansRegistry(cwd)
+        return registry.references ?: emptyMap()
+    }
+
+    /**
+     * Deletes archived references from plans.json + local markdown.
+     * Only deletes if updatedAt still matches (a re-upsert during this window
+     * bumps updatedAt, so the fresh row is preserved).
+     */
+    private fun finalizeReferenceArchive(committed: List<Triple<String, String, String>>, cwd: String) {
+        val freshRegistry = SessionTracker.loadPlansRegistry(cwd)
+        val freshRefs = (freshRegistry.references ?: emptyMap()).toMutableMap()
+        val toDeleteMarkdown = mutableListOf<String>()
+
+        for ((mapKey, sourcePath, updatedAt) in committed) {
+            val fresh = freshRefs[mapKey]
+            if (fresh != null && fresh.updatedAt != updatedAt) {
+                log.info("Reference finalize: %s re-upserted since capture — keeping active row", mapKey)
+                continue
+            }
+            freshRefs.remove(mapKey)
+            toDeleteMarkdown.add(sourcePath)
+        }
+
+        if (toDeleteMarkdown.isNotEmpty() || freshRefs.size != (freshRegistry.references?.size ?: 0)) {
+            val updated = freshRegistry.copy(
+                references = freshRefs.takeIf { it.isNotEmpty() },
+            )
+            SessionTracker.savePlansRegistry(updated, cwd)
+        }
+
+        for (path in toDeleteMarkdown) {
+            ReferenceStore.deleteReferenceMarkdown(path)
+        }
+        log.info("Reference finalize: deleted %d of %d ref(s)", toDeleteMarkdown.size, committed.size)
     }
 
     /** Get the path to this JAR file (for spawning the worker). */

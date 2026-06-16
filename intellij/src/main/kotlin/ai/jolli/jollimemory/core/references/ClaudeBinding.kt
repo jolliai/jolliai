@@ -33,8 +33,10 @@ object ClaudeBinding {
 
 	private val RULES = listOf(
 		Rule("mcp__github__", SourceId.github),
+		Rule("mcp__claude_ai_GitHub__", SourceId.github),
 		Rule("mcp__claude_ai_Atlassian__", SourceId.jira),
 		Rule("mcp__linear__", SourceId.linear),
+		Rule("mcp__claude_ai_Linear__", SourceId.linear),
 		Rule("mcp__claude_ai_Notion__", SourceId.notion, accept = { it.endsWith("notion-fetch") }),
 	)
 

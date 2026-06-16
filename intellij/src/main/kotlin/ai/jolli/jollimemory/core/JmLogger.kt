@@ -75,6 +75,14 @@ object JmLogger {
 
     fun create(module: String): ModuleLogger = ModuleLogger(module)
 
+    /** Drain the write queue synchronously. Call before JVM exit in CLI hooks. */
+    fun flush() {
+        while (true) {
+            val line = writeQueue.poll() ?: break
+            writeToFile(line)
+        }
+    }
+
     private fun shouldLog(level: LogLevel, module: String): Boolean {
         val threshold = moduleOverrides[module]?.let { LogLevel.valueOf(it.name) } ?: globalLogLevel
         return level.priority >= threshold.priority

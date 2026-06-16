@@ -39,5 +39,7 @@ object HookRunner {
                 System.exit(1)
             }
         }
+
+        ai.jolli.jollimemory.core.JmLogger.flush()
     }
 }
