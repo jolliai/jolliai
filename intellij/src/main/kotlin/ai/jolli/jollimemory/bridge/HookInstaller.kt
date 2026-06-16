@@ -463,16 +463,17 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
     private fun findPluginLibJar(): File? {
         val searchLog = StringBuilder()
         return try {
-            // Use IntelliJ Plugin API to find our plugin's installation path.
-            // This will throw NoClassDefFoundError when running from the hooks JAR
-            // (outside IntelliJ), which is caught below.
-            val pluginId = com.intellij.openapi.extensions.PluginId.getId("ai.jolli.jollimemory")
-            searchLog.appendLine("pluginId=$pluginId")
+            // Derive the plugin install path from this class's code-source location
+            // instead of the IntelliJ `PluginManager` API (which is `@ApiStatus.Internal`
+            // and tripped the Marketplace Plugin Verifier). In an installed plugin this
+            // class is loaded from `<pluginPath>/lib/<jar>.jar`, so the plugin root is two
+            // levels up. Pure JVM API — also resolves to null cleanly when running from
+            // the hooks JAR outside the IDE, which the null-guards below handle.
+            val codeSource = File(javaClass.protectionDomain.codeSource.location.toURI())
+            searchLog.appendLine("codeSource=$codeSource")
 
-            val plugin = com.intellij.ide.plugins.PluginManager.getPlugins().firstOrNull { it.pluginId == pluginId }
-            searchLog.appendLine("plugin=${plugin?.name} version=${plugin?.version}")
-
-            val pluginPath = plugin?.pluginPath
+            // <pluginPath>/lib/<jar>.jar -> parent (lib/) -> parent (pluginPath)
+            val pluginPath = codeSource.parentFile?.parentFile?.toPath()
             searchLog.appendLine("pluginPath=$pluginPath")
 
             if (pluginPath != null) {

@@ -98,22 +98,31 @@ class SkillInstaller(private val projectDir: String) {
     }
 
     /**
-     * Resolves the plugin version.
+     * Resolves the plugin version from the classpath resource baked in by
+     * `processResources` (see build.gradle.kts) — the same mechanism
+     * [ai.jolli.jollimemory.services.JolliApiClient] uses. Reading a resource
+     * avoids the IntelliJ `PluginManager` API entirely (it is `@ApiStatus.Internal`
+     * and tripped the Marketplace Plugin Verifier), and works identically in the
+     * IDE, the hooks JAR, and tests.
      *
-     * Tries IntelliJ's PluginManager API first (runtime in IDE), then falls
-     * back to a hardcoded version for non-IDE contexts (tests, hooks JAR).
+     * Falls back to [FALLBACK_VERSION] when the resource is missing or still
+     * carries the un-expanded Gradle token (tests run without `processResources`).
      */
     private fun resolvePluginVersion(): String {
-        return try {
-            val pluginId = com.intellij.openapi.extensions.PluginId.getId("ai.jolli.jollimemory")
-            val plugin = com.intellij.ide.plugins.PluginManager.getPlugins().firstOrNull { it.pluginId == pluginId }
-            plugin?.version ?: FALLBACK_VERSION
+        val raw = try {
+            javaClass.getResourceAsStream(VERSION_RESOURCE_PATH)
+                ?.bufferedReader(Charsets.UTF_8)
+                ?.use { it.readText() }
         } catch (_: Throwable) {
-            // NoClassDefFoundError when running outside IntelliJ (tests, hooks JAR)
-            FALLBACK_VERSION
+            null
         }
+        val trimmed = raw?.trim().orEmpty()
+        return if (trimmed.isEmpty() || trimmed.contains("\${")) FALLBACK_VERSION else trimmed
     }
 }
 
-/** Fallback version when IntelliJ Plugin API is unavailable. */
+/** Classpath resource holding the plugin version, populated by `processResources`. */
+private const val VERSION_RESOURCE_PATH = "/jollimemory-plugin-version.txt"
+
+/** Fallback version when the version resource is unavailable. */
 private const val FALLBACK_VERSION = "dev"
