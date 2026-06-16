@@ -286,6 +286,22 @@ describe("PrCommentService", () => {
 			expect(noPrBlock).toContain("createPrBtn");
 			expect(noPrBlock).toContain("'Create PR'");
 		});
+
+		it("does not paint the 'Previously:' history strip under 'noPr' — merged/closed PRs surface only alongside a live PR ('ready')", () => {
+			// A branch with only merged/closed PRs flows into kind:noPr. Painting
+			// the history strip there made a stale merged PR read as "this
+			// memory's PR" on every memory committed to an already-merged branch.
+			// renderPrHistory must run with the real history ONLY in the 'ready'
+			// branch (anchored to a live open PR); the noPr branch clears it.
+			const js = buildPrMessageScript();
+			const noPrIdx = js.indexOf("s === 'noPr'");
+			const readyIdx = js.indexOf("s === 'ready'");
+			const noPrBlock = js.slice(noPrIdx, readyIdx);
+			const readyBlock = js.slice(readyIdx);
+			expect(noPrBlock).not.toContain("renderPrHistory(msg.history)");
+			expect(noPrBlock).toContain("renderPrHistory([])");
+			expect(readyBlock).toContain("renderPrHistory(msg.history)");
+		});
 	});
 
 	// ─── PR history webview rendering: defense-in-depth assertions ──────────

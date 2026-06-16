@@ -151,7 +151,11 @@ vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	saveConfig: mockSaveConfig,
 }));
 
-vi.mock("../util/WorkspaceUtils.js", () => ({
+vi.mock("../util/WorkspaceUtils.js", async (importOriginal) => ({
+	// Keep the real (pure) resolveEnabledSources so the enabled-source filter
+	// tests exercise the actual flag→source mapping; only loadGlobalConfig is
+	// stubbed to feed those flags.
+	...(await importOriginal<typeof import("../util/WorkspaceUtils.js")>()),
 	loadGlobalConfig: mockLoadConfig,
 }));
 
@@ -170,13 +174,15 @@ vi.mock("../../../cli/src/core/Summarizer.js", () => ({
 	translateToEnglish: mockTranslateToEnglish,
 }));
 
-const { mockRegenerateSummary, mockLoadRegenerateContext } = vi.hoisted(() => ({
+const { mockRegenerateSummary, mockSummarizeCommit, mockLoadRegenerateContext } = vi.hoisted(() => ({
 	mockRegenerateSummary: vi.fn(),
+	mockSummarizeCommit: vi.fn(),
 	mockLoadRegenerateContext: vi.fn(),
 }));
 
 vi.mock("../../../cli/src/core/Regenerator.js", () => ({
 	regenerateSummary: mockRegenerateSummary,
+	summarizeCommit: mockSummarizeCommit,
 }));
 
 vi.mock("../../../cli/src/core/RegenerateContext.js", () => ({
@@ -663,6 +669,9 @@ const stubBridge = {
 	),
 	regenerateSummary: vi.fn((summary: unknown, config: unknown) =>
 		mockRegenerateSummary(summary, workspaceRoot, config),
+	),
+	summarizeCommit: vi.fn((commitHash: unknown, config: unknown) =>
+		mockSummarizeCommit(commitHash, workspaceRoot, config),
 	),
 } as unknown as import("../JolliMemoryBridge.js").JolliMemoryBridge;
 const mainBranch = "main";
@@ -2407,6 +2416,63 @@ describe("SummaryWebviewPanel", () => {
 			});
 		});
 
+		// ── generateMemory (no-summary placeholder path) ────────────────────
+
+		describe("generateMemory", () => {
+			const stubUpdated = () =>
+				makeSummary({ topics: [], recap: "generated", commitMessage: "freshly generated" });
+
+			beforeEach(() => {
+				mockSummarizeCommit.mockReset();
+				withProgress.mockClear();
+				executeCommand.mockClear();
+				mockBuildTopicsSection.mockReturnValue('<div id="topicsSection">t</div>');
+				mockBuildRecapSection.mockReturnValue('<div id="recapSection">r</div>');
+			});
+
+			it("bootstraps via bridge.summarizeCommit, persists, refreshes history, and posts re-render", async () => {
+				mockSummarizeCommit.mockResolvedValue({ updated: stubUpdated(), result: {} as never });
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "generateMemory" });
+				await flushPromises();
+
+				// No "overwrite?" confirm — there is nothing to overwrite.
+				expect(showWarningMessage).not.toHaveBeenCalled();
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({ recap: "generated" }),
+					workspaceRoot,
+					true,
+				);
+				// Row must flip from "no memory" to a real memory.
+				expect(executeCommand).toHaveBeenCalledWith("jollimemory.refreshHistory");
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "summaryRegenerated" }),
+				);
+			});
+
+			it("does NOT generate for a foreign-repo panel (would write the wrong orphan branch)", async () => {
+				await SummaryWebviewPanel.show(
+					makeSummary(),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"memory",
+					"other-repo",
+					"https://github.com/other/repo.git",
+					null,
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "generateMemory" });
+				await flushPromises();
+
+				expect(mockSummarizeCommit).not.toHaveBeenCalled();
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+			});
+		});
+
 		// ── regenerateSummary ───────────────────────────────────────────────
 
 		describe("regenerateSummary", () => {
@@ -2476,15 +2542,19 @@ describe("SummaryWebviewPanel", () => {
 			});
 
 			it("includes a non-empty summaryErrorBannerHtml when regenerate still produces a degraded summary", async () => {
-				// Defensive: if the regenerate result itself somehow carries
-				// summaryError (e.g. user clicks Regenerate while creds are still
-				// broken — though in practice the regenerate path would have
-				// thrown earlier), the post-message should reflect that with a
-				// non-empty banner HTML so the DOM keeps showing it.
+				// Genuinely degraded: the regenerate result carries summaryError AND
+				// no usable content (empty recap + topics) — the banner must show.
+				// (A regenerate that yields content keeps the banner suppressed —
+				// see SummaryErrorBanner's content-aware tests.)
 				mockLoadRegenerateContext.mockResolvedValue(stubCtx());
 				showWarningMessage.mockResolvedValueOnce("Regenerate");
 				mockRegenerateSummary.mockResolvedValue({
-					updated: { ...stubUpdated(), summaryError: "llm-failed" } as never,
+					updated: {
+						...stubUpdated(),
+						summaryError: "llm-failed",
+						recap: "",
+						topics: [],
+					} as never,
 					result: {} as never,
 				});
 				const dispatch = await setupPanel();

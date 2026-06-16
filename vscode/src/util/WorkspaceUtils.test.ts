@@ -34,6 +34,7 @@ import {
 	getWorkspaceRoot,
 	loadGlobalConfig,
 	resolveCLIPath,
+	resolveEnabledSources,
 } from "./WorkspaceUtils.js";
 
 describe("WorkspaceUtils", () => {
@@ -77,6 +78,39 @@ describe("WorkspaceUtils", () => {
 				"/home/user/.jolli/jollimemory",
 			);
 			expect(config.apiKey).toBe("global-key");
+		});
+	});
+
+	describe("resolveEnabledSources()", () => {
+		it("enables every source by default (opt-out semantics)", () => {
+			expect(resolveEnabledSources({})).toEqual(
+				new Set([
+					"claude",
+					"codex",
+					"gemini",
+					"opencode",
+					"cursor",
+					"copilot",
+					"copilot-chat",
+				]),
+			);
+		});
+
+		it("drops a source only when its flag is explicitly false", () => {
+			const result = resolveEnabledSources({
+				codexEnabled: false,
+				claudeEnabled: true,
+			});
+			expect(result.has("claude")).toBe(true);
+			expect(result.has("codex")).toBe(false);
+		});
+
+		it("gates both copilot tags behind the single copilotEnabled flag", () => {
+			const result = resolveEnabledSources({ copilotEnabled: false });
+			expect(result.has("copilot")).toBe(false);
+			expect(result.has("copilot-chat")).toBe(false);
+			// other sources unaffected
+			expect(result.has("claude")).toBe(true);
 		});
 	});
 });

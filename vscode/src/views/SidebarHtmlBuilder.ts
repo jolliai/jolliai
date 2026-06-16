@@ -168,6 +168,9 @@ export function buildSidebarHtml(
     </div>
     <div class="dropdown-menu hidden" id="breadcrumb-menu" role="menu"></div>
     <div class="tab-toolbar hidden" id="tab-toolbar"></div>
+    <!-- Last-conversation banner (Branch view only) — populated by the script,
+         shown above the scrolling content. Hidden on KB / Status overlays. -->
+    <div class="last-convo hidden" id="last-convo"></div>
     <div class="tab-content hidden" id="tab-content-kb"><p class="placeholder">Loading...</p></div>
     <div class="tab-content hidden" id="tab-content-branch"><p class="placeholder">Loading...</p></div>
     <div class="tab-content hidden" id="tab-content-status">
@@ -177,6 +180,10 @@ export function buildSidebarHtml(
       </div>
       <div class="status-entries" id="status-entries"><p class="placeholder">Loading...</p></div>
     </div>
+    <!-- Action bar (Branch view only) — pinned at the BOTTOM, below the
+         scrolling content. Populated by renderActionBar(); hidden on KB /
+         Status and in foreign-repo view. -->
+    <div class="action-bar-dock hidden" id="action-bar-dock"></div>
     <div class="context-menu hidden" id="context-menu"></div>
     <div class="hover-card hidden" id="memory-hover" role="tooltip"></div>
     <div class="text-tip hidden" id="text-tip" role="tooltip"></div>

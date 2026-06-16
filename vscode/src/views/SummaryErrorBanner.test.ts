@@ -28,6 +28,33 @@ describe("buildSummaryErrorBanner", () => {
 		expect(html).toContain('role="status"');
 	});
 
+	it("suppresses the failure banner when summaryError is set but the summary has a recap (transient/partial failure on a complete memory)", () => {
+		const withRecap = {
+			...baseSummary,
+			summaryError: "llm-failed",
+			recap: "A complete recap of the change.",
+		} satisfies CommitSummary;
+		expect(buildSummaryErrorBanner(withRecap)).toBe("");
+	});
+
+	it("suppresses the failure banner when content lives only on a child (squash/amend container)", () => {
+		const container = {
+			...baseSummary,
+			summaryError: "llm-failed",
+			children: [{ ...baseSummary, recap: "Child recap." }],
+		} as CommitSummary;
+		expect(buildSummaryErrorBanner(container)).toBe("");
+	});
+
+	it("still shows the failure banner when summaryError is set and content is empty (the degraded loud-failure state)", () => {
+		const html = buildSummaryErrorBanner({
+			...baseSummary,
+			summaryError: "llm-failed",
+		});
+		expect(html).toContain('class="summary-error-banner"');
+		expect(html).toContain('id="summaryErrorRegenerateBtn"');
+	});
+
 	it("renders banner for legacy summaries with llm.stopReason === 'error'", () => {
 		const legacy: CommitSummary = {
 			...baseSummary,
@@ -72,5 +99,32 @@ describe("buildSummaryErrorBanner", () => {
 		const html = buildSummaryErrorBanner(legacy, { readOnly: true });
 		expect(html).toContain('class="summary-error-banner"');
 		expect(html).not.toContain('id="summaryErrorRegenerateBtn"');
+	});
+
+	it("needsGeneration renders the Generate-memory variant with #generateMemoryBtn", () => {
+		// A never-summarized commit is not a failed one — distinct copy + a
+		// Generate (not Regenerate) button wired to the from-scratch path.
+		const html = buildSummaryErrorBanner(baseSummary, { needsGeneration: true });
+		expect(html).toContain('class="summary-error-banner"');
+		expect(html).toContain('id="generateMemoryBtn"');
+		expect(html).toContain("No memory has been generated");
+		expect(html).not.toContain('id="summaryErrorRegenerateBtn"');
+	});
+
+	it("needsGeneration takes precedence over a healthy summary (no isSummaryError needed)", () => {
+		// The placeholder shell passed on the open-empty path has no summaryError
+		// marker, so the needsGeneration flag must drive the variant on its own.
+		const html = buildSummaryErrorBanner(baseSummary, { needsGeneration: true });
+		expect(html).not.toBe("");
+		expect(html).toContain('id="generateMemoryBtn"');
+	});
+
+	it("needsGeneration + readOnly omits the Generate button (foreign repo)", () => {
+		// Generating writes the workspace orphan branch — never offer it for a
+		// foreign-repo placeholder.
+		const html = buildSummaryErrorBanner(baseSummary, { needsGeneration: true, readOnly: true });
+		expect(html).toContain('class="summary-error-banner"');
+		expect(html).not.toContain('id="generateMemoryBtn"');
+		expect(html).toContain("Open its home repository");
 	});
 });

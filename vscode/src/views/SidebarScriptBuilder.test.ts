@@ -18,6 +18,81 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain('[data-action="view-graph"]');
 	});
 
+	it("labels the Working Memory card as a uniform collapsible section + clickable selection counts", () => {
+		const js = buildSidebarScript();
+		// Header is the shared section-header bar (uppercased via CSS), and the
+		// card is a collapsible section keyed for the shared toggle handler.
+		expect(js).toContain("Working Memory");
+		expect(js).toContain("'wm-card collapsible-section'");
+		expect(js).toContain("'data-section': 'working-memory'");
+		// Selection counts are clickable and OPEN (not toggle) Review; the
+		// chevron reads as the edit path — addresses "hard to modify what goes in".
+		expect(js).toContain("wm-open-review");
+		expect(js).toContain("Review & adjust");
+	});
+
+	it("lazy commit-detail is reload-safe: reset on load + render-driven fetch", () => {
+		const js = buildSidebarScript();
+		// Persisted 'loading'/stale detail is dropped on load so a row never
+		// stays stuck across reloads.
+		expect(js).toContain("state.commitDetail = {}");
+		// Fetch is render-driven: an expanded row with no cached detail sets
+		// 'loading' synchronously (so repeat renders don't re-request) and
+		// requests it — covering both the click and a reload-restored expand.
+		expect(js).toContain("state.commitDetail[item.id] = 'loading'");
+		expect(js).toContain("type: 'branch:loadCommitDetail', hash: item.id");
+	});
+
+	it("selection counts deep-link to their Review sub-section (data-wm-target + scrollIntoView)", () => {
+		const js = buildSidebarScript();
+		// Each count names its target section and the handler scrolls to it,
+		// even when Review is already open (so it's not a no-op).
+		expect(js).toContain("'data-wm-target'");
+		expect(js).toContain(".wm-review-body .collapsible-section[data-section=");
+		expect(js).toContain("scrollIntoView");
+	});
+
+	it("Recall is a split button — main opens Claude Code, caret menu offers copy-for-other-tools", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("action-bar-split");
+		expect(js).toContain("'data-action': 'recall-menu'");
+		// The caret menu surfaces both paths so non-Claude users aren't stranded.
+		expect(js).toContain("Open in Claude Code");
+		expect(js).toContain("Copy prompt for other tools");
+		// The menu trigger MUST stop propagation — otherwise the click bubbles to
+		// the document-level "close menu on outside click" handler and hides the
+		// menu on the same click that opened it (the bug that made the caret
+		// appear to "do nothing"). Assert both within the recall-menu block.
+		const menuIdx = js.indexOf("a === 'recall-menu'");
+		expect(menuIdx).toBeGreaterThan(-1);
+		const menuBlock = js.slice(menuIdx, menuIdx + 600);
+		expect(menuBlock).toContain("showContextMenu");
+		expect(menuBlock).toContain("stopPropagation");
+	});
+
+	it("non-native click targets are keyboard-accessible (role=button + Enter/Space activation)", () => {
+		const js = buildSidebarScript();
+		// role + tabindex + aria-expanded on the clickable span / twirl / header.
+		expect(js).toContain("role: 'button'");
+		expect(js).toContain("tabindex: '0'");
+		expect(js).toContain("'aria-expanded'");
+		// keydown maps Enter/Space to a synthetic click for these classes.
+		expect(js).toContain("t.classList.contains('wm-pick')");
+		expect(js).toContain("t.classList.contains('commit-twirl')");
+		expect(js).toContain("t.classList.contains('section-header')");
+	});
+
+	it("emits the no-summary Generate affordance (recency-gated + command dispatch)", () => {
+		const js = buildSidebarScript();
+		// Inline + context-menu Generate both route to the one-click command.
+		expect(js).toContain("jollimemory.generateMemory");
+		// Recent commits show a passive 'Generating…' indicator; only stale
+		// (past the window) no-summary rows get the Generate button.
+		expect(js).toContain("GENERATING_WINDOW_MS");
+		expect(js).toContain("mem-generating");
+		expect(js).toContain("Generate memory");
+	});
+
 	it("output parses as valid JS — backtick / undeclared-symbol smoke test", () => {
 		// Regression for two bug classes that ship-tested but tests-passed:
 		//   1. Backtick trap: SidebarScriptBuilder warns about it in its
@@ -1036,7 +1111,12 @@ describe("SidebarScriptBuilder", () => {
 		it("checks .section-actions [data-action] before .section-header collapse", () => {
 			const js = buildSidebarScript();
 			const sectionActionIdx = js.indexOf(".section-actions [data-action]");
-			const sectionHeaderIdx = js.indexOf(".section-header");
+			// Match the collapse handler specifically (its data-section read), not
+			// the first ".section-header" anywhere — the Conversations banner's own
+			// collapse handler now references ".section-header" earlier in the file.
+			const sectionHeaderIdx = js.indexOf(
+				"header.parentElement.getAttribute('data-section')",
+			);
 			expect(sectionActionIdx).toBeGreaterThan(-1);
 			expect(sectionHeaderIdx).toBeGreaterThan(-1);
 			expect(sectionActionIdx).toBeLessThan(sectionHeaderIdx);
@@ -1431,28 +1511,36 @@ describe("SidebarScriptBuilder", () => {
 		// foreign-readonly mode because the whole Changes section is dropped
 		// above the predicate. Neither items.length nor `collapsed` may gate
 		// the push site.
-		it("pushes the button on the Changes section without gating on items.length or collapsed", () => {
+		it("renders Commit Memory unconditionally in the Working Memory card (not gated by items.length or collapsed)", () => {
 			const js = buildSidebarScript();
-			// Find the push site. Must match `s.id === 'changes'` but NOT
-			// include `!collapsed` (regression — collapsing Changes hid the
-			// group CTA) nor `s.items.length` (regression — empty Changes hid
-			// the discoverability affordance).
-			const renderSectionStart = js.indexOf("function renderSection");
-			expect(renderSectionStart).toBeGreaterThan(-1);
-			const renderSectionEnd = js.indexOf(
+			// Commit Memory now lives in the Working Memory card, which owns the
+			// cross-panel assembly (Conversations + Context + Changes) and the
+			// CTA together. It must be rendered unconditionally there — never
+			// gated on selection count or a collapsed section.
+			const wmStart = js.indexOf("function renderWorkingMemoryCard");
+			expect(wmStart).toBeGreaterThan(-1);
+			const wmEnd = js.indexOf(
 				"function ",
-				renderSectionStart + "function renderSection".length,
+				wmStart + "function renderWorkingMemoryCard".length,
 			);
-			const body = js.slice(renderSectionStart, renderSectionEnd);
-			expect(body).toMatch(
-				/if\s*\(\s*s\.id\s*===\s*'changes'\s*\)\s*\{\s*sectionKids\.push\(renderCommitMemoryButton\(\)\)/,
+			const wmBody = js.slice(wmStart, wmEnd);
+			expect(wmBody).toContain("renderCommitMemoryButton()");
+			expect(wmBody).not.toMatch(
+				/items\.length[\s\S]{0,80}renderCommitMemoryButton/,
 			);
-			// Defense-in-depth: neither old buggy predicate may reappear.
-			expect(body).not.toMatch(
-				/s\.items\.length\s*>\s*0[\s\S]{0,80}renderCommitMemoryButton/,
-			);
-			expect(body).not.toMatch(
+			expect(wmBody).not.toMatch(
 				/!collapsed[\s\S]{0,80}renderCommitMemoryButton/,
+			);
+			// Regression guard: the button must NOT be re-appended inside the
+			// Changes section (its old home) — that would double-render it.
+			const rsStart = js.indexOf("function renderSection");
+			const rsEnd = js.indexOf(
+				"function ",
+				rsStart + "function renderSection".length,
+			);
+			const rsBody = js.slice(rsStart, rsEnd);
+			expect(rsBody).not.toMatch(
+				/s\.id\s*===\s*'changes'[\s\S]{0,80}renderCommitMemoryButton/,
 			);
 		});
 
@@ -1538,7 +1626,28 @@ describe("SidebarScriptBuilder", () => {
 			);
 			const body = js.slice(renderBranchStart, renderBranchEnd);
 			expect(body).toMatch(/const foreign\s*=\s*isViewingForeign\(\)/);
-			expect(body).toMatch(/if\s*\(\s*!foreign\s*\)/);
+			// Foreign mode early-returns with only the Committed Memories list;
+			// the Working Memory card (Conversations + Context + Changes) is
+			// reached only on the non-foreign path below the guard.
+			expect(body).toMatch(/if\s*\(\s*foreign\s*\)/);
+		});
+
+		it("Committed Memories is NOT filtered to commitWithMemory — every branch commit shows (regression: async-summary commits were hidden)", () => {
+			const js = buildSidebarScript();
+			const renderBranchStart = js.indexOf("function renderBranch");
+			const renderBranchEnd = js.indexOf(
+				"function ",
+				renderBranchStart + "function renderBranch".length,
+			);
+			const body = js.slice(renderBranchStart, renderBranchEnd);
+			// The workspace-view commits section feeds straight from branchData.commits.
+			expect(body).toMatch(/items:\s*branchData\.commits/);
+			// And must NOT re-introduce the contextValue==='commitWithMemory' filter,
+			// which hid just-committed memories until their summary generated async.
+			// (Matches an actual .filter(...) call, not the explanatory comment.)
+			expect(body).not.toMatch(
+				/\.filter\([\s\S]*['"]commitWithMemory['"]/,
+			);
 		});
 	});
 

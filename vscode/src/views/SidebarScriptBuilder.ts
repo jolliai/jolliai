@@ -98,6 +98,17 @@ export function buildSidebarScript(): string {
     // commit collapsed; we mirror that default but persist user toggles
     // across reloads via vscode.setState.
     commitsExpanded: {},
+    // Lazy per-commit memory detail (hash → { conversations, context } or the
+    // string 'loading'). Reset on load (below) so neither a stuck 'loading'
+    // sentinel nor stale detail survives a reload; re-fetched render-driven
+    // (renderCommitRow requests it whenever an expanded row has no cached
+    // detail) so it's cheap and always fresh.
+    commitDetail: {},
+    // "Conversations" banner: latest shown by default; Show more reveals the
+    // next few recent sessions. Not persisted — the toggle deliberately skips
+    // persist(), so it starts collapsed each load (unlike the persisted keys
+    // above; don't add persist() to the toggle without revisiting this).
+    lcExpanded: false,
     scrollTops: {},
     // Live flag pushed by the host whenever the post-commit Worker is holding
     // the lock. Drives the "AI summary in progress…" indicator on the Branch
@@ -119,6 +130,10 @@ export function buildSidebarScript(): string {
   state.workerBusy = false;
   state.workerPhase = null;
   state.syncPhase = null;
+  // Drop any persisted lazy detail (incl. a 'loading' sentinel from an expand
+  // whose reply never landed before reload). Expanded rows re-request it
+  // render-driven, so this never leaves a row stuck — and avoids stale detail.
+  state.commitDetail = {};
   function persist() { vscode.setState(state); }
 
   // ---- DOM refs ----
@@ -189,6 +204,53 @@ export function buildSidebarScript(): string {
   // calls mountIn(statusEntries, ...) which replaceChildren()s its target;
   // mounting into the panel root would clobber the banner.
   const statusEntries = document.getElementById('status-entries');
+  // Branch-view chrome that lives OUTSIDE tab-content-branch (so it can sit
+  // above the scrolling list): the last-conversation banner. Populated by
+  // renderLastConvo(); hidden on KB/Status.
+  const lastConvoEl = document.getElementById('last-convo');
+  // Conversations banner collapse — it lives outside the scroll container, so
+  // the branch click delegate doesn't catch its section-header; wire it here.
+  if (lastConvoEl) {
+    lastConvoEl.addEventListener('click', function(e) {
+      if (!e.target.closest('.section-header')) return;
+      state.sectionsCollapsed['conversations-banner'] = !state.sectionsCollapsed['conversations-banner'];
+      persist();
+      renderLastConvo();
+    });
+  }
+  // Bottom-pinned action bar (Recall / Create PR), also outside the scroll.
+  // Populated by renderActionBar(); hidden on KB/Status + foreign view.
+  const actionBarDock = document.getElementById('action-bar-dock');
+  if (actionBarDock) {
+    actionBarDock.addEventListener('click', function(e) {
+      const btn = e.target.closest('[data-action]');
+      if (!btn) return;
+      const a = btn.getAttribute('data-action');
+      if (a === 'recall-branch') {
+        vscode.postMessage({ type: 'command', command: 'jollimemory.recallBranch' });
+      } else if (a === 'recall-menu') {
+        const r = btn.getBoundingClientRect();
+        showContextMenu(r.left, r.bottom + 2, [
+          { label: 'Open in Claude Code', command: 'jollimemory.recallBranch' },
+          { label: 'Copy prompt for other tools', command: 'jollimemory.copyBranchRecall' },
+        ]);
+        // Stop the click here: otherwise it bubbles to the document-level
+        // "close menu on outside click" handler, which would hide the menu we
+        // just opened on this very click (same pattern as the section-action
+        // menu triggers).
+        e.stopPropagation();
+      } else if (a === 'create-pr-branch') {
+        vscode.postMessage({ type: 'command', command: 'jollimemory.createBranchPr' });
+      }
+    });
+    // Right-click Recall → copy the prompt (twin of the click, which opens Claude Code).
+    actionBarDock.addEventListener('contextmenu', function(e) {
+      if (e.target.closest('[data-action="recall-branch"]')) {
+        e.preventDefault();
+        vscode.postMessage({ type: 'command', command: 'jollimemory.copyBranchRecall' });
+      }
+    });
+  }
 
   // ---- Plain-text tooltip ----
   // Replaces the native title= tooltip on status rows and toolbar buttons. The
@@ -284,6 +346,12 @@ export function buildSidebarScript(): string {
       elBtn.classList.toggle('active', elBtn.getAttribute('data-tab') === tab);
     });
     Object.keys(tabContents).forEach(function(t) { tabContents[t].classList.toggle('hidden', t !== tab); });
+    // Branch-only chrome: hide when leaving Branch. On Branch, renderBranch()
+    // → renderLastConvo() decides the banner's visibility from the data.
+    if (tab !== 'branch') {
+      if (lastConvoEl) lastConvoEl.classList.add('hidden');
+      if (actionBarDock) actionBarDock.classList.add('hidden');
+    }
     renderToolbar();
     const incoming = tabContents[tab];
     if (incoming) incoming.scrollTop = state.scrollTops[tab] || 0;
@@ -581,6 +649,25 @@ export function buildSidebarScript(): string {
     vscode.postMessage({ type: 'command', command: 'jollimemory.enableJolliMemory' });
   });
 
+  // Keyboard activation for the non-native interactive elements we mark with
+  // role="button" (clickable selection-count spans, commit-row <i> twirls,
+  // section-header divs). Native <button>s handle Enter/Space themselves; these
+  // don't, so map the key to a synthetic .click() that flows through the same
+  // delegated click handlers. Space is included (and its default scroll
+  // suppressed) to match native button semantics.
+  document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+    const t = e.target;
+    if (t && t.classList && (
+      t.classList.contains('wm-pick') ||
+      t.classList.contains('commit-twirl') ||
+      t.classList.contains('section-header')
+    )) {
+      e.preventDefault();
+      t.click();
+    }
+  });
+
   // Close context menu on outside click.
   document.addEventListener('click', function(e) {
     if (!ctxMenu.contains(e.target)) ctxMenu.classList.add('hidden');
@@ -604,6 +691,17 @@ export function buildSidebarScript(): string {
     // state-bearing entry path uniformly. Idempotent on already-hidden.
     loadingPanel.classList.add('hidden');
     switch (msg.type) {
+      case 'commitDetailLoaded':
+        // Lazy committed-memory detail arrived — cache it and re-render so the
+        // expanded row swaps "Loading…" for the grouped Conversations/Context.
+        state.commitDetail[msg.hash] = {
+          conversations: Array.isArray(msg.conversations) ? msg.conversations : [],
+          context: Array.isArray(msg.context) ? msg.context : [],
+        };
+        // Coalesced: a reload that restores several expanded rows fires a burst
+        // of these — collapse them into one re-render (see scheduleBranchRender).
+        scheduleBranchRender();
+        break;
       case 'init':
         if (typeof msg.state.authenticated === 'boolean') state.authenticated = msg.state.authenticated;
         if (msg.state.degradedReason) {
@@ -2514,60 +2612,304 @@ export function buildSidebarScript(): string {
     return !!state.sectionsCollapsed[section];
   }
 
+  // Review-expander state for the Working Memory card. Client-side only —
+  // resets on reload. (Preview opens a separate pop-out panel, no card state.)
+  let wmReviewing = false;
+
+  // Coalesce branch re-renders: renderBranch() rebuilds the whole view, so a
+  // burst of async replies (e.g. a reload restoring K expanded commit rows
+  // fires K commitDetailLoaded messages) would otherwise trigger K full
+  // rebuilds for one settled state. Collapse them into a single render on the
+  // next animation frame.
+  let branchRenderQueued = false;
+  function scheduleBranchRender() {
+    if (branchRenderQueued) return;
+    branchRenderQueued = true;
+    requestAnimationFrame(function() {
+      branchRenderQueued = false;
+      renderBranch();
+    });
+  }
+
   function renderBranch() {
     hideTextTip();
+    renderLastConvo();
+    renderActionBar();
     const container = tabContents.branch;
-    // Plans & Notes and Changes are workspace-local — they have no meaningful
-    // representation for a foreign repo/branch selection. Drop them entirely
-    // in foreign-readonly mode so the panel reduces to the Memories list.
     const foreign = isViewingForeign();
-    const sections = [];
-    if (!foreign) {
-      // failedSources is the list of TranscriptSource keys whose discoverer
-      // failed (threw or returned r.error) during the most recent aggregator
-      // pass. When non-empty, the section renders a small banner above the
-      // rows so the user understands "list incomplete", not "list truly empty".
-      const failedSources = branchData.conversationsFailedSources || [];
-      const conversationsWarning = failedSources.length > 0
-        ? 'Some sources unavailable (' + failedSources.join(', ') + '). List may be incomplete.'
-        : null;
-      sections.push({ id: 'conversations', title: 'CONVERSATIONS', items: branchData.conversations, emptyText: 'No active AI conversations in the last 2 days.', warning: conversationsWarning });
-      sections.push({ id: 'plans', title: 'Plans & Notes', items: branchData.plans, emptyText: STRINGS.plansEmpty || 'No plans or notes yet.' });
-      sections.push({ id: 'changes', title: 'Changes', items: branchData.changes, emptyText: STRINGS.changesEmpty || 'No changes.' });
-    }
-    // Section id stays 'commits' (back-compat: section-toggle state and CSS
-    // selectors key off it), but the user-facing title is now "Memories"
-    // because every selected row maps to — or will become — a Jolli memory.
-    //
-    // Data source switches with the breadcrumb selection:
-    //  - workspace view → branchData.commits (rich BranchCommit shape pushed
-    //    by host via branch:commitsData; supports checkboxes / squash / push).
-    //  - foreign view   → memoriesState.items filtered by selectedRepoName +
-    //    selectedBranchName, adapted to the display-item shape renderCommitRow
-    //    consumes. Host doesn't refetch commits on selection change (the bridge
-    //    only knows how to git-log workspace HEAD), so we re-derive locally
-    //    from the cross-repo summary index that's already loaded.
-    const commitsItems = foreign ? getForeignCommitItems() : branchData.commits;
-    // Foreign-mode banner — placed at the top of the Memories section body
-    // so the user sees an explicit in-panel signal that they are viewing
-    // another repo (the chrome-only foreign-readonly CSS class is silent on
-    // its own). Wording mirrors IntelliJ CommitsPanel.kt:722 so the two
-    // surfaces stay aligned. Uses sectionBanner (not warning) to keep the
-    // partial-data orange affordance free for the conversations failure case.
-    //
-    // The "(read-only)" suffix only renders when the repo itself is foreign;
-    // browsing another branch in the workspace repo drops the suffix because
-    // those branches are not actually read-only (the user could check them
-    // out). Both foreign-flavors get a "Switch back to current workspace"
-    // affordance so the user is never stranded after a breadcrumb pick.
     const repo = state.selectedRepoName || state.currentRepoName || '';
     const branch = state.selectedBranchName || state.branchName || '';
     const repoForeign = !!state.selectedRepoName && state.selectedRepoName !== state.currentRepoName;
-    const memoriesBanner = foreign && repo && branch
-      ? { text: 'Viewing memories from ' + repo + ' / ' + branch + (repoForeign ? ' (read-only)' : ''), showResetLink: true }
+
+    // Foreign repo/branch is read-only — there is nothing to commit, so the
+    // Working Memory card is dropped and the panel reduces to the Committed
+    // Memories list. Banner wording mirrors IntelliJ CommitsPanel.kt so the
+    // two surfaces stay aligned. "(read-only)" only when the repo itself is
+    // foreign (another branch in the workspace repo is checkout-able).
+    if (foreign) {
+      const memoriesBanner = repo && branch
+        ? { text: 'Viewing memories from ' + repo + ' / ' + branch + (repoForeign ? ' (read-only)' : ''), showResetLink: true }
+        : null;
+      mountIn(container, [renderSection({
+        id: 'commits', title: 'Committed Memories', items: getForeignCommitItems(),
+        emptyText: STRINGS.commitsEmpty || 'No memories yet.', sectionBanner: memoriesBanner,
+      })]);
+      return;
+    }
+
+    // Workspace view: Working Memory card (Conversations + Context + Changes
+    // behind the Review expander, with the live assembly sentence + Commit
+    // Memory) followed by the Committed Memories list.
+    const failedSources = branchData.conversationsFailedSources || [];
+    const conversationsWarning = failedSources.length > 0
+      ? 'Some sources unavailable (' + failedSources.join(', ') + '). List may be incomplete.'
       : null;
-    sections.push({ id: 'commits', title: 'Memories', items: commitsItems, emptyText: STRINGS.commitsEmpty || 'No memories yet.', sectionBanner: memoriesBanner });
-    mountIn(container, sections.map(renderSection));
+    const convSec = { id: 'conversations', title: 'CONVERSATIONS', items: branchData.conversations, emptyText: 'No active AI conversations in the last 2 days.', warning: conversationsWarning };
+    const ctxSec = { id: 'plans', title: 'Context', items: branchData.plans, emptyText: STRINGS.plansEmpty || 'No plans or notes yet.' };
+    const changeSec = { id: 'changes', title: 'Changes', items: branchData.changes, emptyText: STRINGS.changesEmpty || 'No changes.' };
+    // Section id stays 'commits' (back-compat: section-toggle state + CSS
+    // selectors key off it); user-facing title is "Committed Memories".
+    // Every item here is a real branch commit (sourced from the history
+    // provider) — memory-backed and code-only alike. We deliberately do NOT
+    // filter to contextValue==='commitWithMemory': summaries are generated
+    // asynchronously after commit, so filtering would hide a just-made commit
+    // until its summary lands (and code-only commits forever). Memory-backed
+    // rows still get the inline "View Memory" affordance via the per-row
+    // hasMem check. Uncommitted/in-progress work never appears here — it lives
+    // in the Working Memory card above.
+    const commitsSec = { id: 'commits', title: 'Committed Memories', items: branchData.commits || [], emptyText: STRINGS.commitsEmpty || 'No memories yet.' };
+
+    mountIn(container, [
+      renderWorkingMemoryCard(convSec, ctxSec, changeSec),
+      renderSection(commitsSec),
+    ]);
+  }
+
+  // Two-button action bar pinned at the BOTTOM of the sidebar (outside the
+  // scroll, like the last-conversation banner is pinned at the top). Recall
+  // opens Claude Code with the whole branch's context (jolli recall);
+  // right-click copies the prompt. Create PR opens the branch-level PR flow.
+  // Workspace view only — hidden on KB/Status and in foreign-repo view.
+  function renderActionBar() {
+    if (!actionBarDock) return;
+    if (state.activeTab !== 'branch' || isViewingForeign()) {
+      actionBarDock.replaceChildren();
+      actionBarDock.classList.add('hidden');
+      return;
+    }
+    // Split button: the main part opens Claude Code (the common case); the ▾
+    // caret opens a menu with the tool-neutral "copy prompt" path so non-Claude
+    // users (Codex, Cursor) aren't stranded by a click that silently assumes
+    // Claude Code. Both halves are real <button>s, so the whole control is
+    // keyboard-reachable. Right-click still copies, as a power-user shortcut.
+    const recallMain = attachTextTip(
+      el('button', { type: 'button', className: 'action-bar-btn primary', 'data-action': 'recall-branch' }, [
+        el('i', { className: 'codicon codicon-play' }),
+        el('span', { text: 'Recall' }),
+      ]),
+      'Recall this branch’s context — opens Claude Code if installed, otherwise copies the prompt (use ▾ to choose)',
+    );
+    const recallCaret = attachTextTip(
+      el('button', {
+        type: 'button', className: 'action-bar-caret', 'data-action': 'recall-menu',
+        'aria-label': 'Recall options',
+      }, [el('i', { className: 'codicon codicon-chevron-down' })]),
+      'More Recall options — copy the prompt for Codex, Cursor, or any tool',
+    );
+    const recallBtn = el('div', { className: 'action-bar-split' }, [recallMain, recallCaret]);
+    const prBtn = attachTextTip(
+      el('button', { type: 'button', className: 'action-bar-btn', 'data-action': 'create-pr-branch' }, [
+        el('i', { className: 'codicon codicon-git-pull-request' }),
+        el('span', { text: 'Create PR' }),
+      ]),
+      'Draft a pull request from this branch’s memories',
+    );
+    actionBarDock.replaceChildren(recallBtn, prBtn);
+    actionBarDock.classList.remove('hidden');
+  }
+
+  // Working Memory card: assembly sentence (live selection counts) + Commit
+  // Memory + a Review chevron that expands Conversations / Context / Changes.
+  // Those three reuse the existing renderSection, so every row behaviour —
+  // checkboxes, select-all, discard, add-menu — carries over unchanged.
+  function renderWorkingMemoryCard(convSec, ctxSec, changeSec) {
+    const convN = (branchData.conversations || []).filter(function(c) { return !!c.isSelected; }).length;
+    const ctxN = (branchData.plans || []).filter(function(c) { return !!c.isSelected; }).length;
+    const fileN = (branchData.changes || []).filter(function(c) { return !!c.isSelected; }).length;
+
+    // The selection counts are clickable: they open Review focused on the
+    // attached items, so changing what goes into the memory is one obvious tap
+    // from the sentence that states it — not buried behind the chevron alone.
+    // Each count carries the sub-section it names (data-wm-target) so the
+    // click opens Review AND scrolls to those exact items — a real deep-link,
+    // not just "open the whole panel".
+    const pick = (text, target) => el('span', { className: 'wm-pick', 'data-action': 'wm-open-review', 'data-wm-target': target, role: 'button', tabindex: '0', text: text });
+    const assembly = el('div', { className: 'wm-assembly' });
+    if (fileN === 0) {
+      assembly.appendChild(document.createTextNode('No files selected — '));
+      assembly.appendChild(pick('open Review', 'changes'));
+      assembly.appendChild(document.createTextNode(' to choose what to commit.'));
+    } else {
+      assembly.appendChild(document.createTextNode('Commit Memory will commit '));
+      assembly.appendChild(el('span', { className: 'wm-pick', 'data-action': 'wm-open-review', 'data-wm-target': 'changes', role: 'button', tabindex: '0' }, [
+        el('b', { text: String(fileN) }),
+        document.createTextNode(' file' + (fileN > 1 ? 's' : '')),
+      ]));
+      const attach = [];
+      if (convN > 0) attach.push(pick(convN + ' conversation' + (convN > 1 ? 's' : ''), 'conversations'));
+      if (ctxN > 0) attach.push(pick(ctxN + ' context item' + (ctxN > 1 ? 's' : ''), 'plans'));
+      if (attach.length > 0) {
+        assembly.appendChild(document.createTextNode(' and attach '));
+        attach.forEach(function(node, i) {
+          if (i > 0) assembly.appendChild(document.createTextNode(' + '));
+          assembly.appendChild(node);
+        });
+      }
+      assembly.appendChild(document.createTextNode('.'));
+    }
+
+    // CTA: Commit Memory (primary) + Preview, stacked full-width. Preview opens
+    // an editable pop-out (NextMemoryPreviewPanel) of the next memory — its
+    // include/exclude checkboxes route through the same apply* path as the card.
+    const previewBtn = el('button', {
+      type: 'button', className: 'wm-btn-secondary', 'data-action': 'wm-preview-open',
+    }, [el('span', { text: 'Preview Memory' })]);
+    const cta = el('div', { className: 'wm-cta' }, [renderCommitMemoryButton(), previewBtn]);
+
+    const reviewBtn = el('button', {
+      type: 'button', className: 'wm-review', 'data-action': 'wm-review-toggle',
+      'aria-expanded': String(wmReviewing),
+    }, [
+      el('span', { className: 'twirl', text: '▸' }),
+      el('span', { text: 'Review & adjust what’s attached' }),
+    ]);
+    const reviewBody = el('div', { className: 'wm-review-body' }, [
+      renderSection(convSec), renderSection(ctxSec), renderSection(changeSec),
+    ]);
+
+    // Header is the SAME .section-header bar (twirl + uppercase title) as the
+    // Committed Memories section, so all three section headers are uniform. The
+    // card is a .collapsible-section keyed by data-section='working-memory', so
+    // the existing section-toggle click handler + collapse CSS work unchanged.
+    const collapsed = isCollapsed('working-memory');
+    const header = el('div', { className: 'section-header', role: 'button', tabindex: '0', 'aria-expanded': String(!collapsed) }, [
+      el('span', { className: 'twirl', text: '▾' }),
+      el('span', { className: 'section-title', text: 'Working Memory' }),
+    ]);
+
+    const bodyKids = [assembly, cta];
+    // Background AI-summary indicator — shows while the queue worker is mid-run
+    // (state.workerBusy is pushed by the host worker:busy message).
+    if (state.workerBusy) {
+      bodyKids.push(el('div', { className: 'worker-row' }, [
+        el('i', { className: 'codicon codicon-loading codicon-modifier-spin' }),
+        el('span', { text: 'AI summary in progress…' }),
+      ]));
+    }
+    bodyKids.push(reviewBtn, reviewBody);
+
+    return el('div', {
+      className: 'wm-card collapsible-section' + (collapsed ? ' collapsed' : '') + (wmReviewing ? ' reviewing' : ''),
+      'data-section': 'working-memory',
+    }, [header, el('div', { className: 'section-body' }, bodyKids)]);
+  }
+
+  // Last-conversation banner (Branch view, workspace only): the most-recently
+  // updated AI session with "Show" (opens the conversation panel) and, for
+  // Claude sessions only, "Continue" (true resume via the claude CLI).
+  // Non-Claude sources have no resume mechanism, so they get Show only.
+  // Summarize-to-note is future work (no command exists yet).
+  // Builds one conversation block (head + sub + Show/Continue actions). Shared
+  // by the primary (latest) row and the expanded "Show more" rows.
+  function renderConvoItem(c, primary) {
+    const title = c.title || '(untitled)';
+    const ts = Date.parse(c.updatedAt);
+    const rel = Number.isFinite(ts) ? timeAgo(ts) : '';
+    const n = c.messageCount || 0;
+    const sub = n + ' message' + (n === 1 ? '' : 's') + (rel ? ' · ' + rel : '');
+    const actions = [];
+    // Show opens the transcript — only meaningful when there are messages.
+    if (c.messageCount && c.messageCount > 0) {
+      const showBtn = el('button', { type: 'button' }, [el('span', { text: 'Show' })]);
+      showBtn.addEventListener('click', function() {
+        vscode.postMessage({
+          type: 'branch:openConversation',
+          sessionId: c.sessionId,
+          source: c.source,
+          transcriptPath: c.transcriptPath,
+          title: title,
+        });
+      });
+      actions.push(showBtn);
+    }
+    // Continue (true resume) is Claude-only (claude --resume the session).
+    if (c.source === 'claude') {
+      const continueBtn = el('button', { type: 'button', className: 'primary' }, [el('span', { text: 'Continue' })]);
+      continueBtn.addEventListener('click', function() {
+        vscode.postMessage({
+          type: 'command',
+          command: 'jollimemory.continueConversation',
+          args: [c.source, c.sessionId],
+        });
+      });
+      actions.push(continueBtn);
+    }
+    return el('div', { className: 'lc-item' + (primary ? ' lc-primary' : '') }, [
+      el('div', { className: 'lc-head' }, [
+        el('span', { className: 'badge transcript-source-' + c.source, text: providerLabel(c.source) }),
+        el('span', { className: 'lc-title', text: title }),
+      ]),
+      el('div', { className: 'lc-sub', text: sub }),
+      el('div', { className: 'lc-actions' }, actions),
+    ]);
+  }
+
+  // Cap on how many extra recent conversations "Show more" reveals — the full
+  // list lives in the Working Memory Review. Keep the banner a quick resume
+  // surface, not a second list.
+  const LC_MORE_MAX = 4;
+
+  function renderLastConvo() {
+    if (!lastConvoEl) return;
+    const convos = branchData.conversations || [];
+    if (state.activeTab !== 'branch' || isViewingForeign() || convos.length === 0) {
+      lastConvoEl.replaceChildren();
+      lastConvoEl.classList.add('hidden');
+      return;
+    }
+    // Sort most-recent first. Coerce an unparseable updatedAt to -Infinity so a
+    // bad timestamp never sorts ahead of a real one.
+    const parseTs = function(v) { const t = Date.parse(v); return Number.isFinite(t) ? t : -Infinity; };
+    const sorted = convos.slice().sort(function(a, b) { return parseTs(b.updatedAt) - parseTs(a.updatedAt); });
+
+    // Same .section-header bar (twirl + uppercase title) as Working Memory and
+    // Committed Memories — uniform headers. The banner is a .collapsible-section
+    // keyed by 'conversations-banner'; its click handler (attached to
+    // lastConvoEl) toggles collapse via the shared sectionsCollapsed state.
+    const collapsed = isCollapsed('conversations-banner');
+    const header = el('div', { className: 'section-header', role: 'button', tabindex: '0', 'aria-expanded': String(!collapsed) }, [
+      el('span', { className: 'twirl', text: '▾' }),
+      el('span', { className: 'section-title', text: 'Conversations' }),
+    ]);
+    const bodyKids = [renderConvoItem(sorted[0], true)];
+    const more = sorted.slice(1, 1 + LC_MORE_MAX);
+    if (more.length > 0) {
+      if (state.lcExpanded) {
+        more.forEach(function(c) { bodyKids.push(renderConvoItem(c, false)); });
+      }
+      const moreBtn = el('button', { type: 'button', className: 'lc-more-toggle' }, [
+        el('span', { text: state.lcExpanded ? 'Show less' : 'Show more (' + more.length + ')' }),
+      ]);
+      moreBtn.addEventListener('click', function() {
+        state.lcExpanded = !state.lcExpanded;
+        renderLastConvo();
+      });
+      bodyKids.push(moreBtn);
+    }
+    lastConvoEl.replaceChildren(header, el('div', { className: 'section-body' }, bodyKids));
+    lastConvoEl.classList.add('collapsible-section');
+    lastConvoEl.classList.toggle('collapsed', collapsed);
+    lastConvoEl.classList.remove('hidden');
   }
 
   // Adapts BranchMemoryItem → the minimal display-item shape renderCommitRow
@@ -2658,24 +3000,13 @@ export function buildSidebarScript(): string {
       }
       bodyKids.unshift(el('div', { className: 'foreign-banner' }, kids));
     }
-    // Primary CTA mounted as a SIBLING of .section-body so it survives the
-    // Changes section being collapsed. Commit Memory operates on the group
-    // (Plans + Changes + Commits selections together), so hiding it whenever
-    // the user folds Changes makes the cross-panel action unreachable. The
-    // header sparkle iconbtn is too easy to miss, and a labelled button
-    // mirrors the SCM "Commit" pattern users expect. Stays visible when
-    // Changes is empty (sits below the empty-state placeholder, disabled via
-    // renderCommitMemoryButton's selectedCount===0 guard). Foreign-readonly
-    // mode drops the Changes section entirely above, so the s.id==='changes'
-    // predicate already implicitly excludes foreign view — no extra check
-    // needed.
+    // Commit Memory is no longer appended here — it lives in the Working
+    // Memory card (renderWorkingMemoryCard), which owns the cross-panel
+    // assembly (Conversations + Context + Changes) and the CTA together.
     const sectionKids = [
-      el('div', { className: 'section-header' }, headerKids),
+      el('div', { className: 'section-header', role: 'button', tabindex: '0', 'aria-expanded': String(!collapsed) }, headerKids),
       el('div', { className: 'section-body' }, bodyKids),
     ];
-    if (s.id === 'changes') {
-      sectionKids.push(renderCommitMemoryButton());
-    }
     return el('div', {
       className: 'collapsible-section' + (collapsed ? ' collapsed' : ''),
       'data-section': s.id,
@@ -3102,6 +3433,12 @@ export function buildSidebarScript(): string {
     }, kids), item.tooltip || '');
   }
 
+  // Grace window after a commit during which a missing summary is treated as
+  // "still generating" (the post-commit worker holds a 5-min lock; generation
+  // itself is ~20-40s but can queue behind other commits). Past this, a
+  // missing summary is treated as genuinely absent and the row offers Generate.
+  const GENERATING_WINDOW_MS = 10 * 60 * 1000;
+
   function renderCommitRow(item, depth) {
     const hasMem = item.contextValue === 'commitWithMemory';
     // Children are pre-serialized by HistoryTreeProvider when CommitItem
@@ -3118,6 +3455,10 @@ export function buildSidebarScript(): string {
               (expanded ? 'codicon-chevron-down' : 'codicon-chevron-right') +
               ' commit-twirl',
             'data-commit-toggle': item.id,
+            role: 'button',
+            tabindex: '0',
+            'aria-expanded': String(expanded),
+            'aria-label': (expanded ? 'Collapse' : 'Expand') + ' memory detail',
           }),
           expanded ? 'Collapse' : 'Expand',
         )
@@ -3203,7 +3544,37 @@ export function buildSidebarScript(): string {
           );
       kids.push(el('span', { className: 'inline-actions' }, [inlineBtn]));
     } else {
-      kids.push(el('span', { className: 'inline-actions' }));
+      // No stored memory. A just-committed memory is summarized asynchronously
+      // (~20-40s), so within a short window show a passive "Generating…"
+      // indicator rather than an action. Once that window has passed the
+      // summary genuinely didn't land — offer a one-click Generate. Foreign
+      // rows are always memory-backed (never reach here), but guard anyway:
+      // generating writes the workspace orphan branch.
+      const committedMs = item.committedAt ? Date.parse(item.committedAt) : NaN;
+      const isPending = !isNaN(committedMs) && (Date.now() - committedMs) < GENERATING_WINDOW_MS;
+      if (isPending) {
+        kids.push(el('span', { className: 'inline-actions' }, [
+          el('span', { className: 'mem-generating', title: 'Memory is being generated…' }, [
+            el('i', { className: 'codicon codicon-loading codicon-modifier-spin' }),
+            el('span', { text: 'Generating…' }),
+          ]),
+        ]));
+      } else if (!isViewingForeign()) {
+        kids.push(el('span', { className: 'inline-actions' }, [
+          attachTextTip(
+            el('button', {
+              type: 'button',
+              className: 'iconbtn',
+              'data-inline': 'generate',
+              'data-id': item.id,
+              'aria-label': 'Generate memory',
+            }, [el('i', { className: 'codicon codicon-sparkle' })]),
+            'Generate memory',
+          ),
+        ]));
+      } else {
+        kids.push(el('span', { className: 'inline-actions' }));
+      }
     }
     // No title= attribute — hover content is rendered by the custom
     // .hover-card popup (renderHoverCard / showHoverCard) so the legacy
@@ -3216,15 +3587,57 @@ export function buildSidebarScript(): string {
       'data-id': item.id,
     }, kids);
     if (!expanded) return row;
-    // Children share the parent commit's depth (not depth + 1) so the
-    // file-row icon column-aligns with the commit row's leading M↓ /
-    // git-commit icon. The chevron on the commit row already signals the
-    // parent/child relationship, so an extra 20px indent on the file rows
-    // would just visually break the icon column without adding info.
+    // Grouped expansion mirrors the Working Memory card: Conversations +
+    // Context (lazy-loaded from this memory's summary via branch:loadCommitDetail)
+    // then Files. Children share the parent commit's depth so the file-row icon
+    // column-aligns with the commit row's leading glyph.
+    const out = [row];
+    // Lazy + reload-safe: an expanded row with no cached detail (first expand,
+    // OR a reload that cleared the cache) requests it now and shows a spinner.
+    // Setting 'loading' synchronously means repeat renders don't re-request,
+    // and the host always replies (even on error) so this never hangs.
+    let detail = state.commitDetail[item.id];
+    if (detail === undefined) {
+      state.commitDetail[item.id] = 'loading';
+      detail = 'loading';
+      vscode.postMessage({ type: 'branch:loadCommitDetail', hash: item.id });
+    }
+    const groupLabel = (text) => el('div', { className: 'commit-detail-group', text: text });
+    const cap = (s) => { const v = String(s || ''); return v ? v.charAt(0).toUpperCase() + v.slice(1) : 'Unknown'; };
+    if (detail === 'loading') {
+      out.push(el('div', { className: 'commit-detail-loading', text: 'Loading conversations & context…' }));
+    } else {
+      if (detail.conversations && detail.conversations.length) {
+        out.push(groupLabel('Conversations'));
+        detail.conversations.forEach(function(c) {
+          const n = c.messageCount || 0;
+          out.push(el('div', { className: 'commit-detail-row' }, [
+            // Use the shared providerLabel (OpenCode / Copilot Chat) so this
+            // matches the Conversations banner above — cap() is kept only for
+            // the context kinds (plan/note/reference) below.
+            el('span', { className: 'cd-kind', text: providerLabel(c.source) }),
+            el('span', { className: 'cd-text', text: n + ' message' + (n === 1 ? '' : 's') }),
+          ]));
+        });
+      }
+      if (detail.context && detail.context.length) {
+        out.push(groupLabel('Context'));
+        detail.context.forEach(function(x) {
+          out.push(el('div', { className: 'commit-detail-row' }, [
+            el('span', { className: 'cd-kind', text: cap(x.kind) }),
+            el('span', { className: 'cd-text', text: x.label || '' }),
+          ]));
+        });
+      }
+    }
     const fileRows = item.children.map(function(c) {
       return renderCommitFileRow(c, depth);
     });
-    return [row].concat(fileRows);
+    if (fileRows.length) {
+      out.push(groupLabel('Files'));
+      for (let i = 0; i < fileRows.length; i++) out.push(fileRows[i]);
+    }
+    return out;
   }
 
   function renderCommitFileRow(item, depth) {
@@ -3373,8 +3786,53 @@ export function buildSidebarScript(): string {
       e.stopPropagation();
       return;
     }
-    // Bottom-of-section Commit Memory CTA — not gated on .section-actions
-    // because it lives inside .section-body, not the header. Routes to the
+    // Working Memory card: the Review chevron expands the editable attached
+    // Conversations / Context / Changes. State is client-side; re-render.
+    // Clickable selection counts in the assembly sentence — open (not toggle)
+    // Review so the attached items are visible and editable in one tap.
+    const wmOpenReview = e.target.closest('[data-action="wm-open-review"]');
+    if (wmOpenReview) {
+      if (!wmReviewing) {
+        wmReviewing = true;
+        renderBranch();
+      }
+      // Scroll the named sub-section into view even when Review is already
+      // open, so the count behaves like a deep-link to the items it describes
+      // (rather than a no-op once the panel is expanded).
+      const target = wmOpenReview.getAttribute('data-wm-target');
+      if (target) {
+        const sec = document.querySelector('.wm-review-body .collapsible-section[data-section="' + target + '"]');
+        if (sec && sec.scrollIntoView) sec.scrollIntoView({ block: 'nearest' });
+      }
+      e.stopPropagation();
+      return;
+    }
+    const wmReview = e.target.closest('[data-action="wm-review-toggle"]');
+    if (wmReview) {
+      wmReviewing = !wmReviewing;
+      renderBranch();
+      e.stopPropagation();
+      return;
+    }
+    const wmPreview = e.target.closest('[data-action="wm-preview-open"]');
+    if (wmPreview) {
+      // Gather the currently-selected items WITH the ids the pop-out needs to
+      // toggle exclusion. Files key off the relative path (item.description,
+      // mirrored to data-rel-path); context off id + contextValue.
+      const files = (branchData.changes || [])
+        .filter(function(i) { return !!i.isSelected; })
+        .map(function(i) { return { label: String(i.label || ''), relPath: String(i.description || '') }; });
+      const conversations = (branchData.conversations || [])
+        .filter(function(i) { return !!i.isSelected; })
+        .map(function(i) { return { title: String(i.title || '(untitled)'), source: String(i.source || ''), sessionId: String(i.sessionId || '') }; });
+      const context = (branchData.plans || [])
+        .filter(function(i) { return !!i.isSelected; })
+        .map(function(i) { return { label: String(i.label || ''), contextValue: String(i.contextValue || ''), id: String(i.id || '') }; });
+      vscode.postMessage({ type: 'branch:previewNextMemory', files: files, conversations: conversations, context: context });
+      e.stopPropagation();
+      return;
+    }
+    // Commit Memory CTA — lives in the Working Memory card. Routes to the
     // same command as the header sparkle iconbtn.
     const commitMemoryBtn = e.target.closest('.commit-memory-btn[data-action="changes-commit-memory"]');
     if (commitMemoryBtn && !commitMemoryBtn.disabled) {
@@ -3421,6 +3879,9 @@ export function buildSidebarScript(): string {
     if (commitToggle) {
       const hash = commitToggle.getAttribute('data-commit-toggle');
       state.commitsExpanded[hash] = !state.commitsExpanded[hash];
+      // The detail fetch is render-driven (renderCommitRow requests it when an
+      // expanded row has no cached detail), so it fires for both this click and
+      // a reload that restored the expanded state — nothing to request here.
       persist();
       renderBranch();
       e.stopPropagation();
@@ -3502,6 +3963,19 @@ export function buildSidebarScript(): string {
         // the commit hash through the multi-repo summary index so it works
         // for both workspace and foreign hashes.
         vscode.postMessage({ type: 'command', command: 'jollimemory.copyRecallPrompt', args: [id] });
+      }
+      if (action === 'generate') {
+        // One-click generate for a workspace commit whose summary never
+        // landed. The command bootstraps from the hash, persists, refreshes
+        // the list, then opens the panel on the result. Only rendered on
+        // workspace rows, so it never targets a foreign repo's orphan branch.
+        vscode.postMessage({ type: 'command', command: 'jollimemory.generateMemory', args: [id] });
+      }
+      if (action === 'open-reference') {
+        vscode.postMessage({ type: 'branch:openReference', mapKey: id });
+      }
+      if (action === 'ignore-reference') {
+        vscode.postMessage({ type: 'branch:ignoreReference', mapKey: id });
       }
       e.stopPropagation();
       return;
@@ -3728,6 +4202,12 @@ export function buildSidebarScript(): string {
       const items = [];
       if (ctx === 'commitWithMemory') {
         items.push({ label: 'View Memory',      command: 'jollimemory.viewSummary',    args: [id] });
+        items.push({ separator: true });
+      } else if (!isViewingForeign()) {
+        // Workspace commit with no memory yet — offer to generate one.
+        // Skipped in foreign view: generating writes the workspace orphan
+        // branch, which would corrupt the foreign repo's memory identity.
+        items.push({ label: 'Generate memory', command: 'jollimemory.generateMemory', args: [id] });
         items.push({ separator: true });
       }
       items.push({ label: 'Copy Commit Hash', command: 'jollimemory.copyCommitHash', args: [id] });

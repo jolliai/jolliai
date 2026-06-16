@@ -116,6 +116,13 @@ export interface SerializedTreeItem {
 	/** Commits panel only: whether this commit has an associated memory summary. */
 	readonly hasMemory?: boolean;
 	/**
+	 * Commits panel only: ISO 8601 commit date. Distinguishes a recently
+	 * committed memory still being generated asynchronously ("pending") from an
+	 * older commit whose summary never landed ("needs generation"), so the row
+	 * shows a passive "Generating…" indicator vs a Generate action.
+	 */
+	readonly committedAt?: string;
+	/**
 	 * Commits panel only: structured hover-card data, mirroring the Memories
 	 * panel's `MemoryItem.hover` so the webview can drive both rows through
 	 * the same `.hover-card` popover. Absent on file rows.
@@ -448,6 +455,15 @@ export type SidebarOutboundMsg =
 	| { readonly type: "branch:openCommit"; readonly hash: string }
 	| {
 			/**
+			 * Lazy-load a committed memory's attached conversations + context when
+			 * its sidebar row is expanded. Host replies with `commitDetailLoaded`.
+			 * One read per expand — never eager for every row (perf).
+			 */
+			readonly type: "branch:loadCommitDetail";
+			readonly hash: string;
+	  }
+	| {
+			/**
 			 * User clicked a row in the CONVERSATIONS section. Host opens a
 			 * dedicated ConversationDetailsPanel keyed by `sessionId`, reading
 			 * the transcript from `transcriptPath` using the source-specific
@@ -465,6 +481,28 @@ export type SidebarOutboundMsg =
 			 * tab title and the row label never drift.
 			 */
 			readonly title: string;
+	  }
+	| {
+			/**
+			 * Working Memory card "Preview" button — opens the editable pop-out
+			 * (NextMemoryPreviewPanel) for what the next Commit Memory will capture.
+			 * Each item carries the id the host needs to toggle its exclusion via
+			 * the same apply* path the sidebar checkboxes use (files key off the
+			 * RELATIVE path; context off id + contextValue; conversations off
+			 * source + sessionId).
+			 */
+			readonly type: "branch:previewNextMemory";
+			readonly files: ReadonlyArray<{ readonly label: string; readonly relPath: string }>;
+			readonly conversations: ReadonlyArray<{
+				readonly title: string;
+				readonly source: string;
+				readonly sessionId: string;
+			}>;
+			readonly context: ReadonlyArray<{
+				readonly label: string;
+				readonly contextValue: string;
+				readonly id: string;
+			}>;
 	  }
 	| {
 			/**
@@ -543,6 +581,23 @@ export type SidebarOutboundMsg =
 
 export type SidebarInboundMsg =
 	| { readonly type: "init"; readonly state: SidebarState }
+	| {
+			/**
+			 * Response to `branch:loadCommitDetail` — the conversations + context
+			 * attached to a committed memory, for its grouped inline expansion
+			 * (mirrors the Working Memory card's groups).
+			 */
+			readonly type: "commitDetailLoaded";
+			readonly hash: string;
+			readonly conversations: ReadonlyArray<{
+				readonly source: string;
+				readonly messageCount: number;
+			}>;
+			readonly context: ReadonlyArray<{
+				readonly kind: "plan" | "note" | "reference";
+				readonly label: string;
+			}>;
+	  }
 	| { readonly type: "kb:foldersData"; readonly tree: FolderNode }
 	| {
 			/**

@@ -94,7 +94,7 @@ import { formatShortRelativeDate } from "./util/FormatUtils.js";
 import { isWorkerBusy } from "./util/LockUtils.js";
 import { initLogger, log } from "./util/Logger.js";
 import { StatusBarManager } from "./util/StatusBarManager.js";
-import { getWorkspaceRoot } from "./util/WorkspaceUtils.js";
+import { getWorkspaceRoot, loadGlobalConfig } from "./util/WorkspaceUtils.js";
 import { computeChangesBadge } from "./views/ChangesBadge.js";
 import { NoteEditorWebviewPanel } from "./views/NoteEditorWebviewPanel.js";
 import { SettingsWebviewPanel } from "./views/SettingsWebviewPanel.js";
@@ -207,6 +207,40 @@ function parseSummaryFrontmatter(
 	}
 	if (type !== "commit" || !commitHash) return null;
 	return { commitHash };
+}
+
+/**
+ * Builds a minimal placeholder summary for a commit that has no stored summary
+ * yet, so the detail panel can open in its "Generate memory" state instead of
+ * dead-ending. Pulls real commit metadata (message/author/date) for the title
+ * + header; falls back to the bare hash if the commit can't be read.
+ */
+async function buildPlaceholderSummary(
+	bridge: JolliMemoryBridge,
+	hash: string,
+): Promise<import("../../cli/src/Types.js").CommitSummary> {
+	let message = "";
+	let author = "";
+	let date = "";
+	try {
+		const info = await bridge.getCommitInfo(hash);
+		message = info.message;
+		author = info.author;
+		date = info.date;
+	} catch {
+		// Commit metadata unavailable (shallow clone / gone) — show the hash alone.
+	}
+	return {
+		version: 4,
+		commitHash: hash,
+		commitMessage: message,
+		commitAuthor: author,
+		commitDate: date,
+		branch: "",
+		generatedAt: new Date().toISOString(),
+		topics: [],
+		recap: "",
+	};
 }
 
 /**
@@ -828,6 +862,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			currentRepoName: sidebarRepoName,
 		}),
 		extensionUri: context.extensionUri,
+		loadCommitMemoryDetail: (hash) => bridge.getCommitMemoryDetail(hash),
 		statusProvider: {
 			serialize: () => statusProvider.serialize(),
 			onDidChangeTreeData:
@@ -2539,7 +2574,6 @@ export function activate(context: vscode.ExtensionContext): void {
 			async (item: CommitItem | string) => {
 				const hash = typeof item === "string" ? item : item.commit.hash;
 				const summary = await bridge.getSummary(hash);
-				if (!summary) return;
 				// Local commits also read from the Memory Bank folder layer so
 				// the detail-panel data path is uniform with foreign-repo
 				// panels (and with the user-visible KB tree). Falls back to
@@ -2547,8 +2581,12 @@ export function activate(context: vscode.ExtensionContext): void {
 				// uses bridge-default reads.
 				const readStorageResult =
 					await bridge.createReadStorageForCurrentRepo();
+				// No stored summary → open a placeholder panel in its
+				// "Generate memory" state instead of silently doing nothing.
+				// This is a local commit (workspace orphan branch is writable),
+				// so generating from here is safe.
 				await SummaryWebviewPanel.show(
-					summary,
+					summary ?? (await buildPlaceholderSummary(bridge, hash)),
 					context.extensionUri,
 					workspaceRoot,
 					bridge,
@@ -2557,6 +2595,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					null,
 					null,
 					readStorageResult?.storage ?? null,
+					!summary,
 				);
 			},
 		),
@@ -2569,7 +2608,6 @@ export function activate(context: vscode.ExtensionContext): void {
 			"jollimemory.viewMemorySummary",
 			async (item: MemoryItem | string) => {
 				const hash = typeof item === "string" ? item : item.entry.commitHash;
-				const shortHash = hash.substring(0, 7);
 				// Timeline view aggregates memories across every repo under the
 				// Memory Bank parent (see JolliMemoryBridge.listSummaryEntries),
 				// so a clicked row may belong to a non-current repo whose
@@ -2584,8 +2622,22 @@ export function activate(context: vscode.ExtensionContext): void {
 				const { summary, sourceRepoName, sourceRemoteUrl } =
 					await bridge.getSummaryAnyRepoWithSource(hash);
 				if (!summary) {
-					vscode.window.showInformationMessage(
-						`Jolli Memory: No summary found for commit ${shortHash}.`,
+					// Not found in any repo → treat as a local commit with no
+					// memory yet and open the placeholder panel offering to
+					// generate one, rather than dead-ending on a toast. (A
+					// genuinely foreign commit would have resolved above with a
+					// sourceRepoName, so reaching here means it's local.)
+					await SummaryWebviewPanel.show(
+						await buildPlaceholderSummary(bridge, hash),
+						context.extensionUri,
+						workspaceRoot,
+						bridge,
+						commitsStore.getMainBranch(),
+						"memory",
+						null,
+						null,
+						(await bridge.createReadStorageForCurrentRepo())?.storage ?? null,
+						true,
 					);
 					return;
 				}
@@ -2610,6 +2662,46 @@ export function activate(context: vscode.ExtensionContext): void {
 					sourceRemoteUrl,
 					readStorageResult?.storage ?? null,
 				);
+			},
+		),
+
+		// Generates a memory for a commit that has none yet — the one-click
+		// path from a "Generate memory" row affordance (sidebar) so the user
+		// doesn't have to open the panel first. Bootstraps from the commit hash
+		// via the Bridge, persists, refreshes the history list so the row flips
+		// to a real memory, then opens the panel on the result. Workspace-local
+		// only: generating writes the workspace orphan branch, so this command
+		// is never offered for foreign-repo rows.
+		vscode.commands.registerCommand(
+			"jollimemory.generateMemory",
+			async (item: CommitItem | MemoryItem | string) => {
+				const hash =
+					typeof item === "string"
+						? item
+						: "commit" in item
+							? item.commit.hash
+							: item.entry.commitHash;
+				const config = await loadGlobalConfig();
+				try {
+					await vscode.window.withProgress(
+						{
+							location: vscode.ProgressLocation.Notification,
+							title: "Generating memory…",
+							cancellable: false,
+						},
+						async () => {
+							const result = await bridge.summarizeCommit(hash, config);
+							await bridge.storeSummary(result.updated, true);
+						},
+					);
+				} catch (err) {
+					vscode.window.showErrorMessage(
+						`Jolli Memory: Could not generate memory — ${err instanceof Error ? err.message : String(err)}`,
+					);
+					return;
+				}
+				await vscode.commands.executeCommand("jollimemory.refreshHistory");
+				await vscode.commands.executeCommand("jollimemory.viewSummary", hash);
 			},
 		),
 
@@ -2970,6 +3062,131 @@ export function activate(context: vscode.ExtensionContext): void {
 					`vscode://anthropic.claude-code/open?prompt=${encoded}`,
 				);
 				await vscode.env.openExternal(uri);
+			},
+		),
+
+		// Branch-level Recall (sidebar action bar) — opens Claude Code with the
+		// WHOLE branch's context (every memory + open plans), the same prompt
+		// `jolli recall` emits. Distinct from the per-memory openInClaudeCode
+		// above; right-click on the button copies the prompt instead (handled in
+		// the webview). Empty branch → a friendly no-op notice.
+		vscode.commands.registerCommand("jollimemory.recallBranch", async () => {
+			const branch = await bridge.getCurrentBranch();
+			let prompt: string;
+			try {
+				prompt = await bridge.compileBranchRecall(branch);
+			} catch (err) {
+				vscode.window.showErrorMessage(
+					`Jolli Memory: Could not build recall context — ${err instanceof Error ? err.message : String(err)}`,
+				);
+				return;
+			}
+			if (!prompt || prompt.trim().length === 0) {
+				vscode.window.showInformationMessage(
+					"Jolli Memory: No memories on this branch to recall yet.",
+				);
+				return;
+			}
+			// Recall's deep link is handled by the Claude Code extension. If it
+			// isn't installed, openExternal would hand off a vscode:// URI that
+			// nothing can handle — a dead click for Codex/Cursor/other-tool users.
+			// Detect it and fall back to copying the prompt (the tool-neutral
+			// path), offering a one-click install.
+			if (!vscode.extensions.getExtension("anthropic.claude-code")) {
+				await vscode.env.clipboard.writeText(prompt);
+				const INSTALL = "Install Claude Code";
+				const choice = await vscode.window.showInformationMessage(
+					"Jolli Memory: Claude Code isn't installed — recall prompt copied to your clipboard. Paste it into your AI tool.",
+					INSTALL,
+				);
+				if (choice === INSTALL) {
+					await vscode.env.openExternal(
+						vscode.Uri.parse("vscode:extension/anthropic.claude-code"),
+					);
+				}
+				return;
+			}
+			const uri = vscode.Uri.parse(
+				`vscode://anthropic.claude-code/open?prompt=${encodeURIComponent(prompt)}`,
+			);
+			await vscode.env.openExternal(uri);
+		}),
+
+		// Copy the branch-level recall prompt to the clipboard — the right-click
+		// twin of recallBranch, for pasting into Codex / Cursor / any tool.
+		vscode.commands.registerCommand("jollimemory.copyBranchRecall", async () => {
+			const branch = await bridge.getCurrentBranch();
+			let prompt: string;
+			try {
+				prompt = await bridge.compileBranchRecall(branch);
+			} catch (err) {
+				vscode.window.showErrorMessage(
+					`Jolli Memory: Could not build recall context — ${err instanceof Error ? err.message : String(err)}`,
+				);
+				return;
+			}
+			if (!prompt || prompt.trim().length === 0) {
+				vscode.window.showInformationMessage(
+					"Jolli Memory: No memories on this branch to recall yet.",
+				);
+				return;
+			}
+			await vscode.env.clipboard.writeText(prompt);
+			vscode.window.showInformationMessage(
+				"Recall prompt copied — paste into Codex, Cursor, or any AI tool.",
+			);
+		}),
+
+		// Create PR (sidebar action bar) — v1 opens the most-recent memory's
+		// detail panel, where the existing branch-level Create PR action lives
+		// (the PR flow shows a review form inside that panel before `gh pr
+		// create`, so it can't run fully headless yet — true one-click standalone
+		// is a follow-up). No memory yet → friendly notice.
+		vscode.commands.registerCommand("jollimemory.createBranchPr", async () => {
+			const snap = commitsStore.getSnapshot();
+			const latest = (snap.commits || []).find((c) => c.hasSummary);
+			if (!latest) {
+				vscode.window.showInformationMessage(
+					"Jolli Memory: No memories on this branch yet — commit one before opening a PR.",
+				);
+				return;
+			}
+			await vscode.commands.executeCommand("jollimemory.viewSummary", latest.hash);
+		}),
+
+		// Continue (true resume) for a captured conversation — invoked from the
+		// last-conversation banner's Continue button. Only wired for Claude
+		// sessions: `claude --resume <sessionId>` reopens that exact session.
+		// Other sources have no resume mechanism, so the banner never shows
+		// Continue for them; the guard here is belt-and-suspenders.
+		vscode.commands.registerCommand(
+			"jollimemory.continueConversation",
+			(source: unknown, sessionId: unknown) => {
+				// `sendText` types into a real shell, so an unvalidated sessionId
+				// would be a command-injection sink (JSON.stringify does NOT
+				// neutralize $()/backticks). sessionId crosses the webview trust
+				// boundary (it originates from on-disk session metadata that an
+				// untrusted cloned repo could carry), so hard-restrict it to the
+				// UUID / hex-hash shape Claude session ids actually take —
+				// [0-9a-fA-F-] only — which makes shell metacharacters impossible.
+				if (
+					source !== "claude" ||
+					typeof sessionId !== "string" ||
+					!/^[0-9a-fA-F][0-9a-fA-F-]{7,63}$/.test(sessionId)
+				) {
+					vscode.window.showInformationMessage(
+						"Resume is only available for Claude Code sessions.",
+					);
+					return;
+				}
+				const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+				const terminal = vscode.window.createTerminal({
+					name: "Claude — resume",
+					cwd,
+				});
+				// Safe: sessionId is validated above to contain only [0-9a-fA-F-].
+				terminal.sendText(`claude --resume ${sessionId}`);
+				terminal.show();
 			},
 		),
 

@@ -222,6 +222,7 @@ export class HistoryTreeProvider
 			enriched = {
 				...base,
 				hasMemory: !!item.commit.hasSummary,
+				committedAt: item.commit.date,
 				hover: buildHover(item.commit),
 				isSelected: item.checkboxState === vscode.TreeItemCheckboxState.Checked,
 			};

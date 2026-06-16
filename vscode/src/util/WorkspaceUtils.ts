@@ -43,3 +43,25 @@ export function resolveCLIPath(extensionPath: string): string | null {
 export function loadGlobalConfig(): Promise<JolliMemoryConfig> {
 	return loadConfigFromDir(getGlobalConfigDir());
 }
+
+/**
+ * The transcript sources enabled in config, as a Set of source tags. Each
+ * `<source>Enabled` flag is opt-OUT (a missing/true flag = enabled); only an
+ * explicit `false` disables. Copilot's single flag gates both the CLI and Chat
+ * source tags (they ship together — see CLAUDE.md). Single source of truth for
+ * every "which conversations count" path (the Summary panel's transcript stats
+ * and the sidebar's committed-memory detail) so they never drift apart.
+ */
+export function resolveEnabledSources(config: JolliMemoryConfig): Set<string> {
+	const sources = new Set<string>();
+	if (config.claudeEnabled !== false) sources.add("claude");
+	if (config.codexEnabled !== false) sources.add("codex");
+	if (config.geminiEnabled !== false) sources.add("gemini");
+	if (config.openCodeEnabled !== false) sources.add("opencode");
+	if (config.cursorEnabled !== false) sources.add("cursor");
+	if (config.copilotEnabled !== false) {
+		sources.add("copilot");
+		sources.add("copilot-chat");
+	}
+	return sources;
+}

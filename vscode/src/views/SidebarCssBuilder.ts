@@ -365,6 +365,17 @@ export function buildSidebarCss(): string {
   .iconbtn--sm .codicon {
     font-size: 12px;
   }
+  /* Passive "Generating…" indicator on a just-committed row whose summary is
+     still being produced asynchronously. Non-interactive (no button) — it
+     flips to a Generate action once the grace window passes. */
+  .mem-generating {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    opacity: 0.7;
+    color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+  }
 
   .tab-content {
     flex: 1;
@@ -546,6 +557,29 @@ export function buildSidebarCss(): string {
   .tree-node[data-indent="6"] { padding-left: 128px; }
   .tree-node[data-indent="7"] { padding-left: 148px; }
   .tree-node[data-indent="8"] { padding-left: 168px; }
+  /* Committed-memory grouped expansion (Conversations / Context / Files) —
+     lazy-loaded on expand; mirrors the Working Memory card's grouping. */
+  .commit-detail-group {
+    font-size: 9px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--vscode-descriptionForeground); padding: 5px 10px 1px 28px;
+  }
+  .commit-detail-row {
+    display: flex; align-items: center; gap: 6px; padding: 2px 10px 2px 28px;
+    font-size: 12px; min-width: 0;
+  }
+  .commit-detail-row .cd-kind {
+    font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--vscode-descriptionForeground); flex-shrink: 0;
+    border: 1px solid var(--jolli-border); border-radius: 4px; padding: 0 5px; line-height: 15px;
+  }
+  .commit-detail-row .cd-text {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--vscode-foreground);
+  }
+  .commit-detail-loading {
+    padding: 4px 10px 4px 28px; font-size: 11px; font-style: italic;
+    color: var(--vscode-descriptionForeground);
+  }
   /* KB tab folder-mode rows carry data-kind="dir|file" (set by the
      folder renderer) — branch tab rows use data-context instead, so this
      selector cleanly scopes the spacing bump to folder mode. We match
@@ -738,13 +772,15 @@ export function buildSidebarCss(): string {
      specificity (0,4,0) beats the neutral fallback above (0,3,0); a bare
      '.transcript-source-X' rule (0,1,0) is silently overridden and the
      badge stays descriptionForeground-gray. */
-  .tree-node.conversation-row .badge.transcript-source-claude       { color: #a78bfa; border-color: #a78bfa; background: rgba(167,139,250,0.12); }
-  .tree-node.conversation-row .badge.transcript-source-cursor       { color: #2dd4bf; border-color: #2dd4bf; background: rgba(45,212,191,0.12); }
-  .tree-node.conversation-row .badge.transcript-source-codex        { color: #4ade80; border-color: #4ade80; background: rgba(74,222,128,0.12); }
-  .tree-node.conversation-row .badge.transcript-source-gemini       { color: #60a5fa; border-color: #60a5fa; background: rgba(96,165,250,0.12); }
-  .tree-node.conversation-row .badge.transcript-source-opencode     { color: #fb923c; border-color: #fb923c; background: rgba(251,146,60,0.12); }
-  .tree-node.conversation-row .badge.transcript-source-copilot      { color: #94a3b8; border-color: #94a3b8; background: rgba(148,163,184,0.12); }
-  .tree-node.conversation-row .badge.transcript-source-copilot-chat { color: #fbbf24; border-color: #fbbf24; background: rgba(251,191,36,0.12); }
+  /* Per-source badge colours — shared by the CONVERSATIONS rows and the
+     last-conversation banner so both read with the same brand vocabulary. */
+  .tree-node.conversation-row .badge.transcript-source-claude,       .last-convo .badge.transcript-source-claude       { color: #a78bfa; border-color: #a78bfa; background: rgba(167,139,250,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-cursor,       .last-convo .badge.transcript-source-cursor       { color: #2dd4bf; border-color: #2dd4bf; background: rgba(45,212,191,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-codex,        .last-convo .badge.transcript-source-codex        { color: #4ade80; border-color: #4ade80; background: rgba(74,222,128,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-gemini,       .last-convo .badge.transcript-source-gemini       { color: #60a5fa; border-color: #60a5fa; background: rgba(96,165,250,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-opencode,     .last-convo .badge.transcript-source-opencode     { color: #fb923c; border-color: #fb923c; background: rgba(251,146,60,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-copilot,      .last-convo .badge.transcript-source-copilot      { color: #94a3b8; border-color: #94a3b8; background: rgba(148,163,184,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-copilot-chat, .last-convo .badge.transcript-source-copilot-chat { color: #fbbf24; border-color: #fbbf24; background: rgba(251,191,36,0.12); }
 
   /* "Edited" marker — codicon-edit pencil glyph rendered inline after the
      row title. Intentionally a thin icon (no pill / border / fill) so it
@@ -1169,6 +1205,200 @@ export function buildSidebarCss(): string {
     content: "";
     flex: 1;
     border-top: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
+  }
+
+  /* ============================================================
+     SIDEBAR REDESIGN — Phase 1 primitives.
+     Brand accent is layered ON TOP of VS Code theme tokens:
+     accents only (CTA fill, links, chips, focus). Backgrounds and
+     text stay on --vscode-* so user themes are always respected.
+     Backgrounds/borders use editorWidget/widget tokens; high-contrast
+     themes pull borders from --vscode-contrastBorder.
+     ============================================================ */
+  body {
+    --jolli-accent: #6ba5f8;        /* borders, icons, LED dots (non-text, >=3:1) */
+    --jolli-accent-text: #6ba5f8;   /* TEXT-safe accent + CTA fill (AA on dark) */
+    --jolli-on-accent: #0b1f3a;     /* text on the accent CTA */
+    --jolli-surface: var(--vscode-editorWidget-background, rgba(128,128,128,0.06));
+    --jolli-surface-inner: var(--vscode-textBlockQuote-background, rgba(128,128,128,0.10));
+    --jolli-border: var(--vscode-widget-border, var(--vscode-editorWidget-border, rgba(128,128,128,0.25)));
+  }
+  body.vscode-light {
+    --jolli-accent: #3f85f5;
+    --jolli-accent-text: #2563eb;   /* #3f85f5 on white is 3.6:1 — fails AA for text/CTA */
+    --jolli-on-accent: #ffffff;
+  }
+  body.vscode-high-contrast, body.vscode-high-contrast-light {
+    --jolli-border: var(--vscode-contrastBorder, var(--jolli-border));
+  }
+
+  /* ── Last-conversation banner: always above Working Memory ── */
+  /* Borderless full-width section (uniform with Working Memory + Committed
+     Memories) — pinned above the scroll; no card box. */
+  .last-convo {
+    flex-shrink: 0;
+    display: flex; flex-direction: column;
+  }
+  .last-convo .lc-head { display: flex; align-items: center; gap: 6px; }
+  .last-convo .lc-title {
+    font-size: 12px; font-weight: 600; flex: 1; min-width: 0;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .last-convo .lc-sub { font-size: 10.5px; color: var(--vscode-descriptionForeground); margin-top: 2px; }
+  .last-convo .lc-actions { display: flex; gap: 6px; margin-top: 8px; }
+  /* Stacked conversations revealed by "Show more": a hairline separator + spacing
+     between each, so the latest stays visually primary. */
+  .last-convo .lc-item + .lc-item {
+    margin-top: 8px; padding-top: 8px;
+    border-top: 1px solid var(--jolli-border);
+  }
+  .last-convo .lc-more-toggle {
+    margin-top: 8px; padding: 2px 0; background: none; border: none; cursor: pointer;
+    font-size: 11px; color: var(--vscode-textLink-foreground);
+  }
+  .last-convo .lc-more-toggle:hover { text-decoration: underline; }
+  /* Two-button action bar (Recall / Create PR) pinned at the BOTTOM of the
+     sidebar, below the scrolling content. flex-shrink:0 keeps it fixed while
+     the list scrolls; border-top separates it from the content above. */
+  .action-bar-dock {
+    display: flex; gap: 6px; flex-shrink: 0;
+    padding: 8px 10px;
+    border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
+    background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+  }
+  .action-bar-btn {
+    flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600;
+    background: none; color: var(--vscode-foreground); border: 1px solid var(--jolli-border);
+  }
+  .action-bar-btn:hover {
+    background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15));
+    border-color: var(--jolli-accent);
+  }
+  .action-bar-btn.primary {
+    background: var(--jolli-accent-text); color: var(--jolli-on-accent); border-color: transparent;
+  }
+  .action-bar-btn.primary:hover { filter: brightness(1.08); background: var(--jolli-accent-text); }
+  .action-bar-btn .codicon { font-size: 14px; }
+  /* Recall split button: main action + ▾ caret menu, joined as one control. */
+  .action-bar-split { flex: 1; display: flex; }
+  .action-bar-split .action-bar-btn { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+  .action-bar-caret {
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 7px 8px; cursor: pointer; flex-shrink: 0;
+    background: var(--jolli-accent-text); color: var(--jolli-on-accent);
+    border: 1px solid transparent;
+    border-top-right-radius: 6px; border-bottom-right-radius: 6px;
+    /* Darken the caret segment so the split button reads as two parts — the
+       filled Recall action + a distinct ▾ dropdown — instead of one fused
+       button. A solid divider in the on-accent color reinforces the seam. */
+    border-left: 1px solid var(--jolli-on-accent);
+    filter: brightness(0.82);
+  }
+  .action-bar-caret:hover { filter: brightness(1); }
+  .action-bar-caret .codicon { font-size: 14px; }
+  .last-convo .lc-actions button {
+    flex: 1; font-size: 11px; padding: 4px 6px; cursor: pointer;
+    border: 1px solid var(--jolli-border); border-radius: 5px;
+    background: none; color: var(--vscode-foreground);
+  }
+  .last-convo .lc-actions button:hover {
+    background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15));
+    border-color: var(--jolli-accent);
+  }
+  .last-convo .lc-actions button.primary {
+    background: var(--jolli-accent-text); color: var(--jolli-on-accent); border-color: transparent;
+  }
+
+  /* ── Working Memory card ── */
+  /* Working Memory is a borderless full-width section (uniform with Committed
+     Memories) — no card box; the .section-header bar + .section-body carry the
+     structure. */
+  .wm-card {
+    display: flex; flex-direction: column;
+  }
+  /* Card header — a section-header bar so it reads as a peer of the
+     "Committed Memories" section header below. Negative margins span the card's
+     padding so the bar reaches the card's inner edges; matches .section-header's
+     background / border / type treatment exactly. */
+  /* Working Memory + Conversations reuse the .collapsible-section .section-header
+     bar (twirl + uppercase title) so all three section headers — Conversations,
+     Working Memory, Committed Memories — are uniform. Inside their bordered
+     cards the bar spans the card padding (negative margins) and rounds its top
+     corners; the section-header's own top border is dropped so it doesn't
+     double the card border. */
+  /* The .section-header bar spans edge-to-edge (no card to inset it). The body
+     gets horizontal padding so its content (assembly / CTA / convo rows) insets
+     like the section rows in Committed Memories. */
+  .wm-card > .section-body,
+  .last-convo > .section-body {
+    display: flex; flex-direction: column; gap: 8px; padding: 8px 10px;
+  }
+  .wm-assembly { font-size: 12px; color: var(--vscode-foreground); line-height: 1.55; }
+  .wm-assembly b { color: var(--jolli-accent-text); }
+  .wm-assembly .wm-zero { color: var(--vscode-descriptionForeground); }
+  /* Clickable selection counts → open Review to edit what's attached. */
+  .wm-assembly .wm-pick { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+  .wm-assembly .wm-pick:hover { color: var(--vscode-textLink-foreground); }
+  .wm-cta { display: flex; flex-direction: column; gap: 6px; }
+  .wm-cta .commit-memory-btn { width: 100%; justify-content: center; }
+  .wm-cta .wm-btn-secondary { width: 100%; justify-content: center; }
+  /* Neutralize the wrapper's legacy chrome (it was a right-aligned, padded
+     footer button elsewhere) so inside the card the commit button spans the
+     full card width — matching Preview, which is a direct full-width child. */
+  .wm-cta .commit-memory-action { margin: 0; padding: 0; display: block; }
+  .wm-card .worker-row { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--vscode-descriptionForeground); }
+  .wm-card .worker-row .codicon { font-size: 13px; }
+  /* secondary (Review/Preview) buttons: bordered, transparent fill — matches the
+     last-conversation "Show" button's outlined highlight (border + accent on hover). */
+  .wm-btn-secondary {
+    width: 100%; justify-content: center; display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 12px; font-size: 12px; cursor: pointer; border-radius: 6px;
+    background: none;
+    color: var(--vscode-foreground);
+    border: 1px solid var(--jolli-border);
+  }
+  .wm-btn-secondary:hover {
+    background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15));
+    border-color: var(--jolli-accent);
+  }
+  .wm-review {
+    display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+    background: none; border: none; cursor: pointer; padding: 4px 0 2px;
+    color: var(--vscode-descriptionForeground); font-size: 11px;
+  }
+  .wm-review:hover { color: var(--vscode-textLink-foreground); }
+  .wm-review .twirl { font-size: 9px; transition: transform 0.12s; }
+  .wm-card.reviewing .wm-review .twirl { transform: rotate(90deg); }
+  /* Review body: the three sections render as ONE bounded block fused to the
+     card (tight grouping) rather than three standalone collapsible sections. */
+  .wm-review-body { display: none; margin-top: 6px; border: 1px solid var(--jolli-border); border-radius: 8px; overflow: hidden; }
+  .wm-card.reviewing .wm-review-body { display: block; }
+  .wm-review-body .collapsible-section { border: none; }
+  .wm-review-body .collapsible-section .section-header {
+    background: none; border: none; padding: 6px 10px 2px;
+    font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--vscode-descriptionForeground);
+  }
+  .wm-review-body .collapsible-section .section-header .twirl { display: none; }
+
+  /* Last-conversation banner badge. The base rule is the neutral fallback
+     (unknown source); the per-source rules above (.last-convo .badge.transcript-source-*)
+     win on specificity and tint the badge in the source's brand color, matching
+     the conversation rows. */
+  .last-convo .badge {
+    border: 1px solid var(--vscode-descriptionForeground); border-radius: 4px;
+    padding: 0 6px; font-size: 10px; line-height: 16px; flex-shrink: 0;
+  }
+
+  /* Visible keyboard focus for the redesigned interactive primitives */
+  .wm-review:focus-visible,
+  .last-convo button:focus-visible, .wm-btn-secondary:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .wm-review .twirl { transition: none; }
   }
   `;
 }

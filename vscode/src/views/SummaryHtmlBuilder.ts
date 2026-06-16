@@ -82,6 +82,13 @@ export interface BuildHtmlOptions {
 	 * buttons disappear without knowing why.
 	 */
 	readonly staleRewrittenInto?: string | null;
+	/**
+	 * True when the panel was opened for a commit with no stored summary yet.
+	 * Routes the failure banner into its "Generate memory" variant so the
+	 * empty state offers a from-scratch generate instead of reading as a
+	 * healthy (but blank) summary.
+	 */
+	readonly needsGeneration?: boolean;
 }
 
 /**
@@ -149,7 +156,7 @@ ${csp}
 </head>
 <body>
 <div class="${pageClass}">
-${buildSummaryErrorBanner(summary, { readOnly })}
+${buildSummaryErrorBanner(summary, { readOnly, needsGeneration: opts.needsGeneration })}
 ${staleBannerHtml}
 ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions, !!opts.foreignRepoName)}
 ${buildShipBar(summary)}

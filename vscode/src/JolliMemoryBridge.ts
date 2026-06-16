@@ -112,7 +112,10 @@ import type {
 } from "./Types.js";
 import { mergeCommitMessages } from "./util/CommitMessageUtils.js";
 import { log } from "./util/Logger.js";
-import { loadGlobalConfig } from "./util/WorkspaceUtils.js";
+import {
+	loadGlobalConfig,
+	resolveEnabledSources,
+} from "./util/WorkspaceUtils.js";
 
 // ─── Git helpers ────────────────────────────────────────────────────────────
 
@@ -983,7 +986,9 @@ export class JolliMemoryBridge {
 		const logArgs = [
 			"log",
 			`${mergeBase}..HEAD`,
-			"--pretty=format:%H%x00%s%x00%an%x00%ae%x00%aI%x00%x00",
+			// %T (tree hash) rides along so hasSummary can match summaries indexed
+			// under a different SHA (rebase/cherry-pick/amend) without an extra git call.
+			"--pretty=format:%H%x00%T%x00%s%x00%an%x00%ae%x00%aI%x00%x00",
 		];
 		if (authorFilter) {
 			logArgs.push(`--author=${authorFilter}`);
@@ -1024,7 +1029,7 @@ export class JolliMemoryBridge {
 		// Parse all commit hashes first, then batch-read the index (one git show)
 		const parsedEntries = rawEntries
 			.map((entry) => entry.split("\0"))
-			.filter((parts) => parts.length >= 5);
+			.filter((parts) => parts.length >= 6);
 
 		const commitHashes = parsedEntries.map((parts) => parts[0]);
 		// readStorage drives the index lookup; writeStorage stays on the
@@ -1034,10 +1039,21 @@ export class JolliMemoryBridge {
 		const writeStorage = await this.getStorage();
 		const indexEntryMap = await getIndexEntryMap(this.cwd, readStorage);
 
+		// Tree-hash set for cross-SHA matching: a commit whose summary is indexed
+		// under a different SHA (rebase / cherry-pick / amend) still has a memory
+		// if its tree hash matches an index entry — mirroring getSummary's
+		// tree-hash fallback so the row's "Generate" CTA doesn't appear for
+		// memories that already exist. (The background scanTreeHashAliases below
+		// persists these as aliases; this resolves them immediately for display.)
+		const indexTreeHashes = new Set<string>();
+		for (const e of indexEntryMap.values()) {
+			if (e.treeHash) indexTreeHashes.add(e.treeHash);
+		}
+
 		const commits: Array<BranchCommit> = [];
 
 		for (const parts of parsedEntries) {
-			const [hash, message, author, authorEmail, isoDate] = parts;
+			const [hash, treeHash, message, author, authorEmail, isoDate] = parts;
 
 			const entry = indexEntryMap.get(hash);
 			const meta = await resolveCommitMeta(entry, hash, this.cwd);
@@ -1063,7 +1079,9 @@ export class JolliMemoryBridge {
 					: pushBaseRef
 						? !unpushedHashes.has(hash)
 						: false,
-				hasSummary: indexEntryMap.has(hash),
+				hasSummary:
+					indexEntryMap.has(hash) ||
+					(treeHash !== undefined && indexTreeHashes.has(treeHash)),
 				...(meta.commitType && { commitType: meta.commitType }),
 			});
 		}
@@ -2080,6 +2098,29 @@ export class JolliMemoryBridge {
 		return regenerateSummary(summary, this.cwd, config, storage);
 	}
 
+	/**
+	 * Generates a summary for a commit by hash, bootstrapping a shell from git
+	 * metadata when no summary exists yet (or re-running an existing one). Same
+	 * read-storage threading as `regenerateSummary`; the caller persists the
+	 * result via `storeSummary`.
+	 */
+	async summarizeCommit(
+		commitHash: string,
+		config: import("../../cli/src/Types.js").LlmConfig,
+	): Promise<import("../../cli/src/core/Regenerator.js").RegenerateResult> {
+		const storage = await this.getReadStorage();
+		const { summarizeCommit } = await import("../../cli/src/core/Regenerator.js");
+		return summarizeCommit(commitHash, this.cwd, config, storage);
+	}
+
+	/** Reads git commit metadata (hash/message/author/date) for a single commit. */
+	async getCommitInfo(
+		commitHash: string,
+	): Promise<import("../../cli/src/Types.js").CommitInfo> {
+		const { getCommitInfo } = await import("../../cli/src/core/GitOps.js");
+		return getCommitInfo(commitHash, this.cwd);
+	}
+
 	/** Writes plan files (orphan-branch + Memory Bank visible MD). */
 	async storePlans(
 		planFiles: ReadonlyArray<{ slug: string; content: string }>,
@@ -2155,6 +2196,81 @@ export class JolliMemoryBridge {
 	): Promise<Map<string, StoredTranscript>> {
 		const storage = await this.getStorage();
 		return readTranscriptsForCommits(commitHashes, this.cwd, storage);
+	}
+
+	/**
+	 * Lazy detail for a committed memory's inline sidebar expansion: the
+	 * conversations + context (plans / notes / references) attached to the
+	 * commit's summary. Fetched on-demand when a row is expanded (one read per
+	 * commit), NOT eagerly for every row on refresh — see SidebarScriptBuilder's
+	 * commit-detail round-trip. Mirrors the Working Memory card's grouping.
+	 *
+	 * Context comes straight off the summary; conversations require reading the
+	 * stored transcripts (same path the detail panel + Regenerator use). Returns
+	 * empty groups when the commit has no summary yet.
+	 */
+	async getCommitMemoryDetail(hash: string): Promise<{
+		conversations: Array<{ source: string; messageCount: number }>;
+		context: Array<{ kind: "plan" | "note" | "reference"; label: string }>;
+	}> {
+		const summary = await this.getSummary(hash);
+		if (!summary) return { conversations: [], context: [] };
+
+		const context: Array<{
+			kind: "plan" | "note" | "reference";
+			label: string;
+		}> = [
+			...(summary.plans ?? []).map((p) => ({ kind: "plan" as const, label: p.title })),
+			...(summary.notes ?? []).map((n) => ({ kind: "note" as const, label: n.title })),
+			...(summary.references ?? []).map((r) => ({
+				kind: "reference" as const,
+				label: r.title || r.nativeId || r.archivedKey,
+			})),
+		];
+
+		const { getTranscriptIds } = await import(
+			"../../cli/src/core/SummaryTree.js"
+		);
+		const transcriptMap = await this.readTranscriptsForCommits(
+			getTranscriptIds(summary),
+		);
+		// Mirror the Summary panel's transcript-stats logic
+		// (SummaryWebviewPanel.handleLoadTranscriptStats) so the sidebar's
+		// per-conversation list and the panel never disagree: dedupe sessions by
+		// source:sessionId (the same session can appear across multiple commit
+		// transcripts) and drop disabled sources. Source defaults to "claude" to
+		// match the panel.
+		const enabledSources = resolveEnabledSources(await loadGlobalConfig());
+		const seen = new Set<string>();
+		const conversations: Array<{ source: string; messageCount: number }> = [];
+		for (const stored of transcriptMap.values()) {
+			for (const session of stored.sessions) {
+				const source = session.source ?? "claude";
+				if (!enabledSources.has(source)) continue;
+				const key = `${source}:${session.sessionId}`;
+				if (seen.has(key)) continue;
+				seen.add(key);
+				conversations.push({
+					source,
+					messageCount: session.entries?.length ?? 0,
+				});
+			}
+		}
+		return { conversations, context };
+	}
+
+	/**
+	 * Branch-level recall prompt — the same context `jolli recall` emits: every
+	 * memory on the branch + open plans/notes, compiled and rendered to
+	 * markdown. Powers the sidebar's Recall button (open Claude Code with the
+	 * whole branch's context), distinct from the per-memory recall prompt.
+	 */
+	async compileBranchRecall(branch: string): Promise<string> {
+		const { compileTaskContext, renderContextMarkdown } = await import(
+			"../../cli/src/core/ContextCompiler.js"
+		);
+		const ctx = await compileTaskContext({ branch }, this.cwd);
+		return renderContextMarkdown(ctx);
 	}
 
 	/** Returns true if the index needs migration to v3 flat format. */

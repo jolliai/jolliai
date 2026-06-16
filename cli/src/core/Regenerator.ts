@@ -1,6 +1,6 @@
 import { createLogger } from "../Logger.js";
 import type { CommitSummary, LlmConfig, Reference, ReferenceCommitRef, SourceId } from "../Types.js";
-import { getDiffContent } from "./GitOps.js";
+import { getCommitInfo, getCurrentBranch, getDiffContent } from "./GitOps.js";
 import { escapeForAttr, escapeForText } from "./PromptXmlEscape.js";
 import { truncate } from "./references/ReferenceExtractor.js";
 import { readReferenceMarkdownFromString } from "./references/ReferenceStore.js";
@@ -8,6 +8,7 @@ import { ALL_ADAPTERS } from "./references/sources/index.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import { generateSummary, type SummaryResult } from "./Summarizer.js";
 import {
+	getSummary,
 	normalizeToV4,
 	readNoteFromBranch,
 	readPlanFromBranch,
@@ -158,6 +159,49 @@ export async function regenerateSummary(
 	};
 
 	return { updated, result };
+}
+
+/**
+ * Generate a summary for a commit that has no usable summary yet, OR re-run an
+ * existing one — the two are the same operation. When a summary already exists
+ * (including a failure-marker placeholder) this delegates straight to
+ * `regenerateSummary`. When none exists, it bootstraps a minimal shell
+ * `CommitSummary` from git metadata (`getCommitInfo` + current branch) and feeds
+ * that through the same `regenerateSummary` path, so the from-scratch and re-run
+ * flows share one pipeline rather than duplicating the LLM call + assembly.
+ *
+ * A from-scratch shell carries no archived plans / notes / references (those are
+ * only attached to a summary at first-run commit time), so a never-summarized
+ * commit is summarized from its diff + any stored transcripts alone — the
+ * Summarizer infers topics from the diff when the conversation is empty.
+ *
+ * Returns the `RegenerateResult`; the caller persists via
+ * `storeSummary(result.updated, cwd, true)` exactly as the regenerate path does.
+ */
+export async function summarizeCommit(
+	commitHash: string,
+	cwd: string,
+	config: LlmConfig,
+	storage?: StorageProvider,
+): Promise<RegenerateResult> {
+	const existing = await getSummary(commitHash, cwd, storage);
+	if (existing) {
+		return regenerateSummary(existing, cwd, config, storage);
+	}
+
+	const info = await getCommitInfo(commitHash, cwd);
+	const shell: CommitSummary = {
+		version: 4,
+		commitHash: info.hash,
+		commitMessage: info.message,
+		commitAuthor: info.author,
+		commitDate: info.date,
+		branch: await getCurrentBranch(cwd),
+		generatedAt: new Date().toISOString(),
+		topics: [],
+		recap: "",
+	};
+	return regenerateSummary(shell, cwd, config, storage);
 }
 
 // ─── Prompt-block reconstruction from orphan-branch archives ────────────────

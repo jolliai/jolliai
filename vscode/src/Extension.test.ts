@@ -3,9 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ─── Hoisted mocks ─────────────────────────────────────────────────────────
 
-const { getWorkspaceRoot, resolveCLIPath } = vi.hoisted(() => ({
+const { getWorkspaceRoot, resolveCLIPath, loadGlobalConfig } = vi.hoisted(() => ({
 	getWorkspaceRoot: vi.fn(),
 	resolveCLIPath: vi.fn(),
+	loadGlobalConfig: vi.fn().mockResolvedValue({ apiKey: "test-key", model: "test-model" }),
 }));
 
 const {
@@ -268,6 +269,7 @@ const {
 			.mockResolvedValue({ entries: [], totalCount: 0 }),
 		invalidateEntriesCache: vi.fn(),
 		getCurrentBranch: vi.fn().mockResolvedValue("main"),
+		compileBranchRecall: vi.fn().mockResolvedValue("# Task Context: main\n\nrecall body"),
 		reloadStorage: vi.fn(),
 		reloadReadStorage: vi.fn(),
 		// Bridge wrappers added when storage threading replaced direct
@@ -295,6 +297,22 @@ const {
 		// that don't care about storage threading.
 		createStorageForRepo: vi.fn().mockResolvedValue(null),
 		createReadStorageForCurrentRepo: vi.fn().mockResolvedValue(null),
+		// No-summary "Generate memory" path: viewSummary/viewMemorySummary build a
+		// placeholder via getCommitInfo when getSummary is null, and the
+		// jollimemory.generateMemory command bootstraps via summarizeCommit +
+		// storeSummary. Defaults resolve so the placeholder-open + generate tests
+		// don't need per-test wiring.
+		getCommitInfo: vi.fn().mockResolvedValue({
+			hash: "abc1234567890",
+			message: "feat: add feature",
+			author: "Test User",
+			date: "2026-01-01T00:00:00Z",
+		}),
+		summarizeCommit: vi.fn().mockResolvedValue({
+			updated: { commitHash: "abc1234567890", recap: "generated" },
+			result: {},
+		}),
+		storeSummary: vi.fn().mockResolvedValue(undefined),
 		// Multi-source reference surface — used by the reference commands
 		// (resolveReferenceForCommand resolves a webview mapKey through
 		// listReferences, then routes to the open/ignore handlers). Default:
@@ -406,6 +424,8 @@ const {
 	visibilityCallbacks,
 	openExternal,
 	fsReadFile,
+	createTerminal,
+	getExtension,
 } = vi.hoisted(() => {
 	/** Stores callbacks keyed by tree view ID so tests can trigger checkbox events */
 	const checkboxCallbacks_ = new Map<
@@ -469,6 +489,14 @@ const {
 		// Defaults to rejection = file missing, matching the pre-mock behavior
 		// where the absent `fs` property made readWorkerPhase throw-and-catch.
 		fsReadFile: vi.fn().mockRejectedValue(new Error("ENOENT")),
+		// Default: Claude Code IS installed (the common case). Not-installed
+		// tests override per-call with mockReturnValueOnce(undefined).
+		getExtension: vi.fn().mockReturnValue({ id: "anthropic.claude-code" }),
+		createTerminal: vi.fn(() => ({
+			sendText: vi.fn(),
+			show: vi.fn(),
+			dispose: vi.fn(),
+		})),
 	};
 });
 
@@ -542,6 +570,7 @@ vi.mock("vscode", () => ({
 		})),
 		registerFileDecorationProvider: vi.fn(() => ({ dispose: vi.fn() })),
 		registerUriHandler: vi.fn(() => ({ dispose: vi.fn() })),
+		createTerminal,
 		onDidChangeActiveTextEditor,
 		activeTextEditor: undefined,
 		// Pass-through Progress mock — runs the user's callback so commands that
@@ -573,6 +602,9 @@ vi.mock("vscode", () => ({
 	commands: {
 		executeCommand,
 		registerCommand,
+	},
+	extensions: {
+		getExtension,
 	},
 	env: {
 		clipboard: {
@@ -888,6 +920,7 @@ vi.mock("./util/StatusBarManager.js", () => ({
 vi.mock("./util/WorkspaceUtils.js", () => ({
 	getWorkspaceRoot,
 	resolveCLIPath,
+	loadGlobalConfig,
 }));
 
 vi.mock("./views/SidebarWebviewProvider.js", () => ({
@@ -2284,17 +2317,15 @@ describe("Extension", () => {
 					null,
 					null,
 					null,
+					false, // needsGeneration false — a real summary exists
 				);
 			});
 
-			it("silently returns when no summary is found (no toast, no panel)", async () => {
-				// Product decision: clicking a COMMITS row whose commit has no
-				// summary is a non-event — the row's `codicon-code` glyph (vs
-				// the tinted markdown glyph for memory rows) already conveys
-				// the absence visually, so a follow-up information toast on
-				// every click was redundant noise. The viewMemorySummary path
-				// (next describe) intentionally keeps its toast because hitting
-				// no-summary there indicates a real Memories↔bridge mismatch.
+			it("opens a placeholder panel (needsGeneration) when no summary exists — no toast, no dead-end", async () => {
+				// No-summary is no longer a dead-end: the panel opens on a
+				// git-metadata placeholder with needsGeneration=true so the user
+				// sees a "Generate memory" banner instead of nothing. Still no
+				// toast (the panel IS the feedback).
 				mockBridge.getSummary.mockResolvedValue(null);
 
 				const handler = getRegisteredCommand("jollimemory.viewSummary");
@@ -2303,14 +2334,24 @@ describe("Extension", () => {
 				});
 
 				expect(showInformationMessage).not.toHaveBeenCalled();
-				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
+				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
+					expect.objectContaining({ commitHash: "abc1234567890" }),
+					expect.anything(),
+					"/test/workspace",
+					mockBridge,
+					expect.any(String),
+					"commit",
+					null,
+					null,
+					null,
+					true, // needsGeneration
+				);
 			});
 
-			it("accepts a plain hash string instead of CommitItem", async () => {
+			it("accepts a plain hash string instead of CommitItem (placeholder path)", async () => {
 				// Pinned because the sidebar webview dispatches the command
 				// with a bare hash via `branch:openCommit`, not a CommitItem;
-				// regressing the string branch would break every commit-row
-				// click. The no-summary path is silent (see test above).
+				// regressing the string branch would break every commit-row click.
 				mockBridge.getSummary.mockResolvedValue(null);
 
 				const handler = getRegisteredCommand("jollimemory.viewSummary");
@@ -2318,7 +2359,18 @@ describe("Extension", () => {
 
 				expect(mockBridge.getSummary).toHaveBeenCalledWith("abc1234567890");
 				expect(showInformationMessage).not.toHaveBeenCalled();
-				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
+				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
+					expect.objectContaining({ commitHash: "abc1234567890" }),
+					expect.anything(),
+					"/test/workspace",
+					mockBridge,
+					expect.any(String),
+					"commit",
+					null,
+					null,
+					null,
+					true,
+				);
 			});
 		});
 
@@ -2497,7 +2549,10 @@ describe("Extension", () => {
 				);
 			});
 
-			it("shows info message when no summary is found in any discovered repo", async () => {
+			it("opens a placeholder panel (needsGeneration) when no summary is found in any repo", async () => {
+				// Not found anywhere → treat as a local commit with no memory yet
+				// and open the placeholder offering Generate, rather than the old
+				// "No summary found" toast dead-end.
 				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValue({
 					summary: null,
 					sourceRepoName: null,
@@ -2506,8 +2561,60 @@ describe("Extension", () => {
 				const handler = getRegisteredCommand("jollimemory.viewMemorySummary");
 				await handler({ entry: { commitHash: "def4567890abc" } });
 
-				expect(showInformationMessage).toHaveBeenCalledWith(
-					"Jolli Memory: No summary found for commit def4567.",
+				expect(showInformationMessage).not.toHaveBeenCalled();
+				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
+					expect.objectContaining({ commitHash: "def4567890abc" }),
+					expect.anything(),
+					"/test/workspace",
+					mockBridge,
+					expect.any(String),
+					"memory",
+					null,
+					null,
+					null,
+					true, // needsGeneration
+				);
+			});
+		});
+
+		describe("generateMemory command", () => {
+			it("bootstraps via summarizeCommit, persists, refreshes history, then opens the panel", async () => {
+				mockBridge.summarizeCommit.mockResolvedValue({
+					updated: { commitHash: "abc1234567890", recap: "generated" },
+					result: {},
+				});
+
+				const handler = getRegisteredCommand("jollimemory.generateMemory");
+				await handler("abc1234567890");
+
+				expect(mockBridge.summarizeCommit).toHaveBeenCalledWith(
+					"abc1234567890",
+					expect.objectContaining({ apiKey: "test-key" }),
+				);
+				expect(mockBridge.storeSummary).toHaveBeenCalledWith(
+					expect.objectContaining({ commitHash: "abc1234567890" }),
+					true,
+				);
+				expect(executeCommand).toHaveBeenCalledWith("jollimemory.refreshHistory");
+				expect(executeCommand).toHaveBeenCalledWith(
+					"jollimemory.viewSummary",
+					"abc1234567890",
+				);
+			});
+
+			it("resolves the hash from a CommitItem and surfaces failures as an error toast", async () => {
+				mockBridge.summarizeCommit.mockRejectedValueOnce(new Error("LLM down"));
+
+				const handler = getRegisteredCommand("jollimemory.generateMemory");
+				await handler({ commit: { hash: "def4567890abc" } });
+
+				expect(mockBridge.summarizeCommit).toHaveBeenCalledWith(
+					"def4567890abc",
+					expect.anything(),
+				);
+				expect(mockBridge.storeSummary).not.toHaveBeenCalled();
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Could not generate memory"),
 				);
 			});
 		});
@@ -3408,6 +3515,134 @@ describe("Extension", () => {
 					"No summary found for this commit.",
 				);
 				expect(openExternal).not.toHaveBeenCalled();
+			});
+		});
+
+		// ── branch-level Recall / Create PR (sidebar action bar) ─────────────
+
+		describe("recallBranch command", () => {
+			it("opens Claude Code with the branch recall prompt", async () => {
+				mockBridge.compileBranchRecall.mockResolvedValue("# Task Context: main\n\nbody");
+
+				const handler = getRegisteredCommand("jollimemory.recallBranch");
+				await handler();
+
+				expect(mockBridge.getCurrentBranch).toHaveBeenCalled();
+				expect(mockBridge.compileBranchRecall).toHaveBeenCalledWith("main");
+				expect(openExternal).toHaveBeenCalled();
+			});
+
+			it("shows a friendly notice (no open) when the branch has no memories", async () => {
+				mockBridge.compileBranchRecall.mockResolvedValue("   ");
+
+				const handler = getRegisteredCommand("jollimemory.recallBranch");
+				await handler();
+
+				expect(openExternal).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("No memories on this branch"),
+				);
+			});
+
+			it("surfaces a compile failure as an error toast", async () => {
+				mockBridge.compileBranchRecall.mockRejectedValueOnce(new Error("boom"));
+
+				const handler = getRegisteredCommand("jollimemory.recallBranch");
+				await handler();
+
+				expect(openExternal).not.toHaveBeenCalled();
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Could not build recall context"),
+				);
+			});
+
+			it("copies the prompt (not a dead deep-link) when Claude Code is NOT installed", async () => {
+				getExtension.mockReturnValueOnce(undefined);
+				mockBridge.compileBranchRecall.mockResolvedValue("# Task Context: main\n\nbody");
+				showInformationMessage.mockResolvedValueOnce(undefined); // user dismisses
+
+				const handler = getRegisteredCommand("jollimemory.recallBranch");
+				await handler();
+
+				// Must NOT fire the claude-code deep link that nothing would handle.
+				expect(openExternal).not.toHaveBeenCalled();
+				expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith(
+					expect.stringContaining("Task Context"),
+				);
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Claude Code isn't installed"),
+					"Install Claude Code",
+				);
+			});
+
+			it("opens the extension page when the user picks Install Claude Code", async () => {
+				getExtension.mockReturnValueOnce(undefined);
+				mockBridge.compileBranchRecall.mockResolvedValue("body text");
+				showInformationMessage.mockResolvedValueOnce("Install Claude Code");
+
+				const handler = getRegisteredCommand("jollimemory.recallBranch");
+				await handler();
+
+				// The only openExternal call is the install deep-link, not the recall one.
+				expect(openExternal).toHaveBeenCalledTimes(1);
+			});
+		});
+
+		describe("copyBranchRecall command", () => {
+			it("copies the branch recall prompt to the clipboard", async () => {
+				mockBridge.compileBranchRecall.mockResolvedValue("# Task Context: main\n\nbody");
+
+				const handler = getRegisteredCommand("jollimemory.copyBranchRecall");
+				await handler();
+
+				expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith(
+					expect.stringContaining("Task Context"),
+				);
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Recall prompt copied"),
+				);
+			});
+
+			it("shows a notice when there is nothing to recall", async () => {
+				mockBridge.compileBranchRecall.mockResolvedValue("");
+
+				const handler = getRegisteredCommand("jollimemory.copyBranchRecall");
+				await handler();
+
+				expect(vscode.env.clipboard.writeText).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("No memories on this branch"),
+				);
+			});
+		});
+
+		describe("createBranchPr command", () => {
+			it("opens the most-recent summarized memory's panel", async () => {
+				mockCommitsStore.getSnapshot.mockReturnValueOnce({
+					commits: [
+						{ hash: "nomemo", hasSummary: false },
+						{ hash: "withmemo", hasSummary: true },
+					],
+				});
+
+				const handler = getRegisteredCommand("jollimemory.createBranchPr");
+				await handler();
+
+				expect(executeCommand).toHaveBeenCalledWith(
+					"jollimemory.viewSummary",
+					"withmemo",
+				);
+			});
+
+			it("shows a notice when no memory exists on the branch yet", async () => {
+				mockCommitsStore.getSnapshot.mockReturnValueOnce({ commits: [] });
+
+				const handler = getRegisteredCommand("jollimemory.createBranchPr");
+				await handler();
+
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("No memories on this branch yet"),
+				);
 			});
 		});
 
@@ -7433,6 +7668,65 @@ describe("Extension", () => {
 			// handleError logs via the shared `log.error`; the test just verifies
 			// the callback didn't throw and an error was logged.
 			expect(error).toHaveBeenCalled();
+		});
+	});
+
+	describe("continueConversation command", () => {
+		it("resumes a Claude session in a terminal", () => {
+			const ctx = makeContext();
+			activate(ctx);
+			createTerminal.mockClear();
+			const handler = commandMap.get("jollimemory.continueConversation");
+			expect(handler).toBeDefined();
+			handler?.("claude", "0fc65422-d25d-41a1-a4f9-b143ffb3addd");
+			expect(createTerminal).toHaveBeenCalledTimes(1);
+			const term = createTerminal.mock.results[0].value as {
+				sendText: ReturnType<typeof vi.fn>;
+				show: ReturnType<typeof vi.fn>;
+			};
+			expect(term.sendText).toHaveBeenCalledWith(
+				"claude --resume 0fc65422-d25d-41a1-a4f9-b143ffb3addd",
+			);
+			expect(term.show).toHaveBeenCalled();
+		});
+
+		it("shows an info message for non-Claude sources (no terminal)", () => {
+			const ctx = makeContext();
+			activate(ctx);
+			createTerminal.mockClear();
+			showInformationMessage.mockClear();
+			commandMap.get("jollimemory.continueConversation")?.(
+				"codex",
+				"0fc65422-d25d-41a1-a4f9-b143ffb3addd",
+			);
+			expect(createTerminal).not.toHaveBeenCalled();
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Claude Code"),
+			);
+		});
+
+		it("rejects a sessionId with shell metacharacters (injection guard)", () => {
+			const ctx = makeContext();
+			activate(ctx);
+			createTerminal.mockClear();
+			showInformationMessage.mockClear();
+			// Would be a command-injection payload if it reached the shell.
+			commandMap.get("jollimemory.continueConversation")?.(
+				"claude",
+				"$(touch /tmp/pwned)",
+			);
+			expect(createTerminal).not.toHaveBeenCalled();
+			expect(showInformationMessage).toHaveBeenCalled();
+		});
+
+		it("guards an empty sessionId (no terminal, info message)", () => {
+			const ctx = makeContext();
+			activate(ctx);
+			createTerminal.mockClear();
+			showInformationMessage.mockClear();
+			commandMap.get("jollimemory.continueConversation")?.("claude", "");
+			expect(createTerminal).not.toHaveBeenCalled();
+			expect(showInformationMessage).toHaveBeenCalled();
 		});
 	});
 });

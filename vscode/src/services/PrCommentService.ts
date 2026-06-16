@@ -1123,7 +1123,13 @@ export function buildPrMessageScript(): string {
             vscode.postMessage({ command: 'generateE2eTest' });
           });
         }
-        renderPrHistory(msg.history);
+        // When the branch has NO open PR, do not surface its merged/closed
+        // PRs: a stale merged PR painted as a "Previously:" strip read as
+        // "this memory's PR" on every memory committed to an already-merged
+        // branch. History stays only alongside a live open PR (the 'ready'
+        // branch below), which preserves the PR1-merged + PR2-open case the
+        // strip was built for.
+        renderPrHistory([]);
       } else if (s === 'ready') {
         var pr = msg.pr;
         setPrChip('is-ok', '#' + pr.number + ' open');

@@ -169,6 +169,17 @@ describe("SidebarWebviewProvider", () => {
 		expect(executeCommand).toHaveBeenCalledWith("jollimemory.openSettings");
 	});
 
+	it("rejects `command` outside the jollimemory namespace (no executeCommand)", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "command",
+			command: "workbench.action.terminal.sendSequence",
+			args: ["rm -rf"],
+		} as unknown as SidebarOutboundMsg);
+		expect(executeCommand).not.toHaveBeenCalled();
+	});
+
 	it("ignores malformed outbound messages without throwing", () => {
 		const view = makeMockView();
 		provider.resolveWebviewView(view as unknown as never);
@@ -3394,6 +3405,86 @@ describe("SidebarWebviewProvider", () => {
 				view.webview.triggerMessage({ type: "refresh", scope: "branch" } as SidebarOutboundMsg),
 			).not.toThrow();
 			expect(discover).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	describe("branch:loadCommitDetail", () => {
+		// The webview sets a persisted 'loading' sentinel on expand, so the host
+		// MUST always reply with commitDetailLoaded — otherwise the row spins
+		// forever (and, because the sentinel is persisted, across reloads). These
+		// pin all three paths: success, rejected load, and unwired dep.
+		function makeProviderWithLoad(
+			load?: (hash: string) => Promise<{
+				conversations: Array<{ source: string; messageCount: number }>;
+				context: Array<{ kind: "plan" | "note" | "reference"; label: string }>;
+			}>,
+		): MockWebviewView {
+			const view = makeMockView();
+			const p = new SidebarWebviewProvider({
+				executeCommand: vi.fn() as never,
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "branch",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				loadCommitMemoryDetail: load,
+			});
+			p.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			return view;
+		}
+
+		it("replies commitDetailLoaded with the loaded detail", async () => {
+			const view = makeProviderWithLoad(async () => ({
+				conversations: [{ source: "claude", messageCount: 3 }],
+				context: [{ kind: "plan", label: "Plan A" }],
+			}));
+			view.webview.triggerMessage({
+				type: "branch:loadCommitDetail",
+				hash: "abc",
+			} as SidebarOutboundMsg);
+			await flushReady();
+			expect(view.webview.postMessage).toHaveBeenCalledWith({
+				type: "commitDetailLoaded",
+				hash: "abc",
+				conversations: [{ source: "claude", messageCount: 3 }],
+				context: [{ kind: "plan", label: "Plan A" }],
+			});
+		});
+
+		it("replies with empty arrays when the load REJECTS — no stuck spinner", async () => {
+			const view = makeProviderWithLoad(() =>
+				Promise.reject(new Error("git read failed")),
+			);
+			view.webview.triggerMessage({
+				type: "branch:loadCommitDetail",
+				hash: "def",
+			} as SidebarOutboundMsg);
+			await flushReady();
+			expect(view.webview.postMessage).toHaveBeenCalledWith({
+				type: "commitDetailLoaded",
+				hash: "def",
+				conversations: [],
+				context: [],
+			});
+		});
+
+		it("replies with empty arrays when the dep is unwired — degrade, don't hang", () => {
+			const view = makeProviderWithLoad(undefined);
+			view.webview.triggerMessage({
+				type: "branch:loadCommitDetail",
+				hash: "ghi",
+			} as SidebarOutboundMsg);
+			expect(view.webview.postMessage).toHaveBeenCalledWith({
+				type: "commitDetailLoaded",
+				hash: "ghi",
+				conversations: [],
+				context: [],
+			});
 		});
 	});
 });

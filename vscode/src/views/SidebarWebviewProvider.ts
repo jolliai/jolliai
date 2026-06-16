@@ -14,6 +14,7 @@ import { isTranscriptSource } from "../../../cli/src/Types.js";
 import type { ActiveSessionsProvider } from "../services/ActiveSessionsProvider.js";
 import { log } from "../util/Logger.js";
 import { ConversationDetailsPanel } from "./ConversationDetailsPanel.js";
+import { NextMemoryPreviewPanel } from "./NextMemoryPreviewPanel.js";
 import { SIDEBAR_EMPTY_STRINGS } from "./SidebarEmptyMessages.js";
 import { buildSidebarHtml } from "./SidebarHtmlBuilder.js";
 import type {
@@ -35,6 +36,19 @@ export interface SidebarWebviewDeps {
 	getInitialState: () => SidebarState;
 	/** Extension installation root — used to compute webview-resolvable URIs for bundled assets (codicons). */
 	extensionUri: vscode.Uri;
+	/**
+	 * Lazy-fetch a committed memory's attached conversations + context for the
+	 * grouped inline row expansion (mirrors the Working Memory card). Called once
+	 * per row expand — never eagerly for every row. Optional so existing tests
+	 * keep working; absent → the expansion shows files only.
+	 */
+	loadCommitMemoryDetail?: (hash: string) => Promise<{
+		conversations: ReadonlyArray<{ source: string; messageCount: number }>;
+		context: ReadonlyArray<{
+			kind: "plan" | "note" | "reference";
+			label: string;
+		}>;
+	}>;
 	/** Optional in scaffold; required once Phase 2 lands. */
 	statusProvider?: {
 		serialize(): ReadonlyArray<SerializedTreeItem>;
@@ -439,6 +453,16 @@ export class SidebarWebviewProvider
 				void this.handleReady();
 				return;
 			case "command":
+				// Trust boundary: `command` arrives from the webview. Restrict it to
+				// this extension's own command namespace so a compromised/spoofed
+				// webview message can never invoke arbitrary VS Code commands (e.g.
+				// workbench.action.* or another extension's command).
+				if (typeof msg.command !== "string" || !msg.command.startsWith("jollimemory.")) {
+					log.warn("SidebarWebviewProvider", "Rejected command outside jollimemory namespace", {
+						command: String(msg.command),
+					});
+					return;
+				}
 				if (msg.args && msg.args.length > 0) {
 					void this.deps.executeCommand(msg.command, ...msg.args);
 				} else {
@@ -534,6 +558,87 @@ export class SidebarWebviewProvider
 			case "branch:openCommit":
 				void this.deps.executeCommand("jollimemory.viewSummary", msg.hash);
 				return;
+			case "branch:loadCommitDetail": {
+				// Lazy: fetch one commit's attached conversations + context on
+				// expand and push it back. The webview sets a persisted
+				// 'loading' sentinel on expand, so EVERY path here must reply
+				// with commitDetailLoaded — a silent return (unwired dep) or an
+				// unhandled rejection (git/transcript read failure) would leave
+				// that row spinning forever, across reloads. Both fall back to
+				// empty arrays, which the webview renders as files-only.
+				const hash = msg.hash;
+				const load = this.deps.loadCommitMemoryDetail;
+				if (!load) {
+					this.postMessage({ type: "commitDetailLoaded", hash, conversations: [], context: [] });
+					return;
+				}
+				void load(hash)
+					.then((detail) => {
+						this.postMessage({
+							type: "commitDetailLoaded",
+							hash,
+							conversations: detail.conversations,
+							context: detail.context,
+						});
+					})
+					.catch((err: unknown) => {
+						log.warn(
+							"SidebarWebviewProvider",
+							`loadCommitMemoryDetail failed for ${hash}; degrading to files-only`,
+							{ error: err instanceof Error ? err.message : String(err) },
+						);
+						this.postMessage({ type: "commitDetailLoaded", hash, conversations: [], context: [] });
+					});
+				return;
+			}
+			case "branch:previewNextMemory": {
+				// Display data + toggle ids from the webview; coerce defensively
+				// across the trust boundary, then open the editable preview pop-out.
+				const toStr = (v: unknown): string => (typeof v === "string" ? v : "");
+				const get = (o: unknown, k: string): string =>
+					toStr((o as Record<string, unknown> | null)?.[k]);
+				const files = Array.isArray(msg.files)
+					? msg.files.map((f) => ({ label: get(f, "label"), relPath: get(f, "relPath") }))
+					: [];
+				const conversations = Array.isArray(msg.conversations)
+					? msg.conversations.map((c) => ({
+							title: get(c, "title"),
+							source: get(c, "source"),
+							sessionId: get(c, "sessionId"),
+						}))
+					: [];
+				const context = Array.isArray(msg.context)
+					? msg.context.map((c) => ({
+							label: get(c, "label"),
+							contextValue: get(c, "contextValue"),
+							id: get(c, "id"),
+						}))
+					: [];
+				NextMemoryPreviewPanel.show({
+					files,
+					conversations,
+					context,
+					// Route an uncheck/recheck in the pop-out through the SAME apply*
+					// path the sidebar checkboxes use — which also refreshes the
+					// sidebar's Working Memory card, keeping the two surfaces in sync.
+					onExclude: (ex) => {
+						if (ex.kind === "file") {
+							this.deps.applyFileCheckbox?.(ex.relPath, ex.selected);
+						} else if (ex.kind === "conversation") {
+							if (isTranscriptSource(ex.source)) {
+								void this.deps.applyConversationCheckbox?.(ex.source, ex.sessionId, ex.selected);
+							}
+						} else if (ex.contextValue === "note") {
+							void this.deps.applyNoteCheckbox?.(ex.id, ex.selected);
+						} else if (ex.contextValue === "reference") {
+							void this.deps.applyReferenceCheckbox?.(ex.id, ex.selected);
+						} else {
+							void this.deps.applyPlanCheckbox?.(ex.id, ex.selected);
+						}
+					},
+				});
+				return;
+			}
 			case "branch:openConversation":
 				// Same sessionId reveals the existing panel; a different sessionId
 				// disposes the prior panel and opens a fresh one. The source-specific

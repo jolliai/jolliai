@@ -74,8 +74,9 @@ const {
 	};
 });
 
-const { loadGlobalConfig } = vi.hoisted(() => ({
+const { loadGlobalConfig, resolveEnabledSources } = vi.hoisted(() => ({
 	loadGlobalConfig: vi.fn(),
+	resolveEnabledSources: vi.fn(),
 }));
 
 const { generateCommitMessage, generateSquashMessage } = vi.hoisted(() => ({
@@ -257,6 +258,7 @@ vi.mock("../../cli/src/core/MetadataManager.js", () => ({
 
 vi.mock("./util/WorkspaceUtils.js", () => ({
 	loadGlobalConfig,
+	resolveEnabledSources,
 }));
 
 vi.mock("../../cli/src/core/Summarizer.js", () => ({
@@ -455,6 +457,19 @@ describe("JolliMemoryBridge", () => {
 			apiKey: "test-key",
 			model: "claude-3",
 		});
+		// Default: all transcript sources enabled (nothing filtered). Tests that
+		// exercise the enabled-source filter override this per-call.
+		resolveEnabledSources.mockReturnValue(
+			new Set([
+				"claude",
+				"codex",
+				"gemini",
+				"opencode",
+				"cursor",
+				"copilot",
+				"copilot-chat",
+			]),
+		);
 		// SessionTracker.loadConfig is read by StorageFactory.createStorage AND
 		// by listSummaryEntries (for the localFolder lookup). Default to an
 		// empty config so storageMode falls back to "dual-write" and there's no
@@ -3343,6 +3358,105 @@ describe("JolliMemoryBridge", () => {
 		});
 	});
 
+	describe("getCommitMemoryDetail()", () => {
+		it("returns empty groups when the commit has no summary", async () => {
+			getSummary.mockResolvedValue(null);
+			const bridge = makeBridge();
+
+			const detail = await bridge.getCommitMemoryDetail("abc");
+
+			expect(detail).toEqual({ conversations: [], context: [] });
+		});
+
+		it("groups plans/notes/references as context and transcript sessions as conversations", async () => {
+			getSummary.mockResolvedValue({
+				version: 5,
+				commitHash: "abc",
+				transcripts: ["t1"],
+				plans: [{ slug: "p", title: "Plan A" }],
+				notes: [{ id: "n", title: "Note A" }],
+				references: [{ archivedKey: "k", nativeId: "PROJ-1", title: "Ref A" }],
+			});
+			readTranscriptsForCommits.mockResolvedValue(
+				new Map([
+					[
+						"t1",
+						{
+							sessions: [
+								{ sessionId: "s1", source: "claude", entries: [{}, {}] },
+								// no source + empty entries → exercises the ?? fallbacks
+								{ sessionId: "s2", entries: [] },
+							],
+						},
+					],
+				]),
+			);
+			const bridge = makeBridge();
+
+			const detail = await bridge.getCommitMemoryDetail("abc");
+
+			expect(detail.context).toEqual([
+				{ kind: "plan", label: "Plan A" },
+				{ kind: "note", label: "Note A" },
+				{ kind: "reference", label: "Ref A" },
+			]);
+			expect(detail.conversations).toEqual([
+				{ source: "claude", messageCount: 2 },
+				// no source → defaults to "claude" (matches the panel), not "unknown"
+				{ source: "claude", messageCount: 0 },
+			]);
+		});
+
+		it("dedupes a session that appears across multiple commit transcripts", async () => {
+			getSummary.mockResolvedValue({
+				version: 5,
+				commitHash: "abc",
+				transcripts: ["t1", "t2"],
+			});
+			// Same claude session s1 stored in two commit transcripts — the panel
+			// counts it once (source:sessionId key), so the sidebar must too.
+			readTranscriptsForCommits.mockResolvedValue(
+				new Map([
+					["t1", { sessions: [{ sessionId: "s1", source: "claude", entries: [{}, {}, {}] }] }],
+					["t2", { sessions: [{ sessionId: "s1", source: "claude", entries: [{}, {}, {}] }] }],
+				]),
+			);
+			const bridge = makeBridge();
+
+			const detail = await bridge.getCommitMemoryDetail("abc");
+
+			expect(detail.conversations).toEqual([{ source: "claude", messageCount: 3 }]);
+		});
+
+		it("drops sessions whose source is disabled in config", async () => {
+			getSummary.mockResolvedValue({
+				version: 5,
+				commitHash: "abc",
+				transcripts: ["t1"],
+			});
+			resolveEnabledSources.mockReturnValueOnce(new Set(["claude"]));
+			readTranscriptsForCommits.mockResolvedValue(
+				new Map([
+					[
+						"t1",
+						{
+							sessions: [
+								{ sessionId: "s1", source: "claude", entries: [{}] },
+								{ sessionId: "s2", source: "codex", entries: [{}, {}] },
+							],
+						},
+					],
+				]),
+			);
+			const bridge = makeBridge();
+
+			const detail = await bridge.getCommitMemoryDetail("abc");
+
+			// codex disabled → only the claude session survives.
+			expect(detail.conversations).toEqual([{ source: "claude", messageCount: 1 }]);
+		});
+	});
+
 	describe("indexNeedsMigration()", () => {
 		it("forwards the Bridge's storage to SummaryStore.indexNeedsMigration", async () => {
 			indexNeedsMigration.mockResolvedValue(true);
@@ -3499,7 +3613,7 @@ describe("JolliMemoryBridge", () => {
 			// merge-base
 			mockExecFileSuccess("mergebase456\n");
 			// git log
-			const logEntry = `commitHash1\x00fix: test change\x00John Doe\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
+			const logEntry = `commitHash1\x00treeC1\x00fix: test change\x00John Doe\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
 			// resolvePushBaseRef: rev-parse @{upstream}
 			mockExecFileSuccess("origin/feature/test\n");
@@ -3540,6 +3654,52 @@ describe("JolliMemoryBridge", () => {
 			expect(result.commits[0].deletions).toBe(3);
 			expect(result.commits[0].filesChanged).toBe(2);
 			expect(result.commits[0].isPushed).toBe(false);
+			expect(result.commits[0].hasSummary).toBe(true);
+		});
+
+		it("hasSummary is true when the summary is indexed under a different SHA but the tree hash matches (rebase/cherry-pick/amend)", async () => {
+			mockExecFileSuccess("feature/test\n");
+			mockExecFileSuccess("abc\n");
+			mockExecFileSuccess("headhash123\n");
+			mockExecFileSuccess("mergebase456\n");
+			// Commit "rebasedSha" is NOT in the index by hash, but its tree hash
+			// (sharedTree) matches the indexed entry — getSummary would resolve it
+			// via tree hash, so the row must not offer "Generate".
+			mockExecFileSuccess(
+				"rebasedSha\x00sharedTree\x00feat: rebased\x00User\x00user@example.com\x002025-03-15T10:00:00Z\x00\x00\n",
+			);
+			mockExecFileSuccess("origin/feature/test\n");
+			mockExecFileSuccess("def\n");
+			mockExecFileSuccess("\n");
+			getIndexEntryMap.mockResolvedValue(
+				new Map([
+					[
+						"originalSha",
+						{
+							commitHash: "originalSha",
+							parentCommitHash: null,
+							commitType: "commit",
+							commitMessage: "feat: rebased",
+							commitDate: "2025-03-15T10:00:00Z",
+							branch: "feature/test",
+							generatedAt: "2025-03-15T10:00:00Z",
+							topicCount: 1,
+							treeHash: "sharedTree",
+							diffStats: { filesChanged: 1, insertions: 1, deletions: 0 },
+						},
+					],
+				]),
+			);
+			getDiffStats.mockResolvedValueOnce({
+				filesChanged: 1,
+				insertions: 1,
+				deletions: 0,
+			});
+
+			const bridge = makeBridge();
+			const result = await bridge.listBranchCommits("main");
+
+			expect(result.commits[0].hash).toBe("rebasedSha");
 			expect(result.commits[0].hasSummary).toBe(true);
 		});
 
@@ -3590,7 +3750,7 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("mainhash\n");
 			mockExecFileSuccess("headhash\n");
 			mockExecFileSuccess("mergebase\n");
-			const logEntry = `commitHash1\x00feat: local fallback\x00User\x00user@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
+			const logEntry = `commitHash1\x00treeC1\x00feat: local fallback\x00User\x00user@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
 			mockExecFileError("no upstream");
 			mockExecFileError("no origin branch");
@@ -3627,7 +3787,7 @@ describe("JolliMemoryBridge", () => {
 			// getCurrentUserName
 			mockExecFileSuccess("John Doe\n");
 			// git log (with --author filter)
-			const logEntry = `commitHash1\x00fix: merged change\x00John Doe\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
+			const logEntry = `commitHash1\x00treeC1\x00fix: merged change\x00John Doe\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
 
 			getIndexEntryMap.mockResolvedValue(new Map());
@@ -3661,7 +3821,7 @@ describe("JolliMemoryBridge", () => {
 			// getCurrentUserName
 			mockExecFileSuccess("Jane Doe\n");
 			// git log
-			const logEntry = `commitHash2\x00feat: fallback\x00Jane Doe\x00jane@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
+			const logEntry = `commitHash2\x00treeC2\x00feat: fallback\x00Jane Doe\x00jane@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
 
 			getIndexEntryMap.mockResolvedValue(new Map());
@@ -3688,7 +3848,7 @@ describe("JolliMemoryBridge", () => {
 			// merge-base
 			mockExecFileSuccess("mergebase456\n");
 			// git log
-			const logEntry = `commitHash1\x00fix: amend\x00John Doe\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
+			const logEntry = `commitHash1\x00treeC1\x00fix: amend\x00John Doe\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
 			// resolvePushBaseRef: rev-parse @{upstream}
 			mockExecFileSuccess("origin/feature/test\n");
@@ -3772,7 +3932,7 @@ describe("JolliMemoryBridge", () => {
 			// merge-base
 			mockExecFileSuccess("mergebase456\n");
 			// git log — one commit
-			const logEntry = `commitHash1\x00fix: test\x00John\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
+			const logEntry = `commitHash1\x00treeC1\x00fix: test\x00John\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
 			// resolvePushBaseRef: rev-parse @{upstream}
 			mockExecFileSuccess("origin/feature/test\n");
@@ -3824,7 +3984,7 @@ describe("JolliMemoryBridge", () => {
 			// merge-base
 			mockExecFileSuccess("mergebase\n");
 			// git log
-			const logEntry = `commitHash1\x00feat: test\x00User\x00user@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
+			const logEntry = `commitHash1\x00treeC1\x00feat: test\x00User\x00user@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
 			// resolvePushBaseRef: rev-parse @{upstream} returns a ref
 			mockExecFileSuccess("origin/main\n");
@@ -3860,7 +4020,7 @@ describe("JolliMemoryBridge", () => {
 			// merge-base
 			mockExecFileSuccess("mergebase\n");
 			// git log
-			const logEntry = `commitHash1\x00feat: new\x00Test User\x00test@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
+			const logEntry = `commitHash1\x00treeC1\x00feat: new\x00Test User\x00test@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
 			// resolvePushBaseRef: rev-parse @{upstream} — fails
 			mockExecFileError("no upstream");
@@ -4077,7 +4237,7 @@ describe("JolliMemoryBridge", () => {
 			// merge-base
 			mockExecFileSuccess("mergebase\n");
 			// git log — one commit
-			const logEntry = `commitHash1\x00feat: test\x00User\x00user@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
+			const logEntry = `commitHash1\x00treeC1\x00feat: test\x00User\x00user@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
 			// resolvePushBaseRef: rev-parse @{upstream}
 			mockExecFileSuccess("origin/feature/test\n");
@@ -5301,7 +5461,7 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("abc\n"); // resolveHistoryBaseRef
 			mockExecFileSuccess("headhash123\n"); // getHEADHash
 			mockExecFileSuccess("mergebase456\n"); // merge-base
-			const logEntry = `commitHash1\x00fix: test change\x00John Doe\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
+			const logEntry = `commitHash1\x00treeC1\x00fix: test change\x00John Doe\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry); // git log
 			mockExecFileSuccess("origin/feature/test\n"); // upstream rev-parse
 			mockExecFileSuccess("def\n"); // refExists upstream
@@ -5345,8 +5505,8 @@ describe("JolliMemoryBridge", () => {
 			// Two commits in log; only one is in the index, so the other
 			// becomes an unmatched candidate that triggers the scan.
 			const logEntry =
-				`matched\x00fix\x00A\x00a@x\x002025-03-15T10:00:00Z\x00\x00\n` +
-				`unmatched\x00wip\x00A\x00a@x\x002025-03-15T11:00:00Z\x00\x00\n`;
+				`matched\x00treeMatched\x00fix\x00A\x00a@x\x002025-03-15T10:00:00Z\x00\x00\n` +
+				`unmatched\x00treeUnmatched\x00wip\x00A\x00a@x\x002025-03-15T11:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
 			mockExecFileSuccess("origin/feature/test\n");
 			mockExecFileSuccess("def\n");

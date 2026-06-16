@@ -79,7 +79,10 @@ import {
 } from "../util/GitRemoteUtils.js";
 import { isWorkerBlockingBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
-import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
+import {
+	loadGlobalConfig,
+	resolveEnabledSources,
+} from "../util/WorkspaceUtils.js";
 import { BindingChooserWebviewPanel } from "./BindingChooserWebviewPanel.js";
 import { loadBranchSummaries } from "./BranchSummaryLoader.js";
 import { SOURCE_TITLES } from "./SourceLabels.js";
@@ -199,6 +202,7 @@ type WebviewMessage =
 	| { command: "editRecap"; recap: string }
 	| { command: "generateRecap" }
 	| { command: "regenerateSummary" }
+	| { command: "generateMemory" }
 	| { command: "openRewrittenCommit"; hash: string };
 
 /** Entry data sent back from the webview on Save All. */
@@ -445,6 +449,13 @@ export class SummaryWebviewPanel {
 	 */
 	private readonly foreignStorage: StorageProvider | null;
 
+	/**
+	 * True when the panel was opened for a commit with no stored summary yet
+	 * (placeholder-open path). Drives the "Generate memory" banner variant.
+	 * Cleared once a summary is generated and the panel re-renders with it.
+	 */
+	private needsGeneration = false;
+
 	private constructor(
 		extensionUri: vscode.Uri,
 		workspaceRoot: string,
@@ -600,6 +611,15 @@ export class SummaryWebviewPanel {
 				this.catchAndShow(
 					this.handleRegenerateSummary(),
 					"Regenerate failed",
+					{
+						command: "summaryRegenerateError",
+					},
+				);
+				break;
+			case "generateMemory":
+				this.catchAndShow(
+					this.handleGenerateMemory(),
+					"Generate failed",
 					{
 						command: "summaryRegenerateError",
 					},
@@ -1088,6 +1108,7 @@ export class SummaryWebviewPanel {
 		foreignRepoName: string | null = null,
 		foreignRepoUrl: string | null = null,
 		foreignStorage: StorageProvider | null = null,
+		needsGeneration = false,
 	): Promise<void> {
 		if (source === "commit" || source === "kb") {
 			const existing = SummaryWebviewPanel.commitPanels.get(summary.commitHash);
@@ -1101,6 +1122,7 @@ export class SummaryWebviewPanel {
 				// we always run them and then compare the full render-input set
 				// (summary + 3 cache sets) to decide whether re-rendering the
 				// webview HTML is necessary.
+				existing.needsGeneration = needsGeneration;
 				const prevTranscriptHashSet = existing.transcriptHashSet;
 				const prevPlanTranslateSet = existing.planTranslateSet;
 				const prevNoteTranslateSet = existing.noteTranslateSet;
@@ -1152,6 +1174,7 @@ export class SummaryWebviewPanel {
 		} else {
 			SummaryWebviewPanel.commitPanels.set(summary.commitHash, instance);
 		}
+		instance.needsGeneration = needsGeneration;
 		await instance.refreshTranscriptHashes(summary);
 		await instance.refreshPlanTranslateSet(summary);
 		await instance.refreshNoteTranslateSet(summary);
@@ -1187,6 +1210,7 @@ export class SummaryWebviewPanel {
 			nonce,
 			foreignRepoName: this.foreignRepoName,
 			staleRewrittenInto: this.staleRewrittenInto ?? null,
+			needsGeneration: this.needsGeneration,
 		});
 	}
 
@@ -2180,6 +2204,65 @@ export class SummaryWebviewPanel {
 						summaryErrorBannerHtml: buildSummaryErrorBanner(outcome.updated),
 					});
 					vscode.window.showInformationMessage("Summary regenerated.");
+				},
+			);
+		} finally {
+			this.regenerateInProgress = false;
+		}
+	}
+
+	/**
+	 * Generate a summary for a commit that has none yet (the placeholder-open
+	 * path). Shares the regenerate in-flight guard, the regenerating-readonly
+	 * chrome, and the topic/recap swap-in messages, but skips the "overwrite?"
+	 * confirm — there is nothing to overwrite. Bootstraps from the commit hash
+	 * via the Bridge's `summarizeCommit`, persists, clears the
+	 * needs-generation state, then refreshes the history list so the row flips
+	 * from "no memory" to a real memory.
+	 *
+	 * Foreign panels never reach the generate path (their banner omits the
+	 * button), but we hard-guard here too: generating writes the workspace's
+	 * orphan branch, which would corrupt the foreign repo's identity.
+	 */
+	private async handleGenerateMemory(): Promise<void> {
+		if (this.foreignRepoName) return;
+		if (this.regenerateInProgress) return;
+		this.regenerateInProgress = true;
+		try {
+			if (!(await this.ensureCommitNotRewritten("generate memory"))) return;
+			const config = await loadGlobalConfig();
+			this.panel.webview.postMessage({ command: "summaryRegenerating" });
+			await vscode.window.withProgress(
+				{
+					location: vscode.ProgressLocation.Notification,
+					title: "Generating memory…",
+					cancellable: true,
+				},
+				async (_progress, token) => {
+					const cancelled = new Promise<"cancelled">((resolve) => {
+						token.onCancellationRequested(() => resolve("cancelled"));
+					});
+					const work = this.bridge.summarizeCommit(this.commitHash, config);
+					const outcome = await Promise.race([work, cancelled]);
+					if (outcome === "cancelled") {
+						this.panel.webview.postMessage({ command: "summaryRegenerateError" });
+						return;
+					}
+					if (!(await this.ensureCommitNotRewritten("generate memory"))) {
+						this.panel.webview.postMessage({ command: "summaryRegenerateError" });
+						return;
+					}
+					await this.bridge.storeSummary(outcome.updated, true);
+					this.currentSummary = outcome.updated;
+					this.needsGeneration = false;
+					this.panel.webview.postMessage({
+						command: "summaryRegenerated",
+						topicsHtml: buildTopicsSection(outcome.updated),
+						recapHtml: buildRecapSection(outcome.updated.recap),
+						summaryErrorBannerHtml: buildSummaryErrorBanner(outcome.updated),
+					});
+					await vscode.commands.executeCommand("jollimemory.refreshHistory");
+					vscode.window.showInformationMessage("Memory generated.");
 				},
 			);
 		} finally {
@@ -3418,28 +3501,7 @@ export class SummaryWebviewPanel {
 
 	/** Returns the set of integration source names that are currently enabled in config. */
 	private async getEnabledSources(): Promise<Set<string>> {
-		const config = await loadGlobalConfig();
-		const sources = new Set<string>();
-		if (config.claudeEnabled !== false) {
-			sources.add("claude");
-		}
-		if (config.codexEnabled !== false) {
-			sources.add("codex");
-		}
-		if (config.geminiEnabled !== false) {
-			sources.add("gemini");
-		}
-		if (config.openCodeEnabled !== false) {
-			sources.add("opencode");
-		}
-		if (config.cursorEnabled !== false) {
-			sources.add("cursor");
-		}
-		if (config.copilotEnabled !== false) {
-			sources.add("copilot");
-			sources.add("copilot-chat");
-		}
-		return sources;
+		return resolveEnabledSources(await loadGlobalConfig());
 	}
 
 	/** Loads lightweight stats (session/entry counts by source) without sending full content. */
