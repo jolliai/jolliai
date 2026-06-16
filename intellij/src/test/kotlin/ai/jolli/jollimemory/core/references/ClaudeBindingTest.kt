@@ -33,6 +33,20 @@ class ClaudeBindingTest {
 		}
 
 		@Test
+		fun `matches claude_ai Linear prefix`() {
+			val result = ClaudeBinding.bindingForToolName("mcp__claude_ai_Linear__get_issue")
+			result.shouldNotBeNull()
+			result.first shouldBe SourceId.linear
+		}
+
+		@Test
+		fun `matches claude_ai GitHub prefix`() {
+			val result = ClaudeBinding.bindingForToolName("mcp__claude_ai_GitHub__get_issue")
+			result.shouldNotBeNull()
+			result.first shouldBe SourceId.github
+		}
+
+		@Test
 		fun `matches Notion only for notion-fetch`() {
 			val result = ClaudeBinding.bindingForToolName("mcp__claude_ai_Notion__notion-fetch")
 			result.shouldNotBeNull()
@@ -63,6 +77,15 @@ class ClaudeBindingTest {
 		}
 
 		@Test
+		fun `resolves claude_ai Linear MCP tool`() {
+			val resolved = ClaudeBinding.resolve("mcp__claude_ai_Linear__get_issue", null)
+			resolved.shouldNotBeNull()
+			resolved.sourceId shouldBe SourceId.linear
+			resolved.kind shouldBe ClaudeBinding.Kind.mcp
+			resolved.toolName shouldBe "mcp__claude_ai_Linear__get_issue"
+		}
+
+		@Test
 		fun `resolves Bash CLI tool`() {
 			val input = JsonObject()
 			input.addProperty("command", "gh issue view 42 --repo o/r --json title,body")
@@ -89,7 +112,8 @@ class ClaudeBindingTest {
 	@Test
 	fun `TOOL_PREFIXES has all rule prefixes`() {
 		ClaudeBinding.TOOL_PREFIXES shouldBe listOf(
-			"mcp__github__", "mcp__claude_ai_Atlassian__", "mcp__linear__", "mcp__claude_ai_Notion__"
+			"mcp__github__", "mcp__claude_ai_GitHub__", "mcp__claude_ai_Atlassian__",
+			"mcp__linear__", "mcp__claude_ai_Linear__", "mcp__claude_ai_Notion__"
 		)
 	}
 }

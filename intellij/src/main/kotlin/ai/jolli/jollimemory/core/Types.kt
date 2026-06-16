@@ -1,5 +1,8 @@
 package ai.jolli.jollimemory.core
 
+import ai.jolli.jollimemory.core.references.ReferenceCommitRef
+import ai.jolli.jollimemory.core.references.ReferenceEntry
+
 /**
  * JolliMemory Type Definitions — Kotlin port of Types.ts
  *
@@ -149,6 +152,7 @@ data class CommitSummary(
     val e2eTestGuide: List<E2eTestScenario>? = null,
     val plans: List<PlanReference>? = null,
     val notes: List<NoteReference>? = null,
+    val references: List<ReferenceCommitRef>? = null,
 )
 
 /** A single E2E test scenario */
@@ -189,6 +193,7 @@ data class PlansRegistry(
     val version: Int = 1,
     val plans: Map<String, PlanEntry> = emptyMap(),
     val notes: Map<String, NoteEntry>? = null,
+    val references: Map<String, ReferenceEntry>? = null,
 )
 
 // ── Note types ─────────────────────────────────────────────────────────────

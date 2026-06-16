@@ -142,6 +142,31 @@ object SessionTracker {
         }
     }
 
+    // ── Discovery Cursors ────────────────────────────────────────────────────
+
+    private const val DISCOVERY_CURSORS_FILE = "discovery-cursors.json"
+
+    fun saveDiscoveryCursor(cursor: TranscriptCursor, cwd: String? = null) {
+        val dir = ensureDir(cwd)
+        val registry = loadDiscoveryCursorsRegistry(dir)
+        val cursors = registry.cursors.toMutableMap()
+        cursors[cursor.transcriptPath] = cursor
+        atomicWrite(File(dir, DISCOVERY_CURSORS_FILE), gson.toJson(CursorsRegistry(version = 1, cursors = cursors)))
+    }
+
+    fun loadDiscoveryCursor(transcriptPath: String, cwd: String? = null): TranscriptCursor? {
+        val dir = JmLogger.getJolliMemoryDir(cwd)
+        return loadDiscoveryCursorsRegistry(dir).cursors[transcriptPath]
+    }
+
+    private fun loadDiscoveryCursorsRegistry(dir: String): CursorsRegistry {
+        return try {
+            gson.fromJson(File(dir, DISCOVERY_CURSORS_FILE).readText(Charsets.UTF_8), CursorsRegistry::class.java)
+        } catch (_: Exception) {
+            CursorsRegistry()
+        }
+    }
+
     // ── Config ──────────────────────────────────────────────────────────────
 
     /** Returns the global config directory: ~/.jolli/jollimemory/ */
