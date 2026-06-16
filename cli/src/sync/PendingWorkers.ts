@@ -149,3 +149,52 @@ export async function consumePendingWorkers(memoryBankRoot: string): Promise<Rea
 	}
 	return cwds;
 }
+
+/**
+ * Drain the pending-worker registry for `memoryBankRoot` and `launch` a worker
+ * for every recorded cwd (skipping `selfCwd` when supplied). The single place
+ * a `vault-write.lock` releaser turns "someone timed out waiting on me" into a
+ * re-spawn.
+ *
+ * `launch` is injected rather than imported so this stays in the sync layer
+ * (the spawn helper, `launchWorker`, lives in `hooks/QueueWorker.ts` and varies
+ * by host — CLI vs VS Code bundle). `selfCwd` exists for the QueueWorker case:
+ * a worker draining its OWN queue already does a chain-spawn for its cwd at the
+ * end of `runWorker`, so re-launching itself here would be a redundant spawn
+ * that loses the worker.lock race. Holders that are NOT queue workers (the
+ * compile/ingest paths) pass no `selfCwd` so a pending worker for the same repo
+ * still gets woken.
+ *
+ * Best-effort: a drain/launch failure is logged and swallowed. The worst
+ * outcome is a worker that isn't auto-woken — its queue entry stays on disk for
+ * the repo's next post-commit hook.
+ */
+export async function wakePendingWorkers(
+	memoryBankRoot: string,
+	launch: (cwd: string) => void,
+	selfCwd?: string,
+): Promise<void> {
+	// `consumePendingWorkers` DRAINS the registry (reads + deletes) before
+	// returning, so the entries are already gone once we start launching. A launch
+	// failure must therefore be isolated PER cwd — letting one throw abort the loop
+	// would silently drop every later (already-consumed) repo, re-opening the
+	// orphaned-queue-entry gap this whole mechanism closes.
+	let pending: ReadonlyArray<string>;
+	try {
+		pending = await consumePendingWorkers(memoryBankRoot);
+		/* v8 ignore start -- consumePendingWorkers is contractually non-throwing (readdir/read/unlink failures are caught internally); this guard only exists so a future contract change can't make wakePendingWorkers throw out of a finally block */
+	} catch (e) {
+		log.warn("wakePendingWorkers: draining the pending registry failed (non-fatal): %s", (e as Error).message);
+		return;
+	}
+	/* v8 ignore stop */
+	for (const cwd of pending) {
+		if (selfCwd !== undefined && cwd === selfCwd) continue;
+		try {
+			log.info("Waking pending worker for cwd=%s", cwd);
+			launch(cwd);
+		} catch (e) {
+			log.warn("wakePendingWorkers: launch failed for cwd=%s (non-fatal): %s", cwd, (e as Error).message);
+		}
+	}
+}

@@ -28,6 +28,7 @@ vi.mock("./IngestRunStore.js", () => ({ appendIngestRun: vi.fn() }));
 // dummy provider is never actually read.
 vi.mock("./ReadStorageResolver.js", () => ({ createReadStorage: vi.fn(async () => ({})) }));
 
+import { VaultWriteBusyError } from "../sync/VaultWriteLock.js";
 import { drainIngest, ingestPendingBatch } from "./IngestPipeline.js";
 import { appendIngestRun } from "./IngestRunStore.js";
 import { callLlm } from "./LlmClient.js";
@@ -52,6 +53,15 @@ const reconcileOut = (slug: string) =>
 	`===TOPIC===\n---TITLE---\nT\n---STABLESLUG---\n${slug}\n---SUMMARY---\nsum\n---CONTENT---\nbody\n`;
 const s = (id: string, ts: string): SourceRef => ({ type: "summary", id, timestamp: ts });
 const sb = (id: string, ts: string, branch: string): SourceRef => ({ type: "summary", id, timestamp: ts, branch });
+const pg = (slug: string, lastUpdatedAt: string, content = "body"): TopicPage => ({
+	schemaVersion: 1,
+	stableSlug: slug,
+	title: "T",
+	content,
+	relatedBranches: [],
+	sourceRefs: [],
+	lastUpdatedAt,
+});
 
 describe("ingestPendingBatch", () => {
 	beforeEach(() => {
@@ -135,6 +145,188 @@ describe("ingestPendingBatch", () => {
 		expect(r.touchedSlugs).toEqual(["auth"]);
 		expect(vi.mocked(saveTopicPage)).toHaveBeenCalledTimes(1);
 		expect(vi.mocked(saveProcessedSet)).toHaveBeenCalledTimes(1);
+	});
+
+	it("runs every LLM call before the first guarded write (LLM phase is lock-free)", async () => {
+		// The write guard is where the QueueWorker hangs the per-write vault-write.lock.
+		// To keep the long reconcile phase off the lock, ALL callLlm calls (route +
+		// reconcile) must complete before the first guarded write runs.
+		vi.mocked(listPendingSources).mockResolvedValue([s("c0", "2026-01-01T00:00:00Z")]);
+		vi.mocked(callLlm)
+			.mockResolvedValueOnce(
+				llmText(
+					"route",
+					JSON.stringify({
+						updates: [],
+						newTopics: [{ stableSlug: "auth", title: "Auth", sourceIndexes: [0] }],
+					}),
+				),
+			)
+			.mockResolvedValueOnce(llmText("reconcile", reconcileOut("auth")));
+		let llmCallsAtFirstGuardedWrite = -1;
+		const writeGuard = vi.fn(async (fn: () => Promise<void>): Promise<void> => {
+			if (llmCallsAtFirstGuardedWrite === -1) llmCallsAtFirstGuardedWrite = vi.mocked(callLlm).mock.calls.length;
+			await fn();
+		});
+		await ingestPendingBatch("/tmp/x", cfg, { writeGuard });
+		expect(writeGuard).toHaveBeenCalled(); // persistence is routed through the guard
+		expect(llmCallsAtFirstGuardedWrite).toBe(2); // route + reconcile both done first
+		expect(vi.mocked(saveTopicPage)).toHaveBeenCalled();
+		expect(vi.mocked(saveProcessedSet)).toHaveBeenCalled();
+	});
+
+	it("re-reads the topic index inside the guard so a concurrent index change is not clobbered (RMW)", async () => {
+		// With the LLM phase lock-free, sync can advance the index between route-read
+		// and apply-write. The apply must merge onto a FRESH index read (inside the
+		// guard), not overwrite from the stale route-time snapshot.
+		vi.mocked(listPendingSources).mockResolvedValue([s("c0", "2026-01-01T00:00:00Z")]);
+		vi.mocked(callLlm)
+			.mockResolvedValueOnce(
+				llmText(
+					"route",
+					JSON.stringify({
+						updates: [],
+						newTopics: [{ stableSlug: "auth", title: "Auth", sourceIndexes: [0] }],
+					}),
+				),
+			)
+			.mockResolvedValueOnce(llmText("reconcile", reconcileOut("auth")));
+		vi.mocked(readTopicIndex)
+			.mockResolvedValueOnce({ schemaVersion: 1, topics: [] }) // route-time read: empty
+			.mockResolvedValueOnce({
+				schemaVersion: 1,
+				topics: [
+					{
+						stableSlug: "other",
+						title: "Other",
+						summary: "s",
+						relatedBranches: [],
+						sourceRefs: [],
+						lastUpdatedAt: "2026-01-01T00:00:00Z",
+					},
+				],
+			}); // apply-time fresh read: a concurrent writer added "other"
+		await ingestPendingBatch("/tmp/x", cfg, { writeGuard: (fn) => fn() });
+		const savedIndex = vi.mocked(saveTopicIndex).mock.calls[0]?.[0];
+		const slugs = savedIndex?.topics.map((t) => t.stableSlug) ?? [];
+		expect(slugs).toContain("other"); // concurrent topic preserved (not clobbered)
+		expect(slugs).toContain("auth"); // our new topic still applied
+	});
+
+	it("holds the source when the page was CREATED concurrently during the lock-free LLM phase", async () => {
+		// New topic: reconcile's `before` snapshot is null. If a concurrent writer
+		// landed the page during the lock-free LLM phase, the guarded re-read finds it
+		// non-null — we must HOLD the source (PAGE_WRITE_CONFLICT), not clobber it.
+		vi.mocked(listPendingSources).mockResolvedValue([s("c0", "2026-01-01T00:00:00Z")]);
+		vi.mocked(callLlm)
+			.mockResolvedValueOnce(
+				llmText(
+					"route",
+					JSON.stringify({
+						updates: [],
+						newTopics: [{ stableSlug: "auth", title: "Auth", sourceIndexes: [0] }],
+					}),
+				),
+			)
+			.mockResolvedValueOnce(llmText("reconcile", reconcileOut("auth")));
+		// New topic → reconcile does NOT read the page; the single read is the guard's.
+		vi.mocked(readTopicPage).mockResolvedValueOnce(pg("auth", "2026-02-02T00:00:00Z"));
+		const r = await ingestPendingBatch("/tmp/x", cfg);
+		expect(vi.mocked(saveTopicPage)).not.toHaveBeenCalled();
+		expect(vi.mocked(saveProcessedSet)).not.toHaveBeenCalled();
+		expect(r.ingested).toBe(0);
+		expect(r.touchedSlugs).toEqual([]);
+		expect(r.topicFailures).toEqual([{ slug: "auth", code: "PAGE_WRITE_CONFLICT" }]);
+	});
+
+	it("holds the source when an EXISTING page changed under us during the LLM phase", async () => {
+		vi.mocked(listPendingSources).mockResolvedValue([s("c0", "2026-01-01T00:00:00Z")]);
+		vi.mocked(callLlm)
+			.mockResolvedValueOnce(
+				llmText(
+					"route",
+					JSON.stringify({ updates: [{ stableSlug: "auth", sourceIndexes: [0] }], newTopics: [] }),
+				),
+			)
+			.mockResolvedValueOnce(llmText("reconcile", reconcileOut("auth")));
+		// reconcile-time read (the `before` snapshot) vs the guard-time re-read differ:
+		// a sync pull bumped lastUpdatedAt while the LLM phase ran lock-free.
+		vi.mocked(readTopicPage)
+			.mockResolvedValueOnce(pg("auth", "2026-01-01T00:00:00Z"))
+			.mockResolvedValueOnce(pg("auth", "2026-09-09T00:00:00Z"));
+		const r = await ingestPendingBatch("/tmp/x", cfg);
+		expect(vi.mocked(saveTopicPage)).not.toHaveBeenCalled();
+		expect(r.ingested).toBe(0);
+		expect(r.topicFailures).toEqual([{ slug: "auth", code: "PAGE_WRITE_CONFLICT" }]);
+	});
+
+	it("holds the source as PAGE_WRITE_CONFLICT when the per-write guard reports the lock busy", async () => {
+		// A VaultWriteBusyError (vault-write.lock not acquired in budget) is benign
+		// contention: hold this page, don't abort the batch or mark the source done.
+		vi.mocked(listPendingSources).mockResolvedValue([s("c0", "2026-01-01T00:00:00Z")]);
+		vi.mocked(callLlm)
+			.mockResolvedValueOnce(
+				llmText(
+					"route",
+					JSON.stringify({
+						updates: [],
+						newTopics: [{ stableSlug: "auth", title: "Auth", sourceIndexes: [0] }],
+					}),
+				),
+			)
+			.mockResolvedValueOnce(llmText("reconcile", reconcileOut("auth")));
+		const writeGuard = vi.fn(async (): Promise<void> => {
+			throw new VaultWriteBusyError();
+		});
+		const r = await ingestPendingBatch("/tmp/x", cfg, { writeGuard });
+		expect(vi.mocked(saveTopicPage)).not.toHaveBeenCalled();
+		expect(vi.mocked(saveProcessedSet)).not.toHaveBeenCalled();
+		expect(r.ingested).toBe(0);
+		expect(r.topicFailures).toEqual([{ slug: "auth", code: "PAGE_WRITE_CONFLICT" }]);
+	});
+
+	it("surfaces a real page-write failure as PAGE_WRITE_ERROR, not a benign conflict", async () => {
+		// A non-busy throw from inside the guarded section (disk / JSON / git plumbing
+		// fault) must NOT be masked as PAGE_WRITE_CONFLICT — otherwise a genuine fault
+		// is silently held and retried forever with no error surfaced. The source is
+		// still held (batch continues), but the failure is reported as an error code.
+		vi.mocked(listPendingSources).mockResolvedValue([s("c0", "2026-01-01T00:00:00Z")]);
+		vi.mocked(callLlm)
+			.mockResolvedValueOnce(
+				llmText(
+					"route",
+					JSON.stringify({
+						updates: [],
+						newTopics: [{ stableSlug: "auth", title: "Auth", sourceIndexes: [0] }],
+					}),
+				),
+			)
+			.mockResolvedValueOnce(llmText("reconcile", reconcileOut("auth")));
+		// Guard runs the body; the body's saveTopicPage throws a real I/O error.
+		vi.mocked(saveTopicPage).mockRejectedValueOnce(new Error("ENOSPC: no space left on device"));
+		const r = await ingestPendingBatch("/tmp/x", cfg, { writeGuard: (fn) => fn() });
+		expect(r.ingested).toBe(0);
+		expect(r.topicFailures).toEqual([{ slug: "auth", code: "PAGE_WRITE_ERROR" }]);
+	});
+
+	it("writes the page when the on-disk version is unchanged since reconcile read it", async () => {
+		// The common case under the per-write guard: nothing changed between the
+		// reconcile read and the guarded write, so the write proceeds normally.
+		vi.mocked(listPendingSources).mockResolvedValue([s("c0", "2026-01-01T00:00:00Z")]);
+		vi.mocked(callLlm)
+			.mockResolvedValueOnce(
+				llmText(
+					"route",
+					JSON.stringify({ updates: [{ stableSlug: "auth", sourceIndexes: [0] }], newTopics: [] }),
+				),
+			)
+			.mockResolvedValueOnce(llmText("reconcile", reconcileOut("auth")));
+		vi.mocked(readTopicPage).mockResolvedValue(pg("auth", "2026-01-01T00:00:00Z"));
+		const r = await ingestPendingBatch("/tmp/x", cfg);
+		expect(vi.mocked(saveTopicPage)).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(saveProcessedSet)).toHaveBeenCalledTimes(1);
+		expect(r.ingested).toBe(1);
+		expect(r.touchedSlugs).toEqual(["auth"]);
 	});
 
 	it("threads the injected readStorage into processed-set / topic-index / topic-page reads", async () => {
@@ -268,6 +460,42 @@ describe("ingestPendingBatch", () => {
 		expect(r.topicFailures).toEqual([{ slug: "t", code: "RECONCILE_TRUNCATED" }]);
 		expect(r.reconcileCalls).toBe(1);
 		expect(vi.mocked(saveProcessedSet)).not.toHaveBeenCalled();
+	});
+
+	it("persists the page+index but treats a failed processed-set write as non-fatal (sources stay pending)", async () => {
+		// The page+index write share one guarded section, so they land atomically.
+		// If the LATER processed-set guard then can't acquire the lock, that is
+		// hold-and-continue: the batch must NOT throw — the page+index stay written
+		// and the source is simply not marked done, so the next drain retries it via
+		// the (now-indexed) UPDATE path. This is what keeps a missed processed-set
+		// write from stranding a source the way a missed index write would.
+		vi.mocked(listPendingSources).mockResolvedValue([s("c0", "2026-01-01T00:00:00Z")]);
+		vi.mocked(callLlm)
+			.mockResolvedValueOnce(
+				llmText(
+					"route",
+					JSON.stringify({
+						updates: [],
+						newTopics: [{ stableSlug: "auth", title: "Auth", sourceIndexes: [0] }],
+					}),
+				),
+			)
+			.mockResolvedValueOnce(llmText("reconcile", reconcileOut("auth")));
+		// First guard call (page + index) runs; the second (processed-set) throws.
+		let calls = 0;
+		const writeGuard = vi.fn(async (fn: () => Promise<void>): Promise<void> => {
+			calls++;
+			if (calls >= 2) throw new Error("lock budget exceeded");
+			await fn();
+		});
+		const r = await ingestPendingBatch("/tmp/x", cfg, { writeGuard });
+		expect(vi.mocked(saveTopicPage)).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(saveTopicIndex)).toHaveBeenCalledTimes(1);
+		// Processed-set write was attempted (2nd guard call) but threw → swallowed.
+		expect(vi.mocked(saveProcessedSet)).not.toHaveBeenCalled();
+		// The page wrote cleanly (not a PAGE_WRITE_CONFLICT) and the batch did not throw.
+		expect(r.topicFailures).toEqual([]);
+		expect(r.touchedSlugs).toEqual(["auth"]);
 	});
 
 	it("reports RECONCILE_PARSE_FAILED when the block is unparseable", async () => {
@@ -518,9 +746,12 @@ describe("drainIngest", () => {
 		expect(r.ingested).toBe(2);
 	});
 
-	it("trips the adaptive iteration guard when the pipeline never drains", async () => {
-		// 2 pending, batchSize 1 -> guard = ceil(2/1)+2 = 4. Every reconcile fails, so
-		// nothing is marked and `done` is always false -> the guard must stop the loop.
+	it("stops after the first no-progress batch instead of re-running the LLM", async () => {
+		// 2 pending, batchSize 1. Every reconcile is truncated, so nothing is marked
+		// and the batch makes ZERO progress. Re-running route+reconcile against the
+		// identical pending slice would just re-bill tokens, so the drain must STOP
+		// after one batch (1 route + 1 reconcile = 2 LLM calls) rather than loop to
+		// the iteration guard (which would be 8 calls).
 		vi.mocked(listPendingSources).mockResolvedValue([
 			s("c0", "2026-01-01T00:00:00Z"),
 			s("c1", "2026-01-02T00:00:00Z"),
@@ -544,8 +775,34 @@ describe("drainIngest", () => {
 					},
 		);
 		const r = await drainIngest("/tmp/x", cfg, { batchSize: 1 });
-		expect(r.batches).toBe(4);
+		expect(r.batches).toBe(1);
 		expect(r.ingested).toBe(0);
+		expect(r.outcome).toBe("RECONCILE_TRUNCATED");
+		expect(vi.mocked(callLlm).mock.calls.length).toBe(2); // not 8 — no wasted re-runs
+	});
+
+	it("trips the adaptive iteration guard when batches make progress but pending never shrinks", async () => {
+		// Backstop for the pathological case the no-progress short-circuit can't catch:
+		// each batch DOES mark a source (ingested>0) yet listPendingSources keeps
+		// returning the same 2 entries, so `done` is never true. guard = ceil(2/1)+2 = 4.
+		vi.mocked(listPendingSources).mockResolvedValue([
+			s("c0", "2026-01-01T00:00:00Z"),
+			s("c1", "2026-01-02T00:00:00Z"),
+		]);
+		vi.mocked(callLlm).mockImplementation(async (o) =>
+			o.action === "route"
+				? llmText(
+						"route",
+						JSON.stringify({
+							updates: [],
+							newTopics: [{ stableSlug: "t", title: "T", sourceIndexes: [0] }],
+						}),
+					)
+				: llmText("reconcile", reconcileOut("t")),
+		);
+		const r = await drainIngest("/tmp/x", cfg, { batchSize: 1 });
+		expect(r.batches).toBe(4);
+		expect(r.outcome).toBe("ITERATION_GUARD");
 	});
 
 	it("records one OK run with aggregated counts", async () => {

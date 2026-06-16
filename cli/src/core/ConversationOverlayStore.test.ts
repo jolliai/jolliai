@@ -8,6 +8,7 @@ import {
 	applyOverlay,
 	applyOverlaysToSessions,
 	type ConversationOverlay,
+	hasOverlayChanges,
 	loadOverlay,
 	mergeOverlay,
 	type OverlayableSession,
@@ -37,6 +38,46 @@ describe("ConversationOverlayStore", () => {
 			"utf8",
 		);
 	}
+
+	describe("hasOverlayChanges", () => {
+		const base = {
+			version: 2 as const,
+			source: "claude" as const,
+			sessionId: "s",
+			updatedAt: "2026-05-17T00:00:00Z",
+		};
+
+		it("returns false for a null overlay", () => {
+			expect(hasOverlayChanges(null)).toBe(false);
+		});
+
+		it("returns false for an undefined overlay", () => {
+			expect(hasOverlayChanges(undefined)).toBe(false);
+		});
+
+		it("returns true when deletes is non-empty", () => {
+			const overlay: ConversationOverlay = {
+				...base,
+				deletes: [{ role: "human", content: "x" }],
+				edits: [],
+			};
+			expect(hasOverlayChanges(overlay)).toBe(true);
+		});
+
+		it("returns true when edits is non-empty while deletes is empty", () => {
+			const overlay: ConversationOverlay = {
+				...base,
+				deletes: [],
+				edits: [{ role: "assistant", content: "y", newContent: "z" }],
+			};
+			expect(hasOverlayChanges(overlay)).toBe(true);
+		});
+
+		it("returns false when both deletes and edits are empty", () => {
+			const overlay: ConversationOverlay = { ...base, deletes: [], edits: [] };
+			expect(hasOverlayChanges(overlay)).toBe(false);
+		});
+	});
 
 	describe("overlayPath", () => {
 		it("returns <projectDir>/.jolli/jollimemory/conversation-edits/<source>--<sessionId>.json", () => {
@@ -886,6 +927,27 @@ describe("ConversationOverlayStore", () => {
 
 			await pruneConsumedOverlayRules([session], projectDir);
 
+			expect(existsSync(overlayFile())).toBe(false);
+		});
+
+		it("defaults source to 'claude' when the session shape omits it", async () => {
+			// Overlay is saved under the 'claude' source; the session below has
+			// no `source` field, so pruneOneSession must fall back to "claude"
+			// (line 347 `s.source ?? "claude"`) to locate and prune it.
+			await saveOverlay(
+				{ projectDir, source: "claude", sessionId: sid },
+				{ deletes: [{ role: "human", content: "drop", timestamp: "t1" }], edits: [] },
+			);
+			expect(existsSync(overlayFile())).toBe(true);
+
+			const session: OverlayableSession = {
+				sessionId: sid,
+				// no source field — must default to "claude"
+				entries: [{ role: "human", content: "drop", timestamp: "t1" }],
+			};
+			await pruneConsumedOverlayRules([session], projectDir);
+
+			// All rules consumed → file unlinked, proving the fallback found it.
 			expect(existsSync(overlayFile())).toBe(false);
 		});
 

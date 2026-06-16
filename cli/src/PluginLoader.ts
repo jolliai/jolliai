@@ -46,7 +46,7 @@ import type { PluginContext, PluginRegister } from "./Api.js";
 import { setHelpGroup } from "./commands/HelpGroups.js";
 import { getGlobalConfigDir } from "./core/SessionTracker.js";
 import { KNOWN_PLUGINS, type KnownPlugin } from "./KnownPlugins.js";
-import { createLogger } from "./Logger.js";
+import { createLogger, errMsg } from "./Logger.js";
 import { runNpmCommand } from "./util/Subprocess.js";
 
 const log = createLogger("PluginLoader");
@@ -225,7 +225,7 @@ export function registerMissingStubs(program: Command, loadedPluginIds: Readonly
 		} catch (err) {
 			// A throwing stub should never tear down the host — same
 			// non-fatal contract as a throwing plugin `register()`.
-			warn(`${known.packageName} stub registration failed: ${errMessage(err)}`);
+			warn(`${known.packageName} stub registration failed: ${errMsg(err)}`);
 		}
 	}
 }
@@ -413,7 +413,12 @@ async function resolveRoots(opts?: LoadPluginsOptions): Promise<ReadonlyArray<st
 			if (existsSync(join(dir, ".git"))) return dir;
 			if (dir === fsRoot) return null;
 			const parent = dirname(dir);
+			// Defensive: `cwd` is always absolute, so `dirname` stabilizes exactly at
+			// `fsRoot` and the `dir === fsRoot` check above always fires first — this
+			// guard against `dirname` non-progress is never reached in production.
+			/* v8 ignore start -- unreachable: dirname stabilizes at fsRoot for absolute cwd */
 			if (parent === dir) return null;
+			/* v8 ignore stop */
 			dir = parent;
 		}
 	};
@@ -432,7 +437,12 @@ async function resolveRoots(opts?: LoadPluginsOptions): Promise<ReadonlyArray<st
 		}
 		if (dir === boundary) break;
 		const parent = dirname(dir);
+		// Defensive: for an absolute `cwd`, `dirname` stabilizes at `fsRoot`, which
+		// is outside any `boundary` (so `isWithinBoundary` exits the loop first) or
+		// equals `boundary` (caught above) — the non-progress guard is never reached.
+		/* v8 ignore start -- unreachable: walk exits via boundary/isWithinBoundary for absolute cwd */
 		if (parent === dir) break;
+		/* v8 ignore stop */
 		dir = parent;
 	}
 
@@ -510,6 +520,25 @@ function defaultSelfInstallRoot(): string | null {
 /* v8 ignore stop */
 
 /**
+ * Byte-order comparator for two scope-directory entry names, used to make the
+ * "first match wins" rule deterministic across filesystems (`readdir`'s native
+ * order is inode-allocation on ext4, undefined on APFS, and varies per FS).
+ *
+ * Plain `<`/`>` is a byte-order comparison (not locale-sensitive), so the
+ * winner is the same regardless of the runner's `LC_COLLATE` —
+ * `localeCompare` without a fixed locale would otherwise reorder names
+ * containing case or punctuation between machines.
+ *
+ * `readdir` never returns two entries with the same name in one directory, so a
+ * strict `<` split is a correct total order here; the equal case can't fire and
+ * is not represented. Exported so the order invariant is unit-testable without
+ * depending on the filesystem's `readdir` ordering.
+ */
+export function compareDirentNames(a: string, b: string): number {
+	return a < b ? -1 : 1;
+}
+
+/**
  * Walk the given roots, scan each known scope directory, and return the first
  * matching package directory per allow-listed plugin ID.
  *
@@ -562,11 +591,8 @@ async function discoverPlugins(
 
 			// Sort for deterministic "first match wins". Without this, two packages
 			// declaring the same ID would race on the underlying filesystem order.
-			// Plain `<`/`>` is a byte-order comparison (not locale-sensitive), so
-			// the winner is the same regardless of the runner's `LC_COLLATE` —
-			// `localeCompare(b.name)` without a fixed locale would otherwise
-			// reorder names containing case or punctuation between machines.
-			entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+			// See {@link compareDirentNames} for the byte-order rationale.
+			entries.sort((a, b) => compareDirentNames(a.name, b.name));
 
 			// Per-scope+root dedupe. Used to detect two packages claiming the same
 			// ID at the same depth (the unstable-migration case the comment above
@@ -615,11 +641,7 @@ async function discoverPlugins(
 					// Compromise: leave a debug breadcrumb (only surfaced with
 					// debug logging on) recording the path + parse error, matching
 					// the symlink-forensics `log.debug` pattern below. Then skip.
-					log.debug(
-						`skipping ${scope}/${entry.name}: unreadable/invalid package.json (${
-							err instanceof Error ? err.message : String(err)
-						})`,
-					);
+					log.debug(`skipping ${scope}/${entry.name}: unreadable/invalid package.json (${errMsg(err)})`);
 					continue;
 				}
 
@@ -662,7 +684,7 @@ async function discoverPlugins(
 						// debug breadcrumb — same rationale as `runNpmRootGlobal`.
 						/* v8 ignore start */
 						log.debug(
-							`plugin symlink ${scope}/${entry.name} realpath failed (${errMessage(err)}) — loading without audit trail`,
+							`plugin symlink ${scope}/${entry.name} realpath failed (${errMsg(err)}) — loading without audit trail`,
 						);
 						/* v8 ignore stop */
 					}
@@ -757,7 +779,7 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
 		try {
 			mod = await import(pathToFileURL(entryAbs).href);
 		} catch (err) {
-			warn(`${name} failed to load: ${errMessage(err)}`);
+			warn(`${name} failed to load: ${errMsg(err)}`);
 			return false;
 		}
 
@@ -796,7 +818,7 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
 		try {
 			await mod.register(ctx);
 		} catch (err) {
-			warn(`${name} register() threw: ${errMessage(err)}`);
+			warn(`${name} register() threw: ${errMsg(err)}`);
 			return false;
 		} finally {
 			restoreCommand();
@@ -825,19 +847,9 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
 		// (e.g. malformed JSON yielding pkg.main as an array, a buggy fs
 		// implementation throwing on existsSync) lands here so loadPlugins
 		// keeps iterating and the CLI keeps running.
-		warn(`${name} unexpected loader error: ${errMessage(err)}`);
+		warn(`${name} unexpected loader error: ${errMsg(err)}`);
 		return false;
 	}
-}
-
-/**
- * Stringify an unknown thrown value for diagnostic warnings. Plugins are
- * untrusted code — `throw "boom"` and `throw null` would otherwise render as
- * `(err as Error).message === undefined`, losing the only signal the operator
- * has for tracking down a misbehaving plugin.
- */
-function errMessage(err: unknown): string {
-	return err instanceof Error ? err.message : String(err);
 }
 
 /**

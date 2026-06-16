@@ -49,14 +49,22 @@ vi.mock("../Logger.js", () => ({
 vi.mock("../sync/SyncBootstrap.js", () => ({
 	deriveMemoryBankRoot: vi.fn((localFolder: string | undefined) => localFolder ?? "/mb"),
 }));
-vi.mock("../sync/VaultWriteLock.js", () => ({
-	DEFAULT_VAULT_WRITE_WAIT_MS: 60_000,
-	// Default: lock free → run the body and surface its value.
-	withVaultWriteLock: vi.fn(async (_root: string, _mode: unknown, body: () => Promise<unknown>) => ({
-		ran: true,
-		value: await body(),
-	})),
-}));
+vi.mock("../sync/VaultWriteLock.js", async (importOriginal) => {
+	// Keep the real `VaultWriteBusyError` so the production `instanceof` check
+	// (busy → clean exit vs real error → propagate) is exercised faithfully; only
+	// the lock acquisition itself is stubbed.
+	const actual = await importOriginal<typeof import("../sync/VaultWriteLock.js")>();
+	return {
+		...actual,
+		DEFAULT_VAULT_WRITE_WAIT_MS: 60_000,
+		// Default: lock free → run the body and surface its value.
+		withVaultWriteLock: vi.fn(async (_root: string, _mode: unknown, body: () => Promise<unknown>) => ({
+			ran: true,
+			value: await body(),
+		})),
+	};
+});
+vi.mock("../hooks/QueueWorker.js", () => ({ launchWorker: vi.fn() }));
 
 import { drainIngest } from "../core/IngestPipeline.js";
 import { appendCredentialMissingRun } from "../core/IngestRunStore.js";
@@ -130,14 +138,6 @@ describe("registerCompileCommand", () => {
 		expect(stdout).toContain("jolli");
 	});
 
-	it("sweep skipped (another compile running): prints skip note, no per-repo output", async () => {
-		mockCompileAllRepos.mockResolvedValue({ repos: [], totalIngested: 0, failed: 0, skipped: true });
-		const { stdout } = await runCompile([]);
-		expect(stdout).toContain("Another compile is already running");
-		expect(stdout).not.toContain("Done:");
-		expect(process.exitCode).not.toBe(1);
-	});
-
 	it("sweep with no localFolder: error + exitCode=1", async () => {
 		mockLoadConfig.mockResolvedValue({ apiKey: "test" } as never);
 		const { stderr } = await runCompile([]);
@@ -171,19 +171,91 @@ describe("registerCompileCommand", () => {
 		expect(stdout).toContain("3 source(s)");
 	});
 
-	it("--cwd: runs the drain under the canonical vault-write lock (wait mode)", async () => {
+	it("--cwd: drains with a per-write writeGuard (lock released during the LLM phase, not held across the whole drain)", async () => {
 		await runCompile(["--cwd", "/repo"]);
-		expect(withVaultWriteLock).toHaveBeenCalledWith("/mb", { wait: 60_000 }, expect.any(Function));
+		// The key contract: drainIngest gets a writeGuard so its reconcile LLM phase
+		// runs UNLOCKED and only re-acquires the lock per write — a concurrent
+		// commit-summary worker can interleave and generate its memory promptly.
+		expect(mockDrainIngest).toHaveBeenCalledWith(
+			"/repo",
+			expect.anything(),
+			expect.objectContaining({ triggeredBy: "manual", writeGuard: expect.any(Function) }),
+		);
+		// And that guard acquires the canonical vault lock in wait-mode with the
+		// pending-worker wakeup hook (4th arg).
+		expect(withVaultWriteLock).toHaveBeenCalledWith("/mb", { wait: 60_000 }, expect.any(Function), {
+			launch: expect.any(Function),
+		});
 	});
 
-	it("--cwd: another vault writer busy → error, exitCode=1, no drain/render", async () => {
-		// Lock held by a worker/sync → body never runs.
+	it("--cwd: a per-write guard that can't acquire the lock (ran:false) surfaces as a non-fatal warn, compile still completes", async () => {
+		// The single writeGuard call on a non-rebuild compile is the search-index
+		// warm-up; a busy lock makes withVaultWriteLock report ran:false, so the
+		// guard throws "could not acquire vault-write.lock". That throw is the
+		// disposable-cache catch's concern — it must NOT fail the compile.
 		vi.mocked(withVaultWriteLock).mockResolvedValueOnce({ ran: false });
-		const { stderr } = await runCompile(["--cwd", "/repo"]);
-		expect(stderr).toContain("another vault writer");
+		const { stdout } = await runCompile(["--cwd", "/repo"]);
+		expect(stdout).toContain("Done:");
+		expect(process.exitCode).not.toBe(1);
+	});
+
+	it("--cwd: a non-Error thrown from the guarded search-index warm-up is stringified, still non-fatal", async () => {
+		// The search-index warm-up is wrapped in a disposable-cache catch that
+		// stringifies a non-Error throw (`String(idxErr)`). A throw from the guard
+		// body propagates as-is, so a non-Error value exercises that branch.
+		vi.mocked(withVaultWriteLock).mockImplementationOnce(async () => {
+			throw "orama exploded (string, not Error)";
+		});
+		const { stdout } = await runCompile(["--cwd", "/repo"]);
+		expect(stdout).toContain("Done:");
+		expect(process.exitCode).not.toBe(1);
+	});
+
+	it("--cwd --rebuild: store reset can't acquire the lock → clean 'busy' exit (exitCode=1), drain skipped, no uncaught throw", async () => {
+		// On --rebuild the FIRST writeGuard call is the store reset (processed-set +
+		// index). A busy lock makes withVaultWriteLock report ran:false, so the guard
+		// throws VaultWriteBusyError. The reset is a real prerequisite — without it
+		// the drain runs against the OLD index and is silently NOT a rebuild — so this
+		// must surface as a clean retry-later exit, not an uncaught stack trace.
+		vi.mocked(withVaultWriteLock).mockResolvedValueOnce({ ran: false });
+		const { stderr } = await runCompile(["--cwd", "/repo", "--rebuild"]);
+		expect(stderr).toMatch(/busy/i);
 		expect(process.exitCode).toBe(1);
 		expect(mockDrainIngest).not.toHaveBeenCalled();
-		expect(mockRenderTopicKBWiki).not.toHaveBeenCalled();
+	});
+
+	it("--cwd --rebuild: a non-lock error during store reset propagates (not swallowed as 'busy')", async () => {
+		// A real write failure (disk, corruption) is NOT a VaultWriteBusyError, so the
+		// busy-exit catch must rethrow it rather than masquerade it as lock contention.
+		mockSaveTopicIndex.mockRejectedValueOnce(new Error("disk full"));
+		await expect(runCompile(["--cwd", "/repo", "--rebuild"])).rejects.toThrow("disk full");
+	});
+
+	it("--cwd: render lock contention is non-fatal — the ingest already persisted, command still reports Done", async () => {
+		// drainIngest swallows its own lock contention (sources held / pending), so by
+		// the time the derived Markdown re-render runs the data is already on the orphan
+		// branch. A busy lock on render must NOT fail the whole command (matches the
+		// QueueWorker unlocked-ingest catch + the search-index disposable-cache catch).
+		mockRenderTopicKBWiki.mockImplementationOnce(
+			async (_cwd: string, _storage: unknown, guard?: (fn: () => Promise<void>) => Promise<void>) => {
+				await guard?.(async () => {});
+			},
+		);
+		vi.mocked(withVaultWriteLock).mockResolvedValueOnce({ ran: false }); // render's per-write guard
+		const { stdout } = await runCompile(["--cwd", "/repo"]);
+		expect(stdout).toContain("Done:");
+		expect(process.exitCode).not.toBe(1);
+	});
+
+	it("--cwd --rebuild: a purge that can't acquire the lock is non-fatal — orphan pages are reclaimed on the next rebuild", async () => {
+		// On --rebuild the guard call order is reset → (drain, no guard) → purge →
+		// (render, no guard) → search-index. Make only the purge call busy.
+		vi.mocked(withVaultWriteLock)
+			.mockResolvedValueOnce({ ran: true, value: undefined }) // store reset
+			.mockResolvedValueOnce({ ran: false }); // purge
+		const { stdout } = await runCompile(["--cwd", "/repo", "--rebuild"]);
+		expect(stdout).toContain("Done:");
+		expect(process.exitCode).not.toBe(1);
 	});
 
 	it("--cwd --rebuild resets stores before drain", async () => {
@@ -243,21 +315,29 @@ describe("registerCompileCommand", () => {
 		expect(vi.mocked(appendCredentialMissingRun)).toHaveBeenCalledWith("/repo", "manual");
 	});
 
-	it("--cwd: passes the index's stable slugs to the topic-page purge", async () => {
-		// The slug-mapping callback in the `purgeTopicPagesExcept(index.topics.map(...))`
-		// call only executes when the index is non-empty. The default mock returns an
-		// empty `topics` array, leaving that arrow uncovered; a populated index exercises
-		// it and pins the convergence contract (keep exactly the indexed slugs).
+	it("--cwd --rebuild: purges to the index's stable slugs (purge runs ONLY on rebuild)", async () => {
+		// Purge is gated to --rebuild: a routine compile must not purge (a concurrent
+		// ingest could have added a page not yet in our index snapshot — deleting it
+		// would be data loss). The slug-mapping callback only runs on a non-empty index.
 		vi.mocked(readTopicIndex).mockResolvedValueOnce({
 			schemaVersion: 1,
 			topics: [{ stableSlug: "auth-flow" }, { stableSlug: "storage-layer" }],
 		} as never);
-		await runCompile(["--cwd", "/repo"]);
+		await runCompile(["--cwd", "/repo", "--rebuild"]);
 		expect(vi.mocked(purgeTopicPagesExcept)).toHaveBeenCalledWith(
 			["auth-flow", "storage-layer"],
 			"/repo",
 			expect.anything(),
 		);
+	});
+
+	it("--cwd (no rebuild): does NOT purge (avoids deleting a page a concurrent ingest just added)", async () => {
+		vi.mocked(readTopicIndex).mockResolvedValueOnce({
+			schemaVersion: 1,
+			topics: [{ stableSlug: "auth-flow" }],
+		} as never);
+		await runCompile(["--cwd", "/repo"]);
+		expect(vi.mocked(purgeTopicPagesExcept)).not.toHaveBeenCalled();
 	});
 
 	it("--cwd: prints the outcome code and held topics in the summary", async () => {
@@ -270,6 +350,10 @@ describe("registerCompileCommand", () => {
 		const { stdout } = await runCompile(["--cwd", "/repo"]);
 		expect(stdout).toContain("[OK]");
 		expect(stdout).toContain("held (RECONCILE_TRUNCATED)");
-		expect(mockDrainIngest).toHaveBeenCalledWith("/repo", expect.anything(), { triggeredBy: "manual" });
+		expect(mockDrainIngest).toHaveBeenCalledWith(
+			"/repo",
+			expect.anything(),
+			expect.objectContaining({ triggeredBy: "manual" }),
+		);
 	});
 });

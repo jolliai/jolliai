@@ -67,6 +67,49 @@ describe("DualWriteStorage", () => {
 		rmrf(tempDir);
 	});
 
+	it("exposes the shadow's kbRoot via the kbRoot getter", () => {
+		const primary = new InMemoryStorage();
+		const shadow = {
+			readFile: vi.fn(),
+			writeFiles: vi.fn(),
+			listFiles: vi.fn(),
+			exists: vi.fn().mockResolvedValue(true),
+			ensure: vi.fn(),
+			kbRoot: "/some/kb/root",
+		} as unknown as StorageProvider;
+
+		const dual = new DualWriteStorage(primary, shadow);
+		// The disposable search index lives in the folder (shadow) layer.
+		expect(dual.kbRoot).toBe("/some/kb/root");
+	});
+
+	describe("isTopicWikiPresent branch coverage", () => {
+		const stub = (over: Partial<StorageProvider> = {}) =>
+			({
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				...over,
+			}) as unknown as StorageProvider;
+
+		it("returns false when the shadow does not implement isTopicWikiPresent", () => {
+			const dual = new DualWriteStorage(stub(), stub());
+			expect(dual.isTopicWikiPresent()).toBe(false);
+		});
+
+		it("returns true when the shadow reports the wiki present", () => {
+			const dual = new DualWriteStorage(stub(), stub({ isTopicWikiPresent: vi.fn().mockReturnValue(true) }));
+			expect(dual.isTopicWikiPresent()).toBe(true);
+		});
+
+		it("returns false when the shadow reports the wiki absent", () => {
+			const dual = new DualWriteStorage(stub(), stub({ isTopicWikiPresent: vi.fn().mockReturnValue(false) }));
+			expect(dual.isTopicWikiPresent()).toBe(false);
+		});
+	});
+
 	it("reads from primary", async () => {
 		const primary = new InMemoryStorage();
 		const shadowRoot = join(tempDir, "shadow");

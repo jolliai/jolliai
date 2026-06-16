@@ -126,4 +126,33 @@ describe("pruneConsumedOverlayRules unlink-failure", () => {
 		// Confirm unlink was actually called so the branch was exercised.
 		expect(realFsPromises.unlink).toHaveBeenCalled();
 	});
+
+	it("swallows an ENOENT unlink error silently (inner catch does not re-throw)", async () => {
+		// Mirror of the non-ENOENT case above, but the unlink fails with ENOENT
+		// — e.g. a concurrent prune already removed the now-empty overlay file.
+		// The inner catch's `if (!isEnoent(err)) throw err;` must NOT re-throw
+		// (exercises the false branch at line 361); the call resolves cleanly.
+		const sessionId = "prune-unlink-enoent";
+		const rule = { role: "human" as const, content: "ask-enoent", timestamp: "tp2" };
+		await saveOverlay({ projectDir, source: "claude", sessionId }, { deletes: [rule], edits: [] });
+
+		const overlayDir = join(projectDir, ".jolli", "jollimemory", "conversation-edits");
+		const overlayFile = join(overlayDir, "claude--prune-unlink-enoent.json");
+		expect(existsSync(overlayFile)).toBe(true);
+
+		// Reject with an ENOENT-shaped error so isEnoent(err) === true.
+		const enoent = Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" });
+		vi.mocked(realFsPromises.unlink).mockRejectedValueOnce(enoent);
+
+		const session: OverlayableSession = {
+			sessionId,
+			source: "claude",
+			entries: [{ role: "human", content: "ask-enoent", timestamp: "tp2" }],
+		};
+
+		// Resolves cleanly — the ENOENT is swallowed by the inner catch, never
+		// reaching the outer warn-log path.
+		await expect(pruneConsumedOverlayRules([session], projectDir)).resolves.toBeUndefined();
+		expect(realFsPromises.unlink).toHaveBeenCalled();
+	});
 });

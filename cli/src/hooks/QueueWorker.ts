@@ -99,9 +99,14 @@ import type { SessionTranscript } from "../core/TranscriptReader.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
 import { deriveSourceTag } from "../install/DistPathResolver.js";
 import { createLogger, errMsg, getJolliMemoryDir, setLogDir, setLogLevel } from "../Logger.js";
-import { consumePendingWorkers, recordPendingWorker } from "../sync/PendingWorkers.js";
+import { recordPendingWorker, wakePendingWorkers } from "../sync/PendingWorkers.js";
 import { deriveMemoryBankRoot } from "../sync/SyncBootstrap.js";
-import { acquireVaultWriteLock, DEFAULT_VAULT_WRITE_WAIT_MS } from "../sync/VaultWriteLock.js";
+import {
+	acquireVaultWriteLock,
+	DEFAULT_VAULT_WRITE_WAIT_MS,
+	VaultWriteBusyError,
+	withVaultWriteLock,
+} from "../sync/VaultWriteLock.js";
 import {
 	type CommitGitOperation,
 	type CommitInfo,
@@ -332,7 +337,7 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 	// sync-allowlist-staging.md (Option (a) — wait-mode, not registry).
 	const vaultLockConfig = await loadConfig();
 	const memoryBankRoot = deriveMemoryBankRoot(vaultLockConfig.localFolder);
-	const vaultLock = await acquireVaultWriteLock(memoryBankRoot, {
+	let vaultLock = await acquireVaultWriteLock(memoryBankRoot, {
 		wait: DEFAULT_VAULT_WRITE_WAIT_MS,
 	});
 	if (vaultLock === null) {
@@ -350,11 +355,32 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 		// the majority — also get the cross-repo wakeup. Passing raw
 		// `vaultLockConfig.localFolder` would no-op when it's undefined.
 		await recordPendingWorker(memoryBankRoot, cwd);
-		log.warn(
-			"Could not acquire vault-write.lock within %d ms; another writer is busy. Exiting — recorded pending-worker entry so the next lock release re-spawns us.",
-			DEFAULT_VAULT_WRITE_WAIT_MS,
+
+		// Lost-wakeup guard. The registry hand-off above has a TOCTOU window:
+		// the holder can release AND drain the registry in the gap between our
+		// wait expiring and `recordPendingWorker` landing. Its
+		// `consumePendingWorkers` then sees an empty registry and never
+		// re-spawns us — and with no further commit/sync round in this repo
+		// our queue entry is orphaned forever (the exact failure that left an
+		// amended commit's summary stranded under its pre-amend hash). So
+		// after recording intent, attempt one fail-fast acquire: if the lock
+		// freed during the gap we grab it here and PROCEED; if it's still held
+		// the current holder will observe our now-recorded entry on its next
+		// release. Either path closes the orphan-entry gap. Recording BEFORE
+		// this retry is what makes it airtight — a concurrent releaser always
+		// sees our entry, so the worst case is a benign duplicate spawn that
+		// loses the worker.lock race and exits.
+		vaultLock = await acquireVaultWriteLock(memoryBankRoot, "fail-fast");
+		if (vaultLock === null) {
+			log.warn(
+				"Could not acquire vault-write.lock within %d ms; another writer is busy. Exiting — recorded pending-worker entry so the next lock release re-spawns us.",
+				DEFAULT_VAULT_WRITE_WAIT_MS,
+			);
+			return;
+		}
+		log.info(
+			"Acquired vault-write.lock on the post-timeout fail-fast retry — the holder released during the pending-record gap; proceeding instead of stranding the queue entry.",
 		);
-		return;
 	}
 
 	// Periodically bump vault-write.lock's mtime so a long-running LLM call
@@ -367,11 +393,58 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 	}, WORKER_LOCK_REFRESH_INTERVAL_MS);
 	/* v8 ignore stop */
 
+	// vault-write.lock is released BEFORE the unlocked-ingest phase, but worker.lock
+	// is held THROUGH it (see that phase below). Releasing the vault-wide lock lets
+	// cross-repo commit-summary workers proceed; holding the per-repo worker.lock
+	// keeps the ingest's worker-phase marker and topic-page writes uncontested
+	// within this repo — no same-repo summary worker (which would clear the marker)
+	// and no second ingest can race. `releaseVault` is idempotent: called explicitly
+	// before ingest and again in the outer finally as the error-path backstop.
+	let vaultReleased = false;
+	const releaseVault = async (): Promise<void> => {
+		if (vaultReleased) return;
+		vaultReleased = true;
+		clearInterval(vaultRefreshTimer);
+		await vaultLock.release();
+	};
+	// Cross-repo wakeup (P2): wake any worker that timed out waiting for
+	// vault-write.lock while WE held it (it recorded its cwd in the per-vault
+	// registry). Draining the registry makes this safe to call more than once; we
+	// call it right after releasing the lock so waiters don't idle through our
+	// ingest, and again in the outer finally to cover the early-return paths.
+	// `cwd` is passed as `selfCwd` so we don't re-launch ourselves — the worker
+	// already chain-spawns for its own cwd at the end of the drain. The shared
+	// `wakePendingWorkers` (also used by the compile paths via withVaultWriteLock)
+	// is the single implementation of the drain+launch loop.
+	const wakeWaiters = async (): Promise<void> => {
+		await wakePendingWorkers(memoryBankRoot, launchWorker, cwd);
+	};
+
+	// A dequeued ingest entry only flips this flag inside the locked drain; its long
+	// reconcile LLM phase runs in the unlocked-ingest phase below (worker.lock held,
+	// vault-write.lock released) so it never holds the vault-wide lock.
+	let storage: StorageProvider | null = null;
+	let ingestRequested = false;
+	let ingestTriggeredBy: IngestOperation["triggeredBy"] = "post-commit";
+	// worker.lock (per-repo) is released only AFTER the unlocked-ingest phase, so its
+	// mtime-refresh timer must outlive ingest too — otherwise the stale-lock reclaimer
+	// could hand the lock to a second worker mid-ingest. `releaseWorker` is idempotent
+	// (explicit release before the chain-spawn check, backstop in the outer finally).
+	let workerRefreshTimer: ReturnType<typeof setInterval> | undefined;
+	let workerLockReleased = true;
+	const releaseWorker = async (): Promise<void> => {
+		if (workerLockReleased) return;
+		workerLockReleased = true;
+		if (workerRefreshTimer) clearInterval(workerRefreshTimer);
+		await releaseWorkerLock(cwd);
+		log.info("=== Queue worker finished ===");
+	};
+
 	try {
 		// Create storage provider based on config (orphan/dual-write/folder).
 		// Now safe — we hold `vault-write.lock` so no concurrent writer can race
 		// on `resolveKBPath`'s side effects.
-		const storage = await createStorage(cwd, cwd);
+		storage = await createStorage(cwd, cwd);
 		setActiveStorage(storage);
 
 		// Acquire worker.lock — the per-source-repo lock that serialises two
@@ -385,6 +458,7 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 			log.warn("Could not acquire worker lock, another worker may be running. Exiting.");
 			return;
 		}
+		workerLockReleased = false;
 
 		// Clear a stale `worker-phase` marker at the source. Holding worker.lock
 		// proves no other worker for this repo is alive, so any leftover phase file
@@ -403,7 +477,7 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 		// Periodically bump the worker.lock mtime — same rationale as
 		// vault-write.lock above.
 		/* v8 ignore start -- setInterval's lambda only fires on a real timer tick; unit tests finish in milliseconds and never observe the callback. */
-		const refreshTimer = setInterval(() => {
+		workerRefreshTimer = setInterval(() => {
 			void refreshWorkerLockMtime(cwd);
 		}, WORKER_LOCK_REFRESH_INTERVAL_MS);
 		/* v8 ignore stop */
@@ -426,9 +500,21 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 					// stop inside the inner loop so the outer while condition can re-check and
 					// exit cleanly. The subsequent chain-spawn (line below) picks up leftovers.
 					if (processedCount >= MAX_ENTRIES_PER_RUN) break;
+					// Divert ingest out of the locked drain: record the request and consume
+					// the trigger entry. The reconcile runs in the unlocked-ingest phase
+					// after both entry-level locks are released, so its minutes-long LLM
+					// phase never holds vault-write.lock. Deleting here (we hold worker.lock)
+					// avoids an infinite re-dequeue; losing the trigger on a crash is benign
+					// — the next commit re-triggers and unprocessed sources stay pending.
+					if (isIngestOperation(op)) {
+						ingestRequested = true;
+						ingestTriggeredBy = op.triggeredBy;
+						await deleteQueueEntry(filePath);
+						continue;
+					}
 					try {
 						await processQueueEntry(op, cwd, storage, force);
-						if (!isIngestOperation(op)) committedThisRun = true;
+						committedThisRun = true;
 					} catch (error: unknown) {
 						// Queue entries are deleted regardless of success or failure (fire-and-forget).
 						// Retry is intentionally not implemented: pipeline steps (transcript cursor
@@ -437,10 +523,11 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 						// TODO: Support re-summarize for specific commits (e.g., after LLM quota
 						// replenishment). Requires persisting transcripts to the orphan branch BEFORE
 						// the LLM call so re-summarize can read them back without cursor dependency.
+						// Ingest is diverted before this try, so `op` here is always commit-typed.
 						log.error(
 							"Failed to process queue entry type=%s ref=%s: %s",
 							op.type,
-							isIngestOperation(op) ? "ingest" : (op as CommitGitOperation).commitHash.substring(0, 8),
+							(op as CommitGitOperation).commitHash.substring(0, 8),
 							(error as Error).message,
 						);
 					}
@@ -465,14 +552,56 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 			/* v8 ignore start -- catch block only reached if dequeueAllGitOperations throws unexpectedly */
 		} catch (error: unknown) {
 			log.error("Worker failed: %s", (error as Error).message);
-		} finally {
-			/* v8 ignore stop */
-			clearInterval(refreshTimer);
-			await releaseWorkerLock(cwd);
-			log.info("=== Queue worker finished ===");
+		}
+		/* v8 ignore stop */
+
+		// Release vault-write.lock BEFORE the (potentially minutes-long) ingest:
+		// cross-repo commit-summary workers only need the vault-wide lock, which we
+		// no longer hold. worker.lock stays held so no same-repo worker races us.
+		await releaseVault();
+
+		// ── Unlocked-ingest phase (vault-write.lock released; worker.lock held) ───
+		// The reconcile LLM phase runs with NO vault-write.lock; only each individual
+		// write re-acquires it briefly via `writeGuard` (per topic page, plus the
+		// index / processed-set / wiki render), so a slow ingest never blocks the
+		// cross-repo commit-summary workers that wait on the same lock. Holding
+		// worker.lock throughout is what keeps it safe within THIS repo: no same-repo
+		// summary worker can run startup cleanup or processQueueEntry (and thus clear
+		// the `ingest` worker-phase marker) mid-run, and no second ingest can race
+		// this one. `storage` is null only if createStorage threw before the drain.
+		if (ingestRequested && storage !== null) {
+			// Wake cross-repo waiters now (vault-write.lock is free) so they don't idle
+			// through our ingest. Each per-write guard below ALSO wakes on its release
+			// (via the releaseHook), so a worker that times out and registers DURING the
+			// ingest is woken at the next per-write release rather than waiting for the
+			// whole drain — matching the compile paths. The outer-finally wake is the
+			// final backstop.
+			await wakeWaiters();
+			const writeGuard = async (fn: () => Promise<void>): Promise<void> => {
+				const r = await withVaultWriteLock(memoryBankRoot, { wait: DEFAULT_VAULT_WRITE_WAIT_MS }, fn, {
+					launch: launchWorker,
+					selfCwd: cwd,
+				});
+				// Typed busy signal (shared verbatim with the compile guards) so
+				// drainIngest's page-write catch can tell contention from a real fault.
+				if (!r.ran) throw new VaultWriteBusyError();
+			};
+			try {
+				const ingestOp: IngestOperation = {
+					type: "ingest",
+					triggeredBy: ingestTriggeredBy,
+					createdAt: new Date().toISOString(),
+				};
+				await runIngestEntry(ingestOp, cwd, storage, writeGuard);
+			} catch (e) {
+				log.error("Unlocked ingest phase failed (non-fatal): %s", errMsg(e));
+			}
 		}
 
-		// Chain spawn: if new entries appeared while we were processing, spawn another Worker
+		// Release worker.lock, THEN chain-spawn: a same-repo successor (commits that
+		// arrived while we held the lock through ingest, plus the post-commit ingest
+		// trigger enqueued above) can acquire worker.lock immediately on its spawn.
+		await releaseWorker();
 		const remaining = await dequeueAllGitOperations(cwd);
 		/* v8 ignore start -- chain spawn only occurs when new entries arrive during worker processing */
 		if (remaining.length > 0) {
@@ -481,27 +610,12 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 		}
 		/* v8 ignore stop */
 	} finally {
-		// Outer finally — vault-write.lock release. Runs AFTER worker.lock
-		// release and AFTER the chain-spawn check, so a chain-spawned successor
-		// can re-acquire vault-write.lock immediately on its own spawn.
-		clearInterval(vaultRefreshTimer);
-		await vaultLock.release();
-		// Cross-repo wakeup (P2). Any worker that timed out waiting for
-		// vault-write.lock while WE held it recorded its cwd; spawn a
-		// successor for each so the queue entry isn't stranded until that
-		// repo's next post-commit hook. Idempotent: `launchWorker` against
-		// an empty queue is a cheap no-op.
-		try {
-			const pending = await consumePendingWorkers(memoryBankRoot);
-			for (const pendingCwd of pending) {
-				if (pendingCwd !== cwd) {
-					log.info("Waking pending worker for cwd=%s", pendingCwd);
-					launchWorker(pendingCwd);
-				}
-			}
-		} catch (e) {
-			log.warn("consumePendingWorkers on release failed (non-fatal): %s", (e as Error).message);
-		}
+		// Backstops (idempotent): cover the early-return and mid-run-throw paths
+		// where the explicit releases above didn't run. worker.lock is released
+		// first (so a successor can grab it), then the vault-wide lock.
+		await releaseWorker();
+		await releaseVault();
+		await wakeWaiters();
 	}
 }
 
@@ -532,7 +646,67 @@ function clearLeftoverIngestMarker(cwd: string): void {
 }
 
 /**
- * Processes a single queue entry based on its type.
+ * Runs a topic-KB ingest with the extension's worker-phase marker around it.
+ *
+ * Called from runWorker's UNLOCKED ingest phase (both entry-level locks already
+ * released). The phase marker (`ingest`) is consumed by the extension's
+ * worker-busy gates (and the toolbar label): while it reads `ingest` AND is
+ * fresh, Commit/Squash stay enabled and the toolbar shows "Updating Memory
+ * Bank…". `writeGuard` is threaded down to drainIngest + renderTopicKBWiki so
+ * each individual write re-acquires `vault-write.lock` briefly — the reconcile
+ * LLM phase between writes holds no lock.
+ */
+async function runIngestEntry(
+	op: IngestOperation,
+	cwd: string,
+	storage: StorageProvider,
+	writeGuard: (fn: () => Promise<void>) => Promise<void> = (fn) => fn(),
+): Promise<void> {
+	log.info("Processing queue entry: type=ingest triggeredBy=%s", op.triggeredBy);
+	// Best-effort marker — a failure only over-blocks (missing marker = blocking
+	// summary phase), never under-blocks.
+	const phaseFile = join(getJolliMemoryDir(cwd), WORKER_PHASE_FILE);
+	try {
+		writeFileSync(phaseFile, "ingest");
+	} catch (e) {
+		/* v8 ignore next -- best-effort marker; a write failure only over-blocks */
+		log.debug("worker-phase write skipped (non-fatal): %s", errMsg(e));
+	}
+	// Heartbeat: keep the marker's mtime fresh for the whole ingest. Readers
+	// treat a stale marker as blocking (fail-safe), so a long ingest needs this
+	// to stay exempt — and conversely an orphaned `ingest` marker (both the
+	// cleanup below and the per-entry guard failed) ages out instead of holding
+	// the gates open during a later summary run.
+	/* v8 ignore start -- timer callback never fires inside fast unit tests */
+	const phaseRefreshTimer = setInterval(() => {
+		try {
+			writeFileSync(phaseFile, "ingest");
+		} catch {
+			// Next tick retries; reader-side staleness covers persistent failure.
+		}
+	}, WORKER_LOCK_REFRESH_INTERVAL_MS);
+	/* v8 ignore stop */
+	try {
+		await runIngestFromQueue(op, cwd, storage, writeGuard);
+	} finally {
+		clearInterval(phaseRefreshTimer);
+		try {
+			rmSync(phaseFile, { force: true });
+		} catch (e) {
+			/* v8 ignore start -- needs an OS-level rm failure (e.g. Windows AV briefly holding the file) */
+			// A surviving `ingest` marker would keep the extension's gates open while
+			// a later summary run is in flight. Two backstops cover it:
+			// clearLeftoverIngestMarker before each commit-typed entry, and the
+			// reader-side mtime staleness check.
+			log.warn("worker-phase cleanup failed — relying on per-entry guard + staleness: %s", errMsg(e));
+			/* v8 ignore stop */
+		}
+	}
+}
+
+/**
+ * Processes a single commit-typed queue entry. Ingest entries are diverted to
+ * the unlocked-ingest phase by runWorker and never reach here.
  * Called by runWorker() for each entry in the queue.
  */
 async function processQueueEntry(
@@ -541,57 +715,6 @@ async function processQueueEntry(
 	storage: StorageProvider,
 	force: boolean,
 ): Promise<void> {
-	// SP3 — topic-KB ingest. Drains all pending sources and renders the wiki.
-	// No commit-hash or branch field; dispatch and return before commit-only code.
-	if (isIngestOperation(op)) {
-		log.info("Processing queue entry: type=ingest triggeredBy=%s", op.triggeredBy);
-		// Phase marker consumed by the extension's worker-busy gates (and the
-		// toolbar label): while it reads `ingest` AND is fresh, Commit/Squash
-		// stay enabled and the toolbar shows "Updating Memory Bank…". The write
-		// is best-effort — a failure only over-blocks (missing marker = blocking
-		// summary phase), never under-blocks.
-		const phaseFile = join(getJolliMemoryDir(cwd), WORKER_PHASE_FILE);
-		try {
-			writeFileSync(phaseFile, "ingest");
-		} catch (e) {
-			/* v8 ignore next -- best-effort marker; a write failure only over-blocks */
-			log.debug("worker-phase write skipped (non-fatal): %s", errMsg(e));
-		}
-		// Heartbeat: keep the marker's mtime fresh for the whole ingest. Readers
-		// treat a stale marker as blocking (fail-safe), so a long ingest needs
-		// this to stay exempt — and conversely an orphaned `ingest` marker (both
-		// the cleanup below and the per-entry guard failed) ages out instead of
-		// holding the gates open during a later summary run.
-		/* v8 ignore start -- timer callback never fires inside fast unit tests */
-		const phaseRefreshTimer = setInterval(() => {
-			try {
-				writeFileSync(phaseFile, "ingest");
-			} catch {
-				// Next tick retries; reader-side staleness covers persistent failure.
-			}
-		}, WORKER_LOCK_REFRESH_INTERVAL_MS);
-		/* v8 ignore stop */
-		try {
-			await runIngestFromQueue(op, cwd, storage);
-		} finally {
-			clearInterval(phaseRefreshTimer);
-			try {
-				rmSync(phaseFile, { force: true });
-			} catch (e) {
-				/* v8 ignore start -- needs an OS-level rm failure (e.g. Windows AV briefly holding the file) */
-				// A surviving `ingest` marker would keep the extension's gates open
-				// while this same drain moves on to blocking summary entries. Two
-				// backstops cover it: clearLeftoverIngestMarker before each
-				// commit-typed entry, and the reader-side mtime staleness check.
-				log.warn("worker-phase cleanup failed — relying on per-entry guard + staleness: %s", errMsg(e));
-				/* v8 ignore stop */
-			}
-		}
-		return;
-	}
-
-	// At this point the only remaining operation is commit-typed (the GitOperation
-	// union is CommitGitOperation | IngestOperation, and ingest returned above).
 	// A summary run must present a blocking phase to the extension's gates, so
 	// clear any `ingest` marker a failed cleanup left behind before starting.
 	clearLeftoverIngestMarker(cwd);
@@ -662,7 +785,12 @@ function now(): number {
  * visible `_wiki/` layer. No branch field — the topic KB is repo-wide.
  * Credential-missing is a silent skip (no API key → skip).
  */
-async function runIngestFromQueue(op: IngestOperation, cwd: string, storage: StorageProvider): Promise<void> {
+async function runIngestFromQueue(
+	op: IngestOperation,
+	cwd: string,
+	storage: StorageProvider,
+	writeGuard: (fn: () => Promise<void>) => Promise<void> = (fn) => fn(),
+): Promise<void> {
 	const { drainIngest } = await import("../core/IngestPipeline.js");
 	const { renderTopicKBWiki } = await import("../core/TopicWikiRenderer.js");
 	const { appendCredentialMissingRun } = await import("../core/IngestRunStore.js");
@@ -672,7 +800,7 @@ async function runIngestFromQueue(op: IngestOperation, cwd: string, storage: Sto
 		await appendCredentialMissingRun(cwd, op.triggeredBy);
 		return;
 	}
-	const result = await drainIngest(cwd, config, { triggeredBy: op.triggeredBy });
+	const result = await drainIngest(cwd, config, { triggeredBy: op.triggeredBy, writeGuard });
 	log.info("Ingest drained: %d batches, %d sources (%s)", result.batches, result.ingested, op.triggeredBy);
 	// Re-render when new sources landed, OR when the visible wiki is gone (the user
 	// deleted `_wiki/`): without the second clause a deleted wiki would never come
@@ -680,7 +808,7 @@ async function runIngestFromQueue(op: IngestOperation, cwd: string, storage: Sto
 	// (ingested === 0 every commit), leaving `jolli compile` as the only recovery.
 	const wikiMissing = storage.isTopicWikiPresent ? !storage.isTopicWikiPresent() : false;
 	if (result.ingested > 0 || wikiMissing) {
-		await renderTopicKBWiki(cwd, storage);
+		await renderTopicKBWiki(cwd, storage, writeGuard);
 	}
 }
 
@@ -2789,6 +2917,7 @@ export const __test__ = {
 	loadSessionTranscripts,
 	buildStoredTranscript,
 	processQueueEntry,
+	runIngestEntry,
 	reassociateMetadata,
 };
 

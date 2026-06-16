@@ -3547,10 +3547,18 @@ export function buildSidebarScript(): string {
         });
       }
       if (ctx === 'commit' || ctx === 'commitWithMemory') {
-        // Foreign rows are cross-repo memories — reuse kb:openMemory
-        // (→ viewMemorySummary, cross-repo) so the Memory slot opens
-        // instead of the Commit slot's single-repo lookup silently missing.
-        if (isViewingForeign()) {
+        // Memory rows route through kb:openMemory (→ viewMemorySummary →
+        // cross-repo getSummaryAnyRepoWithSource): a lookup that resolves
+        // amend/rebase hash aliases AND surfaces "No summary found" feedback
+        // on a true miss. The Commit slot's branch:openCommit → viewSummary
+        // is single-repo, single-hash, and SILENTLY returns on a miss — so a
+        // memory stored under a pre-amend hash (the exact stranded-amend case)
+        // or in a foreign repo made the click a dead no-op. Applies to every
+        // commitWithMemory row (workspace or foreign) plus all foreign rows.
+        // Plain unsummarized workspace commit rows keep branch:openCommit
+        // (Commit slot; intentionally silent — the code glyph already signals
+        // "no memory").
+        if (ctx === 'commitWithMemory' || isViewingForeign()) {
           vscode.postMessage({ type: 'kb:openMemory', commitHash: id });
         } else {
           vscode.postMessage({ type: 'branch:openCommit', hash: id });

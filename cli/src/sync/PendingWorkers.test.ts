@@ -23,7 +23,12 @@ vi.mock("node:os", async () => {
 	return { ...actual, homedir: () => mockHomeDir.value };
 });
 
-import { consumePendingWorkers, getPendingWorkersDir, recordPendingWorker } from "./PendingWorkers.js";
+import {
+	consumePendingWorkers,
+	getPendingWorkersDir,
+	recordPendingWorker,
+	wakePendingWorkers,
+} from "./PendingWorkers.js";
 
 let tempDir: string;
 
@@ -169,5 +174,68 @@ describe("consumePendingWorkers", () => {
 		await recordPendingWorker(memoryBankRoot, "/cwd-2");
 		const cwds = await consumePendingWorkers(memoryBankRoot);
 		expect(cwds).toEqual(["/cwd-2"]);
+	});
+});
+
+describe("wakePendingWorkers", () => {
+	it("drains the registry and launches a worker for each recorded cwd", async () => {
+		const memoryBankRoot = join(tempDir, "vault");
+		await recordPendingWorker(memoryBankRoot, "/repo-a");
+		await recordPendingWorker(memoryBankRoot, "/repo-b");
+		const launched: string[] = [];
+
+		await wakePendingWorkers(memoryBankRoot, (cwd) => launched.push(cwd));
+
+		expect(launched.sort()).toEqual(["/repo-a", "/repo-b"]);
+		// Drained — a second wake launches nothing.
+		const again: string[] = [];
+		await wakePendingWorkers(memoryBankRoot, (cwd) => again.push(cwd));
+		expect(again).toEqual([]);
+	});
+
+	it("skips the holder's own cwd when selfCwd is supplied", async () => {
+		const memoryBankRoot = join(tempDir, "vault");
+		await recordPendingWorker(memoryBankRoot, "/repo-self");
+		await recordPendingWorker(memoryBankRoot, "/repo-other");
+		const launched: string[] = [];
+
+		await wakePendingWorkers(memoryBankRoot, (cwd) => launched.push(cwd), "/repo-self");
+
+		expect(launched).toEqual(["/repo-other"]);
+	});
+
+	it("is a no-op when the registry is empty", async () => {
+		const memoryBankRoot = join(tempDir, "vault");
+		const launched: string[] = [];
+		await wakePendingWorkers(memoryBankRoot, (cwd) => launched.push(cwd));
+		expect(launched).toEqual([]);
+	});
+
+	it("swallows a launch() throw (best-effort — one bad spawn must not abort the rest)", async () => {
+		const memoryBankRoot = join(tempDir, "vault");
+		await recordPendingWorker(memoryBankRoot, "/repo-a");
+		// launch throws — wakePendingWorkers must not propagate it.
+		await expect(
+			wakePendingWorkers(memoryBankRoot, () => {
+				throw new Error("spawn failed");
+			}),
+		).resolves.toBeUndefined();
+	});
+
+	it("isolates a launch() throw per cwd — a later repo is still launched", async () => {
+		// The registry is DRAINED before launching, so a throw that aborted the loop
+		// would silently drop every later (already-consumed) repo. Each launch must
+		// be isolated so one bad spawn never strands the others.
+		const memoryBankRoot = join(tempDir, "vault");
+		await recordPendingWorker(memoryBankRoot, "/repo-throws");
+		await recordPendingWorker(memoryBankRoot, "/repo-ok");
+		const launched: string[] = [];
+
+		await wakePendingWorkers(memoryBankRoot, (cwd) => {
+			if (cwd === "/repo-throws") throw new Error("spawn failed");
+			launched.push(cwd);
+		});
+
+		expect(launched).toEqual(["/repo-ok"]);
 	});
 });

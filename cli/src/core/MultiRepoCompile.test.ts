@@ -5,12 +5,22 @@ vi.mock("../sync/SyncBootstrap.js", () => ({
 	deriveMemoryBankRoot: vi.fn((localFolder: string) => localFolder),
 }));
 vi.mock("../sync/VaultWriteLock.js", () => ({
+	DEFAULT_VAULT_WRITE_WAIT_MS: 60_000,
+	// Stand-in for the real typed busy signal the guard throws on a busy miss; the
+	// default message matches the real class so the substring assertion holds.
+	VaultWriteBusyError: class VaultWriteBusyError extends Error {
+		constructor(message = "could not acquire vault-write.lock within budget") {
+			super(message);
+			this.name = "VaultWriteBusyError";
+		}
+	},
 	// Default: lock free → run the body and surface its value.
 	withVaultWriteLock: vi.fn(async (_root: string, _mode: unknown, body: () => Promise<unknown>) => ({
 		ran: true,
 		value: await body(),
 	})),
 }));
+vi.mock("../hooks/QueueWorker.js", () => ({ launchWorker: vi.fn() }));
 vi.mock("./IngestPipeline.js", () => ({
 	drainIngest: vi.fn(async (cwd: string) => {
 		if (cwd.endsWith("boom")) throw new Error("kaboom");
@@ -18,7 +28,6 @@ vi.mock("./IngestPipeline.js", () => ({
 	}),
 }));
 vi.mock("./TopicWikiRenderer.js", () => ({ renderTopicKBWiki: vi.fn(async () => {}) }));
-vi.mock("./TopicIndexStore.js", () => ({ readTopicIndex: vi.fn(async () => ({ schemaVersion: 1, topics: [] })) }));
 vi.mock("./TopicPageStore.js", () => ({ purgeTopicPagesExcept: vi.fn(async () => []) }));
 vi.mock("./StorageFactory.js", () => ({ createFolderStorageAtRoot: vi.fn((kbRoot: string) => ({ kbRoot })) }));
 vi.mock("./SummaryStore.js", () => ({ setActiveStorage: vi.fn(), getActiveStorage: vi.fn(() => undefined) }));
@@ -43,7 +52,6 @@ import { discoverRepos } from "./MemoryBankRepoDiscovery.js";
 import { compileAllRepos } from "./MultiRepoCompile.js";
 import { SearchIndex } from "./SearchIndex.js";
 import { getActiveStorage, setActiveStorage } from "./SummaryStore.js";
-import { readTopicIndex } from "./TopicIndexStore.js";
 import { purgeTopicPagesExcept } from "./TopicPageStore.js";
 
 describe("compileAllRepos", () => {
@@ -92,30 +100,35 @@ describe("compileAllRepos", () => {
 		);
 	});
 
-	it("passes discovered topic slugs through when purging stale topic pages", async () => {
-		vi.mocked(readTopicIndex).mockResolvedValueOnce({
-			schemaVersion: 1,
-			topics: [{ stableSlug: "auth" }, { stableSlug: "storage" }],
-			// biome-ignore lint/suspicious/noExplicitAny: minimal topic-index stub
-		} as any);
-		const res = await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never);
-		expect(res.repos.map((r) => r.folder)).toEqual(["jolli"]);
-		expect(purgeTopicPagesExcept).toHaveBeenCalledWith(["auth", "storage"], "/mb/jolli", { kbRoot: "/mb/jolli" });
+	it("drains each repo with a per-write writeGuard that acquires vault-write.lock in wait mode (lock released during the LLM phase)", async () => {
+		await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never);
+		// drainIngest receives a writeGuard — the seam that re-acquires the lock per
+		// write so the reconcile LLM phase runs UNLOCKED and a concurrent commit-summary
+		// worker can interleave. NOT one lock held across the whole sweep.
+		const opts = vi.mocked(drainIngest).mock.calls[0][2];
+		expect(opts?.writeGuard).toBeTypeOf("function");
+		// Invoking the guard acquires the canonical vault lock (wait-mode, keyed off the
+		// vault root) with the pending-worker wakeup hook.
+		await opts?.writeGuard?.(async () => {});
+		expect(withVaultWriteLock).toHaveBeenCalledWith("/mb", { wait: 60_000 }, expect.any(Function), {
+			launch: expect.any(Function),
+		});
 	});
 
-	it("runs the sweep under the canonical vault-write lock (fail-fast, keyed off the vault root)", async () => {
-		await compileAllRepos("/mb", { model: "haiku" } as never);
-		expect(withVaultWriteLock).toHaveBeenCalledWith("/mb", "fail-fast", expect.any(Function));
-	});
-
-	it("skips the sweep (no discovery) when another vault writer holds the lock", async () => {
-		// Lock busy → body never runs → ran:false.
+	it("the per-write guard rejects with VaultWriteBusyError when an individual write can't acquire the lock", async () => {
+		await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never);
+		const guard = vi.mocked(drainIngest).mock.calls[0][2]?.writeGuard;
+		// Lock busy on this one write → withVaultWriteLock reports ran:false → the
+		// guard surfaces it as a TYPED VaultWriteBusyError (not a bare Error) so
+		// drainIngest's page-write catch holds the page as a benign conflict instead
+		// of mislabeling it a real write fault.
 		vi.mocked(withVaultWriteLock).mockResolvedValueOnce({ ran: false });
-		const res = await compileAllRepos("/mb", { model: "haiku" } as never);
-		expect(res.skipped).toBe(true);
-		expect(res.repos).toEqual([]);
-		expect(res.totalIngested).toBe(0);
-		expect(discoverRepos).not.toHaveBeenCalled();
+		await expect(guard?.(async () => {})).rejects.toThrow("could not acquire vault-write.lock");
+	});
+
+	it("does NOT purge topic pages during a routine sweep (would delete a page a concurrent ingest just added — data loss)", async () => {
+		await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never);
+		expect(purgeTopicPagesExcept).not.toHaveBeenCalled();
 	});
 
 	it("stringifies non-Error throws in the per-repo error field", async () => {

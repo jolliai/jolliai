@@ -422,6 +422,37 @@ describe("CLI", () => {
 			exitSpy.mockRestore();
 		});
 
+		it("hides a command via the `hidden` fallback field when `_hidden` is absent (forward-compat)", async () => {
+			// isHiddenCommand probes BOTH `_hidden` (commander v13) and `hidden`, so a
+			// future commander that renames the internal can't silently un-hide a
+			// command. Simulate that future: drop `_hidden` and set `hidden` — the
+			// `?? internal.hidden` fallback operand must still hide it.
+			vi.mocked(loadPlugins).mockImplementationOnce(async (program) => {
+				const c = program.command("plugin-fallback-hidden").description("hidden via fallback field");
+				const internal = c as unknown as { _hidden?: boolean; hidden?: boolean };
+				delete internal._hidden;
+				internal.hidden = true;
+				program.command("plugin-visible-after-fallback").description("visible plugin cmd");
+				return { loaded: new Set<string>(), diagnostics: [] };
+			});
+
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main(["--help"]);
+			} catch {
+				// Commander calls process.exit after --help
+			}
+			const helpOutput = vi
+				.mocked(process.stdout.write)
+				.mock.calls.map((c) => String(c[0]))
+				.join("");
+			expect(helpOutput).toContain("plugin-visible-after-fallback");
+			expect(helpOutput).not.toContain("plugin-fallback-hidden");
+			exitSpy.mockRestore();
+		});
+
 		it("classifies every builtin/stub command into Memory, Site, or Space (no 'Other commands:' fall-through)", async () => {
 			// Invariant: every builtin/stub command name must appear in
 			// MEMORY_COMMAND_NAMES, SITE_COMMAND_NAMES, SPACE_COMMAND_NAMES, or

@@ -42,6 +42,27 @@ describe("renderTopicKBWiki", () => {
 		expect(call0[0].map((p) => (p as { stableSlug: string }).stableSlug)).toEqual(["auth", "storage"]);
 	});
 
+	it("routes the storage.renderTopicWiki write through the provided writeGuard", async () => {
+		// The visible-wiki render is one bulk write; the QueueWorker wraps it in the
+		// per-vault lock so it can't land mid-sync. The guard must wrap the actual
+		// renderTopicWiki call, and the reads (index/pages) must precede it.
+		vi.mocked(readTopicIndex).mockResolvedValue({ schemaVersion: 1, topics: [idxEntry("auth")] });
+		vi.mocked(readTopicPage).mockImplementation(async (slug) => page(slug));
+		const order: string[] = [];
+		const renderTopicWiki = vi.fn(async () => {
+			order.push("render");
+		});
+		const writeGuard = vi.fn(async (fn: () => Promise<void>): Promise<void> => {
+			order.push("guard-enter");
+			await fn();
+			order.push("guard-exit");
+		});
+		await renderTopicKBWiki("/tmp/x", { renderTopicWiki } as unknown as StorageProvider, writeGuard);
+		expect(writeGuard).toHaveBeenCalledTimes(1);
+		expect(renderTopicWiki).toHaveBeenCalledTimes(1);
+		expect(order).toEqual(["guard-enter", "render", "guard-exit"]);
+	});
+
 	it("skips index entries whose page file is missing", async () => {
 		vi.mocked(readTopicIndex).mockResolvedValue({ schemaVersion: 1, topics: [idxEntry("auth"), idxEntry("gone")] });
 		vi.mocked(readTopicPage).mockImplementation(async (slug) => (slug === "gone" ? null : page(slug)));
