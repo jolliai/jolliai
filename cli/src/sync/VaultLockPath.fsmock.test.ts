@@ -14,6 +14,14 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+// These assert canonical POSIX path strings, but the function emits the host's
+// native separator and `path.resolve` prepends a drive letter on Windows — the
+// simulated-platform cases can't be faithfully reproduced on a Windows host
+// (real `sep`/`resolve` ignore the `process.platform` stub). They are fully
+// exercised on POSIX CI, so skip on win32 rather than assert a path shape that
+// only holds on POSIX. Mirrors the `skipIfWin32` pattern in other tests.
+const itPosix = process.platform === "win32" ? it.skip : it;
+
 const { mockStatSync, mockRealpathNative } = vi.hoisted(() => ({
 	mockStatSync: vi.fn(),
 	mockRealpathNative: vi.fn(),
@@ -27,7 +35,7 @@ vi.mock("node:fs", () => {
 import { canonicaliseLocalFolder } from "./VaultLockPath.js";
 
 describe("canonicaliseLocalFolder defensive fallbacks", () => {
-	it("trims a trailing separator that survives into the canonical string (step 5)", () => {
+	itPosix("trims a trailing separator that survives into the canonical string (step 5)", () => {
 		// An existing ancestor that realpaths to a path WITH a trailing slash —
 		// the regex collapse preserves the trailing sep, so the explicit trim runs.
 		mockStatSync.mockReturnValue(undefined); // input segment "exists"
@@ -38,7 +46,7 @@ describe("canonicaliseLocalFolder defensive fallbacks", () => {
 		expect(out.endsWith("/")).toBe(false);
 	});
 
-	it("returns the lexical path when no ancestor — not even root — can be statted", () => {
+	itPosix("returns the lexical path when no ancestor — not even root — can be statted", () => {
 		// statSync throws for every segment → resolvePartialRealpath walks to the
 		// filesystem root, hits parent === cur, and returns the resolved input.
 		mockStatSync.mockImplementation(() => {
@@ -64,12 +72,12 @@ describe("canonicaliseLocalFolder case-folding by platform (step 4)", () => {
 		mockRealpathNative.mockImplementation((s: string) => s); // identity realpath
 	}
 
-	it("preserves case on a case-sensitive filesystem (linux — neither branch of the platform check)", () => {
+	itPosix("preserves case on a case-sensitive filesystem (linux — neither branch of the platform check)", () => {
 		stubPlatform("linux");
 		expect(canonicaliseLocalFolder("/Var/Data/Vault")).toBe("/Var/Data/Vault");
 	});
 
-	it("lower-cases on win32 (the first operand of the platform check)", () => {
+	itPosix("lower-cases on win32 (the first operand of the platform check)", () => {
 		stubPlatform("win32");
 		expect(canonicaliseLocalFolder("/Var/Data/Vault")).toBe("/var/data/vault");
 	});

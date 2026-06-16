@@ -2,11 +2,16 @@ import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { symlinksSupported } from "../testUtils/symlinkSupport.js";
 import {
 	__vaultLockCanonicalForTesting as canonicalise,
 	canonicaliseLocalFolder,
 	getVaultWriteLockPath,
 } from "./VaultLockPath.js";
+
+// symlinkSync throws EPERM on a non-elevated Windows account (no
+// SeCreateSymbolicLinkPrivilege); skip the symlink-resolution cases there.
+const itIfSymlinks = symlinksSupported ? it : it.skip;
 
 describe("canonicaliseLocalFolder", () => {
 	let tmpRoot: string;
@@ -54,7 +59,7 @@ describe("canonicaliseLocalFolder", () => {
 		expect(out).not.toContain(`..`);
 	});
 
-	it("realpaths symlinked parent segments (step 3 — production caller correctness)", () => {
+	itIfSymlinks("realpaths symlinked parent segments (step 3 — production caller correctness)", () => {
 		// Build: <tmpRoot>/real/data and a symlink <tmpRoot>/link → real.
 		// canonicalise(<tmpRoot>/link/data) must resolve through the symlink
 		// to <tmpRoot>/real/data — otherwise sync and worker would compute
@@ -168,7 +173,7 @@ describe("getVaultWriteLockPath", () => {
 		expect(filename).toMatch(/^vault-[0-9a-f]{64}\.lock$/);
 	});
 
-	it("symlink-equivalent inputs produce the same lock path (canonical-realpath in path)", () => {
+	itIfSymlinks("symlink-equivalent inputs produce the same lock path (canonical-realpath in path)", () => {
 		// Same scenario as the canonicaliseLocalFolder symlink test, but
 		// asserted at the lock-path level. This is the load-bearing property
 		// for the Hotfix: sync and worker must compute the same hash even if

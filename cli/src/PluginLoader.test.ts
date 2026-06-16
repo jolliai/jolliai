@@ -20,6 +20,11 @@ import type { KnownPlugin } from "./KnownPlugins.js";
 import { KNOWN_PLUGINS } from "./KnownPlugins.js";
 import { setSilentConsole } from "./Logger.js";
 import { findNodeModulesRoot, getNpmRootGlobal, inspectPlugins, loadPlugins } from "./PluginLoader.js";
+import { symlinksSupported } from "./testUtils/symlinkSupport.js";
+
+// The npm-link / symlink-layout case needs a real symlink, which requires
+// SeCreateSymbolicLinkPrivilege on Windows; skip it on an unprivileged account.
+const itIfSymlinks = symlinksSupported ? it : it.skip;
 
 const FIXTURE_NAME = "@test-fixtures/example-plugin";
 const FIXTURE_SCOPE = "@test-fixtures";
@@ -1112,7 +1117,7 @@ describe("loadPlugins", () => {
 		expect(program.commands).toHaveLength(0);
 	});
 
-	it("discovers a plugin installed as a symlink (npm link / workspace layout)", async () => {
+	itIfSymlinks("discovers a plugin installed as a symlink (npm link / workspace layout)", async () => {
 		// Dirent.isDirectory() returns false for a symlink-to-directory under
 		// `withFileTypes: true`, so without the isSymbolicLink() fallback the
 		// loader would silently miss `npm link`, yarn workspaces, and pnpm's

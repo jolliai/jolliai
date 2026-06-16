@@ -10,6 +10,7 @@ vi.mock("./FolderPlanNoteSource.js", () => ({
 vi.mock("node:fs/promises", () => ({ readFile: vi.fn() }));
 
 import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { loadFolderPlanNoteContent, loadFolderPlanNoteHeadline } from "./FolderPlanNoteSource.js";
 import { FolderStorage } from "./FolderStorage.js";
 import { listAllUserKnowledge, listAllUserKnowledgeFromRoot } from "./MemoryBankScanner.js";
@@ -115,7 +116,9 @@ describe("loadSourceContent", () => {
 
 		expect(result).toBe(content);
 		// Reads the one named file at <dirname(kbRoot)>/<path>, not a vault scan.
-		expect(vi.mocked(readFile)).toHaveBeenCalledWith("/mb/notes/a.md", "utf-8");
+		// Built with the same path ops production uses so the expected separator
+		// matches the host (`/mb/notes/a.md` on POSIX, `\mb\notes\a.md` on Windows).
+		expect(vi.mocked(readFile)).toHaveBeenCalledWith(join(dirname("/mb/jolli"), "notes/a.md"), "utf-8");
 		expect(vi.mocked(listAllUserKnowledgeFromRoot)).not.toHaveBeenCalled();
 	});
 

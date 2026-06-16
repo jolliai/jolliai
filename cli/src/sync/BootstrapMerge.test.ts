@@ -12,9 +12,14 @@ import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { symlinksSupported } from "../testUtils/symlinkSupport.js";
 import { BOOTSTRAP_STASH_DIRNAME, runBootstrapMerge, shouldRunBootstrapMerge } from "./BootstrapMerge.js";
 import { GitClient } from "./GitClient.js";
 import type { GitCredentials } from "./SyncTypes.js";
+
+// Creating symlinks needs SeCreateSymbolicLinkPrivilege on Windows; skip the
+// symlink-collection case on a non-elevated account where symlink() throws EPERM.
+const itIfSymlinks = symlinksSupported ? it : it.skip;
 
 // Same global-config isolation rationale as GitClient.test.ts: a developer
 // `commit.gpgsign=true` or husky hook would hang every commit here.
@@ -605,7 +610,7 @@ describe("runBootstrapMerge — per-path dispositions", () => {
 		expect(result.stashedSurvivors).toHaveLength(0);
 	});
 
-	it("symlinks in the local tree are collected and moved like regular files", async () => {
+	itIfSymlinks("symlinks in the local tree are collected and moved like regular files", async () => {
 		const client = await setupFreshLocal();
 		await writeFile(join(memoryBankRoot, "target.md"), "target\n");
 		await symlink("target.md", join(memoryBankRoot, "link.md"));

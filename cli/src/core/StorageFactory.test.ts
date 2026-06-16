@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock dependencies before importing the module under test
@@ -130,7 +131,9 @@ describe("StorageFactory", () => {
 		expect(FolderStorage).toHaveBeenCalledOnce();
 		expect((storage as unknown as Record<string, unknown>).type).toBe("folder");
 		// MetadataManager is constructed against the `<kbRoot>/.jolli` subfolder.
-		expect(MetadataManager).toHaveBeenCalledWith("/explicit/kb/root/.jolli");
+		// Built with `join` so the separator matches the host (production uses
+		// `join(kbRoot, ".jolli")`, which yields `\` on Windows).
+		expect(MetadataManager).toHaveBeenCalledWith(join("/explicit/kb/root", ".jolli"));
 		// No git-derived resolution: the explicit-root path skips the resolver chain.
 		expect(kbResolver.extractRepoName).not.toHaveBeenCalled();
 		expect(kbResolver.getRemoteUrl).not.toHaveBeenCalled();
