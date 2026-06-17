@@ -1417,7 +1417,6 @@ $rootVars
     border-radius: 10px;
     background: var(--pill-bg);
     color: var(--pill-text);
-    margin-left: auto;
   }
   .private-count { font-weight: 600; }
   .private-drawer .private-body {
@@ -1433,6 +1432,9 @@ $rootVars
     padding-top: 0;
     padding-bottom: 0;
   }
+  .private-body .private-zone { border: none; background: none; padding: 0 14px 12px; margin: 0; }
+  .private-body .private-zone .section-title { display: none; }
+  .private-body .private-zone-watermark { display: none; }
 
   /* ── Reduced motion ── */
   @media (prefers-reduced-motion: reduce) {

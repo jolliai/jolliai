@@ -818,16 +818,6 @@ class SummaryPanel(
         jmLog.info("handleCheckPrStatus: start (cwd='%s')", cwd)
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                val commitCount = PrService.getCommitCount(cwd)
-                jmLog.info("handleCheckPrStatus: commitCount=%d", commitCount)
-                if (commitCount > 1) {
-                    jmLog.info("handleCheckPrStatus: status=multipleCommits (count=%d)", commitCount)
-                    ApplicationManager.getApplication().invokeLater {
-                        postToWebview("prStatus", mapOf("status" to "multipleCommits", "count" to commitCount))
-                    }
-                    return@executeOnPooledThread
-                }
-
                 val ghAvailable = PrService.isGhAvailable(cwd)
                 jmLog.info("handleCheckPrStatus: isGhAvailable=%s", ghAvailable)
                 if (!ghAvailable) {

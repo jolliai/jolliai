@@ -1579,13 +1579,7 @@ ${buildPrMessageScript()}
       prCurrentState = s;
       prHide(prForm);
 
-      if (s === 'multipleCommits') {
-        setPrChip('is-warn', 'Multiple commits');
-        prStatusText.textContent = 'Branch has ' + msg.count + ' commits. Please squash into a single commit before creating or updating a PR.';
-        prShow(prStatusText);
-        prHide(prLinkRow);
-        prHide(prActions);
-      } else if (s === 'unavailable') {
+      if (s === 'unavailable') {
         setPrChip('is-warn', 'Unavailable');
         prStatusText.textContent = 'GitHub CLI (gh) is not installed or not authenticated.';
         prShow(prStatusText);

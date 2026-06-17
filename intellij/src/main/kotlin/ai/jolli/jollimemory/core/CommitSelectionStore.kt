@@ -72,6 +72,28 @@ object CommitSelectionStore {
 		writeExclusions(projectDir, next)
 	}
 
+	fun setAllExcluded(projectDir: String, kind: String, keys: List<String>, excluded: Boolean) {
+		val current = readExclusions(projectDir)
+		val next = mutableMapOf(
+			"conversations" to current.conversations.toMutableSet(),
+			"plans" to current.plans.toMutableSet(),
+			"notes" to current.notes.toMutableSet(),
+			"references" to current.references.toMutableSet(),
+		)
+		val set = next[kind] ?: return
+		if (excluded) {
+			for (k in keys) set.add(k)
+		} else {
+			for (k in keys) set.remove(k)
+		}
+
+		writeExclusions(projectDir, next)
+	}
+
+	fun conversationKey(source: TranscriptSource, sessionId: String): String {
+		return "${source.name}:$sessionId"
+	}
+
 	private fun writeExclusions(projectDir: String, data: Map<String, Set<String>>) {
 		val file = selectionFile(projectDir)
 		file.parentFile?.mkdirs()

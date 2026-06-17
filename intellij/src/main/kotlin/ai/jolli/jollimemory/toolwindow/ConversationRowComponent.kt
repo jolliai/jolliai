@@ -8,6 +8,7 @@ import com.intellij.util.ui.JBUI
 import java.awt.*
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import javax.swing.JCheckBox
 import javax.swing.JLabel
 import javax.swing.JPanel
 
@@ -20,7 +21,15 @@ class ConversationRowComponent(
 	val item: ActiveConversationItem,
 	private val onRowClicked: (ActiveConversationItem) -> Unit,
 	private val onHide: (ActiveConversationItem) -> Unit,
+	private val onSelectionChanged: (ActiveConversationItem, Boolean) -> Unit,
 ) : JPanel(BorderLayout()) {
+
+	private val checkbox = JCheckBox().apply {
+		isSelected = item.isSelected
+		isOpaque = false
+		toolTipText = "Include in next memory"
+		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+	}
 
 	private val hideLabel = JLabel(AllIcons.Actions.GC).apply {
 		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
@@ -34,9 +43,14 @@ class ConversationRowComponent(
 		isOpaque = true
 		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
 
-		// Source badge
+		// Left side: checkbox + source badge
+		val leftPanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(2), 0)).apply {
+			isOpaque = false
+		}
+		leftPanel.add(checkbox)
 		val badge = SourceBadge(item.source)
-		add(badge, BorderLayout.WEST)
+		leftPanel.add(badge)
+		add(leftPanel, BorderLayout.WEST)
 
 		// Title (center, truncates)
 		val titleLabel = JLabel(item.title).apply {
@@ -56,6 +70,11 @@ class ConversationRowComponent(
 		}
 		rightPanel.add(hideLabel)
 		add(rightPanel, BorderLayout.EAST)
+
+		// Checkbox toggle
+		checkbox.addActionListener {
+			onSelectionChanged(item, checkbox.isSelected)
+		}
 
 		// Click handlers
 		hideLabel.addMouseListener(object : MouseAdapter() {
@@ -91,10 +110,10 @@ class ConversationRowComponent(
 		}
 		addMouseListener(hoverListener)
 		addMouseListener(clickListener)
-		// Forward events from all children
-		for (c in listOf(badge, titleLabel, rightPanel, hideLabel)) {
+		// Forward events from all children (checkbox handles its own clicks)
+		for (c in listOf(leftPanel, badge, titleLabel, rightPanel, hideLabel)) {
 			c.addMouseListener(hoverListener)
-			if (c !== hideLabel) c.addMouseListener(clickListener)
+			if (c !== hideLabel && c !== checkbox) c.addMouseListener(clickListener)
 		}
 	}
 
