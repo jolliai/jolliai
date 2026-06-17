@@ -52,6 +52,9 @@ Thumbs.db
 # Generated codicon assets (copied from node_modules at build time)
 vscode/assets/codicons/
 
+# Generated knowledge-graph viz assets (copied from cli/src/graph/assets at build time)
+vscode/assets/graph/
+
 # Local pre-PR review state (per-developer scratch)
 .claude/review-findings/
 

@@ -62,7 +62,10 @@ export function registerCompileCommand(opts: CompileCommandOpts): vscode.Disposa
 					title: "Jolli Memory: Building knowledge wiki…",
 					cancellable: false,
 				},
-				async () => compileAllRepos(config.localFolder as string, config),
+				async (progress) =>
+					compileAllRepos(config.localFolder as string, config, {
+						onProgress: (message) => progress.report({ message }),
+					}),
 			);
 			if (result.skipped) {
 				// Lock contended: a background worker / sync / another compile holds the

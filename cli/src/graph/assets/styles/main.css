@@ -1,0 +1,523 @@
+/* Jolli Knowledge Wiki v2 — layered card view.
+   Themed to follow the host VS Code editor theme; relationship palette
+   matches the commit-summary webview's accent family.
+   Pure DOM cards + one SVG overlay for edges. No canvas, no framework. */
+
+/* ── Theme: follows the host VS Code theme ──────────────────
+   The webview <body> carries VS Code's `vscode-light` / `vscode-dark` /
+   `vscode-high-contrast` class and exposes the --vscode-* design tokens.
+   Base colors map straight onto those tokens (so the graph adopts ANY
+   editor theme); the relationship palette + surface overlays are tuned
+   per light/dark to match the commit-summary webview (SummaryCssBuilder).
+   Dark is the :root default (also used for vscode-dark / high-contrast);
+   body.vscode-light overrides it. edges.js reads --edge-* live, so the
+   connections retheme on a theme switch (main.js repaints them). */
+:root {
+  /* base — track the editor's own tokens */
+  --bg: var(--vscode-editor-background, #0d0d12);
+  --bg-raised: var(--vscode-sideBar-background, #16161d);
+  --card: var(--vscode-editorWidget-background, #1c1c25);
+  --card-hover: var(--vscode-list-hoverBackground, #232330);
+  --ink: var(--vscode-foreground, #e8e8ee);
+  --prose: var(--vscode-foreground, #c9c9d4);
+  --muted: var(--vscode-descriptionForeground, #8a8a98);
+  --accent: var(--vscode-textLink-foreground, #d4a368);
+  --accent-soft: var(--vscode-focusBorder, rgba(212, 163, 104, 0.25));
+
+  /* surface overlays + borders — dark defaults (white over a dark bg) */
+  --surface: rgba(255, 255, 255, 0.04);
+  --surface-hover: rgba(255, 255, 255, 0.07);
+  --surface-strong: rgba(255, 255, 255, 0.14);
+  --line: var(--vscode-widget-border, var(--surface-strong));
+  --line-2: var(--vscode-editorWidget-border, var(--surface));
+  --nub: var(--vscode-descriptionForeground, #70707e);
+
+  /* relationship palette — commit-summary accent family (dark labels) */
+  --edge-extends: #6eaaef;
+  --edge-caused-by: #e0ac2b;
+  --edge-supersedes: #f47067;
+  --edge-related-to: #4ece8d;
+  --edge-contradicts: #b494f0;
+
+  /* unit kind chips (aligned to the same accent family) */
+  --kind-decision: #6eaaef;
+  --kind-mechanism: #4ece8d;
+  --kind-fix: #e0ac2b;
+  --kind-migration: #b494f0;
+}
+
+/* ── Light theme: black-over-light overlays + darker accent labels ── */
+body.vscode-light {
+  --surface: rgba(0, 0, 0, 0.03);
+  --surface-hover: rgba(0, 0, 0, 0.06);
+  --surface-strong: rgba(0, 0, 0, 0.10);
+
+  --edge-extends: #1f5a91;
+  --edge-caused-by: #96680e;
+  --edge-supersedes: #c0392b;
+  --edge-related-to: #1b6340;
+  --edge-contradicts: #5c35a0;
+
+  --kind-decision: #1f5a91;
+  --kind-mechanism: #1b6340;
+  --kind-fix: #96680e;
+  --kind-migration: #5c35a0;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.55 var(--vscode-font-family, "Segoe UI", system-ui, -apple-system, sans-serif);
+  overflow: hidden;
+}
+
+.app { display: flex; flex-direction: column; height: 100vh; }
+
+/* ── Topbar ─────────────────────────────────────────────── */
+.topbar {
+  display: flex; align-items: center; gap: 18px;
+  padding: 10px 20px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+.brand { display: flex; align-items: baseline; gap: 6px; }
+.brand-name { font-weight: 700; font-size: 17px; color: var(--accent); }
+.brand-sub { font-size: 11px; letter-spacing: 0.18em; color: var(--muted); }
+
+.breadcrumb { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.breadcrumb .crumb {
+  color: var(--muted); cursor: pointer; padding: 3px 8px; border-radius: 4px;
+  transition: color .12s, background .12s;
+}
+.breadcrumb .crumb:hover { color: var(--ink); background: var(--surface-hover); }
+.breadcrumb .crumb.current { color: var(--ink); font-weight: 600; cursor: default; }
+.breadcrumb .crumb.current:hover { background: none; }
+.breadcrumb .sep { color: var(--line); }
+.breadcrumb .esc-hint { font-size: 11px; color: var(--muted); opacity: .6; margin-left: 4px; }
+
+.topbar-spacer { flex: 1; }
+.searchbox {
+  width: 260px; padding: 6px 12px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+  color: var(--ink); font-size: 13px; outline: none;
+  transition: border-color .15s, width .2s;
+}
+.searchbox:focus { border-color: var(--accent-soft); width: 340px; }
+.searchbox::placeholder { color: var(--muted); }
+
+/* ── Layout ─────────────────────────────────────────────── */
+.layout { display: flex; flex: 1; min-height: 0; }
+/* .main is the pan/zoom viewport: content moves via transform, never scroll */
+.main { flex: 1; min-width: 0; overflow: hidden; position: relative; cursor: grab; }
+.main:active { cursor: grabbing; }
+
+/* .board-wrap is the transformed canvas (panzoom target) */
+.board-wrap { position: relative; width: max-content; will-change: transform; }
+.edge-layer {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  pointer-events: none; z-index: 1;
+  /* An HTML-embedded <svg> clips to its box by default; a card dragged into
+     negative coords would lose its edges. The real viewport clip is .main
+     (overflow:hidden), so let edges draw past the svg box freely. */
+  overflow: visible;
+}
+/* While a unit is focused, lift the edge layer above the cards so the
+   highlighted edges are never hidden behind an unrelated topic box that
+   happens to sit between the two endpoints. Dimmed edges are nearly
+   invisible, so drawing them over dimmed cards is harmless. */
+.edge-layer.spotlight { z-index: 3; }
+.edge-layer .edge-hit { pointer-events: stroke; cursor: pointer; }
+.board { position: relative; z-index: 2; padding: 26px 30px 60px; }
+
+/* ── Overview: category cards ──────────────────────────────── */
+.category-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+  gap: 56px 64px;
+  max-width: 1280px;
+  margin: 0 auto;
+}
+/* ELK mode: engine assigns absolute positions; grid CSS steps aside.
+   Hidden until laid out to avoid a stacked flash. */
+.category-grid.elk-grid {
+  display: block; position: relative;
+  max-width: none; margin: 0;
+  visibility: hidden;
+}
+.category-grid.elk-grid.laid-out { visibility: visible; }
+.elk-grid .category-card { position: absolute; }
+.category-card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--tcolor, var(--accent));
+  border-radius: 8px;
+  padding: 16px 18px 14px;
+  cursor: pointer;
+  transition: background .15s, transform .15s, box-shadow .15s;
+  position: relative;
+}
+.category-card:hover {
+  background: var(--card-hover);
+  transform: translateY(-2px);
+  box-shadow: 0 6px 24px rgba(0,0,0,.45);
+}
+.category-card .c-head {
+  display: flex; align-items: center; margin-bottom: 6px;
+}
+.category-card .t-label {
+  font-size: 9.5px; letter-spacing: .14em; color: var(--tcolor, var(--accent));
+  font-weight: 700;
+}
+.category-card .c-jump,
+.portal .p-jump { cursor: pointer; }
+.category-card .c-jump {
+  margin: -7px -7px -7px auto; color: var(--muted); font-size: 16px; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 32px; min-height: 32px; padding: 7px 9px; border-radius: 6px;
+  transition: color .12s, transform .12s, background .12s;
+}
+.category-card .c-jump:hover { color: var(--ink); background: var(--surface-strong); transform: translateX(2px); }
+.category-card.selected,
+.portal.selected {
+  border-color: var(--tcolor, var(--accent));
+  box-shadow: 0 0 0 1px var(--tcolor, var(--accent)) inset, 0 6px 24px rgba(0,0,0,.45);
+}
+.category-card h3 { margin: 0 0 7px; font-size: 16px; line-height: 1.3; }
+.category-card p { margin: 0 0 12px; font-size: 12.5px; color: var(--prose); line-height: 1.5;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.category-card .t-stats { font-size: 11px; color: var(--muted); }
+.category-card.dimmed { opacity: .35; }
+
+/* ── Category detail: topic groups + unit cards ───────────── */
+/* Masonry: JS assigns absolute left/top per group (shortest column first);
+   hidden until laid out to avoid a stacked-at-origin flash */
+.category-detail.masonry { position: relative; visibility: hidden; }
+.category-detail.masonry.laid-out { visibility: visible; }
+.topic-group {
+  background: var(--surface);
+  border: 1.5px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 16px 16px;
+  box-shadow: inset 0 0 0 1px var(--surface);
+}
+.masonry .topic-group { position: absolute; margin: 0; }
+/* ELK child-mode: the engine positions each card absolutely inside the
+   group; display:contents lifts cards out of the grid box so the group
+   itself is their containing block (visibility still inherits on collapse) */
+.topic-group.elk-cards .unit-grid { display: contents; }
+.topic-group.elk-cards .unit-card { position: absolute; margin: 0; }
+/* Collapse keeps the box size (UA-style spatial stability): the grid keeps
+   its layout space, cards are hidden, a centered hint takes their place.
+   Neighbors never move. */
+.topic-group.collapsed .unit-grid { visibility: hidden; }
+.topic-group.collapsed { background: var(--surface); }
+.collapsed-hint {
+  display: none;
+  position: absolute; left: 0; right: 0; top: 46px; bottom: 0;
+  align-items: center; justify-content: center;
+  font-size: 12px; color: var(--muted); opacity: .7;
+  pointer-events: none;
+}
+.topic-group.collapsed .collapsed-hint { display: flex; }
+.topic-head {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding: 2px 0 10px;
+}
+/* Title + caret = collapse toggle; the rest of the bar is the drag handle */
+.topic-head .tg-toggle {
+  display: inline-flex; align-items: baseline; gap: 10px;
+  cursor: pointer; border-radius: 5px; padding: 1px 4px; margin: -1px -4px;
+}
+.topic-head .tg-toggle:hover { background: rgba(127,127,140,.12); }
+.topic-head .caret { color: var(--muted); font-size: 11px; transition: transform .15s; }
+.topic-group.collapsed .topic-head .caret { transform: rotate(-90deg); }
+.topic-head h4 { margin: 0; font-size: 15px; }
+.topic-head .t-sub { font-size: 12px; color: var(--muted); }
+.topic-head .t-open {
+  margin: -4px -6px -4px auto; font-size: 11px; color: var(--muted); cursor: pointer;
+  display: inline-flex; align-items: center; min-height: 28px;
+  padding: 5px 11px; border-radius: 5px; border: 1px solid transparent;
+}
+.topic-head .t-open:hover { color: var(--ink); border-color: var(--line); }
+
+/* Compact cards, generous gaps (UA-style): the vertical gap is where the
+   intra-group edges live, so it gets the space the card padding gives up */
+.unit-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 42px 30px;
+}
+.unit-card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 9px 11px 10px;
+  cursor: pointer;
+  transition: background .14s, border-color .14s, opacity .2s, transform .14s;
+  position: relative;
+}
+.unit-card:hover {
+  background: var(--card-hover); border-color: var(--surface-strong);
+  transform: translateY(-2px);
+}
+/* Draggable elements: grab affordance; while dragging, lift above siblings */
+.unit-card, .category-card, .portal, .topic-group { cursor: grab; }
+.wiki-dragging { cursor: grabbing !important; z-index: 50 !important; }
+.wiki-dragging.unit-card { transform: none; }
+.unit-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-soft) inset; }
+.unit-card.dimmed { opacity: .3; }
+.unit-card .u-kind {
+  display: inline-block; font-size: 9px; font-weight: 700; letter-spacing: .1em;
+  text-transform: uppercase; padding: 2px 7px; border-radius: 3px; margin-bottom: 7px;
+  font-family: Consolas, monospace;
+}
+.u-kind.decision   { background: rgba(136,192,216,.16); color: var(--kind-decision); }
+.u-kind.mechanism  { background: rgba(163,181,119,.16); color: var(--kind-mechanism); }
+.u-kind.fix        { background: rgba(204,136,86,.18);  color: var(--kind-fix); }
+.u-kind.migration  { background: rgba(169,149,207,.16); color: var(--kind-migration); }
+.unit-card h5 { margin: 0 0 5px; font-size: 13.5px; line-height: 1.35; }
+.unit-card p {
+  margin: 0; font-size: 11.5px; color: var(--prose); line-height: 1.5;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+
+/* ── Portals (cross-category exits) ───────────────────────── */
+/* Horizontal row below the masonry columns; UA-style card:
+   color dot + name + jump arrow, connection count underneath */
+.portal-rail { margin-top: 30px; display: flex; flex-wrap: wrap; gap: 12px; }
+.masonry .portal-rail { position: absolute; margin: 0; }
+/* Portals are special — exits to another category — so they get a bolder
+   dashed border and a category-tinted glow, distinct from unit cards */
+.portal {
+  border: 2px dashed var(--tcolor, var(--muted));
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: 0 0 0 1px rgba(0,0,0,.3), inset 0 0 24px var(--surface);
+  padding: 11px 15px 10px;
+  cursor: pointer;
+  min-width: 210px;
+  position: relative;
+  transition: background .15s, box-shadow .15s, transform .14s;
+}
+.portal:hover { background: var(--surface-hover); transform: translateY(-2px); }
+.portal .p-head { display: flex; align-items: center; }
+.portal .p-label {
+  font-size: 9.5px; letter-spacing: .14em; font-weight: 700;
+  color: var(--tcolor, var(--accent));
+}
+.portal .p-name { font-size: 13.5px; font-weight: 600; margin-top: 3px; }
+.portal .p-jump {
+  margin: -6px -6px -6px auto; padding: 6px 8px 6px 14px;
+  display: inline-flex; align-items: center; min-height: 28px;
+  color: var(--muted); font-size: 15px; line-height: 1; border-radius: 6px;
+  transition: color .12s, transform .12s;
+}
+.portal:hover .p-jump { color: var(--ink); transform: translateX(3px); }
+.portal .p-count { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+/* ── SVG edges ─────────────────────────────────────────── */
+.edge-path { fill: none; transition: opacity .2s; }
+/* Locked-selection flow: marching dashes run along the arrow direction */
+@keyframes edge-flow-anim { to { stroke-dashoffset: -28; } }
+.edge-flow .edge-path {
+  stroke-dasharray: 9 5;
+  animation: edge-flow-anim .55s linear infinite;
+  opacity: 1;
+}
+/* Anchor nubs: DOM semicircles attached inside the card's top/bottom border.
+   Being card children, they ride along with hover lift transforms. */
+.card-nub {
+  position: absolute; left: 50%; transform: translateX(-50%);
+  width: 10px; height: 5px;
+  background: var(--nub);
+  pointer-events: none;
+}
+.card-nub.top { top: 0; border-radius: 0 0 10px 10px; }
+.card-nub.bottom { bottom: 0; border-radius: 10px 10px 0 0; }
+.edge-label {
+  font: 600 10px Consolas, monospace;
+  fill: var(--muted);
+  text-anchor: middle;
+}
+.edge-label-bg {
+  fill: var(--bg-raised);
+  stroke: var(--line);
+  stroke-width: 1;
+  opacity: .95;
+}
+.edge-count-bubble { fill: var(--bg-raised); stroke-width: 1; }
+.edge-count-text { font: 700 10.5px Consolas, monospace; fill: var(--ink); text-anchor: middle; }
+.edge-dim { opacity: .12; }
+
+/* ── Side panel ────────────────────────────────────────── */
+.panel {
+  width: 380px; max-width: 38vw; flex-shrink: 0;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--line);
+  overflow-y: auto;
+  transition: width .16s ease;
+}
+.panel-body { padding: 18px 20px 30px; display: flex; flex-direction: column; min-height: 100%; }
+.panel-back {
+  align-self: flex-start; background: none; border: none; color: var(--muted);
+  font-size: 11.5px; cursor: pointer; padding: 2px 6px; margin: 0 0 12px -6px;
+  border-radius: 3px; font-family: inherit;
+}
+.panel-back:hover { color: var(--ink); background: var(--surface-hover); }
+.panel-open {
+  display: inline-block; margin: 4px 0 6px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+  color: var(--ink); font: 12.5px inherit; cursor: pointer; padding: 8px 14px;
+  transition: background .12s, border-color .12s;
+}
+.panel-open:hover { background: var(--card-hover); border-color: var(--accent); }
+
+.panel h2 { margin: 0 0 4px; font-size: 17px; line-height: 1.3; }
+.panel .p-meta { font-size: 11.5px; color: var(--muted); margin-bottom: 14px; line-height: 1.6; }
+.panel .p-meta code {
+  background: var(--surface-hover); padding: 1px 5px; border-radius: 2px;
+  font: 11px Consolas, monospace;
+}
+.panel h6 {
+  margin: 20px 0 8px; font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--muted); font-weight: 700;
+}
+.panel p.summary { margin: 0 0 10px; font-size: 13px; color: var(--prose); line-height: 1.65; }
+.panel .overview-text { font-size: 12.5px; color: var(--prose); line-height: 1.7; white-space: pre-wrap; }
+
+/* ── Rendered wiki page (marked output) ─────────────────── */
+.wiki-body { font-size: 12.5px; color: var(--prose); line-height: 1.7; }
+.wiki-body > :first-child { margin-top: 0; }
+.wiki-body h1, .wiki-body h2, .wiki-body h3, .wiki-body h4 {
+  color: var(--ink); line-height: 1.3; margin: 18px 0 8px;
+}
+.wiki-body h1 { font-size: 16px; }
+.wiki-body h2 { font-size: 14.5px; padding-bottom: 4px; border-bottom: 1px solid var(--line-2); }
+.wiki-body h3 { font-size: 13px; }
+.wiki-body h4 { font-size: 12px; color: var(--muted); text-transform: none; letter-spacing: 0; }
+.wiki-body p { margin: 8px 0; }
+.wiki-body ul, .wiki-body ol { margin: 8px 0; padding-left: 20px; }
+.wiki-body li { margin: 3px 0; }
+.wiki-body a { color: var(--accent); text-decoration: none; }
+.wiki-body a:hover { text-decoration: underline; }
+.wiki-body code {
+  background: rgba(127,127,140,.14); padding: 1px 5px; border-radius: 3px;
+  font: 11px Consolas, monospace; color: var(--ink);
+}
+.wiki-body pre {
+  background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+  padding: 10px 12px; overflow-x: auto; margin: 10px 0;
+}
+.wiki-body pre code { background: none; padding: 0; font-size: 11.5px; color: var(--prose); }
+.wiki-body blockquote {
+  margin: 10px 0; padding: 2px 12px; color: var(--muted);
+  border-left: 3px solid var(--line); background: rgba(127,127,140,.06);
+}
+.wiki-body hr { border: none; border-top: 1px solid var(--line-2); margin: 16px 0; }
+.wiki-body table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 11.5px; }
+.wiki-body th, .wiki-body td {
+  border: 1px solid var(--line); padding: 5px 8px; text-align: left; vertical-align: top;
+}
+.wiki-body th { background: rgba(127,127,140,.1); color: var(--ink); font-weight: 600; }
+.wiki-body strong { color: var(--ink); }
+
+.rel-item {
+  background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+  padding: 9px 12px; margin-bottom: 8px; cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+.rel-item:hover { background: var(--card-hover); }
+.rel-item.spotlight { border-color: rgba(95,168,255,.45); }
+.rel-head { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; flex-wrap: wrap; }
+.rel-type {
+  font: 700 9px Consolas, monospace; letter-spacing: .06em; text-transform: uppercase;
+  padding: 1.5px 6px; border-radius: 3px;
+}
+.rel-type.extends     { background: rgba(95,168,255,.15);  color: var(--edge-extends); }
+.rel-type.caused-by   { background: rgba(255,179,71,.15);  color: var(--edge-caused-by); }
+.rel-type.supersedes  { background: rgba(255,107,107,.16); color: var(--edge-supersedes); }
+.rel-type.related-to  { background: rgba(95,208,156,.15);  color: var(--edge-related-to); }
+.rel-type.contradicts { background: rgba(192,138,255,.15); color: var(--edge-contradicts); }
+.conf-pill {
+  font: 600 9.5px Consolas, monospace; padding: 1.5px 5px; border-radius: 3px;
+}
+.conf-pill.hi  { background: rgba(95,208,156,.15); color: var(--edge-related-to); }
+.conf-pill.mid { background: rgba(255,179,71,.13); color: var(--edge-caused-by); }
+.conf-pill.lo  { background: rgba(168,168,184,.13); color: var(--muted); }
+.rel-title { font-size: 12.5px; font-weight: 600; }
+.rel-dir { font-size: 10px; color: var(--muted); }
+.rel-evidence { margin-top: 7px; font-size: 12px; color: var(--prose); line-height: 1.6; }
+
+.anchor-list { display: flex; flex-wrap: wrap; gap: 5px; }
+.anchor-list code {
+  background: var(--surface); border: 1px solid var(--line-2);
+  padding: 2px 7px; border-radius: 3px; font: 10.5px Consolas, monospace; color: var(--prose);
+}
+.commit-list { font-size: 12px; }
+.commit-list .ci { padding: 5px 0; border-bottom: 1px solid var(--line-2); display: flex; gap: 8px; }
+.commit-list .ci:last-child { border-bottom: none; }
+.commit-list code { color: var(--accent); font: 11px Consolas, monospace; flex-shrink: 0; }
+.commit-list .cm { color: var(--prose); }
+
+.panel-hint { margin-top: auto; padding-top: 16px; font-size: 10.5px; color: var(--muted); opacity: .55; border-top: 1px solid var(--line-2); }
+
+.stat-rows { font-size: 12.5px; }
+.stat-rows .row { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid var(--line-2); }
+.stat-rows .row:last-child { border-bottom: none; }
+.stat-rows .lbl { color: var(--muted); }
+.stat-rows .val { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* ── Wiki reader drawer ─────────────────────────────────── */
+/* Lives inside .main, so its right edge meets the side panel — the wide
+   reading column opens left-adjacent to the panel, which stays visible. */
+/* Reading mode: the side panel widens for the in-panel full wiki page and
+   bumps the markdown type up a notch (replaces the old wide reader drawer). */
+.panel.reading { width: min(680px, 58vw); max-width: 58vw; }
+.panel.reading .wiki-body { font-size: 13.5px; }
+.panel.reading .wiki-body h1 { font-size: 19px; }
+.panel.reading .wiki-body h2 { font-size: 16px; }
+.panel.reading .wiki-body h3 { font-size: 14px; }
+.panel.reading .wiki-body code { font-size: 12px; }
+
+/* "Open full wiki page" button in the topic panel */
+.wiki-open {
+  display: inline-block; margin: 2px 0 6px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+  color: var(--ink); font: 12.5px inherit; cursor: pointer; padding: 9px 15px;
+  transition: background .12s, border-color .12s;
+}
+.wiki-open:hover { background: var(--card-hover); border-color: var(--accent); }
+
+/* ── Zoom controls ─────────────────────────────────────── */
+.zoom-controls {
+  position: absolute; left: 16px; bottom: 16px; z-index: 10;
+  display: flex; align-items: center; gap: 2px;
+  background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px;
+  padding: 4px 6px; box-shadow: 0 4px 18px rgba(0,0,0,.4);
+  cursor: default;
+}
+.zoom-controls button {
+  background: none; border: none; color: var(--prose); font-size: 15px; cursor: pointer;
+  width: 26px; height: 26px; border-radius: 5px; line-height: 1; font-family: inherit;
+}
+.zoom-controls button:hover { background: var(--surface-hover); color: var(--ink); }
+#zoom-pct {
+  font: 600 11px Consolas, monospace; color: var(--muted);
+  min-width: 42px; text-align: center; font-variant-numeric: tabular-nums;
+}
+
+/* ── Search results dropdown ───────────────────────────── */
+.search-results {
+  position: fixed; top: 52px; right: 20px; width: 420px; max-height: 60vh; overflow-y: auto;
+  background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.6); z-index: 50; padding: 6px;
+}
+.sr-item { padding: 8px 12px; border-radius: 5px; cursor: pointer; }
+.sr-item:hover { background: var(--card-hover); }
+.sr-item .sr-kind { font: 700 9px Consolas, monospace; letter-spacing: .08em; color: var(--muted); text-transform: uppercase; margin-right: 6px; }
+.sr-item .sr-title { font-size: 13px; font-weight: 600; }
+.sr-item .sr-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.sr-empty { padding: 14px; font-size: 12.5px; color: var(--muted); text-align: center; }

@@ -22,7 +22,9 @@ const {
 		}),
 		showInformationMessage: vi.fn(async () => undefined),
 		showErrorMessage: vi.fn(async () => undefined),
-		withProgress: vi.fn(async (_opts: unknown, task: () => Promise<unknown>) => task()),
+		withProgress: vi.fn(async (_opts: unknown, task: (progress: { report: (v: unknown) => void }) => Promise<unknown>) =>
+			task({ report: vi.fn() }),
+		),
 		registeredHandlers,
 		ProgressLocation: { Notification: 15 },
 	};
@@ -106,7 +108,11 @@ describe("registerCompileCommand", () => {
 
 		await registeredHandlers.get("jollimemory.compileNow")?.();
 
-		expect(mockCompileAllRepos).toHaveBeenCalledWith("/mb", expect.objectContaining({ localFolder: "/mb" }));
+		expect(mockCompileAllRepos).toHaveBeenCalledWith(
+			"/mb",
+			expect.objectContaining({ localFolder: "/mb" }),
+			expect.objectContaining({ onProgress: expect.any(Function) }),
+		);
 		expect(opts.sidebarProvider.refreshKnowledgeBaseFolders).toHaveBeenCalled();
 	});
 

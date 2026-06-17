@@ -1532,6 +1532,26 @@ export function buildSidebarScript(): string {
         );
       }
       const rowChildren = [twirl, iconEl].concat(labelChildren);
+      // Repo rows get a trailing "view knowledge graph" button. It dispatches the
+      // jollimemory.viewKnowledgeGraph command (handled host-side) via the generic
+      // command message — the click handler below stops it short of the row toggle.
+      if (isRepoRoot) {
+        rowChildren.push(
+          attachTextTip(
+            el(
+              'span',
+              {
+                className: 'repo-graph-btn',
+                'data-action': 'view-graph',
+                'data-repo': child.relPath,
+                role: 'button',
+              },
+              [el('i', { className: 'codicon codicon-type-hierarchy' })],
+            ),
+            'View knowledge graph',
+          ),
+        );
+      }
       if (titleAttr) attrs.title = titleAttr;
       const row = el('div', attrs, rowChildren);
       out.push(row);
@@ -2427,6 +2447,15 @@ export function buildSidebarScript(): string {
       if (action === 'copy-recall' && hash) {
         vscode.postMessage({ type: 'command', command: 'jollimemory.copyRecallPrompt', args: [hash] });
       }
+      e.stopPropagation();
+      return;
+    }
+    // Per-repo "view knowledge graph" button. Runs before the .tree-node branch
+    // so it opens the graph instead of toggling the repo's expand/collapse.
+    const graphBtn = e.target.closest('[data-action="view-graph"]');
+    if (graphBtn) {
+      const repo = graphBtn.getAttribute('data-repo');
+      if (repo) vscode.postMessage({ type: 'command', command: 'jollimemory.viewKnowledgeGraph', args: [repo] });
       e.stopPropagation();
       return;
     }

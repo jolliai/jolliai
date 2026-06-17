@@ -33,7 +33,10 @@ vi.mock("./MemoryBankRepoDiscovery.js", () => ({
 	}),
 }));
 vi.mock("./SearchIndex.js", () => ({ SearchIndex: { rebuild: vi.fn() } }));
+// Default: graph build is a no-op so the sweep's other assertions are unaffected.
+vi.mock("../graph/GraphBuilder.js", () => ({ buildKnowledgeGraph: vi.fn(async () => ({ built: false })) }));
 
+import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { withVaultWriteLock } from "../sync/VaultWriteLock.js";
 import { drainIngest } from "./IngestPipeline.js";
 import { discoverRepos } from "./MemoryBankRepoDiscovery.js";
@@ -53,6 +56,17 @@ describe("compileAllRepos", () => {
 		expect(res.repos.find((r) => r.folder === "jolli")?.repoIdentity).toBe("id-jolli");
 		// 3 per-repo swaps + 1 final restore.
 		expect(setActiveStorage).toHaveBeenCalledTimes(4);
+	});
+
+	it("reports per-repo progress with [i/total] prefixes when onProgress is supplied", async () => {
+		const messages: string[] = [];
+		await compileAllRepos("/mb", { model: "haiku" } as never, { onProgress: (m) => messages.push(m) });
+		// Phase reports are prefixed with the repo's 1-based index and the total.
+		expect(messages).toContain("[1/3] jolli: ingesting sources");
+		expect(messages).toContain("[1/3] jolli: rendering wiki");
+		// boom (3rd) reports ingest before drainIngest throws, but never reaches "rendering wiki".
+		expect(messages).toContain("[3/3] boom: ingesting sources");
+		expect(messages).not.toContain("[3/3] boom: rendering wiki");
 	});
 
 	it("restores the previous active storage override after the sweep (no leak into the host process)", async () => {
@@ -134,6 +148,35 @@ describe("compileAllRepos", () => {
 		// rather than reading `.message`; it must stay non-fatal like the Error path.
 		// biome-ignore lint/suspicious/noExplicitAny: rejecting with a non-Error value is the point
 		vi.mocked(SearchIndex.rebuild).mockRejectedValue("orama string boom" as any);
+		const res = await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never);
+		expect(res.failed).toBe(0);
+		expect(res.totalIngested).toBe(2);
+	});
+
+	it("relays graph-build progress under a `graph:` prefix", async () => {
+		vi.mocked(buildKnowledgeGraph).mockImplementationOnce(async (_cwd, _storage, _config, opts) => {
+			opts?.onProgress?.("distilling topics");
+			return { built: true };
+		});
+		const messages: string[] = [];
+		await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never, {
+			onProgress: (m) => messages.push(m),
+		});
+		expect(messages).toContain("[1/1] jolli: graph: distilling topics");
+	});
+
+	it("swallows a graph-build failure without failing the repo (non-fatal)", async () => {
+		vi.mocked(buildKnowledgeGraph).mockRejectedValueOnce(new Error("graph boom"));
+		const res = await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never);
+		expect(res.failed).toBe(0); // graph failure is non-fatal
+		expect(res.totalIngested).toBe(2);
+	});
+
+	it("swallows a non-Error graph-build rejection without failing the repo", async () => {
+		// The graph catch stringifies a bare-value rejection via String(graphErr)
+		// rather than reading `.message`; it must stay non-fatal like the Error path.
+		// biome-ignore lint/suspicious/noExplicitAny: rejecting with a non-Error value is the point
+		vi.mocked(buildKnowledgeGraph).mockRejectedValueOnce("graph string boom" as any);
 		const res = await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never);
 		expect(res.failed).toBe(0);
 		expect(res.totalIngested).toBe(2);

@@ -21,6 +21,7 @@ import { getActiveStorage, setActiveStorage } from "../core/SummaryStore.js";
 import { emptyTopicIndex, readTopicIndex, saveTopicIndex } from "../core/TopicIndexStore.js";
 import { purgeTopicPagesExcept } from "../core/TopicPageStore.js";
 import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
+import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import { deriveMemoryBankRoot } from "../sync/SyncBootstrap.js";
 import { DEFAULT_VAULT_WRITE_WAIT_MS, withVaultWriteLock } from "../sync/VaultWriteLock.js";
@@ -74,6 +75,18 @@ async function compileSingleRepo(cwd: string, rebuild: boolean): Promise<void> {
 				storage,
 			);
 			await renderTopicKBWiki(cwd, storage);
+			// Build the knowledge graph from the freshly-ingested topic KB. Wrapped
+			// non-fatal: a graph build failure or missing LLM key must never fail the
+			// compile. Statically imported — the graph module pulls no optional/native
+			// deps, so eager load is safe (unlike the SearchIndex warm-up below).
+			try {
+				await buildKnowledgeGraph(cwd, storage, config);
+			} catch (graphErr) {
+				log.warn(
+					"Knowledge graph build failed (non-fatal): %s",
+					graphErr instanceof Error ? graphErr.message : String(graphErr),
+				);
+			}
 			// Keep the local search index warm so the next query (MCP server / `jolli
 			// search`) rarely pays a lazy rebuild. Disposable cache: a failure here must
 			// never fail the compile. SearchIndex (→ @orama/*) is lazy-imported INSIDE

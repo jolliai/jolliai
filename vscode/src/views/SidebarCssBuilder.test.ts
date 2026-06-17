@@ -14,6 +14,12 @@ describe("SidebarCssBuilder", () => {
 		expect(css).toContain("var(--vscode-editor-background)");
 	});
 
+	it("styles the per-repo knowledge-graph button (hover-revealed, right-aligned)", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".repo-graph-btn");
+		expect(css).toContain(".tree-node:hover .repo-graph-btn");
+	});
+
 	it("declares the .sidebar-root and .tab-bar classes", () => {
 		const css = buildSidebarCss();
 		expect(css).toContain(".sidebar-root");
