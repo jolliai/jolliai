@@ -1,10 +1,22 @@
-import { readFileSync } from "node:fs";
+import { cpSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { defineConfig } from "vite";
 
 const pkg = JSON.parse(readFileSync(resolve(__dirname, "package.json"), "utf-8"));
 
+// The knowledge-graph viz runtime (HTML/CSS/JS/vendor) is read at runtime by
+// `jolli graph --export`, relative to the bundle. Copy it next to dist/ as
+// graph-assets/ so it ships in the published package. (The VS Code extension
+// has its own copy step; this one is CLI-only.)
+const copyGraphAssets = {
+	name: "copy-graph-assets",
+	closeBundle() {
+		cpSync(resolve(__dirname, "src/graph/assets"), resolve(__dirname, "dist/graph-assets"), { recursive: true });
+	},
+};
+
 export default defineConfig({
+	plugins: [copyGraphAssets],
 	define: {
 		__PKG_VERSION__: JSON.stringify(pkg.version),
 		__CLI_PKG_VERSION__: JSON.stringify(pkg.version),
@@ -74,7 +86,7 @@ export default defineConfig({
 		coverage: {
 			provider: "v8",
 			reporter: ["text", "json-summary"],
-			exclude: ["src/Types.ts", "vite.config.ts", "test/**"],
+			exclude: ["src/Types.ts", "vite.config.ts", "test/**", "src/graph/assets/**"],
 			thresholds: {
 				statements: 97,
 				branches: 96,

@@ -559,6 +559,16 @@ export function buildSidebarCss(): string {
   }
   .tree-node:hover { background: var(--vscode-list-hoverBackground); }
   .tree-node.selected { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+  /* Per-repo "view knowledge graph" button: right-aligned, revealed on row hover. */
+  .tree-node .repo-graph-btn {
+    margin-left: auto;
+    flex-shrink: 0;
+    padding: 0 2px;
+    opacity: 0;
+    color: var(--vscode-descriptionForeground);
+  }
+  .tree-node:hover .repo-graph-btn { opacity: 1; }
+  .tree-node .repo-graph-btn:hover { color: var(--vscode-foreground); }
   .tree-node .twirl {
     width: 12px;
     flex-shrink: 0;

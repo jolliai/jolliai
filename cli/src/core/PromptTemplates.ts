@@ -739,6 +739,69 @@ const RECONCILE = `You are a knowledge synthesizer maintaining ONE topic page in
 ---SOURCECOMMITS---
 <comma-separated commit hashes drawn from the sources> (omit if none)`;
 
+// -- Knowledge graph templates ------------------------------------------------
+// Used by cli/src/graph/GraphDistiller.ts to build the browsable knowledge graph
+// from the topic KB. All three emit ONLY JSON. Edge taxonomy mirrors the
+// extract-topic-edges / extract-knowledge-graph skills (reference only).
+
+const GRAPH_CATEGORIES = `You are organizing a software project's knowledge wiki into a browsable graph. You are given every wiki topic (slug, title, one-line summary). Group them into categories and write a concise label + summary for each topic and category.
+
+## Topics
+{{topics}}
+
+## Task
+- Invent 5-15 categories that group the topics by subject area. Give each a stable kebab-case id, a shortTitle (<= 5 words), and a one-sentence summary.
+- Assign EVERY topic to exactly one category via categoryId (must match a category id you created).
+- For each topic, write a shortTitle (<= 5 words) and a one-sentence summary. Keep the original slug and title unchanged.
+
+## Output
+Output ONLY a JSON object -- no prose, no markdown fences:
+{"categories":[{"id":"<kebab-id>","shortTitle":"<<=5 words>","summary":"<one sentence>"}],"topics":[{"slug":"<unchanged>","title":"<unchanged>","shortTitle":"<<=5 words>","summary":"<one sentence>","categoryId":"<category id>"}]}
+Include EVERY input topic exactly once. Use [] for empty arrays.`;
+
+const GRAPH_UNITS = `You are distilling ONE wiki topic into its atomic knowledge units. A unit is a single decision, mechanism, or fix that a future contributor must know -- project-specific knowledge, not generic engineering facts.
+
+## Topic
+{{topicTitle}}
+
+## Page content
+{{content}}
+
+## Task
+- Extract 1-8 units. Each is exactly one decision / mechanism / fix.
+- kind is one of: decision (a deliberate trade-off), mechanism (how something works), fix (a bug or gotcha resolved).
+- id: a short kebab-case slug unique within THIS topic (the caller namespaces it globally).
+- shortTitle <= 5 words; summary one sentence.
+- anchors.files: source file paths named in the content (verbatim). anchors.commits: commit hashes named in the content. Use [] when none.
+
+## Output
+Output ONLY a JSON object -- no prose, no markdown fences:
+{"units":[{"id":"<kebab>","kind":"decision|mechanism|fix","shortTitle":"<<=5 words>","summary":"<one sentence>","anchors":{"files":[],"commits":[]}}]}
+Use [] for empty arrays.`;
+
+const GRAPH_EDGES = `You are finding typed relationships between knowledge units in a software project's wiki. You are given a flat list of units (id, topic, short title, summary).
+
+## Units
+{{units}}
+
+## Edge types
+- extends: A builds on B without invalidating it.
+- caused-by: A exists because of B (a downstream consequence).
+- supersedes: A replaces B; B is now obsolete.
+- contradicts: A and B conflict (an audit signal; rare).
+- related-to: a weak generic association; use only when none of the above fit.
+
+## Task
+- Emit edges ONLY between unit ids in the list above. from and to must both be exact ids from the list.
+- Prefer the most specific type. Use related-to sparingly.
+- confidence is a number in [0.5, 1.0]. evidence is one sentence citing the basis (a file, commit, or quoted phrase).
+- Do not emit an edge from a unit to itself, and do not repeat a (from, to, type) triple.
+
+## Output
+Output ONLY a JSON object -- no prose, no markdown fences:
+{"edges":[{"from":"<unit id>","to":"<unit id>","type":"extends|caused-by|supersedes|contradicts|related-to","confidence":<0.5-1.0>,"evidence":"<one sentence>"}]}
+Use [] when there are no edges.`;
+
 // -- Exported map -------------------------------------------------------------
 
 /**
@@ -788,4 +851,7 @@ export const TEMPLATES: ReadonlyMap<string, PromptTemplate> = new Map<string, Pr
 	["translate", { action: "translate", version: 2, template: TRANSLATE }],
 	["route", { action: "route", version: 1, template: ROUTE }],
 	["reconcile", { action: "reconcile", version: 1, template: RECONCILE }],
+	["graph-categories", { action: "graph-categories", version: 1, template: GRAPH_CATEGORIES }],
+	["graph-units", { action: "graph-units", version: 1, template: GRAPH_UNITS }],
+	["graph-edges", { action: "graph-edges", version: 1, template: GRAPH_EDGES }],
 ]);

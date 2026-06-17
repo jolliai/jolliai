@@ -8,6 +8,16 @@ describe("SidebarScriptBuilder", () => {
 		expect(js.length).toBeGreaterThan(0);
 	});
 
+	it("emits the per-repo knowledge-graph button and its click dispatch", () => {
+		const js = buildSidebarScript();
+		// The repo row renders a trailing view-graph button...
+		expect(js).toContain("'data-action': 'view-graph'");
+		expect(js).toContain("'data-repo': child.relPath");
+		// ...and the kb click delegation dispatches the command with the repo arg.
+		expect(js).toContain("jollimemory.viewKnowledgeGraph");
+		expect(js).toContain('[data-action="view-graph"]');
+	});
+
 	it("output parses as valid JS — backtick / undeclared-symbol smoke test", () => {
 		// Regression for two bug classes that ship-tested but tests-passed:
 		//   1. Backtick trap: SidebarScriptBuilder warns about it in its

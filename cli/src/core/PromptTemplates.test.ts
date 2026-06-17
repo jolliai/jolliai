@@ -38,6 +38,9 @@ describe("PromptTemplates", () => {
 			"translate",
 			"route",
 			"reconcile",
+			"graph-categories",
+			"graph-units",
+			"graph-edges",
 		]);
 	});
 

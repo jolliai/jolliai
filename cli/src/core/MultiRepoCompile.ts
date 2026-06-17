@@ -5,6 +5,7 @@
  * working tree). Per-repo failures are isolated and reported, never swallowed.
  */
 
+import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { createLogger } from "../Logger.js";
 import { deriveMemoryBankRoot } from "../sync/SyncBootstrap.js";
 import { withVaultWriteLock } from "../sync/VaultWriteLock.js";
@@ -35,10 +36,19 @@ export interface CompileAllResult {
 	readonly skipped?: boolean;
 }
 
+export interface CompileAllOptions extends Pick<IngestOptions, "batchSize"> {
+	/**
+	 * Optional one-line progress reporter for UI surfaces (the VS Code "Building
+	 * knowledge wiki…" notification). Messages are prefixed with `[i/total] <repo>`
+	 * so the user sees which repo and phase the sweep is on.
+	 */
+	readonly onProgress?: (message: string) => void;
+}
+
 export async function compileAllRepos(
 	localFolder: string,
 	config: JolliMemoryConfig,
-	opts?: Pick<IngestOptions, "batchSize">,
+	opts?: CompileAllOptions,
 ): Promise<CompileAllResult> {
 	// This sweep writes each repo's canonical JSON and regenerates its `_wiki/` in
 	// place. Serialise on the SAME `vault-write.lock` the QueueWorker and SyncEngine
@@ -54,6 +64,7 @@ export async function compileAllRepos(
 		const repos: CompileAllRepoResult[] = [];
 		let totalIngested = 0;
 		let failed = 0;
+		const total = targets.length;
 
 		// We swap the process-global storage override per repo (inner stores fall back
 		// to it). Capture the prior value and restore it in a finally so the override
@@ -61,12 +72,16 @@ export async function compileAllRepos(
 		// it would silently point later reads/writes at the last-compiled repo.
 		const previousStorage = getActiveStorage();
 		try {
-			for (const t of targets) {
+			for (const [i, t] of targets.entries()) {
+				// `[i/total] <repo>: <phase>` — keeps the UI notification legible about
+				// which repo and phase a long sweep is on.
+				const report = (phase: string) => opts?.onProgress?.(`[${i + 1}/${total}] ${t.folder}: ${phase}`);
 				try {
 					const storage = createFolderStorageAtRoot(t.kbRoot);
 					setActiveStorage(storage);
+					report("ingesting sources");
 					const { batches, ingested } = await drainIngest(t.kbRoot, config, {
-						...opts,
+						batchSize: opts?.batchSize,
 						readStorage: storage,
 						triggeredBy: "manual",
 					});
@@ -76,7 +91,23 @@ export async function compileAllRepos(
 						t.kbRoot,
 						storage,
 					);
+					report("rendering wiki");
 					await renderTopicKBWiki(t.kbRoot, storage);
+					// Build the knowledge graph from the freshly-ingested topic KB. Wrapped
+					// non-fatal: a graph build failure or missing LLM key must never fail the
+					// compile. Statically imported — unlike the SearchIndex warm-up below, the
+					// graph module pulls no optional/native deps, so eager load is safe.
+					try {
+						await buildKnowledgeGraph(t.kbRoot, storage, config, {
+							onProgress: (m) => report(`graph: ${m}`),
+						});
+					} catch (graphErr) {
+						log.warn(
+							"Knowledge graph build failed for %s (non-fatal): %s",
+							t.folder,
+							graphErr instanceof Error ? graphErr.message : String(graphErr),
+						);
+					}
 					// Keep the local search index warm so query-time rebuilds are rare.
 					// Disposable cache: a failure here must never fail the compile.
 					// SearchIndex (→ @orama/*) is lazy-imported INSIDE this try so a

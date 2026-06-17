@@ -16,6 +16,7 @@ import { registerConfigureCommand } from "./commands/ConfigureCommand.js";
 import { registerDoctorCommand } from "./commands/DoctorCommand.js";
 import { registerDisableCommand, registerEnableCommand } from "./commands/EnableCommand.js";
 import { registerExportCommand, registerExportPromptCommand } from "./commands/ExportCommand.js";
+import { registerGraphCommand } from "./commands/GraphCommand.js";
 import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { getHelpGroup } from "./commands/HelpGroups.js";
 import { registerMcpCommand } from "./commands/McpCommand.js";
@@ -154,6 +155,7 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"recall",
 	"search",
 	"compile",
+	"graph",
 	"export",
 	"auth",
 	"heal-folder",
@@ -327,6 +329,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerRecallCommand(program);
 	registerSearchCommand(program);
 	registerCompileCommand(program);
+	registerGraphCommand(program);
 	registerMigrateCommand(program);
 	registerHealFolderCommand(program);
 	registerExportPromptCommand(program);

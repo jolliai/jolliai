@@ -87,6 +87,7 @@ import { MemoriesStore } from "./stores/MemoriesStore.js";
 import { PlansStore } from "./stores/PlansStore.js";
 import { StatusStore } from "./stores/StatusStore.js";
 import { registerCompileCommand } from "./CompileCommand.js";
+import { openKnowledgeGraph } from "./views/KnowledgeGraphPanel.js";
 import { activateSync } from "./sync/VsCodeSyncBootstrap.js";
 import { ExcludeFilterManager } from "./util/ExcludeFilterManager.js";
 import { formatShortRelativeDate } from "./util/FormatUtils.js";
@@ -961,6 +962,12 @@ export function activate(context: vscode.ExtensionContext): void {
 		),
 		branchChangeEmitter,
 		registerCompileCommand({ sidebarProvider }),
+			// Per-repo "view graph" icon (sidebar HTML button) dispatches here with the
+			// repo name. sidebarKbParent is a mutable let re-resolved on folder re-target,
+			// so read it at invocation (inside the arrow), not at registration time.
+			vscode.commands.registerCommand("jollimemory.viewKnowledgeGraph", (repoName?: string) =>
+				openKnowledgeGraph(context.extensionUri, sidebarKbParent, repoName),
+			),
 	);
 
 	// Wire the post-sync UI refresh now that `kbFoldersService` + `sidebarProvider`

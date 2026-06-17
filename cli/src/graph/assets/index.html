@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Jolli Graph</title>
+  <link rel="stylesheet" href="styles/main.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand"><span class="brand-name">Jolli</span><span class="brand-sub">GRAPH</span></div>
+      <nav class="breadcrumb" id="breadcrumb"></nav>
+      <div class="topbar-spacer"></div>
+      <input type="search" class="searchbox" id="searchbox" placeholder="Search topics & decisions…" autocomplete="off" />
+    </header>
+
+    <div class="layout">
+      <main class="main" id="main">
+        <!-- board-wrap is the pan/zoom canvas: cards and the SVG edge layer
+             transform together, so edge geometry stays valid at any zoom -->
+        <div class="board-wrap" id="board-wrap">
+          <svg class="edge-layer" id="edge-layer"></svg>
+          <div class="board" id="board"></div>
+        </div>
+        <div class="zoom-controls">
+          <button type="button" id="zoom-out" title="Zoom out">−</button>
+          <span id="zoom-pct">100%</span>
+          <button type="button" id="zoom-in" title="Zoom in">+</button>
+          <button type="button" id="zoom-fit" title="Fit to view">⛶</button>
+        </div>
+      </main>
+      <aside class="panel" id="panel">
+        <div class="panel-body" id="panel-body"></div>
+      </aside>
+    </div>
+  </div>
+  <div class="search-results" id="search-results" hidden></div>
+
+  <!-- scripts:start -->
+  <script src="vendor/panzoom.min.js"></script>
+  <script src="vendor/elk.bundled.js"></script>
+  <script src="vendor/marked.min.js"></script>
+  <script src="js/data.js"></script>
+  <script src="js/state.js"></script>
+  <script src="js/edges.js"></script>
+  <script src="js/camera.js"></script>
+  <script src="js/drag.js"></script>
+  <script src="js/views.js"></script>
+  <script src="js/panel.js"></script>
+  <script src="js/main.js"></script>
+  <!-- scripts:end -->
+</body>
+</html>
