@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.toolwindow
 import ai.jolli.jollimemory.core.ActiveConversationItem
 import ai.jolli.jollimemory.core.ActiveConversationsResult
 import ai.jolli.jollimemory.core.ActiveSessionAggregator
+import ai.jolli.jollimemory.core.CommitSelectionStore
 import ai.jolli.jollimemory.core.HiddenConversationsStore
 import ai.jolli.jollimemory.core.TranscriptSource
 import ai.jolli.jollimemory.services.JolliMemoryService
@@ -86,7 +87,13 @@ class ActiveConversationsPanel(
 		} catch (e: Exception) {
 			ActiveConversationsResult(emptyList(), emptyList())
 		}
-		SwingUtilities.invokeLater { updateUI(result) }
+		val exclusions = CommitSelectionStore.readExclusions(cwd)
+		val itemsWithSelection = result.items.map { item ->
+			val key = CommitSelectionStore.conversationKey(item.source, item.sessionId)
+			item.copy(isSelected = key !in exclusions.conversations)
+		}
+		val adjusted = ActiveConversationsResult(itemsWithSelection, result.failedSources)
+		SwingUtilities.invokeLater { updateUI(adjusted) }
 	}
 
 	private fun updateUI(result: ActiveConversationsResult) {
@@ -104,6 +111,7 @@ class ActiveConversationsPanel(
 					item = item,
 					onRowClicked = ::onRowClicked,
 					onHide = ::onHide,
+					onSelectionChanged = ::onSelectionChanged,
 				))
 			}
 		}
@@ -123,6 +131,24 @@ class ActiveConversationsPanel(
 			if (editor is ConversationFileEditor) {
 				editor.onSaved = { refresh() }
 			}
+		}
+	}
+
+	private fun onSelectionChanged(item: ActiveConversationItem, selected: Boolean) {
+		val cwd = service.mainRepoRoot ?: project.basePath ?: return
+		val key = CommitSelectionStore.conversationKey(item.source, item.sessionId)
+		ApplicationManager.getApplication().executeOnPooledThread {
+			CommitSelectionStore.setExcluded(cwd, "conversations", key, !selected)
+		}
+	}
+
+	fun toggleSelectAll() {
+		val anyUnchecked = conversations.any { !it.isSelected }
+		val cwd = service.mainRepoRoot ?: project.basePath ?: return
+		val keys = conversations.map { CommitSelectionStore.conversationKey(it.source, it.sessionId) }
+		ApplicationManager.getApplication().executeOnPooledThread {
+			CommitSelectionStore.setAllExcluded(cwd, "conversations", keys, !anyUnchecked)
+			SwingUtilities.invokeLater { refresh() }
 		}
 	}
 

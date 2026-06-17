@@ -179,8 +179,18 @@ object PostCommitHook {
                 allSessions.addAll(CopilotChatSupport.discoverSessions(cwd).sessions)
             }
 
-            val sessions = allSessions
-            log.info("Discovered %d session(s): %s", sessions.size,
+            // Filter out conversations the user excluded via sidebar checkboxes
+            val exclusions = CommitSelectionStore.readExclusions(cwd)
+            val sessions = allSessions.filter { session ->
+                val source = session.source ?: TranscriptSource.claude
+                val key = CommitSelectionStore.conversationKey(source, session.sessionId)
+                val excluded = key in exclusions.conversations
+                if (excluded) log.info("Excluding session %s (user-excluded)", session.sessionId.take(8))
+                !excluded
+            }
+
+            log.info("Discovered %d session(s) (%d excluded): %s",
+                allSessions.size, allSessions.size - sessions.size,
                 sessions.joinToString(", ") { "${it.source ?: "claude"}:${it.sessionId.take(8)}" })
             if (sessions.isEmpty()) {
                 log.info("No active sessions — skipping summarization")
@@ -271,7 +281,6 @@ object PostCommitHook {
 
             // 7b. Assemble reference blocks for prompt injection
             val registry = SessionTracker.loadPlansRegistry(cwd)
-            val exclusions = CommitSelectionStore.readExclusions(cwd)
             val referenceBlocks = PromptRenderer.assembleReferenceBlocks(
                 registry.references ?: emptyMap(),
                 exclusions.references,

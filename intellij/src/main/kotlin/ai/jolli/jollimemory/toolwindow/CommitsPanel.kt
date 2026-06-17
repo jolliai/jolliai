@@ -437,20 +437,29 @@ class CommitsPanel(
             filesLoaded = false,
         )
 
-        // Click anywhere on the commit row (except checkbox/eye) toggles expand/collapse
-        val expandClickListener = object : MouseAdapter() {
+        // Chevron click toggles expand/collapse only
+        val chevronClickListener = object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
                 if (!SwingUtilities.isLeftMouseButton(e)) return
-                if (e.clickCount == 2 && commit.hasSummary) {
+                e.consume()
+                toggleExpand(commit.hash)
+            }
+        }
+        arrowLabel.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        arrowLabel.addMouseListener(chevronClickListener)
+
+        // Click anywhere else on the row opens the summary (matching VS Code behavior)
+        val rowClickListener = object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (!SwingUtilities.isLeftMouseButton(e)) return
+                if (commit.hasSummary) {
                     viewSummary(commit.hash)
-                } else if (e.clickCount == 1) {
-                    toggleExpand(commit.hash)
                 }
             }
         }
-        for (child in listOf(arrowLabel, messageLabel, leftPanel, row)) {
+        for (child in listOf(messageLabel, leftPanel, row)) {
             child.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-            child.addMouseListener(expandClickListener)
+            child.addMouseListener(rowClickListener)
         }
 
         row.maximumSize = Dimension(Int.MAX_VALUE, row.preferredSize.height)

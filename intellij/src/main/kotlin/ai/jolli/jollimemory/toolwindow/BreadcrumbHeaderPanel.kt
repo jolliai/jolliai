@@ -15,10 +15,14 @@ import java.awt.Dimension
 import java.awt.FlowLayout
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import javax.swing.BorderFactory
 import javax.swing.BoxLayout
 import javax.swing.DefaultComboBoxModel
+import javax.swing.DefaultListCellRenderer
 import javax.swing.JButton
 import javax.swing.JComboBox
+import javax.swing.JLabel
+import javax.swing.JList
 import javax.swing.JPanel
 import javax.swing.SwingUtilities
 import javax.swing.UIManager
@@ -81,6 +85,14 @@ class BreadcrumbHeaderPanel(
 
 	init {
 		border = JBUI.Borders.empty(4, 8)
+
+		// Custom renderers: bold + "(current)" + separator for workspace items
+		repoCombo.renderer = WorkspaceAwareCellRenderer { _, index -> index == 0 && repos.any { it.isCurrentRepo } }
+		branchCombo.renderer = WorkspaceAwareCellRenderer { value, _ ->
+			val selectedRepo = repoCombo.selectedItem as? String
+			val isCurrentRepo = repos.find { it.repoName == selectedRepo }?.isCurrentRepo == true
+			isCurrentRepo && value == currentBranch
+		}
 
 		// Left: repo / branch selectors — BoxLayout so they shrink when the tool window is narrow
 		repoCombo.minimumSize = Dimension(JBUI.scale(30), repoCombo.preferredSize.height)
@@ -301,6 +313,40 @@ class BreadcrumbHeaderPanel(
 			if (isForeign) selectedBranch else null,
 			isForeign,
 		)
+	}
+
+	/**
+	 * Cell renderer that bolds the workspace item, appends a muted "(current)"
+	 * suffix, and draws a 1px separator below it — matching VS Code's breadcrumb
+	 * dropdown styling.
+	 */
+	private inner class WorkspaceAwareCellRenderer(
+		private val isWorkspaceItem: (String, Int) -> Boolean,
+	) : DefaultListCellRenderer() {
+		override fun getListCellRendererComponent(
+			list: JList<*>, value: Any?, index: Int, isSelected: Boolean, cellHasFocus: Boolean,
+		): java.awt.Component {
+			val label = super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus) as JLabel
+			val strValue = value as? String ?: return label
+			val isWorkspace = isWorkspaceItem(strValue, index)
+
+			if (isWorkspace) {
+				label.text = "<html><b>$strValue</b> <span style='color:gray'>(current)</span></html>"
+				// Separator line below the workspace item (only in dropdown, not in the collapsed combo)
+				if (index >= 0) {
+					label.border = BorderFactory.createCompoundBorder(
+						BorderFactory.createMatteBorder(0, 0, 1, 0, com.intellij.ui.JBColor.border()),
+						JBUI.Borders.empty(1, 2),
+					)
+				}
+			} else {
+				label.text = strValue
+				if (index >= 0) {
+					label.border = JBUI.Borders.empty(1, 2)
+				}
+			}
+			return label
+		}
 	}
 
 	/** Update the current branch display without full refresh (e.g., on branch switch). */
