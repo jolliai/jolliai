@@ -59,6 +59,16 @@ export function setLogDir(cwd: string): void {
 }
 
 /**
+ * Returns the current global log directory cwd (or undefined when unset). Lets a
+ * caller that re-points the log dir per work item — e.g. the multi-repo compile
+ * sweep — capture the prior value and restore it afterward, so the override never
+ * leaks into a long-lived host (VS Code) past the operation that set it.
+ */
+export function getLogDir(): string | undefined {
+	return _logDirCwd;
+}
+
+/**
  * Resets the global log directory (for testing only).
  */
 export function resetLogDir(): void {

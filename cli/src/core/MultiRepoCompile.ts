@@ -6,7 +6,7 @@
  */
 
 import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
-import { createLogger } from "../Logger.js";
+import { createLogger, getLogDir, resetLogDir, setLogDir } from "../Logger.js";
 import { deriveMemoryBankRoot } from "../sync/SyncBootstrap.js";
 import { DEFAULT_VAULT_WRITE_WAIT_MS, VaultWriteBusyError, withVaultWriteLock } from "../sync/VaultWriteLock.js";
 import type { JolliMemoryConfig } from "../Types.js";
@@ -35,8 +35,9 @@ export interface CompileAllResult {
 export interface CompileAllOptions extends Pick<IngestOptions, "batchSize"> {
 	/**
 	 * Optional one-line progress reporter for UI surfaces (the VS Code "Building
-	 * knowledge wiki…" notification). Messages are prefixed with `[i/total] <repo>`
-	 * so the user sees which repo and phase the sweep is on.
+	 * knowledge wiki…" notification). Messages take the form `[i/total] <repo>:
+	 * <phase>` so the user sees which repo (and how far through the sweep) plus the
+	 * current phase.
 	 */
 	readonly onProgress?: (message: string) => void;
 }
@@ -92,12 +93,18 @@ export async function compileAllRepos(
 	// never leaks past this sweep into a long-lived host process (VS Code), where
 	// it would silently point later reads/writes at the last-compiled repo.
 	const previousStorage = getActiveStorage();
+	// Capture the global log dir too: we re-point it per repo (below) so each repo's
+	// ingest/graph logs land in its OWN <kbRoot>/.jolli/jollimemory/debug.log instead
+	// of the host process's cwd. Restored in the finally so the override never leaks
+	// into the long-lived VS Code host past this sweep.
+	const previousLogDir = getLogDir();
 	try {
 		for (const [i, t] of targets.entries()) {
 			// `[i/total] <repo>: <phase>` — keeps the UI notification legible about
 			// which repo and phase a long sweep is on.
 			const report = (phase: string) => opts?.onProgress?.(`[${i + 1}/${total}] ${t.folder}: ${phase}`);
 			try {
+				setLogDir(t.kbRoot);
 				const storage = createFolderStorageAtRoot(t.kbRoot);
 				setActiveStorage(storage);
 				report("ingesting sources");
@@ -168,5 +175,7 @@ export async function compileAllRepos(
 		return { repos, totalIngested, failed };
 	} finally {
 		setActiveStorage(previousStorage);
+		if (previousLogDir === undefined) resetLogDir();
+		else setLogDir(previousLogDir);
 	}
 }

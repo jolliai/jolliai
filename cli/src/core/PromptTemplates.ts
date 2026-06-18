@@ -802,6 +802,24 @@ Output ONLY a JSON object -- no prose, no markdown fences:
 {"edges":[{"from":"<unit id>","to":"<unit id>","type":"extends|caused-by|supersedes|contradicts|related-to","confidence":<0.5-1.0>,"evidence":"<one sentence>"}]}
 Use [] when there are no edges.`;
 
+const GRAPH_CATEGORIES_DELTA = `You are incrementally updating a software project's knowledge wiki graph. The category set already exists; only a few topics changed or were added. Place ONLY those topics, reusing existing categories wherever possible.
+
+## Existing categories
+{{existingCategories}}
+
+## Changed / new topics
+{{topics}}
+
+## Task
+- Assign EACH listed topic to a category via categoryId. STRONGLY prefer an existing category id from the list above. Only invent a new category when no existing one fits.
+- When you invent a new category: give it a stable kebab-case id, a shortTitle (<= 5 words), and a one-sentence summary. Its shortTitle MUST NOT duplicate any existing category's label.
+- For each topic, write a shortTitle (<= 5 words) and a one-sentence summary. Keep the original slug and title unchanged.
+
+## Output
+Output ONLY a JSON object -- no prose, no markdown fences:
+{"newCategories":[{"id":"<kebab-id>","shortTitle":"<<=5 words>","summary":"<one sentence>"}],"topics":[{"slug":"<unchanged>","title":"<unchanged>","shortTitle":"<<=5 words>","summary":"<one sentence>","categoryId":"<existing or new id>"}]}
+Include EVERY listed topic exactly once. Put only categories you newly invented in newCategories (never repeat an existing one). Use [] for empty arrays.`;
+
 // -- Exported map -------------------------------------------------------------
 
 /**
@@ -851,7 +869,15 @@ export const TEMPLATES: ReadonlyMap<string, PromptTemplate> = new Map<string, Pr
 	["translate", { action: "translate", version: 2, template: TRANSLATE }],
 	["route", { action: "route", version: 1, template: ROUTE }],
 	["reconcile", { action: "reconcile", version: 1, template: RECONCILE }],
+	// NOTE: the four graph-* templates feed the knowledge-graph distiller. If you
+	// change the OUTPUT SHAPE of any of them (a new/renamed field, a changed kind
+	// or edge-type enum, a changed unit-id format) you MUST also bump
+	// GRAPH_SCHEMA_VERSION in cli/src/graph/GraphSchema.ts — graph.json embeds
+	// these shapes verbatim and the incremental baseline reuses prior output only
+	// when schemaVersion matches. Pure wording/few-shot tweaks need only this
+	// template's own version bump, not the schema version.
 	["graph-categories", { action: "graph-categories", version: 1, template: GRAPH_CATEGORIES }],
+	["graph-categories-delta", { action: "graph-categories-delta", version: 1, template: GRAPH_CATEGORIES_DELTA }],
 	["graph-units", { action: "graph-units", version: 1, template: GRAPH_UNITS }],
 	["graph-edges", { action: "graph-edges", version: 1, template: GRAPH_EDGES }],
 ]);

@@ -97,6 +97,7 @@ import { generateTranscriptId } from "../core/TranscriptId.js";
 import { getParserForSource } from "../core/TranscriptParser.js";
 import type { SessionTranscript } from "../core/TranscriptReader.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
+import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { deriveSourceTag } from "../install/DistPathResolver.js";
 import { createLogger, errMsg, getJolliMemoryDir, setLogDir, setLogLevel } from "../Logger.js";
 import { recordPendingWorker, wakePendingWorkers } from "../sync/PendingWorkers.js";
@@ -809,6 +810,17 @@ async function runIngestFromQueue(
 	const wikiMissing = storage.isTopicWikiPresent ? !storage.isTopicWikiPresent() : false;
 	if (result.ingested > 0 || wikiMissing) {
 		await renderTopicKBWiki(cwd, storage, writeGuard);
+		// Refresh the knowledge graph alongside the wiki, on the same gate. Cheap
+		// now that it's diff-based: a no-op build (nothing changed) costs 0 LLM
+		// calls, and a typical change costs ~one call per changed topic. Isolated +
+		// non-fatal: a graph failure must never break ingest/wiki/commit — it just
+		// leaves the prior graph.json untouched. An incremental failure keeps the
+		// old graph and never auto-falls-back to a full rebuild (see buildKnowledgeGraph).
+		try {
+			await buildKnowledgeGraph(cwd, storage, config);
+		} catch (err) {
+			log.warn("Knowledge graph build failed (non-fatal): %s", (err as Error).message);
+		}
 	}
 }
 
