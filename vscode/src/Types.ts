@@ -65,6 +65,20 @@ export interface BranchCommit {
 	readonly commitType?: string;
 }
 
+/**
+ * Whether amending HEAD is safe, used to gate the Amend actions of the
+ * "Commit Memory" QuickPick. Amend rewrites HEAD in place — on a branch with
+ * no commits of its own, or whose tip was authored by someone else, that
+ * silently rewrites a commit shared with the base branch (keeping the original
+ * author) and inherits its memory onto the new hash.
+ */
+export interface AmendSafety {
+	/** HEAD has commits beyond the merge-base with the base branch (own work on this branch). */
+	readonly hasOwnCommits: boolean;
+	/** HEAD commit's author email matches the current git `user.email`. */
+	readonly headAuthoredByCurrentUser: boolean;
+}
+
 /** Result from listBranchCommits, includes merged-state metadata */
 export interface BranchCommitsResult {
 	/** The commits found on this branch */
