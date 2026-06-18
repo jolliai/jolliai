@@ -1,18 +1,21 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { StorageProvider } from "../core/StorageProvider.js";
 
-const { readTopicIndex, readTopicPage, distillGraph, writeGraphArtifacts } = vi.hoisted(() => ({
-	readTopicIndex: vi.fn(),
-	readTopicPage: vi.fn(),
-	distillGraph: vi.fn(),
-	writeGraphArtifacts: vi.fn(),
-}));
+const { readTopicIndex, readTopicPage, distillGraph, distillGraphIncremental, writeGraphArtifacts, readGraph } =
+	vi.hoisted(() => ({
+		readTopicIndex: vi.fn(),
+		readTopicPage: vi.fn(),
+		distillGraph: vi.fn(),
+		distillGraphIncremental: vi.fn(),
+		writeGraphArtifacts: vi.fn(),
+		readGraph: vi.fn(),
+	}));
 vi.mock("../core/TopicIndexStore.js", () => ({ readTopicIndex }));
 vi.mock("../core/TopicPageStore.js", () => ({ readTopicPage }));
-vi.mock("./GraphDistiller.js", () => ({ distillGraph }));
-vi.mock("./GraphArtifactStore.js", () => ({ writeGraphArtifacts }));
+vi.mock("./GraphDistiller.js", () => ({ distillGraph, distillGraphIncremental }));
+vi.mock("./GraphArtifactStore.js", () => ({ writeGraphArtifacts, readGraph }));
 
-import { buildKnowledgeGraph } from "./GraphBuilder.js";
+import { buildKnowledgeGraph, topicFingerprint, topicMetaFingerprint } from "./GraphBuilder.js";
 
 const ISO = "2026-06-15T00:00:00.000Z";
 const CONFIG = { apiKey: "k" };
@@ -36,9 +39,19 @@ const validDistill = {
 };
 
 beforeEach(() => {
-	for (const m of [readTopicIndex, readTopicPage, distillGraph, writeGraphArtifacts]) m.mockReset();
+	for (const m of [
+		readTopicIndex,
+		readTopicPage,
+		distillGraph,
+		distillGraphIncremental,
+		writeGraphArtifacts,
+		readGraph,
+	])
+		m.mockReset();
 	distillGraph.mockResolvedValue(validDistill);
+	distillGraphIncremental.mockResolvedValue(validDistill);
 	writeGraphArtifacts.mockResolvedValue({ graphJsonPath: "/kb/.jolli/graph/graph.json" });
+	readGraph.mockResolvedValue(null); // default: no baseline → full path
 });
 
 describe("buildKnowledgeGraph", () => {
@@ -49,12 +62,13 @@ describe("buildKnowledgeGraph", () => {
 		expect(readTopicIndex).not.toHaveBeenCalled();
 	});
 
-	it("skips when the topic index is empty", async () => {
+	it("skips when the topic index is empty and there is no prior graph", async () => {
 		readTopicIndex.mockResolvedValue({ schemaVersion: 1, topics: [] });
 		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG);
 		expect(r.built).toBe(false);
 		expect(r.reason).toBe("no topics");
 		expect(distillGraph).not.toHaveBeenCalled();
+		expect(writeGraphArtifacts).not.toHaveBeenCalled();
 	});
 
 	it("forwards onProgress to the distiller and reports the write step", async () => {
@@ -205,6 +219,204 @@ describe("buildKnowledgeGraph", () => {
 		expect(t1.sourceCommits).toEqual([{ hash: "cafebabe", message: "" }]);
 	});
 
+	it("derives overview from the first non-heading paragraph (skips a leading markdown heading)", async () => {
+		readTopicIndex.mockResolvedValue({
+			schemaVersion: 1,
+			topics: [{ stableSlug: "t1", title: "T1", summary: "s", lastUpdatedAt: "x" }],
+		});
+		readTopicPage.mockResolvedValue({
+			schemaVersion: 1,
+			stableSlug: "t1",
+			title: "T1",
+			content: "# Heading line\n\nreal first paragraph",
+			lastUpdatedAt: "x",
+		});
+		await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
+		const [, graphArg] = writeGraphArtifacts.mock.calls[0];
+		expect(graphArg.topics.find((t: { slug: string }) => t.slug === "t1").overview).toBe("real first paragraph");
+	});
+
+	// --- incremental path ---------------------------------------------------
+
+	const ONE_TOPIC_INDEX = {
+		schemaVersion: 1,
+		topics: [{ stableSlug: "t1", title: "Topic1", summary: "s1", lastUpdatedAt: "x" }],
+	};
+
+	/** A minimal, field-valid prior graph.json (the incremental baseline). */
+	function baselineGraph(
+		topicFingerprints: Record<string, string>,
+		topicMetaFingerprints: Record<string, string> = {},
+	) {
+		return {
+			schemaVersion: 2,
+			generatedAt: "x",
+			source: "x",
+			topicFingerprints,
+			topicMetaFingerprints,
+			stats: {},
+			categories: [],
+			topics: [],
+			units: [],
+			edges: [],
+		};
+	}
+
+	// Use the real fingerprint fns (not hand-copied formulas) so the skip / reassemble
+	// tests cannot silently go green if the separator/algorithm ever changes.
+	const fpOf = topicFingerprint;
+	const metaOf = (sourceBranches: string[], sourceCommits: { hash: string; message: string }[]) =>
+		topicMetaFingerprint({ sourceBranches, sourceCommits, overview: "", fullBody: "" });
+
+	/** A field-valid baseline that actually carries a distilled t1 topic + unit, so a
+	 *  no-LLM reassemble (metadata drift) and an empty-on-delete have something to act on. */
+	function richBaseline(topicFingerprints: Record<string, string>, topicMetaFingerprints: Record<string, string>) {
+		return {
+			...baselineGraph(topicFingerprints, topicMetaFingerprints),
+			categories: [{ id: "c", shortTitle: "C", summary: "c" }],
+			topics: [{ slug: "t1", shortTitle: "T1", summary: "s", title: "Topic1", categoryId: "c" }],
+			units: [
+				{
+					id: "t1::u1",
+					topicSlug: "t1",
+					kind: "decision",
+					shortTitle: "U1",
+					summary: "s",
+					anchors: { files: [], commits: [] },
+				},
+			],
+			edges: [],
+		};
+	}
+
+	it("takes the incremental path when a valid baseline exists with changed topics", async () => {
+		readTopicIndex.mockResolvedValue(ONE_TOPIC_INDEX);
+		readTopicPage.mockResolvedValue(null);
+		readGraph.mockResolvedValue(baselineGraph({})); // empty baseline → t1 is "added"
+
+		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
+
+		expect(r.built).toBe(true);
+		expect(r.mode).toBe("incremental");
+		expect(distillGraphIncremental).toHaveBeenCalled();
+		expect(distillGraph).not.toHaveBeenCalled();
+	});
+
+	it("skips entirely (no LLM, no write) when both content and metadata fingerprints are unchanged", async () => {
+		readTopicIndex.mockResolvedValue(ONE_TOPIC_INDEX);
+		readTopicPage.mockResolvedValue(null); // content = "", no branches/commits
+		// Baseline matches BOTH the content fingerprint and the (empty) metadata one.
+		readGraph.mockResolvedValue(baselineGraph({ t1: fpOf("Topic1", "s1", "") }, { t1: metaOf([], []) }));
+
+		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
+
+		expect(r.built).toBe(false);
+		expect(r.reason).toBe("no changes");
+		expect(distillGraph).not.toHaveBeenCalled();
+		expect(distillGraphIncremental).not.toHaveBeenCalled();
+		expect(writeGraphArtifacts).not.toHaveBeenCalled();
+	});
+
+	it("reassembles without LLM when content is unchanged but source metadata drifted", async () => {
+		readTopicIndex.mockResolvedValue(ONE_TOPIC_INDEX);
+		// Page present with a NEW commit ref, but the content (→ content fingerprint) is
+		// unchanged from the baseline. Only the join metadata moved.
+		readTopicPage.mockResolvedValue({
+			schemaVersion: 1,
+			stableSlug: "t1",
+			title: "Topic1",
+			content: "",
+			relatedBranches: [],
+			sourceRefs: [{ type: "summary", id: "abcdef120000", timestamp: "x" }],
+			lastUpdatedAt: "x",
+		});
+		// Baseline: same content fingerprint, but EMPTY (different) metadata fingerprint.
+		readGraph.mockResolvedValue(richBaseline({ t1: fpOf("Topic1", "s1", "") }, { t1: metaOf([], []) }));
+
+		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
+
+		expect(r.built).toBe(true);
+		expect(r.mode).toBe("incremental");
+		// No LLM ran (neither distiller), but graph.json WAS rewritten with fresh metadata.
+		expect(distillGraph).not.toHaveBeenCalled();
+		expect(distillGraphIncremental).not.toHaveBeenCalled();
+		expect(writeGraphArtifacts).toHaveBeenCalled();
+		const [, graphArg] = writeGraphArtifacts.mock.calls[0];
+		const t1 = graphArg.topics.find((t: { slug: string }) => t.slug === "t1");
+		expect(t1.sourceCommits).toEqual([{ hash: "abcdef12", message: "" }]); // refreshed
+		expect(t1.commitCount).toBe(1);
+	});
+
+	it("reassembles without LLM when the baseline metadata map has a different key set", async () => {
+		readTopicIndex.mockResolvedValue(ONE_TOPIC_INDEX);
+		readTopicPage.mockResolvedValue(null); // content unchanged
+		// Content fingerprint matches, but the baseline meta map carries an extra stale
+		// key — a size mismatch that must still trigger a refresh (never a false skip).
+		readGraph.mockResolvedValue(
+			richBaseline({ t1: fpOf("Topic1", "s1", "") }, { t1: metaOf([], []), tGhost: metaOf([], []) }),
+		);
+
+		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
+
+		expect(r.built).toBe(true);
+		expect(r.mode).toBe("incremental");
+		expect(distillGraph).not.toHaveBeenCalled();
+		expect(distillGraphIncremental).not.toHaveBeenCalled();
+		expect(writeGraphArtifacts).toHaveBeenCalled();
+	});
+
+	it("reassembles without LLM when the baseline has no metadata fingerprints (older write heals once)", async () => {
+		readTopicIndex.mockResolvedValue(ONE_TOPIC_INDEX);
+		readTopicPage.mockResolvedValue(null);
+		// schemaVersion matches, content fingerprint matches, but topicMetaFingerprints is
+		// absent (corrupt primitive) → treated as drifted → one reassemble heals it.
+		readGraph.mockResolvedValue({
+			...richBaseline({ t1: fpOf("Topic1", "s1", "") }, {}),
+			topicMetaFingerprints: "corrupt",
+		});
+
+		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
+
+		expect(r.built).toBe(true);
+		expect(r.mode).toBe("incremental");
+		expect(writeGraphArtifacts).toHaveBeenCalled();
+	});
+
+	it("rebuilds fully when the baseline schemaVersion does not match", async () => {
+		readTopicIndex.mockResolvedValue(ONE_TOPIC_INDEX);
+		readTopicPage.mockResolvedValue(null);
+		readGraph.mockResolvedValue({ ...baselineGraph({}), schemaVersion: 1 }); // stale schema
+
+		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
+		expect(r.mode).toBe("full");
+		expect(distillGraph).toHaveBeenCalled();
+		expect(distillGraphIncremental).not.toHaveBeenCalled();
+	});
+
+	it("rebuilds fully (one-time heal) when the baseline topicFingerprints are malformed", async () => {
+		readTopicIndex.mockResolvedValue(ONE_TOPIC_INDEX);
+		readTopicPage.mockResolvedValue(null);
+		// schemaVersion matches but topicFingerprints is a corrupt primitive → not a
+		// usable baseline → full (never throws in diffTopics).
+		readGraph.mockResolvedValue({ ...baselineGraph({}), topicFingerprints: "corrupt" });
+
+		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
+		expect(r.mode).toBe("full");
+		expect(distillGraph).toHaveBeenCalled();
+		expect(distillGraphIncremental).not.toHaveBeenCalled();
+	});
+
+	it("rebuilds fully when the baseline is structurally incompatible (toDistilled → null)", async () => {
+		readTopicIndex.mockResolvedValue(ONE_TOPIC_INDEX);
+		readTopicPage.mockResolvedValue(null);
+		// schemaVersion matches but a unit is missing required fields → toDistilled null.
+		readGraph.mockResolvedValue({ ...baselineGraph({}), units: [{ id: "x" }] });
+
+		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
+		expect(r.mode).toBe("full");
+		expect(distillGraph).toHaveBeenCalled();
+	});
+
 	it("falls back to index metadata when a topic page is missing", async () => {
 		readTopicIndex.mockResolvedValue({
 			schemaVersion: 1,
@@ -232,5 +444,23 @@ describe("buildKnowledgeGraph", () => {
 		const t1 = graphArg.topics.find((t: { slug: string }) => t.slug === "t1");
 		expect(t1.sourceBranches).toEqual(["release/1.x"]);
 		expect(t1.sourceCommits).toEqual([{ hash: "deadbeef", message: "" }]);
+	});
+
+	it("writes an empty graph (no LLM) when the last topic is deleted, clearing the stale graph", async () => {
+		readTopicIndex.mockResolvedValue({ schemaVersion: 1, topics: [] }); // all topics gone
+		readGraph.mockResolvedValue(richBaseline({ t1: fpOf("Topic1", "s1", "") }, { t1: metaOf([], []) }));
+
+		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
+
+		expect(r.built).toBe(true);
+		expect(r.mode).toBe("incremental");
+		expect(r).toMatchObject({ topics: 0, units: 0, edges: 0 });
+		// No LLM, but the stale graph IS overwritten with an empty one (no phantom topics).
+		expect(distillGraph).not.toHaveBeenCalled();
+		expect(distillGraphIncremental).not.toHaveBeenCalled();
+		const [, graphArg] = writeGraphArtifacts.mock.calls[0];
+		expect(graphArg.topics).toEqual([]);
+		expect(graphArg.units).toEqual([]);
+		expect(graphArg.categories).toEqual([]);
 	});
 });

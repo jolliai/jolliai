@@ -35,6 +35,7 @@ Thumbs.db
 .claude/
 .kiro/
 .gemini/
+.agents/
 .cursor/
 .codex/
 .opencode/

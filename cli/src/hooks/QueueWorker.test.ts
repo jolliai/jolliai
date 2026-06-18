@@ -334,6 +334,9 @@ vi.mock("../core/IngestPipeline.js", () => ({
 vi.mock("../core/TopicWikiRenderer.js", () => ({
 	renderTopicKBWiki: vi.fn(async () => {}),
 }));
+vi.mock("../graph/GraphBuilder.js", () => ({
+	buildKnowledgeGraph: vi.fn(async () => ({ built: false })),
+}));
 
 vi.mock("../core/IngestRunStore.js", () => ({
 	appendCredentialMissingRun: vi.fn(async () => {}),
@@ -389,6 +392,7 @@ import { generateSummary } from "../core/Summarizer.js";
 import { storeSummary } from "../core/SummaryStore.js";
 import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
+import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { recordPendingWorker, wakePendingWorkers } from "../sync/PendingWorkers.js";
 import { acquireVaultWriteLock } from "../sync/VaultWriteLock.js";
 import type { CommitGitOperation, IngestOperation } from "../Types.js";
@@ -2454,6 +2458,31 @@ describe("QueueWorker", () => {
 
 			expect(vi.mocked(drainIngest)).toHaveBeenCalledOnce();
 			expect(vi.mocked(renderTopicKBWiki)).toHaveBeenCalledOnce();
+			// The knowledge graph is refreshed right after the wiki, on the same gate.
+			expect(vi.mocked(buildKnowledgeGraph)).toHaveBeenCalledOnce();
+		});
+
+		it("isolates a knowledge-graph build failure (non-fatal: wiki/ingest still succeed)", async () => {
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 2, outcome: "OK", topicFailures: [] });
+			vi.mocked(buildKnowledgeGraph).mockRejectedValueOnce(new Error("graph boom"));
+
+			const op = makeIngestOp("post-merge");
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
+				.mockResolvedValueOnce([]);
+
+			// Must not throw despite the graph build rejecting.
+			await expect(runWorker("/test/cwd")).resolves.not.toThrow();
+			expect(vi.mocked(renderTopicKBWiki)).toHaveBeenCalledOnce();
+			expect(vi.mocked(buildKnowledgeGraph)).toHaveBeenCalledOnce();
+			// The INNER graph try/catch handled it — proven by the graph-specific WARN
+			// firing while the OUTER ingest-phase catch's ERROR does NOT. Without the
+			// inner catch the throw would bubble to that outer catch and this would
+			// flip, so these two assertions are what make the inner isolation
+			// load-bearing rather than redundant with the outer handler.
+			expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("Knowledge graph build failed"));
+			expect(console.error).not.toHaveBeenCalledWith(expect.stringContaining("Unlocked ingest phase failed"));
 		});
 
 		it("releases the entry-level vault-write.lock before running the ingest LLM phase", async () => {
@@ -2566,6 +2595,8 @@ describe("QueueWorker", () => {
 
 			expect(vi.mocked(drainIngest)).toHaveBeenCalledOnce();
 			expect(vi.mocked(renderTopicKBWiki)).not.toHaveBeenCalled();
+			// Graph is gated identically — no wiki render, no graph build.
+			expect(vi.mocked(buildKnowledgeGraph)).not.toHaveBeenCalled();
 		});
 
 		it("re-renders the wiki when ingested=0 but the visible wiki was deleted", async () => {

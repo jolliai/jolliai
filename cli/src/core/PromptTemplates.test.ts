@@ -39,6 +39,7 @@ describe("PromptTemplates", () => {
 			"route",
 			"reconcile",
 			"graph-categories",
+			"graph-categories-delta",
 			"graph-units",
 			"graph-edges",
 		]);
