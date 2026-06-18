@@ -14,6 +14,7 @@ const { info, warn, error, debug } = vi.hoisted(() => ({
 type QuickPickController = {
 	qp: {
 		value: string;
+		title: string;
 		placeholder: string;
 		items: Array<{ label: string }>;
 		selectedItems: Array<{ label: string }>;
@@ -108,11 +109,50 @@ vi.mock("../util/Logger.js", () => ({
 
 import { CommitCommand } from "./CommitCommand.js";
 
+/** Default "amend is safe" availability passed to the QuickPick presenter. */
+const AMEND_ALLOWED = { allowed: true, reason: "" } as const;
+
+/**
+ * Calls the private showCommitQuickPick presenter. Defaults `amend` to allowed
+ * so existing tests exercise the full three-action picker.
+ */
+function showPick(
+	command: CommitCommand,
+	message: string,
+	amend: { allowed: boolean; reason: string } = AMEND_ALLOWED,
+): Promise<{ item: { label: string }; message: string } | undefined> {
+	return (
+		command as unknown as {
+			showCommitQuickPick: (
+				m: string,
+				a: { allowed: boolean; reason: string },
+			) => Promise<{ item: { label: string }; message: string } | undefined>;
+		}
+	).showCommitQuickPick(message, amend);
+}
+
+/** Calls the private executeCommitAction. */
+function runAction(
+	command: CommitCommand,
+	item: { label: string } | undefined,
+	message: string | undefined,
+): Promise<void> {
+	return (
+		command as unknown as {
+			executeCommitAction: (
+				i: { label: string } | undefined,
+				m: string | undefined,
+			) => Promise<void>;
+		}
+	).executeCommitAction(item, message);
+}
+
 function makeDeps() {
 	const bridge = {
 		generateCommitMessage: vi.fn(async () => "feat: generated"),
 		commit: vi.fn().mockResolvedValue(undefined),
 		amendCommit: vi.fn().mockResolvedValue(undefined),
+		amendCommitNoEdit: vi.fn().mockResolvedValue(undefined),
 		saveIndexTree: vi.fn(async () => "tree-sha"),
 		restoreIndexTree: vi.fn().mockResolvedValue(undefined),
 		getStagedFilePaths: vi.fn(async () => []),
@@ -122,6 +162,11 @@ function makeDeps() {
 		getHEADHash: vi.fn(async () => "abcdef1234567890"),
 		getHEADMessage: vi.fn(async () => "Part of PROJ-123: existing"),
 		getStatus: vi.fn(async () => ({ enabled: true })),
+		// Amend is safe by default — own commit, authored by the current user.
+		getAmendSafety: vi.fn(async () => ({
+			hasOwnCommits: true,
+			headAuthoredByCurrentUser: true,
+		})),
 	};
 	const defaultFiles = [
 		{
@@ -161,6 +206,7 @@ function makeDeps() {
 	const commitsStore = {
 		refresh: vi.fn().mockResolvedValue(undefined),
 		getSelectionDebugInfo: vi.fn(() => ({ checkedHashes: [] })),
+		getMainBranch: vi.fn(() => "main"),
 	};
 	const statusStore = {
 		refresh: vi.fn().mockResolvedValue(undefined),
@@ -169,6 +215,17 @@ function makeDeps() {
 		update: vi.fn(),
 	};
 	return { bridge, filesStore, commitsStore, statusStore, statusBar };
+}
+
+function makeCommand(deps: ReturnType<typeof makeDeps>): CommitCommand {
+	return new CommitCommand(
+		deps.bridge as never,
+		deps.filesStore as never,
+		deps.commitsStore as never,
+		deps.statusStore as never,
+		deps.statusBar as never,
+		"/repo",
+	);
 }
 
 describe("CommitCommand", () => {
@@ -189,14 +246,7 @@ describe("CommitCommand", () => {
 	it("stops immediately when the worker lock is held", async () => {
 		isWorkerBlockingBusy.mockResolvedValue(true);
 		const deps = makeDeps();
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
 		await command.execute();
 
@@ -215,14 +265,7 @@ describe("CommitCommand", () => {
 			.mockResolvedValueOnce(false)
 			.mockResolvedValueOnce(true);
 		const deps = makeDeps();
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 		vi.spyOn(command as never, "showCommitQuickPick").mockResolvedValue({
 			item: { label: "$(check) Commit" },
 			message: "feat: generated",
@@ -242,14 +285,7 @@ describe("CommitCommand", () => {
 	it("warns when nothing is selected", async () => {
 		const deps = makeDeps();
 		deps.filesStore.getSelectedFiles.mockReturnValue([]);
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
 		await command.execute();
 
@@ -261,14 +297,7 @@ describe("CommitCommand", () => {
 	it("surfaces commit message generation failures", async () => {
 		const deps = makeDeps();
 		deps.bridge.generateCommitMessage.mockRejectedValue(new Error("api down"));
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
 		await command.execute();
 
@@ -279,22 +308,9 @@ describe("CommitCommand", () => {
 
 	it("shows the quick pick, accepts the first action, and trims the message", async () => {
 		const deps = makeDeps();
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
-		const promise = (
-			command as unknown as {
-				showCommitQuickPick: (
-					message: string,
-				) => Promise<{ item: { label: string }; message: string } | undefined>;
-			}
-		).showCommitQuickPick("  feat: generated  ");
+		const promise = showPick(command, "  feat: generated  ");
 		const controller = queueQuickPick();
 		(controller as NonNullable<typeof controller>).qp.selectedItems = [];
 		controller?.accept?.();
@@ -307,31 +323,64 @@ describe("CommitCommand", () => {
 		expect(controller?.qp.dispose).toHaveBeenCalled();
 	});
 
-	it("returns undefined when the quick pick is dismissed or blank", async () => {
+	it("offers all three actions and the default title when amend is allowed", async () => {
 		const deps = makeDeps();
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
+		const command = makeCommand(deps);
+
+		const promise = showPick(command, "feat: generated");
+		const controller = queueQuickPick();
+		const qp = controller as NonNullable<typeof controller>;
+
+		expect(qp.qp.items).toHaveLength(3);
+		expect(qp.qp.title).toBe(
+			"Edit the commit message, then select an action",
 		);
 
-		const dismissed = (
-			command as unknown as {
-				showCommitQuickPick: (message: string) => Promise<unknown>;
-			}
-		).showCommitQuickPick("feat: generated");
+		qp.accept?.();
+		await promise;
+	});
+
+	it("hides the amend actions and titles the reason when amend is unsafe", async () => {
+		const deps = makeDeps();
+		const command = makeCommand(deps);
+
+		const promise = showPick(command, "feat: generated", {
+			allowed: false,
+			reason: "this branch has no commit of yours to amend",
+		});
+		const controller = queueQuickPick();
+		const qp = controller as NonNullable<typeof controller>;
+
+		// Only Commit remains — Amend actions are removed, not greyed out.
+		expect(qp.qp.items).toHaveLength(1);
+		expect(qp.qp.items[0].label).toContain("Commit");
+		expect(
+			qp.qp.items.some((i) => /Amend/i.test(i.label)),
+		).toBe(false);
+		expect(qp.qp.title).toBe(
+			"Only Commit is available — this branch has no commit of yours to amend",
+		);
+
+		// onDidChangeActive must not overwrite the explanatory title.
+		qp.changeActive?.([qp.qp.items[0]]);
+		expect(qp.qp.title).toBe(
+			"Only Commit is available — this branch has no commit of yours to amend",
+		);
+
+		qp.accept?.();
+		await promise;
+	});
+
+	it("returns undefined when the quick pick is dismissed or blank", async () => {
+		const deps = makeDeps();
+		const command = makeCommand(deps);
+
+		const dismissed = showPick(command, "feat: generated");
 		const dismissedController = queueQuickPick();
 		dismissedController?.hide?.();
 		await expect(dismissed).resolves.toBeUndefined();
 
-		const blank = (
-			command as unknown as {
-				showCommitQuickPick: (message: string) => Promise<unknown>;
-			}
-		).showCommitQuickPick("feat: generated");
+		const blank = showPick(command, "feat: generated");
 		const blankController = queueQuickPick();
 		(blankController as NonNullable<typeof blankController>).qp.value = "   ";
 		blankController?.accept?.();
@@ -341,22 +390,9 @@ describe("CommitCommand", () => {
 	it("amends commits with the new message (no merge) and warns when the original was pushed", async () => {
 		const deps = makeDeps();
 		deps.bridge.isHeadPushed.mockResolvedValue(true);
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
-		const quickPickPromise = (
-			command as unknown as {
-				showCommitQuickPick: (
-					message: string,
-				) => Promise<{ item: { label: string }; message: string } | undefined>;
-			}
-		).showCommitQuickPick("Part of PROJ-123: new change");
+		const quickPickPromise = showPick(command, "Part of PROJ-123: new change");
 		const controller = queueQuickPick();
 		(controller as NonNullable<typeof controller>).qp.selectedItems = [
 			controller?.qp.items[1],
@@ -364,14 +400,7 @@ describe("CommitCommand", () => {
 		controller?.accept?.();
 		const selected = await quickPickPromise;
 
-		await (
-			command as unknown as {
-				executeCommitAction: (
-					item: { label: string },
-					message: string,
-				) => Promise<void>;
-			}
-		).executeCommitAction(selected?.item, selected?.message);
+		await runAction(command, selected?.item, selected?.message);
 
 		// Amend now uses the new message directly without merging with the old one
 		expect(deps.bridge.amendCommit).toHaveBeenCalledWith(
@@ -385,14 +414,7 @@ describe("CommitCommand", () => {
 	it("shows an error when executeCommitAction throws", async () => {
 		const deps = makeDeps();
 		deps.bridge.commit.mockRejectedValue(new Error("git index locked"));
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 		vi.spyOn(command as never, "showCommitQuickPick").mockResolvedValue({
 			item: { label: "$(check) Commit" },
 			message: "feat: generated",
@@ -408,24 +430,11 @@ describe("CommitCommand", () => {
 
 	it("does not resolve twice when onDidHide fires after onDidAccept", async () => {
 		const deps = makeDeps();
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
-		const promise = (
-			command as unknown as {
-				showCommitQuickPick: (
-					message: string,
-				) => Promise<{ item: { label: string }; message: string } | undefined>;
-			}
-		).showCommitQuickPick("feat: test");
+		const promise = showPick(command, "feat: test");
 		const controller = queueQuickPick();
-		// Accept first, then hide — exercises lines 170-171 (accepted=true early return)
+		// Accept first, then hide — exercises the accepted=true early return
 		controller?.accept?.();
 		controller?.hide?.();
 
@@ -439,22 +448,11 @@ describe("CommitCommand", () => {
 
 	it("resolves undefined when QuickPick is dismissed via onDidHide before accept", async () => {
 		const deps = makeDeps();
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
-		const promise = (
-			command as unknown as {
-				showCommitQuickPick: (message: string) => Promise<unknown>;
-			}
-		).showCommitQuickPick("feat: test");
+		const promise = showPick(command, "feat: test");
 		const controller = queueQuickPick();
-		// Simulate hide without prior accept — exercises lines 170-171
+		// Simulate hide without prior accept
 		controller?.hide?.();
 
 		await expect(promise).resolves.toBeUndefined();
@@ -463,14 +461,7 @@ describe("CommitCommand", () => {
 
 	it("returns early when the QuickPick is cancelled during execute()", async () => {
 		const deps = makeDeps();
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 		// Mock showCommitQuickPick to return undefined (user cancelled)
 		vi.spyOn(command as never, "showCommitQuickPick").mockResolvedValue(
 			undefined,
@@ -492,14 +483,7 @@ describe("CommitCommand", () => {
 	it("coerces non-Error thrown from generateCommitMessage to string", async () => {
 		const deps = makeDeps();
 		deps.bridge.generateCommitMessage.mockRejectedValue("plain string error");
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
 		await command.execute();
 
@@ -511,14 +495,7 @@ describe("CommitCommand", () => {
 	it("coerces non-Error thrown from executeCommitAction to string", async () => {
 		const deps = makeDeps();
 		deps.bridge.commit.mockRejectedValue(42);
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 		vi.spyOn(command as never, "showCommitQuickPick").mockResolvedValue({
 			item: { label: "$(check) Commit" },
 			message: "feat: generated",
@@ -534,22 +511,9 @@ describe("CommitCommand", () => {
 	it("amends with new message directly (no merge), no push warning when not pushed", async () => {
 		const deps = makeDeps();
 		deps.bridge.isHeadPushed.mockResolvedValue(false);
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
-		const quickPickPromise = (
-			command as unknown as {
-				showCommitQuickPick: (
-					message: string,
-				) => Promise<{ item: { label: string }; message: string } | undefined>;
-			}
-		).showCommitQuickPick("feat: new");
+		const quickPickPromise = showPick(command, "feat: new");
 		const controller = queueQuickPick();
 		(controller as NonNullable<typeof controller>).qp.selectedItems = [
 			controller?.qp.items[1],
@@ -557,14 +521,7 @@ describe("CommitCommand", () => {
 		controller?.accept?.();
 		const selected = await quickPickPromise;
 
-		await (
-			command as unknown as {
-				executeCommitAction: (
-					item: { label: string },
-					message: string,
-				) => Promise<void>;
-			}
-		).executeCommitAction(selected?.item, selected?.message);
+		await runAction(command, selected?.item, selected?.message);
 
 		expect(deps.bridge.amendCommit).toHaveBeenCalledWith("feat: new");
 		// wasPushed is false, so no push warning
@@ -573,24 +530,10 @@ describe("CommitCommand", () => {
 
 	it("amend no-edit keeps previous message and calls amendCommitNoEdit", async () => {
 		const deps = makeDeps();
-		deps.bridge.amendCommitNoEdit = vi.fn().mockResolvedValue(undefined);
 		deps.bridge.isHeadPushed.mockResolvedValue(false);
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
-		const quickPickPromise = (
-			command as unknown as {
-				showCommitQuickPick: (
-					message: string,
-				) => Promise<{ item: { label: string }; message: string } | undefined>;
-			}
-		).showCommitQuickPick("feat: ignored");
+		const quickPickPromise = showPick(command, "feat: ignored");
 		const controller = queueQuickPick();
 		// Select the third item (Amend, keep message)
 		(controller as NonNullable<typeof controller>).qp.selectedItems = [
@@ -599,14 +542,7 @@ describe("CommitCommand", () => {
 		controller?.accept?.();
 		const selected = await quickPickPromise;
 
-		await (
-			command as unknown as {
-				executeCommitAction: (
-					item: { label: string },
-					message: string,
-				) => Promise<void>;
-			}
-		).executeCommitAction(selected?.item, selected?.message);
+		await runAction(command, selected?.item, selected?.message);
 
 		expect(deps.bridge.amendCommitNoEdit).toHaveBeenCalled();
 		expect(deps.bridge.amendCommit).not.toHaveBeenCalled();
@@ -615,24 +551,10 @@ describe("CommitCommand", () => {
 
 	it("amend no-edit warns when the original was pushed", async () => {
 		const deps = makeDeps();
-		deps.bridge.amendCommitNoEdit = vi.fn().mockResolvedValue(undefined);
 		deps.bridge.isHeadPushed.mockResolvedValue(true);
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
-		const quickPickPromise = (
-			command as unknown as {
-				showCommitQuickPick: (
-					message: string,
-				) => Promise<{ item: { label: string }; message: string } | undefined>;
-			}
-		).showCommitQuickPick("feat: ignored");
+		const quickPickPromise = showPick(command, "feat: ignored");
 		const controller = queueQuickPick();
 		(controller as NonNullable<typeof controller>).qp.selectedItems = [
 			controller?.qp.items[2],
@@ -640,14 +562,7 @@ describe("CommitCommand", () => {
 		controller?.accept?.();
 		const selected = await quickPickPromise;
 
-		await (
-			command as unknown as {
-				executeCommitAction: (
-					item: { label: string },
-					message: string,
-				) => Promise<void>;
-			}
-		).executeCommitAction(selected?.item, selected?.message);
+		await runAction(command, selected?.item, selected?.message);
 
 		expect(deps.bridge.amendCommitNoEdit).toHaveBeenCalled();
 		expect(showInformationMessage).toHaveBeenCalledWith(
@@ -657,23 +572,9 @@ describe("CommitCommand", () => {
 
 	it("amend no-edit resolves even when input is empty", async () => {
 		const deps = makeDeps();
-		deps.bridge.amendCommitNoEdit = vi.fn().mockResolvedValue(undefined);
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
-		const quickPickPromise = (
-			command as unknown as {
-				showCommitQuickPick: (
-					message: string,
-				) => Promise<{ item: { label: string }; message: string } | undefined>;
-			}
-		).showCommitQuickPick("feat: something");
+		const quickPickPromise = showPick(command, "feat: something");
 		const controller = queueQuickPick();
 		// Clear the input and select amend no-edit — should NOT cancel
 		(controller as NonNullable<typeof controller>).qp.value = "";
@@ -692,22 +593,9 @@ describe("CommitCommand", () => {
 		const deps = makeDeps();
 		deps.bridge.isHeadPushed.mockRejectedValue(new Error("fail"));
 		deps.bridge.getHEADHash.mockRejectedValue(new Error("fail"));
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
-		const quickPickPromise = (
-			command as unknown as {
-				showCommitQuickPick: (
-					message: string,
-				) => Promise<{ item: { label: string }; message: string } | undefined>;
-			}
-		).showCommitQuickPick("feat: new");
+		const quickPickPromise = showPick(command, "feat: new");
 		const controller = queueQuickPick();
 		(controller as NonNullable<typeof controller>).qp.selectedItems = [
 			controller?.qp.items[1],
@@ -715,30 +603,120 @@ describe("CommitCommand", () => {
 		controller?.accept?.();
 		const selected = await quickPickPromise;
 
-		await (
-			command as unknown as {
-				executeCommitAction: (
-					item: { label: string },
-					message: string,
-				) => Promise<void>;
-			}
-		).executeCommitAction(selected?.item, selected?.message);
+		await runAction(command, selected?.item, selected?.message);
 
 		// isHeadPushed catch returns false, getHEADHash catch returns ""
 		expect(deps.bridge.amendCommit).toHaveBeenCalledWith("feat: new");
 	});
 
+	// ── Amend gating (getAmendSafety) ────────────────────────────────────────
+
+	it("gates the QuickPick to Commit-only when the branch has no commit of its own", async () => {
+		const deps = makeDeps();
+		deps.bridge.getAmendSafety.mockResolvedValue({
+			hasOwnCommits: false,
+			headAuthoredByCurrentUser: true,
+		});
+		const command = makeCommand(deps);
+		const spy = vi
+			.spyOn(command as never, "showCommitQuickPick")
+			.mockResolvedValue(undefined);
+
+		await command.execute();
+
+		expect(deps.bridge.getAmendSafety).toHaveBeenCalledWith("main");
+		expect(spy).toHaveBeenCalledWith("feat: generated", {
+			allowed: false,
+			reason: "this branch has no commit of yours to amend",
+		});
+	});
+
+	it("gates the QuickPick when the latest commit was authored by someone else", async () => {
+		const deps = makeDeps();
+		deps.bridge.getAmendSafety.mockResolvedValue({
+			hasOwnCommits: true,
+			headAuthoredByCurrentUser: false,
+		});
+		const command = makeCommand(deps);
+		const spy = vi
+			.spyOn(command as never, "showCommitQuickPick")
+			.mockResolvedValue(undefined);
+
+		await command.execute();
+
+		expect(spy).toHaveBeenCalledWith("feat: generated", {
+			allowed: false,
+			reason: "the latest commit was authored by someone else",
+		});
+	});
+
+	it("treats an undeterminable amend safety as unsafe", async () => {
+		const deps = makeDeps();
+		deps.bridge.getAmendSafety.mockRejectedValue(new Error("no HEAD"));
+		const command = makeCommand(deps);
+		const spy = vi
+			.spyOn(command as never, "showCommitQuickPick")
+			.mockResolvedValue(undefined);
+
+		await command.execute();
+
+		expect(spy).toHaveBeenCalledWith("feat: generated", {
+			allowed: false,
+			reason: "this branch has no commit of yours to amend",
+		});
+	});
+
+	it("allows the amend actions when HEAD is the user's own branch commit", async () => {
+		const deps = makeDeps();
+		const command = makeCommand(deps);
+		const spy = vi
+			.spyOn(command as never, "showCommitQuickPick")
+			.mockResolvedValue(undefined);
+
+		await command.execute();
+
+		expect(spy).toHaveBeenCalledWith("feat: generated", {
+			allowed: true,
+			reason: "",
+		});
+	});
+
+	it("blocks amend at execute time when a fresh safety check finds it unamendable", async () => {
+		// Simulates the race / qp.items[0] fallback: the picker yields the real
+		// Amend item, but a fresh safety check finds the commit is not amendable.
+		const deps = makeDeps();
+		deps.bridge.getAmendSafety.mockResolvedValue({
+			hasOwnCommits: false,
+			headAuthoredByCurrentUser: true,
+		});
+		const command = makeCommand(deps);
+
+		const quickPickPromise = showPick(command, "feat: rewrite");
+		const controller = queueQuickPick();
+		(controller as NonNullable<typeof controller>).qp.selectedItems = [
+			controller?.qp.items[1], // real ITEM_AMEND reference
+		];
+		controller?.accept?.();
+		const selected = await quickPickPromise;
+
+		await expect(
+			runAction(command, selected?.item, selected?.message),
+		).rejects.toThrow(
+			"Amend is unavailable — this branch has no commit of yours to amend. Use Commit to create a new commit instead.",
+		);
+		expect(deps.bridge.amendCommit).not.toHaveBeenCalled();
+		expect(deps.bridge.isHeadPushed).not.toHaveBeenCalled();
+		expect(warn).toHaveBeenCalledWith(
+			"commit",
+			"Amend blocked at execute time",
+			{ reason: "this branch has no commit of yours to amend" },
+		);
+	});
+
 	it("handles getHEADHash catch in refreshAll", async () => {
 		const deps = makeDeps();
 		deps.bridge.getHEADHash.mockRejectedValue(new Error("hash fail"));
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 		vi.spyOn(command as never, "showCommitQuickPick").mockResolvedValue({
 			item: { label: "$(check) Commit" },
 			message: "feat: generated",
@@ -753,14 +731,7 @@ describe("CommitCommand", () => {
 
 	it("refreshes files/history/status and updates the status bar after success", async () => {
 		const deps = makeDeps();
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 		vi.spyOn(command as never, "showCommitQuickPick").mockResolvedValue({
 			item: { label: "$(check) Commit" },
 			message: "feat: generated",
@@ -785,14 +756,7 @@ describe("CommitCommand", () => {
 				"Unresolved conflict markers in: bad.ts. Please resolve conflict markers before committing.",
 			),
 		);
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
 		await command.execute();
 
@@ -809,14 +773,7 @@ describe("CommitCommand", () => {
 		deps.bridge.saveIndexTree.mockRejectedValue(
 			new Error("fatal: git-write-tree: error building trees"),
 		);
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
 		await command.execute();
 
@@ -835,14 +792,7 @@ describe("CommitCommand", () => {
 				"Unresolved conflict markers in: x.ts. Please resolve conflict markers before committing.",
 			),
 		);
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
 		await command.execute();
 
@@ -852,14 +802,7 @@ describe("CommitCommand", () => {
 	it("shows error and restores index when stageFiles rejects during index preparation", async () => {
 		const deps = makeDeps();
 		deps.bridge.stageFiles.mockRejectedValue(new Error("cannot stage"));
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
 		await command.execute();
 
@@ -875,14 +818,7 @@ describe("CommitCommand", () => {
 		const deps = makeDeps();
 		// "extra.ts" was staged before commit but is not in selectedPaths (["a.ts"])
 		deps.bridge.getStagedFilePaths.mockResolvedValue(["a.ts", "extra.ts"]);
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 		vi.spyOn(command as never, "showCommitQuickPick").mockResolvedValue({
 			item: { label: "$(check) Commit" },
 			message: "feat: generated",
@@ -918,14 +854,7 @@ describe("CommitCommand", () => {
 			}
 			return Promise.resolve();
 		});
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 		vi.spyOn(command as never, "showCommitQuickPick").mockResolvedValue({
 			item: { label: "$(check) Commit" },
 			message: "feat: generated",
@@ -948,14 +877,7 @@ describe("CommitCommand", () => {
 		deps.bridge.restoreIndexTree.mockRejectedValue(new Error("restore failed"));
 		// Make generateCommitMessage fail so restoreIndex gets called
 		deps.bridge.generateCommitMessage.mockRejectedValue(new Error("api down"));
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
 		await command.execute();
 
@@ -966,34 +888,21 @@ describe("CommitCommand", () => {
 
 	it("updates QuickPick title when onDidChangeActive highlights amend-no-edit", async () => {
 		const deps = makeDeps();
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
-		const promise = (
-			command as unknown as {
-				showCommitQuickPick: (
-					message: string,
-				) => Promise<{ item: { label: string }; message: string } | undefined>;
-			}
-		).showCommitQuickPick("feat: test");
+		const promise = showPick(command, "feat: test");
 		const controller = queueQuickPick();
 		const qp = controller as NonNullable<typeof controller>;
 
 		// Simulate highlighting the "Amend, keep message" item
 		qp.changeActive?.([qp.qp.items[2]]);
-		expect((qp.qp as unknown as { title: string }).title).toBe(
+		expect(qp.qp.title).toBe(
 			"Input will be ignored — reuses last commit message",
 		);
 
 		// Simulate highlighting a non-amend-no-edit item
 		qp.changeActive?.([qp.qp.items[0]]);
-		expect((qp.qp as unknown as { title: string }).title).toBe(
+		expect(qp.qp.title).toBe(
 			"Edit the commit message, then select an action",
 		);
 
@@ -1005,14 +914,7 @@ describe("CommitCommand", () => {
 	it("coerces non-Error thrown from saveIndexTree to string", async () => {
 		const deps = makeDeps();
 		deps.bridge.saveIndexTree.mockRejectedValue("plain string index error");
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
 		await command.execute();
 
@@ -1033,14 +935,7 @@ describe("CommitCommand", () => {
 				worktreeStatus: " ",
 			},
 		]);
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 		vi.spyOn(command as never, "showCommitQuickPick").mockResolvedValue({
 			item: { label: "$(check) Commit" },
 			message: "feat: generated",
@@ -1055,14 +950,7 @@ describe("CommitCommand", () => {
 	it("coerces non-Error thrown from stageFiles during index preparation to string", async () => {
 		const deps = makeDeps();
 		deps.bridge.stageFiles.mockRejectedValue(42);
-		const command = new CommitCommand(
-			deps.bridge as never,
-			deps.filesStore as never,
-			deps.commitsStore as never,
-			deps.statusStore as never,
-			deps.statusBar as never,
-			"/repo",
-		);
+		const command = makeCommand(deps);
 
 		await command.execute();
 

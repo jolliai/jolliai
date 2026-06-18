@@ -53,6 +53,13 @@ const DEFAULT_TITLE = "Edit the commit message, then select an action";
 const AMEND_NO_EDIT_TITLE =
 	"Input will be ignored — reuses last commit message";
 
+/** Whether the Amend actions may be offered, plus a reason when they may not. */
+interface AmendAvailability {
+	readonly allowed: boolean;
+	/** Empty when allowed; a user-facing clause (no leading capital) when not. */
+	readonly reason: string;
+}
+
 // ─── CommitCommand ────────────────────────────────────────────────────────────
 
 export class CommitCommand {
@@ -162,9 +169,12 @@ export class CommitCommand {
 			return;
 		}
 
-		// Step 4: Show QuickPick at top of screen
-		log.info("commit", "Showing QuickPick");
-		const selected = await this.showCommitQuickPick(generatedMessage);
+		// Step 4: Show QuickPick at top of screen. Gate the Amend actions: on a
+		// branch with no commit of its own (or whose tip is someone else's),
+		// amending would rewrite a commit shared with the base branch.
+		const amend = await this.resolveAmendAvailability();
+		log.info("commit", "Showing QuickPick", { amendAllowed: amend.allowed });
+		const selected = await this.showCommitQuickPick(generatedMessage, amend);
 		if (!selected) {
 			log.info("commit", "QuickPick cancelled by user — restoring index");
 			await this.restoreIndex(originalIndexTree);
@@ -257,15 +267,50 @@ export class CommitCommand {
 		}
 	}
 
+	/**
+	 * Decides whether the Amend actions may be offered for the current HEAD.
+	 *
+	 * Unsafe when the branch has no commit of its own (HEAD is the base branch's
+	 * tip) or the tip was authored by someone else — amending either rewrites a
+	 * commit shared with the base branch. A failure to determine safety (e.g. an
+	 * empty repo with no HEAD) is treated as unsafe: there is nothing to amend.
+	 */
+	private async resolveAmendAvailability(): Promise<AmendAvailability> {
+		const safety = await this.bridge
+			.getAmendSafety(this.commitsStore.getMainBranch())
+			.catch(() => undefined);
+		if (!safety || !safety.hasOwnCommits) {
+			return {
+				allowed: false,
+				reason: "this branch has no commit of yours to amend",
+			};
+		}
+		if (!safety.headAuthoredByCurrentUser) {
+			return {
+				allowed: false,
+				reason: "the latest commit was authored by someone else",
+			};
+		}
+		return { allowed: true, reason: "" };
+	}
+
 	private showCommitQuickPick(
 		generatedMessage: string,
+		amend: AmendAvailability,
 	): Promise<{ item: vscode.QuickPickItem; message: string } | undefined> {
 		return new Promise((resolve) => {
 			const qp = vscode.window.createQuickPick<vscode.QuickPickItem>();
 			qp.value = generatedMessage;
-			qp.title = DEFAULT_TITLE;
+			// Hide the Amend actions entirely when unsafe — VS Code QuickPickItem
+			// has no "disabled" state, so a greyed item would still be selectable.
+			// Surface the reason in the title so the absence isn't mysterious.
+			qp.title = amend.allowed
+				? DEFAULT_TITLE
+				: `Only Commit is available — ${amend.reason}`;
 			qp.placeholder = "Edit the commit message, then select an action";
-			qp.items = [ITEM_COMMIT, ITEM_AMEND, ITEM_AMEND_NO_EDIT];
+			qp.items = amend.allowed
+				? [ITEM_COMMIT, ITEM_AMEND, ITEM_AMEND_NO_EDIT]
+				: [ITEM_COMMIT];
 
 			// Disable filtering so the input text is used as a free-form commit
 			// message, not as a filter query. Without this, the commit message
@@ -277,13 +322,16 @@ export class CommitCommand {
 			qp.matchOnDescription = false;
 			qp.matchOnDetail = false;
 
-			// Update title dynamically when the user highlights a different action
-			qp.onDidChangeActive((active) => {
-				qp.title =
-					active[0] === ITEM_AMEND_NO_EDIT
-						? AMEND_NO_EDIT_TITLE
-						: DEFAULT_TITLE;
-			});
+			// Update title dynamically when the user highlights a different action.
+			// Skip while Amend is hidden so the "Only Commit is available" title stays.
+			if (amend.allowed) {
+				qp.onDidChangeActive((active) => {
+					qp.title =
+						active[0] === ITEM_AMEND_NO_EDIT
+							? AMEND_NO_EDIT_TITLE
+							: DEFAULT_TITLE;
+				});
+			}
 
 			log.debug("quickpick", "Commit QuickPick shown", {
 				value: generatedMessage,
@@ -328,6 +376,20 @@ export class CommitCommand {
 		message: string,
 	): Promise<void> {
 		if (item === ITEM_AMEND || item === ITEM_AMEND_NO_EDIT) {
+			// Defensive re-check: the QuickPick hides Amend when unsafe, but state
+			// can change between opening the picker and accepting (and qp.items[0]
+			// is used as a fallback selection). Refuse to rewrite a commit this
+			// branch did not create — let execute()'s catch restore the index.
+			const amend = await this.resolveAmendAvailability();
+			if (!amend.allowed) {
+				log.warn("commit", "Amend blocked at execute time", {
+					reason: amend.reason,
+				});
+				throw new Error(
+					`Amend is unavailable — ${amend.reason}. Use Commit to create a new commit instead.`,
+				);
+			}
+
 			// Check if HEAD is pushed BEFORE amend (hash changes after amend)
 			const wasPushed = await this.bridge.isHeadPushed().catch(() => false);
 			const headBeforeAmend = await this.bridge.getHEADHash().catch(() => "");

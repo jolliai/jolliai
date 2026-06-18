@@ -102,6 +102,7 @@ import {
 	removePlan,
 } from "./core/PlanService.js";
 import type {
+	AmendSafety,
 	BranchCommit,
 	BranchCommitsResult,
 	CommitFileInfo,
@@ -1206,6 +1207,48 @@ export class JolliMemoryBridge {
 		);
 		const unpushedHashes = new Set(unpushedOutput.split("\n").filter(Boolean));
 		return !unpushedHashes.has(headHash);
+	}
+
+	/**
+	 * Reports whether amending HEAD is safe — i.e. HEAD is a commit this branch
+	 * created and the current user authored.
+	 *
+	 * `git commit --amend` always rewrites HEAD in place. On a branch freshly
+	 * created from `main` with no commits of its own, HEAD is still the base
+	 * branch's tip (often authored by someone else): amending it rewrites that
+	 * shared commit, keeps its original author (amend preserves author by
+	 * default), and the post-rewrite memory pipeline inherits that commit's
+	 * summary onto the new hash. The Commit QuickPick uses this to hide the
+	 * Amend actions when unsafe.
+	 *
+	 * `hasOwnCommits` uses the same base ref and `merge-base HEAD <base>` as
+	 * `listBranchCommits`: HEAD equal to the merge-base means the branch has no
+	 * diverging commit to amend. The two differ at one boundary — an empty
+	 * merge-base (no common ancestor, or no resolvable base ref) is counted here
+	 * as own work (amend allowed), since there is no shared commit to clobber;
+	 * the author check below is the real backstop for the "someone else's tip"
+	 * case the gate exists to prevent.
+	 */
+	async getAmendSafety(mainBranch: string): Promise<AmendSafety> {
+		const headHash = await this.getHEADHash();
+		const baseRef = await this.resolveHistoryBaseRef(mainBranch);
+		const mergeBase = (
+			await tryExecGit(["merge-base", "HEAD", baseRef], this.cwd)
+		).trim();
+		const hasOwnCommits = mergeBase !== headHash;
+
+		const headAuthorEmail = (
+			await tryExecGit(["log", "-1", "--pretty=format:%ae"], this.cwd)
+		).trim();
+		const currentUserEmail = (
+			await tryExecGit(["config", "user.email"], this.cwd)
+		).trim();
+		const headAuthoredByCurrentUser =
+			headAuthorEmail !== "" &&
+			currentUserEmail !== "" &&
+			headAuthorEmail.toLowerCase() === currentUserEmail.toLowerCase();
+
+		return { hasOwnCommits, headAuthoredByCurrentUser };
 	}
 
 	/**

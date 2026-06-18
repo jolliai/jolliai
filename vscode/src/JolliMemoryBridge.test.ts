@@ -1930,6 +1930,88 @@ describe("JolliMemoryBridge", () => {
 		});
 	});
 
+	// ── getAmendSafety ───────────────────────────────────────────────────
+
+	describe("getAmendSafety()", () => {
+		// Each getAmendSafety() call runs exactly: getHEADHash → refExists
+		// (origin/main) → merge-base → log %ae → config user.email.
+
+		it("reports own work when HEAD diverges from base and the author matches", async () => {
+			// getHEADHash
+			mockExecFileSuccess("head1111\n");
+			// resolveHistoryBaseRef → refExists origin/main
+			mockExecFileSuccess("base9999\n");
+			// merge-base — differs from HEAD
+			mockExecFileSuccess("mergebase7\n");
+			// HEAD author email (different case — must still match)
+			mockExecFileSuccess("Me@Example.com\n");
+			// current git user.email
+			mockExecFileSuccess("me@example.com\n");
+
+			const bridge = makeBridge();
+			const result = await bridge.getAmendSafety("main");
+
+			expect(result).toEqual({
+				hasOwnCommits: true,
+				headAuthoredByCurrentUser: true,
+			});
+		});
+
+		it("flags no own commits when HEAD equals the merge-base", async () => {
+			mockExecFileSuccess("samehash0\n"); // getHEADHash
+			mockExecFileSuccess("base9999\n"); // refExists origin/main
+			mockExecFileSuccess("samehash0\n"); // merge-base === HEAD
+			mockExecFileSuccess("me@example.com\n"); // author
+			mockExecFileSuccess("me@example.com\n"); // user.email
+
+			const bridge = makeBridge();
+			const result = await bridge.getAmendSafety("main");
+
+			expect(result.hasOwnCommits).toBe(false);
+			expect(result.headAuthoredByCurrentUser).toBe(true);
+		});
+
+		it("flags a foreign author when HEAD email differs from user.email", async () => {
+			mockExecFileSuccess("head1111\n"); // getHEADHash
+			mockExecFileSuccess("base9999\n"); // refExists origin/main
+			mockExecFileSuccess("mergebase7\n"); // merge-base
+			mockExecFileSuccess("colleague@example.com\n"); // author
+			mockExecFileSuccess("me@example.com\n"); // user.email
+
+			const bridge = makeBridge();
+			const result = await bridge.getAmendSafety("main");
+
+			expect(result.hasOwnCommits).toBe(true);
+			expect(result.headAuthoredByCurrentUser).toBe(false);
+		});
+
+		it("treats an empty HEAD author email as not the current user", async () => {
+			mockExecFileSuccess("head1111\n"); // getHEADHash
+			mockExecFileSuccess("base9999\n"); // refExists origin/main
+			mockExecFileSuccess("mergebase7\n"); // merge-base
+			mockExecFileSuccess("\n"); // author email empty
+			mockExecFileSuccess("me@example.com\n"); // user.email
+
+			const bridge = makeBridge();
+			const result = await bridge.getAmendSafety("main");
+
+			expect(result.headAuthoredByCurrentUser).toBe(false);
+		});
+
+		it("treats an empty user.email as not the current user", async () => {
+			mockExecFileSuccess("head1111\n"); // getHEADHash
+			mockExecFileSuccess("base9999\n"); // refExists origin/main
+			mockExecFileSuccess("mergebase7\n"); // merge-base
+			mockExecFileSuccess("someone@example.com\n"); // author
+			mockExecFileSuccess("\n"); // user.email empty
+
+			const bridge = makeBridge();
+			const result = await bridge.getAmendSafety("main");
+
+			expect(result.headAuthoredByCurrentUser).toBe(false);
+		});
+	});
+
 	// ── generateSquashMessage ────────────────────────────────────────────
 
 	describe("generateSquashMessage()", () => {
