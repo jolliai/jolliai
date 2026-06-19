@@ -1449,7 +1449,14 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 
 	// Step 5: Get git diff and stats (moved before guard to enable diff-only summaries)
 	stepStart = now();
-	const branch = await getCurrentBranch(cwd);
+	// Prefer the branch captured at enqueue time over the live branch. The worker
+	// drains asynchronously, so HEAD may have moved between commit and drain (rapid
+	// squash/amend/rebase, or a sibling worktree on another branch). Reading the
+	// live branch here would file the summary under the wrong branch — the same bug
+	// the tail-cleanup and diff steps already guard against via op.branch/op.commitHash.
+	// Fall back to the live branch only for pre-0.99.x queue entries that predate the
+	// captured field.
+	const branch = op.branch ?? (await getCurrentBranch(cwd));
 	let diff: string;
 	let diffStats: DiffStats;
 

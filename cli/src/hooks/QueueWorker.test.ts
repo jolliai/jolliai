@@ -633,6 +633,49 @@ describe("QueueWorker", () => {
 		});
 	});
 
+	// Regression: summary.branch used to be read from the live getCurrentBranch
+	// at drain time. That is wrong when HEAD moved between enqueue and drain —
+	// a rapid squash/amend/rebase (rebase transiently checks out the upstream),
+	// or a sibling worktree sitting on another branch. The branch must come from
+	// the queued op (captured inside the git hook at enqueue time), mirroring the
+	// tail-cleanup fix. Otherwise a commit on a feature branch is filed under
+	// whatever branch happened to be live (e.g. "main"), which breaks branch
+	// grouping and the sidebar's `gh pr list --head <branch>` PR-status lookup.
+	describe("runWorker — summary.branch provenance", () => {
+		it("records op.branch on the summary, not the live getCurrentBranch", async () => {
+			const op = makeCommitOp({ branch: "feature/captured" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			// Simulate HEAD drifting away after enqueue (e.g. rebase checked out main).
+			vi.mocked(getCurrentBranch).mockResolvedValue("main");
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(savedSummary.branch).toBe("feature/captured");
+		});
+
+		it("falls back to live getCurrentBranch when op.branch is absent (pre-0.99.x entries)", async () => {
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			vi.mocked(getCurrentBranch).mockResolvedValue("feature/live");
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(savedSummary.branch).toBe("feature/live");
+		});
+	});
+
 	describe("runWorker — entity association (multi-source)", () => {
 		it("archives entities into the summary with archivedKey populated (Linear projected to linearIssues)", async () => {
 			const op = makeCommitOp({ commitHash: "abc12345def67890" });
