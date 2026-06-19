@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.99.2
+
+### New Features
+
+- **Reference extraction** — automatically extracts Linear, Jira, GitHub, and Notion references from Claude and Codex transcripts and surfaces them in summaries. Includes per-source envelope parsers, a persistent `ReferenceStore`, and transcript-level discovery at both StopHook and post-commit time
+- **References in Plans panel** — plan entries now show clickable "Open in \<Source\>" links instead of static source labels, with a Select All toolbar action
+- **PR history strip** — the summary viewer shows previously merged or closed PRs for the same branch alongside the active PR. Uses `gh pr list --state all` so reopened or multi-PR branches no longer lose history
+- **Conversation multi-select** — active conversation rows now have a checkbox ("Include in next memory") and a Select All toolbar action
+
+### Fixes & Improvements
+
+- Removed periodic polling timer for branch updates; the tool window now updates on events only
+- Resolved JetBrains Marketplace Plugin Verifier internal-API warnings — plugin version and install path are derived from pure JVM APIs instead of `PluginManager`
+- Commit selection state is now tracked via `CommitSelectionStore`
+
 ## 0.99.1
 
 ### New Features
