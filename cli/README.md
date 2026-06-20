@@ -246,7 +246,7 @@ Available flags: `--since` (ISO date or relative `7d`/`2w`/`1m`/`3y`; bad values
 
 ### `jolli mcp`
 
-Starts a Model Context Protocol (MCP) server over stdio so AI agents can query your memories directly. It exposes four tools: **search** (full-text search over your historical decisions and implementations), **recall** (load a branch's complete context), **get_decision_timeline** (trace how one decision evolved across commits), and **list_branches** (catalog of branches that have memories).
+Starts a Model Context Protocol (MCP) server over stdio so AI agents can query your memories directly. It exposes five tools: **search** (full-text search over your historical decisions and implementations), **recall** (load a branch's complete context), **get_decision_timeline** (trace how one decision evolved across commits), **list_branches** (catalog of branches that have memories), and **get_pr_description** (build a PR title and description from a branch's memories).
 
 ```bash
 # Start the server (normally launched by your agent, not by hand)

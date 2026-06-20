@@ -414,6 +414,34 @@ vi.mock("./SummaryPrAggregateMarkdownBuilder.js", () => ({
 	buildAggregatedPrMarkdown: mockBuildAggregatedPrMarkdown,
 }));
 
+// Mock the CLI PrDescription module. SummaryWebviewPanel imports buildPrBodyMarkdown,
+// pickPrTitle, and wrapWithMarkers from here — wire them to the existing mock fns so
+// all prepareCreatePr / prepareUpdatePr tests keep working without change.
+vi.mock("../../../cli/src/core/PrDescription.js", () => ({
+	buildPrBodyMarkdown: (
+		currentSummary: { commitMessage: string },
+		summaries: ReadonlyArray<{ commitMessage: string }>,
+		missingCount: number,
+	) => {
+		if (summaries.length >= 2) return mockBuildAggregatedPrMarkdown(summaries, missingCount);
+		const source = summaries.length === 1 ? summaries[0] : currentSummary;
+		const base = mockBuildPrMarkdown(source);
+		if (missingCount <= 0 || summaries.length === 0) return base;
+		return `${base}\n\n> Note: ${missingCount} commit(s) without summary were skipped.`;
+	},
+	pickPrTitle: (
+		currentSummary: { commitMessage: string },
+		summaries: ReadonlyArray<{ commitMessage: string }>,
+	) => {
+		if (summaries.length >= 2) return summaries[summaries.length - 1].commitMessage;
+		if (summaries.length === 1) return summaries[0].commitMessage;
+		return currentSummary.commitMessage;
+	},
+	wrapWithMarkers: (s: string) => `[MARKERS]${s}[/MARKERS]`,
+	MARKER_START: "<!-- jollimemory-summary-start -->",
+	MARKER_END: "<!-- jollimemory-summary-end -->",
+}));
+
 vi.mock("../util/Logger.js", () => ({
 	log: { info, warn, error: logError },
 }));

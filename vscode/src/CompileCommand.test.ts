@@ -194,6 +194,29 @@ describe("registerCompileCommand", () => {
 		await first;
 	});
 
+	it("forwards compile progress to the VS Code progress reporter", async () => {
+		// The `onProgress` callback handed to compileAllRepos pipes each message
+		// into the withProgress reporter. Drive the mock so it emits a progress
+		// message and assert it reaches `progress.report`.
+		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test", localFolder: "/mb" });
+		const reportSpy = vi.fn();
+		withProgress.mockImplementationOnce(
+			async (_opts: unknown, task: (progress: { report: (v: unknown) => void }) => Promise<unknown>) =>
+				task({ report: reportSpy }),
+		);
+		mockCompileAllRepos.mockImplementationOnce(
+			async (_folder: string, _config: unknown, options: { onProgress: (m: string) => void }) => {
+				options.onProgress("Compiling jolli…");
+				return { repos: [{ folder: "jolli", ingested: 1, batches: 1 }], totalIngested: 1, failed: 0 };
+			},
+		);
+		registerCompileCommand(makeOpts());
+
+		await registeredHandlers.get("jollimemory.compileNow")?.();
+
+		expect(reportSpy).toHaveBeenCalledWith({ message: "Compiling jolli…" });
+	});
+
 	it("accepts ANTHROPIC_API_KEY env var as a key source", async () => {
 		process.env.ANTHROPIC_API_KEY = "env-key";
 		mockLoadConfig.mockResolvedValue({ localFolder: "/mb" });

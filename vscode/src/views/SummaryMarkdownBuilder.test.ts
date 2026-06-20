@@ -21,6 +21,18 @@ const mocks = vi.hoisted(() => ({
 	collectSortedTopics: vi.fn(),
 	formatDate: vi.fn(),
 	formatFullDate: vi.fn(),
+	// Mirrors real SummaryFormat.formatProviderLabel: reads llm.source and maps
+	// it to a display label. Tests that verify the footer "· via Anthropic"
+	// segment depend on this returning the right label, not undefined.
+	formatProviderLabel: vi.fn((summary: { llm?: { source?: string } }) => {
+		const labels: Record<string, string> = {
+			"anthropic-config": "Anthropic",
+			"anthropic-env": "Anthropic (env)",
+			"jolli-proxy": "Jolli proxy",
+		};
+		const src = summary?.llm?.source;
+		return src ? (labels[src] ?? undefined) : undefined;
+	}),
 	getDisplayDate: vi.fn(
 		(e: { generatedAt?: string; commitDate: string }) =>
 			e.generatedAt || e.commitDate,
@@ -40,6 +52,7 @@ vi.mock("../../../cli/src/core/SummaryFormat.js", () => ({
 	collectSortedTopics: mocks.collectSortedTopics,
 	formatDate: mocks.formatDate,
 	formatFullDate: mocks.formatFullDate,
+	formatProviderLabel: mocks.formatProviderLabel,
 	getDisplayDate: mocks.getDisplayDate,
 	padIndex: mocks.padIndex,
 }));

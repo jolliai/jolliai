@@ -22,5 +22,6 @@
 export const JOLLI_CLIENT_HEADER =
 	typeof __JOLLI_CLIENT_KIND__ !== "undefined" && typeof __PKG_VERSION__ !== "undefined"
 		? `${__JOLLI_CLIENT_KIND__}/${__PKG_VERSION__}`
-		: /* v8 ignore next -- fallback for an unbundled execution (no `define:` plugin); the vitest config defines both globals so this branch is unreachable from unit tests */
+		: /* v8 ignore start -- fallback for an unbundled execution (no `define:` plugin); the vitest config defines both globals so this branch is unreachable from unit tests */
 			"cli/dev";
+/* v8 ignore stop */

@@ -12,6 +12,7 @@ import {
 	collectSortedTopics,
 	formatDate,
 	formatFullDate,
+	formatProviderLabel,
 	padIndex,
 	sortTopics,
 	type TopicWithDate,
@@ -541,5 +542,24 @@ describe("collectAllNotesWithHosts", () => {
 
 	it("returns empty array when no notes exist", () => {
 		expect(collectAllNotesWithHosts(leaf())).toHaveLength(0);
+	});
+});
+
+// ─── formatProviderLabel ────────────────────────────────────────────────────
+
+describe("formatProviderLabel", () => {
+	it("returns undefined when no llm source", () => {
+		expect(formatProviderLabel({ children: [] } as never)).toBeUndefined();
+	});
+	it("maps a single source to its label", () => {
+		const s = { llm: { source: "anthropic-config" }, children: [] };
+		expect(formatProviderLabel(s as never)).toBe("Anthropic");
+	});
+	it("prefixes mixed sources", () => {
+		const s = {
+			llm: { source: "anthropic-config" },
+			children: [{ llm: { source: "jolli-proxy" }, children: [] }],
+		};
+		expect(formatProviderLabel(s as never)).toBe("mixed: Anthropic, Jolli proxy");
 	});
 });

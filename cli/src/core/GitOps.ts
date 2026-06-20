@@ -295,6 +295,22 @@ export async function getCurrentBranch(cwd?: string): Promise<string> {
 }
 
 /**
+ * Resolves the repository's default branch from `origin/HEAD` (the symbolic ref
+ * `git clone` / `git remote set-head` records), e.g. `main`, `master`,
+ * `develop`. Falls back to `"main"` when origin/HEAD is unset (bare local repo,
+ * no remote, or never fetched). Used as the PR commit-range base default so a
+ * repo whose default branch isn't `main` doesn't spuriously report "no memory".
+ */
+export async function getDefaultBranch(cwd?: string): Promise<string> {
+	const result = await execGit(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd);
+	if (result.exitCode === 0) {
+		const ref = result.stdout.trim().replace(/^origin\//, "");
+		if (ref) return ref;
+	}
+	return "main";
+}
+
+/**
  * Checks if an orphan branch exists.
  */
 export async function orphanBranchExists(branch: string, cwd?: string): Promise<boolean> {

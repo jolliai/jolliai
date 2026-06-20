@@ -71,7 +71,6 @@ import {
 	handleCreatePr,
 	handlePrepareUpdatePr,
 	handleUpdatePr,
-	wrapWithMarkers,
 } from "../services/PrCommentService.js";
 import {
 	deriveRepoNameFromUrl,
@@ -96,8 +95,7 @@ import {
 	renderTopic,
 } from "./SummaryHtmlBuilder.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
-import { buildAggregatedPrMarkdown } from "./SummaryPrAggregateMarkdownBuilder.js";
-import { buildPrMarkdown } from "./SummaryPrMarkdownBuilder.js";
+import { buildPrBodyMarkdown, pickPrTitle, wrapWithMarkers } from "../../../cli/src/core/PrDescription.js";
 import {
 	buildBranchRelativePath,
 	buildNotePushTitle,
@@ -299,56 +297,6 @@ function isRegenerateSafeCommand(command: WebviewMessage["command"]): boolean {
 	return REGENERATE_SAFE_COMMANDS.has(command);
 }
 
-
-// Single source of truth for Create/Update PR body assembly. Branch-first
-// three-tier selection:
-//   • ≥2 branch summaries → aggregate them
-//   • 1 branch summary    → use that one (NOT currentSummary, which may be
-//                           stale or from another branch the webview was
-//                           opened on)
-//   • 0 branch summaries  → fall back to currentSummary (rebase just happened
-//                           and the worker has not produced a summary for the
-//                           new commit hash yet — keeps the form usable)
-// `missingCount > 0` appends a "K skipped" footnote ONLY when summaries.length
-// >= 1 — the footnote contextualizes "alongside the branch summaries shown, N
-// more were skipped". On the 0-summary fallback the body comes from
-// currentSummary (possibly stale or from another branch), so a current-branch
-// "N skipped" note would describe commits unrelated to the body and read as
-// noise.
-function buildPrBodyMarkdown(
-	currentSummary: CommitSummary,
-	summaries: ReadonlyArray<CommitSummary>,
-	missingCount: number,
-): string {
-	if (summaries.length >= 2) {
-		return buildAggregatedPrMarkdown(summaries, missingCount);
-	}
-	const source = summaries.length === 1 ? summaries[0] : currentSummary;
-	const base = buildPrMarkdown(source);
-	if (missingCount <= 0 || summaries.length === 0) return base;
-	return `${base}\n\n> Note: ${missingCount} commit(s) without summary were skipped.`;
-}
-
-/**
- * Picks the commit message to use as the PR title, mirroring
- * {@link buildPrBodyMarkdown}'s three-tier selection so title and body always
- * come from the same source.
- *   • ≥2 branch summaries → the last (most recent) one's message
- *   • 1 branch summary    → that summary's message
- *   • 0 branch summaries  → fall back to currentSummary's message
- */
-function pickPrTitle(
-	currentSummary: CommitSummary,
-	summaries: ReadonlyArray<CommitSummary>,
-): string {
-	if (summaries.length >= 2) {
-		return summaries[summaries.length - 1].commitMessage;
-	}
-	if (summaries.length === 1) {
-		return summaries[0].commitMessage;
-	}
-	return currentSummary.commitMessage;
-}
 
 export class SummaryWebviewPanel {
 	/**

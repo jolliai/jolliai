@@ -5,6 +5,7 @@ vi.mock("./McpTools.js", () => ({
 	runRecall: vi.fn().mockResolvedValue({ type: "recall" }),
 	runDecisionTimeline: vi.fn().mockResolvedValue({ timeline: [] }),
 	runListBranches: vi.fn().mockResolvedValue({ branches: [] }),
+	runGetPrDescription: vi.fn().mockResolvedValue({ type: "pr_description" }),
 }));
 
 const { mockStorage } = vi.hoisted(() => ({ mockStorage: { kind: "mock-storage" } }));
@@ -44,12 +45,12 @@ import { VERSION } from "../commands/CliUtils.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { dispatchTool, startMcpServer, TOOL_DEFINITIONS } from "./McpServer.js";
-import { runDecisionTimeline, runListBranches, runRecall, runSearch } from "./McpTools.js";
+import { runDecisionTimeline, runGetPrDescription, runListBranches, runRecall, runSearch } from "./McpTools.js";
 
 describe("MCP tool registry", () => {
-	it("declares exactly the four P0 tools", () => {
+	it("declares exactly the five tools", () => {
 		expect(TOOL_DEFINITIONS.map((t) => t.name).sort()).toEqual(
-			["get_decision_timeline", "list_branches", "recall", "search"].sort(),
+			["get_decision_timeline", "get_pr_description", "list_branches", "recall", "search"].sort(),
 		);
 	});
 
@@ -79,6 +80,17 @@ describe("dispatchTool", () => {
 	it("routes get_decision_timeline to runDecisionTimeline with parsed args", async () => {
 		await dispatchTool("/repo", "get_decision_timeline", { slug: "auth-flow" });
 		expect(runDecisionTimeline).toHaveBeenCalledWith("/repo", { slug: "auth-flow" });
+	});
+
+	it("routes get_pr_description to runGetPrDescription with parsed args", async () => {
+		await dispatchTool("/repo", "get_pr_description", {
+			baseBranch: "main",
+			includeMarkers: false,
+		});
+		expect(runGetPrDescription).toHaveBeenCalledWith("/repo", {
+			baseBranch: "main",
+			includeMarkers: false,
+		});
 	});
 
 	it("throws on an unknown tool", async () => {

@@ -516,6 +516,18 @@ esac
 			expect(found.sort()).toEqual([join(tempDir, "repo"), join(tempDir, "repo-2")].sort());
 		});
 
+		it("findRepoFolders skips the base folder when it does not exist (suffix-only repo)", () => {
+			// A prior Migrate archived the base slot and left this repo's data in a
+			// suffixed folder. The base-folder branch must short-circuit on the
+			// missing folder rather than read a non-existent config.
+			const remote = "https://github.com/u/canonical.git";
+			initializeKBFolder(join(tempDir, "repo-2"), "repo", remote);
+
+			const found = findRepoFolders("repo", remote, tempDir);
+			expect(found).toEqual([join(tempDir, "repo-2")]);
+			expect(existsSync(join(tempDir, "repo"))).toBe(false);
+		});
+
 		it("prefers a same-repo match over an unclaimed stub at a lower suffix", () => {
 			initializeKBFolder(join(tempDir, "s"), "s", "https://github.com/u/other.git");
 			// s-2 is an unclaimed schema-default stub (no remoteUrl, no repoName).
@@ -780,6 +792,26 @@ esac
 			expect(() => assertValidLocalFolder("/abs/with/../traversal")).toThrow(/Invalid Memory Bank folder/);
 		});
 
+		it("falls back to a timestamped slot when the base and every -2..-99 slot belongs to another repo", () => {
+			// Safety net: the base and the entire -N ladder are occupied by *other*
+			// repos (no same-repo match, no unclaimed stub, no free slot), so peek
+			// can only offer a fresh timestamped path. Freeze the clock for a stable
+			// assertion.
+			const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+			try {
+				initializeKBFolder(join(tempDir, "repo"), "repo", "https://github.com/u/base-other.git");
+				for (let n = 2; n <= 99; n++) {
+					initializeKBFolder(join(tempDir, `repo-${n}`), "repo", `https://github.com/u/other-${n}.git`);
+				}
+				const result = peekKBPath("repo", "https://github.com/u/wanted.git", tempDir);
+				expect(result).toBe(join(tempDir, "repo-1700000000000"));
+				// Pure read: the timestamped slot is never created.
+				expect(existsSync(result)).toBe(false);
+			} finally {
+				nowSpy.mockRestore();
+			}
+		});
+
 		it("matches resolveKBPath's choice on a pristine system — Migrate parity", () => {
 			// The Migrate handler relies on peekKBPath returning the same path
 			// resolveKBPath would, so the `oldKbRoot === newKbRoot` archive
@@ -835,6 +867,37 @@ esac
 			archiveKBFolder(kbRoot, tempDir);
 			// With the old folder moved aside, the clean base name is available again.
 			expect(resolveKBPath("myrepo", url, tempDir)).toBe(join(tempDir, "myrepo"));
+		});
+
+		it("appends a counter on a same-millisecond archive collision (frozen clock)", () => {
+			// The timestamp alone can't separate two archives that land in the same
+			// millisecond (rapid rebuilds / fake clocks), so the loop appends `-n`.
+			// Freeze Date.now so both archives target the identical `<name>-<ts>`.
+			const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+			try {
+				const first = resolveKBPath("myrepo", url, tempDir);
+				const destA = archiveKBFolder(first, tempDir) as string;
+				const second = resolveKBPath("myrepo", url, tempDir);
+				const destB = archiveKBFolder(second, tempDir) as string;
+				expect(destA).toBe(join(tempDir, ".jolli", "archive", "myrepo-1700000000000"));
+				// Same frozen ts → collision → counter suffix.
+				expect(destB).toBe(join(tempDir, ".jolli", "archive", "myrepo-1700000000000-2"));
+				expect(existsSync(destA)).toBe(true);
+				expect(existsSync(destB)).toBe(true);
+			} finally {
+				nowSpy.mockRestore();
+			}
+		});
+
+		it("returns null when the move fails (archive dir can't be created)", () => {
+			// Block the archive directory: a *file* at <parent>/.jolli makes the
+			// recursive mkdir of <parent>/.jolli/archive throw. The failure is
+			// swallowed (a stale visible folder beats aborting a rebuild) → null.
+			const kbRoot = resolveKBPath("myrepo", url, tempDir);
+			writeFileSync(join(tempDir, ".jolli"), "not a directory", "utf-8");
+			expect(archiveKBFolder(kbRoot, tempDir)).toBeNull();
+			// The original folder is left untouched on failure.
+			expect(existsSync(kbRoot)).toBe(true);
 		});
 	});
 });

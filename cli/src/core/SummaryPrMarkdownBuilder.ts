@@ -19,18 +19,23 @@
  * the same fold/escape/render conventions across multi-commit PR bodies.
  */
 
-import type { CommitSummary, E2eTestScenario } from "../../../cli/src/Types.js";
-import {
-	pushFooter,
-	pushPlansAndNotesSection,
-	pushRecapSection,
-} from "./SummaryMarkdownBuilder.js";
-import {
-	collectSortedTopics,
-	escHtml,
-	padIndex,
-	type TopicWithDate,
-} from "./SummaryUtils.js";
+import type { CommitSummary, E2eTestScenario } from "../Types.js";
+import { escHtml } from "./MarkdownEscape.js";
+import { collectSortedTopics, padIndex, type TopicWithDate } from "./SummaryFormat.js";
+import { pushFooter, pushPlansAndNotesSection } from "./SummaryMarkdownBuilder.js";
+
+// Cumulative soft limits shared by both PR builders (single-commit here and
+// branch-aggregating in SummaryPrAggregateMarkdownBuilder), so neither a single
+// fat commit nor an aggregated body can push the PR past GitHub's 65536 hard
+// cap. Sections are emitted recap → e2e → topics; each ceiling leaves room for
+// the next. `PR_BODY_LIMIT` budgets ~1000 chars below the hard cap for the
+// footer, the missing-summary footnote, and the marker envelope (`wrapWithMarkers`
+// in PrDescription) — all appended downstream, outside this cap. The shared
+// `pushRecapSection` stays unbounded (correct for the clipboard / Jolli-doc
+// path); the PR path uses the bounded variants below.
+export const RECAP_SOFT_LIMIT = 50000;
+export const E2E_SOFT_LIMIT = 60000;
+export const PR_BODY_LIMIT = 64500;
 
 /**
  * Builds a Markdown string optimized for GitHub PR descriptions.
@@ -53,8 +58,8 @@ export function buildPrMarkdown(summary: CommitSummary): string {
 		lines.push("", `## Jolli Memory`, "", `${memoryDocUrl}`);
 	}
 
-	pushPlansAndNotesSection(lines, summary);
-	pushRecapSection(lines, summary);
+	pushPlansAndNotesSection(lines, summary, { includeReferences: true });
+	pushPrRecapSection(lines, summary);
 	pushPrE2eTestSection(lines, summary.e2eTestGuide);
 	pushPrTopicsSection(lines, allTopics);
 	pushFooter(lines, summary);
@@ -88,10 +93,7 @@ export function buildPrMarkdown(summary: CommitSummary): string {
  * `<blockquote>` and the first body block is preserved (needed by GFM to
  * switch from HTML mode to markdown parsing inside the blockquote).
  */
-export function wrapInGithubDetails(
-	summaryContent: string,
-	bodyLines: Array<string>,
-): Array<string> {
+export function wrapInGithubDetails(summaryContent: string, bodyLines: Array<string>): Array<string> {
 	return [
 		"<details>",
 		`<summary>${summaryContent}</summary>`,
@@ -137,10 +139,7 @@ export function escapeGithubWrapperTags(text: string): string {
 export function buildScenarioBodyLines(s: E2eTestScenario): Array<string> {
 	const out: Array<string> = [];
 	if (s.preconditions) {
-		out.push(
-			"",
-			`**Preconditions:** ${escapeGithubWrapperTags(s.preconditions)}`,
-		);
+		out.push("", `**Preconditions:** ${escapeGithubWrapperTags(s.preconditions)}`);
 	}
 	out.push("", "**Steps:**");
 	for (let j = 0; j < s.steps.length; j++) {
@@ -153,6 +152,26 @@ export function buildScenarioBodyLines(s: E2eTestScenario): Array<string> {
 	return out;
 }
 
+/**
+ * PR recap with a size ceiling. The shared `pushRecapSection` is intentionally
+ * unbounded (correct for clipboard / Jolli-doc output), but the PR path must
+ * stay under GitHub's body cap. Mirroring the aggregate path's whole-unit drop,
+ * an over-budget recap is omitted with a standalone notice rather than emitting
+ * an orphaned header — keeping the downstream e2e/topics sections within budget.
+ */
+function pushPrRecapSection(lines: Array<string>, summary: CommitSummary): void {
+	const recap = summary.recap?.trim();
+	if (!recap) {
+		return;
+	}
+	const block = ["", "## Quick recap", "", recap, "", "---"];
+	if (lines.join("\n").length + block.join("\n").length > RECAP_SOFT_LIMIT) {
+		lines.push("", "> ⚠️ Quick recap omitted due to GitHub PR body size limit.");
+		return;
+	}
+	lines.push(...block);
+}
+
 export function pushPrE2eTestSection(
 	lines: Array<string>,
 	e2eTestGuide: ReadonlyArray<E2eTestScenario> | undefined,
@@ -160,15 +179,62 @@ export function pushPrE2eTestSection(
 	if (!e2eTestGuide || e2eTestGuide.length === 0) {
 		return;
 	}
-	lines.push("", `## E2E Test (${e2eTestGuide.length})`);
+	const header = `## E2E Test (${e2eTestGuide.length})`;
+	const currentLength = () => lines.join("\n").length;
+	const buffered: Array<string> = [];
+	let included = 0;
 	for (let i = 0; i < e2eTestGuide.length; i++) {
 		const s = e2eTestGuide[i];
 		const summaryContent = `<strong>${i + 1}. ${escHtml(s.title)}</strong>`;
+		const wrapped = wrapInGithubDetails(summaryContent, buildScenarioBodyLines(s));
+		// Account for the not-yet-pushed header so the first scenario is budgeted correctly.
+		if (currentLength() + ["", header, ...buffered, ...wrapped].join("\n").length > E2E_SOFT_LIMIT) {
+			break;
+		}
+		buffered.push(...wrapped);
+		included++;
+	}
+	const omitted = e2eTestGuide.length - included;
+	const noun = (n: number) => `scenario${n !== 1 ? "s" : ""}`;
+	if (included > 0) {
+		lines.push("", header, ...buffered);
+		if (omitted > 0) {
+			lines.push("", `> ⚠️ ${omitted} more ${noun(omitted)} omitted due to GitHub PR body size limit.`);
+		}
+		lines.push("", "---");
+	} else {
 		lines.push(
-			...wrapInGithubDetails(summaryContent, buildScenarioBodyLines(s)),
+			"",
+			`> ⚠️ All ${e2eTestGuide.length} ${noun(e2eTestGuide.length)} omitted due to GitHub PR body size limit.`,
 		);
 	}
-	lines.push("", "---");
+}
+
+/**
+ * Emits a size-bounded section. The header is pushed ONLY when at least one
+ * item was included, so an over-budget first item never produces an orphaned
+ * "## Section (N)" header followed only by an omitted-notice. When every item
+ * is omitted, a standalone notice is emitted instead — the omission is
+ * signalled, never silent. Notice strings are passed pre-built (with the
+ * `> ⚠️ ` prefix) so each section keeps its own singular/plural/possessive
+ * wording.
+ */
+export function pushBoundedSection(
+	lines: Array<string>,
+	header: string,
+	buffered: ReadonlyArray<string>,
+	included: number,
+	partialNotice: string | null,
+	allOmittedNotice: string,
+): void {
+	if (included > 0) {
+		lines.push("", header, ...buffered);
+		if (partialNotice) {
+			lines.push("", partialNotice);
+		}
+	} else {
+		lines.push("", allOmittedNotice);
+	}
 }
 
 /**
@@ -181,31 +247,11 @@ export function pushPrE2eTestSection(
  * is not parsed, so `filesAffected` entries need no escape.
  */
 export function pushPrTopicBody(out: Array<string>, t: TopicWithDate): void {
-	out.push(
-		"",
-		`**⚡ Why This Change**`,
-		"",
-		escapeGithubWrapperTags(t.trigger),
-	);
-	out.push(
-		"",
-		`**💡 Decisions Behind the Code**`,
-		"",
-		escapeGithubWrapperTags(t.decisions),
-	);
-	out.push(
-		"",
-		`**✅ What Was Implemented**`,
-		"",
-		escapeGithubWrapperTags(t.response),
-	);
+	out.push("", `**⚡ Why This Change**`, "", escapeGithubWrapperTags(t.trigger));
+	out.push("", `**💡 Decisions Behind the Code**`, "", escapeGithubWrapperTags(t.decisions));
+	out.push("", `**✅ What Was Implemented**`, "", escapeGithubWrapperTags(t.response));
 	if (t.todo) {
-		out.push(
-			"",
-			`**📋 Future Enhancements**`,
-			"",
-			escapeGithubWrapperTags(t.todo),
-		);
+		out.push("", `**📋 Future Enhancements**`, "", escapeGithubWrapperTags(t.todo));
 	}
 	if (t.filesAffected && t.filesAffected.length > 0) {
 		out.push("", `**📁 FILES**`);
@@ -220,41 +266,37 @@ export function pushPrTopicBody(out: Array<string>, t: TopicWithDate): void {
  * Each topic is folded in a `<details>` block; truncation stops adding
  * topics once the PR body would exceed the GitHub character limit.
  */
-function pushPrTopicsSection(
-	lines: Array<string>,
-	allTopics: Array<TopicWithDate>,
-): void {
+function pushPrTopicsSection(lines: Array<string>, allTopics: Array<TopicWithDate>): void {
 	if (allTopics.length === 0) {
 		return;
 	}
 
-	// GitHub PR body limit is 65536 chars. Reserve space for footer + markers (~200 chars).
-	const PR_BODY_LIMIT = 65000;
-
-	lines.push(
-		"",
-		`## ${allTopics.length === 1 ? "Topic" : "Topics"} (${allTopics.length})`,
-	);
-	let includedCount = 0;
+	const header = `## ${allTopics.length === 1 ? "Topic" : "Topics"} (${allTopics.length})`;
 	const currentLength = () => lines.join("\n").length;
+	const buffered: Array<string> = [];
+	let included = 0;
 
 	for (let i = 0; i < allTopics.length; i++) {
 		const summaryContent = `<strong>${padIndex(i)} · ${escHtml(allTopics[i].title)}</strong>`;
 		const bodyOnly: Array<string> = [];
 		pushPrTopicBody(bodyOnly, allTopics[i]);
 		const topicLines = wrapInGithubDetails(summaryContent, bodyOnly);
-		if (currentLength() + topicLines.join("\n").length > PR_BODY_LIMIT) {
+		// Account for the not-yet-pushed header so the first topic is budgeted correctly.
+		if (currentLength() + ["", header, ...buffered, ...topicLines].join("\n").length > PR_BODY_LIMIT) {
 			break;
 		}
-		lines.push(...topicLines);
-		includedCount++;
+		buffered.push(...topicLines);
+		included++;
 	}
 
-	const omitted = allTopics.length - includedCount;
-	if (omitted > 0) {
-		lines.push(
-			"",
-			`> ⚠️ ${omitted} more topic${omitted !== 1 ? "s" : ""} omitted due to GitHub PR body size limit.`,
-		);
-	}
+	const omitted = allTopics.length - included;
+	const noun = (n: number) => `topic${n !== 1 ? "s" : ""}`;
+	pushBoundedSection(
+		lines,
+		header,
+		buffered,
+		included,
+		omitted > 0 ? `> ⚠️ ${omitted} more ${noun(omitted)} omitted due to GitHub PR body size limit.` : null,
+		`> ⚠️ All ${allTopics.length} ${noun(allTopics.length)} omitted due to GitHub PR body size limit.`,
+	);
 }

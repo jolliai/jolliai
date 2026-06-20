@@ -4,36 +4,20 @@
  * keys, and budgets follow `docs/feature-allow-multi-commit-pr.md`.
  */
 
-import type {
-	CommitSummary,
-	E2eTestScenario,
-	NoteReference,
-	PlanReference,
-	ReferenceCommitRef,
-} from "../../../cli/src/Types.js";
-import {
-	pushFooter,
-	pushPlansAndNotesSection,
-} from "./SummaryMarkdownBuilder.js";
+import type { CommitSummary, E2eTestScenario, NoteReference, PlanReference, ReferenceCommitRef } from "../Types.js";
+import { escHtml, escMdLinkText } from "./MarkdownEscape.js";
+import { collectSortedTopics, padIndex, type TopicWithDate } from "./SummaryFormat.js";
+import { pushFooter, pushPlansAndNotesSection } from "./SummaryMarkdownBuilder.js";
 import {
 	buildScenarioBodyLines,
+	E2E_SOFT_LIMIT,
 	escapeGithubWrapperTags,
+	PR_BODY_LIMIT,
+	pushBoundedSection,
 	pushPrTopicBody,
+	RECAP_SOFT_LIMIT,
 	wrapInGithubDetails,
 } from "./SummaryPrMarkdownBuilder.js";
-import {
-	collectSortedTopics,
-	escHtml,
-	padIndex,
-	type TopicWithDate,
-} from "./SummaryUtils.js";
-
-// GitHub caps PR body at 65536. Budgets ~1000 chars for footer, missing
-// footnote, marker envelope (added by `wrapWithMarkers` in caller), and
-// per-section omitted-footnotes — keeping wrapped output safely below cap.
-const PR_BODY_LIMIT = 64500;
-const RECAP_SOFT_LIMIT = 50000;
-const E2E_SOFT_LIMIT = 60000;
 
 interface AggregatedScenario extends E2eTestScenario {
 	readonly sourceShortHash: string;
@@ -43,14 +27,9 @@ interface AggregatedTopic extends TopicWithDate {
 	readonly sourceShortHash: string;
 }
 
-export function buildAggregatedPrMarkdown(
-	summaries: ReadonlyArray<CommitSummary>,
-	missingCount: number,
-): string {
+export function buildAggregatedPrMarkdown(summaries: ReadonlyArray<CommitSummary>, missingCount: number): string {
 	if (summaries.length < 2) {
-		throw new Error(
-			`buildAggregatedPrMarkdown requires summaries.length >= 2; got ${summaries.length}`,
-		);
+		throw new Error(`buildAggregatedPrMarkdown requires summaries.length >= 2; got ${summaries.length}`);
 	}
 
 	const lines: Array<string> = [];
@@ -85,9 +64,10 @@ function pushCommitsDirectory(
 		const s = summaries[i];
 		const shortHash = s.commitHash.substring(0, 7);
 		const memoryLink = s.jolliDocUrl ? ` — [Memory](${s.jolliDocUrl})` : "";
-		// Strip backticks: escHtml doesn't escape them, and they would
-		// collide with the inline `${shortHash}` code-span on the same line.
-		const safeMessage = escHtml(s.commitMessage).replace(/`/g, "");
+		// Strip backticks: escHtml doesn't escape them, and they would collide with
+		// the inline `${shortHash}` code-span on the same line. escMdLinkText also
+		// escapes `[`/`]` so a message like `Fix [x](url)` can't render as a live link.
+		const safeMessage = escMdLinkText(escHtml(s.commitMessage)).replace(/`/g, "");
 		lines.push(`${i + 1}. ${safeMessage} (\`${shortHash}\`)${memoryLink}`);
 	}
 }
@@ -95,10 +75,7 @@ function pushCommitsDirectory(
 // Dedupe key: URL when published, else `slug:`/`id:` prefix so unpublished
 // entries with the same slug/id still collapse to one row. Prefix avoids
 // accidental collision with URL strings.
-function pushMergedPlansAndNotes(
-	lines: Array<string>,
-	summaries: ReadonlyArray<CommitSummary>,
-): void {
+function pushMergedPlansAndNotes(lines: Array<string>, summaries: ReadonlyArray<CommitSummary>): void {
 	const planSeen = new Set<string>();
 	const noteSeen = new Set<string>();
 	const referenceSeen = new Set<string>();
@@ -137,19 +114,19 @@ function pushMergedPlansAndNotes(
 		}
 	}
 
-	if (
-		mergedPlans.length === 0 &&
-		mergedNotes.length === 0 &&
-		mergedReferences.length === 0
-	) {
+	if (mergedPlans.length === 0 && mergedNotes.length === 0 && mergedReferences.length === 0) {
 		return;
 	}
 
-	pushPlansAndNotesSection(lines, {
-		plans: mergedPlans,
-		notes: mergedNotes,
-		references: mergedReferences,
-	} as unknown as CommitSummary);
+	pushPlansAndNotesSection(
+		lines,
+		{
+			plans: mergedPlans,
+			notes: mergedNotes,
+			references: mergedReferences,
+		} as unknown as CommitSummary,
+		{ includeReferences: true },
+	);
 }
 
 function pushPerCommitRecap(
@@ -157,46 +134,45 @@ function pushPerCommitRecap(
 	summaries: ReadonlyArray<CommitSummary>,
 	currentLength: () => number,
 ): void {
-	const withRecapCount = summaries.filter((s) => s.recap?.trim()).length;
-	if (withRecapCount === 0) return;
+	const withRecap = summaries.map((s, i) => ({ s, i })).filter(({ s }) => s.recap?.trim());
+	if (withRecap.length === 0) return;
 
 	// Header matches the single-summary `## Quick recap` (in
 	// `SummaryMarkdownBuilder.pushRecapSection`) plus the `(N)` count style
 	// used by every other aggregate section (Commits / E2E / Topics).
-	lines.push("", `## Quick recap (${withRecapCount})`);
-
-	let truncated = false;
-	let truncatedCount = 0;
-	for (let i = 0; i < summaries.length; i++) {
-		const s = summaries[i];
+	const header = `## Quick recap (${withRecap.length})`;
+	const buffered: Array<string> = [];
+	let included = 0;
+	for (const { s, i } of withRecap) {
 		const recap = s.recap?.trim();
 		if (!recap) continue;
-		if (truncated) {
-			truncatedCount++;
-			continue;
-		}
 		const shortHash = s.commitHash.substring(0, 7);
-		const safeMessage = escHtml(s.commitMessage).replace(/`/g, "");
+		const safeMessage = escMdLinkText(escHtml(s.commitMessage)).replace(/`/g, "");
 		const block = [
 			"",
 			`### Commit ${i + 1} of ${summaries.length}: ${safeMessage} (\`${shortHash}\`)`,
 			"",
 			escapeGithubWrapperTags(recap),
 		];
-		if (currentLength() + block.join("\n").length > RECAP_SOFT_LIMIT) {
-			truncated = true;
-			truncatedCount++;
-			continue;
+		// Account for the not-yet-pushed header so the first recap is budgeted correctly.
+		if (currentLength() + ["", header, ...buffered, ...block].join("\n").length > RECAP_SOFT_LIMIT) {
+			break;
 		}
-		lines.push(...block);
+		buffered.push(...block);
+		included++;
 	}
-	if (truncatedCount > 0) {
-		const possessive = truncatedCount === 1 ? "commit's" : "commits'";
-		lines.push(
-			"",
-			`> ⚠️ ${truncatedCount} more ${possessive} recap omitted due to GitHub PR body size limit.`,
-		);
-	}
+	const omitted = withRecap.length - included;
+	const possessive = (n: number) => (n === 1 ? "commit's" : "commits'");
+	pushBoundedSection(
+		lines,
+		header,
+		buffered,
+		included,
+		omitted > 0
+			? `> ⚠️ ${omitted} more ${possessive(omitted)} recap omitted due to GitHub PR body size limit.`
+			: null,
+		`> ⚠️ All ${withRecap.length} ${possessive(withRecap.length)} recap omitted due to GitHub PR body size limit.`,
+	);
 }
 
 function pushAggregatedE2eSection(
@@ -213,29 +189,30 @@ function pushAggregatedE2eSection(
 	}
 	if (all.length === 0) return;
 
-	lines.push("", `## E2E Test (${all.length})`);
-
+	const header = `## E2E Test (${all.length})`;
+	const buffered: Array<string> = [];
 	let included = 0;
 	for (let i = 0; i < all.length; i++) {
 		const sc = all[i];
 		const summaryContent = `<strong>${i + 1}. [${sc.sourceShortHash}] ${escHtml(sc.title)}</strong>`;
-		const wrapped = wrapInGithubDetails(
-			summaryContent,
-			buildScenarioBodyLines(sc),
-		);
-		if (currentLength() + wrapped.join("\n").length > E2E_SOFT_LIMIT) {
+		const wrapped = wrapInGithubDetails(summaryContent, buildScenarioBodyLines(sc));
+		// Account for the not-yet-pushed header so the first scenario is budgeted correctly.
+		if (currentLength() + ["", header, ...buffered, ...wrapped].join("\n").length > E2E_SOFT_LIMIT) {
 			break;
 		}
-		lines.push(...wrapped);
+		buffered.push(...wrapped);
 		included++;
 	}
 	const omitted = all.length - included;
-	if (omitted > 0) {
-		lines.push(
-			"",
-			`> ⚠️ ${omitted} more scenario${omitted !== 1 ? "s" : ""} omitted due to GitHub PR body size limit.`,
-		);
-	}
+	const noun = (n: number) => `scenario${n !== 1 ? "s" : ""}`;
+	pushBoundedSection(
+		lines,
+		header,
+		buffered,
+		included,
+		omitted > 0 ? `> ⚠️ ${omitted} more ${noun(omitted)} omitted due to GitHub PR body size limit.` : null,
+		`> ⚠️ All ${all.length} ${noun(all.length)} omitted due to GitHub PR body size limit.`,
+	);
 }
 
 function pushAggregatedTopicsSection(
@@ -253,8 +230,8 @@ function pushAggregatedTopicsSection(
 	}
 	if (all.length === 0) return;
 
-	lines.push("", `## ${all.length === 1 ? "Topic" : "Topics"} (${all.length})`);
-
+	const header = `## ${all.length === 1 ? "Topic" : "Topics"} (${all.length})`;
+	const buffered: Array<string> = [];
 	let included = 0;
 	for (let i = 0; i < all.length; i++) {
 		const t = all[i];
@@ -262,25 +239,26 @@ function pushAggregatedTopicsSection(
 		const body: Array<string> = [];
 		pushPrTopicBody(body, t);
 		const wrapped = wrapInGithubDetails(summaryContent, body);
-		if (currentLength() + wrapped.join("\n").length > PR_BODY_LIMIT) {
+		// Account for the not-yet-pushed header so the first topic is budgeted correctly.
+		if (currentLength() + ["", header, ...buffered, ...wrapped].join("\n").length > PR_BODY_LIMIT) {
 			break;
 		}
-		lines.push(...wrapped);
+		buffered.push(...wrapped);
 		included++;
 	}
 	const omitted = all.length - included;
-	if (omitted > 0) {
-		lines.push(
-			"",
-			`> ⚠️ ${omitted} more topic${omitted !== 1 ? "s" : ""} omitted due to GitHub PR body size limit.`,
-		);
-	}
+	const noun = (n: number) => `topic${n !== 1 ? "s" : ""}`;
+	pushBoundedSection(
+		lines,
+		header,
+		buffered,
+		included,
+		omitted > 0 ? `> ⚠️ ${omitted} more ${noun(omitted)} omitted due to GitHub PR body size limit.` : null,
+		`> ⚠️ All ${all.length} ${noun(all.length)} omitted due to GitHub PR body size limit.`,
+	);
 }
 
 function pushMissingFootnote(lines: Array<string>, missingCount: number): void {
 	if (missingCount <= 0) return;
-	lines.push(
-		"",
-		`> Note: ${missingCount} commit(s) without summary were skipped.`,
-	);
+	lines.push("", `> Note: ${missingCount} commit(s) without summary were skipped.`);
 }

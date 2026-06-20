@@ -65,6 +65,12 @@ vi.mock("../sync/VaultWriteLock.js", async (importOriginal) => {
 	};
 });
 vi.mock("../hooks/QueueWorker.js", () => ({ launchWorker: vi.fn() }));
+vi.mock("../graph/GraphBuilder.js", () => ({
+	// Default: graph build is a no-op so it doesn't pull the real LLM-bearing
+	// builder into every compile test. Individual tests override to throw and
+	// exercise the non-fatal catch.
+	buildKnowledgeGraph: vi.fn(async () => {}),
+}));
 
 import { drainIngest } from "../core/IngestPipeline.js";
 import { appendCredentialMissingRun } from "../core/IngestRunStore.js";
@@ -74,6 +80,7 @@ import { loadConfig } from "../core/SessionTracker.js";
 import { readTopicIndex, saveTopicIndex } from "../core/TopicIndexStore.js";
 import { purgeTopicPagesExcept } from "../core/TopicPageStore.js";
 import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
+import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { withVaultWriteLock } from "../sync/VaultWriteLock.js";
 import { registerCompileCommand } from "./CompileCommand.js";
 
@@ -254,6 +261,43 @@ describe("registerCompileCommand", () => {
 			.mockResolvedValueOnce({ ran: true, value: undefined }) // store reset
 			.mockResolvedValueOnce({ ran: false }); // purge
 		const { stdout } = await runCompile(["--cwd", "/repo", "--rebuild"]);
+		expect(stdout).toContain("Done:");
+		expect(process.exitCode).not.toBe(1);
+	});
+
+	it("--cwd --rebuild: a non-Error thrown from the purge is stringified, still non-fatal", async () => {
+		// The purge is wrapped in a non-fatal catch that stringifies a non-Error
+		// throw (`String(purgeErr)`). A non-Error rejection from the purge body
+		// exercises that arm — the derived layer lags but the command completes.
+		vi.mocked(purgeTopicPagesExcept).mockRejectedValueOnce("purge exploded (string, not Error)" as never);
+		const { stdout } = await runCompile(["--cwd", "/repo", "--rebuild"]);
+		expect(stdout).toContain("Done:");
+		expect(process.exitCode).not.toBe(1);
+	});
+
+	it("--cwd: a non-Error thrown from the wiki re-render is stringified, still non-fatal", async () => {
+		// The wiki re-render's non-fatal catch stringifies a non-Error throw
+		// (`String(renderErr)`); a thrown string exercises that arm.
+		mockRenderTopicKBWiki.mockImplementationOnce(async () => {
+			throw "render exploded (string, not Error)";
+		});
+		const { stdout } = await runCompile(["--cwd", "/repo"]);
+		expect(stdout).toContain("Done:");
+		expect(process.exitCode).not.toBe(1);
+	});
+
+	it("--cwd: a knowledge-graph build failure (Error) is non-fatal — compile still reports Done", async () => {
+		// The graph is a derived artifact regenerated on the next compile, so a
+		// build failure (or missing LLM key) must never fail the compile.
+		vi.mocked(buildKnowledgeGraph).mockRejectedValueOnce(new Error("graph boom"));
+		const { stdout } = await runCompile(["--cwd", "/repo"]);
+		expect(stdout).toContain("Done:");
+		expect(process.exitCode).not.toBe(1);
+	});
+
+	it("--cwd: a non-Error thrown from the knowledge-graph build is stringified, still non-fatal", async () => {
+		vi.mocked(buildKnowledgeGraph).mockRejectedValueOnce("graph exploded (string, not Error)" as never);
+		const { stdout } = await runCompile(["--cwd", "/repo"]);
 		expect(stdout).toContain("Done:");
 		expect(process.exitCode).not.toBe(1);
 	});

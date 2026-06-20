@@ -6,11 +6,13 @@
  * Structure mirrors the webview layout.
  */
 
-import type { CommitSummary, E2eTestScenario } from "../Types.js";
+import type { CommitSummary, E2eTestScenario, ReferenceCommitRef, SourceId } from "../Types.js";
+import { escMdLinkText, escMdUrl } from "./MarkdownEscape.js";
 import {
 	collectSortedTopics,
 	formatDate,
 	formatFullDate,
+	formatProviderLabel,
 	getDisplayDate,
 	padIndex,
 	type TopicWithDate,
@@ -37,35 +39,6 @@ export function buildMarkdown(summary: CommitSummary): string {
 	pushE2eTestSection(lines, summary.e2eTestGuide);
 	pushSourceCommitsSection(lines, sourceNodes);
 	pushTopicsSection(lines, allTopics, pushTopicBody);
-	pushFooter(lines);
-
-	return lines.join("\n");
-}
-
-/**
- * Builds a simplified Markdown string optimized for GitHub PR descriptions.
- *
- * Only includes information not already visible on the PR page:
- * - Jolli Memory URL (if pushed)
- * - Associated Plans with URLs
- * - E2E Test Guide
- * - Summaries: Why (trigger) -> Decisions -> What (response)
- * - Footer
- */
-export function buildPrMarkdown(summary: CommitSummary): string {
-	const { topics: allTopics } = collectSortedTopics(summary);
-	const lines: Array<string> = [];
-
-	// Jolli Memory URL
-	const memoryDocUrl = summary.jolliDocUrl;
-	if (memoryDocUrl) {
-		lines.push("", "## Jolli Memory", "", `${memoryDocUrl}`);
-	}
-
-	pushPlansAndNotesSection(lines, summary);
-	pushRecapSection(lines, summary);
-	pushE2eTestSection(lines, summary.e2eTestGuide);
-	pushPrTopicsSection(lines, allTopics);
 	pushFooter(lines);
 
 	return lines.join("\n");
@@ -110,17 +83,53 @@ function pushPropertiesSection(lines: Array<string>, summary: CommitSummary): vo
  * Guide). Skipped when the summary has no recap — keeps the section "present
  * iff content" semantics consistent with the Hoist family.
  */
-function pushRecapSection(lines: Array<string>, summary: CommitSummary): void {
+export function pushRecapSection(lines: Array<string>, summary: CommitSummary): void {
 	const recap = summary.recap?.trim();
 	if (!recap) return;
 	lines.push("", "## Quick recap", "", recap, "", "---");
 }
 
-/** Appends a combined Plans & Notes section — title + URL for each item. */
-function pushPlansAndNotesSection(lines: Array<string>, summary: CommitSummary): void {
+const REFERENCE_SOURCE_ORDER: ReadonlyArray<SourceId> = ["linear", "jira", "github", "notion"];
+
+/**
+ * Returns references ordered by source (linear → jira → github → notion),
+ * preserving within-source order, so the section reads deterministically
+ * across regenerations.
+ */
+export function referencesBySourceOrder(
+	references: ReadonlyArray<ReferenceCommitRef>,
+): ReadonlyArray<ReferenceCommitRef> {
+	const bySource = new Map<SourceId, Array<ReferenceCommitRef>>();
+	for (const e of references) {
+		const arr = bySource.get(e.source) ?? [];
+		arr.push(e);
+		bySource.set(e.source, arr);
+	}
+	const out: Array<ReferenceCommitRef> = [];
+	for (const source of REFERENCE_SOURCE_ORDER) {
+		const arr = bySource.get(source);
+		if (arr) out.push(...arr);
+	}
+	return out;
+}
+
+/**
+ * Appends a combined Plans & Notes section — title + URL for each item.
+ * External references (Linear/Jira/GitHub/Notion) are rendered only when
+ * `opts.includeReferences` is set — the PR path opts in; the clipboard/folder
+ * path leaves it off, so the *references* output is the only part that differs
+ * between the two paths (plan/note titles are escaped on both). Exported so PR
+ * builders reuse it.
+ */
+export function pushPlansAndNotesSection(
+	lines: Array<string>,
+	summary: CommitSummary,
+	opts?: { includeReferences?: boolean },
+): void {
 	const plans = summary.plans ?? [];
 	const notes = summary.notes ?? [];
-	const totalCount = plans.length + notes.length;
+	const references: ReadonlyArray<ReferenceCommitRef> = opts?.includeReferences ? (summary.references ?? []) : [];
+	const totalCount = plans.length + notes.length + references.length;
 	if (totalCount === 0) {
 		return;
 	}
@@ -129,12 +138,20 @@ function pushPlansAndNotesSection(lines: Array<string>, summary: CommitSummary):
 
 	for (const plan of plans) {
 		const planUrl = plan.jolliPlanDocUrl;
-		lines.push(planUrl ? `- [${plan.title}](${planUrl})` : `- ${plan.title}`);
+		lines.push(
+			planUrl ? `- [${escMdLinkText(plan.title)}](${escMdUrl(planUrl)})` : `- ${escMdLinkText(plan.title)}`,
+		);
 	}
 
 	for (const note of notes) {
 		const noteUrl = note.jolliNoteDocUrl;
-		lines.push(noteUrl ? `- [${note.title}](${noteUrl})` : `- ${note.title}`);
+		lines.push(
+			noteUrl ? `- [${escMdLinkText(note.title)}](${escMdUrl(noteUrl)})` : `- ${escMdLinkText(note.title)}`,
+		);
+	}
+
+	for (const e of referencesBySourceOrder(references)) {
+		lines.push(`- [${escMdLinkText(e.nativeId)} — ${escMdLinkText(e.title)}](${escMdUrl(e.url)})`);
 	}
 }
 
@@ -194,13 +211,6 @@ function pushTopicBody(out: Array<string>, t: TopicWithDate): void {
 	}
 }
 
-/** Appends simplified topic body for PR: trigger, decisions, response (no todo/files). */
-function pushPrTopicBody(out: Array<string>, t: TopicWithDate): void {
-	out.push("", "**⚡ Why This Change**", "", t.trigger);
-	out.push("", "**💡 Decisions Behind the Code**", "", t.decisions);
-	out.push("", "**✅ What Was Implemented**", "", t.response);
-}
-
 /** Appends the memories/summaries section for clipboard export. Flat list. */
 function pushTopicsSection(
 	lines: Array<string>,
@@ -220,44 +230,14 @@ function pushTopicsSection(
 }
 
 /**
- * Appends the PR summaries section with GitHub body-size truncation.
- * Uses simplified topic body (no todo/files) and stops adding topics
- * once the PR body would exceed the GitHub character limit.
+ * Appends the standard "Generated by Jolli Memory" footer. When `summary`
+ * carries provider attribution (`llm.source`) it is appended as
+ * `· via <provider>`. Clipboard/folder callers pass no `summary`, preserving
+ * the original two-segment footer. Exported so the PR builders reuse it.
  */
-function pushPrTopicsSection(lines: Array<string>, allTopics: Array<TopicWithDate>): void {
-	if (allTopics.length === 0) {
-		return;
-	}
-
-	// GitHub PR body limit is 65536 chars. Reserve space for footer + markers (~200 chars).
-	const PR_BODY_LIMIT = 65000;
-
-	lines.push("", `## ${allTopics.length === 1 ? "Summary" : "Summaries"} (${allTopics.length})`);
-	let includedCount = 0;
-	const currentLength = () => lines.join("\n").length;
-
-	for (let i = 0; i < allTopics.length; i++) {
-		const topicLines: Array<string> = [];
-		topicLines.push("", `### ${padIndex(i)} · ${allTopics[i].title}`);
-		pushPrTopicBody(topicLines, allTopics[i]);
-		if (currentLength() + topicLines.join("\n").length > PR_BODY_LIMIT) {
-			break;
-		}
-		lines.push(...topicLines);
-		includedCount++;
-	}
-
-	const omitted = allTopics.length - includedCount;
-	if (omitted > 0) {
-		lines.push(
-			"",
-			`> ⚠️ ${omitted} more summar${omitted !== 1 ? "ies" : "y"} omitted due to GitHub PR body size limit.`,
-		);
-	}
-}
-
-/** Appends the standard "Generated by Jolli Memory" footer. */
-function pushFooter(lines: Array<string>): void {
+export function pushFooter(lines: Array<string>, summary?: CommitSummary): void {
 	const generatedAt = formatFullDate(new Date().toISOString());
-	lines.push("", "---", "", `*Generated by Jolli Memory · ${generatedAt}*`);
+	const provider = summary ? formatProviderLabel(summary) : undefined;
+	const tail = provider ? ` · via ${provider}` : "";
+	lines.push("", "---", "", `*Generated by Jolli Memory · ${generatedAt}${tail}*`);
 }

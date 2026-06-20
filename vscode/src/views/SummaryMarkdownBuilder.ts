@@ -6,9 +6,10 @@
  * in the clipboard, Jolli doc pages, and any CommonMark renderer.
  *
  * GitHub PR description output (with <details>/<summary>/<blockquote>
- * folding) lives in `SummaryPrMarkdownBuilder.ts` via `buildPrMarkdown`.
- * That file imports `pushPlansAndNotesSection`, `pushRecapSection`, and
- * `pushFooter` from here, which is why those three helpers are exported.
+ * folding) lives in `../../../cli/src/core/SummaryPrMarkdownBuilder.ts` via
+ * `buildPrMarkdown`. The shared `pushPlansAndNotesSection`, `pushRecapSection`,
+ * and `pushFooter` helpers now live in the CLI core too (imported above), not
+ * defined here.
  */
 
 import {
@@ -19,16 +20,12 @@ import {
 import type {
 	CommitSummary,
 	E2eTestScenario,
-	ReferenceCommitRef,
-	SourceId,
 } from "../../../cli/src/Types.js";
+import { pushFooter, pushPlansAndNotesSection, pushRecapSection } from "../../../cli/src/core/SummaryMarkdownBuilder.js";
 import {
 	collectSortedTopics,
-	escMdLinkText,
-	escMdUrl,
 	formatDate,
 	formatFullDate,
-	formatProviderLabel,
 	getDisplayDate,
 	padIndex,
 	type TopicWithDate,
@@ -49,7 +46,7 @@ export function buildMarkdown(summary: CommitSummary): string {
 	const lines: Array<string> = [];
 
 	pushPropertiesSection(lines, summary);
-	pushPlansAndNotesSection(lines, summary);
+	pushPlansAndNotesSection(lines, summary, { includeReferences: true });
 	pushRecapSection(lines, summary);
 	pushE2eTestSection(lines, summary.e2eTestGuide);
 	pushSourceCommitsSection(lines, sourceNodes);
@@ -57,21 +54,6 @@ export function buildMarkdown(summary: CommitSummary): string {
 	pushFooter(lines, summary);
 
 	return lines.join("\n");
-}
-
-/**
- * Appends a Quick recap section sandwiched between Plans & Notes and E2E Test
- * Guide. Skipped when the summary has no recap. Exported because the PR
- * markdown builder calls it too -- recap placement is identical across the
- * clipboard markdown, PR body, and the CLI output.
- */
-export function pushRecapSection(
-	lines: Array<string>,
-	summary: CommitSummary,
-): void {
-	const recap = summary.recap?.trim();
-	if (!recap) return;
-	lines.push("", "## Quick recap", "", recap, "", "---");
 }
 
 // ── Shared section helpers ──────────────────────────────────────────────────
@@ -114,85 +96,12 @@ function pushPropertiesSection(
 }
 
 /**
- * Appends a combined Plans & Notes section — title + URL for each item.
- *
- * Exported because `SummaryPrMarkdownBuilder.buildPrMarkdown` also calls it —
- * plans/notes rendering is identical between clipboard and PR output.
- */
-export function pushPlansAndNotesSection(
-	lines: Array<string>,
-	summary: CommitSummary,
-): void {
-	const plans = summary.plans ?? [];
-	const notes = summary.notes ?? [];
-	// Multi-source reference rendering — `summary.references` is canonical.
-	const references: ReadonlyArray<ReferenceCommitRef> = summary.references ?? [];
-	const totalCount = plans.length + notes.length + references.length;
-	if (totalCount === 0) {
-		return;
-	}
-	const countLabel = totalCount > 1 ? ` (${totalCount})` : "";
-	lines.push("", `## Plans & Notes${countLabel}`, "");
-
-	for (const plan of plans) {
-		const planUrl = plan.jolliPlanDocUrl;
-		lines.push(
-			planUrl ? `- [${escMdLinkText(plan.title)}](${escMdUrl(planUrl)})` : `- ${escMdLinkText(plan.title)}`,
-		);
-	}
-
-	for (const note of notes) {
-		const noteUrl = note.jolliNoteDocUrl;
-		lines.push(
-			noteUrl ? `- [${escMdLinkText(note.title)}](${escMdUrl(noteUrl)})` : `- ${escMdLinkText(note.title)}`,
-		);
-	}
-
-	// External references (Linear / Jira / GitHub / Notion) render with the
-	// stable nativeId prefix (Linear ticket id, Jira key, owner/repo#number,
-	// Notion page id) so reviewers can grep the PR body without parsing
-	// titles. Upstream URL is preferred over any internal Jolli doc URL —
-	// the source tracker is authoritative. Order is deterministic by
-	// source (linear → jira → github → notion) so multi-source PRs read
-	// the same across regenerations.
-	for (const e of referencesBySourceOrder(references)) {
-		// title/url are untrusted (external tracker content) — escape so a crafted
-		// title/url cannot inject a phishing link into the PR body / clipboard.
-		lines.push(`- [${escMdLinkText(e.nativeId)} — ${escMdLinkText(e.title)}](${escMdUrl(e.url)})`);
-	}
-}
-
-const REFERENCE_SOURCE_ORDER: ReadonlyArray<SourceId> = ["linear", "jira", "github", "notion"];
-
-/**
- * Returns references ordered by source (linear → jira → github → notion) and
- * preserves the original within-source order. Used by the clipboard /
- * webview / PR renderers so the section reads deterministically across
- * regenerations.
- */
-export function referencesBySourceOrder(
-	references: ReadonlyArray<ReferenceCommitRef>,
-): ReadonlyArray<ReferenceCommitRef> {
-	const bySource = new Map<SourceId, Array<ReferenceCommitRef>>();
-	for (const e of references) {
-		const arr = bySource.get(e.source) ?? [];
-		arr.push(e);
-		bySource.set(e.source, arr);
-	}
-	const out: Array<ReferenceCommitRef> = [];
-	for (const source of REFERENCE_SOURCE_ORDER) {
-		const arr = bySource.get(source);
-		if (arr) out.push(...arr);
-	}
-	return out;
-}
-
-/**
  * Appends the E2E test guide section for clipboard export. Emits plain
  * markdown H3 headings per scenario.
  *
- * The PR variant lives in `SummaryPrMarkdownBuilder.pushPrE2eTestSection`
- * and wraps each scenario in a `<details>` block with sanitization.
+ * The PR variant lives in `../../../cli/src/core/SummaryPrMarkdownBuilder.ts`
+ * (`pushPrE2eTestSection`) and wraps each scenario in a `<details>` block with
+ * sanitization.
  */
 function pushE2eTestSection(
 	lines: Array<string>,
@@ -276,30 +185,6 @@ function pushTopicsSection(
 		lines.push("", `### ${padIndex(i)} · ${t.title}${catLabel}`);
 		bodyFn(lines, t);
 	}
-}
-
-/**
- * Appends the standard "Generated by Jolli Memory" footer. When the summary
- * carries provider attribution (`llm.source` field, present on summaries
- * generated after this field shipped) it is appended as `· via <provider>`.
- * Pre-attribution summaries fall back to the original two-segment footer.
- *
- * Exported because `SummaryPrMarkdownBuilder.buildPrMarkdown` also calls it —
- * footer content is identical between clipboard and PR output.
- */
-export function pushFooter(
-	lines: Array<string>,
-	summary?: CommitSummary,
-): void {
-	const generatedAt = formatFullDate(new Date().toISOString());
-	const provider = summary ? formatProviderLabel(summary) : undefined;
-	const tail = provider ? ` · via ${provider}` : "";
-	lines.push(
-		"",
-		"---",
-		"",
-		`*Generated by Jolli Memory · ${generatedAt}${tail}*`,
-	);
 }
 
 /**

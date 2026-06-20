@@ -18,14 +18,12 @@ const mocks = vi.hoisted(() => ({
 	collectSortedTopics: vi.fn(),
 	formatDate: vi.fn(),
 	formatFullDate: vi.fn(),
-	getDisplayDate: vi.fn(
-		(e: { generatedAt?: string; commitDate: string }) =>
-			e.generatedAt || e.commitDate,
-	),
+	formatProviderLabel: vi.fn(),
+	getDisplayDate: vi.fn((e: { generatedAt?: string; commitDate: string }) => e.generatedAt || e.commitDate),
 	padIndex: vi.fn(),
 }));
 
-vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
+vi.mock("./SummaryTree.js", () => ({
 	aggregateStats: mocks.aggregateStats,
 	aggregateTurns: mocks.aggregateTurns,
 	formatDurationLabel: mocks.formatDurationLabel,
@@ -33,18 +31,19 @@ vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
 }));
 
 // Mock the core SummaryFormat module (used by the core SummaryMarkdownBuilder)
-vi.mock("../../../cli/src/core/SummaryFormat.js", () => ({
+vi.mock("./SummaryFormat.js", () => ({
 	collectSortedTopics: mocks.collectSortedTopics,
 	formatDate: mocks.formatDate,
 	formatFullDate: mocks.formatFullDate,
+	formatProviderLabel: mocks.formatProviderLabel,
 	getDisplayDate: mocks.getDisplayDate,
 	padIndex: mocks.padIndex,
 }));
 
-import type { CommitSummary } from "../../../cli/src/Types.js";
+import type { CommitSummary } from "../Types.js";
+import type { TopicWithDate } from "./SummaryFormat.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
 import { buildPrMarkdown } from "./SummaryPrMarkdownBuilder.js";
-import type { TopicWithDate } from "./SummaryUtils.js";
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -105,9 +104,7 @@ function setupDefaults(
 	mocks.formatDurationLabel.mockReturnValue("1 day (1 commit)");
 	mocks.formatFullDate.mockReturnValue("March 30, 2026 at 10:00 AM");
 	mocks.formatDate.mockReturnValue("Mar 30, 2026");
-	mocks.padIndex.mockImplementation((i: number) =>
-		String(i + 1).padStart(2, "0"),
-	);
+	mocks.padIndex.mockImplementation((i: number) => String(i + 1).padStart(2, "0"));
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────────
@@ -185,6 +182,17 @@ describe("SummaryPrMarkdownBuilder", () => {
 				expect(md).toContain("- Plan X");
 				expect(md).not.toContain("edited");
 			});
+
+			it("renders external references in the PR plans/notes section", () => {
+				mocks.collectSortedTopics.mockReturnValue({ topics: [], sourceNodes: [] });
+				const md = buildPrMarkdown({
+					topics: [],
+					plans: [],
+					notes: [],
+					references: [{ source: "linear", nativeId: "ENG-9", title: "Ship", url: "https://l/ENG-9" }],
+				} as never);
+				expect(md).toContain("[ENG-9 — Ship](https://l/ENG-9)");
+			});
 		});
 
 		describe("PR topics", () => {
@@ -252,10 +260,7 @@ describe("SummaryPrMarkdownBuilder", () => {
 			});
 
 			it("renders topics without date grouping in PR mode", () => {
-				const topics = [
-					makeTopic({ title: "PR Topic 1" }),
-					makeTopic({ title: "PR Topic 2" }),
-				];
+				const topics = [makeTopic({ title: "PR Topic 1" }), makeTopic({ title: "PR Topic 2" })];
 				const summary = makeSummary();
 				setupDefaults(summary, topics);
 
@@ -278,7 +283,7 @@ describe("SummaryPrMarkdownBuilder", () => {
 		});
 
 		describe("PR body truncation", () => {
-			it("truncates topics that exceed PR_BODY_LIMIT (65000 chars)", () => {
+			it("truncates topics that exceed PR_BODY_LIMIT (64500 chars)", () => {
 				const longText = "x".repeat(20000);
 				const topics = [
 					makeTopic({
@@ -305,9 +310,7 @@ describe("SummaryPrMarkdownBuilder", () => {
 
 				const md = buildPrMarkdown(summary);
 
-				expect(md).toMatch(
-					/⚠️ \d+ more topic(s?) omitted due to GitHub PR body size limit/,
-				);
+				expect(md).toMatch(/⚠️ \d+ more topic(s?) omitted due to GitHub PR body size limit/);
 			});
 
 			it("shows singular 'topic' for 1 omitted topic", () => {
@@ -338,24 +341,26 @@ describe("SummaryPrMarkdownBuilder", () => {
 
 			it("shows plural 'topics' for multiple omitted topics", () => {
 				const longText = "z".repeat(25000);
+				// A small topic fits first so the header is emitted and the omission
+				// is a *partial* one (plural "N more topics omitted"), not all-omitted.
 				const topics = [
 					makeTopic({
 						title: "T1",
+						trigger: "short",
+						decisions: "short",
+						response: "short",
+					}),
+					makeTopic({
+						title: "T2",
 						trigger: longText,
 						decisions: longText,
 						response: longText,
 					}),
 					makeTopic({
-						title: "T2",
-						trigger: longText,
-						decisions: "short",
-						response: "short",
-					}),
-					makeTopic({
 						title: "T3",
-						trigger: "short",
-						decisions: "short",
-						response: "short",
+						trigger: longText,
+						decisions: longText,
+						response: longText,
 					}),
 				];
 				const summary = makeSummary();
@@ -363,9 +368,24 @@ describe("SummaryPrMarkdownBuilder", () => {
 
 				const md = buildPrMarkdown(summary);
 
-				if (md.includes("omitted")) {
-					expect(md).toMatch(/\d+ more topics omitted/);
-				}
+				expect(md).toContain("## Topics (3)");
+				expect(md).toMatch(/\d+ more topics omitted/);
+			});
+
+			it("suppresses the header and emits an all-omitted notice when the first topic overflows", () => {
+				const giantText = "z".repeat(25000);
+				const topics = [
+					makeTopic({ title: "T1", trigger: giantText, decisions: giantText, response: giantText }),
+					makeTopic({ title: "T2", trigger: "short", decisions: "short", response: "short" }),
+				];
+				const summary = makeSummary();
+				setupDefaults(summary, topics);
+
+				const md = buildPrMarkdown(summary);
+
+				// No orphaned "## Topics (N)" header with no body underneath.
+				expect(md).not.toContain("## Topic");
+				expect(md).toMatch(/⚠️ All 2 topics omitted due to GitHub PR body size limit\./);
 			});
 
 			it("does not show warning when all topics fit", () => {
@@ -376,6 +396,64 @@ describe("SummaryPrMarkdownBuilder", () => {
 				const md = buildPrMarkdown(summary);
 
 				expect(md).not.toContain("omitted");
+			});
+		});
+
+		// #3: the single-summary path previously bounded only the topics section,
+		// so a fat recap or many E2E scenarios could push the body past GitHub's
+		// 65536 hard cap and break PR creation. Recap and E2E now have soft caps
+		// mirroring the aggregate path.
+		describe("PR body global size cap (recap + e2e)", () => {
+			it("omits an oversized recap with a notice instead of overflowing", () => {
+				const summary = makeSummary({ recap: "r".repeat(80000) });
+				setupDefaults(summary, [makeTopic({ title: "T" })]);
+
+				const md = buildPrMarkdown(summary);
+
+				expect(md).not.toContain("## Quick recap");
+				expect(md).toMatch(/⚠️ Quick recap omitted due to GitHub PR body size limit\./);
+				expect(md.length).toBeLessThan(65_536);
+			});
+
+			it("keeps a normal-size recap byte-identical to the unbounded renderer", () => {
+				const summary = makeSummary({ recap: "all good here" });
+				setupDefaults(summary, [makeTopic({ title: "T" })]);
+
+				const md = buildPrMarkdown(summary);
+
+				expect(md).toContain("## Quick recap\n\nall good here\n\n---");
+				expect(md).not.toContain("truncated");
+			});
+
+			it("caps E2E scenarios and emits an omitted notice", () => {
+				const big = "y".repeat(4000);
+				const scenarios = Array.from({ length: 30 }, (_, i) => ({
+					title: `Sc-${i}`,
+					preconditions: big,
+					steps: [big, big],
+					expectedResults: [big],
+				}));
+				const summary = makeSummary({ e2eTestGuide: scenarios });
+				setupDefaults(summary, [makeTopic({ title: "T" })]);
+
+				const md = buildPrMarkdown(summary);
+
+				expect(md).toContain("## E2E Test (30)");
+				expect(md).toMatch(/⚠️ \d+ more scenarios? omitted due to GitHub PR body size limit\./);
+				expect(md.length).toBeLessThan(65_536);
+			});
+
+			it("suppresses the E2E header when the first scenario overflows", () => {
+				const giant = "y".repeat(70000);
+				const summary = makeSummary({
+					e2eTestGuide: [{ title: "Sc", preconditions: giant, steps: [giant], expectedResults: [giant] }],
+				});
+				setupDefaults(summary, [makeTopic({ title: "T" })]);
+
+				const md = buildPrMarkdown(summary);
+
+				expect(md).not.toContain("## E2E Test");
+				expect(md).toMatch(/⚠️ All 1 scenario omitted due to GitHub PR body size limit\./);
 			});
 		});
 
@@ -471,10 +549,7 @@ describe("SummaryPrMarkdownBuilder", () => {
 			});
 
 			it("wraps each topic and E2E scenario in balanced <details>/<summary>/<blockquote>", () => {
-				const topics = [
-					makeTopic({ title: "Topic A" }),
-					makeTopic({ title: "Topic B" }),
-				];
+				const topics = [makeTopic({ title: "Topic A" }), makeTopic({ title: "Topic B" })];
 				const summary = makeSummary({
 					e2eTestGuide: [
 						{ title: "Scenario X", steps: ["s1"], expectedResults: ["r1"] },
@@ -547,9 +622,7 @@ describe("SummaryPrMarkdownBuilder", () => {
 				expect((md.match(/<details>/g) ?? []).length).toBe(1);
 				expect((md.match(/<\/details>/g) ?? []).length).toBe(1);
 				expect(md).toContain("Setup &lt;/details&gt; before test");
-				expect(md).toContain(
-					"Run step &lt;details open&gt;debug&lt;/details&gt;",
-				);
+				expect(md).toContain("Run step &lt;details open&gt;debug&lt;/details&gt;");
 				expect(md).toContain("Close &lt;/details&gt; properly");
 				expect(md).not.toContain("Setup </details>");
 				expect(md).not.toContain("<details open>debug");
@@ -560,8 +633,7 @@ describe("SummaryPrMarkdownBuilder", () => {
 					title: "T",
 					trigger: "Has <blockquote>quoted</blockquote> passage",
 					decisions: "- **Note</details>**: inner",
-					response:
-						"Handle </details> edge case and <details open>nested</details> content",
+					response: "Handle </details> edge case and <details open>nested</details> content",
 				});
 				const summary = makeSummary();
 				setupDefaults(summary, [topic]);
@@ -620,7 +692,8 @@ describe("SummaryPrMarkdownBuilder", () => {
 				expect(md).not.toContain("<details>");
 				expect(md).not.toContain("</details>");
 				expect(md).not.toContain("<strong>01 · Huge</strong>");
-				expect(md).toMatch(/⚠️ 1 more topic omitted/);
+				// Single oversized topic → nothing included → all-omitted notice, no header.
+				expect(md).toMatch(/⚠️ All 1 topic omitted/);
 			});
 		});
 

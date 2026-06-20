@@ -46,43 +46,57 @@ function readSearch(target: "claude" | "agents" = "claude"): string {
 	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
 }
 
+function readPr(target: "claude" | "agents" = "claude"): string {
+	const dir = target === "claude" ? ".claude/skills/jolli-pr" : ".agents/skills/jolli-pr";
+	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
+}
+
 // ─── Dual-target write ──────────────────────────────────────────────────────
 
 describe("updateSkillsIfNeeded — target dimension", () => {
-	it("writes both skills into both .claude/skills/ and .agents/skills/", async () => {
+	it("writes all three skills into both .claude/skills/ and .agents/skills/", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
 	});
 
 	it("writes byte-identical SKILL.md to .claude/skills/ and .agents/skills/", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		expect(readRecall("claude")).toBe(readRecall("agents"));
 		expect(readSearch("claude")).toBe(readSearch("agents"));
+		expect(readPr("claude")).toBe(readPr("agents"));
 	});
 
 	it("with claudeEnabled=false, skips .claude/skills/ but still writes .agents/skills/", async () => {
 		await updateSkillsIfNeeded(tempDir, { claudeEnabled: false });
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(false);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
 	});
 
-	it("with claudeEnabled=undefined (default), writes both targets", async () => {
+	it("with claudeEnabled=undefined (default), writes both targets for all skills", async () => {
 		await updateSkillsIfNeeded(tempDir, {});
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
 	});
 
-	it("exports the 4 git-exclude paths for the two skills × two targets", () => {
+	it("exports the 6 git-exclude paths for the three skills × two targets", () => {
 		expect(SKILL_GIT_EXCLUDE_PATHS).toEqual([
 			"/.claude/skills/jolli-recall/",
 			"/.claude/skills/jolli-search/",
+			"/.claude/skills/jolli-pr/",
 			"/.agents/skills/jolli-recall/",
 			"/.agents/skills/jolli-search/",
+			"/.agents/skills/jolli-pr/",
 		]);
 	});
 });
@@ -135,6 +149,24 @@ describe("search template frontmatter", () => {
 		expect(search).not.toMatch(/^argument-hint:/m);
 		expect(search).not.toMatch(/^user-invocable:/m);
 		expect(search).not.toMatch(/^disable-model-invocation:/m);
+	});
+});
+
+describe("pr template frontmatter", () => {
+	it("uses spec-compliant fields only — name, description, metadata.version, metadata.vendor", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/^---\nname: jolli-pr\n/);
+		expect(pr).toMatch(/description: Create a pull request using a Jolli Memory-generated description/);
+		expect(pr).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}vendor: "jolli\.ai"/);
+	});
+
+	it("does NOT contain Claude-private top-level frontmatter fields", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).not.toMatch(/^argument-hint:/m);
+		expect(pr).not.toMatch(/^user-invocable:/m);
+		expect(pr).not.toMatch(/^disable-model-invocation:/m);
 	});
 });
 
@@ -463,6 +495,116 @@ describe("search template content", () => {
 	});
 });
 
+// ─── PR-template content pins ────────────────────────────────────────────────────────────────────────────
+
+describe("pr template content", () => {
+	it("names the MCP tool and its Claude Code alias", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/get_pr_description/);
+		expect(pr).toMatch(/mcp__jollimemory__get_pr_description/);
+	});
+
+	it("documents the tool return shape", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/"title"/);
+		expect(pr).toMatch(/"body"/);
+		expect(pr).toMatch(/"missingCount"/);
+		expect(pr).toMatch(/"summaryCount"/);
+		expect(pr).toMatch(/"commitCount"/);
+	});
+
+	it("instructs to STOP when tool errors with no summaries", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/No JolliMemory summaries/);
+		expect(pr).toMatch(/STOP/);
+	});
+
+	it("instructs to warn user when missingCount > 0 then continue", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/missingCount/);
+		expect(pr).toMatch(/footnote/);
+	});
+
+	it("uses --body-file for gh pr create", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/--body-file/);
+	});
+
+	it("instructs to push the branch first", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/git push -u origin/);
+	});
+
+	it("uses plain `git push` when an upstream already exists (no unconditional -u origin)", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		// An existing upstream may track a non-origin remote; re-pointing it with
+		// `-u origin` would push to the wrong place. The template must check for an
+		// upstream and reserve `-u origin` for the no-upstream case only.
+		expect(pr).toMatch(/@\{u\}/);
+		// A line that is exactly `git push` (indented), distinct from the
+		// `git push -u origin …` line which carries trailing args.
+		expect(pr).toMatch(/\n\s*git push\n/);
+	});
+
+	it("forwards a non-default baseBranch to gh as --base", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/--base <baseBranch>/);
+	});
+
+	it("does NOT use a fixed here-doc delimiter for the PR body (must be a per-invocation <DELIM>)", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		// The body is user-controlled commit memory; a fixed delimiter lets a body
+		// line close the here-doc early and inject shell. Mirror the recall/search
+		// hardening: an LLM-generated per-invocation random hex token.
+		expect(pr).not.toMatch(/<<'JOLLI_PR_BODY_END'/);
+		expect(pr).not.toMatch(/^JOLLI_PR_BODY_END$/m);
+		expect(pr).toMatch(/JOLLI_PR_BODY_<DELIM>_END/);
+		expect(pr).toMatch(/regenerate the token and re-check/);
+	});
+
+	it("enforces the hard rule: do not rewrite body from diff", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/Do NOT rewrite/);
+		expect(pr).toMatch(/body.*MUST come from/i);
+	});
+
+	it("forbids Co-Authored-By Claude footer", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/Do NOT add a[\s\S]*Co-Authored-By: Claude/);
+	});
+
+	it("preserves the Generated by Jolli Memory product signature", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/Generated by Jolli Memory/);
+	});
+
+	it("instructs to relay the PR URL from gh output", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/URL/);
+		expect(pr).toMatch(/gh pr create/);
+	});
+
+	it("includes gh install hint when gh is missing", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/cli\.github\.com/);
+		expect(pr).toMatch(/gh auth login/);
+	});
+});
+
 // ─── No CJK leakage ─────────────────────────────────────────────────────────
 
 describe("English-only", () => {
@@ -476,6 +618,11 @@ describe("English-only", () => {
 	it("search template contains no CJK characters", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		expect(readSearch()).not.toMatch(CJK_AND_OTHER_NON_LATIN);
+	});
+
+	it("pr template contains no CJK characters", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		expect(readPr()).not.toMatch(CJK_AND_OTHER_NON_LATIN);
 	});
 });
 
@@ -498,12 +645,14 @@ describe("legacy directories", () => {
 		expect(fs.existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(true);
 	});
 
-	it("backward-compat alias updateSkillIfNeeded installs both skills into both targets", async () => {
+	it("backward-compat alias updateSkillIfNeeded installs all skills into both targets", async () => {
 		await updateSkillIfNeeded(tempDir);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
 	});
 
 	it("backward-compat alias respects claudeEnabled=false", async () => {

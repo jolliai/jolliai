@@ -442,7 +442,7 @@ The index is also refreshed **incrementally at the end of `jolli compile`** (per
 
 `jolli mcp` ([McpCommand.ts](src/commands/McpCommand.ts)) starts an stdio MCP server ([McpServer.ts](src/mcp/McpServer.ts)) that AI agents connect to. `jolli mcp --reindex` forces a full rebuild of the local search index from source and exits (no server).
 
-The server exposes four tools, all pure handlers in [McpTools.ts](src/mcp/McpTools.ts):
+The server exposes five tools, all pure handlers in [McpTools.ts](src/mcp/McpTools.ts):
 
 | Tool | Purpose |
 |------|---------|
@@ -450,6 +450,7 @@ The server exposes four tools, all pure handlers in [McpTools.ts](src/mcp/McpToo
 | `recall` | Recall a branch's development context from **RAW commit summaries** — the same data path as the `jolli-recall` skill, NOT the topic KB. Defaults to the current branch. |
 | `get_decision_timeline` | Chronological evolution of a topic — its source events ordered oldest-first. |
 | `list_branches` | All branches with JolliMemory records and their topic titles. |
+| `get_pr_description` | Build a GitHub PR title + description from the branch's JolliMemory commit summaries — the same memory-rich body the VS Code extension writes. Use before `gh pr create`. |
 
 `McpServer.ts` is pure glue: tool schemas (`TOOL_DEFINITIONS`) plus a `dispatchTool` table over the `McpTools` handlers, adapted into SDK request handlers (`ListTools` / `CallTool`). Errors from a handler are returned as an `isError` tool response rather than crashing the server.
 
