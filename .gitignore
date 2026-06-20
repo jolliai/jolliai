@@ -35,6 +35,7 @@ Thumbs.db
 .claude/
 .kiro/
 .gemini/
+.cursor/
 .codex/
 .opencode/
 # Claude MCP server config — written per-worktree with an absolute local path

@@ -167,6 +167,8 @@ function makeDeps() {
 			hasOwnCommits: true,
 			headAuthoredByCurrentUser: true,
 		})),
+		// HEAD is not shared with another branch by default.
+		isHeadSharedWithOtherBranch: vi.fn(async () => false),
 	};
 	const defaultFiles = [
 		{
@@ -647,6 +649,25 @@ describe("CommitCommand", () => {
 		expect(spy).toHaveBeenCalledWith("feat: generated", {
 			allowed: false,
 			reason: "the latest commit was authored by someone else",
+		});
+	});
+
+	it("gates the QuickPick when HEAD is shared with another branch (reset/rebase onto a shared tip)", async () => {
+		// hasOwnCommits + own author pass, but the tip is also on another branch —
+		// closes the reflog-fork-point gap (e.g. reset --hard onto release).
+		const deps = makeDeps();
+		deps.bridge.isHeadSharedWithOtherBranch.mockResolvedValue(true);
+		const command = makeCommand(deps);
+		const spy = vi
+			.spyOn(command as never, "showCommitQuickPick")
+			.mockResolvedValue(undefined);
+
+		await command.execute();
+
+		expect(deps.bridge.isHeadSharedWithOtherBranch).toHaveBeenCalled();
+		expect(spy).toHaveBeenCalledWith("feat: generated", {
+			allowed: false,
+			reason: "the latest commit also belongs to another branch",
 		});
 	});
 

@@ -270,10 +270,15 @@ export class CommitCommand {
 	/**
 	 * Decides whether the Amend actions may be offered for the current HEAD.
 	 *
-	 * Unsafe when the branch has no commit of its own (HEAD is the base branch's
-	 * tip) or the tip was authored by someone else — amending either rewrites a
-	 * commit shared with the base branch. A failure to determine safety (e.g. an
-	 * empty repo with no HEAD) is treated as unsafe: there is nothing to amend.
+	 * Unsafe when:
+	 * - the branch has no commit of its own (HEAD is the base branch's tip), or
+	 * - the tip was authored by someone else, or
+	 * - the tip is also reachable from another branch (e.g. HEAD was reset/rebased
+	 *   onto a shared branch) — amending any of these rewrites a commit another
+	 *   branch depends on.
+	 *
+	 * A failure to determine safety (e.g. an empty repo with no HEAD) is treated
+	 * as unsafe: there is nothing to amend.
 	 */
 	private async resolveAmendAvailability(): Promise<AmendAvailability> {
 		const safety = await this.bridge
@@ -289,6 +294,18 @@ export class CommitCommand {
 			return {
 				allowed: false,
 				reason: "the latest commit was authored by someone else",
+			};
+		}
+		// The reflog fork point can look legitimate after a reset/rebase onto a
+		// branch that descends from it; a direct "is HEAD shared with another
+		// branch" check closes that gap (the tip is published elsewhere).
+		const headShared = await this.bridge
+			.isHeadSharedWithOtherBranch()
+			.catch(() => false);
+		if (headShared) {
+			return {
+				allowed: false,
+				reason: "the latest commit also belongs to another branch",
 			};
 		}
 		return { allowed: true, reason: "" };
