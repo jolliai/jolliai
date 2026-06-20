@@ -978,6 +978,12 @@ export class JolliMemoryBridge {
 				creationPoint: creationPoint.substring(0, 8),
 				author: authorFilter,
 			});
+		} else {
+			// Not merged: measure own commits from the branch's true fork point
+			// rather than the mainline merge-base, so a branch cut from
+			// release/1.0 (etc.) doesn't list that base branch's shared commits
+			// as its own. No-op for branches cut directly from main.
+			mergeBase = await this.resolveOwnCommitsBase(branch, mergeBase);
 		}
 
 		// Build git log command with optional --author filter
@@ -1162,10 +1168,29 @@ export class JolliMemoryBridge {
 	 * Uses git reflog to find the commit where a branch was originally created.
 	 * Returns the hash at creation, or undefined if the reflog has expired or
 	 * is unavailable (e.g. after a fresh clone).
+	 *
+	 * @param opts.requireExplicit when true, return undefined unless an explicit
+	 *   `branch: Created from …` reflog entry is found. Reflog entries expire
+	 *   oldest-first, so once the creation entry is gone the oldest *surviving*
+	 *   entry is often the branch's own first commit — guessing it as the
+	 *   creation point would silently drop that commit from history and
+	 *   mis-judge amend safety. Callers that feed history/amend decisions pass
+	 *   true so they degrade to a safe base instead of trusting a guess. The
+	 *   merged-mode history view (constrained by an `--author` filter) leaves it
+	 *   false to keep its best-effort fallback.
 	 */
 	private async findBranchCreationPoint(
 		branch: string,
+		opts?: { requireExplicit?: boolean },
 	): Promise<string | undefined> {
+		// Detached HEAD has no branch reflog of its own — `reflog show HEAD`
+		// would surface HEAD's whole movement history (oldest entry = the repo's
+		// first commit), which is not a creation point. Bail out rather than
+		// return a misleading hash. (getCurrentBranch() returns "HEAD" when
+		// detached and never an empty string.)
+		if (branch === "HEAD") {
+			return;
+		}
 		const reflog = await tryExecGit(
 			["reflog", "show", branch, "--format=%H %gs"],
 			this.cwd,
@@ -1183,9 +1208,86 @@ export class JolliMemoryBridge {
 			}
 		}
 
-		// Fallback: use the oldest reflog entry
+		// No explicit creation record. Only guess the oldest surviving entry when
+		// the caller tolerates it (see requireExplicit).
+		if (opts?.requireExplicit) {
+			return;
+		}
 		const oldest = lines[lines.length - 1];
 		return oldest.split(" ")[0];
+	}
+
+	/** True when `ancestor` is an ancestor of (or equal to) `descendant`. */
+	private async isAncestor(
+		ancestor: string,
+		descendant: string,
+	): Promise<boolean> {
+		// `merge-base --is-ancestor` exits 0 when true, non-zero (execGit throws)
+		// when false or on a bad ref.
+		return execGit(
+			["merge-base", "--is-ancestor", ancestor, descendant],
+			this.cwd,
+		)
+			.then(() => true)
+			.catch(() => false);
+	}
+
+	/**
+	 * Resolves the base commit that "own commits" on the current branch are
+	 * measured from.
+	 *
+	 * Own commits should be counted from where the branch was actually cut, not
+	 * from the mainline. A branch freshly created from `release/1.0` (or any
+	 * branch downstream of main) starts with its tip equal to that base branch's
+	 * tip — comparing against main would wrongly count the base branch's commits
+	 * (and its shared tip) as this branch's own work, which is exactly what lets
+	 * `getAmendSafety` offer Amend on, and `listBranchCommits` list, a commit
+	 * shared with the base branch.
+	 *
+	 * Prefers the branch's reflog creation point when it sits downstream of (is a
+	 * descendant of) the mainline merge-base — the "cut from release/develop"
+	 * case. Falls back to `mergeBaseMain` when the creation point is unavailable
+	 * (reflog expired → graceful degradation to the previous behavior), equals
+	 * it (cut directly from main), or is not downstream of it. When the mainline
+	 * ref is itself unresolvable (`mergeBaseMain === ""`, e.g. a `master`/`trunk`
+	 * default branch) the creation point is used directly.
+	 *
+	 * @param branch        current branch name, for the reflog lookup
+	 * @param mergeBaseMain already-computed `merge-base HEAD <mainline>` ("" if unresolvable)
+	 */
+	private async resolveOwnCommitsBase(
+		branch: string,
+		mergeBaseMain: string,
+	): Promise<string> {
+		const creationPoint = await this.findBranchCreationPoint(branch, {
+			requireExplicit: true,
+		});
+		if (!creationPoint) {
+			return mergeBaseMain;
+		}
+		// Cut directly from main: mergeBaseMain is an ancestor of HEAD by
+		// construction, so no further checks are needed.
+		if (creationPoint === mergeBaseMain) {
+			return mergeBaseMain;
+		}
+		// The creation point must still be an ancestor of HEAD. After a
+		// `reset --hard` / `rebase --onto` onto a *different* branch, the reflog
+		// creation point is left stale — downstream of main yet no longer behind
+		// HEAD — and `git log <stalePoint>..HEAD` would be meaningless. Fall back
+		// to the mainline merge-base in that case.
+		if (!(await this.isAncestor(creationPoint, "HEAD"))) {
+			return mergeBaseMain;
+		}
+		// Mainline unresolvable (e.g. master/trunk default with no origin):
+		// trust the validated fork point directly.
+		if (mergeBaseMain === "") {
+			return creationPoint;
+		}
+		// Adopt the creation point only when it is downstream of (a descendant
+		// of) the mainline merge-base — the "cut from release/develop" case.
+		return (await this.isAncestor(mergeBaseMain, creationPoint))
+			? creationPoint
+			: mergeBaseMain;
 	}
 
 	/**
@@ -1221,21 +1323,25 @@ export class JolliMemoryBridge {
 	 * summary onto the new hash. The Commit QuickPick uses this to hide the
 	 * Amend actions when unsafe.
 	 *
-	 * `hasOwnCommits` uses the same base ref and `merge-base HEAD <base>` as
-	 * `listBranchCommits`: HEAD equal to the merge-base means the branch has no
-	 * diverging commit to amend. The two differ at one boundary — an empty
-	 * merge-base (no common ancestor, or no resolvable base ref) is counted here
-	 * as own work (amend allowed), since there is no shared commit to clobber;
-	 * the author check below is the real backstop for the "someone else's tip"
-	 * case the gate exists to prevent.
+	 * `hasOwnCommits` is measured from the branch's true fork point (see
+	 * {@link resolveOwnCommitsBase}), not just the mainline merge-base: a branch
+	 * cut from `release/1.0` with no commits of its own has its tip equal to that
+	 * fork point, so `hasOwnCommits` is false and Amend is hidden — even though
+	 * the tip is ahead of main. The author check below is a second guard for the
+	 * "someone else's tip" case.
 	 */
 	async getAmendSafety(mainBranch: string): Promise<AmendSafety> {
 		const headHash = await this.getHEADHash();
+		const branch = await this.getCurrentBranch();
 		const baseRef = await this.resolveHistoryBaseRef(mainBranch);
-		const mergeBase = (
+		const mergeBaseMain = (
 			await tryExecGit(["merge-base", "HEAD", baseRef], this.cwd)
 		).trim();
-		const hasOwnCommits = mergeBase !== headHash;
+		// Measure "own commits" from the branch's true fork point, not from main,
+		// so a branch cut from release/1.0 with no commits of its own is not
+		// treated as owning the base branch's shared tip.
+		const base = await this.resolveOwnCommitsBase(branch, mergeBaseMain);
+		const hasOwnCommits = base !== "" && base !== headHash;
 
 		const headAuthorEmail = (
 			await tryExecGit(["log", "-1", "--pretty=format:%ae"], this.cwd)
@@ -1249,6 +1355,65 @@ export class JolliMemoryBridge {
 			headAuthorEmail.toLowerCase() === currentUserEmail.toLowerCase();
 
 		return { hasOwnCommits, headAuthoredByCurrentUser };
+	}
+
+	/**
+	 * True when HEAD is reachable from a branch other than the current one (and
+	 * its own upstream) — i.e. the tip is also published on / shared with another
+	 * branch, so amending it would rewrite a commit that branch depends on.
+	 *
+	 * This is the safety signal the reflog fork point (see {@link getAmendSafety}
+	 * / {@link resolveOwnCommitsBase}) cannot provide: after a `reset --hard` /
+	 * `rebase --onto` onto another branch, HEAD can be a commit that branch still
+	 * points at while the reflog creation point still looks legitimate (it stays
+	 * an ancestor of HEAD when the other branch descends from it, e.g. gitflow's
+	 * release cut from develop). Used only to gate the Amend actions — the
+	 * history panel keeps the reflog-based range.
+	 *
+	 * Degrades to `false` (no extra block; the fork-point + author gates still
+	 * apply) if the ref scan fails.
+	 */
+	async isHeadSharedWithOtherBranch(): Promise<boolean> {
+		const output = await tryExecGit(
+			[
+				"for-each-ref",
+				"--contains=HEAD",
+				"--format=%(refname)",
+				"refs/heads",
+				"refs/remotes",
+			],
+			this.cwd,
+		);
+		const refs = output
+			.split("\n")
+			.map((r) => r.trim())
+			.filter(Boolean);
+		if (refs.length === 0) {
+			return false;
+		}
+		const branch = await this.getCurrentBranch();
+		const currentHeadRef = branch !== "HEAD" ? `refs/heads/${branch}` : "";
+		const upstream = (
+			await tryExecGit(
+				["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+				this.cwd,
+			)
+		).trim();
+		const currentUpstreamRef = upstream ? `refs/remotes/${upstream}` : "";
+		// Also exclude origin/<branch> directly: `git push origin <branch>` (no
+		// -u) leaves no @{upstream}, yet the same-named remote copy still
+		// contains HEAD. Mirrors resolvePushBaseRef's origin/<branch> fallback so
+		// a pushed-but-untracked branch isn't mistaken for "shared".
+		const currentBranchOriginRef =
+			branch !== "HEAD" ? `refs/remotes/origin/${branch}` : "";
+		// Shared when a containing ref is neither the current branch nor a remote
+		// copy of this same branch (its upstream, or origin/<branch>).
+		return refs.some(
+			(ref) =>
+				ref !== currentHeadRef &&
+				ref !== currentUpstreamRef &&
+				ref !== currentBranchOriginRef,
+		);
 	}
 
 	/**

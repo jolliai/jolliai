@@ -205,9 +205,10 @@ const { lstat, mkdir, rm, unlink, writeFile } = vi.hoisted(() => ({
  * The mock signature must match the callback-based execFile:
  *   execFile(cmd, args, options, callback)
  *
- * Uses an argument-matching approach: each stubbed response is keyed by a
- * matcher that inspects (cmd, args) so the order of concurrent calls
- * (e.g. inside Promise.all) does not matter.
+ * Responses are queued FIFO via `mockImplementationOnce` (see
+ * `mockExecFileSuccess`/`mockExecFileError`): each call consumes the next
+ * stubbed response in order, so a test's mocks must be arranged in the exact
+ * order the code under test invokes git.
  */
 const execFileMock = vi.hoisted(() => {
 	const fn = vi.fn();
@@ -1933,20 +1934,20 @@ describe("JolliMemoryBridge", () => {
 	// ── getAmendSafety ───────────────────────────────────────────────────
 
 	describe("getAmendSafety()", () => {
-		// Each getAmendSafety() call runs exactly: getHEADHash → refExists
-		// (origin/main) → merge-base → log %ae → config user.email.
+		// Call order: getHEADHash → getCurrentBranch → refExists(origin/main) →
+		// merge-base → findBranchCreationPoint (reflog) → [merge-base --is-ancestor
+		// when the creation point differs from the merge-base] → log %ae →
+		// config user.email.
 
-		it("reports own work when HEAD diverges from base and the author matches", async () => {
-			// getHEADHash
-			mockExecFileSuccess("head1111\n");
-			// resolveHistoryBaseRef → refExists origin/main
-			mockExecFileSuccess("base9999\n");
-			// merge-base — differs from HEAD
-			mockExecFileSuccess("mergebase7\n");
-			// HEAD author email (different case — must still match)
-			mockExecFileSuccess("Me@Example.com\n");
-			// current git user.email
-			mockExecFileSuccess("me@example.com\n");
+		it("reports own work when the branch was cut from main and the author matches", async () => {
+			mockExecFileSuccess("head1111\n"); // getHEADHash
+			mockExecFileSuccess("feature/x\n"); // getCurrentBranch
+			mockExecFileSuccess("base9999\n"); // refExists origin/main
+			mockExecFileSuccess("mergebase7\n"); // merge-base — differs from HEAD
+			// reflog: created from main at the merge-base → creationPoint == merge-base
+			mockExecFileSuccess("mergebase7 branch: Created from main\n");
+			mockExecFileSuccess("Me@Example.com\n"); // author (different case — must still match)
+			mockExecFileSuccess("me@example.com\n"); // user.email
 
 			const bridge = makeBridge();
 			const result = await bridge.getAmendSafety("main");
@@ -1957,10 +1958,12 @@ describe("JolliMemoryBridge", () => {
 			});
 		});
 
-		it("flags no own commits when HEAD equals the merge-base", async () => {
+		it("flags no own commits when HEAD equals the mainline merge-base", async () => {
 			mockExecFileSuccess("samehash0\n"); // getHEADHash
+			mockExecFileSuccess("fix/foo\n"); // getCurrentBranch
 			mockExecFileSuccess("base9999\n"); // refExists origin/main
 			mockExecFileSuccess("samehash0\n"); // merge-base === HEAD
+			mockExecFileSuccess("samehash0 branch: Created from main\n"); // reflog → creationPoint == merge-base
 			mockExecFileSuccess("me@example.com\n"); // author
 			mockExecFileSuccess("me@example.com\n"); // user.email
 
@@ -1971,10 +1974,176 @@ describe("JolliMemoryBridge", () => {
 			expect(result.headAuthoredByCurrentUser).toBe(true);
 		});
 
-		it("flags a foreign author when HEAD email differs from user.email", async () => {
+		it("flags no own commits for a fresh branch cut from a non-main base (release fork)", async () => {
+			// hotfix/x cut from release/1.0 at E; HEAD is still E (zero own commits).
+			mockExecFileSuccess("E0000000\n"); // getHEADHash (HEAD = E)
+			mockExecFileSuccess("hotfix/x\n"); // getCurrentBranch
+			mockExecFileSuccess("base9999\n"); // refExists origin/main
+			mockExecFileSuccess("C0000000\n"); // merge-base with main = C
+			mockExecFileSuccess("E0000000 branch: Created from release/1.0\n"); // reflog → creationPoint = E
+			mockExecFileSuccess(""); // is-ancestor E HEAD → exit 0 (still behind HEAD) → keep E
+			mockExecFileSuccess(""); // is-ancestor C E → exit 0 (downstream) → base = E
+			mockExecFileSuccess("me@example.com\n"); // author
+			mockExecFileSuccess("me@example.com\n"); // user.email
+
+			const bridge = makeBridge();
+			const result = await bridge.getAmendSafety("main");
+
+			// base == E == HEAD → no own commits, even though E is ahead of main.
+			expect(result.hasOwnCommits).toBe(false);
+		});
+
+		it("reports own work once the release-fork branch has its own commit", async () => {
+			// hotfix/x cut from release/1.0 at E, now with own commit F on top.
+			mockExecFileSuccess("F0000000\n"); // getHEADHash (HEAD = F)
+			mockExecFileSuccess("hotfix/x\n"); // getCurrentBranch
+			mockExecFileSuccess("base9999\n"); // refExists origin/main
+			mockExecFileSuccess("C0000000\n"); // merge-base with main = C
+			mockExecFileSuccess("E0000000 branch: Created from release/1.0\n"); // reflog → creationPoint = E
+			mockExecFileSuccess(""); // is-ancestor E HEAD → behind HEAD → keep E
+			mockExecFileSuccess(""); // is-ancestor C E → downstream → base = E
+			mockExecFileSuccess("me@example.com\n"); // author
+			mockExecFileSuccess("me@example.com\n"); // user.email
+
+			const bridge = makeBridge();
+			const result = await bridge.getAmendSafety("main");
+
+			// base == E != F → own commit exists → amend allowed.
+			expect(result.hasOwnCommits).toBe(true);
+		});
+
+		it("skips the reflog fork point on detached HEAD and uses the mainline merge-base", async () => {
 			mockExecFileSuccess("head1111\n"); // getHEADHash
+			mockExecFileSuccess("HEAD\n"); // getCurrentBranch → detached
 			mockExecFileSuccess("base9999\n"); // refExists origin/main
 			mockExecFileSuccess("mergebase7\n"); // merge-base
+			// findBranchCreationPoint bails out for "HEAD" → no reflog call,
+			// resolveOwnCommitsBase returns the merge-base directly.
+			mockExecFileSuccess("me@example.com\n"); // author
+			mockExecFileSuccess("me@example.com\n"); // user.email
+
+			const bridge = makeBridge();
+			const result = await bridge.getAmendSafety("main");
+
+			// base == merge-base (mergebase7) != HEAD → own work, no reflog consulted.
+			expect(result.hasOwnCommits).toBe(true);
+		});
+
+		it("falls back to the mainline merge-base when the reflog is unavailable", async () => {
+			mockExecFileSuccess("head1111\n"); // getHEADHash
+			mockExecFileSuccess("feature/x\n"); // getCurrentBranch
+			mockExecFileSuccess("base9999\n"); // refExists origin/main
+			mockExecFileSuccess("mergebase7\n"); // merge-base
+			mockExecFileSuccess("\n"); // reflog empty → creationPoint undefined → use merge-base
+			mockExecFileSuccess("me@example.com\n"); // author
+			mockExecFileSuccess("me@example.com\n"); // user.email
+
+			const bridge = makeBridge();
+			const result = await bridge.getAmendSafety("main");
+
+			// base == merge-base (mergebase7) != HEAD → own work.
+			expect(result.hasOwnCommits).toBe(true);
+		});
+
+		it("keeps the mainline merge-base when the creation point is not downstream of it", async () => {
+			mockExecFileSuccess("head1111\n"); // getHEADHash
+			mockExecFileSuccess("feature/x\n"); // getCurrentBranch
+			mockExecFileSuccess("base9999\n"); // refExists origin/main
+			mockExecFileSuccess("mergebase7\n"); // merge-base
+			mockExecFileSuccess("other000 branch: Created from somewhere\n"); // reflog → creationPoint = other000
+			mockExecFileSuccess(""); // is-ancestor other000 HEAD → behind HEAD (P1 guard passes)
+			mockExecFileError("not downstream"); // is-ancestor mergebase7 other000 → exit 1 → keep merge-base
+			mockExecFileSuccess("me@example.com\n"); // author
+			mockExecFileSuccess("me@example.com\n"); // user.email
+
+			const bridge = makeBridge();
+			const result = await bridge.getAmendSafety("main");
+
+			// base == mergebase7 != HEAD → own work.
+			expect(result.hasOwnCommits).toBe(true);
+		});
+
+		it("rejects a stale creation point that is no longer an ancestor of HEAD (reset onto another branch)", async () => {
+			// feature cut from develop (D1), then `git reset --hard release` → HEAD = R1.
+			// The reflog still says "Created from develop", but D1 is no longer behind HEAD.
+			mockExecFileSuccess("R1111111\n"); // getHEADHash (HEAD = R1, release tip)
+			mockExecFileSuccess("feature\n"); // getCurrentBranch
+			mockExecFileSuccess("base9999\n"); // refExists origin/main
+			mockExecFileSuccess("M1111111\n"); // merge-base with main = M1
+			mockExecFileSuccess("D1111111 branch: Created from develop\n"); // reflog → stale creationPoint = D1
+			mockExecFileError("not an ancestor"); // is-ancestor D1 HEAD → exit 1 → stale → fall back to M1
+			mockExecFileSuccess("me@example.com\n"); // author
+			mockExecFileSuccess("me@example.com\n"); // user.email
+
+			const bridge = makeBridge();
+			const result = await bridge.getAmendSafety("main");
+
+			// The stale D1 is rejected; base falls back to the mainline merge-base M1.
+			const guardCall = execFileMock.mock.calls.find(
+				(c) =>
+					Array.isArray(c[1]) &&
+					c[1][1] === "--is-ancestor" &&
+					c[1][2] === "D1111111" &&
+					c[1][3] === "HEAD",
+			);
+			expect(guardCall).toBeDefined();
+			// Falls back to M1 (≠ HEAD); the downstream check on D1 is never reached.
+			expect(result.hasOwnCommits).toBe(true);
+			const downstreamCall = execFileMock.mock.calls.find(
+				(c) =>
+					Array.isArray(c[1]) &&
+					c[1][1] === "--is-ancestor" &&
+					c[1][3] === "D1111111",
+			);
+			expect(downstreamCall).toBeUndefined();
+		});
+
+		it("ignores a guessed oldest reflog entry when no explicit creation record survives (P2)", async () => {
+			// Single-commit branch whose "Created from" reflog entry has expired;
+			// the oldest surviving entry is the branch's own first commit F1.
+			mockExecFileSuccess("F1111111\n"); // getHEADHash (HEAD = F1)
+			mockExecFileSuccess("feature\n"); // getCurrentBranch
+			mockExecFileSuccess("base9999\n"); // refExists origin/main
+			mockExecFileSuccess("M1111111\n"); // merge-base with main = M1
+			// reflog has entries but NO "branch: Created from" → requireExplicit → undefined.
+			mockExecFileSuccess("F1111111 commit: my first commit\n");
+			mockExecFileSuccess("me@example.com\n"); // author
+			mockExecFileSuccess("me@example.com\n"); // user.email
+
+			const bridge = makeBridge();
+			const result = await bridge.getAmendSafety("main");
+
+			// base degrades to M1 (not the guessed F1), so the lone commit still
+			// counts as own work and amend stays available.
+			expect(result.hasOwnCommits).toBe(true);
+		});
+
+		it("uses the reflog creation point directly when the mainline is unresolvable (master default)", async () => {
+			// master-default repo: origin/main, upstream/main, main all missing.
+			mockExecFileSuccess("E0000000\n"); // getHEADHash (HEAD = E)
+			mockExecFileSuccess("hotfix/x\n"); // getCurrentBranch
+			mockExecFileError("no origin/main"); // refExists origin/main
+			mockExecFileError("no upstream/main"); // refExists upstream/main
+			mockExecFileError("no main"); // refExists main → resolveHistoryBaseRef returns "main"
+			mockExecFileError("no merge base"); // merge-base HEAD main → "" (mergeBaseMain unresolvable)
+			mockExecFileSuccess("E0000000 branch: Created from release/1.0\n"); // reflog → creationPoint = E
+			mockExecFileSuccess(""); // is-ancestor E HEAD → behind HEAD (P1 guard passes)
+			mockExecFileSuccess("me@example.com\n"); // author
+			mockExecFileSuccess("me@example.com\n"); // user.email
+
+			const bridge = makeBridge();
+			const result = await bridge.getAmendSafety("main");
+
+			// mergeBaseMain == "" → use creationPoint E directly; E == HEAD → no own commits.
+			expect(result.hasOwnCommits).toBe(false);
+		});
+
+		it("flags a foreign author when HEAD email differs from user.email", async () => {
+			mockExecFileSuccess("head1111\n"); // getHEADHash
+			mockExecFileSuccess("feature/x\n"); // getCurrentBranch
+			mockExecFileSuccess("base9999\n"); // refExists origin/main
+			mockExecFileSuccess("mergebase7\n"); // merge-base
+			mockExecFileSuccess("mergebase7 branch: Created from main\n"); // reflog → creationPoint == merge-base
 			mockExecFileSuccess("colleague@example.com\n"); // author
 			mockExecFileSuccess("me@example.com\n"); // user.email
 
@@ -1987,8 +2156,10 @@ describe("JolliMemoryBridge", () => {
 
 		it("treats an empty HEAD author email as not the current user", async () => {
 			mockExecFileSuccess("head1111\n"); // getHEADHash
+			mockExecFileSuccess("feature/x\n"); // getCurrentBranch
 			mockExecFileSuccess("base9999\n"); // refExists origin/main
 			mockExecFileSuccess("mergebase7\n"); // merge-base
+			mockExecFileSuccess("mergebase7 branch: Created from main\n"); // reflog
 			mockExecFileSuccess("\n"); // author email empty
 			mockExecFileSuccess("me@example.com\n"); // user.email
 
@@ -2000,8 +2171,10 @@ describe("JolliMemoryBridge", () => {
 
 		it("treats an empty user.email as not the current user", async () => {
 			mockExecFileSuccess("head1111\n"); // getHEADHash
+			mockExecFileSuccess("feature/x\n"); // getCurrentBranch
 			mockExecFileSuccess("base9999\n"); // refExists origin/main
 			mockExecFileSuccess("mergebase7\n"); // merge-base
+			mockExecFileSuccess("mergebase7 branch: Created from main\n"); // reflog
 			mockExecFileSuccess("someone@example.com\n"); // author
 			mockExecFileSuccess("\n"); // user.email empty
 
@@ -2009,6 +2182,72 @@ describe("JolliMemoryBridge", () => {
 			const result = await bridge.getAmendSafety("main");
 
 			expect(result.headAuthoredByCurrentUser).toBe(false);
+		});
+	});
+
+	// ── isHeadSharedWithOtherBranch ──────────────────────────────────────
+
+	describe("isHeadSharedWithOtherBranch()", () => {
+		// Call order: for-each-ref --contains=HEAD → [getCurrentBranch →
+		// @{upstream}] (only when the ref list is non-empty).
+
+		it("returns false when only the current branch and its upstream contain HEAD", async () => {
+			mockExecFileSuccess(
+				"refs/heads/feature\nrefs/remotes/origin/feature\n",
+			); // for-each-ref
+			mockExecFileSuccess("feature\n"); // getCurrentBranch
+			mockExecFileSuccess("origin/feature\n"); // @{upstream}
+
+			const bridge = makeBridge();
+			expect(await bridge.isHeadSharedWithOtherBranch()).toBe(false);
+		});
+
+		it("returns true when another branch contains HEAD", async () => {
+			mockExecFileSuccess(
+				"refs/heads/feature\nrefs/remotes/origin/release/1.0\n",
+			); // for-each-ref
+			mockExecFileSuccess("feature\n"); // getCurrentBranch
+			mockExecFileSuccess("origin/feature\n"); // @{upstream}
+
+			const bridge = makeBridge();
+			expect(await bridge.isHeadSharedWithOtherBranch()).toBe(true);
+		});
+
+		it("returns false when no ref contains HEAD", async () => {
+			mockExecFileSuccess("\n"); // for-each-ref → empty (no branch/upstream lookups)
+
+			const bridge = makeBridge();
+			expect(await bridge.isHeadSharedWithOtherBranch()).toBe(false);
+		});
+
+		it("ignores the current branch when it has no upstream", async () => {
+			mockExecFileSuccess("refs/heads/feature\n"); // for-each-ref → only current branch
+			mockExecFileSuccess("feature\n"); // getCurrentBranch
+			mockExecFileError("no upstream"); // @{upstream} fails → no upstream ref
+
+			const bridge = makeBridge();
+			expect(await bridge.isHeadSharedWithOtherBranch()).toBe(false);
+		});
+
+		it("ignores the current branch's pushed copy even without tracking (push without -u)", async () => {
+			// `git push origin feature` (no -u): origin/feature contains HEAD but
+			// @{upstream} is unset — the origin/<branch> fallback must exclude it.
+			mockExecFileSuccess("refs/heads/feature\nrefs/remotes/origin/feature\n"); // for-each-ref
+			mockExecFileSuccess("feature\n"); // getCurrentBranch
+			mockExecFileError("no upstream"); // @{upstream} fails (no tracking)
+
+			const bridge = makeBridge();
+			expect(await bridge.isHeadSharedWithOtherBranch()).toBe(false);
+		});
+
+		it("treats a detached HEAD reachable from a branch as shared", async () => {
+			mockExecFileSuccess("refs/heads/main\n"); // for-each-ref → main contains HEAD
+			mockExecFileSuccess("HEAD\n"); // getCurrentBranch → detached
+			mockExecFileError("no upstream"); // @{upstream} fails
+
+			const bridge = makeBridge();
+			// No current-branch ref to exclude → main counts as another branch.
+			expect(await bridge.isHeadSharedWithOtherBranch()).toBe(true);
 		});
 	});
 
@@ -3580,6 +3819,8 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("headhash123\n");
 			// merge-base
 			mockExecFileSuccess("mergebase456\n");
+			// resolveOwnCommitsBase → findBranchCreationPoint: empty reflog → keep main merge-base
+			mockExecFileSuccess("\n");
 			// git log
 			const logEntry = `commitHash1\x00fix: test change\x00John Doe\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
@@ -3655,6 +3896,8 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("headhash\n");
 			// merge-base
 			mockExecFileSuccess("mergebase\n");
+			// resolveOwnCommitsBase → findBranchCreationPoint: empty reflog → keep main merge-base
+			mockExecFileSuccess("\n");
 			// git log — empty
 			mockExecFileSuccess("\n");
 
@@ -3665,6 +3908,64 @@ describe("JolliMemoryBridge", () => {
 			expect(result.isMerged).toBe(false);
 		});
 
+		it("excludes the base branch's commits for a fresh branch cut from a non-main base (release fork)", async () => {
+			// hotfix/x cut from release/1.0 at E; HEAD is still E (zero own commits).
+			mockExecFileSuccess("hotfix/x\n"); // getCurrentBranch
+			mockExecFileSuccess("abc\n"); // resolveHistoryBaseRef → origin/main
+			mockExecFileSuccess("E0000000\n"); // getHEADHash (HEAD = E)
+			mockExecFileSuccess("C0000000\n"); // merge-base with main = C (≠ HEAD → not merged)
+			mockExecFileSuccess("E0000000 branch: Created from release/1.0\n"); // reflog → creationPoint = E
+			mockExecFileSuccess(""); // is-ancestor E HEAD → behind HEAD (P1 guard)
+			mockExecFileSuccess(""); // is-ancestor C E → downstream → base = E
+			mockExecFileSuccess("\n"); // git log E..E → empty (nothing of its own)
+
+			const bridge = makeBridge();
+			const result = await bridge.listBranchCommits("main");
+
+			// D and E belong to release/1.0, not to hotfix/x.
+			expect(result.commits).toEqual([]);
+			expect(result.isMerged).toBe(false);
+		});
+
+		it("lists only the branch's own commits past the release fork point, not the base branch's", async () => {
+			// hotfix/x cut from release/1.0 at E, with its own commit F on top.
+			mockExecFileSuccess("hotfix/x\n"); // getCurrentBranch
+			mockExecFileSuccess("abc\n"); // resolveHistoryBaseRef → origin/main
+			mockExecFileSuccess("F0000000\n"); // getHEADHash (HEAD = F)
+			mockExecFileSuccess("C0000000\n"); // merge-base with main = C
+			mockExecFileSuccess("E0000000 branch: Created from release/1.0\n"); // reflog → creationPoint = E
+			mockExecFileSuccess(""); // is-ancestor E HEAD → behind HEAD (P1 guard)
+			mockExecFileSuccess(""); // is-ancestor C E → downstream → base = E
+			const logEntry = `F0000000\x00fix: hotfix work\x00Me\x00me@example.com\x002026-06-20T10:00:00Z\x00\x00\n`;
+			mockExecFileSuccess(logEntry); // git log E..HEAD → only F
+			mockExecFileError("no upstream"); // resolvePushBaseRef @{upstream}
+			mockExecFileError("no origin branch"); // refExists origin/hotfix/x
+			getIndexEntryMap.mockResolvedValue(new Map());
+			getDiffStats.mockResolvedValueOnce({
+				filesChanged: 1,
+				insertions: 2,
+				deletions: 0,
+			});
+			scanTreeHashAliases.mockResolvedValue(false);
+
+			const bridge = makeBridge();
+			const result = await bridge.listBranchCommits("main");
+
+			expect(result.commits).toHaveLength(1);
+			expect(result.commits[0].hash).toBe("F0000000");
+			// The git log range must start at the fork point E, not the main merge-base C.
+			const logCall = execFileMock.mock.calls.find(
+				(c) => Array.isArray(c[1]) && c[1].includes("E0000000..HEAD"),
+			);
+			expect(logCall).toBeDefined();
+			// And it must NOT fall back to the main merge-base C (the old behavior
+			// that would surface release/1.0's D and E).
+			const usedMainBase = execFileMock.mock.calls.some(
+				(c) => Array.isArray(c[1]) && c[1].includes("C0000000..HEAD"),
+			);
+			expect(usedMainBase).toBe(false);
+		});
+
 		it("returns local mainBranch when only the local fallback ref exists", async () => {
 			mockExecFileSuccess("feature/test\n");
 			mockExecFileError("origin missing");
@@ -3672,6 +3973,8 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("mainhash\n");
 			mockExecFileSuccess("headhash\n");
 			mockExecFileSuccess("mergebase\n");
+			// resolveOwnCommitsBase → findBranchCreationPoint: empty reflog → keep main merge-base
+			mockExecFileSuccess("\n");
 			const logEntry = `commitHash1\x00feat: local fallback\x00User\x00user@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
 			mockExecFileError("no upstream");
@@ -3769,6 +4072,8 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("headhash123\n");
 			// merge-base
 			mockExecFileSuccess("mergebase456\n");
+			// resolveOwnCommitsBase → findBranchCreationPoint: empty reflog → keep main merge-base
+			mockExecFileSuccess("\n");
 			// git log
 			const logEntry = `commitHash1\x00fix: amend\x00John Doe\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
@@ -3853,6 +4158,8 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("headhash123\n");
 			// merge-base
 			mockExecFileSuccess("mergebase456\n");
+			// resolveOwnCommitsBase → findBranchCreationPoint: empty reflog → keep main merge-base
+			mockExecFileSuccess("\n");
 			// git log — one commit
 			const logEntry = `commitHash1\x00fix: test\x00John\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
@@ -3905,6 +4212,8 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("headhash\n");
 			// merge-base
 			mockExecFileSuccess("mergebase\n");
+			// resolveOwnCommitsBase → findBranchCreationPoint: empty reflog → keep main merge-base
+			mockExecFileSuccess("\n");
 			// git log
 			const logEntry = `commitHash1\x00feat: test\x00User\x00user@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
@@ -3941,6 +4250,8 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("headhash\n");
 			// merge-base
 			mockExecFileSuccess("mergebase\n");
+			// resolveOwnCommitsBase → findBranchCreationPoint: empty reflog → keep main merge-base
+			mockExecFileSuccess("\n");
 			// git log
 			const logEntry = `commitHash1\x00feat: new\x00Test User\x00test@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
@@ -4158,6 +4469,8 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("headhash\n");
 			// merge-base
 			mockExecFileSuccess("mergebase\n");
+			// resolveOwnCommitsBase → findBranchCreationPoint: empty reflog → keep main merge-base
+			mockExecFileSuccess("\n");
 			// git log — one commit
 			const logEntry = `commitHash1\x00feat: test\x00User\x00user@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry);
@@ -5383,6 +5696,7 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("abc\n"); // resolveHistoryBaseRef
 			mockExecFileSuccess("headhash123\n"); // getHEADHash
 			mockExecFileSuccess("mergebase456\n"); // merge-base
+			mockExecFileSuccess("\n"); // resolveOwnCommitsBase → empty reflog → keep main merge-base
 			const logEntry = `commitHash1\x00fix: test change\x00John Doe\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
 			mockExecFileSuccess(logEntry); // git log
 			mockExecFileSuccess("origin/feature/test\n"); // upstream rev-parse
@@ -5424,6 +5738,7 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("abc\n");
 			mockExecFileSuccess("headhash123\n");
 			mockExecFileSuccess("mergebase456\n");
+			mockExecFileSuccess("\n"); // resolveOwnCommitsBase → empty reflog → keep main merge-base
 			// Two commits in log; only one is in the index, so the other
 			// becomes an unmatched candidate that triggers the scan.
 			const logEntry =
