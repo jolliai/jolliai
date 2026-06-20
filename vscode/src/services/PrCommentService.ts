@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as vscode from "vscode";
 import { execFileAsyncHidden } from "../../../cli/src/util/Subprocess.js";
+import { MARKER_END, MARKER_START, wrapWithMarkers } from "../../../cli/src/core/PrDescription.js";
 import { log } from "../util/Logger.js";
 
 const TAG = "PrSection";
@@ -26,17 +27,9 @@ const TAG = "PrSection";
 
 // ─── Marker constants ────────────────────────────────────────────────────────
 
-const MARKER_START = "<!-- jollimemory-summary-start -->";
-const MARKER_END = "<!-- jollimemory-summary-end -->";
-const MARKER_PATTERN =
-	/<!-- jollimemory-summary-start -->[\s\S]*?<!-- jollimemory-summary-end -->/;
-
-// ─── Marker helpers ──────────────────────────────────────────────────────────
-
-/** Wraps markdown content with start/end markers. */
-export function wrapWithMarkers(markdown: string): string {
-	return `${MARKER_START}\n${markdown}\n${MARKER_END}`;
-}
+const MARKER_PATTERN = new RegExp(
+	`${MARKER_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\s\\S]*?${MARKER_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+);
 
 /** Replaces the marker region in body, or appends if no markers found. */
 function replaceSummaryInBody(

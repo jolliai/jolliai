@@ -408,7 +408,12 @@ export async function drainIngest(
 		// The iteration guard below remains a backstop for the pathological case
 		// where each batch DOES make progress yet never drains.
 		if (r.ingested === 0) {
-			outcome = r.topicFailures[0]?.code ?? INGEST_CODES.PAGE_WRITE_CONFLICT;
+			// `ingested === 0` means every batched ref landed in `failedRefs`, and both
+			// sites that add to `failedRefs` (reconcile-failure + page-write-hold) push a
+			// matching `topicFailures` entry in lockstep — so `topicFailures[0]` is always
+			// present here. Read its code directly: a `?? PAGE_WRITE_CONFLICT` fallback
+			// would be unreachable dead code (the array is never empty when ingested === 0).
+			outcome = r.topicFailures[0].code;
 			log.warn(
 				"drainIngest made no progress this batch (%d source(s) held, outcome=%s) -- stopping; next trigger retries",
 				r.pendingCount,

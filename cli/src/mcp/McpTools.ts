@@ -8,6 +8,7 @@
 import type { BranchCatalog, RecallPayload } from "../core/ContextCompiler.js";
 import { buildRecallPayload, compileTaskContext, listBranchCatalog } from "../core/ContextCompiler.js";
 import { getCurrentBranch } from "../core/GitOps.js";
+import { buildPrDescription, type PrDescriptionResult } from "../core/PrDescription.js";
 import type { SearchHitResult } from "../core/SearchIndex.js";
 import { SearchIndex } from "../core/SearchIndex.js";
 import { compareSourceRefs } from "../core/SourceTimeline.js";
@@ -76,4 +77,16 @@ export async function runDecisionTimeline(
 
 export async function runListBranches(cwd: string): Promise<BranchCatalog> {
 	return listBranchCatalog(cwd);
+}
+
+export interface GetPrDescriptionArgs {
+	baseBranch?: string;
+	includeMarkers?: boolean;
+}
+
+export async function runGetPrDescription(cwd: string, args: GetPrDescriptionArgs): Promise<PrDescriptionResult> {
+	return buildPrDescription(cwd, {
+		baseBranch: args.baseBranch,
+		includeMarkers: args.includeMarkers,
+	});
 }

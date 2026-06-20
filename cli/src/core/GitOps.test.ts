@@ -42,6 +42,7 @@ import {
 	getCommitInfo,
 	getCommitRange,
 	getCurrentBranch,
+	getDefaultBranch,
 	getDiffContent,
 	getDiffStats,
 	getGitCommonDir,
@@ -399,6 +400,23 @@ describe("GitOps", () => {
 		it("should throw on failure", async () => {
 			mockFailure(128, "fatal: not a git repo");
 			await expect(getCurrentBranch()).rejects.toThrow("Failed to get current branch");
+		});
+	});
+
+	describe("getDefaultBranch", () => {
+		it("returns the branch from origin/HEAD, stripping the origin/ prefix", async () => {
+			mockSuccess("origin/develop\n");
+			expect(await getDefaultBranch()).toBe("develop");
+		});
+
+		it("falls back to main when origin/HEAD is unset", async () => {
+			mockFailure(128, "fatal: ref refs/remotes/origin/HEAD is not a symbolic ref");
+			expect(await getDefaultBranch()).toBe("main");
+		});
+
+		it("falls back to main when origin/HEAD resolves empty", async () => {
+			mockSuccess("\n");
+			expect(await getDefaultBranch()).toBe("main");
 		});
 	});
 

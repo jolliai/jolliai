@@ -971,6 +971,22 @@ vi.mock("node:fs", () => ({
 	readFileSync,
 }));
 
+// Extension imports setTimeout/clearTimeout from `node:timers` (not the global),
+// so vi.useFakeTimers() can't intercept the kbInitPromise watchdog. Capture the
+// watchdog callback here instead: the latest scheduled callback is stored and a
+// test can fire it manually to simulate the 60s timeout. clearTimeout drops it,
+// mirroring the `.finally()` cancel on the normal (non-hanging) path.
+const { capturedWatchdog } = vi.hoisted(() => ({ capturedWatchdog: { fn: null as null | (() => void) } }));
+vi.mock("node:timers", () => ({
+	setTimeout: vi.fn((cb: () => void) => {
+		capturedWatchdog.fn = cb;
+		return 1 as unknown as NodeJS.Timeout;
+	}),
+	clearTimeout: vi.fn(() => {
+		capturedWatchdog.fn = null;
+	}),
+}));
+
 // ─── Import under test ─────────────────────────────────────────────────────
 
 import * as vscode from "vscode";
@@ -1211,6 +1227,24 @@ describe("Extension", () => {
 			activate(ctx);
 
 			// Activation should succeed even with relative git paths
+			expect(registerCommand).toHaveBeenCalled();
+		});
+	});
+
+	describe("activate — sync activation failure", () => {
+		it("logs and keeps activating when activateSync rejects", async () => {
+			// `activateSync(...)` is guarded by a `.catch` that logs and resolves to
+			// null, so a sync-bootstrap failure never aborts the whole extension —
+			// the round-finished wiring is simply skipped.
+			activateSyncMock.mockRejectedValueOnce(new Error("sync boom"));
+			const ctx = makeContext();
+
+			activate(ctx);
+
+			await vi.waitFor(() => {
+				const warnCalls = warn.mock.calls.map((c) => c.join(" "));
+				expect(warnCalls.some((s) => s.includes("Memory Bank sync activation failed"))).toBe(true);
+			});
 			expect(registerCommand).toHaveBeenCalled();
 		});
 	});
@@ -1530,6 +1564,37 @@ describe("Extension", () => {
 			});
 			expect(migrateSchemaToV5).not.toHaveBeenCalled();
 		});
+
+		it("treats a readSchemaV5State read error as pending and still runs the migration", async () => {
+			// A state-read failure must NOT abort activation — it's treated as
+			// "unknown / pending" (the `.catch(() => null)` arm) so migrateSchemaToV5
+			// gets to re-check and short-circuit if needed.
+			const { readSchemaV5State, migrateSchemaToV5 } = await import("../../cli/src/core/SchemaV5Migration.js");
+			vi.mocked(readSchemaV5State).mockRejectedValueOnce(new Error("state read boom"));
+
+			const ctx = makeContext();
+			activate(ctx);
+
+			await vi.waitFor(() => {
+				expect(migrateSchemaToV5).toHaveBeenCalled();
+			});
+		});
+
+		it("swallows a migrateSchemaToV5 failure (non-fatal) without aborting activation", async () => {
+			// The migration is wrapped in a non-fatal try/catch; a failure is logged
+			// and the spinner is cleared in `finally`, leaving the sidebar usable.
+			const { migrateSchemaToV5 } = await import("../../cli/src/core/SchemaV5Migration.js");
+			vi.mocked(migrateSchemaToV5).mockRejectedValueOnce(new Error("migrate boom"));
+
+			const ctx = makeContext();
+			activate(ctx);
+
+			await vi.waitFor(() => {
+				expect(migrateSchemaToV5).toHaveBeenCalled();
+			});
+			// Activation completed despite the failure — commands are registered.
+			expect(registerCommand).toHaveBeenCalled();
+		});
 	});
 
 	// ── KB folder auto-init / v3 stale-child cleanup on activate ─────────────
@@ -1697,6 +1762,23 @@ describe("Extension", () => {
 					expect.any(Error),
 				);
 			});
+		});
+
+		it("releases the sync gate via the 60s watchdog when initializeKB never settles", () => {
+			// The sync gate (kbInitPromise) is normally released by initializeKB's
+			// `.finally`. If initializeKB hangs (e.g. a wedged git call), the 60s
+			// watchdog releases it anyway so sync can't hang forever. Hang the first
+			// await (orphan.exists) so `.finally` never clears the watchdog, then fire
+			// the captured timeout callback to simulate the 60s elapse.
+			mockOrphanInstance.exists.mockReturnValueOnce(new Promise<boolean>(() => {}));
+			capturedWatchdog.fn = null;
+			activate(makeContext());
+
+			expect(capturedWatchdog.fn).toBeTypeOf("function");
+			capturedWatchdog.fn?.();
+
+			const warnCalls = warn.mock.calls.map((c) => c.join(" "));
+			expect(warnCalls.some((s) => s.includes("watchdog fired"))).toBe(true);
 		});
 
 		it("does nothing when orphan branch does not exist", async () => {
@@ -4053,6 +4135,91 @@ describe("Extension", () => {
 				);
 			});
 
+			it("warns 'hidden source missing' when regenerateVisiblePlan returns false", async () => {
+				// The plan helper returning false means the hidden plan JSON is gone,
+				// so the revert maps to { ok: false, reason: "missing" } and surfaces
+				// the distinct failure hint rather than a success toast.
+				const planAbs = "/tmp/kb-fake/repo/feature-x/plan--abcd1234abcd1234.md";
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn(),
+					regenerateVisiblePlan: vi.fn().mockResolvedValue(false),
+					regenerateVisibleNote: vi.fn(),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "feature-x/plan--abcd1234abcd1234.md",
+						fileId: "plan:abcd1234abcd1234",
+						type: "plan",
+						fingerprint: "old",
+						source: { branch: "feature/x" },
+						title: "Plan x",
+					},
+				});
+
+				await getRegisteredCommand("jollimemory.revertMemoryFileEdits")(planAbs);
+
+				expect(folderStorage.regenerateVisiblePlan).toHaveBeenCalledWith("abcd1234abcd1234", "feature/x");
+				expect(showWarningMessage).toHaveBeenCalledWith(expect.stringContaining("hidden source missing"));
+				expect(showInformationMessage).not.toHaveBeenCalledWith(expect.stringContaining("Reverted"));
+			});
+
+			it("warns 'hidden source missing' when regenerateVisibleNote returns false", async () => {
+				const noteAbs = "/tmp/kb-fake/repo/fix-y/note--ef01ef01ef01ef01.md";
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn(),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn().mockResolvedValue(false),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "fix-y/note--ef01ef01ef01ef01.md",
+						fileId: "note:ef01ef01ef01ef01",
+						type: "note",
+						fingerprint: "old",
+						source: { branch: "fix/y" },
+						title: "Note y",
+					},
+				});
+
+				await getRegisteredCommand("jollimemory.revertMemoryFileEdits")(noteAbs);
+
+				expect(folderStorage.regenerateVisibleNote).toHaveBeenCalledWith("ef01ef01ef01ef01", "fix/y");
+				expect(showWarningMessage).toHaveBeenCalledWith(expect.stringContaining("hidden source missing"));
+				expect(showInformationMessage).not.toHaveBeenCalledWith(expect.stringContaining("Reverted"));
+			});
+
+			it("warns 'no recorded branch' when the manifest entry has no branch and the path has no folder segment", async () => {
+				// resolveBranch returns null: no source.branch AND the path is a bare
+				// filename (no "/"), so there's no folder segment to map to a branch.
+				// The revert must abort with the dedicated warning before touching
+				// the regenerate helpers.
+				const planAbs = "/tmp/kb-fake/repo/plan--abcd1234abcd1234.md";
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn(),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn(),
+					resolveBranchForFolder: vi.fn(() => null),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "plan--abcd1234abcd1234.md",
+						fileId: "plan:abcd1234abcd1234",
+						type: "plan",
+						fingerprint: "old",
+						source: {},
+						title: "Plan x",
+					},
+				});
+
+				await getRegisteredCommand("jollimemory.revertMemoryFileEdits")(planAbs);
+
+				expect(showWarningMessage).toHaveBeenCalledWith(expect.stringContaining("no recorded branch"));
+				expect(folderStorage.regenerateVisiblePlan).not.toHaveBeenCalled();
+			});
+
 			it("silently no-ops when the file is not under any known kbRoot", async () => {
 				// The explorer right-click menu is gated only by `.md`
 				// filename (the `jollimemory.isMemoryBankFile` context-key
@@ -4975,6 +5142,68 @@ describe("Extension", () => {
 				"jollimemory.workerBusy",
 				true,
 			);
+		});
+
+		it("clears the phase when the marker holds a non-ingest value", async () => {
+			// content !== "ingest" → the false arm of `workerPhaseIsIngest ? ... : null`.
+			const phaseWatcher = createFileSystemWatcher.mock.results[4]?.value;
+			const onPhaseChange = phaseWatcher?.onDidChange.mock.calls[0]?.[0] as (() => void) | undefined;
+			expect(onPhaseChange).toBeDefined();
+
+			fsReadFile.mockResolvedValueOnce(Buffer.from("summary"));
+			mockStatusStore.setWorkerPhase.mockClear();
+			onPhaseChange?.();
+
+			await vi.waitFor(() => {
+				expect(mockStatusStore.setWorkerPhase).toHaveBeenCalledWith(null);
+			});
+		});
+
+		it("clears the phase when the marker read fails (missing / unreadable file)", async () => {
+			// readFile rejection → the catch clears the phase (epoch unchanged).
+			const phaseWatcher = createFileSystemWatcher.mock.results[4]?.value;
+			const onPhaseChange = phaseWatcher?.onDidChange.mock.calls[0]?.[0] as (() => void) | undefined;
+			expect(onPhaseChange).toBeDefined();
+
+			fsReadFile.mockRejectedValueOnce(new Error("ENOENT"));
+			mockStatusStore.setWorkerPhase.mockClear();
+			onPhaseChange?.();
+
+			await vi.waitFor(() => {
+				expect(mockStatusStore.setWorkerPhase).toHaveBeenCalledWith(null);
+			});
+		});
+
+		it("discards a FAILED in-flight phase read superseded by the lock-delete clear", async () => {
+			// The catch path also honours the epoch token: a read that REJECTS after a
+			// lock-delete bumped the epoch must not apply its (now stale) clear.
+			const lockWatcher = createFileSystemWatcher.mock.results[3]?.value;
+			const phaseWatcher = createFileSystemWatcher.mock.results[4]?.value;
+			const onLockCreate = lockWatcher?.onDidCreate.mock.calls[0]?.[0] as (() => void) | undefined;
+			const onLockDelete = lockWatcher?.onDidDelete.mock.calls[0]?.[0] as (() => void) | undefined;
+			const onPhaseChange = phaseWatcher?.onDidChange.mock.calls[0]?.[0] as (() => void) | undefined;
+			expect(onLockDelete).toBeDefined();
+			expect(onPhaseChange).toBeDefined();
+
+			onLockCreate?.();
+			let rejectRead: ((e: Error) => void) | undefined;
+			fsReadFile.mockImplementationOnce(
+				() =>
+					new Promise<Buffer>((_resolve, reject) => {
+						rejectRead = reject;
+					}),
+			);
+			onPhaseChange?.();
+
+			// Worker finishes → epoch bumps before the read settles.
+			onLockDelete?.();
+			mockStatusStore.setWorkerPhase.mockClear();
+
+			rejectRead?.(new Error("read aborted"));
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			// epoch changed → the catch early-returns; no stale phase write.
+			expect(mockStatusStore.setWorkerPhase).not.toHaveBeenCalled();
 		});
 
 		it("refreshes status and plans when sessions watcher fires", async () => {
@@ -6547,6 +6776,27 @@ describe("Extension", () => {
 			expect(showWarningMessage).toHaveBeenCalled();
 			expect(mockAuthService.signOut).not.toHaveBeenCalled();
 		});
+
+		it("tolerates a reconcileAutoSync failure after sign-out (logged, non-fatal)", async () => {
+			// The post-sign-out reconcile is fire-and-forget with a defensive catch:
+			// even if the sync runtime throws, sign-out must still complete (auth
+			// cleared, panels notified). Supply a runtime whose reconcile rejects.
+			activateSyncMock.mockResolvedValueOnce({
+				runtime: {
+					setOnRoundFinished: vi.fn(),
+					reconcileAutoSync: vi.fn().mockRejectedValue(new Error("reconcile boom")),
+				},
+			});
+			showWarningMessage.mockResolvedValueOnce("Sign Out");
+			activate(makeContext());
+
+			const handler = getRegisteredCommand("jollimemory.signOut");
+			await handler();
+
+			expect(mockAuthService.signOut).toHaveBeenCalled();
+			// Sign-out flow continued past the swallowed reconcile error.
+			expect(mockStatusStore.refresh).toHaveBeenCalled();
+		});
 	});
 
 	describe("saveAnthropicApiKey command", () => {
@@ -7433,6 +7683,40 @@ describe("Extension", () => {
 			// handleError logs via the shared `log.error`; the test just verifies
 			// the callback didn't throw and an error was logged.
 			expect(error).toHaveBeenCalled();
+		});
+
+		it("openSettings save: re-resolves a moved KB root and tolerates a reconcileAutoSync failure", async () => {
+			// Two paths in one save: (1) refreshSidebarKbRoot detects the parent moved
+			// (resolveKbParent returns a different value), so the KB tree is refreshed;
+			// (2) the post-save reconcileAutoSync rejects, and its defensive catch keeps
+			// the save from failing.
+			activateSyncMock.mockResolvedValueOnce({
+				runtime: {
+					setOnRoundFinished: vi.fn(),
+					reconcileAutoSync: vi.fn().mockRejectedValue(new Error("reconcile boom")),
+				},
+			});
+			const { resolveKbParent } = await import("../../cli/src/core/KBPathResolver.js");
+			try {
+				// Pin the activate-time parent (sidebarKbParent = A) deterministically,
+				// then move it (B) before the save callback so refreshSidebarKbRoot
+				// reports moved === true regardless of any leaked mock state.
+				vi.mocked(resolveKbParent).mockReturnValue("/test/kb-parent-A");
+				activate(makeContext());
+				getRegisteredCommand("jollimemory.openSettings")();
+
+				const showCalls = MockSettingsWebviewPanel.show.mock.calls as [unknown, unknown, () => Promise<void>][];
+				const saveCb = showCalls[showCalls.length - 1][2];
+
+				mockRefreshKnowledgeBaseFolders.mockClear();
+				vi.mocked(resolveKbParent).mockReturnValue("/test/kb-parent-B");
+
+				await saveCb();
+				// moved === true (B !== A) → the KB tree was told to refresh.
+				expect(mockRefreshKnowledgeBaseFolders).toHaveBeenCalled();
+			} finally {
+				vi.mocked(resolveKbParent).mockReturnValue("/test/kb-parent");
+			}
 		});
 	});
 });

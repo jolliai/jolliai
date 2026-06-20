@@ -11,7 +11,7 @@ import { VERSION } from "../commands/CliUtils.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { createLogger } from "../Logger.js";
-import { runDecisionTimeline, runListBranches, runRecall, runSearch } from "./McpTools.js";
+import { runDecisionTimeline, runGetPrDescription, runListBranches, runRecall, runSearch } from "./McpTools.js";
 
 const log = createLogger("McpServer");
 
@@ -60,6 +60,25 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 		description: "List all branches that have JolliMemory records, with their topic titles.",
 		inputSchema: { type: "object", properties: {} },
 	},
+	{
+		name: "get_pr_description",
+		description:
+			"Build a GitHub PR title + description from the CURRENT branch's JolliMemory commit summaries — the same memory-rich body the VS Code extension writes. Use before `gh pr create` so the PR embeds the curated memory instead of a diff-derived summary. Always describes the current branch (the commit range is base..HEAD).",
+		inputSchema: {
+			type: "object",
+			properties: {
+				baseBranch: {
+					type: "string",
+					description:
+						"Base branch for the commit range. Defaults to the repository's default branch (origin/HEAD), falling back to main.",
+				},
+				includeMarkers: {
+					type: "boolean",
+					description: "Wrap body in update markers for idempotent PR edits (default true).",
+				},
+			},
+		},
+	},
 ];
 
 /** Route a validated tool call to its handler. Throws on unknown tool. */
@@ -76,6 +95,8 @@ export async function dispatchTool(cwd: string, name: string, args: Record<strin
 			return runDecisionTimeline(cwd, args as { slug: string });
 		case "list_branches":
 			return runListBranches(cwd);
+		case "get_pr_description":
+			return runGetPrDescription(cwd, args as { baseBranch?: string; includeMarkers?: boolean });
 		default:
 			throw new Error(`Unknown tool: ${name}`);
 	}

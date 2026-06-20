@@ -13,19 +13,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
 	CommitSummary,
 	E2eTestScenario,
-	ReferenceCommitRef,
 	NoteReference,
 	PlanReference,
+	ReferenceCommitRef,
 	TopicSummary,
-} from "../../../cli/src/Types.js";
+} from "../Types.js";
 
 const mocks = vi.hoisted(() => ({
 	collectSortedTopics: vi.fn(),
 	formatFullDate: vi.fn(() => "2026-05-06 00:00:00 UTC"),
-	getDisplayDate: vi.fn(
-		(e: { generatedAt?: string; commitDate: string }) =>
-			e.generatedAt || e.commitDate,
-	),
+	getDisplayDate: vi.fn((e: { generatedAt?: string; commitDate: string }) => e.generatedAt || e.commitDate),
 	padIndex: vi.fn((i: number) => String(i + 1).padStart(2, "0")),
 	formatDate: vi.fn(),
 	aggregateStats: vi.fn(),
@@ -34,7 +31,7 @@ const mocks = vi.hoisted(() => ({
 	resolveDiffStats: vi.fn(),
 }));
 
-vi.mock("../../../cli/src/core/SummaryFormat.js", () => ({
+vi.mock("./SummaryFormat.js", () => ({
 	collectSortedTopics: mocks.collectSortedTopics,
 	formatFullDate: mocks.formatFullDate,
 	getDisplayDate: mocks.getDisplayDate,
@@ -42,7 +39,7 @@ vi.mock("../../../cli/src/core/SummaryFormat.js", () => ({
 	formatDate: mocks.formatDate,
 }));
 
-vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
+vi.mock("./SummaryTree.js", () => ({
 	aggregateStats: mocks.aggregateStats,
 	aggregateTurns: mocks.aggregateTurns,
 	formatDurationLabel: mocks.formatDurationLabel,
@@ -99,9 +96,7 @@ function makeTopic(overrides: Partial<TopicSummary> = {}): TopicSummary {
 	};
 }
 
-function makeScenario(
-	overrides: Partial<E2eTestScenario> = {},
-): E2eTestScenario {
+function makeScenario(overrides: Partial<E2eTestScenario> = {}): E2eTestScenario {
 	return {
 		title: "Scenario title",
 		preconditions: "Preconditions text",
@@ -124,12 +119,10 @@ afterEach(() => {
 
 describe("buildAggregatedPrMarkdown", () => {
 	it("throws when summaries.length < 2 (precondition for caller routing)", () => {
-		expect(() =>
-			buildAggregatedPrMarkdown([makeSummary({ hash: "AAAA1234" })], 0),
-		).toThrow(/summaries.length >= 2/);
-		expect(() => buildAggregatedPrMarkdown([], 0)).toThrow(
+		expect(() => buildAggregatedPrMarkdown([makeSummary({ hash: "AAAA1234" })], 0)).toThrow(
 			/summaries.length >= 2/,
 		);
+		expect(() => buildAggregatedPrMarkdown([], 0)).toThrow(/summaries.length >= 2/);
 	});
 
 	it("renders top directory header as (M) when missingCount === 0", () => {
@@ -165,9 +158,7 @@ describe("buildAggregatedPrMarkdown", () => {
 			makeSummary({ hash: "BBBB5678", message: "no url" }),
 		];
 		const md = buildAggregatedPrMarkdown(summaries, 0);
-		expect(md).toContain(
-			"1. with url (`AAAA123`) — [Memory](https://jolli.example/articles?doc=1)",
-		);
+		expect(md).toContain("1. with url (`AAAA123`) — [Memory](https://jolli.example/articles?doc=1)");
 		expect(md).toContain("2. no url (`BBBB567`)");
 		// No spurious — [Memory]( on the no-url line.
 		expect(md).not.toMatch(/no url \(`BBBB567`\) — \[Memory\]/);
@@ -376,10 +367,7 @@ describe("buildAggregatedPrMarkdown", () => {
 	});
 
 	it("omits Quick recap section entirely when no commit has a recap", () => {
-		const summaries = [
-			makeSummary({ hash: "AAAA1234" }),
-			makeSummary({ hash: "BBBB5678" }),
-		];
+		const summaries = [makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })];
 		const md = buildAggregatedPrMarkdown(summaries, 0);
 		expect(md).not.toContain("## Quick recap");
 		expect(md).not.toContain("## Per-Commit Recap");
@@ -389,10 +377,7 @@ describe("buildAggregatedPrMarkdown", () => {
 		const summaries = [
 			makeSummary({
 				hash: "AAAA1234",
-				e2eTestGuide: [
-					makeScenario({ title: "Login flow" }),
-					makeScenario({ title: "Logout flow" }),
-				],
+				e2eTestGuide: [makeScenario({ title: "Login flow" }), makeScenario({ title: "Logout flow" })],
 			}),
 			makeSummary({
 				hash: "BBBB5678",
@@ -407,10 +392,7 @@ describe("buildAggregatedPrMarkdown", () => {
 	});
 
 	it("omits E2E section when no commit has scenarios", () => {
-		const summaries = [
-			makeSummary({ hash: "AAAA1234" }),
-			makeSummary({ hash: "BBBB5678" }),
-		];
+		const summaries = [makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })];
 		const md = buildAggregatedPrMarkdown(summaries, 0);
 		expect(md).not.toContain("## E2E Test");
 	});
@@ -449,10 +431,7 @@ describe("buildAggregatedPrMarkdown", () => {
 			}
 			return { topics: [], sourceNodes: [] };
 		});
-		const md = buildAggregatedPrMarkdown(
-			[makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })],
-			0,
-		);
+		const md = buildAggregatedPrMarkdown([makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })], 0);
 		expect(md).toContain("## Topic (1)");
 		expect(md).not.toContain("## Topics");
 	});
@@ -470,10 +449,7 @@ describe("buildAggregatedPrMarkdown", () => {
 				sourceNodes: [],
 			};
 		});
-		const md = buildAggregatedPrMarkdown(
-			[makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })],
-			0,
-		);
+		const md = buildAggregatedPrMarkdown([makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })], 0);
 		const idxT1 = md.indexOf("T-1");
 		const idxT2 = md.indexOf("T-2");
 		const idxT3 = md.indexOf("T-3");
@@ -484,19 +460,10 @@ describe("buildAggregatedPrMarkdown", () => {
 	});
 
 	it("appends missing-summary footnote only when missingCount > 0", () => {
-		const summaries = [
-			makeSummary({ hash: "AAAA1234" }),
-			makeSummary({ hash: "BBBB5678" }),
-		];
-		expect(buildAggregatedPrMarkdown(summaries, 0)).not.toContain(
-			"without summary were skipped",
-		);
-		expect(buildAggregatedPrMarkdown(summaries, 1)).toContain(
-			"> Note: 1 commit(s) without summary were skipped.",
-		);
-		expect(buildAggregatedPrMarkdown(summaries, 4)).toContain(
-			"> Note: 4 commit(s) without summary were skipped.",
-		);
+		const summaries = [makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })];
+		expect(buildAggregatedPrMarkdown(summaries, 0)).not.toContain("without summary were skipped");
+		expect(buildAggregatedPrMarkdown(summaries, 1)).toContain("> Note: 1 commit(s) without summary were skipped.");
+		expect(buildAggregatedPrMarkdown(summaries, 4)).toContain("> Note: 4 commit(s) without summary were skipped.");
 	});
 
 	it("truncates Topics at 65K and emits an omitted footnote", () => {
@@ -516,13 +483,8 @@ describe("buildAggregatedPrMarkdown", () => {
 			}
 			return { topics: [], sourceNodes: [] };
 		});
-		const md = buildAggregatedPrMarkdown(
-			[makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })],
-			0,
-		);
-		expect(md).toMatch(
-			/> ⚠️ \d+ more topics? omitted due to GitHub PR body size limit\./,
-		);
+		const md = buildAggregatedPrMarkdown([makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })], 0);
+		expect(md).toMatch(/> ⚠️ \d+ more topics? omitted due to GitHub PR body size limit\./);
 		expect(md.length).toBeLessThan(65_500);
 	});
 
@@ -541,9 +503,7 @@ describe("buildAggregatedPrMarkdown", () => {
 			makeSummary({ hash: "BBBB5678" }),
 		];
 		const md = buildAggregatedPrMarkdown(summaries, 0);
-		expect(md).toMatch(
-			/> ⚠️ \d+ more scenarios? omitted due to GitHub PR body size limit\./,
-		);
+		expect(md).toMatch(/> ⚠️ \d+ more scenarios? omitted due to GitHub PR body size limit\./);
 	});
 
 	it("truncates Per-Commit Recap at 50K and emits an omitted footnote", () => {
@@ -557,9 +517,7 @@ describe("buildAggregatedPrMarkdown", () => {
 			}),
 		);
 		const md = buildAggregatedPrMarkdown(summaries, 0);
-		expect(md).toMatch(
-			/> ⚠️ \d+ more commits?'? recap omitted due to GitHub PR body size limit\./,
-		);
+		expect(md).toMatch(/> ⚠️ \d+ more commits?'? recap omitted due to GitHub PR body size limit\./);
 	});
 
 	it("uses singular possessive 'commit's' when exactly one recap is omitted", () => {
@@ -588,6 +546,52 @@ describe("buildAggregatedPrMarkdown", () => {
 		expect(md).toMatch(/2 more commits' recap omitted/);
 		// And none of the singular form should appear.
 		expect(md).not.toContain("commit's recap omitted");
+	});
+
+	// #2: when the first item of a section overflows (included === 0), the header
+	// must be suppressed (no orphaned "## Section (N)") and a standalone
+	// all-omitted notice emitted instead — never a silent drop.
+	it("suppresses the Recap header and emits an all-omitted notice when the first recap overflows", () => {
+		const summaries = [
+			makeSummary({ hash: "AAAA1234", recap: "z".repeat(60000) }),
+			makeSummary({ hash: "BBBB5678", recap: "small recap" }),
+		];
+		const md = buildAggregatedPrMarkdown(summaries, 0);
+		expect(md).not.toContain("## Quick recap");
+		expect(md).toMatch(/⚠️ All 2 commits' recap omitted due to GitHub PR body size limit\./);
+	});
+
+	it("suppresses the E2E header and emits an all-omitted notice when the first scenario overflows", () => {
+		const giant = "y".repeat(70000);
+		const summaries = [
+			makeSummary({
+				hash: "AAAA1234",
+				e2eTestGuide: [
+					makeScenario({ title: "S1", preconditions: giant, steps: [giant], expectedResults: [giant] }),
+				],
+			}),
+			makeSummary({ hash: "BBBB5678" }),
+		];
+		const md = buildAggregatedPrMarkdown(summaries, 0);
+		expect(md).not.toContain("## E2E Test");
+		expect(md).toMatch(/⚠️ All 1 scenario omitted due to GitHub PR body size limit\./);
+	});
+
+	it("suppresses the Topics header and emits an all-omitted notice when the first topic overflows", () => {
+		const giant = "x".repeat(70000);
+		mocks.collectSortedTopics.mockImplementation((s: CommitSummary) => {
+			if (s.commitHash === "AAAA1234") {
+				return {
+					topics: [makeTopic({ title: "Huge", trigger: giant, decisions: giant, response: giant })],
+					sourceNodes: [],
+				};
+			}
+			return { topics: [], sourceNodes: [] };
+		});
+		const summaries = [makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })];
+		const md = buildAggregatedPrMarkdown(summaries, 0);
+		expect(md).not.toMatch(/## Topics? \(/);
+		expect(md).toMatch(/⚠️ All 1 topic omitted due to GitHub PR body size limit\./);
 	});
 
 	it("does not produce adjacent '---' separators when Topics is absent", () => {
@@ -632,8 +636,7 @@ describe("buildAggregatedPrMarkdown", () => {
 		);
 		const bigRecap = "z".repeat(15000);
 		mocks.collectSortedTopics.mockImplementation((s: CommitSummary) => {
-			if (s.commitHash === "AAAA1234")
-				return { topics: bigTopics, sourceNodes: [] };
+			if (s.commitHash === "AAAA1234") return { topics: bigTopics, sourceNodes: [] };
 			return { topics: [], sourceNodes: [] };
 		});
 		const summaries = [
@@ -686,9 +689,7 @@ describe("buildAggregatedPrMarkdown", () => {
 		expect(md).toContain("No-precondition scenario");
 		// E2E body should not include the Preconditions header when not provided.
 		// (Other scenarios across other tests do include it.)
-		const e2eBlockMatch = md.match(
-			/\[AAAA123\] No-precondition scenario[\s\S]*?<\/details>/,
-		);
+		const e2eBlockMatch = md.match(/\[AAAA123\] No-precondition scenario[\s\S]*?<\/details>/);
 		expect(e2eBlockMatch).not.toBeNull();
 		expect(e2eBlockMatch?.[0]).not.toContain("**Preconditions:**");
 	});
@@ -728,10 +729,7 @@ describe("buildAggregatedPrMarkdown", () => {
 			}
 			return { topics: [], sourceNodes: [] };
 		});
-		const md = buildAggregatedPrMarkdown(
-			[makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })],
-			0,
-		);
+		const md = buildAggregatedPrMarkdown([makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })], 0);
 		expect(md).toContain("1 more topic omitted");
 		expect(md).not.toContain("topics omitted");
 	});
@@ -750,10 +748,7 @@ describe("buildAggregatedPrMarkdown", () => {
 	});
 
 	it("ends with the standard footer", () => {
-		const md = buildAggregatedPrMarkdown(
-			[makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })],
-			0,
-		);
+		const md = buildAggregatedPrMarkdown([makeSummary({ hash: "AAAA1234" }), makeSummary({ hash: "BBBB5678" })], 0);
 		expect(md).toMatch(/\*Generated by Jolli Memory · .+\*$/);
 	});
 

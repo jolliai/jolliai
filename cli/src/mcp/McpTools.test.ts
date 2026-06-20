@@ -11,13 +11,15 @@ vi.mock("../core/ContextCompiler.js", () => ({
 vi.mock("../core/TopicPageStore.js", () => ({ readTopicPage: vi.fn() }));
 vi.mock("../core/GitOps.js", () => ({ getCurrentBranch: vi.fn() }));
 vi.mock("../core/SummaryStore.js", () => ({ getActiveStorage: vi.fn() }));
+vi.mock("../core/PrDescription.js", () => ({ buildPrDescription: vi.fn() }));
 
 import { buildRecallPayload, compileTaskContext, listBranchCatalog } from "../core/ContextCompiler.js";
 import { getCurrentBranch } from "../core/GitOps.js";
+import { buildPrDescription } from "../core/PrDescription.js";
 import { SearchIndex } from "../core/SearchIndex.js";
 import { getActiveStorage } from "../core/SummaryStore.js";
 import { readTopicPage } from "../core/TopicPageStore.js";
-import { runDecisionTimeline, runListBranches, runRecall, runSearch } from "./McpTools.js";
+import { runDecisionTimeline, runGetPrDescription, runListBranches, runRecall, runSearch } from "./McpTools.js";
 
 describe("runSearch", () => {
 	it("delegates to SearchIndex.search and returns hits", async () => {
@@ -116,5 +118,37 @@ describe("runListBranches", () => {
 		vi.mocked(listBranchCatalog).mockResolvedValue({ type: "catalog", branches: [{ branch: "main" }] } as never);
 		const out = await runListBranches("/repo");
 		expect(out.branches).toHaveLength(1);
+	});
+});
+
+describe("runGetPrDescription", () => {
+	it("forwards args to buildPrDescription and returns its result", async () => {
+		const fakeResult = {
+			type: "pr_description",
+			branch: "feature/x",
+			baseBranch: "main",
+			title: "Add feature",
+			body: "<!-- jollimemory-summary-start -->\nbody\n<!-- jollimemory-summary-end -->",
+			commitCount: 2,
+			summaryCount: 2,
+			missingCount: 0,
+		} as never;
+		vi.mocked(buildPrDescription).mockResolvedValue(fakeResult);
+		const out = await runGetPrDescription("/repo", {
+			baseBranch: "main",
+			includeMarkers: true,
+		});
+		expect(buildPrDescription).toHaveBeenCalledWith("/repo", {
+			baseBranch: "main",
+			includeMarkers: true,
+		});
+		expect(out).toBe(fakeResult);
+	});
+
+	it("propagates the 'no summaries' error from buildPrDescription", async () => {
+		vi.mocked(buildPrDescription).mockRejectedValue(
+			new Error('No JolliMemory summaries found on branch "empty" (base "main").'),
+		);
+		await expect(runGetPrDescription("/repo", {})).rejects.toThrow(/No JolliMemory summaries/);
 	});
 });
