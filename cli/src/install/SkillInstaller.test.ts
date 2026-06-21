@@ -515,6 +515,16 @@ describe("pr template content", () => {
 		expect(pr).toMatch(/"commitCount"/);
 	});
 
+	it("documents the CLI fallback for hosts without the MCP tool", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		// Common (default-base) case: plain invocation, no here-doc needed.
+		expect(pr).toMatch(/run-cli" pr-description --format json/);
+		// Non-default base rides the same injection-safe here-doc recipe.
+		expect(pr).toMatch(/run-cli" pr-description --arg-stdin --format json <<'JOLLI_ARG_<DELIM>_END'/);
+		expect(pr).toMatch(/unknown command 'pr-description'/);
+	});
+
 	it("instructs to STOP when tool errors with no summaries", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const pr = readPr();
