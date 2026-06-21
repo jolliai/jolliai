@@ -75,9 +75,12 @@ describe("mcpServerEntry", () => {
 		expect(mcpServerEntry("win32", runCli, cliJs)).toEqual({ command: "node", args: [cliJs, "mcp"] });
 	});
 
-	it("falls back to run-cli on Windows when the dist Cli.js can't be resolved", () => {
-		// Best effort: nothing better to point at, and re-registration will fix it
-		// once a dist path is known.
+	it("returns the run-cli last resort on Windows when the dist Cli.js can't be resolved", () => {
+		// Last resort only: this run-cli entry is itself NOT launchable on win32
+		// (same ENOENT as the shell wrapper), so it does not avoid breakage — it
+		// defers it. The branch is effectively unreachable on the normal install
+		// path (installDistPath runs, and aborts on failure, before registration),
+		// and re-registration replaces it with `node Cli.js` once a dist is known.
 		expect(mcpServerEntry("win32", runCli, undefined)).toEqual({ command: runCli, args: ["mcp"] });
 	});
 });

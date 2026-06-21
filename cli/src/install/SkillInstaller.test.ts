@@ -17,7 +17,13 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SKILL_GIT_EXCLUDE_PATHS, updateSkillIfNeeded, updateSkillsIfNeeded } from "./SkillInstaller.js";
+import {
+	buildRecallSkillTemplate,
+	buildSearchSkillTemplate,
+	SKILL_GIT_EXCLUDE_PATHS,
+	updateSkillIfNeeded,
+	updateSkillsIfNeeded,
+} from "./SkillInstaller.js";
 
 // Vitest reuses vite's `define` config, so `__PKG_VERSION__` is the real
 // package.json version in tests. Use that value when planting legacy SKILL.md
@@ -338,17 +344,9 @@ describe("recall template content", () => {
 	});
 });
 
-// ─── Search-template content pins (carried over from prior versions) ────────
+// ─── Search-template content pins (single-phase lightweight) ─────────────────
 
 describe("search template content", () => {
-	it("instructs the LLM to split the input into query + flags", async () => {
-		await updateSkillsIfNeeded(tempDir);
-		const search = readSearch();
-		expect(search).toMatch(/Parse the user input into query \+ flags/);
-		// Worked-example table shows where flags go on argv (not in the here-doc body).
-		expect(search).toMatch(/--since 2w/);
-	});
-
 	it("includes stale-CLI detection (older install missing the search command)", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const search = readSearch();
@@ -356,75 +354,52 @@ describe("search template content", () => {
 		expect(search).toMatch(/npm update -g @jolli\.ai\/cli/);
 	});
 
-	it("explains catalog is not pre-filtered by query", async () => {
+	it("documents the lightweight hit schema (type/title/snippet/branch/commitDate/slug/hash)", async () => {
+		// Single-phase hits are lightweight — no fullHash, no decisions star field,
+		// no per-topic fields. Template must document only what the tool returns.
 		await updateSkillsIfNeeded(tempDir);
 		const search = readSearch();
-		expect(search).toMatch(/catalog is NOT pre-filtered by the user's query/);
+		expect(search).toMatch(/`type`/);
+		expect(search).toMatch(/`title`/);
+		expect(search).toMatch(/`snippet`/);
+		expect(search).toMatch(/`branch`/);
+		expect(search).toMatch(/`commitDate`/);
+		expect(search).toMatch(/`slug`/);
+		expect(search).toMatch(/`hash`/);
 	});
 
-	it("forbids programmatic processing (temp files / scoring scripts)", async () => {
+	it("does NOT promise rich SearchHit fields that are absent from lightweight hits", async () => {
+		// The old two-phase template documented fullHash, commitAuthor, diffStats,
+		// recap, trigger/response/decisions per-topic, filesAffected, etc. These
+		// fields are not in a lightweight hit — template must NOT promise them.
 		await updateSkillsIfNeeded(tempDir);
 		const search = readSearch();
-		expect(search).toMatch(/DO NOT\*\* process programmatically/);
-		expect(search).toMatch(/no temp files/);
-		expect(search).toMatch(/jq\/python\/grep/);
-		expect(search).toMatch(/Semantic picking/);
+		expect(search).not.toMatch(/`fullHash`/);
+		expect(search).not.toMatch(/`commitAuthor`/);
+		expect(search).not.toMatch(/`recap\?`/);
+		expect(search).not.toMatch(/`trigger\?`/);
+		expect(search).not.toMatch(/`response\?`/);
+		expect(search).not.toMatch(/decisions ★ \*\*THE STAR FIELD\*\*/);
+		expect(search).not.toMatch(/`filesAffected\?`/);
+		expect(search).not.toMatch(/`diffStats\?`/);
 	});
 
-	it("tells the LLM to retry with bigger budget before bothering the user", async () => {
+	it("does NOT contain two-phase machinery (--hashes, load_commits, catalog scan)", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const search = readSearch();
-		expect(search).toMatch(/--budget 50000/);
+		expect(search).not.toContain("--hashes");
+		expect(search).not.toContain("load_commits");
+		expect(search).not.toMatch(/catalog is NOT pre-filtered/);
+		expect(search).not.toMatch(/--budget 50000/);
+		expect(search).not.toMatch(/Phase 2/);
 	});
 
-	it("documents every SearchHit identity / provenance field", async () => {
+	it("tells the user to use jolli-recall for full decisions/rationale", async () => {
+		// Single-phase search can't deliver full decisions — template must redirect.
 		await updateSkillsIfNeeded(tempDir);
 		const search = readSearch();
-		expect(search).toMatch(/`hash` —/);
-		expect(search).toMatch(/`fullHash` —/);
-		expect(search).toMatch(/`commitMessage` —/);
-		expect(search).toMatch(/`commitAuthor` —/);
-		expect(search).toMatch(/`commitDate` —/);
-		expect(search).toMatch(/- `branch`/);
-		expect(search).toMatch(/`commitType\?` —/);
-		expect(search).toMatch(/`ticketId\?` —/);
-		expect(search).toMatch(/`diffStats\?` —/);
-		expect(search).toMatch(/`recap\?` —/);
-	});
-
-	it("marks `decisions` as the star field with explicit emphasis", async () => {
-		await updateSkillsIfNeeded(tempDir);
-		const search = readSearch();
-		expect(search).toMatch(/`decisions` ★ \*\*THE STAR FIELD\*\*/);
-		expect(search).toMatch(/why did we choose X/);
-	});
-
-	it("documents every per-topic field", async () => {
-		await updateSkillsIfNeeded(tempDir);
-		const search = readSearch();
-		expect(search).toMatch(/`title` —/);
-		expect(search).toMatch(/`trigger\?` —/);
-		expect(search).toMatch(/`response\?` —/);
-		expect(search).toMatch(/`decisions` ★/);
-		expect(search).toMatch(/`todo\?` —/);
-		expect(search).toMatch(/`filesAffected\?` —/);
-		expect(search).toMatch(/`category\?` —/);
-		expect(search).toMatch(/`importance\?` —/);
-	});
-
-	it("uses correct diffStats field name (filesChanged, not files)", async () => {
-		await updateSkillsIfNeeded(tempDir);
-		const search = readSearch();
-		expect(search).toMatch(/`diffStats\?` — `\{ filesChanged, insertions, deletions \}`/);
-		expect(search).not.toMatch(/`diffStats\?` — `\{ files,/);
-	});
-
-	it("documents plan/note stubs and forbids navigation promises", async () => {
-		await updateSkillsIfNeeded(tempDir);
-		const search = readSearch();
-		expect(search).toMatch(/`plans\?` — `\{ slug, title \}\[\]`/);
-		expect(search).toMatch(/`notes\?` — `\{ id, title \}\[\]`/);
-		expect(search).toMatch(/Do NOT promise the user they can navigate to the plan body/);
+		expect(search).toMatch(/jolli-recall/);
+		expect(search).toMatch(/full decisions\/rationale/);
 	});
 
 	it("lists Lead-with-the-answer principle and forbids preamble openers", async () => {
@@ -432,12 +407,6 @@ describe("search template content", () => {
 		const search = readSearch();
 		expect(search).toMatch(/Lead with the answer/);
 		expect(search).toMatch(/No "Let me analyze\.\.\." or "Found N commits\.\.\." preamble/);
-	});
-
-	it("requires file paths as markdown links", async () => {
-		await updateSkillsIfNeeded(tempDir);
-		const search = readSearch();
-		expect(search).toMatch(/\[cli\/src\/Types\.ts\]\(cli\/src\/Types\.ts\)/);
 	});
 
 	it("forbids snippet dumps and demands complete verbatim clauses", async () => {
@@ -457,14 +426,17 @@ describe("search template content", () => {
 		expect(search).not.toMatch(/Use sparingly \(1-3 quotes per answer\)/);
 	});
 
-	it("forbids exposing machinery", async () => {
+	it("forbids exposing machinery (BM25, score, SearchHit)", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const search = readSearch();
 		expect(search).toMatch(/Don't expose machinery/);
-		expect(search).toMatch(/"Phase 1"/);
-		expect(search).toMatch(/"Phase 2"/);
-		expect(search).toMatch(/"catalog"/);
+		// New template explicitly bans BM25 and score (lightweight-specific)
+		expect(search).toMatch(/"BM25"/);
 		expect(search).toMatch(/"SearchHit"/);
+		// Old two-phase machinery labels must NOT bleed back in
+		expect(search).not.toMatch(/"Phase 1"/);
+		expect(search).not.toMatch(/"Phase 2"/);
+		expect(search).not.toMatch(/"catalog"/);
 	});
 
 	it("does NOT carry the legacy vscode:// principle", async () => {
@@ -487,11 +459,35 @@ describe("search template content", () => {
 		expect(search).not.toMatch(/Section 1 — Top-line summary/);
 	});
 
-	it("tightens the Step 3 picks limit to 5-10", async () => {
+	it("handles empty hits gracefully (suggest broader keywords)", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const search = readSearch();
-		expect(search).toMatch(/Pick \*\*5-10\*\*/);
-		expect(search).not.toMatch(/Pick 5-15/);
+		expect(search).toMatch(/broader keywords/);
+		// Must NOT mention BM25 or index internals in the empty-hits path
+		expect(search).toMatch(/Do NOT mention BM25/);
+	});
+});
+
+// ─── MCP-preferred invocation ────────────────────────────────────────────────
+
+describe("recall template MCP-preferred invocation", () => {
+	it("recall template prefers MCP recall and keeps the CLI fallback", () => {
+		const t = buildRecallSkillTemplate();
+		expect(t).toContain("mcp__jollimemory__recall");
+		expect(t).toContain('type:"recall"'); // documents type:recall|catalog|error
+		expect(t).toContain("$HOME/.jolli/jollimemory/run-cli"); // fallback retained
+	});
+});
+
+// ─── Search template MCP-preferred invocation ────────────────────────────────
+
+describe("search template MCP-preferred invocation (lightweight hits)", () => {
+	it("search template uses MCP search (lightweight hits) + CLI fallback", () => {
+		const t = buildSearchSkillTemplate();
+		expect(t).toContain("mcp__jollimemory__search");
+		expect(t).not.toContain("load_commits"); // no two-phase
+		expect(t).not.toContain("--hashes");
+		expect(t).toContain("$HOME/.jolli/jollimemory/run-cli"); // fallback retained
 	});
 });
 

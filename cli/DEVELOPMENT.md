@@ -160,7 +160,7 @@ jolli status
 | [SummaryTree.ts](src/core/SummaryTree.ts) | Tree traversal utilities (aggregate stats/turns, collect source nodes, `resolveDiffStats` display helper) |
 | [SummaryMigration.ts](src/core/SummaryMigration.ts) | v1→v3 migration logic for legacy orphan branch data |
 | [GitOperationDetector.ts](src/hooks/GitOperationDetector.ts) | Detects git operation type (commit, amend, squash, rebase, cherry-pick, revert) |
-| [Installer.ts](src/install/Installer.ts) | Installs/removes hooks in Claude Code, Gemini, and git |
+| [Installer.ts](src/install/Installer.ts) | Installs/removes git hooks and MCP server registrations. Git hooks: Claude Code `StopHook`/`SessionStartHook`, Gemini `AfterAgent`, `post-commit`, `prepare-commit-msg`. MCP: `registerAllMcpHosts`/`removeAllMcpHosts` drive per-host `McpHostRegistrar` implementations (Claude `.mcp.json`, Cursor `.cursor/mcp.json`, Gemini `~/.gemini/settings.json`, Codex `~/.codex/config.toml`) gated by per-host detectors. |
 | [references/ReferenceExtractor.ts](src/core/references/ReferenceExtractor.ts) / [references/ReferenceStore.ts](src/core/references/ReferenceStore.ts) | Multi-source external-reference extraction (Linear / Jira / GitHub / Notion) + per-commit reference store. The extractor walks transcripts via per-source envelope parsers (`references/sources/`, `references/bindings/`) for the relevant MCP tool calls and normalises them into an opaque `ReferenceField` bag, so adding a source is a binding entry rather than a schema change. The store persists references to the orphan branch with the same hoist-on-rebase / merge-on-squash semantics as Plans and Notes (see `QueueWorker.runSquashPipeline` for the integration). |
 | [ActiveSessionAggregator.ts](src/core/ActiveSessionAggregator.ts) | Aggregates active sessions across every source (Claude / Codex / Gemini / OpenCode / Cursor / Copilot CLI / Copilot Chat) into a single `ActiveSession[]` snapshot. Powers the VS Code **Conversations** sidebar section; safe to poll because every per-source detector + reader is feature-gated and cheap. |
 | [ConversationOverlayStore.ts](src/core/ConversationOverlayStore.ts) | Persists per-session **transcript edit overlays** — the curated turn list a user produced in the Conversation Details panel. Stored locally per-project; consulted by the summarization pipeline so the LLM sees the user's curated version, not the raw transcript. |
@@ -446,8 +446,8 @@ The server exposes five tools, all pure handlers in [McpTools.ts](src/mcp/McpToo
 
 | Tool | Purpose |
 |------|---------|
-| `search` | Full-text search over the repo's historical decisions and implementations (topics + commits). |
-| `recall` | Recall a branch's development context from **RAW commit summaries** — the same data path as the `jolli-recall` skill, NOT the topic KB. Defaults to the current branch. |
+| `search` | Full-text BM25 search (Orama) over the repo's historical decisions and implementations; returns `{ hits }`. Calls the same `searchHits()` ([SearchHits.ts](src/core/SearchHits.ts)) as `jolli search`, so results are identical. |
+| `recall` | Recall a branch's development context from **RAW commit summaries** — the same data path as the `jolli-recall` skill, NOT the topic KB. Calls the same `resolveRecall()` ([RecallResolver.ts](src/core/RecallResolver.ts)) as `jolli recall --format json`; returns the same `type`-tagged union (`recall` \| `catalog` \| `error`). Defaults to the current branch. |
 | `get_decision_timeline` | Chronological evolution of a topic — its source events ordered oldest-first. |
 | `list_branches` | All branches with JolliMemory records and their topic titles. |
 | `get_pr_description` | Build a GitHub PR title + description from the branch's JolliMemory commit summaries — the same memory-rich body the VS Code extension writes. Use before `gh pr create`. |

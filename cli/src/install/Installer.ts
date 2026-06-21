@@ -81,7 +81,13 @@ import {
 	removePrepareMsgHook,
 } from "./GitHookInstaller.js";
 import type { HookOpResult } from "./HookSettingsHelper.js";
-import { MCP_GIT_EXCLUDE_PATH, registerMcpInClaude, removeMcpFromClaude } from "./McpRegistration.js";
+import {
+	buildRegistrars,
+	type DetectedHosts,
+	registerGlobalMcpHosts,
+	registerRepoMcpHosts,
+	removeRepoMcpHosts,
+} from "./mcp/HostRegistrars.js";
 import { SKILL_GIT_EXCLUDE_PATHS, updateSkillIfNeeded } from "./SkillInstaller.js";
 
 // ─── Re-exports for backward compatibility ──────────────────────────────────
@@ -180,6 +186,16 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			};
 		}
 
+		// Run host detectors once before the per-worktree loop so each detector
+		// is called exactly once. Results are reused both inside the loop (for MCP
+		// registration) and after it (for auto-enable config writes / hook installs).
+		const codexDetectedOnce = await isCodexInstalled();
+		const geminiDetectedOnce = await isGeminiInstalled();
+		const cursorDetectedOnce = await isCursorInstalled();
+		const opencodeDetectedOnce = await isOpenCodeInstalled();
+		const copilotDetectedOnce = await isCopilotInstalled();
+		const copilotChatDetectedOnce = await isCopilotChatInstalled();
+
 		// Install .jolli/jollimemory/ state dir (always) and Claude Code hook (if enabled)
 		let claudeResult: HookOpResult = {};
 		for (const wt of worktrees) {
@@ -206,12 +222,41 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			// We update SKILL.md before the Claude-hook gate below so disabling
 			// Claude doesn't strand the `.agents/` skills target unupdated.
 			await updateSkillIfNeeded(wt, { claudeEnabled: config.claudeEnabled });
+			// Build the set of detected hosts for this worktree iteration.
+			// Claude's detected state mirrors the claudeEnabled config flag so
+			// a user who has disabled Claude still gets non-Claude hosts registered.
+			// Other detectors use the values computed once before the loop.
+			// NOTE: MCP registration is intentionally gated by host DETECTION only,
+			// independent of the per-host *Enabled discovery flags (cursorEnabled,
+			// copilotEnabled, …) — the documented MCP philosophy: "MCP registration
+			// runs regardless of claudeEnabled; the hook and MCP are independent
+			// decisions." So a detected host is wired for MCP even if its session
+			// discovery is disabled. Do not "fix" this into flag-gating.
+			const detected: DetectedHosts = {
+				claude: config.claudeEnabled !== false,
+				codex: codexDetectedOnce,
+				cursor: cursorDetectedOnce,
+				gemini: geminiDetectedOnce,
+				opencode: opencodeDetectedOnce,
+				copilot: copilotDetectedOnce,
+				copilotChat: copilotChatDetectedOnce,
+			};
 			// Keep the user's `git status` clean by adding Jolli-managed paths to
 			// `.git/info/exclude`. Worktree-aware: linked worktrees may have their
-			// own gitdir, so we resolve per-worktree. `.mcp.json` is included
-			// because registerMcpInClaude (below) writes it with a machine-local
-			// absolute path that must never be committed.
-			await updateGitExclude(wt, [...SKILL_GIT_EXCLUDE_PATHS, MCP_GIT_EXCLUDE_PATH]);
+			// own gitdir, so we resolve per-worktree. We compute the union of all
+			// active registrars' gitExcludePaths so each host's config file is
+			// covered (e.g. `.cursor/mcp.json` when Cursor is detected). Global
+			// hosts contribute [] here — their configs live outside the repo.
+			await updateGitExclude(wt, [
+				...SKILL_GIT_EXCLUDE_PATHS,
+				...buildRegistrars(detected).flatMap((r) => r.gitExcludePaths()),
+			]);
+			// Register the MCP server in the detected REPO-scoped hosts (Claude,
+			// Cursor) whose config lives in this worktree. This runs BEFORE the
+			// claudeEnabled gate so Cursor users with Claude disabled still get MCP
+			// registered. Each host is isolated — a failure in one never blocks the
+			// others. Global hosts are registered once after the loop (below).
+			await registerRepoMcpHosts(wt, detected);
 
 			if (config.claudeEnabled === false) continue;
 			const result = await installClaudeHook(wt);
@@ -226,14 +271,21 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			}
 			// Install SessionStart hook for auto-briefing
 			await installSessionStartHook(wt);
-			// Register the MCP server for AI agents (Claude Code project config).
-			// Non-fatal: a failure here must not block hook installation.
-			try {
-				await registerMcpInClaude(wt);
-			} catch (mcpErr) {
-				log.warn("MCP registration failed in %s (non-fatal): %s", wt, (mcpErr as Error).message);
-			}
 		}
+
+		// Register the MCP server in the detected GLOBAL hosts (Codex, Gemini,
+		// OpenCode, Copilot, Copilot Chat). Their config files are machine-wide and
+		// shared across every repo, so we write them ONCE here rather than rewriting
+		// the same file on each worktree iteration above. Detection-gated only.
+		await registerGlobalMcpHosts({
+			claude: false,
+			cursor: false,
+			codex: codexDetectedOnce,
+			gemini: geminiDetectedOnce,
+			opencode: opencodeDetectedOnce,
+			copilot: copilotDetectedOnce,
+			copilotChat: copilotChatDetectedOnce,
+		});
 
 		// Git hooks are shared across all worktrees — install once
 		const gitResult = await installGitHook(projectDir);
@@ -260,8 +312,7 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 		}
 
 		// Auto-detect Codex CLI and enable session discovery (saved to global config)
-		const codexDetected = await isCodexInstalled();
-		if (codexDetected) {
+		if (codexDetectedOnce) {
 			if (config.codexEnabled === undefined) {
 				await saveConfig({ codexEnabled: true });
 				log.info("Codex CLI detected — enabled Codex session discovery");
@@ -270,8 +321,7 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 
 		// Auto-detect Gemini CLI and install AfterAgent hook in all worktrees (if enabled)
 		let geminiSettingsPath: string | undefined;
-		const geminiDetected = await isGeminiInstalled();
-		if (geminiDetected && config.geminiEnabled !== false) {
+		if (geminiDetectedOnce && config.geminiEnabled !== false) {
 			for (const wt of worktrees) {
 				const geminiResult = await installGeminiHook(wt);
 				// Capture the path from the primary worktree
@@ -286,7 +336,7 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 		}
 
 		// Auto-detect OpenCode and enable session discovery
-		const openCodeDetected = config.openCodeEnabled !== false && (await isOpenCodeInstalled());
+		const openCodeDetected = config.openCodeEnabled !== false && opencodeDetectedOnce;
 		if (openCodeDetected) {
 			if (config.openCodeEnabled === undefined) {
 				await saveConfig({ openCodeEnabled: true });
@@ -295,7 +345,7 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 		}
 
 		// Auto-detect Cursor and enable Composer session discovery
-		const cursorDetected = config.cursorEnabled !== false && (await isCursorInstalled());
+		const cursorDetected = config.cursorEnabled !== false && cursorDetectedOnce;
 		if (cursorDetected) {
 			if (config.cursorEnabled === undefined) {
 				await saveConfig({ cursorEnabled: true });
@@ -306,8 +356,8 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 		// Auto-detect GitHub Copilot in either form (terminal CLI or vscode Chat) and
 		// enable the shared copilotEnabled flag. Both sources share one toggle —
 		// see docs/superpowers/specs/2026-05-06-copilot-chat-support-design.md.
-		const copilotDetected = config.copilotEnabled !== false && (await isCopilotInstalled());
-		const copilotChatDetected = config.copilotEnabled !== false && (await isCopilotChatInstalled());
+		const copilotDetected = config.copilotEnabled !== false && copilotDetectedOnce;
+		const copilotChatDetected = config.copilotEnabled !== false && copilotChatDetectedOnce;
 		if ((copilotDetected || copilotChatDetected) && config.copilotEnabled === undefined) {
 			await saveConfig({ copilotEnabled: true });
 			log.info(
@@ -508,12 +558,18 @@ export async function uninstall(cwd?: string): Promise<InstallResult> {
 			}
 			/* v8 ignore stop */
 			await removeGeminiHook(wt);
-			// Non-fatal, mirroring the install side: a failure here (e.g. EPERM on a
-			// read-only .mcp.json) must not abort the uninstall, or the shared git
-			// hooks below would leak and post-commit would keep firing after the
-			// user believes they've uninstalled.
+			// Remove MCP entries from this repo's REPO-scoped hosts (Claude's
+			// .mcp.json, Cursor's .cursor/mcp.json). Global hosts (Codex/Gemini/
+			// OpenCode/Copilot/Copilot Chat) are intentionally left untouched: their
+			// jollimemory entry is shared by every repo on the machine, so removing
+			// it here would break MCP for other repos still using Jolli. Non-fatal: a
+			// failure in one host (e.g. EPERM on a read-only .mcp.json) must not abort
+			// the uninstall, or the shared git hooks below would leak and post-commit
+			// would keep firing after the user believes they've uninstalled.
+			// removeRepoMcpHosts is internally per-host non-fatal, so no outer
+			// try/catch is needed here, but we keep one for defensive parity.
 			try {
-				await removeMcpFromClaude(wt);
+				await removeRepoMcpHosts(wt);
 			} catch (mcpErr) {
 				log.warn("MCP removal failed in %s (non-fatal): %s", wt, (mcpErr as Error).message);
 			}

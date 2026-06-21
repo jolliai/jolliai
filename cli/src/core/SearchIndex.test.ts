@@ -98,14 +98,25 @@ describe("SearchIndex", () => {
 		expect(res.length).toBeGreaterThan(0);
 	});
 
-	it("filters by exact branch membership (multi-branch topic, space-joined)", async () => {
+	it("filters by exact branch membership (multi-branch topic)", async () => {
 		const idx = await SearchIndex.open(dir);
 		// Only topic:auth-timeout lists "main" among its related branches.
 		const onMain = await idx.search({ query: "timeout", branch: "main" });
 		const ids = onMain.map((r) => r.id);
-		expect(ids).toContain("topic:auth-timeout"); // branch "feature/auth main"
+		expect(ids).toContain("topic:auth-timeout"); // relatedBranches ["feature/auth","main"]
 		expect(ids).not.toContain("commit:abc123"); // branch "feature/auth" only
 		expect(ids).not.toContain("topic:billing-cache"); // branch "feature/billing"
+	});
+
+	it("returns a single valid branch (the first) for a multi-branch topic hit, not a space-joined string", async () => {
+		// Regression: `branch` was `doc.branch.join(" ")`, producing "feature/auth
+		// main" — not a real branch — which the jolli-search skill then fed into
+		// jolli-recall. A hit's `branch` must be one valid branch name.
+		const idx = await SearchIndex.open(dir);
+		const res = await idx.search({ query: "timeout", branch: "main" });
+		const topic = res.find((r) => r.id === "topic:auth-timeout");
+		expect(topic?.branch).toBe("feature/auth"); // first related branch, not "feature/auth main"
+		expect(topic?.branch).not.toContain(" ");
 	});
 
 	it("does not leak across slash branches that share a token", async () => {

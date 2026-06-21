@@ -4752,6 +4752,80 @@ describe("CLI", () => {
 				await fs.rm(nestedRoot, { recursive: true, force: true });
 			}
 		});
+
+		it("writes the JSON payload to --output instead of stdout (--format json --output)", async () => {
+			// Regression: `--format json` used to short-circuit to stdout BEFORE the
+			// `--output` path could run, so `--format json --output FILE` silently
+			// discarded the file. The JSON payload must now land in the file.
+			vi.mocked(listBranchCatalog).mockReset();
+			vi.mocked(compileTaskContext).mockReset();
+			vi.mocked(listBranchCatalog).mockResolvedValueOnce({
+				type: "catalog",
+				branches: [
+					{
+						branch: "feature/auth",
+						commitCount: 2,
+						period: { start: "2026-03-28", end: "2026-03-29" },
+						commitMessages: ["a"],
+					},
+				],
+			});
+			vi.mocked(compileTaskContext).mockResolvedValueOnce({
+				branch: "feature/auth",
+				period: { start: "2026-03-28", end: "2026-03-29" },
+				commitCount: 2,
+				totalFilesChanged: 5,
+				totalInsertions: 100,
+				totalDeletions: 20,
+				summaries: [],
+				plans: [],
+				notes: [],
+				keyDecisions: [],
+				stats: {
+					topicCount: 1,
+					planCount: 0,
+					noteCount: 0,
+					decisionCount: 0,
+					topicTokens: 50,
+					planTokens: 0,
+					noteTokens: 0,
+					decisionTokens: 0,
+					transcriptTokens: 0,
+					totalTokens: 50,
+				},
+			});
+
+			const os = await import("node:os");
+			const path = await import("node:path");
+			const fs = await import("node:fs/promises");
+			const outputPath = path.join(os.tmpdir(), `jolli-recall-json-${Date.now()}.json`);
+
+			try {
+				await main([
+					"recall",
+					"feature/auth",
+					"--format",
+					"json",
+					"--output",
+					outputPath,
+					"--cwd",
+					"/tmp/test",
+				]);
+
+				const content = await fs.readFile(outputPath, "utf-8");
+				expect(JSON.parse(content).type).toBe("recall");
+
+				const logged = vi
+					.mocked(console.log)
+					.mock.calls.map((c) => String(c[0]))
+					.join("\n");
+				expect(logged).toContain("Recall context (JSON) written to");
+				// And the JSON must NOT also be dumped to stdout when --output is given.
+				expect(logged).not.toContain('"type":"recall"');
+			} finally {
+				await fs.rm(outputPath, { force: true });
+			}
+		});
 	});
 
 	// ── auth commands ────────────────────────────────────────────────────

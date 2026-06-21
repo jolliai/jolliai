@@ -43,17 +43,18 @@ vi.mock("../core/GeminiSessionDetector.js", () => ({
 	isGeminiInstalled: vi.fn().mockResolvedValue(false),
 }));
 
-// Partial mock of McpRegistration: keep the REAL register/remove implementations
-// (they operate on the temp dir's .mcp.json) but wrap them in vi.fn so a single
-// test can force `removeMcpFromClaude` to reject and assert uninstall still
-// proceeds. `clearMocks: true` only clears call history, so the real impl given
-// to vi.fn() survives across tests.
-vi.mock("./McpRegistration.js", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("./McpRegistration.js")>();
+// Partial mock of HostRegistrars: keep the REAL register/remove implementations
+// (they operate on the temp dir's .mcp.json / .cursor/mcp.json) but wrap them
+// in vi.fn so a single test can force `removeRepoMcpHosts` to reject and assert
+// uninstall still proceeds. `clearMocks: true` only clears call history, so the
+// real impl given to vi.fn() survives across tests.
+vi.mock("./mcp/HostRegistrars.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./mcp/HostRegistrars.js")>();
 	return {
 		...actual,
-		registerMcpInClaude: vi.fn(actual.registerMcpInClaude),
-		removeMcpFromClaude: vi.fn(actual.removeMcpFromClaude),
+		registerRepoMcpHosts: vi.fn(actual.registerRepoMcpHosts),
+		registerGlobalMcpHosts: vi.fn(actual.registerGlobalMcpHosts),
+		removeRepoMcpHosts: vi.fn(actual.removeRepoMcpHosts),
 	};
 });
 
@@ -885,6 +886,51 @@ describe("Installer", () => {
 		});
 	});
 
+	describe("multi-host MCP registration", () => {
+		it("registers MCP across detected hosts during enable", async () => {
+			// claude=true (default), cursor=true, gemini=false, codex=false.
+			// cursor writes to <wt>/.cursor/mcp.json (tmpdir-safe).
+			// claude writes to <wt>/.mcp.json (tmpdir-safe).
+			// gemini/codex stay false so no real ~/.gemini or ~/.codex is touched.
+			const { isCursorInstalled } = await import("../core/CursorDetector.js");
+			vi.mocked(isCursorInstalled).mockResolvedValue(true);
+
+			const result = await install(tempDir);
+			expect(result.success).toBe(true);
+
+			// Claude config: <wt>/.mcp.json
+			const claudeMcpPath = join(tempDir, ".mcp.json");
+			const claudeMcp = JSON.parse(await readFile(claudeMcpPath, "utf-8"));
+			expect(claudeMcp.mcpServers).toBeDefined();
+			expect(claudeMcp.mcpServers.jollimemory).toBeDefined();
+
+			// Cursor config: <wt>/.cursor/mcp.json
+			const cursorMcpPath = join(tempDir, ".cursor", "mcp.json");
+			const cursorMcp = JSON.parse(await readFile(cursorMcpPath, "utf-8"));
+			expect(cursorMcp.mcpServers).toBeDefined();
+			expect(cursorMcp.mcpServers.jollimemory).toBeDefined();
+		});
+
+		it("registers non-Claude MCP hosts even when claudeEnabled is false", async () => {
+			// Save config with claudeEnabled=false, then install.
+			await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ claudeEnabled: false }), "utf-8");
+			const { isCursorInstalled } = await import("../core/CursorDetector.js");
+			vi.mocked(isCursorInstalled).mockResolvedValue(true);
+
+			const result = await install(tempDir);
+			expect(result.success).toBe(true);
+
+			// Claude MCP should NOT be written (claude=false in detected)
+			const claudeMcpPath = join(tempDir, ".mcp.json");
+			await expect(stat(claudeMcpPath)).rejects.toThrow();
+
+			// Cursor MCP SHOULD be written despite claudeEnabled=false
+			const cursorMcpPath = join(tempDir, ".cursor", "mcp.json");
+			const cursorMcp = JSON.parse(await readFile(cursorMcpPath, "utf-8"));
+			expect(cursorMcp.mcpServers.jollimemory).toBeDefined();
+		});
+	});
+
 	describe("uninstall", () => {
 		it("should remove Claude hook and all git hooks", async () => {
 			await install(tempDir);
@@ -898,7 +944,7 @@ describe("Installer", () => {
 			expect(settings.hooks).toBeUndefined();
 		});
 
-		it("continues removing git hooks when removeMcpFromClaude throws (e.g. read-only .mcp.json)", async () => {
+		it("continues removing git hooks when removeRepoMcpHosts throws (e.g. read-only .mcp.json)", async () => {
 			await install(tempDir);
 			const postRewritePath = join(tempDir, ".git", "hooks", "post-rewrite");
 			// Sanity: the hook is installed before uninstall.
@@ -908,8 +954,8 @@ describe("Installer", () => {
 			// EPERM / read-only .mcp.json. The install side already treats this as
 			// non-fatal; uninstall must too, or the git hooks leak and post-commit
 			// keeps firing after the user thinks they've uninstalled.
-			const { removeMcpFromClaude } = await import("./McpRegistration.js");
-			vi.mocked(removeMcpFromClaude).mockRejectedValueOnce(new Error("EPERM: read-only .mcp.json"));
+			const { removeRepoMcpHosts } = await import("./mcp/HostRegistrars.js");
+			vi.mocked(removeRepoMcpHosts).mockRejectedValueOnce(new Error("EPERM: read-only .mcp.json"));
 
 			const result = await uninstall(tempDir);
 			expect(result.success).toBe(true);

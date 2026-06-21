@@ -170,7 +170,12 @@ export class SearchIndex {
 				type: doc.type,
 				title: doc.title,
 				snippet: doc.content.slice(0, 280),
-				branch: doc.branch.join(" "),
+				// Hand back a SINGLE valid branch name. Commit docs always carry
+				// exactly one; topic docs carry their relatedBranches[] — so a
+				// space-join ("feature/auth main") is not a real branch and breaks the
+				// jolli-search skill, which feeds this straight into `jolli-recall`.
+				// Use the first/primary related branch instead.
+				branch: doc.branch[0] ?? "",
 				commitDate: doc.commitDate,
 				slug: doc.slug,
 				hash: doc.hash,
