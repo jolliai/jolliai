@@ -7,18 +7,19 @@ vi.mock("../core/ContextCompiler.js", () => ({
 	compileTaskContext: vi.fn(),
 	buildRecallPayload: vi.fn(),
 	listBranchCatalog: vi.fn(),
+	DEFAULT_TOKEN_BUDGET: 80000,
 }));
 vi.mock("../core/TopicPageStore.js", () => ({ readTopicPage: vi.fn() }));
-vi.mock("../core/GitOps.js", () => ({ getCurrentBranch: vi.fn() }));
 vi.mock("../core/SummaryStore.js", () => ({ getActiveStorage: vi.fn() }));
 vi.mock("../core/PrDescription.js", () => ({ buildPrDescription: vi.fn() }));
+vi.mock("../util/Subprocess.js", () => ({ execFileSyncHidden: vi.fn() }));
 
 import { buildRecallPayload, compileTaskContext, listBranchCatalog } from "../core/ContextCompiler.js";
-import { getCurrentBranch } from "../core/GitOps.js";
 import { buildPrDescription } from "../core/PrDescription.js";
 import { SearchIndex } from "../core/SearchIndex.js";
 import { getActiveStorage } from "../core/SummaryStore.js";
 import { readTopicPage } from "../core/TopicPageStore.js";
+import { execFileSyncHidden } from "../util/Subprocess.js";
 import { runDecisionTimeline, runGetPrDescription, runListBranches, runRecall, runSearch } from "./McpTools.js";
 
 describe("runSearch", () => {
@@ -49,19 +50,48 @@ describe("runSearch", () => {
 
 describe("runRecall", () => {
 	it("defaults to the current branch when none given", async () => {
-		vi.mocked(getCurrentBranch).mockResolvedValue("feature/auth");
-		vi.mocked(compileTaskContext).mockResolvedValue({ branch: "feature/auth" } as never);
+		vi.mocked(execFileSyncHidden).mockReturnValue("feature/auth\n");
+		vi.mocked(listBranchCatalog).mockResolvedValue({
+			type: "catalog",
+			branches: [{ branch: "feature/auth", commitCount: 1, period: { start: "2026-01-01", end: "2026-01-01" } }],
+		} as never);
+		vi.mocked(compileTaskContext).mockResolvedValue({ branch: "feature/auth", commitCount: 1 } as never);
 		vi.mocked(buildRecallPayload).mockReturnValue({ type: "recall", branch: "feature/auth" } as never);
 		const out = await runRecall("/repo", {});
-		expect(compileTaskContext).toHaveBeenCalledWith({ branch: "feature/auth" }, "/repo");
-		expect(out.branch).toBe("feature/auth");
+		expect(out.type).toBe("recall");
+		if (out.type === "recall") expect(out.branch).toBe("feature/auth");
 	});
 
 	it("uses the explicit branch when provided", async () => {
-		vi.mocked(compileTaskContext).mockResolvedValue({ branch: "main" } as never);
+		vi.mocked(listBranchCatalog).mockResolvedValue({
+			type: "catalog",
+			branches: [{ branch: "main", commitCount: 1, period: { start: "2026-01-01", end: "2026-01-01" } }],
+		} as never);
+		vi.mocked(compileTaskContext).mockResolvedValue({ branch: "main", commitCount: 1 } as never);
 		vi.mocked(buildRecallPayload).mockReturnValue({ type: "recall", branch: "main" } as never);
 		await runRecall("/repo", { branch: "main" });
-		expect(compileTaskContext).toHaveBeenCalledWith({ branch: "main" }, "/repo");
+		expect(compileTaskContext).toHaveBeenCalledWith(expect.objectContaining({ branch: "main" }), "/repo");
+	});
+
+	it("returns type:catalog for a non-matching branch fragment", async () => {
+		vi.mocked(listBranchCatalog).mockResolvedValue({
+			type: "catalog",
+			branches: [{ branch: "main", commitCount: 1, period: { start: "2026-01-01", end: "2026-01-01" } }],
+		} as never);
+		const r = await runRecall("/repo", { branch: "no-such-frag" });
+		expect(r.type).toBe("catalog");
+	});
+
+	it("returns type:recall for an exact branch", async () => {
+		const seededBranch = "feature/seeded";
+		vi.mocked(listBranchCatalog).mockResolvedValue({
+			type: "catalog",
+			branches: [{ branch: seededBranch, commitCount: 2, period: { start: "2026-01-01", end: "2026-01-02" } }],
+		} as never);
+		vi.mocked(compileTaskContext).mockResolvedValue({ branch: seededBranch, commitCount: 2 } as never);
+		vi.mocked(buildRecallPayload).mockReturnValue({ type: "recall", branch: seededBranch } as never);
+		const r = await runRecall("/repo", { branch: seededBranch });
+		expect(r.type).toBe("recall");
 	});
 });
 

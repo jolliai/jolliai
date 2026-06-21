@@ -26,6 +26,16 @@ const itIfSymlinks = symlinksSupported ? it : it.skip;
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
 process.env.GIT_CONFIG_SYSTEM = "/dev/null";
 process.env.GIT_TERMINAL_PROMPT = "0";
+// `GIT_CONFIG_GLOBAL=/dev/null` neutralizes ~/.gitconfig but NOT the XDG default
+// excludes file (~/.config/git/ignore) — its path is a git built-in, not read
+// from config. A developer entry there (e.g. `.jolli/`, which `jolli impact
+// init` adds) would make `git add .` silently skip every seeded `.jolli/...`
+// fixture, so origin never receives them and the bootstrap conflict cases
+// resolve local-wins instead of remote-wins. Force core.excludesFile empty for
+// every git invocation this suite spawns.
+process.env.GIT_CONFIG_COUNT = "1";
+process.env.GIT_CONFIG_KEY_0 = "core.excludesFile";
+process.env.GIT_CONFIG_VALUE_0 = "/dev/null";
 
 // Every test spawns several real `git` subprocesses; under parallel suite load
 // + `--coverage` the global 15s testTimeout / 10s hookTimeout flake. 30s gives

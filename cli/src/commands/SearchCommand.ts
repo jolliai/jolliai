@@ -1,50 +1,25 @@
 /**
  * SearchCommand — `jolli search` CLI command.
  *
- * Provides the catalog-driven two-phase search invoked by the `/jolli-search`
- * skill template:
- *
- *   Phase 1: `jolli search <query> [--since X] [--limit N] [--budget T]`
- *            → outputs SearchCatalog (root-commit catalog for LLM scanning).
- *
- *   Phase 2: `jolli search <query> --hashes h1,h2,h3`
- *            → outputs SearchResult (full distilled content for picked hashes:
- *              recap + topics with trigger/response/decisions/files/category/
- *              importance + diffStats). Skill template Step 5 documents the
- *              schema and lets the LLM pick the render shape.
- *
- * The CLI is a pure function: no LLM calls, deterministic JSON output for the
- * skill template to parse.
+ * Single-phase BM25 search over distilled commit summaries. Emits `{ hits }`
+ * JSON (or a compact text render) — the same result the MCP `search` tool
+ * returns so the skill's CLI fallback is identical to the primary path.
  */
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { type Command, Option } from "commander";
-import { LocalSearchProvider } from "../core/LocalSearchProvider.js";
-import { DEFAULT_CATALOG_LIMIT, DEFAULT_SEARCH_BUDGET, type SearchCatalog, type SearchResult } from "../core/Search.js";
+import { searchHits } from "../core/SearchHits.js";
+import type { SearchHitResult } from "../core/SearchIndex.js";
+import { createStorage } from "../core/StorageFactory.js";
+import { getActiveStorage, setActiveStorage } from "../core/SummaryStore.js";
 import { setLogDir } from "../Logger.js";
 import { isSafeQuery, parsePositiveInt, readStdin, resolveProjectDir } from "./CliUtils.js";
 
-/**
- * Pattern matching a comma-separated list of **8- to 40-char hex SHAs**.
- *
- * Accepts abbreviated SHAs (≥ 8 chars, jolli's catalog `hash` field length) up
- * to full 40-char SHAs. The lower bound mirrors what the catalog emits, so the
- * LLM can echo back either `hit.hash` or `hit.fullHash` and have it resolve.
- *
- * Earlier this was locked to exactly 40 because `getSummary`'s tree-hash
- * fallback could silently mis-resolve cherry-pick / rebase twins that share a
- * tree. Once `getSummary` resolves abbreviated input via in-memory index
- * prefix scan (with explicit `AmbiguousHashError` on collisions), the boundary
- * can safely accept abbreviations again.
- */
-const HASH_LIST_PATTERN = /^[0-9a-f]{8,40}(,[0-9a-f]{8,40})*$/i;
-
 interface SearchOptions {
-	since?: string;
-	hashes?: string;
 	limit?: number;
-	budget?: number;
+	branch?: string;
+	type?: "topic" | "commit";
 	format?: "json" | "text";
 	output?: string;
 	cwd?: string;
@@ -52,85 +27,27 @@ interface SearchOptions {
 }
 
 /**
- * Splits a `--hashes` value into a list of trimmed, lowercased hashes.
+ * Renders a list of SearchHitResult as a compact human-readable text block
+ * (used when `--format text` is passed for terminal-friendly inspection).
  *
- * Deduplicates while preserving first-seen order so a copy-pasted list with
- * accidental duplicates (e.g. `abc1234,abc1234`) doesn't double-load the
- * same summary downstream. The order matters because `LocalSearchProvider.
- * loadHits` returns `results` in input order — the caller may rely on that
- * ordering for rendering.
+ * One line per hit: `hash  branch  date  title`
  */
-export function parseHashList(value: string | undefined): ReadonlyArray<string> | null {
-	if (!value) return null;
-	const trimmed = value.trim();
-	if (trimmed.length === 0) return null;
-	if (!HASH_LIST_PATTERN.test(trimmed)) return null;
-	const seen = new Set<string>();
-	const out: string[] = [];
-	for (const raw of trimmed.split(",")) {
-		const h = raw.trim().toLowerCase();
-		if (h.length === 0 || seen.has(h)) continue;
-		seen.add(h);
-		out.push(h);
+function renderHitsText(hits: SearchHitResult[]): string {
+	if (hits.length === 0) {
+		return "(no hits matched the query)";
 	}
-	return out;
-}
-
-/**
- * Renders a SearchCatalog as a compact human-readable text block (used when
- * `--format text` is passed for terminal-friendly inspection).
- */
-function renderCatalogText(catalog: SearchCatalog): string {
-	const lines: string[] = [];
-	lines.push(`Search catalog for "${catalog.query}"`);
-	lines.push(
-		`  ${catalog.entries.length} of ${catalog.totalCandidates} candidates${catalog.truncated ? " (truncated)" : ""}, ~${catalog.estimatedTokens} tokens`,
-	);
-	lines.push("");
-	for (const entry of catalog.entries) {
-		const ticket = entry.ticketId ? ` [${entry.ticketId}]` : "";
-		lines.push(`  ${entry.hash}  ${entry.branch}${ticket}  ${entry.date}`);
-		if (entry.recap) lines.push(`    ${entry.recap}`);
-		for (const t of entry.topics ?? []) {
-			const cat = t.category ? ` [${t.category}]` : "";
-			const imp = t.importance === "major" ? " ★" : "";
-			lines.push(`    - ${t.title}${cat}${imp}`);
-		}
-	}
-	if (catalog.entries.length === 0) {
-		lines.push("  (no commits matched the filter)");
-	}
-	return lines.join("\n");
-}
-
-/** Renders a SearchResult as compact text (Phase 2 fallback). */
-function renderResultText(result: SearchResult): string {
-	const lines: string[] = [];
-	lines.push(`Search hits for "${result.query}" (${result.results.length} of ${result.hashes.length})`);
-	lines.push("");
-	for (const hit of result.results) {
-		lines.push(`  ${hit.hash}  ${hit.branch}  ${hit.commitDate}`);
-		lines.push(`    ${hit.commitMessage.split("\n")[0]}`);
-		// Compact topic-title preview — one line per topic, no decisions/response
-		// dump (text format is for quick inspection, not deep reading; users who
-		// want full content go through `--format json` to a chat or `jolli view
-		// --commit <hash>`).
-		for (const t of hit.topics) {
-			lines.push(`    • ${t.title}`);
-		}
-	}
-	if (result.results.length === 0) {
-		lines.push("  (none of the requested hashes resolved to summaries)");
-	}
-	return lines.join("\n");
+	return hits
+		.map((h) => {
+			const date = h.commitDate.slice(0, 10);
+			return `${h.hash}  ${h.branch}  ${date}  ${h.title}`;
+		})
+		.join("\n");
 }
 
 /**
  * Writes JSON or text output to stdout (or a file when `--output` is given).
  */
 async function writeOutput(payload: unknown, options: SearchOptions, textFallback: () => string): Promise<void> {
-	// `--format` always carries commander's default ("json"), so `options.format`
-	// is non-undefined in practice. We still narrow with the cast for the type.
 	const fmt = options.format as "json" | "text";
 	const body = fmt === "json" ? JSON.stringify(payload, null, 2) : textFallback();
 
@@ -147,37 +64,43 @@ async function writeOutput(payload: unknown, options: SearchOptions, textFallbac
 	console.log(body);
 }
 
+function emitError(options: SearchOptions, message: string): void {
+	const fmt = options.format as "json" | "text";
+	if (fmt === "json") {
+		console.log(JSON.stringify({ type: "error", message }));
+	} else {
+		console.error(`\n  Error: ${message}\n`);
+	}
+	process.exitCode = 1;
+}
+
 /**
  * Registers the `search` command on the given Commander program.
  */
 export function registerSearchCommand(program: Command): void {
 	program
 		.command("search")
-		.description("Search structured commit memories (Phase 1: catalog; Phase 2: --hashes detail load)")
-		.argument("[words...]", "Query keyword(s). Multi-word queries are matched as a single intent.")
-		.option("--since <date>", "Cutoff date — ISO (YYYY-MM-DD) or relative (7d/2w/1m/3y)")
-		.option("--hashes <list>", "Comma-separated list of commit hashes to load full content for (Phase 2)")
-		.option("--limit <n>", `Catalog entry hard cap (default: ${DEFAULT_CATALOG_LIMIT})`, parsePositiveInt)
-		.option(
-			"--budget <tokens>",
-			`Token budget for catalog output (default: ${DEFAULT_SEARCH_BUDGET})`,
-			parsePositiveInt,
-		)
+		.description("Search structured commit memories (BM25 over distilled summaries)")
+		.argument("[words...]", "Query keyword(s)")
+		.option("--limit <n>", "Max hits (default 20)", parsePositiveInt)
+		.option("--branch <branch>", "Restrict to one branch")
+		.addOption(new Option("--type <kind>", "Restrict result kind").choices(["topic", "commit"]))
 		.addOption(new Option("--format <fmt>", "Output format").choices(["json", "text"]).default("json"))
 		.option("--output <path>", "Write output to file instead of stdout")
-		.option("--arg-stdin", "Read the query argument from stdin instead of argv (used by SKILL.md here-doc bridge)")
+		.option("--arg-stdin", "Read the query from stdin (used by SKILL.md here-doc bridge)")
 		.option("--cwd <dir>", "Project directory (default: git repo root)", resolveProjectDir())
 		.action(async (words: string[], options: SearchOptions) => {
 			try {
-				// `--cwd` carries commander's default (resolveProjectDir() at
-				// register time), so it's always defined when the action runs.
 				const projectDir = options.cwd as string;
 				setLogDir(projectDir);
+				// Establish the configured storage backend before any read — same as
+				// the MCP server (McpServer.startMcpServer). Without this, searchHits
+				// falls through resolveStorage to the orphan branch, so a folder-mode
+				// user's `jolli search` (the skill's CLI fallback) would index a
+				// different store than the MCP `search` tool and break the documented
+				// "CLI fallback === MCP primary" parity.
+				setActiveStorage(await createStorage(projectDir, projectDir));
 
-				// --arg-stdin is mutually exclusive with positional words. The skill
-				// template's here-doc pipeline pushes the query via stdin and CLI
-				// flags via argv; allowing both at once would silently concatenate
-				// or drop one side and undermine the injection-defense contract.
 				if (options.argStdin && words.length > 0) {
 					emitError(
 						options,
@@ -186,19 +109,22 @@ export function registerSearchCommand(program: Command): void {
 					return;
 				}
 
-				let query: string;
-				if (options.argStdin) {
-					query = await readStdin();
-				} else {
-					query = words.length > 0 ? words.join(" ") : "";
+				const query = options.argStdin ? await readStdin() : words.join(" ");
+
+				if (!query || !query.trim()) {
+					emitError(options, "A query is required.");
+					return;
 				}
 
-				// Validate query characters when present (prevents shell injection).
-				// Uses isSafeQuery — a deny-list of characters that escape a double-
-				// quoted bash arg (`\` `` ` `` `$` `"` and control chars). Natural
-				// punctuation (`?`, `#`, `(`, `:`, `,` …) is allowed so queries like
-				// "why did we pick X over Y?" or "#789" are accepted.
-				if (query.length > 0 && !isSafeQuery(query)) {
+				// Injection defense is only meaningful on the here-doc bash bridge
+				// (`--arg-stdin`, used by the skill template): that is the only path
+				// where the query is interpolated into a shell. A direct argv query
+				// — and the MCP `search` tool — never re-enters a shell and flows
+				// solely into the in-process Orama index, so validating those would
+				// reject characters (`$`, `` ` ``, …) the MCP path happily accepts and
+				// break the documented "CLI fallback === MCP primary" parity. Gate the
+				// check on `--arg-stdin` so the two surfaces return identical results.
+				if (options.argStdin && !isSafeQuery(query)) {
 					emitError(
 						options,
 						"Invalid characters in query. Backslash, backtick, dollar sign, double-quote, and control characters are not allowed.",
@@ -206,53 +132,21 @@ export function registerSearchCommand(program: Command): void {
 					return;
 				}
 
-				// --hashes implies Phase 2; require 8-40 char hex SHAs and a query.
-				if (options.hashes !== undefined) {
-					const parsed = parseHashList(options.hashes);
-					if (!parsed || parsed.length === 0) {
-						emitError(
-							options,
-							"Invalid --hashes value. Expected comma-separated hex SHAs of 8 to 40 characters (use `hit.hash` or `hit.fullHash` from the Phase 1 catalog).",
-						);
-						return;
-					}
-					if (query.length === 0) {
-						emitError(options, "A query is required when using --hashes (used for snippet highlighting).");
-						return;
-					}
+				const hits = await searchHits(
+					projectDir,
+					{
+						query,
+						...(options.branch !== undefined && { branch: options.branch }),
+						...(options.type !== undefined && { type: options.type }),
+						...(options.limit !== undefined && { limit: options.limit }),
+					},
+					getActiveStorage(),
+				);
 
-					const provider = new LocalSearchProvider(projectDir);
-					const result = await provider.loadHits({ query, hashes: parsed });
-					await writeOutput(result, options, () => renderResultText(result));
-					return;
-				}
-
-				// Phase 1 — empty query is allowed (returns catalog of recent
-				// commits the LLM can pick from based on the user's natural prompt).
-				const provider = new LocalSearchProvider(projectDir);
-				const catalog = await provider.buildCatalog({
-					query,
-					...(options.since !== undefined && { since: options.since }),
-					...(options.limit !== undefined && { limit: options.limit }),
-					...(options.budget !== undefined && { budget: options.budget }),
-				});
-				await writeOutput(catalog, options, () => renderCatalogText(catalog));
+				await writeOutput({ hits }, options, () => renderHitsText(hits));
 			} catch (error: unknown) {
 				const message = error instanceof Error ? error.message : String(error);
 				emitError(options, message);
 			}
 		});
-}
-
-function emitError(options: SearchOptions, message: string): void {
-	// commander default fills `--format`; cast for the type, no fallback needed.
-	const fmt = options.format as "json" | "text";
-	if (fmt === "json") {
-		console.log(JSON.stringify({ type: "error", message }));
-	} else {
-		console.error(`\n  Error: ${message}\n`);
-	}
-	// Always set a non-zero exit code so CI / shell pipelines can detect the
-	// failure regardless of which output format the caller asked for.
-	process.exitCode = 1;
 }

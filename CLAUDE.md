@@ -110,6 +110,32 @@ Local non-summary state is split across **two** `.jolli/jollimemory/` directorie
 
 Hook installation uses dist-path indirection: hooks call `node "$($HOME/.jolli/jollimemory/resolve-dist-path)/PostCommitHook.js"`, where `resolve-dist-path` reads the `~/.jolli/jollimemory/dist-path` file. CLI vs extension write the same version-tagged dist-path (e.g. `source=cli@1.0.0\n/abs/path/to/dist`), so whichever surface was enabled most recently wins, and version comparisons work across surfaces.
 
+### MCP server registration (multi-host)
+
+`jolli enable` wires the `jolli mcp` stdio server into every detected AI host. Registration is handled by per-host `McpHostRegistrar` implementations under [`cli/src/install/mcp/HostRegistrars.ts`](cli/src/install/mcp/HostRegistrars.ts). Each registrar carries a `scope`: **repo**-scoped hosts (config inside the worktree) are registered per-worktree via `registerRepoMcpHosts`; **global**-scoped hosts (one machine-wide file shared by every repo) are registered once via `registerGlobalMcpHosts`. Uninstall calls `removeRepoMcpHosts` — global entries are deliberately **not** removed, since a single-repo uninstall must not break MCP for other repos still using Jolli. Seven hosts are supported:
+
+| Host | Scope | Config path | Writer |
+|------|-------|-------------|--------|
+| Claude Code | repo | `.mcp.json` in the project root | `registerMcpInClaude` (custom merge — preserves other servers) |
+| Cursor | repo | `.cursor/mcp.json` in the project root | `JsonMcpWriter` |
+| Gemini CLI | global | `~/.gemini/settings.json` | `JsonMcpWriter` |
+| Codex | global | `~/.codex/config.toml` | `CodexTomlWriter` (hand-written TOML — no external TOML lib) |
+| OpenCode | global | `~/.config/opencode/opencode.json` | `JsonMcpWriter` (key `mcp`; entry needs `type:"local"` + combined command array) |
+| GitHub Copilot CLI | global | `~/.copilot/mcp-config.json` | `JsonMcpWriter` |
+| VS Code Copilot Chat | global | `<vscodeUserDataDir>/User/mcp.json` | `JsonMcpWriter` (key `servers`; entry `type:"stdio"`) |
+
+Each non-Claude registrar is gated by its host's existing detector (`isCursorInstalled`, `isCodexInstalled`, …) so registration is skipped for hosts the user hasn't installed. **Claude is the exception**: its `detected` flag mirrors `config.claudeEnabled !== false` (not a filesystem detector) — but MCP registration still runs **regardless of `claudeEnabled`** (it happens before the `claudeEnabled` hook gate in the install loop), because the Claude hook and MCP registration are independent decisions. IntelliJ MCP registration is a follow-up; the IntelliJ plugin registers no MCP today.
+
+### MCP tool set and CLI↔MCP result parity
+
+The `jolli mcp` server exposes four tools: `search`, `recall`, `get_decision_timeline`, `list_branches`. There is no `load_commits` tool.
+
+`recall` (MCP) and `jolli recall --format json` (CLI) both call `resolveRecall()` ([`cli/src/core/RecallResolver.ts`](cli/src/core/RecallResolver.ts)), so they return the identical `type`-tagged union (`recall` | `catalog` | `error`), including catalog fuzzy-match on an unrecognized branch.
+
+`search` (MCP) and `jolli search` (CLI) both call `searchHits()` ([`cli/src/core/SearchHits.ts`](cli/src/core/SearchHits.ts)), Orama BM25. Both return `{ hits }` — single-phase. The CLI `search` command's old two-phase catalog / `--hashes` flow was retired; [`LocalSearchProvider.ts`](cli/src/core/LocalSearchProvider.ts) is kept as an unused `SearchProvider` extension point.
+
+The `jolli-recall` and `jolli-search` skill templates (written by [`SkillInstaller.ts`](cli/src/install/SkillInstaller.ts)) prefer the MCP tools (`mcp__jollimemory__recall` / `mcp__jollimemory__search`) and fall back to the CLI here-doc recipe for hosts without MCP support. `jolli-search` is intentionally lightweight (title / snippet / slug / hash; no decisions or recap) — point users to `jolli-recall` for depth.
+
 ### Site generation lives in a separate plugin package
 
 The `jolli new` / `build` / `dev` / `start` / `convert` / `reverse` / `theme` commands are **not** in this repo. They live in `@jolli.ai/site-cli`, a plugin built and released separately. The host CLI discovers it at runtime through [`PluginLoader`](cli/src/PluginLoader.ts) and [`KnownPlugins.ts`](cli/src/KnownPlugins.ts) (allow-listed by random `jolliPluginId`, never by package name — see the PluginLoader header for the rationale).

@@ -98,6 +98,15 @@ const SAFE_GIT_OPTS: readonly string[] = [
 	"init.defaultBranch=main",
 	"-c",
 	"core.hooksPath=/dev/null",
+	// Neutralize the host's XDG global ignore (`~/.config/git/ignore`). On dev
+	// machines `jolli impact init` adds `.jolli/` there, which `git config
+	// --get core.excludesFile` won't reveal (git reads the XDG path implicitly)
+	// yet silently makes `git add .` skip any `.jolli/...` path — so seeding an
+	// aggregate like `test-repo/.jolli/manifest.json` stages nothing and the
+	// commit dies with "nothing to commit". CI lacks the global ignore, so this
+	// only bites locally; pinning excludesFile keeps the tests hermetic.
+	"-c",
+	"core.excludesFile=/dev/null",
 ];
 
 export async function setupAcceptance(): Promise<AcceptanceWorld> {

@@ -30,8 +30,16 @@ interface McpServerEntry {
  *   ENOENT (no shebang support, not on PATHEXT). So we spawn `node` (already a
  *   hard requirement for the hooks, hence on PATH) on the resolved `Cli.js`.
  *   This bakes in an absolute path, but `registerMcpInClaude` re-runs on every
- *   install/activate, so a moved dist is re-resolved then. If the dist can't be
- *   resolved yet, fall back to `run-cli` rather than write a broken entry.
+ *   install/activate, so a moved dist is re-resolved then.
+ *
+ *   If the dist can't be resolved yet on Windows there is no launchable command:
+ *   `run-cli` is returned only as a last resort and is itself NOT launchable on
+ *   win32 (same ENOENT) — i.e. it does NOT "avoid a broken entry", it just defers
+ *   the breakage. This branch is effectively unreachable on the normal install
+ *   path: `Installer.install()` writes this source's dist-path entry (and aborts
+ *   on failure) BEFORE any MCP registration runs, so `resolveCliJs` resolves by
+ *   then. If it were ever hit, the host would surface a spawn error (not silent)
+ *   and the next install/activate would re-register with the real `node Cli.js`.
  */
 export function mcpServerEntry(platform: NodeJS.Platform, runCli: string, cliJs: string | undefined): McpServerEntry {
 	if (platform === "win32" && cliJs) return { command: "node", args: [cliJs, "mcp"] };

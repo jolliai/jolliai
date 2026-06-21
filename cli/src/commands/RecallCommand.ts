@@ -17,12 +17,14 @@ import { dirname } from "node:path";
 import { type Command, Option } from "commander";
 import type { BranchCatalog } from "../core/ContextCompiler.js";
 import {
-	buildRecallPayload,
 	compileTaskContext,
 	DEFAULT_TOKEN_BUDGET,
 	listBranchCatalog,
 	renderContextMarkdown,
 } from "../core/ContextCompiler.js";
+import { resolveRecall } from "../core/RecallResolver.js";
+import { createStorage } from "../core/StorageFactory.js";
+import { setActiveStorage } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
 import { setLogDir } from "../Logger.js";
 import type { CommitSummary } from "../Types.js";
@@ -153,13 +155,31 @@ function renderShortSummary(ctx: {
 }
 
 /**
- * Loads and outputs recalled development context for a branch.
+ * Writes `body` to `outputPath`, creating parent dirs as needed (the `mkdir -p`
+ * ergonomic users expect from a `--output some/nested/path` flag — `writeFile`
+ * itself does not create them, so a fresh repo would otherwise ENOENT).
+ */
+async function writeOutputFile(outputPath: string, body: string): Promise<void> {
+	const parent = dirname(outputPath);
+	if (parent && parent !== ".") {
+		await mkdir(parent, { recursive: true });
+	}
+	await writeFile(outputPath, body, "utf-8");
+}
+
+/**
+ * Loads and outputs recalled development context for a branch (the non-JSON
+ * modes; `--format json` is handled directly in the command action so CLI and
+ * MCP produce byte-identical payloads).
  *
  * Output modes (in priority order):
  * 1. `--output <path>` — writes full markdown to file, prints confirmation line.
- * 2. `--format json` — outputs full JSON (for skill/agent consumption).
- * 3. `--full` — outputs full markdown to stdout.
- * 4. Default — outputs short summary to stdout (terminal-friendly).
+ * 2. `--full` / `--format md` — outputs full markdown to stdout.
+ * 3. Default — outputs short summary to stdout (terminal-friendly).
+ *
+ * Note: `--format json` does NOT reach here — it is intercepted earlier in the
+ * action. When combined with `--output`, the JSON path writes the JSON payload
+ * to the file (see the command action), so `--output` is never silently dropped.
  */
 async function outputRecall(
 	branch: string,
@@ -186,51 +206,28 @@ async function outputRecall(
 	);
 
 	if (ctx.commitCount === 0) {
-		if (options.format === "json") {
-			console.log(
-				JSON.stringify({ type: "error", message: `No Jolli Memory records found for branch "${branch}".` }),
-			);
-		} else {
-			console.log(`No Jolli Memory records found for branch "${branch}".`);
-		}
+		console.log(`No Jolli Memory records found for branch "${branch}".`);
 		return;
 	}
 
 	// Output path 1: --output <file> -> always writes full markdown to file
 	if (options.output) {
 		const markdown = renderContextMarkdown(ctx, options.budget ?? DEFAULT_TOKEN_BUDGET);
-		// Ensure parent dir exists — writeFile itself does not create it, so
-		// `--output some/nested/path.md` on a fresh repo would otherwise ENOENT.
-		// Matches the `mkdir -p`-style ergonomic users expect from --output flags.
-		const parent = dirname(options.output);
-		if (parent && parent !== ".") {
-			await mkdir(parent, { recursive: true });
-		}
-		await writeFile(options.output, markdown, "utf-8");
+		await writeOutputFile(options.output, markdown);
 		console.log(
 			`Context written to ${options.output} (${ctx.stats.totalTokens.toLocaleString()} tokens, ${ctx.commitCount} commit${ctx.commitCount === 1 ? "" : "s"})`,
 		);
 		return;
 	}
 
-	// Output path 2: --format json -> structured RecallPayload for skill/agent
-	// consumption. The skill template's LLM does its own grounded synthesis
-	// from the structured fields; we deliberately do NOT pre-render markdown
-	// here (it would tempt the LLM back into paraphrase mode).
-	if (options.format === "json") {
-		const payload = buildRecallPayload(ctx, options.budget ?? DEFAULT_TOKEN_BUDGET);
-		console.log(JSON.stringify(payload));
-		return;
-	}
-
-	// Output path 3: --full or --format md -> full markdown to stdout
+	// Output path 2: --full or --format md -> full markdown to stdout
 	if (options.full || options.format === "md") {
 		const markdown = renderContextMarkdown(ctx, options.budget ?? DEFAULT_TOKEN_BUDGET);
 		console.log(markdown);
 		return;
 	}
 
-	// Output path 4: default -> short summary for terminal viewing
+	// Output path 3: default -> short summary for terminal viewing
 	console.log(renderShortSummary(ctx));
 }
 
@@ -260,6 +257,14 @@ export function registerRecallCommand(program: Command): void {
 			try {
 				const projectDir = options.cwd;
 				setLogDir(projectDir);
+				// Establish the configured storage backend before any read — same as
+				// the MCP server (McpServer.startMcpServer). resolveRecall and the
+				// text/catalog paths below read through the store APIs without
+				// threading `storage`, so without this they fall through resolveStorage
+				// to the orphan branch. For folder-mode users that diverges from what
+				// the MCP `recall` tool returns, breaking the CLI/MCP parity this
+				// command's JSON mode is built to guarantee.
+				setActiveStorage(await createStorage(projectDir, projectDir));
 
 				// --arg-stdin is mutually exclusive with positional words. The skill
 				// template's here-doc pipeline relies on stdin being the single
@@ -314,6 +319,31 @@ export function registerRecallCommand(program: Command): void {
 					return;
 				}
 
+				// JSON mode: delegate entirely to resolveRecall so CLI and MCP produce
+				// byte-identical output. Non-JSON modes keep their existing text paths.
+				if (options.format === "json") {
+					const result = await resolveRecall(branchOrKeyword, projectDir, {
+						budget: options.budget,
+						depth: options.depth,
+						includeTranscripts: options.includeTranscripts,
+						includePlans: options.plans !== false,
+					});
+					const payload = JSON.stringify(result);
+					// `--output` is honored in JSON mode too: write the SAME payload
+					// that would go to stdout to the file. Previously this branch
+					// short-circuited to stdout before the markdown `--output` path
+					// could run, so `--format json --output FILE` silently dropped
+					// the file. Writing the JSON keeps both flags meaningful.
+					if (options.output) {
+						await writeOutputFile(options.output, payload);
+						console.log(`Recall context (JSON) written to ${options.output}`);
+					} else {
+						console.log(payload);
+					}
+					if (result.type === "error") process.exitCode = 1;
+					return;
+				}
+
 				// Resolve branch: explicit arg, or current git branch
 				let branch = branchOrKeyword as string | undefined;
 				if (!branch) {
@@ -340,38 +370,21 @@ export function registerRecallCommand(program: Command): void {
 						return;
 					}
 
-					// No exact match — return catalog with query for LLM semantic matching
-					if (options.format === "json") {
-						console.log(JSON.stringify({ ...catalog, query: branch }));
-					} else {
-						console.log(renderCatalogText(catalog, branch));
-					}
+					// No exact match — show catalog with query hint for text mode
+					console.log(renderCatalogText(catalog, branch));
 					return;
 				}
 
 				// No branch at all — check current branch in catalog, else return catalog
 				if (catalog.branches.length === 0) {
-					if (options.format === "json") {
-						console.log(
-							JSON.stringify({
-								type: "error",
-								message: "No Jolli Memory records found in this repository.",
-							}),
-						);
-					} else {
-						console.log(
-							'No Jolli Memory records found in this repository.\nRun "jolli enable" to start recording.',
-						);
-					}
+					console.log(
+						'No Jolli Memory records found in this repository.\nRun "jolli enable" to start recording.',
+					);
 					return;
 				}
 
 				// Fallback: return catalog
-				if (options.format === "json") {
-					console.log(JSON.stringify(catalog));
-				} else {
-					console.log(renderCatalogText(catalog));
-				}
+				console.log(renderCatalogText(catalog));
 			} catch (error: unknown) {
 				const message = error instanceof Error ? error.message : String(error);
 				if (options.format === "json") {

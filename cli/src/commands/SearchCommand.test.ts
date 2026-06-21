@@ -1,23 +1,23 @@
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { parseHashList, registerSearchCommand } from "./SearchCommand.js";
+import { registerSearchCommand } from "./SearchCommand.js";
 
-vi.mock("../core/SummaryStore.js", async () => {
-	const actual = await vi.importActual<typeof import("../core/SummaryStore.js")>("../core/SummaryStore.js");
-	return {
-		// Re-export the real AmbiguousHashError so `instanceof` checks in
-		// LocalSearchProvider see the same class the tests would throw.
-		AmbiguousHashError: actual.AmbiguousHashError,
-		getCatalogWithLazyBuild: vi.fn(async () => ({ version: 1, entries: [] })),
-		getIndex: vi.fn(async () => null),
-		getSummary: vi.fn(async () => null),
-	};
-});
+// Mock SearchHits so we don't need a real repo/index on disk.
+vi.mock("../core/SearchHits.js", () => ({
+	searchHits: vi.fn(async () => []),
+}));
 
-import { getCatalogWithLazyBuild, getIndex } from "../core/SummaryStore.js";
+// Mock StorageFactory so the command's `createStorage` call is hermetic (does not
+// read the developer's real ~/.jolli config) and returns a stable sentinel that
+// flows through setActiveStorage → getActiveStorage into the searchHits 3rd arg.
+const fakeStorage = { __fake: "storage" } as unknown as import("../core/StorageProvider.js").StorageProvider;
+vi.mock("../core/StorageFactory.js", () => ({
+	createStorage: vi.fn(async () => fakeStorage),
+}));
 
-const mockGetIndex = vi.mocked(getIndex);
-const mockGetCatalog = vi.mocked(getCatalogWithLazyBuild);
+import { searchHits } from "../core/SearchHits.js";
+
+const mockSearchHits = vi.mocked(searchHits);
 
 vi.mock("node:fs/promises", async () => {
 	const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
@@ -29,82 +29,11 @@ vi.mock("node:fs/promises", async () => {
 });
 
 import { mkdir, writeFile } from "node:fs/promises";
-import { getSummary } from "../core/SummaryStore.js";
 
-const mockGetSummary = vi.mocked(getSummary);
 const mockMkdir = vi.mocked(mkdir);
 const mockWriteFile = vi.mocked(writeFile);
 
-// ─── parseHashList ───────────────────────────────────────────────────────────
-
-describe("parseHashList", () => {
-	it("returns null for empty/whitespace", () => {
-		expect(parseHashList(undefined)).toBeNull();
-		expect(parseHashList("")).toBeNull();
-		expect(parseHashList("   ")).toBeNull();
-	});
-
-	it("parses single hex hash", () => {
-		expect(parseHashList("abcd1234abcd1234abcd1234abcd1234abcd1234")).toEqual([
-			"abcd1234abcd1234abcd1234abcd1234abcd1234",
-		]);
-	});
-
-	it("parses comma-separated hashes", () => {
-		expect(
-			parseHashList("abcd1234abcd1234abcd1234abcd1234abcd1234,deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
-		).toEqual(["abcd1234abcd1234abcd1234abcd1234abcd1234", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"]);
-	});
-
-	it("rejects hashes shorter than 8 characters", () => {
-		// Below 8 we don't try to resolve — the catalog never emits anything
-		// shorter, and very short inputs would just produce ambiguous matches.
-		expect(parseHashList("abc")).toBeNull();
-		expect(parseHashList("1234567")).toBeNull();
-	});
-
-	it("accepts 8-char abbreviations (matches the catalog's `hash` field length)", () => {
-		// Once getSummary resolves abbrevs via in-memory index prefix scan
-		// (returning AmbiguousHashError for collisions instead of silently
-		// picking one), the CLI boundary can safely accept either `hit.hash`
-		// (8-char) or `hit.fullHash` (40-char) from the catalog output.
-		expect(parseHashList("abcd1234")).toEqual(["abcd1234"]);
-		expect(parseHashList("abcd1234,deadbeef")).toEqual(["abcd1234", "deadbeef"]);
-		// Mixed lengths in the same call: one 8-char abbrev, one full 40-char SHA.
-		expect(parseHashList("abcd1234,abcd1234abcd1234abcd1234abcd1234abcd1234")).toEqual([
-			"abcd1234",
-			"abcd1234abcd1234abcd1234abcd1234abcd1234",
-		]);
-	});
-
-	it("rejects hashes longer than 40 characters", () => {
-		// 41 hex chars: longer than any real SHA-1 — likely garbage / typo.
-		expect(parseHashList("abcd1234abcd1234abcd1234abcd1234abcd12345")).toBeNull();
-	});
-
-	it("rejects trailing comma", () => {
-		expect(parseHashList("abcd1234abcd1234abcd1234abcd1234abcd1234,")).toBeNull();
-	});
-
-	it("rejects whitespace inside hashes", () => {
-		// Even a 40-char value gets rejected if there's whitespace inside.
-		expect(parseHashList("abcd1234 abcd1234abcd1234abcd1234abcd123")).toBeNull();
-	});
-
-	it("rejects non-hex characters", () => {
-		// "z" is not a valid hex digit.
-		expect(parseHashList("zzz12345abcd1234abcd1234abcd1234abcd1234")).toBeNull();
-		expect(parseHashList("abcd123g")).toBeNull(); // 8 chars, "g" is not hex
-	});
-
-	it("normalizes mixed case to lowercase", () => {
-		expect(parseHashList("AbCd1234abcd1234abcd1234abcd1234abcd1234")).toEqual([
-			"abcd1234abcd1234abcd1234abcd1234abcd1234",
-		]);
-	});
-});
-
-// ─── registerSearchCommand integration ───────────────────────────────────────
+// ─── test harness ────────────────────────────────────────────────────────────
 
 function makeProgram(): Command {
 	const program = new Command();
@@ -133,6 +62,20 @@ async function runCommand(args: string[]): Promise<{ stdout: string; stderr: str
 	return { stdout, stderr };
 }
 
+async function runWithStdin(args: string[], stdinPayload: string): Promise<{ stdout: string; stderr: string }> {
+	const { Readable } = await import("node:stream");
+	const origStdin = process.stdin;
+	const stream = Readable.from([stdinPayload]);
+	Object.defineProperty(process, "stdin", { value: stream, configurable: true });
+	try {
+		return await runCommand(args);
+	} finally {
+		Object.defineProperty(process, "stdin", { value: origStdin, configurable: true });
+	}
+}
+
+// ─── registerSearchCommand ────────────────────────────────────────────────────
+
 describe("registerSearchCommand", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
@@ -142,497 +85,204 @@ describe("registerSearchCommand", () => {
 		process.exitCode = undefined;
 	});
 
-	it("default JSON output for an empty repo", async () => {
-		const { stdout } = await runCommand(["auth", "--cwd", "/tmp/jolli-search-test-empty"]);
-		expect(stdout).toContain('"type": "search-catalog"');
+	// ─── {hits} JSON output ───────────────────────────────────────────────────
+
+	it("emits {hits} JSON for a valid query (empty hit list from mock)", async () => {
+		const { stdout } = await runCommand(["auth", "--format", "json", "--cwd", "/tmp/jolli-search-test"]);
+		const parsed = JSON.parse(stdout);
+		expect(parsed).toHaveProperty("hits");
+		expect(Array.isArray(parsed.hits)).toBe(true);
 	});
 
-	it("text format prints human-readable header", async () => {
-		const { stdout } = await runCommand(["auth", "--format", "text", "--cwd", "/tmp/jolli-search-test-empty"]);
-		expect(stdout).toContain("Search catalog");
+	it("passes query and options through to searchHits", async () => {
+		await runCommand(["auth flow", "--limit", "5", "--branch", "main", "--type", "topic", "--cwd", "/tmp/t"]);
+		expect(mockSearchHits).toHaveBeenCalledWith(
+			"/tmp/t",
+			expect.objectContaining({ query: "auth flow", limit: 5, branch: "main", type: "topic" }),
+			fakeStorage,
+		);
 	});
 
-	it("rejects unsafe shell chars in query (deny-list) and sets non-zero exit code", async () => {
-		// `$(date)` violates the query deny-list ($ is blocked because it triggers
-		// shell expansion inside double quotes). Pass as a single positional so
-		// commander doesn't treat any token as a flag.
-		const { stdout } = await runCommand(["foo$(date)", "--cwd", "/tmp/jolli-search-test-empty"]);
-		expect(stdout).toContain('"type":"error"');
-		expect(stdout).toContain("Invalid characters");
-		// Exit code must be set even when --format json (callers shouldn't have to
-		// parse JSON to know there was an error).
+	it("emits populated hits in JSON output", async () => {
+		mockSearchHits.mockResolvedValueOnce([
+			{
+				id: "id1",
+				type: "topic",
+				title: "Auth flow design",
+				snippet: "We chose JWT",
+				branch: "feature/auth",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				slug: "auth-flow-design",
+				hash: "abcd1234",
+				score: 0.9,
+			},
+		]);
+		const { stdout } = await runCommand(["auth", "--cwd", "/tmp/t"]);
+		const parsed = JSON.parse(stdout);
+		expect(parsed.hits).toHaveLength(1);
+		expect(parsed.hits[0].title).toBe("Auth flow design");
+		expect(parsed.hits[0].hash).toBe("abcd1234");
+	});
+
+	// ─── empty query → non-zero exit ─────────────────────────────────────────
+
+	it("rejects empty positional query with non-zero exit", async () => {
+		const { stdout } = await runCommand(["--cwd", "/tmp/t"]);
+		const parsed = JSON.parse(stdout);
+		expect(parsed.type).toBe("error");
+		expect(parsed.message).toContain("query is required");
 		expect(process.exitCode).toBe(1);
 	});
 
+	it("--arg-stdin with empty stdin rejects with non-zero exit", async () => {
+		const { code: _code, ...result } = await (async () => {
+			const r = await runWithStdin(["--arg-stdin", "--cwd", "/tmp/t"], "");
+			return { ...r, code: process.exitCode };
+		})();
+		const parsed = JSON.parse(result.stdout);
+		expect(parsed.type).toBe("error");
+		expect(parsed.message).toContain("query is required");
+		expect(process.exitCode).toBe(1);
+	});
+
+	// ─── isSafeQuery validation (gated on --arg-stdin only) ───────────────────
+
+	it("accepts unsafe shell chars on the direct argv path (MCP parity — no shell, no validation)", async () => {
+		// isSafeQuery only guards the --arg-stdin here-doc bridge: that is the one
+		// path where the query is interpolated into a shell. A direct argv query
+		// never re-enters a shell and flows straight into the in-process index, so
+		// it must accept `$`/backticks exactly like the MCP `search` tool — that is
+		// the documented "CLI fallback === MCP primary" parity.
+		const { stdout } = await runCommand(["foo$(date)", "--cwd", "/tmp/t"]);
+		const parsed = JSON.parse(stdout);
+		expect(parsed).toHaveProperty("hits");
+		expect(mockSearchHits).toHaveBeenCalledWith(
+			"/tmp/t",
+			expect.objectContaining({ query: "foo$(date)" }),
+			fakeStorage,
+		);
+		expect(process.exitCode).toBeUndefined();
+	});
+
 	it("accepts natural-language punctuation in queries", async () => {
-		// `?` `(` `)` `:` `,` `'` `!` were rejected by the old strict pattern but
-		// must pass under the new deny-list. Use a sentence with a question mark.
-		const { stdout } = await runCommand(["why did we choose X over Y?", "--cwd", "/tmp/jolli-search-test-empty"]);
-		expect(stdout).not.toContain('"type":"error"');
-		expect(stdout).toContain('"type": "search-catalog"');
+		const { stdout } = await runCommand(["why did we choose X over Y?", "--cwd", "/tmp/t"]);
+		const parsed = JSON.parse(stdout);
+		expect(parsed).toHaveProperty("hits");
 	});
 
-	it("accepts # and parentheses in queries (ticket lookup, parenthetical)", async () => {
-		const { stdout } = await runCommand(["#789 (token bucket)", "--cwd", "/tmp/jolli-search-test-empty"]);
-		expect(stdout).not.toContain('"type":"error"');
+	it("accepts # and parentheses in queries", async () => {
+		const { stdout } = await runCommand(["#789 (token bucket)", "--cwd", "/tmp/t"]);
+		const parsed = JSON.parse(stdout);
+		expect(parsed).toHaveProperty("hits");
 	});
 
-	it("rejects invalid --hashes", async () => {
-		const { stdout } = await runCommand(["auth", "--hashes", "xyz", "--cwd", "/tmp/jolli-search-test-empty"]);
-		expect(stdout).toContain('"type":"error"');
-	});
+	// ─── text format ──────────────────────────────────────────────────────────
 
-	it("rejects --hashes that don't fit the 8-40 hex pattern (too short / non-hex)", async () => {
-		// Abbreviated SHAs ≥ 8 are now ACCEPTED — `getSummary` resolves them via
-		// in-memory index prefix scan with explicit AmbiguousHashError on collisions,
-		// so the boundary no longer has to enforce "full SHA only". Inputs that
-		// don't look like a hex SHA at all (too short, non-hex chars) still error.
-		const { stdout } = await runCommand([
-			"auth",
-			"--hashes",
-			"abc,defg", // both segments < 8 chars
-			"--cwd",
-			"/tmp/jolli-search-test-empty",
+	it("text format prints one line per hit", async () => {
+		mockSearchHits.mockResolvedValueOnce([
+			{
+				id: "id1",
+				type: "commit",
+				title: "Auth refactor",
+				snippet: "Rewrote auth",
+				branch: "feature/auth",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				slug: "auth-refactor",
+				hash: "deadbeef",
+				score: 0.8,
+			},
 		]);
-		expect(stdout).toContain('"type":"error"');
-		expect(stdout).toContain("8 to 40 characters");
-	});
-
-	it("requires query when --hashes is provided", async () => {
-		const { stdout } = await runCommand([
-			"--hashes",
-			"abcd1234abcd1234abcd1234abcd1234abcd1234",
-			"--cwd",
-			"/tmp/jolli-search-test-empty",
-		]);
-		expect(stdout).toContain('"type":"error"');
-		expect(stdout).toContain("query is required");
-	});
-
-	it("rejects invalid --since instead of silently disabling the filter", async () => {
-		// Regression: earlier `--since=lastweek` parsed to null (treated as no
-		// filter), broadening results instead of erroring. Now buildCatalog
-		// throws, the action's outer try/catch emits a JSON error.
-		const { stdout } = await runCommand(["auth", "--since", "lastweek", "--cwd", "/tmp/jolli-search-test-empty"]);
-		expect(stdout).toContain('"type":"error"');
-		expect(stdout).toContain("Invalid --since");
-	});
-
-	it("Phase 2 path: returns search result for picked hash", async () => {
-		mockGetSummary.mockResolvedValueOnce({
-			version: 4,
-			commitHash: "abcd1234abcd1234abcd1234abcd1234abcd1234",
-			commitMessage: "msg",
-			commitAuthor: "dev",
-			commitDate: "2026-04-01T00:00:00.000Z",
-			branch: "x",
-			generatedAt: "2026-04-01T00:00:00.000Z",
-			recap: "Did auth work",
-			topics: [
-				{
-					title: "Auth",
-					trigger: "T",
-					response: "R",
-					decisions: "auth jwt",
-				},
-			],
-		});
-		const { stdout } = await runCommand([
-			"auth",
-			"--hashes",
-			"abcd1234abcd1234abcd1234abcd1234abcd1234",
-			"--cwd",
-			"/tmp/jolli-search-test-found",
-		]);
-		expect(stdout).toContain('"type": "search"');
-		expect(stdout).toContain("abcd1234abcd1234abcd1234abcd1234abcd1234");
-	});
-
-	it("Phase 2 path: 8-char abbreviated hash flows end-to-end through getSummary's prefix scan", async () => {
-		// Integration coverage for the loosened HASH_LIST_PATTERN: parseHashList
-		// accepts the 8-char abbrev, the CLI passes it to LocalSearchProvider,
-		// which passes it to getSummary, which (in production) resolves it via
-		// the new in-memory prefix scan. Mock returns a summary keyed at the
-		// FULL 40-char SHA — buildHit then renders `hit.hash` as the first 8.
-		const fullHash = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
-		mockGetSummary.mockResolvedValueOnce({
-			version: 4,
-			commitHash: fullHash,
-			commitMessage: "feat: thing",
-			commitAuthor: "dev",
-			commitDate: "2026-04-01T00:00:00.000Z",
-			branch: "feature/thing",
-			generatedAt: "2026-04-01T00:00:00.000Z",
-			recap: "Did the thing",
-			topics: [{ title: "T", trigger: "tr", response: "rs", decisions: "d" }],
-		});
-		const { stdout } = await runCommand([
-			"thing",
-			"--hashes",
-			"deadbeef", // 8-char abbreviation
-			"--cwd",
-			"/tmp/jolli-search-test-abbrev",
-		]);
-		expect(stdout).toContain('"type": "search"');
-		// LocalSearchProvider was called with the abbreviated form (CLI doesn't
-		// expand to full SHA — that's getSummary's job in real use).
-		expect(mockGetSummary).toHaveBeenCalledTimes(1);
-		expect(mockGetSummary.mock.calls[0][0]).toBe("deadbeef");
-		// The result contains the full 40-char SHA (returned by getSummary)
-		// and the 8-char display hash matches the abbreviation.
-		expect(stdout).toContain(fullHash);
-	});
-
-	it("Phase 2 path: dedupes duplicate --hashes input", async () => {
-		// Regression: a copy-pasted list with accidental duplicates shouldn't
-		// double-load the same summary. parseHashList collapses duplicates
-		// into a single entry, so getSummary is only invoked once per unique
-		// hash.
-		mockGetSummary.mockResolvedValue({
-			version: 4,
-			commitHash: "abcd1234abcd1234abcd1234abcd1234abcd1234",
-			commitMessage: "m",
-			commitAuthor: "d",
-			commitDate: "2026-04-01T00:00:00.000Z",
-			branch: "b",
-			generatedAt: "2026-04-01T00:00:00.000Z",
-			topics: [],
-		});
-		await runCommand(["q", "--hashes", "abcd1234,abcd1234,abcd1234", "--cwd", "/tmp/jolli-search-test-dedupe"]);
-		expect(mockGetSummary).toHaveBeenCalledTimes(1);
-	});
-
-	it("--output writes file and prints confirmation", async () => {
-		const { stdout } = await runCommand([
-			"auth",
-			"--output",
-			"/tmp/out.json",
-			"--cwd",
-			"/tmp/jolli-search-test-empty",
-		]);
-		expect(mockWriteFile).toHaveBeenCalled();
-		expect(mockMkdir).toHaveBeenCalled();
-		expect(stdout).toContain("Search output written to");
-	});
-
-	it("Phase 2 text format renders the populated-results path", async () => {
-		mockGetSummary.mockResolvedValueOnce({
-			version: 4,
-			commitHash: "abcd1234abcd1234abcd1234abcd1234abcd1234",
-			commitMessage: "feat: add auth",
-			commitAuthor: "dev",
-			commitDate: "2026-04-01T00:00:00.000Z",
-			branch: "feature/auth",
-			generatedAt: "2026-04-01T00:00:00.000Z",
-			recap: "Auth flow",
-			topics: [
-				{
-					title: "Auth",
-					trigger: "T",
-					response: "R",
-					decisions: "auth picked JWT",
-				},
-			],
-		});
-		const { stdout } = await runCommand([
-			"auth",
-			"--hashes",
-			"abcd1234abcd1234abcd1234abcd1234abcd1234",
-			"--format",
-			"text",
-			"--cwd",
-			"/tmp/jolli-search-test-found",
-		]);
-		expect(stdout).toContain("Search hits");
-		// Text renderer prints `hit.hash` (8-char display abbreviation), not the
-		// 40-char fullHash — see renderResultText in SearchCommand.ts.
-		expect(stdout).toContain("abcd1234 ");
+		const { stdout } = await runCommand(["auth", "--format", "text", "--cwd", "/tmp/t"]);
+		expect(stdout).toContain("deadbeef");
 		expect(stdout).toContain("feature/auth");
+		expect(stdout).toContain("2026-04-01");
+		expect(stdout).toContain("Auth refactor");
 	});
 
-	it("Phase 2 text format renders the empty-results path", async () => {
-		mockGetSummary.mockResolvedValueOnce(null);
-		const { stdout } = await runCommand([
-			"auth",
-			"--hashes",
-			"abcd1234abcd1234abcd1234abcd1234abcd1234",
-			"--format",
-			"text",
-			"--cwd",
-			"/tmp/jolli-search-test-found",
-		]);
-		expect(stdout).toContain("none of the requested hashes resolved");
+	it("text format renders empty-hits path", async () => {
+		// mockSearchHits returns [] by default
+		const { stdout } = await runCommand(["notfound", "--format", "text", "--cwd", "/tmp/t"]);
+		expect(stdout).toContain("(no hits matched the query)");
 	});
 
 	it("text format error path writes to stderr and sets exitCode", async () => {
-		const { stdout, stderr } = await runCommand([
-			"foo$(date)",
-			"--format",
-			"text",
-			"--cwd",
-			"/tmp/jolli-search-test-empty",
-		]);
-		// Text-format error goes to stderr, not stdout; exitCode is set non-zero.
+		// Trigger the text-format emitError path via the --arg-stdin validation
+		// (the one path where unsafe chars are still rejected), since a direct argv
+		// unsafe query is now accepted (MCP parity).
+		const { stdout, stderr } = await runWithStdin(
+			["--arg-stdin", "--format", "text", "--cwd", "/tmp/t"],
+			"$(date)\n",
+		);
 		expect(stdout).toBe("");
 		expect(stderr).toContain("Error:");
-		expect(process.exitCode).not.toBe(0);
+		expect(process.exitCode).toBe(1);
 	});
 
-	it("catches and reports runtime errors from the provider", async () => {
-		mockGetSummary.mockImplementationOnce(async () => {
-			throw new Error("simulated storage failure");
-		});
-		const { stdout } = await runCommand([
-			"auth",
-			"--hashes",
-			"abcd1234abcd1234abcd1234abcd1234abcd1234",
-			"--cwd",
-			"/tmp/jolli-search-test-found",
-		]);
-		expect(stdout).toContain('"type":"error"');
-		expect(stdout).toContain("simulated storage failure");
-	});
+	// ─── --output ─────────────────────────────────────────────────────────────
 
-	it("--output also works for Phase 2", async () => {
-		mockGetSummary.mockResolvedValueOnce({
-			version: 4,
-			commitHash: "abcd1234abcd1234abcd1234abcd1234abcd1234",
-			commitMessage: "msg",
-			commitAuthor: "dev",
-			commitDate: "2026-04-01T00:00:00.000Z",
-			branch: "x",
-			generatedAt: "2026-04-01T00:00:00.000Z",
-			topics: [{ title: "t", trigger: "auth", response: "r", decisions: "d" }],
-		});
-		await runCommand([
-			"auth",
-			"--hashes",
-			"abcd1234abcd1234abcd1234abcd1234abcd1234",
-			"--output",
-			"sub/dir/result.json",
-			"--cwd",
-			"/tmp/jolli-search-test-found",
-		]);
+	it("--output writes file and prints confirmation", async () => {
+		const { stdout } = await runCommand(["auth", "--output", "sub/dir/out.json", "--cwd", "/tmp/t"]);
+		expect(mockMkdir).toHaveBeenCalled();
 		expect(mockWriteFile).toHaveBeenCalled();
+		expect(stdout).toContain("Search output written to");
 	});
 
-	it("--output skips mkdir when path has no parent", async () => {
+	it("--output skips mkdir when path has no parent dir", async () => {
 		mockMkdir.mockClear();
-		await runCommand(["auth", "--output", "result.json", "--cwd", "/tmp/jolli-search-test-empty"]);
+		await runCommand(["auth", "--output", "result.json", "--cwd", "/tmp/t"]);
 		// dirname("result.json") === "." → mkdir is skipped
 		expect(mockMkdir).not.toHaveBeenCalled();
 		expect(mockWriteFile).toHaveBeenCalled();
 	});
 
-	it("default Phase 1 with --since and --limit echoes filter back", async () => {
-		const { stdout } = await runCommand([
-			"auth",
-			"--since",
-			"7d",
-			"--limit",
-			"50",
-			"--budget",
-			"4000",
-			"--cwd",
-			"/tmp/jolli-search-test-empty",
-		]);
-		const result = JSON.parse(stdout);
-		expect(result.filter).toEqual({ since: "7d", limit: 50 });
-	});
+	// ─── runtime errors ───────────────────────────────────────────────────────
 
-	it("Phase 1 text format renders entries WITHOUT decorations (falsy branches)", async () => {
-		mockGetIndex.mockResolvedValueOnce({
-			version: 3,
-			entries: [
-				{
-					commitHash: "minimalcommithash01",
-					parentCommitHash: null,
-					branch: "x",
-					commitMessage: "msg",
-					commitDate: "2026-04-01T10:00:00.000Z",
-					generatedAt: "2026-04-01T10:01:00.000Z",
-				},
-			],
+	it("catches and reports runtime errors from searchHits", async () => {
+		mockSearchHits.mockImplementationOnce(async () => {
+			throw new Error("simulated storage failure");
 		});
-		mockGetCatalog.mockResolvedValueOnce({
-			version: 1,
-			entries: [
-				{
-					commitHash: "minimalcommithash01",
-					// No recap, no ticketId
-					topics: [{ title: "Plain Topic" }], // no category, importance, etc.
-				},
-			],
-		});
-		const { stdout } = await runCommand(["q", "--format", "text", "--cwd", "/tmp/jolli-search-test-minimal"]);
-		expect(stdout).toContain("Plain Topic");
-		// No ticket badge / recap / category / star.
-		expect(stdout).not.toContain("[TKT");
-		expect(stdout).not.toContain("[feature]");
-		expect(stdout).not.toContain("★");
-	});
-
-	it("Phase 1 text format shows '(truncated)' marker when result is capped", async () => {
-		const entries: Array<{
-			commitHash: string;
-			parentCommitHash: null;
-			branch: string;
-			commitMessage: string;
-			commitDate: string;
-			generatedAt: string;
-		}> = [];
-		for (let i = 0; i < 3; i++) {
-			entries.push({
-				commitHash: `cmt${i}aaa00000000000000`.slice(0, 16),
-				parentCommitHash: null,
-				branch: "x",
-				commitMessage: `m${i}`,
-				commitDate: `2026-04-0${i + 1}T10:00:00.000Z`,
-				generatedAt: `2026-04-0${i + 1}T10:01:00.000Z`,
-			});
-		}
-		mockGetIndex.mockResolvedValueOnce({ version: 3, entries });
-		mockGetCatalog.mockResolvedValueOnce({ version: 1, entries: [] });
-		const { stdout } = await runCommand([
-			"q",
-			"--limit",
-			"2",
-			"--format",
-			"text",
-			"--cwd",
-			"/tmp/jolli-search-test-trunc",
-		]);
-		expect(stdout).toContain("(truncated)");
-	});
-
-	it("Phase 1 text format shows '(no commits matched)' on empty catalog", async () => {
-		const { stdout } = await runCommand(["q", "--format", "text", "--cwd", "/tmp/jolli-search-test-none"]);
-		expect(stdout).toContain("(no commits matched the filter)");
-	});
-
-	it("Phase 1 text format renders populated entries with all decorations", async () => {
-		mockGetIndex.mockResolvedValueOnce({
-			version: 3,
-			entries: [
-				{
-					commitHash: "deadbeef00deadbeef00deadbeef00deadbeef00",
-					parentCommitHash: null,
-					branch: "feature/x",
-					commitMessage: "msg",
-					commitDate: "2026-04-01T10:00:00.000Z",
-					generatedAt: "2026-04-01T10:01:00.000Z",
-				},
-			],
-		});
-		mockGetCatalog.mockResolvedValueOnce({
-			version: 1,
-			entries: [
-				{
-					commitHash: "deadbeef00deadbeef00deadbeef00deadbeef00",
-					recap: "Recap line",
-					ticketId: "PROJ-9",
-					topics: [{ title: "Major Topic", category: "feature", importance: "major" }],
-				},
-			],
-		});
-		const { stdout } = await runCommand(["auth", "--format", "text", "--cwd", "/tmp/jolli-search-test-rendered"]);
-		expect(stdout).toContain("Search catalog");
-		expect(stdout).toContain("[PROJ-9]");
-		expect(stdout).toContain("Recap line");
-		expect(stdout).toContain("[feature]");
-		expect(stdout).toContain("★");
+		const { stdout } = await runCommand(["auth", "--cwd", "/tmp/t"]);
+		const parsed = JSON.parse(stdout);
+		expect(parsed.type).toBe("error");
+		expect(parsed.message).toContain("simulated storage failure");
+		expect(process.exitCode).toBe(1);
 	});
 
 	it("non-Error thrown values are stringified safely in the catch path", async () => {
-		mockGetSummary.mockImplementationOnce(async () => {
+		mockSearchHits.mockImplementationOnce(async () => {
 			throw "string error not an Error instance";
 		});
-		const { stdout } = await runCommand([
-			"auth",
-			"--hashes",
-			"abcd1234abcd1234abcd1234abcd1234abcd1234",
-			"--cwd",
-			"/tmp/jolli-search-test-found",
-		]);
-		expect(stdout).toContain('"type":"error"');
-		expect(stdout).toContain("string error");
+		const { stdout } = await runCommand(["auth", "--cwd", "/tmp/t"]);
+		const parsed = JSON.parse(stdout);
+		expect(parsed.type).toBe("error");
+		expect(parsed.message).toContain("string error");
 	});
 
-	// ─── --arg-stdin (here-doc bridge from SKILL.md) ─────────────────────
-	// The skill templates pipe user-supplied query text via a here-doc with an
-	// LLM-generated random delimiter; the CLI reads stdin instead of argv so
-	// shell metacharacters never reach a shell parser. These tests confirm
-	// the wiring: stdin content arrives at the search pipeline verbatim,
-	// mutual exclusion with positional args fires, and the empty-stdin case
-	// degrades to the same behavior as an empty positional query.
+	// ─── --arg-stdin ──────────────────────────────────────────────────────────
 
-	async function runWithStdin(args: string[], stdinPayload: string): Promise<{ stdout: string; stderr: string }> {
-		const { Readable } = await import("node:stream");
-		const origStdin = process.stdin;
-		const stream = Readable.from([stdinPayload]);
-		Object.defineProperty(process, "stdin", { value: stream, configurable: true });
-		try {
-			return await runCommand(args);
-		} finally {
-			Object.defineProperty(process, "stdin", { value: origStdin, configurable: true });
-		}
-	}
-
-	it("--arg-stdin reads the query from stdin verbatim (shell metacharacters preserved)", async () => {
-		// `$(date)` is a shell-injection probe — feeding it on stdin must NOT
-		// trigger the deny-list (the user input never went through the shell).
-		// The CLI rejects it because the query content still violates the
-		// `isSafeQuery` policy, but the value the CLI inspected is the literal
-		// string, not a command output.
-		const { stdout } = await runWithStdin(["--arg-stdin", "--cwd", "/tmp/jolli-search-test-empty"], "$(date)\n");
-		// Query is rejected at the validation layer, but the rejection means
-		// the CLI saw the literal `$(date)` — not the shell-expansion result.
-		expect(stdout).toContain('"type":"error"');
-		expect(stdout).toContain("Invalid characters");
+	it("--arg-stdin reads query from stdin verbatim (shell metacharacters rejected at validation)", async () => {
+		const { stdout } = await runWithStdin(["--arg-stdin", "--cwd", "/tmp/t"], "$(date)\n");
+		const parsed = JSON.parse(stdout);
+		expect(parsed.type).toBe("error");
+		expect(parsed.message).toContain("Invalid characters");
 	});
 
-	it("--arg-stdin accepts a safe natural-language query and runs the catalog phase", async () => {
-		const { stdout } = await runWithStdin(
-			["--arg-stdin", "--cwd", "/tmp/jolli-search-test-empty"],
-			"why did we choose X?\n",
+	it("--arg-stdin with safe query calls searchHits", async () => {
+		const { stdout } = await runWithStdin(["--arg-stdin", "--cwd", "/tmp/t"], "why did we choose X?\n");
+		const parsed = JSON.parse(stdout);
+		expect(parsed).toHaveProperty("hits");
+		expect(mockSearchHits).toHaveBeenCalledWith(
+			"/tmp/t",
+			expect.objectContaining({ query: "why did we choose X?" }),
+			fakeStorage,
 		);
-		expect(stdout).toContain('"type": "search-catalog"');
-		expect(stdout).toContain('"query": "why did we choose X?"');
-	});
-
-	it("--arg-stdin with empty stdin behaves like an empty positional query (catalog only)", async () => {
-		const { stdout } = await runWithStdin(["--arg-stdin", "--cwd", "/tmp/jolli-search-test-empty"], "");
-		expect(stdout).toContain('"type": "search-catalog"');
-	});
-
-	it("--arg-stdin combined with --hashes performs the Phase 2 lookup using stdin as the highlight query", async () => {
-		mockGetSummary.mockResolvedValueOnce({
-			version: 4,
-			commitHash: "abcd1234abcd1234abcd1234abcd1234abcd1234",
-			commitMessage: "msg",
-			commitAuthor: "dev",
-			commitDate: "2026-04-01T00:00:00.000Z",
-			branch: "x",
-			generatedAt: "2026-04-01T00:00:00.000Z",
-			topics: [{ title: "t", trigger: "tr", response: "rs", decisions: "d" }],
-		});
-		const { stdout } = await runWithStdin(
-			[
-				"--arg-stdin",
-				"--hashes",
-				"abcd1234abcd1234abcd1234abcd1234abcd1234",
-				"--cwd",
-				"/tmp/jolli-search-test-found",
-			],
-			"auth\n",
-		);
-		expect(stdout).toContain('"type": "search"');
 	});
 
 	it("rejects --arg-stdin combined with positional words (mutually exclusive)", async () => {
-		const { stdout } = await runCommand(["--arg-stdin", "auth", "--cwd", "/tmp/jolli-search-test-empty"]);
-		expect(stdout).toContain('"type":"error"');
-		expect(stdout).toContain("mutually exclusive");
+		const { stdout } = await runCommand(["--arg-stdin", "auth", "--cwd", "/tmp/t"]);
+		const parsed = JSON.parse(stdout);
+		expect(parsed.type).toBe("error");
+		expect(parsed.message).toContain("mutually exclusive");
 		expect(process.exitCode).toBe(1);
 	});
 });

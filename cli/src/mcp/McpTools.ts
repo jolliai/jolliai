@@ -5,12 +5,12 @@
  * adapts these into SDK tool responses.
  */
 
-import type { BranchCatalog, RecallPayload } from "../core/ContextCompiler.js";
-import { buildRecallPayload, compileTaskContext, listBranchCatalog } from "../core/ContextCompiler.js";
-import { getCurrentBranch } from "../core/GitOps.js";
+import type { BranchCatalog } from "../core/ContextCompiler.js";
+import { listBranchCatalog } from "../core/ContextCompiler.js";
 import { buildPrDescription, type PrDescriptionResult } from "../core/PrDescription.js";
+import { type RecallResult, resolveRecall } from "../core/RecallResolver.js";
+import { searchHits } from "../core/SearchHits.js";
 import type { SearchHitResult } from "../core/SearchIndex.js";
-import { SearchIndex } from "../core/SearchIndex.js";
 import { compareSourceRefs } from "../core/SourceTimeline.js";
 import { getActiveStorage } from "../core/SummaryStore.js";
 import { readTopicPage } from "../core/TopicPageStore.js";
@@ -23,28 +23,11 @@ export interface SearchArgs {
 }
 
 export async function runSearch(cwd: string, args: SearchArgs): Promise<{ hits: SearchHitResult[] }> {
-	if (!args.query || !args.query.trim()) {
-		throw new Error("`query` is required and must be non-empty");
-	}
-	// Pass the active storage so the index dir resolves to the SAME location the
-	// compile warm-up wrote to — `<kbRoot>/.jolli/jollimemory/` in folder/dual-write
-	// mode, the checkout's `.jolli/jollimemory/` in orphan-only. Without it,
-	// resolveIndexDir falls back to cwd and a folder-mode server never sees the
-	// warm index (see SearchIndex.resolveIndexDir).
-	const index = await SearchIndex.openCached(cwd, getActiveStorage());
-	const hits = await index.search({
-		query: args.query,
-		branch: args.branch,
-		type: args.type,
-		limit: args.limit,
-	});
-	return { hits };
+	return { hits: await searchHits(cwd, args, getActiveStorage()) };
 }
 
-export async function runRecall(cwd: string, args: { branch?: string }): Promise<RecallPayload> {
-	const branch = args.branch ?? (await getCurrentBranch(cwd));
-	const ctx = await compileTaskContext({ branch }, cwd);
-	return buildRecallPayload(ctx);
+export async function runRecall(cwd: string, args: { branch?: string }): Promise<RecallResult> {
+	return resolveRecall(args.branch, cwd);
 }
 
 export interface TimelineEntry {
