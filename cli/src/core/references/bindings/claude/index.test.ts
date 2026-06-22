@@ -7,6 +7,8 @@ describe("Claude producer binding", () => {
 			expect(claudeBindingForToolName("mcp__github__issue_read")?.sourceId).toBe("github");
 			expect(claudeBindingForToolName("mcp__claude_ai_Atlassian__getJiraIssue")?.sourceId).toBe("jira");
 			expect(claudeBindingForToolName("mcp__linear__get_issue")?.sourceId).toBe("linear");
+			// Both Linear MCP prefixes resolve to the linear source.
+			expect(claudeBindingForToolName("mcp__claude_ai_Linear__get_issue")?.sourceId).toBe("linear");
 			expect(claudeBindingForToolName("mcp__claude_ai_Notion__notion-fetch")?.sourceId).toBe("notion");
 		});
 
@@ -16,6 +18,9 @@ describe("Claude producer binding", () => {
 				"jira",
 			);
 			expect(claudeBindingForToolName("mcp__linear__list_issues")?.sourceId).toBe("linear");
+			// The official Linear connector counts read AND write tools (no accept scope).
+			expect(claudeBindingForToolName("mcp__claude_ai_Linear__list_issues")?.sourceId).toBe("linear");
+			expect(claudeBindingForToolName("mcp__claude_ai_Linear__save_issue")?.sourceId).toBe("linear");
 		});
 
 		it("returns null for an unrecognised tool name", () => {
@@ -47,11 +52,12 @@ describe("Claude producer binding", () => {
 	});
 
 	describe("CLAUDE_TOOL_PREFIXES", () => {
-		it("lists the four vendor prefixes for the envelope pre-filter", () => {
+		it("lists every vendor prefix for the envelope pre-filter (both Linear prefixes included)", () => {
 			expect(CLAUDE_TOOL_PREFIXES).toEqual([
 				"mcp__github__",
 				"mcp__claude_ai_Atlassian__",
 				"mcp__linear__",
+				"mcp__claude_ai_Linear__",
 				"mcp__claude_ai_Notion__",
 			]);
 		});

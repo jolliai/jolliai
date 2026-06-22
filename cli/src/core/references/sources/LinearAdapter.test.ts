@@ -44,6 +44,30 @@ describe("LinearAdapter", () => {
 		expect(fieldVal(ref, "priority")).toBe("Urgent");
 	});
 
+	it("extracts the official Claude Linear connector shape (status string, priority {value,name}, labels[])", () => {
+		// Verified live against mcp__claude_ai_Linear__get_issue (JOLLI-1804): the
+		// official connector and the standalone mcp__linear__ server emit the same
+		// fields, so identity normalize + this adapter handle both unchanged.
+		const ref = LinearAdapter.extractRef(
+			{
+				id: "JOLLI-1804",
+				title: "Incremental knowledge-graph updates",
+				url: "https://linear.app/jolliai/issue/JOLLI-1804/incremental-knowledge-graph-updates",
+				status: "In Progress",
+				priority: { value: 0, name: "No priority" },
+				labels: ["JolliMemory"],
+				description: "Replace the full graph rebuild with incremental updates.",
+			},
+			"mcp__claude_ai_Linear__get_issue",
+			ts,
+		);
+		expect(ref).toMatchObject({ mapKey: "linear:JOLLI-1804", source: "linear", nativeId: "JOLLI-1804" });
+		expect(fieldVal(ref, "status")).toBe("In Progress");
+		expect(fieldVal(ref, "priority")).toBe("No priority");
+		expect(fieldVal(ref, "labels")).toBe("JolliMemory");
+		expect(ref?.toolName).toBe("mcp__claude_ai_Linear__get_issue");
+	});
+
 	it("filters non-string labels", () => {
 		const ref = LinearAdapter.extractRef(
 			{ id: "PROJ-1", title: "x", url: "https://x.example", labels: ["good", 42, ""] },
