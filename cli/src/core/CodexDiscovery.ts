@@ -73,6 +73,7 @@ async function runOnce(cwd: string): Promise<void> {
 
 		await migrateDiscoveryCursors(cwd);
 		const sessions = await discoverCodexSessions(cwd);
+		let advanced = 0;
 		for (const session of sessions) {
 			// Per-session try/catch: one bad transcript (read error, parse failure)
 			// must not abort the rest of the batch or block cursor advances.
@@ -115,10 +116,16 @@ async function runOnce(cwd: string): Promise<void> {
 						},
 						cwd,
 					);
+					advanced++;
 				}
 			} catch (err) {
 				log.warn("Codex discovery failed for %s: %s", session.sessionId, (err as Error).message);
 			}
+		}
+		// Summary line so the otherwise-silent 60s tick is observable in debug.log.
+		// Logged only when there are sessions to scan (no noise on idle ticks).
+		if (sessions.length > 0) {
+			log.info("Codex discovery pass: %d session(s) scanned, %d advanced", sessions.length, advanced);
 		}
 	} catch (err) {
 		// Top-level guard: loadConfig / discoverCodexSessions / migrate can throw.
