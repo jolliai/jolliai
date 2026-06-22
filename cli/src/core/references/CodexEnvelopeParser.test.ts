@@ -26,9 +26,23 @@ function fnCall(namespace: string, name: string, callId: string, args = "{}"): s
 /** function_call_output row. `inner` is the business object; `wrap` controls
  *  whether it's the `[{type:text,text}]` double-string form (Linear/Notion) or a
  *  bare object (GitHub/Jira). `prefix` toggles the `Wall time:` human prefix. */
-function fnOutput(callId: string, inner: unknown, opts: { wrap: "array" | "bare"; prefix: boolean }): string {
+function fnOutput(
+	callId: string,
+	inner: unknown,
+	opts: { wrap: "array" | "bare" | "envelope"; prefix: boolean },
+): string {
 	const innerJson =
-		opts.wrap === "array" ? JSON.stringify([{ type: "text", text: JSON.stringify(inner) }]) : JSON.stringify(inner);
+		opts.wrap === "array"
+			? JSON.stringify([{ type: "text", text: JSON.stringify(inner) }])
+			: opts.wrap === "envelope"
+				? // Newer codex_apps connectors emit the full MCP CallToolResult object.
+					JSON.stringify({
+						meta: null,
+						content: [{ type: "text", text: JSON.stringify(inner) }],
+						structuredContent: null,
+						isError: false,
+					})
+				: JSON.stringify(inner);
 	const output = opts.prefix ? `Wall time: 1.20s\nOutput:\n${innerJson}` : innerJson;
 	return jsonl({
 		type: "response_item",
@@ -139,6 +153,22 @@ describe("CodexEnvelopeParser.parse", () => {
 		expect(results.map((r) => r.adapter.id).sort()).toEqual(["github", "jira", "linear", "notion"]);
 		const jira = results.find((r) => r.adapter.id === "jira");
 		expect(jira?.toolName).toContain("mcp__claude_ai_Atlassian__");
+	});
+
+	it("unwraps the object-envelope function_call_output ({content:[{text}]}) — newer Linear _get_issue connector", () => {
+		// Regression: the OpenAI-curated Linear connector returns the full MCP
+		// CallToolResult object (not the bare [{text}] array). The issue JSON lives
+		// in content[0].text and must be unwrapped, or the adapter sees the envelope
+		// and extracts nothing.
+		const lines = [
+			fnCall("mcp__codex_apps__linear", "_get_issue", "c_gi"),
+			fnOutput("c_gi", LINEAR, { wrap: "envelope", prefix: true }),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		expect(results.map((r) => r.adapter.id)).toEqual(["linear"]);
+		// Payload is the UNWRAPPED issue (id present), not the envelope object.
+		expect((results[0].payload as { id?: string }).id).toBe("JOLLI-1657");
+		expect(results[0].toolName).toBe("mcp__linear__get_issue");
 	});
 
 	it("skips a non-JSON / no-prefix output (execution error) without throwing", () => {
@@ -258,10 +288,10 @@ describe("CodexEnvelopeParser.parse — defensive branches", () => {
 			fnCall("mcp__codex_apps__linear", "_fetch", "c1"),
 			raw({ type: "function_call_output", call_id: "c1", output: "Wall time: 1s but no marker {not json}" }),
 			fnCall("mcp__codex_apps__linear", "_fetch", "c2"),
-			// array form whose first element is not a {type:text} block → unwrapTextArray returns the array as-is → adapter rejects
+			// array form whose first element is not a {type:text} block → unwrapTextEnvelope returns the array as-is → adapter rejects
 			raw({ type: "function_call_output", call_id: "c2", output: JSON.stringify([{ notText: 1 }]) }),
 			fnCall("mcp__codex_apps__linear", "_fetch", "c3"),
-			// array form whose text is not valid JSON → unwrapTextArray returns the array as-is
+			// array form whose text is not valid JSON → unwrapTextEnvelope returns the array as-is
 			raw({
 				type: "function_call_output",
 				call_id: "c3",

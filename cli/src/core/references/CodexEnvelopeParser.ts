@@ -319,9 +319,9 @@ export const codexEnvelopeParser: TranscriptEnvelopeParser = new CodexEnvelopePa
 
 /**
  * function_call_output → business object. Strips the human-readable
- * `Wall time: …\nOutput:\n` prefix when present, parses, and unwraps the
- * `[{type:"text",text:<JSON>}]` double-string form (Linear/Notion) to its inner
- * object. Returns null on any non-JSON / malformed output (e.g. exec errors).
+ * `Wall time: …\nOutput:\n` prefix when present, parses, and unwraps the MCP
+ * text-block envelope to its inner object. Returns null on any non-JSON /
+ * malformed output (e.g. exec errors).
  */
 function parseFunctionCallOutput(output: string): unknown {
 	let text = output;
@@ -333,7 +333,7 @@ function parseFunctionCallOutput(output: string): unknown {
 	}
 	const parsed = tryParse(text);
 	if (parsed === null) return null;
-	return unwrapTextArray(parsed);
+	return unwrapTextEnvelope(parsed);
 }
 
 /** Parse the `command` field from a shell `function_call`'s JSON-string `arguments`. */
@@ -364,15 +364,24 @@ function tryParse(s: string): unknown {
 }
 
 /**
- * If `value` is the `[{type:"text",text:"<JSON>"}]` form, parse the first text
- * block's JSON and return it; otherwise return `value` unchanged.
+ * Unwrap the MCP text-block envelope to its inner JSON. Handles both observed
+ * `function_call_output` shapes:
+ *   - bare array   `[{type:"text",text:"<JSON>"}]`               (older Linear/Notion)
+ *   - object env.  `{content:[{type:"text",text:"<JSON>"}], …}`  (newer codex_apps
+ *     connectors — the full MCP CallToolResult; the payload is `content[0].text`,
+ *     sibling fields `structuredContent`/`isError`/`meta` are ignored)
+ * Anything else (already-unwrapped object, non-text first block, non-JSON inner
+ * text) is returned unchanged.
  */
-function unwrapTextArray(value: unknown): unknown {
-	if (!Array.isArray(value)) return value;
-	const first = value[0];
-	if (isObject(first) && first.type === "text" && typeof first.text === "string") {
-		const inner = tryParse(first.text);
-		return inner === null ? value : inner;
+function unwrapTextEnvelope(value: unknown): unknown {
+	const block = Array.isArray(value)
+		? value[0]
+		: isObject(value) && Array.isArray(value.content)
+			? value.content[0]
+			: undefined;
+	if (isObject(block) && block.type === "text" && typeof block.text === "string") {
+		const inner = tryParse(block.text);
+		if (inner !== null) return inner;
 	}
 	return value;
 }

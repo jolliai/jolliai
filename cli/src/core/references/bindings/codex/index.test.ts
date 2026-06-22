@@ -10,6 +10,12 @@ describe("Codex producer binding registry", () => {
 			expect(codexBindingFromInvocationTool("atlassian rovo_getjiraissue")?.id).toBe("jira");
 		});
 
+		it("maps the OpenAI-curated Linear connector's dotted read invocations", () => {
+			expect(codexBindingFromInvocationTool("linear.get_issue")?.id).toBe("linear");
+			expect(codexBindingFromInvocationTool("linear.list_issues")?.id).toBe("linear");
+			expect(codexBindingFromInvocationTool("linear.search")?.id).toBe("linear");
+		});
+
 		it("maps github_search_issues to github (search-then-resolve path)", () => {
 			expect(codexBindingFromInvocationTool("github_search_issues")?.id).toBe("github");
 		});
@@ -30,6 +36,12 @@ describe("Codex producer binding registry", () => {
 			expect(codexBindingFromFunctionCall("mcp__codex_apps__github", "_fetch_issue")?.id).toBe("github");
 			expect(codexBindingFromFunctionCall("mcp__codex_apps__github", "_search_issues")?.id).toBe("github");
 			expect(codexBindingFromFunctionCall("mcp__codex_apps__atlassian_rovo", "_getjiraissue")?.id).toBe("jira");
+		});
+
+		it("maps the OpenAI-curated Linear connector's read tools (_get_issue/_list_issues/_search)", () => {
+			expect(codexBindingFromFunctionCall("mcp__codex_apps__linear", "_get_issue")?.id).toBe("linear");
+			expect(codexBindingFromFunctionCall("mcp__codex_apps__linear", "_list_issues")?.id).toBe("linear");
+			expect(codexBindingFromFunctionCall("mcp__codex_apps__linear", "_search")?.id).toBe("linear");
 		});
 
 		it("returns null when the source does not expose that tool name", () => {
