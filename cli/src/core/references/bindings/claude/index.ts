@@ -48,9 +48,19 @@ interface Rule {
 const RULES: readonly Rule[] = [
 	{ prefix: "mcp__github__", sourceId: "github" },
 	{ prefix: "mcp__claude_ai_Atlassian__", sourceId: "jira" },
+	// Linear ships under two MCP prefixes: `mcp__linear__` (the standalone Linear
+	// MCP server) and `mcp__claude_ai_Linear__` (Claude's official connector). Both
+	// emit the same issue shape — id / title / url / status (string) / priority
+	// ({name} or string) / labels (string[]) — read directly by LinearAdapter, so
+	// no `accept` scope and identity normalize: read AND write tools both count, and
+	// LinearAdapter.extractRef rejects any payload that isn't a real issue.
 	{ prefix: "mcp__linear__", sourceId: "linear" },
+	{ prefix: "mcp__claude_ai_Linear__", sourceId: "linear" },
 	// Notion: prefix matches all notion tools; only `notion-fetch` is in business
-	// scope (search/update/write deliberately excluded).
+	// scope. Unlike Linear, Notion's create/update/search outputs are each a
+	// DIFFERENT shape from fetch (no top-level `metadata.type`/`title`; update
+	// returns only a page_id), so they can't be extracted without per-tool reshaping
+	// — deliberately left out of scope.
 	{ prefix: "mcp__claude_ai_Notion__", sourceId: "notion", accept: (name) => name.endsWith("notion-fetch") },
 ];
 
