@@ -67,6 +67,11 @@ import {
 	pushToJolli,
 } from "../services/JolliPushService.js";
 import {
+	classifyCreatePrBranch,
+	createPrBlockMessage,
+	effectiveBranchFor,
+} from "../services/CreatePrBranchClassifier.js";
+import {
 	handleCheckPrStatus,
 	handleCreatePr,
 	handlePrepareUpdatePr,
@@ -330,6 +335,13 @@ export class SummaryWebviewPanel {
 	private readonly commitHash: string;
 	/** Tracks the currently displayed summary for the Copy Markdown action. */
 	private currentSummary: CommitSummary | undefined;
+	/**
+	 * Effective branch resolved when a Create/Update PR form is opened (prepare
+	 * step). Passed through to the submit handler so the service can detect a
+	 * branch switch between opening and submitting the form (TOCTOU guard) and
+	 * scope the PR to the same branch the body was aggregated for.
+	 */
+	private pendingPrBranch: string | undefined;
 	/** Cached set of commit hashes that have transcript files in the orphan branch (scoped to current tree). */
 	private transcriptHashSet: Set<string> = new Set();
 	/** Cached set of plan slugs whose content contains non-ASCII characters (need translation). */
@@ -778,14 +790,21 @@ export class SummaryWebviewPanel {
 				// foreign repo is local-only (no remoteUrl in its KB config),
 				// pass null and let PrCommentService short-circuit to
 				// `unavailable` rather than silently querying this workspace.
-				handleCheckPrStatus(
-					this.workspaceRoot,
-					(msg) => this.panel.webview.postMessage(msg),
-					this.currentSummary?.branch,
-					this.foreignRepoName ? this.foreignRepoUrl : null,
-				).catch((err: unknown) =>
-					log.error("SummaryPanel", `Check PR status failed: ${err}`),
-				);
+				// `resolveEffectiveBranch` keeps the displayed PR aligned with a
+				// renamed branch (and short-circuits to the summary branch for
+				// foreign panels).
+				this.resolveEffectiveBranch()
+					.then(({ effectiveBranch }) =>
+						handleCheckPrStatus(
+							this.workspaceRoot,
+							(msg) => this.panel.webview.postMessage(msg),
+							effectiveBranch,
+							this.foreignRepoName ? this.foreignRepoUrl : null,
+						),
+					)
+					.catch((err: unknown) =>
+						log.error("SummaryPanel", `Check PR status failed: ${err}`),
+					);
 				break;
 			case "createPr":
 				this.catchAndShow(
@@ -794,7 +813,7 @@ export class SummaryWebviewPanel {
 						message.body,
 						this.workspaceRoot,
 						(msg) => this.panel.webview.postMessage(msg),
-						this.currentSummary?.branch,
+						this.pendingPrBranch,
 					),
 					"Create PR failed",
 				);
@@ -820,7 +839,7 @@ export class SummaryWebviewPanel {
 						this.workspaceRoot,
 						(msg: Record<string, unknown>) =>
 							this.panel.webview.postMessage(msg),
-						this.currentSummary?.branch,
+						this.pendingPrBranch,
 					),
 					"Update PR failed",
 				);
@@ -1416,24 +1435,27 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
-		// Cross-branch guard: Create PR requires being checked out on the
-		// summary's branch (because `git push -u origin HEAD` pushes the current
-		// branch). Block before opening the form to avoid misleading the user.
-		//
-		// `bridge.getCurrentBranch()` returns the literal sentinel "HEAD" when
-		// `git rev-parse --abbrev-ref HEAD` yields nothing — detached HEAD,
-		// `.git/index.lock`, or permission failures. Telling the user to
-		// "checkout <summary.branch>" in that state is wrong (the repo is in
-		// a transient bad state, not on a different branch); they'd checkout
-		// and only then discover the real problem. Use a distinct message.
+		// Cross-branch guard: Create PR requires being checked out on the branch
+		// the PR will be scoped to (because `git push -u origin HEAD` pushes the
+		// current branch). `classifyCreatePrBranch` distinguishes a genuine
+		// cross-branch view (summary's branch still exists → block) from a rename
+		// or delete-to-successor (old ref gone + current branch contains the
+		// commit → allow, scoping to the current branch). Foreign panels never
+		// reach here — `createPr` / `prepareCreatePr` are denied at dispatch, so
+		// only `checkPrStatus` (via `resolveEffectiveBranch`) runs for them.
+		this.pendingPrBranch = summary.branch;
+		let currentBranch: string | undefined;
 		if (summary.branch) {
-			const currentBranch = await this.bridge.getCurrentBranch();
-			if (summary.branch !== currentBranch) {
-				const message =
-					currentBranch === "HEAD"
-						? `Cannot determine the current branch (detached HEAD or git error). Resolve the repository state, then retry creating the PR for ${summary.branch}.`
-						: `This summary is on branch ${summary.branch}. Checkout ${summary.branch} to create its PR.`;
-				vscode.window.showWarningMessage(message);
+			currentBranch = await this.bridge.getCurrentBranch();
+			const decision = await classifyCreatePrBranch(
+				summary.branch,
+				currentBranch,
+				summary.commitHash,
+				this.workspaceRoot,
+			);
+			const blockMessage = createPrBlockMessage(decision, summary.branch);
+			if (blockMessage) {
+				vscode.window.showWarningMessage(blockMessage);
 				postMessage({
 					command: "prCreateBlockedCrossBranch",
 					summaryBranch: summary.branch,
@@ -1441,10 +1463,12 @@ export class SummaryWebviewPanel {
 				});
 				return;
 			}
+			this.pendingPrBranch = effectiveBranchFor(decision, summary.branch);
 		}
 
 		const { summaries, missingCount } = await this.loadBranchSummariesForPr(
-			summary.branch,
+			this.pendingPrBranch,
+			currentBranch,
 		);
 		const markdown = buildPrBodyMarkdown(summary, summaries, missingCount);
 		const title = pickPrTitle(summary, summaries);
@@ -1466,8 +1490,17 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
+		// Edit PR is branch-name-routed (no `git push`), so a renamed branch must
+		// resolve to the same effective branch the status section displays —
+		// otherwise the page shows the new branch's PR while Edit queries/edits
+		// the stale one. `resolveEffectiveBranch` also scopes body aggregation.
+		const { effectiveBranch, currentBranch } =
+			await this.resolveEffectiveBranch();
+		this.pendingPrBranch = effectiveBranch;
+
 		const { summaries, missingCount } = await this.loadBranchSummariesForPr(
-			summary.branch,
+			effectiveBranch,
+			currentBranch,
 		);
 		const markdown = buildPrBodyMarkdown(summary, summaries, missingCount);
 
@@ -1475,8 +1508,40 @@ export class SummaryWebviewPanel {
 			markdown,
 			this.workspaceRoot,
 			postMessage,
-			summary.branch,
+			effectiveBranch,
 		);
+	}
+
+	/**
+	 * The branch a PR status query / body aggregation should be scoped to for
+	 * the currently displayed summary, plus the `currentBranch` it was resolved
+	 * against (so callers can reuse the single `getCurrentBranch` read). The
+	 * effective branch is the summary's own branch except when that branch was
+	 * renamed away and the current branch now carries its commit (`okAsCurrent`),
+	 * in which case it follows the rename to the current branch. Foreign-repo
+	 * panels short-circuit to the summary branch — their branches aren't in this
+	 * workspace's git graph, so the local classifier must not run (and there is
+	 * no meaningful local `currentBranch` for them).
+	 */
+	private async resolveEffectiveBranch(): Promise<{
+		effectiveBranch: string | undefined;
+		currentBranch: string | undefined;
+	}> {
+		const summary = this.currentSummary;
+		if (!summary?.branch || this.foreignRepoName) {
+			return { effectiveBranch: summary?.branch, currentBranch: undefined };
+		}
+		const currentBranch = await this.bridge.getCurrentBranch();
+		const decision = await classifyCreatePrBranch(
+			summary.branch,
+			currentBranch,
+			summary.commitHash,
+			this.workspaceRoot,
+		);
+		return {
+			effectiveBranch: effectiveBranchFor(decision, summary.branch),
+			currentBranch,
+		};
 	}
 
 	// Returns true when worker is busy with a blocking (summary) run: shows the
@@ -1493,39 +1558,41 @@ export class SummaryWebviewPanel {
 		vscode.window.showWarningMessage(
 			"Jolli Memory: AI summary is being generated. Please wait a moment.",
 		);
+		const { effectiveBranch } = await this.resolveEffectiveBranch();
 		await handleCheckPrStatus(
 			this.workspaceRoot,
 			postMessage,
-			this.currentSummary?.branch,
+			effectiveBranch,
+			this.foreignRepoName ? this.foreignRepoUrl : null,
 		);
 		return true;
 	}
 
 	/**
-	 * Loads summaries for PR body aggregation, scoped to the summary's branch.
+	 * Loads summaries for PR body aggregation, scoped to `effectiveBranch`.
 	 *
 	 * Memory Bank lets the user open any historical summary, including ones on
 	 * branches they're not currently checked out on. In that cross-branch case
-	 * aggregating `currentBranch`'s commits into a PR for `summaryBranch` is
+	 * aggregating `currentBranch`'s commits into a PR for the summary's branch is
 	 * misleading — the body would describe commits unrelated to that PR. So we
 	 * force the single-summary fallback by returning an empty array, and
 	 * `buildPrBodyMarkdown` / `pickPrTitle` fall back to the clicked summary.
 	 *
-	 * When `summaryBranch === currentBranch` (or `summaryBranch` is undefined),
-	 * we run the existing HEAD-based `loadBranchSummaries` to get the full
-	 * branch-aggregation behavior.
+	 * When `effectiveBranch === currentBranch` (or `effectiveBranch` is
+	 * undefined) we run the existing HEAD-based `loadBranchSummaries` to get the
+	 * full branch-aggregation behavior. `currentBranch` is supplied by the caller
+	 * (already read for the branch classifier) so a renamed branch resolves to
+	 * the current checkout and a single `getCurrentBranch` read serves both.
 	 */
 	private async loadBranchSummariesForPr(
-		summaryBranch: string | undefined,
+		effectiveBranch: string | undefined,
+		currentBranch: string | undefined,
 	): Promise<{
 		summaries: ReadonlyArray<CommitSummary>;
 		missingCount: number;
 	}> {
-		if (summaryBranch) {
-			const currentBranch = await this.bridge.getCurrentBranch();
-			if (summaryBranch !== currentBranch) {
-				return { summaries: [], missingCount: 0 };
-			}
+		if (effectiveBranch && effectiveBranch !== currentBranch) {
+			return { summaries: [], missingCount: 0 };
 		}
 		const result = await loadBranchSummaries(this.bridge, this.mainBranch);
 		return {

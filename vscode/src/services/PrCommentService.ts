@@ -19,6 +19,7 @@ import { join } from "node:path";
 import * as vscode from "vscode";
 import { execFileAsyncHidden } from "../../../cli/src/util/Subprocess.js";
 import { MARKER_END, MARKER_START, wrapWithMarkers } from "../../../cli/src/core/PrDescription.js";
+import { detachedHeadMessage } from "./CreatePrBranchClassifier.js";
 import { log } from "../util/Logger.js";
 
 const TAG = "PrSection";
@@ -201,6 +202,23 @@ async function execGit(args: Array<string>, cwd: string): Promise<string> {
 async function getCurrentBranch(cwd: string): Promise<string> {
 	const raw = await execGit(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
 	return raw.trim();
+}
+
+/**
+ * Like {@link getCurrentBranch} but normalizes every "can't determine the
+ * branch" outcome to the literal sentinel `"HEAD"` — both detached HEAD (where
+ * `rev-parse` itself returns `"HEAD"`) and a hard git error (`.git/index.lock`,
+ * permission failure, not a repo), which would otherwise throw and skip the
+ * cross-branch guard entirely (landing in the outer catch as `prCreateFailed`).
+ * Mirrors `JolliMemoryBridge.getCurrentBranch`'s sentinel so the panel and the
+ * service classify a broken repo state identically.
+ */
+async function getCurrentBranchSafe(cwd: string): Promise<string> {
+	try {
+		return (await getCurrentBranch(cwd)) || "HEAD";
+	} catch {
+		return "HEAD";
+	}
 }
 
 /** Pushes the current branch to origin (no-op if already pushed). */
@@ -577,31 +595,48 @@ export async function handleCheckPrStatus(
 }
 
 /**
- * Creates a new PR for the summary's branch.
+ * Creates a new PR scoped to `expectedBranch` — the effective branch the panel
+ * resolved at prepare time (see `classifyCreatePrBranch`): the summary's own
+ * branch normally, or the current branch when the summary's branch was renamed
+ * away. The physical `git push -u origin HEAD` pushes whatever is checked out,
+ * so this is the submit-time second line of the guard:
  *
- * Routing is by `summaryBranch` (matches Check/Update PR), but the physical
- * `git push -u origin HEAD` requires that branch to be the one currently
- * checked out. So we guard: if `summaryBranch !== currentBranch` (Memory Bank
- * cross-branch view), reject with `prCreateBlockedCrossBranch` and let the
- * webview prompt the user to checkout first. When `summaryBranch` is undefined
- * (no summary context), fall back to current-branch behavior.
+ * - If the current branch can't be determined (detached HEAD / git error,
+ *   normalized to `"HEAD"`), block with the shared detached message rather than
+ *   falling through to `prCreateFailed`.
+ * - If `expectedBranch` no longer equals the live current branch, the user
+ *   switched branches between opening the form and submitting (TOCTOU); block
+ *   so we never push a different branch's HEAD onto this PR. The richer
+ *   cross-branch / original-gone cases are decided earlier at prepare time.
+ *
+ * When `expectedBranch` is undefined (no summary context) we fall back to
+ * current-branch behavior.
  */
 export async function handleCreatePr(
 	title: string,
 	body: string,
 	cwd: string,
 	postMessage: PostMessageFn,
-	summaryBranch?: string,
+	expectedBranch?: string,
 ): Promise<void> {
 	try {
-		const currentBranch = await getCurrentBranch(cwd);
-		if (summaryBranch && summaryBranch !== currentBranch) {
+		const currentBranch = await getCurrentBranchSafe(cwd);
+		if (currentBranch === "HEAD") {
+			vscode.window.showWarningMessage(detachedHeadMessage(expectedBranch));
+			postMessage({
+				command: "prCreateBlockedCrossBranch",
+				summaryBranch: expectedBranch ?? "",
+				currentBranch,
+			});
+			return;
+		}
+		if (expectedBranch && expectedBranch !== currentBranch) {
 			vscode.window.showWarningMessage(
-				`This summary is on branch ${summaryBranch}. Checkout ${summaryBranch} to create its PR.`,
+				`The current branch changed to ${currentBranch} (the form was opened for ${expectedBranch}). Reopen Create PR to continue.`,
 			);
 			postMessage({
 				command: "prCreateBlockedCrossBranch",
-				summaryBranch,
+				summaryBranch: expectedBranch,
 				currentBranch,
 			});
 			return;
@@ -619,7 +654,7 @@ export async function handleCreatePr(
 		log.info(TAG, `PR created: ${prUrl}`);
 
 		// Refresh section to show the new PR
-		await handleCheckPrStatus(cwd, postMessage, summaryBranch);
+		await handleCheckPrStatus(cwd, postMessage, expectedBranch);
 
 		// Toast with "Open PR" action
 		vscode.window
