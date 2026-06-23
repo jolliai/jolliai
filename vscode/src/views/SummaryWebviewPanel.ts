@@ -78,6 +78,7 @@ import {
 } from "../util/GitRemoteUtils.js";
 import { isWorkerBlockingBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
+import { latestPlanPerName } from "../util/PlanGrouping.js";
 import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
 import { BindingChooserWebviewPanel } from "./BindingChooserWebviewPanel.js";
 import { loadBranchSummaries } from "./BranchSummaryLoader.js";
@@ -208,6 +209,14 @@ interface TranscriptEntryUpdate {
 	readonly role: "human" | "assistant";
 	readonly content: string;
 	readonly timestamp?: string;
+}
+
+/** A plan/note that could not be pushed — surfaced to the user, not thrown. */
+interface PushAttachmentFailure {
+	/** Human-readable identifier, e.g. `plan "Fix P1/P2 review findings"`. */
+	readonly label: string;
+	/** Error message (includes the HTTP status from JolliPushService). */
+	readonly message: string;
 }
 
 /** Source of the panel — determines which static slot it occupies. */
@@ -1626,31 +1635,41 @@ export class SummaryWebviewPanel {
 		const repoUrl = await getCanonicalRepoUrl(this.workspaceRoot);
 
 		try {
-			// Step 1: Upload associated plans and notes
-			const planUrls = await this.pushPlans(
-				summary,
-				resolvedBaseUrl,
-				baseUrl,
-				jolliApiKey,
-				repoUrl,
-			);
-			const noteUrls = await this.pushNotes(
-				summary,
-				resolvedBaseUrl,
-				baseUrl,
-				jolliApiKey,
-				repoUrl,
-			);
+			// Step 1: Upload associated plans and notes. Per-attachment failures
+			// are collected (not thrown) so one bad plan/note doesn't abort the
+			// whole push — the summary and the remaining attachments still go up.
+			const { results: planUrls, failures: planFailures } =
+				await this.pushPlans(
+					summary,
+					resolvedBaseUrl,
+					baseUrl,
+					jolliApiKey,
+					repoUrl,
+				);
+			const { results: noteUrls, failures: noteFailures } =
+				await this.pushNotes(
+					summary,
+					resolvedBaseUrl,
+					baseUrl,
+					jolliApiKey,
+					repoUrl,
+				);
+			const attachmentFailures = [...planFailures, ...noteFailures];
 
 			// Step 2: Update plan/note URLs in summary before building markdown
-			// (so the Plans & Notes section in markdown includes the published URLs)
-			const plansWithUrls = applyPlanUrls(summary.plans, planUrls);
+			// (so the Plans & Notes section in markdown includes the published
+			// URLs). Dedupe same-named plan snapshots here too: only the latest
+			// was uploaded, so the pushed article's Plans & Notes list must not
+			// repeat the superseded duplicates. The locally-stored summary below
+			// still keeps every snapshot for the detail view.
+			const dedupedPlans = latestPlanPerName(summary.plans ?? []);
+			const plansWithUrls = applyPlanUrls(dedupedPlans, planUrls) ?? dedupedPlans;
 			const notesWithUrls = summary.notes
 				? applyNoteUrls(summary.notes, noteUrls)
 				: summary.notes;
 			const summaryForMarkdown: CommitSummary = {
 				...summary,
-				...(plansWithUrls !== summary.plans && { plans: plansWithUrls }),
+				plans: plansWithUrls,
 				...(notesWithUrls !== summary.notes && { notes: notesWithUrls }),
 			};
 			const markdown = buildMarkdown(summaryForMarkdown);
@@ -1694,9 +1713,24 @@ export class SummaryWebviewPanel {
 				attachments > 0
 					? ` (with ${attachments} attachment${attachments > 1 ? "s" : ""})`
 					: "";
-			vscode.window.showInformationMessage(
-				`${verb} on Jolli Space${attachMsg}.`,
-			);
+			if (attachmentFailures.length > 0) {
+				// Modal (not a transient toast): a partial failure must be as
+				// visible as the old fail-fast error — the panel otherwise
+				// re-renders to "Synced" and the failure would go unnoticed.
+				vscode.window.showWarningMessage(
+					`${verb} the memory on Jolli Space${attachMsg}, but ${attachmentFailures.length} attachment(s) failed to push.`,
+					{
+						modal: true,
+						detail: attachmentFailures
+							.map((f) => `• ${f.label}: ${f.message}`)
+							.join("\n"),
+					},
+				);
+			} else {
+				vscode.window.showInformationMessage(
+					`${verb} on Jolli Space${attachMsg}.`,
+				);
+			}
 
 			// Clean up orphaned memory articles, then persist which ones were actually deleted
 			const cleanedSummary = await cleanupOrphanedDocs(
@@ -1752,17 +1786,29 @@ export class SummaryWebviewPanel {
 		}
 	}
 
-	/** Uploads associated plans to Jolli and returns their published URLs. */
+	/**
+	 * Uploads associated plans to Jolli and returns their published URLs plus
+	 * any per-plan failures. A single plan's failure (e.g. a server 500 because
+	 * the document already exists) is collected and reported, NOT thrown, so it
+	 * doesn't abort the rest of the memory push. The fatal binding/plugin errors
+	 * still propagate — the outer handler drives the binding chooser off them.
+	 */
 	private async pushPlans(
 		summary: CommitSummary,
 		resolvedBaseUrl: string,
 		baseUrl: string,
 		apiKey: string,
 		repoUrl: string,
-	): Promise<
-		Array<{ slug: string; title: string; url: string; docId: number }>
-	> {
-		const allPlans = summary.plans ?? [];
+	): Promise<{
+		results: Array<{ slug: string; title: string; url: string; docId: number }>;
+		failures: PushAttachmentFailure[];
+	}> {
+		const failures: PushAttachmentFailure[] = [];
+		// Same-named plans accumulate one snapshot per source commit after a
+		// squash (slug embeds the commit hash). Upload only the latest snapshot
+		// per name so Jolli gets one document per plan, not a duplicate per
+		// commit. latestPlanPerName is shared with the detail-panel display.
+		const allPlans = latestPlanPerName(summary.plans ?? []);
 		log.info(
 			"SummaryPanel",
 			`Push to Jolli: found ${allPlans.length} plan(s) to upload`,
@@ -1789,16 +1835,33 @@ export class SummaryWebviewPanel {
 				`Uploading plan ${plan.slug} (${planContent.length} chars)`,
 			);
 
-			const planResult = await pushToJolli(resolvedBaseUrl, apiKey, {
-				title: buildPlanPushTitle(summary, plan.title),
-				content: planContent,
-				commitHash: summary.commitHash,
-				docType: "plan",
-				branch: summary.branch,
-				...(plan.jolliPlanDocId && { docId: plan.jolliPlanDocId }),
-				repoUrl,
-				relativePath: buildBranchRelativePath(summary.branch),
-			});
+			let planResult: Awaited<ReturnType<typeof pushToJolli>>;
+			try {
+				planResult = await pushToJolli(resolvedBaseUrl, apiKey, {
+					title: buildPlanPushTitle(summary, plan.title),
+					content: planContent,
+					commitHash: summary.commitHash,
+					docType: "plan",
+					branch: summary.branch,
+					...(plan.jolliPlanDocId && { docId: plan.jolliPlanDocId }),
+					repoUrl,
+					relativePath: buildBranchRelativePath(summary.branch),
+				});
+			} catch (err) {
+				if (
+					err instanceof BindingRequiredError ||
+					err instanceof PluginOutdatedError
+				) {
+					throw err;
+				}
+				const msg = err instanceof Error ? err.message : String(err);
+				log.error(
+					"SummaryPanel",
+					`Plan ${plan.slug} push FAILED (docId=${plan.jolliPlanDocId ?? "none"}, title="${buildPlanPushTitle(summary, plan.title)}"): ${msg}`,
+				);
+				failures.push({ label: `plan "${plan.title}"`, message: msg });
+				continue;
+			}
 			const planUrl = `${baseUrl}/articles?doc=${planResult.docId}`;
 			log.info(
 				"SummaryPanel",
@@ -1811,17 +1874,24 @@ export class SummaryWebviewPanel {
 				docId: planResult.docId,
 			});
 		}
-		return results;
+		return { results, failures };
 	}
 
-	/** Uploads associated notes to Jolli and returns their published URLs. */
+	/**
+	 * Uploads associated notes to Jolli. Like {@link pushPlans}, a single note's
+	 * failure is collected and reported rather than aborting the whole push.
+	 */
 	private async pushNotes(
 		summary: CommitSummary,
 		resolvedBaseUrl: string,
 		baseUrl: string,
 		apiKey: string,
 		repoUrl: string,
-	): Promise<Array<{ id: string; title: string; url: string; docId: number }>> {
+	): Promise<{
+		results: Array<{ id: string; title: string; url: string; docId: number }>;
+		failures: PushAttachmentFailure[];
+	}> {
+		const failures: PushAttachmentFailure[] = [];
 		const allNotes = summary.notes ?? [];
 		log.info(
 			"SummaryPanel",
@@ -1859,16 +1929,33 @@ export class SummaryWebviewPanel {
 					continue;
 				}
 			}
-			const noteResult = await pushToJolli(resolvedBaseUrl, apiKey, {
-				title: buildNotePushTitle(summary, note.title),
-				content: noteContent,
-				commitHash: summary.commitHash,
-				docType: "note",
-				branch: summary.branch,
-				...(note.jolliNoteDocId && { docId: note.jolliNoteDocId }),
-				repoUrl,
-				relativePath: buildBranchRelativePath(summary.branch),
-			});
+			let noteResult: Awaited<ReturnType<typeof pushToJolli>>;
+			try {
+				noteResult = await pushToJolli(resolvedBaseUrl, apiKey, {
+					title: buildNotePushTitle(summary, note.title),
+					content: noteContent,
+					commitHash: summary.commitHash,
+					docType: "note",
+					branch: summary.branch,
+					...(note.jolliNoteDocId && { docId: note.jolliNoteDocId }),
+					repoUrl,
+					relativePath: buildBranchRelativePath(summary.branch),
+				});
+			} catch (err) {
+				if (
+					err instanceof BindingRequiredError ||
+					err instanceof PluginOutdatedError
+				) {
+					throw err;
+				}
+				const msg = err instanceof Error ? err.message : String(err);
+				log.error(
+					"SummaryPanel",
+					`Note ${note.id} push FAILED (docId=${note.jolliNoteDocId ?? "none"}, title="${buildNotePushTitle(summary, note.title)}"): ${msg}`,
+				);
+				failures.push({ label: `note "${note.title}"`, message: msg });
+				continue;
+			}
 			const noteUrl = `${baseUrl}/articles?doc=${noteResult.docId}`;
 			results.push({
 				id: note.id,
@@ -1877,7 +1964,7 @@ export class SummaryWebviewPanel {
 				docId: noteResult.docId,
 			});
 		}
-		return results;
+		return { results, failures };
 	}
 
 	/** Handles editing a memory at the given global index. */

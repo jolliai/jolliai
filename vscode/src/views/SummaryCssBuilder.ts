@@ -246,6 +246,27 @@ export function buildCss(): string {
     color: var(--vscode-descriptionForeground);
     padding-left: 2px;
   }
+  /* Per-snapshot disambiguation: relative date + "Latest" badge let the user
+     tell which of several same-named plans (one per pre-squash commit) is the
+     newest; superseded snapshots are dimmed. */
+  .plan-date {
+    font-size: 0.8em;
+    color: var(--vscode-descriptionForeground);
+    white-space: nowrap;
+  }
+  .plan-latest-badge {
+    font-size: 0.72em;
+    font-weight: 600;
+    line-height: 1;
+    margin-left: 8px;
+    padding: 2px 6px;
+    border-radius: 8px;
+    color: var(--vscode-badge-foreground);
+    background: var(--vscode-badge-background);
+    white-space: nowrap;
+  }
+  .plan-item.plan-older { opacity: 0.6; }
+  .plan-jolli-link { font-size: 0.85em; }
   .plan-remove-btn:hover { color: var(--vscode-errorForeground, #f44); }
   .plan-translate-btn.translating,
   .note-translate-btn.translating {

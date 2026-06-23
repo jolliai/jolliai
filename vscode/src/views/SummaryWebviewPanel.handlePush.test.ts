@@ -525,6 +525,101 @@ describe("SummaryWebviewPanel handlePush", () => {
 			);
 			expect(localResultCalls).toHaveLength(0);
 		});
+
+		it("uploads only the latest snapshot when same-named plans accumulate after squash", async () => {
+			mockLoadConfig.mockResolvedValue({
+				apiKey: "test",
+				jolliApiKey: "jk_valid",
+			});
+			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
+			mockReadPlanFromBranch.mockResolvedValue("# Refactor auth\n\nbody");
+			mockPushToJolli.mockResolvedValue({ docId: 7 });
+			const dispatch = await setupPanel({
+				plans: [
+					{
+						slug: "refactor-auth-1111aaaa",
+						title: "Refactor auth",
+						addedAt: "2026-01-10T00:00:00Z",
+						updatedAt: "2026-01-10T00:00:00Z",
+					},
+					{
+						slug: "refactor-auth-2222bbbb",
+						title: "Refactor auth",
+						addedAt: "2026-01-12T00:00:00Z",
+						updatedAt: "2026-01-12T00:00:00Z",
+					},
+				],
+			});
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			// Exactly one plan-type upload — the two same-named snapshots collapse
+			// to the latest, instead of creating a duplicate document per commit.
+			const planCalls = mockPushToJolli.mock.calls.filter(
+				(c: Array<unknown>) =>
+					(c[2] as { docType?: string }).docType === "plan",
+			);
+			expect(planCalls).toHaveLength(1);
+			// The single upload reads the latest snapshot's content (push reads
+			// with the 2-arg signature; the translate-set refresh uses 3 args).
+			expect(mockReadPlanFromBranch).toHaveBeenCalledWith(
+				"refactor-auth-2222bbbb",
+				workspaceRoot,
+			);
+			// The pushed summary markdown is built from the deduped plans, so the
+			// article's Plans & Notes list doesn't repeat the superseded snapshot.
+			const mdSummary = mockBuildMarkdown.mock.calls.at(-1)?.[0] as {
+				plans: Array<{ slug: string }>;
+			};
+			expect(mdSummary.plans).toHaveLength(1);
+			expect(mdSummary.plans[0].slug).toBe("refactor-auth-2222bbbb");
+		});
+
+		it("does not abort the push when a single plan fails — pushes the summary and warns", async () => {
+			mockLoadConfig.mockResolvedValue({
+				apiKey: "test",
+				jolliApiKey: "jk_valid",
+			});
+			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
+			mockReadPlanFromBranch.mockResolvedValue("# Plan body\n\nbody");
+			// Plan upload 500s (server already has the doc); summary upload succeeds.
+			mockPushToJolli.mockImplementation(
+				(_base: unknown, _key: unknown, payload: { docType?: string }) =>
+					payload.docType === "plan"
+						? Promise.reject(new Error("Push failed (HTTP 500)"))
+						: Promise.resolve({ docId: 55 }),
+			);
+			const dispatch = await setupPanel({
+				plans: [
+					{
+						slug: "stuck-plan-1111aaaa",
+						title: "Stuck plan",
+						addedAt: "2026-01-10T00:00:00Z",
+						updatedAt: "2026-01-10T00:00:00Z",
+					},
+				],
+			});
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			// The summary still uploaded despite the plan failure.
+			const summaryCalls = mockPushToJolli.mock.calls.filter(
+				(c: Array<unknown>) =>
+					(c[2] as { docType?: string }).docType === "summary",
+			);
+			expect(summaryCalls).toHaveLength(1);
+			// The user gets a MODAL warning (not a missable toast) naming the
+			// failed attachment in its detail.
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("attachment(s) failed"),
+				expect.objectContaining({
+					modal: true,
+					detail: expect.stringContaining('plan "Stuck plan"'),
+				}),
+			);
+		});
 	});
 	// ── Test 8: result message edge cases ────────────────────────────────────
 

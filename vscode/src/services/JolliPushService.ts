@@ -232,7 +232,10 @@ export function pushToJolli(
 								),
 							);
 						} else {
-							reject(new Error(json.error ?? `HTTP ${status}`));
+							const detail = [json.error, json.message]
+								.filter(Boolean)
+								.join(" — ");
+							reject(new Error(`${detail || "request failed"} (HTTP ${status})`));
 						}
 					} catch {
 						reject(
