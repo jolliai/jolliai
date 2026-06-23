@@ -153,6 +153,7 @@ data class CommitSummary(
     val plans: List<PlanReference>? = null,
     val notes: List<NoteReference>? = null,
     val references: List<ReferenceCommitRef>? = null,
+    val summaryError: String? = null,
 )
 
 /** A single E2E test scenario */

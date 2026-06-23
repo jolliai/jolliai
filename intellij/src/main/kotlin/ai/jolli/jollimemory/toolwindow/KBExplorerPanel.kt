@@ -275,9 +275,11 @@ class KBExplorerPanel(
         project.messageBus.connect(this as Disposable).subscribe(
             GitRepository.GIT_REPO_CHANGE,
             GitRepositoryChangeListener {
-                // asyncRefresh triggers a VFS scan on the write thread, then calls our
-                // VFS_CHANGES listener which refreshes the tree on a pooled thread.
-                VirtualFileManager.getInstance().asyncRefresh { refresh() }
+                // VFS scan runs on the write thread; bounce the actual tree refresh onto a
+                // pooled thread since refresh() does blocking manifest/index reads.
+                VirtualFileManager.getInstance().asyncRefresh {
+                    ApplicationManager.getApplication().executeOnPooledThread { refresh() }
+                }
             },
         )
     }

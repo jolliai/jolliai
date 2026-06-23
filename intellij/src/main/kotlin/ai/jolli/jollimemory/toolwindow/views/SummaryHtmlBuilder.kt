@@ -14,7 +14,6 @@ import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.escAttr
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.escHtml
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.formatDate
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.formatFullDate
-import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.groupTopicsByDate
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.padIndex
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.renderCalloutText
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.timeAgo
@@ -48,19 +47,16 @@ object SummaryHtmlBuilder {
         bridgeScript: String = "",
         readOnly: Boolean = false,
     ): String {
-        val (allTopics, sourceNodes, showRecordDates) = collectSortedTopics(summary)
+        val (allTopics, sourceNodes) = collectSortedTopics(summary)
         val stats = SummaryTree.aggregateStats(summary)
         val totalInsertions = stats.insertions
         val totalDeletions = stats.deletions
         val totalFiles = stats.filesChanged
 
-        val topicsHtml = when {
-            allTopics.isEmpty() ->
-                """<p class="empty">No topics available for this commit.</p>"""
-            showRecordDates ->
-                renderTimeline(groupTopicsByDate(allTopics))
-            else ->
-                allTopics.mapIndexed { i, t -> renderTopic(t, i) }.joinToString("\n")
+        val topicsHtml = if (allTopics.isEmpty()) {
+            """<p class="empty">No topics available for this commit.</p>"""
+        } else {
+            allTopics.mapIndexed { i, t -> renderTopic(t, i) }.joinToString("\n")
         }
 
         val topicsLabel = "${allTopics.size} topic${if (allTopics.size != 1) "s" else ""} extracted from this commit"
@@ -792,35 +788,6 @@ $listItems
   <span class="commit-msg">${escHtml(node.commitMessage)}</span>
   <span class="commit-meta"><span class="stat-add">+$ins</span> <span class="stat-del">&#x2212;$del</span>$turnsSuffix &middot; ${formatDate(node.commitDate)}</span>
 </div>"""
-    }
-
-    // ── Timeline ──────────────────────────────────────────────────────────
-
-    /** Renders topics grouped by date as a timeline. Global numbering is continuous across groups. */
-    private fun renderTimeline(groups: Map<String, List<ViewTopicWithDate>>): String {
-        var displayIndex = 0
-        val groupsHtml = groups.map { (dayKey, topics) ->
-            val dateStr = formatDate(topics[0].recordDate ?: dayKey)
-            val count = topics.size
-            val topicsHtml = topics.joinToString("\n") { t ->
-                val html = renderTopic(t, displayIndex)
-                displayIndex++
-                html
-            }
-            """
-<div class="timeline-group" id="day-$dayKey">
-  <div class="timeline-header">
-    <span class="timeline-dot"></span>
-    <span class="timeline-arrow">&#x25BC;</span>
-    <span class="timeline-date">${escHtml(dateStr)}</span>
-    <span class="timeline-count">$count memor${if (count != 1) "ies" else "y"}</span>
-  </div>
-  <div class="timeline-content">
-    $topicsHtml
-  </div>
-</div>"""
-        }
-        return """<div class="timeline">${groupsHtml.joinToString("\n")}</div>"""
     }
 
     // ── Footer ────────────────────────────────────────────────────────────

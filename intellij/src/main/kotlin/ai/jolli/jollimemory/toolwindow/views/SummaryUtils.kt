@@ -144,53 +144,39 @@ object SummaryUtils {
 
     // ── Topic sorting / grouping ───────────────────────────────────────────
 
-    /** Extended TopicWithDate with recordDate for multi-record display. */
+    /** Extended TopicWithDate wrapper for display. */
     data class ViewTopicWithDate(
         val topic: TopicWithDate,
-        val recordDate: String? = null,
     )
 
-    /** Sorts topics by record date (newest first), then major before minor. */
+    /** Sorts topics: major before minor. */
     fun sortTopics(topics: List<ViewTopicWithDate>): List<ViewTopicWithDate> {
-        return topics.sortedWith(compareByDescending<ViewTopicWithDate> {
-            // ISO dates (YYYY-MM-DD) sort lexicographically in chronological order
-            it.recordDate?.take(10) ?: ""
-        }.thenBy {
+        return topics.sortedBy {
             if (it.topic.topic.importance?.name == "minor") 1 else 0
-        })
-    }
-
-    /** Groups topics by date (YYYY-MM-DD). */
-    fun groupTopicsByDate(topics: List<ViewTopicWithDate>): Map<String, List<ViewTopicWithDate>> {
-        val groups = linkedMapOf<String, MutableList<ViewTopicWithDate>>()
-        for (t in topics) {
-            val key = t.recordDate?.take(10) ?: "unknown"
-            groups.getOrPut(key) { mutableListOf() }.add(t)
         }
-        return groups
     }
 
     /**
-     * Collects all topics from a summary tree, enriches multi-day squash topics
-     * with a recordDate, and returns them sorted.
+     * Collects all topics from a summary tree and returns them sorted.
+     *
+     * Under v4+ unified hoist all topics on a squash or amend root share the
+     * root's date, so the previous "timeline grouping by day" feature
+     * degenerated into a single useless group. Topics now render as one flat list.
      */
     fun collectSortedTopics(summary: CommitSummary): CollectedTopics {
         val sourceNodes = SummaryTree.collectSourceNodes(summary)
-        val showRecordDates = sourceNodes.size > 1 && SummaryTree.computeDurationDays(summary) > 1
-        val collected = SummaryTree.collectAllTopics(summary)
+        val collected = SummaryTree.collectDisplayTopics(summary)
         val topics = sortTopics(collected.mapIndexed { i, tw ->
             ViewTopicWithDate(
                 topic = tw.copy(treeIndex = i),
-                recordDate = if (showRecordDates && tw.commitDate != null) tw.commitDate else null,
             )
         })
-        return CollectedTopics(topics, sourceNodes, showRecordDates)
+        return CollectedTopics(topics, sourceNodes)
     }
 
     data class CollectedTopics(
         val topics: List<ViewTopicWithDate>,
         val sourceNodes: List<CommitSummary>,
-        val showRecordDates: Boolean,
     )
 
     /**

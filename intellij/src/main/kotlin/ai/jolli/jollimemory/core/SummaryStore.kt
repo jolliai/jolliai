@@ -181,7 +181,7 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
 
     fun migrateOneToOne(oldSummary: CommitSummary, newCommitInfo: CommitInfo) {
         val newSummary = CommitSummary(
-            version = 3, commitHash = newCommitInfo.hash,
+            version = SummaryTree.CURRENT_SCHEMA_VERSION, commitHash = newCommitInfo.hash,
             commitMessage = newCommitInfo.message, commitAuthor = newCommitInfo.author,
             commitDate = newCommitInfo.date, branch = oldSummary.branch,
             generatedAt = Instant.now().toString(), commitType = CommitType.rebase,
@@ -192,21 +192,88 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
         storeSummary(newSummary, force = true)
     }
 
-    fun mergeManyToOne(oldSummaries: List<CommitSummary>, newCommitInfo: CommitInfo) {
+    fun mergeManyToOne(
+        oldSummaries: List<CommitSummary>,
+        newCommitInfo: CommitInfo,
+        apiKey: String? = null,
+        model: String? = null,
+        jolliApiKey: String? = null,
+        aiProvider: String? = null,
+    ) {
         val children = oldSummaries.sortedByDescending { it.commitDate }
             .map { it.copy(jolliDocId = null, jolliDocUrl = null, plans = null, e2eTestGuide = null, recap = null) }
         val allPlans = oldSummaries.flatMap { it.plans ?: emptyList() }
             .groupBy { it.slug }.mapNotNull { (_, p) -> p.maxByOrNull { it.updatedAt } }
         val allE2e = oldSummaries.flatMap { it.e2eTestGuide ?: emptyList() }
-        val mergedRecap = oldSummaries.firstNotNullOfOrNull { it.recap }
+
+        // Build consolidation sources from old summaries
+        val sources = oldSummaries.map { s ->
+            Summarizer.SquashConsolidationSource(
+                commitHash = s.commitHash,
+                commitDate = s.commitDate,
+                commitMessage = s.commitMessage,
+                ticketId = s.ticketId,
+                recap = s.recap,
+                topics = s.topics ?: emptyList(),
+            )
+        }
+
+        // Try LLM consolidation, fall back to mechanical merge
+        var mergedTopics: List<TopicSummary>? = null
+        var mergedRecap: String? = null
+        var mergedTicketId: String? = null
+        var llmMetadata: LlmCallMetadata? = null
+        var summaryError: String? = null
+
+        val hasCredentials = !apiKey.isNullOrBlank() || !jolliApiKey.isNullOrBlank()
+        if (hasCredentials) {
+            val outcome = Summarizer.generateSquashConsolidation(
+                sources = sources,
+                squashCommitMessage = newCommitInfo.message,
+                apiKey = apiKey,
+                model = model,
+                jolliApiKey = jolliApiKey,
+                aiProvider = aiProvider,
+            )
+            when (outcome) {
+                is Summarizer.SquashConsolidationOutcome.Ok -> {
+                    mergedTopics = outcome.result.topics
+                    mergedRecap = outcome.result.recap
+                    mergedTicketId = outcome.result.ticketId
+                    llmMetadata = outcome.result.llm
+                }
+                is Summarizer.SquashConsolidationOutcome.NoContent -> {
+                    val (topics, recap, ticket) = Summarizer.mechanicalConsolidate(sources)
+                    mergedTopics = topics
+                    mergedRecap = recap
+                    mergedTicketId = ticket
+                }
+                is Summarizer.SquashConsolidationOutcome.LlmError -> {
+                    val (topics, recap, ticket) = Summarizer.mechanicalConsolidate(sources)
+                    mergedTopics = topics
+                    mergedRecap = recap
+                    mergedTicketId = ticket
+                    summaryError = "llm-failed"
+                }
+            }
+        } else {
+            val (topics, recap, ticket) = Summarizer.mechanicalConsolidate(sources)
+            mergedTopics = topics
+            mergedRecap = recap
+            mergedTicketId = ticket
+        }
 
         val newSummary = CommitSummary(
-            version = 3, commitHash = newCommitInfo.hash,
+            version = SummaryTree.CURRENT_SCHEMA_VERSION, commitHash = newCommitInfo.hash,
             commitMessage = newCommitInfo.message, commitAuthor = newCommitInfo.author,
             commitDate = newCommitInfo.date, branch = oldSummaries.firstOrNull()?.branch ?: "unknown",
             generatedAt = Instant.now().toString(), commitType = CommitType.squash,
             plans = allPlans.takeIf { it.isNotEmpty() }, e2eTestGuide = allE2e.takeIf { it.isNotEmpty() },
+            topics = mergedTopics?.takeIf { it.isNotEmpty() },
             recap = mergedRecap,
+            ticketId = mergedTicketId,
+            llm = llmMetadata,
+            summaryError = summaryError,
             children = children,
         )
         storeSummary(newSummary, force = true)
