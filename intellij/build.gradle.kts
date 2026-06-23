@@ -149,6 +149,33 @@ intellijPlatform {
             </p>
         """.trimIndent()
         changeNotes = """
+            <h3>0.99.2</h3>
+
+            <h4>New Features</h4>
+            <ul>
+                <li><b>Reference extraction</b> &mdash; automatically extracts Linear, Jira, GitHub,
+                    and Notion references from Claude and Codex transcripts and surfaces them in
+                    summaries. Includes per-source envelope parsers, a persistent <code>ReferenceStore</code>,
+                    and transcript-level discovery at both StopHook and post-commit time</li>
+                <li><b>References in Plans panel</b> &mdash; plan entries now show clickable
+                    "Open in &lt;Source&gt;" links instead of static source labels, with a
+                    Select All toolbar action</li>
+                <li><b>PR history strip</b> &mdash; the summary viewer shows previously merged or closed
+                    PRs for the same branch alongside the active PR. Uses <code>gh pr list --state all</code>
+                    so reopened or multi-PR branches no longer lose history</li>
+                <li><b>Conversation multi-select</b> &mdash; active conversation rows now have a checkbox
+                    ("Include in next memory") and a Select All toolbar action</li>
+            </ul>
+
+            <h4>Fixes &amp; Improvements</h4>
+            <ul>
+                <li>Removed periodic polling timer for branch updates; the tool window now updates
+                    on events only</li>
+                <li>Resolved JetBrains Marketplace Plugin Verifier internal-API warnings &mdash; plugin
+                    version and install path are derived from pure JVM APIs instead of <code>PluginManager</code></li>
+                <li>Commit selection state is now tracked via <code>CommitSelectionStore</code></li>
+            </ul>
+
             <h3>0.99.1</h3>
 
             <h4>New Features</h4>
