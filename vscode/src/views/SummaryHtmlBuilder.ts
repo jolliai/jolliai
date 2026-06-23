@@ -22,6 +22,7 @@ import type {
 	TopicCategory,
 } from "../../../cli/src/Types.js";
 import { buildPrSectionHtml } from "../services/PrCommentService.js";
+import { annotatePlans } from "../util/PlanGrouping.js";
 import { SOURCE_TITLES } from "./SourceLabels.js";
 import { buildCss } from "./SummaryCssBuilder.js";
 import { buildScript } from "./SummaryScriptBuilder.js";
@@ -229,16 +230,30 @@ export function buildJolliRow(
 		: "View on Jolli";
 	const publishedPlans = (plans ?? []).filter((p) => p.jolliPlanDocUrl);
 	const publishedNotes = (notes ?? []).filter((n) => n.jolliNoteDocUrl);
-	const allItems = [
-		...publishedPlans.map((p) => {
-			const planUrl = p.jolliPlanDocUrl as string;
-			return `<div class="jolli-plan-item"><a class="jolli-link" href="${escHtml(planUrl)}" title="${escHtml(p.title)}">${escHtml(planUrl)}</a></div>`;
-		}),
-		...publishedNotes.map((n) => {
-			const noteUrl = n.jolliNoteDocUrl as string;
-			return `<div class="jolli-plan-item"><a class="jolli-link" href="${escHtml(noteUrl)}" title="${escHtml(n.title)}">${escHtml(noteUrl)}</a></div>`;
-		}),
-	];
+	// Same-named plan snapshots collapse to one Jolli doc, so several can carry
+	// the same URL — dedupe by URL so the ship card lists each doc once.
+	const seenUrls = new Set<string>();
+	const allItems: string[] = [];
+	for (const p of publishedPlans) {
+		const planUrl = p.jolliPlanDocUrl as string;
+		if (seenUrls.has(planUrl)) {
+			continue;
+		}
+		seenUrls.add(planUrl);
+		allItems.push(
+			`<div class="jolli-plan-item"><a class="jolli-link" href="${escHtml(planUrl)}" title="${escHtml(p.title)}">${escHtml(planUrl)}</a></div>`,
+		);
+	}
+	for (const n of publishedNotes) {
+		const noteUrl = n.jolliNoteDocUrl as string;
+		if (seenUrls.has(noteUrl)) {
+			continue;
+		}
+		seenUrls.add(noteUrl);
+		allItems.push(
+			`<div class="jolli-plan-item"><a class="jolli-link" href="${escHtml(noteUrl)}" title="${escHtml(n.title)}">${escHtml(noteUrl)}</a></div>`,
+		);
+	}
 	const plansAndNotesHtml =
 		allItems.length > 0
 			? `<div class="jolli-plans-block"><span class="jolli-plans-label">Plans &amp; Notes</span>${allItems.join("")}</div>`
@@ -642,23 +657,33 @@ export function buildPlansAndNotesSection(
 	const referenceList = references ?? [];
 	const totalCount = planList.length + noteList.length + referenceList.length;
 
-	const planItems = planList
-		.map((p) => {
+	const planItems = annotatePlans(planList)
+		.map(({ plan: p, isLatest, isSuperseded }) => {
 			const key = p.slug;
 			const showTranslate = planTranslateSet?.has(key) ?? false;
 			const translateBtn = showTranslate
 				? `<button class="topic-action-btn plan-translate-btn" title="Translate to English" data-plan-slug="${key}" data-action="translatePlan">&#x1F310;</button>`
 				: "";
+			const latestBadge = isLatest ? `<span class="plan-latest-badge">Latest</span>` : "";
+			const dateBadge = `<span class="plan-date">${escHtml(timeAgo(p.updatedAt))}</span>`;
+			// Same-named snapshots collapse to one Jolli doc, so only the latest
+			// links out — a superseded older version would point to the same doc
+			// (now holding the latest content), which reads as confusing.
+			const jolliLink =
+				p.jolliPlanDocUrl && !isSuperseded
+					? ` &middot; <a class="jolli-link plan-jolli-link" href="${escHtml(p.jolliPlanDocUrl)}" title="View plan on Jolli">&#x1F517; View on Jolli</a>`
+					: "";
+			const itemClass = isSuperseded ? "plan-item plan-older" : "plan-item";
 			return `
-  <div class="plan-item" id="plan-${key}">
+  <div class="${itemClass}" id="plan-${key}">
     <div class="plan-header">
-      <a class="plan-title plan-title-link" href="#" title="Click to preview" data-action="previewPlan" data-plan-slug="${key}" data-plan-title="${escAttr(p.title)}">${escHtml(p.title)}</a>
+      <a class="plan-title plan-title-link" href="#" title="Click to preview" data-action="previewPlan" data-plan-slug="${key}" data-plan-title="${escAttr(p.title)}">${escHtml(p.title)}</a>${latestBadge}
       <span class="plan-header-actions">
-        ${translateBtn}<button class="topic-action-btn plan-edit-btn" title="Edit Plan" data-plan-slug="${key}" data-action="loadPlanContent">&#x270E;</button>
+        ${dateBadge}${translateBtn}<button class="topic-action-btn plan-edit-btn" title="Edit Plan" data-plan-slug="${key}" data-action="loadPlanContent">&#x270E;</button>
         <button class="topic-action-btn plan-remove-btn" title="Remove Plan" data-plan-slug="${key}" data-plan-title="${escAttr(p.title)}" data-action="removePlan">&#x1F5D1;</button>
       </span>
     </div>
-    <div class="plan-meta">${escHtml(key)}.md</div>
+    <div class="plan-meta">${escHtml(key)}.md${jolliLink}</div>
     <div class="plan-edit-area">
       <textarea class="plan-edit-textarea" data-plan-slug="${key}" rows="20"></textarea>
       <div class="plan-edit-actions">

@@ -1680,6 +1680,74 @@ describe("buildAllConversationsSection — Regenerate button", () => {
 			expect(html).toContain('id="plansAndNotesSection"');
 		});
 
+		it("marks only the newest of same-named plan snapshots as Latest and renders it first", () => {
+			const older = makePlan({
+				slug: "refactor-auth-1111aaaa",
+				title: "Refactor auth",
+				updatedAt: "2026-01-10T10:00:00Z",
+			});
+			const newer = makePlan({
+				slug: "refactor-auth-2222bbbb",
+				title: "Refactor auth",
+				updatedAt: "2026-01-12T10:00:00Z",
+			});
+			const html = buildPlansAndNotesSection(
+				[older, newer],
+				undefined,
+				[],
+			);
+			// Exactly one Latest badge.
+			expect(html.match(/plan-latest-badge/g)).toHaveLength(1);
+			// The badge sits on the newer snapshot, and the newer item is rendered first.
+			const newerIdx = html.indexOf('id="plan-refactor-auth-2222bbbb"');
+			const olderIdx = html.indexOf('id="plan-refactor-auth-1111aaaa"');
+			expect(newerIdx).toBeGreaterThanOrEqual(0);
+			expect(newerIdx).toBeLessThan(olderIdx);
+			// The superseded (older) snapshot is dimmed.
+			expect(html).toContain('class="plan-item plan-older" id="plan-refactor-auth-1111aaaa"');
+			// Every plan item carries a relative date.
+			expect(html.match(/plan-date/g)).toHaveLength(2);
+		});
+
+		it("does not render a Latest badge for a single (non-duplicated) plan", () => {
+			const html = buildPlansAndNotesSection([makePlan()], undefined, []);
+			expect(html).not.toContain("plan-latest-badge");
+			expect(html).toContain("plan-date");
+		});
+
+		it("renders an inline Jolli link only for a plan with jolliPlanDocUrl", () => {
+			const pushed = makePlan({
+				slug: "pushed-plan",
+				jolliPlanDocUrl: "https://jolli.ai/articles?doc=42",
+			});
+			const unpushed = makePlan({ slug: "unpushed-plan" });
+			const html = buildPlansAndNotesSection([pushed, unpushed], undefined, []);
+			expect(html).toContain(
+				'class="jolli-link plan-jolli-link" href="https://jolli.ai/articles?doc=42"',
+			);
+			// Only one inline link — the unpushed plan has none.
+			expect(html.match(/plan-jolli-link/g)).toHaveLength(1);
+		});
+
+		it("shows the inline Jolli link only on the latest of same-named snapshots", () => {
+			const url = "https://jolli.ai/very/articles?doc=2570";
+			const latest = makePlan({
+				slug: "dup-2222bbbb",
+				title: "Dup",
+				updatedAt: "2026-01-12T00:00:00Z",
+				jolliPlanDocUrl: url,
+			});
+			const older = makePlan({
+				slug: "dup-1111aaaa",
+				title: "Dup",
+				updatedAt: "2026-01-10T00:00:00Z",
+				jolliPlanDocUrl: url,
+			});
+			const html = buildPlansAndNotesSection([older, latest], undefined, []);
+			// Both snapshots share one Jolli doc, so only the latest links out.
+			expect(html.match(/plan-jolli-link/g)).toHaveLength(1);
+		});
+
 		it("buildJolliRow is exported: returns '' without a url, renders #jolliRow with one", () => {
 			expect(buildJolliRow(undefined, "msg", undefined, undefined)).toBe("");
 			const withUrl = buildJolliRow(
@@ -1689,6 +1757,20 @@ describe("buildAllConversationsSection — Regenerate button", () => {
 				undefined,
 			);
 			expect(withUrl).toContain('id="jolliRow"');
+		});
+
+		it("buildJolliRow lists a shared plan doc URL only once", () => {
+			const url = "https://jolli.ai/very/articles?doc=2570";
+			const p1 = makePlan({ slug: "dup-2222bbbb", title: "Dup", jolliPlanDocUrl: url });
+			const p2 = makePlan({ slug: "dup-1111aaaa", title: "Dup", jolliPlanDocUrl: url });
+			const html = buildJolliRow(
+				"https://jolli.ai/very/articles?doc=2571",
+				"msg",
+				[p1, p2],
+				undefined,
+			);
+			// Two snapshots, one doc — the Plans & Notes block lists it once.
+			expect(html.match(/jolli-plan-item/g)).toHaveLength(1);
 		});
 
 		it("buildAllConversationsSection wraps both branches in #allConversationsSection", () => {

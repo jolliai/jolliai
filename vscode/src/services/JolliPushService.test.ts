@@ -690,7 +690,7 @@ describe("pushToJolli", () => {
 			DEFAULT_PAYLOAD,
 		).catch((e: unknown) => e);
 		expect(err).not.toBeInstanceOf(BindingRequiredError);
-		expect((err as Error).message).toBe("precondition_failed");
+		expect((err as Error).message).toBe("precondition_failed (HTTP 412)");
 	});
 
 	it("throws BindingAlreadyExistsError on 409 with binding_already_exists", async () => {
@@ -749,7 +749,7 @@ describe("pushToJolli", () => {
 			DEFAULT_PAYLOAD,
 		).catch((e: unknown) => e);
 		expect(err).not.toBeInstanceOf(BindingAlreadyExistsError);
-		expect((err as Error).message).toBe("conflict");
+		expect((err as Error).message).toBe("conflict (HTTP 409)");
 	});
 
 	it("handles statusCode being undefined (defaults to 0)", async () => {
