@@ -5,6 +5,7 @@
  * coverage-ignore pragmas drifted apart. One implementation now.
  */
 
+import { randomUUID } from "node:crypto";
 import { rename, rm, writeFile } from "node:fs/promises";
 
 /**
@@ -13,9 +14,14 @@ import { rename, rm, writeFile } from "node:fs/promises";
  * On Windows, rename() can fail with EPERM/EACCES when the target is held open
  * by another process (antivirus, file watchers, etc.). In that case it falls
  * back to a direct overwrite and removes the tmpfile. Any other error rethrows.
+ *
+ * The tmpfile name is per-call unique (`pid` + random) so two concurrent writers
+ * of the same target — e.g. the post-commit worker and the VS Code 60s tick over
+ * one worktree's telemetry buffer — never share a tmpfile and tear each other's
+ * partial write before the rename.
  */
 export async function atomicWriteFile(filePath: string, content: string): Promise<void> {
-	const tmpPath = `${filePath}.tmp`;
+	const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
 	await writeFile(tmpPath, content, "utf-8");
 	try {
 		await rename(tmpPath, filePath);

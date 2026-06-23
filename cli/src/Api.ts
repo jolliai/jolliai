@@ -26,12 +26,14 @@ import { registerRecallCommand } from "./commands/RecallCommand.js";
 import { registerSearchCommand } from "./commands/SearchCommand.js";
 import { registerStatusCommand } from "./commands/StatusCommand.js";
 import { registerSyncCommand } from "./commands/SyncCommand.js";
+import { registerTelemetryCommand } from "./commands/TelemetryCommand.js";
 import { registerViewCommand } from "./commands/ViewCommand.js";
 // _parseJolliApiKey / _parseBaseUrl: re-exposed at the bottom of this file.
 // See the `parseJolliApiKey` export for the rationale (Vite tree-shaker drops
 // pure re-exports from the entry bundle when nothing inside the entry
 // consumes them).
 import { parseBaseUrl as _parseBaseUrl, parseJolliApiKey as _parseJolliApiKey } from "./core/JolliApiUtils.js";
+import { installCommandTelemetryHooks } from "./core/TelemetryCommandHook.js";
 import { CLI_PACKAGE_NAME, REFRESH_COMMAND, refreshUpdateCache } from "./core/UpdateCheck.js";
 import type { Logger } from "./Logger.js";
 import { loadPlugins, registerMissingStubs } from "./PluginLoader.js";
@@ -163,6 +165,7 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"heal-folder",
 	"sync-memory-bank",
 	"mcp",
+	"telemetry",
 ]);
 
 const MEMORY_DESCRIPTION = `Auto-documents your AI-assisted development. Lightweight git and AI-agent
@@ -340,6 +343,11 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerAuthCommands(program);
 	registerSyncCommand(program);
 	registerMcpCommand(program);
+	registerTelemetryCommand(program);
+
+	// Auto-emit `command_invoked` for every command (built-in, plugin, future).
+	// No-op until telemetry is bootstrapped (Cli.ts), so harmless in tests.
+	installCommandTelemetryHooks(program);
 
 	// Plugin-provided command surface. `loadPlugins` discovers and registers
 	// installed plugins (returning the set of IDs it loaded); whatever's left

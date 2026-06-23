@@ -26,6 +26,7 @@ import { resolveRecall } from "../core/RecallResolver.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
+import { bucket, track } from "../core/Telemetry.js";
 import { setLogDir } from "../Logger.js";
 import type { CommitSummary } from "../Types.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
@@ -204,6 +205,8 @@ async function outputRecall(
 		},
 		projectDir,
 	);
+
+	track("recall_performed", { result_count_bucket: bucket(ctx.commitCount), hit: ctx.commitCount > 0 });
 
 	if (ctx.commitCount === 0) {
 		console.log(`No Jolli Memory records found for branch "${branch}".`);

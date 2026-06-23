@@ -12,6 +12,7 @@ import * as vscode from "vscode";
 import type { TranscriptSource } from "../../../cli/src/Types.js";
 import { isTranscriptSource } from "../../../cli/src/Types.js";
 import type { ActiveSessionsProvider } from "../services/ActiveSessionsProvider.js";
+import { flushExtensionTelemetry } from "../TelemetryActivation.js";
 import { log } from "../util/Logger.js";
 import { ConversationDetailsPanel } from "./ConversationDetailsPanel.js";
 import { SIDEBAR_EMPTY_STRINGS } from "./SidebarEmptyMessages.js";
@@ -341,6 +342,12 @@ export class SidebarWebviewProvider
 	private tickConversations(): void {
 		if (!this.view?.visible) return;
 		void this.pushConversations();
+		// JOLLI-1785: piggyback the existing 60s tick to flush buffered telemetry.
+		// Fire-and-forget; the helper swallows all errors and no-ops on an empty buffer.
+		const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+		// Pass the live platform opt-out so the flush-time consent re-gate honors a
+		// VS Code telemetry toggle even for events buffered before it was turned off.
+		if (cwd) flushExtensionTelemetry(cwd, !vscode.env.isTelemetryEnabled);
 	}
 
 	/** Send a message to the webview client. No-op when the view is not resolved. */

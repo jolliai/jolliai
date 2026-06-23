@@ -36,6 +36,7 @@
 		"lint:fix": "biome check --write",
 		"cli": "tsx src/Cli.ts",
 		"cli:build": "npm run build && node dist/Cli.js",
+		"gen:telemetry-doc": "tsx scripts/gen-telemetry-doc.mjs",
 		"test": "vitest run --coverage",
 		"test:watch": "vitest",
 		"test:acceptance": "vitest run --config vitest.acceptance.config.ts",

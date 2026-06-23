@@ -269,6 +269,14 @@ object IngestPipeline {
             log.error("drainIngest hit iteration guard (%d) — pipeline not draining, stopping", maxIterations)
             outcome = IngestCode.ITERATION_GUARD
         }
+        // JOLLI-1785: pipeline-health telemetry (no-op until telemetry is bootstrapped).
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+            "ingest_completed",
+            mapOf("outcome" to outcome.name, "batches" to batches, "ingested" to ingested, "topic_failures" to topicFailures.size),
+        )
+        if (outcome != IngestCode.OK && outcome != IngestCode.NO_PENDING) {
+            ai.jolli.jollimemory.core.telemetry.Telemetry.track("error_occurred", mapOf("code" to outcome.name, "where" to "ingest"))
+        }
         return DrainResult(batches, ingested, outcome, topicFailures)
     }
 

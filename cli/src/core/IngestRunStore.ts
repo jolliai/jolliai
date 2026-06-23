@@ -11,6 +11,7 @@ import { getJolliMemoryDir } from "../Logger.js";
 import type { IngestOperation } from "../Types.js";
 import { atomicWriteFile } from "./AtomicWrite.js";
 import { INGEST_CODES, type IngestCode } from "./IngestErrors.js";
+import { track } from "./Telemetry.js";
 
 const RUNS_FILE = "ingest-runs.json";
 const MAX_RUNS = 20;
@@ -44,6 +45,31 @@ export async function appendIngestRun(cwd: string, record: IngestRunRecord): Pro
 	const existing = await readIngestRuns(cwd);
 	const next = [...existing, record].slice(-MAX_RUNS);
 	await atomicWriteFile(join(dir, RUNS_FILE), JSON.stringify(next, null, "\t"));
+	emitIngestTelemetry(record);
+}
+
+/**
+ * Telemetry choke point: every drain run flows through here, so one emit covers
+ * all ingest pipeline-health telemetry (JOLLI-1785 §7.C). `track()` is a no-op
+ * until telemetry is bootstrapped (the QueueWorker does so at startup), so this
+ * is inert in unit tests and unbootstrapped contexts.
+ */
+function emitIngestTelemetry(record: IngestRunRecord): void {
+	track("ingest_completed", {
+		outcome: record.outcome,
+		duration_ms: record.durationMs,
+		batches: record.batches,
+		ingested: record.ingested,
+		touched_slugs: record.touchedSlugs,
+		route_calls: record.routeCalls,
+		reconcile_calls: record.reconcileCalls,
+		topic_failures: record.topicFailures.length,
+	});
+	// A genuine failure outcome also raises a structured error event. OK and
+	// NO_PENDING are normal terminal states, not errors.
+	if (record.outcome !== INGEST_CODES.OK && record.outcome !== INGEST_CODES.NO_PENDING) {
+		track("error_occurred", { code: record.outcome, where: "ingest" });
+	}
 }
 
 /** Records a one-off run for the pre-drain credential guard (no batches ran). */

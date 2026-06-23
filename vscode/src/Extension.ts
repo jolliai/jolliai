@@ -22,6 +22,7 @@ import {
 } from "../../cli/src/core/KBPathResolver.js";
 import type { ManifestEntry } from "../../cli/src/core/KBTypes.js";
 import { toForwardSlash } from "../../cli/src/core/PathUtils.js";
+import { activateExtensionTelemetry, reinitExtensionTelemetry } from "./TelemetryActivation.js";
 import {
 	getGlobalConfigDir,
 	loadConfig,
@@ -416,6 +417,25 @@ export function activate(context: vscode.ExtensionContext): void {
 		workspaceRoot,
 		extensionPath: context.extensionPath,
 	});
+
+	// ── Telemetry (JOLLI-1785) ────────────────────────────────────────────────
+	// Bootstrap anonymous, content-free usage telemetry and show the loud
+	// first-run notice once. Honors VS Code's own telemetry setting via
+	// `isTelemetryEnabled`. Fire-and-forget — never blocks activation.
+	void activateExtensionTelemetry(workspaceRoot, {
+		platformDisabled: !vscode.env.isTelemetryEnabled,
+		showNotice: (message, ...actions) =>
+			Promise.resolve(vscode.window.showInformationMessage(message, ...actions)),
+		openExternal: (url) => {
+			void vscode.env.openExternal(vscode.Uri.parse(url));
+		},
+	});
+	// Follow the IDE: if the user toggles VS Code telemetry mid-session, re-evaluate.
+	context.subscriptions.push(
+		vscode.env.onDidChangeTelemetryEnabled((enabled) => {
+			void reinitExtensionTelemetry(workspaceRoot, !enabled);
+		}),
+	);
 
 	// ── Core bridge ──────────────────────────────────────────────────────────
 	// Bridge now calls Installer functions directly — no CLI subprocess needed.

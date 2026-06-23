@@ -368,6 +368,21 @@ Two `.jolli/jollimemory/` directories carry local state, both stay on your disk 
 
 Every entry on the `jollimemory/summaries/v3` orphan branch — and its mirror in the Memory Bank folder, including the raw transcripts shown in **All Conversations** — also stays on your disk unless the specific actions above are triggered.
 
+### Usage telemetry (anonymous, opt-out)
+
+Separately from your memory content, Jolli Memory collects **anonymous, content-free usage telemetry** to understand which features are used and where things break. It is **on by default** and you'll see a one-time notice on first run with **Learn more** and **Turn off** buttons.
+
+- **What is sent** — event names (e.g. `app_installed`, `summary_generated`, `sync_completed`), the surface and version (`vscode` + version), OS / arch / runtime version, a random `installId` (a UUID generated on this machine), and coarse, bucketed counts. Nothing else.
+- **What is never sent** — your code, file paths, commit messages, diffs, transcripts, memory/summary content, repo names, branch names, API keys, or any account identifier. Property values are scrubbed before they leave your machine, and the payload carries no account ID.
+
+**Turn it off (any one of these):**
+
+- VS Code's own telemetry setting — `telemetry.telemetryLevel: "off"` disables Jolli telemetry too (we honor `vscode.env.isTelemetryEnabled`, and changes take effect immediately).
+- Click **Turn off** on the first-run notice.
+- Run `jolli telemetry off` in a terminal, or set `DO_NOT_TRACK=1`.
+
+See <https://jolli.ai/telemetry> for the full event list.
+
 ## Support
 
 * **Issues & feature requests** — [GitHub Issues](https://github.com/jolliai/jolliai/issues)

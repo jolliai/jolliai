@@ -23,6 +23,7 @@ import {
 	parseJolliApiKey,
 	validateJolliApiKey,
 } from "../../../cli/src/core/JolliApiUtils.js";
+import { track } from "../../../cli/src/core/Telemetry.js";
 import {
 	getGlobalConfigDir,
 	loadConfigFromDir,
@@ -177,6 +178,7 @@ export class SettingsWebviewPanel {
 		onSaved?: OnSavedCallback,
 		authService?: AuthService,
 	): void {
+		track("settings_opened", { tab: "general" });
 		if (SettingsWebviewPanel.currentPanel) {
 			if (onSaved) {
 				SettingsWebviewPanel.currentPanel.onSavedCallback = onSaved;

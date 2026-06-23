@@ -515,6 +515,26 @@ Two `.jolli/jollimemory/` directories carry local state, both stay on your disk 
 
 Every entry on the `jollimemory/summaries/v3` orphan branch — and its mirror inside the Memory Bank folder, including raw transcripts — also stays on your disk unless one of the specific actions above is triggered.
 
+### Usage telemetry (anonymous, opt-out)
+
+Separately from your memory content, Jolli Memory collects **anonymous, content-free usage telemetry** to understand which features are used and where things break. It is **on by default** and you can turn it off at any time.
+
+- **What is sent** — event names (e.g. `app_installed`, `summary_generated`, `sync_completed`), the surface and version (`cli` + version), OS / arch / Node version, a random `installId` (a UUID generated on this machine), and coarse, bucketed counts. Nothing else.
+- **What is never sent** — your code, file paths, commit messages, diffs, transcripts, memory/summary content, repo names, branch names, API keys, or any account identifier. Property values are scrubbed before they leave your machine, and the payload carries no account ID.
+- **How it leaves your machine** — events are written to a local buffer (`<projectDir>/.jolli/jollimemory/telemetry-queue.ndjson`) and flushed in small batches; the buffer is capped and never grows unbounded.
+
+**Turn it off (any one of these):**
+
+```bash
+# Persisted opt-out (writes telemetry: "off" to the shared config)
+jolli telemetry off
+
+# Or set the standard env var (honored on every run)
+export DO_NOT_TRACK=1
+```
+
+Jolli also honors your OS / IDE data-sharing setting. Check the current state with `jolli telemetry status`, print the exact buffered events with `jolli telemetry inspect`, and see <https://jolli.ai/telemetry> for the full event list.
+
 ---
 
 ## Jolli Site — documentation from your content folder

@@ -7,6 +7,7 @@ import type { Command } from "commander";
 import { clearAuthCredentials, getJolliUrl, loadAuthToken } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
 import { loadConfig } from "../core/SessionTracker.js";
+import { track } from "../core/Telemetry.js";
 
 export function registerAuthCommands(program: Command): void {
 	const auth = program
@@ -40,6 +41,7 @@ export function registerAuthCommands(program: Command): void {
 		)
 		.action(async () => {
 			await clearAuthCredentials();
+			track("signed_out");
 			const config = await loadConfig();
 			const hasAnthropicKey = Boolean(config.apiKey || process.env.ANTHROPIC_API_KEY);
 

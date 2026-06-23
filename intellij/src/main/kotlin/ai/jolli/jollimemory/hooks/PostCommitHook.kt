@@ -91,6 +91,7 @@ object PostCommitHook {
     /** Worker: runs the actual summarization pipeline. */
     fun runWorker(cwd: String, force: Boolean = false) {
         JmLogger.setLogDir(cwd)
+        val drainStart = System.currentTimeMillis()
         log.info("=== PostCommitHook worker started (cwd=%s, force=%s) ===", cwd, force)
 
         val git = GitOps(cwd)
@@ -203,6 +204,14 @@ object PostCommitHook {
 
             for (session in sessions) {
                 val source = session.source ?: TranscriptSource.claude
+                // JOLLI-1785: fire ai_source_detected the first time this machine
+                // sees a transcript from `source`. Gated on telemetry being enabled
+                // so an opted-out run never writes the shared first-seen ledger.
+                if (ai.jolli.jollimemory.core.telemetry.Telemetry.isEnabled() &&
+                    ai.jolli.jollimemory.core.telemetry.TelemetrySharedConfig.markAiSourceSeen(source.name)
+                ) {
+                    ai.jolli.jollimemory.core.telemetry.Telemetry.track("ai_source_detected", mapOf("source" to source.name))
+                }
                 try {
                     val cursor = SessionTracker.loadCursorForTranscript(session.transcriptPath, cwd)
                     log.info("Reading session %s source=%s cursor=%s",
@@ -456,6 +465,11 @@ object PostCommitHook {
                 log.warn("Post-commit ingest/render failed (non-fatal): %s", e.message)
             }
             SessionTracker.releaseLock(cwd)
+            // JOLLI-1785: the IntelliJ worker processes one commit per run.
+            ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+                "queue_drained",
+                mapOf("ops" to 1, "duration_ms" to (System.currentTimeMillis() - drainStart)),
+            )
         }
     }
 

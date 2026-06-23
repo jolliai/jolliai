@@ -48,7 +48,11 @@ open class SyncEngine(private val opts: SyncEngineOpts) {
 
 	// ── Public entry point ──────────────────────────────────────────
 
+	/** Start of the current round, for the sync_completed duration (JOLLI-1785). */
+	private var roundStartMs: Long = 0L
+
 	open fun runRound(round: SyncRoundOptions): SyncRoundResult {
+		roundStartMs = System.currentTimeMillis()
 		log.info("runRound start reason=${round.reason} cwd=${round.cwd}")
 		if (!SyncLock.acquire(SyncLockOpts(timeoutMs = opts.lockTimeoutMs))) {
 			log.info("runRound skipped — another round already in progress (lock contention)")
@@ -806,6 +810,13 @@ open class SyncEngine(private val opts: SyncEngineOpts) {
 
 	private fun report(newState: SyncState, result: SyncRoundResult): SyncRoundResult {
 		try { opts.onStateChange?.invoke(newState, result) } catch (_: Exception) {}
+		// JOLLI-1785: one sync_completed per round — every terminal path (incl.
+		// reportOffline) returns through here. Runs in the plugin process where
+		// telemetry is bootstrapped.
+		ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+			"sync_completed",
+			mapOf("outcome" to newState.name.lowercase(), "duration_ms" to (System.currentTimeMillis() - roundStartMs)),
+		)
 		return result
 	}
 

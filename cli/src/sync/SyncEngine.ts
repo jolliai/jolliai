@@ -46,6 +46,7 @@
 
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { track } from "../core/Telemetry.js";
 import { createLogger } from "../Logger.js";
 import {
 	type BackendClient,
@@ -517,6 +518,7 @@ export class SyncEngine {
 
 	async runRound(round: SyncRoundOptions): Promise<SyncRoundResult> {
 		log.info("runRound start reason=%s cwd=%s", round.reason, round.cwd);
+		const roundStart = Date.now();
 		this.canary = { symlinked: [], unowned: [] };
 		const lockAcquired = await acquireSyncLock({
 			timeoutMs: this.opts.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS,
@@ -559,6 +561,7 @@ export class SyncEngine {
 			const ctx = await this.opts.resolveContext(round);
 			const result = await this.doRound(round, ctx, lockHolder);
 			log.info("runRound end state=%s pushed=%s pulled=%s", result.newState, result.pushed, result.pulled);
+			track("sync_completed", { outcome: result.newState, duration_ms: Date.now() - roundStart });
 			return result;
 		} catch (e) {
 			// Catch any uncaught error (e.g. SyncBackendError 4xx/5xx that
@@ -571,6 +574,10 @@ export class SyncEngine {
 				(e as Error).message,
 				(e as Error).stack ?? "(no stack)",
 			);
+			// Pipeline-health visibility: the success path emits sync_completed, so
+			// emit it on the failure path too (content-free — outcome marker only),
+			// otherwise the sync-health view would only ever see successes.
+			track("sync_completed", { outcome: "failed", duration_ms: Date.now() - roundStart });
 			// `VaultLockBusyError` is the polite "worker is busy" surface from
 			// `pullRebaseLocked` — retry semantics are transient (next round
 			// succeeds), so route to `network` rather than the terminal red
