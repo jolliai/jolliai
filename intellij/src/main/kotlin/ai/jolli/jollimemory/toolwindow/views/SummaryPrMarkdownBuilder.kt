@@ -34,7 +34,7 @@ object SummaryPrMarkdownBuilder {
      * - Footer
      */
     fun buildPrMarkdown(summary: CommitSummary): String {
-        val (allTopics, _, _) = collectSortedTopics(summary)
+        val (allTopics, _) = collectSortedTopics(summary)
         val lines = mutableListOf<String>()
 
         // Jolli Memory URL

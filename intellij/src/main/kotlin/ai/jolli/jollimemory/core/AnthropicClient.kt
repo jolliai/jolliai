@@ -54,7 +54,7 @@ class AnthropicClient(private val apiKey: String) {
             .header("content-type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(body))
             // Streaming generations can run for minutes; give them a generous ceiling.
-            .timeout(if (stream) Duration.ofMinutes(10) else Duration.ofSeconds(120))
+            .timeout(if (stream) Duration.ofMinutes(10) else Duration.ofSeconds(180))
             .build()
 
         if (!stream) {

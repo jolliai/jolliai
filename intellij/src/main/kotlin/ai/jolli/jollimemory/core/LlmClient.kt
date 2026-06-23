@@ -100,7 +100,7 @@ object LlmClient {
 
     /** Above this `max_tokens`, use streaming: Anthropic refuses long non-streaming
      *  requests and the non-streaming client timeout can't cover them. */
-    private const val STREAMING_THRESHOLD_TOKENS = 8192
+    private const val STREAMING_THRESHOLD_TOKENS = 16_384
 
     private fun callDirect(prompt: String, apiKey: String, model: String?, maxTokens: Int?): LlmCallResult {
         val resolvedModel = Summarizer.resolveModelId(model)

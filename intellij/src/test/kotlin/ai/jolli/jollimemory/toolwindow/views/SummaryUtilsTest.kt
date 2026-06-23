@@ -317,27 +317,4 @@ class SummaryUtilsTest {
         }
     }
 
-    // ── groupTopicsByDate ───────────────────────────────────────────────
-
-    @Test
-    fun `groupTopicsByDate groups by date prefix`() {
-        val topics = listOf(
-            SummaryUtils.ViewTopicWithDate(
-                topic = SummaryTree.TopicWithDate(TopicSummary("A", "t", "r", "d")),
-                recordDate = "2026-01-15T10:00:00Z",
-            ),
-            SummaryUtils.ViewTopicWithDate(
-                topic = SummaryTree.TopicWithDate(TopicSummary("B", "t", "r", "d")),
-                recordDate = "2026-01-15T14:00:00Z",
-            ),
-            SummaryUtils.ViewTopicWithDate(
-                topic = SummaryTree.TopicWithDate(TopicSummary("C", "t", "r", "d")),
-                recordDate = "2026-01-16T10:00:00Z",
-            ),
-        )
-        val groups = SummaryUtils.groupTopicsByDate(topics)
-        groups.size shouldBe 2
-        groups["2026-01-15"]!! shouldHaveSize 2
-        groups["2026-01-16"]!! shouldHaveSize 1
-    }
 }

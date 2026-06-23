@@ -12,12 +12,35 @@ import java.util.Locale
  */
 object SummaryTree {
 
+    /** Summary schema version that marks root topics as authoritative (unified hoist). */
+    const val UNIFIED_HOIST_VERSION = 4
+
+    /** Current schema version written by this plugin. */
+    const val CURRENT_SCHEMA_VERSION = 5
+
     /** A topic annotated with the commitDate of the node it came from */
     data class TopicWithDate(
         val topic: TopicSummary,
         val commitDate: String? = null,
         val treeIndex: Int? = null,
     )
+
+    /** Returns true when the summary uses the unified hoist format (v4+),
+     *  meaning root topics are authoritative and children are archival only. */
+    fun isUnifiedHoistFormat(summary: CommitSummary): Boolean {
+        return (summary.version ?: 3) >= UNIFIED_HOIST_VERSION
+    }
+
+    /**
+     * Collects topics for display. For v4+ summaries, returns only root topics
+     * (authoritative after LLM consolidation). For v3, recurses into children.
+     */
+    fun collectDisplayTopics(node: CommitSummary): List<TopicWithDate> {
+        if (isUnifiedHoistFormat(node)) {
+            return (node.topics ?: emptyList()).map { TopicWithDate(it, node.commitDate) }
+        }
+        return collectAllTopics(node)
+    }
 
     /** Recursively collects all topics in chronological order (oldest first). */
     fun collectAllTopics(node: CommitSummary): List<TopicWithDate> {

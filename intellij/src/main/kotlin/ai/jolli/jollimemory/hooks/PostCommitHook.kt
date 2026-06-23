@@ -142,7 +142,7 @@ object PostCommitHook {
                         squashPending.expectedParentHash.take(8), parentHash.take(8)
                     )
                 } else {
-                    handleSquash(store, squashPending, commitInfo)
+                    handleSquash(store, squashPending, commitInfo, config)
                     return
                 }
             }
@@ -404,7 +404,7 @@ object PostCommitHook {
             val branch = git.getCurrentBranch() ?: "unknown"
             val commitType = detectCommitType()
             val summary = CommitSummary(
-                version = 3,
+                version = SummaryTree.CURRENT_SCHEMA_VERSION,
                 commitHash = commitInfo.hash,
                 commitMessage = commitInfo.message,
                 commitAuthor = commitInfo.author,
@@ -522,14 +522,19 @@ object PostCommitHook {
         return shouldRender
     }
 
-    private fun handleSquash(store: SummaryStore, pending: SquashPendingState, commitInfo: CommitInfo) {
-        log.info("Handling squash: %d source hashes", pending.sourceHashes.size)
+    private fun handleSquash(store: SummaryStore, pending: SquashPendingState, commitInfo: CommitInfo, config: JolliMemoryConfig) {
         val oldSummaries = pending.sourceHashes.mapNotNull { store.getSummary(it) }
         if (oldSummaries.isEmpty()) {
-            log.info("No existing summaries to merge")
             return
         }
-        store.mergeManyToOne(oldSummaries, commitInfo)
+        val apiKey = config.apiKey ?: System.getenv("ANTHROPIC_API_KEY")
+        store.mergeManyToOne(
+            oldSummaries, commitInfo,
+            apiKey = apiKey,
+            model = config.model,
+            jolliApiKey = config.jolliApiKey,
+            aiProvider = config.aiProvider,
+        )
     }
 
     private fun handleAmend(store: SummaryStore, pending: AmendPendingState, commitInfo: CommitInfo) {

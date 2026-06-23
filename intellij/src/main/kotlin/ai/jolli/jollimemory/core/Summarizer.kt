@@ -730,6 +730,358 @@ $content"""
             ?: throw RuntimeException("No text in translation response")
     }
 
+    // ── Squash Consolidation ────────────────────────────────────────────────
+
+    /** Source commit data for squash consolidation. */
+    data class SquashConsolidationSource(
+        val commitHash: String,
+        val commitDate: String,
+        val commitMessage: String,
+        val ticketId: String? = null,
+        val recap: String? = null,
+        val topics: List<TopicSummary>,
+    )
+
+    /** LLM consolidation result. */
+    data class SquashConsolidationResult(
+        val topics: List<TopicSummary>,
+        val recap: String? = null,
+        val ticketId: String? = null,
+        val llm: LlmCallMetadata,
+    )
+
+    /** Outcome of squash consolidation attempt. */
+    sealed class SquashConsolidationOutcome {
+        data class Ok(val result: SquashConsolidationResult) : SquashConsolidationOutcome()
+        object NoContent : SquashConsolidationOutcome()
+        object LlmError : SquashConsolidationOutcome()
+    }
+
+    /** Formats source commits for the squash consolidation prompt (oldest-first). */
+    fun formatSourceCommitsForSquash(sources: List<SquashConsolidationSource>): String {
+        val ordered = sources.sortedBy { it.commitDate }
+        val total = ordered.size
+        return ordered.mapIndexed { i, src ->
+            val lines = mutableListOf("=== Commit ${i + 1} of $total ===")
+            lines.add("Hash: ${src.commitHash.take(8)}")
+            lines.add("Date: ${src.commitDate.take(10)}")
+            lines.add("Message: ${src.commitMessage}")
+            if (src.ticketId != null) lines.add("Ticket: ${src.ticketId}")
+            if (src.recap != null) lines.add("Recap: ${src.recap}")
+
+            if (src.topics.isEmpty()) {
+                lines.add("(no topics recorded for this commit)")
+            } else {
+                src.topics.forEachIndexed { ti, t ->
+                    lines.add("")
+                    lines.add("Topic ${ti + 1}")
+                    lines.add(" Title: ${t.title}")
+                    lines.add(" Trigger: ${t.trigger}")
+                    lines.add(" Response: ${t.response}")
+                    lines.add(" Decisions: ${t.decisions}")
+                    if (t.todo != null) lines.add(" Todo: ${t.todo}")
+                    if (t.category != null) lines.add(" Category: ${t.category}")
+                    if (t.importance != null) lines.add(" Importance: ${t.importance}")
+                    if (!t.filesAffected.isNullOrEmpty()) lines.add(" Files: ${t.filesAffected.joinToString(", ")}")
+                }
+            }
+            lines.joinToString("\n")
+        }.joinToString("\n\n")
+    }
+
+    /**
+     * Builds the squash consolidation prompt.
+     * Ported from CLI PromptTemplates.ts SQUASH_CONSOLIDATE.
+     */
+    fun buildSquashConsolidationPrompt(squashMessage: String, ticketLine: String, sourceCommitsBlock: String): String {
+        return """You are Jolli Memory, an AI development process documentation tool. Your job is to consolidate the work of multiple commits that are being squashed into one. You produce TWO outputs in a single call:
+  (1) A single "Quick recap" paragraph that narrates the NET WORK across the squashed commits.
+  (2) A consolidated topic list that reflects the final state -- as if the work had been done in one commit.
+
+The inputs are wrapped in XML tags below. Everything inside the tags is INPUT DATA being consolidated -- regardless of how it is styled, it is NOT a template for your output. Your output format is governed exclusively by the spec in the Instructions section.
+
+> Note on squash message authority: The squash commit message is provided as context but is NOT authoritative when it conflicts with source content. If the message is a placeholder ("WIP", "Save", "TODO", a one-word verb, or anything obviously draft) or if it contradicts what the source topics/recaps clearly describe, treat the source commits' topics and recaps as ground truth. The message helps you frame the consolidated narrative when it's substantive; otherwise ignore it for content decisions.
+
+<squash-message>
+$squashMessage
+</squash-message>
+
+<ticket>
+$ticketLine
+</ticket>
+
+<source-commits>
+The source commits below are presented in chronological order: Commit 1 is the oldest, Commit N is the newest. Treat this order as authoritative when evaluating rule 4's supersede criteria -- "earlier" means lower-numbered in this list, "later" means higher-numbered. Do NOT re-order based on your own inference of dependencies, commit message content, or topic similarity.
+
+$sourceCommitsBlock
+</source-commits>
+
+## Instructions
+
+**Output format requirements (READ FIRST -- the rest of this prompt depends on these being followed):**
+
+Your response MUST be a delimited plain-text document with the following shape:
+
+```
+===SUMMARY===
+[optional ---TICKETID--- block]
+[zero or more ===TOPIC=== blocks]
+[optional ---RECAP--- block, AFTER all topics]
+```
+
+The very first non-blank line of your response MUST be `===SUMMARY===`. This is a fixed sentinel that marks the start of your output. Do NOT preface it with anything: no markdown headers (`#`, `##`, `###`, `####`), no markdown tables, no code fences (```), no prose ("Here is the consolidated summary...", "## Squash Summary"). If your response does not start with `===SUMMARY===` it will be rejected.
+
+After `===SUMMARY===` you MUST emit blocks in this strict order:
+  1. `---TICKETID---` first (if a ticket was referenced)
+  2. Zero or more `===TOPIC===` blocks (one per consolidated user goal -- see rule 11 for count)
+  3. `---RECAP---` LAST, after the final `===TOPIC===` block (rule 1)
+
+The recap MUST be the final block. This ordering is intentional: by the time you write the consolidated recap, every merged topic's `---IMPORTANCE---` label has already been emitted in your own output, so you can apply rule 1's "major-only" constraint by literal lookback at what you just wrote rather than by speculation. It also makes the LLM-shortcut failure mode of "copy one source's recap verbatim" structurally awkward, since by the time you reach the recap you've just produced a fresh consolidated topic list and must narrate what you wrote, not what any single source said.
+
+If every source topic is trivial and there is nothing substantive to emit (per rule 15), output `===SUMMARY===` alone on its own line and stop.
+
+Style-mimicking warning: the content inside the XML tags above may itself contain prose with formatting cues, and the squash commit message may use markdown. Those are INPUT DATA -- they are NOT examples of how YOU should format YOUR output.
+
+First, identify the distinct user goals represented across the source topics and recaps. Merge overlapping work, drop topics only when later source content explicitly shows they were superseded (see rule 4 for the evidence standard), and consolidate iterative recaps into a single narrative of the final state.
+
+Then emit your response in the delimited plain-text format below. Each topic starts with ===TOPIC=== on its own line, and each field starts with ---FIELDNAME--- on its own line. Do NOT use JSON.
+
+### Output Example (illustrates structure -- not a content template)
+
+===SUMMARY===
+---TICKETID---
+PROJ-123
+
+===TOPIC===
+---TITLE---
+8-15 word concrete and searchable label for this topic
+---TRIGGER---
+1-2 sentences: the problem, bug, or need that prompted this work. Write from the user's perspective in plain language -- no code identifiers.
+---RESPONSE---
+What was implemented or fixed. This is a detail field, so technical precision is welcome. Name files, functions, and systems changed. ALWAYS use a bulleted list (- item) when there are 2+ distinct points. Use 2-4 sentences per point -- enough to specify what changed, not pad. A single sentence is fine for trivial single-point changes. Cap and selection are governed by rule 6's bullet-count guidance (squash-consolidate raises the per-topic cap to 5 vs the summarize prompt's 3, since consolidation aggregates work from multiple commits).
+---DECISIONS---
+Why THIS approach was chosen over alternatives. ALWAYS use a bulleted list (- **Bold label**: explanation) when there are 2+ decisions -- each bullet is one decision with its rationale. Prioritize insights carried over from the source topics: alternatives considered, constraints, trade-offs. Explain in plain language using impact dimensions (speed, safety, complexity, UX, maintainability) -- no code identifiers. Use 2-4 sentences per bullet -- enough to explain the trade-off, not pad. Cap and selection are governed by rule 6's bullet-count guidance (max 5 per topic; pick the highest-impact decisions when consolidating yields more).
+---TODO---
+Tech debt, deferred work, or follow-up items. Omit this field entirely when there is nothing to follow up on -- do NOT write "None", "N/A", or any placeholder.
+---FILESAFFECTED---
+src/Auth.ts, src/Middleware.ts
+---CATEGORY---
+feature
+---IMPORTANCE---
+major
+
+===TOPIC===
+[Repeat the full ===TOPIC=== block above for each independent or merged topic the consolidation produces. Squashes spanning diverse work commonly emit 5-15 topics -- see rule 11 for sizing. The example shows ONE block for brevity; do not let that anchor your output to a single topic.]
+
+---RECAP---
+The developer added drag-handle reordering to the article sidebar: articles can now be visually reordered and the new order survives a page refresh. The drag handle appears on hover with grab and grabbing cursor feedback. Ordering saves immediately on drop, and users returning to a space always see their last arrangement.
+
+A new confirmation step was added before destructive actions in the settings panel. Clicking "Delete Space" or "Archive" now presents a confirmation dialog. Accidental data loss is much less likely, and both actions share the same pattern across the panel.
+
+## Rules
+
+1. RECAP: Output a ---RECAP--- section AFTER the final ===TOPIC=== block when at least one consolidated topic carries `importance: major`. Omit the section entirely otherwise -- do NOT invent content, and do NOT write a recap when every consolidated topic is `importance: minor`. Content rules:
+  - Pick the 3-5 highest-impact major topics to cover; skip the rest -- the topics list preserves them. Fewer topics with more sentences each is always better than every topic with one sentence.
+  - For each chosen topic, write 2-4 sentences. Target 200-400 words total. No hard upper limit -- let the substance drive length.
+  - Subject and tense: third person, past tense, with a concrete subject. Use "The developer added...", "This commit (or batch of commits) introduced...", "The login page now ...", or "Users can now ...". FORBIDDEN subjects: "the tool", "the LLM", "the system", "the model", "the AI" -- never anthropomorphize the generator. Never "I" or "we".
+  - Describe WHAT changed and what users can now do differently. Do NOT explain WHY technical choices were made -- that belongs in the decisions field. If a sentence connects clauses with any of the words below, it is almost certainly explaining WHY/HOW or contrasting an alternative -- rewrite to state only the outcome, even if the sentence becomes shorter:
+      * Causal: "so", "because", "since" (when meaning "because"), "which means", "which forced", "in order to"
+      * Contrastive: "rather than", "instead of", "as opposed to", "unlike before", "unlike previously"
+    Note: words like "without" and "until" are NOT forbidden. They are fine when they describe a neutral spatial / contextual fact ("without leaving the page", "until the result satisfies the user"). They become a problem only when they implicitly criticise an old path ("...there was no way to fix it without re-running the entire flow from scratch") -- which is already covered by the broader rule "do not describe before-vs-after in the recap".
+  - No code identifiers: no file paths, no function/class/variable names, no CLI flags, no inline code. Also forbidden: any internal field name or section label from this prompt or the data model (e.g. "decisions field", "topic count", "importance label", "recap block", "word ceiling", "trailing mention"). Also forbidden: references to how the generator works internally ("before labeling", "after parsing", "the tool decides", "marked as major"). The test: a colleague who uses the product but has never seen this codebase or this prompt should understand every sentence.
+  - User-facing names ARE allowed and encouraged: product names, page names ("the login page"), feature names ("article reordering"), and widely-recognized UI element names ("the sidebar", "the Settings panel").
+  - Meta-commits (changes to internal rules, prompts, configuration, or generation behavior the user does not directly interact with): describe the user-VISIBLE consequence -- what the user will see in future output or product behavior -- NOT the internal rule that changed. Translate mechanism statements like "the recap is now generated after the topic list" into user-facing outcomes like "future commit summaries will read more clearly: each recap covers fewer topics in greater depth". If you cannot identify a visible consequence for the user, this change may not warrant a recap at all.
+  - Paragraph balance: when the recap has multiple paragraphs, each paragraph MUST contain at least 2 sentences. Single-sentence paragraphs alongside longer ones produce a fragmented finish -- expand the short one with concrete detail, or merge it into an adjacent paragraph. (A whole-recap-of-one-sentence is still fine for trivial single-change commits.)
+  - Self-check (mandatory): before finalizing your output, mentally scan each sentence of your draft recap for the forbidden connectives listed above. For every match, rewrite that sentence to state only the visible outcome and drop the comparison/causation clause entirely. The lost information either belongs in the decisions field or should not be in the recap at all. If you have not done this scan, your output is not ready.
+  - The consolidated recap describes ONLY `importance: major` topics. `importance: minor` topics (routine formatting, config tweaks, version bumps, doc-only changes) MUST NOT be mentioned in the recap, not even briefly -- they survive in the topics list; the recap is reserved for major-work narrative.
+  - Lead with what changed most visibly or impactfully; weave related points into flowing paragraphs. Do NOT write one sentence per topic -- that produces a fragmented list, not a narrative.
+  - When ALL post-merge topics are `importance: minor`, omit the `---RECAP---` section entirely (the topics list alone communicates routine work).
+  - Because the recap is emitted AFTER all topics, you can verify your major/minor selection by literal lookback: scan your own preceding output for each topic's `---IMPORTANCE---` line and include only the `major` ones. Do NOT copy verbatim from any single source recap; the consolidated recap MUST be a fresh synthesis driven by the `major` topics you just emitted, not by which input recap looked most comprehensive.
+  - Deduplicate iterations: describe the FINAL state only, not the iteration history. If an earlier recap says a button was added and a later recap says it was renamed with a confirmation dialog, the consolidated recap describes the button in its final form.
+  - When source iteration represents a substantive technical evolution (algorithm change, library swap, scope pivot), do NOT describe the path here -- that belongs in DECISIONS per rule 6's evolution sub-rule. RECAP is for final-state user-facing prose; the X-over-Y trade-off path lives in the structured decisions field.
+  - Describe net effects (subject to rule 4's evidence requirement).
+  - Flowing prose only. NO bullet lists, NO headings, NO markdown.
+  - Do NOT restate the squash commit message verbatim. Add information a reader cannot get from the commit message alone.
+
+  Recap anti-patterns (do NOT write like this):
+  - BAD: "The way the tool selects topics was overhauled, so it can look back at what was already marked as major rather than guessing ahead."
+    Why bad: subject "the tool" anthropomorphizes the generator; "so" + "rather than" are causal connectives explaining WHY/HOW; "marked as major" is implementation-level vocabulary.
+  - BAD: "The recap block was moved after the topics, which means the LLM no longer needs to anticipate the importance label."
+    Why bad: "the LLM" forbidden subject; "the recap block" / "importance label" are internal field names; "which means" explains mechanism.
+  - GOOD: "Future commit summaries will be easier to read: each recap now focuses on the two or three most impactful changes and explains them in real depth. Single-line summaries of every topic are gone. Routine cleanup work no longer appears in the recap at all."
+    Why good: subject is the user-visible artefact ("future commit summaries"); describes WHAT the user will see; no internal vocabulary; no forbidden causal/contrastive connectives.
+
+2. Consolidate topics about the same feature or user goal. If commit A introduced feature X and commit B later changed how feature X works, produce ONE topic that describes feature X in its final state. Describe the outcome, not the iteration history.
+
+3. Drop superseded work, but preserve partial survivors:
+   - If commit A added code that commit B **completely** removed (no surviving net effect), do NOT emit a topic about it -- a reviewer does not care about the churn.
+   - If commit B only **partially** modified A's addition (kept some, removed some, refactored some), emit ONE topic describing the surviving net effect. Don't drop the whole topic just because part of it was reverted.
+   - "Completely removed" is a high bar -- requires explicit evidence per rule 4. When in doubt, keep the topic and describe the surviving state.
+
+4. Evidence requirement for supersede / merge (governs rules 2 and 3):
+   - Only drop or merge a source topic when the source content EXPLICITLY signals it. Concrete signals to look for:
+     - A later source topic's title / decisions / trigger / response uses words like: "replaces", "renames", "removes", "supersedes", "reverts", "rolled back", "no longer needed", "undid", "deleted", "abandoned", "discarded", "obsoleted".
+     - A later recap describes earlier work as "reworked", "rewritten", "scrapped", "thrown away", "replaced with", "moved to a different approach".
+     - A later decision bullet explicitly compares to the earlier choice ("**Y over the previous X**", "**Switched from X to Y because...**").
+   - Do NOT infer supersede from commit ordering alone, from shared file paths, from shared identifiers, or from surface similarity. Two topics touching the same file may be orthogonal additions; two topics named similarly may address different goals.
+   - When evidence is ambiguous, KEEP both topics. The cost of a redundant topic is lower than the cost of dropping a real one.
+
+5. Preserve independent topics as-is. When a source topic has no peer covering the same goal, carry it forward with minimal editing -- rewriting only to improve consistency with the other consolidated topics (never for its own sake). Every edit is a chance to lose information.
+
+6. Decisions are the highest-value field. When merging topics, combine their decisions into one bulleted list with the most important trade-offs:
+  - Deduplicate overlapping points; prefer the richer phrasing; never paraphrase away specifics like "chose X over Y because Z".
+  - When source topics document an EVOLUTION of approach (e.g. an earlier commit used A, a later commit switched to B), preserve it as ONE bullet that captures both the final choice and the path: "**B over A**: tried A first, hit constraint X, switched to B which avoids X while preserving Y." This is more informative than either source's bullet alone, and avoids the failure mode of either dropping the earlier rationale or emitting two contradictory bullets.
+  - Maximum 5 bullets per topic (note: this is intentionally higher than the 3-bullet cap in the summarize prompt -- squash aggregates decisions from multiple commits). Pick the 5 with highest impact and drop the rest -- lower-impact decisions you don't pick simply don't appear, that's the intended trade-off. Use 2-4 sentences per bullet to actually explain the trade-off (depth over breadth). When there is exactly one decision, write it as plain prose -- no bullet, no bold label. One decision is fine; one bullet is a formatting error.
+
+7. Todo handling on merge:
+   - If a source topic's todo was addressed by a later commit in this squash (under rule 4's evidence standard), DROP that todo.
+   - If a source topic's todo is still relevant to the final state, carry it forward.
+   - Merge multiple surviving todos into a single todo field as a bulleted list.
+
+8. filesAffected handling on merge: union the file lists of the merged topics, then trim to the 2-6 most important files as defined by the summarize rule. Exclude test files, lockfiles, generated files, and config snapshots. If the merged topic touches only 1 non-test file, list just that file.
+
+9. category and importance: when merging, pick the highest-importance ("major" beats "minor") and the category that best reflects the consolidated work (prefer the later commit's category on ties).
+
+10. The narrative fields (title, trigger, decisions) are read by everyone -- write them for a colleague who uses the product but has never read this codebase. Use plain language: no file paths, no function/class/variable names, no code snippets, no CLI flags, and no implementation-level terms that only make sense if you have seen the code. The test: a product manager or designer should understand every sentence in these fields without needing an explanation. The detail fields (response, todo, filesAffected) MAY use technical identifiers.
+
+11. Topic count is determined by what survives consolidation, NOT by an arbitrary range. The upper bound is the union of distinct source topics after rules 2-4 merge duplicates and drop superseded work. Every independent topic from sources MUST be carried forward (per rule 5) -- do not drop independent topics just to keep the count small. There is no artificial cap; squashes spanning diverse work may produce 10+ topics if sources warrant it. The only floor is rule 15: if every source topic is trivial, zero topics is correct.
+
+12. Use the source chronology authoritatively. Commit 1 is the oldest, Commit N is the newest. When evaluating overlap (rules 2 / 3 / 4):
+  - When a topic from an earlier commit is contradicted, replaced, or refined by a later commit (under rule 4's evidence standard), the LATER version represents the final state -- describe that.
+  - When an early-commit topic has no peer in later commits, it has not been touched again; carry it forward unchanged.
+  - Treat each source topic's apparent age as a hint, not a reason to drop it. "Old" alone is not evidence of being outdated -- only explicit supersede signals from later sources are.
+
+13. Do NOT invent new information. The source topics and recaps contain all that is known -- your job is reorganization, deduplication, and narration, not analysis.
+
+14. ticketId: extract from the squash commit message or any source topic's context. If multiple tickets appear, prefer the one on the squash commit message. Output canonical uppercase form. Omit the field entirely if no ticket is referenced.
+
+15. Return ONLY the delimited text starting with the `===SUMMARY===` sentinel. No JSON, no markdown fences, no prose before or after. If every source topic is trivial and none have substantive decisions (e.g. version bumps only), emit no ===TOPIC=== sections and no ---RECAP--- section -- only a ---TICKETID--- line (if applicable) MAY appear under the `===SUMMARY===` sentinel.
+
+16. Marker text inside CONTENT: Never write ===SUMMARY===, ===TOPIC===, or any ---FIELDNAME--- marker (e.g., ---TITLE---, ---RECAP---, ---DECISIONS---, ---TICKETID---) inside the content of a field. If you need to reference these markers in prose, describe them in words (e.g., "the topic delimiter", "the title field"). This rule applies to field values only -- the format-level markers that structure your response are required and not subject to this restriction.
+
+17. Trigger field on merged topics: When merging multiple source topics into one (per rule 2), the merged topic's TRIGGER should reflect the EARLIEST source's trigger -- the original problem that prompted the work, not the iteration context. The follow-up commits' trigger contexts (which typically describe "extending" or "fixing edge case in" the earlier work) are downstream effects; their rationale belongs in DECISIONS per rule 6's evolution sub-rule, not in the trigger field. Goal: a reader sees "what user need started this" in TRIGGER, "what's there now" in RESPONSE, and "what trade-offs along the way" in DECISIONS.
+
+18. Topic ordering: emit topics in two-key sort order:
+    - Primary key: importance descending. "major" topics appear before "minor" topics.
+    - Secondary key: source chronology newest-first. Among topics of equal importance, the topic from the most recent source commit appears first; topics merged from multiple sources use the latest contributing commit's date as their position.
+    This matches the summarize prompt's "git log style" ordering applied to consolidated work, so a reviewer scanning top-down sees the most impactful and most recent work first.
+
+## Begin response now
+
+Output ONLY the delimited text starting with the `===SUMMARY===` sentinel. Do NOT preface it with markdown headers, markdown tables, code fences, or prose. If every source topic is trivial and there is nothing substantive to emit (per rule 15), output `===SUMMARY===` alone on its own line and stop."""
+    }
+
+    /**
+     * Calls the LLM to consolidate topics + recap across squashed source commits.
+     * Returns a discriminated outcome: Ok (use LLM result), NoContent (use mechanical
+     * fallback), or LlmError (use mechanical fallback + mark error).
+     *
+     * Ported from CLI Summarizer.ts generateSquashConsolidation.
+     */
+    fun generateSquashConsolidation(
+        sources: List<SquashConsolidationSource>,
+        squashCommitMessage: String,
+        ticketId: String? = null,
+        apiKey: String? = null,
+        model: String? = null,
+        jolliApiKey: String? = null,
+        aiProvider: String? = null,
+    ): SquashConsolidationOutcome {
+        if (sources.isEmpty()) {
+            return SquashConsolidationOutcome.NoContent
+        }
+
+        val allEmpty = sources.all { it.topics.isEmpty() && it.recap == null }
+        if (allEmpty) {
+            return SquashConsolidationOutcome.NoContent
+        }
+
+        val sourceCommitsBlock = formatSourceCommitsForSquash(sources)
+        val sortedSources = sources.sortedBy { it.commitDate }
+        val ticketLine = ticketId
+            ?: sortedSources.firstOrNull { it.ticketId != null }?.ticketId
+            ?: "No ticket associated"
+
+        val prompt = buildSquashConsolidationPrompt(squashCommitMessage, ticketLine, sourceCommitsBlock)
+        val proxyParams = mapOf(
+            "squashMessage" to squashCommitMessage,
+            "ticketLine" to ticketLine,
+            "sourceCommitsBlock" to sourceCommitsBlock,
+        )
+
+        // First attempt
+        val result = try {
+            LlmClient.callLlm(
+                action = "squash-consolidate",
+                params = proxyParams,
+                apiKey = apiKey,
+                jolliApiKey = jolliApiKey,
+                model = resolveModelId(model),
+                maxTokens = DEFAULT_MAX_TOKENS,
+                prompt = prompt,
+                aiProvider = aiProvider,
+            )
+        } catch (ex: Exception) {
+            try {
+                LlmClient.callLlm(
+                    action = "squash-consolidate",
+                    params = proxyParams,
+                    apiKey = apiKey,
+                    jolliApiKey = jolliApiKey,
+                    model = resolveModelId(model),
+                    maxTokens = DEFAULT_MAX_TOKENS,
+                    prompt = prompt,
+                    aiProvider = aiProvider,
+                )
+            } catch (ex2: Exception) {
+                log.error("generateSquashConsolidation retry failed: %s", ex2.message)
+                return SquashConsolidationOutcome.LlmError
+            }
+        }
+
+        val responseText = result.text ?: ""
+        val parsed = parseSummaryResponse(responseText)
+
+        val llm = LlmCallMetadata(
+            model = result.model ?: resolveModelId(model),
+            inputTokens = result.inputTokens,
+            outputTokens = result.outputTokens,
+            apiLatencyMs = result.apiLatencyMs,
+            stopReason = result.stopReason,
+            source = result.source,
+        )
+
+        if (parsed.topics.isNotEmpty() || parsed.recap != null) {
+            val resolvedTicketId = ticketId
+                ?: sortedSources.firstOrNull { it.ticketId != null }?.ticketId
+                ?: parsed.ticketId
+            return SquashConsolidationOutcome.Ok(SquashConsolidationResult(
+                topics = parsed.topics,
+                recap = parsed.recap,
+                ticketId = resolvedTicketId,
+                llm = llm,
+            ))
+        }
+
+        return SquashConsolidationOutcome.NoContent
+    }
+
+    /**
+     * Mechanical fallback: concatenates all source topics (oldest-first) and
+     * joins recaps. No dedup or consolidation — complete but unconsolidated.
+     */
+    fun mechanicalConsolidate(
+        sources: List<SquashConsolidationSource>,
+        outerTicketId: String? = null,
+    ): Triple<List<TopicSummary>, String?, String?> {
+        val sorted = sources.sortedBy { it.commitDate }
+        val topics = sorted.flatMap { it.topics }
+        val recaps = sorted.mapNotNull { it.recap }
+        val recap = recaps.joinToString("\n\n").takeIf { it.isNotEmpty() }
+        val resolvedTicketId = outerTicketId ?: sorted.firstOrNull { it.ticketId != null }?.ticketId
+        return Triple(topics, recap, resolvedTicketId)
+    }
+
     // ── Squash Message Generation ──────────────────────────────────────────
 
     /** Generates a squash commit message from multiple commits' summaries. */
