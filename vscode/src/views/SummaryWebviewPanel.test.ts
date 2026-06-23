@@ -406,6 +406,27 @@ vi.mock("./BranchSummaryLoader.js", () => ({
 	loadBranchSummaries: mockLoadBranchSummaries,
 }));
 
+// `CreatePrBranchClassifier` (used by the PR guard) calls these two read-only
+// git helpers. Default: the summary's branch still exists (→ crossBranch when
+// it differs from the current branch, preserving the legacy cross-branch
+// block); rename/successor tests override `mockOrphanBranchExists` → false and
+// `mockIsAncestor` → true. Only the real functions are replaced; the rest of
+// GitOps stays intact.
+const { mockOrphanBranchExists, mockIsAncestor } = vi.hoisted(() => ({
+	mockOrphanBranchExists: vi.fn().mockResolvedValue(true),
+	mockIsAncestor: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../../../cli/src/core/GitOps.js", async (importActual) => {
+	const actual =
+		await importActual<typeof import("../../../cli/src/core/GitOps.js")>();
+	return {
+		...actual,
+		orphanBranchExists: mockOrphanBranchExists,
+		isAncestor: mockIsAncestor,
+	};
+});
+
 const { mockBuildAggregatedPrMarkdown } = vi.hoisted(() => ({
 	mockBuildAggregatedPrMarkdown: vi.fn().mockReturnValue("# Aggregated body"),
 }));
@@ -3685,6 +3706,10 @@ describe("SummaryWebviewPanel", () => {
 					"feature/test",
 					"https://github.com/other/repo.git",
 				);
+				// Foreign summaries belong to a different repo — the local-workspace
+				// branch classifier must NOT run for them.
+				expect(mockOrphanBranchExists).not.toHaveBeenCalled();
+				expect(mockIsAncestor).not.toHaveBeenCalled();
 			});
 
 			it("forwards postMessage callback to the webview panel", async () => {
@@ -3703,9 +3728,14 @@ describe("SummaryWebviewPanel", () => {
 		});
 
 		describe("createPr", () => {
-			it("delegates to handleCreatePr, passing summary.branch", async () => {
+			it("delegates to handleCreatePr, passing the prepare-time effective branch", async () => {
+				// Realistic flow: prepareCreatePr resolves and stashes the effective
+				// branch (here same-branch → "feature/test"), then the form's submit
+				// fires createPr, which forwards that stashed branch as expectedBranch.
 				const dispatch = await setupPanel();
 
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
 				dispatch({ command: "createPr", title: "PR Title", body: "PR Body" });
 				await flushPromises();
 
@@ -3715,6 +3745,35 @@ describe("SummaryWebviewPanel", () => {
 					workspaceRoot,
 					expect.any(Function),
 					"feature/test",
+				);
+			});
+
+			it("renamed branch end-to-end: prepare→submit forwards the CURRENT branch (not the stale summary branch) as expectedBranch", async () => {
+				// Core promise of the fix: after `git branch -m old new`, the value
+				// threaded into handleCreatePr must be the live "feature/new", never
+				// the stale "feature/old". The same-branch delegation test can't catch
+				// a regression to the stale branch because there old === new.
+				mockOrphanBranchExists.mockResolvedValueOnce(false); // old ref gone
+				mockIsAncestor.mockResolvedValueOnce(true); // its commit is on HEAD
+				(
+					stubBridge.getCurrentBranch as ReturnType<typeof vi.fn>
+				).mockResolvedValueOnce("feature/new");
+				const dispatch = await setupPanel({
+					branch: "feature/old",
+					commitHash: "abc123",
+				});
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+				dispatch({ command: "createPr", title: "T", body: "B" });
+				await flushPromises();
+
+				expect(mockHandleCreatePr).toHaveBeenCalledWith(
+					"T",
+					"B",
+					workspaceRoot,
+					expect.any(Function),
+					"feature/new",
 				);
 			});
 
@@ -3997,6 +4056,62 @@ describe("SummaryWebviewPanel", () => {
 					expect.stringContaining("Checkout HEAD"),
 				);
 			});
+
+			it("renamed branch (old ref gone + current carries the commit): allows Create PR, scoped to the current branch", async () => {
+				// `git branch -m old new`: the old ref is gone but its commit is on
+				// the current branch, so the classifier returns okAsCurrent and the
+				// form opens instead of dead-ending on "Checkout old".
+				mockOrphanBranchExists.mockResolvedValueOnce(false);
+				mockIsAncestor.mockResolvedValueOnce(true);
+				(
+					stubBridge.getCurrentBranch as ReturnType<typeof vi.fn>
+				).mockResolvedValueOnce("feature/new");
+				const dispatch = await setupPanel({
+					branch: "feature/old",
+					commitHash: "abc123",
+				});
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+
+				expect(postMessage).not.toHaveBeenCalledWith(
+					expect.objectContaining({ command: "prCreateBlockedCrossBranch" }),
+				);
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "prShowCreateForm" }),
+				);
+			});
+
+			it("original branch gone + commit not on current branch: blocks with the 'no longer exists' message", async () => {
+				// Deleted branch + switched to an unrelated branch, OR rename+rebase
+				// that rewrote the hash. The commit isn't reachable from HEAD, so we
+				// can't attribute the PR to the current branch.
+				mockOrphanBranchExists.mockResolvedValueOnce(false);
+				mockIsAncestor.mockResolvedValueOnce(false);
+				(
+					stubBridge.getCurrentBranch as ReturnType<typeof vi.fn>
+				).mockResolvedValueOnce("feature/new");
+				const dispatch = await setupPanel({
+					branch: "feature/old",
+					commitHash: "abc123",
+				});
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "prCreateBlockedCrossBranch",
+					summaryBranch: "feature/old",
+					currentBranch: "feature/new",
+				});
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("no longer exists"),
+				);
+				expect(postMessage).not.toHaveBeenCalledWith(
+					expect.objectContaining({ command: "prShowCreateForm" }),
+				);
+				expect(mockLoadBranchSummaries).not.toHaveBeenCalled();
+			});
 		});
 
 		describe("prepareUpdatePr", () => {
@@ -4137,9 +4252,13 @@ describe("SummaryWebviewPanel", () => {
 		});
 
 		describe("updatePr", () => {
-			it("delegates to handleUpdatePr, passing summary.branch", async () => {
+			it("delegates to handleUpdatePr, passing the prepare-time effective branch", async () => {
+				// prepareUpdatePr resolves + stashes the effective branch (same-branch
+				// → "feature/test"); the form's submit then forwards it to handleUpdatePr.
 				const dispatch = await setupPanel();
 
+				dispatch({ command: "prepareUpdatePr" });
+				await flushPromises();
 				dispatch({ command: "updatePr", title: "Updated", body: "Body" });
 				await flushPromises();
 
@@ -4149,6 +4268,33 @@ describe("SummaryWebviewPanel", () => {
 					workspaceRoot,
 					expect.any(Function),
 					"feature/test",
+				);
+			});
+
+			it("renamed branch end-to-end: prepare→submit forwards the CURRENT branch to handleUpdatePr", async () => {
+				// Edit PR is branch-name-routed; after a rename it must target the
+				// renamed-to "feature/new", matching what the status section displays.
+				mockOrphanBranchExists.mockResolvedValueOnce(false);
+				mockIsAncestor.mockResolvedValueOnce(true);
+				(
+					stubBridge.getCurrentBranch as ReturnType<typeof vi.fn>
+				).mockResolvedValueOnce("feature/new");
+				const dispatch = await setupPanel({
+					branch: "feature/old",
+					commitHash: "abc123",
+				});
+
+				dispatch({ command: "prepareUpdatePr" });
+				await flushPromises();
+				dispatch({ command: "updatePr", title: "T", body: "B" });
+				await flushPromises();
+
+				expect(mockHandleUpdatePr).toHaveBeenCalledWith(
+					"T",
+					"B",
+					workspaceRoot,
+					expect.any(Function),
+					"feature/new",
 				);
 			});
 

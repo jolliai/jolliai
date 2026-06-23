@@ -1598,6 +1598,9 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "push") {
 					throw new Error("push denied");
 				}
+				if (cmd === "git" && args[0] === "rev-parse") {
+					return { stdout: "branch\n" };
+				}
 				return { stdout: "" };
 			});
 
@@ -1615,6 +1618,9 @@ describe("PrCommentService", () => {
 			setupExecFile((cmd, args) => {
 				if (cmd === "git" && args[0] === "push") {
 					throw "string-only rejection";
+				}
+				if (cmd === "git" && args[0] === "rev-parse") {
+					return { stdout: "branch\n" };
 				}
 				return { stdout: "" };
 			});
@@ -1663,14 +1669,16 @@ describe("PrCommentService", () => {
 			expect(uriParse).toHaveBeenCalledWith(prUrl);
 		});
 
-		// ── Cross-branch guard (Memory Bank) ─────────────────────────────────
+		// ── Submit-time branch guard (TOCTOU second line) ────────────────────
 		//
-		// When the user is viewing a summary on branch X while checked out on
-		// branch Y, `git push -u origin HEAD` would push Y's commits to X's PR
-		// — silently wrong. The service-side guard must reject before any
-		// push/create runs.
+		// The panel decides the effective branch when the form opens and passes
+		// it as `expectedBranch`. `git push -u origin HEAD` pushes whatever is
+		// checked out at submit, so if the user switched branches between
+		// opening and submitting (e.g. away from the summary's branch), the
+		// service must reject before any push/create — never push a different
+		// branch's HEAD onto this PR.
 
-		it("cross-branch: rejects with prCreateBlockedCrossBranch and skips push/create when summaryBranch differs from currentBranch", async () => {
+		it("branch changed since prepare: rejects with prCreateBlockedCrossBranch and skips push/create when expectedBranch differs from currentBranch", async () => {
 			let gitPushCalled = false;
 			let prCreateCalled = false;
 			setupExecFile(
@@ -1743,6 +1751,88 @@ describe("PrCommentService", () => {
 			expect(postMessage).toHaveBeenCalledWith({ command: "prCreating" });
 			expect(postMessage).not.toHaveBeenCalledWith(
 				expect.objectContaining({ command: "prCreateBlockedCrossBranch" }),
+			);
+		});
+
+		it("detached HEAD: blocks with the shared 'cannot determine the current branch' message, not prCreateFailed", async () => {
+			let gitPushCalled = false;
+			setupExecFile(
+				buildRouter({
+					// `git rev-parse --abbrev-ref HEAD` returns the literal "HEAD"
+					// in detached state.
+					"git:rev-parse": () => ({ stdout: "HEAD\n" }),
+					"git:push": () => {
+						gitPushCalled = true;
+						return { stdout: "" };
+					},
+				}),
+			);
+
+			await handleCreatePr("T", "B", CWD, postMessage, "feature/x");
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prCreateBlockedCrossBranch",
+				summaryBranch: "feature/x",
+				currentBranch: "HEAD",
+			});
+			expect(postMessage).not.toHaveBeenCalledWith({ command: "prCreating" });
+			expect(postMessage).not.toHaveBeenCalledWith({
+				command: "prCreateFailed",
+			});
+			expect(gitPushCalled).toBe(false);
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Cannot determine the current branch"),
+			);
+		});
+
+		it("git error reading the branch: normalized to detached block, not prCreateFailed", async () => {
+			// A hard git failure (.git/index.lock, permission) makes the branch
+			// read throw. getCurrentBranchSafe normalizes it to the "HEAD"
+			// sentinel so it lands on the detached block rather than the outer
+			// catch → prCreateFailed.
+			let gitPushCalled = false;
+			setupExecFile(
+				buildRouter({
+					"git:rev-parse": () => {
+						throw new Error("fatal: unable to read HEAD");
+					},
+					"git:push": () => {
+						gitPushCalled = true;
+						return { stdout: "" };
+					},
+				}),
+			);
+
+			await handleCreatePr("T", "B", CWD, postMessage, "feature/x");
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prCreateBlockedCrossBranch",
+				summaryBranch: "feature/x",
+				currentBranch: "HEAD",
+			});
+			expect(postMessage).not.toHaveBeenCalledWith({
+				command: "prCreateFailed",
+			});
+			expect(gitPushCalled).toBe(false);
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Cannot determine the current branch"),
+			);
+		});
+
+		it("detached HEAD with no expectedBranch: blocks with an empty summaryBranch field", async () => {
+			setupExecFile(
+				buildRouter({ "git:rev-parse": () => ({ stdout: "HEAD\n" }) }),
+			);
+
+			await handleCreatePr("T", "B", CWD, postMessage);
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prCreateBlockedCrossBranch",
+				summaryBranch: "",
+				currentBranch: "HEAD",
+			});
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Cannot determine the current branch"),
 			);
 		});
 	});
