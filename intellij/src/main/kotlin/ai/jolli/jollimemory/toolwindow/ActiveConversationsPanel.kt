@@ -51,7 +51,12 @@ class ActiveConversationsPanel(
 	private val statusListener: () -> Unit = { refresh() }
 
 	private val pollTimer = Timer(60_000) {
-		if (isShowing) refresh()
+		if (isShowing) {
+			refresh()
+			// JOLLI-1785: piggyback the 60s tick to flush buffered telemetry.
+			// Best-effort; the helper swallows errors and no-ops on an empty buffer.
+			project.basePath?.let { ai.jolli.jollimemory.core.telemetry.TelemetryActivation.flushNow(it) }
+		}
 	}.apply { isRepeats = true }
 
 	init {

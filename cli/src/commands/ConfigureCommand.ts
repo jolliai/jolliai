@@ -9,6 +9,7 @@ import { join } from "node:path";
 import type { Command } from "commander";
 import { validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { getGlobalConfigDir, loadConfig, saveConfig } from "../core/SessionTracker.js";
+import { track } from "../core/Telemetry.js";
 import { createLogger } from "../Logger.js";
 import type { JolliMemoryConfig, LogLevel } from "../Types.js";
 
@@ -263,6 +264,9 @@ export function registerConfigureCommand(program: Command): void {
 				}
 
 				await saveConfig(update as Partial<JolliMemoryConfig>);
+				if (typeof update.aiProvider === "string") {
+					track("ai_provider_selected", { provider: update.aiProvider });
+				}
 				console.log(`\n  Config updated: ${join(getGlobalConfigDir(), "config.json")}\n`);
 				return;
 			}

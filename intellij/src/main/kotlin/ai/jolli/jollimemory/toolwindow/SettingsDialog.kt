@@ -10,6 +10,7 @@ import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
+import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
@@ -23,6 +24,7 @@ import com.intellij.openapi.util.Disposer
 import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPasswordField
+import com.intellij.ui.HyperlinkLabel
 import com.intellij.ui.components.JBTabbedPane
 import com.intellij.ui.components.JBTextField
 import com.intellij.util.ui.FormBuilder
@@ -101,6 +103,8 @@ class SettingsDialog(
     private val copilotEnabledCheckbox = JBCheckBox("GitHub Copilot — CLI session-store scan + VS Code Chat workspace storage", true)
     private val excludePatternsField = JBTextField()
     private val pauseCheckbox = JBCheckBox("Pause Jolli Memory (temporarily disable hooks without losing configuration)")
+    private val telemetryCheckbox =
+        JBCheckBox("Send anonymous usage telemetry (content-free — never code, paths, or memory content)", true)
 
     // ── State ──────────────────────────────────────────────────────────────
     private var savedAnthropicKey: String = ""
@@ -117,6 +121,7 @@ class SettingsDialog(
     init {
         title = "Jolli Memory Settings"
         setOKButtonText("Apply Changes")
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track("settings_opened", mapOf("tab" to "general"))
         init()
         loadSettings()
 
@@ -479,6 +484,21 @@ class SettingsDialog(
             .addTooltip("Uninstalls hooks while preserving all settings. Unpause to re-enable.")
             .panel))
 
+        // Privacy / telemetry consent (JetBrains Marketplace guideline 2.2).
+        panel.add(Box.createVerticalStrut(12))
+        panel.add(JBLabel("<html><b>Privacy</b></html>").apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            border = JBUI.Borders.emptyBottom(2)
+        })
+        panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
+            .addComponent(telemetryCheckbox, 4)
+            .addTooltip("Anonymous, opt-out usage data to improve Jolli Memory. Also honors the IDE's data-sharing setting.")
+            .panel))
+        panel.add(HyperlinkLabel("Privacy & telemetry details").apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            setHyperlinkTarget("https://jolli.ai/telemetry")
+        })
+
         return wrapTabContent(panel)
     }
 
@@ -676,6 +696,19 @@ class SettingsDialog(
             syncPollIntervalSec = pollIntervalField.text.trim().toIntOrNull(),
         )
         SessionTracker.saveConfigToDir(config, configDir)
+        // Telemetry opt-out lives in the shared config.json (machine-global, cross-surface).
+        // Apply the choice to the LIVE Telemetry context too, so it takes effect this session
+        // (parity with the first-run balloon's "Turn off" and the VS Code toggle) rather than
+        // only after the next IDE restart.
+        ai.jolli.jollimemory.core.telemetry.TelemetrySharedConfig.setTelemetry(telemetryCheckbox.isSelected)
+        if (telemetryCheckbox.isSelected) {
+            project.basePath?.let { ai.jolli.jollimemory.core.telemetry.TelemetryActivation.bootstrap(it) }
+        } else {
+            ai.jolli.jollimemory.core.telemetry.Telemetry.shutdown()
+        }
+        if (provider != null) {
+            ai.jolli.jollimemory.core.telemetry.Telemetry.track("ai_provider_selected", mapOf("provider" to provider))
+        }
 
         // Check if any LLM credential is available (matches LlmClient fallback chain)
         val hasCredentials = !config.apiKey.isNullOrBlank() ||
@@ -771,6 +804,9 @@ class SettingsDialog(
         cursorEnabledCheckbox.isSelected = config.cursorEnabled != false
         copilotEnabledCheckbox.isSelected = config.copilotEnabled != false
         pauseCheckbox.isSelected = config.paused == true
+        // Telemetry: on unless the shared opt-out flag says "off" (default on).
+        telemetryCheckbox.isSelected =
+            ai.jolli.jollimemory.core.telemetry.TelemetrySharedConfig.telemetryFlag() != "off"
 
         // Memory Bank
         val projectPath = service.mainRepoRoot ?: project.basePath ?: ""

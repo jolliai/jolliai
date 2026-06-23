@@ -63,6 +63,7 @@ import {
 	loadConfig,
 	loadCursorForTranscript,
 	loadPlansRegistry,
+	markAiSourceSeen,
 	saveCursor,
 	savePlansRegistry,
 } from "../core/SessionTracker.js";
@@ -93,6 +94,8 @@ import {
 	stripFunctionalMetadata,
 } from "../core/SummaryStore.js";
 import { resolveTranscriptIdsFiltered } from "../core/SummaryTree.js";
+import { getTelemetryContext, track } from "../core/Telemetry.js";
+import { bootstrapTelemetry, flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { generateTranscriptId } from "../core/TranscriptId.js";
 import { getParserForSource } from "../core/TranscriptParser.js";
 import type { SessionTranscript } from "../core/TranscriptReader.js";
@@ -305,6 +308,7 @@ export function buildWorkerStartupBanner(info: {
  */
 export async function runWorker(cwd: string, force = false): Promise<void> {
 	setLogDir(cwd);
+	const drainStart = Date.now();
 
 	/* v8 ignore start -- compile-time global fallbacks: vite (tests) and esbuild (builds) always define these three, so the `: "…"` arms are unreachable from unit tests; mirrors ClientHeader.ts */
 	const kind = typeof __JOLLI_CLIENT_KIND__ !== "undefined" ? __JOLLI_CLIENT_KIND__ : "cli";
@@ -539,6 +543,7 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 
 			if (processedCount > 0) {
 				log.info("Processed %d queue entries", processedCount);
+				track("queue_drained", { ops: processedCount, duration_ms: Date.now() - drainStart });
 			}
 
 			// SP3 — a commit just landed, so debounce-trigger a repo-wide topic-KB
@@ -2815,6 +2820,15 @@ async function readAllTranscripts(
 		const startLine = cursor?.lineNumber ?? 0;
 		const source = session.source ?? "claude";
 
+		// JOLLI-1785: fire ai_source_detected the first time this machine ever
+		// processes a transcript from `source` (markAiSourceSeen dedupes globally,
+		// so it never re-fires on later runs and can't skew the AI-source-mix view).
+		// Gated on telemetry being enabled so an opted-out/uninitialized run never
+		// writes the seen-sources ledger (also keeps it out of unit tests).
+		if (getTelemetryContext()?.enabled && (await markAiSourceSeen(source))) {
+			track("ai_source_detected", { source });
+		}
+
 		// Gemini, OpenCode, Cursor, and Copilot use dedicated readers (not JSONL line-based parsing).
 		// Every reader is wrapped in try/catch + `continue` so one bad session never abandons the
 		// rest of the batch. SQLite-backed readers (opencode/cursor/copilot) fail on transient
@@ -2971,10 +2985,22 @@ if (isMainScript()) {
 		const cwdIndex = args.indexOf("--cwd");
 		const cwd = cwdIndex >= 0 && args[cwdIndex + 1] ? args[cwdIndex + 1] : process.cwd();
 
-		runWorker(cwd).catch((error: unknown) => {
-			console.error("[QueueWorker] Fatal error:", error);
-			process.exit(1);
-		});
+		// Bootstrap telemetry first so ingest-path track() calls (ingest_completed,
+		// error_occurred) emit in this worker process, then drain, then flush the
+		// buffer once the drain completes — the long-lived worker is the natural
+		// send point for events that short-lived CLI / hook invocations only
+		// buffered. All best-effort; never blocks exit on a telemetry error.
+		bootstrapTelemetry({ cwd })
+			.then(() => runWorker(cwd))
+			.then(() => flushTelemetryNow(cwd))
+			.catch((_error: unknown) => {
+				// Log a static message only — never anything derived from the error.
+				// In the flush/sync chain an error can carry a jolliApiKey (e.g. in
+				// request headers), so nothing error-derived may reach the log sink
+				// (CodeQL js/clear-text-logging).
+				console.error("[QueueWorker] Fatal error: worker bootstrap/drain failed.");
+				process.exit(1);
+			});
 	}
 }
 /* v8 ignore stop */

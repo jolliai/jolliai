@@ -285,4 +285,12 @@ describe("registerSearchCommand", () => {
 		expect(parsed.message).toContain("mutually exclusive");
 		expect(process.exitCode).toBe(1);
 	});
+
+	it("runs with medium- and long-length queries (telemetry query_len_bucket branches)", async () => {
+		// 20–79 chars → "medium"; ≥80 chars → "long". Both must run the search path
+		// cleanly; the search_performed emit is a no-op (telemetry uninitialized in tests).
+		await runCommand(["a".repeat(40), "--cwd", "/tmp/t"]);
+		await runCommand(["a".repeat(120), "--cwd", "/tmp/t"]);
+		expect(mockSearchHits).toHaveBeenCalled();
+	});
 });

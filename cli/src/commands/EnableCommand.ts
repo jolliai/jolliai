@@ -11,6 +11,7 @@ import { getJolliUrl } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
 import { validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { getGlobalConfigDir, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
+import { track } from "../core/Telemetry.js";
 import { install, uninstall } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { JolliMemoryConfig } from "../Types.js";
@@ -135,6 +136,7 @@ export function registerEnableCommand(program: Command): void {
 			const result = await install(options.cwd, { source: "cli" });
 
 			if (result.success) {
+				track("surface_enabled", { trigger: "cli" });
 				console.log("\n  Jolli Memory enabled successfully!\n");
 				console.log("  Hooks installed:");
 				console.log(`    - Git post-commit hook (${result.gitHookPath ?? ".git/hooks/post-commit"})`);
@@ -153,6 +155,12 @@ export function registerEnableCommand(program: Command): void {
 
 				console.log("\n  IMPORTANT: Restart your AI agent session for the hooks to take effect.");
 				console.log("  Run 'jolli doctor' to verify installation.");
+
+				// Onboarding disclosure: telemetry is opt-out, so state it plainly here
+				// (the once-only first-run banner also covers non-enable first commands).
+				console.log("\n  Telemetry: anonymous, content-free usage data is on by default to improve");
+				console.log("  Jolli Memory (never your code, paths, or memory content). Turn it off with");
+				console.log("  'jolli telemetry off' (or DO_NOT_TRACK=1) · https://jolli.ai/telemetry");
 
 				// Step 2: Interactive API key configuration
 				if (isInteractive() && !options.yes) {
@@ -187,6 +195,7 @@ export function registerDisableCommand(program: Command): void {
 			const result = await uninstall(options.cwd);
 
 			if (result.success) {
+				track("surface_disabled", { reason: "manual" });
 				console.log("\n  Jolli Memory disabled. Hooks removed.\n");
 			} else {
 				console.error(`\n  Error: ${result.message}\n`);

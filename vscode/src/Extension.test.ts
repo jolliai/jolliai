@@ -580,6 +580,7 @@ vi.mock("vscode", () => ({
 		},
 		openExternal,
 		appName: "Visual Studio Code",
+		onDidChangeTelemetryEnabled: vi.fn(() => ({ dispose: vi.fn() })),
 	},
 }));
 
@@ -588,6 +589,9 @@ vi.mock("../../cli/src/core/SessionTracker.js", () => ({
 	getGlobalConfigDir,
 	saveConfig,
 	saveConfigScoped,
+	// Used by the telemetry bootstrap on activate (JOLLI-1785). Returns a stable
+	// id with created=false so no app_installed event fires during activation tests.
+	getOrCreateInstallId: async () => ({ installId: "00000000-0000-4000-8000-000000000000", created: false }),
 }));
 
 vi.mock("../../cli/src/core/SummaryMigration.js", () => ({

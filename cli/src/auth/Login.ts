@@ -13,7 +13,8 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import open from "open";
-import { loadConfig } from "../core/SessionTracker.js";
+import { getOrCreateInstallId, loadConfig } from "../core/SessionTracker.js";
+import { track } from "../core/Telemetry.js";
 import { resolveSignInJolliUrl, saveAuthCredentials, shouldRequestFreshApiKey } from "./AuthConfig.js";
 import { exchangeCliCode } from "./CliExchange.js";
 import { getDeviceLabel } from "./DeviceLabel.js";
@@ -71,6 +72,14 @@ export function browserLogin(jolliUrl: string): Promise<void> {
 					// in one sign-in instead of two).
 					const config = await loadConfig();
 					let loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUrl)}&state=${expectedState}&client=cli&client_version=${encodeURIComponent(CLIENT_VERSION)}`;
+					// JOLLI-1785: carry the anonymous installId through OAuth so the
+					// backend can write the install→account conversion-join row when it
+					// mints the key (it reads `install_id`, strict lowercase UUID, and
+					// records attribution regardless of generate_api_key). This is the
+					// pre-signup funnel's only link between the anonymous identity and
+					// the account the user is about to create.
+					const { installId } = await getOrCreateInstallId();
+					loginUrl += `&install_id=${encodeURIComponent(installId)}`;
 					if (shouldRequestFreshApiKey(config.jolliApiKey, jolliUrl)) {
 						loginUrl += "&generate_api_key=true";
 						// `device_name` scopes the server's per-user idempotency key so
@@ -82,6 +91,8 @@ export function browserLogin(jolliUrl: string): Promise<void> {
 							loginUrl += `&device_name=${encodeURIComponent(deviceLabel)}`;
 						}
 					}
+
+					track("signin_started", { trigger: "cli" });
 
 					console.log("Opening browser to login...");
 					console.log(`If the browser doesn't open automatically, visit: ${loginUrl}`);
@@ -213,6 +224,10 @@ export function createLoginServer(options: LoginServerOptions): Server {
 				return;
 			}
 			await saveAuthCredentials(credentials);
+			// The conversion event. `is_first_signup` is deliberately omitted —
+			// the backend derives it authoritatively (from the account's creation
+			// time) when it writes the join row; the client cannot know it.
+			track("signin_completed", { api_key_minted: Boolean(credentials.jolliApiKey) });
 			sendHtml(res, 200, "Login Successful!", "Your account has been connected to Jolli.");
 			closeServer(server);
 			onSuccess();

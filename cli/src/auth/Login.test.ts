@@ -21,6 +21,7 @@ vi.mock("./AuthConfig.js", async (importActual) => {
 
 vi.mock("../core/SessionTracker.js", () => ({
 	loadConfig: (...args: unknown[]) => mockLoadConfig(...args),
+	getOrCreateInstallId: async () => ({ installId: "11111111-1111-4111-8111-111111111111", created: false }),
 }));
 
 vi.mock("./CliExchange.js", () => ({
@@ -803,6 +804,8 @@ describe("Login", () => {
 			// __PKG_VERSION__ defined, so the fallback "dev" reaches the URL;
 			// what matters is that the param is populated.
 			expect(openedUrl).toMatch(/[?&]client_version=[^&]+/);
+			// JOLLI-1785: installId carried through OAuth for the conversion-join row.
+			expect(openedUrl).toContain("install_id=11111111-1111-4111-8111-111111111111");
 			expect(mockExchangeCliCode).toHaveBeenCalledWith(TEST_JOLLI_URL, "browser-code");
 			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "browser-token", jolliUrl: TEST_JOLLI_URL });
 		});

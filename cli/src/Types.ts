@@ -957,6 +957,34 @@ export interface JolliMemoryConfig {
 	 * always wins" while sounding semantically different to users.
 	 */
 	readonly syncConflictPolicy?: "prompt" | "mine" | "theirs";
+	/**
+	 * Random per-machine UUID minted on first run (JOLLI-1785). The anonymous
+	 * telemetry identity — the conversion funnel's denominator. Stored
+	 * machine-global in `~/.jolli/jollimemory/config.json` so it is ONE
+	 * identity per machine across surfaces (the `surface` field distinguishes
+	 * cli / vscode / intellij). Contains no PII; never derived from anything
+	 * user-controlled. Mint via `getOrCreateInstallId` in `SessionTracker`.
+	 */
+	readonly installId?: string;
+	/**
+	 * Usage-telemetry opt state (JOLLI-1785). Opt-out model: telemetry is on
+	 * unless this is explicitly `"off"`, the platform `DO_NOT_TRACK` signal is
+	 * set, or (VS Code) `telemetry.telemetryLevel` is `"off"`. See
+	 * `TelemetryConsent`.
+	 */
+	readonly telemetry?: "on" | "off";
+	/**
+	 * Set once the loud first-run telemetry notice has been shown on this
+	 * machine, so it is not repeated every run. See `TelemetryConsent`.
+	 */
+	readonly telemetryNoticeShown?: boolean;
+	/**
+	 * AI sources already reported via the `ai_source_detected` telemetry event
+	 * (JOLLI-1785). Machine-global first-seen ledger so the event fires once per
+	 * source per machine rather than on every run — otherwise it would over-count
+	 * and skew the AI-source-mix view. Source names only (e.g. "codex"), no PII.
+	 */
+	readonly telemetrySeenSources?: ReadonlyArray<string>;
 }
 
 /** Result of enable/disable operations */

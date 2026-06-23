@@ -5,6 +5,8 @@ import ai.jolli.jollimemory.auth.JolliConfigStore
 import ai.jolli.jollimemory.auth.JolliUrlConfig
 import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.core.telemetry.Telemetry
+import ai.jolli.jollimemory.core.telemetry.TelemetrySharedConfig
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.intellij.ide.BrowserUtil
@@ -103,11 +105,13 @@ object JolliAuthService {
             // overwrites a manually configured key. Mirrors the CLI's
             // shouldRequestFreshApiKey / VS Code openSignInPage().
             val existingApiKey = SessionTracker.loadConfig().jolliApiKey
+            Telemetry.track("signin_started", mapOf("trigger" to "intellij"))
             val loginUrl = buildLoginUrl(
                 jolliUrl = jolliUrl,
                 callbackUrl = callbackUrl,
                 clientVersion = JolliApiClient.pluginVersion,
                 generateApiKey = JolliAuthUtils.shouldRequestFreshApiKey(existingApiKey, jolliUrl),
+                installId = TelemetrySharedConfig.getOrCreateInstallId().first,
             )
             log.info("Login URL: %s", loginUrl)
 
@@ -184,6 +188,14 @@ object JolliAuthService {
                             JolliConfigStore.saveSpace(result.space)
                         }
 
+                        // Re-resolve telemetry env from the just-saved key so the
+                        // conversion event carries the new tenant's env, not the
+                        // pre-sign-in startup origin's.
+                        ai.jolli.jollimemory.core.telemetry.TelemetryActivation.refreshEnv()
+                        // The conversion event. is_first_signup is omitted — the
+                        // backend derives it authoritatively when it writes the join row.
+                        Telemetry.track("signin_completed", mapOf("api_key_minted" to !result.jolliApiKey.isNullOrBlank()))
+
                         val html = successHtml()
                         sendHtml(exchange, html, 200)
                         notifyAuthListeners()
@@ -228,6 +240,7 @@ object JolliAuthService {
         // (into a different tenant) to the old tenant — sync would keep hitting
         // the stale host. Mirrors VS Code's clearAuthCredentials.
         SessionTracker.saveConfigToDir(existing.copy(authToken = null, jolliApiKey = null), globalDir)
+        Telemetry.track("signed_out")
         notifyAuthListeners()
     }
 
@@ -269,13 +282,20 @@ object JolliAuthService {
         callbackUrl: String,
         clientVersion: String,
         generateApiKey: Boolean,
+        installId: String? = null,
     ): String {
         val encodedCallback = java.net.URLEncoder.encode(callbackUrl, Charsets.UTF_8)
         val encodedVersion = java.net.URLEncoder.encode(clientVersion, Charsets.UTF_8)
         val generateKeyParam = if (generateApiKey) "&generate_api_key=true" else ""
+        // JOLLI-1785: carry the anonymous installId (lowercase UUID) through OAuth
+        // so the backend writes the install→account conversion-join row when it
+        // mints the key (it reads `install_id` regardless of generate_api_key).
+        val installIdParam =
+            if (!installId.isNullOrBlank()) "&install_id=${java.net.URLEncoder.encode(installId, Charsets.UTF_8)}" else ""
         return "$jolliUrl/login?cli_callback=$encodedCallback" +
             "&client=intellij&client_version=$encodedVersion" +
-            generateKeyParam
+            generateKeyParam +
+            installIdParam
     }
 
     internal fun parseQuery(query: String): Map<String, String> {

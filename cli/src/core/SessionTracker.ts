@@ -12,7 +12,7 @@
  * Lock primitives (`worker.lock` / `orphan-write.lock`) live in `Locks.ts`.
  */
 
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -45,6 +45,8 @@ const CURSORS_FILE = "cursors.json";
 const DISCOVERY_CURSORS_FILE = "discovery-cursors.json";
 const CONFIG_FILE = "config.json";
 const PLANS_FILE = "plans.json";
+/** Atomic-exclusive sentinel that arbitrates a single installId mint across concurrent first-runs. */
+const INSTALL_ID_FILE = "install-id";
 
 /** Sessions older than 48 hours are considered stale and pruned automatically */
 const SESSION_STALE_MS = 48 * 60 * 60 * 1000;
@@ -347,6 +349,88 @@ export async function loadConfig(): Promise<JolliMemoryConfig> {
  */
 export async function saveConfig(update: Partial<JolliMemoryConfig>): Promise<void> {
 	return saveConfigScoped(update, getGlobalConfigDir());
+}
+
+/**
+ * Returns the stable per-machine telemetry `installId`, minting and persisting
+ * one on first call (JOLLI-1785). Stored machine-global in
+ * `~/.jolli/jollimemory/config.json` so there is ONE anonymous identity per
+ * machine shared across all surfaces (cli / vscode / intellij). The returned
+ * `created` flag is true only on the run that minted it — the caller uses it
+ * to fire the once-per-machine `app_installed` telemetry event.
+ *
+ * Contains no PII: a random UUID, never derived from anything user-controlled.
+ */
+export async function getOrCreateInstallId(): Promise<{ readonly installId: string; readonly created: boolean }> {
+	return getOrCreateInstallIdInDir(getGlobalConfigDir());
+}
+
+/**
+ * Scoped variant of {@link getOrCreateInstallId} — operates on an explicit
+ * config directory so it can be unit-tested without touching the real
+ * `~/.jolli/jollimemory`. Production code calls the global wrapper above.
+ */
+export async function getOrCreateInstallIdInDir(
+	dir: string,
+): Promise<{ readonly installId: string; readonly created: boolean }> {
+	const config = await loadConfigFromDir(dir);
+	if (config.installId) {
+		return { installId: config.installId, created: false };
+	}
+	// Mint race-free across concurrent first-runs (e.g. CLI post-commit worker +
+	// VS Code activate, or two git hooks): the OS-atomic exclusive create of the
+	// `install-id` sentinel is the single arbiter. Exactly one process wins it
+	// (so `created:true` — and thus `app_installed` — fires once per machine);
+	// the loser adopts the winner's id, so both converge instead of each minting
+	// its own and clobbering the config. Pre-existing installs already carry
+	// `config.installId` and return above without ever touching the sentinel.
+	const sentinel = join(dir, INSTALL_ID_FILE);
+	const candidate = randomUUID();
+	await mkdir(dir, { recursive: true });
+	let installId: string;
+	let created: boolean;
+	try {
+		await writeFile(sentinel, candidate, { flag: "wx" });
+		installId = candidate;
+		created = true;
+	} catch {
+		installId = await readInstallIdSentinel(sentinel, candidate);
+		created = false;
+	}
+	if (config.installId !== installId) {
+		await saveConfigScoped({ installId }, dir);
+	}
+	return { installId, created };
+}
+
+/** Read the install-id sentinel, falling back to `fallback` if missing/empty/unreadable. */
+async function readInstallIdSentinel(path: string, fallback: string): Promise<string> {
+	try {
+		const v = (await readFile(path, "utf-8")).trim();
+		return v.length > 0 ? v : fallback;
+	} catch {
+		return fallback;
+	}
+}
+
+/**
+ * Machine-global first-seen ledger for the `ai_source_detected` telemetry event
+ * (JOLLI-1785). Records `source` in the global config's `telemetrySeenSources`
+ * and returns `true` only the first time a given source is seen on this machine,
+ * so the caller fires `ai_source_detected` once per source rather than every run.
+ */
+export async function markAiSourceSeen(source: string): Promise<boolean> {
+	return markAiSourceSeenInDir(getGlobalConfigDir(), source);
+}
+
+/** Scoped variant of {@link markAiSourceSeen} for unit tests. */
+export async function markAiSourceSeenInDir(dir: string, source: string): Promise<boolean> {
+	const seen = (await loadConfigFromDir(dir)).telemetrySeenSources ?? [];
+	if (seen.includes(source)) {
+		return false;
+	}
+	await saveConfigScoped({ telemetrySeenSources: [...seen, source] }, dir);
+	return true;
 }
 
 const SQUASH_PENDING_FILE = "squash-pending.json";

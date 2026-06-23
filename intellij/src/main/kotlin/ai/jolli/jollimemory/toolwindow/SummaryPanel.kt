@@ -341,6 +341,8 @@ class SummaryPanel(
                     repoUrl = repoUrl, relativePath = relativePath,
                 ))
 
+                ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_pushed", mapOf("kind" to "summary"))
+
                 val fullUrl = "$baseUrl/articles?doc=${result.docId}"
                 var updatedPlans = summary.plans
                 if (updatedPlans != null && planUrls.isNotEmpty()) {

@@ -149,6 +149,34 @@ intellijPlatform {
             </p>
         """.trimIndent()
         changeNotes = """
+            <h3>0.99.2</h3>
+
+            <h4>New Features</h4>
+            <ul>
+                <li><b>Reference extraction</b> &mdash; automatically extracts Linear, Jira, GitHub, and
+                    Notion references from Claude and Codex transcripts and surfaces them in summaries.
+                    Includes per-source envelope parsers, a persistent <code>ReferenceStore</code>, and
+                    transcript-level discovery at both StopHook and post-commit time</li>
+                <li><b>References in Plans panel</b> &mdash; plan entries now show clickable
+                    "Open in &lt;Source&gt;" links instead of static source labels, with a Select All
+                    toolbar action</li>
+                <li><b>PR history strip</b> &mdash; the summary viewer shows previously merged or closed
+                    PRs for the same branch alongside the active PR. Uses <code>gh pr list --state all</code>
+                    so reopened or multi-PR branches no longer lose history</li>
+                <li><b>Conversation multi-select</b> &mdash; active conversation rows now have a checkbox
+                    ("Include in next memory") and a Select All toolbar action</li>
+            </ul>
+
+            <h4>Fixes &amp; Improvements</h4>
+            <ul>
+                <li>Removed periodic polling timer for branch updates; the tool window now updates on
+                    events only</li>
+                <li>Resolved JetBrains Marketplace Plugin Verifier internal-API warnings &mdash; plugin
+                    version and install path are derived from pure JVM APIs instead of
+                    <code>PluginManager</code></li>
+                <li>Commit selection state is now tracked via <code>CommitSelectionStore</code></li>
+            </ul>
+
             <h3>0.99.1</h3>
 
             <h4>New Features</h4>
@@ -204,10 +232,12 @@ intellijPlatform {
             <ul>
                 <li><b>Memory Bank</b> &mdash; a new local storage layer that keeps human-readable
                     Markdown summaries, plans, and notes alongside canonical JSON in a user-configurable
-                    folder. Dual-written to both the git orphan branch and the Memory Bank folder by default</li>
-                <li><b>Memory Bank explorer</b> &mdash; browse your Memory Bank as a tree view with
-                    commit/plan/note badges. Supports file operations (New Folder, File, Import, Rename,
-                    Move, Delete) and drag-and-drop</li>
+                    folder. Summaries are dual-written to both the git orphan branch (system of record)
+                    and the Memory Bank folder by default</li>
+                <li><b>Memory Bank explorer</b> &mdash; browse your Memory Bank as a tree view in the
+                    tool window with commit/plan/note badges, double-click to open the formatted summary
+                    viewer. Supports file operations (New Folder, File, Import, Rename, Move, Delete) and
+                    drag-and-drop</li>
                 <li><b>Auto-migration</b> &mdash; existing orphan branch data is automatically migrated
                     to the Memory Bank folder on plugin startup</li>
             </ul>
@@ -238,34 +268,44 @@ intellijPlatform {
             <h4>Plugin Distribution</h4>
             <ul>
                 <li><b>Reduced plugin size</b> &mdash; stripped unused platform natives from sqlite-jdbc
-                    and deduplicated the dependency between the plugin and hooks JAR.
-                    Plugin zip reduced from 31 MB to 7 MB</li>
-                <li><b>Quality improvements</b> &mdash; resolved JetBrains Marketplace API warnings,
-                    fixed binary compatibility across IntelliJ versions, improved UI layout and
-                    panel management, and added Plugin Verifier to CI</li>
+                    (FreeBSD, Android, ARM32, RISC-V, ppc64) and deduplicated the sqlite-jdbc dependency
+                    between the plugin and hooks JAR. Plugin zip reduced from 31 MB to 7 MB</li>
+                <li><b>Quality improvements</b> &mdash; resolved JetBrains Marketplace internal API
+                    warnings, fixed binary compatibility issues across IntelliJ versions, improved UI
+                    layout and panel management, fixed encoding issues, and added Plugin Verifier to CI</li>
             </ul>
 
-            <h3>0.97.0 &mdash; Initial Release</h3>
+            <h3>0.97.9</h3>
             <ul>
-                <li><b>Pure Kotlin port</b> of the VS Code extension &mdash; no Node.js dependency</li>
-                <li><b>Tool window</b> with STATUS, PLANS &amp; NOTES, CHANGES, and COMMITS panels</li>
+                <li><b>Privacy consent notice</b> &mdash; display a privacy notice with link to privacy
+                    policy at the top of the Settings page, satisfying JetBrains Marketplace guideline
+                    2.2 for explicit user consent before data processing</li>
+            </ul>
+
+            <h3>0.97.0</h3>
+            <ul>
+                <li><b>Initial IntelliJ plugin release</b> &mdash; pure Kotlin port of the VS Code extension</li>
+                <li><b>Four-panel tool window</b>: STATUS, PLANS &amp; NOTES, CHANGES, COMMITS in a right
+                    sidebar with collapsible panels</li>
                 <li><b>AI Commit</b> &mdash; generate commit messages from staged diffs using Anthropic API</li>
                 <li><b>Squash</b> &mdash; squash selected commits with LLM-generated combined message and
                     automatic memory merging</li>
-                <li><b>Summary Viewer</b> &mdash; JCEF-based HTML viewer with dark/light theme support</li>
-                <li><b>Plans &amp; Notes</b> &mdash; auto-detect Claude Code plans, add Markdown files and text snippets</li>
-                <li><b>Hook installation</b> &mdash; pure Kotlin file I/O for git hooks and Claude Code stop hook</li>
-                <li><b>Standalone hooks JAR</b> &mdash; git hooks run as <code>jollimemory-hooks.jar</code> fat JAR
-                    outside the IDE</li>
-                <li><b>Orphan branch storage</b> &mdash; summaries stored in <code>jollimemory/summaries/v3</code>
-                    with tree-hash aliases for cross-branch matching</li>
+                <li><b>Push</b> &mdash; git push with force-push confirmation dialog</li>
+                <li><b>View Summary</b> &mdash; JCEF-based HTML viewer for commit summaries with dark/light
+                    theme support</li>
+                <li><b>Plans &amp; Notes</b> &mdash; auto-detect Claude Code plans, add custom notes
+                    (Markdown files or text snippets)</li>
+                <li><b>Hook installation</b> &mdash; pure Kotlin file I/O, no Node.js; installs git hooks
+                    and Claude Code stop hook</li>
+                <li><b>Standalone hooks JAR</b> &mdash; git hooks run as <code>jollimemory-hooks.jar</code>
+                    fat JAR outside the IDE</li>
+                <li><b>Orphan branch storage</b> &mdash; summaries stored in
+                    <code>jollimemory/summaries/v3</code> with tree-hash aliases</li>
                 <li><b>Push to Jolli Space</b> &mdash; publish summaries to team knowledge base via API</li>
-                <li><b>Create &amp; Update PR</b> &mdash; GitHub PR management via <code>gh</code> CLI with summary markers</li>
-                <li><b>E2E Test Generation</b> &mdash; AI-generated test scenarios editable inline</li>
-                <li><b>Session Context Recall</b> &mdash; automatic briefing at session start and full
-                    <code>/jolli-recall</code> command for branch history</li>
-                <li><b>Settings page</b> &mdash; Anthropic API key, model selection, and Jolli API key
-                    at Settings &gt; Tools &gt; Jolli Memory</li>
+                <li><b>Create &amp; Update PR</b> &mdash; GitHub PR management via <code>gh</code> CLI
+                    with summary markers</li>
+                <li><b>Settings page</b> &mdash; Anthropic API key, model selection, Jolli API key at
+                    Settings &gt; Tools &gt; Jolli Memory</li>
                 <li><b>Compatibility</b>: IntelliJ IDEA 2024.3+ (build 243&ndash;262.*)</li>
             </ul>
         """.trimIndent()

@@ -25,7 +25,12 @@ object HookRunner {
         when (hook) {
             "post-commit" -> {
                 if (hookArgs.contains("--worker")) {
-                    PostCommitHook.runWorker(System.getProperty("user.dir"))
+                    val cwd = System.getProperty("user.dir")
+                    // JOLLI-1785: this worker is a fresh JVM — bootstrap telemetry so
+                    // queue_drained/ingest events emit, then flush before exit.
+                    ai.jolli.jollimemory.core.telemetry.TelemetryActivation.bootstrap(cwd)
+                    PostCommitHook.runWorker(cwd)
+                    ai.jolli.jollimemory.core.telemetry.TelemetryActivation.flushNow(cwd)
                 } else {
                     PostCommitHook.launch(hookArgs)
                 }

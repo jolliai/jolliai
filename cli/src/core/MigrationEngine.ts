@@ -18,6 +18,7 @@ import type { MigrationState } from "./KBTypes.js";
 import type { MetadataManager } from "./MetadataManager.js";
 import { cleanupAllBranchesStaleChildMarkdown } from "./StaleChildMarkdownCleanup.js";
 import type { StorageProvider } from "./StorageProvider.js";
+import { bucket, track } from "./Telemetry.js";
 
 const log = createLogger("MigrationEngine");
 
@@ -121,6 +122,11 @@ export class MigrationEngine {
 			failedHashes: failedHashes.length > 0 ? failedHashes : undefined,
 		};
 		this.saveMigrationState(finalState);
+		track("memory_bank_migrated", {
+			repos: 1,
+			outcome: finalState.status,
+			entries_bucket: bucket(migrated),
+		});
 
 		log.info(
 			"=== Migration %s: %d migrated, %d skipped, %d failed ===",

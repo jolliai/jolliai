@@ -16,6 +16,7 @@ import type { Command } from "commander";
 import { TEMPLATES } from "../core/PromptTemplates.js";
 import { exportSummaries } from "../core/SummaryExporter.js";
 import { AmbiguousHashError } from "../core/SummaryStore.js";
+import { track } from "../core/Telemetry.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import { printAmbiguousHash, resolveProjectDir } from "./CliUtils.js";
 
@@ -282,6 +283,7 @@ export function registerExportCommand(program: Command): void {
 				return;
 			}
 
+			track("export_performed", { format: "markdown" });
 			console.log(`\n  Exported to ${result.outputDir}`);
 			const erroredSegment = result.filesErrored > 0 ? `  Errored: ${result.filesErrored}` : "";
 			console.log(

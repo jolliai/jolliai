@@ -13,6 +13,7 @@ import { searchHits } from "../core/SearchHits.js";
 import type { SearchHitResult } from "../core/SearchIndex.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { getActiveStorage, setActiveStorage } from "../core/SummaryStore.js";
+import { bucket, track } from "../core/Telemetry.js";
 import { setLogDir } from "../Logger.js";
 import { isSafeQuery, parsePositiveInt, readStdin, resolveProjectDir } from "./CliUtils.js";
 
@@ -72,6 +73,13 @@ function emitError(options: SearchOptions, message: string): void {
 		console.error(`\n  Error: ${message}\n`);
 	}
 	process.exitCode = 1;
+}
+
+/** Coarse query-length bucket — never the query text itself (privacy). */
+function queryLenBucket(query: string): "short" | "medium" | "long" {
+	if (query.length < 20) return "short";
+	if (query.length < 80) return "medium";
+	return "long";
 }
 
 /**
@@ -143,6 +151,10 @@ export function registerSearchCommand(program: Command): void {
 					getActiveStorage(),
 				);
 
+				track("search_performed", {
+					result_count_bucket: bucket(hits.length),
+					query_len_bucket: queryLenBucket(query),
+				});
 				await writeOutput({ hits }, options, () => renderHitsText(hits));
 			} catch (error: unknown) {
 				const message = error instanceof Error ? error.message : String(error);

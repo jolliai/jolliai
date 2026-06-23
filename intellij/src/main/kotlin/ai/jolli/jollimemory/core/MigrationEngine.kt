@@ -121,6 +121,14 @@ class MigrationEngine(
             migratedEntries = migrated,
         )
         saveMigrationState(finalState)
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+            "memory_bank_migrated",
+            mapOf(
+                "repos" to 1,
+                "outcome" to finalState.status,
+                "entries_bucket" to ai.jolli.jollimemory.core.telemetry.Telemetry.bucket(migrated),
+            ),
+        )
 
         log.info("=== Migration completed: %d migrated, %d skipped ===", migrated - skipped, skipped)
         return finalState

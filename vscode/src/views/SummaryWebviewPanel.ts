@@ -114,6 +114,7 @@ import {
 import type { RegenerateContext } from "../../../cli/src/core/RegenerateContext.js";
 import { isSummaryError } from "../../../cli/src/core/SummaryErrorMarker.js";
 import { getTranscriptIds } from "../../../cli/src/core/SummaryTree.js";
+import { track } from "../../../cli/src/core/Telemetry.js";
 import type { LlmConfig } from "../../../cli/src/Types.js";
 
 /** Memory field updates sent from the webview edit form. */
@@ -1752,6 +1753,8 @@ export class SummaryWebviewPanel {
 				repoUrl,
 				relativePath: buildBranchRelativePath(summary.branch),
 			});
+
+			track("memory_pushed", { kind: "summary" });
 
 			// Build the full article URL using docId query param (matches frontend routing)
 			const fullUrl = `${baseUrl}/articles?doc=${result.docId}`;

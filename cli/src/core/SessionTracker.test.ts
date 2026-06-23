@@ -68,6 +68,7 @@ import {
 	ensureJolliMemoryDir,
 	filterSessionsByEnabledIntegrations,
 	getGlobalConfigDir,
+	getOrCreateInstallIdInDir,
 	getReferenceEntriesForBranch,
 	loadAllSessions,
 	loadConfig,
@@ -79,6 +80,7 @@ import {
 	loadPlansRegistry,
 	loadPluginSource,
 	loadSquashPending,
+	markAiSourceSeenInDir,
 	migrateDiscoveryCursors,
 	normalizePlansRegistry,
 	pruneStaleQueueEntries,
@@ -668,6 +670,54 @@ describe("SessionTracker", () => {
 			const merged = await loadConfigFromDir(dir);
 			expect(merged.excludePatterns).toEqual(["*.log"]);
 			expect(merged.apiKey).toBe("sk-test");
+		});
+	});
+
+	describe("getOrCreateInstallIdInDir", () => {
+		it("mints a UUID on first call (created=true) and persists it", async () => {
+			const dir = join(tempDir, "install-id");
+			const first = await getOrCreateInstallIdInDir(dir);
+			expect(first.created).toBe(true);
+			expect(first.installId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+			expect((await loadConfigFromDir(dir)).installId).toBe(first.installId);
+		});
+
+		it("returns the existing id on subsequent calls (created=false)", async () => {
+			const dir = join(tempDir, "install-id-stable");
+			const first = await getOrCreateInstallIdInDir(dir);
+			const second = await getOrCreateInstallIdInDir(dir);
+			expect(second.created).toBe(false);
+			expect(second.installId).toBe(first.installId);
+		});
+
+		it("preserves a pre-existing installId without overwriting other config", async () => {
+			const dir = join(tempDir, "install-id-preexisting");
+			await saveConfigScoped({ installId: "fixed-id", apiKey: "sk-keep" }, dir);
+			const result = await getOrCreateInstallIdInDir(dir);
+			expect(result).toEqual({ installId: "fixed-id", created: false });
+			expect((await loadConfigFromDir(dir)).apiKey).toBe("sk-keep");
+		});
+
+		it("mints a single id under concurrent first-runs (created=true fires once)", async () => {
+			const dir = join(tempDir, "install-id-race");
+			// Fire several first-run mints simultaneously — the atomic sentinel must
+			// pick one winner; all callers must converge on the same id.
+			const results = await Promise.all(Array.from({ length: 8 }, () => getOrCreateInstallIdInDir(dir)));
+			const ids = new Set(results.map((r) => r.installId));
+			expect(ids.size).toBe(1);
+			expect(results.filter((r) => r.created).length).toBe(1);
+			expect((await loadConfigFromDir(dir)).installId).toBe([...ids][0]);
+		});
+	});
+
+	describe("markAiSourceSeenInDir", () => {
+		it("returns true only the first time a source is seen, and persists it", async () => {
+			const dir = join(tempDir, "seen-sources");
+			expect(await getOrCreateInstallIdInDir(dir)).toBeTruthy(); // unrelated; dir exists
+			expect(await markAiSourceSeenInDir(dir, "codex")).toBe(true);
+			expect(await markAiSourceSeenInDir(dir, "codex")).toBe(false);
+			expect(await markAiSourceSeenInDir(dir, "claude")).toBe(true);
+			expect((await loadConfigFromDir(dir)).telemetrySeenSources).toEqual(["codex", "claude"]);
 		});
 	});
 

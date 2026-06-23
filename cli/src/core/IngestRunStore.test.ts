@@ -64,6 +64,12 @@ describe("IngestRunStore", () => {
 		expect(await readIngestRuns(cwd)).toEqual([]);
 	});
 
+	it("stores a NO_PENDING run (a normal terminal state, not an error)", async () => {
+		await appendIngestRun(cwd, rec({ outcome: INGEST_CODES.NO_PENDING, batches: 0, ingested: 0 }));
+		const runs = await readIngestRuns(cwd);
+		expect(runs[0].outcome).toBe(INGEST_CODES.NO_PENDING);
+	});
+
 	it("appendCredentialMissingRun records a CREDENTIAL_MISSING outcome", async () => {
 		await appendCredentialMissingRun(cwd, "post-merge");
 		const runs = await readIngestRuns(cwd);
