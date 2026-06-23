@@ -960,9 +960,22 @@ export class JolliMemoryBridge {
 		let authorFilter: string | undefined;
 
 		if (mergeBase === headHash) {
-			// Branch is fully merged into main — attempt merged mode
-			const creationPoint = await this.findBranchCreationPoint(branch);
-			if (!creationPoint) {
+			// Branch is fully merged into main — attempt merged mode.
+			const merged = await this.resolveMergedHistory(branch);
+			if (!merged) {
+				return emptyResult;
+			}
+
+			// A branch whose HEAD is fully contained in main but that never
+			// committed anything of its own (only "Created from main" + a
+			// rebase/reset onto main, i.e. a routine `git rebase main` sync) must
+			// show an empty panel: those commits belong to main, not to this
+			// branch. Without this guard, a sync that pulls in your *own*
+			// already-merged commit re-lists that commit here, because it passes
+			// the `--author` filter below. Git's ancestry can't tell this apart
+			// from a branch whose own work was merged (both have HEAD ⊆ main) —
+			// only the reflog records which branch actually authored the commits.
+			if (!merged.hasOwnCommit) {
 				return emptyResult;
 			}
 
@@ -971,11 +984,11 @@ export class JolliMemoryBridge {
 				return emptyResult;
 			}
 
-			mergeBase = creationPoint;
+			mergeBase = merged.base;
 			isMerged = true;
 			log.info("bridge", "Merged mode activated", {
 				branch,
-				creationPoint: creationPoint.substring(0, 8),
+				creationPoint: merged.base.substring(0, 8),
 				author: authorFilter,
 			});
 		} else {
@@ -1215,6 +1228,80 @@ export class JolliMemoryBridge {
 		}
 		const oldest = lines[lines.length - 1];
 		return oldest.split(" ")[0];
+	}
+
+	/**
+	 * Reads the branch reflog once and resolves what the merged-mode history view
+	 * needs: the log-range base (where the branch was created), and whether the
+	 * branch ever committed anything of its own.
+	 *
+	 * `hasOwnCommit` is the key signal. When a branch's HEAD is fully contained in
+	 * `main`, two very different situations look identical to git's ancestry:
+	 *
+	 *  1. the branch's *own* commits were merged into main (show them, read-only);
+	 *  2. the branch never committed anything — it was created from main and then
+	 *     `git rebase main`'d (a routine sync), so its HEAD is just main's tip.
+	 *
+	 * Only the reflog distinguishes them: case 1 has a `commit` op, case 2 has
+	 * only `branch: Created …` + `rebase`/`reset` ops. Telling them apart matters
+	 * because in case 2 a sync that replays your *own* already-merged commit would
+	 * otherwise re-surface it in the panel (it passes the merged-mode `--author`
+	 * filter), even though that commit belongs to main, not to this branch.
+	 *
+	 * `hasOwnCommit` keys on a `commit` reflog op specifically — not `merge` or
+	 * `cherry-pick`. For a fully-merged branch those land in main via the branch's
+	 * own `commit` ops (or the PR merge), so a branch whose only trace is a local
+	 * merge/cherry-pick of work already in main is correctly the empty case. Two
+	 * residual limitations are accepted (both rare, and the `--author` + fork-point
+	 * range bounds the blast radius): a branch that committed and then
+	 * `reset --hard` away its own work still reads as "has own commit" (the
+	 * historical `commit` op survives in the reflog); and a fully-expired reflog
+	 * degrades to the empty panel below.
+	 *
+	 * Returns `undefined` (→ caller shows an empty panel) for detached HEAD or when
+	 * the reflog is unavailable/expired — the same graceful-degradation boundary
+	 * `findBranchCreationPoint` uses.
+	 */
+	private async resolveMergedHistory(
+		branch: string,
+	): Promise<{ base: string; hasOwnCommit: boolean } | undefined> {
+		// Detached HEAD has no branch reflog of its own (see findBranchCreationPoint).
+		if (branch === "HEAD") {
+			return;
+		}
+		const reflog = await tryExecGit(
+			["reflog", "show", branch, "--format=%H %gs"],
+			this.cwd,
+		);
+		if (!reflog.trim()) {
+			return;
+		}
+
+		const lines = reflog.split("\n").filter(Boolean);
+
+		// Base: the explicit "branch: Created from …" entry if present (scan from
+		// oldest), else the oldest surviving entry — same best-effort fallback the
+		// non-strict findBranchCreationPoint uses for the merged-mode view.
+		let base: string | undefined;
+		for (let i = lines.length - 1; i >= 0; i--) {
+			if (lines[i].includes("branch: Created from")) {
+				base = lines[i].split(" ")[0];
+				break;
+			}
+		}
+		if (!base) {
+			base = lines[lines.length - 1].split(" ")[0];
+		}
+
+		// Own commit = a `commit` reflog op ("commit:", "commit (amend):",
+		// "commit (initial):"). A branch showing only creation + rebase/reset/
+		// checkout never authored anything itself. The subject follows the leading
+		// "<hash> " from the --format above.
+		const hasOwnCommit = lines.some((line) =>
+			/^[0-9a-f]+ commit\b/.test(line),
+		);
+
+		return { base, hasOwnCommit };
 	}
 
 	/** True when `ancestor` is an ancestor of (or equal to) `descendant`. */

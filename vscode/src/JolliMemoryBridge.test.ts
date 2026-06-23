@@ -3996,7 +3996,7 @@ describe("JolliMemoryBridge", () => {
 			expect(result.commits[0].deletions).toBe(0);
 		});
 
-		it("uses findBranchCreationPoint 'Created from' entry when branch is merged", async () => {
+		it("uses resolveMergedHistory 'Created from' entry as the base when branch is merged", async () => {
 			// getCurrentBranch
 			mockExecFileSuccess("feature/merged\n");
 			// resolveHistoryBaseRef: refExists for origin/main
@@ -4005,7 +4005,7 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("mergebase456\n");
 			// merge-base — equals HEAD, triggers merged mode
 			mockExecFileSuccess("mergebase456\n");
-			// findBranchCreationPoint: reflog show
+			// resolveMergedHistory: reflog has own commits + explicit "Created from"
 			mockExecFileSuccess(
 				"ccc333 commit: third commit\nbbb222 commit: second commit\naaa111 branch: Created from main\n",
 			);
@@ -4030,7 +4030,7 @@ describe("JolliMemoryBridge", () => {
 			expect(result.commits[0].hash).toBe("commitHash1");
 		});
 
-		it("uses findBranchCreationPoint oldest entry fallback when no 'Created from'", async () => {
+		it("uses resolveMergedHistory oldest-entry base fallback when reflog has no 'Created from'", async () => {
 			// getCurrentBranch
 			mockExecFileSuccess("feature/merged\n");
 			// resolveHistoryBaseRef: refExists for origin/main
@@ -4039,7 +4039,7 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("mergebase456\n");
 			// merge-base
 			mockExecFileSuccess("mergebase456\n");
-			// findBranchCreationPoint: reflog without "Created from"
+			// resolveMergedHistory: own commits but no "Created from" → base = oldest entry
 			mockExecFileSuccess(
 				"ccc333 commit: third\nbbb222 commit: second\naaa111 commit: first\n",
 			);
@@ -4061,6 +4061,45 @@ describe("JolliMemoryBridge", () => {
 
 			expect(result.isMerged).toBe(true);
 			expect(result.commits).toHaveLength(1);
+			// Base must be the oldest reflog entry (aaa111), not a guessed merge-base.
+			const logCall = execFileMock.mock.calls.find(
+				(c) => Array.isArray(c[1]) && c[1].includes("aaa111..HEAD"),
+			);
+			expect(logCall).toBeDefined();
+		});
+
+		it("treats an amend-only merged branch as having own work (the 'amend when no commit' case)", async () => {
+			// A branch whose only own work is an amended commit: the reflog op is
+			// `commit (amend):`, never a plain `commit:`. hasOwnCommit must still be
+			// true (the `\b` after "commit" matches the "(amend)" variant), so the
+			// merged history is listed rather than emptied.
+			mockExecFileSuccess("feature/amended\n"); // getCurrentBranch
+			mockExecFileSuccess("abc\n"); // resolveHistoryBaseRef → origin/main
+			mockExecFileSuccess("mergebase456\n"); // getHEADHash
+			mockExecFileSuccess("mergebase456\n"); // merge-base == HEAD → merged mode
+			// resolveMergedHistory: amend + initial ops, explicit "Created from"
+			mockExecFileSuccess(
+				"ddd444 commit (amend): reworded\n" +
+					"ccc333 commit (initial): first\n" +
+					"aaa111 branch: Created from main\n",
+			);
+			mockExecFileSuccess("Amy Mender\n"); // getCurrentUserName
+			const logEntry = `commitHash9\x00fix: amended change\x00Amy Mender\x00amy@example.com\x002026-06-23T10:00:00Z\x00\x00\n`;
+			mockExecFileSuccess(logEntry); // git log --author
+
+			getIndexEntryMap.mockResolvedValue(new Map());
+			getDiffStats.mockResolvedValueOnce({
+				filesChanged: 1,
+				insertions: 3,
+				deletions: 1,
+			});
+
+			const bridge = makeBridge();
+			const result = await bridge.listBranchCommits("main");
+
+			expect(result.isMerged).toBe(true);
+			expect(result.commits).toHaveLength(1);
+			expect(result.commits[0].hash).toBe("commitHash9");
 		});
 
 		it("includes commitType when summary has non-'commit' type (e.g. amend, squash)", async () => {
@@ -4118,8 +4157,11 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("mergebase456\n");
 			// merge-base
 			mockExecFileSuccess("mergebase456\n");
-			// findBranchCreationPoint: valid reflog
-			mockExecFileSuccess("aaa111 branch: Created from main\n");
+			// resolveMergedHistory: reflog has an own commit → has own work, so it
+			// proceeds to getCurrentUserName (rather than short-circuiting empty).
+			mockExecFileSuccess(
+				"bbb222 commit: own work\naaa111 branch: Created from main\n",
+			);
 			// getCurrentUserName — returns empty string (git config not set)
 			mockExecFileError("no user.name set");
 
@@ -4130,7 +4172,7 @@ describe("JolliMemoryBridge", () => {
 			expect(result.isMerged).toBe(false);
 		});
 
-		it("returns empty when findBranchCreationPoint gets empty reflog (merged branch)", async () => {
+		it("returns empty when resolveMergedHistory gets empty reflog (merged branch)", async () => {
 			// getCurrentBranch
 			mockExecFileSuccess("feature/merged\n");
 			// resolveHistoryBaseRef: refExists for origin/main
@@ -4139,8 +4181,48 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("mergebase456\n");
 			// merge-base
 			mockExecFileSuccess("mergebase456\n");
-			// findBranchCreationPoint: empty reflog
+			// resolveMergedHistory: empty reflog → undefined → empty panel
 			mockExecFileError("no reflog");
+
+			const bridge = makeBridge();
+			const result = await bridge.listBranchCommits("main");
+
+			expect(result.commits).toEqual([]);
+			expect(result.isMerged).toBe(false);
+		});
+
+		it("returns empty for a merged branch that never committed its own work (created-from-main + rebase sync)", async () => {
+			// The #226 regression case: branch created from main, then `git rebase
+			// main` after one of *your own* commits had merged into main. HEAD is now
+			// main's tip (fully contained in main), the branch has zero own commits,
+			// yet the rebased-in commit is authored by you. It must NOT be listed —
+			// it belongs to main, not to this branch.
+			// X0000000 / M0000000 are opaque sentinels (the test only cares that the
+			// reflog has no `commit` op, not their hex-ness).
+			mockExecFileSuccess("fix/synced-to-main\n"); // getCurrentBranch
+			mockExecFileSuccess("abc\n"); // resolveHistoryBaseRef → origin/main
+			mockExecFileSuccess("X0000000\n"); // getHEADHash (HEAD = X = origin/main tip)
+			mockExecFileSuccess("X0000000\n"); // merge-base == HEAD → merged mode
+			// resolveMergedHistory: reflog has only creation + rebase, no `commit:` op.
+			mockExecFileSuccess(
+				"X0000000 rebase (finish): refs/heads/fix/synced-to-main onto X0000000\n" +
+					"M0000000 branch: Created from main\n",
+			);
+
+			const bridge = makeBridge();
+			const result = await bridge.listBranchCommits("main");
+
+			// No own commits → empty panel, and never reaches getCurrentUserName/log.
+			expect(result.commits).toEqual([]);
+			expect(result.isMerged).toBe(false);
+		});
+
+		it("returns empty for a merged detached HEAD (no branch reflog)", async () => {
+			mockExecFileSuccess("HEAD\n"); // getCurrentBranch → detached
+			mockExecFileSuccess("abc\n"); // resolveHistoryBaseRef → origin/main
+			mockExecFileSuccess("deadbeef\n"); // getHEADHash
+			mockExecFileSuccess("deadbeef\n"); // merge-base == HEAD → merged mode
+			// resolveMergedHistory bails out for "HEAD" before any reflog read.
 
 			const bridge = makeBridge();
 			const result = await bridge.listBranchCommits("main");
