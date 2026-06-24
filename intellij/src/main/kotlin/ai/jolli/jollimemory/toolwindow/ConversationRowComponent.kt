@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.toolwindow
 
+import ai.jolli.jollimemory.JolliMemoryIcons
 import ai.jolli.jollimemory.core.ActiveConversationItem
 import ai.jolli.jollimemory.core.TranscriptSource
 import com.intellij.icons.AllIcons
@@ -21,6 +22,7 @@ class ConversationRowComponent(
 	val item: ActiveConversationItem,
 	private val onRowClicked: (ActiveConversationItem) -> Unit,
 	private val onHide: (ActiveConversationItem) -> Unit,
+	private val onPin: (ActiveConversationItem) -> Unit,
 	private val onSelectionChanged: (ActiveConversationItem, Boolean) -> Unit,
 ) : JPanel(BorderLayout()) {
 
@@ -31,11 +33,31 @@ class ConversationRowComponent(
 		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
 	}
 
-	private val hideLabel = JLabel(AllIcons.Actions.GC).apply {
+	private val pinLabel = JLabel(AllIcons.Nodes.Favorite).apply {
 		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-		toolTipText = "Hide conversation"
+		toolTipText = "Pin"
 		isVisible = false
-		border = JBUI.Borders.emptyRight(4)
+		border = JBUI.Borders.empty(0, 3)
+	}
+
+	private val hideLabel = JLabel(JolliMemoryIcons.Trash).apply {
+		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+		toolTipText = "Delete"
+		isVisible = false
+		border = JBUI.Borders.empty(0, 3)
+	}
+
+	private val countLabel = JLabel(if (item.messageCount > 0) "${item.messageCount}" else "").apply {
+		foreground = JBColor.GRAY
+		font = font.deriveFont(font.size2D - 1f)
+	}
+
+	/** Toggles the right side between the message count and the hover actions. */
+	private fun setHovered(hovered: Boolean) {
+		background = if (hovered) JBColor(Color(0, 0, 0, 20), Color(255, 255, 255, 20)) else null
+		countLabel.isVisible = !hovered
+		pinLabel.isVisible = hovered
+		hideLabel.isVisible = hovered
 	}
 
 	init {
@@ -58,16 +80,12 @@ class ConversationRowComponent(
 		}
 		add(titleLabel, BorderLayout.CENTER)
 
-		// Right side: message count + hide button
-		val rightPanel = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(4), 0)).apply {
+		// Right side: message count (default) swaps to Pin · Delete on hover (matches Context).
+		val rightPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
 			isOpaque = false
 		}
-		if (item.messageCount > 0) {
-			rightPanel.add(JLabel("${item.messageCount}").apply {
-				foreground = JBColor.GRAY
-				font = font.deriveFont(font.size2D - 1f)
-			})
-		}
+		rightPanel.add(countLabel)
+		rightPanel.add(pinLabel)
 		rightPanel.add(hideLabel)
 		add(rightPanel, BorderLayout.EAST)
 
@@ -77,6 +95,12 @@ class ConversationRowComponent(
 		}
 
 		// Click handlers
+		pinLabel.addMouseListener(object : MouseAdapter() {
+			override fun mouseClicked(e: MouseEvent) {
+				e.consume()
+				onPin(item)
+			}
+		})
 		hideLabel.addMouseListener(object : MouseAdapter() {
 			override fun mouseClicked(e: MouseEvent) {
 				e.consume()
@@ -86,20 +110,19 @@ class ConversationRowComponent(
 
 		val hoverListener = object : MouseAdapter() {
 			override fun mouseEntered(e: MouseEvent) {
-				background = JBColor(Color(0, 0, 0, 20), Color(255, 255, 255, 20))
-				hideLabel.isVisible = true
+				setHovered(true)
 			}
 
 			override fun mouseExited(e: MouseEvent) {
-				// Only hide if mouse actually left the row bounds
+				// Only un-hover if the mouse actually left the row bounds (not when
+				// moving onto a child component within the row).
 				val p = e.point
 				val src = e.source as Component
 				val screenPoint = src.locationOnScreen.apply { translate(p.x, p.y) }
 				val rowLoc = this@ConversationRowComponent.locationOnScreen
 				val rowBounds = Rectangle(rowLoc.x, rowLoc.y, width, height)
 				if (!rowBounds.contains(screenPoint)) {
-					background = null
-					hideLabel.isVisible = false
+					setHovered(false)
 				}
 			}
 		}
@@ -111,9 +134,9 @@ class ConversationRowComponent(
 		addMouseListener(hoverListener)
 		addMouseListener(clickListener)
 		// Forward events from all children (checkbox handles its own clicks)
-		for (c in listOf(leftPanel, badge, titleLabel, rightPanel, hideLabel)) {
+		for (c in listOf(leftPanel, badge, titleLabel, rightPanel, countLabel, pinLabel, hideLabel)) {
 			c.addMouseListener(hoverListener)
-			if (c !== hideLabel && c !== checkbox) c.addMouseListener(clickListener)
+			if (c !== hideLabel && c !== pinLabel && c !== checkbox) c.addMouseListener(clickListener)
 		}
 	}
 

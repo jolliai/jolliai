@@ -5,17 +5,20 @@ import ai.jolli.jollimemory.core.NoteEntry
 import ai.jolli.jollimemory.core.NoteFormat
 import ai.jolli.jollimemory.core.PlanEntry
 import ai.jolli.jollimemory.core.CommitSelectionStore
+import ai.jolli.jollimemory.core.PinStore
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.references.ReferenceEntry
 import ai.jolli.jollimemory.core.references.ReferenceStore
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliMemoryService
+import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBScrollPane
@@ -26,6 +29,11 @@ import java.awt.Component
 import java.awt.Cursor
 import java.awt.Desktop
 import java.awt.Dimension
+import java.awt.FlowLayout
+import java.awt.Font
+import java.awt.Graphics
+import java.awt.Graphics2D
+import java.awt.RenderingHints
 import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
@@ -99,83 +107,97 @@ class PlansPanel(
     private companion object {
         const val HOVER_SHOW_DELAY_MS = 1000
         const val HOVER_HIDE_GRACE_MS = 200
+
+        // Context type-tag accent colors (mockup `kb-tag` parity).
+        val TAG_PLAN = JBColor(0x4C82F7, 0x4C82F7)
+        val TAG_NOTE = JBColor(0x3FA45B, 0x3FA45B)
+        val TAG_SNIPPET = JBColor(0xC9851E, 0xD18616)
+        val TAG_LINEAR = JBColor(0x7A6FF0, 0x8A7FF5)
+        val TAG_GITHUB = JBColor(0x6E7681, 0x8B949E)
+        val TAG_JIRA = JBColor(0x2A78C8, 0x3B82D6)
+        val TAG_NOTION = JBColor(0x6B6B6B, 0x9B9B9B)
     }
     private val emptyLabel = JBLabel("No plans or notes yet.", SwingConstants.CENTER)
     private var excludedReferences: Set<String> = emptySet()
+    private var excludedPlans: Set<String> = emptySet()
+    private var excludedNotes: Set<String> = emptySet()
+
+    /** Row index whose hover actions (pin/edit/delete) are currently shown. */
+    private var actionHoverIndex: Int = -1
+
     private val statusListener: () -> Unit = { SwingUtilities.invokeLater { refresh() } }
 
     init {
         border = JBUI.Borders.empty(8)
 
-        // Single click on trash icon to remove; double-click elsewhere to open in editor
+        // Row interaction. Left→right zones: [checkbox] [tag] [title] … [pin][edit][delete].
+        // The pin/edit/delete actions render only on the hovered row.
         itemList.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
                 val index = itemList.locationToIndex(e.point)
                 if (index < 0) return
                 val cellBounds = itemList.getCellBounds(index, index) ?: return
-
-                // Check if click landed on checkbox zone (left edge, references only)
                 val item = listModel.getElementAt(index)
-                if (item is ListItem.ReferenceItem && e.clickCount == 1) {
-                    val checkboxWidth = cellRenderer.getCheckboxWidth()
-                    if (e.x - cellBounds.x < checkboxWidth) {
-                        toggleReferenceExclusion(item.mapKey)
-                        return
-                    }
-                }
 
-                // Check if click landed on the trash icon (right edge of the row)
-                val trashWidth = cellRenderer.getTrashIconWidth()
-                val trashStart = cellBounds.x + cellBounds.width - trashWidth
-                if (e.x >= trashStart && e.clickCount == 1) {
-                    itemList.selectedIndex = index
-                    removeSelectedItem()
+                // Checkbox zone (left edge) — toggles include/exclude for any kind.
+                if (e.clickCount == 1 && e.x - cellBounds.x < cellRenderer.getCheckboxWidth()) {
+                    toggleExclusion(item)
                     return
                 }
 
-                if (e.clickCount == 2) {
-                    val selected = itemList.selectedValue ?: return
-                    when (selected) {
-                        is ListItem.PlanItem -> openPlan(selected.plan)
-                        is ListItem.NoteItem -> openNote(selected.note)
-                        is ListItem.ReferenceItem -> openReference(selected.ref)
+                // Action zone (right edge): pin | edit | delete (left→right).
+                val offsetFromRight = (cellBounds.x + cellBounds.width) - e.x
+                if (e.clickCount == 1 && offsetFromRight in 0..cellRenderer.getActionsWidth()) {
+                    val slot = cellRenderer.getActionSlotWidth()
+                    when {
+                        offsetFromRight <= slot -> { itemList.selectedIndex = index; removeSelectedItem() } // delete
+                        offsetFromRight <= slot * 2 -> openItem(item) // edit
+                        else -> pinItem(item) // pin
                     }
+                    return
                 }
+
+                if (e.clickCount == 2) openItem(item)
             }
         })
 
-        // Show hand cursor when hovering over the trash icon zone + trigger hover popup
+        // Hover: reveal the action icons on the hovered row + hand cursor over click zones.
         itemList.addMouseMotionListener(object : MouseAdapter() {
             override fun mouseMoved(e: MouseEvent) {
                 val index = itemList.locationToIndex(e.point)
-                if (index >= 0) {
-                    val cellBounds = itemList.getCellBounds(index, index)
-                    if (cellBounds != null && cellBounds.contains(e.point)) {
-                        // Cursor: hand over trash icon
-                        val renderer = itemList.cellRenderer as? PlansAndNotesCellRenderer
-                        val trashWidth = renderer?.getTrashIconWidth() ?: 30
-                        val trashStart = cellBounds.x + cellBounds.width - trashWidth
-                        if (e.x >= trashStart) {
-                            itemList.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-                        } else {
-                            itemList.cursor = Cursor.getDefaultCursor()
-                        }
-
-                        // Hover popup: schedule show if moved to a new cell
-                        if (index != hoverIndex || hoverPopup?.isVisible != true) {
-                            scheduleShowHoverPopup(index)
-                        }
-                        return
+                val cellBounds = if (index >= 0) itemList.getCellBounds(index, index) else null
+                if (cellBounds != null && cellBounds.contains(e.point)) {
+                    if (index != actionHoverIndex) {
+                        val old = actionHoverIndex
+                        actionHoverIndex = index
+                        repaintRow(old)
+                        repaintRow(index)
                     }
+                    val offsetFromRight = (cellBounds.x + cellBounds.width) - e.x
+                    val overActions = offsetFromRight in 0..cellRenderer.getActionsWidth()
+                    val overCheckbox = e.x - cellBounds.x < cellRenderer.getCheckboxWidth()
+                    itemList.cursor = if (overActions || overCheckbox) {
+                        Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                    } else {
+                        Cursor.getDefaultCursor()
+                    }
+                    if (index != hoverIndex || hoverPopup?.isVisible != true) {
+                        scheduleShowHoverPopup(index)
+                    }
+                    return
                 }
                 itemList.cursor = Cursor.getDefaultCursor()
+                clearActionHover()
                 scheduleHoverDismiss()
             }
         })
 
-        // Dismiss hover popup when mouse leaves the list
+        // Dismiss hover popup + action icons when mouse leaves the list
         itemList.addMouseListener(object : MouseAdapter() {
-            override fun mouseExited(e: MouseEvent) { scheduleHoverDismiss() }
+            override fun mouseExited(e: MouseEvent) {
+                clearActionHover()
+                scheduleHoverDismiss()
+            }
         })
 
         // Right-click context menu with "Remove" option
@@ -323,14 +345,85 @@ class PlansPanel(
         }
     }
 
-    private fun toggleReferenceExclusion(mapKey: String) {
-        val currentlyExcluded = mapKey in excludedReferences
+    /** (kind, key) used by CommitSelectionStore / PinStore for a given list item. */
+    private fun kindKeyOf(item: ListItem): Pair<String, String> = when (item) {
+        is ListItem.PlanItem -> "plans" to item.plan.slug
+        is ListItem.NoteItem -> "notes" to item.note.id
+        is ListItem.ReferenceItem -> "references" to item.mapKey
+    }
+
+    private fun isExcluded(item: ListItem): Boolean {
+        val (kind, key) = kindKeyOf(item)
+        return when (kind) {
+            "plans" -> key in excludedPlans
+            "notes" -> key in excludedNotes
+            else -> key in excludedReferences
+        }
+    }
+
+    /** Toggles include/exclude for any item kind (checkbox click). */
+    private fun toggleExclusion(item: ListItem) {
+        val (kind, key) = kindKeyOf(item)
+        val nowExcluded = !isExcluded(item)
         val cwd = service.mainRepoRoot ?: project.basePath ?: return
         ApplicationManager.getApplication().executeOnPooledThread {
-            CommitSelectionStore.setExcluded(cwd, "references", mapKey, !currentlyExcluded)
-            // Re-read exclusions and repaint
-            excludedReferences = CommitSelectionStore.readExclusions(cwd).references
+            CommitSelectionStore.setExcluded(cwd, kind, key, nowExcluded)
+            val ex = CommitSelectionStore.readExclusions(cwd)
+            excludedReferences = ex.references
+            excludedPlans = ex.plans
+            excludedNotes = ex.notes
             SwingUtilities.invokeLater { itemList.repaint() }
+        }
+    }
+
+    /** Pins an item so it appears in the Pinned section (pin hover action). */
+    private fun pinItem(item: ListItem) {
+        val (kind, key) = kindKeyOf(item)
+        val title = when (item) {
+            is ListItem.PlanItem -> item.plan.title.ifBlank { item.plan.slug }
+            is ListItem.NoteItem -> item.note.title
+            is ListItem.ReferenceItem -> when (item.ref.source) {
+                SourceId.notion -> item.ref.title
+                else -> "${item.ref.nativeId} — ${item.ref.title}"
+            }
+        }
+        // Same letter tag the Context row shows, so the Pinned row mirrors the icon.
+        val badge = when (item) {
+            is ListItem.PlanItem -> "P"
+            is ListItem.NoteItem -> if (item.note.format == NoteFormat.snippet) "S" else "N"
+            is ListItem.ReferenceItem -> when (item.ref.source) {
+                SourceId.linear -> "L"
+                SourceId.github -> "GH"
+                SourceId.jira -> "J"
+                SourceId.notion -> "No"
+            }
+        }
+        val cwd = service.mainRepoRoot ?: project.basePath ?: return
+        ApplicationManager.getApplication().executeOnPooledThread {
+            PinStore.pin(cwd, kind, key, title, badge)
+            SwingUtilities.invokeLater { service.panelRegistry?.pinnedPanel?.refresh() }
+        }
+    }
+
+    /** Opens an item in its editor / detail view (edit hover action, double-click). */
+    private fun openItem(item: ListItem) {
+        when (item) {
+            is ListItem.PlanItem -> openPlan(item.plan)
+            is ListItem.NoteItem -> openNote(item.note)
+            is ListItem.ReferenceItem -> openReference(item.ref)
+        }
+    }
+
+    private fun repaintRow(index: Int) {
+        if (index < 0) return
+        itemList.getCellBounds(index, index)?.let { itemList.repaint(it) }
+    }
+
+    private fun clearActionHover() {
+        if (actionHoverIndex != -1) {
+            val old = actionHoverIndex
+            actionHoverIndex = -1
+            repaintRow(old)
         }
     }
 
@@ -365,7 +458,10 @@ class PlansPanel(
             val currentBranch = gitOps?.getCurrentBranch()
             val registry = SessionTracker.loadPlansRegistry(cwd)
 
-            excludedReferences = CommitSelectionStore.readExclusions(cwd).references
+            val ex = CommitSelectionStore.readExclusions(cwd)
+            excludedReferences = ex.references
+            excludedPlans = ex.plans
+            excludedNotes = ex.notes
 
             val planItems = filterPlans(registry.plans, gitOps, currentBranch)
                 .map { ListItem.PlanItem(it) }
@@ -709,196 +805,136 @@ class PlansPanel(
      * - Note (committed): lock (green) icon
      */
     private inner class PlansAndNotesCellRenderer : ListCellRenderer<ListItem> {
-        private val panel = JPanel(BorderLayout()).apply { border = JBUI.Borders.empty(4, 8) }
+        private val panel = JPanel(BorderLayout()).apply { border = JBUI.Borders.empty(3, 8) }
         private val checkBox = JCheckBox().apply { isOpaque = false }
-        private val iconLabel = JLabel()
+        private val tagLabel = TagLabel()
         private val titleLabel = JLabel()
-        private val metaLabel = JLabel()
-        private val ageLabel = JLabel().apply {
-            foreground = Color.GRAY
-            border = JBUI.Borders.emptyLeft(4)
-        }
-        private val trashLabel = JLabel(JolliMemoryIcons.Trash).apply {
-            toolTipText = "Remove"
-            border = JBUI.Borders.emptyLeft(6)
-            cursor = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
-        }
+        private val pinLabel = actionIcon(AllIcons.Nodes.Favorite, "Pin")
+        private val editLabel = actionIcon(AllIcons.Actions.Edit, "Edit")
+        private val trashLabel = actionIcon(JolliMemoryIcons.Trash, "Delete")
 
-        /** Returns the width of the trash icon click zone (icon 16px + left border 6px + panel right padding 8px). */
-        fun getTrashIconWidth(): Int = 30
+        /** Checkbox click zone (checkbox ~20px + left padding 8px). */
+        fun getCheckboxWidth(): Int = JBUI.scale(28)
 
-        /** Returns the width of the checkbox click zone (checkbox ~20px + left padding 8px). */
-        fun getCheckboxWidth(): Int = 28
+        /** Width of one hover-action slot (icon + gap). */
+        fun getActionSlotWidth(): Int = JBUI.scale(24)
+
+        /** Total width of the pin/edit/delete action strip on the right. */
+        fun getActionsWidth(): Int = getActionSlotWidth() * 3
+
+        private fun actionIcon(icon: javax.swing.Icon, tip: String): JLabel = JLabel(icon).apply {
+            toolTipText = tip
+            border = JBUI.Borders.empty(0, 3)
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        }
 
         override fun getListCellRendererComponent(
             list: JList<out ListItem>, value: ListItem, index: Int,
             isSelected: Boolean, cellHasFocus: Boolean,
         ): Component {
-            val isRef = value is ListItem.ReferenceItem
-            when (value) {
-                is ListItem.PlanItem -> renderPlan(value.plan, list, isSelected)
-                is ListItem.NoteItem -> renderNote(value.note, list, isSelected)
-                is ListItem.ReferenceItem -> renderReference(value.ref, list, isSelected, value.mapKey)
-            }
+            // Column layout (mockup parity): [checkbox] [type tag] [title] …hover[pin][edit][delete]
+            val (letter, color) = tagFor(value)
+            checkBox.isSelected = !isExcluded(value)
+            tagLabel.setBadge(letter, color)
+            titleLabel.text = titleFor(value)
+            titleLabel.font = list.font
+            titleLabel.foreground = if (isSelected) list.selectionForeground else list.foreground
 
             panel.removeAll()
 
-            // References get a checkbox on the left; plans/notes do not
-            if (isRef) {
-                val leftPanel = JPanel(BorderLayout()).apply {
+            val left = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(2), 0)).apply {
+                isOpaque = false
+                add(checkBox)
+                add(tagLabel)
+            }
+            panel.add(left, BorderLayout.WEST)
+            // Min size 0 so BorderLayout.CENTER can shrink the title and it ellipsizes ("…").
+            titleLabel.minimumSize = Dimension(0, 0)
+            panel.add(titleLabel, BorderLayout.CENTER)
+
+            // Action icons appear only on the hovered row, anchored to the right edge.
+            if (index == actionHoverIndex) {
+                val actions = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
                     isOpaque = false
-                    add(checkBox, BorderLayout.WEST)
-                    add(iconLabel, BorderLayout.CENTER)
+                    add(pinLabel)
+                    add(editLabel)
+                    add(trashLabel)
                 }
-                panel.add(leftPanel, BorderLayout.WEST)
-            } else {
-                panel.add(iconLabel, BorderLayout.WEST)
+                panel.add(actions, BorderLayout.EAST)
             }
 
-            val center = JPanel(BorderLayout()).apply {
-                isOpaque = false
-                add(titleLabel, BorderLayout.WEST)
-                add(metaLabel, BorderLayout.CENTER)
-            }
-            panel.add(center, BorderLayout.CENTER)
-
-            ageLabel.text = formatAge(value.lastModified)
-            ageLabel.font = list.font
-
-            val rightPanel = JPanel(BorderLayout()).apply {
-                isOpaque = false
-                add(ageLabel, BorderLayout.CENTER)
-                add(trashLabel, BorderLayout.EAST)
-            }
-            panel.add(rightPanel, BorderLayout.EAST)
             panel.background = if (isSelected) list.selectionBackground else list.background
 
+            // Pin the cell to the list's visible width so a long title truncates with "…"
+            // instead of widening the cell and pushing the hover icons past the window edge.
+            panel.preferredSize = null
+            val listWidth = list.width
+            if (listWidth > 0) {
+                panel.preferredSize = Dimension(listWidth, panel.preferredSize.height)
+            }
             return panel
         }
 
-        private fun renderPlan(plan: PlanEntry, list: JList<*>, isSelected: Boolean) {
-            iconLabel.icon = if (plan.commitHash != null) JolliMemoryIcons.Lock else JolliMemoryIcons.FileText
-
-            // Match VS Code: "shortHash · title" for committed, plain title for uncommitted
-            val displayTitle = if (plan.commitHash != null) {
-                "${plan.commitHash.take(8)} \u00b7 ${plan.title.ifBlank { plan.slug }}"
-            } else {
-                plan.title.ifBlank { plan.slug }
+        /** Single/double-letter type tag + accent color (mockup `kb-tag` parity). */
+        private fun tagFor(item: ListItem): Pair<String, Color> = when (item) {
+            is ListItem.PlanItem -> "P" to TAG_PLAN
+            is ListItem.NoteItem ->
+                if (item.note.format == NoteFormat.snippet) "S" to TAG_SNIPPET else "N" to TAG_NOTE
+            is ListItem.ReferenceItem -> when (item.ref.source) {
+                SourceId.linear -> "L" to TAG_LINEAR
+                SourceId.github -> "GH" to TAG_GITHUB
+                SourceId.jira -> "J" to TAG_JIRA
+                SourceId.notion -> "No" to TAG_NOTION
             }
-            titleLabel.text = displayTitle
-            titleLabel.font = list.font
-            titleLabel.foreground = if (isSelected) list.selectionForeground else list.foreground
-
-            val editStr = "${plan.editCount} edit${if (plan.editCount != 1) "s" else ""}"
-            metaLabel.text = " $editStr"
-            metaLabel.font = list.font
-            metaLabel.foreground = Color.GRAY
-
         }
 
-        private fun renderNote(note: NoteEntry, list: JList<*>, isSelected: Boolean) {
-            // Match VS Code: lock for committed, comment for snippet, note for markdown
-            iconLabel.icon = when {
-                note.commitHash != null -> JolliMemoryIcons.Lock
-                note.format == NoteFormat.snippet -> JolliMemoryIcons.Comment
-                else -> JolliMemoryIcons.Note
+        private fun titleFor(item: ListItem): String = when (item) {
+            is ListItem.PlanItem -> {
+                val t = item.plan.title.ifBlank { item.plan.slug }
+                if (item.plan.commitHash != null) "${item.plan.commitHash.take(8)} · $t" else t
             }
-
-            // Match VS Code: "shortHash · title" for committed, plain title for uncommitted
-            val displayTitle = if (note.commitHash != null) {
-                "${note.commitHash.take(8)} \u00b7 ${note.title}"
-            } else {
-                note.title
-            }
-            titleLabel.text = displayTitle
-            titleLabel.font = list.font
-            titleLabel.foreground = if (isSelected) list.selectionForeground else list.foreground
-
-            val formatStr = if (note.format == NoteFormat.snippet) "snippet" else "markdown"
-            metaLabel.text = " $formatStr"
-            metaLabel.font = list.font
-            metaLabel.foreground = Color.GRAY
-
-        }
-
-        private fun renderReference(ref: ReferenceEntry, list: JList<*>, isSelected: Boolean, mapKey: String) {
-            // Checked = included (not excluded)
-            checkBox.isSelected = mapKey !in excludedReferences
-            // Match VS Code: issues icon for linear/jira/github, file-text for notion
-            iconLabel.icon = when (ref.source) {
-                SourceId.notion -> JolliMemoryIcons.FileText
-                else -> JolliMemoryIcons.Issues
-            }
-
-            // Match VS Code: "NATIVE_ID — Title" for linear/jira/github, just title for notion
-            val displayTitle = when (ref.source) {
-                SourceId.notion -> ref.title
-                else -> "${ref.nativeId} \u2014 ${ref.title}"
-            }
-            titleLabel.text = displayTitle
-            titleLabel.font = list.font
-            titleLabel.foreground = if (isSelected) list.selectionForeground else list.foreground
-
-            metaLabel.text = " ${ref.source.name}"
-            metaLabel.font = list.font
-            metaLabel.foreground = Color.GRAY
-
-        }
-
-        /** Builds a rich HTML tooltip showing reference fields (status, priority, labels) from the markdown file. */
-        fun buildReferenceTooltip(ref: ReferenceEntry): String {
-            val sourceLabel = when (ref.source) {
-                SourceId.linear -> "Linear"
-                SourceId.jira -> "Jira"
-                SourceId.github -> "GitHub"
-                SourceId.notion -> "Notion"
-            }
-
-            val sb = StringBuilder("<html><div style='padding:2px 4px'>")
-            sb.append("<p><b>${escapeHtml(ref.nativeId)} \u2014 ${escapeHtml(ref.title)}</b></p>")
-
-            // Parse fields from the backing markdown file
-            if (ref.sourcePath != null) {
-                val parsed = ReferenceStore.readReferenceMarkdown(ref.sourcePath)
-                if (parsed?.fields != null) {
-                    sb.append("<table cellpadding='1' cellspacing='0'>")
-                    for (f in parsed.fields) {
-                        sb.append("<tr><td style='color:gray'>${escapeHtml(f.label)}</td><td style='padding-left:8px'>${escapeHtml(f.value)}</td></tr>")
-                    }
-                    sb.append("</table>")
+            is ListItem.NoteItem ->
+                if (item.note.commitHash != null) {
+                    "${item.note.commitHash.take(8)} · ${item.note.title}"
+                } else {
+                    item.note.title
                 }
+            is ListItem.ReferenceItem -> when (item.ref.source) {
+                SourceId.notion -> item.ref.title
+                else -> "${item.ref.nativeId} — ${item.ref.title}"
             }
+        }
+    }
 
-            sb.append("<p style='color:gray'>${escapeHtml(sourceLabel)}</p>")
-            sb.append("</div></html>")
-            return sb.toString()
+    /** A small rounded badge painting a 1–2 letter context-type tag (mockup `kb-tag`). */
+    private inner class TagLabel : JLabel("", SwingConstants.CENTER) {
+        private var badgeColor: Color = JBColor.GRAY
+
+        init {
+            isOpaque = false
+            foreground = Color.WHITE
+            font = JBUI.Fonts.label(9f).deriveFont(Font.BOLD)
         }
 
-        private fun escapeHtml(s: String): String =
-            s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        fun setBadge(text: String, color: Color) {
+            this.text = text
+            this.badgeColor = color
+        }
 
-        private fun formatAge(isoDate: String): String {
-            val millis = try {
-                java.time.Instant.parse(isoDate).toEpochMilli()
-            } catch (_: Exception) { return "" }
-            val diff = System.currentTimeMillis() - millis
-            if (diff < 0) return "just now"
-            val seconds = diff / 1000
-            val minutes = seconds / 60
-            val hours = minutes / 60
-            val days = hours / 24
-            val weeks = days / 7
-            val months = days / 30
-            val years = days / 365
-            return when {
-                seconds < 60 -> "just now"
-                minutes < 60 -> "${minutes}m ago"
-                hours < 24 -> "${hours}h ago"
-                days < 7 -> "${days}d ago"
-                weeks < 5 -> "${weeks}w ago"
-                months < 12 -> "${months}mo ago"
-                else -> "${years}y ago"
+        override fun getPreferredSize(): Dimension =
+            Dimension(JBUI.scale(if (text.length > 1) 24 else 18), JBUI.scale(16))
+
+        override fun paintComponent(g: Graphics) {
+            val g2 = g.create() as Graphics2D
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                g2.color = badgeColor
+                val arc = JBUI.scale(6)
+                g2.fillRoundRect(0, 0, width - 1, height - 1, arc, arc)
+            } finally {
+                g2.dispose()
             }
+            super.paintComponent(g)
         }
     }
 }

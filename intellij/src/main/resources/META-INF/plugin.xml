@@ -148,6 +148,12 @@
                     icon="AllIcons.Actions.Refresh"/>
         </group>
 
+        <!-- Pinned panel actions (redesign: top-level "Pinned" section) -->
+        <group id="JolliMemory.PinnedActions" text="JolliMemory Pinned"/>
+
+        <!-- Current Memory panel actions (redesign: top-level "Current Memory" section) -->
+        <group id="JolliMemory.CurrentMemoryActions" text="JolliMemory Current Memory"/>
+
         <!-- Standalone action (not in a panel toolbar) -->
         <action id="JolliMemory.ViewSummary"
                 class="ai.jolli.jollimemory.actions.ViewSummaryAction"
