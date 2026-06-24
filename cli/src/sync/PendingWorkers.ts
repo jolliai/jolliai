@@ -45,6 +45,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { runWithoutTrace } from "../core/TraceContext.js";
 import { createLogger } from "../Logger.js";
 import { canonicaliseLocalFolder } from "./VaultLockPath.js";
 
@@ -192,7 +193,10 @@ export async function wakePendingWorkers(
 		if (selfCwd !== undefined && cwd === selfCwd) continue;
 		try {
 			log.info("Waking pending worker for cwd=%s", cwd);
-			launch(cwd);
+			// Wake outside the current trace: a pending worker is a different
+			// repo's operation (selfCwd is skipped above), so the current trace id
+			// must not leak into the spawned worker via launchWorker's env stamp.
+			runWithoutTrace(() => launch(cwd));
 		} catch (e) {
 			log.warn("wakePendingWorkers: launch failed for cwd=%s (non-fatal): %s", cwd, (e as Error).message);
 		}

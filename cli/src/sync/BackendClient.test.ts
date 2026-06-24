@@ -5,6 +5,7 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+import { runWithTrace } from "../core/TraceContext.js";
 import { BackendClient, SyncBackendNetworkError, SyncBackendUnauthorizedError } from "./BackendClient.js";
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -124,6 +125,22 @@ describe("BackendClient.mintGitCredentials", () => {
 		expect(capturedHeaders?.get("x-tenant-slug")).toBe("acme");
 		expect(capturedHeaders?.get("x-org-slug")).toBe("org-acme");
 		expect(capturedBody).toBe("{}");
+		// No trace scope here → a fresh standalone value (every request is traceable).
+		expect(capturedHeaders?.get("x-jolli-trace")).toMatch(/^[0-9a-f]{32}-[0-9a-f]{16}$/);
+	});
+
+	it("injects an x-jolli-trace value carrying the ambient trace id", async () => {
+		let capturedHeaders: Headers | undefined;
+		const fetchImpl = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+			capturedHeaders = new Headers(init?.headers);
+			return jsonResponse(200, mintResponse());
+		}) as unknown as typeof fetch;
+		const client = makeClient({ fetchImpl });
+		const traceId = "b".repeat(32);
+
+		await runWithTrace(traceId, () => client.mintGitCredentials());
+
+		expect(capturedHeaders?.get("x-jolli-trace")).toMatch(new RegExp(`^${traceId}-[0-9a-f]{16}$`));
 	});
 
 	it("derives base URL from the jolliApiKey when no override is supplied", async () => {

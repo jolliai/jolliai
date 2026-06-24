@@ -91,7 +91,12 @@ object JmLogger {
     private fun formatMessage(level: LogLevel, module: String, message: String): String {
         val timestamp = Instant.now().toString()
         val levelTag = level.name.uppercase().padEnd(5)
-        return "[$timestamp] $levelTag [$module] $message"
+        // Stamp the ambient trace id (when inside a `TraceContext.withTrace`
+        // operation scope) so every line of one operation can be grepped against
+        // the backend by the same id. Matches the TS core logger's `[trace=]` tag.
+        val traceId = TraceContext.getCurrentTraceId()
+        val traceTag = if (traceId != null) " [trace=$traceId]" else ""
+        return "[$timestamp] $levelTag [$module]$traceTag $message"
     }
 
     private fun writeToFile(line: String) {

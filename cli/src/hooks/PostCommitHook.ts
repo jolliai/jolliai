@@ -13,6 +13,7 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getCurrentTraceId, runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
 import { createLogger } from "../Logger.js";
 import type { CommitSource, GitOperation } from "../Types.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
@@ -104,7 +105,11 @@ export function postCommitEntry(cwd: string): void {
 		}
 	}
 
-	// Enqueue the operation
+	// Enqueue the operation. Stamp the ambient trace id (seeded at the entry
+	// point below) onto the entry so the detached worker adopts it when it
+	// drains this commit — unifying the hook's logs, the worker's logs, and the
+	// outbound LLM/push calls under one id across the process boundary.
+	const traceId = getCurrentTraceId();
 	const op: GitOperation = {
 		type: opType,
 		commitHash,
@@ -112,6 +117,7 @@ export function postCommitEntry(cwd: string): void {
 		...(sourceHashes && { sourceHashes }),
 		commitSource,
 		createdAt: new Date().toISOString(),
+		...(traceId && { traceId }),
 	};
 
 	// Write queue entry synchronously (post-commit hook must return quickly)
@@ -176,7 +182,9 @@ function isMainScript(): boolean {
 }
 
 if (isMainScript()) {
-	// Post-commit hook entry: detect operation type, enqueue, and spawn Worker
-	postCommitEntry(process.cwd());
+	// Post-commit hook entry: detect operation type, enqueue, and spawn Worker.
+	// Adopt a parent-supplied trace id (JOLLI_TRACE_ID) if present, else mint
+	// one; the whole entry — including the GitOperation we enqueue — runs under it.
+	runWithTrace(traceIdFromEnv(), () => postCommitEntry(process.cwd()));
 }
 /* v8 ignore stop */

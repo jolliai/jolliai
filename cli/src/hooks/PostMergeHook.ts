@@ -18,6 +18,7 @@
 import { execGit } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
 import { loadConfig } from "../core/SessionTracker.js";
+import { runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import { launchWorker } from "./QueueWorker.js";
 
@@ -135,9 +136,14 @@ export async function handlePostMerge(cwd: string): Promise<void> {
 /* v8 ignore start */
 if (!process.env.VITEST) {
 	const cwd = process.cwd();
-	handlePostMerge(cwd).catch((error: unknown) => {
-		const errorLog = createLogger("PostMergeHook");
-		errorLog.error("Post-merge hook failed: %s", error instanceof Error ? error.message : String(error));
-	});
+	// Adopt a parent-supplied trace id (JOLLI_TRACE_ID) if present, else mint one,
+	// so the hook's logs and the worker it spawns share one id (same as the
+	// post-commit / post-rewrite entries).
+	runWithTrace(traceIdFromEnv(), () =>
+		handlePostMerge(cwd).catch((error: unknown) => {
+			const errorLog = createLogger("PostMergeHook");
+			errorLog.error("Post-merge hook failed: %s", error instanceof Error ? error.message : String(error));
+		}),
+	);
 }
 /* v8 ignore stop */

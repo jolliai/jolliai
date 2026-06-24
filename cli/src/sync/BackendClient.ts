@@ -47,6 +47,7 @@
 
 import { JOLLI_CLIENT_HEADER } from "../core/ClientHeader.js";
 import { parseBaseUrl, parseJolliApiKey } from "../core/JolliApiUtils.js";
+import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "../core/TraceContext.js";
 import type { GitCredentials, LegacyContentResponse } from "./SyncTypes.js";
 
 /** Generic non-2xx response from the sync backend. */
@@ -374,6 +375,10 @@ export class BackendClient {
 		if (keyMeta.o) {
 			headers["x-org-slug"] = keyMeta.o;
 		}
+		// Jolli trace context: propagate the ambient sync-round trace id so the
+		// backend can correlate this mb-sync call. Every outbound request is
+		// traceable — outside any trace scope we mint a fresh standalone value.
+		headers[TRACE_HEADER_NAME] = currentTraceHeader() ?? newTraceHeader();
 
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), this.timeoutMs);

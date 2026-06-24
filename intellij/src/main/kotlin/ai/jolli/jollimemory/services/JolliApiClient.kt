@@ -2,6 +2,7 @@ package ai.jolli.jollimemory.services
 
 import ai.jolli.jollimemory.auth.JolliConfigStore
 import ai.jolli.jollimemory.core.JmLogger
+import ai.jolli.jollimemory.core.TraceContext
 import com.google.gson.Gson
 import java.net.URI
 import java.net.http.HttpClient
@@ -201,6 +202,11 @@ object JolliApiClient {
             requestBuilder.header("x-org-slug", keyMeta.o)
         }
 
+        // Jolli trace context: carry the ambient operation's id (set by the
+        // withTrace scope around the action) so this request shares one id with
+        // the operation's log lines; fall back to a fresh value outside any scope.
+        requestBuilder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
+
         val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
         val raw = response.body() ?: ""
         val statusCode = response.statusCode()
@@ -233,6 +239,11 @@ object JolliApiClient {
         if (keyMeta?.o != null) {
             requestBuilder.header("x-org-slug", keyMeta.o)
         }
+
+        // Jolli trace context: carry the ambient operation's id (set by the
+        // withTrace scope around the action) so this request shares one id with
+        // the operation's log lines; fall back to a fresh value outside any scope.
+        requestBuilder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
 
         val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
         val statusCode = response.statusCode()
@@ -297,6 +308,11 @@ object JolliApiClient {
             requestBuilder.header("x-org-slug", keyMeta.o)
         }
 
+        // Jolli trace context: carry the ambient operation's id (set by the
+        // withTrace scope around the action) so this request shares one id with
+        // the operation's log lines; fall back to a fresh value outside any scope.
+        requestBuilder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
+
         val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
         val raw = response.body() ?: ""
         val statusCode = response.statusCode()
@@ -352,6 +368,11 @@ object JolliApiClient {
         if (keyMeta?.o != null) {
             requestBuilder.header("x-org-slug", keyMeta.o)
         }
+
+        // Jolli trace context: carry the ambient operation's id (set by the
+        // withTrace scope around the action) so this request shares one id with
+        // the operation's log lines; fall back to a fresh value outside any scope.
+        requestBuilder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
 
         val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
         val raw = response.body() ?: ""
@@ -433,6 +454,11 @@ object JolliApiClient {
         if (keyMeta?.o != null) {
             requestBuilder.header("x-org-slug", keyMeta.o)
         }
+
+        // Jolli trace context: carry the ambient operation's id (set by the
+        // withTrace scope around the action) so this request shares one id with
+        // the operation's log lines; fall back to a fresh value outside any scope.
+        requestBuilder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
 
         val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
         val raw = response.body() ?: ""

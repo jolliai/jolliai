@@ -31,6 +31,7 @@ import {
 	generateRecap,
 	translateToEnglish,
 } from "../../../cli/src/core/Summarizer.js";
+import { runWithTrace } from "../../../cli/src/core/TraceContext.js";
 import {
 	getTranscriptHashes as coreGetTranscriptHashes,
 	readNoteFromBranch,
@@ -479,9 +480,12 @@ export class SummaryWebviewPanel {
 			/* v8 ignore stop */
 		});
 
-		// Handle messages from the webview
+		// Handle messages from the webview. Each message is one logical operation
+		// (push, regenerate, editTopic, …) — run it in a fresh `runWithTrace`
+		// scope so all its log lines and every backend request it makes share one
+		// trace id that can be grepped against the backend logs.
 		this.panel.webview.onDidReceiveMessage((message: WebviewMessage) => {
-			this.dispatchWebviewMessage(message);
+			runWithTrace(undefined, () => this.dispatchWebviewMessage(message));
 		});
 	}
 

@@ -35,6 +35,7 @@ import {
 	parseBaseUrl,
 	parseJolliApiKey,
 } from "../../../cli/src/core/JolliApiUtils.js";
+import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "../../../cli/src/core/TraceContext.js";
 import { type ClientInfo, VSCODE_CLIENT_INFO } from "./ClientInfo.js";
 
 export { parseJolliApiKey, type JolliApiKeyMeta, type ClientInfo };
@@ -150,6 +151,11 @@ export function buildJolliApiHeaders(params: {
 	if (params.keyMeta?.o) {
 		headers["x-org-slug"] = params.keyMeta.o;
 	}
+	// Jolli trace context: carry the ambient operation's trace id (set by the
+	// `runWithTrace` scope around the webview dispatch) so this request shares one
+	// id with the operation's log lines. Outside any scope (standalone one-shot
+	// callers) fall back to a fresh value so the request is still traceable.
+	headers[TRACE_HEADER_NAME] = currentTraceHeader() ?? newTraceHeader();
 	return headers;
 }
 

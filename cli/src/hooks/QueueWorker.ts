@@ -96,6 +96,7 @@ import {
 import { resolveTranscriptIdsFiltered } from "../core/SummaryTree.js";
 import { getTelemetryContext, track } from "../core/Telemetry.js";
 import { bootstrapTelemetry, flushTelemetryNow } from "../core/TelemetryStartup.js";
+import { getCurrentTraceId, runWithTrace, TRACE_ID_ENV, traceIdFromEnv } from "../core/TraceContext.js";
 import { generateTranscriptId } from "../core/TranscriptId.js";
 import { getParserForSource } from "../core/TranscriptParser.js";
 import type { SessionTranscript } from "../core/TranscriptReader.js";
@@ -252,10 +253,17 @@ export function launchWorker(cwd: string): void {
 	// code — and with `stdio: "ignore"` that crash is invisible, so the worker
 	// silently never starts and no summaries are generated. Keep the argv
 	// flag-free; suppressing cosmetic warnings is not worth breaking startup.
+	// Propagate the ambient trace id (the enqueuer's, when launchWorker runs
+	// inside a hook's trace scope) to the detached worker via JOLLI_TRACE_ID so
+	// the worker's own process-level logs — startup, lock, chain-spawn — share
+	// that id. Per-entry work overrides it with the entry's own op.traceId. No
+	// ambient trace → no env override, and the worker mints its own.
+	const traceId = getCurrentTraceId();
 	const child = spawnHidden(process.execPath, [scriptPath, "--worker", "--cwd", cwd], {
 		detached: true,
 		stdio: "ignore",
 		cwd,
+		...(traceId ? { env: { ...process.env, [TRACE_ID_ENV]: traceId } } : {}),
 	});
 	child.unref();
 
@@ -518,7 +526,18 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 						continue;
 					}
 					try {
-						await processQueueEntry(op, cwd, storage, force);
+						// Adopt the trace id stamped on the entry at enqueue time so this
+						// commit's summarize/consolidate logs + outbound LLM/push calls
+						// share one id with the enqueuing hook across the process
+						// boundary. Stale pre-trace-id entries fall back to the worker's
+						// own ambient id (env-seeded by launchWorker, else freshly minted)
+						// so they still correlate with the worker draining them.
+						// Capture `storage` (narrowed non-null here) in a const so the
+						// closure below doesn't widen it back to `StorageProvider | null`.
+						const activeStorage = storage;
+						await runWithTrace(op.traceId ?? getCurrentTraceId(), () =>
+							processQueueEntry(op, cwd, activeStorage, force),
+						);
 						committedThisRun = true;
 					} catch (error: unknown) {
 						// Queue entries are deleted regardless of success or failure (fire-and-forget).
@@ -2985,22 +3004,29 @@ if (isMainScript()) {
 		const cwdIndex = args.indexOf("--cwd");
 		const cwd = cwdIndex >= 0 && args[cwdIndex + 1] ? args[cwdIndex + 1] : process.cwd();
 
-		// Bootstrap telemetry first so ingest-path track() calls (ingest_completed,
-		// error_occurred) emit in this worker process, then drain, then flush the
-		// buffer once the drain completes — the long-lived worker is the natural
-		// send point for events that short-lived CLI / hook invocations only
-		// buffered. All best-effort; never blocks exit on a telemetry error.
-		bootstrapTelemetry({ cwd })
-			.then(() => runWorker(cwd))
-			.then(() => flushTelemetryNow(cwd))
-			.catch((_error: unknown) => {
-				// Log a static message only — never anything derived from the error.
-				// In the flush/sync chain an error can carry a jolliApiKey (e.g. in
-				// request headers), so nothing error-derived may reach the log sink
-				// (CodeQL js/clear-text-logging).
-				console.error("[QueueWorker] Fatal error: worker bootstrap/drain failed.");
-				process.exit(1);
-			});
+		// Adopt the enqueuer's trace id (JOLLI_TRACE_ID, set by launchWorker) for
+		// the worker's process-level logs; each drained entry overrides it with
+		// its own op.traceId inside runWorker. Absent env → a fresh id is minted.
+		//
+		// Inside the trace context: bootstrap telemetry first so ingest-path
+		// track() calls (ingest_completed, error_occurred) emit in this worker
+		// process, then drain, then flush the buffer once the drain completes —
+		// the long-lived worker is the natural send point for events that
+		// short-lived CLI / hook invocations only buffered. All best-effort;
+		// never blocks exit on a telemetry error.
+		runWithTrace(traceIdFromEnv(), () =>
+			bootstrapTelemetry({ cwd })
+				.then(() => runWorker(cwd))
+				.then(() => flushTelemetryNow(cwd))
+				.catch((_error: unknown) => {
+					// Log a static message only — never anything derived from the error.
+					// In the flush/sync chain an error can carry a jolliApiKey (e.g. in
+					// request headers), so nothing error-derived may reach the log sink
+					// (CodeQL js/clear-text-logging).
+					console.error("[QueueWorker] Fatal error: worker bootstrap/drain failed.");
+					process.exit(1);
+				}),
+		);
 	}
 }
 /* v8 ignore stop */

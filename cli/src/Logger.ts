@@ -8,6 +8,7 @@
 
 import { appendFile, readdir, rename, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { getCurrentTraceId } from "./core/TraceContext.js";
 import type { LogLevel } from "./Types.js";
 
 /** The .jolli/jollimemory directory name within a project */
@@ -127,8 +128,19 @@ export interface Logger {
 /**
  * Formats a log message with timestamp and module tag.
  * Uses printf-style formatting for consistency.
+ *
+ * `traceId` is the ambient W3C trace id. When present it is
+ * rendered as a `[trace=<id>]` tag after the module so local debug.log lines
+ * can be correlated with the backend logs of the same operation. Passed
+ * explicitly (rather than read here) to keep this function pure/testable.
  */
-export function formatLogMessage(level: LogLevel, module: string, message: string, args: unknown[]): string {
+export function formatLogMessage(
+	level: LogLevel,
+	module: string,
+	message: string,
+	args: unknown[],
+	traceId?: string,
+): string {
 	const timestamp = new Date().toISOString();
 	const levelTag = level.toUpperCase().padEnd(5);
 
@@ -143,7 +155,8 @@ export function formatLogMessage(level: LogLevel, module: string, message: strin
 		return String(arg);
 	});
 
-	return `[${timestamp}] ${levelTag} [${module}] ${formatted}`;
+	const traceTag = traceId ? ` [trace=${traceId}]` : "";
+	return `[${timestamp}] ${levelTag} [${module}]${traceTag} ${formatted}`;
 }
 
 /**
@@ -303,7 +316,7 @@ function enqueueLogWrite(line: string): void {
  */
 export function createLogger(module: string): Logger {
 	function log(level: LogLevel, message: string, args: unknown[]): void {
-		const formatted = formatLogMessage(level, module, message, args);
+		const formatted = formatLogMessage(level, module, message, args, getCurrentTraceId());
 
 		// Write log output to stderr so stdout stays clean for JSON/command output.
 		// When _silentConsole is true (CLI mode), only warn/error go to stderr.

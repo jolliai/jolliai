@@ -17,6 +17,7 @@ import {
 	createLogger as coreCreateLogger,
 	setLogDir,
 } from "../../../cli/src/Logger.js";
+import { getCurrentTraceId } from "../../../cli/src/core/TraceContext.js";
 
 type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 type CoreLogLevel = "debug" | "info" | "warn" | "error";
@@ -69,10 +70,16 @@ function write(
 	// ── OutputChannel ──
 	const now = new Date();
 	const timestamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}.${String(now.getMilliseconds()).padStart(3, "0")}`;
+	// Render the ambient trace id (when inside a `runWithTrace` operation scope)
+	// so every Output line of one operation can be grepped against the backend by
+	// the same id. Matches the core logger's `[trace=<id>]` tag and the debug.log
+	// destination below. No scope → no tag.
+	const traceId = getCurrentTraceId();
+	const traceTag = traceId ? ` [trace=${traceId}]` : "";
 	const line =
 		extra !== undefined
-			? `[${timestamp}] [${level}] [${tag}] ${message} ${JSON.stringify(extra)}`
-			: `[${timestamp}] [${level}] [${tag}] ${message}`;
+			? `[${timestamp}] [${level}] [${tag}]${traceTag} ${message} ${JSON.stringify(extra)}`
+			: `[${timestamp}] [${level}] [${tag}]${traceTag} ${message}`;
 	getChannel().appendLine(line);
 
 	// ── debug.log (via core logger) ──
