@@ -16,4 +16,6 @@ class PanelRegistry {
 	var changesPanel: ChangesPanel? = null
 	var commitsPanel: CommitsPanel? = null
 	var activeConversationsPanel: ActiveConversationsPanel? = null
+	var pinnedPanel: PinnedPanel? = null
+	var currentMemoryPanel: CurrentMemoryPanel? = null
 }

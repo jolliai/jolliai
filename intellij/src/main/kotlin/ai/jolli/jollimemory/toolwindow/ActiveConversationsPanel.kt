@@ -116,6 +116,7 @@ class ActiveConversationsPanel(
 					item = item,
 					onRowClicked = ::onRowClicked,
 					onHide = ::onHide,
+					onPin = ::onPin,
 					onSelectionChanged = ::onSelectionChanged,
 				))
 			}
@@ -162,6 +163,16 @@ class ActiveConversationsPanel(
 		ApplicationManager.getApplication().executeOnPooledThread {
 			HiddenConversationsStore.hideConversation(cwd, item.source, item.sessionId)
 			SwingUtilities.invokeLater { refresh() }
+		}
+	}
+
+	private fun onPin(item: ActiveConversationItem) {
+		val cwd = service.mainRepoRoot ?: project.basePath ?: return
+		val key = CommitSelectionStore.conversationKey(item.source, item.sessionId)
+		val title = item.title.ifBlank { "${item.source.name} conversation" }
+		ApplicationManager.getApplication().executeOnPooledThread {
+			ai.jolli.jollimemory.core.PinStore.pin(cwd, "conversations", key, title, item.source.name)
+			SwingUtilities.invokeLater { service.panelRegistry?.pinnedPanel?.refresh() }
 		}
 	}
 }
