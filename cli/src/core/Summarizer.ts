@@ -61,6 +61,18 @@ export function resolveModelId(aliasOrId: string | undefined): string {
 const DEFAULT_MAX_TOKENS = 8192;
 
 /**
+ * Character budget for the staged diff fed to the `commit-message` call. The
+ * output is a single line, so the full diff is wasteful: it costs tokens and
+ * latency, and a large diff would push the call off the fast non-streaming path
+ * (see LlmClient's NONSTREAM_MAX_PROMPT_CHARS). We keep only the head of the
+ * diff — the complete file list is sent separately as `fileList`, which is the
+ * highest-signal input for a one-line message — and append a truncation marker.
+ * Sized below NONSTREAM_MAX_PROMPT_CHARS so the call stays in the fast lane even
+ * after the template and file list are added. Exported so a test can pin it.
+ */
+export const COMMIT_MSG_DIFF_BUDGET = 12_000;
+
+/**
  * Result from generateSummary -- fields to be spread onto a CommitSummary.
  * Replaces the deprecated SummaryRecord as the return type.
  */
@@ -669,10 +681,18 @@ export async function generateCommitMessage(params: CommitMessageParams): Promis
 
 	const { config } = params;
 	const fileList = params.stagedFiles.join(", ") || "(none)";
+	// A one-line commit message doesn't need the whole diff — cap it to the head
+	// within COMMIT_MSG_DIFF_BUDGET (fileList carries the full file list) so the
+	// call stays cheap and on the fast non-streaming path even for huge commits.
+	const rawDiff = params.stagedDiff || "(empty diff -- no staged changes)";
+	const stagedDiff =
+		rawDiff.length > COMMIT_MSG_DIFF_BUDGET
+			? `${rawDiff.slice(0, COMMIT_MSG_DIFF_BUDGET)}\n--- diff truncated (${rawDiff.length} chars total); full file list provided separately, head of diff shown above ---`
+			: rawDiff;
 	const llmResult = await callLlm({
 		action: "commit-message",
 		params: {
-			stagedDiff: params.stagedDiff || "(empty diff -- no staged changes)",
+			stagedDiff,
 			branch: params.branch,
 			fileList,
 		},

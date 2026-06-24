@@ -5,11 +5,14 @@ import {
 	isLlmCredentialError,
 	LlmCredentialError,
 	NO_LLM_PROVIDER_MESSAGE,
+	NONSTREAM_MAX_OUTPUT_TOKENS,
+	NONSTREAM_MAX_PROMPT_CHARS,
 	PROXY_FETCH_TIMEOUT_MS,
 	resolveLlmCredentialSource,
 	STREAM_IDLE_TIMEOUT_MS,
 	STREAM_MAX_WALL_CLOCK_MS,
 } from "./LlmClient.js";
+import { COMMIT_MSG_DIFF_BUDGET } from "./Summarizer.js";
 
 const { mockCreate, mockStream, mockLogInfo, mockLogWarn, mockLogError } = vi.hoisted(() => ({
 	mockCreate: vi.fn(),
@@ -88,17 +91,20 @@ describe("LlmClient", () => {
 
 	describe("direct mode", () => {
 		it("resolves the prompt template from the action and fills params", async () => {
+			// maxTokens 256 + a tiny prompt keeps this on the non-streaming
+			// `messages.create` carve-out (the default 8192 budget streams now).
 			const result = await callLlm({
 				action: "translate",
 				params: { content: "# Test" },
 				apiKey: "sk-ant-test",
 				model: "claude-sonnet-4-6",
+				maxTokens: 256,
 			});
 
 			expect(mockCreate).toHaveBeenCalledWith(
 				{
 					model: "claude-sonnet-4-6",
-					max_tokens: 8192,
+					max_tokens: 256,
 					temperature: 0,
 					messages: [
 						{
@@ -126,6 +132,7 @@ describe("LlmClient", () => {
 				action: "translate",
 				params: {},
 				apiKey: "sk-ant-test",
+				maxTokens: 256,
 			});
 
 			expect(mockLogWarn).toHaveBeenCalledWith(
@@ -147,6 +154,7 @@ describe("LlmClient", () => {
 			const result = await callLlm({
 				action: "translate",
 				params: { content: "test prompt" },
+				maxTokens: 256,
 			});
 
 			expect(result.text).toBe("response text");
@@ -188,6 +196,7 @@ describe("LlmClient", () => {
 					action: "translate",
 					params: { content: "test" },
 					apiKey: "sk-ant-test",
+					maxTokens: 256,
 				}),
 			).rejects.toThrow("LLM direct request to https://api.anthropic.com failed: 401 token expired");
 		});
@@ -200,6 +209,7 @@ describe("LlmClient", () => {
 					action: "translate",
 					params: { content: "test" },
 					apiKey: "sk-ant-test",
+					maxTokens: 256,
 				}),
 			).rejects.toThrow("LLM direct request to https://api.anthropic.com failed: raw string failure");
 		});
@@ -223,6 +233,7 @@ describe("LlmClient", () => {
 					action: "translate",
 					params: { content: "test" },
 					apiKey: "sk-ant-test",
+					maxTokens: 256,
 				}),
 			).rejects.toThrow("LLM direct request to https://api.anthropic.com failed: fetch failed");
 		});
@@ -237,6 +248,7 @@ describe("LlmClient", () => {
 					action: "translate",
 					params: { content: "test" },
 					apiKey: "sk-ant-test",
+					maxTokens: 256,
 				}),
 			).rejects.toThrow("LLM direct request to https://api.anthropic.com failed: boom");
 		});
@@ -255,6 +267,7 @@ describe("LlmClient", () => {
 					action: "translate",
 					params: { content: "test" },
 					apiKey: "sk-ant-test",
+					maxTokens: 256,
 				}),
 			).rejects.toThrow("LLM direct request to https://api.anthropic.com failed: outer");
 		});
@@ -270,6 +283,7 @@ describe("LlmClient", () => {
 					action: "translate",
 					params: { content: "test" },
 					apiKey: "sk-ant-test",
+					maxTokens: 256,
 				}),
 			).rejects.toThrow("No text content");
 		});
@@ -285,6 +299,7 @@ describe("LlmClient", () => {
 				action: "translate",
 				params: { content: "test" },
 				apiKey: "sk-ant-test",
+				maxTokens: 256,
 			});
 			const call = mockCreate.mock.calls.at(-1);
 			expect(call).toBeDefined();
@@ -293,13 +308,17 @@ describe("LlmClient", () => {
 			expect(requestOptions?.signal).toBeInstanceOf(AbortSignal);
 		});
 
-		it("logs model, maxTokens, promptChars and elapsedMs on failure so timeout-vs-size is diagnosable", async () => {
-			// The pre-fix failure log only carried action/baseUrl/message/cause —
-			// when a large squash/regenerate prompt hit the wall-clock timeout the
-			// log gave no way to tell HOW big the prompt was or HOW long it ran
-			// before aborting. These fields make "Request was aborted." actionable
-			// in debug.log without re-running the failing call.
-			mockCreate.mockRejectedValueOnce(new Error("Request was aborted."));
+		it("logs model, maxTokens, promptChars, elapsedMs plus errorName/httpStatus/requestId so timeout-vs-size-vs-server is diagnosable", async () => {
+			// A large call streams; when it aborts on the wall-clock/idle timeout the
+			// catch must log enough to tell "prompt too big for the budget" from a
+			// wedged connection from a server-side rejection — without re-running.
+			// An abort that fired on an in-flight request has NO httpStatus and NO
+			// requestId (the response never came), the wedge/slow fingerprint.
+			mockStream.mockReturnValueOnce({
+				finalMessage: vi.fn().mockRejectedValue(new Error("Request was aborted.")),
+				on: vi.fn(),
+				abort: vi.fn(),
+			});
 
 			await expect(
 				callLlm({
@@ -312,15 +331,79 @@ describe("LlmClient", () => {
 			).rejects.toThrow("LLM direct request to https://api.anthropic.com failed: Request was aborted.");
 
 			expect(mockLogError).toHaveBeenCalledWith(
-				expect.stringMatching(/model=%s.*maxTokens=%d.*promptChars=%d.*elapsedMs=%d/),
+				expect.stringMatching(
+					/maxTokens=%d.*promptChars=%d.*elapsedMs=%d.*errorName=%s.*httpStatus=%s.*requestId=%s/,
+				),
 				"translate", // action
 				expect.any(String), // resolved model id
 				8192, // maxTokens
 				expect.any(Number), // promptChars
 				expect.any(Number), // elapsedMs
 				"https://api.anthropic.com", // baseUrl
+				"Error", // errorName (the rejected Error's name)
+				"(none)", // httpStatus — an in-flight abort carries no HTTP status
+				"(none)", // requestId — the request never reached the server
 				"Request was aborted.", // message
 				expect.any(String), // cause
+			);
+		});
+
+		it("surfaces httpStatus and request_id when a server-side error carries them", async () => {
+			// A rate-limit (429) / overloaded (529) / 5xx error from Anthropic carries
+			// an HTTP status and a request id; surfacing them separates "the API
+			// rejected us" from "the connection never produced a response".
+			const apiErr = Object.assign(new Error("429 rate limited"), { status: 429, request_id: "req_abc123" });
+			mockCreate.mockRejectedValueOnce(apiErr);
+
+			await expect(
+				callLlm({ action: "translate", params: { content: "x" }, apiKey: "sk-ant-test", maxTokens: 256 }),
+			).rejects.toThrow("429 rate limited");
+
+			expect(mockLogError).toHaveBeenCalledWith(
+				expect.stringMatching(/errorName=%s.*httpStatus=%s.*requestId=%s/),
+				"translate",
+				expect.any(String),
+				256,
+				expect.any(Number),
+				expect.any(Number),
+				"https://api.anthropic.com",
+				"Error",
+				"429",
+				"req_abc123",
+				"429 rate limited",
+				expect.any(String),
+			);
+		});
+
+		it("surfaces status + requestID (camelCase fallback) on the STREAMING path too", async () => {
+			// Server-side errors (429/529/5xx) most often hit the large STREAMING
+			// calls (reconcile/summarize), where `finalMessage()` rejects. The shared
+			// catch must surface status + the id there too, reading the camelCase
+			// `requestID` fallback when `request_id` is absent. maxTokens 8192 streams.
+			const apiErr = Object.assign(new Error("500 server error"), { status: 500, requestID: "req_xyz789" });
+			mockStream.mockReturnValueOnce({
+				finalMessage: vi.fn().mockRejectedValue(apiErr),
+				on: vi.fn(),
+				abort: vi.fn(),
+			});
+
+			await expect(
+				callLlm({ action: "translate", params: { content: "x" }, apiKey: "sk-ant-test", maxTokens: 8192 }),
+			).rejects.toThrow("500 server error");
+
+			expect(mockLogError).toHaveBeenCalledWith(
+				expect.stringMatching(/httpStatus=%s.*requestId=%s/),
+				"translate",
+				expect.any(String),
+				8192,
+				expect.any(Number),
+				expect.any(Number),
+				"https://api.anthropic.com",
+				"Error",
+				"500",
+				"req_xyz789",
+				"500 server error",
+				expect.any(String),
 			);
 		});
 
@@ -344,36 +427,175 @@ describe("LlmClient", () => {
 			expect(result.outputTokens).toBe(32_000);
 		});
 
-		it("uses non-streaming when maxTokens is at or below the threshold", async () => {
-			// Per-branch compile / summarize / translate all use the default
-			// 8192 budget — keep them on the simple non-streaming path so this
-			// change is a no-op for the vast majority of callers.
+		it("uses non-streaming only when the call is small on BOTH axes", async () => {
+			// Tiny output cap AND tiny prompt → the simple non-streaming path.
 			await callLlm({
 				action: "translate",
 				params: { content: "x" },
 				apiKey: "sk-ant-test",
 				model: "claude-sonnet-4-6",
-				maxTokens: 16_384,
+				maxTokens: 256,
 			});
 
 			expect(mockCreate).toHaveBeenCalledTimes(1);
 			expect(mockStream).not.toHaveBeenCalled();
 		});
 
-		it("uses streaming when forceStreaming is set, even below the token threshold", async () => {
-			// The ingest route call sets forceStreaming explicitly instead of padding
-			// maxTokens above the threshold to coerce the streaming path.
+		it("streams when the output cap is large even if the prompt is tiny", async () => {
 			await callLlm({
 				action: "translate",
 				params: { content: "x" },
 				apiKey: "sk-ant-test",
 				model: "claude-sonnet-4-6",
 				maxTokens: 8192,
+			});
+
+			expect(mockStream).toHaveBeenCalledTimes(1);
+			expect(mockCreate).not.toHaveBeenCalled();
+		});
+
+		it("streams when the prompt is large even if the output cap is tiny (commit-message with a huge diff)", async () => {
+			// The motivating case: a small-output action carrying a large input must
+			// NOT be pinned to the fixed-budget non-streaming path. The filled
+			// template is already > NONSTREAM_MAX_PROMPT_CHARS from `content` alone.
+			await callLlm({
+				action: "translate",
+				params: { content: "x".repeat(NONSTREAM_MAX_PROMPT_CHARS + 1) },
+				apiKey: "sk-ant-test",
+				model: "claude-sonnet-4-6",
+				maxTokens: 256,
+			});
+
+			expect(mockStream).toHaveBeenCalledTimes(1);
+			expect(mockCreate).not.toHaveBeenCalled();
+		});
+
+		it("treats the output-cap boundary correctly: ≤ limit stays non-streaming, +1 streams", async () => {
+			await callLlm({
+				action: "translate",
+				params: { content: "x" },
+				apiKey: "sk-ant-test",
+				maxTokens: NONSTREAM_MAX_OUTPUT_TOKENS,
+			});
+			expect(mockCreate).toHaveBeenCalledTimes(1);
+			expect(mockStream).not.toHaveBeenCalled();
+
+			mockCreate.mockClear();
+			await callLlm({
+				action: "translate",
+				params: { content: "x" },
+				apiKey: "sk-ant-test",
+				maxTokens: NONSTREAM_MAX_OUTPUT_TOKENS + 1,
+			});
+			expect(mockStream).toHaveBeenCalledTimes(1);
+			expect(mockCreate).not.toHaveBeenCalled();
+		});
+
+		it("treats the prompt-char boundary correctly: prompt == limit stays non-streaming, +1 streams", async () => {
+			// The decision compares prompt.length (the FILLED template), not the raw
+			// param. Measure the template overhead with a probe call, then size
+			// `content` to land the prompt exactly on NONSTREAM_MAX_PROMPT_CHARS — with
+			// a tiny maxTokens so only the input axis decides. This pins the `<=` on
+			// the input side (a `<` slip or wrong constant breaks one assertion).
+			const probe = "PROBE";
+			await callLlm({ action: "translate", params: { content: probe }, apiKey: "sk-ant-test", maxTokens: 256 });
+			const probeBody = mockCreate.mock.calls.at(-1)?.[0] as { messages: { content: string }[] };
+			const overhead = probeBody.messages[0].content.length - probe.length;
+
+			mockCreate.mockClear();
+			mockStream.mockClear();
+			await callLlm({
+				action: "translate",
+				params: { content: "x".repeat(NONSTREAM_MAX_PROMPT_CHARS - overhead) },
+				apiKey: "sk-ant-test",
+				maxTokens: 256,
+			});
+			expect(mockCreate).toHaveBeenCalledTimes(1);
+			expect(mockStream).not.toHaveBeenCalled();
+			// Confirm we actually landed on the boundary, not merely under it.
+			const atLimitBody = mockCreate.mock.calls.at(-1)?.[0] as { messages: { content: string }[] };
+			expect(atLimitBody.messages[0].content.length).toBe(NONSTREAM_MAX_PROMPT_CHARS);
+
+			mockCreate.mockClear();
+			await callLlm({
+				action: "translate",
+				params: { content: "x".repeat(NONSTREAM_MAX_PROMPT_CHARS - overhead + 1) },
+				apiKey: "sk-ant-test",
+				maxTokens: 256,
+			});
+			expect(mockStream).toHaveBeenCalledTimes(1);
+			expect(mockCreate).not.toHaveBeenCalled();
+		});
+
+		it("uses streaming when forceStreaming is set, even for an otherwise-trivial call", async () => {
+			// forceStreaming's only remaining job is to force the streaming path on a
+			// call that WOULD be trivial (small output AND small prompt). Use exactly
+			// such a call (maxTokens 256 + tiny prompt) so this test actually guards
+			// the `forceStreaming === true ||` branch — dropping that branch would
+			// route this to messages.create and fail the assertion.
+			await callLlm({
+				action: "translate",
+				params: { content: "x" },
+				apiKey: "sk-ant-test",
+				model: "claude-sonnet-4-6",
+				maxTokens: 256,
 				forceStreaming: true,
 			});
 
 			expect(mockStream).toHaveBeenCalledTimes(1);
 			expect(mockCreate).not.toHaveBeenCalled();
+		});
+
+		it("logs the streaming path decision (observability) with the reason on every direct call", async () => {
+			// A successful call otherwise records nothing about the chosen path;
+			// this info log lets debug.log confirm streaming-vs-non-streaming (and
+			// why) without forcing a failure. Verify the decision + reason per case.
+
+			// trivial → non-streaming
+			await callLlm({ action: "translate", params: { content: "x" }, apiKey: "sk-ant-test", maxTokens: 256 });
+			expect(mockLogInfo).toHaveBeenCalledWith(
+				expect.stringContaining("Direct path: action=%s streaming=%s reason=%s"),
+				"translate",
+				false,
+				"trivial(small output+prompt)",
+				256,
+				expect.any(Number),
+				NONSTREAM_MAX_OUTPUT_TOKENS,
+				NONSTREAM_MAX_PROMPT_CHARS,
+			);
+
+			// large output only → streaming
+			mockLogInfo.mockClear();
+			await callLlm({ action: "translate", params: { content: "x" }, apiKey: "sk-ant-test", maxTokens: 8192 });
+			expect(mockLogInfo).toHaveBeenCalledWith(
+				expect.stringContaining("streaming=%s reason=%s"),
+				"translate",
+				true,
+				"large output",
+				8192,
+				expect.any(Number),
+				NONSTREAM_MAX_OUTPUT_TOKENS,
+				NONSTREAM_MAX_PROMPT_CHARS,
+			);
+
+			// large output AND large prompt → streaming (covers the combined reason)
+			mockLogInfo.mockClear();
+			await callLlm({
+				action: "translate",
+				params: { content: "x".repeat(NONSTREAM_MAX_PROMPT_CHARS + 1) },
+				apiKey: "sk-ant-test",
+				maxTokens: 8192,
+			});
+			expect(mockLogInfo).toHaveBeenCalledWith(
+				expect.stringContaining("reason=%s"),
+				"translate",
+				true,
+				"large output+prompt",
+				8192,
+				expect.any(Number),
+				NONSTREAM_MAX_OUTPUT_TOKENS,
+				NONSTREAM_MAX_PROMPT_CHARS,
+			);
 		});
 
 		it("aborts a streaming call when no stream events arrive within the idle window", async () => {
@@ -763,6 +985,21 @@ describe("LlmClient", () => {
 					jolliApiKey: "sk-jol-test.secret",
 				}),
 			).rejects.toBe(transport);
+
+			// Diagnostic parity with the direct path: the proxy catch logs
+			// elapsedMs + bodyChars + errorName so a wall-clock-timeout abort (≈180s,
+			// name AbortError) is distinguishable from a transport failure that fails
+			// faster with a populated cause.
+			expect(mockLogError).toHaveBeenCalledWith(
+				expect.stringMatching(/elapsedMs=%d.*bodyChars=%d.*errorName=%s/),
+				"commit-message",
+				expect.stringContaining("/api/push/llm/complete"),
+				expect.any(Number),
+				expect.any(Number),
+				"TypeError",
+				"fetch failed",
+				expect.any(String),
+			);
 		});
 
 		it("rethrows when fetch rejects with a non-Error value", async () => {
@@ -1028,6 +1265,25 @@ describe("LlmClient", () => {
 			// proxy fetch wraps — gets the same budget.
 			expect(DIRECT_FETCH_TIMEOUT_MS).toBe(180_000);
 			expect(PROXY_FETCH_TIMEOUT_MS).toBe(180_000);
+		});
+	});
+
+	describe("streaming carve-out thresholds", () => {
+		it("pins the non-streaming carve-out limits (a change here flips which calls stream)", () => {
+			// The direct path streams unless a call is small on BOTH axes. These
+			// values gate that decision; a regression here silently re-routes a
+			// whole class of calls onto the fixed-budget non-streaming path.
+			expect(NONSTREAM_MAX_OUTPUT_TOKENS).toBe(512);
+			expect(NONSTREAM_MAX_PROMPT_CHARS).toBe(16_000);
+		});
+
+		it("keeps the commit-message diff budget under the non-streaming prompt limit (cross-module headroom)", () => {
+			// commit-message truncates its diff to COMMIT_MSG_DIFF_BUDGET specifically
+			// so the assembled prompt (diff + template + fileList) stays under
+			// NONSTREAM_MAX_PROMPT_CHARS and keeps the fast non-streaming path. These
+			// two constants live in different modules; bumping the budget past the
+			// limit would silently re-route every commit-message onto streaming.
+			expect(COMMIT_MSG_DIFF_BUDGET).toBeLessThan(NONSTREAM_MAX_PROMPT_CHARS);
 		});
 	});
 });
