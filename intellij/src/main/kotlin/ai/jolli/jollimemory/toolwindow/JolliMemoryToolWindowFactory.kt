@@ -7,6 +7,8 @@ import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliApiClient
 import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
+import com.intellij.icons.AllIcons
+import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.DumbAware
@@ -149,12 +151,27 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             }
         }
 
-        // Create the panels (Memories + Commits are merged into CommitsPanel)
+        // Create the panels
         val statusPanel = StatusPanel(project, service)
         val conversationsPanel = ActiveConversationsPanel(project, service)
         val plansPanel = PlansPanel(project, service)
         val changesPanel = ChangesPanel(project, service)
         val commitsPanel = CommitsPanel(project, service)
+        val pinnedPanel = PinnedPanel(project, service)
+
+        // ── Review-Memory sub-sections (folded inside Current Memory) ──
+        // Conversations / Changes / Context keep their existing action toolbars and
+        // row logic; they are no longer top-level sections (minimal-density redesign).
+        val conversationsCollapsible = CollapsiblePanel(
+            "Conversations", "JolliMemory.ConversationsActions", conversationsPanel,
+        )
+        val contextCollapsible = CollapsiblePanel("Context", "JolliMemory.PlansActions", plansPanel)
+        val filesCollapsible = CollapsiblePanel("Files", "JolliMemory.ChangesActions", changesPanel)
+
+        // Inputs folded into Current Memory, in order: Conversations → Context → Files.
+        val currentMemoryPanel = CurrentMemoryPanel(
+            service, conversationsCollapsible, contextCollapsible, filesCollapsible,
+        )
 
         // Register panels for action lookup
         val registry = PanelRegistry().apply {
@@ -163,53 +180,41 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             this.plansPanel = plansPanel
             this.changesPanel = changesPanel
             this.commitsPanel = commitsPanel
+            this.pinnedPanel = pinnedPanel
+            this.currentMemoryPanel = currentMemoryPanel
         }
         service.panelRegistry = registry
 
-        // Build collapsible sections (uppercase titles)
-        // CommitsPanel is titled "MEMORIES" — it shows commits in workspace mode
-        // and foreign memories in read-only mode (matching VS Code's unified section).
-        // STATUS is no longer a collapsible — it takes the full content area as
-        // a dedicated card when the breadcrumb status button is toggled on,
-        // matching VS Code's full-pane status view.
-        val conversationsCollapsible = CollapsiblePanel(
-            "CONVERSATIONS", "JolliMemory.ConversationsActions", conversationsPanel,
+        // ── Top-level accordion: Pinned → Current Memory → Committed Memories ──
+        // (the redesign's three collapsible panels). CommitsPanel still shows
+        // workspace commits, or foreign memories in read-only mode.
+        val pinnedCollapsible = CollapsiblePanel("Pinned", "JolliMemory.PinnedActions", pinnedPanel)
+        val currentMemoryCollapsible = CollapsiblePanel(
+            "Current Memory", "JolliMemory.CurrentMemoryActions", currentMemoryPanel,
         )
-        val plansCollapsible = CollapsiblePanel("PLANS & NOTES", "JolliMemory.PlansActions", plansPanel)
-        val changesCollapsible = CollapsiblePanel("CHANGES", "JolliMemory.ChangesActions", changesPanel)
         val memoriesCollapsible = CollapsiblePanel(
-            "MEMORIES", "JolliMemory.CommitsActions", commitsPanel,
+            "Committed Memories", "JolliMemory.CommitsActions", commitsPanel,
         )
 
-        // Use an accordion layout so collapsed panels shrink to header-only height
-        // and expanded panels share the remaining vertical space proportionally.
-        // Resize dividers between panels allow users to drag and adjust panel heights.
+        // Accordion layout so collapsed panels shrink to header-only height and
+        // expanded panels share remaining space; dividers allow manual resize.
         val accordionPanel = JPanel(AccordionLayout()).apply {
-            add(conversationsCollapsible)
+            add(pinnedCollapsible)
             add(ResizeDivider())
-            add(plansCollapsible)
-            add(ResizeDivider())
-            add(changesCollapsible)
+            add(currentMemoryCollapsible)
             add(ResizeDivider())
             add(memoriesCollapsible)
         }
 
-        // Add gear menu toggle actions to the tool window title bar,
-        // allowing users to show/hide individual panels — like VS Code's "..." menu.
+        // Gear menu: show/hide the three top-level panels.
         val gearActions = DefaultActionGroup().apply {
-            add(TogglePanelAction(conversationsCollapsible))
+            add(TogglePanelAction(pinnedCollapsible))
+            add(TogglePanelAction(currentMemoryCollapsible))
             add(TogglePanelAction(memoriesCollapsible))
-            add(TogglePanelAction(plansCollapsible))
-            add(TogglePanelAction(changesCollapsible))
         }
         toolWindow.setAdditionalGearActions(gearActions)
 
-        // Title bar actions — always visible regardless of which panels are open.
-        toolWindow.setTitleActions(listOf(
-            CloudSyncAction(),
-        ))
-
-        // ── Content area: CardLayout swaps accordion / KB explorer / status full-pane ──
+        // ── Content cards: current accordion / KB / Knowledge / status full-pane ──
         val contentCardLayout = CardLayout()
         val contentCards = JPanel(contentCardLayout)
         contentCards.add(accordionPanel, CARD_ACCORDION)
@@ -217,44 +222,104 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         val kbPanel = KBExplorerPanel(project, service)
         contentCards.add(kbPanel, CARD_KB)
 
-        // StatusPanel lives directly as a card so the breadcrumb status button can
-        // swap it in to occupy the full content area (matches VS Code's behavior).
+        val knowledgePanel = buildKnowledgePlaceholder()
+        contentCards.add(knowledgePanel, CARD_KNOWLEDGE)
+
+        // StatusPanel lives directly as a card so the status button can swap it in
+        // to occupy the full content area (matches VS Code's full-pane status view).
         contentCards.add(statusPanel, CARD_STATUS)
 
-        // Breadcrumb header: repo/branch selectors + icon buttons (always visible)
+        // Fixed bottom action bar (Current Branch view only): Commit · Create PR · ⋯ More
+        val actionBar = ActionBarPanel(project, service)
+
+        // Status full-pane controller: shows the STATUS card over the accordion.
+        // Driven by the title-bar Status toggle and auto-shown when Jolli is disabled.
+        var statusShown = false
+        fun setStatusShown(shown: Boolean) {
+            statusShown = shown
+            contentCardLayout.show(contentCards, if (shown) CARD_STATUS else CARD_ACCORDION)
+        }
+
+        // ── Title-bar actions: Agents · Settings · Status · Cloud sync ──
+        // These live in the tool window header (the "Jolli Memory" title bar),
+        // matching the mockup's view-title icon group.
+        val agentsAction = object : AnAction(
+            "Agent Access", "Agent access — what your AI tools can reach", AllIcons.Nodes.Plugin,
+        ), DumbAware {
+            override fun actionPerformed(e: com.intellij.openapi.actionSystem.AnActionEvent) {
+                com.intellij.openapi.ui.Messages.showInfoMessage(
+                    project, "Agent access settings are coming soon.", "Agent Access",
+                )
+            }
+        }
+        val settingsAction = object : AnAction(
+            "Settings", "Open Jolli Memory settings", AllIcons.General.GearPlain,
+        ), DumbAware {
+            override fun actionPerformed(e: com.intellij.openapi.actionSystem.AnActionEvent) {
+                SettingsDialog(project, service).show()
+            }
+        }
+        val statusAction = object : com.intellij.openapi.actionSystem.ToggleAction(
+            "Status", "Toggle the Jolli Memory status panel", JolliMemoryIcons.Pulse,
+        ), DumbAware {
+            override fun isSelected(e: com.intellij.openapi.actionSystem.AnActionEvent): Boolean = statusShown
+            override fun setSelected(e: com.intellij.openapi.actionSystem.AnActionEvent, state: Boolean) {
+                setStatusShown(state)
+            }
+        }
+        toolWindow.setTitleActions(listOf(agentsAction, settingsAction, statusAction, CloudSyncAction()))
+
+        // Breadcrumb header: repo/branch selectors (icon buttons now live in the title bar)
         val breadcrumb = BreadcrumbHeaderPanel(
             service = service,
             onSelectionChanged = { repo, branch, isForeign ->
                 if (isForeign && repo != null && branch != null) {
-                    plansCollapsible.isVisible = false
-                    changesCollapsible.isVisible = false
+                    currentMemoryCollapsible.isVisible = false
+                    actionBar.setForeign(true)
                     commitsPanel.setForeignMode(repo, branch)
                 } else {
-                    plansCollapsible.isVisible = plansCollapsible.isPanelVisible()
-                    changesCollapsible.isVisible = changesCollapsible.isPanelVisible()
+                    currentMemoryCollapsible.isVisible = currentMemoryCollapsible.isPanelVisible()
+                    actionBar.setForeign(false)
                     commitsPanel.clearForeignMode()
                 }
             },
-            onShowAccordion = {
-                contentCardLayout.show(contentCards, CARD_ACCORDION)
-            },
-            onShowKB = {
-                contentCardLayout.show(contentCards, CARD_KB)
-            },
-            onShowStatus = {
-                contentCardLayout.show(contentCards, CARD_STATUS)
-            },
-            onSettingsClicked = {
-                SettingsDialog(project, service).show()
-            },
         )
 
+        // View switch (Current Branch / Memory Bank / Knowledge) above the breadcrumb.
+        val viewSwitch = ViewSwitchPanel { view ->
+            // Switching views replaces the status card with a real view card.
+            statusShown = false
+            when (view) {
+                ViewSwitchPanel.View.CURRENT -> {
+                    contentCardLayout.show(contentCards, CARD_ACCORDION)
+                    breadcrumb.setMode(BreadcrumbHeaderPanel.Mode.BRANCH)
+                    actionBar.isVisible = true
+                }
+                ViewSwitchPanel.View.BANK -> {
+                    contentCardLayout.show(contentCards, CARD_KB)
+                    breadcrumb.setMode(BreadcrumbHeaderPanel.Mode.REPO_FILTER)
+                    actionBar.isVisible = false
+                    ApplicationManager.getApplication().executeOnPooledThread { kbPanel.load() }
+                }
+                ViewSwitchPanel.View.KNOWLEDGE -> {
+                    contentCardLayout.show(contentCards, CARD_KNOWLEDGE)
+                    breadcrumb.setMode(BreadcrumbHeaderPanel.Mode.REPO_FILTER)
+                    actionBar.isVisible = false
+                }
+            }
+        }
+
         // Auto-switch to the STATUS card when Jolli Memory is disabled (preserves
-        // the install/setup discoverability the accordion's auto-show provided),
-        // and auto-return to accordion once it becomes enabled.
+        // the install/setup discoverability), and auto-return once it's enabled.
+        // When enabled, only dismiss the status card if it was being shown — don't
+        // disturb the Memory Bank / Knowledge views.
         fun syncStatusCard() {
             val enabled = service.getStatus()?.enabled == true
-            breadcrumb.setStatusActive(!enabled)
+            if (!enabled) {
+                setStatusShown(true)
+            } else if (statusShown) {
+                setStatusShown(false)
+            }
         }
         syncStatusCard()
         val statusSyncListener: () -> Unit = { SwingUtilities.invokeLater { syncStatusCard() } }
@@ -263,12 +328,20 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             service.removeStatusListener(statusSyncListener)
         }
 
-        // Refresh breadcrumb data on background thread
-        ApplicationManager.getApplication().executeOnPooledThread { breadcrumb.refresh() }
+        // Refresh breadcrumb + pinned data on background thread
+        ApplicationManager.getApplication().executeOnPooledThread {
+            breadcrumb.refresh()
+            pinnedPanel.refresh()
+        }
 
+        val northWrapper = JPanel(BorderLayout()).apply {
+            add(viewSwitch, BorderLayout.NORTH)
+            add(breadcrumb, BorderLayout.SOUTH)
+        }
         val mainPanel = JPanel(BorderLayout()).apply {
-            add(breadcrumb, BorderLayout.NORTH)
+            add(northWrapper, BorderLayout.NORTH)
             add(contentCards, BorderLayout.CENTER)
+            add(actionBar, BorderLayout.SOUTH)
         }
 
         // ── Onboarding / Main card layout ──────────────────────
@@ -343,6 +416,9 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
                 Disposer.register(parentDisposable, plansPanel)
                 Disposer.register(parentDisposable, changesPanel)
                 Disposer.register(parentDisposable, commitsPanel)
+                Disposer.register(parentDisposable, conversationsPanel)
+                Disposer.register(parentDisposable, pinnedPanel)
+                Disposer.register(parentDisposable, currentMemoryPanel)
                 Disposer.register(parentDisposable, kbPanel)
             })
         }
@@ -379,11 +455,28 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         return project.basePath != null
     }
 
+    /**
+     * Placeholder card for the Knowledge view. The wiki + graph rendering is a
+     * follow-up; this keeps the third view-switch tab navigable and discoverable.
+     */
+    private fun buildKnowledgePlaceholder(): JPanel {
+        return JPanel(BorderLayout()).apply {
+            border = JBUI.Borders.empty(16)
+            val message = JBLabel(
+                "<html><b>Knowledge</b><br/><br/>" +
+                    "Your memories, compiled into a browsable wiki + decision graph.<br/>" +
+                    "Coming soon.</html>",
+            )
+            add(message, BorderLayout.NORTH)
+        }
+    }
+
     companion object {
         private const val CARD_ONBOARDING = "onboarding"
         private const val CARD_MAIN = "main"
         private const val CARD_ACCORDION = "accordion"
         private const val CARD_KB = "kb"
+        private const val CARD_KNOWLEDGE = "knowledge"
         private const val CARD_STATUS = "status"
     }
 }
