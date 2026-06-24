@@ -13,6 +13,7 @@
  */
 
 import { assertJolliOriginAllowed, parseBaseUrl } from "../core/JolliApiUtils.js";
+import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "../core/TraceContext.js";
 
 export interface CliExchangeResult {
 	readonly token: string;
@@ -54,6 +55,9 @@ export async function exchangeCliCode(jolliUrl: string, code: string): Promise<C
 	if (parsed.tenantSlug) {
 		headers["x-tenant-slug"] = parsed.tenantSlug;
 	}
+	// Jolli trace context: propagate the ambient command trace id. Every outbound
+	// request is traceable — outside any trace scope we mint a fresh value.
+	headers[TRACE_HEADER_NAME] = currentTraceHeader() ?? newTraceHeader();
 
 	let response: Response;
 	try {

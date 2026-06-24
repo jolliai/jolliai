@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.toolwindow
 
+import ai.jolli.jollimemory.core.TraceContext
 import ai.jolli.jollimemory.services.JolliApiClient
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
@@ -222,37 +223,41 @@ class BindingChooserDialog private constructor(
 		errorLabel?.isVisible = false
 
 		ApplicationManager.getApplication().executeOnPooledThread {
-			LOG.info("createBinding: pooled-thread start (jmSpaceId=${selected.id})")
-			try {
-				val result = JolliApiClient.createBinding(baseUrl, apiKey, repoUrl, suggestedRepoName, selected.id)
-				LOG.info("createBinding: returned id=${result.id} jmSpaceId=${result.jmSpaceId} name=${result.jmSpaceName}; scheduling invokeLater to close dialog")
-				ApplicationManager.getApplication().invokeLater(
-					{
-						LOG.info("createBinding-invokeLater: setting outcome and calling close(OK_EXIT_CODE) (isOKActionEnabled=$isOKActionEnabled)")
-						outcome = BindingChooserOutcome.Selected(result)
-						close(OK_EXIT_CODE)
-						LOG.info("createBinding-invokeLater: close(OK_EXIT_CODE) returned (isShowing=$isShowing)")
-					},
-					ModalityState.any(),
-				)
-			} catch (e: BindingAlreadyExistsException) {
-				LOG.info("createBinding: 409 race-winner — winner=${e.winner.jmSpaceName}")
-				ApplicationManager.getApplication().invokeLater(
-					{
-						showRaceWinner(e.winner)
-						setBusy(false)
-					},
-					ModalityState.any(),
-				)
-			} catch (e: Exception) {
-				LOG.warn("createBinding failed: ${e.message}", e)
-				ApplicationManager.getApplication().invokeLater(
-					{
-						showError(e.message ?: "Failed to register binding.")
-						setBusy(false)
-					},
-					ModalityState.any(),
-				)
+			// One trace per binding op (on this pooled thread) so the createBinding
+			// call and its logs share one grep-able id with the backend.
+			TraceContext.withTrace {
+				LOG.info("createBinding: pooled-thread start (jmSpaceId=${selected.id})")
+				try {
+					val result = JolliApiClient.createBinding(baseUrl, apiKey, repoUrl, suggestedRepoName, selected.id)
+					LOG.info("createBinding: returned id=${result.id} jmSpaceId=${result.jmSpaceId} name=${result.jmSpaceName}; scheduling invokeLater to close dialog")
+					ApplicationManager.getApplication().invokeLater(
+						{
+							LOG.info("createBinding-invokeLater: setting outcome and calling close(OK_EXIT_CODE) (isOKActionEnabled=$isOKActionEnabled)")
+							outcome = BindingChooserOutcome.Selected(result)
+							close(OK_EXIT_CODE)
+							LOG.info("createBinding-invokeLater: close(OK_EXIT_CODE) returned (isShowing=$isShowing)")
+						},
+						ModalityState.any(),
+					)
+				} catch (e: BindingAlreadyExistsException) {
+					LOG.info("createBinding: 409 race-winner — winner=${e.winner.jmSpaceName}")
+					ApplicationManager.getApplication().invokeLater(
+						{
+							showRaceWinner(e.winner)
+							setBusy(false)
+						},
+						ModalityState.any(),
+					)
+				} catch (e: Exception) {
+					LOG.warn("createBinding failed: ${e.message}", e)
+					ApplicationManager.getApplication().invokeLater(
+						{
+							showError(e.message ?: "Failed to register binding.")
+							setBusy(false)
+						},
+						ModalityState.any(),
+					)
+				}
 			}
 		}
 	}

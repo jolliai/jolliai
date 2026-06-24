@@ -47,6 +47,7 @@
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { track } from "../core/Telemetry.js";
+import { runWithTrace } from "../core/TraceContext.js";
 import { createLogger } from "../Logger.js";
 import {
 	type BackendClient,
@@ -516,7 +517,16 @@ export class SyncEngine {
 		return { symlinked: [...symlinked], unowned: [...unowned] };
 	}
 
+	/**
+	 * Runs one sync round under a fresh trace scope. A round's
+	 * backend calls are not tied to a queue entry, so each round mints its own
+	 * id; all its logs + outbound git/credential calls share it.
+	 */
 	async runRound(round: SyncRoundOptions): Promise<SyncRoundResult> {
+		return runWithTrace(undefined, () => this.runRoundTraced(round));
+	}
+
+	private async runRoundTraced(round: SyncRoundOptions): Promise<SyncRoundResult> {
 		log.info("runRound start reason=%s cwd=%s", round.reason, round.cwd);
 		const roundStart = Date.now();
 		this.canary = { symlinked: [], unowned: [] };

@@ -252,6 +252,8 @@ describe("pushToJolli", () => {
 		expect(callArgs[1].headers["x-jolli-client"]).toBe(
 			`${VSCODE_CLIENT_INFO.kind}/${VSCODE_CLIENT_INFO.version}`,
 		);
+		// Every Jolli API request carries a fresh x-jolli-trace value for backend correlation.
+		expect(callArgs[1].headers["x-jolli-trace"]).toMatch(/^[0-9a-f]{32}-[0-9a-f]{16}$/);
 	});
 
 	it("round-trips docType into the JSON request body for each kind", async () => {

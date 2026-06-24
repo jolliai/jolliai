@@ -13,6 +13,7 @@ import {
 	STREAM_MAX_WALL_CLOCK_MS,
 } from "./LlmClient.js";
 import { COMMIT_MSG_DIFF_BUDGET } from "./Summarizer.js";
+import { runWithTrace } from "./TraceContext.js";
 
 const { mockCreate, mockStream, mockLogInfo, mockLogWarn, mockLogError } = vi.hoisted(() => ({
 	mockCreate: vi.fn(),
@@ -781,6 +782,30 @@ describe("LlmClient", () => {
 			// Proxy results have no model from the backend, but source is
 			// still carried back so saved metadata can record "via proxy".
 			expect(result.source).toBe("jolli-proxy");
+		});
+
+		it("mints a fresh x-jolli-trace value outside any trace scope", async () => {
+			await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				jolliApiKey: "sk-jol-test.secret",
+			});
+			const headers = fetchSpy.mock.calls[0][1].headers as Record<string, string>;
+			// Every outbound request is traceable — a fresh standalone value, not omitted.
+			expect(headers["x-jolli-trace"]).toMatch(/^[0-9a-f]{32}-[0-9a-f]{16}$/);
+		});
+
+		it("injects an x-jolli-trace value carrying the ambient trace id", async () => {
+			const traceId = "a".repeat(32);
+			await runWithTrace(traceId, () =>
+				callLlm({
+					action: "commit-message",
+					params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+					jolliApiKey: "sk-jol-test.secret",
+				}),
+			);
+			const headers = fetchSpy.mock.calls[0][1].headers as Record<string, string>;
+			expect(headers["x-jolli-trace"]).toMatch(new RegExp(`^${traceId}-[0-9a-f]{16}$`));
 		});
 
 		// Pins the build-time identity in the `x-jolli-client` header. Kind

@@ -28,6 +28,7 @@ import { fileURLToPath } from "node:url";
 import { getCurrentBranch } from "../core/GitOps.js";
 import { isWorkerLockHeld } from "../core/Locks.js";
 import { enqueueGitOperation } from "../core/SessionTracker.js";
+import { getCurrentTraceId, runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
 import { createLogger, getJolliMemoryDir, setLogDir } from "../Logger.js";
 import type { CommitSource, GitOperation } from "../Types.js";
 import { launchWorker } from "./QueueWorker.js";
@@ -105,6 +106,9 @@ async function handleAmend(
 	branch: string,
 ): Promise<void> {
 	const { oldHash, newHash } = mappings[0];
+	// Stamp the ambient trace id (seeded at the entry point) so the detached
+	// worker adopts it when it drains this entry — same as PostCommitHook.
+	const traceId = getCurrentTraceId();
 	const op: GitOperation = {
 		type: "amend",
 		commitHash: newHash,
@@ -112,6 +116,7 @@ async function handleAmend(
 		sourceHashes: [oldHash],
 		commitSource,
 		createdAt: new Date().toISOString(),
+		...(traceId && { traceId }),
 	};
 	await enqueueGitOperation(op, cwd);
 	log.info("Amend enqueued: %s → %s", oldHash.substring(0, 8), newHash.substring(0, 8));
@@ -135,6 +140,10 @@ async function handleRebase(
 		groups.set(newHash, existing);
 	}
 
+	// Stamp the ambient trace id onto every enqueued entry (see handleAmend).
+	// Every rebased commit shares this one id by design — a rebase is a single
+	// logical operation, so its per-commit summaries correlate under one trace.
+	const traceId = getCurrentTraceId();
 	let enqueued = 0;
 	let failed = 0;
 	for (const [newHash, oldHashes] of groups) {
@@ -146,6 +155,7 @@ async function handleRebase(
 			sourceHashes: oldHashes,
 			commitSource,
 			createdAt: new Date().toISOString(),
+			...(traceId && { traceId }),
 		};
 		const ok = await enqueueGitOperation(op, cwd);
 		if (ok) {
@@ -212,9 +222,13 @@ if (isMainScript()) {
 	const command = process.argv[2] ?? "";
 	const cwd = process.cwd();
 
-	handlePostRewriteHook(command, cwd).catch((error: unknown) => {
-		console.error("[PostRewriteHook] Fatal error:", error);
-		process.exit(1);
-	});
+	// Adopt a parent-supplied trace id (JOLLI_TRACE_ID) if present, else mint one;
+	// the enqueued GitOperations inherit it via enqueueGitOperation.
+	runWithTrace(traceIdFromEnv(), () =>
+		handlePostRewriteHook(command, cwd).catch((error: unknown) => {
+			console.error("[PostRewriteHook] Fatal error:", error);
+			process.exit(1);
+		}),
+	);
 }
 /* v8 ignore stop */

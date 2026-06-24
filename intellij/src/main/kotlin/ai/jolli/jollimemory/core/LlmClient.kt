@@ -73,7 +73,9 @@ object LlmClient {
         maxTokens: Int?,
         prompt: String?,
         aiProvider: String? = null,
-    ): LlmCallResult {
+        // One trace per LLM operation: tags the "LLM call" log + the proxy call's
+        // own logs + the outbound x-jolli-trace header with one grep-able id.
+    ): LlmCallResult = TraceContext.withTrace {
         val source = resolveCredentialSource(apiKey, jolliApiKey, aiProvider)
             ?: throw RuntimeException("No LLM credentials available. Sign in to Jolli or configure an Anthropic API key.")
 
@@ -95,7 +97,7 @@ object LlmClient {
             CredentialSource.ANTHROPIC_ENV -> callDirect(prompt!!, System.getenv("ANTHROPIC_API_KEY"), model, maxTokens)
             CredentialSource.JOLLI_PROXY -> callProxy(jolliApiKey!!, action, params)
         }
-        return result.copy(source = source.wireValue)
+        result.copy(source = source.wireValue)
     }
 
     /** Above this `max_tokens`, use streaming: Anthropic refuses long non-streaming

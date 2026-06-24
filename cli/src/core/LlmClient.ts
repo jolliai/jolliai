@@ -14,6 +14,7 @@ import { JOLLI_CLIENT_HEADER } from "./ClientHeader.js";
 import { parseBaseUrl, parseJolliApiKey } from "./JolliApiUtils.js";
 import { fillTemplate, findUnfilledPlaceholders, TEMPLATES } from "./PromptTemplates.js";
 import { resolveModelId } from "./Summarizer.js";
+import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "./TraceContext.js";
 
 // Re-export so existing imports of LlmCredentialSource from this module keep
 // working — the source-of-truth definition lives in Types.ts because
@@ -520,6 +521,12 @@ async function callProxy(
 	// Tenant is resolved via X-Jolli-Tenant header, not path — the path is always the same.
 	const url = `${parsed.origin}${LLM_PROXY_PATH}`;
 
+	// Jolli trace context: propagate the ambient trace id so the
+	// backend can correlate this proxy call with the CLI operation that issued
+	// it. Every outbound request is traceable — outside any trace scope we mint
+	// a fresh standalone value rather than omit the header.
+	const traceHeader = currentTraceHeader() ?? newTraceHeader();
+
 	// Resolve the version to send to the proxy:
 	// 1. Caller-supplied `options.version` wins (used for pinning to a specific
 	//    revision in tests / debug scenarios).
@@ -551,6 +558,7 @@ async function callProxy(
 				"x-jolli-client": JOLLI_CLIENT_HEADER,
 				...(tenantSlug ? { "x-tenant-slug": tenantSlug } : {}),
 				...(orgSlug ? { "x-org-slug": orgSlug } : {}),
+				[TRACE_HEADER_NAME]: traceHeader,
 			},
 			body,
 			signal: AbortSignal.timeout(PROXY_FETCH_TIMEOUT_MS),

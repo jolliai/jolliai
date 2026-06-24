@@ -16,6 +16,7 @@ vi.mock("node:fs/promises", () => ({
 	unlink: fsMocks.unlink,
 }));
 
+import { runWithTrace } from "./core/TraceContext.js";
 import {
 	createLogger,
 	formatLogMessage,
@@ -82,6 +83,17 @@ describe("Logger", () => {
 		it("should handle excess format specifiers gracefully", () => {
 			const result = formatLogMessage("info", "Test", "%s and %s", ["only-one"]);
 			expect(result).toContain("only-one and %s");
+		});
+
+		it("should render a [trace=<id>] tag when a trace id is passed", () => {
+			const result = formatLogMessage("info", "Test", "hello", [], "a".repeat(32));
+			expect(result).toContain(`[Test] [trace=${"a".repeat(32)}] hello`);
+		});
+
+		it("should omit the trace tag when no trace id is passed", () => {
+			const result = formatLogMessage("info", "Test", "hello", []);
+			expect(result).not.toContain("[trace=");
+			expect(result).toContain("[Test] hello");
 		});
 	});
 
@@ -156,6 +168,16 @@ describe("Logger", () => {
 			logger.info("count: %d, name: %s", 5, "test");
 			const call = vi.mocked(console.error).mock.calls[0][0] as string;
 			expect(call).toContain("count: 5, name: test");
+		});
+
+		it("should stamp the ambient trace id into the line", () => {
+			const traceId = "f".repeat(32);
+			runWithTrace(traceId, () => {
+				const logger = createLogger("TestMod");
+				logger.info("inside trace");
+			});
+			const call = vi.mocked(console.error).mock.calls[0][0] as string;
+			expect(call).toContain(`[trace=${traceId}]`);
 		});
 
 		it("should handle appendToLogFile failure gracefully", async () => {

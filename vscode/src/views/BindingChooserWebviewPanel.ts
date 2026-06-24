@@ -14,6 +14,7 @@
 
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
+import { runWithTrace } from "../../../cli/src/core/TraceContext.js";
 import {
 	type BindingInfo,
 	createJolliMemoryBinding,
@@ -100,7 +101,9 @@ export class BindingChooserWebviewPanel {
 		});
 
 		this.panel.webview.onDidReceiveMessage((message: WebviewMessage) => {
-			this.handleMessage(message).catch((err: unknown) => {
+			// One trace scope per message so the binding listSpaces/createBinding
+			// calls and their log lines share a grep-able id (see SummaryWebviewPanel).
+			runWithTrace(undefined, () => this.handleMessage(message)).catch((err: unknown) => {
 				log.error("BindingChooser", `Unhandled error: ${String(err)}`);
 				this.postError(
 					err instanceof Error ? err.message : "An unexpected error occurred.",

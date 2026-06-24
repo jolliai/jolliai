@@ -12,6 +12,7 @@ import ai.jolli.jollimemory.core.Summarizer
 import ai.jolli.jollimemory.core.SummaryStore
 import ai.jolli.jollimemory.core.SummaryTree
 import ai.jolli.jollimemory.core.TopicUpdates
+import ai.jolli.jollimemory.core.TraceContext
 import ai.jolli.jollimemory.core.TranscriptEntry
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliApiClient
@@ -301,89 +302,94 @@ class SummaryPanel(
         val relativePath = GitRemoteUtils.sanitizeBranchSlug(summary.branch)
 
         ApplicationManager.getApplication().executeOnPooledThread {
-            try {
-                val planUrls = mutableListOf<PlanPushResult>()
+            // One trace per push operation (on this pooled thread) so the push
+            // logs, the binding-required retry, and every pushToJolli/listSpaces
+            // call share one id; ThreadLocal must be set on the worker thread.
+            TraceContext.withTrace {
+                try {
+                    val planUrls = mutableListOf<PlanPushResult>()
 
-                for (plan in summary.plans ?: emptyList()) {
-                    val planContent = store.readPlanFromBranch(plan.slug) ?: continue
-                    if (planContent.isBlank()) continue
+                    for (plan in summary.plans ?: emptyList()) {
+                        val planContent = store.readPlanFromBranch(plan.slug) ?: continue
+                        if (planContent.isBlank()) continue
 
-                    val planResult = JolliApiClient.pushToJolli(resolvedBaseUrl, config.jolliApiKey!!, JolliApiClient.JolliPushPayload(
-                        title = SummaryUtils.buildPlanPushTitle(summary, plan.title),
-                        content = planContent,
-                        commitHash = summary.commitHash,
-                        docType = "plan",
-                        branch = summary.branch,
-                        docId = plan.jolliPlanDocId,
-                        repoUrl = repoUrl,
-                        relativePath = relativePath,
+                        val planResult = JolliApiClient.pushToJolli(resolvedBaseUrl, config.jolliApiKey!!, JolliApiClient.JolliPushPayload(
+                            title = SummaryUtils.buildPlanPushTitle(summary, plan.title),
+                            content = planContent,
+                            commitHash = summary.commitHash,
+                            docType = "plan",
+                            branch = summary.branch,
+                            docId = plan.jolliPlanDocId,
+                            repoUrl = repoUrl,
+                            relativePath = relativePath,
+                        ))
+                        planUrls.add(PlanPushResult(plan.slug, plan.title, "$baseUrl/articles?doc=${planResult.docId}", planResult.docId))
+                    }
+
+                    var plansWithUrls = summary.plans
+                    if (planUrls.isNotEmpty() && plansWithUrls != null) {
+                        val urlMap = planUrls.associateBy { it.slug }
+                        plansWithUrls = plansWithUrls.map { p ->
+                            val pushed = urlMap[p.slug]
+                            if (pushed != null) p.copy(jolliPlanDocUrl = pushed.url, jolliPlanDocId = pushed.docId) else p
+                        }
+                    }
+
+                    val summaryForMarkdown = if (plansWithUrls !== summary.plans) summary.copy(plans = plansWithUrls) else summary
+                    val markdown = SummaryMarkdownBuilder.buildMarkdown(summaryForMarkdown)
+                    val pushTitle = SummaryUtils.buildPushTitle(summary)
+
+                    val result = JolliApiClient.pushToJolli(resolvedBaseUrl, config.jolliApiKey!!, JolliApiClient.JolliPushPayload(
+                        title = pushTitle, content = markdown, commitHash = summary.commitHash,
+                        docType = "summary",
+                        branch = summary.branch, docId = summary.jolliDocId,
+                        repoUrl = repoUrl, relativePath = relativePath,
                     ))
-                    planUrls.add(PlanPushResult(plan.slug, plan.title, "$baseUrl/articles?doc=${planResult.docId}", planResult.docId))
-                }
 
-                var plansWithUrls = summary.plans
-                if (planUrls.isNotEmpty() && plansWithUrls != null) {
-                    val urlMap = planUrls.associateBy { it.slug }
-                    plansWithUrls = plansWithUrls.map { p ->
-                        val pushed = urlMap[p.slug]
-                        if (pushed != null) p.copy(jolliPlanDocUrl = pushed.url, jolliPlanDocId = pushed.docId) else p
+                    val fullUrl = "$baseUrl/articles?doc=${result.docId}"
+                    var updatedPlans = summary.plans
+                    if (updatedPlans != null && planUrls.isNotEmpty()) {
+                        val planResultMap = planUrls.associateBy { it.slug }
+                        updatedPlans = updatedPlans.map { p ->
+                            val pushResult = planResultMap[p.slug]
+                            if (pushResult != null) p.copy(jolliPlanDocUrl = pushResult.url, jolliPlanDocId = pushResult.docId) else p
+                        }
                     }
-                }
 
-                val summaryForMarkdown = if (plansWithUrls !== summary.plans) summary.copy(plans = plansWithUrls) else summary
-                val markdown = SummaryMarkdownBuilder.buildMarkdown(summaryForMarkdown)
-                val pushTitle = SummaryUtils.buildPushTitle(summary)
+                    val updatedSummary = summary.copy(jolliDocUrl = fullUrl, jolliDocId = result.docId, plans = updatedPlans)
+                    store.storeSummary(updatedSummary, force = true)
+                    currentSummary = updatedSummary
 
-                val result = JolliApiClient.pushToJolli(resolvedBaseUrl, config.jolliApiKey!!, JolliApiClient.JolliPushPayload(
-                    title = pushTitle, content = markdown, commitHash = summary.commitHash,
-                    docType = "summary",
-                    branch = summary.branch, docId = summary.jolliDocId,
-                    repoUrl = repoUrl, relativePath = relativePath,
-                ))
+                    val cleanedSummary = cleanupOrphanedDocs(summary, updatedSummary, baseUrl, config.jolliApiKey!!)
+                    if (cleanedSummary != null) currentSummary = cleanedSummary
 
-                ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_pushed", mapOf("kind" to "summary"))
+                    ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_pushed", mapOf("kind" to "summary"))
 
-                val fullUrl = "$baseUrl/articles?doc=${result.docId}"
-                var updatedPlans = summary.plans
-                if (updatedPlans != null && planUrls.isNotEmpty()) {
-                    val planResultMap = planUrls.associateBy { it.slug }
-                    updatedPlans = updatedPlans.map { p ->
-                        val pushResult = planResultMap[p.slug]
-                        if (pushResult != null) p.copy(jolliPlanDocUrl = pushResult.url, jolliPlanDocId = pushResult.docId) else p
+                    ApplicationManager.getApplication().invokeLater {
+                        refreshHtml()
+                        val verb = if (summary.jolliDocUrl != null) "Updated" else "Pushed"
+                        val planMsg = if (planUrls.isNotEmpty()) " (with ${planUrls.size} plan${if (planUrls.size > 1) "s" else ""})" else ""
+                        Messages.showInfoMessage(project, "$verb on Jolli Space$planMsg.", "Push Successful")
                     }
-                }
-
-                val updatedSummary = summary.copy(jolliDocUrl = fullUrl, jolliDocId = result.docId, plans = updatedPlans)
-                store.storeSummary(updatedSummary, force = true)
-                currentSummary = updatedSummary
-
-                val cleanedSummary = cleanupOrphanedDocs(summary, updatedSummary, baseUrl, config.jolliApiKey!!)
-                if (cleanedSummary != null) currentSummary = cleanedSummary
-
-                ApplicationManager.getApplication().invokeLater {
-                    refreshHtml()
-                    val verb = if (summary.jolliDocUrl != null) "Updated" else "Pushed"
-                    val planMsg = if (planUrls.isNotEmpty()) " (with ${planUrls.size} plan${if (planUrls.size > 1) "s" else ""})" else ""
-                    Messages.showInfoMessage(project, "$verb on Jolli Space$planMsg.", "Push Successful")
-                }
-            } catch (e: JolliApiClient.BindingRequiredError) {
-                if (retried) {
+                } catch (e: JolliApiClient.BindingRequiredError) {
+                    if (retried) {
+                        ApplicationManager.getApplication().invokeLater {
+                            postToWebview("pushFailed")
+                            Messages.showErrorDialog(project, "Push failed: binding still not found after retry. Please try again.", "Push Error")
+                        }
+                    } else {
+                        handleBindingRequired(e.repoUrl, resolvedBaseUrl, config.jolliApiKey!!)
+                    }
+                } catch (e: JolliApiClient.PluginOutdatedError) {
                     ApplicationManager.getApplication().invokeLater {
                         postToWebview("pushFailed")
-                        Messages.showErrorDialog(project, "Push failed: binding still not found after retry. Please try again.", "Push Error")
+                        Messages.showErrorDialog(project, "Push failed -- your JolliMemory plugin is outdated. Please update.", "Plugin Outdated")
                     }
-                } else {
-                    handleBindingRequired(e.repoUrl, resolvedBaseUrl, config.jolliApiKey!!)
-                }
-            } catch (e: JolliApiClient.PluginOutdatedError) {
-                ApplicationManager.getApplication().invokeLater {
-                    postToWebview("pushFailed")
-                    Messages.showErrorDialog(project, "Push failed -- your JolliMemory plugin is outdated. Please update.", "Plugin Outdated")
-                }
-            } catch (e: Exception) {
-                ApplicationManager.getApplication().invokeLater {
-                    postToWebview("pushFailed")
-                    Messages.showErrorDialog(project, "Push failed: ${e.message}", "Push Error")
+                } catch (e: Exception) {
+                    ApplicationManager.getApplication().invokeLater {
+                        postToWebview("pushFailed")
+                        Messages.showErrorDialog(project, "Push failed: ${e.message}", "Push Error")
+                    }
                 }
             }
         }

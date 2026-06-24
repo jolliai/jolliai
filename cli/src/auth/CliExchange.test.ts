@@ -34,7 +34,11 @@ describe("exchangeCliCode", () => {
 		const [url, init] = fetchSpy.mock.calls[0];
 		expect(String(url)).toBe("https://app.jolli.ai/api/auth/cli-exchange");
 		expect(init.method).toBe("POST");
-		expect(init.headers).toEqual({ "content-type": "application/json" });
+		// Every outbound request carries a fresh x-jolli-trace value (no ambient scope here).
+		expect(init.headers["x-jolli-trace"]).toMatch(/^[0-9a-f]{32}-[0-9a-f]{16}$/);
+		const headers = { ...init.headers };
+		delete headers["x-jolli-trace"];
+		expect(headers).toEqual({ "content-type": "application/json" });
 		expect(init.signal).toBeInstanceOf(AbortSignal);
 		expect(JSON.parse(init.body as string)).toEqual({ code: "code-123" });
 	});
@@ -46,7 +50,10 @@ describe("exchangeCliCode", () => {
 
 		const [url, init] = fetchSpy.mock.calls[0];
 		expect(String(url)).toBe("https://jolli-local.me/api/auth/cli-exchange");
-		expect(init.headers).toEqual({
+		expect(init.headers["x-jolli-trace"]).toMatch(/^[0-9a-f]{32}-[0-9a-f]{16}$/);
+		const headers = { ...init.headers };
+		delete headers["x-jolli-trace"];
+		expect(headers).toEqual({
 			"content-type": "application/json",
 			"x-tenant-slug": "dev",
 		});
