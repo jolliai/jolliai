@@ -12,6 +12,7 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 
 import type { CommitInfo, CommitMessageParams, DiffStats } from "../Types.js";
 import {
+	COMMIT_MSG_DIFF_BUDGET,
 	extractTicketIdFromMessage,
 	formatSourceCommitsForSquash,
 	generateCommitMessage,
@@ -1277,6 +1278,45 @@ ${delimited({
 					params: expect.objectContaining({
 						stagedDiff: "(empty diff -- no staged changes)",
 					}),
+				}),
+			);
+		});
+
+		it("truncates a staged diff that exceeds COMMIT_MSG_DIFF_BUDGET and marks it", async () => {
+			// A one-line message doesn't need the whole diff; an oversized diff would
+			// also push the call off the fast non-streaming path. The head is kept,
+			// the full file list rides along separately, and a marker records the cut.
+			mockCallLlm.mockResolvedValueOnce(summaryLlmResult("Refactor the storage layer"));
+			// Distinctive head/tail sentinels so the cut point is actually verified:
+			// the head must survive, the tail (past the budget) must be dropped.
+			const head = "HEAD_KEEP_";
+			const tail = "_TAIL_DROP";
+			const hugeDiff = head + "x".repeat(COMMIT_MSG_DIFF_BUDGET) + tail;
+
+			await generateCommitMessage({ ...mockCommitMessageParams, stagedDiff: hugeDiff });
+
+			const sent = mockCallLlm.mock.calls.at(-1)?.[0] as LlmCallOptions;
+			const [keptHead, marker] = sent.params.stagedDiff.split("\n--- diff truncated");
+			// Exactly the budget's worth of head is kept — not more, not less.
+			expect(keptHead.length).toBe(COMMIT_MSG_DIFF_BUDGET);
+			expect(keptHead.startsWith(head)).toBe(true);
+			// Everything past the budget (incl. the tail sentinel) is dropped.
+			expect(sent.params.stagedDiff).not.toContain(tail);
+			// Marker cites the ORIGINAL total length.
+			expect(marker).toContain(`(${hugeDiff.length} chars total)`);
+			// File list is unaffected — it's the highest-signal input for a one-liner.
+			expect(sent.params.fileList).toBe("src/Foo.ts");
+		});
+
+		it("leaves a diff at exactly COMMIT_MSG_DIFF_BUDGET untouched (boundary)", async () => {
+			mockCallLlm.mockResolvedValueOnce(summaryLlmResult("Tidy imports"));
+			const exactDiff = "y".repeat(COMMIT_MSG_DIFF_BUDGET);
+
+			await generateCommitMessage({ ...mockCommitMessageParams, stagedDiff: exactDiff });
+
+			expect(mockCallLlm).toHaveBeenCalledWith(
+				expect.objectContaining({
+					params: expect.objectContaining({ stagedDiff: exactDiff }),
 				}),
 			);
 		});

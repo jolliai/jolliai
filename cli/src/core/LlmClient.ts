@@ -70,9 +70,12 @@ const LLM_PROXY_PATH = "/api/push/llm/complete";
  * End-to-end timeout for proxy LLM calls (covers connect + headers + body).
  * The backend invokes Anthropic non-streaming inside this request, so 180s is
  * generous for a full LLM round-trip while bounding how long a stuck request
- * can hold the QueueWorker file lock. Moved in lockstep with
- * `DIRECT_FETCH_TIMEOUT_MS` so both paths share one wall-clock budget.
- * Exported so a regression test can pin the value.
+ * can hold the QueueWorker file lock. Historically moved in lockstep with
+ * `DIRECT_FETCH_TIMEOUT_MS`, but that rationale no longer holds: the direct
+ * path now streams by default and its non-streaming budget governs only
+ * trivially-small calls, whereas this proxy budget governs ALL proxy calls
+ * (which have no streaming escape). They happen to share 180s today but should
+ * be evaluated independently. Exported so a regression test can pin the value.
  */
 export const PROXY_FETCH_TIMEOUT_MS = 180_000;
 
@@ -94,15 +97,29 @@ export const PROXY_FETCH_TIMEOUT_MS = 180_000;
 export const DIRECT_FETCH_TIMEOUT_MS = 180_000;
 
 /**
- * `max_tokens` above which a direct Anthropic call switches from non-streaming
- * `messages.create` to `messages.stream` (see the call site for the SDK's
- * "Streaming is strongly recommended" guard). Exported because callers tune
- * `maxTokens` *relative to this value* to force one path or the other — most
- * notably the ingest route call (`ROUTE_MAX_TOKENS`), which sits just above it
- * on purpose. Keeping it a shared constant means changing the threshold can't
- * silently flip a caller onto the other path's timeout behaviour.
+ * The direct path **streams by default**. A call takes the simple non-streaming
+ * `messages.create` path only when it is "trivially small" — small on BOTH
+ * axes: output cap ≤ {@link NONSTREAM_MAX_OUTPUT_TOKENS} AND prompt length ≤
+ * {@link NONSTREAM_MAX_PROMPT_CHARS}. Everything else streams.
+ *
+ * Why default to streaming: a non-streaming request has no liveness signal, so
+ * a single fixed wall-clock deadline ({@link DIRECT_FETCH_TIMEOUT_MS}) cannot
+ * tell "healthy but slow" from "wedged socket" — it either kills legitimately
+ * slow large calls or waits the full budget on a dead one. The streaming path's
+ * inactivity watchdog ({@link STREAM_IDLE_TIMEOUT_MS}) governs by liveness
+ * instead: a healthy-but-slow call (big prompt and/or big output) keeps the
+ * `ping` events flowing and completes, while a wedged socket trips the watchdog
+ * and fails fast. So any call that might run long belongs on the streaming path.
+ *
+ * Why BOTH axes: a small-output action can still carry a large input — most
+ * notably `commit-message`, whose `max_tokens` is tiny (256) but whose staged
+ * diff can be huge. Gating only on output would wrongly keep such a call on the
+ * fixed-budget non-streaming path. `finalMessage()` returns the same
+ * `Anthropic.Message` shape `messages.create` returns, so downstream code is
+ * unchanged either way. Exported so a regression test can pin the values.
  */
-export const STREAMING_THRESHOLD_TOKENS = 16_384;
+export const NONSTREAM_MAX_OUTPUT_TOKENS = 512;
+export const NONSTREAM_MAX_PROMPT_CHARS = 16_000;
 
 /**
  * Inactivity budget for the streaming direct path. Streaming is selected for
@@ -211,13 +228,12 @@ export interface LlmCallOptions extends LlmCredentials {
 	/** Max output tokens (direct mode only, default 8192) */
 	readonly maxTokens?: number;
 	/**
-	 * Force the direct path onto `messages.stream` regardless of `maxTokens`.
-	 * Use when a call may run long enough to trip the SDK's non-streaming "10
-	 * minute" refusal even below {@link STREAMING_THRESHOLD_TOKENS} (e.g. the
-	 * ingest route call). Replaces the old trick of padding `maxTokens` just
-	 * above the threshold to coerce the streaming path — an explicit flag can't
-	 * be silently undone by retuning the threshold or the token count. No effect
-	 * in proxy mode.
+	 * Force the direct path onto `messages.stream` regardless of size. Rarely
+	 * needed now that the direct path streams by default for anything but a
+	 * trivially-small call (see {@link NONSTREAM_MAX_OUTPUT_TOKENS}), but kept as
+	 * an explicit override for callers that want to guarantee the streaming path
+	 * even for a small call (e.g. the ingest route call). An explicit flag can't
+	 * be silently undone by retuning the size thresholds. No effect in proxy mode.
 	 */
 	readonly forceStreaming?: boolean;
 	/** Optional prompt revision to pin (proxy mode only) */
@@ -335,17 +351,40 @@ async function callDirect(
 	const client = getOrCreateClient(apiKey);
 	const startTime = Date.now();
 
-	// Anthropic SDK refuses non-streaming `messages.create` when the request's
-	// estimated duration exceeds 10 minutes (sees `max_tokens` and the model's
-	// output speed and errors out with "Streaming is strongly recommended").
-	// Empirically the threshold lands around `max_tokens > ~20k` for the
-	// current generation; cross it via `messages.stream` instead so any caller
-	// (the merge path raised this to 64k) keeps working without a per-call
-	// switch. `finalMessage()` resolves to the same `Anthropic.Message` shape
-	// `messages.create` returns, so the downstream code is unchanged.
-	// `forceStreaming` lets a caller pick streaming explicitly even below the
-	// token threshold (the ingest route call) instead of padding maxTokens.
-	const useStreaming = options.forceStreaming === true || maxTokens > STREAMING_THRESHOLD_TOKENS;
+	// Stream by default; only a "trivially small" call — small on BOTH the output
+	// cap AND the prompt size — takes the simple non-streaming `messages.create`
+	// path. See NONSTREAM_MAX_OUTPUT_TOKENS / NONSTREAM_MAX_PROMPT_CHARS for the
+	// rationale (liveness watchdog beats a fixed wall-clock for anything that may
+	// run long, and a tiny-output action like commit-message can still carry a
+	// huge diff). `forceStreaming` still forces streaming. The SDK's non-streaming
+	// "10-minute" refusal is moot: any call large enough to approach it streams.
+	const isTrivialCall = maxTokens <= NONSTREAM_MAX_OUTPUT_TOKENS && prompt.length <= NONSTREAM_MAX_PROMPT_CHARS;
+	const useStreaming = options.forceStreaming === true || !isTrivialCall;
+
+	// Observability: a successful direct call otherwise logs nothing about which
+	// path it took, so streaming-vs-non-streaming can't be confirmed from
+	// debug.log without forcing a failure. Emit the decision + the inputs behind
+	// it at info level (debug level is not persisted to debug.log).
+	const streamReason =
+		options.forceStreaming === true
+			? "forceStreaming"
+			: !useStreaming
+				? "trivial(small output+prompt)"
+				: maxTokens > NONSTREAM_MAX_OUTPUT_TOKENS && prompt.length > NONSTREAM_MAX_PROMPT_CHARS
+					? "large output+prompt"
+					: maxTokens > NONSTREAM_MAX_OUTPUT_TOKENS
+						? "large output"
+						: "large prompt";
+	log.info(
+		"Direct path: action=%s streaming=%s reason=%s maxTokens=%d promptChars=%d (non-stream needs maxTokens<=%d AND promptChars<=%d)",
+		options.action,
+		useStreaming,
+		streamReason,
+		maxTokens,
+		prompt.length,
+		NONSTREAM_MAX_OUTPUT_TOKENS,
+		NONSTREAM_MAX_PROMPT_CHARS,
+	);
 
 	let response: Anthropic.Message;
 	try {
@@ -410,14 +449,31 @@ async function callDirect(
 		// ran before aborting, so "prompt too big for the 180s budget" is
 		// distinguishable from a genuinely wedged connection without re-running.
 		const elapsedMs = Date.now() - startTime;
+		// errorName / httpStatus / requestId separate the failure modes that share
+		// the "Request was aborted. cause=(none)" fingerprint. A wedged/slow call
+		// killed by our AbortSignal surfaces as an abort with NO httpStatus and NO
+		// requestId (the response never came). A server-side failure (rate limit
+		// 429, overloaded 529, 5xx) carries an httpStatus, and any request that
+		// actually reached Anthropic carries a requestId — so "the API rejected us"
+		// is distinguishable from "the connection never produced a response".
+		const errorName = err instanceof Error ? err.name : "(non-error)";
+		const httpStatus = (err as { status?: number })?.status;
+		// `||` (not `??`) so an empty-string id falls through to the camelCase
+		// fallback and then to "(none)" rather than logging a blank field. The
+		// current SDK sets `request_id` (snake_case) from the `request-id` header;
+		// `requestID` is a defensive fallback for other/older error shapes.
+		const requestId = (err as { request_id?: string })?.request_id || (err as { requestID?: string })?.requestID;
 		log.error(
-			"Direct LLM call failed: action=%s model=%s maxTokens=%d promptChars=%d elapsedMs=%d baseUrl=%s error=%s cause=%s",
+			"Direct LLM call failed: action=%s model=%s maxTokens=%d promptChars=%d elapsedMs=%d baseUrl=%s errorName=%s httpStatus=%s requestId=%s error=%s cause=%s",
 			options.action,
 			model,
 			maxTokens,
 			prompt.length,
 			elapsedMs,
 			baseUrl,
+			errorName,
+			httpStatus === undefined ? "(none)" : String(httpStatus),
+			requestId || "(none)",
 			message,
 			cause,
 		);
@@ -503,9 +559,25 @@ async function callProxy(
 		// Transport-layer failure (DNS, TLS handshake, connect, reset, timeout).
 		// undici wraps the real reason in `cause` — without surfacing it the log
 		// is just "fetch failed" and the operator has no way to diagnose.
+		// elapsedMs / bodyChars / errorName bring the proxy path to diagnostic
+		// parity with the direct path: elapsedMs ≈ PROXY_FETCH_TIMEOUT_MS plus an
+		// AbortError name marks a wall-clock-timeout abort (the backend stalled or
+		// the connection wedged), versus a transport error that fails faster with
+		// a populated cause; bodyChars is the proxy-side analog of promptChars.
+		const elapsedMs = Date.now() - startTime;
 		const message = err instanceof Error ? err.message : String(err);
 		const cause = err instanceof Error ? formatCause((err as { cause?: unknown }).cause) : "(non-error)";
-		log.error("Proxy LLM fetch failed: action=%s url=%s error=%s cause=%s", options.action, url, message, cause);
+		const errorName = err instanceof Error ? err.name : "(non-error)";
+		log.error(
+			"Proxy LLM fetch failed: action=%s url=%s elapsedMs=%d bodyChars=%d errorName=%s error=%s cause=%s",
+			options.action,
+			url,
+			elapsedMs,
+			body.length,
+			errorName,
+			message,
+			cause,
+		);
 		throw err;
 	}
 	const elapsed = Date.now() - startTime;
