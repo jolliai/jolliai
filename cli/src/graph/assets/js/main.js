@@ -90,11 +90,14 @@
   }
 
   function wireCanvasClear() {
-    // Clicking empty canvas releases the locked selection. Interactive
-    // elements are excluded; the camera's capture-phase handler already
+    // Clicking the empty board (outside every card) releases the locked selection,
+    // so the panel falls back to the current category's summary — the third
+    // category-page detail level (unit / topic / category). The whole topic card
+    // is excluded (its own handler selects the topic), as are units, portals,
+    // category cards, and controls. The camera's capture-phase handler already
     // suppresses the click that follows a drag-pan.
     document.getElementById("main").addEventListener("click", (e) => {
-      if (e.target.closest(".unit-card, .topic-head, .portal, .category-card, .zoom-controls, .edge-hit, .topic-group.collapsed")) return;
+      if (e.target.closest(".unit-card, .topic-group, .portal, .category-card, .zoom-controls, .edge-hit")) return;
       const S = window.WikiState;
       if (S.get().selected) S.set({ selected: null });
     });
@@ -149,7 +152,14 @@
         document.querySelectorAll(".selected").forEach((el) => el.classList.remove("selected"));
         if (s.selected && s.selected.kind === "unit") {
           const el = document.querySelector(`[data-unit="${s.selected.id}"]`);
-          if (el) { el.classList.add("selected"); window.WikiCamera.focusOn(el); }
+          // Unit-focus rules (readability zoom + minimal pan); same path as a
+          // navigation that lands on a unit (see views.settleCamera).
+          if (el) { el.classList.add("selected"); window.WikiViews.focusSelectedUnit(s.selected.id); }
+        } else if (s.selected && s.selected.kind === "topic") {
+          // A topic card whose detail is showing in the panel — highlight it
+          // (reached by click OR by Back into a topic within the same category).
+          const el = document.querySelector(`[data-topic="${s.selected.id}"]`);
+          if (el) el.classList.add("selected");
         } else if (s.selected && s.selected.kind === "category") {
           // A category card (overview) or portal (level 2) selected for inspection
           const el = document.querySelector(

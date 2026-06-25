@@ -15,6 +15,17 @@
 export const EDGE_TYPES = ["extends", "caused-by", "supersedes", "contradicts", "related-to"] as const;
 export type EdgeType = (typeof EDGE_TYPES)[number];
 
+/**
+ * The relationships that are SYMMETRIC (undirected): `A relates-to B` is the same
+ * fact as `B relates-to A`. The distiller sometimes emits both directions for one
+ * such relationship, which would otherwise render as two arrowed lines (and list
+ * the peer twice in the panel) for a single undirected link. {@link
+ * normalizeSymmetricEdges} collapses each pair to one edge at assembly time so
+ * graph.json never carries the duplicate. The remaining types
+ * (`extends`/`caused-by`/`supersedes`) are directed and pass through untouched.
+ */
+export const SYMMETRIC_EDGE_TYPES: ReadonlySet<EdgeType> = new Set<EdgeType>(["related-to", "contradicts"]);
+
 /** The kinds a knowledge unit can take. */
 export const UNIT_KINDS = ["decision", "mechanism", "fix"] as const;
 export type UnitKind = (typeof UNIT_KINDS)[number];
@@ -209,6 +220,62 @@ export function validateDistilledGraph(graph: DistilledGraph): string[] {
 	return errors;
 }
 
+/**
+ * Collapses symmetric edges (see {@link SYMMETRIC_EDGE_TYPES}) to a single edge
+ * per unordered endpoint pair, keeping the higher-confidence side (ties keep the
+ * first occurrence). Directed edges pass through untouched and in place.
+ *
+ * Pure; preserves the original order of every edge it keeps. This is the
+ * SOURCE-OF-TRUTH dedup: it runs inside {@link assembleGraph}, so every emitted
+ * graph.json — full, incremental, and the no-LLM reassemble — is already clean.
+ * The viz runtime (`assets/js/data.js`) carries a thin mirror of this logic only
+ * to clean up graph.json files written before this normalization existed; once a
+ * repo rebuilds its graph, the runtime dedup is a no-op.
+ */
+export function normalizeSymmetricEdges(edges: ReadonlyArray<GraphEdge>): GraphEdge[] {
+	const pairKey = (e: GraphEdge): string => {
+		const [a, b] = e.from < e.to ? [e.from, e.to] : [e.to, e.from];
+		return `${a}|${b}|${e.type}`;
+	};
+	// Pass 1: pick the winning edge object for each symmetric endpoint pair.
+	const winner = new Map<string, GraphEdge>();
+	for (const e of edges) {
+		if (!SYMMETRIC_EDGE_TYPES.has(e.type)) continue;
+		const k = pairKey(e);
+		const prev = winner.get(k);
+		if (!prev || e.confidence > prev.confidence) winner.set(k, e);
+	}
+	// Pass 2: emit in original order, dropping the non-winning symmetric duplicates.
+	return edges.filter((e) => !SYMMETRIC_EDGE_TYPES.has(e.type) || winner.get(pairKey(e)) === e);
+}
+
+/**
+ * Drops `related-to` edges that are SUBSUMED by a more specific edge between the
+ * same unordered unit pair. `related-to` is the generic "these two are connected"
+ * relationship; every other type (`extends`/`caused-by`/`supersedes`/
+ * `contradicts`) is a more specific claim that already implies relatedness. When
+ * the distiller emits both a `related-to` and, say, an `extends` for one pair,
+ * they describe the SAME fact at two precisions — rendering both draws two
+ * redundant lines (and lists the peer twice). Keep only the specific edge.
+ *
+ * Pure; order-preserving. Match is on the UNORDERED pair (relatedness is
+ * symmetric, so a directed `A extends B` subsumes `related-to` in either
+ * orientation). Confidence is irrelevant: a generic edge carries no information a
+ * specific one between the same pair doesn't already. Two genuinely-distinct
+ * specific edges on one pair (e.g. `extends` + `caused-by`) are BOTH kept — only
+ * the generic `related-to` is ever dropped. Runs after {@link
+ * normalizeSymmetricEdges} inside {@link assembleGraph}; mirrored defensively in
+ * the viz runtime (`assets/js/data.js`) for pre-normalization graph.json.
+ */
+export function dropSubsumedRelatedTo(edges: ReadonlyArray<GraphEdge>): GraphEdge[] {
+	const unorderedKey = (e: GraphEdge): string => (e.from < e.to ? `${e.from}|${e.to}` : `${e.to}|${e.from}`);
+	const specificPairs = new Set<string>();
+	for (const e of edges) {
+		if (e.type !== "related-to") specificPairs.add(unorderedKey(e));
+	}
+	return edges.filter((e) => e.type !== "related-to" || !specificPairs.has(unorderedKey(e)));
+}
+
 // -- Assembly -----------------------------------------------------------------
 
 /**
@@ -227,7 +294,17 @@ export function assembleGraph(
 	topicFingerprints: Record<string, string> = {},
 	topicMetaFingerprints: Record<string, string> = {},
 ): KnowledgeGraph {
-	const errors = validateDistilledGraph(distill);
+	// Normalize edges BEFORE validation, stats, and emit so graph.json never
+	// carries the distiller's redundant duplicates:
+	//   1. collapse symmetric edges to one undirected link per pair (also kills the
+	//      reversed-pair dupe that validateDistilledGraph's `from|to|type` key
+	//      cannot see);
+	//   2. drop a generic `related-to` whenever a more specific typed edge already
+	//      links the same pair (the specific edge subsumes it).
+	// Directed/specific edges are otherwise untouched.
+	const edges = dropSubsumedRelatedTo(normalizeSymmetricEdges(distill.edges));
+
+	const errors = validateDistilledGraph({ ...distill, edges });
 	if (errors.length > 0) {
 		throw new Error(`knowledge graph validation failed (${errors.length}): ${errors.join("; ")}`);
 	}
@@ -280,7 +357,7 @@ export function assembleGraph(
 	let intraTopicEdges = 0;
 	let crossTopicEdges = 0;
 	let crossCategoryEdges = 0;
-	for (const e of distill.edges) {
+	for (const e of edges) {
 		const ta = unitToTopic.get(e.from);
 		const tb = unitToTopic.get(e.to);
 		if (ta === tb) {
@@ -297,7 +374,7 @@ export function assembleGraph(
 		categories: categories.length,
 		topics: topics.length,
 		units: distill.units.length,
-		edges: distill.edges.length,
+		edges: edges.length,
 		intraTopicEdges,
 		crossTopicEdges,
 		crossCategoryEdges,
@@ -313,7 +390,7 @@ export function assembleGraph(
 		categories,
 		topics,
 		units: distill.units,
-		edges: distill.edges,
+		edges,
 	};
 }
 
