@@ -175,6 +175,15 @@ describe("StatusStore", () => {
 		expect(store.getSnapshot().changeReason).toBe("workerPhase");
 	});
 
+	it("setWorkerPhase carries the ingest sub-phases verbatim (wiki / graph)", () => {
+		const store = new StatusStore({ getStatus: vi.fn() } as never);
+		store.setWorkerBusy(true);
+		store.setWorkerPhase("ingest:wiki");
+		expect(store.getSnapshot().workerPhase).toBe("ingest:wiki");
+		store.setWorkerPhase("ingest:graph");
+		expect(store.getSnapshot().workerPhase).toBe("ingest:graph");
+	});
+
 	it("setWorkerPhase is a no-op when unchanged", () => {
 		const store = new StatusStore({ getStatus: vi.fn() } as never);
 		let emits = 0;
@@ -200,7 +209,7 @@ describe("StatusStore", () => {
 		// isWorkerBusy().then(setWorkerBusy) resolves false. Because workerBusy
 		// starts false, setWorkerBusy(false) would hit the equality early-return
 		// and skip the phase clear — leaving a stale phase that mislabels the
-		// next genuine summary run as "Updating Memory Bank…". The busy-bound
+		// next genuine summary run as "Building knowledge wiki…". The busy-bound
 		// invariant must hold here too.
 		const store = new StatusStore({ getStatus: vi.fn() } as never);
 		store.setWorkerPhase("ingest"); // stale marker read while workerBusy is still false

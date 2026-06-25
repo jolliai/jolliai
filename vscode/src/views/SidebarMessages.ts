@@ -10,6 +10,7 @@
 
 import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSessionAggregator.js";
 import type { ReferenceField, SourceId, TranscriptSource } from "../../../cli/src/Types.js";
+import type { WorkerPhase } from "../stores/StatusStore.js";
 
 export type SidebarTab = "kb" | "branch" | "status";
 export type KbMode = "folders" | "memories";
@@ -631,14 +632,14 @@ export type SidebarInboundMsg =
 	| {
 			/**
 			 * Worker-phase indicator for the Branch-tab toolbar. Selects a
-			 * distinct label for specific worker phases — currently only
-			 * `"ingest"` (topic-KB ingest), which renders "Updating Memory
-			 * Bank…" instead of the default "AI summary in progress…". `null`
-			 * falls back to the default label. Lifetime is bound to
-			 * `worker:busy` on the reader side.
+			 * distinct label per ingest sub-phase: `"ingest:wiki"` → "Building
+			 * knowledge wiki…", `"ingest:graph"` → "Building knowledge graph…"
+			 * (the legacy bare `"ingest"` falls back to the wiki label). `null`
+			 * falls back to the default "AI summary in progress…". Lifetime is
+			 * bound to `worker:busy` on the reader side.
 			 */
 			readonly type: "worker:phase";
-			readonly phase: "ingest" | null;
+			readonly phase: WorkerPhase;
 	  }
 	| {
 			/**

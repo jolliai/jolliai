@@ -104,9 +104,10 @@ export function buildSidebarScript(): string {
     // toolbar. Not persisted — start from false on every load and let the next
     // worker:busy or status push correct it.
     workerBusy: false,
-    // Live phase of the running worker (currently only 'ingest'), pushed on the
-    // worker:phase channel. Selects "Updating Memory Bank..." over the default
-    // summary label. Not persisted -- host re-pushes on reload.
+    // Live phase of the running worker ('ingest:wiki' / 'ingest:graph', or the
+    // legacy bare 'ingest'), pushed on the worker:phase channel. Selects the
+    // matching "Building knowledge wiki/graph…" label over the default summary
+    // label. Not persisted -- host re-pushes on reload.
     workerPhase: null,
     // Live sync-phase indicator pushed by the host as the sync engine
     // advances through phases (downloading / merging / uploading) or ends
@@ -426,10 +427,15 @@ export function buildSidebarScript(): string {
       // toolbar — it's about moving memories to/from the Personal Space, not
       // about the working-tree branch.
       const items = [];
+      // Ingest sub-phase → matching label. 'ingest:graph' is the more specific
+      // case (check first); 'ingest:wiki' and the legacy bare 'ingest' both map to
+      // the wiki label; anything else (summary phase) shows the default.
       const indicator = state.workerBusy
-        ? (state.workerPhase === 'ingest'
-            ? { label: 'Updating Memory Bank…', severity: 'info' }
-            : { label: 'AI summary in progress…', severity: 'info' })
+        ? (state.workerPhase && state.workerPhase.indexOf('ingest:graph') === 0
+            ? { label: 'Building knowledge graph…', severity: 'info' }
+            : (state.workerPhase && state.workerPhase.indexOf('ingest') === 0
+                ? { label: 'Building knowledge wiki…', severity: 'info' }
+                : { label: 'AI summary in progress…', severity: 'info' }))
         : null;
       items.push(buildToolbarIndicator(indicator));
       items.push(iconButton('refresh', 'Refresh', 'refresh'));
@@ -706,12 +712,13 @@ export function buildSidebarScript(): string {
       }
       case 'worker:phase': {
         // Per-phase label for the post-commit Worker. Independent of
-        // worker:busy; only 'ingest' is surfaced today, anything else clears to
-        // the default summary label. Only the Branch tab reacts. renderBranch
-        // runs too because the commit buttons' disabled state depends on the
-        // phase (ingest is exempt from blocking — see isWorkerBlocking), not
-        // just on worker:busy.
-        const nextPhase = (msg.phase === 'ingest') ? 'ingest' : null;
+        // worker:busy; any 'ingest'-prefixed sub-phase ('ingest', 'ingest:wiki',
+        // 'ingest:graph') is kept verbatim so renderToolbar can pick the matching
+        // wiki/graph label, anything else clears to the default summary label.
+        // Only the Branch tab reacts. renderBranch runs too because the commit
+        // buttons' disabled state depends on the phase (ingest is exempt from
+        // blocking — see isWorkerBlocking), not just on worker:busy.
+        const nextPhase = (msg.phase && msg.phase.indexOf('ingest') === 0) ? msg.phase : null;
         if (state.workerPhase === nextPhase) break;
         state.workerPhase = nextPhase;
         if (state.activeTab === 'branch') {
@@ -2683,11 +2690,12 @@ export function buildSidebarScript(): string {
   }
 
   function isWorkerBlocking() {
-    // Busy with a phase that must disable commit actions. The ingest phase
-    // (Memory Bank wiki update, ~80s+) is exempt: it never touches the commit
-    // pipeline, so commits landed during it are simply queued for the next
-    // worker. Mirrors isWorkerBlockingBusy in util/LockUtils.ts.
-    return state.workerBusy && state.workerPhase !== 'ingest';
+    // Busy with a phase that must disable commit actions. The ingest family
+    // (Memory Bank wiki update + graph build, ~80s+) is exempt: it never touches
+    // the commit pipeline, so commits landed during it are simply queued for the
+    // next worker. Prefix match so every 'ingest:*' sub-phase stays exempt.
+    // Mirrors isWorkerBlockingBusy in util/LockUtils.ts.
+    return state.workerBusy && !(state.workerPhase && state.workerPhase.indexOf('ingest') === 0);
   }
 
   function renderCommitMemoryButton() {

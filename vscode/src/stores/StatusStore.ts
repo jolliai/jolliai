@@ -55,12 +55,21 @@ export interface SyncPhaseState {
 	readonly severity: "info" | "error";
 }
 
+/**
+ * Post-commit worker phase surfaced to the sidebar. The QueueWorker writes the
+ * ingest sub-phase (`ingest:wiki` / `ingest:graph`); `"ingest"` is the legacy
+ * bare value, still accepted as a wiki-equivalent fallback. All non-null values
+ * keep the `ingest` prefix, which the commit/squash gates key off. `null` is the
+ * default (blocking) summary phase.
+ */
+export type WorkerPhase = "ingest" | "ingest:wiki" | "ingest:graph" | null;
+
 export interface StatusSnapshot extends Snapshot<StatusChangeReason> {
 	readonly status: StatusInfo | null;
 	readonly config: JolliMemoryConfig | null;
 	readonly derived: StatusDerived;
 	readonly workerBusy: boolean;
-	readonly workerPhase: "ingest" | null;
+	readonly workerPhase: WorkerPhase;
 	readonly syncPhase: SyncPhaseState | null;
 	readonly extensionOutdated: boolean;
 	readonly migrating: boolean;
@@ -90,7 +99,7 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 	private status: StatusInfo | null = null;
 	private config: JolliMemoryConfig | null = null;
 	private workerBusy = false;
-	private workerPhase: "ingest" | null = null;
+	private workerPhase: WorkerPhase = null;
 	private syncPhase: SyncPhaseState | null = null;
 	private extensionOutdated = false;
 	private migrating = false;
@@ -131,7 +140,7 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 		// be cleared even when `workerBusy` is already false. Otherwise the equality
 		// early-return below would skip the clear, and a stale 'ingest' marker read
 		// at activation — before `isWorkerBusy()` resolves false — would survive into
-		// the next genuine summary run and mislabel it "Updating Memory Bank…".
+		// the next genuine summary run and mislabel it "Building knowledge wiki…".
 		const staleClear = !busy && this.workerPhase !== null;
 		if (this.workerBusy === busy && !staleClear) {
 			return;
@@ -144,12 +153,12 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 	}
 
 	/**
-	 * Push (or clear) the post-commit worker's phase. Only `"ingest"` is
-	 * surfaced today; any other phase is represented as `null` (default
-	 * "AI summary in progress…" label). Equality-checked so a redundant call
-	 * is a no-op.
+	 * Push (or clear) the post-commit worker's phase. Non-null values are the
+	 * `ingest:*` sub-phases (wiki / graph), each selecting a distinct sidebar
+	 * label; `null` is the default "AI summary in progress…" phase. Equality-
+	 * checked so a redundant call is a no-op.
 	 */
-	setWorkerPhase(phase: "ingest" | null): void {
+	setWorkerPhase(phase: WorkerPhase): void {
 		if (this.workerPhase === phase) {
 			return;
 		}

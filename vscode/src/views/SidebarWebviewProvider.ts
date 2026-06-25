@@ -13,6 +13,7 @@ import type { TranscriptSource } from "../../../cli/src/Types.js";
 import { isTranscriptSource } from "../../../cli/src/Types.js";
 import type { ActiveSessionsProvider } from "../services/ActiveSessionsProvider.js";
 import { flushExtensionTelemetry } from "../TelemetryActivation.js";
+import type { WorkerPhase } from "../stores/StatusStore.js";
 import { log } from "../util/Logger.js";
 import { ConversationDetailsPanel } from "./ConversationDetailsPanel.js";
 import { SIDEBAR_EMPTY_STRINGS } from "./SidebarEmptyMessages.js";
@@ -60,11 +61,11 @@ export interface SidebarWebviewDeps {
 		} | null;
 		/**
 		 * Returns the current post-commit worker phase from StatusStore. Pushed
-		 * to the webview as `worker:phase` so the Branch tab toolbar can show
-		 * "Updating Memory Bank…" during a topic-KB ingest. Optional so existing
-		 * tests that only stub `getWorkerBusy` keep compiling.
+		 * to the webview as `worker:phase` so the Branch tab toolbar can show the
+		 * matching "Building knowledge wiki/graph…" label during a topic-KB ingest.
+		 * Optional so existing tests that only stub `getWorkerBusy` keep compiling.
 		 */
-		getWorkerPhase?: () => "ingest" | null;
+		getWorkerPhase?: () => WorkerPhase;
 	};
 	kbFolders?: {
 		listChildren(relPath: string): Promise<FolderNode>;
