@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- connectors -->
+  <line x1="6.1" y1="5.1" x2="9.9" y2="7.1" stroke="#6C6C6C" stroke-width="1.5" stroke-linecap="round"/>
+  <line x1="6.1" y1="10.9" x2="9.9" y2="8.9" stroke="#6C6C6C" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- nodes: one on the right, two on the left -->
+  <circle cx="11.5" cy="8" r="1.9" fill="#6C6C6C"/>
+  <circle cx="4.5" cy="4" r="1.9" fill="#6C6C6C"/>
+  <circle cx="4.5" cy="12" r="1.9" fill="#6C6C6C"/>
+</svg>

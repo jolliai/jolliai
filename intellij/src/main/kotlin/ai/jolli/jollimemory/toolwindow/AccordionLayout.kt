@@ -73,6 +73,8 @@ class AccordionLayout : LayoutManager {
             when {
                 comp is ResizeDivider -> fixedHeight += comp.preferredSize.height
                 comp is CollapsiblePanel && !comp.isExpanded() -> fixedHeight += comp.preferredSize.height
+                // Fit-to-content panels (e.g. Pinned) take their content height, not surplus.
+                comp is CollapsiblePanel && comp.isFitContent() -> fixedHeight += comp.preferredSize.height
                 else -> expandedPanels.add(comp)
             }
         }
@@ -95,6 +97,7 @@ class AccordionLayout : LayoutManager {
             val height = when {
                 comp is ResizeDivider -> comp.preferredSize.height
                 comp is CollapsiblePanel && !comp.isExpanded() -> comp.preferredSize.height
+                comp is CollapsiblePanel && comp.isFitContent() -> comp.preferredSize.height
                 else -> {
                     val minH = comp.minimumSize.height
                     val weight = weights.getOrDefault(comp, 1.0)

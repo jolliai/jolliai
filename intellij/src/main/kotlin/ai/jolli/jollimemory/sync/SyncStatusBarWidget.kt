@@ -92,6 +92,11 @@ class SyncStatusBarWidget(private val project: Project) : StatusBarWidget, Statu
 
 	override fun ID(): String = ID
 
+	// This widget IS its own presentation (implements TextPresentation). The 2024.3
+	// platform calls the no-arg getPresentation() and rejects a null return, so
+	// return `this` explicitly rather than relying on the nullable default.
+	override fun getPresentation(): StatusBarWidget.WidgetPresentation = this
+
 	override fun install(statusBar: StatusBar) {
 		this.statusBar = statusBar
 	}

@@ -73,7 +73,10 @@ import javax.swing.UIManager
 class PlansPanel(
     private val project: Project,
     private val service: JolliMemoryService,
-) : JPanel(BorderLayout()), Disposable {
+) : JPanel(BorderLayout()), Disposable, RowCountSource {
+
+    override var onRowCountChanged: ((Int) -> Unit)? = null
+    override fun currentRowCount(): Int = allContextItems.size
 
     /** Unified item wrapper for the merged plans+notes list */
     private sealed class ListItem(val title: String, val lastModified: String) {
@@ -124,6 +127,14 @@ class PlansPanel(
 
     /** Row index whose hover actions (pin/edit/delete) are currently shown. */
     private var actionHoverIndex: Int = -1
+
+    /** Full item list + expand state for the 6-row cap ("Show N more"). */
+    private var allContextItems: List<ListItem> = emptyList()
+    private var contextExpanded = false
+    private val northStack = JPanel().apply {
+        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        isOpaque = false
+    }
 
     private val statusListener: () -> Unit = { SwingUtilities.invokeLater { refresh() } }
 
@@ -341,7 +352,7 @@ class PlansPanel(
         }
         val vf = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(file)
         if (vf != null) {
-            FileEditorManager.getInstance(project).openFile(vf, true)
+            MarkdownPreview.open(project, vf)
         }
     }
 
@@ -552,22 +563,66 @@ class PlansPanel(
 
 
     private fun updateList(items: List<ListItem>) {
+        allContextItems = items
+        renderList()
+    }
+
+    /**
+     * Renders the list without an inner scrollbar, showing at most [CappedRows.CAP]
+     * rows; the rest collapse behind a "Show N more" row below the list. Current
+     * Memory provides a single scrollbar across all three sections.
+     */
+    private fun renderList() {
+        onRowCountChanged?.invoke(allContextItems.size)
         removeAll()
 
-        if (items.isEmpty()) {
+        if (allContextItems.isEmpty()) {
             emptyLabel.text = "<html><center>No plans or notes yet.<br/><br/>Plans appear when Claude Code creates plan files.<br/>Notes can be added with the + button.</center></html>"
-            add(emptyLabel, BorderLayout.CENTER)
-        } else {
-            listModel.clear()
-            items.forEach { listModel.addElement(it) }
-            val scrollPane = JBScrollPane(itemList).apply {
-                horizontalScrollBarPolicy = JBScrollPane.HORIZONTAL_SCROLLBAR_NEVER
-            }
-            add(scrollPane, BorderLayout.CENTER)
+            add(emptyLabel, BorderLayout.NORTH)
+            revalidate(); repaint()
+            return
         }
+
+        val collapsed = !contextExpanded && allContextItems.size > CappedRows.CAP
+        val shown = if (collapsed) allContextItems.take(CappedRows.CAP) else allContextItems
+
+        listModel.clear()
+        shown.forEach { listModel.addElement(it) }
+        itemList.alignmentX = Component.LEFT_ALIGNMENT
+        itemList.maximumSize = Dimension(Int.MAX_VALUE, itemList.preferredSize.height)
+
+        northStack.removeAll()
+        northStack.add(itemList)
+        if (collapsed) northStack.add(showMoreRow(allContextItems.size - CappedRows.CAP))
+        add(northStack, BorderLayout.NORTH)
 
         revalidate(); repaint()
     }
+
+    private fun showMoreRow(remaining: Int): JPanel {
+        val link = JBLabel("Show $remaining more").apply {
+            foreground = com.intellij.ui.JBColor.namedColor("Link.activeForeground", com.intellij.ui.JBColor.BLUE)
+            cursor = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
+        }
+        return JPanel(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, JBUI.scale(2), 0)).apply {
+            isOpaque = false
+            alignmentX = Component.LEFT_ALIGNMENT
+            border = JBUI.Borders.empty(2, 26, 2, 0)
+            maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(22))
+            add(link)
+            cursor = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
+            val expand = object : java.awt.event.MouseAdapter() {
+                override fun mouseClicked(e: java.awt.event.MouseEvent) {
+                    contextExpanded = true
+                    renderList()
+                }
+            }
+            addMouseListener(expand)
+            link.addMouseListener(expand)
+        }
+    }
+
+    override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
 
     /** Toggles all reference checkboxes: if any excluded → select all, otherwise → deselect all. */
     fun toggleSelectAll() {
@@ -770,7 +825,7 @@ class PlansPanel(
         if (file != null) {
             val vf = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(file)
             if (vf != null) {
-                FileEditorManager.getInstance(project).openFile(vf, true)
+                MarkdownPreview.open(project, vf)
                 return
             }
         }
@@ -788,7 +843,7 @@ class PlansPanel(
         if (file != null) {
             val vf = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(file)
             if (vf != null) {
-                FileEditorManager.getInstance(project).openFile(vf, true)
+                MarkdownPreview.open(project, vf)
                 return
             }
         }
@@ -809,7 +864,7 @@ class PlansPanel(
         private val checkBox = JCheckBox().apply { isOpaque = false }
         private val tagLabel = TagLabel()
         private val titleLabel = JLabel()
-        private val pinLabel = actionIcon(AllIcons.Nodes.Favorite, "Pin")
+        private val pinLabel = actionIcon(AllIcons.General.Pin_tab, "Pin")
         private val editLabel = actionIcon(AllIcons.Actions.Edit, "Edit")
         private val trashLabel = actionIcon(JolliMemoryIcons.Trash, "Delete")
 

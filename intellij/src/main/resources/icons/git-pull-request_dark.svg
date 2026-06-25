@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Source branch (left): dot - line - dot -->
+  <line x1="4.5" y1="5.1" x2="4.5" y2="10.9" stroke="#AFB1B3" stroke-width="1.5" stroke-linecap="round"/>
+  <circle cx="4.5" cy="3.5" r="1.75" fill="#AFB1B3"/>
+  <circle cx="4.5" cy="12.5" r="1.75" fill="#AFB1B3"/>
+  <!-- Target branch (right): dot at bottom, line up to an arrow head -->
+  <line x1="11.5" y1="10.9" x2="11.5" y2="6.2" stroke="#AFB1B3" stroke-width="1.5" stroke-linecap="round"/>
+  <circle cx="11.5" cy="12.5" r="1.75" fill="#AFB1B3"/>
+  <path d="M11.5 2.7 L13.4 6 L9.6 6 Z" fill="#AFB1B3"/>
+  <!-- Curve: pull from the source branch into the target branch -->
+  <path fill="none" stroke="#AFB1B3" stroke-width="1.5" stroke-linecap="round" d="M5.6 3.7C8.5 4.4 9.8 4.4 11 5.6"/>
+</svg>

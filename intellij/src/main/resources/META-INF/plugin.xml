@@ -84,11 +84,6 @@
                     text="Select/Deselect All References"
                     description="Toggle selection of all references"
                     icon="AllIcons.Actions.Selectall"/>
-            <action id="JolliMemory.RefreshPlans"
-                    class="ai.jolli.jollimemory.actions.RefreshPlansAction"
-                    text="Refresh"
-                    description="Refresh plans and notes list"
-                    icon="AllIcons.Actions.Refresh"/>
         </group>
 
         <!-- Changes panel actions -->
@@ -108,11 +103,6 @@
                     text="Discard Selected"
                     description="Discard changes for all selected files"
                     icon="/icons/discard.svg"/>
-            <action id="JolliMemory.RefreshChanges"
-                    class="ai.jolli.jollimemory.actions.RefreshChangesAction"
-                    text="Refresh Changes"
-                    description="Refresh changed files"
-                    icon="AllIcons.Actions.Refresh"/>
         </group>
 
         <!-- Conversations panel actions -->
@@ -122,11 +112,6 @@
                     text="Select/Deselect All Conversations"
                     description="Toggle selection of all conversations"
                     icon="AllIcons.Actions.Selectall"/>
-            <action id="JolliMemory.RefreshConversations"
-                    class="ai.jolli.jollimemory.actions.RefreshConversationsAction"
-                    text="Refresh Conversations"
-                    description="Refresh active conversations"
-                    icon="AllIcons.Actions.Refresh"/>
         </group>
 
         <!-- Commits panel actions -->

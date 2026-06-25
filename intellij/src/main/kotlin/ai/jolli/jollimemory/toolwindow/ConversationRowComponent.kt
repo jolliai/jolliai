@@ -33,7 +33,7 @@ class ConversationRowComponent(
 		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
 	}
 
-	private val pinLabel = JLabel(AllIcons.Nodes.Favorite).apply {
+	private val pinLabel = JLabel(AllIcons.General.Pin_tab).apply {
 		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
 		toolTipText = "Pin"
 		isVisible = false

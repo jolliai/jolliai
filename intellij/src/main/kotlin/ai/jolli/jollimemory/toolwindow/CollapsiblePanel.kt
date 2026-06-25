@@ -38,6 +38,10 @@ class CollapsiblePanel(
     private val contentPanel: JComponent,
     private val initiallyExpanded: Boolean = true,
     private val headerExtra: JComponent? = null,
+    /** When true, the accordion sizes this panel to its content height (preferred)
+     *  instead of giving it a share of the surplus space. Used for the Pinned panel
+     *  so its height tracks the number of pinned items. */
+    private val fitContent: Boolean = false,
 ) : JPanel(BorderLayout()) {
 
     private val persistenceKey = "JolliMemory.CollapsiblePanel.expanded.$title"
@@ -154,6 +158,14 @@ class CollapsiblePanel(
 
     fun isExpanded(): Boolean = expanded
 
+    /** Whether the accordion should size this panel to its content (see [fitContent]). */
+    fun isFitContent(): Boolean = fitContent
+
+    /** Appends a live row count to the header title, e.g. "PINNED (3)". */
+    fun setCount(n: Int) {
+        titleLabel.text = "$title ($n)"
+    }
+
     /**
      * Controls whether this panel is visible in the tool window.
      * When hidden via the gear menu, the entire panel (header + content) is removed.
@@ -187,8 +199,9 @@ class CollapsiblePanel(
     }
 
     override fun getMaximumSize(): Dimension {
-        // Allow full width; height follows content so items stay top-aligned
-        return Dimension(Int.MAX_VALUE, super.getMaximumSize().height)
+        // Full width, but height pinned to the preferred (content) height so the panel
+        // doesn't stretch in the vertically-stacked, single-scrollbar sidebar layout.
+        return Dimension(Int.MAX_VALUE, preferredSize.height)
     }
 
     override fun getMinimumSize(): Dimension {
