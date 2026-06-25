@@ -13,9 +13,10 @@ import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
-import com.intellij.ui.components.JBScrollPane
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
+import java.awt.Component
+import java.awt.Dimension
 import javax.swing.*
 
 /**
@@ -26,7 +27,11 @@ import javax.swing.*
 class ActiveConversationsPanel(
 	private val project: Project,
 	private val service: JolliMemoryService,
-) : JPanel(BorderLayout()), Disposable {
+) : JPanel(BorderLayout()), Disposable, RowCountSource {
+
+	override var onRowCountChanged: ((Int) -> Unit)? = null
+	private var rowCount = 0
+	override fun currentRowCount(): Int = rowCount
 
 	private val rowsPanel = JPanel().apply {
 		layout = BoxLayout(this, BoxLayout.Y_AXIS)
@@ -48,6 +53,9 @@ class ActiveConversationsPanel(
 	private var conversations: List<ActiveConversationItem> = emptyList()
 	private var failedSources: List<TranscriptSource> = emptyList()
 
+	/** Whether the user expanded past the 6-row cap (via "Show N more"). */
+	private var expanded = false
+
 	private val statusListener: () -> Unit = { refresh() }
 
 	private val pollTimer = Timer(60_000) {
@@ -60,12 +68,18 @@ class ActiveConversationsPanel(
 	}.apply { isRepeats = true }
 
 	init {
-		val scrollPane = JBScrollPane(rowsPanel).apply {
-			border = JBUI.Borders.empty()
-			verticalScrollBarPolicy = ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED
+		// No inner scrollbar — Current Memory provides a single scrollbar across all
+		// three sections. Rows are placed in NORTH so the panel reports its natural
+		// height (capped at 6 rows unless expanded).
+		warningBanner.alignmentX = Component.LEFT_ALIGNMENT
+		rowsPanel.alignmentX = Component.LEFT_ALIGNMENT
+		val content = JPanel().apply {
+			layout = BoxLayout(this, BoxLayout.Y_AXIS)
+			isOpaque = false
+			add(warningBanner)
+			add(rowsPanel)
 		}
-		add(warningBanner, BorderLayout.NORTH)
-		add(scrollPane, BorderLayout.CENTER)
+		add(content, BorderLayout.NORTH)
 
 		service.addStatusListener(statusListener)
 		pollTimer.start()
@@ -104,27 +118,36 @@ class ActiveConversationsPanel(
 	private fun updateUI(result: ActiveConversationsResult) {
 		conversations = result.items
 		failedSources = result.failedSources
-
 		warningBanner.isVisible = failedSources.isNotEmpty()
-
-		rowsPanel.removeAll()
-		if (conversations.isEmpty()) {
-			rowsPanel.add(emptyLabel)
-		} else {
-			for (item in conversations) {
-				rowsPanel.add(ConversationRowComponent(
-					item = item,
-					onRowClicked = ::onRowClicked,
-					onHide = ::onHide,
-					onPin = ::onPin,
-					onSelectionChanged = ::onSelectionChanged,
-				))
-			}
-		}
-		rowsPanel.add(Box.createVerticalGlue())
-		rowsPanel.revalidate()
-		rowsPanel.repaint()
+		renderRows()
 	}
+
+	private fun renderRows() {
+		rowCount = conversations.size
+		onRowCountChanged?.invoke(rowCount)
+		if (conversations.isEmpty()) {
+			rowsPanel.removeAll()
+			rowsPanel.add(emptyLabel)
+			rowsPanel.revalidate()
+			rowsPanel.repaint()
+			return
+		}
+		val comps = conversations.map { item ->
+			ConversationRowComponent(
+				item = item,
+				onRowClicked = ::onRowClicked,
+				onHide = ::onHide,
+				onPin = ::onPin,
+				onSelectionChanged = ::onSelectionChanged,
+			)
+		}
+		CappedRows.render(rowsPanel, comps, expanded) {
+			expanded = true
+			renderRows()
+		}
+	}
+
+	override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
 
 	// ── Row actions ─────────────────────────────────────────────────────
 

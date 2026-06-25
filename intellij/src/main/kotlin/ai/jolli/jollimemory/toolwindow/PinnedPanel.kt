@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.toolwindow
 
+import ai.jolli.jollimemory.JolliMemoryIcons
 import ai.jolli.jollimemory.core.ActiveSessionAggregator
 import ai.jolli.jollimemory.core.CommitSelectionStore
 import ai.jolli.jollimemory.core.PinStore
@@ -10,6 +11,7 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
@@ -24,6 +26,8 @@ import java.awt.Font
 import java.awt.Graphics
 import java.awt.Graphics2D
 import java.awt.RenderingHints
+import java.awt.Toolkit
+import java.awt.datatransfer.StringSelection
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.io.File
@@ -45,7 +49,11 @@ import javax.swing.SwingUtilities
 class PinnedPanel(
 	private val project: Project,
 	private val service: JolliMemoryService,
-) : JPanel(BorderLayout()), Disposable {
+) : JPanel(BorderLayout()), Disposable, RowCountSource {
+
+	override var onRowCountChanged: ((Int) -> Unit)? = null
+	private var rowCount = 0
+	override fun currentRowCount(): Int = rowCount
 
 	private val rowsPanel = JPanel().apply {
 		layout = BoxLayout(this, BoxLayout.Y_AXIS)
@@ -79,15 +87,21 @@ class PinnedPanel(
 	}
 
 	private fun render(pins: List<PinStore.PinnedEntry>) {
+		rowCount = pins.size
+		onRowCountChanged?.invoke(rowCount)
 		rowsPanel.removeAll()
 		if (pins.isEmpty()) {
 			rowsPanel.add(emptyLabel)
 		} else {
 			pins.forEach { rowsPanel.add(pinRow(it)) }
 		}
-		rowsPanel.revalidate()
-		rowsPanel.repaint()
+		// Revalidate the whole panel so the accordion re-lays out to the new
+		// content height (the Pinned section is sized to fit its items).
+		revalidate()
+		repaint()
 	}
+
+	override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
 
 	private fun pinRow(entry: PinStore.PinnedEntry): JPanel {
 		val row = JPanel(BorderLayout()).apply {
@@ -104,37 +118,32 @@ class PinnedPanel(
 		left.add(title)
 		row.add(left, BorderLayout.CENTER)
 
-		val unpin = JBLabel(AllIcons.Actions.Close).apply {
-			toolTipText = "Unpin"
-			cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-			isVisible = false
-			border = JBUI.Borders.empty(0, 3)
-			addMouseListener(object : MouseAdapter() {
-				override fun mouseClicked(e: MouseEvent) {
-					e.consume()
-					val dir = cwd() ?: return
-					ApplicationManager.getApplication().executeOnPooledThread {
-						PinStore.unpin(dir, entry.kind, entry.key)
-						refresh()
-					}
-				}
-			})
+		// Hover actions, right edge: Open (eye) · Recall (play) · Unpin.
+		val openBtn = actionIcon(JolliMemoryIcons.Eye, "Open") { openPinned(entry) }
+		val recallBtn = actionIcon(AllIcons.Actions.Execute, "Recall") { recallPinned(entry) }
+		val unpinBtn = actionIcon(AllIcons.Actions.Close, "Unpin") {
+			val dir = cwd() ?: return@actionIcon
+			ApplicationManager.getApplication().executeOnPooledThread {
+				PinStore.unpin(dir, entry.kind, entry.key)
+				refresh()
+			}
 		}
-		val east = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
+		val actions = listOf(openBtn, recallBtn, unpinBtn)
+		val east = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(2), 0)).apply {
 			isOpaque = false
-			add(unpin)
+			actions.forEach { add(it) }
 		}
 		row.add(east, BorderLayout.EAST)
 
 		val hover = object : MouseAdapter() {
-			override fun mouseEntered(e: MouseEvent) { unpin.isVisible = true }
+			override fun mouseEntered(e: MouseEvent) { actions.forEach { it.isVisible = true } }
 			override fun mouseExited(e: MouseEvent) {
 				val p = e.point
 				val src = e.source as Component
 				val screen = src.locationOnScreen.apply { translate(p.x, p.y) }
 				val loc = row.locationOnScreen
 				if (!java.awt.Rectangle(loc.x, loc.y, row.width, row.height).contains(screen)) {
-					unpin.isVisible = false
+					actions.forEach { it.isVisible = false }
 				}
 			}
 		}
@@ -145,8 +154,33 @@ class PinnedPanel(
 			c.addMouseListener(hover)
 			c.addMouseListener(click)
 		}
-		unpin.addMouseListener(hover)
+		actions.forEach { it.addMouseListener(hover) }
 		return row
+	}
+
+	private fun actionIcon(icon: javax.swing.Icon, tip: String, onClick: () -> Unit): JBLabel = JBLabel(icon).apply {
+		toolTipText = tip
+		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+		isVisible = false
+		border = JBUI.Borders.empty(0, 2)
+		addMouseListener(object : MouseAdapter() {
+			override fun mouseClicked(e: MouseEvent) {
+				e.consume()
+				onClick()
+			}
+		})
+	}
+
+	/** Recall action (play): copies the recall prompt for the current branch. */
+	private fun recallPinned(entry: PinStore.PinnedEntry) {
+		val branch = service.getGitOps()?.getCurrentBranch()
+		if (branch.isNullOrBlank()) {
+			Messages.showWarningDialog(project, "Could not determine the current branch.", "Recall")
+			return
+		}
+		val prompt = "Invoke the \"jolli-recall\" skill with args \"$branch\"."
+		Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(prompt), null)
+		Messages.showInfoMessage(project, "Recall prompt copied — paste it into your AI coding tool.", "Recall")
 	}
 
 	private fun badgeColor(entry: PinStore.PinnedEntry): Color = when (entry.kind) {
@@ -170,7 +204,8 @@ class PinnedPanel(
 	private fun openPath(path: String?) {
 		if (path.isNullOrBlank()) return
 		val vf = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(File(path)) ?: return
-		FileEditorManager.getInstance(project).openFile(vf, true)
+		// Plans / notes / references are markdown — open rendered (preview), like the mockup.
+		MarkdownPreview.open(project, vf)
 	}
 
 	private fun openConversation(key: String, cwd: String) {
@@ -193,7 +228,8 @@ class PinnedPanel(
 			val summary = service.getSummary(hash)
 			SwingUtilities.invokeLater {
 				if (summary != null) {
-					FileEditorManager.getInstance(project).openFile(SummaryVirtualFile(summary, readOnly = true), true)
+					// Full memory UI (Create PR etc.), same as the Committed Memories view.
+					FileEditorManager.getInstance(project).openFile(SummaryVirtualFile(summary), true)
 				}
 			}
 		}

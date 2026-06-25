@@ -2,24 +2,14 @@ package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.JolliMemoryIcons
 import ai.jolli.jollimemory.services.JolliMemoryService
-import ai.jolli.jollimemory.services.PrService
-import com.intellij.icons.AllIcons
-import com.intellij.openapi.actionSystem.ActionManager
-import com.intellij.openapi.actionSystem.AnActionEvent
-import com.intellij.openapi.actionSystem.impl.SimpleDataContext
 import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.progress.ProgressIndicator
-import com.intellij.openapi.progress.ProgressManager
-import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.util.ui.JBUI
+import java.awt.BorderLayout
 import java.awt.Dimension
-import java.awt.FlowLayout
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
-import java.awt.event.ComponentAdapter
-import java.awt.event.ComponentEvent
 import javax.swing.JButton
 import javax.swing.JPanel
 import javax.swing.SwingUtilities
@@ -43,71 +33,48 @@ import javax.swing.SwingUtilities
 class ActionBarPanel(
 	private val project: Project,
 	private val service: JolliMemoryService,
-) : JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), JBUI.scale(4))) {
+) : JPanel(BorderLayout(JBUI.scale(4), 0)) {
 
-	private val commitBtn: JButton
 	private val prBtn: JButton
+	private val shareBtn: JButton
 	private val moreBtn: JButton
 
 	private var foreign = false
-	private var compact = false
 
 	init {
-		border = JBUI.Borders.empty(2, 6)
+		border = JBUI.Borders.empty(4, 6)
 
-		commitBtn = JButton("Commit", JolliMemoryIcons.Sparkle).apply {
-			toolTipText = "Commit the checked files with an AI-written message and save a memory."
-			addActionListener { invokeRegisteredAction("JolliMemory.CommitAI") }
-		}
-		prBtn = JButton("Create PR", AllIcons.Vcs.Vendors.Github).apply {
+		// Bottom bar, single row: "Create pull request (PR)" fills the width, with
+		// "Share" and the "..." overflow button beside it on the right.
+		prBtn = JolliButtons.secondary("Create pull request (PR)", JolliMemoryIcons.GitPullRequest).apply {
 			toolTipText = "Create a pull request for this branch (drafted from its memories)."
 			addActionListener { handleCreatePr() }
 		}
-		moreBtn = JButton(AllIcons.Actions.More).apply {
+		shareBtn = JolliButtons.secondary("Share", JolliMemoryIcons.Share).apply {
+			toolTipText = "Share this branch's memories."
+			addActionListener { handleShare() }
+		}
+		moreBtn = JolliButtons.secondary("...").apply {
 			toolTipText = "More actions"
 			addActionListener { showMoreMenu() }
 		}
 
-		add(commitBtn)
-		add(prBtn)
-		add(moreBtn)
-
-		// Collapse button labels to icon-only when the tool window is narrow (~240px),
-		// matching the mockup's responsive action strip.
-		addComponentListener(object : ComponentAdapter() {
-			override fun componentResized(e: ComponentEvent) {
-				val shouldCompact = width in 1 until JBUI.scale(240)
-				if (shouldCompact != compact) {
-					compact = shouldCompact
-					applyCompact()
-				}
-			}
-		})
+		add(prBtn, BorderLayout.CENTER)
+		val east = JPanel(java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, JBUI.scale(4), 0)).apply {
+			isOpaque = false
+			add(shareBtn)
+			add(moreBtn)
+		}
+		add(east, BorderLayout.EAST)
 	}
 
-	/** Hide Commit / Create PR when viewing a foreign (read-only) repo/branch. */
+	/** Hide Create PR + Share when viewing a foreign (read-only) repo/branch. */
 	fun setForeign(isForeign: Boolean) {
 		foreign = isForeign
-		commitBtn.isVisible = !isForeign
 		prBtn.isVisible = !isForeign
+		shareBtn.isVisible = !isForeign
 		revalidate()
 		repaint()
-	}
-
-	private fun applyCompact() {
-		commitBtn.text = if (compact) "" else "Commit"
-		prBtn.text = if (compact) "" else "Create PR"
-		revalidate()
-		repaint()
-	}
-
-	// ── Commit ────────────────────────────────────────────────────────────────
-
-	private fun invokeRegisteredAction(actionId: String) {
-		val action = ActionManager.getInstance().getAction(actionId) ?: return
-		val ctx = SimpleDataContext.getProjectContext(project)
-		val event = AnActionEvent.createFromAnAction(action, null, "JolliMemoryActionBar", ctx)
-		action.actionPerformed(event)
 	}
 
 	// ── Recall ──────────────────────────────────────────────────────────────
@@ -177,56 +144,27 @@ class ActionBarPanel(
 
 	// ── Create PR ─────────────────────────────────────────────────────────────
 
+	/**
+	 * Opens the branch's most recent committed memory in its detail webview, where
+	 * the Create PR flow lives — identical to the memory row's "⋯ → Create PR".
+	 */
 	private fun handleCreatePr() {
-		val cwd = service.mainRepoRoot ?: project.basePath ?: return
-		ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Jolli Memory: Preparing PR…", true) {
-			override fun run(indicator: ProgressIndicator) {
-				if (!PrService.isGhAvailable(cwd)) {
-					ApplicationManager.getApplication().invokeLater {
-						Messages.showErrorDialog(
-							project,
-							"GitHub CLI (gh) is not installed or not on PATH. Install it from https://cli.github.com to create PRs.",
-							"Create PR",
-						)
-					}
-					return
-				}
-				if (!PrService.isGhAuthenticated(cwd)) {
-					ApplicationManager.getApplication().invokeLater {
-						Messages.showErrorDialog(
-							project,
-							"GitHub CLI is not authenticated. Run `gh auth login` first.",
-							"Create PR",
-						)
-					}
-					return
-				}
+		val opened = service.panelRegistry?.commitsPanel?.openMostRecentMemory() ?: false
+		if (!opened) {
+			Messages.showInfoMessage(
+				project,
+				"No committed memory on this branch yet. Commit first, then create a PR from the memory view.",
+				"Create PR",
+			)
+		}
+	}
 
-				val branch = PrService.getCurrentBranch(cwd) ?: "this branch"
-				val defaultTitle = branch.substringAfterLast('/').replace('-', ' ').replace('_', ' ')
-				val defaultBody = "Drafted from this branch's Jolli memories.\n\n_Review and edit before creating._"
-
-				ApplicationManager.getApplication().invokeLater {
-					val title = Messages.showInputDialog(
-						project, "PR title:", "Create PR", null, defaultTitle, null,
-					) ?: return@invokeLater
-
-					ApplicationManager.getApplication().executeOnPooledThread {
-						try {
-							PrService.pushBranch(cwd)
-							val url = PrService.createPr(title.ifBlank { defaultTitle }, defaultBody, cwd)
-							ApplicationManager.getApplication().invokeLater {
-								Messages.showInfoMessage(project, "Pull request created:\n$url", "Create PR")
-							}
-						} catch (ex: Exception) {
-							ApplicationManager.getApplication().invokeLater {
-								Messages.showErrorDialog(project, "Create PR failed: ${ex.message}", "Create PR")
-							}
-						}
-					}
-				}
-			}
-		})
+	private fun handleShare() {
+		Messages.showInfoMessage(
+			project,
+			"Share — share this branch's memories to your Jolli Space (action to be wired).",
+			"Share",
+		)
 	}
 
 	override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)

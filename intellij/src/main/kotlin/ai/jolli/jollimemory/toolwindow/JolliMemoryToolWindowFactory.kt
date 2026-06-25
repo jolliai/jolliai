@@ -21,17 +21,22 @@ import com.intellij.openapi.wm.ToolWindowFactory
 import git4idea.repo.GitRepository
 import git4idea.repo.GitRepositoryChangeListener
 import com.intellij.ui.components.JBLabel
+import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.content.ContentFactory
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
 import java.awt.CardLayout
+import java.awt.Component
 import java.awt.Cursor
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import javax.swing.Box
+import javax.swing.BoxLayout
 import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.Popup
 import javax.swing.PopupFactory
+import javax.swing.ScrollPaneConstants
 import javax.swing.SwingUtilities
 
 /**
@@ -55,6 +60,10 @@ import javax.swing.SwingUtilities
 class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
 
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
+        // Display name shown in the tool window header / stripe. The registered id
+        // stays "JOLLI" to preserve layout state.
+        (toolWindow as? com.intellij.openapi.wm.ex.ToolWindowEx)?.stripeTitle = "JOLLI MEMORY"
+
         // ── No Git repository — show a placeholder and listen for VCS changes ──
         val basePath = project.basePath
         val hasGit = basePath != null && java.io.File(basePath, ".git").exists()
@@ -162,15 +171,14 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         // ── Review-Memory sub-sections (folded inside Current Memory) ──
         // Conversations / Changes / Context keep their existing action toolbars and
         // row logic; they are no longer top-level sections (minimal-density redesign).
-        val conversationsCollapsible = CollapsiblePanel(
-            "Conversations", "JolliMemory.ConversationsActions", conversationsPanel,
-        )
-        val contextCollapsible = CollapsiblePanel("Context", "JolliMemory.PlansActions", plansPanel)
-        val filesCollapsible = CollapsiblePanel("Files", "JolliMemory.ChangesActions", changesPanel)
-
         // Inputs folded into Current Memory, in order: Conversations → Context → Files.
+        // Each renders capped at 6 rows (then "Show N more"), separated by a light-blue
+        // divider, with a single shared scrollbar across all three.
         val currentMemoryPanel = CurrentMemoryPanel(
-            service, conversationsCollapsible, contextCollapsible, filesCollapsible,
+            service,
+            conversationsPanel, "JolliMemory.ConversationsActions",
+            plansPanel, "JolliMemory.PlansActions",
+            changesPanel, "JolliMemory.ChangesActions",
         )
 
         // Register panels for action lookup
@@ -188,22 +196,42 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         // ── Top-level accordion: Pinned → Current Memory → Committed Memories ──
         // (the redesign's three collapsible panels). CommitsPanel still shows
         // workspace commits, or foreign memories in read-only mode.
-        val pinnedCollapsible = CollapsiblePanel("Pinned", "JolliMemory.PinnedActions", pinnedPanel)
+        // Pinned sizes to its content (height tracks the number of pinned items)
+        // rather than taking an equal share of the accordion's surplus space.
+        val pinnedCollapsible = CollapsiblePanel(
+            "PINNED", "JolliMemory.PinnedActions", pinnedPanel, fitContent = true,
+        )
         val currentMemoryCollapsible = CollapsiblePanel(
-            "Current Memory", "JolliMemory.CurrentMemoryActions", currentMemoryPanel,
+            "CURRENT MEMORY", "JolliMemory.CurrentMemoryActions", currentMemoryPanel,
         )
         val memoriesCollapsible = CollapsiblePanel(
-            "Committed Memories", "JolliMemory.CommitsActions", commitsPanel,
+            "COMMITTED MEMORIES", "JolliMemory.CommitsActions", commitsPanel,
         )
 
-        // Accordion layout so collapsed panels shrink to header-only height and
-        // expanded panels share remaining space; dividers allow manual resize.
-        val accordionPanel = JPanel(AccordionLayout()).apply {
+        // Live row-count suffix in the section headers, e.g. "PINNED (3)".
+        pinnedCollapsible.setCount(pinnedPanel.currentRowCount())
+        pinnedPanel.onRowCountChanged = { n -> SwingUtilities.invokeLater { pinnedCollapsible.setCount(n) } }
+        memoriesCollapsible.setCount(commitsPanel.currentRowCount())
+        commitsPanel.onRowCountChanged = { n -> SwingUtilities.invokeLater { memoriesCollapsible.setCount(n) } }
+
+        // Single vertical stack with ONE scrollbar spanning all three sections
+        // (Pinned → Current Memory → Committed Memories). Each panel sizes to its
+        // content; the trailing glue fills the viewport when the content is short.
+        val accordionStack = WidthTrackingPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            isOpaque = false
+            pinnedCollapsible.alignmentX = Component.LEFT_ALIGNMENT
+            currentMemoryCollapsible.alignmentX = Component.LEFT_ALIGNMENT
+            memoriesCollapsible.alignmentX = Component.LEFT_ALIGNMENT
             add(pinnedCollapsible)
-            add(ResizeDivider())
             add(currentMemoryCollapsible)
-            add(ResizeDivider())
             add(memoriesCollapsible)
+            add(Box.createVerticalGlue())
+        }
+        val accordionPanel = JBScrollPane(accordionStack).apply {
+            border = JBUI.Borders.empty()
+            verticalScrollBarPolicy = ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED
+            horizontalScrollBarPolicy = ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
         }
 
         // Gear menu: show/hide the three top-level panels.

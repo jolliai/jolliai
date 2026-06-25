@@ -21,6 +21,9 @@ repositories {
     mavenCentral()
     intellijPlatform {
         defaultRepositories()
+        // JBR binaries repository so jetbrainsRuntime() can resolve — required for
+        // JCEF (the commit-memory webview) when runIde isn't launched on a JBR.
+        jetbrainsRuntime()
     }
 }
 
@@ -34,6 +37,10 @@ dependencies {
         bundledPlugin("Git4Idea")
         pluginVerifier()
         instrumentationTools()
+        // Use the JetBrains Runtime for runIde/tests so JCEF is available — the
+        // commit-memory panel renders via JBCefBrowser and otherwise falls back to
+        // a raw-markdown text view (e.g. when launched on a plain Homebrew JDK).
+        jetbrainsRuntime()
     }
     // Gson and kotlin-stdlib are compileOnly — IntelliJ bundles both at runtime.
     // The standalone hooks JAR bundles its own copies via the hooksRuntime configuration.
@@ -598,12 +605,17 @@ tasks {
     // Workaround: IntelliJ Platform Gradle Plugin 2.5.0 fails to parse the Java
     // version from the downloaded IDE runtime, producing "JavaLanguageVersion must
     // be a positive integer, not ''". Explicitly set the JVM launcher for affected tasks.
+    // EXCEPT runIde: it must launch on the JetBrains Runtime (resolved via
+    // jetbrainsRuntime()) so JCEF is available for the commit-memory webview —
+    // forcing the toolchain JDK here would drop JCEF and fall back to raw markdown.
     withType<JavaExec> {
-        javaLauncher.set(
-            project.the<JavaToolchainService>().launcherFor {
-                languageVersion.set(JavaLanguageVersion.of(21))
-            }
-        )
+        if (name != "runIde") {
+            javaLauncher.set(
+                project.the<JavaToolchainService>().launcherFor {
+                    languageVersion.set(JavaLanguageVersion.of(21))
+                }
+            )
+        }
     }
 
     // Bake project.version into jollimemory-plugin-version.txt at build time so

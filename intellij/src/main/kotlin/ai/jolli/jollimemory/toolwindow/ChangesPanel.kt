@@ -59,7 +59,10 @@ import javax.swing.Timer
 class ChangesPanel(
     private val project: Project,
     private val service: JolliMemoryService,
-) : JPanel(BorderLayout()), Disposable {
+) : JPanel(BorderLayout()), Disposable, RowCountSource {
+
+    override var onRowCountChanged: ((Int) -> Unit)? = null
+    override fun currentRowCount(): Int = changes.size
 
     private val emptyLabel = JBLabel("No changes detected.", javax.swing.SwingConstants.CENTER)
     private val checkboxes = mutableListOf<JCheckBox>()
@@ -67,7 +70,8 @@ class ChangesPanel(
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
     }
     private var changes: List<FileChange> = emptyList()
-    private var commitBtn: JButton? = null
+    /** Whether the user expanded past the 6-row cap (via "Show N more"). */
+    private var changesExpanded = false
     private var debounceTimer: Timer? = null
     private var gitChangeDebounceTimer: Timer? = null
     /** Project-level bus for GIT_REPO_CHANGE events. */
@@ -175,6 +179,7 @@ class ChangesPanel(
     }
 
     private fun updateFileList() {
+        onRowCountChanged?.invoke(changes.size)
         removeAll()
         checkboxes.clear()
         fileListPanel.removeAll()
@@ -182,54 +187,24 @@ class ChangesPanel(
 
         if (changes.isEmpty()) {
             emptyLabel.text = "Working tree clean — no changes."
-            add(emptyLabel, BorderLayout.CENTER)
+            add(emptyLabel, BorderLayout.NORTH)
         } else {
-            for (change in changes) {
-                val row = createFileRow(change)
-                fileListPanel.add(row)
+            // Build all rows (so every checkbox exists for getSelectedFiles), but show
+            // at most 6 — the rest collapse behind "Show N more". No inner scrollbar;
+            // Current Memory provides a single scrollbar across all three sections.
+            // The Commit action lives in the bottom action bar, not per-section.
+            val rows = changes.map { createFileRow(it) }
+            CappedRows.render(fileListPanel, rows, changesExpanded) {
+                changesExpanded = true
+                updateFileList()
             }
-            // Push file rows to the top when the list is shorter than the viewport
-            fileListPanel.add(Box.createVerticalGlue())
-
-            add(JBScrollPane(fileListPanel).apply {
-                horizontalScrollBarPolicy = JBScrollPane.HORIZONTAL_SCROLLBAR_NEVER
-            }, BorderLayout.CENTER)
-
-            // AI Commit button at the bottom (matches VS Code "Commit Memory" button)
-            commitBtn = JButton("Commit Memory", JolliMemoryIcons.Sparkle).apply {
-                toolTipText = "Generate AI commit message and commit selected files"
-                cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-                isEnabled = checkboxes.any { it.isSelected }
-                foreground = Color.WHITE
-                isOpaque = false
-                isFocusPainted = false
-                isContentAreaFilled = false
-                isBorderPainted = false
-                border = JBUI.Borders.empty(6, 14)
-                ui = object : javax.swing.plaf.basic.BasicButtonUI() {
-                    override fun paint(g: java.awt.Graphics, c: javax.swing.JComponent) {
-                        val g2 = g.create() as java.awt.Graphics2D
-                        g2.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING, java.awt.RenderingHints.VALUE_ANTIALIAS_ON)
-                        val btn = c as JButton
-                        g2.color = if (btn.isEnabled) Color(0x0078D4) else Color(0x0078D4).darker().darker()
-                        g2.fillRoundRect(0, 0, c.width, c.height, 8, 8)
-                        g2.dispose()
-                        btn.foreground = Color.WHITE
-                        super.paint(g, c)
-                    }
-                }
-                addActionListener {
-                    val action = ActionManager.getInstance().getAction("JolliMemory.CommitAI") ?: return@addActionListener
-                    ActionManager.getInstance().tryToExecute(action, null, this, "JolliMemoryChangesPanel", true)
-                }
-            }
-            val btnPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 4))
-            btnPanel.add(commitBtn)
-            add(btnPanel, BorderLayout.SOUTH)
+            add(fileListPanel, BorderLayout.NORTH)
         }
 
         revalidate(); repaint()
     }
+
+    override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
 
     fun getSelectedFiles(): List<FileChange> {
         return changes.filterIndexed { i, _ -> checkboxes.getOrNull(i)?.isSelected ?: false }
@@ -242,7 +217,6 @@ class ChangesPanel(
     fun toggleSelectAll() {
         val anyUnchecked = checkboxes.any { !it.isSelected }
         checkboxes.forEach { it.isSelected = anyUnchecked }
-        commitBtn?.isEnabled = checkboxes.any { it.isSelected }
         repaint()
     }
 
@@ -311,7 +285,6 @@ class ChangesPanel(
         val cb = JCheckBox("", change.isSelected).apply {
             isOpaque = false
             border = JBUI.Borders.empty()
-            addActionListener { commitBtn?.isEnabled = checkboxes.any { cb -> cb.isSelected } }
         }
         checkboxes.add(cb)
 

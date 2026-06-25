@@ -79,7 +79,11 @@ import javax.swing.UIManager
 class CommitsPanel(
     private val project: Project,
     private val service: JolliMemoryService,
-) : JPanel(BorderLayout()), Disposable {
+) : JPanel(BorderLayout()), Disposable, RowCountSource {
+
+    override var onRowCountChanged: ((Int) -> Unit)? = null
+    private var rowCount = 0
+    override fun currentRowCount(): Int = rowCount
 
     private val listPanel = JPanel().apply {
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
@@ -296,6 +300,8 @@ class CommitsPanel(
     }
 
     private fun updateCommitList() {
+        rowCount = commits.size
+        onRowCountChanged?.invoke(rowCount)
         removeAll()
         listPanel.removeAll()
         commitRowStates.clear()
@@ -311,15 +317,15 @@ class CommitsPanel(
                 listPanel.add(state.row)
                 listPanel.add(state.fileContainer)
             }
-            // Push rows to the top when the list is shorter than the viewport
-            listPanel.add(Box.createVerticalGlue())
-
-            add(JBScrollPane(listPanel).apply {
-                horizontalScrollBarPolicy = JBScrollPane.HORIZONTAL_SCROLLBAR_NEVER
-            }, BorderLayout.CENTER)
+            // No inner scrollbar — the sidebar's single top-level scrollbar covers this
+            // section along with Pinned and Current Memory. Render at natural height.
+            add(listPanel, BorderLayout.NORTH)
         }
         revalidate(); repaint()
     }
+
+    override fun getMaximumSize(): java.awt.Dimension =
+        java.awt.Dimension(Int.MAX_VALUE, preferredSize.height)
 
     // ─── Row creation ─────────────────────────────────────────────────────────
 
@@ -678,6 +684,18 @@ class CommitsPanel(
         }
     }
 
+    /**
+     * Opens the most recent committed memory's detail view (the webview that hosts
+     * the Create PR flow). Mirrors the row's "⋯ → Create PR" menu item, but for the
+     * branch's latest memory — used by the bottom action bar's Create PR button.
+     * Returns false if there is no committed memory on the branch yet.
+     */
+    fun openMostRecentMemory(): Boolean {
+        val target = commits.firstOrNull { it.hasSummary } ?: return false
+        viewSummary(target.hash)
+        return true
+    }
+
     private fun viewSummary(commitHash: String) {
         ApplicationManager.getApplication().executeOnPooledThread {
             val summary = service.getSummary(commitHash)
@@ -726,6 +744,8 @@ class CommitsPanel(
     }
 
     private fun updateForeignList() {
+        rowCount = foreignEntries.size
+        onRowCountChanged?.invoke(rowCount)
         removeAll()
         listPanel.removeAll()
         commitRowStates.clear()
@@ -748,11 +768,7 @@ class CommitsPanel(
             for (entry in foreignEntries) {
                 listPanel.add(createForeignMemoryRow(entry))
             }
-            listPanel.add(Box.createVerticalGlue())
-
-            add(JBScrollPane(listPanel).apply {
-                horizontalScrollBarPolicy = JBScrollPane.HORIZONTAL_SCROLLBAR_NEVER
-            }, BorderLayout.CENTER)
+            add(listPanel, BorderLayout.NORTH)
         }
         revalidate(); repaint()
     }

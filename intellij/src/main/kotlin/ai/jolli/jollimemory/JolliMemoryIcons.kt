@@ -33,6 +33,12 @@ object JolliMemoryIcons {
     /** Git merge — matches VSCode codicon "git-merge" for squash. */
     val GitMerge: Icon = IconLoader.getIcon("/icons/git-merge.svg", JolliMemoryIcons::class.java)
 
+    /** Git pull request — matches VSCode codicon "git-pull-request" for Create PR. */
+    val GitPullRequest: Icon = IconLoader.getIcon("/icons/git-pull-request.svg", JolliMemoryIcons::class.java)
+
+    /** Share — node-share glyph, for the Share action. */
+    val Share: Icon = IconLoader.getIcon("/icons/share.svg", JolliMemoryIcons::class.java)
+
     /** Cloud upload — matches VSCode codicon "cloud-upload" for push. */
     val CloudUpload: Icon = IconLoader.getIcon("/icons/cloud-upload.svg", JolliMemoryIcons::class.java)
 
