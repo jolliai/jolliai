@@ -21,8 +21,8 @@
       if (e.button !== 0) return;
       if (opts.handle && !(e.target.closest && e.target.closest(opts.handle))) return;
       // Never start a drag from an interactive control inside the card
-      // (jump arrows, the "details" link, or the collapse title zone).
-      if (e.target.closest("[data-open-category],[data-open-topic],.p-jump,.c-jump,.t-open,.tg-toggle")) return;
+      // (jump arrows, or the title/caret zone that selects the topic / collapses it).
+      if (e.target.closest("[data-open-category],.p-jump,.c-jump,.tg-toggle")) return;
 
       const scale = window.WikiCamera ? window.WikiCamera.scale() : 1;
       const startX = e.clientX, startY = e.clientY;

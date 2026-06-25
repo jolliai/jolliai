@@ -19,10 +19,12 @@
   }
 
   function relItemHtml(edge, dir, peerUnit, topicOfPeer) {
-    const arrow = dir === "out" ? "→" : "←";
+    // Symmetric relationships are undirected, so they carry no direction arrow.
+    const sym = window.WikiData.symmetricTypes.has(edge.type);
+    const arrow = sym ? "" : (dir === "out" ? "→ " : "← ");
     return `<div class="rel-item" data-goto-unit="${esc(peerUnit.id)}" data-edge-key="${esc(edge.from + ">" + edge.to)}">` +
       `<div class="rel-head">` +
-      `<span class="rel-type ${esc(edge.type)}">${arrow} ${esc(edge.type)}</span>` +
+      `<span class="rel-type ${esc(edge.type)}">${arrow}${esc(edge.type)}</span>` +
       confPill(edge.confidence) +
       `<span class="rel-title">${esc(peerUnit.shortTitle)}</span>` +
       `</div>` +
@@ -36,13 +38,16 @@
     const g = D.graph;
     let html = "";
     html += `<h2>Jolli Graph</h2>`;
-    html += `<div class="p-meta">Distilled from the team wiki · regenerated on every merge</div>`;
+    html += `<div class="p-meta">Distilled from your local knowledge base · regenerated on every merge</div>`;
     html += `<h6>Project stats</h6><div class="stat-rows">`;
     html += row("Categories", g.stats.categories);
-    html += row("Knowledge topics", g.stats.topics);
-    html += row("Knowledge units", g.stats.units);
-    html += row("Typed links", g.stats.edges);
-    html += row("Cross-category links", g.stats.crossCategoryEdges);
+    html += row("Topics", g.stats.topics);
+    html += row("Units", g.stats.units);
+    // Typed links by scope (the three buckets sum to the total): both endpoints in
+    // one topic; across topics but inside one category; across categories.
+    html += row("Links within a topic", g.stats.intraTopicEdges);
+    html += row("Links within a category", g.stats.crossTopicEdges - g.stats.crossCategoryEdges);
+    html += row("Links across categories", g.stats.crossCategoryEdges);
     html += `</div>`;
     html += `<h6>How to read this</h6>`;
     html += `<p class="summary">Each big card is a <strong>category</strong>. Click one to see its knowledge topics and the units inside. Lines with numbers show how many links connect two categories — click a line to list them.</p>`;
@@ -97,6 +102,12 @@
     html += `<div class="p-meta">${esc(t.title)}</div>`;
     html += `<p class="summary">${esc(t.summary)}</p>`;
 
+    // Full wiki page opens in-panel (kind: "wiki"); Back returns to this topic.
+    // Sits right under the description, mirroring the "Open category" button.
+    if (t.fullBody) {
+      html += `<button type="button" class="wiki-open" data-open-wiki="${esc(slug)}">📖 Open full wiki page</button>`;
+    }
+
     // Distilled units as quick links into the board.
     if (units.length) {
       html += `<h6>Units in this topic — ${units.length}</h6>`;
@@ -108,12 +119,6 @@
       }
     }
 
-    // Full wiki page opens in-panel (kind: "wiki"); Back returns to this topic.
-    if (t.fullBody) {
-      html += `<h6>Source wiki page</h6>`;
-      html += `<button type="button" class="wiki-open" data-open-wiki="${esc(slug)}">` +
-        `📖 Open full wiki page</button>`;
-    }
     return html;
   }
 
@@ -143,9 +148,11 @@
     html += `<div class="p-meta">${agg.edges.length} cross-category link${agg.edges.length === 1 ? "" : "s"}</div>`;
     for (const e of agg.edges) {
       const fu = D.unitsById.get(e.from), tu = D.unitsById.get(e.to);
+      // Symmetric relationships are undirected → a non-directional connector.
+      const conn = window.WikiData.symmetricTypes.has(e.type) ? "↔" : "→";
       html += `<div class="rel-item" data-goto-unit="${esc(e.from)}">` +
         `<div class="rel-head"><span class="rel-type ${esc(e.type)}">${esc(e.type)}</span>${confPill(e.confidence)}</div>` +
-        `<div class="rel-title" style="margin-bottom:3px">${esc(fu.shortTitle)} → ${esc(tu.shortTitle)}</div>` +
+        `<div class="rel-title" style="margin-bottom:3px">${esc(fu.shortTitle)} ${conn} ${esc(tu.shortTitle)}</div>` +
         `<div class="rel-evidence">${esc(e.evidence)}</div></div>`;
     }
     return html;
@@ -172,6 +179,9 @@
     // Reading mode widens the panel for the long-form wiki page.
     const panelEl = document.getElementById("panel");
     if (panelEl) panelEl.classList.toggle("reading", !!(sel && sel.kind === "wiki"));
+    // Opening the full wiki page: jump to the top so reading starts at the
+    // beginning, not wherever the previous panel content was scrolled.
+    if (panelEl && sel && sel.kind === "wiki") panelEl.scrollTop = 0;
 
     const back = document.getElementById("panel-back");
     if (back) back.addEventListener("click", () => S.goBack());
@@ -190,7 +200,7 @@
         const key = el.dataset.edgeKey;
         if (!key) return;
         el.classList.add("spotlight");
-        window.WikiEdges.dimAllExcept(document.getElementById("edge-layer"), (k) => k === key);
+        window.WikiEdges.dimAllExcept((k) => k === key);
       });
       el.addEventListener("mouseleave", () => {
         el.classList.remove("spotlight");

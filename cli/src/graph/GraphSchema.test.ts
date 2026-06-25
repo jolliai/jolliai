@@ -6,8 +6,12 @@ import {
 	type DistilledGraph,
 	type DistilledTopic,
 	diffTopics,
+	dropSubsumedRelatedTo,
+	type GraphEdge,
 	isFingerprintMap,
 	mergeCategoryLayer,
+	normalizeSymmetricEdges,
+	SYMMETRIC_EDGE_TYPES,
 	type TopicSourceMeta,
 	toDistilled,
 	UNCATEGORIZED_CATEGORY_ID,
@@ -106,6 +110,128 @@ describe("validateDistilledGraph", () => {
 	});
 });
 
+describe("normalizeSymmetricEdges", () => {
+	const e = (from: string, to: string, type: GraphEdge["type"], confidence: number, evidence = ""): GraphEdge => ({
+		from,
+		to,
+		type,
+		confidence,
+		evidence,
+	});
+
+	it("collapses a reversed symmetric pair to one edge, keeping the higher-confidence side", () => {
+		const out = normalizeSymmetricEdges([
+			e("a", "b", "related-to", 0.6, "lo"),
+			e("b", "a", "related-to", 0.9, "hi"),
+		]);
+		expect(out).toHaveLength(1);
+		expect(out[0]).toMatchObject({ from: "b", to: "a", confidence: 0.9, evidence: "hi" });
+	});
+
+	it("keeps the first occurrence on a confidence tie", () => {
+		const out = normalizeSymmetricEdges([
+			e("a", "b", "related-to", 0.8, "first"),
+			e("b", "a", "related-to", 0.8, "second"),
+		]);
+		expect(out).toHaveLength(1);
+		expect(out[0].evidence).toBe("first");
+	});
+
+	it("dedups every symmetric type but never directed ones", () => {
+		expect([...SYMMETRIC_EDGE_TYPES].sort()).toEqual(["contradicts", "related-to"]);
+		const out = normalizeSymmetricEdges([
+			e("a", "b", "contradicts", 0.5),
+			e("b", "a", "contradicts", 0.7),
+			// Directed: A→B and B→A are genuinely distinct facts — both survive.
+			e("a", "b", "extends", 0.9),
+			e("b", "a", "extends", 0.9),
+		]);
+		expect(out.filter((x) => x.type === "contradicts")).toHaveLength(1);
+		expect(out.filter((x) => x.type === "extends")).toHaveLength(2);
+	});
+
+	it("preserves the original order of kept edges", () => {
+		const out = normalizeSymmetricEdges([
+			e("a", "b", "extends", 0.9),
+			e("c", "d", "related-to", 0.6),
+			e("d", "c", "related-to", 0.4),
+			e("e", "f", "supersedes", 0.8),
+		]);
+		expect(out.map((x) => `${x.from}->${x.to}:${x.type}`)).toEqual([
+			"a->b:extends",
+			"c->d:related-to",
+			"e->f:supersedes",
+		]);
+	});
+
+	it("keeps distinct symmetric pairs separate (different endpoints, same type)", () => {
+		const out = normalizeSymmetricEdges([e("a", "b", "related-to", 0.6), e("a", "c", "related-to", 0.6)]);
+		expect(out).toHaveLength(2);
+	});
+
+	it("keeps a reversed twin of a DIFFERENT symmetric type (type is part of the key)", () => {
+		const out = normalizeSymmetricEdges([e("a", "b", "related-to", 0.7), e("b", "a", "contradicts", 0.7)]);
+		expect(out).toHaveLength(2);
+	});
+
+	it("collapses three-plus duplicates of one pair to the single max-confidence edge", () => {
+		const out = normalizeSymmetricEdges([
+			e("a", "b", "related-to", 0.5, "first"),
+			e("b", "a", "related-to", 0.9, "max"),
+			e("a", "b", "related-to", 0.7, "third"),
+		]);
+		expect(out).toHaveLength(1);
+		expect(out[0].evidence).toBe("max");
+	});
+
+	it("returns an empty list unchanged", () => {
+		expect(normalizeSymmetricEdges([])).toEqual([]);
+	});
+});
+
+describe("dropSubsumedRelatedTo", () => {
+	const e = (from: string, to: string, type: GraphEdge["type"], confidence = 0.7): GraphEdge => ({
+		from,
+		to,
+		type,
+		confidence,
+		evidence: "",
+	});
+
+	it("drops a related-to when a directed edge links the same pair (either orientation)", () => {
+		const out = dropSubsumedRelatedTo([
+			e("a", "b", "related-to", 0.9), // generic, even at higher confidence
+			e("b", "a", "extends", 0.5), // specific, reversed orientation — still subsumes
+		]);
+		expect(out).toHaveLength(1);
+		expect(out[0].type).toBe("extends");
+	});
+
+	it("drops related-to subsumed by any specific type (contradicts included)", () => {
+		const out = dropSubsumedRelatedTo([e("a", "b", "related-to"), e("a", "b", "contradicts")]);
+		expect(out.map((x) => x.type)).toEqual(["contradicts"]);
+	});
+
+	it("keeps a related-to with no competing specific edge on its pair", () => {
+		const out = dropSubsumedRelatedTo([
+			e("a", "b", "related-to"),
+			e("c", "d", "extends"), // different pair — does not subsume a-b
+		]);
+		expect(out).toHaveLength(2);
+	});
+
+	it("keeps two genuinely-distinct specific edges on one pair (only related-to is ever dropped)", () => {
+		const out = dropSubsumedRelatedTo([e("a", "b", "extends"), e("a", "b", "caused-by")]);
+		expect(out).toHaveLength(2);
+	});
+
+	it("is order-preserving and a no-op on the empty list", () => {
+		expect(dropSubsumedRelatedTo([])).toEqual([]);
+		const edges = [e("a", "b", "extends"), e("c", "d", "related-to"), e("e", "f", "supersedes")];
+		expect(dropSubsumedRelatedTo(edges).map((x) => `${x.from}${x.to}`)).toEqual(["ab", "cd", "ef"]);
+	});
+});
+
 describe("assembleGraph", () => {
 	const sources = new Map<string, TopicSourceMeta>([
 		[
@@ -191,6 +317,33 @@ describe("assembleGraph", () => {
 		expect(graph.stats.crossCategoryEdges).toBe(0);
 		// t3 has no units — the `?? 0` rollup path.
 		expect(graph.topics.find((t) => t.slug === "t3")?.unitCount).toBe(0);
+	});
+
+	it("collapses a reversed symmetric edge pair before stats + emit", () => {
+		const g = validGraph();
+		// Reversed twins on a pair that has NO competing specific edge (u2↔u3), so the
+		// symmetric collapse is isolated from the related-to subsumption rule.
+		g.edges.push({ from: "t1::u2", to: "t2::u3", type: "related-to", confidence: 0.6, evidence: "fwd" });
+		g.edges.push({ from: "t2::u3", to: "t1::u2", type: "related-to", confidence: 0.9, evidence: "rev" });
+		const graph = assembleGraph(g, sources, "2026-06-15T00:00:00.000Z");
+		// 2 original directed + 1 collapsed symmetric = 3 (not 4).
+		expect(graph.stats.edges).toBe(3);
+		expect(graph.edges).toHaveLength(3);
+		const rel = graph.edges.filter((x) => x.type === "related-to");
+		expect(rel).toHaveLength(1);
+		expect(rel[0].evidence).toBe("rev"); // higher-confidence side won
+	});
+
+	it("drops a related-to subsumed by an existing extends on the same pair (the screenshot case)", () => {
+		const g = validGraph(); // already has t1::u1 --extends--> t1::u2
+		// Distiller also emitted a generic related-to for the same pair (reversed) at
+		// higher confidence — it must be dropped in favor of the specific extends.
+		g.edges.push({ from: "t1::u2", to: "t1::u1", type: "related-to", confidence: 0.95, evidence: "generic" });
+		const graph = assembleGraph(g, sources, "2026-06-15T00:00:00.000Z");
+		// extends (t1) + caused-by (cross) survive; the related-to is subsumed.
+		expect(graph.stats.edges).toBe(2);
+		expect(graph.edges.some((x) => x.type === "related-to")).toBe(false);
+		expect(graph.edges.filter((x) => x.type === "extends")).toHaveLength(1);
 	});
 
 	it("throws on a graph that fails validation", () => {

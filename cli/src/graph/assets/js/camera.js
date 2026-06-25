@@ -11,6 +11,12 @@
   const MIN_SCALE = 0.2;
   const MAX_SCALE = 2.5;
   const FIT_MARGIN = 70;
+  // Readability standard for a clicked unit: below this scale its text is too
+  // small, so focusUnit zooms IN to it. At/above it the zoom is left untouched
+  // (a click never zooms out). See focusUnit's rules.
+  const READABLE_SCALE = 0.8;
+  // Viewport padding (px) used when deciding "fully visible" / computing pans.
+  const FOCUS_PAD = 16;
 
   let pz = null;
   let main = null;
@@ -146,7 +152,95 @@
     centerOn(cx, cy, target, true);
   }
 
+  // Focus a clicked UNIT, following the unit-focus rules:
+  //   1. Readability — only ever zoom IN, up to READABLE_SCALE; never zoom out.
+  //      (At/above the standard the zoom is left exactly as-is.)
+  //   2. Anchor — zoom around the unit's OWN center, so that center stays on the
+  //      same screen pixel; no recentering pan when the unit stays fully visible.
+  //   3. Pan only when the unit would not be fully visible, and then by the
+  //      minimal amount that brings it in (translate only — scale is never lowered).
+  //   4. Within the slack that still keeps the unit fully visible, bias the pan to
+  //      reveal as many related units as fit; fit the whole unit+related group when
+  //      it can, else keep the unit visible and lean toward the group. Never zoom
+  //      out to fit related units — the unit's readability wins.
+  // relatedEls: the unit's neighbor card elements (may be empty or contain nulls).
+  function focusUnit(el, relatedEls, opts) {
+    if (!pz || !el) return;
+    if (!ready) { pendingOp = () => focusUnit(el, relatedEls, opts); return; }
+    if (!canvas.offsetWidth || !canvas.offsetHeight) return; // not laid out yet → avoid /0
+    const animate = !opts || opts.animate !== false;
+
+    const c = canvas.getBoundingClientRect();
+    const m = main.getBoundingClientRect();
+    const sv = c.width / canvas.offsetWidth;       // current visual scale (robust mid-transition)
+    const ox = canvas.offsetLeft, oy = canvas.offsetTop;
+
+    // Rule 1: raise the scale to the readable standard only if it is below it.
+    const s = clamp(Math.max(sv, READABLE_SCALE), MIN_SCALE, MAX_SCALE);
+
+    // Canvas-local (pre-transform) geometry of an element, from its screen rect.
+    const toLocal = (rect) => ({
+      cx: (rect.left + rect.width / 2 - c.left) / sv,
+      cy: (rect.top + rect.height / 2 - c.top) / sv,
+      w: rect.width / sv,
+      h: rect.height / sv,
+    });
+    const u = toLocal(el.getBoundingClientRect());
+
+    // Rule 2: anchor the unit center at its current main-local screen position, so
+    // the zoom pivots there. A local point p then maps to ax + s*(p - u.center).
+    const r = el.getBoundingClientRect();
+    const ax = (r.left + r.width / 2) - m.left;
+    const ay = (r.top + r.height / 2) - m.top;
+    const box = (g) => ({
+      x0: ax + s * ((g.cx - g.w / 2) - u.cx),
+      x1: ax + s * ((g.cx + g.w / 2) - u.cx),
+      y0: ay + s * ((g.cy - g.h / 2) - u.cy),
+      y1: ay + s * ((g.cy + g.h / 2) - u.cy),
+    });
+    const ub = box(u);
+
+    // Group bbox = unit ∪ related, in the same anchored main-local space.
+    let gx0 = ub.x0, gx1 = ub.x1, gy0 = ub.y0, gy1 = ub.y1;
+    for (const re of relatedEls || []) {
+      if (!re || !re.offsetWidth) continue;
+      const rb = box(toLocal(re.getBoundingClientRect()));
+      gx0 = Math.min(gx0, rb.x0); gx1 = Math.max(gx1, rb.x1);
+      gy0 = Math.min(gy0, rb.y0); gy1 = Math.max(gy1, rb.y1);
+    }
+
+    // Rules 3+4: minimal per-axis pan (screen px) keeping the unit fully visible
+    // and revealing the group as far as that allows.
+    const dx = solveAxis(FOCUS_PAD, main.clientWidth - FOCUS_PAD, ub.x0, ub.x1, gx0, gx1);
+    const dy = solveAxis(FOCUS_PAD, main.clientHeight - FOCUS_PAD, ub.y0, ub.y1, gy0, gy1);
+
+    // Compose anchored translate + the chosen screen-space pan (÷s → local units).
+    const txAnchor = (ax - ox) / s - u.cx;
+    const tyAnchor = (ay - oy) / s - u.cy;
+    pz.zoom(s, { animate });
+    pz.pan(txAnchor + dx / s, tyAnchor + dy / s, { animate });
+  }
+
+  // Minimal screen-space shift along one axis. Hard constraint: keep the unit
+  // [uA,uB] fully inside [viewMin,viewMax]. Within that freedom, bring the group
+  // [gA,gB] (unit ∪ related) in too — fully when it fits, else lean to its center.
+  // Returns the delta closest to 0 (the smallest pan) satisfying the constraints.
+  function solveAxis(viewMin, viewMax, uA, uB, gA, gB) {
+    const viewLen = viewMax - viewMin;
+    // Unit alone overflows the viewport → can't fully fit; center it (no slack).
+    if (uB - uA > viewLen) return (viewMin + viewMax) / 2 - (uA + uB) / 2;
+    const fMin = viewMin - uA, fMax = viewMax - uB; // feasible Δ keeping the unit in
+    if (gB - gA <= viewLen) {
+      // Group fits → minimal Δ to bring the whole group in (unit ⊆ group, so this
+      // keeps the unit in too). 0 when everything is already visible.
+      return clamp(0, Math.max(fMin, viewMin - gA), Math.min(fMax, viewMax - gB));
+    }
+    // Group too spread to fit at this scale → keep the unit fully visible and lean
+    // toward the group's center as far as the unit's slack allows (no zoom-out).
+    return clamp((viewMin + viewMax) / 2 - (gA + gB) / 2, fMin, fMax);
+  }
+
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
-  window.WikiCamera = { init, scale, fit, focusOn };
+  window.WikiCamera = { init, scale, fit, focusOn, focusUnit };
 })();

@@ -26,20 +26,36 @@
 
   const svgNS = "http://www.w3.org/2000/svg";
 
+  // The board is straddled by two SVG layers — "edge-layer" (front, intra-topic
+  // edges, painted above the board) and "edge-layer-back" (cross-topic /
+  // cross-category edges, painted behind the board so opaque boxes occlude
+  // them). Helpers that touch "the edges" operate on both.
+  function layerEls() {
+    return ["edge-layer", "edge-layer-back"]
+      .map((id) => document.getElementById(id))
+      .filter(Boolean);
+  }
+
+  // Reset both layers and return { front, back } so callers can route each edge
+  // to the right one. `back` falls back to `front` if the back layer is absent.
   function clear() {
-    const layer = document.getElementById("edge-layer");
-    while (layer.firstChild) layer.removeChild(layer.firstChild);
+    let front = null, back = null;
+    for (const layer of layerEls()) {
+      while (layer.firstChild) layer.removeChild(layer.firstChild);
+      syncSize(layer);
+      // Arrowheads are drawn manually into this group, kept as the LAST child
+      // of the layer so dashes from other edges can never overlay a triangle
+      // (SVG has no z-index — document order is paint order).
+      const arrows = document.createElementNS(svgNS, "g");
+      arrows.setAttribute("class", "edge-arrows");
+      layer.appendChild(arrows);
+      if (layer.id === "edge-layer-back") back = layer;
+      else front = layer;
+    }
     // Anchor nubs live on the cards themselves (so they move with card hover
     // transforms) — clear them along with the edges they belong to
     document.querySelectorAll(".card-nub").forEach((n) => n.remove());
-    syncSize(layer);
-    // Arrowheads are drawn manually into this group, kept as the LAST child
-    // of the layer so dashes from other edges can never overlay a triangle
-    // (SVG has no z-index — document order is paint order).
-    const arrows = document.createElementNS(svgNS, "g");
-    arrows.setAttribute("class", "edge-arrows");
-    layer.appendChild(arrows);
-    return layer;
+    return { front, back: back || front };
   }
 
   // Attach a semicircle nub to the inside of a card's top/bottom border.
@@ -253,14 +269,18 @@
     return g;
   }
 
-  function dimAllExcept(layer, predicate) {
-    // [data-edge-key] covers both the edge groups and their arrowheads
-    layer.querySelectorAll("[data-edge-key]").forEach((g) => {
-      g.classList.toggle("edge-dim", !predicate(g.dataset.edgeKey));
-    });
+  function dimAllExcept(predicate) {
+    for (const layer of layerEls()) {
+      // [data-edge-key] covers both the edge groups and their arrowheads
+      layer.querySelectorAll("[data-edge-key]").forEach((g) => {
+        g.classList.toggle("edge-dim", !predicate(g.dataset.edgeKey));
+      });
+    }
   }
-  function undim(layer) {
-    layer.querySelectorAll("g.edge-dim").forEach((g) => g.classList.remove("edge-dim"));
+  function undim() {
+    for (const layer of layerEls()) {
+      layer.querySelectorAll("g.edge-dim").forEach((g) => g.classList.remove("edge-dim"));
+    }
   }
 
   window.WikiEdges = { clear, draw, dimAllExcept, undim, EDGE_COLORS };

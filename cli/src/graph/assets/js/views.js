@@ -60,12 +60,17 @@
       window.WikiDrag.enable(el, drawOverviewEdges);
     });
 
-    // ELK layout first, then the aggregated category-pair edges
+    // ELK layout first, then the aggregated category-pair edges. The trailing
+    // .then always runs (catch resolves) so edges are (re)drawn and the camera
+    // settles even if ELK rejects — otherwise render()'s upfront edge-clear would
+    // leave the overview blank with no edges and no camera fit.
     requestAnimationFrame(() => {
-      layoutOverview(board).then(() => {
-        drawOverviewEdges();
-        settleCamera();
-      });
+      layoutOverview(board)
+        .catch((err) => { console.error("[wiki] layoutOverview failed", err); })
+        .then(() => {
+          drawOverviewEdges();
+          settleCamera();
+        });
     });
   }
 
@@ -73,13 +78,15 @@
   function drawOverviewEdges() {
     const D = window.WikiData;
     const board = document.getElementById("board");
-    const layer = window.WikiEdges.clear();
+    // Category cards are opaque, so the aggregated overview edges go on the back
+    // layer (behind the board) — same "tucked behind the cards" look as before.
+    const { back } = window.WikiEdges.clear();
     for (const agg of D.categoryAgg) {
       const elA = board.querySelector(`[data-category="${agg.a}"]`);
       const elB = board.querySelector(`[data-category="${agg.b}"]`);
       if (!elA || !elB) continue;
       const key = "agg:" + agg.a + "|" + agg.b;
-      window.WikiEdges.draw(layer, {
+      window.WikiEdges.draw(back, {
         fromEl: elA, toEl: elB,
         type: dominantType(agg.edges),
         width: Math.min(3.5, 1 + agg.edges.length * 0.35),
@@ -89,9 +96,8 @@
         key,
         onClick: () => window.WikiState.set({ selected: { kind: "category-pair", id: agg.a + "|" + agg.b } }),
         onHover: (on) => {
-          const layerEl = document.getElementById("edge-layer");
-          if (on) window.WikiEdges.dimAllExcept(layerEl, (k) => k === key);
-          else window.WikiEdges.undim(layerEl);
+          if (on) window.WikiEdges.dimAllExcept((k) => k === key);
+          else window.WikiEdges.undim();
         },
       });
     }
@@ -171,18 +177,25 @@
       const sel = S.get().selected;
       return sel && sel.kind === "unit" ? sel.id : null;
     })();
+    const selectedTopicSlug = (() => {
+      const sel = S.get().selected;
+      return sel && sel.kind === "topic" ? sel.id : null;
+    })();
 
-    let html = '<div class="category-detail masonry">';
+    // Expose the current category's color as --tcolor so selected topic/unit cards
+    // highlight in this category's color (mirrors how an overview category card
+    // highlights in its own color). Portals re-set their own --tcolor inline.
+    let html = `<div class="category-detail masonry" style="--tcolor:${category.color}">`;
     for (const t of topics) {
       const units = D.unitsByTopic.get(t.slug) || [];
       // All topics start expanded; only an explicit click on the title bar
       // collapses one (and that survives navigation via collapsedTopics).
       const isCollapsed = collapsed.has(t.slug);
-      html += `<section class="topic-group ${isCollapsed ? "collapsed" : ""}" data-topic="${esc(t.slug)}" title="Drag to move this group">`;
-      html += `<div class="topic-head" data-toggle="${esc(t.slug)}">`;
+      const isSelected = t.slug === selectedTopicSlug;
+      html += `<section class="topic-group ${isCollapsed ? "collapsed" : ""}${isSelected ? " selected" : ""}" data-topic="${esc(t.slug)}" title="Drag to move this group">`;
+      html += `<div class="topic-head">`;
       html += `<span class="tg-toggle"><span class="caret">▼</span><h4>${esc(t.shortTitle)}</h4></span>`;
       html += `<span class="t-sub">${units.length} units · ${t.commitCount} commits</span>`;
-      html += `<span class="t-open" data-open-topic="${esc(t.slug)}">details →</span>`;
       html += `</div>`;
       html += `<div class="collapsed-hint">${units.length} unit${units.length === 1 ? "" : "s"} hidden — click to expand</div>`;
       html += `<div class="unit-grid">`;
@@ -226,26 +239,29 @@
       drawCategoryEdges(categoryId);
       refreshSpotlight();
     }
-    board.querySelectorAll("[data-toggle]").forEach((el) => {
-      el.addEventListener("click", (ev) => {
-        // Collapse only when the title/caret zone is clicked; the rest of the
-        // header bar is the drag handle, and "details" opens the panel.
-        if (!ev.target.closest(".tg-toggle")) return;
-        toggleGroup(el.closest(".topic-group"), el.dataset.toggle);
-      });
-    });
-    // A collapsed group's whole body ("N units hidden — click to expand")
-    // expands it; the header keeps its own toggle.
+    // Topic card click model (one of the three category-page detail levels):
+    //   - the TITLE ZONE (caret + title, .tg-toggle) collapses / expands the group;
+    //   - clicking a COLLAPSED card's body expands it (its units are hidden);
+    //   - clicking an EXPANDED card anywhere else (subtitle, padding, gaps) selects
+    //     the TOPIC, opening its detail in the side panel (replaces the old
+    //     "details →" button);
+    //   - clicking a UNIT card selects that unit instead (its own handler below);
+    //     this handler bails on unit-card clicks so the two never collide.
+    // Clicking the empty board (outside every card) selects the category — handled
+    // by wireCanvasClear (clears the selection → the panel falls back to the
+    // current category's summary).
     board.querySelectorAll(".topic-group").forEach((sec) => {
+      const slug = sec.dataset.topic;
+      // Caret AND title both collapse — they read as one control, so clicking the
+      // title must behave like clicking the caret.
+      const toggle = sec.querySelector(".tg-toggle");
+      if (toggle) {
+        toggle.addEventListener("click", (ev) => { ev.stopPropagation(); toggleGroup(sec, slug); });
+      }
       sec.addEventListener("click", (ev) => {
-        if (!sec.classList.contains("collapsed")) return;
-        if (ev.target.closest(".topic-head")) return;
-        toggleGroup(sec, sec.dataset.topic);
-      });
-    });
-    board.querySelectorAll("[data-open-topic]").forEach((el) => {
-      el.addEventListener("click", () => {
-        S.set({ selected: { kind: "topic", id: el.dataset.openTopic } });
+        if (ev.target.closest(".unit-card") || ev.target.closest(".tg-toggle")) return;
+        if (sec.classList.contains("collapsed")) { toggleGroup(sec, slug); return; }
+        S.set({ selected: { kind: "topic", id: slug } });
       });
     });
     const redraw = () => { drawCategoryEdges(categoryId); refreshSpotlight(); };
@@ -531,13 +547,54 @@
   // fit the whole level into the viewport.
   function settleCamera() {
     const s = window.WikiState.get();
-    let el = null;
-    if (s.selected) {
-      if (s.selected.kind === "unit") el = document.querySelector(`[data-unit="${s.selected.id}"]`);
-      else if (s.selected.kind === "topic") el = document.querySelector(`[data-topic="${s.selected.id}"]`);
-    }
+    // A selected unit uses the unit-focus rules (readability zoom anchored on the
+    // unit's center, minimal pan biased toward its related units).
+    if (s.selected && s.selected.kind === "unit" && focusSelectedUnit(s.selected.id)) return;
+    // Topics keep the prior behavior; nothing selected → fit the whole level.
+    const el = s.selected && s.selected.kind === "topic"
+      ? document.querySelector(`[data-topic="${s.selected.id}"]`)
+      : null;
     if (el) window.WikiCamera.focusOn(el, { scale: 1 });
     else window.WikiCamera.fit({ animate: true });
+  }
+
+  // Apply the unit-focus camera rules to one unit. Shared by settleCamera (after a
+  // navigation re-render) and main.js's selection-only path (clicking a unit while
+  // already on its board), so a click gets identical behavior either way. Returns
+  // false when the unit has no rendered card (e.g. it lives behind a portal).
+  function focusSelectedUnit(unitId) {
+    let el = document.querySelector(`[data-unit="${unitId}"]`);
+    if (!el) return false;
+    // A unit inside a COLLAPSED group has a card that's still in the DOM but
+    // visibility:hidden (non-zero rect) — focusing it would zoom to an invisible
+    // spot. Focus the visible collapsed box instead, so the camera lands on where
+    // the unit lives.
+    const collapsed = el.closest(".topic-group.collapsed");
+    if (collapsed) el = collapsed;
+    window.WikiCamera.focusUnit(el, relatedUnitEls(unitId));
+    return true;
+  }
+
+  // Rendered neighbor cards of a unit, for the focus group bbox. Peers in another
+  // category (shown only via a portal) or otherwise absent resolve to no card and
+  // are simply skipped — the camera math tolerates an empty/partial list. A peer
+  // hidden in a collapsed group resolves to its visible box. Deduped: parallel
+  // edges to the same peer must not count its box twice.
+  function relatedUnitEls(unitId) {
+    const D = window.WikiData;
+    const els = [];
+    const seen = new Set();
+    for (const r of D.adj.get(unitId) || []) {
+      if (seen.has(r.peer)) continue;
+      seen.add(r.peer);
+      let el = document.querySelector(`[data-unit="${r.peer}"]`);
+      if (el) {
+        const collapsed = el.closest(".topic-group.collapsed");
+        if (collapsed) el = collapsed;
+        els.push(el);
+      }
+    }
+    return els;
   }
 
   function computePortals(categoryId) {
@@ -575,7 +632,7 @@
 
   function drawCategoryEdges(categoryId) {
     const D = window.WikiData;
-    const layer = window.WikiEdges.clear();
+    const { front, back } = window.WikiEdges.clear();
     const drawn = new Set(); // dedupe promoted pairs
 
     for (const e of D.edges) {
@@ -593,18 +650,28 @@
       drawn.add(pairKey);
 
       const isPortalEdge = fromEl.hasAttribute("data-portal") || toEl.hasAttribute("data-portal");
-      window.WikiEdges.draw(layer, {
+      // Layer routing: any edge with at least one visible unit-card endpoint
+      // rides the front layer (z-index 3, above the board), so it stays visible
+      // where it enters a box to reach its unit. Edges between two promoted
+      // headers / portals (no unit endpoint) stay on the back layer (z-index 1),
+      // occluded by the opaque boxes. (Front edges ride above ALL boxes — there
+      // is no per-edge occlusion, so a front edge may thread over an unrelated
+      // box it merely passes; that tradeoff was chosen over fragile masking.)
+      const anyUnit = !!(fromEl.dataset.unit || toEl.dataset.unit);
+      const targetLayer = anyUnit ? front : back;
+      window.WikiEdges.draw(targetLayer, {
         fromEl, toEl,
         type: e.type,
         width: 1 + (e.confidence - 0.6) * 4,        // 0.6→1.0, 0.9→2.2
         opacity: isPortalEdge ? 0.45 : 0.3 + (e.confidence - 0.6) * 1.6,
         dashed: isPortalEdge,
+        // Symmetric relationships have no direction → no arrowhead.
+        arrow: !D.symmetricTypes.has(e.type),
         label: e.type,
         key: e.from + ">" + e.to,
         onClick: () => window.WikiState.set({ selected: { kind: "unit", id: e.from } }),
         onHover: (on) => {
-          const l = document.getElementById("edge-layer");
-          if (on) window.WikiEdges.dimAllExcept(l, (k) => k === e.from + ">" + e.to);
+          if (on) window.WikiEdges.dimAllExcept((k) => k === e.from + ">" + e.to);
           else refreshSpotlight();
         },
       });
@@ -617,16 +684,15 @@
 
   // Dim everything not adjacent to unitId; null restores the neutral state.
   function dimToUnit(unitId) {
-    const layer = document.getElementById("edge-layer");
     const D = window.WikiData;
     if (!unitId) {
-      window.WikiEdges.undim(layer);
+      window.WikiEdges.undim();
       document.querySelectorAll(".unit-card.dimmed").forEach((el) => el.classList.remove("dimmed"));
       return;
     }
     const neighbors = new Set([unitId]);
     for (const r of D.adj.get(unitId) || []) neighbors.add(r.peer);
-    window.WikiEdges.dimAllExcept(layer, (k) => {
+    window.WikiEdges.dimAllExcept((k) => {
       const [f, t] = k.split(">");
       return f === unitId || t === unitId;
     });
@@ -644,17 +710,23 @@
   // everything else dims, until the selection is cleared (canvas click / Esc)
   // or moves to another card.
   function applySpotlight(unitId) {
-    const layer = document.getElementById("edge-layer");
-    layer.querySelectorAll("g.edge-flow").forEach((g) => g.classList.remove("edge-flow"));
-    // Lift the edge layer above the cards while focused, so highlighted edges
-    // can't be hidden behind unrelated topic boxes that sit between endpoints.
-    layer.classList.toggle("spotlight", !!unitId);
+    const layers = ["edge-layer", "edge-layer-back"]
+      .map((id) => document.getElementById(id)).filter(Boolean);
+    for (const layer of layers) {
+      layer.querySelectorAll("g.edge-flow").forEach((g) => g.classList.remove("edge-flow"));
+      // Lift the back layer above the boxes while focused (front already sits
+      // above them), so a highlighted cross edge can't be hidden behind an
+      // unrelated topic box sitting between its endpoints.
+      layer.classList.toggle("spotlight", !!unitId);
+    }
     dimToUnit(unitId);
     if (!unitId) return;
-    layer.querySelectorAll("g[data-edge-key]").forEach((g) => {
-      const [f, t] = g.dataset.edgeKey.split(">");
-      if (f === unitId || t === unitId) g.classList.add("edge-flow");
-    });
+    for (const layer of layers) {
+      layer.querySelectorAll("g[data-edge-key]").forEach((g) => {
+        const [f, t] = g.dataset.edgeKey.split(">");
+        if (f === unitId || t === unitId) g.classList.add("edge-flow");
+      });
+    }
   }
 
   // Re-assert the spotlight for the current selection (used after temporary
@@ -671,6 +743,13 @@
   }
 
   function render() {
+    // Wipe the previous level's edges synchronously, the instant we navigate.
+    // The new level's board lays out asynchronously (ELK) and its cards stay
+    // visibility:hidden until `.laid-out`, while its edges are only drawn after
+    // that layout. Without this, the old level's edges keep floating over the
+    // blank incoming board for the duration of the layout (see drawCategoryEdges,
+    // which is the next time the layers would otherwise be cleared).
+    window.WikiEdges.clear();
     const s = window.WikiState.get();
     if (s.level === "category" && s.categoryId) renderCategory(s.categoryId);
     else renderOverview();
@@ -705,5 +784,7 @@
     });
   }
 
-  window.WikiViews = { render, redrawEdges, highlightUnit, drawCategoryEdges, applySpotlight, refreshSpotlight };
+  window.WikiViews = {
+    render, redrawEdges, highlightUnit, drawCategoryEdges, applySpotlight, refreshSpotlight, focusSelectedUnit,
+  };
 })();

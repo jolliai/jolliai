@@ -44,6 +44,13 @@
   --kind-mechanism: #4ece8d;
   --kind-fix: #e0ac2b;
   --kind-migration: #b494f0;
+
+  /* Topic-box fill — OPAQUE (unlike the translucent --surface) so the back edge
+     layer is occluded where a cross edge passes over a box. Mapped onto the
+     editor tokens so it still follows the host theme (no light override needed:
+     --bg/--bg-raised already resolve per-theme via --vscode-*). */
+  --group-bg: var(--bg-raised);
+  --group-bg-collapsed: var(--bg);
 }
 
 /* ── Light theme: black-over-light overlays + darker accent labels ── */
@@ -118,17 +125,27 @@ body {
 .board-wrap { position: relative; width: max-content; will-change: transform; }
 .edge-layer {
   position: absolute; inset: 0; width: 100%; height: 100%;
-  pointer-events: none; z-index: 1;
+  pointer-events: none;
   /* An HTML-embedded <svg> clips to its box by default; a card dragged into
      negative coords would lose its edges. The real viewport clip is .main
      (overflow:hidden), so let edges draw past the svg box freely. */
   overflow: visible;
 }
-/* While a unit is focused, lift the edge layer above the cards so the
-   highlighted edges are never hidden behind an unrelated topic box that
-   happens to sit between the two endpoints. Dimmed edges are nearly
-   invisible, so drawing them over dimmed cards is harmless. */
-.edge-layer.spotlight { z-index: 3; }
+/* Back layer — cross-topic / cross-category edges. Sits BEHIND the board
+   (z < .board), so an opaque topic box occludes any cross edge passing over
+   it: cross edges read as clean connectors in the gaps between boxes instead
+   of threading through box interiors behind the unit cards. */
+#edge-layer-back { z-index: 1; }
+/* Front layer — intra-topic edges (and any edge that enters a box at a unit).
+   Sits ABOVE the board so it stays visible over the now-opaque topic boxes.
+   There is no per-edge occlusion: a front edge rides above every box, so it may
+   thread over an unrelated box it merely passes — accepted over fragile masking. */
+#edge-layer { z-index: 3; }
+/* While a unit is focused, lift the back layer above the boxes too, so a
+   highlighted cross edge is never hidden behind a topic box sitting between
+   its two endpoints. Dimmed edges are nearly invisible, so showing them over
+   boxes is harmless. */
+#edge-layer-back.spotlight { z-index: 4; }
 .edge-layer .edge-hit { pointer-events: stroke; cursor: pointer; }
 .board { position: relative; z-index: 2; padding: 26px 30px 60px; }
 
@@ -197,11 +214,18 @@ body {
 .category-detail.masonry { position: relative; visibility: hidden; }
 .category-detail.masonry.laid-out { visibility: visible; }
 .topic-group {
-  background: var(--surface);
+  background: var(--group-bg);
   border: 1.5px solid var(--line);
   border-radius: 10px;
   padding: 12px 16px 16px;
   box-shadow: inset 0 0 0 1px var(--surface);
+}
+/* Active topic: its detail is showing in the side panel (whether reached by
+   click or by Back navigation). The second-level "big card" — mirrors the
+   overview category card's selected look, in this category's color (--tcolor). */
+.topic-group.selected {
+  border-color: var(--tcolor, var(--accent));
+  box-shadow: 0 0 0 1px var(--tcolor, var(--accent)) inset, 0 6px 24px rgba(0,0,0,.45);
 }
 .masonry .topic-group { position: absolute; margin: 0; }
 /* ELK child-mode: the engine positions each card absolutely inside the
@@ -213,7 +237,7 @@ body {
    its layout space, cards are hidden, a centered hint takes their place.
    Neighbors never move. */
 .topic-group.collapsed .unit-grid { visibility: hidden; }
-.topic-group.collapsed { background: var(--surface); }
+.topic-group.collapsed { background: var(--group-bg-collapsed); }
 .collapsed-hint {
   display: none;
   position: absolute; left: 0; right: 0; top: 46px; bottom: 0;
@@ -226,7 +250,8 @@ body {
   display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
   padding: 2px 0 10px;
 }
-/* Title + caret = collapse toggle; the rest of the bar is the drag handle */
+/* Caret + title (.tg-toggle) = collapse toggle; clicking the rest of the card
+   selects the topic. The bar is also the drag handle. */
 .topic-head .tg-toggle {
   display: inline-flex; align-items: baseline; gap: 10px;
   cursor: pointer; border-radius: 5px; padding: 1px 4px; margin: -1px -4px;
@@ -236,12 +261,6 @@ body {
 .topic-group.collapsed .topic-head .caret { transform: rotate(-90deg); }
 .topic-head h4 { margin: 0; font-size: 15px; }
 .topic-head .t-sub { font-size: 12px; color: var(--muted); }
-.topic-head .t-open {
-  margin: -4px -6px -4px auto; font-size: 11px; color: var(--muted); cursor: pointer;
-  display: inline-flex; align-items: center; min-height: 28px;
-  padding: 5px 11px; border-radius: 5px; border: 1px solid transparent;
-}
-.topic-head .t-open:hover { color: var(--ink); border-color: var(--line); }
 
 /* Compact cards, generous gaps (UA-style): the vertical gap is where the
    intra-group edges live, so it gets the space the card padding gives up */
@@ -267,7 +286,10 @@ body {
 .unit-card, .category-card, .portal, .topic-group { cursor: grab; }
 .wiki-dragging { cursor: grabbing !important; z-index: 50 !important; }
 .wiki-dragging.unit-card { transform: none; }
-.unit-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-soft) inset; }
+.unit-card.selected {
+  border-color: var(--tcolor, var(--accent));
+  box-shadow: 0 0 0 1px var(--tcolor, var(--accent)) inset;
+}
 .unit-card.dimmed { opacity: .3; }
 .unit-card .u-kind {
   display: inline-block; font-size: 9px; font-weight: 700; letter-spacing: .1em;
@@ -294,7 +316,8 @@ body {
 .portal {
   border: 2px dashed var(--tcolor, var(--muted));
   border-radius: 9px;
-  background: var(--surface);
+  /* Opaque so back-layer cross edges routed past a portal are occluded too */
+  background: var(--group-bg);
   box-shadow: 0 0 0 1px rgba(0,0,0,.3), inset 0 0 24px var(--surface);
   padding: 11px 15px 10px;
   cursor: pointer;

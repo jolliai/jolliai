@@ -12,7 +12,7 @@
       <div class="brand"><span class="brand-name">Jolli</span><span class="brand-sub">GRAPH</span></div>
       <nav class="breadcrumb" id="breadcrumb"></nav>
       <div class="topbar-spacer"></div>
-      <input type="search" class="searchbox" id="searchbox" placeholder="Search topics & decisions…" autocomplete="off" />
+      <input type="search" class="searchbox" id="searchbox" placeholder="Search topics & units…" autocomplete="off" />
     </header>
 
     <div class="layout">
@@ -20,8 +20,13 @@
         <!-- board-wrap is the pan/zoom canvas: cards and the SVG edge layer
              transform together, so edge geometry stays valid at any zoom -->
         <div class="board-wrap" id="board-wrap">
-          <svg class="edge-layer" id="edge-layer"></svg>
+          <!-- Two edge layers straddling the board: the back layer (cross-topic
+               / cross-category edges) sits behind the board so opaque topic
+               boxes occlude it; the front layer (intra-topic edges) sits above
+               the board so it stays visible over those boxes. -->
+          <svg class="edge-layer edge-layer-back" id="edge-layer-back"></svg>
           <div class="board" id="board"></div>
+          <svg class="edge-layer edge-layer-front" id="edge-layer"></svg>
         </div>
         <div class="zoom-controls">
           <button type="button" id="zoom-out" title="Zoom out">−</button>
