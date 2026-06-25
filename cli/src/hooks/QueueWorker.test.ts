@@ -2334,7 +2334,7 @@ describe("QueueWorker", () => {
 
 			// The fresh worker holds the lock, proving the previous one is gone, so
 			// the stale marker is cleared at the source — not left to mislabel the
-			// next genuine summary run as "Updating Memory Bank…".
+			// next genuine summary run as "Building knowledge wiki…".
 			expect(realExistsSync(phaseFile)).toBe(false);
 
 			rmSync(tmp, { recursive: true, force: true });
@@ -2398,7 +2398,7 @@ describe("QueueWorker", () => {
 			vi.mocked(createStorage).mockResolvedValue(storageWithWiki(true));
 		});
 
-		it("writes worker-phase=ingest during ingest and removes it after", async () => {
+		it("writes worker-phase=ingest:wiki during ingest, advances to ingest:graph before the graph build, and removes it after", async () => {
 			const tmp = mkdtempSync(join(tmpdir(), "jolli-phase-"));
 			mkdirSync(join(tmp, ".jolli", "jollimemory"), { recursive: true });
 			const phaseFile = join(tmp, ".jolli", "jollimemory", "worker-phase");
@@ -2411,15 +2411,52 @@ describe("QueueWorker", () => {
 			vi.mocked(readFileSync).mockImplementation(realReadFileSync as typeof readFileSync);
 
 			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
-			let phaseSeenDuringIngest: string | null = null;
+			const readPhase = () => (existsSync(phaseFile) ? readFileSync(phaseFile, "utf-8") : null);
+			let phaseSeenDuringDrain: string | null = null;
+			let phaseSeenDuringGraph: string | null = null;
 			vi.mocked(drainIngest).mockImplementation(async () => {
-				phaseSeenDuringIngest = existsSync(phaseFile) ? readFileSync(phaseFile, "utf-8") : null;
+				phaseSeenDuringDrain = readPhase();
 				return { batches: 1, ingested: 2, outcome: "OK", topicFailures: [] };
+			});
+			vi.mocked(buildKnowledgeGraph).mockImplementationOnce(async () => {
+				phaseSeenDuringGraph = readPhase();
+				return { built: true };
 			});
 
 			await __test__.runIngestEntry(makeIngestOp("post-merge"), tmp, storageWithWiki(true));
 
-			expect(phaseSeenDuringIngest).toBe("ingest");
+			// The wiki phase covers ingest + render; the marker flips to graph only
+			// right before the (gated) build.
+			expect(phaseSeenDuringDrain).toBe("ingest:wiki");
+			expect(phaseSeenDuringGraph).toBe("ingest:graph");
+			expect(existsSync(phaseFile)).toBe(false);
+
+			rmSync(tmp, { recursive: true, force: true });
+		});
+
+		it("leaves the marker at ingest:wiki (never ingest:graph) when the graph build is skipped", async () => {
+			const tmp = mkdtempSync(join(tmpdir(), "jolli-phase-"));
+			mkdirSync(join(tmp, ".jolli", "jollimemory"), { recursive: true });
+			const phaseFile = join(tmp, ".jolli", "jollimemory", "worker-phase");
+
+			const { existsSync: realExistsSync, readFileSync: realReadFileSync } =
+				await vi.importActual<typeof import("node:fs")>("node:fs");
+			vi.mocked(existsSync).mockImplementation(realExistsSync);
+			vi.mocked(readFileSync).mockImplementation(realReadFileSync as typeof readFileSync);
+
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			// 0 ingested + wiki present → render + graph both skipped, so the phase
+			// never advances past wiki.
+			let phaseSeenDuringDrain: string | null = null;
+			vi.mocked(drainIngest).mockImplementation(async () => {
+				phaseSeenDuringDrain = existsSync(phaseFile) ? readFileSync(phaseFile, "utf-8") : null;
+				return { batches: 1, ingested: 0, outcome: "OK", topicFailures: [] };
+			});
+
+			await __test__.runIngestEntry(makeIngestOp("post-merge"), tmp, storageWithWiki(true));
+
+			expect(phaseSeenDuringDrain).toBe("ingest:wiki");
+			expect(vi.mocked(buildKnowledgeGraph)).not.toHaveBeenCalled();
 			expect(existsSync(phaseFile)).toBe(false);
 
 			rmSync(tmp, { recursive: true, force: true });

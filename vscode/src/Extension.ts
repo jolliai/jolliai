@@ -86,7 +86,7 @@ import { CommitsStore } from "./stores/CommitsStore.js";
 import { FilesStore } from "./stores/FilesStore.js";
 import { MemoriesStore } from "./stores/MemoriesStore.js";
 import { PlansStore } from "./stores/PlansStore.js";
-import { StatusStore } from "./stores/StatusStore.js";
+import { StatusStore, type WorkerPhase } from "./stores/StatusStore.js";
 import { registerCompileCommand } from "./CompileCommand.js";
 import { openKnowledgeGraph } from "./views/KnowledgeGraphPanel.js";
 import { activateSync } from "./sync/VsCodeSyncBootstrap.js";
@@ -1526,9 +1526,10 @@ export function activate(context: vscode.ExtensionContext): void {
 	void isWorkerBusy(workspaceRoot).then(setWorkerBusy);
 
 	// ── Worker phase file watcher ───────────────────────────────────────
-	// The worker writes `.jolli/jollimemory/worker-phase` (content "ingest")
-	// while running a topic-KB ingest, so the Branch toolbar can show
-	// "Updating Memory Bank…" instead of "AI summary in progress…". The phase
+	// The worker writes `.jolli/jollimemory/worker-phase` (content
+	// "ingest:wiki" / "ingest:graph") while running a topic-KB ingest, so the
+	// Branch toolbar can show "Building knowledge wiki/graph…" instead of
+	// "AI summary in progress…". The phase
 	// is purely cosmetic; its busy-bound lifetime (StatusStore clears it on
 	// workerBusy=false) means a stale marker left by a crashed worker can't
 	// outlive the lock. Separate from the lock watcher because a phase-file
@@ -1555,8 +1556,18 @@ export function activate(context: vscode.ExtensionContext): void {
 				return;
 			}
 			const content = Buffer.from(bytes).toString("utf-8").trim();
-			workerPhaseIsIngest = content === "ingest";
-			statusStore.setWorkerPhase(workerPhaseIsIngest ? "ingest" : null);
+			// Prefix match: every `ingest:*` sub-phase (wiki / graph) plus the legacy
+			// bare `ingest` is commit-exempt — only the prefix decides the gate. Map
+			// the raw marker to a known WorkerPhase rather than casting: `ingest:graph`
+			// keeps the graph label, everything else ingest-prefixed (incl. legacy
+			// bare `ingest`) collapses to the wiki label; non-ingest clears to null.
+			workerPhaseIsIngest = content.startsWith("ingest");
+			const phase: WorkerPhase = !workerPhaseIsIngest
+				? null
+				: content === "ingest:graph"
+					? "ingest:graph"
+					: "ingest:wiki";
+			statusStore.setWorkerPhase(phase);
 		} catch {
 			if (epoch !== workerPhaseEpoch) {
 				return;

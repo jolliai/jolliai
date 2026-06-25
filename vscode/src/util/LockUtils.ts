@@ -79,7 +79,11 @@ async function isFreshIngestPhase(cwd: string): Promise<boolean> {
 	const phasePath = join(cwd, ".jolli", "jollimemory", "worker-phase");
 	try {
 		const content = await readFile(phasePath, "utf-8");
-		if (content.trim() !== "ingest") {
+		// Prefix match: the worker writes `ingest:wiki` / `ingest:graph` (and, for
+		// older workers, bare `ingest`). Every `ingest*` value is commit-exempt;
+		// only a non-ingest phase (e.g. `summary`) blocks. An equality check here
+		// would wrongly block commits during the new sub-phases.
+		if (!content.trim().startsWith("ingest")) {
 			return false;
 		}
 		const phaseStat = await stat(phasePath);

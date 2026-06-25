@@ -76,6 +76,14 @@ describe("isWorkerBlockingBusy", () => {
 		);
 	});
 
+	it("returns false for the ingest:wiki / ingest:graph sub-phases (prefix match)", async () => {
+		readFile.mockResolvedValue("ingest:wiki");
+		await expect(isWorkerBlockingBusy("/repo")).resolves.toBe(false);
+
+		readFile.mockResolvedValue("ingest:graph");
+		await expect(isWorkerBlockingBusy("/repo")).resolves.toBe(false);
+	});
+
 	it("trims whitespace around the phase marker content", async () => {
 		readFile.mockResolvedValue("ingest\n");
 

@@ -1014,9 +1014,10 @@ describe("SidebarScriptBuilder", () => {
 		it("exempts the ingest phase from disabling commit actions", () => {
 			const js = buildSidebarScript();
 			// isWorkerBlocking is the single busy predicate for commit actions:
-			// busy in any phase except ingest.
+			// busy in any phase except an `ingest*` sub-phase (prefix match so
+			// ingest:wiki / ingest:graph both stay exempt).
 			expect(js).toContain(
-				"return state.workerBusy && state.workerPhase !== 'ingest';",
+				"return state.workerBusy && !(state.workerPhase && state.workerPhase.indexOf('ingest') === 0);",
 			);
 			// Both commit entry points go through it: the Commit-AI icon button
 			// (asserted above) and the labelled Commit Memory button.
@@ -2199,15 +2200,30 @@ describe("SidebarScriptBuilder", () => {
 		});
 	});
 
-	it("selects the Updating Memory Bank label for the ingest phase", () => {
+	it("selects the wiki / graph labels per ingest sub-phase (graph checked first, wiki for the rest)", () => {
 		const js = buildSidebarScript();
-		expect(js).toContain("Updating Memory Bank…");
-		expect(js).toContain("state.workerPhase === 'ingest'");
+		expect(js).toContain("Building knowledge wiki…");
+		expect(js).toContain("Building knowledge graph…");
+		// graph is the more specific prefix and must be tested before the wiki
+		// fallback, else 'ingest:graph' would match the wiki branch.
+		expect(js).toContain("state.workerPhase.indexOf('ingest:graph') === 0");
+		expect(js).toContain("state.workerPhase.indexOf('ingest') === 0");
+		// The retired single-value label must be gone.
+		expect(js).not.toContain("Updating Memory Bank…");
 	});
 
 	it("keeps the default AI summary label for non-ingest busy state", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("AI summary in progress…");
+	});
+
+	it("worker:phase keeps any ingest* sub-phase verbatim and clears anything else", () => {
+		const js = buildSidebarScript();
+		const handlerStart = js.indexOf("case 'worker:phase'");
+		const handlerEnd = js.indexOf("case ", handlerStart + 1);
+		const body = js.slice(handlerStart, handlerEnd);
+		// Prefix-gated pass-through: ingest:wiki / ingest:graph survive, summary → null.
+		expect(body).toContain("(msg.phase && msg.phase.indexOf('ingest') === 0) ? msg.phase : null");
 	});
 
 	it("handles the worker:phase message channel", () => {

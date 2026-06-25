@@ -478,7 +478,7 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 		// was orphaned by a crashed/SIGKILL'd predecessor whose `finally` cleanup
 		// (in processQueueEntry) never ran. Removing it here keeps the file's
 		// lifetime genuinely lock-bound — otherwise it survives indefinitely and
-		// mislabels the next plain summary run as "Updating Memory Bank…".
+		// mislabels the next plain summary run as "Building knowledge wiki…".
 		try {
 			rmSync(join(getJolliMemoryDir(cwd), WORKER_PHASE_FILE), { force: true });
 		} catch (e) {
@@ -647,11 +647,11 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 /**
  * Second line of defense for the worker-phase marker. If the ingest `finally`
  * cleanup failed (e.g. Windows AV briefly holding the file), the marker still
- * reads `ingest` while this same drain processes blocking summary entries —
- * and the extension's Commit/Squash gates would stay open during exactly the
- * runs they must block. Retry the delete here; if the file is still
- * undeletable, overwrite the content so readers see a blocking phase (any
- * value other than `ingest` blocks). The reader-side mtime staleness check is
+ * reads an `ingest:*` sub-phase while this same drain processes blocking summary
+ * entries — and the extension's Commit/Squash gates would stay open during
+ * exactly the runs they must block. Retry the delete here; if the file is still
+ * undeletable, overwrite the content so readers see a blocking phase (any value
+ * not starting with `ingest` blocks). The reader-side mtime staleness check is
  * the final backstop when both attempts fail.
  */
 function clearLeftoverIngestMarker(cwd: string): void {
@@ -671,15 +671,23 @@ function clearLeftoverIngestMarker(cwd: string): void {
 }
 
 /**
+ * Ingest sub-phases written to the `worker-phase` marker. Both keep the
+ * `ingest` prefix so the extension's commit/squash gates (which key off the
+ * prefix) treat them identically — only the cosmetic label differs.
+ */
+type IngestPhase = "ingest:wiki" | "ingest:graph";
+
+/**
  * Runs a topic-KB ingest with the extension's worker-phase marker around it.
  *
  * Called from runWorker's UNLOCKED ingest phase (both entry-level locks already
- * released). The phase marker (`ingest`) is consumed by the extension's
- * worker-busy gates (and the toolbar label): while it reads `ingest` AND is
- * fresh, Commit/Squash stay enabled and the toolbar shows "Updating Memory
- * Bank…". `writeGuard` is threaded down to drainIngest + renderTopicKBWiki so
- * each individual write re-acquires `vault-write.lock` briefly — the reconcile
- * LLM phase between writes holds no lock.
+ * released). The phase marker (`ingest:wiki` / `ingest:graph`) is consumed by
+ * the extension's worker-busy gates (and the toolbar label): while it starts
+ * with `ingest` AND is fresh, Commit/Squash stay enabled and the toolbar shows
+ * the matching "Building knowledge wiki/graph…" label. `writeGuard` is threaded
+ * down to drainIngest + renderTopicKBWiki so each individual write re-acquires
+ * `vault-write.lock` briefly — the reconcile LLM phase between writes holds no
+ * lock.
  */
 async function runIngestEntry(
 	op: IngestOperation,
@@ -689,30 +697,46 @@ async function runIngestEntry(
 ): Promise<void> {
 	log.info("Processing queue entry: type=ingest triggeredBy=%s", op.triggeredBy);
 	// Best-effort marker — a failure only over-blocks (missing marker = blocking
-	// summary phase), never under-blocks.
+	// summary phase), never under-blocks. The marker carries the ingest SUB-PHASE
+	// (`ingest:wiki` while ingesting + rendering the wiki, `ingest:graph` while
+	// building the knowledge graph) so the extension can show the matching label.
+	// Both keep the `ingest` prefix the gates key off — every `ingest:*` value is
+	// commit-exempt, so the prefix preserves the gating semantics unchanged.
 	const phaseFile = join(getJolliMemoryDir(cwd), WORKER_PHASE_FILE);
-	try {
-		writeFileSync(phaseFile, "ingest");
-	} catch (e) {
-		/* v8 ignore next -- best-effort marker; a write failure only over-blocks */
-		log.debug("worker-phase write skipped (non-fatal): %s", errMsg(e));
-	}
+	// Shared by the initial write, the heartbeat, and the graph-phase switch
+	// (threaded into runIngestFromQueue as `setPhase`). The heartbeat MUST write
+	// this variable, not a literal, or it would clobber an already-advanced phase
+	// back to wiki and strand the sidebar on the wrong label.
+	let currentPhase: IngestPhase = "ingest:wiki";
+	const writePhase = (phase: IngestPhase) => {
+		currentPhase = phase;
+		try {
+			writeFileSync(phaseFile, phase);
+		} catch (e) {
+			/* v8 ignore next -- best-effort marker; a write failure only over-blocks */
+			log.debug("worker-phase write skipped (non-fatal): %s", errMsg(e));
+		}
+	};
+	writePhase("ingest:wiki");
 	// Heartbeat: keep the marker's mtime fresh for the whole ingest. Readers
 	// treat a stale marker as blocking (fail-safe), so a long ingest needs this
-	// to stay exempt — and conversely an orphaned `ingest` marker (both the
+	// to stay exempt — and conversely an orphaned `ingest:*` marker (both the
 	// cleanup below and the per-entry guard failed) ages out instead of holding
 	// the gates open during a later summary run.
 	/* v8 ignore start -- timer callback never fires inside fast unit tests */
 	const phaseRefreshTimer = setInterval(() => {
 		try {
-			writeFileSync(phaseFile, "ingest");
+			writeFileSync(phaseFile, currentPhase);
 		} catch {
 			// Next tick retries; reader-side staleness covers persistent failure.
 		}
 	}, WORKER_LOCK_REFRESH_INTERVAL_MS);
 	/* v8 ignore stop */
 	try {
-		await runIngestFromQueue(op, cwd, storage, writeGuard);
+		// `setPhase` lets runIngestFromQueue advance the marker to `ingest:graph`
+		// right before the (in-function) graph build — the marker owner lives here
+		// but the graph phase boundary lives there.
+		await runIngestFromQueue(op, cwd, storage, writeGuard, (phase) => writePhase(phase));
 	} finally {
 		clearInterval(phaseRefreshTimer);
 		try {
@@ -815,6 +839,10 @@ async function runIngestFromQueue(
 	cwd: string,
 	storage: StorageProvider,
 	writeGuard: (fn: () => Promise<void>) => Promise<void> = (fn) => fn(),
+	// Advances the worker-phase marker (the marker owner lives in runIngestEntry).
+	// Required — the sole caller always threads it — so there is no dead default
+	// branch to leave uncovered.
+	setPhase: (phase: IngestPhase) => void,
 ): Promise<void> {
 	const { drainIngest } = await import("../core/IngestPipeline.js");
 	const { renderTopicKBWiki } = await import("../core/TopicWikiRenderer.js");
@@ -834,6 +862,11 @@ async function runIngestFromQueue(
 	const wikiMissing = storage.isTopicWikiPresent ? !storage.isTopicWikiPresent() : false;
 	if (result.ingested > 0 || wikiMissing) {
 		await renderTopicKBWiki(cwd, storage, writeGuard);
+		// Advance the marker to the graph sub-phase right before the build so the
+		// sidebar swaps to "Building knowledge graph…". Still commit-exempt (same
+		// `ingest` prefix). Only reached when there was wiki work, so on a no-source
+		// commit the marker stays `ingest:wiki` and `ingest:graph` never shows.
+		setPhase("ingest:graph");
 		// Refresh the knowledge graph alongside the wiki, on the same gate. Cheap
 		// now that it's diff-based: a no-op build (nothing changed) costs 0 LLM
 		// calls, and a typical change costs ~one call per changed topic. Isolated +

@@ -66,15 +66,18 @@ describe("compileAllRepos", () => {
 		expect(setActiveStorage).toHaveBeenCalledTimes(4);
 	});
 
-	it("reports per-repo progress with [i/total] prefixes when onProgress is supplied", async () => {
+	it("reports self-contained `<label> — <repo>` phase lines (no [i/total], no separate render line)", async () => {
 		const messages: string[] = [];
 		await compileAllRepos("/mb", { model: "haiku" } as never, { onProgress: (m) => messages.push(m) });
-		// Phase reports are prefixed with the repo's 1-based index and the total.
-		expect(messages).toContain("[1/3] jolli: ingesting sources");
-		expect(messages).toContain("[1/3] jolli: rendering wiki");
-		// boom (3rd) reports ingest before drainIngest throws, but never reaches "rendering wiki".
-		expect(messages).toContain("[3/3] boom: ingesting sources");
-		expect(messages).not.toContain("[3/3] boom: rendering wiki");
+		// wiki is one phase per repo (ingest + render merged); the line names the repo.
+		expect(messages).toContain("Building knowledge wiki — jolli");
+		expect(messages).toContain("Building knowledge graph — jolli");
+		// boom (3rd) reports the wiki phase before drainIngest throws.
+		expect(messages).toContain("Building knowledge wiki — boom");
+		// No legacy counter prefix and no separate "rendering" line.
+		expect(messages.some((m) => /^\[\d+\/\d+\]/.test(m))).toBe(false);
+		expect(messages.some((m) => m.includes("rendering"))).toBe(false);
+		expect(messages.some((m) => m.includes("ingesting sources"))).toBe(false);
 	});
 
 	it("restores the previous active storage override after the sweep (no leak into the host process)", async () => {
@@ -166,7 +169,7 @@ describe("compileAllRepos", () => {
 		expect(res.totalIngested).toBe(2);
 	});
 
-	it("relays graph-build progress under a `graph:` prefix", async () => {
+	it("relays graph-build sub-progress as a parenthesised detail on the graph phase line", async () => {
 		vi.mocked(buildKnowledgeGraph).mockImplementationOnce(async (_cwd, _storage, _config, opts) => {
 			opts?.onProgress?.("distilling topics");
 			return { built: true };
@@ -175,7 +178,7 @@ describe("compileAllRepos", () => {
 		await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never, {
 			onProgress: (m) => messages.push(m),
 		});
-		expect(messages).toContain("[1/1] jolli: graph: distilling topics");
+		expect(messages).toContain("Building knowledge graph — jolli (distilling topics)");
 	});
 
 	it("swallows a graph-build failure without failing the repo (non-fatal)", async () => {

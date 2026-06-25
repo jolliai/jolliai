@@ -5047,9 +5047,9 @@ describe("Extension", () => {
 		// The workerBusy context key gates the commitAI / squash commands'
 		// `enablement`. The ingest phase (Memory Bank wiki update) must NOT
 		// block them — only summary runs do — so when the worker-phase marker
-		// reads "ingest" the context flips to false even while the lock is held,
-		// and flips back when the marker is deleted (lock still held).
-		it("exempts the ingest phase from the workerBusy context key", async () => {
+		// reads an `ingest:*` sub-phase the context flips to false even while the
+		// lock is held, and flips back when the marker is deleted (lock still held).
+		it("exempts an ingest sub-phase from the workerBusy context key and forwards the full phase", async () => {
 			// Watcher indices: 0=sessions, 1=head, 2=orphan-ref, 3=lock, 4=phase.
 			const lockWatcher = createFileSystemWatcher.mock.results[3]?.value;
 			const phaseWatcher = createFileSystemWatcher.mock.results[4]?.value;
@@ -5068,11 +5068,29 @@ describe("Extension", () => {
 			onLockCreate?.();
 			executeCommand.mockClear();
 
-			fsReadFile.mockResolvedValueOnce(Buffer.from("ingest"));
+			fsReadFile.mockResolvedValueOnce(Buffer.from("ingest:wiki"));
 			onPhaseCreate?.();
 
 			await vi.waitFor(() => {
-				expect(mockStatusStore.setWorkerPhase).toHaveBeenCalledWith("ingest");
+				// The full sub-phase value is forwarded (not collapsed to "ingest"),
+				// so the sidebar can pick the wiki vs graph label.
+				expect(mockStatusStore.setWorkerPhase).toHaveBeenCalledWith("ingest:wiki");
+				expect(executeCommand).toHaveBeenCalledWith(
+					"setContext",
+					"jollimemory.workerBusy",
+					false,
+				);
+			});
+
+			// Phase advances to the graph build — still commit-exempt (ingest prefix),
+			// and the graph value is forwarded verbatim.
+			executeCommand.mockClear();
+			mockStatusStore.setWorkerPhase.mockClear();
+			fsReadFile.mockResolvedValueOnce(Buffer.from("ingest:graph"));
+			onPhaseCreate?.();
+
+			await vi.waitFor(() => {
+				expect(mockStatusStore.setWorkerPhase).toHaveBeenCalledWith("ingest:graph");
 				expect(executeCommand).toHaveBeenCalledWith(
 					"setContext",
 					"jollimemory.workerBusy",

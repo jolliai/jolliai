@@ -34,10 +34,14 @@ export interface CompileAllResult {
 
 export interface CompileAllOptions extends Pick<IngestOptions, "batchSize"> {
 	/**
-	 * Optional one-line progress reporter for UI surfaces (the VS Code "Building
-	 * knowledge wiki…" notification). Messages take the form `[i/total] <repo>:
-	 * <phase>` so the user sees which repo (and how far through the sweep) plus the
-	 * current phase.
+	 * Optional one-line progress reporter for UI surfaces (the VS Code progress
+	 * notification). Each message is a self-contained `<label> — <repo> [(<detail>)]`
+	 * line: the label is one of the two top-level phases ("Building knowledge wiki"
+	 * / "Building knowledge graph"), `<repo>` is the folder being swept, and the
+	 * optional `(<detail>)` is the graph distiller's sub-progress. No `[i/total]`
+	 * counter — it read as a phase index and confused users; the phase label carries
+	 * the meaning. wiki/graph are surfaced as two peers (ingest + render are merged
+	 * into "Building knowledge wiki" — no separate "rendering" line).
 	 */
 	readonly onProgress?: (message: string) => void;
 }
@@ -86,7 +90,6 @@ export async function compileAllRepos(
 	const repos: CompileAllRepoResult[] = [];
 	let totalIngested = 0;
 	let failed = 0;
-	const total = targets.length;
 
 	// We swap the process-global storage override per repo (inner stores fall back
 	// to it). Capture the prior value and restore it in a finally so the override
@@ -99,15 +102,17 @@ export async function compileAllRepos(
 	// into the long-lived VS Code host past this sweep.
 	const previousLogDir = getLogDir();
 	try {
-		for (const [i, t] of targets.entries()) {
-			// `[i/total] <repo>: <phase>` — keeps the UI notification legible about
-			// which repo and phase a long sweep is on.
-			const report = (phase: string) => opts?.onProgress?.(`[${i + 1}/${total}] ${t.folder}: ${phase}`);
+		for (const t of targets) {
+			// Self-contained `<label> — <repo> [(<detail>)]` lines so the notification
+			// reads as two peer phases (wiki / graph) on a named repo, not a counter.
+			const phaseMsg = (label: string, detail?: string) =>
+				opts?.onProgress?.(detail ? `${label} — ${t.folder} (${detail})` : `${label} — ${t.folder}`);
 			try {
 				setLogDir(t.kbRoot);
 				const storage = createFolderStorageAtRoot(t.kbRoot);
 				setActiveStorage(storage);
-				report("ingesting sources");
+				// ingest + render are one user-facing phase: "Building knowledge wiki".
+				phaseMsg("Building knowledge wiki");
 				const { batches, ingested } = await drainIngest(t.kbRoot, config, {
 					batchSize: opts?.batchSize,
 					readStorage: storage,
@@ -119,7 +124,6 @@ export async function compileAllRepos(
 				// "everything not in the index" would delete it (data loss). Orphan pages
 				// from topic consolidation are reclaimed by an explicit `jolli compile
 				// --cwd <repo> --rebuild`, never by the routine sweep.
-				report("rendering wiki");
 				await renderTopicKBWiki(t.kbRoot, storage, writeGuard);
 				// Build the knowledge graph from the freshly-ingested topic KB. Wrapped
 				// non-fatal: a graph build failure or missing LLM key must never fail the
@@ -127,9 +131,9 @@ export async function compileAllRepos(
 				// across it would re-create the commit-blocking stall this fix removes
 				// (the graph is a derived artifact, regenerated on the next sweep).
 				try {
-					report("building knowledge graph");
+					phaseMsg("Building knowledge graph");
 					await buildKnowledgeGraph(t.kbRoot, storage, config, {
-						onProgress: (m) => report(`graph: ${m}`),
+						onProgress: (m) => phaseMsg("Building knowledge graph", m),
 					});
 				} catch (graphErr) {
 					log.warn(

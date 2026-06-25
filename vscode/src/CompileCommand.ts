@@ -59,7 +59,10 @@ export function registerCompileCommand(opts: CompileCommandOpts): vscode.Disposa
 			const result = await vscode.window.withProgress(
 				{
 					location: vscode.ProgressLocation.Notification,
-					title: "Jolli Memory: Building knowledge wiki…",
+					// Title is fixed for the notification's lifetime (VS Code API), so it
+					// stays a neutral prefix; the wiki/graph phase + repo + detail all ride
+					// in progress.report({ message }) so both phases appear as peers.
+					title: "Jolli Memory",
 					cancellable: false,
 				},
 				async (progress) =>
