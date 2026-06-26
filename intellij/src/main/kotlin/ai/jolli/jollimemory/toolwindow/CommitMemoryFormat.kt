@@ -25,9 +25,14 @@ import ai.jolli.jollimemory.bridge.CommitSummaryBrief
 data class BranchTokenTotals(
 	val input: Long,
 	val output: Long,
+	val cacheRead: Long,
+	val cacheWrite: Long,
 	val partial: Boolean,
 ) {
-	val total: Long get() = input + output
+	/** Cache read + write, shown as one "cached" segment. */
+	val cached: Long get() = cacheRead + cacheWrite
+
+	val total: Long get() = input + output + cached
 
 	/** True when there is any reported usage worth rendering a meter for. */
 	val hasData: Boolean get() = total > 0
@@ -61,18 +66,23 @@ object CommitMemoryFormat {
 	fun aggregateTokens(commits: List<CommitSummaryBrief>): BranchTokenTotals {
 		var input = 0L
 		var output = 0L
+		var cacheRead = 0L
+		var cacheWrite = 0L
 		var partial = false
 		for (c in commits) {
 			if (!c.hasSummary) continue
-			val inTok = c.inputTokens
-			val outTok = c.outputTokens
-			if (inTok != null && outTok != null) {
-				input += inTok
-				output += outTok
-			} else {
+			val u = c.tokenUsage
+			if (u == null) {
+				// A memory with no recorded usage (old data / unreported source).
 				partial = true
+				continue
 			}
+			input += u.inputTokens
+			output += u.outputTokens
+			cacheRead += u.cacheReadTokens
+			cacheWrite += u.cacheWriteTokens
+			if (u.partial) partial = true
 		}
-		return BranchTokenTotals(input, output, partial)
+		return BranchTokenTotals(input, output, cacheRead, cacheWrite, partial)
 	}
 }

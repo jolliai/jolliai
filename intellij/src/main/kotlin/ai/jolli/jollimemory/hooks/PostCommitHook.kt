@@ -412,6 +412,16 @@ object PostCommitHook {
             // 9. Build and store CommitSummary
             val branch = git.getCurrentBranch() ?: "unknown"
             val commitType = detectCommitType()
+
+            // Build stored sessions first so we can aggregate this commit's
+            // coding-session token usage from their per-message usage.
+            val storedSessions = sessionTranscripts.map { st ->
+                log.info("StoredSession: sessionId=%s, source=%s, entries=%d", st.sessionId.take(8), st.source, st.entries.size)
+                StoredSession(st.sessionId, source = st.source, entries = st.entries)
+            }
+            val tokenUsage = TokenUsage.aggregate(storedSessions)
+            log.info("TokenUsage: %s", tokenUsage?.let { "in=${it.inputTokens} out=${it.outputTokens} cr=${it.cacheReadTokens} cw=${it.cacheWriteTokens} reported=${it.reportedSessions}/${it.totalSessions}" } ?: "none")
+
             val summary = CommitSummary(
                 version = SummaryTree.CURRENT_SCHEMA_VERSION,
                 commitHash = commitInfo.hash,
@@ -425,6 +435,7 @@ object PostCommitHook {
                 transcriptEntries = summaryResult.transcriptEntries,
                 conversationTurns = summaryResult.conversationTurns,
                 llm = summaryResult.llm,
+                tokenUsage = tokenUsage,
                 stats = summaryResult.stats,
                 topics = summaryResult.topics,
                 ticketId = summaryResult.ticketId,
@@ -433,11 +444,6 @@ object PostCommitHook {
                 references = referenceCommitRefs.takeIf { it.isNotEmpty() },
             )
 
-            // Store transcript data alongside summary
-            val storedSessions = sessionTranscripts.map { st ->
-                log.info("StoredSession: sessionId=%s, source=%s, entries=%d", st.sessionId.take(8), st.source, st.entries.size)
-                StoredSession(st.sessionId, source = st.source, entries = st.entries)
-            }
             val storedTranscript = StoredTranscript(storedSessions)
             log.info("StoredTranscript: %d session(s) total", storedSessions.size)
 

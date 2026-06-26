@@ -620,8 +620,7 @@ val sb = StringBuilder()
             // read per row at expand time.
             var topicCount = 0
             var commitType: String? = null
-            var inputTokens: Int? = null
-            var outputTokens: Int? = null
+            var tokenUsage: ai.jolli.jollimemory.core.TokenUsage? = null
             var e2eScenarioCount = 0
             var isSyncedToJolli = false
             var jolliDocUrl: String? = null
@@ -636,8 +635,7 @@ val sb = StringBuilder()
                     if (summary.commitType != null && summary.commitType.name != "commit") {
                         commitType = summary.commitType.name
                     }
-                    inputTokens = summary.llm?.inputTokens
-                    outputTokens = summary.llm?.outputTokens
+                    tokenUsage = summary.tokenUsage
                     e2eScenarioCount = summary.e2eTestGuide?.size ?: 0
                     isSyncedToJolli = summary.jolliDocId != null || summary.jolliDocUrl != null
                     jolliDocUrl = summary.jolliDocUrl
@@ -670,8 +668,7 @@ val sb = StringBuilder()
                 isPushed = pushBaseRef != null && hash !in unpushedHashes,
                 hasSummary = hash in summaryHashSet,
                 commitType = commitType,
-                inputTokens = inputTokens,
-                outputTokens = outputTokens,
+                tokenUsage = tokenUsage,
                 e2eScenarioCount = e2eScenarioCount,
                 isSyncedToJolli = isSyncedToJolli,
                 jolliDocUrl = jolliDocUrl,

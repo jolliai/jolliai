@@ -29,11 +29,27 @@ data class TranscriptCursor(
     val updatedAt: String,
 )
 
+/**
+ * Per-message AI token usage, parsed from the source transcript (e.g. Claude's
+ * `message.usage`). Field names are the cross-implementation contract shared with
+ * the cli/vscode (TS) side — keep them identical on both. Source mapping:
+ *   input_tokens → inputTokens, output_tokens → outputTokens,
+ *   cache_read_input_tokens → cacheReadTokens, cache_creation_input_tokens → cacheWriteTokens.
+ */
+data class MessageUsage(
+    val inputTokens: Long = 0,
+    val outputTokens: Long = 0,
+    val cacheReadTokens: Long = 0,
+    val cacheWriteTokens: Long = 0,
+)
+
 /** A single parsed transcript entry from the JSONL file */
 data class TranscriptEntry(
     val role: String, // "human" or "assistant"
     val content: String,
     val timestamp: String? = null,
+    /** AI token usage for this (assistant) message, when the source reports it. */
+    val usage: MessageUsage? = null,
 )
 
 /** Result from reading a transcript file */
@@ -94,6 +110,62 @@ data class AmendPendingState(
     val createdAt: String,
 )
 
+/**
+ * Aggregate AI **coding-session** token usage captured by a memory — the tokens
+ * the developer's AI tool spent on the work, summed from the transcript's
+ * per-message [MessageUsage]. This is distinct from [LlmCallMetadata.llm], which
+ * is the cost of Jolli's own summarizer call.
+ *
+ * `reportedSessions` / `totalSessions` let the UI flag "partial" when some
+ * contributing sources don't report usage (e.g. Cursor, Copilot). Cross-impl
+ * contract — keep field names identical on the cli/vscode (TS) side.
+ */
+data class TokenUsage(
+    val inputTokens: Long = 0,
+    val outputTokens: Long = 0,
+    val cacheReadTokens: Long = 0,
+    val cacheWriteTokens: Long = 0,
+    val reportedSessions: Int = 0,
+    val totalSessions: Int = 0,
+) {
+    /** All tokens processed (input + output + cache read + cache write). */
+    val total: Long get() = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
+
+    /** True when some contributing sessions didn't report usage (total understates reality). */
+    val partial: Boolean get() = reportedSessions < totalSessions
+
+    companion object {
+        /**
+         * Sums per-message usage across the given stored sessions. Returns null
+         * when no session reported any usage (so callers render "N/A" rather than
+         * a misleading zero) — e.g. memories created before usage capture, or
+         * sources that don't report it.
+         */
+        fun aggregate(sessions: List<StoredSession>): TokenUsage? {
+            if (sessions.isEmpty()) return null
+            var input = 0L
+            var output = 0L
+            var cacheRead = 0L
+            var cacheWrite = 0L
+            var reported = 0
+            for (session in sessions) {
+                var sessionReported = false
+                for (entry in session.entries) {
+                    val u = entry.usage ?: continue
+                    input += u.inputTokens
+                    output += u.outputTokens
+                    cacheRead += u.cacheReadTokens
+                    cacheWrite += u.cacheWriteTokens
+                    sessionReported = true
+                }
+                if (sessionReported) reported++
+            }
+            if (reported == 0) return null
+            return TokenUsage(input, output, cacheRead, cacheWrite, reported, sessions.size)
+        }
+    }
+}
+
 /** Metadata from the LLM API call */
 data class LlmCallMetadata(
     val model: String,
@@ -141,6 +213,8 @@ data class CommitSummary(
     val transcriptEntries: Int? = null,
     val conversationTurns: Int? = null,
     val llm: LlmCallMetadata? = null,
+    /** Coding-session token usage captured by this memory (null = not recorded). */
+    val tokenUsage: TokenUsage? = null,
     val stats: DiffStats? = null,
     val topics: List<TopicSummary>? = null,
     val children: List<CommitSummary>? = null,
