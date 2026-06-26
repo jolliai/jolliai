@@ -17,10 +17,6 @@ import com.intellij.diff.requests.SimpleDiffRequest
 import com.intellij.ide.BrowserUtil
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
-import com.intellij.openapi.actionSystem.ActionManager
-import com.intellij.openapi.actionSystem.AnAction
-import com.intellij.openapi.actionSystem.AnActionEvent
-import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.project.Project
@@ -143,6 +139,7 @@ class CommitsPanel(
         // Token-meter segment colors (input vs output), dark/light theme aware.
         val TOK_INPUT_COLOR = JBColor(0x4C84C7, 0x5C94D7)
         val TOK_OUTPUT_COLOR = JBColor(0x49A06A, 0x59B07A)
+        val TOK_CACHE_COLOR = JBColor(0x9177C7, 0xA98FD9)
         val CHIP_OK_COLOR = JBColor(0x3C8C4E, 0x5BB06E)
         val CHIP_DIM_COLOR = JBColor(0x808080, 0x8C8C8C)
     }
@@ -431,13 +428,16 @@ class CommitsPanel(
 
         val inTok = totals.input
         val outTok = totals.output
+        val cacheTok = totals.cached
         val bar = object : JPanel() {
             override fun paintComponent(g: Graphics) {
                 super.paintComponent(g)
-                val sum = (inTok + outTok).coerceAtLeast(1)
+                val sum = (inTok + outTok + cacheTok).coerceAtLeast(1)
                 val inW = ((width.toLong() * inTok) / sum).toInt()
+                val outW = ((width.toLong() * outTok) / sum).toInt()
                 g.color = TOK_INPUT_COLOR; g.fillRect(0, 0, inW, height)
-                g.color = TOK_OUTPUT_COLOR; g.fillRect(inW, 0, width - inW, height)
+                g.color = TOK_OUTPUT_COLOR; g.fillRect(inW, 0, outW, height)
+                g.color = TOK_CACHE_COLOR; g.fillRect(inW + outW, 0, width - inW - outW, height)
             }
         }.apply {
             isOpaque = false
@@ -451,6 +451,7 @@ class CommitsPanel(
             alignmentX = Component.LEFT_ALIGNMENT
             add(legendEntry(TOK_INPUT_COLOR, "${CommitMemoryFormat.formatTokens(totals.input)} input"))
             add(legendEntry(TOK_OUTPUT_COLOR, "${CommitMemoryFormat.formatTokens(totals.output)} output"))
+            add(legendEntry(TOK_CACHE_COLOR, "${CommitMemoryFormat.formatTokens(totals.cached)} cached"))
         }
 
         return JPanel().apply {
@@ -525,12 +526,8 @@ class CommitsPanel(
 
     /** "<relative time> · <shortHash> · <token spend>" for the collapsed row. */
     private fun buildSubLine(commit: CommitSummaryBrief): String {
-        val tokenText = if (commit.inputTokens != null && commit.outputTokens != null) {
-            "${CommitMemoryFormat.formatTokens((commit.inputTokens + commit.outputTokens).toLong())} tokens"
-        } else {
-            // Always present, so the row reads consistently even with no usage data.
-            "N/A tokens"
-        }
+        // Always present, so the row reads consistently even with no usage data.
+        val tokenText = commit.tokenUsage?.let { "${CommitMemoryFormat.formatTokens(it.total)} tokens" } ?: "N/A tokens"
         return listOf(formatShortRelativeDate(commit.date), commit.shortHash, tokenText).joinToString(" · ")
     }
 
@@ -657,38 +654,21 @@ class CommitsPanel(
             add(subLabel)
         }
 
-        // Eye icon (only for commits with summaries)
-        val eyeLabel = JLabel(JolliMemoryIcons.Eye).apply {
-            isVisible = commit.hasSummary
-            toolTipText = "View Commit Memory"
-            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-            border = JBUI.Borders.emptyLeft(4)
-            addMouseListener(object : MouseAdapter() {
-                override fun mouseClicked(e: MouseEvent) {
-                    viewSummary(commit.hash)
-                }
-            })
+        // Hover actions (memory rows only): Pin · Copy recall prompt · Share.
+        // Hidden until the row is hovered; the row body still opens the memory on click.
+        val rowActions: List<JLabel> = if (commit.hasSummary) {
+            listOf(
+                convoActionIcon(AllIcons.General.Pin_tab, "Pin to top of this branch") { pinMemory(commit) },
+                convoActionIcon(AllIcons.Actions.Copy, "Copy recall prompt") { copyRecallPrompt(commit.hash) },
+                convoActionIcon(JolliMemoryIcons.Share, "Share to your Jolli Space") { shareMemory(commit) },
+            )
+        } else {
+            emptyList()
         }
 
-        // Three-dots "more actions" button (only for commits with a summary).
-        // Replaces the old right-click context menu as the sole menu trigger.
-        val moreLabel = JLabel(JolliMemoryIcons.MoreVertical).apply {
-            isVisible = commit.hasSummary
-            toolTipText = "More actions"
-            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-            border = JBUI.Borders.emptyLeft(4)
-            addMouseListener(object : MouseAdapter() {
-                override fun mouseClicked(e: MouseEvent) {
-                    if (SwingUtilities.isLeftMouseButton(e)) showCommitRowMenu(commit, e.component, e.x, e.y)
-                }
-            })
-        }
-
-        // Right side: eye icon + three-dots menu
         val rightPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
             isOpaque = false
-            add(eyeLabel)
-            add(moreLabel)
+            rowActions.forEach { add(it) }
         }
 
         // Title line: arrow/checkbox · title+sub · eye/more.
@@ -714,14 +694,28 @@ class CommitsPanel(
             add(chipsRow)
             add(detailsToggle)
         }
-        // Sticky hover popup — matches VS Code: 1s show delay, 200ms hide grace.
+        // Hover: reveal the Pin/Copy/Share actions + the sticky hover popup
+        // (1s show delay, 200ms hide grace). Hiding is bounds-checked so moving
+        // between the row's children doesn't flicker the icons away.
         val hoverListener = object : MouseAdapter() {
-            override fun mouseEntered(e: MouseEvent) { scheduleShowHoverPopup(row, commit) }
-            override fun mouseExited(e: MouseEvent) { scheduleHoverDismiss() }
+            override fun mouseEntered(e: MouseEvent) {
+                rowActions.forEach { it.isVisible = true }
+                scheduleShowHoverPopup(row, commit)
+            }
+            override fun mouseExited(e: MouseEvent) {
+                val src = e.source as? Component ?: return
+                val screen = src.locationOnScreen.apply { translate(e.x, e.y) }
+                val loc = row.locationOnScreen
+                if (!java.awt.Rectangle(loc.x, loc.y, row.width, row.height).contains(screen)) {
+                    rowActions.forEach { it.isVisible = false }
+                }
+                scheduleHoverDismiss()
+            }
         }
         for (child in listOf(arrowLabel, titleLabel, subLabel, leftPanel, rightPanel, topLine, row)) {
             child.addMouseListener(hoverListener)
         }
+        rowActions.forEach { it.addMouseListener(hoverListener) }
 
         // File container — initially hidden, shown on expand
         val fileContainer = JPanel().apply {
@@ -769,24 +763,23 @@ class CommitsPanel(
         return state
     }
 
-    /**
-     * Shows the per-row "more actions" menu, triggered by the three-dots button.
-     * Built via IntelliJ's ActionPopupMenu so it picks up IDE theming (hover
-     * highlight, keyboard nav, Darcula colors). Mirrors VS Code's MemoryItem menu
-     * plus a "Create PR" entry that deep-links into the summary's Create PR flow.
-     */
-    private fun showCommitRowMenu(commit: CommitSummaryBrief, component: java.awt.Component, x: Int, y: Int) {
-        val group = DefaultActionGroup().apply {
-            add(object : AnAction("Create PR") {
-                override fun actionPerformed(ev: AnActionEvent) = viewSummary(commit.hash)
-            })
-            add(object : AnAction("Copy Recall Prompt") {
-                override fun actionPerformed(ev: AnActionEvent) = copyRecallPrompt(commit.hash)
-            })
-
+    /** Pins a committed memory to the Pinned section (row hover action). */
+    private fun pinMemory(commit: CommitSummaryBrief) {
+        val cwd = service.mainRepoRoot ?: project.basePath ?: return
+        val title = commit.message.ifBlank { commit.shortHash }
+        ApplicationManager.getApplication().executeOnPooledThread {
+            ai.jolli.jollimemory.core.PinStore.pin(cwd, "memories", commit.hash, title, "M")
+            SwingUtilities.invokeLater { service.panelRegistry?.pinnedPanel?.refresh() }
         }
-        val menu = ActionManager.getInstance().createActionPopupMenu("JolliMemory.CommitRowMenu", group)
-        menu.component.show(component, x, y)
+    }
+
+    /** Share a memory to the user's Jolli Space (row hover action). */
+    private fun shareMemory(@Suppress("UNUSED_PARAMETER") commit: CommitSummaryBrief) {
+        com.intellij.openapi.ui.Messages.showInfoMessage(
+            project,
+            "Share — push this memory to your Jolli Space (action to be wired).",
+            "Share",
+        )
     }
 
     /** Toggles the expand/collapse state of a commit's memory detail. */

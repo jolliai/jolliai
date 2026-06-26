@@ -1,6 +1,7 @@
 package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.bridge.CommitSummaryBrief
+import ai.jolli.jollimemory.core.TokenUsage
 import io.kotest.matchers.shouldBe
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
@@ -10,8 +11,7 @@ class CommitMemoryFormatTest {
     private fun brief(
         hash: String,
         hasSummary: Boolean = true,
-        inputTokens: Int? = null,
-        outputTokens: Int? = null,
+        tokenUsage: TokenUsage? = null,
     ) = CommitSummaryBrief(
         hash = hash,
         shortHash = hash.take(7),
@@ -19,9 +19,11 @@ class CommitMemoryFormatTest {
         author = "Dev",
         date = "2026-01-01T00:00:00Z",
         hasSummary = hasSummary,
-        inputTokens = inputTokens,
-        outputTokens = outputTokens,
+        tokenUsage = tokenUsage,
     )
+
+    private fun usage(input: Long, output: Long, cacheRead: Long = 0, cacheWrite: Long = 0, reported: Int = 1, total: Int = 1) =
+        TokenUsage(input, output, cacheRead, cacheWrite, reported, total)
 
     @Nested
     inner class FormatTokens {
@@ -62,16 +64,19 @@ class CommitMemoryFormatTest {
         }
 
         @Test
-        fun `sums reported input and output across memory commits`() {
+        fun `sums input, output and cache across memory commits`() {
             val totals = CommitMemoryFormat.aggregateTokens(
                 listOf(
-                    brief("a", inputTokens = 100, outputTokens = 50),
-                    brief("b", inputTokens = 400, outputTokens = 200),
+                    brief("a", tokenUsage = usage(100, 50, cacheRead = 1000, cacheWrite = 200)),
+                    brief("b", tokenUsage = usage(400, 200, cacheRead = 3000, cacheWrite = 0)),
                 ),
             )
             totals.input shouldBe 500L
             totals.output shouldBe 250L
-            totals.total shouldBe 750L
+            totals.cacheRead shouldBe 4000L
+            totals.cacheWrite shouldBe 200L
+            totals.cached shouldBe 4200L
+            totals.total shouldBe 4950L
             totals.partial shouldBe false
             totals.hasData shouldBe true
         }
@@ -80,8 +85,8 @@ class CommitMemoryFormatTest {
         fun `flags partial when a memory commit reports no usage`() {
             val totals = CommitMemoryFormat.aggregateTokens(
                 listOf(
-                    brief("a", inputTokens = 100, outputTokens = 50),
-                    brief("b", inputTokens = null, outputTokens = null),
+                    brief("a", tokenUsage = usage(100, 50)),
+                    brief("b", tokenUsage = null),
                 ),
             )
             totals.total shouldBe 150L
@@ -89,11 +94,19 @@ class CommitMemoryFormatTest {
         }
 
         @Test
+        fun `flags partial when a commit's own usage is partial`() {
+            val totals = CommitMemoryFormat.aggregateTokens(
+                listOf(brief("a", tokenUsage = usage(100, 50, reported = 1, total = 2))),
+            )
+            totals.partial shouldBe true
+        }
+
+        @Test
         fun `ignores code-only commits entirely`() {
             val totals = CommitMemoryFormat.aggregateTokens(
                 listOf(
-                    brief("a", hasSummary = false, inputTokens = null, outputTokens = null),
-                    brief("b", inputTokens = 10, outputTokens = 5),
+                    brief("a", hasSummary = false, tokenUsage = null),
+                    brief("b", tokenUsage = usage(10, 5)),
                 ),
             )
             totals.total shouldBe 15L

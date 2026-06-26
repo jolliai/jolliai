@@ -297,6 +297,7 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
             llm = llmMetadata,
             conversationTurns = totalTurns.takeIf { it > 0 },
             transcriptEntries = totalEntries.takeIf { it > 0 },
+            tokenUsage = mergedTranscript?.let { TokenUsage.aggregate(it.sessions) },
             summaryError = summaryError,
             children = children,
         )

@@ -98,7 +98,7 @@ object TranscriptReader {
                 "assistant" -> {
                     val content = extractContent(msg.get("content"))?.trim()
                     if (content.isNullOrEmpty()) null
-                    else TranscriptEntry("assistant", content, timestamp)
+                    else TranscriptEntry("assistant", content, timestamp, parseUsage(msg))
                 }
                 else -> null
             }
@@ -106,6 +106,22 @@ object TranscriptReader {
             log.debug("Failed to parse transcript line %d: %s", lineNum, e.message)
             null
         }
+    }
+
+    /**
+     * Extracts Claude's `message.usage` token counts into [MessageUsage]. Returns
+     * null when no usage is present. Maps cache_read → cacheRead and
+     * cache_creation → cacheWrite.
+     */
+    private fun parseUsage(msg: com.google.gson.JsonObject): MessageUsage? {
+        val usage = msg.getAsJsonObject("usage") ?: return null
+        fun num(key: String): Long = usage.get(key)?.takeIf { !it.isJsonNull }?.asLong ?: 0L
+        val input = num("input_tokens")
+        val output = num("output_tokens")
+        val cacheRead = num("cache_read_input_tokens")
+        val cacheWrite = num("cache_creation_input_tokens")
+        if (input == 0L && output == 0L && cacheRead == 0L && cacheWrite == 0L) return null
+        return MessageUsage(input, output, cacheRead, cacheWrite)
     }
 
     private fun parseUserMessage(msg: com.google.gson.JsonObject, timestamp: String?, lineNum: Int): TranscriptEntry? {
@@ -218,6 +234,7 @@ object TranscriptReader {
                     role = current.role,
                     content = "${current.content}\n\n${entries[i].content}",
                     timestamp = current.timestamp ?: entries[i].timestamp,
+                    usage = mergeUsage(current.usage, entries[i].usage),
                 )
             } else {
                 merged.add(current)
@@ -226,6 +243,18 @@ object TranscriptReader {
         }
         merged.add(current)
         return merged
+    }
+
+    /** Sums two optional usages (null = none); returns null only when both are null. */
+    private fun mergeUsage(a: MessageUsage?, b: MessageUsage?): MessageUsage? {
+        if (a == null) return b
+        if (b == null) return a
+        return MessageUsage(
+            a.inputTokens + b.inputTokens,
+            a.outputTokens + b.outputTokens,
+            a.cacheReadTokens + b.cacheReadTokens,
+            a.cacheWriteTokens + b.cacheWriteTokens,
+        )
     }
 
     private fun formatEntry(entry: TranscriptEntry): String {
