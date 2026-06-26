@@ -42,7 +42,7 @@ import java.net.URI
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.DefaultListModel
-import javax.swing.JCheckBox
+import java.awt.font.TextAttribute
 import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JList
@@ -150,18 +150,12 @@ class PlansPanel(
                 val cellBounds = itemList.getCellBounds(index, index) ?: return
                 val item = listModel.getElementAt(index)
 
-                // Checkbox zone (left edge) — toggles include/exclude for any kind.
-                if (e.clickCount == 1 && e.x - cellBounds.x < cellRenderer.getCheckboxWidth()) {
-                    toggleExclusion(item)
-                    return
-                }
-
-                // Action zone (right edge): pin | edit | delete (left→right).
+                // Action zone (right edge): pin | edit | toggle (left→right).
                 val offsetFromRight = (cellBounds.x + cellBounds.width) - e.x
                 if (e.clickCount == 1 && offsetFromRight in 0..cellRenderer.getActionsWidth()) {
                     val slot = cellRenderer.getActionSlotWidth()
                     when {
-                        offsetFromRight <= slot -> { itemList.selectedIndex = index; removeSelectedItem() } // delete
+                        offsetFromRight <= slot -> toggleExclusion(item) // select toggle (✕/＋)
                         offsetFromRight <= slot * 2 -> openItem(item) // edit
                         else -> pinItem(item) // pin
                     }
@@ -186,8 +180,7 @@ class PlansPanel(
                     }
                     val offsetFromRight = (cellBounds.x + cellBounds.width) - e.x
                     val overActions = offsetFromRight in 0..cellRenderer.getActionsWidth()
-                    val overCheckbox = e.x - cellBounds.x < cellRenderer.getCheckboxWidth()
-                    itemList.cursor = if (overActions || overCheckbox) {
+                    itemList.cursor = if (overActions) {
                         Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
                     } else {
                         Cursor.getDefaultCursor()
@@ -864,15 +857,16 @@ class PlansPanel(
      */
     private inner class PlansAndNotesCellRenderer : ListCellRenderer<ListItem> {
         private val panel = JPanel(BorderLayout()).apply { border = JBUI.Borders.empty(3, 8) }
-        private val checkBox = JCheckBox().apply { isOpaque = false }
         private val tagLabel = TagLabel()
         private val titleLabel = JLabel()
         private val pinLabel = actionIcon(AllIcons.General.Pin_tab, "Pin")
         private val editLabel = actionIcon(AllIcons.Actions.Edit, "Edit")
-        private val trashLabel = actionIcon(JolliMemoryIcons.Trash, "Delete")
+        // Rightmost action: the select toggle (✕ exclude / ＋ include). Icon + tooltip
+        // are set per row in getListCellRendererComponent.
+        private val toggleLabel = actionIcon(AllIcons.Actions.Close, "Exclude from next memory")
 
-        /** Checkbox click zone (checkbox ~20px + left padding 8px). */
-        fun getCheckboxWidth(): Int = JBUI.scale(28)
+        /** No checkbox column anymore — selection is the strikethrough toggle on the right. */
+        fun getCheckboxWidth(): Int = 0
 
         /** Width of one hover-action slot (icon + gap). */
         fun getActionSlotWidth(): Int = JBUI.scale(24)
@@ -890,19 +884,27 @@ class PlansPanel(
             list: JList<out ListItem>, value: ListItem, index: Int,
             isSelected: Boolean, cellHasFocus: Boolean,
         ): Component {
-            // Column layout (mockup parity): [checkbox] [type tag] [title] …hover[pin][edit][delete]
+            // Column layout: [type tag] [title] …hover[pin][edit][toggle ✕/＋].
+            // Deselected (excluded) items render struck-through + dimmed.
             val (letter, color) = tagFor(value)
-            checkBox.isSelected = !isExcluded(value)
+            val excluded = isExcluded(value)
             tagLabel.setBadge(letter, color)
             titleLabel.text = titleFor(value)
-            titleLabel.font = list.font
-            titleLabel.foreground = if (isSelected) list.selectionForeground else list.foreground
+            titleLabel.font = if (excluded) {
+                list.font.deriveFont(mapOf(TextAttribute.STRIKETHROUGH to TextAttribute.STRIKETHROUGH_ON))
+            } else {
+                list.font
+            }
+            titleLabel.foreground = when {
+                isSelected -> list.selectionForeground
+                excluded -> JBColor.GRAY
+                else -> list.foreground
+            }
 
             panel.removeAll()
 
             val left = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(2), 0)).apply {
                 isOpaque = false
-                add(checkBox)
                 add(tagLabel)
             }
             panel.add(left, BorderLayout.WEST)
@@ -912,11 +914,13 @@ class PlansPanel(
 
             // Action icons appear only on the hovered row, anchored to the right edge.
             if (index == actionHoverIndex) {
+                toggleLabel.icon = if (excluded) AllIcons.General.Add else AllIcons.Actions.Close
+                toggleLabel.toolTipText = if (excluded) "Include in next memory" else "Exclude from next memory"
                 val actions = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
                     isOpaque = false
                     add(pinLabel)
                     add(editLabel)
-                    add(trashLabel)
+                    add(toggleLabel)
                 }
                 panel.add(actions, BorderLayout.EAST)
             }

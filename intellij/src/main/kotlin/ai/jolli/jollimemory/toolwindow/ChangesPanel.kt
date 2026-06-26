@@ -18,6 +18,7 @@ import com.intellij.openapi.vfs.newvfs.events.VFileEvent
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.util.messages.MessageBusConnection
+import com.intellij.icons.AllIcons
 import com.intellij.util.ui.JBUI
 import git4idea.repo.GitRepository
 import git4idea.repo.GitRepositoryChangeListener
@@ -37,7 +38,8 @@ import com.intellij.openapi.actionSystem.Presentation
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.JButton
-import javax.swing.JCheckBox
+import com.intellij.ui.JBColor
+import java.awt.font.TextAttribute
 import javax.swing.JLabel
 import javax.swing.JMenuItem
 import javax.swing.JPanel
@@ -65,7 +67,8 @@ class ChangesPanel(
     override fun currentRowCount(): Int = changes.size
 
     private val emptyLabel = JBLabel("No changes detected.", javax.swing.SwingConstants.CENTER)
-    private val checkboxes = mutableListOf<JCheckBox>()
+    /** Per-file selection (parallel to [changes]); deselected files are struck through. */
+    private val selectedStates = mutableListOf<Boolean>()
     private val fileListPanel = JPanel().apply {
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
     }
@@ -168,6 +171,9 @@ class ChangesPanel(
         } catch (_: Exception) {
             changes = emptyList()
         }
+        // Reset selection to each file's default whenever the working tree changes.
+        selectedStates.clear()
+        changes.forEach { selectedStates.add(it.isSelected) }
         SwingUtilities.invokeLater { if (refreshVersion == myVersion) updateFileList() }
     }
 
@@ -181,7 +187,11 @@ class ChangesPanel(
     private fun updateFileList() {
         onRowCountChanged?.invoke(changes.size)
         removeAll()
-        checkboxes.clear()
+        // Defensive: keep selection state parallel to the current file list.
+        if (selectedStates.size != changes.size) {
+            selectedStates.clear()
+            changes.forEach { selectedStates.add(it.isSelected) }
+        }
         fileListPanel.removeAll()
         hoveredRow = null
 
@@ -193,7 +203,7 @@ class ChangesPanel(
             // at most 6 — the rest collapse behind "Show N more". No inner scrollbar;
             // Current Memory provides a single scrollbar across all three sections.
             // The Commit action lives in the bottom action bar, not per-section.
-            val rows = changes.map { createFileRow(it) }
+            val rows = changes.mapIndexed { i, c -> createFileRow(c, i) }
             CappedRows.render(fileListPanel, rows, changesExpanded) {
                 changesExpanded = true
                 updateFileList()
@@ -207,17 +217,17 @@ class ChangesPanel(
     override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
 
     fun getSelectedFiles(): List<FileChange> {
-        return changes.filterIndexed { i, _ -> checkboxes.getOrNull(i)?.isSelected ?: false }
+        return changes.filterIndexed { i, _ -> selectedStates.getOrNull(i) ?: false }
     }
 
     /** Returns all files in the changes list (selected and unselected). */
     fun getFiles(): List<FileChange> = changes.toList()
 
-    /** Toggles all checkboxes — if any are unchecked, select all; otherwise deselect all. */
+    /** Toggles all files — if any are deselected, select all; otherwise deselect all. */
     fun toggleSelectAll() {
-        val anyUnchecked = checkboxes.any { !it.isSelected }
-        checkboxes.forEach { it.isSelected = anyUnchecked }
-        repaint()
+        val anyUnselected = selectedStates.any { !it }
+        for (i in selectedStates.indices) selectedStates[i] = anyUnselected
+        updateFileList()
     }
 
     /** Discards changes for all selected files after confirmation. */
@@ -281,13 +291,7 @@ class ChangesPanel(
      *
      * The discard button is only visible when the mouse hovers over this row.
      */
-    private fun createFileRow(change: FileChange): JPanel {
-        val cb = JCheckBox("", change.isSelected).apply {
-            isOpaque = false
-            border = JBUI.Borders.empty()
-        }
-        checkboxes.add(cb)
-
+    private fun createFileRow(change: FileChange, index: Int): JPanel {
         val fileName = File(change.relativePath).name
         val fileIcon = FileTypeManager.getInstance().getFileTypeByFileName(fileName).icon
 
@@ -297,9 +301,9 @@ class ChangesPanel(
 
         val displayStatus = displayStatusCode(change.statusCode)
 
-        val nameLabel = JLabel(fileName).apply {
-            foreground = statusColor(change.statusCode)
-        }
+        val nameLabel = JLabel(fileName)
+        val baseNameFont = nameLabel.font
+        val strikeNameFont = baseNameFont.deriveFont(mapOf(TextAttribute.STRIKETHROUGH to TextAttribute.STRIKETHROUGH_ON))
 
         // Parent directory (gray, smaller font — follows directly after filename)
         val parentDir = File(change.relativePath).parent?.let { "$it/" } ?: ""
@@ -321,15 +325,12 @@ class ChangesPanel(
             gbc.weightx = 0.0
 
             gbc.gridx = 0
-            add(cb, gbc)
-
-            gbc.gridx = 1
             add(iconLabel, gbc)
 
-            gbc.gridx = 2
+            gbc.gridx = 1
             add(nameLabel, gbc)
 
-            gbc.gridx = 3
+            gbc.gridx = 2
             gbc.weightx = 1.0
             gbc.fill = java.awt.GridBagConstraints.HORIZONTAL
             gbc.insets = JBUI.insetsLeft(4)
@@ -358,11 +359,19 @@ class ChangesPanel(
             })
         }
 
-        // Right side: status badge + discard icon
+        // Select toggle (✕ exclude / ＋ include) — hidden until hover; flips selection.
+        val toggleLabel = JLabel().apply {
+            isVisible = false
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            border = JBUI.Borders.emptyLeft(2)
+        }
+
+        // Right side: status badge + discard + select toggle
         val rightPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
             isOpaque = false
             add(statusLabel)
             add(discardLabel)
+            add(toggleLabel)
         }
 
         val row = JPanel(BorderLayout()).apply {
@@ -373,11 +382,34 @@ class ChangesPanel(
             add(rightPanel, BorderLayout.EAST)
         }
 
-        // Show/hide discard icon on hover
+        // Strike + dim the filename when deselected; flip the toggle icon (✕/＋).
+        fun applySelection() {
+            val sel = selectedStates.getOrNull(index) ?: true
+            nameLabel.font = if (sel) baseNameFont else strikeNameFont
+            nameLabel.foreground = if (sel) statusColor(change.statusCode) else JBColor.GRAY
+            toggleLabel.icon = if (sel) AllIcons.Actions.Close else AllIcons.General.Add
+            toggleLabel.toolTipText = if (sel) "Exclude from commit" else "Include in commit"
+            leftPanel.revalidate()
+            row.repaint()
+        }
+        applySelection()
+        toggleLabel.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (!SwingUtilities.isLeftMouseButton(e)) return
+                e.consume()
+                if (index in selectedStates.indices) {
+                    selectedStates[index] = !(selectedStates.getOrNull(index) ?: true)
+                }
+                applySelection()
+            }
+        })
+
+        // Show/hide hover actions (discard + select toggle) on hover
         val hoverListener = object : MouseAdapter() {
             override fun mouseEntered(e: MouseEvent) {
                 hoveredRow = row
                 discardLabel.isVisible = true
+                toggleLabel.isVisible = true
                 row.repaint()
             }
             override fun mouseExited(e: MouseEvent) {
@@ -386,6 +418,7 @@ class ChangesPanel(
                 if (!row.contains(point)) {
                     hoveredRow = null
                     discardLabel.isVisible = false
+                    toggleLabel.isVisible = false
                     row.repaint()
                 }
             }
@@ -421,7 +454,7 @@ class ChangesPanel(
         // Attach hover listener to the row and all child components
         row.addMouseListener(hoverListener)
         row.addMouseListener(contextMenuListener)
-        for (child in listOf(leftPanel, rightPanel, cb, iconLabel, nameLabel, pathLabel, statusLabel, discardLabel)) {
+        for (child in listOf(leftPanel, rightPanel, iconLabel, nameLabel, pathLabel, statusLabel, discardLabel, toggleLabel)) {
             child.addMouseListener(hoverListener)
             child.addMouseListener(contextMenuListener)
         }
