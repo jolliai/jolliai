@@ -1,6 +1,7 @@
 package ai.jolli.jollimemory.services
 
 import ai.jolli.jollimemory.bridge.CommitSummaryBrief
+import ai.jolli.jollimemory.bridge.ConversationBrief
 import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.bridge.HookInstaller
 import ai.jolli.jollimemory.bridge.SummaryReader
@@ -598,9 +599,19 @@ val sb = StringBuilder()
             val diffStatRaw = g.exec("diff", "--shortstat", "$hash^", hash) ?: ""
             val (files, ins, del) = parseDiffStatLine(diffStatRaw)
 
-            // Get topic count and commit type from summary (resolving aliases)
+            // Get topic count, commit type, and memory-detail enrichment from the
+            // summary (resolving aliases). The enrichment fields feed the panel's
+            // token meter, status chips, and collapsed sub-line without a second
+            // read per row at expand time.
             var topicCount = 0
             var commitType: String? = null
+            var inputTokens: Int? = null
+            var outputTokens: Int? = null
+            var e2eScenarioCount = 0
+            var isSyncedToJolli = false
+            var jolliDocUrl: String? = null
+            var conversationTurns: Int? = null
+            var contextCount = 0
             if (hash in summaryHashSet) {
                 val resolvedHash = store.resolveAlias(hash)
                 val rootHash = store.findRootHash(resolvedHash) ?: resolvedHash
@@ -610,6 +621,15 @@ val sb = StringBuilder()
                     if (summary.commitType != null && summary.commitType.name != "commit") {
                         commitType = summary.commitType.name
                     }
+                    inputTokens = summary.llm?.inputTokens
+                    outputTokens = summary.llm?.outputTokens
+                    e2eScenarioCount = summary.e2eTestGuide?.size ?: 0
+                    isSyncedToJolli = summary.jolliDocId != null || summary.jolliDocUrl != null
+                    jolliDocUrl = summary.jolliDocUrl
+                    conversationTurns = summary.conversationTurns
+                    contextCount = (summary.plans?.size ?: 0) +
+                        (summary.notes?.size ?: 0) +
+                        (summary.references?.size ?: 0)
                 }
             }
 
@@ -635,9 +655,20 @@ val sb = StringBuilder()
                 isPushed = pushBaseRef != null && hash !in unpushedHashes,
                 hasSummary = hash in summaryHashSet,
                 commitType = commitType,
+                inputTokens = inputTokens,
+                outputTokens = outputTokens,
+                e2eScenarioCount = e2eScenarioCount,
+                isSyncedToJolli = isSyncedToJolli,
+                jolliDocUrl = jolliDocUrl,
+                conversationTurns = conversationTurns,
+                contextCount = contextCount,
             )
         }
     }
+
+    /** Reads the committed AI conversations for a commit (CONVERSATIONS group). */
+    fun getCommittedConversations(hash: String): List<ConversationBrief> =
+        reader?.getCommittedConversations(hash) ?: emptyList()
 
     /**
      * Lists files changed in a specific commit — matches VS Code listCommitFiles().

@@ -21,10 +21,6 @@ class SummaryReader(private val projectDir: String, private val git: GitOps) {
     private val log = JmLogger.create("SummaryReader")
     private val gson = Gson()
 
-    companion object {
-        const val ORPHAN_BRANCH = JmLogger.ORPHAN_BRANCH
-    }
-
     /** Read the full installation and data status. */
     fun getStatus(installer: HookInstaller): StatusInfo {
         val hooksInstalled = installer.areAllHooksInstalled()
@@ -120,6 +116,65 @@ class SummaryReader(private val projectDir: String, private val git: GitOps) {
     fun getSummaryJson(commitHash: String): String? {
         return git.readBranchFile(ORPHAN_BRANCH, "summaries/$commitHash.json")
     }
+
+    /**
+     * Reads the committed AI conversations for a commit from the orphan-branch
+     * `transcripts/<hash>.json` (the system of record). Returns one row per
+     * stored session (source, derived title, message count). Empty when no
+     * transcript was stored or it can't be parsed — the panel falls back to the
+     * summary's `conversationTurns` count in that case.
+     */
+    fun getCommittedConversations(commitHash: String): List<ConversationBrief> {
+        val json = git.readBranchFile(ORPHAN_BRANCH, "transcripts/$commitHash.json")
+        return parseConversations(json)
+    }
+
+    companion object {
+        const val ORPHAN_BRANCH = JmLogger.ORPHAN_BRANCH
+
+        /**
+         * Parses a stored `transcripts/<hash>.json` body (a [StoredTranscript]:
+         * `{ sessions: [...] }`) into lightweight conversation rows. Pure and
+         * tolerant — returns an empty list for null/blank/malformed input rather
+         * than throwing, so a single bad transcript never breaks the panel.
+         *
+         * The stored shape has no human-facing title, so one is derived from the
+         * first human turn's opening line (truncated); failing that, the source
+         * name is used.
+         */
+        fun parseConversations(json: String?): List<ConversationBrief> {
+            if (json.isNullOrBlank()) return emptyList()
+            return try {
+                val obj = JsonParser.parseString(json).asJsonObject
+                val sessions = obj.getAsJsonArray("sessions") ?: return emptyList()
+                sessions.mapNotNull { el ->
+                    val session = el.asJsonObject
+                    val source = session.get("source")?.takeIf { !it.isJsonNull }?.asString ?: "ai"
+                    val entries = session.getAsJsonArray("entries")
+                    val messageCount = entries?.size() ?: 0
+                    ConversationBrief(
+                        source = source,
+                        title = deriveTitle(entries, source),
+                        messageCount = messageCount,
+                        sessionId = session.get("sessionId")?.takeIf { !it.isJsonNull }?.asString ?: "",
+                        transcriptPath = session.get("transcriptPath")?.takeIf { !it.isJsonNull }?.asString,
+                    )
+                }
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+        private fun deriveTitle(entries: com.google.gson.JsonArray?, source: String): String {
+            val firstHuman = entries?.firstOrNull { el ->
+                val role = el.asJsonObject.get("role")?.asString
+                role == "human" || role == "user"
+            }?.asJsonObject?.get("content")?.asString
+            val firstLine = firstHuman?.lineSequence()?.firstOrNull { it.isNotBlank() }?.trim()
+            if (firstLine.isNullOrEmpty()) return "${source.replaceFirstChar { it.uppercase() }} session"
+            return if (firstLine.length > 60) firstLine.take(57) + "…" else firstLine
+        }
+    }
 }
 
 /** Lightweight commit info for list display — matches VS Code BranchCommit. */
@@ -138,4 +193,33 @@ data class CommitSummaryBrief(
     val isPushed: Boolean = false,
     val hasSummary: Boolean = false,
     val commitType: String? = null,
+    // ── Memory-detail enrichment (populated from the commit's CommitSummary in
+    //    JolliMemoryService.getBranchCommits; absent for code-only commits) ──
+    /** Total input tokens the summarizer reported; null when not reported. */
+    val inputTokens: Int? = null,
+    /** Total output tokens the summarizer reported; null when not reported. */
+    val outputTokens: Int? = null,
+    /** Whether this memory carries an E2E test guide, and how many scenarios. */
+    val e2eScenarioCount: Int = 0,
+    /** Whether this memory has been pushed to Jolli Space (article exists). */
+    val isSyncedToJolli: Boolean = false,
+    /** Direct URL to the Jolli Space article, when synced. */
+    val jolliDocUrl: String? = null,
+    /** Count of human turns across the contributing conversations. */
+    val conversationTurns: Int? = null,
+    /** Count of linked context items (plans + notes + references). */
+    val contextCount: Int = 0,
+) {
+    val hasE2eGuide: Boolean get() = e2eScenarioCount > 0
+}
+
+/** A single committed conversation, distilled for the panel's CONVERSATIONS group. */
+data class ConversationBrief(
+    val source: String,
+    val title: String,
+    val messageCount: Int,
+    /** Session id from the stored transcript — used to open the conversation. */
+    val sessionId: String = "",
+    /** Original transcript path on disk; null when not recorded. */
+    val transcriptPath: String? = null,
 )

@@ -46,7 +46,7 @@ class ActionBarPanel(
 
 		// Bottom bar, single row: "Create pull request (PR)" fills the width, with
 		// "Share" and the "..." overflow button beside it on the right.
-		prBtn = JolliButtons.secondary("Create pull request (PR)", JolliMemoryIcons.GitPullRequest).apply {
+		prBtn = JolliButtons.secondary("Create pull request (PR)", JolliMemoryIcons.PullRequest).apply {
 			toolTipText = "Create a pull request for this branch (drafted from its memories)."
 			addActionListener { handleCreatePr() }
 		}

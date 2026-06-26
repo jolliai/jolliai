@@ -2,14 +2,19 @@ package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.JolliMemoryIcons
 import ai.jolli.jollimemory.bridge.CommitSummaryBrief
+import ai.jolli.jollimemory.bridge.ConversationBrief
+import ai.jolli.jollimemory.core.ActiveConversationItem
 import ai.jolli.jollimemory.core.CommitSummary
+import ai.jolli.jollimemory.core.TranscriptSource
 import ai.jolli.jollimemory.core.KBDataCache
 import com.google.gson.Gson
 import ai.jolli.jollimemory.services.CommitFileInfo
 import ai.jolli.jollimemory.services.JolliMemoryService
+import ai.jolli.jollimemory.services.PrService
 import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffManager
 import com.intellij.diff.requests.SimpleDiffRequest
+import com.intellij.ide.BrowserUtil
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionManager
@@ -19,8 +24,9 @@ import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.project.Project
+import com.intellij.ui.JBColor
+import com.intellij.ui.RoundedLineBorder
 import com.intellij.ui.components.JBLabel
-import com.intellij.ui.components.JBScrollPane
 import com.intellij.util.messages.MessageBusConnection
 import com.intellij.util.ui.JBUI
 import git4idea.repo.GitRepository
@@ -35,6 +41,7 @@ import java.awt.Component
 import java.awt.Cursor
 import java.awt.Dimension
 import java.awt.FlowLayout
+import java.awt.Graphics
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
 import java.awt.event.MouseAdapter
@@ -45,6 +52,7 @@ import java.time.Instant
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.JCheckBox
+import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JOptionPane
 import javax.swing.JPanel
@@ -95,13 +103,21 @@ class CommitsPanel(
     )
     private val checkedHashes = mutableSetOf<String>()
     private var commits: List<CommitSummaryBrief> = emptyList()
-    /** Cache of files per commit hash — avoids re-running git for expanded commits.
-     *  Stores a CompletableFuture so that concurrent expands share the same in-flight request. */
-    private val fileCache = ConcurrentHashMap<String, CompletableFuture<List<CommitFileInfo>>>()
     /** Per-commit UI state for expand/collapse and checkbox management. */
     private val commitRowStates = mutableMapOf<String, CommitRowState>()
+    /**
+     * Cache of the expanded memory detail (summary + conversations + files) per
+     * commit hash. Stores a CompletableFuture so concurrent expands share one
+     * in-flight read.
+     */
+    private val detailCache = ConcurrentHashMap<String, CompletableFuture<ExpansionDetail>>()
     /** True when the branch is fully merged into main (read-only history view). */
     private var isMerged = false
+    /**
+     * Branch-level PR status, fetched once per refresh (shared by every row's PR
+     * chip + SHIPPED row). Null when gh is unavailable / the branch is unpublished.
+     */
+    private var prLookup: PrService.PrLookup? = null
 
     // ─── Foreign mode state ──────────────────────────────────────────────────
     /** When non-null, the panel shows read-only memories from a foreign repo/branch. */
@@ -124,6 +140,11 @@ class CommitsPanel(
         const val ARROW_DOWN = "\u25BC"  // ▼
         const val HOVER_SHOW_DELAY_MS = 1000
         const val HOVER_HIDE_GRACE_MS = 200
+        // Token-meter segment colors (input vs output), dark/light theme aware.
+        val TOK_INPUT_COLOR = JBColor(0x4C84C7, 0x5C94D7)
+        val TOK_OUTPUT_COLOR = JBColor(0x49A06A, 0x59B07A)
+        val CHIP_OK_COLOR = JBColor(0x3C8C4E, 0x5BB06E)
+        val CHIP_DIM_COLOR = JBColor(0x808080, 0x8C8C8C)
     }
 
     /**
@@ -196,6 +217,7 @@ class CommitsPanel(
                 val newCommits = service.getBranchCommits()
                 isMerged = newCommits.isNotEmpty() && service.isBranchMerged()
                 commits = newCommits
+                prLookup = lookupBranchPr(newCommits)
                 SwingUtilities.invokeLater { updateCommitList() }
             } catch (_: Exception) {
                 commits = emptyList()
@@ -276,14 +298,15 @@ class CommitsPanel(
             val oldHashes = commits.map { it.hash }
             if (newHashes != oldHashes) {
                 if (checkedHashes.isNotEmpty()) checkedHashes.clear()
-                // Clear file cache when commit sequence changes
-                fileCache.clear()
+                // Clear detail cache when commit sequence changes
+                detailCache.clear()
             }
 
             // Detect merged state: branch HEAD is reachable from main
             isMerged = newCommits.isNotEmpty() && service.isBranchMerged()
 
             commits = newCommits
+            prLookup = lookupBranchPr(newCommits)
             SwingUtilities.invokeLater { if (refreshVersion == myVersion) updateCommitList() }
         } catch (_: Exception) {
             if (refreshVersion != myVersion) return
@@ -291,6 +314,27 @@ class CommitsPanel(
             SwingUtilities.invokeLater { if (refreshVersion == myVersion) updateCommitList() }
         }
     }
+
+    /**
+     * Resolves the branch-level PR once per refresh (runs on the caller's pooled
+     * thread). Skips the `gh` round-trip entirely when the branch is unpublished
+     * (no pushed commits) or `gh` isn't installed / authenticated, so local-only
+     * branches never pay for a process spawn. Returns null on any miss.
+     */
+    private fun lookupBranchPr(commits: List<CommitSummaryBrief>): PrService.PrLookup? {
+        if (commits.none { it.isPushed }) return null
+        val cwd = service.mainRepoRoot ?: return null
+        return try {
+            val branch = service.getGitOps()?.getCurrentBranch() ?: return null
+            if (!PrService.isGhAvailable(cwd) || !PrService.isGhAuthenticated(cwd)) return null
+            PrService.findPrForBranch(cwd, branch)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** The open PR for the branch, or null when there isn't one / lookup failed. */
+    private fun openPr(): PrService.PrInfo? = (prLookup as? PrService.PrLookup.Found)?.pr
 
     private fun showInitializing() {
         removeAll()
@@ -317,15 +361,196 @@ class CommitsPanel(
                 listPanel.add(state.row)
                 listPanel.add(state.fileContainer)
             }
-            // No inner scrollbar — the sidebar's single top-level scrollbar covers this
-            // section along with Pinned and Current Memory. Render at natural height.
-            add(listPanel, BorderLayout.NORTH)
+            // Token-usage meter sits above the list; both share the sidebar's
+            // single top-level scrollbar (no inner scrollbar here). Rendered at
+            // natural height. The meter is omitted when no usage was reported.
+            val totals = CommitMemoryFormat.aggregateTokens(commits)
+            val north = JPanel().apply {
+                layout = BoxLayout(this, BoxLayout.Y_AXIS)
+                isOpaque = false
+            }
+            if (totals.hasData) north.add(buildTokenMeter(totals))
+            north.add(listPanel)
+            add(north, BorderLayout.NORTH)
         }
         revalidate(); repaint()
     }
 
     override fun getMaximumSize(): java.awt.Dimension =
         java.awt.Dimension(Int.MAX_VALUE, preferredSize.height)
+
+    // ─── Token meter ──────────────────────────────────────────────────────────
+
+    /**
+     * Branch token-usage meter: a bold total + a circled "?" that explains what's
+     * counted, a 2-segment input/output bar, and a legend. Degraded by design —
+     * the stored summaries carry only input/output totals (no cache split, no
+     * per-conversation breakdown), and unreported sources are skipped — so the
+     * "?" popover frames the number as a lower bound.
+     */
+    private fun buildTokenMeter(totals: BranchTokenTotals): JComponent {
+        val dimFg = UIManager.getColor("Component.infoForeground") ?: Color.GRAY
+
+        val totalLabel = JBLabel("${CommitMemoryFormat.formatTokens(totals.total)} tokens").apply {
+            font = font.deriveFont(java.awt.Font.BOLD)
+        }
+        val helpLabel = JLabel("?").apply {
+            font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 1f)
+            foreground = dimFg
+            border = javax.swing.BorderFactory.createCompoundBorder(
+                RoundedLineBorder(dimFg, JBUI.scale(10)),
+                JBUI.Borders.empty(0, 4),
+            )
+            toolTipText = "How this total is counted"
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            addMouseListener(object : MouseAdapter() {
+                override fun mouseClicked(e: MouseEvent) { showTokenInfoPopup(this@apply) }
+            })
+        }
+        val headerLine = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), 0)).apply {
+            isOpaque = false
+            alignmentX = Component.LEFT_ALIGNMENT
+            add(totalLabel)
+            if (totals.partial) {
+                add(JBLabel("· partial").apply {
+                    foreground = dimFg
+                    font = font.deriveFont(font.size2D - 1f)
+                })
+            }
+            add(helpLabel)
+        }
+
+        val inTok = totals.input
+        val outTok = totals.output
+        val bar = object : JPanel() {
+            override fun paintComponent(g: Graphics) {
+                super.paintComponent(g)
+                val sum = (inTok + outTok).coerceAtLeast(1)
+                val inW = ((width.toLong() * inTok) / sum).toInt()
+                g.color = TOK_INPUT_COLOR; g.fillRect(0, 0, inW, height)
+                g.color = TOK_OUTPUT_COLOR; g.fillRect(inW, 0, width - inW, height)
+            }
+        }.apply {
+            isOpaque = false
+            alignmentX = Component.LEFT_ALIGNMENT
+            preferredSize = Dimension(0, JBUI.scale(6))
+            maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(6))
+        }
+
+        val legend = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(10), 0)).apply {
+            isOpaque = false
+            alignmentX = Component.LEFT_ALIGNMENT
+            add(legendEntry(TOK_INPUT_COLOR, "${CommitMemoryFormat.formatTokens(totals.input)} input"))
+            add(legendEntry(TOK_OUTPUT_COLOR, "${CommitMemoryFormat.formatTokens(totals.output)} output"))
+        }
+
+        return JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            isOpaque = false
+            alignmentX = Component.LEFT_ALIGNMENT
+            border = JBUI.Borders.empty(2, 4, 8, 4)
+            add(headerLine)
+            add(Box.createVerticalStrut(JBUI.scale(3)))
+            add(bar)
+            add(Box.createVerticalStrut(JBUI.scale(2)))
+            add(legend)
+            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+        }
+    }
+
+    private fun legendEntry(color: Color, text: String): JComponent {
+        val dot = object : JPanel() {
+            override fun paintComponent(g: Graphics) {
+                g.color = color
+                g.fillOval(0, 0, width - 1, height - 1)
+            }
+        }.apply {
+            isOpaque = false
+            preferredSize = Dimension(JBUI.scale(8), JBUI.scale(8))
+            maximumSize = Dimension(JBUI.scale(8), JBUI.scale(8))
+        }
+        val label = JBLabel(text).apply {
+            font = font.deriveFont(font.size2D - 1f)
+            foreground = UIManager.getColor("Component.infoForeground") ?: Color.GRAY
+        }
+        return JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(4), 0)).apply {
+            isOpaque = false
+            add(dot)
+            add(label)
+        }
+    }
+
+    private fun showTokenInfoPopup(anchor: JComponent) {
+        val html = "<html><div style='width:240px'>Summed across memories whose source " +
+            "reports token usage. Sources that don't report it (e.g. Cursor) aren't counted, " +
+            "and cache tokens aren't tracked — so the real total is higher.</div></html>"
+        com.intellij.openapi.ui.popup.JBPopupFactory.getInstance()
+            .createHtmlTextBalloonBuilder(
+                html,
+                null,
+                UIManager.getColor("ToolTip.background") ?: background,
+                null,
+            )
+            .setHideOnClickOutside(true)
+            .setHideOnKeyOutside(true)
+            .createBalloon()
+            .show(
+                com.intellij.ui.awt.RelativePoint.getSouthOf(anchor),
+                com.intellij.openapi.ui.popup.Balloon.Position.below,
+            )
+    }
+
+    /** Small rounded status chip (PR / SYNCED / E2E) used on the collapsed row. */
+    private fun chip(text: String, color: Color): JComponent = JLabel(text).apply {
+        font = font.deriveFont(font.size2D - 2f)
+        foreground = color
+        border = javax.swing.BorderFactory.createCompoundBorder(
+            RoundedLineBorder(color, JBUI.scale(8)),
+            JBUI.Borders.empty(0, 4),
+        )
+    }
+
+    /** "<relative time> · <shortHash> · <token spend>" for the collapsed row. */
+    private fun buildSubLine(commit: CommitSummaryBrief): String {
+        val parts = mutableListOf(formatShortRelativeDate(commit.date), commit.shortHash)
+        val tokenText = when {
+            commit.inputTokens != null && commit.outputTokens != null ->
+                "${CommitMemoryFormat.formatTokens((commit.inputTokens + commit.outputTokens).toLong())} tokens"
+            commit.hasSummary -> "tokens not reported"
+            else -> null
+        }
+        if (tokenText != null) parts.add(tokenText)
+        return parts.joinToString(" · ")
+    }
+
+    /**
+     * Status chips (PR / SYNCED|LOCAL / E2E). PR is branch-level (same chip on
+     * every memory row); SYNCED + E2E are per-commit. Built only for memory-bearing
+     * rows. The expand toggle lives on its own line, not here.
+     */
+    private fun buildChipsRow(commit: CommitSummaryBrief): JComponent {
+        // hgap 0 (+ explicit struts between chips) so there's no trailing gap after
+        // the last chip — that lets the right edge land flush with the SHIPPED rows'
+        // chips (NO PR / LOCAL), which use hgap 0 too. A FlowLayout hgap would add a
+        // trailing gap and leave the chips a few px short of that edge.
+        val row = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
+            isOpaque = false
+            alignmentX = Component.LEFT_ALIGNMENT
+            border = JBUI.Borders.empty()
+        }
+        val chips = mutableListOf<JComponent>()
+        openPr()?.let { chips.add(chip("PR #${it.number}", CHIP_OK_COLOR)) }
+        chips.add(
+            if (commit.isSyncedToJolli) chip("SYNCED", CHIP_OK_COLOR) else chip("LOCAL", CHIP_DIM_COLOR),
+        )
+        if (commit.hasE2eGuide) chips.add(chip("E2E", CHIP_OK_COLOR))
+        chips.forEachIndexed { i, c ->
+            if (i > 0) row.add(Box.createHorizontalStrut(JBUI.scale(4)))
+            row.add(c)
+        }
+        row.maximumSize = Dimension(Int.MAX_VALUE, row.preferredSize.height)
+        return row
+    }
 
     // ─── Row creation ─────────────────────────────────────────────────────────
 
@@ -367,13 +592,61 @@ class CommitsPanel(
             if (checkbox != null) add(checkbox)
         }
 
-        // Message label
+        // Title line: commit message (+ pushed/type badges). Date/hash/tokens move
+        // to the sub-line below so the title stays scannable.
         val displayMessage = commit.message.ifBlank { commit.shortHash }
         val pushedBadge = if (commit.isPushed) " \u2601" else ""
         val typeBadge = if (commit.commitType != null) " [${commit.commitType}]" else ""
-        val datePart = if (commit.shortDate.isNotEmpty()) "  ${commit.shortDate}" else ""
-        val messageLabel = JLabel("$displayMessage$pushedBadge$typeBadge$datePart").apply {
+        val titleLabel = JLabel("$displayMessage$pushedBadge$typeBadge").apply {
             minimumSize = Dimension(0, preferredSize.height)
+            alignmentX = Component.LEFT_ALIGNMENT
+        }
+
+        // Sub-line: "<relative time> \u00b7 <shortHash> \u00b7 <token spend>".
+        val dimFg = UIManager.getColor("Component.infoForeground") ?: Color.GRAY
+        val subLabel = JLabel(buildSubLine(commit)).apply {
+            foreground = dimFg
+            font = font.deriveFont(font.size2D - 1f)
+            alignmentX = Component.LEFT_ALIGNMENT
+        }
+
+        // Status chips (only for memory rows). The expand toggle is NOT here \u2014 it
+        // sits on its own last line below (and flips to "Hide" at the bottom of
+        // the expanded section), so it never crowds the chips.
+        val chipsRow: JComponent? = if (commit.hasSummary) buildChipsRow(commit) else null
+
+        // "Show memory details \u25be" \u2014 its own last line of the collapsed row,
+        // right-aligned to mirror the "Hide memory details \u25b4" link that sits at
+        // the very bottom of the expanded section (see renderExpandedGroups).
+        // Hidden while expanded.
+        val detailsToggle: JComponent? = if (commit.hasSummary) {
+            val link = JLabel("Show memory details \u25be").apply {
+                foreground = JBUI.CurrentTheme.Link.Foreground.ENABLED
+                font = font.deriveFont(font.size2D - 1f)
+                cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                addMouseListener(object : MouseAdapter() {
+                    override fun mouseClicked(e: MouseEvent) {
+                        if (SwingUtilities.isLeftMouseButton(e)) { e.consume(); toggleExpand(commit.hash) }
+                    }
+                })
+            }
+            JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
+                isOpaque = false
+                alignmentX = Component.LEFT_ALIGNMENT
+                border = JBUI.Borders.empty(2, 4, 0, 0)
+                add(link)
+                maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+            }
+        } else {
+            null
+        }
+
+        val centerPanel = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            isOpaque = false
+            alignmentX = Component.LEFT_ALIGNMENT
+            add(titleLabel)
+            add(subLabel)
         }
 
         // Eye icon (only for commits with summaries)
@@ -410,20 +683,35 @@ class CommitsPanel(
             add(moreLabel)
         }
 
-        val row = JPanel(BorderLayout(2, 0)).apply {
+        // Title line: arrow/checkbox · title+sub · eye/more.
+        val topLine = JPanel(BorderLayout(2, 0)).apply {
+            isOpaque = false
+            alignmentX = Component.LEFT_ALIGNMENT
+            add(leftPanel, BorderLayout.WEST)
+            add(centerPanel, BorderLayout.CENTER)
+            add(rightPanel, BorderLayout.EAST)
+            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+        }
+
+        // The row is a vertical stack so the chips + "Show memory details" rows
+        // span the full width and right-align to the window edge (matching the
+        // "Hide memory details" link at the bottom of the expanded section),
+        // rather than being boxed inside the title's CENTER region.
+        val row = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = true
             border = JBUI.Borders.empty(2, 4)
             alignmentX = Component.LEFT_ALIGNMENT
-            add(leftPanel, BorderLayout.WEST)
-            add(messageLabel, BorderLayout.CENTER)
-            add(rightPanel, BorderLayout.EAST)
+            add(topLine)
+            if (chipsRow != null) add(chipsRow)
+            if (detailsToggle != null) add(detailsToggle)
         }
         // Sticky hover popup — matches VS Code: 1s show delay, 200ms hide grace.
         val hoverListener = object : MouseAdapter() {
             override fun mouseEntered(e: MouseEvent) { scheduleShowHoverPopup(row, commit) }
             override fun mouseExited(e: MouseEvent) { scheduleHoverDismiss() }
         }
-        for (child in listOf(arrowLabel, messageLabel, leftPanel, rightPanel, row)) {
+        for (child in listOf(arrowLabel, titleLabel, subLabel, leftPanel, rightPanel, topLine, row)) {
             child.addMouseListener(hoverListener)
         }
 
@@ -440,7 +728,8 @@ class CommitsPanel(
             arrowLabel = arrowLabel,
             checkbox = checkbox,
             isExpanded = false,
-            filesLoaded = false,
+            detailsLoaded = false,
+            detailsToggle = detailsToggle,
         )
 
         // Chevron click toggles expand/collapse only
@@ -463,7 +752,7 @@ class CommitsPanel(
                 }
             }
         }
-        for (child in listOf(messageLabel, leftPanel, row)) {
+        for (child in listOf(titleLabel, subLabel, leftPanel, topLine, row)) {
             child.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
             child.addMouseListener(rowClickListener)
         }
@@ -492,26 +781,33 @@ class CommitsPanel(
         menu.component.show(component, x, y)
     }
 
-    /** Toggles the expand/collapse state of a commit's file list. */
+    /** Toggles the expand/collapse state of a commit's memory detail. */
     private fun toggleExpand(hash: String) {
         val state = commitRowStates[hash] ?: return
         state.isExpanded = !state.isExpanded
         state.arrowLabel.text = if (state.isExpanded) ARROW_DOWN else ARROW_RIGHT
         state.fileContainer.isVisible = state.isExpanded
+        // The "Show memory details" line only makes sense while collapsed; once
+        // expanded, the "Hide memory details" link at the bottom takes over.
+        state.detailsToggle?.isVisible = !state.isExpanded
 
-        if (state.isExpanded && !state.filesLoaded) {
-            loadCommitFiles(hash)
+        if (state.isExpanded && !state.detailsLoaded) {
+            loadExpandedDetail(hash)
         }
 
         listPanel.revalidate()
         listPanel.repaint()
     }
 
-    /** Lazily loads commit files on first expansion, deduplicating in-flight git queries. */
-    private fun loadCommitFiles(hash: String) {
+    /**
+     * Lazily loads a commit's memory detail on first expansion, deduplicating
+     * in-flight reads. Fetches the full summary, its committed conversations, and
+     * its changed files in one bundle (off-EDT), then renders the four grouped
+     * sections — SHIPPED, CONVERSATIONS, CONTEXT, FILES — on the EDT.
+     */
+    private fun loadExpandedDetail(hash: String) {
         val state = commitRowStates[hash] ?: return
 
-        // Show loading indicator
         state.fileContainer.removeAll()
         state.fileContainer.add(JLabel("Loading...").apply {
             foreground = Color.GRAY
@@ -520,40 +816,367 @@ class CommitsPanel(
         })
         state.fileContainer.revalidate()
 
-        // If a future already exists for this hash, reuse it (dedup in-flight requests).
-        // computeIfAbsent is atomic on ConcurrentHashMap, so only one thread creates the future.
-        val future = fileCache.computeIfAbsent(hash) {
+        // computeIfAbsent is atomic on ConcurrentHashMap, so concurrent expands
+        // share a single in-flight bundle per hash.
+        val future = detailCache.computeIfAbsent(hash) {
             CompletableFuture.supplyAsync(
-                { service.listCommitFiles(hash) },
+                {
+                    ExpansionDetail(
+                        summary = service.getSummary(hash),
+                        conversations = service.getCommittedConversations(hash),
+                        files = service.listCommitFiles(hash),
+                    )
+                },
                 { cmd -> ApplicationManager.getApplication().executeOnPooledThread(cmd) },
             )
         }
 
-        future.whenComplete { files, error ->
-            if (error != null) {
-                fileCache.remove(hash)
-            }
+        future.whenComplete { detail, error ->
+            if (error != null) detailCache.remove(hash)
             SwingUtilities.invokeLater {
                 val currentState = commitRowStates[hash] ?: return@invokeLater
+                val commit = commits.firstOrNull { it.hash == hash } ?: return@invokeLater
                 currentState.fileContainer.removeAll()
-
-                val result = files ?: emptyList()
-                if (result.isEmpty()) {
-                    currentState.fileContainer.add(JLabel(if (error != null) "(failed to load)" else "(no files)").apply {
+                if (error != null || detail == null) {
+                    currentState.fileContainer.add(JLabel("(failed to load)").apply {
                         foreground = Color.GRAY
                         border = JBUI.Borders.empty(2, 28)
                         alignmentX = Component.LEFT_ALIGNMENT
                     })
                 } else {
-                    for (file in result) {
-                        currentState.fileContainer.add(createFileRow(hash, file))
-                    }
+                    renderExpandedGroups(currentState.fileContainer, commit, detail)
                 }
-                currentState.filesLoaded = error == null
+                currentState.detailsLoaded = error == null
                 currentState.fileContainer.revalidate()
                 currentState.fileContainer.repaint()
             }
         }
+    }
+
+    /** Builds the SHIPPED / CONVERSATIONS / CONTEXT / FILES groups into [container]. */
+    private fun renderExpandedGroups(container: JPanel, commit: CommitSummaryBrief, detail: ExpansionDetail) {
+        val summary = detail.summary
+
+        // ── SHIPPED ──────────────────────────────────────────────────────────
+        // Always shows all three shipping signals (PR, E2E test guide, Synced to
+        // Jolli) for a memory — done items are actionable (green dot, link out),
+        // not-yet-done items render dim with a "todo" chip so the gaps are visible.
+        // Code-only commits (no summary) skip SHIPPED and expand straight to FILES.
+        if (commit.hasSummary) {
+            val shippedRows = mutableListOf<JComponent>()
+
+            // Pull request (branch-level). Absent / gh-unavailable both read as "not yet".
+            val pr = openPr()
+            if (pr != null) {
+                shippedRows.add(detailRow(stateIcon(JolliMemoryIcons.PullRequest, true), "Pull request #${pr.number} — open", chip("OPEN", CHIP_OK_COLOR)) {
+                    BrowserUtil.browse(pr.url)
+                })
+            } else {
+                shippedRows.add(detailRow(stateIcon(JolliMemoryIcons.PullRequest, false), "Pull request — not created yet", chip("NO PR", CHIP_DIM_COLOR), dim = true) {
+                    viewSummary(commit.hash)
+                })
+            }
+
+            // E2E test guide (tick icon).
+            if (commit.hasE2eGuide) {
+                val n = commit.e2eScenarioCount
+                shippedRows.add(detailRow(stateIcon(AllIcons.RunConfigurations.TestState.Green2, true), "E2E test guide — $n scenario${if (n != 1) "s" else ""}", null) {
+                    viewSummary(commit.hash)
+                })
+            } else {
+                shippedRows.add(detailRow(stateIcon(AllIcons.RunConfigurations.TestState.Green2, false), "E2E test guide — not generated yet", null, dim = true))
+            }
+
+            // Synced to Jolli (sync icon).
+            if (commit.isSyncedToJolli) {
+                val url = commit.jolliDocUrl ?: summary?.jolliDocUrl
+                shippedRows.add(detailRow(stateIcon(AllIcons.Actions.Refresh, true), "Synced to Jolli — open article", chip("SYNCED", CHIP_OK_COLOR)) {
+                    if (url != null) BrowserUtil.browse(url)
+                })
+            } else {
+                shippedRows.add(detailRow(stateIcon(AllIcons.Actions.Refresh, false), "Not synced to Jolli yet", chip("LOCAL", CHIP_DIM_COLOR), dim = true))
+            }
+
+            addGroup(container, "SHIPPED", shippedRows)
+        }
+
+        // ── CONVERSATIONS ──────────────────────────────────────────────────────
+        val convoRows = mutableListOf<JComponent>()
+        if (detail.conversations.isNotEmpty()) {
+            for (c in detail.conversations) convoRows.add(conversationRow(commit, c))
+        } else {
+            val turns = commit.conversationTurns ?: summary?.conversationTurns
+            if (turns != null && turns > 0) {
+                convoRows.add(plainDetailRow("$turns conversation turn${if (turns != 1) "s" else ""}"))
+            }
+        }
+        if (convoRows.isNotEmpty()) addGroup(container, "CONVERSATIONS", convoRows)
+
+        // ── CONTEXT (plans / notes / references) ───────────────────────────────
+        val contextRows = mutableListOf<JComponent>()
+        summary?.plans?.forEach { contextRows.add(contextRow("P", it.title, null)) }
+        summary?.notes?.forEach { contextRows.add(contextRow("N", it.title, null)) }
+        summary?.references?.forEach { ref ->
+            contextRows.add(contextRow(referenceTag(ref.source), ref.title, ref.url.ifBlank { null }))
+        }
+        if (contextRows.isNotEmpty()) addGroup(container, "CONTEXT", contextRows)
+
+        // ── FILES ──────────────────────────────────────────────────────────────
+        if (detail.files.isNotEmpty()) {
+            addGroup(container, "FILES", detail.files.map { createFileRow(commit.hash, it) })
+        }
+
+        // Empty memory (no groups at all) — keep a calm placeholder.
+        if (container.componentCount == 0) {
+            container.add(plainDetailRow("(no linked detail)"))
+        }
+
+        // "Hide memory details ▴" — the last line of the expanded section. Only
+        // memory rows get it; code-only commits collapse via the chevron.
+        if (commit.hasSummary) {
+            val hideLink = JLabel("Hide memory details ▴").apply {
+                foreground = JBUI.CurrentTheme.Link.Foreground.ENABLED
+                font = font.deriveFont(font.size2D - 1f)
+                cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                addMouseListener(object : MouseAdapter() {
+                    override fun mouseClicked(e: MouseEvent) {
+                        if (SwingUtilities.isLeftMouseButton(e)) toggleExpand(commit.hash)
+                    }
+                })
+            }
+            container.add(JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
+                isOpaque = false
+                alignmentX = Component.LEFT_ALIGNMENT
+                border = JBUI.Borders.empty(2, 4, 2, 4)
+                add(hideLink)
+                maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+            })
+        }
+    }
+
+    /** A bold, dim group header ("SHIPPED") + its rows, indented under the commit. */
+    private fun addGroup(container: JPanel, title: String, rows: List<JComponent>) {
+        if (container.componentCount > 0) {
+            container.add(JSeparator().apply {
+                alignmentX = Component.LEFT_ALIGNMENT
+                maximumSize = Dimension(Int.MAX_VALUE, 1)
+            })
+        }
+        container.add(JBLabel(title).apply {
+            foreground = UIManager.getColor("Component.infoForeground") ?: Color.GRAY
+            font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 1f)
+            border = JBUI.Borders.empty(4, 24, 1, 4)
+            alignmentX = Component.LEFT_ALIGNMENT
+        })
+        for (r in rows) {
+            r.alignmentX = Component.LEFT_ALIGNMENT
+            container.add(r)
+        }
+    }
+
+    /**
+     * A SHIPPED-style row: status dot + label + optional trailing chip. Dim text
+     * marks a not-yet-done item; a non-null [onClick] makes the row clickable
+     * (hand cursor), so "todo" rows with nothing to open stay inert.
+     */
+    private fun detailRow(
+        icon: javax.swing.Icon,
+        text: String,
+        trailing: JComponent?,
+        dim: Boolean = false,
+        onClick: (() -> Unit)? = null,
+    ): JComponent {
+        val label = JLabel(text, icon, SwingConstants.LEFT).apply {
+            iconTextGap = JBUI.scale(6)
+            if (dim) foreground = CHIP_DIM_COLOR
+        }
+        val row = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            border = JBUI.Borders.empty(1, 24, 1, 4)
+            alignmentX = Component.LEFT_ALIGNMENT
+            add(label, BorderLayout.CENTER)
+            if (trailing != null) {
+                add(JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply { isOpaque = false; add(trailing) }, BorderLayout.EAST)
+            }
+        }
+        if (onClick != null) {
+            row.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            val click = object : MouseAdapter() {
+                override fun mouseClicked(e: MouseEvent) { if (e.clickCount == 1) onClick() }
+            }
+            label.addMouseListener(click); row.addMouseListener(click)
+        }
+        row.maximumSize = Dimension(Int.MAX_VALUE, row.preferredSize.height)
+        return row
+    }
+
+    /**
+     * SHIPPED-row leading icon: the type icon (PR / sync / E2E tick) at full
+     * strength when the step is done, or its greyed-out (disabled) variant when
+     * it's still a todo — so the icon itself reads done vs not-done.
+     */
+    private fun stateIcon(base: javax.swing.Icon, done: Boolean): javax.swing.Icon =
+        if (done) base else com.intellij.openapi.util.IconLoader.getDisabledIcon(base)
+
+    /**
+     * A CONVERSATIONS row: per-source logo (badge fallback) + derived title, with
+     * the message count on the right that swaps to Open (eye) + Continue (play)
+     * action icons on hover. Clicking the row opens the conversation content.
+     */
+    private fun conversationRow(commit: CommitSummaryBrief, c: ConversationBrief): JComponent {
+        val badge = SourceBadge.leadFor(c.source)
+        val title = JLabel(c.title).apply { minimumSize = Dimension(0, preferredSize.height) }
+        val count = JLabel("${c.messageCount} msg${if (c.messageCount != 1) "s" else ""}").apply {
+            foreground = UIManager.getColor("Component.infoForeground") ?: Color.GRAY
+            font = font.deriveFont(font.size2D - 1f)
+        }
+        // hgap 0 (+ explicit strut) so the badge starts flush at the 24px indent —
+        // a FlowLayout hgap would add a leading gap and push it right of SHIPPED/FILES.
+        val left = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
+            isOpaque = false
+            add(badge)
+            add(Box.createHorizontalStrut(JBUI.scale(6)))
+            add(title)
+        }
+
+        // Hover actions (hidden until hover): Open conversation · Continue.
+        val openBtn = convoActionIcon(JolliMemoryIcons.Eye, "Open conversation") { openCommittedConversation(c) }
+        val continueBtn = convoActionIcon(AllIcons.Actions.Execute, "Continue — reopen this session in your AI tool") {
+            copyRecallPrompt(commit.hash)
+        }
+        val actions = listOf(openBtn, continueBtn)
+        val east = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(2), 0)).apply {
+            isOpaque = false
+            add(count)
+            actions.forEach { add(it) }
+        }
+
+        val row = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            border = JBUI.Borders.empty(1, 24, 1, 4)
+            alignmentX = Component.LEFT_ALIGNMENT
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            add(left, BorderLayout.CENTER)
+            add(east, BorderLayout.EAST)
+            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+        }
+
+        // Swap count ↔ actions on hover; bounds-check on exit so moving onto the
+        // action icons (still inside the row) doesn't flicker them away.
+        val hover = object : MouseAdapter() {
+            override fun mouseEntered(e: MouseEvent) {
+                count.isVisible = false
+                actions.forEach { it.isVisible = true }
+            }
+            override fun mouseExited(e: MouseEvent) {
+                val src = e.source as Component
+                val screen = src.locationOnScreen.apply { translate(e.x, e.y) }
+                val loc = row.locationOnScreen
+                if (!java.awt.Rectangle(loc.x, loc.y, row.width, row.height).contains(screen)) {
+                    count.isVisible = true
+                    actions.forEach { it.isVisible = false }
+                }
+            }
+        }
+        val click = object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (SwingUtilities.isLeftMouseButton(e)) openCommittedConversation(c)
+            }
+        }
+        for (cc in listOf(row, left, title, badge, count)) {
+            cc.addMouseListener(hover)
+            cc.addMouseListener(click)
+        }
+        actions.forEach { it.addMouseListener(hover) }
+        return row
+    }
+
+    /** A hover-revealed action icon for conversation rows. */
+    private fun convoActionIcon(icon: javax.swing.Icon, tip: String, onClick: () -> Unit): JLabel =
+        JLabel(icon).apply {
+            toolTipText = tip
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            border = JBUI.Borders.empty(0, 2)
+            isVisible = false
+            addMouseListener(object : MouseAdapter() {
+                override fun mouseClicked(e: MouseEvent) {
+                    if (SwingUtilities.isLeftMouseButton(e)) { e.consume(); onClick() }
+                }
+            })
+        }
+
+    /**
+     * Opens a committed conversation's content by reusing the live conversation
+     * viewer ([ConversationVirtualFile]). Needs the stored session's source +
+     * transcript path; degrades to a message when the original file isn't
+     * recorded / resolvable.
+     */
+    private fun openCommittedConversation(c: ConversationBrief) {
+        val cwd = service.mainRepoRoot ?: project.basePath ?: return
+        val source = TranscriptSource.entries.firstOrNull { it.name == c.source }
+        val path = c.transcriptPath
+        if (source == null || path.isNullOrBlank()) {
+            com.intellij.openapi.ui.Messages.showInfoMessage(
+                project,
+                "The original conversation file for this memory isn't available to open.",
+                "Open Conversation",
+            )
+            return
+        }
+        val item = ActiveConversationItem(
+            sessionId = c.sessionId,
+            source = source,
+            title = c.title,
+            messageCount = c.messageCount,
+            updatedAt = "",
+            transcriptPath = path,
+            isSelected = true,
+        )
+        com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project)
+            .openFile(ConversationVirtualFile(item, cwd), true)
+    }
+
+    /** A CONTEXT row: a small kind tag (P / N / L / GH …) + title, optionally a link. */
+    private fun contextRow(tag: String, title: String, url: String?): JComponent {
+        val tagLabel = chip(tag, CHIP_DIM_COLOR)
+        val titleLabel = JLabel(title).apply {
+            if (url != null) {
+                foreground = JBUI.CurrentTheme.Link.Foreground.ENABLED
+                cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            }
+            minimumSize = Dimension(0, preferredSize.height)
+        }
+        val row = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
+            isOpaque = false
+            border = JBUI.Borders.empty(1, 24, 1, 4)
+            alignmentX = Component.LEFT_ALIGNMENT
+            add(tagLabel)
+            add(Box.createHorizontalStrut(JBUI.scale(6)))
+            add(titleLabel)
+            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+        }
+        if (url != null) {
+            val click = object : MouseAdapter() {
+                override fun mouseClicked(e: MouseEvent) { if (e.clickCount == 1) BrowserUtil.browse(url) }
+            }
+            titleLabel.addMouseListener(click); row.addMouseListener(click)
+        }
+        return row
+    }
+
+    /** A plain indented detail row (fallbacks / placeholders). */
+    private fun plainDetailRow(text: String): JComponent = JLabel(text).apply {
+        foreground = UIManager.getColor("Component.infoForeground") ?: Color.GRAY
+        border = JBUI.Borders.empty(1, 28, 1, 4)
+        alignmentX = Component.LEFT_ALIGNMENT
+    }
+
+    /** Single-letter context tag for an external reference source. */
+    private fun referenceTag(source: ai.jolli.jollimemory.core.references.SourceId): String = when (source) {
+        ai.jolli.jollimemory.core.references.SourceId.linear -> "L"
+        ai.jolli.jollimemory.core.references.SourceId.jira -> "J"
+        ai.jolli.jollimemory.core.references.SourceId.github -> "GH"
+        ai.jolli.jollimemory.core.references.SourceId.notion -> "No"
     }
 
     /**
@@ -947,7 +1570,16 @@ class CommitsPanel(
         val arrowLabel: JLabel,
         val checkbox: JCheckBox?,
         var isExpanded: Boolean,
-        var filesLoaded: Boolean,
+        var detailsLoaded: Boolean,
+        /** Right-aligned "Show memory details" row, hidden while expanded. */
+        val detailsToggle: JComponent? = null,
+    )
+
+    /** Bundle of everything the expanded memory detail renders, fetched off-EDT. */
+    private data class ExpansionDetail(
+        val summary: CommitSummary?,
+        val conversations: List<ConversationBrief>,
+        val files: List<CommitFileInfo>,
     )
 
     // ─── Sticky hover popup (VS Code hover-card pattern, native Swing) ────

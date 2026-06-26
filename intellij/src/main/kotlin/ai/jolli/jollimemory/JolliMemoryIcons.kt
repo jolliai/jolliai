@@ -36,6 +36,9 @@ object JolliMemoryIcons {
     /** Git pull request — matches VSCode codicon "git-pull-request" for Create PR. */
     val GitPullRequest: Icon = IconLoader.getIcon("/icons/git-pull-request.svg", JolliMemoryIcons::class.java)
 
+    /** GitHub-style pull request glyph (octicon) — used in the Committed Memories SHIPPED row. */
+    val PullRequest: Icon = IconLoader.getIcon("/icons/pull-request.svg", JolliMemoryIcons::class.java)
+
     /** Share — node-share glyph, for the Share action. */
     val Share: Icon = IconLoader.getIcon("/icons/share.svg", JolliMemoryIcons::class.java)
 
@@ -95,4 +98,27 @@ object JolliMemoryIcons {
 
     /** Red cloud — cloud sync disabled (not signed in to Jolli). */
     val CloudRed: Icon = IconLoader.getIcon("/icons/cloud-red.svg", JolliMemoryIcons::class.java)
+
+    // ── Per-source logos (AI tool that produced a conversation) ──────────────
+    private val sourceClaude: Icon = IconLoader.getIcon("/icons/source-claude.svg", JolliMemoryIcons::class.java)
+    private val sourceCodex: Icon = IconLoader.getIcon("/icons/source-codex.svg", JolliMemoryIcons::class.java)
+    private val sourceGemini: Icon = IconLoader.getIcon("/icons/source-gemini.svg", JolliMemoryIcons::class.java)
+    private val sourceCursor: Icon = IconLoader.getIcon("/icons/source-cursor.svg", JolliMemoryIcons::class.java)
+    private val sourceOpenCode: Icon = IconLoader.getIcon("/icons/source-opencode.svg", JolliMemoryIcons::class.java)
+    private val sourceCopilot: Icon = IconLoader.getIcon("/icons/source-copilot.svg", JolliMemoryIcons::class.java)
+
+    /**
+     * Logo for an AI source by its transcript-source name (claude / codex / gemini
+     * / cursor / opencode / copilot / copilot-chat). Returns null for unknown
+     * names so callers can fall back to a generic badge.
+     */
+    fun sourceLogo(name: String): Icon? = when (name) {
+        "claude" -> sourceClaude
+        "codex" -> sourceCodex
+        "gemini" -> sourceGemini
+        "cursor" -> sourceCursor
+        "opencode" -> sourceOpenCode
+        "copilot", "copilot-chat" -> sourceCopilot
+        else -> null
+    }
 }

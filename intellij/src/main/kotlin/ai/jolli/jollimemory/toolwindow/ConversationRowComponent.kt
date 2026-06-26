@@ -10,6 +10,7 @@ import java.awt.*
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.JCheckBox
+import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JPanel
 
@@ -70,7 +71,7 @@ class ConversationRowComponent(
 			isOpaque = false
 		}
 		leftPanel.add(checkbox)
-		val badge = SourceBadge(item.source)
+		val badge = SourceBadge.leadFor(item.source.name)
 		leftPanel.add(badge)
 		add(leftPanel, BorderLayout.WEST)
 
@@ -144,9 +145,13 @@ class ConversationRowComponent(
 		Dimension(Int.MAX_VALUE, preferredSize.height)
 }
 
-/** Small color-coded label showing the AI source name. */
-private class SourceBadge(source: TranscriptSource) : JLabel(source.name) {
-	private val badgeColor = SOURCE_COLORS[source] ?: JBColor.GRAY
+/**
+ * Small color-coded label showing the AI source (Claude, Codex, Gemini, Cursor,
+ * OpenCode, GitHub Copilot, …). Shared by the live Active Conversations panel and
+ * the Committed Memories CONVERSATIONS group so a conversation's tool is
+ * recognizable in both. Construct via [of].
+ */
+internal class SourceBadge private constructor(label: String, private val badgeColor: JBColor) : JLabel(label) {
 	private val arcSize = JBUI.scale(8)
 
 	init {
@@ -166,12 +171,46 @@ private class SourceBadge(source: TranscriptSource) : JLabel(source.name) {
 	}
 
 	companion object {
+		/**
+		 * Lead component for a source: the tool's real logo when one exists,
+		 * otherwise the color-coded text badge. Shared by every surface that shows
+		 * a conversation's tool (live Active Conversations, Committed Memories,
+		 * Pinned) so they stay consistent.
+		 */
+		fun leadFor(sourceName: String): JComponent {
+			val logo = JolliMemoryIcons.sourceLogo(sourceName)
+			return if (logo != null) JLabel(logo).apply { toolTipText = displayName(sourceName) } else of(sourceName)
+		}
+
+		/** Badge for a known transcript source. */
+		fun of(source: TranscriptSource): SourceBadge =
+			SourceBadge(displayName(source.name), SOURCE_COLORS[source] ?: JBColor.GRAY)
+
+		/**
+		 * Badge for a source given by name (e.g. parsed from a stored transcript).
+		 * Unknown names fall back to a neutral gray badge with the raw name.
+		 */
+		fun of(sourceName: String): SourceBadge {
+			val source = TranscriptSource.entries.firstOrNull { it.name == sourceName }
+			val color = source?.let { SOURCE_COLORS[it] } ?: JBColor.GRAY
+			return SourceBadge(displayName(sourceName), color)
+		}
+
+		private fun displayName(name: String): String = when (name) {
+			"copilot" -> "Copilot"
+			"copilot-chat" -> "Copilot Chat"
+			"opencode" -> "OpenCode"
+			else -> name.replaceFirstChar { it.uppercase() }
+		}
+
 		private val SOURCE_COLORS = mapOf(
 			TranscriptSource.claude to JBColor(Color(217, 119, 6), Color(217, 119, 6)),
 			TranscriptSource.gemini to JBColor(Color(5, 150, 105), Color(5, 150, 105)),
 			TranscriptSource.codex to JBColor(Color(124, 58, 237), Color(124, 58, 237)),
 			TranscriptSource.opencode to JBColor(Color(37, 99, 235), Color(37, 99, 235)),
 			TranscriptSource.cursor to JBColor(Color(220, 38, 38), Color(220, 38, 38)),
+			TranscriptSource.copilot to JBColor(Color(45, 164, 78), Color(45, 164, 78)),
+			TranscriptSource.`copilot-chat` to JBColor(Color(45, 164, 78), Color(45, 164, 78)),
 		)
 	}
 }

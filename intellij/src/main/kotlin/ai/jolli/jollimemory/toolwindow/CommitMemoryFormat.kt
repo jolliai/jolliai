@@ -1,0 +1,78 @@
+package ai.jolli.jollimemory.toolwindow
+
+import ai.jolli.jollimemory.bridge.CommitSummaryBrief
+
+/**
+ * Pure (UI-free, git-free) helpers backing the redesigned Committed Memories
+ * panel — token formatting and per-branch aggregation. Kept separate from
+ * [CommitsPanel] so the arithmetic is unit-testable without spinning up Swing
+ * or a git repo.
+ *
+ * Conversation-row parsing lives in `SummaryReader.parseConversations` (it sits
+ * next to the orphan-branch read it depends on); token math lives here because
+ * it's a property of the already-loaded commit list.
+ */
+
+/**
+ * Aggregate token usage across a branch's committed memories.
+ *
+ * Only memory-bearing commits whose summarizer reported usage contribute. When
+ * `partial` is true, at least one memory-bearing commit reported no usage (the
+ * source — e.g. Cursor — doesn't expose token counts, or the summary predates
+ * usage capture), so [total] understates reality. The token meter surfaces this
+ * in its help popover so the number isn't read as exact.
+ */
+data class BranchTokenTotals(
+	val input: Long,
+	val output: Long,
+	val partial: Boolean,
+) {
+	val total: Long get() = input + output
+
+	/** True when there is any reported usage worth rendering a meter for. */
+	val hasData: Boolean get() = total > 0
+}
+
+object CommitMemoryFormat {
+
+	/**
+	 * Compact token count for display: `842`, `61k`, `1.4M`. Mirrors the
+	 * reference mockup (`1.2M`, `96k`). One decimal is kept below 100 of a unit
+	 * (so `1.4M`, `9.2M`) and dropped above it (so `308k`, `120M`); a trailing
+	 * `.0` is always trimmed.
+	 */
+	fun formatTokens(n: Long): String {
+		if (n < 1_000) return n.toString()
+		if (n < 1_000_000) return scale(n / 1_000.0) + "k"
+		return scale(n / 1_000_000.0) + "M"
+	}
+
+	private fun scale(value: Double): String {
+		val formatted = if (value >= 100) "%.0f".format(value) else "%.1f".format(value)
+		return formatted.removeSuffix(".0")
+	}
+
+	/**
+	 * Sum input/output tokens over the branch's commits. A commit contributes
+	 * only when it carries both token counts; a memory-bearing commit missing
+	 * them flips [BranchTokenTotals.partial] (the displayed total is then a lower
+	 * bound). Code-only commits (no summary) are ignored entirely.
+	 */
+	fun aggregateTokens(commits: List<CommitSummaryBrief>): BranchTokenTotals {
+		var input = 0L
+		var output = 0L
+		var partial = false
+		for (c in commits) {
+			if (!c.hasSummary) continue
+			val inTok = c.inputTokens
+			val outTok = c.outputTokens
+			if (inTok != null && outTok != null) {
+				input += inTok
+				output += outTok
+			} else {
+				partial = true
+			}
+		}
+		return BranchTokenTotals(input, output, partial)
+	}
+}
