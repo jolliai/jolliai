@@ -467,6 +467,9 @@ class PlansPanel(
             val cwd = service.mainRepoRoot ?: project.basePath ?: ""
             val gitOps = service.getGitOps()
             val currentBranch = gitOps?.getCurrentBranch()
+            // Pull in any plan Claude generated under ~/.claude/plans/ that isn't
+            // registered yet, so it appears in CONTEXT without a manual "Add plan".
+            ai.jolli.jollimemory.services.PlanService.autoRegisterNewPlans(cwd, currentBranch)
             val registry = SessionTracker.loadPlansRegistry(cwd)
 
             val ex = CommitSelectionStore.readExclusions(cwd)

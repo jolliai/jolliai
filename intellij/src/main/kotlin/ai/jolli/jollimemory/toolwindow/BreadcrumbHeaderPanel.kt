@@ -225,10 +225,18 @@ class BreadcrumbHeaderPanel(
 		SwingUtilities.invokeLater {
 			val selectedRepo = repoCombo.selectedItem as? String
 			val isCurrentRepo = repos.find { it.repoName == selectedRepo }?.isCurrentRepo == true
-			if (isCurrentRepo) {
+			if (!isCurrentRepo) return@invokeLater
+			// A freshly created branch isn't in the dropdown model yet, so simply
+			// selecting it by name is a no-op. Re-list branches from git in that
+			// case so the new branch appears and gets selected.
+			val model = branchCombo.model
+			val present = (0 until model.size).any { model.getElementAt(it) == branch }
+			if (present) {
 				suppressEvents = true
 				branchCombo.selectedItem = branch
 				suppressEvents = false
+			} else {
+				refreshBranches()
 			}
 		}
 	}

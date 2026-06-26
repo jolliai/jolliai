@@ -8,7 +8,7 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.ActionToolbar
 import com.intellij.openapi.actionSystem.DefaultActionGroup
-import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.project.Project
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.util.ui.JBUI
@@ -34,6 +34,7 @@ import javax.swing.SwingUtilities
  * Committed Memories together.
  */
 class CurrentMemoryPanel(
+	private val project: Project,
 	private val service: JolliMemoryService,
 	private val conversationsPanel: JComponent,
 	private val conversationsActions: String,
@@ -129,12 +130,10 @@ class CurrentMemoryPanel(
 		}
 	}
 
+	/** Opens the Working Memory web view — the full memory the next commit will save. */
 	private fun onReview() {
-		Messages.showInfoMessage(
-			this,
-			"Review — preview the current memory's included items (Conversations, Context, Files) before committing.",
-			"Review",
-		)
+		com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project)
+			.openFile(WorkingMemoryVirtualFile(), true)
 	}
 
 	private fun blueSeparator(): JComponent = JPanel().apply {

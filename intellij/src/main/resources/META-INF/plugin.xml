@@ -40,6 +40,10 @@
         <fileEditorProvider
             implementation="ai.jolli.jollimemory.toolwindow.ConversationEditorProvider"/>
 
+        <!-- Editor tab provider for the Working Memory review webview -->
+        <fileEditorProvider
+            implementation="ai.jolli.jollimemory.toolwindow.WorkingMemoryEditorProvider"/>
+
         <!-- Notification group for balloon notifications (e.g., no-Git warning) -->
         <notificationGroup
             id="JolliMemory"

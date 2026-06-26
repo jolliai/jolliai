@@ -279,6 +279,8 @@ val sb = StringBuilder()
         val orphanRefDir = Path.of(repoRoot, ".git", "refs", "heads", orphanBranch).parent
         // Watch .jolli/jollimemory/ for lock file changes
         val lockDir = Path.of(repoRoot, ".jolli", "jollimemory")
+        // Watch ~/.claude/plans/ so plans Claude generates appear live in CONTEXT.
+        val claudePlansDir = Path.of(System.getProperty("user.home"), ".claude", "plans")
 
         // The ref file name we're looking for (e.g., "v3")
         val orphanRefFileName = Path.of(orphanBranch).fileName.toString()
@@ -307,6 +309,16 @@ val sb = StringBuilder()
                 log.info("Lock dir does not exist yet, skipping NIO watch: $lockDir")
             }
 
+            if (Files.isDirectory(claudePlansDir)) {
+                claudePlansDir.register(watchService,
+                    StandardWatchEventKinds.ENTRY_CREATE,
+                    StandardWatchEventKinds.ENTRY_MODIFY,
+                    StandardWatchEventKinds.ENTRY_DELETE)
+                log.info("NIO watcher registered on: $claudePlansDir")
+            } else {
+                log.info("Claude plans dir does not exist yet, skipping NIO watch: $claudePlansDir")
+            }
+
             // Background thread to poll watch events
             val thread = Thread({
                 try {
@@ -315,7 +327,10 @@ val sb = StringBuilder()
                         var shouldRefresh = false
                         for (event in key.pollEvents()) {
                             val fileName = (event.context() as? Path)?.toString() ?: continue
-                            if (fileName == orphanRefFileName || fileName == lockFileName) {
+                            // `.md` events only come from the Claude plans dir (the other
+                            // watched dirs hold the orphan ref + lock file), so matching the
+                            // extension is enough to catch a newly generated plan.
+                            if (fileName == orphanRefFileName || fileName == lockFileName || fileName.endsWith(".md")) {
                                 shouldRefresh = true
                             }
                         }
