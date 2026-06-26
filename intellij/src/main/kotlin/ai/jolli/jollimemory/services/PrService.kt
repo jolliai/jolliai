@@ -145,6 +145,24 @@ object PrService {
         cwd: String,
         timeoutSeconds: Long = 30,
     ): String? {
+        val r = execCommandResult(command, args, cwd, timeoutSeconds)
+        return if (r.exitCode == 0) r.stdout else null
+    }
+
+    /** Full result of a CLI invocation — exit code plus captured stdout and stderr. */
+    private data class ExecResult(val exitCode: Int, val stdout: String, val stderr: String)
+
+    /**
+     * Like [execCommand] but returns the exit code and both streams, so callers
+     * can surface the tool's real error (e.g. why `gh pr create` failed) instead
+     * of a generic message. Exit code is -1 on timeout / spawn failure.
+     */
+    private fun execCommandResult(
+        command: String,
+        args: List<String>,
+        cwd: String,
+        timeoutSeconds: Long = 30,
+    ): ExecResult {
         return try {
             val pb = ProcessBuilder(listOf(resolveExecutable(command)) + args)
                 .directory(File(cwd))
@@ -165,19 +183,19 @@ object PrService {
             if (!completed) {
                 process.destroyForcibly()
                 log.warn("execCommand: timed out after %ds: %s %s", timeoutSeconds, command, args.joinToString(" "))
-                return null
+                return ExecResult(-1, "", "Timed out after ${timeoutSeconds}s")
             }
 
             val exitCode = process.exitValue()
+            val stdout = stdoutFuture.get(5, java.util.concurrent.TimeUnit.SECONDS)
+            val stderr = stderrFuture.get(5, java.util.concurrent.TimeUnit.SECONDS)
             if (exitCode != 0) {
-                val stderr = stderrFuture.get(5, java.util.concurrent.TimeUnit.SECONDS)
                 log.warn("execCommand: exit=%d cmd='%s %s' stderr='%s'", exitCode, command, args.joinToString(" "), stderr)
-                return null
             }
-            stdoutFuture.get(5, java.util.concurrent.TimeUnit.SECONDS)
+            ExecResult(exitCode, stdout, stderr)
         } catch (e: Exception) {
             log.warn("execCommand: exception for '%s %s': %s", command, args.joinToString(" "), e.message ?: e.toString())
-            null
+            ExecResult(-1, "", e.message ?: e.toString())
         }
     }
 
@@ -186,10 +204,18 @@ object PrService {
         return execCommand("gh", args, cwd)
     }
 
-    /** Runs a gh command and returns stdout. Throws on failure. */
+    /** Runs a gh command and returns stdout. Throws on failure, surfacing gh's own error. */
     private fun execGhOrThrow(args: List<String>, cwd: String): String {
-        return execGh(args, cwd)
-            ?: throw RuntimeException("gh command failed: gh ${args.joinToString(" ")}\n\nCheck: Is 'gh' installed? Is it authenticated (gh auth login)? Is the branch pushed to remote?")
+        val r = execCommandResult("gh", args, cwd)
+        if (r.exitCode == 0) return r.stdout
+        // Show gh's actual stderr (e.g. "a pull request for branch X already exists",
+        // "No commits between …", or a push/auth error) rather than a generic hint.
+        val detail = sequenceOf(r.stderr, r.stdout).firstOrNull { it.isNotBlank() }
+            ?: "gh exited with code ${r.exitCode}"
+        throw RuntimeException(
+            "gh ${args.joinToString(" ")} failed:\n\n$detail\n\n" +
+                "Check: Is 'gh' installed and authenticated (gh auth login)? Is the branch pushed to a remote?",
+        )
     }
 
     /** Runs a git command and returns stdout, or null on failure. */

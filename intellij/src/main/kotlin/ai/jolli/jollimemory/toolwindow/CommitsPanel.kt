@@ -217,7 +217,7 @@ class CommitsPanel(
                 val newCommits = service.getBranchCommits()
                 isMerged = newCommits.isNotEmpty() && service.isBranchMerged()
                 commits = newCommits
-                prLookup = lookupBranchPr(newCommits)
+                prLookup = lookupBranchPr()
                 SwingUtilities.invokeLater { updateCommitList() }
             } catch (_: Exception) {
                 commits = emptyList()
@@ -306,7 +306,7 @@ class CommitsPanel(
             isMerged = newCommits.isNotEmpty() && service.isBranchMerged()
 
             commits = newCommits
-            prLookup = lookupBranchPr(newCommits)
+            prLookup = lookupBranchPr()
             SwingUtilities.invokeLater { if (refreshVersion == myVersion) updateCommitList() }
         } catch (_: Exception) {
             if (refreshVersion != myVersion) return
@@ -321,11 +321,19 @@ class CommitsPanel(
      * (no pushed commits) or `gh` isn't installed / authenticated, so local-only
      * branches never pay for a process spawn. Returns null on any miss.
      */
-    private fun lookupBranchPr(commits: List<CommitSummaryBrief>): PrService.PrLookup? {
-        if (commits.none { it.isPushed }) return null
+    private fun lookupBranchPr(): PrService.PrLookup? {
         val cwd = service.mainRepoRoot ?: return null
+        val gitOps = service.getGitOps() ?: return null
+        val branch = gitOps.getCurrentBranch() ?: return null
+        // The branch's PR lives on the remote and stays open regardless of whether
+        // the local tip is pushed — e.g. right after a squash (which leaves the
+        // squashed commit unpushed) or an amend. Gate on the branch being published
+        // (has an upstream or an origin/<branch> ref), NOT on local commits being
+        // pushed; otherwise SHIPPED wrongly reads "not created" until the next push.
+        val published = gitOps.exec("rev-parse", "--verify", "--quiet", "@{upstream}") != null ||
+            gitOps.exec("rev-parse", "--verify", "--quiet", "refs/remotes/origin/$branch") != null
+        if (!published) return null
         return try {
-            val branch = service.getGitOps()?.getCurrentBranch() ?: return null
             if (!PrService.isGhAvailable(cwd) || !PrService.isGhAuthenticated(cwd)) return null
             PrService.findPrForBranch(cwd, branch)
         } catch (_: Exception) {
@@ -821,9 +829,10 @@ class CommitsPanel(
         val future = detailCache.computeIfAbsent(hash) {
             CompletableFuture.supplyAsync(
                 {
+                    val summary = service.getSummary(hash)
                     ExpansionDetail(
-                        summary = service.getSummary(hash),
-                        conversations = service.getCommittedConversations(hash),
+                        summary = summary,
+                        conversations = gatherConversations(hash, summary),
                         files = service.listCommitFiles(hash),
                     )
                 },
@@ -851,6 +860,31 @@ class CommitsPanel(
                 currentState.fileContainer.repaint()
             }
         }
+    }
+
+    /**
+     * Conversations for a committed memory, with a squash fallback: if the commit
+     * has no transcript of its own (older squashed memories whose transcripts were
+     * never merged onto the new hash), aggregate the transcripts of its child
+     * commits instead. Dedupes by session, summing per-commit message counts.
+     */
+    private fun gatherConversations(hash: String, summary: CommitSummary?): List<ConversationBrief> {
+        val own = service.getCommittedConversations(hash)
+        if (own.isNotEmpty() || summary?.children.isNullOrEmpty()) return own
+
+        val merged = LinkedHashMap<String, ConversationBrief>()
+        fun collect(s: CommitSummary?) {
+            s?.children?.forEach { child ->
+                for (c in service.getCommittedConversations(child.commitHash)) {
+                    val key = c.sessionId.ifBlank { "${c.source}|${c.title}" }
+                    val existing = merged[key]
+                    merged[key] = existing?.copy(messageCount = existing.messageCount + c.messageCount) ?: c
+                }
+                collect(child) // nested squashes
+            }
+        }
+        collect(summary)
+        return merged.values.toList()
     }
 
     /**

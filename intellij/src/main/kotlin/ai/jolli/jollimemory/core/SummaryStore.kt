@@ -263,6 +263,28 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
             mergedTicketId = ticket
         }
 
+        // Merge the squashed commits' stored transcripts into one keyed under the
+        // new commit. Each pre-squash commit stored only the *new* entries for a
+        // session, so we group by session and concatenate those slices in
+        // chronological (oldest-first) order to reconstruct the full conversation.
+        // Without this the transcripts stay orphaned under the old hashes and the
+        // panel (which reads transcripts/<commitHash>.json) shows no conversations.
+        val mergedSessions = LinkedHashMap<String, StoredSession>()
+        for (s in oldSummaries.sortedBy { it.commitDate }) {
+            val tjson = storage.readFile("transcripts/${s.commitHash}.json") ?: continue
+            val t = try { gson.fromJson(tjson, StoredTranscript::class.java) } catch (_: Exception) { null } ?: continue
+            for (session in t.sessions) {
+                val key = session.sessionId.ifBlank { "${session.source}|${session.transcriptPath}" }
+                val existing = mergedSessions[key]
+                mergedSessions[key] =
+                    if (existing == null) session else existing.copy(entries = existing.entries + session.entries)
+            }
+        }
+        val mergedTranscript = mergedSessions.values.toList()
+            .takeIf { it.isNotEmpty() }?.let { StoredTranscript(it) }
+        val totalEntries = mergedSessions.values.sumOf { it.entries.size }
+        val totalTurns = mergedSessions.values.sumOf { s -> s.entries.count { it.role == "human" } }
+
         val newSummary = CommitSummary(
             version = SummaryTree.CURRENT_SCHEMA_VERSION, commitHash = newCommitInfo.hash,
             commitMessage = newCommitInfo.message, commitAuthor = newCommitInfo.author,
@@ -273,10 +295,12 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
             recap = mergedRecap,
             ticketId = mergedTicketId,
             llm = llmMetadata,
+            conversationTurns = totalTurns.takeIf { it > 0 },
+            transcriptEntries = totalEntries.takeIf { it > 0 },
             summaryError = summaryError,
             children = children,
         )
-        storeSummary(newSummary, force = true)
+        storeSummary(newSummary, force = true, transcript = mergedTranscript)
     }
 
     // ── Plan progress storage ─────────────────────────────────────────────

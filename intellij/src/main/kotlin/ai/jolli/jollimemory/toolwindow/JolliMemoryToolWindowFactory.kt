@@ -175,6 +175,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         // Each renders capped at 6 rows (then "Show N more"), separated by a light-blue
         // divider, with a single shared scrollbar across all three.
         val currentMemoryPanel = CurrentMemoryPanel(
+            project,
             service,
             conversationsPanel, "JolliMemory.ConversationsActions",
             plansPanel, "JolliMemory.PlansActions",
@@ -202,7 +203,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             "PINNED", "JolliMemory.PinnedActions", pinnedPanel, fitContent = true,
         )
         val currentMemoryCollapsible = CollapsiblePanel(
-            "CURRENT MEMORY", "JolliMemory.CurrentMemoryActions", currentMemoryPanel,
+            "WORKING MEMORY", "JolliMemory.CurrentMemoryActions", currentMemoryPanel,
         )
         val memoriesCollapsible = CollapsiblePanel(
             "COMMITTED MEMORIES", "JolliMemory.CommitsActions", commitsPanel,
