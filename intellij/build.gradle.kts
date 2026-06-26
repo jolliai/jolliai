@@ -35,6 +35,7 @@ dependencies {
         intellijIdeaCommunity("2024.3")
         bundledPlugin("com.intellij.java")
         bundledPlugin("Git4Idea")
+        bundledPlugin("org.jetbrains.plugins.terminal")
         pluginVerifier()
         instrumentationTools()
         // Use the JetBrains Runtime for runIde/tests so JCEF is available — the

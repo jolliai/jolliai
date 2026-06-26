@@ -132,6 +132,7 @@ class CommitsPanel(
     private val hoverDismissTimer = Timer(HOVER_HIDE_GRACE_MS) { dismissHoverPopup() }.apply { isRepeats = false }
     private companion object {
         val LOG: com.intellij.openapi.diagnostic.Logger = com.intellij.openapi.diagnostic.Logger.getInstance(CommitsPanel::class.java)
+        val log = ai.jolli.jollimemory.core.JmLogger.create("CommitsPanel")
         const val ARROW_RIGHT = "\u25B6" // ▶
         const val ARROW_DOWN = "\u25BC"  // ▼
         const val HOVER_SHOW_DELAY_MS = 1000
@@ -862,13 +863,13 @@ class CommitsPanel(
      * commits instead. Dedupes by session, summing per-commit message counts.
      */
     private fun gatherConversations(hash: String, summary: CommitSummary?): List<ConversationBrief> {
-        val own = service.getCommittedConversations(hash)
+        val own = service.getCommittedConversations(hash, summary)
         if (own.isNotEmpty() || summary?.children.isNullOrEmpty()) return own
 
         val merged = LinkedHashMap<String, ConversationBrief>()
         fun collect(s: CommitSummary?) {
             s?.children?.forEach { child ->
-                for (c in service.getCommittedConversations(child.commitHash)) {
+                for (c in service.getCommittedConversations(child.commitHash, child)) {
                     val key = c.sessionId.ifBlank { "${c.source}|${c.title}" }
                     val existing = merged[key]
                     merged[key] = existing?.copy(messageCount = existing.messageCount + c.messageCount) ?: c
@@ -1054,12 +1055,20 @@ class CommitsPanel(
             add(title)
         }
 
-        // Hover actions (hidden until hover): Open conversation · Continue.
-        val openBtn = convoActionIcon(JolliMemoryIcons.Eye, "Open conversation") { openCommittedConversation(c) }
-        val continueBtn = convoActionIcon(AllIcons.Actions.Execute, "Continue — reopen this session in your AI tool") {
-            copyRecallPrompt(commit.hash)
+        // Hover actions (hidden until hover): Open conversation · Resume (only if local session exists).
+        val openBtn = convoActionIcon(JolliMemoryIcons.Eye, "Open conversation") { _ -> openCommittedConversation(c) }
+        val fileExists = !c.transcriptPath.isNullOrBlank() && File(c.transcriptPath).exists()
+        val canResume = c.source == "claude" && fileExists
+        log.info("conversationRow: source=${c.source}, sessionId=${c.sessionId}, transcriptPath=${c.transcriptPath}, fileExists=$fileExists, canResume=$canResume")
+        val actions = if (canResume) {
+            val continueBtn = convoActionIcon(AllIcons.Actions.Execute, "Resume session in terminal") { _ ->
+                log.info("continueBtn clicked: sessionId=${c.sessionId}, commitHash=${commit.hash}")
+                resumeInTerminal(c.sessionId)
+            }
+            listOf(openBtn, continueBtn)
+        } else {
+            listOf(openBtn)
         }
-        val actions = listOf(openBtn, continueBtn)
         val east = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(2), 0)).apply {
             isOpaque = false
             add(count)
@@ -1085,6 +1094,11 @@ class CommitsPanel(
             }
             override fun mouseExited(e: MouseEvent) {
                 val src = e.source as Component
+                if (!src.isShowing || !row.isShowing) {
+                    count.isVisible = true
+                    actions.forEach { it.isVisible = false }
+                    return
+                }
                 val screen = src.locationOnScreen.apply { translate(e.x, e.y) }
                 val loc = row.locationOnScreen
                 if (!java.awt.Rectangle(loc.x, loc.y, row.width, row.height).contains(screen)) {
@@ -1107,7 +1121,7 @@ class CommitsPanel(
     }
 
     /** A hover-revealed action icon for conversation rows. */
-    private fun convoActionIcon(icon: javax.swing.Icon, tip: String, onClick: () -> Unit): JLabel =
+    private fun convoActionIcon(icon: javax.swing.Icon, tip: String, onClick: (Component) -> Unit): JLabel =
         JLabel(icon).apply {
             toolTipText = tip
             cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
@@ -1115,7 +1129,7 @@ class CommitsPanel(
             isVisible = false
             addMouseListener(object : MouseAdapter() {
                 override fun mouseClicked(e: MouseEvent) {
-                    if (SwingUtilities.isLeftMouseButton(e)) { e.consume(); onClick() }
+                    if (SwingUtilities.isLeftMouseButton(e)) { e.consume(); onClick(e.component) }
                 }
             })
         }
@@ -1510,6 +1524,16 @@ class CommitsPanel(
                 }
             }
         }
+    }
+
+    // ─── Resume session ──────────────────────────────────────────────────────
+
+    /** Opens a new terminal tab and runs `claude --resume <sessionId>`. */
+    private fun resumeInTerminal(sessionId: String) {
+        val cwd = service.mainRepoRoot ?: project.basePath
+        log.info("resumeInTerminal: sessionId=$sessionId, cwd=$cwd")
+        if (cwd == null) return
+        TerminalUtils.resumeClaudeSession(project, sessionId, cwd)
     }
 
     // ─── Copy recall prompt ──────────────────────────────────────────────────

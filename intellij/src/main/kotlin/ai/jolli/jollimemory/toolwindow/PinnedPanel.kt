@@ -11,7 +11,6 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
@@ -26,8 +25,6 @@ import java.awt.Font
 import java.awt.Graphics
 import java.awt.Graphics2D
 import java.awt.RenderingHints
-import java.awt.Toolkit
-import java.awt.datatransfer.StringSelection
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.io.File
@@ -125,9 +122,8 @@ class PinnedPanel(
 		left.add(title)
 		row.add(left, BorderLayout.CENTER)
 
-		// Hover actions, right edge: Open (eye) · Recall (play) · Unpin.
+		// Hover actions, right edge: Open (eye) · Resume (play, Claude only) · Unpin.
 		val openBtn = actionIcon(JolliMemoryIcons.Eye, "Open") { openPinned(entry) }
-		val recallBtn = actionIcon(AllIcons.Actions.Execute, "Recall") { recallPinned(entry) }
 		val unpinBtn = actionIcon(AllIcons.Actions.Close, "Unpin") {
 			val dir = cwd() ?: return@actionIcon
 			ApplicationManager.getApplication().executeOnPooledThread {
@@ -135,7 +131,13 @@ class PinnedPanel(
 				refresh()
 			}
 		}
-		val actions = listOf(openBtn, recallBtn, unpinBtn)
+		val canResume = entry.kind == "conversations" && entry.badge.lowercase() == "claude"
+		val actions = if (canResume) {
+			val resumeBtn = actionIcon(AllIcons.Actions.Execute, "Resume session in terminal") { resumeInTerminal(entry) }
+			listOf(openBtn, resumeBtn, unpinBtn)
+		} else {
+			listOf(openBtn, unpinBtn)
+		}
 		val east = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(2), 0)).apply {
 			isOpaque = false
 			actions.forEach { add(it) }
@@ -145,8 +147,12 @@ class PinnedPanel(
 		val hover = object : MouseAdapter() {
 			override fun mouseEntered(e: MouseEvent) { actions.forEach { it.isVisible = true } }
 			override fun mouseExited(e: MouseEvent) {
-				val p = e.point
 				val src = e.source as Component
+				if (!src.isShowing || !row.isShowing) {
+					actions.forEach { it.isVisible = false }
+					return
+				}
+				val p = e.point
 				val screen = src.locationOnScreen.apply { translate(p.x, p.y) }
 				val loc = row.locationOnScreen
 				if (!java.awt.Rectangle(loc.x, loc.y, row.width, row.height).contains(screen)) {
@@ -178,16 +184,13 @@ class PinnedPanel(
 		})
 	}
 
-	/** Recall action (play): copies the recall prompt for the current branch. */
-	private fun recallPinned(entry: PinStore.PinnedEntry) {
-		val branch = service.getGitOps()?.getCurrentBranch()
-		if (branch.isNullOrBlank()) {
-			Messages.showWarningDialog(project, "Could not determine the current branch.", "Recall")
-			return
+	/** Resume a pinned Claude conversation directly in terminal. */
+	private fun resumeInTerminal(entry: PinStore.PinnedEntry) {
+		val cwd = cwd() ?: return
+		val sessionId = entry.key.substringAfter(":")
+		if (sessionId.isNotBlank()) {
+			TerminalUtils.resumeClaudeSession(project, sessionId, cwd, "Claude – ${entry.title}")
 		}
-		val prompt = "Invoke the \"jolli-recall\" skill with args \"$branch\"."
-		Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(prompt), null)
-		Messages.showInfoMessage(project, "Recall prompt copied — paste it into your AI coding tool.", "Recall")
 	}
 
 	private fun badgeColor(entry: PinStore.PinnedEntry): Color = when (entry.kind) {

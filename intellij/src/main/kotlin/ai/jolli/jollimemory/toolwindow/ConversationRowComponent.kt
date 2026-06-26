@@ -28,8 +28,8 @@ import javax.swing.JPanel
 class ConversationRowComponent(
 	val item: ActiveConversationItem,
 	private val onRowClicked: (ActiveConversationItem) -> Unit,
-	private val onContinue: (ActiveConversationItem) -> Unit,
 	private val onPin: (ActiveConversationItem) -> Unit,
+	private val onResume: (ActiveConversationItem) -> Unit,
 	private val onSelectionChanged: (ActiveConversationItem, Boolean) -> Unit,
 ) : JPanel(BorderLayout()) {
 
@@ -43,7 +43,7 @@ class ConversationRowComponent(
 
 	private val pinLabel = actionIcon(AllIcons.General.Pin_tab, "Pin") { onPin(item) }
 	private val eyeLabel = actionIcon(JolliMemoryIcons.Eye, "Open conversation") { onRowClicked(item) }
-	private val continueLabel = actionIcon(AllIcons.Actions.Execute, "Continue — reopen this session in your AI tool") { onContinue(item) }
+	private val resumeLabel = actionIcon(AllIcons.Actions.Execute, "Resume session in terminal") { onResume(item) }
 	private val toggleLabel = JLabel().apply {
 		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
 		isVisible = false
@@ -88,7 +88,7 @@ class ConversationRowComponent(
 		countLabel.isVisible = !hovered
 		pinLabel.isVisible = hovered
 		eyeLabel.isVisible = hovered
-		continueLabel.isVisible = hovered
+		resumeLabel.isVisible = hovered
 		toggleLabel.isVisible = hovered
 	}
 
@@ -111,7 +111,7 @@ class ConversationRowComponent(
 		rightPanel.add(countLabel)
 		rightPanel.add(pinLabel)
 		rightPanel.add(eyeLabel)
-		rightPanel.add(continueLabel)
+		rightPanel.add(resumeLabel)
 		rightPanel.add(toggleLabel)
 		add(rightPanel, BorderLayout.EAST)
 
@@ -125,8 +125,12 @@ class ConversationRowComponent(
 			override fun mouseExited(e: MouseEvent) {
 				// Only un-hover if the mouse actually left the row bounds (not when
 				// moving onto a child component within the row).
-				val p = e.point
 				val src = e.source as Component
+				if (!src.isShowing || !this@ConversationRowComponent.isShowing) {
+					setHovered(false)
+					return
+				}
+				val p = e.point
 				val screenPoint = src.locationOnScreen.apply { translate(p.x, p.y) }
 				val rowLoc = this@ConversationRowComponent.locationOnScreen
 				if (!Rectangle(rowLoc.x, rowLoc.y, width, height).contains(screenPoint)) {
@@ -140,7 +144,7 @@ class ConversationRowComponent(
 		addMouseListener(hoverListener)
 		addMouseListener(clickListener)
 		// Icons handle their own clicks; the row body (badge/title/count) opens the conversation.
-		for (c in listOf(leftPanel, badge, titleLabel, rightPanel, countLabel, pinLabel, eyeLabel, continueLabel, toggleLabel)) {
+		for (c in listOf(leftPanel, badge, titleLabel, rightPanel, countLabel, pinLabel, eyeLabel, resumeLabel, toggleLabel)) {
 			c.addMouseListener(hoverListener)
 			if (c === leftPanel || c === badge || c === titleLabel || c === rightPanel || c === countLabel) {
 				c.addMouseListener(clickListener)

@@ -679,8 +679,8 @@ val sb = StringBuilder()
     }
 
     /** Reads the committed AI conversations for a commit (CONVERSATIONS group). */
-    fun getCommittedConversations(hash: String): List<ConversationBrief> =
-        reader?.getCommittedConversations(hash) ?: emptyList()
+    fun getCommittedConversations(hash: String, summary: CommitSummary? = null): List<ConversationBrief> =
+        reader?.getCommittedConversations(hash, summary) ?: emptyList()
 
     /**
      * Lists files changed in a specific commit — matches VS Code listCommitFiles().

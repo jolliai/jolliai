@@ -228,6 +228,7 @@ data class CommitSummary(
     val notes: List<NoteReference>? = null,
     val references: List<ReferenceCommitRef>? = null,
     val summaryError: String? = null,
+    val transcripts: List<String>? = null,
 )
 
 /** A single E2E test scenario */
@@ -256,9 +257,9 @@ data class PlanEntry(
     val sourcePath: String,
     val addedAt: String,
     val updatedAt: String,
-    val branch: String,
+    val branch: String? = null,
     val commitHash: String?,
-    val editCount: Int,
+    val editCount: Int = 0,
     val contentHashAtCommit: String? = null,
     val ignored: Boolean? = null,
 )
