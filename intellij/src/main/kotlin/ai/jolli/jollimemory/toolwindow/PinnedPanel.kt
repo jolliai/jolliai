@@ -113,7 +113,14 @@ class PinnedPanel(
 		}
 
 		val left = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(4), 0)).apply { isOpaque = false }
-		left.add(BadgePill(entry.badge, badgeColor(entry)))
+		// Conversation pins lead with the AI tool's real logo (badge = source name);
+		// other kinds keep their letter/tag pill.
+		val sourceLogo = if (entry.kind == "conversations") JolliMemoryIcons.sourceLogo(entry.badge.lowercase()) else null
+		if (sourceLogo != null) {
+			left.add(JLabel(sourceLogo).apply { toolTipText = entry.badge })
+		} else {
+			left.add(BadgePill(entry.badge, badgeColor(entry)))
+		}
 		val title = JBLabel(entry.title).apply { minimumSize = Dimension(0, 0) }
 		left.add(title)
 		row.add(left, BorderLayout.CENTER)
