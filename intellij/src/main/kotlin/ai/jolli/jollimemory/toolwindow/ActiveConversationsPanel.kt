@@ -135,8 +135,8 @@ class ActiveConversationsPanel(
 			ConversationRowComponent(
 				item = item,
 				onRowClicked = ::onRowClicked,
-				onContinue = ::onContinue,
 				onPin = ::onPin,
+				onResume = ::onResume,
 				onSelectionChanged = ::onSelectionChanged,
 			)
 		}
@@ -162,6 +162,12 @@ class ActiveConversationsPanel(
 		}
 	}
 
+	private fun onResume(item: ActiveConversationItem) {
+		if (item.source != TranscriptSource.claude) return
+		val cwd = service.mainRepoRoot ?: project.basePath ?: return
+		TerminalUtils.resumeClaudeSession(project, item.sessionId, cwd, "Claude – ${item.title}")
+	}
+
 	private fun onSelectionChanged(item: ActiveConversationItem, selected: Boolean) {
 		val cwd = service.mainRepoRoot ?: project.basePath ?: return
 		val key = CommitSelectionStore.conversationKey(item.source, item.sessionId)
@@ -178,27 +184,6 @@ class ActiveConversationsPanel(
 			CommitSelectionStore.setAllExcluded(cwd, "conversations", keys, !anyUnchecked)
 			SwingUtilities.invokeLater { refresh() }
 		}
-	}
-
-	/**
-	 * Continue — copy a recall prompt for the current branch so the user can paste
-	 * it into their AI tool and resume with this branch's context. (The plugin
-	 * can't relaunch an external tool directly.)
-	 */
-	private fun onContinue(@Suppress("UNUSED_PARAMETER") item: ActiveConversationItem) {
-		val branch = service.getGitOps()?.getCurrentBranch()
-		val prompt = if (branch.isNullOrBlank()) {
-			"Invoke the \"jolli-recall\" skill."
-		} else {
-			"Invoke the \"jolli-recall\" skill with args \"$branch\"."
-		}
-		java.awt.Toolkit.getDefaultToolkit().systemClipboard
-			.setContents(java.awt.datatransfer.StringSelection(prompt), null)
-		com.intellij.openapi.ui.Messages.showInfoMessage(
-			project,
-			"Recall prompt copied — paste it into your AI tool to continue with this branch's context.",
-			"Continue",
-		)
 	}
 
 	private fun onPin(item: ActiveConversationItem) {

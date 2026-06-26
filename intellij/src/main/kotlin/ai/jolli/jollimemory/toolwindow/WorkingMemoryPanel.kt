@@ -193,7 +193,7 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             val registry = SessionTracker.loadPlansRegistry(cwd)
             registry.plans.values.forEach { p ->
                 if (p.ignored == true || p.commitHash != null) return@forEach
-                if (p.branch.isNotBlank() && p.branch != branch) return@forEach
+                if (!p.branch.isNullOrBlank() && p.branch != branch) return@forEach
                 if (!File(p.sourcePath).exists()) return@forEach
                 out.add(WmContext("P", p.title))
             }

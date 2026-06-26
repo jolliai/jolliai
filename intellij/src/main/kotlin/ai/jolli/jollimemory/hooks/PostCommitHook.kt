@@ -326,39 +326,43 @@ object PostCommitHook {
                 val commitDate = Instant.parse(commitInfo.date).toString()
 
                 for (slug in uncommittedSlugs) {
-                    // Read plan markdown before archiving (retain for eval)
-                    val planFile = File(plansDir, "$slug.md")
-                    val planMarkdown = if (planFile.exists()) planFile.readText(Charsets.UTF_8) else null
+                    try {
+                        // Read plan markdown before archiving (retain for eval)
+                        val planFile = File(plansDir, "$slug.md")
+                        val planMarkdown = if (planFile.exists()) planFile.readText(Charsets.UTF_8) else null
 
-                    // Archive: renames slug to slug-hash in registry, stores plan on orphan branch
-                    val ref = PlanService.archivePlanForCommit(slug, commitInfo.hash, store, cwd)
-                    if (ref != null) {
-                        planRefs.add(ref)
+                        // Archive: renames slug to slug-hash in registry, stores plan on orphan branch
+                        val ref = PlanService.archivePlanForCommit(slug, commitInfo.hash, store, cwd)
+                        if (ref != null) {
+                            planRefs.add(ref)
 
-                        // Evaluate progress via Haiku LLM call
-                        if (planMarkdown != null) {
-                            val evalResult = try {
-                                PlanProgressEvaluator.evaluatePlanProgress(
-                                    planMarkdown, diff, topics, conversation, apiKey, config.model, config.jolliApiKey, config.aiProvider,
-                                )
-                            } catch (e: Exception) {
-                                log.warn("Plan progress eval failed for %s: %s", slug, e.message)
-                                null
-                            }
+                            // Evaluate progress via Haiku LLM call
+                            if (planMarkdown != null) {
+                                val evalResult = try {
+                                    PlanProgressEvaluator.evaluatePlanProgress(
+                                        planMarkdown, diff, topics, conversation, apiKey, config.model, config.jolliApiKey, config.aiProvider,
+                                    )
+                                } catch (e: Exception) {
+                                    log.warn("Plan progress eval failed for %s: %s", slug, e.message)
+                                    null
+                                }
 
-                            if (evalResult != null) {
-                                planProgressArtifacts.add(PlanProgressArtifact(
-                                    commitHash = commitInfo.hash,
-                                    commitMessage = commitInfo.message,
-                                    commitDate = commitDate,
-                                    planSlug = ref.slug,
-                                    originalSlug = slug,
-                                    summary = evalResult.summary,
-                                    steps = evalResult.steps,
-                                    llm = evalResult.llm,
-                                ))
+                                if (evalResult != null) {
+                                    planProgressArtifacts.add(PlanProgressArtifact(
+                                        commitHash = commitInfo.hash,
+                                        commitMessage = commitInfo.message,
+                                        commitDate = commitDate,
+                                        planSlug = ref.slug,
+                                        originalSlug = slug,
+                                        summary = evalResult.summary,
+                                        steps = evalResult.steps,
+                                        llm = evalResult.llm,
+                                    ))
+                                }
                             }
                         }
+                    } catch (e: Exception) {
+                        log.warn("Plan archive failed for %s (non-fatal, skipping): %s", slug, e.message)
                     }
                 }
                 log.info("Plan progress: evaluated %d/%d plan(s)", planProgressArtifacts.size, planRefs.size)
@@ -417,7 +421,7 @@ object PostCommitHook {
             // coding-session token usage from their per-message usage.
             val storedSessions = sessionTranscripts.map { st ->
                 log.info("StoredSession: sessionId=%s, source=%s, entries=%d", st.sessionId.take(8), st.source, st.entries.size)
-                StoredSession(st.sessionId, source = st.source, entries = st.entries)
+                StoredSession(st.sessionId, source = st.source, transcriptPath = st.transcriptPath, entries = st.entries)
             }
             val tokenUsage = TokenUsage.aggregate(storedSessions)
             log.info("TokenUsage: %s", tokenUsage?.let { "in=${it.inputTokens} out=${it.outputTokens} cr=${it.cacheReadTokens} cw=${it.cacheWriteTokens} reported=${it.reportedSessions}/${it.totalSessions}" } ?: "none")

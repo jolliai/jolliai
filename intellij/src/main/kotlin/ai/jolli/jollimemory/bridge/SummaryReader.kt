@@ -118,13 +118,22 @@ class SummaryReader(private val projectDir: String, private val git: GitOps) {
     }
 
     /**
-     * Reads the committed AI conversations for a commit from the orphan-branch
-     * `transcripts/<hash>.json` (the system of record). Returns one row per
-     * stored session (source, derived title, message count). Empty when no
-     * transcript was stored or it can't be parsed — the panel falls back to the
-     * summary's `conversationTurns` count in that case.
+     * Reads the committed AI conversations for a commit. Looks up the
+     * summary's `transcripts` array for the real transcript IDs (UUIDs in v5,
+     * commit hashes in legacy data), then reads each transcript file and
+     * aggregates all sessions. Falls back to `transcripts/{commitHash}.json`
+     * for pre-v5 data that has no summary or no `transcripts` field.
      */
-    fun getCommittedConversations(commitHash: String): List<ConversationBrief> {
+    fun getCommittedConversations(commitHash: String, summary: CommitSummary? = null): List<ConversationBrief> {
+        val resolved = summary ?: getSummary(commitHash)
+        val ids = resolved?.transcripts
+        if (!ids.isNullOrEmpty()) {
+            return ids.flatMap { id ->
+                val json = git.readBranchFile(ORPHAN_BRANCH, "transcripts/$id.json")
+                parseConversations(json)
+            }
+        }
+        // Legacy fallback: transcript file named by commit hash.
         val json = git.readBranchFile(ORPHAN_BRANCH, "transcripts/$commitHash.json")
         return parseConversations(json)
     }

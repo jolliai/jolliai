@@ -277,7 +277,10 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
                 val key = session.sessionId.ifBlank { "${session.source}|${session.transcriptPath}" }
                 val existing = mergedSessions[key]
                 mergedSessions[key] =
-                    if (existing == null) session else existing.copy(entries = existing.entries + session.entries)
+                    if (existing == null) session else existing.copy(
+                        entries = existing.entries + session.entries,
+                        transcriptPath = existing.transcriptPath ?: session.transcriptPath,
+                    )
             }
         }
         val mergedTranscript = mergedSessions.values.toList()
