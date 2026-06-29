@@ -1,6 +1,15 @@
 # Changelog
 
-<!-- Last synced commit: ff0bd24d | 2026-06-15 -->
+<!-- Last synced commit: 54473e60 | 2026-06-29 -->
+
+## 0.99.4
+
+- **See your memories as a knowledge graph** — `jolli graph` turns the topics in your knowledge wiki into an interactive map: categories, the decisions/mechanisms/fixes inside each, and the typed links between them (extends, caused-by, supersedes, contradicts, related-to). It exports a single self-contained HTML file you can open in any browser or share — no server needed (`jolli graph --export <dir> --open`). The graph is built automatically right after the wiki on each commit, and updated incrementally (only changed topics are re-distilled), so it stays current without a full rebuild.
+- **Turn a branch's memories into a PR description** — a new `get_pr_description` MCP tool and `jolli pr-description` command assemble a ready-to-paste GitHub PR title and body from everything captured on the branch. The `/jolli-pr` skill wires this straight into your agent so it can open the PR for you. The MCP server now exposes five tools (`search`, `recall`, `get_decision_timeline`, `list_branches`, `get_pr_description`).
+- **Agent skills now go through the MCP server** — the `/jolli-recall` and `/jolli-search` skills prefer the MCP tools and fall back to the CLI recipe only on hosts without MCP support. MCP registration now reaches seven AI hosts (Claude Code, Cursor, Gemini CLI, Codex, OpenCode, GitHub Copilot CLI, VS Code Copilot Chat).
+- **Anonymous, opt-out usage telemetry** — to understand which features are used and where the pipeline breaks, Jolli Memory now collects **content-free** usage events (never your code, paths, commit messages, transcripts, or memory content). It's on by default and shares one anonymous machine id across the CLI, VS Code, and IntelliJ. Manage it with `jolli telemetry status` / `on` / `off`, see exactly what's buffered with `jolli telemetry inspect`, or set `DO_NOT_TRACK=1`. Full event list: <https://jolli.ai/telemetry> (and [TELEMETRY.md](../TELEMETRY.md)).
+- **Better Linear detection from Codex** — Linear references are now picked up from OpenAI-curated connector tools and the `mcp__claude_ai_Linear__` tool prefix, so more of your issue links survive into memories.
+- Bug fixes
 
 ## 0.99.3
 

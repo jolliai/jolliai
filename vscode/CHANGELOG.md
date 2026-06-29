@@ -1,6 +1,12 @@
 # Changelog
 
-<!-- Last synced commit: ff0bd24d | 2026-06-15 -->
+<!-- Last synced commit: 54473e60 | 2026-06-29 -->
+
+## 0.99.4
+
+- **Knowledge graph view** — each repo row in the Memory Bank panel gets a **View knowledge graph** button that opens an interactive map of your knowledge wiki: categories, the decisions/mechanisms/fixes inside each, and the typed links between them. Click a node to focus and reveal its neighbors; the graph rebuilds incrementally in the background after each commit. (Build the wiki first if a repo doesn't have a graph yet.)
+- **Anonymous, opt-out usage telemetry** — Jolli Memory now collects **content-free** usage events (never your code, paths, commit messages, transcripts, or memory content) to understand which features are used and where things break. It's on by default; a one-time notice on first run has **Learn more** and **Turn off** buttons. It also honors VS Code's own `telemetry.telemetryLevel` setting, and you can run `jolli telemetry off` or set `DO_NOT_TRACK=1`. Full event list: <https://jolli.ai/telemetry>.
+- Bug fixes
 
 ## 0.99.3
 

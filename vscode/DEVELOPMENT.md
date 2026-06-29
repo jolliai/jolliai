@@ -157,8 +157,12 @@ src/
 │   ├── ConversationDetailsScriptBuilder.ts  # Embedded JS — turn selection, edit/restore/delete actions, message bus to the panel host
 │   ├── TranscriptEntryRenderer.ts         # Shared per-turn renderer used by both the Summary Webview "All Conversations" section and the Conversation Details panel
 │   │
+│   ├── KnowledgeGraphPanel.ts            # Per-repo knowledge-graph webview (one panel per repo). Loads the shared viz assets from `assets/graph/` via `asWebviewUri` (NOT bundled) and inlines the repo's `graph.json` as `window.__EMBEDDED_GRAPH__`. Opened by `jollimemory.viewKnowledgeGraph`; shows a "build the wiki first" hint when no graph.json exists yet.
+│   │
 │   └── NoteEditorWebviewPanel.ts         # Singleton "Add Text Snippet" editor
 │       NoteEditorHtmlBuilder.ts / NoteEditorCssBuilder.ts / NoteEditorScriptBuilder.ts
+│
+├── TelemetryActivation.ts        # Bootstraps the bundled CLI telemetry engine on activate: shows the one-time first-run notice (Learn more / Turn off), passes `!vscode.env.isTelemetryEnabled` as the platform-off signal, and re-evaluates consent on `onDidChangeTelemetryEnabled`.
 │
 └── util/
     ├── CommitMessageUtils.ts     # Commit message formatting and validation
@@ -304,3 +308,7 @@ Two migration paths populate the folder:
 **Webview CSP — no inline style/JS** — All webviews use a strict CSP with no `unsafe-inline`. Dynamic visibility uses a `.hidden` CSS class (not the HTML `hidden` attribute, which is silently overridden by `display: flex`). Inline `style=""` and inline event handlers are dropped silently and must be replaced by classes + `addEventListener`.
 
 **Worktree-aware** — Hooks and summaries work across `git worktree` checkouts. `git rev-parse --git-path` is used everywhere to resolve paths under `.git/`, because in a worktree `.git` is a pointer file rather than a directory.
+
+**Knowledge graph webview** — `KnowledgeGraphPanel` opens a per-repo webview keyed by repo name, registered as `jollimemory.viewKnowledgeGraph` and triggered from a per-repo **View knowledge graph** button in the Memory Bank tree (`SidebarScriptBuilder` posts `{ command: 'jollimemory.viewKnowledgeGraph', args: [repo] }`). It reads `<kbParent>/<repo>/.jolli/graph/graph.json` (produced by the CLI's `cli/src/graph/` pipeline during `compile`), and renders the **same** viz assets the CLI ships under `assets/graph/`. The assets are loaded via `asWebviewUri` (not inlined into the esbuild bundle); only `graph.json` is inlined, as `window.__EMBEDDED_GRAPH__`. CSP uses a nonce for scripts; category colors are the one place inline `style` is allowed.
+
+**Anonymous usage telemetry** — `TelemetryActivation.ts` bootstraps the CLI's bundled telemetry engine (`cli/src/core/Telemetry*.ts`) on activate. It honors VS Code's own telemetry switch by passing `!vscode.env.isTelemetryEnabled` as the platform-off signal into `resolveTelemetryConsent`, shows a one-time first-run notice (**Learn more** / **Turn off**, the latter writing `telemetry: "off"`), and re-checks consent live via `vscode.env.onDidChangeTelemetryEnabled`. Events are content-free and carry a random `installId` shared with the CLI and IntelliJ — see [`cli/DEVELOPMENT.md`](../cli/DEVELOPMENT.md#usage-telemetry--trace-correlation) and [`TELEMETRY.md`](../TELEMETRY.md).

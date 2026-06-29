@@ -14,9 +14,10 @@ Turns your AI coding sessions into structured development documentation attached
 - **Worktree-aware** — hooks and summaries work across `git worktree` checkouts.
 - **Squash / amend / rebase safe** — a unified operation queue migrates or consolidates summaries when commits are rewritten, so memories are never lost.
 - **Session context recall** — `jolli recall` (or the `/jolli-recall` skill) loads complete branch history back into your AI agent so it can pick up where you left off. A lightweight briefing is also injected at the start of every Claude Code session.
-- **Cross-branch search** — `jolli search <keyword>` searches every branch's memories with a two-phase pipeline (catalog → full topic bodies).
+- **Cross-branch search** — `jolli search <keyword>` ranks every branch's memories with BM25 and returns the best-matching hits in a single pass.
 - **MCP server for AI agents** — `jolli mcp` exposes your history to Claude Code (and any MCP-aware agent) so it can search memories, recall a branch, and trace a decision's history without leaving the chat. Registered automatically on `jolli enable`.
 - **Knowledge wiki** — `jolli compile` folds the work scattered across many commits into per-topic pages and a browsable `_wiki/` folder in your Memory Bank, updated automatically after each commit.
+- **Knowledge graph** — `jolli graph` exports the wiki's topics as an interactive, self-contained HTML map of categories, knowledge units, and the typed links between them. Built incrementally alongside the wiki on every commit.
 - **Issue & page references** — Linear, Jira, GitHub, and Notion items mentioned in your AI conversations are captured and attached to the relevant memory.
 - **Privacy-first** — transcripts and diff go straight to Anthropic (with your `apiKey`) or via the Jolli LLM proxy (in-memory, never persisted). Raw transcripts are never uploaded to Jolli Space.
 
@@ -226,23 +227,20 @@ jolli recall --budget 30000 --format json
 
 ### `jolli search`
 
-Searches stored memories with a two-phase pipeline: Phase 1 returns a catalog of matching commits (hash + branch + date + recap + topic titles); Phase 2 takes a comma-separated `--hashes` list and returns full topic bodies for those commits.
+Searches stored memories with BM25 ranking (Orama) over the distilled summaries and returns the best-matching hits in a single pass. Each hit carries its `hash`, `branch`, `commitDate`, `slug`, `title`, and a content `snippet`, plus a relevance `score` and a `type` (`topic` or `commit`).
 
 ```bash
-# Phase 1 — catalog of matches on the current branch
+# Search every branch's memories
 jolli search "rate limiter"
 
-# Filter to recent commits, cap entries, JSON for skills/agents
-jolli search "auth refactor" --since 2026-04-01 --limit 5 --format json
+# Cap hits, JSON for skills/agents
+jolli search "auth refactor" --limit 5 --format json
 
-# Phase 2 — load full topic bodies for chosen hashes
-jolli search "rate limiter" --hashes deadbeef,cafe1234 --format json
-
-# Cap the token budget on the catalog output
-jolli search "windows path" --budget 8000 --format json
+# Restrict to one branch and one result kind
+jolli search "rate limiter" --branch feature/auth --type topic --format json
 ```
 
-Available flags: `--since` (ISO date or relative `7d`/`2w`/`1m`/`3y`; bad values are rejected with exit 1), `--hashes`, `--limit`, `--budget`, `--format` (`json` default; `text` for terminal-friendly output), `--output`, `--cwd`. There is **no `--branch` flag** — the catalog is scanned across every branch in the repo by design.
+Available flags: `--limit` (max hits, default 20), `--branch` (restrict to one branch), `--type` (`topic` or `commit`), `--format` (`json` default; `text` for terminal-friendly output), `--output`, `--cwd`. With no `--branch`, every branch in the repo is searched.
 
 ### `jolli mcp`
 
@@ -274,6 +272,23 @@ jolli compile --cwd /path/to/repo --rebuild
 ```
 
 You normally don't need to run this by hand — after each commit, Jolli Memory incrementally folds new sources into the wiki in the background (the editor extensions expose the same action as a **Build Knowledge Wiki** button). Running `jolli compile` is for an on-demand refresh or a full `--rebuild`. Requires an API key (same as summary generation).
+
+### `jolli graph`
+
+Exports your **knowledge graph** — an interactive visualization of the topics in your knowledge wiki — to a self-contained HTML file you can open in any browser or hand to a teammate. The graph shows your categories, the knowledge units inside each (decisions, mechanisms, fixes), and the typed relationships between them (`extends`, `caused-by`, `supersedes`, `contradicts`, `related-to`). Click a unit to zoom in and surface its related neighbors.
+
+```bash
+# Write <repo>-graph.html into a directory
+jolli graph --export ./out
+
+# Write to a specific file and open it in the browser
+jolli graph --export ./out/graph.html --open
+
+# Target a specific repo
+jolli graph --export ./out --cwd /path/to/repo
+```
+
+The graph is built automatically right after the knowledge wiki on each commit and updated incrementally — only topics whose content changed are re-distilled — so it stays current without a full rebuild. It's stored folder-locally (`<localFolder>/<repo>/.jolli/graph/graph.json`) and regenerable, never written to the orphan branch. Run `jolli compile` first if a repo has no graph yet. The editor extensions expose the same visualization via a **View knowledge graph** button.
 
 ### `jolli configure`
 
@@ -375,7 +390,7 @@ Jolli Memory feeds prior development context back into your AI agent so it can p
 
 If the current branch has no memories, the command shows a catalog of branches that do, letting you pick one to recall. You can also pass a branch name or keyword as an argument (e.g. `/jolli-recall auth-refactor`).
 
-**Targeted search** — run `/jolli-search <keyword>` (or `jolli search <keyword>` from the terminal) to search across every branch's memories. The raw CLI returns the catalog and full topic bodies (Phase 1 + Phase 2 via `--hashes`).
+**Targeted search** — run `/jolli-search <keyword>` (or `jolli search <keyword>` from the terminal) to search across every branch's memories. The raw CLI returns BM25-ranked hits (hash, branch, slug, title, snippet) in a single pass.
 
 ## Configuration
 
@@ -519,7 +534,7 @@ Every entry on the `jollimemory/summaries/v3` orphan branch — and its mirror i
 
 Separately from your memory content, Jolli Memory collects **anonymous, content-free usage telemetry** to understand which features are used and where things break. It is **on by default** and you can turn it off at any time.
 
-- **What is sent** — event names (e.g. `app_installed`, `summary_generated`, `sync_completed`), the surface and version (`cli` + version), OS / arch / Node version, a random `installId` (a UUID generated on this machine), and coarse, bucketed counts. Nothing else.
+- **What is sent** — event names (e.g. `app_installed`, `ingest_completed`, `sync_completed`), the surface and version (`cli` + version), OS / arch / Node version, a random `installId` (a UUID generated on this machine), and coarse, bucketed counts. Nothing else.
 - **What is never sent** — your code, file paths, commit messages, diffs, transcripts, memory/summary content, repo names, branch names, API keys, or any account identifier. Property values are scrubbed before they leave your machine, and the payload carries no account ID.
 - **How it leaves your machine** — events are written to a local buffer (`<projectDir>/.jolli/jollimemory/telemetry-queue.ndjson`) and flushed in small batches; the buffer is capped and never grows unbounded.
 

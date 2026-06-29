@@ -117,7 +117,7 @@ jolli status
 
 | Module | Build Output | Purpose |
 |--------|-------------|---------|
-| [Cli.ts](src/Cli.ts) | `dist/Cli.js` | CLI commands — Memory: `enable` / `disable` / `status` / `doctor` / `clean` / `heal-folder` / `view` / `export` / `recall` / `search` / `configure` / `migrate`; Auth: `auth login` / `logout` / `status`; Site: `new` / `convert` / `dev` / `build` / `start`. Delegates command registration to per-command modules under `src/commands/` and to `Api.registerCli` so the same registration pipeline is reusable by plugins and the test harness. |
+| [Cli.ts](src/Cli.ts) | `dist/Cli.js` | CLI commands — Memory: `enable` / `disable` / `status` / `doctor` / `clean` / `heal-folder` / `view` / `export` / `recall` / `search` / `compile` / `graph` / `pr-description` / `mcp` / `sync-memory-bank` / `telemetry` / `configure` / `migrate`; Auth: `auth login` / `logout` / `status`; Site (stubs unless `@jolli.ai/site-cli` is installed): `new` / `convert` / `dev` / `build` / `start`. Delegates command registration to per-command modules under `src/commands/` and to `Api.registerCli` so the same registration pipeline is reusable by plugins and the test harness. |
 | [Api.ts](src/Api.ts) | `dist/Api.js` | Public API entry (`@jolli.ai/cli/api`). Exports `PluginContext`, `PluginRegister`, `parseJolliApiKey`, `parseBaseUrl`; runs `loadPlugins` after built-in command registration so plugins can append subcommands without touching `Cli.ts`. Backed by an `exports` field in `package.json` that explicitly blocks deep `@jolli.ai/cli/dist/*` imports. |
 | [PluginLoader.ts](src/PluginLoader.ts) | inlined in `dist/Api.js` | Plugin discovery — scans the current git project's `node_modules` and the global npm root for entries on the `KNOWN_PLUGINS` allow-list, validates the plugin's `peerDependencies['@jolli.ai/cli']` range against the host's `VERSION`, and invokes the plugin's `register(ctx)` once. Non-throwing — a broken plugin logs and is skipped, never blocks the CLI. Disabled entirely by `JOLLI_NO_PLUGINS=1`. |
 | [StopHook.ts](src/hooks/StopHook.ts) | `dist/StopHook.js` | Claude Code Stop event handler. Saves session metadata, then runs one incremental discovery pass (plans + references) sharing a single `discovery-cursors.json` line. Plan scan/upsert lives in [core/plans/](src/core/plans/), not inline here. |
@@ -453,6 +453,42 @@ The server exposes five tools, all pure handlers in [McpTools.ts](src/mcp/McpToo
 | `get_pr_description` | Build a GitHub PR title + description from the branch's JolliMemory commit summaries — the same memory-rich body the VS Code extension writes. Use before `gh pr create`. |
 
 `McpServer.ts` is pure glue: tool schemas (`TOOL_DEFINITIONS`) plus a `dispatchTool` table over the `McpTools` handlers, adapted into SDK request handlers (`ListTools` / `CallTool`). Errors from a handler are returned as an `isError` tool response rather than crashing the server.
+
+## Knowledge Wiki & Graph
+
+`jolli compile` ([CompileCommand.ts](src/commands/CompileCommand.ts), multi-repo sweep in [MultiRepoCompile.ts](src/core/MultiRepoCompile.ts)) is a two-phase build over a repo's memories:
+
+1. **Knowledge wiki** — ingest sources → fold work on the same theme into per-topic pages → render the browsable `_wiki/` folder. Progress is reported as `Building knowledge wiki — <repo>`.
+2. **Knowledge graph** — immediately after the wiki, `buildKnowledgeGraph` distills those topics into a graph. Progress is reported as `Building knowledge graph — <repo>`.
+
+Everything graph-related lives under [`cli/src/graph/`](src/graph/):
+
+| Module | Purpose |
+|--------|---------|
+| [GraphBuilder.ts](src/graph/GraphBuilder.ts) | Orchestrates an **incremental** build. Computes two SHA256 fingerprints per topic — a *content* fingerprint over the exact LLM inputs (`topicFingerprint`) and a *metadata* fingerprint over `sourceBranches` + `sourceCommits` (`topicMetaFingerprint`) — and diffs them against the fingerprints persisted in the prior `graph.json` to partition topics into `clean` / `dirty` / `added` / `deleted`. Three outcomes: no change → skip; content unchanged but metadata drifted → NO-LLM reassemble reusing the distilled layer verbatim; content changed → incremental distillation of only the dirty/new topics. |
+| [GraphDistiller.ts](src/graph/GraphDistiller.ts) | The LLM work: categorize topics, extract knowledge units per topic, compute typed edges. `distillGraphIncremental` reuses clean topics' units from the baseline, re-distills only dirty/new topics (4-concurrency fan-out), recomputes categories via a delta call, and recomputes edges in full over the final unit set. Live progress via `GraphProgressReporter`. |
+| [GraphSchema.ts](src/graph/GraphSchema.ts) | The `KnowledgeGraph` type plus `assembleGraph()`, which runs `normalizeSymmetricEdges()` (collapse the symmetric `related-to` / `contradicts` types to one edge per unordered pair, keeping the higher-confidence endpoint) and `dropSubsumedRelatedTo()` (drop a generic `related-to` when a more specific typed edge already links the pair) so every emitted `graph.json` is already clean. |
+| [GraphArtifactStore.ts](src/graph/GraphArtifactStore.ts) | Atomic (tmp + rename) read/write of `<kbRoot>/.jolli/graph/graph.json`. **Folder-local and regenerable — never written to the orphan branch**, like the search index. The persisted fingerprints are the baseline for the next incremental build. |
+| [GraphExport.ts](src/graph/GraphExport.ts) | `buildStandaloneHtml()` inlines the viz assets + `graph.json` into one self-contained HTML file. Backs `jolli graph --export`. |
+| [assets/](src/graph/assets/) | The viz runtime (vendored `panzoom` / `elk` / `marked` + app scripts `data` / `state` / `edges` / `camera` / `drag` / `views` / `panel` / `main`). `edges.js` paints **dual edge layers** — a front layer for intra-topic edges and a back layer (behind the board) for cross-topic/category edges so opaque boxes occlude them. `camera.js`'s `focusUnit()` is the **unit-focus camera**: zoom-in-only toward the clicked unit's own center, pan minimally, and reveal as many related neighbors as fit without lowering zoom. |
+
+`GraphCommand.ts` ([src/commands/GraphCommand.ts](src/commands/GraphCommand.ts)) is export-only — it reads the existing `graph.json` and writes HTML; it does **not** trigger a build (run `jolli compile` for that). The VS Code extension renders the same assets in a webview ([KnowledgeGraphPanel.ts](../vscode/src/views/KnowledgeGraphPanel.ts)).
+
+## Usage Telemetry & Trace Correlation
+
+`jolli telemetry` ([TelemetryCommand.ts](src/commands/TelemetryCommand.ts): `status` (default) / `on` / `off` / `inspect`) is the user-facing surface for **anonymous, content-free, opt-out** usage telemetry. The shared engine lives in `cli/src/core/Telemetry*.ts` and is bundled into both the VS Code extension ([TelemetryActivation.ts](../vscode/src/TelemetryActivation.ts)) and ported to Kotlin for IntelliJ:
+
+| Module | Purpose |
+|--------|---------|
+| [TelemetryEvents.ts](src/core/TelemetryEvents.ts) | The append-only event-name registry (source of truth for the generated [TELEMETRY.md](../TELEMETRY.md) — regenerate with `npm run gen:telemetry-doc`). |
+| [TelemetryBuffer.ts](src/core/TelemetryBuffer.ts) | The `TelemetryEnvelope` shape (schemaVersion, eventName, surface, surfaceVersion, anonymous `installId`, os/arch/runtime, env, `accountId: null`, scrubbed `properties`) and the capped NDJSON ring buffer at `<projectDir>/.jolli/jollimemory/telemetry-queue.ndjson` (500 events / 1 MB). |
+| [TelemetryConsent.ts](src/core/TelemetryConsent.ts) | Priority-ordered consent resolution: `DO_NOT_TRACK` → platform setting (VS Code `telemetry.telemetryLevel`, IntelliJ data-sharing) → config `telemetry: "on" \| "off"` → default on. |
+| [Telemetry.ts](src/core/Telemetry.ts) | `scrubProperties()` — buckets counts (`"1-5"` / `"6-20"` / …), redacts paths/URLs/emails/secrets, drops `ALWAYS_DROP_KEYS`, bounds depth/length. `accountId` is **always null from the client**; the backend attributes events server-side from the `Bearer` key when present. |
+| [TelemetryFlusher.ts](src/core/TelemetryFlusher.ts) | Fire-and-forget `POST <origin>/api/telemetry/events` in batches of ≤100; non-2xx / network errors leave events buffered for the next flush. |
+
+**Anonymity**: `installId` is a `crypto.randomUUID()` minted once into `~/.jolli/jollimemory/config.json` (race-free via an atomic sentinel file), never derived from hostname / account / email. All three surfaces share that one id; the `surface` field distinguishes which client sent each event.
+
+**Trace correlation** ([TraceContext.ts](src/core/TraceContext.ts)) is a separate, **purely internal** concern: an ambient `<traceId>-<spanId>` carried on the private `x-jolli-trace` header of every outbound Jolli request and stamped into log lines. It propagates in-process via `AsyncLocalStorage` (`runWithTrace`), across the hook→worker handoff via the queue entry's `op.traceId`, and across spawns via the `JOLLI_TRACE_ID` env var. Kept in lockstep with the backend and the IntelliJ Kotlin port.
 
 ## Memory Bank Cloud Sync
 
