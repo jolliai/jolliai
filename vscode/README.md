@@ -129,7 +129,7 @@ Click **Share in Jolli** to publish the summary to your team's Jolli Space kno
 
 Plans and notes (both Markdown files and text snippets) are each uploaded as separate articles first, so their URLs appear in the summary. The summary itself is published last. 
 
-Requires a Jolli API Key configured via Settings (or auto-filled by **Sign In to Jolli** from the Status tab toolbar). Please contact support@jolli.ai with your name and email address.
+Requires a Jolli API Key configured via Settings (or auto-filled by **Sign In to Jolli** from the Status tab toolbar).
 
 ### Local copies of memories
 
@@ -195,6 +195,8 @@ Tab toolbar actions (when the Memory Bank tab is active):
 | **Build Knowledge Wiki** | Compile every repo in the Memory Bank into a topic-organized knowledge wiki (see below). |
 
 **Knowledge wiki** — **Build Knowledge Wiki** gathers the memories scattered across your commits and folds work on the same theme into per-topic pages, so a feature touched by ten commits reads as one evolving page instead of ten disconnected entries. A browsable `_wiki/` folder is written into your Memory Bank, and the same topic pages back the MCP server's search and decision-timeline tools. You rarely need to click it: after each commit the extension incrementally folds new memories into the wiki in the background; the button is for an immediate, repo-wide rebuild. Needs an API key (same as summary generation).
+
+**Knowledge graph** — each repo row in the Memory Bank tree has a **View knowledge graph** button (`$(type-hierarchy)`) that opens an interactive map of that wiki: categories, the knowledge units inside each (decisions, mechanisms, fixes), and the typed links between them (`extends`, `caused-by`, `supersedes`, `contradicts`, `related-to`). Click a unit to zoom in and reveal its related neighbors. The graph rebuilds incrementally in the background after each commit — if a repo doesn't have one yet, build the wiki first. The same visualization can be exported to a shareable HTML file from the CLI with `jolli graph`.
 
 **Per-memory context menu** (right-click any memory file in the tree):
 
@@ -372,7 +374,7 @@ Every entry on the `jollimemory/summaries/v3` orphan branch — and its mirror i
 
 Separately from your memory content, Jolli Memory collects **anonymous, content-free usage telemetry** to understand which features are used and where things break. It is **on by default** and you'll see a one-time notice on first run with **Learn more** and **Turn off** buttons.
 
-- **What is sent** — event names (e.g. `app_installed`, `summary_generated`, `sync_completed`), the surface and version (`vscode` + version), OS / arch / runtime version, a random `installId` (a UUID generated on this machine), and coarse, bucketed counts. Nothing else.
+- **What is sent** — event names (e.g. `app_installed`, `ingest_completed`, `sync_completed`), the surface and version (`vscode` + version), OS / arch / runtime version, a random `installId` (a UUID generated on this machine), and coarse, bucketed counts. Nothing else.
 - **What is never sent** — your code, file paths, commit messages, diffs, transcripts, memory/summary content, repo names, branch names, API keys, or any account identifier. Property values are scrubbed before they leave your machine, and the payload carries no account ID.
 
 **Turn it off (any one of these):**
