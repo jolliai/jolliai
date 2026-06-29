@@ -1835,6 +1835,184 @@ describe("PrCommentService", () => {
 				expect.stringContaining("Cannot determine the current branch"),
 			);
 		});
+
+		// ── Non-fast-forward push → force-push confirmation (mirrors Push Branch) ──
+		//
+		// When the branch was pushed and its local history was later rewritten
+		// (rebase / amend / squash / reset), the normal `git push -u origin HEAD`
+		// is rejected as non-fast-forward. Create PR mirrors the sidebar Push
+		// Branch flow: confirm via a modal, then retry with --force-with-lease.
+
+		/** A git stderr that matches `isNonFastForwardError`. */
+		const NON_FAST_FORWARD_ERROR =
+			" ! [rejected]          HEAD -> feature/branch (non-fast-forward)\n" +
+			"error: failed to push some refs to 'origin'\n" +
+			"hint: Updates were rejected because the tip of your current branch is behind";
+		const FORCE_PUSH_LABEL = "Force Push (--force-with-lease)";
+
+		it("non-fast-forward push + user confirms → force-pushes with --force-with-lease and continues creating the PR", async () => {
+			const prUrl = "https://github.com/org/repo/pull/88";
+			let normalPushCalled = false;
+			let forcePushCalled = false;
+			let prCreateCalled = false;
+			setupExecFile(
+				buildRouter({
+					"git:push:-u": () => {
+						normalPushCalled = true;
+						throw new Error(NON_FAST_FORWARD_ERROR);
+					},
+					"git:push:--force-with-lease": () => {
+						forcePushCalled = true;
+						return { stdout: "" };
+					},
+					"gh:pr:create": () => {
+						prCreateCalled = true;
+						return { stdout: `${prUrl}\n` };
+					},
+					"git:rev-list": () => ({ stdout: "1\n" }),
+					"git:rev-parse": () => ({ stdout: "feature/branch\n" }),
+					"gh:--version": () => ({ stdout: "gh 2.40.0\n" }),
+					"gh:auth": () => ({ stdout: "ok\n" }),
+					"gh:pr:list": () => ({
+						stdout: JSON.stringify([
+							{
+								number: 88,
+								url: prUrl,
+								title: "Rebased PR",
+								body: "",
+								state: "OPEN",
+							},
+						]),
+					}),
+				}),
+			);
+			showWarningMessage.mockResolvedValue(FORCE_PUSH_LABEL);
+			showInformationMessage.mockResolvedValue(undefined);
+
+			await handleCreatePr("Rebased PR", "PR body", CWD, postMessage);
+
+			expect(normalPushCalled).toBe(true);
+			// The modal must be a force-push confirmation, shown modally.
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Force push will overwrite"),
+				expect.objectContaining({ modal: true }),
+				FORCE_PUSH_LABEL,
+			);
+			expect(forcePushCalled).toBe(true);
+			expect(prCreateCalled).toBe(true);
+			expect(postMessage).toHaveBeenCalledWith({ command: "prCreating" });
+			expect(postMessage).not.toHaveBeenCalledWith({
+				command: "prCreateFailed",
+			});
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ command: "prStatus", status: "ready" }),
+			);
+		});
+
+		it("non-fast-forward push + user cancels → does not force-push, does not create the PR, posts prCreateFailed", async () => {
+			let forcePushCalled = false;
+			let prCreateCalled = false;
+			setupExecFile(
+				buildRouter({
+					"git:push:-u": () => {
+						throw new Error(NON_FAST_FORWARD_ERROR);
+					},
+					"git:push:--force-with-lease": () => {
+						forcePushCalled = true;
+						return { stdout: "" };
+					},
+					"gh:pr:create": () => {
+						prCreateCalled = true;
+						return { stdout: "https://example/0\n" };
+					},
+					"git:rev-parse": () => ({ stdout: "feature/branch\n" }),
+				}),
+			);
+			// User dismisses the modal (no button clicked).
+			showWarningMessage.mockResolvedValue(undefined);
+
+			await handleCreatePr("T", "B", CWD, postMessage);
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("rewrite remote history"),
+				expect.objectContaining({ modal: true }),
+				FORCE_PUSH_LABEL,
+			);
+			expect(forcePushCalled).toBe(false);
+			expect(prCreateCalled).toBe(false);
+			expect(postMessage).toHaveBeenCalledWith({ command: "prCreating" });
+			expect(postMessage).toHaveBeenCalledWith({ command: "prCreateFailed" });
+			// Symmetric with the confirm test: the PR-ready status must never
+			// leak through on a cancelled create.
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ command: "prStatus", status: "ready" }),
+			);
+			// A cancel is not an error — no error toast.
+			expect(showErrorMessage).not.toHaveBeenCalled();
+		});
+
+		it("non-fast-forward push + confirm, but force-push itself rejected (lease stale) → no PR, prCreateFailed + error toast", async () => {
+			// --force-with-lease is exactly the guard that fires when the remote
+			// moved in a way this clone hasn't observed (e.g. a collaborator
+			// pushed). When it rejects, the throw propagates to the outer catch:
+			// no PR is created, and the user sees the real git error.
+			let prCreateCalled = false;
+			setupExecFile(
+				buildRouter({
+					"git:push:-u": () => {
+						throw new Error(NON_FAST_FORWARD_ERROR);
+					},
+					"git:push:--force-with-lease": () => {
+						throw new Error(
+							"! [rejected] HEAD -> feature/branch (stale info)\n" +
+								"error: failed to push some refs — remote ref moved",
+						);
+					},
+					"gh:pr:create": () => {
+						prCreateCalled = true;
+						return { stdout: "https://example/0\n" };
+					},
+					"git:rev-parse": () => ({ stdout: "feature/branch\n" }),
+				}),
+			);
+			showWarningMessage.mockResolvedValue(FORCE_PUSH_LABEL);
+
+			await handleCreatePr("T", "B", CWD, postMessage);
+
+			expect(prCreateCalled).toBe(false);
+			expect(postMessage).toHaveBeenCalledWith({ command: "prCreating" });
+			expect(postMessage).toHaveBeenCalledWith({ command: "prCreateFailed" });
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining("stale info"),
+			);
+		});
+
+		it("non-NFF push error (auth/network) → no force-push modal, original prCreateFailed error path", async () => {
+			let forcePushCalled = false;
+			setupExecFile(
+				buildRouter({
+					"git:push:-u": () => {
+						throw new Error("fatal: Authentication failed for 'origin'");
+					},
+					"git:push:--force-with-lease": () => {
+						forcePushCalled = true;
+						return { stdout: "" };
+					},
+					"git:rev-parse": () => ({ stdout: "feature/branch\n" }),
+				}),
+			);
+
+			await handleCreatePr("T", "B", CWD, postMessage);
+
+			// No modal for a non-fast-forward-unrelated failure.
+			expect(showWarningMessage).not.toHaveBeenCalled();
+			expect(forcePushCalled).toBe(false);
+			expect(postMessage).toHaveBeenCalledWith({ command: "prCreating" });
+			expect(postMessage).toHaveBeenCalledWith({ command: "prCreateFailed" });
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Authentication failed"),
+			);
+		});
 	});
 
 	// ─── handlePrepareUpdatePr ──────────────────────────────────────────────

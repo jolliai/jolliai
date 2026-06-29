@@ -20,6 +20,7 @@ import * as vscode from "vscode";
 import { execFileAsyncHidden } from "../../../cli/src/util/Subprocess.js";
 import { MARKER_END, MARKER_START, wrapWithMarkers } from "../../../cli/src/core/PrDescription.js";
 import { detachedHeadMessage } from "./CreatePrBranchClassifier.js";
+import { confirmForcePush, isNonFastForwardError } from "../util/ForcePushPrompt.js";
 import { log } from "../util/Logger.js";
 
 const TAG = "PrSection";
@@ -224,6 +225,18 @@ async function getCurrentBranchSafe(cwd: string): Promise<string> {
 /** Pushes the current branch to origin (no-op if already pushed). */
 async function pushBranch(cwd: string): Promise<void> {
 	await execGit(["push", "-u", "origin", "HEAD"], cwd);
+}
+
+/**
+ * Force-pushes the current branch with `--force-with-lease`. Only invoked
+ * after the user confirms the shared modal warning, when a normal push was
+ * rejected as non-fast-forward. `--force-with-lease` (never bare `--force`)
+ * refuses when the remote moved in a way the local clone hasn't observed,
+ * giving the collaborator-pushed-too case a chance to be caught before the
+ * overwrite. Mirrors `PushCommand`'s `bridge.forcePush()`.
+ */
+async function forcePushBranch(cwd: string): Promise<void> {
+	await execGit(["push", "--force-with-lease", "origin", "HEAD"], cwd);
 }
 
 interface PrInfo {
@@ -644,9 +657,30 @@ export async function handleCreatePr(
 
 		postMessage({ command: "prCreating" });
 
-		// Ensure branch is pushed
+		// Ensure branch is pushed. A normal push is rejected as non-fast-forward
+		// when this branch was already pushed and its local history was then
+		// rewritten (rebase / amend / squash / reset). Mirror Push Branch:
+		// confirm via a modal, then retry with --force-with-lease. Any other
+		// push error (auth, network) propagates to the outer catch unchanged.
 		log.info(TAG, "Pushing branch to origin...");
-		await pushBranch(cwd);
+		try {
+			await pushBranch(cwd);
+		} catch (pushErr: unknown) {
+			if (!isNonFastForwardError(pushErr)) {
+				throw pushErr;
+			}
+			log.warn(
+				TAG,
+				"Create PR push rejected (non-fast-forward) — offering force push",
+			);
+			const confirmed = await confirmForcePush();
+			if (!confirmed) {
+				log.info(TAG, "Create PR force-push declined — aborting");
+				postMessage({ command: "prCreateFailed" });
+				return;
+			}
+			await forcePushBranch(cwd);
+		}
 
 		// Create the PR
 		log.info(TAG, `Creating PR: "${title}"`);
