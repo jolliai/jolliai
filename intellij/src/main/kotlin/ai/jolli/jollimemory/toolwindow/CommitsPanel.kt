@@ -1058,12 +1058,12 @@ class CommitsPanel(
         // Hover actions (hidden until hover): Open conversation · Resume (only if local session exists).
         val openBtn = convoActionIcon(JolliMemoryIcons.Eye, "Open conversation") { _ -> openCommittedConversation(c) }
         val fileExists = !c.transcriptPath.isNullOrBlank() && File(c.transcriptPath).exists()
-        val canResume = c.source == "claude" && fileExists
+        val canResume = TerminalUtils.canResumeSource(c.source) && fileExists
         log.info("conversationRow: source=${c.source}, sessionId=${c.sessionId}, transcriptPath=${c.transcriptPath}, fileExists=$fileExists, canResume=$canResume")
         val actions = if (canResume) {
             val continueBtn = convoActionIcon(AllIcons.Actions.Execute, "Resume session in terminal") { _ ->
                 log.info("continueBtn clicked: sessionId=${c.sessionId}, commitHash=${commit.hash}")
-                resumeInTerminal(c.sessionId)
+                resumeInTerminal(c.source, c.sessionId)
             }
             listOf(openBtn, continueBtn)
         } else {
@@ -1528,12 +1528,12 @@ class CommitsPanel(
 
     // ─── Resume session ──────────────────────────────────────────────────────
 
-    /** Opens a new terminal tab and runs `claude --resume <sessionId>`. */
-    private fun resumeInTerminal(sessionId: String) {
+    /** Opens a new terminal tab and runs the source-appropriate resume command. */
+    private fun resumeInTerminal(source: String, sessionId: String) {
         val cwd = service.mainRepoRoot ?: project.basePath
-        log.info("resumeInTerminal: sessionId=$sessionId, cwd=$cwd")
+        log.info("resumeInTerminal: source=$source, sessionId=$sessionId, cwd=$cwd")
         if (cwd == null) return
-        TerminalUtils.resumeClaudeSession(project, sessionId, cwd)
+        TerminalUtils.resumeSession(project, source, sessionId, cwd)
     }
 
     // ─── Copy recall prompt ──────────────────────────────────────────────────
