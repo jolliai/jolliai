@@ -112,6 +112,10 @@ import type {
 	ReferenceInfo,
 } from "./Types.js";
 import { mergeCommitMessages } from "./util/CommitMessageUtils.js";
+import {
+	type ForcePushSafety,
+	inspectForcePushSafety,
+} from "./util/ForcePushSafety.js";
 import { log } from "./util/Logger.js";
 import { loadGlobalConfig } from "./util/WorkspaceUtils.js";
 
@@ -1734,6 +1738,20 @@ export class JolliMemoryBridge {
 	/** Force-pushes the current branch. */
 	async forcePush(): Promise<void> {
 		await this.execPush(["--force-with-lease"]);
+	}
+
+	/**
+	 * Measures how the current branch diverges from its remote after a
+	 * non-fast-forward rejection, so the push UI can tell a real history rewrite
+	 * apart from a branch that is merely behind. Returns null when inconclusive.
+	 * See {@link inspectForcePushSafety}.
+	 */
+	async inspectForcePushSafety(): Promise<ForcePushSafety | null> {
+		const branch = await this.getCurrentBranch();
+		return inspectForcePushSafety(
+			(args) => execGit([...args], this.cwd),
+			branch,
+		);
 	}
 
 	// ── Summary access ────────────────────────────────────────────────────

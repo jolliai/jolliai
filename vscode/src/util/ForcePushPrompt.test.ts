@@ -11,8 +11,28 @@ vi.mock("vscode", () => ({
 import {
 	FORCE_PUSH_CONFIRM_LABEL,
 	confirmForcePush,
+	gateForcePush,
 	isNonFastForwardError,
 } from "./ForcePushPrompt.js";
+import { inspectForcePushSafety } from "./ForcePushSafety.js";
+
+/**
+ * Builds a fake GitRunner from a map of `git <args joined by space>` → stdout.
+ * `rev-list --count A..B` lookups read the joined-args key. Unknown commands
+ * (e.g. `fetch origin <branch>`) resolve to "" so the fetch is a no-op success;
+ * a key mapped to the THROW sentinel rejects, exercising the catch path.
+ */
+const THROW = Symbol("throw");
+function fakeGit(table: Record<string, string | typeof THROW>) {
+	return (args: ReadonlyArray<string>): Promise<string> => {
+		const key = args.join(" ");
+		const v = table[key];
+		if (v === THROW) {
+			return Promise.reject(new Error(`git failed: ${key}`));
+		}
+		return Promise.resolve(v ?? "");
+	};
+}
 
 describe("ForcePushPrompt", () => {
 	beforeEach(() => {
@@ -95,6 +115,156 @@ describe("ForcePushPrompt", () => {
 			expect(leadIdx).toBeLessThan(detailIdx);
 			expect(detailIdx).toBeLessThan(reasonIdx);
 			expect(reasonIdx).toBeLessThan(collabIdx);
+		});
+	});
+
+	describe("inspectForcePushSafety", () => {
+		it("returns null for a detached HEAD / empty branch (no remote ref to compare)", async () => {
+			const git = fakeGit({});
+			expect(await inspectForcePushSafety(git, "HEAD")).toBeNull();
+			expect(await inspectForcePushSafety(git, "")).toBeNull();
+		});
+
+		it("flags behind-only when the remote is strictly ahead (rewrite NOT detected)", async () => {
+			const git = fakeGit({
+				"rev-list --count HEAD..origin/feature": "3",
+				"rev-list --count origin/feature..HEAD": "0",
+			});
+			expect(await inspectForcePushSafety(git, "feature")).toEqual({
+				branch: "feature",
+				remoteOnly: 3,
+				localOnly: 0,
+				behindOnly: true,
+			});
+		});
+
+		it("reports a true divergence (both sides have unique commits) without flagging behind-only", async () => {
+			const git = fakeGit({
+				"rev-list --count HEAD..origin/feature": "2",
+				"rev-list --count origin/feature..HEAD": "5",
+			});
+			expect(await inspectForcePushSafety(git, "feature")).toEqual({
+				branch: "feature",
+				remoteOnly: 2,
+				localOnly: 5,
+				behindOnly: false,
+			});
+		});
+
+		it("reports no remote-only commits when local is the superset (pure rewrite)", async () => {
+			const git = fakeGit({
+				"rev-list --count HEAD..origin/feature": "0",
+				"rev-list --count origin/feature..HEAD": "4",
+			});
+			const safety = await inspectForcePushSafety(git, "feature");
+			expect(safety).toMatchObject({ remoteOnly: 0, behindOnly: false });
+		});
+
+		it("returns null when fetch fails (inconclusive → caller keeps prior behavior)", async () => {
+			const git = fakeGit({ "fetch origin feature": THROW });
+			expect(await inspectForcePushSafety(git, "feature")).toBeNull();
+		});
+
+		it("returns null when a rev-list count is non-numeric", async () => {
+			const git = fakeGit({
+				"rev-list --count HEAD..origin/feature": "not-a-number",
+				"rev-list --count origin/feature..HEAD": "0",
+			});
+			expect(await inspectForcePushSafety(git, "feature")).toBeNull();
+		});
+	});
+
+	describe("gateForcePush", () => {
+		it("blocks (no force-push offered) when the branch is merely behind", async () => {
+			const outcome = await gateForcePush({
+				inspect: async () => ({
+					branch: "feature",
+					remoteOnly: 2,
+					localOnly: 0,
+					behindOnly: true,
+				}),
+			});
+			expect(outcome).toBe("blocked");
+			const [message, options] = showWarningMessage.mock.calls[0];
+			expect(message).toContain('Remote branch "feature" has 2 commits');
+			expect(message).toContain("simply behind");
+			expect(options).toEqual({ modal: true });
+			// The force-push confirm button must NOT be offered in the blocked path:
+			// the call has exactly (message, {modal:true}) and no label argument.
+			expect(showWarningMessage.mock.calls[0]).toHaveLength(2);
+		});
+
+		it("appends a lost-commits warning line to the confirm modal on a true divergence", async () => {
+			showWarningMessage.mockResolvedValue(FORCE_PUSH_CONFIRM_LABEL);
+			const outcome = await gateForcePush({
+				inspect: async () => ({
+					branch: "feature",
+					remoteOnly: 2,
+					localOnly: 5,
+					behindOnly: false,
+				}),
+				detailLines: ["Commit: abc123 do a thing"],
+			});
+			expect(outcome).toBe("confirmed");
+			const message = showWarningMessage.mock.calls[0][0] as string;
+			expect(message).toContain("Commit: abc123 do a thing");
+			expect(message).toContain(
+				"this will permanently delete 2 commits that exist only on the remote",
+			);
+		});
+
+		it("falls back to the plain confirm modal when divergence is inconclusive (null)", async () => {
+			showWarningMessage.mockResolvedValue(undefined);
+			const outcome = await gateForcePush({ inspect: async () => null });
+			expect(outcome).toBe("declined");
+			const message = showWarningMessage.mock.calls[0][0] as string;
+			// No lost-commits line when the probe is inconclusive.
+			expect(message).not.toContain("permanently delete");
+		});
+
+		it("uses singular wording when exactly one commit would be lost", async () => {
+			showWarningMessage.mockResolvedValue(FORCE_PUSH_CONFIRM_LABEL);
+			// behindOnly path: blocked message singular.
+			const blocked = await gateForcePush({
+				inspect: async () => ({
+					branch: "feature",
+					remoteOnly: 1,
+					localOnly: 0,
+					behindOnly: true,
+				}),
+			});
+			expect(blocked).toBe("blocked");
+			expect(showWarningMessage.mock.calls[0][0]).toContain(
+				'has 1 commit you don\'t have',
+			);
+			showWarningMessage.mockClear();
+			// diverged path: lost-commits line singular.
+			await gateForcePush({
+				inspect: async () => ({
+					branch: "feature",
+					remoteOnly: 1,
+					localOnly: 2,
+					behindOnly: false,
+				}),
+			});
+			expect(showWarningMessage.mock.calls[0][0]).toContain(
+				"delete 1 commit that exist only on the remote",
+			);
+		});
+
+		it("returns confirmed when no remote-only commits would be lost", async () => {
+			showWarningMessage.mockResolvedValue(FORCE_PUSH_CONFIRM_LABEL);
+			const outcome = await gateForcePush({
+				inspect: async () => ({
+					branch: "feature",
+					remoteOnly: 0,
+					localOnly: 4,
+					behindOnly: false,
+				}),
+			});
+			expect(outcome).toBe("confirmed");
+			const message = showWarningMessage.mock.calls[0][0] as string;
+			expect(message).not.toContain("permanently delete");
 		});
 	});
 });

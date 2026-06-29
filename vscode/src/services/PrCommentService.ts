@@ -20,7 +20,8 @@ import * as vscode from "vscode";
 import { execFileAsyncHidden } from "../../../cli/src/util/Subprocess.js";
 import { MARKER_END, MARKER_START, wrapWithMarkers } from "../../../cli/src/core/PrDescription.js";
 import { detachedHeadMessage } from "./CreatePrBranchClassifier.js";
-import { confirmForcePush, isNonFastForwardError } from "../util/ForcePushPrompt.js";
+import { gateForcePush, isNonFastForwardError } from "../util/ForcePushPrompt.js";
+import { inspectForcePushSafety } from "../util/ForcePushSafety.js";
 import { log } from "../util/Logger.js";
 
 const TAG = "PrSection";
@@ -228,12 +229,14 @@ async function pushBranch(cwd: string): Promise<void> {
 }
 
 /**
- * Force-pushes the current branch with `--force-with-lease`. Only invoked
- * after the user confirms the shared modal warning, when a normal push was
- * rejected as non-fast-forward. `--force-with-lease` (never bare `--force`)
- * refuses when the remote moved in a way the local clone hasn't observed,
- * giving the collaborator-pushed-too case a chance to be caught before the
- * overwrite. Mirrors `PushCommand`'s `bridge.forcePush()`.
+ * Force-pushes the current branch with `--force-with-lease`. Only invoked after
+ * the divergence gate (`gateForcePush`) cleared it and the user confirmed the
+ * shared modal, when a normal push was rejected as non-fast-forward. The gate is
+ * the primary guard against overwriting collaborator commits — it already
+ * fetched and counted what would be lost. `--force-with-lease` (never bare
+ * `--force`) is the secondary backstop: it still refuses if the remote moves
+ * again between the gate's fetch and this push. Mirrors `PushCommand`'s
+ * `bridge.forcePush()`.
  */
 async function forcePushBranch(cwd: string): Promise<void> {
 	await execGit(["push", "--force-with-lease", "origin", "HEAD"], cwd);
@@ -658,10 +661,12 @@ export async function handleCreatePr(
 		postMessage({ command: "prCreating" });
 
 		// Ensure branch is pushed. A normal push is rejected as non-fast-forward
-		// when this branch was already pushed and its local history was then
-		// rewritten (rebase / amend / squash / reset). Mirror Push Branch:
-		// confirm via a modal, then retry with --force-with-lease. Any other
-		// push error (auth, network) propagates to the outer catch unchanged.
+		// both when this branch's local history was rewritten (rebase / amend /
+		// squash / reset) AND when it is simply behind the remote. Mirror Push
+		// Branch: gate on the actual divergence before offering force-push, so a
+		// branch that is merely behind a collaborator's commits is sent to rebase
+		// rather than overwritten. Any other push error (auth, network)
+		// propagates to the outer catch unchanged.
 		log.info(TAG, "Pushing branch to origin...");
 		try {
 			await pushBranch(cwd);
@@ -671,11 +676,19 @@ export async function handleCreatePr(
 			}
 			log.warn(
 				TAG,
-				"Create PR push rejected (non-fast-forward) — offering force push",
+				"Create PR push rejected (non-fast-forward) — checking divergence",
 			);
-			const confirmed = await confirmForcePush();
-			if (!confirmed) {
-				log.info(TAG, "Create PR force-push declined — aborting");
+			const outcome = await gateForcePush({
+				inspect: () =>
+					inspectForcePushSafety((args) => execGit([...args], cwd), currentBranch),
+			});
+			if (outcome !== "confirmed") {
+				log.info(
+					TAG,
+					outcome === "blocked"
+						? "Create PR push blocked — remote is ahead; rebase first"
+						: "Create PR force-push declined — aborting",
+				);
 				postMessage({ command: "prCreateFailed" });
 				return;
 			}

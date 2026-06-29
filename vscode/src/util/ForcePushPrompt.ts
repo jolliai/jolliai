@@ -17,6 +17,10 @@
  */
 
 import * as vscode from "vscode";
+// The divergence inspection lives in the vscode-free `ForcePushSafety` module so
+// non-UI callers (e.g. JolliMemoryBridge, tested under node) can import it
+// without pulling in `vscode`. The gate below only needs the result shape.
+import type { ForcePushSafety } from "./ForcePushSafety.js";
 
 /** Button label for the modal force-push confirmation. */
 export const FORCE_PUSH_CONFIRM_LABEL = "Force Push (--force-with-lease)";
@@ -27,8 +31,11 @@ const DEFAULT_FORCE_PUSH_REASON =
 
 /**
  * Recognizes git's non-fast-forward push rejection. A normal push emits this
- * when the local branch was rewritten after it was first pushed. Both push
- * entry points classify the same stderr identically through this helper.
+ * both when the local branch was rewritten after it was first pushed (the
+ * force-push case) AND when the branch is merely behind a collaborator's new
+ * remote commits (the rebase case) — git uses the same stderr for both, so this
+ * matcher alone cannot tell them apart. Callers must run `gateForcePush` after
+ * a match to measure the actual divergence before offering a force-push.
  */
 export function isNonFastForwardError(err: unknown): boolean {
 	const message = (
@@ -40,6 +47,65 @@ export function isNonFastForwardError(err: unknown): boolean {
 		message.includes("[rejected]") ||
 		message.includes("tip of your current branch is behind")
 	);
+}
+
+/** Modal warning shown when the branch is merely behind the remote (no force-push offered). */
+export function remoteAheadMessage(branch: string, remoteOnly: number): string {
+	const commits = remoteOnly === 1 ? "commit" : "commits";
+	return [
+		`Remote branch "${branch}" has ${remoteOnly} ${commits} you don't have locally,`,
+		"and your branch has no commits the remote is missing.",
+		"",
+		"This is not a history rewrite — your branch is simply behind. Pull or",
+		"rebase to integrate the remote commits, then push again. Force-pushing",
+		`here would permanently delete those ${remoteOnly} remote ${commits}.`,
+	].join("\n");
+}
+
+/** Detail line appended to the force-push modal when remote-only commits would be lost. */
+export function lostRemoteCommitsLine(remoteOnly: number): string {
+	const commits = remoteOnly === 1 ? "commit" : "commits";
+	return `Warning: this will permanently delete ${remoteOnly} ${commits} that exist only on the remote.`;
+}
+
+/** Result of the post-rejection force-push gate. */
+export type ForcePushOutcome = "confirmed" | "declined" | "blocked";
+
+/**
+ * Post-rejection gate shared by both push entry points. Inspects the divergence,
+ * then either:
+ * - blocks (returns `"blocked"` after a modal warning) when the branch is merely
+ *   behind the remote — force-push is never offered, the user must rebase first;
+ * - shows the shared force-push modal (annotated with the count of remote-only
+ *   commits that will be lost) and returns the user's choice (`"confirmed"` /
+ *   `"declined"`).
+ *
+ * When the divergence can't be measured (inconclusive probe), it falls back to
+ * the plain confirm modal so a legitimate rewrite is never blocked by a transient
+ * git/network failure.
+ */
+export async function gateForcePush(opts: {
+	inspect: () => Promise<ForcePushSafety | null>;
+	detailLines?: ReadonlyArray<string>;
+	reason?: string;
+}): Promise<ForcePushOutcome> {
+	const safety = await opts.inspect();
+	if (safety?.behindOnly) {
+		await vscode.window.showWarningMessage(
+			remoteAheadMessage(safety.branch, safety.remoteOnly),
+			{ modal: true },
+		);
+		return "blocked";
+	}
+	const lostLine =
+		safety && safety.remoteOnly > 0
+			? [lostRemoteCommitsLine(safety.remoteOnly)]
+			: [];
+	const confirmed = await confirmForcePush({
+		detailLines: [...(opts.detailLines ?? []), ...lostLine],
+		reason: opts.reason,
+	});
+	return confirmed ? "confirmed" : "declined";
 }
 
 /**

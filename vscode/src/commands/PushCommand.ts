@@ -26,10 +26,7 @@ import type { CommitsStore } from "../stores/CommitsStore.js";
 import type { FilesStore } from "../stores/FilesStore.js";
 import type { StatusStore } from "../stores/StatusStore.js";
 import type { BranchCommit } from "../Types.js";
-import {
-	confirmForcePush,
-	isNonFastForwardError,
-} from "../util/ForcePushPrompt.js";
+import { gateForcePush, isNonFastForwardError } from "../util/ForcePushPrompt.js";
 import { log } from "../util/Logger.js";
 import type { StatusBarManager } from "../util/StatusBarManager.js";
 
@@ -64,16 +61,21 @@ export class PushCommand {
 
 		try {
 			if (headCommit.isPushed) {
+				// HEAD is already on remote, so any push here rewrites remote
+				// history. Gate on the actual divergence first — this path used to
+				// offer force-push unconditionally, which would clobber a
+				// collaborator's commits when the branch was merely behind.
 				log.info(
 					"push",
-					`HEAD already pushed (${commits.length} commit(s) on branch) — asking for force-push confirmation`,
+					`HEAD already pushed (${commits.length} commit(s) on branch) — checking divergence`,
 				);
-				const confirmed = await this.showForcePushWarning(
-					commits,
-					"HEAD is already on remote. Force push will rewrite remote branch history.",
-				);
-				if (!confirmed) {
-					log.info("push", "Force-push confirmation cancelled");
+				if (
+					!(await this.runForcePushGate(
+						commits,
+						"HEAD is already on remote. Force push will rewrite remote branch history.",
+						"Force-push confirmation cancelled",
+					))
+				) {
 					return;
 				}
 				await this.bridge.forcePush();
@@ -87,14 +89,15 @@ export class PushCommand {
 					}
 					log.warn(
 						"push",
-						"Normal push rejected (non-fast-forward) — offering force push",
+						"Normal push rejected (non-fast-forward) — checking divergence",
 					);
-					const confirmed = await this.showForcePushWarning(
-						commits,
-						"Remote branch has diverged. Force push will overwrite remote history.",
-					);
-					if (!confirmed) {
-						log.info("push", "Force-push fallback cancelled");
+					if (
+						!(await this.runForcePushGate(
+							commits,
+							"Remote branch has diverged. Force push will overwrite remote history.",
+							"Force-push fallback cancelled",
+						))
+					) {
 						return;
 					}
 					await this.bridge.forcePush();
@@ -115,25 +118,47 @@ export class PushCommand {
 	}
 
 	/**
-	 * Shows the shared modal force-push confirmation, adding the commit detail
-	 * line this flow has the context for: single-commit branches show
-	 * "Commit: <hash> <msg>"; multi-commit branches show
+	 * Builds the commit detail line this flow has the context for: single-commit
+	 * branches show "Commit: <hash> <msg>"; multi-commit branches show
 	 * "HEAD (N commits): <hash> <msg>" so the user can see at a glance how many
-	 * commits the force-push will replace on the remote.
+	 * commits the force-push will replace on the remote. Shared by both the
+	 * already-pushed pre-warning and the non-fast-forward gate so the wording
+	 * can't drift between them.
 	 */
-	private async showForcePushWarning(
-		commits: ReadonlyArray<BranchCommit>,
-		reason: string,
-	): Promise<boolean> {
+	private headDetailLine(commits: ReadonlyArray<BranchCommit>): string {
 		const head = commits[0];
 		const headLabel =
 			commits.length === 1 ? "Commit" : `HEAD (${commits.length} commits)`;
-		return confirmForcePush({
-			detailLines: [
-				`${headLabel}: ${head.shortHash} ${head.message.substring(0, 80)}`,
-			],
+		return `${headLabel}: ${head.shortHash} ${head.message.substring(0, 80)}`;
+	}
+
+	/**
+	 * Runs the shared force-push gate (divergence check → block-or-confirm) with
+	 * this flow's commit detail line. Returns true only when the caller should go
+	 * ahead and force-push. Both push entry points — the "HEAD already pushed"
+	 * pre-warning and the non-fast-forward fallback — route through here so a
+	 * branch that is merely behind the remote is never force-pushed over a
+	 * collaborator's commits.
+	 */
+	private async runForcePushGate(
+		commits: ReadonlyArray<BranchCommit>,
+		reason: string,
+		declinedLog: string,
+	): Promise<boolean> {
+		const outcome = await gateForcePush({
+			inspect: () => this.bridge.inspectForcePushSafety(),
+			detailLines: [this.headDetailLine(commits)],
 			reason,
 		});
+		if (outcome === "blocked") {
+			log.info("push", "Push blocked — remote is ahead; rebase first");
+			return false;
+		}
+		if (outcome === "declined") {
+			log.info("push", declinedLog);
+			return false;
+		}
+		return true;
 	}
 
 	private async refreshAll(): Promise<void> {
