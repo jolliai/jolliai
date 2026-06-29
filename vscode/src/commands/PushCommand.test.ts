@@ -49,6 +49,11 @@ function makeDeps(commits = [makeCommit()]) {
 	const bridge = {
 		pushCurrentBranch: vi.fn().mockResolvedValue(undefined),
 		forcePush: vi.fn().mockResolvedValue(undefined),
+		// Default: divergence probe is inconclusive, so the gate falls back to
+		// the plain confirm modal — matching the pre-gate behavior the existing
+		// force-push tests assert. Tests exercising the behind-only block
+		// override this to return a behindOnly result.
+		inspectForcePushSafety: vi.fn().mockResolvedValue(null),
 		getStatus: vi.fn(async () => ({ enabled: true })),
 	};
 	const commitsStore = {
@@ -236,6 +241,36 @@ describe("PushCommand", () => {
 		);
 	});
 
+	it("blocks force-push of an already-pushed HEAD when the branch is merely behind the remote", async () => {
+		// Regression guard: the "HEAD already pushed" pre-warning path used to
+		// force-push unconditionally on confirm. It must now route through the
+		// divergence gate so a behind-only branch can't clobber collaborator commits.
+		const deps = makeDeps([makeCommit({ isPushed: true })]);
+		deps.bridge.inspectForcePushSafety.mockResolvedValueOnce({
+			branch: "feature",
+			remoteOnly: 2,
+			localOnly: 0,
+			behindOnly: true,
+		});
+		const command = new PushCommand(
+			deps.bridge as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
+			deps.statusBar as never,
+		);
+
+		await command.execute();
+
+		expect(showWarningMessage).toHaveBeenCalled();
+		expect(deps.bridge.forcePush).not.toHaveBeenCalled();
+		expect(showInformationMessage).not.toHaveBeenCalled();
+		expect(info).toHaveBeenCalledWith(
+			"push",
+			"Push blocked — remote is ahead; rebase first",
+		);
+	});
+
 	it("returns early when force-push fallback is cancelled after non-fast-forward rejection", async () => {
 		const deps = makeDeps();
 		deps.bridge.pushCurrentBranch.mockRejectedValueOnce(
@@ -255,6 +290,38 @@ describe("PushCommand", () => {
 		expect(deps.bridge.forcePush).not.toHaveBeenCalled();
 		expect(showInformationMessage).not.toHaveBeenCalled();
 		expect(info).toHaveBeenCalledWith("push", "Force-push fallback cancelled");
+	});
+
+	it("blocks force-push (sends user to rebase) when the branch is merely behind the remote", async () => {
+		const deps = makeDeps();
+		deps.bridge.pushCurrentBranch.mockRejectedValueOnce(
+			new Error("! [rejected] (fetch first)"),
+		);
+		// Remote is strictly ahead: this is not a rewrite, force-push would clobber.
+		deps.bridge.inspectForcePushSafety.mockResolvedValueOnce({
+			branch: "feature",
+			remoteOnly: 2,
+			localOnly: 0,
+			behindOnly: true,
+		});
+		const command = new PushCommand(
+			deps.bridge as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
+			deps.statusBar as never,
+		);
+
+		await command.execute();
+
+		// The behind-only modal is shown, but force-push is never invoked.
+		expect(showWarningMessage).toHaveBeenCalled();
+		expect(deps.bridge.forcePush).not.toHaveBeenCalled();
+		expect(showInformationMessage).not.toHaveBeenCalled();
+		expect(info).toHaveBeenCalledWith(
+			"push",
+			"Push blocked — remote is ahead; rebase first",
+		);
 	});
 
 	it("coerces non-Error thrown from push to string in error message", async () => {
