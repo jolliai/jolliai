@@ -26,10 +26,12 @@ import type { CommitsStore } from "../stores/CommitsStore.js";
 import type { FilesStore } from "../stores/FilesStore.js";
 import type { StatusStore } from "../stores/StatusStore.js";
 import type { BranchCommit } from "../Types.js";
+import {
+	confirmForcePush,
+	isNonFastForwardError,
+} from "../util/ForcePushPrompt.js";
 import { log } from "../util/Logger.js";
 import type { StatusBarManager } from "../util/StatusBarManager.js";
-
-const FORCE_PUSH_CONFIRM_LABEL = "Force Push (--force-with-lease)";
 
 export class PushCommand {
 	constructor(
@@ -80,7 +82,7 @@ export class PushCommand {
 				try {
 					await this.bridge.pushCurrentBranch();
 				} catch (err: unknown) {
-					if (!this.isNonFastForwardError(err)) {
+					if (!isNonFastForwardError(err)) {
 						throw err;
 					}
 					log.warn(
@@ -113,11 +115,11 @@ export class PushCommand {
 	}
 
 	/**
-	 * Shows a modal force-push confirmation dialog.
-	 *
-	 * Single-commit branches show "Commit: <hash> <msg>"; multi-commit branches
-	 * show "HEAD (N commits): <hash> <msg>" so the user can see at a glance how
-	 * many commits the force-push will replace on the remote.
+	 * Shows the shared modal force-push confirmation, adding the commit detail
+	 * line this flow has the context for: single-commit branches show
+	 * "Commit: <hash> <msg>"; multi-commit branches show
+	 * "HEAD (N commits): <hash> <msg>" so the user can see at a glance how many
+	 * commits the force-push will replace on the remote.
 	 */
 	private async showForcePushWarning(
 		commits: ReadonlyArray<BranchCommit>,
@@ -126,31 +128,12 @@ export class PushCommand {
 		const head = commits[0];
 		const headLabel =
 			commits.length === 1 ? "Commit" : `HEAD (${commits.length} commits)`;
-		const answer = await vscode.window.showWarningMessage(
-			[
-				"This operation may rewrite remote history.",
-				"",
+		return confirmForcePush({
+			detailLines: [
 				`${headLabel}: ${head.shortHash} ${head.message.substring(0, 80)}`,
-				"",
-				reason,
-				"This may affect collaborators on the same branch.",
-			].join("\n"),
-			{ modal: true },
-			FORCE_PUSH_CONFIRM_LABEL,
-		);
-		return answer === FORCE_PUSH_CONFIRM_LABEL;
-	}
-
-	private isNonFastForwardError(err: unknown): boolean {
-		const message = (
-			err instanceof Error ? err.message : String(err)
-		).toLowerCase();
-		return (
-			message.includes("non-fast-forward") ||
-			message.includes("fetch first") ||
-			message.includes("[rejected]") ||
-			message.includes("tip of your current branch is behind")
-		);
+			],
+			reason,
+		});
 	}
 
 	private async refreshAll(): Promise<void> {
