@@ -6,19 +6,22 @@ import ai.jolli.jollimemory.core.KBRepoDiscoverer
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.ui.popup.JBPopupFactory
 import com.intellij.ui.components.JBLabel
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
+import java.awt.Cursor
 import java.awt.Dimension
+import java.awt.event.MouseAdapter
+import java.awt.event.MouseEvent
 import javax.swing.BorderFactory
 import javax.swing.Box
 import javax.swing.BoxLayout
-import javax.swing.DefaultComboBoxModel
 import javax.swing.DefaultListCellRenderer
-import javax.swing.JComboBox
 import javax.swing.JLabel
 import javax.swing.JList
 import javax.swing.JPanel
+import javax.swing.SwingConstants
 import javax.swing.SwingUtilities
 
 /**
@@ -33,6 +36,11 @@ import javax.swing.SwingUtilities
  * live here moved to the view switch and the tool window title bar respectively;
  * this row is now just the repo/branch selectors. Selecting a foreign repo/branch
  * fires [onSelectionChanged] so the factory can toggle read-only mode.
+ *
+ * The pickers are flat label + chevron "crumbs" (mockup `.crumb` styling) backed by
+ * a popup list rather than `JComboBox`: the LaF combo paints its own (lighter) field
+ * + arrow-button background that can't be flattened to the header, so a label that
+ * inherits the header background is the only way to make them blend in.
  */
 class BreadcrumbHeaderPanel(
 	private val service: JolliMemoryService,
@@ -41,11 +49,20 @@ class BreadcrumbHeaderPanel(
 
 	enum class Mode { BRANCH, REPO_FILTER }
 
-	private val repoCombo = JComboBox<String>()
-	private val branchCombo = JComboBox<String>()
 	private val showingLabel = JBLabel("Showing:")
 	private val slashLabel = JBLabel("/")
-	private val branchIcon = JBLabel(AllIcons.Vcs.Branch)
+
+	private val repoPicker = CrumbPicker(
+		isWorkspaceItem = { _, index -> index == 0 && repos.any { it.isCurrentRepo } },
+		onPick = { onRepoSelected() },
+	)
+	private val branchPicker = CrumbPicker(
+		isWorkspaceItem = { value, _ ->
+			val isCurrentRepo = repos.find { it.repoName == repoPicker.selected }?.isCurrentRepo == true
+			isCurrentRepo && value == currentBranch
+		},
+		onPick = { onBranchSelected() },
+	)
 
 	private var mode = Mode.BRANCH
 
@@ -53,48 +70,28 @@ class BreadcrumbHeaderPanel(
 	private var currentBranch: String? = null
 	private var repos: List<KBRepoDiscoverer.DiscoveredRepo> = emptyList()
 
-	private var suppressEvents = false
-
 	init {
 		border = JBUI.Borders.empty(4, 8)
 
-		// Custom renderers: bold + "(current)" + separator for workspace items
-		repoCombo.renderer = WorkspaceAwareCellRenderer { _, index -> index == 0 && repos.any { it.isCurrentRepo } }
-		branchCombo.renderer = WorkspaceAwareCellRenderer { value, _ ->
-			val selectedRepo = repoCombo.selectedItem as? String
-			val isCurrentRepo = repos.find { it.repoName == selectedRepo }?.isCurrentRepo == true
-			isCurrentRepo && value == currentBranch
+		// Breadcrumb text is 12px in the mockup (base − 1).
+		for (c in listOf<JLabel>(slashLabel, showingLabel)) {
+			c.font = c.font.deriveFont(c.font.size2D - 1f)
 		}
 
-		// Left: repo / branch selectors — BoxLayout so they shrink when the tool window is narrow
-		repoCombo.minimumSize = Dimension(JBUI.scale(30), repoCombo.preferredSize.height)
-		branchCombo.minimumSize = Dimension(JBUI.scale(30), branchCombo.preferredSize.height)
 		showingLabel.isVisible = false
+		// Mockup breadcrumb is text label + chevron only (no leading repo/branch icons).
 		val selectorPanel = JPanel().apply {
 			layout = BoxLayout(this, BoxLayout.X_AXIS)
+			isOpaque = false
 			add(showingLabel)
 			add(Box.createHorizontalStrut(JBUI.scale(4)))
-			add(JBLabel(AllIcons.Nodes.Module))
-			add(Box.createHorizontalStrut(JBUI.scale(4)))
-			add(repoCombo)
+			add(repoPicker)
 			add(Box.createHorizontalStrut(JBUI.scale(4)))
 			add(slashLabel)
 			add(Box.createHorizontalStrut(JBUI.scale(4)))
-			add(branchIcon)
-			add(Box.createHorizontalStrut(JBUI.scale(4)))
-			add(branchCombo)
+			add(branchPicker)
 		}
 		add(selectorPanel, BorderLayout.CENTER)
-
-		// Selection listeners
-		repoCombo.addActionListener {
-			if (suppressEvents) return@addActionListener
-			onRepoSelected()
-		}
-		branchCombo.addActionListener {
-			if (suppressEvents) return@addActionListener
-			onBranchSelected()
-		}
 	}
 
 	/** Switches between branch selectors and the repo-filter ("Showing:") display. */
@@ -103,14 +100,13 @@ class BreadcrumbHeaderPanel(
 		mode = newMode
 		val branchVisible = newMode == Mode.BRANCH
 		slashLabel.isVisible = branchVisible
-		branchIcon.isVisible = branchVisible
-		branchCombo.isVisible = branchVisible
+		branchPicker.isVisible = branchVisible
 		showingLabel.isVisible = !branchVisible
 		revalidate()
 		repaint()
 	}
 
-	/** Populate combos. Call from a background thread after KB data is loaded. */
+	/** Populate pickers. Call from a background thread after KB data is loaded. */
 	fun refresh() {
 		val gitOps = service.getGitOps() ?: return
 		currentRepoName = service.mainRepoRoot?.let { KBPathResolver.extractRepoName(it) }
@@ -128,12 +124,9 @@ class BreadcrumbHeaderPanel(
 		val repoNames = discoveredRepos.map { it.repoName }
 
 		SwingUtilities.invokeLater {
-			suppressEvents = true
-			repoCombo.model = DefaultComboBoxModel(repoNames.toTypedArray())
-			if (repoNames.isNotEmpty()) {
-				repoCombo.selectedIndex = 0 // current repo is first
-			}
-			suppressEvents = false
+			repoPicker.setItems(repoNames)
+			// Current repo is first.
+			repoPicker.setSelectedSilently(repoNames.firstOrNull())
 			refreshBranches()
 		}
 	}
@@ -143,7 +136,7 @@ class BreadcrumbHeaderPanel(
 	}
 
 	private fun refreshBranches() {
-		val selectedRepo = repoCombo.selectedItem as? String ?: return
+		val selectedRepo = repoPicker.selected ?: return
 		val isCurrentRepo = repos.find { it.repoName == selectedRepo }?.isCurrentRepo == true
 
 		ApplicationManager.getApplication().executeOnPooledThread {
@@ -159,22 +152,20 @@ class BreadcrumbHeaderPanel(
 			}
 
 			SwingUtilities.invokeLater {
-				suppressEvents = true
-				branchCombo.model = DefaultComboBoxModel(branches.toTypedArray())
+				branchPicker.setItems(branches)
 				if (isCurrentRepo && currentBranch != null) {
-					branchCombo.selectedItem = currentBranch
-				} else if (branches.isNotEmpty()) {
-					branchCombo.selectedIndex = 0
+					branchPicker.setSelectedSilently(currentBranch)
+				} else {
+					branchPicker.setSelectedSilently(branches.firstOrNull())
 				}
-				suppressEvents = false
 				onBranchSelected()
 			}
 		}
 	}
 
 	private fun onBranchSelected() {
-		val selectedRepo = repoCombo.selectedItem as? String ?: return
-		val selectedBranch = branchCombo.selectedItem as? String ?: return
+		val selectedRepo = repoPicker.selected ?: return
+		val selectedBranch = branchPicker.selected ?: return
 		val isCurrentRepo = repos.find { it.repoName == selectedRepo }?.isCurrentRepo == true
 		val isForeign = !isCurrentRepo || selectedBranch != currentBranch
 
@@ -183,6 +174,79 @@ class BreadcrumbHeaderPanel(
 			if (isForeign) selectedBranch else null,
 			isForeign,
 		)
+	}
+
+	/** Update the current branch display without full refresh (e.g., on branch switch). */
+	fun updateCurrentBranch(branch: String) {
+		currentBranch = branch
+		SwingUtilities.invokeLater {
+			val isCurrentRepo = repos.find { it.repoName == repoPicker.selected }?.isCurrentRepo == true
+			if (!isCurrentRepo) return@invokeLater
+			// A freshly created branch isn't in the picker's list yet, so simply
+			// selecting it by name is a no-op. Re-list branches from git in that case
+			// so the new branch appears and gets selected.
+			if (branchPicker.hasItem(branch)) {
+				branchPicker.setSelectedSilently(branch)
+			} else {
+				refreshBranches()
+			}
+		}
+	}
+
+	/**
+	 * A flat breadcrumb "crumb": current value as label text + a trailing chevron,
+	 * opening a popup list on click. Inherits the header background (no boxed combo
+	 * field), matching the mockup's `.crumb` styling.
+	 */
+	private inner class CrumbPicker(
+		private val isWorkspaceItem: (value: String, index: Int) -> Boolean,
+		private val onPick: (String) -> Unit,
+	) : JBLabel() {
+
+		private var items: List<String> = emptyList()
+		var selected: String? = null
+			private set
+
+		init {
+			icon = AllIcons.General.ArrowDown
+			horizontalTextPosition = SwingConstants.LEFT // chevron sits to the right of the text
+			iconTextGap = JBUI.scale(2)
+			font = font.deriveFont(font.size2D - 1f)
+			cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+			border = JBUI.Borders.empty(1, 2)
+			// Allow the elastic branch crumb to shrink (and clip to "…") on narrow windows.
+			minimumSize = Dimension(JBUI.scale(30), preferredSize.height)
+			addMouseListener(object : MouseAdapter() {
+				override fun mouseClicked(e: MouseEvent) {
+					if (SwingUtilities.isLeftMouseButton(e)) showPopup()
+				}
+			})
+		}
+
+		fun setItems(newItems: List<String>) {
+			items = newItems
+		}
+
+		fun hasItem(value: String): Boolean = items.contains(value)
+
+		/** Set the displayed selection without firing [onPick] (programmatic update). */
+		fun setSelectedSilently(value: String?) {
+			selected = value
+			text = value ?: ""
+		}
+
+		private fun showPopup() {
+			if (items.isEmpty()) return
+			JBPopupFactory.getInstance()
+				.createPopupChooserBuilder(items)
+				.setRenderer(WorkspaceAwareCellRenderer(isWorkspaceItem))
+				.setItemChosenCallback { chosen ->
+					setSelectedSilently(chosen)
+					onPick(chosen)
+				}
+				.createPopup()
+				.showUnderneathOf(this)
+		}
 	}
 
 	/**
@@ -202,7 +266,7 @@ class BreadcrumbHeaderPanel(
 
 			if (isWorkspace) {
 				label.text = "<html><b>$strValue</b> <span style='color:gray'>(current)</span></html>"
-				// Separator line below the workspace item (only in dropdown, not in the collapsed combo)
+				// Separator line below the workspace item.
 				if (index >= 0) {
 					label.border = BorderFactory.createCompoundBorder(
 						BorderFactory.createMatteBorder(0, 0, 1, 0, com.intellij.ui.JBColor.border()),
@@ -216,28 +280,6 @@ class BreadcrumbHeaderPanel(
 				}
 			}
 			return label
-		}
-	}
-
-	/** Update the current branch display without full refresh (e.g., on branch switch). */
-	fun updateCurrentBranch(branch: String) {
-		currentBranch = branch
-		SwingUtilities.invokeLater {
-			val selectedRepo = repoCombo.selectedItem as? String
-			val isCurrentRepo = repos.find { it.repoName == selectedRepo }?.isCurrentRepo == true
-			if (!isCurrentRepo) return@invokeLater
-			// A freshly created branch isn't in the dropdown model yet, so simply
-			// selecting it by name is a no-op. Re-list branches from git in that
-			// case so the new branch appears and gets selected.
-			val model = branchCombo.model
-			val present = (0 until model.size).any { model.getElementAt(it) == branch }
-			if (present) {
-				suppressEvents = true
-				branchCombo.selectedItem = branch
-				suppressEvents = false
-			} else {
-				refreshBranches()
-			}
 		}
 	}
 }

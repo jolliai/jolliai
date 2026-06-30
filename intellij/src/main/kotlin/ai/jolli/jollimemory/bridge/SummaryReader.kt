@@ -117,6 +117,12 @@ class SummaryReader(private val projectDir: String, private val git: GitOps) {
         return git.readBranchFile(ORPHAN_BRANCH, "summaries/$commitHash.json")
     }
 
+    /** Reads an archived plan body (`plans/<slug>.md`) from the orphan branch. */
+    fun readPlanBody(slug: String): String? = git.readBranchFile(ORPHAN_BRANCH, "plans/$slug.md")
+
+    /** Reads an archived markdown-note body (`notes/<id>.md`) from the orphan branch. */
+    fun readNoteBody(id: String): String? = git.readBranchFile(ORPHAN_BRANCH, "notes/$id.md")
+
     /**
      * Reads the committed AI conversations for a commit. Looks up the
      * summary's `transcripts` array for the real transcript IDs (UUIDs in v5,
@@ -138,8 +144,56 @@ class SummaryReader(private val projectDir: String, private val git: GitOps) {
         return parseConversations(json)
     }
 
+    /**
+     * Renders a committed conversation (matched by [sessionId]) from the stored
+     * transcript JSON into a read-only markdown transcript — used to display a
+     * conversation whose original live file is gone. Returns null if not found.
+     */
+    fun renderCommittedConversationMarkdown(commitHash: String, sessionId: String, summary: CommitSummary? = null): String? {
+        val resolved = summary ?: getSummary(commitHash)
+        val ids = resolved?.transcripts
+        val jsons = if (!ids.isNullOrEmpty()) {
+            ids.map { git.readBranchFile(ORPHAN_BRANCH, "transcripts/$it.json") }
+        } else {
+            listOf(git.readBranchFile(ORPHAN_BRANCH, "transcripts/$commitHash.json"))
+        }
+        for (json in jsons) {
+            val md = sessionToMarkdown(json, sessionId)
+            if (md != null) return md
+        }
+        return null
+    }
+
     companion object {
         const val ORPHAN_BRANCH = JmLogger.ORPHAN_BRANCH
+
+        /** Renders the matching session's entries from a stored transcript JSON as markdown. */
+        private fun sessionToMarkdown(json: String?, sessionId: String): String? {
+            if (json.isNullOrBlank()) return null
+            return try {
+                val obj = JsonParser.parseString(json).asJsonObject
+                val sessions = obj.getAsJsonArray("sessions") ?: return null
+                val session = sessions.map { it.asJsonObject }.firstOrNull {
+                    (it.get("sessionId")?.takeIf { e -> !e.isJsonNull }?.asString ?: "") == sessionId
+                } ?: sessions.firstOrNull()?.asJsonObject ?: return null
+                val entries = session.getAsJsonArray("entries") ?: return null
+                val sb = StringBuilder()
+                for (el in entries) {
+                    val e = el.asJsonObject
+                    val role = e.get("role")?.takeIf { !it.isJsonNull }?.asString ?: "?"
+                    val content = e.get("content")?.takeIf { !it.isJsonNull }?.asString ?: ""
+                    val who = when (role.lowercase()) {
+                        "human", "user" -> "User"
+                        "assistant" -> "Assistant"
+                        else -> role.replaceFirstChar { it.uppercase() }
+                    }
+                    sb.append("### ").append(who).append("\n\n").append(content.trim()).append("\n\n---\n\n")
+                }
+                sb.toString().ifBlank { null }
+            } catch (_: Exception) {
+                null
+            }
+        }
 
         /**
          * Parses a stored `transcripts/<hash>.json` body (a [StoredTranscript]:
@@ -229,4 +283,12 @@ data class ConversationBrief(
     val sessionId: String = "",
     /** Original transcript path on disk; null when not recorded. */
     val transcriptPath: String? = null,
+    /**
+     * Commit hash whose stored transcript actually holds this conversation. Null
+     * means "the commit being displayed". It differs from the displayed hash only
+     * for squashed memories whose transcripts live on a child commit, not the
+     * squashed parent — without it, opening the stored transcript would look under
+     * the parent hash (which has none) and fail. See [CommitsPanel.gatherConversations].
+     */
+    val sourceCommitHash: String? = null,
 )

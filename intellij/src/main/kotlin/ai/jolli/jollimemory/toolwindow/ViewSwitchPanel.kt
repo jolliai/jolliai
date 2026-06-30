@@ -35,8 +35,12 @@ class ViewSwitchPanel(
 	private val tabs = linkedMapOf(
 		View.CURRENT to "Current Branch",
 		View.BANK to "Memory Bank",
-		View.KNOWLEDGE to "Knowledge",
-	)
+	).apply {
+		// Knowledge (wiki + decision graph) is still a placeholder — hide the tab
+		// until it's built. The View.KNOWLEDGE enum + handler stay so re-enabling
+		// is a one-line flag flip.
+		if (FeatureFlags.SHOW_UNFINISHED) put(View.KNOWLEDGE, "Knowledge")
+	}
 
 	private val labels = mutableMapOf<View, TabLabel>()
 	private var selected: View = View.CURRENT

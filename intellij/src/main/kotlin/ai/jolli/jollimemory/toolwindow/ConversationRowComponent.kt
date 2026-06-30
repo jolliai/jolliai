@@ -13,6 +13,7 @@ import java.awt.font.TextAttribute
 import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JPanel
+import javax.swing.JTextArea
 
 /**
  * A single row in the [ActiveConversationsPanel]. Shows a color-coded source
@@ -36,14 +37,36 @@ class ConversationRowComponent(
 	/** Live selection state; strikethrough + the ✕/＋ toggle mirror this. */
 	private var selected = item.isSelected
 
-	private val titleLabel = JLabel(item.title).apply { border = JBUI.Borders.emptyLeft(8) }
+	// Wrapping title: long conversation names wrap and grow the row taller instead of
+	// clipping to one line. JTextArea (styled like a label) gives word-wrap.
+	private val titleLabel = JTextArea(item.title).apply {
+		border = JBUI.Borders.emptyLeft(8)
+		isEditable = false
+		isFocusable = false
+		isOpaque = false
+		lineWrap = true
+		wrapStyleWord = true
+		margin = JBUI.insets(0)
+		// Match the mockup's 12px row title (base − 1) for a denser, less cluttered list.
+		font = JBUI.Fonts.label().let { it.deriveFont(it.size2D - 1f) }
+	}
 	private val baseFont = titleLabel.font
 	private val strikeFont = baseFont.deriveFont(mapOf(TextAttribute.STRIKETHROUGH to TextAttribute.STRIKETHROUGH_ON))
 	private val baseFg = titleLabel.foreground
 
+	// vCenter wrappers around the badge / right-side controls so they stay vertically
+	// centered as the title wraps and the row grows taller.
+	private var leftWrap: JComponent? = null
+	private var rightWrap: JComponent? = null
+
 	private val pinLabel = actionIcon(AllIcons.General.Pin_tab, "Pin") { onPin(item) }
 	private val eyeLabel = actionIcon(JolliMemoryIcons.Eye, "Open conversation") { onRowClicked(item) }
 	private val resumeLabel = actionIcon(AllIcons.Actions.Execute, "Resume session in terminal") { onResume(item) }
+
+	// Resume runs `claude --resume <id>`, which only works for Claude sessions. For
+	// other sources (Codex, etc.) the icon was shown but the handler silently no-op'd,
+	// so hide it entirely for non-Claude rows (matches the Committed/Pinned panels).
+	private val canResume = item.source == TranscriptSource.claude
 	private val toggleLabel = JLabel().apply {
 		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
 		isVisible = false
@@ -60,7 +83,7 @@ class ConversationRowComponent(
 
 	private val countLabel = JLabel(if (item.messageCount > 0) "${item.messageCount}" else "").apply {
 		foreground = JBColor.GRAY
-		font = font.deriveFont(font.size2D - 1f)
+		font = font.deriveFont(font.size2D - 2f)
 	}
 
 	private fun actionIcon(icon: javax.swing.Icon, tip: String, onClick: () -> Unit): JLabel =
@@ -84,26 +107,30 @@ class ConversationRowComponent(
 
 	/** Swaps the right side between the message count and the hover actions. */
 	private fun setHovered(hovered: Boolean) {
-		background = if (hovered) JBColor(Color(0, 0, 0, 20), Color(255, 255, 255, 20)) else null
+		background = if (hovered) RowStyle.HOVER_BG else null
 		countLabel.isVisible = !hovered
 		pinLabel.isVisible = hovered
 		eyeLabel.isVisible = hovered
-		resumeLabel.isVisible = hovered
+		resumeLabel.isVisible = hovered && canResume
 		toggleLabel.isVisible = hovered
 	}
 
 	init {
-		border = JBUI.Borders.empty(4, 8)
+		// Match PINNED's row insets (empty(2,4)); the rowsPanel adds the other 4px of
+		// side padding so the edge gaps line up across all sections.
+		border = JBUI.Borders.empty(2, 4)
 		isOpaque = true
 		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
 
-		// Left side: source badge / logo (no more checkbox)
+		// Left side: source badge / logo (no more checkbox), vertically centered.
 		val badge = SourceBadge.leadFor(item.source.name)
 		val leftPanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(2), 0)).apply {
 			isOpaque = false
 			add(badge)
 		}
-		add(leftPanel, BorderLayout.WEST)
+		val left = RowStyle.vCenter(leftPanel)
+		leftWrap = left
+		add(left, BorderLayout.WEST)
 		add(titleLabel, BorderLayout.CENTER)
 
 		// Right side: count (default) swaps to Pin · Open · Continue · toggle on hover.
@@ -111,9 +138,24 @@ class ConversationRowComponent(
 		rightPanel.add(countLabel)
 		rightPanel.add(pinLabel)
 		rightPanel.add(eyeLabel)
-		rightPanel.add(resumeLabel)
+		if (canResume) rightPanel.add(resumeLabel)
 		rightPanel.add(toggleLabel)
-		add(rightPanel, BorderLayout.EAST)
+		// Reserve the widest state's width (hover actions) so the title's wrap width is
+		// stable whether or not the row is hovered. The toggle icon is set in
+		// applySelectionState() — give it one here first so its width is counted (else
+		// the 4th icon is clipped).
+		toggleLabel.icon = AllIcons.Actions.Close
+		countLabel.isVisible = false
+		pinLabel.isVisible = true; eyeLabel.isVisible = true; resumeLabel.isVisible = canResume; toggleLabel.isVisible = true
+		val reservedRightW = rightPanel.preferredSize.width
+		countLabel.isVisible = true
+		pinLabel.isVisible = false; eyeLabel.isVisible = false; resumeLabel.isVisible = false; toggleLabel.isVisible = false
+		val right = RowStyle.vCenter(rightPanel).apply {
+			preferredSize = Dimension(reservedRightW, JBUI.scale(16))
+			minimumSize = Dimension(reservedRightW, 0)
+		}
+		rightWrap = right
+		add(right, BorderLayout.EAST)
 
 		applySelectionState()
 
@@ -144,12 +186,33 @@ class ConversationRowComponent(
 		addMouseListener(hoverListener)
 		addMouseListener(clickListener)
 		// Icons handle their own clicks; the row body (badge/title/count) opens the conversation.
-		for (c in listOf(leftPanel, badge, titleLabel, rightPanel, countLabel, pinLabel, eyeLabel, resumeLabel, toggleLabel)) {
+		for (c in listOf(left, leftPanel, badge, titleLabel, right, rightPanel, countLabel, pinLabel, eyeLabel, resumeLabel, toggleLabel)) {
 			c.addMouseListener(hoverListener)
-			if (c === leftPanel || c === badge || c === titleLabel || c === rightPanel || c === countLabel) {
+			if (c === left || c === leftPanel || c === badge || c === titleLabel || c === rightPanel || c === countLabel) {
 				c.addMouseListener(clickListener)
 			}
 		}
+
+		// Recompute the wrapped height when the row width changes (tool-window resize).
+		addComponentListener(object : java.awt.event.ComponentAdapter() {
+			override fun componentResized(e: java.awt.event.ComponentEvent) { revalidate() }
+		})
+	}
+
+	override fun getPreferredSize(): Dimension {
+		val base = super.getPreferredSize()
+		val lw = leftWrap
+		val rw = rightWrap
+		val w = width
+		if (w <= 0 || lw == null || rw == null) return base
+		val ins = insets
+		val titleW = (w - ins.left - ins.right - lw.preferredSize.width - rw.preferredSize.width)
+			.coerceAtLeast(JBUI.scale(20))
+		// Sizing the text area to the available width makes its preferred height reflect
+		// the wrapped line count.
+		titleLabel.setSize(titleW, Short.MAX_VALUE.toInt())
+		val contentH = maxOf(titleLabel.preferredSize.height, lw.preferredSize.height, JBUI.scale(16))
+		return Dimension(base.width, contentH + ins.top + ins.bottom)
 	}
 
 	override fun getMaximumSize(): Dimension =

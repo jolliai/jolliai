@@ -94,6 +94,8 @@ class CloudSyncAction : AnAction() {
 			signInButton.isEnabled = false
 			signInButton.text = "Signing in..."
 			JolliAuthService.login(
+				// User-initiated sign-in: mint a fresh key so a revoked same-tenant key recovers.
+				forceFreshApiKey = true,
 				onSuccess = { _ ->
 					SwingUtilities.invokeLater {
 						// Popup will be stale after sign-in; close the parent popup

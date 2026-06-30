@@ -33,13 +33,31 @@ object JmLogger {
     private var writerRunning = false
     private val writerLock = Any()
 
+    @Volatile
+    private var writerThread: Thread? = null
+
+    @Volatile
+    private var stopped = false
+
+    /**
+     * Stops the writer thread for plugin unload. This is an `object`, so the
+     * daemon writer thread would otherwise pin the plugin classloader until its
+     * idle timeout. Interrupting it drains the queue and exits immediately; the
+     * [stopped] guard prevents a late log call from respawning (and re-pinning) it.
+     */
+    fun shutdown() {
+        stopped = true
+        writerThread?.interrupt()
+        writerThread = null
+    }
+
     /** Ensures a single daemon writer thread is active. Starts one if needed. */
     private fun ensureWriterThread() {
-        if (writerRunning) return
+        if (stopped || writerRunning) return
         synchronized(writerLock) {
-            if (writerRunning) return
+            if (stopped || writerRunning) return
             writerRunning = true
-            Thread({
+            writerThread = Thread({
                 try {
                     while (true) {
                         // Poll with timeout so the thread exits when idle (prevents thread-leak false positives)

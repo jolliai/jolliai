@@ -5,6 +5,7 @@ import ai.jolli.jollimemory.bridge.GitRemoteUtils
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.E2eTestScenario
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.core.StorageFactory
 import ai.jolli.jollimemory.core.StoredSession
 import ai.jolli.jollimemory.core.StoredTranscript
@@ -363,7 +364,14 @@ class SummaryPanel(
                     val cleanedSummary = cleanupOrphanedDocs(summary, updatedSummary, baseUrl, config.jolliApiKey!!)
                     if (cleanedSummary != null) currentSummary = cleanedSummary
 
-                    ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_pushed", mapOf("kind" to "summary"))
+                    ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+                        "memory_pushed",
+                        mapOf(
+                            "kind" to "summary",
+                            "created" to result.created,
+                            "plans_bucket" to ai.jolli.jollimemory.core.telemetry.Telemetry.bucket(planUrls.size),
+                        ),
+                    )
 
                     ApplicationManager.getApplication().invokeLater {
                         refreshHtml()
@@ -385,12 +393,57 @@ class SummaryPanel(
                         postToWebview("pushFailed")
                         Messages.showErrorDialog(project, "Push failed -- your JolliMemory plugin is outdated. Please update.", "Plugin Outdated")
                     }
+                } catch (e: JolliApiClient.UnauthorizedError) {
+                    // Server rejected the key (invalid/disabled). Offer to re-authenticate
+                    // and retry once — self-heals a stale/deleted key.
+                    ai.jolli.jollimemory.core.telemetry.Telemetry.track("key_rejected", mapOf("retried" to retried, "where" to "push"))
+                    ApplicationManager.getApplication().invokeLater {
+                        postToWebview("pushFailed")
+                        if (retried) {
+                            Messages.showErrorDialog(project, "Push failed: ${e.message}", "Push Error")
+                            return@invokeLater
+                        }
+                        val choice = Messages.showYesNoDialog(
+                            project,
+                            "Your Jolli key was rejected by the server (invalid or disabled).\n\nRe-authenticate and retry the push?",
+                            "Re-authenticate",
+                            Messages.getQuestionIcon(),
+                        )
+                        if (choice == Messages.YES) reauthenticateAndRetry()
+                    }
                 } catch (e: Exception) {
+                    ai.jolli.jollimemory.core.telemetry.Telemetry.track("error_occurred", mapOf("code" to "push_failed", "where" to "push"))
                     ApplicationManager.getApplication().invokeLater {
                         postToWebview("pushFailed")
                         Messages.showErrorDialog(project, "Push failed: ${e.message}", "Push Error")
                     }
                 }
+            }
+        }
+    }
+
+    /**
+     * Clears the stale Jolli key, runs the login flow (which mints a FRESH key — a
+     * same-tenant re-login would otherwise keep the existing, now-disabled one), and
+     * retries the push once on success.
+     */
+    private fun reauthenticateAndRetry() {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val dir = SessionTracker.getGlobalConfigDir()
+            SessionTracker.saveConfigToDir(SessionTracker.loadConfigFromDir(dir).copy(jolliApiKey = null), dir)
+            ApplicationManager.getApplication().invokeLater {
+                JolliAuthService.login(
+                    onSuccess = {
+                        ai.jolli.jollimemory.core.telemetry.Telemetry.track("reauth_completed", mapOf("outcome" to "success"))
+                        handlePushToJolli(retried = true)
+                    },
+                    onError = { msg ->
+                        ai.jolli.jollimemory.core.telemetry.Telemetry.track("reauth_completed", mapOf("outcome" to "failed"))
+                        ApplicationManager.getApplication().invokeLater {
+                            Messages.showErrorDialog(project, "Re-authentication failed: $msg", "Push Error")
+                        }
+                    },
+                )
             }
         }
     }

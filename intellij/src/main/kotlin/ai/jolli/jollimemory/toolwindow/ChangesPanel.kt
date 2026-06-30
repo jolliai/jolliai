@@ -29,6 +29,7 @@ import java.awt.Cursor
 import java.awt.Dimension
 import java.awt.FlowLayout
 import java.awt.event.MouseAdapter
+import java.awt.font.TextAttribute
 import java.awt.event.MouseEvent
 import java.io.File
 import com.intellij.openapi.actionSystem.ActionManager
@@ -39,7 +40,6 @@ import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.JButton
 import com.intellij.ui.JBColor
-import java.awt.font.TextAttribute
 import javax.swing.JLabel
 import javax.swing.JMenuItem
 import javax.swing.JPanel
@@ -90,8 +90,11 @@ class ChangesPanel(
     /** Tracks which row panel is currently hovered (for showing discard icon). */
     private var hoveredRow: JPanel? = null
 
+
     init {
-        border = JBUI.Borders.empty(8)
+        // Match PINNED's container insets (empty(2,4)) so all sections share the same
+        // first-row/last-row edge gaps. Each row adds empty(2,4) → 4px edge, 8px sides.
+        border = JBUI.Borders.empty(2, 4)
 
         // Listen for status changes (enable/disable)
         service.addStatusListener(statusListener)
@@ -228,6 +231,7 @@ class ChangesPanel(
         val anyUnselected = selectedStates.any { !it }
         for (i in selectedStates.indices) selectedStates[i] = anyUnselected
         updateFileList()
+        service.notifySelectionChanged()
     }
 
     /** Discards changes for all selected files after confirmation. */
@@ -301,40 +305,35 @@ class ChangesPanel(
 
         val displayStatus = displayStatusCode(change.statusCode)
 
-        val nameLabel = JLabel(fileName)
+        // Filename (line 1) + parent directory (line 2). Always two lines so the row
+        // has room for the hover icons and the full name/path are readable; each line
+        // ellipsizes when too narrow.
+        val parentDir = File(change.relativePath).parent?.let { "$it/" } ?: ""
+
+        val nameLabel = JLabel(fileName).apply {
+            minimumSize = Dimension(0, preferredSize.height)
+            alignmentX = Component.LEFT_ALIGNMENT
+        }
         val baseNameFont = nameLabel.font
         val strikeNameFont = baseNameFont.deriveFont(mapOf(TextAttribute.STRIKETHROUGH to TextAttribute.STRIKETHROUGH_ON))
-
-        // Parent directory (gray, smaller font — follows directly after filename)
-        val parentDir = File(change.relativePath).parent?.let { "$it/" } ?: ""
         val pathLabel = JLabel(parentDir).apply {
             foreground = Color.GRAY
             font = font.deriveFont(font.size2D - 1f)
-            // Allow the label to shrink so it truncates instead of forcing wider rows
             minimumSize = Dimension(0, preferredSize.height)
+            alignmentX = Component.LEFT_ALIGNMENT
+            isVisible = parentDir.isNotBlank()
+        }
+        val centerPanel = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            isOpaque = false
+            add(nameLabel)
+            add(pathLabel)
         }
 
-        // Left side: GridBagLayout ensures checkbox + icon + filename get their preferred
-        // widths and the path label fills remaining space without clipping.
-        val leftPanel = JPanel(java.awt.GridBagLayout()).apply {
+        // Icon, vertically centered next to the two-line text.
+        val iconWrap = JPanel(java.awt.GridBagLayout()).apply {
             isOpaque = false
-            val gbc = java.awt.GridBagConstraints()
-            gbc.gridy = 0
-            gbc.anchor = java.awt.GridBagConstraints.WEST
-            gbc.fill = java.awt.GridBagConstraints.NONE
-            gbc.weightx = 0.0
-
-            gbc.gridx = 0
-            add(iconLabel, gbc)
-
-            gbc.gridx = 1
-            add(nameLabel, gbc)
-
-            gbc.gridx = 2
-            gbc.weightx = 1.0
-            gbc.fill = java.awt.GridBagConstraints.HORIZONTAL
-            gbc.insets = JBUI.insetsLeft(4)
-            add(pathLabel, gbc)
+            add(iconLabel, java.awt.GridBagConstraints())
         }
 
         // Status badge (colored letter matching VS Code: M, A, D, U, R)
@@ -366,20 +365,34 @@ class ChangesPanel(
             border = JBUI.Borders.emptyLeft(2)
         }
 
-        // Right side: status badge + discard + select toggle
-        val rightPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
+        // Right side: status badge + discard + select toggle, vertically centered with a
+        // reserved width measured with the hover actions visible (and the toggle icon set,
+        // so its width is counted) — otherwise the last icon is clipped.
+        val rightInner = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
             isOpaque = false
             add(statusLabel)
             add(discardLabel)
             add(toggleLabel)
+        }
+        toggleLabel.icon = AllIcons.Actions.Close
+        discardLabel.isVisible = true; toggleLabel.isVisible = true
+        val reservedRightW = rightInner.preferredSize.width
+        discardLabel.isVisible = false; toggleLabel.isVisible = false
+        val rightWrap = JPanel(java.awt.GridBagLayout()).apply {
+            isOpaque = false
+            add(rightInner, java.awt.GridBagConstraints())
+            preferredSize = Dimension(reservedRightW, JBUI.scale(16))
+            minimumSize = Dimension(reservedRightW, 0)
         }
 
         val row = JPanel(BorderLayout()).apply {
             isOpaque = false
             border = JBUI.Borders.empty(2, 4)
             alignmentX = Component.LEFT_ALIGNMENT
-            add(leftPanel, BorderLayout.CENTER)
-            add(rightPanel, BorderLayout.EAST)
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            add(iconWrap, BorderLayout.WEST)
+            add(centerPanel, BorderLayout.CENTER)
+            add(rightWrap, BorderLayout.EAST)
         }
 
         // Strike + dim the filename when deselected; flip the toggle icon (✕/＋).
@@ -389,7 +402,6 @@ class ChangesPanel(
             nameLabel.foreground = if (sel) statusColor(change.statusCode) else JBColor.GRAY
             toggleLabel.icon = if (sel) AllIcons.Actions.Close else AllIcons.General.Add
             toggleLabel.toolTipText = if (sel) "Exclude from commit" else "Include in commit"
-            leftPanel.revalidate()
             row.repaint()
         }
         applySelection()
@@ -401,6 +413,7 @@ class ChangesPanel(
                     selectedStates[index] = !(selectedStates.getOrNull(index) ?: true)
                 }
                 applySelection()
+                service.notifySelectionChanged()
             }
         })
 
@@ -408,6 +421,8 @@ class ChangesPanel(
         val hoverListener = object : MouseAdapter() {
             override fun mouseEntered(e: MouseEvent) {
                 hoveredRow = row
+                row.isOpaque = true
+                row.background = RowStyle.HOVER_BG
                 discardLabel.isVisible = true
                 toggleLabel.isVisible = true
                 row.repaint()
@@ -417,6 +432,8 @@ class ChangesPanel(
                 val point = SwingUtilities.convertPoint(e.component, e.point, row)
                 if (!row.contains(point)) {
                     hoveredRow = null
+                    row.isOpaque = false
+                    row.background = null
                     discardLabel.isVisible = false
                     toggleLabel.isVisible = false
                     row.repaint()
@@ -454,12 +471,12 @@ class ChangesPanel(
         // Attach hover listener to the row and all child components
         row.addMouseListener(hoverListener)
         row.addMouseListener(contextMenuListener)
-        for (child in listOf(leftPanel, rightPanel, iconLabel, nameLabel, pathLabel, statusLabel, discardLabel, toggleLabel)) {
+        for (child in listOf(iconWrap, rightWrap, rightInner, centerPanel, iconLabel, nameLabel, pathLabel, statusLabel, discardLabel, toggleLabel)) {
             child.addMouseListener(hoverListener)
             child.addMouseListener(contextMenuListener)
         }
 
-        // Constrain row height so BoxLayout doesn't stretch rows apart
+        // Constrain row height so BoxLayout doesn't stretch rows apart.
         row.maximumSize = Dimension(Int.MAX_VALUE, row.preferredSize.height)
         return row
     }

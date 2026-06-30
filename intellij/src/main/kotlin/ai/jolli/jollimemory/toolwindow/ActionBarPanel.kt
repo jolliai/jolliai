@@ -62,7 +62,10 @@ class ActionBarPanel(
 		add(prBtn, BorderLayout.CENTER)
 		val east = JPanel(java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, JBUI.scale(4), 0)).apply {
 			isOpaque = false
-			add(shareBtn)
+			// "Share" (share branch memories to a Jolli Space) isn't wired yet — keep it
+			// out of the bar until it does something. shareBtn stays constructed so
+			// setForeign() still compiles; it's just not added to the layout.
+			if (FeatureFlags.SHOW_UNFINISHED) add(shareBtn)
 			add(moreBtn)
 		}
 		add(east, BorderLayout.EAST)
@@ -131,10 +134,14 @@ class ActionBarPanel(
 			menu.add(javax.swing.JMenuItem("Copy recall prompt for other tools").apply {
 				addActionListener { copyRecallPrompt() }
 			})
-			menu.addSeparator()
-			menu.add(javax.swing.JMenuItem("Sync to Memory Bank", JolliMemoryIcons.CloudUpload).apply {
-				addActionListener { syncToMemoryBank() }
-			})
+			// "Sync to Memory Bank" silently no-ops unless the sync orchestrator is built
+			// (sign-in + binding); hide it until that lazy-build path is wired here.
+			if (FeatureFlags.SHOW_UNFINISHED) {
+				menu.addSeparator()
+				menu.add(javax.swing.JMenuItem("Sync to Memory Bank", JolliMemoryIcons.CloudUpload).apply {
+					addActionListener { syncToMemoryBank() }
+				})
+			}
 		}
 		menu.add(javax.swing.JMenuItem("Refresh", JolliMemoryIcons.Refresh).apply {
 			addActionListener { refreshAll() }

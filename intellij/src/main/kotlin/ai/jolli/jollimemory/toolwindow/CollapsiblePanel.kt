@@ -5,13 +5,19 @@ import com.intellij.ide.util.PropertiesComponent
 import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.ActionToolbar
 import com.intellij.openapi.actionSystem.DefaultActionGroup
+import com.intellij.ui.ColorUtil
+import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
 import java.awt.Cursor
 import java.awt.Dimension
+import java.awt.GridBagConstraints
+import java.awt.GridBagLayout
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import javax.swing.Box
+import javax.swing.Icon
 import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.UIManager
@@ -42,6 +48,10 @@ class CollapsiblePanel(
      *  instead of giving it a share of the surplus space. Used for the Pinned panel
      *  so its height tracks the number of pinned items. */
     private val fitContent: Boolean = false,
+    /** Optional accent icon shown between the expand arrow and the title text,
+     *  e.g. the pin badge on the PINNED section (matches the mockup, which gives
+     *  only that section a leading icon). */
+    private val titleIcon: Icon? = null,
 ) : JPanel(BorderLayout()) {
 
     private val persistenceKey = "JolliMemory.CollapsiblePanel.expanded.$title"
@@ -52,16 +62,37 @@ class CollapsiblePanel(
 
     init {
         // Build header
+        val separatorColor = UIManager.getColor("Separator.separatorColor")
+            ?: UIManager.getColor("Component.borderColor")
+            ?: java.awt.Color.GRAY
         headerPanel.apply {
-            border = JBUI.Borders.empty(4, 4, 4, 0)
+            // Grey divider along the top edge + padding, so every section title reads
+            // as a banded header even when collapsed (matches the mockup's
+            // section-header border-top).
+            // Line is the OUTER border (drawn at the very top edge); the empty padding
+            // is INNER so it sits between the divider line and the title text. The top
+            // value is the gap below the line — bump it to give the title more room
+            // (also offsets the bold font's descent, which reads top-heavy).
+            border = javax.swing.BorderFactory.createCompoundBorder(
+                JBUI.Borders.customLineTop(separatorColor),
+                JBUI.Borders.empty(8, 4, 5, 0),
+            )
             cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
             isOpaque = true
-            background = UIManager.getColor("ToolWindow.HeaderTab.selectedInactiveBackground")
-                ?: UIManager.getColor("Panel.background")
+            // A header band that stands apart from the panel body: lighter in dark
+            // themes, a touch darker in light themes — mirroring VS Code's
+            // sideBarSectionHeader background.
+            background = JBColor.lazy {
+                val panel = UIManager.getColor("Panel.background") ?: JBColor.background()
+                if (ColorUtil.isDark(panel)) ColorUtil.brighter(panel, 2) else ColorUtil.darker(panel, 1)
+            }
         }
 
         titleLabel.apply {
-            font = font.deriveFont(java.awt.Font.BOLD)
+            // Mockup section headers are 11px (base − 2) — smaller than the row titles
+            // below them. Keeping them at the full label size inverted that hierarchy
+            // and made the sidebar read crowded.
+            font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 2f)
             border = JBUI.Borders.emptyLeft(4)
         }
 
@@ -73,13 +104,34 @@ class CollapsiblePanel(
         val leftPanel = JPanel(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 0, 0)).apply {
             isOpaque = false
             add(arrowLabel)
+            if (titleIcon != null) {
+                add(Box.createHorizontalStrut(JBUI.scale(2)))
+                add(JBLabel(titleIcon))
+            }
             add(titleLabel)
             if (headerExtra != null) {
                 headerExtra.isOpaque = false
                 add(headerExtra)
             }
         }
-        headerPanel.add(leftPanel, BorderLayout.CENTER)
+        // BorderLayout.CENTER stretches leftPanel to the full header height, but a
+        // FlowLayout pins its row to the top of that space — leaving the title looking
+        // top-aligned whenever the toolbar/arrow make the header taller than the text.
+        // Wrap it in a GridBag cell so the row keeps its preferred height and is
+        // vertically centered (WEST anchor + horizontal fill keeps it left-aligned and
+        // full-width).
+        val centerWrap = JPanel(GridBagLayout()).apply {
+            isOpaque = false
+            add(
+                leftPanel,
+                GridBagConstraints().apply {
+                    anchor = GridBagConstraints.WEST
+                    fill = GridBagConstraints.HORIZONTAL
+                    weightx = 1.0
+                },
+            )
+        }
+        headerPanel.add(centerWrap, BorderLayout.CENTER)
 
         // Right side: action toolbar
         val actionGroup = ActionManager.getInstance().getAction(actionGroupId)

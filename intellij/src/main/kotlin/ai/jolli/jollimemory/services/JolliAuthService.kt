@@ -75,6 +75,13 @@ object JolliAuthService {
 
     fun login(
         timeoutSeconds: Long = DEFAULT_LOGIN_TIMEOUT_SECONDS,
+        /**
+         * Force the server to mint a fresh Jolli API key even when the existing key
+         * already matches the target tenant. User-initiated "Sign In" actions pass
+         * true so a manual recovery from a revoked same-tenant key actually replaces
+         * the dead key (otherwise [JolliAuthUtils.shouldRequestFreshApiKey] keeps it).
+         */
+        forceFreshApiKey: Boolean = false,
         onSuccess: (result: LoginResult) -> Unit,
         onError: (message: String) -> Unit,
     ) {
@@ -110,7 +117,7 @@ object JolliAuthService {
                 jolliUrl = jolliUrl,
                 callbackUrl = callbackUrl,
                 clientVersion = JolliApiClient.pluginVersion,
-                generateApiKey = JolliAuthUtils.shouldRequestFreshApiKey(existingApiKey, jolliUrl),
+                generateApiKey = forceFreshApiKey || JolliAuthUtils.shouldRequestFreshApiKey(existingApiKey, jolliUrl),
                 installId = TelemetrySharedConfig.getOrCreateInstallId().first,
             )
             log.info("Login URL: %s", loginUrl)
@@ -251,6 +258,18 @@ object JolliAuthService {
         server = null
         serverExecutor?.shutdownNow()
         serverExecutor = null
+    }
+
+    /**
+     * Full teardown for plugin unload. This is an `object`, so its
+     * [timeoutExecutor] thread and the [authListeners] list would otherwise pin
+     * the plugin classloader after a dynamic unload. Called from
+     * [ai.jolli.jollimemory.JolliDynamicUnloadCleaner] on `beforePluginUnload`.
+     */
+    fun shutdownForUnload() {
+        shutdown()
+        timeoutExecutor.shutdownNow()
+        authListeners.clear()
     }
 
     /**

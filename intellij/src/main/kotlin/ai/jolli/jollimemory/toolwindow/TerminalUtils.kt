@@ -15,9 +15,11 @@ object TerminalUtils {
 	/** Opens a new terminal tab in the given [cwd] and runs `claude --resume <sessionId>`. */
 	fun resumeClaudeSession(project: Project, sessionId: String, cwd: String, title: String = "Claude – resume") {
 		try {
+			// createLocalShellWidget / executeCommand are scheduled for removal; use the
+			// current createShellWidget + sendCommandToExecute API.
 			val widget = TerminalToolWindowManager.getInstance(project)
-				.createLocalShellWidget(cwd, title)
-			widget.executeCommand("claude --resume $sessionId")
+				.createShellWidget(cwd, title, true, true)
+			widget.sendCommandToExecute("claude --resume $sessionId")
 		} catch (e: Exception) {
 			log.warn("Failed to open terminal for session resume: ${e.message}", e)
 			Notifications.Bus.notify(
