@@ -388,6 +388,33 @@ describe("StatusBarManager", () => {
 			expect(item.tooltip).toContain(".memorybank-state.json");
 		});
 
+		it("symlinked sample without a count falls back to the sample length in the tooltip", () => {
+			// canarySymlinkedCount omitted → the visual stays green check
+			// (n defaults to 0) but the sample is still surfaced, and the
+			// "(shown/total)" total falls back to the sample's own length.
+			const manager = new StatusBarManager();
+			manager.setSyncState("synced", {
+				canarySymlinkedSample: ["s1", "s2"],
+			});
+			expect(item.text).toBe("$(check) Jolli Memory");
+			const tip = item.tooltip ?? "";
+			expect(tip).toContain("Blocked symlinks (2/2):");
+			expect(tip).toContain("s1");
+			expect(tip).toContain("s2");
+		});
+
+		it("unowned sample without a count falls back to the sample length in the tooltip", () => {
+			const manager = new StatusBarManager();
+			manager.setSyncState("synced", {
+				canaryUnownedSample: ["u1", "u2"],
+			});
+			expect(item.text).toBe("$(check) Jolli Memory");
+			const tip = item.tooltip ?? "";
+			expect(tip).toContain("Unowned paths (2/2):");
+			expect(tip).toContain("u1");
+			expect(tip).toContain("u2");
+		});
+
 		it("tooltip caps the path sample at 3 even when more were collected", () => {
 			const manager = new StatusBarManager();
 			manager.setSyncState("synced", {

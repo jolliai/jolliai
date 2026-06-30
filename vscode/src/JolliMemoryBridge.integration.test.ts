@@ -142,3 +142,46 @@ describe("getStagedFilePaths() — real git integration (NUL-separated, unicode)
 		expect(staged).toEqual(["foö.ts"]);
 	});
 });
+
+function git(args: string, cwd: string): string {
+	return execSync(`git ${args}`, { cwd, encoding: "utf8" }).trim();
+}
+
+describe("getBranchPrStats vs listBranchCommits — sync-only merged branch agreement (E1)", () => {
+	it("a created-from-main + rebased branch with NO own commits yields empty stats AND empty memory list", async () => {
+		// Build a sync-only merged branch:
+		//   1. main has commit A (the `init` commit from beforeEach).
+		//   2. branch `sync` is created from main (reflog: "branch: Created from HEAD").
+		//   3. main advances to commit B.
+		//   4. `sync` is rebased onto main → its HEAD becomes B, with NO `commit`
+		//      reflog op of its own (only "Created from" + the rebase/reset move).
+		// Now merge-base(sync@B, main@B) === HEAD, so both code paths enter "merged
+		// mode". listBranchCommits gates on `hasOwnCommit` (false here) and returns
+		// empty. Before the fix, getBranchPrStats skipped that gate and diffed the
+		// creation point (A) against HEAD (B) — a NON-empty diff that contradicted
+		// the empty memory list. After the fix both must agree on empty.
+		const mainBranch = git("branch --show-current", repoDir) || "main";
+		git("checkout -b sync", repoDir); // reflog: branch: Created from <main>@A
+		git(`checkout ${mainBranch}`, repoDir);
+		writeFileSync(join(repoDir, "on-main.ts"), "added on main\n");
+		git("add on-main.ts", repoDir);
+		git('-c commit.gpgsign=false commit -qm "B: real change on main"', repoDir);
+		git("checkout sync", repoDir);
+		git(`rebase ${mainBranch}`, repoDir); // sync HEAD now == main HEAD (B), no own commit
+
+		const bridge = new JolliMemoryBridge(repoDir);
+
+		const list = await bridge.listBranchCommits(mainBranch);
+		const stats = await bridge.getBranchPrStats(mainBranch);
+
+		// Memory list is empty (the existing hasOwnCommit gate).
+		expect(list.commits).toEqual([]);
+		// PR-stats must ALSO be empty — same commit range, no contradiction.
+		expect(stats).toEqual({
+			insertions: 0,
+			deletions: 0,
+			filesChanged: 0,
+			files: [],
+		});
+	});
+});

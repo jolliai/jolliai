@@ -187,13 +187,29 @@ export class FilesStore extends BaseStore<FilesChangeReason, FilesSnapshot> {
 		this.rebuildSnapshot({ reorder: false, reason: "userCheckbox" });
 	}
 
-	/** Programmatic select-all toggle (from the "Select All" button). */
-	toggleSelectAll(): void {
+	/**
+	 * Selection summary for the visible file set. `total` is the visible-file
+	 * count; `allSelected` is true only when there is at least one visible file
+	 * and every one is selected. Used by the unified "Current Memory" select-all
+	 * (SelectAllSelection.selectAllCurrentMemoryCommand) to compute one target
+	 * across conversations + plans + files without mutating any group first.
+	 */
+	selectionSummary(): { total: number; allSelected: boolean } {
 		const visible = this.snapshot.visibleFiles;
-		const allSelected =
-			visible.length > 0 && visible.every((f) => f.isSelected);
-		const target = !allSelected;
-		for (const f of visible) {
+		return {
+			total: visible.length,
+			allSelected: visible.length > 0 && visible.every((f) => f.isSelected),
+		};
+	}
+
+	/**
+	 * Set every visible file to an explicit selected/deselected target (no
+	 * toggle). Deselection records each path in `unselectedPaths` so the next
+	 * refresh's default-select loop does not silently re-seed it — mirroring
+	 * toggleSelectAll's negative-memory semantics.
+	 */
+	selectAll(target: boolean): void {
+		for (const f of this.snapshot.visibleFiles) {
 			if (target) {
 				this.selectedPaths.add(f.relativePath);
 				this.unselectedPaths?.delete(f.relativePath);
@@ -204,6 +220,11 @@ export class FilesStore extends BaseStore<FilesChangeReason, FilesSnapshot> {
 			}
 		}
 		this.rebuildSnapshot({ reorder: false, reason: "selectAll" });
+	}
+
+	/** Programmatic select-all toggle (from the "Select All" button). */
+	toggleSelectAll(): void {
+		this.selectAll(!this.selectionSummary().allSelected);
 	}
 
 	/**

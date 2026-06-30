@@ -37,10 +37,12 @@ const { mockRefreshKnowledgeBaseFolders, mockClearKnowledgeBaseFolderDivergence 
 	mockClearKnowledgeBaseFolderDivergence: vi.fn(),
 }));
 
-const { mockNotifyEnabledChanged, mockNotifyAuthChanged } = vi.hoisted(() => ({
-	mockNotifyEnabledChanged: vi.fn(),
-	mockNotifyAuthChanged: vi.fn(),
-}));
+const { mockNotifyEnabledChanged, mockNotifyAuthChanged, mockToggleStatus } =
+	vi.hoisted(() => ({
+		mockNotifyEnabledChanged: vi.fn(),
+		mockNotifyAuthChanged: vi.fn(),
+		mockToggleStatus: vi.fn(),
+	}));
 
 const { isWorkerBusy } = vi.hoisted(() => ({
 	isWorkerBusy: vi.fn(),
@@ -73,11 +75,13 @@ const {
 	migrateIndexToV3,
 	readPlanFromBranch,
 	readNoteFromBranch,
+	readReferenceFromBranch,
 } = vi.hoisted(() => ({
 	indexNeedsMigration: vi.fn(),
 	migrateIndexToV3: vi.fn(),
 	readNoteFromBranch: vi.fn(),
 	readPlanFromBranch: vi.fn(),
+	readReferenceFromBranch: vi.fn(),
 }));
 
 const {
@@ -177,6 +181,7 @@ const {
 	MockPushCommand,
 	mockSquashCommand,
 	MockSquashCommand,
+	MockCreatePrWebviewPanel,
 	MockSummaryWebviewPanel,
 	MockSettingsWebviewPanel,
 	MockNoteEditorWebviewPanel,
@@ -362,6 +367,7 @@ const {
 		MockSquashCommand: vi.fn(function MockSquashCommand() {
 			return mockSquashCommand_;
 		}),
+		MockCreatePrWebviewPanel: { show: vi.fn().mockResolvedValue(undefined) },
 		MockSummaryWebviewPanel: { show: vi.fn().mockResolvedValue(undefined) },
 		MockSettingsWebviewPanel: {
 			show: vi.fn(),
@@ -622,6 +628,13 @@ vi.mock("../../cli/src/core/SummaryStore.js", () => ({
 	migrateIndexToV3,
 	readNoteFromBranch,
 	readPlanFromBranch,
+	readReferenceFromBranch,
+}));
+
+vi.mock("../../cli/src/core/PinStore.js", () => ({
+	addPin: vi.fn(),
+	removePin: vi.fn(),
+	listPins: vi.fn(async () => []),
 }));
 
 // Mock the KB folder-mode dependencies so the auto-migration path in `activate`
@@ -907,6 +920,7 @@ vi.mock("./views/SidebarWebviewProvider.js", () => ({
 		refreshConversationsPanel = mockRefreshConversationsPanel;
 		refreshPlansPanel() {}
 		notifyEnabledChanged = mockNotifyEnabledChanged;
+		toggleStatus = mockToggleStatus;
 		notifyAuthChanged = mockNotifyAuthChanged;
 		notifyConfiguredChanged() {}
 		setBadge() {}
@@ -915,6 +929,10 @@ vi.mock("./views/SidebarWebviewProvider.js", () => ({
 		// the constructed instance.
 		notifyApiKeySaveError = mockNotifyApiKeySaveError;
 	},
+}));
+
+vi.mock("./views/CreatePrWebviewPanel.js", () => ({
+	CreatePrWebviewPanel: MockCreatePrWebviewPanel,
 }));
 
 vi.mock("./views/SummaryWebviewPanel.js", () => ({
@@ -1365,6 +1383,40 @@ describe("Extension", () => {
 			]);
 		});
 
+		it("wires pinStore with addPin, removePin, and listPins", () => {
+			const ctx = makeContext();
+
+			activate(ctx);
+
+			const deps = sidebarDepsCaptured as { pinStore?: { addPin: unknown; removePin: unknown; listPins: unknown } };
+			expect(deps.pinStore).toBeDefined();
+			expect(typeof deps.pinStore?.addPin).toBe("function");
+			expect(typeof deps.pinStore?.removePin).toBe("function");
+			expect(typeof deps.pinStore?.listPins).toBe("function");
+		});
+
+		it("wires getSummaryAnyRepoWithSource and readTranscriptForRepo for pushMemoryEvidence", () => {
+			const ctx = makeContext();
+
+			activate(ctx);
+
+			const deps = sidebarDepsCaptured as {
+				getSummaryAnyRepoWithSource?: unknown;
+				readTranscriptForRepo?: unknown;
+			};
+			expect(typeof deps.getSummaryAnyRepoWithSource).toBe("function");
+			expect(typeof deps.readTranscriptForRepo).toBe("function");
+		});
+
+		it("wires getKnowledgeData for the Knowledge view", () => {
+			const ctx = makeContext();
+
+			activate(ctx);
+
+			const deps = sidebarDepsCaptured as { getKnowledgeData?: unknown };
+			expect(typeof deps.getKnowledgeData).toBe("function");
+		});
+
 		it("registers all expected commands", () => {
 			const ctx = makeContext();
 
@@ -1380,6 +1432,9 @@ describe("Extension", () => {
 				"jollimemory.clearMemoryFilter",
 				"jollimemory.loadMoreMemories",
 				"jollimemory.copyRecallPrompt",
+				"jollimemory.recallBranchInClaudeCode",
+				"jollimemory.copyBranchRecallPrompt",
+				"jollimemory.createPrForBranch",
 				"jollimemory.openInClaudeCode",
 				"jollimemory.refreshFiles",
 				"jollimemory.selectAllFiles",
@@ -1402,6 +1457,9 @@ describe("Extension", () => {
 				"jollimemory.viewMemorySummary",
 				"jollimemory.copyCommitHash",
 				"jollimemory.openSettings",
+				"jollimemory.toggleStatus",
+				"jollimemory.reviewNextMemory",
+				"jollimemory.shareBranchPlaceholder",
 			];
 
 			for (const cmd of expectedCommands) {
@@ -2230,6 +2288,68 @@ describe("Extension", () => {
 				expect(mockBridge.previewReferenceMarkdown).not.toHaveBeenCalled();
 			});
 
+			it("previewCommittedReference: reads the archived snapshot off the orphan branch and opens an untitled doc", async () => {
+				readReferenceFromBranch.mockResolvedValueOnce("# PROJ-1\nArchived snapshot body");
+				openTextDocument.mockClear();
+				showTextDocument.mockClear();
+
+				const handler = getRegisteredCommand(
+					"jollimemory.previewCommittedReference",
+				);
+				await handler("linear:PROJ-1-ab12cd34", "linear");
+
+				// archivedKey + source go to readReferenceFromBranch (NOT the live
+				// listReferences/mapKey path). No foreign repo → no storage override.
+				expect(readReferenceFromBranch).toHaveBeenCalledWith(
+					"linear",
+					"linear:PROJ-1-ab12cd34",
+					expect.anything(),
+					undefined,
+				);
+				expect(openTextDocument).toHaveBeenCalledWith(
+					expect.objectContaining({ language: "markdown", content: "# PROJ-1\nArchived snapshot body" }),
+				);
+				expect(showTextDocument).toHaveBeenCalled();
+			});
+
+			it("previewCommittedReference: threads foreign FolderStorage when foreignRepoName is set", async () => {
+				mockBridge.createStorageForRepo.mockResolvedValueOnce({
+					storage: { tag: "foreign-storage" },
+				} as never);
+				readReferenceFromBranch.mockResolvedValueOnce("# body");
+
+				const handler = getRegisteredCommand(
+					"jollimemory.previewCommittedReference",
+				);
+				await handler("linear:PROJ-9-ffe1", "linear", "other-repo", "https://github.com/org/other-repo");
+
+				expect(mockBridge.createStorageForRepo).toHaveBeenCalledWith(
+					"other-repo",
+					"https://github.com/org/other-repo",
+				);
+				expect(readReferenceFromBranch).toHaveBeenCalledWith(
+					"linear",
+					"linear:PROJ-9-ffe1",
+					expect.anything(),
+					{ tag: "foreign-storage" },
+				);
+			});
+
+			it("previewCommittedReference: warns and does not open a doc when the snapshot is missing", async () => {
+				readReferenceFromBranch.mockResolvedValueOnce(null);
+				openTextDocument.mockClear();
+
+				const handler = getRegisteredCommand(
+					"jollimemory.previewCommittedReference",
+				);
+				await handler("linear:GONE-1", "linear");
+
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("linear:GONE-1"),
+				);
+				expect(openTextDocument).not.toHaveBeenCalled();
+			});
+
 			it("ignoreReference: marks the entity ignored and refreshes plans", async () => {
 				const info = {
 					mapKey: "linear:ENG-4",
@@ -2661,6 +2781,16 @@ describe("Extension", () => {
 				// Critical guard: the save path must NOT call filesStore.refresh —
 				// re-querying the bridge is unnecessary and masked the race.
 				expect(mockFilesStore.refresh).not.toHaveBeenCalled();
+			});
+		});
+
+		describe("toggleStatus", () => {
+			it("relays the native title-bar Status click to the sidebar provider", () => {
+				mockToggleStatus.mockClear();
+				const handler = getRegisteredCommand("jollimemory.toggleStatus");
+				expect(handler).toBeDefined();
+				handler();
+				expect(mockToggleStatus).toHaveBeenCalledTimes(1);
 			});
 		});
 

@@ -11,8 +11,11 @@ import {
 import { JOLLI_DIR, JOLLIMEMORY_DIR } from "../../../cli/src/Logger.js";
 import type { SerializedTreeItem } from "../views/SidebarMessages.js";
 import {
+	type FilesSelectAll,
 	type SelectAllCtx,
+	type SelectAllCurrentMemoryCtx,
 	selectAllConversationsCommand,
+	selectAllCurrentMemoryCommand,
 	selectAllPlansAndNotesCommand,
 } from "./SelectAllSelection.js";
 
@@ -350,6 +353,222 @@ describe("selectAllPlansAndNotesCommand", () => {
 			],
 		);
 		await selectAllPlansAndNotesCommand(ctx);
+		expect(called).toBe(true);
+	});
+});
+
+// ── selectAllCurrentMemoryCommand ─────────────────────────────────────────────
+
+/**
+ * Stateful FilesStore fake: `selectionSummary()` reports the current array
+ * state, `selectAll(target)` records the call and flips every entry to the
+ * target so a follow-up summary reflects it.
+ */
+function makeFilesFake(initial: boolean[]): {
+	store: FilesSelectAll;
+	calls: boolean[];
+	current: () => boolean[];
+} {
+	let selected = [...initial];
+	const calls: boolean[] = [];
+	return {
+		store: {
+			selectionSummary: () => ({
+				total: selected.length,
+				allSelected: selected.length > 0 && selected.every(Boolean),
+			}),
+			selectAll: (target: boolean) => {
+				calls.push(target);
+				selected = selected.map(() => target);
+			},
+		},
+		calls,
+		current: () => selected,
+	};
+}
+
+/** Builds a unified ctx spanning conversations + plans/notes + a files fake. */
+function makeCurrentMemoryCtx(opts: {
+	conversations?: Array<{
+		source: "claude" | "codex";
+		sessionId: string;
+	}>;
+	planIds?: string[];
+	noteIds?: string[];
+	referenceIds?: string[];
+	files: ReturnType<typeof makeFilesFake>;
+	onChanged?: () => void | Promise<void>;
+}): SelectAllCurrentMemoryCtx {
+	const conversations = opts.conversations ?? [];
+	const planIds = opts.planIds ?? [];
+	const noteIds = opts.noteIds ?? [];
+	const referenceIds = opts.referenceIds ?? [];
+	let lastExclusions = {
+		plans: new Set<string>(),
+		notes: new Set<string>(),
+		conversations: new Set<string>(),
+		references: new Set<string>(),
+	};
+	return {
+		cwd,
+		activeSessions: {
+			async listWithDiagnostics() {
+				const ex = await readExclusions(cwd);
+				return {
+					items: conversations.map((c) => ({
+						sessionId: c.sessionId,
+						source: c.source,
+						title: c.sessionId,
+						messageCount: 0,
+						updatedAt: new Date().toISOString(),
+						transcriptPath: "/tmp/fake",
+						isEdited: false,
+						isSelected: !ex.conversations.has(
+							conversationKey(c.source, c.sessionId),
+						),
+					})),
+					failedSources: [],
+				};
+			},
+		},
+		plansProvider: {
+			serialize(): ReadonlyArray<SerializedTreeItem> {
+				// Synchronous read of the last-known exclusions is good enough for
+				// these tests — the command only needs isSelected to compute the
+				// combined verdict, and the suite seeds exclusions before calling.
+				return [
+					...planIds.map((id) => ({
+						id,
+						label: id,
+						contextValue: "plan" as const,
+						isSelected: !lastExclusions.plans.has(id),
+					})),
+					...noteIds.map((id) => ({
+						id,
+						label: id,
+						contextValue: "note" as const,
+						isSelected: !lastExclusions.notes.has(id),
+					})),
+					...referenceIds.map((id) => ({
+						id,
+						label: id,
+						contextValue: "reference" as const,
+						isSelected: !lastExclusions.references.has(id),
+					})),
+				];
+			},
+			async refreshExclusions() {
+				lastExclusions = await readExclusions(cwd);
+			},
+		},
+		filesStore: opts.files.store,
+		onChanged: async () => {
+			await opts.onChanged?.();
+		},
+	};
+}
+
+describe("selectAllCurrentMemoryCommand", () => {
+	it("deselects everything when all three groups are fully selected", async () => {
+		const files = makeFilesFake([true, true]);
+		const ctx = makeCurrentMemoryCtx({
+			conversations: [{ source: "claude", sessionId: "a" }],
+			files,
+		});
+		await selectAllCurrentMemoryCommand(ctx);
+
+		const ex = await readExclusions(cwd);
+		// Conversations now excluded (deselected) …
+		expect(ex.conversations.has(conversationKey("claude", "a"))).toBe(true);
+		// … and files told to deselect (selectAll(false)).
+		expect(files.calls).toEqual([false]);
+		expect(files.current()).toEqual([false, false]);
+	});
+
+	it("selects everything when nothing is selected", async () => {
+		await setAllExcluded(cwd, "conversations", [conversationKey("claude", "a")], true);
+		const files = makeFilesFake([false, false]);
+		const ctx = makeCurrentMemoryCtx({
+			conversations: [{ source: "claude", sessionId: "a" }],
+			files,
+		});
+		await selectAllCurrentMemoryCommand(ctx);
+
+		const ex = await readExclusions(cwd);
+		expect(ex.conversations.size).toBe(0);
+		expect(files.calls).toEqual([true]);
+		expect(files.current()).toEqual([true, true]);
+	});
+
+	it("selects everything when only the files group is partially selected", async () => {
+		// Conversations all selected (no exclusions), but one file unchecked →
+		// the combined verdict is "not all selected" → select all.
+		const files = makeFilesFake([true, false]);
+		const ctx = makeCurrentMemoryCtx({
+			conversations: [{ source: "claude", sessionId: "a" }],
+			files,
+		});
+		await selectAllCurrentMemoryCommand(ctx);
+
+		const ex = await readExclusions(cwd);
+		expect(ex.conversations.size).toBe(0);
+		expect(files.calls).toEqual([true]);
+	});
+
+	it("deselects across conversations, plans, notes and references together", async () => {
+		// Every group populated and fully selected → combined verdict is
+		// "all selected" → deselect everything. Exercises the plan / note /
+		// reference filter+map splits and the rows.every() verdict on a
+		// non-empty Context group (the contextAllSelected branch).
+		const files = makeFilesFake([true]);
+		const ctx = makeCurrentMemoryCtx({
+			conversations: [{ source: "claude", sessionId: "a" }],
+			planIds: ["plan-1"],
+			noteIds: ["note-1"],
+			referenceIds: ["jira:KAN-7"],
+			files,
+		});
+		await selectAllCurrentMemoryCommand(ctx);
+
+		const ex = await readExclusions(cwd);
+		expect(ex.conversations.has(conversationKey("claude", "a"))).toBe(true);
+		expect(ex.plans.has("plan-1")).toBe(true);
+		expect(ex.notes.has("note-1")).toBe(true);
+		expect(ex.references.has("jira:KAN-7")).toBe(true);
+		expect(files.calls).toEqual([false]);
+	});
+
+	it("selects everything when only the Context group is partially selected", async () => {
+		// Conversations + files fully selected, but one plan excluded → the
+		// combined verdict is "not all selected" → select all. Drives the
+		// rows.every() callback to its false outcome (contextAllSelected=false).
+		await setExcluded(cwd, "plans", "plan-1", true);
+		const files = makeFilesFake([true]);
+		const ctx = makeCurrentMemoryCtx({
+			conversations: [{ source: "claude", sessionId: "a" }],
+			planIds: ["plan-1", "plan-2"],
+			files,
+		});
+		await ctx.plansProvider.refreshExclusions();
+		await selectAllCurrentMemoryCommand(ctx);
+
+		const ex = await readExclusions(cwd);
+		expect(ex.plans.size).toBe(0);
+		expect(files.calls).toEqual([true]);
+	});
+
+	it("is a no-op verdict on a fully empty Current Memory (selects, never throws)", async () => {
+		const files = makeFilesFake([]);
+		let called = false;
+		const ctx = makeCurrentMemoryCtx({
+			files,
+			onChanged: () => {
+				called = true;
+			},
+		});
+		await selectAllCurrentMemoryCommand(ctx);
+		// total === 0 → allSelected false → target select; no files to flip.
+		expect(files.calls).toEqual([true]);
 		expect(called).toBe(true);
 	});
 });

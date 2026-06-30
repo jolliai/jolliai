@@ -1382,6 +1382,62 @@ export class JolliMemoryBridge {
 	}
 
 	/**
+	 * Resolves the refined delta base commit used by both {@link listBranchCommits}
+	 * and {@link getBranchPrStats} so their commit range and diffstat are computed
+	 * over the same `<base>..HEAD` span.
+	 *
+	 * Base resolution (same logic as `listBranchCommits`):
+	 *
+	 * 1. Compute the plain `merge-base HEAD <mainline>` via {@link resolveHistoryBaseRef}.
+	 *    Returns `undefined` when no common ancestor exists.
+	 * 2. **Merged mode** (`mergeBase === HEAD`): the branch has been merged; resolve via
+	 *    {@link resolveMergedHistory} so the diff covers the branch's own work rather
+	 *    than the entire mainline. This also applies the same `hasOwnCommit` gate as
+	 *    `listBranchCommits`: a sync-only merged branch (created from main + rebased,
+	 *    no own commits) returns `undefined` here so the diffstat is empty — matching
+	 *    the empty "Memories included" list rather than contradicting it.
+	 * 3. **Non-merged** (`mergeBase !== HEAD`): narrow the base via
+	 *    {@link resolveOwnCommitsBase} so a branch cut from `release/x.y` (or any
+	 *    non-main base branch) excludes that base branch's shared commits.
+	 *
+	 * Note: in merged mode this returns the creation-point hash regardless of whether
+	 * `getCurrentUserName()` is available — the diffstat doesn't need an author filter,
+	 * so that specific early-return guard in `listBranchCommits` is not replicated. The
+	 * `hasOwnCommit` guard (#2 above) IS replicated, because dropping it lets PR-stats
+	 * and the memory list disagree on the commit range.
+	 */
+	private async resolveBranchDeltaBase(mainBranch: string): Promise<string | undefined> {
+		const branch = await this.getCurrentBranch();
+		const baseRef = await this.resolveHistoryBaseRef(mainBranch);
+		const headHash = await this.getHEADHash();
+
+		const mergeBase = (
+			await tryExecGit(["merge-base", "HEAD", baseRef], this.cwd)
+		).trim();
+		if (!mergeBase) {
+			return undefined;
+		}
+
+		if (mergeBase === headHash) {
+			// Merged mode: resolve via the reflog so we share the SAME creation point
+			// AND the same `hasOwnCommit` gate as listBranchCommits (~978). A sync-only
+			// merged branch (created from main + rebased onto main, no own commits) must
+			// yield an empty diffstat — otherwise PR-stats would show a non-empty diff
+			// while the "Memories included" list is empty, contradicting the promise
+			// that both views cover exactly the same commit range.
+			const merged = await this.resolveMergedHistory(branch);
+			if (!merged || !merged.hasOwnCommit) {
+				return undefined;
+			}
+			return merged.base;
+		}
+
+		// Not merged: narrow the base so a branch cut from release/develop doesn't
+		// count that base branch's shared commits. No-op for branches cut from main.
+		return this.resolveOwnCommitsBase(branch, mergeBase);
+	}
+
+	/**
 	 * Returns true if the current HEAD commit has already been pushed to the
 	 * branch upstream. Used to show a toast after amend so the user knows
 	 * a force push will be needed.
@@ -2061,12 +2117,12 @@ export class JolliMemoryBridge {
 		}
 
 		try {
-			const cfg = (await loadConfig()) as Record<string, unknown>;
-			const customKBPath = cfg.localFolder as string | undefined;
-			const kbParent = resolveKbParent(customKBPath);
-			const currentRepoName = extractRepoName(this.cwd);
-			const currentRemoteUrl = getRemoteUrl(this.cwd);
-			const repos = discoverRepos(currentRepoName, currentRemoteUrl, kbParent);
+			// Route through the shared discovery cache (mirrors
+			// createStorageForRepo/createStorageForCurrentRepo) so a miss here
+			// reuses the already-resolved config + remote URL + folder scan rather
+			// than re-running loadConfig + getRemoteUrl (git subprocess) +
+			// discoverRepos (full folder walk) on every single lookup.
+			const { repos } = await this.getDiscoveryCached();
 			for (const repo of repos) {
 				if (repo.isCurrentRepo) continue;
 				try {
@@ -2165,12 +2221,11 @@ export class JolliMemoryBridge {
 		remoteUrl: string | null,
 	): Promise<{ storage: StorageProvider; kbRoot: string } | null> {
 		try {
-			const cfg = (await loadConfig()) as Record<string, unknown>;
-			const customKBPath = cfg.localFolder as string | undefined;
-			const kbParent = resolveKbParent(customKBPath);
-			const currentRepoName = extractRepoName(this.cwd);
-			const currentRemoteUrl = getRemoteUrl(this.cwd);
-			const repos = discoverRepos(currentRepoName, currentRemoteUrl, kbParent);
+			// Reuse the short-lived discovery cache instead of re-running
+			// loadConfig + getRemoteUrl (a git subprocess) + discoverRepos on
+			// every call — pushMemoryEvidence reads N transcripts per memory and
+			// would otherwise repeat the full scan once per transcript.
+			const { repos } = await this.getDiscoveryCached();
 			for (const repo of repos) {
 				if (repo.isCurrentRepo) continue;
 				const urlMatches =
@@ -2528,6 +2583,47 @@ export class JolliMemoryBridge {
 		return (await execGit(["rev-parse", "HEAD"], this.cwd)).trim();
 	}
 
+	/**
+	 * Returns diff statistics and changed-file list for the current branch
+	 * relative to the refined delta base shared with {@link listBranchCommits}.
+	 *
+	 * Delegates base resolution to {@link resolveBranchDeltaBase} so the
+	 * diffstat and file list reflect exactly the same commit range as the
+	 * "Memories included" list — including the two refinements that
+	 * `listBranchCommits` applies:
+	 *
+	 * 1. Merged mode (`mergeBase === HEAD`): uses `resolveMergedHistory` so the
+	 *    diff covers only the branch's own work, and a sync-only merged branch
+	 *    (no own commits) yields empty stats — matching the empty memory list.
+	 * 2. Branch cut from a non-main base (e.g. `release/x.y`): uses
+	 *    `resolveOwnCommitsBase` to narrow the range so the base branch's
+	 *    shared commits are excluded.
+	 *
+	 * Numeric counts come from the shared {@link getDiffStats} helper.
+	 * File-level detail comes from `git diff --name-status <base> HEAD`.
+	 */
+	async getBranchPrStats(mainBranch: string): Promise<{
+		insertions: number;
+		deletions: number;
+		filesChanged: number;
+		files: Array<{ path: string; dir: string; status: string }>;
+	}> {
+		const deltaBase = await this.resolveBranchDeltaBase(mainBranch);
+		if (!deltaBase) {
+			return { insertions: 0, deletions: 0, filesChanged: 0, files: [] };
+		}
+		const [stats, nameStatusRaw] = await Promise.all([
+			getDiffStats(deltaBase, "HEAD", this.cwd),
+			tryExecGit(["-c", "core.quotepath=false", "diff", "--name-status", deltaBase, "HEAD"], this.cwd),
+		]);
+		return {
+			insertions: stats.insertions,
+			deletions: stats.deletions,
+			filesChanged: stats.filesChanged,
+			files: parseDiffNameStatus(nameStatusRaw),
+		};
+	}
+
 	// ── Private helpers ───────────────────────────────────────────────────
 
 	/**
@@ -2691,6 +2787,30 @@ export class JolliMemoryBridge {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Parses raw `git diff --name-status` output into file rows.
+ * Each line is `<STATUS>\t<path>` (or `R100\t<old>\t<new>` for renames).
+ * Status codes are normalised: rename codes like "R100" become "R".
+ *
+ * keep in lockstep with parseNameStatus in CreatePrData.ts — they are
+ * byte-identical; any logic change must be applied to both.
+ */
+function parseDiffNameStatus(raw: string): Array<{ path: string; dir: string; status: string }> {
+	const rows: Array<{ path: string; dir: string; status: string }> = [];
+	for (const line of raw.split("\n")) {
+		const entry = line.endsWith("\r") ? line.slice(0, -1) : line;
+		if (!entry.trim() || !entry.includes("\t")) continue;
+		const parts = entry.split("\t");
+		const rawStatus = parts[0];
+		const status = rawStatus.startsWith("R") ? "R" : rawStatus;
+		const filePath = toForwardSlash(status === "R" && parts.length >= 3 ? parts[2] : parts[1]);
+		const lastSlash = filePath.lastIndexOf("/");
+		const dir = lastSlash >= 0 ? filePath.slice(0, lastSlash) : "";
+		rows.push({ path: filePath, dir, status });
+	}
+	return rows;
+}
 
 /** Extracts display-level metadata for a commit from the index entry (fast) or git diff (fallback). */
 async function resolveCommitMeta(

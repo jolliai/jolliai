@@ -142,7 +142,7 @@ export class StatusBarManager {
 	setSyncState(state: SyncState, detail?: SyncStatusDetail): void {
 		this.syncOwned = true;
 		switch (state) {
-			case "synced":
+			case "synced": {
 				// P2 #2 — symlinked canary entries are a strong hostile-
 				// placement signal (a peer or a foreign writer dropped a
 				// symlink at a path the classifier would otherwise have
@@ -153,8 +153,8 @@ export class StatusBarManager {
 				// signal sits in logs only. `unowned` is a weak signal
 				// (classifier drift / OS noise) and stays in the tooltip
 				// only, no badge.
-				if ((detail?.canarySymlinkedCount ?? 0) > 0) {
-					const n = detail?.canarySymlinkedCount ?? 0;
+				const n = detail?.canarySymlinkedCount ?? 0;
+				if (n > 0) {
 					this.item.text = `$(warning) Memory Bank: symlink blocked`;
 					this.item.backgroundColor = new vscode.ThemeColor(
 						"statusBarItem.warningBackground",
@@ -173,6 +173,7 @@ export class StatusBarManager {
 				this.item.color = undefined;
 				this.item.tooltip = buildTooltip("Memory Bank in sync", detail);
 				return;
+			}
 			case "syncing":
 				this.item.text = "$(sync~spin) Syncing…";
 				this.item.backgroundColor = undefined;

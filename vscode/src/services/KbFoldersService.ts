@@ -295,6 +295,7 @@ export class KbFoldersService {
 				return {
 					...prefixed,
 					name: repoDisplayName(repo),
+					repoName: repo.repoName,
 					isRepoRoot: true,
 					isCurrentRepo: repo.isCurrentRepo,
 				};
@@ -342,6 +343,7 @@ export class KbFoldersService {
 		);
 		const repoChildren: FolderNode[] = repos.map((repo) => ({
 			name: repoDisplayName(repo),
+			repoName: repo.repoName,
 			relPath: repo.dirName,
 			isDirectory: true,
 			children: undefined,

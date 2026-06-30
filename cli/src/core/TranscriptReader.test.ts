@@ -892,4 +892,37 @@ describe("TranscriptReader", () => {
 			expect(result.newCursor.lineNumber).toBe(2);
 		});
 	});
+
+	describe("usageTokens accumulation", () => {
+		it("accumulates per-turn token usage from Claude transcript", async () => {
+			const filePath = join(tempDir, "claude-usage.jsonl");
+			const lines = [
+				JSON.stringify({
+					message: { role: "user", content: "hello" },
+					timestamp: "2026-03-22T00:00:00Z",
+				}),
+				JSON.stringify({
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "hi there" }],
+					},
+					usage: {
+						input_tokens: 100,
+						cache_creation_input_tokens: 20,
+						cache_read_input_tokens: 300,
+						output_tokens: 5,
+					},
+					timestamp: "2026-03-22T00:00:01Z",
+				}),
+			];
+			await writeFile(filePath, lines.join("\n"), "utf-8");
+
+			const result = await readTranscript(filePath);
+			expect(result.entries).toHaveLength(2);
+			// 100 (input) + 20 (cache_creation) + 5 (output) = 125. cache_read_input_tokens
+			// (300) is excluded — it is the cumulative re-read of an already-counted cached
+			// prefix and must not be summed (see ClaudeTranscriptParser.parseUsageTokens / C6).
+			expect(result.usageTokens).toBe(125);
+		});
+	});
 });

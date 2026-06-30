@@ -177,6 +177,20 @@ export class CommitsStore extends BaseStore<
 		this.rebuildSnapshot("userCheckbox");
 	}
 
+	/**
+	 * Clear all commit selections unconditionally (not a toggle). Used when the
+	 * sidebar enters or leaves squash-selection mode so a stale pre-checked set
+	 * never carries over into the next squash session. No-op when already empty
+	 * so we don't push a redundant snapshot.
+	 */
+	clearSelection(): void {
+		if (this.checkedHashes.size === 0) {
+			return;
+		}
+		this.checkedHashes.clear();
+		this.rebuildSnapshot("selectAll");
+	}
+
 	/** Programmatic select-all toggle. */
 	toggleSelectAll(): void {
 		if (this.checkedHashes.size > 0) {

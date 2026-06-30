@@ -212,6 +212,7 @@ data class CommitSummary(
     val commitSource: CommitSource? = null,
     val transcriptEntries: Int? = null,
     val conversationTurns: Int? = null,
+    val conversationTokens: Int? = null,
     val llm: LlmCallMetadata? = null,
     /** Coding-session token usage captured by this memory (null = not recorded). */
     val tokenUsage: TokenUsage? = null,

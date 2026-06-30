@@ -34,10 +34,10 @@ export function buildScript(): string {
   }
   document.querySelectorAll('.toggle-header').forEach(attachToggleHeader);
 
-  // ── Redesign v2: Details disclosure + panel/card/drawer collapse ──
-  // Net-new presentational toggles. The collapse wrappers (.attach-card,
-  // .private-drawer) live OUTSIDE the sections that replaceSection rebuilds, so
-  // their collapsed state survives plansAndNotesUpdated / refreshConversations
+  // ── Redesign v2: Details disclosure + panel/card collapse ──
+  // Net-new presentational toggles. The collapse wrapper (.attach-card)
+  // lives OUTSIDE the sections that replaceSection rebuilds, so
+  // its collapsed state survives plansAndNotesUpdated / refreshConversations
   // refreshes with no state persistence needed. Bound once at load; the heads
   // are never replaced. Default state is expanded for every collapsible region
   // except the Details property table (which ships with .collapsed).

@@ -84,6 +84,7 @@ import {
 	storeSummary,
 	stripFunctionalMetadata,
 } from "./SummaryStore.js";
+import { aggregateConversationTokens } from "./SummaryTree.js";
 
 /** Creates a minimal mock CommitSummary in tree format (leaf node). */
 function createMockSummary(hash = "abc123def456", message = "Fix bug"): CommitSummary {
@@ -2051,6 +2052,36 @@ describe("SummaryStore", () => {
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
 			expect(merged.summaryError).toBeUndefined();
+		});
+
+		describe("conversationTokens aggregation (B5)", () => {
+			it("root stores no conversationTokens; aggregateConversationTokens returns children sum (300 + 700 = 1000)", async () => {
+				vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+				const s1: CommitSummary = { ...createMockSummary("tok1", "Feat A"), conversationTokens: 300 };
+				const s2: CommitSummary = { ...createMockSummary("tok2", "Feat B"), conversationTokens: 700 };
+
+				await mergeManyToOne([s1, s2], createMockCommitInfo("tokmerge1", "Squashed"));
+
+				const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+				const merged = JSON.parse(files[0].content) as CommitSummary;
+				// Root must NOT store conversationTokens — value lives on children, derived at display time.
+				expect("conversationTokens" in merged).toBe(false);
+				// Aggregate across the tree must equal the children sum.
+				expect(aggregateConversationTokens(merged)).toBe(1000);
+			});
+
+			it("omits conversationTokens on the merged root when all sources lack it (no zero write)", async () => {
+				vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+				const s1 = createMockSummary("notok1", "No tokens A");
+				const s2 = createMockSummary("notok2", "No tokens B");
+
+				await mergeManyToOne([s1, s2], createMockCommitInfo("tokmerge2", "Squashed no tokens"));
+
+				const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+				const merged = JSON.parse(files[0].content) as CommitSummary;
+				expect("conversationTokens" in merged).toBe(false);
+				expect(aggregateConversationTokens(merged)).toBe(0);
+			});
 		});
 	});
 

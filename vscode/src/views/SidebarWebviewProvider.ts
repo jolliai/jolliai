@@ -9,9 +9,19 @@
 
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
-import type { TranscriptSource } from "../../../cli/src/Types.js";
+import type { PinEntry, PinKind } from "../../../cli/src/core/PinStore.js";
+import { resolveSessionTitle } from "../../../cli/src/core/SessionTitleResolver.js";
+import { getTranscriptIds } from "../../../cli/src/core/SummaryTree.js";
+import type {
+	CommitSummary,
+	StoredSession,
+	StoredTranscript,
+	TranscriptEntry,
+	TranscriptSource,
+} from "../../../cli/src/Types.js";
 import { isTranscriptSource } from "../../../cli/src/Types.js";
 import type { ActiveSessionsProvider } from "../services/ActiveSessionsProvider.js";
+import type { CommitFileInfo } from "../Types.js";
 import { flushExtensionTelemetry } from "../TelemetryActivation.js";
 import type { WorkerPhase } from "../stores/StatusStore.js";
 import { log } from "../util/Logger.js";
@@ -21,6 +31,9 @@ import { buildSidebarHtml } from "./SidebarHtmlBuilder.js";
 import type {
 	BranchMemoryItem,
 	FolderNode,
+	KnowledgeRepo,
+	MemoryEvidence,
+	MemoryEvidenceItem,
 	MemoryItem,
 	RepoChoice,
 	SerializedTreeItem,
@@ -28,6 +41,14 @@ import type {
 	SidebarOutboundMsg,
 	SidebarState,
 } from "./SidebarMessages.js";
+
+/**
+ * Closed set of reference `SourceId`s (mirrors `SourceId` in cli Types.ts).
+ * Used to validate the `source` on an inbound `kb:openEvidenceReference`
+ * message — webview messages cross a trust boundary, so an unknown source is
+ * dropped rather than forwarded into the archived-snapshot read path.
+ */
+const REFERENCE_SOURCE_IDS = new Set<string>(["linear", "jira", "github", "notion"]);
 
 export interface SidebarWebviewDeps {
 	executeCommand: (
@@ -120,6 +141,13 @@ export interface SidebarWebviewDeps {
 			dispose: () => void;
 		};
 	};
+	/**
+	 * Resolves the workspace HEAD short hash, attached to `worker:busy` while
+	 * the blocking summary runs so the webview's "Summarizing <hash>…" row can
+	 * name the commit. Returns undefined on any failure (detached/empty repo).
+	 * Optional so existing provider tests keep compiling without a stub.
+	 */
+	getHeadShortHash?: () => string | undefined;
 	plansProvider?: {
 		serialize(): ReadonlyArray<SerializedTreeItem>;
 		onDidChangeTreeData: (cb: () => void) => { dispose: () => void };
@@ -162,6 +190,12 @@ export interface SidebarWebviewDeps {
 	applyFileCheckbox?: (filePath: string, selected: boolean) => void;
 	/** Toggle a single commit's selection state in CommitsStore. */
 	applyCommitCheckbox?: (hash: string, selected: boolean) => void;
+	/**
+	 * Clear ALL commit selections in CommitsStore. Called when the squash UI
+	 * enters or exits selection mode so host-side isSelected flags never go
+	 * stale across squash sessions (the webview squashMode flag is local only).
+	 */
+	deselectAllCommits?: () => void;
 	/** Toggle a single conversation's selection state in ConversationsStore. */
 	applyConversationCheckbox?: (
 		source: TranscriptSource,
@@ -203,6 +237,112 @@ export interface SidebarWebviewDeps {
 	 * placeholder.
 	 */
 	initialStateReady?: Promise<unknown>;
+	/**
+	 * Access to the PinStore operations. Optional so existing tests (which
+	 * don't exercise pin/unpin) keep compiling without changes. When absent,
+	 * `branch:pin` / `branch:unpin` messages are silently ignored and
+	 * `pushPins()` posts an empty list.
+	 */
+	pinStore?: {
+		addPin(projectDir: string, repoName: string, branchName: string, entry: PinEntry): Promise<void>;
+		removePin(projectDir: string, repoName: string, branchName: string, kind: PinKind, id: string): Promise<void>;
+		listPins(projectDir: string, repoName: string, branchName: string): Promise<PinEntry[]>;
+	};
+	/**
+	 * Source-aware summary lookup for the Timeline's `kb:expandMemory` handler.
+	 * Returns the `CommitSummary` together with its provenance (`sourceRepoName` /
+	 * `sourceRemoteUrl`) so that `pushMemoryEvidence` can route transcript reads
+	 * to the correct repo's storage rather than always reading from the cwd
+	 * workspace storage (which lacks transcripts for foreign-repo memories).
+	 *
+	 * Optional so existing tests that don't exercise `kb:expandMemory` keep
+	 * compiling without changes. When absent, `pushMemoryEvidence` falls back
+	 * to `getSummaryByHash` (no source provenance, cwd storage used for
+	 * transcripts). When both are absent, evidence groups are empty.
+	 *
+	 * Wired in Extension.ts via `bridge.getSummaryAnyRepoWithSource(hash)`.
+	 */
+	getSummaryAnyRepoWithSource?: (commitHash: string) => Promise<{
+		summary: CommitSummary | undefined;
+		sourceRepoName: string | null;
+		sourceRemoteUrl: string | null;
+	}>;
+	/**
+	 * Resolves a commit hash to its stored `CommitSummary`. Optional fallback
+	 * for tests that mock only the simple lookup without source provenance.
+	 * `getSummaryAnyRepoWithSource` takes precedence when both are wired.
+	 */
+	getSummaryByHash?: (commitHash: string) => Promise<CommitSummary | undefined>;
+	/**
+	 * Reads the `StoredTranscript` for a given transcript ID from the repo
+	 * identified by `sourceRepoName` / `sourceRemoteUrl`. When `sourceRepoName`
+	 * is non-null the implementation reads from that foreign repo's FolderStorage
+	 * (mirroring `SummaryWebviewPanel`'s detail-panel read path); when null it
+	 * reads from the current workspace storage. Optional; when absent,
+	 * `readTranscriptById` is tried as a fallback (cwd storage only).
+	 *
+	 * Wired in Extension.ts via `bridge.createStorageForRepo` /
+	 * `bridge.createReadStorageForCurrentRepo` + `readTranscript`.
+	 */
+	readTranscriptForRepo?: (
+		id: string,
+		sourceRepoName: string | null,
+		sourceRemoteUrl: string | null,
+	) => Promise<StoredTranscript | null>;
+	/**
+	 * Reads the `StoredTranscript` for a given transcript ID from the current
+	 * workspace storage. Optional fallback used when `readTranscriptForRepo` is
+	 * absent; when both are absent, conversations evidence is empty.
+	 */
+	readTranscriptById?: (id: string) => Promise<StoredTranscript | null>;
+	/**
+	 * Returns `KnowledgeRepo[]` for the Knowledge wiki view — one entry per
+	 * discoverable Memory Bank repo, each projected from its compiled
+	 * knowledge-graph artifact. A repo with no graph contributes a
+	 * `KnowledgeRepo` with `categories: []` (the client renders a Build CTA).
+	 *
+	 * Optional so existing tests that don't exercise the Knowledge view keep
+	 * compiling without changes. When absent, `pushKnowledgeData` posts an
+	 * empty repos list.
+	 */
+	getKnowledgeData?: () => Promise<ReadonlyArray<KnowledgeRepo>>;
+	/**
+	 * Returns aggregated LLM token counts across all committed summaries on
+	 * the current branch. Called alongside `pushCommits` so the token bar
+	 * renders immediately when commits data arrives. Optional: when absent,
+	 * no `branch:tokenStats` message is posted and the token bar stays hidden.
+	 * Must never reject — caller uses `.catch(() => undefined)`.
+	 */
+	getBranchTokenStats?: () => Promise<{
+		input: number;
+		output: number;
+		cached: number;
+		reporting: number;
+		memories: number;
+	}>;
+	/**
+	 * Returns the real per-file git status (A/M/D/R + rename oldPath) for a
+	 * commit — the same `git diff-tree --name-status` projection the Branch-tab
+	 * commit-file rows use. Wired in Extension.ts via `bridge.listCommitFiles`.
+	 *
+	 * Used by `pushMemoryEvidence` to source a LOCAL memory's FILES group from
+	 * git truth instead of the summary's path-only `topic.filesAffected`, so
+	 * `jollimemory.openCommitFileChange` opens the correct diff for added /
+	 * deleted / renamed files (a path-only list defaulted every file to 'M',
+	 * which errored "file not found" for non-modified files). Optional: when
+	 * absent (or it yields nothing) the path-only topic projection is the
+	 * fallback. Foreign-repo memories never call it — their commit can't be
+	 * diffed against the workspace git, so their rows are non-interactive.
+	 */
+	listCommitFiles?: (commitHash: string) => Promise<ReadonlyArray<CommitFileInfo>>;
+	/**
+	 * Looks up the open GitHub PR for the given branch via `gh pr list`.
+	 * Returns `{ number, url }` when an open PR is found, or `undefined` when
+	 * there is none. Runs `gh` as a subprocess — callers must guard failures
+	 * with try/catch. Optional so existing tests keep compiling without changes.
+	 * Wired in Extension.ts via `findOpenPrForBranch(workspaceRoot, branch)`.
+	 */
+	findOpenPrForBranch?: (branch: string) => Promise<{ number: number; url: string } | undefined>;
 }
 
 export class SidebarWebviewProvider
@@ -302,6 +442,14 @@ export class SidebarWebviewProvider
 		if (this.deps.branchWatcher && !this.branchSub) {
 			this.branchSub = this.deps.branchWatcher.onChange((name, detached) => {
 				this.postMessage({ type: "branch:branchName", name, detached });
+				// Pins are grouped per branch (pinGroupKey(repo, branch)). A git
+				// checkout changes which group is current, so re-push or the
+				// Pinned section keeps showing the previous branch's pins until a
+				// manual refresh — and a pin added meanwhile lands in the new
+				// branch's group while the stale list hides it. Skip when the user
+				// is viewing a foreign branch via the breadcrumb (selectedBranchName
+				// set): that selection is independent of the workspace HEAD.
+				if (this.selectedBranchName === undefined) void this.pushPins();
 			});
 		}
 		if (this.deps.plansProvider && !this.plansSub) {
@@ -420,6 +568,7 @@ export class SidebarWebviewProvider
 		this.pushChanges();
 		void this.pushCommits();
 		void this.pushConversations();
+		void this.pushPins();
 		if (this.deps.branchWatcher) {
 			const cur = this.deps.branchWatcher.current();
 			this.postMessage({
@@ -478,6 +627,58 @@ export class SidebarWebviewProvider
 					msg.commitHash,
 				);
 				return;
+			case "kb:expandMemory":
+				void this.pushMemoryEvidence(msg.commitHash);
+				return;
+			case "kb:openEvidenceNote":
+				// Committed-memory note evidence row. Routes to the orphan-only
+				// previewNote (the same command the detail panel uses for committed
+				// notes), passing the memory's provenance so a foreign-repo note
+				// reads from the owning repo's storage. The live openNoteForPreview
+				// would silently no-op here — the note is gone from plans.json.
+				void this.deps.executeCommand(
+					"jollimemory.previewNote",
+					msg.noteId,
+					msg.title,
+					msg.sourceRepoName,
+					msg.sourceRemoteUrl,
+				);
+				return;
+			case "kb:openEvidencePlan":
+				// Foreign-repo committed-memory plan evidence row. Routes to
+				// previewCommittedPlan, passing the memory's provenance so the plan
+				// body reads from the owning repo's FolderStorage. The live
+				// openPlanForPreview path resolves against the current workspace and
+				// can't see a foreign repo's plan.
+				void this.deps.executeCommand(
+					"jollimemory.previewCommittedPlan",
+					msg.planId,
+					msg.title,
+					msg.sourceRepoName,
+					msg.sourceRemoteUrl,
+				);
+				return;
+			case "kb:openEvidenceReference": {
+				// Committed-memory reference evidence row. The archived snapshot is
+				// read off the orphan branch by source + archivedKey; the live
+				// openReferenceForPreview path is dead post-commit. `source` crosses
+				// a trust boundary, so validate it against the closed SourceId set
+				// before forwarding (mirrors branch:openConversation's source check).
+				if (!REFERENCE_SOURCE_IDS.has(msg.source)) {
+					log.warn("SidebarWebviewProvider", "Rejected kb:openEvidenceReference with unknown source", {
+						source: String(msg.source),
+					});
+					return;
+				}
+				void this.deps.executeCommand(
+					"jollimemory.previewCommittedReference",
+					msg.archivedKey,
+					msg.source,
+					msg.sourceRepoName,
+					msg.sourceRemoteUrl,
+				);
+				return;
+			}
 			case "branch:openPlan":
 				// Sidebar row-click → markdown preview, not editor. Editing goes
 				// through the context menu's "Edit Plan" (editPlan).
@@ -600,6 +801,38 @@ export class SidebarWebviewProvider
 					},
 				});
 				return;
+			case "kb:openEvidenceConversation":
+				// Committed-memory conversation evidence row. Unlike
+				// branch:openConversation, this reads the ARCHIVED snapshot off
+				// the orphan branch and renders it read-only — the live
+				// cursor-trimmed path is empty for a committed memory. Same trust
+				// boundary as branch:openConversation: every field is `unknown`
+				// at runtime and must be validated before it routes a storage
+				// read / flows into the panel DOM.
+				if (!isTranscriptSource(msg.source)) {
+					log.warn(
+						"SidebarWebviewProvider",
+						"Rejected kb:openEvidenceConversation with unknown source",
+						{ source: String(msg.source) },
+					);
+					return;
+				}
+				if (
+					typeof msg.commitHash !== "string" ||
+					msg.commitHash.length === 0 ||
+					typeof msg.sessionId !== "string" ||
+					msg.sessionId.length === 0 ||
+					typeof msg.title !== "string" ||
+					msg.title.length === 0
+				) {
+					log.warn(
+						"SidebarWebviewProvider",
+						"Rejected kb:openEvidenceConversation with non-string or empty commitHash/sessionId/title",
+					);
+					return;
+				}
+				void this.openEvidenceConversation(msg.commitHash, msg.sessionId, msg.source, msg.title);
+				return;
 			case "branch:discardFile":
 				// jollimemory.discardFileChanges reads item.fileStatus.{relativePath,
 				// statusCode, absolutePath} — same structural shape we hand the open
@@ -630,6 +863,9 @@ export class SidebarWebviewProvider
 				return;
 			case "branch:toggleCommitSelection":
 				this.deps.applyCommitCheckbox?.(msg.hash, msg.selected);
+				return;
+			case "branch:deselectAllCommits":
+				this.deps.deselectAllCommits?.();
 				return;
 			case "branch:toggleConversationSelection":
 				if (!isTranscriptSource(msg.source)) {
@@ -664,6 +900,86 @@ export class SidebarWebviewProvider
 			case "selection:requestBranchMemories":
 				void this.handleBranchMemoriesRequest(msg.repoName, msg.branchName);
 				return;
+			case "branch:pin": {
+				const state = this.deps.getInitialState();
+				const repo = this.selectedRepoName ?? state.currentRepoName ?? "";
+				// Resolve the branch the same way pushPins() does: the live HEAD from
+				// branchWatcher is authoritative because state.branchName can lag a
+				// fresh checkout. A pin written under the stale branch group would
+				// never surface in the pushPins() read (which uses the live branch).
+				const branch =
+					this.selectedBranchName ?? this.deps.branchWatcher?.current().name ?? state.branchName;
+				const projectDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+				if (projectDir && repo && this.deps.pinStore) {
+					void this.deps.pinStore
+						.addPin(projectDir, repo, branch, {
+							kind: msg.kind,
+							id: msg.id,
+							title: msg.title,
+							pinnedAt: Date.now(),
+							// Persist source/transcriptPath only when non-empty.
+							// Webview messages cross a trust boundary, and an empty
+							// string here would round-trip into a conversation pin
+							// the openConversation handler later rejects as empty —
+							// a row that silently does nothing on click.
+							...(msg.source ? { source: msg.source } : {}),
+							...(msg.transcriptPath ? { transcriptPath: msg.transcriptPath } : {}),
+						})
+						.then(() => this.pushPins())
+						// The webview only renders pins from the pushPins response —
+						// it never optimistically draws the row — so a swallowed write
+						// failure would leave the user's click doing nothing with no
+						// signal. Log it instead of leaking an unhandled rejection.
+						.catch((err) =>
+							log.warn(
+								"SidebarWebviewProvider",
+								`addPin failed: ${err instanceof Error ? err.message : String(err)}`,
+							),
+						);
+				}
+				return;
+			}
+			case "branch:unpin": {
+				const state = this.deps.getInitialState();
+				const repo = this.selectedRepoName ?? state.currentRepoName ?? "";
+				// Resolve the branch the same way pushPins() does: the live HEAD from
+				// branchWatcher is authoritative because state.branchName can lag a
+				// fresh checkout. A pin written under the stale branch group would
+				// never surface in the pushPins() read (which uses the live branch).
+				const branch =
+					this.selectedBranchName ?? this.deps.branchWatcher?.current().name ?? state.branchName;
+				const projectDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+				if (projectDir && repo && this.deps.pinStore) {
+					void this.deps.pinStore
+						.removePin(projectDir, repo, branch, msg.kind, msg.id)
+						.then(() => this.pushPins())
+						.catch((err) =>
+							log.warn(
+								"SidebarWebviewProvider",
+								`removePin failed: ${err instanceof Error ? err.message : String(err)}`,
+							),
+						);
+				}
+				return;
+			}
+			case "kb:requestPrStatus": {
+				// Fire-and-forget: never throw — post pr: null on any failure or
+				// when the dep is absent. Mirrors the fire-and-forget pattern of
+				// other optional-dep handlers (e.g. kb:expandMemory / pushCommits).
+				const { branch } = msg;
+				void (async () => {
+					let pr: { number: number; url: string } | null = null;
+					if (this.deps.findOpenPrForBranch) {
+						try {
+							pr = (await this.deps.findOpenPrForBranch(branch)) ?? null;
+						} catch {
+							pr = null;
+						}
+					}
+					this.postMessage({ type: "kb:prStatus", branch, pr });
+				})();
+				return;
+			}
 			default:
 				return;
 		}
@@ -706,6 +1022,7 @@ export class SidebarWebviewProvider
 				repoName: this.selectedRepoName,
 				branchName: this.selectedBranchName,
 			});
+			void this.pushPins();
 			return;
 		}
 		if (branchName) {
@@ -715,6 +1032,7 @@ export class SidebarWebviewProvider
 				repoName: this.selectedRepoName,
 				branchName,
 			});
+			void this.pushPins();
 		}
 	}
 
@@ -756,6 +1074,331 @@ export class SidebarWebviewProvider
 		}
 	}
 
+	/**
+	 * Reads every archived `StoredSession` for a commit's transcripts, deduped by
+	 * (source, sessionId) in first-seen order. Routes the read to the owning
+	 * repo's storage via `readTranscriptForRepo` (foreign-repo memories), falling
+	 * back to `readTranscriptById` (cwd storage) then to `[]` when neither dep is
+	 * wired. Per-transcript read failures degrade to an empty slice + a warn,
+	 * never throw — both callers (`pushMemoryEvidence` projection and the archived
+	 * conversation opener) treat a missing transcript as "no conversations".
+	 *
+	 * Dedupe-and-merge is essential for consolidated / squashed memories: a
+	 * long-running session is captured once per commit it spans, each transcript
+	 * holding only the unread turns consumed at THAT commit (disjoint, sequential
+	 * slices — not a full copy). A consolidated summary references every such
+	 * transcript, so a naive flatten emitted one duplicate row per slice (observed
+	 * as 17 identical rows for a single session) and the opener's `sessions.find`
+	 * surfaced just the first slice. Collapsing by (source, sessionId) and
+	 * concatenating slices in first-seen order yields one row per session whose
+	 * `entries` reconstruct the full conversation. The first-seen
+	 * source/transcriptPath win — they are identical across a session's slices.
+	 */
+	private async readArchivedSessions(
+		summary: CommitSummary,
+		sourceRepoName: string | null,
+		sourceRemoteUrl: string | null,
+	): Promise<StoredSession[]> {
+		const transcriptIds = getTranscriptIds(summary);
+		const readFn = this.deps.readTranscriptForRepo
+			? (tid: string) => this.deps.readTranscriptForRepo?.(tid, sourceRepoName, sourceRemoteUrl)
+			: this.deps.readTranscriptById
+				? (tid: string) => this.deps.readTranscriptById?.(tid)
+				: null;
+		if (!readFn) return [];
+		// Read transcripts concurrently — each readFn call resolves the owning
+		// repo's storage independently, so serial awaits would stack the per-read
+		// latencies. Promise.all preserves first-seen order.
+		const perTranscript = await Promise.all(
+			transcriptIds.map(async (tid) => {
+				try {
+					const stored = await readFn(tid);
+					return stored?.sessions ?? [];
+				} catch (err) {
+					log.warn(
+						"SidebarWebviewProvider",
+						`readArchivedSessions: failed to read transcript ${tid}: ${err instanceof Error ? err.message : String(err)}`,
+					);
+					return [];
+				}
+			}),
+		);
+		// Collapse the same session across transcripts: keep first-seen order of
+		// sessions, gathering each transcript's slice of a session as a separate
+		// part. The "claude" default mirrors the reader's back-compat for a
+		// source-less stored session and matches the opener's match key + the
+		// aggregator's dedupe key, so the same session keys consistently
+		// everywhere.
+		const order: string[] = [];
+		const grouped = new Map<
+			string,
+			{ base: StoredSession; parts: ReadonlyArray<TranscriptEntry>[] }
+		>();
+		for (const session of perTranscript.flat()) {
+			const key = `${session.source ?? "claude"}:${session.sessionId}`;
+			// Coalesce: a malformed stored session may omit `entries` (the JSON
+			// field is optional in practice). Treat it as an empty slice so the
+			// flatten below never yields an `undefined` entry.
+			const entries = session.entries ?? [];
+			const existing = grouped.get(key);
+			if (existing) {
+				existing.parts.push(entries);
+			} else {
+				order.push(key);
+				grouped.set(key, { base: session, parts: [entries] });
+			}
+		}
+		// Reassemble each session by ordering its slices chronologically. The
+		// `transcripts` array is NOT in time order for a consolidated memory, but
+		// each slice is internally time-ordered and a session's slices occupy
+		// disjoint time ranges (cursor consumes turns in order), so sorting slices
+		// by their first known timestamp reconstructs the true conversation order.
+		// The sort is stable, so slices with no parseable timestamp (legacy data)
+		// keep their first-seen order rather than jumping to the front.
+		return order.map((key) => {
+			// Non-null: every key in `order` was set in `grouped` above.
+			const { base, parts } = grouped.get(key) as {
+				base: StoredSession;
+				parts: ReadonlyArray<TranscriptEntry>[];
+			};
+			const sorted = [...parts].sort((a, b) => {
+				const ta = sliceStartTime(a);
+				const tb = sliceStartTime(b);
+				if (ta === undefined || tb === undefined) return 0;
+				return ta - tb;
+			});
+			return { ...base, entries: sorted.flat() };
+		});
+	}
+
+	/**
+	 * Reads the `CommitSummary` for `commitHash` and projects it into
+	 * `MemoryEvidence` groups (conversations / context / files), then posts
+	 * `kb:memoryEvidence` back to the webview so the Timeline can render
+	 * per-memory evidence rows without a full detail-panel open.
+	 *
+	 * Evidence sourcing mirrors `SummaryWebviewPanel.show()`:
+	 * - `conversations` — one item per stored session (from each
+	 *   `transcripts/{id}.json`), carrying `source` + `transcriptPath` so
+	 *   the Timeline can open `ConversationDetailsPanel` exactly as the
+	 *   Branch view's `branch:openConversation` does.
+	 * - `context` — `summary.plans` / `summary.notes` / `summary.references`,
+	 *   each projected to an id/title item for its existing open command.
+	 * - `files` — unique relative paths from `summary.topics[].filesAffected`,
+	 *   the same source the detail pane's topic-level files callout uses.
+	 *
+	 * A foreign-repo memory resolves against the right storage: the summary
+	 * lookup returns its source repo provenance, and each transcript is read
+	 * from that source repo's storage (falling back to the workspace storage
+	 * for local memories).
+	 *
+	 * On any error (missing summary, read failure), posts empty groups and
+	 * never throws so the Timeline row stays interactive.
+	 */
+	private async pushMemoryEvidence(commitHash: string): Promise<void> {
+		const empty: MemoryEvidence = { conversations: [], context: [], files: [] };
+		try {
+			// Prefer the source-aware lookup so we know which repo owns this
+			// memory and can route transcript reads to its storage. Fall back to
+			// the simpler getSummaryByHash (no provenance, cwd storage used).
+			let summary: CommitSummary | undefined;
+			let sourceRepoName: string | null = null;
+			let sourceRemoteUrl: string | null = null;
+			if (this.deps.getSummaryAnyRepoWithSource) {
+				const result = await this.deps.getSummaryAnyRepoWithSource(commitHash);
+				summary = result.summary;
+				sourceRepoName = result.sourceRepoName;
+				sourceRemoteUrl = result.sourceRemoteUrl;
+			} else {
+				summary = await this.deps.getSummaryByHash?.(commitHash);
+			}
+			if (!summary) {
+				this.postMessage({ type: "kb:memoryEvidence", commitHash, evidence: empty });
+				return;
+			}
+
+			// — conversations —
+			// Title goes through the SAME resolver the working-memory "All
+			// Conversations" list uses (resolveSessionTitle), so the two surfaces
+			// show identical labels. For Claude that means preferring the
+			// `ai-title` row — which is stripped from the archived `entries` and
+			// can only be recovered by re-reading the live transcript at
+			// `session.transcriptPath`. Without this, the list fell back to the
+			// raw first human turn ("继续", "1", "<task-notification>…") or
+			// "(untitled session)" even when a human-readable title existed.
+			//
+			// When the live transcript is gone, resolveSessionTitle degrades to
+			// the archived first human turn (we pass `session.entries` as its
+			// merged-entries fallback) — identical to the previous behavior, so a
+			// deleted transcript is no worse than before, never a throw. `?? []`
+			// guards a malformed transcript JSON missing `entries`.
+			const archivedSessions = await this.readArchivedSessions(summary, sourceRepoName, sourceRemoteUrl);
+			const conversations: MemoryEvidenceItem[] = await Promise.all(
+				archivedSessions.map(async (session) => ({
+					kind: "conversation" as const,
+					id: session.sessionId,
+					title: await resolveSessionTitle(
+						{
+							sessionId: session.sessionId,
+							transcriptPath: session.transcriptPath ?? "",
+							updatedAt: "",
+							source: session.source,
+						},
+						session.entries ?? [],
+					),
+					...(session.source ? { source: session.source } : {}),
+					...(session.transcriptPath ? { transcriptPath: session.transcriptPath } : {}),
+					// Archived turn count for the trailing "N msgs" evidence-row label.
+					// session.entries is the orphan-branch snapshot consumed into this
+					// commit, so its length is the memory's conversation depth.
+					messageCount: session.entries?.length ?? 0,
+				})),
+			);
+
+			// — context —
+			const context: MemoryEvidenceItem[] = [];
+			for (const plan of summary.plans ?? []) {
+				context.push({ kind: "plan", id: plan.slug, title: plan.title });
+			}
+			for (const note of summary.notes ?? []) {
+				context.push({ kind: "note", id: note.id, title: note.title });
+			}
+			for (const ref of summary.references ?? []) {
+				// `source` is required so the Timeline can read the archived
+				// snapshot off the orphan branch (readReferenceFromBranch keys on
+				// source + archivedKey); the live openReferenceForPreview path is
+				// dead post-commit (registry row deleted, mapKey ≠ archivedKey).
+				context.push({ kind: "reference", id: ref.archivedKey, title: ref.title, source: ref.source });
+			}
+
+			// — files —
+			// Prefer git truth for LOCAL memories: listCommitFiles gives the real
+			// per-file status (A/M/D/R) + rename oldPath, so openCommitFileChange
+			// opens the correct diff. The summary's topic.filesAffected is path-only
+			// — projecting from it defaulted statusCode to 'M', so added / deleted /
+			// renamed files diffed against a parent/commit tree where they don't
+			// exist and the editor errored "file was not found". Foreign memories
+			// can't be diffed against the workspace git at all, so they skip this and
+			// keep the path-only projection (their rows are non-interactive).
+			const files: MemoryEvidenceItem[] = [];
+			let commitFiles: ReadonlyArray<CommitFileInfo> = [];
+			if (!sourceRepoName && this.deps.listCommitFiles) {
+				try {
+					commitFiles = await this.deps.listCommitFiles(commitHash);
+				} catch (err) {
+					log.warn(
+						"SidebarWebviewProvider",
+						`listCommitFiles(${commitHash.substring(0, 8)}) failed, falling back to topic paths: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
+			}
+			if (commitFiles.length > 0) {
+				for (const f of commitFiles) {
+					files.push({
+						kind: "file",
+						id: f.relativePath,
+						title: f.relativePath,
+						relativePath: f.relativePath,
+						statusCode: f.statusCode,
+						...(f.oldPath ? { oldPath: f.oldPath } : {}),
+					});
+				}
+			} else {
+				// Fallback (foreign memory, or a commit listCommitFiles couldn't read):
+				// path-only projection from topics, deduped in first-seen order. Rows
+				// default to statusCode 'M' on the client.
+				const seenPaths = new Set<string>();
+				for (const topic of summary.topics ?? []) {
+					for (const relPath of topic.filesAffected ?? []) {
+						if (!seenPaths.has(relPath)) {
+							seenPaths.add(relPath);
+							files.push({ kind: "file", id: relPath, title: relPath, relativePath: relPath });
+						}
+					}
+				}
+			}
+
+			this.postMessage({
+				type: "kb:memoryEvidence",
+				commitHash,
+				evidence: { conversations, context, files, sourceRepoName, sourceRemoteUrl },
+			});
+		} catch (err) {
+			log.warn(
+				"SidebarWebviewProvider",
+				`pushMemoryEvidence(${commitHash.substring(0, 8)}) failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			this.postMessage({ type: "kb:memoryEvidence", commitHash, evidence: empty });
+		}
+	}
+
+	/**
+	 * Opens a committed memory's conversation from its ARCHIVED snapshot. Mirrors
+	 * `pushMemoryEvidence`'s provenance lookup, then re-reads the orphan-branch
+	 * sessions and hands the matching session's full `entries` to
+	 * `ConversationDetailsPanel` in archived (read-only) mode — the same content
+	 * the memory-details "Manage" view shows. The live `branch:openConversation`
+	 * path is wrong here: its cursor-trimmed read returns nothing once the turns
+	 * have been consumed into the commit summary.
+	 *
+	 * Never throws — a missing summary / session degrades to a warn so a stale
+	 * evidence row (e.g. summary GC'd) cannot break the sidebar.
+	 */
+	private async openEvidenceConversation(
+		commitHash: string,
+		sessionId: string,
+		source: TranscriptSource,
+		title: string,
+	): Promise<void> {
+		try {
+			let summary: CommitSummary | undefined;
+			let sourceRepoName: string | null = null;
+			let sourceRemoteUrl: string | null = null;
+			if (this.deps.getSummaryAnyRepoWithSource) {
+				const result = await this.deps.getSummaryAnyRepoWithSource(commitHash);
+				summary = result.summary;
+				sourceRepoName = result.sourceRepoName;
+				sourceRemoteUrl = result.sourceRemoteUrl;
+			} else {
+				summary = await this.deps.getSummaryByHash?.(commitHash);
+			}
+			if (!summary) {
+				log.warn(
+					"SidebarWebviewProvider",
+					`openEvidenceConversation: no summary for ${commitHash.substring(0, 8)}`,
+				);
+				return;
+			}
+			const sessions = await this.readArchivedSessions(summary, sourceRepoName, sourceRemoteUrl);
+			// Match on session + source: sessionId alone is not unique across
+			// sources (Claude UUIDs and Cursor hashes share a namespace). Stored
+			// sessions default to "claude" when source is absent, mirroring the
+			// reader's back-compat default.
+			const session = sessions.find((s) => s.sessionId === sessionId && (s.source ?? "claude") === source);
+			if (!session) {
+				log.warn(
+					"SidebarWebviewProvider",
+					`openEvidenceConversation: session ${sessionId} not found in ${commitHash.substring(0, 8)}`,
+				);
+				return;
+			}
+			ConversationDetailsPanel.show({
+				extensionUri: this.deps.extensionUri,
+				sessionId,
+				source,
+				transcriptPath: session.transcriptPath ?? "",
+				title,
+				archivedEntries: session.entries,
+				commitHash,
+			});
+		} catch (err) {
+			log.warn(
+				"SidebarWebviewProvider",
+				`openEvidenceConversation(${commitHash.substring(0, 8)}) failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+	}
+
 	private pushRepos(): void {
 		if (!this.deps.selection) return;
 		const repos = this.deps.selection.listRepos();
@@ -779,14 +1422,37 @@ export class SidebarWebviewProvider
 	 * have no command equivalent (no upstream cache; we read fs each time), so
 	 * we call `handleExpandFolder("")` directly to push a fresh root listing.
 	 */
-	private handleRefresh(scope: "kb" | "branch" | "status" | "all"): void {
+	private handleRefresh(
+		scope:
+			| "kb"
+			| "branch"
+			| "branch-current"
+			| "branch-commits"
+			| "status"
+			| "knowledge"
+			| "all",
+	): void {
 		if (scope === "kb" || scope === "all") {
 			void this.handleExpandFolder("");
 			void this.deps.executeCommand("jollimemory.refreshMemories");
 		}
-		if (scope === "branch" || scope === "all") {
+		// Current Memory block: conversations + context (plans/notes) + files.
+		// Split out of the whole-branch refresh so the Current Memory header's
+		// own refresh button reloads only the next-memory draft, not the
+		// committed history below it.
+		if (scope === "branch" || scope === "branch-current" || scope === "all") {
 			void this.deps.executeCommand("jollimemory.refreshPlans");
 			void this.deps.executeCommand("jollimemory.refreshFiles");
+			// Active Conversations has no host-side watcher (the five no-hook
+			// sources — Codex/OpenCode/Cursor/Copilot CLI/Copilot Chat — only
+			// surface state through on-disk transcripts), so refresh is the
+			// only update path after the initial `handleReady` push.
+			void this.pushConversations();
+			void this.pushPins();
+		}
+		// Committed Memories section: git history + the foreign-readonly memory
+		// cache. The Committed Memories header's refresh button targets this.
+		if (scope === "branch" || scope === "branch-commits" || scope === "all") {
 			void this.deps.executeCommand("jollimemory.refreshHistory");
 			// The workspace-scoped refresh* commands above don't reach the
 			// foreign-readonly Branch view's `branchMemoriesCache` (host pushes
@@ -796,15 +1462,39 @@ export class SidebarWebviewProvider
 			// whatever the first selection load returned, no matter how many
 			// times they click Refresh.
 			this.postMessage({ type: "selection:invalidateBranchMemories" });
-			// Active Conversations has no host-side watcher (the five no-hook
-			// sources — Codex/OpenCode/Cursor/Copilot CLI/Copilot Chat — only
-			// surface state through on-disk transcripts), so refresh is the
-			// only update path after the initial `handleReady` push.
-			void this.pushConversations();
 		}
 		if (scope === "status" || scope === "all") {
 			void this.deps.executeCommand("jollimemory.refreshStatus");
 		}
+		if (scope === "knowledge" || scope === "all") {
+			void this.pushKnowledgeData();
+		}
+	}
+
+	/**
+	 * Reads each repo's compiled knowledge-graph artifact and posts a
+	 * `kb:knowledgeData` message with the projected `KnowledgeRepo[]`. When
+	 * `deps.getKnowledgeData` is absent, posts an empty repos list so the
+	 * webview can render a "no data yet" state rather than staying on the
+	 * loading placeholder.
+	 *
+	 * Errors are caught here so a dep failure degrades to an empty list
+	 * rather than leaving the webview on the loading placeholder. Per-repo
+	 * error isolation is the responsibility of the dep implementation.
+	 */
+	async pushKnowledgeData(): Promise<void> {
+		let repos: ReadonlyArray<KnowledgeRepo> = [];
+		if (this.deps.getKnowledgeData) {
+			try {
+				repos = await this.deps.getKnowledgeData();
+			} catch (err) {
+				log.warn(
+					"SidebarWebviewProvider",
+					`pushKnowledgeData: getKnowledgeData failed: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+		}
+		this.postMessage({ type: "kb:knowledgeData", repos });
 	}
 
 	/**
@@ -868,6 +1558,15 @@ export class SidebarWebviewProvider
 		this.postMessage({ type: "enabled:changed", enabled });
 	}
 
+	/**
+	 * Toggle the Status overlay from the native view-title Status icon
+	 * (`jollimemory.toggleStatus`). No-ops when the view hasn't resolved —
+	 * the title-bar icon is only clickable while the view is visible anyway.
+	 */
+	toggleStatus(): void {
+		this.postMessage({ type: "status:toggle" });
+	}
+
 	/** Pushed after the OAuth callback completes (sign-in) and after signOut. */
 	notifyAuthChanged(authenticated: boolean): void {
 		this.postMessage({ type: "auth:changed", authenticated });
@@ -901,10 +1600,15 @@ export class SidebarWebviewProvider
 		});
 		// Worker-busy travels on its own channel so the Branch tab toolbar can
 		// react without re-parsing status entries. Pushed alongside status:data
-		// because both originate from the same StatusStore change event.
+		// because both originate from the same StatusStore change event. While
+		// busy, attach the HEAD short hash so the Working Memory "Summarizing
+		// <hash>…" row can name the commit (only resolved when busy to avoid a
+		// git call on every idle status push).
+		const workerBusy = this.deps.statusProvider.getWorkerBusy();
 		this.postMessage({
 			type: "worker:busy",
-			busy: this.deps.statusProvider.getWorkerBusy(),
+			busy: workerBusy,
+			commit: workerBusy ? this.deps.getHeadShortHash?.() : undefined,
 		});
 		// Sync-phase indicator. Optional on the provider interface so existing
 		// tests that don't stub `getSyncPhase` keep working unchanged.
@@ -941,6 +1645,42 @@ export class SidebarWebviewProvider
 		});
 	}
 
+	private async pushPins(): Promise<void> {
+		const state = this.deps.getInitialState();
+		const repo = this.selectedRepoName ?? state.currentRepoName ?? "";
+		// When not viewing a foreign branch, the live HEAD from branchWatcher is
+		// the source of truth for the current branch — getInitialState().branchName
+		// can lag a fresh checkout (handleReady reads branchWatcher.current() for
+		// the displayed name for the same reason). Without this, pins re-pushed
+		// from a checkout would still resolve against the stale branch group.
+		const branch =
+			this.selectedBranchName ?? this.deps.branchWatcher?.current().name ?? state.branchName;
+		const projectDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+		if (!projectDir || !repo) {
+			// Documented empty-list contract — but log so this is distinguishable
+			// from "genuinely no pins". A persistently empty Pinned section paired
+			// with this line points at an unresolved workspace/repo, not user state.
+			log.info("SidebarWebviewProvider", "pushPins: no projectDir/repo resolved, posting empty list", {
+				hasProjectDir: !!projectDir,
+				hasRepo: !!repo,
+			});
+			this.postMessage({ type: "branch:pinsData", items: [] });
+			return;
+		}
+		try {
+			const items = this.deps.pinStore
+				? await this.deps.pinStore.listPins(projectDir, repo, branch)
+				: [];
+			this.postMessage({ type: "branch:pinsData", items });
+		} catch (err) {
+			log.warn(
+				"SidebarWebviewProvider",
+				`pushPins failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			this.postMessage({ type: "branch:pinsData", items: [] });
+		}
+	}
+
 	private pushChanges(): void {
 		if (!this.deps.filesProvider) return;
 		this.postMessage({
@@ -971,6 +1711,33 @@ export class SidebarWebviewProvider
 				`pushCommits failed: ${err instanceof Error ? err.message : String(err)}`,
 			);
 			this.postMessage({ type: "branch:commitsData", items: [], mode });
+		}
+		// Post aggregated token stats alongside commits data. Fire-and-forget;
+		// errors degrade silently (no token bar rendered rather than broken view).
+		// Not posted in foreign-readonly mode — aggregate is workspace-branch-bound.
+		// Both selectedRepoName and selectedBranchName are set together on a foreign breadcrumb pick, so "neither set" == viewing the workspace branch — post stats only then.
+		if (this.deps.getBranchTokenStats && !this.selectedRepoName && !this.selectedBranchName) {
+			void this.deps
+				.getBranchTokenStats()
+				.then((stats) => {
+					// cached counts toward the total so input + output + cached
+					// reconcile (Anthropic bills input_tokens separately from the
+					// cache_read / cache_creation totals folded into `cached`).
+					const total = stats.input + stats.output + stats.cached;
+					if (total > 0) {
+						this.postMessage({
+							type: "branch:tokenStats",
+							input: stats.input,
+							output: stats.output,
+							cached: stats.cached,
+							total,
+							reporting: stats.reporting,
+							memories: stats.memories,
+							scope: "branch",
+						});
+					}
+				})
+				.catch(() => undefined);
 		}
 	}
 
@@ -1041,7 +1808,11 @@ export class SidebarWebviewProvider
 					err instanceof Error ? err.message : String(err)
 				}`,
 			);
-			const name = relPath === "" ? "" : (relPath.split("/").pop() ?? "");
+			// split("/") is always non-empty, so the last segment is a string —
+			// index it directly rather than coalescing a pop() that can't be
+			// undefined here.
+			const segments = relPath.split("/");
+			const name = relPath === "" ? "" : segments[segments.length - 1];
 			this.postMessage({
 				type: "kb:foldersData",
 				tree: { name, relPath, isDirectory: true, children: [] },
@@ -1080,7 +1851,11 @@ export class SidebarWebviewProvider
 		// flight — the newer signal is authoritative and posts the correct state.
 		const seq = this.bumpDivergenceSeq(relPath);
 		const diverged = await this.deps.isMemoryFileDivergedOnDisk(abs);
-		if ((this.divergenceCheckSeq.get(relPath) ?? 0) !== seq) return;
+		// `seq` is always ≥ 1 (bumpDivergenceSeq increments) and the map is only
+		// ever get/set, so `get()` returns the latest number here; an absent
+		// entry (undefined) compares unequal to seq exactly as the old `?? 0`
+		// did. No coalesce needed — and the fallback was unreachable anyway.
+		if (this.divergenceCheckSeq.get(relPath) !== seq) return;
 		// Mirror the disk result onto the row BOTH ways: mark when diverged, clear
 		// when in sync. The clear is what lets reopening a now-synced file drop a
 		// ✎ left by an earlier open (or a stale listing) — without it the row
@@ -1098,6 +1873,54 @@ export class SidebarWebviewProvider
 
 	public async refreshPlansPanel(): Promise<void> {
 		this.pushPlans();
+	}
+
+	/**
+	 * Projects the provider's in-memory feeds into a `NextMemorySelection`
+	 * — the three groups (conversations / context / files) filtered to only
+	 * the items that are currently selected (i.e. `isSelected !== false`).
+	 * Called by the `jollimemory.reviewNextMemory` command handler in
+	 * Extension.ts to populate the NextMemoryPreviewPanel.
+	 */
+	public async getNextMemorySelection(): Promise<{
+		conversations: Array<{ title: string }>;
+		context: Array<{ title: string }>;
+		files: Array<{ path: string }>;
+	}> {
+		const conversations: Array<{ title: string }> = [];
+		if (this.deps.activeSessionsProvider) {
+			try {
+				const { items } = await this.deps.activeSessionsProvider.listWithDiagnostics();
+				for (const item of items) {
+					if (item.isSelected) {
+						conversations.push({ title: item.title });
+					}
+				}
+			} catch {
+				// Non-fatal — return empty conversations on provider error.
+			}
+		}
+
+		const context: Array<{ title: string }> = [];
+		if (this.deps.plansProvider) {
+			for (const item of this.deps.plansProvider.serialize()) {
+				if (item.isSelected !== false) {
+					context.push({ title: item.label });
+				}
+			}
+		}
+
+		const files: Array<{ path: string }> = [];
+		if (this.deps.filesProvider) {
+			for (const item of this.deps.filesProvider.serialize()) {
+				if (item.isSelected !== false) {
+					// Use `description` (relativePath) when available, fall back to `label` (basename).
+					files.push({ path: item.description ?? item.label });
+				}
+			}
+		}
+
+		return { conversations, context, files };
 	}
 
 	dispose(): void {
@@ -1130,6 +1953,23 @@ export class SidebarWebviewProvider
 			this.conversationsRefreshTimer = undefined;
 		}
 	}
+}
+
+/**
+ * Epoch ms of the first parseable `timestamp` in a session slice, or undefined
+ * when no entry carries one. Used to order a session's slices chronologically
+ * when reassembling it across a consolidated memory's transcripts — see
+ * `readArchivedSessions`.
+ */
+function sliceStartTime(
+	entries: ReadonlyArray<TranscriptEntry>,
+): number | undefined {
+	for (const entry of entries) {
+		if (entry.timestamp === undefined) continue;
+		const ms = Date.parse(entry.timestamp);
+		if (Number.isFinite(ms)) return ms;
+	}
+	return undefined;
 }
 
 function isOutbound(x: unknown): x is SidebarOutboundMsg {

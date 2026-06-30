@@ -421,6 +421,61 @@ describe("ConversationDetailsPanel", () => {
 		});
 	});
 
+	// BUG 3: committed-memory conversations are opened in ARCHIVED mode — the
+	// panel renders the orphan-branch snapshot entries verbatim instead of the
+	// cursor-trimmed live transcript (which is empty once the turns are consumed
+	// into the commit summary). The mode is read-only.
+	describe("archived mode (committed-memory snapshot)", () => {
+		const archivedArgs = {
+			...baseShowArgs,
+			sessionId: "arch-s1",
+			commitHash: "deadbeef",
+			archivedEntries: [
+				{ role: "human" as const, content: "archived q", timestamp: "t0" },
+				{ role: "assistant" as const, content: "archived a", timestamp: "t1" },
+			],
+		};
+
+		it("renders archivedEntries verbatim and never touches the live loaders", async () => {
+			ConversationDetailsPanel.show(archivedArgs);
+			const handler = lastMessageHandler();
+			await handler({ type: "requestTranscript" });
+
+			// The live cursor-trimmed read + overlay lookup are bypassed entirely.
+			expect(loadUnreadTranscriptMock).not.toHaveBeenCalled();
+			expect(loadOverlayMock).not.toHaveBeenCalled();
+
+			expect(mockVsCode.__panels[0].webview.postMessage).toHaveBeenCalledWith({
+				type: "transcriptLoaded",
+				entries: [
+					{ role: "human", content: "archived q", timestamp: "t0", displayIndex: 0 },
+					{ role: "assistant", content: "archived a", timestamp: "t1", displayIndex: 1 },
+				],
+				isEdited: false,
+			});
+		});
+
+		it("opens a panel distinct from the live view of the same session (commitHash discriminates the key)", () => {
+			// Live panel for the session...
+			ConversationDetailsPanel.show({ ...baseShowArgs, sessionId: "arch-s1" });
+			// ...and the archived view of the same session must NOT reveal it.
+			ConversationDetailsPanel.show(archivedArgs);
+			expect(mockVsCode.__createWebviewPanel).toHaveBeenCalledTimes(2);
+		});
+
+		it("rejects saveOverrides in archived mode without touching the overlay store", async () => {
+			ConversationDetailsPanel.show(archivedArgs);
+			const handler = lastMessageHandler();
+			await handler({ type: "saveOverrides", deletedIndices: [0], edits: {} });
+
+			expect(saveOverlayMock).not.toHaveBeenCalled();
+			expect(mockVsCode.__panels[0].webview.postMessage).toHaveBeenCalledWith({
+				type: "overridesSaveError",
+				message: "Committed conversations are read-only and cannot be edited.",
+			});
+		});
+	});
+
 	describe("saveOverrides message", () => {
 		it("translates display indices to identity rules, merges with existing, saves, and refreshes", async () => {
 			const displayedEntries = [

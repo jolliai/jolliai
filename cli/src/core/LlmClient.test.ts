@@ -122,10 +122,36 @@ describe("LlmClient", () => {
 			expect(result.model).toBe("claude-sonnet-4-6");
 			expect(result.inputTokens).toBe(50);
 			expect(result.outputTokens).toBe(10);
+			// No cache fields in this usage → cachedTokens defaults to 0.
+			expect(result.cachedTokens).toBe(0);
 			expect(result.stopReason).toBe("end_turn");
 			// Authoritative provider tag for the saved summary's metadata —
 			// must match resolveLlmCredentialSource for the same options.
 			expect(result.source).toBe("anthropic-config");
+		});
+
+		it("sums cache_read + cache_creation into cachedTokens", async () => {
+			mockCreate.mockResolvedValueOnce({
+				content: [{ type: "text", text: "cached response" }],
+				model: "claude-sonnet-4-6",
+				usage: {
+					input_tokens: 50,
+					output_tokens: 10,
+					cache_read_input_tokens: 1500,
+					cache_creation_input_tokens: 200,
+				},
+				stop_reason: "end_turn",
+			});
+			const result = await callLlm({
+				action: "translate",
+				params: { content: "# Test" },
+				apiKey: "sk-ant-test",
+				model: "claude-sonnet-4-6",
+				maxTokens: 256,
+			});
+			// input_tokens stays the uncached prompt; cached folds both cache totals.
+			expect(result.inputTokens).toBe(50);
+			expect(result.cachedTokens).toBe(1700);
 		});
 
 		it("warns when direct mode params do not fill every placeholder", async () => {

@@ -2768,4 +2768,187 @@ describe("QueueWorker", () => {
 			expect(vi.mocked(enqueueIngestOperation)).not.toHaveBeenCalled();
 		});
 	});
+
+	describe("conversationTokens accumulation (B4)", () => {
+		it("sums usageTokens from two Claude sessions and writes conversationTokens onto the CommitSummary", async () => {
+			// Two Claude sessions whose usage sums to 1425 (425 + 1000).
+			// readTranscript is mocked to return usageTokens for each session.
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/tokens-test.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadAllSessions).mockResolvedValue([
+				{
+					sessionId: "claude-a",
+					transcriptPath: "/tmp/claude-a.jsonl",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "claude" as const,
+				},
+				{
+					sessionId: "claude-b",
+					transcriptPath: "/tmp/claude-b.jsonl",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "claude" as const,
+				},
+			]);
+			vi.mocked(readTranscript).mockImplementation(async (transcriptPath: string) => {
+				const usageTokens = transcriptPath.endsWith("claude-a.jsonl") ? 425 : 1000;
+				return {
+					entries: [{ role: "human", content: "ctx", timestamp: "2026-04-01T12:00:00.000Z" }],
+					newCursor: { transcriptPath, lineNumber: 1, updatedAt: "2026-04-01T12:00:00.000Z" },
+					totalLinesRead: 1,
+					usageTokens,
+				};
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			const [calledSummary] = vi.mocked(storeSummary).mock.calls[0] as [
+				{ conversationTokens?: number },
+				...unknown[],
+			];
+			expect(calledSummary.conversationTokens).toBe(1425);
+		});
+	});
+
+	// ─── C5: usage tokens counted even when a slice yields 0 merged entries ──────
+	describe("conversationTokens — usage counted regardless of merged-entry count (C5)", () => {
+		it("accumulates usageTokens from a slice that produced zero merged entries", async () => {
+			const cwd = mkdtempSync(join(tmpdir(), "jolli-c5-"));
+			try {
+				vi.mocked(loadAllSessions).mockResolvedValue([
+					{
+						sessionId: "claude-empty",
+						transcriptPath: "/tmp/claude-empty.jsonl",
+						updatedAt: "2026-04-01T12:00:00.000Z",
+						source: "claude" as const,
+					},
+				]);
+				vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+				vi.mocked(saveCursor).mockResolvedValue(undefined);
+				// Slice has real token usage (assistant turns carried a usage block) but
+				// every parsed entry was dropped/merged away → 0 merged entries. Pre-fix,
+				// the `if (entries.length > 0)` gate dropped these tokens entirely.
+				vi.mocked(readTranscript).mockResolvedValue({
+					entries: [],
+					newCursor: {
+						transcriptPath: "/tmp/claude-empty.jsonl",
+						lineNumber: 3,
+						updatedAt: "2026-04-01T12:00:00.000Z",
+					},
+					totalLinesRead: 3,
+					usageTokens: 777,
+				});
+
+				const result = await __test__.loadSessionTranscripts(cwd, {});
+
+				expect(result.totalEntries).toBe(0);
+				expect(result.sessionTranscripts).toHaveLength(0);
+				expect(result.conversationTokens).toBe(777);
+			} finally {
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+	});
+
+	// ─── C1: conversationTokens reconciled against overlay-applied entry set ─────
+	// The overlay is driven through the module-level `node:fs/promises.readFile`
+	// mock (declared at the top of this file). loadOverlay reads the overlay JSON
+	// via readFile, so returning a real overlay payload for the overlay path (and
+	// "" elsewhere) exercises the genuine applyOverlaysToSessions delete path
+	// without needing an un-mocked filesystem.
+	describe("conversationTokens — overlay delete reconciliation (C1)", () => {
+		it("zeros conversationTokens when an overlay removed entries from the slice", async () => {
+			const cwd = mkdtempSync(join(tmpdir(), "jolli-c1-"));
+			const { readFile } = await import("node:fs/promises");
+			try {
+				const { overlayPath } = await import("../core/ConversationOverlayStore.js");
+				vi.mocked(loadAllSessions).mockResolvedValue([
+					{
+						sessionId: "claude-c1",
+						transcriptPath: "/tmp/claude-c1.jsonl",
+						updatedAt: "2026-04-01T12:00:00.000Z",
+						source: "claude" as const,
+					},
+				]);
+				vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+				vi.mocked(saveCursor).mockResolvedValue(undefined);
+				// Two entries read with 500 tokens of usage. The overlay deletes one.
+				vi.mocked(readTranscript).mockResolvedValue({
+					entries: [
+						{ role: "human", content: "keep me", timestamp: "2026-04-01T12:00:00.000Z" },
+						{ role: "human", content: "delete me", timestamp: "2026-04-01T12:00:01.000Z" },
+					],
+					newCursor: {
+						transcriptPath: "/tmp/claude-c1.jsonl",
+						lineNumber: 2,
+						updatedAt: "2026-04-01T12:00:00.000Z",
+					},
+					totalLinesRead: 2,
+					usageTokens: 500,
+				});
+				const op = overlayPath({ projectDir: cwd, source: "claude", sessionId: "claude-c1" });
+				const overlayJson = JSON.stringify({
+					version: 2,
+					source: "claude",
+					sessionId: "claude-c1",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					deletes: [{ role: "human", content: "delete me", timestamp: "2026-04-01T12:00:01.000Z" }],
+					edits: [],
+				});
+				vi.mocked(readFile).mockImplementation(async (p: unknown) => (String(p) === op ? overlayJson : ""));
+
+				const result = await __test__.loadSessionTranscripts(cwd, {});
+
+				// Overlay removed one entry; per-line token attribution to the surviving
+				// entry set does not exist, so the raw 500 is no longer meaningful → 0.
+				expect(result.totalEntries).toBe(1);
+				expect(result.conversationTokens).toBe(0);
+			} finally {
+				vi.mocked(readFile).mockResolvedValue(""); // restore the file-level default
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+
+		it("keeps the raw token sum when no overlay altered the entry set", async () => {
+			const cwd = mkdtempSync(join(tmpdir(), "jolli-c1b-"));
+			const { readFile } = await import("node:fs/promises");
+			try {
+				vi.mocked(readFile).mockResolvedValue(""); // no overlay file → pass-through
+				vi.mocked(loadAllSessions).mockResolvedValue([
+					{
+						sessionId: "claude-c1b",
+						transcriptPath: "/tmp/claude-c1b.jsonl",
+						updatedAt: "2026-04-01T12:00:00.000Z",
+						source: "claude" as const,
+					},
+				]);
+				vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+				vi.mocked(saveCursor).mockResolvedValue(undefined);
+				vi.mocked(readTranscript).mockResolvedValue({
+					entries: [{ role: "human", content: "no overlay here", timestamp: "2026-04-01T12:00:00.000Z" }],
+					newCursor: {
+						transcriptPath: "/tmp/claude-c1b.jsonl",
+						lineNumber: 1,
+						updatedAt: "2026-04-01T12:00:00.000Z",
+					},
+					totalLinesRead: 1,
+					usageTokens: 321,
+				});
+
+				const result = await __test__.loadSessionTranscripts(cwd, {});
+
+				expect(result.totalEntries).toBe(1);
+				expect(result.conversationTokens).toBe(321);
+			} finally {
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+	});
 });

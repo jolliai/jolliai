@@ -33,7 +33,7 @@ describe("SidebarHtmlBuilder", () => {
 		expect(occurrences).toBeGreaterThanOrEqual(3);
 	});
 
-	it("renders the header bar with breadcrumb (repo + branch) and 3 right-side icon buttons", () => {
+	it("renders the header bar with the breadcrumb (repo + branch) and no in-webview icon strip", () => {
 		const html = buildSidebarHtml(
 			"n",
 			"vscode-resource:",
@@ -53,31 +53,50 @@ describe("SidebarHtmlBuilder", () => {
 		expect(html).toMatch(
 			/<i[^>]*class="codicon codicon-chevron-down breadcrumb-seg-chevron hidden"/,
 		);
-		// 3 icon buttons on the right side. Memory Bank and Status carry
-		// data-tab for the switchTab dispatch; Settings carries
-		// data-action="open-settings" so the existing event handler routes it
-		// to the openSettings command without going through tab dispatch.
-		expect(html).toContain('id="kb-icon-btn"');
-		expect(html).toContain('data-tab="kb"');
-		expect(html).toContain('id="settings-icon-btn"');
-		expect(html).toContain('data-action="open-settings"');
-		expect(html).toContain('id="status-icon-btn"');
-		expect(html).toContain('data-tab="status"');
-		expect(html).toContain("codicon-circle-filled");
-		// The branch label is now part of the breadcrumb, not a tab button.
-		// data-tab="branch" no longer appears anywhere because Branch is the
-		// implicit default view that surfaces whenever no overlay is active.
-		expect(html).not.toContain('data-tab="branch"');
-		// Native title="Status" was removed in favor of attachTextTip (which
-		// renders a dynamic OK/Warnings/Errors tooltip from JS). Keeping both
-		// would cause the native title to flash before the project tip shows.
-		expect(html).not.toContain('id="status-icon-btn" title=');
+		// The Settings (gear) and Status (pulse) actions moved to the native
+		// "JOLLI MEMORY" title bar (view/title contributions), so the webview no
+		// longer renders an in-header icon strip at all.
+		expect(html).not.toContain('id="kb-icon-btn"');
+		expect(html).not.toContain('id="settings-icon-btn"');
+		expect(html).not.toContain('data-action="open-settings"');
+		expect(html).not.toContain('id="status-icon-btn"');
+		expect(html).not.toContain('class="tab-bar-right"');
 		// Dropdown menu container — empty by default, populated on demand by
 		// the script when a breadcrumb segment is clicked.
 		expect(html).toContain('id="breadcrumb-menu"');
 	});
 
-	it("includes 3 tab content panels with stable ids", () => {
+	it("renders the three-view switch with Current Branch / Memory Bank / Knowledge", () => {
+		const html = buildSidebarHtml(
+			"n",
+			"vscode-resource:",
+			"https://example/codicon.css",
+			SIDEBAR_EMPTY_STRINGS,
+		);
+		// The view-switch is hidden by default (like tab-bar) so it doesn't
+		// peek through during the loading-panel phase.
+		expect(html).toMatch(/<div class="view-switch hidden" id="view-switch"/);
+		expect(html).toContain('class="view-tab active" type="button" data-tab="branch"');
+		expect(html).toContain('data-tab="kb"');
+		expect(html).toContain('data-tab="knowledge"');
+		expect(html).toContain("Current Branch");
+		expect(html).toContain("Memory Bank");
+		expect(html).toContain("Knowledge");
+		// The view-switch sits ABOVE the breadcrumb header now (it used to be
+		// below it). The repo/branch dropdowns live under the three-view tabs.
+		const switchIdx = html.indexOf('id="view-switch"');
+		const tabBarIdx = html.indexOf('id="tab-bar"');
+		expect(switchIdx).toBeGreaterThan(-1);
+		expect(tabBarIdx).toBeGreaterThan(switchIdx);
+	});
+
+	it("renders a repo filter selector for the Memory Bank header", () => {
+		const html = buildSidebarHtml("n", "vscode-resource:", "https://example/codicon.css", SIDEBAR_EMPTY_STRINGS);
+		expect(html).toContain('id="repo-filter"');
+		expect(html).toContain("Showing");
+	});
+
+	it("includes 4 tab content panels with stable ids", () => {
 		const html = buildSidebarHtml(
 			"n",
 			"vscode-resource:",
@@ -87,6 +106,7 @@ describe("SidebarHtmlBuilder", () => {
 		expect(html).toContain('id="tab-content-kb"');
 		expect(html).toContain('id="tab-content-branch"');
 		expect(html).toContain('id="tab-content-status"');
+		expect(html).toContain('id="tab-content-knowledge"');
 	});
 
 	it("includes a hidden disabled banner mount", () => {
@@ -223,6 +243,10 @@ describe("SidebarHtmlBuilder", () => {
 			expect(html).toMatch(
 				/<div class="tab-content hidden" id="tab-content-status"/,
 			);
+			expect(html).toMatch(/<div class="view-switch hidden" id="view-switch"/);
+			expect(html).toMatch(
+				/<div class="tab-content hidden" id="tab-content-knowledge"/,
+			);
 		});
 	});
 
@@ -303,11 +327,11 @@ describe("SidebarHtmlBuilder", () => {
 				"https://example/codicon.css",
 				SIDEBAR_EMPTY_STRINGS,
 			);
-			// Slice from disabled-panel open to the next sibling (tab-bar);
-			// disabled-panel sits between onboarding-panel and tab-bar in the
+			// Slice from disabled-panel open to the next sibling (view-switch);
+			// disabled-panel sits between onboarding-panel and view-switch in the
 			// skeleton, so this window contains exactly the panel's body.
 			const start = html.indexOf('<div class="disabled-panel');
-			const end = html.indexOf('<div class="tab-bar', start);
+			const end = html.indexOf('<div class="view-switch', start);
 			expect(start).toBeGreaterThan(-1);
 			expect(end).toBeGreaterThan(start);
 			const panel = html.slice(start, end);

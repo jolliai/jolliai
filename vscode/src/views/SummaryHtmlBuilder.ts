@@ -156,8 +156,8 @@ ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions, !!opts.forei
 ${buildShipBar(summary)}
 ${buildMemoryPanel(summary, { readOnly })}
 ${buildE2ePanel(summary)}
+${buildConversationsSection(transcriptHashSet, !!opts.foreignRepoName)}
 ${buildAttachmentsPanel(summary, sourceNodes, planTranslateSet, noteTranslateSet, referenceTranslateSet)}
-${buildPrivateDrawer(transcriptHashSet, !!opts.foreignRepoName)}
 ${buildFooter(summary)}
 </div>
 <script${nonceAttr}>${buildScript()}</script>
@@ -473,32 +473,22 @@ function buildAttachmentsPanel(
 }
 
 /**
- * Demotes the All Conversations (private transcripts) zone to a collapsible
- * drawer at the bottom of the page. The collapse toggle lives on the drawer
- * head (outside #allConversationsSection) so refreshConversations rebuilds of
- * the inner section never reset the drawer's collapse state. The inner
- * section's own title is hidden by CSS in favor of the drawer head; its
- * Manage/View transcript button is preserved.
+ * Renders the Conversations section as a normal top-level section.
+ *
+ * Replaces the former private-drawer wrapper — the PRIVATE badge / lock chrome
+ * and bottom placement are gone. The inner allConversationsSection content
+ * (rows, Open/View transcript action, modal) is preserved unchanged.
  */
-function buildPrivateDrawer(
+function buildConversationsSection(
 	transcriptHashSet?: ReadonlySet<string>,
 	isForeign: boolean = false,
 ): string {
-	const count = transcriptHashSet?.size ?? 0;
-	const countLabel =
-		count > 0
-			? `<span class="private-count">${count} session${count !== 1 ? "s" : ""}</span>`
-			: "";
 	return `
-<div class="private-drawer" id="privateDrawer">
-  <div class="private-head" data-collapse="privateDrawer" role="button" tabindex="0" aria-expanded="true" data-foreign-safe>
-    <span class="private-lock">&#x1F512;</span>
-    <span class="private-title">All Conversations</span>
-    <span class="private-badge">PRIVATE</span>
-    ${countLabel}
-    <span class="attach-arrow">&#x25BC;</span>
+<div class="section conversations-section">
+  <div class="section-header">
+    <div class="section-title">&#x1F4AC; Conversations</div>
   </div>
-  <div class="private-body">${buildAllConversationsSection(transcriptHashSet, isForeign)}</div>
+  ${buildAllConversationsSection(transcriptHashSet, isForeign)}
 </div>`;
 }
 
@@ -993,15 +983,10 @@ export function buildAllConversationsSection(
 	if (count === 0) {
 		// Regenerate moved to the page header (buildHeader); the conversations
 		// zone no longer renders its own button to avoid a duplicate id.
-		const emptyActions = "";
 		inner = `
 <div class="private-zone">
-  <div class="private-zone-watermark">PRIVATE</div>
   <div class="section-header">
     <div class="section-title">&#x1F4AC; All Conversations</div>
-    <span class="conversations-actions">
-${emptyActions}
-    </span>
   </div>
   <p class="empty">No conversation transcripts saved for this commit.</p>
 </div>`;
@@ -1012,7 +997,6 @@ ${emptyActions}
 
 		inner = `
 <div class="private-zone">
-  <div class="private-zone-watermark">PRIVATE</div>
   <div class="section-header">
     <div class="section-title">&#x1F4AC; All Conversations</div>
     <span class="conversations-actions">

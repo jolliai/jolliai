@@ -35,15 +35,24 @@ import {
 	migrateV1toV3,
 	writeMigrationMeta,
 } from "../../cli/src/core/SummaryMigration.js";
-import { readNoteFromBranch, readPlanFromBranch } from "../../cli/src/core/SummaryStore.js";
+import { addPin, listPins, removePin } from "../../cli/src/core/PinStore.js";
+import {
+	readNoteFromBranch,
+	readPlanFromBranch,
+	readReferenceFromBranch,
+	readTranscript,
+} from "../../cli/src/core/SummaryStore.js";
+import { aggregateConversationTokens } from "../../cli/src/core/SummaryTree.js";
 import type { StorageProvider } from "../../cli/src/core/StorageProvider.js";
 import { ORPHAN_BRANCH } from "../../cli/src/Logger.js";
-import type { StatusInfo } from "../../cli/src/Types.js";
+import type { SourceId, StatusInfo } from "../../cli/src/Types.js";
 import { execFileSyncHidden } from "../../cli/src/util/Subprocess.js";
+import { runCopyBranchRecallPrompt, runRecallInClaudeCode } from "./commands/BranchRecallCommands.js";
 import { CommitCommand } from "./commands/CommitCommand.js";
 import { PushCommand } from "./commands/PushCommand.js";
 import {
 	selectAllConversationsCommand,
+	selectAllCurrentMemoryCommand,
 	selectAllPlansAndNotesCommand,
 } from "./commands/SelectAllSelection.js";
 import { SquashCommand } from "./commands/SquashCommand.js";
@@ -82,13 +91,16 @@ import {
 	writeManualDisableFlag,
 } from "./services/ManualDisableFlag.js";
 import { MemoryFileDecorationProvider } from "./services/MemoryFileDecorationProvider.js";
+import { findOpenPrForBranch as lookupOpenPrForBranch } from "./services/PrCommentService.js";
 import { CommitsStore } from "./stores/CommitsStore.js";
 import { FilesStore } from "./stores/FilesStore.js";
 import { MemoriesStore } from "./stores/MemoriesStore.js";
 import { PlansStore } from "./stores/PlansStore.js";
 import { StatusStore, type WorkerPhase } from "./stores/StatusStore.js";
+import { graphJsonPath, readGraph } from "../../cli/src/graph/GraphArtifactStore.js";
 import { registerCompileCommand } from "./CompileCommand.js";
 import { openKnowledgeGraph } from "./views/KnowledgeGraphPanel.js";
+import { projectKnowledgeRepo } from "./views/KnowledgeProjection.js";
 import { activateSync } from "./sync/VsCodeSyncBootstrap.js";
 import { ExcludeFilterManager } from "./util/ExcludeFilterManager.js";
 import { formatShortRelativeDate } from "./util/FormatUtils.js";
@@ -97,9 +109,12 @@ import { initLogger, log } from "./util/Logger.js";
 import { StatusBarManager } from "./util/StatusBarManager.js";
 import { getWorkspaceRoot } from "./util/WorkspaceUtils.js";
 import { computeChangesBadge } from "./views/ChangesBadge.js";
+import { CreatePrWebviewPanel } from "./views/CreatePrWebviewPanel.js";
+import { NextMemoryPreviewPanel } from "./views/NextMemoryPreviewPanel.js";
 import { NoteEditorWebviewPanel } from "./views/NoteEditorWebviewPanel.js";
 import { SettingsWebviewPanel } from "./views/SettingsWebviewPanel.js";
 import { SidebarWebviewProvider } from "./views/SidebarWebviewProvider.js";
+import { loadBranchSummaries } from "./views/BranchSummaryLoader.js";
 import { buildClaudeCodeContext } from "./views/SummaryMarkdownBuilder.js";
 import { SummaryWebviewPanel } from "./views/SummaryWebviewPanel.js";
 
@@ -293,6 +308,7 @@ const ALL_DECLARED_COMMANDS: ReadonlyArray<string> = [
 	"jollimemory.selectAllCommits",
 	"jollimemory.selectAllConversations",
 	"jollimemory.selectAllPlansAndNotes",
+	"jollimemory.selectAllCurrentMemory",
 	"jollimemory.searchMemories",
 	"jollimemory.clearMemoryFilter",
 	"jollimemory.loadMoreMemories",
@@ -304,6 +320,8 @@ const ALL_DECLARED_COMMANDS: ReadonlyArray<string> = [
 	"jollimemory.signIn",
 	"jollimemory.signOut",
 	"jollimemory.saveAnthropicApiKey",
+	"jollimemory.reviewNextMemory",
+	"jollimemory.shareBranchPlaceholder",
 ];
 
 /**
@@ -691,7 +709,16 @@ export function activate(context: vscode.ExtensionContext): void {
 	const memoriesProvider = new MemoriesTreeProvider(memoriesStore);
 	const plansProvider = new PlansTreeProvider(plansStore, workspaceRoot);
 	const filesProvider = new FilesTreeProvider(filesStore);
-	const historyProvider = new HistoryTreeProvider(commitsStore);
+	const historyProvider = new HistoryTreeProvider(commitsStore, async (hash) => {
+		const s = await bridge.getSummary(hash);
+		if (!s) return null;
+		const tokens = aggregateConversationTokens(s);
+		return {
+			jolliDocUrl: s.jolliDocUrl,
+			e2eCount: s.e2eTestGuide?.length,
+			...(tokens > 0 && { conversationTokens: tokens }),
+		};
+	});
 
 	context.subscriptions.push(statusProvider);
 	context.subscriptions.push(memoriesProvider);
@@ -933,10 +960,27 @@ export function activate(context: vscode.ExtensionContext): void {
 				return { dispose: () => disposable.dispose() };
 			},
 		},
+		// Workspace HEAD short hash for the "Summarizing <hash>…" Working Memory
+		// row (attached to worker:busy). The blocking post-commit summary runs
+		// against the just-made HEAD; rebase/squash edge cases where the worker
+		// is mid-list are accepted as an approximation.
+		getHeadShortHash: () => {
+			try {
+				return (
+					execFileSyncHidden("git", ["rev-parse", "--short", "HEAD"], {
+						cwd: workspaceRoot,
+						encoding: "utf-8",
+					}).trim() || undefined
+				);
+			} catch {
+				return undefined;
+			}
+		},
 		applyFileCheckbox: (filePath, selected) =>
 			filesStore.applyCheckboxBatch([[filePath, selected]]),
 		applyCommitCheckbox: (hash, selected) =>
 			commitsStore.onCheckboxToggle(hash, selected),
+		deselectAllCommits: () => commitsStore.clearSelection(),
 		applyConversationCheckbox: async (source, sessionId, selected) => {
 			await setExcluded(
 				workspaceRoot,
@@ -971,6 +1015,101 @@ export function activate(context: vscode.ExtensionContext): void {
 				if (cwd) void discoverCodexConversations(cwd);
 			},
 		},
+		pinStore: { addPin, removePin, listPins },
+		// Source-aware summary lookup for the Timeline's kb:expandMemory handler.
+		// Returns the CommitSummary plus the repo it came from (null = current
+		// workspace) so pushMemoryEvidence can route transcript reads to the
+		// right FolderStorage instead of always reading cwd storage.
+		getSummaryAnyRepoWithSource: async (commitHash) => {
+			const { summary, sourceRepoName, sourceRemoteUrl } =
+				await bridge.getSummaryAnyRepoWithSource(commitHash);
+			return { summary: summary ?? undefined, sourceRepoName, sourceRemoteUrl };
+		},
+		// Real per-file git status for a commit (git diff-tree --name-status), so
+		// the Timeline's FILES group opens the correct diff for added / deleted /
+		// renamed files instead of assuming 'M'. Same projection the Branch-tab
+		// commit-file rows use.
+		listCommitFiles: (commitHash) => bridge.listCommitFiles(commitHash),
+		// Transcript read that honours source provenance. When sourceRepoName is
+		// non-null (foreign repo), the transcript is read from that repo's
+		// FolderStorage; otherwise the current workspace storage is used. This
+		// mirrors the SummaryWebviewPanel detail-panel read path exactly.
+		readTranscriptForRepo: async (id, sourceRepoName, sourceRemoteUrl) => {
+			if (sourceRepoName) {
+				const result = await bridge.createStorageForRepo(sourceRepoName, sourceRemoteUrl);
+				if (!result) return null;
+				return readTranscript(id, undefined, result.storage);
+			}
+			return bridge.readTranscript(id);
+		},
+		getKnowledgeData: async () => {
+			const repos = kbFoldersService.listRepos();
+			const results = await Promise.all(
+				repos.map(async (repo) => {
+					try {
+						const graph = await readGraph(repo.kbRoot);
+						// `readGraph` returns null for BOTH "never built" (graph.json
+						// absent) and "present but unreadable" (parse error / partial
+						// write / permissions), collapsing them into the same empty
+						// "Build Wiki" CTA. Only the latter is a bug worth diagnosing,
+						// so when null comes back we probe the file to tell them apart
+						// and warn for the unreadable case — keeping the graceful empty
+						// fallback either way rather than silently swallowing a corrupt
+						// graph.
+						if (!graph && existsSync(graphJsonPath(repo.kbRoot))) {
+							log.warn(
+								"getKnowledgeData",
+								"Knowledge graph present but unreadable — falling back to empty Build-Wiki CTA",
+								{ repoName: repo.repoName, kbRoot: repo.kbRoot },
+							);
+						}
+						return projectKnowledgeRepo(graph, repo);
+					} catch (err) {
+						// readGraph itself never throws, but projectKnowledgeRepo (or a
+						// future change) could. Don't let one bad repo blank the whole
+						// Knowledge view; log so the failure is visible, not swallowed.
+						log.warn("getKnowledgeData", "Failed to project knowledge graph", {
+							repoName: repo.repoName,
+							kbRoot: repo.kbRoot,
+							error: err instanceof Error ? err.message : String(err),
+						});
+						return projectKnowledgeRepo(null, repo);
+					}
+				}),
+			);
+			return results;
+		},
+		// Aggregate LLM token usage across all committed summaries on the
+		// current branch. loadBranchSummaries re-uses the same bridge.getSummary
+		// lookup the PR description builder uses, so storage-backend selection
+		// is consistent (orphan / dual-write / folder-only all work identically).
+		getBranchTokenStats: async () => {
+			const { summaries } = await loadBranchSummaries(bridge, commitsStore.getMainBranch());
+			let input = 0;
+			let output = 0;
+			let cached = 0;
+			// `reporting` counts memories that carried any token usage; `memories`
+			// is the total. The difference is memories from sources that don't
+			// report usage (most non-Claude agents) — the tooltip surfaces this as
+			// "N of M memories report token usage" so the total reads as a floor.
+			let reporting = 0;
+			for (const s of summaries) {
+				const i = s.llm?.inputTokens ?? 0;
+				const o = s.llm?.outputTokens ?? 0;
+				// cachedTokens is absent on summaries written before the field
+				// existed — default to 0 so historical branches just read as
+				// "no cache" rather than NaN.
+				const c = s.llm?.cachedTokens ?? 0;
+				input += i;
+				output += o;
+				cached += c;
+				if (i > 0 || o > 0 || c > 0) reporting += 1;
+			}
+			return { input, output, cached, reporting, memories: summaries.length };
+		},
+		// Live gh pr list lookup for the SHIPPED group's "PR #N — open" status row.
+		// Aliased import avoids a name clash between the dep key and the imported fn.
+		findOpenPrForBranch: (branch) => lookupOpenPrForBranch(workspaceRoot, branch),
 		initialStateReady,
 	});
 	sidebarProviderRef = sidebarProvider;
@@ -1940,6 +2079,23 @@ export function activate(context: vscode.ExtensionContext): void {
 				onChanged: () => sidebarProvider.refreshPlansPanel(),
 			}),
 		),
+
+		// Unified "Current Memory" select-all: flips Conversations + Context +
+		// Files together. Files refresh themselves via filesStore.onChange (the
+		// selectAll mutation broadcasts a snapshot); the onChanged callback only
+		// needs to push the two panels that have no store-driven sidebar refresh.
+		vscode.commands.registerCommand("jollimemory.selectAllCurrentMemory", () =>
+			selectAllCurrentMemoryCommand({
+				cwd: workspaceRoot,
+				activeSessions: activeSessionsProvider,
+				plansProvider,
+				filesStore,
+				onChanged: async () => {
+					await sidebarProvider.refreshConversationsPanel();
+					await sidebarProvider.refreshPlansPanel();
+				},
+			}),
+		),
 		/* v8 ignore stop */
 
 		vscode.commands.registerCommand("jollimemory.commitAI", () => {
@@ -2359,6 +2515,30 @@ export function activate(context: vscode.ExtensionContext): void {
 		),
 
 		vscode.commands.registerCommand(
+			"jollimemory.previewCommittedPlan",
+			async (
+				slug: string,
+				title: string,
+				// Foreign-provenance hint supplied by the sidebar's plan evidence
+				// row so the rendered plan preview reads from the foreign repo's
+				// FolderStorage instead of the current workspace's storage. The
+				// snapshot-at-commit semantic mirrors previewNote (NOT
+				// openPlanForPreview, which prefers a local draft that a foreign
+				// repo's plan never has here).
+				foreignRepoName?: string | null,
+				foreignRepoUrl?: string | null,
+			) => {
+				const readStorageResult = foreignRepoName
+					? await bridge.createStorageForRepo(
+							foreignRepoName,
+							foreignRepoUrl ?? null,
+						)
+					: null;
+				await showPlanPreview(slug, title, readStorageResult?.storage);
+			},
+		),
+
+		vscode.commands.registerCommand(
 			"jollimemory.editNote",
 			async (itemOrId: NoteItem | string) => {
 				const noteId =
@@ -2512,6 +2692,49 @@ export function activate(context: vscode.ExtensionContext): void {
 					"openReferenceForPreview",
 				);
 				if (info) await bridge.previewReferenceMarkdown(info);
+			},
+		),
+
+		// Preview a COMMITTED reference snapshot from a memory's Timeline evidence
+		// row. Unlike openReferenceForPreview (which resolves the live plans.json
+		// registry by mapKey — empty once the reference is archived on commit),
+		// this reads the archived markdown straight off the orphan branch by
+		// source + archivedKey, mirroring SummaryWebviewPanel.handlePreviewReference.
+		// foreignRepoName/Url thread a foreign-repo memory's FolderStorage so the
+		// snapshot comes from the owning repo rather than the current workspace.
+		vscode.commands.registerCommand(
+			"jollimemory.previewCommittedReference",
+			async (
+				archivedKey: string,
+				source: SourceId,
+				foreignRepoName?: string | null,
+				foreignRepoUrl?: string | null,
+			) => {
+				log.info("cmd", `previewCommittedReference: ${source}:${archivedKey}`);
+				if (!archivedKey) return;
+				const readStorageResult = foreignRepoName
+					? await bridge.createStorageForRepo(foreignRepoName, foreignRepoUrl ?? null)
+					: null;
+				const content = await readReferenceFromBranch(
+					source,
+					archivedKey,
+					workspaceRoot,
+					readStorageResult?.storage,
+				);
+				if (!content) {
+					vscode.window.showErrorMessage(
+						`Reference snapshot "${archivedKey}" not found on the orphan branch.`,
+					);
+					return;
+				}
+				// Untitled markdown doc — same rationale as plan/note/reference
+				// preview elsewhere: never re-materialize an archived snapshot on
+				// the user's disk; the orphan branch is the source of truth.
+				const doc = await vscode.workspace.openTextDocument({
+					language: "markdown",
+					content,
+				});
+				await vscode.window.showTextDocument(doc);
 			},
 		),
 
@@ -2983,6 +3206,37 @@ export function activate(context: vscode.ExtensionContext): void {
 			},
 		),
 
+		// Open in Claude Code via URI scheme for the current branch recall.
+		vscode.commands.registerCommand("jollimemory.recallBranchInClaudeCode", () =>
+			runRecallInClaudeCode(bridge, workspaceRoot),
+		),
+
+		// Copy the current branch recall prompt to clipboard.
+		vscode.commands.registerCommand("jollimemory.copyBranchRecallPrompt", () =>
+			runCopyBranchRecallPrompt(bridge, workspaceRoot),
+		),
+
+		// Open the Create PR pane for the current branch.
+		vscode.commands.registerCommand("jollimemory.createPrForBranch", async () => {
+			await CreatePrWebviewPanel.show(
+				context.extensionUri,
+				workspaceRoot,
+				bridge,
+				commitsStore.getMainBranch(),
+			);
+		}),
+
+		// Preview the items that will be included in the next memory for this branch.
+		vscode.commands.registerCommand("jollimemory.reviewNextMemory", async () => {
+			const selection = await sidebarProvider.getNextMemorySelection();
+			NextMemoryPreviewPanel.show(selection);
+		}),
+
+		// Placeholder for the share-branch feature (not yet implemented).
+		vscode.commands.registerCommand("jollimemory.shareBranchPlaceholder", () => {
+			vscode.window.showInformationMessage("Sharing is coming soon.");
+		}),
+
 		// Open in Claude Code via URI scheme. Same cross-repo reasoning as
 		// copyRecallPrompt above — MemoryItem rows may belong to a non-current
 		// repo discovered under the Memory Bank parent.
@@ -3051,6 +3305,15 @@ export function activate(context: vscode.ExtensionContext): void {
 				},
 				authService,
 			);
+		}),
+
+		// Status overlay toggle — backs the native "JOLLI MEMORY" title-bar
+		// pulse icon (view/title contribution). The webview owns the toggle
+		// semantics (open Status, or collapse back to Branch if already open);
+		// here we just relay the click across the host→webview channel.
+		vscode.commands.registerCommand("jollimemory.toggleStatus", () => {
+			log.info("cmd", "toggleStatus invoked");
+			sidebarProvider.toggleStatus();
 		}),
 
 		// Inline onboarding API key save — wired from the sidebar's apikey-panel

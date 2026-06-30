@@ -229,4 +229,26 @@ describe("openKnowledgeGraph", () => {
 		await openKnowledgeGraph(extensionUri, kbParent, "repo-a");
 		expect(showErrorMessage).toHaveBeenCalledTimes(1);
 	});
+
+	it("stringifies a non-Error throw in the open-time failure message", async () => {
+		// Defensive String(err) branch: when whatever show() throws is not an
+		// Error instance, the message must still render the raw value rather
+		// than "[object Object]" / crash on a missing .message.
+		const extensionUri = makeExtensionDir() as never;
+		const kbParent = mkdtempSync(join(tmpdir(), "kg-kb-"));
+		tmpDirs.push(kbParent);
+		mkdirSync(join(kbParent, "repo-a", ".jolli", "graph"), { recursive: true });
+		writeFileSync(join(kbParent, "repo-a", ".jolli", "graph", "graph.json"), '{"stats":{}}', "utf8");
+
+		const spy = vi.spyOn(KnowledgeGraphPanel, "show").mockImplementation(() => {
+			throw "raw-string-failure";
+		});
+		try {
+			await openKnowledgeGraph(extensionUri, kbParent, "repo-a");
+		} finally {
+			spy.mockRestore();
+		}
+		expect(showErrorMessage).toHaveBeenCalledTimes(1);
+		expect(showErrorMessage.mock.calls[0][0]).toContain("raw-string-failure");
+	});
 });

@@ -131,6 +131,12 @@
 				"category": "Jolli Memory"
 			},
 			{
+				"command": "jollimemory.toggleStatus",
+				"title": "Status",
+				"icon": "$(pulse)",
+				"category": "Jolli Memory"
+			},
+			{
 				"command": "jollimemory.refreshFiles",
 				"title": "Refresh Files",
 				"icon": "$(refresh)",
@@ -239,6 +245,16 @@
 				"title": "View Knowledge Graph",
 				"icon": "$(type-hierarchy)",
 				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.reviewNextMemory",
+				"title": "Jolli Memory: Review Next Memory",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.shareBranchPlaceholder",
+				"title": "Jolli Memory: Share Branch",
+				"category": "Jolli Memory"
 			}
 		],
 		"menus": {
@@ -267,6 +283,18 @@
 					"command": "jollimemory.revertMemoryFileEdits",
 					"when": "resourceFilename =~ /\\.md$/",
 					"group": "jollimemory@1"
+				}
+			],
+			"view/title": [
+				{
+					"command": "jollimemory.openSettings",
+					"when": "view == jollimemory.mainView",
+					"group": "navigation@1"
+				},
+				{
+					"command": "jollimemory.toggleStatus",
+					"when": "view == jollimemory.mainView",
+					"group": "navigation@2"
 				}
 			]
 		}

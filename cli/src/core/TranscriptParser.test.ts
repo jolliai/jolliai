@@ -206,6 +206,75 @@ describe("ClaudeTranscriptParser", () => {
 		const line = JSON.stringify({ type: "toolUseResult", content: "..." });
 		expect(parser.parseLine(line, 0)).toBeNull();
 	});
+
+	describe("parseUsageTokens", () => {
+		it("sums input + cache_creation + output, EXCLUDING the cumulative cache_read prefix", () => {
+			const line = JSON.stringify({
+				type: "assistant",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "hi" }],
+					usage: {
+						input_tokens: 100,
+						cache_creation_input_tokens: 20,
+						cache_read_input_tokens: 300,
+						output_tokens: 5,
+					},
+				},
+			});
+			// 100 + 20 + 5 = 125. cache_read_input_tokens (300) is intentionally NOT
+			// summed — it is the cumulative re-read of an already-counted cached prefix.
+			expect(parser.parseUsageTokens(line, 1)).toBe(125);
+		});
+
+		// Real-fixture regression for C6. These three usage objects are copied verbatim
+		// from a real Claude transcript on disk
+		// (~/.claude/projects/-Users-flyer-jolli-code-worktrees-jolli-wt-2/050d4420-…​.jsonl,
+		// captured 2026-06-14). They prove cache_read_input_tokens is CUMULATIVE: it grows
+		// 16036 → 26231 → 50109 across the three turns while each turn's own new spend
+		// (input + cache_creation + output) is independent. Summing cache_read across the
+		// slice would add 16036+26231+50109 = 92376 of double-counted cached prefix.
+		it("does not inflate by summing the cumulative cache_read across real-transcript turns", () => {
+			const realTurns = [
+				{
+					input_tokens: 21060,
+					cache_creation_input_tokens: 10195,
+					cache_read_input_tokens: 16036,
+					output_tokens: 359,
+				},
+				{
+					input_tokens: 1,
+					cache_creation_input_tokens: 23878,
+					cache_read_input_tokens: 26231,
+					output_tokens: 655,
+				},
+				{
+					input_tokens: 2,
+					cache_creation_input_tokens: 2192,
+					cache_read_input_tokens: 50109,
+					output_tokens: 229,
+				},
+			];
+			const lines = realTurns.map((usage) =>
+				JSON.stringify({
+					type: "assistant",
+					message: { role: "assistant", content: [{ type: "text", text: "x" }], usage },
+				}),
+			);
+			const total = lines.reduce((acc, l) => acc + parser.parseUsageTokens(l, 0), 0);
+			// Per-turn deltas only: (21060+10195+359) + (1+23878+655) + (2+2192+229) = 31614 + 24534 + 2423 = 58571.
+			expect(total).toBe(58571);
+			// And it excludes the 92376 of cumulative cache_read that the old summation added.
+			expect(total).toBeLessThan(58571 + 92376);
+		});
+
+		it("returns 0 for human/user lines and malformed JSON", () => {
+			expect(
+				parser.parseUsageTokens(JSON.stringify({ type: "user", message: { role: "user", content: "x" } }), 1),
+			).toBe(0);
+			expect(parser.parseUsageTokens("{not json", 1)).toBe(0);
+		});
+	});
 });
 
 // ─── getParserForSource factory ──────────────────────────────────────────────

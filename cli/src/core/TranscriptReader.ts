@@ -23,6 +23,7 @@ import { readFile } from "node:fs/promises";
 import { createLogger } from "../Logger.js";
 import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult, TranscriptSource } from "../Types.js";
 import type { TranscriptParser } from "./TranscriptParser.js";
+import { ClaudeTranscriptParser } from "./TranscriptParser.js";
 
 const log = createLogger("TranscriptReader");
 
@@ -87,7 +88,8 @@ export async function readTranscript(
 	beforeTimestamp?: string,
 ): Promise<TranscriptReadResult> {
 	const startLine = cursor?.lineNumber ?? 0;
-	const parseFn = parser ? (line: string, num: number) => parser.parseLine(line, num) : parseTranscriptLine;
+	const activeParser = parser ?? new ClaudeTranscriptParser();
+	const parseFn = (line: string, num: number) => activeParser.parseLine(line, num);
 
 	let content: string;
 	try {
@@ -104,6 +106,7 @@ export async function readTranscript(
 	const rawEntries: TranscriptEntry[] = [];
 	const cutoffTime = beforeTimestamp ? new Date(beforeTimestamp).getTime() : undefined;
 	let lastConsumedLineIndex = startLine; // Track how far we actually consumed
+	let usageTokens = 0;
 
 	for (let i = 0; i < newLines.length; i++) {
 		const lineNum = startLine + i;
@@ -120,6 +123,8 @@ export async function readTranscript(
 			}
 			rawEntries.push(entry);
 		}
+		// Accumulate per-line token usage from the parser
+		usageTokens += activeParser.parseUsageTokens?.(newLines[i], lineNum) ?? 0;
 		// Only advance cursor for lines we actually processed (not past the break point)
 		lastConsumedLineIndex = startLine + i + 1;
 	}
@@ -135,7 +140,7 @@ export async function readTranscript(
 		updatedAt: new Date().toISOString(),
 	};
 
-	return { entries, newCursor, totalLinesRead: lastConsumedLineIndex - startLine };
+	return { entries, newCursor, totalLinesRead: lastConsumedLineIndex - startLine, usageTokens };
 }
 
 /**

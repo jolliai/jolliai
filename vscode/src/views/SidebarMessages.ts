@@ -9,10 +9,11 @@
  */
 
 import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSessionAggregator.js";
+import type { PinEntry, PinKind } from "../../../cli/src/core/PinStore.js";
 import type { ReferenceField, SourceId, TranscriptSource } from "../../../cli/src/Types.js";
 import type { WorkerPhase } from "../stores/StatusStore.js";
 
-export type SidebarTab = "kb" | "branch" | "status";
+export type SidebarTab = "kb" | "branch" | "status" | "knowledge";
 export type KbMode = "folders" | "memories";
 
 /**
@@ -117,6 +118,27 @@ export interface SerializedTreeItem {
 	/** Commits panel only: whether this commit has an associated memory summary. */
 	readonly hasMemory?: boolean;
 	/**
+	 * Commits panel only: full URL of the memory article on Jolli Space after
+	 * pushing. Present only when the commit has a memory that has been pushed.
+	 * Drives the SHIPPED group's Push/Synced status row in the expanded memory
+	 * detail (Synced + link when present; "Not pushed — Push to Jolli" action
+	 * when absent). Undefined for commits with no memory or unpushed memories.
+	 */
+	readonly jolliDocUrl?: string;
+	/**
+	 * Commits panel only: number of E2E-test-guide scenarios attached to this
+	 * memory (`summary.e2eTestGuide.length`). Undefined when the summary has no
+	 * test guide or when the commit has no memory.
+	 */
+	readonly e2eCount?: number;
+	/**
+	 * Commits panel only: tree-aggregated total LLM token usage for this memory
+	 * (`aggregateConversationTokens(summary)`). Sums tokens across amend/rebase
+	 * children so consolidated memories reflect the full conversation cost.
+	 * Undefined when the summary carries no token metadata.
+	 */
+	readonly conversationTokens?: number;
+	/**
 	 * Commits panel only: structured hover-card data, mirroring the Memories
 	 * panel's `MemoryItem.hover` so the webview can drive both rows through
 	 * the same `.hover-card` popover. Absent on file rows.
@@ -220,6 +242,14 @@ export interface FolderNode {
 	 * UX as IntelliJ's Memory Bank tool window.
 	 */
 	readonly isCurrentRepo?: boolean;
+	/**
+	 * Directory-only, repo nodes only. The raw `config.repoName` (NOT the
+	 * `name` display label, which `repoDisplayName` may suffix with a
+	 * `(dirName)` collision marker). Lets the Folders renderer scope to a
+	 * single repo using the same `repoName` key the `Showing` repo-filter and
+	 * the Memories / Knowledge renderers compare against.
+	 */
+	readonly repoName?: string;
 }
 
 export interface MemoryItem {
@@ -355,6 +385,56 @@ export interface ReferenceHover {
 }
 
 /**
+ * Minimal display shape for a single piece of evidence backing a memory.
+ * Carries the information needed to dispatch the appropriate open command
+ * when a user clicks the evidence row in the Timeline.
+ */
+export interface MemoryEvidenceItem {
+	readonly kind: "conversation" | "plan" | "note" | "reference" | "file";
+	readonly id: string;
+	readonly title: string;
+	/**
+	 * For kind === 'conversation': the transcript provider id.
+	 * For kind === 'reference': the reference's `SourceId` (`linear` / `jira` /
+	 * `github` / `notion`) — required to read the archived snapshot off the
+	 * orphan branch via `readReferenceFromBranch`.
+	 */
+	readonly source?: string;
+	readonly transcriptPath?: string;
+	readonly relativePath?: string;
+	readonly statusCode?: string;
+	/**
+	 * For kind === 'file' with statusCode === 'R': the pre-rename path, needed
+	 * so `jollimemory.openCommitFileChange` can diff old↔new across the rename.
+	 */
+	readonly oldPath?: string;
+	/**
+	 * For kind === 'conversation': the number of archived turns in the session
+	 * (`session.entries.length`), shown as the trailing "N msgs" count on the
+	 * evidence row. Undefined for non-conversation kinds.
+	 */
+	readonly messageCount?: number;
+}
+
+/**
+ * Evidence sources backing a single memory, grouped by category.
+ * Used by the Timeline (Memory expansion view) to display per-memory evidence
+ * without scrolling through the global source list.
+ *
+ * `sourceRepoName` / `sourceRemoteUrl` carry the memory's provenance (null =
+ * current workspace). They route note/reference previews to the owning repo's
+ * FolderStorage and gate file-diff opening (a foreign commit can't be diffed
+ * against the workspace git).
+ */
+export interface MemoryEvidence {
+	readonly conversations: ReadonlyArray<MemoryEvidenceItem>;
+	readonly context: ReadonlyArray<MemoryEvidenceItem>;
+	readonly files: ReadonlyArray<MemoryEvidenceItem>;
+	readonly sourceRepoName?: string | null;
+	readonly sourceRemoteUrl?: string | null;
+}
+
+/**
  * Minimal projection of `SummaryIndexEntry` for the foreign-readonly Branch
  * tab Memories section. Carries just the display fields the webview's
  * commit-row renderer reads, so the wire payload stays small. Does NOT
@@ -393,6 +473,28 @@ export interface RepoChoice {
 	readonly isCurrent: boolean;
 }
 
+export interface KnowledgeTopic {
+	readonly title: string;
+	readonly stableSlug: string;
+	readonly memoryCount: number;
+	readonly wikiFile: string;
+}
+
+export interface KnowledgeCategory {
+	readonly name: string;
+	readonly description?: string;
+	readonly topicCount: number;
+	readonly memoryCount: number;
+	readonly topics: ReadonlyArray<KnowledgeTopic>;
+}
+
+export interface KnowledgeRepo {
+	readonly repoName: string;
+	readonly memoryCount: number;
+	readonly indexPath: string;
+	readonly categories: ReadonlyArray<KnowledgeCategory>;
+}
+
 export type SidebarOutboundMsg =
 	| { readonly type: "ready" }
 	| { readonly type: "tab:switched"; readonly tab: SidebarTab }
@@ -422,6 +524,7 @@ export type SidebarOutboundMsg =
 	| { readonly type: "kb:expandFolder"; readonly path: string }
 	| { readonly type: "kb:openFile"; readonly path: string }
 	| { readonly type: "kb:openMemory"; readonly commitHash: string }
+	| { readonly type: "kb:expandMemory"; readonly commitHash: string }
 	| { readonly type: "kb:loadMore" }
 	| { readonly type: "kb:search"; readonly query: string }
 	| { readonly type: "kb:clearSearch" }
@@ -502,6 +605,12 @@ export type SidebarOutboundMsg =
 			readonly selected: boolean;
 	  }
 	| {
+			// Clear every commit selection on the host. Sent when the squash UI
+			// enters or exits selection mode so stale isSelected flags never
+			// carry over into the next squash session.
+			readonly type: "branch:deselectAllCommits";
+	  }
+	| {
 			readonly type: "branch:toggleConversationSelection";
 			readonly source: TranscriptSource;
 			readonly sessionId: string;
@@ -539,7 +648,100 @@ export type SidebarOutboundMsg =
 	  }
 	| {
 			readonly type: "refresh";
-			readonly scope: "kb" | "branch" | "status" | "all";
+			// "branch-current" refreshes only the Current Memory block
+			// (conversations + context + files); "branch-commits" refreshes only
+			// the Committed Memories section. "branch" stays as the whole-tab
+			// refresh (used by "all").
+			readonly scope:
+				| "kb"
+				| "branch"
+				| "branch-current"
+				| "branch-commits"
+				| "status"
+				| "knowledge"
+				| "all";
+	  }
+	| {
+			readonly type: "branch:pin";
+			readonly kind: PinKind;
+			readonly id: string;
+			readonly title: string;
+			/** Populated only for kind === 'conversation'. Forwarded to PinEntry so the pin can reopen. */
+			readonly source?: string;
+			/** Populated only for kind === 'conversation'. Forwarded to PinEntry so the pin can reopen. */
+			readonly transcriptPath?: string;
+	  }
+	| { readonly type: "branch:unpin"; readonly kind: PinKind; readonly id: string }
+	| {
+			/**
+			 * Open a FOREIGN-repo committed memory's PLAN evidence row. Routes to
+			 * `jollimemory.previewCommittedPlan`, which reads the plan body from the
+			 * owning repo's FolderStorage (NOT the live `openPlanForPreview`, which
+			 * resolves against the current workspace's plans.json + workspace orphan
+			 * branch and so can't see a foreign repo's plan). Only emitted when the
+			 * memory carries provenance — local-memory plan rows keep using
+			 * `branch:openPlan` so they get the "prefer local draft" behavior.
+			 */
+			readonly type: "kb:openEvidencePlan";
+			readonly planId: string;
+			readonly title: string;
+			readonly sourceRepoName: string;
+			readonly sourceRemoteUrl: string | null;
+	  }
+	| {
+			/**
+			 * Open a committed memory's NOTE evidence row. Routes to the orphan-only
+			 * `jollimemory.previewNote` (NOT the live `openNoteForPreview`, which
+			 * resolves against the active plans.json registry where committed notes
+			 * no longer live). `sourceRepoName` / `sourceRemoteUrl` come from the
+			 * memory's provenance so a foreign-repo note reads from the right storage.
+			 */
+			readonly type: "kb:openEvidenceNote";
+			readonly noteId: string;
+			readonly title: string;
+			readonly sourceRepoName: string | null;
+			readonly sourceRemoteUrl: string | null;
+	  }
+	| {
+			/**
+			 * Open a committed memory's REFERENCE evidence row. Routes to
+			 * `jollimemory.previewCommittedReference`, which reads the archived
+			 * snapshot off the orphan branch by `archivedKey` + `source` (NOT the
+			 * live `openReferenceForPreview`, which matches plans.json by `mapKey`
+			 * and is empty post-commit). Provenance routes foreign reads.
+			 */
+			readonly type: "kb:openEvidenceReference";
+			readonly archivedKey: string;
+			readonly source: string;
+			readonly sourceRepoName: string | null;
+			readonly sourceRemoteUrl: string | null;
+	  }
+	| {
+			/**
+			 * Open a committed memory's CONVERSATION evidence row. Unlike the live
+			 * `branch:openConversation` (which reopens the cursor-trimmed *unread*
+			 * slice of the live transcript file — empty for a committed memory,
+			 * whose turns were all consumed into the commit summary and now sit
+			 * before the cursor), this routes the host to re-read the ARCHIVED
+			 * transcript snapshot off the orphan branch by `commitHash` +
+			 * `sessionId` and render its full `entries` in a read-only panel —
+			 * the same archived content the memory-details "Manage" view shows.
+			 */
+			readonly type: "kb:openEvidenceConversation";
+			readonly commitHash: string;
+			readonly sessionId: string;
+			readonly source: TranscriptSource;
+			readonly title: string;
+	  }
+	| {
+			/**
+			 * Webview requests the open GitHub PR status for a branch.
+			 * Host responds with `kb:prStatus` carrying the PR number + URL
+			 * (or null when no open PR exists). Fire-and-forget: the host
+			 * never throws — errors resolve to pr: null.
+			 */
+			readonly type: "kb:requestPrStatus";
+			readonly branch: string;
 	  };
 
 export type SidebarInboundMsg =
@@ -590,6 +792,11 @@ export type SidebarInboundMsg =
 			readonly hasMore: boolean;
 	  }
 	| {
+			readonly type: "kb:memoryEvidence";
+			readonly commitHash: string;
+			readonly evidence: MemoryEvidence;
+	  }
+	| {
 			readonly type: "branch:branchName";
 			readonly name: string;
 			readonly detached: boolean;
@@ -628,7 +835,16 @@ export type SidebarInboundMsg =
 	| { readonly type: "enabled:changed"; readonly enabled: boolean }
 	| { readonly type: "auth:changed"; readonly authenticated: boolean }
 	| { readonly type: "configured:changed"; readonly configured: boolean }
-	| { readonly type: "worker:busy"; readonly busy: boolean }
+	| {
+			readonly type: "worker:busy";
+			readonly busy: boolean;
+			/**
+			 * Workspace HEAD short hash while busy — names the commit being
+			 * summarized in the Working Memory "Summarizing <hash>…" row.
+			 * Omitted when idle or when the host can't resolve HEAD.
+			 */
+			readonly commit?: string;
+	  }
 	| {
 			/**
 			 * Worker-phase indicator for the Branch-tab toolbar. Selects a
@@ -722,4 +938,59 @@ export type SidebarInboundMsg =
 			 */
 			readonly type: "apikey:saveError";
 			readonly message: string;
+	  }
+	| {
+			/**
+			 * Toggle the Status overlay. Posted by the native view-title Status
+			 * icon (`jollimemory.toggleStatus`), which lives in the editor's
+			 * "JOLLI MEMORY" title bar now instead of inside the webview. The
+			 * webview owns the toggle semantics: open the Status overlay, or
+			 * collapse back to the Branch view if Status is already showing.
+			 */
+			readonly type: "status:toggle";
+	  }
+	| {
+			/**
+			 * Host pushes the current branch's pinned items. Sent on init, after
+			 * each pin/unpin, on branch switch, and on branch/all refresh.
+			 */
+			readonly type: "branch:pinsData";
+			readonly items: ReadonlyArray<PinEntry>;
+	  }
+	| { readonly type: "kb:knowledgeData"; readonly repos: ReadonlyArray<KnowledgeRepo> }
+	| {
+			/**
+			 * Aggregated LLM token usage across all committed summaries on the current
+			 * branch. Posted alongside `branch:commitsData` when at least one summary
+			 * carries token metadata. Drives the horizontal token-usage bar rendered
+			 * at the top of the Committed Memories section body (non-foreign only).
+			 * `scope: "branch"` is reserved for future per-commit / per-session scopes.
+			 */
+			readonly type: "branch:tokenStats";
+			readonly input: number;
+			readonly output: number;
+			/** Prompt-cache tokens (cache_read + cache_creation) summed across summaries. */
+			readonly cached: number;
+			readonly total: number;
+			/**
+			 * How many committed memories on this branch carried token usage
+			 * (`reporting`) out of the total memory count (`memories`). Sources that
+			 * don't report usage (most non-Claude agents) contribute to `memories`
+			 * but not `reporting`, so the bar's total is a floor — the tooltip uses
+			 * these two counts to say "N of M memories report token usage".
+			 */
+			readonly reporting: number;
+			readonly memories: number;
+			readonly scope: "branch";
+	  }
+	| {
+			/**
+			 * Response to `kb:requestPrStatus`. Carries the open PR for the
+			 * branch (number + URL), or null when no open PR exists or the
+			 * lookup failed. The webview uses this to render "PR #N — open"
+			 * in the SHIPPED group.
+			 */
+			readonly type: "kb:prStatus";
+			readonly branch: string;
+			readonly pr: { readonly number: number; readonly url: string } | null;
 	  };

@@ -24,7 +24,18 @@ describe("SidebarCssBuilder", () => {
 		const css = buildSidebarCss();
 		expect(css).toContain(".sidebar-root");
 		expect(css).toContain(".tab-bar");
-		expect(css).toContain(".tab.active");
+		// The in-header icon strip (.tab / .tab-bar-right / status-icon color
+		// classes) was removed when Settings + Status moved to the native
+		// title bar — only the breadcrumb lives in the header now.
+		expect(css).not.toContain(".tab-bar-right");
+		expect(css).not.toContain(".status-icon-ok");
+	});
+
+	it("styles the view-switch row and its view-tab buttons", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".view-switch");
+		expect(css).toContain(".view-tab");
+		expect(css).toContain(".view-tab.active");
 	});
 
 	it("declares the .collapsible-section class", () => {
@@ -85,14 +96,57 @@ describe("SidebarCssBuilder", () => {
 		);
 		expect(css).not.toContain('[data-kind="repo-root"]');
 	});
+
+	it("styles Timeline time-group labels", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".tl-group-label");
+	});
+
+	it("styles the repo filter and scopes it to the Memory Bank view", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".repo-filter");
+	});
+
+	it("styles the Knowledge wiki tree and entry rows", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".kn-entry");
+		expect(css).toContain(".kn-cat");
+	});
+
+	it("defines conversation source-icon and usage-note styles", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".icon.conv-source-icon");
+		expect(css).toContain(".conv-source-svg");
+		expect(css).toContain(".usage-note");
+	});
+
+	it("defines the blocking-summary AI pill and Summarizing row styles", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".section-ai-pill");
+		expect(css).toContain(".section-ai-dot");
+		expect(css).toContain("@keyframes jm-ai-pulse");
+		expect(css).toContain(".tree-node.summarizing-row");
+	});
+
+	it("defines the compact build pill for the Memory Bank ingest phase", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".section-build-pill");
+		expect(css).toContain(".section-build-spin");
+		// The retired inline worker-status text style is gone (replaced by the pill).
+		expect(css).not.toContain(".section-worker-status");
+	});
 });
 
 describe("hover-reveal actions use visibility (no reflow)", () => {
 	// History: an earlier display-toggle attempt on .section-actions caused
 	// header-height flicker on mouse-enter because display:none collapses the
-	// slot. The fix across the sidebar — for both .section-header and
-	// .memory-row — is to use visibility:hidden ↔ visibility:visible, which
-	// keeps the slot reserved at rest and avoids any layout shift.
+	// slot. The fix across the sidebar is to use visibility:hidden ↔
+	// visibility:visible (never display) so revealing the actions never shifts
+	// layout. .memory-row + .tree-node--changes rows keep that hover model (the
+	// reserved slot is acceptable on a row). Section-HEADER actions, by contrast,
+	// are now ALWAYS visible (in-flow, margin-left:auto) — Context's +, Committed
+	// Memories' squash/push/refresh stay discoverable without a hover — so the
+	// no-reflow concern doesn't apply to them (nothing toggles).
 	//
 	// .tree-node rows still keep their inline actions always-visible: each row
 	// is short enough that an extra hover gate would be more noise than help.
@@ -116,11 +170,15 @@ describe("hover-reveal actions use visibility (no reflow)", () => {
 		);
 	});
 
-	it("section-header reveals its .section-actions on hover via visibility", () => {
+	it("keeps section-header .section-actions always visible (no hover gate)", () => {
 		const css = buildSidebarCss();
-		expect(css).toMatch(/\.section-actions\s*{[^}]*visibility:\s*hidden/);
+		// Always-visible: never hidden via visibility, never revealed on hover.
+		expect(css).not.toMatch(/\.section-actions\s*{[^}]*visibility:\s*hidden/);
+		expect(css).not.toMatch(/\.section-header:hover\s+\.section-actions/);
+		expect(css).not.toMatch(/\.memory-group-header:hover\s+\.section-actions/);
+		// In-flow, right-pinned via margin-left:auto.
 		expect(css).toMatch(
-			/\.section-header:hover\s+\.section-actions\s*{[^}]*visibility:\s*visible/,
+			/\.collapsible-section\s+\.section-actions\s*{[^}]*margin-left:\s*auto/,
 		);
 	});
 
@@ -446,6 +504,59 @@ describe("onboarding panel styles", () => {
 				expect(css).toMatch(re);
 			}
 		});
+
+		// The committed-memory conversation evidence row now shares the live rows'
+		// per-source brand glyph (.conv-source-icon / .conv-source-svg) plus a
+		// trailing "N msgs" count (.memory-evidence-row .msgs). The old generic
+		// per-source comment tint (.mem-conv-icon.src-*) is retired.
+		it("declares the shared brand-glyph styles + the trailing msg-count style", () => {
+			const css = buildSidebarCss();
+			expect(css).toMatch(/\.memory-evidence-row\s+\.msgs\s*\{[^}]*margin-left:\s*auto/);
+			expect(css).toMatch(/\.conv-source-svg\s*\{[^}]*width:\s*16px/);
+			// The retired per-source comment tint is gone.
+			expect(css).not.toMatch(/\.mem-conv-icon/);
+			// The retired source pill base rule is gone from the evidence row.
+			expect(css).not.toMatch(/\.memory-evidence-row\s+\.badge\s*\{/);
+		});
+
+		// Context evidence badges: colored square letter chips replacing the old
+		// monochrome codicons (P plan / N note / L linear / J jira / G github / N notion).
+		it("declares the context letter-badge base + per-kind hues", () => {
+			const css = buildSidebarCss();
+			expect(css).toMatch(/\.mem-ctx-badge\s*\{[^}]*border-radius/);
+			for (const kind of ["plan", "note", "linear", "jira", "github", "notion", "reference"]) {
+				expect(css).toMatch(new RegExp(`\\.mem-ctx-badge--${kind}\\b[^{]*\\{[^}]*background:`));
+			}
+		});
+
+		// File evidence rows: two-line filename (git-status tinted) over muted dir,
+		// with the trailing status letter pinned right.
+		it("declares the stacked file-row layout + trailing status letter", () => {
+			const css = buildSidebarCss();
+			expect(css).toMatch(/\.memory-evidence-file\s+\.mef-text\s*\{[^}]*flex-direction:\s*column/);
+			expect(css).toMatch(/\.memory-evidence-file\s+\.mef-dir\s*\{[^}]*var\(--vscode-descriptionForeground\)/);
+			expect(css).toMatch(/\.memory-evidence-row\s+\.gs-letter\s*\{[^}]*margin-left:\s*auto/);
+		});
+	});
+
+	// BUG 4: the "Show/Hide memory details" affordance shipped with no CSS at
+	// all and rendered as bare unstyled text. It must read as a muted dotted-
+	// underline disclosure link that lifts to the link hue on hover.
+	describe(".commit-memory-details-toggle — Show/Hide memory details affordance", () => {
+		it("styles the toggle as a quiet inline expander with a chevron and hover hue", () => {
+			const css = buildSidebarCss();
+			expect(css).toMatch(
+				/\.commit-memory-details-toggle\s*\{[^}]*cursor:\s*pointer[^}]*\}/,
+			);
+			// Mockup .mem-evd look: inline-flex with a trailing chevron, no underline.
+			expect(css).toMatch(
+				/\.commit-memory-details-toggle\s*\{[^}]*display:\s*inline-flex/,
+			);
+			expect(css).toContain(".memory-details-chevron");
+			expect(css).toMatch(
+				/\.commit-memory-details-toggle:hover\s*\{[^}]*color:\s*var\(--vscode-textLink-foreground\)/,
+			);
+		});
 	});
 
 	describe(".edited-icon — applies to both conversation rows and KB folder file rows", () => {
@@ -464,5 +575,124 @@ describe("onboarding panel styles", () => {
 				/\.tree-node\[data-kind="file"\]\s+\.edited-icon\s*\{[^}]*color:\s*var\(--vscode-gitDecoration-modifiedResourceForeground/,
 			);
 		});
+	});
+
+	it("styles the Current Memory group and its sub-sections", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".memory-group");
+		expect(css).toContain(".subsection");
+		// Each sub-section body reserves a ~4-row minimum height so the blocks
+		// keep a stable rhythm and don't collapse when sparse/empty. Pinned and
+		// Committed Memories (top-level sections) share the same floor.
+		expect(css).toMatch(/\.subsection\s+\.section-body\s*,/);
+		expect(css).toMatch(
+			/\.collapsible-section\[data-section="pinned"\]\s*>\s*\.section-body\s*,/,
+		);
+		expect(css).toMatch(
+			/\.collapsible-section\[data-section="commits"\]\s*>\s*\.section-body\s*{[^}]*min-height:\s*88px/,
+		);
+		// Pinned rows are top-level .tree-node (no .subsection class), so they must
+		// re-derive the sub-section alignment explicitly: pull the row in to 14px
+		// and drop the dead .twirl placeholder, so the pinned leading icon column
+		// lines up with the Conversations / Context / Files rows below instead of
+		// sitting ~10px further right.
+		expect(css).toMatch(
+			/\.collapsible-section\[data-section="pinned"\]\s*>\s*\.section-body\s+\.tree-node\s*{[^}]*padding-left:\s*14px/,
+		);
+		expect(css).toMatch(
+			/\.collapsible-section\[data-section="pinned"\]\s*>\s*\.section-body\s+\.tree-node\s*>\s*\.twirl\s*{[^}]*display:\s*none/,
+		);
+	});
+
+	it("styles the Current Branch command-bar footer (absolute, fixed height)", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".branch-footer");
+		// Absolutely positioned + fixed height, pinned to the sidebar bottom.
+		expect(css).toMatch(/\.branch-footer\s*{[^}]*position:\s*absolute/);
+		expect(css).toMatch(/\.branch-footer\s*{[^}]*bottom:\s*0/);
+		expect(css).toMatch(/\.branch-footer\s*{[^}]*height:\s*44px/);
+		// Action buttons stretch to share the bar width (scale with the sidebar);
+		// the overflow (...) button hugs its glyph instead.
+		expect(css).toMatch(/\.branch-footer\s+\.cmd-btn\s*{[^}]*flex:\s*1/);
+		expect(css).toMatch(/\.branch-footer\s+\.cmd-btn\.aa-more\s*{[^}]*flex:\s*0 0 auto/);
+		// Containing block + content clearance for the overlaid bar.
+		expect(css).toMatch(/\.sidebar-root\s*{[^}]*position:\s*relative/);
+		expect(css).toMatch(/#tab-content-branch\s*{[^}]*padding-bottom/);
+	});
+
+	it("defines commit-review-bar style", () => {
+		expect(buildSidebarCss()).toContain(".commit-review-bar");
+	});
+
+	it("drops the old inline committed-memory cloud-sync chip styles", () => {
+		// The always-visible inline sync pill was removed from the commit row, so
+		// its dedicated classes are gone. Sync state now lives only in the expanded
+		// SHIPPED group, styled by .ship-badge--synced (asserted below).
+		const css = buildSidebarCss();
+		expect(css).not.toContain(".mem-chips");
+		expect(css).not.toContain(".cloud-chip");
+	});
+
+	it("defines the strikethrough-exclude affordance styles", () => {
+		const css = buildSidebarCss();
+		// The ✕/+ toggle and the struck-through excluded row.
+		expect(css).toContain(".row-excl");
+		expect(css).toContain(".excluded");
+		// The raw include checkbox is hidden on rows that carry the toggle, so
+		// it can act purely as a hidden state-holder.
+		expect(css).toContain(".row-excl");
+		expect(css).toMatch(/:has\(\s*\.row-excl\s*\)/);
+	});
+
+	it("aligns expanded memory evidence to the mockup (whitespace-separated groups + bottom collapse)", () => {
+		const css = buildSidebarCss();
+		// Groups (Conversations / Context / Files) are separated by whitespace,
+		// not a divider line — matching the mockup's .mem-files .mem-group.
+		expect(css).toMatch(/\.memory-evidence-group:first-child\s+\.memory-evidence-group-label/);
+		expect(css).not.toMatch(/\.memory-evidence-group-label\s*{[^}]*border-top/);
+		expect(css).toContain(".memory-evidence-collapse");
+		expect(css).toContain(".memory-details-chevron");
+	});
+
+	it("defines token-bar styles", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".token-bar");
+		expect(css).toContain(".token-seg--input");
+		expect(css).toContain(".token-seg--w");
+		// cached segment + legend swatch, plus the "?" help affordance row.
+		expect(css).toContain(".token-seg--cached");
+		expect(css).toContain(".tk-leg--cached::before");
+		expect(css).toContain(".token-bar-help");
+		expect(css).toContain(".token-bar-label-row");
+	});
+
+	it("defines .mem-subline, .mem-sub-hash, and .mem-sub-sep styles", () => {
+		const css = buildSidebarCss();
+		// Subline container: flex row, muted color.
+		expect(css).toContain(".mem-subline");
+		expect(css).toMatch(/\.mem-subline\s*{[^}]*display:\s*flex/);
+		expect(css).toMatch(/\.mem-subline\s*{[^}]*var\(--vscode-descriptionForeground\)/);
+		// Hash: monospace font family.
+		expect(css).toContain(".mem-sub-hash");
+		expect(css).toMatch(/\.mem-sub-hash\s*{[^}]*font-family/);
+		// Separator span.
+		expect(css).toContain(".mem-sub-sep");
+	});
+
+	it("defines .ship-badge base class for SHIPPED group status chips", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".ship-badge");
+	});
+
+	it("defines .ship-badge--open (green) for the open-PR chip", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".ship-badge--open");
+		// Uses a green hue (charts-green or testing-iconPassed fallback)
+		expect(css).toMatch(/\.ship-badge--open\s*{[^}]*var\(--vscode-charts-green/);
+	});
+
+	it("defines .ship-badge--synced for the Synced chip (reuses cloud-synced or charts-green hue)", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".ship-badge--synced");
 	});
 });

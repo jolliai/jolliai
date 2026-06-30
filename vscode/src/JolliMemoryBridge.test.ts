@@ -4358,6 +4358,163 @@ describe("JolliMemoryBridge", () => {
 		});
 	});
 
+	// ── getBranchPrStats / resolveBranchDeltaBase ────────────────────
+
+	describe("getBranchPrStats()", () => {
+		it("uses the plain merge-base for a branch cut directly from main", async () => {
+			// getCurrentBranch
+			mockExecFileSuccess("feature/x\n");
+			// resolveHistoryBaseRef → refExists origin/main
+			mockExecFileSuccess("abc\n");
+			// getHEADHash — differs from merge-base, so NOT merged mode
+			mockExecFileSuccess("HEAD0000\n");
+			// merge-base
+			mockExecFileSuccess("BASE0000\n");
+			// resolveOwnCommitsBase → findBranchCreationPoint: no reflog entry
+			mockExecFileSuccess("\n");
+			// getDiffStats (mocked)
+			getDiffStats.mockResolvedValueOnce({ insertions: 3, deletions: 1, filesChanged: 2 });
+			// git diff --name-status
+			mockExecFileSuccess("M\tsrc/foo.ts\nA\tsrc/bar.ts\n");
+
+			const bridge = makeBridge();
+			const result = await bridge.getBranchPrStats("main");
+
+			expect(result.insertions).toBe(3);
+			expect(result.deletions).toBe(1);
+			expect(result.filesChanged).toBe(2);
+			expect(result.files).toHaveLength(2);
+			expect(result.files[0]).toEqual({ path: "src/foo.ts", dir: "src", status: "M" });
+			expect(result.files[1]).toEqual({ path: "src/bar.ts", dir: "src", status: "A" });
+		});
+
+		it("uses the refined creation-point base for a branch cut from release/* (resolveOwnCommitsBase path)", async () => {
+			// Scenario: hotfix/x cut from release/1.0 at commit E.
+			// Plain merge-base with main = C; creation point = E (downstream of C).
+			// resolveBranchDeltaBase should return E, not C.
+			// getCurrentBranch
+			mockExecFileSuccess("hotfix/x\n");
+			// resolveHistoryBaseRef → refExists origin/main
+			mockExecFileSuccess("abc\n");
+			// getHEADHash (HEAD = F, a commit past E)
+			mockExecFileSuccess("F0000000\n");
+			// merge-base with main = C (≠ HEAD → not merged mode)
+			mockExecFileSuccess("C0000000\n");
+			// resolveOwnCommitsBase → findBranchCreationPoint: explicit creation entry
+			mockExecFileSuccess("E0000000 branch: Created from release/1.0\n");
+			// isAncestor E HEAD → true (E is ancestor of F)
+			mockExecFileSuccess("");
+			// isAncestor C E → true (C is ancestor of E, i.e. E is downstream of C)
+			mockExecFileSuccess("");
+			// getDiffStats called with E0000000 as base
+			getDiffStats.mockResolvedValueOnce({ insertions: 5, deletions: 2, filesChanged: 3 });
+			// git diff --name-status from E
+			mockExecFileSuccess("M\tsrc/hotfix.ts\n");
+
+			const bridge = makeBridge();
+			const result = await bridge.getBranchPrStats("main");
+
+			// Verify getDiffStats was called with the refined base (E), not the coarse C
+			expect(getDiffStats).toHaveBeenCalledWith("E0000000", "HEAD", expect.any(String));
+			expect(result.insertions).toBe(5);
+			expect(result.deletions).toBe(2);
+			expect(result.filesChanged).toBe(3);
+			expect(result.files).toHaveLength(1);
+			expect(result.files[0].path).toBe("src/hotfix.ts");
+		});
+
+		it("returns zeros when no merge-base exists", async () => {
+			// getCurrentBranch
+			mockExecFileSuccess("orphan-branch\n");
+			// resolveHistoryBaseRef → all refExists fail
+			mockExecFileError("not found");
+			mockExecFileError("not found");
+			mockExecFileError("not found");
+			// getHEADHash
+			mockExecFileSuccess("HEAD0000\n");
+			// merge-base fails (no common ancestor)
+			mockExecFileError("no merge base");
+
+			const bridge = makeBridge();
+			const result = await bridge.getBranchPrStats("main");
+
+			expect(result).toEqual({ insertions: 0, deletions: 0, filesChanged: 0, files: [] });
+		});
+
+		it("uses the creation point as base in merged mode when the branch has own commits", async () => {
+			// Branch fully merged: plain merge-base equals HEAD.
+			// resolveBranchDeltaBase routes through resolveMergedHistory; with an
+			// own `commit` reflog op present (hasOwnCommit=true) it returns the
+			// creation-point hash so the diffstat covers the branch's own work.
+			// getCurrentBranch
+			mockExecFileSuccess("feature/merged\n");
+			// resolveHistoryBaseRef → refExists origin/main
+			mockExecFileSuccess("abc\n");
+			// getHEADHash
+			mockExecFileSuccess("HEAD1111\n");
+			// merge-base === HEAD → merged mode
+			mockExecFileSuccess("HEAD1111\n");
+			// resolveMergedHistory reflog: creation entry (base) + an own `commit`
+			// op (hasOwnCommit=true). Commit-line hash must be lowercase hex to
+			// match the /^[0-9a-f]+ commit\b/ own-commit detector.
+			mockExecFileSuccess(
+				"create00 branch: Created from main\ndeadbeef commit: did real work\n",
+			);
+			// getDiffStats called with create00 as base
+			getDiffStats.mockResolvedValueOnce({ insertions: 7, deletions: 3, filesChanged: 4 });
+			// git diff --name-status
+			mockExecFileSuccess("A\tsrc/new.ts\n");
+
+			const bridge = makeBridge();
+			const result = await bridge.getBranchPrStats("main");
+
+			expect(getDiffStats).toHaveBeenCalledWith("create00", "HEAD", expect.any(String));
+			expect(result.insertions).toBe(7);
+		});
+
+		it("returns zeros in merged mode for a sync-only branch with NO own commits (E1: matches empty memory list)", async () => {
+			// A created-from-main + rebased branch (HEAD ⊆ main, no own `commit`
+			// reflog op) must yield empty stats — same hasOwnCommit gate that
+			// listBranchCommits applies — so PR-stats and the memory list agree.
+			// getCurrentBranch
+			mockExecFileSuccess("feature/sync\n");
+			// resolveHistoryBaseRef → refExists origin/main
+			mockExecFileSuccess("abc\n");
+			// getHEADHash
+			mockExecFileSuccess("HEAD3333\n");
+			// merge-base === HEAD → merged mode
+			mockExecFileSuccess("HEAD3333\n");
+			// resolveMergedHistory reflog: ONLY a creation entry + a rebase move,
+			// no `commit` op → hasOwnCommit=false → resolveBranchDeltaBase undefined.
+			mockExecFileSuccess(
+				"create00 branch: Created from main\nHEAD3333 rebase (finish): returning to refs/heads/feature/sync\n",
+			);
+
+			const bridge = makeBridge();
+			const result = await bridge.getBranchPrStats("main");
+
+			expect(result).toEqual({ insertions: 0, deletions: 0, filesChanged: 0, files: [] });
+		});
+
+		it("returns zeros when in merged mode but the reflog is empty (creation point unavailable)", async () => {
+			// getCurrentBranch
+			mockExecFileSuccess("feature/old\n");
+			// resolveHistoryBaseRef → refExists origin/main
+			mockExecFileSuccess("abc\n");
+			// getHEADHash
+			mockExecFileSuccess("HEAD2222\n");
+			// merge-base === HEAD → merged mode
+			mockExecFileSuccess("HEAD2222\n");
+			// resolveMergedHistory: empty reflog → returns undefined
+			mockExecFileSuccess("\n");
+
+			const bridge = makeBridge();
+			const result = await bridge.getBranchPrStats("main");
+
+			expect(result).toEqual({ insertions: 0, deletions: 0, filesChanged: 0, files: [] });
+		});
+	});
+
 	// ── listBranchMemories ──────────────────────────────────────────
 
 	describe("listBranchMemories()", () => {

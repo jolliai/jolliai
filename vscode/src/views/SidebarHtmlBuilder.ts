@@ -25,20 +25,22 @@
  *     drops the option cards and shows a single primary "Enable" button. The
  *     legacy disabled-banner inside the Status panel is kept for the degraded
  *     (no-workspace / no-git) fallback only.
- *   - A header bar (`#tab-bar`) split into two halves:
- *       * Left: breadcrumb showing `<repo> / <branch>` with chevron dropdown
- *         affordances. The dropdowns are populated on demand by the host via
- *         `selection:repos` / `selection:branches` messages; when only one
- *         repo or one branch is known, the chevron is suppressed so the row
- *         doesn't dangle a no-op affordance. The breadcrumb text doubles as
- *         the "what am I viewing" indicator — `branchName` lives here now
- *         instead of inside a labeled tab.
- *       * Right: 3 icon buttons — Memory Bank, Settings, Status. Memory Bank
- *         and Status are toggle buttons (`data-tab="kb"` / `data-tab="status"`)
- *         that open the corresponding overlay panel; clicking an already-active
- *         icon collapses the overlay back to the default Branch view. Settings
- *         posts `jollimemory.openSettings` (moved out of the Status toolbar so
- *         configuration lives in the same row as the other top-level actions).
+ *   - A view-switch row (`#view-switch`) with the 3 primary views — Current
+ *     Branch / Memory Bank / Knowledge — as segmented `data-tab` buttons. It
+ *     sits directly under the editor's native "JOLLI MEMORY" title bar, above
+ *     the breadcrumb row.
+ *   - A header bar (`#tab-bar`) holding only the breadcrumb `<repo> / <branch>`
+ *     with chevron dropdown affordances. The dropdowns are populated on demand
+ *     by the host via `selection:repos` / `selection:branches` messages; when
+ *     only one repo or one branch is known, the chevron is suppressed so the
+ *     row doesn't dangle a no-op affordance. The breadcrumb text doubles as the
+ *     "what am I viewing" indicator — `branchName` lives here now instead of
+ *     inside a labeled tab. The Settings (gear) and Status (pulse) actions used
+ *     to live in a right-side icon strip here; they are now native `view/title`
+ *     contributions in the "JOLLI MEMORY" title bar. Settings runs
+ *     `jollimemory.openSettings`; Status runs `jollimemory.toggleStatus`, which
+ *     posts `status:toggle` to open the Status overlay (or collapse back to
+ *     Branch if it's already showing).
  *   - 3 tab content panels (one shown at a time, the others have the `.hidden` class).
  *     The Branch panel is the persistent default; KB / Status are toggled by
  *     the icon buttons. Renamed user-facing string: "Commits" → "Memories"
@@ -140,6 +142,11 @@ export function buildSidebarHtml(
       </header>
       <button type="button" id="disabled-enable-btn" class="ob-btn ob-btn--primary">Enable Jolli Memory</button>
     </div>
+    <div class="view-switch hidden" id="view-switch" role="tablist" aria-label="Jolli Memory views">
+      <button class="view-tab active" type="button" data-tab="branch" role="tab">Current Branch</button>
+      <button class="view-tab" type="button" data-tab="kb" role="tab">Memory Bank</button>
+      <button class="view-tab" type="button" data-tab="knowledge" role="tab">Knowledge</button>
+    </div>
     <div class="tab-bar hidden" id="tab-bar" role="toolbar" aria-label="Jolli Memory header">
       <div class="breadcrumb" id="breadcrumb">
         <button class="breadcrumb-seg" type="button" id="breadcrumb-repo-btn" aria-haspopup="menu" aria-expanded="false">
@@ -154,15 +161,11 @@ export function buildSidebarHtml(
           <i class="codicon codicon-chevron-down breadcrumb-seg-chevron hidden" aria-hidden="true"></i>
         </button>
       </div>
-      <div class="tab-bar-right">
-        <button class="tab tab-icon" type="button" data-tab="kb" id="kb-icon-btn" aria-label="Memory Bank">
-          <i class="codicon codicon-book" aria-hidden="true"></i>
-        </button>
-        <button class="tab tab-icon" type="button" data-action="open-settings" id="settings-icon-btn" aria-label="Settings">
-          <i class="codicon codicon-gear" aria-hidden="true"></i>
-        </button>
-        <button class="tab tab-icon" type="button" data-tab="status" id="status-icon-btn" aria-label="Status">
-          <i class="codicon codicon-circle-filled"></i>
+      <div class="repo-filter hidden" id="repo-filter">
+        <span class="repo-filter-label">Showing</span>
+        <button class="breadcrumb-seg" type="button" id="repo-filter-btn" aria-haspopup="menu" aria-expanded="false">
+          <span class="breadcrumb-seg-label" id="repo-filter-value">All repos</span>
+          <i class="codicon codicon-chevron-down breadcrumb-seg-chevron" aria-hidden="true"></i>
         </button>
       </div>
     </div>
@@ -170,6 +173,7 @@ export function buildSidebarHtml(
     <div class="tab-toolbar hidden" id="tab-toolbar"></div>
     <div class="tab-content hidden" id="tab-content-kb"><p class="placeholder">Loading...</p></div>
     <div class="tab-content hidden" id="tab-content-branch"><p class="placeholder">Loading...</p></div>
+    <div class="tab-content hidden" id="tab-content-knowledge"><p class="placeholder">Loading...</p></div>
     <div class="tab-content hidden" id="tab-content-status">
       <div class="disabled-banner hidden" id="disabled-banner">
         <p class="disabled-intro">Capture searchable memories from your AI coding sessions and weave them into your git history. Each commit gets an AI-generated summary you can recall later.</p>
