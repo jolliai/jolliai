@@ -14,7 +14,7 @@
  * any LLM call — used for validation and to tune thresholds.
  */
 
-import { execGit, getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
+import { execGit, getCommitInfo, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
@@ -24,7 +24,7 @@ import { getIndexEntryMap, setActiveStorage, storeSummary } from "../core/Summar
 import { generateTranscriptId } from "../core/TranscriptId.js";
 import { buildMultiSessionContext } from "../core/TranscriptReader.js";
 import { launchWorker } from "../hooks/QueueWorker.js";
-import { createLogger, ORPHAN_BRANCH } from "../Logger.js";
+import { createLogger } from "../Logger.js";
 import { type CommitSummary, CURRENT_SCHEMA_VERSION, type StoredTranscript } from "../Types.js";
 import { type AttributedCommit, attributeCommits } from "./CommitAttributor.js";
 import { buildCommitTargetIndex } from "./CommitTargetIndex.js";
@@ -32,10 +32,23 @@ import { cwdInRoots, scanClaudeTranscripts } from "./RawTranscriptScanner.js";
 
 const log = createLogger("BackfillEngine");
 
+/**
+ * Branch label for a diff-only back-filled summary (no conversation attributed).
+ * A historical commit's *development* branch cannot be reliably recovered after
+ * the fact — git stores no "made on branch X" in the commit object; the original
+ * branch may be merged/deleted and `git branch --contains` / `git log --source`
+ * return arbitrary refs. So instead of stamping the run-time HEAD (wrong) we use
+ * an explicit "backfilled" marker. When a conversation IS attributed, its
+ * transcript `gitBranch` (captured at edit time) is used — that one is reliable.
+ */
+const DIFF_ONLY_BRANCH = "backfilled";
+
 export type BackfillStatus = "generated" | "would-generate" | "skipped-has-summary" | "error";
 
 export interface BackfillOutcome {
 	readonly commitHash: string;
+	/** Commit subject (first line) for human-friendly progress display. */
+	readonly commitSubject?: string;
 	readonly status: BackfillStatus;
 	readonly confidence?: "high" | "medium";
 	readonly method?: "file-overlap" | "time-window" | "diff-only";
@@ -103,7 +116,6 @@ async function generateAndStore(
 	hash: string,
 	attr: AttributedCommit | null,
 	cwd: string,
-	fallbackBranch: string,
 	llmConfig: { apiKey?: string; model?: string; jolliApiKey?: string; aiProvider?: "anthropic" | "jolli" },
 	storage: StorageProvider,
 ): Promise<number> {
@@ -133,7 +145,7 @@ async function generateAndStore(
 		commitMessage: commitInfo.message,
 		commitAuthor: commitInfo.author,
 		commitDate: commitInfo.date,
-		branch: attr?.branch || fallbackBranch,
+		branch: attr?.branch || DIFF_ONLY_BRANCH,
 		generatedAt: new Date().toISOString(),
 		commitType: "commit",
 		commitSource: "cli",
@@ -214,7 +226,6 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 		jolliApiKey: config.jolliApiKey,
 		aiProvider: config.aiProvider,
 	};
-	const fallbackBranch = await getCurrentBranch(cwd).catch(() => ORPHAN_BRANCH);
 	const credsOk = hasLlmCredentials(config);
 
 	let done = 0;
@@ -224,6 +235,9 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 		// an unsure conversation; every own-commit still gets at least a diff summary.
 		const attr = attributed.get(hash) ?? null;
 		const method = attr?.method ?? "diff-only";
+		// Subject is already in the target index (no extra git call) — carry it so
+		// progress UIs can show the commit's one-line message instead of a bare hash.
+		const subject = index.commitMeta.get(hash)?.subject;
 		let outcome: BackfillOutcome;
 		if (dryRun) {
 			outcome = {
@@ -236,7 +250,7 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 			outcome = { commitHash: hash, status: "error", message: "no LLM credentials configured" };
 		} else {
 			try {
-				const topics = await generateAndStore(hash, attr, cwd, fallbackBranch, llmConfig, storage);
+				const topics = await generateAndStore(hash, attr, cwd, llmConfig, storage);
 				log.info("Back-fill generated %s via %s (%d topics)", hash.substring(0, 8), method, topics);
 				outcome = {
 					commitHash: hash,
@@ -250,6 +264,7 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 				log.error("Back-fill failed for %s: %s", hash.substring(0, 8), (err as Error).message);
 			}
 		}
+		if (subject) outcome = { ...outcome, commitSubject: subject };
 		outcomes.push(outcome);
 		done++;
 		onProgress?.(done, missing.length, outcome);
@@ -297,6 +312,16 @@ async function localAuthorEmail(cwd: string): Promise<string | null> {
 }
 
 /**
+ * Escapes regex metacharacters so a string matches literally. `git rev-list
+ * --author=<v>` treats `<v>` as a regex, so an unescaped `.`/`+` in an email
+ * (e.g. a Gmail `user+tag@…` alias) would match unintended authors and pull in
+ * other people's commits — breaking the "own commits only" scoping.
+ */
+function escapeRegex(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
  * Returns commit hashes reachable from HEAD, newest-first. Capped to `limit`
  * when given (`undefined` → all reachable commits). Shared by the CLI command,
  * the enable-time worker, and the VS Code "missing summaries" count/button.
@@ -311,7 +336,7 @@ export async function recentCommitHashes(cwd: string, limit?: number): Promise<s
 	const args = ["rev-list", "HEAD"];
 	if (limit && limit > 0) args.push("--max-count", String(limit));
 	const email = await localAuthorEmail(cwd);
-	if (email) args.push(`--author=${email}`);
+	if (email) args.push(`--author=${escapeRegex(email)}`);
 	const res = await execGit(args, cwd);
 	if (res.exitCode !== 0 || !res.stdout.trim()) return [];
 	return res.stdout

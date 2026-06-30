@@ -9,8 +9,11 @@ describe("relativizeUnderCwd", () => {
 		expect(relativizeUnderCwd("e:/repo/src/foo.ts", "e:/repo")).toBe("src/foo.ts");
 		expect(relativizeUnderCwd("e:\\repo\\src\\foo.ts", "e:\\repo")).toBe("src/foo.ts");
 	});
-	it("is case-insensitive on the cwd prefix but preserves case in the slice", () => {
-		expect(relativizeUnderCwd("E:/Repo/Src/Foo.ts", "e:/repo")).toBe("Src/Foo.ts");
+	it("folds case on the cwd prefix on case-insensitive platforms; preserves slice case", () => {
+		// normalizePathForCompare folds case on win32/darwin but NOT on Linux, so on a
+		// case-sensitive filesystem the differing-case prefix legitimately does not match.
+		const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
+		expect(relativizeUnderCwd("E:/Repo/Src/Foo.ts", "e:/repo")).toBe(caseInsensitive ? "Src/Foo.ts" : null);
 	});
 	it("returns null when the path is not under cwd, and '' when equal", () => {
 		expect(relativizeUnderCwd("e:/other/x.ts", "e:/repo")).toBeNull();
@@ -24,7 +27,8 @@ describe("cwdInRoots", () => {
 		const pred = cwdInRoots(["e:/repo", "e:/wt2"]);
 		expect(pred("e:/repo")).toBe(true);
 		expect(pred("e:/repo/sub")).toBe(true);
-		expect(pred("E:\\WT2")).toBe(true);
+		// A differing-case root match only holds on case-insensitive platforms (win32/darwin).
+		expect(pred("E:\\WT2")).toBe(process.platform === "win32" || process.platform === "darwin");
 		expect(pred("e:/elsewhere")).toBe(false);
 		expect(pred(undefined)).toBe(false);
 	});
@@ -208,5 +212,30 @@ describe("scanClaudeTranscripts", () => {
 		writeFileSync(join(root, "loose.jsonl"), "ignored-at-root");
 		const bySession = await scanClaudeTranscripts(() => true, root);
 		expect(bySession.size).toBe(0);
+	});
+
+	it("tolerates null/non-object blocks, nameless tools, bare filenames, and missing cwd/sessionId", async () => {
+		writeProject("proj", "weird.jsonl", [
+			{
+				// no cwd, no gitBranch, no sessionId → cwd/gitBranch undefined, sessionId falls back to file name
+				timestamp: "2026-06-01T00:00:00.000Z",
+				type: "assistant",
+				message: {
+					role: "assistant",
+					content: [
+						null, // block === null → skipped
+						"a string block", // typeof !== "object" → skipped
+						{ type: "tool_use", name: "Edit" }, // no input → (b.input ?? {}) fallback
+						{ type: "tool_use", input: { file_path: "bare.ts" } }, // no name → not extracted
+						{ type: "tool_use", name: "Edit", input: { file_path: "bare.ts" } }, // bare basename (no "/")
+					],
+				},
+			},
+		]);
+		const bySession = await scanClaudeTranscripts(() => true, root);
+		const entries = bySession.get("weird"); // sessionId fell back to the file basename
+		expect(entries).toHaveLength(1);
+		expect(entries?.[0].editedBase).toEqual(["bare.ts"]);
+		expect(entries?.[0].cwd).toBeUndefined();
 	});
 });

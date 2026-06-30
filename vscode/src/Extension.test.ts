@@ -726,6 +726,11 @@ vi.mock("../../cli/src/Logger.js", () => ({
 	getJolliMemoryDir: vi.fn((cwd: string) => `${cwd}/.jolli/jollimemory`),
 }));
 
+vi.mock("../../cli/src/backfill/BackfillEngine.js", () => ({
+	recentCommitHashes: vi.fn(),
+	runBackfill: vi.fn(),
+}));
+
 vi.mock("./commands/CommitCommand.js", () => ({
 	CommitCommand: MockCommitCommand,
 }));
@@ -7338,6 +7343,37 @@ describe("Extension", () => {
 			expect(showInformationMessage).toHaveBeenCalledWith(
 				"Please open a folder to use Jolli Memory.",
 			);
+		});
+	});
+
+	describe("generateMissingSummaries command", () => {
+		it("returns ok:false with a message when there are no commits", async () => {
+			const { recentCommitHashes } = await import("../../cli/src/backfill/BackfillEngine.js");
+			vi.mocked(recentCommitHashes).mockResolvedValue([]);
+			activate(makeContext());
+			const handler = commandMap.get("jollimemory.generateMissingSummaries");
+			expect(handler).toBeDefined();
+			const result = await handler?.();
+			expect(result).toEqual(expect.objectContaining({ ok: false, message: "No commits found." }));
+		});
+
+		it("runs the back-fill and renders each progress label variant", async () => {
+			const { recentCommitHashes, runBackfill } = await import("../../cli/src/backfill/BackfillEngine.js");
+			vi.mocked(recentCommitHashes).mockResolvedValue(["h1", "h2", "h3"]);
+			vi.mocked(runBackfill).mockImplementation(async (opts) => {
+				// Drives the label branches: short subject (≤60), long subject (>60 →
+				// truncated) with an error tag, and no subject (→ falls back to hash).
+				opts.onProgress?.(1, 3, { commitHash: "aaaaaaaa1111", status: "generated", commitSubject: "short subject" });
+				opts.onProgress?.(2, 3, { commitHash: "bbbbbbbb2222", status: "error", commitSubject: "x".repeat(70) });
+				opts.onProgress?.(3, 3, { commitHash: "cccccccc3333", status: "generated" });
+				return { total: 3, generated: 2, skipped: 0, errors: 1, outcomes: [] };
+			});
+			mockMemoriesStore.hasFirstLoaded.mockReturnValueOnce(true);
+			activate(makeContext());
+			const handler = commandMap.get("jollimemory.generateMissingSummaries");
+			const result = await handler?.();
+			expect(vi.mocked(runBackfill)).toHaveBeenCalled();
+			expect(result).toEqual(expect.objectContaining({ total: 3, generated: 2 }));
 		});
 	});
 

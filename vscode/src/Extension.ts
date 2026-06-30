@@ -1947,7 +1947,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					const report = await vscode.window.withProgress(
 						{
 							location: vscode.ProgressLocation.Notification,
-							title: "Jolli: back-filling summaries",
+							title: "Jolli Memory: Back-filling summaries",
 							cancellable: false,
 						},
 						(progress) =>
@@ -1955,10 +1955,17 @@ export function activate(context: vscode.ExtensionContext): void {
 								cwd: workspaceRoot,
 								hashes,
 								onProgress: (done, total, outcome) => {
-									progress.report({
-										message: `${done}/${total} — ${outcome.commitHash.substring(0, 8)} (${outcome.status})`,
-										increment: 100 / total,
-									});
+									// Show the commit's one-line message (more readable than a hash),
+									// truncated; flag only failures — success is the norm and the
+									// advancing count already signals progress.
+									const subject = outcome.commitSubject?.trim();
+									const label = subject
+										? subject.length > 60
+											? `${subject.slice(0, 57)}…`
+											: subject
+										: outcome.commitHash.substring(0, 8);
+									const tag = outcome.status === "error" ? " (failed)" : "";
+									progress.report({ message: `${done}/${total} — ${label}${tag}`, increment: 100 / total });
 								},
 							}),
 					);
