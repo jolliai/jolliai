@@ -337,9 +337,9 @@ class PlansPanel(
                 .map { ListItem.PlanItem(it) }
             val noteItems = filterNotes(registry.notes ?: emptyMap(), gitOps, currentBranch)
                 .map { ListItem.NoteItem(it) }
-            val refItems = (registry.references ?: emptyMap()).map { (mapKey, entry) ->
-                ListItem.ReferenceItem(entry, mapKey)
-            }
+            val refItems = (registry.references ?: emptyMap())
+                .filter { (_, entry) -> filterReference(entry, currentBranch) }
+                .map { (mapKey, entry) -> ListItem.ReferenceItem(entry, mapKey) }
 
             // Merge and sort by lastModified descending (newest first), matching VS Code
             (planItems + noteItems + refItems).sortedByDescending { it.lastModified }
@@ -411,6 +411,17 @@ class PlansPanel(
             }
             true
         }
+    }
+
+    /**
+     * References are branch-scoped like plans/notes: a row stamped with a branch
+     * only shows on that branch; legacy blank-branch rows (written before
+     * branch-scoping) stay visible everywhere. References carry no committed /
+     * guard state — a commit deletes the row — so there is nothing else to filter.
+     */
+    private fun filterReference(entry: ReferenceEntry, currentBranch: String?): Boolean {
+        if (currentBranch != null && !entry.branch.isNullOrBlank() && entry.branch != currentBranch) return false
+        return true
     }
 
     private fun showInitializing() {

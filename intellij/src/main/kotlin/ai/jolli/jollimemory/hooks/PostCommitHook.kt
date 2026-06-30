@@ -296,10 +296,15 @@ object PostCommitHook {
                 return
             }
 
-            // 7b. Assemble reference blocks for prompt injection
+            // 7b. Assemble reference blocks for prompt injection — branch-scoped to
+            //     this commit's branch (legacy blank-branch rows allowed) so the
+            //     summary prompt never sees another branch's references.
+            val branch = git.getCurrentBranch() ?: "unknown"
             val registry = SessionTracker.loadPlansRegistry(cwd)
             val referenceBlocks = PromptRenderer.assembleReferenceBlocks(
-                registry.references ?: emptyMap(),
+                (registry.references ?: emptyMap()).filter { (_, entry) ->
+                    entry.branch.isNullOrBlank() || entry.branch == branch
+                },
                 exclusions.references,
             )
             if (referenceBlocks.isNotEmpty()) {
@@ -376,12 +381,15 @@ object PostCommitHook {
                 log.info("Plan progress: evaluated %d/%d plan(s)", planProgressArtifacts.size, planRefs.size)
             }
 
-            // 8c. Detect uncommitted references, archive to orphan branch
+            // 8c. Detect uncommitted references on this branch, archive to orphan branch.
+            //     Branch-scoped like notes (8d) so a commit on this branch leaves other
+            //     branches' references pending instead of sweeping them up. `branch` is
+            //     declared at the 7b prompt-assembly step above.
             val referenceCommitRefs = mutableListOf<ReferenceCommitRef>()
             val referenceFilesToStore = mutableListOf<FileWrite>()
             val referenceCommitted = mutableListOf<Triple<String, String, String>>() // mapKey, sourcePath, updatedAt
 
-            val uncommittedRefResult = detectUncommittedReferences(cwd)
+            val uncommittedRefResult = detectUncommittedReferences(cwd, branch)
             if (uncommittedRefResult.isNotEmpty()) {
                 log.info("Detected %d uncommitted reference(s)", uncommittedRefResult.size)
                 val shortHash = commitInfo.hash.substring(0, 8)
@@ -422,7 +430,6 @@ object PostCommitHook {
             }
 
             // 9. Build and store CommitSummary
-            val branch = git.getCurrentBranch() ?: "unknown"
             val commitType = detectCommitType()
 
             // 8d. Detect uncommitted notes on this branch, archive, and attach to the summary.
@@ -677,10 +684,20 @@ object PostCommitHook {
         return DiffStats(files, ins, del)
     }
 
-    /** Returns all entries from plans.json.references (every entry is uncommitted). */
-    private fun detectUncommittedReferences(cwd: String): Map<String, ai.jolli.jollimemory.core.references.ReferenceEntry> {
+    /**
+     * References eligible to be archived by this commit: every plans.json row is
+     * uncommitted (a commit deletes the row), scoped to the current branch with the
+     * legacy blank-branch fallback — mirrors [detectUncommittedNotes] so committing
+     * on one branch does not sweep up references stamped for another.
+     */
+    private fun detectUncommittedReferences(
+        cwd: String,
+        branch: String,
+    ): Map<String, ai.jolli.jollimemory.core.references.ReferenceEntry> {
         val registry = SessionTracker.loadPlansRegistry(cwd)
-        return registry.references ?: emptyMap()
+        return (registry.references ?: emptyMap()).filter { (_, entry) ->
+            entry.branch.isNullOrBlank() || entry.branch == branch
+        }
     }
 
     /**

@@ -5,6 +5,14 @@
 		"moduleResolution": "bundler",
 		"lib": ["ES2022"],
 		"outDir": "dist",
+		// tsc is type-check only here (esbuild produces dist/). Cross-package imports of
+		// ../../../cli/src/** pull files outside this package into the program, so their
+		// common source dir is the repo root — TS then can't infer a rootDir (TS6059),
+		// which the IDE language server flags even though tsc never emits here. noEmit
+		// stops emission; rootDir ".." pins the layout root explicitly so the IDE's
+		// project-layout check is satisfied. Both are inert for the esbuild build.
+		"noEmit": true,
+		"rootDir": "..",
 		"strict": true,
 		"noUnusedLocals": true,
 		"noUnusedParameters": true,
