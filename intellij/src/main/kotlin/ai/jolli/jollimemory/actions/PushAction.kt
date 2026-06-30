@@ -2,6 +2,7 @@ package ai.jolli.jollimemory.actions
 
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliMemoryService
+import ai.jolli.jollimemory.util.ForcePushUtil
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.application.ApplicationManager
@@ -12,6 +13,8 @@ import com.intellij.openapi.ui.Messages
 
 /**
  * Push current branch to remote with upstream tracking.
+ * On non-fast-forward rejection, offers a force-push confirmation via
+ * [ForcePushUtil.gateForcePush] with divergence inspection.
  * Matches VS Code PushCommand.ts.
  */
 class PushAction : AnAction() {
@@ -39,17 +42,37 @@ class PushAction : AnAction() {
                 }
 
                 indicator.text = "Pushing $branch to origin..."
-                val result = git.exec("push", "-u", "origin", branch, timeoutSeconds = 60)
+                val result = git.execWithResult("push", "-u", "origin", branch, timeoutSeconds = 60)
 
-                ApplicationManager.getApplication().invokeLater {
-                    if (result != null) {
+                if (result.exitCode == 0) {
+                    ApplicationManager.getApplication().invokeLater {
                         Messages.showInfoMessage(project, "Pushed $branch to origin.", "Jolli Memory")
-                    } else {
-                        Messages.showErrorDialog(
-                            project,
-                            "Push may have failed for $branch. Check git output for details.",
-                            "Push Warning"
-                        )
+                        service.refreshStatus()
+                    }
+                    return
+                }
+
+                if (!ForcePushUtil.isNonFastForwardError(result.stderr)) {
+                    ApplicationManager.getApplication().invokeLater {
+                        Messages.showErrorDialog(project, "Push failed for $branch:\n\n${result.stderr}", "Push Failed")
+                        service.refreshStatus()
+                    }
+                    return
+                }
+
+                // NFF rejection — switch to EDT for divergence gate + dialog
+                ApplicationManager.getApplication().invokeAndWait {
+                    val outcome = ForcePushUtil.gateForcePush(
+                        project, git, branch,
+                        reason = "Remote branch has diverged. Force push will overwrite remote history.",
+                    )
+                    if (outcome == ForcePushUtil.ForcePushOutcome.CONFIRMED) {
+                        val forceResult = ForcePushUtil.forcePushBranch(git, branch)
+                        if (forceResult.exitCode == 0) {
+                            Messages.showInfoMessage(project, "Force-pushed $branch to origin.", "Jolli Memory")
+                        } else {
+                            Messages.showErrorDialog(project, "Force push failed:\n\n${forceResult.stderr}", "Push Failed")
+                        }
                     }
                     service.refreshStatus()
                 }
