@@ -589,15 +589,21 @@ export function buildSettingsScript(): string {
         applyAuthState(msg);
         updateAnthropicWarning();
         // The count arrives separately via 'missingSummaryCountLoaded' (computed
-        // off the settings-load critical path). Reset to the pending state here.
+        // off the settings-load critical path). Reset to the pending state here,
+        // and keep the button disabled until the count lands so it can't be
+        // clicked on an unknown count.
         if (missingSummariesCount) missingSummariesCount.textContent = 'Checking…';
+        if (generateSummariesBtn) generateSummariesBtn.disabled = true;
         captureInitialState();
         break;
       case 'missingSummaryCountLoaded': {
         const n = msg.missingSummaryCount;
+        const where = msg.repoName ? ' in ' + msg.repoName : ' in this repository';
         if (missingSummariesCount) {
           missingSummariesCount.textContent = typeof n === 'number'
-            ? (n === 0 ? 'All your commits have summaries.' : n + ' of your commits lack a summary.')
+            ? (n === 0
+                ? 'All your commits' + where + ' already have summaries.'
+                : n + ' of your commits' + where + ' still need summaries.')
             : '';
         }
         if (generateSummariesBtn) generateSummariesBtn.disabled = n === 0;

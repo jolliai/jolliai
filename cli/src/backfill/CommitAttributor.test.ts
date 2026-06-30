@@ -24,229 +24,257 @@ function entry(over: Partial<RawEntry> & { offsetMin: number }): RawEntry {
 	};
 }
 
-/** Build a target index where each file maps to one commit committed at `commitOffsetMin`. */
-function index(files: Record<string, { hash: string; commitOffsetMin: number }>): CommitTargetIndex {
+/**
+ * Build a target index from commit specs. `files` are repo-relative paths; the
+ * file→commit history is derived so attributionLowerBound works. `ts` is author
+ * time in minutes from T0.
+ */
+function index(commits: { hash: string; offsetMin: number; files: string[]; branch?: string }[]): CommitTargetIndex {
+	const commitMeta = new Map<string, { ts: number; subject: string; branch?: string }>();
+	const commitFiles = new Map<string, string[]>();
 	const fileToCommits = new Map<string, { ts: number; hash: string }[]>();
 	const baseToCommits = new Map<string, { ts: number; hash: string }[]>();
-	const commitMeta = new Map<string, { ts: number; subject: string }>();
-	for (const [rel, { hash, commitOffsetMin }] of Object.entries(files)) {
-		const ref = { ts: T0 + min(commitOffsetMin), hash };
-		fileToCommits.set(rel, [ref]);
-		baseToCommits.set(rel.split("/").pop() ?? rel, [ref]);
-		commitMeta.set(hash, { ts: ref.ts, subject: `commit ${hash}` });
+	const push = (m: Map<string, { ts: number; hash: string }[]>, k: string, v: { ts: number; hash: string }) => {
+		const l = m.get(k);
+		if (l) l.push(v);
+		else m.set(k, [v]);
+	};
+	for (const c of commits) {
+		const ts = T0 + min(c.offsetMin);
+		commitMeta.set(c.hash, { ts, subject: `c ${c.hash}`, ...(c.branch ? { branch: c.branch } : {}) });
+		commitFiles.set(c.hash, c.files);
+		for (const f of c.files) {
+			push(fileToCommits, f, { ts, hash: c.hash });
+			push(baseToCommits, f.split("/").pop() ?? f, { ts, hash: c.hash });
+		}
 	}
-	return { commitMeta, fileToCommits, baseToCommits };
+	for (const l of fileToCommits.values()) l.sort((a, b) => a.ts - b.ts);
+	for (const l of baseToCommits.values()) l.sort((a, b) => a.ts - b.ts);
+	return { commitMeta, commitFiles, fileToCommits, baseToCommits };
 }
 
-describe("attributeCommits — file-overlap (HIGH)", () => {
-	it("attributes an edited file to the commit that next touches it", () => {
-		const idx = index({ "foo.ts": { hash: "C1", commitOffsetMin: 10 } });
+describe("attributeCommits — file-overlap window model", () => {
+	it("attributes a session that edited the commit's files within (L, T]", () => {
+		const idx = index([{ hash: "C1", offsetMin: 10, files: ["foo.ts"] }]);
 		const entries = [entry({ offsetMin: 5, editedRel: ["foo.ts"], role: "assistant", content: "editing foo" })];
 		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx);
 		const a = res.attributed.get("C1");
 		expect(a?.confidence).toBe("high");
 		expect(a?.method).toBe("file-overlap");
-		expect(a?.branch).toBe("feat");
 		expect(a?.sessions).toHaveLength(1);
 	});
 
-	it("propagates to a discussion entry enclosed by two same-commit anchors", () => {
-		const idx = index({ "foo.ts": { hash: "C1", commitOffsetMin: 30 } });
+	it("② caps attribution at the commit time — later entries are excluded", () => {
+		const idx = index([{ hash: "C1", offsetMin: 10, files: ["foo.ts"] }]);
 		const entries = [
-			entry({ offsetMin: 1, editedRel: ["foo.ts"], role: "assistant", content: "edit 1" }),
-			entry({ offsetMin: 2, role: "human", content: "what about edge cases?" }), // no edit
-			entry({ offsetMin: 3, editedRel: ["foo.ts"], role: "assistant", content: "edit 2" }),
+			entry({ offsetMin: 5, editedRel: ["foo.ts"], role: "assistant", content: "before commit" }),
+			entry({ offsetMin: 20, role: "human", content: "after commit — must be excluded" }),
 		];
 		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx);
 		const a = res.attributed.get("C1");
-		// All three conversational turns belong to C1 (the middle one via propagation).
-		expect(a?.transcriptEntries).toBe(3);
-		expect(a?.conversationTurns).toBe(1);
+		expect(a?.transcriptEntries).toBe(1);
+		expect(a?.sessions[0].entries[0].content).toBe("before commit");
 	});
 
-	it("drops a contested entry between anchors of different commits", () => {
-		const idx = index({
-			"foo.ts": { hash: "C1", commitOffsetMin: 30 },
-			"bar.ts": { hash: "C2", commitOffsetMin: 31 },
-		});
+	it("① floors at the previous commit of the files — sibling commits don't bleed", () => {
+		// foo.ts committed by C0 @5m and C1 @30m. C1's window = (5m, 30m].
+		const idx = index([
+			{ hash: "C0", offsetMin: 5, files: ["foo.ts"] },
+			{ hash: "C1", offsetMin: 30, files: ["foo.ts"] },
+		]);
 		const entries = [
-			entry({ offsetMin: 1, editedRel: ["foo.ts"], role: "assistant", content: "edit foo" }),
-			entry({ offsetMin: 2, role: "human", content: "contested middle" }),
-			entry({ offsetMin: 3, editedRel: ["bar.ts"], role: "assistant", content: "edit bar" }),
+			entry({ offsetMin: 3, editedRel: ["foo.ts"], role: "assistant", content: "C0 work (before L)" }),
+			entry({ offsetMin: 20, editedRel: ["foo.ts"], role: "assistant", content: "C1 work (in window)" }),
 		];
-		const res = attributeCommits(["C1", "C2"], new Map([["S1", entries]]), idx);
-		// The middle turn is contested → excluded from both.
-		expect(res.attributed.get("C1")?.transcriptEntries).toBe(1);
-		expect(res.attributed.get("C2")?.transcriptEntries).toBe(1);
+		const res = attributeCommits(["C0", "C1"], new Map([["S1", entries]]), idx);
+		// C1 only gets the 20m entry (3m belongs to C0's window, before C1's L=5m).
+		const c1 = res.attributed.get("C1");
+		expect(c1?.transcriptEntries).toBe(1);
+		expect(c1?.sessions[0].entries[0].content).toBe("C1 work (in window)");
 	});
 
-	it("propagates one-sided only within the reach window", () => {
-		const idx = index({ "foo.ts": { hash: "C1", commitOffsetMin: 120 } });
-		const entries = [
-			entry({ offsetMin: 0, editedRel: ["foo.ts"], role: "assistant", content: "anchor edit" }),
-			entry({ offsetMin: 10, role: "human", content: "near (10m)" }), // within 30m reach
-			entry({ offsetMin: 90, role: "human", content: "far (90m, but same segment? no)" }),
-		];
-		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx);
-		// The 90m entry is in a separate segment (gap > 2h? no, 80m < 2h) but beyond
-		// one-sided reach (30m) → excluded. Near entry included with the anchor.
-		expect(res.attributed.get("C1")?.transcriptEntries).toBe(2);
+	it("recovers a commit even when its files were first committed by a sibling (the recall fix)", () => {
+		// bar.ts is committed first by SIB @8m, then by C @20m. The work session edits
+		// bar.ts at 12m — in C's window (8m, 20m]. Old first-committer logic gave this
+		// to SIB; the window model correctly attributes it to C.
+		const idx = index([
+			{ hash: "SIB", offsetMin: 8, files: ["bar.ts"] },
+			{ hash: "C", offsetMin: 20, files: ["bar.ts"] },
+		]);
+		const entries = [entry({ offsetMin: 12, editedRel: ["bar.ts"], role: "assistant", content: "work for C" })];
+		const res = attributeCommits(["C"], new Map([["S1", entries]]), idx);
+		expect(res.attributed.get("C")?.method).toBe("file-overlap");
 	});
 
-	it("does not attribute a commit outside the target set", () => {
-		const idx = index({ "foo.ts": { hash: "C1", commitOffsetMin: 10 } });
-		const entries = [entry({ offsetMin: 5, editedRel: ["foo.ts"], role: "assistant", content: "x" })];
-		const res = attributeCommits(["OTHER"], new Map([["S1", entries]]), idx);
-		expect(res.attributed.size).toBe(0);
-		expect(res.skipped).toContain("OTHER");
-	});
-
-	it("skips a target whose attributed entries carry no conversational text", () => {
-		const idx = index({ "foo.ts": { hash: "C1", commitOffsetMin: 10 } });
-		// edit entry with no role/content (pure tool call)
-		const entries = [entry({ offsetMin: 5, editedRel: ["foo.ts"] })];
+	it("skips a commit no session touched (→ engine diff-only)", () => {
+		const idx = index([{ hash: "C1", offsetMin: 10, files: ["foo.ts"] }]);
+		const entries = [entry({ offsetMin: 5, editedRel: ["other.ts"], role: "assistant", content: "unrelated" })];
 		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx);
 		expect(res.attributed.has("C1")).toBe(false);
 		expect(res.skipped).toContain("C1");
 	});
-});
 
-describe("attributeCommits — segmentation & branch", () => {
-	it("splits segments on branch change so cross-branch anchors don't bleed", () => {
-		const idx = index({
-			"foo.ts": { hash: "C1", commitOffsetMin: 30 },
-			"bar.ts": { hash: "C2", commitOffsetMin: 31 },
-		});
-		const entries = [
-			entry({ offsetMin: 1, gitBranch: "a", editedRel: ["foo.ts"], role: "assistant", content: "on a" }),
-			entry({ offsetMin: 2, gitBranch: "b", role: "human", content: "on b, no anchor" }),
-		];
-		const res = attributeCommits(["C1", "C2"], new Map([["S1", entries]]), idx);
-		// The 'b' entry is in its own anchor-less segment → not attributed to C1.
-		expect(res.attributed.get("C1")?.transcriptEntries).toBe(1);
+	it("skips a target absent from the index (no files)", () => {
+		const idx = index([{ hash: "C1", offsetMin: 10, files: ["foo.ts"] }]);
+		const res = attributeCommits(["UNKNOWN"], new Map(), idx);
+		expect(res.skipped).toContain("UNKNOWN");
 	});
 
-	it("splits a segment on a >2h idle gap so a distant anchor doesn't bleed across", () => {
-		const idx = index({
-			"foo.ts": { hash: "C1", commitOffsetMin: 5 },
-			"bar.ts": { hash: "C2", commitOffsetMin: 605 },
-		});
+	it("matches by basename when the edit's relative path differs", () => {
+		const idx = index([{ hash: "C1", offsetMin: 10, files: ["cli/src/foo.ts"] }]);
+		// edit recorded under a different relative path but same basename
 		const entries = [
-			entry({ offsetMin: 1, editedRel: ["foo.ts"], role: "assistant", content: "morning work" }),
-			// 10h later — beyond the 2h gap → new segment.
-			entry({ offsetMin: 600, editedRel: ["bar.ts"], role: "assistant", content: "evening work" }),
+			entry({
+				offsetMin: 5,
+				editedRel: ["other/foo.ts"],
+				editedBase: ["foo.ts"],
+				role: "assistant",
+				content: "x",
+			}),
 		];
-		const res = attributeCommits(["C1", "C2"], new Map([["S1", entries]]), idx);
-		expect(res.attributed.get("C1")?.transcriptEntries).toBe(1);
-		expect(res.attributed.get("C2")?.transcriptEntries).toBe(1);
+		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx);
+		expect(res.attributed.get("C1")?.method).toBe("file-overlap");
 	});
 
-	it("tolerates entries without a timestamp", () => {
-		const idx = index({ "foo.ts": { hash: "C1", commitOffsetMin: 10 } });
-		const noTs = {
-			...entry({ offsetMin: 5, editedRel: ["foo.ts"], role: "assistant", content: "x" }),
-			ts: undefined,
-			tsMs: Number.NaN,
-		};
-		const res = attributeCommits(["C1"], new Map([["S1", [noTs]]]), idx);
-		// No timestamp → no anchor (anchorForEntry bails on NaN) → skipped.
+	it("excludes pure tool-call entries (no text) from the built session", () => {
+		const idx = index([{ hash: "C1", offsetMin: 10, files: ["foo.ts"] }]);
+		const entries = [
+			entry({ offsetMin: 4, editedRel: ["foo.ts"] }), // pure tool call, no role/content
+			entry({ offsetMin: 5, editedRel: ["foo.ts"], role: "assistant", content: "kept turn" }),
+		];
+		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx);
+		const a = res.attributed.get("C1");
+		expect(a?.transcriptEntries).toBe(1);
+		expect(a?.sessions[0].entries[0].content).toBe("kept turn");
+	});
+
+	it("splits the in-window slice on a >2h idle gap (keeps the touching segment)", () => {
+		const idx = index([{ hash: "C1", offsetMin: 200, files: ["foo.ts"] }]);
+		const entries = [
+			entry({ offsetMin: 10, role: "human", content: "early unrelated chat" }),
+			// >2h gap → new segment; this later segment edits foo.ts
+			entry({ offsetMin: 190, editedRel: ["foo.ts"], role: "assistant", content: "the actual work" }),
+		];
+		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx);
+		const a = res.attributed.get("C1");
+		// Only the touching segment (190m) is collected, not the early-chat segment.
+		expect(a?.transcriptEntries).toBe(1);
+		expect(a?.sessions[0].entries[0].content).toBe("the actual work");
+	});
+
+	it("skips a commit whose only in-window touch is a non-conversational tool call", () => {
+		const idx = index([{ hash: "C1", offsetMin: 10, files: ["foo.ts"] }]);
+		const entries = [entry({ offsetMin: 5, editedRel: ["foo.ts"] })]; // edit only, no role/content
+		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx);
+		expect(res.attributed.has("C1")).toBe(false);
 		expect(res.skipped).toContain("C1");
 	});
 
 	it("uses the modal branch of attributed entries", () => {
-		const idx = index({ "foo.ts": { hash: "C1", commitOffsetMin: 30 } });
+		const idx = index([{ hash: "C1", offsetMin: 10, files: ["foo.ts"] }]);
 		const entries = [
-			entry({ offsetMin: 1, gitBranch: "feat-x", editedRel: ["foo.ts"], role: "assistant", content: "e1" }),
-			entry({ offsetMin: 2, gitBranch: "feat-x", editedRel: ["foo.ts"], role: "assistant", content: "e2" }),
+			entry({ offsetMin: 5, gitBranch: "feat-x", editedRel: ["foo.ts"], role: "assistant", content: "e1" }),
+			entry({ offsetMin: 6, gitBranch: "feat-x", role: "human", content: "q" }),
 		];
 		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx);
 		expect(res.attributed.get("C1")?.branch).toBe("feat-x");
 	});
 
-	it("returns an empty branch when no attributed entry carries a gitBranch", () => {
-		const idx = index({ "foo.ts": { hash: "C1", commitOffsetMin: 30 } });
-		const e = entry({ offsetMin: 1, editedRel: ["foo.ts"], role: "assistant", content: "e1" });
-		const res = attributeCommits(["C1"], new Map([["S1", [{ ...e, gitBranch: undefined }]]]), idx);
-		expect(res.attributed.get("C1")?.branch).toBe("");
+	it("splits a session on a branch change so each branch segment is collected", () => {
+		// Adjacent entries on different (both-known) branches break the segment;
+		// both segments edit foo.ts in-window, so both slices are collected.
+		const idx = index([{ hash: "C1", offsetMin: 30, files: ["foo.ts"] }]);
+		const entries = [
+			entry({ offsetMin: 5, gitBranch: "a", editedRel: ["foo.ts"], role: "assistant", content: "on a" }),
+			entry({ offsetMin: 6, gitBranch: "b", editedRel: ["foo.ts"], role: "assistant", content: "on b" }),
+		];
+		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx);
+		expect(res.attributed.get("C1")?.transcriptEntries).toBe(2);
 	});
 
-	it("excludes pure tool-call entries (no text) from the built session while keeping the commit", () => {
-		const idx = index({ "foo.ts": { hash: "C1", commitOffsetMin: 30 } });
+	it("modalBranch ignores blank-branch entries and keeps the first on a tie", () => {
+		const idx = index([{ hash: "C1", offsetMin: 30, files: ["foo.ts"] }]);
 		const entries = [
-			entry({ offsetMin: 1, editedRel: ["foo.ts"] }), // pure tool call, no role/content
-			entry({ offsetMin: 2, editedRel: ["foo.ts"], role: "assistant", content: "kept turn" }),
+			entry({ offsetMin: 5, gitBranch: "x", editedRel: ["foo.ts"], role: "assistant", content: "e1" }),
+			entry({ offsetMin: 6, gitBranch: "", role: "human", content: "blank branch" }),
+			entry({ offsetMin: 7, gitBranch: "y", role: "human", content: "y1" }),
+		];
+		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx);
+		// x and y each occur once; the first to reach the max (x) wins; "" is skipped.
+		expect(res.attributed.get("C1")?.branch).toBe("x");
+	});
+
+	it("drops an entry that has text content but no role", () => {
+		const idx = index([{ hash: "C1", offsetMin: 10, files: ["foo.ts"] }]);
+		const entries = [
+			entry({ offsetMin: 5, editedRel: ["foo.ts"], content: "content but no role" }),
+			entry({ offsetMin: 6, editedRel: ["foo.ts"], role: "assistant", content: "kept" }),
 		];
 		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx);
 		const a = res.attributed.get("C1");
-		// Both edits anchor C1, but only the one with text becomes a session entry.
 		expect(a?.transcriptEntries).toBe(1);
-		expect(a?.sessions[0].entries[0].content).toBe("kept turn");
+		expect(a?.sessions[0].entries[0].content).toBe("kept");
 	});
 });
 
-describe("attributeCommits — medium (time-window)", () => {
-	it("attributes an anchor-less segment to the single commit right after it", () => {
-		const idx = index({ "foo.ts": { hash: "C1", commitOffsetMin: 1000 } }); // unrelated file/commit
-		// add a target commit C9 right after the discussion segment
-		(idx.commitMeta as Map<string, { ts: number; subject: string }>).set("C9", { ts: T0 + min(20), subject: "C9" });
+describe("attributeCommits — time-window MEDIUM (③, opt-in)", () => {
+	it("attributes an in-window segment ending just before the commit when no file edit matches", () => {
+		const idx = index([{ hash: "C1", offsetMin: 30, files: ["foo.ts"], branch: "feat" }]);
+		// session discusses, edits NOTHING in foo.ts, ends ~5m before commit
 		const entries = [
-			entry({ offsetMin: 5, role: "human", content: "let's plan the refactor" }),
-			entry({ offsetMin: 8, role: "assistant", content: "here is the plan" }),
+			entry({ offsetMin: 24, gitBranch: "feat", role: "human", content: "let's plan" }),
+			entry({ offsetMin: 25, gitBranch: "feat", role: "assistant", content: "ok" }),
 		];
-		const res = attributeCommits(["C9"], new Map([["S1", entries]]), idx, { includeMedium: true });
-		const a = res.attributed.get("C9");
+		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx, { includeMedium: true });
+		const a = res.attributed.get("C1");
 		expect(a?.confidence).toBe("medium");
 		expect(a?.method).toBe("time-window");
-		expect(a?.transcriptEntries).toBe(2);
 	});
 
-	it("does not emit medium when includeMedium is off", () => {
-		const idx = index({});
-		(idx.commitMeta as Map<string, { ts: number; subject: string }>).set("C9", { ts: T0 + min(20), subject: "C9" });
-		const entries = [entry({ offsetMin: 5, role: "human", content: "plan" })];
-		const res = attributeCommits(["C9"], new Map([["S1", entries]]), idx);
-		expect(res.attributed.has("C9")).toBe(false);
+	it("does not emit MEDIUM by default (includeMedium off)", () => {
+		const idx = index([{ hash: "C1", offsetMin: 30, files: ["foo.ts"] }]);
+		const entries = [entry({ offsetMin: 25, role: "human", content: "plan" })];
+		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx);
+		expect(res.attributed.has("C1")).toBe(false);
 	});
 
-	it("rejects a medium candidate on a different branch than the segment", () => {
-		const idx = index({});
-		// Candidate C9 is committed in-window but on branch "other"; segment is "feat".
-		(idx.commitMeta as Map<string, { ts: number; subject: string; branch?: string }>).set("C9", {
-			ts: T0 + min(20),
-			subject: "C9",
-			branch: "other",
-		});
-		const entries = [entry({ offsetMin: 5, gitBranch: "feat", role: "human", content: "plan" })];
-		const res = attributeCommits(["C9"], new Map([["S1", entries]]), idx, { includeMedium: true });
-		expect(res.attributed.has("C9")).toBe(false); // branch gate rejects
+	it("MEDIUM branch gate rejects a segment on a different known branch", () => {
+		const idx = index([{ hash: "C1", offsetMin: 30, files: ["foo.ts"], branch: "main" }]);
+		const entries = [entry({ offsetMin: 25, gitBranch: "feat", role: "human", content: "on feat, not main" })];
+		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx, { includeMedium: true });
+		expect(res.attributed.has("C1")).toBe(false);
 	});
 
-	it("allows a medium candidate whose branch matches the segment", () => {
-		const idx = index({});
-		(idx.commitMeta as Map<string, { ts: number; subject: string; branch?: string }>).set("C9", {
-			ts: T0 + min(20),
-			subject: "C9",
-			branch: "feat",
-		});
-		const entries = [entry({ offsetMin: 5, gitBranch: "feat", role: "human", content: "plan" })];
-		const res = attributeCommits(["C9"], new Map([["S1", entries]]), idx, { includeMedium: true });
-		expect(res.attributed.get("C9")?.confidence).toBe("medium");
+	it("MEDIUM ignores a segment that ended long before the commit", () => {
+		const idx = index([{ hash: "C1", offsetMin: 600, files: ["foo.ts"], branch: "feat" }]);
+		// segment ends at 25m, commit at 600m (~9.6h later, > 2h gap) → not "led into it"
+		const entries = [entry({ offsetMin: 25, gitBranch: "feat", role: "human", content: "stale" })];
+		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx, { includeMedium: true });
+		expect(res.attributed.has("C1")).toBe(false);
 	});
 
-	it("ignores an anchor-less segment whose entries have no timestamps", () => {
-		const idx = index({});
-		(idx.commitMeta as Map<string, { ts: number; subject: string }>).set("C9", { ts: T0 + min(20), subject: "C9" });
-		const noTs = { ...entry({ offsetMin: 5, role: "human", content: "plan" }), ts: undefined, tsMs: Number.NaN };
-		const res = attributeCommits(["C9"], new Map([["S1", [noTs]]]), idx, { includeMedium: true });
-		expect(res.attributed.has("C9")).toBe(false); // no usable timestamps → no medium window
+	it("MEDIUM collects the in-window segment and skips a later out-of-window one", () => {
+		const idx = index([{ hash: "C1", offsetMin: 100, files: ["foo.ts"], branch: "feat" }]);
+		const entries = [
+			entry({ offsetMin: 95, gitBranch: "feat", role: "human", content: "in window" }),
+			// >2h gap → new segment; offset 300 is AFTER the commit (100) → out of window → empty slice.
+			entry({ offsetMin: 300, gitBranch: "feat", role: "human", content: "after commit" }),
+		];
+		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx, { includeMedium: true });
+		const a = res.attributed.get("C1");
+		expect(a?.confidence).toBe("medium");
+		expect(a?.transcriptEntries).toBe(1);
+		expect(a?.sessions[0].entries[0].content).toBe("in window");
 	});
 
-	it("does not emit medium when two commits compete for the same segment", () => {
-		const idx = index({});
-		(idx.commitMeta as Map<string, { ts: number; subject: string }>).set("C9", { ts: T0 + min(20), subject: "C9" });
-		(idx.commitMeta as Map<string, { ts: number; subject: string }>).set("C8", { ts: T0 + min(25), subject: "C8" });
-		const entries = [entry({ offsetMin: 5, role: "human", content: "plan" })];
-		const res = attributeCommits(["C9", "C8"], new Map([["S1", entries]]), idx, { includeMedium: true });
-		expect(res.attributed.size).toBe(0);
+	it("MEDIUM keeps a segment whose two entries share a timestamp", () => {
+		// Equal timestamps exercise the `tsMs > segEnd` false branch (segEnd not bumped).
+		const idx = index([{ hash: "C1", offsetMin: 30, files: ["foo.ts"], branch: "feat" }]);
+		const entries = [
+			entry({ offsetMin: 25, lineNo: 1, gitBranch: "feat", role: "human", content: "a" }),
+			entry({ offsetMin: 25, lineNo: 2, gitBranch: "feat", role: "assistant", content: "b" }),
+		];
+		const res = attributeCommits(["C1"], new Map([["S1", entries]]), idx, { includeMedium: true });
+		expect(res.attributed.get("C1")?.transcriptEntries).toBe(2);
 	});
 });

@@ -2,30 +2,37 @@
  * CommitAttributor — maps on-disk Claude transcript slices to historical commits.
  *
  * Isolated from the live cursor/queue flow. Operates on the offline indexes built
- * by {@link RawTranscriptScanner} and {@link CommitTargetIndex}. The algorithm and
- * its confidence tiers were validated against real local data (see the plan):
- * locality holds — a commit's edits form a single contiguous run in a session, so
- * attribution propagates safely from a file-overlap anchor to its neighbours.
+ * by {@link RawTranscriptScanner} and {@link CommitTargetIndex}.
  *
- * Per target commit C the result is one of:
- *   - HIGH (file-overlap): at least one edited file in the attributed run matches
- *     C's diff (C is the first commit to touch that file after the edit). The run
- *     = the anchor edits + the conversational turns the propagation reaches.
- *   - MEDIUM (time-window, opt-in): no file overlap, but a single anchor-less work
- *     segment ends immediately before C with no competing commit in the gap.
- *   - skipped: contested / no signal — nothing is generated (宁缺毋滥).
+ * Model (per target commit C, see the recall study doc for why this replaced the
+ * earlier "first-committer" anchoring):
+ *   - Window = (L, T]  where T = C's commit time (② upper bound: a commit's
+ *     conversation can only precede the commit) and L = the previous time any of
+ *     C's files was committed (① commit-boundary lower bound: consecutive commits
+ *     touching overlapping files don't bleed into each other). L is capped to a
+ *     max lookback so a long-dormant file doesn't open a huge window.
+ *   - HIGH (file-overlap): a session segment that *edited one of C's files inside
+ *     the window* contributes its in-window slice — independent of which commit
+ *     "first committed" the file. This is what recovers the conversation even for
+ *     commits that are not the first committer of their files.
+ *   - MEDIUM (time-window, opt-in via includeMedium / ③): when no session edited
+ *     C's files in the window, fall back to in-window segments that end right
+ *     before C on a branch-compatible session.
+ *   - none → the engine falls back to a diff-only summary.
  */
 
+import { normalizePathForCompare } from "../core/PathUtils.js";
 import type { SessionTranscript } from "../core/TranscriptReader.js";
 import { createLogger } from "../Logger.js";
 import type { TranscriptEntry } from "../Types.js";
-import { anchorCommitForEdit, type CommitTargetIndex } from "./CommitTargetIndex.js";
+import { attributionLowerBound, type CommitTargetIndex } from "./CommitTargetIndex.js";
 import type { RawEntry } from "./RawTranscriptScanner.js";
 
 const log = createLogger("CommitAttributor");
 
 const SEGMENT_GAP_MS = 2 * 60 * 60 * 1000; // 2h idle splits a work segment
-const ONE_SIDED_MS = 30 * 60 * 1000; // one-sided propagation reach
+/** Max window lookback when a commit's files have no earlier commit (e.g. new files). */
+const WINDOW_CAP_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface AttributedCommit {
 	readonly commitHash: string;
@@ -40,7 +47,7 @@ export interface AttributedCommit {
 export interface AttributionResult {
 	/** Target commits that earned a confident attribution. */
 	readonly attributed: ReadonlyMap<string, AttributedCommit>;
-	/** Target commits with no confident attribution (skipped under 宁缺毋滥). */
+	/** Target commits with no confident attribution (engine → diff-only). */
 	readonly skipped: ReadonlyArray<string>;
 }
 
@@ -49,7 +56,12 @@ interface Segment {
 	readonly end: number; // exclusive
 }
 
-/** Splits a session's time-ordered entries into work segments. */
+interface SessionSegments {
+	readonly entries: ReadonlyArray<RawEntry>;
+	readonly segs: ReadonlyArray<Segment>;
+}
+
+/** Splits a session's time-ordered entries into work segments (branch change / >2h gap). */
 function segmentSession(entries: ReadonlyArray<RawEntry>): Segment[] {
 	const segs: Segment[] = [];
 	let start = 0;
@@ -60,8 +72,7 @@ function segmentSession(entries: ReadonlyArray<RawEntry>): Segment[] {
 			const cur = entries[i];
 			// Split on a branch change only when BOTH sides have a known branch and
 			// they differ. Early Claude transcripts omit `gitBranch` on some lines;
-			// treating undefined as a new branch would shred a continuous work run
-			// into spurious segments. Undefined inherits the surrounding branch.
+			// treating undefined as a new branch would shred a continuous work run.
 			if (cur.gitBranch && prev.gitBranch && cur.gitBranch !== prev.gitBranch) brk = true;
 			else if (!Number.isNaN(cur.tsMs) && !Number.isNaN(prev.tsMs) && cur.tsMs - prev.tsMs > SEGMENT_GAP_MS)
 				brk = true;
@@ -74,133 +85,34 @@ function segmentSession(entries: ReadonlyArray<RawEntry>): Segment[] {
 	return segs;
 }
 
-/** Modal commit hash among an entry's edited files (first file wins on ties). */
-function anchorForEntry(index: CommitTargetIndex, e: RawEntry): string | null {
-	if (e.editedRel.length === 0 || Number.isNaN(e.tsMs)) return null;
-	const counts = new Map<string, number>();
-	let bestHash: string | null = null;
-	let bestCount = 0;
-	for (let k = 0; k < e.editedRel.length; k++) {
-		const hash = anchorCommitForEdit(index, e.editedRel[k], e.editedBase[k] ?? "", e.tsMs);
-		if (!hash) continue;
-		const c = (counts.get(hash) ?? 0) + 1;
-		counts.set(hash, c);
-		if (c > bestCount) {
-			bestCount = c;
-			bestHash = hash;
-		}
-	}
-	return bestHash;
+/**
+ * True when entry `e` edited one of the commit's files (by repo-relative path or
+ * basename). Both sides are folded through {@link normalizePathForCompare} so a
+ * transcript path whose case differs from git's (common on case-insensitive
+ * Windows/macOS filesystems, where `Src/Foo.ts` and `src/foo.ts` are the same
+ * file) still matches. On case-sensitive Linux the fold is a no-op, so genuinely
+ * distinct `Foo.ts`/`foo.ts` are NOT merged. `relSet`/`baseSet` are pre-folded.
+ */
+function touchesFiles(e: RawEntry, relSet: ReadonlySet<string>, baseSet: ReadonlySet<string>): boolean {
+	for (const r of e.editedRel) if (relSet.has(normalizePathForCompare(r))) return true;
+	for (const b of e.editedBase) if (baseSet.has(normalizePathForCompare(b))) return true;
+	return false;
 }
 
-/** Appends `e` to the per-commit collection map. */
+function inWindow(e: RawEntry, lo: number, hi: number): boolean {
+	return !Number.isNaN(e.tsMs) && e.tsMs > lo && e.tsMs <= hi;
+}
+
+function basename(p: string): string {
+	const i = p.lastIndexOf("/");
+	return i >= 0 ? p.slice(i + 1) : p;
+}
+
+/** Appends `e` to the per-commit collection map (dedup by lineNo+session within a commit). */
 function collect(map: Map<string, RawEntry[]>, commit: string, e: RawEntry): void {
 	const list = map.get(commit);
 	if (list) list.push(e);
 	else map.set(commit, [e]);
-}
-
-/**
- * File-overlap (HIGH) attribution within one session: anchor edits, then
- * propagate to no-signal neighbours bounded by the segment and by competing
- * anchors. Only commits in `targetSet` are collected. Anchors pointing at
- * non-target commits still act as propagation boundaries.
- */
-function attributeSessionHigh(
-	entries: ReadonlyArray<RawEntry>,
-	index: CommitTargetIndex,
-	targetSet: ReadonlySet<string>,
-	into: Map<string, RawEntry[]>,
-	anchorlessSegments: { entries: RawEntry[] }[],
-): void {
-	const anchors = entries.map((e) => anchorForEntry(index, e));
-	for (const seg of segmentSession(entries)) {
-		const anchored: { idx: number; commit: string }[] = [];
-		for (let i = seg.start; i < seg.end; i++) {
-			const a = anchors[i];
-			if (a) anchored.push({ idx: i, commit: a });
-		}
-		if (anchored.length === 0) {
-			anchorlessSegments.push({ entries: entries.slice(seg.start, seg.end) });
-			continue;
-		}
-		for (let i = seg.start; i < seg.end; i++) {
-			let commit: string | null = anchors[i];
-			if (!commit) {
-				const before = lastBefore(anchored, i);
-				const after = firstAfter(anchored, i);
-				if (before && after && before.commit === after.commit) {
-					commit = before.commit; // enclosed by same commit → inherit
-				} else if (before && after) {
-					commit = null; // contested boundary → skip
-				} else {
-					const one = before ?? after;
-					if (one && withinReach(entries[i], entries[one.idx])) commit = one.commit;
-				}
-			}
-			if (commit && targetSet.has(commit)) collect(into, commit, entries[i]);
-		}
-	}
-}
-
-function lastBefore(anchored: ReadonlyArray<{ idx: number; commit: string }>, i: number) {
-	let res: { idx: number; commit: string } | undefined;
-	for (const a of anchored) {
-		if (a.idx < i) res = a;
-		else break;
-	}
-	return res;
-}
-
-function firstAfter(anchored: ReadonlyArray<{ idx: number; commit: string }>, i: number) {
-	for (const a of anchored) if (a.idx > i) return a;
-	return undefined;
-}
-
-function withinReach(a: RawEntry, b: RawEntry): boolean {
-	if (Number.isNaN(a.tsMs) || Number.isNaN(b.tsMs)) return false;
-	return Math.abs(a.tsMs - b.tsMs) <= ONE_SIDED_MS;
-}
-
-/**
- * Time-window (MEDIUM) attribution: for an anchor-less work segment, attribute it
- * to a target commit iff exactly one *uncovered* target was committed within
- * `SEGMENT_GAP_MS` after the segment ended (the work led straight into it).
- *
- * Branch gate: a candidate on a *different* branch than the segment is dropped —
- * a branch-A discussion must not be attributed to a branch-B commit that merely
- * happened to land next. The gate only fires when BOTH branches are known
- * (commit branch from `%S`, segment branch from its entries' modal `gitBranch`);
- * when either is unknown it does not constrain (mirrors the undefined-inherit
- * rule in segmentation).
- */
-function attributeMedium(
-	anchorlessSegments: ReadonlyArray<{ entries: RawEntry[] }>,
-	index: CommitTargetIndex,
-	targets: ReadonlyArray<string>,
-	covered: ReadonlySet<string>,
-	into: Map<string, RawEntry[]>,
-): void {
-	const uncovered = targets.filter((t) => !covered.has(t) && index.commitMeta.has(t));
-	for (const seg of anchorlessSegments) {
-		const times = seg.entries.map((e) => e.tsMs).filter((t) => !Number.isNaN(t));
-		if (times.length === 0) continue;
-		// reduce (not Math.max(...spread)) — a session segment can hold tens of
-		// thousands of entries, and spreading that many args overflows the call stack.
-		const segEnd = times.reduce((m, t) => (t > m ? t : m), Number.NEGATIVE_INFINITY);
-		const segBranch = modalBranch(seg.entries);
-		const cands = uncovered.filter((t) => {
-			const meta = index.commitMeta.get(t);
-			const ts = meta?.ts ?? Number.NaN;
-			if (ts < segEnd || ts - segEnd > SEGMENT_GAP_MS) return false;
-			// Branch gate: reject only when both branches are known and differ.
-			if (meta?.branch && segBranch && meta.branch !== segBranch) return false;
-			return true;
-		});
-		if (cands.length === 1) {
-			for (const e of seg.entries) collect(into, cands[0], e);
-		}
-	}
 }
 
 /** Picks the most frequent gitBranch among entries (fallback: ""). */
@@ -231,6 +143,7 @@ function buildSessions(entries: ReadonlyArray<RawEntry>): SessionTranscript[] {
 	}
 	const sessions: SessionTranscript[] = [];
 	for (const [sessionId, list] of bySid) {
+		// Disjoint segments mean each entry is collected at most once; just order it.
 		list.sort((a, b) => a.lineNo - b.lineNo);
 		const tEntries: TranscriptEntry[] = list.map((e) => ({
 			role: e.role as "human" | "assistant",
@@ -243,12 +156,74 @@ function buildSessions(entries: ReadonlyArray<RawEntry>): SessionTranscript[] {
 }
 
 /**
+ * HIGH (file-overlap) collection for commit C over one pre-segmented session:
+ * any segment that edited one of C's files inside the window contributes its
+ * in-window slice.
+ */
+function collectFileOverlap(
+	session: SessionSegments,
+	relSet: ReadonlySet<string>,
+	baseSet: ReadonlySet<string>,
+	lo: number,
+	hi: number,
+	commit: string,
+	into: Map<string, RawEntry[]>,
+): boolean {
+	const { entries, segs } = session;
+	let got = false;
+	for (const seg of segs) {
+		let touched = false;
+		for (let i = seg.start; i < seg.end; i++) {
+			if (inWindow(entries[i], lo, hi) && touchesFiles(entries[i], relSet, baseSet)) {
+				touched = true;
+				break;
+			}
+		}
+		if (!touched) continue;
+		got = true;
+		for (let i = seg.start; i < seg.end; i++) {
+			if (inWindow(entries[i], lo, hi)) collect(into, commit, entries[i]);
+		}
+	}
+	return got;
+}
+
+/**
+ * MEDIUM (time-window, ③) collection for commit C: in-window segments that end
+ * within SEGMENT_GAP before C and are branch-compatible, with no file overlap.
+ */
+function collectTimeWindow(
+	session: SessionSegments,
+	lo: number,
+	hi: number,
+	commitBranch: string | undefined,
+	commit: string,
+	into: Map<string, RawEntry[]>,
+): void {
+	const { entries, segs } = session;
+	for (const seg of segs) {
+		const slice: RawEntry[] = [];
+		let segEnd = Number.NEGATIVE_INFINITY;
+		for (let i = seg.start; i < seg.end; i++) {
+			if (!inWindow(entries[i], lo, hi)) continue;
+			slice.push(entries[i]);
+			if (entries[i].tsMs > segEnd) segEnd = entries[i].tsMs;
+		}
+		if (slice.length === 0) continue;
+		if (hi - segEnd > SEGMENT_GAP_MS) continue; // work didn't lead straight into the commit
+		const sb = modalBranch(slice);
+		if (commitBranch && sb && commitBranch !== sb) continue; // branch gate
+		for (const e of slice) collect(into, commit, e);
+	}
+}
+
+/**
  * Attributes transcript slices to the given target commits.
  *
  * @param targets   commit hashes (lacking summaries) to attribute
  * @param bySession scanner output (sessionId → time-ordered RawEntry[])
  * @param index     real-commit target index
- * @param opts.includeMedium  also emit time-window (MEDIUM) attributions
+ * @param opts.includeMedium  also emit time-window (MEDIUM) attributions (③)
  */
 export function attributeCommits(
 	targets: ReadonlyArray<string>,
@@ -256,49 +231,60 @@ export function attributeCommits(
 	index: CommitTargetIndex,
 	opts: { includeMedium?: boolean } = {},
 ): AttributionResult {
-	const targetSet = new Set(targets);
-	const highEntries = new Map<string, RawEntry[]>();
-	const anchorlessSegments: { entries: RawEntry[] }[] = [];
-
-	for (const entries of bySession.values()) {
-		attributeSessionHigh(entries, index, targetSet, highEntries, anchorlessSegments);
-	}
-
-	const medEntries = new Map<string, RawEntry[]>();
-	if (opts.includeMedium) {
-		attributeMedium(anchorlessSegments, index, targets, new Set(highEntries.keys()), medEntries);
-	}
+	// Pre-segment every session once (reused across all targets).
+	const sessions: SessionSegments[] = [];
+	for (const entries of bySession.values()) sessions.push({ entries, segs: segmentSession(entries) });
 
 	const attributed = new Map<string, AttributedCommit>();
 	const skipped: string[] = [];
+
 	for (const hash of targets) {
-		const high = highEntries.get(hash);
-		const med = high ? undefined : medEntries.get(hash);
-		const entries = high ?? med;
-		const confidence: "high" | "medium" = high ? "high" : "medium";
-		const method: "file-overlap" | "time-window" = high ? "file-overlap" : "time-window";
+		const meta = index.commitMeta.get(hash);
+		const files = index.commitFiles.get(hash);
+		if (!meta || !files || files.length === 0) {
+			skipped.push(hash); // not a real code commit / no files → diff-only by engine
+			continue;
+		}
+		const hi = meta.ts; // ② commit-time upper bound
+		const lo = attributionLowerBound(index, hash, hi, WINDOW_CAP_MS); // ① commit-boundary lower bound
+		const relSet = new Set(files.map(normalizePathForCompare));
+		const baseSet = new Set(files.map((f) => normalizePathForCompare(basename(f))));
+
+		const high = new Map<string, RawEntry[]>();
+		let gotFileOverlap = false;
+		for (const s of sessions) {
+			if (collectFileOverlap(s, relSet, baseSet, lo, hi, hash, high)) gotFileOverlap = true;
+		}
+
+		let method: "file-overlap" | "time-window" = "file-overlap";
+		let entries = high.get(hash);
+		if (!gotFileOverlap && opts.includeMedium) {
+			const med = new Map<string, RawEntry[]>();
+			for (const s of sessions) collectTimeWindow(s, lo, hi, meta.branch, hash, med);
+			entries = med.get(hash);
+			method = "time-window";
+		}
+
 		if (!entries || entries.length === 0) {
 			skipped.push(hash);
 			continue;
 		}
-		const sessions = buildSessions(entries);
-		if (sessions.length === 0) {
-			// All attributed entries were non-conversational (pure tool calls) — no
-			// text to summarize, so there is nothing useful to generate.
-			skipped.push(hash);
+		const sessionsOut = buildSessions(entries);
+		if (sessionsOut.length === 0) {
+			skipped.push(hash); // attributed entries were all non-conversational tool calls
 			continue;
 		}
-		const conversationTurns = sessions.reduce(
+		const conversationTurns = sessionsOut.reduce(
 			(sum, s) => sum + s.entries.filter((e) => e.role === "human").length,
 			0,
 		);
-		const transcriptEntries = sessions.reduce((sum, s) => sum + s.entries.length, 0);
+		const transcriptEntries = sessionsOut.reduce((sum, s) => sum + s.entries.length, 0);
 		attributed.set(hash, {
 			commitHash: hash,
-			confidence,
+			confidence: method === "file-overlap" ? "high" : "medium",
 			method,
 			branch: modalBranch(entries),
-			sessions,
+			sessions: sessionsOut,
 			transcriptEntries,
 			conversationTurns,
 		});

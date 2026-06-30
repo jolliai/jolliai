@@ -256,6 +256,7 @@ export class SettingsWebviewPanel {
 			case "rebuildKnowledgeBase":
 				this.handleRebuildKnowledgeBase().catch((err: unknown) => {
 					log.error("SettingsPanel", `Rebuild failed: ${err}`);
+					if (SettingsWebviewPanel.currentPanel !== this) return;
 					this.panel.webview.postMessage({
 						command: "rebuildKnowledgeBaseDone",
 						success: false,
@@ -266,6 +267,7 @@ export class SettingsWebviewPanel {
 			case "generateMissingSummaries":
 				this.handleGenerateMissingSummaries().catch((err: unknown) => {
 					log.error("SettingsPanel", `Generate missing summaries failed: ${err}`);
+					if (SettingsWebviewPanel.currentPanel !== this) return;
 					this.panel.webview.postMessage({
 						command: "generateMissingSummariesDone",
 						success: false,
@@ -381,11 +383,20 @@ export class SettingsWebviewPanel {
 	private async refreshMissingSummaryCount(): Promise<void> {
 		try {
 			const { countMissingSummaries } = await import("../../../cli/src/backfill/BackfillEngine.js");
+			const { extractRepoName } = await import("../../../cli/src/core/KBPathResolver.js");
 			const { missing } = await countMissingSummaries(this.workspaceRoot);
 			if (SettingsWebviewPanel.currentPanel !== this) return; // panel closed meanwhile
-			this.panel.webview.postMessage({ command: "missingSummaryCountLoaded", missingSummaryCount: missing });
+			this.panel.webview.postMessage({
+				command: "missingSummaryCountLoaded",
+				missingSummaryCount: missing,
+				repoName: extractRepoName(this.workspaceRoot),
+			});
 		} catch (err) {
 			log.warn("SettingsPanel", `Missing-summary count failed: ${err}`);
+			if (SettingsWebviewPanel.currentPanel !== this) return;
+			// Count failed — release the button from its initial disabled state so the
+			// user isn't stuck (back-fill is idempotent for commits that already have one).
+			this.panel.webview.postMessage({ command: "missingSummaryCountLoaded" });
 		}
 	}
 
