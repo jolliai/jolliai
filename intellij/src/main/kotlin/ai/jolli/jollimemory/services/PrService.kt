@@ -322,12 +322,18 @@ object PrService {
         }
     }
 
-    /** Pushes the current branch to origin (sets upstream tracking). */
-    fun pushBranch(cwd: String) {
-        val result = execGit(listOf("push", "-u", "origin", "HEAD"), cwd)
-        if (result == null) {
-            log.warn("Push may have failed, but stderr output is common for push")
+    /** Result of a push attempt — exit code plus stderr for failure classification. */
+    data class PushResult(val exitCode: Int, val stderr: String) {
+        val success: Boolean get() = exitCode == 0
+    }
+
+    /** Pushes the current branch to origin (sets upstream tracking). Returns the result for NFF classification. */
+    fun pushBranch(cwd: String): PushResult {
+        val result = execCommandResult("git", listOf("push", "-u", "origin", "HEAD"), cwd, timeoutSeconds = 60)
+        if (result.exitCode != 0) {
+            log.warn("Push may have failed: stderr='%s'", result.stderr)
         }
+        return PushResult(result.exitCode, result.stderr)
     }
 
     /**
