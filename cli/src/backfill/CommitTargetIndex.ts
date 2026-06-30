@@ -38,6 +38,8 @@ export interface CommitTargetIndex {
 	 * the conversation segment. Absent when the source ref isn't a branch.
 	 */
 	readonly commitMeta: ReadonlyMap<string, { ts: number; subject: string; branch?: string }>;
+	/** hash → repo-relative forward-slash paths the commit changed (real files only). */
+	readonly commitFiles: ReadonlyMap<string, ReadonlyArray<string>>;
 	/** repo-relative forward-slash path → commits touching it, sorted by ts asc. */
 	readonly fileToCommits: ReadonlyMap<string, ReadonlyArray<CommitRef>>;
 	/** basename → commits touching a file with that basename, sorted by ts asc. */
@@ -95,17 +97,21 @@ export async function buildCommitTargetIndex(cwd: string): Promise<CommitTargetI
 	if (await orphanRefExists(cwd)) {
 		args.push("--not", ORPHAN_BRANCH);
 	}
-	// @@ record marker keeps parsing simple; %ct is author-independent commit time;
-	// %S (needs --source) is the ref the commit was reached from → its branch.
-	args.push("--name-only", "--pretty=format:@@%H|%ct|%S|%s");
+	// @@ record marker keeps parsing simple. %at = AUTHOR date (seconds): unlike
+	// committer date (%ct) it is preserved across rebase/amend, so it tracks when
+	// the work was actually done — which is what the attribution window must align
+	// with (the on-disk transcript edits happened at author time, not at the later
+	// rebase/commit time). %S (needs --source) is the ref reached → its branch.
+	args.push("--name-only", "--pretty=format:@@%H|%at|%S|%s");
 
 	const res = await execGit(args, cwd);
 	if (res.exitCode !== 0) {
 		log.warn("git log failed building target index: %s", res.stderr.substring(0, 200));
-		return { commitMeta: new Map(), fileToCommits: new Map(), baseToCommits: new Map() };
+		return { commitMeta: new Map(), commitFiles: new Map(), fileToCommits: new Map(), baseToCommits: new Map() };
 	}
 
 	const commitMeta = new Map<string, { ts: number; subject: string; branch?: string }>();
+	const commitFiles = new Map<string, string[]>();
 	const fileToCommits = new Map<string, CommitRef[]>();
 	const baseToCommits = new Map<string, CommitRef[]>();
 
@@ -121,6 +127,7 @@ export async function buildCommitTargetIndex(cwd: string): Promise<CommitTargetI
 		// Skip jolli bookkeeping commits and orphan-only commits — never targets.
 		if (!curSubject.startsWith("Add summary for") && real.length > 0) {
 			commitMeta.set(curHash, { ts: curTs, subject: curSubject, ...(curBranch ? { branch: curBranch } : {}) });
+			commitFiles.set(curHash, real);
 			const ref: CommitRef = { ts: curTs, hash: curHash };
 			for (const f of real) {
 				pushRef(fileToCommits, f, ref);
@@ -155,30 +162,35 @@ export async function buildCommitTargetIndex(cwd: string): Promise<CommitTargetI
 	for (const list of baseToCommits.values()) list.sort((a, b) => a.ts - b.ts);
 
 	log.info("Target index: %d commits, %d files", commitMeta.size, fileToCommits.size);
-	return { commitMeta, fileToCommits, baseToCommits };
+	return { commitMeta, commitFiles, fileToCommits, baseToCommits };
 }
 
-const ANCHOR_SKEW_MS = 60_000; // allow a commit up to 60s before the edit (clock skew)
-const ANCHOR_HORIZON_MS = 21 * 24 * 60 * 60 * 1000; // 21 days
-
 /**
- * Resolves the commit an edit of `rel` (basename fallback `base`) at epoch-ms
- * `editMs` belongs to: the earliest commit touching that file at or after the
- * edit time (minus skew), within the horizon. Returns null when no such commit
- * exists (file never committed, or only committed long after / before).
+ * Returns the lower-bound time for commit `hash`'s attribution window: the most
+ * recent commit-time strictly before `commitTs` among commits that touch any of
+ * `hash`'s files — i.e. "the last time these files were committed before this
+ * commit". Conversation slices are floored at this so consecutive commits that
+ * touch overlapping files don't bleed into each other (improvement ①). Capped to
+ * `commitTs - maxLookbackMs` so a long-dormant file doesn't open a huge window.
  */
-export function anchorCommitForEdit(
+export function attributionLowerBound(
 	index: CommitTargetIndex,
-	rel: string,
-	base: string,
-	editMs: number,
-): string | null {
-	if (Number.isNaN(editMs)) return null;
-	const candidates = index.fileToCommits.get(rel) ?? index.baseToCommits.get(base);
-	if (!candidates) return null;
-	const lower = editMs - ANCHOR_SKEW_MS;
-	for (const c of candidates) {
-		if (c.ts >= lower && c.ts - editMs <= ANCHOR_HORIZON_MS) return c.hash;
+	hash: string,
+	commitTs: number,
+	maxLookbackMs: number,
+): number {
+	const files = index.commitFiles.get(hash) ?? [];
+	let lb = commitTs - maxLookbackMs;
+	for (const f of files) {
+		const refs = index.fileToCommits.get(f);
+		if (!refs) continue;
+		// refs sorted asc by ts; find the latest with ts < commitTs.
+		let prev = Number.NEGATIVE_INFINITY;
+		for (const r of refs) {
+			if (r.ts < commitTs) prev = r.ts;
+			else break;
+		}
+		if (prev > lb) lb = prev;
 	}
-	return null;
+	return lb;
 }

@@ -1,9 +1,62 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execGit } from "../core/GitOps.js";
-import { anchorCommitForEdit, buildCommitTargetIndex, shortBranch } from "./CommitTargetIndex.js";
+import {
+	attributionLowerBound,
+	buildCommitTargetIndex,
+	type CommitTargetIndex,
+	shortBranch,
+} from "./CommitTargetIndex.js";
+
+describe("attributionLowerBound", () => {
+	const idx: CommitTargetIndex = {
+		commitMeta: new Map([
+			["C0", { ts: 1000, subject: "" }],
+			["C1", { ts: 5000, subject: "" }],
+		]),
+		commitFiles: new Map([
+			["C1", ["foo.ts", "bar.ts"]],
+			["NOFILES", []],
+		]),
+		fileToCommits: new Map([
+			[
+				"foo.ts",
+				[
+					{ ts: 1000, hash: "C0" },
+					{ ts: 5000, hash: "C1" },
+				],
+			], // prior commit @1000
+			["bar.ts", [{ ts: 5000, hash: "C1" }]], // only committed by C1 itself
+		]),
+		baseToCommits: new Map(),
+	};
+
+	it("floors at the previous commit of the files (most recent before commitTs)", () => {
+		expect(attributionLowerBound(idx, "C1", 5000, 1_000_000)).toBe(1000); // foo.ts prior @1000
+	});
+	it("caps to commitTs - maxLookback when no earlier commit exists", () => {
+		// If only bar.ts mattered there'd be no prior → cap. Force via a commit whose
+		// file has no earlier commit:
+		const idx2: CommitTargetIndex = { ...idx, commitFiles: new Map([["X", ["bar.ts"]]]) };
+		expect(attributionLowerBound(idx2, "X", 5000, 2000)).toBe(3000); // 5000 - 2000 (bar.ts has no commit < 5000)
+	});
+	it("returns commitTs - maxLookback for a commit with no files", () => {
+		expect(attributionLowerBound(idx, "NOFILES", 9000, 1500)).toBe(7500);
+	});
+	it("caps immediately when every commit of the files is at/after commitTs", () => {
+		// foo.ts committed @1000 and @5000; commitTs=500 → first ref (1000) is NOT < 500,
+		// so the loop breaks at once, prev stays -Inf, and lb falls back to the cap.
+		const idx3: CommitTargetIndex = { ...idx, commitFiles: new Map([["Z", ["foo.ts"]]]) };
+		expect(attributionLowerBound(idx3, "Z", 500, 100)).toBe(400);
+	});
+	it("skips files that have no commit history", () => {
+		// ghost.ts is not in fileToCommits → the `!refs` branch skips it; foo.ts@1000 floors it.
+		const idx4: CommitTargetIndex = { ...idx, commitFiles: new Map([["Q", ["ghost.ts", "foo.ts"]]]) };
+		expect(attributionLowerBound(idx4, "Q", 5000, 1_000_000)).toBe(1000);
+	});
+});
 
 describe("shortBranch", () => {
 	it("reduces a source ref to a short branch name", () => {
@@ -52,23 +105,6 @@ describe("CommitTargetIndex (real temp git repo)", () => {
 		expect(idx.fileToCommits.has("c.ts")).toBe(false);
 	});
 
-	it("anchorCommitForEdit resolves the earliest commit touching the file after the edit", async () => {
-		const a = await commit("a.ts", "feat: add A");
-		const idx = await buildCommitTargetIndex(repo);
-		const commitTs = idx.commitMeta.get(a)?.ts ?? 0;
-
-		// Edit slightly before the commit → resolves to A.
-		expect(anchorCommitForEdit(idx, "a.ts", "a.ts", commitTs - 1000)).toBe(a);
-		// Basename fallback works when the rel path is unknown.
-		expect(anchorCommitForEdit(idx, "weird/a.ts", "a.ts", commitTs - 1000)).toBe(a);
-		// Unknown file → null.
-		expect(anchorCommitForEdit(idx, "nope.ts", "nope.ts", commitTs)).toBeNull();
-		// NaN edit time → null.
-		expect(anchorCommitForEdit(idx, "a.ts", "a.ts", Number.NaN)).toBeNull();
-		// Edit far AFTER the commit (beyond horizon) → null (no later commit touches it).
-		expect(anchorCommitForEdit(idx, "a.ts", "a.ts", commitTs + 60 * 24 * 60 * 60 * 1000)).toBeNull();
-	});
-
 	it("excludes the orphan summaries branch when it exists", async () => {
 		const a = await commit("a.ts", "feat: real");
 		// Create an orphan ref (no parent) via plumbing so `--not <orphan>` has
@@ -107,5 +143,14 @@ describe("CommitTargetIndex (real temp git repo)", () => {
 		} finally {
 			rmSync(notRepo, { recursive: true, force: true });
 		}
+	});
+
+	it("derives the basename for a file in a subdirectory", async () => {
+		mkdirSync(join(repo, "sub"), { recursive: true });
+		await commit("sub/x.ts", "feat: nested file");
+		const idx = await buildCommitTargetIndex(repo);
+		expect(idx.fileToCommits.has("sub/x.ts")).toBe(true);
+		// basename() takes the path after the last "/" — the idx>=0 branch.
+		expect(idx.baseToCommits.has("x.ts")).toBe(true);
 	});
 });

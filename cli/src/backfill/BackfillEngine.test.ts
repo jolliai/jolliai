@@ -32,6 +32,7 @@ vi.mock("./RawTranscriptScanner.js", () => ({
 vi.mock("./CommitTargetIndex.js", () => ({
 	buildCommitTargetIndex: vi.fn().mockResolvedValue({
 		commitMeta: new Map(),
+		commitFiles: new Map(),
 		fileToCommits: new Map(),
 		baseToCommits: new Map(),
 	}),
@@ -113,6 +114,32 @@ describe("runBackfill", () => {
 		expect(vi.mocked(launchWorker)).toHaveBeenCalledTimes(1);
 	});
 
+	it("falls back to [cwd] when `git worktree list` fails", async () => {
+		const { execGit } = await import("../core/GitOps.js");
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) =>
+			args[0] === "worktree"
+				? ({ exitCode: 1, stdout: "", stderr: "no worktrees" } as never)
+				: ({ exitCode: 0, stdout: "", stderr: "" } as never),
+		);
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+		const report = await runBackfill({ cwd: CWD, hashes: ["c1"] });
+		// worktree-list failure must not abort the run — roots defaults to just [cwd].
+		expect(report.generated).toBe(1);
+	});
+
+	it("attaches the commit subject (from the target index) to the outcome", async () => {
+		const { buildCommitTargetIndex } = await import("./CommitTargetIndex.js");
+		vi.mocked(buildCommitTargetIndex).mockResolvedValue({
+			commitMeta: new Map([["c1", { ts: 1, subject: "Fix the login bug" }]]),
+			commitFiles: new Map(),
+			fileToCommits: new Map(),
+			baseToCommits: new Map(),
+		} as never);
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+		const report = await runBackfill({ cwd: CWD, hashes: ["c1"] });
+		expect(report.outcomes[0].commitSubject).toBe("Fix the login bug");
+	});
+
 	it("dry-run reports would-generate without calling the LLM or triggering ingest", async () => {
 		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
 
@@ -179,11 +206,19 @@ describe("runBackfill", () => {
 		expect(vi.mocked(launchWorker)).toHaveBeenCalledTimes(1);
 	});
 
-	it("falls back to the current branch when attribution has no branch", async () => {
-		const a = { ...attrFor("c1"), branch: "" };
-		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", a]]), skipped: [] });
+	it("labels the branch 'backfilled' when no conversation branch is known (diff-only)", async () => {
+		// A historical commit's dev branch can't be recovered after the fact, so a
+		// diff-only summary uses an explicit "backfilled" marker rather than the
+		// run-time HEAD (which would be wrong).
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map(), skipped: ["c1"] });
 		await runBackfill({ cwd: CWD, hashes: ["c1"] });
-		expect(vi.mocked(storeSummary).mock.calls[0][0].branch).toBe("main");
+		expect(vi.mocked(storeSummary).mock.calls[0][0].branch).toBe("backfilled");
+	});
+
+	it("keeps the attributed conversation's branch when one was found", async () => {
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+		await runBackfill({ cwd: CWD, hashes: ["c1"] });
+		expect(vi.mocked(storeSummary).mock.calls[0][0].branch).toBe("feat"); // attrFor sets branch "feat"
 	});
 
 	it("discovers worktree roots and tolerates a failed tree-hash lookup", async () => {
@@ -208,9 +243,8 @@ describe("runBackfill", () => {
 		expect(report.outcomes[0].confidence).toBeUndefined();
 	});
 
-	it("stamps treeHash, ticketId, and recap; tolerates getCurrentBranch failure", async () => {
-		const { execGit, getCurrentBranch } = await import("../core/GitOps.js");
-		vi.mocked(getCurrentBranch).mockRejectedValue(new Error("detached"));
+	it("stamps treeHash, ticketId, and recap", async () => {
+		const { execGit } = await import("../core/GitOps.js");
 		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
 			if (args[0] === "rev-parse") return { exitCode: 0, stdout: "treeSHA123", stderr: "" } as never;
 			return { exitCode: 0, stdout: "", stderr: "" } as never;
@@ -228,8 +262,8 @@ describe("runBackfill", () => {
 		expect(stored.treeHash).toBe("treeSHA123");
 		expect(stored.ticketId).toBe("JOLLI-9");
 		expect(stored.recap).toBe("did stuff");
-		// attribution empty + getCurrentBranch threw → ORPHAN_BRANCH fallback (non-empty).
-		expect(stored.branch).toMatch(/summaries/);
+		// attribution has no branch → diff-only "backfilled" label.
+		expect(stored.branch).toBe("backfilled");
 	});
 });
 
@@ -246,18 +280,20 @@ describe("countMissingSummaries / own-commit scoping", () => {
 		expect(missing).toBe(2);
 	});
 
-	it("scopes rev-list to the local author when git user.email is set", async () => {
+	it("scopes rev-list to the local author, regex-escaping the email", async () => {
 		const { execGit } = await import("../core/GitOps.js");
 		const calls: string[][] = [];
 		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
 			calls.push([...args]);
-			if (args[0] === "config") return { exitCode: 0, stdout: "me@dev.io", stderr: "" } as never;
+			// Gmail-style alias with regex metacharacters ('+' and '.').
+			if (args[0] === "config") return { exitCode: 0, stdout: "me+tag@dev.io", stderr: "" } as never;
 			return { exitCode: 0, stdout: "h1", stderr: "" } as never;
 		});
 		vi.mocked(getIndexEntryMap).mockResolvedValue(new Map());
 		await countMissingSummaries(CWD);
 		const revList = calls.find((c) => c[0] === "rev-list");
-		expect(revList).toContain("--author=me@dev.io");
+		// '+' and '.' must be escaped so git's --author regex matches them literally.
+		expect(revList).toContain("--author=me\\+tag@dev\\.io");
 	});
 
 	it("returns [] when rev-list fails or is empty", async () => {
