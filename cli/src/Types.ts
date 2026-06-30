@@ -486,6 +486,29 @@ export interface CommitSummary {
 	 * Release N keeps reading legacy data; Release N+M will make it required.
 	 */
 	readonly transcripts?: ReadonlyArray<string>;
+	/**
+	 * Marks a summary produced by the historical back-fill flow (`jolli backfill`
+	 * / enable-time catch-up) rather than the live post-commit pipeline. The
+	 * back-fill flow is fully isolated from QueueWorker: it reconstructs the
+	 * conversation by attributing on-disk Claude transcripts to historical
+	 * commits offline. Absent on summaries written by the live pipeline.
+	 */
+	readonly backfilled?: boolean;
+	/**
+	 * Confidence of the back-fill conversation attribution. "high" = an edited
+	 * file in the attributed conversation matches this commit's diff
+	 * (file-orthogonality anchor). "medium" = time-window / branch match only.
+	 * Absent when no conversation was confidently attributed (a `diff-only`
+	 * summary). Only meaningful when `backfilled`.
+	 */
+	readonly backfillConfidence?: "high" | "medium";
+	/**
+	 * Which back-fill signal produced this summary. `file-overlap` / `time-window`
+	 * mean a conversation was attributed; `diff-only` means no conversation was
+	 * confidently found, so the summary was generated from the git diff alone
+	 * (mirrors the live pipeline's no-session path). Only meaningful when `backfilled`.
+	 */
+	readonly backfillMethod?: "file-overlap" | "time-window" | "diff-only";
 }
 
 /** A single E2E test scenario for one feature or bug fix */

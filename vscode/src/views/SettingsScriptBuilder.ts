@@ -41,6 +41,9 @@ export function buildSettingsScript(): string {
   const browseLocalFolderBtn = document.getElementById('browseLocalFolderBtn');
   const rebuildKbBtn = document.getElementById('rebuildKbBtn');
   const rebuildKbStatus = document.getElementById('rebuildKbStatus');
+  const generateSummariesBtn = document.getElementById('generateSummariesBtn');
+  const generateSummariesStatus = document.getElementById('generateSummariesStatus');
+  const missingSummariesCount = document.getElementById('missingSummariesCount');
   const excludePatternsInput = document.getElementById('excludePatterns');
   const compileExcludeFoldersInput = document.getElementById('compileExcludeFolders');
   const dcoSignoffInput = document.getElementById('dcoSignoff');
@@ -291,6 +294,15 @@ export function buildSettingsScript(): string {
     }
     startRebuild();
   });
+
+  if (generateSummariesBtn) {
+    generateSummariesBtn.addEventListener('click', function() {
+      if (generateSummariesBtn.disabled) return;
+      generateSummariesBtn.disabled = true;
+      if (generateSummariesStatus) generateSummariesStatus.textContent = 'Generating… (see notification for progress)';
+      vscode.postMessage({ command: 'generateMissingSummaries' });
+    });
+  }
 
   // ── Dirty tracking ──
   function getActiveJolliApiKeyValue() {
@@ -576,8 +588,21 @@ export function buildSettingsScript(): string {
         hasErrors = false;
         applyAuthState(msg);
         updateAnthropicWarning();
+        // The count arrives separately via 'missingSummaryCountLoaded' (computed
+        // off the settings-load critical path). Reset to the pending state here.
+        if (missingSummariesCount) missingSummariesCount.textContent = 'Checking…';
         captureInitialState();
         break;
+      case 'missingSummaryCountLoaded': {
+        const n = msg.missingSummaryCount;
+        if (missingSummariesCount) {
+          missingSummariesCount.textContent = typeof n === 'number'
+            ? (n === 0 ? 'All your commits have summaries.' : n + ' of your commits lack a summary.')
+            : '';
+        }
+        if (generateSummariesBtn) generateSummariesBtn.disabled = n === 0;
+        break;
+      }
       case 'authStateChanged':
         // Pushed after sign-in / sign-out so the cards re-render without
         // requiring a full settings reload. Mirror IntelliJ's auth listener.
@@ -592,6 +617,14 @@ export function buildSettingsScript(): string {
         rebuildKbStatus.textContent = msg.success
           ? 'Rebuild complete: ' + (msg.message || '')
           : 'Rebuild failed: ' + (msg.message || 'unknown error');
+        break;
+      case 'generateMissingSummariesDone':
+        if (generateSummariesBtn) generateSummariesBtn.disabled = false;
+        if (generateSummariesStatus) {
+          generateSummariesStatus.textContent = msg.success
+            ? 'Done: ' + (msg.message || '')
+            : 'Failed: ' + (msg.message || 'unknown error');
+        }
         break;
       case 'confirmDirtyMigrateResult':
         if (!msg.proceed) {

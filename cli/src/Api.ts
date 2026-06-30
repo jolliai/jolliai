@@ -9,6 +9,7 @@
 
 import { Command, Help } from "commander";
 import { registerAuthCommands } from "./commands/AuthCommand.js";
+import { registerBackfillCommand } from "./commands/BackfillCommand.js";
 import { registerCleanCommand } from "./commands/CleanCommand.js";
 import { checkVersionMismatch, VERSION } from "./commands/CliUtils.js";
 import { registerCompileCommand } from "./commands/CompileCommand.js";
@@ -157,6 +158,7 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"view",
 	"recall",
 	"search",
+	"backfill",
 	"pr-description",
 	"compile",
 	"graph",
@@ -333,6 +335,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerViewCommand(program);
 	registerRecallCommand(program);
 	registerSearchCommand(program);
+	registerBackfillCommand(program);
 	registerPrDescriptionCommand(program);
 	registerCompileCommand(program);
 	registerGraphCommand(program);
