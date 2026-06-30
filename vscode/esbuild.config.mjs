@@ -88,6 +88,7 @@ const cliOptions = {
 		{ in: `${jmSrc}/hooks/PrepareMsgHook.ts`,          out: "PrepareMsgHook" },
 		{ in: `${jmSrc}/hooks/GeminiAfterAgentHook.ts`,   out: "GeminiAfterAgentHook" },
 		{ in: `${jmSrc}/hooks/SessionStartHook.ts`,       out: "SessionStartHook" },
+		{ in: `${jmSrc}/backfill/BackfillWorker.ts`,       out: "BackfillWorker" },
 	],
 	outdir: "dist",
 	// CLI entry points live under ../cli/src/, so esbuild's Node module

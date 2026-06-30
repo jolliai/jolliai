@@ -187,6 +187,12 @@ export function buildSettingsHtml(nonce: string): string {
         <div class="hint" id="rebuildKbStatus"></div>
       </div>
 
+      <div class="settings-row column rebuild-row">
+        <button type="button" class="browse-btn rebuild-btn" id="generateSummariesBtn">Generate Missing Summaries</button>
+        <div class="hint rebuild-hint"><span id="missingSummariesCount">Checking…</span> Back-fills summaries for your own historical commits, attributing Claude Code conversations where they can be found and falling back to a diff-only summary otherwise. May take a while and makes one AI call per commit.</div>
+        <div class="hint" id="generateSummariesStatus"></div>
+      </div>
+
       <!-- ── Cloud sync to Personal Space ───────────────────────────────── -->
       <hr class="settings-divider" />
 

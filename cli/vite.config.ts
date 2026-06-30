@@ -36,6 +36,7 @@ export default defineConfig({
 				SessionStartHook: resolve(__dirname, "src/hooks/SessionStartHook.ts"),
 				PostMergeHook: resolve(__dirname, "src/hooks/PostMergeHook.ts"),
 				QueueWorker: resolve(__dirname, "src/hooks/QueueWorker.ts"),
+				BackfillWorker: resolve(__dirname, "src/backfill/BackfillWorker.ts"),
 			},
 			formats: ["es"],
 		},
