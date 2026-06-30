@@ -500,6 +500,13 @@ export interface PlanEntry {
 	readonly commitHash: string | null;
 	/** SHA-256 hash of the plan file content when associated with a commit. Used as a guard to detect if the file was overwritten with new content. */
 	readonly contentHashAtCommit?: string;
+	/**
+	 * Branch the plan was created/last touched on. Optional: legacy rows and rows
+	 * written before branch-scoping omit it (treated as visible on every branch).
+	 * The CLI does not filter on it, but persists it so the IntelliJ plugin — which
+	 * shares this plans.json — can branch-scope its CONTEXT view.
+	 */
+	readonly branch?: string;
 }
 
 /**
@@ -536,6 +543,12 @@ export interface NoteEntry {
 	readonly contentHashAtCommit?: string;
 	/** File path in .jolli/jollimemory/notes/<id>.md (all notes are file-backed) */
 	readonly sourcePath?: string;
+	/**
+	 * Branch the note was created on. Optional for the same reason as
+	 * {@link PlanEntry.branch}: persisted by the CLI (not filtered on) so the
+	 * IntelliJ plugin can branch-scope its shared CONTEXT view.
+	 */
+	readonly branch?: string;
 }
 
 // ─── Plan progress types ────────────────────────────────────────────────────
@@ -653,8 +666,9 @@ export interface Reference {
  * `<source>:<nativeId>`. Unlike Plan / Note rows, a reference is DELETED from
  * the registry when its commit lands — its value-snapshot lives on in the
  * orphan branch's `CommitSummary.references`. So there is no archive row,
- * `contentHashAtCommit` guard, branch scoping, or ignored flag: every row
- * here is an active, uncommitted reference.
+ * `contentHashAtCommit` guard, or ignored flag: every row here is an active,
+ * uncommitted reference. The optional `branch` is persisted (not filtered on by
+ * the CLI) so the IntelliJ plugin can branch-scope its shared CONTEXT view.
  */
 export interface ReferenceEntry {
 	readonly source: SourceId;
@@ -667,6 +681,8 @@ export interface ReferenceEntry {
 	readonly updatedAt: string;
 	/** MCP tool name that originally surfaced this reference. */
 	readonly sourceToolName: string;
+	/** Branch the reference was last captured on; see {@link PlanEntry.branch}. */
+	readonly branch?: string;
 }
 
 /**
