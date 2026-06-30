@@ -65,6 +65,15 @@ data class ReferenceEntry(
 	val addedAt: String,
 	val updatedAt: String,
 	val sourceToolName: String,
+	/**
+	 * Branch the reference was last captured on. Nullable/blank for legacy rows
+	 * written before branch-scoping; those are treated as visible on every branch
+	 * (same graceful fallback as [ai.jolli.jollimemory.core.PlanEntry.branch] /
+	 * [ai.jolli.jollimemory.core.NoteEntry.branch]). Stamped by
+	 * `TranscriptReferenceDiscovery.upsertReferenceEntry` and filtered at the
+	 * CONTEXT / Working Memory display sites + the post-commit archive selection.
+	 */
+	val branch: String? = null,
 )
 
 /**

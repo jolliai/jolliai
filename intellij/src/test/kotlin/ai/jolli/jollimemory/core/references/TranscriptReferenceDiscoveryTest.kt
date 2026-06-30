@@ -94,6 +94,8 @@ class TranscriptReferenceDiscoveryTest {
 			entry!!.nativeId shouldBe "PROJ-42"
 			entry.title shouldBe "Test issue"
 			entry.source shouldBe SourceId.linear
+			// Branch is stamped at capture (temp dir is not a git repo → "unknown").
+			entry.branch shouldBe "unknown"
 		}
 
 		@Test

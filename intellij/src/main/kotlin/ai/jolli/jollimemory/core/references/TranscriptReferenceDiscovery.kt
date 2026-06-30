@@ -110,6 +110,9 @@ object TranscriptReferenceDiscovery {
 					sourcePath = result.sourcePath,
 					sourceToolName = ref.toolName,
 					updatedAt = now,
+					// Re-stamp the branch: a reference re-surfaced on a new branch
+					// follows that branch (matches plan/note upsert semantics).
+					branch = branch,
 				)
 			} else {
 				ReferenceEntry(
@@ -121,6 +124,7 @@ object TranscriptReferenceDiscovery {
 					addedAt = now,
 					updatedAt = now,
 					sourceToolName = ref.toolName,
+					branch = branch,
 				)
 			}
 

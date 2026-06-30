@@ -5,6 +5,8 @@ import ai.jolli.jollimemory.core.NoteEntry
 import ai.jolli.jollimemory.core.NoteFormat
 import ai.jolli.jollimemory.core.PlansRegistry
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.core.references.ReferenceEntry
+import ai.jolli.jollimemory.core.references.SourceId
 import io.kotest.matchers.collections.shouldContainExactlyInAnyOrder
 import io.kotest.matchers.shouldBe
 import org.junit.jupiter.api.BeforeEach
@@ -51,6 +53,27 @@ class PostCommitHookTest {
         )
         method.isAccessible = true
         return method.invoke(PostCommitHook, cwd, branch, excluded) as Map<String, NoteEntry>
+    }
+
+    private fun ref(nativeId: String, branch: String?) = ReferenceEntry(
+        source = SourceId.linear,
+        nativeId = nativeId,
+        title = "Ref $nativeId",
+        url = "https://linear.app/x/issue/$nativeId",
+        sourcePath = "/references/linear/$nativeId.md",
+        addedAt = "2026-01-01T00:00:00Z",
+        updatedAt = "2026-01-01T00:00:00Z",
+        sourceToolName = "linear",
+        branch = branch,
+    )
+
+    @Suppress("UNCHECKED_CAST")
+    private fun detectUncommittedReferences(branch: String): Map<String, ReferenceEntry> {
+        val method = PostCommitHook::class.java.getDeclaredMethod(
+            "detectUncommittedReferences", String::class.java, String::class.java,
+        )
+        method.isAccessible = true
+        return method.invoke(PostCommitHook, cwd, branch) as Map<String, ReferenceEntry>
     }
 
     private fun sha256Hex(s: String): String {
@@ -137,6 +160,34 @@ invalid line
         fun `returns empty when there are no notes`() {
             SessionTracker.savePlansRegistry(PlansRegistry(), cwd)
             detectUncommittedNotes(branch = "main", excluded = emptySet()) shouldBe emptyMap()
+        }
+    }
+
+    @Nested
+    inner class DetectUncommittedReferences {
+        @Test
+        fun `includes only current-branch and legacy blank-branch references`() {
+            SessionTracker.savePlansRegistry(
+                PlansRegistry(
+                    references = mapOf(
+                        "linear:ENG-1" to ref("ENG-1", branch = "feature/x"),
+                        "linear:ENG-2" to ref("ENG-2", branch = null),
+                        "linear:ENG-3" to ref("ENG-3", branch = ""),
+                        "linear:ENG-4" to ref("ENG-4", branch = "feature/y"),
+                    ),
+                ),
+                cwd,
+            )
+
+            val result = detectUncommittedReferences(branch = "feature/x")
+
+            result.keys shouldContainExactlyInAnyOrder listOf("linear:ENG-1", "linear:ENG-2", "linear:ENG-3")
+        }
+
+        @Test
+        fun `returns empty when there are no references`() {
+            SessionTracker.savePlansRegistry(PlansRegistry(), cwd)
+            detectUncommittedReferences(branch = "main") shouldBe emptyMap()
         }
     }
 

@@ -255,6 +255,9 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             }
             registry.references?.forEach { (mapKey, r) ->
                 if (mapKey in exclusions.references) return@forEach
+                // Branch-scope like plans/notes above: legacy blank-branch rows stay
+                // visible everywhere; a branch-stamped row only shows on its branch.
+                if (!r.branch.isNullOrBlank() && r.branch != branch) return@forEach
                 out.add(WmContext(referenceTag(r.source), r.title))
             }
         } catch (_: Exception) {
