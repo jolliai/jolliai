@@ -20,6 +20,7 @@ import {
 import { basename, join } from "node:path";
 import { withPlansLock } from "../../../cli/src/core/Locks.js";
 import { isPathInside } from "../../../cli/src/core/PathUtils.js";
+import { getCurrentBranchSafe } from "../../../cli/src/core/GitBranch.js";
 import {
 	loadPlansRegistry,
 	loadPlansRegistryWithStatus,
@@ -122,6 +123,10 @@ export async function saveNote(
 		resolvedTitle = title || extractTitle(sourcePath);
 	}
 
+	// Stamp the current branch so the IntelliJ plugin (sharing this plans.json)
+	// can branch-scope its CONTEXT view; an "unknown" git lookup keeps any branch
+	// already on the existing row via the leading spread.
+	const noteBranch = getCurrentBranchSafe(cwd);
 	const entry: NoteEntry = {
 		...(existingNotes[noteId] ?? {}),
 		id: noteId,
@@ -131,6 +136,7 @@ export async function saveNote(
 		addedAt: existingNotes[noteId]?.addedAt ?? now,
 		updatedAt: now,
 		commitHash: existingNotes[noteId]?.commitHash ?? null,
+		...(noteBranch && noteBranch !== "unknown" ? { branch: noteBranch } : {}),
 	};
 
 	// plans.lock + fresh re-read so this single-note upsert can't clobber a

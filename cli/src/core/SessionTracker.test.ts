@@ -1995,6 +1995,21 @@ describe("SessionTracker", () => {
 			expect(e?.sourcePath).toContain("PROJ-1528.md");
 			expect(e?.sourceToolName).toBe("mcp__linear__get_issue");
 			expect(e?.title).toBe("Treat referenced Linear issues");
+			// Branch is stamped so IntelliJ can branch-scope the shared plans.json.
+			expect(e?.branch).toBe("main");
+		});
+
+		it("stamps the current branch on insert and re-stamps it on update", async () => {
+			await upsertReferenceEntry(ref(), tempDir, "feature/x");
+			expect(linearIssuesOfReg(await loadPlansRegistry(tempDir))?.["PROJ-1528"]?.branch).toBe("feature/x");
+			// Re-surfaced on another branch → follows the new branch.
+			await upsertReferenceEntry(ref({ title: "v2" }), tempDir, "feature/y");
+			expect(linearIssuesOfReg(await loadPlansRegistry(tempDir))?.["PROJ-1528"]?.branch).toBe("feature/y");
+		});
+
+		it("omits branch on an unknown git lookup (stays visible on every branch)", async () => {
+			await upsertReferenceEntry(ref(), tempDir, "unknown");
+			expect(linearIssuesOfReg(await loadPlansRegistry(tempDir))?.["PROJ-1528"]?.branch).toBeUndefined();
 		});
 
 		it("refreshes title/url/sourceToolName on an existing entry, preserving addedAt", async () => {
@@ -2351,7 +2366,7 @@ describe("normalizePlansRegistry", () => {
 		...over,
 	});
 
-	it("plans: drops ignored rows, strips ignored/branch/editCount, keeps guard", () => {
+	it("plans: drops ignored rows, strips ignored/editCount, keeps guard and branch", () => {
 		const raw = {
 			version: 1,
 			plans: {
@@ -2371,12 +2386,15 @@ describe("normalizePlansRegistry", () => {
 
 		expect(changed).toBe(true);
 		expect(Object.keys(registry.plans).sort()).toEqual(["active", "guard"]);
-		expect(JSON.stringify(registry.plans)).not.toMatch(/editCount|"branch"|"ignored"/);
+		expect(JSON.stringify(registry.plans)).not.toMatch(/editCount|"ignored"/);
+		// `branch` is preserved (IntelliJ branch-scopes off it via the shared plans.json).
+		expect(registry.plans.active?.branch).toBe("main");
+		expect(registry.plans.guard?.branch).toBe("main");
 		expect(registry.plans.guard?.commitHash).toBe("abc");
 		expect(registry.plans.guard?.contentHashAtCommit).toBe("h");
 	});
 
-	it("notes: drops ignored rows, strips ignored/branch, keeps guard", () => {
+	it("notes: drops ignored rows, strips ignored, keeps guard and branch", () => {
 		const raw = {
 			version: 1,
 			plans: {},
@@ -2406,7 +2424,9 @@ describe("normalizePlansRegistry", () => {
 
 		expect(changed).toBe(true);
 		expect(Object.keys(registry.notes ?? {})).toEqual(["keep"]);
-		expect(JSON.stringify(registry.notes)).not.toMatch(/"branch"|"ignored"/);
+		expect(JSON.stringify(registry.notes)).not.toMatch(/"ignored"/);
+		// `branch` is preserved for the IntelliJ shared-plans.json branch filter.
+		expect(registry.notes?.keep?.branch).toBe("main");
 	});
 
 	it("references: drops ignored/committed/guard rows, keeps active rows, strips dead fields", () => {
@@ -2428,7 +2448,9 @@ describe("normalizePlansRegistry", () => {
 
 		expect(changed).toBe(true);
 		expect(Object.keys(registry.references ?? {}).sort()).toEqual(["linear:ACTIVE-1", "linear:ENG-12345678"]);
-		expect(JSON.stringify(registry.references)).not.toMatch(/"branch"|"ignored"|"commitHash"|contentHashAtCommit/);
+		expect(JSON.stringify(registry.references)).not.toMatch(/"ignored"|"commitHash"|contentHashAtCommit/);
+		// `branch` is preserved on the surviving active rows.
+		expect(registry.references?.["linear:ACTIVE-1"]?.branch).toBe("main");
 	});
 
 	it("is idempotent: an already-clean registry returns changed=false and equal data", () => {

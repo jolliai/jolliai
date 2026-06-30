@@ -11,7 +11,7 @@
 
 import { createLogger } from "../../Logger.js";
 import type { TranscriptSource } from "../../Types.js";
-import { execFileSyncHidden } from "../../util/Subprocess.js";
+import { getCurrentBranchSafe } from "../GitBranch.js";
 import { upsertReferenceEntry } from "../SessionTracker.js";
 import { extractReferencesFromTranscript } from "./ReferenceExtractor.js";
 import { getAdaptersForSource } from "./sources/index.js";
@@ -68,21 +68,4 @@ export async function scanReferencesFrom(
 	);
 
 	return lastLineNumberScanned;
-}
-
-/**
- * Current git branch (synchronous, never throws). Returns "unknown" on any
- * failure. Named `…Safe` to NOT collide with the async, throwing
- * `GitOps.getCurrentBranch` — the two have opposite error semantics.
- */
-export function getCurrentBranchSafe(cwd: string): string {
-	try {
-		return execFileSyncHidden("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
-			cwd,
-			encoding: "utf-8",
-			stdio: ["ignore", "pipe", "ignore"],
-		}).trim();
-	} catch {
-		return "unknown";
-	}
 }
