@@ -34,6 +34,8 @@ class ActiveConversationsPanel(
 
 	private val rowsPanel = JPanel().apply {
 		layout = BoxLayout(this, BoxLayout.Y_AXIS)
+		// Match PINNED's container insets so the first/last row edge gaps line up.
+		border = JBUI.Borders.empty(2, 4)
 	}
 	private val emptyLabel = JBLabel("No active conversations").apply {
 		horizontalAlignment = SwingConstants.CENTER
@@ -60,9 +62,16 @@ class ActiveConversationsPanel(
 	private val pollTimer = Timer(60_000) {
 		if (isShowing) {
 			refresh()
-			// JOLLI-1785: piggyback the 60s tick to flush buffered telemetry.
+			// JOLLI-1785: piggyback the 60s tick to flush buffered telemetry — on a
+			// pooled thread, NOT the EDT. The Swing Timer fires on the EDT and
+			// flushNow does a blocking HTTP send (kept synchronous for the hook path),
+			// so a slow DNS lookup / network would otherwise freeze the UI.
 			// Best-effort; the helper swallows errors and no-ops on an empty buffer.
-			project.basePath?.let { ai.jolli.jollimemory.core.telemetry.TelemetryActivation.flushNow(it) }
+			project.basePath?.let { base ->
+				ApplicationManager.getApplication().executeOnPooledThread {
+					ai.jolli.jollimemory.core.telemetry.TelemetryActivation.flushNow(base)
+				}
+			}
 		}
 	}.apply { isRepeats = true }
 
@@ -173,6 +182,7 @@ class ActiveConversationsPanel(
 		val key = CommitSelectionStore.conversationKey(item.source, item.sessionId)
 		ApplicationManager.getApplication().executeOnPooledThread {
 			CommitSelectionStore.setExcluded(cwd, "conversations", key, !selected)
+			service.notifySelectionChanged()
 		}
 	}
 
@@ -182,6 +192,7 @@ class ActiveConversationsPanel(
 		val keys = conversations.map { CommitSelectionStore.conversationKey(it.source, it.sessionId) }
 		ApplicationManager.getApplication().executeOnPooledThread {
 			CommitSelectionStore.setAllExcluded(cwd, "conversations", keys, !anyUnchecked)
+			service.notifySelectionChanged()
 			SwingUtilities.invokeLater { refresh() }
 		}
 	}

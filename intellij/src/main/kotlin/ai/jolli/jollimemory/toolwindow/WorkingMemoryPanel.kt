@@ -1,6 +1,7 @@
 package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.core.ActiveSessionAggregator
+import ai.jolli.jollimemory.core.CommitSelectionStore
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliMemoryService
@@ -11,7 +12,6 @@ import ai.jolli.jollimemory.toolwindow.views.WorkingMemoryHtmlBuilder.WmFile
 import ai.jolli.jollimemory.toolwindow.views.WorkingMemoryHtmlBuilder.WorkingMemoryView
 import com.google.gson.JsonParser
 import com.intellij.ide.BrowserUtil
-import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
@@ -49,6 +49,9 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
     init {
         add(createContent(), BorderLayout.CENTER)
         service?.addStatusListener(statusListener)
+        // Live-refresh when the user toggles a conversation / context / file selection
+        // in the sidebar while this review is open.
+        service?.addSelectionListener(statusListener)
     }
 
     private fun createContent(): JComponent {
@@ -120,12 +123,10 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
      * the JCEF panel's own component context would otherwise risk a null project.
      */
     private fun runCommit() {
-        val action = ActionManager.getInstance().getAction("JolliMemory.CommitAI") ?: return
-        val dataContext = com.intellij.openapi.actionSystem.impl.SimpleDataContext.getProjectContext(project)
-        val event = com.intellij.openapi.actionSystem.AnActionEvent.createFromAnAction(
-            action, null, "JolliMemoryWorkingMemory", dataContext,
-        )
-        action.actionPerformed(event)
+        // Call the commit logic directly with our explicit project — the JCEF panel's
+        // own data context doesn't reliably carry the project, and the action-invocation
+        // API (ActionUtil.invokeAction) is deprecated inconsistently across IDE versions.
+        ai.jolli.jollimemory.actions.CommitAIAction().performCommit(project)
     }
 
     // ── Data gathering ────────────────────────────────────────────────────────
@@ -134,34 +135,70 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
         val gitOps = service?.getGitOps()
         val branch = gitOps?.getCurrentBranch() ?: "unknown"
 
-        val (files, ins, del) = diffStats(branch)
+        // Insertions/deletions reflect the whole working-tree change; the file *count*
+        // tracks the selected files below so it agrees with the Files section.
+        val (_, ins, del) = diffStats(branch)
+        val selectedFiles = changedFiles()
+
+        // The review must show exactly what the next commit will save, so honor the
+        // same sidebar exclusions the PostCommitHook applies (conversations unchecked
+        // in the CONVERSATIONS list, plans/notes/references unchecked in CONTEXT).
+        val exclusions = try {
+            CommitSelectionStore.readExclusions(cwd)
+        } catch (_: Exception) {
+            CommitSelectionStore.CommitExclusions()
+        }
 
         val conversations = try {
-            ActiveSessionAggregator.listActiveConversations(cwd).map {
-                WmConversation(it.source.name, it.title.ifBlank { "${it.source.name} conversation" }, it.messageCount)
-            }
+            ActiveSessionAggregator.listActiveConversations(cwd)
+                .filter { CommitSelectionStore.conversationKey(it.source, it.sessionId) !in exclusions.conversations }
+                .map {
+                    WmConversation(it.source.name, it.title.ifBlank { "${it.source.name} conversation" }, it.messageCount)
+                }
         } catch (_: Exception) {
             emptyList()
         }
 
-        val context = gatherContext(branch)
+        val context = gatherContext(branch, exclusions)
         val detectedTicket = context.firstOrNull { it.tag == "L" || it.tag == "J" }
             ?.let { Regex("[A-Z]+-\\d+").find(it.title)?.value }
             ?: Regex("[A-Z]+-\\d+").find(branch)?.value
 
         return WorkingMemoryView(
             branch = branch,
-            filesChanged = files,
+            filesChanged = selectedFiles.size,
             insertions = ins,
             deletions = del,
             detectedTicket = detectedTicket,
+            proposedTitle = buildProposedTitle(branch, detectedTicket),
             // Live sessions don't carry token usage in the plugin; usage is captured
             // when the memory is generated at commit time.
             tokenLabel = "N/A tokens",
             conversations = conversations,
             context = context,
-            files = changedFiles(),
+            files = selectedFiles,
         )
+    }
+
+    /**
+     * Heuristic preview of the next commit's title, shown before the AI writes the
+     * real one at commit time. Combines any detected ticket with a humanized branch
+     * name (drop the `feature/`-style prefix and a leading ticket token, turn
+     * separators into spaces). Returns null when there's no useful signal (e.g. an
+     * unknown/empty branch), so the view falls back to its explanatory placeholder.
+     */
+    private fun buildProposedTitle(branch: String, ticket: String?): String? {
+        if (branch.isBlank() || branch == "unknown") return ticket
+        val humanized = branch.substringAfterLast('/')
+            .replace(Regex("^[A-Za-z]+-\\d+[-_]?"), "") // strip a leading ticket token (jolli-1785-…)
+            .replace(Regex("[-_]+"), " ")
+            .trim()
+        return when {
+            ticket != null && humanized.isNotBlank() -> "$ticket — $humanized"
+            ticket != null -> ticket
+            humanized.isNotBlank() -> humanized.replaceFirstChar { it.uppercase() }
+            else -> null
+        }
     }
 
     /** +insertions / −deletions / files changed vs HEAD (staged + unstaged). */
@@ -175,34 +212,49 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
         return Triple(fileCount, ins, del)
     }
 
+    /**
+     * Files the next commit will include. Prefers the Changes panel's live selection
+     * (the same set [JolliMemory.CommitAI] commits) so unchecking a file in the sidebar
+     * removes it here too; falls back to all changed files when the panel isn't mounted.
+     */
     private fun changedFiles(): List<WmFile> = try {
-        service?.getChangedFiles()?.map { fc ->
+        val source = service?.panelRegistry?.changesPanel?.getSelectedFiles()
+            ?: service?.getChangedFiles()
+            ?: emptyList()
+        source.map { fc ->
             val slash = fc.relativePath.lastIndexOf('/')
             val name = if (slash >= 0) fc.relativePath.substring(slash + 1) else fc.relativePath
             val dir = if (slash > 0) fc.relativePath.substring(0, slash) else ""
             WmFile(name, dir, fc.statusCode.take(1).ifBlank { "M" })
-        } ?: emptyList()
+        }
     } catch (_: Exception) {
         emptyList()
     }
 
-    /** Uncommitted plans + notes on the current branch, plus all references. */
-    private fun gatherContext(branch: String): List<WmContext> {
+    /**
+     * Uncommitted plans + notes on the current branch, plus all references —
+     * minus anything the user unchecked in the CONTEXT list (same exclusion keys
+     * the CONTEXT panel and PostCommitHook use: plan slug, note id, reference map key).
+     */
+    private fun gatherContext(branch: String, exclusions: CommitSelectionStore.CommitExclusions): List<WmContext> {
         val out = mutableListOf<WmContext>()
         try {
             val registry = SessionTracker.loadPlansRegistry(cwd)
             registry.plans.values.forEach { p ->
+                if (p.slug in exclusions.plans) return@forEach
                 if (p.ignored == true || p.commitHash != null) return@forEach
                 if (!p.branch.isNullOrBlank() && p.branch != branch) return@forEach
                 if (!File(p.sourcePath).exists()) return@forEach
                 out.add(WmContext("P", p.title))
             }
             registry.notes?.values?.forEach { n ->
+                if (n.id in exclusions.notes) return@forEach
                 if (n.ignored == true || n.commitHash != null) return@forEach
                 if (n.branch.isNotBlank() && n.branch != branch) return@forEach
                 out.add(WmContext("N", n.title))
             }
-            registry.references?.values?.forEach { r ->
+            registry.references?.forEach { (mapKey, r) ->
+                if (mapKey in exclusions.references) return@forEach
                 out.add(WmContext(referenceTag(r.source), r.title))
             }
         } catch (_: Exception) {
@@ -220,6 +272,7 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
 
     fun dispose() {
         service?.removeStatusListener(statusListener)
+        service?.removeSelectionListener(statusListener)
         jsQuery?.dispose()
         browser?.dispose()
     }

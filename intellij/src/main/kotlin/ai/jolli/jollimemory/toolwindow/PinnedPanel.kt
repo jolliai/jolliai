@@ -24,13 +24,17 @@ import java.awt.FlowLayout
 import java.awt.Font
 import java.awt.Graphics
 import java.awt.Graphics2D
+import java.awt.GridBagConstraints
+import java.awt.GridBagLayout
 import java.awt.RenderingHints
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.io.File
 import javax.swing.BoxLayout
+import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JPanel
+import javax.swing.JTextArea
 import javax.swing.SwingConstants
 import javax.swing.SwingUtilities
 
@@ -101,31 +105,43 @@ class PinnedPanel(
 	override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
 
 	private fun pinRow(entry: PinStore.PinnedEntry): JPanel {
-		val row = JPanel(BorderLayout()).apply {
-			border = JBUI.Borders.empty(2, 4)
-			maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(26))
-			alignmentX = Component.LEFT_ALIGNMENT
+		val hgap = JBUI.scale(4)
+
+		// Title wraps to the available width so long pins grow the row taller instead
+		// of clipping. JTextArea (not JBLabel) gives us word-wrapping; styled to read
+		// like a label.
+		val title = JTextArea(entry.title).apply {
+			isEditable = false
+			isFocusable = false
 			isOpaque = false
+			lineWrap = true
+			wrapStyleWord = true
+			border = JBUI.Borders.empty()
+			margin = JBUI.insets(0)
+			font = JBUI.Fonts.label()
+			foreground = JBColor.foreground()
 			cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
 		}
 
-		val left = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(4), 0)).apply { isOpaque = false }
 		// Conversation pins lead with the AI tool's real logo (badge = source name);
-		// other kinds keep their letter/tag pill.
+		// other kinds keep their letter/tag pill. Wrapped in a GridBag cell so the
+		// badge keeps its natural size and stays vertically centered as the row grows.
 		val sourceLogo = if (entry.kind == "conversations") JolliMemoryIcons.sourceLogo(entry.badge.lowercase()) else null
-		if (sourceLogo != null) {
-			left.add(JLabel(sourceLogo).apply { toolTipText = entry.badge })
+		val badge: JComponent = if (sourceLogo != null) {
+			JLabel(sourceLogo).apply { toolTipText = entry.badge }
 		} else {
-			left.add(BadgePill(entry.badge, badgeColor(entry)))
+			BadgePill(entry.badge, badgeColor(entry))
 		}
-		val title = JBLabel(entry.title).apply { minimumSize = Dimension(0, 0) }
-		left.add(title)
-		row.add(left, BorderLayout.CENTER)
+		val west = JPanel(GridBagLayout()).apply {
+			isOpaque = false
+			add(badge, GridBagConstraints())
+		}
 
 		// Hover actions, right edge: Open (eye) · Resume (play, Claude only) · Unpin.
 		val openBtn = actionIcon(JolliMemoryIcons.Eye, "Open") { openPinned(entry) }
 		val unpinBtn = actionIcon(AllIcons.Actions.Close, "Unpin") {
 			val dir = cwd() ?: return@actionIcon
+			ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_unpinned", mapOf("kind" to entry.kind))
 			ApplicationManager.getApplication().executeOnPooledThread {
 				PinStore.unpin(dir, entry.kind, entry.key)
 				refresh()
@@ -138,32 +154,86 @@ class PinnedPanel(
 		} else {
 			listOf(openBtn, unpinBtn)
 		}
-		val east = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(2), 0)).apply {
+		val iconsRow = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(2), 0)).apply {
 			isOpaque = false
 			actions.forEach { add(it) }
 		}
-		row.add(east, BorderLayout.EAST)
+		// Reserve the icons' full width up-front (measured while visible) so the title
+		// wrap width stays constant whether or not the row is hovered — no reflow when
+		// the icons appear. GridBag keeps the icons vertically centered as the row grows.
+		actions.forEach { it.isVisible = true }
+		val reservedIconsW = iconsRow.preferredSize.width
+		actions.forEach { it.isVisible = false }
+		val east = JPanel(GridBagLayout()).apply {
+			isOpaque = false
+			add(iconsRow, GridBagConstraints())
+			preferredSize = Dimension(reservedIconsW, JBUI.scale(16))
+			minimumSize = Dimension(reservedIconsW, 0)
+		}
 
+		// Row height follows the wrapped title at the row's actual width; the badge and
+		// icons stay vertically centered (BorderLayout WEST/EAST + GridBag).
+		val row = object : JPanel(BorderLayout(hgap, 0)) {
+			override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
+
+			override fun getPreferredSize(): Dimension {
+				val base = super.getPreferredSize()
+				val w = width
+				if (w <= 0) return base
+				val ins = insets
+				val titleW = (w - ins.left - ins.right - west.preferredSize.width - east.preferredSize.width - hgap * 2)
+					.coerceAtLeast(JBUI.scale(20))
+				// Sizing the text area to the available width makes its preferred height
+				// reflect the wrapped line count.
+				title.setSize(titleW, Short.MAX_VALUE.toInt())
+				val contentH = maxOf(title.preferredSize.height, west.preferredSize.height, JBUI.scale(16))
+				return Dimension(base.width, contentH + ins.top + ins.bottom)
+			}
+		}.apply {
+			border = JBUI.Borders.empty(2, 4)
+			alignmentX = Component.LEFT_ALIGNMENT
+			isOpaque = false
+			cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+			add(west, BorderLayout.WEST)
+			add(title, BorderLayout.CENTER)
+			add(east, BorderLayout.EAST)
+		}
+		// Recompute the wrapped height when the row's width changes (tool-window resize).
+		row.addComponentListener(object : java.awt.event.ComponentAdapter() {
+			override fun componentResized(e: java.awt.event.ComponentEvent) {
+				row.revalidate()
+			}
+		})
+
+		// Hover: reveal the action icons and paint a subtle highlight bar across the
+		// row (mirrors the Active Conversations rows). The row is transparent until
+		// hovered, then opaque with a translucent overlay.
+		fun setRowHovered(hovered: Boolean) {
+			row.isOpaque = hovered
+			row.background = if (hovered) RowStyle.HOVER_BG else null
+			actions.forEach { it.isVisible = hovered }
+			row.repaint()
+		}
 		val hover = object : MouseAdapter() {
-			override fun mouseEntered(e: MouseEvent) { actions.forEach { it.isVisible = true } }
+			override fun mouseEntered(e: MouseEvent) { setRowHovered(true) }
 			override fun mouseExited(e: MouseEvent) {
 				val src = e.source as Component
 				if (!src.isShowing || !row.isShowing) {
-					actions.forEach { it.isVisible = false }
+					setRowHovered(false)
 					return
 				}
 				val p = e.point
 				val screen = src.locationOnScreen.apply { translate(p.x, p.y) }
 				val loc = row.locationOnScreen
 				if (!java.awt.Rectangle(loc.x, loc.y, row.width, row.height).contains(screen)) {
-					actions.forEach { it.isVisible = false }
+					setRowHovered(false)
 				}
 			}
 		}
 		val click = object : MouseAdapter() {
 			override fun mouseClicked(e: MouseEvent) { openPinned(entry) }
 		}
-		for (c in listOf(row, left, title)) {
+		for (c in listOf(row, west, badge, title)) {
 			c.addMouseListener(hover)
 			c.addMouseListener(click)
 		}
@@ -189,6 +259,7 @@ class PinnedPanel(
 		val cwd = cwd() ?: return
 		val sessionId = entry.key.substringAfter(":")
 		if (sessionId.isNotBlank()) {
+			ai.jolli.jollimemory.core.telemetry.Telemetry.track("session_resumed", mapOf("source" to "claude"))
 			TerminalUtils.resumeClaudeSession(project, sessionId, cwd, "Claude – ${entry.title}")
 		}
 	}
@@ -276,6 +347,7 @@ class PinnedPanel(
 	}
 
 	private companion object {
+
 		// Mirrors ConversationRowComponent.SourceBadge colors.
 		val SOURCE_COLORS = mapOf(
 			"claude" to JBColor(Color(217, 119, 6), Color(217, 119, 6)),

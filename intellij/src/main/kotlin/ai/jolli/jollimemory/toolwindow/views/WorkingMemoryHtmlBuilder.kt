@@ -26,6 +26,12 @@ object WorkingMemoryHtmlBuilder {
         val insertions: Int,
         val deletions: Int,
         val detectedTicket: String?,
+        /**
+         * Heuristic preview of the commit title (ticket + humanized branch), shown
+         * before the AI writes the real one at commit time. Null when there's no
+         * useful signal — the view then shows an explanatory placeholder.
+         */
+        val proposedTitle: String?,
         val tokenLabel: String,
         val conversations: List<WmConversation>,
         val context: List<WmContext>,
@@ -90,10 +96,17 @@ object WorkingMemoryHtmlBuilder {
         val ticket = v.detectedTicket?.let {
             "<span>Detected&nbsp;ticket&nbsp;<b>${esc(it)}</b></span>"
         } ?: ""
+        // A heuristic preview when we have one; otherwise the honest "written at commit" note.
+        val titleHtml = if (v.proposedTitle != null) {
+            "<div class=\"wm-title-text\">${esc(v.proposedTitle)}</div>" +
+                "<div class=\"wm-title-note\">Preview — the AI writes the final message when you commit.</div>"
+        } else {
+            "<div class=\"wm-title-text\">An AI-written commit message is generated when you commit.</div>"
+        }
         return """
             <div class="wm-panel">
               <div class="wm-label">Proposed title <span class="wm-ai">AI</span></div>
-              <div class="wm-title-text">An AI-written commit message is generated when you commit.</div>
+              $titleHtml
               <div class="wm-grid">
                 <span>Target&nbsp;commit&nbsp;<b>next on ${esc(v.branch)}</b></span>
                 $ticket
@@ -223,7 +236,8 @@ object WorkingMemoryHtmlBuilder {
         .wm-panel { background: var(--panel-bg); border: 1px solid var(--widget-border); border-radius: 8px; padding: 10px 12px; margin: 0 0 12px; }
         .wm-label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-tertiary); margin-bottom: 4px; }
         .wm-ai { background: var(--pill-bg); color: var(--pill-text); border-radius: 5px; padding: 0 5px; font-size: 9.5px; font-weight: 700; margin-left: 4px; }
-        .wm-title-text { font-size: 13.5px; color: var(--text-primary); margin-bottom: 8px; }
+        .wm-title-text { font-size: 13.5px; color: var(--text-primary); margin-bottom: 4px; }
+        .wm-title-note { font-size: 11px; color: var(--text-tertiary); margin-bottom: 8px; }
         .wm-grid { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 11.5px; color: var(--text-secondary); }
         .wm-grid b { color: var(--text-primary); font-weight: 600; }
         .wm-tmeter { margin: 0 0 12px; }

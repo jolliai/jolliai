@@ -107,6 +107,9 @@ object JolliApiClient {
     /** Thrown when the server rejects the request due to outdated plugin version (HTTP 426). */
     class PluginOutdatedError(message: String) : RuntimeException(message)
 
+    /** Thrown when the server rejects the API key (HTTP 401/403) — invalid/disabled/wrong org. */
+    class UnauthorizedError(message: String) : RuntimeException(message)
+
     /** Thrown when the server returns 412 because the repo has no space binding yet. */
     class BindingRequiredError(
         val repoUrl: String,
@@ -137,25 +140,30 @@ object JolliApiClient {
         if (!key.startsWith("sk-jol-")) return null
 
         val rest = key.substring("sk-jol-".length)
-        val dotIndex = rest.indexOf('.')
-        if (dotIndex == -1) return null
+        // Old format `sk-jol-<32 hex chars>` has no embedded meta.
+        if (!rest.contains(".")) return null
 
-        return try {
-            // Base64 URL decode the metadata portion
-            val metaPart = rest.substring(0, dotIndex)
-            val decoder = Base64.getUrlDecoder()
-            val metaJson = String(decoder.decode(metaPart), Charsets.UTF_8)
-
-            @Suppress("UNCHECKED_CAST")
-            val meta = gson.fromJson(metaJson, Map::class.java) as Map<String, Any?>
-            val t = meta["t"] as? String ?: return null
-            val u = meta["u"] as? String ?: return null
-            val o = meta["o"] as? String
-
-            JolliApiKeyMeta(t = t, u = u, o = o)
-        } catch (_: Exception) {
-            null
+        // Scan EVERY dot-separated segment (not just the first) and return the first
+        // that base64url-decodes to JSON carrying string `t` + `u`. This handles both
+        // Format A (`sk-jol-<metaB64>.<secretB64>`, meta in segment 0) and Format B /
+        // JWT-shaped (`sk-jol-<headerB64>.<payloadB64>.<sigB64>`, meta in segment 1).
+        // Must stay in lockstep with the canonical parser in
+        // cli/src/core/JolliApiUtils.ts (and the VS Code bundle).
+        val decoder = Base64.getUrlDecoder()
+        for (segment in rest.split(".")) {
+            try {
+                val metaJson = String(decoder.decode(segment), Charsets.UTF_8)
+                @Suppress("UNCHECKED_CAST")
+                val meta = gson.fromJson(metaJson, Map::class.java) as? Map<String, Any?> ?: continue
+                val t = meta["t"] as? String ?: continue
+                val u = meta["u"] as? String ?: continue
+                val o = meta["o"] as? String
+                return JolliApiKeyMeta(t = t, u = u, o = o)
+            } catch (_: Exception) {
+                // Segment isn't valid base64url JSON — try the next one.
+            }
         }
+        return null
     }
 
     /**
@@ -544,6 +552,10 @@ object JolliApiClient {
                 throw PluginOutdatedError(
                     json["message"] as? String
                         ?: "Plugin version is outdated. Please update to the latest version."
+                )
+            } else if (statusCode == 401 || statusCode == 403) {
+                throw UnauthorizedError(
+                    json["error"] as? String ?: "Invalid or disabled API key"
                 )
             } else {
                 throw RuntimeException(

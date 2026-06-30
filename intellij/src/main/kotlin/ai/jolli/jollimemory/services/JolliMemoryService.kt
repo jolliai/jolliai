@@ -99,6 +99,18 @@ class JolliMemoryService(private val project: Project) : Disposable {
     private fun notifyListeners() { listeners.forEach { it() } }
 
     /**
+     * Listeners notified whenever a commit-selection toggle changes — a conversation
+     * or context checkbox ([CommitSelectionStore]) or an in-memory file selection in
+     * [ChangesPanel]. Kept separate from the status listeners so toggling a checkbox
+     * can refresh the open Working Memory review without forcing the sidebar panels to
+     * rebuild (which would, for files, reset their in-memory selection).
+     */
+    private val selectionListeners = CopyOnWriteArrayList<() -> Unit>()
+    fun addSelectionListener(listener: () -> Unit) { selectionListeners.add(listener) }
+    fun removeSelectionListener(listener: () -> Unit) { selectionListeners.remove(listener) }
+    fun notifySelectionChanged() { selectionListeners.forEach { it() } }
+
+    /**
      * Adds a sync-state listener. If a sync state has already been observed,
      * the listener is invoked immediately with it so late-registering panels
      * reflect the current state.
@@ -523,16 +535,39 @@ val sb = StringBuilder()
 
     fun getSummaryJson(commitHash: String): String? = reader?.getSummaryJson(commitHash)
 
+    /** Archived plan body (`plans/<slug>.md`) from committed-memory storage, or null. */
+    fun readArchivedPlan(slug: String): String? = reader?.readPlanBody(slug)
+
+    /** Archived markdown-note body (`notes/<id>.md`) from committed-memory storage, or null. */
+    fun readArchivedNote(id: String): String? = reader?.readNoteBody(id)
+
+    /** Stored committed conversation (by session) rendered as read-only markdown, or null. */
+    fun readCommittedConversationMarkdown(commitHash: String, sessionId: String): String? =
+        reader?.renderCommittedConversationMarkdown(commitHash, sessionId)
+
     fun getChangedFiles(): List<FileChange> {
         val output = git?.getStatus() ?: return emptyList()
-        return output.lines()
-            .filter { it.isNotBlank() && it.length > 3 }
-            .map { line ->
-                FileChange(
-                    relativePath = line.substring(3),
-                    statusCode = line.substring(0, 2).trim(),
-                )
-            }
+        // Parse the NUL-separated `git status -z` stream (mirrors VS Code's listFiles):
+        //   normal entry: <XY><space><path>; rename/copy adds the old path as the next segment.
+        val segments = output.split("\u0000")
+        val files = mutableListOf<FileChange>()
+        var i = 0
+        while (i < segments.size) {
+            val segment = segments[i]
+            if (segment.length < 3) { i++; continue }
+            val stagedCode = segment[0]
+            val unstagedCode = segment[1]
+            val resolvedPath = segment.substring(3)
+            // Rename/copy carries the original path in the next NUL segment — consume it.
+            if (stagedCode == 'R' || stagedCode == 'C') i++
+            // Belt-and-suspenders: skip any directory-shaped row (files-only list).
+            if (resolvedPath.endsWith("/")) { i++; continue }
+            // Single display code: the index column when staged, else the worktree column.
+            val code = if (stagedCode != ' ' && stagedCode != '?') stagedCode else unstagedCode
+            files.add(FileChange(relativePath = resolvedPath, statusCode = code.toString()))
+            i++
+        }
+        return files
     }
 
     fun getBranchCommits(): List<CommitSummaryBrief> {

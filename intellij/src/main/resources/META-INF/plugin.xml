@@ -1,4 +1,11 @@
-<idea-plugin>
+<!-- require-restart: even after releasing the static-singleton resources (see
+     JolliDynamicUnloadCleaner) the platform's dynamic unload still hangs on this
+     plugin's coroutine scope + project-service/NIO-watcher dispose ordering,
+     leaving the file index turned off and never turned back on (the IDE wedges in
+     perpetual "indexing"). Sandbox-verified. Until a full coroutine/lifecycle
+     refactor makes hot-unload provably clean, require a restart so enable/disable/
+     uninstall does one clean full reload instead of a fragile hot-unload. -->
+<idea-plugin require-restart="true">
     <id>ai.jolli.jollimemory</id>
     <name>Jolli Memory</name>
     <vendor url="https://jolli.ai" email="support@jolli.ai">Jolli</vendor>
@@ -14,6 +21,14 @@
 
     <depends>com.intellij.modules.platform</depends>
     <depends>Git4Idea</depends>
+
+    <!-- Release app-level (object-held) background resources before a dynamic
+         unload so they don't pin the plugin classloader. Lets the plugin be
+         enabled/disabled without an IDE restart. -->
+    <applicationListeners>
+        <listener class="ai.jolli.jollimemory.JolliDynamicUnloadCleaner"
+                  topic="com.intellij.ide.plugins.DynamicPluginListener"/>
+    </applicationListeners>
 
     <extensions defaultExtensionNs="com.intellij">
         <!-- Project-level service: manages hook installation and core library integration -->

@@ -5,6 +5,7 @@ import java.util.zip.ZipEntry
 import java.io.ByteArrayOutputStream
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicInteger
+import org.jetbrains.changelog.Changelog
 
 plugins {
     id("java")
@@ -12,10 +13,11 @@ plugins {
     id("org.jetbrains.intellij.platform") version "2.5.0"
     id("com.gradleup.shadow") version "9.0.0-beta12"
     id("org.jetbrains.kotlinx.kover") version "0.9.1"
+    id("org.jetbrains.changelog") version "2.2.1"
 }
 
 group = "ai.jolli"
-version = "0.99.2"
+version = "0.99.3"
 
 repositories {
     mavenCentral()
@@ -156,167 +158,16 @@ intellijPlatform {
                 by the background summary worker.
             </p>
         """.trimIndent()
-        changeNotes = """
-            <h3>0.99.2</h3>
-
-            <h4>New Features</h4>
-            <ul>
-                <li><b>Reference extraction</b> &mdash; automatically extracts Linear, Jira, GitHub, and
-                    Notion references from Claude and Codex transcripts and surfaces them in summaries.
-                    Includes per-source envelope parsers, a persistent <code>ReferenceStore</code>, and
-                    transcript-level discovery at both StopHook and post-commit time</li>
-                <li><b>References in Plans panel</b> &mdash; plan entries now show clickable
-                    "Open in &lt;Source&gt;" links instead of static source labels, with a Select All
-                    toolbar action</li>
-                <li><b>PR history strip</b> &mdash; the summary viewer shows previously merged or closed
-                    PRs for the same branch alongside the active PR. Uses <code>gh pr list --state all</code>
-                    so reopened or multi-PR branches no longer lose history</li>
-                <li><b>Conversation multi-select</b> &mdash; active conversation rows now have a checkbox
-                    ("Include in next memory") and a Select All toolbar action</li>
-            </ul>
-
-            <h4>Fixes &amp; Improvements</h4>
-            <ul>
-                <li>Removed periodic polling timer for branch updates; the tool window now updates on
-                    events only</li>
-                <li>Resolved JetBrains Marketplace Plugin Verifier internal-API warnings &mdash; plugin
-                    version and install path are derived from pure JVM APIs instead of
-                    <code>PluginManager</code></li>
-                <li>Commit selection state is now tracked via <code>CommitSelectionStore</code></li>
-            </ul>
-
-            <h3>0.99.1</h3>
-
-            <h4>New Features</h4>
-            <ul>
-                <li><b>Active Conversations</b> &mdash; a new panel showing in-progress AI agent
-                    sessions live, with inline transcript editing, message counts, and the ability
-                    to hide sessions</li>
-                <li><b>Knowledge Wiki</b> &mdash; build a browsable topic wiki from your Memory Bank
-                    via an LLM ingest pipeline. Trigger it with the <b>Build Knowledge Wiki</b> button
-                    or let it auto-compile after each commit; supports both Anthropic and Jolli
-                    summarization providers</li>
-                <li><b>Full-text search &amp; MCP server</b> &mdash; search across all memories, plus
-                    an MCP server that exposes your memory to AI tools, with ingest-phase progress UI</li>
-                <li><b>Full vault sync pipeline</b> &mdash; sync your Memory Bank to your Jolli space
-                    with live UI feedback, a space-binding dialog, and binding-required (412) handling</li>
-                <li><b>Quick Recap</b> &mdash; generate, regenerate, and edit a branch recap section</li>
-                <li><b>Memory scope filter</b> &mdash; filter the Memories panel by scope; auto-refreshes
-                    on branch switch</li>
-                <li><b>Discard selected</b> &mdash; discard multiple selected files at once in the
-                    Changes panel</li>
-                <li><b>"Push to Jolli" is now "Share in Jolli"</b> &mdash; the cloud-publish button is
-                    relabeled across all surfaces. Behavior is unchanged; only the label was updated</li>
-            </ul>
-
-            <h4>UI</h4>
-            <ul>
-                <li><b>Tool window redesign</b> &mdash; breadcrumb navigation and foreign-mode support</li>
-                <li><b>Summary panel redesign</b> &mdash; realigned to match the VS Code layout</li>
-                <li><b>LLM provider attribution</b> &mdash; summary footers now show which provider
-                    generated the summary</li>
-            </ul>
-
-            <h4>Fixes &amp; Improvements</h4>
-            <ul>
-                <li>Fixed Jolli API key clearing not triggering the status indicator, and not saving
-                    as <code>null</code> when cleared</li>
-                <li>Fixed SSH/HTTPS remote mismatch that split Memory Banks and created duplicate repo
-                    entries; repo identity is now canonicalized on merge</li>
-                <li>Fixed Migrate-to-Memory-Bank creating duplicate repo folders; consolidated onto the
-                    base folder name</li>
-                <li>Auto-clear stale sync-status badges in the status bar</li>
-                <li>Windows: mark the <code>.jolli</code> directory as hidden, fix path-separator drift
-                    in the storage layer, and fix the build &amp; test suite</li>
-                <li>Fixed SQLite JDBC driver loading</li>
-                <li>Fixed a stderr deadlock and refined the sync poll interval</li>
-                <li>Fixed OnboardingPanel font rendering and added an API key help tooltip</li>
-                <li>Added <code>client_version</code> to OAuth login URLs</li>
-            </ul>
-
-            <h3>0.99.0</h3>
-
-            <h4>Memory Bank</h4>
-            <ul>
-                <li><b>Memory Bank</b> &mdash; a new local storage layer that keeps human-readable
-                    Markdown summaries, plans, and notes alongside canonical JSON in a user-configurable
-                    folder. Summaries are dual-written to both the git orphan branch (system of record)
-                    and the Memory Bank folder by default</li>
-                <li><b>Memory Bank explorer</b> &mdash; browse your Memory Bank as a tree view in the
-                    tool window with commit/plan/note badges, double-click to open the formatted summary
-                    viewer. Supports file operations (New Folder, File, Import, Rename, Move, Delete) and
-                    drag-and-drop</li>
-                <li><b>Auto-migration</b> &mdash; existing orphan branch data is automatically migrated
-                    to the Memory Bank folder on plugin startup</li>
-            </ul>
-
-            <h4>AI Agent Support</h4>
-            <ul>
-                <li><b>Claude Code</b> &mdash; StopHook after each response, SessionStartHook briefing at startup</li>
-                <li><b>Gemini CLI</b> &mdash; AfterAgent hook after each agent completion</li>
-                <li><b>Codex CLI</b> &mdash; automatic filesystem discovery, no hook needed</li>
-                <li><b>OpenCode</b> &mdash; session discovery via SQLite database scan</li>
-                <li><b>Cursor IDE</b> &mdash; Composer session discovery via SQLite database scan</li>
-                <li><b>GitHub Copilot CLI &amp; Copilot Chat</b> &mdash; session discovery via filesystem scan</li>
-            </ul>
-
-            <h4>Settings &amp; Setup</h4>
-            <ul>
-                <li><b>Simplified setup flow</b> &mdash; hooks auto-install on credential save and
-                    auto-remove on credential clear; no separate Enable/Disable step</li>
-                <li><b>Onboarding screen</b> &mdash; detects existing API keys (config or
-                    <code>ANTHROPIC_API_KEY</code> env var) and skips onboarding automatically</li>
-                <li><b>Tabbed Settings dialog</b> &mdash; reorganized into five tabs: General,
-                    AI Agents, AI Summary, Sync to Jolli, and Memory Bank</li>
-                <li><b>AI Summary provider selection</b> &mdash; choose between Anthropic and Jolli
-                    as the summarization provider</li>
-                <li><b>Pause toggle</b> &mdash; temporarily disable hooks without losing configuration</li>
-            </ul>
-
-            <h4>Plugin Distribution</h4>
-            <ul>
-                <li><b>Reduced plugin size</b> &mdash; stripped unused platform natives from sqlite-jdbc
-                    (FreeBSD, Android, ARM32, RISC-V, ppc64) and deduplicated the sqlite-jdbc dependency
-                    between the plugin and hooks JAR. Plugin zip reduced from 31 MB to 7 MB</li>
-                <li><b>Quality improvements</b> &mdash; resolved JetBrains Marketplace internal API
-                    warnings, fixed binary compatibility issues across IntelliJ versions, improved UI
-                    layout and panel management, fixed encoding issues, and added Plugin Verifier to CI</li>
-            </ul>
-
-            <h3>0.97.9</h3>
-            <ul>
-                <li><b>Privacy consent notice</b> &mdash; display a privacy notice with link to privacy
-                    policy at the top of the Settings page, satisfying JetBrains Marketplace guideline
-                    2.2 for explicit user consent before data processing</li>
-            </ul>
-
-            <h3>0.97.0</h3>
-            <ul>
-                <li><b>Initial IntelliJ plugin release</b> &mdash; pure Kotlin port of the VS Code extension</li>
-                <li><b>Four-panel tool window</b>: STATUS, PLANS &amp; NOTES, CHANGES, COMMITS in a right
-                    sidebar with collapsible panels</li>
-                <li><b>AI Commit</b> &mdash; generate commit messages from staged diffs using Anthropic API</li>
-                <li><b>Squash</b> &mdash; squash selected commits with LLM-generated combined message and
-                    automatic memory merging</li>
-                <li><b>Push</b> &mdash; git push with force-push confirmation dialog</li>
-                <li><b>View Summary</b> &mdash; JCEF-based HTML viewer for commit summaries with dark/light
-                    theme support</li>
-                <li><b>Plans &amp; Notes</b> &mdash; auto-detect Claude Code plans, add custom notes
-                    (Markdown files or text snippets)</li>
-                <li><b>Hook installation</b> &mdash; pure Kotlin file I/O, no Node.js; installs git hooks
-                    and Claude Code stop hook</li>
-                <li><b>Standalone hooks JAR</b> &mdash; git hooks run as <code>jollimemory-hooks.jar</code>
-                    fat JAR outside the IDE</li>
-                <li><b>Orphan branch storage</b> &mdash; summaries stored in
-                    <code>jollimemory/summaries/v3</code> with tree-hash aliases</li>
-                <li><b>Push to Jolli Space</b> &mdash; publish summaries to team knowledge base via API</li>
-                <li><b>Create &amp; Update PR</b> &mdash; GitHub PR management via <code>gh</code> CLI
-                    with summary markers</li>
-                <li><b>Settings page</b> &mdash; Anthropic API key, model selection, Jolli API key at
-                    Settings &gt; Tools &gt; Jolli Memory</li>
-                <li><b>Compatibility</b>: IntelliJ IDEA 2024.3+ (build 243&ndash;262.*)</li>
-            </ul>
-        """.trimIndent()
+        // Source the marketplace "What's New" from CHANGELOG.md (single source of
+        // truth). Render every released section so the full history ships with each build.
+        changeNotes = provider {
+            changelog.getAll().values.joinToString("\n") { item ->
+                changelog.renderItem(
+                    item.withHeader(true).withEmptySections(false),
+                    Changelog.OutputType.HTML,
+                )
+            }
+        }
         vendor {
             name = "Jolli"
             url = "https://jolli.ai"
@@ -687,4 +538,17 @@ tasks {
             }),
         )
     }
+}
+
+// Changelog config: CHANGELOG.md is the single source of truth for the
+// marketplace change notes (rendered into patchPluginXml.changeNotes above).
+// Headers are bare "## <version>"; sections use custom group names, so we
+// disable the standard-group templating.
+changelog {
+    version = project.version.toString()
+    path = file("CHANGELOG.md").canonicalPath
+    header = provider { version.get() }
+    headerParserRegex = """(\d+\.\d+\.\d+)""".toRegex()
+    groups = emptyList()
+    keepUnreleasedSection = false
 }

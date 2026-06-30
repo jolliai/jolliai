@@ -160,6 +160,14 @@ object PostCommitHook {
             log.info("Step 4: Loading sessions")
             val allSessions = SessionTracker.loadAllSessions(cwd).toMutableList()
 
+            // On-demand discovery: Codex (filesystem scan, no hook). Codex has no
+            // Stop/Session hook, so without this scan a Codex-only memory finds no
+            // sessions and is silently skipped at commit time. Mirrors the CLI worker
+            // and the sidebar aggregator, which both discover Codex this way.
+            if (config.codexEnabled != false && CodexSessionDiscoverer.isCodexInstalled()) {
+                allSessions.addAll(CodexSessionDiscoverer.discoverSessions())
+            }
+
             // On-demand discovery: OpenCode (SQLite-backed, no hook)
             if (config.openCodeEnabled != false && OpenCodeSupport.isOpenCodeInstalled()) {
                 allSessions.addAll(OpenCodeSupport.discoverSessions(cwd).sessions)
@@ -417,6 +425,50 @@ object PostCommitHook {
             val branch = git.getCurrentBranch() ?: "unknown"
             val commitType = detectCommitType()
 
+            // 8d. Detect uncommitted notes on this branch, archive, and attach to the summary.
+            //     Mirrors the plan path (8b): the note body is written through the StorageProvider
+            //     (so it dual-writes to the orphan branch AND the Memory Bank folder), a
+            //     NoteReference goes into the summary so the committed memory shows it, and the
+            //     registry row is later stamped committed (finalizeNoteArchive) so it clears from
+            //     the CONTEXT panel. Excluded notes and notes from other branches stay pending.
+            val noteRefs = mutableListOf<NoteReference>()
+            val noteFilesToStore = mutableListOf<FileWrite>()
+            val noteGuards = mutableListOf<Pair<String, String>>() // id -> contentHashAtCommit
+            val snippetFilesToDelete = mutableListOf<String>()
+            run {
+                val noteNow = Instant.now().toString()
+                val shortHash = commitInfo.hash.take(8)
+                val uncommittedNotes = detectUncommittedNotes(cwd, branch, exclusions.notes)
+                if (uncommittedNotes.isNotEmpty()) {
+                    log.info("Detected %d uncommitted note(s): %s", uncommittedNotes.size, uncommittedNotes.keys.joinToString(", "))
+                    for ((id, entry) in uncommittedNotes) {
+                        try {
+                            val sourcePath = entry.sourcePath
+                            if (sourcePath == null || !File(sourcePath).exists()) {
+                                log.warn("Note archive: source file missing for %s — skipping", id)
+                                continue
+                            }
+                            val content = File(sourcePath).readText(Charsets.UTF_8)
+                            val newId = "$id-$shortHash"
+                            noteFilesToStore.add(FileWrite("notes/$newId.md", content))
+                            noteRefs.add(NoteReference(
+                                id = newId,
+                                title = entry.title,
+                                format = entry.format,
+                                content = if (entry.format == NoteFormat.snippet) content else null,
+                                addedAt = entry.addedAt,
+                                updatedAt = noteNow,
+                            ))
+                            noteGuards.add(id to sha256Hex(content))
+                            if (entry.format == NoteFormat.snippet) snippetFilesToDelete.add(sourcePath)
+                            log.info("Note snapshot captured: %s → %s", id, newId)
+                        } catch (e: Exception) {
+                            log.warn("Note archive failed for %s (non-fatal, skipping): %s", id, e.message)
+                        }
+                    }
+                }
+            }
+
             // Build stored sessions first so we can aggregate this commit's
             // coding-session token usage from their per-message usage.
             val storedSessions = sessionTranscripts.map { st ->
@@ -445,6 +497,7 @@ object PostCommitHook {
                 ticketId = summaryResult.ticketId,
                 recap = summaryResult.recap,
                 plans = planRefs.takeIf { it.isNotEmpty() },
+                notes = noteRefs.takeIf { it.isNotEmpty() },
                 references = referenceCommitRefs.takeIf { it.isNotEmpty() },
             )
 
@@ -458,10 +511,21 @@ object PostCommitHook {
                 referenceFiles = referenceFilesToStore.takeIf { it.isNotEmpty() },
             )
 
+            // Persist note bodies through the StorageProvider so they dual-write to the
+            // orphan branch and the Memory Bank folder, then stamp/clean up the registry.
+            if (noteFilesToStore.isNotEmpty()) {
+                store.storeNoteFiles(noteFilesToStore, "Associate notes with commit ${commitInfo.hash.take(8)}")
+            }
+
             // Finalize: delete archived references from plans.json + local markdown
             // (only if updatedAt matches — a re-upsert during this window preserves the fresh row)
             if (referenceCommitted.isNotEmpty()) {
                 finalizeReferenceArchive(referenceCommitted, cwd)
+            }
+            // Finalize notes: stamp the original rows committed (so they clear from CONTEXT)
+            // and delete the now-archived snippet files.
+            if (noteGuards.isNotEmpty() || snippetFilesToDelete.isNotEmpty()) {
+                finalizeNoteArchive(noteGuards, commitInfo.hash, snippetFilesToDelete, cwd)
             }
             log.info("=== PostCommitHook worker finished successfully for %s ===", commitInfo.hash.take(8))
 
@@ -618,6 +682,58 @@ object PostCommitHook {
         val registry = SessionTracker.loadPlansRegistry(cwd)
         return registry.references ?: emptyMap()
     }
+
+    /**
+     * Notes eligible to be captured by this commit: uncommitted, not ignored, on the
+     * current branch (legacy blank-branch rows allowed), and not excluded via the
+     * sidebar checkbox. Mirrors the CONTEXT panel's note visibility so what the user
+     * sees cleared is exactly what gets committed.
+     */
+    private fun detectUncommittedNotes(cwd: String, branch: String, excluded: Set<String>): Map<String, NoteEntry> {
+        val registry = SessionTracker.loadPlansRegistry(cwd)
+        return (registry.notes ?: emptyMap()).filter { (id, entry) ->
+            entry.commitHash == null &&
+                entry.ignored != true &&
+                (entry.branch.isBlank() || entry.branch == branch) &&
+                id !in excluded
+        }
+    }
+
+    /**
+     * Stamps each captured note's registry row as committed (commitHash +
+     * contentHashAtCommit) so `PlansPanel.filterNotes` hides it, and deletes the
+     * now-archived snippet source files. Stamping skips a row that became committed
+     * or was edited since capture (commitHash already set), so a concurrent change
+     * is never clobbered.
+     */
+    private fun finalizeNoteArchive(
+        guards: List<Pair<String, String>>,
+        commitHash: String,
+        snippetFilesToDelete: List<String>,
+        cwd: String,
+    ) {
+        if (guards.isNotEmpty()) {
+            val now = Instant.now().toString()
+            val fresh = SessionTracker.loadPlansRegistry(cwd)
+            val notes = (fresh.notes ?: emptyMap()).toMutableMap()
+            for ((id, contentHash) in guards) {
+                val entry = notes[id] ?: continue
+                if (entry.commitHash != null) continue
+                notes[id] = entry.copy(commitHash = commitHash, updatedAt = now, contentHashAtCommit = contentHash)
+            }
+            SessionTracker.savePlansRegistry(fresh.copy(notes = notes.takeIf { it.isNotEmpty() }), cwd)
+        }
+        for (path in snippetFilesToDelete) {
+            try { File(path).delete() } catch (_: Exception) { /* best-effort */ }
+        }
+        log.info("Note finalize: stamped %d note(s), removed %d snippet file(s)", guards.size, snippetFilesToDelete.size)
+    }
+
+    /** Lowercase hex SHA-256 of a string — used for the note archive guard. */
+    private fun sha256Hex(s: String): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(s.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
 
     /**
      * Deletes archived references from plans.json + local markdown.

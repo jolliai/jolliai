@@ -132,6 +132,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         if (!service.isInitialized) {
             service.initialize()
         }
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track("toolwindow_opened", mapOf("view" to "current"))
 
         // Listen for .git removal — switch back to placeholder when detected.
         // Two detection paths: VCS config change (rm -rf .git) and service error (git command failure).
@@ -201,6 +202,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         // rather than taking an equal share of the accordion's surplus space.
         val pinnedCollapsible = CollapsiblePanel(
             "PINNED", "JolliMemory.PinnedActions", pinnedPanel, fitContent = true,
+            titleIcon = AllIcons.General.Pin_tab,
         )
         val currentMemoryCollapsible = CollapsiblePanel(
             "WORKING MEMORY", "JolliMemory.CurrentMemoryActions", currentMemoryPanel,
@@ -296,7 +298,15 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
                 setStatusShown(state)
             }
         }
-        toolWindow.setTitleActions(listOf(agentsAction, settingsAction, statusAction, CloudSyncAction()))
+        // "Agent Access" is a coming-soon stub — keep it out of the title bar until
+        // it does something (the action object stays defined so re-enabling is a flag flip).
+        val titleActions = buildList {
+            if (FeatureFlags.SHOW_UNFINISHED) add(agentsAction)
+            add(settingsAction)
+            add(statusAction)
+            add(CloudSyncAction())
+        }
+        toolWindow.setTitleActions(titleActions)
 
         // Breadcrumb header: repo/branch selectors (icon buttons now live in the title bar)
         val breadcrumb = BreadcrumbHeaderPanel(
@@ -318,6 +328,10 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         val viewSwitch = ViewSwitchPanel { view ->
             // Switching views replaces the status card with a real view card.
             statusShown = false
+            ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+                "view_switched",
+                mapOf("view" to view.name.lowercase()),
+            )
             when (view) {
                 ViewSwitchPanel.View.CURRENT -> {
                     contentCardLayout.show(contentCards, CARD_ACCORDION)
@@ -418,6 +432,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
                 if (!hasCredentials) {
                     ApplicationManager.getApplication().executeOnPooledThread {
                         service.uninstall()
+                        ai.jolli.jollimemory.core.telemetry.Telemetry.track("surface_disabled", mapOf("trigger" to "auto_signout"))
                         service.refreshStatus()
                     }
                 }
@@ -434,22 +449,25 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         }
 
         // Single content — breadcrumb stays visible across accordion/KB views
+        // Hoisted so the breadcrumb message-bus connection below can also be tied to
+        // it — a project.messageBus.connect() with no parent Disposable would keep its
+        // plugin-class handler subscribed after a dynamic unload and pin the classloader.
+        val contentDisposable = Disposer.newDisposable("JolliMemoryContent")
+        Disposer.register(contentDisposable, onboardingPanel)
+        Disposer.register(contentDisposable, factoryAuthDisposable)
+        Disposer.register(contentDisposable, statusListenerDisposable)
+        Disposer.register(contentDisposable, syncViewDisposable)
+        Disposer.register(contentDisposable, statusPanel)
+        Disposer.register(contentDisposable, plansPanel)
+        Disposer.register(contentDisposable, changesPanel)
+        Disposer.register(contentDisposable, commitsPanel)
+        Disposer.register(contentDisposable, conversationsPanel)
+        Disposer.register(contentDisposable, pinnedPanel)
+        Disposer.register(contentDisposable, currentMemoryPanel)
+        Disposer.register(contentDisposable, kbPanel)
         val content = ContentFactory.getInstance().createContent(rootPanel, "", false).apply {
             isCloseable = false
-            setDisposer(Disposer.newDisposable("JolliMemoryContent").also { parentDisposable ->
-                Disposer.register(parentDisposable, onboardingPanel)
-                Disposer.register(parentDisposable, factoryAuthDisposable)
-                Disposer.register(parentDisposable, statusListenerDisposable)
-                Disposer.register(parentDisposable, syncViewDisposable)
-                Disposer.register(parentDisposable, statusPanel)
-                Disposer.register(parentDisposable, plansPanel)
-                Disposer.register(parentDisposable, changesPanel)
-                Disposer.register(parentDisposable, commitsPanel)
-                Disposer.register(parentDisposable, conversationsPanel)
-                Disposer.register(parentDisposable, pinnedPanel)
-                Disposer.register(parentDisposable, currentMemoryPanel)
-                Disposer.register(parentDisposable, kbPanel)
-            })
+            setDisposer(contentDisposable)
         }
 
         // Update breadcrumb on branch switch — multiple detection paths
@@ -459,7 +477,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         }
 
         // Path 1: IntelliJ git repository change event
-        val branchUpdateConnection = project.messageBus.connect()
+        val branchUpdateConnection = project.messageBus.connect(contentDisposable)
         branchUpdateConnection.subscribe(
             GitRepository.GIT_REPO_CHANGE,
             GitRepositoryChangeListener { updateBreadcrumbBranch() },

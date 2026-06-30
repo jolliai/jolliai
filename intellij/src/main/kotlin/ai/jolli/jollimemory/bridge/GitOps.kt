@@ -207,9 +207,15 @@ class GitOps(private val projectDir: String) {
         return exec("rev-parse", "HEAD")
     }
 
-    /** Get git status in porcelain format (preserves leading spaces in status codes). */
+    /**
+     * Get git status in NUL-separated porcelain format (preserves leading spaces in
+     * status codes). `-uall` lists every file inside a freshly created directory
+     * individually instead of collapsing them into one `?? dir/` row; `-z` makes
+     * entries NUL-separated so paths with spaces and rename pairs parse unambiguously.
+     * Mirrors the VS Code bridge's `listFiles` flags.
+     */
     fun getStatus(): String? {
-        return exec("status", "--porcelain=v1", trim = false)
+        return exec("status", "-z", "--porcelain=v1", "-uall", trim = false)
     }
 
     /**

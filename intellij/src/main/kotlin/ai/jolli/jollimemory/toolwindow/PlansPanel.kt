@@ -14,14 +14,11 @@ import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
-import com.intellij.ui.components.JBList
-import com.intellij.ui.components.JBScrollPane
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
 import java.awt.Color
@@ -33,42 +30,38 @@ import java.awt.FlowLayout
 import java.awt.Font
 import java.awt.Graphics
 import java.awt.Graphics2D
+import java.awt.Rectangle
 import java.awt.RenderingHints
-import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import java.awt.font.TextAttribute
 import java.io.File
 import java.net.URI
 import javax.swing.Box
 import javax.swing.BoxLayout
-import javax.swing.DefaultListModel
-import java.awt.font.TextAttribute
 import javax.swing.JComponent
 import javax.swing.JLabel
-import javax.swing.JList
+import javax.swing.JTextArea
 import javax.swing.JMenuItem
 import javax.swing.JOptionPane
 import javax.swing.JPanel
 import javax.swing.JPopupMenu
 import javax.swing.JSeparator
 import javax.swing.JWindow
-import javax.swing.KeyStroke
-import javax.swing.ListCellRenderer
-import javax.swing.ListSelectionModel
 import javax.swing.SwingConstants
 import javax.swing.SwingUtilities
 import javax.swing.Timer
 import javax.swing.UIManager
 
 /**
- * Plans & Notes panel — shows Claude Code plan files and user-created notes.
- * Matches VS Code PlansTreeProvider: merges plans and notes into a single
- * list sorted by lastModified (newest first).
+ * Plans & Notes panel ("CONTEXT") — shows Claude Code plan files, user notes and
+ * references. Merges them into a single list sorted by lastModified (newest first).
  *
- * Plans are tracked in .jolli/jollimemory/plans.json by the StopHook.
- * Notes are stored in .jolli/jollimemory/notes/ directory.
- * Each item shows title, icon (plan/note type), edit count or format, and commit association.
- * Double-click to open in editor.
+ * Rows are individual [JPanel]s (one per item), mirroring [ConversationRowComponent]
+ * and the Files panel: each row word-wraps its title and grows taller as the window
+ * narrows, with a hover highlight bar, hand cursor and per-row hover actions. (This
+ * replaced an earlier JBList, whose cached cell heights made wrapping/auto-height
+ * unreliable on resize.)
  */
 class PlansPanel(
     private val project: Project,
@@ -94,16 +87,9 @@ class PlansPanel(
         )
     }
 
-    private val listModel = DefaultListModel<ListItem>()
-    private val cellRenderer = PlansAndNotesCellRenderer()
-    private val itemList = JBList(listModel).apply {
-        cellRenderer = this@PlansPanel.cellRenderer
-        selectionMode = ListSelectionModel.SINGLE_SELECTION
-    }
-
     // ─── Sticky hover popup (JWindow, same pattern as CommitsPanel) ──────
     private var hoverPopup: JWindow? = null
-    private var hoverIndex: Int = -1
+    private var hoverAnchor: Component? = null
     private var hoverShowTimer: Timer? = null
     private val hoverDismissTimer = Timer(HOVER_HIDE_GRACE_MS) { dismissHoverPopup() }.apply { isRepeats = false }
 
@@ -125,13 +111,10 @@ class PlansPanel(
     private var excludedPlans: Set<String> = emptySet()
     private var excludedNotes: Set<String> = emptySet()
 
-    /** Row index whose hover actions (pin/edit/delete) are currently shown. */
-    private var actionHoverIndex: Int = -1
-
     /** Full item list + expand state for the 6-row cap ("Show N more"). */
     private var allContextItems: List<ListItem> = emptyList()
     private var contextExpanded = false
-    private val northStack = JPanel().apply {
+    private val rowsPanel = JPanel().apply {
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
         isOpaque = false
     }
@@ -139,117 +122,9 @@ class PlansPanel(
     private val statusListener: () -> Unit = { SwingUtilities.invokeLater { refresh() } }
 
     init {
-        border = JBUI.Borders.empty(8)
-
-        // Row interaction. Left→right zones: [checkbox] [tag] [title] … [pin][edit][delete].
-        // The pin/edit/delete actions render only on the hovered row.
-        itemList.addMouseListener(object : MouseAdapter() {
-            override fun mouseClicked(e: MouseEvent) {
-                val index = itemList.locationToIndex(e.point)
-                if (index < 0) return
-                val cellBounds = itemList.getCellBounds(index, index) ?: return
-                val item = listModel.getElementAt(index)
-
-                // Action zone (right edge): pin | edit | toggle (left→right).
-                val offsetFromRight = (cellBounds.x + cellBounds.width) - e.x
-                if (e.clickCount == 1 && offsetFromRight in 0..cellRenderer.getActionsWidth()) {
-                    val slot = cellRenderer.getActionSlotWidth()
-                    when {
-                        offsetFromRight <= slot -> toggleExclusion(item) // select toggle (✕/＋)
-                        offsetFromRight <= slot * 2 -> openItem(item) // edit
-                        else -> pinItem(item) // pin
-                    }
-                    return
-                }
-
-                if (e.clickCount == 2) openItem(item)
-            }
-        })
-
-        // Hover: reveal the action icons on the hovered row + hand cursor over click zones.
-        itemList.addMouseMotionListener(object : MouseAdapter() {
-            override fun mouseMoved(e: MouseEvent) {
-                val index = itemList.locationToIndex(e.point)
-                val cellBounds = if (index >= 0) itemList.getCellBounds(index, index) else null
-                if (cellBounds != null && cellBounds.contains(e.point)) {
-                    if (index != actionHoverIndex) {
-                        val old = actionHoverIndex
-                        actionHoverIndex = index
-                        repaintRow(old)
-                        repaintRow(index)
-                    }
-                    val offsetFromRight = (cellBounds.x + cellBounds.width) - e.x
-                    val overActions = offsetFromRight in 0..cellRenderer.getActionsWidth()
-                    itemList.cursor = if (overActions) {
-                        Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-                    } else {
-                        Cursor.getDefaultCursor()
-                    }
-                    if (index != hoverIndex || hoverPopup?.isVisible != true) {
-                        scheduleShowHoverPopup(index)
-                    }
-                    return
-                }
-                itemList.cursor = Cursor.getDefaultCursor()
-                clearActionHover()
-                scheduleHoverDismiss()
-            }
-        })
-
-        // Dismiss hover popup + action icons when mouse leaves the list
-        itemList.addMouseListener(object : MouseAdapter() {
-            override fun mouseExited(e: MouseEvent) {
-                clearActionHover()
-                scheduleHoverDismiss()
-            }
-        })
-
-        // Right-click context menu with "Remove" option
-        itemList.addMouseListener(object : MouseAdapter() {
-            override fun mousePressed(e: MouseEvent) { maybeShowPopup(e) }
-            override fun mouseReleased(e: MouseEvent) { maybeShowPopup(e) }
-
-            private fun maybeShowPopup(e: MouseEvent) {
-                if (!e.isPopupTrigger) return
-                val index = itemList.locationToIndex(e.point)
-                if (index < 0) return
-                itemList.selectedIndex = index
-                val selected = itemList.selectedValue ?: return
-                val popup = JPopupMenu()
-
-                if (selected is ListItem.ReferenceItem) {
-                    val previewItem = JMenuItem("Preview", JolliMemoryIcons.Eye)
-                    previewItem.addActionListener { openReference(selected.ref) }
-                    popup.add(previewItem)
-
-                    if (selected.ref.url.isNotBlank()) {
-                        val openItem = JMenuItem("Open in Browser", JolliMemoryIcons.Globe)
-                        openItem.addActionListener { openReferenceInBrowser(selected.ref.url) }
-                        popup.add(openItem)
-                    }
-
-                    popup.add(JSeparator())
-                }
-
-                val removeItem = JMenuItem("Remove", JolliMemoryIcons.Trash)
-                removeItem.addActionListener { removeSelectedItem() }
-                popup.add(removeItem)
-                popup.show(itemList, e.x, e.y)
-            }
-        })
-
-        // Delete / Backspace key to remove selected item
-        itemList.registerKeyboardAction(
-            { removeSelectedItem() },
-            KeyStroke.getKeyStroke(KeyEvent.VK_DELETE, 0),
-            JComponent.WHEN_FOCUSED,
-        )
-        itemList.registerKeyboardAction(
-            { removeSelectedItem() },
-            KeyStroke.getKeyStroke(KeyEvent.VK_BACK_SPACE, 0),
-            JComponent.WHEN_FOCUSED,
-        )
-
+        // Match PINNED's container insets (empty(2,4)) so all sections share the same
+        // first-row/last-row edge gaps. Each row adds empty(2,4) → 4px edge, 8px sides.
+        border = JBUI.Borders.empty(2, 4)
         service.addStatusListener(statusListener)
         ApplicationManager.getApplication().executeOnPooledThread { refreshFromDisk() }
     }
@@ -259,12 +134,11 @@ class PlansPanel(
     }
 
     /**
-     * Prompts the user to confirm removal of the selected plan or note.
-     * Plans are soft-deleted (ignored: true); notes are fully removed from
+     * Prompts the user to confirm removal of a plan / note / reference.
+     * Plans are soft-deleted (ignored: true); notes/references are removed from
      * the registry (matching VS Code semantics).
      */
-    private fun removeSelectedItem() {
-        val selected = itemList.selectedValue ?: return
+    private fun removeItem(selected: ListItem) {
         val (itemType, itemName) = when (selected) {
             is ListItem.PlanItem -> "plan" to (selected.plan.title.ifBlank { selected.plan.slug })
             is ListItem.NoteItem -> "note" to selected.note.title
@@ -365,18 +239,19 @@ class PlansPanel(
         }
     }
 
-    /** Toggles include/exclude for any item kind (checkbox click). */
+    /** Toggles include/exclude for any item kind (select toggle click). */
     private fun toggleExclusion(item: ListItem) {
         val (kind, key) = kindKeyOf(item)
         val nowExcluded = !isExcluded(item)
         val cwd = service.mainRepoRoot ?: project.basePath ?: return
         ApplicationManager.getApplication().executeOnPooledThread {
             CommitSelectionStore.setExcluded(cwd, kind, key, nowExcluded)
+            service.notifySelectionChanged()
             val ex = CommitSelectionStore.readExclusions(cwd)
             excludedReferences = ex.references
             excludedPlans = ex.plans
             excludedNotes = ex.notes
-            SwingUtilities.invokeLater { itemList.repaint() }
+            SwingUtilities.invokeLater { renderList() }
         }
     }
 
@@ -403,31 +278,19 @@ class PlansPanel(
             }
         }
         val cwd = service.mainRepoRoot ?: project.basePath ?: return
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_pinned", mapOf("kind" to kind))
         ApplicationManager.getApplication().executeOnPooledThread {
             PinStore.pin(cwd, kind, key, title, badge)
             SwingUtilities.invokeLater { service.panelRegistry?.pinnedPanel?.refresh() }
         }
     }
 
-    /** Opens an item in its editor / detail view (edit hover action, double-click). */
+    /** Opens an item in its editor / detail view (edit hover action, row click). */
     private fun openItem(item: ListItem) {
         when (item) {
             is ListItem.PlanItem -> openPlan(item.plan)
             is ListItem.NoteItem -> openNote(item.note)
             is ListItem.ReferenceItem -> openReference(item.ref)
-        }
-    }
-
-    private fun repaintRow(index: Int) {
-        if (index < 0) return
-        itemList.getCellBounds(index, index)?.let { itemList.repaint(it) }
-    }
-
-    private fun clearActionHover() {
-        if (actionHoverIndex != -1) {
-            val old = actionHoverIndex
-            actionHoverIndex = -1
-            repaintRow(old)
         }
     }
 
@@ -557,16 +420,15 @@ class PlansPanel(
         revalidate(); repaint()
     }
 
-
     private fun updateList(items: List<ListItem>) {
         allContextItems = items
         renderList()
     }
 
     /**
-     * Renders the list without an inner scrollbar, showing at most [CappedRows.CAP]
-     * rows; the rest collapse behind a "Show N more" row below the list. Current
-     * Memory provides a single scrollbar across all three sections.
+     * Renders the rows without an inner scrollbar, showing at most [CappedRows.CAP]
+     * rows; the rest collapse behind a "Show N more" row below. Current Memory
+     * provides a single scrollbar across all three sections.
      */
     private fun renderList() {
         onRowCountChanged?.invoke(allContextItems.size)
@@ -582,17 +444,204 @@ class PlansPanel(
         val collapsed = !contextExpanded && allContextItems.size > CappedRows.CAP
         val shown = if (collapsed) allContextItems.take(CappedRows.CAP) else allContextItems
 
-        listModel.clear()
-        shown.forEach { listModel.addElement(it) }
-        itemList.alignmentX = Component.LEFT_ALIGNMENT
-        itemList.maximumSize = Dimension(Int.MAX_VALUE, itemList.preferredSize.height)
-
-        northStack.removeAll()
-        northStack.add(itemList)
-        if (collapsed) northStack.add(showMoreRow(allContextItems.size - CappedRows.CAP))
-        add(northStack, BorderLayout.NORTH)
+        rowsPanel.removeAll()
+        shown.forEach { rowsPanel.add(contextRow(it)) }
+        if (collapsed) rowsPanel.add(showMoreRow(allContextItems.size - CappedRows.CAP))
+        add(rowsPanel, BorderLayout.NORTH)
 
         revalidate(); repaint()
+    }
+
+    // ─── Row construction ─────────────────────────────────────────────────
+
+    private fun rowActionIcon(icon: javax.swing.Icon, tip: String, onClick: () -> Unit): JLabel =
+        JLabel(icon).apply {
+            toolTipText = tip
+            isVisible = false
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            border = JBUI.Borders.empty(0, 3)
+            addMouseListener(object : MouseAdapter() {
+                override fun mouseClicked(e: MouseEvent) {
+                    if (!SwingUtilities.isLeftMouseButton(e)) return
+                    e.consume()
+                    onClick()
+                }
+            })
+        }
+
+    /**
+     * Builds one Context row: [tag] [wrapping title] …hover[pin][edit][toggle]. The
+     * title wraps and the row grows on narrow windows; tag + actions stay vertically
+     * centered. The action strip reserves width only while hovered, so short titles
+     * stay on a single line by default.
+     */
+    private fun contextRow(item: ListItem): JPanel {
+        val excluded = isExcluded(item)
+        val (letter, color) = tagFor(item)
+        val baseFont = JBUI.Fonts.label()
+        val strikeFont = baseFont.deriveFont(mapOf(TextAttribute.STRIKETHROUGH to TextAttribute.STRIKETHROUGH_ON))
+
+        val tag = TagLabel().apply { setBadge(letter, color) }
+        val tagInner = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(2), 0)).apply {
+            isOpaque = false
+            add(tag)
+        }
+        val tagWrap = RowStyle.vCenter(tagInner)
+
+        val title = JTextArea(titleFor(item)).apply {
+            isEditable = false
+            isFocusable = false
+            isOpaque = false
+            lineWrap = true
+            wrapStyleWord = true
+            margin = JBUI.insets(0)
+            border = JBUI.Borders.empty()
+            font = if (excluded) strikeFont else baseFont
+            foreground = if (excluded) JBColor.GRAY else (UIManager.getColor("Label.foreground") ?: foreground)
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        }
+
+        val pin = rowActionIcon(AllIcons.General.Pin_tab, "Pin") { pinItem(item) }
+        val edit = rowActionIcon(AllIcons.Actions.Edit, "Open") { openItem(item) }
+        val toggle = rowActionIcon(
+            if (excluded) AllIcons.General.Add else AllIcons.Actions.Close,
+            if (excluded) "Include in next memory" else "Exclude from next memory",
+        ) { toggleExclusion(item) }
+        val icons = listOf(pin, edit, toggle)
+        val iconsRow = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
+            isOpaque = false
+            icons.forEach { add(it) }
+        }
+        // Measure the icons' width (while visible) to reserve on hover; hide by default.
+        icons.forEach { it.isVisible = true }
+        val reservedW = iconsRow.preferredSize.width
+        icons.forEach { it.isVisible = false }
+        // Reserve width only while hovered → short titles stay single-line by default.
+        val rightWrap = RowStyle.vCenter(iconsRow).apply {
+            preferredSize = Dimension(0, JBUI.scale(16))
+        }
+
+        val row = object : JPanel(BorderLayout(JBUI.scale(4), 0)) {
+            override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
+            override fun getPreferredSize(): Dimension {
+                val base = super.getPreferredSize()
+                val w = width
+                if (w <= 0) return base
+                val ins = insets
+                val titleW = (w - ins.left - ins.right - tagWrap.preferredSize.width - rightWrap.preferredSize.width)
+                    .coerceAtLeast(JBUI.scale(20))
+                title.setSize(titleW, Short.MAX_VALUE.toInt())
+                val contentH = maxOf(title.preferredSize.height, tagWrap.preferredSize.height, JBUI.scale(18))
+                return Dimension(w, contentH + ins.top + ins.bottom)
+            }
+        }.apply {
+            isOpaque = false
+            border = JBUI.Borders.empty(2, 4)
+            alignmentX = Component.LEFT_ALIGNMENT
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            add(tagWrap, BorderLayout.WEST)
+            add(title, BorderLayout.CENTER)
+            add(rightWrap, BorderLayout.EAST)
+        }
+        // Re-wrap (recompute height) when the row width changes (tool-window resize).
+        row.addComponentListener(object : java.awt.event.ComponentAdapter() {
+            override fun componentResized(e: java.awt.event.ComponentEvent) { row.revalidate() }
+        })
+
+        fun setHovered(hovered: Boolean) {
+            row.isOpaque = hovered
+            row.background = if (hovered) RowStyle.HOVER_BG else null
+            icons.forEach { it.isVisible = hovered }
+            rightWrap.preferredSize = Dimension(if (hovered) reservedW else 0, JBUI.scale(16))
+            row.revalidate()
+            row.repaint()
+            this@PlansPanel.revalidate()
+        }
+
+        val hover = object : MouseAdapter() {
+            override fun mouseEntered(e: MouseEvent) {
+                setHovered(true)
+                scheduleShowHoverPopup(item, row)
+            }
+            override fun mouseExited(e: MouseEvent) {
+                val src = e.source as? Component ?: return
+                if (!src.isShowing || !row.isShowing) {
+                    setHovered(false); scheduleHoverDismiss(); return
+                }
+                val screen = src.locationOnScreen.apply { translate(e.x, e.y) }
+                val loc = row.locationOnScreen
+                if (!Rectangle(loc.x, loc.y, row.width, row.height).contains(screen)) {
+                    setHovered(false)
+                    scheduleHoverDismiss()
+                }
+            }
+        }
+        val click = object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (SwingUtilities.isLeftMouseButton(e)) openItem(item)
+            }
+        }
+        val contextMenu = object : MouseAdapter() {
+            override fun mousePressed(e: MouseEvent) { maybeShowPopup(e) }
+            override fun mouseReleased(e: MouseEvent) { maybeShowPopup(e) }
+            private fun maybeShowPopup(e: MouseEvent) {
+                if (e.isPopupTrigger) showRowContextMenu(item, e)
+            }
+        }
+        for (c in listOf(row, tagWrap, tagInner, tag, title)) {
+            c.addMouseListener(hover)
+            c.addMouseListener(click)
+            c.addMouseListener(contextMenu)
+        }
+        icons.forEach { it.addMouseListener(hover) }
+
+        row.maximumSize = Dimension(Int.MAX_VALUE, row.preferredSize.height)
+        return row
+    }
+
+    private fun showRowContextMenu(item: ListItem, e: MouseEvent) {
+        val popup = JPopupMenu()
+        if (item is ListItem.ReferenceItem) {
+            popup.add(JMenuItem("Preview", JolliMemoryIcons.Eye).apply { addActionListener { openReference(item.ref) } })
+            if (item.ref.url.isNotBlank()) {
+                popup.add(JMenuItem("Open in Browser", JolliMemoryIcons.Globe).apply {
+                    addActionListener { openReferenceInBrowser(item.ref.url) }
+                })
+            }
+            popup.add(JSeparator())
+        }
+        popup.add(JMenuItem("Remove", JolliMemoryIcons.Trash).apply { addActionListener { removeItem(item) } })
+        popup.show(e.component, e.x, e.y)
+    }
+
+    /** Single/double-letter type tag + accent color (mockup `kb-tag` parity). */
+    private fun tagFor(item: ListItem): Pair<String, Color> = when (item) {
+        is ListItem.PlanItem -> "P" to TAG_PLAN
+        is ListItem.NoteItem ->
+            if (item.note.format == NoteFormat.snippet) "S" to TAG_SNIPPET else "N" to TAG_NOTE
+        is ListItem.ReferenceItem -> when (item.ref.source) {
+            SourceId.linear -> "L" to TAG_LINEAR
+            SourceId.github -> "GH" to TAG_GITHUB
+            SourceId.jira -> "J" to TAG_JIRA
+            SourceId.notion -> "No" to TAG_NOTION
+        }
+    }
+
+    private fun titleFor(item: ListItem): String = when (item) {
+        is ListItem.PlanItem -> {
+            val t = item.plan.title.ifBlank { item.plan.slug }
+            if (item.plan.commitHash != null) "${item.plan.commitHash.take(8)} · $t" else t
+        }
+        is ListItem.NoteItem ->
+            if (item.note.commitHash != null) {
+                "${item.note.commitHash.take(8)} · ${item.note.title}"
+            } else {
+                item.note.title
+            }
+        is ListItem.ReferenceItem -> when (item.ref.source) {
+            SourceId.notion -> item.ref.title
+            else -> "${item.ref.nativeId} — ${item.ref.title}"
+        }
     }
 
     private fun showMoreRow(remaining: Int): JPanel {
@@ -622,9 +671,7 @@ class PlansPanel(
 
     /** Toggles all reference checkboxes: if any excluded → select all, otherwise → deselect all. */
     fun toggleSelectAll() {
-        val refItems = (0 until listModel.size())
-            .map { listModel.getElementAt(it) }
-            .filterIsInstance<ListItem.ReferenceItem>()
+        val refItems = allContextItems.filterIsInstance<ListItem.ReferenceItem>()
         if (refItems.isEmpty()) return
 
         val anyExcluded = refItems.any { it.mapKey in excludedReferences }
@@ -635,30 +682,30 @@ class PlansPanel(
             for (item in refItems) {
                 CommitSelectionStore.setExcluded(cwd, "references", item.mapKey, !select)
             }
+            service.notifySelectionChanged()
             excludedReferences = CommitSelectionStore.readExclusions(cwd).references
-            SwingUtilities.invokeLater { itemList.repaint() }
+            SwingUtilities.invokeLater { renderList() }
         }
     }
 
     // ─── Hover popup logic (mirrors CommitsPanel) ─────────────────────────
 
-    private fun scheduleShowHoverPopup(index: Int) {
+    private fun scheduleShowHoverPopup(item: ListItem, anchor: Component) {
         hoverDismissTimer.stop()
-        if (hoverIndex == index && hoverPopup?.isVisible == true) return
+        if (hoverAnchor === anchor && hoverPopup?.isVisible == true) return
         hoverShowTimer?.stop()
-        hoverShowTimer = Timer(HOVER_SHOW_DELAY_MS) { showHoverPopup(index) }.apply {
+        hoverShowTimer = Timer(HOVER_SHOW_DELAY_MS) { showHoverPopup(item, anchor) }.apply {
             isRepeats = false
             start()
         }
     }
 
-    private fun showHoverPopup(index: Int) {
+    private fun showHoverPopup(item: ListItem, anchor: Component) {
         hoverShowTimer?.stop()
         dismissHoverPopup()
 
-        if (index < 0 || index >= listModel.size()) return
-        val item = listModel.getElementAt(index)
-        val window = SwingUtilities.getWindowAncestor(itemList) ?: return
+        if (!anchor.isShowing) return
+        val window = SwingUtilities.getWindowAncestor(anchor) ?: return
         val popup = JWindow(window)
 
         val bg = UIManager.getColor("ToolTip.background") ?: background
@@ -685,12 +732,9 @@ class PlansPanel(
         }
         popup.pack()
 
-        // Position below the hovered cell
-        val cellBounds = itemList.getCellBounds(index, index)
-        if (cellBounds != null) {
-            val listLoc = itemList.locationOnScreen
-            popup.setLocation(listLoc.x + cellBounds.x, listLoc.y + cellBounds.y + cellBounds.height + 2)
-        }
+        // Position below the hovered row.
+        val loc = anchor.locationOnScreen
+        popup.setLocation(loc.x, loc.y + anchor.height + 2)
 
         val popupHoverListener = object : MouseAdapter() {
             override fun mouseEntered(e: MouseEvent) { hoverDismissTimer.stop() }
@@ -700,7 +744,7 @@ class PlansPanel(
         content.addMouseListener(popupHoverListener)
 
         hoverPopup = popup
-        hoverIndex = index
+        hoverAnchor = anchor
         popup.isVisible = true
     }
 
@@ -750,7 +794,7 @@ class PlansPanel(
         }
 
         // Title
-        content.add(JBLabel("${ref.nativeId} \u2014 ${ref.title}").apply {
+        content.add(JBLabel("${ref.nativeId} — ${ref.title}").apply {
             foreground = fg; font = font.deriveFont(java.awt.Font.BOLD); alignmentX = Component.LEFT_ALIGNMENT
         })
 
@@ -803,7 +847,7 @@ class PlansPanel(
         hoverDismissTimer.stop()
         hoverPopup?.dispose()
         hoverPopup = null
-        hoverIndex = -1
+        hoverAnchor = null
     }
 
     override fun dispose() {
@@ -844,128 +888,6 @@ class PlansPanel(
             }
         }
         JOptionPane.showMessageDialog(this, "Note file not found: ${note.id}", "Note", JOptionPane.WARNING_MESSAGE)
-    }
-
-    /**
-     * Unified cell renderer for both plans and notes.
-     * Icons match VS Code:
-     * - Plan (uncommitted): file-text icon
-     * - Plan (committed): lock (green) icon
-     * - Note markdown (uncommitted): note icon
-     * - Note snippet (uncommitted): comment icon
-     * - Note (committed): lock (green) icon
-     */
-    private inner class PlansAndNotesCellRenderer : ListCellRenderer<ListItem> {
-        private val panel = JPanel(BorderLayout()).apply { border = JBUI.Borders.empty(3, 8) }
-        private val tagLabel = TagLabel()
-        private val titleLabel = JLabel()
-        private val pinLabel = actionIcon(AllIcons.General.Pin_tab, "Pin")
-        private val editLabel = actionIcon(AllIcons.Actions.Edit, "Edit")
-        // Rightmost action: the select toggle (✕ exclude / ＋ include). Icon + tooltip
-        // are set per row in getListCellRendererComponent.
-        private val toggleLabel = actionIcon(AllIcons.Actions.Close, "Exclude from next memory")
-
-        /** No checkbox column anymore — selection is the strikethrough toggle on the right. */
-        fun getCheckboxWidth(): Int = 0
-
-        /** Width of one hover-action slot (icon + gap). */
-        fun getActionSlotWidth(): Int = JBUI.scale(24)
-
-        /** Total width of the pin/edit/delete action strip on the right. */
-        fun getActionsWidth(): Int = getActionSlotWidth() * 3
-
-        private fun actionIcon(icon: javax.swing.Icon, tip: String): JLabel = JLabel(icon).apply {
-            toolTipText = tip
-            border = JBUI.Borders.empty(0, 3)
-            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-        }
-
-        override fun getListCellRendererComponent(
-            list: JList<out ListItem>, value: ListItem, index: Int,
-            isSelected: Boolean, cellHasFocus: Boolean,
-        ): Component {
-            // Column layout: [type tag] [title] …hover[pin][edit][toggle ✕/＋].
-            // Deselected (excluded) items render struck-through + dimmed.
-            val (letter, color) = tagFor(value)
-            val excluded = isExcluded(value)
-            tagLabel.setBadge(letter, color)
-            titleLabel.text = titleFor(value)
-            titleLabel.font = if (excluded) {
-                list.font.deriveFont(mapOf(TextAttribute.STRIKETHROUGH to TextAttribute.STRIKETHROUGH_ON))
-            } else {
-                list.font
-            }
-            titleLabel.foreground = when {
-                isSelected -> list.selectionForeground
-                excluded -> JBColor.GRAY
-                else -> list.foreground
-            }
-
-            panel.removeAll()
-
-            val left = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(2), 0)).apply {
-                isOpaque = false
-                add(tagLabel)
-            }
-            panel.add(left, BorderLayout.WEST)
-            // Min size 0 so BorderLayout.CENTER can shrink the title and it ellipsizes ("…").
-            titleLabel.minimumSize = Dimension(0, 0)
-            panel.add(titleLabel, BorderLayout.CENTER)
-
-            // Action icons appear only on the hovered row, anchored to the right edge.
-            if (index == actionHoverIndex) {
-                toggleLabel.icon = if (excluded) AllIcons.General.Add else AllIcons.Actions.Close
-                toggleLabel.toolTipText = if (excluded) "Include in next memory" else "Exclude from next memory"
-                val actions = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
-                    isOpaque = false
-                    add(pinLabel)
-                    add(editLabel)
-                    add(toggleLabel)
-                }
-                panel.add(actions, BorderLayout.EAST)
-            }
-
-            panel.background = if (isSelected) list.selectionBackground else list.background
-
-            // Pin the cell to the list's visible width so a long title truncates with "…"
-            // instead of widening the cell and pushing the hover icons past the window edge.
-            panel.preferredSize = null
-            val listWidth = list.width
-            if (listWidth > 0) {
-                panel.preferredSize = Dimension(listWidth, panel.preferredSize.height)
-            }
-            return panel
-        }
-
-        /** Single/double-letter type tag + accent color (mockup `kb-tag` parity). */
-        private fun tagFor(item: ListItem): Pair<String, Color> = when (item) {
-            is ListItem.PlanItem -> "P" to TAG_PLAN
-            is ListItem.NoteItem ->
-                if (item.note.format == NoteFormat.snippet) "S" to TAG_SNIPPET else "N" to TAG_NOTE
-            is ListItem.ReferenceItem -> when (item.ref.source) {
-                SourceId.linear -> "L" to TAG_LINEAR
-                SourceId.github -> "GH" to TAG_GITHUB
-                SourceId.jira -> "J" to TAG_JIRA
-                SourceId.notion -> "No" to TAG_NOTION
-            }
-        }
-
-        private fun titleFor(item: ListItem): String = when (item) {
-            is ListItem.PlanItem -> {
-                val t = item.plan.title.ifBlank { item.plan.slug }
-                if (item.plan.commitHash != null) "${item.plan.commitHash.take(8)} · $t" else t
-            }
-            is ListItem.NoteItem ->
-                if (item.note.commitHash != null) {
-                    "${item.note.commitHash.take(8)} · ${item.note.title}"
-                } else {
-                    item.note.title
-                }
-            is ListItem.ReferenceItem -> when (item.ref.source) {
-                SourceId.notion -> item.ref.title
-                else -> "${item.ref.nativeId} — ${item.ref.title}"
-            }
-        }
     }
 
     /** A small rounded badge painting a 1–2 letter context-type tag (mockup `kb-tag`). */

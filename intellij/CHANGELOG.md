@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.99.3
+
+### UI
+
+- **Memory panel polish** — consistent row hover, full-text wrapping, vertically centered icons, and tighter, aligned section headers across the Pinned, Current Memory, and Committed Memories sections
+- **Open committed items inline** — click a conversation, context entry, or file inside a committed memory to read its content in an editor tab, reusing the stored transcript when the original is gone
+
+### Fixes & Improvements
+
+- **Share in Jolli** — fixed "Invalid or disabled API key" on push: credentials are now shared across surfaces, and a rejected key triggers a one-time silent re-authenticate & retry instead of failing
+- Fixed the Jolli API key parser to scan every token segment, keeping it in lockstep with the CLI
+- Fixed an IDE freeze when applying Settings — install, uninstall, and Memory Bank migration now run off the UI thread
+- Added opt-out anonymous usage telemetry (content-free — never code, paths, or memory content). Disable it under Settings → General
+
 ## 0.99.2
 
 ### New Features

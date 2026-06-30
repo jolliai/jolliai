@@ -71,6 +71,17 @@ disk **before** they are sent.
 | `error_occurred` | A structured error code was raised. |
 | `queue_drained` | QueueWorker finished a drain. |
 | `sync_completed` | A memory-bank sync round finished. |
+| `toolwindow_opened` | The memory tool window was opened. |
+| `view_switched` | Tool window view switched (current/bank/knowledge). |
+| `memory_committed` | User committed a memory via the Commit button. |
+| `memory_expanded` | A committed memory's details were expanded. |
+| `memory_item_opened` | An item inside a memory was opened (conversation/file/context/shipped). |
+| `session_resumed` | A conversation session was resumed in a terminal. |
+| `recall_prompt_copied` | A recall prompt was copied to the clipboard. |
+| `memory_pinned` | An item was pinned. |
+| `memory_unpinned` | An item was unpinned. |
+| `key_rejected` | The server rejected the API key (401/403). |
+| `reauth_completed` | Re-authentication after a rejected key finished. |
 
 ---
 *Generated from `cli/src/core/TelemetryEvents.ts`. The IntelliJ plugin is an

@@ -12,8 +12,10 @@ import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.Disposable
-import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
+import com.intellij.openapi.progress.ProgressIndicator
+import com.intellij.openapi.progress.ProgressManager
+import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
@@ -576,6 +578,8 @@ class SettingsDialog(
         button.isEnabled = false
         button.text = "Signing in..."
         JolliAuthService.login(
+            // User-initiated sign-in: mint a fresh key so a revoked same-tenant key recovers.
+            forceFreshApiKey = true,
             onSuccess = { _ ->
                 SwingUtilities.invokeLater {
                     button.isEnabled = true
@@ -715,39 +719,58 @@ class SettingsDialog(
             !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() ||
             !config.jolliApiKey.isNullOrBlank()
 
-        // Handle pause toggle or credential removal, then always refresh status
+        // Snapshot the inputs needed off the EDT, then close the dialog immediately. All
+        // the heavy work (git subprocesses, hook install/uninstall, Memory Bank init +
+        // migration) runs in ONE ordered background task so the IDE never freezes and the
+        // enable/disable and migration steps can't race each other.
         val wasPaused = existing.paused == true
         val nowPaused = pauseCheckbox.isSelected
-        ApplicationManager.getApplication().executeOnPooledThread {
-            if (!hasCredentials || (nowPaused && !wasPaused)) {
-                service.uninstall()
-            } else if (!nowPaused && wasPaused) {
-                if (!service.isInitialized) service.initialize()
-                service.install()
-            }
-            service.refreshStatus()
-        }
-
-        // Initialize Memory Bank folder + auto-migrate data from orphan branch
         val projectPath = service.mainRepoRoot ?: project.basePath
-        if (projectPath != null) {
-            val repoName = KBPathResolver.extractRepoName(projectPath)
-            val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
-            val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
-            KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
-
-            val gitOps = GitOps(projectPath)
-            val orphan = OrphanBranchStorage(gitOps)
-            if (orphan.exists()) {
-                val mm = MetadataManager(kbRoot.resolve(".jolli"))
-                val folder = FolderStorage(kbRoot, mm)
-                folder.ensure()
-                val engine = MigrationEngine(orphan, folder, mm)
-                engine.runMigration()
-            }
-        }
+        val kbCustomPath = config.knowledgeBasePath
 
         super.doOKAction()
+
+        ProgressManager.getInstance().run(
+            object : Task.Backgroundable(project, "Applying Jolli Memory settings…", false) {
+                override fun run(indicator: ProgressIndicator) {
+                    indicator.isIndeterminate = true
+
+                    // 1. Enable / disable hooks (was already off-EDT; now ordered before migration).
+                    if (!hasCredentials || (nowPaused && !wasPaused)) {
+                        indicator.text = "Disabling Jolli Memory…"
+                        service.uninstall()
+                        ai.jolli.jollimemory.core.telemetry.Telemetry.track("surface_disabled", mapOf("trigger" to "settings"))
+                    } else if (!nowPaused && wasPaused) {
+                        indicator.text = "Enabling Jolli Memory…"
+                        if (!service.isInitialized) service.initialize()
+                        service.install()
+                        ai.jolli.jollimemory.core.telemetry.Telemetry.track("surface_enabled", mapOf("trigger" to "settings"))
+                    }
+
+                    // 2. Initialize Memory Bank folder + auto-migrate data from the orphan branch.
+                    if (projectPath != null) {
+                        indicator.text = "Initializing Memory Bank…"
+                        val repoName = KBPathResolver.extractRepoName(projectPath)
+                        val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
+                        val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, kbCustomPath)
+                        KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
+
+                        val gitOps = GitOps(projectPath)
+                        val orphan = OrphanBranchStorage(gitOps)
+                        if (orphan.exists()) {
+                            indicator.text = "Migrating memories to Memory Bank…"
+                            val mm = MetadataManager(kbRoot.resolve(".jolli"))
+                            val folder = FolderStorage(kbRoot, mm)
+                            folder.ensure()
+                            MigrationEngine(orphan, folder, mm).runMigration()
+                        }
+                    }
+
+                    // 3. Refresh status once, after everything settled.
+                    service.refreshStatus()
+                }
+            },
+        )
     }
 
     private fun getEffectiveAnthropicKey(): String {

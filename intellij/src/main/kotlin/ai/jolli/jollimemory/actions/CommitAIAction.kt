@@ -46,7 +46,17 @@ class CommitAIAction : AnAction() {
     private data class CommitDialogResult(val action: CommitAction, val message: String)
 
     override fun actionPerformed(e: AnActionEvent) {
-        val project = e.project ?: return
+        performCommit(e.project ?: return)
+    }
+
+    /**
+     * Runs the AI commit for [project]. Exposed so callers with an explicit project
+     * (e.g. the Working Memory webview, whose JCEF data context doesn't reliably
+     * carry the project) can invoke it directly, instead of going through the
+     * action-invocation API — `ActionUtil.invokeAction`'s overloads are deprecated
+     * inconsistently across IDE versions, so calling the logic directly is stable.
+     */
+    fun performCommit(project: com.intellij.openapi.project.Project) {
         val service = project.getService(JolliMemoryService::class.java)
         val cwd = service.mainRepoRoot ?: project.basePath ?: return
 

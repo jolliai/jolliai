@@ -37,6 +37,18 @@ object TelemetryEvents {
             "error_occurred" to "A structured error code was raised.",
             "queue_drained" to "QueueWorker finished a drain.",
             "sync_completed" to "A memory-bank sync round finished.",
+            // ── IDE tool-window UI / engagement (IntelliJ, VS Code) ──
+            "toolwindow_opened" to "The memory tool window was opened.",
+            "view_switched" to "Tool window view switched (current/bank/knowledge).",
+            "memory_committed" to "User committed a memory via the Commit button.",
+            "memory_expanded" to "A committed memory's details were expanded.",
+            "memory_item_opened" to "An item inside a memory was opened (conversation/file/context/shipped).",
+            "session_resumed" to "A conversation session was resumed in a terminal.",
+            "recall_prompt_copied" to "A recall prompt was copied to the clipboard.",
+            "memory_pinned" to "An item was pinned.",
+            "memory_unpinned" to "An item was unpinned.",
+            "key_rejected" to "The server rejected the API key (401/403).",
+            "reauth_completed" to "Re-authentication after a rejected key finished.",
         )
 
     /** `object_action`: lowercase snake_case with at least two words. */

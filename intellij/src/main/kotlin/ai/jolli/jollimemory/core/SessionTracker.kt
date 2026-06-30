@@ -201,11 +201,60 @@ object SessionTracker {
                 }
             }
         }
-        return try {
+        val base = try {
             gson.fromJson(target.readText(Charsets.UTF_8), JolliMemoryConfig::class.java)
         } catch (_: Exception) {
-            JolliMemoryConfig()
+            null
+        } ?: JolliMemoryConfig()
+
+        // Credentials (jolliApiKey / authToken) are account-level and shared across all
+        // surfaces (CLI / VS Code / IntelliJ) via the legacy config.json — the source of
+        // truth. IntelliJ keeps its own settings in config-intellij.json but overlays the
+        // shared credentials on read so a re-login on any surface is picked up here (no
+        // stale-key drift). Falls back to this file's own values when config.json is absent.
+        val (sharedKey, sharedAuth) = readSharedCredentials(dir)
+        return base.copy(
+            jolliApiKey = sharedKey ?: base.jolliApiKey,
+            authToken = sharedAuth ?: base.authToken,
+        )
+    }
+
+    /** Reads jolliApiKey/authToken from the shared config.json (or null/null if absent). */
+    private fun readSharedCredentials(dir: String): Pair<String?, String?> {
+        val shared = File(dir, LEGACY_CONFIG_FILE)
+        if (!shared.exists()) return null to null
+        return try {
+            val obj = com.google.gson.JsonParser.parseString(shared.readText(Charsets.UTF_8)).asJsonObject
+            fun str(k: String) = obj.get(k)?.takeIf { !it.isJsonNull }?.asString?.takeIf { it.isNotBlank() }
+            str("jolliApiKey") to str("authToken")
+        } catch (_: Exception) {
+            null to null
         }
+    }
+
+    /**
+     * Merges jolliApiKey/authToken into the shared config.json at the JSON level so a
+     * login/refresh on IntelliJ propagates to CLI / VS Code — preserving every other
+     * field (we never deserialize-then-overwrite, which would drop fields this surface
+     * doesn't model and clobber the other surfaces' settings). A null value clears the
+     * field (sign-out), which all save paths only produce intentionally because they
+     * load-first (carrying the shared credential forward).
+     */
+    private fun writeSharedCredentials(dir: String, jolliApiKey: String?, authToken: String?) {
+        val shared = File(dir, LEGACY_CONFIG_FILE)
+        val obj = try {
+            if (shared.exists()) {
+                com.google.gson.JsonParser.parseString(shared.readText(Charsets.UTF_8)).asJsonObject
+            } else {
+                com.google.gson.JsonObject()
+            }
+        } catch (_: Exception) {
+            com.google.gson.JsonObject()
+        }
+        if (jolliApiKey != null) obj.addProperty("jolliApiKey", jolliApiKey) else obj.remove("jolliApiKey")
+        if (authToken != null) obj.addProperty("authToken", authToken) else obj.remove("authToken")
+        File(dir).mkdirs()
+        atomicWrite(shared, gson.toJson(obj))
     }
 
     fun saveConfig(update: JolliMemoryConfig, cwd: String? = null) {
@@ -230,6 +279,7 @@ object SessionTracker {
             storageMode = update.storageMode ?: existing.storageMode,
         )
         atomicWrite(File(dir, CONFIG_FILE), gson.toJson(merged))
+        writeSharedCredentials(dir, merged.jolliApiKey, merged.authToken)
         log.info("Config saved")
     }
 
@@ -240,6 +290,7 @@ object SessionTracker {
     fun saveConfigToDir(config: JolliMemoryConfig, dir: String) {
         File(dir).mkdirs()
         atomicWrite(File(dir, CONFIG_FILE), gson.toJson(config))
+        writeSharedCredentials(dir, config.jolliApiKey, config.authToken)
         log.info("Config saved to %s", dir)
     }
 

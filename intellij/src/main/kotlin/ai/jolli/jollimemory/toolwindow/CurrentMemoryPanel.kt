@@ -49,6 +49,9 @@ class CurrentMemoryPanel(
 
 	private val statusListener: () -> Unit = { SwingUtilities.invokeLater { updateHeader() } }
 
+	/** The three section headers, normalized to a uniform height after construction. */
+	private val sectionHeaders = mutableListOf<JComponent>()
+
 	init {
 		layout = BoxLayout(this, BoxLayout.Y_AXIS)
 
@@ -60,6 +63,9 @@ class CurrentMemoryPanel(
 		addSection(this, "CONVERSATIONS", conversationsActions, conversationsPanel, separatorAfter = true)
 		addSection(this, "CONTEXT", contextActions, contextPanel, separatorAfter = true)
 		addSection(this, "FILES", filesActions, filesPanel, separatorAfter = false)
+		// Headers with an action toolbar are taller than those without; pin all three to
+		// the tallest so the CONVERSATIONS / CONTEXT / FILES titles align consistently.
+		normalizeSectionHeaderHeights()
 		// Commit lives right after the Files list (the bottom bar keeps Create PR).
 		add(commitButtonRow())
 
@@ -70,14 +76,28 @@ class CurrentMemoryPanel(
 	override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
 
 	private fun addSection(stack: JPanel, title: String, actionGroupId: String, body: JComponent, separatorAfter: Boolean) {
-		stack.add(sectionHeader(title, actionGroupId, body))
+		val header = sectionHeader(title, actionGroupId, body)
+		sectionHeaders.add(header)
+		stack.add(header)
 		body.alignmentX = Component.LEFT_ALIGNMENT
 		stack.add(body)
-		if (separatorAfter) stack.add(blueSeparator())
+		if (separatorAfter) stack.add(sectionSeparator())
+	}
+
+	/** Pins every section header to the tallest header's height so the titles align. */
+	private fun normalizeSectionHeaderHeights() {
+		val maxH = sectionHeaders.maxOfOrNull { it.preferredSize.height } ?: return
+		for (h in sectionHeaders) {
+			h.preferredSize = Dimension(h.preferredSize.width, maxH)
+			h.minimumSize = Dimension(h.minimumSize.width, maxH)
+			h.maximumSize = Dimension(Int.MAX_VALUE, maxH)
+		}
 	}
 
 	private fun sectionHeader(title: String, actionGroupId: String, target: JComponent): JComponent {
-		val titleLabel = JBLabel(title).apply { font = font.deriveFont(Font.BOLD) }
+		// Match the top-level section headers (mockup: 11px / base − 2) so the folded
+		// sub-section titles don't tower over the rows beneath them.
+		val titleLabel = JBLabel(title).apply { font = font.deriveFont(Font.BOLD, font.size2D - 2f) }
 
 		// Live row count in the header, e.g. "CONTEXT (4)".
 		(target as? RowCountSource)?.let { src ->
@@ -87,9 +107,11 @@ class CurrentMemoryPanel(
 		}
 		val header = JPanel(BorderLayout()).apply {
 			isOpaque = false
-			border = JBUI.Borders.empty(4, 6, 2, 2)
+			// Tight header insets: bottom 0 so the title sits right above its first row
+			// (the body keeps its 4px PINNED-aligned top), top 2 to pull consecutive
+			// sections closer together.
+			border = JBUI.Borders.empty(2, 6, 0, 2)
 			alignmentX = Component.LEFT_ALIGNMENT
-			maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
 			add(titleLabel, BorderLayout.WEST)
 		}
 		val group = ActionManager.getInstance().getAction(actionGroupId)
@@ -98,6 +120,9 @@ class CurrentMemoryPanel(
 				.createActionToolbar("JolliMemory.CurrentMemory.$title", group, true)
 			toolbar.targetComponent = target
 			toolbar.setReservePlaceAutoPopupIcon(false)
+			// Compact buttons so the header (whose height is driven by the toolbar) stays
+			// short and consistent with toolbar-less sections.
+			toolbar.minimumButtonSize = Dimension(JBUI.scale(18), JBUI.scale(18))
 			toolbar.component.isOpaque = false
 			header.add(toolbar.component, BorderLayout.EAST)
 		}
@@ -111,6 +136,15 @@ class CurrentMemoryPanel(
 		val commit = JolliButtons.primary("Commit", JolliMemoryIcons.Sparkle).apply {
 			toolTipText = "Commit the checked files with an AI-written message and save a memory."
 			addActionListener {
+				val reg = service.panelRegistry
+				ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+					"memory_committed",
+					mapOf(
+						"files_bucket" to ai.jolli.jollimemory.core.telemetry.Telemetry.bucket(reg?.changesPanel?.currentRowCount() ?: 0),
+						"has_conversations" to ((reg?.activeConversationsPanel?.currentRowCount() ?: 0) > 0),
+						"context_bucket" to ai.jolli.jollimemory.core.telemetry.Telemetry.bucket(reg?.plansPanel?.currentRowCount() ?: 0),
+					),
+				)
 				val action = ActionManager.getInstance().getAction("JolliMemory.CommitAI") ?: return@addActionListener
 				ActionManager.getInstance().tryToExecute(action, null, this, "JolliMemoryCurrentMemory", true)
 			}
@@ -136,9 +170,19 @@ class CurrentMemoryPanel(
 			.openFile(WorkingMemoryVirtualFile(), true)
 	}
 
-	private fun blueSeparator(): JComponent = JPanel().apply {
+	/** A grey divider between sections (mockup parity) — a stronger, 2px line. */
+	private fun sectionSeparator(): JComponent = JPanel().apply {
 		isOpaque = true
-		background = LIGHT_BLUE
+		val base = javax.swing.UIManager.getColor("Separator.separatorColor")
+			?: javax.swing.UIManager.getColor("Component.borderColor")
+			?: JBColor.border()
+		// More prominent than the faint theme separator: darker in light themes,
+		// brighter (so it reads on dark backgrounds) in dark themes.
+		background = if (com.intellij.ui.ColorUtil.isDark(base)) {
+			com.intellij.ui.ColorUtil.brighter(base, 3)
+		} else {
+			com.intellij.ui.ColorUtil.darker(base, 3)
+		}
 		alignmentX = Component.LEFT_ALIGNMENT
 		preferredSize = Dimension(0, JBUI.scale(2))
 		maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(2))
@@ -174,9 +218,5 @@ class CurrentMemoryPanel(
 
 	override fun dispose() {
 		service.removeStatusListener(statusListener)
-	}
-
-	private companion object {
-		val LIGHT_BLUE = JBColor(0xBFD7F2, 0x2C3E55)
 	}
 }

@@ -329,6 +329,13 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
         log.info("Stored %d plan file(s): %s", files.size, commitMessage)
     }
 
+    /** Batch write note files (`notes/<id>.md`) to storage — dual-writes like plans. */
+    fun storeNoteFiles(files: List<FileWrite>, commitMessage: String) {
+        if (files.isEmpty()) return
+        storage.writeFiles(files, commitMessage)
+        log.info("Stored %d note file(s): %s", files.size, commitMessage)
+    }
+
     /** Reads a plan file from storage. */
     fun readPlanFromBranch(slug: String): String? {
         return storage.readFile("plans/$slug.md")

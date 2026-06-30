@@ -5,6 +5,7 @@ import ai.jolli.jollimemory.bridge.CommitSummaryBrief
 import ai.jolli.jollimemory.bridge.ConversationBrief
 import ai.jolli.jollimemory.core.ActiveConversationItem
 import ai.jolli.jollimemory.core.CommitSummary
+import ai.jolli.jollimemory.core.NoteFormat
 import ai.jolli.jollimemory.core.TranscriptSource
 import ai.jolli.jollimemory.core.KBDataCache
 import com.google.gson.Gson
@@ -50,6 +51,7 @@ import javax.swing.BoxLayout
 import javax.swing.JCheckBox
 import javax.swing.JComponent
 import javax.swing.JLabel
+import javax.swing.JTextArea
 import javax.swing.JOptionPane
 import javax.swing.JPanel
 import javax.swing.SwingConstants
@@ -606,16 +608,28 @@ class CommitsPanel(
         val displayMessage = commit.message.ifBlank { commit.shortHash }
         val pushedBadge = if (commit.isPushed) " \u2601" else ""
         val typeBadge = if (commit.commitType != null) " [${commit.commitType}]" else ""
-        val titleLabel = JLabel("$displayMessage$pushedBadge$typeBadge").apply {
-            minimumSize = Dimension(0, preferredSize.height)
+        val titleLabel = JTextArea("$displayMessage$pushedBadge$typeBadge").apply {
+            // Wrapping title so long commit messages wrap and grow the row instead of
+            // clipping. Styled like a label at the mockup's 12px (base − 1).
+            isEditable = false
+            isFocusable = false
+            isOpaque = false
+            lineWrap = true
+            wrapStyleWord = true
+            margin = JBUI.insets(0)
+            border = JBUI.Borders.empty()
+            font = JBUI.Fonts.label().let { it.deriveFont(it.size2D - 1f) }
             alignmentX = Component.LEFT_ALIGNMENT
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
         }
 
         // Sub-line: "<relative time> \u00b7 <shortHash> \u00b7 <token spend>".
         val dimFg = UIManager.getColor("Component.infoForeground") ?: Color.GRAY
         val subLabel = JLabel(buildSubLine(commit)).apply {
             foreground = dimFg
-            font = font.deriveFont(font.size2D - 1f)
+            // Mockup sub-line is ~10.5px (base − 2.5); base − 2 keeps it clearly
+            // smaller than the title while still legible at the IDE's font scale.
+            font = font.deriveFont(font.size2D - 2f)
             alignmentX = Component.LEFT_ALIGNMENT
         }
 
@@ -672,34 +686,59 @@ class CommitsPanel(
             rowActions.forEach { add(it) }
         }
 
-        // Title line: arrow/checkbox · title+sub · eye/more.
-        val topLine = JPanel(BorderLayout(2, 0)).apply {
+        // Title line: arrow/checkbox · title+sub · eye/more. Height tracks the wrapped
+        // title at the current width (the title + sub stack in CENTER).
+        val topLine = object : JPanel(BorderLayout(2, 0)) {
+            override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
+            override fun getPreferredSize(): Dimension {
+                val base = super.getPreferredSize()
+                val w = width
+                if (w <= 0) return base
+                val ins = insets
+                val cW = (w - ins.left - ins.right - leftPanel.preferredSize.width - rightPanel.preferredSize.width - 2 * 2)
+                    .coerceAtLeast(JBUI.scale(20))
+                titleLabel.setSize(cW, Short.MAX_VALUE.toInt())
+                val centerH = titleLabel.preferredSize.height + subLabel.preferredSize.height
+                val h = maxOf(centerH, leftPanel.preferredSize.height, rightPanel.preferredSize.height)
+                return Dimension(base.width, h + ins.top + ins.bottom)
+            }
+        }.apply {
             isOpaque = false
             alignmentX = Component.LEFT_ALIGNMENT
             add(leftPanel, BorderLayout.WEST)
             add(centerPanel, BorderLayout.CENTER)
             add(rightPanel, BorderLayout.EAST)
-            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
         }
 
         // The row is a vertical stack so the chips + "Show memory details" rows
         // span the full width and right-align to the window edge (matching the
         // "Hide memory details" link at the bottom of the expanded section),
         // rather than being boxed inside the title's CENTER region.
-        val row = JPanel().apply {
+        val row = object : JPanel() {
+            // Height tracks content (the title wraps and grows topLine), so the max must
+            // follow the current preferred height rather than a value fixed at build time.
+            override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
+        }.apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = true
             border = JBUI.Borders.empty(2, 4)
             alignmentX = Component.LEFT_ALIGNMENT
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
             add(topLine)
             add(chipsRow)
             add(detailsToggle)
         }
+        // Re-wrap the title (recompute height) when the row width changes on resize.
+        row.addComponentListener(object : java.awt.event.ComponentAdapter() {
+            override fun componentResized(e: java.awt.event.ComponentEvent) { row.revalidate() }
+        })
         // Hover: reveal the Pin/Copy/Share actions + the sticky hover popup
         // (1s show delay, 200ms hide grace). Hiding is bounds-checked so moving
         // between the row's children doesn't flicker the icons away.
         val hoverListener = object : MouseAdapter() {
             override fun mouseEntered(e: MouseEvent) {
+                row.background = RowStyle.HOVER_BG
+                row.repaint()
                 rowActions.forEach { it.isVisible = true }
                 scheduleShowHoverPopup(row, commit)
             }
@@ -708,6 +747,8 @@ class CommitsPanel(
                 val screen = src.locationOnScreen.apply { translate(e.x, e.y) }
                 val loc = row.locationOnScreen
                 if (!java.awt.Rectangle(loc.x, loc.y, row.width, row.height).contains(screen)) {
+                    row.background = null
+                    row.repaint()
                     rowActions.forEach { it.isVisible = false }
                 }
                 scheduleHoverDismiss()
@@ -768,6 +809,7 @@ class CommitsPanel(
     private fun pinMemory(commit: CommitSummaryBrief) {
         val cwd = service.mainRepoRoot ?: project.basePath ?: return
         val title = commit.message.ifBlank { commit.shortHash }
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_pinned", mapOf("kind" to "memories"))
         ApplicationManager.getApplication().executeOnPooledThread {
             ai.jolli.jollimemory.core.PinStore.pin(cwd, "memories", commit.hash, title, "M")
             SwingUtilities.invokeLater { service.panelRegistry?.pinnedPanel?.refresh() }
@@ -787,6 +829,7 @@ class CommitsPanel(
     private fun toggleExpand(hash: String) {
         val state = commitRowStates[hash] ?: return
         state.isExpanded = !state.isExpanded
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_expanded", mapOf("expanded" to state.isExpanded))
         state.arrowLabel.text = if (state.isExpanded) ARROW_DOWN else ARROW_RIGHT
         state.fileContainer.isVisible = state.isExpanded
         // The "Show memory details" line only makes sense while collapsed; once
@@ -870,9 +913,13 @@ class CommitsPanel(
         fun collect(s: CommitSummary?) {
             s?.children?.forEach { child ->
                 for (c in service.getCommittedConversations(child.commitHash, child)) {
-                    val key = c.sessionId.ifBlank { "${c.source}|${c.title}" }
+                    // Remember which child commit owns this transcript so the stored-markdown
+                    // fallback in openCommittedConversation reads from the right hash, not the
+                    // squashed parent (which has no transcript of its own).
+                    val cc = if (c.sourceCommitHash == null) c.copy(sourceCommitHash = child.commitHash) else c
+                    val key = cc.sessionId.ifBlank { "${cc.source}|${cc.title}" }
                     val existing = merged[key]
-                    merged[key] = existing?.copy(messageCount = existing.messageCount + c.messageCount) ?: c
+                    merged[key] = existing?.copy(messageCount = existing.messageCount + cc.messageCount) ?: cc
                 }
                 collect(child) // nested squashes
             }
@@ -911,7 +958,9 @@ class CommitsPanel(
                 viewSummary(commit.hash)
             })
         } else {
-            shippedRows.add(detailRow(stateIcon(AllIcons.RunConfigurations.TestState.Green2, false), "E2E test guide — not generated yet", null, dim = true))
+            shippedRows.add(detailRow(stateIcon(AllIcons.RunConfigurations.TestState.Green2, false), "E2E test guide — not generated yet", null, dim = true) {
+                if (commit.hasSummary) viewSummary(commit.hash)
+            })
         }
         if (commit.isSyncedToJolli) {
             val url = commit.jolliDocUrl ?: summary?.jolliDocUrl
@@ -919,7 +968,9 @@ class CommitsPanel(
                 if (url != null) BrowserUtil.browse(url)
             })
         } else {
-            shippedRows.add(detailRow(stateIcon(AllIcons.Actions.Refresh, false), "Not synced to Jolli yet", chip("LOCAL", CHIP_DIM_COLOR), dim = true))
+            shippedRows.add(detailRow(stateIcon(AllIcons.Actions.Refresh, false), "Not synced to Jolli yet", chip("LOCAL", CHIP_DIM_COLOR), dim = true) {
+                if (commit.hasSummary) viewSummary(commit.hash)
+            })
         }
         addGroup(container, "SHIPPED", shippedRows.size, shippedRows)
 
@@ -937,10 +988,29 @@ class CommitsPanel(
 
         // ── CONTEXT (plans / notes / references) ───────────────────────────────
         val contextRows = mutableListOf<JComponent>()
-        summary?.plans?.forEach { contextRows.add(contextRow("P", it.title, null)) }
-        summary?.notes?.forEach { contextRows.add(contextRow("N", it.title, null)) }
+        summary?.plans?.forEach { p ->
+            contextRows.add(contextRow("P", p.title, isLink = false) {
+                trackItemOpened("plan")
+                openArchivedMarkdown(commit, p.title) { service.readArchivedPlan(p.slug) }
+            })
+        }
+        summary?.notes?.forEach { n ->
+            val tag = if (n.format == NoteFormat.snippet) "S" else "N"
+            contextRows.add(contextRow(tag, n.title, isLink = false) {
+                trackItemOpened("note")
+                if (n.format == NoteFormat.snippet && n.content != null) {
+                    openMarkdownContent(n.content, n.title)
+                } else {
+                    openArchivedMarkdown(commit, n.title) { service.readArchivedNote(n.id) }
+                }
+            })
+        }
         summary?.references?.forEach { ref ->
-            contextRows.add(contextRow(referenceTag(ref.source), ref.title, ref.url.ifBlank { null }))
+            val url = ref.url.ifBlank { null }
+            contextRows.add(contextRow(referenceTag(ref.source), ref.title, isLink = url != null) {
+                trackItemOpened("reference")
+                if (url != null) BrowserUtil.browse(url) else if (commit.hasSummary) viewSummary(commit.hash)
+            })
         }
         val contextCount = contextRows.size
         if (contextRows.isEmpty()) contextRows.add(plainDetailRow("No linked context"))
@@ -1002,28 +1072,112 @@ class CommitsPanel(
         dim: Boolean = false,
         onClick: (() -> Unit)? = null,
     ): JComponent {
-        val label = JLabel(text, icon, SwingConstants.LEFT).apply {
-            iconTextGap = JBUI.scale(6)
+        val iconWrap = RowStyle.vCenter(JLabel(icon))
+        val textArea = wrappingTitleArea(text).apply {
             if (dim) foreground = CHIP_DIM_COLOR
+            if (onClick == null) cursor = Cursor.getDefaultCursor()
         }
-        val row = JPanel(BorderLayout()).apply {
-            isOpaque = false
-            border = JBUI.Borders.empty(1, 24, 1, 4)
-            alignmentX = Component.LEFT_ALIGNMENT
-            add(label, BorderLayout.CENTER)
-            if (trailing != null) {
-                add(JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply { isOpaque = false; add(trailing) }, BorderLayout.EAST)
-            }
-        }
+        val east = trailing?.let { RowStyle.vCenter(JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply { isOpaque = false; add(it) }) }
+        val row = wrappingRow(iconWrap, textArea, east, leftIndent = 24)
         if (onClick != null) {
-            row.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
             val click = object : MouseAdapter() {
-                override fun mouseClicked(e: MouseEvent) { if (e.clickCount == 1) onClick() }
+                override fun mouseClicked(e: MouseEvent) {
+                    if (e.clickCount == 1) { trackItemOpened("shipped"); onClick() }
+                }
             }
-            label.addMouseListener(click); row.addMouseListener(click)
+            textArea.addMouseListener(click); row.addMouseListener(click)
         }
-        row.maximumSize = Dimension(Int.MAX_VALUE, row.preferredSize.height)
+        attachRowHoverBar(row, listOfNotNull(textArea, iconWrap, east))
         return row
+    }
+
+    /** Records that an item inside a memory was opened (conversation/file/context/shipped). */
+    private fun trackItemOpened(itemType: String) {
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_item_opened", mapOf("item_type" to itemType))
+    }
+
+    /** A label-styled, word-wrapping title for sub-section rows. */
+    private fun wrappingTitleArea(text: String): JTextArea = JTextArea(text).apply {
+        isEditable = false
+        isFocusable = false
+        isOpaque = false
+        lineWrap = true
+        wrapStyleWord = true
+        margin = JBUI.insets(0)
+        border = JBUI.Borders.empty()
+        font = JBUI.Fonts.label()
+        foreground = UIManager.getColor("Label.foreground") ?: foreground
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+    }
+
+    /**
+     * A BorderLayout sub-section row whose height tracks the wrapped [title] at the
+     * current width. [west]/[east] (badge/tag/actions) stay vertically centered; their
+     * widths are reserved so the title's wrap width — and the row height — are stable.
+     */
+    private fun wrappingRow(west: JComponent?, title: JTextArea, east: JComponent?, leftIndent: Int): JPanel {
+        val gap = JBUI.scale(4)
+        val row = object : JPanel(BorderLayout(gap, 0)) {
+            override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
+            override fun getPreferredSize(): Dimension {
+                val base = super.getPreferredSize()
+                val w = width
+                if (w <= 0) return base
+                val ins = insets
+                val wW = west?.preferredSize?.width ?: 0
+                val eW = east?.preferredSize?.width ?: 0
+                val gaps = gap * listOfNotNull(west, east).size
+                val tW = (w - ins.left - ins.right - wW - eW - gaps).coerceAtLeast(JBUI.scale(20))
+                title.setSize(tW, Short.MAX_VALUE.toInt())
+                val cH = maxOf(
+                    title.preferredSize.height,
+                    west?.preferredSize?.height ?: 0,
+                    east?.preferredSize?.height ?: 0,
+                    JBUI.scale(16),
+                )
+                return Dimension(w, cH + ins.top + ins.bottom)
+            }
+        }.apply {
+            isOpaque = false
+            border = JBUI.Borders.empty(1, leftIndent, 1, 4)
+            alignmentX = Component.LEFT_ALIGNMENT
+            if (west != null) add(west, BorderLayout.WEST)
+            add(title, BorderLayout.CENTER)
+            if (east != null) add(east, BorderLayout.EAST)
+        }
+        row.addComponentListener(object : java.awt.event.ComponentAdapter() {
+            override fun componentResized(e: java.awt.event.ComponentEvent) { row.revalidate() }
+        })
+        return row
+    }
+
+    /**
+     * Adds the shared translucent hover bar to an expanded sub-section row (the row is
+     * transparent until hovered). Attached to the row + its children so the bar shows
+     * regardless of which child the pointer enters; the exit is bounds-checked against
+     * the row so moving between children doesn't flicker it.
+     */
+    private fun attachRowHoverBar(row: JPanel, children: List<Component>) {
+        val hover = object : MouseAdapter() {
+            override fun mouseEntered(e: MouseEvent) {
+                row.isOpaque = true
+                row.background = RowStyle.HOVER_BG
+                row.repaint()
+            }
+            override fun mouseExited(e: MouseEvent) {
+                val src = e.source as? Component ?: return
+                if (src.isShowing && row.isShowing) {
+                    val screen = src.locationOnScreen.apply { translate(e.x, e.y) }
+                    val loc = row.locationOnScreen
+                    if (java.awt.Rectangle(loc.x, loc.y, row.width, row.height).contains(screen)) return
+                }
+                row.isOpaque = false
+                row.background = null
+                row.repaint()
+            }
+        }
+        row.addMouseListener(hover)
+        children.forEach { it.addMouseListener(hover) }
     }
 
     /**
@@ -1041,22 +1195,14 @@ class CommitsPanel(
      */
     private fun conversationRow(commit: CommitSummaryBrief, c: ConversationBrief): JComponent {
         val badge = SourceBadge.leadFor(c.source)
-        val title = JLabel(c.title).apply { minimumSize = Dimension(0, preferredSize.height) }
+        val title = wrappingTitleArea(c.title)
         val count = JLabel("${c.messageCount} msg${if (c.messageCount != 1) "s" else ""}").apply {
             foreground = UIManager.getColor("Component.infoForeground") ?: Color.GRAY
             font = font.deriveFont(font.size2D - 1f)
         }
-        // hgap 0 (+ explicit strut) so the badge starts flush at the 24px indent —
-        // a FlowLayout hgap would add a leading gap and push it right of SHIPPED/FILES.
-        val left = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
-            isOpaque = false
-            add(badge)
-            add(Box.createHorizontalStrut(JBUI.scale(6)))
-            add(title)
-        }
 
         // Hover actions (hidden until hover): Open conversation · Resume (only if local session exists).
-        val openBtn = convoActionIcon(JolliMemoryIcons.Eye, "Open conversation") { _ -> openCommittedConversation(c) }
+        val openBtn = convoActionIcon(JolliMemoryIcons.Eye, "Open conversation") { _ -> openCommittedConversation(commit, c) }
         val fileExists = !c.transcriptPath.isNullOrBlank() && File(c.transcriptPath).exists()
         val canResume = c.source == "claude" && fileExists
         log.info("conversationRow: source=${c.source}, sessionId=${c.sessionId}, transcriptPath=${c.transcriptPath}, fileExists=$fileExists, canResume=$canResume")
@@ -1069,53 +1215,64 @@ class CommitsPanel(
         } else {
             listOf(openBtn)
         }
-        val east = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(2), 0)).apply {
+        val eastInner = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(2), 0)).apply {
             isOpaque = false
             add(count)
             actions.forEach { add(it) }
         }
-
-        val row = JPanel(BorderLayout()).apply {
-            isOpaque = false
-            border = JBUI.Borders.empty(1, 24, 1, 4)
-            alignmentX = Component.LEFT_ALIGNMENT
-            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-            add(left, BorderLayout.CENTER)
-            add(east, BorderLayout.EAST)
-            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+        // Reserve the wider of the count vs hover-actions widths so the title's wrap
+        // width (and the row height) stay stable when they swap on hover.
+        count.isVisible = false; actions.forEach { it.isVisible = true }
+        val actionsW = eastInner.preferredSize.width
+        count.isVisible = true; actions.forEach { it.isVisible = false }
+        val reservedEastW = maxOf(actionsW, eastInner.preferredSize.width)
+        val west = RowStyle.vCenter(badge)
+        val east = RowStyle.vCenter(eastInner).apply {
+            preferredSize = Dimension(reservedEastW, JBUI.scale(16))
+            minimumSize = Dimension(reservedEastW, 0)
         }
+        val row = wrappingRow(west, title, east, leftIndent = 24)
 
         // Swap count ↔ actions on hover; bounds-check on exit so moving onto the
         // action icons (still inside the row) doesn't flicker them away.
         val hover = object : MouseAdapter() {
             override fun mouseEntered(e: MouseEvent) {
+                row.isOpaque = true
+                row.background = RowStyle.HOVER_BG
+                row.repaint()
                 count.isVisible = false
                 actions.forEach { it.isVisible = true }
             }
             override fun mouseExited(e: MouseEvent) {
                 val src = e.source as Component
-                if (!src.isShowing || !row.isShowing) {
+                fun clear() {
+                    row.isOpaque = false
+                    row.background = null
+                    row.repaint()
                     count.isVisible = true
                     actions.forEach { it.isVisible = false }
+                }
+                if (!src.isShowing || !row.isShowing) {
+                    clear()
                     return
                 }
                 val screen = src.locationOnScreen.apply { translate(e.x, e.y) }
                 val loc = row.locationOnScreen
                 if (!java.awt.Rectangle(loc.x, loc.y, row.width, row.height).contains(screen)) {
-                    count.isVisible = true
-                    actions.forEach { it.isVisible = false }
+                    clear()
                 }
             }
         }
         val click = object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
-                if (SwingUtilities.isLeftMouseButton(e)) openCommittedConversation(c)
+                if (SwingUtilities.isLeftMouseButton(e)) openCommittedConversation(commit, c)
             }
         }
-        for (cc in listOf(row, left, title, badge, count)) {
+        for (cc in listOf(row, west, badge, title)) {
             cc.addMouseListener(hover)
             cc.addMouseListener(click)
         }
+        for (cc in listOf(eastInner, count)) cc.addMouseListener(hover)
         actions.forEach { it.addMouseListener(hover) }
         return row
     }
@@ -1140,18 +1297,40 @@ class CommitsPanel(
      * transcript path; degrades to a message when the original file isn't
      * recorded / resolvable.
      */
-    private fun openCommittedConversation(c: ConversationBrief) {
+    private fun openCommittedConversation(commit: CommitSummaryBrief, c: ConversationBrief) {
         val cwd = service.mainRepoRoot ?: project.basePath ?: return
         val source = TranscriptSource.entries.firstOrNull { it.name == c.source }
         val path = c.transcriptPath
-        if (source == null || path.isNullOrBlank()) {
-            com.intellij.openapi.ui.Messages.showInfoMessage(
-                project,
-                "The original conversation file for this memory isn't available to open.",
-                "Open Conversation",
+        // The live transcript file may be gone (deleted / never recorded). When it can't
+        // be opened, render the conversation stored in the memory itself (read-only),
+        // falling back to the commit memory only if even that isn't available.
+        if (source == null || path.isNullOrBlank() || !File(path).exists()) {
+            ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+                "memory_item_opened",
+                mapOf("item_type" to "conversation", "render" to "stored", "source" to c.source),
             )
+            ApplicationManager.getApplication().executeOnPooledThread {
+                // For squashed memories the transcript lives on the child commit, not the
+                // displayed parent — read from sourceCommitHash when present.
+                val md = service.readCommittedConversationMarkdown(c.sourceCommitHash ?: commit.hash, c.sessionId)
+                SwingUtilities.invokeLater {
+                    when {
+                        md != null -> openMarkdownContent(md, c.title)
+                        commit.hasSummary -> viewSummary(commit.hash)
+                        else -> com.intellij.openapi.ui.Messages.showInfoMessage(
+                            project,
+                            "The conversation for this memory isn't available to open.",
+                            "Open Conversation",
+                        )
+                    }
+                }
+            }
             return
         }
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+            "memory_item_opened",
+            mapOf("item_type" to "conversation", "render" to "live", "source" to c.source),
+        )
         val item = ActiveConversationItem(
             sessionId = c.sessionId,
             source = source,
@@ -1165,32 +1344,50 @@ class CommitsPanel(
             .openFile(ConversationVirtualFile(item, cwd), true)
     }
 
-    /** A CONTEXT row: a small kind tag (P / N / L / GH …) + title, optionally a link. */
-    private fun contextRow(tag: String, title: String, url: String?): JComponent {
+    /**
+     * A CONTEXT row: a small kind tag (P / N / L / GH …) + wrapping title. Clicking runs
+     * [onClick] (open the plan/note body or the reference link). [isLink] styles the
+     * title as a link.
+     */
+    private fun contextRow(tag: String, title: String, isLink: Boolean, onClick: () -> Unit): JComponent {
         val tagLabel = chip(tag, CHIP_DIM_COLOR)
-        val titleLabel = JLabel(title).apply {
-            if (url != null) {
-                foreground = JBUI.CurrentTheme.Link.Foreground.ENABLED
-                cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        val titleArea = wrappingTitleArea(title).apply {
+            if (isLink) foreground = JBUI.CurrentTheme.Link.Foreground.ENABLED
+        }
+        val west = RowStyle.vCenter(JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply { isOpaque = false; add(tagLabel) })
+        val row = wrappingRow(west, titleArea, east = null, leftIndent = 24)
+        val click = object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (e.clickCount == 1 && SwingUtilities.isLeftMouseButton(e)) onClick()
             }
-            minimumSize = Dimension(0, preferredSize.height)
         }
-        val row = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
-            isOpaque = false
-            border = JBUI.Borders.empty(1, 24, 1, 4)
-            alignmentX = Component.LEFT_ALIGNMENT
-            add(tagLabel)
-            add(Box.createHorizontalStrut(JBUI.scale(6)))
-            add(titleLabel)
-            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
-        }
-        if (url != null) {
-            val click = object : MouseAdapter() {
-                override fun mouseClicked(e: MouseEvent) { if (e.clickCount == 1) BrowserUtil.browse(url) }
-            }
-            titleLabel.addMouseListener(click); row.addMouseListener(click)
-        }
+        titleArea.addMouseListener(click); row.addMouseListener(click)
+        attachRowHoverBar(row, listOf(tagLabel, titleArea, west))
         return row
+    }
+
+    /** Opens markdown [content] read-only in a preview editor (in-memory, no disk file). */
+    private fun openMarkdownContent(content: String, name: String) {
+        val safeName = if (name.endsWith(".md")) name else "$name.md"
+        val vf = com.intellij.testFramework.LightVirtualFile(safeName, content).apply { isWritable = false }
+        MarkdownPreview.open(project, vf)
+    }
+
+    /**
+     * Reads an archived plan/note body from committed-memory storage (off the EDT) and
+     * opens it read-only; falls back to the commit memory if the body isn't found.
+     */
+    private fun openArchivedMarkdown(commit: CommitSummaryBrief, title: String, read: () -> String?) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val body = read()
+            SwingUtilities.invokeLater {
+                if (body != null) {
+                    openMarkdownContent(body, title)
+                } else if (commit.hasSummary) {
+                    viewSummary(commit.hash)
+                }
+            }
+        }
     }
 
     /** A plain indented detail row (fallbacks / placeholders). */
@@ -1224,53 +1421,43 @@ class CommitsPanel(
             border = JBUI.Borders.emptyRight(4)
         }
 
+        // Filename (line 1, status-colored) + relative path (line 2, grey) — always two
+        // lines so long paths are readable; each ellipsizes when too narrow. Matches the
+        // WORKING MEMORY Files rows.
         val nameLabel = JLabel(fileName).apply {
             foreground = statusColor(file.statusCode)
+            minimumSize = Dimension(0, preferredSize.height)
+            alignmentX = Component.LEFT_ALIGNMENT
         }
-
         val pathLabel = JLabel(file.relativePath).apply {
             foreground = Color.GRAY
+            font = font.deriveFont(font.size2D - 1f)
             minimumSize = Dimension(0, preferredSize.height)
+            alignmentX = Component.LEFT_ALIGNMENT
         }
-
-        // Left side: icon + filename + path
-        val leftPanel = JPanel(GridBagLayout()).apply {
+        val centerPanel = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = false
-            val gbc = GridBagConstraints().apply {
-                gridy = 0
-                anchor = GridBagConstraints.WEST
-                fill = GridBagConstraints.NONE
-                weighty = 1.0
-            }
-
-            gbc.gridx = 0; gbc.weightx = 0.0; gbc.insets = JBUI.insetsRight(4)
-            add(iconLabel, gbc)
-
-            gbc.gridx = 1; gbc.insets = JBUI.emptyInsets()
-            add(nameLabel, gbc)
-
-            gbc.gridx = 2; gbc.weightx = 1.0; gbc.fill = GridBagConstraints.HORIZONTAL
-            gbc.insets = JBUI.insetsLeft(6)
-            add(pathLabel, gbc)
+            add(nameLabel)
+            add(pathLabel)
         }
+        val iconWrap = RowStyle.vCenter(iconLabel)
 
-        // Right side: status badge
+        // Right side: status badge, vertically centered.
         val statusLabel = JLabel(file.statusCode).apply {
             foreground = statusColor(file.statusCode)
             border = JBUI.Borders.emptyRight(4)
         }
-        val rightPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
-            isOpaque = false
-            add(statusLabel)
-        }
+        val rightWrap = RowStyle.vCenter(JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply { isOpaque = false; add(statusLabel) })
 
-        val row = JPanel(BorderLayout()).apply {
+        val row = JPanel(BorderLayout(JBUI.scale(4), 0)).apply {
             isOpaque = false
             // Indent file rows under their parent commit
             border = JBUI.Borders.empty(1, 24, 1, 4)
             alignmentX = Component.LEFT_ALIGNMENT
-            add(leftPanel, BorderLayout.CENTER)
-            add(rightPanel, BorderLayout.EAST)
+            add(iconWrap, BorderLayout.WEST)
+            add(centerPanel, BorderLayout.CENTER)
+            add(rightWrap, BorderLayout.EAST)
             toolTipText = file.relativePath
         }
 
@@ -1284,6 +1471,7 @@ class CommitsPanel(
             child.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
             child.addMouseListener(diffClickListener)
         }
+        attachRowHoverBar(row, listOf(iconLabel, nameLabel, pathLabel, statusLabel, centerPanel, iconWrap, rightWrap))
 
         row.maximumSize = Dimension(Int.MAX_VALUE, row.preferredSize.height)
         return row
@@ -1299,6 +1487,10 @@ class CommitsPanel(
      * - Modified/Renamed files: parent content -> commit content
      */
     private fun openCommitFileDiff(commitHash: String, file: CommitFileInfo) {
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+            "memory_item_opened",
+            mapOf("item_type" to "file", "status" to file.statusCode),
+        )
         ApplicationManager.getApplication().executeOnPooledThread {
             val gitOps = service.getGitOps() ?: return@executeOnPooledThread
 
@@ -1533,6 +1725,7 @@ class CommitsPanel(
         val cwd = service.mainRepoRoot ?: project.basePath
         log.info("resumeInTerminal: sessionId=$sessionId, cwd=$cwd")
         if (cwd == null) return
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track("session_resumed", mapOf("source" to "claude"))
         TerminalUtils.resumeClaudeSession(project, sessionId, cwd)
     }
 
@@ -1563,6 +1756,7 @@ class CommitsPanel(
         val prompt = "Invoke the \"jolli-recall\" skill with args \"$branch\"."
         val clipboard = Toolkit.getDefaultToolkit().systemClipboard
         clipboard.setContents(StringSelection(prompt), null)
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track("recall_prompt_copied")
         com.intellij.openapi.ui.Messages.showInfoMessage(
             project,
             "Recall prompt copied \u2014 paste it into Claude Code.",

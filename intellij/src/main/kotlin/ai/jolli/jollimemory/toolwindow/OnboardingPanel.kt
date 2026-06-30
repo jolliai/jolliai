@@ -183,6 +183,7 @@ class OnboardingPanel(
 			ApplicationManager.getApplication().executeOnPooledThread {
 				if (!service.isInitialized) service.initialize()
 				service.install()
+				ai.jolli.jollimemory.core.telemetry.Telemetry.track("surface_enabled", mapOf("trigger" to "onboarding"))
 				service.refreshStatus()
 				SwingUtilities.invokeLater {
 					saveButton.isEnabled = true
@@ -245,6 +246,8 @@ class OnboardingPanel(
 		signInButton.isEnabled = false
 		signInButton.text = "Signing in..."
 		JolliAuthService.login(
+			// User-initiated sign-in: mint a fresh key so a revoked same-tenant key recovers.
+			forceFreshApiKey = true,
 			onSuccess = { _ ->
 				// Save aiProvider to config so isConfigured() picks it up
 				val configDir = SessionTracker.getGlobalConfigDir()
@@ -258,6 +261,7 @@ class OnboardingPanel(
 				ApplicationManager.getApplication().executeOnPooledThread {
 					if (!service.isInitialized) service.initialize()
 					service.install()
+					ai.jolli.jollimemory.core.telemetry.Telemetry.track("surface_enabled", mapOf("trigger" to "onboarding"))
 					service.refreshStatus()
 					// Button state reset handled by auth listener
 				}
