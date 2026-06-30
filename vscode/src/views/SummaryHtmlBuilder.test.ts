@@ -247,6 +247,16 @@ describe("SummaryHtmlBuilder", () => {
 	// ─── buildHtml ────────────────────────────────────────────────────────────
 
 	describe("buildHtml", () => {
+		it("renders a top-level Conversations section and no private drawer", () => {
+			const html = buildHtml(makeSummary(), {
+				transcriptHashSet: new Set(["t1"]),
+			});
+			expect(html).toContain("Conversations");
+			// 1b: the demoted bottom 'All Conversations' PRIVATE drawer is gone.
+			expect(html).not.toContain('id="privateDrawer"');
+			expect(html).not.toContain("PRIVATE");
+		});
+
 		it("returns a valid HTML document structure", () => {
 			const html = buildHtml(makeSummary());
 			expect(html).toContain("<!DOCTYPE html>");
@@ -292,10 +302,12 @@ describe("SummaryHtmlBuilder", () => {
 				"e2ePanel",
 				"attachmentsPanel",
 				"plansCard",
-				"privateDrawer",
 			]) {
 				expect(html).toContain(`id="${id}"`);
 			}
+			// privateDrawer is gone; conversations are now a top-level section
+			expect(html).not.toContain('id="privateDrawer"');
+			expect(html).toContain('class="section conversations-section"');
 			expect(html).toContain('class="ship-bar"');
 			expect(html).toContain('class="meta-strip"');
 			// Refresh-target sections must keep their ids (replaceSection contract)
@@ -1050,13 +1062,14 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).not.toContain("stat-turns");
 		});
 
-		it("All Conversations section shows empty message when no transcripts", () => {
+		it("Conversations section shows empty message when no transcripts", () => {
 			const html = buildHtml(makeSummary());
-			expect(html).toContain("All Conversations");
+			// The section title is now "Conversations" (top-level, no PRIVATE badge)
+			expect(html).toContain("Conversations");
 			expect(html).toContain(
 				"No conversation transcripts saved for this commit.",
 			);
-			expect(html).toContain("PRIVATE");
+			expect(html).not.toContain("PRIVATE");
 		});
 
 		it("All Conversations section with empty set shows empty message", () => {

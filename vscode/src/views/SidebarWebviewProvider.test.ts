@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
 	SidebarInboundMsg,
@@ -105,6 +108,26 @@ function makeMockView(): MockWebviewView {
 		visible: true,
 		badge: undefined,
 	};
+}
+
+/**
+ * Polls the webview's posted messages until one of `type` appears (or the tick
+ * budget runs out), returning every message sent so far. A plain single-tick
+ * `await setTimeout(0)` is not enough for handlers whose work spans multiple
+ * async turns (e.g. pushMemoryEvidence resolves Claude titles by reading the
+ * live transcript off disk) — without polling those assertions flake.
+ */
+async function flushUntilMessage(
+	view: MockWebviewView,
+	type: string,
+	maxTicks = 50,
+): Promise<SidebarInboundMsg[]> {
+	for (let i = 0; i < maxTicks; i++) {
+		const sent = view.webview.postMessage.mock.calls.map((c) => c[0] as SidebarInboundMsg);
+		if (sent.some((m) => m.type === type)) return sent;
+		await new Promise((r) => setTimeout(r, 0));
+	}
+	return view.webview.postMessage.mock.calls.map((c) => c[0] as SidebarInboundMsg);
 }
 
 describe("SidebarWebviewProvider", () => {
@@ -233,23 +256,33 @@ describe("SidebarWebviewProvider", () => {
 				},
 				getWorkerBusy: () => busyValue,
 			},
+			getHeadShortHash: () => "269d108",
 		});
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({ type: "ready" });
 		await flushReady();
-		// Initial pushStatus on ready: busy=false.
+		// Initial pushStatus on ready: busy=false, and no commit hash attached
+		// while idle (the git call is skipped unless busy).
 		const initial = view.webview.postMessage.mock.calls.map((c) => c[0]);
 		expect(
-			initial.some((m) => m.type === "worker:busy" && m.busy === false),
+			initial.some(
+				(m) =>
+					m.type === "worker:busy" &&
+					m.busy === false &&
+					m.commit === undefined,
+			),
 		).toBe(true);
 		// Flip the flag and re-fire onDidChangeTreeData; expect a follow-up push
-		// with busy=true.
+		// with busy=true carrying the HEAD short hash for the Summarizing row.
 		busyValue = true;
 		storedHandler?.();
 		const after = view.webview.postMessage.mock.calls.map((c) => c[0]);
-		expect(after.some((m) => m.type === "worker:busy" && m.busy === true)).toBe(
-			true,
-		);
+		expect(
+			after.some(
+				(m) =>
+					m.type === "worker:busy" && m.busy === true && m.commit === "269d108",
+			),
+		).toBe(true);
 	});
 
 	it("posts an empty-tree kb:foldersData when listChildren rejects (so webview leaves Loading)", async () => {
@@ -1468,6 +1501,54 @@ describe("SidebarWebviewProvider", () => {
 		expect(exec).toHaveBeenCalledWith("jollimemory.refreshHistory");
 	});
 
+	it("handles refresh scope='branch-current' by refreshing the draft only (not history)", () => {
+		const view = makeMockView();
+		const exec = vi.fn().mockResolvedValue(undefined);
+		const provider = new SidebarWebviewProvider({
+			executeCommand: exec,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		exec.mockClear();
+		view.webview.triggerMessage({ type: "refresh", scope: "branch-current" });
+		const cmds = exec.mock.calls.map((c) => c[0]);
+		expect(cmds).toContain("jollimemory.refreshPlans");
+		expect(cmds).toContain("jollimemory.refreshFiles");
+		expect(cmds).not.toContain("jollimemory.refreshHistory");
+	});
+
+	it("handles refresh scope='branch-commits' by refreshing history only (not the draft)", () => {
+		const view = makeMockView();
+		const exec = vi.fn().mockResolvedValue(undefined);
+		const provider = new SidebarWebviewProvider({
+			executeCommand: exec,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		exec.mockClear();
+		view.webview.triggerMessage({ type: "refresh", scope: "branch-commits" });
+		const cmds = exec.mock.calls.map((c) => c[0]);
+		expect(cmds).toContain("jollimemory.refreshHistory");
+		expect(cmds).not.toContain("jollimemory.refreshPlans");
+		expect(cmds).not.toContain("jollimemory.refreshFiles");
+	});
+
 	it("handles refresh scope='status' by invoking jollimemory.refreshStatus", () => {
 		const view = makeMockView();
 		const exec = vi.fn().mockResolvedValue(undefined);
@@ -1546,6 +1627,34 @@ describe("SidebarWebviewProvider", () => {
 					(m as { type?: unknown; enabled?: unknown }).type ===
 						"enabled:changed" &&
 					(m as { enabled?: unknown }).enabled === false,
+			),
+		).toBe(true);
+	});
+
+	it("toggleStatus posts status:toggle", () => {
+		const view = makeMockView();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		provider.toggleStatus();
+		const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+		expect(
+			sent.some(
+				(m) =>
+					typeof m === "object" &&
+					m !== null &&
+					(m as { type?: unknown }).type === "status:toggle",
 			),
 		).toBe(true);
 	});
@@ -1881,6 +1990,27 @@ describe("SidebarWebviewProvider", () => {
 			selected: true,
 		});
 		expect(applyCommitCheckbox).toHaveBeenCalledWith("abc1234", true);
+	});
+
+	it("branch:deselectAllCommits forwards to deps.deselectAllCommits", () => {
+		const view = makeMockView();
+		const deselectAllCommits = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			deselectAllCommits,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "branch:deselectAllCommits" });
+		expect(deselectAllCommits).toHaveBeenCalledTimes(1);
 	});
 
 	it("dispatches branch:toggleConversationSelection to applyConversationCheckbox", () => {
@@ -2630,7 +2760,7 @@ describe("SidebarWebviewProvider", () => {
 		});
 	});
 
-	it("selection:request with only branchName posts selection:set without re-listing branches", () => {
+	it("selection:request with only branchName posts selection:set without re-listing branches", async () => {
 		const view = makeMockView();
 		const listRepos = vi.fn().mockReturnValue([
 			{ repoName: "workspace-repo", isCurrent: true },
@@ -2655,16 +2785,17 @@ describe("SidebarWebviewProvider", () => {
 			branchName: "draft",
 		});
 		expect(listBranches).not.toHaveBeenCalled();
+		await new Promise((r) => setTimeout(r, 0));
 		const sent = view.webview.postMessage.mock.calls.map(
 			(c) => c[0],
 		) as SidebarInboundMsg[];
-		expect(sent).toEqual([
-			{
-				type: "selection:set",
-				repoName: "other-repo",
-				branchName: "draft",
-			},
-		]);
+		// selection:set is the primary assertion; branch:pinsData follows (pushPins on branch switch).
+		expect(sent).toContainEqual({
+			type: "selection:set",
+			repoName: "other-repo",
+			branchName: "draft",
+		});
+		expect(sent).toContainEqual({ type: "branch:pinsData", items: [] });
 	});
 
 	it("selection:request for an unknown repo is a no-op (no messages, no state mutation)", () => {
@@ -3394,6 +3525,2018 @@ describe("SidebarWebviewProvider", () => {
 				view.webview.triggerMessage({ type: "refresh", scope: "branch" } as SidebarOutboundMsg),
 			).not.toThrow();
 			expect(discover).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	describe("kb:expandMemory → kb:memoryEvidence", () => {
+		it("posts kb:memoryEvidence with projected conversations/context/files from the summary", async () => {
+			const view = makeMockView();
+			const fakeSummary = {
+				version: 5,
+				commitHash: "abc1234",
+				commitMessage: "feat: add widget",
+				commitAuthor: "Dev",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				transcripts: ["tid-1"],
+				plans: [{ slug: "plan-a", title: "Plan A", addedAt: "2024-01-01T00:00:00Z", updatedAt: "2024-01-01T00:00:00Z" }],
+				notes: [{ id: "note-1", title: "Note 1", format: "markdown" as const, addedAt: "2024-01-01T00:00:00Z", updatedAt: "2024-01-01T00:00:00Z" }],
+				references: [{ archivedKey: "linear:PROJ-1", source: "linear" as const, nativeId: "PROJ-1", title: "PROJ-1", url: "https://linear.app/proj-1" }],
+				topics: [
+					{ title: "Widget", trigger: "x", response: "y", decisions: "z", filesAffected: ["src/widget.ts", "src/index.ts"] },
+					{ title: "Tests", trigger: "a", response: "b", decisions: "c", filesAffected: ["src/widget.ts", "src/widget.test.ts"] },
+				],
+			};
+			const fakeTranscript = {
+				sessions: [
+					{ sessionId: "sess-abc", source: "claude" as const, transcriptPath: "/tmp/claude.jsonl" },
+				],
+			};
+			const getSummaryByHash = vi.fn().mockResolvedValue(fakeSummary);
+			const readTranscriptById = vi.fn().mockResolvedValue(fakeTranscript);
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+					currentRepoName: "myrepo",
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash,
+				readTranscriptById,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "abc1234" });
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
+			expect(evidenceMsg).toBeDefined();
+			expect(evidenceMsg.commitHash).toBe("abc1234");
+			// conversations: one item from the fake transcript session
+			expect(evidenceMsg.evidence.conversations).toHaveLength(1);
+			expect(evidenceMsg.evidence.conversations[0]).toMatchObject({
+				kind: "conversation",
+				id: "sess-abc",
+				source: "claude",
+				transcriptPath: "/tmp/claude.jsonl",
+				// No `entries` on the fake session → archived turn count falls back to 0.
+				messageCount: 0,
+			});
+			// context: plan + note + reference
+			expect(evidenceMsg.evidence.context).toHaveLength(3);
+			expect(evidenceMsg.evidence.context.find((i: { kind: string }) => i.kind === "plan")?.id).toBe("plan-a");
+			expect(evidenceMsg.evidence.context.find((i: { kind: string }) => i.kind === "note")?.id).toBe("note-1");
+			const refItem = evidenceMsg.evidence.context.find((i: { kind: string }) => i.kind === "reference");
+			expect(refItem?.id).toBe("linear:PROJ-1");
+			// `source` must ride along — the Timeline reads the archived reference
+			// snapshot by source + archivedKey (the live mapKey path is dead post-commit).
+			expect(refItem?.source).toBe("linear");
+			// Local memory (getSummaryByHash, no provenance): sourceRepoName is null.
+			expect(evidenceMsg.evidence.sourceRepoName).toBeNull();
+			// files: deduplicated across topics
+			expect(evidenceMsg.evidence.files).toHaveLength(3);
+			const filePaths = evidenceMsg.evidence.files.map((f: { relativePath: string }) => f.relativePath);
+			expect(filePaths).toContain("src/widget.ts");
+			expect(filePaths).toContain("src/index.ts");
+			expect(filePaths).toContain("src/widget.test.ts");
+		});
+
+		it("dedupes a session spanning multiple transcripts into a single conversation row, merging its entry slices", async () => {
+			// A long-running session is captured once per commit it spans: each
+			// transcript file holds only the unread turns consumed at THAT commit
+			// (disjoint, sequential slices — NOT a full copy). A consolidated /
+			// squashed summary references every such transcript, so flattening
+			// `stored.sessions` across them used to emit one duplicate row per
+			// transcript (observed: 17 identical-title rows for one session). All
+			// rows shared `${source}:${sessionId}:${commitHash}`, so the panel
+			// registry collapsed them to a single panel — clicking any row past the
+			// first only re-revealed the first. Dedupe by (source, sessionId),
+			// concatenating slices in first-seen order to reconstruct the full
+			// conversation.
+			const view = makeMockView();
+			const fakeSummary = {
+				version: 5,
+				commitHash: "dup1234",
+				commitMessage: "consolidated work",
+				commitAuthor: "Dev",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				transcripts: ["tid-1", "tid-2", "tid-3"],
+				topics: [],
+			};
+			// Same (source, sessionId) in every transcript, each carrying a
+			// different sequential slice of the conversation.
+			const sliceFor = (tid: string) => ({
+				sessions: [
+					{
+						sessionId: "sess-dup",
+						source: "claude" as const,
+						transcriptPath: "/tmp/dup.jsonl",
+						entries:
+							tid === "tid-1"
+								? [{ role: "human" as const, content: "实现去重逻辑" }]
+								: tid === "tid-2"
+									? [{ role: "assistant" as const, content: "Task 1 DONE" }]
+									: [{ role: "assistant" as const, content: "Task 2 DONE" }],
+					},
+				],
+			});
+			const readTranscriptById = vi.fn().mockImplementation((tid: string) => Promise.resolve(sliceFor(tid)));
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash: vi.fn().mockResolvedValue(fakeSummary),
+				readTranscriptById,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "dup1234" });
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
+			expect(evidenceMsg).toBeDefined();
+			// One row, not three — the session is collapsed across transcripts.
+			expect(evidenceMsg.evidence.conversations).toHaveLength(1);
+			expect(evidenceMsg.evidence.conversations[0]).toMatchObject({
+				kind: "conversation",
+				id: "sess-dup",
+				source: "claude",
+			});
+			// Title resolves from the merged first human turn (slice order preserved).
+			expect(evidenceMsg.evidence.conversations[0].title).toBe("实现去重逻辑");
+			// messageCount counts the merged archived turns across all 3 slices.
+			expect(evidenceMsg.evidence.conversations[0].messageCount).toBe(3);
+		});
+
+		it("enriches local-memory file evidence with real git status via listCommitFiles (added/renamed diff correctly)", async () => {
+			// REGRESSION: file evidence was projected from summary.topics[].filesAffected
+			// (path-only), so statusCode defaulted to 'M'. Added/deleted/renamed files
+			// then diffed against the parent commit where they don't exist → the editor
+			// errored "file was not found". The fix sources files from git truth
+			// (listCommitFiles), the same path the Branch-tab commit-file rows use.
+			const view = makeMockView();
+			const fakeSummary = {
+				version: 5,
+				commitHash: "fff1234",
+				commitMessage: "feat: files",
+				commitAuthor: "Dev",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				transcripts: [],
+				// Topic paths are now ignored when git truth is available — and they
+				// deliberately disagree with the commit's real file set below.
+				topics: [{ title: "t", trigger: "x", response: "y", decisions: "z", filesAffected: ["src/stale.ts"] }],
+			};
+			const listCommitFiles = vi.fn().mockResolvedValue([
+				{ relativePath: "src/added.ts", statusCode: "A" },
+				{ relativePath: "src/mod.ts", statusCode: "M" },
+				{ relativePath: "src/new-name.ts", statusCode: "R", oldPath: "src/old-name.ts" },
+			]);
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash: vi.fn().mockResolvedValue(fakeSummary),
+				listCommitFiles,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "fff1234" });
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const ev = sent.find((m) => m.type === "kb:memoryEvidence");
+			expect(listCommitFiles).toHaveBeenCalledWith("fff1234");
+			const files = ev.evidence.files as Array<{ relativePath: string; statusCode?: string; oldPath?: string }>;
+			// Files are the commit's real changed set (git truth), not the stale topic path.
+			expect(files.map((f) => f.relativePath)).toEqual(["src/added.ts", "src/mod.ts", "src/new-name.ts"]);
+			expect(files.find((f) => f.relativePath === "src/added.ts")?.statusCode).toBe("A");
+			const renamed = files.find((f) => f.relativePath === "src/new-name.ts");
+			expect(renamed?.statusCode).toBe("R");
+			expect(renamed?.oldPath).toBe("src/old-name.ts");
+		});
+
+		it("falls back to topic file paths when listCommitFiles yields nothing (e.g. unreadable commit)", async () => {
+			const view = makeMockView();
+			const fakeSummary = {
+				version: 5,
+				commitHash: "eee1234",
+				commitMessage: "feat: x",
+				commitAuthor: "Dev",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				transcripts: [],
+				topics: [{ title: "t", trigger: "x", response: "y", decisions: "z", filesAffected: ["src/a.ts", "src/b.ts"] }],
+			};
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash: vi.fn().mockResolvedValue(fakeSummary),
+				// Rejects → caught → empty → topic fallback.
+				listCommitFiles: vi.fn().mockRejectedValue(new Error("bad object")),
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "eee1234" });
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const ev = sent.find((m) => m.type === "kb:memoryEvidence");
+			const files = ev.evidence.files as Array<{ relativePath: string; statusCode?: string }>;
+			expect(files.map((f) => f.relativePath)).toEqual(["src/a.ts", "src/b.ts"]);
+			// Path-only fallback carries no statusCode (the row defaults to 'M').
+			expect(files[0].statusCode).toBeUndefined();
+		});
+
+		it("derives the conversation title from the archived first human turn, not the session UUID (BUG 1)", async () => {
+			const view = makeMockView();
+			const fakeSummary = {
+				version: 5,
+				commitHash: "ttl1234",
+				commitMessage: "feat: x",
+				commitAuthor: "Dev",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				transcripts: ["tid-1"],
+				topics: [],
+			};
+			// The archived snapshot carries full `entries`; the first human turn
+			// is the title source (matches the working-memory list's label).
+			const fakeTranscript = {
+				sessions: [
+					{
+						sessionId: "a8e0d4cc-92c9-4146-9fe0-0fa2e9f7176d",
+						source: "claude" as const,
+						transcriptPath: "/tmp/claude.jsonl",
+						entries: [
+							{ role: "assistant" as const, content: "Sure, let me look." },
+							{ role: "human" as const, content: "分析迁移统计数据和shard分配" },
+						],
+					},
+				],
+			};
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash: vi.fn().mockResolvedValue(fakeSummary),
+				readTranscriptById: vi.fn().mockResolvedValue(fakeTranscript),
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "ttl1234" });
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
+			expect(evidenceMsg.evidence.conversations).toHaveLength(1);
+			const conv = evidenceMsg.evidence.conversations[0];
+			// id stays the UUID (used to re-find the archived session on click);
+			// title is the human-readable first turn, NOT the UUID.
+			expect(conv.id).toBe("a8e0d4cc-92c9-4146-9fe0-0fa2e9f7176d");
+			expect(conv.title).toBe("分析迁移统计数据和shard分配");
+			expect(conv.title).not.toBe(conv.id);
+		});
+
+		it("uses the Claude ai-title when the live transcript is present, not the raw first turn (parity with working-memory list)", async () => {
+			// Repro for the committed-memory CONVERSATIONS list showing raw first
+			// turns ("继续", "1", "<task-notification>…") instead of the same
+			// human-readable label the working-memory "All Conversations" list
+			// shows. The working-memory list resolves titles via
+			// resolveSessionTitle, which prefers Claude's `ai-title` row; this
+			// surface must too. The `ai-title` row is stripped from the archived
+			// `entries`, so it can only be recovered by re-reading the live
+			// transcript at session.transcriptPath.
+			const dir = mkdtempSync(join(tmpdir(), "jolli-aititle-"));
+			const transcriptPath = join(dir, "claude.jsonl");
+			writeFileSync(
+				transcriptPath,
+				[
+					'{"type":"user","message":{"content":"继续"}}',
+					'{"type":"ai-title","aiTitle":"重新设计 Knowledge 侧边栏","sessionId":"sess-junk"}',
+				].join("\n"),
+			);
+			try {
+				const fakeSummary = {
+					version: 5,
+					commitHash: "ait1234",
+					commitMessage: "feat: x",
+					commitAuthor: "Dev",
+					commitDate: "2024-01-01T00:00:00Z",
+					branch: "main",
+					generatedAt: "2024-01-01T00:01:00Z",
+					transcripts: ["tid-1"],
+					topics: [],
+				};
+				const fakeTranscript = {
+					sessions: [
+						{
+							sessionId: "sess-junk",
+							source: "claude" as const,
+							transcriptPath,
+							// Archived entries: the first human turn is the junk "继续".
+							entries: [{ role: "human" as const, content: "继续" }],
+						},
+					],
+				};
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "kb",
+						kbMode: "memories",
+						branchName: "main",
+						detached: false,
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					getSummaryByHash: vi.fn().mockResolvedValue(fakeSummary),
+					readTranscriptById: vi.fn().mockResolvedValue(fakeTranscript),
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				view.webview.postMessage.mockClear();
+				view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "ait1234" });
+				const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+				const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
+				const conv = evidenceMsg.evidence.conversations[0];
+				expect(conv.title).toBe("重新设计 Knowledge 侧边栏");
+				expect(conv.title).not.toBe("继续");
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("posts empty evidence groups when getSummaryByHash returns undefined", async () => {
+			const view = makeMockView();
+			const getSummaryByHash = vi.fn().mockResolvedValue(undefined);
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "missing123" });
+			await new Promise((r) => setTimeout(r, 0));
+			const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+			const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
+			expect(evidenceMsg).toBeDefined();
+			expect(evidenceMsg.commitHash).toBe("missing123");
+			expect(evidenceMsg.evidence.conversations).toHaveLength(0);
+			expect(evidenceMsg.evidence.context).toHaveLength(0);
+			expect(evidenceMsg.evidence.files).toHaveLength(0);
+		});
+
+		it("posts empty evidence when getSummaryByHash rejects (outer catch)", async () => {
+			const view = makeMockView();
+			const getSummaryByHash = vi.fn().mockRejectedValue(new Error("storage error"));
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "bad456" });
+			await new Promise((r) => setTimeout(r, 0));
+			const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+			const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
+			expect(evidenceMsg).toBeDefined();
+			expect(evidenceMsg.commitHash).toBe("bad456");
+			expect(evidenceMsg.evidence.conversations).toHaveLength(0);
+			expect(evidenceMsg.evidence.context).toHaveLength(0);
+			expect(evidenceMsg.evidence.files).toHaveLength(0);
+		});
+
+		it("skips a transcript ID when readTranscriptById rejects (inner catch)", async () => {
+			const view = makeMockView();
+			const fakeSummary = {
+				version: 5,
+				commitHash: "abc111",
+				commitMessage: "fix: bug",
+				commitAuthor: "Dev",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				transcripts: ["tid-ok", "tid-bad"],
+				plans: [],
+				notes: [],
+				references: [],
+				topics: [],
+			};
+			const getSummaryByHash = vi.fn().mockResolvedValue(fakeSummary);
+			const readTranscriptById = vi.fn()
+				.mockResolvedValueOnce({ sessions: [{ sessionId: "s1", source: "claude" as const, transcriptPath: "/tmp/a.jsonl" }] })
+				.mockRejectedValueOnce(new Error("read failed"));
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash,
+				readTranscriptById,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "abc111" });
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
+			expect(evidenceMsg).toBeDefined();
+			// Only the successful transcript contributes; the failing one is silently skipped.
+			expect(evidenceMsg.evidence.conversations).toHaveLength(1);
+			expect(evidenceMsg.evidence.conversations[0].id).toBe("s1");
+		});
+
+		it("posts empty evidence when getSummaryByHash dep is absent", async () => {
+			const view = makeMockView();
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				// getSummaryByHash intentionally absent
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "nodep123" });
+			await new Promise((r) => setTimeout(r, 0));
+			const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+			const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
+			expect(evidenceMsg).toBeDefined();
+			expect(evidenceMsg.evidence.conversations).toHaveLength(0);
+			expect(evidenceMsg.evidence.context).toHaveLength(0);
+			expect(evidenceMsg.evidence.files).toHaveLength(0);
+		});
+
+		it("populates Conversations from foreign-repo storage when sourceRepoName is set", async () => {
+			// Memory belongs to "other-repo", not the cwd workspace. The transcript
+			// exists in the foreign repo's storage but NOT in the cwd storage. The
+			// cwd-only readTranscriptById returns null; readTranscriptForRepo reads
+			// from the source-specific storage and must return the transcript.
+			const view = makeMockView();
+			const foreignSummary = {
+				version: 5,
+				commitHash: "foreign123",
+				commitMessage: "feat: foreign widget",
+				commitAuthor: "Dev",
+				commitDate: "2024-02-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-02-01T00:01:00Z",
+				transcripts: ["foreign-tid-1"],
+				plans: [],
+				notes: [],
+				references: [],
+				topics: [{ title: "Widget", trigger: "x", response: "y", decisions: "z", filesAffected: ["src/widget.ts"] }],
+			};
+			const foreignTranscript = {
+				sessions: [
+					{ sessionId: "foreign-sess-1", source: "claude" as const, transcriptPath: "/other-repo/claude.jsonl" },
+				],
+			};
+			// getSummaryAnyRepoWithSource returns the summary with sourceRepoName set (foreign repo)
+			const getSummaryAnyRepoWithSource = vi.fn().mockResolvedValue({
+				summary: foreignSummary,
+				sourceRepoName: "other-repo",
+				sourceRemoteUrl: "https://github.com/org/other-repo",
+			});
+			// readTranscriptForRepo returns the transcript when called with the foreign source info,
+			// simulating reading from the foreign repo's storage.
+			const readTranscriptForRepo = vi.fn().mockImplementation(
+				(_id: string, sourceRepoName: string | null, _sourceRemoteUrl: string | null) => {
+					// Only the foreign storage has the transcript; cwd (null) would return null.
+					return Promise.resolve(sourceRepoName === "other-repo" ? foreignTranscript : null);
+				},
+			);
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+					currentRepoName: "my-repo",
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryAnyRepoWithSource,
+				readTranscriptForRepo,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "foreign123" });
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
+			expect(evidenceMsg).toBeDefined();
+			expect(evidenceMsg.commitHash).toBe("foreign123");
+			// Provenance rides along so note/reference opens route to the foreign
+			// storage and file rows render non-interactive in the webview.
+			expect(evidenceMsg.evidence.sourceRepoName).toBe("other-repo");
+			expect(evidenceMsg.evidence.sourceRemoteUrl).toBe("https://github.com/org/other-repo");
+			// Conversations group is POPULATED from the foreign repo's storage
+			expect(evidenceMsg.evidence.conversations).toHaveLength(1);
+			expect(evidenceMsg.evidence.conversations[0]).toMatchObject({
+				kind: "conversation",
+				id: "foreign-sess-1",
+				source: "claude",
+				transcriptPath: "/other-repo/claude.jsonl",
+			});
+			// readTranscriptForRepo was called with the source provenance, not null
+			expect(readTranscriptForRepo).toHaveBeenCalledWith(
+				"foreign-tid-1",
+				"other-repo",
+				"https://github.com/org/other-repo",
+			);
+			// Files come from summary topics (not transcript-dependent)
+			expect(evidenceMsg.evidence.files).toHaveLength(1);
+			expect(evidenceMsg.evidence.files[0].relativePath).toBe("src/widget.ts");
+		});
+	});
+
+	describe("evidence open routing (archived paths)", () => {
+		function makeEvidenceProvider() {
+			const executeCommand = vi.fn().mockResolvedValue(undefined);
+			const view = makeMockView();
+			const provider = new SidebarWebviewProvider({
+				executeCommand,
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+					currentRepoName: "myrepo",
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			return { provider, view, executeCommand };
+		}
+
+		it("kb:openEvidenceNote routes to orphan-only jollimemory.previewNote with provenance", () => {
+			const { view, executeCommand } = makeEvidenceProvider();
+			view.webview.triggerMessage({
+				type: "kb:openEvidenceNote",
+				noteId: "note-7",
+				title: "My Note",
+				sourceRepoName: "other-repo",
+				sourceRemoteUrl: "https://github.com/org/other-repo",
+			});
+			expect(executeCommand).toHaveBeenCalledWith(
+				"jollimemory.previewNote",
+				"note-7",
+				"My Note",
+				"other-repo",
+				"https://github.com/org/other-repo",
+			);
+		});
+
+		it("kb:openEvidencePlan routes to jollimemory.previewCommittedPlan with provenance", () => {
+			const { view, executeCommand } = makeEvidenceProvider();
+			view.webview.triggerMessage({
+				type: "kb:openEvidencePlan",
+				planId: "2026-06-22-some-plan",
+				title: "Some Plan",
+				sourceRepoName: "other-repo",
+				sourceRemoteUrl: "https://github.com/org/other-repo",
+			});
+			expect(executeCommand).toHaveBeenCalledWith(
+				"jollimemory.previewCommittedPlan",
+				"2026-06-22-some-plan",
+				"Some Plan",
+				"other-repo",
+				"https://github.com/org/other-repo",
+			);
+		});
+
+		it("kb:openEvidenceReference routes to jollimemory.previewCommittedReference for a known source", () => {
+			const { view, executeCommand } = makeEvidenceProvider();
+			view.webview.triggerMessage({
+				type: "kb:openEvidenceReference",
+				archivedKey: "linear:PROJ-1-ab12cd34",
+				source: "linear",
+				sourceRepoName: null,
+				sourceRemoteUrl: null,
+			});
+			expect(executeCommand).toHaveBeenCalledWith(
+				"jollimemory.previewCommittedReference",
+				"linear:PROJ-1-ab12cd34",
+				"linear",
+				null,
+				null,
+			);
+		});
+
+		it("kb:openEvidenceReference drops an unknown source without dispatching", () => {
+			const { view, executeCommand } = makeEvidenceProvider();
+			view.webview.triggerMessage({
+				type: "kb:openEvidenceReference",
+				archivedKey: "evil:x",
+				source: "evil",
+				sourceRepoName: null,
+				sourceRemoteUrl: null,
+			});
+			expect(executeCommand).not.toHaveBeenCalled();
+		});
+
+		// BUG 3: a committed-memory conversation row must render the ARCHIVED
+		// snapshot, not the live cursor-trimmed transcript (empty once the turns
+		// are consumed into the commit). The host re-reads the orphan-branch
+		// session by commitHash+sessionId and opens the panel in archived mode.
+		const archivedSummary = {
+			version: 5,
+			commitHash: "arch1234",
+			commitMessage: "feat: y",
+			commitAuthor: "Dev",
+			commitDate: "2024-01-01T00:00:00Z",
+			branch: "main",
+			generatedAt: "2024-01-01T00:01:00Z",
+			transcripts: ["tid-1"],
+			topics: [],
+		};
+		const archivedEntries = [
+			{ role: "human" as const, content: "first turn" },
+			{ role: "assistant" as const, content: "reply" },
+		];
+		const archivedTranscript = {
+			sessions: [
+				{
+					sessionId: "sess-x",
+					source: "claude" as const,
+					transcriptPath: "/tmp/x.jsonl",
+					entries: archivedEntries,
+				},
+			],
+		};
+
+		function makeArchivedConvProvider() {
+			const view = makeMockView();
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash: vi.fn().mockResolvedValue(archivedSummary),
+				readTranscriptById: vi.fn().mockResolvedValue(archivedTranscript),
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			return { provider, view };
+		}
+
+		it("kb:openEvidenceConversation opens the archived snapshot read-only via ConversationDetailsPanel.show (BUG 3)", async () => {
+			showMock.mockReset();
+			const { view } = makeArchivedConvProvider();
+			view.webview.triggerMessage({
+				type: "kb:openEvidenceConversation",
+				commitHash: "arch1234",
+				sessionId: "sess-x",
+				source: "claude",
+				title: "first turn",
+			});
+			await new Promise((r) => setTimeout(r, 0));
+			expect(showMock).toHaveBeenCalledTimes(1);
+			const call = showMock.mock.calls[0][0] as {
+				sessionId: string;
+				source: string;
+				title: string;
+				commitHash: string;
+				archivedEntries: unknown;
+			};
+			expect(call.sessionId).toBe("sess-x");
+			expect(call.source).toBe("claude");
+			expect(call.title).toBe("first turn");
+			// commitHash discriminates the panel registry key; archivedEntries are
+			// the full snapshot the panel renders verbatim (read-only).
+			expect(call.commitHash).toBe("arch1234");
+			expect(call.archivedEntries).toEqual(archivedEntries);
+		});
+
+		it.each([
+			["unknown source", { commitHash: "arch1234", sessionId: "sess-x", source: "evil", title: "t" }],
+			["empty commitHash", { commitHash: "", sessionId: "sess-x", source: "claude", title: "t" }],
+			["empty sessionId", { commitHash: "arch1234", sessionId: "", source: "claude", title: "t" }],
+			["empty title", { commitHash: "arch1234", sessionId: "sess-x", source: "claude", title: "" }],
+		])("rejects kb:openEvidenceConversation with %s", async (_label, fields) => {
+			showMock.mockReset();
+			const { view } = makeArchivedConvProvider();
+			view.webview.triggerMessage({ type: "kb:openEvidenceConversation", ...fields });
+			await new Promise((r) => setTimeout(r, 0));
+			expect(showMock).not.toHaveBeenCalled();
+		});
+
+		it("orders the merged slices chronologically when the transcripts array is not in time order", async () => {
+			// `summary.transcripts` is NOT chronological for a consolidated memory
+			// (observed: a later transcript holding turns from an EARLIER commit).
+			// Each slice is internally time-ordered and a session's slices occupy
+			// disjoint time ranges, so the merge must reorder slices by their start
+			// timestamp — otherwise the panel shows 17:18 → 17:20 → 16:33 jumps.
+			showMock.mockReset();
+			const view = makeMockView();
+			const summary = {
+				version: 5,
+				commitHash: "ord1234",
+				commitMessage: "consolidated",
+				commitAuthor: "Dev",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				// t-late lists FIRST but holds the chronologically EARLIER slice.
+				transcripts: ["t-late", "t-early"],
+				topics: [],
+			};
+			const sliceFor = (tid: string) => ({
+				sessions: [
+					{
+						sessionId: "sess-o",
+						source: "claude" as const,
+						transcriptPath: "/tmp/o.jsonl",
+						entries:
+							tid === "t-late"
+								? [{ role: "assistant" as const, content: "later turn", timestamp: "2026-06-21T17:18:00.000Z" }]
+								: [{ role: "human" as const, content: "earlier turn", timestamp: "2026-06-21T16:33:00.000Z" }],
+					},
+				],
+			});
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash: vi.fn().mockResolvedValue(summary),
+				readTranscriptById: vi.fn().mockImplementation((tid: string) => Promise.resolve(sliceFor(tid))),
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.triggerMessage({
+				type: "kb:openEvidenceConversation",
+				commitHash: "ord1234",
+				sessionId: "sess-o",
+				source: "claude",
+				title: "earlier turn",
+			});
+			await new Promise((r) => setTimeout(r, 0));
+			expect(showMock).toHaveBeenCalledTimes(1);
+			const call = showMock.mock.calls[0][0] as { archivedEntries: { content: string }[] };
+			// Chronological, NOT transcript-array order.
+			expect(call.archivedEntries.map((e) => e.content)).toEqual(["earlier turn", "later turn"]);
+		});
+
+		it("kb:openEvidenceConversation merges the session's slices across transcripts into archivedEntries", async () => {
+			// Mirror of the evidence-projection dedupe on the opener path: the same
+			// session split across three transcripts must open ONE panel rendering
+			// the full reconstructed conversation, not just the first matching slice
+			// (the old sessions.find returned a single transcript's slice).
+			showMock.mockReset();
+			const view = makeMockView();
+			const summary = {
+				version: 5,
+				commitHash: "merge123",
+				commitMessage: "consolidated",
+				commitAuthor: "Dev",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				transcripts: ["t1", "t2", "t3"],
+				topics: [],
+			};
+			const sliceFor = (tid: string) => ({
+				sessions: [
+					{
+						sessionId: "sess-m",
+						source: "claude" as const,
+						transcriptPath: "/tmp/m.jsonl",
+						entries:
+							tid === "t1"
+								? [{ role: "human" as const, content: "turn 1" }]
+								: tid === "t2"
+									? [{ role: "assistant" as const, content: "turn 2" }]
+									: [{ role: "human" as const, content: "turn 3" }],
+					},
+				],
+			});
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash: vi.fn().mockResolvedValue(summary),
+				readTranscriptById: vi.fn().mockImplementation((tid: string) => Promise.resolve(sliceFor(tid))),
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.triggerMessage({
+				type: "kb:openEvidenceConversation",
+				commitHash: "merge123",
+				sessionId: "sess-m",
+				source: "claude",
+				title: "turn 1",
+			});
+			await new Promise((r) => setTimeout(r, 0));
+			expect(showMock).toHaveBeenCalledTimes(1);
+			const call = showMock.mock.calls[0][0] as { archivedEntries: unknown };
+			expect(call.archivedEntries).toEqual([
+				{ role: "human", content: "turn 1" },
+				{ role: "assistant", content: "turn 2" },
+				{ role: "human", content: "turn 3" },
+			]);
+		});
+
+		it("kb:openEvidenceConversation does not open a panel when no session matches", async () => {
+			showMock.mockReset();
+			const { view } = makeArchivedConvProvider();
+			view.webview.triggerMessage({
+				type: "kb:openEvidenceConversation",
+				commitHash: "arch1234",
+				sessionId: "no-such-session",
+				source: "claude",
+				title: "t",
+			});
+			await new Promise((r) => setTimeout(r, 0));
+			expect(showMock).not.toHaveBeenCalled();
+		});
+
+		it("kb:openEvidenceConversation does not open a panel when the summary is missing", async () => {
+			showMock.mockReset();
+			const view = makeMockView();
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash: vi.fn().mockResolvedValue(undefined),
+				readTranscriptById: vi.fn().mockResolvedValue(archivedTranscript),
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.triggerMessage({
+				type: "kb:openEvidenceConversation",
+				commitHash: "gone9999",
+				sessionId: "sess-x",
+				source: "claude",
+				title: "t",
+			});
+			await new Promise((r) => setTimeout(r, 0));
+			expect(showMock).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("pin/unpin message handling", () => {
+		it("branch:pin calls addPin and re-pushes branch:pinsData", async () => {
+			const addPin = vi.fn().mockResolvedValue(undefined);
+			const listPins = vi.fn().mockResolvedValue([
+				{ kind: "memory" as const, id: "h", title: "T", pinnedAt: 1234 },
+			]);
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+			try {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "feature/x",
+						detached: false,
+						currentRepoName: "myrepo",
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					pinStore: { addPin, removePin: vi.fn(), listPins },
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				view.webview.postMessage.mockClear();
+				view.webview.triggerMessage({
+					type: "branch:pin",
+					kind: "memory",
+					id: "h",
+					title: "T",
+				});
+				// allow the async handler to flush
+				await new Promise((r) => setTimeout(r, 0));
+				expect(addPin).toHaveBeenCalledWith(
+					"/proj",
+					"myrepo",
+					"feature/x",
+					expect.objectContaining({ kind: "memory", id: "h", title: "T" }),
+				);
+				const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+				const pinsMsg = sent.find((m) => m.type === "branch:pinsData");
+				expect(pinsMsg).toBeDefined();
+				expect(pinsMsg.items).toHaveLength(1);
+				expect(pinsMsg.items[0].id).toBe("h");
+			} finally {
+				mockWorkspaceFolders.length = 0;
+			}
+		});
+
+		it("branch:unpin calls removePin and re-pushes branch:pinsData", async () => {
+			const removePin = vi.fn().mockResolvedValue(undefined);
+			const listPins = vi.fn().mockResolvedValue([]);
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+			try {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+						currentRepoName: "myrepo",
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					pinStore: { addPin: vi.fn(), removePin, listPins },
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				view.webview.postMessage.mockClear();
+				view.webview.triggerMessage({
+					type: "branch:unpin",
+					kind: "memory",
+					id: "h",
+				});
+				await new Promise((r) => setTimeout(r, 0));
+				expect(removePin).toHaveBeenCalledWith("/proj", "myrepo", "main", "memory", "h");
+				const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+				const pinsMsg = sent.find((m) => m.type === "branch:pinsData");
+				expect(pinsMsg).toBeDefined();
+				expect(pinsMsg.items).toHaveLength(0);
+			} finally {
+				mockWorkspaceFolders.length = 0;
+			}
+		});
+
+		it("re-pushes branch:pinsData for the new branch when the workspace HEAD changes (Bug 2)", async () => {
+			// Pins are grouped per branch; a `git checkout` must refresh the
+			// Pinned section. Before the fix, branchWatcher.onChange only posted
+			// branch:branchName and the stale pins lingered (and pushPins resolved
+			// against getInitialState().branchName, which lags the live HEAD).
+			const listPins = vi
+				.fn()
+				.mockImplementation((_dir: string, _repo: string, branch: string) =>
+					Promise.resolve(
+						branch === "feature/new"
+							? [{ kind: "memory" as const, id: "n", title: "N", pinnedAt: 1 }]
+							: [],
+					),
+				);
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+			let branchHandler: ((name: string, detached: boolean) => void) | undefined;
+			let currentName = "main";
+			try {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+						currentRepoName: "myrepo",
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					pinStore: { addPin: vi.fn(), removePin: vi.fn(), listPins },
+					branchWatcher: {
+						current: () => ({ name: currentName, detached: false }),
+						onChange: (cb) => {
+							branchHandler = cb;
+							return { dispose: () => {} };
+						},
+					},
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				view.webview.postMessage.mockClear();
+				listPins.mockClear();
+				// Simulate `git checkout feature/new`.
+				currentName = "feature/new";
+				branchHandler?.("feature/new", false);
+				await new Promise((r) => setTimeout(r, 0));
+				// pushPins must resolve pins against the NEW branch, not stale main.
+				expect(listPins).toHaveBeenCalledWith("/proj", "myrepo", "feature/new");
+				const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+				const pinsMsg = sent.find((m) => m.type === "branch:pinsData");
+				expect(pinsMsg).toBeDefined();
+				expect(pinsMsg.items).toHaveLength(1);
+			} finally {
+				mockWorkspaceFolders.length = 0;
+			}
+		});
+
+		it("pushPins posts empty items and does not throw when listPins rejects", async () => {
+			const listPins = vi.fn().mockRejectedValue(new Error("disk error"));
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+			try {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+						currentRepoName: "myrepo",
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					pinStore: { addPin: vi.fn(), removePin: vi.fn(), listPins },
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				view.webview.postMessage.mockClear();
+				view.webview.triggerMessage({ type: "ready" });
+				await flushReady();
+				await new Promise((r) => setTimeout(r, 0));
+				const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+				const pinsMsg = sent.find((m) => m.type === "branch:pinsData");
+				expect(pinsMsg).toBeDefined();
+				expect(pinsMsg.items).toEqual([]);
+			} finally {
+				mockWorkspaceFolders.length = 0;
+			}
+		});
+
+		it("pushPins reads the breadcrumb-selected repo+branch, not workspace HEAD", async () => {
+			// When the user has selected a foreign repo+branch via the breadcrumb,
+			// pushPins must read pins for the SELECTED repo+branch, not the
+			// workspace HEAD (currentRepoName / branchName from getInitialState).
+			const listPins = vi.fn().mockResolvedValue([
+				{ kind: "memory" as const, id: "x", title: "X", pinnedAt: 9999 },
+			]);
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+			try {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",          // workspace HEAD branch
+						detached: false,
+						currentRepoName: "workspace-repo",  // workspace HEAD repo
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					selection: {
+						listRepos: vi.fn().mockReturnValue([
+							{ repoName: "workspace-repo", isCurrent: true },
+							{ repoName: "foreign-repo", isCurrent: false },
+						]),
+						listBranches: vi.fn().mockImplementation((r: string) =>
+							r === "foreign-repo" ? ["topic"] : ["main"],
+						),
+						listBranchMemories: vi.fn().mockResolvedValue([]),
+					},
+					pinStore: { addPin: vi.fn(), removePin: vi.fn(), listPins },
+				});
+				provider.resolveWebviewView(view as unknown as never);
+
+				// Select the foreign repo via breadcrumb — mirrors what handleSelectionRequest does.
+				view.webview.triggerMessage({
+					type: "selection:request",
+					repoName: "foreign-repo",
+				});
+				await new Promise((r) => setTimeout(r, 0));
+
+				// listPins should have been called with the SELECTED repo+branch,
+				// not the workspace "workspace-repo" / "main".
+				expect(listPins).toHaveBeenCalledWith("/proj", "foreign-repo", "topic");
+				expect(listPins).not.toHaveBeenCalledWith("/proj", "workspace-repo", "main");
+			} finally {
+				mockWorkspaceFolders.length = 0;
+			}
+		});
+
+		it("branch:pin uses breadcrumb-selected repo+branch when a foreign repo is active", async () => {
+			const addPin = vi.fn().mockResolvedValue(undefined);
+			const listPins = vi.fn().mockResolvedValue([]);
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+			try {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+						currentRepoName: "workspace-repo",
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					selection: {
+						listRepos: vi.fn().mockReturnValue([
+							{ repoName: "workspace-repo", isCurrent: true },
+							{ repoName: "foreign-repo", isCurrent: false },
+						]),
+						listBranches: vi.fn().mockImplementation((r: string) =>
+							r === "foreign-repo" ? ["topic"] : ["main"],
+						),
+						listBranchMemories: vi.fn().mockResolvedValue([]),
+					},
+					pinStore: { addPin, removePin: vi.fn(), listPins },
+				});
+				provider.resolveWebviewView(view as unknown as never);
+
+				// Select the foreign repo via breadcrumb.
+				view.webview.triggerMessage({
+					type: "selection:request",
+					repoName: "foreign-repo",
+				});
+				await new Promise((r) => setTimeout(r, 0));
+				addPin.mockClear();
+
+				view.webview.triggerMessage({
+					type: "branch:pin",
+					kind: "memory",
+					id: "y",
+					title: "Y",
+				});
+				await new Promise((r) => setTimeout(r, 0));
+
+				// addPin must target the SELECTED foreign-repo/topic, not workspace-repo/main.
+				expect(addPin).toHaveBeenCalledWith(
+					"/proj",
+					"foreign-repo",
+					"topic",
+					expect.objectContaining({ kind: "memory", id: "y" }),
+				);
+				expect(addPin).not.toHaveBeenCalledWith(
+					"/proj",
+					"workspace-repo",
+					"main",
+					expect.anything(),
+				);
+			} finally {
+				mockWorkspaceFolders.length = 0;
+			}
+		});
+
+		it("branch:unpin uses breadcrumb-selected repo+branch when a foreign repo is active", async () => {
+			const removePin = vi.fn().mockResolvedValue(undefined);
+			const listPins = vi.fn().mockResolvedValue([]);
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+			try {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+						currentRepoName: "workspace-repo",
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					selection: {
+						listRepos: vi.fn().mockReturnValue([
+							{ repoName: "workspace-repo", isCurrent: true },
+							{ repoName: "foreign-repo", isCurrent: false },
+						]),
+						listBranches: vi.fn().mockImplementation((r: string) =>
+							r === "foreign-repo" ? ["topic"] : ["main"],
+						),
+						listBranchMemories: vi.fn().mockResolvedValue([]),
+					},
+					pinStore: { addPin: vi.fn(), removePin, listPins },
+				});
+				provider.resolveWebviewView(view as unknown as never);
+
+				// Select the foreign repo via breadcrumb.
+				view.webview.triggerMessage({
+					type: "selection:request",
+					repoName: "foreign-repo",
+				});
+				await new Promise((r) => setTimeout(r, 0));
+				removePin.mockClear();
+
+				view.webview.triggerMessage({
+					type: "branch:unpin",
+					kind: "memory",
+					id: "y",
+				});
+				await new Promise((r) => setTimeout(r, 0));
+
+				// removePin must target the SELECTED foreign-repo/topic, not workspace-repo/main.
+				expect(removePin).toHaveBeenCalledWith("/proj", "foreign-repo", "topic", "memory", "y");
+				expect(removePin).not.toHaveBeenCalledWith("/proj", "workspace-repo", "main", "memory", "y");
+			} finally {
+				mockWorkspaceFolders.length = 0;
+			}
+		});
+
+		it("branch:pin for a conversation carries source and transcriptPath into the stored PinEntry", async () => {
+			const addPin = vi.fn().mockResolvedValue(undefined);
+			const listPins = vi.fn().mockResolvedValue([]);
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+			try {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+						currentRepoName: "myrepo",
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					pinStore: { addPin, removePin: vi.fn(), listPins },
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				view.webview.postMessage.mockClear();
+				view.webview.triggerMessage({
+					type: "branch:pin",
+					kind: "conversation",
+					id: "sess-abc",
+					title: "My chat",
+					source: "claude",
+					transcriptPath: "/home/user/.claude/projects/foo/session.jsonl",
+				});
+				await new Promise((r) => setTimeout(r, 0));
+				expect(addPin).toHaveBeenCalledWith(
+					"/proj",
+					"myrepo",
+					"main",
+					expect.objectContaining({
+						kind: "conversation",
+						id: "sess-abc",
+						title: "My chat",
+						source: "claude",
+						transcriptPath: "/home/user/.claude/projects/foo/session.jsonl",
+					}),
+				);
+			} finally {
+				mockWorkspaceFolders.length = 0;
+			}
+		});
+
+		it("branch:pin omits empty source/transcriptPath so no un-openable pin is stored", async () => {
+			const addPin = vi.fn().mockResolvedValue(undefined);
+			const listPins = vi.fn().mockResolvedValue([]);
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+			try {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+						currentRepoName: "myrepo",
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					pinStore: { addPin, removePin: vi.fn(), listPins },
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				view.webview.postMessage.mockClear();
+				view.webview.triggerMessage({
+					type: "branch:pin",
+					kind: "conversation",
+					id: "sess-abc",
+					title: "My chat",
+					source: "",
+					transcriptPath: "",
+				});
+				await new Promise((r) => setTimeout(r, 0));
+				const entry = addPin.mock.calls[0]?.[3] as Record<string, unknown>;
+				expect(entry).not.toHaveProperty("source");
+				expect(entry).not.toHaveProperty("transcriptPath");
+			} finally {
+				mockWorkspaceFolders.length = 0;
+			}
+		});
+	});
+
+	describe("pushKnowledgeData", () => {
+		it("posts kb:knowledgeData with projected KnowledgeRepo[] when refresh:knowledge is triggered", async () => {
+			const view = makeMockView();
+			const fakeRepo = {
+				repoName: "myrepo",
+				memoryCount: 5,
+				indexPath: "/kb/myrepo/_wiki/_index.md",
+				categories: [
+					{
+						name: "Architecture",
+						description: "Core architectural decisions",
+						topicCount: 1,
+						memoryCount: 5,
+						topics: [
+							{
+								title: "Storage Layer",
+								stableSlug: "storage-layer",
+								memoryCount: 5,
+								wikiFile: "/kb/myrepo/_wiki/topic--storage-layer.md",
+							},
+						],
+					},
+				],
+			};
+			const getKnowledgeData = vi.fn().mockResolvedValue([fakeRepo]);
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "knowledge",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+					currentRepoName: "myrepo",
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getKnowledgeData,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "refresh", scope: "knowledge" });
+			await new Promise((r) => setTimeout(r, 0));
+			const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+			const knowledgeMsg = sent.find((m) => m.type === "kb:knowledgeData");
+			expect(knowledgeMsg).toBeDefined();
+			expect(knowledgeMsg.repos).toHaveLength(1);
+			const repo = knowledgeMsg.repos[0];
+			expect(repo.repoName).toBe("myrepo");
+			expect(repo.memoryCount).toBe(5);
+			expect(repo.indexPath).toBe("/kb/myrepo/_wiki/_index.md");
+			expect(repo.categories).toHaveLength(1);
+			const cat = repo.categories[0];
+			expect(cat.name).toBe("Architecture");
+			expect(cat.description).toBe("Core architectural decisions");
+			expect(cat.topicCount).toBe(1);
+			expect(cat.memoryCount).toBe(5);
+			expect(cat.topics).toHaveLength(1);
+			const topic = cat.topics[0];
+			expect(topic.title).toBe("Storage Layer");
+			expect(topic.stableSlug).toBe("storage-layer");
+			expect(topic.memoryCount).toBe(5);
+			expect(topic.wikiFile).toBe("/kb/myrepo/_wiki/topic--storage-layer.md");
+		});
+
+		it("posts kb:knowledgeData with categories:[] when getKnowledgeData returns a repo with no categories (no graph)", async () => {
+			const view = makeMockView();
+			const noGraphRepo = {
+				repoName: "emptyrepo",
+				memoryCount: 0,
+				indexPath: "/kb/emptyrepo/_wiki/_index.md",
+				categories: [],
+			};
+			const getKnowledgeData = vi.fn().mockResolvedValue([noGraphRepo]);
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "knowledge",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+					currentRepoName: "emptyrepo",
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getKnowledgeData,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "refresh", scope: "knowledge" });
+			await new Promise((r) => setTimeout(r, 0));
+			const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+			const knowledgeMsg = sent.find((m) => m.type === "kb:knowledgeData");
+			expect(knowledgeMsg).toBeDefined();
+			expect(knowledgeMsg.repos).toHaveLength(1);
+			expect(knowledgeMsg.repos[0].repoName).toBe("emptyrepo");
+			expect(knowledgeMsg.repos[0].categories).toEqual([]);
+		});
+
+		it("posts kb:knowledgeData with empty repos when getKnowledgeData dep is absent", async () => {
+			const view = makeMockView();
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "knowledge",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "refresh", scope: "knowledge" });
+			await new Promise((r) => setTimeout(r, 0));
+			const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+			const knowledgeMsg = sent.find((m) => m.type === "kb:knowledgeData");
+			expect(knowledgeMsg).toBeDefined();
+			expect(knowledgeMsg.repos).toEqual([]);
+		});
+	});
+
+	describe("coverage edge cases", () => {
+		const baseState = {
+			enabled: true,
+			authenticated: false,
+			activeTab: "kb" as const,
+			kbMode: "memories" as const,
+			branchName: "main",
+			detached: false,
+		};
+
+		it("projects empty evidence when summary has no transcript readers and omits context/topic fields", async () => {
+			// readFn resolves to null (neither readTranscriptForRepo nor
+			// readTranscriptById provided) → the conversation loop is skipped.
+			// plans/notes/references/topics are all absent → every `?? []`
+			// fallback is taken.
+			const view = makeMockView();
+			const fakeSummary = {
+				version: 5,
+				commitHash: "bare1",
+				commitMessage: "x",
+				commitAuthor: "D",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				transcripts: ["tid-1"],
+			};
+			const getSummaryByHash = vi.fn().mockResolvedValue(fakeSummary);
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({ ...baseState }),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "bare1" });
+			await new Promise((r) => setTimeout(r, 0));
+			const ev = view.webview.postMessage.mock.calls
+				.map((c) => c[0])
+				.find((m) => m.type === "kb:memoryEvidence");
+			expect(ev).toBeDefined();
+			expect(ev.evidence.conversations).toEqual([]);
+			expect(ev.evidence.context).toEqual([]);
+			expect(ev.evidence.files).toEqual([]);
+		});
+
+		it("skips null transcript reads, sessions without source/path, and topics without filesAffected", async () => {
+			const view = makeMockView();
+			const fakeSummary = {
+				version: 5,
+				commitHash: "mix1",
+				commitMessage: "x",
+				commitAuthor: "D",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				transcripts: ["tid-null", "tid-bare"],
+				plans: [],
+				notes: [],
+				references: [],
+				topics: [{ title: "T", trigger: "a", response: "b", decisions: "c" }],
+			};
+			const getSummaryByHash = vi.fn().mockResolvedValue(fakeSummary);
+			const readTranscriptById = vi
+				.fn()
+				.mockResolvedValueOnce(null) // tid-null → !stored → continue
+				// no source/transcriptPath; entries drive the derived title
+				.mockResolvedValueOnce({
+					sessions: [{ sessionId: "bare", entries: [{ role: "human", content: "bare turn" }] }],
+				});
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({ ...baseState }),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash,
+				readTranscriptById,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "mix1" });
+			await new Promise((r) => setTimeout(r, 0));
+			const ev = view.webview.postMessage.mock.calls
+				.map((c) => c[0])
+				.find((m) => m.type === "kb:memoryEvidence");
+			expect(ev).toBeDefined();
+			// Only the second (non-null) read contributes; its session carries
+			// neither source nor transcriptPath, so those keys are omitted. The
+			// title is derived from the archived first human turn (BUG 1), not the
+			// session id.
+			expect(ev.evidence.conversations).toEqual([
+				// One archived turn ("bare turn") → messageCount 1.
+				{ kind: "conversation", id: "bare", title: "bare turn", messageCount: 1 },
+			]);
+			// The single topic had no filesAffected → no files.
+			expect(ev.evidence.files).toEqual([]);
+		});
+
+		it("stringifies a non-Error transcript read failure (inner catch)", async () => {
+			const view = makeMockView();
+			const fakeSummary = {
+				version: 5,
+				commitHash: "innr1",
+				commitMessage: "x",
+				commitAuthor: "D",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				transcripts: ["tid-x"],
+				plans: [],
+				notes: [],
+				references: [],
+				topics: [],
+			};
+			const getSummaryByHash = vi.fn().mockResolvedValue(fakeSummary);
+			const readTranscriptById = vi.fn().mockRejectedValue("string-failure");
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({ ...baseState }),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash,
+				readTranscriptById,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "innr1" });
+			await new Promise((r) => setTimeout(r, 0));
+			const ev = view.webview.postMessage.mock.calls
+				.map((c) => c[0])
+				.find((m) => m.type === "kb:memoryEvidence");
+			expect(ev).toBeDefined();
+			expect(ev.evidence.conversations).toEqual([]);
+		});
+
+		it("posts empty evidence when the summary lookup rejects with a non-Error (outer catch)", async () => {
+			const view = makeMockView();
+			const getSummaryByHash = vi.fn().mockRejectedValue("outer-string");
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({ ...baseState }),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "outr1" });
+			await new Promise((r) => setTimeout(r, 0));
+			const ev = view.webview.postMessage.mock.calls
+				.map((c) => c[0])
+				.find((m) => m.type === "kb:memoryEvidence");
+			expect(ev).toBeDefined();
+			expect(ev.evidence.conversations).toHaveLength(0);
+			expect(ev.evidence.context).toHaveLength(0);
+			expect(ev.evidence.files).toHaveLength(0);
+		});
+
+		it("branch:pin is a no-op when no repo resolves", async () => {
+			const addPin = vi.fn();
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+			try {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					// No currentRepoName / selection → repo resolves to "".
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					pinStore: { addPin, removePin: vi.fn(), listPins: vi.fn().mockResolvedValue([]) },
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				view.webview.triggerMessage({ type: "branch:pin", kind: "memory", id: "h", title: "T" });
+				await new Promise((r) => setTimeout(r, 0));
+				expect(addPin).not.toHaveBeenCalled();
+			} finally {
+				mockWorkspaceFolders.length = 0;
+			}
+		});
+
+		it("branch:unpin is a no-op when no repo resolves", async () => {
+			const removePin = vi.fn();
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+			try {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					pinStore: { addPin: vi.fn(), removePin, listPins: vi.fn().mockResolvedValue([]) },
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				view.webview.triggerMessage({ type: "branch:unpin", kind: "memory", id: "h" });
+				await new Promise((r) => setTimeout(r, 0));
+				expect(removePin).not.toHaveBeenCalled();
+			} finally {
+				mockWorkspaceFolders.length = 0;
+			}
+		});
+
+		for (const failure of [new Error("boom"), "boom-string"]) {
+			const kindLabel = failure instanceof Error ? "Error" : "non-Error";
+			it(`branch:pin swallows an addPin rejection (${kindLabel})`, async () => {
+				const addPin = vi.fn().mockRejectedValue(failure);
+				mockWorkspaceFolders.length = 0;
+				mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+				try {
+					const view = makeMockView();
+					const provider = new SidebarWebviewProvider({
+						executeCommand: vi.fn(),
+						getInitialState: () => ({
+							enabled: true,
+							authenticated: false,
+							activeTab: "branch",
+							kbMode: "folders",
+							branchName: "main",
+							detached: false,
+							currentRepoName: "myrepo",
+						}),
+						extensionUri: mockExtensionUri as unknown as never,
+						pinStore: { addPin, removePin: vi.fn(), listPins: vi.fn().mockResolvedValue([]) },
+					});
+					provider.resolveWebviewView(view as unknown as never);
+					view.webview.postMessage.mockClear();
+					view.webview.triggerMessage({ type: "branch:pin", kind: "memory", id: "h", title: "T" });
+					await new Promise((r) => setTimeout(r, 0));
+					expect(addPin).toHaveBeenCalled();
+					// addPin rejected → the .then(pushPins) is skipped, so no
+					// branch:pinsData follows from this path.
+					const pinsMsg = view.webview.postMessage.mock.calls
+						.map((c) => c[0])
+						.find((m) => m.type === "branch:pinsData");
+					expect(pinsMsg).toBeUndefined();
+				} finally {
+					mockWorkspaceFolders.length = 0;
+				}
+			});
+
+			it(`branch:unpin swallows a removePin rejection (${kindLabel})`, async () => {
+				const removePin = vi.fn().mockRejectedValue(failure);
+				mockWorkspaceFolders.length = 0;
+				mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+				try {
+					const view = makeMockView();
+					const provider = new SidebarWebviewProvider({
+						executeCommand: vi.fn(),
+						getInitialState: () => ({
+							enabled: true,
+							authenticated: false,
+							activeTab: "branch",
+							kbMode: "folders",
+							branchName: "main",
+							detached: false,
+							currentRepoName: "myrepo",
+						}),
+						extensionUri: mockExtensionUri as unknown as never,
+						pinStore: { addPin: vi.fn(), removePin, listPins: vi.fn().mockResolvedValue([]) },
+					});
+					provider.resolveWebviewView(view as unknown as never);
+					view.webview.postMessage.mockClear();
+					view.webview.triggerMessage({ type: "branch:unpin", kind: "memory", id: "h" });
+					await new Promise((r) => setTimeout(r, 0));
+					expect(removePin).toHaveBeenCalled();
+					const pinsMsg = view.webview.postMessage.mock.calls
+						.map((c) => c[0])
+						.find((m) => m.type === "branch:pinsData");
+					expect(pinsMsg).toBeUndefined();
+				} finally {
+					mockWorkspaceFolders.length = 0;
+				}
+			});
+		}
+
+		it("pushPins posts an empty list when a repo resolves but no pinStore is wired", async () => {
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+			try {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+						currentRepoName: "myrepo",
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					// pinStore intentionally absent → listPins ternary takes `: []`.
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				view.webview.postMessage.mockClear();
+				view.webview.triggerMessage({ type: "ready" });
+				await flushReady();
+				await new Promise((r) => setTimeout(r, 0));
+				const pinsMsg = view.webview.postMessage.mock.calls
+					.map((c) => c[0])
+					.find((m) => m.type === "branch:pinsData");
+				expect(pinsMsg).toBeDefined();
+				expect(pinsMsg.items).toEqual([]);
+			} finally {
+				mockWorkspaceFolders.length = 0;
+			}
+		});
+
+		it("pushPins posts an empty list and does not throw when listPins rejects with a non-Error", async () => {
+			const listPins = vi.fn().mockRejectedValue("disk-string");
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/proj" } });
+			try {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+						currentRepoName: "myrepo",
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					pinStore: { addPin: vi.fn(), removePin: vi.fn(), listPins },
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				view.webview.postMessage.mockClear();
+				view.webview.triggerMessage({ type: "ready" });
+				await flushReady();
+				await new Promise((r) => setTimeout(r, 0));
+				const pinsMsg = view.webview.postMessage.mock.calls
+					.map((c) => c[0])
+					.find((m) => m.type === "branch:pinsData");
+				expect(pinsMsg).toBeDefined();
+				expect(pinsMsg.items).toEqual([]);
+			} finally {
+				mockWorkspaceFolders.length = 0;
+			}
+		});
+
+		it("posts worker:phase on ready when statusProvider exposes getWorkerPhase", async () => {
+			const view = makeMockView();
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "branch",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				statusProvider: {
+					serialize: () => [],
+					onDidChangeTreeData: () => ({ dispose: () => {} }),
+					getWorkerBusy: () => false,
+					getWorkerPhase: () => "ingest",
+				},
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.triggerMessage({ type: "ready" });
+			await flushReady();
+			const phaseMsg = view.webview.postMessage.mock.calls
+				.map((c) => c[0])
+				.find((m) => m.type === "worker:phase");
+			expect(phaseMsg).toBeDefined();
+			expect(phaseMsg.phase).toBe("ingest");
+		});
+
+		for (const failure of [new Error("kb-boom"), "kb-string"]) {
+			const kindLabel = failure instanceof Error ? "Error" : "non-Error";
+			it(`pushKnowledgeData degrades to empty repos when getKnowledgeData rejects (${kindLabel})`, async () => {
+				const view = makeMockView();
+				const getKnowledgeData = vi.fn().mockRejectedValue(failure);
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "knowledge",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+						currentRepoName: "myrepo",
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					getKnowledgeData,
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				view.webview.postMessage.mockClear();
+				view.webview.triggerMessage({ type: "refresh", scope: "knowledge" });
+				await new Promise((r) => setTimeout(r, 0));
+				const knowledgeMsg = view.webview.postMessage.mock.calls
+					.map((c) => c[0])
+					.find((m) => m.type === "kb:knowledgeData");
+				expect(knowledgeMsg).toBeDefined();
+				expect(knowledgeMsg.repos).toEqual([]);
+			});
+		}
+
+		describe("kb:requestPrStatus → kb:prStatus", () => {
+			it("posts kb:prStatus with the pr when findOpenPrForBranch resolves", async () => {
+				const view = makeMockView();
+				const findOpenPrForBranch = vi
+					.fn()
+					.mockResolvedValue({ number: 214, url: "https://github.com/x/y/pull/214" });
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					findOpenPrForBranch,
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				view.webview.triggerMessage({ type: "kb:requestPrStatus", branch: "feat/x" });
+				await flushUntilMessage(view, "kb:prStatus");
+				const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+				const msg = sent.find((m) => m.type === "kb:prStatus");
+				expect(msg).toBeDefined();
+				expect(msg.branch).toBe("feat/x");
+				expect(msg.pr).toEqual({ number: 214, url: "https://github.com/x/y/pull/214" });
+				expect(findOpenPrForBranch).toHaveBeenCalledWith("feat/x");
+			});
+
+			it("posts kb:prStatus with pr:null when findOpenPrForBranch rejects (never throws)", async () => {
+				const view = makeMockView();
+				const findOpenPrForBranch = vi.fn().mockRejectedValue(new Error("gh not found"));
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					findOpenPrForBranch,
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				// Must not throw
+				expect(() =>
+					view.webview.triggerMessage({ type: "kb:requestPrStatus", branch: "feat/x" }),
+				).not.toThrow();
+				await flushUntilMessage(view, "kb:prStatus");
+				const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+				const msg = sent.find((m) => m.type === "kb:prStatus");
+				expect(msg).toBeDefined();
+				expect(msg.branch).toBe("feat/x");
+				expect(msg.pr).toBeNull();
+			});
+
+			it("posts kb:prStatus with pr:null when findOpenPrForBranch dep is absent", async () => {
+				const view = makeMockView();
+				const provider = new SidebarWebviewProvider({
+					executeCommand: vi.fn(),
+					getInitialState: () => ({
+						enabled: true,
+						authenticated: false,
+						activeTab: "branch",
+						kbMode: "folders",
+						branchName: "main",
+						detached: false,
+					}),
+					extensionUri: mockExtensionUri as unknown as never,
+					// No findOpenPrForBranch dep wired.
+				});
+				provider.resolveWebviewView(view as unknown as never);
+				expect(() =>
+					view.webview.triggerMessage({ type: "kb:requestPrStatus", branch: "feat/x" }),
+				).not.toThrow();
+				await flushUntilMessage(view, "kb:prStatus");
+				const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+				const msg = sent.find((m) => m.type === "kb:prStatus");
+				expect(msg).toBeDefined();
+				expect(msg.branch).toBe("feat/x");
+				expect(msg.pr).toBeNull();
+			});
 		});
 	});
 });

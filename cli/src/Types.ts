@@ -66,6 +66,9 @@ export interface TranscriptReadResult {
 	readonly entries: ReadonlyArray<TranscriptEntry>;
 	readonly newCursor: TranscriptCursor;
 	readonly totalLinesRead: number;
+	/** Sum of per-turn token usage (input + cache_creation + cache_read + output)
+	 *  over the slice read. 0 for sources whose parser does not expose usage. */
+	readonly usageTokens?: number;
 }
 
 // ─── Stored transcript types (orphan branch persistence) ─────────────────────
@@ -211,6 +214,12 @@ export interface LlmCallMetadata {
 	readonly model: string;
 	readonly inputTokens: number;
 	readonly outputTokens: number;
+	/**
+	 * Prompt-cache tokens (cache_read + cache_creation). Optional because
+	 * summaries written before this field existed lack it — readers must
+	 * default to 0 when absent (e.g. the VS Code branch token-usage bar).
+	 */
+	readonly cachedTokens?: number;
 	/** Wall-clock time for the API call in milliseconds */
 	readonly apiLatencyMs: number;
 	/** API stop reason — "max_tokens" indicates the summary may have been truncated */
@@ -235,6 +244,7 @@ export interface SummaryRecord {
 	readonly commitDate: string;
 	readonly transcriptEntries: number;
 	readonly conversationTurns?: number;
+	readonly conversationTokens?: number;
 	readonly llm?: LlmCallMetadata;
 	readonly stats: DiffStats;
 	readonly topics: ReadonlyArray<TopicSummary>;
@@ -336,6 +346,11 @@ export interface CommitSummary {
 	readonly transcriptEntries?: number;
 	/** Actual conversation turns (count of human-role entries in transcript) */
 	readonly conversationTurns?: number;
+	/** Total conversation token consumption (input + cache_creation + cache_read +
+	 *  output across assistant turns) for the turns consumed into this commit.
+	 *  Forward-only: absent on memories generated before this field existed, and on
+	 *  sources whose transcript carries no usage. Consolidated roots aggregate children. */
+	readonly conversationTokens?: number;
 	/** LLM call metadata; absent for squash/merge containers (no API call made) */
 	readonly llm?: LlmCallMetadata;
 	/**

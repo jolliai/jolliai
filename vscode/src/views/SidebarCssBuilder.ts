@@ -25,7 +25,9 @@ export function buildSidebarCss(): string {
     flex-direction: column;
   }
 
-  .sidebar-root { display: flex; flex-direction: column; height: 100%; }
+  /* position:relative makes this the containing block for the absolutely
+     positioned .branch-footer so the bar pins to the sidebar's bottom edge. */
+  .sidebar-root { display: flex; flex-direction: column; height: 100%; position: relative; }
   .sidebar-root .disabled-banner {
     padding: 20px 16px 16px;
     color: var(--vscode-foreground);
@@ -48,11 +50,10 @@ export function buildSidebarCss(): string {
     background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
   }
 
-  /* Header bar — was the tab-bar in the previous tab-UI design; now a flex
-     row with breadcrumb on the left and a fixed icon strip on the right.
-     The old .tab class names (data-tab="kb" / data-tab="status") are kept on
-     the icon buttons so the script's existing switchTab dispatch keeps
-     working — only the visual treatment changed. */
+  /* Header bar — the breadcrumb row, sitting directly under the view-switch.
+     The Settings (gear) and Status (pulse) actions that used to live in a
+     right-side icon strip here are now native view/title contributions in the
+     editor's "JOLLI MEMORY" title bar, so this row holds only the breadcrumb. */
   .tab-bar {
     display: flex;
     align-items: center;
@@ -105,33 +106,39 @@ export function buildSidebarCss(): string {
     flex: 0 0 auto;
     user-select: none;
   }
-  /* Right-side icon strip — Memory Bank / Settings / Status. \`margin-left: auto\`
-     pins it to the right when the breadcrumb collapses; \`flex-shrink: 0\` stops
-     it from being elided when the sidebar is narrow (the breadcrumb truncates
-     instead via text-overflow on .breadcrumb-seg-label). */
-  .tab-bar-right { display: flex; align-items: center; gap: 2px; margin-left: auto; flex-shrink: 0; }
-
-  /* Header-bar icon button — square button hosting a single codicon. The
-     legacy .tab class is preserved so the existing switchTab dispatch
-     (document.querySelectorAll('.tab[data-tab]')) still finds these buttons.
-     The .active marker means the corresponding overlay panel is currently
-     open; clicking the active icon again collapses back to the Branch view. */
-  .tab {
-    flex: 0 0 auto;
-    padding: 4px 6px;
+  /* View switch — the three primary views (Current Branch / Memory Bank /
+     Knowledge) as a segmented text-button row. It sits above the breadcrumb
+     header, directly under the native "JOLLI MEMORY" title bar. Each button
+     carries data-tab so the script switchTab dispatch (and the .active sync,
+     broadened to data-tab) drives it. */
+  .view-switch {
+    display: flex;
+    align-items: stretch;
+    gap: 2px;
+    padding: 2px 6px;
+    border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
+    flex-shrink: 0;
+  }
+  .view-tab {
+    flex: 1 1 0;
+    padding: 5px 8px;
     border: none;
     background: transparent;
-    color: var(--vscode-icon-foreground, var(--vscode-foreground));
+    color: var(--vscode-foreground);
     cursor: pointer;
     border-radius: 3px;
-    min-width: 24px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
+    font-size: 11px;
+    font-family: inherit;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
-  .tab.tab-icon { /* explicit modifier preserved for selector specificity in legacy hover/active rules */ }
-  .tab:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15)); }
-  .tab.active { background: var(--vscode-toolbar-activeBackground, rgba(0,122,204,0.2)); color: var(--vscode-foreground); }
+  .view-tab:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15)); }
+  .view-tab.active {
+    background: var(--vscode-toolbar-activeBackground, rgba(0,122,204,0.2));
+    color: var(--vscode-foreground);
+    font-weight: 600;
+  }
 
   /* Dropdown menu for the breadcrumb repo / branch pickers. Anchored to the
      triggering segment via inline left/top set by the script (we can't
@@ -218,11 +225,6 @@ export function buildSidebarCss(): string {
     color: var(--vscode-descriptionForeground);
     font-style: italic;
   }
-
-  /* Status indicator color classes — applied to the codicon-circle-filled inside #status-icon-btn. */
-  .status-icon-ok { color: var(--vscode-testing-iconPassed, #89d185); }
-  .status-icon-warn { color: var(--vscode-testing-iconQueued, #cca700); }
-  .status-icon-error { color: var(--vscode-testing-iconFailed, #f48771); }
 
   /* Foreign-readonly chrome on the Branch panel. Mirrors the
      SummaryWebviewPanel.foreign-readonly default-deny: when the user is
@@ -371,13 +373,26 @@ export function buildSidebarCss(): string {
     overflow: auto;
     overflow-x: hidden;
   }
+  /* Reserve space for the fixed-height .branch-footer (44px) that overlays the
+     bottom of the sidebar in the Current Branch view, so the last rows can
+     scroll clear of it rather than hiding behind it. Harmless on other tabs. */
+  #tab-content-branch { padding-bottom: 52px; }
   .placeholder { padding: 16px; color: var(--vscode-descriptionForeground); font-style: italic; }
   .empty-state {
-    padding: 24px 16px;
-    text-align: center;
+    padding: 12px 14px;
+    text-align: left;
     color: var(--vscode-descriptionForeground);
     line-height: 1.5;
   }
+  /* Secondary hint line under an empty-state's headline (e.g. the Pinned
+     section's discoverability copy). Smaller + dimmer than the headline. */
+  .empty-hint {
+    margin-top: 4px;
+    font-size: 11px;
+    opacity: 0.8;
+  }
+  /* Pin glyph in the Pinned section header, left of the title. */
+  .pinned-glyph { font-size: 13px; opacity: 0.8; flex-shrink: 0; }
 
   /* Partial-data banner shown above a section's rows when some upstream
      loaders failed (e.g. one SQLite-backed source locked / schema-drifted).
@@ -430,6 +445,9 @@ export function buildSidebarCss(): string {
   .collapsible-section .section-header {
     display: flex;
     align-items: center;
+    /* Positioning context for the absolutely-positioned .section-actions
+       overlay below (it pins to this header's right edge on hover). */
+    position: relative;
     /* Mirror .tree-node's gap:4px so the section title starts at the same
        x-coordinate as the row's row-leading slot — i.e. the section title
        text left edge column-aligns with the row's checkbox / leading icon. */
@@ -451,22 +469,86 @@ export function buildSidebarCss(): string {
     transition: transform 0.1s;
   }
   .collapsible-section.collapsed .section-header .twirl { transform: rotate(-90deg); }
-  .collapsible-section .section-title { flex: 1; }
-  /* Hover-only actions on the section header. Uses visibility (not display)
-     so the slot is always reserved — no header-height flicker on mouse-enter
-     (the layout-shift trap that earlier display:none attempts hit). Mirrors
-     the same pattern used by .memory-row .inline-actions below. */
+  /* Content-width (NOT flex:1) so the inline worker signal ("AI summary in
+     progress…" / "Updating Memory Bank…") sits flush against the title rather
+     than being pushed to the right edge by a growing title — the slack now
+     falls to the right of the worker-status instead. nowrap keeps the title on
+     one line; when the row genuinely overflows, the title's min-content (the
+     full nowrap text) can't shrink, so the deficit is absorbed by the
+     worker-status, which carries min-width:0 + ellipsis and truncates. */
+  .collapsible-section .section-title { white-space: nowrap; }
+  /* Section-header actions are ALWAYS visible (not hover-revealed) so the
+     affordances (Context's +, Committed Memories' squash / push / refresh) stay
+     discoverable. In-flow with margin-left:auto pins them to the header's right
+     edge; the title (content-width) and the inline worker-status sit flush to
+     the left of the auto gap. Since they never toggle in/out, there's no
+     reveal-reflow to guard against — the old position:absolute + visibility
+     overlay was only needed for the hover model. Mirrors .memory-group-header
+     .section-actions below. */
   .collapsible-section .section-actions {
+    margin-left: auto;
     display: inline-flex;
+    align-items: center;
     gap: 2px;
-    /* 4px here + 4px from the section-header flex gap above = 8px of breathing
-       room to the right of the section title (the value before the header gap
-       existed). Keep these two numbers in lockstep if either changes. */
-    margin-left: 4px;
-    visibility: hidden;
+    flex-shrink: 0;
   }
-  .collapsible-section .section-header:hover .section-actions { visibility: visible; }
   .collapsible-section.collapsed .section-body { display: none; }
+
+  /* Compact build pill (Wiki / Graph) for the non-blocking Memory Bank build in
+     the Committed Memories header. Mirrors the .section-ai-pill chrome below but
+     carries a spinner instead of the pulsing dot. The short phase word never
+     truncates; the verbose "Building knowledge …" label lives in the title
+     attribute for hover/accessibility. */
+  .collapsible-section .section-build-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: 4px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: none;
+    flex: 0 0 auto;
+  }
+  .collapsible-section .section-build-pill .section-build-spin { font-size: 11px; }
+
+  /* Compact "● AI" pill that replaces the verbose blocking-summary text in the
+     Committed Memories header (the detail now lives in the Working Memory
+     "Summarizing <hash>…" row). The dot pulses to read as "working". */
+  .collapsible-section .section-ai-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: 4px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: none;
+    flex: 0 0 auto;
+  }
+  .collapsible-section .section-ai-pill .section-ai-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    animation: jm-ai-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes jm-ai-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  /* Working Memory "Summarizing <hash>…" progress row. Reuses .tree-node
+     layout; the spinner sits in the standard 16px .icon column so it aligns
+     with conversation rows below it. Muted, non-interactive (read-only). */
+  .tree-node.summarizing-row { cursor: default; color: var(--vscode-descriptionForeground); font-style: italic; }
+  .tree-node.summarizing-row .icon.summarizing-icon { color: var(--vscode-charts-blue); }
+  .tree-node.summarizing-row .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* Divider that separates the Changes file list from the Commit Memory CTA
      below. Lives on the section body's bottom edge (not on the CTA wrapper)
@@ -482,45 +564,126 @@ export function buildSidebarCss(): string {
     border-bottom: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border, var(--vscode-panel-border)));
   }
 
-  /* Bottom-of-section "Commit Memory" CTA — sits below the Changes section
-     body. Button aligns right (SCM-view convention) and the wrapper carries
-     vertical breathing room above (gap from the divider that lives on the
-     section body) and below (gap to the next section header). Button reuses
-     VS Code's primary-button tokens so it adapts to theme. Disabled state
-     matches .iconbtn:disabled (opacity-only, no hover background change) so
-     the visual semantics are consistent with the header sparkle iconbtn that
-     points at the same command. */
-  .commit-memory-action {
-    margin: 12px 0 0 0;
-    padding: 0 8px 12px 8px;
+  /* Current Memory group — wraps the Conversations / Context / Files
+     sub-sections under one heading so they read as the next memory's draft. */
+  .memory-group { display: flex; flex-direction: column; }
+  /* Current Memory header now reads as a collapsible section header: chevron +
+     uppercase title + hover-revealed actions (Select All / Refresh). Mirrors
+     .collapsible-section .section-header so the two top-level blocks (Current
+     Memory and Committed Memories) share one visual rhythm. */
+  .memory-group-header {
     display: flex;
-    justify-content: flex-end;
-  }
-  .commit-memory-btn {
-    display: inline-flex;
     align-items: center;
-    gap: 6px;
-    padding: 6px 14px;
-    background: var(--vscode-button-background);
-    color: var(--vscode-button-foreground);
-    border: 1px solid transparent;
-    border-radius: 3px;
-    font-size: 13px;
+    gap: 4px;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
     cursor: pointer;
+    user-select: none;
+    color: var(--vscode-sideBarSectionHeader-foreground, var(--vscode-foreground));
+    background: var(--vscode-sideBarSectionHeader-background, transparent);
+    border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15));
+    border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15));
   }
-  .commit-memory-btn:hover {
-    background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
+  .memory-group-header .section-title { flex: 1; }
+  /* Always-visible actions, matching .collapsible-section .section-actions. */
+  .memory-group-header .section-actions {
+    display: inline-flex;
+    gap: 2px;
+    margin-left: auto;
+    flex-shrink: 0;
   }
-  .commit-memory-btn:disabled {
-    opacity: 0.5;
-    cursor: default;
+  .memory-group-body { display: flex; flex-direction: column; }
+  .subsection .section-title { font-size: 11px; opacity: 0.8; padding-left: 6px; }
+  /* Sub-sections (Conversations / Context / Files) no longer collapse on their
+     own — they carry no chevron and the Working Memory group header owns the
+     fold. Drop the inherited pointer cursor so the header reads as inert. */
+  .subsection .section-header { cursor: default; }
+  /* Sub-section rows carry two leading slots that are dead space here:
+       1. the empty 12px .twirl placeholder (column-aligns with expandable
+          commit rows elsewhere — but conversation / plan / note / reference /
+          change rows never expand), and
+       2. the 18px .row-leading checkbox slot — in Working Memory the include
+          checkbox is hidden (the ✕/+ exclude toggle in the hover actions is the
+          real control; the box is just a DOM state-holder), so its slot reserves
+          width nobody sees.
+     Both pushed the leading icon out to ~36px, far right of the chevron-less
+     sub-section title (8px header pad + 6px title pad-left = 14px). Drop both
+     placeholders and pull the row in to 14px so the leading icon (or, for the
+     icon-less Files rows, the filename) column-aligns with the title text. The
+     show-more toggle (sub-section-only) and its chevron follow the same column.
+     The empty-state is left-aligned text with its own padding, so it's exempt. */
+  .subsection .section-body .tree-node { padding-left: 14px; }
+  .subsection .section-body .tree-node > .twirl { display: none; }
+  .subsection .section-body .tree-node > .row-leading { display: none; }
+  .subsection .section-body .show-more-row { padding-left: 14px; }
+  /* Pinned rows are top-level .tree-node (not .subsection), so they'd otherwise
+     keep the default 8px padding plus the silent 12px .twirl placeholder — which
+     pushed their leading icon ~10px right of the Working Memory sub-section rows
+     (Conversations / Context / Files) below, breaking the left-alignment between
+     the two blocks. Pinned rows never expand, so the .twirl is dead space here
+     too: mirror the sub-section treatment (drop it, pull the row in to 14px) so
+     the pinned icon column lands in the same column as the sub-section icons.
+     Direct-child combinator scopes this to the Pinned body, matching the
+     min-height rule below. */
+  .collapsible-section[data-section="pinned"] > .section-body .tree-node { padding-left: 14px; }
+  .collapsible-section[data-section="pinned"] > .section-body .tree-node > .twirl { display: none; }
+  /* Each Current Memory sub-section (Conversations / Context / Files), plus the
+     top-level Pinned and Committed Memories sections, reserves at least ~4 rows
+     of height (~22px/row) so the blocks keep a stable rhythm and don't collapse
+     to a thin strip when they have few or no items. Pinned and Committed are
+     plain .collapsible-section (no .subsection class), so they're matched by
+     data-section and use a direct-child combinator to avoid reaching into the
+     Current Memory group's nested sub-section bodies. section-body has no
+     overflow clip, so this is a floor only — a block with more than 4 rows grows
+     past it naturally (up to the SUBSECTION_PREVIEW cap, then "Show N more"). */
+  .subsection .section-body,
+  .collapsible-section[data-section="pinned"] > .section-body,
+  .collapsible-section[data-section="commits"] > .section-body { min-height: 88px; }
+
+  /* Unified expand/collapse chevron for every Branch-tab collapsible block
+     (Current Memory + sub-sections + Pinned + Committed Memories). The codicon
+     glyph itself encodes direction (chevron-down open / chevron-right closed),
+     so — unlike the old text .twirl — there is no rotation transform.
+     Selector is .codicon.section-twirl (NOT a bare .section-twirl): codicon.css
+     pins font:16px on .codicon[class*='codicon-'] at (0,2,0) specificity, so a
+     plain (0,1,0) .section-twirl loses and the glyph renders at 16px — visibly
+     larger than the (0,2,0) .tree-node .commit-twirl on committed-memory rows.
+     Matching it to (0,2,0) here ties codicon and wins on source order, landing
+     the chevron at 12px to mirror .commit-twirl (same fix as .iconbtn--sm
+     .codicon above). */
+  .codicon.section-twirl {
+    width: 12px;
+    flex-shrink: 0;
+    font-size: 12px;
+    line-height: 1;
+    color: var(--vscode-foreground);
   }
-  .commit-memory-btn:disabled:hover {
-    background: var(--vscode-button-background);
+  /* Item-count after a sub-section title (Conversations 7). Muted + slightly
+     smaller so it reads as metadata, not part of the label. */
+  .section-count {
+    margin-left: 6px;
+    font-weight: 400;
+    opacity: 0.6;
+    font-variant-numeric: tabular-nums;
   }
-  .commit-memory-btn .codicon {
-    font-size: 14px;
+  /* "Show N more" / "Show less" toggle row at the bottom of a capped
+     sub-section. Indented to align with row content; reads as a quiet,
+     clickable affordance rather than a data row. */
+  .show-more-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px 3px 20px;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--vscode-textLink-foreground, var(--vscode-descriptionForeground));
+    user-select: none;
   }
+  .show-more-row:hover { background: var(--vscode-list-hoverBackground, transparent); }
+  .show-more-row .section-twirl { color: inherit; }
 
   .tree-node {
     display: flex;
@@ -531,6 +694,9 @@ export function buildSidebarCss(): string {
     cursor: pointer;
     white-space: nowrap;
     user-select: none;
+    /* Containing block for the absolutely-positioned hover .inline-actions
+       overlay (Conversations / Context / Changes rows) — see below. */
+    position: relative;
   }
   /* Per-level indent step is 20px (matching VS Code's default tree). The
      row's leading column is chevron(12) + gap(4) + icon(16) = 32px+; with a
@@ -682,21 +848,53 @@ export function buildSidebarCss(): string {
   /* Inline actions on tree nodes default to always visible (plans rows keep
      edit/remove visible for fast access; commit rows keep View Memory). */
   .tree-node .inline-actions { display: inline-flex; gap: 2px; flex-shrink: 0; }
-  /* Changes rows trailing pair: [discard (hover-only)] [letter (always)].
-     - margin-left:auto on inline-actions pushes the whole pair to the
-       right edge (gs-letter rides along just after it in DOM order).
-     - visibility (not display) toggle keeps the row from reflowing on
-       hover; the slot stays reserved.
-     - gs-letter override drops the margin-left:auto it'd inherit from
-       the commit-file default rule below — letter sits flush against
-       the inline-actions group (its own padding-left:4px supplies the
-       breathing room from the discard button's internal right padding). */
+  /* Changes rows trailing layout: the always-visible gs-letter (M/A/D) sits at
+     the right edge via its inherited margin-left:auto; the hover-only discard
+     button overlays the right edge ON TOP of it (absolute, out of flow) so the
+     filename/dir content gets the full row width and the discard never reserves
+     a slot or reflows the row. Mirrors the .section-actions header overlay. */
   .tree-node.tree-node--changes .inline-actions {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    /* Fade gap + opaque backing so the covered text/letter doesn't bleed
+       through; the gradient over a solid base reproduces the hovered row
+       background exactly (list-hover tint composited over the sidebar bg). */
+    padding-left: 8px;
+    background-color: var(--vscode-sideBar-background, var(--vscode-editor-background));
+    background-image: linear-gradient(var(--vscode-list-hoverBackground), var(--vscode-list-hoverBackground));
     visibility: hidden;
-    margin-left: auto;
   }
   .tree-node.tree-node--changes:hover .inline-actions { visibility: visible; }
-  .tree-node.tree-node--changes .gs-letter { margin-left: 0; }
+
+  /* Hover-revealed inline actions (Conversations rows + Context plan/note/
+     reference rows + the expanded-commit memory row). The Pin affordance — and,
+     for these rows, edit/remove — surfaces only on hover, matching VS Code's
+     native tree row behavior. Floated OUT of the flex flow (position:absolute,
+     pinned to the right edge) so they claim zero layout width while idle — the
+     row content (title + trailing metadata chips) gets the full width instead
+     of leaving an icon-buttons' slot reserved — and overlay the right edge on
+     hover, riding on an opaque backing so the content underneath doesn't bleed
+     through. Mirrors the .section-actions header overlay; visibility (not
+     display) keeps the no-reflow guard valid. */
+  .tree-node--hover-actions .inline-actions {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding-left: 8px;
+    background-color: var(--vscode-sideBar-background, var(--vscode-editor-background));
+    background-image: linear-gradient(var(--vscode-list-hoverBackground), var(--vscode-list-hoverBackground));
+    visibility: hidden;
+  }
+  .tree-node--hover-actions:hover .inline-actions { visibility: visible; }
 
   /* CONVERSATIONS section rows: one active AI session per row. Inherits the
      base .tree-node flex layout (gap: 4px) so the leading checkbox / icon
@@ -774,6 +972,17 @@ export function buildSidebarCss(): string {
     flex-shrink: 0;
   }
 
+  /* Conversation-type glyph: per-source brand <svg> ported from the IntelliJ
+     icon set. The .icon column is already 16px; flex-center the svg so the
+     glyph sits on the text mid-line regardless of its internal padding (the
+     old trailing source-dot relied on .tree-node align-items:center, but an
+     svg needs the box explicitly centered). Neutral marks inherit color via
+     currentColor; brand-colored marks (Claude/Codex/Gemini) carry their own. */
+  .tree-node .icon.conv-source-icon { display: inline-flex; align-items: center; justify-content: center; color: var(--vscode-icon-foreground); }
+  .conv-source-svg { width: 16px; height: 16px; display: block; }
+  .conversation-row .msgs { margin-left: auto; color: var(--vscode-descriptionForeground); font-size: 0.9em; white-space: nowrap; }
+  .conversation-row .usage-note { color: var(--vscode-descriptionForeground); opacity: 0.7; font-size: 0.85em; margin-left: 6px; white-space: nowrap; }
+
   .memory-row {
     padding: 6px 12px;
     border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.1));
@@ -781,6 +990,8 @@ export function buildSidebarCss(): string {
     display: flex;
     align-items: center;
     gap: 8px;
+    /* Containing block for the absolutely-positioned hover .inline-actions. */
+    position: relative;
   }
   .memory-row:hover { background: var(--vscode-list-hoverBackground); }
   .memory-row-icon { width: 16px; flex-shrink: 0; text-align: center; }
@@ -797,13 +1008,323 @@ export function buildSidebarCss(): string {
   }
   .memory-row .meta { color: var(--vscode-descriptionForeground); font-size: 10px; }
   .memory-row .meta .hash { font-family: var(--vscode-editor-font-family, ui-monospace, monospace); }
-  /* Hover-only buttons matching the legacy native TreeView UX. Uses
-     visibility (not display) so the row reserves the slot at all times —
-     no reflow on hover, no flicker. The "always-visible" guard in
-     SidebarCssBuilder.test.ts is scoped to .tree-node + .section-header
-     where layout-shift problems originally surfaced. */
-  .memory-row .inline-actions { display: inline-flex; gap: 2px; flex-shrink: 0; visibility: hidden; }
+  /* Hover-only buttons matching the legacy native TreeView UX. Floated OUT of
+     the flex flow (position:absolute, pinned to the row's right edge so it
+     aligns with the row's 12px right padding) so they claim zero layout width
+     while idle — the title/meta column gets the full width — and overlay the
+     right edge on hover, riding on an opaque backing so the meta line beneath
+     doesn't bleed through. Mirrors the .section-actions header overlay;
+     visibility (not display) keeps the no-reflow guard valid. */
+  .memory-row .inline-actions {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding-left: 8px;
+    background-color: var(--vscode-sideBar-background, var(--vscode-editor-background));
+    background-image: linear-gradient(var(--vscode-list-hoverBackground), var(--vscode-list-hoverBackground));
+    visibility: hidden;
+  }
   .memory-row:hover .inline-actions { visibility: visible; }
+  /* Strikethrough-exclude (Working Memory). Rows are included by default;
+     the ✕/+ .row-excl button leaves an item out (reversible). On rows that
+     carry the toggle the raw include checkbox becomes a hidden state-holder —
+     scoped via :has() so squash commit checkboxes (no .row-excl) keep theirs. */
+  .tree-node:has(.row-excl) input[type="checkbox"][data-checkbox="1"] { display: none; }
+  /* .row-excl inherits the .iconbtn look (it lives inside .inline-actions);
+     no standalone box styling — that previously sat in normal flow and the
+     absolutely-positioned hover overlay landed on top of it (file rows: the
+     Discard icon stacked over it, making it unclickable). */
+  /* Excluded row: struck through + dimmed so "left out of this memory" reads
+     at a glance. The label carries the line-through; the whole row dims. The
+     hover action overlay is exempted so its icons stay legible. */
+  .tree-node.excluded .label { text-decoration: line-through; }
+  .tree-node.excluded { opacity: 0.6; }
+  .tree-node.excluded:hover { opacity: 1; }
+  /* Twirl chevron that toggles evidence expansion — sits at the very left
+     of the memory row (before the M icon). Vertically centered; cursor pointer
+     since it is a toggle target, not a full-row action. */
+  .memory-twirl {
+    flex-shrink: 0;
+    width: 14px;
+    font-size: 12px;
+    cursor: pointer;
+    color: var(--vscode-foreground);
+    opacity: 0.6;
+  }
+  .memory-row:hover .memory-twirl { opacity: 1; }
+  /* Expanded committed-memory evidence (mockup .mem-files): a full-width block
+     under the row — no indent rail, padding only. Groups are separated by a
+     top-border divider and a plain uppercase label (no leading codicon), and a
+     right-aligned "Hide memory details" button closes it. */
+  .memory-evidence {
+    padding: 2px 10px 4px;
+  }
+  .memory-evidence-empty,
+  .memory-evidence-loading {
+    padding: 4px 10px;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+  }
+  /* Groups (Conversations / Context / Files) are separated by whitespace only —
+     no divider rule — matching the mockup's .mem-files .mem-group. The label is
+     small uppercase tertiary text; the breathing room above each group reads as
+     the separation. */
+  .memory-evidence-group { margin-top: 0; }
+  .memory-evidence-group-label {
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--vscode-descriptionForeground);
+    padding: 6px 0 1px;
+  }
+  .memory-evidence-group:first-child .memory-evidence-group-label {
+    padding-top: 1px;
+  }
+  /* Right-aligned bottom collapse (mockup .mem-collapse). */
+  .memory-evidence-collapse {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: fit-content;
+    margin: 6px 0 2px auto;
+    padding: 4px 2px;
+    background: none;
+    border: none;
+    color: var(--vscode-descriptionForeground);
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .memory-evidence-collapse:hover { color: var(--vscode-textLink-foreground); }
+  .memory-evidence-collapse .codicon { font-size: 10px; }
+  .memory-evidence-rows { display: flex; flex-direction: column; }
+  .memory-evidence-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px;
+    border-radius: 2px;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--vscode-foreground);
+    overflow: hidden;
+  }
+  .memory-evidence-row:hover { background: var(--vscode-list-hoverBackground); }
+  /* Foreign-repo file rows: shown for context but not openable (the workspace
+     git can't diff a foreign commit). Default cursor + no hover affordance. */
+  .memory-evidence-row--static { cursor: default; }
+  .memory-evidence-row--static:hover { background: transparent; }
+  .memory-evidence-row .codicon { font-size: 12px; flex-shrink: 0; }
+  .memory-evidence-title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* File evidence rows: filename (tinted by git-status .gs-{code}) stacked over
+     the muted directory path, with the trailing status letter pushed to the
+     right edge. Mirrors the mockup's two-line file treatment — distinct from
+     the single-line Branch-tab commit-file rows. */
+  .memory-evidence-file { align-items: center; }
+  .memory-evidence-file .mef-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .memory-evidence-file .mef-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .memory-evidence-file .mef-dir {
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .memory-evidence-row .gs-letter {
+    margin-left: auto;
+    padding-left: 6px;
+    font-size: 11px;
+    font-weight: 500;
+    flex-shrink: 0;
+  }
+  /* Context evidence badge: a small solid square with a single white letter,
+     hue keyed by kind/source. Replaces the previous monochrome codicon so the
+     plan / note / reference provenance reads at a glance (mockup parity). */
+  .mem-ctx-badge {
+    flex-shrink: 0;
+    width: 16px;
+    height: 16px;
+    border-radius: 3px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    color: #fff;
+    background: var(--vscode-descriptionForeground);
+  }
+  .mem-ctx-badge--plan      { background: #3fb950; }
+  .mem-ctx-badge--note      { background: #d29922; }
+  .mem-ctx-badge--linear    { background: #5e6ad2; }
+  .mem-ctx-badge--jira      { background: #0052cc; }
+  .mem-ctx-badge--github    { background: #6e7681; }
+  .mem-ctx-badge--notion    { background: #787774; }
+  .mem-ctx-badge--reference { background: #6e7681; }
+  /* Conversation evidence: trailing "N msgs" count. The leading glyph is the
+     shared per-source brand icon (.conv-source-icon), so the agent identity
+     reads identically here, on the live CONVERSATIONS rows, and on Pinned. */
+  .memory-evidence-row .msgs {
+    margin-left: auto;
+    padding-left: 6px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  /* SHIPPED group — Push-to-Jolli status + Create-PR action rows rendered
+     above the evidence groups in an expanded committed-memory row. */
+  .shipped-group {
+    padding: 4px 10px 2px;
+  }
+  .shipped-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px;
+    border-radius: 2px;
+    font-size: 11px;
+    color: var(--vscode-foreground);
+  }
+  .shipped-row--action {
+    cursor: pointer;
+  }
+  .shipped-row--action:hover {
+    background: var(--vscode-list-hoverBackground);
+  }
+  .shipped-row--synced {
+    color: var(--vscode-charts-green, var(--vscode-testing-iconPassed, #73c991));
+  }
+  .shipped-row .codicon {
+    font-size: 12px;
+    flex-shrink: 0;
+  }
+  .shipped-label {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .shipped-link {
+    font-size: 11px;
+    color: var(--vscode-textLink-foreground);
+    flex-shrink: 0;
+  }
+  .shipped-link:hover {
+    text-decoration: underline;
+  }
+  /* Status chips inside the SHIPPED group rows (PR open / Synced). */
+  .ship-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0 4px;
+    border-radius: 2px;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    flex-shrink: 0;
+  }
+  .ship-badge--open {
+    background: color-mix(in srgb, var(--vscode-charts-green, var(--vscode-testing-iconPassed, #73c991)) 20%, transparent);
+    color: var(--vscode-charts-green, var(--vscode-testing-iconPassed, #73c991));
+  }
+  .ship-badge--synced {
+    background: color-mix(in srgb, var(--vscode-charts-green, var(--vscode-testing-iconPassed, #73c991)) 20%, transparent);
+    color: var(--vscode-charts-green, var(--vscode-testing-iconPassed, #73c991));
+  }
+
+  /* "Show memory details" affordance for a collapsed committed-memory row.
+     Rendered on its OWN line below the row (not crammed onto the title line),
+     right-aligned, so the title gets the full row width and the expander reads
+     as a distinct control. When expanded the row-level toggle is dropped — the
+     evidence block's bottom .memory-evidence-collapse is the sole "Hide" control
+     (matching the mockup, which hides the chips line on expand). */
+  .mem-details-line {
+    display: flex;
+    justify-content: flex-end;
+    padding: 0 12px 4px;
+  }
+  /* Mirrors the mockup's .mem-evd: a quiet inline expander (no underline) with a
+     trailing disclosure chevron, reading as a control rather than body text or a
+     navigation link. */
+  .commit-memory-details-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+    cursor: pointer;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .commit-memory-details-toggle:hover {
+    color: var(--vscode-textLink-foreground);
+  }
+  .memory-details-chevron { font-size: 10px; }
+
+  /* Row subline under the committed-memory title row: "2h ago · hash · tokens".
+     Quiet secondary line — description foreground, smaller text, left-aligned
+     to sit naturally under the label. Indented via padding-left to clear the
+     leading icon column (twirl + row-leading + icon slot = ~56px). */
+  .mem-subline {
+    display: flex;
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 3px;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    padding: 0 8px 3px 56px;
+    line-height: 1.3;
+  }
+  /* Hash segment is monospace so the 8-char hash reads at a glance. */
+  .mem-sub-hash {
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 10px;
+    opacity: 0.85;
+  }
+  /* Middle-dot separators match the muted subline tone. */
+  .mem-sub-sep {
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.6;
+    padding: 0 1px;
+  }
+
+  /* Memory Bank repo filter ("Showing: <repo>") — replaces the branch
+     breadcrumb segment on the Memory Bank / Knowledge views. Hidden by
+     default (.hidden in the HTML); the script removes .hidden when
+     activeTab === 'kb' and adds it back on other tabs. */
+  .repo-filter { display: inline-flex; align-items: center; gap: 5px; padding: 2px 4px 2px 6px; min-width: 0; flex: 1 1 auto; }
+  .repo-filter-label { font-size: 11px; color: var(--vscode-descriptionForeground); flex-shrink: 0; }
+
+  /* Memory Bank Timeline — relative-time group headers. */
+  .tl-group-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--vscode-descriptionForeground);
+    padding: 8px 14px 2px;
+  }
 
   /* Custom hover popup that replaces the native title= tooltip. Mirrors the
      legacy MarkdownString tooltip 1:1 (codicons + command links). Positioned
@@ -1170,5 +1691,251 @@ export function buildSidebarCss(): string {
     flex: 1;
     border-top: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
   }
+
+  /* Knowledge wiki view ---------------------------------------------------- */
+  /* Header line: memory count label + Rebuild icon-button. */
+  .kn-header {
+    display: flex;
+    align-items: center;
+    padding: 6px 8px 4px;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .kn-header-label {
+    flex: 1 1 auto;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Shared entry row: Overview, Knowledge graph, and topic rows. */
+  .kn-entry {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 13px;
+    min-height: 22px;
+  }
+  .kn-entry:hover {
+    background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
+  }
+  .kn-entry .icon { flex: 0 0 16px; display: flex; align-items: center; }
+  .kn-entry .label {
+    flex: 1 1 auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .kn-topic-meta {
+    flex: 0 0 auto;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+  }
+
+  /* Category row: collapsible, sits between repo and topic rows. */
+  .kn-cat {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 13px;
+    min-height: 22px;
+  }
+  .kn-cat:hover {
+    background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
+  }
+  .kn-cat .icon { flex: 0 0 16px; display: flex; align-items: center; }
+  .kn-cat .label {
+    flex: 1 1 auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-weight: 600;
+  }
+  .kn-cat-meta {
+    flex: 0 0 auto;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+  }
+
+  /* Repo row in the knowledge tree. */
+  .kn-repo-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 13px;
+    min-height: 24px;
+    font-weight: 600;
+  }
+  .kn-repo-row:hover {
+    background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
+  }
+  .kn-repo-meta {
+    flex: 0 0 auto;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    font-weight: 400;
+  }
+
+  /* Empty-state CTA when no wiki has been compiled for a repo yet. */
+  .kn-nowiki {
+    padding: 10px 16px;
+  }
+  .kn-nowiki-msg {
+    font-size: 12px;
+    color: var(--vscode-descriptionForeground);
+    margin-bottom: 8px;
+    line-height: 1.4;
+  }
+  .kn-build-btn {
+    font-size: 12px;
+    padding: 5px 12px;
+  }
+
+  /* Pinned to the bottom of the sidebar (the .sidebar-root box is the
+     positioning context — see its position:relative). absolute (not sticky)
+     so the bar holds a fixed-height strip at the bottom regardless of how the
+     scrollable branch content above it grows or scrolls; #tab-content-branch
+     carries a matching padding-bottom so the last rows clear it. */
+  .branch-footer {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 44px;
+    box-sizing: border-box;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    padding: 0 8px;
+    background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+    border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15));
+  }
+  .commit-review-bar { display: flex; gap: 6px; padding: 8px 12px; }
+  /* Squash confirm bar — top of the Committed Memories body while in squash
+     selection mode. The count takes the flexible slack on the left; Select-all,
+     Squash and Cancel stay grouped on the right. nowrap + a shrinkable count
+     (flex:1 / min-width:0) means a long count WRAPS ITS OWN TEXT to a second
+     line rather than pushing the rigid buttons onto a new row. */
+  .squash-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 6px;
+    padding: 6px 10px;
+    margin-bottom: 4px;
+    border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
+    border-radius: 4px;
+    background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+  }
+  .squash-count { flex: 1 1 auto; min-width: 0; font-size: 11px; color: var(--vscode-descriptionForeground); }
+  .squash-select-all {
+    flex-shrink: 0;
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 11px;
+    color: var(--vscode-textLink-foreground);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .squash-select-all:hover { text-decoration: underline; }
+  /* Squash/Cancel hug their labels and never shrink, so the count yields space
+     first. Select-all sits directly left of Squash (no auto gap between them). */
+  .squash-bar .cmd-btn { flex: 0 0 auto; }
+  /* Shared command-button look — used by the Working Memory Commit/Review bar
+     AND the branch footer. Previously the visual styling lived ONLY under
+     .branch-footer .cmd-btn, so the Commit/Review bar buttons rendered as bare
+     unstyled buttons (no padding / primary fill). This generic base fixes that;
+     per-container rules below only set flex sizing. Surfaces ride the VS Code
+     button tokens so themes are respected. */
+  .cmd-btn {
+    flex: 1;
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    padding: 5px 10px;
+    border: 1px solid var(--vscode-button-border, transparent);
+    border-radius: 4px;
+    background: var(--vscode-button-secondaryBackground, transparent);
+    color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .cmd-btn.primary {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border-color: transparent;
+  }
+  .cmd-btn:hover { background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground)); }
+  .cmd-btn.primary:hover { background: var(--vscode-button-hoverBackground); }
+  .cmd-btn:disabled { opacity: 0.5; cursor: default; }
+  .cmd-btn.aa-more { flex: 0 0 auto; }
+  /* Commit Memory leads — the primary gets a bit more width than Review. */
+  .commit-review-bar .cmd-btn { flex: 1 1 auto; }
+  .commit-review-bar .cmd-btn.primary { flex-grow: 1.7; }
+  /* flex:1 — footer action buttons (Create PR / Share) share the bar's width
+     equally; min-width:0 + ellipsis lets labels truncate on a narrow sidebar.
+     The overflow (...) button hugs its glyph (flex:0 0 auto). */
+  .branch-footer .cmd-btn { flex: 1; min-width: 0; }
+  .branch-footer .cmd-btn.aa-more { flex: 0 0 auto; }
+
+  /* ── Token-usage bar (Committed Memories, non-foreign only) ──────────────
+     .token-bar-wrap  outer container with section-matched padding
+     .token-bar-label label line: "1.8M tokens · this branch"
+     .token-bar       horizontal pill bar (input=green / output=blue)
+     .token-seg       one colored segment inside the bar
+     .token-bar-legend two-item row: "<n> input  <n> output"
+     Width classes .token-seg--wN (N = 0..100 step 10) set the INPUT segment
+     width; the OUTPUT segment (no width class) fills the remainder via flex. */
+  .token-bar-wrap { padding: 4px 12px 8px; }
+  /* Label line + trailing "?" help affordance share one row so the icon hugs
+     the right edge (margin-left:auto) without an inline style. */
+  .token-bar-label-row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+  .token-bar-label { color: var(--vscode-descriptionForeground); font-size: 0.85em; }
+  .token-bar-help { margin-left: auto; display: inline-flex; align-items: center; color: var(--vscode-descriptionForeground); opacity: 0.7; cursor: pointer; flex: 0 0 auto; }
+  .token-bar-help:hover { opacity: 1; }
+  .token-bar-help .codicon { font-size: 13px; }
+  .token-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--vscode-input-background); }
+  .token-seg { display: block; height: 100%; }
+  .token-seg--input { background: var(--vscode-charts-green, #4ec9b0); }
+  /* Cached sits between input and output as a neutral gray segment. */
+  .token-seg--cached { background: var(--vscode-descriptionForeground); opacity: 0.5; }
+  .token-seg--output { background: var(--vscode-charts-blue, #4fc1ff); flex: 1 1 auto; }
+  .token-bar-legend { display: flex; gap: 12px; margin-top: 4px; font-size: 0.8em; color: var(--vscode-descriptionForeground); }
+  .tk-leg--input::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-charts-green, #4ec9b0); margin-right: 4px; vertical-align: middle; }
+  .tk-leg--output::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-charts-blue, #4fc1ff); margin-right: 4px; vertical-align: middle; }
+  .tk-leg--cached::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-descriptionForeground); opacity: 0.5; margin-right: 4px; vertical-align: middle; }
+  /* Bucketed input-segment width classes (0..100 in steps of 10).
+     The input segment gets one of these; output fills the rest via flex:1 1 auto. */
+  .token-seg--w0   { width: 0%; }
+  .token-seg--w10  { width: 10%; }
+  .token-seg--w20  { width: 20%; }
+  .token-seg--w30  { width: 30%; }
+  .token-seg--w40  { width: 40%; }
+  .token-seg--w50  { width: 50%; }
+  .token-seg--w60  { width: 60%; }
+  .token-seg--w70  { width: 70%; }
+  .token-seg--w80  { width: 80%; }
+  .token-seg--w90  { width: 90%; }
+  .token-seg--w100 { width: 100%; }
   `;
 }

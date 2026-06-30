@@ -57,6 +57,194 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("switchTab");
 	});
 
+	it("renders the knowledge stub on init when it is the restored active tab", () => {
+		// Regression: switchTab() early-returns when getState() already restored
+		// activeTab, so the init handler must paint knowledge explicitly or the
+		// recreated webview stays stuck on the "Loading..." HTML placeholder.
+		const js = buildSidebarScript();
+		expect(js).toContain("state.activeTab === 'knowledge'");
+		expect(js).toContain("renderKnowledge()");
+	});
+
+	it("posts a refresh scope message on toolbar Refresh (knowledge tab gets host data)", () => {
+		// The knowledge view now has host-driven data (kb:knowledgeData) so toolbar
+		// Refresh posts a 'refresh' scope message rather than re-rendering locally.
+		const js = buildSidebarScript();
+		expect(js).toContain("vscode.postMessage({ type: 'refresh', scope: state.activeTab });");
+	});
+
+	it("renders the Knowledge view: Overview + graph entry + repo/category/topic tree", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("'kb:knowledgeData'");
+		expect(js).toContain("function renderKnowledge");
+		expect(js).toContain("Overview");
+		// single graph entry reuses the existing command (not a graph-list mode)
+		expect(js).toContain("jollimemory.viewKnowledgeGraph");
+		// no leftover stub
+		expect(js).not.toContain("Knowledge wiki — coming soon.");
+	});
+
+	it("shows a Build CTA when a repo has no compiled wiki, and Rebuild reuses compileNow", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("jollimemory.compileNow");
+		expect(js).toContain("Build Knowledge Wiki");
+	});
+
+	it("filters the Knowledge tree by a search query", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("knowledgeQuery");
+		expect(js).toContain("Search topics");
+	});
+
+	// Regression guards for the Current Branch / Knowledge review findings.
+	// These are substring assertions; the `new Function(...)` parse smoke test
+	// above is what guarantees the surrounding edits stay syntactically valid.
+	describe("review fixes (Bug 1-6)", () => {
+		it("Bug 1: conversation rows carry data-context so the native menu stays suppressed", () => {
+			const js = buildSidebarScript();
+			// The contextmenu listener filters via closest('.tree-node[data-context]');
+			// an absent attribute is not matched by the presence selector, so the
+			// native menu would leak. Pin itself moved to a hover-revealed inline
+			// button (canPinConv gate), so there is no custom conversation menu.
+			expect(js).toContain("'data-context': 'conversation'");
+			expect(js).toContain("const canPinConv");
+		});
+
+		it("Bug 3: foreign-memory conversation evidence rows are static (no open dispatch)", () => {
+			const js = buildSidebarScript();
+			// Mirrors the Files group's isForeignMemory guard: static class + tip,
+			// no click wiring to branch:openConversation against a non-local path.
+			expect(js).toContain(
+				"'memory-evidence-row' + (isForeignMemory ? ' memory-evidence-row--static' : '')",
+			);
+			expect(js).toContain(
+				"Conversations are only available for memories in the current workspace",
+			);
+		});
+
+		it("Bug 4: a pin re-appearing expands the Pinned section instead of leaving it collapsed-empty", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("pinsHydrated");
+			expect(js).toContain("state.sectionsCollapsed['pinned'] = false");
+		});
+
+		it("Bug 5: kb:expandMemory is de-duplicated by an in-flight pending guard", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("evidencePending");
+			expect(js).toContain("if (!evidencePending[hash])");
+			expect(js).toContain("delete evidencePending[msg.commitHash]");
+		});
+
+		it("Bug 6: Overview/Graph are single at top only for one repo, else nested per repo", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("function knRepoEntries(repo)");
+			expect(js).toContain("visibleRepos.length === 1");
+			expect(js).toContain("visibleRepos.length > 1");
+		});
+
+		it("foreign-readonly hides the body Commit|Review bar, footer, and token bar", () => {
+			const js = buildSidebarScript();
+			// renderCommitReviewBar + footer are only mounted in the non-foreign branch
+			expect(js).toContain("if (!foreign) {");
+			// token bar is gated on !foreign
+			expect(js).toContain("if (!foreign && state.tokenStats)");
+		});
+	});
+
+	it("conversation row leads with a per-source brand icon and 'N msgs' (no static usage placeholder)", () => {
+		const js = buildSidebarScript();
+		// Leading glyph is now the source-typed brand icon (replaces the old
+		// generic comment glyph + trailing colored source-dot), with a hover tip.
+		expect(js).toContain("convSourceIcon(item.source)");
+		expect(js).toContain("'icon conv-source-icon'");
+		expect(js).toContain("providerLabel(item.source)");
+		// The trailing source-dot is gone.
+		expect(js).not.toContain("'source-dot source-dot-' + item.source");
+		// message count rendered as "N msgs"
+		expect(js).toContain("item.messageCount) + ' msgs'");
+		// The old "usage not reported" placeholder is gone — no token data exists,
+		// so stamping it on every row was noise (and wrong for sources that report).
+		expect(js).not.toContain("usage not reported");
+	});
+
+	it("defines a per-source brand-icon map covering every provider", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("var SOURCE_ICON_SVG = {");
+		for (const src of ["claude", "codex", "gemini", "cursor", "copilot", "opencode"]) {
+			expect(js).toContain(`${src}:`);
+		}
+		// copilot-chat reuses the Copilot mark.
+		expect(js).toContain("SOURCE_ICON_SVG['copilot-chat'] = SOURCE_ICON_SVG.copilot");
+		// Parsed as a trusted constant via DOMParser, not innerHTML.
+		expect(js).toContain("new DOMParser().parseFromString(markup, 'image/svg+xml')");
+		expect(js).not.toContain(".innerHTML = markup");
+	});
+
+	describe("Working Memory strikethrough-exclude", () => {
+		it("declares a shared excludeToggle helper that renders a ✕/+ row-excl button", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("function excludeToggle(");
+			expect(js).toContain("row-excl");
+			expect(js).toContain("'data-exclude-toggle'");
+			// '+' (add back) vs close (leave out) codicons, flipped by selection.
+			expect(js).toContain("codicon-add");
+			expect(js).toContain("codicon-close");
+		});
+
+		it("conversation row reflects exclusion via an .excluded class instead of an unchecked visible box", () => {
+			const js = buildSidebarScript();
+			const renderConversationRow = js.slice(
+				js.indexOf("function renderConversationRow"),
+				js.indexOf("function providerLabel"),
+			);
+			// included-by-default: the row carries 'excluded' only when !isSelected.
+			expect(renderConversationRow).toContain("excluded");
+			expect(renderConversationRow).toContain("excludeToggle(");
+		});
+
+		it("wires a delegated click handler that flips the hidden checkbox and redispatches change", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("[data-exclude-toggle]");
+			// reuses the existing per-kind change roundtrip rather than a new message
+			expect(js).toContain("new Event('change'");
+		});
+
+		it("context rows (plan/note/reference) also carry the exclude toggle", () => {
+			const js = buildSidebarScript();
+			const renderPlanRow = js.slice(
+				js.indexOf("function renderPlanRow"),
+				js.indexOf("function renderConversationRow"),
+			);
+			expect(renderPlanRow).toContain("excludeToggle(");
+			expect(renderPlanRow).toContain(" excluded");
+		});
+
+		it("file change rows also carry the exclude toggle (Discard stays distinct)", () => {
+			const js = buildSidebarScript();
+			const renderChangeRow = js.slice(
+				js.indexOf("function renderChangeRow"),
+				js.indexOf("function renderCommitRow"),
+			);
+			expect(renderChangeRow).toContain("excludeToggle(");
+			expect(renderChangeRow).toContain(" excluded");
+			// the destructive discard affordance is untouched
+			expect(renderChangeRow).toContain("'discard'");
+		});
+	});
+
+	it("always renders the Pinned section with an empty-state when nothing is pinned", () => {
+		const js = buildSidebarScript();
+		// The empty-state copy (mockup) is present...
+		expect(js).toContain("Nothing pinned.");
+		// ...and the section is no longer gated behind a non-empty pins check.
+		const branch = js.slice(
+			js.indexOf("function renderBranch"),
+			js.indexOf("function renderShowMoreRow"),
+		);
+		expect(branch).not.toContain("if (pinsData.length > 0)");
+		expect(branch).toContain("'data-section': 'pinned'");
+	});
+
 	it("persists state via vscode.setState", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("vscode.setState");
@@ -311,12 +499,13 @@ describe("SidebarScriptBuilder", () => {
 		expect(js.slice(handlerStart, handlerEnd)).toContain("renderToolbar()");
 	});
 
-	it("renders shared indicator chrome (worker on Branch, sync-phase on Memory Bank)", () => {
+	it("renders toolbar indicator chrome (sync-phase) plus the post-commit worker label", () => {
 		const js = buildSidebarScript();
-		// Shared indicator chrome: spinner for info, error icon for sticky
-		// sync failures. The post-commit "AI summary in progress…" label is
-		// still emitted (used by the Branch tab worker indicator); the
-		// sync-phase variant reuses the same chrome on the Memory Bank tab.
+		// toolbar-worker-status is the Memory Bank tab's sync-phase chrome
+		// (spinner for info, error icon for sticky sync failures). The
+		// post-commit "AI summary in progress…" label is still emitted, now by
+		// the Committed Memories header indicator (renderWorkerSignal)
+		// rather than the removed Branch toolbar.
 		expect(js).toContain("toolbar-worker-status");
 		expect(js).toContain("codicon-loading codicon-modifier-spin");
 		expect(js).toContain("codicon-error");
@@ -344,8 +533,15 @@ describe("SidebarScriptBuilder", () => {
 	it("handles worker:busy by re-rendering toolbar AND branch on the Branch tab", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("'worker:busy'");
-		// Idempotent: skip re-render when the flag did not change.
-		expect(js).toContain("if (state.workerBusy === next) break;");
+		// Idempotent: skip re-render when neither the flag nor the attached
+		// summarizing hash changed.
+		expect(js).toContain(
+			"if (state.workerBusy === next && state.summarizingHash === nextHash) break;",
+		);
+		// The host attaches the HEAD short hash while busy; the handler stores it
+		// for the "Summarizing <hash>…" Working Memory row.
+		expect(js).toContain("const nextHash = next ? (msg.commit || null) : null;");
+		expect(js).toContain("state.summarizingHash = nextHash;");
 		// Scoped re-render: only Branch tab needs to repaint. Take the whole
 		// case body (up to the next `case `) since the early-return `break;` for
 		// the no-change branch sits before the activeTab guard.
@@ -367,19 +563,15 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("kb:expandFolder");
 	});
 
-	it("attaches a dynamic tooltip to the Status indicator that follows OK/Warning/Error", () => {
+	it("drops the in-webview Status indicator tooltip wiring (moved to native title bar)", () => {
 		const js = buildSidebarScript();
-		// One-time attach at script init (the icon lives in the static skeleton).
-		expect(js).toContain(
-			"if (statusIconBtn) attachTextTip(statusIconBtn, 'Jolli Memory: All good')",
-		);
-		// renderStatus picks the tip in the same loop that picks the indicator
-		// class, so the dot color and the tooltip can never disagree.
-		expect(js).toContain("tip = 'Jolli Memory: Errors'");
-		expect(js).toContain("tip = 'Jolli Memory: Warnings'");
-		expect(js).toContain("statusIconBtn.dataset.tip = tip");
-		// attachTextTip prefers dataset.tip on show so dynamic updates don't
-		// require re-attaching listeners.
+		// The header-bar Status icon + its OK/Warning/Error dot tooltip are gone;
+		// Status is now a native view/title icon.
+		expect(js).not.toContain("statusIconBtn");
+		expect(js).not.toContain("'Jolli Memory: All good'");
+		expect(js).not.toContain("tip = 'Jolli Memory: Errors'");
+		// attachTextTip's dataset.tip-on-show mechanism stays — it still drives
+		// the tooltips on status entry rows and toolbar buttons.
 		expect(js).toContain("showTextTip(el.dataset.tip || text");
 	});
 
@@ -543,10 +735,11 @@ describe("SidebarScriptBuilder", () => {
 	it("renders repos as top-level nodes (no Memory Bank header banner)", () => {
 		const js = buildSidebarScript();
 		// renderFolders() has no separate header — repos render directly at
-		// depth 0. The banner row would have re-emitted data-kind="repo-root";
-		// removing that surface is the observable contract here.
+		// depth 0 (repoChildren is root.children optionally scoped to a single
+		// repo by the 'Showing' filter). The banner row would have re-emitted
+		// data-kind="repo-root"; removing that surface is the observable contract.
 		expect(js).not.toContain("'data-kind': 'repo-root'");
-		expect(js).toContain("renderFolderChildren(root.children, 0)");
+		expect(js).toContain("renderFolderChildren(repoChildren, 0)");
 	});
 
 	it("auto-expands the current repo via kb:expandFolder on first delivery", () => {
@@ -664,6 +857,77 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("'commits'");
 	});
 
+	it("renders the Current Memory group and Committed Memories sections", () => {
+		const js = buildSidebarScript();
+		// Working Memory groups Conversations / Context / Files under one header.
+		expect(js).toContain("Working Memory");
+		expect(js).toContain("Committed Memories");
+		// The internal section ids are unchanged (selection + collapse keys).
+		expect(js).toContain("id: 'conversations'");
+		expect(js).toContain("id: 'changes'");
+		expect(js).toContain("id: 'commits'");
+	});
+
+	it("labels the Current Memory sub-sections Conversations / Context / Files", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("Conversations");
+		expect(js).toContain("Context");
+		expect(js).toContain("Files");
+	});
+
+	it("renders Working Memory as a collapsible header with a refresh action (select-all removed)", () => {
+		const js = buildSidebarScript();
+		// Header is clickable to fold the whole group (data-cm-header marker).
+		expect(js).toContain("'data-cm-header': '1'");
+		// Select-All is no longer rendered as a header icon (mockup: per-row ✕/+
+		// exclude under the included-by-default model). Refresh stays, always-on.
+		expect(js).not.toMatch(/iconButton\('current-memory-select-all',/);
+		expect(js).toMatch(/iconButton\('current-memory-refresh',/);
+	});
+
+	it("scopes the two header refresh buttons to branch-current / branch-commits", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("scope: 'branch-current'");
+		expect(js).toContain("scope: 'branch-commits'");
+	});
+
+	it("uses the unified codicon chevron (not the legacy text twirl) for collapse affordances", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("function chevron(");
+		expect(js).toContain("codicon-chevron-right");
+		// The old text-arrow twirls are gone from the section/group headers.
+		expect(js).not.toContain("text: '▾'");
+		expect(js).not.toContain("isCollapsed('pinned') ? '▸' : '▾'");
+	});
+
+	it("renders a per-sub-section item count and a Show-more preview cap", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("section-count");
+		expect(js).toContain("SUBSECTION_PREVIEW");
+		expect(js).toContain("'data-show-more'");
+		expect(js).toContain("Show less");
+		expect(js).toContain("function renderShowMoreRow(");
+	});
+
+	it("drops the Branch toolbar entirely (refresh + AI-summary signal relocated)", () => {
+		const js = buildSidebarScript();
+		// renderToolbar early-returns for the Branch tab, clearing + hiding the
+		// bar so no empty strip shows above the tree.
+		expect(js).toContain("clear(tabToolbar);");
+		expect(js).toContain("tabToolbar.classList.add('hidden');");
+		// applyEnabled also hides the bar on the Branch tab (covers boot-on-Branch
+		// where switchTab early-returns and renderToolbar never runs).
+		expect(js).toContain("!enabled || state.activeTab === 'branch'");
+	});
+
+	it("shows the AI-summary worker signal in the Committed Memories header", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("function renderWorkerSignal(");
+		// Only the commits section header mounts the indicator.
+		expect(js).toContain("if (s.id === 'commits') {");
+		expect(js).toContain("renderWorkerSignal()");
+	});
+
 	it("posts section:toggle on header click", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("section:toggle");
@@ -723,13 +987,17 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("jollimemory.openSettings");
 	});
 
-	it("updates status indicator color class in renderStatus", () => {
+	it("toggles the Status overlay via the status:toggle message (native title-bar icon)", () => {
 		const js = buildSidebarScript();
-		expect(js).toContain("status-icon-btn");
-		expect(js).toContain("status-icon-ok");
-		expect(js).toContain("status-icon-warn");
-		expect(js).toContain("status-icon-error");
-		expect(js).toContain("codicon-circle-filled");
+		// Status moved to the native "JOLLI MEMORY" title bar; the click arrives
+		// as the 'status:toggle' inbound message and drives toggleStatusOverlay.
+		expect(js).toContain("case 'status:toggle':");
+		expect(js).toContain("toggleStatusOverlay");
+		expect(js).toMatch(/function toggleStatusOverlay\(\)/);
+		// The old in-webview health dot (and its color classes) is gone.
+		expect(js).not.toContain("status-icon-btn");
+		expect(js).not.toContain("status-icon-ok");
+		expect(js).not.toContain("codicon-circle-filled");
 	});
 
 	it("attaches the plain-text tooltip helper to status entry rows", () => {
@@ -874,18 +1142,20 @@ describe("SidebarScriptBuilder", () => {
 			expect(renderChangeRow).toContain("'gs-letter gs-'");
 		});
 
-		it("uses pathToFileCodicon (file-type) instead of gitStatusToCodicon", () => {
+		it("renders no leading file-type icon (filename tint + status letter carry git state)", () => {
 			const js = buildSidebarScript();
 			const renderChangeRow = js.slice(
 				js.indexOf("function renderChangeRow"),
 				js.indexOf("function renderCommitRow"),
 			);
-			// Two-channel encoding parity with commit-file: shape = file
-			// kind, color = git status. Diff-modified-style dots are
-			// retired here; gitStatusToCodicon may still exist for legacy
-			// callers but renderChangeRow must not call it.
-			expect(renderChangeRow).toContain("pathToFileCodicon(");
+			// Parity with the committed-memory evidence "Files" rows: no leading
+			// codicon at all. The git state reads from the .gs-{code} filename
+			// tint and the trailing gs-letter, so neither the file-type icon
+			// (pathToFileCodicon) nor the legacy status glyph (gitStatusToCodicon)
+			// is rendered on the row.
+			expect(renderChangeRow).not.toContain("pathToFileCodicon(");
 			expect(renderChangeRow).not.toContain("gitStatusToCodicon(");
+			expect(renderChangeRow).not.toContain("className: 'icon'");
 		});
 
 		it("tags changes rows with .tree-node--changes for the hover-reveal scope", () => {
@@ -900,10 +1170,29 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toContain("function renderCommitRow");
 		});
 
-		it("shows a viewSummary inline only for commitWithMemory contextValue", () => {
+		it("committed-memory inline-actions are Pin + Copy Recall + Share (no viewSummary)", () => {
 			const js = buildSidebarScript();
-			expect(js).toMatch(/contextValue\s*===\s*['"]commitWithMemory['"]/);
-			expect(js).toContain("'data-inline': 'viewSummary'");
+			// Scope to renderCommitRow body only.
+			const fnIdx = js.indexOf("function renderCommitRow(");
+			expect(fnIdx).toBeGreaterThan(-1);
+			const fnEnd = js.indexOf("function ", fnIdx + 1);
+			const body = js.slice(fnIdx, fnEnd > 0 ? fnEnd : fnIdx + 6000);
+			// Workspace rows: Pin, Copy Recall, Share all present.
+			expect(body).toMatch(/'data-inline':\s*'pin'/);
+			expect(body).toMatch(/'data-inline':\s*'copy-recall'/);
+			expect(body).toMatch(/'data-inline':\s*'share'/);
+			// View Memory (eye) must be gone from the inline-actions block.
+			expect(body).not.toMatch(/'data-inline':\s*'viewSummary'/);
+		});
+
+		it("omits the inline short-date (.desc) on committed-memory rows; keeps it for plain commits", () => {
+			const js = buildSidebarScript();
+			const fnIdx = js.indexOf("function renderCommitRow(");
+			const fnEnd = js.indexOf("function ", fnIdx + 1);
+			const body = js.slice(fnIdx, fnEnd > 0 ? fnEnd : fnIdx + 6000);
+			// The short-date span is gated on !hasMem — memory rows carry the
+			// relative date in .mem-subline instead, so the MM-DD desc is dropped.
+			expect(body).toContain("item.description && !hasMem");
 		});
 
 		it("renderSection routes to per-section row renderer based on section id", () => {
@@ -914,17 +1203,230 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toMatch(/renderCommitRow/);
 		});
 
-		it("fills the leading slot with a git-commit codicon when no checkbox is shown", () => {
+		it("drops the leading git-commit dot for every commit row; only squash mode fills the slot (checkbox)", () => {
 			const js = buildSidebarScript();
-			// Visual parity with the legacy native TreeView: HistoryTreeProvider
-			// used to set iconPath = ThemeIcon("git-commit") in single-commit /
-			// merged modes; the webview must do the same so the column doesn't
-			// look empty when checkboxes are hidden.
+			// The leading git-commit dot was removed for ALL rows — memory rows (M
+			// glyph) and code-only / mid-summary commits (</> glyph) alike. The
+			// glyph already conveys type, and a code commit mid-AI-summary read as a
+			// memory row that confusingly still showed the dot. Slot defaults to
+			// null; only squash-selection mode puts a checkbox in it.
 			const renderCommitRow = js.slice(
 				js.indexOf("function renderCommitRow"),
 				js.indexOf("function renderCommitFileRow"),
 			);
-			expect(renderCommitRow).toContain("'codicon codicon-git-commit'");
+			// No git-commit codicon anywhere in the row builder.
+			expect(renderCommitRow).not.toContain("codicon-git-commit");
+			// Slot defaults to null; the checkbox path is the only one that fills it.
+			expect(renderCommitRow).toContain("let leading = null;");
+			expect(renderCommitRow).toContain("'data-checkbox-kind': 'commit'");
+		});
+
+		it("committed memory row expands to inline evidence groups + a memory-details toggle", () => {
+			const js = buildSidebarScript();
+			// Scope assertions to renderCommitRow body only (not the whole output)
+			// so a match inside renderMemoryEvidence or another renderer doesn't
+			// let a missing renderCommitRow call pass silently.
+			const renderCommitRow = js.slice(
+				js.indexOf("function renderCommitRow"),
+				js.indexOf("function renderCommitFileRow"),
+			);
+			// expanded committed row with a memory reuses renderMemoryEvidence (not just file children)
+			expect(renderCommitRow).toContain("renderMemoryEvidence(");
+			// a labeled show/hide affordance for the memory detail
+			expect(renderCommitRow).toContain("memory details");
+			// the existing lazy channel drives it
+			expect(renderCommitRow).toContain("'kb:expandMemory'");
+		});
+
+		it("expanded memory row renders a SHIPPED group: Create PR action + Push/Synced status", () => {
+			const js = buildSidebarScript();
+			const renderCommitRow = js.slice(
+				js.indexOf("function renderCommitRow"),
+				js.indexOf("function renderCommitFileRow"),
+			);
+			// The SHIPPED rows themselves moved to buildShippedGroup (so the in-place
+			// PR updater can rebuild a single group); renderCommitRow now just calls
+			// it, forwarding the synced-state field.
+			expect(renderCommitRow).toContain("buildShippedGroup(hash, memBranch, item.e2eCount, item.jolliDocUrl)");
+			const shipped = js.slice(
+				js.indexOf("function buildShippedGroup"),
+				js.indexOf("function updatePrStatusInPlace"),
+			);
+			expect(shipped).toContain("'data-action': 'ship-create-pr'");
+			expect(shipped).toContain("'data-action': 'ship-push-jolli'");
+			expect(shipped).toContain("Push to Jolli");
+			expect(shipped).toContain("create PR");
+			// synced state keys off the jolliDocUrl param.
+			expect(shipped).toContain("if (jolliDocUrl)");
+		});
+
+		it("committed memory row has no inline LOCAL/SYNCED cloud chip (sync state lives in the expanded SHIPPED group)", () => {
+			const js = buildSidebarScript();
+			const renderCommitRow = js.slice(
+				js.indexOf("function renderCommitRow"),
+				js.indexOf("function renderCommitFileRow"),
+			);
+			// The always-visible inline cloud chip was removed to de-clutter the
+			// collapsed row. Its strip + class vocabulary must be gone…
+			expect(renderCommitRow).not.toContain("'mem-chips'");
+			expect(renderCommitRow).not.toContain("cloud-chip");
+			expect(renderCommitRow).not.toContain("LOCAL");
+			// …but sync state is still surfaced: renderCommitRow forwards
+			// item.jolliDocUrl to buildShippedGroup, which renders the SYNCED row.
+			expect(renderCommitRow).toContain("item.jolliDocUrl");
+			const shipped = js.slice(
+				js.indexOf("function buildShippedGroup"),
+				js.indexOf("function updatePrStatusInPlace"),
+			);
+			expect(shipped).toContain("SYNCED");
+		});
+
+		it("the show-details toggle carries a chevron glyph (mockup .mem-evd look)", () => {
+			const js = buildSidebarScript();
+			const renderCommitRow = js.slice(
+				js.indexOf("function renderCommitRow"),
+				js.indexOf("function renderCommitFileRow"),
+			);
+			// The "Show memory details" affordance gains a disclosure chevron so it
+			// reads as an expander, not body text.
+			expect(renderCommitRow).toContain("memory-details-chevron");
+		});
+
+		it("expanded evidence ends with a right-aligned 'Hide memory details' collapse control", () => {
+			const js = buildSidebarScript();
+			const renderMemoryEvidence = js.slice(
+				js.indexOf("function renderMemoryEvidence"),
+				js.indexOf("function renderHoverCard"),
+			);
+			// A bottom collapse button mirrors the mockup's .mem-collapse; it reuses
+			// the same data-commit-toggle channel as the chevron so one click path
+			// drives expand + collapse.
+			expect(renderMemoryEvidence).toContain("memory-evidence-collapse");
+			expect(renderMemoryEvidence).toContain("Hide memory details");
+			expect(renderMemoryEvidence).toContain("'data-commit-toggle'");
+		});
+
+		it("evidence group labels drop the leading codicon (mockup label typography)", () => {
+			const js = buildSidebarScript();
+			const renderMemoryEvidence = js.slice(
+				js.indexOf("function renderMemoryEvidence"),
+				js.indexOf("function renderHoverCard"),
+			);
+			// makeGroup no longer injects an icon into the group label — the label
+			// is plain uppercase text separated by whitespace (no divider) in CSS.
+			expect(renderMemoryEvidence).not.toContain("'codicon ' + iconClass");
+		});
+
+		it("delegated click handler wires ship-push-jolli and ship-create-pr to viewSummary", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("'ship-push-jolli'");
+			expect(js).toContain("'ship-create-pr'");
+			// Both dispatch viewSummary (or viewMemorySummary in foreign mode) with the hash
+			expect(js).toContain("'jollimemory.viewSummary'");
+		});
+
+		it("delegated click handler intercepts .shipped-link[href] and dispatches vscode.open", () => {
+			const js = buildSidebarScript();
+			// Guard that catches anchor clicks before the generic fallthrough
+			expect(js).toContain(".shipped-link[href]");
+			// Dispatches the built-in vscode.open command via the command channel
+			expect(js).toContain("'vscode.open'");
+		});
+
+		describe("Task A5: SHIPPED group — PR / E2E / Synced rows", () => {
+			function getShippedGroupScope(js: string): string {
+				// The SHIPPED group (PR / E2E / Synced rows) was extracted into
+				// buildShippedGroup so the in-place kb:prStatus updater can rebuild a
+				// single group without a whole-tree re-render. Scope to that function
+				// (between it and the updatePrStatusInPlace helper that follows it).
+				return js.slice(
+					js.indexOf("function buildShippedGroup"),
+					js.indexOf("function updatePrStatusInPlace"),
+				);
+			}
+
+			it("Synced row: jolliDocUrl present renders Synced-to-Jolli label + SYNCED badge + shipped-link", () => {
+				const js = buildSidebarScript();
+				const scope = getShippedGroupScope(js);
+				// Must reference jolliDocUrl to gate the synced row (now a
+				// buildShippedGroup parameter rather than item.jolliDocUrl).
+				expect(scope).toContain("if (jolliDocUrl)");
+				// Synced row label text
+				expect(scope).toContain("Synced to Jolli");
+				// SYNCED badge class
+				expect(scope).toContain("ship-badge--synced");
+				// The link carries the jolliDocUrl so the delegated .shipped-link handler opens it
+				expect(scope).toContain("shipped-link");
+			});
+
+			it("Synced row: jolliDocUrl absent falls back to ship-push-jolli action (push affordance not lost)", () => {
+				const js = buildSidebarScript();
+				const scope = getShippedGroupScope(js);
+				// The push action must still be present as the else-branch
+				expect(scope).toContain("'data-action': 'ship-push-jolli'");
+				expect(scope).toContain("Push to Jolli");
+			});
+
+			it("E2E row rendered only when e2eCount > 0: shows label + scenario count", () => {
+				const js = buildSidebarScript();
+				const scope = getShippedGroupScope(js);
+				// Gated on e2eCount being truthy / > 0
+				expect(scope).toContain("e2eCount");
+				// Row label text
+				expect(scope).toContain("E2E test guide");
+				// Shows the count number
+				expect(scope).toContain("scenarios");
+			});
+
+			it("E2E row is NOT rendered when e2eCount is absent or 0 (guard present)", () => {
+				const js = buildSidebarScript();
+				const scope = getShippedGroupScope(js);
+				// The guard expression (item.e2eCount or e2eCount with > 0 check) must appear
+				// so the row is conditional. The mere presence of e2eCount in an if-guard satisfies this.
+				expect(scope).toMatch(/if\s*\([^)]*e2eCount/);
+			});
+
+			it("on memory expand the client posts kb:requestPrStatus with the branch", () => {
+				const js = buildSidebarScript();
+				const scope = getShippedGroupScope(js);
+				// The lazy request fires on expand (same entry path as kb:expandMemory)
+				expect(scope).toContain("'kb:requestPrStatus'");
+				// Keyed by branch (item.hover.branch or state.branchName fallback)
+				expect(scope).toContain("branch");
+			});
+
+			it("prStatusCache and prStatusPending guards prevent duplicate requests", () => {
+				const js = buildSidebarScript();
+				// Both cache and pending maps must exist to mirror the evidenceCache/evidencePending pattern
+				expect(js).toContain("prStatusCache");
+				expect(js).toContain("prStatusPending");
+			});
+
+			it("kb:prStatus handler stores result and re-renders", () => {
+				const js = buildSidebarScript();
+				// The inbound message handler case
+				expect(js).toContain("'kb:prStatus'");
+				// It stores into the cache keyed by branch
+				expect(js).toContain("prStatusCache");
+			});
+
+			it("kb:prStatus with pr present renders PR-number row with codicon + OPEN badge", () => {
+				const js = buildSidebarScript();
+				const scope = getShippedGroupScope(js);
+				// The PR row references the pr number
+				expect(scope).toContain("pr.number");
+				// OPEN badge class
+				expect(scope).toContain("ship-badge--open");
+				// git-pull-request codicon
+				expect(scope).toContain("codicon-git-pull-request");
+			});
+
+			it("kb:prStatus with pr null falls back to ship-create-pr action (create-PR affordance not lost)", () => {
+				const js = buildSidebarScript();
+				const scope = getShippedGroupScope(js);
+				// The create-PR fallback action must still be rendered when pr is null
+				expect(scope).toContain("'data-action': 'ship-create-pr'");
+			});
 		});
 	});
 
@@ -949,65 +1451,31 @@ describe("SidebarScriptBuilder", () => {
 	});
 
 	describe("changes toolbar", () => {
-		it("renders three buttons: select-all, commitAI, discard (refresh removed)", () => {
+		it("renders no action icons on the Files header (mockup: per-row Discard + Commit Memory button)", () => {
 			const js = buildSidebarScript();
-			expect(js).toMatch(/iconButton\('changes-select-all',/);
-			expect(js).toMatch(/iconButton\('changes-commit-ai',/);
-			expect(js).toMatch(/iconButton\('changes-discard',/);
+			// Select-All / Commit-AI / Discard icons are retired from the header:
+			// commit moved to the Working Memory Commit Memory button, Discard is
+			// per-row, and Select-All is obsolete under included-by-default.
+			expect(js).not.toMatch(/iconButton\('changes-select-all',/);
+			expect(js).not.toMatch(/iconButton\('changes-commit-ai',/);
+			expect(js).not.toMatch(/iconButton\('changes-discard',/);
 			expect(js).not.toContain("'changes-refresh'");
 		});
 
-		it("uses codicons matching package.json contributes (check-all / sparkle / discard)", () => {
+		it("gates entering squash mode while a background AI summary is in progress", () => {
 			const js = buildSidebarScript();
-			// `[,)]` accepts either a closing paren (no opts arg) or a comma
-			// (followed by a 4th-arg opts object such as { disabled: ... }) —
-			// the assertion only cares about the codicon string itself.
-			expect(js).toMatch(/iconButton\('changes-select-all',.*?'check-all'[,)]/);
-			expect(js).toMatch(/iconButton\('changes-commit-ai',.*?'sparkle'[,)]/);
-			expect(js).toMatch(/iconButton\('changes-discard',.*?'discard'[,)]/);
-		});
-
-		it("routes changes-commit-ai to jollimemory.commitAI", () => {
-			const js = buildSidebarScript();
-			expect(js).toContain("'jollimemory.commitAI'");
-		});
-
-		it("routes changes-discard to jollimemory.discardSelectedChanges", () => {
-			const js = buildSidebarScript();
-			expect(js).toContain("'jollimemory.discardSelectedChanges'");
-		});
-
-		it("disables changes-commit-ai while a background AI summary is in progress", () => {
-			const js = buildSidebarScript();
-			// Even with selected changes, the Commit-AI button must stay
-			// disabled during a summary run — kicking off another LLM call
-			// while the queue worker is mid-summary risks racing the same
-			// provider / hitting rate limits. The check is phase-aware
-			// (isWorkerBlocking), NOT raw state.workerBusy: the ingest phase
-			// (Memory Bank wiki update) must not block committing. Discard
-			// stays available because it's purely local (no LLM).
+			// The "Squash memories…" enter button is disabled during a blocking
+			// worker run (ingest exempt via isWorkerBlocking), mirroring the
+			// SquashCommand handler gate. The actual confirm lives in the squash
+			// bar (gated on 2+ selected || worker busy — asserted below).
 			expect(js).toMatch(
-				/iconButton\('changes-commit-ai',[\s\S]*?disabled:\s*noneSelected\s*\|\|\s*isWorkerBlocking\(\)/,
+				/iconButton\('commits-enter-squash',[\s\S]*?disabled:\s*isWorkerBlocking\(\)/,
 			);
-			// Discard's disabled condition must NOT include the busy check.
-			expect(js).toMatch(
-				/iconButton\('changes-discard',[\s\S]*?disabled:\s*noneSelected\s*\}/,
-			);
-		});
-
-		it("disables commits-squash while a background AI summary is in progress", () => {
-			const js = buildSidebarScript();
-			// The squash button must mirror the SquashCommand handler gate and the
-			// jollimemory.workerBusy command enablement: disabled during a blocking
-			// worker run (ingest exempt via isWorkerBlocking), on top of the
-			// 2+-selected threshold. Without this, the button stays clickable
-			// mid-summary even though the handler refuses — UI/handler mismatch.
-			expect(js).toMatch(
-				/iconButton\('commits-squash',[\s\S]*?disabled:\s*selectedCount < 2\s*\|\|\s*isWorkerBlocking\(\)/,
-			);
+			// Squash bar confirm is gated on selection count AND worker busy.
+			expect(js).toMatch(/selected < 2 \|\| isWorkerBlocking\(\)/);
 			// Push Branch is not worker-gated at all.
 			expect(js).toMatch(
-				/iconButton\('commits-push-branch', 'Push Branch',\s*'cloud-upload'\),/,
+				/iconButton\('commits-push-branch', 'Push Branch', 'cloud-upload'\)/,
 			);
 		});
 
@@ -1020,9 +1488,9 @@ describe("SidebarScriptBuilder", () => {
 				"return state.workerBusy && !(state.workerPhase && state.workerPhase.indexOf('ingest') === 0);",
 			);
 			// Both commit entry points go through it: the Commit-AI icon button
-			// (asserted above) and the labelled Commit Memory button.
+			// (asserted above) and the body-bar Commit Memory button.
 			expect(js).toMatch(
-				/const disabled = selectedCount === 0 \|\| isWorkerBlocking\(\);/,
+				/var disabled = selectedCount === 0 \|\| isWorkerBlocking\(\);/,
 			);
 		});
 	});
@@ -1044,55 +1512,55 @@ describe("SidebarScriptBuilder", () => {
 		});
 	});
 
-	describe("commits toolbar mode-aware", () => {
-		it("declares branchData.commitsMode field consumed by renderSectionActions", () => {
+	describe("commits toolbar — explicit squash mode", () => {
+		it("header offers a 'Squash memories…' enter action (git-merge), not a permanent squash button", () => {
 			const js = buildSidebarScript();
-			expect(js).toContain("commitsMode");
+			// New: an enter-mode action that flips the client-side squashMode flag.
+			expect(js).toMatch(/iconButton\('commits-enter-squash',.*?'git-merge'[,)]/);
+			// Old commitsMode 'multi'/'single' branching is gone.
+			expect(js).not.toMatch(/if \(m === 'multi'\)/);
 		});
 
-		it("renders multi mode toolbar action: squash", () => {
+		it("commit-row checkbox visibility keys off the squashMode flag, not commitsMode", () => {
 			const js = buildSidebarScript();
-			expect(js).toMatch(/iconButton\('commits-squash',/);
+			expect(js).toContain("let squashMode = false;");
+			expect(js).toMatch(/const isMulti = squashMode && !isViewingForeign\(\);/);
 		});
 
-		it("does not render a per-section refresh in commits toolbar", () => {
+		it("renders a Committed Memories refresh action (global toolbar refresh removed)", () => {
 			const js = buildSidebarScript();
-			expect(js).not.toContain("'commits-refresh'");
+			expect(js).toContain("'commits-refresh'");
+			expect(js).toMatch(/iconButton\('commits-refresh',/);
 		});
 
-		it("renders single mode toolbar action: pushBranch", () => {
+		it("shows Push Branch when commits exist", () => {
 			const js = buildSidebarScript();
-			expect(js).toMatch(/iconButton\('commits-push-branch',/);
+			expect(js).toMatch(/iconButton\('commits-push-branch',.*?'cloud-upload'[,)]/);
 		});
 
-		it("multi mode toolbar includes pushBranch alongside select-all and squash", () => {
-			// Multi-commit branches now support push directly (no squash precondition).
-			// Assert the multi branch in the rendered JS contains all three button ids.
+		it("entering squash mode flips the flag, clears host selection, and re-renders", () => {
 			const js = buildSidebarScript();
-			const multiMatch = js.match(
-				/if \(m === 'multi'\)[\s\S]*?return \[([\s\S]*?)\];/,
-			);
-			expect(multiMatch).not.toBeNull();
-			const multiArr = multiMatch?.[1] ?? "";
-			expect(multiArr).toMatch(/iconButton\('commits-select-all',/);
-			expect(multiArr).toMatch(/iconButton\('commits-squash',/);
-			expect(multiArr).toMatch(/iconButton\('commits-push-branch',/);
-		});
-
-		it("uses codicons matching package.json contributes (check-all / git-merge / cloud-upload)", () => {
-			const js = buildSidebarScript();
-			// `[,)]` accepts either a closing paren (no opts arg) or a comma
-			// (followed by a 4th-arg opts object such as { disabled: ... }).
-			expect(js).toMatch(/iconButton\('commits-select-all',.*?'check-all'[,)]/);
-			expect(js).toMatch(/iconButton\('commits-squash',.*?'git-merge'[,)]/);
+			// Now also posts branch:deselectAllCommits between the flag flip and the
+			// re-render so a prior session's checks don't surface as stale boxes.
 			expect(js).toMatch(
-				/iconButton\('commits-push-branch',.*?'cloud-upload'[,)]/,
+				/a === 'commits-enter-squash'[\s\S]{0,120}squashMode = true;[\s\S]{0,200}'branch:deselectAllCommits'[\s\S]{0,80}renderBranch\(\)/,
 			);
 		});
 
-		it("routes commits-squash to jollimemory.squash", () => {
+		it("renders a squash confirm bar with Select-all / Squash / Cancel, gated on 2+ selected", () => {
 			const js = buildSidebarScript();
-			expect(js).toContain("'jollimemory.squash'");
+			expect(js).toContain("function renderSquashBar(");
+			expect(js).toContain("'squash-select-all'");
+			expect(js).toContain("'squash-confirm'");
+			expect(js).toContain("'squash-cancel'");
+			expect(js).toContain("Select 2+ memories to squash");
+		});
+
+		it("squash bar actions: confirm posts squash, cancel exits, select-all reuses selectAllCommits", () => {
+			const js = buildSidebarScript();
+			expect(js).toMatch(/act === 'squash-cancel'[\s\S]{0,80}squashMode = false/);
+			expect(js).toMatch(/act === 'squash-confirm'[\s\S]{0,400}'jollimemory\.squash'/);
+			expect(js).toMatch(/act === 'squash-select-all'[\s\S]{0,220}'jollimemory\.selectAllCommits'/);
 		});
 
 		it("routes commits-push-branch to jollimemory.pushBranch", () => {
@@ -1423,38 +1891,34 @@ describe("SidebarScriptBuilder", () => {
 		});
 	});
 
-	describe("Commit Memory button visibility on the Changes section", () => {
-		// User-visible CTA must remain rendered (a) when Changes is empty (so
-		// users can discover it during onboarding before they've staged
-		// anything), AND (b) when the Changes section is collapsed (Commit
-		// Memory is a group action across Plans + Changes + Commits — folding
-		// Changes alone shouldn't hide it). It is implicitly hidden in
-		// foreign-readonly mode because the whole Changes section is dropped
-		// above the predicate. Neither items.length nor `collapsed` may gate
-		// the push site.
-		it("pushes the button on the Changes section without gating on items.length or collapsed", () => {
+	describe("Current Branch command bar footer", () => {
+		it("Current Branch renders a bottom command bar with Commit, Create PR and more", () => {
 			const js = buildSidebarScript();
-			// Find the push site. Must match `s.id === 'changes'` but NOT
-			// include `!collapsed` (regression — collapsing Changes hid the
-			// group CTA) nor `s.items.length` (regression — empty Changes hid
-			// the discoverability affordance).
-			const renderSectionStart = js.indexOf("function renderSection");
-			expect(renderSectionStart).toBeGreaterThan(-1);
-			const renderSectionEnd = js.indexOf(
+			expect(js).toContain("branch-footer");
+			expect(js).toContain("jollimemory.createPrForBranch");
+			expect(js).toContain("jollimemory.recallBranchInClaudeCode");
+			expect(js).toContain("jollimemory.copyBranchRecallPrompt");
+		});
+
+		it("no longer mounts the in-section Commit Memory button", () => {
+			const js = buildSidebarScript();
+			// The old bottom-of-Changes CTA helper is gone; footer owns commit now.
+			expect(js).not.toContain("renderCommitMemoryButton");
+			expect(js).not.toContain("commit-memory-action");
+		});
+
+		it("footer is appended in renderBranch only when not in foreign mode", () => {
+			const js = buildSidebarScript();
+			// renderBranch must guard the footer append with the foreign check.
+			const renderBranchStart = js.indexOf("function renderBranch");
+			expect(renderBranchStart).toBeGreaterThan(-1);
+			const renderBranchEnd = js.indexOf(
 				"function ",
-				renderSectionStart + "function renderSection".length,
+				renderBranchStart + "function renderBranch".length,
 			);
-			const body = js.slice(renderSectionStart, renderSectionEnd);
-			expect(body).toMatch(
-				/if\s*\(\s*s\.id\s*===\s*'changes'\s*\)\s*\{\s*sectionKids\.push\(renderCommitMemoryButton\(\)\)/,
-			);
-			// Defense-in-depth: neither old buggy predicate may reappear.
-			expect(body).not.toMatch(
-				/s\.items\.length\s*>\s*0[\s\S]{0,80}renderCommitMemoryButton/,
-			);
-			expect(body).not.toMatch(
-				/!collapsed[\s\S]{0,80}renderCommitMemoryButton/,
-			);
+			const body = js.slice(renderBranchStart, renderBranchEnd);
+			expect(body).toMatch(/if\s*\(\s*!foreign\s*\)/);
+			expect(body).toContain("renderBranchFooter");
 		});
 
 		it("renders a 'Viewing memories from <repo> / <branch>' banner in foreign mode with conditional (read-only) suffix", () => {
@@ -1541,6 +2005,103 @@ describe("SidebarScriptBuilder", () => {
 			expect(body).toMatch(/const foreign\s*=\s*isViewingForeign\(\)/);
 			expect(body).toMatch(/if\s*\(\s*!foreign\s*\)/);
 		});
+
+		describe("foreign-hide + disabled-state regression contracts", () => {
+			// NOTE: This suite asserts on the GENERATED SCRIPT STRING, not on a
+			// live DOM. The existing test harness throughout this file is
+			// string-based (no jsdom execution), so behavioral DOM tests are not
+			// possible without a heavier harness. These are structural assertions
+			// that pin the control-flow tokens so a regression that removes a guard
+			// or swaps a predicate fails loudly.
+			//
+			// Slicing strategy: renderBranchFooter contains inline anonymous
+			// functions (e.g. `function (c) { return !!c.isSelected; }`), so
+			// `indexOf("function ")` from fnStart+1 terminates too early. We use
+			// `indexOf("\n  function ", fnStart + 1)` (two-space top-level indent
+			// matching the surrounding source conventions) to find the NEXT
+			// top-level function, consistent with the renderConversationRow tests
+			// in this file. For renderBranch we use the same slice pattern as the
+			// sibling "footer is appended in renderBranch only when not in foreign
+			// mode" test (which is already green) so we reuse its indexing logic.
+
+			it("omits the command bar in foreign read-only mode — renderBranchFooter is called inside the !foreign block", () => {
+				// The footer append (container.appendChild(renderBranchFooter()))
+				// must be inside the same if(!foreign) block as the workspace-only
+				// sections. Slicing renderBranch and asserting that renderBranchFooter
+				// appears only after the !foreign guard (and not outside it) locks
+				// the structural invariant.
+				const js = buildSidebarScript();
+				const renderBranchStart = js.indexOf("function renderBranch");
+				expect(renderBranchStart).toBeGreaterThan(-1);
+				const renderBranchEnd = js.indexOf(
+					"\n  function ",
+					renderBranchStart + "function renderBranch".length,
+				);
+				const body = js.slice(renderBranchStart, renderBranchEnd > renderBranchStart ? renderBranchEnd : renderBranchStart + 8000);
+				// Guard must precede footer call.
+				const foreignGuardIdx = body.search(/if\s*\(\s*!foreign\s*\)/);
+				const footerCallIdx = body.indexOf("renderBranchFooter");
+				expect(foreignGuardIdx).toBeGreaterThan(-1);
+				expect(footerCallIdx).toBeGreaterThan(foreignGuardIdx);
+				// renderBranchFooter must not appear anywhere outside/before the guard.
+				expect(body.slice(0, foreignGuardIdx)).not.toContain("renderBranchFooter");
+			});
+
+			it("Commit button disabled predicate: selectedCount === 0 OR isWorkerBlocking()", () => {
+				// The disabled flag governs the body-bar Commit Memory and Review buttons.
+				// Both arms of the OR must be present: zero-selection (no staged files to
+				// commit) and worker-blocking (summary run in progress, ingest phase exempt).
+				// Either arm alone would leave a broken path — e.g. a no-selection check
+				// without the worker check lets the user double-trigger an LLM run mid-summary.
+				const js = buildSidebarScript();
+				// Use whole-script assertions — the anonymous `function (c) { ... }`
+				// inside the filter body prevents a clean `indexOf("function ")` slice.
+				// These strings are unique to renderCommitReviewBar in the generated output.
+				expect(js).toMatch(
+					/var disabled = selectedCount === 0 \|\| isWorkerBlocking\(\);/,
+				);
+				// The flag gates the button's disabled attribute.
+				expect(js).toContain("if (disabled) commitBtn.disabled = true");
+			});
+
+			it("Create PR button is disabled when the branch has no committed memories (commits.length === 0)", () => {
+				// prDisabled reads from branchData.commits with a fallback empty array
+				// so it never throws on an uninitialised payload. The Create PR command
+				// has no meaningful target when there are no committed memories on the
+				// branch.
+				const js = buildSidebarScript();
+				expect(js).toMatch(
+					/var prDisabled = \(branchData\.commits \|\| \[\]\)\.length === 0;/,
+				);
+				// The flag gates the button's disabled attribute.
+				expect(js).toContain("if (prDisabled) prBtn.disabled = true");
+			});
+
+			it("positive case: renderCommitReviewBar has exactly two conditional disables (commit + review), renderBranchFooter has exactly one (PR)", () => {
+				// Guard: the only `.disabled = true` assignments inside each function
+				// must be the guarded-by-if ones. An unconditional disable would mean
+				// a button can never be enabled regardless of state.
+				// We slice using the two-space-indent next-function marker to avoid
+				// the anonymous-function-inside-filter truncation trap.
+				const js = buildSidebarScript();
+				const barStart = js.indexOf("function renderCommitReviewBar");
+				expect(barStart).toBeGreaterThan(-1);
+				const barEnd = js.indexOf("\n  function ", barStart + 1);
+				const barBody = js.slice(barStart, barEnd > barStart ? barEnd : barStart + 2000);
+				// Exactly two conditional disables in the body bar — commit and review.
+				const barDisabled = barBody.match(/\.disabled\s*=\s*true/g) ?? [];
+				expect(barDisabled).toHaveLength(2);
+
+				const fnStart = js.indexOf("function renderBranchFooter");
+				expect(fnStart).toBeGreaterThan(-1);
+				const fnEnd = js.indexOf("\n  function ", fnStart + 1);
+				const footerBody = js.slice(fnStart, fnEnd > fnStart ? fnEnd : fnStart + 2000);
+				// Exactly one conditional disable in the footer — Create PR only.
+				const footerDisabled = footerBody.match(/\.disabled\s*=\s*true/g) ?? [];
+				expect(footerDisabled).toHaveLength(1);
+				expect(footerBody).toContain("if (prDisabled) prBtn.disabled = true");
+			});
+		});
 	});
 
 	describe("foreign-mode memory click routes through cross-repo lookup", () => {
@@ -1610,29 +2171,26 @@ describe("SidebarScriptBuilder", () => {
 			expect(window).toContain("'jollimemory.viewSummary'");
 		});
 
-		it("foreign-mode commitWithMemory inline button is a copy-recall iconbtn (codicon-copy), not eye", () => {
-			// Cross-repo browsing is dominated by "pull this memory into the
-			// AI" — the primary inline tap-target switches to Copy Recall
-			// Prompt to match the KB-tab timeline view. The eye affordance
-			// still exists in the hover-card and contextmenu, so View Memory
-			// is not lost.
+		it("both workspace and foreign committed-memory rows expose copy-recall; only workspace exposes pin", () => {
+			// Both workspace and foreign rows now show Copy Recall Prompt as
+			// an inline button. Workspace rows additionally show Pin (and
+			// Share). Foreign rows keep Pin suppressed (as before) but gain
+			// Share alongside copy-recall.
 			const js = buildSidebarScript();
-			// Locate renderCommitRow's hasMem branch (where the inline button
-			// lives) — we slice from the function header through the !hasMem
-			// fallback so the assertions are contained.
 			const fnIdx = js.indexOf("function renderCommitRow(");
 			expect(fnIdx).toBeGreaterThan(-1);
 			const fnEnd = js.indexOf("function ", fnIdx + 1);
 			const body = js.slice(fnIdx, fnEnd > 0 ? fnEnd : fnIdx + 6000);
-			// The branch must be gated on isViewingForeign() — non-foreign
-			// rows must still render the eye/viewSummary affordance.
+			// isViewingForeign gate still controls Pin suppression.
 			expect(body).toContain("isViewingForeign()");
+			// copy-recall and share appear in both branches.
 			expect(body).toMatch(/'data-inline':\s*'copy-recall'/);
-			expect(body).toMatch(/codicon-copy/);
-			// And the non-foreign branch must still be present so workspace
-			// muscle memory is unchanged.
-			expect(body).toMatch(/'data-inline':\s*'viewSummary'/);
-			expect(body).toMatch(/codicon-eye/);
+			expect(body).toMatch(/'data-inline':\s*'share'/);
+			// pin appears only in the non-foreign branch.
+			expect(body).toMatch(/'data-inline':\s*'pin'/);
+			// eye/viewSummary must be gone from inline-actions entirely.
+			expect(body).not.toMatch(/'data-inline':\s*'viewSummary'/);
+			expect(body).not.toMatch(/codicon-eye/);
 		});
 
 		it("inline copy-recall dispatch posts jollimemory.copyRecallPrompt with the row id", () => {
@@ -1804,19 +2362,34 @@ describe("SidebarScriptBuilder", () => {
 	});
 
 	describe("Entity row icon", () => {
-		// Final shape after the multi-source refactor: the row uses the codicon
-		// `issues` glyph for Linear / Jira / GitHub (provider-supplied
-		// via iconKey on the SerializedTreeItem) and `file-text` for Notion.
-		// No brand-specific colour class — the user explicitly rejected brand
-		// tints to keep rows visually uniform.
-		it("does not apply any brand-specific colour class on entity rows", () => {
+		// Reversed from the earlier "no brand tints" decision: CONTEXT rows
+		// (plan / note / reference) now use the colored square letter badge
+		// (mem-ctx-badge, via the shared ctxBadge helper) so they match the
+		// committed-memory evidence "Context" rows and the mockup. References
+		// take their hue from the provider (linear / jira / github / notion).
+		it("renderPlanRow uses the shared ctxBadge letter badge (not a codicon icon)", () => {
 			const js = buildSidebarScript();
-			// Webview-side: no per-brand icon-color class is emitted, nor any
-			// per-source ThemeColor mapping leaking into the JS.
-			expect(js).not.toContain("icon-color-linear");
-			expect(js).not.toContain("icon-color-jira");
-			expect(js).not.toContain("icon-color-github");
-			expect(js).not.toContain("icon-color-notion");
+			const fnStart = js.indexOf("function renderPlanRow");
+			const fnEnd = js.indexOf("function gitStatusToCodicon", fnStart);
+			const body = js.slice(fnStart, fnEnd);
+			// Leading glyph is the badge, not the old codicon-iconKey span.
+			expect(body).toContain("ctxBadge(badgeKind, badgeSource)");
+			expect(body).not.toContain("'codicon codicon-' + iconKey");
+			// References derive their provider from the forwarded referenceHover.
+			expect(body).toContain("item.referenceHover.source");
+		});
+
+		it("ctxBadge maps kind/source to the mem-ctx-badge variant + letter", () => {
+			const js = buildSidebarScript();
+			const fnStart = js.indexOf("function ctxBadge");
+			const fnEnd = js.indexOf("function renderMemoryEvidence", fnStart);
+			const body = js.slice(fnStart, fnEnd);
+			expect(body).toContain("'mem-ctx-badge mem-ctx-badge--' + badgeKind");
+			// Per-source reference letters live here now (L / J / G / N / R).
+			expect(body).toContain("'linear'");
+			expect(body).toContain("'jira'");
+			expect(body).toContain("'github'");
+			expect(body).toContain("'notion'");
 		});
 	});
 
@@ -1971,17 +2544,20 @@ describe("SidebarScriptBuilder", () => {
 			const fnStart = js.indexOf("function renderPlanRow");
 			const fnEnd = js.indexOf("function renderConversationRow", fnStart);
 			const body = js.slice(fnStart, fnEnd);
-			// ✎ before 🗑 inside the row's inline-actions.
+			// 📌 (pin, plan/note only) before ✎ before 🗑 inside inline-actions.
+			const pinIdx = body.indexOf("'data-inline': 'pin'");
 			const editIdx = body.indexOf("'data-inline': 'edit'");
 			const removeIdx = body.indexOf("'data-inline': 'remove'");
-			expect(editIdx).toBeGreaterThan(-1);
+			expect(pinIdx).toBeGreaterThan(-1);
+			expect(editIdx).toBeGreaterThan(pinIdx);
 			expect(removeIdx).toBeGreaterThan(editIdx);
 			expect(body).toContain("codicon-edit");
-			// BOTH trailing buttons use the small variant so they stay visually
-			// subordinate to the Memories rows' View Memory eye — a single
-			// occurrence would mean one of the two silently lost it.
+			// Pin / edit / remove all use the small variant so they stay visually
+			// subordinate to the Memories rows' View Memory eye — a missing
+			// occurrence would mean one of them silently lost it. The exclude
+			// toggle (✕/+) is the 4th small iconbtn in the cluster.
 			const smCount = body.split("iconbtn iconbtn--sm").length - 1;
-			expect(smCount).toBe(2);
+			expect(smCount).toBe(4);
 			// Tooltip mirrors the context menu's per-type edit labels.
 			expect(body).toContain("'Edit Markdown'");
 			expect(body).toContain("'Edit Note'");
@@ -2200,10 +2776,17 @@ describe("SidebarScriptBuilder", () => {
 		});
 	});
 
-	it("selects the wiki / graph labels per ingest sub-phase (graph checked first, wiki for the rest)", () => {
+	it("renders a compact build pill (Wiki / Graph) for the ingest phase, full label in the title", () => {
 		const js = buildSidebarScript();
-		expect(js).toContain("Building knowledge wiki…");
+		// Non-blocking Memory Bank build → a compact pill mirroring the ● AI pill:
+		// a spinner + a short phase word that never truncates in a narrow header.
+		expect(js).toContain("className: 'section-build-pill'");
+		expect(js).toContain("section-build-spin");
+		expect(js).toContain("className: 'section-build-text', text: short");
+		// Short word per sub-phase; the verbose label survives only as the title.
+		expect(js).toContain("const short = isGraph ? 'Graph' : 'Wiki';");
 		expect(js).toContain("Building knowledge graph…");
+		expect(js).toContain("Building knowledge wiki…");
 		// graph is the more specific prefix and must be tested before the wiki
 		// fallback, else 'ingest:graph' would match the wiki branch.
 		expect(js).toContain("state.workerPhase.indexOf('ingest:graph') === 0");
@@ -2215,6 +2798,37 @@ describe("SidebarScriptBuilder", () => {
 	it("keeps the default AI summary label for non-ingest busy state", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("AI summary in progress…");
+	});
+
+	it("renders a compact '● AI' pill for the blocking summary instead of inline text", () => {
+		const js = buildSidebarScript();
+		// Blocking (non-ingest) branch returns the pill; the full phrase survives
+		// only as the pill's hover title.
+		expect(js).toContain("className: 'section-ai-pill'");
+		expect(js).toContain("className: 'section-ai-dot'");
+		expect(js).toContain("className: 'section-ai-text', text: 'AI'");
+		// The spinner-and-text status is now reserved for the ingest phases only.
+		expect(js).toContain("const isIngest = state.workerPhase && state.workerPhase.indexOf('ingest') === 0;");
+	});
+
+	it("renders a neutral 'Working…' Working Memory row gated on blocking busy state", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("function renderSummarizingRow(");
+		// Only during a blocking worker run (busy && no ingest phase).
+		expect(js).toContain("if (!state.workerBusy || state.workerPhase) return null;");
+		// busy && no phase does NOT prove summarization (worker:busy and
+		// worker:phase are independent channels; a Memory Bank ingest run can be
+		// busy before its phase signal lands), so the label is neutral, not
+		// "Summarizing…". Names the commit from the host-attached hash, degrading
+		// to a bare label.
+		expect(js).toContain("'Working on ' + hash + '…'");
+		expect(js).toContain("'Working…'");
+		// The misleading summarize-specific label must be gone.
+		expect(js).not.toContain("'Summarizing ' + hash + '…'");
+		expect(js).not.toContain("'Summarizing…'");
+		expect(js).toContain("summarizing-row");
+		// Mounted ahead of the sub-sections inside the Working Memory body.
+		expect(js).toContain("if (summarizing) bodyKids.push(summarizing);");
 	});
 
 	it("worker:phase keeps any ingest* sub-phase verbatim and clears anything else", () => {
@@ -2244,5 +2858,500 @@ describe("SidebarScriptBuilder", () => {
 		expect(body).toContain("if (state.workerPhase === nextPhase) break;");
 		expect(body).toContain("renderToolbar()");
 		expect(body).toContain("renderBranch()");
+	});
+
+	it("registers the knowledge tab content and a renderKnowledge stub", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("tab-content-knowledge");
+		expect(js).toContain("function renderKnowledge");
+	});
+
+	it("wires the view-switch buttons to switchTab", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain(".view-tab[data-tab]");
+		expect(js).toContain("view-switch");
+	});
+
+	it("syncs the active class across all [data-tab] elements, not just .tab", () => {
+		const js = buildSidebarScript();
+		// Broadened selector so the view-switch buttons receive .active too.
+		expect(js).toContain("querySelectorAll('[data-tab]')");
+	});
+
+	it("sources the refresh scope from the active tab so knowledge maps correctly", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("scope: state.activeTab");
+	});
+
+	it("handles branch:pinsData and renders a Pinned section", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("'branch:pinsData'");
+		expect(js).toContain("function renderPinned");
+	});
+
+	it("wires pin / unpin row actions", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("type: 'branch:pin'");
+		expect(js).toContain("type: 'branch:unpin'");
+	});
+
+	it("conversation pin includes source and transcriptPath in the branch:pin message", () => {
+		const js = buildSidebarScript();
+		// The inline pin handler for conversation rows reads source and transcriptPath
+		// from the row's data attributes so they survive into the persisted PinEntry.
+		expect(js).toContain("data-transcript-path");
+		expect(js).toContain("convSource");
+		expect(js).toContain("convTranscriptPath");
+		// The pin message for a conversation row carries both fields.
+		expect(js).toMatch(/source:\s*convSource/);
+		expect(js).toMatch(/transcriptPath:\s*convTranscriptPath/);
+		// Pin is not offered when either field is empty — a conversation that
+		// cannot be reopened must not be pinnable (the hover Pin button is only
+		// rendered when canPinConv holds).
+		expect(js).toMatch(/canPinConv\s*=\s*!isViewingForeign\(\)\s*&&\s*!!item\.source\s*&&\s*!!item\.transcriptPath/);
+	});
+
+	it("reference rows pin by mapKey and reopen via branch:openReferencePreview", () => {
+		const js = buildSidebarScript();
+		// Inline pin handler: reference rows emit kind 'reference' keyed by the
+		// row's data-id (which is the reference mapKey).
+		expect(js).toMatch(/ctx === 'reference'[\s\S]{0,160}kind:\s*'reference',\s*id:\s*id/);
+		// renderPinnedRow reopens a pinned reference through its preview path,
+		// passing pin.id as the mapKey.
+		expect(js).toMatch(/case 'reference':[\s\S]{0,300}type:\s*'branch:openReferencePreview',\s*mapKey:\s*pin\.id/);
+		// The pinned-row icon map carries a reference entry (else it would fall
+		// back to the generic 'pin' codicon).
+		expect(js).toContain("reference:    'link-external'");
+	});
+
+	it("pinned conversation row posts full branch:openConversation with source and transcriptPath", () => {
+		const js = buildSidebarScript();
+		// renderPinnedRow for conversation must include source and transcriptPath
+		// so SidebarWebviewProvider accepts the message (it guards on both fields).
+		expect(js).toMatch(/source:\s*pin\.source/);
+		expect(js).toMatch(/transcriptPath:\s*pin\.transcriptPath/);
+		expect(js).toMatch(/title:\s*pin\.title/);
+	});
+
+	it("pinned conversation row renders the per-source brand icon (like live CONVERSATIONS rows)", () => {
+		const js = buildSidebarScript();
+		const renderPinnedRow = js.slice(
+			js.indexOf("function renderPinnedRow"),
+			js.indexOf("function renderPinned("),
+		);
+		// Conversation pins use convSourceIcon + the conv-source-icon column,
+		// not the generic comment-discussion codicon, so the brand glyph shows.
+		expect(renderPinnedRow).toMatch(/pin\.kind === 'conversation' && pin\.source/);
+		expect(renderPinnedRow).toContain("convSourceIcon(pin.source)");
+		expect(renderPinnedRow).toContain("'icon conv-source-icon'");
+	});
+
+	it("pinned context + memory icons match the committed-memory section", () => {
+		const js = buildSidebarScript();
+		const renderPinnedRow = js.slice(
+			js.indexOf("function renderPinnedRow"),
+			js.indexOf("function renderPinned("),
+		);
+		// plan / note / reference pins → the shared colored letter badge. The
+		// reference provider comes from the "source:nativeId" mapKey (pin.id).
+		expect(renderPinnedRow).toContain("ctxBadge(pin.kind, refSource)");
+		expect(renderPinnedRow).toContain("String(pin.id || '').split(':')[0]");
+		// memory pins → blue kb-icon-memory markdown glyph (was untinted gray).
+		expect(renderPinnedRow).toMatch(/pin\.kind === 'memory'/);
+		expect(renderPinnedRow).toContain("'icon kb-icon-memory'");
+	});
+
+	it("handles kb:memoryEvidence and renders memory evidence in the Timeline", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("'kb:memoryEvidence'");
+		expect(js).toContain("function renderMemoryEvidence");
+	});
+
+	// Lockstep with the live CONVERSATIONS rows and Pinned rows: the
+	// committed-memory conversation row surfaces the agent identity via the
+	// shared per-source brand glyph (convSourceIcon) and a trailing "N msgs"
+	// count — NOT a source text pill, and no longer the old generic
+	// colored-comment glyph (.mem-conv-icon.src-*).
+	it("committed-memory conversation evidence row uses the per-source brand glyph + trailing msg count", () => {
+		const js = buildSidebarScript();
+		// Isolate the Conversations evidence group (between its makeGroup call
+		// and the following Context group) so the convSourceIcon assertion can't
+		// be satisfied by the live-row / Pinned-row usages elsewhere in the file.
+		const start = js.indexOf("makeGroup('Conversations'");
+		const end = js.indexOf("makeGroup('Context'", start);
+		const body = js.slice(start, end);
+		expect(body).toContain("conv-source-icon' }, [convSourceIcon(item.source)]");
+		expect(body).toContain("String(item.messageCount) + ' msgs'");
+		// The old generic colored-comment glyph is gone from the evidence row.
+		expect(body).not.toContain("codicon-comment mem-conv-icon");
+		expect(body).not.toContain("' src-' + item.source");
+		// The source text pill (both flavors) is gone from the evidence row.
+		expect(body).not.toContain("'badge transcript-source-' + item.source");
+		expect(body).not.toContain("'memory-evidence-source'");
+	});
+
+	// BUG 3: clicking a committed-memory conversation must open the ARCHIVED
+	// snapshot (kb:openEvidenceConversation with commitHash), NOT the live
+	// branch:openConversation path whose cursor-trimmed read is empty for a
+	// committed memory.
+	it("committed-memory conversation evidence row opens the archived snapshot via kb:openEvidenceConversation", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("type: 'kb:openEvidenceConversation'");
+		expect(js).toContain("commitHash: commitHash");
+	});
+
+	it("lazily requests memory evidence on expand", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("type: 'kb:expandMemory'");
+	});
+
+	it("groups Timeline memories under relative-time labels", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("function timeGroupLabel");
+		expect(js).toContain("Today");
+		expect(js).toContain("Earlier this week");
+	});
+
+	it("scopes the Timeline by the repo filter and shows it on the Memory Bank view", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("repo-filter");
+		expect(js).toContain("kbRepoFilter");
+	});
+
+	it("scopes the Folders tree by the repo filter using the raw repoName", () => {
+		const js = buildSidebarScript();
+		// renderFolders filters repo roots on the same repoName key the Showing
+		// dropdown and the Memories / Knowledge renderers compare against.
+		expect(js).toContain("c.repoName === kbRepoFilter");
+		// Picking a repo while in Folders mode re-renders the tree (not just the
+		// Timeline / Knowledge views).
+		expect(js).toContain("else if (state.kbMode === 'folders') renderFolders();");
+	});
+
+	it("hides the repo/branch breadcrumb on the Memory Bank and Knowledge views", () => {
+		const js = buildSidebarScript();
+		// The 'Showing' repo-filter is the sole repo selector on those tabs, so
+		// the whole breadcrumb is hidden to avoid a redundant second dropdown.
+		expect(js).toContain("breadcrumbEl.classList.toggle('hidden', isKb)");
+	});
+
+	it("renders a body Commit Memory | Review bar and removes Commit from the footer", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("function renderCommitReviewBar");
+		expect(js).toContain("'data-action': 'body-commit'");
+		expect(js).toContain("'data-action': 'body-review'");
+		expect(js).toContain("Commit Memory");
+		expect(js).toContain("Review");
+		// footer no longer carries the commit action
+		expect(js).not.toContain("'data-action': 'footer-commit'");
+	});
+
+	it("footer is Create PR | Share | More", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("'data-action': 'footer-create-pr'");
+		expect(js).toContain("'data-action': 'footer-share'");
+		expect(js).toContain("'data-action': 'footer-more'");
+	});
+
+	it("Review dispatches reviewNextMemory and Share dispatches the placeholder", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("jollimemory.reviewNextMemory");
+		expect(js).toContain("jollimemory.shareBranchPlaceholder");
+	});
+
+	it("renders a Committed Memories token bar from branch:tokenStats", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("'branch:tokenStats'");
+		expect(js).toContain("function renderTokenBar");
+		// Label now carries a cache-aware cost estimate between the token total
+		// and the "this branch" scope: "<total> tokens · ≈$X.XX · this branch".
+		expect(js).toContain("' tokens \xB7 '");
+		expect(js).toContain("' \xB7 this branch'");
+		// degrades to hidden when no stats received
+		expect(js).toContain("state.tokenStats");
+		// bucketed CSS width class (not inline style)
+		expect(js).toContain("token-seg--w");
+		// cached is the third segment + legend item, gated on cached > 0.
+		expect(js).toContain("token-seg--cached");
+		expect(js).toContain("' cached'");
+		expect(js).toContain("cached: msg.cached || 0");
+		// total reconciles input + output + cached.
+		// "?" help affordance explains the partial-reporting total + the cost.
+		expect(js).toContain("token-bar-help");
+		expect(js).toContain("codicon-question");
+	});
+
+	it("token bar shows a cache-aware Sonnet-priced cost estimate in the label", () => {
+		const js = buildSidebarScript();
+		// Sonnet 4.6 rates per million tokens: input 3, output 15, cached at the
+		// cache-read rate 0.30 (a floor — cached folds read + the pricier creation).
+		expect(js).toContain("(stats.input * 3 + stats.output * 15 + cached * 0.3) / 1000000");
+		// Rendered as "≈$X.XX", with a "<$0.01" floor for sub-cent branches.
+		expect(js).toContain("'≈$'");
+		expect(js).toContain("'<$0.01'");
+		expect(js).toContain("costUsd.toFixed(2)");
+	});
+
+	it("token bar tooltip reports N-of-M reporting memories and the Sonnet cost caveat", () => {
+		const js = buildSidebarScript();
+		// reporting / memories counts are plumbed through state.tokenStats…
+		expect(js).toContain("reporting: msg.reporting || 0");
+		expect(js).toContain("memories: msg.memories || 0");
+		// …and drive the mockup's partial-reporting tooltip line.
+		expect(js).toContain("memories on this branch report token usage");
+		expect(js).toContain("don’t report it");
+		// Cost caveat sentence (assumes Sonnet pricing, counts reporting only).
+		expect(js).toContain("assumes Sonnet pricing");
+		expect(js).toContain("actual spend may be higher");
+	});
+
+	it("branch-tab mouseover handler skips hover-card for commitWithMemory rows", () => {
+		// The row subline + expandable memory-details replace the hover card for
+		// committed-memory rows; the popover must never show for them. The gate
+		// must live in the COMMIT hover-card show path (the handler that calls
+		// scheduleShowHoverCard with 'data-id'), NOT in the plan/note/reference
+		// handler. Plain 'commit' rows must still reach scheduleShowHoverCard.
+		const js = buildSidebarScript();
+		// The branch-tab commit card handler passes the row id via the `sid`
+		// local (the KB tab uses 'data-hash' inline), so anchor on that to find
+		// the right call-site.
+		const branchScheduleCall = "scheduleShowHoverCard(sid, e.clientX, e.clientY)";
+		const scheduleIdx = js.indexOf(branchScheduleCall);
+		expect(scheduleIdx).toBeGreaterThan(-1);
+		// Walk back to the nearest preceding branch mouseover addEventListener.
+		const moMarker = "tabContents.branch.addEventListener('mouseover'";
+		const moIdx = js.lastIndexOf(moMarker, scheduleIdx);
+		expect(moIdx).toBeGreaterThan(-1);
+		// Slice from the handler open to just past the scheduleShowHoverCard call.
+		const handlerWindow = js.slice(moIdx, scheduleIdx + 100);
+		// Must suppress commitWithMemory before reaching scheduleShowHoverCard.
+		expect(handlerWindow).toContain("commitWithMemory");
+		// Plain 'commit' context must NOT be unconditionally excluded — it is
+		// handled via isCommitRow and must reach scheduleShowHoverCard.
+		expect(handlerWindow).not.toMatch(/ctx\s*===\s*'commit'\s*\)/);
+	});
+
+	it("branch-tab commit hover-card is suppressed for the row being AI-summarized", () => {
+		// During the blocking AI summary, the HEAD commit is still a plain
+		// 'commit' row (it becomes a hover-less 'commitWithMemory' row only once
+		// the summary lands). The mouseover handler must bail BEFORE
+		// scheduleShowHoverCard when the row id matches the summarizing hash, so
+		// the popover never shows mid-generation. summarizingHash is a SHORT hash
+		// and the row id is the FULL hash → the guard must prefix-match, not ===.
+		const js = buildSidebarScript();
+		const branchScheduleCall = "scheduleShowHoverCard(sid, e.clientX, e.clientY)";
+		const scheduleIdx = js.indexOf(branchScheduleCall);
+		expect(scheduleIdx).toBeGreaterThan(-1);
+		const moMarker = "tabContents.branch.addEventListener('mouseover'";
+		const moIdx = js.lastIndexOf(moMarker, scheduleIdx);
+		const handlerWindow = js.slice(moIdx, scheduleIdx);
+		// Gated on the blocking-summary state + the summarizing hash...
+		expect(handlerWindow).toContain("isWorkerBlocking()");
+		expect(handlerWindow).toContain("state.summarizingHash");
+		// ...and matched by prefix (short hash is a prefix of the full row id).
+		expect(handlerWindow).toContain("sid.indexOf(state.summarizingHash) === 0");
+		// Must NOT use strict equality (full vs short hash would never match).
+		expect(handlerWindow).not.toContain("sid === state.summarizingHash");
+	});
+
+	describe("Task A4: committed-memory row subline (time · hash · tokens)", () => {
+		// Slice renderCommitRow from the script for scoped assertions.
+		function getRenderCommitRow(js: string): string {
+			const start = js.indexOf("function renderCommitRow");
+			const end = js.indexOf("\n  function ", start + 1);
+			return js.slice(start, end > start ? end : undefined);
+		}
+
+		it("renderCommitRow hasMem branch builds a .mem-subline element", () => {
+			const js = buildSidebarScript();
+			const fn = getRenderCommitRow(js);
+			expect(fn).toContain("'mem-subline'");
+		});
+
+		it("renderCommitRow hasMem branch references item.hover.relativeDate in the subline", () => {
+			const js = buildSidebarScript();
+			const fn = getRenderCommitRow(js);
+			// The subline must pull relativeDate from the hover payload.
+			expect(fn).toContain("item.hover.relativeDate");
+		});
+
+		it("renderCommitRow hasMem branch references item.hover.shortHash in the subline", () => {
+			const js = buildSidebarScript();
+			const fn = getRenderCommitRow(js);
+			// shortHash must be emitted in the subline (monospace class).
+			expect(fn).toContain("item.hover.shortHash");
+			// The hash segment must carry a monospace class.
+			expect(fn).toContain("mem-sub-hash");
+		});
+
+		it("renderCommitRow hasMem branch calls formatTokens(item.conversationTokens) in the subline", () => {
+			const js = buildSidebarScript();
+			const fn = getRenderCommitRow(js);
+			expect(fn).toContain("formatTokens(item.conversationTokens)");
+		});
+
+		it("token segment is gated on typeof item.conversationTokens === 'number' (never renders undefined)", () => {
+			const js = buildSidebarScript();
+			const fn = getRenderCommitRow(js);
+			// The guard must be present so the segment is absent when conversationTokens is undefined.
+			expect(fn).toContain("typeof item.conversationTokens === 'number'");
+		});
+
+		it("dot separators between subline segments use a .mem-sub-sep span (not a bare literal dot)", () => {
+			const js = buildSidebarScript();
+			const fn = getRenderCommitRow(js);
+			expect(fn).toContain("mem-sub-sep");
+		});
+	});
+
+	describe("code-review fixes S1-S8", () => {
+		it("S1: knowledge search restores focus + exact caret on host-pushed renders", () => {
+			const js = buildSidebarScript();
+			const fn = js.slice(
+				js.indexOf("function renderKnowledge"),
+				js.indexOf("// Click delegation for status entries"),
+			);
+			// Capture the live input's focus + selection range BEFORE mountIn
+			// destroys it (covers a kb:knowledgeData arriving mid-typing).
+			expect(fn).toContain("document.activeElement === liveInput");
+			expect(fn).toContain("liveInput.selectionStart");
+			expect(fn).toContain("liveInput.selectionEnd");
+			// Restore fires for both the host-pushed path (inputWasFocused) and the
+			// debounced-search path (knRestoreSearchFocus).
+			expect(fn).toContain("if (inputWasFocused || knRestoreSearchFocus)");
+			// Replays the exact range when captured, else falls back to end-of-value.
+			expect(fn).toContain("inp.setSelectionRange(savedSelStart, savedSelEnd)");
+		});
+
+		it("S2: squash enter and cancel post branch:deselectAllCommits; confirm does not (race)", () => {
+			const js = buildSidebarScript();
+			// Enter squash clears stale host-side selection.
+			const enterScope = js.slice(
+				js.indexOf("a === 'commits-enter-squash'"),
+				js.indexOf("const cmdMap = {"),
+			);
+			expect(enterScope).toContain("type: 'branch:deselectAllCommits'");
+			// Cancel clears on exit.
+			const exitScope = js.slice(
+				js.indexOf("if (act === 'squash-cancel')"),
+				js.indexOf("// Commit rows: data-checkbox-kind"),
+			);
+			expect(exitScope).toContain("type: 'branch:deselectAllCommits'");
+			// Confirm must NOT post deselect (it would race the async squash read).
+			const confirmScope = exitScope.slice(exitScope.indexOf("act === 'squash-confirm'"));
+			expect(confirmScope).not.toContain("branch:deselectAllCommits");
+		});
+
+		it("S3: subsectionShowAll[s.id] is reset when a sub-section shrinks to/below the cap", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("if (s.subsection && !overLimit && state.subsectionShowAll[s.id])");
+			expect(js).toContain("delete state.subsectionShowAll[s.id];");
+		});
+
+		it("S4: token bar floors buckets and clamps cached so input+cached never crowds out output", () => {
+			const js = buildSidebarScript();
+			const fn = js.slice(
+				js.indexOf("function renderTokenBar"),
+				js.indexOf("function renderBranch"),
+			);
+			// Floor, not round — round-up on both segments could push the sum past 100.
+			expect(fn).toContain("Math.floor((n / stats.total) * 100 / 10) * 10");
+			// Cached is clamped to leave at least one 10% slot for the output segment.
+			expect(fn).toContain("Math.min(bucket(cached), 90 - inputW)");
+			// Negative clamp guard.
+			expect(fn).toContain("if (cachedW < 0) cachedW = 0;");
+		});
+
+		// Pure-function repro for the S4 overflow: simulate the bucket+clamp math the
+		// way the webview computes it and assert the fixed widths can never sum to
+		// >= 100% (which would collapse the flex output segment / overflow the bar).
+		it("S4 repro: input% + cached% bucket+clamp stays <= 90 for adversarial splits", () => {
+			function bucket(n: number, total: number): number {
+				const pct = Math.floor((n / total) * 100 / 10) * 10;
+				return pct < 0 ? 0 : pct > 100 ? 100 : pct;
+			}
+			function widths(input: number, cached: number, total: number): [number, number] {
+				const inputW = bucket(input, total);
+				let cachedW = Math.min(bucket(cached, total), 90 - inputW);
+				if (cachedW < 0) cachedW = 0;
+				return [inputW, cachedW];
+			}
+			// The classic failing case: both segments ~46-49% → old round() gave 50+50=100,
+			// crushing output. floor+clamp keeps room.
+			const cases: Array<[number, number, number]> = [
+				[46, 46, 100],
+				[49, 49, 100],
+				[48, 48, 100],
+				[90, 9, 100],
+				[55, 44, 100],
+				[1, 99, 100],
+			];
+			for (const [input, cached, total] of cases) {
+				const [iw, cw] = widths(input, cached, total);
+				expect(iw + cw).toBeLessThanOrEqual(90);
+				// Output (flex remainder) always has at least 10% of room.
+				expect(100 - (iw + cw)).toBeGreaterThanOrEqual(10);
+			}
+		});
+
+		it("S6: kb:memoryEvidence updates one row in place and only full-renders on miss", () => {
+			const js = buildSidebarScript();
+			const handler = js.slice(
+				js.indexOf("case 'kb:memoryEvidence'"),
+				js.indexOf("case 'kb:prStatus'"),
+			);
+			// Calls the in-place updater first.
+			expect(handler).toContain("updateMemoryEvidenceInPlace(msg.commitHash, msg.evidence)");
+			// Full re-render only when the row isn't currently mounted.
+			expect(handler).toContain("if (!placedEvidence)");
+			// The in-place updater scans forward siblings and replaces only the
+			// evidence/loading node (single-row update, not a tree reset).
+			const updater = js.slice(
+				js.indexOf("function updateMemoryEvidenceInPlace"),
+				js.indexOf("function cssAttrEscape"),
+			);
+			expect(updater).toContain("nextElementSibling");
+			expect(updater).toContain("renderMemoryEvidence(hash, evidence)");
+			// It targets BOTH the KB memory-row and the Branch commit row.
+			expect(updater).toContain(".memory-row[data-hash=");
+			expect(updater).toContain(".tree-node[data-id=");
+			// The whole-tree fallback is GUARDED by the in-place miss, never
+			// unconditional (the regression being fixed).
+			expect(handler).toContain("if (!placedEvidence)");
+			expect(handler).not.toContain(
+				"if (state.activeTab === 'kb' && state.kbMode === 'memories') renderMemories();\n        if (state.activeTab === 'branch') renderBranch();",
+			);
+		});
+
+		it("S6: kb:prStatus rebuilds only the matching shipped-group(s) in place", () => {
+			const js = buildSidebarScript();
+			const handler = js.slice(
+				js.indexOf("case 'kb:prStatus'"),
+				js.indexOf("case 'branch:plansData'"),
+			);
+			expect(handler).toContain("updatePrStatusInPlace(msg.branch)");
+			expect(handler).toContain("if (!placedPr)");
+			const updater = js.slice(
+				js.indexOf("function updatePrStatusInPlace"),
+				js.indexOf("function updateMemoryEvidenceInPlace"),
+			);
+			// Locates groups by the data-pr-branch tag and replaces each in place.
+			expect(updater).toContain(".shipped-group[data-pr-branch]");
+			expect(updater).toContain("g.replaceWith(fresh)");
+			// Rebuilds via the shared builder, not a whole renderBranch.
+			expect(updater).toContain("buildShippedGroup(hash, branch, e2eCount, jolliDocUrl)");
+		});
+
+		it("S6: shipped-group carries the data-* the in-place PR updater needs", () => {
+			const js = buildSidebarScript();
+			const fn = js.slice(
+				js.indexOf("function buildShippedGroup"),
+				js.indexOf("function updatePrStatusInPlace"),
+			);
+			expect(fn).toContain("'data-pr-branch': memBranch || ''");
+			expect(fn).toContain("'data-pr-hash': hash");
+			expect(fn).toContain("'data-e2e-count'");
+			expect(fn).toContain("'data-jolli-doc-url'");
+		});
 	});
 });

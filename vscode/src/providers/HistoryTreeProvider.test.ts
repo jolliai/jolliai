@@ -458,59 +458,6 @@ describe("HistoryTreeProvider tree behavior", () => {
 		});
 	});
 
-	it("builds a tooltip with commit type, stats, and view link when a summary exists", async () => {
-		const commit = {
-			...makeCommit("aaaaaaaa", "  fix markdown *issue*"),
-			author: "Taylor [QA]",
-			date: "2026-03-29T00:00:00Z",
-			commitType: "squash",
-			insertions: 2,
-			deletions: 1,
-			filesChanged: 1,
-			hasSummary: true,
-		};
-		const provider = makeHistoryProvider(
-			makeBridge(() => makeResult([commit])),
-		);
-
-		await provider.refresh();
-		const [item] = await provider.getChildren();
-		const tooltip = item.tooltip as { value: string; isTrusted: boolean };
-
-		expect(tooltip.isTrusted).toBe(true);
-		expect(tooltip.value).toContain("**Taylor \\[QA\\]**");
-		expect(tooltip.value).toContain("$(tag) squash");
-		expect(tooltip.value).toContain("fix markdown \\*issue\\*");
-		expect(tooltip.value).toContain(
-			"1 file changed, 2 insertions(+), 1 deletion(-)",
-		);
-		expect(tooltip.value).toContain("command:jollimemory.viewSummary");
-		expect(item.contextValue).toBe("commitWithMemory");
-	});
-
-	it("omits optional tooltip rows and view link when no summary exists", async () => {
-		const commit = {
-			...makeCommit("aaaaaaaa", "plain commit"),
-			insertions: 0,
-			deletions: 0,
-			filesChanged: 2,
-			hasSummary: false,
-		};
-		const provider = makeHistoryProvider(
-			makeBridge(() => makeResult([commit])),
-		);
-
-		await provider.refresh();
-		const [item] = await provider.getChildren();
-		const tooltip = item.tooltip as { value: string };
-
-		expect(tooltip.value).toContain("2 files changed");
-		expect(tooltip.value).not.toContain("insertion");
-		expect(tooltip.value).not.toContain("deletion");
-		expect(tooltip.value).not.toContain("View Memory");
-		expect(item.contextValue).toBe("commit");
-	});
-
 	it("updates VS Code context keys during refresh", async () => {
 		const provider = makeHistoryProvider(
 			makeBridge(() => makeResult([makeCommit("aaaaaaaa")], true)),
@@ -569,33 +516,10 @@ describe("HistoryTreeProvider tree behavior", () => {
 
 		await provider.refresh();
 		const [item] = (await provider.getChildren()) as Array<CommitItem>;
-		const tooltip = item.tooltip as { value: string };
 
-		// The tooltip contains the commit message and the label includes the cloud icon
-		// Verify push status is reflected through the tooltip which contains the message
-		expect(tooltip.value).toContain("deployed feature");
-		// Also verify the commit is flagged as pushed
+		// The pushed flag rides through to the serialized commit; the cloud
+		// affordance is rendered from item.commit.isPushed in the webview.
 		expect(item.commit.isPushed).toBe(true);
-	});
-
-	it("includes deletions in tooltip stats", async () => {
-		const commit = {
-			...makeCommit("aaaaaaaa", "remove old code"),
-			insertions: 0,
-			deletions: 5,
-			filesChanged: 2,
-			hasSummary: false,
-		};
-		const provider = makeHistoryProvider(
-			makeBridge(() => makeResult([commit])),
-		);
-
-		await provider.refresh();
-		const [item] = await provider.getChildren();
-		const tooltip = item.tooltip as { value: string };
-
-		expect(tooltip.value).toContain("5 deletions(-)");
-		expect(tooltip.value).not.toContain("insertion");
 	});
 
 	it("returns tree items unchanged and disposes its event emitter", async () => {
@@ -1034,8 +958,161 @@ describe("HistoryTreeProvider.serialize", () => {
 			statsLine: "2 files changed, 12 insertions(+), 3 deletions(-)",
 		});
 		expect(typeof hover?.relativeDate).toBe("string");
+		// Compact form for the row subline ("2h ago" / "3d ago" / "just now") —
+		// NOT the verbose formatRelativeDate which appends " (absolute date)".
+		expect(hover?.relativeDate).not.toContain("(");
+		expect(hover?.relativeDate).toMatch(/ago|just now/);
 		// Branch is intentionally omitted on commit rows — see buildHover docs.
 		expect(hover?.branch).toBeUndefined();
+	});
+
+	it("serialize sets jolliDocUrl from lookupSummary when commit has a memory", async () => {
+		const commit = { ...makeCommit("abcd1234efgh5678"), hasSummary: true };
+		const bridge = makeBridge(() => makeResult([commit]));
+		const store = new CommitsStore(bridge as never);
+		const provider = new HistoryTreeProvider(
+			store,
+			async (hash) => (hash === "abcd1234efgh5678" ? { jolliDocUrl: "https://team.jolli.app/d/42" } : null),
+		);
+
+		await store.refresh();
+		const items = await provider.serialize();
+
+		expect(items).toHaveLength(1);
+		expect((items[0] as { jolliDocUrl?: string }).jolliDocUrl).toBe("https://team.jolli.app/d/42");
+	});
+
+	it("serialize omits jolliDocUrl when commit has no memory", async () => {
+		const commit = { ...makeCommit("h1"), hasSummary: false };
+		const bridge = makeBridge(() => makeResult([commit]));
+		const store = new CommitsStore(bridge as never);
+		const provider = new HistoryTreeProvider(
+			store,
+			async (_hash) => ({ jolliDocUrl: "https://team.jolli.app/d/99" }),
+		);
+
+		await store.refresh();
+		const items = await provider.serialize();
+
+		expect(items).toHaveLength(1);
+		// lookupSummary should NOT be called for commits without a memory
+		expect((items[0] as { jolliDocUrl?: string }).jolliDocUrl).toBeUndefined();
+	});
+
+	it("serialize omits jolliDocUrl when lookupSummary is not provided", async () => {
+		const commit = { ...makeCommit("h1"), hasSummary: true };
+		const bridge = makeBridge(() => makeResult([commit]));
+		const store = new CommitsStore(bridge as never);
+		// No lookupSummary passed — classic construction
+		const provider = new HistoryTreeProvider(store);
+
+		await store.refresh();
+		const items = await provider.serialize();
+
+		expect(items).toHaveLength(1);
+		expect((items[0] as { jolliDocUrl?: string }).jolliDocUrl).toBeUndefined();
+	});
+
+	it("serialize resolves without throw and omits jolliDocUrl when lookupSummary rejects", async () => {
+		const commit = { ...makeCommit("h1"), hasSummary: true };
+		const bridge = makeBridge(() => makeResult([commit]));
+		const store = new CommitsStore(bridge as never);
+		const provider = new HistoryTreeProvider(store, async (_hash) => {
+			throw new Error("network error");
+		});
+
+		await store.refresh();
+		// serialize() must not reject even though lookupSummary throws
+		const items = await provider.serialize();
+
+		expect(items).toHaveLength(1);
+		expect((items[0] as { jolliDocUrl?: string }).jolliDocUrl).toBeUndefined();
+	});
+
+	it("serialize sets e2eCount and conversationTokens from lookupSummary when commit has a memory", async () => {
+		const commit = { ...makeCommit("abcd1234efgh5678"), hasSummary: true };
+		const bridge = makeBridge(() => makeResult([commit]));
+		const store = new CommitsStore(bridge as never);
+		const provider = new HistoryTreeProvider(
+			store,
+			async (hash) =>
+				hash === "abcd1234efgh5678"
+					? { jolliDocUrl: "u", e2eCount: 3, conversationTokens: 1_400_000 }
+					: null,
+		);
+
+		await store.refresh();
+		const items = await provider.serialize();
+
+		expect(items).toHaveLength(1);
+		expect((items[0] as { e2eCount?: number }).e2eCount).toBe(3);
+		expect((items[0] as { conversationTokens?: number }).conversationTokens).toBe(1_400_000);
+	});
+
+	it("serialize calls lookupSummary at most once per hash within a single pass (memoized)", async () => {
+		// Two distinct memory-bearing commits → exactly two lookups, never more.
+		const c1 = { ...makeCommit("hash-one"), hasSummary: true };
+		const c2 = { ...makeCommit("hash-two"), hasSummary: true };
+		const bridge = makeBridge(() => makeResult([c1, c2]));
+		const store = new CommitsStore(bridge as never);
+		const lookup = vi.fn(async (hash: string) => ({ jolliDocUrl: `u/${hash}` }));
+		const provider = new HistoryTreeProvider(store, lookup);
+
+		await store.refresh();
+		await provider.serialize();
+
+		expect(lookup).toHaveBeenCalledTimes(2);
+		expect(lookup).toHaveBeenCalledWith("hash-one");
+		expect(lookup).toHaveBeenCalledWith("hash-two");
+	});
+
+	it("serialize memoizes a repeated hash within one pass to a single read", async () => {
+		// Snapshot with the SAME hash listed twice (e.g. a transient store state).
+		// The per-pass memo must collapse the two rows to one lookupSummary read.
+		const dup = { ...makeCommit("dup-hash"), hasSummary: true };
+		const bridge = makeBridge(() => makeResult([dup, { ...dup }]));
+		const store = new CommitsStore(bridge as never);
+		const lookup = vi.fn(async (_hash: string) => ({ jolliDocUrl: "u" }));
+		const provider = new HistoryTreeProvider(store, lookup);
+
+		await store.refresh();
+		const items = await provider.serialize();
+
+		// Both rows are serialized, but the duplicate hash was read only once.
+		expect(items.length).toBeGreaterThanOrEqual(1);
+		expect(lookup).toHaveBeenCalledTimes(1);
+	});
+
+	it("serialize memo is per-pass — a second serialize re-reads (no stale cross-pass cache)", async () => {
+		const commit = { ...makeCommit("hash-x"), hasSummary: true };
+		const bridge = makeBridge(() => makeResult([commit]));
+		const store = new CommitsStore(bridge as never);
+		const lookup = vi.fn(async (_hash: string) => ({ jolliDocUrl: "u" }));
+		const provider = new HistoryTreeProvider(store, lookup);
+
+		await store.refresh();
+		await provider.serialize();
+		await provider.serialize();
+
+		// Memo lives only for one pass, so two passes → two reads.
+		expect(lookup).toHaveBeenCalledTimes(2);
+	});
+
+	it("serialize omits e2eCount and conversationTokens when lookupSummary returns only jolliDocUrl", async () => {
+		const commit = { ...makeCommit("abcd1234efgh5678"), hasSummary: true };
+		const bridge = makeBridge(() => makeResult([commit]));
+		const store = new CommitsStore(bridge as never);
+		const provider = new HistoryTreeProvider(
+			store,
+			async (hash) => (hash === "abcd1234efgh5678" ? { jolliDocUrl: "u" } : null),
+		);
+
+		await store.refresh();
+		const items = await provider.serialize();
+
+		expect(items).toHaveLength(1);
+		expect(Object.hasOwn(items[0], "e2eCount")).toBe(false);
+		expect(Object.hasOwn(items[0], "conversationTokens")).toBe(false);
 	});
 });
 

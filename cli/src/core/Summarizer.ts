@@ -79,6 +79,13 @@ export const COMMIT_MSG_DIFF_BUDGET = 12_000;
 export interface SummaryResult {
 	readonly transcriptEntries: number;
 	readonly conversationTurns?: number;
+	/** Total conversation token consumption accumulated over the consumed transcript slice.
+	 *  Forward-only: absent when no usage data is available. `generateSummary` does NOT
+	 *  populate this on the success path — QueueWorker computes the slice total itself and
+	 *  applies it onto the CommitSummary via a guarded spread (`...(conversationTokens > 0 …)`).
+	 *  The only place a SummaryResult carries it directly is QueueWorker's LLM-failed
+	 *  fallback arm, which constructs a SummaryResult by hand. */
+	readonly conversationTokens?: number;
 	readonly llm: LlmCallMetadata;
 	readonly stats: DiffStats;
 	readonly topics: ReadonlyArray<TopicSummary>;
@@ -192,6 +199,7 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 		model: llmResult.model ?? resolveModelId(config.model),
 		inputTokens: llmResult.inputTokens,
 		outputTokens: llmResult.outputTokens,
+		cachedTokens: llmResult.cachedTokens,
 		apiLatencyMs: llmResult.apiLatencyMs,
 		stopReason: llmResult.stopReason ?? null,
 		source: llmResult.source,
@@ -233,6 +241,7 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 					model: retryResult.model ?? resolveModelId(config.model),
 					inputTokens: llmMeta.inputTokens + retryResult.inputTokens,
 					outputTokens: llmMeta.outputTokens + retryResult.outputTokens,
+					cachedTokens: (llmMeta.cachedTokens ?? 0) + (retryResult.cachedTokens ?? 0),
 					apiLatencyMs: llmMeta.apiLatencyMs + retryResult.apiLatencyMs,
 					stopReason: retryResult.stopReason ?? null,
 					// Retry uses the same credentials as the first call, so source
@@ -1405,6 +1414,7 @@ export async function generateSquashConsolidation(
 			model: llmResult.model ?? resolveModelId(config.model),
 			inputTokens: llmResult.inputTokens,
 			outputTokens: llmResult.outputTokens,
+			cachedTokens: llmResult.cachedTokens,
 			apiLatencyMs: llmResult.apiLatencyMs,
 			stopReason: llmResult.stopReason ?? null,
 			source: llmResult.source,
@@ -1470,6 +1480,7 @@ export async function generateSquashConsolidation(
 					model: strict.llm.model,
 					inputTokens: first.llm.inputTokens + strict.llm.inputTokens,
 					outputTokens: first.llm.outputTokens + strict.llm.outputTokens,
+					cachedTokens: (first.llm.cachedTokens ?? 0) + (strict.llm.cachedTokens ?? 0),
 					apiLatencyMs: first.llm.apiLatencyMs + strict.llm.apiLatencyMs,
 					stopReason: strict.llm.stopReason,
 					// Same credentials across both calls; strict.llm.source is

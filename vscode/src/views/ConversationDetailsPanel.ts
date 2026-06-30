@@ -40,6 +40,19 @@ export interface ShowOptions {
 	 * (like the sidebar CONVERSATIONS row) can refresh badges/counts.
 	 */
 	readonly onSessionChanged?: (sessionId: string) => void;
+	/**
+	 * ARCHIVED mode. When present, the panel renders these entries verbatim
+	 * (the orphan-branch snapshot captured at commit time) instead of loading
+	 * the cursor-trimmed live transcript. Used by committed-memory conversation
+	 * evidence rows: their turns were all consumed into the commit summary and
+	 * sit *before* the cursor, so the live `loadUnreadTranscript` path returns
+	 * nothing. Forces the panel read-only — the archived snapshot has no live
+	 * overlay/cursor to edit against. `commitHash` disambiguates the panel
+	 * registry key so an archived view and the live view of the same session
+	 * can coexist.
+	 */
+	readonly archivedEntries?: ReadonlyArray<TranscriptEntry>;
+	readonly commitHash?: string;
 }
 
 /**
@@ -108,6 +121,8 @@ export class ConversationDetailsPanel {
 	private readonly projectDir: string | undefined;
 	private readonly onSessionHidden: ((sessionId: string) => void) | undefined;
 	private readonly onSessionChanged: ((sessionId: string) => void) | undefined;
+	private readonly archivedEntries: ReadonlyArray<TranscriptEntry> | undefined;
+	private readonly commitHash: string | undefined;
 
 	private constructor(opts: ShowOptions) {
 		this.sessionId = opts.sessionId;
@@ -116,6 +131,8 @@ export class ConversationDetailsPanel {
 		this.projectDir = opts.projectDir;
 		this.onSessionHidden = opts.onSessionHidden;
 		this.onSessionChanged = opts.onSessionChanged;
+		this.archivedEntries = opts.archivedEntries;
+		this.commitHash = opts.commitHash;
 		this.panel = vscode.window.createWebviewPanel(
 			"jollimemory.conversationDetails",
 			opts.title,
@@ -141,13 +158,13 @@ export class ConversationDetailsPanel {
 			source: opts.source,
 			transcriptPath: opts.transcriptPath,
 			title: opts.title,
-			readOnly: this.projectDir === undefined,
+			readOnly: this.projectDir === undefined || this.archivedEntries !== undefined,
 			cspSource: this.panel.webview.cspSource,
 			codiconCssUri: codiconCssUri.toString(),
 		});
 		this.panel.onDidDispose(() => {
 			ConversationDetailsPanel.panels.delete(
-				panelKey(this.source, this.sessionId),
+				panelKey(this.source, this.sessionId, this.commitHash),
 			);
 		});
 		// Return the promise so tests can `await` the handler. VS Code itself
@@ -156,7 +173,7 @@ export class ConversationDetailsPanel {
 	}
 
 	static show(opts: ShowOptions): void {
-		const key = panelKey(opts.source, opts.sessionId);
+		const key = panelKey(opts.source, opts.sessionId, opts.commitHash);
 		const existing = ConversationDetailsPanel.panels.get(key);
 		if (existing) {
 			// Refresh tab title in case the row's title was resolved later
@@ -234,6 +251,16 @@ export class ConversationDetailsPanel {
 		readonly rawByIndex: ReadonlyArray<TranscriptEntry>;
 		readonly isEdited: boolean;
 	}> {
+		// Archived mode: the orphan-branch snapshot is the source of truth.
+		// Render it verbatim, read-only — there is no live cursor/overlay for a
+		// committed memory, so displayed === rawByIndex and nothing is "edited".
+		if (this.archivedEntries) {
+			return {
+				displayed: this.archivedEntries,
+				rawByIndex: this.archivedEntries,
+				isEdited: false,
+			};
+		}
 		const { loadUnreadTranscript } = await import(
 			"../../../cli/src/core/TranscriptMessageCounter.js"
 		);
@@ -278,6 +305,17 @@ export class ConversationDetailsPanel {
 	private async handleSaveOverrides(
 		payload: SaveOverridesPayload,
 	): Promise<void> {
+		if (this.archivedEntries) {
+			// Archived (committed-memory) snapshots are read-only — there is no
+			// live cursor/overlay to anchor an edit against. The Save button is
+			// hidden in read-only mode; this guard rejects a spoofed save before
+			// it can touch the (wrong) live overlay store.
+			void this.panel.webview.postMessage({
+				type: "overridesSaveError",
+				message: "Committed conversations are read-only and cannot be edited.",
+			});
+			return;
+		}
 		if (!this.projectDir) {
 			// Defensive — the Save button is hidden in read-only mode, but if
 			// the webview were spoofed into posting saveOverrides we still
@@ -408,6 +446,15 @@ function toIdentity(entry: TranscriptEntry): {
 // The colon separator matches HiddenConversationsStore.hiddenKey and is
 // safe because TranscriptSource values are a closed enum that never
 // contain a colon.
-function panelKey(source: TranscriptSource, sessionId: string): string {
-	return `${source}:${sessionId}`;
+function panelKey(
+	source: TranscriptSource,
+	sessionId: string,
+	commitHash?: string,
+): string {
+	// Archived (committed-memory) panels carry a commitHash discriminator so an
+	// archived snapshot and the live view of the same source+session do not
+	// collide in the registry — clicking one must not reveal the other.
+	return commitHash
+		? `${source}:${sessionId}:${commitHash}`
+		: `${source}:${sessionId}`;
 }

@@ -29,6 +29,7 @@ function llmResult(text: string, overrides: Partial<LlmCallResult> = {}): LlmCal
 		model: "claude-haiku-4-5-20251001",
 		inputTokens: 500,
 		outputTokens: 200,
+		cachedTokens: 0,
 		apiLatencyMs: 350,
 		stopReason: "end_turn",
 		// Default to direct config-key path; proxy/env tests override.

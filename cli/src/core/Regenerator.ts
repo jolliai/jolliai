@@ -148,6 +148,7 @@ export async function regenerateSummary(
 		llm: result.llm,
 		transcriptEntries: result.transcriptEntries,
 		...(result.conversationTurns !== undefined ? { conversationTurns: result.conversationTurns } : {}),
+		...(normalized.conversationTokens !== undefined ? { conversationTokens: normalized.conversationTokens } : {}),
 		diffStats: result.stats,
 		generatedAt: new Date().toISOString(),
 		// Successful regenerate clears any stale failure marker so the

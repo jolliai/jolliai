@@ -1515,7 +1515,11 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// advance — keep the plans/notes exclusion read here, but no `sessionTranscripts.filter`
 	// step is needed.
 	const exclusions = await readExclusions(cwd);
-	const { sessionTranscripts, totalEntries, humanEntries } = await loadSessionTranscripts(cwd, config, op.createdAt);
+	const { sessionTranscripts, totalEntries, humanEntries, conversationTokens } = await loadSessionTranscripts(
+		cwd,
+		config,
+		op.createdAt,
+	);
 
 	// Step 5: Get git diff and stats (moved before guard to enable diff-only summaries)
 	stepStart = now();
@@ -1597,6 +1601,9 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		diffStats,
 		transcriptEntries: totalEntries,
 		conversationTurns: humanEntries,
+		// NB: conversationTokens is deliberately NOT passed — generateSummary does not
+		// read it (it was a dead SummarizeParams field). The slice token total is applied
+		// directly onto the CommitSummary below via the guarded conversationTokens spread.
 		referenceBlocks,
 		plans: plansBlock,
 		notes: notesBlock,
@@ -1637,6 +1644,13 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 			summaryResult = {
 				transcriptEntries: totalEntries,
 				conversationTurns: humanEntries,
+				// Mirror the success path: only carry conversationTokens when >0 so a
+				// literal `conversationTokens: 0` is never stored. The guarded spread at
+				// the CommitSummary assembler (`...(conversationTokens > 0 && …)`) only
+				// ADDS the field — it never deletes an already-present 0 — so an
+				// unconditional `conversationTokens: 0` here would survive onto the
+				// stored summary, where the success path omits it entirely.
+				...(conversationTokens > 0 && { conversationTokens }),
 				llm: {
 					model: config.model ?? "unknown",
 					inputTokens: 0,
@@ -1765,6 +1779,8 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		commitType,
 		commitSource,
 		...summaryResult,
+		/* v8 ignore next -- conversationTokens=0 arm: only omitted when no usage-aware sessions ran */
+		...(conversationTokens > 0 && { conversationTokens }),
 		diffStats,
 		...(llmFailed ? { summaryError: LLM_FAILED } : {}),
 		...(planRefs.length > 0 ? { plans: planRefs } : {}),
@@ -2160,7 +2176,11 @@ function buildHoistedAmendRoot(
 	hoisted: AmendHoistedFields,
 	metadata: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
 	fullDiffStats: DiffStats,
-	stats?: { readonly transcriptEntries?: number; readonly conversationTurns?: number },
+	stats?: {
+		readonly transcriptEntries?: number;
+		readonly conversationTurns?: number;
+		readonly conversationTokens?: number;
+	},
 ): CommitSummary {
 	return {
 		version: CURRENT_SCHEMA_VERSION,
@@ -2180,6 +2200,8 @@ function buildHoistedAmendRoot(
 		...(hoisted.llm && { llm: hoisted.llm }),
 		...(stats?.transcriptEntries !== undefined && { transcriptEntries: stats.transcriptEntries }),
 		...(stats?.conversationTurns !== undefined && { conversationTurns: stats.conversationTurns }),
+		...(stats?.conversationTokens !== undefined &&
+			stats.conversationTokens > 0 && { conversationTokens: stats.conversationTokens }),
 		...(hoisted.summaryError && { summaryError: hoisted.summaryError }),
 		/* v8 ignore stop */
 		...hoistMetadataFromOldSummary(oldSummary),
@@ -2222,6 +2244,7 @@ async function applyAmendShortCircuit(
 	amendTranscripts: ReadonlyArray<string>,
 	totalEntries: number,
 	humanEntries: number,
+	conversationTokens: number,
 	cwd: string,
 	pipelineStart: number,
 	oldHash: string,
@@ -2243,7 +2266,7 @@ async function applyAmendShortCircuit(
 		},
 		metadata ?? {},
 		amendFullDiffStats,
-		{ transcriptEntries: totalEntries, conversationTurns: humanEntries },
+		{ transcriptEntries: totalEntries, conversationTurns: humanEntries, conversationTokens },
 	);
 
 	await storeSummary(root, cwd, false, transcriptArtifact ? { transcript: transcriptArtifact } : undefined);
@@ -2300,7 +2323,7 @@ async function handleAmendPipeline(
 	// plans/notes exclusion read here, but no `sessionTranscripts.filter` step is needed.
 	const amendConfig = await loadConfig();
 	const amendExclusions = await readExclusions(cwd);
-	const { sessionTranscripts, totalEntries, humanEntries } = await loadSessionTranscripts(
+	const { sessionTranscripts, totalEntries, humanEntries, conversationTokens } = await loadSessionTranscripts(
 		cwd,
 		amendConfig,
 		beforeTimestamp,
@@ -2394,6 +2417,7 @@ async function handleAmendPipeline(
 			amendTranscripts,
 			totalEntries,
 			humanEntries,
+			conversationTokens,
 			cwd,
 			pipelineStart,
 			oldHash,
@@ -2457,6 +2481,9 @@ async function handleAmendPipeline(
 		diffStats: deltaDiffStats,
 		transcriptEntries: totalEntries,
 		conversationTurns: humanEntries,
+		// NB: conversationTokens is deliberately NOT passed — see the leaf-pipeline note.
+		// generateSummary does not read it; the slice total is applied onto the summary
+		// directly via the guarded conversationTokens spread.
 		referenceBlocks: amendReferenceBlocks,
 		plans: amendPlansBlock,
 		notes: amendNotesBlock,
@@ -2486,6 +2513,12 @@ async function handleAmendPipeline(
 			delta = {
 				transcriptEntries: totalEntries,
 				conversationTurns: humanEntries,
+				// Same guard as the leaf LLM-failed arm (C2): only carry
+				// conversationTokens when >0. `...delta` is spread onto `freshLeaf`
+				// below, and the assembler's `...(conversationTokens > 0 && …)` spread
+				// only ADDS the field — it cannot delete a literal 0 carried in via
+				// `...delta`, so an unconditional 0 here would survive onto the summary.
+				...(conversationTokens > 0 && { conversationTokens }),
 				llm: {
 					model: amendConfig.model ?? "unknown",
 					inputTokens: 0,
@@ -2524,6 +2557,7 @@ async function handleAmendPipeline(
 			amendTranscripts,
 			totalEntries,
 			humanEntries,
+			conversationTokens,
 			cwd,
 			pipelineStart,
 			oldHash,
@@ -2621,7 +2655,7 @@ async function handleAmendPipeline(
 			},
 			metadata ?? {},
 			amendFullDiffStats,
-			{ transcriptEntries: totalEntries, conversationTurns: humanEntries },
+			{ transcriptEntries: totalEntries, conversationTurns: humanEntries, conversationTokens },
 		);
 		await storeSummary(
 			root,
@@ -2697,6 +2731,8 @@ async function handleAmendPipeline(
 		...(metadata?.commitType && { commitType: metadata.commitType }),
 		...(metadata?.commitSource && { commitSource: metadata.commitSource }),
 		...delta,
+		/* v8 ignore next -- conversationTokens=0 arm: only omitted when no usage-aware sessions ran */
+		...(conversationTokens > 0 && { conversationTokens }),
 		diffStats: amendFullDiffStats,
 		...(deltaLlmFailed && { summaryError: LLM_FAILED }),
 		...(freshLeafPlanRefs.length > 0 ? { plans: freshLeafPlanRefs } : {}),
@@ -2744,6 +2780,7 @@ async function loadSessionTranscripts(
 	sessionTranscripts: SessionTranscript[];
 	totalEntries: number;
 	humanEntries: number;
+	conversationTokens: number;
 }> {
 	const trackedSessions = filterSessionsByEnabledIntegrations(await loadAllSessions(cwd), config);
 
@@ -2850,7 +2887,28 @@ async function loadSessionTranscripts(
 		}
 	}
 
-	return { allSessions, sessionTranscripts, totalEntries, humanEntries };
+	// Reconcile conversationTokens against the overlay-applied entry set.
+	//
+	// `raw.conversationTokens` is summed per *JSONL line* in readAllTranscripts
+	// (TranscriptEntry carries no per-entry token field — usage lives only on the
+	// raw assistant turns and is accumulated before merge). Overlay deletes then
+	// drop merged entries from `sessionTranscripts` without any way to subtract the
+	// tokens those deleted turns consumed: the token-to-entry attribution simply
+	// does not exist post-merge. So when an overlay has REMOVED entries (the
+	// post-overlay count is below the pre-overlay count), the raw sum no longer
+	// describes the surviving conversation and would overcount — zero it rather than
+	// report an inflated, now-meaningless figure. (`conversationTokens > 0` guards in
+	// the assembler then omit the field entirely, matching the no-usage case.)
+	//
+	// Edit-only overlays keep the entry count unchanged: those tokens were genuinely
+	// spent generating the original turns, so we keep the raw sum rather than zero it
+	// on a content rewrite that has no token attribution either way.
+	let preOverlayEntries = 0;
+	for (const s of raw.sessionTranscripts) preOverlayEntries += s.entries.length;
+	const overlayRemovedEntries = totalEntries < preOverlayEntries;
+	const conversationTokens = overlayRemovedEntries ? 0 : raw.conversationTokens;
+
+	return { allSessions, sessionTranscripts, totalEntries, humanEntries, conversationTokens };
 }
 
 /**
@@ -2866,10 +2924,16 @@ async function readAllTranscripts(
 	sessions: ReadonlyArray<{ sessionId: string; transcriptPath: string; source?: TranscriptSource }>,
 	cwd: string,
 	beforeTimestamp?: string,
-): Promise<{ sessionTranscripts: SessionTranscript[]; totalEntries: number; humanEntries: number }> {
+): Promise<{
+	sessionTranscripts: SessionTranscript[];
+	totalEntries: number;
+	humanEntries: number;
+	conversationTokens: number;
+}> {
 	const sessionTranscripts: SessionTranscript[] = [];
 	let totalEntries = 0;
 	let humanEntries = 0;
+	let conversationTokens = 0;
 
 	for (const session of sessions) {
 		const cursor = await loadCursorForTranscript(session.transcriptPath, cwd);
@@ -2945,6 +3009,16 @@ async function readAllTranscripts(
 		}
 		const endLine = result.newCursor.lineNumber;
 
+		// Count usage tokens regardless of whether this slice produced any *merged*
+		// conversation entries. A slice can legitimately carry usage lines (assistant
+		// turns with a `usage` block) while yielding zero merged entries — e.g. the
+		// only assistant text was empty/tool-only and got dropped, or the human turns
+		// were noise-filtered. Gating the token accumulation on `entries.length > 0`
+		// (as the entry/session bookkeeping below is) would silently drop those tokens
+		// from conversationTokens. Token accounting and entry accounting are
+		// independent concerns, so accumulate tokens here, before the entries gate.
+		conversationTokens += result.usageTokens ?? 0;
+
 		if (result.entries.length > 0) {
 			sessionTranscripts.push({
 				sessionId: session.sessionId,
@@ -2968,7 +3042,7 @@ async function readAllTranscripts(
 		await saveCursor(result.newCursor, cwd);
 	}
 
-	return { sessionTranscripts, totalEntries, humanEntries };
+	return { sessionTranscripts, totalEntries, humanEntries, conversationTokens };
 }
 
 /**

@@ -36,6 +36,20 @@ export interface SelectAllCtx {
 }
 
 /**
+ * Narrow view of FilesStore used by the unified Current-Memory select-all:
+ * `selectionSummary()` to read the visible-file selection state without
+ * mutating it, `selectAll(target)` to apply one explicit target.
+ */
+export interface FilesSelectAll {
+	selectionSummary(): { total: number; allSelected: boolean };
+	selectAll(target: boolean): void;
+}
+
+export interface SelectAllCurrentMemoryCtx extends SelectAllCtx {
+	readonly filesStore: FilesSelectAll;
+}
+
+/**
  * Flip selection state for all visible conversations.
  * Matches `FilesStore.toggleSelectAll()` / the design spec: only when every
  * visible row is currently selected does the click deselect all; in every
@@ -86,5 +100,64 @@ export async function selectAllPlansAndNotesCommand(
 	await setAllExcluded(ctx.cwd, "notes", noteKeys, target);
 	await setAllExcluded(ctx.cwd, "references", referenceKeys, target);
 	await ctx.plansProvider.refreshExclusions();
+	await ctx.onChanged();
+}
+
+/**
+ * Unified select / deselect for the whole "Current Memory" block — flips
+ * Conversations, Context (plans / notes / references) AND Files together so the
+ * three sub-sections stay in sync from a single header button.
+ *
+ * The target is computed once across all three groups BEFORE any mutation:
+ * only when every existing item in every group is currently selected does the
+ * click deselect everything; in every other state (none, or mixed across
+ * groups) it selects everything. This is what makes the combined button
+ * deterministic — firing the three per-group toggle commands instead would let
+ * each group flip on its own state and desync (e.g. conversations deselect
+ * while files select). An empty group never blocks the all-selected verdict.
+ */
+export async function selectAllCurrentMemoryCommand(
+	ctx: SelectAllCurrentMemoryCtx,
+): Promise<void> {
+	const { items: conversations } =
+		await ctx.activeSessions.listWithDiagnostics();
+	const conversationKeys = conversations.map((it) =>
+		conversationKey(it.source, it.sessionId),
+	);
+	// `isSelected !== false` because "absence of a record means included".
+	const conversationsAllSelected = conversations.every(
+		(it) => it.isSelected !== false,
+	);
+
+	const rows = ctx.plansProvider.serialize();
+	const planKeys = rows.filter((r) => r.contextValue === "plan").map((r) => r.id);
+	const noteKeys = rows.filter((r) => r.contextValue === "note").map((r) => r.id);
+	const referenceKeys = rows
+		.filter((r) => r.contextValue === "reference")
+		.map((r) => r.id);
+	const contextAllSelected = rows.every((r) => r.isSelected !== false);
+
+	const files = ctx.filesStore.selectionSummary();
+
+	// All-selected only when every NON-empty group is fully selected and at
+	// least one group has items (so the button is a no-op on a fully empty
+	// Current Memory rather than flipping an imaginary "all").
+	const total = conversations.length + rows.length + files.total;
+	const allSelected =
+		total > 0 &&
+		(conversations.length === 0 || conversationsAllSelected) &&
+		(rows.length === 0 || contextAllSelected) &&
+		(files.total === 0 || files.allSelected);
+	// excluded = allSelected → deselect everything; otherwise select everything.
+	const target = allSelected;
+
+	await setAllExcluded(ctx.cwd, "conversations", conversationKeys, target);
+	await setAllExcluded(ctx.cwd, "plans", planKeys, target);
+	await setAllExcluded(ctx.cwd, "notes", noteKeys, target);
+	await setAllExcluded(ctx.cwd, "references", referenceKeys, target);
+	await ctx.plansProvider.refreshExclusions();
+	// Files use the inverse boolean — selectAll(true) = "select", whereas
+	// setAllExcluded(true) = "exclude / deselect".
+	ctx.filesStore.selectAll(!target);
 	await ctx.onChanged();
 }

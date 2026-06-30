@@ -155,6 +155,32 @@ describe("CommitsStore — checkbox behaviour", () => {
 		store.toggleSelectAll();
 		expect(store.getSnapshot().selectedCommits).toHaveLength(0);
 	});
+
+	it("clearSelection unconditionally drops all selections (squash enter/exit)", async () => {
+		const store = new CommitsStore(
+			makeBridge(() =>
+				makeResult([makeCommit("aaa1"), makeCommit("bbb2")]),
+			) as never,
+		);
+		await store.refresh();
+		store.onCheckboxToggle("bbb2", true);
+		expect(store.getSnapshot().selectedCommits).toHaveLength(2);
+		store.clearSelection();
+		expect(store.getSnapshot().selectedCommits).toHaveLength(0);
+	});
+
+	it("clearSelection is a no-op (no snapshot push) when nothing is selected", async () => {
+		const store = new CommitsStore(
+			makeBridge(() =>
+				makeResult([makeCommit("aaa1"), makeCommit("bbb2")]),
+			) as never,
+		);
+		await store.refresh();
+		const listener = vi.fn();
+		store.onChange(listener);
+		store.clearSelection();
+		expect(listener).not.toHaveBeenCalled();
+	});
 });
 
 describe("CommitsStore — getCommitFiles cache", () => {

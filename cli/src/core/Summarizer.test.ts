@@ -81,6 +81,7 @@ function summaryLlmResult(text: string, overrides: Partial<LlmCallResult> = {}):
 		model: "claude-sonnet-4-6",
 		inputTokens: 100,
 		outputTokens: 50,
+		cachedTokens: 0,
 		apiLatencyMs: 123,
 		stopReason: "end_turn",
 		// Default to direct config-key path for test brevity. Tests that

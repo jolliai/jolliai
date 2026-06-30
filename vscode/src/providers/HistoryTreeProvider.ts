@@ -19,7 +19,7 @@ import { basename } from "node:path";
 import * as vscode from "vscode";
 import type { CommitsStore } from "../stores/CommitsStore.js";
 import type { BranchCommit, CommitFileInfo } from "../Types.js";
-import { escMd, formatRelativeDate } from "../util/FormatUtils.js";
+import { formatShortRelativeDate } from "../util/FormatUtils.js";
 import type {
 	MemoryHover,
 	SerializedTreeItem,
@@ -106,7 +106,6 @@ export class CommitItem extends vscode.TreeItem {
 		this.contextValue = commit.hasSummary
 			? CONTEXT_WITH_MEMORY
 			: CONTEXT_NO_MEMORY;
-		this.tooltip = buildTooltip(commit);
 	}
 }
 
@@ -155,7 +154,27 @@ export class HistoryTreeProvider
 
 	private readonly unsubscribe: () => void;
 
-	constructor(private readonly store: CommitsStore) {
+	/**
+	 * Optional summary lookup used by serializeNode to populate jolliDocUrl,
+	 * e2eCount, and conversationTokens on committed memory rows. The callback
+	 * receives a commit hash and should return an object with those fields (or
+	 * null/undefined on miss). Kept out-of-band from CommitsStore so the store
+	 * remains a pure BranchCommit list without an extra per-commit round-trip
+	 * for every refresh.
+	 *
+	 * When absent, none of the three fields are set on the serialized item.
+	 */
+	private readonly lookupSummary?: (
+		hash: string,
+	) => Promise<{ jolliDocUrl?: string; e2eCount?: number; conversationTokens?: number } | null | undefined>;
+
+	constructor(
+		private readonly store: CommitsStore,
+		lookupSummary?: (
+			hash: string,
+		) => Promise<{ jolliDocUrl?: string; e2eCount?: number; conversationTokens?: number } | null | undefined>,
+	) {
+		this.lookupSummary = lookupSummary;
 		this.unsubscribe = store.onChange((snap) => {
 			void this.syncContextKeys(
 				snap.isEnabled && snap.singleCommitMode,
@@ -203,8 +222,35 @@ export class HistoryTreeProvider
 		return "multi";
 	}
 
+	/**
+	 * Resolves a commit's summary once per `serialize()` pass.
+	 *
+	 * `lookupSummary` (= `bridge.getSummary`) is an UNCACHED storage read — a
+	 * `git show` / file read per call. Without memoization a single Branch
+	 * refresh that lists the same hash more than once (or re-serializes after a
+	 * cheap change) would issue N duplicate uncached reads. The `memo` map is
+	 * created fresh in `serialize()` and shared across the whole recursive pass,
+	 * so each hash is read at most once per refresh. Stores the in-flight
+	 * Promise (not the resolved value) so concurrent `Promise.all` siblings for
+	 * the same hash share one read.
+	 */
+	private lookupSummaryMemoized(
+		hash: string,
+		memo: Map<string, ReturnType<NonNullable<typeof this.lookupSummary>>>,
+	): ReturnType<NonNullable<typeof this.lookupSummary>> {
+		const cached = memo.get(hash);
+		if (cached) {
+			return cached;
+		}
+		// lookupSummary is guaranteed defined by the caller's guard.
+		const p = (this.lookupSummary as NonNullable<typeof this.lookupSummary>)(hash);
+		memo.set(hash, p);
+		return p;
+	}
+
 	private async serializeNode(
 		item: CommitItem | CommitFileItem,
+		memo: Map<string, ReturnType<NonNullable<typeof this.lookupSummary>>>,
 	): Promise<SerializedTreeItem> {
 		// CommitItem has a stable id (commit hash) set directly; use it as idHint.
 		// CommitFileItem already has id set to "commitHash:relativePath", so use that directly.
@@ -219,11 +265,35 @@ export class HistoryTreeProvider
 			// In single-commit / merged modes checkboxState is left undefined
 			// (see getChildren above), so isSelected falls to false and the
 			// webview gates checkbox rendering on commitsMode === 'multi'.
+			//
+			// jolliDocUrl: read from the full summary via the optional lookupSummary
+			// callback. Only fetched when the commit has a memory — avoids a
+			// superfluous async call for code-only commits. Undefined when
+			// lookupSummary is not provided (e.g. in tests) or the summary is
+			// missing.
+			let jolliDocUrl: string | undefined;
+			let e2eCount: number | undefined;
+			let conversationTokens: number | undefined;
+			if (item.commit.hasSummary && this.lookupSummary) {
+				try {
+					const s = await this.lookupSummaryMemoized(item.commit.hash, memo);
+					jolliDocUrl = s?.jolliDocUrl;
+					e2eCount = s?.e2eCount;
+					conversationTokens = s?.conversationTokens;
+				} catch {
+					// Graceful fallback — leave all three fields undefined so the row
+					// renders in a degraded-but-safe state. Matches the per-commit
+					// getChildren degradation pattern (line ~291).
+				}
+			}
 			enriched = {
 				...base,
 				hasMemory: !!item.commit.hasSummary,
 				hover: buildHover(item.commit),
 				isSelected: item.checkboxState === vscode.TreeItemCheckboxState.Checked,
+				...(jolliDocUrl !== undefined && { jolliDocUrl }),
+				...(e2eCount !== undefined && { e2eCount }),
+				...(conversationTokens !== undefined && { conversationTokens }),
 			};
 		} else {
 			// CommitFileItem: surface the four fields needed to dispatch
@@ -253,7 +323,7 @@ export class HistoryTreeProvider
 			try {
 				const kidsRaw = await this.getChildren(item);
 				const kids = await Promise.all(
-					kidsRaw.map((k) => this.serializeNode(k)),
+					kidsRaw.map((k) => this.serializeNode(k, memo)),
 				);
 				return Object.assign({}, enriched, { children: kids });
 			} catch {
@@ -265,7 +335,9 @@ export class HistoryTreeProvider
 
 	async serialize(): Promise<ReadonlyArray<SerializedTreeItem>> {
 		const tops = await this.getChildren();
-		return Promise.all(tops.map((it) => this.serializeNode(it)));
+		// Per-pass memo: one uncached summary read per hash for this whole refresh.
+		const memo = new Map<string, ReturnType<NonNullable<typeof this.lookupSummary>>>();
+		return Promise.all(tops.map((it) => this.serializeNode(it, memo)));
 	}
 
 	private async syncContextKeys(
@@ -336,44 +408,14 @@ function buildStatsLine(c: BranchCommit): string {
 function buildHover(c: BranchCommit): MemoryHover {
 	return {
 		message: c.message,
-		relativeDate: formatRelativeDate(c.date),
+		// Compact relative form ("2h ago", "3d ago") for the row subline — the
+		// verbose formatRelativeDate ("… (absolute date)") stays on the
+		// MarkdownString tooltip below, but the subline wants the short style.
+		relativeDate: formatShortRelativeDate(c.date),
 		commitType: c.commitType,
 		shortHash: c.shortHash,
 		statsLine: buildStatsLine(c),
 	};
-}
-
-function buildTooltip(c: BranchCommit): vscode.MarkdownString {
-	const md = new vscode.MarkdownString("", true);
-	md.isTrusted = true;
-
-	const relativeDate = formatRelativeDate(c.date);
-	md.appendMarkdown(
-		`**${escMd(c.author)}**  $(clock) ${escMd(relativeDate)}\n\n`,
-	);
-
-	if (c.commitType) {
-		md.appendMarkdown(`$(tag) ${escMd(c.commitType)}\n\n`);
-	}
-
-	md.appendMarkdown(`${escMd(c.message)}\n\n`);
-	md.appendMarkdown("---\n\n");
-
-	md.appendMarkdown(`${buildStatsLine(c)}\n\n`);
-
-	md.appendMarkdown("---\n\n");
-
-	const hashArg = encodeURIComponent(JSON.stringify([c.hash]));
-	const copyLink = `[$(git-commit) \`${c.shortHash}\` $(copy)](command:jollimemory.copyCommitHash?${hashArg})`;
-
-	if (c.hasSummary) {
-		const viewLink = `[$(eye) View Memory](command:jollimemory.viewSummary?${hashArg})`;
-		md.appendMarkdown(`${copyLink}  |  ${viewLink}`);
-	} else {
-		md.appendMarkdown(copyLink);
-	}
-
-	return md;
 }
 
 // Re-exported helper (kept for backward compat with old test imports).

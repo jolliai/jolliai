@@ -249,6 +249,13 @@ export interface LlmCallResult {
 	readonly model?: string;
 	readonly inputTokens: number;
 	readonly outputTokens: number;
+	/**
+	 * Prompt-cache tokens for this call: cache_read + cache_creation input
+	 * tokens. Anthropic counts these separately from `input_tokens` (which is
+	 * the uncached prompt), so input + cached + output ≈ the billed total.
+	 * Surfaced in the VS Code token-usage bar's "cached" segment.
+	 */
+	readonly cachedTokens: number;
 	readonly apiLatencyMs: number;
 	/** Stop reason from the API (e.g. "end_turn"); undefined in proxy mode */
 	readonly stopReason?: string | null;
@@ -493,6 +500,7 @@ async function callDirect(
 		model: response.model,
 		inputTokens: response.usage.input_tokens,
 		outputTokens: response.usage.output_tokens,
+		cachedTokens: (response.usage.cache_read_input_tokens ?? 0) + (response.usage.cache_creation_input_tokens ?? 0),
 		apiLatencyMs: elapsed,
 		stopReason: response.stop_reason,
 		source,
@@ -605,6 +613,7 @@ async function callProxy(
 		text: result.text as string | undefined,
 		inputTokens: (result.inputTokens as number) ?? 0,
 		outputTokens: (result.outputTokens as number) ?? 0,
+		cachedTokens: (result.cachedTokens as number) ?? 0,
 		apiLatencyMs: elapsed,
 		source,
 	};

@@ -110,6 +110,13 @@ export function aggregateTurns(node: CommitSummary): number {
 	return own + childTurns;
 }
 
+/** Recursively sums conversationTokens across the entire tree. */
+export function aggregateConversationTokens(node: CommitSummary): number {
+	const own = node.conversationTokens ?? 0;
+	const childTokens = (node.children ?? []).reduce((acc, c) => acc + aggregateConversationTokens(c), 0);
+	return own + childTokens;
+}
+
 /** Recursively counts total topics across the entire tree. */
 export function countTopics(node: CommitSummary): number {
 	const own = node.topics?.length ?? 0;

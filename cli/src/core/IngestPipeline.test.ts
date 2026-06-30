@@ -46,6 +46,7 @@ const llmText = (_action: string, text: string) => ({
 	stopReason: "end_turn",
 	inputTokens: 0,
 	outputTokens: 0,
+	cachedTokens: 0,
 	apiLatencyMs: 0,
 	source: "anthropic-config" as const,
 });
@@ -388,6 +389,7 @@ describe("ingestPendingBatch", () => {
 			stopReason: "max_tokens",
 			inputTokens: 0,
 			outputTokens: 0,
+			cachedTokens: 0,
 			apiLatencyMs: 0,
 			source: "anthropic-config",
 		});
@@ -417,6 +419,7 @@ describe("ingestPendingBatch", () => {
 				stopReason: "max_tokens",
 				inputTokens: 0,
 				outputTokens: 0,
+				cachedTokens: 0,
 				apiLatencyMs: 0,
 				source: "anthropic-config",
 			}); // storage fails
@@ -689,6 +692,7 @@ describe("ingestPendingBatch", () => {
 			stopReason: "end_turn",
 			inputTokens: 0,
 			outputTokens: 0,
+			cachedTokens: 0,
 			apiLatencyMs: 0,
 			source: "anthropic-config",
 		});
@@ -710,6 +714,7 @@ describe("ingestPendingBatch", () => {
 				stopReason: "end_turn",
 				inputTokens: 0,
 				outputTokens: 0,
+				cachedTokens: 0,
 				apiLatencyMs: 0,
 				source: "anthropic-config",
 			});
@@ -770,6 +775,7 @@ describe("drainIngest", () => {
 						stopReason: "max_tokens",
 						inputTokens: 0,
 						outputTokens: 0,
+						cachedTokens: 0,
 						apiLatencyMs: 0,
 						source: "anthropic-config" as const,
 					},

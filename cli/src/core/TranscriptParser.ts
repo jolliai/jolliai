@@ -22,6 +22,7 @@ const log = createLogger("TranscriptParser");
  */
 export interface TranscriptParser {
 	parseLine(line: string, lineNum: number): TranscriptEntry | null;
+	parseUsageTokens?(line: string, lineNum: number): number;
 }
 
 /**
@@ -31,6 +32,32 @@ export interface TranscriptParser {
 export class ClaudeTranscriptParser implements TranscriptParser {
 	parseLine(line: string, lineNum: number): TranscriptEntry | null {
 		return parseTranscriptLine(line, lineNum);
+	}
+
+	parseUsageTokens(line: string, _lineNum?: number): number {
+		try {
+			const o = JSON.parse(line) as {
+				message?: { usage?: Record<string, unknown> };
+				usage?: Record<string, unknown>;
+			};
+			const u = o.message?.usage ?? o.usage;
+			if (!u || typeof u !== "object") return 0;
+			const n = (k: string) => (typeof u[k] === "number" ? (u[k] as number) : 0);
+			// Per-turn token *delta* only — deliberately EXCLUDES cache_read_input_tokens.
+			// Real Claude transcripts (~/.claude/projects/*/*.jsonl) emit a cumulative
+			// cache_read_input_tokens on every assistant turn: it is the running total of
+			// the cached prefix re-read so far, so it grows monotonically across turns
+			// (e.g. 16036 → 26231 → 50109 → … within one session). Summing it across the
+			// turns of a slice re-counts the cached prefix on every turn and inflates
+			// conversationTokens by an order of magnitude. The genuine new spend per turn
+			// is input (uncached input) + cache_creation (the portion newly written to the
+			// cache this turn) + output; the cache *read* of an already-counted prefix is
+			// not new work and must not be summed. See the fixture-backed test for the
+			// observed cumulative shape.
+			return n("input_tokens") + n("cache_creation_input_tokens") + n("output_tokens");
+		} catch {
+			return 0;
+		}
 	}
 }
 

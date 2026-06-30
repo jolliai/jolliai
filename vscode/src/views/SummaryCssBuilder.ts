@@ -1557,24 +1557,11 @@ export function buildCss(): string {
   .attach-card-body .section-header { display: none; }
   .attach-card-body .section-title { display: none; }
 
-  /* ── Private drawer (demoted to bottom, collapsible) ── */
-  .private-drawer {
-    border: 1px dashed var(--private-zone-border); border-radius: 10px;
-    background: var(--private-zone-bg); margin-top: 8px; overflow: hidden;
-  }
-  .private-head { display: flex; align-items: center; gap: 9px; padding: 11px 14px; cursor: pointer; user-select: none; }
-  .private-head:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: -2px; }
-  .private-lock { font-size: 0.92em; }
-  .private-title { font-weight: 650; font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.05em; }
-  .private-badge { font-size: 0.62em; font-weight: 700; letter-spacing: 0.1em; padding: 1px 6px; border-radius: 4px; background: var(--private-zone-border); color: var(--vscode-editor-background); }
-  .private-count { color: var(--text-secondary); font-size: 0.82em; }
-  .private-head .attach-arrow { color: var(--text-secondary); }
-  .private-drawer.collapsed .attach-arrow { transform: rotate(-90deg); }
-  .private-drawer.collapsed .private-body { display: none; }
-  /* the drawer head replaces the inner private-zone chrome; keep Manage/View */
-  .private-body .private-zone { border: none; background: none; padding: 0 14px 12px; margin: 0; }
-  .private-body .private-zone .section-title { display: none; }
-  .private-body .private-zone-watermark { display: none; }
+  /* ── Conversations section (top-level, no private drawer chrome) ── */
+  .conversations-section .private-zone { border: none; background: none; padding: 0; margin: 0; }
+  .conversations-section .private-zone .section-title { display: none; }
+  .conversations-section .private-zone-watermark { display: none; }
+  .conversations-section .section-header { margin-bottom: 8px; }
 
   @media (prefers-reduced-motion: reduce) {
     .attach-arrow, .ship-status.is-loading .led { transition: none; animation: none; }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { CommitSummary } from "../Types.js";
 import {
+	aggregateConversationTokens,
 	aggregateStats,
 	aggregateTurns,
 	collectAllTopics,
@@ -163,6 +164,21 @@ describe("SummaryTree", () => {
 		it("sums across tree", () => {
 			// D(0) + B(5) + C(1) + A(8) = 14
 			expect(aggregateTurns(D)).toBe(14);
+		});
+	});
+
+	describe("aggregateConversationTokens", () => {
+		it("sums own and children tokens", () => {
+			const child1 = leaf({ commitHash: "t1", conversationTokens: 200 });
+			const child2 = leaf({ commitHash: "t2", conversationTokens: 300 });
+			const node: CommitSummary = { ...D, conversationTokens: 100, children: [child1, child2] };
+			// node(100) + child1(200) + child2(300) = 600
+			expect(aggregateConversationTokens(node)).toBe(600);
+		});
+
+		it("returns 0 when no conversationTokens anywhere", () => {
+			const node: CommitSummary = { ...D, conversationTokens: undefined, children: [] };
+			expect(aggregateConversationTokens(node)).toBe(0);
 		});
 	});
 
