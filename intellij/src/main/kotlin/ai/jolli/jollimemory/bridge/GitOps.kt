@@ -68,10 +68,15 @@ class GitOps(private val projectDir: String) {
         return basePath
     }
 
+    /** Full result of a git invocation — exit code plus captured stdout and stderr. */
+    data class ExecResult(val exitCode: Int, val stdout: String, val stderr: String)
+
     /**
-     * Runs a git command and returns stdout, or null on failure.
+     * Runs a git command and returns the full [ExecResult] (exit code, stdout, stderr).
+     * Callers that need to classify failures (e.g. non-fast-forward detection) use this
+     * instead of [exec] which discards stderr on failure.
      */
-    fun exec(vararg args: String, timeoutSeconds: Long = 15, trim: Boolean = true): String? {
+    fun execWithResult(vararg args: String, timeoutSeconds: Long = 15, trim: Boolean = true): ExecResult {
         return try {
             val cmdArgs = mutableListOf("git")
             cmdArgs.addAll(args)
@@ -79,37 +84,47 @@ class GitOps(private val projectDir: String) {
             val pb = ProcessBuilder(cmdArgs)
                 .directory(File(projectDir))
                 .redirectErrorStream(false)
-            // Inject the user's full PATH so git hooks can find node (nvm/homebrew)
             pb.environment()["PATH"] = shellPath
             val process = pb.start()
 
-            // Read stdout on a separate thread to avoid pipe buffer deadlock.
-            // If stdout exceeds the OS pipe buffer (~64 KB) and we wait for the
-            // process to finish before reading, the process blocks on write and
-            // we block on waitFor → deadlock → timeout.
+            // Read stdout and stderr concurrently to avoid pipe buffer deadlock.
             val stdoutFuture = java.util.concurrent.CompletableFuture.supplyAsync {
                 process.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            }
+            val stderrFuture = java.util.concurrent.CompletableFuture.supplyAsync {
+                process.errorStream.bufferedReader(Charsets.UTF_8).use { it.readText().trim() }
             }
 
             val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
             if (!completed) {
                 process.destroyForcibly()
                 stdoutFuture.cancel(true)
+                stderrFuture.cancel(true)
                 log.warn("Git command timed out: %s (cwd=%s)", args.toList(), projectDir)
-                return null
+                return ExecResult(-1, "", "Timed out after ${timeoutSeconds}s")
             }
 
-            if (process.exitValue() != 0) {
-                val stderr = process.errorStream.bufferedReader(Charsets.UTF_8).use { it.readText().trim() }
-                log.warn("Git command exit=%d: %s stderr=%s (cwd=%s)", process.exitValue(), args.toList(), stderr.take(200), projectDir)
-                return null
+            val exitCode = process.exitValue()
+            val stdout = stdoutFuture.get(5, TimeUnit.SECONDS)
+            val stderr = stderrFuture.get(5, TimeUnit.SECONDS)
+            if (exitCode != 0) {
+                log.warn("Git command exit=%d: %s stderr=%s (cwd=%s)", exitCode, args.toList(), stderr.take(200), projectDir)
             }
-            val output = stdoutFuture.get(5, TimeUnit.SECONDS)
-            if (trim) output?.trim() else output?.trimEnd()
+            val out = if (trim) stdout.trim() else stdout.trimEnd()
+            ExecResult(exitCode, out, stderr)
         } catch (e: Exception) {
             log.warn("Git command exception: %s: %s (cwd=%s)", args.toList(), e.message, projectDir)
-            null
+            ExecResult(-1, "", e.message ?: e.toString())
         }
+    }
+
+    /**
+     * Runs a git command and returns stdout, or null on failure.
+     * Delegates to [execWithResult] — use that directly when stderr is needed.
+     */
+    fun exec(vararg args: String, timeoutSeconds: Long = 15, trim: Boolean = true): String? {
+        val result = execWithResult(*args, timeoutSeconds = timeoutSeconds, trim = trim)
+        return if (result.exitCode == 0) result.stdout else null
     }
 
     /** Check if a branch exists. */
