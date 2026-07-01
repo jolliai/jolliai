@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.99.4
+
+### Changes
+
+- **Selection is now a one-time discard** — unchecking a conversation, plan, note, or reference in CONTEXT now removes it from the working area when you commit, instead of keeping it around to re-check later. Unchecked conversations are consumed (they leave the list) but their content is dropped from the summary; unchecked plans/notes/references have their working-area entries removed without being saved into committed memory. Your own `~/.claude/plans` files and external note sources are never deleted
+- **Plans surface from your session** — plans now appear in CONTEXT via transcript discovery (matching the VS Code extension) rather than scanning `~/.claude/plans`, so a plan shows up only once you actually create or edit it in a session, and the panel refreshes live as plans and references are discovered
+- **Working-area items follow you across branches** — uncommitted plans, notes, and references are no longer hidden when you switch branches; only committed memory stays branch-tagged
+
+### Fixes & Improvements
+
+- Fixed a race condition when opening a file from the Current Memory review
+- Cleared a JetBrains Marketplace verifier warning for the terminal-based "Resume in terminal" action
+
 ## 0.99.3
 
 ### UI
