@@ -65,6 +65,7 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		associateNoteWithCommit: vi.fn().mockResolvedValue(undefined),
 		associateReferenceWithCommit: vi.fn().mockResolvedValue(undefined),
 		detectUncommittedReferenceIds: vi.fn().mockResolvedValue([]),
+		discardExcludedWorkingItems: vi.fn().mockResolvedValue({ plans: 0, notes: 0, references: 0 }),
 		detectActivePlansForBranch: vi.fn().mockResolvedValue([]),
 		detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
 		getReferenceEntriesForBranch: vi.fn().mockResolvedValue([]),
@@ -267,6 +268,7 @@ import {
 	detectActiveNotesForBranch,
 	detectActivePlansForBranch,
 	detectUncommittedReferenceIds,
+	discardExcludedWorkingItems,
 	getReferenceEntriesForBranch,
 	loadAllSessions,
 	loadConfig,
@@ -406,11 +408,12 @@ describe("QueueWorker selection filter", () => {
 		expect(capturedSessions).toHaveLength(1);
 	});
 
-	it("does not advance the cursor for an excluded conversation", async () => {
-		// Regression: when the worker advanced cursors for excluded sessions, the
-		// sidebar's "messageCount > 0" filter dropped them on the next 60-second
-		// refresh — making the *unchecked* rows disappear alongside the committed
-		// ones. The fix is to skip the read entirely for excluded sessions.
+	it("advances the cursor for an excluded conversation (discard)", async () => {
+		// Selection is a one-time discard: an unchecked conversation is consumed
+		// (cursor → commit boundary) so it leaves the working area on the next
+		// refresh, even though its entries never enter the summary. So the excluded
+		// session IS read and its cursor IS advanced — it is just dropped from the
+		// summary input (verified elsewhere).
 		const claudeSessionId = "claude-sess-excluded";
 		seedGitMocks(projectDir);
 		seedClaudeSession(claudeSessionId, "EXCLUDED_CONTENT");
@@ -419,8 +422,8 @@ describe("QueueWorker selection filter", () => {
 
 		await executePipeline(projectDir, makeCommitOp());
 
-		expect(vi.mocked(saveCursor)).not.toHaveBeenCalled();
-		expect(vi.mocked(readTranscript)).not.toHaveBeenCalled();
+		expect(vi.mocked(saveCursor)).toHaveBeenCalled();
+		expect(vi.mocked(readTranscript)).toHaveBeenCalled();
 	});
 
 	it("advances the cursor for a non-excluded conversation", async () => {
@@ -433,7 +436,9 @@ describe("QueueWorker selection filter", () => {
 		expect(vi.mocked(saveCursor)).toHaveBeenCalledTimes(1);
 	});
 
-	it("does not advance the cursor for an excluded conversation on the amend path", async () => {
+	it("advances the cursor for an excluded conversation on the amend path (discard)", async () => {
+		// The amend path shares loadSessionTranscripts, so excluded conversations are
+		// discarded there too: consumed (cursor advanced) but dropped from the summary.
 		const claudeSessionId = "claude-sess-amend-excluded";
 		seedGitMocks(projectDir);
 		seedClaudeSession(claudeSessionId, "EXCLUDED_AMEND_CONTENT");
@@ -443,8 +448,26 @@ describe("QueueWorker selection filter", () => {
 		const amendOp = makeCommitOp({ type: "amend", sourceHashes: ["old-hash-0001"] });
 		await executePipeline(projectDir, amendOp);
 
-		expect(vi.mocked(saveCursor)).not.toHaveBeenCalled();
-		expect(vi.mocked(readTranscript)).not.toHaveBeenCalled();
+		expect(vi.mocked(saveCursor)).toHaveBeenCalled();
+		expect(vi.mocked(readTranscript)).toHaveBeenCalled();
+	});
+
+	it("discards excluded plans/notes/references after archival (commit path)", async () => {
+		seedGitMocks(projectDir);
+		vi.mocked(loadAllSessions).mockResolvedValue([]);
+		vi.mocked(buildMultiSessionContext).mockReturnValue("");
+
+		await setExcluded(projectDir, "plans", "plan-skip", true);
+		await setExcluded(projectDir, "notes", "note-skip", true);
+		await setExcluded(projectDir, "references", "linear:L-9", true);
+
+		await executePipeline(projectDir, makeCommitOp());
+
+		expect(vi.mocked(discardExcludedWorkingItems)).toHaveBeenCalledTimes(1);
+		const arg = vi.mocked(discardExcludedWorkingItems).mock.calls[0][0];
+		expect(arg.plans.has("plan-skip")).toBe(true);
+		expect(arg.notes.has("note-skip")).toBe(true);
+		expect(arg.references.has("linear:L-9")).toBe(true);
 	});
 
 	it("filters excluded plans out of the plans block input", async () => {

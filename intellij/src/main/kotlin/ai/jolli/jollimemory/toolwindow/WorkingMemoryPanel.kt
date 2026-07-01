@@ -159,7 +159,7 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             emptyList()
         }
 
-        val context = gatherContext(branch, exclusions)
+        val context = gatherContext(exclusions)
         val detectedTicket = context.firstOrNull { it.tag == "L" || it.tag == "J" }
             ?.let { Regex("[A-Z]+-\\d+").find(it.title)?.value }
             ?: Regex("[A-Z]+-\\d+").find(branch)?.value
@@ -236,28 +236,26 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
      * minus anything the user unchecked in the CONTEXT list (same exclusion keys
      * the CONTEXT panel and PostCommitHook use: plan slug, note id, reference map key).
      */
-    private fun gatherContext(branch: String, exclusions: CommitSelectionStore.CommitExclusions): List<WmContext> {
+    private fun gatherContext(exclusions: CommitSelectionStore.CommitExclusions): List<WmContext> {
         val out = mutableListOf<WmContext>()
         try {
             val registry = SessionTracker.loadPlansRegistry(cwd)
+            // No branch filter on any kind: uncommitted working-area items follow the
+            // user across branches (matches CLI/VS Code). `branch` is stamped but not
+            // filtered on; only committed memory is branch-tagged.
             registry.plans.values.forEach { p ->
                 if (p.slug in exclusions.plans) return@forEach
                 if (p.ignored == true || p.commitHash != null) return@forEach
-                if (!p.branch.isNullOrBlank() && p.branch != branch) return@forEach
                 if (!File(p.sourcePath).exists()) return@forEach
                 out.add(WmContext("P", p.title))
             }
             registry.notes?.values?.forEach { n ->
                 if (n.id in exclusions.notes) return@forEach
                 if (n.ignored == true || n.commitHash != null) return@forEach
-                if (n.branch.isNotBlank() && n.branch != branch) return@forEach
                 out.add(WmContext("N", n.title))
             }
             registry.references?.forEach { (mapKey, r) ->
                 if (mapKey in exclusions.references) return@forEach
-                // Branch-scope like plans/notes above: legacy blank-branch rows stay
-                // visible everywhere; a branch-stamped row only shows on its branch.
-                if (!r.branch.isNullOrBlank() && r.branch != branch) return@forEach
                 out.add(WmContext(referenceTag(r.source), r.title))
             }
         } catch (_: Exception) {
