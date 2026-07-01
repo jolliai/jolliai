@@ -65,6 +65,21 @@ export interface BuildHtmlOptions {
 	 */
 	readonly foreignRepoName?: string | null;
 	/**
+	 * Default kind of the header Share button — follows the panel's share
+	 * ENTRY (see SummaryScriptOptions.defaultShareKind). Persisted for the
+	 * panel's lifetime by SummaryWebviewPanel so re-renders keep the button
+	 * consistent with how the user opened the panel.
+	 */
+	readonly shareDefaultKind?: "branch" | "commit";
+	/**
+	 * One-shot: open the share modal (at `shareDefaultKind`) as soon as the
+	 * webview script loads. Set by the sidebar share entries via
+	 * `SummaryWebviewPanel.showWithShareModal` — the modal UI lives in this
+	 * webview, so the open call is baked into the script (see buildScript).
+	 * Ignored on readonly panels (they render no share modal at all).
+	 */
+	readonly autoOpenShare?: boolean;
+	/**
 	 * Full 40-char hash of the live root commit when the panel's commit has
 	 * been rewritten by amend / squash / rebase. The `.page` root receives
 	 * a `stale-readonly` hook class (parallel to `foreign-readonly`) so the
@@ -152,7 +167,7 @@ ${csp}
 <div class="${pageClass}">
 ${buildSummaryErrorBanner(summary, { readOnly })}
 ${staleBannerHtml}
-${buildHeader(summary, totalFiles, totalInsertions, totalDeletions, !!opts.foreignRepoName)}
+${buildHeader(summary, totalFiles, totalInsertions, totalDeletions, readOnly)}
 ${buildShipBar(summary)}
 ${buildMemoryPanel(summary, { readOnly })}
 ${buildE2ePanel(summary)}
@@ -160,9 +175,119 @@ ${buildConversationsSection(transcriptHashSet, !!opts.foreignRepoName)}
 ${buildAttachmentsPanel(summary, sourceNodes, planTranslateSet, noteTranslateSet, referenceTranslateSet)}
 ${buildFooter(summary)}
 </div>
-<script${nonceAttr}>${buildScript()}</script>
+${readOnly ? "" : buildShareModal()}
+<script${nonceAttr}>${buildScript(
+		readOnly
+			? {}
+			: { defaultShareKind: opts.shareDefaultKind ?? "commit", autoOpenShare: opts.autoOpenShare ?? false },
+	)}</script>
 </body>
 </html>`;
+}
+
+/**
+ * Inline share glyph — a tray with an up arrow, the same iconography as the
+ * sidebar's share entries. Inline SVG (not an icon font): this webview's CSP
+ * carries no `font-src`, so codicons can't load here; `currentColor` keeps the
+ * stroke matching the surrounding button/label text color.
+ */
+const SHARE_ICON_SVG = `<svg class="share-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 10V2.2M5.3 4.6 8 1.9l2.7 2.7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M5.2 7H4.2c-.7 0-1.2.5-1.2 1.2v4.4c0 .7.5 1.2 1.2 1.2h7.6c.7 0 1.2-.5 1.2-1.2V8.2c0-.7-.5-1.2-1.2-1.2h-1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`;
+
+/**
+ * Builds the hidden "Share this memory / branch" popover — a live, Space-backed share
+ * with an explicit create step for new links. The main pane shows the (mock)
+ * Collaborators list, the General-access selector, the "what travels" banner, a disabled
+ * transcript opt-in, Copy link, and a SYNCED status. The card is anchored under the Share
+ * button by the client script (`getBoundingClientRect`); the overlay is a transparent
+ * full-screen click-catcher (no dimming). The client toggles panes per share state and
+ * fills the collaborators list + link (see SummaryScriptBuilder).
+ */
+export function buildShareModal(): string {
+	return `
+<div class="share-overlay" id="shareOverlay" hidden>
+  <div class="share-modal share-popover" role="dialog" aria-modal="true" aria-labelledby="shareModalTitle">
+    <div class="share-modal-head">
+      <span class="share-modal-title">${SHARE_ICON_SVG}<span id="shareModalTitle">Share this memory</span></span>
+      <span class="share-head-right">
+        <span class="share-sync-badge" id="shareSyncBadge" hidden></span>
+        <button type="button" class="share-modal-close" id="shareModalClose" title="Close" aria-label="Close">&#x2715;</button>
+      </span>
+    </div>
+    <p class="share-modal-sub" id="shareModalSub"></p>
+
+    <div class="share-pane" id="sharePaneMain" hidden>
+      <div class="share-search-wrap">
+        <input type="text" class="share-search" id="shareTeammateSearch" placeholder="Search teammates by name or email…" aria-label="Search teammates or add an email" autocomplete="off" />
+        <div class="share-suggest" id="shareSuggest" hidden></div>
+      </div>
+
+      <div class="share-section-label">COLLABORATORS</div>
+      <div class="share-collab-list" id="shareCollabList" aria-label="Collaborators"></div>
+
+      <div class="share-section-label">GENERAL ACCESS</div>
+      <div class="share-access-row">
+        <span class="share-access-icon" aria-hidden="true">&#x1F441;</span>
+        <select class="share-select" id="shareVisibilitySelect" aria-label="Who can open this link">
+          <option value="org" id="shareOrgOption">Anyone at jolliai</option>
+          <option value="public">Anyone with the link</option>
+          <option value="people">Only people you add</option>
+        </select>
+      </div>
+      <p class="share-access-sub" id="shareAccessSub"></p>
+
+      <div class="share-travel-banner">
+        <span class="share-travel-icon" aria-hidden="true">&#x21C4;</span>
+        <span>Summaries + decisions + linked refs travel.<br /><strong>Conversation transcripts stay on your machine.</strong></span>
+      </div>
+
+      <label class="share-transcript-opt" title="Not available — transcripts stay on your machine.">
+        <input type="checkbox" id="shareIncludeTranscripts" disabled />
+        <span>Include conversation transcripts</span>
+        <span class="share-optin-badge">opt-in</span>
+      </label>
+
+      <input type="text" class="share-link-hidden" id="shareLinkInput" readonly aria-hidden="true" hidden />
+      <div class="share-modal-actions">
+        <button class="action-btn primary" id="shareCopyBtn" title="Copy the shareable link">&#x1F4CB; Copy link</button>
+      </div>
+    </div>
+
+    <div class="share-pane" id="sharePaneCreate" hidden>
+      <div class="share-section-label">GENERAL ACCESS</div>
+      <div class="share-access-row">
+        <span class="share-access-icon" aria-hidden="true">&#x1F441;</span>
+        <select class="share-select" id="shareCreateVisibilitySelect" aria-label="Who can open this link">
+          <option value="org" id="shareCreateOrgOption">Anyone at jolliai</option>
+          <option value="public">Anyone with the link</option>
+          <option value="people">Only people you add</option>
+        </select>
+      </div>
+      <p class="share-access-sub" id="shareCreateAccessSub"></p>
+
+      <div class="share-travel-banner">
+        <span class="share-travel-icon" aria-hidden="true">&#x21C4;</span>
+        <span>Summaries + decisions + linked refs travel.<br /><strong>Conversation transcripts stay on your machine.</strong></span>
+      </div>
+
+      <div class="share-modal-actions">
+        <button class="action-btn primary" id="shareCreateBtn" title="Create the share link">&#x1F517; Create link</button>
+      </div>
+    </div>
+
+    <div class="share-pane" id="sharePaneLoading" hidden>
+      <p class="share-loading"><span class="share-spinner" aria-hidden="true"></span><span id="shareLoadingLabel">Syncing to Jolli…</span></p>
+    </div>
+
+    <div class="share-pane" id="sharePaneNoKey" hidden>
+      <p class="share-nokey">Set your Jolli API Key first (STATUS panel → …) to share.</p>
+    </div>
+
+    <div class="share-pane" id="sharePaneError" hidden>
+      <p class="share-error-msg" id="shareErrorMsg"></p>
+      <div class="share-modal-actions"><button class="action-btn primary" id="shareRetryBtn">Try again</button></div>
+    </div>
+  </div>
+</div>`;
 }
 
 // ─── Header helpers ───────────────────────────────────────────────────────────
@@ -291,7 +416,7 @@ function buildHeader(
 	totalFiles: number,
 	totalInsertions: number,
 	totalDeletions: number,
-	isForeign: boolean = false,
+	readOnly: boolean = false,
 ): string {
 	const changesHtml = `${totalFiles} file${totalFiles !== 1 ? "s" : ""} changed, <span class="stat-add">${totalInsertions} insertion${totalInsertions !== 1 ? "s" : ""}(+)</span>, <span class="stat-del">${totalDeletions} deletion${totalDeletions !== 1 ? "s" : ""}(-)</span>`;
 	const totalTurns = aggregateTurns(summary);
@@ -354,7 +479,12 @@ function buildHeader(
       <button class="split-menu-item" id="downloadMdBtn" data-foreign-safe>Save as Markdown File</button>
     </div>
   </div>
-  ${isForeign ? "" : `<button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>`}
+  ${
+		readOnly
+			? ""
+			: `<button class="action-btn" id="shareBtn" title="Share this memory as a read-only link">${SHARE_ICON_SVG} Share</button>`
+	}
+  ${readOnly ? "" : `<button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>`}
 </div>`;
 }
 

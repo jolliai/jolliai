@@ -310,6 +310,57 @@ export async function getDefaultBranch(cwd?: string): Promise<string> {
 	return "main";
 }
 
+/** A distinct commit author of the repo, with how many commits they authored. */
+export interface RepoContributor {
+	readonly name: string;
+	readonly email: string;
+	readonly commitCount: number;
+}
+
+/**
+ * Whether an email looks deliverable — i.e. worth offering as a share recipient.
+ * Drops the placeholder addresses git history is full of (GitHub's privacy
+ * `noreply` addresses and the like), which a `mailto:` could never reach.
+ */
+function isDeliverableEmail(email: string): boolean {
+	const e = email.trim().toLowerCase();
+	if (!e.includes("@")) return false;
+	if (e.endsWith(".noreply.github.com") || e === "noreply@github.com") return false;
+	if (e.startsWith("noreply@") || e.startsWith("no-reply@")) return false;
+	return true;
+}
+
+/**
+ * Distinct commit authors of the repo (HEAD's history), most-commits-first — the
+ * people who participated in this repo, as candidate share recipients.
+ *
+ * Read-only and checkout-free; used only as a *source of candidate emails* for the
+ * share "send link to" picker — it never gates access. Deduped by lowercased
+ * email, with non-deliverable placeholder addresses (GitHub `noreply` etc.)
+ * filtered out so we never offer an address a `mailto:` can't reach. `max` caps the
+ * result. Returns `[]` when the repo has no commits or `git log` fails (e.g.
+ * outside a work tree).
+ */
+export async function getRepoContributors(cwd?: string, max = 200): Promise<RepoContributor[]> {
+	const result = await execGit(["log", "--no-merges", "--format=%an%x00%aE"], cwd);
+	if (result.exitCode !== 0) return [];
+	const byEmail = new Map<string, RepoContributor>();
+	for (const line of result.stdout.split("\n")) {
+		const [name, email] = line.split(NUL);
+		if (!email || !isDeliverableEmail(email)) continue;
+		const key = email.trim().toLowerCase();
+		const prev = byEmail.get(key);
+		byEmail.set(key, {
+			// `git log` streams newest-first, so keep the first (most recent) non-empty
+			// name we see — a contributor who has since renamed shows their current name.
+			name: prev?.name || (name?.trim() ?? ""),
+			email: email.trim(),
+			commitCount: (prev?.commitCount ?? 0) + 1,
+		});
+	}
+	return [...byEmail.values()].sort((a, b) => b.commitCount - a.commitCount).slice(0, max);
+}
+
 /**
  * Checks if an orphan branch exists.
  */

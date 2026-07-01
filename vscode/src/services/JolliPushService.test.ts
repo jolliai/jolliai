@@ -294,6 +294,48 @@ describe("pushToJolli", () => {
 		expect(parsedDocTypes).toEqual(["summary", "plan", "note"]);
 	});
 
+	it("round-trips summaryJson into the request body when present, and omits the key when absent", async () => {
+		const responseBody = JSON.stringify({
+			url: "u",
+			docId: 1,
+			jrn: "j",
+			created: true,
+		});
+		const writtenBodies: Array<string> = [];
+		mockHttpsRequest.mockImplementation(
+			(
+				_url: unknown,
+				_opts: unknown,
+				cb: (res: MockIncomingMessage) => void,
+			) => {
+				cb(createMockResponse(200, responseBody));
+				const req = createMockRequest();
+				req.write.mockImplementation((body: string) => {
+					writtenBodies.push(body);
+					return true;
+				});
+				return req;
+			},
+		);
+
+		const summaryJson = JSON.stringify({ version: 4, commitHash: "abc123" });
+		await pushToJolli("https://acme.jolli.ai", OLD_KEY, {
+			...DEFAULT_PAYLOAD,
+			docType: "summary",
+			summaryJson,
+		});
+		await pushToJolli("https://acme.jolli.ai", OLD_KEY, {
+			...DEFAULT_PAYLOAD,
+			docType: "summary",
+		});
+
+		expect(writtenBodies).toHaveLength(2);
+		const withField = JSON.parse(writtenBodies[0]) as Record<string, unknown>;
+		expect(withField.summaryJson).toBe(summaryJson);
+		const withoutField = JSON.parse(writtenBodies[1]) as Record<string, unknown>;
+		expect("summaryJson" in withoutField).toBe(false);
+	});
+
 	it("throws PluginOutdatedError on HTTP 426", async () => {
 		const responseBody = JSON.stringify({
 			message: "Please update your plugin.",
@@ -670,6 +712,32 @@ describe("pushToJolli", () => {
 		);
 	});
 
+	it("falls back to an empty repoUrl when both the 412 body and the payload omit it", async () => {
+		const responseBody = JSON.stringify({ error: "binding_required" });
+		const mockReq = createMockRequest();
+		const mockRes = createMockResponse(412, responseBody);
+
+		mockHttpsRequest.mockImplementation(
+			(
+				_url: unknown,
+				_opts: unknown,
+				cb: (res: MockIncomingMessage) => void,
+			) => {
+				cb(mockRes);
+				return mockReq;
+			},
+		);
+
+		// DEFAULT_PAYLOAD carries no repoUrl, so the error's repoUrl bottoms out at "".
+		const err = await pushToJolli(
+			"https://acme.jolli.ai",
+			OLD_KEY,
+			DEFAULT_PAYLOAD,
+		).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(BindingRequiredError);
+		expect((err as BindingRequiredError).repoUrl).toBe("");
+	});
+
 	it("does not treat unrelated 412 errors as BindingRequiredError", async () => {
 		const responseBody = JSON.stringify({ error: "precondition_failed" });
 		const mockReq = createMockRequest();
@@ -1005,5 +1073,29 @@ describe("deleteFromJolli", () => {
 
 		expect(mockHttpRequest).toHaveBeenCalledOnce();
 		expect(mockHttpsRequest).not.toHaveBeenCalled();
+	});
+
+	it("defaults the port to 80 for an http URL without an explicit port", async () => {
+		const mockReq = createMockRequest();
+		const mockRes: MockIncomingMessage = {
+			statusCode: 204,
+			on: vi.fn(),
+			resume: vi.fn(),
+		};
+
+		mockHttpRequest.mockImplementation(
+			(_opts: unknown, cb: (res: MockIncomingMessage) => void) => {
+				cb(mockRes);
+				return mockReq;
+			},
+		);
+
+		await deleteFromJolli("http://localhost", OLD_KEY, 42);
+
+		expect(mockHttpRequest).toHaveBeenCalledOnce();
+		const callArgs = mockHttpRequest.mock.calls[0] as [
+			{ port: number | string },
+		];
+		expect(callArgs[0].port).toBe(80);
 	});
 });

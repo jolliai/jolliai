@@ -15,8 +15,29 @@ import {
 import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
 import { buildTranscriptEntriesScript } from "./TranscriptEntryRenderer.js";
 
+/** Share-entry options threaded from the panel into the webview script. */
+export interface SummaryScriptOptions {
+	/**
+	 * Kind of the single header Share button — follows the panel's ENTRY so the
+	 * button stays consistent with how the user got here: opened via the
+	 * sidebar's "Share this branch" → `"branch"`; every other entry (commit
+	 * click, per-memory share icon) → `"commit"`. There is no ▾ menu — the
+	 * branch/memory choice lives in the sidebar's two share entries.
+	 */
+	readonly defaultShareKind?: "branch" | "commit";
+	/**
+	 * One-shot: open the share modal (at `defaultShareKind`) as soon as the
+	 * script loads — set when the panel was opened BY a share entry. Baked into
+	 * the script rather than posted from the host because a message sent right
+	 * after `webview.html` assignment can race the listener setup and get
+	 * dropped.
+	 */
+	readonly autoOpenShare?: boolean;
+}
+
 /** Returns the JavaScript for toggle interactions and the Copy Markdown button. */
-export function buildScript(): string {
+export function buildScript(options: SummaryScriptOptions = {}): string {
+	const defaultShareKind = options.defaultShareKind === "branch" ? "branch" : "commit";
 	return `
   ${buildContextMenuGuardScript()}
 
@@ -124,6 +145,355 @@ export function buildScript(): string {
     });
   }
 
+  // ── Share popover (live Space-backed share): this memory (commit) or whole branch ──
+  var shareOverlay = document.getElementById('shareOverlay');
+  var shareBtn = document.getElementById('shareBtn');
+  // Set on open; included in every share message so the host knows which subject
+  // (this commit vs whole branch) to act on. Defaults to commit (the primary button).
+  var shareKind = 'commit';
+  function sharePane(id) {
+    var panes = document.querySelectorAll('.share-pane');
+    for (var i = 0; i < panes.length; i++) { panes[i].hidden = (panes[i].id !== id); }
+  }
+  // Anchor the card under the Share button — the overlay is a transparent full-screen
+  // click-catcher with no DOM relationship to the button, so position it in JS.
+  function sharePositionCard() {
+    if (!shareBtn || !shareOverlay) { return; }
+    var card = shareOverlay.querySelector('.share-modal');
+    if (!card) { return; }
+    var r = shareBtn.getBoundingClientRect();
+    // The Share button is left-aligned in the header, so open the card RIGHTWARD from
+    // the button's left edge; clamp to the viewport so it never overflows (which looked
+    // like the sidebar was covering half of it).
+    var cardW = card.offsetWidth || 440;
+    var maxLeft = Math.max(8, window.innerWidth - cardW - 8);
+    var left = Math.min(Math.max(8, Math.round(r.left)), maxLeft);
+    card.style.top = Math.round(r.bottom + 6) + 'px';
+    card.style.left = left + 'px';
+    card.style.right = 'auto';
+  }
+  // Auto-sync on open: the host pushes + creates the live share and returns 'ready'.
+  function shareOpen(kind) {
+    if (!shareOverlay) { return; }
+    shareKind = (kind === 'branch') ? 'branch' : 'commit';
+    // Text only — the share glyph is a sibling SVG in the modal head, so setting
+    // textContent here must not wipe it.
+    var title = document.getElementById('shareModalTitle');
+    if (title) { title.textContent = (shareKind === 'branch') ? 'Share this branch' : 'Share this memory'; }
+    shareOverlay.hidden = false;
+    sharePositionCard();
+    sharePane('sharePaneLoading');
+    shareSetSyncBadge('loading');
+    vscode.postMessage({ command: 'shareBranch', shareKind: shareKind });
+  }
+  function shareClose() {
+    if (shareOverlay) { shareOverlay.hidden = true; }
+  }
+
+  // Single Share button (no ▾ menu — the branch/memory choice lives in the
+  // sidebar's two entries). It re-shares at the panel's ENTRY kind: 'commit'
+  // ("this memory") by default, 'branch' when the panel was opened via a
+  // share-this-branch entry, so the button stays consistent with how the user
+  // got here.
+  var defaultShareKind = ${JSON.stringify(defaultShareKind)};
+  if (shareBtn) {
+    if (defaultShareKind === 'branch') { shareBtn.title = 'Share this branch as a read-only link'; }
+    shareBtn.addEventListener('click', function() { shareClose(); shareOpen(defaultShareKind); });
+  }
+
+  var shareModalClose = document.getElementById('shareModalClose');
+  if (shareModalClose) { shareModalClose.addEventListener('click', shareClose); }
+
+  if (shareOverlay) {
+    shareOverlay.addEventListener('click', function(e) { if (e.target === shareOverlay) { shareClose(); } });
+  }
+  window.addEventListener('resize', function() { if (shareOverlay && !shareOverlay.hidden) { sharePositionCard(); } });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && shareOverlay && !shareOverlay.hidden) { shareClose(); }
+  });
+
+  // people-tier state: the current allowlist (added people's emails) and the search
+  // suggestion directory (org members + git contributors), both set on each render.
+  var shareRecipients = [];
+  var shareOrgMembers = [];
+  var shareOwnerEmail = '';
+  var shareOwnerName = '';
+  function shareSetSyncBadge(mode) {
+    var badge = document.getElementById('shareSyncBadge');
+    if (!badge) { return; }
+    if (mode === 'ready') { badge.textContent = '\\u25CF SYNCED'; badge.className = 'share-sync-badge synced'; badge.hidden = false; }
+    else if (mode === 'loading') { badge.textContent = 'SYNCING\\u2026'; badge.className = 'share-sync-badge syncing'; badge.hidden = false; }
+    else { badge.hidden = true; }
+  }
+  function shareAccessSubText(vis) {
+    if (vis === 'org') { return 'Anyone in the jolliai workspace can open this.'; }
+    if (vis === 'people') { return 'Only the people above can open this.'; }
+    return 'Anyone with the link can open this \\u2014 no account needed.';
+  }
+  // PATCH the audience (access level + current recipients) and drop to the SYNCING pane;
+  // the host re-renders 'ready' when the server confirms.
+  function shareSendAudience() {
+    var sel = document.getElementById('shareVisibilitySelect');
+    var vis = sel && sel.value ? sel.value : 'public';
+    // Stay on the main pane (the list was already updated optimistically) — just show the
+    // SYNCING badge while the host PATCHes; the authoritative 'ready' re-render follows.
+    shareSetSyncBadge('loading');
+    vscode.postMessage({ command: 'shareSetAudience', visibility: vis, recipients: shareRecipients.slice(), shareKind: shareKind });
+  }
+  function shareCreate() {
+    var sel = document.getElementById('shareCreateVisibilitySelect');
+    var vis = sel && sel.value ? sel.value : 'public';
+    shareSetSyncBadge('loading');
+    sharePane('sharePaneLoading');
+    vscode.postMessage({ command: 'shareCreate', visibility: vis, recipients: shareRecipients.slice(), shareKind: shareKind });
+  }
+  // Resolve a display name for an email from the directory (org members + contributors).
+  function shareResolveName(email) {
+    var lower = (email || '').toLowerCase();
+    for (var i = 0; i < shareOrgMembers.length; i++) {
+      if ((shareOrgMembers[i].email || '').toLowerCase() === lower) { return shareOrgMembers[i].name || email; }
+    }
+    return email;
+  }
+  // Build the collaborator rows locally (owner + current recipients) for optimistic render.
+  function shareLocalCollabRows() {
+    var rows = [{ name: shareOwnerName || shareOwnerEmail, email: shareOwnerEmail, isOwner: true }];
+    var seen = {};
+    seen[(shareOwnerEmail || '').toLowerCase()] = true;
+    shareRecipients.forEach(function(e) {
+      var l = e.toLowerCase();
+      if (!seen[l]) { seen[l] = true; rows.push({ name: shareResolveName(e), email: e, isOwner: false }); }
+    });
+    return rows;
+  }
+  function shareRemoveRecipient(email) {
+    var lower = (email || '').toLowerCase();
+    shareRecipients = shareRecipients.filter(function(e) { return e.toLowerCase() !== lower; });
+    shareRenderCollaborators(shareLocalCollabRows()); // optimistic — reflect the removal immediately
+    shareSendAudience();
+  }
+  function shareAddRecipient(email) {
+    var e = (email || '').trim();
+    if (!e) { return; }
+    var lower = e.toLowerCase();
+    if (lower === (shareOwnerEmail || '').toLowerCase()) { return; }
+    if (shareRecipients.some(function(x) { return x.toLowerCase() === lower; })) { return; }
+    shareRecipients = shareRecipients.concat([e]);
+    // Adding someone means "Only people you add" — switch access to people so the
+    // allowlist actually gates (and persists server-side).
+    var sel = document.getElementById('shareVisibilitySelect');
+    if (sel) { sel.value = 'people'; }
+    var sub = document.getElementById('shareAccessSub');
+    if (sub) { sub.textContent = shareAccessSubText('people'); }
+    shareRenderCollaborators(shareLocalCollabRows()); // optimistic — show the new person immediately
+    shareSendAudience();
+  }
+  function shareInitials(name, email) {
+    var src = (name || '').trim() || (email || '').trim();
+    if (!src) { return '?'; }
+    var parts = src.split(/\\s+/);
+    if (name && parts.length >= 2) { return (parts[0].charAt(0) + parts[1].charAt(0)).toUpperCase(); }
+    return src.slice(0, 2).toUpperCase();
+  }
+  // Renders the Collaborators list (owner + added recipients). Rows use textContent so
+  // names/emails can never inject HTML. Non-owner rows get a functional remove ("\\u00D7").
+  function shareRenderCollaborators(list) {
+    var box = document.getElementById('shareCollabList');
+    if (!box) { return; }
+    box.innerHTML = '';
+    (list || []).forEach(function(c) {
+      var row = document.createElement('div');
+      row.className = 'share-collab-row';
+      var av = document.createElement('span');
+      av.className = 'share-avatar';
+      av.textContent = shareInitials(c.name, c.email);
+      var meta = document.createElement('div');
+      meta.className = 'share-collab-meta';
+      var nm = document.createElement('span');
+      nm.className = 'share-collab-name';
+      nm.textContent = (c.name || c.email) + (c.isOwner ? ' (you)' : '');
+      var em = document.createElement('span');
+      em.className = 'share-collab-email';
+      em.textContent = c.email || '';
+      meta.appendChild(nm); meta.appendChild(em);
+      row.appendChild(av); row.appendChild(meta);
+      if (c.isOwner) {
+        var role = document.createElement('span');
+        role.className = 'share-collab-role';
+        role.textContent = 'Owner';
+        row.appendChild(role);
+      } else {
+        var rm = document.createElement('button');
+        rm.type = 'button';
+        rm.className = 'share-collab-remove';
+        rm.title = 'Remove ' + (c.email || '');
+        rm.setAttribute('aria-label', 'Remove ' + (c.email || ''));
+        rm.textContent = '\\u00D7';
+        rm.addEventListener('click', function() { shareRemoveRecipient(c.email); });
+        row.appendChild(rm);
+      }
+      box.appendChild(row);
+    });
+  }
+  function shareHideSuggest() {
+    var s = document.getElementById('shareSuggest');
+    if (s) { s.hidden = true; s.innerHTML = ''; }
+  }
+  var EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;
+  // Search → suggestions dropdown: matching directory members not already added, plus an
+  // "Add <email>" row for a valid, new email. Picking one adds it to the allowlist.
+  function shareRenderSuggest(q) {
+    var box = document.getElementById('shareSuggest');
+    if (!box) { return; }
+    box.innerHTML = '';
+    var query = (q || '').trim().toLowerCase();
+    if (!query) { box.hidden = true; return; }
+    var inList = {};
+    shareRecipients.forEach(function(e) { inList[e.toLowerCase()] = true; });
+    if (shareOwnerEmail) { inList[shareOwnerEmail.toLowerCase()] = true; }
+    var matches = (shareOrgMembers || []).filter(function(m) {
+      var hay = ((m.name || '') + ' ' + (m.email || '')).toLowerCase();
+      return hay.indexOf(query) !== -1 && !inList[(m.email || '').toLowerCase()];
+    }).slice(0, 6);
+    matches.forEach(function(m) {
+      var item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'share-suggest-item';
+      var nm = document.createElement('span'); nm.className = 'share-suggest-name'; nm.textContent = m.name || m.email;
+      var em = document.createElement('span'); em.className = 'share-suggest-email'; em.textContent = m.email || '';
+      item.appendChild(nm); item.appendChild(em);
+      item.addEventListener('click', function() { var s = document.getElementById('shareTeammateSearch'); if (s) { s.value = ''; } shareHideSuggest(); shareAddRecipient(m.email); });
+      box.appendChild(item);
+    });
+    var raw = (q || '').trim();
+    if (EMAIL_RE.test(raw) && !inList[raw.toLowerCase()]) {
+      var add = document.createElement('button');
+      add.type = 'button';
+      add.className = 'share-suggest-item share-suggest-add';
+      add.textContent = '\\u2795 Add ' + raw;
+      add.addEventListener('click', function() { var s = document.getElementById('shareTeammateSearch'); if (s) { s.value = ''; } shareHideSuggest(); shareAddRecipient(raw); });
+      box.appendChild(add);
+    }
+    box.hidden = box.children.length === 0;
+  }
+  var shareSearch = document.getElementById('shareTeammateSearch');
+  if (shareSearch) {
+    shareSearch.addEventListener('input', function() { shareRenderSuggest(shareSearch.value); });
+    shareSearch.addEventListener('click', function(e) { e.stopPropagation(); });
+  }
+  document.addEventListener('click', shareHideSuggest);
+  // Access level: org / public / people are all functional. A live share exists by the
+  // time this pane shows (auto-sync), so a change PATCHes the audience (+ current people).
+  var shareVisSelect = document.getElementById('shareVisibilitySelect');
+  if (shareVisSelect) {
+    shareVisSelect.addEventListener('change', function() {
+      var sub = document.getElementById('shareAccessSub');
+      if (sub) { sub.textContent = shareAccessSubText(shareVisSelect.value); }
+      shareSendAudience();
+    });
+  }
+  var shareRetryBtn = document.getElementById('shareRetryBtn');
+  if (shareRetryBtn) { shareRetryBtn.addEventListener('click', function() { shareOpen(shareKind); }); }
+  var shareCreateBtn = document.getElementById('shareCreateBtn');
+  if (shareCreateBtn) { shareCreateBtn.addEventListener('click', shareCreate); }
+  var shareCreateVisSelect = document.getElementById('shareCreateVisibilitySelect');
+  if (shareCreateVisSelect) {
+    shareCreateVisSelect.addEventListener('change', function() {
+      var sub = document.getElementById('shareCreateAccessSub');
+      if (sub) { sub.textContent = shareAccessSubText(shareCreateVisSelect.value); }
+    });
+  }
+  // Copy the bare shareable URL (held in a hidden input), with "Copied!" feedback.
+  var shareCopyBtn = document.getElementById('shareCopyBtn');
+  if (shareCopyBtn) {
+    shareCopyBtn.addEventListener('click', function() {
+      var input = document.getElementById('shareLinkInput');
+      if (!input || !input.value) { return; }
+      var done = function() {
+        var orig = shareCopyBtn.textContent;
+        shareCopyBtn.textContent = 'Copied!';
+        setTimeout(function() { shareCopyBtn.textContent = orig; }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(input.value).then(done, function() { input.select(); done(); });
+      } else {
+        input.select(); try { document.execCommand('copy'); } catch (e) {} done();
+      }
+    });
+  }
+
+  function shareRender(state) {
+    if (!state || !shareOverlay) { return; }
+    if (state.kind === 'revoked') { shareClose(); return; } // stopped → just dismiss (toast confirms)
+    if (state.kind === 'needsApiKey') { shareSetSyncBadge('hide'); sharePane('sharePaneNoKey'); return; }
+    if (state.kind === 'needsCreate') { shareRenderCreate(state); return; }
+    if (state.kind === 'ready') { shareRenderMain(state); return; }
+    if (state.kind === 'loading') {
+      var lbl = document.getElementById('shareLoadingLabel');
+      if (lbl && state.label) { lbl.textContent = state.label; }
+      shareSetSyncBadge('loading');
+      sharePane('sharePaneLoading');
+      return;
+    }
+    if (state.kind === 'error') {
+      var em = document.getElementById('shareErrorMsg');
+      if (em) { em.textContent = state.message || 'Something went wrong.'; }
+      shareSetSyncBadge('hide');
+      sharePane('sharePaneError');
+      return;
+    }
+  }
+
+  function shareRenderCreate(state) {
+    shareRecipients = (state.recipients || []).slice();
+    shareOrgMembers = state.orgMembers || [];
+    var ownerRow = (state.collaborators || []).filter(function(c) { return c.isOwner; })[0];
+    shareOwnerEmail = ownerRow ? (ownerRow.email || '') : '';
+    shareOwnerName = ownerRow ? (ownerRow.name || '') : '';
+    var sub = document.getElementById('shareModalSub');
+    if (sub) { sub.textContent = state.subjectTitle || state.subject || state.branch || ''; }
+    var orgOption = document.getElementById('shareCreateOrgOption');
+    if (orgOption) { orgOption.disabled = !state.canOrg; orgOption.hidden = !state.canOrg; }
+    var visSelect = document.getElementById('shareCreateVisibilitySelect');
+    if (visSelect) { visSelect.value = state.visibility || (state.canOrg ? 'org' : 'public'); }
+    var accessSub = document.getElementById('shareCreateAccessSub');
+    if (accessSub) { accessSub.textContent = shareAccessSubText(visSelect ? visSelect.value : (state.visibility || 'public')); }
+    shareSetSyncBadge('hide');
+    sharePane('sharePaneCreate');
+    sharePositionCard();
+  }
+
+  // The SYNCED popover: subtitle, collaborators, access selector + sub-copy, the
+  // (hidden) link input for Copy, and the SYNCED badge. Auto-sync means we only ever
+  // render 'ready' here (loading/error use their own panes).
+  function shareRenderMain(state) {
+    shareRecipients = (state.recipients || []).slice();
+    shareOrgMembers = state.orgMembers || [];
+    var ownerRow = (state.collaborators || []).filter(function(c) { return c.isOwner; })[0];
+    shareOwnerEmail = ownerRow ? (ownerRow.email || '') : '';
+    shareOwnerName = ownerRow ? (ownerRow.name || '') : '';
+    var sub = document.getElementById('shareModalSub');
+    if (sub) {
+      var n = state.decisionCount || 0;
+      sub.textContent = (state.subjectTitle || state.subject || state.branch) + ' \\u00B7 ' + n + ' decision' + (n === 1 ? '' : 's');
+    }
+    var orgOption = document.getElementById('shareOrgOption');
+    if (orgOption) { orgOption.disabled = !state.canOrg; orgOption.hidden = !state.canOrg; }
+    var visSelect = document.getElementById('shareVisibilitySelect');
+    if (visSelect) { visSelect.value = state.visibility || 'public'; }
+    var accessSub = document.getElementById('shareAccessSub');
+    if (accessSub) { accessSub.textContent = shareAccessSubText(state.visibility || 'public'); }
+    shareRenderCollaborators(state.collaborators);
+    var input = document.getElementById('shareLinkInput');
+    if (input) { input.value = state.shareUrl || ''; }
+    var search = document.getElementById('shareTeammateSearch');
+    if (search) { search.value = ''; }
+    shareHideSuggest();
+    shareSetSyncBadge('ready');
+    sharePane('sharePaneMain');
+    sharePositionCard();
+  }
+
   // Stale-readonly banner: "Open new commit's summary" button. The live
   // root hash is rendered into data-target-hash by buildHtml; the
   // extension routes the message to jollimemory.viewSummary.
@@ -145,6 +515,11 @@ ${buildPrSectionScript()}
   // itself is never changed mid-push.
   window.addEventListener('message', function(event) {
     var msg = event.data;
+
+    // ── Share modal state ──
+    if (msg.command === 'shareState') {
+      shareRender(msg.state);
+    }
 
     // ── Push status ──
     if (pushBtn && msg.command === 'pushStarted') {
@@ -1928,5 +2303,6 @@ ${buildTranscriptEntriesScript()}
     }
   });
 
+  ${options.autoOpenShare ? `shareOpen(${JSON.stringify(defaultShareKind)});` : ""}
 `;
 }

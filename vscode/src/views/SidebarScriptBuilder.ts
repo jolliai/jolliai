@@ -4777,9 +4777,9 @@ export function buildSidebarScript(): string {
         }, [el('i', { className: 'codicon codicon-copy' })]),
         'Copy Recall Prompt',
       ));
-      // Share — placeholder for a dedicated PR. The button is rendered now
-      // so the slot is reserved in the UI, but the click handler is a no-op
-      // (see the 'share' case in the inline-action dispatcher below).
+      // Share this memory — opens the memory's summary panel with the
+      // commit-kind share modal (see the 'share' case in the inline-action
+      // dispatcher below).
       memActions.push(attachTextTip(
         el('button', {
           type: 'button',
@@ -5049,7 +5049,9 @@ export function buildSidebarScript(): string {
     }
     var footerShare = e.target.closest('.cmd-btn[data-action="footer-share"]');
     if (footerShare) {
-      vscode.postMessage({ type: 'command', command: 'jollimemory.shareBranchPlaceholder' });
+      // Opens the newest branch memory's panel with the "Share this branch"
+      // modal — the modal lives in the summary panel's webview, not here.
+      vscode.postMessage({ type: 'command', command: 'jollimemory.shareBranch' });
       e.stopPropagation(); return;
     }
     var footerMore = e.target.closest('.cmd-btn[data-action="footer-more"]');
@@ -5291,10 +5293,10 @@ export function buildSidebarScript(): string {
         vscode.postMessage({ type: 'command', command: 'jollimemory.copyRecallPrompt', args: [id] });
       }
       if (action === 'share') {
-        // Share is a placeholder — a dedicated PR will implement the full
-        // share flow (copy shareable link, open share sheet, etc.). The
-        // case is handled here so the click is swallowed cleanly and does
-        // NOT fall through to the row-open path below.
+        // Opens this memory's panel with the "Share this memory" (commit-kind)
+        // modal. Foreign rows resolve no summary in this workspace's storage —
+        // the command replies with a pointer to the memory's own repo.
+        vscode.postMessage({ type: 'command', command: 'jollimemory.shareMemory', args: [id] });
         e.stopPropagation();
         return;
       }

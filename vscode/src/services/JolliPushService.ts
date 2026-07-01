@@ -105,6 +105,13 @@ export interface JolliPushPayload {
 	readonly repoUrl?: string;
 	/** Folder chain below the repo folder — flat `<branchSlug>` for all docTypes. No leading `/`. */
 	readonly relativePath?: string;
+	/**
+	 * Serialized structured summary JSON (summary docType only). The server stores
+	 * it as a hidden sidecar at `<repoFolder>/.jolli/summaries/<commitHash>.json`
+	 * for the share page's structured rendering. Optional: old servers strip the
+	 * unknown field and the push succeeds unchanged.
+	 */
+	readonly summaryJson?: string;
 }
 
 /** Response from a successful push */
@@ -113,6 +120,12 @@ export interface JolliPushResult {
 	readonly docId: number;
 	readonly jrn: string;
 	readonly created: boolean;
+	/**
+	 * Doc id of the hidden summary-JSON sidecar the server upserted (summary
+	 * pushes that carried `summaryJson` only). Informational — the server keys
+	 * the sidecar by commit hash, so the client never needs to track this id.
+	 */
+	readonly summaryJsonDocId?: number;
 }
 
 /** Body shape the server emits for non-2xx responses we explicitly handle. */

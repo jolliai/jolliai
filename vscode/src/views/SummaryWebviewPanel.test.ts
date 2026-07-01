@@ -1938,7 +1938,7 @@ describe("SummaryWebviewPanel", () => {
 				await flushPromises();
 
 				expect(warn).toHaveBeenCalledWith(
-					"SummaryPanel",
+					"PushOrchestrator",
 					expect.stringContaining("broken-snip"),
 				);
 				// mockPushToJolli is called for: summary + ok-snip (the broken one is skipped).

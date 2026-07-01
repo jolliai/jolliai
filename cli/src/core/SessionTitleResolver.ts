@@ -55,7 +55,11 @@ export async function resolveSessionTitle(
 	// 2. Source-specific native reader (Claude only for now). `ai-title`
 	// rows are stripped by `parseClaude` in `loadTranscript`, so `mergedEntries`
 	// never contains them — we must keep this independent stream for Claude.
-	if (source === "claude") {
+	// Skipped when the session carries no transcript path (archived sessions
+	// whose live transcript is gone): opening a read stream on "" is a real
+	// fs round-trip that always ENOENTs — pure waste, and it made callers'
+	// evidence pipelines timing-sensitive for nothing.
+	if (source === "claude" && session.transcriptPath) {
 		try {
 			const ai = await readClaudeAiTitle(session.transcriptPath);
 			if (ai && ai.length > 0) {

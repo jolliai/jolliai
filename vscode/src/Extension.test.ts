@@ -1459,7 +1459,8 @@ describe("Extension", () => {
 				"jollimemory.openSettings",
 				"jollimemory.toggleStatus",
 				"jollimemory.reviewNextMemory",
-				"jollimemory.shareBranchPlaceholder",
+				"jollimemory.shareBranch",
+				"jollimemory.shareMemory",
 			];
 
 			for (const cmd of expectedCommands) {

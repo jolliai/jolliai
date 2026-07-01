@@ -48,6 +48,18 @@ describe("resolveSessionTitle", () => {
 		expect(readClaudeAiTitle).toHaveBeenCalledWith("/tmp/x.jsonl");
 	});
 
+	it("skips the Claude ai-title disk read when the session has no transcript path", async () => {
+		// Archived sessions (orphan-branch snapshots) often carry no live
+		// transcriptPath — streaming "" would be a guaranteed-ENOENT fs
+		// round-trip, and it made callers' evidence pipelines timing-sensitive.
+		const result = await resolveSessionTitle(
+			{ sessionId: "s1", transcriptPath: "", updatedAt: "2026-05-15T00:00:00Z", source: "claude" },
+			[{ role: "human", content: "bare turn" }],
+		);
+		expect(result).toBe("bare turn");
+		expect(readClaudeAiTitle).not.toHaveBeenCalled();
+	});
+
 	it("falls back to first-user-message when Claude has no ai-title", async () => {
 		vi.mocked(readClaudeAiTitle).mockResolvedValueOnce(undefined);
 		vi.mocked(readFirstUserMessageTitle).mockResolvedValueOnce("first user msg");

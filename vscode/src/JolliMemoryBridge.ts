@@ -2562,6 +2562,11 @@ export class JolliMemoryBridge {
 		return (await tryExecGit(["config", "user.name"], this.cwd)).trim();
 	}
 
+	/** Returns the git user.email configured for this repo (empty string if unset). */
+	async getCurrentUserEmail(): Promise<string> {
+		return (await tryExecGit(["config", "user.email"], this.cwd)).trim();
+	}
+
 	/** Returns the current branch name. */
 	async getCurrentBranch(): Promise<string> {
 		return (
