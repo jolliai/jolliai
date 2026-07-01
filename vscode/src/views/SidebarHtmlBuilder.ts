@@ -25,8 +25,8 @@
  *     drops the option cards and shows a single primary "Enable" button. The
  *     legacy disabled-banner inside the Status panel is kept for the degraded
  *     (no-workspace / no-git) fallback only.
- *   - A view-switch row (`#view-switch`) with the 3 primary views — Current
- *     Branch / Memory Bank / Knowledge — as segmented `data-tab` buttons. It
+ *   - A view-switch row (`#view-switch`) with the 2 primary views — Current
+ *     Branch / Memory Bank — as segmented `data-tab` buttons. It
  *     sits directly under the editor's native "JOLLI MEMORY" title bar, above
  *     the breadcrumb row.
  *   - A header bar (`#tab-bar`) holding only the breadcrumb `<repo> / <branch>`
@@ -145,7 +145,6 @@ export function buildSidebarHtml(
     <div class="view-switch hidden" id="view-switch" role="tablist" aria-label="Jolli Memory views">
       <button class="view-tab active" type="button" data-tab="branch" role="tab">Current Branch</button>
       <button class="view-tab" type="button" data-tab="kb" role="tab">Memory Bank</button>
-      <button class="view-tab" type="button" data-tab="knowledge" role="tab">Knowledge</button>
     </div>
     <div class="tab-bar hidden" id="tab-bar" role="toolbar" aria-label="Jolli Memory header">
       <div class="breadcrumb" id="breadcrumb">
@@ -173,7 +172,6 @@ export function buildSidebarHtml(
     <div class="tab-toolbar hidden" id="tab-toolbar"></div>
     <div class="tab-content hidden" id="tab-content-kb"><p class="placeholder">Loading...</p></div>
     <div class="tab-content hidden" id="tab-content-branch"><p class="placeholder">Loading...</p></div>
-    <div class="tab-content hidden" id="tab-content-knowledge"><p class="placeholder">Loading...</p></div>
     <div class="tab-content hidden" id="tab-content-status">
       <div class="disabled-banner hidden" id="disabled-banner">
         <p class="disabled-intro">Capture searchable memories from your AI coding sessions and weave them into your git history. Each commit gets an AI-generated summary you can recall later.</p>

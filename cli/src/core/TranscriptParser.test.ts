@@ -222,9 +222,12 @@ describe("ClaudeTranscriptParser", () => {
 					},
 				},
 			});
-			// 100 + 20 + 5 = 125. cache_read_input_tokens (300) is intentionally NOT
-			// summed — it is the cumulative re-read of an already-counted cached prefix.
-			expect(parser.parseUsageTokens(line, 1)).toBe(125);
+			// input=100, output=5, cached(cache_creation)=20 → 125 total.
+			// cache_read_input_tokens (300) is intentionally NOT included — it is the
+			// cumulative re-read of an already-counted cached prefix.
+			const b = parser.parseUsageTokens(line, 1);
+			expect(b).toEqual({ input: 100, output: 5, cached: 20 });
+			expect(b.input + b.output + b.cached).toBe(125);
 		});
 
 		// Real-fixture regression for C6. These three usage objects are copied verbatim
@@ -261,18 +264,21 @@ describe("ClaudeTranscriptParser", () => {
 					message: { role: "assistant", content: [{ type: "text", text: "x" }], usage },
 				}),
 			);
-			const total = lines.reduce((acc, l) => acc + parser.parseUsageTokens(l, 0), 0);
+			const total = lines.reduce((acc, l) => {
+				const b = parser.parseUsageTokens(l, 0);
+				return acc + b.input + b.output + b.cached;
+			}, 0);
 			// Per-turn deltas only: (21060+10195+359) + (1+23878+655) + (2+2192+229) = 31614 + 24534 + 2423 = 58571.
 			expect(total).toBe(58571);
 			// And it excludes the 92376 of cumulative cache_read that the old summation added.
 			expect(total).toBeLessThan(58571 + 92376);
 		});
 
-		it("returns 0 for human/user lines and malformed JSON", () => {
+		it("returns a zeroed breakdown for human/user lines and malformed JSON", () => {
 			expect(
 				parser.parseUsageTokens(JSON.stringify({ type: "user", message: { role: "user", content: "x" } }), 1),
-			).toBe(0);
-			expect(parser.parseUsageTokens("{not json", 1)).toBe(0);
+			).toEqual({ input: 0, output: 0, cached: 0 });
+			expect(parser.parseUsageTokens("{not json", 1)).toEqual({ input: 0, output: 0, cached: 0 });
 		});
 	});
 });

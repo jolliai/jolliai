@@ -870,6 +870,51 @@ describe("TranscriptReader", () => {
 			expect(result.totalLinesRead).toBe(2);
 		});
 
+		it("does not consume tokens or advance the cursor past a tool-only turn after the cutoff", async () => {
+			// A tool-only assistant turn (content is all tool_use blocks) yields no
+			// TranscriptEntry — extractContent keeps only text — yet its raw line still
+			// carries a `usage` block. The cutoff `break` only fires on lines that
+			// produce an entry, so a tool-only turn AFTER the cutoff had its tokens
+			// summed into this (earlier) commit AND the cursor advanced past it, so the
+			// later commit that owns it could never read it. Cross-commit misattribution.
+			const lines = [
+				JSON.stringify({
+					type: "human",
+					message: { role: "user", content: "Before cutoff" },
+					timestamp: "2026-03-20T10:00:00Z",
+				}),
+				JSON.stringify({
+					message: { role: "assistant", content: [{ type: "text", text: "Response before" }] },
+					usage: { input_tokens: 100, cache_creation_input_tokens: 20, output_tokens: 5 },
+					timestamp: "2026-03-20T10:00:01Z",
+				}),
+				// Tool-only turn AFTER the cutoff: no text → no entry, but carries usage.
+				JSON.stringify({
+					message: { role: "assistant", content: [{ type: "tool_use", id: "x", name: "Bash", input: {} }] },
+					usage: { input_tokens: 1000, cache_creation_input_tokens: 0, output_tokens: 50 },
+					timestamp: "2026-03-20T12:00:00Z",
+				}),
+				JSON.stringify({
+					type: "human",
+					message: { role: "user", content: "After cutoff" },
+					timestamp: "2026-03-20T12:00:01Z",
+				}),
+			].join("\n");
+
+			const filePath = join(tempDir, "tool-only-cutoff.jsonl");
+			await writeFile(filePath, lines, "utf-8");
+
+			const result = await readTranscript(filePath, undefined, undefined, "2026-03-20T11:00:00Z");
+
+			// Only the before-cutoff turn's 125 tokens belong to this commit; the
+			// tool-only turn's 1050 are past the cutoff and belong to the next commit.
+			expect(result.usageTokens).toBe(125);
+			expect(result.entries).toHaveLength(2);
+			// Cursor stops at the first post-cutoff line (2), so the next read re-reads
+			// the tool-only turn and attributes its tokens to the commit that owns it.
+			expect(result.newCursor.lineNumber).toBe(2);
+		});
+
 		it("advances cursor to EOF when no beforeTimestamp is provided", async () => {
 			const lines = [
 				JSON.stringify({
@@ -923,6 +968,9 @@ describe("TranscriptReader", () => {
 			// (300) is excluded — it is the cumulative re-read of an already-counted cached
 			// prefix and must not be summed (see ClaudeTranscriptParser.parseUsageTokens / C6).
 			expect(result.usageTokens).toBe(125);
+			// Per-segment split powering the branch token-usage bar. cached carries
+			// cache_creation only; input + output + cached === usageTokens.
+			expect(result.usageBreakdown).toEqual({ input: 100, output: 5, cached: 20 });
 		});
 	});
 });

@@ -887,7 +887,22 @@ export async function handleUpdatePrWithPush(
 	summaryBranch?: string,
 ): Promise<void> {
 	try {
-		const currentBranch = await getCurrentBranch(cwd);
+		// getCurrentBranchSafe (not getCurrentBranch): normalize detached HEAD and
+		// hard git errors (index.lock, permissions) to the "HEAD" sentinel, exactly
+		// as handleCreatePr does. The bare getCurrentBranch would return the literal
+		// "HEAD" on a detached checkout (passing the cross-branch guard, then
+		// force-pushing detached HEAD) and would THROW on a locked index (landing in
+		// the outer catch as a generic "Update PR failed").
+		const currentBranch = await getCurrentBranchSafe(cwd);
+		if (currentBranch === "HEAD") {
+			vscode.window.showWarningMessage(detachedHeadMessage(summaryBranch));
+			postMessage({
+				command: "prCreateBlockedCrossBranch",
+				summaryBranch: summaryBranch ?? "",
+				currentBranch,
+			});
+			return;
+		}
 		if (summaryBranch && summaryBranch !== currentBranch) {
 			vscode.window.showWarningMessage(
 				`This summary is on branch ${summaryBranch}. Checkout ${summaryBranch} to update its PR.`,

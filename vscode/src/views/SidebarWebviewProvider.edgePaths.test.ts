@@ -333,6 +333,9 @@ describe("SidebarWebviewProvider edge paths", () => {
 				input: 100,
 				output: 40,
 				cached: 10,
+				// Scalar branch total (Σ aggregateConversationTokens) — a required field of
+				// the dep contract; here it equals input+output+cached, its minimum.
+				total: 150,
 				reporting: 2,
 				memories: 3,
 			});

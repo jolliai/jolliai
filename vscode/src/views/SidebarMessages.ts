@@ -13,7 +13,7 @@ import type { PinEntry, PinKind } from "../../../cli/src/core/PinStore.js";
 import type { ReferenceField, SourceId, TranscriptSource } from "../../../cli/src/Types.js";
 import type { WorkerPhase } from "../stores/StatusStore.js";
 
-export type SidebarTab = "kb" | "branch" | "status" | "knowledge";
+export type SidebarTab = "kb" | "branch" | "status";
 export type KbMode = "folders" | "memories";
 
 /**
@@ -247,7 +247,7 @@ export interface FolderNode {
 	 * `name` display label, which `repoDisplayName` may suffix with a
 	 * `(dirName)` collision marker). Lets the Folders renderer scope to a
 	 * single repo using the same `repoName` key the `Showing` repo-filter and
-	 * the Memories / Knowledge renderers compare against.
+	 * the Memories renderer compares against.
 	 */
 	readonly repoName?: string;
 }
@@ -473,28 +473,6 @@ export interface RepoChoice {
 	readonly isCurrent: boolean;
 }
 
-export interface KnowledgeTopic {
-	readonly title: string;
-	readonly stableSlug: string;
-	readonly memoryCount: number;
-	readonly wikiFile: string;
-}
-
-export interface KnowledgeCategory {
-	readonly name: string;
-	readonly description?: string;
-	readonly topicCount: number;
-	readonly memoryCount: number;
-	readonly topics: ReadonlyArray<KnowledgeTopic>;
-}
-
-export interface KnowledgeRepo {
-	readonly repoName: string;
-	readonly memoryCount: number;
-	readonly indexPath: string;
-	readonly categories: ReadonlyArray<KnowledgeCategory>;
-}
-
 export type SidebarOutboundMsg =
 	| { readonly type: "ready" }
 	| { readonly type: "tab:switched"; readonly tab: SidebarTab }
@@ -658,7 +636,6 @@ export type SidebarOutboundMsg =
 				| "branch-current"
 				| "branch-commits"
 				| "status"
-				| "knowledge"
 				| "all";
 	  }
 	| {
@@ -957,7 +934,6 @@ export type SidebarInboundMsg =
 			readonly type: "branch:pinsData";
 			readonly items: ReadonlyArray<PinEntry>;
 	  }
-	| { readonly type: "kb:knowledgeData"; readonly repos: ReadonlyArray<KnowledgeRepo> }
 	| {
 			/**
 			 * Aggregated LLM token usage across all committed summaries on the current

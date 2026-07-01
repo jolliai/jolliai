@@ -5,7 +5,7 @@
  * CommitSummary tree. Children are stored newest-first (commitDate descending),
  * so traversal helpers reverse them when chronological order is needed.
  */
-import type { CommitSummary, DiffStats, TopicSummary } from "../Types.js";
+import type { CommitSummary, ConversationTokenBreakdown, DiffStats, TopicSummary } from "../Types.js";
 
 /**
  * Discriminator: returns true when the summary node was written by the unified
@@ -115,6 +115,41 @@ export function aggregateConversationTokens(node: CommitSummary): number {
 	const own = node.conversationTokens ?? 0;
 	const childTokens = (node.children ?? []).reduce((acc, c) => acc + aggregateConversationTokens(c), 0);
 	return own + childTokens;
+}
+
+/**
+ * Recursively sums the per-segment conversation-token breakdown across the
+ * entire tree — the segmented counterpart of {@link aggregateConversationTokens}.
+ *
+ * The Branch tab's aggregate token bar must walk the SAME tree that each memory
+ * row's subline walks (via aggregateConversationTokens); reading only a root
+ * node's own breakdown drops the tokens amend/rebase folded into its children,
+ * which would make the branch total read as LESS than the sum of its own rows.
+ */
+export function aggregateConversationTokenBreakdown(node: CommitSummary): ConversationTokenBreakdown {
+	// Per-field fallback, not just a whole-object one: summaries load through a
+	// bare JSON.parse with no schema validation, so a present-but-PARTIAL breakdown
+	// (hand-edited file, older schema, a future producer that writes only some
+	// segments) must not leak `undefined` into the sums — `undefined + n` is NaN,
+	// which poisons the tree total and, since `NaN > 0` is false, makes the branch
+	// token bar silently vanish.
+	const raw = node.conversationTokenBreakdown;
+	const own: ConversationTokenBreakdown = {
+		input: raw?.input ?? 0,
+		output: raw?.output ?? 0,
+		cached: raw?.cached ?? 0,
+	};
+	return (node.children ?? []).reduce<ConversationTokenBreakdown>(
+		(acc, c) => {
+			const child = aggregateConversationTokenBreakdown(c);
+			return {
+				input: acc.input + child.input,
+				output: acc.output + child.output,
+				cached: acc.cached + child.cached,
+			};
+		},
+		{ input: own.input, output: own.output, cached: own.cached },
+	);
 }
 
 /** Recursively counts total topics across the entire tree. */

@@ -105,6 +105,72 @@ describe("buildCreatePrHtml", () => {
 		expect(html).toContain("1 SCENARIO");
 	});
 
+	it("does not throw when a scenario's steps/expectedResults are not arrays (malformed summary JSON)", () => {
+		// steps/expectedResults are typed as required arrays, but the summary is
+		// deserialized from orphan-branch JSON with no read-time validation — an
+		// older schema or hand-edited file can leave them undefined. The panel is
+		// built in one synchronous pass with no render try/catch, so a TypeError
+		// here would white-screen the whole Create-PR panel. Degrade to empty lists.
+		const malformed = {
+			...vm,
+			e2eScenarios: [{ title: "Broken", steps: undefined, expectedResults: undefined }],
+		} as unknown as CreatePrViewModel;
+		let html = "";
+		expect(() => {
+			html = buildCreatePrHtml(malformed, "N");
+		}).not.toThrow();
+		expect(html).toContain("E2E Test Guide");
+		expect(html).toContain("Broken");
+		expect(html).toContain("<ol></ol>");
+	});
+
+	it("does not throw when e2eScenarios itself is not an array (malformed summary JSON)", () => {
+		// The container is also unvalidated: a non-array truthy value makes the
+		// spread / `.length` throw BEFORE the per-scenario guard runs. Degrade to
+		// no E2E panel rather than white-screening the whole Create-PR panel.
+		const malformed = { ...vm, e2eScenarios: { nope: true } } as unknown as CreatePrViewModel;
+		let html = "";
+		expect(() => {
+			html = buildCreatePrHtml(malformed, "N");
+		}).not.toThrow();
+		// Non-array container degrades to empty → the E2E panel is omitted entirely.
+		expect(html).not.toContain("E2E Test Guide");
+	});
+
+	it("does not throw when a scenario title is not a string (malformed summary JSON)", () => {
+		// esc (escAttr) calls String.prototype.replace directly, so a non-string
+		// title throws TypeError — the same white-screen class the guard targets.
+		const malformed = {
+			...vm,
+			e2eScenarios: [{ title: null, steps: ["a"], expectedResults: ["b"] }],
+		} as unknown as CreatePrViewModel;
+		let html = "";
+		expect(() => {
+			html = buildCreatePrHtml(malformed, "N");
+		}).not.toThrow();
+		expect(html).toContain("E2E Test Guide");
+	});
+
+	it("does not throw when a scenario's step/result ELEMENTS are not strings (malformed summary JSON)", () => {
+		// The container and title were already guarded, but the individual step /
+		// expectedResult items still flow straight into esc (escAttr → .replace),
+		// which throws TypeError on a non-string. A partially corrupted summary with
+		// steps: [null] or expectedResults: [42] must degrade, not white-screen.
+		const malformed = {
+			...vm,
+			e2eScenarios: [{ title: "Broken", steps: [null, 42], expectedResults: [42, null] }],
+		} as unknown as CreatePrViewModel;
+		let html = "";
+		expect(() => {
+			html = buildCreatePrHtml(malformed, "N");
+		}).not.toThrow();
+		expect(html).toContain("E2E Test Guide");
+		expect(html).toContain("Broken");
+		// Non-string elements coerce to a string (null/undefined → empty); the
+		// numeric ones stringify. Two <li> entries are still emitted.
+		expect(html).toContain("<li>42</li>");
+	});
+
 	it("renders plural SCENARIOS label when there are multiple scenarios", () => {
 		const html = buildCreatePrHtml(
 			{

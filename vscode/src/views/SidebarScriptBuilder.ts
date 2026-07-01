@@ -206,8 +206,7 @@ export function buildSidebarScript(): string {
   const tabContents = {
     kb: document.getElementById('tab-content-kb'),
     branch: document.getElementById('tab-content-branch'),
-    status: document.getElementById('tab-content-status'),
-    knowledge: document.getElementById('tab-content-knowledge')
+    status: document.getElementById('tab-content-status')
   };
   // Status panel has two stacked children: the disabled-banner (intro + Enable
   // button shown when state.enabled === false) and the status-entries list
@@ -286,7 +285,7 @@ export function buildSidebarScript(): string {
 
   // ---- Tab switching ----
   // Navigation has two surfaces that both dispatch through switchTab():
-  // the three view-switch buttons (Current Branch / Memory Bank / Knowledge,
+  // the two view-switch buttons (Current Branch / Memory Bank,
   // class 'view-tab') always navigate to their view, and the native
   // "JOLLI MEMORY" title-bar Status icon (jollimemory.toggleStatus → the
   // 'status:toggle' inbound message) toggles the Status overlay open and
@@ -324,14 +323,6 @@ export function buildSidebarScript(): string {
       } else {
         renderMemories();
       }
-    }
-    else if (tab === 'knowledge') {
-      renderKnowledge();
-      // Request fresh data from the host so the wiki tree reflects current
-      // compiled state. The host's handleRefresh('knowledge') calls pushKnowledgeData
-      // which replies with 'kb:knowledgeData'. The render above shows whatever
-      // is currently cached; the reply will re-render with live data.
-      vscode.postMessage({ type: 'refresh', scope: 'knowledge' });
     }
     vscode.postMessage({ type: 'tab:switched', tab: tab });
   }
@@ -474,12 +465,6 @@ export function buildSidebarScript(): string {
         iconButton('refresh', 'Refresh', 'refresh'),
       ];
       mountIn(tabToolbar, items);
-    } else if (state.activeTab === 'knowledge') {
-      // Knowledge view: Rebuild (compileNow) + Refresh.
-      mountIn(tabToolbar, [
-        iconButton('compile-now', 'Rebuild Knowledge Wiki', 'database'),
-        iconButton('refresh', 'Refresh', 'refresh'),
-      ]);
     }
     // No trailing else: the Branch tab returned early above (no toolbar).
   }
@@ -664,7 +649,10 @@ export function buildSidebarScript(): string {
         // true on undefined (e.g. older host code, transient init message)
         // so the regular UI keeps working without a strict-host upgrade.
         applyConfigured(msg.state.configured !== false);
-        if (msg.state.activeTab) switchTab(msg.state.activeTab);
+        // Guard against a stale persisted tab that no longer exists (e.g. the
+        // removed 'knowledge' view): fall back to the default 'branch' rather
+        // than switching to a tab with no panel/toolbar.
+        if (msg.state.activeTab && tabContents[msg.state.activeTab]) switchTab(msg.state.activeTab);
         if (msg.state.kbMode) state.kbMode = msg.state.kbMode;
         state.branchName = msg.state.branchName;
         state.detached = !!msg.state.detached;
@@ -683,14 +671,6 @@ export function buildSidebarScript(): string {
         }
         if (msg.state.enabled && state.activeTab === 'branch') {
           renderBranch();
-        }
-        // Knowledge view: on reload the webview is recreated (no retainContextWhenHidden)
-        // and switchTab() early-returns because getState() already restored activeTab;
-        // render whatever is cached and request fresh data from the host so the tree
-        // is never stuck on a "Loading..." placeholder after reload.
-        if (msg.state.enabled && state.activeTab === 'knowledge') {
-          renderKnowledge();
-          vscode.postMessage({ type: 'refresh', scope: 'knowledge' });
         }
         persist();
         break;
@@ -1015,10 +995,6 @@ export function buildSidebarScript(): string {
         if (state.activeTab === 'branch') renderBranch();
         break;
       }
-      case 'kb:knowledgeData':
-        knowledgeData = { repos: Array.isArray(msg.repos) ? msg.repos : [] };
-        if (state.activeTab === 'knowledge') renderKnowledge();
-        break;
       // Renderers added in later phases handle the remaining message types.
       default:
         break;
@@ -1075,7 +1051,6 @@ export function buildSidebarScript(): string {
       tabContents.kb.classList.add('hidden');
       tabContents.branch.classList.add('hidden');
       tabContents.status.classList.add('hidden');
-      tabContents.knowledge.classList.add('hidden');
       document.querySelectorAll('[data-tab]').forEach(function(elBtn) {
         elBtn.classList.remove('active');
       });
@@ -1107,7 +1082,6 @@ export function buildSidebarScript(): string {
       tabContents.kb.classList.add('hidden');
       tabContents.branch.classList.add('hidden');
       tabContents.status.classList.add('hidden');
-      tabContents.knowledge.classList.add('hidden');
       disabledBanner.classList.add('hidden');
       return;
     }
@@ -1221,13 +1195,13 @@ export function buildSidebarScript(): string {
   }
 
   // Show the repo-filter control and hide the repo/branch breadcrumb when the
-  // Memory Bank or Knowledge tab is active; restore the breadcrumb on other tabs.
+  // Memory Bank tab is active; restore the breadcrumb on other tabs.
   // Called from renderBreadcrumb (runs on every tab switch that touches the
   // breadcrumb) and from applyEnabled (when the tab bar visibility itself changes).
   function applyRepoFilterVisibility() {
-    const isKb = state.activeTab === 'kb' || state.activeTab === 'knowledge';
+    const isKb = state.activeTab === 'kb';
     if (repoFilterEl) repoFilterEl.classList.toggle('hidden', !isKb);
-    // On the Memory Bank / Knowledge tabs the repo-filter ("Showing: <repo>")
+    // On the Memory Bank tab the repo-filter ("Showing: <repo>")
     // is the sole repo selector, so hide the entire repo/branch breadcrumb to
     // avoid a redundant second repo dropdown sitting beside it. The Branch tab
     // keeps the breadcrumb as its repo/branch navigation surface.
@@ -1437,8 +1411,7 @@ export function buildSidebarScript(): string {
       showBreadcrumbMenu(repoFilterBtn, items, function(picked) {
         kbRepoFilter = picked;
         updateRepoFilterLabel();
-        if (state.activeTab === 'knowledge') renderKnowledge();
-        else if (state.kbMode === 'folders') renderFolders();
+        if (state.kbMode === 'folders') renderFolders();
         else renderMemories();
       });
     });
@@ -1534,304 +1507,6 @@ export function buildSidebarScript(): string {
     // Status action moved to the native title bar (a static $(pulse) icon that
     // can't carry a runtime color). Health now reads from the entry rows
     // rendered above, visible once the Status overlay is open.
-  }
-
-  // Per-repo/category expansion state for the Knowledge view. Keyed by
-  // 'kn-repo:<repoName>' or 'kn-cat:<repoName>/<categoryName>'. Session-only —
-  // not persisted to vscode.setState (mirrors the Memory Bank tree pattern).
-  const knExpandState = {};
-
-  function renderKnowledge() {
-    hideTextTip();
-    const container = tabContents.knowledge;
-    const repos = knowledgeData.repos || [];
-
-    // Capture the search input's focus + caret BEFORE mountIn's replaceChildren
-    // destroys it. A host-pushed kb:knowledgeData (refresh / rebuild response)
-    // can arrive mid-typing; without this, re-rendering would silently steal
-    // focus and the caret. We restore from the live DOM here (preserving the
-    // exact selection range) in addition to the debounced-search path, which
-    // sets knRestoreSearchFocus and relies on the end-of-value fallback.
-    const liveInput = document.getElementById('kn-search-input');
-    const inputWasFocused = !!liveInput && document.activeElement === liveInput;
-    const savedSelStart = inputWasFocused ? liveInput.selectionStart : null;
-    const savedSelEnd = inputWasFocused ? liveInput.selectionEnd : null;
-
-    // Apply the repo filter (shared with the Memory Bank 'Showing:' control).
-    const repoFiltered = kbRepoFilter
-      ? repos.filter(function(r) { return r.repoName === kbRepoFilter; })
-      : repos;
-
-    const nodes = [];
-
-    // Search input — always rendered first so it stays visible even when the
-    // filtered tree is empty. Mirrors the 'buildKbSearchBox' pattern: a wrapper
-    // div with a leading magnifier codicon and an <input> child. Wired via
-    // addEventListener (CSP forbids inline event handlers).
-    const knSearchWrap = el('div', { className: 'kb-search-box', id: 'kn-search-box' });
-    knSearchWrap.appendChild(el('i', { className: 'codicon codicon-search kb-search-icon' }));
-    const knSearchInput = el('input', {
-      type: 'text',
-      id: 'kn-search-input',
-      placeholder: 'Search topics & decisions…',
-      'aria-label': 'Search topics and decisions',
-    });
-    knSearchInput.value = knowledgeQuery;
-    knSearchInput.addEventListener('input', function() {
-      knowledgeQuery = knSearchInput.value.toLowerCase();
-      // Debounce: only re-render (and refilter the tree) once typing pauses for
-      // 2s. The native input keeps its value + focus during the wait since no
-      // re-render happens; the render that fires afterwards restores focus.
-      if (knSearchDebounce) { clearTimeout(knSearchDebounce); }
-      knSearchDebounce = setTimeout(function() {
-        knSearchDebounce = null;
-        knRestoreSearchFocus = true;
-        renderKnowledge();
-      }, 2000);
-    });
-    knSearchWrap.appendChild(knSearchInput);
-    nodes.push(knSearchWrap);
-
-    // When a search query is active, filter the repo/category/topic tree:
-    //   - Keep topics whose title contains the query OR whose category name
-    //     contains the query (category-level match shows all topics in that
-    //     category).
-    //   - Drop categories left with no matching topics; drop repos left empty.
-    const visibleRepos = knowledgeQuery
-      ? repoFiltered.reduce(function(acc, repo) {
-          const matchedCats = (Array.isArray(repo.categories) ? repo.categories : []).reduce(function(cacc, cat) {
-            const catMatches = cat.name.toLowerCase().indexOf(knowledgeQuery) !== -1;
-            const matchedTopics = catMatches
-              ? (Array.isArray(cat.topics) ? cat.topics : [])
-              : (Array.isArray(cat.topics) ? cat.topics : []).filter(function(t) {
-                  return t.title.toLowerCase().indexOf(knowledgeQuery) !== -1;
-                });
-            if (matchedTopics.length > 0) {
-              cacc.push(Object.assign({}, cat, { topics: matchedTopics }));
-            }
-            return cacc;
-          }, []);
-          if (matchedCats.length > 0) {
-            acc.push(Object.assign({}, repo, { categories: matchedCats }));
-          }
-          return acc;
-        }, [])
-      : repoFiltered;
-
-    if (visibleRepos.length === 0) {
-      if (!knowledgeQuery) {
-        nodes.push(el('div', { className: 'empty-state', text: 'No knowledge data yet.' }));
-      } else {
-        nodes.push(el('div', { className: 'empty-state', text: 'No topics match your search.' }));
-      }
-      mountIn(container, nodes);
-      return;
-    }
-
-    // Count total memories across visible repos for the header.
-    let totalMemories = 0;
-    for (let ri = 0; ri < visibleRepos.length; ri++) {
-      totalMemories += (visibleRepos[ri].memoryCount || 0);
-    }
-
-    // Active repo for single-entry items (Overview / graph). When the filter
-    // pins one repo, use it; otherwise use the current workspace repo or the
-    // first repo in the list.
-    const activeRepo = kbRepoFilter
-      ? visibleRepos[0]
-      : (visibleRepos.find(function(r) { return r.repoName === state.currentRepoName; }) || visibleRepos[0]);
-
-    // Header: memory count + Rebuild button (dispatches jollimemory.compileNow).
-    const rebuildBtn = attachTextTip(
-      el('button', {
-        type: 'button',
-        className: 'iconbtn',
-        'aria-label': 'Rebuild Knowledge Wiki',
-      }, [el('i', { className: 'codicon codicon-database' })]),
-      'Rebuild Knowledge Wiki',
-    );
-    rebuildBtn.addEventListener('click', function() {
-      vscode.postMessage({ type: 'command', command: 'jollimemory.compileNow' });
-    });
-    nodes.push(el('div', { className: 'kn-header' }, [
-      el('span', { className: 'kn-header-label', text: 'Built from ' + totalMemories + ' memories' }),
-      rebuildBtn,
-    ]));
-
-    // Overview + Knowledge-graph entry rows for ONE repo. Both are inherently
-    // single-repo concepts (a repo's index.md wiki page / that repo's graph).
-    // Captured locals (not the shared activeRepo) so each call's click handler
-    // targets its own repo — this is what lets the same builder serve both the
-    // single top-level pair and the per-repo pairs nested in the tree below.
-    function knRepoEntries(repo) {
-      const out = [];
-      if (repo && repo.indexPath) {
-        const indexPath = repo.indexPath;
-        const overviewRow = el('div', { className: 'kn-entry', 'data-kn-action': 'open-index', 'data-path': indexPath }, [
-          el('span', { className: 'icon' }, [el('i', { className: 'codicon codicon-home' })]),
-          el('span', { className: 'label', text: 'Overview' }),
-        ]);
-        overviewRow.addEventListener('click', function() {
-          vscode.postMessage({ type: 'kb:openFile', path: indexPath });
-        });
-        out.push(overviewRow);
-      }
-      const repoName = repo ? repo.repoName : '';
-      const graphRow = el('div', { className: 'kn-entry', 'data-kn-action': 'view-graph' }, [
-        el('span', { className: 'icon' }, [el('i', { className: 'codicon codicon-type-hierarchy' })]),
-        el('span', { className: 'label', text: 'Knowledge graph' }),
-      ]);
-      graphRow.addEventListener('click', function() {
-        vscode.postMessage({ type: 'command', command: 'jollimemory.viewKnowledgeGraph', args: [repoName] });
-      });
-      out.push(graphRow);
-      return out;
-    }
-
-    // Overview/graph are suppressed while a search is active so the results
-    // list stays relevant. In single-repo view they sit at the top; in
-    // multi-repo (All repos) view there is no single "active" repo, so the
-    // pair is rendered per-repo inside the tree below instead — the old single
-    // top-level pair silently bound to the first/current repo regardless of
-    // which repo's topics the user was browsing.
-    if (!knowledgeQuery && visibleRepos.length === 1) {
-      const topEntries = knRepoEntries(activeRepo);
-      for (let i = 0; i < topEntries.length; i++) nodes.push(topEntries[i]);
-    }
-
-    // Repo -> category -> topic tree. When a search is active, all matched
-    // levels render expanded (no collapse toggle) so results are always visible.
-    for (let ri = 0; ri < visibleRepos.length; ri++) {
-      const repo = visibleRepos[ri];
-      const repoKey = 'kn-repo:' + repo.repoName;
-      const repoExpanded = knowledgeQuery ? true : knExpandState[repoKey] !== false;
-
-      const repoLabel = el('span', { className: 'kn-repo-label', text: repo.repoName });
-      const repoMeta = el('span', { className: 'kn-repo-meta', text: repo.memoryCount + ' memories' });
-      const repoTwirl = el('i', {
-        className: 'codicon ' + (repoExpanded ? 'codicon-chevron-down' : 'codicon-chevron-right') + ' commit-twirl',
-      });
-      const repoRow = el('div', { className: 'kn-repo-row tree-node' + (repoExpanded ? ' expanded' : '') }, [
-        repoTwirl,
-        el('span', { className: 'icon' }, [el('i', { className: 'codicon codicon-repo' })]),
-        repoLabel,
-        repoMeta,
-      ]);
-      if (!knowledgeQuery) {
-        repoRow.addEventListener('click', function() {
-          knExpandState[repoKey] = !repoExpanded;
-          renderKnowledge();
-        });
-      }
-      nodes.push(repoRow);
-
-      if (!repoExpanded) continue;
-
-      // Multi-repo view: this repo's own Overview / Knowledge-graph entries,
-      // rendered as the first children under the repo node so they target the
-      // repo unambiguously. Single-repo view shows the equivalent pair at the
-      // top level instead (above), so they are not duplicated here.
-      if (!knowledgeQuery && visibleRepos.length > 1) {
-        const repoEntries = knRepoEntries(repo);
-        for (let ei = 0; ei < repoEntries.length; ei++) nodes.push(repoEntries[ei]);
-      }
-
-      const categories = Array.isArray(repo.categories) ? repo.categories : [];
-
-      // Empty state: no compiled wiki yet — offer a Build CTA.
-      if (categories.length === 0) {
-        const buildBtn = el('button', {
-          type: 'button',
-          className: 'ob-btn ob-btn--primary kn-build-btn',
-          text: 'Build Knowledge Wiki',
-        });
-        buildBtn.addEventListener('click', function() {
-          vscode.postMessage({ type: 'command', command: 'jollimemory.compileNow' });
-        });
-        nodes.push(el('div', { className: 'kn-nowiki' }, [
-          el('p', { className: 'kn-nowiki-msg', text: 'No wiki compiled yet for this repo.' }),
-          buildBtn,
-        ]));
-        continue;
-      }
-
-      // Category rows.
-      for (let ci = 0; ci < categories.length; ci++) {
-        const cat = categories[ci];
-        const catKey = 'kn-cat:' + repo.repoName + '/' + cat.name;
-        // Categories start collapsed so topic entries stay hidden until the
-        // user opens a category (=== true, not !== false). Under an active
-        // query everything renders expanded so matches are always visible.
-        const catExpanded = knowledgeQuery ? true : knExpandState[catKey] === true;
-
-        const catTwirl = el('i', {
-          className: 'codicon ' + (catExpanded ? 'codicon-chevron-down' : 'codicon-chevron-right') + ' commit-twirl',
-        });
-        // Under an active query the category carries only its matched topics,
-        // so count the visible ones; otherwise use the full rollup count.
-        const catMetaText = (knowledgeQuery ? cat.topics.length : cat.topicCount) + ' topics';
-        const catChildren = [
-          catTwirl,
-          el('span', { className: 'icon' }, [el('i', { className: 'codicon codicon-folder' })]),
-          el('span', { className: 'label', text: cat.name }),
-          el('span', { className: 'kn-cat-meta', text: catMetaText }),
-        ];
-        const catRow = el('div', { className: 'kn-cat tree-node' + (catExpanded ? ' expanded' : '') }, catChildren);
-        // Category description (when present) rides as a hover tooltip so the
-        // single-line tree rhythm matches the Memory Bank folder rows.
-        if (cat.description) catRow.title = cat.description;
-        if (!knowledgeQuery) {
-          catRow.addEventListener('click', function() {
-            knExpandState[catKey] = !catExpanded;
-            renderKnowledge();
-          });
-        }
-        nodes.push(catRow);
-
-        if (!catExpanded) continue;
-
-        // Topic rows.
-        const topics = Array.isArray(cat.topics) ? cat.topics : [];
-        for (let ti = 0; ti < topics.length; ti++) {
-          const topic = topics[ti];
-          const topicRow = el('div', { className: 'kn-entry tree-node', 'data-kn-action': 'open-topic', 'data-path': topic.wikiFile || '' }, [
-            el('span', { className: 'twirl' }),
-            el('span', { className: 'icon' }, [el('i', { className: 'codicon codicon-markdown' })]),
-            el('span', { className: 'label', text: topic.title }),
-            el('span', { className: 'kn-topic-meta', text: topic.memoryCount + ' memories' }),
-          ]);
-          if (topic.wikiFile) {
-            const wikiFilePath = topic.wikiFile;
-            topicRow.addEventListener('click', function() {
-              vscode.postMessage({ type: 'kb:openFile', path: wikiFilePath });
-            });
-          }
-          nodes.push(topicRow);
-        }
-      }
-    }
-
-    mountIn(container, nodes);
-
-    // replaceChildren above destroyed the input the user was typing in. Restore
-    // focus when either (a) the input was focused at render time — covers
-    // host-pushed kb:knowledgeData arriving mid-typing — or (b) the debounced
-    // search set knRestoreSearchFocus. When we captured a live selection range
-    // we replay it exactly; otherwise (debounce-only path) we fall back to the
-    // end of the value so the user can keep typing seamlessly.
-    if (inputWasFocused || knRestoreSearchFocus) {
-      knRestoreSearchFocus = false;
-      const inp = document.getElementById('kn-search-input');
-      if (inp) {
-        inp.focus();
-        if (savedSelStart != null && savedSelEnd != null) {
-          inp.setSelectionRange(savedSelStart, savedSelEnd);
-        } else {
-          const len = inp.value.length;
-          inp.setSelectionRange(len, len);
-        }
-      }
-    }
   }
 
   // Click delegation for status entries with a command.
@@ -2216,22 +1891,6 @@ export function buildSidebarScript(): string {
   // In-flight kb:requestPrStatus requests keyed by branch. Guards against
   // re-posting on every render tick while the first response is in flight.
   const prStatusPending = {};
-
-  // Knowledge wiki data. Populated by 'kb:knowledgeData' inbound messages pushed
-  // by the host in response to a 'refresh' with scope 'knowledge'.
-  let knowledgeData = { repos: [] };
-  // Client-side search query for the Knowledge view. Set by the search input
-  // rendered in the Knowledge header. Lower-cased at write time so comparisons
-  // skip repeated toLowerCase calls.
-  let knowledgeQuery = '';
-  // Debounce handle for the Knowledge search input. Typing no longer re-renders
-  // on every keystroke (which destroyed the focused <input> via replaceChildren);
-  // instead a render is scheduled 2s after the user stops typing. Lives outside
-  // renderKnowledge so it survives the listener being re-created each render.
-  let knSearchDebounce = null;
-  // Set true by the debounced search before it re-renders, so renderKnowledge
-  // knows to restore focus + caret to the freshly-built input afterwards.
-  let knRestoreSearchFocus = false;
 
   function timeAgo(ts) {
     const diff = Date.now() - ts;
@@ -3475,23 +3134,23 @@ export function buildSidebarScript(): string {
     }, [header, body]);
   }
 
-  // Read-only working-indicator row shown at the top of Working Memory while the
-  // blocking post-commit worker runs (workerBusy && no ingest phase —
+  // Read-only summarizing-indicator row shown at the top of Working Memory while
+  // the blocking post-commit worker runs (workerBusy && no ingest phase —
   // ingest:wiki/graph keep their own header label and add no row).
   //
-  // worker:busy and worker:phase are INDEPENDENT channels: busy is driven by the
-  // lock file, phase only ever stores 'ingest'-prefixed values (else null). So
-  // "busy && no phase" does NOT prove a summary is running — a Memory Bank ingest
-  // run whose worker:busy arrives before its phase signal also lands here for a
-  // transient window, where labelling it "Summarizing…" is misleading. There is
-  // no positive "summarize" phase on the wire, so we show a NEUTRAL "Working…"
-  // indicator when the phase is unknown rather than asserting summarization.
+  // Per the redesign mockup this row reads "Summarizing <hash>…" (matching the
+  // .summarizing-row class name and every surrounding reference). worker:busy and
+  // worker:phase are independent channels (busy is lock-file-driven; phase only
+  // ever stores 'ingest'-prefixed values, else null), so "busy && no phase" is
+  // overwhelmingly the blocking summary — a Memory Bank ingest run can briefly
+  // land here before its phase signal arrives, but that transient window is rare
+  // and the mockup accepts the summarize wording over a vaguer neutral label.
   // The short hash is the workspace HEAD the host attaches to worker:busy;
-  // absent (older host / detached edge) it degrades to a bare "Working…".
+  // absent (older host / detached edge) it degrades to a bare "Summarizing…".
   function renderSummarizingRow() {
     if (!state.workerBusy || state.workerPhase) return null;
     const hash = state.summarizingHash;
-    const label = hash ? ('Working on ' + hash + '…') : 'Working…';
+    const label = hash ? ('Summarizing ' + hash + '…') : 'Summarizing…';
     return el('div', { className: 'tree-node summarizing-row', title: label }, [
       el('span', { className: 'icon summarizing-icon' }, [
         el('i', { className: 'codicon codicon-loading codicon-modifier-spin', 'aria-hidden': 'true' }),
@@ -3537,17 +3196,27 @@ export function buildSidebarScript(): string {
     }
     segs.push(el('span', { className: 'token-seg token-seg--output' }));
     var bar = el('div', { className: 'token-bar' }, segs);
-    // Cache-aware cost estimate (Sonnet 4.6 pricing, per the mockup tooltip's
-    // "assumes Sonnet pricing"): input 3 / output 15 / cached 0.30 USD per
-    // million tokens. Cached is priced at the cache-READ rate (0.1x input) —
-    // stats.cached folds cache_read + cache_creation, and creation costs more
-    // (1.25x), so this is deliberately a floor, which is why the tooltip says
-    // "actual spend may be higher".
-    var costUsd = (stats.input * 3 + stats.output * 15 + cached * 0.3) / 1000000;
+    // 'total' is the scalar floor (includes legacy memories that carry
+    // conversationTokens but no per-segment breakdown); the segments/cost derive
+    // from the breakdown. When NO memory on the branch reports a breakdown the
+    // segments are all zero, so a $ estimate and an "0 input · 0 output" legend
+    // would contradict the non-zero total — suppress both and show the total
+    // alone (the help tooltip already explains the partial reporting).
+    var hasBreakdown = stats.input > 0 || stats.output > 0 || cached > 0;
+    // Cost estimate (Sonnet 4.6 pricing, per the mockup tooltip's "assumes
+    // Sonnet pricing"): input 3 / output 15 / cached 3.75 USD per million tokens.
+    // The cached segment now carries cache_CREATION tokens (billed at 1.25x the
+    // input rate) — cache_READ is excluded upstream because it is cumulative per
+    // turn and would inflate the total. So this is a floor (a session's re-read of
+    // an already-cached prefix is real spend we deliberately do not count), which
+    // is why the tooltip says "actual spend may be higher".
+    var costUsd = (stats.input * 3 + stats.output * 15 + cached * 3.75) / 1000000;
     var costLabel = costUsd >= 0.01 ? '≈$' + costUsd.toFixed(2) : '<$0.01';
     var label = el('div', {
       className: 'token-bar-label',
-      text: formatTokens(stats.total) + ' tokens \xB7 ' + costLabel + ' \xB7 this branch',
+      text: hasBreakdown
+        ? formatTokens(stats.total) + ' tokens \xB7 ' + costLabel + ' \xB7 this branch'
+        : formatTokens(stats.total) + ' tokens \xB7 this branch',
     });
     // "?" help affordance — explains the partial-reporting total and the cost
     // estimate (both non-obvious). Wording tracks the mockup. The first sentence
@@ -3555,8 +3224,9 @@ export function buildSidebarScript(): string {
     // (older host → memories 0) it degrades to a generic total explanation.
     var reporting = stats.reporting || 0;
     var memories = stats.memories || 0;
-    var costSentence =
-      ' The ≈$ cost is a cache-aware estimate; it assumes Sonnet pricing and counts reporting memories only, so actual spend may be higher.';
+    var costSentence = hasBreakdown
+      ? ' The ≈$ cost is a cache-aware estimate; it assumes Sonnet pricing and counts reporting memories only, so actual spend may be higher.'
+      : '';
     var helpText;
     if (memories > 0 && reporting < memories) {
       helpText =
@@ -3568,7 +3238,8 @@ export function buildSidebarScript(): string {
         'All ' + memories + ' memories on this branch report token usage.' + costSentence;
     } else {
       helpText =
-        'Tokens used generating this branch’s memories.' + costSentence;
+        'Tokens your AI coding sessions spent on this branch — not the tokens Jolli spent summarizing them.' +
+        costSentence;
     }
     var help = attachTextTip(
       el('span', { className: 'token-bar-help', 'aria-label': 'About these token counts' }, [
@@ -3577,6 +3248,11 @@ export function buildSidebarScript(): string {
       helpText,
     );
     var labelRow = el('div', { className: 'token-bar-label-row' }, [label, help]);
+    // No per-segment legend when the breakdown is all zero — a "0 input · 0 output"
+    // row is noise next to the non-zero total.
+    if (!hasBreakdown) {
+      return el('div', { className: 'token-bar-wrap' }, [labelRow, bar]);
+    }
     var legendKids = [
       el('span', { className: 'tk-leg tk-leg--input', text: formatTokens(stats.input) + ' input' }),
       el('span', { className: 'tk-leg tk-leg--output', text: formatTokens(stats.output) + ' output' }),
@@ -3763,12 +3439,15 @@ export function buildSidebarScript(): string {
   function renderWorkerSignal() {
     if (!state.workerBusy) return null;
     const isIngest = state.workerPhase && state.workerPhase.indexOf('ingest') === 0;
-    // Blocking AI summary run: the header now carries only a compact "● AI"
-    // pill — the verbose "AI summary in progress…" text moved to the Working
-    // Memory "Summarizing <hash>…" row (renderSummarizingRow). Title keeps the
-    // full phrasing for hover/accessibility.
+    // Blocking AI summary run: the header carries only a compact "● AI" pill
+    // (the visible text stays short so it never crowds the narrow header). The
+    // hover title names the commit being summarized — "Summarizing <hash>…",
+    // matching the Working Memory row — degrading to a bare "Summarizing…" when
+    // the host attached no hash (older host / detached edge).
     if (!isIngest) {
-      return el('span', { className: 'section-ai-pill', title: 'AI summary in progress…' }, [
+      const hash = state.summarizingHash;
+      const aiTitle = hash ? ('Summarizing ' + hash + '…') : 'Summarizing…';
+      return el('span', { className: 'section-ai-pill', title: aiTitle }, [
         el('span', { className: 'section-ai-dot', 'aria-hidden': 'true' }),
         el('span', { className: 'section-ai-text', text: 'AI' }),
       ]);

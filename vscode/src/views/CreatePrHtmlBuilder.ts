@@ -81,21 +81,40 @@ function buildFileRows(vm: CreatePrViewModel): string {
 }
 
 function buildE2ePanel(vm: CreatePrViewModel): string {
-	if (vm.e2eScenarios.length === 0) return "";
-	const scenarioLabel = vm.e2eScenarios.length === 1 ? "SCENARIO" : "SCENARIOS";
-	const scenarioHtml = [...vm.e2eScenarios]
-		.map(
-			(s) =>
-				`<p><b>${esc(s.title)}</b></p>` +
-				`<ol>${s.steps.map((st) => `<li>${esc(st)}</li>`).join("")}</ol>` +
-				`<p><i>Expect:</i> ${s.expectedResults.map(esc).join("; ")}</p>`,
-		)
+	// `e2eScenarios` is typed as a required array, but this summary is
+	// deserialized from orphan-branch JSON with no read-time schema validation —
+	// an older schema, a hand-edited file, or a partial write can leave it a
+	// non-array (or an individual field below undefined/non-array). Guard at BOTH
+	// levels so a malformed summary degrades to empty instead of throwing: the
+	// container spread/`.length` here would throw BEFORE the per-scenario guard
+	// runs, and in this single synchronous build with no render try/catch that
+	// TypeError would white-screen the entire Create-PR panel and block opening
+	// any PR.
+	// Annotate the element type explicitly: `Array.isArray` narrows a readonly
+	// array to `any[]`, which would infect the `.map` callback params with `any`
+	// (noExplicitAny is a biome error). The view model's own type restores it.
+	const scenarios: CreatePrViewModel["e2eScenarios"] = Array.isArray(vm.e2eScenarios) ? vm.e2eScenarios : [];
+	if (scenarios.length === 0) return "";
+	const scenarioLabel = scenarios.length === 1 ? "SCENARIO" : "SCENARIOS";
+	const scenarioHtml = scenarios
+		.map((s) => {
+			const steps = Array.isArray(s.steps) ? s.steps : [];
+			const expected = Array.isArray(s.expectedResults) ? s.expectedResults : [];
+			// `esc` (escAttr) calls `.replace` with no coercion, so any non-string
+			// value from the same malformed-JSON class throws. Coerce the title AND
+			// every step / expectedResult element (`[null]`, `[42]` etc.) to a string.
+			return (
+				`<p><b>${esc(String(s.title ?? ""))}</b></p>` +
+				`<ol>${steps.map((st) => `<li>${esc(String(st ?? ""))}</li>`).join("")}</ol>` +
+				`<p><i>Expect:</i> ${expected.map((ex) => esc(String(ex ?? ""))).join("; ")}</p>`
+			);
+		})
 		.join("");
 	return (
 		`<div class="panel">` +
 		`<div class="panel-header">` +
 		`<span class="panel-title">E2E Test Guide</span>` +
-		`<span class="ship-status is-ok">${vm.e2eScenarios.length} ${scenarioLabel}</span>` +
+		`<span class="ship-status is-ok">${scenarios.length} ${scenarioLabel}</span>` +
 		`</div>` +
 		`<div class="md-mock">${scenarioHtml}</div>` +
 		`</div>`

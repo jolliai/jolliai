@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import type {
-	KnowledgeRepo,
 	MemoryEvidence,
 	SerializedTreeItem,
 	SidebarInboundMsg,
@@ -74,10 +73,10 @@ describe("SidebarMessages types", () => {
 		expect(msg.mode).toBe("multi");
 	});
 
-	it("admits 'knowledge' as a SidebarTab and refresh scope", () => {
-		const tab: SidebarTab = "knowledge";
-		const msg: SidebarOutboundMsg = { type: "refresh", scope: "knowledge" };
-		expect(tab).toBe("knowledge");
+	it("admits 'kb' as a SidebarTab and refresh scope", () => {
+		const tab: SidebarTab = "kb";
+		const msg: SidebarOutboundMsg = { type: "refresh", scope: "kb" };
+		expect(tab).toBe("kb");
 		expect(msg.type).toBe("refresh");
 	});
 
@@ -144,18 +143,4 @@ describe("SidebarMessages types", () => {
 		}
 	});
 
-	it("admits kb:knowledgeData inbound with repo/category/topic shape", () => {
-		const repo: KnowledgeRepo = {
-			repoName: "acme",
-			memoryCount: 30,
-			indexPath: "/kb/acme/_wiki/_index.md",
-			categories: [
-				{ name: "Storage", description: "where memories live", topicCount: 1, memoryCount: 8,
-				  topics: [{ title: "Storage", stableSlug: "storage", memoryCount: 8, wikiFile: "/kb/acme/_wiki/topic--storage.md" }] },
-			],
-		};
-		const msg: SidebarInboundMsg = { type: "kb:knowledgeData", repos: [repo] };
-		expect(msg.type).toBe("kb:knowledgeData");
-		expect(repo.categories[0].topics[0].wikiFile).toContain("topic--storage.md");
-	});
 });

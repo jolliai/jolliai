@@ -24,7 +24,11 @@ vi.mock("vscode", () => ({
 	ViewColumn: { One: 1, Active: -1 },
 	Uri: {
 		file: (p: string) => ({ scheme: "file", fsPath: p, toString: () => `file://${p}` }),
-		parse: (s: string) => ({ scheme: "https", toString: () => s, value: s }),
+		parse: (s: string) => ({
+			scheme: (s.match(/^([a-z][a-z0-9+.-]*):/i)?.[1] ?? "file").toLowerCase(),
+			toString: () => s,
+			value: s,
+		}),
 		joinPath: (base: { fsPath: string }, ...segs: Array<string>) => {
 			const fsPath = [base.fsPath.replace(/\/$/, ""), ...segs].join("/");
 			return { scheme: "file", fsPath, toString: () => `file://${fsPath}` };
@@ -310,6 +314,43 @@ describe("CreatePrWebviewPanel", () => {
 		created[0].onMsg({ command: "openPr", url: "https://gh/pr/7" });
 		await Promise.resolve();
 		expect(vscode.env.openExternal).toHaveBeenCalled();
+	});
+
+	it("openPr: rejects a non-http(s) scheme (file:) and never opens it", async () => {
+		const vscode = await import("vscode");
+		const logMod = await import("../util/Logger.js");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		created[0].onMsg({ command: "openPr", url: "file:///etc/passwd" });
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(vscode.env.openExternal).not.toHaveBeenCalled();
+		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
+			"CreatePrPanel",
+			expect.stringContaining("non-http(s)"),
+		);
+	});
+
+	it("in-flight guard: a second createPr while the first is still awaiting posts prCreateFailed and does not double-dispatch", async () => {
+		// The webview's own inFlight flag is reset by a re-render (re-running the
+		// command), so only the host-side lock prevents a concurrent push + duplicate
+		// PR. Hold the first handleCreatePr pending, fire a second createPr, and
+		// assert it never reaches handleCreatePr a second time.
+		let releaseFirst: () => void = () => {};
+		const pending = new Promise<void>((resolve) => {
+			releaseFirst = () => resolve();
+		});
+		mocks.handleCreatePr.mockReturnValueOnce(pending);
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		created[0].onMsg({ command: "createPr" });
+		created[0].onMsg({ command: "createPr" });
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		expect(mocks.handleCreatePr).toHaveBeenCalledTimes(1);
+		expect(created[0].webview.postMessage).toHaveBeenCalledWith({ command: "prCreateFailed" });
+		// Release the first call; the lock clears so a later createPr works again.
+		releaseFirst();
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		created[0].onMsg({ command: "createPr" });
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(mocks.handleCreatePr).toHaveBeenCalledTimes(2);
 	});
 
 	it("onDidDispose: clears the singleton so the next show() creates a new panel", async () => {

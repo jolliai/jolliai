@@ -11,7 +11,7 @@
  */
 
 import { createLogger } from "../Logger.js";
-import type { TranscriptEntry } from "../Types.js";
+import type { ConversationTokenBreakdown, TranscriptEntry } from "../Types.js";
 import { parseTranscriptLine } from "./TranscriptReader.js";
 
 const log = createLogger("TranscriptParser");
@@ -22,7 +22,16 @@ const log = createLogger("TranscriptParser");
  */
 export interface TranscriptParser {
 	parseLine(line: string, lineNum: number): TranscriptEntry | null;
-	parseUsageTokens?(line: string, lineNum: number): number;
+	/** Per-turn token usage split into input / output / cached segments. The
+	 *  reader sums these into the scalar `usageTokens` total. Absent method =
+	 *  source exposes no usage (all downstream sums default to 0). */
+	parseUsageTokens?(line: string, lineNum: number): ConversationTokenBreakdown;
+	/** ISO timestamp of a raw line even when {@link parseLine} yields no entry
+	 *  (e.g. a tool-only assistant turn — no text content, but a real timestamp
+	 *  and usage). The reader needs this so the `beforeTimestamp` cutoff can gate
+	 *  token accumulation / cursor advance on such lines, not only on entry-bearing
+	 *  ones. Absent method = the cutoff falls back to entry timestamps only. */
+	parseTimestamp?(line: string, lineNum: number): string | undefined;
 }
 
 /**
@@ -34,14 +43,14 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 		return parseTranscriptLine(line, lineNum);
 	}
 
-	parseUsageTokens(line: string, _lineNum?: number): number {
+	parseUsageTokens(line: string, _lineNum?: number): ConversationTokenBreakdown {
 		try {
 			const o = JSON.parse(line) as {
 				message?: { usage?: Record<string, unknown> };
 				usage?: Record<string, unknown>;
 			};
 			const u = o.message?.usage ?? o.usage;
-			if (!u || typeof u !== "object") return 0;
+			if (!u || typeof u !== "object") return { input: 0, output: 0, cached: 0 };
 			const n = (k: string) => (typeof u[k] === "number" ? (u[k] as number) : 0);
 			// Per-turn token *delta* only — deliberately EXCLUDES cache_read_input_tokens.
 			// Real Claude transcripts (~/.claude/projects/*/*.jsonl) emit a cumulative
@@ -53,10 +62,24 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 			// is input (uncached input) + cache_creation (the portion newly written to the
 			// cache this turn) + output; the cache *read* of an already-counted prefix is
 			// not new work and must not be summed. See the fixture-backed test for the
-			// observed cumulative shape.
-			return n("input_tokens") + n("cache_creation_input_tokens") + n("output_tokens");
+			// observed cumulative shape. `cached` carries cache_creation so the segment
+			// reflects real cache-write volume without the cumulative cache_read trap.
+			return {
+				input: n("input_tokens"),
+				output: n("output_tokens"),
+				cached: n("cache_creation_input_tokens"),
+			};
 		} catch {
-			return 0;
+			return { input: 0, output: 0, cached: 0 };
+		}
+	}
+
+	parseTimestamp(line: string, _lineNum?: number): string | undefined {
+		try {
+			const o = JSON.parse(line) as { timestamp?: unknown };
+			return typeof o.timestamp === "string" ? o.timestamp : undefined;
+		} catch {
+			return undefined;
 		}
 	}
 }

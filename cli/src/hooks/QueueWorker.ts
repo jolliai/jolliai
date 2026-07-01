@@ -119,6 +119,7 @@ import {
 	type CommitSource,
 	type CommitSummary,
 	type CommitType,
+	type ConversationTokenBreakdown,
 	CURRENT_SCHEMA_VERSION,
 	type DiffStats,
 	type GitOperation,
@@ -1516,11 +1517,8 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// advanced (consumed) but their entries are dropped from the summary. The plans/notes/refs
 	// exclusion read here drives both prompt-block filtering and the discard pass below.
 	const exclusions = await readExclusions(cwd);
-	const { sessionTranscripts, totalEntries, humanEntries, conversationTokens } = await loadSessionTranscripts(
-		cwd,
-		config,
-		op.createdAt,
-	);
+	const { sessionTranscripts, totalEntries, humanEntries, conversationTokens, conversationTokenBreakdown } =
+		await loadSessionTranscripts(cwd, config, op.createdAt);
 
 	// Step 5: Get git diff and stats (moved before guard to enable diff-only summaries)
 	stepStart = now();
@@ -1651,7 +1649,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 				// ADDS the field — it never deletes an already-present 0 — so an
 				// unconditional `conversationTokens: 0` here would survive onto the
 				// stored summary, where the success path omits it entirely.
-				...(conversationTokens > 0 && { conversationTokens }),
+				...(conversationTokens > 0 && { conversationTokens, conversationTokenBreakdown }),
 				llm: {
 					model: config.model ?? "unknown",
 					inputTokens: 0,
@@ -1794,7 +1792,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		commitSource,
 		...summaryResult,
 		/* v8 ignore next -- conversationTokens=0 arm: only omitted when no usage-aware sessions ran */
-		...(conversationTokens > 0 && { conversationTokens }),
+		...(conversationTokens > 0 && { conversationTokens, conversationTokenBreakdown }),
 		diffStats,
 		...(llmFailed ? { summaryError: LLM_FAILED } : {}),
 		...(planRefs.length > 0 ? { plans: planRefs } : {}),
@@ -2194,6 +2192,7 @@ function buildHoistedAmendRoot(
 		readonly transcriptEntries?: number;
 		readonly conversationTurns?: number;
 		readonly conversationTokens?: number;
+		readonly conversationTokenBreakdown?: ConversationTokenBreakdown;
 	},
 ): CommitSummary {
 	return {
@@ -2215,7 +2214,12 @@ function buildHoistedAmendRoot(
 		...(stats?.transcriptEntries !== undefined && { transcriptEntries: stats.transcriptEntries }),
 		...(stats?.conversationTurns !== undefined && { conversationTurns: stats.conversationTurns }),
 		...(stats?.conversationTokens !== undefined &&
-			stats.conversationTokens > 0 && { conversationTokens: stats.conversationTokens }),
+			stats.conversationTokens > 0 && {
+				conversationTokens: stats.conversationTokens,
+				...(stats.conversationTokenBreakdown && {
+					conversationTokenBreakdown: stats.conversationTokenBreakdown,
+				}),
+			}),
 		...(hoisted.summaryError && { summaryError: hoisted.summaryError }),
 		/* v8 ignore stop */
 		...hoistMetadataFromOldSummary(oldSummary),
@@ -2259,6 +2263,7 @@ async function applyAmendShortCircuit(
 	totalEntries: number,
 	humanEntries: number,
 	conversationTokens: number,
+	conversationTokenBreakdown: ConversationTokenBreakdown,
 	cwd: string,
 	pipelineStart: number,
 	oldHash: string,
@@ -2280,7 +2285,12 @@ async function applyAmendShortCircuit(
 		},
 		metadata ?? {},
 		amendFullDiffStats,
-		{ transcriptEntries: totalEntries, conversationTurns: humanEntries, conversationTokens },
+		{
+			transcriptEntries: totalEntries,
+			conversationTurns: humanEntries,
+			conversationTokens,
+			conversationTokenBreakdown,
+		},
 	);
 
 	await storeSummary(root, cwd, false, transcriptArtifact ? { transcript: transcriptArtifact } : undefined);
@@ -2337,11 +2347,8 @@ async function handleAmendPipeline(
 	// exclusion read here drives prompt-block filtering and the discard pass below.
 	const amendConfig = await loadConfig();
 	const amendExclusions = await readExclusions(cwd);
-	const { sessionTranscripts, totalEntries, humanEntries, conversationTokens } = await loadSessionTranscripts(
-		cwd,
-		amendConfig,
-		beforeTimestamp,
-	);
+	const { sessionTranscripts, totalEntries, humanEntries, conversationTokens, conversationTokenBreakdown } =
+		await loadSessionTranscripts(cwd, amendConfig, beforeTimestamp);
 
 	// Get git diff and stats. diffOverride (Scenario 1) provides oldHash->newHash
 	// (the actual amend delta); default HEAD~1..HEAD is the full amended diff.
@@ -2432,6 +2439,7 @@ async function handleAmendPipeline(
 			totalEntries,
 			humanEntries,
 			conversationTokens,
+			conversationTokenBreakdown,
 			cwd,
 			pipelineStart,
 			oldHash,
@@ -2532,7 +2540,7 @@ async function handleAmendPipeline(
 				// below, and the assembler's `...(conversationTokens > 0 && …)` spread
 				// only ADDS the field — it cannot delete a literal 0 carried in via
 				// `...delta`, so an unconditional 0 here would survive onto the summary.
-				...(conversationTokens > 0 && { conversationTokens }),
+				...(conversationTokens > 0 && { conversationTokens, conversationTokenBreakdown }),
 				llm: {
 					model: amendConfig.model ?? "unknown",
 					inputTokens: 0,
@@ -2572,6 +2580,7 @@ async function handleAmendPipeline(
 			totalEntries,
 			humanEntries,
 			conversationTokens,
+			conversationTokenBreakdown,
 			cwd,
 			pipelineStart,
 			oldHash,
@@ -2669,7 +2678,12 @@ async function handleAmendPipeline(
 			},
 			metadata ?? {},
 			amendFullDiffStats,
-			{ transcriptEntries: totalEntries, conversationTurns: humanEntries, conversationTokens },
+			{
+				transcriptEntries: totalEntries,
+				conversationTurns: humanEntries,
+				conversationTokens,
+				conversationTokenBreakdown,
+			},
 		);
 		await storeSummary(
 			root,
@@ -2746,7 +2760,7 @@ async function handleAmendPipeline(
 		...(metadata?.commitSource && { commitSource: metadata.commitSource }),
 		...delta,
 		/* v8 ignore next -- conversationTokens=0 arm: only omitted when no usage-aware sessions ran */
-		...(conversationTokens > 0 && { conversationTokens }),
+		...(conversationTokens > 0 && { conversationTokens, conversationTokenBreakdown }),
 		diffStats: amendFullDiffStats,
 		...(deltaLlmFailed && { summaryError: LLM_FAILED }),
 		...(freshLeafPlanRefs.length > 0 ? { plans: freshLeafPlanRefs } : {}),
@@ -2803,6 +2817,7 @@ async function loadSessionTranscripts(
 	totalEntries: number;
 	humanEntries: number;
 	conversationTokens: number;
+	conversationTokenBreakdown: ConversationTokenBreakdown;
 }> {
 	const trackedSessions = filterSessionsByEnabledIntegrations(await loadAllSessions(cwd), config);
 
@@ -2875,20 +2890,18 @@ async function loadSessionTranscripts(
 
 	const rawAll = await readAllTranscripts(allSessions, cwd, beforeTimestamp);
 	// Keep only checked conversations for the summary; excluded ones were read
-	// purely to advance their cursor (discard). Their usage tokens must be dropped
-	// from conversationTokens too — otherwise the stored token bar overcounts by the
-	// excluded conversations' tokens while the summary body and entry counts reflect
-	// only the kept ones. Sum tokens over the retained conversations only.
-	let retainedConversationTokens = 0;
-	for (const [key, tokens] of rawAll.tokensByKey) {
-		if (!excludedConversationKeys.has(key)) retainedConversationTokens += tokens;
-	}
+	// purely to advance their cursor (discard). Drop them at this SINGLE point from
+	// BOTH the entry stream and the per-session token map — the downstream token
+	// reconciliation sums `raw.perSessionTokens`, so an excluded conversation left
+	// in that map would have its tokens re-added to the stored total (overcounting
+	// the branch token bar) even though the summary body and entry counts reflect
+	// only the kept ones.
 	const raw = {
 		...rawAll,
-		conversationTokens: retainedConversationTokens,
 		sessionTranscripts: rawAll.sessionTranscripts.filter(
 			(s) => !excludedConversationKeys.has(conversationKey(s.source ?? "claude", s.sessionId)),
 		),
+		perSessionTokens: new Map([...rawAll.perSessionTokens].filter(([key]) => !excludedConversationKeys.has(key))),
 	};
 
 	// Apply per-session conversation-edit overlays (panel-authored deletes/edits
@@ -2925,28 +2938,68 @@ async function loadSessionTranscripts(
 		}
 	}
 
-	// Reconcile conversationTokens against the overlay-applied entry set.
+	// Reconcile conversationTokens against the overlay-applied entry set,
+	// PER SESSION.
 	//
-	// `raw.conversationTokens` is summed per *JSONL line* in readAllTranscripts
-	// (TranscriptEntry carries no per-entry token field — usage lives only on the
-	// raw assistant turns and is accumulated before merge). Overlay deletes then
-	// drop merged entries from `sessionTranscripts` without any way to subtract the
-	// tokens those deleted turns consumed: the token-to-entry attribution simply
-	// does not exist post-merge. So when an overlay has REMOVED entries (the
-	// post-overlay count is below the pre-overlay count), the raw sum no longer
-	// describes the surviving conversation and would overcount — zero it rather than
-	// report an inflated, now-meaningless figure. (`conversationTokens > 0` guards in
-	// the assembler then omit the field entirely, matching the no-usage case.)
+	// Token usage is summed per *JSONL line* in readAllTranscripts (TranscriptEntry
+	// carries no per-entry token field — usage lives only on the raw assistant turns
+	// and is accumulated before merge). Overlay deletes then drop merged entries from
+	// `sessionTranscripts` without any way to subtract the tokens those deleted turns
+	// consumed: the token-to-entry attribution simply does not exist post-merge.
 	//
-	// Edit-only overlays keep the entry count unchanged: those tokens were genuinely
-	// spent generating the original turns, so we keep the raw sum rather than zero it
-	// on a content rewrite that has no token attribution either way.
-	let preOverlayEntries = 0;
-	for (const s of raw.sessionTranscripts) preOverlayEntries += s.entries.length;
-	const overlayRemovedEntries = totalEntries < preOverlayEntries;
-	const conversationTokens = overlayRemovedEntries ? 0 : raw.conversationTokens;
+	// So when an overlay has REMOVED entries from a session (its post-overlay count
+	// is below its pre-overlay count), that session's raw sum no longer describes its
+	// surviving conversation and would overcount — zero THAT SESSION rather than
+	// report an inflated figure. Reconciling per session (rather than at the aggregate
+	// level) means a delete in one conversation no longer wipes the real, untouched
+	// token counts of every other conversation in the same commit. We still can't
+	// prorate within the pruned session (no per-entry attribution), so zeroing it
+	// whole is the finest granularity available.
+	//
+	// Edit-only overlays keep a session's entry count unchanged: those tokens were
+	// genuinely spent generating the original turns, so we keep the raw sum rather
+	// than zero it on a content rewrite that has no token attribution either way.
+	// Zero-entry sessions (usage lines, no merged entries) appear in neither count
+	// map (0 vs 0), so they are never flagged as removed and keep their tokens.
+	const entryCountBySession = (sessions: ReadonlyArray<SessionTranscript>): Map<string, number> => {
+		const counts = new Map<string, number>();
+		for (const s of sessions) {
+			const key = `${s.source ?? "claude"}:${s.sessionId}`;
+			counts.set(key, (counts.get(key) ?? 0) + s.entries.length);
+		}
+		return counts;
+	};
+	const preBySession = entryCountBySession(raw.sessionTranscripts);
+	const postBySession = entryCountBySession(sessionTranscripts);
 
-	return { allSessions, sessionTranscripts, totalEntries, humanEntries, conversationTokens };
+	let conversationTokens = 0;
+	let ctInput = 0;
+	let ctOutput = 0;
+	let ctCached = 0;
+	for (const [key, bucket] of raw.perSessionTokens) {
+		// A session removed by an overlay has a lower post-overlay entry count than
+		// its pre-overlay count; skip its (now-unattributable) tokens. Sessions the
+		// overlay left alone — and zero-entry sessions (0 vs 0) — contribute in full.
+		if ((postBySession.get(key) ?? 0) < (preBySession.get(key) ?? 0)) continue;
+		conversationTokens += bucket.tokens;
+		ctInput += bucket.breakdown.input;
+		ctOutput += bucket.breakdown.output;
+		ctCached += bucket.breakdown.cached;
+	}
+	const conversationTokenBreakdown: ConversationTokenBreakdown = {
+		input: ctInput,
+		output: ctOutput,
+		cached: ctCached,
+	};
+
+	return {
+		allSessions,
+		sessionTranscripts,
+		totalEntries,
+		humanEntries,
+		conversationTokens,
+		conversationTokenBreakdown,
+	};
 }
 
 /**
@@ -2967,7 +3020,14 @@ async function readAllTranscripts(
 	totalEntries: number;
 	humanEntries: number;
 	conversationTokens: number;
-	tokensByKey: Map<string, number>;
+	/**
+	 * Per-conversation token attribution keyed by `conversationKey(source, sessionId)`.
+	 * The caller drops excluded conversations from this map so the reconciliation in
+	 * `loadSessionTranscripts` never re-adds their tokens, and zeroes ONLY the session
+	 * an overlay actually pruned — see the reconciliation comment there. Includes
+	 * zero-entry sessions (usage lines with no merged entries) so their tokens survive.
+	 */
+	perSessionTokens: Map<string, { tokens: number; breakdown: { input: number; output: number; cached: number } }>;
 }> {
 	const sessionTranscripts: SessionTranscript[] = [];
 	let totalEntries = 0;
@@ -2977,7 +3037,10 @@ async function readAllTranscripts(
 	// conversations' tokens from the stored total. Keyed by conversationKey and
 	// populated even when a slice yields zero merged entries (a usage-only slice),
 	// so the subtraction stays exact.
-	const tokensByKey = new Map<string, number>();
+	const perSessionTokens = new Map<
+		string,
+		{ tokens: number; breakdown: { input: number; output: number; cached: number } }
+	>();
 
 	for (const session of sessions) {
 		const cursor = await loadCursorForTranscript(session.transcriptPath, cwd);
@@ -3063,8 +3126,24 @@ async function readAllTranscripts(
 		// independent concerns, so accumulate tokens here, before the entries gate.
 		const usage = result.usageTokens ?? 0;
 		conversationTokens += usage;
+
+		// Attribute this slice's tokens to its conversation so the caller can drop
+		// excluded conversations and overlay-delete reconciliation can zero only the
+		// pruned session (not the whole commit). Keyed by conversationKey — the same
+		// (source, sessionId) identity used everywhere else; a repeated session merges
+		// into its bucket rather than overwriting.
 		const convKey = conversationKey(source, session.sessionId);
-		tokensByKey.set(convKey, (tokensByKey.get(convKey) ?? 0) + usage);
+		const bucket = perSessionTokens.get(convKey) ?? {
+			tokens: 0,
+			breakdown: { input: 0, output: 0, cached: 0 },
+		};
+		bucket.tokens += usage;
+		if (result.usageBreakdown) {
+			bucket.breakdown.input += result.usageBreakdown.input;
+			bucket.breakdown.output += result.usageBreakdown.output;
+			bucket.breakdown.cached += result.usageBreakdown.cached;
+		}
+		perSessionTokens.set(convKey, bucket);
 
 		if (result.entries.length > 0) {
 			sessionTranscripts.push({
@@ -3089,7 +3168,7 @@ async function readAllTranscripts(
 		await saveCursor(result.newCursor, cwd);
 	}
 
-	return { sessionTranscripts, totalEntries, humanEntries, conversationTokens, tokensByKey };
+	return { sessionTranscripts, totalEntries, humanEntries, conversationTokens, perSessionTokens };
 }
 
 /**
