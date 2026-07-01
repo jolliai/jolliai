@@ -39,6 +39,11 @@ describe("SummaryCssBuilder", () => {
 		expect(css).toContain(".separator");
 	});
 
+	it("lets the [hidden] attribute actually hide a filtered collaborator row (display:flex must not override it)", () => {
+		const css = buildCss();
+		expect(css).toContain(".share-collab-row[hidden]");
+	});
+
 	it("contains the PR section CSS from buildPrSectionCss()", () => {
 		expect(css).toContain("/* pr-css */");
 	});

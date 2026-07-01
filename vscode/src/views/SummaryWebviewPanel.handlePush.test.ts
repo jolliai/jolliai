@@ -28,6 +28,7 @@ const {
 	openExternal,
 	executeCommand,
 	getConfiguration,
+	withProgressMock,
 } = vi.hoisted(() => ({
 	postMessage: vi.fn().mockResolvedValue(true),
 	onDidReceiveMessage: vi.fn(),
@@ -44,6 +45,7 @@ const {
 	openExternal: vi.fn(),
 	executeCommand: vi.fn(),
 	getConfiguration: vi.fn(() => ({ get: vi.fn() })),
+	withProgressMock: vi.fn((_opts: unknown, work: () => unknown) => work()),
 }));
 
 const { createWebviewPanel } = vi.hoisted(() => ({
@@ -70,7 +72,9 @@ vi.mock("vscode", () => ({
 		showQuickPick,
 		showOpenDialog,
 		showSaveDialog,
+		withProgress: withProgressMock,
 	},
+	ProgressLocation: { Notification: 15 },
 	env: {
 		clipboard: { writeText: clipboardWriteText },
 		openExternal,
@@ -115,6 +119,41 @@ vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 
 vi.mock("../util/WorkspaceUtils.js", () => ({
 	loadGlobalConfig: mockLoadConfig,
+}));
+
+const {
+	mockOpenShareModal,
+	mockCreateShareModal,
+	mockRevokeShareModal,
+	mockShareModalTarget,
+	mockSetShareExpiryModal,
+	mockSetShareVisibilityModal,
+	mockListOrgMembers,
+} = vi.hoisted(() => ({
+	mockOpenShareModal: vi.fn().mockResolvedValue(undefined),
+	mockCreateShareModal: vi.fn().mockResolvedValue(undefined),
+	mockRevokeShareModal: vi.fn().mockResolvedValue(undefined),
+	mockShareModalTarget: vi.fn().mockResolvedValue(undefined),
+	mockSetShareExpiryModal: vi.fn().mockResolvedValue(undefined),
+	mockSetShareVisibilityModal: vi.fn().mockResolvedValue(undefined),
+	mockListOrgMembers: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../services/BranchShareModal.js", () => ({
+	openShareModal: mockOpenShareModal,
+	createShareModal: mockCreateShareModal,
+	revokeShareModal: mockRevokeShareModal,
+	shareModalTarget: mockShareModalTarget,
+	setShareExpiryModal: mockSetShareExpiryModal,
+	setShareVisibilityModal: mockSetShareVisibilityModal,
+}));
+
+vi.mock("../services/JolliShareService.js", () => ({
+	listOrgMembers: mockListOrgMembers,
+}));
+
+vi.mock("../../../cli/src/core/BranchShareSnapshot.js", () => ({
+	resolveShareHead: vi.fn().mockResolvedValue(undefined),
 }));
 
 const { mockGenerateE2eTest, mockTranslateToEnglish } = vi.hoisted(() => ({
@@ -164,6 +203,7 @@ vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 	storeNotes: mockStoreNotes,
 	storePlans: mockStorePlans,
 	storeSummary: mockStoreSummary,
+	resolveEffectiveTopics: vi.fn(() => []),
 }));
 
 const { mockDeleteTopicInTree, mockUpdateTopicInTree } = vi.hoisted(() => ({
@@ -464,6 +504,14 @@ const stubBridge = {
 						artifacts,
 					) as Promise<void>),
 	),
+	// Share path reads the current branch here (the snapshot content is sourced
+	// from the current checkout, so the share's branch label/key follows it).
+	// Defaults to the branch the share tests open the panel on.
+	getCurrentBranch: vi.fn().mockResolvedValue("feature/share"),
+	// Share popover flags the Owner collaborator row by matching this against the
+	// repo contributors' emails; the name falls back to git user.name.
+	getCurrentUserEmail: vi.fn().mockResolvedValue("dev@example.com"),
+	getCurrentUserName: vi.fn().mockResolvedValue("Dev"),
 	// Stale-commit guard reads the index via this bridge wrapper. Default to
 	// "empty index" so push tests stay on the happy path.
 	getSummaryIndexEntryMap: vi.fn().mockResolvedValue(new Map()),
@@ -877,5 +925,164 @@ describe("SummaryWebviewPanel handlePush", () => {
 				}),
 			);
 		});
+	});
+});
+
+describe("SummaryWebviewPanel share modal", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		(SummaryWebviewPanel as unknown as { currentMemoryPanel: undefined }).currentMemoryPanel = undefined;
+		(SummaryWebviewPanel as unknown as { commitPanels: Map<string, unknown> }).commitPanels.clear();
+		mockLoadConfig.mockResolvedValue({ apiKey: "test", jolliApiKey: "jk_valid" });
+	});
+
+	it("routes shareBranch / shareRevoke to the modal state machine", async () => {
+		const dispatch = await setupPanel({ branch: "feature/share" });
+
+		dispatch({ command: "shareBranch" });
+		await flushPromises();
+		expect(mockOpenShareModal).toHaveBeenCalledTimes(1);
+		const [, ctx] = mockOpenShareModal.mock.calls[0];
+		expect(ctx).toMatchObject({ workspaceRoot, branch: "feature/share", apiKey: "jk_valid" });
+
+		dispatch({ command: "shareRevoke" });
+		await flushPromises();
+		expect(mockRevokeShareModal).toHaveBeenCalledTimes(1);
+	});
+
+	it("routes shareSetAudience (people + recipients) to setShareVisibilityModal", async () => {
+		const dispatch = await setupPanel({ branch: "feature/share" });
+		dispatch({ command: "shareSetAudience", visibility: "people", recipients: ["Ext@GMAIL.com", "bad", "ext@gmail.com"] });
+		await flushPromises();
+		expect(mockSetShareVisibilityModal).toHaveBeenCalledTimes(1);
+		const [, , visibility, recipients] = mockSetShareVisibilityModal.mock.calls[0];
+		expect(visibility).toBe("people");
+		expect(recipients).toEqual(["ext@gmail.com"]);
+	});
+
+	it("routes shareCreate to createShareModal with validated audience and recipients", async () => {
+		const dispatch = await setupPanel({ branch: "feature/share" });
+		dispatch({ command: "shareCreate", visibility: "people", recipients: ["A@X.com", "nope"], shareKind: "commit" });
+		await flushPromises();
+		expect(mockCreateShareModal).toHaveBeenCalledTimes(1);
+		const [, ctx] = mockCreateShareModal.mock.calls[0];
+		expect(ctx).toMatchObject({ visibility: "people", recipients: ["a@x.com"] });
+	});
+
+	it("rejects invalid share messages before they reach the modal services", async () => {
+		const dispatch = await setupPanel({ branch: "feature/share" });
+		dispatch({ command: "shareSetAudience", visibility: "admin" });
+		dispatch({ command: "shareSetExpiry", days: 13 });
+		dispatch({ command: "shareOpenTarget", target: "javascript" });
+		dispatch({ command: "shareCreate", visibility: "admin" });
+		await flushPromises();
+		expect(mockSetShareVisibilityModal).not.toHaveBeenCalled();
+		expect(mockSetShareExpiryModal).not.toHaveBeenCalled();
+		expect(mockShareModalTarget).not.toHaveBeenCalled();
+		expect(mockCreateShareModal).not.toHaveBeenCalled();
+		expect(showErrorMessage).toHaveBeenCalledTimes(4);
+	});
+
+	it("resolves the owner name + builds the deduped add-people directory from org members", async () => {
+		// A case-insensitive duplicate exercises the directory dedupe.
+		mockListOrgMembers.mockResolvedValueOnce([
+			{ name: "Dev Eloper", email: "dev@example.com" },
+			{ name: "Dup", email: "DEV@example.com" },
+		]);
+		const dispatch = await setupPanel({ branch: "feature/share" });
+		dispatch({ command: "shareBranch" });
+		await flushPromises();
+		const [, ctx] = mockOpenShareModal.mock.calls[0];
+		expect(ctx.owner).toEqual({ name: "Dev Eloper", email: "dev@example.com" });
+		expect(ctx.directory).toEqual([{ name: "Dev Eloper", email: "dev@example.com" }]);
+	});
+
+	it("skips the org-member fetch when there is no API key", async () => {
+		mockLoadConfig.mockResolvedValue({});
+		const dispatch = await setupPanel({ branch: "feature/share" });
+		dispatch({ command: "shareBranch" });
+		await flushPromises();
+		expect(mockListOrgMembers).not.toHaveBeenCalled();
+		const [, ctx] = mockOpenShareModal.mock.calls[0];
+		expect(ctx.apiKey).toBeUndefined();
+	});
+
+	it("branch share is labeled with the CURRENT branch, not the opened summary's branch", async () => {
+		// Panel opened on feature/a, but the user has since checked out feature/b.
+		// The snapshot content comes from the current checkout, so the share must be
+		// labeled/keyed feature/b — otherwise it'd publish feature/b's content under
+		// a feature/a label.
+		const dispatch = await setupPanel({ branch: "feature/a" });
+		(stubBridge.getCurrentBranch as ReturnType<typeof vi.fn>).mockResolvedValue("feature/b");
+
+		dispatch({ command: "shareBranch" });
+		await flushPromises();
+		const [, ctx] = mockOpenShareModal.mock.calls[0];
+		expect(ctx).toMatchObject({ branch: "feature/b" });
+	});
+
+	it("commit share stays bound to the opened summary when the current branch changed", async () => {
+		const dispatch = await setupPanel({ branch: "feature/a", commitHash: "abc123" });
+		(stubBridge.getCurrentBranch as ReturnType<typeof vi.fn>).mockResolvedValue("feature/b");
+
+		dispatch({ command: "shareBranch", shareKind: "commit" });
+		await flushPromises();
+		const [, ctx] = mockOpenShareModal.mock.calls[0];
+		expect(ctx).toMatchObject({ branch: "feature/a", commitHash: "abc123" });
+		expect(ctx.commitSummary).toMatchObject({ branch: "feature/a", commitHash: "abc123" });
+	});
+
+	it("falls back to the summary branch when HEAD is detached", async () => {
+		const dispatch = await setupPanel({ branch: "feature/a" });
+		(stubBridge.getCurrentBranch as ReturnType<typeof vi.fn>).mockResolvedValue("HEAD");
+
+		dispatch({ command: "shareBranch" });
+		await flushPromises();
+		const [, ctx] = mockOpenShareModal.mock.calls[0];
+		expect(ctx).toMatchObject({ branch: "feature/a" });
+	});
+
+	it("routes shareOpenTarget to the modal target handler", async () => {
+		const dispatch = await setupPanel({ branch: "feature/share" });
+		dispatch({ command: "shareOpenTarget", target: "email" });
+		await flushPromises();
+		expect(mockShareModalTarget).toHaveBeenCalledWith(expect.anything(), expect.anything(), "email");
+	});
+
+	it("builds a VS Code-backed IO (postState, openUrl, composeEmail, formatExpiry)", async () => {
+		const dispatch = await setupPanel({ branch: "feature/share" });
+		dispatch({ command: "shareBranch" });
+		await flushPromises();
+		const [io] = mockOpenShareModal.mock.calls[0];
+
+		io.postState({ kind: "needsApiKey" });
+		expect(postMessage).toHaveBeenCalledWith({ command: "shareState", state: { kind: "needsApiKey" } });
+
+		await io.openUrl("https://acme.jolli.ai/b/x");
+		await io.composeEmail("feature/share", "https://acme.jolli.ai/b/x", 4, ["Add dark mode"]);
+		expect(openExternal).toHaveBeenCalledTimes(2);
+		const mailto = openExternal.mock.calls[1][0].toString();
+		expect(mailto).toContain("mailto:?subject=");
+		expect(mailto).toContain("body=");
+		// Rich payload: subject teases how-we-built + decision count; body teases the branch titles.
+		expect(decodeURIComponent(mailto)).toContain('How we built "feature/share" — 4 decisions');
+		expect(decodeURIComponent(mailto)).toContain("Add dark mode");
+
+		// Copy message → clipboard + a confirmation toast.
+		await io.copyMessage("feature/share", "https://acme.jolli.ai/b/x", 4, ["Add dark mode"]);
+		expect(clipboardWriteText).toHaveBeenCalledWith(expect.stringContaining("feature/share"));
+		expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("copied"));
+
+		// Social → opens the platform's intent URL externally.
+		await io.openSocial("x", "feature/share", "https://acme.jolli.ai/b/x", 4, ["Add dark mode"]);
+		expect(openExternal).toHaveBeenCalledTimes(3);
+		expect(openExternal.mock.calls[2][0].toString()).toContain("twitter.com/intent/tweet");
+
+		io.notifyError("boom");
+		expect(showErrorMessage).toHaveBeenCalledWith("boom");
+
+		expect(io.formatExpiry("2026-09-01T00:00:00.000Z")).toContain("expires");
+		expect(io.formatExpiry("")).toBe("");
+		expect(io.formatExpiry("not-a-date")).toBe("");
 	});
 });

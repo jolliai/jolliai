@@ -2,12 +2,27 @@ import { describe, expect, it, vi } from "vitest";
 
 // `vscode` is not available in the test environment — provide a minimal stub
 // so the module-level `import * as vscode from "vscode"` in NextMemoryPreviewPanel
-// does not throw. The tests only exercise `buildNextMemoryHtml`, which is pure
-// and never touches the vscode API.
+// does not throw.
+const { createWebviewPanel } = vi.hoisted(() => {
+	const createWebviewPanel = vi.fn(() => {
+		const panel = {
+			webview: { html: "" },
+			reveal: vi.fn(),
+			onDispose: () => {},
+			onDidDispose(cb: () => void) {
+				panel.onDispose = cb;
+				return { dispose() {} };
+			},
+		};
+		return panel;
+	});
+	return { createWebviewPanel };
+});
+
 vi.mock("vscode", () => ({
 	ViewColumn: { Active: -1 },
 	window: {
-		createWebviewPanel: vi.fn(),
+		createWebviewPanel,
 	},
 }));
 

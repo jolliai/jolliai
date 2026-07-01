@@ -51,6 +51,7 @@ import {
 	getLastReflogAction,
 	getParentHash,
 	getProjectRootDir,
+	getRepoContributors,
 	getTreeHash,
 	isAncestor,
 	listFilesInBranch,
@@ -417,6 +418,71 @@ describe("GitOps", () => {
 		it("falls back to main when origin/HEAD resolves empty", async () => {
 			mockSuccess("\n");
 			expect(await getDefaultBranch()).toBe("main");
+		});
+	});
+
+	describe("getRepoContributors", () => {
+		it("dedupes by lowercased email, tallies counts, sorts most-commits-first", async () => {
+			mockSuccess(
+				[
+					`Ada Lovelace\x00ada@example.com`,
+					`A. Lovelace\x00ADA@example.com`,
+					`Grace Hopper\x00grace@example.com`,
+					`Ada Lovelace\x00ada@example.com`,
+				].join("\n"),
+			);
+			const contributors = await getRepoContributors();
+			expect(contributors).toEqual([
+				{ name: "Ada Lovelace", email: "ada@example.com", commitCount: 3 },
+				{ name: "Grace Hopper", email: "grace@example.com", commitCount: 1 },
+			]);
+		});
+
+		it("keeps the most recent non-empty name across renames (git log is newest-first)", async () => {
+			mockSuccess(
+				[
+					`\x00bob@example.com`, // newest commit, empty name → fall through
+					`Bob Smith\x00bob@example.com`, // current display name (most recent non-empty)
+					`bob-old\x00bob@example.com`, // oldest name — must not win
+				].join("\n"),
+			);
+			expect(await getRepoContributors()).toEqual([
+				{ name: "Bob Smith", email: "bob@example.com", commitCount: 3 },
+			]);
+		});
+
+		it("returns [] when git log fails (e.g. outside a work tree)", async () => {
+			mockFailure(128, "fatal: not a git repository");
+			expect(await getRepoContributors()).toEqual([]);
+		});
+
+		it("returns [] for a repo with no commits (empty stdout)", async () => {
+			mockSuccess("");
+			expect(await getRepoContributors()).toEqual([]);
+		});
+
+		it("filters out non-deliverable placeholder emails (GitHub noreply)", async () => {
+			mockSuccess(
+				[
+					`Ada Lovelace\x00ada@example.com`,
+					`Bot\x0049699333+dependabot[bot]@users.noreply.github.com`,
+					`Ghost\x00noreply@github.com`,
+					`No Reply\x00no-reply@example.com`,
+				].join("\n"),
+			);
+			expect(await getRepoContributors()).toEqual([
+				{ name: "Ada Lovelace", email: "ada@example.com", commitCount: 1 },
+			]);
+		});
+
+		it("skips lines with no email and tolerates an empty name", async () => {
+			mockSuccess([`malformed-no-nul-line`, `\x00solo@example.com`].join("\n"));
+			expect(await getRepoContributors()).toEqual([{ name: "", email: "solo@example.com", commitCount: 1 }]);
+		});
+
+		it("caps the result at max", async () => {
+			mockSuccess([`A\x00a@x.com`, `B\x00b@x.com`, `C\x00c@x.com`].join("\n"));
+			expect(await getRepoContributors(undefined, 2)).toHaveLength(2);
 		});
 	});
 

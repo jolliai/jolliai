@@ -29,6 +29,32 @@ describe("SummaryScriptBuilder", () => {
 		expect(script).toContain("acquireVsCodeApi");
 	});
 
+	it("defaults the single header Share button to commit kind (no ▾ menu)", () => {
+		expect(script).toContain(`var defaultShareKind = "commit";`);
+		// The branch/memory choice lives in the sidebar entries — no dropdown here.
+		expect(script).not.toContain("shareDropdown");
+		expect(script).not.toContain("shareThisBranchBtn");
+		// No auto-open baked in by default.
+		expect(script).not.toContain('shareOpen("');
+	});
+
+	it("flips the button default when the panel was entered via share-this-branch", () => {
+		// Sidebar share entries thread the kind through so the button and modal
+		// title stay consistent with the entry the user clicked ("Share this
+		// branch" vs "Share this memory").
+		const branchScript = buildScript({ defaultShareKind: "branch", autoOpenShare: true });
+		expect(branchScript).toContain(`var defaultShareKind = "branch";`);
+		expect(branchScript).toContain("'Share this branch as a read-only link'");
+		expect(branchScript).toContain('shareOpen("branch");');
+		expect(() => new Function(branchScript)).not.toThrow();
+	});
+
+	it("bakes a one-shot commit-kind shareOpen for the per-memory share entry", () => {
+		const commitScript = buildScript({ defaultShareKind: "commit", autoOpenShare: true });
+		expect(commitScript).toContain('shareOpen("commit");');
+		expect(() => new Function(commitScript)).not.toThrow();
+	});
+
 	it("contains toggle expand/collapse handlers", () => {
 		expect(script).toContain(".toggle-header");
 		expect(script).toContain("classList.toggle");

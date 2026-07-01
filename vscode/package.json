@@ -252,8 +252,13 @@
 				"category": "Jolli Memory"
 			},
 			{
-				"command": "jollimemory.shareBranchPlaceholder",
+				"command": "jollimemory.shareBranch",
 				"title": "Jolli Memory: Share Branch",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.shareMemory",
+				"title": "Jolli Memory: Share Memory",
 				"category": "Jolli Memory"
 			}
 		],
@@ -261,6 +266,10 @@
 			"commandPalette": [
 				{
 					"command": "jollimemory.viewKnowledgeGraph",
+					"when": "false"
+				},
+				{
+					"command": "jollimemory.shareMemory",
 					"when": "false"
 				}
 			],

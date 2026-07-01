@@ -321,7 +321,8 @@ const ALL_DECLARED_COMMANDS: ReadonlyArray<string> = [
 	"jollimemory.signOut",
 	"jollimemory.saveAnthropicApiKey",
 	"jollimemory.reviewNextMemory",
-	"jollimemory.shareBranchPlaceholder",
+	"jollimemory.shareBranch",
+	"jollimemory.shareMemory",
 ];
 
 /**
@@ -3232,10 +3233,62 @@ export function activate(context: vscode.ExtensionContext): void {
 			NextMemoryPreviewPanel.show(selection);
 		}),
 
-		// Placeholder for the share-branch feature (not yet implemented).
-		vscode.commands.registerCommand("jollimemory.shareBranchPlaceholder", () => {
-			vscode.window.showInformationMessage("Sharing is coming soon.");
+		// Sidebar footer "Share" → the in-panel "Share this branch" modal. The
+		// modal lives in the summary panel's webview, so this opens the NEWEST
+		// branch memory's panel as the host (the share content is branch-wide —
+		// base..HEAD — regardless of which memory hosts the modal; newest matches
+		// the share's headCommitHash and the "share current branch state" intent).
+		vscode.commands.registerCommand("jollimemory.shareBranch", async () => {
+			const { summaries } = await loadBranchSummaries(
+				bridge,
+				commitsStore.getMainBranch(),
+			);
+			const newest = summaries.at(-1);
+			if (!newest) {
+				vscode.window.showInformationMessage(
+					"Jolli Memory: No memories on this branch to share yet.",
+				);
+				return;
+			}
+			const readStorageResult = await bridge.createReadStorageForCurrentRepo();
+			await SummaryWebviewPanel.showWithShareModal(
+				newest,
+				context.extensionUri,
+				workspaceRoot,
+				bridge,
+				commitsStore.getMainBranch(),
+				"branch",
+				readStorageResult?.storage ?? null,
+			);
 		}),
+
+		// Committed-memory row "Share this memory" icon → the same in-panel modal
+		// in commit kind. Workspace rows only: sharing always targets the current
+		// workspace (the panel's foreign guard denies share commands anyway), so a
+		// hash that doesn't resolve in this repo's storage gets a clear message.
+		vscode.commands.registerCommand(
+			"jollimemory.shareMemory",
+			async (item: MemoryItem | string) => {
+				const hash = typeof item === "string" ? item : item.entry.commitHash;
+				const summary = await bridge.getSummary(hash);
+				if (!summary) {
+					vscode.window.showInformationMessage(
+						"Jolli Memory: Sharing works from the memory's own repository — open that workspace to share it.",
+					);
+					return;
+				}
+				const readStorageResult = await bridge.createReadStorageForCurrentRepo();
+				await SummaryWebviewPanel.showWithShareModal(
+					summary,
+					context.extensionUri,
+					workspaceRoot,
+					bridge,
+					commitsStore.getMainBranch(),
+					"commit",
+					readStorageResult?.storage ?? null,
+				);
+			},
+		),
 
 		// Open in Claude Code via URI scheme. Same cross-repo reasoning as
 		// copyRecallPrompt above — MemoryItem rows may belong to a non-current

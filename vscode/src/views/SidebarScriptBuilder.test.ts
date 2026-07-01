@@ -3053,10 +3053,11 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("'data-action': 'footer-more'");
 	});
 
-	it("Review dispatches reviewNextMemory and Share dispatches the placeholder", () => {
+	it("Review dispatches reviewNextMemory; footer Share and the row icon dispatch the share commands", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("jollimemory.reviewNextMemory");
-		expect(js).toContain("jollimemory.shareBranchPlaceholder");
+		expect(js).toContain("jollimemory.shareBranch");
+		expect(js).toContain("jollimemory.shareMemory");
 	});
 
 	it("renders a Committed Memories token bar from branch:tokenStats", () => {

@@ -31,6 +31,7 @@ import {
 	generateRecap,
 	translateToEnglish,
 } from "../../../cli/src/core/Summarizer.js";
+import { getRepoContributors } from "../../../cli/src/core/GitOps.js";
 import { runWithTrace } from "../../../cli/src/core/TraceContext.js";
 import {
 	getTranscriptHashes as coreGetTranscriptHashes,
@@ -47,8 +48,6 @@ import {
 import type {
 	CommitSummary,
 	E2eTestScenario,
-	NoteReference,
-	PlanReference,
 	ReferenceCommitRef,
 	SourceId,
 	StoredTranscript,
@@ -60,13 +59,12 @@ import {
 	removePlan,
 } from "../core/PlanService.js";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
+import { PluginOutdatedError, parseJolliApiKey } from "../services/JolliPushService.js";
 import {
-	BindingRequiredError,
-	deleteFromJolli,
-	PluginOutdatedError,
-	parseJolliApiKey,
-	pushToJolli,
-} from "../services/JolliPushService.js";
+	type PushContext,
+	pushSummaryWithAttachments,
+	ShareBindingError,
+} from "../services/JolliPushOrchestrator.js";
 import {
 	classifyCreatePrBranch,
 	createPrBlockMessage,
@@ -84,8 +82,24 @@ import {
 } from "../util/GitRemoteUtils.js";
 import { isWorkerBlockingBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
-import { latestPlanPerName } from "../util/PlanGrouping.js";
 import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
+import {
+	type ShareKind,
+	type ShareMember,
+	createShareModal,
+	openShareModal,
+	revokeShareModal,
+	type ShareModalContext,
+	type ShareModalIO,
+	type ShareModalState,
+	type ShareTarget,
+	type ShareVisibility,
+	setShareExpiryModal,
+	setShareVisibilityModal,
+	shareModalTarget,
+} from "../services/BranchShareModal.js";
+import { listOrgMembers } from "../services/JolliShareService.js";
+import { buildShareCopyMessage, buildShareEmail, buildSocialShareUrl } from "../services/ShareMessage.js";
 import { BindingChooserWebviewPanel } from "./BindingChooserWebviewPanel.js";
 import { loadBranchSummaries } from "./BranchSummaryLoader.js";
 import { SOURCE_TITLES } from "./SourceLabels.js";
@@ -103,20 +117,81 @@ import {
 } from "./SummaryHtmlBuilder.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
 import { buildPrBodyMarkdown, pickPrTitle, wrapWithMarkers } from "../../../cli/src/core/PrDescription.js";
-import {
-	buildBranchRelativePath,
-	buildNotePushTitle,
-	buildPanelTitle,
-	buildPlanPushTitle,
-	buildPushTitle,
-	collectSortedTopics,
-	formatActiveProviderLabel,
-} from "./SummaryUtils.js";
+import { buildPanelTitle, collectSortedTopics, formatActiveProviderLabel } from "./SummaryUtils.js";
 import type { RegenerateContext } from "../../../cli/src/core/RegenerateContext.js";
 import { isSummaryError } from "../../../cli/src/core/SummaryErrorMarker.js";
 import { getTranscriptIds } from "../../../cli/src/core/SummaryTree.js";
-import { track } from "../../../cli/src/core/Telemetry.js";
 import type { LlmConfig } from "../../../cli/src/Types.js";
+
+/** The user's access + expiry + recipient choices from the share modal webview. */
+interface ShareSelection {
+	readonly visibility: ShareVisibility;
+	readonly recipients: ReadonlyArray<string>;
+	/** Link lifetime in days chosen in the pane; applied at create. Omit for the server default. */
+	readonly expiryDays?: number;
+}
+const DEFAULT_SHARE_SELECTION: ShareSelection = { visibility: "public", recipients: [] };
+
+const SHARE_VISIBILITIES = new Set<ShareVisibility>(["public", "org", "people"]);
+const SHARE_KINDS = new Set<ShareKind>(["branch", "commit"]);
+const SHARE_EXPIRY_DAYS = new Set([7, 30, 90, 365]);
+const SHARE_TARGETS = new Set<ShareTarget>([
+	"page",
+	"email",
+	"copy",
+	"x",
+	"linkedin",
+	"reddit",
+	"whatsapp",
+	"telegram",
+]);
+const SHARE_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function normalizeShareVisibility(value: unknown): ShareVisibility | undefined {
+	return typeof value === "string" && SHARE_VISIBILITIES.has(value as ShareVisibility)
+		? (value as ShareVisibility)
+		: undefined;
+}
+
+function normalizeShareKind(value: unknown): ShareKind {
+	return typeof value === "string" && SHARE_KINDS.has(value as ShareKind) ? (value as ShareKind) : "branch";
+}
+
+function normalizeShareTarget(value: unknown): ShareTarget | undefined {
+	return typeof value === "string" && SHARE_TARGETS.has(value as ShareTarget) ? (value as ShareTarget) : undefined;
+}
+
+function normalizeShareExpiryDays(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) && SHARE_EXPIRY_DAYS.has(value) ? value : undefined;
+}
+
+function normalizeShareRecipients(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	const seen = new Set<string>();
+	const recipients: string[] = [];
+	for (const raw of value) {
+		if (typeof raw !== "string") continue;
+		const email = raw.trim().toLowerCase();
+		if (!email || !SHARE_EMAIL_RE.test(email) || seen.has(email)) continue;
+		seen.add(email);
+		recipients.push(email);
+		if (recipients.length >= 50) break;
+	}
+	return recipients;
+}
+
+/** Dedupes a member list by lowercased email, keeping the first (name-bearing) entry. */
+function dedupeMembersByEmail(members: ReadonlyArray<ShareMember>): ShareMember[] {
+	const seen = new Set<string>();
+	const out: ShareMember[] = [];
+	for (const m of members) {
+		const key = m.email.trim().toLowerCase();
+		if (!key || seen.has(key)) continue;
+		seen.add(key);
+		out.push({ name: m.name, email: m.email });
+	}
+	return out;
+}
 
 /** Memory field updates sent from the webview edit form. */
 interface TopicUpdates {
@@ -205,6 +280,27 @@ type WebviewMessage =
 	| { command: "editRecap"; recap: string }
 	| { command: "generateRecap" }
 	| { command: "regenerateSummary" }
+	| { command: "shareBranch"; shareKind?: ShareKind }
+	| { command: "shareRevoke"; shareKind?: ShareKind }
+	| {
+			command: "shareCreate";
+			visibility: ShareVisibility;
+			recipients?: ReadonlyArray<string>;
+			shareKind?: ShareKind;
+	  }
+	| {
+			command: "shareOpenTarget";
+			target: "page" | "email" | "copy" | "x" | "linkedin" | "reddit" | "whatsapp" | "telegram";
+			shareKind?: ShareKind;
+			recipients?: ReadonlyArray<string>;
+	  }
+	| { command: "shareSetExpiry"; days: number; shareKind?: ShareKind }
+	| {
+			command: "shareSetAudience";
+			visibility: ShareVisibility;
+			recipients?: ReadonlyArray<string>;
+			shareKind?: ShareKind;
+	  }
 	| { command: "openRewrittenCommit"; hash: string };
 
 /** Entry data sent back from the webview on Save All. */
@@ -216,14 +312,6 @@ interface TranscriptEntryUpdate {
 	readonly role: "human" | "assistant";
 	readonly content: string;
 	readonly timestamp?: string;
-}
-
-/** A plan/note that could not be pushed — surfaced to the user, not thrown. */
-interface PushAttachmentFailure {
-	/** Human-readable identifier, e.g. `plan "Fix P1/P2 review findings"`. */
-	readonly label: string;
-	/** Error message (includes the HTTP status from JolliPushService). */
-	readonly message: string;
 }
 
 /** Source of the panel — determines which static slot it occupies. */
@@ -313,6 +401,13 @@ function isRegenerateSafeCommand(command: WebviewMessage["command"]): boolean {
 	return REGENERATE_SAFE_COMMANDS.has(command);
 }
 
+/** Formats a share's ISO expiry into a short "expires Sep 1, 2026" label; "" when absent/invalid. */
+function formatExpiry(iso: string): string {
+	if (!iso) return "";
+	const t = Date.parse(iso);
+	if (Number.isNaN(t)) return "";
+	return `expires ${new Date(t).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })}`;
+}
 
 export class SummaryWebviewPanel {
 	/**
@@ -379,6 +474,21 @@ export class SummaryWebviewPanel {
 	 * computed at render time in `buildHtml`.
 	 */
 	private staleRewrittenInto: string | undefined;
+
+	/**
+	 * Default kind of the webview's header Share button — set by the panel's
+	 * share ENTRY (`showWithShareModal`) and persisted for the panel's lifetime
+	 * so full re-renders keep the button consistent with how the user got here
+	 * ("Share this branch" entry → branch-first button; everything else →
+	 * memory-first, the stock layout).
+	 */
+	private shareEntryKind: ShareKind = "commit";
+	/**
+	 * One-shot share-modal auto-open, consumed (and cleared) by the next
+	 * `update()`. Set only by `showWithShareModal`. Cleared immediately so
+	 * ordinary refreshes never re-pop the modal.
+	 */
+	private pendingShareOpen = false;
 
 	private readonly bridge: JolliMemoryBridge;
 	// Snapshot of `CommitsStore.getMainBranch()` at panel creation. Revisit
@@ -541,6 +651,71 @@ export class SummaryWebviewPanel {
 			case "push":
 				if (this.currentSummary) {
 					this.catchAndShow(this.handlePush(), "Push failed");
+				}
+				break;
+			case "shareBranch":
+				if (this.currentSummary) {
+					this.catchAndShow(this.handleShareModal("open", normalizeShareKind(message.shareKind)), "Share failed");
+				}
+				break;
+			case "shareRevoke":
+				if (this.currentSummary) {
+					this.catchAndShow(this.handleShareModal("revoke", normalizeShareKind(message.shareKind)), "Share failed");
+				}
+				break;
+			case "shareCreate":
+				if (this.currentSummary) {
+					const visibility = normalizeShareVisibility(message.visibility);
+					if (!visibility) {
+						vscode.window.showErrorMessage("Invalid share audience.");
+						break;
+					}
+					const selection: ShareSelection = {
+						visibility,
+						recipients: normalizeShareRecipients(message.recipients),
+					};
+					this.catchAndShow(this.handleShareModal("create", normalizeShareKind(message.shareKind), selection), "Share failed");
+				}
+				break;
+			case "shareOpenTarget":
+				if (this.currentSummary) {
+					const target = normalizeShareTarget(message.target);
+					if (!target) {
+						vscode.window.showErrorMessage("Invalid share action.");
+						break;
+					}
+					const selection: ShareSelection = {
+						visibility: "public",
+						recipients: normalizeShareRecipients(message.recipients),
+					};
+					this.catchAndShow(this.handleShareTarget(target, normalizeShareKind(message.shareKind), selection), "Share failed");
+				}
+				break;
+			case "shareSetExpiry":
+				if (this.currentSummary) {
+					const days = normalizeShareExpiryDays(message.days);
+					if (!days) {
+						vscode.window.showErrorMessage("Invalid share expiry.");
+						break;
+					}
+					this.catchAndShow(this.handleShareSetExpiry(days, normalizeShareKind(message.shareKind)), "Share failed");
+				}
+				break;
+			case "shareSetAudience":
+				if (this.currentSummary) {
+					const visibility = normalizeShareVisibility(message.visibility);
+					if (!visibility) {
+						vscode.window.showErrorMessage("Invalid share audience.");
+						break;
+					}
+					this.catchAndShow(
+						this.handleShareSetAudience(
+							visibility,
+							normalizeShareRecipients(message.recipients),
+							normalizeShareKind(message.shareKind),
+						),
+						"Share failed",
+					);
 				}
 				break;
 			case "editTopic":
@@ -1140,6 +1315,48 @@ export class SummaryWebviewPanel {
 		instance.update(summary);
 	}
 
+	/**
+	 * Opens (or reveals) the commit panel for `summary` with the in-panel share
+	 * modal already open — the entry point for the sidebar's share affordances
+	 * (footer "Share" → `kind: "branch"` on the newest branch memory; a row's
+	 * "Share this memory" icon → `kind: "commit"`). The modal lives in this
+	 * panel's webview, so sharing from anywhere else must route through here;
+	 * the kind is threaded into the webview so the modal title matches the
+	 * entry the user clicked. Workspace summaries only (foreign/readonly panels
+	 * render no share modal).
+	 */
+	static async showWithShareModal(
+		summary: CommitSummary,
+		extensionUri: vscode.Uri,
+		workspaceRoot: string,
+		bridge: JolliMemoryBridge,
+		mainBranch: string,
+		kind: ShareKind,
+		readStorage: StorageProvider | null = null,
+	): Promise<void> {
+		await SummaryWebviewPanel.show(
+			summary,
+			extensionUri,
+			workspaceRoot,
+			bridge,
+			mainBranch,
+			"commit",
+			null,
+			null,
+			readStorage,
+		);
+		// A full re-render with the one-shot flag: show() may have skipped its
+		// update (unchanged inputs on an already-open panel), and a baked-in
+		// script call is the only delivery that can't race webview listener
+		// setup on a fresh panel. The entry kind persists on the instance so the
+		// header Share button keeps matching this entry across later re-renders.
+		const instance = SummaryWebviewPanel.commitPanels.get(summary.commitHash);
+		if (!instance) return;
+		instance.shareEntryKind = kind;
+		instance.pendingShareOpen = true;
+		instance.update(instance.currentSummary ?? summary);
+	}
+
 	/** Updates the webview HTML content and tab title with a new summary. Stays synchronous. */
 	private update(summary: CommitSummary): void {
 		// A concurrent show() may have disposed this instance while the caller
@@ -1160,6 +1377,8 @@ export class SummaryWebviewPanel {
 		if (this.staleRewrittenInto) title = `⚠ Rewritten — ${title}`;
 		this.panel.title = title;
 		const nonce = randomBytes(16).toString("base64");
+		const autoOpenShare = this.pendingShareOpen;
+		this.pendingShareOpen = false;
 		this.panel.webview.html = buildHtml(summary, {
 			transcriptHashSet: this.transcriptHashSet,
 			planTranslateSet: this.planTranslateSet,
@@ -1168,6 +1387,8 @@ export class SummaryWebviewPanel {
 			nonce,
 			foreignRepoName: this.foreignRepoName,
 			staleRewrittenInto: this.staleRewrittenInto ?? null,
+			shareDefaultKind: this.shareEntryKind,
+			autoOpenShare,
 		});
 	}
 
@@ -1626,6 +1847,167 @@ export class SummaryWebviewPanel {
 	 * Trade-off is favourable for the common case; documented here so a
 	 * future maintainer doesn't quietly add the re-check without realising.
 	 */
+	/**
+	 * Builds the VS Code-backed ShareModalIO: pushes modal states to the webview
+	 * and opens external targets (browser page / mail client / clipboard).
+	 */
+	private buildShareModalIO(kind: ShareKind = "branch"): ShareModalIO {
+		// The share kind is fixed for the modal session; capture it (and derive the
+		// commit hash) here so the IO method signatures stay branch-shaped and the
+		// kind-aware copy is selected without threading extra params through.
+		const shareKind: "branch" | "commit" = kind === "commit" ? "commit" : "branch";
+		return {
+			postState: (state: ShareModalState) => {
+				this.panel.webview.postMessage({ command: "shareState", state });
+			},
+			openUrl: async (url) => {
+				await vscode.env.openExternal(vscode.Uri.parse(url));
+			},
+			composeEmail: async (branch, url, decisionCount, titles, recipients) => {
+				const { subject, body } = buildShareEmail({ branch, url, decisionCount, titles, kind: shareKind });
+				// Recipients go in the mailto `To:` (comma-separated). They are added only
+				// to this local link — they never reach the server (delivery is client-side).
+				const to = (recipients ?? []).map((r) => encodeURIComponent(r.trim())).join(",");
+				const qs = `subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+				await vscode.env.openExternal(vscode.Uri.parse(`mailto:${to}?${qs}`));
+			},
+			copyMessage: async (branch, url, decisionCount, titles) => {
+				const message = buildShareCopyMessage({ branch, url, decisionCount, titles, kind: shareKind });
+				await vscode.env.clipboard.writeText(message);
+				vscode.window.showInformationMessage("Share message copied — paste it into Slack, IM, or anywhere.");
+			},
+			openSocial: async (platform, branch, url, decisionCount, titles) => {
+				const intentUrl = buildSocialShareUrl(platform, { branch, url, decisionCount, titles, kind: shareKind });
+				await vscode.env.openExternal(vscode.Uri.parse(intentUrl));
+			},
+			formatExpiry,
+			notifyError: (message) => {
+				vscode.window.showErrorMessage(message);
+			},
+			notifyInfo: (message) => {
+				vscode.window.showInformationMessage(message);
+			},
+		};
+	}
+
+	/**
+	 * Resolves the share context for the current summary: the current branch, API
+	 * key, the chosen access level + recipients, the bridge (for the live push), and
+	 * a binding-chooser callback. `selection` carries the user's access/recipient
+	 * choices from the webview (defaults: `public`, no recipients).
+	 */
+	private async shareContext(
+		kind: ShareKind = "branch",
+		selection: ShareSelection = DEFAULT_SHARE_SELECTION,
+	): Promise<ShareModalContext | undefined> {
+		const summary = this.currentSummary;
+		if (!summary) return undefined;
+		const config = await loadGlobalConfig();
+		// Branch shares are sourced from the CURRENT git checkout (base..HEAD), so their
+		// label/key follows HEAD. Commit shares are the open memory itself; keep them
+		// bound to `summary.branch` so a later branch switch doesn't make "Share this
+		// memory" re-filter the wrong branch and lose the commit.
+		const current = await this.bridge.getCurrentBranch();
+		const branch = kind === "commit" ? summary.branch : current && current !== "HEAD" ? current : summary.branch;
+		const commitHash = kind === "commit" ? summary.commitHash : undefined;
+		const apiKey = config.jolliApiKey;
+		const keyMeta = apiKey ? parseJolliApiKey(apiKey) : null;
+		const baseUrl = keyMeta?.u || "";
+		// `org` access is only meaningful when the key carries an org. Repo contributors
+		// (deliverable emails) prefill the "send link to" field; read-only, no checkout.
+		const canOrg = Boolean(keyMeta?.o);
+		// Build the add-people directory (for `people` search + name resolution): org
+		// members (best-effort) + git contributors, deduped by lowercased email. The current
+		// git user is the fixed Owner row.
+		const contributors = await getRepoContributors(this.workspaceRoot);
+		const orgMembers = apiKey ? await listOrgMembers(baseUrl, apiKey).catch(() => []) : [];
+		const directory = dedupeMembersByEmail([...orgMembers, ...contributors.map((c) => ({ name: c.name, email: c.email }))]);
+		const ownerEmail = await this.bridge.getCurrentUserEmail();
+		const ownerName =
+			directory.find((m) => m.email.toLowerCase() === ownerEmail.toLowerCase())?.name ||
+			(await this.bridge.getCurrentUserName());
+		const owner = { name: ownerName, email: ownerEmail };
+		return {
+			workspaceRoot: this.workspaceRoot,
+			branch,
+			apiKey,
+			commitHash,
+			commitSummary: kind === "commit" ? summary : undefined,
+			subjectTitle: kind === "commit" ? summary.commitMessage : branch,
+			visibility: selection.visibility,
+			recipients: selection.recipients,
+			expiryDays: selection.expiryDays,
+			canOrg,
+			owner,
+			directory,
+			bridge: this.bridge,
+			resolveBinding: async (repo) => {
+				const outcome = await BindingChooserWebviewPanel.openAndAwait({
+					extensionUri: this.extensionUri,
+					baseUrl: baseUrl.replace(/\/+$/, ""),
+					apiKey: apiKey ?? "",
+					repoUrl: repo,
+					suggestedRepoName: deriveRepoNameFromUrl(repo),
+				});
+				if (outcome.kind === "selected") return { status: "bound" };
+				if (outcome.kind === "anotherOpen") return { status: "anotherOpen" };
+				return { status: "cancelled" };
+			},
+			nowMs: Date.now(),
+		};
+	}
+
+	/**
+	 * Drives the in-panel "Share this branch" modal (public read-only link).
+	 * Foreign summaries can't reach here (the share commands are not in
+	 * FOREIGN_SAFE_COMMANDS) — sharing always targets the current workspace.
+	 */
+	private async handleShareModal(
+		step: "open" | "create" | "revoke",
+		kind: ShareKind = "branch",
+		selection: ShareSelection = DEFAULT_SHARE_SELECTION,
+	): Promise<void> {
+		const ctx = await this.shareContext(kind, selection);
+		if (!ctx) return;
+		const io = this.buildShareModalIO(kind);
+		if (step === "open") await openShareModal(io, ctx);
+		else if (step === "create") await createShareModal(io, ctx);
+		else await revokeShareModal(io, ctx);
+	}
+
+	private async handleShareTarget(
+		target: "page" | "email" | "copy" | "x" | "linkedin" | "reddit" | "whatsapp" | "telegram",
+		kind: ShareKind = "branch",
+		selection: ShareSelection = DEFAULT_SHARE_SELECTION,
+	): Promise<void> {
+		const ctx = await this.shareContext(kind, selection);
+		if (!ctx) return;
+		await shareModalTarget(this.buildShareModalIO(kind), ctx, target);
+	}
+
+	private async handleShareSetExpiry(
+		days: number,
+		kind: ShareKind = "branch",
+		selection: ShareSelection = DEFAULT_SHARE_SELECTION,
+	): Promise<void> {
+		const ctx = await this.shareContext(kind, selection);
+		if (!ctx) return;
+		// PATCH wants an absolute timestamp; compute it from the chosen lifetime.
+		const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+		await setShareExpiryModal(this.buildShareModalIO(kind), ctx, expiresAt);
+	}
+
+	private async handleShareSetAudience(
+		visibility: ShareVisibility,
+		recipients: ReadonlyArray<string>,
+		kind: ShareKind = "branch",
+		selection: ShareSelection = DEFAULT_SHARE_SELECTION,
+	): Promise<void> {
+		const ctx = await this.shareContext(kind, selection);
+		if (!ctx) return;
+		await setShareVisibilityModal(this.buildShareModalIO(kind), ctx, visibility, recipients);
+	}
+
 	private async handlePush(): Promise<void> {
 		// Prevent concurrent pushes: the button can be re-clicked when
 		// runJolliPush throws before posting pushStarted (button never
@@ -1670,19 +2052,15 @@ export class SummaryWebviewPanel {
 	}
 
 	/**
-	 * Runs the Jolli Cloud push (plans, notes, summary, orphan cleanup).
-	 * Returns the outcome so the caller can post the result message.
-	 *
-	 * On `412 binding_required` the plugin opens BindingChooserWebviewPanel for
-	 * the user to pick or create a JM space, registers the binding server-side,
-	 * and retries the push exactly once. The `retried` flag prevents infinite
-	 * recursion if a second 412 fires after binding registration (which would
-	 * indicate a server bug).
+	 * Runs the Jolli Cloud push for this panel's summary via the shared
+	 * {@link pushSummaryWithAttachments} orchestrator (so the per-summary button and
+	 * the subject-level live share never double-push or fight over jolliDocId). This
+	 * wrapper owns only the VS Code UI: the progress ping, the binding-chooser
+	 * wiring, the success/partial toasts, and adopting the returned summary.
 	 */
 	private async runJolliPush(
 		summary: CommitSummary,
 		jolliApiKey: string | undefined,
-		retried = false,
 	): Promise<{ url: string; docId: number }> {
 		if (!jolliApiKey) {
 			vscode.window.showWarningMessage(
@@ -1706,143 +2084,72 @@ export class SummaryWebviewPanel {
 		const baseUrl = resolvedBaseUrl.replace(/\/+$/, "");
 		const repoUrl = await getCanonicalRepoUrl(this.workspaceRoot);
 
-		try {
-			// Step 1: Upload associated plans and notes. Per-attachment failures
-			// are collected (not thrown) so one bad plan/note doesn't abort the
-			// whole push — the summary and the remaining attachments still go up.
-			const { results: planUrls, failures: planFailures } =
-				await this.pushPlans(
-					summary,
-					resolvedBaseUrl,
-					baseUrl,
-					jolliApiKey,
-					repoUrl,
-				);
-			const { results: noteUrls, failures: noteFailures } =
-				await this.pushNotes(
-					summary,
-					resolvedBaseUrl,
-					baseUrl,
-					jolliApiKey,
-					repoUrl,
-				);
-			const attachmentFailures = [...planFailures, ...noteFailures];
-
-			// Step 2: Update plan/note URLs in summary before building markdown
-			// (so the Plans & Notes section in markdown includes the published
-			// URLs). Dedupe same-named plan snapshots here too: only the latest
-			// was uploaded, so the pushed article's Plans & Notes list must not
-			// repeat the superseded duplicates. The locally-stored summary below
-			// still keeps every snapshot for the detail view.
-			const dedupedPlans = latestPlanPerName(summary.plans ?? []);
-			const plansWithUrls = applyPlanUrls(dedupedPlans, planUrls) ?? dedupedPlans;
-			const notesWithUrls = summary.notes
-				? applyNoteUrls(summary.notes, noteUrls)
-				: summary.notes;
-			const summaryForMarkdown: CommitSummary = {
-				...summary,
-				plans: plansWithUrls,
-				...(notesWithUrls !== summary.notes && { notes: notesWithUrls }),
-			};
-			const markdown = buildMarkdown(summaryForMarkdown);
-
-			const title = buildPushTitle(summary);
-			const result = await pushToJolli(resolvedBaseUrl, jolliApiKey, {
-				title,
-				content: markdown,
-				commitHash: summary.commitHash,
-				docType: "summary",
-				branch: summary.branch,
-				...(summary.jolliDocId && { docId: summary.jolliDocId }),
-				repoUrl,
-				relativePath: buildBranchRelativePath(summary.branch),
-			});
-
-			track("memory_pushed", { kind: "summary" });
-
-			// Build the full article URL using docId query param (matches frontend routing)
-			const fullUrl = `${baseUrl}/articles?doc=${result.docId}`;
-
-			const updatedSummary: CommitSummary = {
-				...summary,
-				jolliDocUrl: fullUrl,
-				jolliDocId: result.docId,
-				...(planUrls.length > 0
-					? { plans: applyPlanUrls(summary.plans, planUrls) }
-					: {}),
-				...(noteUrls.length > 0 && summary.notes
-					? { notes: applyNoteUrls(summary.notes, noteUrls) }
-					: {}),
-			};
-			await this.bridge.storeSummary(updatedSummary, true);
-
-			// Update in-memory state and fully re-render the WebView so PR section picks up
-			// the new plan/note URLs and jolliDocUrl in its markdown body
-			this.currentSummary = updatedSummary;
-			this.update(updatedSummary);
-			const docUrl = summary.jolliDocUrl;
-			const verb = docUrl ? "Updated" : "Pushed";
-			const attachments = planUrls.length + noteUrls.length;
-			const attachMsg =
-				attachments > 0
-					? ` (with ${attachments} attachment${attachments > 1 ? "s" : ""})`
-					: "";
-			if (attachmentFailures.length > 0) {
-				// Modal (not a transient toast): a partial failure must be as
-				// visible as the old fail-fast error — the panel otherwise
-				// re-renders to "Synced" and the failure would go unnoticed.
-				vscode.window.showWarningMessage(
-					`${verb} the memory on Jolli Space${attachMsg}, but ${attachmentFailures.length} attachment(s) failed to push.`,
-					{
-						modal: true,
-						detail: attachmentFailures
-							.map((f) => `• ${f.label}: ${f.message}`)
-							.join("\n"),
-					},
-				);
-			} else {
-				vscode.window.showInformationMessage(
-					`${verb} on Jolli Space${attachMsg}.`,
-				);
-			}
-
-			// Clean up orphaned memory articles, then persist which ones were actually deleted
-			const cleanedSummary = await cleanupOrphanedDocs(
-				summary,
-				updatedSummary,
-				baseUrl,
-				jolliApiKey,
-				this.bridge,
-			);
-			if (cleanedSummary) {
-				this.currentSummary = cleanedSummary;
-			}
-
-			return { url: fullUrl, docId: result.docId };
-		} catch (err: unknown) {
-			if (err instanceof BindingRequiredError && !retried) {
+		const ctx: PushContext = {
+			baseUrl: resolvedBaseUrl,
+			apiKey: jolliApiKey,
+			repoUrl,
+			workspaceRoot: this.workspaceRoot,
+			storeSummary: (s, syncToCloud) => this.bridge.storeSummary(s, syncToCloud),
+			// On 412 binding_required the orchestrator calls this; we open the chooser
+			// and map its outcome back. Chooser UI stays in the panel layer.
+			resolveBinding: async (repo) => {
 				const outcome = await BindingChooserWebviewPanel.openAndAwait({
 					extensionUri: this.extensionUri,
 					baseUrl,
 					apiKey: jolliApiKey,
-					repoUrl,
-					suggestedRepoName: deriveRepoNameFromUrl(repoUrl),
+					repoUrl: repo,
+					suggestedRepoName: deriveRepoNameFromUrl(repo),
 				});
-				if (outcome.kind === "selected") {
-					return this.runJolliPush(summary, jolliApiKey, true);
-				}
-				if (outcome.kind === "anotherOpen") {
-					// Another summary panel for the same repo already opened the
-					// chooser; that panel is the one driving the binding decision.
-					// Tell this caller to wait there and re-push afterwards — using
-					// "Push cancelled" here would be misleading (the user never
-					// cancelled anything in this panel).
+				if (outcome.kind === "selected") return { status: "bound" };
+				if (outcome.kind === "anotherOpen") return { status: "anotherOpen" };
+				return { status: "cancelled" };
+			},
+		};
+
+		try {
+			const result = await pushSummaryWithAttachments(summary, ctx);
+
+			// Adopt the pushed/cleaned summary and fully re-render so the PR section
+			// picks up the new plan/note URLs and jolliDocUrl in its markdown body.
+			this.currentSummary = result.updatedSummary;
+			this.update(result.updatedSummary);
+
+			const verb = result.isUpdate ? "Updated" : "Pushed";
+			const attachMsg =
+				result.attachmentCount > 0
+					? ` (with ${result.attachmentCount} attachment${result.attachmentCount > 1 ? "s" : ""})`
+					: "";
+			if (result.attachmentFailures.length > 0) {
+				// Modal (not a transient toast): a partial failure must be as visible as
+				// the old fail-fast error — the panel otherwise re-renders to "Synced".
+				vscode.window.showWarningMessage(
+					`${verb} the memory on Jolli Space${attachMsg}, but ${result.attachmentFailures.length} attachment(s) failed to push.`,
+					{
+						modal: true,
+						detail: result.attachmentFailures.map((f) => `• ${f.label}: ${f.message}`).join("\n"),
+					},
+				);
+			} else {
+				vscode.window.showInformationMessage(`${verb} on Jolli Space${attachMsg}.`);
+			}
+
+			return { url: result.pushedDoc.summaryUrl, docId: result.pushedDoc.summaryDocId };
+		} catch (err: unknown) {
+			if (err instanceof ShareBindingError) {
+				if (err.outcome === "anotherOpen") {
+					// Another summary panel for the same repo already opened the chooser;
+					// that panel drives the binding decision. Tell this caller to wait
+					// there and re-push — "cancelled" would be misleading here.
 					vscode.window.showInformationMessage(
 						"A Memory space chooser is already open for this repo. Finish there, then click the Jolli push button again.",
 					);
-				} else {
+				} else if (err.outcome === "cancelled") {
 					vscode.window.showErrorMessage(
 						"Push cancelled — no Memory space chosen for this repo. Click the Jolli push button again when you're ready.",
+					);
+				} else {
+					vscode.window.showErrorMessage(
+						"Push failed — could not bind a Memory space for this repo.",
 					);
 				}
 				throw err;
@@ -1858,187 +2165,6 @@ export class SummaryWebviewPanel {
 			}
 			throw err;
 		}
-	}
-
-	/**
-	 * Uploads associated plans to Jolli and returns their published URLs plus
-	 * any per-plan failures. A single plan's failure (e.g. a server 500 because
-	 * the document already exists) is collected and reported, NOT thrown, so it
-	 * doesn't abort the rest of the memory push. The fatal binding/plugin errors
-	 * still propagate — the outer handler drives the binding chooser off them.
-	 */
-	private async pushPlans(
-		summary: CommitSummary,
-		resolvedBaseUrl: string,
-		baseUrl: string,
-		apiKey: string,
-		repoUrl: string,
-	): Promise<{
-		results: Array<{ slug: string; title: string; url: string; docId: number }>;
-		failures: PushAttachmentFailure[];
-	}> {
-		const failures: PushAttachmentFailure[] = [];
-		// Same-named plans accumulate one snapshot per source commit after a
-		// squash (slug embeds the commit hash). Upload only the latest snapshot
-		// per name so Jolli gets one document per plan, not a duplicate per
-		// commit. latestPlanPerName is shared with the detail-panel display.
-		const allPlans = latestPlanPerName(summary.plans ?? []);
-		log.info(
-			"SummaryPanel",
-			`Push to Jolli: found ${allPlans.length} plan(s) to upload`,
-		);
-		const results: Array<{
-			slug: string;
-			title: string;
-			url: string;
-			docId: number;
-		}> = [];
-
-		for (const plan of allPlans) {
-			const planContent =
-				(await readPlanFromBranch(plan.slug, this.workspaceRoot)) ?? "";
-			if (!planContent) {
-				log.info(
-					"SummaryPanel",
-					`Plan ${plan.slug}: no content found, skipping`,
-				);
-				continue;
-			}
-			log.info(
-				"SummaryPanel",
-				`Uploading plan ${plan.slug} (${planContent.length} chars)`,
-			);
-
-			let planResult: Awaited<ReturnType<typeof pushToJolli>>;
-			try {
-				planResult = await pushToJolli(resolvedBaseUrl, apiKey, {
-					title: buildPlanPushTitle(summary, plan.title),
-					content: planContent,
-					commitHash: summary.commitHash,
-					docType: "plan",
-					branch: summary.branch,
-					...(plan.jolliPlanDocId && { docId: plan.jolliPlanDocId }),
-					repoUrl,
-					relativePath: buildBranchRelativePath(summary.branch),
-				});
-			} catch (err) {
-				if (
-					err instanceof BindingRequiredError ||
-					err instanceof PluginOutdatedError
-				) {
-					throw err;
-				}
-				const msg = err instanceof Error ? err.message : String(err);
-				log.error(
-					"SummaryPanel",
-					`Plan ${plan.slug} push FAILED (docId=${plan.jolliPlanDocId ?? "none"}, title="${buildPlanPushTitle(summary, plan.title)}"): ${msg}`,
-				);
-				failures.push({ label: `plan "${plan.title}"`, message: msg });
-				continue;
-			}
-			const planUrl = `${baseUrl}/articles?doc=${planResult.docId}`;
-			log.info(
-				"SummaryPanel",
-				`Plan ${plan.slug} uploaded: docId=${planResult.docId}, url=${planUrl}`,
-			);
-			results.push({
-				slug: plan.slug,
-				title: plan.title,
-				url: planUrl,
-				docId: planResult.docId,
-			});
-		}
-		return { results, failures };
-	}
-
-	/**
-	 * Uploads associated notes to Jolli. Like {@link pushPlans}, a single note's
-	 * failure is collected and reported rather than aborting the whole push.
-	 */
-	private async pushNotes(
-		summary: CommitSummary,
-		resolvedBaseUrl: string,
-		baseUrl: string,
-		apiKey: string,
-		repoUrl: string,
-	): Promise<{
-		results: Array<{ id: string; title: string; url: string; docId: number }>;
-		failures: PushAttachmentFailure[];
-	}> {
-		const failures: PushAttachmentFailure[] = [];
-		const allNotes = summary.notes ?? [];
-		log.info(
-			"SummaryPanel",
-			`Push to Jolli: found ${allNotes.length} note(s) to upload`,
-		);
-		const results: Array<{
-			id: string;
-			title: string;
-			url: string;
-			docId: number;
-		}> = [];
-
-		for (const note of allNotes) {
-			// Schema-guard for legacy/corrupt entries — see mirrored logic in
-			// buildSatellitesFromSummary. Snippets with missing `content` are warned
-			// (and reported back to the webview via the skipped tally below).
-			let noteContent: string;
-			if (note.format === "snippet") {
-				if (note.content === undefined || note.content === "") {
-					log.warn(
-						"SummaryPanel",
-						`Snippet note ${note.id} has no content — skipping push`,
-					);
-					continue;
-				}
-				noteContent = note.content;
-			} else {
-				noteContent =
-					(await readNoteFromBranch(note.id, this.workspaceRoot)) ?? "";
-				if (!noteContent) {
-					log.info(
-						"SummaryPanel",
-						`Note ${note.id}: no content found, skipping`,
-					);
-					continue;
-				}
-			}
-			let noteResult: Awaited<ReturnType<typeof pushToJolli>>;
-			try {
-				noteResult = await pushToJolli(resolvedBaseUrl, apiKey, {
-					title: buildNotePushTitle(summary, note.title),
-					content: noteContent,
-					commitHash: summary.commitHash,
-					docType: "note",
-					branch: summary.branch,
-					...(note.jolliNoteDocId && { docId: note.jolliNoteDocId }),
-					repoUrl,
-					relativePath: buildBranchRelativePath(summary.branch),
-				});
-			} catch (err) {
-				if (
-					err instanceof BindingRequiredError ||
-					err instanceof PluginOutdatedError
-				) {
-					throw err;
-				}
-				const msg = err instanceof Error ? err.message : String(err);
-				log.error(
-					"SummaryPanel",
-					`Note ${note.id} push FAILED (docId=${note.jolliNoteDocId ?? "none"}, title="${buildNotePushTitle(summary, note.title)}"): ${msg}`,
-				);
-				failures.push({ label: `note "${note.title}"`, message: msg });
-				continue;
-			}
-			const noteUrl = `${baseUrl}/articles?doc=${noteResult.docId}`;
-			results.push({
-				id: note.id,
-				title: note.title,
-				url: noteUrl,
-				docId: noteResult.docId,
-			});
-		}
-		return { results, failures };
 	}
 
 	/** Handles editing a memory at the given global index. */
@@ -3952,91 +4078,6 @@ function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
 		}
 	}
 	return true;
-}
-
-/** Merges published plan URLs/docIds into plan references. */
-function applyPlanUrls(
-	plans: ReadonlyArray<PlanReference> | undefined,
-	planUrls: ReadonlyArray<{ slug: string; url: string; docId: number }>,
-): ReadonlyArray<PlanReference> | undefined {
-	if (!plans || planUrls.length === 0) {
-		return plans;
-	}
-	const urlMap = new Map(planUrls.map((p) => [p.slug, p]));
-	return plans.map((p) => {
-		const pushed = urlMap.get(p.slug);
-		return pushed
-			? { ...p, jolliPlanDocUrl: pushed.url, jolliPlanDocId: pushed.docId }
-			: p;
-	});
-}
-
-/** Merges published note URLs/docIds into note references. */
-function applyNoteUrls(
-	notes: ReadonlyArray<NoteReference>,
-	noteUrls: ReadonlyArray<{ id: string; url: string; docId: number }>,
-): ReadonlyArray<NoteReference> {
-	const urlMap = new Map(noteUrls.map((n) => [n.id, n]));
-	return notes.map((n) => {
-		const pushed = urlMap.get(n.id);
-		return pushed
-			? { ...n, jolliNoteDocUrl: pushed.url, jolliNoteDocId: pushed.docId }
-			: n;
-	});
-}
-
-/**
- * Deletes orphaned memory articles from Jolli Space, then persists the result.
- * Only IDs that were successfully deleted are removed from orphanedDocIds;
- * IDs that failed to delete are kept so the next push retries them.
- */
-async function cleanupOrphanedDocs(
-	originalSummary: CommitSummary,
-	updatedSummary: CommitSummary,
-	baseUrl: string,
-	apiKey: string,
-	bridge: JolliMemoryBridge,
-): Promise<CommitSummary | null> {
-	const orphanedIds = originalSummary.orphanedDocIds
-		? [...originalSummary.orphanedDocIds]
-		: [];
-	if (orphanedIds.length === 0) {
-		return null;
-	}
-
-	const results = await Promise.allSettled(
-		orphanedIds.map((id) =>
-			deleteFromJolli(baseUrl, apiKey, id).then(() => id),
-		),
-	);
-
-	const deleted = new Set<number>();
-	for (const r of results) {
-		if (r.status === "fulfilled") {
-			deleted.add(r.value);
-		}
-	}
-
-	const remaining = orphanedIds.filter((id) => !deleted.has(id));
-	if (deleted.size > 0) {
-		log.info("SummaryPanel", `Deleted ${deleted.size} orphaned article(s)`);
-	}
-	if (remaining.length > 0) {
-		log.warn(
-			"SummaryPanel",
-			`Failed to delete ${remaining.length} orphaned article(s), will retry on next push`,
-		);
-	}
-
-	// Persist: clear successfully deleted IDs, keep failed ones for retry
-	const cleaned: CommitSummary = {
-		...updatedSummary,
-		...(remaining.length > 0
-			? { orphanedDocIds: remaining }
-			: { orphanedDocIds: undefined }),
-	};
-	await bridge.storeSummary(cleaned, true);
-	return cleaned;
 }
 
 /** Extracts a human-readable error message from a rejected `PromiseSettledResult`. */
