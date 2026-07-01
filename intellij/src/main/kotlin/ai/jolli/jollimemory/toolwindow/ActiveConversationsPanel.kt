@@ -163,9 +163,9 @@ class ActiveConversationsPanel(
 	}
 
 	private fun onResume(item: ActiveConversationItem) {
-		if (item.source != TranscriptSource.claude) return
+		if (!TerminalUtils.canResumeSource(item.source.name)) return
 		val cwd = service.mainRepoRoot ?: project.basePath ?: return
-		TerminalUtils.resumeClaudeSession(project, item.sessionId, cwd, "Claude – ${item.title}")
+		TerminalUtils.resumeSession(project, item.source.name, item.sessionId, cwd, item.title)
 	}
 
 	private fun onSelectionChanged(item: ActiveConversationItem, selected: Boolean) {

@@ -122,7 +122,7 @@ class PinnedPanel(
 		left.add(title)
 		row.add(left, BorderLayout.CENTER)
 
-		// Hover actions, right edge: Open (eye) · Resume (play, Claude only) · Unpin.
+		// Hover actions, right edge: Open (eye) · Resume (play, Claude/Codex only) · Unpin.
 		val openBtn = actionIcon(JolliMemoryIcons.Eye, "Open") { openPinned(entry) }
 		val unpinBtn = actionIcon(AllIcons.Actions.Close, "Unpin") {
 			val dir = cwd() ?: return@actionIcon
@@ -131,7 +131,7 @@ class PinnedPanel(
 				refresh()
 			}
 		}
-		val canResume = entry.kind == "conversations" && entry.badge.lowercase() == "claude"
+		val canResume = entry.kind == "conversations" && TerminalUtils.canResumeSource(entry.badge)
 		val actions = if (canResume) {
 			val resumeBtn = actionIcon(AllIcons.Actions.Execute, "Resume session in terminal") { resumeInTerminal(entry) }
 			listOf(openBtn, resumeBtn, unpinBtn)
@@ -184,12 +184,12 @@ class PinnedPanel(
 		})
 	}
 
-	/** Resume a pinned Claude conversation directly in terminal. */
+	/** Resume a pinned conversation directly in terminal (Claude or Codex). */
 	private fun resumeInTerminal(entry: PinStore.PinnedEntry) {
 		val cwd = cwd() ?: return
 		val sessionId = entry.key.substringAfter(":")
 		if (sessionId.isNotBlank()) {
-			TerminalUtils.resumeClaudeSession(project, sessionId, cwd, "Claude – ${entry.title}")
+			TerminalUtils.resumeSession(project, entry.badge, sessionId, cwd, entry.title)
 		}
 	}
 
