@@ -31,7 +31,6 @@ import { buildSidebarHtml } from "./SidebarHtmlBuilder.js";
 import type {
 	BranchMemoryItem,
 	FolderNode,
-	KnowledgeRepo,
 	MemoryEvidence,
 	MemoryEvidenceItem,
 	MemoryItem,
@@ -49,6 +48,50 @@ import type {
  * dropped rather than forwarded into the archived-snapshot read path.
  */
 const REFERENCE_SOURCE_IDS = new Set<string>(["linear", "jira", "github", "notion"]);
+
+/**
+ * Built-in VS Code commands the sidebar webview is allowed to dispatch, in
+ * addition to this extension's own `jollimemory.*` commands. `vscode.open`
+ * follows external links (the "View on Jolli" PR / synced-doc rows) since a
+ * webview cannot navigate `<a href>` itself. `vscode.openFolder` backs the
+ * no-workspace onboarding CTA (applyDegraded sets the enable button's
+ * data-command to it); it is dispatched argless, so it only ever raises the
+ * native folder picker. Keep this list minimal — every entry is a command a
+ * webview-controlled message can trigger on the host.
+ */
+const ALLOWED_BUILTIN_WEBVIEW_COMMANDS = new Set<string>(["vscode.open", "vscode.openFolder"]);
+
+/** True when the webview may ask the host to run `command` (see the set above). */
+function isAllowedWebviewCommand(command: string): boolean {
+	return command.startsWith("jollimemory.") || ALLOWED_BUILTIN_WEBVIEW_COMMANDS.has(command);
+}
+
+/**
+ * Argument-level guard for the built-in commands on the allowlist. Gating the
+ * command NAME is not enough for `vscode.open`: it resolves whatever URI it is
+ * handed, so a webview-controlled `command:` URI would execute an arbitrary VS
+ * Code command (with webview-controlled args), and `file:` / `vscode:` URIs
+ * would open local files or trigger deep-link handlers. A corrupted or hostile
+ * memory row's `href` flows straight into this path, so the payload — not just
+ * the name — crosses the trust boundary. Only external `https:` links (the
+ * "View on Jolli" PR / synced-doc rows the sidebar actually needs) are allowed
+ * through; every other scheme is dropped. `vscode.openFolder` is only allowed
+ * argless (raising the native folder picker) — a webview-supplied folder URI
+ * would open an arbitrary folder as a trusted workspace, so any args are
+ * dropped. `jollimemory.*` commands are dispatched only from host-defined call
+ * sites, so their args are trusted.
+ */
+function isAllowedWebviewCommandArgs(command: string, args: ReadonlyArray<unknown> | undefined): boolean {
+	if (command === "vscode.openFolder") return args === undefined || args.length === 0;
+	if (command !== "vscode.open") return true;
+	const target = args?.[0];
+	if (typeof target !== "string") return false;
+	try {
+		return new URL(target).protocol === "https:";
+	} catch {
+		return false;
+	}
+}
 
 export interface SidebarWebviewDeps {
 	executeCommand: (
@@ -120,8 +163,11 @@ export interface SidebarWebviewDeps {
 			branchName: string,
 		): Promise<ReadonlyArray<BranchMemoryItem>>;
 	};
-	/** Returns absolute path under kbRoot for a relative path. */
-	resolveKbAbs?: (relPath: string) => string;
+	/**
+	 * Returns the absolute path under kbRoot for a relative path, or `undefined`
+	 * when `relPath` would escape the Memory Bank parent (traversal guard).
+	 */
+	resolveKbAbs?: (relPath: string) => string | undefined;
 	/**
 	 * True when the Memory Bank `.md` at `abs` has been edited on disk and its
 	 * sha256 no longer matches the manifest fingerprint. Consulted from
@@ -296,17 +342,6 @@ export interface SidebarWebviewDeps {
 	 */
 	readTranscriptById?: (id: string) => Promise<StoredTranscript | null>;
 	/**
-	 * Returns `KnowledgeRepo[]` for the Knowledge wiki view — one entry per
-	 * discoverable Memory Bank repo, each projected from its compiled
-	 * knowledge-graph artifact. A repo with no graph contributes a
-	 * `KnowledgeRepo` with `categories: []` (the client renders a Build CTA).
-	 *
-	 * Optional so existing tests that don't exercise the Knowledge view keep
-	 * compiling without changes. When absent, `pushKnowledgeData` posts an
-	 * empty repos list.
-	 */
-	getKnowledgeData?: () => Promise<ReadonlyArray<KnowledgeRepo>>;
-	/**
 	 * Returns aggregated LLM token counts across all committed summaries on
 	 * the current branch. Called alongside `pushCommits` so the token bar
 	 * renders immediately when commits data arrives. Optional: when absent,
@@ -317,6 +352,14 @@ export interface SidebarWebviewDeps {
 		input: number;
 		output: number;
 		cached: number;
+		/**
+		 * Scalar branch total (Σ `aggregateConversationTokens` per root) — the SAME
+		 * basis each memory row's subline uses, so the bar total reconciles with the
+		 * sum of its rows even when legacy roots carry a scalar `conversationTokens`
+		 * with no per-segment breakdown. Always ≥ input+output+cached; the difference
+		 * is untracked legacy tokens the coloured segments cannot attribute.
+		 */
+		total: number;
 		reporting: number;
 		memories: number;
 	}>;
@@ -596,6 +639,26 @@ export class SidebarWebviewProvider
 				void this.handleReady();
 				return;
 			case "command":
+				// Defense-in-depth (confused-deputy): the webview can only ask the
+				// host to run this extension's own commands. `msg.command` is
+				// webview-supplied and flows straight into executeCommand — without a
+				// check, any VS Code command (built-in or from another extension)
+				// could be invoked with webview-controlled args. Sidebar-dispatched
+				// commands are `jollimemory.*`, PLUS a tiny allowlist of built-ins the
+				// sidebar itself needs: `vscode.open` is how it follows external links
+				// (webviews don't navigate `<a href>`), e.g. the "View on Jolli" PR /
+				// synced-doc rows in the Branch view.
+				if (typeof msg.command !== "string" || !isAllowedWebviewCommand(msg.command)) {
+					log.warn("SidebarWebviewProvider", `Blocked disallowed command from webview: ${msg.command}`);
+					return;
+				}
+				// Name-allowlisted, but built-ins like `vscode.open` also need their
+				// URI argument validated — an unchecked scheme (command:/file:/vscode:)
+				// re-opens the confused-deputy hole the name gate closed.
+				if (!isAllowedWebviewCommandArgs(msg.command, msg.args)) {
+					log.warn("SidebarWebviewProvider", `Blocked disallowed command args from webview: ${msg.command}`);
+					return;
+				}
 				if (msg.args && msg.args.length > 0) {
 					void this.deps.executeCommand(msg.command, ...msg.args);
 				} else {
@@ -1429,7 +1492,6 @@ export class SidebarWebviewProvider
 			| "branch-current"
 			| "branch-commits"
 			| "status"
-			| "knowledge"
 			| "all",
 	): void {
 		if (scope === "kb" || scope === "all") {
@@ -1466,35 +1528,6 @@ export class SidebarWebviewProvider
 		if (scope === "status" || scope === "all") {
 			void this.deps.executeCommand("jollimemory.refreshStatus");
 		}
-		if (scope === "knowledge" || scope === "all") {
-			void this.pushKnowledgeData();
-		}
-	}
-
-	/**
-	 * Reads each repo's compiled knowledge-graph artifact and posts a
-	 * `kb:knowledgeData` message with the projected `KnowledgeRepo[]`. When
-	 * `deps.getKnowledgeData` is absent, posts an empty repos list so the
-	 * webview can render a "no data yet" state rather than staying on the
-	 * loading placeholder.
-	 *
-	 * Errors are caught here so a dep failure degrades to an empty list
-	 * rather than leaving the webview on the loading placeholder. Per-repo
-	 * error isolation is the responsibility of the dep implementation.
-	 */
-	async pushKnowledgeData(): Promise<void> {
-		let repos: ReadonlyArray<KnowledgeRepo> = [];
-		if (this.deps.getKnowledgeData) {
-			try {
-				repos = await this.deps.getKnowledgeData();
-			} catch (err) {
-				log.warn(
-					"SidebarWebviewProvider",
-					`pushKnowledgeData: getKnowledgeData failed: ${err instanceof Error ? err.message : String(err)}`,
-				);
-			}
-		}
-		this.postMessage({ type: "kb:knowledgeData", repos });
 	}
 
 	/**
@@ -1720,10 +1753,14 @@ export class SidebarWebviewProvider
 			void this.deps
 				.getBranchTokenStats()
 				.then((stats) => {
-					// cached counts toward the total so input + output + cached
-					// reconcile (Anthropic bills input_tokens separately from the
-					// cache_read / cache_creation totals folded into `cached`).
-					const total = stats.input + stats.output + stats.cached;
+					// `cached` here is cache_CREATION only (cache_read is deliberately
+					// excluded — see ConversationTokenBreakdown in Types.ts), matching the
+					// per-memory subline basis so the two token figures reconcile. The bar
+					// TOTAL comes from the scalar `stats.total` (Σ aggregateConversationTokens),
+					// NOT input+output+cached: a branch with legacy roots that carry the
+					// scalar but no breakdown would otherwise read as LESS than the sum of
+					// its own rows. The coloured segments stay a floor of what's attributable.
+					const total = stats.total;
 					if (total > 0) {
 						this.postMessage({
 							type: "branch:tokenStats",
@@ -1823,6 +1860,8 @@ export class SidebarWebviewProvider
 	private handleOpenFile(relPath: string): void {
 		if (!this.deps.resolveKbAbs) return;
 		const abs = this.deps.resolveKbAbs(relPath);
+		// undefined → resolveKbAbs rejected a traversal escape; do not open it.
+		if (!abs) return;
 		if (relPath.toLowerCase().endsWith(".md")) {
 			void this.deps.executeCommand("jollimemory.openMemoryFile", abs);
 			// Opening a `.md` is the one place divergence is checked outside the

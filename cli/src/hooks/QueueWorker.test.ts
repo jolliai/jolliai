@@ -2917,6 +2917,75 @@ describe("QueueWorker", () => {
 			}
 		});
 
+		it("zeros only the session whose entries an overlay removed, keeping other sessions' tokens", async () => {
+			// Per-session isolation: a delete in session A must not wipe session B's
+			// real token count. Pre-fix, the removal was detected at the aggregate
+			// level (totalEntries < preOverlayEntries), so a single deleted turn in
+			// ANY session zeroed conversationTokens for the whole commit.
+			const cwd = mkdtempSync(join(tmpdir(), "jolli-c1multi-"));
+			const { readFile } = await import("node:fs/promises");
+			try {
+				const { overlayPath } = await import("../core/ConversationOverlayStore.js");
+				vi.mocked(loadAllSessions).mockResolvedValue([
+					{
+						sessionId: "claude-a",
+						transcriptPath: "/tmp/claude-a.jsonl",
+						updatedAt: "2026-04-01T12:00:00.000Z",
+						source: "claude" as const,
+					},
+					{
+						sessionId: "claude-b",
+						transcriptPath: "/tmp/claude-b.jsonl",
+						updatedAt: "2026-04-01T12:00:00.000Z",
+						source: "claude" as const,
+					},
+				]);
+				vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+				vi.mocked(saveCursor).mockResolvedValue(undefined);
+				// Session A: two entries, 500 tokens — the overlay deletes one of them.
+				// Session B: one untouched entry, 900 tokens — must survive intact.
+				vi.mocked(readTranscript).mockImplementation(async (transcriptPath: string) => {
+					if (transcriptPath === "/tmp/claude-a.jsonl") {
+						return {
+							entries: [
+								{ role: "human", content: "keep me", timestamp: "2026-04-01T12:00:00.000Z" },
+								{ role: "human", content: "delete me", timestamp: "2026-04-01T12:00:01.000Z" },
+							],
+							newCursor: { transcriptPath, lineNumber: 2, updatedAt: "2026-04-01T12:00:00.000Z" },
+							totalLinesRead: 2,
+							usageTokens: 500,
+						};
+					}
+					return {
+						entries: [{ role: "human", content: "b untouched", timestamp: "2026-04-01T12:00:00.000Z" }],
+						newCursor: { transcriptPath, lineNumber: 1, updatedAt: "2026-04-01T12:00:00.000Z" },
+						totalLinesRead: 1,
+						usageTokens: 900,
+					};
+				});
+				const opA = overlayPath({ projectDir: cwd, source: "claude", sessionId: "claude-a" });
+				const overlayJson = JSON.stringify({
+					version: 2,
+					source: "claude",
+					sessionId: "claude-a",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					deletes: [{ role: "human", content: "delete me", timestamp: "2026-04-01T12:00:01.000Z" }],
+					edits: [],
+				});
+				vi.mocked(readFile).mockImplementation(async (p: unknown) => (String(p) === opA ? overlayJson : ""));
+
+				const result = await __test__.loadSessionTranscripts(cwd, {});
+
+				// A (removed) is zeroed; B (untouched) keeps its 900 → total 900, not 0.
+				expect(result.totalEntries).toBe(2);
+				expect(result.conversationTokens).toBe(900);
+			} finally {
+				vi.mocked(readTranscript).mockReset();
+				vi.mocked(readFile).mockResolvedValue("");
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+
 		it("keeps the raw token sum when no overlay altered the entry set", async () => {
 			const cwd = mkdtempSync(join(tmpdir(), "jolli-c1b-"));
 			const { readFile } = await import("node:fs/promises");

@@ -106,25 +106,37 @@ export async function readTranscript(
 	const rawEntries: TranscriptEntry[] = [];
 	const cutoffTime = beforeTimestamp ? new Date(beforeTimestamp).getTime() : undefined;
 	let lastConsumedLineIndex = startLine; // Track how far we actually consumed
-	let usageTokens = 0;
+	let usageInput = 0;
+	let usageOutput = 0;
+	let usageCached = 0;
 
 	for (let i = 0; i < newLines.length; i++) {
 		const lineNum = startLine + i;
 		const entry = parseFn(newLines[i], lineNum);
-		if (entry) {
-			// If a time cutoff is specified, stop consuming when we hit an entry after it.
-			// Entries without timestamps are conservatively included (they were written
-			// before the next timestamped entry, so they belong to the current window).
-			if (cutoffTime && entry.timestamp) {
-				const entryTime = new Date(entry.timestamp).getTime();
-				if (entryTime > cutoffTime) {
-					break; // Remaining lines belong to a later commit
-				}
+		// Apply the time cutoff per LINE, not only per produced entry. A tool-only
+		// assistant turn yields no entry (extractContent keeps only text) yet carries
+		// a real timestamp and usage; gating only on entry-bearing lines let such a
+		// turn past the cutoff still have its tokens summed here and the cursor
+		// advanced over it, so the commit that owns it could never read those tokens.
+		// Falls back to the entry timestamp, then the parser's raw-line timestamp.
+		// Lines with no resolvable timestamp are conservatively included (they were
+		// written before the next timestamped line, so they belong to this window).
+		if (cutoffTime) {
+			const lineTimestamp = entry?.timestamp ?? activeParser.parseTimestamp?.(newLines[i], lineNum);
+			if (lineTimestamp && new Date(lineTimestamp).getTime() > cutoffTime) {
+				break; // Remaining lines (this one included) belong to a later commit
 			}
+		}
+		if (entry) {
 			rawEntries.push(entry);
 		}
-		// Accumulate per-line token usage from the parser
-		usageTokens += activeParser.parseUsageTokens?.(newLines[i], lineNum) ?? 0;
+		// Accumulate per-line token usage (per segment) from the parser
+		const usage = activeParser.parseUsageTokens?.(newLines[i], lineNum);
+		if (usage) {
+			usageInput += usage.input;
+			usageOutput += usage.output;
+			usageCached += usage.cached;
+		}
 		// Only advance cursor for lines we actually processed (not past the break point)
 		lastConsumedLineIndex = startLine + i + 1;
 	}
@@ -140,7 +152,13 @@ export async function readTranscript(
 		updatedAt: new Date().toISOString(),
 	};
 
-	return { entries, newCursor, totalLinesRead: lastConsumedLineIndex - startLine, usageTokens };
+	return {
+		entries,
+		newCursor,
+		totalLinesRead: lastConsumedLineIndex - startLine,
+		usageTokens: usageInput + usageOutput + usageCached,
+		usageBreakdown: { input: usageInput, output: usageOutput, cached: usageCached },
+	};
 }
 
 /**

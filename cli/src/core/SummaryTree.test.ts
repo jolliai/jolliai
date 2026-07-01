@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { CommitSummary } from "../Types.js";
 import {
+	aggregateConversationTokenBreakdown,
 	aggregateConversationTokens,
 	aggregateStats,
 	aggregateTurns,
@@ -179,6 +180,60 @@ describe("SummaryTree", () => {
 		it("returns 0 when no conversationTokens anywhere", () => {
 			const node: CommitSummary = { ...D, conversationTokens: undefined, children: [] };
 			expect(aggregateConversationTokens(node)).toBe(0);
+		});
+	});
+
+	describe("aggregateConversationTokenBreakdown", () => {
+		it("sums own and children breakdown segments across the tree", () => {
+			// Mirror of aggregateConversationTokens so the branch bar and the
+			// per-memory subline walk the SAME tree — a root that ignored children
+			// would under-report and the sum of rows could exceed the branch total.
+			const child1 = leaf({
+				commitHash: "t1",
+				conversationTokenBreakdown: { input: 100, output: 20, cached: 5 },
+			});
+			const child2 = leaf({
+				commitHash: "t2",
+				conversationTokenBreakdown: { input: 200, output: 40, cached: 10 },
+			});
+			const node: CommitSummary = {
+				...D,
+				conversationTokenBreakdown: { input: 50, output: 10, cached: 1 },
+				children: [child1, child2],
+			};
+			expect(aggregateConversationTokenBreakdown(node)).toEqual({
+				input: 350,
+				output: 70,
+				cached: 16,
+			});
+		});
+
+		it("returns zeros when no breakdown anywhere", () => {
+			const node: CommitSummary = { ...D, conversationTokenBreakdown: undefined, children: [] };
+			expect(aggregateConversationTokenBreakdown(node)).toEqual({ input: 0, output: 0, cached: 0 });
+		});
+
+		it("coerces missing segment fields to 0 instead of propagating NaN", () => {
+			// summaries load through a bare JSON.parse with no schema validation, so a
+			// hand-edited file, an older schema, or a future producer that writes only
+			// some segments can leave a PARTIAL breakdown object. The `?? {0,0,0}`
+			// fallback only covers a wholly-absent object — a present-but-partial one
+			// would make `own.output + child.output === undefined + n === NaN` poison
+			// the whole tree total, and NaN > 0 is false, so the branch bar vanishes.
+			const child = leaf({
+				commitHash: "t1",
+				// output/cached omitted — the partial-object case.
+				conversationTokenBreakdown: { input: 100 } as unknown as CommitSummary["conversationTokenBreakdown"],
+			});
+			const node: CommitSummary = {
+				...D,
+				conversationTokenBreakdown: {
+					input: 50,
+					output: 10,
+				} as unknown as CommitSummary["conversationTokenBreakdown"],
+				children: [child],
+			};
+			expect(aggregateConversationTokenBreakdown(node)).toEqual({ input: 150, output: 10, cached: 0 });
 		});
 	});
 

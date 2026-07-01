@@ -107,12 +107,6 @@ describe("SidebarCssBuilder", () => {
 		expect(css).toContain(".repo-filter");
 	});
 
-	it("styles the Knowledge wiki tree and entry rows", () => {
-		const css = buildSidebarCss();
-		expect(css).toContain(".kn-entry");
-		expect(css).toContain(".kn-cat");
-	});
-
 	it("defines conversation source-icon and usage-note styles", () => {
 		const css = buildSidebarCss();
 		expect(css).toContain(".icon.conv-source-icon");

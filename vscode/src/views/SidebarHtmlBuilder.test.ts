@@ -66,7 +66,7 @@ describe("SidebarHtmlBuilder", () => {
 		expect(html).toContain('id="breadcrumb-menu"');
 	});
 
-	it("renders the three-view switch with Current Branch / Memory Bank / Knowledge", () => {
+	it("renders the two-view switch with Current Branch / Memory Bank", () => {
 		const html = buildSidebarHtml(
 			"n",
 			"vscode-resource:",
@@ -78,10 +78,9 @@ describe("SidebarHtmlBuilder", () => {
 		expect(html).toMatch(/<div class="view-switch hidden" id="view-switch"/);
 		expect(html).toContain('class="view-tab active" type="button" data-tab="branch"');
 		expect(html).toContain('data-tab="kb"');
-		expect(html).toContain('data-tab="knowledge"');
+		expect(html).not.toContain('data-tab="knowledge"');
 		expect(html).toContain("Current Branch");
 		expect(html).toContain("Memory Bank");
-		expect(html).toContain("Knowledge");
 		// The view-switch sits ABOVE the breadcrumb header now (it used to be
 		// below it). The repo/branch dropdowns live under the three-view tabs.
 		const switchIdx = html.indexOf('id="view-switch"');
@@ -96,7 +95,7 @@ describe("SidebarHtmlBuilder", () => {
 		expect(html).toContain("Showing");
 	});
 
-	it("includes 4 tab content panels with stable ids", () => {
+	it("includes 3 tab content panels with stable ids", () => {
 		const html = buildSidebarHtml(
 			"n",
 			"vscode-resource:",
@@ -106,7 +105,7 @@ describe("SidebarHtmlBuilder", () => {
 		expect(html).toContain('id="tab-content-kb"');
 		expect(html).toContain('id="tab-content-branch"');
 		expect(html).toContain('id="tab-content-status"');
-		expect(html).toContain('id="tab-content-knowledge"');
+		expect(html).not.toContain('id="tab-content-knowledge"');
 	});
 
 	it("includes a hidden disabled banner mount", () => {
@@ -244,9 +243,6 @@ describe("SidebarHtmlBuilder", () => {
 				/<div class="tab-content hidden" id="tab-content-status"/,
 			);
 			expect(html).toMatch(/<div class="view-switch hidden" id="view-switch"/);
-			expect(html).toMatch(
-				/<div class="tab-content hidden" id="tab-content-knowledge"/,
-			);
 		});
 	});
 

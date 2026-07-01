@@ -61,14 +61,34 @@ export interface TranscriptEntry {
 	readonly timestamp?: string;
 }
 
+/**
+ * Per-turn conversation token usage, split into the three segments the VS Code
+ * branch token-usage bar renders (input / output / cached).
+ *
+ * `cached` is `cache_creation_input_tokens` only. `cache_read_input_tokens` is
+ * deliberately EXCLUDED because real Claude transcripts emit it as a *cumulative*
+ * running total per turn — summing it across a slice re-counts the cached prefix
+ * on every turn and inflates the figure by an order of magnitude (see
+ * `ClaudeTranscriptParser.parseUsageTokens`). So `input + output + cached` equals
+ * the scalar total historically stored as `conversationTokens`. */
+export interface ConversationTokenBreakdown {
+	readonly input: number;
+	readonly output: number;
+	readonly cached: number;
+}
+
 /** Result from reading a transcript file */
 export interface TranscriptReadResult {
 	readonly entries: ReadonlyArray<TranscriptEntry>;
 	readonly newCursor: TranscriptCursor;
 	readonly totalLinesRead: number;
-	/** Sum of per-turn token usage (input + cache_creation + cache_read + output)
-	 *  over the slice read. 0 for sources whose parser does not expose usage. */
+	/** Sum of per-turn token usage (input + cache_creation + output) over the
+	 *  slice read; cache_read is excluded (see {@link ConversationTokenBreakdown}).
+	 *  0 for sources whose parser does not expose usage. */
 	readonly usageTokens?: number;
+	/** Per-segment split of {@link usageTokens}. Absent for sources whose parser
+	 *  does not expose usage. `input + output + cached === usageTokens`. */
+	readonly usageBreakdown?: ConversationTokenBreakdown;
 }
 
 // ─── Stored transcript types (orphan branch persistence) ─────────────────────
@@ -346,11 +366,17 @@ export interface CommitSummary {
 	readonly transcriptEntries?: number;
 	/** Actual conversation turns (count of human-role entries in transcript) */
 	readonly conversationTurns?: number;
-	/** Total conversation token consumption (input + cache_creation + cache_read +
-	 *  output across assistant turns) for the turns consumed into this commit.
+	/** Total conversation token consumption (input + cache_creation + output across
+	 *  assistant turns; cache_read excluded — see {@link ConversationTokenBreakdown})
+	 *  for the turns consumed into this commit.
 	 *  Forward-only: absent on memories generated before this field existed, and on
 	 *  sources whose transcript carries no usage. Consolidated roots aggregate children. */
 	readonly conversationTokens?: number;
+	/** Per-segment (input / output / cached) split of {@link conversationTokens},
+	 *  powering the branch token-usage bar's coloured segments and cost estimate.
+	 *  Forward-only and co-written with `conversationTokens` (both present or both
+	 *  absent going forward); older memories may carry the scalar total only. */
+	readonly conversationTokenBreakdown?: ConversationTokenBreakdown;
 	/** LLM call metadata; absent for squash/merge containers (no API call made) */
 	readonly llm?: LlmCallMetadata;
 	/**

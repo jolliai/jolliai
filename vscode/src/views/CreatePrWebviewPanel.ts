@@ -40,6 +40,16 @@ export class CreatePrWebviewPanel {
 
 	private vm: CreatePrViewModel | undefined;
 
+	/**
+	 * Host-side in-flight guard for the create/update-PR action. The webview's own
+	 * `inFlight` flag only survives within a single render, but `show()` re-renders
+	 * this same singleton (resetting the webview's flag to false) when the "Create
+	 * PR" command is re-run. Without a host-side lock, a second click while the
+	 * first push/create is still awaiting would fire a concurrent push + duplicate
+	 * PR create. This flag lives on the instance, so it spans re-renders.
+	 */
+	private prActionInFlight = false;
+
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
 		private readonly workspaceRoot: string,
@@ -139,22 +149,47 @@ export class CreatePrWebviewPanel {
 					post({ command: "prCreateFailed" });
 					return;
 				}
-				const title = m.title?.trim() ? m.title : this.vm.title;
-				const body = m.body?.trim() ? wrapWithMarkers(m.body) : wrapWithMarkers(this.vm.bodyMarkdown);
-				// Same webview message for both modes; the host is the source of
-				// truth for whether an open PR exists. Update pushes + syncs the
-				// draft into the existing PR; otherwise create a fresh one.
-				if (this.vm.existingPr) {
-					await handleUpdatePrWithPush(title, body, this.workspaceRoot, post, this.vm.branch);
-				} else {
-					await handleCreatePr(title, body, this.workspaceRoot, post, this.vm.branch);
+				// Host-side re-entry guard. A re-run of the "Create PR" command
+				// re-renders this singleton and resets the webview's own inFlight
+				// flag, so a second click could otherwise land here while the first
+				// push/create is still awaiting — two pushes + a duplicate PR. Post
+				// prCreateFailed so the (re-rendered) buttons re-enable for a retry
+				// once the first action settles.
+				if (this.prActionInFlight) {
+					post({ command: "prCreateFailed" });
+					return;
+				}
+				this.prActionInFlight = true;
+				try {
+					const title = m.title?.trim() ? m.title : this.vm.title;
+					const body = m.body?.trim() ? wrapWithMarkers(m.body) : wrapWithMarkers(this.vm.bodyMarkdown);
+					// Same webview message for both modes; the host is the source of
+					// truth for whether an open PR exists. Update pushes + syncs the
+					// draft into the existing PR; otherwise create a fresh one.
+					if (this.vm.existingPr) {
+						await handleUpdatePrWithPush(title, body, this.workspaceRoot, post, this.vm.branch);
+					} else {
+						await handleCreatePr(title, body, this.workspaceRoot, post, this.vm.branch);
+					}
+				} finally {
+					this.prActionInFlight = false;
 				}
 				return;
 			}
 
-			case "openPr":
-				await vscode.env.openExternal(vscode.Uri.parse(m.url));
+			case "openPr": {
+				// Defense-in-depth: only follow http(s) URLs. `m.url` is webview-
+				// supplied; without a scheme check a `file:`/`vscode:`/`command:` URI
+				// would be handed to openExternal. Mirrors the openDiff traversal
+				// guard below and the https-only check on the PR-history rows.
+				const uri = vscode.Uri.parse(m.url);
+				if (uri.scheme !== "https" && uri.scheme !== "http") {
+					log.warn("CreatePrPanel", `openPr rejected non-http(s) URL: ${m.url}`);
+					return;
+				}
+				await vscode.env.openExternal(uri);
 				return;
+			}
 
 			case "copyBody":
 				await vscode.env.clipboard.writeText(wrapWithMarkers(this.vm.bodyMarkdown));

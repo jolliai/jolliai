@@ -192,6 +192,79 @@ describe("SidebarWebviewProvider", () => {
 		expect(executeCommand).toHaveBeenCalledWith("jollimemory.openSettings");
 	});
 
+	it("blocks a `command` message whose command is not a jollimemory.* command", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "command",
+			command: "workbench.action.terminal.sendSequence",
+			args: ["rm -rf ~"],
+		} as unknown as SidebarOutboundMsg);
+		expect(executeCommand).not.toHaveBeenCalled();
+	});
+
+	it("allows the built-in `vscode.open` command the sidebar uses for external links", () => {
+		// The "View on Jolli" PR / synced-doc rows dispatch { command: 'vscode.open' }
+		// because webviews cannot follow <a href>. The confused-deputy guard must let
+		// this specific built-in through (it is on the allowlist), or those links die.
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "command",
+			command: "vscode.open",
+			args: ["https://jolli.ai/x"],
+		} as unknown as SidebarOutboundMsg);
+		expect(executeCommand).toHaveBeenCalledWith("vscode.open", "https://jolli.ai/x");
+	});
+
+	it("blocks a `vscode.open` command carrying a `command:` scheme URI", () => {
+		// The command-name allowlist is not enough: vscode.open resolves ANY URI it
+		// is handed. A `command:` URI would run an arbitrary VS Code command with
+		// webview-controlled args — the exact confused-deputy hole the name gate
+		// was meant to close. A corrupted memory row's href must not reach the host.
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "command",
+			command: "vscode.open",
+			args: ["command:jollimemory.deleteEverything?%5B%22x%22%5D"],
+		} as unknown as SidebarOutboundMsg);
+		expect(executeCommand).not.toHaveBeenCalled();
+	});
+
+	it("blocks a `vscode.open` command carrying a `file:` scheme URI", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "command",
+			command: "vscode.open",
+			args: ["file:///etc/passwd"],
+		} as unknown as SidebarOutboundMsg);
+		expect(executeCommand).not.toHaveBeenCalled();
+	});
+
+	it("blocks a `vscode.open` command whose URI argument is not a string", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "command",
+			command: "vscode.open",
+			args: [{ scheme: "command" }],
+		} as unknown as SidebarOutboundMsg);
+		expect(executeCommand).not.toHaveBeenCalled();
+	});
+
+	it("blocks a `vscode.open` command whose argument is not a parseable URL", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "command",
+			command: "vscode.open",
+			args: ["not a url"],
+		} as unknown as SidebarOutboundMsg);
+		expect(executeCommand).not.toHaveBeenCalled();
+	});
+
 	it("ignores malformed outbound messages without throwing", () => {
 		const view = makeMockView();
 		provider.resolveWebviewView(view as unknown as never);
@@ -372,6 +445,30 @@ describe("SidebarWebviewProvider", () => {
 			"jollimemory.openMemoryFile",
 			"/kbroot/memo.md",
 		);
+	});
+
+	it("kb:openFile does nothing when resolveKbAbs rejects the path (traversal escape → undefined)", () => {
+		const view = makeMockView();
+		const exec = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: exec,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			// Mirrors the real resolveKbAbs returning undefined for an escaping path.
+			resolveKbAbs: () => undefined,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		expect(() =>
+			view.webview.triggerMessage({ type: "kb:openFile", path: "../../etc/passwd" }),
+		).not.toThrow();
+		expect(exec).not.toHaveBeenCalled();
 	});
 
 	it("posts kb:markDiverged when an opened .md is diverged on disk", async () => {
@@ -1449,6 +1546,53 @@ describe("SidebarWebviewProvider", () => {
 		);
 		expect(commitsMsg).toBeDefined();
 		expect((commitsMsg as unknown as { mode?: unknown }).mode).toBe("empty");
+	});
+
+	it("posts the branch token total from stats.total, not the sum of the reported segments", async () => {
+		// A branch with a newly amended/squashed root wrapping pre-breakdown history
+		// has memories whose row subline (aggregateConversationTokens, scalar) counts
+		// legacy child tokens the per-segment breakdown does not carry. If the bar
+		// derives its total from input+output+cached it reads LESS than the sum of
+		// its own rows. The host must post the scalar-based `total` verbatim so the
+		// bar and the rows reconcile; the coloured segments stay a floor.
+		const view = makeMockView();
+		const historyProvider = {
+			serialize: vi.fn().mockResolvedValue([]),
+			onDidChangeTreeData: vi.fn().mockReturnValue({ dispose: vi.fn() }),
+			getMode: vi.fn().mockReturnValue("single"),
+		};
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: { fsPath: "/mock", with: () => ({}) } as never,
+			historyProvider,
+			// Segments sum to 125, but the true scalar branch total is 500 (the extra
+			// 375 lives on legacy scalar-only memories with no breakdown).
+			getBranchTokenStats: async () => ({
+				input: 100,
+				output: 20,
+				cached: 5,
+				total: 500,
+				reporting: 1,
+				memories: 3,
+			}),
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "ready" });
+		await new Promise((r) => setTimeout(r, 0));
+		const msgs = view.webview.postMessage.mock.calls.map((c) => c[0]) as unknown[];
+		const statsMsg = msgs.find(
+			(m) => typeof m === "object" && m !== null && (m as { type?: unknown }).type === "branch:tokenStats",
+		) as { total?: number } | undefined;
+		expect(statsMsg).toBeDefined();
+		expect(statsMsg?.total).toBe(500);
 	});
 
 	it("handles refresh scope='kb' by re-listing root and refreshing memories", async () => {
@@ -4912,131 +5056,6 @@ describe("SidebarWebviewProvider", () => {
 		});
 	});
 
-	describe("pushKnowledgeData", () => {
-		it("posts kb:knowledgeData with projected KnowledgeRepo[] when refresh:knowledge is triggered", async () => {
-			const view = makeMockView();
-			const fakeRepo = {
-				repoName: "myrepo",
-				memoryCount: 5,
-				indexPath: "/kb/myrepo/_wiki/_index.md",
-				categories: [
-					{
-						name: "Architecture",
-						description: "Core architectural decisions",
-						topicCount: 1,
-						memoryCount: 5,
-						topics: [
-							{
-								title: "Storage Layer",
-								stableSlug: "storage-layer",
-								memoryCount: 5,
-								wikiFile: "/kb/myrepo/_wiki/topic--storage-layer.md",
-							},
-						],
-					},
-				],
-			};
-			const getKnowledgeData = vi.fn().mockResolvedValue([fakeRepo]);
-			const provider = new SidebarWebviewProvider({
-				executeCommand: vi.fn(),
-				getInitialState: () => ({
-					enabled: true,
-					authenticated: false,
-					activeTab: "knowledge",
-					kbMode: "folders",
-					branchName: "main",
-					detached: false,
-					currentRepoName: "myrepo",
-				}),
-				extensionUri: mockExtensionUri as unknown as never,
-				getKnowledgeData,
-			});
-			provider.resolveWebviewView(view as unknown as never);
-			view.webview.postMessage.mockClear();
-			view.webview.triggerMessage({ type: "refresh", scope: "knowledge" });
-			await new Promise((r) => setTimeout(r, 0));
-			const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
-			const knowledgeMsg = sent.find((m) => m.type === "kb:knowledgeData");
-			expect(knowledgeMsg).toBeDefined();
-			expect(knowledgeMsg.repos).toHaveLength(1);
-			const repo = knowledgeMsg.repos[0];
-			expect(repo.repoName).toBe("myrepo");
-			expect(repo.memoryCount).toBe(5);
-			expect(repo.indexPath).toBe("/kb/myrepo/_wiki/_index.md");
-			expect(repo.categories).toHaveLength(1);
-			const cat = repo.categories[0];
-			expect(cat.name).toBe("Architecture");
-			expect(cat.description).toBe("Core architectural decisions");
-			expect(cat.topicCount).toBe(1);
-			expect(cat.memoryCount).toBe(5);
-			expect(cat.topics).toHaveLength(1);
-			const topic = cat.topics[0];
-			expect(topic.title).toBe("Storage Layer");
-			expect(topic.stableSlug).toBe("storage-layer");
-			expect(topic.memoryCount).toBe(5);
-			expect(topic.wikiFile).toBe("/kb/myrepo/_wiki/topic--storage-layer.md");
-		});
-
-		it("posts kb:knowledgeData with categories:[] when getKnowledgeData returns a repo with no categories (no graph)", async () => {
-			const view = makeMockView();
-			const noGraphRepo = {
-				repoName: "emptyrepo",
-				memoryCount: 0,
-				indexPath: "/kb/emptyrepo/_wiki/_index.md",
-				categories: [],
-			};
-			const getKnowledgeData = vi.fn().mockResolvedValue([noGraphRepo]);
-			const provider = new SidebarWebviewProvider({
-				executeCommand: vi.fn(),
-				getInitialState: () => ({
-					enabled: true,
-					authenticated: false,
-					activeTab: "knowledge",
-					kbMode: "folders",
-					branchName: "main",
-					detached: false,
-					currentRepoName: "emptyrepo",
-				}),
-				extensionUri: mockExtensionUri as unknown as never,
-				getKnowledgeData,
-			});
-			provider.resolveWebviewView(view as unknown as never);
-			view.webview.postMessage.mockClear();
-			view.webview.triggerMessage({ type: "refresh", scope: "knowledge" });
-			await new Promise((r) => setTimeout(r, 0));
-			const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
-			const knowledgeMsg = sent.find((m) => m.type === "kb:knowledgeData");
-			expect(knowledgeMsg).toBeDefined();
-			expect(knowledgeMsg.repos).toHaveLength(1);
-			expect(knowledgeMsg.repos[0].repoName).toBe("emptyrepo");
-			expect(knowledgeMsg.repos[0].categories).toEqual([]);
-		});
-
-		it("posts kb:knowledgeData with empty repos when getKnowledgeData dep is absent", async () => {
-			const view = makeMockView();
-			const provider = new SidebarWebviewProvider({
-				executeCommand: vi.fn(),
-				getInitialState: () => ({
-					enabled: true,
-					authenticated: false,
-					activeTab: "knowledge",
-					kbMode: "folders",
-					branchName: "main",
-					detached: false,
-				}),
-				extensionUri: mockExtensionUri as unknown as never,
-			});
-			provider.resolveWebviewView(view as unknown as never);
-			view.webview.postMessage.mockClear();
-			view.webview.triggerMessage({ type: "refresh", scope: "knowledge" });
-			await new Promise((r) => setTimeout(r, 0));
-			const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
-			const knowledgeMsg = sent.find((m) => m.type === "kb:knowledgeData");
-			expect(knowledgeMsg).toBeDefined();
-			expect(knowledgeMsg.repos).toEqual([]);
-		});
-	});
-
 	describe("coverage edge cases", () => {
 		const baseState = {
 			enabled: true,
@@ -5073,10 +5092,8 @@ describe("SidebarWebviewProvider", () => {
 			provider.resolveWebviewView(view as unknown as never);
 			view.webview.postMessage.mockClear();
 			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "bare1" });
-			await new Promise((r) => setTimeout(r, 0));
-			const ev = view.webview.postMessage.mock.calls
-				.map((c) => c[0])
-				.find((m) => m.type === "kb:memoryEvidence");
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const ev = sent.find((m) => m.type === "kb:memoryEvidence");
 			expect(ev).toBeDefined();
 			expect(ev.evidence.conversations).toEqual([]);
 			expect(ev.evidence.context).toEqual([]);
@@ -5117,10 +5134,8 @@ describe("SidebarWebviewProvider", () => {
 			provider.resolveWebviewView(view as unknown as never);
 			view.webview.postMessage.mockClear();
 			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "mix1" });
-			await new Promise((r) => setTimeout(r, 0));
-			const ev = view.webview.postMessage.mock.calls
-				.map((c) => c[0])
-				.find((m) => m.type === "kb:memoryEvidence");
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const ev = sent.find((m) => m.type === "kb:memoryEvidence");
 			expect(ev).toBeDefined();
 			// Only the second (non-null) read contributes; its session carries
 			// neither source nor transcriptPath, so those keys are omitted. The
@@ -5162,10 +5177,8 @@ describe("SidebarWebviewProvider", () => {
 			provider.resolveWebviewView(view as unknown as never);
 			view.webview.postMessage.mockClear();
 			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "innr1" });
-			await new Promise((r) => setTimeout(r, 0));
-			const ev = view.webview.postMessage.mock.calls
-				.map((c) => c[0])
-				.find((m) => m.type === "kb:memoryEvidence");
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const ev = sent.find((m) => m.type === "kb:memoryEvidence");
 			expect(ev).toBeDefined();
 			expect(ev.evidence.conversations).toEqual([]);
 		});
@@ -5182,10 +5195,8 @@ describe("SidebarWebviewProvider", () => {
 			provider.resolveWebviewView(view as unknown as never);
 			view.webview.postMessage.mockClear();
 			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "outr1" });
-			await new Promise((r) => setTimeout(r, 0));
-			const ev = view.webview.postMessage.mock.calls
-				.map((c) => c[0])
-				.find((m) => m.type === "kb:memoryEvidence");
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const ev = sent.find((m) => m.type === "kb:memoryEvidence");
 			expect(ev).toBeDefined();
 			expect(ev.evidence.conversations).toHaveLength(0);
 			expect(ev.evidence.context).toHaveLength(0);
@@ -5420,37 +5431,6 @@ describe("SidebarWebviewProvider", () => {
 			expect(phaseMsg).toBeDefined();
 			expect(phaseMsg.phase).toBe("ingest");
 		});
-
-		for (const failure of [new Error("kb-boom"), "kb-string"]) {
-			const kindLabel = failure instanceof Error ? "Error" : "non-Error";
-			it(`pushKnowledgeData degrades to empty repos when getKnowledgeData rejects (${kindLabel})`, async () => {
-				const view = makeMockView();
-				const getKnowledgeData = vi.fn().mockRejectedValue(failure);
-				const provider = new SidebarWebviewProvider({
-					executeCommand: vi.fn(),
-					getInitialState: () => ({
-						enabled: true,
-						authenticated: false,
-						activeTab: "knowledge",
-						kbMode: "folders",
-						branchName: "main",
-						detached: false,
-						currentRepoName: "myrepo",
-					}),
-					extensionUri: mockExtensionUri as unknown as never,
-					getKnowledgeData,
-				});
-				provider.resolveWebviewView(view as unknown as never);
-				view.webview.postMessage.mockClear();
-				view.webview.triggerMessage({ type: "refresh", scope: "knowledge" });
-				await new Promise((r) => setTimeout(r, 0));
-				const knowledgeMsg = view.webview.postMessage.mock.calls
-					.map((c) => c[0])
-					.find((m) => m.type === "kb:knowledgeData");
-				expect(knowledgeMsg).toBeDefined();
-				expect(knowledgeMsg.repos).toEqual([]);
-			});
-		}
 
 		describe("kb:requestPrStatus → kb:prStatus", () => {
 			it("posts kb:prStatus with the pr when findOpenPrForBranch resolves", async () => {

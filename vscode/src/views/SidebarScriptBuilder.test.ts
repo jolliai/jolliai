@@ -57,43 +57,17 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("switchTab");
 	});
 
-	it("renders the knowledge stub on init when it is the restored active tab", () => {
-		// Regression: switchTab() early-returns when getState() already restored
-		// activeTab, so the init handler must paint knowledge explicitly or the
-		// recreated webview stays stuck on the "Loading..." HTML placeholder.
-		const js = buildSidebarScript();
-		expect(js).toContain("state.activeTab === 'knowledge'");
-		expect(js).toContain("renderKnowledge()");
-	});
-
-	it("posts a refresh scope message on toolbar Refresh (knowledge tab gets host data)", () => {
-		// The knowledge view now has host-driven data (kb:knowledgeData) so toolbar
-		// Refresh posts a 'refresh' scope message rather than re-rendering locally.
+	it("posts a refresh scope message on toolbar Refresh", () => {
+		// The toolbar Refresh posts a generic 'refresh' scope message keyed to the
+		// active tab; the host maps the scope to the right data providers.
 		const js = buildSidebarScript();
 		expect(js).toContain("vscode.postMessage({ type: 'refresh', scope: state.activeTab });");
 	});
 
-	it("renders the Knowledge view: Overview + graph entry + repo/category/topic tree", () => {
-		const js = buildSidebarScript();
-		expect(js).toContain("'kb:knowledgeData'");
-		expect(js).toContain("function renderKnowledge");
-		expect(js).toContain("Overview");
-		// single graph entry reuses the existing command (not a graph-list mode)
-		expect(js).toContain("jollimemory.viewKnowledgeGraph");
-		// no leftover stub
-		expect(js).not.toContain("Knowledge wiki — coming soon.");
-	});
-
-	it("shows a Build CTA when a repo has no compiled wiki, and Rebuild reuses compileNow", () => {
+	it("Memory Bank toolbar exposes Build Knowledge Wiki (compileNow)", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("jollimemory.compileNow");
 		expect(js).toContain("Build Knowledge Wiki");
-	});
-
-	it("filters the Knowledge tree by a search query", () => {
-		const js = buildSidebarScript();
-		expect(js).toContain("knowledgeQuery");
-		expect(js).toContain("Search topics");
 	});
 
 	// Regression guards for the Current Branch / Knowledge review findings.
@@ -133,13 +107,6 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toContain("evidencePending");
 			expect(js).toContain("if (!evidencePending[hash])");
 			expect(js).toContain("delete evidencePending[msg.commitHash]");
-		});
-
-		it("Bug 6: Overview/Graph are single at top only for one repo, else nested per repo", () => {
-			const js = buildSidebarScript();
-			expect(js).toContain("function knRepoEntries(repo)");
-			expect(js).toContain("visibleRepos.length === 1");
-			expect(js).toContain("visibleRepos.length > 1");
 		});
 
 		it("foreign-readonly hides the body Commit|Review bar, footer, and token bar", () => {
@@ -503,13 +470,13 @@ describe("SidebarScriptBuilder", () => {
 		const js = buildSidebarScript();
 		// toolbar-worker-status is the Memory Bank tab's sync-phase chrome
 		// (spinner for info, error icon for sticky sync failures). The
-		// post-commit "AI summary in progress…" label is still emitted, now by
-		// the Committed Memories header indicator (renderWorkerSignal)
-		// rather than the removed Branch toolbar.
+		// post-commit worker signal is emitted by the Committed Memories header
+		// indicator (renderWorkerSignal) — a compact "● AI" pill whose hover
+		// tooltip names the commit as "Summarizing <hash>…".
 		expect(js).toContain("toolbar-worker-status");
 		expect(js).toContain("codicon-loading codicon-modifier-spin");
 		expect(js).toContain("codicon-error");
-		expect(js).toContain("AI summary in progress…");
+		expect(js).toContain("'Summarizing ' + hash + '…'");
 		// Sync-phase indicator is wired into the Memory Bank tab toolbar so
 		// it sits next to the Sync-now action that drives it.
 		expect(js).toContain("buildToolbarIndicator(state.syncPhase)");
@@ -550,7 +517,7 @@ describe("SidebarScriptBuilder", () => {
 		expect(handlerStart).toBeGreaterThan(-1);
 		const body = js.slice(handlerStart, handlerEnd);
 		expect(body).toContain("state.activeTab === 'branch'");
-		// Toolbar repaint covers the "AI summary in progress…" indicator.
+		// Toolbar repaint covers the "● AI" ("Summarizing <hash>…") indicator.
 		expect(body).toContain("renderToolbar()");
 		// Branch repaint covers the changes section's Commit-AI button —
 		// its disabled state depends on state.workerBusy, and renderToolbar
@@ -2811,21 +2778,18 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("const isIngest = state.workerPhase && state.workerPhase.indexOf('ingest') === 0;");
 	});
 
-	it("renders a neutral 'Working…' Working Memory row gated on blocking busy state", () => {
+	it("renders the 'Summarizing <hash>…' Working Memory row gated on blocking busy state", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("function renderSummarizingRow(");
 		// Only during a blocking worker run (busy && no ingest phase).
 		expect(js).toContain("if (!state.workerBusy || state.workerPhase) return null;");
-		// busy && no phase does NOT prove summarization (worker:busy and
-		// worker:phase are independent channels; a Memory Bank ingest run can be
-		// busy before its phase signal lands), so the label is neutral, not
-		// "Summarizing…". Names the commit from the host-attached hash, degrading
-		// to a bare label.
-		expect(js).toContain("'Working on ' + hash + '…'");
-		expect(js).toContain("'Working…'");
-		// The misleading summarize-specific label must be gone.
-		expect(js).not.toContain("'Summarizing ' + hash + '…'");
-		expect(js).not.toContain("'Summarizing…'");
+		// Per the redesign mockup the row reads "Summarizing <hash>…", naming the
+		// commit from the host-attached hash and degrading to a bare "Summarizing…".
+		expect(js).toContain("'Summarizing ' + hash + '…'");
+		expect(js).toContain("'Summarizing…'");
+		// The old neutral wording must be gone.
+		expect(js).not.toContain("'Working on ' + hash + '…'");
+		expect(js).not.toContain("'Working…'");
 		expect(js).toContain("summarizing-row");
 		// Mounted ahead of the sub-sections inside the Working Memory body.
 		expect(js).toContain("if (summarizing) bodyKids.push(summarizing);");
@@ -2860,12 +2824,6 @@ describe("SidebarScriptBuilder", () => {
 		expect(body).toContain("renderBranch()");
 	});
 
-	it("registers the knowledge tab content and a renderKnowledge stub", () => {
-		const js = buildSidebarScript();
-		expect(js).toContain("tab-content-knowledge");
-		expect(js).toContain("function renderKnowledge");
-	});
-
 	it("wires the view-switch buttons to switchTab", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain(".view-tab[data-tab]");
@@ -2878,7 +2836,7 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("querySelectorAll('[data-tab]')");
 	});
 
-	it("sources the refresh scope from the active tab so knowledge maps correctly", () => {
+	it("sources the refresh scope from the active tab", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("scope: state.activeTab");
 	});
@@ -3021,16 +2979,16 @@ describe("SidebarScriptBuilder", () => {
 	it("scopes the Folders tree by the repo filter using the raw repoName", () => {
 		const js = buildSidebarScript();
 		// renderFolders filters repo roots on the same repoName key the Showing
-		// dropdown and the Memories / Knowledge renderers compare against.
+		// dropdown and the Memories renderer compares against.
 		expect(js).toContain("c.repoName === kbRepoFilter");
 		// Picking a repo while in Folders mode re-renders the tree (not just the
-		// Timeline / Knowledge views).
-		expect(js).toContain("else if (state.kbMode === 'folders') renderFolders();");
+		// Timeline view).
+		expect(js).toContain("if (state.kbMode === 'folders') renderFolders();");
 	});
 
-	it("hides the repo/branch breadcrumb on the Memory Bank and Knowledge views", () => {
+	it("hides the repo/branch breadcrumb on the Memory Bank view", () => {
 		const js = buildSidebarScript();
-		// The 'Showing' repo-filter is the sole repo selector on those tabs, so
+		// The 'Showing' repo-filter is the sole repo selector on that tab, so
 		// the whole breadcrumb is hidden to avoid a redundant second dropdown.
 		expect(js).toContain("breadcrumbEl.classList.toggle('hidden', isKb)");
 	});
@@ -3084,9 +3042,10 @@ describe("SidebarScriptBuilder", () => {
 
 	it("token bar shows a cache-aware Sonnet-priced cost estimate in the label", () => {
 		const js = buildSidebarScript();
-		// Sonnet 4.6 rates per million tokens: input 3, output 15, cached at the
-		// cache-read rate 0.30 (a floor — cached folds read + the pricier creation).
-		expect(js).toContain("(stats.input * 3 + stats.output * 15 + cached * 0.3) / 1000000");
+		// Sonnet 4.6 rates per million tokens: input 3, output 15, cached (which now
+		// carries cache_creation) at the 1.25x cache-write rate 3.75. Still a floor —
+		// the excluded cumulative cache_read is real but uncounted spend.
+		expect(js).toContain("(stats.input * 3 + stats.output * 15 + cached * 3.75) / 1000000");
 		// Rendered as "≈$X.XX", with a "<$0.01" floor for sub-cent branches.
 		expect(js).toContain("'≈$'");
 		expect(js).toContain("'<$0.01'");
@@ -3206,24 +3165,6 @@ describe("SidebarScriptBuilder", () => {
 	});
 
 	describe("code-review fixes S1-S8", () => {
-		it("S1: knowledge search restores focus + exact caret on host-pushed renders", () => {
-			const js = buildSidebarScript();
-			const fn = js.slice(
-				js.indexOf("function renderKnowledge"),
-				js.indexOf("// Click delegation for status entries"),
-			);
-			// Capture the live input's focus + selection range BEFORE mountIn
-			// destroys it (covers a kb:knowledgeData arriving mid-typing).
-			expect(fn).toContain("document.activeElement === liveInput");
-			expect(fn).toContain("liveInput.selectionStart");
-			expect(fn).toContain("liveInput.selectionEnd");
-			// Restore fires for both the host-pushed path (inputWasFocused) and the
-			// debounced-search path (knRestoreSearchFocus).
-			expect(fn).toContain("if (inputWasFocused || knRestoreSearchFocus)");
-			// Replays the exact range when captured, else falls back to end-of-value.
-			expect(fn).toContain("inp.setSelectionRange(savedSelStart, savedSelEnd)");
-		});
-
 		it("S2: squash enter and cancel post branch:deselectAllCommits; confirm does not (race)", () => {
 			const js = buildSidebarScript();
 			// Enter squash clears stale host-side selection.

@@ -21,7 +21,7 @@ import {
 	resolveKbParent,
 } from "../../cli/src/core/KBPathResolver.js";
 import type { ManifestEntry } from "../../cli/src/core/KBTypes.js";
-import { toForwardSlash } from "../../cli/src/core/PathUtils.js";
+import { isPathInside, toForwardSlash } from "../../cli/src/core/PathUtils.js";
 import { activateExtensionTelemetry, reinitExtensionTelemetry } from "./TelemetryActivation.js";
 import {
 	getGlobalConfigDir,
@@ -42,7 +42,7 @@ import {
 	readReferenceFromBranch,
 	readTranscript,
 } from "../../cli/src/core/SummaryStore.js";
-import { aggregateConversationTokens } from "../../cli/src/core/SummaryTree.js";
+import { aggregateConversationTokenBreakdown, aggregateConversationTokens } from "../../cli/src/core/SummaryTree.js";
 import type { StorageProvider } from "../../cli/src/core/StorageProvider.js";
 import { ORPHAN_BRANCH } from "../../cli/src/Logger.js";
 import type { SourceId, StatusInfo } from "../../cli/src/Types.js";
@@ -97,10 +97,8 @@ import { FilesStore } from "./stores/FilesStore.js";
 import { MemoriesStore } from "./stores/MemoriesStore.js";
 import { PlansStore } from "./stores/PlansStore.js";
 import { StatusStore, type WorkerPhase } from "./stores/StatusStore.js";
-import { graphJsonPath, readGraph } from "../../cli/src/graph/GraphArtifactStore.js";
 import { registerCompileCommand } from "./CompileCommand.js";
 import { openKnowledgeGraph } from "./views/KnowledgeGraphPanel.js";
-import { projectKnowledgeRepo } from "./views/KnowledgeProjection.js";
 import { activateSync } from "./sync/VsCodeSyncBootstrap.js";
 import { ExcludeFilterManager } from "./util/ExcludeFilterManager.js";
 import { formatShortRelativeDate } from "./util/FormatUtils.js";
@@ -938,7 +936,20 @@ export function activate(context: vscode.ExtensionContext): void {
 		// relPath's first segment is now a repo directory name under
 		// <kbParent>; join'ing on kbParent gives back the absolute on-disk
 		// path. Same shape as the IntelliJ Memory Bank tree.
-		resolveKbAbs: (relPath) => join(sidebarKbParent, relPath),
+		//
+		// Traversal guard: relPath is webview-supplied and could carry `..`
+		// segments to escape the Memory Bank parent (join collapses `..`, so the
+		// escape is visible post-join). Reject escapes — returning undefined lets
+		// handleOpenFile bail instead of opening/reading a file outside kbParent.
+		// Mirrors the openDiff isPathInside guard in CreatePrWebviewPanel.
+		resolveKbAbs: (relPath) => {
+			const abs = join(sidebarKbParent, relPath);
+			if (!isPathInside(abs, sidebarKbParent)) {
+				log.warn("resolveKbAbs", `rejected path outside Memory Bank parent: ${relPath}`);
+				return undefined;
+			}
+			return abs;
+		},
 		// Lets handleOpenFile light up the Folders-tab ✎ marker the moment a
 		// user opens a `.md` that's been edited on disk — same sha256-vs-manifest
 		// check the native MemoryFileDecorationProvider badge uses.
@@ -1043,70 +1054,50 @@ export function activate(context: vscode.ExtensionContext): void {
 			}
 			return bridge.readTranscript(id);
 		},
-		getKnowledgeData: async () => {
-			const repos = kbFoldersService.listRepos();
-			const results = await Promise.all(
-				repos.map(async (repo) => {
-					try {
-						const graph = await readGraph(repo.kbRoot);
-						// `readGraph` returns null for BOTH "never built" (graph.json
-						// absent) and "present but unreadable" (parse error / partial
-						// write / permissions), collapsing them into the same empty
-						// "Build Wiki" CTA. Only the latter is a bug worth diagnosing,
-						// so when null comes back we probe the file to tell them apart
-						// and warn for the unreadable case — keeping the graceful empty
-						// fallback either way rather than silently swallowing a corrupt
-						// graph.
-						if (!graph && existsSync(graphJsonPath(repo.kbRoot))) {
-							log.warn(
-								"getKnowledgeData",
-								"Knowledge graph present but unreadable — falling back to empty Build-Wiki CTA",
-								{ repoName: repo.repoName, kbRoot: repo.kbRoot },
-							);
-						}
-						return projectKnowledgeRepo(graph, repo);
-					} catch (err) {
-						// readGraph itself never throws, but projectKnowledgeRepo (or a
-						// future change) could. Don't let one bad repo blank the whole
-						// Knowledge view; log so the failure is visible, not swallowed.
-						log.warn("getKnowledgeData", "Failed to project knowledge graph", {
-							repoName: repo.repoName,
-							kbRoot: repo.kbRoot,
-							error: err instanceof Error ? err.message : String(err),
-						});
-						return projectKnowledgeRepo(null, repo);
-					}
-				}),
-			);
-			return results;
-		},
-		// Aggregate LLM token usage across all committed summaries on the
-		// current branch. loadBranchSummaries re-uses the same bridge.getSummary
-		// lookup the PR description builder uses, so storage-backend selection
-		// is consistent (orphan / dual-write / folder-only all work identically).
+		// Aggregate the user's *conversation* token usage across all committed
+		// summaries on the current branch — the tokens the user's own AI coding
+		// sessions spent, NOT the tokens Jolli Memory spent summarizing them
+		// (that lives on `s.llm.*` and is deliberately excluded here). The bar is
+		// a "how much did I burn coding on this branch" readout, so it reads from
+		// `conversationTokenBreakdown` (input / cache_creation / output parsed from
+		// the agent transcript). loadBranchSummaries re-uses the same
+		// bridge.getSummary lookup the PR description builder uses, so
+		// storage-backend selection is consistent (orphan / dual-write /
+		// folder-only all work identically).
 		getBranchTokenStats: async () => {
 			const { summaries } = await loadBranchSummaries(bridge, commitsStore.getMainBranch());
 			let input = 0;
 			let output = 0;
 			let cached = 0;
-			// `reporting` counts memories that carried any token usage; `memories`
-			// is the total. The difference is memories from sources that don't
-			// report usage (most non-Claude agents) — the tooltip surfaces this as
-			// "N of M memories report token usage" so the total reads as a floor.
+			// Scalar branch total, summed on the SAME basis as each memory row's
+			// subline (aggregateConversationTokens). Kept separate from the segment
+			// sum so a legacy root carrying `conversationTokens` with no breakdown
+			// still counts toward the bar total — otherwise the bar reads as less
+			// than the sum of its own rows.
+			let total = 0;
+			// `reporting` counts memories that carried a conversation-token
+			// breakdown; `memories` is the total. The difference is memories from
+			// sources that don't report usage (most non-Claude agents) plus older
+			// memories written before the breakdown field existed — the tooltip
+			// surfaces this as "N of M memories report token usage" so the total
+			// reads as a floor.
 			let reporting = 0;
 			for (const s of summaries) {
-				const i = s.llm?.inputTokens ?? 0;
-				const o = s.llm?.outputTokens ?? 0;
-				// cachedTokens is absent on summaries written before the field
-				// existed — default to 0 so historical branches just read as
-				// "no cache" rather than NaN.
-				const c = s.llm?.cachedTokens ?? 0;
-				input += i;
-				output += o;
-				cached += c;
-				if (i > 0 || o > 0 || c > 0) reporting += 1;
+				// Aggregate the WHOLE tree per root so the branch bar matches each
+				// memory row's subline, which sums via aggregateConversationTokens
+				// (recursive). Reading only the root's own breakdown would drop the
+				// tokens amend/rebase folded into children — making the branch total
+				// read as less than the sum of its own rows. Forward-only: absent
+				// breakdowns (pre-field memories, no-usage sources) aggregate to zeros
+				// so historical branches read as "no data" rather than NaN.
+				const b = aggregateConversationTokenBreakdown(s);
+				input += b.input;
+				output += b.output;
+				cached += b.cached;
+				total += aggregateConversationTokens(s);
+				if (b.input > 0 || b.output > 0 || b.cached > 0) reporting += 1;
 			}
-			return { input, output, cached, reporting, memories: summaries.length };
+			return { input, output, cached, total, reporting, memories: summaries.length };
 		},
 		// Live gh pr list lookup for the SHIPPED group's "PR #N — open" status row.
 		// Aliased import avoids a name clash between the dep key and the imported fn.

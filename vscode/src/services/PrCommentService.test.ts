@@ -2694,6 +2694,65 @@ describe("PrCommentService", () => {
 			);
 		});
 
+		it("detached HEAD: blocks with the shared message and never force-pushes detached HEAD", async () => {
+			// rev-parse returns the literal "HEAD" when detached. The bare
+			// getCurrentBranch would let summaryBranch===currentBranch pass and then
+			// `git push -u origin HEAD` onto the detached HEAD; getCurrentBranchSafe +
+			// the "HEAD" guard must block it, mirroring handleCreatePr.
+			let gitPushCalled = false;
+			setupExecFile(
+				buildRouter({
+					"git:rev-parse": () => ({ stdout: "HEAD\n" }),
+					"git:push": () => {
+						gitPushCalled = true;
+						return { stdout: "" };
+					},
+				}),
+			);
+
+			await handleUpdatePrWithPush("T", "B", CWD, postMessage, "feature/x");
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prCreateBlockedCrossBranch",
+				summaryBranch: "feature/x",
+				currentBranch: "HEAD",
+			});
+			expect(postMessage).not.toHaveBeenCalledWith({ command: "prCreating" });
+			expect(postMessage).not.toHaveBeenCalledWith({ command: "prCreateFailed" });
+			expect(gitPushCalled).toBe(false);
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Cannot determine the current branch"),
+			);
+		});
+
+		it("git error reading the branch: normalized to the detached block, not a generic prCreateFailed", async () => {
+			// A hard git failure (.git/index.lock, permission) makes the branch read
+			// throw. getCurrentBranchSafe normalizes it to the "HEAD" sentinel so it
+			// lands on the block rather than the outer catch → prCreateFailed.
+			let gitPushCalled = false;
+			setupExecFile(
+				buildRouter({
+					"git:rev-parse": () => {
+						throw new Error("fatal: unable to read HEAD");
+					},
+					"git:push": () => {
+						gitPushCalled = true;
+						return { stdout: "" };
+					},
+				}),
+			);
+
+			await handleUpdatePrWithPush("T", "B", CWD, postMessage);
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prCreateBlockedCrossBranch",
+				summaryBranch: "",
+				currentBranch: "HEAD",
+			});
+			expect(postMessage).not.toHaveBeenCalledWith({ command: "prCreateFailed" });
+			expect(gitPushCalled).toBe(false);
+		});
+
 		it("falls back to creating a PR when the open PR vanished", async () => {
 			let created = false;
 			setupExecFile((cmd, args) => {

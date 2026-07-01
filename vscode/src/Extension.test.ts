@@ -1408,15 +1408,6 @@ describe("Extension", () => {
 			expect(typeof deps.readTranscriptForRepo).toBe("function");
 		});
 
-		it("wires getKnowledgeData for the Knowledge view", () => {
-			const ctx = makeContext();
-
-			activate(ctx);
-
-			const deps = sidebarDepsCaptured as { getKnowledgeData?: unknown };
-			expect(typeof deps.getKnowledgeData).toBe("function");
-		});
-
 		it("registers all expected commands", () => {
 			const ctx = makeContext();
 
