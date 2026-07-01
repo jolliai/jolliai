@@ -291,8 +291,6 @@ val sb = StringBuilder()
         val orphanRefDir = Path.of(repoRoot, ".git", "refs", "heads", orphanBranch).parent
         // Watch .jolli/jollimemory/ for lock file changes
         val lockDir = Path.of(repoRoot, ".jolli", "jollimemory")
-        // Watch ~/.claude/plans/ so plans Claude generates appear live in CONTEXT.
-        val claudePlansDir = Path.of(System.getProperty("user.home"), ".claude", "plans")
 
         // The ref file name we're looking for (e.g., "v3")
         val orphanRefFileName = Path.of(orphanBranch).fileName.toString()
@@ -315,20 +313,16 @@ val sb = StringBuilder()
             if (Files.isDirectory(lockDir)) {
                 lockDir.register(watchService,
                     StandardWatchEventKinds.ENTRY_CREATE,
-                    StandardWatchEventKinds.ENTRY_DELETE)
+                    StandardWatchEventKinds.ENTRY_DELETE,
+                    // ENTRY_MODIFY so a live plans.json write (StopHook reference/plan
+                    // discovery) refreshes the panel. The lock-file create/delete signal
+                    // is too brief for the macOS polling WatchService to catch reliably,
+                    // and plans.json persists — so watching the data file itself is the
+                    // reliable trigger for CONTEXT updates during a session.
+                    StandardWatchEventKinds.ENTRY_MODIFY)
                 log.info("NIO watcher registered on: $lockDir")
             } else {
                 log.info("Lock dir does not exist yet, skipping NIO watch: $lockDir")
-            }
-
-            if (Files.isDirectory(claudePlansDir)) {
-                claudePlansDir.register(watchService,
-                    StandardWatchEventKinds.ENTRY_CREATE,
-                    StandardWatchEventKinds.ENTRY_MODIFY,
-                    StandardWatchEventKinds.ENTRY_DELETE)
-                log.info("NIO watcher registered on: $claudePlansDir")
-            } else {
-                log.info("Claude plans dir does not exist yet, skipping NIO watch: $claudePlansDir")
             }
 
             // Background thread to poll watch events
@@ -339,10 +333,14 @@ val sb = StringBuilder()
                         var shouldRefresh = false
                         for (event in key.pollEvents()) {
                             val fileName = (event.context() as? Path)?.toString() ?: continue
-                            // `.md` events only come from the Claude plans dir (the other
-                            // watched dirs hold the orphan ref + lock file), so matching the
-                            // extension is enough to catch a newly generated plan.
-                            if (fileName == orphanRefFileName || fileName == lockFileName || fileName.endsWith(".md")) {
+                            // Refresh on: orphan-ref updates (summary written), lock file
+                            // create/delete (worker start/finish), and plans.json writes
+                            // (StopHook reference/plan discovery during a live session —
+                            // this is what surfaces a newly created plan in CONTEXT without
+                            // waiting for the next commit). Other files in the dir
+                            // (debug.log, sessions.json, cursors.json) are ignored here so
+                            // their churn doesn't spam refreshes.
+                            if (fileName == orphanRefFileName || fileName == lockFileName || fileName == "plans.json") {
                                 shouldRefresh = true
                             }
                         }

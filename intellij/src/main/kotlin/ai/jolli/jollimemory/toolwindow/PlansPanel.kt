@@ -323,9 +323,10 @@ class PlansPanel(
             val cwd = service.mainRepoRoot ?: project.basePath ?: ""
             val gitOps = service.getGitOps()
             val currentBranch = gitOps?.getCurrentBranch()
-            // Pull in any plan Claude generated under ~/.claude/plans/ that isn't
-            // registered yet, so it appears in CONTEXT without a manual "Add plan".
-            ai.jolli.jollimemory.services.PlanService.autoRegisterNewPlans(cwd, currentBranch)
+            // Plans enter the registry via transcript discovery (StopHook →
+            // TranscriptPlanDiscovery), mirroring VS Code — so a plan appears in
+            // CONTEXT only when the user actually created/edited it in a session, and
+            // is consumed on commit. We no longer directory-scan ~/.claude/plans/.
             val registry = SessionTracker.loadPlansRegistry(cwd)
 
             val ex = CommitSelectionStore.readExclusions(cwd)
@@ -337,8 +338,9 @@ class PlansPanel(
                 .map { ListItem.PlanItem(it) }
             val noteItems = filterNotes(registry.notes ?: emptyMap(), gitOps, currentBranch)
                 .map { ListItem.NoteItem(it) }
+            // No branch filter: uncommitted references follow the user across branches
+            // (a commit deletes the row; there is no committed/guard state to filter).
             val refItems = (registry.references ?: emptyMap())
-                .filter { (_, entry) -> filterReference(entry, currentBranch) }
                 .map { (mapKey, entry) -> ListItem.ReferenceItem(entry, mapKey) }
 
             // Merge and sort by lastModified descending (newest first), matching VS Code
@@ -359,8 +361,8 @@ class PlansPanel(
         val plansDir = File(System.getProperty("user.home"), ".claude/plans")
         return plans.values.filter { entry ->
             if (entry.ignored == true) return@filter false
-            // Skip entries from other branches
-            if (currentBranch != null && entry.branch != null && entry.branch != currentBranch) return@filter false
+            // No branch filter: uncommitted working-area plans follow the user across
+            // branches (matches CLI/VS Code). `branch` is stamped but not filtered on.
             // Skip committed snapshot copies (slug-<shortHash> entries created by archivePlanForCommit).
             // These exist only for orphan branch storage / Summary WebView, not for the sidebar panel.
             if (entry.commitHash != null && entry.contentHashAtCommit == null) return@filter false
@@ -389,8 +391,8 @@ class PlansPanel(
     ): List<NoteEntry> {
         return notes.values.filter { entry ->
             if (entry.ignored == true) return@filter false
-            // Skip entries from other branches
-            if (currentBranch != null && entry.branch != null && entry.branch != currentBranch) return@filter false
+            // No branch filter: uncommitted working-area notes follow the user across
+            // branches (matches CLI/VS Code). `branch` is stamped but not filtered on.
             // Skip committed snapshot copies (created by archiveNoteForCommit).
             // These exist only for orphan branch storage / Summary WebView, not for the sidebar panel.
             if (entry.commitHash != null && entry.contentHashAtCommit == null) return@filter false
@@ -413,16 +415,6 @@ class PlansPanel(
         }
     }
 
-    /**
-     * References are branch-scoped like plans/notes: a row stamped with a branch
-     * only shows on that branch; legacy blank-branch rows (written before
-     * branch-scoping) stay visible everywhere. References carry no committed /
-     * guard state — a commit deletes the row — so there is nothing else to filter.
-     */
-    private fun filterReference(entry: ReferenceEntry, currentBranch: String?): Boolean {
-        if (currentBranch != null && !entry.branch.isNullOrBlank() && entry.branch != currentBranch) return false
-        return true
-    }
 
     private fun showInitializing() {
         removeAll()

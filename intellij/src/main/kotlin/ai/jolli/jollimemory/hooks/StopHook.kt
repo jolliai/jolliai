@@ -7,6 +7,7 @@ import ai.jolli.jollimemory.core.SessionInfo
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.TranscriptCursor
 import ai.jolli.jollimemory.core.TranscriptSource
+import ai.jolli.jollimemory.core.plans.TranscriptPlanDiscovery
 import ai.jolli.jollimemory.core.references.TranscriptReferenceDiscovery
 import com.google.gson.Gson
 import java.io.File
@@ -70,8 +71,9 @@ object StopHook {
     }
 
     /**
-     * Incremental reference discovery for one transcript. Loads discovery cursor,
-     * scans for references, advances cursor on success.
+     * Incremental discovery for one transcript. Loads the discovery cursor, scans
+     * for both references AND plans from the same line, then advances the cursor to
+     * the furthest line either scan reached.
      */
     private fun discoverFromTranscript(sessionInfo: SessionInfo, cwd: String) {
         val transcriptPath = sessionInfo.transcriptPath
@@ -92,13 +94,25 @@ object StopHook {
             log.error("Reference discovery failed: %s", e.message)
         }
 
-        log.debug("discoverFromTranscript: scanned to line %d (was %d)", referenceLine, fromLine)
+        var planLine = fromLine
+        try {
+            planLine = TranscriptPlanDiscovery.scanPlansFrom(
+                transcriptPath, fromLine, cwd, TranscriptSource.claude,
+            )
+        } catch (e: Exception) {
+            log.error("Plan discovery failed: %s", e.message)
+        }
 
-        if (referenceLine > fromLine) {
+        // Persist the furthest line either scan reached — both read from the same
+        // fromLine to EOF, so the merged cursor advances past everything scanned.
+        val scannedLine = maxOf(referenceLine, planLine)
+        log.debug("discoverFromTranscript: scanned to line %d (was %d)", scannedLine, fromLine)
+
+        if (scannedLine > fromLine) {
             SessionTracker.saveDiscoveryCursor(
                 TranscriptCursor(
                     transcriptPath = transcriptPath,
-                    lineNumber = referenceLine,
+                    lineNumber = scannedLine,
                     updatedAt = Instant.now().toString(),
                 ),
                 cwd,

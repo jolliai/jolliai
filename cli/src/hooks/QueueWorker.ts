@@ -57,6 +57,7 @@ import {
 	detectActiveNotesForBranch,
 	detectActivePlansForBranch,
 	detectUncommittedReferenceIds,
+	discardExcludedWorkingItems,
 	filterSessionsByEnabledIntegrations,
 	getReferenceEntriesForBranch,
 	loadAllSessions,
@@ -1511,9 +1512,9 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	}
 
 	// Step 3+4: Load sessions and read transcripts with time cutoff for queue-driven attribution.
-	// Excluded conversations are filtered inside `loadSessionTranscripts` BEFORE any cursor
-	// advance — keep the plans/notes exclusion read here, but no `sessionTranscripts.filter`
-	// step is needed.
+	// Excluded conversations are DISCARDED inside `loadSessionTranscripts` — their cursor is
+	// advanced (consumed) but their entries are dropped from the summary. The plans/notes/refs
+	// exclusion read here drives both prompt-block filtering and the discard pass below.
 	const exclusions = await readExclusions(cwd);
 	const { sessionTranscripts, totalEntries, humanEntries, conversationTokens } = await loadSessionTranscripts(
 		cwd,
@@ -1671,6 +1672,8 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// post-filter on `planAssociation.refs` would still leave the excluded plan
 	// archived on disk. The prompt-block filter only governs LLM input;
 	// the archive path is a separate registry scan and must be filtered here.
+	// The excluded rows are then DISCARDED by `discardExcludedWorkingItems` below
+	// (removed from the working area, but never archived into committed memory).
 	const planSlugs = await detectPlanSlugsFromRegistry(cwd, branch);
 	for (const excludedSlug of exclusions.plans) planSlugs.delete(excludedSlug);
 	const planAssociation = await associatePlansWithCommit(planSlugs, commitInfo.hash, cwd, branch);
@@ -1687,8 +1690,8 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// returned filesToStore is forwarded directly to storeReferences — captured
 	// BEFORE the local rename so the orphan-branch snapshot is independent of
 	// rename success. Mirrors the plans / notes archive-side filter — excluded
-	// references are dropped here too, so the row reappears on the
-	// next commit (skip-don't-archive semantics).
+	// references are dropped from archival here and DISCARDED (row + markdown
+	// removed) by `discardExcludedWorkingItems` below.
 	const rawReferenceIds = await detectUncommittedReferenceIds(cwd, branch);
 	const referenceIds = rawReferenceIds.filter((e) => !exclusions.references.has(e.mapKey));
 	const {
@@ -1708,6 +1711,17 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		);
 		await finalizeReferenceArchive(referenceCommitted, cwd);
 	}
+
+	// Discard the unchecked working items: the CHECKED ones were archived above;
+	// the excluded ones are useless per the user's selection, so remove their
+	// registry rows (+ .jolli-owned backing files) WITHOUT writing them into the
+	// committed memory. Runs after associate* so the checked-item archival (which
+	// reloads the registry under lock) has already settled.
+	await discardExcludedWorkingItems(
+		{ plans: exclusions.plans, notes: exclusions.notes, references: exclusions.references },
+		cwd,
+	);
+
 	// Step 8b: Evaluate plan progress for each linked plan (Haiku calls parallelized)
 	const planProgressArtifacts: PlanProgressArtifact[] = [];
 	if (planRefs.length > 0) {
@@ -2319,8 +2333,8 @@ async function handleAmendPipeline(
 	}
 
 	// Load sessions and read transcripts with time cutoff. Excluded conversations are
-	// filtered inside `loadSessionTranscripts` BEFORE any cursor advance — keep the
-	// plans/notes exclusion read here, but no `sessionTranscripts.filter` step is needed.
+	// DISCARDED inside `loadSessionTranscripts` (cursor advanced, entries dropped). The
+	// exclusion read here drives prompt-block filtering and the discard pass below.
 	const amendConfig = await loadConfig();
 	const amendExclusions = await readExclusions(cwd);
 	const { sessionTranscripts, totalEntries, humanEntries, conversationTokens } = await loadSessionTranscripts(
@@ -2752,6 +2766,14 @@ async function handleAmendPipeline(
 			? { transcript: transcriptArtifact }
 			: undefined,
 	);
+	// Discard the unchecked working items on the amend fresh-leaf path too — the
+	// checked ones were archived above; the excluded ones are removed from the
+	// working area without entering committed memory.
+	await discardExcludedWorkingItems(
+		{ plans: amendExclusions.plans, notes: amendExclusions.notes, references: amendExclusions.references },
+		cwd,
+	);
+
 	log.info(
 		"Amend with no old summary -> stored as fresh leaf for %s (%s)",
 		commitInfo.hash.substring(0, 8),
@@ -2837,21 +2859,29 @@ async function loadSessionTranscripts(
 		log.info("No active sessions found — will infer topics from diff if available");
 	}
 
-	// Drop sessions the user unchecked in the sidebar BEFORE reading transcripts.
-	// Reading advances per-transcript cursors via `saveCursor`, and the sidebar's
-	// active-conversations list uses `messageCount > 0` (unread = cursor → EOF)
-	// to decide whether to render a row — so any cursor advance silently removes
-	// the row on the next 60-second refresh. That regression made *unchecked*
-	// conversations disappear alongside the committed ones after every commit;
-	// excluding here keeps them visible with the unchecked box, as the per-item
-	// selection design spec requires ("excluded items stay visible so the user
-	// knows the item exists and can put it back in").
+	// Read ALL sessions (including the ones the user unchecked) so their cursors
+	// advance too. Selection semantics are "unchecked ⇒ discard": an excluded
+	// conversation is consumed (cursor → EOF/commit boundary via `saveCursor`
+	// inside readAllTranscripts) so it leaves the working area, but its entries are
+	// dropped below so they never enter the summary. (This intentionally reverses
+	// the earlier "keep excluded conversations visible so the user can re-check
+	// them" behavior — the per-item selection is now a one-time discard.)
 	const conversationExclusions = (await readExclusions(cwd)).conversations;
-	const includedSessions = allSessions.filter(
-		(s) => !conversationExclusions.has(conversationKey(s.source ?? "claude", s.sessionId)),
+	const excludedConversationKeys = new Set(
+		allSessions
+			.filter((s) => conversationExclusions.has(conversationKey(s.source ?? "claude", s.sessionId)))
+			.map((s) => conversationKey(s.source ?? "claude", s.sessionId)),
 	);
 
-	const raw = await readAllTranscripts(includedSessions, cwd, beforeTimestamp);
+	const rawAll = await readAllTranscripts(allSessions, cwd, beforeTimestamp);
+	// Keep only checked conversations for the summary; excluded ones were read
+	// purely to advance their cursor (discard).
+	const raw = {
+		...rawAll,
+		sessionTranscripts: rawAll.sessionTranscripts.filter(
+			(s) => !excludedConversationKeys.has(conversationKey(s.source ?? "claude", s.sessionId)),
+		),
+	};
 
 	// Apply per-session conversation-edit overlays (panel-authored deletes/edits
 	// from ConversationDetailsPanel) BEFORE the values flow into either the

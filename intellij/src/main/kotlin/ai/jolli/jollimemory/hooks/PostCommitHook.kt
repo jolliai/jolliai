@@ -188,18 +188,16 @@ object PostCommitHook {
                 allSessions.addAll(CopilotChatSupport.discoverSessions(cwd).sessions)
             }
 
-            // Filter out conversations the user excluded via sidebar checkboxes
+            // Read ALL sessions so excluded conversations' cursors advance too:
+            // selection is a one-time discard — an unchecked conversation is consumed
+            // (cursor → commit boundary) so it leaves the working area, but its entries
+            // are dropped below and never enter the summary. (Reverses the earlier
+            // "keep excluded conversations visible so the user can re-check them".)
             val exclusions = CommitSelectionStore.readExclusions(cwd)
-            val sessions = allSessions.filter { session ->
-                val source = session.source ?: TranscriptSource.claude
-                val key = CommitSelectionStore.conversationKey(source, session.sessionId)
-                val excluded = key in exclusions.conversations
-                if (excluded) log.info("Excluding session %s (user-excluded)", session.sessionId.take(8))
-                !excluded
-            }
+            val sessions = allSessions
 
-            log.info("Discovered %d session(s) (%d excluded): %s",
-                allSessions.size, allSessions.size - sessions.size,
+            log.info("Discovered %d session(s): %s",
+                allSessions.size,
                 sessions.joinToString(", ") { "${it.source ?: "claude"}:${it.sessionId.take(8)}" })
             if (sessions.isEmpty()) {
                 log.info("No active sessions — skipping summarization")
@@ -259,13 +257,20 @@ object PostCommitHook {
                         log.info("  ...and %d more entries", result.entries.size - 3)
                     }
 
-                    if (result.entries.isNotEmpty()) {
+                    // Discard unchecked conversations: still advance the cursor (below)
+                    // so the row leaves the working area, but drop the entries so they
+                    // never enter the summary.
+                    val excludedConversation =
+                        CommitSelectionStore.conversationKey(source, session.sessionId) in exclusions.conversations
+                    if (result.entries.isNotEmpty() && !excludedConversation) {
                         sessionTranscripts.add(TranscriptReader.SessionTranscript(
                             session.sessionId, session.transcriptPath, result.entries, source
                         ))
                     }
-                    totalEntries += result.totalLinesRead
-                    totalTurns += result.entries.count { it.role == "human" }
+                    if (!excludedConversation) {
+                        totalEntries += result.totalLinesRead
+                        totalTurns += result.entries.count { it.role == "human" }
+                    }
                     SessionTracker.saveCursor(result.newCursor, cwd)
                 } catch (e: Exception) {
                     log.warn("Failed to read transcript for session %s (%s), skipping: %s",
@@ -331,7 +336,7 @@ object PostCommitHook {
             val planRefs = mutableListOf<PlanReference>()
             val planProgressArtifacts = mutableListOf<PlanProgressArtifact>()
 
-            val uncommittedSlugs = detectUncommittedPlanSlugs(cwd)
+            val uncommittedSlugs = detectUncommittedPlanSlugs(cwd, exclusions.plans)
             if (uncommittedSlugs.isNotEmpty()) {
                 log.info("Detected %d uncommitted plan(s): %s", uncommittedSlugs.size, uncommittedSlugs.joinToString(", "))
                 val plansDir = File(System.getProperty("user.home"), ".claude/plans")
@@ -389,7 +394,7 @@ object PostCommitHook {
             val referenceFilesToStore = mutableListOf<FileWrite>()
             val referenceCommitted = mutableListOf<Triple<String, String, String>>() // mapKey, sourcePath, updatedAt
 
-            val uncommittedRefResult = detectUncommittedReferences(cwd, branch)
+            val uncommittedRefResult = detectUncommittedReferences(cwd, exclusions.references)
             if (uncommittedRefResult.isNotEmpty()) {
                 log.info("Detected %d uncommitted reference(s)", uncommittedRefResult.size)
                 val shortHash = commitInfo.hash.substring(0, 8)
@@ -445,7 +450,7 @@ object PostCommitHook {
             run {
                 val noteNow = Instant.now().toString()
                 val shortHash = commitInfo.hash.take(8)
-                val uncommittedNotes = detectUncommittedNotes(cwd, branch, exclusions.notes)
+                val uncommittedNotes = detectUncommittedNotes(cwd, exclusions.notes)
                 if (uncommittedNotes.isNotEmpty()) {
                     log.info("Detected %d uncommitted note(s): %s", uncommittedNotes.size, uncommittedNotes.keys.joinToString(", "))
                     for ((id, entry) in uncommittedNotes) {
@@ -534,6 +539,12 @@ object PostCommitHook {
             if (noteGuards.isNotEmpty() || snippetFilesToDelete.isNotEmpty()) {
                 finalizeNoteArchive(noteGuards, commitInfo.hash, snippetFilesToDelete, cwd)
             }
+
+            // Discard the unchecked working items: the CHECKED ones were archived above;
+            // the excluded ones are useless per the user's selection, so remove their
+            // registry rows (+ .jolli-owned backing files) WITHOUT archiving them into
+            // committed memory.
+            discardExcludedWorkingItems(exclusions, cwd)
             log.info("=== PostCommitHook worker finished successfully for %s ===", commitInfo.hash.take(8))
 
         } finally {
@@ -654,11 +665,16 @@ object PostCommitHook {
         }
     }
 
-    /** Returns slugs of plans in plans.json that are not yet committed and not ignored. */
-    private fun detectUncommittedPlanSlugs(cwd: String): Set<String> {
+    /**
+     * Slugs of plans to ARCHIVE into this commit: uncommitted, not ignored, and NOT
+     * unchecked by the user. Excluded (unchecked) plans are left out here — they are
+     * discarded separately by [discardExcludedWorkingItems], never archived. No branch
+     * filter: uncommitted plans follow the user across branches (matches the CLI).
+     */
+    private fun detectUncommittedPlanSlugs(cwd: String, excluded: Set<String>): Set<String> {
         val registry = SessionTracker.loadPlansRegistry(cwd)
         return registry.plans.entries
-            .filter { (_, entry) -> entry.commitHash == null && entry.ignored != true }
+            .filter { (slug, entry) -> entry.commitHash == null && entry.ignored != true && slug !in excluded }
             .map { (slug, _) -> slug }
             .toSet()
     }
@@ -685,33 +701,30 @@ object PostCommitHook {
     }
 
     /**
-     * References eligible to be archived by this commit: every plans.json row is
-     * uncommitted (a commit deletes the row), scoped to the current branch with the
-     * legacy blank-branch fallback — mirrors [detectUncommittedNotes] so committing
-     * on one branch does not sweep up references stamped for another.
+     * References to ARCHIVE into this commit: every plans.json reference row is
+     * uncommitted (a commit deletes the row) and NOT unchecked by the user. Excluded
+     * references are left out here — they are discarded by [discardExcludedWorkingItems],
+     * never archived. No branch filter: uncommitted references follow the user across
+     * branches (matches the CLI).
      */
     private fun detectUncommittedReferences(
         cwd: String,
-        branch: String,
+        excluded: Set<String>,
     ): Map<String, ai.jolli.jollimemory.core.references.ReferenceEntry> {
         val registry = SessionTracker.loadPlansRegistry(cwd)
-        return (registry.references ?: emptyMap()).filter { (_, entry) ->
-            entry.branch.isNullOrBlank() || entry.branch == branch
-        }
+        return (registry.references ?: emptyMap()).filter { (mapKey, _) -> mapKey !in excluded }
     }
 
     /**
-     * Notes eligible to be captured by this commit: uncommitted, not ignored, on the
-     * current branch (legacy blank-branch rows allowed), and not excluded via the
-     * sidebar checkbox. Mirrors the CONTEXT panel's note visibility so what the user
-     * sees cleared is exactly what gets committed.
+     * Notes to ARCHIVE into this commit: uncommitted, not ignored, and not unchecked via
+     * the sidebar. Excluded notes are discarded by [discardExcludedWorkingItems], never
+     * archived. No branch filter: uncommitted notes follow the user across branches.
      */
-    private fun detectUncommittedNotes(cwd: String, branch: String, excluded: Set<String>): Map<String, NoteEntry> {
+    private fun detectUncommittedNotes(cwd: String, excluded: Set<String>): Map<String, NoteEntry> {
         val registry = SessionTracker.loadPlansRegistry(cwd)
         return (registry.notes ?: emptyMap()).filter { (id, entry) ->
             entry.commitHash == null &&
                 entry.ignored != true &&
-                (entry.branch.isBlank() || entry.branch == branch) &&
                 id !in excluded
         }
     }
@@ -783,6 +796,90 @@ object PostCommitHook {
             ReferenceStore.deleteReferenceMarkdown(path)
         }
         log.info("Reference finalize: deleted %d of %d ref(s)", toDeleteMarkdown.size, committed.size)
+    }
+
+    /**
+     * Discards the working-area items the user left UNCHECKED: removes the excluded
+     * uncommitted rows from plans.json (+ their `.jolli`-owned backing files) WITHOUT
+     * archiving them into committed memory. Mirrors the CLI `discardExcludedWorkingItems`.
+     *
+     * - Plans: registry row removed; the external `~/.claude/plans/<slug>.md` is left
+     *   untouched (user-owned). Hard-deletes the row (not `ignored=true`) so the on-disk
+     *   plans.json state matches whichever worker — CLI or native — ran the commit.
+     * - Notes: registry row removed; backing file deleted only for uncommitted snippet
+     *   notes (external markdown note sources are preserved).
+     * - References: registry row removed; backing markdown (always `.jolli`) deleted.
+     *
+     * Only uncommitted rows are touched, so a stale exclusion key can never clobber a
+     * committed guard row.
+     */
+    private fun discardExcludedWorkingItems(exclusions: CommitSelectionStore.CommitExclusions, cwd: String) {
+        if (exclusions.plans.isEmpty() && exclusions.notes.isEmpty() && exclusions.references.isEmpty()) return
+
+        val registry = SessionTracker.loadPlansRegistry(cwd)
+        val plans = registry.plans.toMutableMap()
+        val notes = (registry.notes ?: emptyMap()).toMutableMap()
+        val references = (registry.references ?: emptyMap()).toMutableMap()
+        val noteFilesToDelete = mutableListOf<String>()
+        val refFilesToDelete = mutableListOf<String>()
+        var removedPlans = 0
+        var removedNotes = 0
+        var removedRefs = 0
+
+        for (slug in exclusions.plans) {
+            val entry = plans[slug]
+            if (entry != null && entry.commitHash == null && entry.contentHashAtCommit == null) {
+                plans.remove(slug)
+                removedPlans++
+            }
+        }
+        for (id in exclusions.notes) {
+            val entry = notes[id]
+            if (entry != null && entry.commitHash == null && entry.contentHashAtCommit == null) {
+                if (entry.format == NoteFormat.snippet && entry.sourcePath != null) noteFilesToDelete.add(entry.sourcePath)
+                notes.remove(id)
+                removedNotes++
+            }
+        }
+        for (mapKey in exclusions.references) {
+            val entry = references[mapKey]
+            if (entry != null) {
+                refFilesToDelete.add(entry.sourcePath)
+                references.remove(mapKey)
+                removedRefs++
+            }
+        }
+
+        if (removedPlans > 0 || removedNotes > 0 || removedRefs > 0) {
+            SessionTracker.savePlansRegistry(
+                registry.copy(
+                    plans = plans,
+                    notes = notes.takeIf { it.isNotEmpty() },
+                    references = references.takeIf { it.isNotEmpty() },
+                ),
+                cwd,
+            )
+        }
+
+        // Backing-file cleanup after the registry write — snippet note bodies and
+        // reference markdown live under .jolli/jollimemory/ (owned); external note
+        // sources and ~/.claude/plans files are never deleted.
+        for (path in noteFilesToDelete) {
+            try {
+                val file = File(path)
+                if (file.exists()) file.delete()
+            } catch (_: Exception) { /* best-effort */ }
+        }
+        for (path in refFilesToDelete) {
+            ReferenceStore.deleteReferenceMarkdown(path)
+        }
+
+        if (removedPlans > 0 || removedNotes > 0 || removedRefs > 0) {
+            log.info(
+                "Discarded excluded working items: %d plan(s), %d note(s), %d reference(s)",
+                removedPlans, removedNotes, removedRefs,
+            )
+        }
     }
 
     /** Get the path to this JAR file (for spawning the worker). */

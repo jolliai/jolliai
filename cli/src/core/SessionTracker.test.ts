@@ -64,6 +64,7 @@ import {
 	detectActiveNotesForBranch,
 	detectActivePlansForBranch,
 	detectUncommittedReferenceIds,
+	discardExcludedWorkingItems,
 	enqueueGitOperation,
 	ensureJolliMemoryDir,
 	filterSessionsByEnabledIntegrations,
@@ -138,6 +139,116 @@ describe("SessionTracker", () => {
 			await ensureJolliMemoryDir(tempDir);
 			await ensureJolliMemoryDir(tempDir);
 			// No error thrown
+		});
+	});
+
+	describe("discardExcludedWorkingItems", () => {
+		it("removes excluded uncommitted rows + .jolli files; keeps checked/committed rows and external plan files", async () => {
+			const jolliDir = join(tempDir, ".jolli", "jollimemory");
+			const notesDir = join(jolliDir, "notes");
+			const refsDir = join(jolliDir, "references", "linear");
+			const extDir = join(tempDir, "ext-plans");
+			await mkdir(notesDir, { recursive: true });
+			await mkdir(refsDir, { recursive: true });
+			await mkdir(extDir, { recursive: true });
+
+			const keepPlanFile = join(extDir, "keep.md");
+			const dropPlanFile = join(extDir, "drop.md");
+			const noteFile = join(notesDir, "n1.md");
+			const refFile = join(refsDir, "L-1.md");
+			await writeFile(keepPlanFile, "# Keep");
+			await writeFile(dropPlanFile, "# Drop");
+			await writeFile(noteFile, "note body");
+			await writeFile(refFile, "ref body");
+
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {
+						"keep-plan": {
+							slug: "keep-plan",
+							title: "Keep",
+							sourcePath: keepPlanFile,
+							addedAt: "t",
+							updatedAt: "t",
+							commitHash: null,
+						},
+						"drop-plan": {
+							slug: "drop-plan",
+							title: "Drop",
+							sourcePath: dropPlanFile,
+							addedAt: "t",
+							updatedAt: "t",
+							commitHash: null,
+						},
+						// committed guard: excluded key must NOT clobber it.
+						"committed-plan": {
+							slug: "committed-plan",
+							title: "Committed",
+							sourcePath: keepPlanFile,
+							addedAt: "t",
+							updatedAt: "t",
+							commitHash: "abc12345",
+							contentHashAtCommit: "hash",
+						},
+					},
+					notes: {
+						n1: {
+							id: "n1",
+							title: "Note",
+							format: "snippet",
+							addedAt: "t",
+							updatedAt: "t",
+							commitHash: null,
+							sourcePath: noteFile,
+						},
+					},
+					references: {
+						"linear:L-1": {
+							source: "linear",
+							nativeId: "L-1",
+							title: "Ref",
+							url: "https://x",
+							sourcePath: refFile,
+							addedAt: "t",
+							updatedAt: "t",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					},
+				},
+				tempDir,
+			);
+
+			const removed = await discardExcludedWorkingItems(
+				{
+					plans: new Set(["drop-plan", "committed-plan"]),
+					notes: new Set(["n1"]),
+					references: new Set(["linear:L-1"]),
+				},
+				tempDir,
+			);
+			expect(removed).toEqual({ plans: 1, notes: 1, references: 1 });
+
+			const reg = await loadPlansRegistry(tempDir);
+			// drop-plan removed; keep-plan + committed guard preserved.
+			expect(Object.keys(reg.plans).sort()).toEqual(["committed-plan", "keep-plan"]);
+			expect(reg.notes ?? {}).toEqual({});
+			expect(reg.references ?? {}).toEqual({});
+
+			const { existsSync } = await import("node:fs");
+			// .jolli-owned note + reference files deleted…
+			expect(existsSync(noteFile)).toBe(false);
+			expect(existsSync(refFile)).toBe(false);
+			// …but the external plan file is never touched.
+			expect(existsSync(dropPlanFile)).toBe(true);
+		});
+
+		it("is a no-op when nothing is excluded", async () => {
+			const removed = await discardExcludedWorkingItems(
+				{ plans: new Set(), notes: new Set(), references: new Set() },
+				tempDir,
+			);
+			expect(removed).toEqual({ plans: 0, notes: 0, references: 0 });
 		});
 	});
 

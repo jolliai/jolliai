@@ -65,52 +65,6 @@ object PlanService {
     }
 
     /**
-     * Auto-registers plan files that exist in ~/.claude/plans/ but aren't yet in
-     * the project's plans.json registry, so a plan Claude just generated shows up
-     * live in the WORKING MEMORY → CONTEXT section without a manual "Add plan".
-     *
-     * New entries are uncommitted (commitHash = null) and tagged with the current
-     * branch — mirroring the VS Code extension's handleNewPlanFile. Slugs already
-     * present in the registry (in any state, including ignored or committed) are
-     * left untouched, so this never resurrects a removed plan or duplicates one.
-     *
-     * @return true when at least one new plan was registered (caller should refresh).
-     */
-    fun autoRegisterNewPlans(cwd: String, branch: String?): Boolean {
-        if (!PLANS_DIR.exists() || !PLANS_DIR.isDirectory) return false
-        val files = PLANS_DIR.listFiles { file -> file.extension == "md" } ?: return false
-        if (files.isEmpty()) return false
-
-        val registry = SessionTracker.loadPlansRegistry(cwd)
-        val updated = registry.plans.toMutableMap()
-        val now = Instant.now().toString()
-        val resolvedBranch = branch ?: getCurrentBranch(cwd)
-        var changed = false
-
-        for (file in files) {
-            val slug = file.nameWithoutExtension
-            if (registry.plans.containsKey(slug)) continue
-            updated[slug] = ai.jolli.jollimemory.core.PlanEntry(
-                slug = slug,
-                title = extractPlanTitle(file.readText(Charsets.UTF_8)),
-                sourcePath = file.absolutePath,
-                addedAt = now,
-                updatedAt = now,
-                branch = resolvedBranch,
-                commitHash = null,
-                editCount = 0,
-            )
-            changed = true
-        }
-
-        if (changed) {
-            SessionTracker.savePlansRegistry(registry.copy(plans = updated), cwd)
-            log.info("Auto-registered new plan(s) from %s on branch %s", PLANS_DIR.absolutePath, resolvedBranch)
-        }
-        return changed
-    }
-
-    /**
      * Archives a plan and associates it with a commit.
      *
      * Mirrors PostCommitHook's archive logic: renames slug to slug-hash,

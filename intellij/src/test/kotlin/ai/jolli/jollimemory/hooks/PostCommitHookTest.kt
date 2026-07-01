@@ -1,8 +1,10 @@
 package ai.jolli.jollimemory.hooks
 
+import ai.jolli.jollimemory.core.CommitSelectionStore
 import ai.jolli.jollimemory.core.DiffStats
 import ai.jolli.jollimemory.core.NoteEntry
 import ai.jolli.jollimemory.core.NoteFormat
+import ai.jolli.jollimemory.core.PlanEntry
 import ai.jolli.jollimemory.core.PlansRegistry
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.references.ReferenceEntry
@@ -47,12 +49,12 @@ class PostCommitHookTest {
     )
 
     @Suppress("UNCHECKED_CAST")
-    private fun detectUncommittedNotes(branch: String, excluded: Set<String>): Map<String, NoteEntry> {
+    private fun detectUncommittedNotes(excluded: Set<String>): Map<String, NoteEntry> {
         val method = PostCommitHook::class.java.getDeclaredMethod(
-            "detectUncommittedNotes", String::class.java, String::class.java, Set::class.java,
+            "detectUncommittedNotes", String::class.java, Set::class.java,
         )
         method.isAccessible = true
-        return method.invoke(PostCommitHook, cwd, branch, excluded) as Map<String, NoteEntry>
+        return method.invoke(PostCommitHook, cwd, excluded) as Map<String, NoteEntry>
     }
 
     private fun ref(nativeId: String, branch: String?) = ReferenceEntry(
@@ -68,12 +70,30 @@ class PostCommitHookTest {
     )
 
     @Suppress("UNCHECKED_CAST")
-    private fun detectUncommittedReferences(branch: String): Map<String, ReferenceEntry> {
+    private fun detectUncommittedReferences(excluded: Set<String>): Map<String, ReferenceEntry> {
         val method = PostCommitHook::class.java.getDeclaredMethod(
-            "detectUncommittedReferences", String::class.java, String::class.java,
+            "detectUncommittedReferences", String::class.java, Set::class.java,
         )
         method.isAccessible = true
-        return method.invoke(PostCommitHook, cwd, branch) as Map<String, ReferenceEntry>
+        return method.invoke(PostCommitHook, cwd, excluded) as Map<String, ReferenceEntry>
+    }
+
+    private fun plan(slug: String, commitHash: String?, contentHashAtCommit: String? = null, sourcePath: String) = PlanEntry(
+        slug = slug,
+        title = "Plan $slug",
+        sourcePath = sourcePath,
+        addedAt = "2026-01-01T00:00:00Z",
+        updatedAt = "2026-01-01T00:00:00Z",
+        commitHash = commitHash,
+        contentHashAtCommit = contentHashAtCommit,
+    )
+
+    private fun discardExcludedWorkingItems(exclusions: CommitSelectionStore.CommitExclusions) {
+        val method = PostCommitHook::class.java.getDeclaredMethod(
+            "discardExcludedWorkingItems", CommitSelectionStore.CommitExclusions::class.java, String::class.java,
+        )
+        method.isAccessible = true
+        method.invoke(PostCommitHook, exclusions, cwd)
     }
 
     private fun sha256Hex(s: String): String {
@@ -136,7 +156,7 @@ invalid line
     @Nested
     inner class DetectUncommittedNotes {
         @Test
-        fun `includes only uncommitted, non-ignored, current-branch, non-excluded notes`() {
+        fun `includes uncommitted non-ignored non-excluded notes regardless of branch`() {
             SessionTracker.savePlansRegistry(
                 PlansRegistry(
                     notes = mapOf(
@@ -144,6 +164,7 @@ invalid line
                         "blank-branch" to note("blank-branch", branch = "", commitHash = null),
                         "committed" to note("committed", branch = "feature/x", commitHash = "abc123"),
                         "ignored" to note("ignored", branch = "feature/x", commitHash = null, ignored = true),
+                        // Uncommitted items follow the user across branches — no branch filter.
                         "other-branch" to note("other-branch", branch = "feature/y", commitHash = null),
                         "excluded" to note("excluded", branch = "feature/x", commitHash = null),
                     ),
@@ -151,35 +172,36 @@ invalid line
                 cwd,
             )
 
-            val result = detectUncommittedNotes(branch = "feature/x", excluded = setOf("excluded"))
+            val result = detectUncommittedNotes(excluded = setOf("excluded"))
 
-            result.keys shouldContainExactlyInAnyOrder listOf("eligible", "blank-branch")
+            result.keys shouldContainExactlyInAnyOrder listOf("eligible", "blank-branch", "other-branch")
         }
 
         @Test
         fun `returns empty when there are no notes`() {
             SessionTracker.savePlansRegistry(PlansRegistry(), cwd)
-            detectUncommittedNotes(branch = "main", excluded = emptySet()) shouldBe emptyMap()
+            detectUncommittedNotes(excluded = emptySet()) shouldBe emptyMap()
         }
     }
 
     @Nested
     inner class DetectUncommittedReferences {
         @Test
-        fun `includes only current-branch and legacy blank-branch references`() {
+        fun `includes all uncommitted references regardless of branch, minus excluded`() {
             SessionTracker.savePlansRegistry(
                 PlansRegistry(
                     references = mapOf(
                         "linear:ENG-1" to ref("ENG-1", branch = "feature/x"),
                         "linear:ENG-2" to ref("ENG-2", branch = null),
                         "linear:ENG-3" to ref("ENG-3", branch = ""),
+                        // Other-branch reference is still included — no branch filter.
                         "linear:ENG-4" to ref("ENG-4", branch = "feature/y"),
                     ),
                 ),
                 cwd,
             )
 
-            val result = detectUncommittedReferences(branch = "feature/x")
+            val result = detectUncommittedReferences(excluded = setOf("linear:ENG-4"))
 
             result.keys shouldContainExactlyInAnyOrder listOf("linear:ENG-1", "linear:ENG-2", "linear:ENG-3")
         }
@@ -187,7 +209,68 @@ invalid line
         @Test
         fun `returns empty when there are no references`() {
             SessionTracker.savePlansRegistry(PlansRegistry(), cwd)
-            detectUncommittedReferences(branch = "main") shouldBe emptyMap()
+            detectUncommittedReferences(excluded = emptySet()) shouldBe emptyMap()
+        }
+    }
+
+    @Nested
+    inner class DiscardExcludedWorkingItems {
+        @Test
+        fun `removes excluded uncommitted rows and jolli files but keeps committed rows and external plan files`() {
+            val jolliDir = File(tempDir, ".jolli/jollimemory")
+            val notesDir = File(jolliDir, "notes").apply { mkdirs() }
+            val refsDir = File(jolliDir, "references/linear").apply { mkdirs() }
+            val extDir = File(tempDir, "ext-plans").apply { mkdirs() }
+
+            val dropPlanFile = File(extDir, "drop.md").apply { writeText("# Drop") }
+            val noteFile = File(notesDir, "n1.md").apply { writeText("note") }
+            val refFile = File(refsDir, "L-1.md").apply { writeText("ref") }
+
+            SessionTracker.savePlansRegistry(
+                PlansRegistry(
+                    plans = mapOf(
+                        "drop-plan" to plan("drop-plan", commitHash = null, sourcePath = dropPlanFile.absolutePath),
+                        // committed guard must survive even if its key is in the exclusion set.
+                        "committed-plan" to plan("committed-plan", commitHash = "abc12345", contentHashAtCommit = "h", sourcePath = dropPlanFile.absolutePath),
+                    ),
+                    notes = mapOf(
+                        "n1" to NoteEntry(
+                            id = "n1", title = "Note", format = NoteFormat.snippet,
+                            addedAt = "t", updatedAt = "t", branch = "", commitHash = null,
+                            sourcePath = noteFile.absolutePath,
+                        ),
+                    ),
+                    references = mapOf("linear:L-1" to ref("L-1", branch = null).copy(sourcePath = refFile.absolutePath)),
+                ),
+                cwd,
+            )
+
+            discardExcludedWorkingItems(
+                CommitSelectionStore.CommitExclusions(
+                    plans = setOf("drop-plan", "committed-plan"),
+                    notes = setOf("n1"),
+                    references = setOf("linear:L-1"),
+                ),
+            )
+
+            val reg = SessionTracker.loadPlansRegistry(cwd)
+            reg.plans.keys shouldContainExactlyInAnyOrder listOf("committed-plan")
+            (reg.notes ?: emptyMap()) shouldBe emptyMap()
+            (reg.references ?: emptyMap()) shouldBe emptyMap()
+            // .jolli-owned files deleted; external plan file preserved.
+            noteFile.exists() shouldBe false
+            refFile.exists() shouldBe false
+            dropPlanFile.exists() shouldBe true
+        }
+
+        @Test
+        fun `is a no-op when nothing is excluded`() {
+            SessionTracker.savePlansRegistry(
+                PlansRegistry(plans = mapOf("p" to plan("p", commitHash = null, sourcePath = "/ext/p.md"))),
+                cwd,
+            )
+            discardExcludedWorkingItems(CommitSelectionStore.CommitExclusions())
+            SessionTracker.loadPlansRegistry(cwd).plans.keys shouldContainExactlyInAnyOrder listOf("p")
         }
     }
 
