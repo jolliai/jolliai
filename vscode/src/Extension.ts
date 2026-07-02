@@ -1923,6 +1923,72 @@ export function activate(context: vscode.ExtensionContext): void {
 				}
 			},
 		),
+		// Back-fill summaries for historical commits that lack one. Reuses the
+		// isolated CLI back-fill engine (Claude transcript attribution → the same
+		// generateSummary/storeSummary path as the live flow). Progress streams
+		// through a native notification; the result text goes back to the
+		// Settings panel's "Generate Missing Summaries" button.
+		vscode.commands.registerCommand(
+			"jollimemory.generateMissingSummaries",
+			async (): Promise<{
+				ok: boolean;
+				generated: number;
+				total: number;
+				skipped: number;
+				message: string;
+			}> => {
+				try {
+					const { runBackfill, recentCommitHashes } = await import(
+						"../../cli/src/backfill/BackfillEngine.js"
+					);
+					const hashes = await recentCommitHashes(workspaceRoot);
+					if (hashes.length === 0) {
+						return { ok: false, generated: 0, total: 0, skipped: 0, message: "No commits found." };
+					}
+					const report = await vscode.window.withProgress(
+						{
+							location: vscode.ProgressLocation.Notification,
+							title: "Jolli Memory: Back-filling summaries",
+							cancellable: false,
+						},
+						(progress) =>
+							runBackfill({
+								cwd: workspaceRoot,
+								hashes,
+								onProgress: (done, total, outcome) => {
+									// Show the commit's one-line message (more readable than a hash),
+									// truncated; flag only failures — success is the norm and the
+									// advancing count already signals progress.
+									const subject = outcome.commitSubject?.trim();
+									const label = subject
+										? subject.length > 60
+											? `${subject.slice(0, 57)}…`
+											: subject
+										: outcome.commitHash.substring(0, 8);
+									const tag = outcome.status === "error" ? " (failed)" : "";
+									progress.report({ message: `${done}/${total} — ${label}${tag}`, increment: 100 / total });
+								},
+							}),
+					);
+					bridge.invalidateEntriesCache();
+					if (memoriesStore.hasFirstLoaded()) {
+						memoriesStore.refresh().catch(handleError("generateMissingSummaries.memories"));
+					}
+					// Newly back-filled summaries also land in the Memory Bank folder's
+					// visible layer — refresh the Folders tree like rebuildKnowledgeBase does.
+					sidebarProvider.refreshKnowledgeBaseFolders();
+					return {
+						ok: report.errors === 0,
+						generated: report.generated,
+						total: report.total,
+						skipped: report.skipped,
+						message: `${report.generated} generated, ${report.skipped} skipped, ${report.errors} error(s)`,
+					};
+				} catch (err) {
+					return { ok: false, generated: 0, total: 0, skipped: 0, message: (err as Error).message };
+				}
+			},
+		),
 		// Status panel
 		// Beyond refreshing the status store + status bar, this also re-pulls
 		// `bridge.getStatus()` (via refreshStatusBar's return value) and
@@ -2009,6 +2075,14 @@ export function activate(context: vscode.ExtensionContext): void {
 						filesStore.refresh(true),
 						commitsStore.refresh(),
 					]);
+					// Mirror the CLI `jolli enable`: kick off a best-effort back-fill of
+					// historical commits that lack a summary. Fire-and-forget so enable stays
+					// responsive — the command streams its own progress notification and
+					// refreshes panels when done. runBackfill self-limits (early-returns when
+					// every recent commit already has a summary), a cheap no-op then.
+					void vscode.commands
+						.executeCommand("jollimemory.generateMissingSummaries")
+						.then(undefined, handleError("enable.backfill"));
 				}
 			},
 		),

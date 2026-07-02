@@ -269,6 +269,25 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("<title>Commit Memory</title>");
 		});
 
+		it("shows a Back-filled badge only for back-filled summaries, with a method-specific tooltip", () => {
+			expect(buildHtml(makeSummary())).not.toContain("Back-filled"); // live summary → no badge
+
+			const fileOverlap = buildHtml(makeSummary({ backfilled: true, backfillMethod: "file-overlap" }));
+			expect(fileOverlap).toContain('class="meta-backfill"');
+			expect(fileOverlap).toContain(">Back-filled<");
+			expect(fileOverlap).toContain("conversation that edited these files");
+
+			expect(buildHtml(makeSummary({ backfilled: true, backfillMethod: "time-window" }))).toContain(
+				"matched by timing",
+			);
+			expect(buildHtml(makeSummary({ backfilled: true, backfillMethod: "branch-match" }))).toContain(
+				"matched by the branch you were working on",
+			);
+			expect(buildHtml(makeSummary({ backfilled: true, backfillMethod: "diff-only" }))).toContain(
+				"written from the code changes alone",
+			);
+		});
+
 		it("includes CSS from buildCss() in a style tag", () => {
 			const html = buildHtml(makeSummary());
 			expect(html).toContain("<style>/* css */</style>");

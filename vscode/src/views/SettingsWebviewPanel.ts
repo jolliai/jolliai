@@ -75,6 +75,7 @@ type SettingsMessage =
 	| { command: "loadSettings" }
 	| { command: "browseLocalFolder" }
 	| { command: "rebuildKnowledgeBase" }
+	| { command: "generateMissingSummaries" }
 	| { command: "confirmDirtyMigrate" }
 	| { command: "signIn" }
 	| { command: "signOut" }
@@ -255,8 +256,20 @@ export class SettingsWebviewPanel {
 			case "rebuildKnowledgeBase":
 				this.handleRebuildKnowledgeBase().catch((err: unknown) => {
 					log.error("SettingsPanel", `Rebuild failed: ${err}`);
+					if (SettingsWebviewPanel.currentPanel !== this) return;
 					this.panel.webview.postMessage({
 						command: "rebuildKnowledgeBaseDone",
+						success: false,
+						message: err instanceof Error ? err.message : String(err),
+					});
+				});
+				break;
+			case "generateMissingSummaries":
+				this.handleGenerateMissingSummaries().catch((err: unknown) => {
+					log.error("SettingsPanel", `Generate missing summaries failed: ${err}`);
+					if (SettingsWebviewPanel.currentPanel !== this) return;
+					this.panel.webview.postMessage({
+						command: "generateMissingSummariesDone",
 						success: false,
 						message: err instanceof Error ? err.message : String(err),
 					});
@@ -337,6 +350,54 @@ export class SettingsWebviewPanel {
 			success: result?.ok ?? false,
 			message: result?.message ?? "",
 		});
+	}
+
+	/**
+	 * Forwards the Settings → Generate Missing Summaries button click to the
+	 * `jollimemory.generateMissingSummaries` command (back-fills historical
+	 * commits via the isolated CLI engine) and posts the result back.
+	 */
+	private async handleGenerateMissingSummaries(): Promise<void> {
+		const result = (await vscode.commands.executeCommand("jollimemory.generateMissingSummaries")) as
+			| { ok: boolean; generated: number; total: number; skipped: number; message: string }
+			| undefined;
+		// The command can run for minutes; the user may have closed the panel
+		// meanwhile. Bail out instead of posting to a disposed webview / doing
+		// the (git + index) count work for a panel nobody is looking at.
+		if (SettingsWebviewPanel.currentPanel !== this) return;
+		this.panel.webview.postMessage({
+			command: "generateMissingSummariesDone",
+			success: result?.ok ?? false,
+			message: result?.message ?? "",
+		});
+		// Counts changed — refresh just the missing-summary number (async).
+		void this.refreshMissingSummaryCount();
+	}
+
+	/**
+	 * Computes the "N commits lack a summary" count off the settings-load critical
+	 * path and posts it to the webview. Best-effort: any failure leaves the count
+	 * blank. Uses a dynamic import so the Node-only BackfillEngine dependency chain
+	 * (QueueWorker, node:child_process) is not statically bundled into the panel.
+	 */
+	private async refreshMissingSummaryCount(): Promise<void> {
+		try {
+			const { countMissingSummaries } = await import("../../../cli/src/backfill/BackfillEngine.js");
+			const { extractRepoName } = await import("../../../cli/src/core/KBPathResolver.js");
+			const { missing } = await countMissingSummaries(this.workspaceRoot);
+			if (SettingsWebviewPanel.currentPanel !== this) return; // panel closed meanwhile
+			this.panel.webview.postMessage({
+				command: "missingSummaryCountLoaded",
+				missingSummaryCount: missing,
+				repoName: extractRepoName(this.workspaceRoot),
+			});
+		} catch (err) {
+			log.warn("SettingsPanel", `Missing-summary count failed: ${err}`);
+			if (SettingsWebviewPanel.currentPanel !== this) return;
+			// Count failed — release the button from its initial disabled state so the
+			// user isn't stuck (back-fill is idempotent for commits that already have one).
+			this.panel.webview.postMessage({ command: "missingSummaryCountLoaded" });
+		}
 	}
 
 	/** Opens a folder picker and posts the selected path back to the webview. */
@@ -424,6 +485,12 @@ export class SettingsWebviewPanel {
 			hasJolliKey,
 			jolliSiteLabel: buildJolliSiteLabel(config.jolliApiKey, config.jolliUrl),
 		});
+
+		// The missing-summary count runs `git rev-list` over all of HEAD plus an
+		// index read — too slow to block the form render on. Compute it off the
+		// critical path and push a separate update when ready (the count span
+		// shows "Checking…" until then).
+		void this.refreshMissingSummaryCount();
 
 		if (this.fullJolliApiKey.length > 0) {
 			try {

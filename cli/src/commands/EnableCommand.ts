@@ -9,6 +9,7 @@ import { join } from "node:path";
 import type { Command } from "commander";
 import { getJolliUrl } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
+import { ENABLE_BACKFILL_COUNT, launchBackfillWorker } from "../backfill/BackfillWorker.js";
 import { validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { getGlobalConfigDir, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
@@ -172,6 +173,14 @@ export function registerEnableCommand(program: Command): void {
 					console.log(`    Edit: ${join(configDir, "config.json")}`);
 					console.log('    Set "apiKey" (Anthropic) and/or "jolliApiKey" (Jolli Space)\n');
 				}
+
+				// Kick off a detached, best-effort back-fill of recent history so the
+				// user's existing commits get summaries too. Runs in the background
+				// (LLM-bound) and never blocks enable; failures are logged only.
+				launchBackfillWorker(options.cwd);
+				console.log(
+					`  Back-filling summaries for the last ${ENABLE_BACKFILL_COUNT} commits in the background…`,
+				);
 			} else {
 				console.error(`\n  Error: ${result.message}\n`);
 				process.exitCode = 1;

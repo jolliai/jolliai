@@ -411,6 +411,34 @@ export function buildJolliRow(
  * modes it stays in the DOM and is hidden by the readonly CSS rule (it is
  * intentionally not `data-foreign-safe`).
  */
+/**
+ * Renders the "Back-filled" badge shown in the meta strip for summaries produced
+ * by the historical back-fill flow (absent on live post-commit summaries). The
+ * badge text is deliberately plain ("Back-filled"); the *how* lives in the
+ * hover tooltip, phrased for end users rather than as a confidence tier.
+ */
+function buildBackfillBadge(summary: CommitSummary): string {
+	if (!summary.backfilled) return "";
+	let tip: string;
+	switch (summary.backfillMethod) {
+		case "diff-only":
+			tip =
+				"Back-filled for an earlier commit. No matching AI conversation was found, so this summary was written from the code changes alone.";
+			break;
+		case "time-window":
+			tip =
+				"Back-filled for an earlier commit. The AI conversation was matched by timing alone, so it may not be the exact one.";
+			break;
+		case "branch-match":
+			tip =
+				"Back-filled for an earlier commit. The AI conversation was matched by the branch you were working on, so it may not be the exact one.";
+			break;
+		default:
+			tip = "Back-filled for an earlier commit, reconstructed from the AI conversation that edited these files.";
+	}
+	return `<span class="meta-sep">&middot;</span><span class="meta-backfill" title="${escAttr(tip)}">Back-filled</span>`;
+}
+
 function buildHeader(
 	summary: CommitSummary,
 	totalFiles: number,
@@ -439,6 +467,7 @@ function buildHeader(
   <span class="meta-sep">&middot;</span>
   <span class="meta-changes"><span class="stat-add">+${totalInsertions}</span>/<span class="stat-del">\u2212${totalDeletions}</span></span>
   ${turnsMeta}
+  ${buildBackfillBadge(summary)}
   <button class="details-toggle" id="detailsToggle" data-foreign-safe aria-expanded="false">Details &#x25BE;</button>
 </div>
 <div class="properties collapsed" id="propTable">

@@ -163,6 +163,23 @@ vi.mock("node:crypto", () => ({
 	randomBytes: mockRandomBytes,
 }));
 
+// refreshMissingSummaryCount dynamic-imports these; mock the count so the
+// success/failure branches are deterministic (real countMissingSummaries would
+// run git + storage against a non-existent workspace path).
+const { mockCountMissingSummaries, mockExtractRepoName } = vi.hoisted(() => ({
+	mockCountMissingSummaries: vi.fn().mockResolvedValue({ missing: 0, total: 0 }),
+	mockExtractRepoName: vi.fn(() => "myrepo"),
+}));
+
+vi.mock("../../../cli/src/backfill/BackfillEngine.js", () => ({
+	countMissingSummaries: mockCountMissingSummaries,
+}));
+
+vi.mock("../../../cli/src/core/KBPathResolver.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../../cli/src/core/KBPathResolver.js")>()),
+	extractRepoName: mockExtractRepoName,
+}));
+
 // ── Import under test ────────────────────────────────────────────────────────
 
 import { SettingsWebviewPanel } from "./SettingsWebviewPanel.js";
@@ -2431,6 +2448,196 @@ describe("SettingsWebviewPanel", () => {
 				success: false,
 				message: "plain string failure",
 			});
+		});
+
+		it("bails out of the catch when the panel was disposed before the rebuild rejected", async () => {
+			let rejectCmd: (e: unknown) => void = () => {};
+			mockExecuteCommand.mockImplementation(() => new Promise((_res, rej) => {
+				rejectCmd = rej;
+			}));
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "rebuildKnowledgeBase" });
+			(SettingsWebviewPanel as unknown as { currentPanel: undefined }).currentPanel = undefined;
+			rejectCmd(new Error("late rebuild"));
+			await flushPromises();
+
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ command: "rebuildKnowledgeBaseDone" }),
+			);
+		});
+	});
+
+	describe("generateMissingSummaries message", () => {
+		it("forwards the command, posts the result, and refreshes the count", async () => {
+			mockCountMissingSummaries.mockResolvedValue({ missing: 3, total: 10 });
+			mockExecuteCommand.mockImplementation(async (cmd: string) =>
+				cmd === "jollimemory.generateMissingSummaries"
+					? { ok: true, generated: 2, total: 2, skipped: 0, message: "done" }
+					: undefined,
+			);
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "generateMissingSummaries" });
+			await flushPromises();
+			await flushPromises(); // let refreshMissingSummaryCount's dynamic import resolve
+
+			expect(mockExecuteCommand).toHaveBeenCalledWith("jollimemory.generateMissingSummaries");
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "generateMissingSummariesDone",
+				success: true,
+				message: "done",
+			});
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "missingSummaryCountLoaded",
+				missingSummaryCount: 3,
+				repoName: "myrepo",
+			});
+		});
+
+		it("falls back to success=false / empty message when the command returns undefined", async () => {
+			mockExecuteCommand.mockResolvedValue(undefined);
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "generateMissingSummaries" });
+			await flushPromises();
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "generateMissingSummariesDone",
+				success: false,
+				message: "",
+			});
+		});
+
+		it("posts the error message back when the command rejects", async () => {
+			mockExecuteCommand.mockRejectedValue(new Error("gen boom"));
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "generateMissingSummaries" });
+			await flushPromises();
+
+			expect(logError).toHaveBeenCalledWith("SettingsPanel", expect.stringContaining("gen boom"));
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "generateMissingSummariesDone",
+				success: false,
+				message: "gen boom",
+			});
+		});
+
+		it("bails out without posting when the panel was disposed while the command ran", async () => {
+			let release: (v: unknown) => void = () => {};
+			mockExecuteCommand.mockImplementation(() => new Promise((r) => {
+				release = r;
+			}));
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "generateMissingSummaries" });
+			// Panel disposed/replaced before the command resolves.
+			(SettingsWebviewPanel as unknown as { currentPanel: undefined }).currentPanel = undefined;
+			release({ ok: true, generated: 0, total: 0, skipped: 0, message: "" });
+			await flushPromises();
+
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ command: "generateMissingSummariesDone" }),
+			);
+		});
+
+		it("stringifies a non-Error rejection in the failure message", async () => {
+			mockExecuteCommand.mockRejectedValue("plain gen failure");
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "generateMissingSummaries" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "generateMissingSummariesDone",
+				success: false,
+				message: "plain gen failure",
+			});
+		});
+
+		it("bails out of the catch when the panel was disposed before the command rejected", async () => {
+			let rejectCmd: (e: unknown) => void = () => {};
+			mockExecuteCommand.mockImplementation(() => new Promise((_res, rej) => {
+				rejectCmd = rej;
+			}));
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "generateMissingSummaries" });
+			(SettingsWebviewPanel as unknown as { currentPanel: undefined }).currentPanel = undefined;
+			rejectCmd(new Error("late boom"));
+			await flushPromises();
+
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ command: "generateMissingSummariesDone" }),
+			);
+		});
+	});
+
+	describe("missing-summary count refresh", () => {
+		it("posts the count on success (via loadSettings)", async () => {
+			mockCountMissingSummaries.mockResolvedValue({ missing: 5, total: 12 });
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "missingSummaryCountLoaded",
+				missingSummaryCount: 5,
+				repoName: "myrepo",
+			});
+		});
+
+		it("posts an empty count message when the computation fails", async () => {
+			mockCountMissingSummaries.mockRejectedValue(new Error("count boom"));
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			await flushPromises();
+
+			expect(warn).toHaveBeenCalledWith("SettingsPanel", expect.stringContaining("count boom"));
+			expect(postMessage).toHaveBeenCalledWith({ command: "missingSummaryCountLoaded" });
+		});
+
+		it("does not post when the count fails after the panel was disposed", async () => {
+			let rejectCount: (e: unknown) => void = () => {};
+			mockCountMissingSummaries.mockImplementation(() => new Promise((_res, rej) => {
+				rejectCount = rej;
+			}));
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises(); // let the dynamic import + countMissingSummaries call start
+			postMessage.mockClear();
+			(SettingsWebviewPanel as unknown as { currentPanel: undefined }).currentPanel = undefined;
+			rejectCount(new Error("count late"));
+			await flushPromises();
+			await flushPromises();
+
+			expect(postMessage).not.toHaveBeenCalledWith({ command: "missingSummaryCountLoaded" });
 		});
 	});
 

@@ -1469,6 +1469,11 @@ export function buildCss(): string {
     white-space: nowrap; vertical-align: bottom;
     padding: 1px 8px; border-radius: 5px; background: var(--pill-bg); color: var(--pill-text); font-size: 0.92em;
   }
+  .meta-backfill {
+    padding: 1px 8px; border-radius: 5px; font-size: 0.92em; cursor: help;
+    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+    border: 1px solid var(--vscode-contrastBorder, transparent);
+  }
   .details-toggle {
     background: none; border: none; cursor: pointer; font-family: var(--vscode-font-family);
     font-size: 0.96em; color: var(--text-tertiary); padding: 1px 4px; border-radius: 4px;

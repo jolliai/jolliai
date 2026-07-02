@@ -231,6 +231,15 @@ export function buildSettingsHtml(nonce: string): string {
           ⚠ Pick a <code>localFolder</code> only Jolli writes to. Sharing it with iCloud / Dropbox / Syncthing races on the same files — and turning off auto-sync isn't enough, since manual sync still writes.
         </div>
       </div>
+
+      <!-- ── Back-fill summaries for historical commits ─────────────────── -->
+      <hr class="settings-divider" />
+
+      <div class="settings-row column rebuild-row">
+        <button type="button" class="browse-btn rebuild-btn" id="generateSummariesBtn" disabled>Generate Missing Summaries</button>
+        <div class="hint rebuild-hint"><span id="missingSummariesCount">Checking for commits without a summary…</span> Generates summaries for your own past commits in this repository that don't have one yet — using the Claude Code conversation behind each commit when it can be found, otherwise summarizing the code change alone. Runs one AI call per commit, so it may take a while.</div>
+        <div class="hint" id="generateSummariesStatus"></div>
+      </div>
     </section>
 
     <!-- ── Tab 5: Others ── -->
