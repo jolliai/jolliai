@@ -250,10 +250,23 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             LOG.warn("toggleExclude failed: ${e.message}")
             return
         }
-        // Refresh the sidebar panels + this review. notifySelectionChanged fans out to
-        // our own selectionListener (→ reload); fall back to a direct reload if the
-        // service is unavailable.
-        if (service != null) service.notifySelectionChanged() else reload()
+        val svc = service
+        if (svc == null) {
+            reload()
+            return
+        }
+        // notifySelectionChanged wakes this review (our selectionListener → reload) and
+        // any other open review. The sidebar panels listen on the *status* channel, not
+        // selection, so refresh the ones that mirror this state directly — otherwise a
+        // remove/add here wouldn't update the sidebar's checkboxes (and both must agree,
+        // since the commit reads the same CommitSelectionStore they all write to).
+        svc.notifySelectionChanged()
+        svc.panelRegistry?.let { reg ->
+            when (kind) {
+                "conversations" -> reg.activeConversationsPanel?.refresh()
+                else -> reg.plansPanel?.refresh() // plans / notes / references live in the CONTEXT (Plans) panel
+            }
+        }
     }
 
     /**
