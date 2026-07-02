@@ -152,18 +152,21 @@ class ActionBarPanel(
 	// ── Create PR ─────────────────────────────────────────────────────────────
 
 	/**
-	 * Opens the branch's most recent committed memory in its detail webview, where
-	 * the Create PR flow lives — identical to the memory row's "⋯ → Create PR".
+	 * Opens the dedicated branch-level Create PR webview (the mockup design). It
+	 * aggregates the branch's committed memories and, when signed in, also shares
+	 * them to Jolli on submit. Shows the "commit first" hint when there are none.
 	 */
 	private fun handleCreatePr() {
-		val opened = service.panelRegistry?.commitsPanel?.openMostRecentMemory() ?: false
-		if (!opened) {
+		val panel = service.panelRegistry?.commitsPanel
+		if (panel == null) {
 			Messages.showInfoMessage(
 				project,
-				"No committed memory on this branch yet. Commit first, then create a PR from the memory view.",
+				"Create PR is unavailable right now — open the Jolli Memory tool window and try again.",
 				"Create PR",
 			)
+			return
 		}
+		panel.openCreatePrView()
 	}
 
 	private fun handleShare() {

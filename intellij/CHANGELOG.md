@@ -2,6 +2,10 @@
 
 ## 0.99.4
 
+### New Features
+
+- **Redesigned Create PR view** — the **Create pull request (PR)** button now opens a dedicated, branch-level Create PR tab that matches the new design: a branch → main header with diff stats, the drafted title and a rendered-markdown body, the memories included in the PR, the E2E test guide, and the changed files. When you're signed in to Jolli, creating the PR **also shares the included memories to Jolli in the same action** (a sign-in hint appears when you're signed out; the PR is still a normal git PR either way)
+
 ### Changes
 
 - **Selection is now a one-time discard** — unchecking a conversation, plan, note, or reference in CONTEXT now removes it from the working area when you commit, instead of keeping it around to re-check later. Unchecked conversations are consumed (they leave the list) but their content is dropped from the summary; unchecked plans/notes/references have their working-area entries removed without being saved into committed memory. Your own `~/.claude/plans` files and external note sources are never deleted
