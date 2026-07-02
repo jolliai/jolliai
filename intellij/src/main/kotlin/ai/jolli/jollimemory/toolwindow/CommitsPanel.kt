@@ -1540,6 +1540,29 @@ class CommitsPanel(
         return true
     }
 
+    /**
+     * Opens the dedicated branch-level Create PR webview (matches the design mockup).
+     * Builds the view model off the EDT (git/gh), then opens the editor tab — or shows
+     * the "commit first" hint when the branch has no committed memories.
+     */
+    fun openCreatePrView() {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val vm = ai.jolli.jollimemory.toolwindow.views.CreatePrData.build(project)
+            SwingUtilities.invokeLater {
+                if (vm == null) {
+                    com.intellij.openapi.ui.Messages.showInfoMessage(
+                        project,
+                        "No committed memory on this branch yet. Commit first, then create a PR.",
+                        "Create PR",
+                    )
+                } else {
+                    com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project)
+                        .openFile(CreatePrVirtualFile(vm), true)
+                }
+            }
+        }
+    }
+
     private fun viewSummary(commitHash: String) {
         ApplicationManager.getApplication().executeOnPooledThread {
             val summary = service.getSummary(commitHash)
