@@ -81,9 +81,13 @@ class SummaryPanel(
     private val transcriptHashSet = mutableSetOf<String>()
     private val planTranslateSet = mutableSetOf<String>()
     private val cwd: String
+    private val service = project.getService(JolliMemoryService::class.java)
+    // Refresh when a PR is created/updated or a memory is shared elsewhere (the Create PR
+    // view or the Commits list), so this memory's PR section + "Share in Jolli" state stay
+    // in sync — they read the same branch PR + this summary's jolliDocUrl.
+    private val memoryStateListener: () -> Unit = { onMemoryStateChanged() }
 
     init {
-        val service = project.getService(JolliMemoryService::class.java)
         cwd = service?.mainRepoRoot ?: project.basePath ?: ""
         val gitOps = service?.getGitOps()
         val git = gitOps ?: GitOps(cwd)
@@ -91,6 +95,27 @@ class SummaryPanel(
         refreshTranscriptHashes()
         refreshPlanTranslateSet()
         add(createContent(), BorderLayout.CENTER)
+        if (!readOnly) service?.addMemoryStateListener(memoryStateListener)
+    }
+
+    /**
+     * Reloads this commit's summary from the store (so a share done elsewhere shows its
+     * fresh jolliDocUrl) and re-checks the branch PR, then re-renders — keeping this view
+     * in sync with the Create PR view and the Commits list.
+     */
+    private fun onMemoryStateChanged() {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val fresh = try {
+                service?.getSummary(currentSummary.commitHash)
+            } catch (_: Exception) {
+                null
+            }
+            ApplicationManager.getApplication().invokeLater {
+                if (fresh != null) currentSummary = fresh
+                refreshHtml()
+                handleCheckPrStatus()
+            }
+        }
     }
 
     private fun createContent(): JComponent {
@@ -161,6 +186,7 @@ class SummaryPanel(
     }
 
     fun dispose() {
+        service?.removeMemoryStateListener(memoryStateListener)
         jsQuery?.dispose()
         browser?.dispose()
     }
@@ -316,6 +342,8 @@ class SummaryPanel(
                         val verb = if (summary.jolliDocUrl != null) "Updated" else "Pushed"
                         val planMsg = if (res.planCount > 0) " (with ${res.planCount} plan${if (res.planCount > 1) "s" else ""})" else ""
                         Messages.showInfoMessage(project, "$verb on Jolli Space$planMsg.", "Push Successful")
+                        // This memory is now shared — let the Create PR view + Commits list update.
+                        service?.notifyMemoryStateChanged()
                     }
                 } catch (e: JolliApiClient.BindingRequiredError) {
                     if (retried) {
@@ -932,6 +960,8 @@ class SummaryPanel(
                 ApplicationManager.getApplication().invokeLater {
                     postToWebview("prCreated", mapOf("url" to prUrl))
                     handleCheckPrStatus()
+                    // A PR now exists for the branch — sync the Create PR view + Commits list.
+                    service?.notifyMemoryStateChanged()
                 }
             } catch (e: Exception) {
                 ApplicationManager.getApplication().invokeLater {
@@ -976,6 +1006,7 @@ class SummaryPanel(
                 ApplicationManager.getApplication().invokeLater {
                     postToWebview("prUpdated", mapOf("url" to pr.url))
                     handleCheckPrStatus()
+                    service?.notifyMemoryStateChanged()
                 }
             } catch (e: Exception) {
                 ApplicationManager.getApplication().invokeLater {

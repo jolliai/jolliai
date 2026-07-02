@@ -124,6 +124,7 @@ class CommitsPanel(
     private var foreignEntries: List<KBDataCache.KBEntry> = emptyList()
 
     private val statusListener: () -> Unit = { SwingUtilities.invokeLater { refresh() } }
+    private val memoryStateListener: () -> Unit = { SwingUtilities.invokeLater { refresh() } }
     private val messageBusConnection: MessageBusConnection = project.messageBus.connect()
     private var gitChangeDebounceTimer: Timer? = null
 
@@ -161,6 +162,10 @@ class CommitsPanel(
         border = JBUI.Borders.empty(8)
 
         service.addStatusListener(statusListener)
+        // Refresh when a PR is created/updated or a memory is shared elsewhere (memory
+        // summary or Create PR view), so the per-commit PR / Jolli-shared badges stay in
+        // sync — all read the same branch PR + summary jolliDocUrl.
+        service.addMemoryStateListener(memoryStateListener)
 
         // Subscribe directly to git repository changes (new commits, branch switches).
         // The service's status listener alone may not reliably trigger panel refresh
@@ -1813,6 +1818,7 @@ class CommitsPanel(
     override fun dispose() {
         dismissHoverPopup()
         service.removeStatusListener(statusListener)
+        service.removeMemoryStateListener(memoryStateListener)
         gitChangeDebounceTimer?.stop()
         messageBusConnection.disconnect()
     }

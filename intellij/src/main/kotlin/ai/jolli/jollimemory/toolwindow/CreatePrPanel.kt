@@ -63,13 +63,35 @@ class CreatePrPanel(
     private val gson = Gson()
     private val store: SummaryStore
     private val cwd: String
+    private val service = project.getService(JolliMemoryService::class.java)
+    // Refresh when a PR is created/updated or a memory is shared elsewhere (a memory
+    // summary or the Commits list) so this branch-level view's PR mode + per-memory
+    // "shared" badges stay in sync with the single branch PR + each summary's jolliDocUrl.
+    private val memoryStateListener: () -> Unit = { onMemoryStateChanged() }
 
     init {
-        val service = project.getService(JolliMemoryService::class.java)
         cwd = service?.mainRepoRoot ?: project.basePath ?: ""
         val git = service?.getGitOps() ?: GitOps(cwd)
         store = SummaryStore(cwd, git, StorageFactory.create(git, cwd))
         add(createContent(), BorderLayout.CENTER)
+        service?.addMemoryStateListener(memoryStateListener)
+    }
+
+    /** Rebuilds the view model from fresh data (PR lookup + summaries) and re-renders. */
+    private fun onMemoryStateChanged() {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val refreshed = try {
+                CreatePrData.build(project)
+            } catch (_: Exception) {
+                null
+            }
+            if (refreshed != null) {
+                ApplicationManager.getApplication().invokeLater {
+                    vm = refreshed
+                    refreshHtml()
+                }
+            }
+        }
     }
 
     private fun createContent(): JComponent {
@@ -125,6 +147,7 @@ class CreatePrPanel(
     }
 
     fun dispose() {
+        service?.removeMemoryStateListener(memoryStateListener)
         jsQuery?.dispose()
         browser?.dispose()
     }
@@ -227,6 +250,9 @@ class CreatePrPanel(
                         } else {
                             postToWebview("prCreated", mapOf("text" to "Pull request ready.$shareMsg"))
                         }
+                        // Tell the other surfaces (Commits list, open memory summaries) a PR
+                        // now exists and memories were shared, so they re-read and match.
+                        service?.notifyMemoryStateChanged()
                     }
                 } catch (e: Exception) {
                     ApplicationManager.getApplication().invokeLater {
