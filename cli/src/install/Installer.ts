@@ -80,6 +80,7 @@ import {
 	removePostRewriteHook,
 	removePrepareMsgHook,
 } from "./GitHookInstaller.js";
+import { installGlobalInstructions } from "./GlobalInstructionsInstaller.js";
 import type { HookOpResult } from "./HookSettingsHelper.js";
 import {
 	buildRegistrars,
@@ -285,6 +286,21 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			opencode: opencodeDetectedOnce,
 			copilot: copilotDetectedOnce,
 			copilotChat: copilotChatDetectedOnce,
+		});
+
+		// Prefer Jolli's skills by default: write a standing rule into each
+		// enabled host's GLOBAL instruction file. Machine-global (one per host,
+		// shared by every repo) — mirrors registerGlobalMcpHosts above, and like
+		// it, uninstall deliberately leaves the block in place. Gating matches the
+		// hooks: gemini/codex are detection-gated (never create their file on a
+		// machine without them), while Claude has no filesystem detector and is
+		// gated only on `claudeEnabled` — so `~/.claude/CLAUDE.md` is created
+		// whenever Claude isn't explicitly disabled, consistent with the rest of
+		// the installer treating Claude as the primary host.
+		await installGlobalInstructions({
+			claude: config.claudeEnabled !== false,
+			gemini: geminiDetectedOnce && config.geminiEnabled !== false,
+			codex: codexDetectedOnce && config.codexEnabled !== false,
 		});
 
 		// Git hooks are shared across all worktrees — install once
