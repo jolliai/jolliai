@@ -99,6 +99,9 @@ object CreatePrScriptBuilder {
     show('prBody', !on); show('prBodyInput', on);
     var eb = document.getElementById('cmdEdit');
     if (eb) eb.textContent = on ? 'Done' : 'Edit';
+    // Editing is itself a change, so re-enable a dimmed "Up to date" submit button
+    // once the user starts editing the title/body.
+    if (on) { var cb = document.getElementById('cmdCreatePr'); if (cb) cb.disabled = false; }
     if (!on) {
       var t = document.getElementById('prTitleInput'), d = document.getElementById('prTitleDisplay');
       if (t && d) d.textContent = t.value;
