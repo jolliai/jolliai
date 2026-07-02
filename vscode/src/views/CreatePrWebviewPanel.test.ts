@@ -18,7 +18,7 @@ const created: Array<{
 	onDispose: () => void;
 	reveal: ReturnType<typeof vi.fn>;
 	dispose: ReturnType<typeof vi.fn>;
-	webview: { html: string; postMessage: ReturnType<typeof vi.fn>; onDidReceiveMessage: (cb: (m: unknown) => void) => { dispose: () => void } };
+	webview: { html: string; cspSource: string; asWebviewUri: (u: { toString(): string }) => { toString(): string }; postMessage: ReturnType<typeof vi.fn>; onDidReceiveMessage: (cb: (m: unknown) => void) => { dispose: () => void } };
 }> = [];
 vi.mock("vscode", () => ({
 	ViewColumn: { One: 1, Active: -1 },
@@ -48,6 +48,8 @@ vi.mock("vscode", () => ({
 				onDispose: () => {},
 				webview: {
 					html: "",
+					cspSource: "vscode-webview://test",
+					asWebviewUri: (u: { toString(): string }) => u,
 					postMessage: vi.fn(),
 					onDidReceiveMessage: (cb: (m: unknown) => void) => {
 						rec.onMsg = cb;
