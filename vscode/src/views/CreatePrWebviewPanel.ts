@@ -53,6 +53,7 @@ export class CreatePrWebviewPanel {
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
 		private readonly workspaceRoot: string,
+		private readonly extensionUri: vscode.Uri,
 	) {
 		this.panel.onDidDispose(() => {
 			CreatePrWebviewPanel.current = undefined;
@@ -108,7 +109,7 @@ export class CreatePrWebviewPanel {
 			vscode.ViewColumn.One,
 			{ enableScripts: true, localResourceRoots: [extensionUri], retainContextWhenHidden: true },
 		);
-		const self = new CreatePrWebviewPanel(panel, workspaceRoot);
+		const self = new CreatePrWebviewPanel(panel, workspaceRoot, extensionUri);
 		CreatePrWebviewPanel.current = self;
 		self.render(result);
 	}
@@ -123,7 +124,13 @@ export class CreatePrWebviewPanel {
 
 	private render(vm: CreatePrViewModel): void {
 		this.vm = vm;
-		this.panel.webview.html = buildCreatePrHtml(vm, randomBytes(16).toString("hex"));
+		const codiconCssUri = this.panel.webview.asWebviewUri(
+			vscode.Uri.joinPath(this.extensionUri, "assets", "codicons", "codicon.css"),
+		);
+		this.panel.webview.html = buildCreatePrHtml(vm, randomBytes(16).toString("hex"), {
+			cspSource: this.panel.webview.cspSource,
+			codiconCssUri: codiconCssUri.toString(),
+		});
 	}
 
 	private async handle(m: Msg): Promise<void> {

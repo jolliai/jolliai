@@ -189,8 +189,23 @@ describe("buildCreatePrHtml", () => {
 		const html = buildCreatePrHtml(vm, "N");
 		expect(html).toContain("Create Pull Request");
 		expect(html).toContain(">Create PR<");
-		expect(html).toContain("Create with these");
 		expect(html).not.toContain('id="pr-open-link"');
+	});
+
+	it("Edit is a full mode switch: view-mode wrapper, form labels, Cancel button, and toggle script", () => {
+		const html = buildCreatePrHtml(vm, "N");
+		// The read-only content lives in a #view-mode wrapper (visible initially);
+		// the edit form starts hidden.
+		expect(html).toContain('id="view-mode"');
+		expect(html).toContain("edit-form hidden");
+		// The form carries Title/Body labels bound to their inputs.
+		expect(html).toContain('<label class="field-label" for="prTitleInput">Title</label>');
+		expect(html).toContain('<label class="field-label" for="prBodyInput">Body</label>');
+		// Edit mode's action row is Create PR + Cancel.
+		expect(html).toContain('id="cmd-cancel"');
+		// Clicking Edit hides the view and reveals the form; Cancel reverses it.
+		expect(html).toContain("document.getElementById('view-mode').classList.add('hidden')");
+		expect(html).toContain("document.getElementById('view-mode').classList.remove('hidden')");
 	});
 
 	it("update mode (existingPr): heading + buttons say Update and render a clickable PR link", () => {
@@ -200,7 +215,6 @@ describe("buildCreatePrHtml", () => {
 		);
 		expect(html).toContain("Update Pull Request");
 		expect(html).toContain(">Update PR<");
-		expect(html).toContain("Update with these");
 		expect(html).toContain('id="pr-open-link"');
 		expect(html).toContain('data-pr-url="https://github.com/o/r/pull/7"');
 		expect(html).toContain("PR #7");
@@ -229,6 +243,28 @@ describe("buildCreatePrHtml", () => {
 		// responds — without it a double-click runs two push + create flows.
 		expect(html).toContain("if (inFlight) return;");
 		expect(html).toContain("b.disabled = on;");
+	});
+
+	it("omits codicon glyph, stylesheet link and font-src when no assets are supplied", () => {
+		const html = buildCreatePrHtml(vm, "N");
+		expect(html).not.toContain("codicon-git-pull-request");
+		expect(html).not.toContain('rel="stylesheet"');
+		// Tighter nonce-only CSP: no cspSource origin, no font-src directive.
+		expect(html).toContain("style-src 'nonce-N'; script-src 'nonce-N';");
+		expect(html).not.toContain("font-src");
+	});
+
+	it("renders the pull-request glyph, links codicon.css and allowlists it in CSP when assets are supplied", () => {
+		const html = buildCreatePrHtml(vm, "N", {
+			cspSource: "vscode-webview://abc",
+			codiconCssUri: "https://file+.vscode-resource/codicon.css",
+		});
+		// Both submit buttons carry the glyph (matching the design mockup).
+		expect(html.match(/codicon-git-pull-request/g)?.length).toBe(2);
+		expect(html).toContain('<link rel="stylesheet" href="https://file+.vscode-resource/codicon.css" />');
+		// CSP allowlists the asset origin for both the stylesheet and its font.
+		expect(html).toContain("style-src vscode-webview://abc 'nonce-N'");
+		expect(html).toContain("font-src vscode-webview://abc");
 	});
 
 	it("renders a file whose path has no slash using the full path as filename with empty dir", () => {
