@@ -16,6 +16,8 @@ import ai.jolli.jollimemory.core.TopicUpdates
 import ai.jolli.jollimemory.core.TraceContext
 import ai.jolli.jollimemory.core.TranscriptEntry
 import ai.jolli.jollimemory.core.references.SourceId
+import ai.jolli.jollimemory.services.BranchShareSnapshot
+import ai.jolli.jollimemory.services.BranchShareStore
 import ai.jolli.jollimemory.services.JolliApiClient
 import ai.jolli.jollimemory.services.JolliMemoryService
 import ai.jolli.jollimemory.services.JolliShareService
@@ -222,6 +224,7 @@ class SummaryPanel(
         "deleteE2eTest", "savePlan", "removePlan", "translatePlan", "associatePlan",
         "createPrDirect", "createPrWithE2e", "createPr", "updatePr", "saveAllTranscripts", "deleteAllTranscripts",
         "generateRecap", "editRecap", "saveReferenceEdit", "removeReference",
+        "copyShareLink",
     )
 
     private fun dispatchWebviewMessage(json: JsonObject) {
@@ -233,6 +236,11 @@ class SummaryPanel(
         try {
             when (command) {
                 "copyMarkdown" -> handleCopyMarkdown()
+                "copyShareLink" -> handleCopyShareLink(
+                    json.get("access")?.asString ?: "link",
+                    json.get("includeTranscripts")?.asBoolean ?: false,
+                )
+                "exportPdf" -> handleExportPdf()
                 "pushToJolli" -> handlePushToJolli()
                 "editTopic" -> handleEditTopic(json.get("topicIndex").asInt, json.getAsJsonObject("updates"))
                 "deleteTopic" -> handleDeleteTopic(json.get("topicIndex").asInt, json.get("title")?.asString)
@@ -275,6 +283,223 @@ class SummaryPanel(
         val markdown = SummaryMarkdownBuilder.buildMarkdown(currentSummary)
         val clipboard = Toolkit.getDefaultToolkit().systemClipboard
         clipboard.setContents(StringSelection(markdown), null)
+    }
+
+    private fun handleCopyShareLink(access: String, @Suppress("UNUSED_PARAMETER") includeTranscripts: Boolean) {
+        if (access != "link") {
+            postToWebview("shareFailed", mapOf("message" to "This access level is not yet supported."))
+            return
+        }
+
+        val config = SessionTracker.loadConfig(cwd)
+        val apiKey = config.jolliApiKey
+        if (apiKey.isNullOrBlank()) {
+            ApplicationManager.getApplication().invokeLater {
+                Messages.showWarningDialog(project, "Please sign in or configure a Jolli API Key in Settings > Tools > Jolli Memory.", "Missing API Key")
+            }
+            return
+        }
+
+        val service = project.getService(JolliMemoryService::class.java)
+        val git = service?.getGitOps() ?: ai.jolli.jollimemory.bridge.GitOps(cwd)
+        val currentBranch = git.getCurrentBranch()?.trim()
+        if (currentBranch.isNullOrBlank()) {
+            postToWebview("shareFailed", mapOf("message" to "Could not determine current branch."))
+            return
+        }
+
+        // Check for existing fresh share (matching head commit hash)
+        val storeKey = BranchShareStore.branchKey(currentBranch)
+        val existing = BranchShareStore.get(cwd, storeKey)
+        if (existing != null && existing.shareUrl != null && existing.headCommitHash == currentSummary.commitHash) {
+            val clipboard = Toolkit.getDefaultToolkit().systemClipboard
+            clipboard.setContents(StringSelection(existing.shareUrl), null)
+            postToWebview("shareLinkCopied")
+            return
+        }
+
+        postToWebview("shareStarted")
+
+        ApplicationManager.getApplication().executeOnPooledThread {
+            TraceContext.withTrace {
+                try {
+                    // Public confirmation dialog (first time only)
+                    if (!BranchShareStore.isPublicConfirmed(cwd, currentBranch)) {
+                        val confirmed = java.util.concurrent.atomic.AtomicBoolean(false)
+                        val latch = java.util.concurrent.CountDownLatch(1)
+                        ApplicationManager.getApplication().invokeLater {
+                            val choice = Messages.showYesNoDialog(
+                                project,
+                                "This will create a public share link. Anyone with the link will be able to view this branch's memories.\n\nContinue?",
+                                "Share Branch Publicly",
+                                Messages.getQuestionIcon(),
+                            )
+                            confirmed.set(choice == Messages.YES)
+                            latch.countDown()
+                        }
+                        latch.await()
+                        if (!confirmed.get()) {
+                            ApplicationManager.getApplication().invokeLater {
+                                postToWebview("shareCancelled")
+                            }
+                            return@withTrace
+                        }
+                        BranchShareStore.markPublicConfirmed(cwd, currentBranch)
+                    }
+
+                    // Assemble snapshot
+                    val snapshot = BranchShareSnapshot.assemble(service!!, currentBranch)
+                    if (snapshot == null) {
+                        ApplicationManager.getApplication().invokeLater {
+                            postToWebview("shareFailed", mapOf("message" to "No summaries found on this branch to share."))
+                        }
+                        return@withTrace
+                    }
+
+                    // Build payload
+                    val repoUrl = GitRemoteUtils.getCanonicalRepoUrl(cwd)
+                    val repoName = GitRemoteUtils.deriveRepoNameFromUrl(repoUrl)
+                    val branchSlug = GitRemoteUtils.sanitizeBranchSlug(currentBranch)
+
+                    val payload = JolliApiClient.BranchSharePayload(
+                        repoUrl = repoUrl,
+                        repoName = repoName,
+                        branch = currentBranch,
+                        branchSlug = branchSlug,
+                        kind = "branch",
+                        headCommitHash = snapshot.headCommitHash,
+                        commitHashes = snapshot.commitHashes,
+                        decisionCount = snapshot.decisionCount,
+                        scope = mapOf("summary" to true, "plans" to true, "transcripts" to false),
+                        content = snapshot.content,
+                        visibility = "public",
+                    )
+
+                    val result = JolliApiClient.createBranchShare(apiKey, payload)
+
+                    // Persist locally
+                    BranchShareStore.put(cwd, storeKey, BranchShareStore.BranchShareRecord(
+                        shareId = result.shareId,
+                        shareUrl = result.shareUrl,
+                        token8 = result.token.take(8),
+                        headCommitHash = snapshot.headCommitHash,
+                        expiresAt = result.expiresAt,
+                        decisionCount = snapshot.decisionCount,
+                    ))
+
+                    // Copy to clipboard
+                    val clipboard = Toolkit.getDefaultToolkit().systemClipboard
+                    clipboard.setContents(StringSelection(result.shareUrl), null)
+
+                    ApplicationManager.getApplication().invokeLater {
+                        postToWebview("shareLinkCopied")
+                    }
+                } catch (e: JolliApiClient.PluginOutdatedError) {
+                    ApplicationManager.getApplication().invokeLater {
+                        postToWebview("shareFailed")
+                        Messages.showErrorDialog(project, "Share failed — your JolliMemory plugin is outdated. Please update.", "Plugin Outdated")
+                    }
+                } catch (e: JolliApiClient.UnauthorizedError) {
+                    ApplicationManager.getApplication().invokeLater {
+                        postToWebview("shareFailed")
+                        Messages.showErrorDialog(project, "Share failed: ${e.message}", "Share Error")
+                    }
+                } catch (e: Exception) {
+                    ApplicationManager.getApplication().invokeLater {
+                        postToWebview("shareFailed", mapOf("message" to (e.message ?: "Unknown error")))
+                        Messages.showErrorDialog(project, "Share failed: ${e.message}", "Share Error")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun handleExportPdf() {
+        jmLog.info("handleExportPdf: started")
+        ApplicationManager.getApplication().invokeLater {
+            val msg = currentSummary.commitMessage
+                .take(50)
+                .replace(Regex("[^a-zA-Z0-9_\\- ]"), "")
+                .trim()
+                .replace(Regex("\\s+"), "-")
+                .ifEmpty { "memory" }
+            val hash = currentSummary.commitHash.take(8)
+            val suggestedName = "$msg-$hash.pdf"
+
+            val descriptor = com.intellij.openapi.fileChooser.FileSaverDescriptor(
+                "Export as PDF", "Choose where to save the PDF", "pdf"
+            )
+            val dialog = com.intellij.openapi.fileChooser.FileChooserFactory.getInstance()
+                .createSaveFileDialog(descriptor, project)
+            val wrapper = dialog.save(suggestedName) ?: run {
+                jmLog.info("handleExportPdf: user cancelled save dialog")
+                return@invokeLater
+            }
+
+            val outputPath = wrapper.file.absolutePath
+            jmLog.info("handleExportPdf: outputPath=$outputPath")
+            val markdown = SummaryMarkdownBuilder.buildMarkdown(currentSummary)
+            jmLog.info("handleExportPdf: markdown length=${markdown.length}")
+            val printHtml = buildPrintHtml(markdown)
+            jmLog.info("handleExportPdf: printHtml length=${printHtml.length}")
+
+            try {
+                java.io.FileOutputStream(outputPath).use { os ->
+                    val builder = com.openhtmltopdf.pdfboxout.PdfRendererBuilder()
+                    builder.useFastMode()
+                    builder.withHtmlContent(printHtml, null)
+                    builder.toStream(os)
+                    builder.run()
+                }
+                jmLog.info("handleExportPdf: PDF written to $outputPath")
+                Messages.showInfoMessage(project, "PDF saved to $outputPath", "Export Complete")
+            } catch (e: Exception) {
+                jmLog.error("handleExportPdf: failed to write PDF", e)
+                Messages.showErrorDialog(project, "Failed to export PDF: ${e.message}", "Export Error")
+            }
+        }
+    }
+
+    /** Converts markdown to a simple styled XHTML document for PDF export. */
+    private fun buildPrintHtml(markdown: String): String {
+        // Strip emoji characters (surrogate pairs and common emoji ranges) before conversion
+        val cleaned = markdown.replace(Regex("[\\x{1F300}-\\x{1FAFF}\\x{2600}-\\x{27BF}\\x{FE00}-\\x{FE0F}\\x{200D}\\x{26A1}\\x{2705}]"), "").trim()
+
+        val intermediate = cleaned
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace(Regex("^### (.+)$", RegexOption.MULTILINE), "<h3>\$1</h3>")
+            .replace(Regex("^## (.+)$", RegexOption.MULTILINE), "<h2>\$1</h2>")
+            .replace(Regex("^# (.+)$", RegexOption.MULTILINE), "<h1>\$1</h1>")
+            .replace(Regex("^---$", RegexOption.MULTILINE), "<hr/>")
+            .replace(Regex("\\*\\*(.+?)\\*\\*"), "<strong>\$1</strong>")
+            .replace(Regex("\\*(.+?)\\*"), "<em>\$1</em>")
+            .replace(Regex("_(.+?)_"), "<em>\$1</em>")
+            .replace(Regex("`([^`]+)`"), "<code>\$1</code>")
+            .replace(Regex("^(\\d+)\\. (.+)$", RegexOption.MULTILINE), "<li>\$2</li>")
+            .replace(Regex("^- (.+)$", RegexOption.MULTILINE), "<li>\$1</li>")
+            .replace(Regex("\\[([^]]+)]\\(([^)]+)\\)"), "<a href=\"\$2\">\$1</a>")
+            .replace(Regex("\n\n+"), "\n<br/><br/>\n")
+
+        // Wrap consecutive <li> runs in <ul> tags
+        val body = intermediate.replace(Regex("((<li>.*?</li>\\s*)+)")) { match ->
+            "<ul>${match.value}</ul>"
+        }
+
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\">" +
+            "<head><meta charset=\"utf-8\"/><style>" +
+            "body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; font-size: 14px; line-height: 1.6; color: #24292e; }" +
+            "h1 { font-size: 24px; border-bottom: 1px solid #e1e4e8; padding-bottom: 8px; }" +
+            "h2 { font-size: 20px; margin-top: 24px; border-bottom: 1px solid #e1e4e8; padding-bottom: 6px; }" +
+            "h3 { font-size: 16px; margin-top: 20px; }" +
+            "hr { border: none; border-top: 1px solid #e1e4e8; margin: 24px 0; }" +
+            "code { background: #f6f8fa; padding: 2px 6px; border-radius: 3px; font-size: 13px; }" +
+            "li { margin: 4px 0; }" +
+            "a { color: #0366d6; text-decoration: none; }" +
+            "</style></head>" +
+            "<body>$body</body></html>"
     }
 
     private fun handlePushToJolli(retried: Boolean = false) {

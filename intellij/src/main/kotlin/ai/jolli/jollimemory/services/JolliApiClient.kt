@@ -512,6 +512,209 @@ object JolliApiClient {
         }
     }
 
+    // ── Branch Share endpoints ────────────────────────────────────────────
+
+    /** Payload sent to POST /api/share/branch. */
+    data class BranchSharePayload(
+        val repoUrl: String,
+        val repoName: String,
+        val branch: String,
+        val branchSlug: String,
+        val kind: String,
+        val headCommitHash: String,
+        val commitHashes: List<String>,
+        val decisionCount: Int,
+        val scope: Map<String, Boolean>,
+        val content: String,
+        val visibility: String,
+    )
+
+    /** Response from a successful branch share create/refresh. */
+    data class BranchShareResult(
+        val shareId: String,
+        val token: String,
+        val shareUrl: String,
+        val expiresAt: String?,
+        val visibility: String,
+    )
+
+    /** Response from a successful branch share expiry update. */
+    data class ShareExpiryResult(val expiresAt: String?)
+
+    /**
+     * POST /api/share/branch
+     *
+     * Creates or refreshes a branch share (idempotent by repo+branch+kind).
+     */
+    fun createBranchShare(apiKey: String, payload: BranchSharePayload): BranchShareResult {
+        val keyMeta = parseJolliApiKey(apiKey)
+        val resolvedBaseUrl = keyMeta?.u
+            ?: throw RuntimeException(
+                "Jolli site URL could not be determined from API key. " +
+                    "Please regenerate your Jolli API Key."
+            )
+
+        val parsed = parseBaseUrl(resolvedBaseUrl)
+        val targetUri = URI.create("${parsed.origin}/api/share/branch")
+
+        val body = gson.toJson(payload)
+        val requestBuilder = HttpRequest.newBuilder()
+            .uri(targetUri)
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer $apiKey")
+            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
+            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .timeout(Duration.ofSeconds(60))
+
+        if (parsed.tenantSlug != null) {
+            requestBuilder.header("x-tenant-slug", parsed.tenantSlug)
+        }
+        if (keyMeta.o != null) {
+            requestBuilder.header("x-org-slug", keyMeta.o)
+        }
+        requestBuilder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
+
+        val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
+        val raw = response.body() ?: ""
+        val statusCode = response.statusCode()
+
+        if (statusCode == 426) {
+            throw PluginOutdatedError("Plugin version is outdated. Please update to the latest version.")
+        }
+        if (statusCode == 401 || statusCode == 403) {
+            throw UnauthorizedError("Invalid or disabled API key")
+        }
+        if (statusCode !in 200..299) {
+            throw RuntimeException("Branch share failed (HTTP $statusCode): ${raw.take(200)}")
+        }
+
+        if (raw.isBlank()) {
+            throw RuntimeException("Branch share returned empty response (HTTP $statusCode)")
+        }
+
+        // Detect non-JSON responses (e.g. HTML login pages, redirects)
+        val trimmed = raw.trimStart()
+        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+            log.warn("Branch share returned non-JSON (HTTP %d): %s", statusCode, raw.take(500))
+            // Write full response to a temp file for debugging
+            try {
+                val debugFile = java.io.File(System.getProperty("java.io.tmpdir"), "jolli-share-debug.txt")
+                debugFile.writeText("HTTP $statusCode\nURI: ${parsed.origin}/api/share/branch\n\n$raw")
+                log.warn("Full response written to: %s", debugFile.absolutePath)
+            } catch (_: Exception) { /* ignore */ }
+            // Escape angle brackets so IntelliJ dialog renders them
+            val escaped = raw.take(300).replace("<", "&lt;").replace(">", "&gt;")
+            throw RuntimeException(
+                "Branch share returned non-JSON (HTTP $statusCode). Check ${System.getProperty("java.io.tmpdir")}/jolli-share-debug.txt for full response. Preview: $escaped"
+            )
+        }
+
+        return try {
+            @Suppress("UNCHECKED_CAST")
+            val json = gson.fromJson(raw, Map::class.java) as Map<String, Any?>
+            // shareId is a numeric auto-increment ID on the server side
+            val shareId = json["shareId"]?.let {
+                when (it) {
+                    is Number -> it.toLong().toString()
+                    else -> it.toString()
+                }
+            } ?: ""
+            BranchShareResult(
+                shareId = shareId,
+                token = json["token"] as? String ?: "",
+                shareUrl = json["shareUrl"] as? String ?: "",
+                expiresAt = json["expiresAt"] as? String,
+                visibility = json["visibility"] as? String ?: "public",
+            )
+        } catch (e: Exception) {
+            log.warn("Branch share JSON parse failed (HTTP %d): %s — body: %s", statusCode, e.message, raw.take(500))
+            throw RuntimeException("Invalid JSON from branch share (HTTP $statusCode): ${e.message} — ${raw.take(300)}")
+        }
+    }
+
+    /**
+     * DELETE /api/share/branch/:shareId
+     *
+     * Revokes (soft-deletes) a branch share. Accepts 200/204/404 as success (idempotent).
+     */
+    fun revokeBranchShare(apiKey: String, shareId: String) {
+        val keyMeta = parseJolliApiKey(apiKey)
+        val resolvedBaseUrl = keyMeta?.u
+            ?: throw RuntimeException("Jolli site URL could not be determined from API key.")
+
+        val parsed = parseBaseUrl(resolvedBaseUrl)
+        val targetUri = URI.create("${parsed.origin}/api/share/branch/$shareId")
+
+        val requestBuilder = HttpRequest.newBuilder()
+            .uri(targetUri)
+            .header("Authorization", "Bearer $apiKey")
+            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
+            .DELETE()
+            .timeout(Duration.ofSeconds(30))
+
+        if (parsed.tenantSlug != null) {
+            requestBuilder.header("x-tenant-slug", parsed.tenantSlug)
+        }
+        if (keyMeta.o != null) {
+            requestBuilder.header("x-org-slug", keyMeta.o)
+        }
+        requestBuilder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
+
+        val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
+        val statusCode = response.statusCode()
+
+        if (statusCode != 200 && statusCode != 204 && statusCode != 404) {
+            throw RuntimeException("Revoke share failed with status $statusCode")
+        }
+    }
+
+    /**
+     * PATCH /api/share/branch/:shareId
+     *
+     * Updates the expiry of a branch share.
+     */
+    fun updateBranchShareExpiry(apiKey: String, shareId: String, expiresAt: String): ShareExpiryResult {
+        val keyMeta = parseJolliApiKey(apiKey)
+        val resolvedBaseUrl = keyMeta?.u
+            ?: throw RuntimeException("Jolli site URL could not be determined from API key.")
+
+        val parsed = parseBaseUrl(resolvedBaseUrl)
+        val targetUri = URI.create("${parsed.origin}/api/share/branch/$shareId")
+
+        val body = gson.toJson(mapOf("expiresAt" to expiresAt))
+        val requestBuilder = HttpRequest.newBuilder()
+            .uri(targetUri)
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer $apiKey")
+            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
+            .method("PATCH", HttpRequest.BodyPublishers.ofString(body))
+            .timeout(Duration.ofSeconds(30))
+
+        if (parsed.tenantSlug != null) {
+            requestBuilder.header("x-tenant-slug", parsed.tenantSlug)
+        }
+        if (keyMeta.o != null) {
+            requestBuilder.header("x-org-slug", keyMeta.o)
+        }
+        requestBuilder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
+
+        val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
+        val raw = response.body() ?: ""
+        val statusCode = response.statusCode()
+
+        if (statusCode !in 200..299) {
+            throw RuntimeException("Update share expiry failed (HTTP $statusCode): ${raw.take(200)}")
+        }
+
+        return try {
+            @Suppress("UNCHECKED_CAST")
+            val json = gson.fromJson(raw, Map::class.java) as Map<String, Any?>
+            ShareExpiryResult(expiresAt = json["expiresAt"] as? String)
+        } catch (_: Exception) {
+            throw RuntimeException("Invalid JSON from update expiry (HTTP $statusCode): ${raw.take(200)}")
+        }
+    }
+
     // ── Internal helpers ────────────────────────────────────────────────────
 
     /**

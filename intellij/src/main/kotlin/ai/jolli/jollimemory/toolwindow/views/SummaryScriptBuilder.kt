@@ -105,6 +105,107 @@ object SummaryScriptBuilder {
     });
   }
 
+  // ── Share popover ──
+  var shareModal = document.getElementById('shareModal');
+  var sharePopover = document.getElementById('sharePopover');
+  var shareBtn = document.getElementById('shareBtn');
+
+  function openShareModal() {
+    if (!shareModal || !sharePopover || !shareBtn) return;
+    var rect = shareBtn.getBoundingClientRect();
+    sharePopover.style.top = (rect.bottom + 6) + 'px';
+    sharePopover.style.right = (document.documentElement.clientWidth - rect.right) + 'px';
+    shareModal.classList.add('visible');
+  }
+  function closeShareModal() {
+    if (shareModal) shareModal.classList.remove('visible');
+  }
+
+  if (shareBtn) shareBtn.addEventListener('click', openShareModal);
+  if (shareModal) {
+    shareModal.addEventListener('click', function(e) {
+      if (e.target === shareModal) closeShareModal();
+    });
+  }
+
+  // General access custom dropdown
+  var spAccessDropdown = document.getElementById('spAccessDropdown');
+  var spAccessToggle = document.getElementById('spAccessToggle');
+  var spAccessLabel = document.getElementById('spAccessLabel');
+  var spAccessMenu = document.getElementById('spAccessMenu');
+  var spGenDesc = document.getElementById('spGenDesc');
+  var spAccessValue = 'link';
+  var ACCESS_DESCRIPTIONS = {
+    org: 'Anyone in your organization can open this.',
+    link: 'Anyone with the link can open this.',
+    restricted: 'Only people you add above can open this.'
+  };
+  if (spAccessToggle && spAccessDropdown) {
+    spAccessToggle.addEventListener('click', function(e) {
+      e.stopPropagation();
+      spAccessDropdown.classList.toggle('open');
+    });
+  }
+  if (spAccessMenu) {
+    spAccessMenu.addEventListener('click', function(e) {
+      var item = e.target.closest('.sp-access-item');
+      if (!item) return;
+      var items = spAccessMenu.querySelectorAll('.sp-access-item');
+      for (var i = 0; i < items.length; i++) items[i].classList.remove('selected');
+      item.classList.add('selected');
+      spAccessValue = item.getAttribute('data-value') || 'link';
+      if (spAccessLabel) spAccessLabel.textContent = item.textContent;
+      if (spGenDesc) spGenDesc.textContent = ACCESS_DESCRIPTIONS[spAccessValue] || '';
+      if (spAccessDropdown) spAccessDropdown.classList.remove('open');
+    });
+  }
+  document.addEventListener('click', function() {
+    if (spAccessDropdown) spAccessDropdown.classList.remove('open');
+  });
+
+  // Copy link button
+  var spCopyLink = document.getElementById('spCopyLink');
+  var spCopyLinkOriginal = spCopyLink ? spCopyLink.innerHTML : '';
+  if (spCopyLink) {
+    spCopyLink.addEventListener('click', function() {
+      var transcripts = document.getElementById('spTranscripts');
+      var includeTranscripts = transcripts ? transcripts.checked : false;
+      jmSend({ command: 'copyShareLink', access: spAccessValue, includeTranscripts: includeTranscripts });
+    });
+  }
+
+  // Share status listener
+  window.addEventListener('jollimemory', function(e) {
+    var msg = e.detail;
+    if (!spCopyLink) return;
+    if (msg.command === 'shareStarted') {
+      spCopyLink.textContent = 'Sharing...';
+      spCopyLink.disabled = true;
+    } else if (msg.command === 'shareLinkCopied') {
+      spCopyLink.textContent = 'Copied \u2713';
+      spCopyLink.disabled = false;
+      setTimeout(function() { spCopyLink.innerHTML = spCopyLinkOriginal; }, 1500);
+    } else if (msg.command === 'shareFailed') {
+      spCopyLink.innerHTML = spCopyLinkOriginal;
+      spCopyLink.disabled = false;
+    } else if (msg.command === 'shareCancelled') {
+      spCopyLink.innerHTML = spCopyLinkOriginal;
+      spCopyLink.disabled = false;
+    }
+  });
+
+  // Search input scaffolding (no backend yet — show empty state on focus)
+  var spInvite = document.getElementById('spInvite');
+  var spSuggest = document.getElementById('spSuggest');
+  if (spInvite && spSuggest) {
+    spInvite.addEventListener('focus', function() {
+      spSuggest.classList.add('on');
+    });
+    spInvite.addEventListener('blur', function() {
+      setTimeout(function() { spSuggest.classList.remove('on'); }, 170);
+    });
+  }
+
   // Push to Jolli button
   var pushBtn = document.getElementById('pushJolliBtn');
   if (pushBtn) {
@@ -1435,8 +1536,9 @@ ${buildPrMessageScript()}
     });
   }
   document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape' && transcriptModal && transcriptModal.classList.contains('visible')) {
-      closeModal();
+    if (e.key === 'Escape') {
+      if (shareModal && shareModal.classList.contains('visible')) { closeShareModal(); return; }
+      if (transcriptModal && transcriptModal.classList.contains('visible')) { closeModal(); return; }
     }
   });
   if (modalSaveBtn) {

@@ -50,6 +50,7 @@ dependencies {
     compileOnly("com.google.code.gson:gson:2.12.1")
     compileOnly("org.jetbrains.kotlin:kotlin-stdlib")
     implementation("org.xerial:sqlite-jdbc:3.49.1.0")
+    implementation("com.openhtmltopdf:openhtmltopdf-pdfbox:1.0.10")
     hooksRuntime("com.google.code.gson:gson:2.12.1")
     hooksRuntime("org.jetbrains.kotlin:kotlin-stdlib:2.1.20")
     hooksRuntime("org.xerial:sqlite-jdbc:3.49.1.0")
