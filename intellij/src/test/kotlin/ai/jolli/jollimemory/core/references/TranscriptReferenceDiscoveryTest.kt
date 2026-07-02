@@ -94,8 +94,10 @@ class TranscriptReferenceDiscoveryTest {
 			entry!!.nativeId shouldBe "PROJ-42"
 			entry.title shouldBe "Test issue"
 			entry.source shouldBe SourceId.linear
-			// Branch is stamped at capture (temp dir is not a git repo → "unknown").
-			entry.branch shouldBe "unknown"
+			// Temp dir is not a git repo → getCurrentBranchSafe returns "unknown", which
+			// is left OFF the row (branch = null) rather than written literally. Writing
+			// "unknown" would exclude the reference from every branch's summary prompt.
+			entry.branch shouldBe null
 		}
 
 		@Test
@@ -163,6 +165,51 @@ class TranscriptReferenceDiscoveryTest {
 			val secondLast = TranscriptReferenceDiscovery.scanReferencesFrom(path, firstLast, cwd, TranscriptSource.claude)
 			secondLast shouldBe firstLast
 			plansRegistry.references shouldBe null
+		}
+
+		@Test
+		fun `preserves an existing real branch when the git lookup is unknown`() {
+			// Seed a row stamped with a real branch (as if captured on feature/x).
+			plansRegistry = PlansRegistry(
+				references = mapOf(
+					"linear:PROJ-42" to ReferenceEntry(
+						source = SourceId.linear,
+						nativeId = "PROJ-42",
+						title = "Old title",
+						url = "https://linear.app/x/issue/PROJ-42",
+						sourcePath = "",
+						addedAt = "t",
+						updatedAt = "t",
+						sourceToolName = "mcp__linear__get_issue",
+						branch = "feature/x",
+					),
+				),
+			)
+			val path = writeTranscript(
+				toolUseLine("tu1", "mcp__linear__get_issue"),
+				toolResultLine("tu1", LINEAR_PAYLOAD),
+			)
+
+			// Non-git temp dir → lookup is "unknown"; the re-upsert must keep the
+			// existing branch rather than clobber it with a summary-excluding value.
+			TranscriptReferenceDiscovery.scanReferencesFrom(path, 0, cwd, TranscriptSource.claude)
+
+			plansRegistry.references!!["linear:PROJ-42"]!!.branch shouldBe "feature/x"
+		}
+
+		@Test
+		fun `does not release the lock when it was not acquired`() {
+			// When another writer (PostCommitHook worker / parallel StopHook) holds the
+			// lock, acquire fails — we must NOT release it, or we'd delete their lock.
+			every { SessionTracker.acquireLock(any()) } returns false
+			val path = writeTranscript(
+				toolUseLine("tu1", "mcp__linear__get_issue"),
+				toolResultLine("tu1", LINEAR_PAYLOAD),
+			)
+
+			TranscriptReferenceDiscovery.scanReferencesFrom(path, 0, cwd, TranscriptSource.claude)
+
+			io.mockk.verify(exactly = 0) { SessionTracker.releaseLock(any()) }
 		}
 
 		@Test
