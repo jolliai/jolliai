@@ -84,27 +84,49 @@ object CreatePrScriptBuilder {
   })();
 
   var inFlight = false;
-  function submitButtons() {
-    return ['cmdCreatePr', 'cmdCreateEdited'].map(function (id) { return document.getElementById(id); }).filter(Boolean);
-  }
-  function setInFlight(on) { inFlight = on; submitButtons().forEach(function (b) { b.disabled = on; }); }
+  function setInFlight(on) { inFlight = on; var b = document.getElementById('cmdCreatePr'); if (b) b.disabled = on; }
   function setStatus(t) { var s = document.getElementById('prStatusText'); if (s) s.textContent = t || ''; }
   function submit(payload) { if (inFlight) return; setInFlight(true); jmSend(payload); }
 
+  function show(id, visible) { var el = document.getElementById(id); if (el) el.classList.toggle('hidden', !visible); }
+
+  // Edit toggles the Title/Body panels between their read-only display and inline
+  // editors (no separate form). Toggling back re-renders the display from the edits.
+  var editing = false;
+  function setEditing(on) {
+    editing = on;
+    show('prTitleDisplay', !on); show('prTitleInput', on);
+    show('prBody', !on); show('prBodyInput', on);
+    var eb = document.getElementById('cmdEdit');
+    if (eb) eb.textContent = on ? 'Done' : 'Edit';
+    if (!on) {
+      var t = document.getElementById('prTitleInput'), d = document.getElementById('prTitleDisplay');
+      if (t && d) d.textContent = t.value;
+      var b = document.getElementById('prBodyInput'), body = document.getElementById('prBody');
+      if (b && body) body.innerHTML = renderMarkdown(b.value);
+    }
+  }
+
+  function showToast(text) {
+    var el = document.getElementById('prToast');
+    if (!el) return;
+    el.textContent = text;
+    el.classList.add('show');
+    setTimeout(function () { el.classList.remove('show'); }, 2200);
+  }
+
+  // Create/Update always submits the (possibly edited) title + body inputs so the
+  // read-only path and the edited path share one code path.
   var createBtn = document.getElementById('cmdCreatePr');
-  if (createBtn) createBtn.addEventListener('click', function () { submit({ command: 'createPr' }); });
-  var editBtn = document.getElementById('cmdEdit');
-  if (editBtn) editBtn.addEventListener('click', function () {
-    var f = document.getElementById('editForm'); if (f) f.classList.toggle('hidden');
-  });
-  var copyBtn = document.getElementById('cmdCopyBody');
-  if (copyBtn) copyBtn.addEventListener('click', function () { jmSend({ command: 'copyBody' }); });
-  var editedBtn = document.getElementById('cmdCreateEdited');
-  if (editedBtn) editedBtn.addEventListener('click', function () {
+  if (createBtn) createBtn.addEventListener('click', function () {
     var t = document.getElementById('prTitleInput');
     var b = document.getElementById('prBodyInput');
     submit({ command: 'createPr', title: t ? t.value : undefined, body: b ? b.value : undefined });
   });
+  var editBtn = document.getElementById('cmdEdit');
+  if (editBtn) editBtn.addEventListener('click', function () { setEditing(!editing); });
+  var copyBtn = document.getElementById('cmdCopyBody');
+  if (copyBtn) copyBtn.addEventListener('click', function () { jmSend({ command: 'copyBody' }); });
 
   document.querySelectorAll('.row[data-hash]').forEach(function (r) {
     r.addEventListener('click', function () { jmSend({ command: 'openMemory', hash: r.getAttribute('data-hash') }); });
@@ -124,6 +146,7 @@ object CreatePrScriptBuilder {
       case 'prProgress': setStatus(msg.text || ''); break;
       case 'prCreated': setInFlight(false); setStatus(msg.text || ''); break;
       case 'prCreateError': setInFlight(false); setStatus(msg.text || ''); break;
+      case 'bodyCopied': showToast(msg.text || 'Copied PR body to clipboard'); break;
     }
   });
 """

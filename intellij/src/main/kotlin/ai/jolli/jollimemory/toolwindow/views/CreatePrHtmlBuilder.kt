@@ -18,7 +18,6 @@ object CreatePrHtmlBuilder {
         val isUpdate = vm.existingPr != null
         val heading = if (isUpdate) "Update Pull Request" else "Create Pull Request"
         val primaryLabel = if (isUpdate) "Update PR" else "Create PR"
-        val editedLabel = if (isUpdate) "Update with these" else "Create with these"
 
         return """<!DOCTYPE html>
 <html lang="en">
@@ -35,11 +34,13 @@ object CreatePrHtmlBuilder {
   ${buildShipSub(vm)}
   <div class="panel">
     <div class="panel-header"><span class="panel-title">Title</span></div>
-    <p>${escAttr(vm.title)}</p>
+    <p id="prTitleDisplay">${escAttr(vm.title)}</p>
+    <input id="prTitleInput" class="pr-input hidden" value="${escAttr(vm.title)}" />
   </div>
   <div class="panel">
     <div class="panel-header"><span class="panel-title">Body — drafted from this branch&#39;s memories</span></div>
     <div class="md-mock" id="prBody" data-body="${escAttr(vm.bodyMarkdown)}"></div>
+    <textarea id="prBodyInput" class="pr-textarea hidden" rows="12">${escAttr(vm.bodyMarkdown)}</textarea>
   </div>
   <div class="panel">
     <div class="panel-header">
@@ -62,12 +63,8 @@ object CreatePrHtmlBuilder {
     <button class="btn secondary" id="cmdCopyBody">Copy body</button>
   </div>
   <p class="ship-sub" id="prStatusText"></p>
-  <div class="edit-form hidden" id="editForm">
-    <input id="prTitleInput" class="pr-input" value="${escAttr(vm.title)}" />
-    <textarea id="prBodyInput" class="pr-textarea" rows="12">${escAttr(vm.bodyMarkdown)}</textarea>
-    <button class="btn" id="cmdCreateEdited">$editedLabel</button>
-  </div>
 </div>
+<div class="toast" id="prToast"></div>
 <script>$bridgeScript</script>
 <script>${CreatePrScriptBuilder.buildScript()}</script>
 </body>

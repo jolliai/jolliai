@@ -121,8 +121,7 @@ ${if (isDark) darkVars() else lightVars()}
   .btn.secondary:hover { background: var(--btn-secondary-hover-bg); color: var(--text-primary); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
 
-  /* ── Edit form ── */
-  .edit-form { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+  /* ── Inline editors (revealed by Edit, replace the read-only display in place) ── */
   .pr-input, .pr-textarea {
     width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 4px;
     background: var(--input-bg); color: var(--input-fg); border: 1px solid var(--input-border);
@@ -130,6 +129,15 @@ ${if (isDark) darkVars() else lightVars()}
   }
   .pr-textarea { min-height: 240px; resize: vertical; font-family: $MONO_FONT_FAMILY; font-size: 0.85em; }
   .pr-input:focus, .pr-textarea:focus { outline: 1px solid var(--focus-border); outline-offset: -1px; }
+
+  /* ── Toast (copy confirmation) ── */
+  .toast {
+    position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%) translateY(8px); z-index: 80;
+    background: var(--toast-bg); border: 1px solid var(--border-light); color: var(--text-primary);
+    border-radius: 7px; padding: 8px 16px; font-size: 0.82em; box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+    opacity: 0; pointer-events: none; transition: all 0.18s ease;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 """
 
     private fun darkVars() = """
@@ -143,7 +151,7 @@ ${if (isDark) darkVars() else lightVars()}
     --btn-secondary-bg: #3a3d41; --btn-secondary-fg: #fff; --btn-secondary-hover-bg: #45494e;
     --btn-border: rgba(255,255,255,0.06);
     --input-bg: #1e1e1e; --input-fg: #ccc; --input-border: #444;
-    --ship-ok: #4ece8d;
+    --toast-bg: #2b2d30; --ship-ok: #4ece8d;
     --gs-modified: #e0ac2b; --gs-added: #4ece8d; --gs-deleted: #f47067;
     --gs-renamed: #b494f0; --gs-untracked: #8c8c8c;"""
 
@@ -158,7 +166,7 @@ ${if (isDark) darkVars() else lightVars()}
     --btn-secondary-bg: #e8e8e8; --btn-secondary-fg: #444; --btn-secondary-hover-bg: #d6d6d6;
     --btn-border: rgba(0,0,0,0.06);
     --input-bg: #ffffff; --input-fg: #1e1e1e; --input-border: #cecece;
-    --ship-ok: #1b8a4f;
+    --toast-bg: #ffffff; --ship-ok: #1b8a4f;
     --gs-modified: #96680e; --gs-added: #1b8a4f; --gs-deleted: #c0392b;
     --gs-renamed: #5c35a0; --gs-untracked: #6e6e6e;"""
 }
