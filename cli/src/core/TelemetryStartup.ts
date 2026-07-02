@@ -95,7 +95,7 @@ export const CLI_TELEMETRY_NOTICE =
 	"\nℹ Jolli Memory collects anonymous, content-free usage telemetry to improve the product —\n" +
 	"  never your code, file paths, or memory content. Turn it off any time:\n" +
 	"    jolli telemetry off      (or set DO_NOT_TRACK=1)\n" +
-	"  See exactly what would be sent: jolli telemetry inspect · https://jolli.ai/telemetry\n\n";
+	"  See exactly what would be sent: jolli telemetry inspect · https://www.jolli.ai/telemetry\n\n";
 
 export interface CliNoticeDeps {
 	readonly loadConfig?: () => Promise<JolliMemoryConfig>;
