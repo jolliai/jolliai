@@ -419,12 +419,23 @@ export function buildJolliRow(
  */
 function buildBackfillBadge(summary: CommitSummary): string {
 	if (!summary.backfilled) return "";
-	const tip =
-		summary.backfillMethod === "diff-only"
-			? "Back-filled for an earlier commit. No matching AI conversation was found, so this summary was written from the code changes alone."
-			: summary.backfillMethod === "time-window"
-				? "Back-filled for an earlier commit. The AI conversation was matched by timing (same branch, right before the commit), so it may not be the exact one."
-				: "Back-filled for an earlier commit, reconstructed from the AI conversation that edited these files.";
+	let tip: string;
+	switch (summary.backfillMethod) {
+		case "diff-only":
+			tip =
+				"Back-filled for an earlier commit. No matching AI conversation was found, so this summary was written from the code changes alone.";
+			break;
+		case "time-window":
+			tip =
+				"Back-filled for an earlier commit. The AI conversation was matched by timing alone, so it may not be the exact one.";
+			break;
+		case "branch-match":
+			tip =
+				"Back-filled for an earlier commit. The AI conversation was matched by the branch you were working on, so it may not be the exact one.";
+			break;
+		default:
+			tip = "Back-filled for an earlier commit, reconstructed from the AI conversation that edited these files.";
+	}
 	return `<span class="meta-sep">&middot;</span><span class="meta-backfill" title="${escAttr(tip)}">Back-filled</span>`;
 }
 

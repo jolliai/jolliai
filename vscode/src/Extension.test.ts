@@ -1957,6 +1957,7 @@ describe("Extension", () => {
 				mockMemoriesStore.refresh.mockClear();
 				mockFilesStore.refresh.mockClear();
 				mockCommitsStore.refresh.mockClear();
+				executeCommand.mockClear();
 
 				const handler = getRegisteredCommand("jollimemory.enableJolliMemory");
 				await handler();
@@ -1969,6 +1970,10 @@ describe("Extension", () => {
 				// refetch so the panel is not stuck empty until a watcher fires.
 				expect(mockPlansStore.refresh).toHaveBeenCalled();
 				expect(mockMemoriesStore.refresh).toHaveBeenCalled();
+
+				// Enable also kicks off a best-effort back-fill of missing summaries
+				// (mirrors the CLI `jolli enable`); fire-and-forget via executeCommand.
+				expect(executeCommand).toHaveBeenCalledWith("jollimemory.generateMissingSummaries");
 
 				// Ordering guard: `plansStore.setEnabled(true)` (called inside
 				// refreshStatusBar) MUST run before `plansStore.refresh()`,
