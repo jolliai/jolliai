@@ -18,6 +18,7 @@ import ai.jolli.jollimemory.core.TranscriptEntry
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliApiClient
 import ai.jolli.jollimemory.services.JolliMemoryService
+import ai.jolli.jollimemory.services.JolliShareService
 import ai.jolli.jollimemory.services.PlanService
 import ai.jolli.jollimemory.services.PrService
 import ai.jolli.jollimemory.toolwindow.views.SummaryHtmlBuilder
@@ -297,10 +298,6 @@ class SummaryPanel(
         }
 
         postToWebview("pushStarted")
-        val baseUrl = resolvedBaseUrl.trimEnd('/')
-
-        val repoUrl = GitRemoteUtils.getCanonicalRepoUrl(cwd)
-        val relativePath = GitRemoteUtils.sanitizeBranchSlug(summary.branch)
 
         ApplicationManager.getApplication().executeOnPooledThread {
             // One trace per push operation (on this pooled thread) so the push
@@ -308,75 +305,16 @@ class SummaryPanel(
             // call share one id; ThreadLocal must be set on the worker thread.
             TraceContext.withTrace {
                 try {
-                    val planUrls = mutableListOf<PlanPushResult>()
-
-                    for (plan in summary.plans ?: emptyList()) {
-                        val planContent = store.readPlanFromBranch(plan.slug) ?: continue
-                        if (planContent.isBlank()) continue
-
-                        val planResult = JolliApiClient.pushToJolli(resolvedBaseUrl, config.jolliApiKey!!, JolliApiClient.JolliPushPayload(
-                            title = SummaryUtils.buildPlanPushTitle(summary, plan.title),
-                            content = planContent,
-                            commitHash = summary.commitHash,
-                            docType = "plan",
-                            branch = summary.branch,
-                            docId = plan.jolliPlanDocId,
-                            repoUrl = repoUrl,
-                            relativePath = relativePath,
-                        ))
-                        planUrls.add(PlanPushResult(plan.slug, plan.title, "$baseUrl/articles?doc=${planResult.docId}", planResult.docId))
-                    }
-
-                    var plansWithUrls = summary.plans
-                    if (planUrls.isNotEmpty() && plansWithUrls != null) {
-                        val urlMap = planUrls.associateBy { it.slug }
-                        plansWithUrls = plansWithUrls.map { p ->
-                            val pushed = urlMap[p.slug]
-                            if (pushed != null) p.copy(jolliPlanDocUrl = pushed.url, jolliPlanDocId = pushed.docId) else p
-                        }
-                    }
-
-                    val summaryForMarkdown = if (plansWithUrls !== summary.plans) summary.copy(plans = plansWithUrls) else summary
-                    val markdown = SummaryMarkdownBuilder.buildMarkdown(summaryForMarkdown)
-                    val pushTitle = SummaryUtils.buildPushTitle(summary)
-
-                    val result = JolliApiClient.pushToJolli(resolvedBaseUrl, config.jolliApiKey!!, JolliApiClient.JolliPushPayload(
-                        title = pushTitle, content = markdown, commitHash = summary.commitHash,
-                        docType = "summary",
-                        branch = summary.branch, docId = summary.jolliDocId,
-                        repoUrl = repoUrl, relativePath = relativePath,
-                    ))
-
-                    val fullUrl = "$baseUrl/articles?doc=${result.docId}"
-                    var updatedPlans = summary.plans
-                    if (updatedPlans != null && planUrls.isNotEmpty()) {
-                        val planResultMap = planUrls.associateBy { it.slug }
-                        updatedPlans = updatedPlans.map { p ->
-                            val pushResult = planResultMap[p.slug]
-                            if (pushResult != null) p.copy(jolliPlanDocUrl = pushResult.url, jolliPlanDocId = pushResult.docId) else p
-                        }
-                    }
-
-                    val updatedSummary = summary.copy(jolliDocUrl = fullUrl, jolliDocId = result.docId, plans = updatedPlans)
-                    store.storeSummary(updatedSummary, force = true)
-                    currentSummary = updatedSummary
-
-                    val cleanedSummary = cleanupOrphanedDocs(summary, updatedSummary, baseUrl, config.jolliApiKey!!)
-                    if (cleanedSummary != null) currentSummary = cleanedSummary
-
-                    ai.jolli.jollimemory.core.telemetry.Telemetry.track(
-                        "memory_pushed",
-                        mapOf(
-                            "kind" to "summary",
-                            "created" to result.created,
-                            "plans_bucket" to ai.jolli.jollimemory.core.telemetry.Telemetry.bucket(planUrls.size),
-                        ),
-                    )
+                    // The push core lives in JolliShareService so the Create-PR view can
+                    // reuse the exact same logic; the binding/re-auth/UI handling below
+                    // stays panel-side.
+                    val res = JolliShareService.shareSummary(store, summary, cwd, config.jolliApiKey!!, resolvedBaseUrl)
+                    currentSummary = res.updatedSummary
 
                     ApplicationManager.getApplication().invokeLater {
                         refreshHtml()
                         val verb = if (summary.jolliDocUrl != null) "Updated" else "Pushed"
-                        val planMsg = if (planUrls.isNotEmpty()) " (with ${planUrls.size} plan${if (planUrls.size > 1) "s" else ""})" else ""
+                        val planMsg = if (res.planCount > 0) " (with ${res.planCount} plan${if (res.planCount > 1) "s" else ""})" else ""
                         Messages.showInfoMessage(project, "$verb on Jolli Space$planMsg.", "Push Successful")
                     }
                 } catch (e: JolliApiClient.BindingRequiredError) {
@@ -1207,19 +1145,7 @@ class SummaryPanel(
         } catch (_: Exception) { "" }
     }
 
-    private fun cleanupOrphanedDocs(originalSummary: CommitSummary, updatedSummary: CommitSummary, baseUrl: String, apiKey: String): CommitSummary? {
-        val orphanedIds = originalSummary.orphanedDocIds ?: return null
-        if (orphanedIds.isEmpty()) return null
-        val deleted = mutableSetOf<Int>()
-        for (id in orphanedIds) { try { JolliApiClient.deleteFromJolli(baseUrl, apiKey, id); deleted.add(id) } catch (e: Exception) { LOG.warn("Failed to delete orphaned doc $id: ${e.message}") } }
-        val remaining = orphanedIds.filter { it !in deleted }
-        val cleanedSummary = updatedSummary.copy(orphanedDocIds = remaining.takeIf { it.isNotEmpty() })
-        store.storeSummary(cleanedSummary, force = true)
-        return cleanedSummary
-    }
-
     private data class RebuildSession(val sessionId: String, val source: String, val transcriptPath: String?, val entries: MutableList<TranscriptEntry> = mutableListOf())
-    private data class PlanPushResult(val slug: String, val title: String, val url: String, val docId: Int)
 
     companion object {
         private val LOG = Logger.getInstance(SummaryPanel::class.java)

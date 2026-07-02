@@ -59,6 +59,10 @@
         <fileEditorProvider
             implementation="ai.jolli.jollimemory.toolwindow.WorkingMemoryEditorProvider"/>
 
+        <!-- Editor tab provider for the dedicated Create PR webview -->
+        <fileEditorProvider
+            implementation="ai.jolli.jollimemory.toolwindow.CreatePrEditorProvider"/>
+
         <!-- Notification group for balloon notifications (e.g., no-Git warning) -->
         <notificationGroup
             id="JolliMemory"
