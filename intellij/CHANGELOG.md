@@ -15,6 +15,7 @@
 
 ### Fixes & Improvements
 
+- **Working Memory review selection stays in sync** — removing or adding a conversation / context item in the review now updates the sidebar's selection immediately and is honored at commit; the review, the sidebar, and the commit all read and write the same commit-selection state
 - **Committed Memories clears on a new branch** — creating a branch off a feature or release branch no longer shows the parent branch's committed memories as the new branch's own; the panel now measures each branch's commits from its true creation point
 - Fixed a race condition when opening a file from the Current Memory review
 - Cleared a JetBrains Marketplace verifier warning for the terminal-based "Resume in terminal" action
