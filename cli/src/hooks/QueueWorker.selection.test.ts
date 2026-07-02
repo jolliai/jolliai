@@ -436,6 +436,47 @@ describe("QueueWorker selection filter", () => {
 		expect(vi.mocked(saveCursor)).toHaveBeenCalledTimes(1);
 	});
 
+	it("excludes an unchecked conversation's usage tokens from stored conversationTokens", async () => {
+		// Both conversations are read (so the unchecked one's cursor advances), but only
+		// the kept conversation's tokens may count toward the stored total — otherwise
+		// the token bar reports A+B while the body/entries reflect only A.
+		seedGitMocks(projectDir);
+		vi.mocked(buildMultiSessionContext).mockReturnValue("ctx");
+		vi.mocked(loadAllSessions).mockResolvedValue([
+			{
+				sessionId: "sess-keep",
+				transcriptPath: "/fake/sess-keep.jsonl",
+				updatedAt: "2026-01-01T00:00:00Z",
+				source: "claude" as const,
+			},
+			{
+				sessionId: "sess-drop",
+				transcriptPath: "/fake/sess-drop.jsonl",
+				updatedAt: "2026-01-01T00:00:00Z",
+				source: "claude" as const,
+			},
+		]);
+		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+		vi.mocked(readTranscript).mockImplementation(async (transcriptPath: string) => {
+			const isKeep = transcriptPath.includes("sess-keep");
+			return {
+				entries: [{ role: "human", content: isKeep ? "KEEP" : "DROP", timestamp: "t0" }],
+				newCursor: { transcriptPath, lineNumber: 1, updatedAt: "2026-01-01T00:00:00Z" },
+				totalLinesRead: 1,
+				usageTokens: isKeep ? 100 : 999,
+			};
+		});
+
+		await setExcluded(projectDir, "conversations", conversationKey("claude", "sess-drop"), true);
+
+		await executePipeline(projectDir, makeCommitOp());
+
+		expect(vi.mocked(storeSummary)).toHaveBeenCalledTimes(1);
+		const summaryArg = vi.mocked(storeSummary).mock.calls[0][0];
+		// 100 (kept) only — NOT 1099 (would include the excluded conversation's 999).
+		expect(summaryArg.conversationTokens).toBe(100);
+	});
+
 	it("advances the cursor for an excluded conversation on the amend path (discard)", async () => {
 		// The amend path shares loadSessionTranscripts, so excluded conversations are
 		// discarded there too: consumed (cursor advanced) but dropped from the summary.
