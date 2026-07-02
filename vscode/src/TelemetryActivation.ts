@@ -21,7 +21,7 @@ import { bootstrapTelemetry, flushTelemetryNow } from "../../cli/src/core/Teleme
 export const TELEMETRY_NOTICE =
 	"Jolli Memory collects anonymous, content-free usage telemetry (never code, file paths, or memory content) to improve the product. " +
 	"Manage it any time with `jolli telemetry off`, the DO_NOT_TRACK env var, or VS Code's own telemetry setting.";
-export const TELEMETRY_DOCS_URL = "https://jolli.ai/telemetry";
+export const TELEMETRY_DOCS_URL = "https://www.jolli.ai/telemetry";
 const LEARN_MORE = "Learn more";
 const TURN_OFF = "Turn off";
 

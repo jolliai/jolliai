@@ -19,6 +19,7 @@ class CreatePrHtmlBuilderTest {
         signedIn: Boolean = true,
         title: String = "feat: redesign",
         e2e: List<E2eTestScenario> = emptyList(),
+        hasUnpushedChanges: Boolean = true,
     ) = CreatePrData.ViewModel(
         branch = "feature/x",
         mainBranch = "main",
@@ -37,13 +38,15 @@ class CreatePrHtmlBuilderTest {
         existingPr = existingPr,
         signedIn = signedIn,
         includedSummaries = listOf(summary("aaaaaaaa1111", "feat: redesign")),
+        hasUnpushedChanges = hasUnpushedChanges,
     )
 
     @Test
     fun `renders create mode with meta strip, memories, files, and body data`() {
         val html = CreatePrHtmlBuilder.buildHtml(vm(), isDark = true, bridgeScript = "")
         html shouldContain "Create Pull Request"
-        html shouldContain """id="cmdCreatePr">Create PR"""
+        html shouldContain """id="cmdCreatePr""""
+        html shouldContain ">Create PR</button>"
         html shouldContain """<span class="meta-branch">feature/x</span>"""
         html shouldContain "drafted from 2 memories"
         html shouldContain "+10 −2 · 1 file"
@@ -63,9 +66,27 @@ class CreatePrHtmlBuilderTest {
             isDark = false, bridgeScript = "",
         )
         html shouldContain "Update Pull Request"
-        html shouldContain """id="cmdCreatePr">Update PR"""
+        html shouldContain ">Update PR</button>"
         html shouldContain "PR #42"
         html shouldContain """data-pr-url="https://github.com/o/r/pull/42""""
+    }
+
+    @Test
+    fun `dims the Update button when there are no unpushed changes, enables it otherwise`() {
+        val pr = CreatePrData.ExistingPr(42, "https://github.com/o/r/pull/42")
+        // Update mode, nothing new to push → button disabled + "Up to date" hint.
+        val upToDate = CreatePrHtmlBuilder.buildHtml(vm(existingPr = pr, hasUnpushedChanges = false), true, "")
+        upToDate shouldContain """id="cmdCreatePr" data-uptodate="true" disabled"""
+        upToDate shouldContain """<span class="up-to-date">"""
+        // Update mode with unpushed commits → enabled (no disabled attr on the button).
+        val hasChanges = CreatePrHtmlBuilder.buildHtml(vm(existingPr = pr, hasUnpushedChanges = true), true, "")
+        hasChanges shouldContain """id="cmdCreatePr" data-uptodate="false""""
+        hasChanges shouldNotContain """id="cmdCreatePr" data-uptodate="false" disabled"""
+        // Create mode never dims, even if pushed (the button has no disabled attr;
+        // ".btn:disabled" in the CSS is why we assert on the button markup, not "disabled").
+        val create = CreatePrHtmlBuilder.buildHtml(vm(existingPr = null, hasUnpushedChanges = false), true, "")
+        create shouldContain """id="cmdCreatePr" data-uptodate="false">Create PR</button>"""
+        create shouldNotContain """<span class="up-to-date">"""
     }
 
     @Test

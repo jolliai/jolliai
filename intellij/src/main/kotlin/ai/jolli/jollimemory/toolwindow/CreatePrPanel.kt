@@ -210,9 +210,23 @@ class CreatePrPanel(
                     // One-click share: when signed in, push the included memories to Jolli.
                     val shareMsg = shareIncludedMemoriesIfSignedIn()
 
+                    // Re-detect the PR so the panel flips to Update mode ("Update PR"
+                    // button + a link to the PR) now that one exists. A later submit then
+                    // updates that PR instead of erroring on a duplicate create.
+                    val refreshed = try {
+                        CreatePrData.build(project)
+                    } catch (_: Exception) {
+                        null
+                    }
+
                     ApplicationManager.getApplication().invokeLater {
-                        postToWebview("prCreated", mapOf("text" to "Pull request ready.$shareMsg"))
                         Messages.showInfoMessage(project, "Pull request ready.\n$prUrl$shareMsg", "Create PR")
+                        if (refreshed != null) {
+                            vm = refreshed
+                            refreshHtml()
+                        } else {
+                            postToWebview("prCreated", mapOf("text" to "Pull request ready.$shareMsg"))
+                        }
                     }
                 } catch (e: Exception) {
                     ApplicationManager.getApplication().invokeLater {

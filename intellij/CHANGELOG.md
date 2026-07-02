@@ -4,7 +4,8 @@
 
 ### New Features
 
-- **Redesigned Create PR view** — the **Create pull request (PR)** button now opens a dedicated, branch-level Create PR tab that matches the new design: a branch → main header with diff stats, the drafted title and a rendered-markdown body, the memories included in the PR, the E2E test guide, and the changed files. When you're signed in to Jolli, creating the PR **also shares the included memories to Jolli in the same action** (a sign-in hint appears when you're signed out; the PR is still a normal git PR either way)
+- **Redesigned Create PR view** — the **Create pull request (PR)** button now opens a dedicated, branch-level Create PR tab that matches the new design: a branch → main header with diff stats, the drafted title and a rendered-markdown body, the memories included in the PR, the E2E test guide, and the changed files.
+- **Create a PR and share to Jolli in one step** — when you're signed in to Jolli, creating (or updating) the PR now **automatically syncs the PR's memory summaries to your Jolli site** in the same action — no separate "Share in Jolli" step. Signed out, you get a one-click sign-in hint and the PR is still created as a normal git PR.
 - **Working Memory review — token meter + inline edit** — the review now shows a token-usage meter (input / output / cached breakdown, aggregated from the included conversations, with a graceful "recorded at commit" state when a source doesn't report usage), and each conversation / context row has an inline **✕ leave out** / **+ add back** toggle so you can shape exactly what the next memory captures without leaving the review
 
 ### Changes
@@ -15,6 +16,7 @@
 
 ### Fixes & Improvements
 
+- **Working Memory review selection stays in sync** — removing or adding a conversation / context item in the review now updates the sidebar's selection immediately and is honored at commit; the review, the sidebar, and the commit all read and write the same commit-selection state
 - **Committed Memories clears on a new branch** — creating a branch off a feature or release branch no longer shows the parent branch's committed memories as the new branch's own; the panel now measures each branch's commits from its true creation point
 - Fixed a race condition when opening a file from the Current Memory review
 - Cleared a JetBrains Marketplace verifier warning for the terminal-based "Resume in terminal" action

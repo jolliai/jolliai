@@ -53,6 +53,13 @@ object CreatePrData {
         val signedIn: Boolean,
         /** Summaries included in this PR, newest-first — the payload the share step pushes. */
         val includedSummaries: List<CommitSummary>,
+        /**
+         * True when the branch has local commits not yet on its remote (something to
+         * push). In Update mode the primary button dims when this is false — there's
+         * nothing new to push, mirroring the commit-level push UI. Defaults to true
+         * (enabled) so create-mode and tests aren't accidentally disabled.
+         */
+        val hasUnpushedChanges: Boolean = true,
     )
 
     /**
@@ -81,8 +88,12 @@ object CreatePrData {
             else -> null
         }
         val signedIn = !SessionTracker.loadConfig(cwd).jolliApiKey.isNullOrBlank()
+        // Something to push = HEAD isn't on the remote yet (unpushed commits, or a
+        // branch never pushed). After a create/update with no new commits this is
+        // false, so the Update button dims — matching the commit-level push UI.
+        val hasUnpushedChanges = !git.isHeadPushed()
 
-        return assemble(branch, mainBranch, summaries, stats, files, existingPr, signedIn)
+        return assemble(branch, mainBranch, summaries, stats, files, existingPr, signedIn, hasUnpushedChanges)
     }
 
     /** Aggregate insertions/deletions/filesChanged. */
@@ -97,6 +108,7 @@ object CreatePrData {
         files: List<FileRow>,
         existingPr: ExistingPr?,
         signedIn: Boolean,
+        hasUnpushedChanges: Boolean = true,
     ): ViewModel {
         val anchor = summaries.first()
         return ViewModel(
@@ -114,6 +126,7 @@ object CreatePrData {
             existingPr = existingPr,
             signedIn = signedIn,
             includedSummaries = summaries,
+            hasUnpushedChanges = hasUnpushedChanges,
         )
     }
 
