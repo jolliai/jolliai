@@ -269,6 +269,19 @@ vi.mock("./core/TopicWikiRenderer.js", () => ({
 	renderTopicKBWiki: vi.fn(async () => {}),
 }));
 
+// `compile` also runs buildKnowledgeGraph (LLM-bearing) and SearchIndex.rebuild
+// after the ingest. Both are non-fatal/best-effort in the command, but left un-
+// mocked they attempt real work: buildKnowledgeGraph opens an LLM connection that
+// fails fast in CI but can HANG until the 45s test timeout in a sandbox with no
+// network. Mock them so the compile tests are deterministic and network-free.
+vi.mock("./graph/GraphBuilder.js", () => ({
+	buildKnowledgeGraph: vi.fn(async () => {}),
+}));
+
+vi.mock("./core/SearchIndex.js", () => ({
+	SearchIndex: { rebuild: vi.fn(async () => {}) },
+}));
+
 vi.mock("./core/ProcessedSourceStore.js", () => ({
 	saveProcessedSet: vi.fn(async () => {}),
 	emptyProcessedSet: vi.fn(() => ({ schemaVersion: 1, processed: {} })),
