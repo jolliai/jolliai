@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../backfill/BackfillEngine.js", () => ({
 	runBackfill: vi.fn(),
 	recentCommitHashes: vi.fn(),
+	DEFAULT_BACKFILL_TIER: "low",
 }));
 vi.mock("../Logger.js", () => ({
 	setLogDir: vi.fn(),
@@ -51,18 +52,33 @@ const report = {
 };
 
 describe("jolli backfill command", () => {
-	it("passes --last / --dry-run / --include-medium through to runBackfill", async () => {
+	it("passes --last / --dry-run / --min-confidence through to runBackfill", async () => {
 		vi.mocked(recentCommitHashes).mockResolvedValue(["h1", "h2"]);
 		vi.mocked(runBackfill).mockResolvedValue({ ...report, outcomes: [] });
 
-		await makeProgram().parseAsync(["backfill", "--cwd", "e:/r", "--last", "5", "--dry-run", "--include-medium"], {
-			from: "user",
-		});
+		await makeProgram().parseAsync(
+			["backfill", "--cwd", "e:/r", "--last", "5", "--dry-run", "--min-confidence", "high"],
+			{ from: "user" },
+		);
 
 		expect(vi.mocked(recentCommitHashes)).toHaveBeenCalledWith("e:/r", 5);
 		expect(vi.mocked(runBackfill)).toHaveBeenCalledWith(
-			expect.objectContaining({ cwd: "e:/r", hashes: ["h1", "h2"], dryRun: true, includeMedium: true }),
+			expect.objectContaining({ cwd: "e:/r", hashes: ["h1", "h2"], dryRun: true, minTier: "high" }),
 		);
+	});
+
+	it("defaults minTier to 'low' (window-collect-all) when --min-confidence is omitted", async () => {
+		vi.mocked(recentCommitHashes).mockResolvedValue(["h1"]);
+		vi.mocked(runBackfill).mockResolvedValue({ ...report, outcomes: [] });
+		await makeProgram().parseAsync(["backfill"], { from: "user" });
+		expect(vi.mocked(runBackfill)).toHaveBeenCalledWith(expect.objectContaining({ minTier: "low" }));
+	});
+
+	it("rejects an invalid --min-confidence value", async () => {
+		vi.mocked(recentCommitHashes).mockResolvedValue(["h1"]);
+		await expect(
+			makeProgram().parseAsync(["backfill", "--min-confidence", "bogus"], { from: "user" }),
+		).rejects.toThrow(/min-confidence must be one of/);
 	});
 
 	it("--all considers every reachable commit (no cap)", async () => {

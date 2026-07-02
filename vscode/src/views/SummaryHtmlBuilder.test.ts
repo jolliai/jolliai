@@ -280,6 +280,9 @@ describe("SummaryHtmlBuilder", () => {
 			expect(buildHtml(makeSummary({ backfilled: true, backfillMethod: "time-window" }))).toContain(
 				"matched by timing",
 			);
+			expect(buildHtml(makeSummary({ backfilled: true, backfillMethod: "branch-match" }))).toContain(
+				"matched by the branch you were working on",
+			);
 			expect(buildHtml(makeSummary({ backfilled: true, backfillMethod: "diff-only" }))).toContain(
 				"written from the code changes alone",
 			);

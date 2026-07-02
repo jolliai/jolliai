@@ -30,8 +30,8 @@ export interface RegenerateResult {
  * Reads inputs straight from the orphan branch (transcripts, archived plans /
  * notes / linear issues) and rebuilds the commit diff via `git show`. No
  * disk-side registries are consulted, no archives are re-written, and no
- * cursors / locks / queue entries are touched — see the plan's §1.6 isolation
- * matrix. The single side effect this returns is the updated CommitSummary
+ * cursors / locks / queue entries are touched — fully isolated from the live
+ * ingest pipeline. The single side effect this returns is the updated CommitSummary
  * that callers pass to `storeSummary(_, _, true)` (force=true).
  *
  * Fields replaced:        topics, recap, diffStats, transcriptEntries,
@@ -61,7 +61,7 @@ export interface RegenerateResult {
  *     empty conversation to the LLM. Mirrors the webview's All Conversations
  *     card (`SummaryWebviewPanel.refreshTranscriptHashes`).
  *
- * Preservation of ticketId and e2eTestGuide is deliberate (see plan §1.2):
+ * Preservation of ticketId and e2eTestGuide is deliberate:
  *   - ticketId is a stable identifier; the LLM may not see the original
  *     ticket ID in this re-run and would otherwise drop or change it.
  *   - e2eTestGuide is a user-initiated secondary artifact; the user can
