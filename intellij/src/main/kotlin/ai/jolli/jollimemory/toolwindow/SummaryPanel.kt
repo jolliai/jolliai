@@ -14,6 +14,7 @@ import ai.jolli.jollimemory.core.SummaryStore
 import ai.jolli.jollimemory.core.SummaryTree
 import ai.jolli.jollimemory.core.TopicUpdates
 import ai.jolli.jollimemory.core.TraceContext
+import ai.jolli.jollimemory.util.ForcePushUtil
 import ai.jolli.jollimemory.core.TranscriptEntry
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliApiClient
@@ -919,9 +920,49 @@ class SummaryPanel(
         postToWebview("prCreating")
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                PrService.pushBranch(cwd)
+                val git = GitOps(cwd)
+                val branch = currentSummary.branch
+
+                // Push — detect NFF and offer force-push retry
+                val pushResult = PrService.pushBranch(cwd)
+                if (!pushResult.success) {
+                    if (git != null && ForcePushUtil.isNonFastForwardError(pushResult.stderr)) {
+                        // Switch to EDT for the divergence gate dialog
+                        var outcome = ForcePushUtil.ForcePushOutcome.DECLINED
+                        ApplicationManager.getApplication().invokeAndWait {
+                            outcome = ForcePushUtil.gateForcePush(
+                                project, git, branch,
+                                reason = "The remote has changes your branch does not include.",
+                            )
+                        }
+                        when (outcome) {
+                            ForcePushUtil.ForcePushOutcome.CONFIRMED -> {
+                                val forceResult = ForcePushUtil.forcePushBranch(git, branch)
+                                if (forceResult.exitCode != 0) {
+                                    ApplicationManager.getApplication().invokeLater {
+                                        postToWebview("prCreateError", mapOf("message" to "Force push failed: ${forceResult.stderr}"))
+                                    }
+                                    return@executeOnPooledThread
+                                }
+                            }
+                            else -> {
+                                ApplicationManager.getApplication().invokeLater {
+                                    postToWebview("prCreateError", mapOf("message" to "Push cancelled."))
+                                }
+                                return@executeOnPooledThread
+                            }
+                        }
+                    } else {
+                        // Non-NFF push error — surface it
+                        ApplicationManager.getApplication().invokeLater {
+                            postToWebview("prCreateError", mapOf("message" to "Push failed: ${pushResult.stderr}"))
+                        }
+                        return@executeOnPooledThread
+                    }
+                }
+
                 // Check if PR already exists for this branch — update instead of create
-                val lookup = PrService.findPrForBranch(cwd, currentSummary.branch)
+                val lookup = PrService.findPrForBranch(cwd, branch)
                 val prUrl: String
                 if (lookup is PrService.PrLookup.Found) {
                     PrService.updatePr(lookup.pr.number, title, body, cwd)
