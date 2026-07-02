@@ -111,6 +111,20 @@ class JolliMemoryService(private val project: Project) : Disposable {
     fun notifySelectionChanged() { selectionListeners.forEach { it() } }
 
     /**
+     * Listeners notified when a commit memory's PR or Jolli-share state changes — a PR
+     * created/updated for the branch, or a memory shared to the Jolli site. All surfaces
+     * that show those two states (the Commits list, an open memory summary, the Create PR
+     * view) subscribe so they re-read the shared truth — the branch PR
+     * ([ai.jolli.jollimemory.services.PrService.findPrForBranch]) and each summary's
+     * `jolliDocUrl`/`jolliDocId` — and never disagree. Since GitHub has one PR per branch,
+     * creating it from any surface must update them all.
+     */
+    private val memoryStateListeners = CopyOnWriteArrayList<() -> Unit>()
+    fun addMemoryStateListener(listener: () -> Unit) { memoryStateListeners.add(listener) }
+    fun removeMemoryStateListener(listener: () -> Unit) { memoryStateListeners.remove(listener) }
+    fun notifyMemoryStateChanged() { memoryStateListeners.forEach { it() } }
+
+    /**
      * Adds a sync-state listener. If a sync state has already been observed,
      * the listener is invoked immediately with it so late-registering panels
      * reflect the current state.
