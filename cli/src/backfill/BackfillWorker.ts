@@ -64,6 +64,8 @@ export async function runWorker(cwd: string): Promise<void> {
 		log.info("No commits to back-fill — exiting");
 		return;
 	}
+	// Uses the shared DEFAULT_BACKFILL_TIER (see BackfillEngine) — every entry point
+	// attributes at the same tier; the per-summary confidence badge flags weaker turns.
 	const report = await runBackfill({ cwd, hashes });
 	log.info(
 		"Back-fill complete: %d generated, %d skipped, %d error(s) of %d candidate(s)",

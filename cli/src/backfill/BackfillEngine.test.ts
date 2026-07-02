@@ -58,11 +58,17 @@ import { attributeCommits } from "./CommitAttributor.js";
 
 const CWD = "e:/repo";
 
-function attrFor(hash: string, confidence: "high" | "medium" = "high") {
+const TIER_METHOD = {
+	high: "file-overlap",
+	medium: "branch-match",
+	low: "time-window",
+} as const;
+
+function attrFor(hash: string, confidence: "high" | "medium" | "low" = "high") {
 	return {
 		commitHash: hash,
 		confidence,
-		method: confidence === "high" ? ("file-overlap" as const) : ("time-window" as const),
+		method: TIER_METHOD[confidence],
 		branch: "feat",
 		sessions: [
 			{
@@ -221,6 +227,77 @@ describe("runBackfill", () => {
 		expect(vi.mocked(storeSummary).mock.calls[0][0].branch).toBe("feat"); // attrFor sets branch "feat"
 	});
 
+	it("passes cursor candidates (incl. an out-of-range neighbor), emitOnly, worktreeRoots and minTier", async () => {
+		const c1Ts = Date.parse("2026-06-10T00:00:00Z");
+		const c0Ts = Date.parse("2026-06-09T00:00:00Z"); // within [c1Ts − 7d, c1Ts]
+		const { buildCommitTargetIndex } = await import("./CommitTargetIndex.js");
+		vi.mocked(buildCommitTargetIndex).mockResolvedValue({
+			commitMeta: new Map([["c1", { ts: c1Ts, subject: "s" }]]),
+			commitFiles: new Map(),
+			fileToCommits: new Map(),
+			baseToCommits: new Map(),
+		} as never);
+		const { execGit } = await import("../core/GitOps.js");
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			if (args[0] === "worktree")
+				return { exitCode: 0, stdout: "worktree e:/repo\nworktree e:/repo-wt2\n", stderr: "" } as never;
+			// gatherCursorCandidates own-commit range query (author time in seconds).
+			// Includes a malformed line (skipped) and an ancient out-of-range commit (filtered).
+			if (args[0] === "log") {
+				const ancient = Math.floor(Date.parse("2026-01-01T00:00:00Z") / 1000);
+				return {
+					exitCode: 0,
+					stdout: `c1|${Math.floor(c1Ts / 1000)}\nc0|${Math.floor(c0Ts / 1000)}\ngarbage-no-pipe\ncAncient|${ancient}`,
+					stderr: "",
+				} as never;
+			}
+			return { exitCode: 0, stdout: "", stderr: "" } as never;
+		});
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+
+		await runBackfill({ cwd: CWD, hashes: ["c1"], minTier: "medium" });
+
+		const call = vi.mocked(attributeCommits).mock.calls[0];
+		// c0 (out of `--last N`, but in the 7-day range) is pulled in as a cursor boundary.
+		expect(call[0]).toEqual(expect.arrayContaining(["c1", "c0"]));
+		// The ancient commit is outside [minTs−7d, maxTs] and the garbage line is ignored.
+		expect(call[0]).not.toContain("cAncient");
+		expect(call[0]).not.toContain("garbage-no-pipe");
+		const opts = call[3] as { minTier: string; emitOnly: Set<string>; worktreeRoots: string[] };
+		expect(opts.minTier).toBe("medium");
+		expect(opts.worktreeRoots).toEqual(["e:/repo", "e:/repo-wt2"]);
+		expect([...opts.emitOnly]).toEqual(["c1"]); // only the missing commit is emitted
+	});
+
+	it("passes through low-confidence / branch-match attribution to storeSummary and outcome", async () => {
+		vi.mocked(attributeCommits).mockReturnValue({
+			attributed: new Map([["c1", attrFor("c1", "low")]]),
+			skipped: [],
+		});
+		const report = await runBackfill({ cwd: CWD, hashes: ["c1"], minTier: "low" });
+		const stored = vi.mocked(storeSummary).mock.calls[0][0];
+		expect(stored.backfillConfidence).toBe("low");
+		expect(stored.backfillMethod).toBe("time-window");
+		expect(report.outcomes[0].confidence).toBe("low");
+		expect(report.outcomes[0].method).toBe("time-window");
+
+		vi.mocked(storeSummary).mockClear();
+		vi.mocked(attributeCommits).mockReturnValue({
+			attributed: new Map([["c2", attrFor("c2", "medium")]]),
+			skipped: [],
+		});
+		await runBackfill({ cwd: CWD, hashes: ["c2"], minTier: "medium" });
+		expect(vi.mocked(storeSummary).mock.calls[0][0].backfillMethod).toBe("branch-match");
+		expect(vi.mocked(storeSummary).mock.calls[0][0].backfillConfidence).toBe("medium");
+	});
+
+	it("defaults minTier to the unified 'low' tier when the caller omits it", async () => {
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+		await runBackfill({ cwd: CWD, hashes: ["c1"] });
+		const opts = vi.mocked(attributeCommits).mock.calls[0][3] as { minTier: string };
+		expect(opts.minTier).toBe("low");
+	});
+
 	it("discovers worktree roots and tolerates a failed tree-hash lookup", async () => {
 		const { execGit } = await import("../core/GitOps.js");
 		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
@@ -280,20 +357,60 @@ describe("countMissingSummaries / own-commit scoping", () => {
 		expect(missing).toBe(2);
 	});
 
-	it("scopes rev-list to the local author, regex-escaping the email", async () => {
+	it("matches the author literally via --fixed-strings (regex metachars are not escaped)", async () => {
 		const { execGit } = await import("../core/GitOps.js");
 		const calls: string[][] = [];
 		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
 			calls.push([...args]);
-			// Gmail-style alias with regex metacharacters ('+' and '.').
+			// Gmail-style alias: '+' is a BRE literal — escaping it would match nothing.
 			if (args[0] === "config") return { exitCode: 0, stdout: "me+tag@dev.io", stderr: "" } as never;
 			return { exitCode: 0, stdout: "h1", stderr: "" } as never;
 		});
 		vi.mocked(getIndexEntryMap).mockResolvedValue(new Map());
 		await countMissingSummaries(CWD);
 		const revList = calls.find((c) => c[0] === "rev-list");
-		// '+' and '.' must be escaped so git's --author regex matches them literally.
-		expect(revList).toContain("--author=me\\+tag@dev\\.io");
+		// Literal substring match: no backslash escaping, and --fixed-strings present.
+		expect(revList).toContain("--author=me+tag@dev.io");
+		expect(revList).toContain("--fixed-strings");
+	});
+
+	it("scopes rev-list to BOTH author email and name (git --author OR, literal)", async () => {
+		const { execGit } = await import("../core/GitOps.js");
+		const calls: string[][] = [];
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			calls.push([...args]);
+			if (args[0] === "config" && args[1] === "user.email")
+				return { exitCode: 0, stdout: "me@dev.io", stderr: "" } as never;
+			if (args[0] === "config" && args[1] === "user.name")
+				return { exitCode: 0, stdout: "J. Doe (Acme)", stderr: "" } as never;
+			return { exitCode: 0, stdout: "h1", stderr: "" } as never;
+		});
+		const { recentCommitHashes } = await import("./BackfillEngine.js");
+		await recentCommitHashes(CWD, 10);
+		const revList = calls.find((c) => c[0] === "rev-list");
+		// Two --author patterns → git ORs them; both passed verbatim (name with '( )'
+		// would match zero commits if regex-escaped, hence --fixed-strings).
+		expect(revList).toContain("--author=me@dev.io");
+		expect(revList).toContain("--author=J. Doe (Acme)");
+		expect(revList).toContain("--fixed-strings");
+	});
+
+	it("uses the name filter alone when only user.name is set", async () => {
+		const { execGit } = await import("../core/GitOps.js");
+		const calls: string[][] = [];
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			calls.push([...args]);
+			if (args[0] === "config" && args[1] === "user.name")
+				return { exitCode: 0, stdout: "Me Dev", stderr: "" } as never;
+			if (args[0] === "config") return { exitCode: 0, stdout: "", stderr: "" } as never; // no email
+			return { exitCode: 0, stdout: "h1", stderr: "" } as never;
+		});
+		const { recentCommitHashes } = await import("./BackfillEngine.js");
+		await recentCommitHashes(CWD, 10);
+		const revList = calls.find((c) => c[0] === "rev-list");
+		const authors = revList?.filter((a) => a.startsWith("--author=")) ?? [];
+		expect(authors).toEqual(["--author=Me Dev"]);
+		expect(revList).toContain("--fixed-strings");
 	});
 
 	it("returns [] when rev-list fails or is empty", async () => {
@@ -315,6 +432,8 @@ describe("countMissingSummaries / own-commit scoping", () => {
 		vi.mocked(getIndexEntryMap).mockResolvedValue(new Map());
 		await countMissingSummaries(CWD);
 		const revList = calls.find((c) => c[0] === "rev-list");
+		// No identity → neither --author nor the --fixed-strings that accompanies it.
 		expect(revList?.some((a) => a.startsWith("--author="))).toBe(false);
+		expect(revList).not.toContain("--fixed-strings");
 	});
 });

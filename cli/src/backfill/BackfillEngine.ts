@@ -27,7 +27,7 @@ import { launchWorker } from "../hooks/QueueWorker.js";
 import { createLogger } from "../Logger.js";
 import { type CommitSummary, CURRENT_SCHEMA_VERSION, type StoredTranscript } from "../Types.js";
 import { type AttributedCommit, attributeCommits } from "./CommitAttributor.js";
-import { buildCommitTargetIndex } from "./CommitTargetIndex.js";
+import { buildCommitTargetIndex, type CommitTargetIndex } from "./CommitTargetIndex.js";
 import { cwdInRoots, scanClaudeTranscripts } from "./RawTranscriptScanner.js";
 
 const log = createLogger("BackfillEngine");
@@ -43,6 +43,26 @@ const log = createLogger("BackfillEngine");
  */
 const DIFF_ONLY_BRANCH = "backfilled";
 
+/**
+ * Back-margin (matches {@link WINDOW_CAP_MS} in CommitAttributor) applied to the
+ * oldest emitted commit's author time when gathering cursor-boundary candidates:
+ * a commit's attribution window can reach back this far, so a neighbor commit that
+ * old must still be present to truncate ownership.
+ */
+const CURSOR_BACK_MARGIN_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * The single confidence tier EVERY back-fill entry point uses — manual `jolli
+ * backfill`, the enable-time background worker, and the VS Code enable trigger.
+ * "low" = window-collect-all: attach every in-window conversation turn within the
+ * commit's effective worktree + cursor slice, and let the per-summary confidence
+ * badge flag the weaker ones honestly. Chosen for maximal historical-context
+ * recovery (highest recall, closest to the live pipeline's behavior). Still
+ * overridable per invocation via `BackfillOptions.minTier` (the CLI exposes it as
+ * `--min-confidence`); this is only the default when a caller omits it.
+ */
+export const DEFAULT_BACKFILL_TIER: "high" | "medium" | "low" = "low";
+
 export type BackfillStatus = "generated" | "would-generate" | "skipped-has-summary" | "error";
 
 export interface BackfillOutcome {
@@ -50,8 +70,8 @@ export interface BackfillOutcome {
 	/** Commit subject (first line) for human-friendly progress display. */
 	readonly commitSubject?: string;
 	readonly status: BackfillStatus;
-	readonly confidence?: "high" | "medium";
-	readonly method?: "file-overlap" | "time-window" | "diff-only";
+	readonly confidence?: "high" | "medium" | "low";
+	readonly method?: "file-overlap" | "branch-match" | "time-window" | "diff-only";
 	readonly topics?: number;
 	readonly message?: string;
 }
@@ -69,7 +89,12 @@ export interface BackfillOptions {
 	/** Candidate commit hashes, newest-first (engine drops those already summarized). */
 	readonly hashes: ReadonlyArray<string>;
 	readonly dryRun?: boolean;
-	readonly includeMedium?: boolean;
+	/**
+	 * Lowest confidence tier to attribute. Defaults to {@link DEFAULT_BACKFILL_TIER}
+	 * ("low" = window-collect-all) for every entry point; pass an explicit value only
+	 * to override (e.g. the CLI `--min-confidence` flag).
+	 */
+	readonly minTier?: "high" | "medium" | "low";
 	/** Override for `~/.claude/projects` (tests inject a temp dir). */
 	readonly projectsRoot?: string;
 	/** Progress callback fired after each commit is processed. */
@@ -176,16 +201,10 @@ async function generateAndStore(
  * failure — per-commit errors become `error` outcomes so a batch always finishes.
  */
 export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport> {
-	const { cwd, hashes, dryRun = false, includeMedium = false, projectsRoot, onProgress } = opts;
+	const { cwd, hashes, dryRun = false, minTier = DEFAULT_BACKFILL_TIER, projectsRoot, onProgress } = opts;
 	const outcomes: BackfillOutcome[] = [];
 
-	log.info(
-		"Back-fill start: cwd=%s candidates=%d dryRun=%s includeMedium=%s",
-		cwd,
-		hashes.length,
-		dryRun,
-		includeMedium,
-	);
+	log.info("Back-fill start: cwd=%s candidates=%d dryRun=%s minTier=%s", cwd, hashes.length, dryRun, minTier);
 
 	const storage = await createStorage(cwd, cwd);
 	setActiveStorage(storage);
@@ -215,8 +234,17 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 		roots,
 	);
 
-	// 3. Attribute.
-	const { attributed } = attributeCommits(missing, bySession, index, { includeMedium });
+	// 3. Attribute. `attributeCommits` needs cursor boundaries beyond the emitted
+	// set: an already-summarized or out-of-`--last N` neighbor in the same worktree
+	// must truncate the window so its conversation isn't mis-attributed. So we pass
+	// EVERY own commit whose author time falls in the emitted range
+	// `[minTs − 7d, maxTs]` as `candidates`, but only `missing` as `emitOnly`.
+	const cursorCandidates = await gatherCursorCandidates(cwd, missing, index);
+	const { attributed } = attributeCommits(cursorCandidates, bySession, index, {
+		minTier,
+		emitOnly: new Set(missing),
+		worktreeRoots: roots,
+	});
 
 	// 4. Generate + store (unless dry-run).
 	const config = await loadConfig();
@@ -304,21 +332,39 @@ function summarize(total: number, outcomes: BackfillOutcome[]): BackfillReport {
 	return { total, generated, skipped, errors, outcomes };
 }
 
-/** The local git author email, or null when unset (used to scope to own commits). */
-async function localAuthorEmail(cwd: string): Promise<string | null> {
-	const res = await execGit(["config", "user.email"], cwd);
-	const email = res.exitCode === 0 ? res.stdout.trim() : "";
-	return email.length > 0 ? email : null;
+/** The local git author identity (email + name); each field null when unset. */
+async function localAuthorIdentity(cwd: string): Promise<{ email: string | null; name: string | null }> {
+	const read = async (key: string): Promise<string | null> => {
+		const res = await execGit(["config", key], cwd);
+		const v = res.exitCode === 0 ? res.stdout.trim() : "";
+		return v.length > 0 ? v : null;
+	};
+	return { email: await read("user.email"), name: await read("user.name") };
 }
 
 /**
- * Escapes regex metacharacters so a string matches literally. `git rev-list
- * --author=<v>` treats `<v>` as a regex, so an unescaped `.`/`+` in an email
- * (e.g. a Gmail `user+tag@…` alias) would match unintended authors and pull in
- * other people's commits — breaking the "own commits only" scoping.
+ * Pushes the local author filter onto `args`. git treats multiple `--author` as
+ * OR, so we match EITHER the configured email OR name — a commit made under a
+ * different-but-equivalent identity (local/remote email mismatch, or a name-only
+ * remote) still counts as the local user's own work, mirroring the live
+ * `isLocallyAuthored` (email OR name).
+ *
+ * `--author` is matched as a regex by default (git's BRE), where `+ ( ) ? { } |`
+ * are LITERALS — escaping them (as a naive regex-escape does) turns them into
+ * operators and matches nothing (a Gmail `user+tag@…` alias or a `J. Doe (Acme)`
+ * name would silently match zero commits). So we add `--fixed-strings` and pass
+ * the identity verbatim as a literal substring, mirroring `BranchCommitLister`.
+ * `--fixed-strings` is global but safe here since `--author` is the only pattern
+ * operand (no `--grep`). Returns whether any filter was added (false → no git
+ * identity configured, every commit is a candidate).
  */
-function escapeRegex(s: string): string {
-	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+async function pushAuthorFilter(args: string[], cwd: string): Promise<boolean> {
+	const { email, name } = await localAuthorIdentity(cwd);
+	if (!email && !name) return false;
+	args.push("--fixed-strings");
+	if (email) args.push(`--author=${email}`);
+	if (name) args.push(`--author=${name}`);
+	return true;
 }
 
 /**
@@ -326,23 +372,63 @@ function escapeRegex(s: string): string {
  * when given (`undefined` → all reachable commits). Shared by the CLI command,
  * the enable-time worker, and the VS Code "missing summaries" count/button.
  *
- * Scoped to the local user's OWN commits via `--author=<git user.email>`:
- * commits authored by others (merged or pulled in) never have Claude transcripts
- * on this machine, so back-filling them is pointless — they would always resolve
- * to "no conversation found" and inflate the missing-summary count. When no git
- * author email is configured, the filter is dropped (every commit is a candidate).
+ * Scoped to the local user's OWN commits (author email OR name): commits authored
+ * by others (merged or pulled in) never have Claude transcripts on this machine,
+ * so back-filling them is pointless — they would always resolve to "no
+ * conversation found" and inflate the missing-summary count. When no git author
+ * identity is configured, the filter is dropped (every commit is a candidate).
  */
 export async function recentCommitHashes(cwd: string, limit?: number): Promise<string[]> {
 	const args = ["rev-list", "HEAD"];
 	if (limit && limit > 0) args.push("--max-count", String(limit));
-	const email = await localAuthorEmail(cwd);
-	if (email) args.push(`--author=${escapeRegex(email)}`);
+	await pushAuthorFilter(args, cwd);
 	const res = await execGit(args, cwd);
 	if (res.exitCode !== 0 || !res.stdout.trim()) return [];
 	return res.stdout
 		.trim()
 		.split("\n")
 		.filter((h) => h.length > 0);
+}
+
+/**
+ * Builds the cursor-boundary candidate set for `attributeCommits`: every own
+ * commit whose AUTHOR time (rebase-stable, unlike committer time) falls in the
+ * emitted range `[min(emit ts) − 7d, max(emit ts)]`, unioned with `emitOnly`
+ * itself. This pulls in already-summarized / out-of-`--last N` neighbors so they
+ * can truncate the attribution window. The range is derived from the target
+ * index's author times; `emitOnly` commits absent from the index (no real files)
+ * simply keep the fallback (just `emitOnly`).
+ */
+async function gatherCursorCandidates(
+	cwd: string,
+	emitOnly: ReadonlyArray<string>,
+	index: CommitTargetIndex,
+): Promise<string[]> {
+	const emitTimes: number[] = [];
+	for (const h of emitOnly) {
+		const ts = index.commitMeta.get(h)?.ts;
+		if (typeof ts === "number") emitTimes.push(ts);
+	}
+	if (emitTimes.length === 0) return [...emitOnly];
+	const minTs = Math.min(...emitTimes) - CURSOR_BACK_MARGIN_MS;
+	const maxTs = Math.max(...emitTimes);
+
+	// `git log --pretty=format:%H|%at` — one clean line per commit (no "commit"
+	// header), %at = author epoch seconds. Own-author scoped (email OR name).
+	const args = ["log", "HEAD", "--pretty=format:%H|%at"];
+	await pushAuthorFilter(args, cwd);
+	const res = await execGit(args, cwd);
+	const candidates = new Set(emitOnly);
+	if (res.exitCode === 0 && res.stdout.trim()) {
+		for (const line of res.stdout.trim().split("\n")) {
+			const sep = line.indexOf("|");
+			if (sep < 0) continue;
+			const hash = line.slice(0, sep);
+			const ts = Number.parseInt(line.slice(sep + 1), 10) * 1000;
+			if (hash && !Number.isNaN(ts) && ts >= minTs && ts <= maxTs) candidates.add(hash);
+		}
+	}
+	return [...candidates];
 }
 
 /**

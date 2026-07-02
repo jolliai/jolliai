@@ -2074,6 +2074,14 @@ export function activate(context: vscode.ExtensionContext): void {
 						filesStore.refresh(true),
 						commitsStore.refresh(),
 					]);
+					// Mirror the CLI `jolli enable`: kick off a best-effort back-fill of
+					// historical commits that lack a summary. Fire-and-forget so enable stays
+					// responsive — the command streams its own progress notification and
+					// refreshes panels when done. runBackfill self-limits (early-returns when
+					// every recent commit already has a summary), a cheap no-op then.
+					void vscode.commands
+						.executeCommand("jollimemory.generateMissingSummaries")
+						.then(undefined, handleError("enable.backfill"));
 				}
 			},
 		),
