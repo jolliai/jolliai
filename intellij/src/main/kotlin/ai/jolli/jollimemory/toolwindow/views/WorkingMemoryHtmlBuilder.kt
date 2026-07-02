@@ -1,20 +1,54 @@
 package ai.jolli.jollimemory.toolwindow.views
 
+import ai.jolli.jollimemory.toolwindow.CommitMemoryFormat
+
 /**
  * Renders the "Working Memory" review web view — the full memory the next commit
  * will save. Mirrors the mockup's `pane-working` and reuses [SummaryCssBuilder]
  * for theme tokens so it matches the Memory Summary / PR webviews.
  *
- * Read-only/presentational: it shows what's included, plus a Commit Memory button
- * that bridges back to the IDE to run the AI commit.
+ * Interactive: each conversation / context row carries a ✕ (leave out) / + (add
+ * back) toggle that flips its commit-selection exclusion in place, and a token
+ * meter shows the AI usage captured by the included conversations. A Commit
+ * Memory button bridges back to the IDE to run the AI commit.
  */
 object WorkingMemoryHtmlBuilder {
 
-    /** A conversation feeding the next memory. */
-    data class WmConversation(val source: String, val title: String, val messageCount: Int)
+    /** Aggregate AI token usage captured by the included conversations. */
+    data class WmTokens(
+        val total: Long,
+        val input: Long,
+        val output: Long,
+        val cacheRead: Long,
+        val cacheWrite: Long,
+        /** Some included sources didn't report usage — the total understates reality. */
+        val partial: Boolean,
+    )
 
-    /** A linked context item (plan / note / reference / snippet). `tag` is the kb glyph. */
-    data class WmContext(val tag: String, val title: String)
+    /**
+     * A conversation feeding the next memory. [key] is the commit-selection key
+     * (`conversationKey`); [excluded] reflects whether the user has left it out.
+     */
+    data class WmConversation(
+        val source: String,
+        val title: String,
+        val messageCount: Int,
+        val key: String,
+        val excluded: Boolean,
+    )
+
+    /**
+     * A linked context item (plan / note / reference). `tag` is the kb glyph;
+     * [kind] is the commit-selection kind (`plans` / `notes` / `references`) and
+     * [key] its selection key (slug / id / mapKey).
+     */
+    data class WmContext(
+        val tag: String,
+        val title: String,
+        val kind: String,
+        val key: String,
+        val excluded: Boolean,
+    )
 
     /** A changed file that will be committed. */
     data class WmFile(val name: String, val dir: String, val status: String)
@@ -32,7 +66,8 @@ object WorkingMemoryHtmlBuilder {
          * useful signal — the view then shows an explanatory placeholder.
          */
         val proposedTitle: String?,
-        val tokenLabel: String,
+        /** AI usage captured by the included conversations; null when none reported. */
+        val token: WmTokens?,
         val conversations: List<WmConversation>,
         val context: List<WmContext>,
         val files: List<WmFile>,
@@ -53,10 +88,10 @@ object WorkingMemoryHtmlBuilder {
                 <h1 class="wm-title">Working Memory</h1>
                 ${metaStrip(view)}
                 <p class="wm-intro">The full memory your next commit will save — your final review.
-                Everything here is included. Nothing is committed until you choose
-                <b>Commit Memory</b> below.</p>
+                Everything here is included; leave an item out with <b>✕</b> or add it back with <b>+</b>.
+                Nothing is committed until you choose <b>Commit Memory</b> below.</p>
                 ${proposedTitle(view)}
-                ${tokenMeter(view)}
+                ${tokenMeter(view.token)}
                 ${conversationsPanel(view, isDark)}
                 ${contextPanel(view)}
                 ${filesPanel(view)}
@@ -73,6 +108,17 @@ object WorkingMemoryHtmlBuilder {
                 function __wmCommit() {
                   if (window.__jbQuery) window.__jbQuery(JSON.stringify({ command: 'commitMemory' }));
                 }
+                function __wmToggle(kind, key, excluded) {
+                  if (window.__jbQuery) window.__jbQuery(JSON.stringify({ command: 'toggleExclude', kind: kind, key: key, excluded: excluded }));
+                }
+                document.querySelectorAll('.wm-excl').forEach(function (btn) {
+                  btn.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    // data-excluded holds the CURRENT state; clicking flips it.
+                    var nowExcluded = btn.getAttribute('data-excluded') !== 'true';
+                    __wmToggle(btn.getAttribute('data-kind'), btn.getAttribute('data-key'), nowExcluded);
+                  });
+                });
               </script>
             </body>
             </html>
@@ -96,7 +142,6 @@ object WorkingMemoryHtmlBuilder {
         val ticket = v.detectedTicket?.let {
             "<span>Detected&nbsp;ticket&nbsp;<b>${esc(it)}</b></span>"
         } ?: ""
-        // A heuristic preview when we have one; otherwise the honest "written at commit" note.
         val titleHtml = if (v.proposedTitle != null) {
             "<div class=\"wm-title-text\">${esc(v.proposedTitle)}</div>" +
                 "<div class=\"wm-title-note\">Preview — the AI writes the final message when you commit.</div>"
@@ -115,15 +160,53 @@ object WorkingMemoryHtmlBuilder {
         """.trimIndent()
     }
 
-    private fun tokenMeter(v: WorkingMemoryView): String {
+    /**
+     * Token usage meter: a segmented input/output/cache bar + legend when usage was
+     * reported, or an honest "recorded at commit" note when it wasn't (live sessions
+     * from sources that don't emit per-message usage). Mirrors the mockup's `.tmeter`.
+     */
+    private fun tokenMeter(t: WmTokens?): String {
+        if (t == null || t.total <= 0) {
+            return """
+                <div class="wm-tmeter wm-tmeter-na">
+                  <div class="wm-tmeter-head">
+                    <span class="wm-tmeter-total">Token usage is recorded when you commit</span>
+                  </div>
+                </div>
+            """.trimIndent()
+        }
+        val cache = t.cacheRead + t.cacheWrite
+        fun pct(n: Long): Int = if (t.total <= 0) 0 else Math.round(n * 100.0 / t.total).toInt()
+        val partialNote = if (t.partial) """<span class="wm-tmeter-sub">· partial (some sources don't report)</span>""" else ""
+        val tip = "${CommitMemoryFormat.formatTokens(t.input)} input · ${CommitMemoryFormat.formatTokens(t.output)} output · " +
+            "${CommitMemoryFormat.formatTokens(t.cacheRead)} cache read · ${CommitMemoryFormat.formatTokens(t.cacheWrite)} cache write"
         return """
             <div class="wm-tmeter">
               <div class="wm-tmeter-head">
-                <span class="wm-tmeter-total">${esc(v.tokenLabel)}</span>
+                <span class="wm-tmeter-total">${CommitMemoryFormat.formatTokens(t.total)} tokens</span>
                 <span class="wm-tmeter-sub">· captured by this memory</span>
+                $partialNote
+              </div>
+              <div class="wm-tmeter-bar" title="${esc(tip)}">
+                <span class="wm-seg-in" style="width:${pct(t.input)}%"></span>
+                <span class="wm-seg-out" style="width:${pct(t.output)}%"></span>
+                <span class="wm-seg-cache" style="width:${pct(cache)}%"></span>
+              </div>
+              <div class="wm-tmeter-legend">
+                <span><i class="wm-lg-dot wm-seg-in"></i>${CommitMemoryFormat.formatTokens(t.input)} input</span>
+                <span><i class="wm-lg-dot wm-seg-out"></i>${CommitMemoryFormat.formatTokens(t.output)} output</span>
+                <span><i class="wm-lg-dot wm-seg-cache"></i>${CommitMemoryFormat.formatTokens(cache)} cached</span>
               </div>
             </div>
         """.trimIndent()
+    }
+
+    /** ✕ (leave out) / + (add back) toggle appended to a row. */
+    private fun exclBtn(kind: String, key: String, excluded: Boolean): String {
+        val glyph = if (excluded) "+" else "✕"
+        val title = if (excluded) "Add back to this memory" else "Leave out of this memory"
+        return """<button class="wm-excl" data-kind="${esc(kind)}" data-key="${esc(key)}" """ +
+            """data-excluded="$excluded" title="$title" aria-label="$title">$glyph</button>"""
     }
 
     private fun conversationsPanel(v: WorkingMemoryView, isDark: Boolean): String {
@@ -133,10 +216,11 @@ object WorkingMemoryHtmlBuilder {
             v.conversations.joinToString("") { c ->
                 val meta = if (c.messageCount > 0) "${c.messageCount} msg${if (c.messageCount != 1) "s" else ""}" else ""
                 """
-                <div class="wm-row">
+                <div class="wm-row${if (c.excluded) " wm-excluded" else ""}">
                   <span class="wm-logo" title="${esc(sourceLabel(c.source))}">${sourceIconSvg(c.source, isDark)}</span>
                   <div class="wm-rmain"><div class="wm-rtitle">${esc(c.title)}</div></div>
                   <span class="wm-rmeta">$meta</span>
+                  ${exclBtn("conversations", c.key, c.excluded)}
                 </div>
                 """.trimIndent()
             }
@@ -144,11 +228,6 @@ object WorkingMemoryHtmlBuilder {
         return panel("Conversations", v.conversations.size, rows)
     }
 
-    /**
-     * Inlines the per-tool logo SVG (the same `source-*.svg` icons the sidebar
-     * uses) so it renders inside the JCEF page. Picks the `_dark` variant in dark
-     * themes when one exists; falls back to the source initial on a miss.
-     */
     private fun sourceIconSvg(source: String, isDark: Boolean): String {
         val name = if (source == "copilot-chat") "copilot" else source
         val base = "/icons/source-$name"
@@ -166,9 +245,10 @@ object WorkingMemoryHtmlBuilder {
         } else {
             v.context.joinToString("") { c ->
                 """
-                <div class="wm-row">
+                <div class="wm-row${if (c.excluded) " wm-excluded" else ""}">
                   <span class="wm-kbtag">${esc(c.tag)}</span>
                   <div class="wm-rmain"><div class="wm-rtitle">${esc(c.title)}</div></div>
+                  ${exclBtn(c.kind, c.key, c.excluded)}
                 </div>
                 """.trimIndent()
             }
@@ -213,7 +293,6 @@ object WorkingMemoryHtmlBuilder {
         else -> source.replaceFirstChar { it.uppercase() }
     }
 
-    /** Small database glyph for the Local-first note; inherits the note's color. */
     private const val DB_ICON =
         "<svg class=\"wm-db\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.3\">" +
             "<ellipse cx=\"8\" cy=\"3.5\" rx=\"5\" ry=\"2\"/>" +
@@ -223,7 +302,6 @@ object WorkingMemoryHtmlBuilder {
     private fun esc(s: String): String = s
         .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
 
-    /** Working-memory-specific styling layered on top of the shared summary theme. */
     private fun extraCss(): String = """
         .wm { padding: 14px 16px 22px; }
         .wm-title { font-size: 19px; margin: 0 0 8px; color: var(--text-primary); }
@@ -240,9 +318,20 @@ object WorkingMemoryHtmlBuilder {
         .wm-title-note { font-size: 11px; color: var(--text-tertiary); margin-bottom: 8px; }
         .wm-grid { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 11.5px; color: var(--text-secondary); }
         .wm-grid b { color: var(--text-primary); font-weight: 600; }
-        .wm-tmeter { margin: 0 0 12px; }
-        .wm-tmeter-total { font-weight: 700; color: var(--text-primary); }
-        .wm-tmeter-sub { color: var(--text-tertiary); font-size: 11.5px; margin-left: 4px; }
+        /* ── Token meter ── */
+        .wm-tmeter { margin: 2px 0 14px; }
+        .wm-tmeter-head { font-size: 12.5px; color: var(--text-secondary); display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; }
+        .wm-tmeter-total { font-size: 15px; font-weight: 700; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+        .wm-tmeter-sub { color: var(--text-tertiary); font-size: 11px; }
+        .wm-tmeter-na .wm-tmeter-total { font-size: 12.5px; font-weight: 400; font-style: italic; color: var(--text-tertiary); }
+        .wm-tmeter-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; margin: 8px 2px; max-width: 380px; background: rgba(128,128,128,0.16); }
+        .wm-tmeter-bar > span { display: block; height: 100%; }
+        .wm-seg-in { background: var(--stat-add); }
+        .wm-seg-out { background: var(--link-fg); }
+        .wm-seg-cache { background: rgba(128,128,128,0.55); }
+        .wm-tmeter-legend { display: flex; flex-wrap: wrap; gap: 13px; font-size: 10.5px; color: var(--text-secondary); }
+        .wm-tmeter-legend span { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
+        .wm-lg-dot { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; display: inline-block; }
         .wm-panel-head { display: flex; align-items: center; margin-bottom: 6px; }
         .wm-panel-title { font-weight: 600; color: var(--text-primary); font-size: 12.5px; }
         .wm-count { margin-left: auto; color: var(--text-tertiary); font-size: 11.5px; }
@@ -261,6 +350,12 @@ object WorkingMemoryHtmlBuilder {
         .wm-gs-A { color: var(--stat-add); }
         .wm-gs-D { color: var(--stat-del); }
         .wm-fname { font-family: ui-monospace, monospace; }
+        /* ── Remove / add toggle ── */
+        .wm-excl { flex-shrink: 0; width: 20px; height: 20px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: none; border: none; border-radius: 4px; cursor: pointer; color: var(--text-secondary); font-size: 14px; font-weight: 600; line-height: 1; }
+        .wm-excl:hover { background: var(--surface-hover); color: var(--text-primary); }
+        .wm-excluded { opacity: 0.6; }
+        .wm-excluded .wm-rtitle { text-decoration: line-through; }
+        .wm-excluded .wm-excl { color: var(--link-fg); }
         .wm-privacy { display: flex; gap: 6px; align-items: flex-start; font-size: 11.5px; color: var(--text-secondary); margin: 10px 0 6px; }
         .wm-ccnote { font-size: 11.5px; color: var(--text-secondary); line-height: 1.5; margin: 0 0 8px; }
         .wm-localfirst { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--ship-ok); margin: 0 0 10px; }

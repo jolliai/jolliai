@@ -1,14 +1,20 @@
 package ai.jolli.jollimemory.toolwindow
 
+import ai.jolli.jollimemory.core.ActiveConversationItem
 import ai.jolli.jollimemory.core.ActiveSessionAggregator
 import ai.jolli.jollimemory.core.CommitSelectionStore
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.core.StoredSession
+import ai.jolli.jollimemory.core.TokenUsage
+import ai.jolli.jollimemory.core.TranscriptReader
+import ai.jolli.jollimemory.core.TranscriptSource
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliMemoryService
 import ai.jolli.jollimemory.toolwindow.views.WorkingMemoryHtmlBuilder
 import ai.jolli.jollimemory.toolwindow.views.WorkingMemoryHtmlBuilder.WmContext
 import ai.jolli.jollimemory.toolwindow.views.WorkingMemoryHtmlBuilder.WmConversation
 import ai.jolli.jollimemory.toolwindow.views.WorkingMemoryHtmlBuilder.WmFile
+import ai.jolli.jollimemory.toolwindow.views.WorkingMemoryHtmlBuilder.WmTokens
 import ai.jolli.jollimemory.toolwindow.views.WorkingMemoryHtmlBuilder.WorkingMemoryView
 import com.google.gson.JsonParser
 import com.intellij.ide.BrowserUtil
@@ -64,8 +70,16 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             query.addHandler { request ->
                 try {
                     val json = JsonParser.parseString(request).asJsonObject
-                    if (json.get("command")?.asString == "commitMemory") {
-                        SwingUtilities.invokeLater { runCommit() }
+                    when (json.get("command")?.asString) {
+                        "commitMemory" -> SwingUtilities.invokeLater { runCommit() }
+                        "toggleExclude" -> {
+                            val kind = json.get("kind")?.asString
+                            val key = json.get("key")?.asString
+                            val excluded = json.get("excluded")?.asBoolean ?: false
+                            if (kind != null && key != null) {
+                                SwingUtilities.invokeLater { handleToggleExclude(kind, key, excluded) }
+                            }
+                        }
                     }
                 } catch (e: Exception) {
                     LOG.warn("Failed to parse working-memory message: ${e.message}")
@@ -149,20 +163,36 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             CommitSelectionStore.CommitExclusions()
         }
 
-        val conversations = try {
+        // Show ALL active conversations, not just the included ones: excluded rows stay
+        // visible (struck through) with a + to add them back — the mockup's inline
+        // "leave out / add back" editing. `excluded` drives the ✕/+ toggle state.
+        val rawConversations = try {
             ActiveSessionAggregator.listActiveConversations(cwd)
-                .filter { CommitSelectionStore.conversationKey(it.source, it.sessionId) !in exclusions.conversations }
-                .map {
-                    WmConversation(it.source.name, it.title.ifBlank { "${it.source.name} conversation" }, it.messageCount)
-                }
         } catch (_: Exception) {
             emptyList()
+        }
+        val conversations = rawConversations.map {
+            val key = CommitSelectionStore.conversationKey(it.source, it.sessionId)
+            WmConversation(
+                source = it.source.name,
+                title = it.title.ifBlank { "${it.source.name} conversation" },
+                messageCount = it.messageCount,
+                key = key,
+                excluded = key in exclusions.conversations,
+            )
         }
 
         val context = gatherContext(exclusions)
         val detectedTicket = context.firstOrNull { it.tag == "L" || it.tag == "J" }
             ?.let { Regex("[A-Z]+-\\d+").find(it.title)?.value }
             ?: Regex("[A-Z]+-\\d+").find(branch)?.value
+
+        // Token usage is aggregated from the INCLUDED conversations' transcripts (the
+        // ones that will actually enter the memory), so unchecking a conversation drops
+        // its tokens from the meter too.
+        val includedConversations = rawConversations.filter {
+            CommitSelectionStore.conversationKey(it.source, it.sessionId) !in exclusions.conversations
+        }
 
         return WorkingMemoryView(
             branch = branch,
@@ -171,13 +201,59 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             deletions = del,
             detectedTicket = detectedTicket,
             proposedTitle = buildProposedTitle(branch, detectedTicket),
-            // Live sessions don't carry token usage in the plugin; usage is captured
-            // when the memory is generated at commit time.
-            tokenLabel = "N/A tokens",
+            token = computeTokens(includedConversations),
             conversations = conversations,
             context = context,
             files = selectedFiles,
         )
+    }
+
+    /**
+     * Aggregates AI coding-session token usage from the included conversations'
+     * transcripts. Only JSONL sources that emit per-message `usage` (Claude, Codex,
+     * Gemini) are read; others count toward the session total but not the reported
+     * count, so [TokenUsage.partial] flags an understated meter. Returns null when no
+     * included source reported usage — the meter then shows its "recorded at commit"
+     * state instead of a misleading zero. Runs on the caller's pooled thread.
+     */
+    private fun computeTokens(included: List<ActiveConversationItem>): WmTokens? {
+        if (included.isEmpty()) return null
+        val usageSources = setOf(TranscriptSource.claude, TranscriptSource.codex, TranscriptSource.gemini)
+        val sessions = included.map { c ->
+            val entries = if (c.source in usageSources) {
+                try {
+                    TranscriptReader.readTranscript(c.transcriptPath).entries
+                } catch (_: Exception) {
+                    emptyList()
+                }
+            } else {
+                emptyList()
+            }
+            StoredSession(c.sessionId, c.source, c.transcriptPath, entries)
+        }
+        val usage = TokenUsage.aggregate(sessions) ?: return null
+        return WmTokens(
+            total = usage.total,
+            input = usage.inputTokens,
+            output = usage.outputTokens,
+            cacheRead = usage.cacheReadTokens,
+            cacheWrite = usage.cacheWriteTokens,
+            partial = usage.partial,
+        )
+    }
+
+    /** Flips a working-memory item's commit-selection exclusion, then refreshes. */
+    private fun handleToggleExclude(kind: String, key: String, excluded: Boolean) {
+        try {
+            CommitSelectionStore.setExcluded(cwd, kind, key, excluded)
+        } catch (e: Exception) {
+            LOG.warn("toggleExclude failed: ${e.message}")
+            return
+        }
+        // Refresh the sidebar panels + this review. notifySelectionChanged fans out to
+        // our own selectionListener (→ reload); fall back to a direct reload if the
+        // service is unavailable.
+        if (service != null) service.notifySelectionChanged() else reload()
     }
 
     /**
@@ -243,20 +319,19 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             // No branch filter on any kind: uncommitted working-area items follow the
             // user across branches (matches CLI/VS Code). `branch` is stamped but not
             // filtered on; only committed memory is branch-tagged.
+            // Excluded items stay listed (struck through, with a + to add back), so
+            // only committed/ignored ones are dropped. `excluded` drives the toggle.
             registry.plans.values.forEach { p ->
-                if (p.slug in exclusions.plans) return@forEach
                 if (p.ignored == true || p.commitHash != null) return@forEach
                 if (!File(p.sourcePath).exists()) return@forEach
-                out.add(WmContext("P", p.title))
+                out.add(WmContext("P", p.title, "plans", p.slug, p.slug in exclusions.plans))
             }
             registry.notes?.values?.forEach { n ->
-                if (n.id in exclusions.notes) return@forEach
                 if (n.ignored == true || n.commitHash != null) return@forEach
-                out.add(WmContext("N", n.title))
+                out.add(WmContext("N", n.title, "notes", n.id, n.id in exclusions.notes))
             }
             registry.references?.forEach { (mapKey, r) ->
-                if (mapKey in exclusions.references) return@forEach
-                out.add(WmContext(referenceTag(r.source), r.title))
+                out.add(WmContext(referenceTag(r.source), r.title, "references", mapKey, mapKey in exclusions.references))
             }
         } catch (_: Exception) {
             // best-effort
