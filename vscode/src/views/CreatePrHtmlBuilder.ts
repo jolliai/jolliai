@@ -7,14 +7,14 @@
  * no inline `style=""` attributes and no inline event handlers (CSP forbids
  * both).
  *
- * Markdown rendering decision: no shared markdown renderer is available as a
- * TypeScript-side import in the views/ layer (renderMarkdown lives inside the
- * webview JS bundle, not importable here).  `bodyMarkdown` is therefore
- * rendered inside `<pre class="md-raw">` with HTML-escaped content.
- * This is intentional and noted here for a follow-up.
+ * Markdown rendering: `bodyMarkdown` is rendered to formatted HTML server-side
+ * by {@link renderPrBodyMarkdown} (headings, bold, lists, code, quotes, plus
+ * native `<details>` folding), so the body reads like the memory detail view
+ * instead of raw monospace text.
  */
 
 import type { CreatePrViewModel } from "./CreatePrData.js";
+import { renderPrBodyMarkdown } from "./CreatePrBodyMarkdown.js";
 // Reuse the shared attribute escaper rather than a private copy — both escape
 // the same five chars (&, ", ', <, >), & first to avoid double-escaping.
 import { escAttr as esc } from "./SummaryUtils.js";
@@ -220,11 +220,36 @@ function buildCss(nonce: string): string {
   .gs-R { color: var(--vscode-gitDecoration-renamedResourceForeground); }
   .gs-U { color: var(--vscode-gitDecoration-untrackedResourceForeground); }
   .gs-C { color: var(--vscode-gitDecoration-conflictingResourceForeground); }
-  /* ── Body markdown (pre-escaped, raw display) ── */
-  pre.md-raw {
-    white-space: pre-wrap; word-break: break-word; font-family: var(--vscode-font-family);
-    font-size: 0.9em; color: var(--vscode-foreground); line-height: 1.6;
+  /* ── Body markdown (rendered like the memory detail view) ── */
+  .md-body { font-size: 0.9em; line-height: 1.6; color: var(--vscode-foreground); word-break: break-word; }
+  .md-body .md-heading {
+    font-size: 0.82em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--text-secondary); margin: 14px 0 6px;
   }
+  .md-body .md-heading:first-child { margin-top: 0; }
+  .md-body .md-line { margin: 2px 0; }
+  .md-body .md-blank { height: 8px; }
+  .md-body .md-list { margin: 4px 0 8px 20px; }
+  .md-body .md-list li { margin: 2px 0; }
+  .md-body strong { font-weight: 650; }
+  .md-body .md-link { color: var(--vscode-textLink-foreground); }
+  .md-body .md-hr { border: none; border-top: 1px solid var(--border-light); margin: 14px 0; }
+  .md-body .md-inline-code, .md-body code {
+    font-family: var(--vscode-editor-font-family, monospace); font-size: 0.9em;
+    background: var(--panel-inner); padding: 1px 5px; border-radius: 4px;
+  }
+  .md-body .md-code-block {
+    background: var(--panel-inner); border-radius: 6px; padding: 10px 12px;
+    overflow-x: auto; margin: 8px 0; font-size: 0.9em; line-height: 1.5;
+  }
+  .md-body .md-code-block code { background: none; padding: 0; }
+  .md-body blockquote {
+    border-left: 2px solid var(--border-light); margin: 8px 0;
+    padding: 2px 0 2px 12px; color: var(--text-secondary);
+  }
+  .md-body details { margin: 6px 0; }
+  .md-body summary { cursor: pointer; padding: 3px 0; }
+  .md-body summary:hover { color: var(--vscode-foreground); }
   /* ── E2E guide content ── */
   .md-mock p { margin: 6px 0; }
   .md-mock ol { margin: 4px 0 8px 20px; }
@@ -233,11 +258,16 @@ function buildCss(nonce: string): string {
   .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
   .btn {
     font-family: var(--vscode-font-family); font-size: 0.88em;
+    display: inline-flex; align-items: center; gap: 5px;
     padding: 5px 14px; border-radius: 5px; cursor: pointer;
     border: 1px solid var(--vscode-button-border, var(--border-light));
     background: var(--vscode-button-background);
     color: var(--vscode-button-foreground);
   }
+  /* codicon.css pins .codicon to font: 16px with (0,2,0) specificity; this rule
+     matches that specificity and — loading after the linked stylesheet — wins on
+     source order, sizing the pull-request glyph to the button label. */
+  .btn .codicon { font-size: 1em; }
   .btn:hover { background: var(--vscode-button-hoverBackground); }
   .btn.secondary {
     background: var(--vscode-button-secondaryBackground, var(--surface-hover));
@@ -248,7 +278,15 @@ function buildCss(nonce: string): string {
   /* ── Edit form (revealed by the Edit button) ── */
   /* Mirrors the pr-form-input/pr-form-textarea styling in PrCommentService's
      buildPrSectionCss: theme input bg/fg, full width, comfortable padding. */
-  .edit-form { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+  .edit-form { display: flex; flex-direction: column; gap: 16px; margin-top: 4px; }
+  .edit-form .field { display: flex; flex-direction: column; gap: 6px; }
+  /* Field labels reuse the panel-title treatment so the form reads as part of
+     the same visual system as the read-only panels it replaces. */
+  .edit-form .field-label {
+    font-size: 0.78em; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.09em; color: var(--text-secondary);
+  }
+  .edit-form .actions { margin-top: 0; }
   .pr-input {
     width: 100%; box-sizing: border-box; padding: 6px 10px;
     font-size: 0.92em; font-family: var(--vscode-font-family);
@@ -310,8 +348,16 @@ function buildScript(nonce: string): string {
   document.getElementById('cmd-create-pr').addEventListener('click', function () {
     submit({ command: 'createPr' });
   });
+  // Edit is a full mode switch: hide the read-only view (meta, panels, primary
+  // actions) and reveal the title/body form with its own Create + Cancel row.
+  // Cancel returns to the view without submitting; input values are retained.
   document.getElementById('cmd-edit').addEventListener('click', function () {
+    document.getElementById('view-mode').classList.add('hidden');
     document.getElementById('edit-form').classList.remove('hidden');
+  });
+  document.getElementById('cmd-cancel').addEventListener('click', function () {
+    document.getElementById('edit-form').classList.add('hidden');
+    document.getElementById('view-mode').classList.remove('hidden');
   });
   document.getElementById('cmd-copy-body').addEventListener('click', function () {
     vscode.postMessage({ command: 'copyBody' });
@@ -348,21 +394,47 @@ function buildScript(nonce: string): string {
 }
 
 /**
+ * Bundled-asset URIs the pane needs beyond the nonce.
+ *
+ * Optional so unit tests can call `buildCreatePrHtml(vm, nonce)` without a
+ * webview: when omitted the pane renders no codicon glyph and keeps the
+ * nonce-only CSP (so an inline-style/JS regression still fails loudly). The
+ * panel always supplies it in production.
+ */
+export interface CreatePrAssets {
+	/** `webview.cspSource` — allowlists the bundled codicon stylesheet + font. */
+	cspSource: string;
+	/** `asWebviewUri(extensionUri/assets/codicons/codicon.css)` result. */
+	codiconCssUri: string;
+}
+
+/**
  * Builds the full HTML document for the Create PR webview pane.
  *
  * @param vm - The view-model assembled by buildCreatePrViewModel.
  * @param nonce - CSP nonce injected by the VS Code extension host.
+ * @param assets - Bundled codicon stylesheet URI + `cspSource`. When present the
+ *   submit buttons render a git-pull-request glyph (matching the design mockup)
+ *   and the CSP allowlists the codicon font. Omit in tests to render icon-free.
  * @returns A complete `<!DOCTYPE html>` document string.
  */
-export function buildCreatePrHtml(vm: CreatePrViewModel, nonce: string): string {
-	const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';" />`;
+export function buildCreatePrHtml(vm: CreatePrViewModel, nonce: string, assets?: CreatePrAssets): string {
+	// With codicons the CSP must allowlist the bundled stylesheet (style-src) and
+	// its font file (font-src) from the extension asset origin; without assets we
+	// keep the tighter nonce-only CSP.
+	const csp = assets
+		? `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${assets.cspSource} 'nonce-${nonce}'; font-src ${assets.cspSource}; script-src 'nonce-${nonce}';" />`
+		: `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';" />`;
+	// Linked before buildCss so the inline .btn .codicon size override wins on
+	// source order (see buildCss). Empty when icon-free.
+	const codiconLink = assets ? `<link rel="stylesheet" href="${assets.codiconCssUri}" />` : "";
+	const prIcon = assets ? `<span class="codicon codicon-git-pull-request"></span>` : "";
 	// Update mode when an open PR already exists on the branch: the button
 	// pushes the latest commits and syncs this draft into PR #N instead of
 	// creating a duplicate (which GitHub rejects).
 	const isUpdate = vm.existingPr !== undefined;
 	const heading = isUpdate ? "Update Pull Request" : "Create Pull Request";
 	const primaryLabel = isUpdate ? "Update PR" : "Create PR";
-	const editedLabel = isUpdate ? "Update with these" : "Create with these";
 
 	return `<!DOCTYPE html>
 <html lang="en">
@@ -371,44 +443,56 @@ export function buildCreatePrHtml(vm: CreatePrViewModel, nonce: string): string 
   ${csp}
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>${heading}</title>
+  ${codiconLink}
   ${buildCss(nonce)}
 </head>
 <body>
 <div class="pane" id="pane-pr">
   <h1>${heading}</h1>
-  ${buildMetaStrip(vm)}
-  <div class="panel">
-    <div class="panel-header"><span class="panel-title">Title</span></div>
-    <p>${esc(vm.title)}</p>
-  </div>
-  <div class="panel">
-    <div class="panel-header"><span class="panel-title">Body — drafted from this branch&#39;s memories</span></div>
-    <pre class="md-raw">${esc(vm.bodyMarkdown)}</pre>
-  </div>
-  <div class="panel">
-    <div class="panel-header">
-      <span class="panel-title">Memories included</span>
-      <span class="sec-count">${vm.memoryCount}</span>
+  <div id="view-mode">
+    ${buildMetaStrip(vm)}
+    <div class="panel">
+      <div class="panel-header"><span class="panel-title">Title</span></div>
+      <p>${esc(vm.title)}</p>
     </div>
-    ${buildMemoryRows(vm)}
-  </div>
-  ${buildE2ePanel(vm)}
-  <div class="panel">
-    <div class="panel-header">
-      <span class="panel-title">Files changed</span>
-      <span class="sec-count">${vm.filesChanged}</span>
+    <div class="panel">
+      <div class="panel-header"><span class="panel-title">Body: drafted from this branch&#39;s memories</span></div>
+      <div class="md-body">${renderPrBodyMarkdown(vm.bodyMarkdown)}</div>
     </div>
-    ${buildFileRows(vm)}
-  </div>
-  <div class="actions">
-    <button class="btn" id="cmd-create-pr">${primaryLabel}</button>
-    <button class="btn secondary" id="cmd-edit">Edit</button>
-    <button class="btn secondary" id="cmd-copy-body">Copy body</button>
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Memories included</span>
+        <span class="sec-count">${vm.memoryCount}</span>
+      </div>
+      ${buildMemoryRows(vm)}
+    </div>
+    ${buildE2ePanel(vm)}
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Files changed</span>
+        <span class="sec-count">${vm.filesChanged}</span>
+      </div>
+      ${buildFileRows(vm)}
+    </div>
+    <div class="actions">
+      <button class="btn" id="cmd-create-pr">${prIcon}${primaryLabel}</button>
+      <button class="btn secondary" id="cmd-edit">Edit</button>
+      <button class="btn secondary" id="cmd-copy-body">Copy body</button>
+    </div>
   </div>
   <div class="edit-form hidden" id="edit-form">
-    <input id="prTitleInput" class="pr-input" value="${esc(vm.title)}" />
-    <textarea id="prBodyInput" class="pr-textarea" rows="12">${esc(vm.bodyMarkdown)}</textarea>
-    <button class="btn" id="cmd-create-edited"><span class="codicon codicon-git-pull-request"></span> ${editedLabel}</button>
+    <div class="field">
+      <label class="field-label" for="prTitleInput">Title</label>
+      <input id="prTitleInput" class="pr-input" value="${esc(vm.title)}" />
+    </div>
+    <div class="field">
+      <label class="field-label" for="prBodyInput">Body</label>
+      <textarea id="prBodyInput" class="pr-textarea" rows="12">${esc(vm.bodyMarkdown)}</textarea>
+    </div>
+    <div class="actions">
+      <button class="btn" id="cmd-create-edited">${prIcon}${primaryLabel}</button>
+      <button class="btn secondary" id="cmd-cancel">Cancel</button>
+    </div>
   </div>
 </div>
 ${buildScript(nonce)}
