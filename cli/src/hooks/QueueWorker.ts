@@ -2875,9 +2875,17 @@ async function loadSessionTranscripts(
 
 	const rawAll = await readAllTranscripts(allSessions, cwd, beforeTimestamp);
 	// Keep only checked conversations for the summary; excluded ones were read
-	// purely to advance their cursor (discard).
+	// purely to advance their cursor (discard). Their usage tokens must be dropped
+	// from conversationTokens too — otherwise the stored token bar overcounts by the
+	// excluded conversations' tokens while the summary body and entry counts reflect
+	// only the kept ones. Sum tokens over the retained conversations only.
+	let retainedConversationTokens = 0;
+	for (const [key, tokens] of rawAll.tokensByKey) {
+		if (!excludedConversationKeys.has(key)) retainedConversationTokens += tokens;
+	}
 	const raw = {
 		...rawAll,
+		conversationTokens: retainedConversationTokens,
 		sessionTranscripts: rawAll.sessionTranscripts.filter(
 			(s) => !excludedConversationKeys.has(conversationKey(s.source ?? "claude", s.sessionId)),
 		),
@@ -2959,11 +2967,17 @@ async function readAllTranscripts(
 	totalEntries: number;
 	humanEntries: number;
 	conversationTokens: number;
+	tokensByKey: Map<string, number>;
 }> {
 	const sessionTranscripts: SessionTranscript[] = [];
 	let totalEntries = 0;
 	let humanEntries = 0;
 	let conversationTokens = 0;
+	// Per-conversation token attribution so the caller can drop excluded
+	// conversations' tokens from the stored total. Keyed by conversationKey and
+	// populated even when a slice yields zero merged entries (a usage-only slice),
+	// so the subtraction stays exact.
+	const tokensByKey = new Map<string, number>();
 
 	for (const session of sessions) {
 		const cursor = await loadCursorForTranscript(session.transcriptPath, cwd);
@@ -3047,7 +3061,10 @@ async function readAllTranscripts(
 		// (as the entry/session bookkeeping below is) would silently drop those tokens
 		// from conversationTokens. Token accounting and entry accounting are
 		// independent concerns, so accumulate tokens here, before the entries gate.
-		conversationTokens += result.usageTokens ?? 0;
+		const usage = result.usageTokens ?? 0;
+		conversationTokens += usage;
+		const convKey = conversationKey(source, session.sessionId);
+		tokensByKey.set(convKey, (tokensByKey.get(convKey) ?? 0) + usage);
 
 		if (result.entries.length > 0) {
 			sessionTranscripts.push({
@@ -3072,7 +3089,7 @@ async function readAllTranscripts(
 		await saveCursor(result.newCursor, cwd);
 	}
 
-	return { sessionTranscripts, totalEntries, humanEntries, conversationTokens };
+	return { sessionTranscripts, totalEntries, humanEntries, conversationTokens, tokensByKey };
 }
 
 /**
