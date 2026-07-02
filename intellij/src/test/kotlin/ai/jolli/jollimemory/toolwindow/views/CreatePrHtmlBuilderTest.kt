@@ -87,6 +87,20 @@ class CreatePrHtmlBuilderTest {
     }
 
     @Test
+    fun `edits title and body in place — no separate edit form — and includes a copy toast`() {
+        val html = CreatePrHtmlBuilder.buildHtml(vm(), isDark = true, bridgeScript = "")
+        // Inline editors live inside the Title/Body panels (hidden until Edit).
+        html shouldContain """id="prTitleDisplay""""
+        html shouldContain """id="prTitleInput" class="pr-input hidden""""
+        html shouldContain """id="prBodyInput" class="pr-textarea hidden""""
+        // Toast target for the copy confirmation.
+        html shouldContain """id="prToast""""
+        // The old separate edit form is gone.
+        html shouldNotContain """id="editForm""""
+        html shouldNotContain "cmdCreateEdited"
+    }
+
+    @Test
     fun `escapes HTML in the title to prevent injection`() {
         val html = CreatePrHtmlBuilder.buildHtml(vm(title = "<img src=x onerror=alert(1)>"), true, "")
         html shouldContain "&lt;img src=x onerror=alert(1)&gt;"

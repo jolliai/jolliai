@@ -157,6 +157,7 @@ class CreatePrPanel(
     private fun handleCopyBody() {
         val body = PrService.wrapWithMarkers(vm.bodyMarkdown)
         Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(body), null)
+        postToWebview("bodyCopied", mapOf("text" to "Copied PR body markdown to clipboard"))
     }
 
     private fun handleOpenMemory(hash: String) {
