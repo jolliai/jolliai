@@ -581,11 +581,9 @@ val sb = StringBuilder()
 
         val headHash = g.getHeadHash()
 
-        // Find merge-base
-        var mergeBase = g.exec("merge-base", "HEAD", baseRef)?.trim()
-        if (mergeBase.isNullOrBlank()) {
-            mergeBase = null
-        }
+        // Find merge-base (val so the else arm below smart-casts it to non-null).
+        val mergeBaseRaw = g.exec("merge-base", "HEAD", baseRef)?.trim()
+        val mergeBase = mergeBaseRaw?.takeIf { it.isNotBlank() }
 
         // If merge-base equals HEAD, we're on main or branch is fully merged.
         // When on main with a remote, show unpushed commits (origin/main..HEAD).
@@ -595,7 +593,18 @@ val sb = StringBuilder()
             mergeBase == null -> null // No common ancestor
             mergeBase == headHash && baseRef.startsWith("origin/") -> "$baseRef..HEAD"
             mergeBase == headHash -> return emptyList() // On main or fresh branch — no branch-specific commits
-            else -> "$mergeBase..HEAD"
+            else -> {
+                // Narrow the fork point to the branch's true reflog creation point,
+                // so a branch cut from a feature/release branch — including a
+                // brand-new branch that still shares its parent's tip — does not
+                // inherit the base branch's commits as its own. When the refined
+                // base equals HEAD the branch has no own commits yet, so the panel
+                // clears. Mirrors VS Code listBranchCommits -> resolveOwnCommitsBase.
+                val branch = g.getCurrentBranch()?.trim()
+                val ownBase = if (branch.isNullOrBlank()) mergeBase else g.resolveOwnCommitsBase(branch, mergeBase)
+                if (ownBase == headHash) return emptyList()
+                "$ownBase..HEAD"
+            }
         }
 
         // Get commits with full metadata

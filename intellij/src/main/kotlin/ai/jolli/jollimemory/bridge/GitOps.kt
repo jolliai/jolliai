@@ -264,6 +264,80 @@ class GitOps(private val projectDir: String) {
         return result != null
     }
 
+    /** True when [ancestor] is an ancestor of (or equal to) [descendant]. */
+    fun isAncestor(ancestor: String, descendant: String): Boolean {
+        // `merge-base --is-ancestor` exits 0 when true, non-zero when false;
+        // exec() returns "" on exit 0 and null on a non-zero exit.
+        return exec("merge-base", "--is-ancestor", ancestor, descendant) != null
+    }
+
+    /**
+     * Uses git reflog to find the commit where [branch] was originally created.
+     * Returns the hash at creation, or null when the reflog has expired or is
+     * unavailable (e.g. after a fresh clone).
+     *
+     * When [requireExplicit] is true, returns null unless an explicit
+     * "branch: Created from …" entry is found. Reflog entries expire oldest-first,
+     * so once the creation entry is gone the oldest surviving entry is often the
+     * branch's own first commit — guessing it as the creation point would silently
+     * drop that commit from history. Callers feeding history decisions pass true so
+     * they degrade to a safe base instead of trusting a guess. Mirrors the VS Code
+     * bridge's findBranchCreationPoint.
+     */
+    fun findBranchCreationPoint(branch: String, requireExplicit: Boolean = false): String? {
+        // Detached HEAD has no branch reflog of its own — `reflog show HEAD` would
+        // surface HEAD's whole movement history (oldest entry = the repo's first
+        // commit), which is not a creation point. Bail rather than mislead.
+        if (branch == "HEAD") return null
+        val reflog = exec("reflog", "show", branch, "--format=%H %gs") ?: return null
+        val lines = reflog.lines().filter { it.isNotBlank() }
+        if (lines.isEmpty()) return null
+
+        // Explicit "branch: Created from ..." entry (scan from oldest).
+        for (i in lines.indices.reversed()) {
+            if (lines[i].contains("branch: Created from")) {
+                return lines[i].substringBefore(" ").takeIf { it.isNotBlank() }
+            }
+        }
+
+        // No explicit creation record. Only guess the oldest surviving entry when
+        // the caller tolerates it (see requireExplicit).
+        if (requireExplicit) return null
+        return lines.last().substringBefore(" ").takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Resolves the base commit that "own commits" on [branch] are measured from.
+     *
+     * Own commits should be counted from where the branch was actually cut, not
+     * from the mainline. A branch freshly created from a feature/release branch
+     * starts with its tip equal to that base branch's tip — comparing against main
+     * would wrongly count the base branch's shared commits (and a brand-new
+     * branch's inherited history) as this branch's own work.
+     *
+     * Prefers the branch's reflog creation point when it sits downstream of (is a
+     * descendant of) the mainline merge-base. Falls back to [mergeBaseMain] when
+     * the creation point is unavailable (reflog expired), equals it (cut directly
+     * from main), or is no longer an ancestor of HEAD (stale after reset --hard /
+     * rebase --onto). When the mainline ref is unresolvable ([mergeBaseMain] is
+     * empty) the validated creation point is used directly. Mirrors the VS Code
+     * bridge's resolveOwnCommitsBase.
+     */
+    fun resolveOwnCommitsBase(branch: String, mergeBaseMain: String): String {
+        val creationPoint = findBranchCreationPoint(branch, requireExplicit = true) ?: return mergeBaseMain
+        // Cut directly from main: mergeBaseMain is already an ancestor of HEAD.
+        if (creationPoint == mergeBaseMain) return mergeBaseMain
+        // A stale creation point (after reset/rebase --onto) is no longer behind
+        // HEAD — `<stalePoint>..HEAD` would be meaningless. Fall back to mainline.
+        if (!isAncestor(creationPoint, "HEAD")) return mergeBaseMain
+        // Mainline unresolvable (e.g. master/trunk default with no origin): trust
+        // the validated fork point directly.
+        if (mergeBaseMain.isEmpty()) return creationPoint
+        // Adopt the creation point only when downstream of the mainline merge-base
+        // (the "cut from release/develop" case).
+        return if (isAncestor(mergeBaseMain, creationPoint)) creationPoint else mergeBaseMain
+    }
+
     /** Resolve the main worktree root (handles worktrees). */
     fun resolveMainWorktreeRoot(): String? {
         val gitFile = File(projectDir, ".git")
