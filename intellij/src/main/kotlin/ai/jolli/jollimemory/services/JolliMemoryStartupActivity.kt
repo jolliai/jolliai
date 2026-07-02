@@ -67,7 +67,7 @@ class JolliMemoryStartupActivity : ProjectActivity {
                         NotificationType.INFORMATION,
                     )
                     .addAction(NotificationAction.createSimple("Learn more") {
-                        BrowserUtil.browse("https://jolli.ai/telemetry")
+                        BrowserUtil.browse("https://www.jolli.ai/telemetry")
                     })
                     .addAction(NotificationAction.createSimple("Turn off") {
                         ai.jolli.jollimemory.core.telemetry.TelemetrySharedConfig.setTelemetry(false)

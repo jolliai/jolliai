@@ -498,7 +498,7 @@ class SettingsDialog(
             .panel))
         panel.add(HyperlinkLabel("Privacy & telemetry details").apply {
             alignmentX = JComponent.LEFT_ALIGNMENT
-            setHyperlinkTarget("https://jolli.ai/telemetry")
+            setHyperlinkTarget("https://www.jolli.ai/telemetry")
         })
 
         return wrapTabContent(panel)
