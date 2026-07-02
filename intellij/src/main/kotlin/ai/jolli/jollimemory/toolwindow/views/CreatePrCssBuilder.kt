@@ -120,6 +120,7 @@ ${if (isDark) darkVars() else lightVars()}
   .btn.secondary { background: var(--btn-secondary-bg); color: var(--btn-secondary-fg); }
   .btn.secondary:hover { background: var(--btn-secondary-hover-bg); color: var(--text-primary); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
+  .up-to-date { align-self: center; font-size: 0.8em; color: var(--text-tertiary); }
 
   /* ── Inline editors (revealed by Edit, replace the read-only display in place) ── */
   .pr-input, .pr-textarea {

@@ -18,6 +18,12 @@ object CreatePrHtmlBuilder {
         val isUpdate = vm.existingPr != null
         val heading = if (isUpdate) "Update Pull Request" else "Create Pull Request"
         val primaryLabel = if (isUpdate) "Update PR" else "Create PR"
+        // In Update mode with nothing new to push, dim the button (like the commit-
+        // level push UI) — data-uptodate lets the script re-enable it when the user
+        // edits the title/body (a body-only update is still a change).
+        val upToDate = isUpdate && !vm.hasUnpushedChanges
+        val primaryDisabled = if (upToDate) " disabled" else ""
+        val upToDateHint = if (upToDate) """<span class="up-to-date">Up to date — no new commits to push</span>""" else ""
 
         return """<!DOCTYPE html>
 <html lang="en">
@@ -58,9 +64,10 @@ object CreatePrHtmlBuilder {
     ${buildFileRows(vm)}
   </div>
   <div class="actions">
-    <button class="btn" id="cmdCreatePr">$primaryLabel</button>
+    <button class="btn" id="cmdCreatePr" data-uptodate="$upToDate"$primaryDisabled>$primaryLabel</button>
     <button class="btn secondary" id="cmdEdit">Edit</button>
     <button class="btn secondary" id="cmdCopyBody">Copy body</button>
+    $upToDateHint
   </div>
   <p class="ship-sub" id="prStatusText"></p>
 </div>
