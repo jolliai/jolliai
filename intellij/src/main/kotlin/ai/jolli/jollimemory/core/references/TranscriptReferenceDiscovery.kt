@@ -43,13 +43,18 @@ object TranscriptReferenceDiscovery {
 			return result.lastLineNumberScanned
 		}
 
-		val branch = getCurrentBranchSafe(cwd)
-		log.debug("scanReferencesFrom: branch=%s, upserting %d ref(s)", branch, result.references.size)
+		// Stamp the branch on newly-created rows so the panel can branch-scope.
+		// Omit on an "unknown" git lookup (a transient rev-parse failure) so the row
+		// stays branch-less — writing the literal "unknown" would silently exclude
+		// the reference from every branch's summary prompt. Mirrors the plan path.
+		val discoveredBranch = getCurrentBranchSafe(cwd)
+		val branchField: String? = if (discoveredBranch.isNotEmpty() && discoveredBranch != "unknown") discoveredBranch else null
+		log.debug("scanReferencesFrom: branch=%s, upserting %d ref(s)", branchField ?: "(none)", result.references.size)
 		val upserted = mutableListOf<String>()
 		val failed = mutableListOf<String>()
 		for (ref in result.references) {
 			try {
-				upsertReferenceEntry(ref, cwd, branch)
+				upsertReferenceEntry(ref, cwd, branchField)
 				upserted.add(ref.mapKey)
 			} catch (err: Exception) {
 				log.warn(
@@ -88,15 +93,19 @@ object TranscriptReferenceDiscovery {
 	/**
 	 * Upsert a reference entry: write markdown + update plans.json.references.
 	 */
-	private fun upsertReferenceEntry(ref: Reference, cwd: String, branch: String) {
+	private fun upsertReferenceEntry(ref: Reference, cwd: String, branch: String?) {
 		log.debug("upsertReferenceEntry: writing markdown for %s (title=%s)", ref.mapKey, ref.title)
 		val result = ReferenceStore.writeReferenceMarkdown(ref, cwd)
 		log.debug("upsertReferenceEntry: markdown written to %s", result.sourcePath)
 		val mapKey = ref.mapKey
 		val now = java.time.Instant.now().toString()
 
-		// Load → merge → save under lock
-		if (!SessionTracker.acquireLock(cwd)) {
+		// Load → merge → save under lock. Only release the lock if we actually hold
+		// it — releaseLock is an unconditional file delete, so releasing a lock we
+		// never acquired would wipe the holder's lock (the PostCommitHook worker or a
+		// parallel StopHook) and let a second writer interleave plans.json writes.
+		val locked = SessionTracker.acquireLock(cwd)
+		if (!locked) {
 			log.warn("upsertReferenceEntry: could not acquire lock for %s — writing without lock", mapKey)
 		}
 		try {
@@ -110,9 +119,11 @@ object TranscriptReferenceDiscovery {
 					sourcePath = result.sourcePath,
 					sourceToolName = ref.toolName,
 					updatedAt = now,
-					// Re-stamp the branch: a reference re-surfaced on a new branch
-					// follows that branch (matches plan/note upsert semantics).
-					branch = branch,
+					// Re-stamp the branch only on a known git lookup: a reference
+					// re-surfaced on a new branch follows it (matches plan/note
+					// upsert). On an "unknown" lookup keep the existing branch rather
+					// than clobber a real value with a summary-excluding sentinel.
+					branch = branch ?: existing.branch,
 				)
 			} else {
 				ReferenceEntry(
@@ -136,7 +147,7 @@ object TranscriptReferenceDiscovery {
 			log.debug("upsertReferenceEntry: saved plans.json with %d reference(s)", freshRefs.size)
 			log.info("upsertReferenceEntry: %s (%s)", mapKey, if (existing == null) "new" else "updated")
 		} finally {
-			SessionTracker.releaseLock(cwd)
+			if (locked) SessionTracker.releaseLock(cwd)
 		}
 	}
 }
