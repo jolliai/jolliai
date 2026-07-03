@@ -729,6 +729,14 @@ vi.mock("../../cli/src/Logger.js", () => ({
 vi.mock("../../cli/src/backfill/BackfillEngine.js", () => ({
 	recentCommitHashes: vi.fn(),
 	runBackfill: vi.fn(),
+	listMissingCommits: vi.fn(),
+	countMissingSummaries: vi.fn(),
+	repoHasAnyMemory: vi.fn(),
+}));
+
+vi.mock("./services/BackfillDismissFlag.js", () => ({
+	readBackfillDismissFlag: vi.fn().mockResolvedValue(false),
+	writeBackfillDismissFlag: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("./commands/CommitCommand.js", () => ({
@@ -1971,9 +1979,10 @@ describe("Extension", () => {
 				expect(mockPlansStore.refresh).toHaveBeenCalled();
 				expect(mockMemoriesStore.refresh).toHaveBeenCalled();
 
-				// Enable also kicks off a best-effort back-fill of missing summaries
-				// (mirrors the CLI `jolli enable`); fire-and-forget via executeCommand.
-				expect(executeCommand).toHaveBeenCalledWith("jollimemory.generateMissingSummaries");
+				// Enable no longer auto-triggers a back-fill — historical back-fill is
+				// user-driven now (sidebar cold-start card / Settings button), so
+				// enabling never spends LLM budget without an explicit opt-in.
+				expect(executeCommand).not.toHaveBeenCalledWith("jollimemory.generateMissingSummaries");
 
 				// Ordering guard: `plansStore.setEnabled(true)` (called inside
 				// refreshStatusBar) MUST run before `plansStore.refresh()`,
@@ -7371,6 +7380,160 @@ describe("Extension", () => {
 			const result = await handler?.();
 			expect(vi.mocked(runBackfill)).toHaveBeenCalled();
 			expect(result).toEqual(expect.objectContaining({ total: 3, generated: 2 }));
+		});
+
+		it("passes an explicit hash subset through instead of the full scope", async () => {
+			const { recentCommitHashes, runBackfill } = await import("../../cli/src/backfill/BackfillEngine.js");
+			vi.mocked(runBackfill).mockResolvedValue({ total: 2, generated: 2, skipped: 0, errors: 0, outcomes: [] });
+			activate(makeContext());
+			const handler = commandMap.get("jollimemory.generateMissingSummaries");
+			await handler?.(["h1", "h2"]);
+			// Subset path: recentCommitHashes (full scope) is NOT consulted.
+			expect(vi.mocked(recentCommitHashes)).not.toHaveBeenCalled();
+			expect(vi.mocked(runBackfill)).toHaveBeenCalledWith(expect.objectContaining({ hashes: ["h1", "h2"] }));
+		});
+	});
+
+	describe("back-fill sidebar dep (cold-start card wiring)", () => {
+		type BackfillDep = {
+			listCandidates: (scope: "recent-month" | "all") => Promise<{ items: unknown[]; totalMissing: number }>;
+			run: (
+				hashes: readonly string[],
+				onProgress: (d: number, t: number, s: string, f: boolean) => void,
+			) => Promise<{ rows: unknown[]; generated: number; skipped: number; errors: number }>;
+			dismiss: () => void;
+		};
+		function capturedBackfill(): BackfillDep {
+			return (sidebarDepsCaptured as { backfill: BackfillDep }).backfill;
+		}
+
+		it("listCandidates maps missing commits + dry-run session/turn counts", async () => {
+			const { listMissingCommits, countMissingSummaries, runBackfill } = await import(
+				"../../cli/src/backfill/BackfillEngine.js"
+			);
+			vi.mocked(listMissingCommits).mockResolvedValue([
+				{ commitHash: "h1", subject: "fix a", ts: 100 },
+				{ commitHash: "h2", subject: "fix b", ts: 200 },
+			]);
+			vi.mocked(countMissingSummaries).mockResolvedValue({ missing: 9, total: 20 });
+			vi.mocked(runBackfill).mockResolvedValue({
+				total: 2,
+				generated: 0,
+				skipped: 0,
+				errors: 0,
+				outcomes: [
+					{ commitHash: "h1", status: "would-generate", sessions: 2, conversationTurns: 6 },
+					{ commitHash: "h2", status: "would-generate", sessions: 0, conversationTurns: 0 },
+				],
+			});
+			activate(makeContext());
+			const res = await capturedBackfill().listCandidates("recent-month");
+			expect(vi.mocked(listMissingCommits)).toHaveBeenCalledWith("/test/workspace", 30 * 24 * 60 * 60 * 1000);
+			expect(res.totalMissing).toBe(9);
+			expect(res.items).toEqual([
+				{ commitHash: "h1", subject: "fix a", ts: 100, sessions: 2, conversationTurns: 6 },
+				{ commitHash: "h2", subject: "fix b", ts: 200, sessions: 0, conversationTurns: 0 },
+			]);
+		});
+
+		it("listCandidates uses full scope (no time bound) for scope 'all'", async () => {
+			const { listMissingCommits, countMissingSummaries, runBackfill } = await import(
+				"../../cli/src/backfill/BackfillEngine.js"
+			);
+			vi.mocked(listMissingCommits).mockResolvedValue([]);
+			vi.mocked(countMissingSummaries).mockResolvedValue({ missing: 0, total: 5 });
+			activate(makeContext());
+			const res = await capturedBackfill().listCandidates("all");
+			expect(vi.mocked(listMissingCommits)).toHaveBeenCalledWith("/test/workspace", undefined);
+			// Empty missing → no dry-run call, empty items.
+			expect(vi.mocked(runBackfill)).not.toHaveBeenCalled();
+			expect(res.items).toEqual([]);
+		});
+
+		it("run streams progress, returns result rows, and clears the dismiss marker on success", async () => {
+			const { runBackfill } = await import("../../cli/src/backfill/BackfillEngine.js");
+			const { writeBackfillDismissFlag } = await import("./services/BackfillDismissFlag.js");
+			vi.mocked(runBackfill).mockImplementation(async (opts) => {
+				opts.onProgress?.(1, 1, { commitHash: "h1", status: "generated", commitSubject: "fix a" });
+				return {
+					total: 1,
+					generated: 1,
+					skipped: 0,
+					errors: 0,
+					outcomes: [{ commitHash: "h1", status: "generated", commitSubject: "fix a", sessions: 2, topics: 3 }],
+				};
+			});
+			activate(makeContext());
+			const progress: number[] = [];
+			const res = await capturedBackfill().run(["h1"], (done) => progress.push(done));
+			expect(progress).toEqual([1]);
+			expect(res.generated).toBe(1);
+			expect(res.rows).toEqual([{ commitHash: "h1", subject: "fix a", sessions: 2, topics: 3, status: "generated" }]);
+			expect(vi.mocked(writeBackfillDismissFlag)).toHaveBeenCalledWith("/test/workspace", false);
+		});
+
+		it("run maps an errored outcome to a failed result row", async () => {
+			const { runBackfill } = await import("../../cli/src/backfill/BackfillEngine.js");
+			vi.mocked(runBackfill).mockResolvedValue({
+				total: 1,
+				generated: 0,
+				skipped: 0,
+				errors: 1,
+				outcomes: [{ commitHash: "abcd1234ffff", status: "error", message: "llm" }],
+			});
+			activate(makeContext());
+			const res = await capturedBackfill().run(["abcd1234ffff"], () => {});
+			expect(res.rows).toEqual([
+				{ commitHash: "abcd1234ffff", subject: "abcd1234", sessions: 0, topics: 0, status: "error" },
+			]);
+		});
+
+		it("dismiss writes the per-repo dismiss marker AND syncs the in-memory flag", async () => {
+			const { writeBackfillDismissFlag } = await import("./services/BackfillDismissFlag.js");
+			activate(makeContext());
+			// Let initialLoad's .finally (which sets currentBackfillDismissed from the
+			// marker) settle first, so the assertion observes dismiss()'s effect only.
+			for (let i = 0; i < 10; i++) await Promise.resolve();
+			capturedBackfill().dismiss();
+			expect(vi.mocked(writeBackfillDismissFlag)).toHaveBeenCalledWith("/test/workspace", true);
+			// Regression: without the in-memory sync, a webview recreate in the same
+			// session would re-show the dismissed card (getInitialState reads this).
+			const state = (sidebarDepsCaptured as { getInitialState: () => { backfillDismissed?: boolean } }).getInitialState();
+			expect(state.backfillDismissed).toBe(true);
+		});
+
+		it("the Settings full-scope command also leaves cold start (clears the dismiss marker on generated>0)", async () => {
+			const { recentCommitHashes, runBackfill } = await import("../../cli/src/backfill/BackfillEngine.js");
+			const { writeBackfillDismissFlag } = await import("./services/BackfillDismissFlag.js");
+			vi.mocked(recentCommitHashes).mockResolvedValue(["h1"]);
+			vi.mocked(runBackfill).mockResolvedValue({
+				total: 1,
+				generated: 1,
+				skipped: 0,
+				errors: 0,
+				outcomes: [{ commitHash: "h1", status: "generated", commitSubject: "fix", sessions: 1, topics: 2 }],
+			});
+			activate(makeContext());
+			// Settings path = the command with no hash arg (full scope).
+			const handler = commandMap.get("jollimemory.generateMissingSummaries");
+			expect(handler).toBeDefined();
+			await handler?.();
+			expect(vi.mocked(runBackfill)).toHaveBeenCalled();
+			// Regression: the cold-start state update lives in runBackfillJob so BOTH
+			// entry points (card + Settings) clear the dismiss marker on generated>0.
+			expect(vi.mocked(writeBackfillDismissFlag)).toHaveBeenCalledWith("/test/workspace", false);
+		});
+
+		it("tolerates a failure resolving the cold-start signals (activate still completes)", async () => {
+			const { repoHasAnyMemory } = await import("../../cli/src/backfill/BackfillEngine.js");
+			vi.mocked(repoHasAnyMemory).mockRejectedValueOnce(new Error("index read failed"));
+			// activate must not throw; the finally-block catch swallows the error and
+			// keeps the optimistic default (repoHasMemories = true → no card).
+			expect(() => activate(makeContext())).not.toThrow();
+			// Let initialLoad's .finally(async …) settle.
+			for (let i = 0; i < 10; i++) await Promise.resolve();
+			const state = (sidebarDepsCaptured as { getInitialState: () => { repoHasMemories?: boolean } }).getInitialState();
+			expect(state.repoHasMemories).toBe(true);
 		});
 	});
 

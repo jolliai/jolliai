@@ -1557,7 +1557,8 @@ export function buildSidebarCss(): string {
      container rule keeps padding/scroll behavior in lockstep. */
   .onboarding-panel,
   .disabled-panel,
-  .apikey-panel {
+  .apikey-panel,
+  .backfill-panel {
     padding: 16px;
     overflow-y: auto;
     height: 100%;
@@ -1646,6 +1647,116 @@ export function buildSidebarCss(): string {
     cursor: default;
   }
   .ob-btn:disabled:hover { background: var(--vscode-button-background); }
+  /* ── Back-fill cold-start card ────────────────────────────────────────
+     Reuses .ob-header / .ob-title / .ob-subtitle / .ob-btn from the
+     onboarding panel; the bf-* classes add the benefits list, the
+     selectable candidate rows, the progress bar (fixed-width classes — no
+     inline style, CSP), and the result list. All colors are theme tokens. */
+  .bf-header { position: relative; }
+  .bf-dismiss {
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    background: transparent;
+    border: none;
+    color: var(--vscode-descriptionForeground);
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 4px;
+    line-height: 1;
+  }
+  .bf-dismiss:hover { background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground)); color: var(--vscode-foreground); }
+  .bf-benefits { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 12px 0; }
+  .bf-benefit { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; line-height: 1.5; }
+  .bf-benefit-icon { color: var(--vscode-textLink-foreground); font-size: 15px; margin-top: 1px; }
+  .bf-note {
+    font-size: 12px;
+    color: var(--vscode-descriptionForeground);
+    line-height: 1.5;
+    margin: 0 0 12px 0;
+    padding: 8px 10px;
+    border-radius: 4px;
+    background: var(--vscode-textBlockQuote-background, var(--vscode-editor-background));
+  }
+  .bf-honest { font-size: 11px; color: var(--vscode-descriptionForeground); margin: 10px 0 0 0; line-height: 1.4; }
+  .bf-cta .codicon, .bf-open .codicon { vertical-align: text-bottom; margin-right: 2px; }
+  .bf-prog { display: flex; gap: 8px; align-items: center; font-size: 13px; margin: 4px 0 10px 0; }
+  .bf-prog .codicon { color: var(--vscode-textLink-foreground); }
+  /* Candidate list */
+  .bf-list {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 10px;
+  }
+  .bf-row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    padding: 8px 10px;
+    cursor: pointer;
+    border-bottom: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
+  }
+  .bf-list .bf-row:last-child { border-bottom: none; }
+  .bf-row:hover { background: var(--vscode-list-hoverBackground); }
+  .bf-row-cb { margin-top: 2px; accent-color: var(--vscode-checkbox-background); flex: none; }
+  .bf-row-main { flex: 1; min-width: 0; }
+  .bf-row-title {
+    font-size: 12px;
+    color: var(--vscode-foreground);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .bf-row-meta { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 2px; }
+  .bf-older { margin: 0 0 10px 0; }
+  .bf-link {
+    background: transparent;
+    border: none;
+    color: var(--vscode-textLink-foreground);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 0;
+    text-align: left;
+  }
+  .bf-link:hover { text-decoration: underline; }
+  /* Progress bar — width via fixed classes (CSP: no inline style). */
+  .bf-bar {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--vscode-progressBar-background, var(--vscode-editorWidget-border));
+    overflow: hidden;
+    margin: 0 0 6px 0;
+  }
+  .bf-bar-fill { display: block; height: 100%; background: var(--vscode-progressBar-background, var(--vscode-textLink-foreground)); transition: width 0.2s ease; }
+  .bf-bar-fill--w0 { width: 0%; }
+  .bf-bar-fill--w10 { width: 10%; }
+  .bf-bar-fill--w20 { width: 20%; }
+  .bf-bar-fill--w30 { width: 30%; }
+  .bf-bar-fill--w40 { width: 40%; }
+  .bf-bar-fill--w50 { width: 50%; }
+  .bf-bar-fill--w60 { width: 60%; }
+  .bf-bar-fill--w70 { width: 70%; }
+  .bf-bar-fill--w80 { width: 80%; }
+  .bf-bar-fill--w90 { width: 90%; }
+  .bf-bar-fill--w100 { width: 100%; }
+  /* Result list */
+  .bf-result-list { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 12px 0; }
+  .bf-result-row { display: flex; gap: 8px; align-items: center; font-size: 12px; }
+  .bf-result-icon { color: var(--vscode-textLink-foreground); font-size: 14px; flex: none; }
+  .bf-result-row .bf-row-title { flex: 1; }
+  .bf-chip {
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+    border: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
+    border-radius: 8px;
+    padding: 1px 7px;
+    white-space: nowrap;
+    flex: none;
+  }
+  .bf-chip--err { color: var(--vscode-errorForeground); border-color: var(--vscode-errorForeground); }
   /* ── API key entry panel ──────────────────────────────────────────
      Reuses .ob-header / .ob-btn from the onboarding panel. The label +
      input pair sits between the header and the Save/Back buttons. The

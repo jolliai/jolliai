@@ -142,6 +142,7 @@ export function buildSidebarHtml(
       </header>
       <button type="button" id="disabled-enable-btn" class="ob-btn ob-btn--primary">Enable Jolli Memory</button>
     </div>
+    <div class="backfill-panel hidden" id="backfill-panel" role="region" aria-label="Build memories from commits"></div>
     <div class="view-switch hidden" id="view-switch" role="tablist" aria-label="Jolli Memory views">
       <button class="view-tab active" type="button" data-tab="branch" role="tab">Current Branch</button>
       <button class="view-tab" type="button" data-tab="kb" role="tab">Memory Bank</button>

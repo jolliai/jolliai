@@ -19,6 +19,7 @@
  * quotes (or no quotes) when referring to identifiers in comments below.
  */
 
+import { backfillListRendererSource } from "./BackfillListRenderer.js";
 import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
 import { SOURCE_TITLES } from "./SourceLabels.js";
 
@@ -79,6 +80,10 @@ export function buildSidebarScript(): string {
   }
   function clear(container) { container.replaceChildren(); }
 
+  // Shared back-fill row-label helpers (formatBackfillMeta / formatBackfillResult) —
+  // single source of truth with the Settings panel; see BackfillListRenderer.ts.
+  ${backfillListRendererSource()}
+
   // ---- State (persisted via vscode.setState/getState). ----
   // 'authenticated' is NOT persisted from setState: persisting auth across
   // sessions could surface a stale Sign Out button after the user revoked
@@ -131,7 +136,22 @@ export function buildSidebarScript(): string {
     // Aggregated token usage for the current branch, pushed alongside
     // branch:commitsData. Shape: { input, output, total } | null. Not
     // persisted -- host re-pushes on reload.
-    tokenStats: null
+    tokenStats: null,
+    // ── Back-fill cold-start card ──────────────────────────────────────
+    // repoHasMemories / backfillDismissed are pushed by the host on init and
+    // reset below on load (never trusted from persisted state — a stale value
+    // would flash the card). Optimistic defaults (has memories / not dismissed)
+    // so the card never appears before init resolves the truth.
+    repoHasMemories: true,
+    backfillDismissed: false,
+    // Card runtime (all reset on load): 'offer' → 'loading' → 'list' →
+    // 'progress' → 'done'. candidates/selected/result hold the current flow.
+    backfillMode: 'offer',
+    backfillCandidates: [],
+    backfillSelected: {},
+    backfillTotalMissing: 0,
+    backfillProgress: { done: 0, total: 0 },
+    backfillResult: null
   }, vscode.getState() || {});
   // workerBusy is intentionally reset on load (above), even if persisted state
   // had it set — the lock is process-bound and cannot survive a reload.
@@ -140,6 +160,16 @@ export function buildSidebarScript(): string {
   state.summarizingHash = null;
   state.syncPhase = null;
   state.tokenStats = null;
+  // Cold-start signals + card runtime are host-driven / transient — never
+  // resurrected from persisted state (would flash a stale card on reload).
+  state.repoHasMemories = true;
+  state.backfillDismissed = false;
+  state.backfillMode = 'offer';
+  state.backfillCandidates = [];
+  state.backfillSelected = {};
+  state.backfillTotalMissing = 0;
+  state.backfillProgress = { done: 0, total: 0 };
+  state.backfillResult = null;
   function persist() { vscode.setState(state); }
 
   // ---- DOM refs ----
@@ -187,6 +217,9 @@ export function buildSidebarScript(): string {
   // onboarding panel; mutually exclusive with it.
   const disabledPanel = document.getElementById('disabled-panel');
   const disabledEnableBtn = document.getElementById('disabled-enable-btn');
+  // Back-fill cold-start card — full-viewport panel (like onboarding/disabled),
+  // shown when enabled + configured + repo has zero memories + not dismissed.
+  const backfillPanel = document.getElementById('backfill-panel');
   // API key entry panel — replaces the onboarding cards when the user
   // clicks "Configure API Key". Also a sibling of onboarding-panel: only
   // one of {onboarding, apikey, disabled} is visible at any time when
@@ -325,6 +358,14 @@ export function buildSidebarScript(): string {
       }
     }
     vscode.postMessage({ type: 'tab:switched', tab: tab });
+    // switchTab unconditionally reveals the target tab content. If the cold-start
+    // card should own the viewport (e.g. init posts activeTab:'branch' after the
+    // card was shown, or onboarding lands on 'status'), re-assert it so the card
+    // and a tab's content never render stacked. No-op when the card is inactive
+    // (applyBackfillCard only touches tab visibility when it is showing), and the
+    // "Open your Memory Bank" path flips repoHasMemories=true BEFORE its
+    // switchTab('kb'), so that navigation is unaffected.
+    applyBackfillCard();
   }
 
   // The Status overlay's click-to-toggle behavior: opening it when already
@@ -643,6 +684,11 @@ export function buildSidebarScript(): string {
           applyDegraded(msg.state.degradedReason);
           break;
         }
+        // Cold-start signals must be set BEFORE applyConfigured/applyEnabled,
+        // which call applyBackfillCard() and read these. undefined → keep the
+        // optimistic default (has memories) so the card stays hidden.
+        state.repoHasMemories = msg.state.repoHasMemories !== false;
+        state.backfillDismissed = !!msg.state.backfillDismissed;
         applyEnabled(msg.state.enabled);
         // Onboarding gate sits on top of enabled — when configured===false it
         // hides the tab UI applyEnabled just configured. configured defaults to
@@ -995,6 +1041,37 @@ export function buildSidebarScript(): string {
         if (state.activeTab === 'branch') renderBranch();
         break;
       }
+      case 'backfill:candidates': {
+        // Ignore a stale reply for a scope we're no longer showing (only the
+        // sidebar card requests, and only 'recent-month', but guard anyway).
+        if (msg.scope !== 'recent-month') break;
+        // Only accept candidates while awaiting them (offer → 'loading'). A late
+        // or duplicate reply must not clobber an in-progress / done view back to
+        // the selectable list (which would also reset the user's selection).
+        if (state.backfillMode !== 'loading') break;
+        state.backfillCandidates = Array.isArray(msg.items) ? msg.items.slice() : [];
+        state.backfillTotalMissing = typeof msg.totalMissing === 'number' ? msg.totalMissing : 0;
+        // Default every candidate selected.
+        state.backfillSelected = {};
+        state.backfillCandidates.forEach(function(c) { state.backfillSelected[c.commitHash] = true; });
+        state.backfillMode = 'list';
+        if (shouldShowBackfillCard()) renderBackfillCard();
+        break;
+      }
+      case 'backfill:progress':
+        state.backfillProgress = { done: msg.done || 0, total: msg.total || 0 };
+        if (state.backfillMode === 'progress' && shouldShowBackfillCard()) renderBackfillCard();
+        break;
+      case 'backfill:done':
+        state.backfillResult = {
+          rows: Array.isArray(msg.rows) ? msg.rows.slice() : [],
+          generated: msg.generated || 0,
+          skipped: msg.skipped || 0,
+          errors: msg.errors || 0,
+        };
+        state.backfillMode = 'done';
+        if (shouldShowBackfillCard()) renderBackfillCard();
+        break;
       // Renderers added in later phases handle the remaining message types.
       default:
         break;
@@ -1011,6 +1088,7 @@ export function buildSidebarScript(): string {
       disabledPanel.classList.add('hidden');
       disabledBanner.classList.add('hidden');
       statusEntries.classList.add('hidden');
+      applyBackfillCard();
       return;
     }
     statusEntries.classList.toggle('hidden', !enabled);
@@ -1057,6 +1135,10 @@ export function buildSidebarScript(): string {
       // Hide the repo filter in disabled mode — tab bar is hidden anyway.
       if (repoFilterEl) repoFilterEl.classList.add('hidden');
     }
+    // Cold-start card sits on top of the enabled tab UI: when active it takes
+    // the viewport (like onboarding/disabled). Run last so it can re-hide the
+    // tab content applyEnabled just revealed.
+    applyBackfillCard();
   }
 
   // Toggles between the onboarding flow and the regular tab UI based on
@@ -1083,6 +1165,9 @@ export function buildSidebarScript(): string {
       tabContents.branch.classList.add('hidden');
       tabContents.status.classList.add('hidden');
       disabledBanner.classList.add('hidden');
+      // Onboarding owns the viewport when unconfigured — the cold-start card
+      // must not compete with it.
+      applyBackfillCard();
       return;
     }
     onboardingPanel.classList.add('hidden');
@@ -1117,6 +1202,222 @@ export function buildSidebarScript(): string {
       enableBtn.textContent = 'Initialize Git';
       enableBtn.dataset.command = 'jollimemory.initGit';
     }
+  }
+
+  // ── Back-fill cold-start card ────────────────────────────────────────────
+  // Shown when the repo has zero memories (per-repo cold start): offer →
+  // (dry-run) list → (LLM) progress → done. All content is built with el()
+  // (textContent, no innerHTML) and the progress bar uses fixed-width classes
+  // (no inline style — CSP), matching renderTokenBar.
+  function shouldShowBackfillCard() {
+    return state.enabled
+      && state.configured !== false
+      && !state.backfillDismissed
+      && state.repoHasMemories === false;
+  }
+  function applyBackfillCard() {
+    const show = shouldShowBackfillCard();
+    backfillPanel.classList.toggle('hidden', !show);
+    if (!show) { clear(backfillPanel); return; }
+    // Card owns the viewport, like the onboarding / disabled panels.
+    viewSwitch.classList.add('hidden');
+    tabBar.classList.add('hidden');
+    tabToolbar.classList.add('hidden');
+    tabContents.kb.classList.add('hidden');
+    tabContents.branch.classList.add('hidden');
+    tabContents.status.classList.add('hidden');
+    renderBackfillCard();
+  }
+  // Dismiss (✕): persist the per-repo marker + drop back to the normal UI.
+  function bfDismiss() {
+    state.backfillDismissed = true;
+    vscode.postMessage({ type: 'backfill:dismiss' });
+    persist();
+    applyBackfillCard();
+    applyEnabled(state.enabled); // re-reveal the tab UI the card was masking
+  }
+  function bfDismissButton() {
+    const b = el('button', { className: 'bf-dismiss', type: 'button', title: 'Dismiss', 'aria-label': 'Dismiss' }, [
+      el('i', { className: 'codicon codicon-close', 'aria-hidden': 'true' }),
+    ]);
+    b.addEventListener('click', bfDismiss);
+    return b;
+  }
+  function bfSelectedHashes() {
+    // Use the SAME predicate the checkbox render uses (!== false) so the visible
+    // checked state and the acted-on set never disagree — a candidate with no
+    // explicit entry reads as selected in both places.
+    return state.backfillCandidates
+      .filter(function(c) { return state.backfillSelected[c.commitHash] !== false; })
+      .map(function(c) { return c.commitHash; });
+  }
+  function renderBackfillCard() {
+    if (state.backfillMode === 'loading') { mountIn(backfillPanel, renderBackfillLoading()); return; }
+    if (state.backfillMode === 'list') { mountIn(backfillPanel, renderBackfillList()); return; }
+    if (state.backfillMode === 'progress') { mountIn(backfillPanel, renderBackfillProgress()); return; }
+    if (state.backfillMode === 'done') { mountIn(backfillPanel, renderBackfillDone()); return; }
+    mountIn(backfillPanel, renderBackfillOffer());
+  }
+  function bfHeader(titleText, subText) {
+    return el('header', { className: 'ob-header bf-header' }, [
+      bfDismissButton(),
+      el('div', { className: 'ob-title-row' }, [
+        el('i', { className: 'codicon codicon-sparkle ob-title-icon', 'aria-hidden': 'true' }),
+        el('h2', { className: 'ob-title', text: titleText }),
+      ]),
+      subText ? el('p', { className: 'ob-subtitle', text: subText }) : null,
+    ]);
+  }
+  function renderBackfillOffer() {
+    const benefits = [
+      ['play', 'Pick up where you left off.', 'Sessions and plans replay next time.'],
+      ['references', 'Recall in any tool.', 'Claude, Cursor, Codex via MCP. No copy-paste.'],
+      ['graph', 'Knowledge builds itself.', 'A wiki + graph from your commits.'],
+    ].map(function(b) {
+      return el('div', { className: 'bf-benefit' }, [
+        el('i', { className: 'codicon codicon-' + b[0] + ' bf-benefit-icon', 'aria-hidden': 'true' }),
+        el('span', {}, [ el('b', { text: b[1] }), document.createTextNode(' ' + b[2]) ]),
+      ]);
+    });
+    const cta = el('button', { className: 'ob-btn ob-btn--primary bf-cta', type: 'button' }, [
+      el('i', { className: 'codicon codicon-database', 'aria-hidden': 'true' }),
+      document.createTextNode(' Build memories from commits'),
+    ]);
+    cta.addEventListener('click', function() {
+      state.backfillMode = 'loading';
+      vscode.postMessage({ type: 'backfill:requestCandidates', scope: 'recent-month' });
+      renderBackfillCard();
+    });
+    return [
+      bfHeader('Never re-explain a decision again',
+        'The conversations, plans and the why behind every commit, replayed into your next session — in any AI tool.'),
+      el('div', { className: 'bf-benefits' }, benefits),
+      el('p', { className: 'bf-note' },
+        'You are set up — this repo has no memories yet. Build them from your recent commits, or just keep coding and they capture automatically.'),
+      cta,
+      el('p', { className: 'bf-honest' }, 'Runs locally on your machine: nothing leaves unless you Share or Sync.'),
+    ];
+  }
+  function renderBackfillLoading() {
+    return [
+      bfHeader('Scanning your recent commits…', null),
+      el('div', { className: 'bf-prog' }, [
+        el('i', { className: 'codicon codicon-loading codicon-modifier-spin', 'aria-hidden': 'true' }),
+        el('span', { text: 'Looking for the conversations behind each commit. This stays on your machine.' }),
+      ]),
+    ];
+  }
+  function renderBackfillRow(c) {
+    const cb = el('input', { type: 'checkbox', className: 'bf-row-cb' });
+    cb.checked = state.backfillSelected[c.commitHash] !== false;
+    cb.addEventListener('change', function() {
+      state.backfillSelected[c.commitHash] = cb.checked;
+      bfUpdateGenerateBtn();
+    });
+    return el('label', { className: 'bf-row' }, [
+      cb,
+      el('div', { className: 'bf-row-main' }, [
+        el('div', { className: 'bf-row-title', title: c.subject, text: c.subject }),
+        el('div', { className: 'bf-row-meta', text: formatBackfillMeta(c.sessions, c.conversationTurns) }),
+      ]),
+    ]);
+  }
+  function bfUpdateGenerateBtn() {
+    const btn = backfillPanel.querySelector('.bf-generate');
+    if (!btn) return;
+    const n = bfSelectedHashes().length;
+    btn.disabled = n === 0;
+    btn.textContent = n === 0 ? 'Select commits to build' : 'Build ' + n + ' memor' + (n === 1 ? 'y' : 'ies');
+  }
+  function renderBackfillList() {
+    const candidates = state.backfillCandidates;
+    if (candidates.length === 0) {
+      return [
+        bfHeader('No commits to build from', null),
+        el('p', { className: 'bf-note' }, 'No commits from the last month need a memory. Keep coding — new commits capture automatically.'),
+      ];
+    }
+    const rows = candidates.map(renderBackfillRow);
+    const children = [
+      bfHeader('Build memories from your recent commits',
+        'Pick the commits to reconstruct. We attach the AI conversation behind each one when we can find it.'),
+      el('div', { className: 'bf-list' }, rows),
+    ];
+    // "N older commits" escape hatch → full scope lives in Settings.
+    const older = state.backfillTotalMissing - candidates.length;
+    if (older > 0) {
+      const link = el('button', { className: 'bf-link', type: 'button' },
+        older + ' older commit' + (older === 1 ? '' : 's') + ' without a memory — manage all in Settings');
+      link.addEventListener('click', function() { vscode.postMessage({ type: 'backfill:openSettings' }); });
+      children.push(el('p', { className: 'bf-older' }, [link]));
+    }
+    const gen = el('button', { className: 'ob-btn ob-btn--primary bf-generate', type: 'button' });
+    // Initial label reflects the default all-selected state (bfUpdateGenerateBtn
+    // keeps it in sync as checkboxes toggle).
+    const initialN = bfSelectedHashes().length;
+    gen.disabled = initialN === 0;
+    gen.textContent = initialN === 0 ? 'Select commits to build' : 'Build ' + initialN + ' memor' + (initialN === 1 ? 'y' : 'ies');
+    gen.addEventListener('click', function() {
+      const hashes = bfSelectedHashes();
+      if (hashes.length === 0) return;
+      state.backfillProgress = { done: 0, total: hashes.length };
+      state.backfillMode = 'progress';
+      vscode.postMessage({ type: 'backfill:run', hashes: hashes });
+      renderBackfillCard();
+    });
+    children.push(gen);
+    children.push(el('p', { className: 'bf-honest' }, 'Runs one AI call per commit, locally. Nothing leaves unless you Share or Sync.'));
+    return children;
+  }
+  function bfBarWidthClass(done, total) {
+    var pct = total > 0 ? Math.floor((done / total) * 10) * 10 : 0;
+    if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
+    return 'bf-bar-fill bf-bar-fill--w' + pct;
+  }
+  function renderBackfillProgress() {
+    const p = state.backfillProgress;
+    return [
+      bfHeader('Building memories from your commits…', null),
+      el('div', { className: 'bf-prog' }, [
+        el('i', { className: 'codicon codicon-loading codicon-modifier-spin', 'aria-hidden': 'true' }),
+        el('span', {}, [ el('b', { text: String(p.done) }), document.createTextNode(' / ' + p.total + ' built') ]),
+      ]),
+      el('div', { className: 'bf-bar' }, [ el('span', { className: bfBarWidthClass(p.done, p.total) }) ]),
+      el('p', { className: 'bf-honest' }, "Reading each commit's message + diff. This stays on your machine."),
+    ];
+  }
+  function renderBackfillDone() {
+    const r = state.backfillResult || { rows: [], generated: 0, skipped: 0, errors: 0 };
+    const rows = r.rows.map(function(row) {
+      const isErr = row.status === 'error';
+      return el('div', { className: 'bf-result-row' }, [
+        el('i', { className: 'codicon codicon-' + (isErr ? 'warning' : 'sparkle') + ' bf-result-icon', 'aria-hidden': 'true' }),
+        el('span', { className: 'bf-row-title', title: row.subject, text: row.subject }),
+        isErr
+          ? el('span', { className: 'bf-chip bf-chip--err', text: 'failed' })
+          : el('span', { className: 'bf-chip', text: formatBackfillResult(row.sessions, row.topics) }),
+      ]);
+    });
+    const errNote = r.errors > 0 ? ' · ' + r.errors + ' could not be built' : '';
+    const open = el('button', { className: 'ob-btn ob-btn--primary bf-open', type: 'button' }, [
+      el('i', { className: 'codicon codicon-arrow-right', 'aria-hidden': 'true' }),
+      document.createTextNode(' Open your Memory Bank'),
+    ]);
+    open.addEventListener('click', function() {
+      // Memories now exist for this repo — leave cold start, land on the bank.
+      state.repoHasMemories = true;
+      state.backfillMode = 'offer';
+      persist();
+      applyBackfillCard();
+      switchTab('kb');
+    });
+    return [
+      bfHeader(r.generated + ' memor' + (r.generated === 1 ? 'y' : 'ies') + ' built from your history', null),
+      el('p', { className: 'bf-note' },
+        'Reconstructed from each commit + diff' + errNote + '. Live AI sessions will add richer memories as you work.'),
+      el('div', { className: 'bf-result-list' }, rows),
+      open,
+    ];
   }
 
   function renderBreadcrumbBranchLabel(name, detached) {

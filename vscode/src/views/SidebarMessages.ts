@@ -17,6 +17,44 @@ export type SidebarTab = "kb" | "branch" | "status";
 export type KbMode = "folders" | "memories";
 
 /**
+ * Which commits the back-fill card / Settings list operates on.
+ * `recent-month` = own missing commits from the last 30 days (sidebar cold-start
+ * default); `all` = every own missing commit (Settings full scope).
+ */
+export type BackfillScope = "recent-month" | "all";
+
+/**
+ * One selectable row in the back-fill candidate list — the dry-run preview of a
+ * commit that lacks a summary. `sessions` / `conversationTurns` come from the
+ * offline attribution (0 = no conversation found → "仅代码变更"). No confidence
+ * or attribution-method fields are surfaced: users care about "how much real
+ * conversation backs this commit", not the internal tier.
+ */
+export interface BackfillCandidate {
+	readonly commitHash: string;
+	readonly subject: string;
+	/** Author time (epoch ms) — relative-date display + newest-first order. */
+	readonly ts: number;
+	/** Attributed conversations (`attr.sessions.length`; 0 = diff-only). */
+	readonly sessions: number;
+	/** User-initiated turns across those sessions (`conversationTurns`; 0 = diff-only). */
+	readonly conversationTurns: number;
+}
+
+/**
+ * One row in the completed back-fill result list (the "done" state the candidate
+ * list flips into). `topics` is populated post-generation; `status: "error"`
+ * rows are rendered with a failure marker.
+ */
+export interface BackfillResultRow {
+	readonly commitHash: string;
+	readonly subject: string;
+	readonly sessions: number;
+	readonly topics: number;
+	readonly status: "generated" | "error";
+}
+
+/**
  * Why the sidebar can't run its normal flow. Set by activate() in the
  * pre-workspace / pre-git early-return paths so the webview can render a
  * targeted CTA banner (Open Folder / Initialize Git) instead of an empty view.
@@ -79,6 +117,26 @@ export interface SidebarState {
 	 * Undefined in the normal flow.
 	 */
 	readonly degradedReason?: SidebarDegradedReason;
+	/**
+	 * Whether this repo has ANY memory on ANY branch (orphan-branch index
+	 * non-empty). `false` = per-repo cold start → the webview shows the
+	 * back-fill cold-start card (offer → select → progress → done). `true` /
+	 * `undefined` = normal UI (undefined = "not yet known" during early init,
+	 * treated as "has memories" so the card never flashes before the count
+	 * resolves). Sent only on `init`; the host also updates its in-memory value
+	 * once a back-fill generates a memory, so a later sidebar reload reads the
+	 * resolved state. Within a live session the card flips itself to its "done"
+	 * view via `backfill:done`, not via a state re-push.
+	 */
+	readonly repoHasMemories?: boolean;
+	/**
+	 * Whether the user dismissed the cold-start card for this repo (persisted
+	 * per-repo marker). When `true` the card is suppressed even in cold start,
+	 * until the repo re-enters an empty state. Pushed alongside
+	 * `repoHasMemories` so the webview can decide card visibility from state
+	 * alone.
+	 */
+	readonly backfillDismissed?: boolean;
 }
 
 export interface SerializedTreeItem {
@@ -719,6 +777,43 @@ export type SidebarOutboundMsg =
 			 */
 			readonly type: "kb:requestPrStatus";
 			readonly branch: string;
+	  }
+	| {
+			/**
+			 * Cold-start card asks the host for the back-fillable commit list.
+			 * `scope: "recent-month"` → own missing commits authored in the last
+			 * 30 days (sidebar default); `"all"` → every own missing commit
+			 * (Settings full scope). Host runs a dry-run attribution (no LLM) and
+			 * replies with `backfill:candidates` (each row carries session + turn
+			 * counts). Cheap for recent-month; may take a moment for `all`.
+			 */
+			readonly type: "backfill:requestCandidates";
+			readonly scope: BackfillScope;
+	  }
+	| {
+			/**
+			 * User confirmed the selection — generate summaries for exactly these
+			 * commit hashes. Host runs the real back-fill (LLM), streaming
+			 * `backfill:progress` and finishing with `backfill:done`. An empty
+			 * array is a no-op (host guards it).
+			 */
+			readonly type: "backfill:run";
+			readonly hashes: ReadonlyArray<string>;
+	  }
+	| {
+			/**
+			 * User dismissed the cold-start card. Host persists a per-repo marker
+			 * so the card stays hidden until the repo re-enters an empty state.
+			 */
+			readonly type: "backfill:dismiss";
+	  }
+	| {
+			/**
+			 * "Manage all in Settings" affordance on the cold-start card — opens the
+			 * Settings panel (the full-scope back-fill entry point). The panel's
+			 * "Generate Missing Summaries" control lives under its Memory Bank area.
+			 */
+			readonly type: "backfill:openSettings";
 	  };
 
 export type SidebarInboundMsg =
@@ -969,4 +1064,40 @@ export type SidebarInboundMsg =
 			readonly type: "kb:prStatus";
 			readonly branch: string;
 			readonly pr: { readonly number: number; readonly url: string } | null;
+	  }
+	| {
+			/**
+			 * Response to `backfill:requestCandidates`. `items` are the selectable
+			 * rows (dry-run preview); `totalMissing` is the full-scope missing
+			 * count (so the recent-month card can say "更早还有 N 条"). `scope`
+			 * echoes the request so the client can ignore a stale reply.
+			 */
+			readonly type: "backfill:candidates";
+			readonly scope: BackfillScope;
+			readonly items: ReadonlyArray<BackfillCandidate>;
+			readonly totalMissing: number;
+	  }
+	| {
+			/**
+			 * Streamed once per commit while a back-fill runs. Drives the card's
+			 * inline progress bar / count. `subject` names the commit just
+			 * processed; `failed` flags a per-commit error (the batch continues).
+			 */
+			readonly type: "backfill:progress";
+			readonly done: number;
+			readonly total: number;
+			readonly subject: string;
+			readonly failed: boolean;
+	  }
+	| {
+			/**
+			 * Terminal back-fill result — the card flips the candidate list into
+			 * a result list. `rows` are the generated (and any errored) commits;
+			 * the count fields summarize the batch.
+			 */
+			readonly type: "backfill:done";
+			readonly rows: ReadonlyArray<BackfillResultRow>;
+			readonly generated: number;
+			readonly skipped: number;
+			readonly errors: number;
 	  };
