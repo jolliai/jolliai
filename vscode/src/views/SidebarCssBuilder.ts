@@ -1693,6 +1693,7 @@ export function buildSidebarCss(): string {
     border-top: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
   }
   .bf-note-icon { color: var(--vscode-charts-green, var(--vscode-testing-iconPassed, var(--vscode-terminal-ansiGreen))); font-size: 14px; margin-top: 1px; flex-shrink: 0; }
+  .bf-note-icon--err { color: var(--vscode-errorForeground); }
   /* 🔒 honest footer — top-border divider (mockup .sf-honest). */
   .bf-honest {
     font-size: 10.5px;

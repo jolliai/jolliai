@@ -19,7 +19,7 @@
  * quotes (or no quotes) when referring to identifiers in comments below.
  */
 
-import { backfillListRendererSource } from "./BackfillListRenderer.js";
+import { backfillListRendererSource, COLD_START_CAP } from "./BackfillListRenderer.js";
 import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
 import { SOURCE_TITLES } from "./SourceLabels.js";
 
@@ -75,7 +75,10 @@ export function buildSidebarScript(): string {
     return n;
   }
   function mountIn(container, nodes) {
-    const arr = Array.isArray(nodes) ? nodes : [nodes];
+    // Filter null/undefined (matching el()'s child handling): replaceChildren does
+    // NOT — it stringifies null to a literal "null" text node. Callers that build
+    // a top-level children array with a conditional else-null entry rely on this.
+    const arr = (Array.isArray(nodes) ? nodes : [nodes]).filter(function(n) { return n != null; });
     container.replaceChildren.apply(container, arr);
   }
   function clear(container) { container.replaceChildren(); }
@@ -1299,7 +1302,7 @@ export function buildSidebarScript(): string {
   // The ✓ note switches on the cold-start variant — wording lives in the shared,
   // unit-tested formatColdStartNote (BackfillListRenderer.ts) so it can't drift.
   function backfillOfferNote() {
-    return formatColdStartNote(state.coldStartVariant === 'gaps' ? 'gaps' : 'empty', state.recentMissingCount || 0);
+    return formatColdStartNote(state.coldStartVariant === 'gaps' ? 'gaps' : 'empty', state.recentMissingCount || 0, ${COLD_START_CAP});
   }
   function renderBackfillOffer() {
     const benefits = [
@@ -1380,11 +1383,13 @@ export function buildSidebarScript(): string {
         'Pick the commits to reconstruct. We attach the AI conversation behind each one when we can find it.'),
       el('div', { className: 'bf-list' }, rows),
     ];
-    // "N older commits" escape hatch → full scope lives in Settings.
-    const older = state.backfillTotalMissing - candidates.length;
-    if (older > 0) {
+    // "N more commits" escape hatch → full scope lives in Settings. The excess
+    // is everything missing beyond this capped/windowed list (older commits AND
+    // any recent-month commits past the 10-item cap), so label it "more", not "older".
+    const more = state.backfillTotalMissing - candidates.length;
+    if (more > 0) {
       const link = el('button', { className: 'bf-link', type: 'button' },
-        older + ' older commit' + (older === 1 ? '' : 's') + ' without a memory — manage all in Settings');
+        more + ' more commit' + (more === 1 ? '' : 's') + ' without a memory — manage all in Settings');
       link.addEventListener('click', function() { vscode.postMessage({ type: 'backfill:openSettings' }); });
       children.push(el('p', { className: 'bf-older' }, [link]));
     }
@@ -1435,6 +1440,36 @@ export function buildSidebarScript(): string {
           : el('span', { className: 'bf-chip', text: formatBackfillResult(row.sessions, row.topics) }),
       ]);
     });
+    // All-error / nothing built (backfill:done also fires on the failure path with
+    // generated: 0). Do NOT clear cold-start state or send the user to an empty
+    // Memory Bank — keep the card and offer an in-session retry.
+    if (r.generated === 0) {
+      const nErr = r.errors || 0;
+      const retry = el('button', { className: 'ob-btn ob-btn--primary bf-cta', type: 'button' }, [
+        el('i', { className: 'codicon codicon-refresh', 'aria-hidden': 'true' }),
+        document.createTextNode(' Try again'),
+      ]);
+      retry.addEventListener('click', function() {
+        // Re-fetch candidates and return to the list; cold-start state untouched.
+        state.backfillMode = 'loading';
+        vscode.postMessage({ type: 'backfill:requestCandidates', scope: 'recent-month' });
+        renderBackfillCard();
+      });
+      // Build children conditionally — a top-level null entry would reach mountIn's
+      // replaceChildren (which, unlike el(), does not filter nulls) and render a
+      // literal "null" text node. The thrown-run path posts rows: [] exactly here.
+      const errChildren = [
+        bfHeader("Couldn't build memories", null),
+        el('div', { className: 'bf-note' }, [
+          el('i', { className: 'codicon codicon-warning bf-note-icon bf-note-icon--err', 'aria-hidden': 'true' }),
+          el('span', { text: nErr + ' commit' + (nErr === 1 ? '' : 's') + " couldn't be built. Check your AI credentials, then try again." }),
+        ]),
+      ];
+      if (rows.length) errChildren.push(el('div', { className: 'bf-result-list' }, rows));
+      errChildren.push(retry);
+      return errChildren;
+    }
+
     const errNote = r.errors > 0 ? ' · ' + r.errors + ' could not be built' : '';
     const open = el('button', { className: 'ob-btn ob-btn--primary bf-open', type: 'button' }, [
       el('i', { className: 'codicon codicon-arrow-right', 'aria-hidden': 'true' }),
