@@ -73,6 +73,21 @@ export interface BackfillOutcome {
 	readonly confidence?: "high" | "medium" | "low";
 	readonly method?: "file-overlap" | "branch-match" | "time-window" | "diff-only";
 	readonly topics?: number;
+	/**
+	 * Number of AI conversations attributed to this commit (`attr.sessions.length`;
+	 * 0 when no conversation was found → diff-only). Populated on both `would-generate`
+	 * (dry-run preview) and `generated`. The UI shows this as "N 个会话".
+	 */
+	readonly sessions?: number;
+	/**
+	 * User-initiated conversation turns across the attributed sessions
+	 * (`attr.conversationTurns`; count of human-role entries). 0 when diff-only,
+	 * and possibly 0 even with sessions > 0 if the attributed turns are all
+	 * non-human (AI/tool only). Deliberately NOT `transcriptEntries` (which
+	 * includes AI/tool lines and is a larger, less intuitive number). The UI shows
+	 * this as "N 轮对话".
+	 */
+	readonly conversationTurns?: number;
 	readonly message?: string;
 }
 
@@ -272,6 +287,8 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 				commitHash: hash,
 				status: "would-generate",
 				method,
+				sessions: attr?.sessions.length ?? 0,
+				conversationTurns: attr?.conversationTurns ?? 0,
 				...(attr ? { confidence: attr.confidence } : {}),
 			};
 		} else if (!credsOk) {
@@ -285,6 +302,8 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 					status: "generated",
 					method,
 					topics,
+					sessions: attr?.sessions.length ?? 0,
+					conversationTurns: attr?.conversationTurns ?? 0,
 					...(attr ? { confidence: attr.confidence } : {}),
 				};
 			} catch (err) {
@@ -444,4 +463,77 @@ export async function countMissingSummaries(cwd: string): Promise<{ missing: num
 	let missing = 0;
 	for (const h of hashes) if (!existing.has(h)) missing++;
 	return { missing, total: hashes.length };
+}
+
+/**
+ * Whether this repo has ANY memory on ANY branch (orphan-branch index non-empty).
+ * Cheap — a single index read, no transcript scan or LLM call. Drives the VS Code
+ * per-repo cold-start decision: `false` → show the back-fill cold-start card.
+ * NOT branch-scoped: a returning user on a fresh branch of a repo that already has
+ * memories is not in cold start.
+ */
+export async function repoHasAnyMemory(cwd: string): Promise<boolean> {
+	const storage = await createStorage(cwd, cwd);
+	setActiveStorage(storage);
+	const existing = await getIndexEntryMap(cwd, storage);
+	return existing.size > 0;
+}
+
+/** One own commit that lacks a summary — the row shape the UI candidate list renders. */
+export interface MissingCommitInfo {
+	readonly commitHash: string;
+	/** First line of the commit message. */
+	readonly subject: string;
+	/** Author time (epoch ms). Newest-first ordering + relative-date display. */
+	readonly ts: number;
+}
+
+/**
+ * Lists the local user's OWN commits that lack a summary, newest-first, optionally
+ * bounded to those authored within the last `sinceMs` milliseconds.
+ *
+ * This is the metadata-carrying sibling of {@link recentCommitHashes}: the
+ * VS Code cold-start card + Settings panel need the subject + timestamp per commit
+ * (to render the selectable row and its relative date), not just the hash. Own-author
+ * scoped (email OR name) like every other back-fill entry point — commits authored by
+ * others never have local Claude transcripts, so back-filling them is pointless.
+ *
+ *   - `sinceMs` given  → cold-start window (e.g. "last 30 days"): only commits whose
+ *                        AUTHOR time is `>= now - sinceMs`. `now` is derived from the
+ *                        newest own commit (NOT wall-clock) so the window is stable and
+ *                        testable without injecting a clock.
+ *   - `sinceMs` omitted → every own commit lacking a summary (Settings full scope).
+ */
+export async function listMissingCommits(cwd: string, sinceMs?: number): Promise<MissingCommitInfo[]> {
+	// `%x00` = NUL field separator so a commit subject containing '|' can't corrupt
+	// parsing (mirrors the caution in gatherCursorCandidates, which only needed %at).
+	const args = ["log", "HEAD", "--pretty=format:%H%x00%at%x00%s"];
+	await pushAuthorFilter(args, cwd);
+	const res = await execGit(args, cwd);
+	if (res.exitCode !== 0 || !res.stdout.trim()) return [];
+
+	const rows: MissingCommitInfo[] = [];
+	let newest = Number.NEGATIVE_INFINITY;
+	for (const line of res.stdout.split("\n")) {
+		const parts = line.split("\u0000");
+		if (parts.length < 3) continue;
+		const [hash, atStr, subject] = parts;
+		const ts = Number.parseInt(atStr, 10) * 1000;
+		if (!hash || Number.isNaN(ts)) continue;
+		if (ts > newest) newest = ts;
+		rows.push({ commitHash: hash, subject, ts });
+	}
+	if (rows.length === 0) return [];
+
+	// Time-window filter is applied relative to the newest own commit, not wall-clock:
+	// keeps the boundary deterministic and lets tests fix `sinceMs` without a clock stub.
+	// (The newest row always satisfies the bound for any non-negative sinceMs, so
+	// `windowed` is never empty when `rows` isn't — no separate empty guard needed.)
+	const windowed = typeof sinceMs === "number" ? rows.filter((r) => r.ts >= newest - sinceMs) : rows;
+
+	// Drop the ones that already have a summary (index membership — no transcript scan).
+	const storage = await createStorage(cwd, cwd);
+	setActiveStorage(storage);
+	const existing = await getIndexEntryMap(cwd, storage);
+	return windowed.filter((r) => !existing.has(r.commitHash));
 }

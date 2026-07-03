@@ -5520,3 +5520,148 @@ describe("SidebarWebviewProvider", () => {
 		});
 	});
 });
+
+describe("SidebarWebviewProvider — back-fill cold-start handlers", () => {
+	function makeProviderWithBackfill(backfill?: {
+		listCandidates: ReturnType<typeof vi.fn>;
+		run: ReturnType<typeof vi.fn>;
+		dismiss: ReturnType<typeof vi.fn>;
+	}): { provider: SidebarWebviewProvider; view: MockWebviewView; executeCommand: ReturnType<typeof vi.fn> } {
+		const executeCommand = vi.fn().mockResolvedValue(undefined);
+		const provider = new SidebarWebviewProvider({
+			executeCommand: executeCommand as never,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			...(backfill ? { backfill: backfill as never } : {}),
+		});
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		return { provider, view, executeCommand };
+	}
+	function sentOf(view: MockWebviewView): SidebarInboundMsg[] {
+		return view.webview.postMessage.mock.calls.map((c) => c[0] as SidebarInboundMsg);
+	}
+
+	it("requestCandidates → calls listCandidates and posts the candidates back", async () => {
+		const backfill = {
+			listCandidates: vi.fn().mockResolvedValue({
+				items: [{ commitHash: "h1", subject: "fix", ts: 1, sessions: 2, conversationTurns: 5 }],
+				totalMissing: 7,
+			}),
+			run: vi.fn(),
+			dismiss: vi.fn(),
+		};
+		const { view } = makeProviderWithBackfill(backfill);
+		view.webview.triggerMessage({ type: "backfill:requestCandidates", scope: "recent-month" });
+		await flushUntilMessage(view, "backfill:candidates");
+		expect(backfill.listCandidates).toHaveBeenCalledWith("recent-month");
+		const msg = sentOf(view).find((m) => m.type === "backfill:candidates") as Extract<
+			SidebarInboundMsg,
+			{ type: "backfill:candidates" }
+		>;
+		expect(msg.items).toHaveLength(1);
+		expect(msg.totalMissing).toBe(7);
+		expect(msg.scope).toBe("recent-month");
+	});
+
+	it("requestCandidates → posts empty candidates when no backfill dep is wired", async () => {
+		const { view } = makeProviderWithBackfill(undefined);
+		view.webview.triggerMessage({ type: "backfill:requestCandidates", scope: "recent-month" });
+		await flushUntilMessage(view, "backfill:candidates");
+		const msg = sentOf(view).find((m) => m.type === "backfill:candidates") as Extract<
+			SidebarInboundMsg,
+			{ type: "backfill:candidates" }
+		>;
+		expect(msg.items).toEqual([]);
+		expect(msg.totalMissing).toBe(0);
+	});
+
+	it("requestCandidates → posts empty candidates when listCandidates throws", async () => {
+		const backfill = {
+			listCandidates: vi.fn().mockRejectedValue(new Error("boom")),
+			run: vi.fn(),
+			dismiss: vi.fn(),
+		};
+		const { view } = makeProviderWithBackfill(backfill);
+		view.webview.triggerMessage({ type: "backfill:requestCandidates", scope: "recent-month" });
+		await flushUntilMessage(view, "backfill:candidates");
+		const msg = sentOf(view).find((m) => m.type === "backfill:candidates") as Extract<
+			SidebarInboundMsg,
+			{ type: "backfill:candidates" }
+		>;
+		expect(msg.items).toEqual([]);
+	});
+
+	it("run → streams progress and posts done", async () => {
+		const backfill = {
+			listCandidates: vi.fn(),
+			run: vi.fn(async (_hashes: readonly string[], onProgress: (d: number, t: number, s: string, f: boolean) => void) => {
+				onProgress(1, 2, "first", false);
+				onProgress(2, 2, "second", false);
+				return { rows: [{ commitHash: "h1", subject: "fix", sessions: 1, topics: 3, status: "generated" }], generated: 1, skipped: 0, errors: 0 };
+			}),
+			dismiss: vi.fn(),
+		};
+		const { view } = makeProviderWithBackfill(backfill);
+		view.webview.triggerMessage({ type: "backfill:run", hashes: ["h1", "h2"] });
+		await flushUntilMessage(view, "backfill:done");
+		expect(backfill.run).toHaveBeenCalledWith(["h1", "h2"], expect.any(Function));
+		const sent = sentOf(view);
+		const progresses = sent.filter((m) => m.type === "backfill:progress");
+		expect(progresses.length).toBe(2);
+		const done = sent.find((m) => m.type === "backfill:done") as Extract<SidebarInboundMsg, { type: "backfill:done" }>;
+		expect(done.generated).toBe(1);
+		expect(done.rows).toHaveLength(1);
+	});
+
+	it("run → no-op done for an empty hash list (does not call run)", async () => {
+		const backfill = { listCandidates: vi.fn(), run: vi.fn(), dismiss: vi.fn() };
+		const { view } = makeProviderWithBackfill(backfill);
+		view.webview.triggerMessage({ type: "backfill:run", hashes: [] });
+		await flushUntilMessage(view, "backfill:done");
+		expect(backfill.run).not.toHaveBeenCalled();
+		const done = sentOf(view).find((m) => m.type === "backfill:done") as Extract<
+			SidebarInboundMsg,
+			{ type: "backfill:done" }
+		>;
+		expect(done.generated).toBe(0);
+	});
+
+	it("run → posts a terminal errored done when run throws", async () => {
+		const backfill = {
+			listCandidates: vi.fn(),
+			run: vi.fn().mockRejectedValue(new Error("llm down")),
+			dismiss: vi.fn(),
+		};
+		const { view } = makeProviderWithBackfill(backfill);
+		view.webview.triggerMessage({ type: "backfill:run", hashes: ["h1", "h2"] });
+		await flushUntilMessage(view, "backfill:done");
+		const done = sentOf(view).find((m) => m.type === "backfill:done") as Extract<
+			SidebarInboundMsg,
+			{ type: "backfill:done" }
+		>;
+		expect(done.errors).toBe(2);
+		expect(done.rows).toEqual([]);
+	});
+
+	it("dismiss → calls the backfill dismiss dep", () => {
+		const backfill = { listCandidates: vi.fn(), run: vi.fn(), dismiss: vi.fn() };
+		const { view } = makeProviderWithBackfill(backfill);
+		view.webview.triggerMessage({ type: "backfill:dismiss" });
+		expect(backfill.dismiss).toHaveBeenCalledTimes(1);
+	});
+
+	it("openSettings → runs the openSettings command", () => {
+		const backfill = { listCandidates: vi.fn(), run: vi.fn(), dismiss: vi.fn() };
+		const { view, executeCommand } = makeProviderWithBackfill(backfill);
+		view.webview.triggerMessage({ type: "backfill:openSettings" });
+		expect(executeCommand).toHaveBeenCalledWith("jollimemory.openSettings");
+	});
+});

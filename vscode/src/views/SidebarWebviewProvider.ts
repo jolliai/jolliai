@@ -29,6 +29,9 @@ import { ConversationDetailsPanel } from "./ConversationDetailsPanel.js";
 import { SIDEBAR_EMPTY_STRINGS } from "./SidebarEmptyMessages.js";
 import { buildSidebarHtml } from "./SidebarHtmlBuilder.js";
 import type {
+	BackfillCandidate,
+	BackfillResultRow,
+	BackfillScope,
 	BranchMemoryItem,
 	FolderNode,
 	MemoryEvidence,
@@ -177,6 +180,32 @@ export interface SidebarWebviewDeps {
 	 * tests that inject only `resolveKbAbs` keep working; absent → no check.
 	 */
 	isMemoryFileDivergedOnDisk?: (abs: string) => Promise<boolean>;
+	/**
+	 * Back-fill cold-start card orchestration. Optional so existing provider
+	 * tests can omit it (absent → the four backfill:* messages are inert no-ops).
+	 * Wired in Extension.ts against the isolated CLI back-fill engine:
+	 *   - `listCandidates` runs a dry-run (no LLM) and returns the selectable rows
+	 *     + the full-scope missing count.
+	 *   - `run` generates summaries for the given hashes, streaming per-commit
+	 *     progress through `onProgress`, and resolves with the result rows.
+	 *   - `dismiss` persists the per-repo "card dismissed" marker.
+	 */
+	backfill?: {
+		listCandidates(scope: BackfillScope): Promise<{
+			items: ReadonlyArray<BackfillCandidate>;
+			totalMissing: number;
+		}>;
+		run(
+			hashes: ReadonlyArray<string>,
+			onProgress: (done: number, total: number, subject: string, failed: boolean) => void,
+		): Promise<{
+			rows: ReadonlyArray<BackfillResultRow>;
+			generated: number;
+			skipped: number;
+			errors: number;
+		}>;
+		dismiss(): void;
+	};
 	memoriesProvider?: {
 		serialize(): { items: ReadonlyArray<MemoryItem>; hasMore: boolean };
 		onDidChangeTreeData: (cb: () => void) => { dispose: () => void };
@@ -1043,8 +1072,75 @@ export class SidebarWebviewProvider
 				})();
 				return;
 			}
+			case "backfill:requestCandidates": {
+				const { scope } = msg;
+				void this.handleBackfillRequestCandidates(scope);
+				return;
+			}
+			case "backfill:run": {
+				const { hashes } = msg;
+				void this.handleBackfillRun(hashes);
+				return;
+			}
+			case "backfill:dismiss":
+				this.deps.backfill?.dismiss();
+				return;
+			case "backfill:openSettings":
+				void this.deps.executeCommand("jollimemory.openSettings");
+				return;
 			default:
 				return;
+		}
+	}
+
+	/**
+	 * Dry-run attribution for the cold-start card (no LLM). Never throws — a
+	 * failure posts an empty candidate set so the card can show its empty/error
+	 * copy rather than hanging on the spinner.
+	 */
+	private async handleBackfillRequestCandidates(scope: BackfillScope): Promise<void> {
+		if (!this.deps.backfill) {
+			this.postMessage({ type: "backfill:candidates", scope, items: [], totalMissing: 0 });
+			return;
+		}
+		try {
+			const { items, totalMissing } = await this.deps.backfill.listCandidates(scope);
+			this.postMessage({ type: "backfill:candidates", scope, items, totalMissing });
+		} catch {
+			this.postMessage({ type: "backfill:candidates", scope, items: [], totalMissing: 0 });
+		}
+	}
+
+	/**
+	 * Runs the real back-fill for the selected hashes, streaming per-commit
+	 * progress to the card and finishing with the result list. Never throws — a
+	 * failure posts a terminal `backfill:done` with an errored summary so the
+	 * card leaves its progress state.
+	 */
+	private async handleBackfillRun(hashes: ReadonlyArray<string>): Promise<void> {
+		if (!this.deps.backfill || hashes.length === 0) {
+			this.postMessage({ type: "backfill:done", rows: [], generated: 0, skipped: 0, errors: 0 });
+			return;
+		}
+		try {
+			const result = await this.deps.backfill.run(hashes, (done, total, subject, failed) => {
+				this.postMessage({ type: "backfill:progress", done, total, subject, failed });
+			});
+			this.postMessage({
+				type: "backfill:done",
+				rows: result.rows,
+				generated: result.generated,
+				skipped: result.skipped,
+				errors: result.errors,
+			});
+		} catch {
+			this.postMessage({
+				type: "backfill:done",
+				rows: [],
+				generated: 0,
+				skipped: 0,
+				errors: hashes.length,
+			});
 		}
 	}
 

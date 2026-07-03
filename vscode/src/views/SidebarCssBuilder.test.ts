@@ -377,15 +377,15 @@ describe("onboarding panel styles", () => {
 		expect(css).toContain("var(--vscode-descriptionForeground)");
 	});
 
-	it("shares the onboarding-panel container rule with .disabled-panel and .apikey-panel", () => {
+	it("shares the onboarding-panel container rule with .disabled-panel, .apikey-panel and .backfill-panel", () => {
 		const css = buildSidebarCss();
-		// All three full-viewport configured===false views (onboarding cards,
-		// apikey input, and disabled CTA) reuse the same container rule
+		// All full-viewport panels (onboarding cards, apikey input, disabled CTA,
+		// and the back-fill cold-start card) reuse the same container rule
 		// (padding/scroll/height) by way of a multi-selector rule rather
 		// than redeclaring the same declarations. This keeps tweaks to
 		// onboarding spacing in lockstep across every sibling panel.
 		expect(css).toMatch(
-			/\.onboarding-panel\s*,\s*\.disabled-panel\s*,\s*\.apikey-panel\s*\{/,
+			/\.onboarding-panel\s*,\s*\.disabled-panel\s*,\s*\.apikey-panel\s*,\s*\.backfill-panel\s*\{/,
 		);
 	});
 

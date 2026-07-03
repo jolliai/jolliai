@@ -318,6 +318,24 @@ describe("runBackfill", () => {
 		expect(report.outcomes[0].status).toBe("would-generate");
 		expect(report.outcomes[0].method).toBe("diff-only");
 		expect(report.outcomes[0].confidence).toBeUndefined();
+		// diff-only → no conversation: sessions/turns are 0 (not undefined) so the UI
+		// can render "仅代码变更" without a null check.
+		expect(report.outcomes[0].sessions).toBe(0);
+		expect(report.outcomes[0].conversationTurns).toBe(0);
+	});
+
+	it("carries attributed session + conversation-turn counts on both dry-run and generated", async () => {
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+		const dry = await runBackfill({ cwd: CWD, hashes: ["c1"], dryRun: true });
+		// attrFor → 1 session, conversationTurns: 1
+		expect(dry.outcomes[0].sessions).toBe(1);
+		expect(dry.outcomes[0].conversationTurns).toBe(1);
+
+		const gen = await runBackfill({ cwd: CWD, hashes: ["c1"] });
+		expect(gen.outcomes[0].status).toBe("generated");
+		expect(gen.outcomes[0].sessions).toBe(1);
+		expect(gen.outcomes[0].conversationTurns).toBe(1);
+		expect(gen.outcomes[0].topics).toBe(1);
 	});
 
 	it("stamps treeHash, ticketId, and recap", async () => {
@@ -435,5 +453,98 @@ describe("countMissingSummaries / own-commit scoping", () => {
 		// No identity → neither --author nor the --fixed-strings that accompanies it.
 		expect(revList?.some((a) => a.startsWith("--author="))).toBe(false);
 		expect(revList).not.toContain("--fixed-strings");
+	});
+});
+
+describe("repoHasAnyMemory", () => {
+	it("returns true when the orphan-branch index has entries", async () => {
+		vi.mocked(getIndexEntryMap).mockResolvedValue(new Map([["h1", {} as never]]));
+		const { repoHasAnyMemory } = await import("./BackfillEngine.js");
+		expect(await repoHasAnyMemory(CWD)).toBe(true);
+	});
+
+	it("returns false when the index is empty (per-repo cold start)", async () => {
+		vi.mocked(getIndexEntryMap).mockResolvedValue(new Map());
+		const { repoHasAnyMemory } = await import("./BackfillEngine.js");
+		expect(await repoHasAnyMemory(CWD)).toBe(false);
+	});
+});
+
+describe("listMissingCommits", () => {
+	const NUL = String.fromCharCode(0);
+	// git log --pretty=format:%H%x00%at%x00%s → one NUL-delimited line per commit.
+	const row = (hash: string, atSec: number, subject: string) => `${hash}${NUL}${atSec}${NUL}${subject}`;
+
+	// A fixed "now" anchor for the window math (newest commit's author time).
+	const NOW_SEC = 1_800_000_000; // arbitrary epoch seconds
+	const DAY = 24 * 60 * 60;
+
+	async function mockLog(lines: string[]): Promise<void> {
+		const { execGit } = await import("../core/GitOps.js");
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			if (args[0] === "config") return { exitCode: 0, stdout: "me@dev.io", stderr: "" } as never;
+			return { exitCode: 0, stdout: lines.join("\n"), stderr: "" } as never;
+		});
+	}
+
+	it("returns own missing commits newest-first with subject + ms timestamp, dropping summarized ones", async () => {
+		await mockLog([
+			row("h1", NOW_SEC, "newest | with pipe in subject"),
+			row("h2", NOW_SEC - DAY, "second"),
+			row("h3", NOW_SEC - 2 * DAY, "third"),
+		]);
+		vi.mocked(getIndexEntryMap).mockResolvedValue(new Map([["h2", {} as never]])); // h2 already summarized
+		const { listMissingCommits } = await import("./BackfillEngine.js");
+		const rows = await listMissingCommits(CWD);
+		expect(rows.map((r) => r.commitHash)).toEqual(["h1", "h3"]);
+		expect(rows[0].subject).toBe("newest | with pipe in subject"); // '|' in subject survives NUL parsing
+		expect(rows[0].ts).toBe(NOW_SEC * 1000); // epoch seconds → ms
+	});
+
+	it("applies the sinceMs window relative to the newest own commit (deterministic, no clock)", async () => {
+		await mockLog([
+			row("h1", NOW_SEC, "today"),
+			row("h2", NOW_SEC - 10 * DAY, "ten days ago"),
+			row("h3", NOW_SEC - 40 * DAY, "forty days ago"),
+		]);
+		vi.mocked(getIndexEntryMap).mockResolvedValue(new Map());
+		const { listMissingCommits } = await import("./BackfillEngine.js");
+		const rows = await listMissingCommits(CWD, 30 * DAY * 1000); // last 30 days
+		expect(rows.map((r) => r.commitHash)).toEqual(["h1", "h2"]); // h3 (40d) excluded
+	});
+
+	it("tolerates malformed lines and empty subjects", async () => {
+		await mockLog([
+			"garbage-no-separators",
+			row("h1", NOW_SEC, ""), // empty subject
+			`h2${NUL}notanumber${NUL}bad-timestamp`, // NaN ts → skipped
+		]);
+		vi.mocked(getIndexEntryMap).mockResolvedValue(new Map());
+		const { listMissingCommits } = await import("./BackfillEngine.js");
+		const rows = await listMissingCommits(CWD);
+		expect(rows.map((r) => r.commitHash)).toEqual(["h1"]);
+		expect(rows[0].subject).toBe("");
+	});
+
+	it("returns [] when every line is malformed (non-empty output, zero parseable rows)", async () => {
+		await mockLog(["no-separators-here", "still-garbage"]);
+		vi.mocked(getIndexEntryMap).mockResolvedValue(new Map());
+		const { listMissingCommits } = await import("./BackfillEngine.js");
+		expect(await listMissingCommits(CWD)).toEqual([]);
+	});
+
+	it("returns [] on git failure or no output", async () => {
+		const { execGit } = await import("../core/GitOps.js");
+		vi.mocked(execGit).mockResolvedValue({ exitCode: 1, stdout: "", stderr: "boom" } as never);
+		const { listMissingCommits } = await import("./BackfillEngine.js");
+		expect(await listMissingCommits(CWD)).toEqual([]);
+	});
+
+	it("returns [] when the window excludes every commit", async () => {
+		await mockLog([row("h1", NOW_SEC, "a"), row("h2", NOW_SEC - 100 * DAY, "b")]);
+		vi.mocked(getIndexEntryMap).mockResolvedValue(new Map([["h1", {} as never]])); // only in-window one is summarized
+		const { listMissingCommits } = await import("./BackfillEngine.js");
+		// window keeps only h1, but h1 is summarized → []
+		expect(await listMissingCommits(CWD, 1 * DAY * 1000)).toEqual([]);
 	});
 });

@@ -85,6 +85,7 @@ import { PlansTreeProvider } from "./providers/PlansTreeProvider.js";
 import { StatusTreeProvider } from "./providers/StatusTreeProvider.js";
 import { ActiveSessionsProvider } from "./services/ActiveSessionsProvider.js";
 import { AuthService } from "./services/AuthService.js";
+import { readBackfillDismissFlag, writeBackfillDismissFlag } from "./services/BackfillDismissFlag.js";
 import { KbFoldersService } from "./services/KbFoldersService.js";
 import {
 	readManualDisableFlag,
@@ -112,6 +113,7 @@ import { NextMemoryPreviewPanel } from "./views/NextMemoryPreviewPanel.js";
 import { NoteEditorWebviewPanel } from "./views/NoteEditorWebviewPanel.js";
 import { SettingsWebviewPanel } from "./views/SettingsWebviewPanel.js";
 import { SidebarWebviewProvider } from "./views/SidebarWebviewProvider.js";
+import type { BackfillResultRow } from "./views/SidebarMessages.js";
 import { loadBranchSummaries } from "./views/BranchSummaryLoader.js";
 import { buildClaudeCodeContext } from "./views/SummaryMarkdownBuilder.js";
 import { SummaryWebviewPanel } from "./views/SummaryWebviewPanel.js";
@@ -831,6 +833,11 @@ export function activate(context: vscode.ExtensionContext): void {
 	// from statusStore.onChange so sign-in / sign-out / settings save / config
 	// reload all converge on a single source of truth.
 	let currentConfigured = false;
+	// Per-repo cold-start signals for the back-fill card. Optimistic defaults
+	// (has memories / not dismissed) so the card never flashes before
+	// initialLoad resolves the real values under the `initialStateReady` barrier.
+	let currentRepoHasMemories = true;
+	let currentBackfillDismissed = false;
 
 	// Deferred barrier that the SidebarWebviewProvider awaits before posting
 	// the first `init` message. We resolve it once `initialLoad()` (which
@@ -854,6 +861,96 @@ export function activate(context: vscode.ExtensionContext): void {
 		getWorkspaceCwd: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
 	});
 
+	// Shared back-fill runner used by BOTH the Settings command
+	// (`jollimemory.generateMissingSummaries`) and the sidebar cold-start card's
+	// `backfill.run` dep. Streams per-commit progress to the native notification
+	// (product requirement: keep the bottom-right toast) AND, when `onProgress`
+	// is supplied, to the caller (the card's inline bar). `hashes === undefined`
+	// → full scope (all own missing commits). Function declaration so the
+	// `backfill` dep in the sidebar deps object below can reference it.
+	async function runBackfillJob(
+		hashes: ReadonlyArray<string> | undefined,
+		onProgress?: (done: number, total: number, subject: string, failed: boolean) => void,
+	): Promise<{
+		ok: boolean;
+		generated: number;
+		total: number;
+		skipped: number;
+		errors: number;
+		rows: BackfillResultRow[];
+		message: string;
+	}> {
+		const { runBackfill, recentCommitHashes } = await import("../../cli/src/backfill/BackfillEngine.js");
+		const candidateHashes = hashes ?? (await recentCommitHashes(workspaceRoot));
+		if (candidateHashes.length === 0) {
+			return { ok: false, generated: 0, total: 0, skipped: 0, errors: 0, rows: [], message: "No commits found." };
+		}
+		const report = await vscode.window.withProgress(
+			{
+				location: vscode.ProgressLocation.Notification,
+				title: "Jolli Memory: Back-filling summaries",
+				cancellable: false,
+			},
+			(progress) =>
+				runBackfill({
+					cwd: workspaceRoot,
+					hashes: candidateHashes,
+					onProgress: (done, total, outcome) => {
+						// Show the commit's one-line message (more readable than a hash),
+						// truncated; flag only failures — success is the norm and the
+						// advancing count already signals progress.
+						const subject = outcome.commitSubject?.trim();
+						const short = outcome.commitHash.substring(0, 8);
+						const label = subject ? (subject.length > 60 ? `${subject.slice(0, 57)}…` : subject) : short;
+						const failed = outcome.status === "error";
+						progress.report({
+							message: `${done}/${total} — ${label}${failed ? " (failed)" : ""}`,
+							increment: 100 / total,
+						});
+						onProgress?.(done, total, subject || short, failed);
+					},
+				}),
+		);
+		bridge.invalidateEntriesCache();
+		if (memoriesStore.hasFirstLoaded()) {
+			memoriesStore.refresh().catch(handleError("generateMissingSummaries.memories"));
+		}
+		// Newly back-filled summaries also land in the Memory Bank folder's
+		// visible layer — refresh the Folders tree like rebuildKnowledgeBase does.
+		sidebarProvider.refreshKnowledgeBaseFolders();
+		// Cold-start bookkeeping is done HERE (not in the sidebar `run` dep) so BOTH
+		// entry points — the cold-start card AND the Settings "Generate Missing
+		// Summaries" button — leave cold start consistently: once any back-fill
+		// produces a memory, the repo is no longer empty, and the per-repo dismiss
+		// marker is cleared so a future fresh-empty transition re-shows the card.
+		// (An already-open sidebar card flips to its own done view via `backfill:done`;
+		// this only fixes the host-side state a later sidebar reload reads.)
+		if (report.generated > 0) {
+			currentRepoHasMemories = true;
+			void writeBackfillDismissFlag(workspaceRoot, false).catch(handleError("backfill.clearDismiss"));
+		}
+		// Card result list shows only the commits acted on (generated / errored);
+		// already-summarized neighbors in a full-scope run are not interesting rows.
+		const rows: BackfillResultRow[] = report.outcomes
+			.filter((o) => o.status === "generated" || o.status === "error")
+			.map((o) => ({
+				commitHash: o.commitHash,
+				subject: o.commitSubject?.trim() || o.commitHash.substring(0, 8),
+				sessions: o.sessions ?? 0,
+				topics: o.topics ?? 0,
+				status: o.status === "generated" ? "generated" : "error",
+			}));
+		return {
+			ok: report.errors === 0,
+			generated: report.generated,
+			total: report.total,
+			skipped: report.skipped,
+			errors: report.errors,
+			rows,
+			message: `${report.generated} generated, ${report.skipped} skipped, ${report.errors} error(s)`,
+		};
+	}
+
 	let sidebarProvider: SidebarWebviewProvider;
 	sidebarProvider = new SidebarWebviewProvider({
 		executeCommand: (cmd, ...args) =>
@@ -872,6 +969,10 @@ export function activate(context: vscode.ExtensionContext): void {
 			// identity, so foreign-readonly chrome stays inactive even after
 			// the user picks another repo from the dropdown.
 			currentRepoName: sidebarRepoName,
+			// Per-repo cold-start signals — drive the back-fill card (shown only
+			// when enabled + configured + repo has zero memories + not dismissed).
+			repoHasMemories: currentRepoHasMemories,
+			backfillDismissed: currentBackfillDismissed,
 		}),
 		extensionUri: context.extensionUri,
 		statusProvider: {
@@ -886,6 +987,55 @@ export function activate(context: vscode.ExtensionContext): void {
 			serialize: () => memoriesProvider.serialize(),
 			onDidChangeTreeData:
 				memoriesProvider.onDidChangeTreeData.bind(memoriesProvider),
+		},
+		backfill: {
+			// Dry-run attribution (no LLM): list the missing commits for the
+			// requested scope, then enrich each with its session + turn counts.
+			listCandidates: async (scope) => {
+				const { listMissingCommits, countMissingSummaries, runBackfill } = await import(
+					"../../cli/src/backfill/BackfillEngine.js"
+				);
+				const RECENT_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
+				const missing = await listMissingCommits(
+					workspaceRoot,
+					scope === "recent-month" ? RECENT_MONTH_MS : undefined,
+				);
+				const totalMissing = (await countMissingSummaries(workspaceRoot)).missing;
+				if (missing.length === 0) return { items: [], totalMissing };
+				// dry-run gives per-commit sessions/conversationTurns without an LLM call.
+				const report = await runBackfill({
+					cwd: workspaceRoot,
+					hashes: missing.map((m) => m.commitHash),
+					dryRun: true,
+				});
+				const byHash = new Map(report.outcomes.map((o) => [o.commitHash, o]));
+				const items = missing.map((m) => {
+					const o = byHash.get(m.commitHash);
+					return {
+						commitHash: m.commitHash,
+						subject: m.subject,
+						ts: m.ts,
+						sessions: o?.sessions ?? 0,
+						conversationTurns: o?.conversationTurns ?? 0,
+					};
+				});
+				return { items, totalMissing };
+			},
+			// Real generation for the selected hashes. Streams per-commit progress
+			// to the card AND to the native notification (via runBackfillJob).
+			// Cold-start host state (repoHasMemories / dismiss marker) is updated
+			// inside runBackfillJob so this path and the Settings command agree.
+			run: async (hashes, onProgress) => {
+				const r = await runBackfillJob(hashes, onProgress);
+				return { rows: r.rows, generated: r.generated, skipped: r.skipped, errors: r.errors };
+			},
+			dismiss: () => {
+				// Sync the in-memory flag too (not just the disk marker) — getInitialState
+				// reads `currentBackfillDismissed`, so without this a webview recreate
+				// (collapse/reopen the sidebar) in the same session would re-show the card.
+				currentBackfillDismissed = true;
+				void writeBackfillDismissFlag(workspaceRoot, true).catch(handleError("backfill.dismiss"));
+			},
 		},
 		plansProvider: {
 			serialize: () => plansProvider.serialize(),
@@ -1914,14 +2064,16 @@ export function activate(context: vscode.ExtensionContext): void {
 				}
 			},
 		),
-		// Back-fill summaries for historical commits that lack one. Reuses the
-		// isolated CLI back-fill engine (Claude transcript attribution → the same
-		// generateSummary/storeSummary path as the live flow). Progress streams
-		// through a native notification; the result text goes back to the
-		// Settings panel's "Generate Missing Summaries" button.
+		// Back-fill summaries for historical commits that lack one. Thin command
+		// wrapper over runBackfillJob (shared with the sidebar cold-start card's
+		// `backfill.run` dep). `hashesArg` selects a subset (cold-start selection);
+		// omitted → full scope (every own missing commit, the Settings button path).
+		// Returns the count summary the Settings panel button reads.
 		vscode.commands.registerCommand(
 			"jollimemory.generateMissingSummaries",
-			async (): Promise<{
+			async (
+				hashesArg?: ReadonlyArray<string>,
+			): Promise<{
 				ok: boolean;
 				generated: number;
 				total: number;
@@ -1929,51 +2081,13 @@ export function activate(context: vscode.ExtensionContext): void {
 				message: string;
 			}> => {
 				try {
-					const { runBackfill, recentCommitHashes } = await import(
-						"../../cli/src/backfill/BackfillEngine.js"
-					);
-					const hashes = await recentCommitHashes(workspaceRoot);
-					if (hashes.length === 0) {
-						return { ok: false, generated: 0, total: 0, skipped: 0, message: "No commits found." };
-					}
-					const report = await vscode.window.withProgress(
-						{
-							location: vscode.ProgressLocation.Notification,
-							title: "Jolli Memory: Back-filling summaries",
-							cancellable: false,
-						},
-						(progress) =>
-							runBackfill({
-								cwd: workspaceRoot,
-								hashes,
-								onProgress: (done, total, outcome) => {
-									// Show the commit's one-line message (more readable than a hash),
-									// truncated; flag only failures — success is the norm and the
-									// advancing count already signals progress.
-									const subject = outcome.commitSubject?.trim();
-									const label = subject
-										? subject.length > 60
-											? `${subject.slice(0, 57)}…`
-											: subject
-										: outcome.commitHash.substring(0, 8);
-									const tag = outcome.status === "error" ? " (failed)" : "";
-									progress.report({ message: `${done}/${total} — ${label}${tag}`, increment: 100 / total });
-								},
-							}),
-					);
-					bridge.invalidateEntriesCache();
-					if (memoriesStore.hasFirstLoaded()) {
-						memoriesStore.refresh().catch(handleError("generateMissingSummaries.memories"));
-					}
-					// Newly back-filled summaries also land in the Memory Bank folder's
-					// visible layer — refresh the Folders tree like rebuildKnowledgeBase does.
-					sidebarProvider.refreshKnowledgeBaseFolders();
+					const r = await runBackfillJob(Array.isArray(hashesArg) ? hashesArg : undefined);
 					return {
-						ok: report.errors === 0,
-						generated: report.generated,
-						total: report.total,
-						skipped: report.skipped,
-						message: `${report.generated} generated, ${report.skipped} skipped, ${report.errors} error(s)`,
+						ok: r.ok,
+						generated: r.generated,
+						total: r.total,
+						skipped: r.skipped,
+						message: r.message,
 					};
 				} catch (err) {
 					return { ok: false, generated: 0, total: 0, skipped: 0, message: (err as Error).message };
@@ -2066,14 +2180,11 @@ export function activate(context: vscode.ExtensionContext): void {
 						filesStore.refresh(true),
 						commitsStore.refresh(),
 					]);
-					// Mirror the CLI `jolli enable`: kick off a best-effort back-fill of
-					// historical commits that lack a summary. Fire-and-forget so enable stays
-					// responsive — the command streams its own progress notification and
-					// refreshes panels when done. runBackfill self-limits (early-returns when
-					// every recent commit already has a summary), a cheap no-op then.
-					void vscode.commands
-						.executeCommand("jollimemory.generateMissingSummaries")
-						.then(undefined, handleError("enable.backfill"));
+					// Historical back-fill is no longer auto-triggered on enable — it is
+					// user-driven via the sidebar cold-start card (or the Settings
+					// "Generate Missing Summaries" button), so enabling never spends LLM
+					// budget without an explicit opt-in. Freshly-enabled empty repos
+					// surface the cold-start card on the next sidebar init.
 				}
 			},
 		),
@@ -3654,7 +3765,18 @@ export function activate(context: vscode.ExtensionContext): void {
 		commitsStore,
 		memoriesStore,
 		statusBar,
-	).finally(() => {
+	).finally(async () => {
+		// Resolve the per-repo cold-start signals under the same barrier as
+		// currentConfigured, so the first `init` carries correct card visibility
+		// (no flash). Best-effort: any failure leaves the optimistic defaults
+		// (has memories / not dismissed) so the card simply doesn't appear.
+		try {
+			const { repoHasAnyMemory } = await import("../../cli/src/backfill/BackfillEngine.js");
+			currentRepoHasMemories = await repoHasAnyMemory(workspaceRoot);
+			currentBackfillDismissed = await readBackfillDismissFlag(workspaceRoot);
+		} catch (err) {
+			log.debug("activate", `cold-start signal resolve failed: ${(err as Error).message}`);
+		}
 		resolveInitialStateReady();
 	});
 
