@@ -246,6 +246,13 @@ export function buildSettingsCss(): string {
     transition: opacity 0.15s;
   }
   .browse-btn:hover { opacity: 0.85; }
+  .browse-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  /* Don't brighten on hover while disabled (e.g. "Generate Missing Summaries"
+     when the repo has no commits lacking a summary). */
+  .browse-btn:disabled:hover { opacity: 0.4; }
 
   /* ── Primary action button (Sign In etc.) ── */
   .primary-btn {

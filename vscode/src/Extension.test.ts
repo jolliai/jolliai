@@ -7430,7 +7430,9 @@ describe("Extension", () => {
 			});
 			activate(makeContext());
 			const res = await capturedBackfill().listCandidates("recent-month");
-			expect(vi.mocked(listMissingCommits)).toHaveBeenCalledWith("/test/workspace", 30 * 24 * 60 * 60 * 1000);
+			// recent-month = the shared cold-start window, capped to the shared cap.
+			const { COLD_START_WINDOW_MS, COLD_START_CAP } = await import("./views/BackfillListRenderer.js");
+			expect(vi.mocked(listMissingCommits)).toHaveBeenCalledWith("/test/workspace", COLD_START_WINDOW_MS, COLD_START_CAP);
 			expect(res.totalMissing).toBe(9);
 			expect(res.items).toEqual([
 				{ commitHash: "h1", subject: "fix a", ts: 100, sessions: 2, conversationTurns: 6 },

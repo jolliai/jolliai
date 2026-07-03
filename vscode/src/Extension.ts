@@ -113,6 +113,7 @@ import { NextMemoryPreviewPanel } from "./views/NextMemoryPreviewPanel.js";
 import { NoteEditorWebviewPanel } from "./views/NoteEditorWebviewPanel.js";
 import { SettingsWebviewPanel } from "./views/SettingsWebviewPanel.js";
 import { SidebarWebviewProvider } from "./views/SidebarWebviewProvider.js";
+import { COLD_START_CAP, COLD_START_WINDOW_MS } from "./views/BackfillListRenderer.js";
 import type { BackfillResultRow } from "./views/SidebarMessages.js";
 import { loadBranchSummaries } from "./views/BranchSummaryLoader.js";
 import { buildClaudeCodeContext } from "./views/SummaryMarkdownBuilder.js";
@@ -982,8 +983,8 @@ export function activate(context: vscode.ExtensionContext): void {
 			} else {
 				// Only pay for the git-log scan when the repo is non-empty (the
 				// 'empty' case already answered it). No transcript scan / LLM.
-				const RECENT_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
-				const missing = await listMissingCommits(workspaceRoot, RECENT_MONTH_MS);
+				// Same window + cap as the selectable list so the count == rows.
+				const missing = await listMissingCommits(workspaceRoot, COLD_START_WINDOW_MS, COLD_START_CAP);
 				count = missing.length;
 				variant = count > 0 ? "gaps" : null;
 			}
@@ -1045,11 +1046,12 @@ export function activate(context: vscode.ExtensionContext): void {
 				const { listMissingCommits, countMissingSummaries, runBackfill } = await import(
 					"../../cli/src/backfill/BackfillEngine.js"
 				);
-				const RECENT_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
-				const missing = await listMissingCommits(
-					workspaceRoot,
-					scope === "recent-month" ? RECENT_MONTH_MS : undefined,
-				);
+				// recent-month = same window + cap as the offer's count (so the list
+				// matches "N recent commits"); 'all' = full scope, no window/cap.
+				const missing =
+					scope === "recent-month"
+						? await listMissingCommits(workspaceRoot, COLD_START_WINDOW_MS, COLD_START_CAP)
+						: await listMissingCommits(workspaceRoot, undefined);
 				const totalMissing = (await countMissingSummaries(workspaceRoot)).missing;
 				if (missing.length === 0) return { items: [], totalMissing };
 				// dry-run gives per-commit sessions/conversationTurns without an LLM

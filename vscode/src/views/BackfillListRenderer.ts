@@ -21,6 +21,17 @@
 
 const s = (n: number): string => (n === 1 ? "" : "s");
 
+/**
+ * Cold-start scope, shared by the host (Extension.ts: `listMissingCommits` window
+ * + cap) and the note copy below, so a single change stays consistent everywhere.
+ * `COLD_START_CAP` is the max commits the cold-start card lists (the rest go to
+ * Settings via the card's "manage all" link). NOTE: temporarily lowered to 1 for
+ * manual testing of the capped / "N more in Settings" flow — restore to 10 for
+ * release.
+ */
+export const COLD_START_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+export const COLD_START_CAP = 10;
+
 /** Candidate-row meta: "3 sessions · 12 turns", or "Code change only" when diff-only. */
 export function formatBackfillMeta(sessions: number, conversationTurns: number): string {
 	if (sessions <= 0) return "Code change only";
@@ -36,15 +47,24 @@ export function formatBackfillResult(sessions: number, topics: number): string {
 /**
  * The cold-start card's ✓ note, by variant:
  *   - "empty": repo has zero memories.
- *   - "gaps":  repo has memories but `recentMissingCount` own commits lack one.
- * The "gaps" copy uses a verb-free noun phrase ("N recent commit(s) without a
- * memory yet") to sidestep singular/plural verb agreement AND to avoid claiming
- * "last month" (the window is anchored to the newest commit, not wall-clock).
+ *   - "gaps":  repo has memories but `recentMissingCount` own commits (from the
+ *              last month, capped at `cap`) lack one.
+ * The copy states the scope explicitly ("last month", "up to `cap`") so a user
+ * with a large local backlog understands why only some commits are offered — the
+ * rest are reached via the list's "manage all in Settings" link. Verb-free noun
+ * phrasing sidesteps singular/plural verb agreement across N. `n >= cap` means
+ * the list was capped (there may be more). `cap` is {@link COLD_START_CAP} at the
+ * call site, so wording + list cap can never drift.
  */
-export function formatColdStartNote(variant: "empty" | "gaps", recentMissingCount: number): string {
+export function formatColdStartNote(variant: "empty" | "gaps", recentMissingCount: number, cap: number): string {
 	if (variant === "gaps") {
 		const n = recentMissingCount;
-		return `You are set up. ${n} recent commit${s(n)} without a memory yet — build now, or keep coding (new commits capture automatically).`;
+		if (n >= cap) {
+			// Capped: the newest `cap` are offered; more (older or beyond the cap) → Settings.
+			// `cap` is always > 1 in production, so plural is fine (no singular special-case).
+			return `You are set up. The ${cap} most recent commits from the last month without a memory yet — build now, or manage all in Settings (new commits capture automatically).`;
+		}
+		return `You are set up. ${n} recent commit${s(n)} from the last month (up to ${cap}) without a memory yet — build now, or keep coding (new commits capture automatically).`;
 	}
 	return "You are set up — this repo has no memories yet. Build them from your recent commits, or just keep coding and they capture automatically.";
 }
@@ -65,10 +85,13 @@ export function backfillListRendererSource(): string {
     if (sessions <= 0) return topics + ' topic' + __bfPlural(topics);
     return sessions + ' session' + __bfPlural(sessions) + ' · ' + topics + ' topic' + __bfPlural(topics);
   }
-  function formatColdStartNote(variant, recentMissingCount) {
+  function formatColdStartNote(variant, recentMissingCount, cap) {
     if (variant === 'gaps') {
       var n = recentMissingCount;
-      return 'You are set up. ' + n + ' recent commit' + __bfPlural(n) + ' without a memory yet — build now, or keep coding (new commits capture automatically).';
+      if (n >= cap) {
+        return 'You are set up. The ' + cap + ' most recent commits from the last month without a memory yet — build now, or manage all in Settings (new commits capture automatically).';
+      }
+      return 'You are set up. ' + n + ' recent commit' + __bfPlural(n) + ' from the last month (up to ' + cap + ') without a memory yet — build now, or keep coding (new commits capture automatically).';
     }
     return 'You are set up — this repo has no memories yet. Build them from your recent commits, or just keep coding and they capture automatically.';
   }`;

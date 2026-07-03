@@ -34,15 +34,22 @@ describe("formatColdStartNote", () => {
 	it("empty variant → the zero-memories copy (no count)", () => {
 		expect(formatColdStartNote("empty", 0)).toContain("this repo has no memories yet");
 	});
-	it("gaps variant → 'N recent commits without a memory yet' (plural)", () => {
-		expect(formatColdStartNote("gaps", 3)).toContain("3 recent commits without a memory yet");
+	it("gaps below the cap states the scope: 'from the last month (up to CAP)'", () => {
+		const note = formatColdStartNote("gaps", 3, 10);
+		expect(note).toContain("3 recent commits from the last month (up to 10)");
 	});
-	it("gaps variant with N=1 → singular 'commit' (no verb-agreement error)", () => {
-		const note = formatColdStartNote("gaps", 1);
-		expect(note).toContain("1 recent commit without a memory yet");
+	it("gaps with N=1 (below cap) → singular 'commit' (no verb-agreement error)", () => {
+		const note = formatColdStartNote("gaps", 1, 10);
+		expect(note).toContain("1 recent commit from the last month");
 		expect(note).not.toContain("1 recent commits"); // singular noun, not plural
 		// Regression: an earlier draft hardcoded "have" → "1 commit … have" (wrong).
 		expect(note).not.toContain(" have ");
+	});
+	it("gaps at the cap (N=cap=10) → 'The 10 most recent' + points to Settings", () => {
+		const note = formatColdStartNote("gaps", 10, 10);
+		// Answers "I have many locally, why only 10?" — states the cap + full-scope route.
+		expect(note).toContain("The 10 most recent commits from the last month");
+		expect(note).toContain("manage all in Settings");
 	});
 });
 
@@ -60,15 +67,16 @@ describe("backfillListRendererSource", () => {
 		const js = factory() as {
 			formatBackfillMeta: (s: number, t: number) => string;
 			formatBackfillResult: (s: number, t: number) => string;
-			formatColdStartNote: (v: "empty" | "gaps", n: number) => string;
+			formatColdStartNote: (v: "empty" | "gaps", n: number, cap: number) => string;
 		};
 		expect(js.formatBackfillMeta(2, 5)).toBe(formatBackfillMeta(2, 5));
 		expect(js.formatBackfillMeta(1, 1)).toBe(formatBackfillMeta(1, 1));
 		expect(js.formatBackfillMeta(0, 0)).toBe(formatBackfillMeta(0, 0));
 		expect(js.formatBackfillResult(3, 4)).toBe(formatBackfillResult(3, 4));
 		expect(js.formatBackfillResult(0, 2)).toBe(formatBackfillResult(0, 2));
-		expect(js.formatColdStartNote("empty", 0)).toBe(formatColdStartNote("empty", 0));
-		expect(js.formatColdStartNote("gaps", 1)).toBe(formatColdStartNote("gaps", 1));
-		expect(js.formatColdStartNote("gaps", 4)).toBe(formatColdStartNote("gaps", 4));
+		expect(js.formatColdStartNote("empty", 0, 10)).toBe(formatColdStartNote("empty", 0, 10));
+		expect(js.formatColdStartNote("gaps", 1, 10)).toBe(formatColdStartNote("gaps", 1, 10)); // below cap
+		expect(js.formatColdStartNote("gaps", 4, 10)).toBe(formatColdStartNote("gaps", 4, 10));
+		expect(js.formatColdStartNote("gaps", 10, 10)).toBe(formatColdStartNote("gaps", 10, 10)); // capped
 	});
 });

@@ -533,6 +533,27 @@ describe("listMissingCommits", () => {
 		expect(await listMissingCommits(CWD)).toEqual([]);
 	});
 
+	it("caps the result to the `limit` newest missing commits", async () => {
+		await mockLog([
+			row("h1", NOW_SEC, "newest"),
+			row("h2", NOW_SEC - DAY, "second"),
+			row("h3", NOW_SEC - 2 * DAY, "third"),
+			row("h4", NOW_SEC - 3 * DAY, "fourth"),
+		]);
+		vi.mocked(getIndexEntryMap).mockResolvedValue(new Map());
+		const { listMissingCommits } = await import("./BackfillEngine.js");
+		// git-log order is newest-first, so the cap keeps the 2 newest.
+		const rows = await listMissingCommits(CWD, undefined, 2);
+		expect(rows.map((r) => r.commitHash)).toEqual(["h1", "h2"]);
+	});
+
+	it("ignores a non-positive limit (returns all)", async () => {
+		await mockLog([row("h1", NOW_SEC, "a"), row("h2", NOW_SEC - DAY, "b")]);
+		vi.mocked(getIndexEntryMap).mockResolvedValue(new Map());
+		const { listMissingCommits } = await import("./BackfillEngine.js");
+		expect((await listMissingCommits(CWD, undefined, 0)).map((r) => r.commitHash)).toEqual(["h1", "h2"]);
+	});
+
 	it("returns [] on git failure or no output", async () => {
 		const { execGit } = await import("../core/GitOps.js");
 		vi.mocked(execGit).mockResolvedValue({ exitCode: 1, stdout: "", stderr: "boom" } as never);

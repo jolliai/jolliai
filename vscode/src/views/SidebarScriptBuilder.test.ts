@@ -3317,5 +3317,20 @@ describe("SidebarScriptBuilder", () => {
 			// The guard sits at the top of the case, before any state absorption.
 			expect(js).toContain("if (state.backfillMode !== 'offer') break;");
 		});
+		it("an all-error done keeps cold-start state and offers a retry (not 'Open Memory Bank')", () => {
+			const js = buildSidebarScript();
+			// Failure path (generated: 0) branches before the state-clearing Open button.
+			expect(js).toContain("if (r.generated === 0)");
+			expect(js).toContain("Couldn't build memories");
+			expect(js).toContain(" Try again");
+			// The retry re-requests candidates rather than clearing repoHasMemories/variant.
+			expect(js).toMatch(/Try again[\s\S]*?backfill:requestCandidates/);
+		});
+		it("mountIn filters null/undefined so a conditional top-level child never renders literal 'null'", () => {
+			// Regression: the thrown-run done path posts rows:[] → the error branch's
+			// conditional child was null → replaceChildren stringified it to "null".
+			const js = buildSidebarScript();
+			expect(js).toMatch(/function mountIn\(container, nodes\)[\s\S]*?\.filter\(function\(n\)\s*\{\s*return n != null;/);
+		});
 	});
 });

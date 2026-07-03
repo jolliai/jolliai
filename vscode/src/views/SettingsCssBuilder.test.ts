@@ -77,4 +77,10 @@ describe("SettingsCssBuilder", () => {
 	it("contains action bar styles", () => {
 		expect(css).toContain(".action-bar");
 	});
+
+	it("gives .browse-btn a disabled style (e.g. Generate Missing Summaries with 0 missing)", () => {
+		// The button's `disabled` attr is set when the missing count is 0; without
+		// a :disabled rule it looked fully clickable. It must dim + show not-allowed.
+		expect(css).toMatch(/\.browse-btn:disabled\s*\{[^}]*cursor\s*:\s*not-allowed/s);
+	});
 });

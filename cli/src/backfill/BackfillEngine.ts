@@ -503,8 +503,12 @@ export interface MissingCommitInfo {
  *                        newest own commit (NOT wall-clock) so the window is stable and
  *                        testable without injecting a clock.
  *   - `sinceMs` omitted → every own commit lacking a summary (Settings full scope).
+ *
+ * `limit` (when > 0) caps the result to the `limit` NEWEST missing commits — used
+ * by the cold-start card so a huge backlog doesn't produce an overwhelming list
+ * (the excess is surfaced via the card's "manage all in Settings" link).
  */
-export async function listMissingCommits(cwd: string, sinceMs?: number): Promise<MissingCommitInfo[]> {
+export async function listMissingCommits(cwd: string, sinceMs?: number, limit?: number): Promise<MissingCommitInfo[]> {
 	// `%x00` = NUL field separator so a commit subject containing '|' can't corrupt
 	// parsing (mirrors the caution in gatherCursorCandidates, which only needed %at).
 	const args = ["log", "HEAD", "--pretty=format:%H%x00%at%x00%s"];
@@ -535,5 +539,7 @@ export async function listMissingCommits(cwd: string, sinceMs?: number): Promise
 	const storage = await createStorage(cwd, cwd);
 	setActiveStorage(storage);
 	const existing = await getIndexEntryMap(cwd, storage);
-	return windowed.filter((r) => !existing.has(r.commitHash));
+	const missing = windowed.filter((r) => !existing.has(r.commitHash));
+	// Cap to the newest `limit` when requested (rows are already newest-first).
+	return typeof limit === "number" && limit > 0 ? missing.slice(0, limit) : missing;
 }
