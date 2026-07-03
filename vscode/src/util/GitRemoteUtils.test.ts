@@ -9,6 +9,7 @@ vi.mock("../../../cli/src/core/GitOps.js", () => ({
 }));
 
 import {
+	deriveOwnerRepoFromUrl,
 	deriveRepoNameFromUrl,
 	getCanonicalRepoUrl,
 	normalizeRemoteUrl,
@@ -301,6 +302,33 @@ describe("deriveRepoNameFromUrl", () => {
 		expect(deriveRepoNameFromUrl("mailto:foo@bar.com")).toBe(
 			"mailto:foo@bar.com",
 		);
+	});
+});
+
+describe("deriveOwnerRepoFromUrl", () => {
+	it("returns owner/repo for an https remote", () => {
+		expect(deriveOwnerRepoFromUrl("https://github.com/jolliai/jolli")).toBe("jolliai/jolli");
+	});
+
+	it("strips a .git suffix", () => {
+		expect(deriveOwnerRepoFromUrl("https://github.com/jolliai/jolli.git")).toBe("jolliai/jolli");
+	});
+
+	it("keeps nested groups (e.g. GitLab subgroups)", () => {
+		expect(deriveOwnerRepoFromUrl("https://gitlab.com/group/sub/repo")).toBe("group/sub/repo");
+	});
+
+	it("returns '' for a single-segment path (bare repo, no owner)", () => {
+		expect(deriveOwnerRepoFromUrl("https://example.com/repo")).toBe("");
+	});
+
+	it("returns '' for a file:// local URL (no owner)", () => {
+		expect(deriveOwnerRepoFromUrl("file:///tmp/foo/scratch")).toBe("");
+	});
+
+	it("returns '' on empty or unparseable input", () => {
+		expect(deriveOwnerRepoFromUrl("")).toBe("");
+		expect(deriveOwnerRepoFromUrl("not a url")).toBe("");
 	});
 });
 

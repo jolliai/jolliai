@@ -195,12 +195,16 @@ const SHARE_ICON_SVG = `<svg class="share-icon" width="14" height="14" viewBox="
 
 /**
  * Builds the hidden "Share this memory / branch" popover — a live, Space-backed share
- * with an explicit create step for new links. The main pane shows the (mock)
- * Collaborators list, the General-access selector, the "what travels" banner, a disabled
- * transcript opt-in, Copy link, and a SYNCED status. The card is anchored under the Share
+ * with a SINGLE link created lazily on first use. The main pane has a "General access"
+ * select (public bearer / anyone-at-site / only invited people) that sets the one
+ * link's tier — Copy mints it on first use and changing the select flips the same
+ * link in place — plus the invited-people list, the "what travels" banner, and a
+ * disabled transcript opt-in. A separate Send-invite pane stages people (grouped
+ * suggestions: jolli account members / git collaborators) with an optional note; the
+ * server grants access AND emails in one step. The card is anchored under the Share
  * button by the client script (`getBoundingClientRect`); the overlay is a transparent
- * full-screen click-catcher (no dimming). The client toggles panes per share state and
- * fills the collaborators list + link (see SummaryScriptBuilder).
+ * full-screen click-catcher (no dimming). The client toggles panes per share state
+ * (see SummaryScriptBuilder).
  */
 export function buildShareModal(): string {
 	return `
@@ -217,23 +221,23 @@ export function buildShareModal(): string {
 
     <div class="share-pane" id="sharePaneMain" hidden>
       <div class="share-search-wrap">
-        <input type="text" class="share-search" id="shareTeammateSearch" placeholder="Search teammates by name or email…" aria-label="Search teammates or add an email" autocomplete="off" />
+        <input type="text" class="share-search" id="shareTeammateSearch" placeholder="Search teammates by name or email&hellip;" aria-label="Search teammates or add an email" autocomplete="off" />
         <div class="share-suggest" id="shareSuggest" hidden></div>
       </div>
 
       <div class="share-section-label">COLLABORATORS</div>
-      <div class="share-collab-list" id="shareCollabList" aria-label="Collaborators"></div>
+      <div class="share-collab-list" id="shareInvitedList" aria-label="Collaborators"></div>
 
       <div class="share-section-label">GENERAL ACCESS</div>
       <div class="share-access-row">
         <span class="share-access-icon" aria-hidden="true">&#x1F441;</span>
-        <select class="share-select" id="shareVisibilitySelect" aria-label="Who can open this link">
-          <option value="org" id="shareOrgOption">Anyone at jolliai</option>
+        <select class="share-select" id="shareAccessSelect" aria-label="Who can open this link">
+          <option value="org" id="shareOrgOption">Anyone within your Jolli Account</option>
           <option value="public">Anyone with the link</option>
           <option value="people">Only people you add</option>
         </select>
       </div>
-      <p class="share-access-sub" id="shareAccessSub"></p>
+      <p class="share-access-sub" id="shareAccessDesc"></p>
 
       <div class="share-travel-banner">
         <span class="share-travel-icon" aria-hidden="true">&#x21C4;</span>
@@ -241,36 +245,33 @@ export function buildShareModal(): string {
       </div>
 
       <label class="share-transcript-opt" title="Not available — transcripts stay on your machine.">
-        <input type="checkbox" id="shareIncludeTranscripts" disabled />
+        <input type="checkbox" disabled />
         <span>Include conversation transcripts</span>
         <span class="share-optin-badge">opt-in</span>
       </label>
 
-      <input type="text" class="share-link-hidden" id="shareLinkInput" readonly aria-hidden="true" hidden />
-      <div class="share-modal-actions">
-        <button class="action-btn primary" id="shareCopyBtn" title="Copy the shareable link">&#x1F4CB; Copy link</button>
+      <div class="share-modal-actions share-actions-main">
+        <button class="action-btn primary" id="shareCopyBtn" title="Copy the link for the selected access level (created on first copy)">&#x1F4CB; Copy link</button>
       </div>
     </div>
 
-    <div class="share-pane" id="sharePaneCreate" hidden>
-      <div class="share-section-label">GENERAL ACCESS</div>
-      <div class="share-access-row">
-        <span class="share-access-icon" aria-hidden="true">&#x1F441;</span>
-        <select class="share-select" id="shareCreateVisibilitySelect" aria-label="Who can open this link">
-          <option value="org" id="shareCreateOrgOption">Anyone at jolliai</option>
-          <option value="public">Anyone with the link</option>
-          <option value="people">Only people you add</option>
-        </select>
+    <div class="share-pane" id="sharePaneInvite" hidden>
+      <div class="share-invite-head">
+        <button type="button" class="share-invite-back" id="shareInviteBack" title="Back" aria-label="Back">&#x2039;</button>
+        <span class="share-invite-title">Send invite</span>
       </div>
-      <p class="share-access-sub" id="shareCreateAccessSub"></p>
-
-      <div class="share-travel-banner">
-        <span class="share-travel-icon" aria-hidden="true">&#x21C4;</span>
-        <span>Summaries + decisions + linked refs travel.<br /><strong>Conversation transcripts stay on your machine.</strong></span>
+      <div class="share-section-label">TO</div>
+      <div class="share-chips" id="shareInviteTo"></div>
+      <div class="share-search-wrap">
+        <input type="text" class="share-search" id="shareInviteSearch" placeholder="Add another &mdash; name or email&hellip;" aria-label="Add a person by name or email" autocomplete="off" />
+        <div class="share-suggest" id="shareInviteSuggest" hidden></div>
       </div>
-
+      <div class="share-section-label">MESSAGE <span class="share-label-soft">optional</span></div>
+      <textarea class="share-invite-message" id="shareInviteMessage" rows="3" placeholder="Add a note &mdash; it appears at the top of their email&hellip;"></textarea>
+      <p class="share-invite-foot">They'll get an email with a link to open this in Jolli.</p>
       <div class="share-modal-actions">
-        <button class="action-btn primary" id="shareCreateBtn" title="Create the share link">&#x1F517; Create link</button>
+        <button class="action-btn" id="shareInviteCancel">Cancel</button>
+        <button class="action-btn primary" id="shareInviteSend" disabled>Send invite <span id="shareInviteSendCount"></span> &rarr;</button>
       </div>
     </div>
 
@@ -541,7 +542,7 @@ function buildShipBar(summary: CommitSummary): string {
   <div class="ship-card" id="prCard">
     ${buildPrSectionHtml()}
   </div>
-  <div class="ship-card" id="jolliCard">
+  <div class="ship-card">
     <div class="ship-head">
       <span class="ship-icon">&#x25C6;</span>
       <span class="ship-name">Jolli Memory</span>
@@ -581,7 +582,7 @@ function buildMemoryPanel(
  */
 function buildE2ePanel(summary: CommitSummary): string {
 	return `
-<div class="panel" id="e2ePanel">
+<div class="panel">
   ${buildE2eTestSection(summary)}
 </div>`;
 }
@@ -621,7 +622,7 @@ function buildAttachmentsPanel(
   </div>`
 		: "";
 	return `
-<div class="panel" id="attachmentsPanel">
+<div class="panel">
   <div class="panel-header"><span class="panel-title">Attachments &amp; context</span></div>
   <div class="attach-card" id="plansCard">
     <div class="attach-card-head" data-collapse="plansCard" role="button" tabindex="0" aria-expanded="true" data-foreign-safe>&#x1F4CB; Plans &amp; Notes <span class="attach-arrow">&#x25BC;</span></div>

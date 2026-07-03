@@ -312,16 +312,7 @@ describe("SummaryHtmlBuilder", () => {
 				transcriptHashSet: new Set(["t1"]),
 			});
 			// New presentation wrappers
-			for (const id of [
-				"prCard",
-				"jolliCard",
-				"propTable",
-				"detailsToggle",
-				"memoryPanel",
-				"e2ePanel",
-				"attachmentsPanel",
-				"plansCard",
-			]) {
+			for (const id of ["prCard", "propTable", "detailsToggle", "memoryPanel", "plansCard"]) {
 				expect(html).toContain(`id="${id}"`);
 			}
 			// privateDrawer is gone; conversations are now a top-level section

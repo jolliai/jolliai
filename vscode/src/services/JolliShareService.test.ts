@@ -11,16 +11,13 @@ vi.mock("node:http", () => ({ request: mockHttpRequest }));
 vi.mock("node:https", () => ({ request: mockHttpsRequest }));
 
 import {
-	type BranchSharePayload,
-	createBranchShare,
+	clearOrgMembersCache,
 	createLiveShare,
-	fetchSharedSnapshot,
 	type LiveSharePayload,
 	listOrgMembers,
+	sendShareInviteAndGrantAccess,
 	PluginOutdatedError,
 	revokeBranchShare,
-	ShareRevokedError,
-	updateBranchShareExpiry,
 	updateLiveShare,
 } from "./JolliShareService.js";
 
@@ -89,18 +86,6 @@ function makeKey(meta: Record<string, unknown>): string {
 const KEY = makeKey({ t: "acme", u: "https://acme.jolli.ai" });
 const BASE = "https://acme.jolli.ai";
 
-const PAYLOAD: BranchSharePayload = {
-	repoUrl: "https://github.com/acme/repo",
-	repoName: "repo",
-	branch: "feature/x",
-	branchSlug: "feature-x",
-	headCommitHash: "a".repeat(40),
-	commitHashes: ["a".repeat(40)],
-	decisionCount: 3,
-	scope: { summary: true, plans: true, notes: true, transcripts: false },
-	content: "# memory",
-};
-
 const OK_RESULT = JSON.stringify({
 	shareId: "sh_1",
 	token: "tok_abc",
@@ -112,87 +97,6 @@ const OK_RESULT = JSON.stringify({
 beforeEach(() => {
 	mockHttpRequest.mockReset();
 	mockHttpsRequest.mockReset();
-});
-
-describe("createBranchShare", () => {
-	it("resolves the share result on 2xx", async () => {
-		replyHttps(200, OK_RESULT);
-		const res = await createBranchShare(BASE, KEY, PAYLOAD);
-		expect(res.shareUrl).toBe("https://acme.jolli.ai/b/feature-x-tok_abc");
-		expect(res.token).toBe("tok_abc");
-	});
-
-	it("rejects when no base URL can be determined", async () => {
-		await expect(createBranchShare(undefined, "sk-jol-plainnowurl", PAYLOAD)).rejects.toThrow(
-			/site URL could not be determined/,
-		);
-	});
-
-	it("derives the base URL from the API key when none is passed", async () => {
-		replyHttps(200, OK_RESULT);
-		const res = await createBranchShare(undefined, KEY, PAYLOAD);
-		expect(res.shareId).toBe("sh_1");
-	});
-
-	it("maps 426 to PluginOutdatedError", async () => {
-		replyHttps(426, JSON.stringify({ message: "too old" }));
-		await expect(createBranchShare(BASE, KEY, PAYLOAD)).rejects.toBeInstanceOf(PluginOutdatedError);
-	});
-
-	it("surfaces a detailed error on other non-2xx", async () => {
-		replyHttps(400, JSON.stringify({ error: "bad_request", message: "nope" }));
-		await expect(createBranchShare(BASE, KEY, PAYLOAD)).rejects.toThrow(/bad_request — nope \(HTTP 400\)/);
-	});
-
-	it("rejects on invalid JSON", async () => {
-		replyHttps(200, "not json");
-		await expect(createBranchShare(BASE, KEY, PAYLOAD)).rejects.toThrow(/Invalid JSON/);
-	});
-
-	it("accepts a numeric shareId (server auto-increment id)", async () => {
-		replyHttps(200, JSON.stringify({ ...JSON.parse(OK_RESULT), shareId: 1 }));
-		const res = await createBranchShare(BASE, KEY, PAYLOAD);
-		expect(res.shareId).toBe(1);
-	});
-
-	it("rejects a 2xx whose body is missing required fields, surfacing the raw body", async () => {
-		replyHttps(200, JSON.stringify({ token: null, url: "https://acme.jolli.ai/x" }));
-		await expect(createBranchShare(BASE, KEY, PAYLOAD)).rejects.toThrow(
-			/unexpected response \(missing shareId\/token\/shareUrl\).*acme\.jolli\.ai/s,
-		);
-	});
-
-	it("rejects on a network error", async () => {
-		mockHttpsRequest.mockImplementation((_url: unknown, _opts: unknown, _cb: unknown) => {
-			const req = mockRequest();
-			queueMicrotask(() => req._emit("error", new Error("boom")));
-			return req;
-		});
-		await expect(createBranchShare(BASE, KEY, PAYLOAD)).rejects.toThrow(/Network error: boom/);
-	});
-
-	it("uses plain http for an http base URL", async () => {
-		replyHttp(200, OK_RESULT);
-		const res = await createBranchShare("http://jolli-local.me/test1", KEY, PAYLOAD);
-		expect(res.shareId).toBe("sh_1");
-		expect(mockHttpRequest).toHaveBeenCalled();
-		expect(mockHttpsRequest).not.toHaveBeenCalled();
-	});
-
-	it("falls back to a generic message on 426 with no body message", async () => {
-		replyHttps(426, JSON.stringify({}));
-		await expect(createBranchShare(BASE, KEY, PAYLOAD)).rejects.toThrow(/Plugin version is outdated/);
-	});
-
-	it("falls back to 'request failed' when the error body is empty", async () => {
-		replyHttps(500, JSON.stringify({}));
-		await expect(createBranchShare(BASE, KEY, PAYLOAD)).rejects.toThrow(/request failed \(HTTP 500\)/);
-	});
-
-	it("treats a response with no status code as HTTP 0 and rejects", async () => {
-		replyHttps(undefined, JSON.stringify({}));
-		await expect(createBranchShare(BASE, KEY, PAYLOAD)).rejects.toThrow(/request failed \(HTTP 0\)/);
-	});
 });
 
 describe("revokeBranchShare", () => {
@@ -234,146 +138,6 @@ describe("revokeBranchShare", () => {
 	});
 });
 
-describe("updateBranchShareExpiry", () => {
-	const EXPIRES = "2026-10-01T00:00:00.000Z";
-
-	it("PATCHes and resolves the server-confirmed expiry", async () => {
-		replyHttps(200, JSON.stringify({ shareId: 1, expiresAt: EXPIRES, visibility: "public" }));
-		const res = await updateBranchShareExpiry(BASE, KEY, "1", EXPIRES);
-		expect(res.expiresAt).toBe(EXPIRES);
-		const opts = mockHttpsRequest.mock.calls[0][1] as { method: string };
-		expect(opts.method).toBe("PATCH");
-	});
-
-	it("rejects a non-2xx with detail", async () => {
-		replyHttps(400, JSON.stringify({ error: "invalid_expiry", message: "must be in the future" }));
-		await expect(updateBranchShareExpiry(BASE, KEY, "1", EXPIRES)).rejects.toThrow(/must be in the future/);
-	});
-
-	it("rejects when no base URL can be determined", async () => {
-		await expect(updateBranchShareExpiry(undefined, "sk-jol-plain", "1", EXPIRES)).rejects.toThrow(
-			/site URL could not be determined/,
-		);
-	});
-
-	it("rejects on invalid JSON", async () => {
-		replyHttps(200, "nope");
-		await expect(updateBranchShareExpiry(BASE, KEY, "1", EXPIRES)).rejects.toThrow(/Invalid JSON/);
-	});
-
-	it("uses plain http for an http base URL", async () => {
-		replyHttp(200, JSON.stringify({ shareId: 1, expiresAt: EXPIRES, visibility: "public" }));
-		const res = await updateBranchShareExpiry("http://jolli-local.me/test1", KEY, "1", EXPIRES);
-		expect(res.expiresAt).toBe(EXPIRES);
-		expect(mockHttpRequest).toHaveBeenCalled();
-		expect(mockHttpsRequest).not.toHaveBeenCalled();
-	});
-
-	it("treats a response with no status code as HTTP 0 and rejects", async () => {
-		replyHttps(undefined, JSON.stringify({ shareId: 1, expiresAt: EXPIRES, visibility: "public" }));
-		await expect(updateBranchShareExpiry(BASE, KEY, "1", EXPIRES)).rejects.toThrow(/\(HTTP 0\)/);
-	});
-
-	it("falls back to a generic message when the error body is empty", async () => {
-		replyHttps(500, JSON.stringify({}));
-		await expect(updateBranchShareExpiry(BASE, KEY, "1", EXPIRES)).rejects.toThrow(
-			/expiry update failed \(HTTP 500\)/,
-		);
-	});
-
-	it("rejects on a network error", async () => {
-		mockHttpsRequest.mockImplementation((_url: unknown, _opts: unknown, _cb: unknown) => {
-			const req = mockRequest();
-			queueMicrotask(() => req._emit("error", new Error("offline")));
-			return req;
-		});
-		await expect(updateBranchShareExpiry(BASE, KEY, "1", EXPIRES)).rejects.toThrow(/Network error: offline/);
-	});
-});
-
-describe("fetchSharedSnapshot", () => {
-	const SNAP = JSON.stringify({
-		branch: "feature/x",
-		repoName: "repo",
-		decisionCount: 3,
-		headCommitHash: "a".repeat(40),
-		generatedAt: "2026-01-01T00:00:00.000Z",
-		scope: { summary: true, plans: true, notes: true, transcripts: false },
-		content: "# shared",
-	});
-
-	it("rejects an empty token", async () => {
-		await expect(fetchSharedSnapshot(BASE, "")).rejects.toThrow(/Missing share token/);
-	});
-
-	it("rejects an off-allowlist origin", async () => {
-		await expect(fetchSharedSnapshot("https://evil.example.com", "tok")).rejects.toThrow(/Rejected Jolli origin/);
-	});
-
-	it("resolves the snapshot on 2xx", async () => {
-		replyHttps(200, SNAP);
-		const snap = await fetchSharedSnapshot(BASE, "tok_abc");
-		expect(snap.branch).toBe("feature/x");
-		expect(snap.content).toBe("# shared");
-	});
-
-	it("sends a tenant-slug header for a path-based origin", async () => {
-		replyHttps(200, SNAP);
-		await fetchSharedSnapshot("https://jolli-local.me/test1", "tok_abc");
-		const opts = mockHttpsRequest.mock.calls[0][1] as { headers: Record<string, string> };
-		expect(opts.headers["x-tenant-slug"]).toBe("test1");
-	});
-
-	it("maps 410 to ShareRevokedError", async () => {
-		replyHttps(410, "");
-		await expect(fetchSharedSnapshot(BASE, "tok_abc")).rejects.toBeInstanceOf(ShareRevokedError);
-	});
-
-	it("maps a 200 with revoked:true to ShareRevokedError", async () => {
-		replyHttps(200, JSON.stringify({ revoked: true }));
-		await expect(fetchSharedSnapshot(BASE, "tok_abc")).rejects.toBeInstanceOf(ShareRevokedError);
-	});
-
-	it("maps 426 to PluginOutdatedError", async () => {
-		replyHttps(426, JSON.stringify({ message: "old" }));
-		await expect(fetchSharedSnapshot(BASE, "tok_abc")).rejects.toBeInstanceOf(PluginOutdatedError);
-	});
-
-	it("surfaces a detailed error on other non-2xx", async () => {
-		replyHttps(404, JSON.stringify({ error: "not_found" }));
-		await expect(fetchSharedSnapshot(BASE, "tok_abc")).rejects.toThrow(/not_found \(HTTP 404\)/);
-	});
-
-	it("rejects on invalid JSON", async () => {
-		replyHttps(200, "nope");
-		await expect(fetchSharedSnapshot(BASE, "tok_abc")).rejects.toThrow(/Invalid JSON/);
-	});
-
-	it("rejects on a network error", async () => {
-		mockHttpsRequest.mockImplementation((_url: unknown, _opts: unknown, _cb: unknown) => {
-			const req = mockRequest();
-			queueMicrotask(() => req._emit("error", new Error("net")));
-			return req;
-		});
-		await expect(fetchSharedSnapshot(BASE, "tok_abc")).rejects.toThrow(/Network error: net/);
-	});
-
-	it("treats a response with no status code as HTTP 0 and rejects", async () => {
-		replyHttps(undefined, JSON.stringify({}));
-		await expect(fetchSharedSnapshot(BASE, "tok_abc")).rejects.toThrow(/request failed \(HTTP 0\)/);
-	});
-
-	it("falls back to the default 426 message when the body has none", async () => {
-		replyHttps(426, JSON.stringify({}));
-		await expect(fetchSharedSnapshot(BASE, "tok_abc")).rejects.toThrow(/Plugin version is outdated/);
-	});
-
-	it("falls back to 'request failed' when the error body is empty", async () => {
-		replyHttps(500, JSON.stringify({}));
-		await expect(fetchSharedSnapshot(BASE, "tok_abc")).rejects.toThrow(/request failed \(HTTP 500\)/);
-	});
-});
-
 const LIVE_PAYLOAD: LiveSharePayload = {
 	repoUrl: "https://github.com/acme/repo",
 	repoName: "repo",
@@ -399,17 +163,26 @@ describe("createLiveShare", () => {
 		expect(res.token).toBe("tok_abc");
 	});
 
-	it("resolves an org share with no token on 2xx", async () => {
-		replyHttps(
-			201,
-			JSON.stringify({
-				shareId: 7,
-				shareUrl: "https://acme.jolli.ai/share/branch/7/view",
-				expiresAt: "2026-09-01T00:00:00.000Z",
-				visibility: "org",
-			}),
-		);
+	it("sends the org visibility on the wire unchanged and echoes it back as 'org'", async () => {
+		const req = mockRequest();
+		mockHttpsRequest.mockImplementation((_url: unknown, _opts: unknown, cb: (res: unknown) => void) => {
+			cb(
+				mockResponse(
+					201,
+					JSON.stringify({
+						shareId: 7,
+						shareUrl: "https://acme.jolli.ai/share/branch/7/view",
+						expiresAt: "2026-09-01T00:00:00.000Z",
+						// The org tier uses the same value end-to-end — no wire translation.
+						visibility: "org",
+					}),
+				),
+			);
+			return req;
+		});
 		const res = await createLiveShare(BASE, KEY, { ...LIVE_PAYLOAD, visibility: "org" });
+		const sentBody = JSON.parse((req.write as ReturnType<typeof vi.fn>).mock.calls[0][0] as string);
+		expect(sentBody.visibility).toBe("org");
 		expect(res.visibility).toBe("org");
 		expect(res.token).toBeUndefined();
 	});
@@ -475,6 +248,18 @@ describe("updateLiveShare", () => {
 		expect(res.shareId).toBe("sh_1");
 	});
 
+	it("sends the org visibility on a PATCH unchanged and echoes it back as 'org'", async () => {
+		const req = mockRequest();
+		mockHttpsRequest.mockImplementation((_url: unknown, _opts: unknown, cb: (res: unknown) => void) => {
+			cb(mockResponse(200, JSON.stringify({ shareId: "sh_1", visibility: "org" })));
+			return req;
+		});
+		const res = await updateLiveShare(BASE, KEY, "sh_1", { visibility: "org" });
+		const sentBody = JSON.parse((req.write as ReturnType<typeof vi.fn>).mock.calls[0][0] as string);
+		expect(sentBody.visibility).toBe("org");
+		expect(res.visibility).toBe("org");
+	});
+
 	it("rejects on a non-2xx", async () => {
 		replyHttps(500, JSON.stringify({ error: "boom" }));
 		await expect(updateLiveShare(BASE, KEY, "sh_1", { visibility: "org" })).rejects.toThrow(/HTTP 500/);
@@ -489,6 +274,11 @@ describe("updateLiveShare", () => {
 });
 
 describe("listOrgMembers", () => {
+	beforeEach(() => {
+		// Each case wires its own reply; a cached list from a prior case would mask it.
+		clearOrgMembersCache();
+	});
+
 	it("maps { members }, coalescing a non-string name to empty and skipping members with no email", async () => {
 		replyHttps(
 			200,
@@ -529,5 +319,98 @@ describe("listOrgMembers", () => {
 	it("returns [] when members is not an array", async () => {
 		replyHttps(200, JSON.stringify({ members: "not-an-array" }));
 		expect(await listOrgMembers(BASE, KEY)).toEqual([]);
+	});
+
+	it("caps the directory at 100 members", async () => {
+		const members = Array.from({ length: 150 }, (_, i) => ({ name: `User ${i}`, email: `u${i}@example.com` }));
+		replyHttps(200, JSON.stringify({ members }));
+		const result = await listOrgMembers(BASE, KEY);
+		expect(result).toHaveLength(100);
+		expect(result[99]).toEqual({ name: "User 99", email: "u99@example.com" });
+	});
+
+	it("serves a repeat call from the cache within the TTL (one HTTP request total)", async () => {
+		replyHttps(200, JSON.stringify({ members: [{ name: "Ada", email: "ada@example.com" }] }));
+		const first = await listOrgMembers(BASE, KEY);
+		const second = await listOrgMembers(BASE, KEY);
+		expect(second).toEqual(first);
+		expect(mockHttpsRequest).toHaveBeenCalledTimes(1);
+	});
+
+	it("re-fetches once the 3-minute TTL has elapsed", async () => {
+		vi.useFakeTimers();
+		try {
+			replyHttps(200, JSON.stringify({ members: [{ name: "Ada", email: "ada@example.com" }] }));
+			// mockResponse delivers via queueMicrotask, which fake timers don't gate — awaiting still resolves.
+			await listOrgMembers(BASE, KEY);
+			vi.advanceTimersByTime(3 * 60 * 1000 + 1);
+			replyHttps(200, JSON.stringify({ members: [{ name: "Grace", email: "grace@example.com" }] }));
+			expect(await listOrgMembers(BASE, KEY)).toEqual([{ name: "Grace", email: "grace@example.com" }]);
+			expect(mockHttpsRequest).toHaveBeenCalledTimes(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("caches per (baseUrl, apiKey) — a different key is a fresh fetch", async () => {
+		replyHttps(200, JSON.stringify({ members: [{ name: "Ada", email: "ada@example.com" }] }));
+		await listOrgMembers(BASE, KEY);
+		await listOrgMembers(BASE, makeKey({ t: "other", u: "https://acme.jolli.ai" }));
+		expect(mockHttpsRequest).toHaveBeenCalledTimes(2);
+	});
+
+	it("does not cache a failed fetch — the next call retries", async () => {
+		replyHttps(500, JSON.stringify({ error: "boom" }));
+		expect(await listOrgMembers(BASE, KEY)).toEqual([]);
+		replyHttps(200, JSON.stringify({ members: [{ name: "Ada", email: "ada@example.com" }] }));
+		expect(await listOrgMembers(BASE, KEY)).toEqual([{ name: "Ada", email: "ada@example.com" }]);
+		expect(mockHttpsRequest).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe("sendShareInviteAndGrantAccess", () => {
+	it("POSTs the invite (grant + email) and returns the sent/failed report", async () => {
+		let requestedUrl: URL | undefined;
+		let sentBody = "";
+		mockHttpsRequest.mockImplementation((url: unknown, _opts: unknown, cb: (res: unknown) => void) => {
+			requestedUrl = url as URL;
+			const req = mockRequest();
+			req.write = vi.fn((chunk: string) => {
+				sentBody += chunk;
+			});
+			cb(mockResponse(200, JSON.stringify({ sent: ["cy@x.io"], failed: ["down@x.io"] })));
+			return req;
+		});
+		const out = await sendShareInviteAndGrantAccess(BASE, KEY, "42", {
+			recipients: ["cy@x.io", "down@x.io"],
+			message: "note",
+		});
+		expect(requestedUrl?.pathname).toBe("/api/share/branch/42/invite");
+		expect(JSON.parse(sentBody)).toEqual({ recipients: ["cy@x.io", "down@x.io"], message: "note" });
+		expect(out).toEqual({ sent: ["cy@x.io"], failed: ["down@x.io"] });
+	});
+
+	it("rejects a non-2xx (e.g. owner-only 403) with the status", async () => {
+		replyHttps(403, JSON.stringify({ error: "forbidden" }));
+		await expect(sendShareInviteAndGrantAccess(BASE, KEY, "42", { recipients: ["a@x.io"] })).rejects.toThrow(
+			/HTTP 403/,
+		);
+	});
+
+	it("treats a 202 Accepted (empty async body) as success — all requested recipients sent", async () => {
+		replyHttps(202, "");
+		const out = await sendShareInviteAndGrantAccess(BASE, KEY, "42", { recipients: ["a@x.io", "b@x.io"] });
+		expect(out).toEqual({ sent: ["a@x.io", "b@x.io"], failed: [] });
+	});
+
+	it("treats a 2xx JSON body without a sent/failed report as success (all sent)", async () => {
+		replyHttps(200, JSON.stringify({ ok: true }));
+		const out = await sendShareInviteAndGrantAccess(BASE, KEY, "42", { recipients: ["a@x.io"] });
+		expect(out).toEqual({ sent: ["a@x.io"], failed: [] });
+	});
+
+	it("still rejects a 2xx whose body is an SPA HTML page (misrouted host)", async () => {
+		replyHttps(200, "<!doctype html><html><title>Jolli</title></html>");
+		await expect(sendShareInviteAndGrantAccess(BASE, KEY, "42", { recipients: ["a@x.io"] })).rejects.toThrow();
 	});
 });
