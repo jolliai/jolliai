@@ -1,121 +1,90 @@
 /**
  * BranchShareController
  *
- * Share lifecycle helpers shared by the modal: revoke a share and adjust its
- * expiry. Pure orchestration — no VS Code/webview dependency — so it is
- * unit-testable. Creation lives in `LiveShareController` (live, Space-backed);
- * the old snapshot create path has been removed.
+ * Share lifecycle helpers shared by the modal: revoke a subject's link and PATCH
+ * its audience (visibility + recipients). Pure orchestration — no VS Code/webview
+ * dependency — so it is unit-testable. Creation lives in `LiveShareController`
+ * (live, Space-backed).
+ *
+ * Single-slot model: a subject carries at most ONE link. Changing access flips
+ * that one record's visibility in place — `public` (bearer), `org` (auth-gated:
+ * any signed-in member ∪ recipients), or `people` (recipients only) — so the old
+ * link dies when access is tightened; there is never a coexisting second link.
  */
 
 import {
-	getBranchShare,
-	isPublicConfirmed,
-	markPublicConfirmed,
+	type BranchShareRecord,
+	getShare,
 	putBranchShare,
-	removeBranchShare,
+	removeShare,
 } from "../../../cli/src/core/BranchShareStore.js";
-import { revokeBranchShare, updateBranchShareExpiry, updateLiveShare } from "./JolliShareService.js";
+import { revokeBranchShare, updateLiveShare } from "./JolliShareService.js";
 
-/** Access level for a live share. */
-type ShareVisibility = "public" | "org" | "people";
+/** A subject's access change: the visibility tier and/or the invited-people allowlist. */
+export interface ShareAudiencePatch {
+	/** `public` bearer, `org` (any signed-in member ∪ recipients), or `people` (recipients only). */
+	readonly visibility?: "public" | "org" | "people";
+	/** Replacement allowlist (lowercased emails, never the owner). */
+	readonly recipients?: ReadonlyArray<string>;
+}
 
-/** Revokes a subject's share (if any) and clears the local record. Idempotent. */
-export async function revokeBranchShareForBranch(
+/** Revokes a subject's link (if present) and clears its record. Idempotent. */
+export async function revokeShare(
 	workspaceRoot: string,
 	branch: string,
 	apiKey: string,
 	commitHash?: string,
 ): Promise<void> {
-	const existing = await getBranchShare(workspaceRoot, branch, commitHash);
+	const existing = await getShare(workspaceRoot, branch, commitHash);
 	if (existing?.shareId) {
 		await revokeBranchShare(undefined, apiKey, existing.shareId);
 	}
-	await removeBranchShare(workspaceRoot, branch, commitHash);
+	await removeShare(workspaceRoot, branch, commitHash);
 }
 
 /**
- * Adjusts an existing share's expiry (absolute ISO `expiresAt`) via PATCH and
- * mirrors the server-confirmed value into the local record, **preserving** the
- * live reference (`ref`), visibility, and local recipient list. Returns the new
- * `expiresAt`, or `undefined` when there is no share to patch.
+ * Changes the subject's audience — the visibility tier (`public`↔`org`↔`people`)
+ * and/or the invited-people allowlist — via PATCH, mirroring the server-confirmed
+ * values into the single record. The link flips in place (same `shareId`); the URL
+ * is re-issued for the new tier. Flipping to `public` drops the recipients
+ * allowlist (the server does too). Returns the updated record, or `undefined` when
+ * there is no link.
  */
-export async function setBranchShareExpiry(
+export async function patchShareAudience(
 	workspaceRoot: string,
 	branch: string,
 	apiKey: string,
-	expiresAt: string,
+	patch: ShareAudiencePatch,
 	commitHash?: string,
-): Promise<string | undefined> {
-	const existing = await getBranchShare(workspaceRoot, branch, commitHash);
-	if (!existing?.shareId) return undefined;
-	const result = await updateBranchShareExpiry(undefined, apiKey, existing.shareId, expiresAt);
-	await putBranchShare(
-		workspaceRoot,
-		branch,
-		{
-			shareId: existing.shareId,
-			shareUrl: existing.shareUrl,
-			visibility: existing.visibility,
-			ref: existing.ref,
-			token8: existing.token8,
-			recipients: existing.recipients,
-			headCommitHash: existing.headCommitHash,
-			expiresAt: result.expiresAt,
-			decisionCount: existing.decisionCount,
-			titles: existing.titles,
-			commitHash: existing.commitHash,
-		},
-		commitHash,
-	);
-	return result.expiresAt;
-}
-
-/**
- * Changes an existing share's audience — access level (`public` / `org` / `people`) and,
- * for `people`, the `recipients` allowlist — via PATCH, mirroring the server-confirmed
- * values into the local record. Switching to/from `public` re-mints (or drops) the bearer
- * link, so the returned `shareUrl`/`token` can change — all are persisted. Returns the new
- * visibility, or `undefined` when there is no share.
- */
-export async function setBranchShareVisibility(
-	workspaceRoot: string,
-	branch: string,
-	apiKey: string,
-	visibility: ShareVisibility,
-	commitHash?: string,
-	recipients?: ReadonlyArray<string>,
-): Promise<ShareVisibility | undefined> {
-	const existing = await getBranchShare(workspaceRoot, branch, commitHash);
+): Promise<BranchShareRecord | undefined> {
+	const existing = await getShare(workspaceRoot, branch, commitHash);
 	if (!existing?.shareId) return undefined;
 	const result = await updateLiveShare(undefined, apiKey, existing.shareId, {
-		visibility,
-		...(recipients && { recipients }),
+		...(patch.visibility && { visibility: patch.visibility }),
+		...(patch.recipients && { recipients: patch.recipients }),
 	});
-	const nextVisibility = result.visibility ?? visibility;
-	const token8 = result.token ? result.token.slice(0, 8) : nextVisibility === "public" ? existing.token8 : undefined;
-	const nextRecipients = result.recipients ?? (nextVisibility === "people" ? recipients ?? existing.recipients : undefined);
-	await putBranchShare(
-		workspaceRoot,
-		branch,
-		{
-			shareId: String(result.shareId ?? existing.shareId),
-			// A recipients-only PATCH doesn't re-mint the link, so the server may omit
-			// `shareUrl` — keep the existing one in that case.
-			shareUrl: result.shareUrl || existing.shareUrl,
-			visibility: nextVisibility,
-			ref: existing.ref,
-			...(token8 ? { token8 } : {}),
-			...(nextRecipients ? { recipients: nextRecipients } : {}),
-			headCommitHash: existing.headCommitHash,
-			expiresAt: result.expiresAt ?? existing.expiresAt,
-			decisionCount: existing.decisionCount,
-			titles: existing.titles,
-			commitHash: existing.commitHash,
-		},
-		commitHash,
-	);
-	return nextVisibility;
+	// Prefer the visibility we ASKED for: the PATCH didn't throw, so the flip took.
+	// Trusting the server echo instead let a stale/omitted echo silently revert the
+	// tier (e.g. flip to public rendered back as org). Fall back to the echo, then
+	// the existing value, for a recipients-only patch that carries no visibility.
+	const nextVisibility = patch.visibility ?? result.visibility ?? existing.visibility;
+	// Public bearer links never carry an allowlist — drop recipients on a flip to public.
+	const nextRecipients =
+		nextVisibility === "public" ? undefined : (result.recipients ?? patch.recipients ?? existing.recipients);
+	const { recipients: _drop, ...base } = existing;
+	const updated: BranchShareRecord = {
+		...base,
+		shareId: String(result.shareId ?? existing.shareId),
+		// An audience-only PATCH doesn't re-mint the link, so the server may omit
+		// `shareUrl` — keep the existing one in that case.
+		shareUrl: result.shareUrl || existing.shareUrl,
+		visibility: nextVisibility,
+		expiresAt: result.expiresAt ?? existing.expiresAt,
+		...(nextRecipients && nextRecipients.length > 0 ? { recipients: nextRecipients } : {}),
+	};
+	await putBranchShare(workspaceRoot, branch, updated, commitHash);
+	return updated;
 }
 
 /** Re-exports the persistence reads the panel/modal need when (re)opening the modal. */
-export { getBranchShare, isPublicConfirmed, markPublicConfirmed };
+export { getShare, putBranchShare };

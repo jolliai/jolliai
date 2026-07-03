@@ -1,15 +1,13 @@
 /**
  * JolliShareService
  *
- * HTTP client for the public branch-share feature. Three operations:
+ * HTTP client for the live (Space-backed) branch-share feature:
  *
- * - `createBranchShare` (sharer side, authed) — POST a branch snapshot
- *   (summary + plan + notes, never transcripts) and get back a public `shareUrl`.
+ * - `createLiveShare` / `updateLiveShare` (sharer side, authed) — POST/PATCH a
+ *   share that references live Space docs and get back a `shareUrl`.
  * - `revokeBranchShare` (sharer side, authed) — DELETE a share.
- * - `fetchSharedSnapshot` (recipient side, **login-free**) — GET a snapshot by
- *   token to render in the read-only share viewer. The token is the credential;
- *   no Authorization header is sent. The origin is validated against the Jolli
- *   allowlist before any request leaves the machine.
+ * - `sendShareInviteAndGrantAccess` — grant recipients access + email them.
+ * - `listOrgMembers` — recipient-picker candidates.
  *
  * Mirrors JolliPushService: Node http/https (not fetch) to tolerate self-signed
  * certs in local dev, and the shared `buildJolliApiHeaders` for authed calls.
@@ -17,91 +15,11 @@
 
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import {
-	assertJolliOriginAllowed,
-	type JolliApiKeyMeta,
-	parseBaseUrl,
-	parseJolliApiKey,
-} from "../../../cli/src/core/JolliApiUtils.js";
+import { type JolliApiKeyMeta, parseBaseUrl, parseJolliApiKey } from "../../../cli/src/core/JolliApiUtils.js";
 import type { LiveRef } from "../../../cli/src/core/BranchShareStore.js";
-import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "../../../cli/src/core/TraceContext.js";
-import { VSCODE_CLIENT_INFO } from "./ClientInfo.js";
 import { buildJolliApiHeaders, PluginOutdatedError } from "./JolliPushService.js";
 
 export { PluginOutdatedError };
-
-/** Thrown when a share has been revoked or expired (HTTP 410 / `revoked: true`). */
-export class ShareRevokedError extends Error {
-	constructor(message?: string) {
-		super(message ?? "This share has been stopped.");
-		this.name = "ShareRevokedError";
-	}
-}
-
-/** Snapshot scope — summary always, plans/notes opt-in, transcripts never (conversations stay local). */
-export interface ShareScope {
-	readonly summary: true;
-	readonly plans: boolean;
-	readonly notes: boolean;
-	readonly transcripts: false;
-}
-
-/** Body posted to create/refresh a public share (branch or single commit). */
-export interface BranchSharePayload {
-	readonly repoUrl: string;
-	readonly repoName: string;
-	readonly branch: string;
-	readonly branchSlug: string;
-	/**
-	 * "branch" → every commit's summary, organized by commit. "commit" → a single
-	 * commit's summary. The server keys idempotency on this `kind` (commit shares
-	 * additionally on `headCommitHash`), so a branch share and a commit share on
-	 * the same branch are distinct resources with distinct tokens. The field name
-	 * MUST be `kind` — the backend's zod schema strips unknown keys, so a misnamed
-	 * field silently defaults to "branch" and collapses both onto one resource.
-	 */
-	readonly kind: "branch" | "commit";
-	readonly headCommitHash: string;
-	readonly commitHashes: ReadonlyArray<string>;
-	readonly decisionCount: number;
-	readonly scope: ShareScope;
-	readonly content: string;
-}
-
-/** Response from a successful expiry update (PATCH). */
-export interface ShareExpiryResult {
-	readonly shareId: number | string;
-	readonly expiresAt: string;
-	readonly visibility: "public";
-}
-
-/** Response from a successful create. */
-export interface BranchShareResult {
-	/** Server share id — numeric in practice (auto-increment), but treated as opaque. */
-	readonly shareId: number | string;
-	readonly token: string;
-	readonly shareUrl: string;
-	readonly expiresAt: string;
-	readonly visibility: "public";
-}
-
-/** Login-free snapshot returned to the recipient viewer. */
-export interface SharedSnapshot {
-	readonly branch: string;
-	readonly repoName: string;
-	readonly repoUrl?: string;
-	readonly decisionCount: number;
-	readonly headCommitHash: string;
-	readonly generatedAt: string;
-	readonly scope: {
-		readonly summary: boolean;
-		readonly plans: boolean;
-		readonly notes: boolean;
-		readonly transcripts: boolean;
-	};
-	readonly content: string;
-	readonly revoked?: boolean;
-}
 
 interface ErrorBody {
 	error?: string;
@@ -111,85 +29,6 @@ interface ErrorBody {
 /** Resolves the base URL from an explicit arg or the API key's embedded URL. */
 function resolveBaseUrl(baseUrl: string | undefined, keyMeta: JolliApiKeyMeta | null): string | undefined {
 	return baseUrl ?? keyMeta?.u;
-}
-
-/**
- * Creates (or refreshes, idempotent per repo+branch) a public branch share.
- * Returns the share URL and token.
- */
-export function createBranchShare(
-	baseUrl: string | undefined,
-	apiKey: string,
-	payload: BranchSharePayload,
-): Promise<BranchShareResult> {
-	const keyMeta = parseJolliApiKey(apiKey);
-	const resolvedBaseUrl = resolveBaseUrl(baseUrl, keyMeta);
-	if (!resolvedBaseUrl) {
-		return Promise.reject(
-			new Error(
-				"Jolli site URL could not be determined. Please regenerate your Jolli API Key and set it again (STATUS panel → ...).",
-			),
-		);
-	}
-	const parsed = parseBaseUrl(resolvedBaseUrl);
-	const targetUrl = new URL("/api/share/branch", parsed.origin);
-	const body = JSON.stringify(payload);
-	const isHttps = targetUrl.protocol === "https:";
-	const headers = buildJolliApiHeaders({
-		apiKey,
-		keyMeta,
-		tenantSlug: parsed.tenantSlug,
-		bodyByteLength: Buffer.byteLength(body),
-	});
-	const requestFn = isHttps ? httpsRequest : httpRequest;
-
-	return new Promise<BranchShareResult>((resolve, reject) => {
-		const req = requestFn(targetUrl, { method: "POST", headers }, (res) => {
-			const chunks: Array<Buffer> = [];
-			res.on("data", (chunk: Buffer) => chunks.push(chunk));
-			res.on("end", () => {
-				const raw = Buffer.concat(chunks).toString("utf-8");
-				try {
-					const json = JSON.parse(raw) as BranchShareResult & ErrorBody;
-					const status = res.statusCode ?? 0;
-					if (status >= 200 && status < 300) {
-						// A 2xx whose body is missing shareId/token/shareUrl means the
-						// server's response shape doesn't match this client's contract
-						// (e.g. a stub, or a different field naming). Fail loud with the
-						// raw body instead of crashing later on `token.slice(...)`.
-						if (
-							json?.shareId === undefined ||
-							json?.shareId === null ||
-							typeof json?.token !== "string" ||
-							typeof json?.shareUrl !== "string"
-						) {
-							reject(
-								new Error(
-									`Share endpoint returned an unexpected response (missing shareId/token/shareUrl). HTTP ${status}: ${raw.slice(0, 300)}`,
-								),
-							);
-							return;
-						}
-						resolve(json);
-					} else if (status === 426) {
-						reject(
-							new PluginOutdatedError(
-								json.message ?? "Plugin version is outdated. Please update to the latest version.",
-							),
-						);
-					} else {
-						const detail = [json.error, json.message].filter(Boolean).join(" — ");
-						reject(new Error(`${detail || "request failed"} (HTTP ${status})`));
-					}
-				} catch {
-					reject(new Error(`Invalid JSON response (HTTP ${res.statusCode}): ${raw.slice(0, 200)}`));
-				}
-			});
-		});
-		req.on("error", (err) => reject(new Error(`Network error: ${err.message}`)));
-		req.write(body);
-		req.end();
-	});
 }
 
 /** Revokes a public branch share by id. */
@@ -218,64 +57,12 @@ export function revokeBranchShare(baseUrl: string | undefined, apiKey: string, s
 	});
 }
 
-/**
- * Adjusts an existing share's expiry via `PATCH /api/share/branch/:shareId`.
- * `expiresAt` is an absolute ISO timestamp (server requires future, ≤ now+365d).
- * Returns the server-confirmed `expiresAt`.
- */
-export function updateBranchShareExpiry(
-	baseUrl: string | undefined,
-	apiKey: string,
-	shareId: string,
-	expiresAt: string,
-): Promise<ShareExpiryResult> {
-	const keyMeta = parseJolliApiKey(apiKey);
-	const resolvedBaseUrl = resolveBaseUrl(baseUrl, keyMeta);
-	if (!resolvedBaseUrl) {
-		return Promise.reject(new Error("Jolli site URL could not be determined."));
-	}
-	const parsed = parseBaseUrl(resolvedBaseUrl);
-	const targetUrl = new URL(`/api/share/branch/${encodeURIComponent(shareId)}`, parsed.origin);
-	const body = JSON.stringify({ expiresAt });
-	const isHttps = targetUrl.protocol === "https:";
-	const headers = buildJolliApiHeaders({
-		apiKey,
-		keyMeta,
-		tenantSlug: parsed.tenantSlug,
-		bodyByteLength: Buffer.byteLength(body),
-	});
-	const requestFn = isHttps ? httpsRequest : httpRequest;
-
-	return new Promise<ShareExpiryResult>((resolve, reject) => {
-		const req = requestFn(targetUrl, { method: "PATCH", headers }, (res) => {
-			const chunks: Array<Buffer> = [];
-			res.on("data", (chunk: Buffer) => chunks.push(chunk));
-			res.on("end", () => {
-				const raw = Buffer.concat(chunks).toString("utf-8");
-				const status = res.statusCode ?? 0;
-				try {
-					const json = JSON.parse(raw) as ShareExpiryResult & ErrorBody;
-					if (status >= 200 && status < 300 && typeof json.expiresAt === "string") {
-						resolve(json);
-					} else {
-						const detail = [json.error, json.message].filter(Boolean).join(" — ");
-						reject(new Error(`${detail || "expiry update failed"} (HTTP ${status})`));
-					}
-				} catch {
-					reject(new Error(`Invalid JSON response (HTTP ${status}): ${raw.slice(0, 200)}`));
-				}
-			});
-		});
-		req.on("error", (err) => reject(new Error(`Network error: ${err.message}`)));
-		req.write(body);
-		req.end();
-	});
-}
-
 // ─── Live (Space-backed) shares ────────────────────────────────────────────────
 // These target the SAME /api/share/branch routes, now live-only: the share
 // references live Space docs (a `covered` allowlist) instead of a frozen `content`
-// blob. `visibility` is `public` (bearer link) or `org` (auth-gated, no token).
+// blob. `visibility` is `public` (bearer link) or the auth-gated member tier
+// (no token). The member-tier value is `"org"` end-to-end — the record, the webview
+// value, and the wire all use `"org"` (the server gates it to the share's own org).
 
 /** Body posted to create a live share. No `content` blob. */
 export interface LiveSharePayload {
@@ -377,13 +164,21 @@ function rejectForStatus(status: number, json: ErrorBody | null, raw: string): E
 	return new Error(`${detail || "request failed"} (HTTP ${status})${json ? "" : `: ${raw.slice(0, 200)}`}`);
 }
 
+/** Narrow an unknown wire visibility to the plugin's tier union, or undefined when unrecognized. */
+function asVisibility(v: unknown): "public" | "org" | "people" | undefined {
+	return v === "public" || v === "org" || v === "people" ? v : undefined;
+}
+
+/** Wire shape of a live-share create/update response — `visibility` may be absent (e.g. expiry-only PATCH). */
+type WireLiveShareResult = Omit<LiveShareResult, "visibility"> & { readonly visibility?: string };
+
 /** Creates a live share. Requires `shareId` + `shareUrl`; `token` only for `public`. */
 export async function createLiveShare(
 	baseUrl: string | undefined,
 	apiKey: string,
 	payload: LiveSharePayload,
 ): Promise<LiveShareResult> {
-	const { status, json, raw } = await requestJson<LiveShareResult>(
+	const { status, json, raw } = await requestJson<WireLiveShareResult>(
 		"POST",
 		baseUrl,
 		apiKey,
@@ -396,7 +191,7 @@ export async function createLiveShare(
 				`Share endpoint returned an unexpected response (missing shareId/shareUrl). HTTP ${status}: ${raw.slice(0, 300)}`,
 			);
 		}
-		return json;
+		return { ...json, visibility: asVisibility(json.visibility) ?? payload.visibility };
 	}
 	throw rejectForStatus(status, json, raw);
 }
@@ -417,7 +212,7 @@ export async function updateLiveShare(
 	shareId: string,
 	patch: LiveSharePatch,
 ): Promise<LiveShareUpdateResult> {
-	const { status, json, raw } = await requestJson<LiveShareUpdateResult>(
+	const { status, json, raw } = await requestJson<Partial<WireLiveShareResult>>(
 		"PATCH",
 		baseUrl,
 		apiKey,
@@ -428,9 +223,66 @@ export async function updateLiveShare(
 	// (the link didn't change), so accept any 2xx with a body — the caller falls back to
 	// the existing URL. Only a missing body or a non-2xx is an error.
 	if (status >= 200 && status < 300 && json) {
-		return json;
+		const { visibility: wireVisibility, ...rest } = json;
+		const visibility = asVisibility(wireVisibility);
+		return { ...rest, ...(visibility && { visibility }) };
 	}
 	throw rejectForStatus(status, json, raw);
+}
+
+/** What the invite endpoint reports back: who got the email, and who couldn't be reached. */
+export interface ShareInviteResult {
+	/** Emails an invite mail was sent to. */
+	readonly sent: ReadonlyArray<string>;
+	/** Emails whose mail failed — access was still granted (mail is notification, not permission). */
+	readonly failed: ReadonlyArray<string>;
+}
+
+/**
+ * Invites people to a member share — **this has a permission side effect**, it is
+ * not just email: the server first MERGES the emails into the member link's
+ * recipients allowlist (granting them access to the `/view` URL), then sends each
+ * one an invite mail with the link + optional note. A mail failure never revokes
+ * the granted access; it shows up in `failed`. Owner-only server-side (403
+ * otherwise); rejects public shares (404).
+ */
+export async function sendShareInviteAndGrantAccess(
+	baseUrl: string | undefined,
+	apiKey: string,
+	shareId: string,
+	body: { readonly recipients: ReadonlyArray<string>; readonly message?: string },
+): Promise<ShareInviteResult> {
+	const { status, json, raw } = await requestJson<ShareInviteResult>(
+		"POST",
+		baseUrl,
+		apiKey,
+		`/api/share/branch/${encodeURIComponent(shareId)}/invite`,
+		body,
+	);
+	if (status >= 200 && status < 300) {
+		if (json && Array.isArray(json.sent) && Array.isArray(json.failed)) {
+			return json;
+		}
+		// A 2xx with no per-recipient breakdown (e.g. 202 Accepted: access granted,
+		// mail queued for async delivery) is still success — treat every requested
+		// recipient as sent. Guard against a non-JSON body: a misrouted host can 200
+		// with an SPA HTML page, which is NOT a real API success.
+		if (json !== null || raw.trim() === "") {
+			return { sent: [...body.recipients], failed: [] };
+		}
+	}
+	throw rejectForStatus(status, json, raw);
+}
+
+/** Directory cap: the share popover's suggestion list never needs more than this many members. */
+const ORG_MEMBERS_MAX = 100;
+/** Successful member lists are reused for 3 minutes so reopening Share doesn't re-hit the API. */
+const ORG_MEMBERS_TTL_MS = 3 * 60 * 1000;
+const orgMembersCache = new Map<string, { members: OrgMember[]; ts: number }>();
+
+/** Test hook: drops all cached member lists so cases don't leak into each other. */
+export function clearOrgMembersCache(): void {
+	orgMembersCache.clear();
 }
 
 /**
@@ -439,8 +291,18 @@ export async function updateLiveShare(
  * `{ members: [{ email, name }] }` (active users only, deactivated excluded).
  * Best-effort: skips entries without a deliverable email and returns `[]` on any
  * error (the recipient picker still has git contributors + manual entry).
+ *
+ * Capped at {@link ORG_MEMBERS_MAX} and cached per (baseUrl, apiKey) for
+ * {@link ORG_MEMBERS_TTL_MS} — only successful fetches are cached, so a transient
+ * failure never sticks for the TTL.
  */
 export async function listOrgMembers(baseUrl: string | undefined, apiKey: string): Promise<OrgMember[]> {
+	// NUL joiner: can't occur in a URL or an API key, so keys never collide.
+	const cacheKey = `${baseUrl ?? ""}\u0000${apiKey}`;
+	const cached = orgMembersCache.get(cacheKey);
+	if (cached && Date.now() - cached.ts < ORG_MEMBERS_TTL_MS) {
+		return cached.members;
+	}
 	try {
 		const { status, json } = await requestJson<{ members?: Array<Record<string, unknown>> }>(
 			"GET",
@@ -452,69 +314,15 @@ export async function listOrgMembers(baseUrl: string | undefined, apiKey: string
 		const rows = Array.isArray(json.members) ? json.members : [];
 		const members: OrgMember[] = [];
 		for (const row of rows) {
+			if (members.length >= ORG_MEMBERS_MAX) break;
 			const email = typeof row.email === "string" ? row.email.trim() : "";
 			if (!email) continue;
 			const name = typeof row.name === "string" ? row.name : "";
 			members.push({ name, email });
 		}
+		orgMembersCache.set(cacheKey, { members, ts: Date.now() });
 		return members;
 	} catch {
 		return [];
 	}
-}
-
-/**
- * Fetches a shared snapshot by token (login-free). Validates `origin` against
- * the Jolli allowlist first. Throws `ShareRevokedError` on 410 / `revoked`.
- */
-export function fetchSharedSnapshot(origin: string, token: string): Promise<SharedSnapshot> {
-	if (token.length === 0) {
-		return Promise.reject(new Error("Missing share token."));
-	}
-	return new Promise<SharedSnapshot>((resolve, reject) => {
-		const parsed = parseBaseUrl(origin);
-		// Refuse off-allowlist / non-HTTPS origins before any request leaves the machine.
-		// Inside the executor so a bad origin rejects rather than throwing synchronously.
-		assertJolliOriginAllowed(parsed.origin);
-		const targetUrl = new URL(`/api/share/snapshot/${encodeURIComponent(token)}`, parsed.origin);
-		const headers: Record<string, string> = {
-			"x-jolli-client": `${VSCODE_CLIENT_INFO.kind}/${VSCODE_CLIENT_INFO.version}`,
-			// Carry a trace id so this login-free outbound call is correlated in logs.
-			[TRACE_HEADER_NAME]: currentTraceHeader() ?? newTraceHeader(),
-		};
-		if (parsed.tenantSlug) headers["x-tenant-slug"] = parsed.tenantSlug;
-		// assertJolliOriginAllowed guarantees https, so no http fallback is needed here.
-		const req = httpsRequest(targetUrl, { method: "GET", headers }, (res) => {
-			const chunks: Array<Buffer> = [];
-			res.on("data", (chunk: Buffer) => chunks.push(chunk));
-			res.on("end", () => {
-				const raw = Buffer.concat(chunks).toString("utf-8");
-				const status = res.statusCode ?? 0;
-				if (status === 410) {
-					reject(new ShareRevokedError());
-					return;
-				}
-				try {
-					const json = JSON.parse(raw) as SharedSnapshot & ErrorBody;
-					if (status >= 200 && status < 300) {
-						if (json.revoked) reject(new ShareRevokedError());
-						else resolve(json);
-					} else if (status === 426) {
-						reject(
-							new PluginOutdatedError(
-								json.message ?? "Plugin version is outdated. Please update to the latest version.",
-							),
-						);
-					} else {
-						const detail = [json.error, json.message].filter(Boolean).join(" — ");
-						reject(new Error(`${detail || "request failed"} (HTTP ${status})`));
-					}
-				} catch {
-					reject(new Error(`Invalid JSON response (HTTP ${status}): ${raw.slice(0, 200)}`));
-				}
-			});
-		});
-		req.on("error", (err) => reject(new Error(`Network error: ${err.message}`)));
-		req.end();
-	});
 }

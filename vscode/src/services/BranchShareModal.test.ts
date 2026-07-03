@@ -1,28 +1,31 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
-	getBranchShare: vi.fn(),
-	isPublicConfirmed: vi.fn(),
-	markPublicConfirmed: vi.fn(),
-	revokeBranchShareForBranch: vi.fn(),
-	setBranchShareExpiry: vi.fn(),
-	setBranchShareVisibility: vi.fn(),
+	getShare: vi.fn(),
+	patchShareAudience: vi.fn(),
+	putBranchShare: vi.fn(),
+	revokeShare: vi.fn(),
 	generateLiveShare: vi.fn(),
 	reconcileLiveShare: vi.fn(),
+	countSubjectDecisions: vi.fn(),
+	sendShareInviteAndGrantAccess: vi.fn(),
+	assertJolliOriginAllowed: vi.fn(),
 }));
 
 vi.mock("./BranchShareController.js", () => ({
-	getBranchShare: h.getBranchShare,
-	isPublicConfirmed: h.isPublicConfirmed,
-	markPublicConfirmed: h.markPublicConfirmed,
-	revokeBranchShareForBranch: h.revokeBranchShareForBranch,
-	setBranchShareExpiry: h.setBranchShareExpiry,
-	setBranchShareVisibility: h.setBranchShareVisibility,
+	getShare: h.getShare,
+	patchShareAudience: h.patchShareAudience,
+	putBranchShare: h.putBranchShare,
+	revokeShare: h.revokeShare,
 }));
 vi.mock("./LiveShareController.js", () => ({
 	generateLiveShare: h.generateLiveShare,
 	reconcileLiveShare: h.reconcileLiveShare,
+	countSubjectDecisions: h.countSubjectDecisions,
 	NothingToShareError: class NothingToShareError extends Error {},
+}));
+vi.mock("./JolliShareService.js", () => ({
+	sendShareInviteAndGrantAccess: h.sendShareInviteAndGrantAccess,
 }));
 vi.mock("./JolliPushOrchestrator.js", () => ({
 	ShareBindingError: class ShareBindingError extends Error {
@@ -34,521 +37,622 @@ vi.mock("./JolliPushOrchestrator.js", () => ({
 		}
 	},
 }));
+vi.mock("../../../cli/src/core/JolliApiUtils.js", () => ({
+	assertJolliOriginAllowed: h.assertJolliOriginAllowed,
+}));
 
 import { ShareBindingError } from "./JolliPushOrchestrator.js";
 import { NothingToShareError } from "./LiveShareController.js";
 import {
-	createShareModal,
-	deriveShareCollaborators,
+	copyShareLinkModal,
 	openShareModal,
-	revokeShareModal,
-	setShareExpiryModal,
-	setShareVisibilityModal,
+	removeRecipientModal,
+	sendInviteModal,
+	setShareAccessModal,
 	type ShareMember,
 	type ShareModalContext,
 	type ShareModalIO,
-	shareModalTarget,
 } from "./BranchShareModal.js";
 
 const NOW_MS = Date.parse("2026-06-25T00:00:00.000Z");
+const URL = "https://acme.jolli.ai/b/x";
+const MEMBER_URL = "https://acme.jolli.ai/share/branch/1/view";
+const EXPIRES = "2026-09-01T00:00:00.000Z";
 const OWNER: ShareMember = { name: "Ada", email: "ada@example.com" };
-const DIRECTORY: ShareMember[] = [
-	{ name: "Ada", email: "ada@example.com" },
-	{ name: "Bo", email: "bo@example.com" },
-];
-/** Collaborators for a share with no recipients: just the owner row. */
-const OWNER_ROWS = [{ name: "Ada", email: "ada@example.com", isOwner: true }];
+const ACCOUNT: ShareMember[] = [{ name: "Bo", email: "bo@example.com" }];
+const GIT: ShareMember[] = [{ name: "Cy", email: "cy@example.com" }];
+const PUBLIC_RECORD = {
+	shareId: "pub",
+	shareUrl: URL,
+	expiresAt: EXPIRES,
+	decisionCount: 4,
+	visibility: "public" as const,
+	titles: ["Decision A"],
+};
+const MEMBER_RECORD = {
+	shareId: "mem",
+	shareUrl: MEMBER_URL,
+	expiresAt: EXPIRES,
+	decisionCount: 5,
+	visibility: "org" as const,
+	recipients: ["bo@example.com"],
+};
+
 const CTX: ShareModalContext = {
 	workspaceRoot: "/repo",
 	branch: "feature/x",
 	apiKey: "KEY",
 	subjectTitle: "feature/x",
-	visibility: "public",
-	recipients: [],
 	canOrg: true,
 	owner: OWNER,
-	directory: DIRECTORY,
+	accountMembers: ACCOUNT,
+	gitCollaborators: GIT,
 	bridge: {} as never,
 	resolveBinding: vi.fn(),
 	nowMs: NOW_MS,
 };
-const URL = "https://acme.jolli.ai/b/x";
-const EXPIRES = "2026-09-01T00:00:00.000Z"; // 68 days after NOW_MS
-/** A stored live record, as getBranchShare would return after a successful generate. */
-const RECORD = { shareId: "sh", shareUrl: URL, expiresAt: EXPIRES, decisionCount: 4, visibility: "public" as const };
 
 function makeIO(): ShareModalIO & { states: Array<unknown> } {
 	const states: Array<unknown> = [];
 	return {
 		states,
 		postState: vi.fn((s) => states.push(s)),
-		openUrl: vi.fn().mockResolvedValue(undefined),
-		composeEmail: vi.fn().mockResolvedValue(undefined),
-		copyMessage: vi.fn().mockResolvedValue(undefined),
-		openSocial: vi.fn().mockResolvedValue(undefined),
+		copyToClipboard: vi.fn().mockResolvedValue(true),
+		postCopyResult: vi.fn(),
 		notifyError: vi.fn(),
 		notifyInfo: vi.fn(),
-		formatExpiry: vi.fn(() => "expires Sep 1, 2026"),
 	};
 }
 
 beforeEach(() => {
 	for (const fn of Object.values(h)) fn.mockReset();
-	h.getBranchShare.mockResolvedValue(undefined);
-	h.isPublicConfirmed.mockResolvedValue(false);
-	h.generateLiveShare.mockResolvedValue({ shareId: "sh", shareUrl: URL, expiresAt: EXPIRES, visibility: "public" });
+	h.getShare.mockResolvedValue(undefined);
+	h.generateLiveShare.mockResolvedValue(undefined);
 	h.reconcileLiveShare.mockResolvedValue(undefined);
+	h.countSubjectDecisions.mockResolvedValue(0);
+	h.sendShareInviteAndGrantAccess.mockResolvedValue({ sent: [], failed: [] });
 });
 
-describe("deriveShareCollaborators", () => {
-	it("puts the owner first (flagged) then one row per recipient, names resolved from the directory", () => {
-		const rows = deriveShareCollaborators(OWNER, ["bo@example.com", "ext@gmail.com"], DIRECTORY);
-		expect(rows).toEqual([
-			{ name: "Ada", email: "ada@example.com", isOwner: true },
-			{ name: "Bo", email: "bo@example.com", isOwner: false },
-			{ name: "ext@gmail.com", email: "ext@gmail.com", isOwner: false },
-		]);
-	});
-
-	it("de-dupes the owner and repeated recipients (case-insensitive)", () => {
-		const rows = deriveShareCollaborators(OWNER, ["ADA@example.com", "bo@example.com", "BO@example.com"], DIRECTORY);
-		expect(rows.map((r) => r.email)).toEqual(["ada@example.com", "bo@example.com"]);
-	});
-
-	it("owner-only when there are no recipients", () => {
-		expect(deriveShareCollaborators(OWNER, [], DIRECTORY)).toEqual([
-			{ name: "Ada", email: "ada@example.com", isOwner: true },
-		]);
-	});
-
-	it("skips blank recipient entries", () => {
-		const rows = deriveShareCollaborators(OWNER, ["", "  ", "bo@example.com"], DIRECTORY);
-		expect(rows.map((r) => r.email)).toEqual(["ada@example.com", "bo@example.com"]);
-	});
-
-	it("falls back to the email as the owner name when unnamed", () => {
-		const rows = deriveShareCollaborators({ name: "", email: "x@y.com" }, [], []);
-		expect(rows[0]).toEqual({ name: "x@y.com", email: "x@y.com", isOwner: true });
-	});
-});
-
-describe("openShareModal — re-show existing", () => {
+describe("openShareModal", () => {
 	it("shows needsApiKey when no key", async () => {
 		const io = makeIO();
 		await openShareModal(io, { ...CTX, apiKey: undefined });
 		expect(io.states).toEqual([{ kind: "needsApiKey" }]);
 	});
 
-	it("re-shows an existing live share as ready (never re-syncs)", async () => {
-		h.getBranchShare.mockResolvedValue({ ...RECORD, decisionCount: 7 });
+	it("renders the subject's single link", async () => {
+		h.getShare.mockResolvedValue(MEMBER_RECORD);
 		const io = makeIO();
 		await openShareModal(io, CTX);
-		expect(io.states[0]).toEqual({
+		expect(io.states.at(-1)).toEqual({
 			kind: "ready",
 			branch: "feature/x",
 			subject: "feature/x",
 			subjectTitle: "feature/x",
-			shareUrl: URL,
-			expiresLabel: "expires Sep 1, 2026",
-			expiryDays: 68,
-			decisionCount: 7,
-			visibility: "public",
+			decisionCount: 5,
 			canOrg: true,
-			recipients: [],
-			orgMembers: DIRECTORY,
-			collaborators: OWNER_ROWS,
+			share: { shareUrl: MEMBER_URL, visibility: "org", recipients: ["bo@example.com"] },
+			accountMembers: ACCOUNT,
+			gitCollaborators: GIT,
+			owner: OWNER,
 		});
-		expect(h.generateLiveShare).not.toHaveBeenCalled();
+		expect(h.countSubjectDecisions).not.toHaveBeenCalled(); // cached count used, no recompute
 	});
 
-	it("reconciles an existing branch share before showing (live shares render current base..HEAD)", async () => {
-		const rec = { ...RECORD, ref: { kind: "branchCollection", relativePath: "feature/x", covered: [] } };
-		h.getBranchShare.mockResolvedValue(rec);
+	it("shows the current subject's decision count before the first share (no cached record)", async () => {
+		h.getShare.mockResolvedValue(undefined);
+		h.countSubjectDecisions.mockResolvedValue(7);
 		const io = makeIO();
 		await openShareModal(io, CTX);
+		expect(io.states.at(-1)).toMatchObject({ kind: "ready", decisionCount: 7 });
+		expect(h.countSubjectDecisions).toHaveBeenCalledWith(CTX.bridge, "/repo", undefined, undefined);
+	});
+
+	it("defaults a link's missing recipients to []", async () => {
+		h.getShare.mockResolvedValue({ ...MEMBER_RECORD, recipients: undefined });
+		const io = makeIO();
+		await openShareModal(io, CTX);
+		const state = io.states.at(-1) as { share?: { recipients: string[] } };
+		expect(state.share?.recipients).toEqual([]);
+	});
+
+	it("reconciles an existing branch collection link before rendering", async () => {
+		h.getShare.mockResolvedValue({
+			...PUBLIC_RECORD,
+			ref: { kind: "branchCollection", relativePath: "feature/x", covered: [] },
+		});
+		const io = makeIO();
+		await openShareModal(io, CTX);
+		expect(io.states[0]).toEqual({ kind: "loading", label: "Syncing to Jolli…" });
 		expect(h.reconcileLiveShare).toHaveBeenCalledWith(
 			expect.objectContaining({ workspaceRoot: "/repo", apiKey: "KEY" }),
 			"feature/x",
 		);
-		expect(io.states[0]).toEqual({ kind: "loading", label: "Syncing to Jolli…" });
-		expect(io.states.at(-1)).toMatchObject({ kind: "ready", shareUrl: URL });
 	});
 
-	it("reconcile failure is non-fatal — surfaces a toast and still shows the cached record", async () => {
-		const rec = { ...RECORD, ref: { kind: "branchCollection", relativePath: "feature/x", covered: [] } };
-		h.getBranchShare.mockResolvedValue(rec);
-		h.reconcileLiveShare.mockRejectedValue(new Error("net down"));
+	it("does NOT reconcile an expired branch share (and renders it as absent)", async () => {
+		h.getShare.mockResolvedValue({
+			...PUBLIC_RECORD,
+			ref: { kind: "branchCollection", relativePath: "feature/x", covered: [] },
+			expiresAt: "2026-01-01T00:00:00.000Z", // before CTX.nowMs (2026-06-25)
+		});
 		const io = makeIO();
 		await openShareModal(io, CTX);
-		expect(io.notifyError).toHaveBeenCalledWith(expect.stringContaining("net down"));
-		expect(io.states.at(-1)).toMatchObject({ kind: "ready", shareUrl: URL });
+		expect(h.reconcileLiveShare).not.toHaveBeenCalled();
+		expect(io.states.at(-1)).toMatchObject({ kind: "ready" });
+		expect(io.states.at(-1)).not.toHaveProperty("share");
 	});
 
-	it("does NOT reconcile a commit share (fixed doc list) or a ref-less record", async () => {
-		const commitHash = "c".repeat(40);
-		h.getBranchShare.mockResolvedValue({
-			...RECORD,
+	it("does not reconcile commit shares", async () => {
+		h.getShare.mockResolvedValue({
+			...PUBLIC_RECORD,
 			ref: { kind: "branchCollection", relativePath: "feature/x", covered: [] },
 		});
 		const io = makeIO();
-		await openShareModal(io, { ...CTX, commitHash });
+		await openShareModal(io, { ...CTX, commitHash: "c".repeat(40), subjectTitle: "fix: thing" });
 		expect(h.reconcileLiveShare).not.toHaveBeenCalled();
+		expect(io.states.at(-1)).toMatchObject({ kind: "ready", subjectTitle: "fix: thing" });
+	});
+
+	it("hides a stored link whose URL origin is not trusted", async () => {
+		h.getShare.mockResolvedValue({ ...PUBLIC_RECORD, shareUrl: "https://evil.example/b/x" });
+		h.assertJolliOriginAllowed.mockImplementation((origin: string) => {
+			if (origin === "https://evil.example") throw new Error("blocked origin");
+		});
+		const io = makeIO();
+		await openShareModal(io, CTX);
 		expect(io.states.at(-1)).toMatchObject({ kind: "ready" });
-	});
-
-	it("ready carries the commit message as subjectTitle for a commit share", async () => {
-		h.getBranchShare.mockResolvedValue(RECORD);
-		const io = makeIO();
-		await openShareModal(io, { ...CTX, commitHash: "c".repeat(40), subjectTitle: "fix: the thing" });
-		expect(io.states.at(-1)).toMatchObject({ kind: "ready", subjectTitle: "fix: the thing" });
-	});
-
-	it("ready expiry: a missing/unparseable expiresAt resolves to 0 days (still served)", async () => {
-		h.getBranchShare.mockResolvedValue({ ...RECORD, expiresAt: undefined });
-		const io = makeIO();
-		await openShareModal(io, CTX);
-		expect(io.states.at(-1)).toMatchObject({ kind: "ready", expiryDays: 0 });
-	});
-
-	it("refuses to render a cached share URL from an untrusted origin", async () => {
-		h.getBranchShare.mockResolvedValue({ ...RECORD, shareUrl: "https://evil.example/b/x" });
-		const io = makeIO();
-		await openShareModal(io, CTX);
-		expect(io.states.at(-1)).toMatchObject({ kind: "error", message: expect.stringContaining("not trusted") });
-		expect(h.generateLiveShare).not.toHaveBeenCalled();
+		expect(io.states.at(-1)).not.toHaveProperty("share");
 	});
 });
 
-describe("openShareModal — create confirmation", () => {
-	it("shows a create confirmation instead of generating a new link on open", async () => {
+describe("copyShareLinkModal", () => {
+	it("shows needsApiKey when no key", async () => {
 		const io = makeIO();
-		await openShareModal(io, CTX);
-		expect(h.generateLiveShare).not.toHaveBeenCalled();
-		expect(h.markPublicConfirmed).not.toHaveBeenCalled();
-		expect(io.states).toEqual([
-			expect.objectContaining({
-				kind: "needsCreate",
-				branch: "feature/x",
-				subject: "feature/x",
-				subjectTitle: "feature/x",
-				visibility: "org",
-				canOrg: true,
-				recipients: [],
-				collaborators: OWNER_ROWS,
-			}),
-		]);
+		await copyShareLinkModal(io, { ...CTX, apiKey: undefined }, "public");
+		expect(io.states).toEqual([{ kind: "needsApiKey" }]);
+		expect(h.getShare).not.toHaveBeenCalled();
 	});
 
-	it("uses public as the create default when org access is unavailable", async () => {
+	it("mints and copies a missing public link", async () => {
+		h.getShare.mockResolvedValueOnce(undefined).mockResolvedValueOnce(PUBLIC_RECORD);
 		const io = makeIO();
-		await openShareModal(io, { ...CTX, canOrg: false });
-		expect(io.states.at(-1)).toMatchObject({ kind: "needsCreate", visibility: "public", canOrg: false });
-		expect(h.generateLiveShare).not.toHaveBeenCalled();
-	});
-
-	it("does not re-serve an expired link; asks the user to create a fresh one", async () => {
-		h.getBranchShare.mockResolvedValue({ ...RECORD, expiresAt: "2020-01-01T00:00:00.000Z" });
-		const io = makeIO();
-		await openShareModal(io, { ...CTX, nowMs: NOW_MS });
-		expect(h.generateLiveShare).not.toHaveBeenCalled();
-		expect(io.states.at(-1)).toMatchObject({ kind: "needsCreate" });
-	});
-});
-
-describe("createShareModal", () => {
-	it("creates a new share with the selected audience", async () => {
-		h.getBranchShare.mockResolvedValue(RECORD);
-		const io = makeIO();
-		await createShareModal(io, { ...CTX, visibility: "org" });
-		expect(h.generateLiveShare).toHaveBeenCalledWith(expect.objectContaining({ visibility: "org" }));
-		expect(h.markPublicConfirmed).not.toHaveBeenCalled();
-		expect(io.states[0]).toEqual({ kind: "loading", label: "Syncing to Jolli…" });
-		expect(io.states.at(-1)).toMatchObject({ kind: "ready", shareUrl: URL, collaborators: OWNER_ROWS });
-	});
-
-	it("records the public ack when creating a public link", async () => {
-		h.getBranchShare.mockResolvedValue(RECORD);
-		const io = makeIO();
-		await createShareModal(io, { ...CTX, canOrg: false, visibility: "public" });
+		await copyShareLinkModal(io, CTX, "public");
 		expect(h.generateLiveShare).toHaveBeenCalledWith(expect.objectContaining({ visibility: "public" }));
-		expect(h.markPublicConfirmed).toHaveBeenCalledWith("/repo", "feature/x");
+		expect(io.copyToClipboard).toHaveBeenCalledWith(URL);
+		expect(io.postCopyResult).toHaveBeenCalledWith({ ok: true });
 	});
 
-	it("commit share: keys the existing-share lookup by commit and threads commitHash into generate", async () => {
-		const commitHash = "c".repeat(40);
-		h.getBranchShare.mockResolvedValue(RECORD);
+	it("mints an org link when Copy targets the org tier and none exists", async () => {
+		h.getShare.mockResolvedValueOnce(undefined).mockResolvedValueOnce(MEMBER_RECORD);
 		const io = makeIO();
-		await createShareModal(io, { ...CTX, commitHash, visibility: "org" });
-		expect(h.getBranchShare).toHaveBeenCalledWith("/repo", "feature/x", commitHash);
-		expect(h.generateLiveShare).toHaveBeenCalledWith(expect.objectContaining({ commitHash, visibility: "org" }));
+		await copyShareLinkModal(io, CTX, "org");
+		expect(h.generateLiveShare).toHaveBeenCalledWith(expect.objectContaining({ visibility: "org" }));
+		expect(io.copyToClipboard).toHaveBeenCalledWith(MEMBER_URL);
+		expect(io.postCopyResult).toHaveBeenCalledWith({ ok: true });
+	});
+
+	it("copies an existing live link without re-minting or re-rendering", async () => {
+		h.getShare.mockResolvedValue(PUBLIC_RECORD);
+		const io = makeIO();
+		await copyShareLinkModal(io, CTX, "public");
+		expect(h.generateLiveShare).not.toHaveBeenCalled();
+		expect(io.copyToClipboard).toHaveBeenCalledWith(URL);
+		expect(io.postCopyResult).toHaveBeenCalledWith({ ok: true });
+		// A pure copy leaves the card still — no ready re-render is posted.
+		expect(io.states.some((s) => (s as { kind?: string }).kind === "ready")).toBe(false);
+	});
+
+	it("patches an existing link to the selected tier before copying", async () => {
+		h.getShare.mockResolvedValue(PUBLIC_RECORD);
+		h.patchShareAudience.mockResolvedValue({ ...MEMBER_RECORD, visibility: "org" });
+		const io = makeIO();
+		await copyShareLinkModal(io, CTX, "org");
+		expect(h.patchShareAudience).toHaveBeenCalledWith("/repo", "feature/x", "KEY", { visibility: "org" }, undefined);
+		expect(io.copyToClipboard).toHaveBeenCalledWith(MEMBER_URL);
+		expect(io.postCopyResult).toHaveBeenCalledWith({ ok: true });
 		expect(io.states.at(-1)).toMatchObject({ kind: "ready" });
 	});
 
-	it("does NOT auto-open the mail client", async () => {
-		h.getBranchShare.mockResolvedValue(RECORD);
+	it("does not flip an existing link to people on copy without invitees", async () => {
+		h.getShare.mockResolvedValue(PUBLIC_RECORD);
 		const io = makeIO();
-		await createShareModal(io, { ...CTX, recipients: ["a@x.com"] });
-		expect(io.composeEmail).not.toHaveBeenCalled();
+		await copyShareLinkModal(io, CTX, "people");
+		expect(h.patchShareAudience).not.toHaveBeenCalled();
+		expect(io.notifyError).toHaveBeenCalledWith(expect.stringContaining("No one is invited yet"));
+		expect(io.postCopyResult).toHaveBeenCalledWith({ ok: false });
 	});
 
-	it("applies a caller-provided expiry via PATCH right after sync", async () => {
-		h.getBranchShare.mockResolvedValue(RECORD);
+	it("does not mint a people-tier link from copy (dead owner-only link)", async () => {
 		const io = makeIO();
-		await createShareModal(io, { ...CTX, expiryDays: 30, nowMs: NOW_MS });
-		expect(h.setBranchShareExpiry).toHaveBeenCalledWith("/repo", "feature/x", "KEY", "2026-07-25T00:00:00.000Z", undefined);
-		expect(io.states.at(-1)).toMatchObject({ kind: "ready", shareUrl: URL });
+		await copyShareLinkModal(io, CTX, "people");
+		expect(h.generateLiveShare).not.toHaveBeenCalled();
+		expect(io.notifyError).toHaveBeenCalledWith(expect.stringContaining("No one is invited yet"));
+		expect(io.postCopyResult).toHaveBeenCalledWith({ ok: false });
 	});
 
-	it("skips the expiry PATCH when no lifetime was chosen (server default)", async () => {
-		h.getBranchShare.mockResolvedValue(RECORD);
+	it("maps generation failures to an error state", async () => {
+		h.generateLiveShare.mockRejectedValue(new NothingToShareError("nothing here"));
 		const io = makeIO();
-		await createShareModal(io, CTX);
-		expect(h.setBranchShareExpiry).not.toHaveBeenCalled();
+		await copyShareLinkModal(io, CTX, "public");
+		expect(io.states.at(-1)).toEqual({ kind: "error", message: "nothing here" });
 	});
 
-	it("sync succeeds but the expiry PATCH fails → toasts and still shows the link", async () => {
-		h.getBranchShare.mockResolvedValue(RECORD);
-		h.setBranchShareExpiry.mockRejectedValue(new Error("patch boom"));
-		const io = makeIO();
-		await createShareModal(io, { ...CTX, expiryDays: 7, nowMs: undefined });
-		expect(io.notifyError).toHaveBeenCalledWith(expect.stringContaining("patch boom"));
-		expect(io.states.at(-1)).toMatchObject({ kind: "ready", shareUrl: URL });
-	});
-
-	it("surfaces NothingToShareError verbatim", async () => {
-		h.generateLiveShare.mockRejectedValue(new NothingToShareError("nope, no memories on feature/x"));
-		const io = makeIO();
-		await createShareModal(io, CTX);
-		expect(io.states.at(-1)).toMatchObject({ kind: "error", message: expect.stringContaining("no memories") });
-	});
-
-	it("maps a cancelled binding to a friendly message", async () => {
+	it("maps binding cancellation to a friendly error", async () => {
 		h.generateLiveShare.mockRejectedValue(new ShareBindingError("cancelled"));
 		const io = makeIO();
-		await createShareModal(io, CTX);
+		await copyShareLinkModal(io, CTX, "public");
 		expect(io.states.at(-1)).toMatchObject({ kind: "error", message: expect.stringContaining("none was chosen") });
 	});
 
-	it("maps an anotherOpen binding to the 'already open' message", async () => {
+	it("maps an already-open binding chooser to a friendly error", async () => {
 		h.generateLiveShare.mockRejectedValue(new ShareBindingError("anotherOpen"));
 		const io = makeIO();
-		await createShareModal(io, CTX);
+		await copyShareLinkModal(io, CTX, "public");
 		expect(io.states.at(-1)).toMatchObject({ kind: "error", message: expect.stringContaining("already open") });
 	});
 
-	it("maps a failed binding to the 'couldn't be set up' message", async () => {
+	it("maps other binding failures to a setup error", async () => {
 		h.generateLiveShare.mockRejectedValue(new ShareBindingError("failed"));
 		const io = makeIO();
-		await createShareModal(io, CTX);
+		await copyShareLinkModal(io, CTX, "public");
 		expect(io.states.at(-1)).toMatchObject({ kind: "error", message: expect.stringContaining("couldn't be set up") });
 	});
 
-	it("errors when the record vanished right after a successful sync", async () => {
-		// getBranchShare returns undefined for both the existing-check and the read-back.
-		h.getBranchShare.mockResolvedValue(undefined);
+	it("maps generic generation failures to a create-link error", async () => {
+		h.generateLiveShare.mockRejectedValue(new Error("backend down"));
 		const io = makeIO();
-		await createShareModal(io, CTX);
-		expect(io.states.at(-1)).toMatchObject({ kind: "error", message: expect.stringContaining("could not be created") });
+		await copyShareLinkModal(io, CTX, "public");
+		expect(io.states.at(-1)).toEqual({ kind: "error", message: "Could not create share link: backend down" });
 	});
 
-	it("wraps other generation errors", async () => {
-		h.generateLiveShare.mockRejectedValue(new Error("net down"));
+	it("reports clipboard failure when an existing link is not trusted", async () => {
+		h.getShare.mockResolvedValue({ ...PUBLIC_RECORD, shareUrl: "https://evil.example/b/x" });
+		h.assertJolliOriginAllowed.mockImplementation((origin: string) => {
+			if (origin === "https://evil.example") throw new Error("blocked origin");
+		});
 		const io = makeIO();
-		await createShareModal(io, CTX);
-		expect(io.states.at(-1)).toMatchObject({ kind: "error", message: expect.stringContaining("net down") });
-	});
-});
-
-describe("revokeShareModal", () => {
-	it("revokes in one action: toast + revoked state (no re-prompt to create a link)", async () => {
-		const io = makeIO();
-		await revokeShareModal(io, CTX);
-		expect(h.revokeBranchShareForBranch).toHaveBeenCalledWith("/repo", "feature/x", "KEY", undefined);
-		expect(io.states[0]).toEqual({ kind: "loading", label: "Stopping share…" });
-		expect(io.states[1]).toEqual({ kind: "revoked" });
-		expect(io.notifyInfo).toHaveBeenCalledWith(expect.stringContaining("Sharing stopped"));
-	});
-
-	it("guards on a missing API key", async () => {
-		const io = makeIO();
-		await revokeShareModal(io, { ...CTX, apiKey: undefined });
-		expect(io.states).toEqual([{ kind: "needsApiKey" }]);
-		expect(h.revokeBranchShareForBranch).not.toHaveBeenCalled();
+		await copyShareLinkModal(io, CTX, "public");
+		expect(io.copyToClipboard).not.toHaveBeenCalled();
+		expect(io.notifyError).toHaveBeenCalledWith(expect.stringContaining("Couldn't copy the link: blocked origin"));
+		expect(io.postCopyResult).toHaveBeenCalledWith({ ok: false });
 	});
 });
 
-describe("setShareExpiryModal", () => {
-	const NEW_EXPIRES = "2026-10-01T00:00:00.000Z";
-
-	it("needsApiKey guard", async () => {
+describe("setShareAccessModal", () => {
+	it("shows needsApiKey before setting access", async () => {
 		const io = makeIO();
-		await setShareExpiryModal(io, { ...CTX, apiKey: undefined }, NEW_EXPIRES);
+		await setShareAccessModal(io, { ...CTX, apiKey: undefined }, "org");
 		expect(io.states).toEqual([{ kind: "needsApiKey" }]);
-		expect(h.setBranchShareExpiry).not.toHaveBeenCalled();
+		expect(h.getShare).not.toHaveBeenCalled();
 	});
 
-	it("PATCHes the expiry (no regenerate) and re-renders ready with the new label", async () => {
-		h.setBranchShareExpiry.mockResolvedValue(NEW_EXPIRES);
-		h.getBranchShare.mockResolvedValue({ ...RECORD, expiresAt: NEW_EXPIRES });
+	it("selecting org with no link mints an org link", async () => {
 		const io = makeIO();
-		await setShareExpiryModal(io, CTX, NEW_EXPIRES);
-		expect(h.setBranchShareExpiry).toHaveBeenCalledWith("/repo", "feature/x", "KEY", NEW_EXPIRES, undefined);
+		await setShareAccessModal(io, CTX, "org");
+		expect(h.generateLiveShare).toHaveBeenCalledWith(expect.objectContaining({ visibility: "org" }));
+	});
+
+	it("selecting public with no link mints a public link", async () => {
+		const io = makeIO();
+		await setShareAccessModal(io, CTX, "public");
+		expect(h.generateLiveShare).toHaveBeenCalledWith(expect.objectContaining({ visibility: "public" }));
+	});
+
+	it("selecting people with no link mints nothing (waits for the first invite)", async () => {
+		const io = makeIO();
+		await setShareAccessModal(io, CTX, "people");
 		expect(h.generateLiveShare).not.toHaveBeenCalled();
+		expect(h.patchShareAudience).not.toHaveBeenCalled();
 		expect(io.states.at(-1)).toMatchObject({ kind: "ready" });
 	});
 
-	it("on PATCH failure: toasts the error and re-renders the still-valid link", async () => {
-		h.setBranchShareExpiry.mockRejectedValue(new Error("bad date"));
-		h.getBranchShare.mockResolvedValue(RECORD);
+	it("flips an existing link to a different tier in place", async () => {
+		h.getShare.mockResolvedValue(MEMBER_RECORD); // org
 		const io = makeIO();
-		await setShareExpiryModal(io, CTX, NEW_EXPIRES);
-		expect(io.notifyError).toHaveBeenCalledWith(expect.stringContaining("bad date"));
-		expect(h.generateLiveShare).not.toHaveBeenCalled();
+		await setShareAccessModal(io, CTX, "public");
+		expect(h.patchShareAudience).toHaveBeenCalledWith("/repo", "feature/x", "KEY", { visibility: "public" }, undefined);
+	});
+
+	it("does not PATCH when the tier is unchanged", async () => {
+		h.getShare.mockResolvedValue(MEMBER_RECORD); // org
+		const io = makeIO();
+		await setShareAccessModal(io, CTX, "org");
+		expect(h.patchShareAudience).not.toHaveBeenCalled();
+	});
+
+	it("selecting people on a link with no recipients stops it (dead owner-only link)", async () => {
+		h.getShare.mockResolvedValue({ ...MEMBER_RECORD, visibility: "public", recipients: undefined });
+		const io = makeIO();
+		await setShareAccessModal(io, CTX, "people");
+		expect(h.revokeShare).toHaveBeenCalledWith("/repo", "feature/x", "KEY", undefined);
+		expect(io.notifyInfo).toHaveBeenCalledWith(expect.stringContaining("no one was invited"));
+	});
+
+	it("reports set-access failures and keeps the modal ready", async () => {
+		h.getShare.mockResolvedValue(MEMBER_RECORD);
+		h.patchShareAudience.mockRejectedValue(new Error("audience rejected"));
+		const io = makeIO();
+		await setShareAccessModal(io, CTX, "people");
+		expect(io.notifyError).toHaveBeenCalledWith("Couldn't update who can open this link: audience rejected");
 		expect(io.states.at(-1)).toMatchObject({ kind: "ready" });
 	});
 
-	it("errors (not stuck loading) when the record vanished mid-update", async () => {
-		h.setBranchShareExpiry.mockResolvedValue(NEW_EXPIRES);
-		h.getBranchShare.mockResolvedValue(undefined);
+	it("preserves the error pane when a lazy mint from the access dropdown fails (no ready clobber)", async () => {
+		h.getShare.mockResolvedValue(undefined); // no link yet
+		h.generateLiveShare.mockRejectedValue(new NothingToShareError("nothing here"));
 		const io = makeIO();
-		await setShareExpiryModal(io, CTX, NEW_EXPIRES);
-		expect(io.states.at(-1)).toMatchObject({ kind: "error", message: expect.stringContaining("no longer available") });
+		await setShareAccessModal(io, CTX, "public");
+		expect(h.generateLiveShare).toHaveBeenCalledWith(expect.objectContaining({ visibility: "public" }));
+		// generate() posted the error pane; setShareAccessModal must NOT overwrite it with a ready render.
+		expect(io.states.at(-1)).toMatchObject({ kind: "error" });
 	});
 });
 
-describe("setShareVisibilityModal", () => {
-	it("needsApiKey guard", async () => {
+describe("sendInviteModal", () => {
+	it("sends invites, grants access, and mirrors the merged allowlist", async () => {
+		h.getShare.mockResolvedValue(MEMBER_RECORD);
+		h.sendShareInviteAndGrantAccess.mockResolvedValue({ sent: ["cy@example.com"], failed: [] });
 		const io = makeIO();
-		await setShareVisibilityModal(io, { ...CTX, apiKey: undefined }, "org");
-		expect(io.states).toEqual([{ kind: "needsApiKey" }]);
-		expect(h.setBranchShareVisibility).not.toHaveBeenCalled();
+		await sendInviteModal(io, CTX, ["CY@example.com", "ada@example.com", "cy@example.com"]);
+		expect(h.sendShareInviteAndGrantAccess).toHaveBeenCalledWith(undefined, "KEY", "mem", {
+			recipients: ["cy@example.com"],
+		});
+		expect(h.putBranchShare).toHaveBeenCalledWith(
+			"/repo",
+			"feature/x",
+			expect.objectContaining({ recipients: ["bo@example.com", "cy@example.com"] }),
+			undefined,
+		);
+		expect(io.notifyInfo).toHaveBeenCalledWith(expect.stringContaining("Invite sent"));
 	});
 
-	it("PATCHes the visibility (no regenerate) and re-renders ready", async () => {
-		h.setBranchShareVisibility.mockResolvedValue("org");
-		h.getBranchShare.mockResolvedValue({ ...RECORD, visibility: "org" });
+	it("merges into an empty allowlist and pluralizes the toast for multiple invitees", async () => {
+		h.getShare.mockResolvedValue({ ...MEMBER_RECORD, recipients: undefined });
+		h.sendShareInviteAndGrantAccess.mockResolvedValue({ sent: ["a@x.com", "b@x.com"], failed: [] });
 		const io = makeIO();
-		await setShareVisibilityModal(io, CTX, "org");
-		expect(h.setBranchShareVisibility).toHaveBeenCalledWith("/repo", "feature/x", "KEY", "org", undefined, undefined);
+		await sendInviteModal(io, CTX, ["a@x.com", "b@x.com"]);
+		expect(h.putBranchShare).toHaveBeenCalledWith(
+			"/repo",
+			"feature/x",
+			expect.objectContaining({ recipients: ["a@x.com", "b@x.com"] }),
+			undefined,
+		);
+		expect(io.notifyInfo).toHaveBeenCalledWith("Invite sent to 2 people.");
+	});
+
+	it("tightens a public link to people before inviting", async () => {
+		h.getShare
+			.mockResolvedValueOnce(PUBLIC_RECORD) // read: currently public
+			.mockResolvedValueOnce({ ...MEMBER_RECORD, visibility: "people", recipients: [] }); // after the flip
+		h.patchShareAudience.mockResolvedValue({ ...MEMBER_RECORD, visibility: "people", recipients: [] });
+		h.sendShareInviteAndGrantAccess.mockResolvedValue({ sent: ["cy@example.com"], failed: [] });
+		const io = makeIO();
+		await sendInviteModal(io, CTX, ["cy@example.com"]);
 		expect(h.generateLiveShare).not.toHaveBeenCalled();
-		expect(io.states.at(-1)).toMatchObject({ kind: "ready", visibility: "org" });
-	});
-
-	it("people: PATCHes visibility + recipients and renders the added people as collaborators", async () => {
-		h.setBranchShareVisibility.mockResolvedValue("people");
-		h.getBranchShare.mockResolvedValue({ ...RECORD, visibility: "people", recipients: ["bo@example.com"] });
-		const io = makeIO();
-		await setShareVisibilityModal(io, CTX, "people", ["bo@example.com"]);
-		expect(h.setBranchShareVisibility).toHaveBeenCalledWith("/repo", "feature/x", "KEY", "people", undefined, [
-			"bo@example.com",
-		]);
-		expect(h.markPublicConfirmed).not.toHaveBeenCalled();
-		expect(io.states.at(-1)).toMatchObject({
-			kind: "ready",
-			visibility: "people",
-			recipients: ["bo@example.com"],
-			collaborators: [
-				{ name: "Ada", email: "ada@example.com", isOwner: true },
-				{ name: "Bo", email: "bo@example.com", isOwner: false },
-			],
+		expect(h.patchShareAudience).toHaveBeenCalledWith("/repo", "feature/x", "KEY", { visibility: "people" }, undefined);
+		expect(h.sendShareInviteAndGrantAccess).toHaveBeenCalledWith(undefined, "KEY", "mem", {
+			recipients: ["cy@example.com"],
 		});
 	});
 
-	it("records the public ack when switching to public (no separate confirm pane)", async () => {
-		h.setBranchShareVisibility.mockResolvedValue("public");
-		h.getBranchShare.mockResolvedValue(RECORD);
+	it("reports the emails that couldn't be mailed while keeping access granted", async () => {
+		h.getShare.mockResolvedValue(MEMBER_RECORD);
+		h.sendShareInviteAndGrantAccess.mockResolvedValue({ sent: [], failed: ["down@x.com"] });
 		const io = makeIO();
-		await setShareVisibilityModal(io, CTX, "public");
-		expect(h.markPublicConfirmed).toHaveBeenCalledWith("/repo", "feature/x");
+		await sendInviteModal(io, CTX, ["down@x.com"]);
+		expect(io.notifyError).toHaveBeenCalledWith(expect.stringContaining("down@x.com"));
 	});
 
-	it("does NOT record a public ack when switching to org", async () => {
-		h.setBranchShareVisibility.mockResolvedValue("org");
-		h.getBranchShare.mockResolvedValue({ ...RECORD, visibility: "org" });
+	it("surfaces a non-Error rejection from the invite call as a string message", async () => {
+		h.getShare.mockResolvedValue(MEMBER_RECORD);
+		h.sendShareInviteAndGrantAccess.mockRejectedValue("smtp exploded"); // not an Error instance
 		const io = makeIO();
-		await setShareVisibilityModal(io, CTX, "org");
-		expect(h.markPublicConfirmed).not.toHaveBeenCalled();
+		await sendInviteModal(io, CTX, ["cy@example.com"]);
+		expect(io.notifyError).toHaveBeenCalledWith(expect.stringContaining("smtp exploded"));
 	});
 
-	it("on PATCH failure: toasts the error and re-renders the still-valid link", async () => {
-		// Reject with a non-Error value to exercise the String(err) formatting path.
-		h.setBranchShareVisibility.mockRejectedValue("plain-string-boom");
-		h.getBranchShare.mockResolvedValue(RECORD);
+	it("mints a people link before sending the first invite", async () => {
+		h.getShare.mockResolvedValueOnce(undefined).mockResolvedValueOnce({ ...MEMBER_RECORD, visibility: "people" });
+		h.sendShareInviteAndGrantAccess.mockResolvedValue({ sent: ["cy@example.com"], failed: [] });
 		const io = makeIO();
-		await setShareVisibilityModal(io, CTX, "org");
-		expect(io.notifyError).toHaveBeenCalledWith(expect.stringContaining("plain-string-boom"));
+		await sendInviteModal(io, CTX, ["cy@example.com"], "  welcome in  ");
+		expect(h.generateLiveShare).toHaveBeenCalledWith(expect.objectContaining({ visibility: "people" }));
+		expect(h.sendShareInviteAndGrantAccess).toHaveBeenCalledWith(undefined, "KEY", "mem", {
+			recipients: ["cy@example.com"],
+			message: "welcome in",
+		});
+	});
+
+	it("mints at the selected 'org' tier on the first invite (not people-only)", async () => {
+		h.getShare.mockResolvedValueOnce(undefined).mockResolvedValueOnce({ ...MEMBER_RECORD, visibility: "org" });
+		h.sendShareInviteAndGrantAccess.mockResolvedValue({ sent: ["cy@example.com"], failed: [] });
+		const io = makeIO();
+		await sendInviteModal(io, CTX, ["cy@example.com"], undefined, "org");
+		// The user had "Anyone at jolliai" selected → the link is minted at `org`,
+		// with the invitee layered on (grants union), not silently people-only.
+		expect(h.generateLiveShare).toHaveBeenCalledWith(expect.objectContaining({ visibility: "org" }));
+	});
+
+	it("revokes a newly minted invite link when the invite endpoint fails", async () => {
+		h.getShare.mockResolvedValueOnce(undefined).mockResolvedValueOnce({ ...MEMBER_RECORD, visibility: "people", recipients: [] });
+		h.sendShareInviteAndGrantAccess.mockRejectedValue(new Error("invite api down"));
+		const io = makeIO();
+		await sendInviteModal(io, CTX, ["cy@example.com"]);
+		expect(h.generateLiveShare).toHaveBeenCalledWith(expect.objectContaining({ visibility: "people" }));
+		expect(h.revokeShare).toHaveBeenCalledWith("/repo", "feature/x", "KEY", undefined);
+		expect(io.notifyError).toHaveBeenCalledWith("Couldn't send the invite: invite api down");
+	});
+
+	it("restores public access when invite fails after tightening a public link", async () => {
+		h.getShare
+			.mockResolvedValueOnce(PUBLIC_RECORD)
+			.mockResolvedValueOnce({ ...MEMBER_RECORD, visibility: "people", recipients: [] });
+		h.patchShareAudience.mockResolvedValue({ ...MEMBER_RECORD, visibility: "people", recipients: [] });
+		h.sendShareInviteAndGrantAccess.mockRejectedValue(new Error("invite api down"));
+		const io = makeIO();
+		await sendInviteModal(io, CTX, ["cy@example.com"]);
+		expect(h.patchShareAudience).toHaveBeenNthCalledWith(
+			1,
+			"/repo",
+			"feature/x",
+			"KEY",
+			{ visibility: "people" },
+			undefined,
+		);
+		expect(h.patchShareAudience).toHaveBeenNthCalledWith(
+			2,
+			"/repo",
+			"feature/x",
+			"KEY",
+			{ visibility: "public" },
+			undefined,
+		);
+	});
+
+	it("tightens an existing org link to people before inviting when people is selected", async () => {
+		h.getShare
+			.mockResolvedValueOnce({ ...MEMBER_RECORD, visibility: "org", recipients: [] }) // live org link
+			.mockResolvedValueOnce({ ...MEMBER_RECORD, visibility: "people", recipients: [] }); // after the flip
+		h.patchShareAudience.mockResolvedValue({ ...MEMBER_RECORD, visibility: "people", recipients: [] });
+		h.sendShareInviteAndGrantAccess.mockResolvedValue({ sent: ["cy@example.com"], failed: [] });
+		const io = makeIO();
+		await sendInviteModal(io, CTX, ["cy@example.com"], undefined, "people");
+		expect(h.generateLiveShare).not.toHaveBeenCalled();
+		expect(h.patchShareAudience).toHaveBeenCalledWith("/repo", "feature/x", "KEY", { visibility: "people" }, undefined);
+		expect(h.sendShareInviteAndGrantAccess).toHaveBeenCalledWith(undefined, "KEY", "mem", {
+			recipients: ["cy@example.com"],
+		});
+	});
+
+	it("does not re-tier when the invite tier already matches the live link (org + org)", async () => {
+		h.getShare.mockResolvedValue({ ...MEMBER_RECORD, visibility: "org" });
+		h.sendShareInviteAndGrantAccess.mockResolvedValue({ sent: ["cy@example.com"], failed: [] });
+		const io = makeIO();
+		await sendInviteModal(io, CTX, ["cy@example.com"], undefined, "org");
+		expect(h.patchShareAudience).not.toHaveBeenCalled();
+	});
+
+	it("rolls back to the ORIGINAL tier (org) when invite fails after tightening org→people", async () => {
+		h.getShare
+			.mockResolvedValueOnce({ ...MEMBER_RECORD, visibility: "org", recipients: [] })
+			.mockResolvedValueOnce({ ...MEMBER_RECORD, visibility: "people", recipients: [] });
+		h.patchShareAudience.mockResolvedValue({ ...MEMBER_RECORD, visibility: "people", recipients: [] });
+		h.sendShareInviteAndGrantAccess.mockRejectedValue(new Error("invite api down"));
+		const io = makeIO();
+		await sendInviteModal(io, CTX, ["cy@example.com"], undefined, "people");
+		expect(h.patchShareAudience).toHaveBeenNthCalledWith(1, "/repo", "feature/x", "KEY", { visibility: "people" }, undefined);
+		expect(h.patchShareAudience).toHaveBeenNthCalledWith(2, "/repo", "feature/x", "KEY", { visibility: "org" }, undefined);
+	});
+
+	it("stops invite flow when link generation fails", async () => {
+		h.generateLiveShare.mockRejectedValue(new Error("space unavailable"));
+		const io = makeIO();
+		await sendInviteModal(io, CTX, ["cy@example.com"]);
+		expect(io.states.at(-1)).toEqual({ kind: "error", message: "Could not create share link: space unavailable" });
+		// The webview closed the popover optimistically, so a toast is the only visible channel.
+		expect(io.notifyError).toHaveBeenCalledWith(expect.stringContaining("Couldn't create the share link"));
+		expect(h.sendShareInviteAndGrantAccess).not.toHaveBeenCalled();
+	});
+
+	it("reports an error when a generated link is still missing its share id", async () => {
+		h.getShare.mockResolvedValueOnce(undefined).mockResolvedValueOnce({ ...MEMBER_RECORD, shareId: "" });
+		const io = makeIO();
+		await sendInviteModal(io, CTX, ["cy@example.com"]);
+		expect(io.notifyError).toHaveBeenCalledWith("The link could not be created — please try again.");
+		expect(h.sendShareInviteAndGrantAccess).not.toHaveBeenCalled();
+	});
+
+	it("reports invite mail failures after mirroring granted access", async () => {
+		h.getShare.mockResolvedValue(MEMBER_RECORD);
+		h.sendShareInviteAndGrantAccess.mockResolvedValue({ sent: [], failed: ["cy@example.com"] });
+		const io = makeIO();
+		await sendInviteModal(io, CTX, ["cy@example.com"]);
+		expect(h.putBranchShare).toHaveBeenCalledWith(
+			"/repo",
+			"feature/x",
+			expect.objectContaining({ recipients: ["bo@example.com", "cy@example.com"] }),
+			undefined,
+		);
+		expect(io.notifyError).toHaveBeenCalledWith("Access granted, but the email couldn't be sent to: cy@example.com");
+	});
+
+	it("reports invite endpoint failures and keeps the modal ready", async () => {
+		h.getShare.mockResolvedValue(MEMBER_RECORD);
+		h.sendShareInviteAndGrantAccess.mockRejectedValue(new Error("smtp down"));
+		const io = makeIO();
+		await sendInviteModal(io, CTX, ["cy@example.com"]);
+		expect(io.notifyError).toHaveBeenCalledWith("Couldn't send the invite: smtp down");
 		expect(io.states.at(-1)).toMatchObject({ kind: "ready" });
 	});
 
-	it("errors when the record vanished mid-update", async () => {
-		h.setBranchShareVisibility.mockResolvedValue("org");
-		h.getBranchShare.mockResolvedValue(undefined);
+	it("shows needsApiKey before sending invites", async () => {
 		const io = makeIO();
-		await setShareVisibilityModal(io, CTX, "org");
-		expect(io.states.at(-1)).toMatchObject({ kind: "error", message: expect.stringContaining("no longer available") });
+		await sendInviteModal(io, { ...CTX, apiKey: undefined }, ["cy@example.com"]);
+		expect(io.states).toEqual([{ kind: "needsApiKey" }]);
+		expect(h.getShare).not.toHaveBeenCalled();
+	});
+
+	it("asks for at least one non-owner recipient", async () => {
+		const io = makeIO();
+		await sendInviteModal(io, CTX, [" ", "ADA@example.com"]);
+		expect(io.notifyError).toHaveBeenCalledWith("Add at least one person to invite.");
+		expect(h.sendShareInviteAndGrantAccess).not.toHaveBeenCalled();
+		expect(io.states.at(-1)).toMatchObject({ kind: "ready" });
 	});
 });
 
-describe("shareModalTarget", () => {
-	it("opens the page", async () => {
-		h.getBranchShare.mockResolvedValue({ shareUrl: URL });
+describe("removeRecipientModal", () => {
+	it("shows needsApiKey before removing a recipient", async () => {
 		const io = makeIO();
-		await shareModalTarget(io, CTX, "page");
-		expect(io.openUrl).toHaveBeenCalledWith(URL);
+		await removeRecipientModal(io, { ...CTX, apiKey: undefined }, "bo@example.com");
+		expect(io.states).toEqual([{ kind: "needsApiKey" }]);
+		expect(h.getShare).not.toHaveBeenCalled();
 	});
 
-	it("composes an email with the live picker selection (ctx.recipients)", async () => {
-		h.getBranchShare.mockResolvedValue({ shareUrl: URL, decisionCount: 4, titles: ["A", "B"] });
+	it("patches the remaining recipients", async () => {
+		h.getShare.mockResolvedValue({ ...MEMBER_RECORD, visibility: "org", recipients: ["bo@example.com", "cy@example.com"] });
 		const io = makeIO();
-		await shareModalTarget(io, { ...CTX, recipients: ["ctx@x.com"] }, "email");
-		expect(io.composeEmail).toHaveBeenCalledWith("feature/x", URL, 4, ["A", "B"], ["ctx@x.com"]);
+		await removeRecipientModal(io, CTX, "bo@example.com");
+		expect(h.patchShareAudience).toHaveBeenCalledWith(
+			"/repo",
+			"feature/x",
+			"KEY",
+			{ recipients: ["cy@example.com"] },
+			undefined,
+		);
 	});
 
-	it("ignores any recipients stored on the record — recipients are session-only", async () => {
-		h.getBranchShare.mockResolvedValue({ shareUrl: URL, recipients: ["stored@x.com"] });
+	it("reports remove-recipient patch failures", async () => {
+		h.getShare.mockResolvedValue({ ...MEMBER_RECORD, visibility: "org", recipients: ["bo@example.com", "cy@example.com"] });
+		h.patchShareAudience.mockRejectedValue(new Error("patch failed"));
 		const io = makeIO();
-		await shareModalTarget(io, CTX, "email"); // CTX.recipients === []
-		expect(io.composeEmail).toHaveBeenCalledWith("feature/x", URL, 0, [], []);
+		await removeRecipientModal(io, CTX, "bo@example.com");
+		expect(io.notifyError).toHaveBeenCalledWith("Couldn't remove bo@example.com: patch failed");
+		expect(io.states.at(-1)).toMatchObject({ kind: "ready" });
 	});
 
-	it("copies a message with the branch's decision count + titles", async () => {
-		h.getBranchShare.mockResolvedValue({ shareUrl: URL, decisionCount: 4, titles: ["A"] });
+	it("no-ops when there is no link", async () => {
+		h.getShare.mockResolvedValue(undefined);
 		const io = makeIO();
-		await shareModalTarget(io, CTX, "copy");
-		expect(io.copyMessage).toHaveBeenCalledWith("feature/x", URL, 4, ["A"]);
-		expect(io.composeEmail).not.toHaveBeenCalled();
+		await removeRecipientModal(io, CTX, "bo@example.com");
+		expect(h.patchShareAudience).not.toHaveBeenCalled();
+		expect(h.revokeShare).not.toHaveBeenCalled();
+		expect(io.states.at(-1)).toMatchObject({ kind: "ready" });
 	});
 
-	it("delegates a social platform to openSocial", async () => {
-		h.getBranchShare.mockResolvedValue({ shareUrl: URL, decisionCount: 4, titles: ["A"] });
+	it("removing from an org link with no allowlist patches an empty list (org stays live)", async () => {
+		h.getShare.mockResolvedValue({ ...MEMBER_RECORD, visibility: "org", recipients: undefined });
 		const io = makeIO();
-		await shareModalTarget(io, CTX, "x");
-		expect(io.openSocial).toHaveBeenCalledWith("x", "feature/x", URL, 4, ["A"]);
-		expect(io.openUrl).not.toHaveBeenCalled();
+		await removeRecipientModal(io, CTX, "nobody@example.com");
+		expect(h.patchShareAudience).toHaveBeenCalledWith("/repo", "feature/x", "KEY", { recipients: [] }, undefined);
 	});
 
-	it("does nothing when there is no stored share", async () => {
-		h.getBranchShare.mockResolvedValue(undefined);
+	it("removing the last people recipient stops the link", async () => {
+		h.getShare.mockResolvedValue({ ...MEMBER_RECORD, visibility: "people", recipients: ["bo@example.com"] });
 		const io = makeIO();
-		await shareModalTarget(io, CTX, "page");
-		expect(io.openUrl).not.toHaveBeenCalled();
-		expect(io.composeEmail).not.toHaveBeenCalled();
-	});
-
-	it("refuses to act on an expired link and surfaces an error", async () => {
-		h.getBranchShare.mockResolvedValue({ shareUrl: URL, expiresAt: "2020-01-01T00:00:00.000Z" });
-		const io = makeIO();
-		await shareModalTarget(io, { ...CTX, nowMs: NOW_MS }, "page");
-		expect(io.openUrl).not.toHaveBeenCalled();
-		expect(io.states.at(-1)).toMatchObject({ kind: "error", message: expect.stringContaining("expired") });
-	});
-
-	it("refuses to open/copy a cached share URL from an untrusted origin", async () => {
-		h.getBranchShare.mockResolvedValue({ shareUrl: "vscode://evil" });
-		const io = makeIO();
-		await shareModalTarget(io, CTX, "copy");
-		expect(io.copyMessage).not.toHaveBeenCalled();
-		expect(io.openUrl).not.toHaveBeenCalled();
-		expect(io.states.at(-1)).toMatchObject({ kind: "error", message: expect.stringContaining("not trusted") });
+		await removeRecipientModal(io, CTX, "bo@example.com");
+		expect(h.revokeShare).toHaveBeenCalledWith("/repo", "feature/x", "KEY", undefined);
 	});
 });
+

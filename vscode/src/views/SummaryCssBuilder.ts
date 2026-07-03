@@ -1587,7 +1587,18 @@ export function buildCss(): string {
   .share-icon { vertical-align: -2px; margin-right: 2px; flex: 0 0 auto; }
   .share-modal-sub { color: var(--text-secondary); font-size: 0.85em; margin: 0 0 14px; }
   .share-pane[hidden] { display: none; }
-  .share-modal-actions { display: flex; gap: 8px; align-items: center; margin-top: 16px; }
+  /* Invite footer: Cancel/Send right-aligned (mockup .sp-send-foot). Main footer:
+     the lone Copy link sits LEFT (mockup .sp-foot); Stop is a subtle text link right. */
+  .share-modal-actions { display: flex; gap: 8px; align-items: center; justify-content: flex-end; margin-top: 16px; }
+  .share-actions-main { justify-content: flex-start; }
+  /* In-page copy confirmation toast (mockup) — fixed pill, auto-fades */
+  .share-toast { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%) translateY(8px); z-index: 1200; background: var(--vscode-editorWidget-background, #252526); color: var(--vscode-foreground); border: 1px solid var(--vscode-widget-border, var(--vscode-editorGroup-border)); border-radius: 6px; padding: 7px 14px; font-size: 0.85em; box-shadow: 0 6px 18px rgba(0,0,0,0.4); opacity: 0; pointer-events: none; transition: opacity 0.15s ease, transform 0.15s ease; }
+  .share-toast.on { opacity: 1; transform: translateX(-50%) translateY(0); }
+  /* Share-card buttons inherit the global .action-btn styles (theme button colors):
+     primary = --vscode-button-background, secondary = the secondary button pair. */
+  /* Invite mode swaps the whole card into the compose step (mockup .sending): the
+     popover's own title/subtitle disappear, "Send invite" becomes the header. */
+  .share-modal.inviting .share-modal-head, .share-modal.inviting .share-modal-sub { display: none; }
   /* Sync status badge */
   .share-sync-badge { flex: 0 0 auto; font-size: 0.72em; font-weight: 700; letter-spacing: 0.05em; padding: 2px 9px; border-radius: 10px; }
   .share-sync-badge[hidden] { display: none; }
@@ -1597,15 +1608,44 @@ export function buildCss(): string {
   .share-search-wrap { position: relative; margin-bottom: 14px; }
   .share-search { display: block; width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-editorGroup-border)); border-radius: 6px; padding: 7px 10px; font-family: var(--vscode-font-family); font-size: 0.85em; }
   .share-search:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
-  .share-suggest { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 5; max-height: 200px; overflow-y: auto; background: var(--vscode-dropdown-background); border: 1px solid var(--vscode-dropdown-border, var(--vscode-editorGroup-border)); border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+  /* Inline (static) suggestion panel — it pushes content down instead of overlaying it (mockup). */
+  .share-suggest { position: static; margin-top: 5px; max-height: 160px; overflow-y: auto; background: var(--vscode-dropdown-background); border: 1px solid var(--vscode-dropdown-border, var(--vscode-editorGroup-border)); border-radius: 6px; }
+  .share-suggest .share-avatar { width: 24px; height: 24px; font-size: 0.62em; }
+  .share-suggest-item { align-items: center; }
   .share-suggest[hidden] { display: none; }
   .share-suggest-item { display: flex; align-items: baseline; gap: 8px; width: 100%; box-sizing: border-box; text-align: left; background: none; border: none; padding: 7px 10px; cursor: pointer; font-family: var(--vscode-font-family); font-size: 0.85em; color: var(--vscode-foreground); }
   .share-suggest-item:hover { background: var(--vscode-list-hoverBackground); }
   .share-suggest-name { font-weight: 600; }
   .share-suggest-email { color: var(--text-secondary); font-size: 0.92em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .share-suggest-add { color: var(--vscode-textLink-foreground); }
+  .share-suggest-group { padding: 7px 10px 3px; font-size: 0.68em; font-weight: 700; letter-spacing: 0.07em; color: var(--text-secondary); text-transform: uppercase; position: sticky; top: 0; background: var(--vscode-dropdown-background); }
   .share-section-label { font-size: 0.72em; font-weight: 700; letter-spacing: 0.07em; color: var(--text-secondary); margin: 0 0 8px; }
-  /* Collaborators (visual mock) */
+  .share-label-soft { font-weight: 400; letter-spacing: normal; text-transform: none; }
+  /* General access (select decides which coexisting link Copy targets) */
+  .share-access-row { display: flex; align-items: center; gap: 8px; }
+  .share-access-icon { flex: 0 0 auto; color: var(--text-secondary); }
+  .share-access-row .share-select { flex: 1 1 auto; }
+  .share-select { display: block; width: 100%; box-sizing: border-box; background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border, var(--vscode-editorGroup-border)); border-radius: 6px; padding: 7px 9px; font-family: var(--vscode-font-family); font-size: 0.85em; cursor: pointer; }
+  .share-select:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+  .share-access-sub { color: var(--text-secondary); font-size: 0.8em; margin: 6px 0 14px; }
+  /* Send-invite pane */
+  .share-invite-head { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
+  .share-invite-back { background: none; border: none; color: var(--vscode-foreground); font-size: 1.3em; line-height: 1; cursor: pointer; padding: 2px 8px; border-radius: 4px; }
+  .share-invite-back:hover { background: var(--vscode-toolbar-hoverBackground); }
+  .share-invite-title { font-size: 1em; font-weight: 650; }
+  /* TO recipients: full-width stacked row cards (avatar + name/email + External + remove) */
+  .share-chips { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; max-height: 168px; overflow-y: auto; }
+  .share-recip { display: flex; align-items: center; gap: 9px; padding: 5px 7px; border: 1px solid var(--vscode-widget-border, var(--vscode-editorGroup-border)); border-radius: 7px; background: var(--vscode-editor-background); }
+  .share-recip-main { display: flex; flex-direction: column; min-width: 0; flex: 1; line-height: 1.25; }
+  .share-recip-name { font-size: 0.88em; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .share-recip-email { font-size: 0.78em; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .share-recip-x { flex: 0 0 auto; background: none; border: none; color: var(--text-secondary); font-size: 1.05em; line-height: 1; cursor: pointer; padding: 2px 6px; border-radius: 4px; }
+  .share-recip-x:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+  .share-invite-empty { color: var(--text-secondary); font-size: 0.8em; margin: 4px 2px; }
+  .share-invite-message { display: block; width: 100%; box-sizing: border-box; resize: vertical; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-editorGroup-border)); border-radius: 6px; padding: 7px 10px; font-family: var(--vscode-font-family); font-size: 0.85em; margin-bottom: 8px; }
+  .share-invite-message:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+  .share-invite-foot { color: var(--text-secondary); font-size: 0.8em; margin: 0; }
+  /* Invited people rows (member block + invite TO list) */
   .share-collab-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 16px; max-height: 168px; overflow-y: auto; }
   .share-collab-row { display: flex; align-items: center; gap: 10px; padding: 5px 4px; }
   .share-collab-row[hidden] { display: none; }
@@ -1614,15 +1654,14 @@ export function buildCss(): string {
   .share-collab-name { font-size: 0.88em; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .share-collab-email { font-size: 0.78em; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .share-collab-role { flex: 0 0 auto; color: var(--text-secondary); font-size: 0.8em; }
-  .share-collab-remove { flex: 0 0 auto; background: none; border: none; color: var(--text-secondary); font-size: 1.05em; line-height: 1; cursor: pointer; padding: 2px 6px; border-radius: 4px; }
-  .share-collab-remove:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
-  /* General access */
-  .share-access-row { display: flex; align-items: center; gap: 8px; }
-  .share-access-icon { flex: 0 0 auto; color: var(--text-secondary); }
-  .share-access-row .share-select { flex: 1 1 auto; }
-  .share-select { display: block; width: 100%; box-sizing: border-box; background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border, var(--vscode-editorGroup-border)); border-radius: 6px; padding: 7px 9px; font-family: var(--vscode-font-family); font-size: 0.85em; cursor: pointer; }
-  .share-select:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
-  .share-access-sub { color: var(--text-secondary); font-size: 0.8em; margin: 6px 0 14px; }
+  /* Per-person "Manage access" ellipsis menu (mockup) */
+  .share-role-wrap { flex: 0 0 auto; position: relative; }
+  .share-collab-menu-btn { background: none; border: none; color: var(--text-secondary); font-size: 1.1em; line-height: 1; cursor: pointer; padding: 2px 6px; border-radius: 4px; }
+  .share-collab-menu-btn:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+  .share-role-menu { position: absolute; right: 0; top: calc(100% + 2px); z-index: 6; background: var(--vscode-dropdown-background); border: 1px solid var(--vscode-dropdown-border, var(--vscode-editorGroup-border)); border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); padding: 3px; }
+  .share-role-menu[hidden] { display: none; }
+  .share-role-menu button { display: block; width: 100%; text-align: left; white-space: nowrap; background: none; border: none; color: var(--vscode-errorForeground); font-family: inherit; font-size: 0.85em; padding: 5px 10px; border-radius: 4px; cursor: pointer; }
+  .share-role-menu button:hover { background: var(--vscode-list-hoverBackground); }
   /* "What travels" banner */
   .share-travel-banner { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: 8px; background: var(--vscode-textBlockQuote-background, rgba(127,127,127,0.06)); font-size: 0.83em; line-height: 1.5; margin-bottom: 12px; }
   .share-travel-icon { flex: 0 0 auto; color: var(--vscode-textLink-foreground); font-size: 1.05em; }
@@ -1630,7 +1669,6 @@ export function buildCss(): string {
   .share-transcript-opt { display: flex; align-items: center; gap: 8px; font-size: 0.85em; color: var(--text-secondary); cursor: not-allowed; }
   .share-transcript-opt input { margin: 0; }
   .share-optin-badge { font-size: 0.7em; font-weight: 700; letter-spacing: 0.04em; padding: 1px 6px; border-radius: 4px; background: rgba(127,127,127,0.16); color: var(--text-secondary); text-transform: uppercase; }
-  .share-link-hidden { position: absolute; opacity: 0; pointer-events: none; height: 0; width: 0; }
   /* Shared panes (loading / error / no-key) */
   .share-loading { display: flex; align-items: center; gap: 10px; color: var(--text-secondary); }
   .share-spinner { width: 14px; height: 14px; border: 2px solid var(--text-secondary); border-top-color: transparent; border-radius: 50%; animation: share-spin 0.8s linear infinite; }

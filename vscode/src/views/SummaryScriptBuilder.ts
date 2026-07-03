@@ -154,6 +154,10 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
   function sharePane(id) {
     var panes = document.querySelectorAll('.share-pane');
     for (var i = 0; i < panes.length; i++) { panes[i].hidden = (panes[i].id !== id); }
+    // A pane swap changes the card's height — drop any leftover inner scroll so the
+    // new pane always shows from its top (a stale scroll made the card look broken).
+    var card = shareOverlay ? shareOverlay.querySelector('.share-modal') : null;
+    if (card) { card.scrollTop = 0; }
   }
   // Anchor the card under the Share button — the overlay is a transparent full-screen
   // click-catcher with no DOM relationship to the button, so position it in JS.
@@ -163,16 +167,25 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
     if (!card) { return; }
     var r = shareBtn.getBoundingClientRect();
     // The Share button is left-aligned in the header, so open the card RIGHTWARD from
-    // the button's left edge; clamp to the viewport so it never overflows (which looked
-    // like the sidebar was covering half of it).
+    // the button's left edge; clamp BOTH axes to the viewport so the card can never
+    // detach off-screen (e.g. after a scroll or a pane swap that changes its height).
     var cardW = card.offsetWidth || 440;
+    var cardH = card.offsetHeight || 300;
     var maxLeft = Math.max(8, window.innerWidth - cardW - 8);
     var left = Math.min(Math.max(8, Math.round(r.left)), maxLeft);
-    card.style.top = Math.round(r.bottom + 6) + 'px';
+    var maxTop = Math.max(8, window.innerHeight - cardH - 8);
+    var top = Math.min(Math.max(8, Math.round(r.bottom + 6)), maxTop);
+    card.style.top = top + 'px';
     card.style.left = left + 'px';
     card.style.right = 'auto';
   }
-  // Auto-sync on open: the host pushes + creates the live share and returns 'ready'.
+  // Keep the card glued to its anchor while the page scrolls under the fixed overlay
+  // (capture: the scroller is the document or any inner container).
+  document.addEventListener('scroll', function() {
+    if (shareOverlay && !shareOverlay.hidden) { sharePositionCard(); }
+  }, true);
+  // Lazy on open: the host only READS existing links (reconciling live branch
+  // shares) and returns 'ready' — nothing is created until Copy / invite / org-on.
   function shareOpen(kind) {
     if (!shareOverlay) { return; }
     shareKind = (kind === 'branch') ? 'branch' : 'commit';
@@ -212,12 +225,16 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
     if (e.key === 'Escape' && shareOverlay && !shareOverlay.hidden) { shareClose(); }
   });
 
-  // people-tier state: the current allowlist (added people's emails) and the search
-  // suggestion directory (org members + git contributors), both set on each render.
-  var shareRecipients = [];
-  var shareOrgMembers = [];
+  // Single-slot state: the subject's ONE link (access tier + invited people),
+  // plus the two suggestion groups. Set on each render.
+  var shareLink = null;              // { shareUrl, visibility: 'public'|'org'|'people', recipients[] } | null
+  var shareAccountMembers = [];      // "From your Jolli account" (site members)
+  var shareGitCollaborators = [];    // "From this repo" (git contributors)
+  var shareCanOrg = false;
   var shareOwnerEmail = '';
   var shareOwnerName = '';
+  var shareInvitePending = [];       // emails staged in the invite pane, sent on "Send invite"
+  var shareUserPickedTier = '';      // the access tier the user explicitly chose (preserved across re-renders while no link exists)
   function shareSetSyncBadge(mode) {
     var badge = document.getElementById('shareSyncBadge');
     if (!badge) { return; }
@@ -225,68 +242,22 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
     else if (mode === 'loading') { badge.textContent = 'SYNCING\\u2026'; badge.className = 'share-sync-badge syncing'; badge.hidden = false; }
     else { badge.hidden = true; }
   }
-  function shareAccessSubText(vis) {
-    if (vis === 'org') { return 'Anyone in the jolliai workspace can open this.'; }
-    if (vis === 'people') { return 'Only the people above can open this.'; }
-    return 'Anyone with the link can open this \\u2014 no account needed.';
-  }
-  // PATCH the audience (access level + current recipients) and drop to the SYNCING pane;
-  // the host re-renders 'ready' when the server confirms.
-  function shareSendAudience() {
-    var sel = document.getElementById('shareVisibilitySelect');
-    var vis = sel && sel.value ? sel.value : 'public';
-    // Stay on the main pane (the list was already updated optimistically) — just show the
-    // SYNCING badge while the host PATCHes; the authoritative 'ready' re-render follows.
-    shareSetSyncBadge('loading');
-    vscode.postMessage({ command: 'shareSetAudience', visibility: vis, recipients: shareRecipients.slice(), shareKind: shareKind });
-  }
-  function shareCreate() {
-    var sel = document.getElementById('shareCreateVisibilitySelect');
-    var vis = sel && sel.value ? sel.value : 'public';
-    shareSetSyncBadge('loading');
-    sharePane('sharePaneLoading');
-    vscode.postMessage({ command: 'shareCreate', visibility: vis, recipients: shareRecipients.slice(), shareKind: shareKind });
-  }
-  // Resolve a display name for an email from the directory (org members + contributors).
+  // Resolve a display name for an email from either suggestion group.
   function shareResolveName(email) {
     var lower = (email || '').toLowerCase();
-    for (var i = 0; i < shareOrgMembers.length; i++) {
-      if ((shareOrgMembers[i].email || '').toLowerCase() === lower) { return shareOrgMembers[i].name || email; }
+    var groups = [shareAccountMembers, shareGitCollaborators];
+    for (var g = 0; g < groups.length; g++) {
+      var arr = groups[g] || [];
+      for (var i = 0; i < arr.length; i++) {
+        if ((arr[i].email || '').toLowerCase() === lower) { return arr[i].name || email; }
+      }
     }
     return email;
   }
-  // Build the collaborator rows locally (owner + current recipients) for optimistic render.
-  function shareLocalCollabRows() {
-    var rows = [{ name: shareOwnerName || shareOwnerEmail, email: shareOwnerEmail, isOwner: true }];
-    var seen = {};
-    seen[(shareOwnerEmail || '').toLowerCase()] = true;
-    shareRecipients.forEach(function(e) {
-      var l = e.toLowerCase();
-      if (!seen[l]) { seen[l] = true; rows.push({ name: shareResolveName(e), email: e, isOwner: false }); }
-    });
-    return rows;
-  }
+  // Remove an invited person from the member link (server-side; no email involved).
   function shareRemoveRecipient(email) {
-    var lower = (email || '').toLowerCase();
-    shareRecipients = shareRecipients.filter(function(e) { return e.toLowerCase() !== lower; });
-    shareRenderCollaborators(shareLocalCollabRows()); // optimistic — reflect the removal immediately
-    shareSendAudience();
-  }
-  function shareAddRecipient(email) {
-    var e = (email || '').trim();
-    if (!e) { return; }
-    var lower = e.toLowerCase();
-    if (lower === (shareOwnerEmail || '').toLowerCase()) { return; }
-    if (shareRecipients.some(function(x) { return x.toLowerCase() === lower; })) { return; }
-    shareRecipients = shareRecipients.concat([e]);
-    // Adding someone means "Only people you add" — switch access to people so the
-    // allowlist actually gates (and persists server-side).
-    var sel = document.getElementById('shareVisibilitySelect');
-    if (sel) { sel.value = 'people'; }
-    var sub = document.getElementById('shareAccessSub');
-    if (sub) { sub.textContent = shareAccessSubText('people'); }
-    shareRenderCollaborators(shareLocalCollabRows()); // optimistic — show the new person immediately
-    shareSendAudience();
+    shareSetSyncBadge('loading');
+    vscode.postMessage({ command: 'shareRemoveRecipient', email: email, shareKind: shareKind });
   }
   function shareInitials(name, email) {
     var src = (name || '').trim() || (email || '').trim();
@@ -295,138 +266,346 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
     if (name && parts.length >= 2) { return (parts[0].charAt(0) + parts[1].charAt(0)).toUpperCase(); }
     return src.slice(0, 2).toUpperCase();
   }
-  // Renders the Collaborators list (owner + added recipients). Rows use textContent so
-  // names/emails can never inject HTML. Non-owner rows get a functional remove ("\\u00D7").
-  function shareRenderCollaborators(list) {
-    var box = document.getElementById('shareCollabList');
+  // Builds one person row (avatar + name + email). Rows use textContent so
+  // names/emails can never inject HTML. onRemove null = fixed Owner row.
+  function shareRowEl(name, email, isOwner, onRemove) {
+    var row = document.createElement('div');
+    row.className = 'share-collab-row';
+    var av = document.createElement('span');
+    av.className = 'share-avatar';
+    av.textContent = shareInitials(name, email);
+    var meta = document.createElement('div');
+    meta.className = 'share-collab-meta';
+    var nm = document.createElement('span');
+    nm.className = 'share-collab-name';
+    nm.textContent = (name || email) + (isOwner ? ' (you)' : '');
+    var em = document.createElement('span');
+    em.className = 'share-collab-email';
+    em.textContent = email || '';
+    meta.appendChild(nm); meta.appendChild(em);
+    row.appendChild(av); row.appendChild(meta);
+    if (isOwner) {
+      var role = document.createElement('span');
+      role.className = 'share-collab-role';
+      role.textContent = 'Owner';
+      row.appendChild(role);
+    } else if (onRemove) {
+      // Mockup: an ellipsis "Manage access" menu with a Remove-access item.
+      var wrap = document.createElement('span');
+      wrap.className = 'share-role-wrap';
+      var dots = document.createElement('button');
+      dots.type = 'button';
+      dots.className = 'share-collab-menu-btn';
+      dots.title = 'Manage access';
+      dots.setAttribute('aria-label', 'Manage access for ' + (email || ''));
+      dots.textContent = '\\u22EF';
+      var menu = document.createElement('div');
+      menu.className = 'share-role-menu';
+      menu.hidden = true;
+      var rm = document.createElement('button');
+      rm.type = 'button';
+      rm.textContent = 'Remove access';
+      rm.addEventListener('click', function(ev) { ev.stopPropagation(); onRemove(email); });
+      menu.appendChild(rm);
+      dots.addEventListener('click', function(ev) { ev.stopPropagation(); shareHideRoleMenus(menu); menu.hidden = !menu.hidden; });
+      wrap.appendChild(dots); wrap.appendChild(menu);
+      row.appendChild(wrap);
+    }
+    return row;
+  }
+  function shareHideRoleMenus(except) {
+    var menus = document.querySelectorAll('.share-role-menu');
+    for (var i = 0; i < menus.length; i++) { if (menus[i] !== except) { menus[i].hidden = true; } }
+  }
+  document.addEventListener('click', function() { shareHideRoleMenus(null); });
+  // Member block: the fixed Owner row + each invited person (server-confirmed).
+  function shareRenderInvited() {
+    var box = document.getElementById('shareInvitedList');
     if (!box) { return; }
     box.innerHTML = '';
-    (list || []).forEach(function(c) {
-      var row = document.createElement('div');
-      row.className = 'share-collab-row';
-      var av = document.createElement('span');
-      av.className = 'share-avatar';
-      av.textContent = shareInitials(c.name, c.email);
-      var meta = document.createElement('div');
-      meta.className = 'share-collab-meta';
-      var nm = document.createElement('span');
-      nm.className = 'share-collab-name';
-      nm.textContent = (c.name || c.email) + (c.isOwner ? ' (you)' : '');
-      var em = document.createElement('span');
-      em.className = 'share-collab-email';
-      em.textContent = c.email || '';
-      meta.appendChild(nm); meta.appendChild(em);
-      row.appendChild(av); row.appendChild(meta);
-      if (c.isOwner) {
-        var role = document.createElement('span');
-        role.className = 'share-collab-role';
-        role.textContent = 'Owner';
-        row.appendChild(role);
-      } else {
-        var rm = document.createElement('button');
-        rm.type = 'button';
-        rm.className = 'share-collab-remove';
-        rm.title = 'Remove ' + (c.email || '');
-        rm.setAttribute('aria-label', 'Remove ' + (c.email || ''));
-        rm.textContent = '\\u00D7';
-        rm.addEventListener('click', function() { shareRemoveRecipient(c.email); });
-        row.appendChild(rm);
-      }
-      box.appendChild(row);
+    box.appendChild(shareRowEl(shareOwnerName || shareOwnerEmail, shareOwnerEmail, true, null));
+    (shareLink && shareLink.recipients ? shareLink.recipients : []).forEach(function(e) {
+      box.appendChild(shareRowEl(shareResolveName(e), e, false, shareRemoveRecipient));
     });
   }
-  function shareHideSuggest() {
-    var s = document.getElementById('shareSuggest');
-    if (s) { s.hidden = true; s.innerHTML = ''; }
-  }
   var EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;
-  // Search → suggestions dropdown: matching directory members not already added, plus an
-  // "Add <email>" row for a valid, new email. Picking one adds it to the allowlist.
-  function shareRenderSuggest(q) {
-    var box = document.getElementById('shareSuggest');
-    if (!box) { return; }
-    box.innerHTML = '';
-    var query = (q || '').trim().toLowerCase();
-    if (!query) { box.hidden = true; return; }
+  // Emails that shouldn't be suggested again: the owner, already-invited people,
+  // and anything staged in the invite pane.
+  function shareExcludedEmails() {
     var inList = {};
-    shareRecipients.forEach(function(e) { inList[e.toLowerCase()] = true; });
     if (shareOwnerEmail) { inList[shareOwnerEmail.toLowerCase()] = true; }
-    var matches = (shareOrgMembers || []).filter(function(m) {
-      var hay = ((m.name || '') + ' ' + (m.email || '')).toLowerCase();
-      return hay.indexOf(query) !== -1 && !inList[(m.email || '').toLowerCase()];
-    }).slice(0, 6);
-    matches.forEach(function(m) {
+    (shareLink && shareLink.recipients ? shareLink.recipients : []).forEach(function(e) { inList[e.toLowerCase()] = true; });
+    shareInvitePending.forEach(function(e) { inList[e.toLowerCase()] = true; });
+    return inList;
+  }
+  // Grouped suggestions panel (inline, pushes content down), reusable for any
+  // (input, box) pair. Focus with an empty query shows the groups in full
+  // (scrollable, 100 per group); typing filters. Any typed address matching
+  // EMAIL_RE gets a trailing "Invite by email" row (no domain restriction).
+  // Picking calls onPick(email).
+  function shareRenderSuggestInto(inputEl, boxEl, onPick) {
+    if (!boxEl) { return; }
+    boxEl.innerHTML = '';
+    var query = (inputEl && inputEl.value ? inputEl.value : '').trim().toLowerCase();
+    var inList = shareExcludedEmails();
+    var itemEl = function(m) {
       var item = document.createElement('button');
       item.type = 'button';
       item.className = 'share-suggest-item';
+      var av = document.createElement('span');
+      av.className = 'share-avatar';
+      av.textContent = shareInitials(m.name, m.email);
+      var main = document.createElement('span'); main.className = 'share-recip-main';
       var nm = document.createElement('span'); nm.className = 'share-suggest-name'; nm.textContent = m.name || m.email;
       var em = document.createElement('span'); em.className = 'share-suggest-email'; em.textContent = m.email || '';
-      item.appendChild(nm); item.appendChild(em);
-      item.addEventListener('click', function() { var s = document.getElementById('shareTeammateSearch'); if (s) { s.value = ''; } shareHideSuggest(); shareAddRecipient(m.email); });
-      box.appendChild(item);
-    });
-    var raw = (q || '').trim();
+      main.appendChild(nm); main.appendChild(em);
+      item.appendChild(av); item.appendChild(main);
+      item.addEventListener('click', function() { if (inputEl) { inputEl.value = ''; } shareHideSuggests(); onPick(m.email); });
+      return item;
+    };
+    var appendGroup = function(label, members) {
+      var matches = (members || []).filter(function(m) {
+        var hay = ((m.name || '') + ' ' + (m.email || '')).toLowerCase();
+        if ((query && hay.indexOf(query) === -1) || inList[(m.email || '').toLowerCase()]) { return false; }
+        return true;
+      }).slice(0, 100);
+      if (matches.length === 0) { return; }
+      var head = document.createElement('div');
+      head.className = 'share-suggest-group';
+      head.textContent = label;
+      boxEl.appendChild(head);
+      matches.forEach(function(m) { boxEl.appendChild(itemEl(m)); });
+    };
+    appendGroup('From your Jolli account', shareAccountMembers);
+    appendGroup('From this repo', shareGitCollaborators);
+    var raw = (inputEl && inputEl.value ? inputEl.value : '').trim();
     if (EMAIL_RE.test(raw) && !inList[raw.toLowerCase()]) {
-      var add = document.createElement('button');
-      add.type = 'button';
-      add.className = 'share-suggest-item share-suggest-add';
-      add.textContent = '\\u2795 Add ' + raw;
-      add.addEventListener('click', function() { var s = document.getElementById('shareTeammateSearch'); if (s) { s.value = ''; } shareHideSuggest(); shareAddRecipient(raw); });
-      box.appendChild(add);
+      var head2 = document.createElement('div');
+      head2.className = 'share-suggest-group';
+      head2.textContent = 'Invite by email';
+      boxEl.appendChild(head2);
+      boxEl.appendChild(itemEl({ name: raw, email: raw }));
     }
-    box.hidden = box.children.length === 0;
+    boxEl.hidden = boxEl.children.length === 0;
   }
-  var shareSearch = document.getElementById('shareTeammateSearch');
-  if (shareSearch) {
-    shareSearch.addEventListener('input', function() { shareRenderSuggest(shareSearch.value); });
-    shareSearch.addEventListener('click', function(e) { e.stopPropagation(); });
+  function shareHideSuggests() {
+    var boxes = document.querySelectorAll('.share-suggest');
+    for (var i = 0; i < boxes.length; i++) { boxes[i].hidden = true; boxes[i].innerHTML = ''; }
   }
-  document.addEventListener('click', shareHideSuggest);
-  // Access level: org / public / people are all functional. A live share exists by the
-  // time this pane shows (auto-sync), so a change PATCHes the audience (+ current people).
-  var shareVisSelect = document.getElementById('shareVisibilitySelect');
-  if (shareVisSelect) {
-    shareVisSelect.addEventListener('change', function() {
-      var sub = document.getElementById('shareAccessSub');
-      if (sub) { sub.textContent = shareAccessSubText(shareVisSelect.value); }
-      shareSendAudience();
+  // Wires one search input to its grouped dropdown: opens on focus (empty query
+  // shows everything), filters on input, Enter adds a typed email directly, and
+  // clicks are swallowed so the global click-away handler doesn't close it.
+  function shareWireSuggest(inputId, boxId, onPick) {
+    var input = document.getElementById(inputId);
+    var box = document.getElementById(boxId);
+    if (!input || !box) { return; }
+    var render = function() { shareRenderSuggestInto(input, box, onPick); };
+    input.addEventListener('focus', render);
+    input.addEventListener('input', render);
+    input.addEventListener('keydown', function(e) {
+      if (e.key !== 'Enter') { return; }
+      e.preventDefault();
+      var raw = (input.value || '').trim();
+      if (EMAIL_RE.test(raw) && !shareExcludedEmails()[raw.toLowerCase()]) {
+        input.value = '';
+        shareHideSuggests();
+        onPick(raw);
+      }
     });
+    input.addEventListener('click', function(e) { e.stopPropagation(); });
   }
+  document.addEventListener('click', shareHideSuggests);
   var shareRetryBtn = document.getElementById('shareRetryBtn');
   if (shareRetryBtn) { shareRetryBtn.addEventListener('click', function() { shareOpen(shareKind); }); }
-  var shareCreateBtn = document.getElementById('shareCreateBtn');
-  if (shareCreateBtn) { shareCreateBtn.addEventListener('click', shareCreate); }
-  var shareCreateVisSelect = document.getElementById('shareCreateVisibilitySelect');
-  if (shareCreateVisSelect) {
-    shareCreateVisSelect.addEventListener('change', function() {
-      var sub = document.getElementById('shareCreateAccessSub');
-      if (sub) { sub.textContent = shareAccessSubText(shareCreateVisSelect.value); }
-    });
+  // ── General access select: the single link's access tier. ──
+  // 'public' = bearer (anyone with the link); 'org' = any signed-in member ∪
+  // invited people; 'people' = invited people only. Changing it flips the one link.
+  function shareAccessValue() {
+    var sel = document.getElementById('shareAccessSelect');
+    return sel && sel.value ? sel.value : (shareCanOrg ? 'org' : 'people');
   }
-  // Copy the bare shareable URL (held in a hidden input), with "Copied!" feedback.
-  var shareCopyBtn = document.getElementById('shareCopyBtn');
-  if (shareCopyBtn) {
-    shareCopyBtn.addEventListener('click', function() {
-      var input = document.getElementById('shareLinkInput');
-      if (!input || !input.value) { return; }
-      var done = function() {
-        var orig = shareCopyBtn.textContent;
-        shareCopyBtn.textContent = 'Copied!';
-        setTimeout(function() { shareCopyBtn.textContent = orig; }, 1500);
-      };
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(input.value).then(done, function() { input.select(); done(); });
-      } else {
-        input.select(); try { document.execCommand('copy'); } catch (e) {} done();
+  function shareAccessDescText(v) {
+    if (v === 'public') { return 'Anyone with the link can open this \\u2014 no account needed.'; }
+    if (v === 'people') { return 'Only the people above can open this.'; }
+    return 'Anyone in your Jolli Account can open this.';
+  }
+  function shareSyncAccessUi() {
+    var v = shareAccessValue();
+    var desc = document.getElementById('shareAccessDesc');
+    if (desc) { desc.textContent = shareAccessDescText(v); }
+  }
+  var shareAccessSelect = document.getElementById('shareAccessSelect');
+  if (shareAccessSelect) {
+    shareAccessSelect.addEventListener('click', function(e) { e.stopPropagation(); });
+    shareAccessSelect.addEventListener('change', function() {
+      var v = shareAccessSelect.value;
+      // Remember the explicit choice so a re-render with no minted link yet (e.g.
+      // 'people' waiting for its first invite) doesn't snap the dropdown back to the
+      // default tier — which would silently widen the access the user just narrowed.
+      shareUserPickedTier = v;
+      shareSyncAccessUi();
+      // Flip the single link to the chosen tier. When a link already exists the host
+      // PATCHes it in place (the old URL dies); with no link yet, 'public'/'org' mint
+      // one and 'people' waits for the first invite. Skip the no-op (tier unchanged).
+      if (!shareLink || shareLink.visibility !== v) {
+        shareSetSyncBadge('loading');
+        vscode.postMessage({ command: 'shareSetAccess', visibility: v, shareKind: shareKind });
       }
     });
   }
+  var shareCopyBtn = document.getElementById('shareCopyBtn');
+  // The default label, captured so the waiting state can be restored verbatim.
+  var shareCopyBtnLabel = shareCopyBtn ? shareCopyBtn.innerHTML : '';
+  function shareResetCopyBtn() {
+    if (shareCopyBtn) { shareCopyBtn.disabled = false; shareCopyBtn.innerHTML = shareCopyBtnLabel; }
+  }
+  if (shareCopyBtn) {
+    shareCopyBtn.addEventListener('click', function() {
+      var v = shareAccessValue();
+      // The card doesn't move; but until the host's shareCopyResult ack the link may
+      // still be minting (a network round-trip) AND the clipboard write hasn't run —
+      // so show an explicit waiting label, or the user thinks they already have the URL.
+      shareCopyBtn.disabled = true;
+      shareCopyBtn.innerHTML = '\\u23F3 Copying\\u2026';
+      vscode.postMessage({ command: 'shareCopyLink', visibility: v, shareKind: shareKind });
+    });
+  }
+  // Bottom-of-card toast (mockup's confirmation style — the button itself never changes).
+  var shareToastTimer = null;
+  function shareShowToast(msg) {
+    var t = document.getElementById('shareToast');
+    if (!t) {
+      t = document.createElement('div');
+      t.id = 'shareToast';
+      t.className = 'share-toast';
+      document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.classList.add('on');
+    if (shareToastTimer) { clearTimeout(shareToastTimer); }
+    shareToastTimer = setTimeout(function() { t.classList.remove('on'); }, 2200);
+  }
+  // Copy ack from the host (the clipboard write happens host-side — postMessage
+  // has no return channel for the URL): re-enable the button, toast on success.
+  function shareFlashCopy(ok) {
+    shareResetCopyBtn();
+    if (ok) { shareShowToast('Link copied: opens the shared page'); }
+  }
+
+  // ── Send invite sub-pane: stage people locally, send once (server grants + emails). ──
+  function shareRenderInvitePending() {
+    var box = document.getElementById('shareInviteTo');
+    if (!box) { return; }
+    box.innerHTML = '';
+    if (shareInvitePending.length === 0) {
+      var empty = document.createElement('p');
+      empty.className = 'share-invite-empty';
+      empty.textContent = 'No one added yet \\u2014 search below.';
+      box.appendChild(empty);
+    }
+    shareInvitePending.forEach(function(e) {
+      var row = document.createElement('span');
+      row.className = 'share-recip';
+      var av = document.createElement('span');
+      av.className = 'share-avatar';
+      av.textContent = shareInitials(shareResolveName(e), e);
+      var main = document.createElement('span');
+      main.className = 'share-recip-main';
+      var nm = document.createElement('span');
+      nm.className = 'share-recip-name';
+      nm.textContent = shareResolveName(e);
+      var em = document.createElement('span');
+      em.className = 'share-recip-email';
+      em.textContent = e;
+      main.appendChild(nm); main.appendChild(em);
+      row.appendChild(av); row.appendChild(main);
+      var rm = document.createElement('button');
+      rm.type = 'button';
+      rm.className = 'share-recip-x';
+      rm.title = 'Remove ' + e;
+      rm.setAttribute('aria-label', 'Remove ' + e);
+      rm.textContent = '\\u00D7';
+      rm.addEventListener('click', function() {
+        shareInvitePending = shareInvitePending.filter(function(x) { return x !== e; });
+        shareRenderInvitePending();
+      });
+      row.appendChild(rm);
+      box.appendChild(row);
+    });
+    var send = document.getElementById('shareInviteSend');
+    if (send) { send.disabled = shareInvitePending.length === 0; }
+    var count = document.getElementById('shareInviteSendCount');
+    if (count) { count.textContent = shareInvitePending.length > 1 ? String(shareInvitePending.length) : ''; }
+  }
+  // Entering invite mode happens by PICKING someone in the main search (mockup flow:
+  // the default pane shows Copy link; Cancel/Send invite only appear once a teammate
+  // is staged). Fresh entry clears the note; the picked person is already staged.
+  // The card swaps wholesale: its own title/subtitle hide (the .inviting class).
+  function shareSetInviting(on) {
+    var card = shareOverlay ? shareOverlay.querySelector('.share-modal') : null;
+    if (card) { card.classList.toggle('inviting', !!on); }
+  }
+  function shareInviteEnter() {
+    if (shareInvitePending.length <= 1) {
+      var msgBox = document.getElementById('shareInviteMessage');
+      if (msgBox) { msgBox.value = ''; }
+    }
+    var input = document.getElementById('shareInviteSearch');
+    if (input) { input.value = ''; }
+    shareRenderInvitePending();
+    shareSetInviting(true);
+    sharePane('sharePaneInvite');
+    sharePositionCard();
+    // Mockup behavior: keep momentum — the "Add another" input takes focus.
+    if (input) { setTimeout(function() { input.focus(); }, 20); }
+  }
+  function shareInviteLeave() {
+    shareInvitePending = [];
+    shareSetInviting(false);
+    sharePane('sharePaneMain');
+    sharePositionCard();
+  }
+  var shareInviteBack = document.getElementById('shareInviteBack');
+  if (shareInviteBack) { shareInviteBack.addEventListener('click', shareInviteLeave); }
+  var shareInviteCancel = document.getElementById('shareInviteCancel');
+  if (shareInviteCancel) { shareInviteCancel.addEventListener('click', shareInviteLeave); }
+  var shareInviteSend = document.getElementById('shareInviteSend');
+  if (shareInviteSend) {
+    shareInviteSend.addEventListener('click', function() {
+      if (shareInvitePending.length === 0) { return; }
+      var msgBox = document.getElementById('shareInviteMessage');
+      var note = msgBox && msgBox.value ? msgBox.value.trim() : '';
+      // Carry the selected access tier so the FIRST invite mints the link at the tier
+      // the user picked (e.g. "Anyone within your Jolli Account") — not always people-only.
+      var payload = { command: 'shareSendInvite', recipients: shareInvitePending.slice(), visibility: shareAccessValue(), shareKind: shareKind };
+      if (note) { payload.message = note; }
+      vscode.postMessage(payload);
+      // Sending CLOSES the share popover — the host's toasts report the outcome,
+      // and reopening Share shows the invitees in Collaborators (server-confirmed).
+      shareInvitePending = [];
+      shareSetInviting(false);
+      shareClose();
+    });
+  }
+  function shareStagePending(email) {
+    var lower = (email || '').trim().toLowerCase();
+    if (!lower) { return; }
+    if (shareInvitePending.indexOf(lower) === -1) { shareInvitePending = shareInvitePending.concat([lower]); }
+  }
+  // Main-pane search: picking a teammate stages them and flips into invite mode
+  // (Cancel / Send invite). The invite pane's "Add another" stages in place.
+  shareWireSuggest('shareTeammateSearch', 'shareSuggest', function(email) {
+    shareStagePending(email);
+    shareInviteEnter();
+  });
+  shareWireSuggest('shareInviteSearch', 'shareInviteSuggest', function(email) {
+    shareStagePending(email);
+    shareRenderInvitePending();
+  });
 
   function shareRender(state) {
     if (!state || !shareOverlay) { return; }
-    if (state.kind === 'revoked') { shareClose(); return; } // stopped → just dismiss (toast confirms)
     if (state.kind === 'needsApiKey') { shareSetSyncBadge('hide'); sharePane('sharePaneNoKey'); return; }
-    if (state.kind === 'needsCreate') { shareRenderCreate(state); return; }
     if (state.kind === 'ready') { shareRenderMain(state); return; }
     if (state.kind === 'loading') {
       var lbl = document.getElementById('shareLoadingLabel');
@@ -444,52 +623,50 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
     }
   }
 
-  function shareRenderCreate(state) {
-    shareRecipients = (state.recipients || []).slice();
-    shareOrgMembers = state.orgMembers || [];
-    var ownerRow = (state.collaborators || []).filter(function(c) { return c.isOwner; })[0];
-    shareOwnerEmail = ownerRow ? (ownerRow.email || '') : '';
-    shareOwnerName = ownerRow ? (ownerRow.name || '') : '';
-    var sub = document.getElementById('shareModalSub');
-    if (sub) { sub.textContent = state.subjectTitle || state.subject || state.branch || ''; }
-    var orgOption = document.getElementById('shareCreateOrgOption');
-    if (orgOption) { orgOption.disabled = !state.canOrg; orgOption.hidden = !state.canOrg; }
-    var visSelect = document.getElementById('shareCreateVisibilitySelect');
-    if (visSelect) { visSelect.value = state.visibility || (state.canOrg ? 'org' : 'public'); }
-    var accessSub = document.getElementById('shareCreateAccessSub');
-    if (accessSub) { accessSub.textContent = shareAccessSubText(visSelect ? visSelect.value : (state.visibility || 'public')); }
-    shareSetSyncBadge('hide');
-    sharePane('sharePaneCreate');
-    sharePositionCard();
-  }
-
-  // The SYNCED popover: subtitle, collaborators, access selector + sub-copy, the
-  // (hidden) link input for Copy, and the SYNCED badge. Auto-sync means we only ever
-  // render 'ready' here (loading/error use their own panes).
+  // The main pane (mockup layout): search → Collaborators → General access select →
+  // banner → single Copy link. The select sets the one link's access tier;
+  // Copy copies it (minting on first use).
   function shareRenderMain(state) {
-    shareRecipients = (state.recipients || []).slice();
-    shareOrgMembers = state.orgMembers || [];
-    var ownerRow = (state.collaborators || []).filter(function(c) { return c.isOwner; })[0];
-    shareOwnerEmail = ownerRow ? (ownerRow.email || '') : '';
-    shareOwnerName = ownerRow ? (ownerRow.name || '') : '';
+    // Defensive: a ready re-render always leaves the Copy button usable + relabeled,
+    // in case an action returned without a shareCopyResult ack (disabled on click).
+    shareResetCopyBtn();
+    shareLink = state.share || null;
+    shareAccountMembers = state.accountMembers || [];
+    shareGitCollaborators = state.gitCollaborators || [];
+    shareCanOrg = !!state.canOrg;
+    shareOwnerEmail = state.owner ? (state.owner.email || '') : '';
+    shareOwnerName = state.owner ? (state.owner.name || '') : '';
     var sub = document.getElementById('shareModalSub');
     if (sub) {
       var n = state.decisionCount || 0;
       sub.textContent = (state.subjectTitle || state.subject || state.branch) + ' \\u00B7 ' + n + ' decision' + (n === 1 ? '' : 's');
     }
     var orgOption = document.getElementById('shareOrgOption');
-    if (orgOption) { orgOption.disabled = !state.canOrg; orgOption.hidden = !state.canOrg; }
-    var visSelect = document.getElementById('shareVisibilitySelect');
-    if (visSelect) { visSelect.value = state.visibility || 'public'; }
-    var accessSub = document.getElementById('shareAccessSub');
-    if (accessSub) { accessSub.textContent = shareAccessSubText(state.visibility || 'public'); }
-    shareRenderCollaborators(state.collaborators);
-    var input = document.getElementById('shareLinkInput');
-    if (input) { input.value = state.shareUrl || ''; }
-    var search = document.getElementById('shareTeammateSearch');
-    if (search) { search.value = ''; }
-    shareHideSuggest();
-    shareSetSyncBadge('ready');
+    if (orgOption) {
+      orgOption.disabled = !shareCanOrg;
+      orgOption.hidden = !shareCanOrg;
+      orgOption.textContent = 'Anyone within your Jolli Account';
+    }
+    // Preselect the access that matches the existing link's tier. With no link yet,
+    // keep whatever tier the user explicitly picked (so selecting "people" isn't
+    // reverted to the org default and later Copy-minted as an org link); on the first
+    // render (nothing picked) fall back to org — or "only people you add" without an
+    // org-carrying key — so a public (anyone-with-link) share is always explicit.
+    if (shareAccessSelect) {
+      shareAccessSelect.value = shareLink
+        ? shareLink.visibility
+        : (shareUserPickedTier || (shareCanOrg ? 'org' : 'people'));
+    }
+    shareSyncAccessUi();
+    shareRenderInvited();
+    // A ready render always lands on the main pane: drop any staged-but-unsent
+    // invitees (a completed send re-renders here too) and reset the search box.
+    shareInvitePending = [];
+    shareSetInviting(false);
+    var mainSearch = document.getElementById('shareTeammateSearch');
+    if (mainSearch) { mainSearch.value = ''; }
+    shareHideSuggests();
+    shareSetSyncBadge(shareLink ? 'ready' : 'hide');
     sharePane('sharePaneMain');
     sharePositionCard();
   }
@@ -519,6 +696,9 @@ ${buildPrSectionScript()}
     // ── Share modal state ──
     if (msg.command === 'shareState') {
       shareRender(msg.state);
+    }
+    if (msg.command === 'shareCopyResult') {
+      shareFlashCopy(msg.ok === true);
     }
 
     // ── Push status ──

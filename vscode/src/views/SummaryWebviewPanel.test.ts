@@ -792,29 +792,50 @@ describe("SummaryWebviewPanel", () => {
 			);
 		});
 
-		it("uses a distinct viewType when opened in the memory slot", async () => {
-			const summary = makeSummary();
-			await SummaryWebviewPanel.show(
-				summary,
-				extensionUri,
-				workspaceRoot,
-				stubBridge,
-				mainBranch,
-				"memory",
+			it("uses a distinct viewType when opened in the memory slot", async () => {
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"memory",
 			);
 
-			expect(createWebviewPanel).toHaveBeenCalledWith(
-				"jollimemory.summary.memory",
-				"Commit Memory",
-				1,
-				expect.objectContaining({
-					enableScripts: true,
-					retainContextWhenHidden: true,
-				}),
-			);
-		});
+				expect(createWebviewPanel).toHaveBeenCalledWith(
+					"jollimemory.summary.memory",
+					"Commit Memory",
+					1,
+					expect.objectContaining({
+						enableScripts: true,
+						retainContextWhenHidden: true,
+					}),
+				);
+			});
 
-		// All sources — memory / commit / kb — open on ViewColumn.One so every
+			it("opens a commit panel with the share modal one-shot flag", async () => {
+				const summary = makeSummary({ commitHash: "share-me" });
+
+				await SummaryWebviewPanel.showWithShareModal(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"commit",
+				);
+
+				const lastBuild = mockBuildHtml.mock.calls.at(-1);
+				expect(lastBuild?.[1]).toEqual(
+					expect.objectContaining({
+						shareDefaultKind: "commit",
+						autoOpenShare: true,
+					}),
+				);
+			});
+
+			// All sources — memory / commit / kb — open on ViewColumn.One so every
 		// memory/summary panel stacks as tabs in the main editor group (the same
 		// group VS Code's built-in markdown preview uses for the plain-markdown
 		// memory files: wiki / plan / note). kb was already on One; this guards
@@ -11056,21 +11077,38 @@ describe("SummaryWebviewPanel", () => {
 				mainBranch,
 			);
 			return captureMessageHandler();
-		}
+			}
 
-		/** Opens a panel then nulls its currentSummary, returning the dispatcher. */
-		async function openPanelThenClearSummary(
-			overrides?: Partial<CommitSummary>,
-		): Promise<(msg: Record<string, unknown>) => void> {
-			const dispatch = await openPanel(overrides);
-			firstCommitPanel<{ currentSummary: null }>().currentSummary = null;
-			return dispatch;
-		}
+			/** Opens a panel then nulls its currentSummary, returning the dispatcher. */
+			async function openPanelThenClearSummary(
+				overrides?: Partial<CommitSummary>,
+			): Promise<(msg: Record<string, unknown>) => void> {
+				const dispatch = await openPanel(overrides);
+				firstCommitPanel<{ currentSummary: null }>().currentSummary = null;
+				return dispatch;
+			}
 
-		describe("no-summary early returns", () => {
-			it("editRecap returns early when currentSummary is null", async () => {
-				const dispatch = await openPanelThenClearSummary();
+			it("returns the same v5 summary when transcript removal matches nothing", async () => {
+				await openPanel();
+				const panel = firstCommitPanel<{
+					persistTranscriptIdRemoval(
+						summary: CommitSummary,
+						idsToRemove: ReadonlySet<string>,
+					): Promise<CommitSummary>;
+				}>();
+				const summary = makeSummary({ version: 5, transcripts: ["kept"] });
 				mockStoreSummary.mockClear();
+
+				const result = await panel.persistTranscriptIdRemoval(summary, new Set(["missing"]));
+
+				expect(result).toBe(summary);
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+			});
+
+			describe("no-summary early returns", () => {
+				it("editRecap returns early when currentSummary is null", async () => {
+					const dispatch = await openPanelThenClearSummary();
+					mockStoreSummary.mockClear();
 
 				dispatch({ command: "editRecap", recap: "ignored" });
 				await flushPromises();

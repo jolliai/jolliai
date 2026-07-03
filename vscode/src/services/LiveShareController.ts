@@ -25,15 +25,16 @@
  * reconcile passes from lost-updating `covered` (PATCH replaces it wholesale).
  */
 
+import { createHash } from "node:crypto";
 import type { CommitSummary, PlanReference, NoteReference } from "../../../cli/src/Types.js";
-import { type LiveRef, getBranchShare, putBranchShare } from "../../../cli/src/core/BranchShareStore.js";
+import { type LiveRef, getShare, putBranchShare } from "../../../cli/src/core/BranchShareStore.js";
 import { getDefaultBranch } from "../../../cli/src/core/GitOps.js";
 import { parseJolliApiKey } from "../../../cli/src/core/JolliApiUtils.js";
 import { extractRepoName } from "../../../cli/src/core/KBPathResolver.js";
 import { slugify } from "../../../cli/src/core/SummaryExporter.js";
-import { resolveEffectiveTopics } from "../../../cli/src/core/SummaryStore.js";
+import { resolveEffectiveRecap, resolveEffectiveTopics } from "../../../cli/src/core/SummaryStore.js";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
-import { getCanonicalRepoUrl } from "../util/GitRemoteUtils.js";
+import { deriveOwnerRepoFromUrl, getCanonicalRepoUrl } from "../util/GitRemoteUtils.js";
 import { log } from "../util/Logger.js";
 import { planBaseKey } from "../util/PlanGrouping.js";
 import { loadBranchSummaries } from "../views/BranchSummaryLoader.js";
@@ -118,12 +119,14 @@ function resolveBaseUrl(apiKey: string): string {
 
 /** Loads the subject's summaries (chronological oldest→newest); a commit share filters to one. */
 async function loadSubjectSummaries(
-	deps: LiveShareDeps & { readonly commitSummary?: CommitSummary },
+	bridge: JolliMemoryBridge,
+	workspaceRoot: string,
 	commitHash: string | undefined,
+	commitSummary?: CommitSummary,
 ): Promise<ReadonlyArray<CommitSummary>> {
-	if (commitHash && deps.commitSummary?.commitHash === commitHash) return [deps.commitSummary];
-	const base = await getDefaultBranch(deps.workspaceRoot);
-	const { summaries } = await loadBranchSummaries(deps.bridge, base);
+	if (commitHash && commitSummary?.commitHash === commitHash) return [commitSummary];
+	const base = await getDefaultBranch(workspaceRoot);
+	const { summaries } = await loadBranchSummaries(bridge, base);
 	return commitHash ? summaries.filter((s) => s.commitHash === commitHash) : summaries;
 }
 
@@ -243,17 +246,50 @@ async function pushSubjectAndBuildRef(
 }
 
 /**
- * Aggregates the subject's decisions for the share headline/teaser: total topic
- * count and the first 5 distinct topic titles. Shared by generate + reconcile so
- * a reconciled share reflects the CURRENT base..HEAD, not the create-time set.
+ * Total decision (topic) count across the subject's summaries — sent to the server
+ * (NOT-NULL column) and cached on the record so the modal subtitle needn't reload
+ * summaries to show "N decisions".
  */
-function summarizeDecisions(summaries: ReadonlyArray<CommitSummary>): { decisionCount: number; titles: string[] } {
-	const topicsByCommit = summaries.map((s) => resolveEffectiveTopics(s));
-	const decisionCount = topicsByCommit.reduce((total, topics) => total + topics.length, 0);
-	const titles = [
-		...new Set(topicsByCommit.flatMap((ts) => ts.map((t) => t.title.trim())).filter((t) => t.length > 0)),
-	].slice(0, 5);
-	return { decisionCount, titles };
+function countDecisions(summaries: ReadonlyArray<CommitSummary>): number {
+	return summaries.reduce((total, s) => total + resolveEffectiveTopics(s).length, 0);
+}
+
+/**
+ * Decision (topic) count for a subject from the live summaries — the modal uses this
+ * ONLY as a fallback for a subject with no cached share record yet, so the subtitle
+ * shows the real count BEFORE the first share. A commit share is free (the open
+ * summary); a branch share loads base..HEAD once (only when unshared).
+ */
+export async function countSubjectDecisions(
+	bridge: JolliMemoryBridge,
+	workspaceRoot: string,
+	commitHash?: string,
+	commitSummary?: CommitSummary,
+): Promise<number> {
+	return countDecisions(await loadSubjectSummaries(bridge, workspaceRoot, commitHash, commitSummary));
+}
+
+/**
+ * Content fingerprint of the subject's summaries — everything a push sends that a
+ * memory edit can change WITHOUT a new git commit: per-commit topics + recap (the
+ * recap is the share card's fallback when a summary has no topics) and the
+ * plan/note revisions (`updatedAt` bumps on edit). `reconcileLiveShare` compares it
+ * to skip the re-push only when the content is genuinely unchanged, so topic edits /
+ * regenerated summaries / plan+note changes still republish even though HEAD didn't
+ * move. Excludes push-assigned doc ids (they'd make the hash change on every push).
+ */
+export function subjectFingerprint(summaries: ReadonlyArray<CommitSummary>): string {
+	const projection = summaries.map((s) => ({
+		c: s.commitHash,
+		t: resolveEffectiveTopics(s),
+		// A topics-less summary renders its recap as the share card (server-side
+		// fallback in BranchShareRouter.decisionsFromStructuredSummary), so a
+		// recap-only edit must still move the hash and trigger a re-push.
+		r: resolveEffectiveRecap(s) ?? null,
+		p: (s.plans ?? []).map((pl) => [pl.slug, pl.updatedAt]),
+		n: (s.notes ?? []).map((nt) => [nt.id, nt.updatedAt]),
+	}));
+	return createHash("sha1").update(JSON.stringify(projection)).digest("hex").slice(0, 16);
 }
 
 /** Builds the push context (binding chooser injected) for a subject push. */
@@ -276,18 +312,29 @@ export function generateLiveShare(params: GenerateLiveShareParams): Promise<Live
 	return withSubjectLock(params.workspaceRoot, params.branch, async () => {
 		const baseUrl = resolveBaseUrl(params.apiKey);
 		const repoUrl = await getCanonicalRepoUrl(params.workspaceRoot);
-		const repoName = extractRepoName(params.workspaceRoot);
+		// Prefer the "owner/repo" full name (from the remote) so the share page shows
+		// the two-segment "owner / repo" form; fall back to the bare name for a
+		// local/remoteless repo where no owner segment exists.
+		const repoName = deriveOwnerRepoFromUrl(repoUrl) || extractRepoName(params.workspaceRoot);
 		const kind = params.commitHash ? "commit" : "branch";
 
-		const subjectSummaries = await loadSubjectSummaries(params, params.commitHash);
+		const subjectSummaries = await loadSubjectSummaries(
+			params.bridge,
+			params.workspaceRoot,
+			params.commitHash,
+			params.commitSummary,
+		);
 		if (subjectSummaries.length === 0) throw new NothingToShareError(params.branch);
 
 		const ctx = buildPushContext(params, baseUrl, repoUrl);
 		const ref = await pushSubjectAndBuildRef(subjectSummaries, kind, params.branch, ctx);
 
-		const { decisionCount, titles } = summarizeDecisions(subjectSummaries);
 		const headCommitHash = subjectSummaries[subjectSummaries.length - 1].commitHash;
 		const commitHashes = subjectSummaries.map((s) => s.commitHash);
+		// Computed once from the just-loaded summaries: sent to the server AND cached
+		// on the record so the modal subtitle needn't reload summaries to count.
+		const decisionCount = countDecisions(subjectSummaries);
+		const contentHash = subjectFingerprint(subjectSummaries);
 
 		const result = await createLiveShare(baseUrl, params.apiKey, {
 			repoUrl,
@@ -311,13 +358,11 @@ export function generateLiveShare(params: GenerateLiveShareParams): Promise<Live
 				shareUrl: result.shareUrl,
 				visibility: result.visibility,
 				ref,
-				...(result.token && { token8: result.token.slice(0, 8) }),
 				...(result.recipients && { recipients: result.recipients }),
 				headCommitHash,
+				contentHash,
 				expiresAt: result.expiresAt,
 				decisionCount,
-				titles,
-				commitHash: params.commitHash,
 			},
 			params.commitHash,
 		);
@@ -335,42 +380,48 @@ export function generateLiveShare(params: GenerateLiveShareParams): Promise<Live
  */
 export function reconcileLiveShare(deps: LiveShareDeps, branch: string): Promise<void> {
 	return withSubjectLock(deps.workspaceRoot, branch, async () => {
-		const existing = await getBranchShare(deps.workspaceRoot, branch);
-		// Only branch shares reconcile here; commit shares are a fixed doc list, and a
-		// blank confirmed-public placeholder has no shareId.
+		const existing = await getShare(deps.workspaceRoot, branch);
+		// Only a branch (branchCollection) share reconciles here; commit shares are a fixed doc list.
 		if (!existing?.shareId || existing.ref?.kind !== "branchCollection") return;
 
-		const baseUrl = resolveBaseUrl(deps.apiKey);
-		const repoUrl = await getCanonicalRepoUrl(deps.workspaceRoot);
-		const subjectSummaries = await loadSubjectSummaries(deps, undefined);
+		const subjectSummaries = await loadSubjectSummaries(deps.bridge, deps.workspaceRoot, undefined);
 		if (subjectSummaries.length === 0) {
 			log.info("LiveShare", `reconcile: ${branch} has no summaries; leaving share untouched`);
 			return;
 		}
+		const headCommitHash = subjectSummaries[subjectSummaries.length - 1].commitHash;
+		const contentHash = subjectFingerprint(subjectSummaries);
+		// Content-staleness short-circuit: `contentHash` fingerprints what the last push
+		// sent (topics + recap + plan/note revisions), so it moves on a NEW commit AND on a
+		// memory edit that doesn't advance HEAD (topic edit, regenerated summary, plan/note
+		// change). Skip the per-commit re-push + PATCH only when the content is genuinely
+		// unchanged. A record missing the field (older cache) reads as stale and reconciles.
+		if (existing.contentHash === contentHash) {
+			log.info("LiveShare", `reconcile: ${branch} content unchanged (${contentHash}); skipping re-push`);
+			return;
+		}
 
+		const baseUrl = resolveBaseUrl(deps.apiKey);
+		const repoUrl = await getCanonicalRepoUrl(deps.workspaceRoot);
 		const ctx = buildPushContext(deps, baseUrl, repoUrl);
 		const ref = await pushSubjectAndBuildRef(subjectSummaries, "branch", branch, ctx);
-		const result = await updateLiveShare(baseUrl, deps.apiKey, existing.shareId, { ref });
 
-		// A ref-only PATCH legitimately omits unchanged fields (shareUrl/token/recipients/…).
-		// Preserve the existing values so the cached record stays reopen-able and people-share
-		// allowlists aren't dropped; only `ref` and anything the server actually returned change.
-		const token8 = result.token ? result.token.slice(0, 8) : existing.token8;
+		const result = await updateLiveShare(baseUrl, deps.apiKey, existing.shareId, { ref });
+		// A ref-only PATCH legitimately omits unchanged fields (shareUrl/recipients/…).
+		// Preserve the existing values so the cached record stays reopen-able and the
+		// allowlist isn't dropped; only `ref` and anything the server actually returned change.
 		const recipients = result.recipients ?? existing.recipients;
-		// Recompute the headline/teaser from the freshly-loaded summaries — the share now
-		// covers the current base..HEAD, so a stale create-time count/titles would misreport it.
-		const { decisionCount, titles } = summarizeDecisions(subjectSummaries);
 		await putBranchShare(deps.workspaceRoot, branch, {
 			shareId: String(result.shareId ?? existing.shareId),
 			shareUrl: result.shareUrl || existing.shareUrl,
 			visibility: result.visibility || existing.visibility,
 			ref,
-			...(token8 ? { token8 } : {}),
 			...(recipients ? { recipients } : {}),
-			headCommitHash: subjectSummaries[subjectSummaries.length - 1].commitHash,
+			headCommitHash,
+			contentHash,
 			expiresAt: result.expiresAt || existing.expiresAt,
-			decisionCount,
-			titles,
+			// Refreshed from the current base..HEAD (the covered set just changed).
+			decisionCount: countDecisions(subjectSummaries),
 		});
 	});
 }

@@ -1,24 +1,24 @@
 /**
  * BranchShareStore
  *
- * Per-project record of the public shares this machine has created, stored in
+ * Per-project record of the shares this machine has created, stored in
  * `<projectDir>/.jolli/jollimemory/branch-shares.json` (gitignored).
  *
  * Records are keyed by *share subject*: a branch share keys on the bare branch
- * name; a commit share keys on `<branch>\0<commitHash>` (see `recordKey`). The
- * NUL separator can't appear in a git ref or hash, so the two namespaces never
- * collide.
+ * name; a commit share keys on `<branch>:<commitHash>` (see `subjectKey`). A branch
+ * name can't contain `:` (git check-ref-format forbids it), so the two namespaces
+ * never collide, and the key stays readable (unlike a NUL sentinel).
+ *
+ * v4: **single-slot** — each subject holds at most ONE share record, whatever its
+ * `visibility` (`public` bearer, or the auth-gated member tiers `org`/`people`).
+ * Changing access flips that one record's visibility in place; a subject can never
+ * carry a public link and a member link at once. This mirrors the server's single
+ * unique index per subject (repo+branch, or repo+branch+commit) — the row's tier
+ * flips in place, so the old link dies when access is tightened.
  *
  * Two jobs:
  *  - Remember the issued share per subject so the Share modal can re-open to the
- *    same link, drive Revoke, and detect "branch moved since I shared" (the
- *    stored `headCommitHash` differs from the branch tip → offer re-share).
- *  - Remember that the user acknowledged the one-time "this is a PUBLIC link"
- *    confirmation. Confirmation is tracked **per branch** (keyed on the bare
- *    branch name) and intentionally covers both branch and commit shares on that
- *    branch — once you've accepted public links for a branch, commit shares on it
- *    don't re-prompt.
- *
+ *    same link, drive Copy/Stop, and PATCH the audience (visibility + recipients).
  * This is a local cache, not the system of record — the backend owns share
  * lifecycle. The account-level management view (web dashboard) is the
  * authoritative cross-repo surface; both align on `shareId`.
@@ -32,9 +32,12 @@ import { atomicWriteFile } from "./AtomicWrite.js";
 const log = createLogger("BranchShare");
 
 const SHARES_FILE = "branch-shares.json";
-// v2: live Space-backed shares (visibility/recipients/ref); v1 snapshot records
-// are dropped on read (the snapshot share was never released, so no migration).
-const SHARES_VERSION = 2 as const;
+// One share record per subject (single-slot). Branch sharing never shipped with an
+// older on-disk shape (v2/v3 existed only on unreleased dev builds), so there is no
+// migration: a file whose `version` or shape doesn't match is ignored (treated as
+// empty) and re-created on the next share. The number stays MONOTONIC past the
+// dev-only v2/v3 so an older file is never mistaken for the current shape.
+const SHARES_VERSION = 4 as const;
 
 /**
  * Reference to the live Space content a share renders from. Branch shares carry a
@@ -62,51 +65,60 @@ export interface BranchShareRecord {
 	readonly shareId: string;
 	readonly shareUrl: string;
 	/**
-	 * Access level: `public` (anyone-with-link bearer), `org` (auth-gated to the org),
-	 * or `people` (auth-gated to the `recipients` allowlist).
+	 * Access level: `public` (anyone-with-link bearer), `org` (auth-gated: any
+	 * signed-in member ∪ recipients), or `people` (auth-gated: recipients only).
+	 * A subject has one record; changing access flips this field in place.
 	 */
 	readonly visibility: "public" | "org" | "people";
 	/**
-	 * The `people` access allowlist (lowercased emails). For `people` shares this is
-	 * **server-authoritative** (sent on the audience PATCH, echoed back, gated on the
-	 * view route); cached here for re-open. Absent/empty for public/org.
+	 * The member link's invited-people allowlist (lowercased emails). Server-
+	 * authoritative (written by the invite endpoint / audience PATCH, echoed back,
+	 * gated on the view route); cached here for re-open. Never set on `public`.
 	 */
 	readonly recipients?: ReadonlyArray<string>;
 	/** Reference to the live Space content this share renders from. */
 	readonly ref?: LiveRef;
 	/**
-	 * First 8 chars of the bearer token — enough to display/build the deep link, not
-	 * the secret. Optional: `org` shares are auth-gated and have no token.
-	 */
-	readonly token8?: string;
-	/**
-	 * The subject's tip at create time (still sent to the server; backs the NOT-NULL
-	 * column + idempotency index). Optional in the cache — a live share renders current
-	 * membership, so it's not used for a client-side staleness check.
+	 * The subject's `base..HEAD` tip the share last covered (also sent to the server;
+	 * backs the NOT-NULL column + idempotency index). Optional in the cache; when
+	 * present it drives `reconcileLiveShare`'s head-staleness short-circuit (skip the
+	 * re-push when the current head already matches). A missing value reads as stale.
 	 */
 	readonly headCommitHash?: string;
+	/**
+	 * Fingerprint of the shared content (topics/recap + plan/note revisions) at the
+	 * last push. `reconcileLiveShare` re-pushes only when this differs from the current
+	 * subject's fingerprint — so a memory edit that DOESN'T advance the git HEAD (topic
+	 * edit, regenerated summary, plan/note change) is still detected and republished,
+	 * while an unchanged subject skips the per-commit re-push. Optional: a record
+	 * without it reads as stale and reconciles, repopulating it.
+	 */
+	readonly contentHash?: string;
 	readonly expiresAt: string;
-	/** Decision (topic) count captured at share time — drives the modal preview on reuse. */
+	/**
+	 * Decision (topic) count for the subject, captured at share/reconcile time. Cached
+	 * here (rather than recomputed on open) so the modal subtitle doesn't reload every
+	 * base..HEAD summary just to show "N decisions".
+	 */
 	readonly decisionCount: number;
-	/** A few decision titles captured at share time — teaser for share copy. */
-	readonly titles?: ReadonlyArray<string>;
-	/** Set on a commit-share record so the kind is recoverable from the cache alone. */
-	readonly commitHash?: string;
-	/** Set once the user acknowledged the public-link confirmation for this branch. */
-	readonly confirmedPublic?: boolean;
 }
+
+// A branch/ref name can never contain ":" (git check-ref-format forbids it), so
+// "<branch>:<commitHash>" splits unambiguously. Unlike a NUL sentinel it stays
+// readable in the JSON file, logs, and editors.
+const COMMIT_KEY_SEP = ":";
 
 /**
  * Map key for a share subject. Branch share → bare branch; commit share →
- * `<branch>\0<commitHash>` (NUL can't occur in a ref/hash, so no collision).
+ * `<branch>:<commitHash>` (":" can't occur in a git ref, so no collision).
  */
-function recordKey(branch: string, commitHash?: string): string {
-	return commitHash ? `${branch}\u0000${commitHash}` : branch;
+function subjectKey(branch: string, commitHash?: string): string {
+	return commitHash ? `${branch}${COMMIT_KEY_SEP}${commitHash}` : branch;
 }
 
 interface PersistedShape {
 	readonly version: typeof SHARES_VERSION;
-	readonly branches: Readonly<Record<string, BranchShareRecord>>;
+	readonly subjects: Readonly<Record<string, BranchShareRecord>>;
 }
 
 function sharesPath(projectDir: string): string {
@@ -114,7 +126,7 @@ function sharesPath(projectDir: string): string {
 }
 
 function emptyShape(): PersistedShape {
-	return { version: SHARES_VERSION, branches: {} };
+	return { version: SHARES_VERSION, subjects: {} };
 }
 
 async function readAll(projectDir: string): Promise<PersistedShape> {
@@ -125,18 +137,19 @@ async function readAll(projectDir: string): Promise<PersistedShape> {
 		if (!isEnoent(err)) log.warn("readAll read failed: %s", errMsg(err));
 		return emptyShape();
 	}
-	let parsed: Partial<PersistedShape>;
+	// Parse loosely and narrow by hand; a shape/version mismatch is ignored, not fatal.
+	let parsed: { version?: unknown; subjects?: PersistedShape["subjects"] };
 	try {
-		parsed = JSON.parse(raw) as Partial<PersistedShape>;
+		parsed = JSON.parse(raw) as typeof parsed;
 	} catch (err) {
 		log.warn("readAll JSON parse failed: %s", errMsg(err));
 		return emptyShape();
 	}
-	if (parsed.version !== SHARES_VERSION || typeof parsed.branches !== "object" || parsed.branches === null) {
+	if (parsed.version !== SHARES_VERSION || typeof parsed.subjects !== "object" || parsed.subjects === null) {
 		log.warn("readAll version/shape mismatch (got %s) — ignoring file", String(parsed.version));
 		return emptyShape();
 	}
-	return { version: SHARES_VERSION, branches: parsed.branches };
+	return { version: SHARES_VERSION, subjects: parsed.subjects };
 }
 
 async function writeAll(projectDir: string, next: PersistedShape): Promise<void> {
@@ -165,75 +178,45 @@ function serialize<T>(projectDir: string, work: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Returns the stored share record for a subject, or undefined. Pass `commitHash`
- * for a commit share; omit it for a branch share.
+ * Returns a subject's single share record, or undefined. Pass `commitHash` for a
+ * commit share; omit it for a branch share.
  */
-export async function getBranchShare(
+export async function getShare(
 	projectDir: string,
 	branch: string,
 	commitHash?: string,
 ): Promise<BranchShareRecord | undefined> {
 	const all = await readAll(projectDir);
-	return all.branches[recordKey(branch, commitHash)];
+	return all.subjects[subjectKey(branch, commitHash)];
 }
 
-/** Upserts a subject's share record (preserves the existing `confirmedPublic` flag). */
+/**
+ * Upserts a subject's single share record (create or in-place flip). Overwrites
+ * whatever was there — a subject holds exactly one link.
+ */
 export async function putBranchShare(
 	projectDir: string,
 	branch: string,
-	record: Omit<BranchShareRecord, "confirmedPublic">,
+	record: BranchShareRecord,
 	commitHash?: string,
 ): Promise<void> {
-	const key = recordKey(branch, commitHash);
+	const key = subjectKey(branch, commitHash);
 	return serialize(projectDir, async () => {
 		const all = await readAll(projectDir);
-		const prev = all.branches[key];
-		const branches = { ...all.branches, [key]: { ...record, confirmedPublic: prev?.confirmedPublic } };
-		await writeAll(projectDir, { version: SHARES_VERSION, branches });
+		await writeAll(projectDir, { ...all, subjects: { ...all.subjects, [key]: record } });
 	});
 }
 
 /**
- * Removes a subject's share record (e.g. after revoke). Idempotent.
- *
- * The one-time public-link confirmation (`confirmedPublic`) is independent of the
- * share's lifecycle, so revoking a share must NOT make the user re-confirm next
- * time. When the dropped record carried `confirmedPublic`, we keep a blank
- * placeholder that preserves only that flag rather than deleting the entry.
+ * Removes a subject's share record (e.g. after a Stop). Idempotent; an absent
+ * subject is a no-op and the entry is dropped entirely.
  */
-export async function removeBranchShare(projectDir: string, branch: string, commitHash?: string): Promise<void> {
-	const key = recordKey(branch, commitHash);
+export async function removeShare(projectDir: string, branch: string, commitHash?: string): Promise<void> {
+	const key = subjectKey(branch, commitHash);
 	return serialize(projectDir, async () => {
 		const all = await readAll(projectDir);
-		const prev = all.branches[key];
-		if (!prev) return;
-		if (prev.confirmedPublic) {
-			const branches = { ...all.branches, [key]: { ...blankRecord(), confirmedPublic: true } };
-			await writeAll(projectDir, { version: SHARES_VERSION, branches });
-			return;
-		}
-		const { [key]: _drop, ...rest } = all.branches;
-		await writeAll(projectDir, { version: SHARES_VERSION, branches: rest });
+		if (!all.subjects[key]) return;
+		const { [key]: _drop, ...subjects } = all.subjects;
+		await writeAll(projectDir, { ...all, subjects });
 	});
-}
-
-/** Whether the user has acknowledged the public-link confirmation for this branch. */
-export async function isPublicConfirmed(projectDir: string, branch: string): Promise<boolean> {
-	const all = await readAll(projectDir);
-	return all.branches[branch]?.confirmedPublic === true;
-}
-
-/** Records that the user acknowledged the public-link confirmation for this branch. */
-export async function markPublicConfirmed(projectDir: string, branch: string): Promise<void> {
-	return serialize(projectDir, async () => {
-		const all = await readAll(projectDir);
-		const prev = all.branches[branch];
-		const branches = { ...all.branches, [branch]: { ...(prev ?? blankRecord()), confirmedPublic: true } };
-		await writeAll(projectDir, { version: SHARES_VERSION, branches });
-	});
-}
-
-/** A placeholder record for a branch confirmed-public before any share exists. */
-function blankRecord(): BranchShareRecord {
-	return { shareId: "", shareUrl: "", visibility: "public", expiresAt: "", decisionCount: 0 };
 }

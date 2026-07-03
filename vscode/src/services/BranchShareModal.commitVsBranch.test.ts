@@ -14,7 +14,6 @@ const h = vi.hoisted(() => ({
 	createLiveShare: vi.fn(),
 	updateLiveShare: vi.fn(),
 	revokeBranchShare: vi.fn(),
-	updateBranchShareExpiry: vi.fn(),
 	loadBranchSummaries: vi.fn(),
 	getDefaultBranch: vi.fn(),
 	getCanonicalRepoUrl: vi.fn(),
@@ -26,7 +25,6 @@ vi.mock("./JolliShareService.js", () => ({
 	createLiveShare: h.createLiveShare,
 	updateLiveShare: h.updateLiveShare,
 	revokeBranchShare: h.revokeBranchShare,
-	updateBranchShareExpiry: h.updateBranchShareExpiry,
 }));
 vi.mock("./JolliPushOrchestrator.js", () => ({
 	pushSummaryWithAttachments: h.push,
@@ -34,10 +32,16 @@ vi.mock("./JolliPushOrchestrator.js", () => ({
 }));
 vi.mock("../views/BranchSummaryLoader.js", () => ({ loadBranchSummaries: h.loadBranchSummaries }));
 vi.mock("../../../cli/src/core/GitOps.js", () => ({ getDefaultBranch: h.getDefaultBranch }));
-vi.mock("../util/GitRemoteUtils.js", () => ({ getCanonicalRepoUrl: h.getCanonicalRepoUrl }));
+vi.mock("../util/GitRemoteUtils.js", async (importActual) => ({
+	...(await importActual<typeof import("../util/GitRemoteUtils.js")>()),
+	getCanonicalRepoUrl: h.getCanonicalRepoUrl,
+}));
 vi.mock("../../../cli/src/core/KBPathResolver.js", () => ({ extractRepoName: h.extractRepoName }));
 vi.mock("../../../cli/src/core/SummaryExporter.js", () => ({ slugify: h.slugify }));
-vi.mock("../../../cli/src/core/SummaryStore.js", () => ({ resolveEffectiveTopics: () => [] }));
+vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
+	resolveEffectiveTopics: () => [],
+	resolveEffectiveRecap: () => undefined,
+}));
 vi.mock("../views/SummaryUtils.js", () => ({ buildBranchRelativePath: (b: string) => b }));
 vi.mock("../../../cli/src/core/JolliApiUtils.js", () => ({
 	parseJolliApiKey: () => ({ u: "https://acme.jolli.ai" }),
@@ -45,8 +49,8 @@ vi.mock("../../../cli/src/core/JolliApiUtils.js", () => ({
 }));
 vi.mock("../util/Logger.js", () => ({ log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
-import { getBranchShare } from "../../../cli/src/core/BranchShareStore.js";
-import { createShareModal, openShareModal, type ShareModalContext, type ShareModalIO } from "./BranchShareModal.js";
+import { getShare } from "../../../cli/src/core/BranchShareStore.js";
+import { copyShareLinkModal, openShareModal, type ShareModalContext, type ShareModalIO } from "./BranchShareModal.js";
 
 const BRANCH = "feature/x";
 const TIP = "z".repeat(40);
@@ -63,11 +67,8 @@ function makeIO(): ShareModalIO & { states: Array<{ kind: string; shareUrl?: str
 	return {
 		states,
 		postState: vi.fn((s) => states.push(s as { kind: string })),
-		openUrl: vi.fn().mockResolvedValue(undefined),
-		composeEmail: vi.fn().mockResolvedValue(undefined),
-		copyMessage: vi.fn().mockResolvedValue(undefined),
-		openSocial: vi.fn().mockResolvedValue(undefined),
-		formatExpiry: vi.fn(() => "expires"),
+		copyToClipboard: vi.fn().mockResolvedValue(true),
+		postCopyResult: vi.fn(),
 		notifyError: vi.fn(),
 		notifyInfo: vi.fn(),
 	};
@@ -79,11 +80,10 @@ const ctx = (over: Partial<ShareModalContext>): ShareModalContext => ({
 	branch: BRANCH,
 	apiKey: "KEY",
 	subjectTitle: BRANCH,
-	visibility: "public",
-	recipients: [],
 	canOrg: false,
 	owner: { name: "Dev", email: "dev@example.com" },
-	directory: [],
+	accountMembers: [],
+	gitCollaborators: [],
 	bridge: { storeSummary: vi.fn() } as never,
 	resolveBinding: vi.fn(),
 	...over,
@@ -120,19 +120,19 @@ describe("commit share then branch share (live)", () => {
 
 		// 1) Share the OLDER commit.
 		const io1 = makeIO();
-		await createShareModal(io1, ctx({ commitHash: OLDER }));
+		await copyShareLinkModal(io1, ctx({ commitHash: OLDER }), "public");
 
 		// 2) Share the whole branch.
 		const io2 = makeIO();
-		await createShareModal(io2, ctx({ commitHash: undefined }));
+		await copyShareLinkModal(io2, ctx({ commitHash: undefined }), "public");
 
 		expect(h.createLiveShare).toHaveBeenCalledTimes(2);
 		expect(h.createLiveShare.mock.calls[0][2]).toMatchObject({ kind: "commit", headCommitHash: OLDER });
 		expect(h.createLiveShare.mock.calls[1][2]).toMatchObject({ kind: "branch", headCommitHash: TIP });
 
 		// Distinct persisted records: commit-keyed vs branch-keyed, with distinct URLs.
-		expect((await getBranchShare(cwd, BRANCH, OLDER))?.shareUrl).toBe(COMMIT_URL);
-		expect((await getBranchShare(cwd, BRANCH))?.shareUrl).toBe(BRANCH_URL);
+		expect((await getShare(cwd, BRANCH, OLDER))?.shareUrl).toBe(COMMIT_URL);
+		expect((await getShare(cwd, BRANCH))?.shareUrl).toBe(BRANCH_URL);
 	});
 
 	it("reopening the branch share re-serves the BRANCH url (not the commit's)", async () => {
@@ -142,18 +142,18 @@ describe("commit share then branch share (live)", () => {
 
 		// 1) Branch share first.
 		const io1 = makeIO();
-		await createShareModal(io1, ctx({ commitHash: undefined }));
+		await copyShareLinkModal(io1, ctx({ commitHash: undefined }), "public");
 
 		// 2) Commit share.
 		const io2 = makeIO();
-		await createShareModal(io2, ctx({ commitHash: OLDER }));
+		await copyShareLinkModal(io2, ctx({ commitHash: OLDER }), "public");
 
 		// 3) Reopen the branch share → re-serves the BRANCH url, no regenerate.
 		h.createLiveShare.mockClear();
 		const io3 = makeIO();
 		await openShareModal(io3, ctx({ commitHash: undefined }));
 		const ready = io3.states.find((s) => s.kind === "ready");
-		expect(ready?.shareUrl).toBe(BRANCH_URL);
+		expect(ready).toMatchObject({ share: { shareUrl: BRANCH_URL } });
 		expect(h.createLiveShare).not.toHaveBeenCalled();
 	});
 });

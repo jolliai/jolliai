@@ -31,7 +31,7 @@ import {
 	generateRecap,
 	translateToEnglish,
 } from "../../../cli/src/core/Summarizer.js";
-import { getRepoContributors } from "../../../cli/src/core/GitOps.js";
+import { getRepoContributors, type RepoContributor } from "../../../cli/src/core/GitOps.js";
 import { runWithTrace } from "../../../cli/src/core/TraceContext.js";
 import {
 	getTranscriptHashes as coreGetTranscriptHashes,
@@ -86,20 +86,17 @@ import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
 import {
 	type ShareKind,
 	type ShareMember,
-	createShareModal,
+	type ShareVisibility,
+	copyShareLinkModal,
 	openShareModal,
-	revokeShareModal,
+	removeRecipientModal,
+	sendInviteModal,
+	setShareAccessModal,
 	type ShareModalContext,
 	type ShareModalIO,
 	type ShareModalState,
-	type ShareTarget,
-	type ShareVisibility,
-	setShareExpiryModal,
-	setShareVisibilityModal,
-	shareModalTarget,
 } from "../services/BranchShareModal.js";
 import { listOrgMembers } from "../services/JolliShareService.js";
-import { buildShareCopyMessage, buildShareEmail, buildSocialShareUrl } from "../services/ShareMessage.js";
 import { BindingChooserWebviewPanel } from "./BindingChooserWebviewPanel.js";
 import { loadBranchSummaries } from "./BranchSummaryLoader.js";
 import { SOURCE_TITLES } from "./SourceLabels.js";
@@ -123,29 +120,35 @@ import { isSummaryError } from "../../../cli/src/core/SummaryErrorMarker.js";
 import { getTranscriptIds } from "../../../cli/src/core/SummaryTree.js";
 import type { LlmConfig } from "../../../cli/src/Types.js";
 
-/** The user's access + expiry + recipient choices from the share modal webview. */
-interface ShareSelection {
-	readonly visibility: ShareVisibility;
-	readonly recipients: ReadonlyArray<string>;
-	/** Link lifetime in days chosen in the pane; applied at create. Omit for the server default. */
-	readonly expiryDays?: number;
-}
-const DEFAULT_SHARE_SELECTION: ShareSelection = { visibility: "public", recipients: [] };
-
-const SHARE_VISIBILITIES = new Set<ShareVisibility>(["public", "org", "people"]);
 const SHARE_KINDS = new Set<ShareKind>(["branch", "commit"]);
-const SHARE_EXPIRY_DAYS = new Set([7, 30, 90, 365]);
-const SHARE_TARGETS = new Set<ShareTarget>([
-	"page",
-	"email",
-	"copy",
-	"x",
-	"linkedin",
-	"reddit",
-	"whatsapp",
-	"telegram",
-]);
+const SHARE_VISIBILITIES = new Set<ShareVisibility>(["public", "org", "people"]);
 const SHARE_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * Repo contributors (a full-history `git log`) back the share picker's "Git
+ * collaborators" suggestion group. They change only when new commits land, and the
+ * share popover re-resolves its context on every interaction (copy / set-access /
+ * invite / remove), so cache per workspace to keep those clicks off `git log`.
+ * A long TTL — effectively the session — since the candidate-email list is a
+ * convenience, not access control (mirrors {@link listOrgMembers}'s own cache).
+ */
+const CONTRIBUTORS_TTL_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
+const contributorsCache = new Map<string, { contributors: RepoContributor[]; ts: number }>();
+
+/** Test hook: drops all cached contributor lists so cases don't leak into each other. */
+export function clearContributorsCache(): void {
+	contributorsCache.clear();
+}
+
+async function getCachedRepoContributors(workspaceRoot: string): Promise<RepoContributor[]> {
+	const cached = contributorsCache.get(workspaceRoot);
+	if (cached && Date.now() - cached.ts < CONTRIBUTORS_TTL_MS) {
+		return cached.contributors;
+	}
+	const contributors = await getRepoContributors(workspaceRoot);
+	contributorsCache.set(workspaceRoot, { contributors, ts: Date.now() });
+	return contributors;
+}
 
 function normalizeShareVisibility(value: unknown): ShareVisibility | undefined {
 	return typeof value === "string" && SHARE_VISIBILITIES.has(value as ShareVisibility)
@@ -155,14 +158,6 @@ function normalizeShareVisibility(value: unknown): ShareVisibility | undefined {
 
 function normalizeShareKind(value: unknown): ShareKind {
 	return typeof value === "string" && SHARE_KINDS.has(value as ShareKind) ? (value as ShareKind) : "branch";
-}
-
-function normalizeShareTarget(value: unknown): ShareTarget | undefined {
-	return typeof value === "string" && SHARE_TARGETS.has(value as ShareTarget) ? (value as ShareTarget) : undefined;
-}
-
-function normalizeShareExpiryDays(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isInteger(value) && SHARE_EXPIRY_DAYS.has(value) ? value : undefined;
 }
 
 function normalizeShareRecipients(value: unknown): string[] {
@@ -281,26 +276,16 @@ type WebviewMessage =
 	| { command: "generateRecap" }
 	| { command: "regenerateSummary" }
 	| { command: "shareBranch"; shareKind?: ShareKind }
-	| { command: "shareRevoke"; shareKind?: ShareKind }
+	| { command: "shareCopyLink"; visibility: ShareVisibility; shareKind?: ShareKind }
+	| { command: "shareSetAccess"; visibility: ShareVisibility; shareKind?: ShareKind }
 	| {
-			command: "shareCreate";
-			visibility: ShareVisibility;
-			recipients?: ReadonlyArray<string>;
+			command: "shareSendInvite";
+			recipients: ReadonlyArray<string>;
+			message?: string;
+			visibility?: ShareVisibility;
 			shareKind?: ShareKind;
 	  }
-	| {
-			command: "shareOpenTarget";
-			target: "page" | "email" | "copy" | "x" | "linkedin" | "reddit" | "whatsapp" | "telegram";
-			shareKind?: ShareKind;
-			recipients?: ReadonlyArray<string>;
-	  }
-	| { command: "shareSetExpiry"; days: number; shareKind?: ShareKind }
-	| {
-			command: "shareSetAudience";
-			visibility: ShareVisibility;
-			recipients?: ReadonlyArray<string>;
-			shareKind?: ShareKind;
-	  }
+	| { command: "shareRemoveRecipient"; email: string; shareKind?: ShareKind }
 	| { command: "openRewrittenCommit"; hash: string };
 
 /** Entry data sent back from the webview on Save All. */
@@ -399,14 +384,6 @@ const REGENERATE_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set
 
 function isRegenerateSafeCommand(command: WebviewMessage["command"]): boolean {
 	return REGENERATE_SAFE_COMMANDS.has(command);
-}
-
-/** Formats a share's ISO expiry into a short "expires Sep 1, 2026" label; "" when absent/invalid. */
-function formatExpiry(iso: string): string {
-	if (!iso) return "";
-	const t = Date.parse(iso);
-	if (Number.isNaN(t)) return "";
-	return `expires ${new Date(t).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })}`;
 }
 
 export class SummaryWebviewPanel {
@@ -655,64 +632,62 @@ export class SummaryWebviewPanel {
 				break;
 			case "shareBranch":
 				if (this.currentSummary) {
-					this.catchAndShow(this.handleShareModal("open", normalizeShareKind(message.shareKind)), "Share failed");
+					this.catchAndShow(
+					this.handleShareAction(normalizeShareKind(message.shareKind), openShareModal, true),
+					"Share failed",
+				);
 				}
 				break;
-			case "shareRevoke":
-				if (this.currentSummary) {
-					this.catchAndShow(this.handleShareModal("revoke", normalizeShareKind(message.shareKind)), "Share failed");
-				}
-				break;
-			case "shareCreate":
+			case "shareCopyLink":
 				if (this.currentSummary) {
 					const visibility = normalizeShareVisibility(message.visibility);
 					if (!visibility) {
-						vscode.window.showErrorMessage("Invalid share audience.");
-						break;
-					}
-					const selection: ShareSelection = {
-						visibility,
-						recipients: normalizeShareRecipients(message.recipients),
-					};
-					this.catchAndShow(this.handleShareModal("create", normalizeShareKind(message.shareKind), selection), "Share failed");
-				}
-				break;
-			case "shareOpenTarget":
-				if (this.currentSummary) {
-					const target = normalizeShareTarget(message.target);
-					if (!target) {
-						vscode.window.showErrorMessage("Invalid share action.");
-						break;
-					}
-					const selection: ShareSelection = {
-						visibility: "public",
-						recipients: normalizeShareRecipients(message.recipients),
-					};
-					this.catchAndShow(this.handleShareTarget(target, normalizeShareKind(message.shareKind), selection), "Share failed");
-				}
-				break;
-			case "shareSetExpiry":
-				if (this.currentSummary) {
-					const days = normalizeShareExpiryDays(message.days);
-					if (!days) {
-						vscode.window.showErrorMessage("Invalid share expiry.");
-						break;
-					}
-					this.catchAndShow(this.handleShareSetExpiry(days, normalizeShareKind(message.shareKind)), "Share failed");
-				}
-				break;
-			case "shareSetAudience":
-				if (this.currentSummary) {
-					const visibility = normalizeShareVisibility(message.visibility);
-					if (!visibility) {
-						vscode.window.showErrorMessage("Invalid share audience.");
+						vscode.window.showErrorMessage("Invalid share access level.");
 						break;
 					}
 					this.catchAndShow(
-						this.handleShareSetAudience(
-							visibility,
-							normalizeShareRecipients(message.recipients),
-							normalizeShareKind(message.shareKind),
+						this.handleShareAction(normalizeShareKind(message.shareKind), (io, ctx) =>
+							copyShareLinkModal(io, ctx, visibility),
+						),
+						"Share failed",
+					);
+				}
+				break;
+			case "shareSetAccess":
+				if (this.currentSummary) {
+					const visibility = normalizeShareVisibility(message.visibility);
+					if (!visibility) {
+						vscode.window.showErrorMessage("Invalid share access level.");
+						break;
+					}
+					this.catchAndShow(
+						this.handleShareAction(normalizeShareKind(message.shareKind), (io, ctx) =>
+							setShareAccessModal(io, ctx, visibility),
+						),
+						"Share failed",
+					);
+				}
+				break;
+			case "shareSendInvite":
+				if (this.currentSummary) {
+					const recipients = normalizeShareRecipients(message.recipients);
+					const note = typeof message.message === "string" ? message.message.slice(0, 2000) : undefined;
+					// The tier the user had selected; a first invite mints the link at it.
+					const inviteVisibility = normalizeShareVisibility(message.visibility);
+					this.catchAndShow(
+						this.handleShareAction(normalizeShareKind(message.shareKind), (io, ctx) =>
+							sendInviteModal(io, ctx, recipients, note, inviteVisibility),
+						),
+						"Share failed",
+					);
+				}
+				break;
+			case "shareRemoveRecipient":
+				if (this.currentSummary) {
+					const email = typeof message.email === "string" ? message.email : "";
+					this.catchAndShow(
+						this.handleShareAction(normalizeShareKind(message.shareKind), (io, ctx) =>
+							removeRecipientModal(io, ctx, email),
 						),
 						"Share failed",
 					);
@@ -1828,6 +1803,152 @@ export class SummaryWebviewPanel {
 	}
 
 	/**
+	 * Builds the VS Code-backed ShareModalIO: pushes modal states to the webview
+	 * and opens external targets (browser page / mail client / clipboard).
+	 */
+	private buildShareModalIO(): ShareModalIO {
+		return {
+			postState: (state: ShareModalState) => {
+				this.panel.webview.postMessage({ command: "shareState", state });
+			},
+			// Clipboard writes happen host-side (webview postMessage is one-way, so the
+			// modal can't hand the URL back for a client-side copy); the webview only
+			// gets the shareCopyResult ack to flash its button.
+			copyToClipboard: async (text) => {
+				try {
+					await vscode.env.clipboard.writeText(text);
+					return true;
+				} catch {
+					return false;
+				}
+			},
+			postCopyResult: (result) => {
+				this.panel.webview.postMessage({ command: "shareCopyResult", ...result });
+			},
+			notifyError: (message) => {
+				vscode.window.showErrorMessage(message);
+			},
+			notifyInfo: (message) => {
+				vscode.window.showInformationMessage(message);
+			},
+		};
+	}
+
+	/**
+	 * Resolves the share context for the current summary: the current branch, API
+	 * key, the two suggestion groups (jolli account members / git collaborators),
+	 * the bridge (for the live push), and a binding-chooser callback.
+	 */
+	private async shareContext(kind: ShareKind = "branch"): Promise<ShareModalContext | undefined> {
+		const summary = this.currentSummary;
+		if (!summary) return undefined;
+		const config = await loadGlobalConfig();
+		// Branch shares are sourced from the CURRENT git checkout (base..HEAD), so their
+		// label/key follows HEAD. Commit shares are the open memory itself; keep them
+		// bound to `summary.branch` so a later branch switch doesn't make "Share this
+		// memory" re-filter the wrong branch and lose the commit.
+		const current = await this.bridge.getCurrentBranch();
+		// A branch share needs a real named branch to label + key by. In detached HEAD
+		// (`getCurrentBranch()` → "HEAD") the content would still be the detached
+		// base..HEAD but get mislabeled/miskeyed under `summary.branch`, so block it and
+		// tell the user. Commit shares are unaffected (bound to the memory's own commit).
+		if (kind === "branch" && current === "HEAD") {
+			vscode.window.showWarningMessage(
+				"Can't share a branch while HEAD is detached — check out a branch first, then share.",
+			);
+			return undefined;
+		}
+		const branch = kind === "commit" ? summary.branch : current || summary.branch;
+		const commitHash = kind === "commit" ? summary.commitHash : undefined;
+		const apiKey = config.jolliApiKey;
+		const keyMeta = apiKey ? parseJolliApiKey(apiKey) : null;
+		const baseUrl = keyMeta?.u || "";
+		// The org toggle is only meaningful when the key carries an org.
+		const canOrg = Boolean(keyMeta?.o);
+		// Two suggestion groups for the invite search: "From your jolli account" (org
+		// members, cached + capped in the service) and "Git collaborators" (repo
+		// contributors with deliverable emails, minus anyone already in the account
+		// group — the account entry carries the better name). These four lookups are
+		// independent — a whole-history git log, a network GET, and two git-config
+		// reads — so run them concurrently to keep modal-open latency the max, not the
+		// sum. The git-config owner name is only a fallback, but fetching it eagerly
+		// (a cheap read) is what lets the join happen in one await.
+		const [contributors, accountMembers, ownerEmail, ownerNameFromGit] = await Promise.all([
+			getCachedRepoContributors(this.workspaceRoot),
+			apiKey ? listOrgMembers(baseUrl, apiKey).catch(() => []) : Promise.resolve([]),
+			this.bridge.getCurrentUserEmail(),
+			this.bridge.getCurrentUserName(),
+		]);
+		const accountEmails = new Set(accountMembers.map((m) => m.email.trim().toLowerCase()));
+		const gitCollaborators = dedupeMembersByEmail(
+			contributors.map((c) => ({ name: c.name, email: c.email })),
+		).filter((m) => !accountEmails.has(m.email.trim().toLowerCase()));
+		const ownerLower = ownerEmail.toLowerCase();
+		const ownerName =
+			[...accountMembers, ...gitCollaborators].find((m) => m.email.toLowerCase() === ownerLower)?.name ||
+			ownerNameFromGit;
+		const owner = { name: ownerName, email: ownerEmail };
+		return {
+			workspaceRoot: this.workspaceRoot,
+			branch,
+			apiKey,
+			commitHash,
+			commitSummary: kind === "commit" ? summary : undefined,
+			subjectTitle: kind === "commit" ? summary.commitMessage : branch,
+			canOrg,
+			owner,
+			accountMembers,
+			gitCollaborators,
+			bridge: this.bridge,
+			resolveBinding: async (repo) => {
+				const outcome = await BindingChooserWebviewPanel.openAndAwait({
+					extensionUri: this.extensionUri,
+					baseUrl: baseUrl.replace(/\/+$/, ""),
+					apiKey: apiKey ?? "",
+					repoUrl: repo,
+					suggestedRepoName: deriveRepoNameFromUrl(repo),
+				});
+				if (outcome.kind === "selected") return { status: "bound" };
+				if (outcome.kind === "anotherOpen") return { status: "anotherOpen" };
+				return { status: "cancelled" };
+			},
+			nowMs: Date.now(),
+		};
+	}
+
+	/**
+	 * Runs one share-modal entry point (open / copy-link / org-toggle / invite /
+	 * remove-recipient / stop-link / open-target) against a freshly-resolved
+	 * context. Foreign summaries can't reach here (the share commands are not in
+	 * FOREIGN_SAFE_COMMANDS) — sharing always targets the current workspace.
+	 */
+	private async handleShareAction(
+		kind: ShareKind,
+		action: (io: ShareModalIO, ctx: ShareModalContext) => Promise<void>,
+		opensModal = false,
+	): Promise<void> {
+		const ctx = await this.shareContext(kind);
+		const io = this.buildShareModalIO();
+		if (!ctx) {
+			// No context (e.g. detached HEAD / missing current summary). Ack a failed
+			// copy so an optimistically-disabled Copy button re-enables.
+			io.postCopyResult({ ok: false });
+			// ONLY the open path put the webview on the loading pane (which would spin
+			// forever without a state) — post an error so it recovers. For other actions
+			// the popover is already on the main pane; posting an error would destructively
+			// tear it down (and discard the user's dropdown/staged state), so we don't.
+			if (opensModal) {
+				io.postState({
+					kind: "error",
+					message: "Can't share right now — if HEAD is detached, check out a branch first, then reopen Share.",
+				});
+			}
+			return;
+		}
+		await action(io, ctx);
+	}
+
+	/**
 	 * Orchestrates the push to Jolli Cloud and posts the result message back
 	 * to the webview. Wrapped in `Promise.allSettled` semantics by
 	 * {@link toJolliResultMessage} so a thrown error becomes a structured
@@ -1847,167 +1968,6 @@ export class SummaryWebviewPanel {
 	 * Trade-off is favourable for the common case; documented here so a
 	 * future maintainer doesn't quietly add the re-check without realising.
 	 */
-	/**
-	 * Builds the VS Code-backed ShareModalIO: pushes modal states to the webview
-	 * and opens external targets (browser page / mail client / clipboard).
-	 */
-	private buildShareModalIO(kind: ShareKind = "branch"): ShareModalIO {
-		// The share kind is fixed for the modal session; capture it (and derive the
-		// commit hash) here so the IO method signatures stay branch-shaped and the
-		// kind-aware copy is selected without threading extra params through.
-		const shareKind: "branch" | "commit" = kind === "commit" ? "commit" : "branch";
-		return {
-			postState: (state: ShareModalState) => {
-				this.panel.webview.postMessage({ command: "shareState", state });
-			},
-			openUrl: async (url) => {
-				await vscode.env.openExternal(vscode.Uri.parse(url));
-			},
-			composeEmail: async (branch, url, decisionCount, titles, recipients) => {
-				const { subject, body } = buildShareEmail({ branch, url, decisionCount, titles, kind: shareKind });
-				// Recipients go in the mailto `To:` (comma-separated). They are added only
-				// to this local link — they never reach the server (delivery is client-side).
-				const to = (recipients ?? []).map((r) => encodeURIComponent(r.trim())).join(",");
-				const qs = `subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-				await vscode.env.openExternal(vscode.Uri.parse(`mailto:${to}?${qs}`));
-			},
-			copyMessage: async (branch, url, decisionCount, titles) => {
-				const message = buildShareCopyMessage({ branch, url, decisionCount, titles, kind: shareKind });
-				await vscode.env.clipboard.writeText(message);
-				vscode.window.showInformationMessage("Share message copied — paste it into Slack, IM, or anywhere.");
-			},
-			openSocial: async (platform, branch, url, decisionCount, titles) => {
-				const intentUrl = buildSocialShareUrl(platform, { branch, url, decisionCount, titles, kind: shareKind });
-				await vscode.env.openExternal(vscode.Uri.parse(intentUrl));
-			},
-			formatExpiry,
-			notifyError: (message) => {
-				vscode.window.showErrorMessage(message);
-			},
-			notifyInfo: (message) => {
-				vscode.window.showInformationMessage(message);
-			},
-		};
-	}
-
-	/**
-	 * Resolves the share context for the current summary: the current branch, API
-	 * key, the chosen access level + recipients, the bridge (for the live push), and
-	 * a binding-chooser callback. `selection` carries the user's access/recipient
-	 * choices from the webview (defaults: `public`, no recipients).
-	 */
-	private async shareContext(
-		kind: ShareKind = "branch",
-		selection: ShareSelection = DEFAULT_SHARE_SELECTION,
-	): Promise<ShareModalContext | undefined> {
-		const summary = this.currentSummary;
-		if (!summary) return undefined;
-		const config = await loadGlobalConfig();
-		// Branch shares are sourced from the CURRENT git checkout (base..HEAD), so their
-		// label/key follows HEAD. Commit shares are the open memory itself; keep them
-		// bound to `summary.branch` so a later branch switch doesn't make "Share this
-		// memory" re-filter the wrong branch and lose the commit.
-		const current = await this.bridge.getCurrentBranch();
-		const branch = kind === "commit" ? summary.branch : current && current !== "HEAD" ? current : summary.branch;
-		const commitHash = kind === "commit" ? summary.commitHash : undefined;
-		const apiKey = config.jolliApiKey;
-		const keyMeta = apiKey ? parseJolliApiKey(apiKey) : null;
-		const baseUrl = keyMeta?.u || "";
-		// `org` access is only meaningful when the key carries an org. Repo contributors
-		// (deliverable emails) prefill the "send link to" field; read-only, no checkout.
-		const canOrg = Boolean(keyMeta?.o);
-		// Build the add-people directory (for `people` search + name resolution): org
-		// members (best-effort) + git contributors, deduped by lowercased email. The current
-		// git user is the fixed Owner row.
-		const contributors = await getRepoContributors(this.workspaceRoot);
-		const orgMembers = apiKey ? await listOrgMembers(baseUrl, apiKey).catch(() => []) : [];
-		const directory = dedupeMembersByEmail([...orgMembers, ...contributors.map((c) => ({ name: c.name, email: c.email }))]);
-		const ownerEmail = await this.bridge.getCurrentUserEmail();
-		const ownerName =
-			directory.find((m) => m.email.toLowerCase() === ownerEmail.toLowerCase())?.name ||
-			(await this.bridge.getCurrentUserName());
-		const owner = { name: ownerName, email: ownerEmail };
-		return {
-			workspaceRoot: this.workspaceRoot,
-			branch,
-			apiKey,
-			commitHash,
-			commitSummary: kind === "commit" ? summary : undefined,
-			subjectTitle: kind === "commit" ? summary.commitMessage : branch,
-			visibility: selection.visibility,
-			recipients: selection.recipients,
-			expiryDays: selection.expiryDays,
-			canOrg,
-			owner,
-			directory,
-			bridge: this.bridge,
-			resolveBinding: async (repo) => {
-				const outcome = await BindingChooserWebviewPanel.openAndAwait({
-					extensionUri: this.extensionUri,
-					baseUrl: baseUrl.replace(/\/+$/, ""),
-					apiKey: apiKey ?? "",
-					repoUrl: repo,
-					suggestedRepoName: deriveRepoNameFromUrl(repo),
-				});
-				if (outcome.kind === "selected") return { status: "bound" };
-				if (outcome.kind === "anotherOpen") return { status: "anotherOpen" };
-				return { status: "cancelled" };
-			},
-			nowMs: Date.now(),
-		};
-	}
-
-	/**
-	 * Drives the in-panel "Share this branch" modal (public read-only link).
-	 * Foreign summaries can't reach here (the share commands are not in
-	 * FOREIGN_SAFE_COMMANDS) — sharing always targets the current workspace.
-	 */
-	private async handleShareModal(
-		step: "open" | "create" | "revoke",
-		kind: ShareKind = "branch",
-		selection: ShareSelection = DEFAULT_SHARE_SELECTION,
-	): Promise<void> {
-		const ctx = await this.shareContext(kind, selection);
-		if (!ctx) return;
-		const io = this.buildShareModalIO(kind);
-		if (step === "open") await openShareModal(io, ctx);
-		else if (step === "create") await createShareModal(io, ctx);
-		else await revokeShareModal(io, ctx);
-	}
-
-	private async handleShareTarget(
-		target: "page" | "email" | "copy" | "x" | "linkedin" | "reddit" | "whatsapp" | "telegram",
-		kind: ShareKind = "branch",
-		selection: ShareSelection = DEFAULT_SHARE_SELECTION,
-	): Promise<void> {
-		const ctx = await this.shareContext(kind, selection);
-		if (!ctx) return;
-		await shareModalTarget(this.buildShareModalIO(kind), ctx, target);
-	}
-
-	private async handleShareSetExpiry(
-		days: number,
-		kind: ShareKind = "branch",
-		selection: ShareSelection = DEFAULT_SHARE_SELECTION,
-	): Promise<void> {
-		const ctx = await this.shareContext(kind, selection);
-		if (!ctx) return;
-		// PATCH wants an absolute timestamp; compute it from the chosen lifetime.
-		const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
-		await setShareExpiryModal(this.buildShareModalIO(kind), ctx, expiresAt);
-	}
-
-	private async handleShareSetAudience(
-		visibility: ShareVisibility,
-		recipients: ReadonlyArray<string>,
-		kind: ShareKind = "branch",
-		selection: ShareSelection = DEFAULT_SHARE_SELECTION,
-	): Promise<void> {
-		const ctx = await this.shareContext(kind, selection);
-		if (!ctx) return;
-		await setShareVisibilityModal(this.buildShareModalIO(kind), ctx, visibility, recipients);
-	}
-
 	private async handlePush(): Promise<void> {
 		// Prevent concurrent pushes: the button can be re-clicked when
 		// runJolliPush throws before posting pushStarted (button never

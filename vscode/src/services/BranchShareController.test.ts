@@ -1,116 +1,63 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
-	getBranchShare: vi.fn(),
+	getShare: vi.fn(),
 	putBranchShare: vi.fn(),
-	removeBranchShare: vi.fn(),
+	removeShare: vi.fn(),
 	revokeBranchShare: vi.fn(),
-	updateBranchShareExpiry: vi.fn(),
 	updateLiveShare: vi.fn(),
 }));
 
 vi.mock("../../../cli/src/core/BranchShareStore.js", () => ({
-	getBranchShare: h.getBranchShare,
+	getShare: h.getShare,
 	putBranchShare: h.putBranchShare,
-	removeBranchShare: h.removeBranchShare,
-	isPublicConfirmed: vi.fn(),
-	markPublicConfirmed: vi.fn(),
+	removeShare: h.removeShare,
 }));
 vi.mock("./JolliShareService.js", () => ({
 	revokeBranchShare: h.revokeBranchShare,
-	updateBranchShareExpiry: h.updateBranchShareExpiry,
 	updateLiveShare: h.updateLiveShare,
 }));
 
-import { revokeBranchShareForBranch, setBranchShareExpiry, setBranchShareVisibility } from "./BranchShareController.js";
+import { patchShareAudience, revokeShare } from "./BranchShareController.js";
 
 beforeEach(() => {
 	for (const fn of Object.values(h)) fn.mockReset();
 });
 
-describe("revokeBranchShareForBranch", () => {
-	it("revokes the server share and clears the local record", async () => {
-		h.getBranchShare.mockResolvedValue({ shareId: "sh_1" });
-		await revokeBranchShareForBranch("/repo", "feature/x", "KEY");
+describe("revokeShare", () => {
+	it("revokes the server share and clears the record", async () => {
+		h.getShare.mockResolvedValue({ shareId: "sh_1" });
+		await revokeShare("/repo", "feature/x", "KEY");
 		expect(h.revokeBranchShare).toHaveBeenCalledWith(undefined, "KEY", "sh_1");
-		expect(h.removeBranchShare).toHaveBeenCalledWith("/repo", "feature/x", undefined);
+		expect(h.removeShare).toHaveBeenCalledWith("/repo", "feature/x", undefined);
 	});
 
-	it("revokes a commit share under its commit key", async () => {
+	it("keys a commit share by its commit hash", async () => {
 		const commitHash = "c".repeat(40);
-		h.getBranchShare.mockResolvedValue({ shareId: "sh_2" });
-		await revokeBranchShareForBranch("/repo", "feature/x", "KEY", commitHash);
-		expect(h.getBranchShare).toHaveBeenCalledWith("/repo", "feature/x", commitHash);
-		expect(h.revokeBranchShare).toHaveBeenCalledWith(undefined, "KEY", "sh_2");
-		expect(h.removeBranchShare).toHaveBeenCalledWith("/repo", "feature/x", commitHash);
+		h.getShare.mockResolvedValue({ shareId: "sh_2" });
+		await revokeShare("/repo", "feature/x", "KEY", commitHash);
+		expect(h.getShare).toHaveBeenCalledWith("/repo", "feature/x", commitHash);
+		expect(h.removeShare).toHaveBeenCalledWith("/repo", "feature/x", commitHash);
 	});
 
-	it("skips the server call when there is no stored share", async () => {
-		h.getBranchShare.mockResolvedValue(undefined);
-		await revokeBranchShareForBranch("/repo", "feature/x", "KEY");
+	it("skips the server call when there is no stored share (still clears locally)", async () => {
+		h.getShare.mockResolvedValue(undefined);
+		await revokeShare("/repo", "feature/x", "KEY");
 		expect(h.revokeBranchShare).not.toHaveBeenCalled();
-		expect(h.removeBranchShare).toHaveBeenCalledWith("/repo", "feature/x", undefined);
-	});
-
-	it("skips the server call for a confirm-only placeholder (empty shareId)", async () => {
-		h.getBranchShare.mockResolvedValue({ shareId: "" });
-		await revokeBranchShareForBranch("/repo", "feature/x", "KEY");
-		expect(h.revokeBranchShare).not.toHaveBeenCalled();
-		expect(h.removeBranchShare).toHaveBeenCalledWith("/repo", "feature/x", undefined);
+		expect(h.removeShare).toHaveBeenCalledWith("/repo", "feature/x", undefined);
 	});
 });
 
-describe("setBranchShareExpiry", () => {
-	const EXPIRES = "2026-10-01T00:00:00.000Z";
-
-	it("PATCHes the share and preserves the live ref/visibility with the new expiry", async () => {
-		const ref = {
-			kind: "branchCollection" as const,
-			relativePath: "feature/x",
-			covered: [{ commitHash: "a".repeat(40), summaryDocId: 11, attachmentDocIds: [12] }],
-		};
-		h.getBranchShare.mockResolvedValue({
-			shareId: "sh_1",
-			shareUrl: "https://acme.jolli.ai/b/x",
-			visibility: "org",
-			ref,
-			headCommitHash: "a".repeat(40),
-			decisionCount: 4,
-		});
-		h.updateBranchShareExpiry.mockResolvedValue({ shareId: "sh_1", expiresAt: EXPIRES, visibility: "org" });
-
-		const out = await setBranchShareExpiry("/repo", "feature/x", "KEY", EXPIRES);
-
-		expect(out).toBe(EXPIRES);
-		expect(h.updateBranchShareExpiry).toHaveBeenCalledWith(undefined, "KEY", "sh_1", EXPIRES);
-		const [, , record] = h.putBranchShare.mock.calls[0];
-		expect(record).toMatchObject({
-			shareId: "sh_1",
-			visibility: "org",
-			ref,
-			expiresAt: EXPIRES, // server-confirmed new value
-		});
-	});
-
-	it("no-ops when there is no stored share", async () => {
-		h.getBranchShare.mockResolvedValue(undefined);
-		const out = await setBranchShareExpiry("/repo", "feature/x", "KEY", EXPIRES);
-		expect(out).toBeUndefined();
-		expect(h.updateBranchShareExpiry).not.toHaveBeenCalled();
-	});
-});
-
-describe("setBranchShareVisibility", () => {
+describe("patchShareAudience", () => {
 	const ref = {
 		kind: "branchCollection" as const,
 		relativePath: "feature/x",
 		covered: [{ commitHash: "a".repeat(40), summaryDocId: 11, attachmentDocIds: [12] }],
 	};
-	const EXISTING = {
+	const MEMBER = {
 		shareId: "sh_1",
-		shareUrl: "https://acme.jolli.ai/b/x",
-		visibility: "public" as const,
-		token8: "tok_olde",
+		shareUrl: "https://acme.jolli.ai/share/branch/1/view",
+		visibility: "org" as const,
 		recipients: ["a@x.com"],
 		ref,
 		headCommitHash: "a".repeat(40),
@@ -119,112 +66,115 @@ describe("setBranchShareVisibility", () => {
 		titles: ["A"],
 	};
 
-	it("public→org: PATCHes and persists the server URL/visibility, dropping the bearer token", async () => {
-		h.getBranchShare.mockResolvedValue(EXISTING);
-		// org switch returns no token (auth-gated link).
-		h.updateLiveShare.mockResolvedValue({
-			shareId: "sh_1",
-			shareUrl: "https://acme.jolli.ai/org/view/1",
-			expiresAt: "2026-10-01T00:00:00.000Z",
-			visibility: "org",
-		});
+	it("org→people: PATCHes visibility, keeps recipients and the member URL", async () => {
+		h.getShare.mockResolvedValue(MEMBER);
+		// The member URL is stable across the toggle — the server omits shareUrl.
+		h.updateLiveShare.mockResolvedValue({ shareId: "sh_1", visibility: "people", recipients: ["a@x.com"] });
 
-		const out = await setBranchShareVisibility("/repo", "feature/x", "KEY", "org");
+		const out = await patchShareAudience("/repo", "feature/x", "KEY", { visibility: "people" });
 
-		expect(out).toBe("org");
-		expect(h.updateLiveShare).toHaveBeenCalledWith(undefined, "KEY", "sh_1", { visibility: "org" });
+		expect(h.updateLiveShare).toHaveBeenCalledWith(undefined, "KEY", "sh_1", { visibility: "people" });
+		expect(out).toMatchObject({ visibility: "people", recipients: ["a@x.com"], shareUrl: MEMBER.shareUrl, ref });
 		const [, , record] = h.putBranchShare.mock.calls[0];
-		expect(record).toMatchObject({
-			shareId: "sh_1",
-			shareUrl: "https://acme.jolli.ai/org/view/1",
-			visibility: "org",
-			ref,
-		});
-		expect(record.token8).toBeUndefined();
+		expect(record).toMatchObject({ visibility: "people", shareUrl: MEMBER.shareUrl });
 	});
 
-	it("org→public: persists the freshly minted bearer token (first 8 chars)", async () => {
-		h.getBranchShare.mockResolvedValue({ ...EXISTING, visibility: "org" });
+	it("flip to public: re-issues the bearer URL and DROPS the recipients allowlist", async () => {
+		h.getShare.mockResolvedValue(MEMBER);
 		h.updateLiveShare.mockResolvedValue({
 			shareId: "sh_1",
-			shareUrl: "https://acme.jolli.ai/b/x",
-			expiresAt: "2026-10-01T00:00:00.000Z",
 			visibility: "public",
-			token: "tok_abcdef_long",
+			shareUrl: "https://acme.jolli.ai/share/tok_new?ref=1",
 		});
 
-		await setBranchShareVisibility("/repo", "feature/x", "KEY", "public");
+		const out = await patchShareAudience("/repo", "feature/x", "KEY", { visibility: "public" });
 
+		expect(out?.visibility).toBe("public");
+		expect(out?.shareUrl).toBe("https://acme.jolli.ai/share/tok_new?ref=1");
+		expect(out?.recipients).toBeUndefined();
 		const [, , record] = h.putBranchShare.mock.calls[0];
-		expect(record).toMatchObject({ visibility: "public", token8: "tok_abcd" });
+		expect("recipients" in record).toBe(false);
 	});
 
-	it("→people: sends the allowlist, persists the echo, keeps the URL on a recipients-only PATCH", async () => {
-		const recipients = ["b@x.com", "c@x.com"];
-		h.getBranchShare.mockResolvedValue(EXISTING);
-		// A recipients-only PATCH doesn't re-mint the link — the server omits shareUrl.
-		h.updateLiveShare.mockResolvedValue({
-			shareId: "sh_1",
-			expiresAt: "2026-10-01T00:00:00.000Z",
+	it("reflects the requested tier even when the server echoes a stale visibility", async () => {
+		// Repro of the UI-revert bug: flip org→public, but the PATCH response echoes
+		// the old tier. The requested visibility must win so the record (and dropdown)
+		// don't snap back to org.
+		h.getShare.mockResolvedValue(MEMBER); // org
+		h.updateLiveShare.mockResolvedValue({ shareId: "sh_1", visibility: "org" });
+
+		const out = await patchShareAudience("/repo", "feature/x", "KEY", { visibility: "public" });
+
+		expect(out?.visibility).toBe("public");
+		const [, , record] = h.putBranchShare.mock.calls[0];
+		expect(record.visibility).toBe("public");
+		expect("recipients" in record).toBe(false); // public drops the allowlist
+	});
+
+	it("recipients change: sends the replacement allowlist and persists the server echo", async () => {
+		const next = ["b@x.com", "c@x.com"];
+		h.getShare.mockResolvedValue(MEMBER);
+		h.updateLiveShare.mockResolvedValue({ shareId: "sh_1", visibility: "org", recipients: next });
+
+		const out = await patchShareAudience("/repo", "feature/x", "KEY", { recipients: next });
+
+		expect(h.updateLiveShare).toHaveBeenCalledWith(undefined, "KEY", "sh_1", { recipients: next });
+		expect(out?.recipients).toEqual(next);
+		expect(out?.visibility).toBe("org");
+	});
+
+	it("preserves unchanged cached fields when the PATCH echoes only changed ones", async () => {
+		h.getShare.mockResolvedValue(MEMBER);
+		h.updateLiveShare.mockResolvedValue({ visibility: "people" });
+
+		const out = await patchShareAudience("/repo", "feature/x", "KEY", { visibility: "people" });
+
+		expect(out).toMatchObject({
+			shareId: MEMBER.shareId,
+			shareUrl: MEMBER.shareUrl,
 			visibility: "people",
-			recipients,
-		});
-
-		const out = await setBranchShareVisibility("/repo", "feature/x", "KEY", "people", undefined, recipients);
-
-		expect(out).toBe("people");
-		expect(h.updateLiveShare).toHaveBeenCalledWith(undefined, "KEY", "sh_1", { visibility: "people", recipients });
-		const [, , record] = h.putBranchShare.mock.calls[0];
-		expect(record.shareUrl).toBe(EXISTING.shareUrl); // existing URL survives the omitted field
-		expect(record.recipients).toEqual(recipients); // server-confirmed allowlist replaces the local one
-	});
-
-	it("preserves unchanged cached fields when a visibility PATCH returns only changed fields", async () => {
-		h.getBranchShare.mockResolvedValue(EXISTING);
-		h.updateLiveShare.mockResolvedValue({ visibility: "public" });
-
-		const out = await setBranchShareVisibility("/repo", "feature/x", "KEY", "public");
-
-		expect(out).toBe("public");
-		const [, , record] = h.putBranchShare.mock.calls[0];
-		expect(record).toMatchObject({
-			shareId: EXISTING.shareId,
-			shareUrl: EXISTING.shareUrl,
-			visibility: "public",
-			token8: EXISTING.token8,
-			expiresAt: EXISTING.expiresAt,
+			recipients: MEMBER.recipients,
+			expiresAt: MEMBER.expiresAt,
 			ref,
-			headCommitHash: EXISTING.headCommitHash,
-			decisionCount: EXISTING.decisionCount,
-			titles: EXISTING.titles,
+			headCommitHash: MEMBER.headCommitHash,
+			decisionCount: MEMBER.decisionCount,
+			titles: MEMBER.titles,
 		});
 	});
 
-	it("no-ops when there is no stored share", async () => {
-		h.getBranchShare.mockResolvedValue(undefined);
-		const out = await setBranchShareVisibility("/repo", "feature/x", "KEY", "org");
-		expect(out).toBeUndefined();
-		expect(h.updateLiveShare).not.toHaveBeenCalled();
+	it("falls back to the patched visibility when the server echoes nothing", async () => {
+		h.getShare.mockResolvedValue({ ...MEMBER, visibility: "org", recipients: undefined });
+		h.updateLiveShare.mockResolvedValue({});
+
+		const out = await patchShareAudience("/repo", "feature/x", "KEY", { recipients: ["z@x.com"] });
+
+		expect(out?.visibility).toBe("org"); // no patch.visibility, no echo → existing wins
+		expect(out?.recipients).toEqual(["z@x.com"]); // from the patch
 	});
 
-	it("no-ops for a confirm-only placeholder (empty shareId)", async () => {
-		h.getBranchShare.mockResolvedValue({ shareId: "" });
-		const out = await setBranchShareVisibility("/repo", "feature/x", "KEY", "org");
+	it("omits recipients entirely when none are known (member had none, patch/echo carry none)", async () => {
+		h.getShare.mockResolvedValue({ ...MEMBER, visibility: "org", recipients: undefined });
+		h.updateLiveShare.mockResolvedValue({});
+
+		const out = await patchShareAudience("/repo", "feature/x", "KEY", { visibility: "people" });
+
+		expect(out?.visibility).toBe("people"); // patch.visibility wins over the missing echo
+		expect(out?.recipients).toBeUndefined(); // no allowlist carried through
+	});
+
+	it("no-ops when there is no link", async () => {
+		h.getShare.mockResolvedValue(undefined);
+		const out = await patchShareAudience("/repo", "feature/x", "KEY", { visibility: "people" });
 		expect(out).toBeUndefined();
 		expect(h.updateLiveShare).not.toHaveBeenCalled();
 	});
 
 	it("keys a commit share by its commit hash", async () => {
 		const commitHash = "c".repeat(40);
-		h.getBranchShare.mockResolvedValue({ ...EXISTING, commitHash });
-		h.updateLiveShare.mockResolvedValue({
-			shareId: "sh_1",
-			shareUrl: "https://acme.jolli.ai/b/x",
-			expiresAt: "2026-10-01T00:00:00.000Z",
-			visibility: "org",
-		});
-		await setBranchShareVisibility("/repo", "feature/x", "KEY", "org", commitHash);
-		expect(h.getBranchShare).toHaveBeenCalledWith("/repo", "feature/x", commitHash);
+		h.getShare.mockResolvedValue({ ...MEMBER, commitHash });
+		h.updateLiveShare.mockResolvedValue({ shareId: "sh_1", visibility: "people" });
+		await patchShareAudience("/repo", "feature/x", "KEY", { visibility: "people" }, commitHash);
+		expect(h.getShare).toHaveBeenCalledWith("/repo", "feature/x", commitHash);
 		expect(h.putBranchShare).toHaveBeenCalledWith("/repo", "feature/x", expect.any(Object), commitHash);
 	});
 });

@@ -148,6 +148,33 @@ export function deriveRepoNameFromUrl(repoUrl: string): string {
 }
 
 /**
+ * Derives the "owner/repo" full name from a remote URL's path (e.g.
+ * `https://github.com/jolliai/jolli` → `jolliai/jolli`), for the two-segment
+ * "owner / repo" display on the share page. Returns `""` when the URL carries no
+ * owner segment — a `file://` local URL, a bare host, or a single-segment path —
+ * so callers can fall back to the bare repo name.
+ */
+export function deriveOwnerRepoFromUrl(repoUrl: string): string {
+	const trimmed = repoUrl.trim();
+	if (trimmed.length === 0) {
+		return "";
+	}
+	let parsed: URL;
+	try {
+		parsed = new URL(trimmed);
+	} catch {
+		return "";
+	}
+	const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
+	if (scheme !== "http" && scheme !== "https" && scheme !== "ssh" && scheme !== "git") {
+		return "";
+	}
+	const path = stripGitSuffixAndSlashes(parsed.pathname.replace(/^\/+/, ""));
+	// A "full name" needs at least owner/repo; a single segment is just the bare repo.
+	return path.includes("/") ? path : "";
+}
+
+/**
  * Sanitizes a branch name into a path-safe slug for use inside `relativePath`.
  * Mirrors the server's `stripPathUnsafeChars` (replace anything outside
  * `[A-Za-z0-9._-]` and `/` with `_`, collapse runs, trim leading/trailing

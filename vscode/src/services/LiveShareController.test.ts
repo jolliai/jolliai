@@ -3,31 +3,42 @@ import type { CommitSummary, PlanReference } from "../../../cli/src/Types.js";
 
 const { mockPush } = vi.hoisted(() => ({ mockPush: vi.fn() }));
 const { mockCreate, mockUpdate } = vi.hoisted(() => ({ mockCreate: vi.fn(), mockUpdate: vi.fn() }));
-const { mockGetShare, mockPutShare } = vi.hoisted(() => ({ mockGetShare: vi.fn(), mockPutShare: vi.fn() }));
+const { mockGetShare, mockPutShare } = vi.hoisted(() => ({
+	mockGetShare: vi.fn(),
+	mockPutShare: vi.fn(),
+}));
 const { mockLoad } = vi.hoisted(() => ({ mockLoad: vi.fn() }));
 const { mockParseKey } = vi.hoisted(() => ({ mockParseKey: vi.fn() }));
 
 vi.mock("./JolliPushOrchestrator.js", () => ({ pushSummaryWithAttachments: mockPush }));
 vi.mock("./JolliShareService.js", () => ({ createLiveShare: mockCreate, updateLiveShare: mockUpdate }));
 vi.mock("../../../cli/src/core/BranchShareStore.js", () => ({
-	getBranchShare: mockGetShare,
+	getShare: mockGetShare,
 	putBranchShare: mockPutShare,
 }));
 vi.mock("../views/BranchSummaryLoader.js", () => ({ loadBranchSummaries: mockLoad }));
 vi.mock("../../../cli/src/core/GitOps.js", () => ({ getDefaultBranch: vi.fn().mockResolvedValue("main") }));
-vi.mock("../util/GitRemoteUtils.js", () => ({
+vi.mock("../util/GitRemoteUtils.js", async (importActual) => ({
+	...(await importActual<typeof import("../util/GitRemoteUtils.js")>()),
 	getCanonicalRepoUrl: vi.fn().mockResolvedValue("https://github.com/acme/repo"),
 }));
 vi.mock("../../../cli/src/core/KBPathResolver.js", () => ({ extractRepoName: () => "repo" }));
 vi.mock("../../../cli/src/core/JolliApiUtils.js", () => ({ parseJolliApiKey: mockParseKey }));
 vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 	resolveEffectiveTopics: (s: CommitSummary) => s.topics ?? [],
+	resolveEffectiveRecap: (s: CommitSummary) => s.recap,
 }));
 vi.mock("../views/SummaryUtils.js", () => ({ buildBranchRelativePath: (b: string) => b }));
 vi.mock("../../../cli/src/core/SummaryExporter.js", () => ({ slugify: (b: string) => b.replace(/\//g, "-") }));
 vi.mock("../util/Logger.js", () => ({ log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
-import { AttachmentPushError, generateLiveShare, NothingToShareError, reconcileLiveShare } from "./LiveShareController.js";
+import {
+	AttachmentPushError,
+	generateLiveShare,
+	NothingToShareError,
+	reconcileLiveShare,
+	subjectFingerprint,
+} from "./LiveShareController.js";
 
 // Maps a commit hash to a deterministic summary docId for assertions.
 const SUMMARY_DOC = { A: 1001, B: 1002, C: 1003 } as const;
@@ -85,6 +96,7 @@ beforeEach(() => {
 		expiresAt: "2026-09-01T00:00:00.000Z",
 		visibility: "public",
 	});
+	mockGetShare.mockResolvedValue(undefined);
 	mockPutShare.mockResolvedValue(undefined);
 	// Default push: echo a docId for the chosen plan/note attachments; summary doc per commit.
 	type Att = { plans: PlanReference[]; notes: Array<{ id: string; title: string; jolliNoteDocId?: number }> };
@@ -113,6 +125,20 @@ beforeEach(() => {
 			isUpdate: false,
 			attachmentCount: plans.length + notes.length,
 		});
+	});
+});
+
+describe("subjectFingerprint", () => {
+	it("moves when only the recap changes on a topics-less summary (share card stays fresh)", () => {
+		const before = [{ ...summary("A"), topics: [], recap: "old recap" } as unknown as CommitSummary];
+		const after = [{ ...summary("A"), topics: [], recap: "new recap" } as unknown as CommitSummary];
+		expect(subjectFingerprint(after)).not.toBe(subjectFingerprint(before));
+	});
+
+	it("is stable when the content is unchanged", () => {
+		const a = [{ ...summary("A"), recap: "same" } as unknown as CommitSummary];
+		const b = [{ ...summary("A"), recap: "same" } as unknown as CommitSummary];
+		expect(subjectFingerprint(a)).toBe(subjectFingerprint(b));
 	});
 });
 
@@ -165,7 +191,6 @@ describe("generateLiveShare", () => {
 		const stored = mockPutShare.mock.calls[0][2];
 		expect(stored.visibility).toBe("public"); // from the (mocked) create result
 		expect(stored.recipients).toBeUndefined(); // recipients are session-only, never persisted
-		expect(stored.token8).toBe("tok_abcd");
 	});
 
 	it("dedupes a recurring NOTE to its newest revision and links both commits to the same doc", async () => {
@@ -344,7 +369,6 @@ describe("generateLiveShare", () => {
 		const stored = mockPutShare.mock.calls[0][2];
 		expect(stored.visibility).toBe("people");
 		expect(stored.recipients).toEqual(["marta@jolli.ai"]);
-		expect(stored.token8).toBeUndefined(); // people shares carry no bearer token
 	});
 
 	it("builds a commitDocs ref for a single-commit share", async () => {
@@ -410,6 +434,49 @@ describe("reconcileLiveShare", () => {
 		expect(mockUpdate).not.toHaveBeenCalled();
 	});
 
+	it("short-circuits (no push, no PATCH) when the content fingerprint is unchanged", async () => {
+		const summaries = [summary("A"), summary("B")];
+		mockGetShare.mockResolvedValue({
+			shareId: "7",
+			shareUrl: "https://acme.jolli.ai/b/x",
+			visibility: "public",
+			ref: { kind: "branchCollection", relativePath: "feature/x", covered: [{ commitHash: "B", summaryDocId: 2, attachmentDocIds: [] }] },
+			expiresAt: "2026-09-01T00:00:00.000Z",
+			decisionCount: 2,
+			headCommitHash: "B",
+			contentHash: subjectFingerprint(summaries), // already at the current content
+		});
+		mockLoad.mockResolvedValue({ summaries, missingCount: 0 });
+
+		await reconcileLiveShare(deps(), "feature/x");
+
+		expect(mockPush).not.toHaveBeenCalled();
+		expect(mockUpdate).not.toHaveBeenCalled();
+		expect(mockPutShare).not.toHaveBeenCalled();
+	});
+
+	it("re-pushes when a memory edit changed content but HEAD did not advance", async () => {
+		const summaries = [summary("A"), summary("B")];
+		mockGetShare.mockResolvedValue({
+			shareId: "7",
+			shareUrl: "https://acme.jolli.ai/b/x",
+			visibility: "public",
+			ref: { kind: "branchCollection", relativePath: "feature/x", covered: [] },
+			expiresAt: "2026-09-01T00:00:00.000Z",
+			decisionCount: 2,
+			headCommitHash: "B", // same tip…
+			contentHash: "stale-different-hash", // …but content changed since last push
+		});
+		mockLoad.mockResolvedValue({ summaries, missingCount: 0 });
+
+		await reconcileLiveShare(deps(), "feature/x");
+
+		expect(mockPush).toHaveBeenCalled();
+		expect(mockUpdate).toHaveBeenCalledOnce();
+		const stored = mockPutShare.mock.calls.at(-1)?.[2];
+		expect(stored.contentHash).toBe(subjectFingerprint(summaries));
+	});
+
 	it("rebuilds covered from the current base..HEAD and PATCHes (drops a removed commit)", async () => {
 		mockGetShare.mockResolvedValue({
 			shareId: "7",
@@ -429,24 +496,22 @@ describe("reconcileLiveShare", () => {
 		expect(ref.covered).toEqual([{ commitHash: "A", summaryDocId: 1001, attachmentDocIds: [] }]);
 	});
 
-	it("recomputes decisionCount/titles from the current base..HEAD (not the stale create-time values)", async () => {
+	it("refreshes the cached decision count from the current base..HEAD (and writes no titles)", async () => {
 		mockGetShare.mockResolvedValue({
 			shareId: "7",
 			shareUrl: "https://acme.jolli.ai/b/x",
 			visibility: "public",
 			ref: { kind: "branchCollection", relativePath: "feature/x", covered: [] },
 			expiresAt: "2026-09-01T00:00:00.000Z",
-			decisionCount: 1, // stale: recorded when the branch had a single commit
-			titles: ["t-A"],
+			decisionCount: 1, // stale
 		});
-		// The branch now carries two commits — the reconciled record must reflect both.
 		mockLoad.mockResolvedValue({ summaries: [summary("A"), summary("B")], missingCount: 0 });
 
 		await reconcileLiveShare(deps(), "feature/x");
 
 		const stored = mockPutShare.mock.calls.at(-1)?.[2];
-		expect(stored.decisionCount).toBe(2);
-		expect(stored.titles).toEqual(["t-A", "t-B"]);
+		expect(stored.decisionCount).toBe(2); // one topic per commit
+		expect(stored).not.toHaveProperty("titles");
 	});
 
 	it("fails reconcile instead of PATCHing covered when an attachment upload failed", async () => {
@@ -475,7 +540,7 @@ describe("reconcileLiveShare", () => {
 		expect(mockPutShare).not.toHaveBeenCalled();
 	});
 
-	it("adopts a re-minted token but keeps the cached visibility when the PATCH omits it", async () => {
+	it("keeps the cached visibility and shareUrl when the ref-only PATCH omits them", async () => {
 		mockGetShare.mockResolvedValue({
 			shareId: "7",
 			shareUrl: "https://acme.jolli.ai/b/x",
@@ -485,23 +550,21 @@ describe("reconcileLiveShare", () => {
 			decisionCount: 1,
 		});
 		mockLoad.mockResolvedValue({ summaries: [summary("A")], missingCount: 0 });
-		// The PATCH re-minted a bearer token but echoed neither visibility nor shareUrl.
-		mockUpdate.mockResolvedValue({ shareId: "7", token: "tok_fresh_full" });
+		// A ref-only PATCH response that echoes neither visibility nor shareUrl.
+		mockUpdate.mockResolvedValue({ shareId: "7" });
 
 		await reconcileLiveShare(deps(), "feature/x");
 
 		const stored = mockPutShare.mock.calls.at(-1)?.[2];
-		expect(stored.token8).toBe("tok_fres"); // fresh token wins over any cached token8
 		expect(stored.visibility).toBe("org"); // cached fallback
 		expect(stored.shareUrl).toBe("https://acme.jolli.ai/b/x"); // cached fallback
 	});
 
-	it("preserves the cached shareUrl/expiry/recipients/token when the ref-only PATCH omits them", async () => {
+	it("preserves the cached shareUrl/expiry/recipients when the ref-only PATCH omits them", async () => {
 		mockGetShare.mockResolvedValue({
 			shareId: "7",
 			shareUrl: "https://acme.jolli.ai/b/keep",
 			visibility: "people",
-			token8: "keeptok8",
 			recipients: ["marta@jolli.ai"],
 			ref: { kind: "branchCollection", relativePath: "feature/x", covered: [] },
 			expiresAt: "2026-09-01T00:00:00.000Z",
@@ -517,7 +580,6 @@ describe("reconcileLiveShare", () => {
 		expect(stored.shareUrl).toBe("https://acme.jolli.ai/b/keep");
 		expect(stored.expiresAt).toBe("2026-09-01T00:00:00.000Z");
 		expect(stored.recipients).toEqual(["marta@jolli.ai"]);
-		expect(stored.token8).toBe("keeptok8");
 		expect(stored.visibility).toBe("people");
 	});
 });

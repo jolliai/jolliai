@@ -55,6 +55,16 @@ describe("SummaryScriptBuilder", () => {
 		expect(() => new Function(commitScript)).not.toThrow();
 	});
 
+	it("preserves the user's picked access tier across a linkless re-render (no revert to the org default)", () => {
+		// Regression: selecting "people" before a link exists must not snap the dropdown
+		// back to the org default (which a later Copy would mint as an org-wide link).
+		expect(script).toContain("shareUserPickedTier = v;");
+		expect(script).toContain("shareUserPickedTier || (shareCanOrg ? 'org' : 'people')");
+		// The old unconditional revert must be gone.
+		expect(script).not.toContain("shareAccessSelect.value = shareLink ? shareLink.visibility : (shareCanOrg ? 'org' : 'people')");
+		expect(() => new Function(script)).not.toThrow();
+	});
+
 	it("contains toggle expand/collapse handlers", () => {
 		expect(script).toContain(".toggle-header");
 		expect(script).toContain("classList.toggle");

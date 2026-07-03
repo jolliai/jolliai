@@ -1,6 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommitSummary } from "../../../cli/src/Types.js";
 
+const h = vi.hoisted(() => ({
+	loadBranchSummaries: vi.fn(),
+}));
+
+vi.mock("./BranchSummaryLoader.js", () => ({
+	loadBranchSummaries: h.loadBranchSummaries,
+}));
+
+import { buildCreatePrViewModel, parseNameStatus } from "./CreatePrData.js";
+
 function summary(hash: string, msg: string, extra: Partial<CommitSummary> = {}): CommitSummary {
 	return {
 		version: 5,
@@ -37,15 +47,12 @@ function makeBridge(over: Partial<Record<string, unknown>> = {}) {
 
 describe("buildCreatePrViewModel", () => {
 	beforeEach(() => {
-		vi.resetModules();
+		h.loadBranchSummaries.mockReset();
 	});
 
 	it("returns { empty: true } when no unmerged memories exist", async () => {
-		vi.doMock("./BranchSummaryLoader.js", () => ({
-			loadBranchSummaries: vi.fn().mockResolvedValue({ summaries: [], missingCount: 0 }),
-		}));
-		const { buildCreatePrViewModel: fn } = await import("./CreatePrData.js");
-		const vm = await fn(makeBridge(), "main");
+		h.loadBranchSummaries.mockResolvedValue({ summaries: [], missingCount: 0 });
+		const vm = await buildCreatePrViewModel(makeBridge(), "main");
 		expect(vm).toEqual({ empty: true });
 	});
 
@@ -55,14 +62,11 @@ describe("buildCreatePrViewModel", () => {
 			e2eTestGuide: [{ title: "Smoke", steps: ["open"], expectedResults: ["ok"] }],
 		});
 		// summaries in chronological order: oldest first, anchor (newest) last
-		vi.doMock("./BranchSummaryLoader.js", () => ({
-			loadBranchSummaries: vi.fn().mockResolvedValue({
-				summaries: [older, anchor],
-				missingCount: 1,
-			}),
-		}));
-		const { buildCreatePrViewModel: fn } = await import("./CreatePrData.js");
-		const vm = await fn(makeBridge(), "main");
+		h.loadBranchSummaries.mockResolvedValue({
+			summaries: [older, anchor],
+			missingCount: 1,
+		});
+		const vm = await buildCreatePrViewModel(makeBridge(), "main");
 		if ("empty" in vm) throw new Error("expected a view model");
 		expect(vm.branch).toBe("feature/x");
 		expect(vm.mainBranch).toBe("main");
@@ -88,20 +92,16 @@ describe("buildCreatePrViewModel", () => {
 
 	it("falls back to getCurrentBranch when anchor.branch is empty", async () => {
 		const anchor = summary("ccc3333", "feat: no branch", { branch: "" });
-		vi.doMock("./BranchSummaryLoader.js", () => ({
-			loadBranchSummaries: vi.fn().mockResolvedValue({ summaries: [anchor], missingCount: 0 }),
-		}));
+		h.loadBranchSummaries.mockResolvedValue({ summaries: [anchor], missingCount: 0 });
 		const bridge = makeBridge({ getCurrentBranch: vi.fn().mockResolvedValue("fallback-branch") });
-		const { buildCreatePrViewModel: fn } = await import("./CreatePrData.js");
-		const vm = await fn(bridge, "main");
+		const vm = await buildCreatePrViewModel(bridge, "main");
 		if ("empty" in vm) throw new Error("expected a view model");
 		expect(vm.branch).toBe("fallback-branch");
 	});
 });
 
 describe("parseNameStatus", () => {
-	it("parses name-status lines into file rows", async () => {
-		const { parseNameStatus } = await import("./CreatePrData.js");
+	it("parses name-status lines into file rows", () => {
 		const raw = "M\tsrc/foo.ts\nA\tREADME.md\nD\told/bar.ts\nR100\told/baz.ts\tnew/baz.ts";
 		const rows = parseNameStatus(raw);
 		expect(rows).toEqual([
@@ -112,8 +112,7 @@ describe("parseNameStatus", () => {
 		]);
 	});
 
-	it("returns empty array for empty input", async () => {
-		const { parseNameStatus } = await import("./CreatePrData.js");
+	it("returns empty array for empty input", () => {
 		expect(parseNameStatus("")).toEqual([]);
 		expect(parseNameStatus("  \n  ")).toEqual([]);
 	});
