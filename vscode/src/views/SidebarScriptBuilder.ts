@@ -144,6 +144,11 @@ export function buildSidebarScript(): string {
     // so the card never appears before init resolves the truth.
     repoHasMemories: true,
     backfillDismissed: false,
+    // Which cold-start card variant applies ('empty' | 'gaps' | null). The card
+    // keys visibility on THIS (not repoHasMemories). recentMissingCount is the N
+    // in the 'gaps' copy. Host-driven; reset on load.
+    coldStartVariant: null,
+    recentMissingCount: 0,
     // Card runtime (all reset on load): 'offer' → 'loading' → 'list' →
     // 'progress' → 'done'. candidates/selected/result hold the current flow.
     backfillMode: 'offer',
@@ -164,6 +169,8 @@ export function buildSidebarScript(): string {
   // resurrected from persisted state (would flash a stale card on reload).
   state.repoHasMemories = true;
   state.backfillDismissed = false;
+  state.coldStartVariant = null;
+  state.recentMissingCount = 0;
   state.backfillMode = 'offer';
   state.backfillCandidates = [];
   state.backfillSelected = {};
@@ -685,10 +692,12 @@ export function buildSidebarScript(): string {
           break;
         }
         // Cold-start signals must be set BEFORE applyConfigured/applyEnabled,
-        // which call applyBackfillCard() and read these. undefined → keep the
-        // optimistic default (has memories) so the card stays hidden.
+        // which call applyBackfillCard() and read these. Card visibility keys on
+        // coldStartVariant ('empty' | 'gaps' | null); undefined → null (no card).
         state.repoHasMemories = msg.state.repoHasMemories !== false;
         state.backfillDismissed = !!msg.state.backfillDismissed;
+        state.coldStartVariant = msg.state.coldStartVariant || null;
+        state.recentMissingCount = msg.state.recentMissingCount || 0;
         applyEnabled(msg.state.enabled);
         // Onboarding gate sits on top of enabled — when configured===false it
         // hides the tab UI applyEnabled just configured. configured defaults to
@@ -1072,6 +1081,19 @@ export function buildSidebarScript(): string {
         state.backfillMode = 'done';
         if (shouldShowBackfillCard()) renderBackfillCard();
         break;
+      case 'backfill:coldStart':
+        // Live re-push after enable. Ignore entirely while a flow is active
+        // (loading/list/progress/done): an enable re-push only matters when the
+        // card isn't already mid-flow, and absorbing a variant→null here could
+        // later hide the card (via applyBackfillCard on a subsequent
+        // enabled:changed) and lose an in-progress selection.
+        if (state.backfillMode !== 'offer') break;
+        state.repoHasMemories = msg.repoHasMemories !== false;
+        state.backfillDismissed = !!msg.backfillDismissed;
+        state.recentMissingCount = msg.recentMissingCount || 0;
+        state.coldStartVariant = msg.coldStartVariant || null;
+        applyBackfillCard();
+        break;
       // Renderers added in later phases handle the remaining message types.
       default:
         break;
@@ -1210,31 +1232,37 @@ export function buildSidebarScript(): string {
   // (textContent, no innerHTML) and the progress bar uses fixed-width classes
   // (no inline style — CSP), matching renderTokenBar.
   function shouldShowBackfillCard() {
+    // Visibility keys on the host-computed variant: 'empty' (zero memories) or
+    // 'gaps' (has memories but a last-month backlog). null/undefined → no card.
     return state.enabled
       && state.configured !== false
       && !state.backfillDismissed
-      && state.repoHasMemories === false;
+      && (state.coldStartVariant === 'empty' || state.coldStartVariant === 'gaps');
   }
+  // The card is an in-flow bordered card at the TOP of the Branch tab, above
+  // the PINNED section — it does NOT mask the breadcrumb or other panels. It
+  // lives as the first child of the Branch tab content (so it scrolls with the
+  // sections). Shown only on the Branch tab; removed elsewhere. renderBranch
+  // re-invokes this after rebuilding branch content (which detaches the card).
   function applyBackfillCard() {
-    const show = shouldShowBackfillCard();
-    backfillPanel.classList.toggle('hidden', !show);
-    if (!show) { clear(backfillPanel); return; }
-    // Card owns the viewport, like the onboarding / disabled panels.
-    viewSwitch.classList.add('hidden');
-    tabBar.classList.add('hidden');
-    tabToolbar.classList.add('hidden');
-    tabContents.kb.classList.add('hidden');
-    tabContents.branch.classList.add('hidden');
-    tabContents.status.classList.add('hidden');
+    const show = shouldShowBackfillCard() && state.activeTab === 'branch';
+    if (!show) {
+      backfillPanel.classList.add('hidden');
+      if (backfillPanel.parentNode) backfillPanel.parentNode.removeChild(backfillPanel);
+      return;
+    }
+    backfillPanel.classList.remove('hidden');
+    const branchEl = tabContents.branch;
+    if (branchEl.firstChild !== backfillPanel) branchEl.insertBefore(backfillPanel, branchEl.firstChild);
     renderBackfillCard();
   }
-  // Dismiss (✕): persist the per-repo marker + drop back to the normal UI.
+  // Dismiss (✕): persist the per-repo marker + remove the card. The rest of the
+  // Branch tab is already visible (the card never masked it), so just hide.
   function bfDismiss() {
     state.backfillDismissed = true;
     vscode.postMessage({ type: 'backfill:dismiss' });
     persist();
     applyBackfillCard();
-    applyEnabled(state.enabled); // re-reveal the tab UI the card was masking
   }
   function bfDismissButton() {
     const b = el('button', { className: 'bf-dismiss', type: 'button', title: 'Dismiss', 'aria-label': 'Dismiss' }, [
@@ -1268,6 +1296,11 @@ export function buildSidebarScript(): string {
       subText ? el('p', { className: 'ob-subtitle', text: subText }) : null,
     ]);
   }
+  // The ✓ note switches on the cold-start variant — wording lives in the shared,
+  // unit-tested formatColdStartNote (BackfillListRenderer.ts) so it can't drift.
+  function backfillOfferNote() {
+    return formatColdStartNote(state.coldStartVariant === 'gaps' ? 'gaps' : 'empty', state.recentMissingCount || 0);
+  }
   function renderBackfillOffer() {
     const benefits = [
       ['play', 'Pick up where you left off.', 'Sessions and plans replay next time.'],
@@ -1292,10 +1325,14 @@ export function buildSidebarScript(): string {
       bfHeader('Never re-explain a decision again',
         'The conversations, plans and the why behind every commit, replayed into your next session — in any AI tool.'),
       el('div', { className: 'bf-benefits' }, benefits),
-      el('p', { className: 'bf-note' },
-        'You are set up — this repo has no memories yet. Build them from your recent commits, or just keep coding and they capture automatically.'),
+      // ✓ "You're set up" note — top-border divider + green check (mockup .sf-auto).
+      el('div', { className: 'bf-note' }, [
+        el('i', { className: 'codicon codicon-check bf-note-icon', 'aria-hidden': 'true' }),
+        el('span', { text: backfillOfferNote() }),
+      ]),
       cta,
-      el('p', { className: 'bf-honest' }, 'Runs locally on your machine: nothing leaves unless you Share or Sync.'),
+      // 🔒 honest footer — top-border divider (mockup .sf-honest).
+      el('p', { className: 'bf-honest' }, '🔒 Runs locally on your machine: nothing leaves unless you Share or Sync.'),
     ];
   }
   function renderBackfillLoading() {
@@ -1406,6 +1443,7 @@ export function buildSidebarScript(): string {
     open.addEventListener('click', function() {
       // Memories now exist for this repo — leave cold start, land on the bank.
       state.repoHasMemories = true;
+      state.coldStartVariant = null; // card visibility keys on this → hides the card
       state.backfillMode = 'offer';
       persist();
       applyBackfillCard();
@@ -3677,6 +3715,9 @@ export function buildSidebarScript(): string {
       // pins to the bottom of the branch view. Hidden in foreign read-only mode.
       container.appendChild(renderBranchFooter());
     }
+    // The cold-start card is the first child of the branch content (above PINNED);
+    // mountIn above detached it, so re-place it now (no-op when not shown).
+    applyBackfillCard();
   }
 
   // Adapts BranchMemoryItem → the minimal display-item shape renderCommitRow

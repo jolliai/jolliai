@@ -377,16 +377,24 @@ describe("onboarding panel styles", () => {
 		expect(css).toContain("var(--vscode-descriptionForeground)");
 	});
 
-	it("shares the onboarding-panel container rule with .disabled-panel, .apikey-panel and .backfill-panel", () => {
+	it("shares the onboarding-panel container rule with .disabled-panel and .apikey-panel", () => {
 		const css = buildSidebarCss();
-		// All full-viewport panels (onboarding cards, apikey input, disabled CTA,
-		// and the back-fill cold-start card) reuse the same container rule
-		// (padding/scroll/height) by way of a multi-selector rule rather
-		// than redeclaring the same declarations. This keeps tweaks to
-		// onboarding spacing in lockstep across every sibling panel.
-		expect(css).toMatch(
-			/\.onboarding-panel\s*,\s*\.disabled-panel\s*,\s*\.apikey-panel\s*,\s*\.backfill-panel\s*\{/,
-		);
+		// The three full-viewport panels (onboarding cards, apikey input, disabled
+		// CTA) reuse the same container rule (padding/scroll/height) via a
+		// multi-selector rule rather than redeclaring the same declarations.
+		expect(css).toMatch(/\.onboarding-panel\s*,\s*\.disabled-panel\s*,\s*\.apikey-panel\s*\{/);
+	});
+
+	it("styles .backfill-panel as an in-flow bordered card (not a full-viewport panel)", () => {
+		const css = buildSidebarCss();
+		// The cold-start card is a bordered card at the top of the Branch tab
+		// (mockup .setup-card), NOT a full-viewport panel — it must have its own
+		// border/radius rule and must NOT be in the height:100% container group.
+		expect(css).toMatch(/\.backfill-panel\s*\{[^}]*border-radius/);
+		expect(css).not.toMatch(/\.apikey-panel\s*,\s*\.backfill-panel/);
+		// The ✓ note and 🔒 footer sit under top-border dividers (mockup sf-auto/sf-honest).
+		expect(css).toMatch(/\.bf-note\s*\{[^}]*border-top/);
+		expect(css).toMatch(/\.bf-honest\s*\{[^}]*border-top/);
 	});
 
 	it("declares apikey-panel-specific styles for input + inline error", () => {

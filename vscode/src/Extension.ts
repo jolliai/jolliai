@@ -834,10 +834,15 @@ export function activate(context: vscode.ExtensionContext): void {
 	// reload all converge on a single source of truth.
 	let currentConfigured = false;
 	// Per-repo cold-start signals for the back-fill card. Optimistic defaults
-	// (has memories / not dismissed) so the card never flashes before
-	// initialLoad resolves the real values under the `initialStateReady` barrier.
+	// (has memories / no variant / not dismissed) so the card never flashes
+	// before initialLoad resolves the real values under the barrier.
 	let currentRepoHasMemories = true;
 	let currentBackfillDismissed = false;
+	// Which cold-start card variant applies: 'empty' (zero memories) | 'gaps'
+	// (has memories but last-month own commits lack a summary) | null (no card).
+	// The webview keys card visibility on this, not repoHasMemories.
+	let currentColdStartVariant: "empty" | "gaps" | null = null;
+	let currentRecentMissingCount = 0;
 
 	// Deferred barrier that the SidebarWebviewProvider awaits before posting
 	// the first `init` message. We resolve it once `initialLoad()` (which
@@ -927,6 +932,13 @@ export function activate(context: vscode.ExtensionContext): void {
 		// this only fixes the host-side state a later sidebar reload reads.)
 		if (report.generated > 0) {
 			currentRepoHasMemories = true;
+			// Optimistically clear the card variant: the user just acted, so don't
+			// re-nag this session. This is host-memory only — a webview recreate
+			// (collapse/reopen) reads it via getInitialState and shows no card; a
+			// full window reload (re-activate) re-runs computeColdStartSignals and
+			// will re-surface 'gaps' if a partial back-fill left recent gaps.
+			currentColdStartVariant = null;
+			currentRecentMissingCount = 0;
 			void writeBackfillDismissFlag(workspaceRoot, false).catch(handleError("backfill.clearDismiss"));
 		}
 		// Card result list shows only the commits acted on (generated / errored);
@@ -951,6 +963,41 @@ export function activate(context: vscode.ExtensionContext): void {
 		};
 	}
 
+	// Resolves the per-repo cold-start signals: 'empty' when the repo has zero
+	// memories; else 'gaps' when the last ~month has own commits lacking a
+	// summary; else null (no card). Shared by the initialLoad barrier and the
+	// enable command (which re-pushes so the card can appear without a reload).
+	// Best-effort AND atomic: signals are computed into locals across all awaits
+	// and assigned only on full success, so a mid-way failure leaves the PRIOR
+	// consistent snapshot (never a mixed "new repoHasMemories + stale variant").
+	async function computeColdStartSignals(): Promise<void> {
+		try {
+			const { repoHasAnyMemory, listMissingCommits } = await import("../../cli/src/backfill/BackfillEngine.js");
+			const hasMemory = await repoHasAnyMemory(workspaceRoot);
+			let variant: "empty" | "gaps" | null;
+			let count: number;
+			if (!hasMemory) {
+				variant = "empty";
+				count = 0;
+			} else {
+				// Only pay for the git-log scan when the repo is non-empty (the
+				// 'empty' case already answered it). No transcript scan / LLM.
+				const RECENT_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
+				const missing = await listMissingCommits(workspaceRoot, RECENT_MONTH_MS);
+				count = missing.length;
+				variant = count > 0 ? "gaps" : null;
+			}
+			const dismissed = await readBackfillDismissFlag(workspaceRoot);
+			// All awaits succeeded → commit the snapshot atomically.
+			currentRepoHasMemories = hasMemory;
+			currentColdStartVariant = variant;
+			currentRecentMissingCount = count;
+			currentBackfillDismissed = dismissed;
+		} catch (err) {
+			log.debug("activate", `cold-start signal resolve failed: ${(err as Error).message}`);
+		}
+	}
+
 	let sidebarProvider: SidebarWebviewProvider;
 	sidebarProvider = new SidebarWebviewProvider({
 		executeCommand: (cmd, ...args) =>
@@ -969,10 +1016,13 @@ export function activate(context: vscode.ExtensionContext): void {
 			// identity, so foreign-readonly chrome stays inactive even after
 			// the user picks another repo from the dropdown.
 			currentRepoName: sidebarRepoName,
-			// Per-repo cold-start signals — drive the back-fill card (shown only
-			// when enabled + configured + repo has zero memories + not dismissed).
+			// Per-repo cold-start signals — drive the back-fill card. The webview
+			// keys visibility on `coldStartVariant` ('empty' | 'gaps' | null);
+			// repoHasMemories / recentMissingCount are carried for context + copy.
 			repoHasMemories: currentRepoHasMemories,
 			backfillDismissed: currentBackfillDismissed,
+			coldStartVariant: currentColdStartVariant,
+			recentMissingCount: currentRecentMissingCount,
 		}),
 		extensionUri: context.extensionUri,
 		statusProvider: {
@@ -1002,13 +1052,21 @@ export function activate(context: vscode.ExtensionContext): void {
 				);
 				const totalMissing = (await countMissingSummaries(workspaceRoot)).missing;
 				if (missing.length === 0) return { items: [], totalMissing };
-				// dry-run gives per-commit sessions/conversationTurns without an LLM call.
-				const report = await runBackfill({
-					cwd: workspaceRoot,
-					hashes: missing.map((m) => m.commitHash),
-					dryRun: true,
-				});
-				const byHash = new Map(report.outcomes.map((o) => [o.commitHash, o]));
+				// dry-run gives per-commit sessions/conversationTurns without an LLM
+				// call. If the dry-run itself fails (attribution/transcript-scan
+				// error), still show the commits with 0/0 preview rather than an
+				// empty list — the list must never contradict the offer's count.
+				const byHash = new Map<string, { sessions?: number; conversationTurns?: number }>();
+				try {
+					const report = await runBackfill({
+						cwd: workspaceRoot,
+						hashes: missing.map((m) => m.commitHash),
+						dryRun: true,
+					});
+					for (const o of report.outcomes) byHash.set(o.commitHash, o);
+				} catch (err) {
+					log.debug("backfill", `dry-run preview failed, listing without counts: ${(err as Error).message}`);
+				}
 				const items = missing.map((m) => {
 					const o = byHash.get(m.commitHash);
 					return {
@@ -2183,8 +2241,17 @@ export function activate(context: vscode.ExtensionContext): void {
 					// Historical back-fill is no longer auto-triggered on enable — it is
 					// user-driven via the sidebar cold-start card (or the Settings
 					// "Generate Missing Summaries" button), so enabling never spends LLM
-					// budget without an explicit opt-in. Freshly-enabled empty repos
-					// surface the cold-start card on the next sidebar init.
+					// budget without an explicit opt-in. Instead, recompute the
+					// cold-start signals and push them so the card appears WITHOUT a
+					// reload when the repo is empty OR the last month has own commits
+					// lacking a summary (a pre-enable backlog).
+					await computeColdStartSignals();
+					sidebarProvider.notifyColdStart({
+						coldStartVariant: currentColdStartVariant,
+						recentMissingCount: currentRecentMissingCount,
+						repoHasMemories: currentRepoHasMemories,
+						backfillDismissed: currentBackfillDismissed,
+					});
 				}
 			},
 		),
@@ -3768,15 +3835,9 @@ export function activate(context: vscode.ExtensionContext): void {
 	).finally(async () => {
 		// Resolve the per-repo cold-start signals under the same barrier as
 		// currentConfigured, so the first `init` carries correct card visibility
-		// (no flash). Best-effort: any failure leaves the optimistic defaults
-		// (has memories / not dismissed) so the card simply doesn't appear.
-		try {
-			const { repoHasAnyMemory } = await import("../../cli/src/backfill/BackfillEngine.js");
-			currentRepoHasMemories = await repoHasAnyMemory(workspaceRoot);
-			currentBackfillDismissed = await readBackfillDismissFlag(workspaceRoot);
-		} catch (err) {
-			log.debug("activate", `cold-start signal resolve failed: ${(err as Error).message}`);
-		}
+		// (no flash). Best-effort inside the helper: any failure leaves the
+		// optimistic defaults (no variant → no card).
+		await computeColdStartSignals();
 		resolveInitialStateReady();
 	});
 

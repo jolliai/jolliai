@@ -37,11 +37,12 @@ const { mockRefreshKnowledgeBaseFolders, mockClearKnowledgeBaseFolderDivergence 
 	mockClearKnowledgeBaseFolderDivergence: vi.fn(),
 }));
 
-const { mockNotifyEnabledChanged, mockNotifyAuthChanged, mockToggleStatus } =
+const { mockNotifyEnabledChanged, mockNotifyAuthChanged, mockToggleStatus, mockNotifyColdStart } =
 	vi.hoisted(() => ({
 		mockNotifyEnabledChanged: vi.fn(),
 		mockNotifyAuthChanged: vi.fn(),
 		mockToggleStatus: vi.fn(),
+		mockNotifyColdStart: vi.fn(),
 	}));
 
 const { isWorkerBusy } = vi.hoisted(() => ({
@@ -933,6 +934,7 @@ vi.mock("./views/SidebarWebviewProvider.js", () => ({
 		refreshConversationsPanel = mockRefreshConversationsPanel;
 		refreshPlansPanel() {}
 		notifyEnabledChanged = mockNotifyEnabledChanged;
+		notifyColdStart = mockNotifyColdStart;
 		toggleStatus = mockToggleStatus;
 		notifyAuthChanged = mockNotifyAuthChanged;
 		notifyConfiguredChanged() {}
@@ -7534,6 +7536,48 @@ describe("Extension", () => {
 			for (let i = 0; i < 10; i++) await Promise.resolve();
 			const state = (sidebarDepsCaptured as { getInitialState: () => { repoHasMemories?: boolean } }).getInitialState();
 			expect(state.repoHasMemories).toBe(true);
+		});
+
+		async function runEnable(): Promise<void> {
+			const handler = commandMap.get("jollimemory.enableJolliMemory");
+			expect(handler).toBeDefined();
+			await handler?.();
+		}
+
+		it("enable on an empty repo re-pushes cold-start variant 'empty'", async () => {
+			const { repoHasAnyMemory } = await import("../../cli/src/backfill/BackfillEngine.js");
+			vi.mocked(repoHasAnyMemory).mockResolvedValue(false);
+			activate(makeContext());
+			mockNotifyColdStart.mockClear();
+			await runEnable();
+			expect(mockNotifyColdStart).toHaveBeenCalledWith(
+				expect.objectContaining({ coldStartVariant: "empty", recentMissingCount: 0 }),
+			);
+		});
+
+		it("enable on a non-empty repo with a last-month backlog re-pushes 'gaps' + count", async () => {
+			const { repoHasAnyMemory, listMissingCommits } = await import("../../cli/src/backfill/BackfillEngine.js");
+			vi.mocked(repoHasAnyMemory).mockResolvedValue(true);
+			vi.mocked(listMissingCommits).mockResolvedValue([
+				{ commitHash: "h1", subject: "a", ts: 1 },
+				{ commitHash: "h2", subject: "b", ts: 2 },
+			]);
+			activate(makeContext());
+			mockNotifyColdStart.mockClear();
+			await runEnable();
+			expect(mockNotifyColdStart).toHaveBeenCalledWith(
+				expect.objectContaining({ coldStartVariant: "gaps", recentMissingCount: 2 }),
+			);
+		});
+
+		it("enable on a non-empty repo with no recent gaps re-pushes null (no card)", async () => {
+			const { repoHasAnyMemory, listMissingCommits } = await import("../../cli/src/backfill/BackfillEngine.js");
+			vi.mocked(repoHasAnyMemory).mockResolvedValue(true);
+			vi.mocked(listMissingCommits).mockResolvedValue([]);
+			activate(makeContext());
+			mockNotifyColdStart.mockClear();
+			await runEnable();
+			expect(mockNotifyColdStart).toHaveBeenCalledWith(expect.objectContaining({ coldStartVariant: null }));
 		});
 	});
 

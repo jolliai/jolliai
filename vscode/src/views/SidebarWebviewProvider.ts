@@ -1688,6 +1688,21 @@ export class SidebarWebviewProvider
 	}
 
 	/**
+	 * Pushed after `enableJolliMemory` so the cold-start card can appear without a
+	 * window reload when the freshly-enabled repo is empty OR has a last-month
+	 * back-fill backlog. The webview re-asserts card visibility only when it is
+	 * not mid-flow (offer state), so an in-progress / done view is never clobbered.
+	 */
+	notifyColdStart(signals: {
+		readonly coldStartVariant: "empty" | "gaps" | null;
+		readonly recentMissingCount: number;
+		readonly repoHasMemories: boolean;
+		readonly backfillDismissed: boolean;
+	}): void {
+		this.postMessage({ type: "backfill:coldStart", ...signals });
+	}
+
+	/**
 	 * Toggle the Status overlay from the native view-title Status icon
 	 * (`jollimemory.toggleStatus`). No-ops when the view hasn't resolved —
 	 * the title-bar icon is only clickable while the view is visible anyway.

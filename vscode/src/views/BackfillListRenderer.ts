@@ -34,6 +34,22 @@ export function formatBackfillResult(sessions: number, topics: number): string {
 }
 
 /**
+ * The cold-start card's ✓ note, by variant:
+ *   - "empty": repo has zero memories.
+ *   - "gaps":  repo has memories but `recentMissingCount` own commits lack one.
+ * The "gaps" copy uses a verb-free noun phrase ("N recent commit(s) without a
+ * memory yet") to sidestep singular/plural verb agreement AND to avoid claiming
+ * "last month" (the window is anchored to the newest commit, not wall-clock).
+ */
+export function formatColdStartNote(variant: "empty" | "gaps", recentMissingCount: number): string {
+	if (variant === "gaps") {
+		const n = recentMissingCount;
+		return `You are set up. ${n} recent commit${s(n)} without a memory yet — build now, or keep coding (new commits capture automatically).`;
+	}
+	return "You are set up — this repo has no memories yet. Build them from your recent commits, or just keep coding and they capture automatically.";
+}
+
+/**
  * Emits the JS source that defines `formatBackfillMeta` / `formatBackfillResult`
  * inside a webview script scope, mirroring the TS functions above 1:1. Embed the
  * returned string once inside `buildSidebarScript()` / the Settings script.
@@ -48,5 +64,12 @@ export function backfillListRendererSource(): string {
   function formatBackfillResult(sessions, topics) {
     if (sessions <= 0) return topics + ' topic' + __bfPlural(topics);
     return sessions + ' session' + __bfPlural(sessions) + ' · ' + topics + ' topic' + __bfPlural(topics);
+  }
+  function formatColdStartNote(variant, recentMissingCount) {
+    if (variant === 'gaps') {
+      var n = recentMissingCount;
+      return 'You are set up. ' + n + ' recent commit' + __bfPlural(n) + ' without a memory yet — build now, or keep coding (new commits capture automatically).';
+    }
+    return 'You are set up — this repo has no memories yet. Build them from your recent commits, or just keep coding and they capture automatically.';
   }`;
 }

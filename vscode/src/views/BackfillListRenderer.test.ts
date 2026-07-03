@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { backfillListRendererSource, formatBackfillMeta, formatBackfillResult } from "./BackfillListRenderer";
+import {
+	backfillListRendererSource,
+	formatBackfillMeta,
+	formatBackfillResult,
+	formatColdStartNote,
+} from "./BackfillListRenderer";
 
 describe("formatBackfillMeta", () => {
 	it("shows sessions + turns with correct pluralization", () => {
@@ -25,22 +30,45 @@ describe("formatBackfillResult", () => {
 	});
 });
 
+describe("formatColdStartNote", () => {
+	it("empty variant → the zero-memories copy (no count)", () => {
+		expect(formatColdStartNote("empty", 0)).toContain("this repo has no memories yet");
+	});
+	it("gaps variant → 'N recent commits without a memory yet' (plural)", () => {
+		expect(formatColdStartNote("gaps", 3)).toContain("3 recent commits without a memory yet");
+	});
+	it("gaps variant with N=1 → singular 'commit' (no verb-agreement error)", () => {
+		const note = formatColdStartNote("gaps", 1);
+		expect(note).toContain("1 recent commit without a memory yet");
+		expect(note).not.toContain("1 recent commits"); // singular noun, not plural
+		// Regression: an earlier draft hardcoded "have" → "1 commit … have" (wrong).
+		expect(note).not.toContain(" have ");
+	});
+});
+
 describe("backfillListRendererSource", () => {
-	it("emits JS defining both label helpers, mirroring the TS wording", () => {
+	it("emits JS defining the label + note helpers, mirroring the TS wording", () => {
 		const src = backfillListRendererSource();
 		expect(src).toContain("function formatBackfillMeta(");
 		expect(src).toContain("function formatBackfillResult(");
+		expect(src).toContain("function formatColdStartNote(");
 		// The emitted JS must produce the same strings as the TS functions —
 		// eval the snippet in an isolated scope and compare a few cases.
-		const factory = new Function(`${src}\nreturn { formatBackfillMeta, formatBackfillResult };`);
+		const factory = new Function(
+			`${src}\nreturn { formatBackfillMeta, formatBackfillResult, formatColdStartNote };`,
+		);
 		const js = factory() as {
 			formatBackfillMeta: (s: number, t: number) => string;
 			formatBackfillResult: (s: number, t: number) => string;
+			formatColdStartNote: (v: "empty" | "gaps", n: number) => string;
 		};
 		expect(js.formatBackfillMeta(2, 5)).toBe(formatBackfillMeta(2, 5));
 		expect(js.formatBackfillMeta(1, 1)).toBe(formatBackfillMeta(1, 1));
 		expect(js.formatBackfillMeta(0, 0)).toBe(formatBackfillMeta(0, 0));
 		expect(js.formatBackfillResult(3, 4)).toBe(formatBackfillResult(3, 4));
 		expect(js.formatBackfillResult(0, 2)).toBe(formatBackfillResult(0, 2));
+		expect(js.formatColdStartNote("empty", 0)).toBe(formatColdStartNote("empty", 0));
+		expect(js.formatColdStartNote("gaps", 1)).toBe(formatColdStartNote("gaps", 1));
+		expect(js.formatColdStartNote("gaps", 4)).toBe(formatColdStartNote("gaps", 4));
 	});
 });

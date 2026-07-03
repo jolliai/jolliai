@@ -3296,4 +3296,26 @@ describe("SidebarScriptBuilder", () => {
 			expect(fn).toContain("'data-jolli-doc-url'");
 		});
 	});
+
+	// The cold-start card's stateful bits live in the emitted script string (not
+	// eval'd by the suite). These pin the pieces the v2 reviewers flagged as
+	// otherwise-untested, so a regression (reverting the variant gate, dropping
+	// the mid-flow guard, or bypassing the shared note helper) fails a test.
+	describe("cold-start card v2 wiring (source assertions)", () => {
+		it("card visibility gates on coldStartVariant, not repoHasMemories", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("state.coldStartVariant === 'empty'");
+			expect(js).toContain("state.coldStartVariant === 'gaps'");
+		});
+		it("offer note is produced by the shared formatColdStartNote helper", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("function formatColdStartNote(");
+			expect(js).toContain("formatColdStartNote(state.coldStartVariant === 'gaps' ? 'gaps' : 'empty'");
+		});
+		it("backfill:coldStart ignores the re-push while a flow is mid-run", () => {
+			const js = buildSidebarScript();
+			// The guard sits at the top of the case, before any state absorption.
+			expect(js).toContain("if (state.backfillMode !== 'offer') break;");
+		});
+	});
 });

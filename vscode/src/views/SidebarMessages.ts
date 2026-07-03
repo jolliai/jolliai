@@ -137,6 +137,22 @@ export interface SidebarState {
 	 * alone.
 	 */
 	readonly backfillDismissed?: boolean;
+	/**
+	 * Which cold-start card variant to show (the webview keys card visibility on
+	 * THIS, not `repoHasMemories`):
+	 *   - `"empty"` — repo has zero memories on any branch (fresh install).
+	 *   - `"gaps"`  — repo HAS memories, but the last ~month has own commits
+	 *                 lacking a summary (e.g. a pre-enable backlog). Same card,
+	 *                 different copy (see `recentMissingCount`).
+	 *   - `null` / `undefined` — no card.
+	 * Recomputed on init and re-pushed after enable (`backfill:coldStart`).
+	 */
+	readonly coldStartVariant?: "empty" | "gaps" | null;
+	/**
+	 * Count of own commits in the last ~month that lack a summary — the `N` in
+	 * the `"gaps"` variant's copy. 0 for the `"empty"` variant.
+	 */
+	readonly recentMissingCount?: number;
 }
 
 export interface SerializedTreeItem {
@@ -1100,4 +1116,18 @@ export type SidebarInboundMsg =
 			readonly generated: number;
 			readonly skipped: number;
 			readonly errors: number;
+	  }
+	| {
+			/**
+			 * Live re-push of the cold-start signals (host → webview), sent after
+			 * `enableJolliMemory` so the card can appear WITHOUT a window reload.
+			 * The webview updates its signals and re-asserts card visibility — but
+			 * only when the card is not mid-flow (offer state), so an in-progress
+			 * back-fill / done view is never clobbered.
+			 */
+			readonly type: "backfill:coldStart";
+			readonly coldStartVariant: "empty" | "gaps" | null;
+			readonly recentMissingCount: number;
+			readonly repoHasMemories: boolean;
+			readonly backfillDismissed: boolean;
 	  };
