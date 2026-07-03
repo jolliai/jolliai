@@ -5664,4 +5664,21 @@ describe("SidebarWebviewProvider — back-fill cold-start handlers", () => {
 		view.webview.triggerMessage({ type: "backfill:openSettings" });
 		expect(executeCommand).toHaveBeenCalledWith("jollimemory.openSettings");
 	});
+
+	it("notifyColdStart posts a backfill:coldStart message with the signals", () => {
+		const { provider, view } = makeProviderWithBackfill();
+		provider.notifyColdStart({
+			coldStartVariant: "gaps",
+			recentMissingCount: 3,
+			repoHasMemories: true,
+			backfillDismissed: false,
+		});
+		expect(view.webview.postMessage).toHaveBeenCalledWith({
+			type: "backfill:coldStart",
+			coldStartVariant: "gaps",
+			recentMissingCount: 3,
+			repoHasMemories: true,
+			backfillDismissed: false,
+		});
+	});
 });

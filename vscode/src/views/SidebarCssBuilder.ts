@@ -1557,8 +1557,7 @@ export function buildSidebarCss(): string {
      container rule keeps padding/scroll behavior in lockstep. */
   .onboarding-panel,
   .disabled-panel,
-  .apikey-panel,
-  .backfill-panel {
+  .apikey-panel {
     padding: 16px;
     overflow-y: auto;
     height: 100%;
@@ -1648,15 +1647,26 @@ export function buildSidebarCss(): string {
   }
   .ob-btn:disabled:hover { background: var(--vscode-button-background); }
   /* ── Back-fill cold-start card ────────────────────────────────────────
-     Reuses .ob-header / .ob-title / .ob-subtitle / .ob-btn from the
-     onboarding panel; the bf-* classes add the benefits list, the
-     selectable candidate rows, the progress bar (fixed-width classes — no
-     inline style, CSP), and the result list. All colors are theme tokens. */
+     Bordered card (mirrors the mockup's .setup-card) rendered at the TOP of
+     the Branch tab, above the PINNED section — NOT a full-viewport panel; the
+     breadcrumb + all other sections stay visible. The ✓ "you're set up" note
+     and the 🔒 honest footer each sit under a top-border divider (mockup
+     .sf-auto / .sf-honest). Reuses .ob-title / .ob-btn; all colors are theme
+     tokens. Progress bar uses fixed-width classes (no inline style, CSP). */
+  .backfill-panel {
+    position: relative;
+    margin: 10px;
+    padding: 14px;
+    border: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
+    border-radius: 11px;
+    background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+    box-sizing: border-box;
+  }
   .bf-header { position: relative; }
   .bf-dismiss {
     position: absolute;
-    top: -2px;
-    right: -2px;
+    top: -4px;
+    right: -4px;
     background: transparent;
     border: none;
     color: var(--vscode-descriptionForeground);
@@ -1666,19 +1676,33 @@ export function buildSidebarCss(): string {
     line-height: 1;
   }
   .bf-dismiss:hover { background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground)); color: var(--vscode-foreground); }
-  .bf-benefits { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 12px 0; }
-  .bf-benefit { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; line-height: 1.5; }
-  .bf-benefit-icon { color: var(--vscode-textLink-foreground); font-size: 15px; margin-top: 1px; }
+  .bf-benefits { display: flex; flex-direction: column; gap: 8px; margin: 10px 0 2px 0; }
+  .bf-benefit { display: flex; gap: 9px; align-items: flex-start; font-size: 12px; line-height: 1.45; color: var(--vscode-descriptionForeground); }
+  .bf-benefit b { color: var(--vscode-foreground); font-weight: 650; }
+  .bf-benefit-icon { color: var(--vscode-textLink-foreground); font-size: 15px; margin-top: 1px; flex-shrink: 0; }
+  /* ✓ "You're set up" note — top-border divider + green check (mockup .sf-auto). */
   .bf-note {
-    font-size: 12px;
+    display: flex;
+    gap: 7px;
+    align-items: flex-start;
+    font-size: 11.5px;
     color: var(--vscode-descriptionForeground);
-    line-height: 1.5;
-    margin: 0 0 12px 0;
-    padding: 8px 10px;
-    border-radius: 4px;
-    background: var(--vscode-textBlockQuote-background, var(--vscode-editor-background));
+    line-height: 1.4;
+    margin: 9px 0 0 0;
+    padding-top: 9px;
+    border-top: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
   }
-  .bf-honest { font-size: 11px; color: var(--vscode-descriptionForeground); margin: 10px 0 0 0; line-height: 1.4; }
+  .bf-note-icon { color: var(--vscode-charts-green, var(--vscode-testing-iconPassed, var(--vscode-terminal-ansiGreen))); font-size: 14px; margin-top: 1px; flex-shrink: 0; }
+  /* 🔒 honest footer — top-border divider (mockup .sf-honest). */
+  .bf-honest {
+    font-size: 10.5px;
+    color: var(--vscode-descriptionForeground);
+    line-height: 1.45;
+    margin: 9px 0 0 0;
+    padding-top: 9px;
+    border-top: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
+  }
+  .bf-cta { margin-top: 11px; }
   .bf-cta .codicon, .bf-open .codicon { vertical-align: text-bottom; margin-right: 2px; }
   .bf-prog { display: flex; gap: 8px; align-items: center; font-size: 13px; margin: 4px 0 10px 0; }
   .bf-prog .codicon { color: var(--vscode-textLink-foreground); }
