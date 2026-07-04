@@ -14,7 +14,6 @@ import ai.jolli.jollimemory.core.SummaryStore
 import ai.jolli.jollimemory.core.SummaryTree
 import ai.jolli.jollimemory.core.TopicUpdates
 import ai.jolli.jollimemory.core.TraceContext
-import ai.jolli.jollimemory.util.ForcePushUtil
 import ai.jolli.jollimemory.core.TranscriptEntry
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliApiClient
@@ -26,6 +25,7 @@ import ai.jolli.jollimemory.toolwindow.views.SummaryHtmlBuilder
 import ai.jolli.jollimemory.toolwindow.views.SummaryMarkdownBuilder
 import ai.jolli.jollimemory.toolwindow.views.SummaryPrMarkdownBuilder
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils
+import ai.jolli.jollimemory.util.ForcePushUtil
 import com.google.gson.Gson
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
@@ -980,12 +980,13 @@ class SummaryPanel(
                 // Push — detect NFF and offer force-push retry
                 val pushResult = PrService.pushBranch(cwd)
                 if (!pushResult.success) {
-                    if (git != null && ForcePushUtil.isNonFastForwardError(pushResult.stderr)) {
-                        // Switch to EDT for the divergence gate dialog
+                    if (ForcePushUtil.isNonFastForwardError(pushResult.stderr)) {
+                        // Inspect divergence off the EDT (git fetch), then show the gate dialog on the EDT
+                        val safety = ForcePushUtil.inspectForcePushSafety(git, branch)
                         var outcome = ForcePushUtil.ForcePushOutcome.DECLINED
                         ApplicationManager.getApplication().invokeAndWait {
                             outcome = ForcePushUtil.gateForcePush(
-                                project, git, branch,
+                                project, branch, safety,
                                 reason = "The remote has changes your branch does not include.",
                             )
                         }
@@ -999,7 +1000,13 @@ class SummaryPanel(
                                     return@executeOnPooledThread
                                 }
                             }
-                            else -> {
+                            ForcePushUtil.ForcePushOutcome.BLOCKED -> {
+                                ApplicationManager.getApplication().invokeLater {
+                                    postToWebview("prCreateError", mapOf("message" to "Push blocked — your branch is behind the remote. Pull or rebase, then try again."))
+                                }
+                                return@executeOnPooledThread
+                            }
+                            ForcePushUtil.ForcePushOutcome.DECLINED -> {
                                 ApplicationManager.getApplication().invokeLater {
                                     postToWebview("prCreateError", mapOf("message" to "Push cancelled."))
                                 }

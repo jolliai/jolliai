@@ -60,21 +60,31 @@ class PushAction : AnAction() {
                     return
                 }
 
-                // NFF rejection — switch to EDT for divergence gate + dialog
+                // NFF rejection — inspect divergence off the EDT (git fetch), then
+                // show the gate dialog on the EDT, then force-push off the EDT again.
+                val safety = ForcePushUtil.inspectForcePushSafety(git, branch)
+                var outcome = ForcePushUtil.ForcePushOutcome.DECLINED
                 ApplicationManager.getApplication().invokeAndWait {
-                    val outcome = ForcePushUtil.gateForcePush(
-                        project, git, branch,
+                    outcome = ForcePushUtil.gateForcePush(
+                        project, branch, safety,
                         reason = "Remote branch has diverged. Force push will overwrite remote history.",
                     )
-                    if (outcome == ForcePushUtil.ForcePushOutcome.CONFIRMED) {
-                        val forceResult = ForcePushUtil.forcePushBranch(git, branch)
+                }
+
+                if (outcome == ForcePushUtil.ForcePushOutcome.CONFIRMED) {
+                    val forceResult = ForcePushUtil.forcePushBranch(git, branch)
+                    ApplicationManager.getApplication().invokeLater {
                         if (forceResult.exitCode == 0) {
                             Messages.showInfoMessage(project, "Force-pushed $branch to origin.", "Jolli Memory")
                         } else {
                             Messages.showErrorDialog(project, "Force push failed:\n\n${forceResult.stderr}", "Push Failed")
                         }
+                        service.refreshStatus()
                     }
-                    service.refreshStatus()
+                } else {
+                    ApplicationManager.getApplication().invokeLater {
+                        service.refreshStatus()
+                    }
                 }
             }
         })
