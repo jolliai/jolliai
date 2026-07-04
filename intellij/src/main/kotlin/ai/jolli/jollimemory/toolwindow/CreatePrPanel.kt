@@ -182,7 +182,7 @@ class CreatePrPanel(
     private fun dispatchWebviewMessage(json: JsonObject) {
         when (json.get("command")?.asString) {
             "createPr" -> handleCreatePr(json.get("title")?.asString, json.get("body")?.asString)
-            "copyBody" -> handleCopyBody()
+            "copyBody" -> handleCopyBody(json.get("body")?.asString)
             "openMemory" -> handleOpenMemory(json.get("hash")?.asString ?: return)
             "openDiff" -> handleOpenDiff(json.get("path")?.asString ?: return)
             "openPr" -> json.get("url")?.asString?.let { BrowserUtil.browse(it) }
@@ -191,8 +191,11 @@ class CreatePrPanel(
         }
     }
 
-    private fun handleCopyBody() {
-        val body = PrService.wrapWithMarkers(vm.bodyMarkdown)
+    private fun handleCopyBody(bodyArg: String?) {
+        // Use the live (possibly edited) body from the textarea, matching what Create/Update
+        // submits; fall back to the view-model body when the webview sends nothing.
+        val raw = bodyArg?.takeIf { it.isNotBlank() } ?: vm.bodyMarkdown
+        val body = PrService.wrapWithMarkers(raw)
         Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(body), null)
         postToWebview("bodyCopied", mapOf("text" to "Copied PR body markdown to clipboard"))
     }
@@ -229,7 +232,6 @@ class CreatePrPanel(
     private fun handleCreatePr(titleArg: String?, bodyArg: String?) {
         val title = titleArg?.takeIf { it.isNotBlank() } ?: vm.title
         val rawBody = bodyArg?.takeIf { it.isNotBlank() } ?: vm.bodyMarkdown
-        val body = PrService.wrapWithMarkers(rawBody)
 
         postToWebview("prCreating", mapOf("text" to "Pushing branch…"))
         ApplicationManager.getApplication().executeOnPooledThread {
@@ -238,10 +240,15 @@ class CreatePrPanel(
                     PrService.pushBranch(cwd)
                     val lookup = PrService.findPrForBranch(cwd, vm.branch)
                     val prUrl = if (lookup is PrService.PrLookup.Found) {
-                        PrService.updatePr(lookup.pr.number, title, body, cwd)
+                        // Update: merge our summary into the EXISTING PR body's marker region so
+                        // any user-authored text OUTSIDE the markers is preserved. Overwriting with
+                        // wrapWithMarkers would delete that custom text (mirrors SummaryPanel.handleUpdatePr).
+                        val mergedBody = PrService.replaceSummaryInBody(lookup.pr.body, rawBody)
+                        PrService.updatePr(lookup.pr.number, title, mergedBody, cwd)
                         lookup.pr.url
                     } else {
-                        PrService.createPr(title, body, cwd)
+                        // Create: no existing body to preserve — wrap the summary in markers.
+                        PrService.createPr(title, PrService.wrapWithMarkers(rawBody), cwd)
                     }
 
                     // One-click share: when signed in, push the included memories to Jolli.
@@ -292,16 +299,20 @@ class CreatePrPanel(
         if (resolvedBaseUrl.isBlank()) return ""
 
         postToWebview("prProgress", mapOf("text" to "PR ready — sharing memories to Jolli…"))
+        val attempted = vm.includedSummaries.size
         var shared = 0
+        var failed = 0
+        var stopReason: String? = null
         var bindingResolved = false
-        for (summary in vm.includedSummaries) {
+        loop@ for (summary in vm.includedSummaries) {
             try {
                 JolliShareService.shareSummary(store, summary, cwd, apiKey, resolvedBaseUrl)
                 shared++
             } catch (e: JolliApiClient.BindingRequiredError) {
                 if (bindingResolved || !resolveBinding(e.repoUrl, resolvedBaseUrl, apiKey)) {
                     LOG.info("Share aborted: binding not resolved")
-                    break
+                    stopReason = "space not bound"
+                    break@loop
                 }
                 bindingResolved = true
                 // Retry this memory now that the repo is bound.
@@ -310,18 +321,30 @@ class CreatePrPanel(
                     shared++
                 } catch (e2: Exception) {
                     LOG.warn("Share retry failed for ${summary.commitHash.take(8)}: ${e2.message}")
+                    failed++
                 }
             } catch (e: JolliApiClient.UnauthorizedError) {
                 LOG.warn("Share stopped — key rejected: ${e.message}")
-                break
+                stopReason = "sign-in rejected"
+                break@loop
             } catch (e: JolliApiClient.PluginOutdatedError) {
                 LOG.warn("Share stopped — plugin outdated: ${e.message}")
-                break
+                stopReason = "plugin outdated"
+                break@loop
             } catch (e: Exception) {
                 LOG.warn("Share failed for ${summary.commitHash.take(8)}: ${e.message}")
+                failed++
             }
         }
-        return if (shared > 0) " Shared $shared ${if (shared == 1) "memory" else "memories"} to Jolli." else ""
+        // Report honestly: don't imply every memory shared when some (or all) failed or
+        // sharing stopped early. Diagnosable stops (auth / plugin outdated / binding) are
+        // named; per-memory failures are counted; everything points at the log for detail.
+        return when {
+            stopReason != null -> " Sharing stopped ($stopReason) — shared $shared of $attempted to Jolli. See log."
+            failed > 0 -> " Shared $shared of $attempted to Jolli — $failed failed. See log."
+            shared > 0 -> " Shared $shared ${if (shared == 1) "memory" else "memories"} to Jolli."
+            else -> " Sharing failed — 0 of $attempted shared to Jolli. See log."
+        }
     }
 
     /**

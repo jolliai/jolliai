@@ -204,7 +204,18 @@ class SummaryPanel(
 
     // ── Webview bridge ──────────────────────────────────────────────────────
 
+    // Success acks for local-patch saves (no full reload). Once one arrives, the prior
+    // edits are persisted, so the webview is no longer dirty — clear the flag so
+    // cross-panel memory-state events refresh again. (Any further typing re-arms it via
+    // the 'editState' input listener.) Without this, webviewDirty would stay true forever
+    // after the first save, permanently short-circuiting onMemoryStateChanged().
+    private val savePersistedAcks = setOf(
+        "topicUpdated", "topicDeleted", "planSaved", "planTranslated", "referenceSaved",
+        "recapUpdated", "transcriptsSaved", "transcriptsDeleted", "prCreated", "prUpdated",
+    )
+
     private fun postToWebview(command: String, data: Map<String, Any?> = emptyMap()) {
+        if (command in savePersistedAcks) webviewDirty = false
         val payload = gson.toJson(data + ("command" to command))
         // Encode as Base64 to avoid any escaping issues with newlines, quotes, backslashes in content.
         // Use TextDecoder on the JS side to correctly decode UTF-8 multi-byte characters
