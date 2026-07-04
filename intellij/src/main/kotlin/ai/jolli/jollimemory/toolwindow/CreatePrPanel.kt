@@ -77,8 +77,17 @@ class CreatePrPanel(
         service?.addMemoryStateListener(memoryStateListener)
     }
 
+    // True while the webview holds unsaved title/body edits (set by the 'editState'
+    // message, cleared on every full reload). Guards against a cross-panel memory-state
+    // event reloading the page and silently dropping those edits.
+    @Volatile
+    private var webviewDirty = false
+
     /** Rebuilds the view model from fresh data (PR lookup + summaries) and re-renders. */
     private fun onMemoryStateChanged() {
+        // Never clobber unsaved edits. The status will re-sync on the next reload (after
+        // the user submits/refreshes) — losing in-progress typing is the worse failure.
+        if (webviewDirty) return
         ApplicationManager.getApplication().executeOnPooledThread {
             val refreshed = try {
                 CreatePrData.build(project)
@@ -87,6 +96,7 @@ class CreatePrPanel(
             }
             if (refreshed != null) {
                 ApplicationManager.getApplication().invokeLater {
+                    if (webviewDirty) return@invokeLater
                     vm = refreshed
                     refreshHtml()
                 }
@@ -163,6 +173,9 @@ class CreatePrPanel(
     }
 
     private fun refreshHtml() {
+        // A full reload replaces the DOM, so any prior unsaved edits are gone either way;
+        // clear the flag so future memory-state events can refresh again.
+        webviewDirty = false
         browser?.loadHTML(CreatePrHtmlBuilder.buildHtml(vm, !JBColor.isBright(), bridgeScript))
     }
 
@@ -174,6 +187,7 @@ class CreatePrPanel(
             "openDiff" -> handleOpenDiff(json.get("path")?.asString ?: return)
             "openPr" -> json.get("url")?.asString?.let { BrowserUtil.browse(it) }
             "signIn" -> handleSignIn()
+            "editState" -> webviewDirty = json.get("editing")?.asBoolean == true
         }
     }
 

@@ -18,12 +18,18 @@ object CreatePrHtmlBuilder {
         val isUpdate = vm.existingPr != null
         val heading = if (isUpdate) "Update Pull Request" else "Create Pull Request"
         val primaryLabel = if (isUpdate) "Update PR" else "Create PR"
-        // In Update mode with nothing new to push, dim the button (like the commit-
-        // level push UI) — data-uptodate lets the script re-enable it when the user
-        // edits the title/body (a body-only update is still a change).
+        // "Up to date" here means only "no new commits to push". The PR body is drafted
+        // from memory content (summary / E2E / plans), which is editable without a new
+        // git commit — and can even change from another panel — so an Update is ALWAYS a
+        // valid action. We therefore never disable the button; we only surface an
+        // informational hint about the git-push state.
         val upToDate = isUpdate && !vm.hasUnpushedChanges
-        val primaryDisabled = if (upToDate) " disabled" else ""
-        val upToDateHint = if (upToDate) """<span class="up-to-date">Up to date — no new commits to push</span>""" else ""
+        val primaryDisabled = ""
+        val upToDateHint = if (upToDate) {
+            """<span class="up-to-date">No new commits to push — Update still refreshes the PR body from the latest memory</span>"""
+        } else {
+            ""
+        }
 
         return """<!DOCTYPE html>
 <html lang="en">

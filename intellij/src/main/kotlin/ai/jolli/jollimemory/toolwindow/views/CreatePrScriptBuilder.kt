@@ -142,6 +142,16 @@ object CreatePrScriptBuilder {
   var signInLink = document.getElementById('prSignInLink');
   if (signInLink) signInLink.addEventListener('click', function () { jmSend({ command: 'signIn' }); });
 
+  // Tell the panel the user has unsaved edits, so a cross-panel memory-state event
+  // doesn't reload the page and drop the in-progress title/body. Fires on real content
+  // changes (typing), not mere focus; the flag clears on the next full reload.
+  document.addEventListener('input', function (e) {
+    var t = e.target;
+    if (t && (t.isContentEditable || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) {
+      jmSend({ command: 'editState', editing: true });
+    }
+  });
+
   window.addEventListener('jollimemory', function (e) {
     var msg = e.detail || {};
     switch (msg.command) {
