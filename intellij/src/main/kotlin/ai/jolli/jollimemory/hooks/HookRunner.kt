@@ -25,15 +25,23 @@ object HookRunner {
         when (hook) {
             "post-commit" -> {
                 if (hookArgs.contains("--worker")) {
+                    // Legacy path: a stray `post-commit --worker` (from an older hook
+                    // script still on disk) now drains the queue like queue-drain.
                     val cwd = System.getProperty("user.dir")
-                    // JOLLI-1785: this worker is a fresh JVM — bootstrap telemetry so
-                    // queue_drained/ingest events emit, then flush before exit.
                     ai.jolli.jollimemory.core.telemetry.TelemetryActivation.bootstrap(cwd)
-                    PostCommitHook.runWorker(cwd)
+                    PostCommitHook.drainWorker(cwd)
                     ai.jolli.jollimemory.core.telemetry.TelemetryActivation.flushNow(cwd)
                 } else {
                     PostCommitHook.launch(hookArgs)
                 }
+            }
+            "queue-drain" -> {
+                val cwd = System.getProperty("user.dir")
+                // Fresh JVM — bootstrap telemetry so queue_drained/ingest events emit,
+                // then flush before exit.
+                ai.jolli.jollimemory.core.telemetry.TelemetryActivation.bootstrap(cwd)
+                PostCommitHook.drainWorker(cwd)
+                ai.jolli.jollimemory.core.telemetry.TelemetryActivation.flushNow(cwd)
             }
             "post-rewrite" -> PostRewriteHook.run(hookArgs)
             "prepare-commit-msg" -> PrepareMsgHook.run(hookArgs)

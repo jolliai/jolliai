@@ -138,12 +138,22 @@ function hasRequiredWorktreeHooks(
  *   Written to the global dist-path file so refreshHookPathsIfStale() can distinguish
  *   extension-managed paths from CLI-managed paths and avoid unwanted overwrites.
  */
-export async function install(cwd?: string, options?: { source?: "vscode-extension" | "cli" }): Promise<InstallResult> {
+export async function install(
+	cwd?: string,
+	options?: { source?: "vscode-extension" | "cli"; integrationsOnly?: boolean; sourceTag?: string },
+): Promise<InstallResult> {
 	/* v8 ignore next - process.cwd() fallback only used when called without cwd arg */
 	const projectDir = cwd ?? process.cwd();
 	const warnings: string[] = [];
 
-	log.info("Installing Jolli Memory hooks");
+	// integrations-only: set up the node-side integrations (dispatch scripts,
+	// dist-paths, MCP registration, skills) but install NO hooks (git or agent).
+	// Used by the IntelliJ plugin, which manages its own Java hooks and only needs
+	// this to light up MCP + skills — installing node hooks here would clobber
+	// IntelliJ's Java hooks and make memory generation depend on Node.
+	const integrationsOnly = options?.integrationsOnly === true;
+
+	log.info(integrationsOnly ? "Installing Jolli Memory integrations (no hooks)" : "Installing Jolli Memory hooks");
 
 	try {
 		// Load config to check integration enabled flags (always global)
@@ -173,10 +183,12 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 		/* v8 ignore stop */
 
 		// Determine this caller's source tag and write its per-source dist-paths/ entry.
-		// CLI -> "cli"; VSCode-family -> derive from extension path (vscode/cursor/...).
+		// An explicit sourceTag (e.g. "intellij" passed by the IntelliJ plugin) wins;
+		// otherwise CLI -> "cli"; VSCode-family -> derive from extension path.
 		const callerDistDir = dirname(fileURLToPath(import.meta.url));
 		const callerSource = options?.source ?? "cli";
-		const sourceTag = callerSource === "vscode-extension" ? deriveSourceTag(callerDistDir) : "cli";
+		const sourceTag =
+			options?.sourceTag ?? (callerSource === "vscode-extension" ? deriveSourceTag(callerDistDir) : "cli");
 
 		const distPathOk = await installDistPath(sourceTag);
 		if (!distPathOk) {
@@ -259,6 +271,9 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			// others. Global hosts are registered once after the loop (below).
 			await registerRepoMcpHosts(wt, detected);
 
+			// integrations-only stops here: MCP + skills + git-exclude are done, but no
+			// Claude/SessionStart hooks (the caller manages its own hooks).
+			if (integrationsOnly) continue;
 			if (config.claudeEnabled === false) continue;
 			const result = await installClaudeHook(wt);
 			/* v8 ignore start -- defensive: installClaudeHook currently never returns warnings */
@@ -296,35 +311,44 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 		// machine without them), while Claude has no filesystem detector and is
 		// gated only on `claudeEnabled` — so `~/.claude/CLAUDE.md` is created
 		// whenever Claude isn't explicitly disabled, consistent with the rest of
-		// the installer treating Claude as the primary host.
+		// the installer treating Claude as the primary host. This is an integration
+		// (skill preference), not a hook, so it runs in integrations-only mode too.
 		await installGlobalInstructions({
 			claude: config.claudeEnabled !== false,
 			gemini: geminiDetectedOnce && config.geminiEnabled !== false,
 			codex: codexDetectedOnce && config.codexEnabled !== false,
 		});
 
-		// Git hooks are shared across all worktrees — install once
-		const gitResult = await installGitHook(projectDir);
-		if (gitResult.warning) {
-			warnings.push(gitResult.warning);
-		}
+		// Git hooks are shared across all worktrees — install once. Skipped in
+		// integrations-only mode (the caller owns its own git hooks); the *HookPath
+		// results then stay undefined, which the return below handles.
+		let gitResult: HookOpResult = {};
+		let postRewriteResult: HookOpResult = {};
+		let prepareMsgResult: HookOpResult = {};
+		let postMergeResult: HookOpResult = {};
+		if (!integrationsOnly) {
+			gitResult = await installGitHook(projectDir);
+			if (gitResult.warning) {
+				warnings.push(gitResult.warning);
+			}
 
-		// Install Git post-rewrite hook (handles amend/rebase summary migration)
-		const postRewriteResult = await installPostRewriteHook(projectDir);
-		if (postRewriteResult.warning) {
-			warnings.push(postRewriteResult.warning);
-		}
+			// Install Git post-rewrite hook (handles amend/rebase summary migration)
+			postRewriteResult = await installPostRewriteHook(projectDir);
+			if (postRewriteResult.warning) {
+				warnings.push(postRewriteResult.warning);
+			}
 
-		// Install Git prepare-commit-msg hook (handles git merge --squash)
-		const prepareMsgResult = await installPrepareMsgHook(projectDir);
-		if (prepareMsgResult.warning) {
-			warnings.push(prepareMsgResult.warning);
-		}
+			// Install Git prepare-commit-msg hook (handles git merge --squash)
+			prepareMsgResult = await installPrepareMsgHook(projectDir);
+			if (prepareMsgResult.warning) {
+				warnings.push(prepareMsgResult.warning);
+			}
 
-		// Install Git post-merge hook (auto-compiles merged branch summaries after pull/merge)
-		const postMergeResult = await installPostMergeHook(projectDir);
-		if (postMergeResult.warning) {
-			warnings.push(postMergeResult.warning);
+			// Install Git post-merge hook (auto-compiles merged branch summaries after pull/merge)
+			postMergeResult = await installPostMergeHook(projectDir);
+			if (postMergeResult.warning) {
+				warnings.push(postMergeResult.warning);
+			}
 		}
 
 		// Auto-detect Codex CLI and enable session discovery (saved to global config)
@@ -335,14 +359,18 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			}
 		}
 
-		// Auto-detect Gemini CLI and install AfterAgent hook in all worktrees (if enabled)
+		// Auto-detect Gemini CLI and install AfterAgent hook in all worktrees (if enabled).
+		// The AfterAgent hook install is skipped in integrations-only mode; the config
+		// flag is still recorded so session discovery works for the caller's own hooks.
 		let geminiSettingsPath: string | undefined;
 		if (geminiDetectedOnce && config.geminiEnabled !== false) {
-			for (const wt of worktrees) {
-				const geminiResult = await installGeminiHook(wt);
-				// Capture the path from the primary worktree
-				if (wt === projectDir || geminiSettingsPath === undefined) {
-					geminiSettingsPath = geminiResult.path;
+			if (!integrationsOnly) {
+				for (const wt of worktrees) {
+					const geminiResult = await installGeminiHook(wt);
+					// Capture the path from the primary worktree
+					if (wt === projectDir || geminiSettingsPath === undefined) {
+						geminiSettingsPath = geminiResult.path;
+					}
 				}
 			}
 			if (config.geminiEnabled === undefined) {
@@ -549,12 +577,18 @@ async function migrateWorktreeConfig(worktreeDir: string): Promise<void> {
  *
  * @param cwd - Optional working directory (defaults to process.cwd())
  */
-export async function uninstall(cwd?: string): Promise<InstallResult> {
+export async function uninstall(cwd?: string, options?: { integrationsOnly?: boolean }): Promise<InstallResult> {
 	/* v8 ignore next - process.cwd() fallback only used when called without cwd arg */
 	const projectDir = cwd ?? process.cwd();
 	const warnings: string[] = [];
 
-	log.info("Removing Jolli Memory hooks");
+	// integrations-only: mirror of `install --integrations-only` — remove only the
+	// repo-scoped MCP registration (the caller owns its own hooks, so leave them,
+	// the git hooks, skills, and dist-paths alone). Used by the IntelliJ plugin on
+	// disable so it doesn't tear out hooks it never installed.
+	const integrationsOnly = options?.integrationsOnly === true;
+
+	log.info(integrationsOnly ? "Removing Jolli Memory integrations (MCP)" : "Removing Jolli Memory hooks");
 
 	try {
 		// Attempt to list all worktrees; fall back to just this directory if it fails
@@ -563,6 +597,18 @@ export async function uninstall(cwd?: string): Promise<InstallResult> {
 			worktrees = await listWorktrees(projectDir);
 		} catch {
 			worktrees = [projectDir];
+		}
+
+		if (integrationsOnly) {
+			for (const wt of worktrees) {
+				try {
+					await removeRepoMcpHosts(wt);
+				} catch (mcpErr) {
+					log.warn("MCP removal failed in %s (non-fatal): %s", wt, (mcpErr as Error).message);
+				}
+			}
+			log.info("Integrations removal complete");
+			return { success: true, message: "Jolli Memory integrations removed (MCP)", warnings };
 		}
 
 		// Remove Claude Code and Gemini hooks from every worktree

@@ -52,110 +52,226 @@ object PostCommitHook {
             java.io.File(gitDir, "rebase-apply").isDirectory
     }
 
-    /** Launcher: spawns the worker as a background process. */
+    /** How many queue entries one drain worker processes before deferring to a successor. */
+    private const val MAX_ENTRIES_PER_RUN = 20
+
+    /**
+     * Launcher (git post-commit): enqueues one git operation, then spawns the drain
+     * worker. Synchronous and fast (a few git calls + one file write) so it never
+     * blocks the commit. Rebase replays are skipped here — post-rewrite migrates those.
+     *
+     * Enqueue (instead of the old spawn-one-worker-per-commit) is what makes rapid
+     * commit/amend bursts safe: every op lands as its own file, and the drain worker
+     * processes them all in order — so a second commit that arrives while the first is
+     * still summarizing no longer loses its memory.
+     */
     fun launch(args: Array<String>) {
         val cwd = System.getProperty("user.dir")
         JmLogger.setLogDir(cwd)
 
         if (isRebase(cwd)) {
-            log.info("Rebase in progress — skipping post-commit worker")
+            log.info("Rebase in progress — skipping post-commit enqueue (post-rewrite handles it)")
             return
         }
 
-        log.info("PostCommitHook launcher — spawning background worker")
+        val git = GitOps(cwd)
+        val headHash = git.getHeadHash()?.trim()
+        if (headHash.isNullOrBlank()) {
+            log.error("Cannot resolve HEAD — skipping enqueue")
+            return
+        }
 
+        // Capture commit source at enqueue time (consume the one-shot plugin marker here,
+        // not in the worker — the worker may run much later, against a different commit).
+        val commitSource = if (SessionTracker.loadPluginSource(cwd)) {
+            SessionTracker.deletePluginSource(cwd)
+            CommitSource.plugin
+        } else CommitSource.cli
+
+        val branch = git.getCurrentBranch()
+
+        // Resolve op type + source hashes from the pending markers written by
+        // prepare-commit-msg, else from the reflog (cherry-pick / revert / plain commit).
+        var type = "commit"
+        var sourceHashes: List<String>? = null
+
+        val squashPending = SessionTracker.loadSquashPending(cwd)
+        if (squashPending != null) {
+            SessionTracker.deleteSquashPending(cwd)
+            // A stale squash-pending (from a prior failed run) can be adopted by an
+            // unrelated commit — validate its recorded parent against HEAD~1.
+            val parent = git.exec("rev-parse", "HEAD~1")?.trim()
+            if (parent == null || parent == squashPending.expectedParentHash) {
+                type = "squash"; sourceHashes = squashPending.sourceHashes
+            } else {
+                log.warn("Stale squash-pending (parent %s != HEAD~1 %s) — treating as plain commit",
+                    squashPending.expectedParentHash.take(8), parent.take(8))
+            }
+        } else {
+            val amendPending = SessionTracker.loadAmendPending(cwd)
+            if (amendPending != null) {
+                SessionTracker.deleteAmendPending(cwd)
+                type = "amend"; sourceHashes = listOf(amendPending.oldHash)
+            } else {
+                type = detectQueueCommitType()
+            }
+        }
+
+        val op = GitOpQueue.GitOperation(
+            type = type,
+            commitHash = headHash,
+            branch = branch,
+            sourceHashes = sourceHashes,
+            commitSource = commitSource.name,
+            createdAt = Instant.now().toString(),
+        )
+        GitOpQueue.enqueue(op, cwd)
+        spawnDrainWorker(cwd)
+    }
+
+    /** Spawns the drain worker as a detached background process (never blocks git). */
+    private fun spawnDrainWorker(cwd: String) {
         val javaHome = System.getProperty("java.home")
         val javaBin = "$javaHome/bin/java"
         val jarPath = getJarPath() ?: return
-        val cmd = listOf(javaBin, "-jar", jarPath, "post-commit", "--worker")
-
+        val cmd = listOf(javaBin, "-jar", jarPath, "queue-drain")
         try {
-            // Redirect worker output to log file instead of inheritIO().
-            // inheritIO() causes the worker to hold git's stdout/stderr FDs open,
-            // which makes git wait for the hook to finish (blocking the commit).
+            // Redirect worker output to a log file, not inheritIO(): inheritIO() would
+            // hold git's stdout/stderr FDs open and make git wait for the worker.
             val logDir = java.io.File(JmLogger.getJolliMemoryDir(cwd))
             logDir.mkdirs()
             val workerLog = java.io.File(logDir, "post-commit-worker.log")
-
             ProcessBuilder(cmd)
                 .directory(java.io.File(cwd))
                 .redirectOutput(ProcessBuilder.Redirect.appendTo(workerLog))
                 .redirectError(ProcessBuilder.Redirect.appendTo(workerLog))
                 .start()
-            log.info("Worker process spawned (output → %s)", workerLog.absolutePath)
+            log.info("Drain worker spawned (output → %s)", workerLog.absolutePath)
         } catch (e: Exception) {
-            log.error("Failed to spawn worker: %s", e.message)
+            log.error("Failed to spawn drain worker: %s", e.message)
         }
     }
 
-    /** Worker: runs the actual summarization pipeline. */
-    fun runWorker(cwd: String, force: Boolean = false) {
+    /** Detects the git-op type from GIT_REFLOG_ACTION for the non-squash/non-amend path. */
+    private fun detectQueueCommitType(): String {
+        val reflogAction = System.getenv("GIT_REFLOG_ACTION") ?: return "commit"
+        return when {
+            reflogAction.startsWith("cherry-pick") -> "cherry-pick"
+            reflogAction.startsWith("revert") -> "revert"
+            else -> "commit"
+        }
+    }
+
+    /** Backward-compatible entry: a stray `post-commit --worker` now drains the queue. */
+    fun runWorker(cwd: String, force: Boolean = false) = drainWorker(cwd, force)
+
+    /**
+     * Drain worker: holds the per-repo lock and processes every queued git op in
+     * chronological order (bounded by [MAX_ENTRIES_PER_RUN]), runs the wiki ingest
+     * once, then chain-spawns a successor if new entries arrived mid-drain. The lock's
+     * mtime is refreshed every 60s so a long LLM call never lets a concurrent commit's
+     * worker judge the lock stale and start a racing drain.
+     */
+    fun drainWorker(cwd: String, force: Boolean = false) {
         JmLogger.setLogDir(cwd)
         val drainStart = System.currentTimeMillis()
-        log.info("=== PostCommitHook worker started (cwd=%s, force=%s) ===", cwd, force)
+        log.info("=== Queue drain worker started (cwd=%s, force=%s) ===", cwd, force)
 
         val git = GitOps(cwd)
-        log.info("Creating storage via StorageFactory.create")
         val storage = StorageFactory.create(git, cwd)
-        log.info("Storage created: %s", storage::class.simpleName)
         val store = SummaryStore(cwd, git, storage)
         val config = SessionTracker.loadConfig(cwd)
-        log.info("Config loaded: apiKey=%s, jolliApiKey=%s, model=%s", if (config.apiKey != null) "set" else "null", if (config.jolliApiKey != null) "set" else "null", config.model ?: "default")
+        log.info("Config loaded: apiKey=%s, jolliApiKey=%s, model=%s",
+            if (config.apiKey != null) "set" else "null",
+            if (config.jolliApiKey != null) "set" else "null", config.model ?: "default")
 
-        // Load log level from config
         val logLevel = config.logLevel?.let { try { LogLevel.valueOf(it) } catch (_: Exception) { null } }
         if (logLevel != null) JmLogger.setLogLevel(logLevel)
 
-        // Acquire lock
         if (!SessionTracker.acquireLock(cwd)) {
-            log.warn("Cannot acquire lock — another worker is running")
+            log.warn("Cannot acquire lock — another drain worker is running")
             return
         }
 
+        // Keep the lock fresh during long LLM calls so a concurrent commit's worker
+        // doesn't reclaim it as stale mid-drain.
+        val refresher = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "jolli-lock-refresh").apply { isDaemon = true }
+        }
+        refresher.scheduleAtFixedRate(
+            { SessionTracker.refreshLock(cwd) }, 60, 60, java.util.concurrent.TimeUnit.SECONDS,
+        )
+
+        var processed = 0
         try {
-            // 1. Get HEAD commit info
-            val commitInfoStr = git.getHeadCommitInfo()
-            if (commitInfoStr == null) {
-                log.error("Cannot get HEAD commit info")
-                return
-            }
-            val parts = commitInfoStr.split("\u0000")
-            if (parts.size < 4) return
-            val commitInfo = CommitInfo(parts[0], parts[1], parts[2], parts[3])
-            log.info("HEAD: %s — %s", commitInfo.hash.take(8), commitInfo.message.take(60))
-
-            // Detect commit source (plugin or CLI)
-            val commitSource = if (SessionTracker.loadPluginSource(cwd)) {
-                SessionTracker.deletePluginSource(cwd)
-                CommitSource.plugin
-            } else CommitSource.cli
-
-            // 2. Check for squash-pending
-            val squashPending = SessionTracker.loadSquashPending(cwd)
-            if (squashPending != null) {
-                SessionTracker.deleteSquashPending(cwd)
-                // Validate: a stale squash-pending from a failed lock can be consumed
-                // by an unrelated future commit. Compare expectedParentHash against HEAD~1.
-                val parentHash = git.exec("rev-parse", "HEAD~1")?.trim()
-                if (parentHash != null && parentHash != squashPending.expectedParentHash) {
-                    log.warn(
-                        "Stale squash-pending: expected parent %s but HEAD~1 is %s — discarding",
-                        squashPending.expectedParentHash.take(8), parentHash.take(8)
-                    )
-                } else {
-                    handleSquash(store, squashPending, commitInfo, config)
-                    return
+            loop@ while (processed < MAX_ENTRIES_PER_RUN) {
+                val entries = GitOpQueue.dequeueAll(cwd)
+                if (entries.isEmpty()) break
+                for ((op, file) in entries) {
+                    if (processed >= MAX_ENTRIES_PER_RUN) break@loop
+                    try {
+                        dispatchOp(op, cwd, git, store, config, force)
+                    } catch (e: Exception) {
+                        log.error("Failed to process queue op type=%s ref=%s: %s",
+                            op.type, op.commitHash.take(8), e.message ?: e.toString())
+                    }
+                    GitOpQueue.deleteEntry(file)
+                    processed++
                 }
             }
-
-            // 3. Check for amend-pending
-            val amendPending = SessionTracker.loadAmendPending(cwd)
-            if (amendPending != null) {
-                SessionTracker.deleteAmendPending(cwd)
-                handleAmend(store, amendPending, commitInfo)
-                return
+        } finally {
+            // Auto-ingest + re-render the wiki once per drain (no-op when nothing pending).
+            try {
+                runIngestAndRender(cwd, config)
+            } catch (e: Exception) {
+                log.warn("Post-commit ingest/render failed (non-fatal): %s", e.message)
             }
+            refresher.shutdownNow()
+            SessionTracker.releaseLock(cwd)
+            ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+                "queue_drained",
+                mapOf("ops" to processed, "duration_ms" to (System.currentTimeMillis() - drainStart)),
+            )
+            // Chain-spawn: entries that landed after our last dequeue get their own worker.
+            if (GitOpQueue.hasEntries(cwd)) {
+                log.info("Queue non-empty after drain — chain-spawning successor")
+                spawnDrainWorker(cwd)
+            }
+        }
+        log.info("=== Queue drain worker finished (%d op(s)) ===", processed)
+    }
 
+    /** Resolves the op's commit, then dispatches to the matching handler. */
+    private fun dispatchOp(
+        op: GitOpQueue.GitOperation, cwd: String, git: GitOps,
+        store: SummaryStore, config: JolliMemoryConfig, force: Boolean,
+    ) {
+        val commitInfoStr = git.getHeadCommitInfo(op.commitHash)
+        if (commitInfoStr == null) {
+            log.warn("Cannot resolve commit %s (rewritten/gone?) — skipping op", op.commitHash.take(8))
+            return
+        }
+        val infoParts = commitInfoStr.split(" ")
+        if (infoParts.size < 4) return
+        val commitInfo = CommitInfo(infoParts[0], infoParts[1], infoParts[2], infoParts[3])
+        log.info("Processing %s op: %s — %s", op.type, commitInfo.hash.take(8), commitInfo.message.take(60))
+
+        when (op.type) {
+            "squash", "rebase-squash" -> processSquash(op.sourceHashes ?: emptyList(), commitInfo, store, config)
+            "amend", "rebase-pick" -> processAmend(op.sourceHashes?.firstOrNull(), commitInfo, store)
+            else -> processCommitOp(op, commitInfo, cwd, git, store, config, force)
+        }
+    }
+
+    /** Full summarization pipeline for a real commit (commit / cherry-pick / revert). */
+    private fun processCommitOp(
+        op: GitOpQueue.GitOperation, commitInfo: CommitInfo, cwd: String, git: GitOps,
+        store: SummaryStore, config: JolliMemoryConfig, force: Boolean,
+    ) {
+        val commitSource =
+            if (op.commitSource == CommitSource.plugin.name) CommitSource.plugin else CommitSource.cli
+
+        run {
             // 4. Load sessions and read transcripts
             log.info("Step 4: Loading sessions")
             val allSessions = SessionTracker.loadAllSessions(cwd).toMutableList()
@@ -242,7 +358,9 @@ object PostCommitHook {
                         }
                         else -> {
                             val parser = getParserForSource(source)
-                            TranscriptReader.readTranscript(session.transcriptPath, cursor, parser)
+                            // Slice to this commit's window (commitInfo.date) so a queued burst
+                            // of commits doesn't fold the whole conversation into the oldest one.
+                            TranscriptReader.readTranscript(session.transcriptPath, cursor, parser, commitInfo.date)
                         }
                     }
 
@@ -280,8 +398,10 @@ object PostCommitHook {
 
             // 5. Get diff
             log.info("Step 5: Getting diff (transcripts=%d entries, %d turns)", totalEntries, totalTurns)
-            val diff = git.getDiffContent() ?: ""
-            val diffStatStr = git.getDiffStats() ?: ""
+            // Diff this op's OWN commit — by the time the queue drains, HEAD may have
+            // moved past it, so HEAD~1..HEAD would be the wrong change.
+            val diff = git.getDiffContent(op.commitHash) ?: ""
+            val diffStatStr = git.getDiffStats(op.commitHash) ?: ""
             val diffStats = parseDiffStats(diffStatStr)
             log.info("Diff: %d files changed, +%d -%d, diff length=%d chars", diffStats.filesChanged, diffStats.insertions, diffStats.deletions, diff.length)
 
@@ -304,7 +424,7 @@ object PostCommitHook {
             // 7b. Assemble reference blocks for prompt injection — branch-scoped to
             //     this commit's branch (legacy blank-branch rows allowed) so the
             //     summary prompt never sees another branch's references.
-            val branch = git.getCurrentBranch() ?: "unknown"
+            val branch = op.branch ?: git.getCurrentBranch() ?: "unknown"
             val registry = SessionTracker.loadPlansRegistry(cwd)
             val referenceBlocks = PromptRenderer.assembleReferenceBlocks(
                 (registry.references ?: emptyMap()).filter { (_, entry) ->
@@ -434,8 +554,13 @@ object PostCommitHook {
                 }
             }
 
-            // 9. Build and store CommitSummary
-            val commitType = detectCommitType()
+            // 9. Build and store CommitSummary — type comes from the op captured at
+            //    enqueue time (the drained JVM has no GIT_REFLOG_ACTION to read).
+            val commitType = when (op.type) {
+                "cherry-pick" -> CommitType.`cherry-pick`
+                "revert" -> CommitType.revert
+                else -> CommitType.commit
+            }
 
             // 8d. Detect uncommitted notes on this branch, archive, and attach to the summary.
             //     Mirrors the plan path (8b): the note body is written through the StorageProvider
@@ -547,21 +672,6 @@ object PostCommitHook {
             discardExcludedWorkingItems(exclusions, cwd)
             log.info("=== PostCommitHook worker finished successfully for %s ===", commitInfo.hash.take(8))
 
-        } finally {
-            // Auto-ingest + re-render the wiki for this repo after summaries are
-            // written — covers the normal, squash, amend, and no-session paths
-            // (a no-op when nothing is pending). Failures here never fail the worker.
-            try {
-                runIngestAndRender(cwd, config)
-            } catch (e: Exception) {
-                log.warn("Post-commit ingest/render failed (non-fatal): %s", e.message)
-            }
-            SessionTracker.releaseLock(cwd)
-            // JOLLI-1785: the IntelliJ worker processes one commit per run.
-            ai.jolli.jollimemory.core.telemetry.Telemetry.track(
-                "queue_drained",
-                mapOf("ops" to 1, "duration_ms" to (System.currentTimeMillis() - drainStart)),
-            )
         }
     }
 
@@ -628,9 +738,11 @@ object PostCommitHook {
         return shouldRender
     }
 
-    private fun handleSquash(store: SummaryStore, pending: SquashPendingState, commitInfo: CommitInfo, config: JolliMemoryConfig) {
-        val oldSummaries = pending.sourceHashes.mapNotNull { store.getSummary(it) }
+    /** Squash / rebase-squash: consolidate the source summaries into the new commit. */
+    private fun processSquash(sourceHashes: List<String>, commitInfo: CommitInfo, store: SummaryStore, config: JolliMemoryConfig) {
+        val oldSummaries = sourceHashes.mapNotNull { store.getSummary(it) }
         if (oldSummaries.isEmpty()) {
+            log.warn("Squash op for %s: no source summaries found — skipping", commitInfo.hash.take(8))
             return
         }
         val apiKey = config.apiKey ?: System.getenv("ANTHROPIC_API_KEY")
@@ -643,26 +755,17 @@ object PostCommitHook {
         )
     }
 
-    private fun handleAmend(store: SummaryStore, pending: AmendPendingState, commitInfo: CommitInfo) {
-        log.info("Handling amend: %s → %s", pending.oldHash.take(8), commitInfo.hash.take(8))
-        val oldSummary = store.getSummary(pending.oldHash) ?: return
-        store.migrateOneToOne(oldSummary, commitInfo)
-    }
-
-    /**
-     * Detects the commit type from GIT_REFLOG_ACTION environment variable.
-     * Values: cherry-pick, revert, commit (regular), etc.
-     */
-    private fun detectCommitType(): CommitType? {
-        val reflogAction = System.getenv("GIT_REFLOG_ACTION") ?: return CommitType.commit
-        return when {
-            reflogAction.startsWith("cherry-pick") -> CommitType.`cherry-pick`
-            reflogAction.startsWith("revert") -> CommitType.revert
-            reflogAction.startsWith("rebase") -> CommitType.rebase
-            reflogAction.startsWith("commit --amend") -> CommitType.amend
-            reflogAction.startsWith("commit") -> CommitType.commit
-            else -> CommitType.commit
+    /** Amend / rebase-pick: 1:1 migrate the old summary to the new hash (no LLM). */
+    private fun processAmend(oldHash: String?, commitInfo: CommitInfo, store: SummaryStore) {
+        if (oldHash == null) {
+            log.warn("Amend/pick op for %s: no source hash — skipping", commitInfo.hash.take(8))
+            return
         }
+        log.info("Migrating summary: %s -> %s", oldHash.take(8), commitInfo.hash.take(8))
+        val oldSummary = store.getSummary(oldHash)
+            ?: store.findRootHash(oldHash)?.let { store.getSummary(it) }
+            ?: return
+        store.migrateOneToOne(oldSummary, commitInfo)
     }
 
     /**

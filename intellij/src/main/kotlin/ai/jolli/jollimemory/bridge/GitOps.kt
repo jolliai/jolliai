@@ -187,19 +187,29 @@ class GitOps(private val projectDir: String) {
         }
     }
 
-    /** Get diff content for HEAD commit. */
-    fun getDiffContent(): String? {
-        return exec("diff", "HEAD~1..HEAD")
+    /**
+     * Get diff content for a commit (defaults to HEAD). Pass a specific [ref] when
+     * the queue drains a commit that is no longer HEAD — the diff must be that
+     * commit's own change, not whatever HEAD points at now. A root commit (no
+     * parent) has no `<ref>~1`, so fall back to `git show` against the empty tree.
+     */
+    fun getDiffContent(ref: String = "HEAD"): String? {
+        return if (hasParent(ref)) exec("diff", "$ref~1..$ref")
+        else exec("show", "--format=", ref)
     }
 
-    /** Get diff stats for HEAD commit. */
-    fun getDiffStats(): String? {
-        return exec("diff", "--stat", "--numstat", "HEAD~1..HEAD")
+    /** Get diff stats for a commit (defaults to HEAD). See [getDiffContent] for the [ref] rationale. */
+    fun getDiffStats(ref: String = "HEAD"): String? {
+        return if (hasParent(ref)) exec("diff", "--stat", "--numstat", "$ref~1..$ref")
+        else exec("show", "--stat", "--numstat", "--format=", ref)
     }
 
-    /** Get HEAD commit info. */
-    fun getHeadCommitInfo(): String? {
-        return exec("log", "-1", "--pretty=format:%H%x00%s%x00%an%x00%aI")
+    /** True when [ref] has a first parent (so `<ref>~1` resolves). */
+    private fun hasParent(ref: String): Boolean = exec("rev-parse", "--verify", "-q", "$ref~1") != null
+
+    /** Get commit info (hash subject author authorDate) for [ref] (defaults to HEAD). */
+    fun getHeadCommitInfo(ref: String = "HEAD"): String? {
+        return exec("log", "-1", "--pretty=format:%H%x00%s%x00%an%x00%aI", ref)
     }
 
     /** Get HEAD hash. */

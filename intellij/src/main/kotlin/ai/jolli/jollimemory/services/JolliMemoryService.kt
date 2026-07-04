@@ -256,6 +256,19 @@ val sb = StringBuilder()
             install()
             refreshStatus()
             sb.appendLine("status after auto-install=${cachedStatus}")
+        } else if (hasCredentials && !isPaused && cachedStatus?.enabled == true) {
+            // Plugin-upgrade catch-up: hooks are already installed (so the block above is
+            // skipped), but the node integrations (MCP + skills + bundled Cli.js) may be
+            // absent or built for an older plugin version. Refresh them off the EDT so a
+            // plugin update activates MCP/skills without a manual re-enable. Version-gated,
+            // so this is a no-op once current.
+            com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+                try {
+                    if (installer?.ensureIntegrations() == true) notifyNodeMissing()
+                } catch (e: Exception) {
+                    log.warn("Integrations catch-up failed (non-fatal): ${e.message}")
+                }
+            }
         }
 
         isInitialized = true
@@ -455,11 +468,32 @@ val sb = StringBuilder()
             // Protect against GIT_REPO_CHANGE flapping: for 3 seconds after install,
             // refreshStatus() will not downgrade enabled:true → enabled:false.
             installProtectionUntil = System.currentTimeMillis() + 3000
+            if (result.nodeMissing) notifyNodeMissing()
             refreshStatus()
             return true
         }
         lastError = result?.message ?: "Installer not available"
         return false
+    }
+
+    /**
+     * Non-blocking heads-up when Node.js was absent at enable time: memory generation
+     * works (Java hooks), but MCP + skills need Node. Never an error — just guidance.
+     */
+    private fun notifyNodeMissing() {
+        try {
+            com.intellij.notification.NotificationGroupManager.getInstance()
+                .getNotificationGroup("JolliMemory")
+                .createNotification(
+                    "Jolli Memory: Node.js not found",
+                    "Memory generation is active. MCP and skills need Node.js — install it and " +
+                        "re-enable Jolli Memory to activate them.",
+                    com.intellij.notification.NotificationType.WARNING,
+                )
+                .notify(project)
+        } catch (_: Throwable) {
+            // Notification is best-effort; never fail install over it.
+        }
     }
 
     fun uninstall(): Boolean {
