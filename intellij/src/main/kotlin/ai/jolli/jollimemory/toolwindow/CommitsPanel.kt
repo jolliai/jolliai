@@ -101,6 +101,14 @@ class CommitsPanel(
     )
     private val checkedHashes = mutableSetOf<String>()
     private var commits: List<CommitSummaryBrief> = emptyList()
+    /**
+     * How many commits are currently shown. Starts at [CappedRows.CAP] and grows
+     * by that page size each time the user clicks "Show N more". Reset to the cap
+     * whenever the commit sequence changes (new branch / new commit), but preserved
+     * across content-identical refreshes (e.g. a background summary tick) so the
+     * list doesn't snap shut while the user is reading.
+     */
+    private var visibleCommits: Int = CappedRows.CAP
     /** Per-commit UI state for expand/collapse and checkbox management. */
     private val commitRowStates = mutableMapOf<String, CommitRowState>()
     /**
@@ -305,6 +313,9 @@ class CommitsPanel(
                 if (checkedHashes.isNotEmpty()) checkedHashes.clear()
                 // Clear detail cache when commit sequence changes
                 detailCache.clear()
+                // Collapse the list back to the first page on a new branch / new
+                // commit; a content-identical refresh leaves the count untouched.
+                visibleCommits = CappedRows.CAP
             }
 
             // Detect merged state: branch HEAD is reachable from main
@@ -368,11 +379,23 @@ class CommitsPanel(
                 "Every commit on this branch will be automatically summarized.</center></html>"
             add(emptyLabel, BorderLayout.CENTER)
         } else {
-            for (commit in commits) {
+            // Show at most [visibleCommits] rows; the rest hide behind a
+            // "Show N more" row that reveals the next page on click.
+            val shown = commits.take(visibleCommits)
+            for (commit in shown) {
                 val state = createCommitRow(commit)
                 commitRowStates[commit.hash] = state
                 listPanel.add(state.row)
                 listPanel.add(state.fileContainer)
+            }
+            if (commits.size > visibleCommits) {
+                val remaining = commits.size - visibleCommits
+                listPanel.add(
+                    CappedRows.showMoreRow(remaining) {
+                        visibleCommits += CappedRows.CAP
+                        updateCommitList()
+                    },
+                )
             }
             // Token-usage meter sits above the list; both share the sidebar's
             // single top-level scrollbar (no inner scrollbar here). Rendered at

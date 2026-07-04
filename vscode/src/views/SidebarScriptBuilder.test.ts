@@ -50,6 +50,20 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("acquireVsCodeApi");
 	});
 
+	it("paginates the committed-memories list a page at a time", () => {
+		const js = buildSidebarScript();
+		// A fixed page size drives both the initial cap and each reveal.
+		expect(js).toContain("COMMITS_PAGE = 6");
+		// The list caps at commitsVisible and appends the incremental more-row.
+		expect(js).toContain("commitsCapped");
+		expect(js).toContain("renderCommitsMoreRow");
+		expect(js).toContain("'data-commits-more'");
+		// Clicking the more-row grows the reveal count and re-renders.
+		expect(js).toContain("commitsVisible += COMMITS_PAGE");
+		// The reveal count resets when the commit sequence changes.
+		expect(js).toContain("commitsVisible = COMMITS_PAGE");
+	});
+
 	it("registers a message listener and posts ready on load", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("addEventListener('message'");

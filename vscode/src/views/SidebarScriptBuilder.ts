@@ -449,6 +449,12 @@ export function buildSidebarScript(): string {
   // preview list that expands on demand.
   const SUBSECTION_PREVIEW = 5;
 
+  // Page size for the top-level Committed Memories list: show this many commits
+  // at first, then reveal another page on each "Show N more" click until all are
+  // visible. Unlike the sub-section preview (a binary show-all / show-less
+  // toggle), the commit list grows incrementally.
+  const COMMITS_PAGE = 6;
+
   function buildKbSearchBox() {
     // Always-visible search affordance for memories mode. Leading magnifier
     // glyph (codicon) sits inside the input box via CSS positioning. Pressing
@@ -1037,11 +1043,18 @@ export function buildSidebarScript(): string {
         branchData.changes = msg.items.slice();
         if (state.activeTab === 'branch') renderBranch();
         break;
-      case 'branch:commitsData':
+      case 'branch:commitsData': {
+        // Collapse the list back to the first page when the commit sequence
+        // changes (branch switch / new commit); a content-identical refresh
+        // leaves the reveal count untouched.
+        const newHashes = msg.items.map(function(c) { return c.hash; }).join('|');
+        const oldHashes = branchData.commits.map(function(c) { return c.hash; }).join('|');
+        if (newHashes !== oldHashes) commitsVisible = COMMITS_PAGE;
         branchData.commits = msg.items.slice();
         branchData.commitsMode = msg.mode || 'empty';
         if (state.activeTab === 'branch') renderBranch();
         break;
+      }
       case 'branch:tokenStats':
         // cached defaults to 0 for back-compat with an older host that didn't
         // send the field (the bar then renders just input/output, no third seg).
@@ -3378,6 +3391,12 @@ export function buildSidebarScript(): string {
 
   // ---- Branch tab renderer ----
   let branchData = { plans: [], changes: [], commits: [], commitsMode: 'empty', conversations: [], conversationsFailedSources: [] };
+  // How many committed memories are currently shown. Grows by COMMITS_PAGE each
+  // time "Show N more" is clicked; reset to the page size whenever the commit
+  // sequence changes (new branch / new commit) so a fresh list starts collapsed.
+  // Transient (mirrors the IntelliJ panel field) — a same-content refresh leaves
+  // it untouched so a background summary tick doesn't snap the list shut.
+  let commitsVisible = COMMITS_PAGE;
   // Squash is an explicit, transient selection mode (mockup): the user clicks
   // "Squash" to reveal per-memory checkboxes + a confirm bar, picks 2+, then
   // confirms or cancels. Not persisted — a reload starts out of squash mode.
@@ -3835,6 +3854,18 @@ export function buildSidebarScript(): string {
     ]);
   }
 
+  // Bottom-of-list "Show N more" row for the top-level Committed Memories
+  // section. Unlike renderShowMoreRow (a binary show-all/less toggle keyed on
+  // data-show-more), this one only ever grows the list a page at a time and
+  // disappears once every commit is shown, so it carries a distinct
+  // data-commits-more marker and always uses the down chevron.
+  function renderCommitsMoreRow(hiddenCount) {
+    return el('div', { className: 'show-more-row', 'data-commits-more': '1' }, [
+      el('i', { className: 'codicon codicon-chevron-down section-twirl', 'aria-hidden': 'true' }),
+      el('span', { className: 'show-more-label', text: 'Show ' + hiddenCount + ' more' }),
+    ]);
+  }
+
   // Inline worker/ingest signal for the Committed Memories header. The global
   // toolbar that used to host "AI summary in progress…" was removed, so the
   // signal moved next to the section it describes. Priority single pill, summary
@@ -3922,7 +3953,12 @@ export function buildSidebarScript(): string {
       delete state.subsectionShowAll[s.id];
     }
     const showAll = !!state.subsectionShowAll[s.id];
-    const visibleItems = (overLimit && !showAll) ? s.items.slice(0, SUBSECTION_PREVIEW) : s.items;
+    // The top-level commit list pages incrementally: show commitsVisible rows,
+    // then a "Show N more" row reveals the next page. commitsCapped gates that row.
+    const commitsCapped = s.id === 'commits' && s.items.length > commitsVisible;
+    const visibleItems = commitsCapped
+      ? s.items.slice(0, commitsVisible)
+      : ((overLimit && !showAll) ? s.items.slice(0, SUBSECTION_PREVIEW) : s.items);
     // rowFn may return either a single node OR an array (commit rows fan
     // out into commit + nested file children when expanded). Flatten one
     // level so the result is a flat list of DOM nodes the section body
@@ -3945,6 +3981,10 @@ export function buildSidebarScript(): string {
     // the top. Only when the sub-section actually has more than the preview cap.
     if (bodyKids && overLimit) {
       bodyKids.push(renderShowMoreRow(s.id, showAll, s.items.length - SUBSECTION_PREVIEW));
+    }
+    // Incremental "Show N more" for the commit list (see commitsCapped above).
+    if (bodyKids && commitsCapped) {
+      bodyKids.push(renderCommitsMoreRow(s.items.length - commitsVisible));
     }
     // Partial-data banner — prepended to the body so it survives both the
     // empty-state and the populated-list rendering paths. Sections that don't
@@ -5210,6 +5250,17 @@ export function buildSidebarScript(): string {
         e.stopPropagation();
         return;
       }
+    }
+
+    // Incremental "Show N more" on the top-level commit list: reveal one more
+    // page and re-render. Transient, so no persist(). Sits before the section
+    // header branch so the click never bubbles into a collapse toggle.
+    const commitsMore = e.target.closest('[data-commits-more]');
+    if (commitsMore) {
+      commitsVisible += COMMITS_PAGE;
+      renderBranch();
+      e.stopPropagation();
+      return;
     }
 
     // "Show N more" / "Show less" toggle on a Current Memory sub-section.

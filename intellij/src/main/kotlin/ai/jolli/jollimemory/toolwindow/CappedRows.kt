@@ -43,7 +43,12 @@ object CappedRows {
 		container.repaint()
 	}
 
-	private fun showMoreRow(remaining: Int, onClick: () -> Unit): JComponent {
+	/**
+	 * A clickable "Show N more" row (down-chevron-free, link-styled). Exposed so
+	 * lists that page incrementally rather than toggling all-at-once (e.g. the
+	 * commit list in [CommitsPanel]) can reuse the exact styling.
+	 */
+	fun showMoreRow(remaining: Int, onClick: () -> Unit): JComponent {
 		val link = JBLabel("Show $remaining more").apply {
 			foreground = com.intellij.ui.JBColor.namedColor("Link.activeForeground", com.intellij.ui.JBColor.BLUE)
 			font = font.deriveFont(font.size2D - 1f).deriveFont(Font.PLAIN)
