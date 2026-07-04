@@ -335,6 +335,17 @@ object SessionTracker {
     }
 
     /**
+     * Bumps the lock file's mtime to now, keeping it fresh while a drain worker runs.
+     * Without this, a drain that spends >[LOCK_TIMEOUT_MS] in LLM calls would look
+     * stale to a concurrent commit's worker, which could then reclaim it and race.
+     */
+    fun refreshLock(cwd: String? = null) {
+        val dir = JmLogger.getJolliMemoryDir(cwd)
+        val lockFile = File(dir, LOCK_FILE)
+        if (lockFile.exists()) lockFile.setLastModified(System.currentTimeMillis())
+    }
+
+    /**
      * Checks if the post-commit worker is currently running.
      * Returns true if the lock file exists and is younger than [LOCK_TIMEOUT_MS].
      * Matches VS Code's isWorkerBusy() in LockUtils.ts.

@@ -199,8 +199,9 @@ class JolliApiClientTest {
         @Test
         fun `pluginVersion is populated from build-time resource`() {
             // Asserts the processResources expand step ran and produced a real
-            // semver — not the 0.0.0 fallback that signals a packaging bug.
-            JolliApiClient.pluginVersion shouldMatch Regex("""^\d+\.\d+\.\d+$""")
+            // version — not the 0.0.0 fallback that signals a packaging bug. Allows an
+            // optional 4th segment for local dev builds (e.g. 0.99.4.2).
+            JolliApiClient.pluginVersion shouldMatch Regex("""^\d+\.\d+\.\d+(\.\d+)?$""")
             JolliApiClient.pluginVersion shouldNotBe "0.0.0"
         }
     }

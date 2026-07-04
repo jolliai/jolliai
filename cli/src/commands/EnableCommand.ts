@@ -129,31 +129,53 @@ export function registerEnableCommand(program: Command): void {
 		.description("Install Jolli Memory hooks (AI agent + git hooks)")
 		.option("--cwd <dir>", "Project directory (default: git repo root)", resolveProjectDir())
 		.option("-y, --yes", "Skip interactive prompts")
-		.action(async (options: { cwd: string; yes?: boolean }) => {
+		.option(
+			"--integrations-only",
+			"Set up MCP + skills + dispatch scripts only; install no git/agent hooks (for hosts that manage their own hooks, e.g. the IntelliJ plugin)",
+		)
+		.option(
+			"--source-tag <tag>",
+			"Override the dist-paths source tag (e.g. 'intellij') so this install coexists with other surfaces",
+		)
+		.action(async (options: { cwd: string; yes?: boolean; integrationsOnly?: boolean; sourceTag?: string }) => {
 			setLogDir(options.cwd);
 
 			log.info("Running 'enable' command");
-			const result = await install(options.cwd, { source: "cli" });
+			const result = await install(options.cwd, {
+				source: "cli",
+				integrationsOnly: options.integrationsOnly,
+				sourceTag: options.sourceTag,
+			});
 
 			if (result.success) {
 				track("surface_enabled", { trigger: "cli" });
-				console.log("\n  Jolli Memory enabled successfully!\n");
-				console.log("  Hooks installed:");
-				console.log(`    - Git post-commit hook (${result.gitHookPath ?? ".git/hooks/post-commit"})`);
-				console.log(`    - Git post-rewrite hook (${result.postRewriteHookPath ?? ".git/hooks/post-rewrite"})`);
-				console.log(
-					`    - Git prepare-commit-msg hook (${result.prepareMsgHookPath ?? ".git/hooks/prepare-commit-msg"})`,
-				);
-				console.log(`    - Claude Code hooks (${result.claudeSettingsPath ?? ".claude/settings.local.json"})`);
-				if (result.geminiSettingsPath) {
-					console.log(`    - Gemini CLI hook (${result.geminiSettingsPath})`);
+				if (options.integrationsOnly) {
+					console.log("\n  Jolli Memory integrations enabled (MCP + skills; no hooks installed).\n");
+				} else {
+					console.log("\n  Jolli Memory enabled successfully!\n");
+					console.log("  Hooks installed:");
+					console.log(`    - Git post-commit hook (${result.gitHookPath ?? ".git/hooks/post-commit"})`);
+					console.log(
+						`    - Git post-rewrite hook (${result.postRewriteHookPath ?? ".git/hooks/post-rewrite"})`,
+					);
+					console.log(
+						`    - Git prepare-commit-msg hook (${result.prepareMsgHookPath ?? ".git/hooks/prepare-commit-msg"})`,
+					);
+					console.log(
+						`    - Claude Code hooks (${result.claudeSettingsPath ?? ".claude/settings.local.json"})`,
+					);
+					if (result.geminiSettingsPath) {
+						console.log(`    - Gemini CLI hook (${result.geminiSettingsPath})`);
+					}
 				}
 
 				for (const warning of result.warnings) {
 					console.warn(`  Warning: ${warning}`);
 				}
 
-				console.log("\n  IMPORTANT: Restart your AI agent session for the hooks to take effect.");
+				if (!options.integrationsOnly) {
+					console.log("\n  IMPORTANT: Restart your AI agent session for the hooks to take effect.");
+				}
 				console.log("  Run 'jolli doctor' to verify installation.");
 
 				// Onboarding disclosure: telemetry is opt-out, so state it plainly here
@@ -193,15 +215,23 @@ export function registerDisableCommand(program: Command): void {
 		.command("disable")
 		.description("Remove all Jolli Memory hooks")
 		.option("--cwd <dir>", "Project directory (default: git repo root)", resolveProjectDir())
-		.action(async (options: { cwd: string }) => {
+		.option(
+			"--integrations-only",
+			"Remove only the repo-scoped MCP registration; leave hooks, skills, and dist-paths (mirror of enable --integrations-only)",
+		)
+		.action(async (options: { cwd: string; integrationsOnly?: boolean }) => {
 			setLogDir(options.cwd);
 
 			log.info("Running 'disable' command");
-			const result = await uninstall(options.cwd);
+			const result = await uninstall(options.cwd, { integrationsOnly: options.integrationsOnly });
 
 			if (result.success) {
 				track("surface_disabled", { reason: "manual" });
-				console.log("\n  Jolli Memory disabled. Hooks removed.\n");
+				console.log(
+					options.integrationsOnly
+						? "\n  Jolli Memory integrations removed (MCP).\n"
+						: "\n  Jolli Memory disabled. Hooks removed.\n",
+				);
 			} else {
 				console.error(`\n  Error: ${result.message}\n`);
 				process.exitCode = 1;

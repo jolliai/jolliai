@@ -17,7 +17,7 @@ plugins {
 }
 
 group = "ai.jolli"
-version = "0.99.4"
+version = "0.99.4.5"
 
 repositories {
     mavenCentral()
@@ -306,31 +306,71 @@ tasks.register("copyHookJarToSandbox") {
     }
 }
 
-// buildSearchableOptions reads from sandbox — make sure hooks JAR is there
+// Bundle the self-contained CLI bundle (esbuild output — all deps inlined, no
+// node_modules) so the plugin can run `node Cli.js enable --integrations-only`
+// to light up MCP + skills without depending on a global CLI install. Source is
+// vscode/dist/Cli.js (produced by `npm run build`); copied into the plugin's
+// cli-dist/ (like the hooks JAR's bin/), off the classloader path.
+// Bundle the FULL self-contained CLI dist (all esbuild bundles: Cli.js + the hook
+// entry scripts PostCommitHook.js / PrepareMsgHook.js / …). Cli.js alone is enough
+// for MCP + skills, but the shared `run-hook` dispatcher execs the per-hook .js
+// files by name — so a single-file bundle would break node git hooks whenever the
+// IntelliJ dist wins dist-paths arbitration (mixed installs). Excludes Extension.js
+// (the VS Code extension-host bundle, not needed here).
+val vscodeDistDir = rootProject.layout.projectDirectory.dir("../vscode/dist")
+tasks.register("copyCliDistToSandbox") {
+    dependsOn("prepareSandbox")
+    doLast {
+        val srcDir = vscodeDistDir.asFile
+        val cliJs = File(srcDir, "Cli.js")
+        if (!cliJs.exists()) {
+            throw GradleException(
+                "Bundled CLI not found at ${cliJs.path}. Run `npm run build` at the repo root " +
+                    "first (it builds vscode/dist/*.js), then re-run the Gradle build.",
+            )
+        }
+        val cliDist = layout.buildDirectory.dir("idea-sandbox/plugins/jollimemory-intellij/cli-dist").get().asFile
+        cliDist.mkdirs()
+        val copied = srcDir.listFiles { f -> f.isFile && f.name.endsWith(".js") && f.name != "Extension.js" }
+            ?.onEach { it.copyTo(File(cliDist, it.name), overwrite = true) }
+            ?.size ?: 0
+        logger.lifecycle("Copied bundled CLI dist ($copied .js files) to: $cliDist")
+    }
+}
+
+// buildSearchableOptions reads from sandbox — make sure hooks JAR + CLI bundle are there
 tasks.named("buildSearchableOptions") {
-    dependsOn("copyHookJarToSandbox")
+    dependsOn("copyHookJarToSandbox", "copyCliDistToSandbox")
 }
 
 // After buildPlugin creates the zip, inject bin/ JARs and strip unused sqlite-jdbc natives from lib/.
 tasks.named("buildPlugin") {
-    dependsOn("copyHookJarToSandbox")
+    dependsOn("copyHookJarToSandbox", "copyCliDistToSandbox")
+    val buildPluginArchive = layout.buildDirectory.file("distributions/jollimemory-intellij-${project.version}.zip")
     doLast {
-        val zipFile = layout.buildDirectory.dir("distributions").get().asFile
-            .listFiles()?.firstOrNull { it.name.endsWith(".zip") } ?: return@doLast
+        // Target THIS build's archive by exact name. Using listFiles().firstOrNull { .zip }
+        // grabbed a stale prior-version (or already-signed) zip when build/distributions/
+        // still held old artifacts, leaving the real output un-injected and unstripped.
+        val zipFile = buildPluginArchive.get().asFile.takeIf { it.exists() } ?: return@doLast
         val pluginBin = layout.buildDirectory.dir("idea-sandbox/plugins/jollimemory-intellij/bin").get().asFile
+        val pluginCliDist = layout.buildDirectory.dir("idea-sandbox/plugins/jollimemory-intellij/cli-dist").get().asFile
 
         // 1. Add hooks JAR to bin/ (outside lib/ so Plugin Verifier skips it).
         //    sqlite-jdbc.jar is NOT duplicated here — the hooks JAR's Class-Path manifest
         //    references ../lib/sqlite-jdbc-*.jar when running from the plugin directory.
         //    A separate copy is only made to ~/.jolli/bin/ by HookInstaller at install time.
+        //    The bundled CLI goes to cli-dist/ (also off the classloader path).
         ant.withGroovyBuilder {
             "zip"("destfile" to zipFile.absolutePath, "update" to true) {
                 "zipfileset"("dir" to pluginBin.absolutePath, "prefix" to "jollimemory-intellij/bin") {
                     "include"("name" to "jollimemory-hooks.jar")
                 }
+                "zipfileset"("dir" to pluginCliDist.absolutePath, "prefix" to "jollimemory-intellij/cli-dist") {
+                    "include"("name" to "*.js")
+                }
             }
         }
-        logger.lifecycle("Injected hooks JAR into: ${zipFile.name}")
+        logger.lifecycle("Injected hooks JAR + CLI bundle into: ${zipFile.name}")
 
         // 2. Strip sqlite-jdbc native libraries in lib/ for platforms IntelliJ never runs on.
         //    The lib/ copy is used by the IDE plugin classloader; bin/sqlite-jdbc.jar is for hooks.

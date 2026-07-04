@@ -26,13 +26,26 @@ object TranscriptReader {
         "<(?:system-reminder|ide_opened_file|ide_selection|local-command-caveat|command-name|command-message|command-args|local-command-stdout)>[\\s\\S]*?</(?:system-reminder|ide_opened_file|ide_selection|local-command-caveat|command-name|command-message|command-args|local-command-stdout)>"
     )
 
-    /** Reads a transcript file and returns parsed entries since the cursor position. */
+    /**
+     * Reads a transcript file and returns parsed entries since the cursor position.
+     *
+     * @param beforeTimestamp Optional ISO-8601 cutoff for commit attribution. When set,
+     *   entries whose timestamp is strictly after the cutoff are NOT consumed — the cursor
+     *   stops just before them so the next commit's drain picks them up. This is what keeps
+     *   a queued burst of commits from all folding the same conversation into the oldest
+     *   commit; each commit gets only the slice that predates it. Entries without a parsable
+     *   timestamp are always consumed (can't attribute them otherwise).
+     */
     fun readTranscript(
         transcriptPath: String,
         cursor: TranscriptCursor? = null,
         parser: TranscriptParser? = null,
+        beforeTimestamp: String? = null,
     ): TranscriptReadResult {
         val startLine = cursor?.lineNumber ?: 0
+        val cutoffMs = beforeTimestamp?.let {
+            try { java.time.Instant.parse(it).toEpochMilli() } catch (_: Exception) { null }
+        }
         val parseFn: (String, Int) -> TranscriptEntry? = parser?.let { p -> { line, num -> p.parseLine(line, num) } }
             ?: { line, num -> parseTranscriptLine(line, num) }
 
@@ -53,6 +66,9 @@ object TranscriptReader {
         val rawEntries = mutableListOf<TranscriptEntry>()
         var totalLines = 0
         var newLinesRead = 0
+        // Cursor advances only over lines we actually consumed, so an over-cutoff line
+        // is re-read next time rather than skipped.
+        var consumedLine = startLine
 
         try {
             file.bufferedReader(Charsets.UTF_8).useLines { lineSequence ->
@@ -60,8 +76,14 @@ object TranscriptReader {
                     if (line.isBlank()) continue
                     totalLines++
                     if (totalLines <= startLine) continue
-                    newLinesRead++
                     val entry = parseFn(line, totalLines - 1)
+                    // Stop (without consuming this line) at the first entry past the cutoff.
+                    if (cutoffMs != null && entry?.timestamp != null) {
+                        val ts = try { java.time.Instant.parse(entry.timestamp).toEpochMilli() } catch (_: Exception) { null }
+                        if (ts != null && ts > cutoffMs) return@useLines
+                    }
+                    newLinesRead++
+                    consumedLine = totalLines
                     if (entry != null) rawEntries.add(entry)
                 }
             }
@@ -74,7 +96,7 @@ object TranscriptReader {
 
         val newCursor = TranscriptCursor(
             transcriptPath = transcriptPath,
-            lineNumber = totalLines,
+            lineNumber = consumedLine,
             updatedAt = java.time.Instant.now().toString(),
         )
 

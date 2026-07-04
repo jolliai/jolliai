@@ -115,6 +115,29 @@ class TranscriptReaderTest {
         }
 
         @Test
+        fun `beforeTimestamp stops at the cutoff and leaves later entries for the next read`(@TempDir tempDir: File) {
+            val file = File(tempDir, "test.jsonl")
+            file.writeText(
+                """
+{"message":{"role":"user","content":"Before"},"timestamp":"2026-01-01T00:00:01Z"}
+{"message":{"role":"assistant","content":"AlsoBefore"},"timestamp":"2026-01-01T00:00:02Z"}
+{"message":{"role":"user","content":"After"},"timestamp":"2026-01-01T00:00:09Z"}
+                """.trimIndent(),
+            )
+
+            // Cutoff between the 2nd and 3rd entries: only the first two are consumed.
+            val first = TranscriptReader.readTranscript(file.absolutePath, null, null, "2026-01-01T00:00:05Z")
+            first.entries shouldHaveSize 2
+            first.entries.last().content shouldBe "AlsoBefore"
+
+            // The cursor stopped before "After", so a later read (no cutoff) picks it up —
+            // it was NOT skipped.
+            val second = TranscriptReader.readTranscript(file.absolutePath, first.newCursor)
+            second.entries shouldHaveSize 1
+            second.entries.first().content shouldBe "After"
+        }
+
+        @Test
         fun `merges consecutive same-role entries`(@TempDir tempDir: File) {
             val file = File(tempDir, "test.jsonl")
             file.writeText("""

@@ -243,6 +243,33 @@ describe("Installer", () => {
 			expect(matcherGroup.hooks[0].async).toBe(true);
 		});
 
+		it("integrations-only installs MCP + skills but no git/agent hooks", async () => {
+			const exists = (p: string) =>
+				stat(p)
+					.then(() => true)
+					.catch(() => false);
+
+			const result = await install(tempDir, { integrationsOnly: true, sourceTag: "intellij" });
+			expect(result.success).toBe(true);
+
+			// No hooks: git post-commit + Claude settings must NOT be written.
+			expect(await exists(join(tempDir, ".git", "hooks", "post-commit"))).toBe(false);
+			expect(await exists(join(tempDir, ".git", "hooks", "post-rewrite"))).toBe(false);
+			expect(await exists(join(tempDir, ".git", "hooks", "prepare-commit-msg"))).toBe(false);
+			expect(await exists(join(tempDir, ".claude", "settings.local.json"))).toBe(false);
+
+			// Integrations ARE set up: MCP registered for Claude (repo-scoped) + skills written.
+			const mcp = JSON.parse(await readFile(join(tempDir, ".mcp.json"), "utf-8"));
+			expect(mcp.mcpServers?.jollimemory).toBeDefined();
+			expect(await exists(join(tempDir, ".agents", "skills", "jolli-recall", "SKILL.md"))).toBe(true);
+
+			// The explicit source tag lands the dist-paths entry under "intellij", not "cli",
+			// so an IntelliJ install coexists with a real CLI install.
+			const distPaths = join(fakeHomeDir, ".jolli", "jollimemory", "dist-paths");
+			expect(await exists(join(distPaths, "intellij"))).toBe(true);
+			expect(await exists(join(distPaths, "cli"))).toBe(false);
+		});
+
 		it("should auto-enable Codex discovery when Codex is detected and not configured", async () => {
 			const { isCodexInstalled } = await import("../core/CodexSessionDiscoverer.js");
 			vi.mocked(isCodexInstalled).mockResolvedValueOnce(true);
@@ -942,6 +969,30 @@ describe("Installer", () => {
 			const content = await readFile(settingsPath, "utf-8");
 			const settings = JSON.parse(content);
 			expect(settings.hooks).toBeUndefined();
+		});
+
+		it("integrations-only uninstall removes repo MCP but leaves hooks + skills", async () => {
+			const exists = (p: string) =>
+				stat(p)
+					.then(() => true)
+					.catch(() => false);
+
+			// Install the full stack (hooks + MCP + skills), then remove ONLY integrations.
+			await install(tempDir);
+			expect(
+				JSON.parse(await readFile(join(tempDir, ".mcp.json"), "utf-8")).mcpServers?.jollimemory,
+			).toBeDefined();
+
+			const result = await uninstall(tempDir, { integrationsOnly: true });
+			expect(result.success).toBe(true);
+
+			// MCP entry gone…
+			expect(
+				JSON.parse(await readFile(join(tempDir, ".mcp.json"), "utf-8")).mcpServers?.jollimemory,
+			).toBeUndefined();
+			// …but hooks and skills are untouched (the caller owns its hooks).
+			expect(await exists(join(tempDir, ".git", "hooks", "post-commit"))).toBe(true);
+			expect(await exists(join(tempDir, ".agents", "skills", "jolli-recall", "SKILL.md"))).toBe(true);
 		});
 
 		it("continues removing git hooks when removeRepoMcpHosts throws (e.g. read-only .mcp.json)", async () => {

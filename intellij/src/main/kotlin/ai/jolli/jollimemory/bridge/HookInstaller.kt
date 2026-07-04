@@ -190,6 +190,26 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             SkillInstaller(mainRepoRoot).updateSkillIfNeeded()
             installLog.appendLine("Skill installed")
 
+            // Light up MCP + the full skill set (recall/search/pr) by shelling the bundled
+            // CLI's integrations-only enable. Node-only: when Node is absent this is a clean
+            // skip — Java hooks above already made memory generation work. Never fatal.
+            var nodeMissing = false
+            when (val integ = CliIntegrations.enableIntegrations(projectDir)) {
+                is CliIntegrations.Result.Ok -> installLog.appendLine("Integrations (MCP + skills) enabled")
+                is CliIntegrations.Result.NodeMissing -> {
+                    nodeMissing = true
+                    warnings.add(
+                        "Node.js not found — MCP and skills were skipped. Memory generation still works; " +
+                            "install Node.js and re-enable to activate MCP + skills.",
+                    )
+                    installLog.appendLine("Integrations skipped: Node.js not found")
+                }
+                is CliIntegrations.Result.BundleMissing ->
+                    installLog.appendLine("Integrations skipped: bundled Cli.js not found")
+                is CliIntegrations.Result.Failed ->
+                    installLog.appendLine("Integrations failed (non-fatal): ${integ.message}")
+            }
+
             // Final verification: re-read Claude hook file
             val finalVerify = File(mainRepoRoot, ".claude/settings.local.json")
             val finalContent = if (finalVerify.exists()) finalVerify.readText(Charsets.UTF_8) else "FILE NOT FOUND"
@@ -199,7 +219,7 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             // Write install log
             writeInstallLog(installLog.toString())
 
-            return InstallResult(true, "JolliMemory hooks installed successfully", warnings)
+            return InstallResult(true, "JolliMemory hooks installed successfully", warnings, nodeMissing = nodeMissing)
         } catch (e: Exception) {
             installLog.appendLine("ERROR: ${e.message}\n${e.stackTraceToString()}")
             writeInstallLog(installLog.toString())
@@ -215,6 +235,19 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
     }
 
     /**
+     * Ensures the node integrations (MCP + skills + bundled Cli.js) are set up for the
+     * CURRENT plugin version WITHOUT touching hooks. Called on startup so a plugin
+     * upgrade activates them without a manual re-enable — `install()` doesn't re-run
+     * once hooks are already installed. Idempotent + version-gated; node-only.
+     *
+     * @return true if Node was missing (so the caller can notify).
+     */
+    fun ensureIntegrations(): Boolean {
+        if (CliIntegrations.integrationsUpToDate()) return false
+        return CliIntegrations.enableIntegrations(projectDir) is CliIntegrations.Result.NodeMissing
+    }
+
+    /**
      * Remove all hooks.
      */
     fun uninstall(): InstallResult {
@@ -224,6 +257,10 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             removeGitHookSection("post-commit", POST_COMMIT_START, POST_COMMIT_END)
             removeGitHookSection("post-rewrite", POST_REWRITE_START, POST_REWRITE_END)
             removeGitHookSection("prepare-commit-msg", PREPARE_MSG_START, PREPARE_MSG_END)
+            // Mirror of enable: tear down the MCP registration via the bundled CLI
+            // (best-effort, node-only). Leaves hooks/skills/dist-paths per the CLI's
+            // conservative uninstall policy. Never fails the disable over this.
+            CliIntegrations.disableIntegrations(projectDir)
             return InstallResult(true, "JolliMemory hooks removed", emptyList())
         } catch (e: Exception) {
             return InstallResult(false, "Uninstallation failed: ${e.message}", emptyList())
@@ -469,12 +506,10 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             // class is loaded from `<pluginPath>/lib/<jar>.jar`, so the plugin root is two
             // levels up. Pure JVM API — also resolves to null cleanly when running from
             // the hooks JAR outside the IDE, which the null-guards below handle.
-            val codeSource = File(javaClass.protectionDomain.codeSource.location.toURI())
-            searchLog.appendLine("codeSource=$codeSource")
-
-            // <pluginPath>/lib/<jar>.jar -> parent (lib/) -> parent (pluginPath)
-            val pluginPath = codeSource.parentFile?.parentFile?.toPath()
-            searchLog.appendLine("pluginPath=$pluginPath")
+            // Robust plugin-dir resolution: codeSource first, then a bundled-resource URL
+            // fallback (codeSource.location is null under IntelliJ 2026.1's module loader).
+            val pluginPath = CliIntegrations.resolvePluginDir()?.toPath()
+            searchLog.appendLine("pluginPath=$pluginPath (via resolvePluginDir)")
 
             if (pluginPath != null) {
                 // Check bin/ first (hooks JAR lives outside lib/ to avoid Plugin Verifier scanning)
@@ -620,4 +655,6 @@ data class InstallResult(
     val success: Boolean,
     val message: String,
     val warnings: List<String>,
+    /** True when Node.js was absent so MCP + skills were skipped (memory generation still works). */
+    val nodeMissing: Boolean = false,
 )
