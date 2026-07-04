@@ -129,7 +129,11 @@ object CreatePrScriptBuilder {
   var editBtn = document.getElementById('cmdEdit');
   if (editBtn) editBtn.addEventListener('click', function () { setEditing(!editing); });
   var copyBtn = document.getElementById('cmdCopyBody');
-  if (copyBtn) copyBtn.addEventListener('click', function () { jmSend({ command: 'copyBody' }); });
+  if (copyBtn) copyBtn.addEventListener('click', function () {
+    // Send the live textarea body (matches Create/Update) so Copy reflects inline edits.
+    var cb = document.getElementById('prBodyInput');
+    jmSend({ command: 'copyBody', body: cb ? cb.value : undefined });
+  });
 
   document.querySelectorAll('.row[data-hash]').forEach(function (r) {
     r.addEventListener('click', function () { jmSend({ command: 'openMemory', hash: r.getAttribute('data-hash') }); });
