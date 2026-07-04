@@ -69,23 +69,24 @@ object ForcePushUtil {
 	}
 
 	/**
-	 * Post-rejection gate. Inspects divergence, then either:
+	 * Post-rejection gate. Given the divergence [safety] (computed by
+	 * [inspectForcePushSafety]), either:
 	 * - blocks when the branch is merely behind (force-push never offered),
 	 * - shows the shared force-push confirmation with lost-commit count.
 	 *
-	 * When divergence can't be measured, falls back to plain confirm so a
-	 * legitimate rewrite is never blocked by a transient failure.
+	 * When [safety] is null (divergence couldn't be measured), falls back to a
+	 * plain confirm so a legitimate rewrite is never blocked by a transient
+	 * failure.
 	 *
-	 * MUST be called from the EDT (shows dialogs).
+	 * Dialog-only: MUST be called from the EDT. Run [inspectForcePushSafety] on a
+	 * background thread first and pass its result in — this function does no I/O.
 	 */
 	fun gateForcePush(
 		project: Project,
-		git: GitOps,
 		branch: String,
+		safety: ForcePushSafety?,
 		reason: String = "Remote branch has diverged. Force push will overwrite remote history.",
 	): ForcePushOutcome {
-		val safety = inspectForcePushSafety(git, branch)
-
 		if (safety?.behindOnly == true) {
 			val commits = if (safety.remoteOnly == 1) "commit" else "commits"
 			val message = buildString {
