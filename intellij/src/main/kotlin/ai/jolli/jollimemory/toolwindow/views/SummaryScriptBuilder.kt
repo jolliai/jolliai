@@ -35,6 +35,16 @@ object SummaryScriptBuilder {
     }
   }
 
+  // Tell the panel the user has unsaved edits (typing in any topic / E2E / plan / recap /
+  // reference / transcript field) so a cross-panel memory-state event doesn't reload the
+  // page and drop them. Fires on real content changes, not focus; clears on next reload.
+  document.addEventListener('input', function(e) {
+    var t = e.target;
+    if (t && (t.isContentEditable || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) {
+      jmSend({ command: 'editState', editing: true });
+    }
+  });
+
   // Toggle expand/collapse for individual memory sections (skip clicks on action buttons)
   document.querySelectorAll('.toggle-header').forEach(function(header) {
     header.addEventListener('click', function(e) {

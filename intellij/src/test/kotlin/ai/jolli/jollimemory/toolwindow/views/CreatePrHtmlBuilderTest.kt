@@ -72,18 +72,19 @@ class CreatePrHtmlBuilderTest {
     }
 
     @Test
-    fun `dims the Update button when there are no unpushed changes, enables it otherwise`() {
+    fun `keeps Update PR enabled even with no unpushed commits (body-only updates are valid), with an informational hint`() {
         val pr = CreatePrData.ExistingPr(42, "https://github.com/o/r/pull/42")
-        // Update mode, nothing new to push → button disabled + "Up to date" hint.
+        // Update mode, nothing new to push: the button must NOT be disabled — the PR body
+        // is memory-derived and can change without a commit — but an informational hint shows.
         val upToDate = CreatePrHtmlBuilder.buildHtml(vm(existingPr = pr, hasUnpushedChanges = false), true, "")
-        upToDate shouldContain """id="cmdCreatePr" data-uptodate="true" disabled"""
+        upToDate shouldContain """id="cmdCreatePr" data-uptodate="true">Update PR</button>"""
+        upToDate shouldNotContain """id="cmdCreatePr" data-uptodate="true" disabled"""
         upToDate shouldContain """<span class="up-to-date">"""
-        // Update mode with unpushed commits → enabled (no disabled attr on the button).
+        // Update mode with unpushed commits → enabled, no hint.
         val hasChanges = CreatePrHtmlBuilder.buildHtml(vm(existingPr = pr, hasUnpushedChanges = true), true, "")
-        hasChanges shouldContain """id="cmdCreatePr" data-uptodate="false""""
-        hasChanges shouldNotContain """id="cmdCreatePr" data-uptodate="false" disabled"""
-        // Create mode never dims, even if pushed (the button has no disabled attr;
-        // ".btn:disabled" in the CSS is why we assert on the button markup, not "disabled").
+        hasChanges shouldContain """id="cmdCreatePr" data-uptodate="false">Update PR</button>"""
+        hasChanges shouldNotContain """<span class="up-to-date">"""
+        // Create mode: enabled, no hint.
         val create = CreatePrHtmlBuilder.buildHtml(vm(existingPr = null, hasUnpushedChanges = false), true, "")
         create shouldContain """id="cmdCreatePr" data-uptodate="false">Create PR</button>"""
         create shouldNotContain """<span class="up-to-date">"""

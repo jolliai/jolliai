@@ -103,7 +103,17 @@ class SummaryPanel(
      * fresh jolliDocUrl) and re-checks the branch PR, then re-renders — keeping this view
      * in sync with the Create PR view and the Commits list.
      */
+    // True while the webview holds unsaved edits (topics / E2E / plans / recap /
+    // references / transcripts). Set by the 'editState' message, cleared on every full
+    // reload. Guards against a cross-panel memory-state event reloading the page and
+    // silently dropping in-progress edits.
+    @Volatile
+    private var webviewDirty = false
+
     private fun onMemoryStateChanged() {
+        // Never clobber unsaved edits — the PR/share badges will re-sync on the next
+        // reload (after the user saves). Dropping in-progress edits is the worse failure.
+        if (webviewDirty) return
         ApplicationManager.getApplication().executeOnPooledThread {
             val fresh = try {
                 service?.getSummary(currentSummary.commitHash)
@@ -111,6 +121,7 @@ class SummaryPanel(
                 null
             }
             ApplicationManager.getApplication().invokeLater {
+                if (webviewDirty) return@invokeLater
                 if (fresh != null) currentSummary = fresh
                 refreshHtml()
                 handleCheckPrStatus()
@@ -207,6 +218,9 @@ class SummaryPanel(
     }
 
     private fun refreshHtml() {
+        // A full reload replaces the DOM, so clear the unsaved-edits flag: future
+        // memory-state events may refresh again.
+        webviewDirty = false
         val isDark = !JBColor.isBright()
         val html = SummaryHtmlBuilder.buildHtml(currentSummary, isDark, transcriptHashSet, planTranslateSet, bridgeScript, readOnly)
         browser?.loadHTML(html)
@@ -258,6 +272,7 @@ class SummaryPanel(
         }
         try {
             when (command) {
+                "editState" -> webviewDirty = json.get("editing")?.asBoolean == true
                 "copyMarkdown" -> handleCopyMarkdown()
                 "pushToJolli" -> handlePushToJolli()
                 "editTopic" -> handleEditTopic(json.get("topicIndex").asInt, json.getAsJsonObject("updates"))
