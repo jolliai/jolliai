@@ -475,6 +475,10 @@ data class StatusInfo(
     val copilotScanError: SqliteScanError? = null,
     val copilotChatDetected: Boolean? = null,
     val copilotChatScanError: CopilotChatScanError? = null,
+    /** Node.js resolvable on PATH — required for the MCP server + full skill set. */
+    val nodeAvailable: Boolean = true,
+    /** MCP + full skills are set up (bundled CLI extracted and version-matched). */
+    val integrationsActive: Boolean = false,
 )
 
 /** Log levels */

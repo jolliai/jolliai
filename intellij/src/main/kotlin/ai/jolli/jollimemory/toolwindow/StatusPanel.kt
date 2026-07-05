@@ -134,6 +134,10 @@ class StatusPanel(
             tooltip = hooksTooltip,
         ))
 
+        // 1b. MCP & Skills — the Node-powered features. Always shown so a missing/failed
+        // Node runtime is a durable, hover-explained status (not just a transient balloon).
+        listModel.addElement(mcpStatusRow(status.nodeAvailable, status.integrationsActive))
+
         // 2. Sessions (Claude/Gemini — other sources are discovered on-demand at commit time)
         listModel.addElement(StatusRow(
             icon = Icon.PULSE,
@@ -351,6 +355,44 @@ class StatusPanel(
 
     override fun dispose() {
         service.removeStatusListener(statusListener)
+    }
+
+    companion object {
+        /**
+         * Maps the Node integration state to the "MCP & Skills" status row. Pure (no Swing,
+         * no I/O) so it can be unit-tested. Three states:
+         *   - node present + integrations set up → OK "active"
+         *   - node missing                       → WARN, lists what's unavailable
+         *   - node present but not set up        → WARN "setup incomplete" (enable failed / bundle missing)
+         */
+        fun mcpStatusRow(nodeAvailable: Boolean, integrationsActive: Boolean): StatusRow = when {
+            nodeAvailable && integrationsActive -> StatusRow(
+                icon = Icon.OK,
+                label = "MCP & Skills",
+                description = "active",
+                tooltip = "Node.js found — the MCP tools (search / recall / decision timeline) and the " +
+                    "/jolli-recall, /jolli-search, /jolli-pr skills are active.",
+            )
+            !nodeAvailable -> StatusRow(
+                icon = Icon.WARN,
+                label = "MCP & Skills",
+                description = "Node.js not found",
+                tooltip = "Node.js was not detected on your PATH, so these are unavailable:\n" +
+                    "  • MCP tools (search / recall / decision timeline)\n" +
+                    "  • /jolli-search\n" +
+                    "  • /jolli-pr\n" +
+                    "Memory generation is unaffected (native Java hooks). Install Node.js and reopen " +
+                    "the project to activate them.",
+            )
+            else -> StatusRow(
+                icon = Icon.WARN,
+                label = "MCP & Skills",
+                description = "setup incomplete",
+                tooltip = "Node.js is available but MCP + skills are not fully set up — the bundled CLI " +
+                    "failed to enable or was not found. See ~/.jolli/logs/jollimemory-install-debug.log " +
+                    "for details, then reopen the project to retry.",
+            )
+        }
     }
 
     // ── Data model ──────────────────────────────────────────────────────────

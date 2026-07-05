@@ -44,6 +44,12 @@ class SummaryReader(private val projectDir: String, private val git: GitOps) {
 
         val copilotChatInstalled = CopilotChatSupport.isCopilotChatInstalled()
 
+        // Node-powered integrations (MCP + full skill set). getStatus() runs off the EDT
+        // (refreshStatus is invoked on a pooled thread / the startup coroutine), so the
+        // login-shell PATH probe inside isNodeAvailable() never blocks the UI.
+        val nodeAvailable = CliIntegrations.isNodeAvailable()
+        val integrationsActive = CliIntegrations.integrationsUpToDate()
+
         return StatusInfo(
             enabled = hooksInstalled,
             claudeHookInstalled = installer.isClaudeHookInstalled(),
@@ -70,6 +76,8 @@ class SummaryReader(private val projectDir: String, private val git: GitOps) {
             copilotScanError = copilotError,
             copilotChatDetected = copilotChatInstalled,
             copilotChatScanError = null,
+            nodeAvailable = nodeAvailable,
+            integrationsActive = integrationsActive,
         )
     }
 
