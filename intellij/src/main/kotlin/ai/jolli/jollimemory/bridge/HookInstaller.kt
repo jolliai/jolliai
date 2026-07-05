@@ -193,22 +193,19 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             // Light up MCP + the full skill set (recall/search/pr) by shelling the bundled
             // CLI's integrations-only enable. Node-only: when Node is absent this is a clean
             // skip — Java hooks above already made memory generation work. Never fatal.
-            var nodeMissing = false
-            when (val integ = CliIntegrations.enableIntegrations(projectDir)) {
-                is CliIntegrations.Result.Ok -> installLog.appendLine("Integrations (MCP + skills) enabled")
-                is CliIntegrations.Result.NodeMissing -> {
-                    nodeMissing = true
-                    warnings.add(
-                        "Node.js not found — MCP and skills were skipped. Memory generation still works; " +
-                            "install Node.js and re-enable to activate MCP + skills.",
-                    )
-                    installLog.appendLine("Integrations skipped: Node.js not found")
-                }
-                is CliIntegrations.Result.BundleMissing ->
-                    installLog.appendLine("Integrations skipped: bundled Cli.js not found")
-                is CliIntegrations.Result.Failed ->
-                    installLog.appendLine("Integrations failed (non-fatal): ${integ.message}")
-            }
+            // ALL non-Ok results surface a warning (not just NodeMissing) so a failed/absent
+            // bundle no longer fails silently.
+            val integ = CliIntegrations.enableIntegrations(projectDir)
+            val integrationsIssue = CliIntegrations.warningFor(integ)
+            if (integrationsIssue != null) warnings.add(integrationsIssue)
+            installLog.appendLine(
+                when (integ) {
+                    is CliIntegrations.Result.Ok -> "Integrations (MCP + skills) enabled"
+                    is CliIntegrations.Result.NodeMissing -> "Integrations skipped: Node.js not found"
+                    is CliIntegrations.Result.BundleMissing -> "Integrations skipped: bundled Cli.js not found"
+                    is CliIntegrations.Result.Failed -> "Integrations failed (non-fatal): ${integ.message}"
+                },
+            )
 
             // Final verification: re-read Claude hook file
             val finalVerify = File(mainRepoRoot, ".claude/settings.local.json")
@@ -219,7 +216,7 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             // Write install log
             writeInstallLog(installLog.toString())
 
-            return InstallResult(true, "JolliMemory hooks installed successfully", warnings, nodeMissing = nodeMissing)
+            return InstallResult(true, "JolliMemory hooks installed successfully", warnings, integrationsIssue = integrationsIssue)
         } catch (e: Exception) {
             installLog.appendLine("ERROR: ${e.message}\n${e.stackTraceToString()}")
             writeInstallLog(installLog.toString())
@@ -240,11 +237,13 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
      * upgrade activates them without a manual re-enable — `install()` doesn't re-run
      * once hooks are already installed. Idempotent + version-gated; node-only.
      *
-     * @return true if Node was missing (so the caller can notify).
+     * @return a human-readable warning when integrations could not be set up (Node missing,
+     *   bundle missing, or the CLI failed) so the caller can notify, or `null` when they are
+     *   already up to date or were set up successfully.
      */
-    fun ensureIntegrations(): Boolean {
-        if (CliIntegrations.integrationsUpToDate()) return false
-        return CliIntegrations.enableIntegrations(projectDir) is CliIntegrations.Result.NodeMissing
+    fun ensureIntegrations(): String? {
+        if (CliIntegrations.integrationsUpToDate()) return null
+        return CliIntegrations.warningFor(CliIntegrations.enableIntegrations(projectDir))
     }
 
     /**
@@ -655,6 +654,10 @@ data class InstallResult(
     val success: Boolean,
     val message: String,
     val warnings: List<String>,
-    /** True when Node.js was absent so MCP + skills were skipped (memory generation still works). */
-    val nodeMissing: Boolean = false,
+    /**
+     * Human-readable reason MCP + skills were not set up (Node missing, bundle missing, or
+     * the bundled CLI failed), or `null` when they succeeded. Memory generation works either
+     * way. Drives the balloon notification; the StatusPanel row reflects the live state.
+     */
+    val integrationsIssue: String? = null,
 )

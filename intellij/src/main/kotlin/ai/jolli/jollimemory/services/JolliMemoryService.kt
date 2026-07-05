@@ -264,7 +264,11 @@ val sb = StringBuilder()
             // so this is a no-op once current.
             com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
                 try {
-                    if (installer?.ensureIntegrations() == true) notifyNodeMissing()
+                    val issue = installer?.ensureIntegrations()
+                    if (issue != null) {
+                        refreshStatus() // so the StatusPanel row reflects the new integration state
+                        notifyIntegrationsIssue(issue)
+                    }
                 } catch (e: Exception) {
                     log.warn("Integrations catch-up failed (non-fatal): ${e.message}")
                 }
@@ -468,7 +472,7 @@ val sb = StringBuilder()
             // Protect against GIT_REPO_CHANGE flapping: for 3 seconds after install,
             // refreshStatus() will not downgrade enabled:true → enabled:false.
             installProtectionUntil = System.currentTimeMillis() + 3000
-            if (result.nodeMissing) notifyNodeMissing()
+            result.integrationsIssue?.let { notifyIntegrationsIssue(it) }
             refreshStatus()
             return true
         }
@@ -477,22 +481,24 @@ val sb = StringBuilder()
     }
 
     /**
-     * Non-blocking heads-up when Node.js was absent at enable time: memory generation
-     * works (Java hooks), but MCP + skills need Node. Never an error — just guidance.
+     * Non-blocking heads-up when MCP + skills could not be set up (Node missing, bundle
+     * missing, or the bundled CLI failed): memory generation works (Java hooks), but the
+     * Node-powered features are unavailable. Never an error — just guidance. The durable
+     * surface is the StatusPanel "MCP & Skills" row; this balloon is the first-time nudge.
      */
-    private fun notifyNodeMissing() {
+    private fun notifyIntegrationsIssue(message: String) {
         try {
             com.intellij.notification.NotificationGroupManager.getInstance()
                 .getNotificationGroup("JolliMemory")
                 .createNotification(
-                    "Jolli Memory: Node.js not found",
-                    "Memory generation is active. MCP and skills need Node.js — install it and " +
-                        "re-enable Jolli Memory to activate them.",
+                    "Jolli Memory: MCP & skills unavailable",
+                    message,
                     com.intellij.notification.NotificationType.WARNING,
                 )
                 .notify(project)
-        } catch (_: Throwable) {
-            // Notification is best-effort; never fail install over it.
+        } catch (t: Throwable) {
+            // Notification is best-effort; never fail install over it — but no longer silent.
+            log.warn("Failed to show integrations notification: ${t.message}")
         }
     }
 

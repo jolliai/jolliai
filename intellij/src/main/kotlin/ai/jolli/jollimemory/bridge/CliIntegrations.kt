@@ -40,6 +40,24 @@ object CliIntegrations {
     }
 
     /**
+     * Human-readable warning for a non-successful integrations result, or `null` when
+     * everything is fine ([Result.Ok]). Centralized here so the install path and the
+     * startup catch-up path surface identical wording (balloon + StatusPanel tooltip).
+     */
+    fun warningFor(result: Result): String? = when (result) {
+        is Result.Ok -> null
+        is Result.NodeMissing ->
+            "Node.js not found — the MCP tools and the /jolli-search and /jolli-pr skills were skipped. " +
+                "Memory generation still works (native hooks). Install Node.js and reopen the project to activate them."
+        is Result.BundleMissing ->
+            "MCP and skills could not be set up — the bundled CLI was not found in the plugin. " +
+                "Try reinstalling the Jolli Memory plugin."
+        is Result.Failed ->
+            "MCP and skills failed to set up: ${result.message}. Memory generation still works. " +
+                "See ~/.jolli/logs/jollimemory-install-debug.log for details."
+    }
+
+    /**
      * Locates the installed plugin's root directory. Tries the class's codeSource
      * first, then falls back to parsing a bundled resource's URL — because on newer
      * IntelliJ (2026.1+) `protectionDomain.codeSource.location` is null for plugin
