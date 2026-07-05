@@ -45,6 +45,7 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 import { getCurrentBranch } from "../core/GitOps.js";
 import { isWorkerLockHeld } from "../core/Locks.js";
 import { enqueueGitOperation } from "../core/SessionTracker.js";
+import { runWithTrace } from "../core/TraceContext.js";
 import { handlePostRewriteHook } from "./PostRewriteHook.js";
 import { launchWorker } from "./QueueWorker.js";
 
@@ -128,6 +129,19 @@ describe("PostRewriteHook", () => {
 			);
 		});
 
+		// Coverage: handleAmend's truthy `...(traceId && { traceId })` arm.
+		// Running inside a real trace scope makes getCurrentTraceId() resolve a
+		// valid id, so the spread stamps it onto the enqueued op.
+		it("stamps the ambient trace id onto the amend op when inside a trace scope", async () => {
+			setStdinLines(["aaaa1111 bbbb2222"]);
+			const traceId = "0123456789abcdef0123456789abcdef";
+			await runWithTrace(traceId, () => handlePostRewriteHook("amend", "/test/project"));
+			expect(enqueueGitOperation).toHaveBeenCalledWith(
+				expect.objectContaining({ type: "amend", traceId }),
+				"/test/project",
+			);
+		});
+
 		it("should not enqueue when amend has no stdin mappings", async () => {
 			setStdinLines([]);
 
@@ -177,6 +191,17 @@ describe("PostRewriteHook", () => {
 			await handlePostRewriteHook("rebase", "/test/project");
 			expect(enqueueGitOperation).toHaveBeenCalledWith(
 				expect.objectContaining({ type: "rebase-pick", branch: "topic/y" }),
+				"/test/project",
+			);
+		});
+
+		// Coverage: handleRebase's truthy `...(traceId && { traceId })` arm.
+		it("stamps the ambient trace id onto rebase ops when inside a trace scope", async () => {
+			setStdinLines(["aaaa1111 bbbb2222"]);
+			const traceId = "fedcba9876543210fedcba9876543210";
+			await runWithTrace(traceId, () => handlePostRewriteHook("rebase", "/test/project"));
+			expect(enqueueGitOperation).toHaveBeenCalledWith(
+				expect.objectContaining({ type: "rebase-pick", traceId }),
 				"/test/project",
 			);
 		});

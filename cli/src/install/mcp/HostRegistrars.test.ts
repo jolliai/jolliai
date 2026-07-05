@@ -262,11 +262,15 @@ describe("opencode/copilot/copilotChat registrars — structure", () => {
 		expect(r.host).toBe("opencode");
 		expect(r.gitExcludePaths()).toEqual([]);
 	});
-	it("copilot appears when detected.copilot is true", () => {
-		expect(buildRegistrars({ ...NONE, copilot: true }).map((r) => r.host)).toContain("copilot");
+	it("copilot appears when detected.copilot is true, with empty gitExcludePaths", () => {
+		const [r] = buildRegistrars({ ...NONE, copilot: true });
+		expect(r.host).toBe("copilot");
+		expect(r.gitExcludePaths()).toEqual([]);
 	});
-	it("copilotChat appears when detected.copilotChat is true", () => {
-		expect(buildRegistrars({ ...NONE, copilotChat: true }).map((r) => r.host)).toContain("copilotChat");
+	it("copilotChat appears when detected.copilotChat is true, with empty gitExcludePaths", () => {
+		const [r] = buildRegistrars({ ...NONE, copilotChat: true });
+		expect(r.host).toBe("copilotChat");
+		expect(r.gitExcludePaths()).toEqual([]);
 	});
 });
 
@@ -324,6 +328,15 @@ describe("new registrars — register targets & entry shape (mocked writer)", ()
 		removeMock.mockClear();
 		await build({ ...NONE, copilotChat: true })[0].remove("/some/wt");
 		expect(removeMock.mock.calls[0][1]).toBe("servers");
+	});
+
+	it("copilot remove() → ~/.copilot/mcp-config.json, default key", async () => {
+		const { buildRegistrars: build } = await import("./HostRegistrars.js");
+		const [r] = build({ ...NONE, copilot: true });
+		await r.remove("/some/wt");
+		const [path, key] = removeMock.mock.calls[0];
+		expect(path).toBe(join(homedir(), ".copilot", "mcp-config.json"));
+		expect(key).toBeUndefined(); // default mcpServers
 	});
 });
 

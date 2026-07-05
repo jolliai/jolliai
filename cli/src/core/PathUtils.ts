@@ -24,14 +24,26 @@
  * and could mask legitimate upgrades if either endpoint is a stale symlink.
  */
 export function normalizePathForCompare(p: string): string {
-	let unified = p.replace(/\\/g, "/");
-	// Strip trailing slashes via a bounded loop rather than `/\/+$/`. The regex
-	// is linear-time, but CodeQL flags any unbounded quantifier on input as a
-	// polynomial-regex risk; the loop form removes the false positive.
-	let end = unified.length;
-	while (end > 0 && unified[end - 1] === "/") end--;
-	if (end !== unified.length) unified = unified.slice(0, end);
+	const unified = stripTrailingSlashes(p.replace(/\\/g, "/"));
 	return process.platform === "win32" || process.platform === "darwin" ? unified.toLowerCase() : unified;
+}
+
+/**
+ * Removes any trailing `/` characters from a forward-slash path.
+ *
+ * Uses a bounded loop rather than the obvious `s.replace(/\/+$/, "")`. That
+ * regex is linear-time in practice, but its unbounded `+` quantifier anchored
+ * at `$` trips CodeQL's `js/polynomial-redos` rule whenever the input is
+ * library-controlled (e.g. a git remote URL). The loop form is provably O(n)
+ * and carries no such flag, so it is the canonical way to strip trailing
+ * slashes across the CLI — do NOT reintroduce the `/\/+$/` regex on untrusted
+ * input. Backslashes are not handled here; convert with {@link toForwardSlash}
+ * first if the input may contain them.
+ */
+export function stripTrailingSlashes(p: string): string {
+	let end = p.length;
+	while (end > 0 && p[end - 1] === "/") end--;
+	return end === p.length ? p : p.slice(0, end);
 }
 
 /**

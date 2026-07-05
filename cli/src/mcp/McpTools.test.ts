@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../core/SearchIndex.js", () => ({
 	SearchIndex: { openCached: vi.fn() },
@@ -13,14 +16,65 @@ vi.mock("../core/TopicPageStore.js", () => ({ readTopicPage: vi.fn() }));
 vi.mock("../core/SummaryStore.js", () => ({ getActiveStorage: vi.fn() }));
 vi.mock("../core/PrDescription.js", () => ({ buildPrDescription: vi.fn() }));
 vi.mock("../util/Subprocess.js", () => ({ execFileSyncHidden: vi.fn() }));
+vi.mock("../core/JolliMemoryPushOrchestrator.js", () => ({
+	pushBranchToJolli: vi.fn(),
+	resolveSpaceId: vi.fn(),
+}));
+vi.mock("../core/JolliMemoryPushClient.js", async () => {
+	const actual = await vi.importActual<typeof import("../core/JolliMemoryPushClient.js")>(
+		"../core/JolliMemoryPushClient.js",
+	);
+	return { ...actual, JolliMemoryPushClient: vi.fn() };
+});
+vi.mock("../core/GitRemoteUtils.js", () => ({
+	getCanonicalRepoUrl: vi.fn(),
+	deriveRepoNameFromUrl: vi.fn(),
+}));
 
 import { buildRecallPayload, compileTaskContext, listBranchCatalog } from "../core/ContextCompiler.js";
+import { deriveRepoNameFromUrl, getCanonicalRepoUrl } from "../core/GitRemoteUtils.js";
+import { BindingAlreadyExistsError, JolliMemoryPushClient } from "../core/JolliMemoryPushClient.js";
+import { pushBranchToJolli, resolveSpaceId } from "../core/JolliMemoryPushOrchestrator.js";
 import { buildPrDescription } from "../core/PrDescription.js";
 import { SearchIndex } from "../core/SearchIndex.js";
 import { getActiveStorage } from "../core/SummaryStore.js";
 import { readTopicPage } from "../core/TopicPageStore.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
-import { runDecisionTimeline, runGetPrDescription, runListBranches, runRecall, runSearch } from "./McpTools.js";
+import {
+	runBindSpace,
+	runDecisionTimeline,
+	runGetPrDescription,
+	runListBranches,
+	runListSpaces,
+	runPushMemory,
+	runQueueStatus,
+	runRecall,
+	runSearch,
+} from "./McpTools.js";
+
+const MockClient = vi.mocked(JolliMemoryPushClient);
+
+/**
+ * `new JolliMemoryPushClient()` requires the mock implementation to be a real
+ * constructible function — an arrow function throws "is not a constructor"
+ * when invoked with `new`. `mockImplementation(function () {...})` sidesteps
+ * that; this helper keeps call sites reading like a plain stub swap.
+ */
+function setClientStub(stub: Partial<JolliMemoryPushClient>): void {
+	MockClient.mockImplementation(function (this: unknown) {
+		return stub;
+	} as unknown as typeof JolliMemoryPushClient);
+}
+
+let tempDir: string;
+
+beforeEach(async () => {
+	tempDir = join(tmpdir(), `mcptools-${process.pid}-${Math.floor(Date.now() % 1e9)}`);
+	await mkdir(tempDir, { recursive: true });
+});
+afterEach(async () => {
+	await rm(tempDir, { recursive: true, force: true });
+});
 
 describe("runSearch", () => {
 	it("delegates to SearchIndex.search and returns hits", async () => {
@@ -180,5 +234,114 @@ describe("runGetPrDescription", () => {
 			new Error('No JolliMemory summaries found on branch "empty" (base "main").'),
 		);
 		await expect(runGetPrDescription("/repo", {})).rejects.toThrow(/No JolliMemory summaries/);
+	});
+});
+
+describe("runQueueStatus", () => {
+	it("returns drained for an empty queue", async () => {
+		const r = await runQueueStatus(tempDir, {});
+		expect(r).toMatchObject({ active: 0, drained: true });
+	});
+
+	it("returns waitedMs when wait is requested", async () => {
+		const r = await runQueueStatus(tempDir, { wait: true, timeoutMs: 20 });
+		expect(r).toHaveProperty("waitedMs");
+	});
+});
+
+describe("runPushMemory", () => {
+	afterEach(() => {
+		vi.mocked(pushBranchToJolli).mockReset();
+	});
+
+	it("delegates to pushBranchToJolli and returns a pushed result", async () => {
+		vi.mocked(pushBranchToJolli).mockResolvedValue({
+			type: "pushed",
+			pushed: 2,
+			skipped: 0,
+			urls: ["https://jolli.ai/articles?doc=1"],
+		});
+		const out = await runPushMemory("/repo", { baseBranch: "main", space: "acme" });
+		expect(pushBranchToJolli).toHaveBeenCalledWith({ cwd: "/repo", baseBranch: "main", space: "acme" });
+		expect(out).toEqual({ type: "pushed", pushed: 2, skipped: 0, urls: ["https://jolli.ai/articles?doc=1"] });
+	});
+
+	it("returns the binding_required union member unchanged", async () => {
+		vi.mocked(pushBranchToJolli).mockResolvedValue({
+			type: "binding_required",
+			repoUrl: "https://github.com/acme/widgets",
+			spaces: [{ id: 1, name: "Acme", slug: "acme" }],
+			defaultSpaceId: 1,
+		});
+		const out = await runPushMemory("/repo", {});
+		expect(pushBranchToJolli).toHaveBeenCalledWith({ cwd: "/repo", baseBranch: undefined, space: undefined });
+		expect(out.type).toBe("binding_required");
+	});
+});
+
+describe("runListSpaces", () => {
+	afterEach(() => {
+		MockClient.mockReset();
+	});
+
+	it("returns the spaces and default space id from the client", async () => {
+		const spaces = [
+			{ id: 1, name: "Acme", slug: "acme" },
+			{ id: 2, name: "Widgets", slug: "widgets" },
+		];
+		setClientStub({ listSpaces: vi.fn(async () => ({ spaces, defaultSpaceId: 2 })) });
+		const out = await runListSpaces("/repo");
+		expect(out).toEqual({ spaces, defaultSpaceId: 2 });
+	});
+});
+
+describe("runBindSpace", () => {
+	afterEach(() => {
+		MockClient.mockReset();
+		vi.mocked(getCanonicalRepoUrl).mockReset();
+		vi.mocked(deriveRepoNameFromUrl).mockReset();
+		vi.mocked(resolveSpaceId).mockReset();
+	});
+
+	it("resolves the repo + space and returns the bound result", async () => {
+		vi.mocked(getCanonicalRepoUrl).mockResolvedValue("https://github.com/acme/widgets");
+		vi.mocked(deriveRepoNameFromUrl).mockReturnValue("widgets");
+		vi.mocked(resolveSpaceId).mockResolvedValue(2);
+		const createBinding = vi.fn(async () => ({ bindingId: 9, jmSpaceId: 2, repoName: "widgets" }));
+		setClientStub({ createBinding });
+		const out = await runBindSpace("/repo", { space: "widgets" });
+		expect(createBinding).toHaveBeenCalledWith({
+			repoUrl: "https://github.com/acme/widgets",
+			repoName: "widgets",
+			jmSpaceId: 2,
+		});
+		expect(out).toEqual({ type: "bound", bindingId: 9, jmSpaceId: 2, repoName: "widgets" });
+	});
+
+	it("returns type:already_bound instead of throwing when the repo is already bound", async () => {
+		vi.mocked(getCanonicalRepoUrl).mockResolvedValue("https://github.com/acme/widgets");
+		vi.mocked(deriveRepoNameFromUrl).mockReturnValue("widgets");
+		vi.mocked(resolveSpaceId).mockResolvedValue(1);
+		const createBinding = vi.fn(async () => {
+			throw new BindingAlreadyExistsError("binding_already_exists");
+		});
+		setClientStub({ createBinding });
+		const out = await runBindSpace("/repo", { space: "acme" });
+		expect(out).toEqual({ type: "already_bound", message: "binding_already_exists" });
+	});
+
+	it("rejects an empty space", async () => {
+		await expect(runBindSpace("/repo", { space: "  " })).rejects.toThrow(/space` is required/i);
+	});
+
+	it("propagates a non-BindingAlreadyExistsError from createBinding", async () => {
+		vi.mocked(getCanonicalRepoUrl).mockResolvedValue("https://github.com/acme/widgets");
+		vi.mocked(deriveRepoNameFromUrl).mockReturnValue("widgets");
+		vi.mocked(resolveSpaceId).mockResolvedValue(1);
+		const createBinding = vi.fn(async () => {
+			throw new Error("HTTP 500");
+		});
+		setClientStub({ createBinding });
+		await expect(runBindSpace("/repo", { space: "acme" })).rejects.toThrow("HTTP 500");
 	});
 });

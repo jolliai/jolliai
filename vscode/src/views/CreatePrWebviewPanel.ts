@@ -290,7 +290,19 @@ export class CreatePrWebviewPanel {
 						// A share failure never rolls back the already-created PR.
 						if (this.signedIn) {
 							post({ command: "prProgress", text: "Sharing memories to your Jolli Space…" });
-							await this.pushMemoriesToSpace();
+							try {
+								await this.pushMemoriesToSpace();
+							} catch (err) {
+								// pushMemoriesToSpace handles its own expected errors, but an
+								// unexpected throw (e.g. loadGlobalConfig failing before its inner
+								// try) must NOT skip the settle below — that would leave the panel's
+								// buttons disabled. The PR is already live; surface and continue.
+								log.warn(
+									"CreatePrPanel",
+									`pushMemoriesToSpace threw: ${err instanceof Error ? err.message : String(err)}`,
+								);
+								vscode.window.showWarningMessage("PR is ready, but sharing memories to Jolli Space failed.");
+							}
 						}
 						// Rebuild the whole pane from fresh storage and re-render regardless
 						// of the pre-submit mode. This does two things at once: (a) the body

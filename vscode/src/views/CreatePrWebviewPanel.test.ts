@@ -410,6 +410,38 @@ describe("CreatePrWebviewPanel", () => {
 		);
 	});
 
+	it("openDiff: swallows non-Error rejections from vscode.diff via the rejection handler", async () => {
+		const vscode = await import("vscode");
+		const logMod = await import("../util/Logger.js");
+		// Diff base resolves → vscode.diff path; reject with a plain string (not an
+		// Error) to cover the String(e) branch of the diff's rejection handler.
+		(bridge as { getBranchDiffBase: ReturnType<typeof vi.fn> }).getBranchDiffBase.mockResolvedValueOnce("basehash");
+		(vscode.commands.executeCommand as ReturnType<typeof vi.fn>).mockRejectedValueOnce("diff perm denied");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		created[0].onMsg({ command: "openDiff", path: "missing/file.ts" });
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
+			"CreatePrPanel",
+			expect.stringContaining("diff perm denied"),
+		);
+	});
+
+	it("openDiff: swallows Error rejections from the working-tree fallback via the rejection handler", async () => {
+		const vscode = await import("vscode");
+		const logMod = await import("../util/Logger.js");
+		// No diff base → working-tree fallback; reject with an Error to cover the
+		// e.message branch of the fallback's rejection handler.
+		(bridge as { getBranchDiffBase: ReturnType<typeof vi.fn> }).getBranchDiffBase.mockResolvedValueOnce(undefined);
+		(vscode.commands.executeCommand as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("open failed"));
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		created[0].onMsg({ command: "openDiff", path: "another/file.ts" });
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
+			"CreatePrPanel",
+			expect.stringContaining("open failed"),
+		);
+	});
+
 	it("update mode: when an open PR exists, the panel renders Update PR and routes to handleUpdatePrWithPush", async () => {
 		mocks.findOpenPrForBranch.mockResolvedValueOnce({ number: 7, url: "https://gh/pr/7" });
 		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
@@ -443,6 +475,45 @@ describe("CreatePrWebviewPanel", () => {
 		created[0].onMsg({ command: "createPr" });
 		await Promise.resolve(); await Promise.resolve();
 		expect(mocks.handleCreatePr).toHaveBeenCalledTimes(1);
+	});
+
+	it("post-create refresh: logs an Error from the PR re-lookup without re-throwing", async () => {
+		const logMod = await import("../util/Logger.js");
+		// First lookup (show) → create mode; second lookup (post-create refresh) throws.
+		mocks.findOpenPrForBranch.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("refresh boom"));
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		created[0].onMsg({ command: "createPr" });
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		expect(mocks.handleCreatePr).toHaveBeenCalledTimes(1);
+		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
+			"CreatePrPanel",
+			expect.stringContaining("refresh boom"),
+		);
+	});
+
+	it("post-create refresh: stringifies a non-Error from the PR re-lookup", async () => {
+		const logMod = await import("../util/Logger.js");
+		mocks.findOpenPrForBranch.mockResolvedValueOnce(undefined).mockRejectedValueOnce("refresh string boom");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		created[0].onMsg({ command: "createPr" });
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
+			"CreatePrPanel",
+			expect.stringContaining("refresh string boom"),
+		);
+	});
+
+	it("create failure: a non-succeeded outcome skips the post-create refresh and prComplete", async () => {
+		// The handler already posted prCreateFailed; the panel must not run the
+		// post-create share/refresh or post prComplete when the outcome isn't success.
+		mocks.handleCreatePr.mockResolvedValueOnce("failed");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		created[0].onMsg({ command: "createPr" });
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		expect(mocks.handleCreatePr).toHaveBeenCalledTimes(1);
+		// findOpenPrForBranch ran once (initial show lookup), never again for a refresh.
+		expect(mocks.findOpenPrForBranch).toHaveBeenCalledTimes(1);
+		expect(created[0].webview.postMessage).not.toHaveBeenCalledWith({ command: "prComplete" });
 	});
 
 	it("existing-PR lookup failure (non-Error): stringifies the reason in the warning and falls back to create mode", async () => {

@@ -398,9 +398,11 @@ export async function getOrCreateInstallIdInDir(
 		installId = await readInstallIdSentinel(sentinel, candidate);
 		created = false;
 	}
+	/* v8 ignore start -- reaching here means config.installId was falsy (a truthy value returns at line 378) while installId is always a non-empty string, so the guard is always true; its else branch is unreachable */
 	if (config.installId !== installId) {
 		await saveConfigScoped({ installId }, dir);
 	}
+	/* v8 ignore stop */
 	return { installId, created };
 }
 
@@ -525,6 +527,76 @@ export async function countActiveQueueEntries(cwd?: string): Promise<number> {
 		}
 	}
 	return count;
+}
+
+/**
+ * Counts active (non-stale) queue entries that produce a memory summary —
+ * every op EXCEPT `ingest` (wiki/graph rendering). Used by the queue-status /
+ * PR-wait path so building a PR never blocks on Memory Bank wiki generation.
+ */
+export async function countActiveSummaryQueueEntries(cwd?: string): Promise<number> {
+	const queueDir = join(getJolliMemoryDir(cwd), GIT_OP_QUEUE_DIR);
+	let files: string[];
+	try {
+		files = await readdir(queueDir);
+	} catch {
+		return 0;
+	}
+
+	const now = Date.now();
+	let count = 0;
+	for (const file of files.filter((f) => f.endsWith(".json"))) {
+		try {
+			const content = await readFile(join(queueDir, file), "utf-8");
+			const op = JSON.parse(content) as GitOperation;
+			const age = now - new Date(op.createdAt).getTime();
+			// Count as active unless PROVABLY stale (`age > STALE`). A missing/unparseable
+			// `createdAt` makes `age` NaN and `NaN > STALE` false, so such an op counts as
+			// active — the PR-wait path must wait for it rather than silently omit a pending
+			// summary. The wait's own timeout bounds the downside of a genuinely stuck op.
+			if (!(age > GIT_OP_QUEUE_STALE_MS) && !isIngestOperation(op)) {
+				count++;
+			}
+		} catch {
+			// Corrupt entry — ignore (treated as neither active-summary nor countable).
+		}
+	}
+	return count;
+}
+
+/**
+ * Single-pass count of active (non-stale) queue entries split by kind — summary
+ * (every op except `ingest`) vs `ingest` (wiki/graph). One directory scan keeps
+ * the two counts mutually consistent: deriving ingest as `total - summary` from
+ * two independent scans can skew if an entry is enqueued between them. Uses the
+ * same "active unless provably stale" rule as {@link countActiveSummaryQueueEntries}.
+ */
+export async function countActiveQueueEntriesByKind(cwd?: string): Promise<{ summary: number; ingest: number }> {
+	const queueDir = join(getJolliMemoryDir(cwd), GIT_OP_QUEUE_DIR);
+	let files: string[];
+	try {
+		files = await readdir(queueDir);
+	} catch {
+		return { summary: 0, ingest: 0 };
+	}
+
+	const now = Date.now();
+	let summary = 0;
+	let ingest = 0;
+	for (const file of files.filter((f) => f.endsWith(".json"))) {
+		try {
+			const content = await readFile(join(queueDir, file), "utf-8");
+			const op = JSON.parse(content) as GitOperation;
+			const age = now - new Date(op.createdAt).getTime();
+			if (!(age > GIT_OP_QUEUE_STALE_MS)) {
+				if (isIngestOperation(op)) ingest++;
+				else summary++;
+			}
+		} catch {
+			// Corrupt entry — neither active-summary nor active-ingest.
+		}
+	}
+	return { summary, ingest };
 }
 
 /**

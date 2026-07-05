@@ -238,6 +238,23 @@ describe("pushSummaryWithAttachments", () => {
 		expect(result.updatedSummary.jolliDocId).toBe(100);
 	});
 
+	it("still resolves a successful push when orphan cleanup throws a non-Error value", async () => {
+		mockPushToJolli.mockResolvedValue({ docId: 100 });
+		mockDeleteFromJolli.mockResolvedValue(undefined);
+		// A non-Error rejection (e.g. a bare string) must be stringified by the
+		// best-effort cleanup catch without surfacing as a failed push.
+		const storeSummary = vi
+			.fn()
+			.mockResolvedValueOnce(undefined)
+			.mockRejectedValueOnce("disk full");
+		const ctx = makeContext({ storeSummary });
+
+		const result = await pushSummaryWithAttachments(makeSummary({ orphanedDocIds: [7] }), ctx);
+
+		expect(result.pushedDoc.summaryDocId).toBe(100);
+		expect(result.updatedSummary.jolliDocId).toBe(100);
+	});
+
 	it("skips a plan whose body cannot be read", async () => {
 		mockPushToJolli.mockResolvedValue({ docId: 100 });
 		mockReadPlan.mockResolvedValue("");

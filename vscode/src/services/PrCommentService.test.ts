@@ -13,9 +13,16 @@ const { mockExecFileAsync } = vi.hoisted(() => ({
 	mockExecFileAsync: vi.fn(),
 }));
 
-const { randomBytesMock } = vi.hoisted(() => ({
-	randomBytesMock: vi.fn(),
-}));
+const { randomBytesMock } = vi.hoisted(() => {
+	// Seed a return value in the hoisted factory (not just in beforeEach): the
+	// mocked `randomBytes` is called at MODULE-LOAD time by a transitive import
+	// (SessionTracker's top-level PROCESS_NONCE = randomBytes(4).toString(...)),
+	// which runs before any beforeEach. A bare vi.fn() returns undefined there
+	// and crashes the whole suite on load.
+	const fn = vi.fn();
+	fn.mockReturnValue({ toString: () => "a1b2c3d4e5f6" });
+	return { randomBytesMock: fn };
+});
 
 const { writeFileMock, unlinkMock } = vi.hoisted(() => ({
 	writeFileMock: vi.fn(),
@@ -923,6 +930,24 @@ describe("PrCommentService", () => {
 			);
 			expect(postMessage).not.toHaveBeenCalledWith(
 				expect.objectContaining({ status: "noPr" }),
+			);
+		});
+
+		it("wraps a non-Error gh rejection in an Error so lookupError still has a message", async () => {
+			// gh (via execFile) normally rejects with an Error, but a non-Error
+			// rejection (e.g. a bare string) must be coerced by tryExecGh so
+			// `result.err.message` is always populated for the lookupError reason.
+			setupHappyProbesWithPrHandler(() => {
+				throw "gh blew up";
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					status: "unavailable",
+					reason: expect.stringContaining("gh blew up"),
+				}),
 			);
 		});
 
@@ -2972,6 +2997,75 @@ describe("PrCommentService", () => {
 			expect(postMessage).toHaveBeenCalledWith({ command: "prCreateFailed" });
 			expect(showErrorMessage).toHaveBeenCalledWith(
 				expect.stringContaining("Update PR failed — auth failed"),
+			);
+		});
+
+		it("empty rev-parse output normalizes to the HEAD sentinel and blocks", async () => {
+			// getCurrentBranch returns "" (rev-parse output blank); getCurrentBranchSafe
+			// applies its `|| "HEAD"` fallback, landing on the detached-HEAD block
+			// rather than force-pushing an empty branch name.
+			let gitPushCalled = false;
+			setupExecFile(
+				buildRouter({
+					"git:rev-parse": () => ({ stdout: "\n" }),
+					"git:push": () => {
+						gitPushCalled = true;
+						return { stdout: "" };
+					},
+				}),
+			);
+
+			await handleUpdatePrWithPush("T", "B", CWD, postMessage, "feature/x");
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prCreateBlockedCrossBranch",
+				summaryBranch: "feature/x",
+				currentBranch: "HEAD",
+			});
+			expect(gitPushCalled).toBe(false);
+		});
+
+		it("vanished + confirmed but the push is cancelled: prCreateFailed without creating", async () => {
+			// noPr → user confirms creating a fresh PR → the push is rejected as
+			// non-fast-forward and the user dismisses the force modal → "cancelled".
+			// No PR must be created and the button must reset without an error toast.
+			let created = false;
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") return { stdout: "feature/branch\n" };
+				if (cmd === "git" && args[0] === "push") throw new Error("! [rejected] (non-fast-forward)");
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") return { stdout: "[]" };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "create") {
+					created = true;
+					return { stdout: "https://gh/pr/9\n" };
+				}
+				return { stdout: "" };
+			});
+			showWarningMessage.mockResolvedValueOnce("Create New PR"); // confirm the fallback
+			showWarningMessage.mockResolvedValueOnce(undefined); // dismiss the force-push modal
+
+			await handleUpdatePrWithPush("T", "B", CWD, postMessage);
+
+			expect(created).toBe(false);
+			expect(postMessage).toHaveBeenCalledWith({ command: "prCreateFailed" });
+			expect(showErrorMessage).not.toHaveBeenCalled();
+		});
+
+		it("posts prCreateFailed with the stringified value when the push rejects with a non-Error", async () => {
+			// A non-Error rejection that is not a non-fast-forward error bubbles out of
+			// pushBranch to the outer catch, which must stringify it for the toast.
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") return { stdout: "feature/branch\n" };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list")
+					return { stdout: JSON.stringify(OPEN_PR) };
+				if (cmd === "git" && args[0] === "push") throw "kaboom";
+				return { stdout: "" };
+			});
+
+			await handleUpdatePrWithPush("T", "B", CWD, postMessage);
+
+			expect(postMessage).toHaveBeenCalledWith({ command: "prCreateFailed" });
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Update PR failed — kaboom"),
 			);
 		});
 

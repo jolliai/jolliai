@@ -102,6 +102,20 @@ describe("CodexTomlWriter", () => {
 		await removeCodexMcpServer(p);
 		expect(await readFile(p, "utf-8")).toBe(original);
 	});
+	it("removeCodexMcpServer normalizes the seam when the block sits between other tables", async () => {
+		const p = join(await mkdtemp(join(tmpdir(), "c-")), "config.toml");
+		// jollimemory sits BETWEEN [a] and [b]: removing it leaves non-empty `before`
+		// AND non-empty `rest`, so stripBlock must collapse the seam to one blank line.
+		await writeFile(
+			p,
+			'[a]\nx = 1\n\n[mcp_servers.jollimemory]\ncommand = "old"\nargs = ["mcp"]\n\n[b]\ny = 2\n',
+			"utf-8",
+		);
+		await removeCodexMcpServer(p);
+		const t = await readFile(p, "utf-8");
+		expect(t).not.toContain("jollimemory");
+		expect(t).toBe("[a]\nx = 1\n\n[b]\ny = 2\n");
+	});
 	it("removeCodexMcpServer strips a jollimemory block followed by another table", async () => {
 		const p = join(await mkdtemp(join(tmpdir(), "c-")), "config.toml");
 		// jollimemory is NOT the last table — a subsequent '[' header follows it,

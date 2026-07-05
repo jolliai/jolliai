@@ -22,6 +22,8 @@ function sampleResult(overrides: Partial<PrDescriptionResult> = {}): PrDescripti
 		commitCount: 3,
 		summaryCount: 3,
 		missingCount: 0,
+		queueActive: 0,
+		workerBlocking: false,
 		...overrides,
 	};
 }

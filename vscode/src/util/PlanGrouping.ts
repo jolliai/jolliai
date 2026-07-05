@@ -34,8 +34,11 @@ export function planBaseKey(slug: string): string {
 /**
  * Compares two plans newest-first by `updatedAt`, tiebroken by `slug` so the
  * order is deterministic across the standalone re-renders the panel performs.
+ * Exported so the cross-commit dedup in LiveShareController picks the same
+ * "latest" snapshot this module's display + push paths do — a disagreement drops
+ * a plan's markdown link on an equal-timestamp tie.
  */
-function byUpdatedAtDesc(a: PlanReference, b: PlanReference): number {
+export function byUpdatedAtDesc(a: PlanReference, b: PlanReference): number {
 	if (a.updatedAt !== b.updatedAt) {
 		return a.updatedAt < b.updatedAt ? 1 : -1;
 	}

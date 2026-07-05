@@ -59,7 +59,7 @@
  * release path.
  */
 
-import { mkdir, stat } from "node:fs/promises";
+import { mkdir, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { createLogger, getJolliMemoryDir } from "../Logger.js";
 import * as Subprocess from "../util/Subprocess.js";
@@ -257,6 +257,51 @@ export async function isWorkerLockHeld(cwd?: string): Promise<boolean> {
 export async function isWorkerLockStale(cwd?: string): Promise<boolean> {
 	const dir = getJolliMemoryDir(cwd);
 	return isLockStale(join(dir, WORKER_LOCK_FILE));
+}
+
+/**
+ * True when the `worker-phase` marker is a fresh `ingest*` phase. Mirrors the
+ * vscode `LockUtils.isFreshIngestPhase`: the worker writes `ingest:wiki` /
+ * `ingest:graph` (older workers: bare `ingest`) and heartbeats the marker, so a
+ * stale marker is residue from a failed cleanup and is treated as NOT ingest
+ * (fail-safe → the run is assumed to be a blocking summary).
+ */
+async function isFreshIngestPhase(cwd?: string): Promise<boolean> {
+	const phasePath = join(getJolliMemoryDir(cwd), WORKER_PHASE_FILE);
+	try {
+		const content = await readFile(phasePath, "utf-8");
+		if (!content.trim().startsWith("ingest")) return false;
+		const phaseStat = await stat(phasePath);
+		return Date.now() - phaseStat.mtimeMs < LOCK_TIMEOUT_MS;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * True only when the worker is busy with a phase that generates memory
+ * summaries — i.e. `worker.lock` is held AND the current phase is not a fresh
+ * ingest (wiki/graph) phase. Callers waiting on "is a summary still being
+ * written?" use this, not `isWorkerLockHeld`, so they never block on Memory
+ * Bank wiki/graph rendering. CLI analogue of vscode `LockUtils.isWorkerBlockingBusy`.
+ */
+export async function isWorkerBlockingBusy(cwd?: string): Promise<boolean> {
+	if (!(await isWorkerLockHeld(cwd))) return false;
+	return !(await isFreshIngestPhase(cwd));
+}
+
+/**
+ * Reads both worker-busy axes with `held` gating `blocking` — `blocking` is only
+ * computed when `held` is true, so the two can never contradict each other.
+ * Callers that need both (e.g. `getQueueStatus`) must use this rather than calling
+ * `isWorkerLockHeld` and `isWorkerBlockingBusy` separately — those evaluate the
+ * lock independently, and a cross-process lock release between them can interleave
+ * into the impossible pair `held=false, blocking=true`.
+ */
+export async function getWorkerBusyState(cwd?: string): Promise<{ held: boolean; blocking: boolean }> {
+	const held = await isWorkerLockHeld(cwd);
+	if (!held) return { held: false, blocking: false };
+	return { held, blocking: !(await isFreshIngestPhase(cwd)) };
 }
 
 /**

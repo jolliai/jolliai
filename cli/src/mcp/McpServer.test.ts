@@ -6,6 +6,10 @@ vi.mock("./McpTools.js", () => ({
 	runDecisionTimeline: vi.fn().mockResolvedValue({ timeline: [] }),
 	runListBranches: vi.fn().mockResolvedValue({ branches: [] }),
 	runGetPrDescription: vi.fn().mockResolvedValue({ type: "pr_description" }),
+	runQueueStatus: vi.fn().mockResolvedValue({ active: 0, drained: true }),
+	runPushMemory: vi.fn().mockResolvedValue({ type: "pushed", pushed: 0, skipped: 0, urls: [] }),
+	runListSpaces: vi.fn().mockResolvedValue({ spaces: [], defaultSpaceId: null }),
+	runBindSpace: vi.fn().mockResolvedValue({ type: "bound", bindingId: 1, jmSpaceId: 1, repoName: "acme" }),
 }));
 
 const { mockStorage } = vi.hoisted(() => ({ mockStorage: { kind: "mock-storage" } }));
@@ -45,12 +49,32 @@ import { VERSION } from "../commands/CliUtils.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { dispatchTool, startMcpServer, TOOL_DEFINITIONS } from "./McpServer.js";
-import { runDecisionTimeline, runGetPrDescription, runListBranches, runRecall, runSearch } from "./McpTools.js";
+import {
+	runBindSpace,
+	runDecisionTimeline,
+	runGetPrDescription,
+	runListBranches,
+	runListSpaces,
+	runPushMemory,
+	runQueueStatus,
+	runRecall,
+	runSearch,
+} from "./McpTools.js";
 
 describe("MCP tool registry", () => {
-	it("declares exactly the five tools", () => {
+	it("declares exactly the nine tools", () => {
 		expect(TOOL_DEFINITIONS.map((t) => t.name).sort()).toEqual(
-			["get_decision_timeline", "get_pr_description", "list_branches", "recall", "search"].sort(),
+			[
+				"bind_space",
+				"get_decision_timeline",
+				"get_pr_description",
+				"list_branches",
+				"list_spaces",
+				"push_memory",
+				"queue_status",
+				"recall",
+				"search",
+			].sort(),
 		);
 	});
 
@@ -91,6 +115,26 @@ describe("dispatchTool", () => {
 			baseBranch: "main",
 			includeMarkers: false,
 		});
+	});
+
+	it("routes queue_status to runQueueStatus with parsed args", async () => {
+		await dispatchTool("/repo", "queue_status", { wait: true, timeoutMs: 5000 });
+		expect(runQueueStatus).toHaveBeenCalledWith("/repo", { wait: true, timeoutMs: 5000 });
+	});
+
+	it("routes push_memory to runPushMemory with parsed args", async () => {
+		await dispatchTool("/repo", "push_memory", { baseBranch: "main", space: "acme" });
+		expect(runPushMemory).toHaveBeenCalledWith("/repo", { baseBranch: "main", space: "acme" });
+	});
+
+	it("routes list_spaces (no args) to runListSpaces", async () => {
+		await dispatchTool("/repo", "list_spaces", {});
+		expect(runListSpaces).toHaveBeenCalledWith("/repo");
+	});
+
+	it("routes bind_space to runBindSpace with parsed args", async () => {
+		await dispatchTool("/repo", "bind_space", { space: "acme" });
+		expect(runBindSpace).toHaveBeenCalledWith("/repo", { space: "acme" });
 	});
 
 	it("throws on an unknown tool", async () => {
@@ -139,6 +183,34 @@ describe("startMcpServer", () => {
 		};
 		expect(result.isError).toBe(true);
 		expect(JSON.parse(result.content[0].text)).toEqual({ error: "boom" });
+	});
+
+	it("CallTool handler flags a structured {type:'error'} result as isError (push_memory contract parity)", async () => {
+		// push_memory reports failure as a resolved { type: "error" } object rather
+		// than throwing; the server must still mark it isError so its contract
+		// matches the thrown-error path list_spaces/bind_space take.
+		vi.mocked(runPushMemory).mockResolvedValueOnce({ type: "error", message: "Not signed in" });
+		await startMcpServer("/repo");
+		const callHandler = capturedHandlers[1];
+		const result = (await callHandler({ params: { name: "push_memory", arguments: {} } })) as {
+			content: { type: string; text: string }[];
+			isError?: boolean;
+		};
+		expect(result.isError).toBe(true);
+		expect(JSON.parse(result.content[0].text)).toEqual({ type: "error", message: "Not signed in" });
+	});
+
+	it("CallTool handler does NOT flag a binding_required result as isError (it's a needs-input outcome)", async () => {
+		vi.mocked(runPushMemory).mockResolvedValueOnce({
+			type: "binding_required",
+			repoUrl: "https://github.com/o/r",
+			spaces: [],
+			defaultSpaceId: null,
+		});
+		await startMcpServer("/repo");
+		const callHandler = capturedHandlers[1];
+		const result = (await callHandler({ params: { name: "push_memory", arguments: {} } })) as { isError?: boolean };
+		expect(result.isError).toBeUndefined();
 	});
 
 	it("CallTool handler stringifies a non-Error throw into the error response", async () => {

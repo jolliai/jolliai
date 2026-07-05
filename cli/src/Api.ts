@@ -20,9 +20,11 @@ import { registerExportCommand, registerExportPromptCommand } from "./commands/E
 import { registerGraphCommand } from "./commands/GraphCommand.js";
 import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { getHelpGroup } from "./commands/HelpGroups.js";
+import { registerBindCommand, registerPushCommand, registerSpacesCommand } from "./commands/JolliCloudCommands.js";
 import { registerMcpCommand } from "./commands/McpCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
 import { registerPrDescriptionCommand } from "./commands/PrDescriptionCommand.js";
+import { registerQueueStatusCommand } from "./commands/QueueStatusCommand.js";
 import { registerRecallCommand } from "./commands/RecallCommand.js";
 import { registerSearchCommand } from "./commands/SearchCommand.js";
 import { registerStatusCommand } from "./commands/StatusCommand.js";
@@ -160,6 +162,7 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"search",
 	"backfill",
 	"pr-description",
+	"queue-status",
 	"compile",
 	"graph",
 	"export",
@@ -168,6 +171,9 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"sync-memory-bank",
 	"mcp",
 	"telemetry",
+	"push",
+	"spaces",
+	"bind",
 ]);
 
 const MEMORY_DESCRIPTION = `Auto-documents your AI-assisted development. Lightweight git and AI-agent
@@ -337,6 +343,10 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerSearchCommand(program);
 	registerBackfillCommand(program);
 	registerPrDescriptionCommand(program);
+	registerPushCommand(program);
+	registerSpacesCommand(program);
+	registerBindCommand(program);
+	registerQueueStatusCommand(program);
 	registerCompileCommand(program);
 	registerGraphCommand(program);
 	registerMigrateCommand(program);
