@@ -103,15 +103,43 @@ object CliIntegrations {
         return null
     }
 
+    /** The extracted-CLI directory that `dist-paths/intellij` points at. */
+    internal fun distIntellijDir(): File =
+        File(System.getProperty("user.home"), ".jolli/jollimemory/dist-intellij")
+
     /**
-     * True when the integrations have already been set up for the CURRENT plugin
-     * version — i.e. the bundled Cli.js is extracted and its version stamp matches.
-     * Lets startup skip re-running node on every launch, but re-run after an upgrade.
+     * True when integrations were **successfully enabled** for the CURRENT plugin version.
+     * The `.version` stamp is written ONLY after [enableIntegrations] returns [Result.Ok]
+     * (see [markIntegrationsEnabled]) — NOT when the bundle is merely extracted. That
+     * distinction matters: a failed `enable` (skills/MCP not written) must not look "done",
+     * otherwise startup never retries it and the StatusPanel shows a false "active".
+     * Lets startup skip re-running node on every launch, but re-run after an upgrade or a
+     * previous failure.
      */
-    fun integrationsUpToDate(): Boolean {
-        val distDir = File(System.getProperty("user.home"), ".jolli/jollimemory/dist-intellij")
+    fun integrationsUpToDate(): Boolean = integrationsUpToDate(distIntellijDir())
+
+    /** Testable seam: same predicate against an explicit dist dir. */
+    internal fun integrationsUpToDate(distDir: File): Boolean {
         val stamp = File(distDir, ".version")
         return File(distDir, "Cli.js").exists() && stamp.exists() && stamp.readText().trim() == readPluginVersion()
+    }
+
+    /** Records a successful enable by stamping the current plugin version. */
+    internal fun markIntegrationsEnabled(distDir: File) {
+        try {
+            File(distDir, ".version").writeText(readPluginVersion())
+        } catch (e: Exception) {
+            log.warn("Failed to write integrations version stamp: %s", e.message)
+        }
+    }
+
+    /** Clears the enabled stamp so the next startup retries `enable`. */
+    internal fun clearIntegrationsEnabled(distDir: File) {
+        try {
+            File(distDir, ".version").delete()
+        } catch (_: Exception) {
+            // best-effort — a stale stamp only means one extra retry
+        }
     }
 
     /** Resolves the plugin-bundled `cli-dist/Cli.js`. */
@@ -132,21 +160,19 @@ object CliIntegrations {
     fun extractCliDist(): File? {
         val cliJs = resolveBundledCliJs() ?: return null
         val srcDir = cliJs.parentFile ?: return null // the bundled cli-dist directory
-        val distDir = File(System.getProperty("user.home"), ".jolli/jollimemory/dist-intellij")
-        val stamp = File(distDir, ".version")
-        val version = readPluginVersion()
+        val distDir = distIntellijDir()
         return try {
             distDir.mkdirs()
-            val current = if (stamp.exists()) stamp.readText().trim() else null
-            if (!File(distDir, "Cli.js").exists() || current != version) {
-                // Copy the WHOLE dist (Cli.js + the per-hook entry scripts) so this dist
-                // also satisfies `run-hook`, not just `run-cli`/MCP/skills.
-                val n = srcDir.listFiles { f -> f.isFile && f.name.endsWith(".js") }
-                    ?.onEach { it.copyTo(File(distDir, it.name), overwrite = true) }
-                    ?.size ?: 0
-                stamp.writeText(version)
-                log.info("Extracted bundled CLI dist (%d files) to %s (version=%s)", n, distDir.absolutePath, version)
-            }
+            // Copy the WHOLE dist (Cli.js + the per-hook entry scripts) so this dist also
+            // satisfies `run-hook`, not just `run-cli`/MCP/skills. This runs only from
+            // [enableIntegrations]/[disableIntegrations] (i.e. when NOT already enabled),
+            // so an unconditional overwrite is off the hot path. Deliberately writes NO
+            // version stamp — the stamp means "enable succeeded" and is written by
+            // [markIntegrationsEnabled] only after the enable subprocess returns Ok.
+            val n = srcDir.listFiles { f -> f.isFile && f.name.endsWith(".js") }
+                ?.onEach { it.copyTo(File(distDir, it.name), overwrite = true) }
+                ?.size ?: 0
+            log.info("Extracted bundled CLI dist (%d files) to %s", n, distDir.absolutePath)
             distDir
         } catch (e: Exception) {
             log.error("Failed to extract bundled CLI: %s", e.message)
@@ -220,13 +246,18 @@ object CliIntegrations {
                 return Result.Failed("integrations enable timed out")
             }
             if (proc.exitValue() == 0) {
+                // Stamp "enabled" ONLY now — after a confirmed success — so a later failure
+                // or an interrupted run is never mistaken for a completed one.
+                markIntegrationsEnabled(distDir)
                 log.info("Integrations enabled via bundled CLI")
                 Result.Ok
             } else {
+                clearIntegrationsEnabled(distDir)
                 log.warn("Integrations enable exited %d: %s", proc.exitValue(), out.take(500))
                 Result.Failed("exit ${proc.exitValue()}")
             }
         } catch (e: Exception) {
+            clearIntegrationsEnabled(distDir)
             log.error("Failed to run integrations enable: %s", e.message)
             Result.Failed(e.message ?: "unknown")
         }

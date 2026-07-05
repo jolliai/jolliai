@@ -64,4 +64,30 @@ class CliIntegrationsTest {
         msg shouldNotBe null
         msg!! shouldContain "exit 1"
     }
+
+    // ── integrationsUpToDate — stamp means "enabled", not merely "extracted" ──
+    // Regression guard for the bug where extractCliDist() wrote the version stamp at
+    // extraction time, so a FAILED enable still looked "up to date" and was never retried
+    // (and the StatusPanel showed a false "active").
+
+    @Test
+    fun `extracted-but-not-enabled is NOT up to date`() {
+        // Simulate the bundle having been copied (Cli.js present) with no successful enable
+        // recorded (no .version stamp). This is exactly the extract-succeeded-enable-failed
+        // state — it must report false so startup retries.
+        File(tempDir, "Cli.js").writeText("bundle")
+        CliIntegrations.integrationsUpToDate(tempDir) shouldBe false
+    }
+
+    @Test
+    fun `up to date only after a successful enable is recorded`() {
+        File(tempDir, "Cli.js").writeText("bundle")
+        CliIntegrations.integrationsUpToDate(tempDir) shouldBe false // extracted only
+
+        CliIntegrations.markIntegrationsEnabled(tempDir) // enable succeeded
+        CliIntegrations.integrationsUpToDate(tempDir) shouldBe true
+
+        CliIntegrations.clearIntegrationsEnabled(tempDir) // e.g. a later failure
+        CliIntegrations.integrationsUpToDate(tempDir) shouldBe false // retries again
+    }
 }
