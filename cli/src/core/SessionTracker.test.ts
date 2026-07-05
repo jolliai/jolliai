@@ -55,6 +55,8 @@ import {
 	associatePlanWithCommit,
 	checkStaleSquashPending,
 	countActiveQueueEntries,
+	countActiveQueueEntriesByKind,
+	countActiveSummaryQueueEntries,
 	countStaleQueueEntries,
 	countStaleSessions,
 	deletePluginSource,
@@ -69,6 +71,7 @@ import {
 	ensureJolliMemoryDir,
 	filterSessionsByEnabledIntegrations,
 	getGlobalConfigDir,
+	getOrCreateInstallId,
 	getOrCreateInstallIdInDir,
 	getReferenceEntriesForBranch,
 	loadAllSessions,
@@ -81,6 +84,7 @@ import {
 	loadPlansRegistry,
 	loadPluginSource,
 	loadSquashPending,
+	markAiSourceSeen,
 	markAiSourceSeenInDir,
 	migrateDiscoveryCursors,
 	normalizePlansRegistry,
@@ -249,6 +253,105 @@ describe("SessionTracker", () => {
 				tempDir,
 			);
 			expect(removed).toEqual({ plans: 0, notes: 0, references: 0 });
+		});
+
+		it("handles source-less rows, committed/missing exclusions, external files, and surviving siblings", async () => {
+			// Exercises the complement branches of the happy-path test:
+			//  - a removed note with no sourcePath / reference with empty sourcePath (nothing queued to delete)
+			//  - an excluded-but-committed note (guard skipped) + an excluded missing ref
+			//  - surviving siblings so the `length > 0 ? … : undefined` writeback keeps both maps
+			//  - a removed note whose sourcePath lives OUTSIDE .jolli (never unlinked)
+			const externalNoteFile = join(tempDir, "ext-notes", "keep-me.md");
+			await mkdir(dirname(externalNoteFile), { recursive: true });
+			await writeFile(externalNoteFile, "user-owned note");
+
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {},
+					notes: {
+						"rm-no-src": {
+							id: "rm-no-src",
+							title: "No source",
+							format: "snippet",
+							addedAt: "t",
+							updatedAt: "t",
+							commitHash: null,
+						},
+						"rm-external": {
+							id: "rm-external",
+							title: "External source",
+							format: "markdown",
+							addedAt: "t",
+							updatedAt: "t",
+							commitHash: null,
+							sourcePath: externalNoteFile,
+						},
+						"committed-note": {
+							id: "committed-note",
+							title: "Committed",
+							format: "markdown",
+							addedAt: "t",
+							updatedAt: "t",
+							commitHash: "abc12345",
+							contentHashAtCommit: "h",
+						},
+						"survivor-note": {
+							id: "survivor-note",
+							title: "Survivor",
+							format: "markdown",
+							addedAt: "t",
+							updatedAt: "t",
+							commitHash: null,
+						},
+					},
+					references: {
+						"linear:RM-NO-SRC": {
+							source: "linear",
+							nativeId: "RM-NO-SRC",
+							title: "No source ref",
+							url: "https://x/1",
+							// Empty sourcePath stands in for "no owned .jolli file": the
+							// row is still removed + counted, but nothing is queued to unlink.
+							sourcePath: "",
+							addedAt: "t",
+							updatedAt: "t",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+						"linear:SURVIVOR": {
+							source: "linear",
+							nativeId: "SURVIVOR",
+							title: "Survivor ref",
+							url: "https://x/2",
+							// Not excluded below, so this path is never read/unlinked.
+							sourcePath: join(tempDir, ".jolli", "jollimemory", "references", "linear", "survivor.md"),
+							addedAt: "t",
+							updatedAt: "t",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					},
+				},
+				tempDir,
+			);
+
+			const removed = await discardExcludedWorkingItems(
+				{
+					plans: new Set(),
+					notes: new Set(["rm-no-src", "rm-external", "committed-note"]),
+					references: new Set(["linear:RM-NO-SRC", "linear:MISSING"]),
+				},
+				tempDir,
+			);
+			// committed-note is skipped (guard), MISSING ref is absent → not counted.
+			expect(removed).toEqual({ plans: 0, notes: 2, references: 1 });
+
+			const reg = await loadPlansRegistry(tempDir);
+			expect(Object.keys(reg.notes ?? {}).sort()).toEqual(["committed-note", "survivor-note"]);
+			expect(Object.keys(reg.references ?? {})).toEqual(["linear:SURVIVOR"]);
+
+			// The external note file is outside .jolli, so it is never unlinked.
+			const { existsSync } = await import("node:fs");
+			expect(existsSync(externalNoteFile)).toBe(true);
 		});
 	});
 
@@ -818,6 +921,57 @@ describe("SessionTracker", () => {
 			expect(ids.size).toBe(1);
 			expect(results.filter((r) => r.created).length).toBe(1);
 			expect((await loadConfigFromDir(dir)).installId).toBe([...ids][0]);
+		});
+
+		it("falls back to the fresh candidate when the sentinel exists but is unreadable", async () => {
+			// Sentinel write ("wx") fails because the path already exists, and the
+			// subsequent read also fails (it's a directory, not a file) — the
+			// readInstallIdSentinel catch must return the fresh candidate id.
+			const dir = join(tempDir, "install-id-unreadable");
+			await mkdir(join(dir, "install-id"), { recursive: true });
+			const result = await getOrCreateInstallIdInDir(dir);
+			expect(result.created).toBe(false);
+			expect(result.installId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+			expect((await loadConfigFromDir(dir)).installId).toBe(result.installId);
+		});
+
+		it("falls back to the fresh candidate when the sentinel exists but is empty", async () => {
+			// Sentinel write ("wx") fails because the file already exists, and the
+			// read yields whitespace-only content — readInstallIdSentinel's
+			// `v.length > 0 ? v : fallback` must choose the fresh candidate.
+			const dir = join(tempDir, "install-id-empty");
+			await mkdir(dir, { recursive: true });
+			await writeFile(join(dir, "install-id"), "   \n", "utf-8");
+			const result = await getOrCreateInstallIdInDir(dir);
+			expect(result.created).toBe(false);
+			expect(result.installId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+			expect((await loadConfigFromDir(dir)).installId).toBe(result.installId);
+		});
+	});
+
+	describe("global install-id / telemetry wrappers", () => {
+		beforeEach(() => {
+			mockHomedir.mockReturnValue(tempDir);
+		});
+
+		afterEach(() => {
+			if (realHomedir.current) mockHomedir.mockImplementation(realHomedir.current);
+		});
+
+		it("getOrCreateInstallId mints and persists into the global config dir", async () => {
+			const first = await getOrCreateInstallId();
+			expect(first.created).toBe(true);
+			expect(first.installId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+			const second = await getOrCreateInstallId();
+			expect(second.created).toBe(false);
+			expect(second.installId).toBe(first.installId);
+			expect((await loadConfigFromDir(getGlobalConfigDir())).installId).toBe(first.installId);
+		});
+
+		it("markAiSourceSeen records a source once in the global config dir", async () => {
+			expect(await markAiSourceSeen("codex")).toBe(true);
+			expect(await markAiSourceSeen("codex")).toBe(false);
+			expect((await loadConfigFromDir(getGlobalConfigDir())).telemetrySeenSources).toEqual(["codex"]);
 		});
 	});
 
@@ -1691,6 +1845,19 @@ describe("SessionTracker", () => {
 			expect(entries).toEqual([]);
 		});
 
+		it("tags ingest operations with an 'ingest' filename segment (no commitHash)", async () => {
+			await enqueueGitOperation(
+				{ type: "ingest", triggeredBy: "post-commit", createdAt: new Date().toISOString() },
+				tempDir,
+			);
+			const { readdir } = await import("node:fs/promises");
+			const queueDir = join(tempDir, ".jolli", "jollimemory", "git-op-queue");
+			const [name] = await readdir(queueDir);
+			expect(name).toMatch(/^\d+-\d{8}-[0-9a-f]{8}-ingest\.json$/);
+			const entries = await dequeueAllGitOperations(tempDir);
+			expect(entries[0].op).toMatchObject({ type: "ingest", triggeredBy: "post-commit" });
+		});
+
 		it("names queue files with a process-unique nonce segment (guards cross-process same-ms collisions)", async () => {
 			const { readdir } = await import("node:fs/promises");
 			await enqueueGitOperation(makeOp("aaa111ff"), tempDir);
@@ -1906,6 +2073,100 @@ describe("SessionTracker", () => {
 			await mkdir(queueDir, { recursive: true });
 			await writeFile(join(queueDir, "corrupt.json"), "not json");
 			expect(await countActiveQueueEntries(tempDir)).toBe(0);
+		});
+	});
+
+	// ── countActiveSummaryQueueEntries ───────────────────────────────────
+
+	describe("countActiveSummaryQueueEntries", () => {
+		it("should return 0 when queue dir does not exist", async () => {
+			expect(await countActiveSummaryQueueEntries(tempDir)).toBe(0);
+		});
+
+		it("should count commit-type entries and exclude ingest entries", async () => {
+			const queueDir = join(tempDir, ".jolli/jollimemory/git-op-queue");
+			await mkdir(queueDir, { recursive: true });
+
+			const now = new Date().toISOString();
+			await writeFile(
+				join(queueDir, "1-a.json"),
+				JSON.stringify({ type: "commit", commitHash: "a".repeat(40), createdAt: now }),
+			);
+			await writeFile(
+				join(queueDir, "2-b.json"),
+				JSON.stringify({ type: "squash", commitHash: "b".repeat(40), createdAt: now }),
+			);
+			await writeFile(
+				join(queueDir, "3-ingest.json"),
+				JSON.stringify({ type: "ingest", triggeredBy: "post-commit", createdAt: now }),
+			);
+
+			expect(await countActiveSummaryQueueEntries(tempDir)).toBe(2);
+		});
+
+		it("should exclude stale entries", async () => {
+			const queueDir = join(tempDir, ".jolli/jollimemory/git-op-queue");
+			await mkdir(queueDir, { recursive: true });
+
+			const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+			await writeFile(
+				join(queueDir, "1-old.json"),
+				JSON.stringify({ type: "commit", commitHash: "a".repeat(40), createdAt: eightDaysAgo }),
+			);
+
+			expect(await countActiveSummaryQueueEntries(tempDir)).toBe(0);
+		});
+
+		it("should count a parseable entry with a missing/unparseable createdAt as active", async () => {
+			const queueDir = join(tempDir, ".jolli/jollimemory/git-op-queue");
+			await mkdir(queueDir, { recursive: true });
+
+			// Valid JSON summary op but no createdAt (version skew / foreign enqueuer):
+			// it must NOT be invisible to the PR-wait verdict.
+			await writeFile(
+				join(queueDir, "1-nodate.json"),
+				JSON.stringify({ type: "commit", commitHash: "a".repeat(40) }),
+			);
+			await writeFile(
+				join(queueDir, "2-baddate.json"),
+				JSON.stringify({ type: "squash", commitHash: "b".repeat(40), createdAt: "not-a-date" }),
+			);
+
+			expect(await countActiveSummaryQueueEntries(tempDir)).toBe(2);
+		});
+	});
+
+	// ── countActiveQueueEntriesByKind ────────────────────────────────────
+
+	describe("countActiveQueueEntriesByKind", () => {
+		it("returns {0,0} when the queue dir does not exist", async () => {
+			expect(await countActiveQueueEntriesByKind(tempDir)).toEqual({ summary: 0, ingest: 0 });
+		});
+
+		it("splits summary vs ingest in one pass, excludes stale, ignores corrupt", async () => {
+			const queueDir = join(tempDir, ".jolli/jollimemory/git-op-queue");
+			await mkdir(queueDir, { recursive: true });
+			const now = new Date().toISOString();
+			const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+			await writeFile(
+				join(queueDir, "1-commit.json"),
+				JSON.stringify({ type: "commit", commitHash: "a".repeat(40), createdAt: now }),
+			);
+			await writeFile(
+				join(queueDir, "2-squash.json"),
+				JSON.stringify({ type: "squash", commitHash: "b".repeat(40), createdAt: now }),
+			);
+			await writeFile(
+				join(queueDir, "3-ingest.json"),
+				JSON.stringify({ type: "ingest", triggeredBy: "post-commit", createdAt: now }),
+			);
+			await writeFile(
+				join(queueDir, "4-stale.json"),
+				JSON.stringify({ type: "commit", commitHash: "c".repeat(40), createdAt: eightDaysAgo }),
+			);
+			await writeFile(join(queueDir, "5-corrupt.json"), "{ not json");
+
+			expect(await countActiveQueueEntriesByKind(tempDir)).toEqual({ summary: 2, ingest: 1 });
 		});
 	});
 
@@ -2538,6 +2799,40 @@ describe("normalizePlansRegistry", () => {
 		expect(JSON.stringify(registry.notes)).not.toMatch(/"ignored"/);
 		// `branch` is preserved for the IntelliJ shared-plans.json branch filter.
 		expect(registry.notes?.keep?.branch).toBe("main");
+	});
+
+	it("notes: strips a lingering `ignored: false` field (changed=true) but leaves a clean note untouched", () => {
+		const raw = {
+			version: 1,
+			plans: {},
+			notes: {
+				stale: {
+					id: "stale",
+					title: "Stale",
+					format: "markdown",
+					addedAt: "t",
+					updatedAt: "t",
+					commitHash: null,
+					// `ignored: false` is a legacy field that must be stripped — the row
+					// survives (it's not `ignored === true`) but `changed` flips true.
+					ignored: false,
+				},
+				clean: {
+					id: "clean",
+					title: "Clean",
+					format: "markdown",
+					addedAt: "t",
+					updatedAt: "t",
+					commitHash: null,
+				},
+			},
+		} as unknown as Partial<PlansRegistry>;
+
+		const { registry, changed } = normalizePlansRegistry(raw);
+
+		expect(changed).toBe(true);
+		expect(Object.keys(registry.notes ?? {}).sort()).toEqual(["clean", "stale"]);
+		expect(JSON.stringify(registry.notes)).not.toMatch(/"ignored"/);
 	});
 
 	it("references: drops ignored/committed/guard rows, keeps active rows, strips dead fields", () => {

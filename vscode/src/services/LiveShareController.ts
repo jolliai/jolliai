@@ -36,7 +36,7 @@ import { resolveEffectiveRecap, resolveEffectiveTopics } from "../../../cli/src/
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import { deriveOwnerRepoFromUrl, getCanonicalRepoUrl } from "../util/GitRemoteUtils.js";
 import { log } from "../util/Logger.js";
-import { planBaseKey } from "../util/PlanGrouping.js";
+import { byUpdatedAtDesc, planBaseKey } from "../util/PlanGrouping.js";
 import { loadBranchSummaries } from "../views/BranchSummaryLoader.js";
 import { buildBranchRelativePath } from "../views/SummaryUtils.js";
 import type { BindingOutcome, PushAttachmentFailure, PushContext } from "./JolliPushOrchestrator.js";
@@ -178,20 +178,35 @@ function assignOwnedAttachments(subjectSummaries: ReadonlyArray<CommitSummary>):
 		for (const plan of summary.plans ?? []) {
 			const key = planBaseKey(plan.slug);
 			const prev = planWinners.get(key);
-			const seedDocId = plan.jolliPlanDocId ?? prev?.seedDocId;
-			if (!prev || Date.parse(plan.updatedAt) >= Date.parse(prev.ref.updatedAt)) {
+			// Use the SAME comparator as latestPlanPerName (updatedAt desc, slug
+			// tiebreak) so the two dedup paths never disagree on which snapshot is
+			// "latest" — a disagreement would push one slug but weave the URL against
+			// the other, dropping the plan's markdown link. String compare (via
+			// byUpdatedAtDesc) also avoids Date.parse's NaN-on-malformed-date pitfall.
+			if (!prev || byUpdatedAtDesc(plan, prev.ref) < 0) {
+				// This revision wins (or is the first seen). Its own docId is
+				// authoritative for the latest article; fall back to a docId a prior
+				// revision surfaced only when this one carries none.
+				const seedDocId = plan.jolliPlanDocId ?? prev?.seedDocId;
 				planWinners.set(key, { ref: plan, ownerCommit: summary.commitHash, seedDocId });
-			} else if (seedDocId !== prev.seedDocId) {
-				planWinners.set(key, { ...prev, seedDocId });
+			} else if (prev.seedDocId === undefined && plan.jolliPlanDocId !== undefined) {
+				// A losing (older) revision only fills in a docId the winner didn't
+				// already have. It must NEVER overwrite the winner's own docId —
+				// doing so would push the latest content to an older article and
+				// orphan (leak) the winner's real one.
+				planWinners.set(key, { ...prev, seedDocId: plan.jolliPlanDocId });
 			}
 		}
 		for (const note of summary.notes ?? []) {
 			const prev = noteWinners.get(note.id);
-			const seedDocId = note.jolliNoteDocId ?? prev?.seedDocId;
-			if (!prev || Date.parse(note.updatedAt) >= Date.parse(prev.ref.updatedAt)) {
+			// Notes are keyed by exact id, so no slug tiebreak is needed. Compare
+			// updatedAt as strings (newest wins, first-seen kept on a tie) to stay
+			// deterministic and NaN-free for a malformed/missing updatedAt.
+			if (!prev || note.updatedAt > prev.ref.updatedAt) {
+				const seedDocId = note.jolliNoteDocId ?? prev?.seedDocId;
 				noteWinners.set(note.id, { ref: note, ownerCommit: summary.commitHash, seedDocId });
-			} else if (seedDocId !== prev.seedDocId) {
-				noteWinners.set(note.id, { ...prev, seedDocId });
+			} else if (prev.seedDocId === undefined && note.jolliNoteDocId !== undefined) {
+				noteWinners.set(note.id, { ...prev, seedDocId: note.jolliNoteDocId });
 			}
 		}
 	}

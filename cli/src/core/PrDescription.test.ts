@@ -195,4 +195,14 @@ describe("buildPrDescription", () => {
 		expect(result.body).not.toContain(MARKER_START);
 		expect(result.body).not.toContain(MARKER_END);
 	});
+
+	it("includes queueActive and workerBlocking backstop fields", async () => {
+		vi.mocked(listBranchCommitHashes).mockResolvedValue({ hashes: ["h1"], isMerged: false });
+		vi.mocked(getSummary).mockResolvedValue(s("feat: backstop", { commitHash: "h1" }));
+		const result = await buildPrDescription("/repo", {});
+		expect(result).toHaveProperty("queueActive");
+		expect(result).toHaveProperty("workerBlocking");
+		expect(typeof result.queueActive).toBe("number");
+		expect(typeof result.workerBlocking).toBe("boolean");
+	});
 });

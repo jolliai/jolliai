@@ -7,7 +7,15 @@
 
 import type { BranchCatalog } from "../core/ContextCompiler.js";
 import { listBranchCatalog } from "../core/ContextCompiler.js";
+import { deriveRepoNameFromUrl, getCanonicalRepoUrl } from "../core/GitRemoteUtils.js";
+import {
+	BindingAlreadyExistsError,
+	JolliMemoryPushClient,
+	type JolliMemorySpace,
+} from "../core/JolliMemoryPushClient.js";
+import { type PushBranchResult, pushBranchToJolli, resolveSpaceId } from "../core/JolliMemoryPushOrchestrator.js";
 import { buildPrDescription, type PrDescriptionResult } from "../core/PrDescription.js";
+import { getQueueStatus, type QueueStatus, waitForQueueDrained } from "../core/QueueStatus.js";
 import { type RecallResult, resolveRecall } from "../core/RecallResolver.js";
 import { searchHits } from "../core/SearchHits.js";
 import type { SearchHitResult } from "../core/SearchIndex.js";
@@ -72,4 +80,61 @@ export async function runGetPrDescription(cwd: string, args: GetPrDescriptionArg
 		baseBranch: args.baseBranch,
 		includeMarkers: args.includeMarkers,
 	});
+}
+
+export interface QueueStatusArgs {
+	wait?: boolean;
+	timeoutMs?: number;
+}
+
+export async function runQueueStatus(cwd: string, args: QueueStatusArgs): Promise<QueueStatus & { waitedMs?: number }> {
+	if (args.wait) {
+		return waitForQueueDrained(cwd, { timeoutMs: args.timeoutMs });
+	}
+	return getQueueStatus(cwd);
+}
+
+export interface PushMemoryArgs {
+	baseBranch?: string;
+	space?: string;
+}
+
+/** Pushes `base..HEAD` commit summaries on the current branch to the bound Jolli Space. */
+export async function runPushMemory(cwd: string, args: PushMemoryArgs): Promise<PushBranchResult> {
+	return pushBranchToJolli({ cwd, baseBranch: args.baseBranch, space: args.space });
+}
+
+/** Lists the Jolli Spaces this tenant can bind a repo to, plus its configured default. */
+export async function runListSpaces(
+	_cwd: string,
+): Promise<{ spaces: JolliMemorySpace[]; defaultSpaceId: number | null }> {
+	return new JolliMemoryPushClient().listSpaces();
+}
+
+export type BindSpaceResult =
+	| { type: "bound"; bindingId: number; jmSpaceId: number; repoName: string }
+	| { type: "already_bound"; message: string };
+
+/**
+ * Binds this repo to a Jolli Space. Mirrors `jolli bind` (`JolliCloudCommands.ts`):
+ * an already-existing binding is not an error condition — it comes back as
+ * `{ type: "already_bound" }` rather than throwing.
+ */
+export async function runBindSpace(cwd: string, args: { space: string }): Promise<BindSpaceResult> {
+	if (!args.space || !args.space.trim()) {
+		throw new Error("`space` is required");
+	}
+	const client = new JolliMemoryPushClient();
+	const repoUrl = await getCanonicalRepoUrl(cwd);
+	const jmSpaceId = await resolveSpaceId(client, args.space);
+	const repoName = deriveRepoNameFromUrl(repoUrl);
+	try {
+		const binding = await client.createBinding({ repoUrl, repoName, jmSpaceId });
+		return { type: "bound", ...binding };
+	} catch (err) {
+		if (err instanceof BindingAlreadyExistsError) {
+			return { type: "already_bound", message: err.message };
+		}
+		throw err;
+	}
 }

@@ -186,7 +186,9 @@ export async function pushSummaryWithAttachments(
 		// article's Plans & Notes list links to the published docs). Dedupe
 		// same-named plan snapshots — only the latest was uploaded.
 		const dedupedPlans = latestPlanPerName(summary.plans ?? []);
+		/* v8 ignore start -- unreachable defensive fallback: applyPlanUrls returns its first arg unchanged when there are no URLs to weave in, and dedupedPlans is always a (possibly empty) array — so `?? dedupedPlans` never fires; it only satisfies applyPlanUrls's `| undefined` return type */
 		const plansWithUrls = applyPlanUrls(dedupedPlans, planUrls) ?? dedupedPlans;
+		/* v8 ignore stop */
 		const notesWithUrls = summary.notes ? applyNoteUrls(summary.notes, noteUrls) : summary.notes;
 		const summaryForMarkdown: CommitSummary = {
 			...summary,

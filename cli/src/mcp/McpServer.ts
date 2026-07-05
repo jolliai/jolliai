@@ -11,7 +11,17 @@ import { VERSION } from "../commands/CliUtils.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { createLogger } from "../Logger.js";
-import { runDecisionTimeline, runGetPrDescription, runListBranches, runRecall, runSearch } from "./McpTools.js";
+import {
+	runBindSpace,
+	runDecisionTimeline,
+	runGetPrDescription,
+	runListBranches,
+	runListSpaces,
+	runPushMemory,
+	runQueueStatus,
+	runRecall,
+	runSearch,
+} from "./McpTools.js";
 
 const log = createLogger("McpServer");
 
@@ -22,6 +32,47 @@ export interface ToolDefinition {
 }
 
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
+	{
+		name: "bind_space",
+		description:
+			'Bind this repo to a Jolli Space so `push_memory` can push to it. Idempotent — binding an already-bound repo returns `{type:"already_bound"}` rather than erroring.',
+		inputSchema: {
+			type: "object",
+			properties: {
+				space: {
+					type: "string",
+					description: "Jolli Space id (numeric), slug, or exact name to bind this repo to.",
+				},
+			},
+			required: ["space"],
+		},
+	},
+	{
+		name: "list_spaces",
+		description:
+			"List the Jolli Spaces this tenant can bind a repo to, plus the tenant's configured default space.",
+		inputSchema: { type: "object", properties: {} },
+	},
+	{
+		name: "push_memory",
+		description:
+			'Push this branch\'s JolliMemory commit summaries to the bound Jolli Space as articles. If the repo isn\'t bound yet, returns {"type":"binding_required"} with the available spaces — call again with `space` set (or use `bind_space` first) to bind and push.',
+		inputSchema: {
+			type: "object",
+			properties: {
+				baseBranch: {
+					type: "string",
+					description:
+						"Base branch for the commit range (base..HEAD). Defaults to the repository's default branch.",
+				},
+				space: {
+					type: "string",
+					description:
+						"Jolli Space id, slug, or name to bind this repo to before pushing, if not already bound.",
+				},
+			},
+		},
+	},
 	{
 		name: "search",
 		description:
@@ -79,6 +130,18 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 			},
 		},
 	},
+	{
+		name: "queue_status",
+		description:
+			'Report whether this repo\'s memory-summary generation is still in progress. Call before building a PR (get_pr_description) so freshly-committed summaries are included. Wiki/graph rendering is excluded from the verdict. Pass {"wait": true} to block until drained (default 120s, override with timeoutMs).',
+		inputSchema: {
+			type: "object",
+			properties: {
+				wait: { type: "boolean", description: "Block until the queue drains or the timeout elapses." },
+				timeoutMs: { type: "number", description: "Max ms to wait when wait is true (default 120000)." },
+			},
+		},
+	},
 ];
 
 /** Route a validated tool call to its handler. Throws on unknown tool. */
@@ -97,6 +160,14 @@ export async function dispatchTool(cwd: string, name: string, args: Record<strin
 			return runListBranches(cwd);
 		case "get_pr_description":
 			return runGetPrDescription(cwd, args as { baseBranch?: string; includeMarkers?: boolean });
+		case "queue_status":
+			return runQueueStatus(cwd, args as { wait?: boolean; timeoutMs?: number });
+		case "push_memory":
+			return runPushMemory(cwd, args as { baseBranch?: string; space?: string });
+		case "list_spaces":
+			return runListSpaces(cwd);
+		case "bind_space":
+			return runBindSpace(cwd, args as { space: string });
 		default:
 			throw new Error(`Unknown tool: ${name}`);
 	}
@@ -118,7 +189,15 @@ export async function startMcpServer(cwd: string): Promise<void> {
 		const { name, arguments: args } = req.params;
 		try {
 			const result = await dispatchTool(cwd, name, args ?? {});
-			return { content: [{ type: "text", text: JSON.stringify(result) }] };
+			// Unify the error contract across tools. `push_memory` reports failure
+			// as a structured `{ type: "error" }` result (its CLI caller branches on
+			// that) rather than throwing, so flag it `isError` here to match the
+			// thrown-error path that `list_spaces` / `bind_space` take. A
+			// `binding_required` result is a legitimate "needs input" outcome, not
+			// an error, so it stays a normal result.
+			const isError =
+				typeof result === "object" && result !== null && (result as { type?: unknown }).type === "error";
+			return { content: [{ type: "text", text: JSON.stringify(result) }], ...(isError ? { isError: true } : {}) };
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			log.warn("Tool %s failed: %s", name, message);

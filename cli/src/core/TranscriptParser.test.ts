@@ -280,6 +280,40 @@ describe("ClaudeTranscriptParser", () => {
 			).toEqual({ input: 0, output: 0, cached: 0 });
 			expect(parser.parseUsageTokens("{not json", 1)).toEqual({ input: 0, output: 0, cached: 0 });
 		});
+
+		it("coerces non-numeric usage fields to 0", () => {
+			// A usage object is present, but its fields are non-numeric (e.g. null / string) —
+			// each key falls through the `typeof … === "number"` guard to 0.
+			const line = JSON.stringify({
+				type: "assistant",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "hi" }],
+					usage: { input_tokens: null, cache_creation_input_tokens: "20", output_tokens: undefined },
+				},
+			});
+			expect(parser.parseUsageTokens(line, 1)).toEqual({ input: 0, output: 0, cached: 0 });
+		});
+	});
+
+	describe("parseTimestamp", () => {
+		it("returns the ISO timestamp from a real Claude assistant line", () => {
+			const line = JSON.stringify({
+				type: "assistant",
+				message: { role: "assistant", content: [{ type: "text", text: "hi" }] },
+				timestamp: "2026-06-14T18:03:11.482Z",
+			});
+			expect(parser.parseTimestamp(line, 1)).toBe("2026-06-14T18:03:11.482Z");
+		});
+
+		it("returns undefined when the timestamp field is absent or non-string", () => {
+			expect(parser.parseTimestamp(JSON.stringify({ type: "assistant" }), 1)).toBeUndefined();
+			expect(parser.parseTimestamp(JSON.stringify({ timestamp: 12345 }), 1)).toBeUndefined();
+		});
+
+		it("returns undefined for malformed JSON (catch branch)", () => {
+			expect(parser.parseTimestamp("{not json", 1)).toBeUndefined();
+		});
 	});
 });
 

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -23,11 +23,14 @@ vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
+import { getJolliMemoryDir } from "../Logger.js";
 import {
 	__resetSharedLockDirCache,
 	acquireOrphanWriteLock,
 	acquireWorkerLock,
 	DEFAULT_ORPHAN_WRITE_POLL_MS,
+	getWorkerBusyState,
+	isWorkerBlockingBusy,
 	isWorkerLockHeld,
 	isWorkerLockStale,
 	LOCK_TIMEOUT_MS,
@@ -577,6 +580,85 @@ describe("Locks", () => {
 			expect(result).toBe("best-effort");
 			// The foreign-owned lock is untouched.
 			await expect(stat(plansLockPath(tempDir))).resolves.toBeDefined();
+		});
+	});
+
+	describe("isWorkerBlockingBusy", () => {
+		async function jmDir(cwd: string): Promise<string> {
+			const dir = getJolliMemoryDir(cwd);
+			await mkdir(dir, { recursive: true });
+			return dir;
+		}
+
+		it("is false when no worker lock is held", async () => {
+			expect(await isWorkerBlockingBusy(tempDir)).toBe(false);
+		});
+
+		it("is true when the lock is held and no phase marker exists (default summary phase)", async () => {
+			const dir = await jmDir(tempDir);
+			await writeFile(join(dir, "worker.lock"), String(process.pid));
+			expect(await isWorkerBlockingBusy(tempDir)).toBe(true);
+		});
+
+		it("is false when the lock is held and a fresh ingest phase is active", async () => {
+			const dir = await jmDir(tempDir);
+			await writeFile(join(dir, "worker.lock"), String(process.pid));
+			await writeFile(join(dir, "worker-phase"), "ingest:wiki");
+			expect(await isWorkerBlockingBusy(tempDir)).toBe(false);
+		});
+
+		it("is true when the phase marker is a non-ingest value", async () => {
+			const dir = await jmDir(tempDir);
+			await writeFile(join(dir, "worker.lock"), String(process.pid));
+			await writeFile(join(dir, "worker-phase"), "summary");
+			expect(await isWorkerBlockingBusy(tempDir)).toBe(true);
+		});
+
+		it("is true when the ingest phase marker is stale (fail-safe: treated as blocking)", async () => {
+			const dir = await jmDir(tempDir);
+			// worker.lock stays fresh — only the phase marker is backdated past
+			// LOCK_TIMEOUT_MS, simulating a worker that died mid-ingest without
+			// heartbeating the marker.
+			await writeFile(join(dir, "worker.lock"), String(process.pid));
+			const phasePath = join(dir, "worker-phase");
+			await writeFile(phasePath, "ingest:wiki");
+			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
+			await utimes(phasePath, past, past);
+			expect(await isWorkerBlockingBusy(tempDir)).toBe(true);
+		});
+	});
+
+	describe("getWorkerBusyState", () => {
+		async function jmDir(cwd: string): Promise<string> {
+			const dir = getJolliMemoryDir(cwd);
+			await mkdir(dir, { recursive: true });
+			return dir;
+		}
+
+		it("returns held=false, blocking=false when no lock is held", async () => {
+			expect(await getWorkerBusyState(tempDir)).toEqual({ held: false, blocking: false });
+		});
+
+		it("returns held=true, blocking=true for a held lock with a non-ingest phase", async () => {
+			const dir = await jmDir(tempDir);
+			await writeFile(join(dir, "worker.lock"), String(process.pid));
+			await writeFile(join(dir, "worker-phase"), "summary");
+			expect(await getWorkerBusyState(tempDir)).toEqual({ held: true, blocking: true });
+		});
+
+		it("returns held=true, blocking=false for a held lock in a fresh ingest phase", async () => {
+			const dir = await jmDir(tempDir);
+			await writeFile(join(dir, "worker.lock"), String(process.pid));
+			await writeFile(join(dir, "worker-phase"), "ingest:wiki");
+			expect(await getWorkerBusyState(tempDir)).toEqual({ held: true, blocking: false });
+		});
+
+		// The whole point of the combined read: blocking can never be true while
+		// held is false (that impossible pair was reachable when the two axes were
+		// two independent lock stats).
+		it("never reports blocking=true with held=false", async () => {
+			const state = await getWorkerBusyState(tempDir);
+			expect(state.blocking && !state.held).toBe(false);
 		});
 	});
 });

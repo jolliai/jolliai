@@ -10,6 +10,7 @@
 import type { CommitSummary } from "../Types.js";
 import { listBranchCommitHashes } from "./BranchCommitLister.js";
 import { getCurrentBranch, getDefaultBranch } from "./GitOps.js";
+import { getQueueStatus } from "./QueueStatus.js";
 import { buildAggregatedPrMarkdown } from "./SummaryPrAggregateMarkdownBuilder.js";
 import { buildPrMarkdown } from "./SummaryPrMarkdownBuilder.js";
 import { getSummary } from "./SummaryStore.js";
@@ -82,6 +83,15 @@ export interface PrDescriptionResult {
 	commitCount: number;
 	summaryCount: number;
 	missingCount: number;
+	/**
+	 * Non-ingest queue entries still pending — backstop so a single call reveals
+	 * in-progress generation. This result has no `drained` field (unlike
+	 * `queue_status`), so a consumer relying only on these two backstop fields
+	 * derives "generation in progress" as `queueActive > 0 || workerBlocking`.
+	 */
+	queueActive: number;
+	/** True when a summary is still being written (worker blocking-busy). */
+	workerBlocking: boolean;
 }
 
 export interface BuildPrDescriptionOpts {
@@ -116,6 +126,8 @@ export async function buildPrDescription(cwd: string, opts: BuildPrDescriptionOp
 	const rawBody = buildPrBodyMarkdown(currentSummary, summaries, missingCount);
 	const body = includeMarkers ? wrapWithMarkers(rawBody) : rawBody;
 
+	const queue = await getQueueStatus(cwd);
+
 	return {
 		type: "pr_description",
 		branch,
@@ -125,5 +137,7 @@ export async function buildPrDescription(cwd: string, opts: BuildPrDescriptionOp
 		commitCount: summaries.length + missingCount,
 		summaryCount: summaries.length,
 		missingCount,
+		queueActive: queue.active,
+		workerBlocking: queue.workerBlocking,
 	};
 }

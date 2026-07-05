@@ -81,4 +81,20 @@ describe("findTicketInContext", () => {
 	it("returns undefined for an empty list", () => {
 		expect(findTicketInContext([])).toBeUndefined();
 	});
+
+	it("does not misread a `LETTERS-DIGITS` fragment in a free-text title as a ticket", () => {
+		// A Notion reference titled "Migrate to UTF-8 encoding" contains "UTF-8",
+		// which the old unanchored pattern matched. The anchored pattern must not.
+		const items = [
+			{ id: "r1", label: "Migrate to UTF-8 encoding", contextValue: "reference", isSelected: true },
+		];
+		expect(findTicketInContext(items)).toBeUndefined();
+	});
+
+	it("does not treat a GitHub `owner/repo#n` reference whose title contains a fragment as a ticket", () => {
+		const items = [
+			{ id: "r1", label: "jolliai/jolli#959 · Migrate to UTF-8 encoding", contextValue: "reference", isSelected: true },
+		];
+		expect(findTicketInContext(items)).toBeUndefined();
+	});
 });

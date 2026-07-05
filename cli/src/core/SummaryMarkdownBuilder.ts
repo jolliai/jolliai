@@ -47,7 +47,7 @@ export function buildMarkdown(summary: CommitSummary): string {
 // ── Shared section helpers ──────────────────────────────────────────────────
 
 /** Appends the commit properties header (H1, metadata list, separator). */
-function pushPropertiesSection(lines: Array<string>, summary: CommitSummary): void {
+export function pushPropertiesSection(lines: Array<string>, summary: CommitSummary): void {
 	const displayStats = resolveDiffStats(summary);
 	const totalFiles = displayStats.filesChanged;
 	const totalTurns = aggregateTurns(summary);
@@ -156,7 +156,10 @@ export function pushPlansAndNotesSection(
 }
 
 /** Appends the E2E test guide section (shared between clipboard and PR markdown). */
-function pushE2eTestSection(lines: Array<string>, e2eTestGuide: ReadonlyArray<E2eTestScenario> | undefined): void {
+export function pushE2eTestSection(
+	lines: Array<string>,
+	e2eTestGuide: ReadonlyArray<E2eTestScenario> | undefined,
+): void {
 	if (!e2eTestGuide || e2eTestGuide.length === 0) {
 		return;
 	}
@@ -180,7 +183,7 @@ function pushE2eTestSection(lines: Array<string>, e2eTestGuide: ReadonlyArray<E2
 }
 
 /** Appends the source commits section (only for squash/multi-record summaries). */
-function pushSourceCommitsSection(lines: Array<string>, sourceNodes: ReadonlyArray<CommitSummary>): void {
+export function pushSourceCommitsSection(lines: Array<string>, sourceNodes: ReadonlyArray<CommitSummary>): void {
 	if (sourceNodes.length <= 1) {
 		return;
 	}
@@ -196,7 +199,7 @@ function pushSourceCommitsSection(lines: Array<string>, sourceNodes: ReadonlyArr
 }
 
 /** Appends the full topic body fields (trigger, decisions, response, todo, files). */
-function pushTopicBody(out: Array<string>, t: TopicWithDate): void {
+export function pushTopicBody(out: Array<string>, t: TopicWithDate): void {
 	out.push("", "**⚡ Why This Change**", "", t.trigger);
 	out.push("", "**💡 Decisions Behind the Code**", "", t.decisions);
 	out.push("", "**✅ What Was Implemented**", "", t.response);
@@ -211,16 +214,22 @@ function pushTopicBody(out: Array<string>, t: TopicWithDate): void {
 	}
 }
 
-/** Appends the memories/summaries section for clipboard export. Flat list. */
-function pushTopicsSection(
+/**
+ * Appends the memories/summaries section. Flat list. The section heading label
+ * defaults to "Summary"/"Summaries" (clipboard/folder export); the push path
+ * passes `{ singular: "Topic", plural: "Topics" }` so pushed docs read as
+ * "Topic(s)" without duplicating the whole section builder.
+ */
+export function pushTopicsSection(
 	lines: Array<string>,
 	allTopics: Array<TopicWithDate>,
 	bodyFn: (out: Array<string>, t: TopicWithDate) => void,
+	label: { singular: string; plural: string } = { singular: "Summary", plural: "Summaries" },
 ): void {
 	if (allTopics.length === 0) {
 		return;
 	}
-	lines.push("", `## ${allTopics.length === 1 ? "Summary" : "Summaries"} (${allTopics.length})`);
+	lines.push("", `## ${allTopics.length === 1 ? label.singular : label.plural} (${allTopics.length})`);
 	for (let i = 0; i < allTopics.length; i++) {
 		const t = allTopics[i];
 		const catLabel = t.category ? ` \`${t.category}\`` : "";

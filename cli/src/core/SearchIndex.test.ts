@@ -303,6 +303,28 @@ describe("SearchIndex", () => {
 		}
 	});
 
+	it("returns an empty-string branch when a hit's doc carries no branches", async () => {
+		// Defensive: `branch: doc.branch[0] ?? ""` must fall back to "" when a doc's
+		// branch array is empty (no related branches), rather than yield undefined.
+		const noBranch: SearchDoc = {
+			id: "commit:nobranch",
+			type: "commit",
+			title: "orphan timeout",
+			content: "orphan timeout note with no branch attached",
+			decisions: "",
+			branch: [],
+			category: "commit",
+			commitDate: "2026-01-06T00:00:00Z",
+			slug: "",
+			hash: "nobranch",
+		};
+		vi.mocked(collectSearchDocs).mockResolvedValue([noBranch]);
+		const idx = await SearchIndex.open(dir);
+		const res = await idx.search({ query: "timeout" });
+		const hit = res.find((r) => r.id === "commit:nobranch");
+		expect(hit?.branch).toBe("");
+	});
+
 	it("rebuilds when the persisted manifest is missing/corrupt", async () => {
 		const { writeFile } = await import("node:fs/promises");
 		const { getJolliMemoryDir } = await import("../Logger.js");

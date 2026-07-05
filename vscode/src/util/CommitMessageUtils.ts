@@ -9,6 +9,18 @@
 export const TICKET_PATTERN = /[A-Z]+-\d+/i;
 
 /**
+ * Reference-row ticket pattern — anchored to the START and case-sensitive.
+ *
+ * `findTicketInContext` scans arbitrary reference titles, so the loose,
+ * unanchored, case-insensitive `TICKET_PATTERN` would misread any
+ * `LETTERS-DIGITS` fragment inside a title as a ticket (e.g. "Migrate to UTF-8
+ * encoding" → "UTF-8"). Real Linear/Jira ids (`KAN-5`, `PROJ-123`) are
+ * upper-case and sit at the FRONT of the `<nativeId> — <title>` label, so we
+ * anchor to the leading id segment and require ≥2 upper-case letters.
+ */
+const REFERENCE_TICKET_PATTERN = /^[A-Z]{2,}-\d+\b/;
+
+/**
  * Finds the longest common prefix across all messages, truncated to the
  * last structural delimiter (": " or ". ") so we only strip meaningful
  * prefixes like "Part of PROJ-123: " rather than coincidental word matches.
@@ -134,7 +146,12 @@ export function findTicketInContext(
 ): string | undefined {
 	for (const item of items) {
 		if (item.contextValue !== "reference" || item.isSelected === false) continue;
-		const match = TICKET_PATTERN.exec(item.label);
+		// Reference labels are `<nativeId> — <title>`; only the leading id segment
+		// can be a ticket. Matching the whole label (or the free-text title) would
+		// misread a fragment like "UTF-8" as a ticket, so test only the id segment
+		// with the anchored pattern.
+		const idSegment = item.label.split(" — ")[0];
+		const match = REFERENCE_TICKET_PATTERN.exec(idSegment);
 		if (match) return match[0].toUpperCase();
 	}
 	return undefined;

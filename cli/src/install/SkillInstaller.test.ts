@@ -163,7 +163,7 @@ describe("pr template frontmatter", () => {
 		await updateSkillsIfNeeded(tempDir);
 		const pr = readPr();
 		expect(pr).toMatch(/^---\nname: jolli-pr\n/);
-		expect(pr).toMatch(/description: Create a pull request using a Jolli Memory-generated description/);
+		expect(pr).toMatch(/description: Create or update a pull request using a Jolli Memory-generated description/);
 		expect(pr).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}vendor: "jolli\.ai"/);
 	});
 
@@ -541,6 +541,22 @@ describe("pr template content", () => {
 		expect(pr).toMatch(/--body-file/);
 	});
 
+	it("keeps the temp-body write and the gh command in one shell block", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		// A random `mktemp` path can't survive a separate shell invocation, so the
+		// heredoc write and the `gh` call must live in the same fenced block.
+		const block = pr.match(/JOLLI_PR_BODY_FILE=\$\(mktemp\)[\s\S]*?rm -f "\$JOLLI_PR_BODY_FILE"/)?.[0] ?? "";
+		expect(block).toMatch(/gh pr create/);
+		expect(block).not.toContain("```");
+	});
+
+	it("guards PR detection against a detached HEAD", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toMatch(/detached HEAD/);
+	});
+
 	it("instructs to push the branch first", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const pr = readPr();
@@ -608,6 +624,53 @@ describe("pr template content", () => {
 		const pr = readPr();
 		expect(pr).toMatch(/cli\.github\.com/);
 		expect(pr).toMatch(/gh auth login/);
+	});
+
+	it("Step 0: the jolli-pr template gates on queue-status before building the description", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toContain("## Step 0: Wait for pending memory");
+		expect(pr).toContain("queue-status");
+		expect(pr).toContain("queue_status");
+		// Step 0 must come before Step 1.
+		expect(pr.indexOf("## Step 0")).toBeLessThan(pr.indexOf("## Step 1"));
+	});
+
+	it("Step 6 offers to push memory to Jolli and handles space binding", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toContain("## Step 6: Push memory to Jolli");
+		expect(pr).toContain("push_memory");
+		expect(pr).toContain("binding_required");
+		// Report-URL (Step 5) precedes push-memory (Step 6).
+		expect(pr.indexOf("## Step 5")).toBeLessThan(pr.indexOf("## Step 6"));
+	});
+
+	it("Step 1 detects an existing open PR before building the description", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toContain("## Step 1: Detect");
+		expect(pr).toMatch(/gh pr list --head/);
+		expect(pr).toMatch(/--state open/);
+		// Detection (Step 1) must precede description generation (Step 2).
+		expect(pr.indexOf("## Step 1")).toBeLessThan(pr.indexOf("## Step 2: Get the PR description"));
+	});
+
+	it("Step 4 creates a new PR or updates the existing one", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		expect(pr).toContain("## Step 4: Create or update the PR");
+		// Create path still uses gh pr create; update path uses gh pr edit.
+		expect(pr).toMatch(/gh pr create/);
+		expect(pr).toMatch(/gh pr edit/);
+	});
+
+	it("update mode feeds the existing PR's base into the description", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const pr = readPr();
+		// Step 1 captures baseRefName; Step 2 passes it so the diff range matches
+		// the PR being updated.
+		expect(pr).toMatch(/baseRefName/);
 	});
 });
 
