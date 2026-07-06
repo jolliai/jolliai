@@ -144,6 +144,12 @@ export async function readTranscript(
 	// Merge consecutive entries with the same role (streaming chunks from a single API response)
 	const entries = mergeConsecutiveEntries(rawEntries);
 
+	// Per-model usage over exactly the lines we consumed (respecting the cutoff
+	// break). Whole-slice, not per-line, because a source may record the model on
+	// a different line than the usage — see TranscriptParser.parseUsageByModel.
+	const consumedLines = newLines.slice(0, lastConsumedLineIndex - startLine);
+	const usageByModel = activeParser.parseUsageByModel?.(consumedLines);
+
 	// When beforeTimestamp is set, advance cursor only to the last consumed line.
 	// Without beforeTimestamp (legacy/CLI path), advance to EOF for backward compatibility.
 	const newCursor: TranscriptCursor = {
@@ -158,6 +164,7 @@ export async function readTranscript(
 		totalLinesRead: lastConsumedLineIndex - startLine,
 		usageTokens: usageInput + usageOutput + usageCached,
 		usageBreakdown: { input: usageInput, output: usageOutput, cached: usageCached },
+		...(usageByModel && usageByModel.length > 0 && { usageByModel }),
 	};
 }
 

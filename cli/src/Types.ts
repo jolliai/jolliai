@@ -77,6 +77,26 @@ export interface ConversationTokenBreakdown {
 	readonly cached: number;
 }
 
+/** Billing provider for a conversation model — selects the pricing formula. */
+export type TokenProvider = "anthropic" | "openai" | "unknown";
+
+/**
+ * One conversation model's token usage, normalised into the three disjoint
+ * segments the cost formula prices (`input·inRate + cached·cachedRate +
+ * output·outRate`). See `core/Pricing.ts` for the segment contract — in short:
+ * `input` is uncached input only, `cached` is whatever is billed at the model's
+ * cached rate, `output` includes reasoning tokens. Sessions can switch models
+ * mid-stream, so a commit may carry several of these (one per model seen).
+ */
+export interface ModelTokenUsage {
+	/** Exact transcript model id (`message.model` / `turn_context.payload.model`). */
+	readonly model: string;
+	readonly provider: TokenProvider;
+	readonly input: number;
+	readonly output: number;
+	readonly cached: number;
+}
+
 /** Result from reading a transcript file */
 export interface TranscriptReadResult {
 	readonly entries: ReadonlyArray<TranscriptEntry>;
@@ -89,6 +109,11 @@ export interface TranscriptReadResult {
 	/** Per-segment split of {@link usageTokens}. Absent for sources whose parser
 	 *  does not expose usage. `input + output + cached === usageTokens`. */
 	readonly usageBreakdown?: ConversationTokenBreakdown;
+	/** Per-model split of the usage read over the slice, one bucket per model the
+	 *  transcript attributed tokens to (sessions can switch models mid-stream).
+	 *  Powers the USD cost estimate. Absent for sources whose parser exposes no
+	 *  usage; the summed segments equal {@link usageBreakdown}. */
+	readonly usageByModel?: ReadonlyArray<ModelTokenUsage>;
 }
 
 // ─── Stored transcript types (orphan branch persistence) ─────────────────────
@@ -377,6 +402,20 @@ export interface CommitSummary {
 	 *  Forward-only and co-written with `conversationTokens` (both present or both
 	 *  absent going forward); older memories may carry the scalar total only. */
 	readonly conversationTokenBreakdown?: ConversationTokenBreakdown;
+	/** Per-model split of the conversation tokens consumed into this commit, one
+	 *  bucket per model seen (sessions can switch models mid-stream). Distinct
+	 *  from {@link llm} (which is Jolli's OWN summarization call, not the user's
+	 *  conversation). Feeds {@link estimatedCostUsd}. Forward-only; consolidated
+	 *  roots aggregate children. */
+	readonly conversationModels?: ReadonlyArray<ModelTokenUsage>;
+	/** Estimated USD cost of {@link conversationModels} at list prices as of
+	 *  {@link pricesAsOf}. A lower bound when the conversation used a model absent
+	 *  from the price table (those tokens are excluded, never guessed). Excludes
+	 *  promotional/batch/volume discounts. Forward-only; roots aggregate children. */
+	readonly estimatedCostUsd?: number;
+	/** Date of the price table used to compute {@link estimatedCostUsd} (from
+	 *  `core/Pricing.ts` PRICES_AS_OF), so a reader can judge staleness. */
+	readonly pricesAsOf?: string;
 	/** LLM call metadata; absent for squash/merge containers (no API call made) */
 	readonly llm?: LlmCallMetadata;
 	/**

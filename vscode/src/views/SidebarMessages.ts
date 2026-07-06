@@ -1069,6 +1069,13 @@ export type SidebarInboundMsg =
 			 */
 			readonly reporting: number;
 			readonly memories: number;
+			/**
+			 * Σ estimated USD cost from stored per-model usage (write-time, actual
+			 * model priced via core/Pricing.ts). Optional/lower-bound: absent or 0
+			 * for branches whose memories predate the field or used an unpriced
+			 * model, in which case the webview falls back to a client-side estimate.
+			 */
+			readonly estimatedCostUsd?: number;
 			readonly scope: "branch";
 	  }
 	| {

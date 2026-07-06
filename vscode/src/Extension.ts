@@ -46,7 +46,11 @@ import {
 	readReferenceFromBranch,
 	readTranscript,
 } from "../../cli/src/core/SummaryStore.js";
-import { aggregateConversationTokenBreakdown, aggregateConversationTokens } from "../../cli/src/core/SummaryTree.js";
+import {
+	aggregateConversationTokenBreakdown,
+	aggregateConversationTokens,
+	aggregateEstimatedCost,
+} from "../../cli/src/core/SummaryTree.js";
 import type { StorageProvider } from "../../cli/src/core/StorageProvider.js";
 import { ORPHAN_BRANCH } from "../../cli/src/Logger.js";
 import type { SourceId, StatusInfo } from "../../cli/src/Types.js";
@@ -1314,6 +1318,12 @@ export function activate(context: vscode.ExtensionContext): void {
 			// surfaces this as "N of M memories report token usage" so the total
 			// reads as a floor.
 			let reporting = 0;
+			// Σ per-root estimated USD cost, computed at write time from the actual
+			// conversation model(s) (core/Pricing.ts). A lower bound: roots written
+			// before the field existed, or whose model wasn't in the price table,
+			// contribute 0. When it stays 0 the bar falls back to a client-side
+			// estimate so legacy branches still show an approximate figure.
+			let estimatedCostUsd = 0;
 			for (const s of summaries) {
 				// Aggregate the WHOLE tree per root so the branch bar matches each
 				// memory row's subline, which sums via aggregateConversationTokens
@@ -1328,8 +1338,9 @@ export function activate(context: vscode.ExtensionContext): void {
 				cached += b.cached;
 				total += aggregateConversationTokens(s);
 				if (b.input > 0 || b.output > 0 || b.cached > 0) reporting += 1;
+				estimatedCostUsd += aggregateEstimatedCost(s);
 			}
-			return { input, output, cached, total, reporting, memories: summaries.length };
+			return { input, output, cached, total, reporting, memories: summaries.length, estimatedCostUsd };
 		},
 		// Live gh pr list lookup for the SHIPPED group's "PR #N — open" status row.
 		// Aliased import avoids a name clash between the dep key and the imported fn.

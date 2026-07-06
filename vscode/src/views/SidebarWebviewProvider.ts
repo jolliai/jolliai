@@ -397,6 +397,13 @@ export interface SidebarWebviewDeps {
 		total: number;
 		reporting: number;
 		memories: number;
+		/**
+		 * Σ per-root estimated USD cost from the stored per-model usage
+		 * (`aggregateEstimatedCost`). A lower bound — 0 for roots with no priced
+		 * model or written before the field existed. When 0, the webview falls
+		 * back to a client-side Sonnet-rate estimate off the segment breakdown.
+		 */
+		estimatedCostUsd?: number;
 	}>;
 	/**
 	 * Returns the real per-file git status (A/M/D/R + rename oldPath) for a
@@ -1921,6 +1928,7 @@ export class SidebarWebviewProvider
 						total: stats.total,
 						reporting: stats.reporting,
 						memories: stats.memories,
+						...(stats.estimatedCostUsd !== undefined && { estimatedCostUsd: stats.estimatedCostUsd }),
 						scope: "branch",
 					});
 				})
