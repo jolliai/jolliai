@@ -1,6 +1,17 @@
 # Changelog
 
-<!-- Last synced commit: 54473e60 | 2026-06-29 -->
+<!-- Last synced commit: 38920160 | 2026-07-06 -->
+
+## 0.99.5
+
+- **Cleaner sidebar** — a simple **Current Branch / Memory Bank** switch up top and a `repo / branch` breadcrumb to jump around. Each memory now expands to show the files and conversations behind it. (The "Commits" section is now "Memories".)
+- **A dedicated Create PR view** — review and edit the PR title and body before you open it, copy the body with one click, and update the same PR later as you add more work.
+- **Share your branch when you open a PR** — creating a PR also shares that branch's memories with your team, in one step.
+- **Simpler branch sharing** — see what you've shared and who can see it, kept up to date as you work.
+- **Review what goes into your next memory** — a running token count plus quick toggles to drop or add back a conversation, plan, note, or file, all in sync with the sidebar.
+- **Catch up on older commits** — enable Jolli in a repo that already has history and it offers to create memories for those earlier commits.
+- **Safer force-push** — Jolli won't overwrite commits that only exist on the remote.
+- Bug fixes
 
 ## 0.99.4
 

@@ -113,6 +113,7 @@ src/
 │   ├── AuthService.ts            # OAuth callback URI handling (code-exchange flow + CSRF state validation per RFC 6749), sign-in / sign-out, jollimemory.signedIn context key. Carries `device_label` (hostname + OS) and `client_version` into the OAuth URL so the Jolli web UI can name authorized sessions, and preserves the per-flow nonce across the `openExternal=false` Copy URL path so the manual fallback still completes a sign-in.
 │   ├── ActiveSessionsProvider.ts # Background poller over the seven per-source session aggregators. Powers the Branch tab's CONVERSATIONS section — emits `ActiveSession[]` snapshots that the sidebar webview renders without manual refresh.
 │   ├── ManualDisableFlag.ts      # Durable per-repo opt-out for auto-enable (set when user clicks Disable; respected on every activation)
+│   ├── BackfillDismissFlag.ts    # Records a dismissal of the cold-start back-fill offer in the git common dir, so switching worktrees on the same repo doesn't re-nag
 │   ├── JolliPushService.ts       # HTTP client for pushing summaries to a Jolli Space
 │   ├── PrCommentService.ts       # GitHub PR creation/update via gh CLI; PR section markers
 │   └── data/                     # Pure derivations consumed by providers (no VSCode imports, no state)
@@ -131,7 +132,7 @@ src/
 │   └── KnowledgeBaseTreeProvider.ts  # Branch-aware Memory Bank folder tree (the class name keeps the legacy "KnowledgeBase" identifier)
 │
 ├── views/                        # Webview panels (HTML + CSS + JS, served via webview API)
-│   ├── SidebarWebviewProvider.ts         # Top-level sidebar webview that hosts the 3 tabs (Branch / Memory Bank / Status) and the onboarding / api-key / disabled panels
+│   ├── SidebarWebviewProvider.ts         # Top-level sidebar webview: the segmented Current Branch / Memory Bank switch, the repo/branch breadcrumb, the Status overlay (opened from the title bar), and the onboarding / api-key / disabled panels
 │   ├── SidebarHtmlBuilder.ts             # HTML assembly for the sidebar (onboarding panel, sections, Memory Bank tree)
 │   ├── SidebarCssBuilder.ts              # Sidebar stylesheet (CSP-compatible — no inline style)
 │   ├── SidebarScriptBuilder.ts           # Embedded JS — onboarding interactions, message bus, lazy data fetches
@@ -159,6 +160,10 @@ src/
 │   │
 │   ├── KnowledgeGraphPanel.ts            # Per-repo knowledge-graph webview (one panel per repo). Loads the shared viz assets from `assets/graph/` via `asWebviewUri` (NOT bundled) and inlines the repo's `graph.json` as `window.__EMBEDDED_GRAPH__`. Opened by `jollimemory.viewKnowledgeGraph`; shows a "build the wiki first" hint when no graph.json exists yet.
 │   │
+│   ├── CreatePrWebviewPanel.ts           # Singleton editor-column "Create Pull Request" view: edit the drafted title/body in place, copy the body, open per-file base..HEAD diffs, create the PR (and share the branch's memories to Jolli Space on create), then flip to Update-PR mode. Supported by CreatePrData (assembles branch memories + diff stats), CreatePrHtmlBuilder, CreatePrBodyMarkdown (the drafted body), and CreatePrDiffContentProvider / CreatePrDiffUri (the `jolli-prdiff` diff scheme).
+│   │
+│   ├── NextMemoryPreviewPanel.ts         # "Working Memory" review panel — a live token meter over the next commit's selected conversations/plans/notes/files plus inline remove / add-back toggles. Its selection stays in sync with the sidebar checkboxes. HTML/CSS/JS in NextMemoryHtmlBuilder / NextMemoryCssBuilder / NextMemoryScriptBuilder.
+│   │
 │   └── NoteEditorWebviewPanel.ts         # Singleton "Add Text Snippet" editor
 │       NoteEditorHtmlBuilder.ts / NoteEditorCssBuilder.ts / NoteEditorScriptBuilder.ts
 │
@@ -167,6 +172,8 @@ src/
 └── util/
     ├── CommitMessageUtils.ts     # Commit message formatting and validation
     ├── ExcludeFilterManager.ts   # File-exclusion patterns for the Changes section in the Branch tab
+    ├── ForcePushPrompt.ts        # Shared force-push confirmation prompt used by PushCommand, SquashCommand, and the Create PR flow
+    ├── ForcePushSafety.ts        # Divergence gate — distinguishes "behind remote" (safe fast-forward) from true divergence, so a force-push never clobbers upstream-only commits
     ├── FormatUtils.ts            # Relative date / size formatting shared across panels
     ├── LockUtils.ts              # File-based concurrency lock (used to detect Worker busy state)
     ├── Logger.ts                 # Output-channel logger
@@ -270,7 +277,11 @@ Both panels are singletons (one instance at a time, focused if reopened) and use
 
 **Share in Jolli Space** — The summary webview posts the Markdown summary to a Jolli Space via `/api/push/jollimemory`. Authentication uses Jolli API keys (`sk-jol-…`); new-format keys embed the tenant URL as Base64-encoded JSON metadata, so no separate base URL configuration is needed. `JolliPushService` uses Node's `http` / `https` modules (not `fetch`) so it can talk to local self-signed dev servers (`jolli-local.me`).
 
-**Create & Update PR section** — `PrCommentService.ts` encapsulates all GitHub PR logic. It uses the `gh` CLI (zero new dependencies) to check commit count, PR existence, and current PR body. The summary is embedded in the PR description using dual HTML comment markers (`<!-- jollimemory-summary-start -->` / `<!-- jollimemory-summary-end -->`); on update, only the marker region is replaced, preserving any user-written content above and below. The section transitions through states: `loading` → `multipleCommits` | `unavailable` | `noPr` | `ready`. Cancel button state is managed via `prCurrentState` to restore the correct visibility (link row vs status text) without a full re-render.
+**Create & Update PR view** — Creating a PR opens `CreatePrWebviewPanel`, a singleton editor-column view (not a section at the bottom of the summary panel) that pre-populates the drafted title/body from the branch's memories and diff stats, lets the user edit both in place, copy the body, and open per-file `base..HEAD` diffs. On create it opens the PR **and** shares the branch's memories to the user's Personal Space in Jolli, then flips the same view to Update-PR mode; the create/update button dims when there's nothing new to push. `PrCommentService.ts` still encapsulates the GitHub logic: it uses the `gh` CLI (zero new dependencies) to check commit count, PR existence, and current PR body. The summary is embedded using dual HTML comment markers (`<!-- jollimemory-summary-start -->` / `<!-- jollimemory-summary-end -->`); on update, only the marker region is replaced, preserving any user-written content above and below. Before any force-push the flow routes through `ForcePushPrompt` + `ForcePushSafety`, which gate on true divergence (not merely "behind remote") so a stale branch never clobbers upstream-only commits.
+
+**Cold-start back-fill offer** — When the extension enables Jolli Memory in a repo that already has commit history but no memories, it offers to back-fill summaries for those earlier commits (calling the CLI's backfill engine, Claude transcripts only). `BackfillListRenderer` renders the offer in the sidebar; `BackfillDismissFlag` records a dismissal in the git **common** dir (not the worktree) so switching worktrees on the same repo doesn't re-nag.
+
+**Working Memory review** — `NextMemoryPreviewPanel` previews what the next commit's memory will be built from: a live token meter (over the selected conversations / plans / notes / files) plus inline remove / add-back toggles. Its selection is kept in sync with the sidebar's per-item checkboxes, so unchecking something lines up in both places; the selection is a one-time discard for the next commit rather than a branch-scoped preference.
 
 **Memories store — lazy load + filter** — `MemoriesTreeProvider` is no longer registered as a VS Code TreeView; the sidebar is a single webview that renders the Branch tab and Memory Bank tab directly. `MemoriesStore` and `MemoriesDataService` are kept as a data layer that the webview consumes via `JolliMemoryBridge`. The lazy-load pattern still applies: the first page is fetched on first visibility of the surface that consumes it, subsequent loads come from the in-store cache; when a filter is active the bridge returns the matched set in one call (no pagination), without a filter it paginates with a `canLoadMore` derivation.
 

@@ -335,6 +335,19 @@ node "$("$HOME/.jolli/jollimemory/resolve-dist-path")/PostCommitHook.js"
 
 If an existing hook file exists, Jolli Memory's section is appended. On uninstall, only the marked sections are removed.
 
+### Global skill-preference instructions
+
+`enable` also runs [`GlobalInstructionsInstaller`](src/install/GlobalInstructionsInstaller.ts), which upserts a "prefer these skills by default" managed block into each detected host's **global** instruction file — `~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`, `~/.codex/AGENTS.md`. The block is bracketed by `<!-- >>> jolli memory instructions >>> -->` / `<!-- <<< … <<< -->` markers (the same managed-block strategy as [`GitExclude.ts`](src/install/GitExclude.ts)): the section between markers is rewritten on each install, everything outside is preserved verbatim, and a pre-existing *unmarked* section a user pasted by hand is adopted in place rather than duplicated. The whole operation is fail-soft — a broken or read-only global file never breaks `jolli enable`. Because these files are machine-global (one per host, shared by every repo), `disable` / `uninstall` deliberately **leaves the block in place**, mirroring global-scope MCP registration. Only Codex reads a global `AGENTS.md`; Cursor / OpenCode / Copilot read `AGENTS.md` at the project root, so they are intentionally out of reach here.
+
+## Cold-start Backfill
+
+`jolli backfill` ([`BackfillCommand`](src/commands/BackfillCommand.ts) → [`BackfillEngine`](src/backfill/BackfillEngine.ts)) generates summaries for historical commits that predate `enable`. For each candidate commit with no summary on the orphan branch, the engine attributes Claude transcripts by tier:
+
+- **high** — the commit's changed files overlap a session's touched files.
+- **medium** / **low** — the session merely falls within a nearby time window of the commit (branch-match and time-window tiers).
+
+`--min-confidence` sets the floor for *attaching a conversation*: an attribution below the floor is dropped and the commit falls back to a diff-only summary — every own commit still gets at least a diff summary (宁缺毋滥 only blocks attaching an unsure conversation). `--dry-run` reports each commit's `method` (`file-overlap` / `branch-match` / `time-window` / `diff-only`), its `confidence` when a conversation was attributed, and the `commitSubject`, without an LLM call. Diff-only summaries are stamped with the `branch` marker `"backfilled"` (the `DIFF_ONLY_BRANCH` constant), since with no attributed conversation there is no reliable branch to record. Scope is `--last <n>` (default 20) or `--all` (everything reachable from HEAD); output is `text` or `json`. The backfill scan window and per-run limit come from shared constants, and the editor extensions call the same engine when they detect a repo with commit history but no memories (the "offer to back-fill on enable" prompt), storing a dismiss flag in the git common dir so a worktree switch doesn't re-nag.
+
 ## Concurrency and Safety
 
 - **File lock**: `.jolli/jollimemory/lock` prevents concurrent worker runs. Uses `writeFile` with `wx` flag (exclusive create). Stale locks (>5 min) are auto-removed.
