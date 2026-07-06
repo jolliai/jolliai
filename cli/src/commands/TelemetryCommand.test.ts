@@ -3,13 +3,25 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Redirect homedir() so getGlobalConfigDir() lands in a temp dir — these tests must
+// never read or mutate the developer's real ~/.jolli/jollimemory/config.json.
+// Cross-platform: unlike process.env.HOME, this also works on Windows, where
+// homedir() reads %USERPROFILE% and ignores $HOME.
+const { mockHomedir } = vi.hoisted(() => ({
+	mockHomedir: vi.fn<typeof import("node:os").homedir>(),
+}));
+vi.mock("node:os", async (importOriginal) => {
+	const original = await importOriginal<typeof import("node:os")>();
+	mockHomedir.mockImplementation(original.homedir);
+	return { ...original, homedir: mockHomedir };
+});
+
 import { loadConfig } from "../core/SessionTracker.js";
 import { appendTelemetryEvent, readTelemetryEvents, type TelemetryEnvelope } from "../core/TelemetryBuffer.js";
 import { registerTelemetryCommand } from "./TelemetryCommand.js";
 
-// Redirect HOME so getGlobalConfigDir() lands in a temp dir — never the real ~/.jolli.
 let home: string;
-let savedHome: string | undefined;
 let logs: string[];
 
 const run = async (...argv: string[]): Promise<void> => {
@@ -37,8 +49,7 @@ const env = (over: Partial<TelemetryEnvelope> = {}): TelemetryEnvelope => ({
 
 beforeEach(async () => {
 	home = await mkdtemp(join(tmpdir(), "telemetry-cmd-home-"));
-	savedHome = process.env.HOME;
-	process.env.HOME = home;
+	mockHomedir.mockReturnValue(home);
 	logs = [];
 	vi.spyOn(console, "log").mockImplementation((msg?: unknown) => {
 		logs.push(String(msg));
@@ -46,8 +57,6 @@ beforeEach(async () => {
 });
 afterEach(async () => {
 	vi.restoreAllMocks();
-	if (savedHome === undefined) delete process.env.HOME;
-	else process.env.HOME = savedHome;
 	await rm(home, { recursive: true, force: true });
 });
 

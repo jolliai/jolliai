@@ -35,11 +35,14 @@ describe("buildRegistrars", () => {
 		expect(registrars).toHaveLength(0);
 	});
 
-	it("claude registrar.register() writes .mcp.json with mcpServers.jollimemory.args === ['mcp']", async () => {
+	it("claude registrar.register() writes .mcp.json with the jollimemory mcp subcommand", async () => {
 		const [claude] = buildRegistrars({ ...NONE, claude: true });
 		await claude.register(dir);
 		const json = JSON.parse(await readFile(join(dir, ".mcp.json"), "utf-8"));
-		expect(json.mcpServers.jollimemory.args).toEqual(["mcp"]);
+		// `.toContain` not `.toEqual(["mcp"])`: on Windows the args are prefixed with
+		// the resolved `Cli.js` path (see mcpServerEntry). The exact per-platform shape
+		// is asserted by the mcpServerEntry unit tests and the "jolliEntry — Windows" test.
+		expect(json.mcpServers.jollimemory.args).toContain("mcp");
 	});
 
 	it("claude registrar.gitExcludePaths() returns [MCP_GIT_EXCLUDE_PATH]", () => {
@@ -57,7 +60,7 @@ describe("registerRepoMcpHosts", () => {
 	it("registers claude (repo-scoped) when detected", async () => {
 		await registerRepoMcpHosts(dir, { ...NONE, claude: true });
 		const json = JSON.parse(await readFile(join(dir, ".mcp.json"), "utf-8"));
-		expect(json.mcpServers.jollimemory.args).toEqual(["mcp"]);
+		expect(json.mcpServers.jollimemory.args).toContain("mcp");
 	});
 
 	it("skips registration when no hosts detected", async () => {
@@ -100,7 +103,7 @@ describe("cursor registrar", () => {
 		await cursor.register(dir);
 		const json = JSON.parse(await readFile(join(dir, ".cursor", "mcp.json"), "utf-8"));
 		expect(json.mcpServers.jollimemory).toBeDefined();
-		expect(json.mcpServers.jollimemory.args).toEqual(["mcp"]);
+		expect(json.mcpServers.jollimemory.args).toContain("mcp");
 	});
 
 	it("remove() is a no-op when .cursor/mcp.json is absent", async () => {
@@ -307,7 +310,7 @@ describe("new registrars — register targets & entry shape (mocked writer)", ()
 		const [path, entry, key] = upsertMock.mock.calls[0];
 		expect(path).toBe(join(homedir(), ".copilot", "mcp-config.json"));
 		expect(key).toBeUndefined(); // default mcpServers
-		expect(entry.args).toEqual(["mcp"]);
+		expect(entry.args).toContain("mcp");
 	});
 
 	it("copilotChat register() → VS Code User/mcp.json, key `servers`, type:stdio", async () => {
@@ -318,7 +321,7 @@ describe("new registrars — register targets & entry shape (mocked writer)", ()
 		expect(path).toBe(join(getVscodeUserDataDir("Code"), "User", "mcp.json"));
 		expect(key).toBe("servers");
 		expect(entry.type).toBe("stdio");
-		expect(entry.args).toEqual(["mcp"]);
+		expect(entry.args).toContain("mcp");
 	});
 
 	it("opencode/copilotChat remove() pass the right serversKey", async () => {
