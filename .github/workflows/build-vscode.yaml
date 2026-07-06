@@ -54,3 +54,17 @@ jobs:
             -   if: steps.changes.outputs.relevant == 'true'
                 name: Build, lint, and test (CLI + VS Code)
                 run: npm run all
+
+            # Enforce the vscode → IntelliJ bundling contract here (cheaply) so
+            # build-intellij no longer has to rebuild the bundle on every cli/vscode
+            # change. The IntelliJ plugin bundles vscode/dist/Cli.js (esbuild output) into
+            # its distribution; intellij/build.gradle.kts copyCliDistToSandbox hard-fails
+            # if this file is missing. `npm run all` just built it, so this is a no-op
+            # unless the esbuild output moved or disappeared.
+            -   if: steps.changes.outputs.relevant == 'true'
+                name: Assert IntelliJ bundling contract (vscode/dist/Cli.js)
+                run: |
+                    test -f vscode/dist/Cli.js || {
+                        echo "::error::vscode/dist/Cli.js missing after build — the IntelliJ plugin bundles this file (see intellij/build.gradle.kts copyCliDistToSandbox). Did the esbuild output path change?"
+                        exit 1
+                    }
