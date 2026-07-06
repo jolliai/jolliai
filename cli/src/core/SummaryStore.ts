@@ -133,7 +133,7 @@ const ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS = 1000;
  * (worker path). Throws on timeout — see `ORPHAN_WRITE_REQUIRED_TIMEOUT_MS`
  * for why "lose this entry" is the chosen failure mode.
  */
-async function withRequiredOrphanWriteLock<T>(
+export async function withRequiredOrphanWriteLock<T>(
 	cwd: string | undefined,
 	label: string,
 	fn: () => Promise<T>,
