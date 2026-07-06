@@ -113,5 +113,38 @@ class CommitMemoryFormatTest {
             // The code-only commit must not flip partial.
             totals.partial shouldBe false
         }
+
+        @Test
+        fun `sums per-commit estimated cost across the branch`() {
+            val totals = CommitMemoryFormat.aggregateTokens(
+                listOf(
+                    brief("a", tokenUsage = usage(100, 50).copy(estimatedCostUsd = 0.25)),
+                    brief("b", tokenUsage = usage(400, 200).copy(estimatedCostUsd = 0.50)),
+                ),
+            )
+            totals.estimatedCostUsd shouldBe 0.75
+        }
+
+        @Test
+        fun `cost stays null when no memory carries a priced estimate`() {
+            val totals = CommitMemoryFormat.aggregateTokens(
+                listOf(brief("a", tokenUsage = usage(100, 50))),
+            )
+            totals.estimatedCostUsd shouldBe null
+        }
+    }
+
+    @Nested
+    inner class FormatCost {
+        @Test
+        fun `renders two decimals with the approx-dollar prefix`() {
+            CommitMemoryFormat.formatCost(0.42) shouldBe "≈$0.42"
+            CommitMemoryFormat.formatCost(12.5) shouldBe "≈$12.50"
+        }
+
+        @Test
+        fun `renders a tiny non-zero estimate as less-than-a-cent`() {
+            CommitMemoryFormat.formatCost(0.004) shouldBe "<$0.01"
+        }
     }
 }

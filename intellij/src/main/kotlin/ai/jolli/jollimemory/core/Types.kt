@@ -41,6 +41,13 @@ data class MessageUsage(
     val outputTokens: Long = 0,
     val cacheReadTokens: Long = 0,
     val cacheWriteTokens: Long = 0,
+    /**
+     * The model that produced this turn (`message.model`), or "" when the source
+     * didn't record it. Used to price the tokens per model; an empty/unknown id
+     * is treated as unpriced. Last field with a default so positional
+     * constructions elsewhere keep compiling.
+     */
+    val model: String = "",
 )
 
 /** A single parsed transcript entry from the JSONL file */
@@ -127,6 +134,20 @@ data class TokenUsage(
     val cacheWriteTokens: Long = 0,
     val reportedSessions: Int = 0,
     val totalSessions: Int = 0,
+    /**
+     * Per-model split of the usage (one bucket per model seen; sessions can switch
+     * models mid-stream). Feeds [estimatedCostUsd]. Empty for memories created
+     * before per-model capture, or when no assistant turn recorded a model.
+     */
+    val models: List<ModelUsage> = emptyList(),
+    /**
+     * Estimated USD cost of [models] at list prices as of
+     * [ModelPricing.PRICES_AS_OF]. Null when nothing priced (no models, or all
+     * models absent from the price table); a lower bound when some models were
+     * unpriced. Excludes promotional/batch/volume discounts. Prices input +
+     * cache_write + output only (cache_read is excluded — see [ModelPricing]).
+     */
+    val estimatedCostUsd: Double? = null,
 ) {
     /** All tokens processed (input + output + cache read + cache write). */
     val total: Long get() = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
@@ -140,6 +161,9 @@ data class TokenUsage(
          * when no session reported any usage (so callers render "N/A" rather than
          * a misleading zero) — e.g. memories created before usage capture, or
          * sources that don't report it.
+         *
+         * Also buckets usage per model and prices it into [estimatedCostUsd] via
+         * [ModelPricing] (cost excludes cache_read; see that object).
          */
         fun aggregate(sessions: List<StoredSession>): TokenUsage? {
             if (sessions.isEmpty()) return null
@@ -148,6 +172,8 @@ data class TokenUsage(
             var cacheRead = 0L
             var cacheWrite = 0L
             var reported = 0
+            // Per-model buckets keyed by model id; insertion-ordered for stable output.
+            val byModel = LinkedHashMap<String, ModelUsage>()
             for (session in sessions) {
                 var sessionReported = false
                 for (entry in session.entries) {
@@ -156,15 +182,40 @@ data class TokenUsage(
                     output += u.outputTokens
                     cacheRead += u.cacheReadTokens
                     cacheWrite += u.cacheWriteTokens
+                    val prev = byModel[u.model]
+                    byModel[u.model] = if (prev != null) {
+                        prev.copy(
+                            input = prev.input + u.inputTokens,
+                            output = prev.output + u.outputTokens,
+                            cacheWrite = prev.cacheWrite + u.cacheWriteTokens,
+                        )
+                    } else {
+                        ModelUsage(u.model, ModelPricing.providerOf(u.model), u.inputTokens, u.outputTokens, u.cacheWriteTokens)
+                    }
                     sessionReported = true
                 }
                 if (sessionReported) reported++
             }
             if (reported == 0) return null
-            return TokenUsage(input, output, cacheRead, cacheWrite, reported, sessions.size)
+            val models = byModel.values.toList()
+            val cost = ModelPricing.estimateCostUsd(models).takeIf { it > 0.0 }
+            return TokenUsage(input, output, cacheRead, cacheWrite, reported, sessions.size, models, cost)
         }
     }
 }
+
+/**
+ * One model's token usage, normalised to the segments the cost formula prices
+ * (cache_read is excluded — see [ModelPricing]). `provider` is derived from the
+ * price table ("unknown" when the model isn't listed).
+ */
+data class ModelUsage(
+    val model: String,
+    val provider: String,
+    val input: Long,
+    val output: Long,
+    val cacheWrite: Long,
+)
 
 /** Metadata from the LLM API call */
 data class LlmCallMetadata(

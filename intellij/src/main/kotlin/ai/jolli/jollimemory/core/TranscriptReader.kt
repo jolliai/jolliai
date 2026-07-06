@@ -143,7 +143,10 @@ object TranscriptReader {
         val cacheRead = num("cache_read_input_tokens")
         val cacheWrite = num("cache_creation_input_tokens")
         if (input == 0L && output == 0L && cacheRead == 0L && cacheWrite == 0L) return null
-        return MessageUsage(input, output, cacheRead, cacheWrite)
+        // `message.model` is a sibling of `message.usage`; captured so the tokens
+        // can be priced per model. Absent → "" (treated as unpriced downstream).
+        val model = msg.get("model")?.takeIf { !it.isJsonNull }?.asString ?: ""
+        return MessageUsage(input, output, cacheRead, cacheWrite, model)
     }
 
     private fun parseUserMessage(msg: com.google.gson.JsonObject, timestamp: String?, lineNum: Int): TranscriptEntry? {
@@ -276,6 +279,10 @@ object TranscriptReader {
             a.outputTokens + b.outputTokens,
             a.cacheReadTokens + b.cacheReadTokens,
             a.cacheWriteTokens + b.cacheWriteTokens,
+            // Only CONSECUTIVE same-role turns merge (streaming chunks of one
+            // response), so both sides carry the same model; keep the first
+            // non-empty id.
+            a.model.ifEmpty { b.model },
         )
     }
 

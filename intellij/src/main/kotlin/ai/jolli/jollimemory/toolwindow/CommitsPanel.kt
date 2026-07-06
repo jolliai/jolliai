@@ -444,10 +444,17 @@ class CommitsPanel(
                 override fun mouseClicked(e: MouseEvent) { showTokenInfoPopup(this@apply) }
             })
         }
+        // Estimated USD cost next to the token total, priced per model at write
+        // time (null when no contributing memory carried a priced estimate — then
+        // the meter shows tokens only, never a misleading "≈$0.00").
+        val costLabel: JComponent? = totals.estimatedCostUsd?.takeIf { totals.hasData }?.let { usd ->
+            JBLabel("· ${CommitMemoryFormat.formatCost(usd)}").apply { foreground = dimFg }
+        }
         val headerLine = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), 0)).apply {
             isOpaque = false
             alignmentX = Component.LEFT_ALIGNMENT
             add(totalLabel)
+            if (costLabel != null) add(costLabel)
             if (totals.partial) {
                 add(JBLabel("· partial").apply {
                     foreground = dimFg
@@ -558,7 +565,11 @@ class CommitsPanel(
     /** "<relative time> · <shortHash> · <token spend>" for the collapsed row. */
     private fun buildSubLine(commit: CommitSummaryBrief): String {
         // Always present, so the row reads consistently even with no usage data.
-        val tokenText = commit.tokenUsage?.let { "${CommitMemoryFormat.formatTokens(it.total)} tokens" } ?: "N/A tokens"
+        // Append the per-model cost estimate when this memory carries one.
+        val tokenText = commit.tokenUsage?.let { u ->
+            val base = "${CommitMemoryFormat.formatTokens(u.total)} tokens"
+            u.estimatedCostUsd?.let { "$base · ${CommitMemoryFormat.formatCost(it)}" } ?: base
+        } ?: "N/A tokens"
         return listOf(formatShortRelativeDate(commit.date), commit.shortHash, tokenText).joinToString(" · ")
     }
 

@@ -28,6 +28,13 @@ data class BranchTokenTotals(
 	val cacheRead: Long,
 	val cacheWrite: Long,
 	val partial: Boolean,
+	/**
+	 * Sum of the per-commit estimated USD cost across the branch (null when no
+	 * contributing memory carried a priced estimate). A lower bound for the same
+	 * reasons [partial] is: unpriced models and pre-capture memories contribute
+	 * nothing. Priced per model at write time via [ai.jolli.jollimemory.core.ModelPricing].
+	 */
+	val estimatedCostUsd: Double? = null,
 ) {
 	/** Cache read + write, shown as one "cached" segment. */
 	val cached: Long get() = cacheRead + cacheWrite
@@ -58,6 +65,13 @@ object CommitMemoryFormat {
 	}
 
 	/**
+	 * Compact cost label: `≈$0.42`, or `<$0.01` for a tiny non-zero estimate.
+	 * Mirrors the VS Code branch bar. Callers only invoke this when a cost exists.
+	 */
+	fun formatCost(usd: Double): String =
+		if (usd >= 0.01) "≈$" + "%.2f".format(usd) else "<$0.01"
+
+	/**
 	 * Sum input/output tokens over the branch's commits. A commit contributes
 	 * only when it carries both token counts; a memory-bearing commit missing
 	 * them flips [BranchTokenTotals.partial] (the displayed total is then a lower
@@ -69,6 +83,9 @@ object CommitMemoryFormat {
 		var cacheRead = 0L
 		var cacheWrite = 0L
 		var partial = false
+		// Σ per-commit cost; stays null unless at least one memory carried a priced
+		// estimate, so a branch with no cost data renders tokens only (no "≈$0.00").
+		var cost: Double? = null
 		for (c in commits) {
 			if (!c.hasSummary) continue
 			val u = c.tokenUsage
@@ -82,7 +99,8 @@ object CommitMemoryFormat {
 			cacheRead += u.cacheReadTokens
 			cacheWrite += u.cacheWriteTokens
 			if (u.partial) partial = true
+			u.estimatedCostUsd?.let { cost = (cost ?: 0.0) + it }
 		}
-		return BranchTokenTotals(input, output, cacheRead, cacheWrite, partial)
+		return BranchTokenTotals(input, output, cacheRead, cacheWrite, partial, cost)
 	}
 }
