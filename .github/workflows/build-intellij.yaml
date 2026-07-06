@@ -37,6 +37,19 @@ jobs:
             .nvmrc
             .github/workflows/build-intellij.yaml
 
+      # Narrower flag for the expensive Kotlin `test` + Plugin Verifier steps. Those
+      # exercise only Kotlin code: they never exec the bundled Cli.js (CliIntegrationsTest
+      # runs with NO cli-dist on the classpath) and `test` has no sandbox dependency, so a
+      # cli/vscode/deps-only change cannot change their outcome. On such a change we still
+      # rebuild the plugin below (which re-runs copyCliDistToSandbox — the one thing a
+      # bundle change can break) but skip the ~20 min test suite and the Verifier.
+      - id: intellij-changes
+        uses: ./.github/actions/detect-relevant-paths
+        with:
+          globs: |
+            intellij/*
+            .github/workflows/build-intellij.yaml
+
       - if: steps.changes.outputs.relevant == 'true'
         name: Set up JDK 21
         uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520 # v5.4.0
@@ -78,11 +91,11 @@ jobs:
         name: Build plugin
         run: ./gradlew buildPlugin
 
-      - if: steps.changes.outputs.relevant == 'true'
+      - if: steps.intellij-changes.outputs.relevant == 'true'
         name: Run tests
         run: ./gradlew test
 
-      - if: steps.changes.outputs.relevant == 'true'
+      - if: steps.intellij-changes.outputs.relevant == 'true'
         name: Run Plugin Verifier
         run: ./gradlew verifyPlugin
 
