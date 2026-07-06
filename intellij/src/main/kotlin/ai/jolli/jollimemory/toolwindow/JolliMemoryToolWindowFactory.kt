@@ -291,12 +291,21 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             }
         }
         val statusAction = object : com.intellij.openapi.actionSystem.ToggleAction(
-            "Status", "Toggle the Jolli Memory status panel", JolliMemoryIcons.Pulse,
+            "Status", "Toggle the Jolli Memory status panel", JolliMemoryIcons.CircleGreen,
         ), DumbAware {
             override fun isSelected(e: com.intellij.openapi.actionSystem.AnActionEvent): Boolean = statusShown
             override fun setSelected(e: com.intellij.openapi.actionSystem.AnActionEvent, state: Boolean) {
                 setStatusShown(state)
             }
+
+            // The title-bar status glyph reflects health: green / yellow / red — matching
+            // the STATUS panel and the MCP & Skills row (yellow when Node is missing).
+            override fun update(e: com.intellij.openapi.actionSystem.AnActionEvent) {
+                super.update(e)
+                e.presentation.icon = statusCircleIcon(service)
+            }
+
+            override fun getActionUpdateThread() = com.intellij.openapi.actionSystem.ActionUpdateThread.BGT
         }
         // "Agent Access" is a coming-soon stub — keep it out of the title bar until
         // it does something (the action object stays defined so re-enabling is a flag flip).
@@ -529,6 +538,62 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
 }
 
 /**
+ * Picks the status-circle icon (green / yellow / red) for the current service state.
+ * Shared by the title-bar Status action and the hover status indicator so both always agree:
+ *   - red    → not enabled / no status
+ *   - yellow → enabled but degraded (missing creds/hooks, scan errors, Node/MCP unavailable)
+ *   - green  → all good
+ */
+private fun statusCircleIcon(service: JolliMemoryService): javax.swing.Icon {
+    val status = service.getStatus()
+    return when {
+        status == null || !status.enabled -> JolliMemoryIcons.CircleRed
+        statusHasWarnings(service, status) -> JolliMemoryIcons.CircleYellow
+        else -> JolliMemoryIcons.CircleGreen
+    }
+}
+
+/**
+ * Whether the current status is degraded but still functional (→ yellow):
+ * - No LLM credentials configured (selected provider can't work)
+ * - Service has a lastError
+ * - Git hooks not fully installed
+ * - Claude/Gemini hooks not installed when that host is detected
+ * - OpenCode/Cursor scan errors
+ * - Node missing, or present but MCP + skills integrations not set up (non-blocking)
+ */
+private fun statusHasWarnings(
+    service: JolliMemoryService,
+    status: ai.jolli.jollimemory.core.StatusInfo,
+): Boolean {
+    val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
+    when (config.aiProvider) {
+        "anthropic" ->
+            if (config.apiKey.isNullOrBlank() && System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()) return true
+        "jolli" ->
+            if (config.jolliApiKey.isNullOrBlank()) return true
+        else -> {
+            val hasAny = !config.apiKey.isNullOrBlank() ||
+                !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() ||
+                !config.jolliApiKey.isNullOrBlank()
+            if (!hasAny) return true
+        }
+    }
+
+    if (service.lastError != null) return true
+    if (!status.gitHookInstalled) return true
+    if (status.claudeDetected == true && !status.claudeHookInstalled) return true
+    if (status.geminiDetected == true && !status.geminiHookInstalled) return true
+    if (status.openCodeScanError != null) return true
+    if (status.cursorScanError != null) return true
+    // MCP + skills degraded — Node missing, or present but integrations not set up.
+    // Non-blocking (memory generation uses native hooks), so it's a warning, not an
+    // error. Mirrors the "MCP & Skills" WARN row in StatusPanel.mcpStatusRow().
+    if (!status.nodeAvailable || !status.integrationsActive) return true
+    return false
+}
+
+/**
  * A small status indicator label that shows a colored circle icon
  * (green/yellow/red) based on the JolliMemory service state.
  *
@@ -565,53 +630,7 @@ private class StatusIndicatorLabel(
     }
 
     private fun updateIcon() {
-        val status = service.getStatus()
-        icon = when {
-            // Not enabled or no status — red
-            status == null || !status.enabled -> JolliMemoryIcons.CircleRed
-
-            // Enabled but has warnings (missing hooks, lastError set)
-            hasWarnings(status) -> JolliMemoryIcons.CircleYellow
-
-            // All good — green
-            else -> JolliMemoryIcons.CircleGreen
-        }
-    }
-
-    /**
-     * Checks whether the current status has any warnings:
-     * - No LLM credentials configured (selected provider can't work)
-     * - Service has a lastError
-     * - Git hooks not fully installed
-     * - Claude hooks not installed when Claude is detected
-     * - Gemini hooks not installed when Gemini is detected
-     */
-    private fun hasWarnings(status: ai.jolli.jollimemory.core.StatusInfo): Boolean {
-        // Check if the selected provider's credential is missing
-        val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
-        when (config.aiProvider) {
-            "anthropic" -> {
-                if (config.apiKey.isNullOrBlank() && System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()) return true
-            }
-            "jolli" -> {
-                if (config.jolliApiKey.isNullOrBlank()) return true
-            }
-            else -> {
-                // No provider set — warn if nothing at all
-                val hasAny = !config.apiKey.isNullOrBlank() ||
-                    !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() ||
-                    !config.jolliApiKey.isNullOrBlank()
-                if (!hasAny) return true
-            }
-        }
-
-        if (service.lastError != null) return true
-        if (!status.gitHookInstalled) return true
-        if (status.claudeDetected == true && !status.claudeHookInstalled) return true
-        if (status.geminiDetected == true && !status.geminiHookInstalled) return true
-        if (status.openCodeScanError != null) return true
-        if (status.cursorScanError != null) return true
-        return false
+        icon = statusCircleIcon(service)
     }
 
     private fun showStatusPopup(e: MouseEvent) {

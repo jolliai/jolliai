@@ -19,6 +19,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBScrollPane
+import com.intellij.ui.JBColor
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
 import java.awt.Color
@@ -414,6 +415,19 @@ class StatusPanel(
         private val textLabel = JLabel()
         private val descLabel = JLabel()
 
+        /**
+         * Severity color for a row's description text so a non-healthy status reads
+         * by color, not just by a small icon. Mirrors VS Code's charts.yellow / charts.red:
+         *   - WARN  → amber (non-blocking: e.g. MCP & Skills not enabled — memory still works)
+         *   - ERROR → red   (blocking: e.g. required hooks missing)
+         *   - everything else → null (falls back to the normal gray)
+         */
+        private fun statusColor(icon: StatusPanel.Icon): Color? = when (icon) {
+            StatusPanel.Icon.WARN -> WARN_COLOR
+            StatusPanel.Icon.ERROR -> ERROR_COLOR
+            else -> null
+        }
+
         /** Cache of white-tinted icons for selected state. */
         private val whiteIconCache = mutableMapOf<javax.swing.Icon, javax.swing.Icon>()
 
@@ -465,7 +479,10 @@ class StatusPanel(
             textLabel.font = list.font
             descLabel.text = "  ${value.description}"
             descLabel.font = list.font
-            descLabel.foreground = if (isSelected) list.selectionForeground else Color.GRAY
+            descLabel.foreground = when {
+                isSelected -> list.selectionForeground
+                else -> statusColor(value.icon) ?: Color.GRAY
+            }
 
             panel.removeAll()
             val left = JPanel(BorderLayout()).apply {
@@ -485,12 +502,21 @@ class StatusPanel(
             textLabel.foreground = if (isSelected) list.selectionForeground else list.foreground
             panel.toolTipText = value.tooltip
 
-            // Show hand cursor for clickable items
-            if (value.onClick != null) {
-                descLabel.foreground = if (isSelected) list.selectionForeground else Color(0x4A90D9)
+            // Clickable rows read blue as an affordance — but a warning/error color wins,
+            // since severity is more important to convey than clickability.
+            if (value.onClick != null && !isSelected && statusColor(value.icon) == null) {
+                descLabel.foreground = Color(0x4A90D9)
             }
 
             return panel
+        }
+
+        companion object {
+            /** Amber for non-blocking warnings — theme-aware (darker on light, brighter on dark). */
+            private val WARN_COLOR = JBColor(Color(0xB8860B), Color(0xE0A030))
+
+            /** Red for blocking errors — theme-aware. */
+            private val ERROR_COLOR = JBColor(Color(0xC0392B), Color(0xE57373))
         }
     }
 }
