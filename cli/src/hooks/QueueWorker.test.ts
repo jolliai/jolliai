@@ -223,6 +223,13 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 		storeNotes: vi.fn(),
 		storeReferences: vi.fn().mockResolvedValue(undefined),
 		setActiveStorage: vi.fn(),
+		// Passthrough spy for the ingest writeGuard's inner orphan-write.lock. Runs
+		// the body without touching the real lock file (the acquire/release contract
+		// is covered in SummaryStore.test.ts); tests here assert the WIRING — that
+		// ingest writes now flow through this lock, nested inside vault-write.lock.
+		withRequiredOrphanWriteLock: vi.fn(
+			async (_cwd: string | undefined, _label: string, fn: () => Promise<unknown>) => fn(),
+		),
 		// Real implementations -- runSquashPipeline / handleAmendPipeline call
 		// these to expand source commits and copy-hoist topics. The mocks above
 		// cover the storage write side; these helpers are pure tree transforms
@@ -390,12 +397,12 @@ import {
 import { cleanupBranchStaleChildMarkdown } from "../core/StaleChildMarkdownCleanup.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { generateSummary } from "../core/Summarizer.js";
-import { storeSummary } from "../core/SummaryStore.js";
+import { storeSummary, withRequiredOrphanWriteLock } from "../core/SummaryStore.js";
 import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
 import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { recordPendingWorker, wakePendingWorkers } from "../sync/PendingWorkers.js";
-import { acquireVaultWriteLock } from "../sync/VaultWriteLock.js";
+import { acquireVaultWriteLock, withVaultWriteLock } from "../sync/VaultWriteLock.js";
 import type { CommitGitOperation, IngestOperation } from "../Types.js";
 import { __test__, buildWorkerStartupBanner, launchWorker, runWorker } from "./QueueWorker.js";
 
@@ -2687,6 +2694,71 @@ describe("QueueWorker", () => {
 			const drainOpts = vi.mocked(drainIngest).mock.calls[0]?.[2];
 			expect(typeof drainOpts?.writeGuard).toBe("function");
 			expect(typeof vi.mocked(renderTopicKBWiki).mock.calls[0]?.[2]).toBe("function");
+		});
+
+		it("routes each ingest write through orphan-write.lock (PR1: ingest orphan-ref writes self-lock)", async () => {
+			// PR1 wraps the ingest writeGuard body in `withRequiredOrphanWriteLock`
+			// so ingest's orphan-ref writes serialise against summary writes on the
+			// same lock. Drive the guard with a sentinel write and assert it flowed
+			// through the orphan lock with the "ingest-write" label.
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			let sentinelRan = false;
+			vi.mocked(drainIngest).mockImplementation(async (_op, _cwd, opts) => {
+				await opts?.writeGuard?.(async () => {
+					sentinelRan = true;
+				});
+				return { batches: 1, ingested: 1, outcome: "OK", topicFailures: [] };
+			});
+
+			const op = makeIngestOp("post-merge");
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
+				.mockResolvedValueOnce([]);
+
+			await runWorker("/test/cwd");
+
+			expect(sentinelRan).toBe(true);
+			expect(vi.mocked(withRequiredOrphanWriteLock)).toHaveBeenCalledWith(
+				"/test/cwd",
+				"ingest-write",
+				expect.any(Function),
+			);
+		});
+
+		it("nests orphan-write.lock INSIDE vault-write.lock in the ingest writeGuard (vault→orphan order)", async () => {
+			// Lock-ordering guarantee: the ingest writeGuard must take vault-write.lock
+			// (outer) then orphan-write.lock (inner), matching the summary path's
+			// vault→orphan direction so the two never deadlock. Record entry order of
+			// both locks plus the actual write.
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			const order: string[] = [];
+			vi.mocked(withVaultWriteLock).mockImplementationOnce(
+				async (_root: string, _mode: unknown, body: () => Promise<unknown>) => {
+					order.push("vault");
+					return { ran: true, value: await body() };
+				},
+			);
+			vi.mocked(withRequiredOrphanWriteLock).mockImplementationOnce(
+				async (_cwd: string | undefined, label: string, fn: () => Promise<unknown>) => {
+					order.push(`orphan:${label}`);
+					return fn();
+				},
+			);
+			vi.mocked(drainIngest).mockImplementation(async (_op, _cwd, opts) => {
+				await opts?.writeGuard?.(async () => {
+					order.push("write");
+				});
+				return { batches: 1, ingested: 1, outcome: "OK", topicFailures: [] };
+			});
+
+			const op = makeIngestOp("post-merge");
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
+				.mockResolvedValueOnce([]);
+
+			await runWorker("/test/cwd");
+
+			expect(order).toEqual(["vault", "orphan:ingest-write", "write"]);
 		});
 
 		it("skips drainIngest when no API key is configured", async () => {

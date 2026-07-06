@@ -93,6 +93,7 @@ import {
 	storeReferences,
 	storeSummary,
 	stripFunctionalMetadata,
+	withRequiredOrphanWriteLock,
 } from "../core/SummaryStore.js";
 import { resolveTranscriptIdsFiltered } from "../core/SummaryTree.js";
 import { getTelemetryContext, track } from "../core/Telemetry.js";
@@ -605,10 +606,24 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 			// final backstop.
 			await wakeWaiters();
 			const writeGuard = async (fn: () => Promise<void>): Promise<void> => {
-				const r = await withVaultWriteLock(memoryBankRoot, { wait: DEFAULT_VAULT_WRITE_WAIT_MS }, fn, {
-					launch: launchWorker,
-					selfCwd: cwd,
-				});
+				const r = await withVaultWriteLock(
+					memoryBankRoot,
+					{ wait: DEFAULT_VAULT_WRITE_WAIT_MS },
+					// Inner orphan-write.lock: matches the summary write path's
+					// vault→orphan lock ordering so ingest's orphan-ref writes
+					// (saveTopicPage / saveTopicIndex / saveProcessedSet) serialise
+					// against summary writes on the same lock. Today the two run
+					// serially so this never contends; it's the groundwork for
+					// splitting worker.lock (lets summary + ingest run concurrently)
+					// without an orphan-ref torn write. The folder-only wiki write
+					// this also wraps is already covered by vault-write.lock — the
+					// extra orphan lock there is harmless.
+					() => withRequiredOrphanWriteLock(cwd, "ingest-write", fn),
+					{
+						launch: launchWorker,
+						selfCwd: cwd,
+					},
+				);
 				// Typed busy signal (shared verbatim with the compile guards) so
 				// drainIngest's page-write catch can tell contention from a real fault.
 				if (!r.ran) throw new VaultWriteBusyError();
