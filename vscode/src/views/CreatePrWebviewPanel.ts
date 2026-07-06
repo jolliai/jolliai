@@ -33,7 +33,7 @@ import {
 	handleUpdatePrWithPush,
 } from "../services/PrCommentService.js";
 import { log } from "../util/Logger.js";
-import { isWorkerBlockingBusy } from "../util/LockUtils.js";
+import { isWorkerBusy } from "../util/LockUtils.js";
 import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
 import { resolveBindingViaChooser } from "./BindingResolver.js";
 import { buildCreatePrViewModel, type CreatePrViewModel } from "./CreatePrData.js";
@@ -243,7 +243,7 @@ export class CreatePrWebviewPanel {
 
 		switch (m.command) {
 			case "createPr": {
-				if (await isWorkerBlockingBusy(this.workspaceRoot)) {
+				if (await isWorkerBusy(this.workspaceRoot)) {
 					vscode.window.showWarningMessage(
 						"Jolli Memory: AI summary is being generated. Please wait a moment.",
 					);

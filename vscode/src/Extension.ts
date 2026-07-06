@@ -102,13 +102,13 @@ import { CommitsStore } from "./stores/CommitsStore.js";
 import { FilesStore } from "./stores/FilesStore.js";
 import { MemoriesStore } from "./stores/MemoriesStore.js";
 import { PlansStore } from "./stores/PlansStore.js";
-import { StatusStore, type WorkerPhase } from "./stores/StatusStore.js";
+import { StatusStore } from "./stores/StatusStore.js";
 import { registerCompileCommand } from "./CompileCommand.js";
 import { openKnowledgeGraph } from "./views/KnowledgeGraphPanel.js";
 import { activateSync } from "./sync/VsCodeSyncBootstrap.js";
 import { ExcludeFilterManager } from "./util/ExcludeFilterManager.js";
 import { formatShortRelativeDate } from "./util/FormatUtils.js";
-import { isWorkerBusy } from "./util/LockUtils.js";
+import { isWorkerBusy, readIngestPhase } from "./util/LockUtils.js";
 import { initLogger, log } from "./util/Logger.js";
 import { StatusBarManager } from "./util/StatusBarManager.js";
 import { getWorkspaceRoot } from "./util/WorkspaceUtils.js";
@@ -1051,7 +1051,10 @@ export function activate(context: vscode.ExtensionContext): void {
 				statusProvider.onDidChangeTreeData.bind(statusProvider),
 			getWorkerBusy: () => statusProvider.getWorkerBusy(),
 			getSyncPhase: () => statusStore.getSnapshot().syncPhase,
-			getWorkerPhase: () => statusStore.getSnapshot().workerPhase,
+			getIngest: () => {
+				const s = statusStore.getSnapshot();
+				return { busy: s.ingestBusy, phase: s.ingestPhase };
+			},
 		},
 		memoriesProvider: {
 			serialize: () => memoriesProvider.serialize(),
@@ -1821,44 +1824,18 @@ export function activate(context: vscode.ExtensionContext): void {
 		new vscode.RelativePattern(workspaceRoot, ".jolli/jollimemory/worker.lock"),
 	);
 	// The `jollimemory.workerBusy` context key drives `enablement` of the
-	// commitAI / squash contributed commands, so it carries BLOCKING semantics:
-	// busy with any phase except ingest. The ingest phase (Memory Bank wiki
-	// update, ~80s+) never touches the commit pipeline or code-branch history,
-	// so commit/squash stay enabled during it — git ops landed mid-ingest are
-	// enqueued and drained right after the ingest entry, usually by the SAME
-	// worker in the same lock hold. That worker can move into a blocking
-	// summary run while the user is mid-flow, so the command handlers re-check
-	// the gate right before executing their git operations. Display
-	// surfaces (StatusStore.workerBusy → toolbar indicator) keep the raw busy
-	// flag so progress still shows during ingest.
-	// Local mirrors of the two watcher-fed inputs. Mirrored here (rather than
-	// read back from StatusStore's snapshot) so the context computation stays a
-	// pure function of what the two watchers below reported.
+	// commitAI / squash contributed commands. `worker.lock` is held ONLY during
+	// summary generation (ingest has its own `ingest.lock`), so this key is now
+	// exactly the raw worker-busy flag — ingest can't hold `worker.lock`, so it
+	// never trips the gate. The command handlers still re-check the gate right
+	// before executing, since the click-time check goes stale during LLM message
+	// generation + QuickPick.
 	let workerBusyRaw = false;
-	let workerPhaseIsIngest = false;
-	// Invalidation token for in-flight async phase reads. readWorkerPhase awaits
-	// a readFile; if a synchronous phase clear (lock delete / phase-file delete)
-	// runs while that read is in flight, the read's continuation must NOT apply
-	// its result — it would resurrect a stale `workerPhaseIsIngest = true` with
-	// no worker running, and the next summary run's setWorkerBusy(true) would
-	// then compute a non-blocking context and leave Commit/Squash enabled
-	// mid-summary (the exact race the ingest exemption must not reopen).
-	let workerPhaseEpoch = 0;
 	const updateWorkerBusyContext = () => {
-		void vscode.commands.executeCommand(
-			"setContext",
-			"jollimemory.workerBusy",
-			workerBusyRaw && !workerPhaseIsIngest,
-		);
+		void vscode.commands.executeCommand("setContext", "jollimemory.workerBusy", workerBusyRaw);
 	};
 	const setWorkerBusy = (busy: boolean) => {
 		workerBusyRaw = busy;
-		// Phase lifetime is bound to the lock (mirrors StatusStore.setWorkerBusy):
-		// a crash-left 'ingest' marker must not leak into the next summary run.
-		if (!busy) {
-			workerPhaseIsIngest = false;
-			workerPhaseEpoch++;
-		}
 		statusStore.setWorkerBusy(busy);
 		updateWorkerBusyContext();
 	};
@@ -1893,73 +1870,39 @@ export function activate(context: vscode.ExtensionContext): void {
 	// Check initial state — lock file might already exist on activation
 	void isWorkerBusy(workspaceRoot).then(setWorkerBusy);
 
-	// ── Worker phase file watcher ───────────────────────────────────────
-	// The worker writes `.jolli/jollimemory/worker-phase` (content
-	// "ingest:wiki" / "ingest:graph") while running a topic-KB ingest, so the
-	// Branch toolbar can show "Building knowledge wiki/graph…" instead of
-	// "AI summary in progress…". The phase
-	// is purely cosmetic; its busy-bound lifetime (StatusStore clears it on
-	// workerBusy=false) means a stale marker left by a crashed worker can't
-	// outlive the lock. Separate from the lock watcher because a phase-file
-	// write does not touch worker.lock, so onDidChange there would not fire.
-	const phaseWatcher = vscode.workspace.createFileSystemWatcher(
-		new vscode.RelativePattern(workspaceRoot, ".jolli/jollimemory/worker-phase"),
+	// ── Ingest phase file watcher (cosmetic sidebar pill) ───────────────
+	// The worker writes `.jolli/jollimemory/ingest-phase` (content "ingest:wiki" /
+	// "ingest:graph") while running a topic-KB ingest, so the Branch toolbar can
+	// show a "Building knowledge wiki/graph…" pill. It is purely cosmetic and
+	// carries NO gate role: ingest runs under its own `ingest.lock`, which the
+	// commit/squash gate ignores. So it feeds only `statusStore.setIngest`, never
+	// the `jollimemory.workerBusy` context. Separate from the lock watcher because
+	// writing the phase file does not touch `worker.lock`.
+	const ingestPhaseWatcher = vscode.workspace.createFileSystemWatcher(
+		new vscode.RelativePattern(workspaceRoot, ".jolli/jollimemory/ingest-phase"),
 	);
-	const readWorkerPhase = async (): Promise<void> => {
-		// Capture the epoch before awaiting; a clear that runs during the await
-		// bumps it, marking this read's result stale (see workerPhaseEpoch).
-		const epoch = workerPhaseEpoch;
-		try {
-			const uri = vscode.Uri.joinPath(
-				vscode.Uri.file(workspaceRoot),
-				".jolli",
-				"jollimemory",
-				"worker-phase",
-			);
-			const bytes = await vscode.workspace.fs.readFile(uri);
-			if (epoch !== workerPhaseEpoch) {
-				// A synchronous clear superseded this read; its flag/store writes
-				// are already correct, so applying the pre-clear file content here
-				// would resurrect a stale phase.
-				return;
-			}
-			const content = Buffer.from(bytes).toString("utf-8").trim();
-			// Prefix match: every `ingest:*` sub-phase (wiki / graph) plus the legacy
-			// bare `ingest` is commit-exempt — only the prefix decides the gate. Map
-			// the raw marker to a known WorkerPhase rather than casting: `ingest:graph`
-			// keeps the graph label, everything else ingest-prefixed (incl. legacy
-			// bare `ingest`) collapses to the wiki label; non-ingest clears to null.
-			workerPhaseIsIngest = content.startsWith("ingest");
-			const phase: WorkerPhase = !workerPhaseIsIngest
-				? null
-				: content === "ingest:graph"
-					? "ingest:graph"
-					: "ingest:wiki";
-			statusStore.setWorkerPhase(phase);
-		} catch {
-			if (epoch !== workerPhaseEpoch) {
-				return;
-			}
-			// File missing / unreadable → no special phase.
-			workerPhaseIsIngest = false;
-			statusStore.setWorkerPhase(null);
-		}
-		// Phase flips change the blocking decision (ingest is exempt), so the
-		// context key must be recomputed alongside the cosmetic label.
-		updateWorkerBusyContext();
+	const refreshIngestState = async (): Promise<void> => {
+		const { busy, phase } = await readIngestPhase(workspaceRoot);
+		statusStore.setIngest(busy, phase);
 	};
-	phaseWatcher.onDidCreate(() => void readWorkerPhase());
-	phaseWatcher.onDidChange(() => void readWorkerPhase());
-	phaseWatcher.onDidDelete(() => {
-		workerPhaseIsIngest = false;
-		workerPhaseEpoch++;
-		statusStore.setWorkerPhase(null);
-		updateWorkerBusyContext();
-	});
-	context.subscriptions.push(phaseWatcher);
-	// Check initial state — phase file might already exist on activation
-	// (extension started while a worker is mid-ingest).
-	void readWorkerPhase();
+	ingestPhaseWatcher.onDidCreate(() => void refreshIngestState());
+	ingestPhaseWatcher.onDidChange(() => void refreshIngestState());
+	// An explicit delete of the phase file is authoritative teardown: the worker
+	// removes it when the ingest ends. Clear the pill directly rather than going
+	// through readIngestPhase — otherwise the `ingest.lock` liveness backstop
+	// (the lock is released just AFTER the phase file) could momentarily resurrect
+	// a stale (and possibly mislabeled) pill until the 60s timer catches it.
+	ingestPhaseWatcher.onDidDelete(() => statusStore.setIngest(false, null));
+	context.subscriptions.push(ingestPhaseWatcher);
+	// The watcher fires on file writes but NOT when the phase file / `ingest.lock`
+	// simply age out (a crashed ingest leaves them behind). Re-check on a 60s timer
+	// while a pill is showing so `readIngestPhase`'s staleness check clears it.
+	const ingestStaleTimer = setInterval(() => {
+		if (statusStore.getSnapshot().ingestBusy) void refreshIngestState();
+	}, 60_000);
+	context.subscriptions.push({ dispose: () => clearInterval(ingestStaleTimer) });
+	// Check initial state — an ingest might already be running on activation.
+	void refreshIngestState();
 
 	// COMMITS title updates are handled by the commitsStore.onChange subscription
 	// the sidebar webview wires up — no provider hook needed.

@@ -2188,8 +2188,10 @@ describe("queue-driven Worker", () => {
 				.mockResolvedValueOnce([DEFAULT_COMMIT_OP])
 				// Second call inside the while loop: empty → break
 				.mockResolvedValueOnce([])
-				// Third call after the finally block: one remaining entry → chain spawn
-				.mockResolvedValueOnce([DEFAULT_COMMIT_OP]);
+				// Third call (chain-spawn probe): one remaining summary entry → chain spawn
+				.mockResolvedValueOnce([DEFAULT_COMMIT_OP])
+				// Fourth call (ingest-phase pre-check) and beyond: no ingest entries
+				.mockResolvedValue([]);
 			vi.mocked(deleteQueueEntry).mockResolvedValue(undefined);
 			vi.mocked(getCommitInfo).mockResolvedValue({
 				hash: "abc123",

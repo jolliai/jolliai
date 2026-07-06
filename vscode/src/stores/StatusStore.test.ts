@@ -167,56 +167,70 @@ describe("StatusStore", () => {
 		});
 	});
 
-	it("setWorkerPhase updates the snapshot and reason", () => {
-		const store = new StatusStore({ getStatus: vi.fn() } as never);
-		store.setWorkerBusy(true);
-		store.setWorkerPhase("ingest");
-		expect(store.getSnapshot().workerPhase).toBe("ingest");
-		expect(store.getSnapshot().changeReason).toBe("workerPhase");
-	});
-
-	it("setWorkerPhase carries the ingest sub-phases verbatim (wiki / graph)", () => {
-		const store = new StatusStore({ getStatus: vi.fn() } as never);
-		store.setWorkerBusy(true);
-		store.setWorkerPhase("ingest:wiki");
-		expect(store.getSnapshot().workerPhase).toBe("ingest:wiki");
-		store.setWorkerPhase("ingest:graph");
-		expect(store.getSnapshot().workerPhase).toBe("ingest:graph");
-	});
-
-	it("setWorkerPhase is a no-op when unchanged", () => {
-		const store = new StatusStore({ getStatus: vi.fn() } as never);
-		let emits = 0;
-		store.onChange(() => {
-			emits++;
+	// ── setIngest — cosmetic sidebar ingest pill ───────────────────────────
+	describe("setIngest", () => {
+		it("sets busy + phase on the snapshot and emits the 'ingest' reason", () => {
+			const store = new StatusStore({ getStatus: vi.fn() } as never);
+			const listener = vi.fn();
+			store.onChange(listener);
+			store.setIngest(true, "wiki");
+			expect(store.getSnapshot().ingestBusy).toBe(true);
+			expect(store.getSnapshot().ingestPhase).toBe("wiki");
+			expect(store.getSnapshot().changeReason).toBe("ingest");
+			expect(listener).toHaveBeenCalledTimes(1);
 		});
-		store.setWorkerPhase(null);
-		expect(emits).toBe(0);
-	});
 
-	it("setWorkerBusy(false) clears a set workerPhase (lock-bound lifetime)", () => {
-		const store = new StatusStore({ getStatus: vi.fn() } as never);
-		store.setWorkerBusy(true);
-		store.setWorkerPhase("ingest");
-		store.setWorkerBusy(false);
-		expect(store.getSnapshot().workerPhase).toBeNull();
-		expect(store.getSnapshot().workerBusy).toBe(false);
-	});
+		it("carries the graph sub-phase verbatim", () => {
+			const store = new StatusStore({ getStatus: vi.fn() } as never);
+			store.setIngest(true, "graph");
+			expect(store.getSnapshot().ingestPhase).toBe("graph");
+		});
 
-	it("setWorkerBusy(false) clears a stale workerPhase even when already not busy (crash-residue activation path)", () => {
-		// Activation order is unspecified: readWorkerPhase() may read a stale
-		// 'ingest' marker (left by a SIGKILL'd worker) BEFORE
-		// isWorkerBusy().then(setWorkerBusy) resolves false. Because workerBusy
-		// starts false, setWorkerBusy(false) would hit the equality early-return
-		// and skip the phase clear — leaving a stale phase that mislabels the
-		// next genuine summary run as "Building knowledge wiki…". The busy-bound
-		// invariant must hold here too.
-		const store = new StatusStore({ getStatus: vi.fn() } as never);
-		store.setWorkerPhase("ingest"); // stale marker read while workerBusy is still false
-		const listener = vi.fn();
-		store.onChange(listener);
-		store.setWorkerBusy(false); // isWorkerBusy() resolved false — no busy transition
-		expect(store.getSnapshot().workerPhase).toBeNull();
-		expect(listener).toHaveBeenCalled(); // snapshot changed (phase cleared), so subscribers must re-render
+		it("forces phase to null when busy is false", () => {
+			const store = new StatusStore({ getStatus: vi.fn() } as never);
+			store.setIngest(true, "wiki");
+			// Even if a stale phase is passed alongside busy=false, it must clear.
+			store.setIngest(false, "graph");
+			expect(store.getSnapshot().ingestBusy).toBe(false);
+			expect(store.getSnapshot().ingestPhase).toBeNull();
+		});
+
+		it("is a no-op when busy + phase are unchanged", () => {
+			const store = new StatusStore({ getStatus: vi.fn() } as never);
+			store.setIngest(true, "wiki");
+			const listener = vi.fn();
+			store.onChange(listener);
+			store.setIngest(true, "wiki");
+			expect(listener).not.toHaveBeenCalled();
+		});
+
+		it("is a no-op for a redundant idle call (busy=false already idle)", () => {
+			const store = new StatusStore({ getStatus: vi.fn() } as never);
+			const listener = vi.fn();
+			store.onChange(listener);
+			store.setIngest(false, null);
+			expect(listener).not.toHaveBeenCalled();
+		});
+
+		it("is independent of workerBusy — both can be live on the snapshot at once", () => {
+			const store = new StatusStore({ getStatus: vi.fn() } as never);
+			store.setWorkerBusy(true);
+			store.setIngest(true, "graph");
+			expect(store.getSnapshot().workerBusy).toBe(true);
+			expect(store.getSnapshot().ingestBusy).toBe(true);
+			expect(store.getSnapshot().ingestPhase).toBe("graph");
+		});
+
+		it("setWorkerBusy(false) leaves the ingest state untouched (ingest has its own lock)", () => {
+			// Ingest runs under ingest.lock, not worker.lock, so toggling the
+			// summary-busy flag off must not clear a live ingest pill.
+			const store = new StatusStore({ getStatus: vi.fn() } as never);
+			store.setWorkerBusy(true);
+			store.setIngest(true, "wiki");
+			store.setWorkerBusy(false);
+			expect(store.getSnapshot().workerBusy).toBe(false);
+			expect(store.getSnapshot().ingestBusy).toBe(true);
+			expect(store.getSnapshot().ingestPhase).toBe("wiki");
+		});
 	});
 });

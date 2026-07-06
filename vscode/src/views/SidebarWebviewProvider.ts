@@ -24,7 +24,7 @@ import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSession
 import type { ActiveSessionsProvider } from "../services/ActiveSessionsProvider.js";
 import type { CommitFileInfo } from "../Types.js";
 import { flushExtensionTelemetry } from "../TelemetryActivation.js";
-import type { WorkerPhase } from "../stores/StatusStore.js";
+import type { IngestPhase } from "../stores/StatusStore.js";
 import { log } from "../util/Logger.js";
 import { ConversationDetailsPanel } from "./ConversationDetailsPanel.js";
 import { SIDEBAR_EMPTY_STRINGS } from "./SidebarEmptyMessages.js";
@@ -129,12 +129,13 @@ export interface SidebarWebviewDeps {
 			readonly severity: "info" | "error";
 		} | null;
 		/**
-		 * Returns the current post-commit worker phase from StatusStore. Pushed
-		 * to the webview as `worker:phase` so the Branch tab toolbar can show the
-		 * matching "Building knowledge wiki/graph…" label during a topic-KB ingest.
-		 * Optional so existing tests that only stub `getWorkerBusy` keep compiling.
+		 * Returns the current ingest display state from StatusStore. Pushed to the
+		 * webview as `ingest:phase` so the Branch tab toolbar can show the matching
+		 * "Building knowledge wiki/graph…" pill during a topic-KB ingest. Fully
+		 * independent of worker-busy (ingest has its own lock). Optional so existing
+		 * tests that only stub `getWorkerBusy` keep compiling.
 		 */
-		getWorkerPhase?: () => WorkerPhase;
+		getIngest?: () => { readonly busy: boolean; readonly phase: IngestPhase };
 	};
 	kbFolders?: {
 		listChildren(relPath: string): Promise<FolderNode>;
@@ -1794,13 +1795,16 @@ export class SidebarWebviewProvider
 				phase: getSyncPhase(),
 			});
 		}
-		// Worker-phase indicator (ingest). Same StatusStore change event as
-		// worker:busy; optional getter so existing stubs keep compiling.
-		const getWorkerPhase = this.deps.statusProvider.getWorkerPhase;
-		if (getWorkerPhase) {
+		// Ingest indicator. Same StatusStore change event as worker:busy; optional
+		// getter so existing stubs keep compiling. Independent of worker:busy — the
+		// ingest pill shows even when no summary (worker.lock) is running.
+		const getIngest = this.deps.statusProvider.getIngest;
+		if (getIngest) {
+			const ingest = getIngest();
 			this.postMessage({
-				type: "worker:phase",
-				phase: getWorkerPhase(),
+				type: "ingest:phase",
+				busy: ingest.busy,
+				phase: ingest.phase,
 			});
 		}
 	}

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -26,17 +26,20 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 import { getJolliMemoryDir } from "../Logger.js";
 import {
 	__resetSharedLockDirCache,
+	acquireIngestLock,
 	acquireOrphanWriteLock,
 	acquireWorkerLock,
 	DEFAULT_ORPHAN_WRITE_POLL_MS,
 	getWorkerBusyState,
-	isWorkerBlockingBusy,
+	INGEST_LOCK_FILE,
 	isWorkerLockHeld,
 	isWorkerLockStale,
 	LOCK_TIMEOUT_MS,
 	ORPHAN_WRITE_LOCK_FILE,
 	PLANS_LOCK_FILE,
+	refreshIngestLockMtime,
 	refreshWorkerLockMtime,
+	releaseIngestLock,
 	releaseOrphanWriteLock,
 	releaseWorkerLock,
 	WORKER_LOCK_FILE,
@@ -88,6 +91,7 @@ describe("Locks", () => {
 		// starts with both locks definitively unheld. `force: true` covers the
 		// usual "file does not exist" case.
 		await rm(join(tempDir, ".jolli", "jollimemory", WORKER_LOCK_FILE), { force: true });
+		await rm(join(tempDir, ".jolli", "jollimemory", INGEST_LOCK_FILE), { force: true });
 		await rm(join(tempDir, ".git", "jollimemory", ORPHAN_WRITE_LOCK_FILE), { force: true });
 		await rm(plansLockPath(tempDir), { force: true });
 	});
@@ -583,51 +587,6 @@ describe("Locks", () => {
 		});
 	});
 
-	describe("isWorkerBlockingBusy", () => {
-		async function jmDir(cwd: string): Promise<string> {
-			const dir = getJolliMemoryDir(cwd);
-			await mkdir(dir, { recursive: true });
-			return dir;
-		}
-
-		it("is false when no worker lock is held", async () => {
-			expect(await isWorkerBlockingBusy(tempDir)).toBe(false);
-		});
-
-		it("is true when the lock is held and no phase marker exists (default summary phase)", async () => {
-			const dir = await jmDir(tempDir);
-			await writeFile(join(dir, "worker.lock"), String(process.pid));
-			expect(await isWorkerBlockingBusy(tempDir)).toBe(true);
-		});
-
-		it("is false when the lock is held and a fresh ingest phase is active", async () => {
-			const dir = await jmDir(tempDir);
-			await writeFile(join(dir, "worker.lock"), String(process.pid));
-			await writeFile(join(dir, "worker-phase"), "ingest:wiki");
-			expect(await isWorkerBlockingBusy(tempDir)).toBe(false);
-		});
-
-		it("is true when the phase marker is a non-ingest value", async () => {
-			const dir = await jmDir(tempDir);
-			await writeFile(join(dir, "worker.lock"), String(process.pid));
-			await writeFile(join(dir, "worker-phase"), "summary");
-			expect(await isWorkerBlockingBusy(tempDir)).toBe(true);
-		});
-
-		it("is true when the ingest phase marker is stale (fail-safe: treated as blocking)", async () => {
-			const dir = await jmDir(tempDir);
-			// worker.lock stays fresh — only the phase marker is backdated past
-			// LOCK_TIMEOUT_MS, simulating a worker that died mid-ingest without
-			// heartbeating the marker.
-			await writeFile(join(dir, "worker.lock"), String(process.pid));
-			const phasePath = join(dir, "worker-phase");
-			await writeFile(phasePath, "ingest:wiki");
-			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
-			await utimes(phasePath, past, past);
-			expect(await isWorkerBlockingBusy(tempDir)).toBe(true);
-		});
-	});
-
 	describe("getWorkerBusyState", () => {
 		async function jmDir(cwd: string): Promise<string> {
 			const dir = getJolliMemoryDir(cwd);
@@ -639,26 +598,79 @@ describe("Locks", () => {
 			expect(await getWorkerBusyState(tempDir)).toEqual({ held: false, blocking: false });
 		});
 
-		it("returns held=true, blocking=true for a held lock with a non-ingest phase", async () => {
+		// worker.lock is held only during summary generation (ingest has its own
+		// lock), so blocking always equals held.
+		it("returns held=true, blocking=true whenever worker.lock is held", async () => {
 			const dir = await jmDir(tempDir);
 			await writeFile(join(dir, "worker.lock"), String(process.pid));
-			await writeFile(join(dir, "worker-phase"), "summary");
 			expect(await getWorkerBusyState(tempDir)).toEqual({ held: true, blocking: true });
 		});
 
-		it("returns held=true, blocking=false for a held lock in a fresh ingest phase", async () => {
+		it("treats a stale worker.lock as not held", async () => {
 			const dir = await jmDir(tempDir);
-			await writeFile(join(dir, "worker.lock"), String(process.pid));
-			await writeFile(join(dir, "worker-phase"), "ingest:wiki");
-			expect(await getWorkerBusyState(tempDir)).toEqual({ held: true, blocking: false });
+			const lockPath = join(dir, "worker.lock");
+			await writeFile(lockPath, String(process.pid));
+			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
+			await utimes(lockPath, past, past);
+			expect(await getWorkerBusyState(tempDir)).toEqual({ held: false, blocking: false });
 		});
 
-		// The whole point of the combined read: blocking can never be true while
-		// held is false (that impossible pair was reachable when the two axes were
-		// two independent lock stats).
 		it("never reports blocking=true with held=false", async () => {
 			const state = await getWorkerBusyState(tempDir);
 			expect(state.blocking && !state.held).toBe(false);
+		});
+	});
+
+	describe("ingest.lock", () => {
+		function ingestLockPath(cwd: string): string {
+			return join(cwd, ".jolli", "jollimemory", INGEST_LOCK_FILE);
+		}
+
+		it("acquires fail-fast and writes our PID", async () => {
+			expect(await acquireIngestLock(tempDir)).toBe(true);
+			const content = await readFile(ingestLockPath(tempDir), "utf-8");
+			expect(content.trim()).toBe(String(process.pid));
+		});
+
+		it("is fail-fast: a second acquire while held returns false", async () => {
+			// After we hold it (our own live PID written), a second acquire fails
+			// immediately — the PID-liveness check sees us alive, so no reclaim.
+			expect(await acquireIngestLock(tempDir)).toBe(true);
+			expect(await acquireIngestLock(tempDir)).toBe(false);
+			await releaseIngestLock(tempDir);
+		});
+
+		it("reclaims a stale ingest.lock", async () => {
+			const lockPath = ingestLockPath(tempDir);
+			await mkdir(join(tempDir, ".jolli", "jollimemory"), { recursive: true });
+			await writeFile(lockPath, "999999");
+			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
+			await utimes(lockPath, past, past);
+			expect(await acquireIngestLock(tempDir)).toBe(true);
+			expect((await readFile(lockPath, "utf-8")).trim()).toBe(String(process.pid));
+		});
+
+		it("releaseIngestLock only removes a lock we own (PID gate)", async () => {
+			const lockPath = ingestLockPath(tempDir);
+			await mkdir(join(tempDir, ".jolli", "jollimemory"), { recursive: true });
+			await writeFile(lockPath, "999999"); // foreign PID
+			await releaseIngestLock(tempDir);
+			// Not ours → left in place.
+			await expect(stat(lockPath)).resolves.toBeDefined();
+			// Ours → removed.
+			await acquireIngestLock(tempDir);
+			await releaseIngestLock(tempDir);
+			await expect(stat(lockPath)).rejects.toThrow();
+		});
+
+		it("refreshIngestLockMtime bumps mtime for a lock we own", async () => {
+			const lockPath = ingestLockPath(tempDir);
+			await acquireIngestLock(tempDir);
+			const past = new Date(Date.now() - 120_000);
+			await utimes(lockPath, past, past);
+			await refreshIngestLockMtime(tempDir);
+			const fresh = await stat(lockPath);
+			expect(Date.now() - fresh.mtimeMs).toBeLessThan(LOCK_TIMEOUT_MS);
 		});
 	});
 });

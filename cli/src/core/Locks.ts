@@ -59,7 +59,7 @@
  * release path.
  */
 
-import { mkdir, readFile, stat } from "node:fs/promises";
+import { mkdir, stat } from "node:fs/promises";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { createLogger, getJolliMemoryDir } from "../Logger.js";
 import * as Subprocess from "../util/Subprocess.js";
@@ -90,22 +90,31 @@ function gitRevParseCommonDir(cwd: string): Promise<{ stdout: string; stderr: st
 export const WORKER_LOCK_FILE = "worker.lock";
 
 /**
- * Best-effort marker the QueueWorker writes while running a phase the UI
- * treats specially (currently only `ingest`). Lives next to `worker.lock` in
- * `<cwd>/.jolli/jollimemory/`. It is NOT a lock and carries no mutual-exclusion
- * role, but it is more than cosmetic: the extension's worker-busy gates
- * (`isWorkerBlockingBusy` in vscode LockUtils) exempt Commit/Squash from
- * blocking while the marker reads `ingest`, so a wrongly-surviving marker
- * under-protects. Three mechanisms bound its lifetime:
- *   - reader side: the phase is ignored whenever `worker.lock` is gone/stale,
- *     and an `ingest` marker whose own mtime is stale is treated as blocking
- *     (the worker heartbeats the marker during a genuine ingest);
- *   - writer side: each commit-typed queue entry clears a leftover marker
- *     before processing (`clearLeftoverIngestMarker` in QueueWorker);
- *   - acquisition: a fresh worker removes any crash-orphaned marker right
- *     after taking `worker.lock`.
+ * Fail-fast per-worktree lock the QueueWorker holds for the duration of a
+ * topic-KB ingest (wiki render + graph build). Split out from `worker.lock`
+ * so a long ingest (minutes, mostly graph build) no longer blocks summary
+ * generation: summary drain keeps `worker.lock`, ingest runs concurrently
+ * under `ingest.lock`. Lives next to `worker.lock` at
+ * `<cwd>/.jolli/jollimemory/ingest.lock`. Heartbeated the same way (an ingest
+ * can outlast `LOCK_TIMEOUT_MS`, so its mtime must be bumped to avoid a
+ * stale-reclaim by the next worker).
  */
-export const WORKER_PHASE_FILE = "worker-phase";
+export const INGEST_LOCK_FILE = "ingest.lock";
+
+/**
+ * Purely-cosmetic phase file the QueueWorker writes while running an ingest so
+ * the VS Code sidebar can show a "Building knowledge wiki/graph…" pill. Lives
+ * next to `worker.lock` in `<cwd>/.jolli/jollimemory/`. It is NOT a lock and
+ * carries **no gate role**: since ingest no longer holds `worker.lock`, the
+ * commit/squash gates
+ * (which key off `worker.lock` alone) are already open during ingest, so this
+ * file only drives display. It holds the full sub-phase value (`ingest:wiki`
+ * while ingesting + rendering the wiki, `ingest:graph` while building the
+ * graph), is heartbeated for its lifetime, and is removed when ingest ends. A
+ * surviving file only leaves the pill up a little longer (bounded by its own
+ * mtime staleness + `ingest.lock` liveness on the reader side).
+ */
+export const INGEST_PHASE_FILE = "ingest-phase";
 export const ORPHAN_WRITE_LOCK_FILE = "orphan-write.lock";
 export const SYNC_LOCK_FILE = "sync.lock";
 export const PLANS_LOCK_FILE = "plans.lock";
@@ -260,48 +269,16 @@ export async function isWorkerLockStale(cwd?: string): Promise<boolean> {
 }
 
 /**
- * True when the `worker-phase` marker is a fresh `ingest*` phase. Mirrors the
- * vscode `LockUtils.isFreshIngestPhase`: the worker writes `ingest:wiki` /
- * `ingest:graph` (older workers: bare `ingest`) and heartbeats the marker, so a
- * stale marker is residue from a failed cleanup and is treated as NOT ingest
- * (fail-safe → the run is assumed to be a blocking summary).
- */
-async function isFreshIngestPhase(cwd?: string): Promise<boolean> {
-	const phasePath = join(getJolliMemoryDir(cwd), WORKER_PHASE_FILE);
-	try {
-		const content = await readFile(phasePath, "utf-8");
-		if (!content.trim().startsWith("ingest")) return false;
-		const phaseStat = await stat(phasePath);
-		return Date.now() - phaseStat.mtimeMs < LOCK_TIMEOUT_MS;
-	} catch {
-		return false;
-	}
-}
-
-/**
- * True only when the worker is busy with a phase that generates memory
- * summaries — i.e. `worker.lock` is held AND the current phase is not a fresh
- * ingest (wiki/graph) phase. Callers waiting on "is a summary still being
- * written?" use this, not `isWorkerLockHeld`, so they never block on Memory
- * Bank wiki/graph rendering. CLI analogue of vscode `LockUtils.isWorkerBlockingBusy`.
- */
-export async function isWorkerBlockingBusy(cwd?: string): Promise<boolean> {
-	if (!(await isWorkerLockHeld(cwd))) return false;
-	return !(await isFreshIngestPhase(cwd));
-}
-
-/**
- * Reads both worker-busy axes with `held` gating `blocking` — `blocking` is only
- * computed when `held` is true, so the two can never contradict each other.
- * Callers that need both (e.g. `getQueueStatus`) must use this rather than calling
- * `isWorkerLockHeld` and `isWorkerBlockingBusy` separately — those evaluate the
- * lock independently, and a cross-process lock release between them can interleave
- * into the impossible pair `held=false, blocking=true`.
+ * Reads the worker-busy state. `worker.lock` is held ONLY during summary
+ * generation (ingest has its own `ingest.lock`), so "blocking" (a summary is in
+ * flight, callers should wait) is exactly "held" — ingest can never make this
+ * report blocking. Kept as a single atomic read (rather than inlining
+ * `isWorkerLockHeld` at call sites) so the `held`/`blocking` pair is always
+ * self-consistent.
  */
 export async function getWorkerBusyState(cwd?: string): Promise<{ held: boolean; blocking: boolean }> {
 	const held = await isWorkerLockHeld(cwd);
-	if (!held) return { held: false, blocking: false };
-	return { held, blocking: !(await isFreshIngestPhase(cwd)) };
+	return { held, blocking: held };
 }
 
 /**
@@ -317,6 +294,37 @@ export async function getWorkerBusyState(cwd?: string): Promise<{ held: boolean;
 export async function refreshWorkerLockMtime(cwd?: string): Promise<void> {
 	const dir = getJolliMemoryDir(cwd);
 	await refreshLockMtime(join(dir, WORKER_LOCK_FILE));
+}
+
+/**
+ * Acquires `ingest.lock`. Fail-fast: returns false immediately when another
+ * worker already holds it, so only one ingest runs per worktree at a time.
+ * Mirrors `acquireWorkerLock` — per-worktree, since ingest is a worktree-local
+ * operation (same rationale as `worker.lock`).
+ */
+export async function acquireIngestLock(cwd?: string): Promise<boolean> {
+	const dir = await ensureWorktreeLockDir(cwd);
+	return tryAcquireOnce(join(dir, INGEST_LOCK_FILE));
+}
+
+/**
+ * Releases `ingest.lock` — only if the lock file's PID matches us (see
+ * `releaseWorkerLock` for the stale-reclaim rationale).
+ */
+export async function releaseIngestLock(cwd?: string): Promise<void> {
+	const dir = getJolliMemoryDir(cwd);
+	await releaseIfOwned(join(dir, INGEST_LOCK_FILE), INGEST_LOCK_FILE);
+}
+
+/**
+ * Bumps `ingest.lock`'s mtime so a long ingest (wiki + graph build can run for
+ * minutes) is not stolen by the stale-lock reclaimer. The worker calls this on
+ * a periodic timer for the duration of the ingest. Skips the bump when a
+ * different PID owns the lock (same guard as `refreshWorkerLockMtime`).
+ */
+export async function refreshIngestLockMtime(cwd?: string): Promise<void> {
+	const dir = getJolliMemoryDir(cwd);
+	await refreshLockMtime(join(dir, INGEST_LOCK_FILE));
 }
 
 /**

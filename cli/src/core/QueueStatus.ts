@@ -4,8 +4,10 @@
  *
  * `drained` is decided by two axes only: (1) no non-ingest queue entries remain,
  * and (2) the worker is not blocking-busy (not mid-summary). Wiki/graph ingest
- * entries and the ingest worker phase are intentionally excluded so the PR-wait
- * path never blocks on Memory Bank wiki rendering. The other fields are
+ * entries are intentionally excluded so the PR-wait path never blocks on Memory
+ * Bank wiki rendering — and because ingest runs under its own `ingest.lock`,
+ * `worker.lock` is held only during summary, so this exclusion is now automatic
+ * (ingest simply doesn't touch `worker.lock`). The other fields are
  * informational (debugging / progress messaging).
  */
 
@@ -17,9 +19,9 @@ export interface QueueStatus {
 	active: number;
 	/** Non-stale ingest (wiki/graph) entries — informational. */
 	ingestActive: number;
-	/** worker.lock held, any phase — informational. */
+	/** worker.lock held — informational. */
 	workerBusy: boolean;
-	/** worker.lock held AND not a fresh ingest phase (a summary is in flight). */
+	/** worker.lock held (a summary is in flight). Equals `workerBusy`. */
 	workerBlocking: boolean;
 	/** active === 0 && !workerBlocking. */
 	drained: boolean;

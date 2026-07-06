@@ -407,12 +407,12 @@ vi.mock("../services/PrCommentService.js", () => ({
 	wrapWithMarkers: (s: string) => `[MARKERS]${s}[/MARKERS]`,
 }));
 
-const { mockIsWorkerBlockingBusy } = vi.hoisted(() => ({
-	mockIsWorkerBlockingBusy: vi.fn().mockResolvedValue(false),
+const { mockIsWorkerBusy } = vi.hoisted(() => ({
+	mockIsWorkerBusy: vi.fn().mockResolvedValue(false),
 }));
 
 vi.mock("../util/LockUtils.js", () => ({
-	isWorkerBlockingBusy: mockIsWorkerBlockingBusy,
+	isWorkerBusy: mockIsWorkerBusy,
 }));
 
 const { mockLoadBranchSummaries } = vi.hoisted(() => ({
@@ -4006,7 +4006,7 @@ describe("SummaryWebviewPanel", () => {
 			});
 
 			it("worker-busy: shows warning + re-runs handleCheckPrStatus to reset the button", async () => {
-				mockIsWorkerBlockingBusy.mockResolvedValueOnce(true);
+				mockIsWorkerBusy.mockResolvedValueOnce(true);
 				const dispatch = await setupPanel();
 
 				dispatch({ command: "prepareCreatePr" });
@@ -4240,7 +4240,7 @@ describe("SummaryWebviewPanel", () => {
 			});
 
 			it("worker-busy: shows warning + re-runs handleCheckPrStatus to reset the button", async () => {
-				mockIsWorkerBlockingBusy.mockResolvedValueOnce(true);
+				mockIsWorkerBusy.mockResolvedValueOnce(true);
 				const dispatch = await setupPanel();
 
 				dispatch({ command: "prepareUpdatePr" });
@@ -11925,7 +11925,7 @@ describe("SummaryWebviewPanel", () => {
 				// Worker busy → handleWorkerBusyOrContinue runs the PR status re-check,
 				// which for a foreign panel passes foreignRepoUrl (the truthy arm of
 				// `this.foreignRepoName ? this.foreignRepoUrl : null`).
-				mockIsWorkerBlockingBusy.mockResolvedValueOnce(true);
+				mockIsWorkerBusy.mockResolvedValueOnce(true);
 				// Reset (not just clear): an earlier test sets a persistent
 				// mockRejectedValue on this mock, which clearMocks does not undo.
 				mockHandleCheckPrStatus.mockReset();
