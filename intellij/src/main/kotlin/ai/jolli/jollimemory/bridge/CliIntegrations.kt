@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.bridge
 
+import com.google.gson.JsonParser
 import ai.jolli.jollimemory.core.JmLogger
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -122,6 +123,44 @@ object CliIntegrations {
     internal fun integrationsUpToDate(distDir: File): Boolean {
         val stamp = File(distDir, ".version")
         return File(distDir, "Cli.js").exists() && stamp.exists() && stamp.readText().trim() == readPluginVersion()
+    }
+
+    /**
+     * True when `<projectDir>/.mcp.json` registers the jollimemory MCP server at a
+     * command that can no longer be spawned — specifically the Windows form
+     * `node <abs Cli.js>` whose Cli.js no longer exists on disk. That happens when the
+     * dist that won dist-path selection at registration time was later removed (e.g. a
+     * VS Code extension uninstall) and nothing re-registered since, leaving a dead
+     * `.mcp.json` the AI host fails to launch.
+     *
+     * The version stamp alone can't catch this: the registration goes stale from an
+     * environment change (another surface uninstalled), not a plugin-version change, so
+     * [integrationsUpToDate] stays true and startup would otherwise never re-register.
+     * Used as an extra re-enable trigger alongside the version gate — one healing
+     * re-enable re-resolves `.mcp.json` to a live dist (the CLI also prunes the ghost
+     * dist-paths entry as part of that enable).
+     *
+     * The POSIX form registers the `run-cli` dispatch script (indirection that
+     * re-resolves at spawn time and never goes stale), so this only fires on the
+     * baked-absolute-path Windows form. Pure file I/O — no node — so it's cheap on every
+     * startup. Returns false when there is no `.mcp.json`, no jollimemory entry, the
+     * entry isn't the `node <Cli.js>` form, or its Cli.js still exists.
+     */
+    fun mcpRegistrationStale(projectDir: String): Boolean {
+        val f = File(projectDir, ".mcp.json")
+        if (!f.exists()) return false
+        return try {
+            val root = JsonParser.parseString(f.readText(Charsets.UTF_8)).asJsonObject
+            val server = root.getAsJsonObject("mcpServers")?.getAsJsonObject("jollimemory") ?: return false
+            val command = server.get("command")?.asString ?: return false
+            // POSIX form uses the run-cli dispatch script (never stales); only the Windows
+            // `node <Cli.js>` form bakes an absolute path that can point at a removed dist.
+            if (!command.equals("node", ignoreCase = true)) return false
+            val cliJs = server.getAsJsonArray("args")?.firstOrNull()?.asString ?: return false
+            !File(cliJs).exists()
+        } catch (_: Exception) {
+            false
+        }
     }
 
     /** Records a successful enable by stamping the current plugin version. */

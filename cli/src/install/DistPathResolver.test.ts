@@ -8,6 +8,7 @@ import {
 	deriveSourceTag,
 	migrateLegacyDistPath,
 	pickBestDistPath,
+	pruneStaleDistPaths,
 	readDistPathInfo,
 	resolveDistPath,
 	traverseDistPaths,
@@ -287,6 +288,44 @@ describe("DistPathResolver", () => {
 			await writeFile(join(distPaths, "broken"), "single-line", "utf-8");
 
 			expect(traverseDistPaths(tempDir)).toEqual([]);
+		});
+	});
+
+	// ── pruneStaleDistPaths ──────────────────────────────────────────────
+
+	describe("pruneStaleDistPaths", () => {
+		it("should remove only entries whose dist dir is missing, keeping live ones", async () => {
+			const distPaths = join(tempDir, "dist-paths");
+			await mkdir(distPaths, { recursive: true });
+
+			// Live source: dist dir exists → must survive.
+			const liveDist = join(tempDir, "intellij-dist");
+			await mkdir(liveDist, { recursive: true });
+			await writeFile(join(distPaths, "intellij"), `0.99.4\n${liveDist}`, "utf-8");
+
+			// Ghost source: dist dir removed (e.g. uninstalled VS Code extension) → must go.
+			await writeFile(join(distPaths, "vscode"), "0.99.4\n/gone/extensions/jolli/dist", "utf-8");
+
+			const pruned = await pruneStaleDistPaths(tempDir);
+
+			expect(pruned).toEqual(["vscode"]);
+			const remaining = traverseDistPaths(tempDir);
+			expect(remaining.map((e) => e.source)).toEqual(["intellij"]);
+		});
+
+		it("should return [] when every entry is available", async () => {
+			const distPaths = join(tempDir, "dist-paths");
+			await mkdir(distPaths, { recursive: true });
+			const cliDist = join(tempDir, "cli-dist");
+			await mkdir(cliDist, { recursive: true });
+			await writeFile(join(distPaths, "cli"), `0.99.3\n${cliDist}`, "utf-8");
+
+			expect(await pruneStaleDistPaths(tempDir)).toEqual([]);
+			expect(traverseDistPaths(tempDir).map((e) => e.source)).toEqual(["cli"]);
+		});
+
+		it("should return [] when dist-paths/ directory does not exist", async () => {
+			expect(await pruneStaleDistPaths(tempDir)).toEqual([]);
 		});
 	});
 

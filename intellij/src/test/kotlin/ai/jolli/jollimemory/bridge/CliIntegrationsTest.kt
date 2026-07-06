@@ -90,4 +90,54 @@ class CliIntegrationsTest {
         CliIntegrations.clearIntegrationsEnabled(tempDir) // e.g. a later failure
         CliIntegrations.integrationsUpToDate(tempDir) shouldBe false // retries again
     }
+
+    // ── mcpRegistrationStale — self-heal trigger for a dead .mcp.json ──────
+    // Regression guard for the bug where .mcp.json's jollimemory entry pointed at a
+    // `node <Cli.js>` under a removed VS Code extension dist. The version stamp stayed
+    // current (env change, not a plugin upgrade), so startup never re-registered.
+
+    @Test
+    fun `mcpRegistrationStale false when there is no mcp json`() {
+        CliIntegrations.mcpRegistrationStale(tempDir.absolutePath) shouldBe false
+    }
+
+    @Test
+    fun `mcpRegistrationStale true when node Cli js path no longer exists`() {
+        val gone = File(tempDir, "removed-extension/dist/Cli.js").absolutePath.replace("\\", "/")
+        File(tempDir, ".mcp.json").writeText(
+            """{"mcpServers":{"jollimemory":{"command":"node","args":["$gone","mcp"]}}}""",
+        )
+        CliIntegrations.mcpRegistrationStale(tempDir.absolutePath) shouldBe true
+    }
+
+    @Test
+    fun `mcpRegistrationStale false when the node Cli js still exists`() {
+        val cliJs = File(tempDir, "dist/Cli.js").apply { parentFile.mkdirs(); writeText("bundle") }
+        File(tempDir, ".mcp.json").writeText(
+            """{"mcpServers":{"jollimemory":{"command":"node","args":["${cliJs.absolutePath.replace("\\", "/")}","mcp"]}}}""",
+        )
+        CliIntegrations.mcpRegistrationStale(tempDir.absolutePath) shouldBe false
+    }
+
+    @Test
+    fun `mcpRegistrationStale false for the POSIX run-cli indirection form`() {
+        // The run-cli dispatch form re-resolves at spawn time and never goes stale, so a
+        // non-node command is always treated as healthy regardless of whether it exists.
+        File(tempDir, ".mcp.json").writeText(
+            """{"mcpServers":{"jollimemory":{"command":"/home/u/.jolli/jollimemory/run-cli","args":["mcp"]}}}""",
+        )
+        CliIntegrations.mcpRegistrationStale(tempDir.absolutePath) shouldBe false
+    }
+
+    @Test
+    fun `mcpRegistrationStale false when there is no jollimemory entry`() {
+        File(tempDir, ".mcp.json").writeText("""{"mcpServers":{"other":{"command":"node","args":["x"]}}}""")
+        CliIntegrations.mcpRegistrationStale(tempDir.absolutePath) shouldBe false
+    }
+
+    @Test
+    fun `mcpRegistrationStale false on malformed json`() {
+        File(tempDir, ".mcp.json").writeText("{ not json")
+        CliIntegrations.mcpRegistrationStale(tempDir.absolutePath) shouldBe false
+    }
 }
