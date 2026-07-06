@@ -1,7 +1,21 @@
-import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+// Spy on readFile so a single test can simulate a non-ENOENT read failure (EACCES)
+// deterministically on every platform. Default passes through to the real impl.
+// (chmod(0o000) can't make a file unreadable on Windows — it only sets read-only,
+// which leaves reads working and instead fails the later write.)
+const { mockReadFile } = vi.hoisted(() => ({
+	mockReadFile: vi.fn<typeof import("node:fs/promises").readFile>(),
+}));
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const original = await importOriginal<typeof import("node:fs/promises")>();
+	mockReadFile.mockImplementation(original.readFile);
+	return { ...original, readFile: mockReadFile };
+});
+
 import { removeCodexMcpServer, upsertCodexMcpServer } from "./CodexTomlWriter.js";
 
 const entry = { command: "/h/.jolli/jollimemory/run-cli", args: ["mcp"] };
@@ -44,14 +58,11 @@ describe("CodexTomlWriter", () => {
 	it("upsertCodexMcpServer skips and warns when file exists but is unreadable (non-ENOENT)", async () => {
 		const p = join(await mkdtemp(join(tmpdir(), "c-")), "config.toml");
 		await writeFile(p, 'model = "o4"\n', "utf-8");
-		await chmod(p, 0o000);
-		try {
-			await upsertCodexMcpServer(p, entry);
-			// file should be untouched (chmod 000 means we cannot write either)
-		} finally {
-			await chmod(p, 0o644);
-		}
-		const t = await readFile(p, "utf-8");
+		// Simulate an unreadable-but-present file (EACCES). The writer must skip rather
+		// than treat it like ENOENT and clobber the user's other Codex config.
+		mockReadFile.mockRejectedValueOnce(Object.assign(new Error("EACCES"), { code: "EACCES" }));
+		await upsertCodexMcpServer(p, entry);
+		const t = await readFile(p, "utf-8"); // passthrough (real impl) — file untouched
 		expect(t).toBe('model = "o4"\n');
 	});
 	it("removeCodexMcpServer is a no-op when file is absent", async () => {

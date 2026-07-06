@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -158,13 +159,13 @@ beforeEach(() => {
 
 describe("CreatePrWebviewPanel", () => {
 	it("opens a panel and renders the Create PR HTML", async () => {
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		expect(created).toHaveLength(1);
 		expect(created[0].webview.html).toContain("Create Pull Request");
 	});
 
 	it("createPr message routes to handleCreatePr with title+wrapped body", async () => {
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "createPr" });
 		await Promise.resolve(); await Promise.resolve();
 		expect(mocks.handleCreatePr).toHaveBeenCalledTimes(1);
@@ -185,7 +186,7 @@ describe("CreatePrWebviewPanel", () => {
 				postFn({ command: "prCreated", prUrl: "https://github.com/example/1" });
 			},
 		);
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "createPr" });
 		await Promise.resolve(); await Promise.resolve();
 		expect(created[0].webview.postMessage).toHaveBeenCalledWith(
@@ -194,7 +195,7 @@ describe("CreatePrWebviewPanel", () => {
 	});
 
 	it("createPr with edited title/body overrides the drafted values", async () => {
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "createPr", title: "edited title", body: "edited body" });
 		await Promise.resolve(); await Promise.resolve();
 		expect(mocks.handleCreatePr.mock.calls[0][0]).toBe("edited title");
@@ -203,15 +204,15 @@ describe("CreatePrWebviewPanel", () => {
 
 	it("copyBody writes the wrapped markdown to the clipboard", async () => {
 		const vscode = await import("vscode");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "copyBody" });
 		await Promise.resolve();
 		expect((vscode.env.clipboard.writeText as ReturnType<typeof vi.fn>)).toHaveBeenCalled();
 	});
 
 	it("is a singleton — second show reveals, not re-creates", async () => {
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		expect(created).toHaveLength(1);
 		expect(created[0].reveal).toHaveBeenCalled();
 	});
@@ -219,7 +220,7 @@ describe("CreatePrWebviewPanel", () => {
 	it("worker-busy guard: shows toast and skips handleCreatePr when worker is blocking", async () => {
 		mocks.isWorkerBlockingBusy.mockResolvedValue(true);
 		const vscode = await import("vscode");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "createPr" });
 		await Promise.resolve(); await Promise.resolve();
 		expect(mocks.handleCreatePr).not.toHaveBeenCalled();
@@ -232,7 +233,7 @@ describe("CreatePrWebviewPanel", () => {
 	it("worker-busy guard: update path also posts a settling message (buttons re-enable)", async () => {
 		mocks.findOpenPrForBranch.mockResolvedValueOnce({ number: 7, url: "https://gh/pr/7" });
 		mocks.isWorkerBlockingBusy.mockResolvedValue(true);
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "createPr" });
 		await Promise.resolve(); await Promise.resolve();
 		expect(mocks.handleUpdatePrWithPush).not.toHaveBeenCalled();
@@ -243,14 +244,14 @@ describe("CreatePrWebviewPanel", () => {
 	it("empty guard: shows info message and does NOT open panel when VM is empty", async () => {
 		mocks.buildCreatePrViewModel.mockResolvedValueOnce({ empty: true });
 		const vscode = await import("vscode");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		expect(created).toHaveLength(0);
 		expect(vscode.window.showInformationMessage).toHaveBeenCalled();
 	});
 
 	it("openMemory: executes jollimemory.viewMemorySummary with the message hash", async () => {
 		const vscode = await import("vscode");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "openMemory", hash: "abc123def456" });
 		await Promise.resolve();
 		expect(vscode.commands.executeCommand).toHaveBeenCalledWith(
@@ -262,7 +263,7 @@ describe("CreatePrWebviewPanel", () => {
 	it("openDiff: opens a base..HEAD diff (base + HEAD virtual URIs) for the given path", async () => {
 		const vscode = await import("vscode");
 		(bridge as { getBranchDiffBase: ReturnType<typeof vi.fn> }).getBranchDiffBase.mockResolvedValueOnce("basehash");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "openDiff", path: "vscode/src/a.ts" });
 		for (let i = 0; i < 5; i++) await Promise.resolve();
 		expect(vscode.commands.executeCommand).toHaveBeenCalledWith(
@@ -279,7 +280,7 @@ describe("CreatePrWebviewPanel", () => {
 	it("openDiff: reads the base (left) side from oldPath for a rename, HEAD (right) from the new path", async () => {
 		const vscode = await import("vscode");
 		(bridge as { getBranchDiffBase: ReturnType<typeof vi.fn> }).getBranchDiffBase.mockResolvedValueOnce("basehash");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "openDiff", path: "vscode/src/new.ts", oldPath: "vscode/src/old.ts" });
 		for (let i = 0; i < 5; i++) await Promise.resolve();
 		expect(vscode.commands.executeCommand).toHaveBeenCalledWith(
@@ -295,7 +296,7 @@ describe("CreatePrWebviewPanel", () => {
 		const vscode = await import("vscode");
 		const logMod = await import("../util/Logger.js");
 		// No getBranchDiffBase mock: the traversal guard rejects before it is reached.
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "openDiff", path: "vscode/src/new.ts", oldPath: "../../etc/passwd" });
 		for (let i = 0; i < 10; i++) await Promise.resolve();
 		expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith(
@@ -313,7 +314,7 @@ describe("CreatePrWebviewPanel", () => {
 	it("registers a jolli-prdiff content provider whose reader delegates to bridge.readFileAtRef", async () => {
 		const vscode = await import("vscode");
 		(bridge as { readFileAtRef: ReturnType<typeof vi.fn> }).readFileAtRef.mockResolvedValueOnce("BODY");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		const reg = vscode.workspace.registerTextDocumentContentProvider as ReturnType<typeof vi.fn>;
 		const [scheme, provider] = reg.mock.calls[0] as [string, { provideTextDocumentContent: (u: unknown) => Promise<string> }];
 		expect(scheme).toBe("jolli-prdiff");
@@ -325,13 +326,16 @@ describe("CreatePrWebviewPanel", () => {
 	it("openDiff: falls back to opening the working-tree file when no diff base resolves", async () => {
 		const vscode = await import("vscode");
 		(bridge as { getBranchDiffBase: ReturnType<typeof vi.fn> }).getBranchDiffBase.mockResolvedValueOnce(undefined);
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		// Resolve the workspace root against the host so path.resolve/isPathInside behave
+		// identically on POSIX and Windows (a bare "/repo" is drive-qualified by resolve()).
+		const root = resolve("/repo");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, root, bridge, "main");
 		created[0].onMsg({ command: "openDiff", path: "vscode/src/a.ts" });
 		for (let i = 0; i < 5; i++) await Promise.resolve();
 		expect(vscode.commands.executeCommand).toHaveBeenCalledWith(
 			"vscode.open",
-			// Repo-relative path resolved against the workspace root ("/repo").
-			expect.objectContaining({ fsPath: "/repo/vscode/src/a.ts" }),
+			// Repo-relative path resolved against the workspace root.
+			expect.objectContaining({ fsPath: resolve(root, "vscode/src/a.ts") }),
 		);
 		expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("vscode.diff", expect.anything(), expect.anything(), expect.anything());
 	});
@@ -339,7 +343,7 @@ describe("CreatePrWebviewPanel", () => {
 	it("openDiff: rejects a path that escapes the workspace via ../ and never opens it", async () => {
 		const vscode = await import("vscode");
 		const logMod = await import("../util/Logger.js");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "openDiff", path: "../../etc/passwd" });
 		for (let i = 0; i < 10; i++) await Promise.resolve();
 		expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith(
@@ -357,7 +361,7 @@ describe("CreatePrWebviewPanel", () => {
 
 	it("openDiff: rejects an absolute path outside the workspace", async () => {
 		const vscode = await import("vscode");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "openDiff", path: "/etc/passwd" });
 		for (let i = 0; i < 10; i++) await Promise.resolve();
 		expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("vscode.open", expect.anything());
@@ -376,7 +380,7 @@ describe("CreatePrWebviewPanel", () => {
 		(vscode.commands.executeCommand as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
 			new Error("diff failed"),
 		);
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "openDiff", path: "missing/file.ts" });
 		// Drain all microtasks until the rejection handler has run.
 		for (let i = 0; i < 10; i++) await Promise.resolve();
@@ -401,7 +405,7 @@ describe("CreatePrWebviewPanel", () => {
 		(vscode.commands.executeCommand as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
 			"permission denied",
 		);
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "openDiff", path: "another/file.ts" });
 		for (let i = 0; i < 10; i++) await Promise.resolve();
 		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
@@ -444,7 +448,7 @@ describe("CreatePrWebviewPanel", () => {
 
 	it("update mode: when an open PR exists, the panel renders Update PR and routes to handleUpdatePrWithPush", async () => {
 		mocks.findOpenPrForBranch.mockResolvedValueOnce({ number: 7, url: "https://gh/pr/7" });
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		expect(created[0].webview.html).toContain("Update Pull Request");
 		expect(created[0].webview.html).toContain("PR #7");
 
@@ -456,7 +460,7 @@ describe("CreatePrWebviewPanel", () => {
 
 	it("create mode (no open PR): routes to handleCreatePr, not handleUpdatePrWithPush", async () => {
 		mocks.findOpenPrForBranch.mockResolvedValueOnce(undefined);
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "createPr" });
 		await Promise.resolve(); await Promise.resolve();
 		expect(mocks.handleCreatePr).toHaveBeenCalledTimes(1);
@@ -466,7 +470,7 @@ describe("CreatePrWebviewPanel", () => {
 	it("existing-PR lookup failure: logs a warning and falls back to create mode", async () => {
 		const logMod = await import("../util/Logger.js");
 		mocks.findOpenPrForBranch.mockRejectedValueOnce(new Error("gh not installed"));
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		expect(created[0].webview.html).toContain("Create Pull Request");
 		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
 			"CreatePrPanel",
@@ -521,7 +525,7 @@ describe("CreatePrWebviewPanel", () => {
 		// Reject with a plain string (not an Error) to cover the String(e) arm of
 		// the `e instanceof Error ? e.message : String(e)` ternary.
 		mocks.findOpenPrForBranch.mockRejectedValueOnce("gh exploded");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		expect(created[0].webview.html).toContain("Create Pull Request");
 		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
 			"CreatePrPanel",
@@ -531,7 +535,7 @@ describe("CreatePrWebviewPanel", () => {
 
 	it("openPr: opens the PR url externally", async () => {
 		const vscode = await import("vscode");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "openPr", url: "https://gh/pr/7" });
 		await Promise.resolve();
 		expect(vscode.env.openExternal).toHaveBeenCalled();
@@ -540,7 +544,7 @@ describe("CreatePrWebviewPanel", () => {
 	it("openPr: rejects a non-http(s) scheme (file:) and never opens it", async () => {
 		const vscode = await import("vscode");
 		const logMod = await import("../util/Logger.js");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "openPr", url: "file:///etc/passwd" });
 		for (let i = 0; i < 5; i++) await Promise.resolve();
 		expect(vscode.env.openExternal).not.toHaveBeenCalled();
@@ -560,7 +564,7 @@ describe("CreatePrWebviewPanel", () => {
 			releaseFirst = () => resolve();
 		});
 		mocks.handleCreatePr.mockReturnValueOnce(pending);
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "createPr" });
 		created[0].onMsg({ command: "createPr" });
 		for (let i = 0; i < 10; i++) await Promise.resolve();
@@ -576,7 +580,7 @@ describe("CreatePrWebviewPanel", () => {
 
 	it("signIn message: executes the jollimemory.signIn command", async () => {
 		const vscode = await import("vscode");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "signIn" });
 		await Promise.resolve();
 		expect(vscode.commands.executeCommand).toHaveBeenCalledWith("jollimemory.signIn");
@@ -591,13 +595,13 @@ describe("CreatePrWebviewPanel", () => {
 	});
 
 	it("signedIn defaults to false: renders the Sign In link (signed-in variant hidden)", async () => {
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		expect(created[0].webview.html).toContain('id="pr-signin-link"');
 		expect(created[0].webview.html).toContain('class="share-signed-in hidden"');
 	});
 
 	it("notifyAuthChanged: posts an authChanged message to the open panel", async () => {
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		CreatePrWebviewPanel.notifyAuthChanged(true);
 		expect(created[0].webview.postMessage).toHaveBeenCalledWith({
 			command: "authChanged",
@@ -612,12 +616,12 @@ describe("CreatePrWebviewPanel", () => {
 	});
 
 	it("onDidDispose: clears the singleton so the next show() creates a new panel", async () => {
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		expect(created).toHaveLength(1);
 		// Simulate VS Code disposing the panel (e.g. user closes the tab).
 		created[0].onDispose();
 		// Now show() must create a fresh panel, not reveal the disposed one.
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		expect(created).toHaveLength(2);
 	});
 });
