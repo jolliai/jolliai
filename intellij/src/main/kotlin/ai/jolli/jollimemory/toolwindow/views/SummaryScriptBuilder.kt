@@ -123,6 +123,14 @@ object SummaryScriptBuilder {
     });
   }
 
+  // Create share link button — opens the native share dialog.
+  var shareBtn = document.getElementById('shareLinkBtn');
+  if (shareBtn) {
+    shareBtn.addEventListener('click', function() {
+      jmSend({ command: 'shareMemory' });
+    });
+  }
+
 ${buildPrSectionScript()}
 
   // Listen for messages from the IDE (push + topic edit status updates)

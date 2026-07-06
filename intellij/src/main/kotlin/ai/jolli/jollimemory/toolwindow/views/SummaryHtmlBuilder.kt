@@ -71,7 +71,7 @@ object SummaryHtmlBuilder {
 <style>${SummaryCssBuilder.buildCss(isDark)}${if (readOnly) """
 /* Read-only mode: hide all write-action buttons but keep Copy Markdown */
 .topic-action-btn, .associate-plan-btn, .plan-actions,
-#pushJolliBtn, #generateE2eBtn, #editE2eBtn, #regenE2eBtn, #deleteE2eBtn,
+#pushJolliBtn, #shareLinkBtn, #generateE2eBtn, #editE2eBtn, #regenE2eBtn, #deleteE2eBtn,
 #generateRecapBtn, #editRecapBtn, #regenerateRecapBtn,
 #openTranscriptsBtn, #deleteTranscriptsBtn,
 .pr-section, .topic-card .topic-actions { display: none !important; }
@@ -521,6 +521,7 @@ $listItems
     ${buildJolliRow(summary.jolliDocUrl, summary.commitMessage, summary.plans)}
     <div class="ship-actions">
       <button class="action-btn primary" id="pushJolliBtn">$pushLabel</button>
+      <button class="action-btn" id="shareLinkBtn" title="Create a read-only share link">&#x1F517; Share link</button>
     </div>
   </div>
 </div>"""

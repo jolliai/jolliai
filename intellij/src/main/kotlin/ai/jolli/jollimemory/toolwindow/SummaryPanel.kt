@@ -286,6 +286,7 @@ class SummaryPanel(
                 "editState" -> webviewDirty = json.get("editing")?.asBoolean == true
                 "copyMarkdown" -> handleCopyMarkdown()
                 "pushToJolli" -> handlePushToJolli()
+                "shareMemory" -> ShareLauncher.openForCommit(project, currentSummary)
                 "editTopic" -> handleEditTopic(json.get("topicIndex").asInt, json.getAsJsonObject("updates"))
                 "deleteTopic" -> handleDeleteTopic(json.get("topicIndex").asInt, json.get("title")?.asString)
                 "generateE2eTest" -> handleGenerateE2eTest()

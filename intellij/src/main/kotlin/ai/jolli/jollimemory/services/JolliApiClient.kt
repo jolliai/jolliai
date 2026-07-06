@@ -512,6 +512,246 @@ object JolliApiClient {
         }
     }
 
+    // ── Branch share (live, Space-backed) endpoints ─────────────────────────
+    // Kotlin port of vscode/src/services/JolliShareService.ts (live-share ops).
+    // These target /api/share/branch and reference live Space docs (a `covered`
+    // allowlist via LiveRef) instead of a frozen content blob. Auth is the same
+    // Bearer + x-jolli-client + x-tenant-slug/x-org-slug + trace scheme as push.
+
+    /** Thrown when a share has been revoked or expired (HTTP 410 / `revoked: true`). */
+    class ShareRevokedError(message: String = "This share has been stopped.") : RuntimeException(message)
+
+    /** Body posted to create a live share. No `content` blob — references live docs via [ref]. */
+    data class LiveSharePayload(
+        val repoUrl: String,
+        val repoName: String,
+        val branch: String,
+        /** "branch" | "commit" */
+        val kind: String,
+        /** "public" | "org" | "people" */
+        val visibility: String,
+        val decisionCount: Int,
+        /** Still sent: backs the NOT-NULL columns + the server's idempotency indexes. */
+        val headCommitHash: String,
+        val commitHashes: List<String>,
+        /** Display slug — distinct from the push folder identity in [ref]. */
+        val branchSlug: String? = null,
+        val ref: ai.jolli.jollimemory.core.BranchShareStore.LiveRef,
+        /** `people` access allowlist (lowercased emails). Omit for public/org. */
+        val recipients: List<String>? = null,
+    )
+
+    /** Response from creating a live share. `token` is absent for `org`/`people` shares. */
+    data class LiveShareResult(
+        val shareId: String,
+        val shareUrl: String,
+        val expiresAt: String,
+        /** "public" | "org" | "people" */
+        val visibility: String,
+        val token: String? = null,
+        /** Server-confirmed `people` allowlist (echoed back). */
+        val recipients: List<String>? = null,
+    )
+
+    /** Patch for a live share update — any subset may be sent; server echoes only changed fields. */
+    data class LiveSharePatch(
+        val visibility: String? = null,
+        val expiresAt: String? = null,
+        val ref: ai.jolli.jollimemory.core.BranchShareStore.LiveRef? = null,
+        val recipients: List<String>? = null,
+    )
+
+    /** Partial result from a live-share PATCH — any field may be absent (link unchanged, etc.). */
+    data class LiveShareUpdateResult(
+        val shareId: String? = null,
+        val shareUrl: String? = null,
+        val expiresAt: String? = null,
+        val visibility: String? = null,
+        val token: String? = null,
+        val recipients: List<String>? = null,
+    )
+
+    /** Response from a successful expiry update (PATCH). */
+    data class ShareExpiryResult(
+        val shareId: String,
+        val expiresAt: String,
+    )
+
+    /** An org member offered as a recipient candidate (name + deliverable email). */
+    data class OrgMember(val name: String, val email: String)
+
+    private fun resolveShareBaseUrl(baseUrl: String?, apiKey: String): String {
+        return baseUrl ?: parseJolliApiKey(apiKey)?.u
+            ?: throw RuntimeException(
+                "Jolli site URL could not be determined. " +
+                    "Please regenerate your Jolli API Key and set it again (STATUS panel)."
+            )
+    }
+
+    /** Sends an authed request to a Jolli API path; centralizes the header + send boilerplate. */
+    private fun sendAuthed(
+        method: String,
+        resolvedBaseUrl: String,
+        apiKey: String,
+        path: String,
+        body: String?,
+        timeoutSec: Long = 60,
+    ): HttpResponse<String> {
+        val keyMeta = parseJolliApiKey(apiKey)
+        val parsed = parseBaseUrl(resolvedBaseUrl)
+        val targetUri = URI.create("${parsed.origin}$path")
+        val builder = HttpRequest.newBuilder()
+            .uri(targetUri)
+            .header("Authorization", "Bearer $apiKey")
+            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
+            .timeout(Duration.ofSeconds(timeoutSec))
+        if (body != null) builder.header("Content-Type", "application/json")
+        when (method) {
+            "POST" -> builder.POST(HttpRequest.BodyPublishers.ofString(body ?: ""))
+            "PATCH" -> builder.method("PATCH", HttpRequest.BodyPublishers.ofString(body ?: ""))
+            "DELETE" -> builder.DELETE()
+            else -> builder.GET()
+        }
+        if (parsed.tenantSlug != null) builder.header("x-tenant-slug", parsed.tenantSlug)
+        if (keyMeta?.o != null) builder.header("x-org-slug", keyMeta.o)
+        builder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
+        return client.send(builder.build(), HttpResponse.BodyHandlers.ofString())
+    }
+
+    /** Maps a non-2xx response to the right error (426 → outdated, else detail + status). */
+    private fun shareError(status: Int, json: com.google.gson.JsonObject?, raw: String): RuntimeException {
+        if (status == 426) {
+            return PluginOutdatedError(
+                json?.get("message")?.takeIf { it.isJsonPrimitive }?.asString
+                    ?: "Plugin version is outdated. Please update to the latest version."
+            )
+        }
+        val detail = listOfNotNull(
+            json?.get("error")?.takeIf { it.isJsonPrimitive }?.asString,
+            json?.get("message")?.takeIf { it.isJsonPrimitive }?.asString,
+        ).joinToString(" — ")
+        val suffix = if (json == null) ": ${raw.take(200)}" else ""
+        return RuntimeException("${detail.ifEmpty { "request failed" }} (HTTP $status)$suffix")
+    }
+
+    private fun parseObjectOrNull(raw: String): com.google.gson.JsonObject? = try {
+        if (raw.isEmpty()) null else gson.fromJson(raw, com.google.gson.JsonElement::class.java)
+            ?.takeIf { it.isJsonObject }?.asJsonObject
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun com.google.gson.JsonObject.str(key: String): String? =
+        get(key)?.takeIf { it.isJsonPrimitive }?.asString
+
+    private fun com.google.gson.JsonObject.stringList(key: String): List<String>? =
+        get(key)?.takeIf { it.isJsonArray }?.asJsonArray
+            ?.mapNotNull { it.takeIf { e -> e.isJsonPrimitive }?.asString }
+
+    /** Creates a live share. Requires `shareId` + `shareUrl`; `token` only for `public`. */
+    fun createLiveShare(baseUrl: String?, apiKey: String, payload: LiveSharePayload): LiveShareResult {
+        val resolved = resolveShareBaseUrl(baseUrl, apiKey)
+        val response = sendAuthed("POST", resolved, apiKey, "/api/share/branch", gson.toJson(payload))
+        val raw = response.body() ?: ""
+        val status = response.statusCode()
+        val json = parseObjectOrNull(raw)
+        if (status in 200..299) {
+            val shareId = json?.get("shareId")?.takeIf { it.isJsonPrimitive }?.asString
+            val shareUrl = json?.str("shareUrl")
+            if (shareId == null || shareUrl == null) {
+                throw RuntimeException(
+                    "Share endpoint returned an unexpected response (missing shareId/shareUrl). HTTP $status: ${raw.take(300)}"
+                )
+            }
+            return LiveShareResult(
+                shareId = shareId,
+                shareUrl = shareUrl,
+                expiresAt = json.str("expiresAt") ?: "",
+                visibility = json.str("visibility") ?: payload.visibility,
+                token = json.str("token"),
+                recipients = json.stringList("recipients"),
+            )
+        }
+        throw shareError(status, json, raw)
+    }
+
+    /** Updates a live share (visibility / covered ref / expiry / recipients) via PATCH. */
+    fun updateLiveShare(baseUrl: String?, apiKey: String, shareId: String, patch: LiveSharePatch): LiveShareUpdateResult {
+        val resolved = resolveShareBaseUrl(baseUrl, apiKey)
+        val path = "/api/share/branch/${java.net.URLEncoder.encode(shareId, Charsets.UTF_8)}"
+        val response = sendAuthed("PATCH", resolved, apiKey, path, gson.toJson(patch))
+        val raw = response.body() ?: ""
+        val status = response.statusCode()
+        val json = parseObjectOrNull(raw)
+        // A recipients-only / non-`public`-toggle PATCH legitimately returns NO `shareUrl`
+        // (the link didn't change), so accept any 2xx with a body — the caller falls back.
+        if (status in 200..299 && json != null) {
+            return LiveShareUpdateResult(
+                shareId = json.get("shareId")?.takeIf { it.isJsonPrimitive }?.asString,
+                shareUrl = json.str("shareUrl"),
+                expiresAt = json.str("expiresAt"),
+                visibility = json.str("visibility"),
+                token = json.str("token"),
+                recipients = json.stringList("recipients"),
+            )
+        }
+        throw shareError(status, json, raw)
+    }
+
+    /** Revokes a live share by id. 404 = already gone → idempotent success. */
+    fun revokeShare(baseUrl: String?, apiKey: String, shareId: String) {
+        val resolved = resolveShareBaseUrl(baseUrl, apiKey)
+        val path = "/api/share/branch/${java.net.URLEncoder.encode(shareId, Charsets.UTF_8)}"
+        val response = sendAuthed("DELETE", resolved, apiKey, path, null, timeoutSec = 30)
+        val status = response.statusCode()
+        if (status != 200 && status != 204 && status != 404) {
+            throw RuntimeException("Revoke failed with status $status")
+        }
+    }
+
+    /**
+     * Adjusts an existing share's expiry via `PATCH /api/share/branch/:shareId`.
+     * `expiresAt` is an absolute ISO timestamp. Returns the server-confirmed value.
+     */
+    fun updateShareExpiry(baseUrl: String?, apiKey: String, shareId: String, expiresAt: String): ShareExpiryResult {
+        val resolved = resolveShareBaseUrl(baseUrl, apiKey)
+        val path = "/api/share/branch/${java.net.URLEncoder.encode(shareId, Charsets.UTF_8)}"
+        val response = sendAuthed("PATCH", resolved, apiKey, path, gson.toJson(mapOf("expiresAt" to expiresAt)))
+        val raw = response.body() ?: ""
+        val status = response.statusCode()
+        val json = parseObjectOrNull(raw)
+        val confirmed = json?.str("expiresAt")
+        if (status in 200..299 && confirmed != null) {
+            return ShareExpiryResult(
+                shareId = json.get("shareId")?.takeIf { it.isJsonPrimitive }?.asString ?: shareId,
+                expiresAt = confirmed,
+            )
+        }
+        throw shareError(status, json, raw)
+    }
+
+    /**
+     * Lists active org members as recipient candidates (name + email), via
+     * `GET /api/jolli-memory/org-members`. Best-effort: returns [] on any error.
+     */
+    fun listOrgMembers(baseUrl: String?, apiKey: String): List<OrgMember> {
+        return try {
+            val resolved = resolveShareBaseUrl(baseUrl, apiKey)
+            val response = sendAuthed("GET", resolved, apiKey, "/api/jolli-memory/org-members", null, timeoutSec = 30)
+            val status = response.statusCode()
+            if (status !in 200..299) return emptyList()
+            val json = parseObjectOrNull(response.body() ?: "") ?: return emptyList()
+            val rows = json.get("members")?.takeIf { it.isJsonArray }?.asJsonArray ?: return emptyList()
+            rows.mapNotNull { el ->
+                val obj = el.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapNotNull null
+                val email = obj.str("email")?.trim().orEmpty()
+                if (email.isEmpty()) null else OrgMember(name = obj.str("name") ?: "", email = email)
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
     // ── Internal helpers ────────────────────────────────────────────────────
 
     /**
