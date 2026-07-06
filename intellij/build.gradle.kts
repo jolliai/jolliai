@@ -528,11 +528,14 @@ tasks {
         // unit tests in one sequential JVM by default (~20 min); separate forks give
         // full isolation (each fork has its own System.out and mockk global state, so
         // the System.out-swapping and mockkStatic/mockkObject tests can't race), unlike
-        // in-JVM JUnit parallelism. Capped to avoid oversubscribing the IDE-sandbox JVMs.
+        // in-JVM JUnit parallelism. These are plain unit tests (no IDE boot), so use ALL
+        // available cores, capped at 6 to bound heap on large dev machines. (The old
+        // `processors / 2` left CI's 4-core public runner at 2 forks — a ~20 min run;
+        // full utilization fits comfortably in the 16 GB runner and roughly halves it.)
         // Partitioning captured output per fork (vs. one shared buffer) also avoids the
         // Gradle "Could not write XML test results" failure that the serial run hit when a
         // test emitted a NUL byte that is illegal in XML 1.0. Cuts a full run to ~5 min.
-        maxParallelForks = (Runtime.getRuntime().availableProcessors() / 2).coerceIn(1, 6)
+        maxParallelForks = Runtime.getRuntime().availableProcessors().coerceIn(1, 6)
         javaLauncher.set(
             project.the<JavaToolchainService>().launcherFor {
                 languageVersion.set(JavaLanguageVersion.of(21))
