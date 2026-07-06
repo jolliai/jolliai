@@ -957,6 +957,20 @@ vi.mock("./views/SummaryWebviewPanel.js", () => ({
 	SummaryWebviewPanel: MockSummaryWebviewPanel,
 }));
 
+// /share deep-link route deps. JolliShareService is partial-mocked (other exports feed
+// the share-modal graph SummaryWebviewPanel pulls in); SharedBranchImporter is a leaf.
+const { mockExportSharedBranch, mockImportSharedBranchForDisplay } = vi.hoisted(() => ({
+	mockExportSharedBranch: vi.fn(),
+	mockImportSharedBranchForDisplay: vi.fn(),
+}));
+vi.mock("./services/JolliShareService.js", async (orig) => ({
+	...(await orig<typeof import("./services/JolliShareService.js")>()),
+	exportSharedBranch: mockExportSharedBranch,
+}));
+vi.mock("./services/SharedBranchImporter.js", () => ({
+	importSharedBranchForDisplay: mockImportSharedBranchForDisplay,
+}));
+
 vi.mock("./views/SettingsWebviewPanel.js", () => ({
 	SettingsWebviewPanel: MockSettingsWebviewPanel,
 }));
@@ -7346,6 +7360,177 @@ describe("Extension", () => {
 				expect(mockBridge.getSummary).not.toHaveBeenCalled();
 				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
 				expect(mockAuthService.handleAuthCallback).not.toHaveBeenCalled();
+			});
+		});
+
+		describe("/share route", () => {
+			function getHandler() {
+				const ctx = makeContext();
+				activate(ctx);
+				const registerUriHandler = (
+					vscode.window as unknown as { registerUriHandler: ReturnType<typeof vi.fn> }
+				).registerUriHandler;
+				return registerUriHandler.mock.calls[0]?.[0] as { handleUri: (uri: unknown) => Promise<void> };
+			}
+			const shareUri = (query: string) => ({
+				path: "/share",
+				query,
+				toString: () => `vscode://jolli.jollimemory-vscode/share?${query}`,
+			});
+
+			beforeEach(() => {
+				mockExportSharedBranch.mockReset();
+				mockImportSharedBranchForDisplay.mockReset();
+				loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-key" });
+			});
+
+			it("downloads the shared branch and renders it read-only", async () => {
+				mockExportSharedBranch.mockResolvedValue({
+					branch: "feat/x",
+					repoName: "acme/widgets",
+					repoUrl: "https://github.com/acme/widgets",
+					kind: "branch",
+					headCommitHash: "h1",
+					commits: [],
+				});
+				const storage = {};
+				mockImportSharedBranchForDisplay.mockResolvedValue({ storage, head: { commitHash: "h1" }, commitCount: 1 });
+
+				const handler = getHandler();
+				await handler.handleUri(shareUri("origin=https%3A%2F%2Facme.jolli.ai&token=tok"));
+
+				expect(mockExportSharedBranch).toHaveBeenCalledWith(undefined, "sk-jol-key", "tok");
+				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
+					{ commitHash: "h1" },
+					expect.anything(),
+					"/test/workspace",
+					expect.anything(),
+					"main",
+					"commit",
+					"acme/widgets",
+					"https://github.com/acme/widgets",
+					storage,
+				);
+			});
+
+			it("opens a normal writable local panel when the share was ingested into the current repo", async () => {
+				mockExportSharedBranch.mockResolvedValue({
+					branch: "feat/x",
+					repoName: "acme/widgets",
+					repoUrl: "https://github.com/acme/widgets",
+					kind: "branch",
+					headCommitHash: "h1",
+					commits: [],
+				});
+				const storage = {};
+				mockImportSharedBranchForDisplay.mockResolvedValue({
+					storage,
+					head: { commitHash: "h1" },
+					commitCount: 1,
+					ingestedLocally: true,
+				});
+
+				const handler = getHandler();
+				await handler.handleUri(shareUri("origin=https%3A%2F%2Facme.jolli.ai&token=tok"));
+
+				// No foreign identity — the panel is the same writable local view the
+				// sidebar opens, NOT the read-only shared rendering.
+				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
+					{ commitHash: "h1" },
+					expect.anything(),
+					"/test/workspace",
+					expect.anything(),
+					"main",
+					"commit",
+					null,
+					null,
+					storage,
+				);
+			});
+
+			it("keeps the read-only foreign view for a display-only import (not ingested)", async () => {
+				mockExportSharedBranch.mockResolvedValue({
+					branch: "feat/x",
+					repoName: "acme/widgets",
+					repoUrl: "https://github.com/acme/widgets",
+					kind: "branch",
+					headCommitHash: "h1",
+					commits: [],
+				});
+				const storage = {};
+				mockImportSharedBranchForDisplay.mockResolvedValue({
+					storage,
+					head: { commitHash: "h1" },
+					commitCount: 1,
+					ingestedLocally: false,
+				});
+
+				const handler = getHandler();
+				await handler.handleUri(shareUri("origin=https%3A%2F%2Facme.jolli.ai&token=tok"));
+
+				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
+					{ commitHash: "h1" },
+					expect.anything(),
+					"/test/workspace",
+					expect.anything(),
+					"main",
+					"commit",
+					"acme/widgets",
+					"https://github.com/acme/widgets",
+					storage,
+				);
+			});
+
+			it("shows info and skips download when the link carries no token", async () => {
+				const handler = getHandler();
+				await handler.handleUri(shareUri("origin=https%3A%2F%2Facme.jolli.ai"));
+				expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("no token"));
+				expect(mockExportSharedBranch).not.toHaveBeenCalled();
+			});
+
+			it("refuses a link from a non-allowlisted origin", async () => {
+				const handler = getHandler();
+				await handler.handleUri(shareUri("origin=https%3A%2F%2Fevil.example&token=tok"));
+				expect(showErrorMessage).toHaveBeenCalledWith(expect.stringContaining("unrecognized origin"));
+				expect(mockExportSharedBranch).not.toHaveBeenCalled();
+			});
+
+			it("refuses a link that omits the origin entirely (fail-closed, no download)", async () => {
+				const handler = getHandler();
+				await handler.handleUri(shareUri("token=tok"));
+				expect(showErrorMessage).toHaveBeenCalledWith(expect.stringContaining("no origin"));
+				expect(mockExportSharedBranch).not.toHaveBeenCalled();
+			});
+
+			it("prompts sign-in when no API key is configured", async () => {
+				loadConfig.mockResolvedValue({});
+				const handler = getHandler();
+				await handler.handleUri(shareUri("origin=https%3A%2F%2Facme.jolli.ai&token=tok"));
+				expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("Sign in"));
+				expect(mockExportSharedBranch).not.toHaveBeenCalled();
+			});
+
+			it("shows info when the share has no structured memory to display", async () => {
+				mockExportSharedBranch.mockResolvedValue({
+					branch: "feat/x",
+					repoName: "r",
+					repoUrl: "u",
+					kind: "branch",
+					headCommitHash: "h1",
+					commits: [],
+				});
+				mockImportSharedBranchForDisplay.mockResolvedValue(null);
+				const handler = getHandler();
+				await handler.handleUri(shareUri("origin=https%3A%2F%2Facme.jolli.ai&token=tok"));
+				expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("no structured memory"));
+				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
+			});
+
+			it("surfaces a download failure as an error toast", async () => {
+				mockExportSharedBranch.mockRejectedValue(new Error("forbidden (HTTP 403)"));
+				const handler = getHandler();
+				await handler.handleUri(shareUri("origin=https%3A%2F%2Facme.jolli.ai&token=tok"));
+				expect(showErrorMessage).toHaveBeenCalledWith(expect.stringContaining("HTTP 403"));
 			});
 		});
 	});

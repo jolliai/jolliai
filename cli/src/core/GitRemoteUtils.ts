@@ -152,6 +152,80 @@ export function deriveOwnerRepoFromUrl(repoUrl: string): string {
 }
 
 /**
+ * Whether two raw remote strings denote the same repo, compared CANONICALLY (see
+ * {@link normalizeRemoteUrl}). Guards the `file:///` sentinel: an empty or unparseable
+ * remote canonicalizes to `file:///` via the empty fallback, and two DISTINCT unparseable
+ * remotes must NOT be judged equal just because they both collapse to that sentinel. A
+ * real `file://` remote normalizes to `file:///<path>` and still compares by path.
+ */
+export function sameCanonicalRemote(a: string, b: string): boolean {
+	const na = normalizeRemoteUrl(a, "");
+	const nb = normalizeRemoteUrl(b, "");
+	if (na !== nb) {
+		return false;
+	}
+	// Equal canonical form. If it's the empty-fallback `file:///` sentinel, the inputs were
+	// empty or unparseable (e.g. a bare local path like `/srv/git/foo.git`): fall back to
+	// raw-string equality so two DIFFERENT unparseable remotes don't collapse into a false
+	// match, while an identical local-path remote still matches (preserving the pre-canonical
+	// `===` behavior). Two empty strings are never a real repo, so require non-empty.
+	if (na === "file:///") {
+		const rawA = a.trim();
+		return rawA.length > 0 && rawA === b.trim();
+	}
+	return true;
+}
+
+/**
+ * Mirror of the backend's `sanitizeRepoNameInput` (BranchShareRouter →
+ * `GitRemoteUrl.sanitizeRepoNameInput`): the share row stores `repoName` with the
+ * path-unsafe chars — crucially `/` — stripped, so `owner/repo` becomes `ownerrepo`.
+ * Only the `/`-class strip matters for URL-derived input (the backend's extra
+ * control-char sweep and 120-char clip never fire here). Kept in lockstep with the
+ * backend regex; drift only ever yields a safe false-negative (the share falls through
+ * to the read-only sandbox), never a wrong-repo write.
+ */
+function sanitizeSharedRepoName(name: string): string {
+	return name.replace(/[/\\:*?"<>|]/g, "");
+}
+
+/**
+ * Whether a local repo (`candidate*`) is the repo a share was made from (`share*`). The
+ * single identity rule shared by the foreign-bank lookup
+ * (`JolliMemoryBridge.createStorageForRepo`) and the current-repo lookup
+ * (`SharedBranchImporter`), so both paths benefit from every case below:
+ *
+ *  1. Both sides carry a remote → canonical remote compare ({@link sameCanonicalRemote}).
+ *     The `/export` payload carries the backend's normalized `repoUrl` while the local
+ *     bank keeps the raw git remote, so a strict `===` would miss (`…/x.git` vs `…/x`).
+ *  2. Public-tier share (`shareRepoUrl == null`, the backend withholds the URL) but the
+ *     candidate has a remote → reconstruct the backend's `ownerrepo` form from the
+ *     candidate remote and compare to `shareRepoName` CASE-INSENSITIVELY. GitHub-family
+ *     owner/repo is case-insensitive (and `normalizeRemoteUrl` already folds those host
+ *     paths), so `Acme/Widgets` and `acme/widgets` are the same repo. This preserves the
+ *     owner dimension — two repos sharing a basename under different owners don't collide.
+ *  3. Last-ditch bare-name compare for the remote-less-on-both-sides case (the backend
+ *     stored a basename, not `owner/repo`).
+ */
+export function sharedRepoIdentityMatches(
+	shareRepoName: string,
+	shareRepoUrl: string | null,
+	candidateRepoName: string,
+	candidateRemoteUrl: string | null,
+): boolean {
+	if (shareRepoUrl != null && candidateRemoteUrl != null) {
+		return sameCanonicalRemote(shareRepoUrl, candidateRemoteUrl);
+	}
+	if (candidateRemoteUrl != null) {
+		const ownerRepo = deriveOwnerRepoFromUrl(candidateRemoteUrl);
+		if (ownerRepo.length > 0 && sanitizeSharedRepoName(ownerRepo).toLowerCase() === shareRepoName.toLowerCase()) {
+			return true;
+		}
+	}
+	return candidateRepoName === shareRepoName;
+}
+
+/**
  * Sanitizes a branch name into a path-safe slug for use inside `relativePath`.
  * Mirrors the server's `stripPathUnsafeChars` (replace anything outside
  * `[A-Za-z0-9._-]` and `/` with `_`, collapse runs, trim leading/trailing

@@ -52,10 +52,56 @@ describe("SummaryScriptBuilder", () => {
 	it("preserves the user's picked access tier across a linkless re-render (no revert to the org default)", () => {
 		// Regression: selecting "people" before a link exists must not snap the dropdown
 		// back to the org default (which a later Copy would mint as an org-wide link).
+		// Fallback order: user's explicit pick → the branch's last-used tier (defaults,
+		// seeded when an amend re-keyed the previous subject) → org/people default.
 		expect(script).toContain("shareUserPickedTier = v;");
-		expect(script).toContain("shareUserPickedTier || (shareCanOrg ? 'org' : 'people')");
+		expect(script).toContain(
+			"shareUserPickedTier || (shareDefaults && shareDefaults.visibility) || (shareCanOrg ? 'org' : 'people')",
+		);
 		// The old unconditional revert must be gone.
 		expect(script).not.toContain("shareAccessSelect.value = shareLink ? shareLink.visibility : (shareCanOrg ? 'org' : 'people')");
+		expect(() => new Function(script)).not.toThrow();
+	});
+
+	it("resets the in-session picked tier on open so it can't leak into the next subject", () => {
+		// Issue #5: shareUserPickedTier is per-open state; a tier picked on one subject
+		// must not shadow the next subject's seeded default. shareOpen clears it.
+		const openBody = script.slice(script.indexOf("function shareOpen(kind)"), script.indexOf("function shareClose()"));
+		expect(openBody).toContain("shareUserPickedTier = '';");
+		expect(() => new Function(script)).not.toThrow();
+	});
+
+	it("clamps a seeded 'org' tier to 'people' when the current key has no org capability", () => {
+		// Issue #6: a prior share's 'org' default (or a stale picked tier) is invalid when
+		// shareCanOrg is false (org <option> hidden+disabled) — seeding it would leave the
+		// select on an unrepresentable tier and a later Copy would mint an org link the key
+		// can't back. The clamp downgrades it to 'people'.
+		expect(script).toContain("if (seededTier === 'org' && !shareCanOrg) { seededTier = 'people'; }");
+		expect(() => new Function(script)).not.toThrow();
+	});
+
+	it("shows an existing link's tier verbatim — the org→people clamp is seed-only", () => {
+		// A real link renders its actual visibility; clamping it would mislabel a live 'org'
+		// link as 'people' if the key's org capability later lapsed. The clamp lives in the
+		// no-link (seed) branch only, AFTER the real-link assignment.
+		expect(script).toContain("seededTier = shareLink.visibility;");
+		const clampIdx = script.indexOf("if (seededTier === 'org' && !shareCanOrg)");
+		const linkTierIdx = script.indexOf("seededTier = shareLink.visibility;");
+		expect(linkTierIdx).toBeGreaterThanOrEqual(0);
+		expect(clampIdx).toBeGreaterThan(linkTierIdx);
+		expect(() => new Function(script)).not.toThrow();
+	});
+
+	it("restores the branch's last-used people ONCE per open (staged in invite mode, nothing auto-granted)", () => {
+		// A subject with no link but last-used defaults (amend re-keyed the previous
+		// commit share) prefills the previous recipients as staged invitees and enters
+		// invite mode — a single Send re-grants them; Cancel drops to the main pane.
+		expect(script).toContain("shareDefaults = state.defaults || null;");
+		expect(script).toContain("shareDefaultsPrefilled = true;");
+		expect(script).toContain("shareDefaults.recipients.forEach(function(e) { shareStagePending(e); });");
+		// One prefill per modal open: the flag resets when the modal opens.
+		const openBody = script.slice(script.indexOf("function shareOpen(kind)"), script.indexOf("function shareClose()"));
+		expect(openBody).toContain("shareDefaultsPrefilled = false;");
 		expect(() => new Function(script)).not.toThrow();
 	});
 

@@ -16,6 +16,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { FolderStorage } from "../../cli/src/core/FolderStorage.js";
 import { getDiffStats } from "../../cli/src/core/GitOps.js";
+import { sharedRepoIdentityMatches } from "../../cli/src/core/GitRemoteUtils.js";
 import { filterToBranchHeads } from "../../cli/src/core/HeadEntryFilter.js";
 import {
 	extractRepoName,
@@ -2266,10 +2267,16 @@ export class JolliMemoryBridge {
 	 *     of-truth contract for users who opted out of dual-write.
 	 *   - No matching kbRoot is discoverable yet (fresh repo whose KB
 	 *     folder hasn't been created).
+	 *
+	 * Also returns the current repo's identity (`repoName` + `remoteUrl`)
+	 * so callers holding content for a NAMED repo (SharedBranchImporter)
+	 * can verify this is that repo before writing into its bank.
 	 */
 	async createReadStorageForCurrentRepo(): Promise<{
 		storage: StorageProvider;
 		kbRoot: string;
+		repoName: string;
+		remoteUrl: string | null;
 	} | null> {
 		try {
 			const { cfg, repos } = await this.getDiscoveryCached();
@@ -2278,7 +2285,7 @@ export class JolliMemoryBridge {
 				if (!repo.isCurrentRepo) continue;
 				const mm = new MetadataManager(join(repo.kbRoot, ".jolli"));
 				const storage = new FolderStorage(repo.kbRoot, mm);
-				return { storage, kbRoot: repo.kbRoot };
+				return { storage, kbRoot: repo.kbRoot, repoName: repo.repoName, remoteUrl: repo.remoteUrl };
 			}
 			/* v8 ignore start -- defensive logger coercion: same pattern as listSummaryEntries above; non-Error rejections are rare. */
 		} catch (err) {
@@ -2303,21 +2310,13 @@ export class JolliMemoryBridge {
 			const { repos } = await this.getDiscoveryCached();
 			for (const repo of repos) {
 				if (repo.isCurrentRepo) continue;
-				const urlMatches =
-					remoteUrl != null &&
-					repo.remoteUrl != null &&
-					repo.remoteUrl === remoteUrl;
-				const nameMatches = repo.repoName === repoName;
-				if (!urlMatches && !nameMatches) continue;
-				// When the caller supplied a remoteUrl AND this repo has one, we
-				// require the remote to match — name-only matches across distinct
-				// remotes would be a silent identity collision (folder renames
-				// produce this; see KBRepoDiscoverer.isCurrentRepo).
-				if (
-					remoteUrl != null &&
-					repo.remoteUrl != null &&
-					repo.remoteUrl !== remoteUrl
-				) {
+				// One identity rule for foreign banks and shared-repo lookups alike
+				// (`sharedRepoIdentityMatches`): canonical remote compare (raw-vs-normalized
+				// `.git` no longer misses), owner/repo reconstruction for public-tier shares
+				// that withhold the URL, then bare name. It also guards the `file:///` sentinel
+				// so two unparseable remotes don't collapse into a false match, and rejects a
+				// name-only match across distinct remotes (a folder-rename identity collision).
+				if (!sharedRepoIdentityMatches(repoName, remoteUrl, repo.repoName, repo.remoteUrl)) {
 					continue;
 				}
 				const mm = new MetadataManager(join(repo.kbRoot, ".jolli"));

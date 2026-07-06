@@ -208,6 +208,66 @@ export async function putBranchShare(
 }
 
 /**
+ * The best prior record to SEED a subject's defaults from when it has no link yet — the
+ * most-recently-minted (max `expiresAt`) record of the SAME KIND, excluding the subject
+ * itself. A commit share's key carries its commit hash, so an amend/rebase strands the
+ * previous commit share; seeding lets the modal bring back that last-used tier + people
+ * instead of starting blank.
+ *
+ * Same-kind is deliberate: a commit subject seeds only from OTHER commit shares (the
+ * stranded ones), NOT from the branch share. The branch share is a live sibling of a
+ * different scope — seeding a commit modal from it (and auto-staging its recipients) would
+ * duplicate-grant people who already have branch-wide access. A branch subject's key is
+ * stable (never stranded), so it has no same-kind prior and gets no seed.
+ *
+ * Expiry is NOT filtered here (the store has no clock); the caller passes the result
+ * through its liveness check so an intentionally-lapsed grant never seeds.
+ */
+function pickSeedForSubject(
+	subjects: Readonly<Record<string, BranchShareRecord>>,
+	branch: string,
+	commitHash: string | undefined,
+	currentKey: string,
+): BranchShareRecord | undefined {
+	const wantCommit = commitHash !== undefined;
+	let seed: BranchShareRecord | undefined;
+	let seedAt = Number.NEGATIVE_INFINITY;
+	for (const [key, record] of Object.entries(subjects)) {
+		if (key === currentKey) continue; // never seed a subject from itself
+		const sameKind = wantCommit ? key.startsWith(branch + COMMIT_KEY_SEP) : key === branch;
+		if (!sameKind) continue;
+		const parsed = Date.parse(record.expiresAt);
+		// Unparseable expiry sorts oldest — a well-formed record always wins over it.
+		const at = Number.isNaN(parsed) ? 0 : parsed;
+		if (at >= seedAt) {
+			seedAt = at;
+			seed = record;
+		}
+	}
+	return seed;
+}
+
+/**
+ * One read that returns BOTH a subject's own record (`record`) and the best prior record
+ * to seed its defaults from (`seed`, see {@link pickSeedForSubject}). The share modal's
+ * no-link path needs both; doing it in one pass avoids reading + JSON-parsing
+ * `branch-shares.json` twice on every open. `seed` is subject-scoped and expiry-unfiltered
+ * — the caller applies its liveness check before using it.
+ */
+export async function getShareWithBranchLatest(
+	projectDir: string,
+	branch: string,
+	commitHash?: string,
+): Promise<{ record: BranchShareRecord | undefined; seed: BranchShareRecord | undefined }> {
+	const all = await readAll(projectDir);
+	const currentKey = subjectKey(branch, commitHash);
+	return {
+		record: all.subjects[currentKey],
+		seed: pickSeedForSubject(all.subjects, branch, commitHash, currentKey),
+	};
+}
+
+/**
  * Removes a subject's share record (e.g. after a Stop). Idempotent; an absent
  * subject is a no-op and the entry is dropped entirely.
  */
