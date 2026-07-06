@@ -61,6 +61,7 @@ import {
 	installDistPath,
 	migrateLegacyDistPath,
 	pickBestDistPath,
+	pruneStaleDistPaths,
 	traverseDistPaths,
 } from "./DistPathResolver.js";
 import { installGeminiHook, isGeminiHookInstalled, removeGeminiHook } from "./GeminiHookInstaller.js";
@@ -198,6 +199,20 @@ export async function install(
 				warnings,
 			};
 		}
+
+		// Sweep dist-paths entries whose dist dir was removed (e.g. an uninstalled IDE
+		// extension). Keeps dist-path selection — and the absolute Cli.js path it bakes
+		// into .mcp.json on Windows — pointed at live dists, so a ghost entry can't leave
+		// a dead MCP registration behind. Runs after writing our own (live) entry, so it
+		// never prunes the caller. Non-fatal: a leftover ghost is filtered at selection time.
+		try {
+			const pruned = await pruneStaleDistPaths();
+			if (pruned.length > 0) log.info("Pruned stale dist-paths entries: %s", pruned.join(", "));
+			/* v8 ignore start -- defensive: pruneStaleDistPaths swallows its own per-entry errors */
+		} catch (error: unknown) {
+			log.warn("Pruning stale dist-paths failed (non-fatal): %s", (error as Error).message);
+		}
+		/* v8 ignore stop */
 
 		// Run host detectors once before the per-worktree loop so each detector
 		// is called exactly once. Results are reused both inside the loop (for MCP

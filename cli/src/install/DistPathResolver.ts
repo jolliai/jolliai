@@ -154,6 +154,45 @@ export function traverseDistPaths(globalDir?: string): DistPathInfo[] {
 	return results;
 }
 
+/**
+ * Deletes `dist-paths/<source>` entries whose recorded dist directory no longer
+ * exists — e.g. a ghost `vscode` entry left behind after an IDE extension is
+ * uninstalled, still pointing at a deleted `.../extensions/<name>/dist`.
+ *
+ * Runtime hook selection already tolerates such ghosts (`pickBestDistPath` filters
+ * on `.available`), so why sweep them? The Windows `.mcp.json` entry bakes an
+ * ABSOLUTE `node <dist>/Cli.js` path resolved at registration time. If a ghost won
+ * selection when `.mcp.json` was last written and its dir was later removed, the
+ * baked path is dead until something re-registers — and nothing re-resolves it as
+ * long as the ghost still outranks the live sources on disk. Sweeping ghosts on
+ * every `enable` keeps both selection and the next re-registration pointed at live
+ * dists, and keeps `getStatus().allSources` free of phantom rows.
+ *
+ * Only unavailable entries are removed; an entry whose dir exists is never touched.
+ * Best-effort — a per-entry unlink failure is logged and skipped (a leftover ghost
+ * is harmless, being filtered at selection time). `globalDir` is injectable for
+ * tests; production omits it and uses the machine-global config dir.
+ *
+ * @returns the source tags that were pruned (for logging/tests).
+ */
+export async function pruneStaleDistPaths(globalDir?: string): Promise<string[]> {
+	const dir = join(globalDir ?? join(homedir(), ".jolli", "jollimemory"), "dist-paths");
+	const pruned: string[] = [];
+	for (const entry of traverseDistPaths(globalDir)) {
+		if (entry.available) continue;
+		try {
+			await unlink(join(dir, entry.source));
+			pruned.push(entry.source);
+			log.info("Pruned stale dist-paths/%s (dir gone: %s)", entry.source, entry.distDir);
+		} catch (error: unknown) {
+			/* v8 ignore start -- defensive: unlink race (already deleted) or EPERM is non-fatal */
+			log.warn("Failed to prune stale dist-paths/%s: %s", entry.source, (error as Error).message);
+			/* v8 ignore stop */
+		}
+	}
+	return pruned;
+}
+
 // ─── Version comparison ──────────────────────────────────────────────────────
 
 /**

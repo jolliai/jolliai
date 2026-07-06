@@ -237,12 +237,19 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
      * upgrade activates them without a manual re-enable — `install()` doesn't re-run
      * once hooks are already installed. Idempotent + version-gated; node-only.
      *
+     * Beyond the version gate, this also re-runs when the project's `.mcp.json` points
+     * the jollimemory server at a `node <Cli.js>` path that no longer exists (see
+     * [CliIntegrations.mcpRegistrationStale]). Such a dead registration comes from an
+     * environment change — another surface's dist being removed — not a plugin-version
+     * change, so the version stamp can't catch it; one re-enable re-resolves `.mcp.json`
+     * to a live dist.
+     *
      * @return a human-readable warning when integrations could not be set up (Node missing,
      *   bundle missing, or the CLI failed) so the caller can notify, or `null` when they are
      *   already up to date or were set up successfully.
      */
     fun ensureIntegrations(): String? {
-        if (CliIntegrations.integrationsUpToDate()) return null
+        if (CliIntegrations.integrationsUpToDate() && !CliIntegrations.mcpRegistrationStale(projectDir)) return null
         return CliIntegrations.warningFor(CliIntegrations.enableIntegrations(projectDir))
     }
 
