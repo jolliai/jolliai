@@ -3156,6 +3156,26 @@ describe("JolliMemoryBridge", () => {
 			expect(result?.kbRoot).toBe("/mock/home/Documents/jolli/b");
 		});
 
+		it("matches a foreign repo when the caller's canonical remote differs only by .git from the raw local remote", async () => {
+			// The bank keeps the raw git remote (`.git` suffix) while a shared-branch import
+			// passes the backend's normalized form. A strict === missed this and dropped the
+			// foreign display-only path into the sandbox; canonical comparison recovers it.
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/foreign",
+					repoName: "foreignrepo",
+					dirName: "foreign",
+					remoteUrl: "https://github.com/acme/foreign.git",
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.createStorageForRepo("acmeforeign", "https://github.com/acme/foreign");
+
+			expect(result?.kbRoot).toBe("/mock/home/Documents/jolli/foreign");
+		});
+
 		it("returns null when no DiscoveredRepo matches (foreign entry has neither matching name nor remote)", async () => {
 			// Two-repo scan covering both early-skip branches of the loop:
 			// (1) the currentRepo continue and (2) the `!urlMatches &&
@@ -3255,6 +3275,10 @@ describe("JolliMemoryBridge", () => {
 			expect((result?.storage as { rootPath: string }).rootPath).toBe(
 				"/mock/home/Documents/jolli/cur",
 			);
+			// Identity fields: SharedBranchImporter verifies the current repo IS the
+			// share's repo before writing into its bank.
+			expect(result?.repoName).toBe("cur");
+			expect(result?.remoteUrl).toBeNull();
 		});
 
 		it("returns null when no DiscoveredRepo is flagged isCurrentRepo", async () => {

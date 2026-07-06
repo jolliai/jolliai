@@ -20,7 +20,13 @@
  * would be a dead owner-only link, so it is revoked rather than kept.
  */
 
-import { getShare, patchShareAudience, putBranchShare, revokeShare } from "./BranchShareController.js";
+import {
+	getShare,
+	getShareWithBranchLatest,
+	patchShareAudience,
+	putBranchShare,
+	revokeShare,
+} from "./BranchShareController.js";
 import { assertJolliOriginAllowed } from "../../../cli/src/core/JolliApiUtils.js";
 import type { BindingOutcome } from "./JolliPushOrchestrator.js";
 import type { BranchShareRecord } from "../../../cli/src/core/BranchShareStore.js";
@@ -29,6 +35,7 @@ import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import { sendShareInviteAndGrantAccess } from "./JolliShareService.js";
 import { ShareBindingError } from "./JolliPushOrchestrator.js";
 import type { CommitSummary } from "../../../cli/src/Types.js";
+import { log } from "../util/Logger.js";
 
 /** Whether a share covers a whole branch or a single commit. */
 export type ShareKind = "branch" | "commit";
@@ -67,6 +74,16 @@ export type ShareModalState =
 			readonly canOrg: boolean;
 			/** The subject's single link, when minted. */
 			readonly share?: ShareLinkState;
+			/**
+			 * Last-used choices for a subject with NO link yet — UI seed values only, no
+			 * live grant. Present when the branch has a prior share record whose subject
+			 * was stranded (an amend/rebase re-keyed the commit share), so reopening the
+			 * modal brings back the previous access tier + invited people.
+			 */
+			readonly defaults?: {
+				readonly visibility: ShareVisibility;
+				readonly recipients: ReadonlyArray<string>;
+			};
 			/** "From your jolli account" suggestion group (org members). */
 			readonly accountMembers: ReadonlyArray<ShareMember>;
 			/** "Git collaborators" suggestion group (repo contributors not in the account group). */
@@ -187,7 +204,7 @@ export async function copyShareLinkModal(io: ShareModalIO, ctx: ShareModalContex
 		// Silent mint: the pane must NOT swap to a spinner (mockup keeps the card
 		// still); the webview disables the button until the copy-result ack lands.
 		const generated = await generate(io, ctx, visibility, null);
-		if (!generated) {
+		if (!generated.ok) {
 			io.postCopyResult({ ok: false });
 			return;
 		}
@@ -236,7 +253,7 @@ export async function setShareAccessModal(io: ShareModalIO, ctx: ShareModalConte
 			const generated = await generate(io, ctx, visibility, null);
 			// On failure generate() already posted the error pane — don't overwrite it
 			// with a ready render (which would silently hide the failure).
-			if (!generated) return;
+			if (!generated.ok) return;
 		}
 		await postReadyState(io, ctx);
 		return;
@@ -290,10 +307,11 @@ export async function sendInviteModal(
 	let reTieredFrom: ShareVisibility | undefined;
 	if (!isLive(record, ctx.nowMs)) {
 		const generated = await generate(io, ctx, targetTier, "Creating link…");
-		if (!generated) {
-			// The webview optimistically closed the popover before this ran, so an
-			// error posted into the hidden overlay is invisible — report via a toast.
-			io.notifyError("Couldn't create the share link — there may be nothing to share, or it couldn't be bound to your Jolli account.");
+		if (!generated.ok) {
+			// The webview optimistically closed the popover before this ran, so the
+			// error posted into the hidden overlay is invisible — surface the REAL
+			// reason via a toast (binding / nothing-to-share / HTTP), not a guess.
+			io.notifyError(generated.message);
 			return;
 		}
 		mintedForInvite = true;
@@ -407,7 +425,7 @@ async function generate(
 	ctx: ShareModalContext,
 	visibility: ShareVisibility,
 	label: string | null,
-): Promise<boolean> {
+): Promise<{ ok: true } | { ok: false; message: string }> {
 	if (label !== null) io.postState({ kind: "loading", label });
 	try {
 		// apiKey is guaranteed non-null by the callers' guards.
@@ -421,10 +439,16 @@ async function generate(
 			commitSummary: ctx.commitSummary,
 			visibility,
 		});
-		return true;
+		return { ok: true };
 	} catch (err) {
-		io.postState({ kind: "error", message: generateErrorMessage(err) });
-		return false;
+		// Post the specific reason into the (usually visible) error pane AND return it,
+		// so a caller whose pane is already gone (invite closes the popover) can toast
+		// the real message instead of a generic guess.
+		const message = generateErrorMessage(err);
+		// Also record it: share-link failures were previously invisible in the debug log.
+		log.warn("BranchShareModal", `share link generation failed: ${message}`);
+		io.postState({ kind: "error", message });
+		return { ok: false, message };
 	}
 }
 
@@ -445,12 +469,26 @@ function generateErrorMessage(err: unknown): string {
 
 /** Reads the subject's link and posts the `ready` state (expired/untrusted links render as absent). */
 async function postReadyState(io: ShareModalIO, ctx: ShareModalContext): Promise<void> {
-	const record = presentable(await getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash), ctx.nowMs);
+	// One read of branch-shares.json yields BOTH this subject's record and the best prior
+	// record to seed from — the no-link path needs both, and reading + parsing the file
+	// twice (getShare then a separate latest scan) was pure waste on every open.
+	const { record: rawRecord, seed: rawSeed } = await getShareWithBranchLatest(
+		ctx.workspaceRoot,
+		ctx.branch,
+		ctx.commitHash,
+	);
+	const record = presentable(rawRecord, ctx.nowMs);
 	// A shared subject's count is cached on the record; before the first share there is
 	// no record, so compute the current subject's count (commit: free from the open
 	// summary; branch: one base..HEAD load) rather than showing a misleading "0".
 	const decisionCount =
 		record?.decisionCount ?? (await countSubjectDecisions(ctx.bridge, ctx.workspaceRoot, ctx.commitHash, ctx.commitSummary));
+	// No link on THIS subject: seed the UI with the branch's last-used choices from a
+	// same-kind stranded record (an amend/rebase re-keyed the previous commit share).
+	// Filter expiry here — an intentionally-lapsed grant must NOT seed people back
+	// (which a one-click Send would then re-grant). Seed values only; nothing is granted
+	// until the user acts (Send invite / Copy).
+	const prior = record ? undefined : presentable(rawSeed, ctx.nowMs);
 	io.postState({
 		kind: "ready",
 		branch: ctx.branch,
@@ -464,6 +502,14 @@ async function postReadyState(io: ShareModalIO, ctx: ShareModalContext): Promise
 						shareUrl: record.shareUrl,
 						visibility: record.visibility,
 						recipients: record.recipients ?? [],
+					},
+				}
+			: {}),
+		...(prior
+			? {
+					defaults: {
+						visibility: prior.visibility,
+						recipients: prior.recipients ?? [],
 					},
 				}
 			: {}),

@@ -23,6 +23,9 @@ import {
 } from "../../cli/src/core/KBPathResolver.js";
 import type { ManifestEntry } from "../../cli/src/core/KBTypes.js";
 import { isPathInside, toForwardSlash } from "../../cli/src/core/PathUtils.js";
+import { assertJolliOriginAllowed } from "../../cli/src/core/JolliApiUtils.js";
+import { exportSharedBranch } from "./services/JolliShareService.js";
+import { importSharedBranchForDisplay } from "./services/SharedBranchImporter.js";
 import { activateExtensionTelemetry, reinitExtensionTelemetry } from "./TelemetryActivation.js";
 import {
 	getGlobalConfigDir,
@@ -3841,6 +3844,80 @@ export function activate(context: vscode.ExtensionContext): void {
 						sourceRemoteUrl,
 						readStorageResult?.storage ?? null,
 					);
+					return;
+				}
+
+				// Deep link from a web share page's "Open in VS Code" button: download the
+				// shared branch's structured memory over the api-key-authed /export endpoint
+				// and render it read-only. `token` is the share's opaque code; `origin` is the
+				// web origin (validated against the Jolli allowlist — the request itself goes to
+				// the user's own tenant from their API key, and the token self-routes).
+				if (uri.path === "/share") {
+					const params = new URLSearchParams(uri.query);
+					const token = params.get("token");
+					const origin = params.get("origin");
+					if (!token) {
+						vscode.window.showInformationMessage(
+							"Jolli Memory: This share link has no token to load — open it on the web instead.",
+						);
+						return;
+					}
+					// Origin is REQUIRED and must be on the Jolli allowlist. A link that omits
+					// it can't be vetted, so it's refused too (fail-closed) — skipping the
+					// check on a missing param would let a crafted `?token=…` link through.
+					// The legit web share page always includes origin.
+					if (!origin) {
+						log.info("uriHandler", "Rejected /share deep link: missing origin");
+						vscode.window.showErrorMessage(
+							"Jolli Memory: Refused a share link with no origin to verify.",
+						);
+						return;
+					}
+					try {
+						assertJolliOriginAllowed(origin);
+					} catch {
+						log.info("uriHandler", "Rejected /share deep link: origin not on the Jolli allowlist");
+						vscode.window.showErrorMessage(
+							"Jolli Memory: Refused a share link from an unrecognized origin.",
+						);
+						return;
+					}
+					const cfg = await loadConfig();
+					const apiKey = cfg.jolliApiKey ?? cfg.apiKey;
+					if (!apiKey) {
+						vscode.window.showInformationMessage("Jolli Memory: Sign in to Jolli to open a shared branch.");
+						return;
+					}
+					try {
+						const data = await exportSharedBranch(undefined, apiKey, token);
+						const imported = await importSharedBranchForDisplay(data, bridge, context);
+						if (!imported) {
+							vscode.window.showInformationMessage(
+								`Jolli Memory: The shared branch "${data.branch}" has no structured memory to display.`,
+							);
+							return;
+						}
+						// When the share was ingested into the currently-open repo (recall/search
+						// now find it), open the normal writable local panel — same shape as the
+						// /summary deep link's local path. The read-only foreign view is reserved
+						// for display-only imports (foreign local repo, or pure-external sandbox).
+						const openAsLocal = imported.ingestedLocally;
+						await SummaryWebviewPanel.show(
+							imported.head,
+							context.extensionUri,
+							workspaceRoot,
+							bridge,
+							commitsStore.getMainBranch(),
+							"commit",
+							openAsLocal ? null : data.repoName,
+							openAsLocal ? null : data.repoUrl,
+							imported.storage,
+						);
+					} catch (err) {
+						const message = err instanceof Error ? err.message : String(err);
+						log.warn("uriHandler", `/share load failed: ${message}`);
+						vscode.window.showErrorMessage(`Jolli Memory: Couldn't open the shared branch — ${message}`);
+					}
 					return;
 				}
 

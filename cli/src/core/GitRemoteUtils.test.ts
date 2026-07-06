@@ -10,7 +10,9 @@ import {
 	deriveRepoNameFromUrl,
 	getCanonicalRepoUrl,
 	normalizeRemoteUrl,
+	sameCanonicalRemote,
 	sanitizeBranchSlug,
+	sharedRepoIdentityMatches,
 } from "./GitRemoteUtils.js";
 
 const gitResult = (stdout: string, exitCode = 0): GitCommandResult => ({ stdout, stderr: "", exitCode });
@@ -142,5 +144,93 @@ describe("deriveOwnerRepoFromUrl", () => {
 	it("returns '' on empty or unparseable input", () => {
 		expect(deriveOwnerRepoFromUrl("")).toBe("");
 		expect(deriveOwnerRepoFromUrl("not a url")).toBe("");
+	});
+});
+
+describe("sameCanonicalRemote", () => {
+	it("matches raw-vs-normalized forms of the same repo (.git suffix, scp form)", () => {
+		expect(sameCanonicalRemote("https://github.com/acme/widgets.git", "https://github.com/acme/widgets")).toBe(
+			true,
+		);
+		expect(sameCanonicalRemote("git@github.com:acme/widgets.git", "https://github.com/acme/widgets")).toBe(true);
+	});
+
+	it("does not match two distinct repos", () => {
+		expect(sameCanonicalRemote("https://github.com/acme/widgets", "https://github.com/acme/gadgets")).toBe(false);
+	});
+
+	it("does NOT collapse two distinct unparseable remotes into a match via the file:/// sentinel", () => {
+		// Both normalize to the empty-fallback `file:///` sentinel; treating that as equal
+		// would ingest a share into the wrong local repo. It must stay a non-match.
+		expect(sameCanonicalRemote("not-a-url", "also-not-a-url")).toBe(false);
+		expect(sameCanonicalRemote("", "")).toBe(false);
+	});
+
+	it("still matches two real file:// remotes with the same path", () => {
+		expect(sameCanonicalRemote("file:///home/x/repo", "file:///home/x/repo")).toBe(true);
+	});
+
+	it("still matches an IDENTICAL bare local-path remote (preserves pre-canonical === behavior)", () => {
+		// A bare path is unparseable → the `file:///` sentinel; identical raw strings must
+		// still match so a local-path remote isn't newly dropped by the canonical compare.
+		expect(sameCanonicalRemote("/srv/git/foo.git", "/srv/git/foo.git")).toBe(true);
+	});
+
+	it("does NOT match two DIFFERENT bare local-path remotes (both hit the sentinel)", () => {
+		expect(sameCanonicalRemote("/srv/git/foo.git", "/srv/git/bar.git")).toBe(false);
+	});
+});
+
+describe("sharedRepoIdentityMatches", () => {
+	it("matches by canonical remote when both sides carry a URL (raw .git vs normalized)", () => {
+		expect(
+			sharedRepoIdentityMatches(
+				"acmewidgets",
+				"https://github.com/acme/widgets",
+				"widgets",
+				"https://github.com/acme/widgets.git",
+			),
+		).toBe(true);
+	});
+
+	it("rejects a name match when both sides have a URL but the remotes differ", () => {
+		expect(
+			sharedRepoIdentityMatches(
+				"widgets",
+				"https://github.com/acme/widgets",
+				"widgets",
+				"https://github.com/other/widgets",
+			),
+		).toBe(false);
+	});
+
+	it("reconstructs owner/repo from the candidate remote for a public-tier share (URL withheld)", () => {
+		// Public tier: shareRepoUrl is null, but the candidate still knows its own remote.
+		// Backend stored sanitize("acme/widgets") = "acmewidgets"; the bank keeps bare "widgets".
+		expect(sharedRepoIdentityMatches("acmewidgets", null, "widgets", "https://github.com/acme/widgets.git")).toBe(
+			true,
+		);
+	});
+
+	it("matches a public-tier share case-insensitively (Acme/Widgets vs acme/widgets)", () => {
+		// GitHub owner/repo is case-insensitive; the two users' remotes differ only in case.
+		expect(sharedRepoIdentityMatches("AcmeWidgets", null, "widgets", "https://github.com/acme/widgets.git")).toBe(
+			true,
+		);
+	});
+
+	it("preserves the owner dimension — a shared basename under a different owner does not match", () => {
+		expect(sharedRepoIdentityMatches("acmewidgets", null, "widgets", "https://github.com/other/widgets.git")).toBe(
+			false,
+		);
+	});
+
+	it("falls back to a bare-name compare when neither side has a remote", () => {
+		expect(sharedRepoIdentityMatches("widgets", null, "widgets", null)).toBe(true);
+		expect(sharedRepoIdentityMatches("widgets", null, "gadgets", null)).toBe(false);
+	});
+
+	it("does not match a public-tier share when the candidate has no owner segment and the name differs", () => {
+		expect(sharedRepoIdentityMatches("acmewidgets", null, "widgets", "https://example.com/widgets")).toBe(false);
 	});
 });

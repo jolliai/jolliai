@@ -9,10 +9,14 @@ const { mockHttpRequest, mockHttpsRequest } = vi.hoisted(() => ({
 
 vi.mock("node:http", () => ({ request: mockHttpRequest }));
 vi.mock("node:https", () => ({ request: mockHttpsRequest }));
+vi.mock("../util/Logger.js", () => ({
+	log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
 
 import {
 	clearOrgMembersCache,
 	createLiveShare,
+	exportSharedBranch,
 	type LiveSharePayload,
 	listOrgMembers,
 	sendShareInviteAndGrantAccess,
@@ -273,6 +277,66 @@ describe("updateLiveShare", () => {
 	});
 });
 
+describe("exportSharedBranch", () => {
+	const EXPORT_BODY = JSON.stringify({
+		branch: "feature/x",
+		repoName: "acme/widgets",
+		repoUrl: "https://github.com/acme/widgets",
+		kind: "branch",
+		headCommitHash: "a1b2c3",
+		commits: [{ commitHash: "a1b2c3", summaryJson: '{"commitHash":"a1b2c3"}', attachments: [] }],
+	});
+
+	it("resolves the structured export on 2xx", async () => {
+		replyHttps(200, EXPORT_BODY);
+		const res = await exportSharedBranch(BASE, KEY, "tok");
+		expect(res.repoUrl).toBe("https://github.com/acme/widgets");
+		expect(res.commits).toHaveLength(1);
+		expect(res.commits[0].commitHash).toBe("a1b2c3");
+	});
+
+	it("hits the api-key-authed /export path with the encoded token", async () => {
+		let requestedUrl: URL | undefined;
+		mockHttpsRequest.mockImplementation((url: unknown, _opts: unknown, cb: (res: unknown) => void) => {
+			requestedUrl = url as URL;
+			cb(mockResponse(200, EXPORT_BODY));
+			return mockRequest();
+		});
+		await exportSharedBranch(BASE, KEY, "tok/en");
+		expect(requestedUrl?.pathname).toBe("/api/share/branch/tok%2Fen/export");
+	});
+
+	it("rejects a 2xx that is not a real export payload (missing commits array)", async () => {
+		replyHttps(200, JSON.stringify({ branch: "x" }));
+		await expect(exportSharedBranch(BASE, KEY, "tok")).rejects.toThrow(/HTTP 200|request failed/);
+	});
+
+	it("rejects a 2xx whose commits are an array but the identity fields are missing", async () => {
+		// commits is an array, but repoName/branch/headCommitHash are absent — the importer
+		// would otherwise feed `undefined` into path building and throw a raw TypeError.
+		replyHttps(200, JSON.stringify({ commits: [] }));
+		await expect(exportSharedBranch(BASE, KEY, "tok")).rejects.toThrow(/HTTP 200|request failed/);
+	});
+
+	it("rejects a 403 (not authorized for this share)", async () => {
+		replyHttps(403, JSON.stringify({ error: "forbidden" }));
+		await expect(exportSharedBranch(BASE, KEY, "tok")).rejects.toThrow(/forbidden \(HTTP 403\)/);
+	});
+
+	it("accepts a public-tier payload whose repoUrl is null (backend withholds it)", async () => {
+		const body = JSON.parse(EXPORT_BODY) as Record<string, unknown>;
+		replyHttps(200, JSON.stringify({ ...body, repoUrl: null }));
+		const res = await exportSharedBranch(BASE, KEY, "tok");
+		expect(res.repoUrl).toBeNull();
+		expect(res.repoName).toBe("acme/widgets");
+	});
+
+	it("rejects a 404 — a cross-deployment/unknown token", async () => {
+		replyHttps(404, JSON.stringify({ error: "not_found" }));
+		await expect(exportSharedBranch(BASE, KEY, "tok")).rejects.toThrow(/HTTP 404/);
+	});
+});
+
 describe("listOrgMembers", () => {
 	beforeEach(() => {
 		// Each case wires its own reply; a cached list from a prior case would mask it.
@@ -361,6 +425,14 @@ describe("listOrgMembers", () => {
 
 	it("does not cache a failed fetch — the next call retries", async () => {
 		replyHttps(500, JSON.stringify({ error: "boom" }));
+		expect(await listOrgMembers(BASE, KEY)).toEqual([]);
+		replyHttps(200, JSON.stringify({ members: [{ name: "Ada", email: "ada@example.com" }] }));
+		expect(await listOrgMembers(BASE, KEY)).toEqual([{ name: "Ada", email: "ada@example.com" }]);
+		expect(mockHttpsRequest).toHaveBeenCalledTimes(2);
+	});
+
+	it("does not cache an empty result — the next call re-fetches", async () => {
+		replyHttps(200, JSON.stringify({ members: [] }));
 		expect(await listOrgMembers(BASE, KEY)).toEqual([]);
 		replyHttps(200, JSON.stringify({ members: [{ name: "Ada", email: "ada@example.com" }] }));
 		expect(await listOrgMembers(BASE, KEY)).toEqual([{ name: "Ada", email: "ada@example.com" }]);

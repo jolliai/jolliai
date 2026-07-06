@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
 	getShare: vi.fn(),
+	getLatestShareForBranch: vi.fn(),
+	getShareWithBranchLatest: vi.fn(),
 	patchShareAudience: vi.fn(),
 	putBranchShare: vi.fn(),
 	revokeShare: vi.fn(),
@@ -14,6 +16,7 @@ const h = vi.hoisted(() => ({
 
 vi.mock("./BranchShareController.js", () => ({
 	getShare: h.getShare,
+	getShareWithBranchLatest: h.getShareWithBranchLatest,
 	patchShareAudience: h.patchShareAudience,
 	putBranchShare: h.putBranchShare,
 	revokeShare: h.revokeShare,
@@ -39,6 +42,9 @@ vi.mock("./JolliPushOrchestrator.js", () => ({
 }));
 vi.mock("../../../cli/src/core/JolliApiUtils.js", () => ({
 	assertJolliOriginAllowed: h.assertJolliOriginAllowed,
+}));
+vi.mock("../util/Logger.js", () => ({
+	log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
 import { ShareBindingError } from "./JolliPushOrchestrator.js";
@@ -111,6 +117,14 @@ beforeEach(() => {
 	h.reconcileLiveShare.mockResolvedValue(undefined);
 	h.countSubjectDecisions.mockResolvedValue(0);
 	h.sendShareInviteAndGrantAccess.mockResolvedValue({ sent: [], failed: [] });
+	// postReadyState reads via the single combined getter; compose it from the two knobs
+	// so existing setups keep driving it. `getLatestShareForBranch` here is a test double
+	// standing in for the store's subject-scoped seed pick (real filtering is covered in
+	// BranchShareStore.test.ts); the modal then applies its own expiry filter to it.
+	h.getShareWithBranchLatest.mockImplementation(async (cwd: string, branch: string, commit?: string) => ({
+		record: await h.getShare(cwd, branch, commit),
+		seed: await h.getLatestShareForBranch(cwd, branch),
+	}));
 });
 
 describe("openShareModal", () => {
@@ -154,6 +168,69 @@ describe("openShareModal", () => {
 		await openShareModal(io, CTX);
 		const state = io.states.at(-1) as { share?: { recipients: string[] } };
 		expect(state.share?.recipients).toEqual([]);
+	});
+
+	it("seeds defaults from the branch's latest prior share when THIS subject has no record (amend re-key)", async () => {
+		// The commit share's subject key carries the commit hash; an amend strands the
+		// old record. The ready state must bring back the last-used tier + people.
+		h.getShare.mockResolvedValue(undefined);
+		h.getLatestShareForBranch.mockResolvedValue({
+			...MEMBER_RECORD,
+			visibility: "people",
+			recipients: ["ada@example.com", "tom@jolli.ai"],
+		});
+		const io = makeIO();
+		await openShareModal(io, CTX);
+		expect(h.getLatestShareForBranch).toHaveBeenCalledWith("/repo", "feature/x");
+		expect(io.states.at(-1)).toMatchObject({
+			kind: "ready",
+			defaults: { visibility: "people", recipients: ["ada@example.com", "tom@jolli.ai"] },
+		});
+		const state = io.states.at(-1) as { share?: unknown };
+		expect(state.share).toBeUndefined(); // seed values only — no live link
+	});
+
+	it("defaults a prior record's missing recipients to [] in the seed", async () => {
+		h.getShare.mockResolvedValue(undefined);
+		h.getLatestShareForBranch.mockResolvedValue({ ...PUBLIC_RECORD, recipients: undefined });
+		const io = makeIO();
+		await openShareModal(io, CTX);
+		expect(io.states.at(-1)).toMatchObject({ defaults: { visibility: "public", recipients: [] } });
+	});
+
+	it("omits defaults when the subject HAS a live link (no seeding over real state)", async () => {
+		// The branch's latest record is read in the same single pass, but a live link on
+		// THIS subject means it's never used to seed — defaults stay absent.
+		h.getShare.mockResolvedValue(MEMBER_RECORD);
+		h.getLatestShareForBranch.mockResolvedValue({ ...PUBLIC_RECORD, recipients: ["x@y.io"] });
+		const io = makeIO();
+		await openShareModal(io, CTX);
+		const state = io.states.at(-1) as { defaults?: unknown };
+		expect(state.defaults).toBeUndefined();
+	});
+
+	it("omits defaults when the branch has no prior share at all", async () => {
+		h.getShare.mockResolvedValue(undefined);
+		h.getLatestShareForBranch.mockResolvedValue(undefined);
+		const io = makeIO();
+		await openShareModal(io, CTX);
+		const state = io.states.at(-1) as { defaults?: unknown };
+		expect(state.defaults).toBeUndefined();
+	});
+
+	it("does NOT seed from an expired prior record (a lapsed grant must not be re-staged)", async () => {
+		// Issue #4: the seed candidate is expiry-filtered — seeding people from a share
+		// whose access intentionally lapsed would let one Send re-grant them.
+		h.getShare.mockResolvedValue(undefined);
+		h.getLatestShareForBranch.mockResolvedValue({
+			...MEMBER_RECORD,
+			recipients: ["ada@example.com"],
+			expiresAt: "2026-01-01T00:00:00.000Z", // before CTX.nowMs (2026-06-25)
+		});
+		const io = makeIO();
+		await openShareModal(io, CTX);
+		const state = io.states.at(-1) as { defaults?: unknown };
+		expect(state.defaults).toBeUndefined();
 	});
 
 	it("reconciles an existing branch collection link before rendering", async () => {
@@ -550,8 +627,17 @@ describe("sendInviteModal", () => {
 		const io = makeIO();
 		await sendInviteModal(io, CTX, ["cy@example.com"]);
 		expect(io.states.at(-1)).toEqual({ kind: "error", message: "Could not create share link: space unavailable" });
-		// The webview closed the popover optimistically, so a toast is the only visible channel.
-		expect(io.notifyError).toHaveBeenCalledWith(expect.stringContaining("Couldn't create the share link"));
+		// The webview closed the popover optimistically, so a toast is the only visible
+		// channel — it must carry the REAL reason, not a generic guess.
+		expect(io.notifyError).toHaveBeenCalledWith("Could not create share link: space unavailable");
+		expect(h.sendShareInviteAndGrantAccess).not.toHaveBeenCalled();
+	});
+
+	it("surfaces the specific binding reason in the invite toast (not a generic guess)", async () => {
+		h.generateLiveShare.mockRejectedValue(new ShareBindingError("cancelled"));
+		const io = makeIO();
+		await sendInviteModal(io, CTX, ["cy@example.com"]);
+		expect(io.notifyError).toHaveBeenCalledWith(expect.stringContaining("none was chosen"));
 		expect(h.sendShareInviteAndGrantAccess).not.toHaveBeenCalled();
 	});
 

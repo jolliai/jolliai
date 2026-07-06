@@ -18,5 +18,7 @@ export {
 	deriveRepoNameFromUrl,
 	getCanonicalRepoUrl,
 	normalizeRemoteUrl,
+	sameCanonicalRemote,
 	sanitizeBranchSlug,
+	sharedRepoIdentityMatches,
 } from "../../../cli/src/core/GitRemoteUtils.js";

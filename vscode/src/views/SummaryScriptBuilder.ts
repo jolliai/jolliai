@@ -209,6 +209,11 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
   // shares) and returns 'ready' — nothing is created until Copy / invite / org-on.
   function shareOpen(kind) {
     if (!shareOverlay) { return; }
+    shareDefaultsPrefilled = false;
+    // The explicit tier pick is in-session only — it must NOT leak into the next open of
+    // a different subject (which has its own link tier / prior default). Without this, a
+    // 'people' picked here would shadow the next subject's seeded default (issue #5).
+    shareUserPickedTier = '';
     shareKind = (kind === 'branch') ? 'branch' : 'commit';
     // Text only — the share glyph is a sibling SVG in the modal head, so setting
     // textContent here must not wipe it.
@@ -256,6 +261,8 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
   var shareOwnerName = '';
   var shareInvitePending = [];       // emails staged in the invite pane, sent on "Send invite"
   var shareUserPickedTier = '';      // the access tier the user explicitly chose (preserved across re-renders while no link exists)
+  var shareDefaults = null;          // last-used {visibility, recipients[]} for a subject with no link (amend re-keyed it)
+  var shareDefaultsPrefilled = false; // one prefill per modal open — a later ready re-render must not re-stage removed people
   function shareSetSyncBadge(mode) {
     var badge = document.getElementById('shareSyncBadge');
     if (!badge) { return; }
@@ -668,18 +675,48 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
       orgOption.hidden = !shareCanOrg;
       orgOption.textContent = 'Anyone within your Jolli Account';
     }
+    shareDefaults = state.defaults || null;
     // Preselect the access that matches the existing link's tier. With no link yet,
     // keep whatever tier the user explicitly picked (so selecting "people" isn't
-    // reverted to the org default and later Copy-minted as an org link); on the first
-    // render (nothing picked) fall back to org — or "only people you add" without an
-    // org-carrying key — so a public (anyone-with-link) share is always explicit.
+    // reverted to the org default and later Copy-minted as an org link); then the
+    // branch's last-used tier (the previous subject was re-keyed by an amend); on the
+    // first render (nothing picked, no history) fall back to org — or "only people
+    // you add" without an org-carrying key — so a public share is always explicit.
     if (shareAccessSelect) {
-      shareAccessSelect.value = shareLink
-        ? shareLink.visibility
-        : (shareUserPickedTier || (shareCanOrg ? 'org' : 'people'));
+      var seededTier;
+      if (shareLink) {
+        // A real link: show its actual tier verbatim — never clamp, or an existing org
+        // link would misrender as 'people' if the key's org capability later lapsed.
+        seededTier = shareLink.visibility;
+      } else {
+        seededTier = shareUserPickedTier || (shareDefaults && shareDefaults.visibility) || (shareCanOrg ? 'org' : 'people');
+        // Clamp only the SEEDED (no-link) tier to what THIS key can back: a seeded 'org'
+        // from a prior share (or a stale picked tier) is invalid when the current key has
+        // no org — the org <option> is hidden+disabled, so 'org' would leave the select on a
+        // tier the UI can't represent and a later Copy/mint would use an org tier the key
+        // can't carry. Fall to 'people'.
+        if (seededTier === 'org' && !shareCanOrg) { seededTier = 'people'; }
+      }
+      shareAccessSelect.value = seededTier;
     }
     shareSyncAccessUi();
     shareRenderInvited();
+    // No link but the branch has last-used people (the previous commit share's subject
+    // was stranded by an amend): restore them ONCE per open — staged in invite mode so a
+    // single "Send invite" re-grants everyone on the fresh link. Cancel drops to the
+    // normal main pane; nothing is granted until the user sends.
+    if (!shareLink && !shareDefaultsPrefilled && shareDefaults
+        && shareDefaults.recipients && shareDefaults.recipients.length > 0) {
+      shareDefaultsPrefilled = true;
+      shareInvitePending = [];
+      shareDefaults.recipients.forEach(function(e) { shareStagePending(e); });
+      var prefillSearch = document.getElementById('shareTeammateSearch');
+      if (prefillSearch) { prefillSearch.value = ''; }
+      shareHideSuggests();
+      shareSetSyncBadge('hide');
+      shareInviteEnter();
+      return;
+    }
     // A ready render always lands on the main pane: drop any staged-but-unsent
     // invitees (a completed send re-renders here too) and reset the search box.
     shareInvitePending = [];

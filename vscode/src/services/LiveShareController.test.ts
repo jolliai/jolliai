@@ -43,6 +43,7 @@ vi.mock("../util/Logger.js", () => ({ log: { info: vi.fn(), warn: vi.fn(), error
 import {
 	AttachmentPushError,
 	BranchMismatchError,
+	deriveShareDescription,
 	generateLiveShare,
 	NothingToShareError,
 	pushBranchMemoriesToSpace,
@@ -154,6 +155,44 @@ describe("subjectFingerprint", () => {
 	});
 });
 
+describe("deriveShareDescription", () => {
+	it("prefers the head commit's recap over its commit message", () => {
+		const head = { ...summary("B"), recap: "Reworked the share flow." } as unknown as CommitSummary;
+		expect(deriveShareDescription([summary("A"), head])).toBe("Reworked the share flow.");
+	});
+
+	it("falls back to the commit-message subject when the head has no recap", () => {
+		const head = { ...summary("B"), commitMessage: "Fix share blurb\n\nBody text" } as unknown as CommitSummary;
+		expect(deriveShareDescription([head])).toBe("Fix share blurb");
+	});
+
+	it("collapses whitespace and truncates to 200 chars with an ellipsis", () => {
+		const head = { ...summary("B"), recap: `${"word ".repeat(60)}tail` } as unknown as CommitSummary;
+		const blurb = deriveShareDescription([head]);
+		expect(blurb).toHaveLength(200);
+		expect(blurb?.endsWith("…")).toBe(true);
+		expect(blurb).not.toContain("\n");
+	});
+
+	it("returns undefined for an empty subject or a blank head", () => {
+		expect(deriveShareDescription([])).toBeUndefined();
+		const blank = { ...summary("B"), commitMessage: "   " } as unknown as CommitSummary;
+		expect(deriveShareDescription([blank])).toBeUndefined();
+	});
+
+	it("falls back to the commit subject when a unified-hoist head carries an empty recap", () => {
+		// version>=4 makes resolveEffectiveRecap return the recap verbatim — `""` here — so a
+		// `??` fallback would keep it; the truthy fallback must reach the commit subject.
+		const head = {
+			...summary("B"),
+			version: 4,
+			recap: "",
+			commitMessage: "Fix share blurb\n\nBody",
+		} as unknown as CommitSummary;
+		expect(deriveShareDescription([head])).toBe("Fix share blurb");
+	});
+});
+
 describe("generateLiveShare", () => {
 	it("throws NothingToShareError when the subject has no summaries", async () => {
 		mockLoad.mockResolvedValue({ summaries: [], missingCount: 0 });
@@ -199,6 +238,8 @@ describe("generateLiveShare", () => {
 		expect(payload.commitHashes).toEqual(["A", "B"]);
 		expect(payload.decisionCount).toBe(2); // one topic per commit
 		expect(payload.visibility).toBe("org");
+		// Blurb derived from the head commit (fixture has no recap → commit-message subject).
+		expect(payload.description).toBe("commit B");
 
 		const stored = mockPutShare.mock.calls[0][2];
 		expect(stored.visibility).toBe("public"); // from the (mocked) create result
@@ -506,6 +547,23 @@ describe("reconcileLiveShare", () => {
 		expect(mockUpdate).toHaveBeenCalledOnce();
 		const ref = mockUpdate.mock.calls[0][3].ref;
 		expect(ref.covered).toEqual([{ commitHash: "A", summaryDocId: 1001, attachmentDocIds: [] }]);
+	});
+
+	it("refreshes the description from the current head on PATCH", async () => {
+		mockGetShare.mockResolvedValue({
+			shareId: "7",
+			shareUrl: "https://acme.jolli.ai/b/x",
+			visibility: "public",
+			ref: { kind: "branchCollection", relativePath: "feature/x", covered: [] },
+			expiresAt: "2026-09-01T00:00:00.000Z",
+			decisionCount: 1,
+		});
+		const head = { ...summary("B"), recap: "Now with a recap." } as unknown as CommitSummary;
+		mockLoad.mockResolvedValue({ summaries: [summary("A"), head], missingCount: 0 });
+
+		await reconcileLiveShare(deps(), "feature/x");
+
+		expect(mockUpdate.mock.calls[0][3].description).toBe("Now with a recap.");
 	});
 
 	it("refreshes the cached decision count from the current base..HEAD (and writes no titles)", async () => {

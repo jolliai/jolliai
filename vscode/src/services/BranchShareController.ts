@@ -15,6 +15,7 @@
 import {
 	type BranchShareRecord,
 	getShare,
+	getShareWithBranchLatest,
 	putBranchShare,
 	removeShare,
 } from "../../../cli/src/core/BranchShareStore.js";
@@ -87,4 +88,4 @@ export async function patchShareAudience(
 }
 
 /** Re-exports the persistence reads the panel/modal need when (re)opening the modal. */
-export { getShare, putBranchShare };
+export { getShare, getShareWithBranchLatest, putBranchShare };

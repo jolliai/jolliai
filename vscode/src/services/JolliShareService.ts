@@ -18,6 +18,7 @@ import { request as httpsRequest } from "node:https";
 import { type JolliApiKeyMeta, parseBaseUrl, parseJolliApiKey } from "../../../cli/src/core/JolliApiUtils.js";
 import type { LiveRef } from "../../../cli/src/core/BranchShareStore.js";
 import { buildJolliApiHeaders, PluginOutdatedError } from "./JolliPushService.js";
+import { log } from "../util/Logger.js";
 
 export { PluginOutdatedError };
 
@@ -77,6 +78,8 @@ export interface LiveSharePayload {
 	readonly commitHashes: ReadonlyArray<string>;
 	/** Display slug (slugify) — distinct from the push folder identity in `ref`. */
 	readonly branchSlug?: string;
+	/** One-line blurb for the share page / invite email description line (≤200 chars). */
+	readonly description?: string;
 	readonly ref: LiveRef;
 	/** `people` access allowlist (lowercased emails). Server-gated; omit for public/org. */
 	readonly recipients?: ReadonlyArray<string>;
@@ -155,13 +158,21 @@ function requestJson<T>(
 	});
 }
 
-/** Maps a non-2xx response to the right error (426 → outdated, else detail + status). */
-function rejectForStatus(status: number, json: ErrorBody | null, raw: string): Error {
+/**
+ * Maps a non-2xx response to the right error (426 → outdated, else detail + status)
+ * AND logs it — backend error responses were previously invisible in the debug log,
+ * so a failed share/invite left no trace. `context` names the failing operation.
+ */
+function rejectForStatus(status: number, json: ErrorBody | null, raw: string, context: string): Error {
+	// Single source of truth for the failure text, so the logged reason and the thrown
+	// message never diverge (e.g. a json-present-but-empty body).
+	const errText = [json?.error, json?.message].filter(Boolean).join(" — ") || "request failed";
+	const rawTail = json ? "" : `: ${raw.slice(0, 200)}`;
+	log.warn("JolliShareService", `${context} failed (HTTP ${status}): ${errText}${rawTail}`);
 	if (status === 426) {
 		return new PluginOutdatedError(json?.message ?? "Plugin version is outdated. Please update to the latest version.");
 	}
-	const detail = [json?.error, json?.message].filter(Boolean).join(" — ");
-	return new Error(`${detail || "request failed"} (HTTP ${status})${json ? "" : `: ${raw.slice(0, 200)}`}`);
+	return new Error(`${errText} (HTTP ${status})${rawTail}`);
 }
 
 /** Narrow an unknown wire visibility to the plugin's tier union, or undefined when unrecognized. */
@@ -193,19 +204,21 @@ export async function createLiveShare(
 		}
 		return { ...json, visibility: asVisibility(json.visibility) ?? payload.visibility };
 	}
-	throw rejectForStatus(status, json, raw);
+	throw rejectForStatus(status, json, raw, "create share (POST /api/share/branch)");
 }
 
-/** Patch type for a live share update — expiry, visibility, recipients, and/or the `covered` ref. */
+/** Patch type for a live share update — expiry, visibility, recipients, description, and/or the `covered` ref. */
 export interface LiveSharePatch {
 	readonly visibility?: "public" | "org" | "people";
 	readonly expiresAt?: string;
 	readonly ref?: LiveRef;
+	/** One-line blurb for the share page / invite email description line (≤200 chars). */
+	readonly description?: string;
 	/** `people` allowlist (lowercased emails); sent when changing audience. */
 	readonly recipients?: ReadonlyArray<string>;
 }
 
-/** Updates a live share (visibility / covered ref / expiry) via PATCH. */
+/** Updates a live share (visibility / covered ref / expiry / description) via PATCH. */
 export async function updateLiveShare(
 	baseUrl: string | undefined,
 	apiKey: string,
@@ -227,7 +240,7 @@ export async function updateLiveShare(
 		const visibility = asVisibility(wireVisibility);
 		return { ...rest, ...(visibility && { visibility }) };
 	}
-	throw rejectForStatus(status, json, raw);
+	throw rejectForStatus(status, json, raw, "update share (PATCH /api/share/branch/:id)");
 }
 
 /** What the invite endpoint reports back: who got the email, and who couldn't be reached. */
@@ -271,7 +284,61 @@ export async function sendShareInviteAndGrantAccess(
 			return { sent: [...body.recipients], failed: [] };
 		}
 	}
-	throw rejectForStatus(status, json, raw);
+	throw rejectForStatus(status, json, raw, "send invite (POST /api/share/branch/:id/invite)");
+}
+
+/** One commit's downloaded share content: the sanitized structured summary + attachment (plan/note) bodies. */
+export interface SharedCommitExport {
+	readonly commitHash: string;
+	readonly summaryJson: string | null;
+	readonly attachments: ReadonlyArray<{ readonly title: string; readonly body: string }>;
+}
+
+/** The `/export` payload: a shared branch's structured memory, downloaded for local render. */
+export interface SharedBranchExport {
+	readonly branch: string;
+	readonly repoName: string;
+	/** Remote URL; null on public-tier shares (the backend withholds it from non-member callers). */
+	readonly repoUrl: string | null;
+	readonly kind: "branch" | "commit";
+	readonly headCommitHash: string;
+	readonly commits: ReadonlyArray<SharedCommitExport>;
+}
+
+/**
+ * Downloads a shared branch's structured memory (sanitized summaries + plan/note bodies)
+ * via the api-key-authenticated `GET /api/share/branch/<token>/export`. The request goes
+ * to the caller's OWN tenant (`keyMeta.u`); the token self-routes to the share's tenant
+ * within the same deployment. A cross-deployment token (a share on a different Jolli
+ * instance the user isn't signed into) resolves to a 404 — surfaced as a normal error.
+ */
+export async function exportSharedBranch(
+	baseUrl: string | undefined,
+	apiKey: string,
+	token: string,
+): Promise<SharedBranchExport> {
+	const { status, json, raw } = await requestJson<SharedBranchExport>(
+		"GET",
+		baseUrl,
+		apiKey,
+		`/api/share/branch/${encodeURIComponent(token)}/export`,
+	);
+	// Validate the string identity fields too, not just `commits`: the importer feeds
+	// repoName/branch/headCommitHash straight into path building + display, so a truncated
+	// 2xx body missing them would throw a raw TypeError instead of a clean error toast.
+	const body = json as Partial<SharedBranchExport> | null;
+	if (
+		status >= 200 &&
+		status < 300 &&
+		body &&
+		Array.isArray(body.commits) &&
+		typeof body.repoName === "string" &&
+		typeof body.branch === "string" &&
+		typeof body.headCommitHash === "string"
+	) {
+		return body as SharedBranchExport;
+	}
+	throw rejectForStatus(status, json, raw, "export shared branch (GET /api/share/branch/:token/export)");
 }
 
 /** Directory cap: the share popover's suggestion list never needs more than this many members. */
@@ -293,8 +360,8 @@ export function clearOrgMembersCache(): void {
  * error (the recipient picker still has git contributors + manual entry).
  *
  * Capped at {@link ORG_MEMBERS_MAX} and cached per (baseUrl, apiKey) for
- * {@link ORG_MEMBERS_TTL_MS} — only successful fetches are cached, so a transient
- * failure never sticks for the TTL.
+ * {@link ORG_MEMBERS_TTL_MS} — only a NON-EMPTY result is cached, so neither a
+ * transient failure nor an empty read sticks for the TTL (the next call re-fetches).
  */
 export async function listOrgMembers(baseUrl: string | undefined, apiKey: string): Promise<OrgMember[]> {
 	// NUL joiner: can't occur in a URL or an API key, so keys never collide.
@@ -310,7 +377,10 @@ export async function listOrgMembers(baseUrl: string | undefined, apiKey: string
 			apiKey,
 			"/api/jolli-memory/org-members",
 		);
-		if (status < 200 || status >= 300 || json === null) return [];
+		if (status < 200 || status >= 300 || json === null) {
+			log.warn("JolliShareService", `list org-members failed (HTTP ${status}) — not caching`);
+			return [];
+		}
 		const rows = Array.isArray(json.members) ? json.members : [];
 		const members: OrgMember[] = [];
 		for (const row of rows) {
@@ -320,9 +390,17 @@ export async function listOrgMembers(baseUrl: string | undefined, apiKey: string
 			const name = typeof row.name === "string" ? row.name : "";
 			members.push({ name, email });
 		}
-		orgMembersCache.set(cacheKey, { members, ts: Date.now() });
+		// Cache ONLY a non-empty result: an empty list means no members were resolved
+		// (indistinguishable from a soft failure), so it must not stick for the TTL —
+		// the next call re-fetches. Non-2xx/null above already return [] without caching.
+		if (members.length > 0) {
+			orgMembersCache.set(cacheKey, { members, ts: Date.now() });
+		} else {
+			log.warn("JolliShareService", "list org-members returned no members — not caching");
+		}
 		return members;
-	} catch {
+	} catch (err) {
+		log.warn("JolliShareService", `list org-members threw — not caching: ${err instanceof Error ? err.message : String(err)}`);
 		return [];
 	}
 }

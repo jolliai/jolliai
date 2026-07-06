@@ -3,7 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { JOLLI_DIR, JOLLIMEMORY_DIR } from "../Logger.js";
-import { type BranchShareRecord, getShare, putBranchShare, removeShare } from "./BranchShareStore.js";
+import {
+	type BranchShareRecord,
+	getShare,
+	getShareWithBranchLatest,
+	putBranchShare,
+	removeShare,
+} from "./BranchShareStore.js";
 
 let cwd: string;
 
@@ -165,5 +171,85 @@ describe("BranchShareStore", () => {
 		expect((await getShare(cwd, "a"))?.shareId).toBe("a");
 		expect((await getShare(cwd, "b"))?.shareId).toBe("b");
 		expect((await getShare(cwd, "c"))?.shareId).toBe("c");
+	});
+
+	describe("getShareWithBranchLatest", () => {
+		it("both undefined when the branch has no subjects at all", async () => {
+			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x");
+			expect(record).toBeUndefined();
+			expect(seed).toBeUndefined();
+		});
+
+		it("returns a commit subject's own record and no seed when it's the only commit share", async () => {
+			const hash = "a".repeat(40);
+			await putBranchShare(cwd, "feature/x", { ...MEMBER, shareId: "own" }, hash);
+			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", hash);
+			expect(record?.shareId).toBe("own");
+			expect(seed).toBeUndefined(); // no OTHER commit share to seed from
+		});
+
+		it("seeds a fresh commit subject from a stranded (same-kind) commit share, latest expiry wins", async () => {
+			await putBranchShare(
+				cwd,
+				"feature/x",
+				{ ...MEMBER, shareId: "old", recipients: ["ada@jolli.ai"], expiresAt: "2026-08-01T00:00:00.000Z" },
+				"a".repeat(40),
+			);
+			await putBranchShare(
+				cwd,
+				"feature/x",
+				{ ...MEMBER, shareId: "new", recipients: ["tom@jolli.ai"], expiresAt: "2026-10-01T00:00:00.000Z" },
+				"b".repeat(40),
+			);
+			// Open a brand-new commit subject (no record): seed is the newest stranded commit share.
+			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", "c".repeat(40));
+			expect(record).toBeUndefined();
+			expect(seed?.shareId).toBe("new");
+			expect(seed?.recipients).toEqual(["tom@jolli.ai"]);
+		});
+
+		it("does NOT seed a commit subject from a live branch share (cross-kind → no duplicate grant)", async () => {
+			// The branch share grants branch-wide access; seeding a commit modal from it and
+			// auto-staging its people would double-grant. A commit subject only seeds from
+			// other commit shares.
+			await putBranchShare(cwd, "feature/x", { ...MEMBER, shareId: "branch", recipients: ["ada@jolli.ai"] });
+			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", "a".repeat(40));
+			expect(record).toBeUndefined();
+			expect(seed).toBeUndefined(); // the branch share is not a seed source for a commit subject
+		});
+
+		it("a branch subject never seeds (its key is stable, never stranded)", async () => {
+			await putBranchShare(cwd, "feature/x", { ...MEMBER, shareId: "branch" });
+			await putBranchShare(cwd, "feature/x", { ...MEMBER, shareId: "commit" }, "a".repeat(40));
+			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x");
+			expect(record?.shareId).toBe("branch"); // its own record
+			expect(seed).toBeUndefined(); // does not seed from the commit share (cross-kind)
+		});
+
+		it("excludes the queried commit subject itself when picking the seed", async () => {
+			await putBranchShare(
+				cwd,
+				"feature/x",
+				{ ...MEMBER, shareId: "self", expiresAt: "2026-10-01T00:00:00.000Z" },
+				"a".repeat(40),
+			);
+			await putBranchShare(
+				cwd,
+				"feature/x",
+				{ ...MEMBER, shareId: "other", expiresAt: "2026-08-01T00:00:00.000Z" },
+				"b".repeat(40),
+			);
+			// Query the newer subject: its own record is returned; the seed is the OTHER one,
+			// even though the queried subject has a later expiry.
+			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", "a".repeat(40));
+			expect(record?.shareId).toBe("self");
+			expect(seed?.shareId).toBe("other");
+		});
+
+		it("does not match a branch whose name is a prefix of another (feat vs feature/x)", async () => {
+			await putBranchShare(cwd, "feature/x", PUB, "a".repeat(40));
+			const { seed } = await getShareWithBranchLatest(cwd, "feat", "b".repeat(40));
+			expect(seed).toBeUndefined();
+		});
 	});
 });

@@ -348,6 +348,28 @@ export function subjectFingerprint(summaries: ReadonlyArray<CommitSummary>): str
 	return createHash("sha1").update(JSON.stringify(projection)).digest("hex").slice(0, 16);
 }
 
+/** Server accepts up to 500; 200 keeps the email card / share page line to a true one-liner. */
+const SHARE_DESCRIPTION_MAX = 200;
+
+/**
+ * One-line blurb sent as the share's `description` (share page description line +
+ * invite email card): the head commit's recap, falling back to its commit-message
+ * subject. Whitespace-collapsed and capped at {@link SHARE_DESCRIPTION_MAX} chars.
+ * Undefined when the head summary yields no text — the server keeps `null` and the
+ * email simply omits the blurb block.
+ */
+export function deriveShareDescription(summaries: ReadonlyArray<CommitSummary>): string | undefined {
+	const head = summaries[summaries.length - 1];
+	if (!head) return undefined;
+	// Truthy fallback, not `??`: a unified-hoist summary can carry `recap: ""`, and `??`
+	// would keep the empty string instead of falling back to the commit subject.
+	const raw = resolveEffectiveRecap(head) || head.commitMessage.split("\n")[0] || "";
+	const oneLine = raw.replace(/\s+/g, " ").trim();
+	if (oneLine.length === 0) return undefined;
+	if (oneLine.length <= SHARE_DESCRIPTION_MAX) return oneLine;
+	return `${oneLine.slice(0, SHARE_DESCRIPTION_MAX - 1).trimEnd()}…`;
+}
+
 /** Builds the push context (binding chooser injected) for a subject push. */
 function buildPushContext(deps: LiveShareDeps, baseUrl: string, repoUrl: string): PushContext {
 	return {
@@ -391,6 +413,7 @@ export function generateLiveShare(params: GenerateLiveShareParams): Promise<Live
 		// on the record so the modal subtitle needn't reload summaries to count.
 		const decisionCount = countDecisions(subjectSummaries);
 		const contentHash = subjectFingerprint(subjectSummaries);
+		const description = deriveShareDescription(subjectSummaries);
 
 		const result = await createLiveShare(baseUrl, params.apiKey, {
 			repoUrl,
@@ -402,6 +425,7 @@ export function generateLiveShare(params: GenerateLiveShareParams): Promise<Live
 			headCommitHash,
 			commitHashes,
 			branchSlug: slugify(params.branch),
+			...(description && { description }),
 			ref,
 			...(params.recipients && { recipients: params.recipients }),
 		});
@@ -462,7 +486,13 @@ export function reconcileLiveShare(deps: LiveShareDeps, branch: string): Promise
 		const ctx = buildPushContext(deps, baseUrl, repoUrl);
 		const ref = await pushSubjectAndBuildRef(subjectSummaries, "branch", branch, ctx);
 
-		const result = await updateLiveShare(baseUrl, deps.apiKey, existing.shareId, { ref });
+		// Recap edits move `contentHash` (see subjectFingerprint), so the blurb refreshes
+		// on the same reconcile that republishes the content.
+		const description = deriveShareDescription(subjectSummaries);
+		const result = await updateLiveShare(baseUrl, deps.apiKey, existing.shareId, {
+			ref,
+			...(description && { description }),
+		});
 		// A ref-only PATCH legitimately omits unchanged fields (shareUrl/recipients/…).
 		// Preserve the existing values so the cached record stays reopen-able and the
 		// allowlist isn't dropped; only `ref` and anything the server actually returned change.
