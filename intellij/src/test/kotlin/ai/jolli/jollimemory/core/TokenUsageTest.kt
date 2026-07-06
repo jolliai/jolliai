@@ -56,6 +56,67 @@ class TokenUsageTest {
     }
 
     @Nested
+    inner class Cost {
+        @Test
+        fun `buckets per model and prices from cache_write + input + output (excludes cache_read)`() {
+            val agg = TokenUsage.aggregate(
+                listOf(
+                    session(
+                        "s1",
+                        listOf(
+                            entry(
+                                MessageUsage(
+                                    inputTokens = 1_000_000,
+                                    outputTokens = 1_000_000,
+                                    cacheReadTokens = 9_000_000, // must NOT affect cost
+                                    cacheWriteTokens = 1_000_000,
+                                    model = "claude-opus-4-8",
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )!!
+            agg.models shouldBe listOf(
+                ModelUsage("claude-opus-4-8", "anthropic", 1_000_000, 1_000_000, 1_000_000),
+            )
+            // 5 (input) + 25 (output) + 6.25 (cache_write); cache_read ignored.
+            agg.estimatedCostUsd shouldBe (5.0 + 25.0 + 6.25)
+        }
+
+        @Test
+        fun `merges same model across sessions and keeps distinct models separate`() {
+            val agg = TokenUsage.aggregate(
+                listOf(
+                    session("s1", listOf(entry(MessageUsage(inputTokens = 1_000_000, model = "claude-opus-4-8")))),
+                    session("s2", listOf(entry(MessageUsage(outputTokens = 1_000_000, model = "claude-opus-4-8")))),
+                    session("s3", listOf(entry(MessageUsage(inputTokens = 1_000_000, model = "claude-haiku-4-5")))),
+                ),
+            )!!
+            agg.models shouldBe listOf(
+                ModelUsage("claude-opus-4-8", "anthropic", 1_000_000, 1_000_000, 0),
+                ModelUsage("claude-haiku-4-5", "anthropic", 1_000_000, 0, 0),
+            )
+            // opus: 5 + 25 = 30 ; haiku: 1 → 31
+            agg.estimatedCostUsd shouldBe 31.0
+        }
+
+        @Test
+        fun `no cost when the model is unpriced or unrecorded`() {
+            val unpriced = TokenUsage.aggregate(
+                listOf(session("s1", listOf(entry(MessageUsage(inputTokens = 500, model = "mystery-model"))))),
+            )!!
+            unpriced.estimatedCostUsd shouldBe null
+            unpriced.models shouldBe listOf(ModelUsage("mystery-model", "unknown", 500, 0, 0))
+
+            val noModel = TokenUsage.aggregate(
+                listOf(session("s1", listOf(entry(MessageUsage(inputTokens = 500))))),
+            )!!
+            noModel.estimatedCostUsd shouldBe null
+        }
+    }
+
+    @Nested
     inner class ParseUsage {
         @Test
         fun `parses Claude message dot usage into the entry`() {
@@ -72,6 +133,21 @@ class TokenUsageTest {
                 cacheReadTokens = 19604,
                 cacheWriteTokens = 13064,
             )
+        }
+
+        @Test
+        fun `captures message dot model onto the usage for pricing`() {
+            val line = """
+                {"message":{"role":"assistant","model":"claude-opus-4-8",
+                "content":"hi","usage":{"input_tokens":10,"output_tokens":2}}}
+            """.trimIndent().replace("\n", "")
+            TranscriptReader.parseTranscriptLine(line, 0)!!.usage!!.model shouldBe "claude-opus-4-8"
+        }
+
+        @Test
+        fun `model defaults to empty when absent`() {
+            val line = """{"message":{"role":"assistant","content":"hi","usage":{"input_tokens":10}}}"""
+            TranscriptReader.parseTranscriptLine(line, 0)!!.usage!!.model shouldBe ""
         }
 
         @Test
