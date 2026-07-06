@@ -8,13 +8,17 @@ import {
 	diffTopics,
 	dropSubsumedRelatedTo,
 	type GraphEdge,
+	isCanonicalKinds,
 	isFingerprintMap,
+	MAX_UNIT_KINDS,
 	mergeCategoryLayer,
+	normalizeKinds,
 	normalizeSymmetricEdges,
 	SYMMETRIC_EDGE_TYPES,
 	type TopicSourceMeta,
 	toDistilled,
 	UNCATEGORIZED_CATEGORY_ID,
+	UNIT_KINDS,
 	validateDistilledGraph,
 } from "./GraphSchema.js";
 
@@ -32,7 +36,7 @@ function validGraph(): DistilledGraph {
 			{
 				id: "t1::u1",
 				topicSlug: "t1",
-				kind: "decision",
+				kinds: ["decision"],
 				shortTitle: "U1",
 				summary: "Unit 1.",
 				anchors: { files: [], commits: [] },
@@ -40,7 +44,7 @@ function validGraph(): DistilledGraph {
 			{
 				id: "t1::u2",
 				topicSlug: "t1",
-				kind: "mechanism",
+				kinds: ["mechanism", "constraint"],
 				shortTitle: "U2",
 				summary: "Unit 2.",
 				anchors: { files: [], commits: [] },
@@ -48,7 +52,7 @@ function validGraph(): DistilledGraph {
 			{
 				id: "t2::u3",
 				topicSlug: "t2",
-				kind: "fix",
+				kinds: ["fix"],
 				shortTitle: "U3",
 				summary: "Unit 3.",
 				anchors: { files: [], commits: [] },
@@ -84,11 +88,17 @@ describe("validateDistilledGraph", () => {
 		expect(validateDistilledGraph(g)).toContain("unit t1::u1: unknown topicSlug ghost");
 	});
 
-	it("flags an invalid unit kind", () => {
+	it("flags invalid unit kinds", () => {
 		const g = validGraph();
 		// biome-ignore lint/suspicious/noExplicitAny: deliberately bad data
-		g.units[0] = { ...g.units[0], kind: "bogus" as any };
-		expect(validateDistilledGraph(g)).toContain("unit t1::u1: invalid kind bogus");
+		g.units[0] = { ...g.units[0], kinds: ["bogus"] as any };
+		expect(validateDistilledGraph(g)).toContain('unit t1::u1: invalid kinds ["bogus"]');
+	});
+
+	it("flags an empty kinds array", () => {
+		const g = validGraph();
+		g.units[0] = { ...g.units[0], kinds: [] };
+		expect(validateDistilledGraph(g)).toContain("unit t1::u1: invalid kinds []");
 	});
 
 	it("flags dangling edge endpoints", () => {
@@ -253,7 +263,7 @@ describe("assembleGraph", () => {
 		const graph = assembleGraph(validGraph(), sources, "2026-06-15T00:00:00.000Z", "");
 
 		expect(graph.generatedAt).toBe("2026-06-15T00:00:00.000Z");
-		expect(graph.schemaVersion).toBe(2);
+		expect(graph.schemaVersion).toBe(3);
 
 		const t1 = graph.topics.find((t) => t.slug === "t1");
 		expect(t1?.sourceBranches).toEqual(["main", "feature/x"]);
@@ -296,7 +306,7 @@ describe("assembleGraph", () => {
 				{
 					id: "t1::u1",
 					topicSlug: "t1",
-					kind: "decision",
+					kinds: ["decision"],
 					shortTitle: "U1",
 					summary: "s",
 					anchors: { files: [], commits: [] },
@@ -304,7 +314,7 @@ describe("assembleGraph", () => {
 				{
 					id: "t2::u2",
 					topicSlug: "t2",
-					kind: "fix",
+					kinds: ["fix"],
 					shortTitle: "U2",
 					summary: "s",
 					anchors: { files: [], commits: [] },
@@ -455,10 +465,10 @@ describe("toDistilled", () => {
 
 	it("returns null on a unit missing a field, a bad kind, or bad anchors", () => {
 		const g = priorGraph() as Record<string, unknown>;
-		const baseUnit = { id: "x::u", topicSlug: "x", kind: "decision", shortTitle: "U", summary: "s" };
+		const baseUnit = { id: "x::u", topicSlug: "x", kinds: ["decision"], shortTitle: "U", summary: "s" };
 		expect(toDistilled({ ...g, units: [{ ...baseUnit /* no anchors */ }] })).toBeNull();
 		expect(
-			toDistilled({ ...g, units: [{ ...baseUnit, kind: "bogus", anchors: { files: [], commits: [] } }] }),
+			toDistilled({ ...g, units: [{ ...baseUnit, kinds: ["bogus"], anchors: { files: [], commits: [] } }] }),
 		).toBeNull();
 		expect(toDistilled({ ...g, units: [{ ...baseUnit, anchors: { files: "no", commits: [] } }] })).toBeNull();
 		expect(toDistilled({ ...g, units: [{ ...baseUnit, anchors: null }] })).toBeNull();
@@ -614,5 +624,83 @@ describe("mergeCategoryLayer", () => {
 		);
 		expect(categories.filter((c) => c.id === "x")).toHaveLength(1);
 		expect(categories.find((c) => c.id === "x")?.shortTitle).toBe("First");
+	});
+});
+
+describe("normalizeKinds", () => {
+	it("keeps a valid kinds array in order", () => {
+		expect(normalizeKinds({ kinds: ["mechanism", "constraint"] })).toEqual(["mechanism", "constraint"]);
+	});
+
+	it("coerces a legacy scalar kind to a single-element array", () => {
+		expect(normalizeKinds({ kind: "fix" })).toEqual(["fix"]);
+	});
+
+	it("prefers kinds[] over a legacy scalar when both are present", () => {
+		expect(normalizeKinds({ kinds: ["decision"], kind: "fix" })).toEqual(["decision"]);
+	});
+
+	it("dedupes preserving first-seen order (primary stays first)", () => {
+		expect(normalizeKinds({ kinds: ["fix", "fix", "decision"] })).toEqual(["fix", "decision"]);
+	});
+
+	it("caps at MAX_UNIT_KINDS", () => {
+		const many = ["decision", "mechanism", "fix", "constraint", "gotcha"];
+		expect(normalizeKinds({ kinds: many })).toHaveLength(MAX_UNIT_KINDS);
+		expect(normalizeKinds({ kinds: many })).toEqual(["decision", "mechanism", "fix"]);
+	});
+
+	it("filters out unknown and non-string members", () => {
+		expect(normalizeKinds({ kinds: ["decision", "bogus", 7, null, "gotcha"] })).toEqual(["decision", "gotcha"]);
+	});
+
+	it("returns [] when nothing valid survives", () => {
+		expect(normalizeKinds({ kinds: ["bogus", 5] })).toEqual([]);
+		expect(normalizeKinds({ kind: "nope" })).toEqual([]);
+		expect(normalizeKinds({})).toEqual([]);
+		expect(normalizeKinds({ kinds: "bogus" })).toEqual([]); // scalar kinds, but not a known kind
+	});
+
+	it("coerces a stray scalar kinds into a single-element array", () => {
+		expect(normalizeKinds({ kinds: "decision" })).toEqual(["decision"]);
+		// a scalar kinds still wins over a legacy scalar kind
+		expect(normalizeKinds({ kinds: "gotcha", kind: "fix" })).toEqual(["gotcha"]);
+	});
+
+	it("accepts all seven kinds", () => {
+		for (const k of ["decision", "mechanism", "fix", "constraint", "gotcha", "non-goal", "convention"]) {
+			expect(normalizeKinds({ kind: k })).toEqual([k]);
+		}
+	});
+
+	it("pins UNIT_KINDS to exactly the seven-member closed vocabulary", () => {
+		// The closed vocabulary is a red line (a stray add/remove would silently
+		// break cross-build tag consistency): assert set identity, not just membership.
+		expect([...UNIT_KINDS]).toEqual([
+			"decision",
+			"mechanism",
+			"fix",
+			"constraint",
+			"gotcha",
+			"non-goal",
+			"convention",
+		]);
+	});
+});
+
+describe("isCanonicalKinds", () => {
+	it("accepts a non-empty deduped array of valid kinds", () => {
+		expect(isCanonicalKinds(["decision"])).toBe(true);
+		expect(isCanonicalKinds(["decision", "constraint", "gotcha"])).toBe(true);
+	});
+
+	it("rejects empty, over-long, duplicated, non-array, or invalid-member values", () => {
+		expect(isCanonicalKinds([])).toBe(false);
+		expect(isCanonicalKinds(["decision", "mechanism", "fix", "constraint"])).toBe(false); // > MAX
+		expect(isCanonicalKinds(["fix", "fix"])).toBe(false); // dupes
+		expect(isCanonicalKinds(["decision", "bogus"])).toBe(false);
+		expect(isCanonicalKinds("decision")).toBe(false);
+		expect(isCanonicalKinds(undefined)).toBe(false);
+		expect(isCanonicalKinds([1, 2])).toBe(false);
 	});
 });

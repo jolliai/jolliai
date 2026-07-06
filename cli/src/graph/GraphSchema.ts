@@ -26,9 +26,63 @@ export type EdgeType = (typeof EDGE_TYPES)[number];
  */
 export const SYMMETRIC_EDGE_TYPES: ReadonlySet<EdgeType> = new Set<EdgeType>(["related-to", "contradicts"]);
 
-/** The kinds a knowledge unit can take. */
-export const UNIT_KINDS = ["decision", "mechanism", "fix"] as const;
+/**
+ * The kinds a knowledge unit can take. A unit carries 1–3 of these as an ordered
+ * `kinds[]` (see {@link DistilledUnit}); the first is the PRIMARY, driving the
+ * node's colour in the viz. The four kinds beyond the original trio
+ * (decision/mechanism/fix) were added to stop over-loading `decision` as a
+ * catch-all — see docs/graph-unit-*.md for the definitions and boundary rules.
+ */
+export const UNIT_KINDS = ["decision", "mechanism", "fix", "constraint", "gotcha", "non-goal", "convention"] as const;
 export type UnitKind = (typeof UNIT_KINDS)[number];
+
+/** Max number of kinds a single unit may carry (primary + up to two secondary). */
+export const MAX_UNIT_KINDS = 3;
+
+/**
+ * Coerce raw LLM/JSON input into a canonical `kinds[]`: accept a `kinds` array, a
+ * stray scalar `kinds`, or a legacy scalar `kind` string, keep only members of
+ * {@link UNIT_KINDS},
+ * dedupe preserving first-seen order (so `kinds[0]` stays the primary), and cap at
+ * {@link MAX_UNIT_KINDS}. Returns `[]` when nothing valid survives — callers decide
+ * whether an empty result means "drop this unit" (full path) or "fail the round"
+ * (strict path); see {@link GraphDistiller}. The legacy-scalar branch is a
+ * transitional robustness net for LLM responses only — persisted graph.json always
+ * stores canonical `kinds[]`.
+ */
+export function normalizeKinds(raw: { kinds?: unknown; kind?: unknown }): UnitKind[] {
+	const candidates: unknown[] = Array.isArray(raw.kinds)
+		? raw.kinds
+		: raw.kinds !== undefined
+			? [raw.kinds]
+			: raw.kind !== undefined
+				? [raw.kind]
+				: [];
+	const out: UnitKind[] = [];
+	for (const c of candidates) {
+		if (typeof c !== "string") continue;
+		const k = c as UnitKind;
+		if (UNIT_KINDS.includes(k) && !out.includes(k)) out.push(k);
+		if (out.length >= MAX_UNIT_KINDS) break;
+	}
+	return out;
+}
+
+/**
+ * Validates a persisted/canonical `kinds` value: a non-empty, deduped array of
+ * length ≤ {@link MAX_UNIT_KINDS} whose every member is a known {@link UnitKind}.
+ * Unlike {@link normalizeKinds} this does NOT coerce or accept a legacy scalar —
+ * it is the strict gate for graph.json (`validUnit` / `validateDistilledGraph`).
+ */
+export function isCanonicalKinds(v: unknown): v is UnitKind[] {
+	return (
+		Array.isArray(v) &&
+		v.length > 0 &&
+		v.length <= MAX_UNIT_KINDS &&
+		new Set(v).size === v.length &&
+		v.every((k) => typeof k === "string" && UNIT_KINDS.includes(k as UnitKind))
+	);
+}
 
 /**
  * Schema version stamped onto the emitted graph; bump on a breaking shape change.
@@ -50,8 +104,10 @@ export type UnitKind = (typeof UNIT_KINDS)[number];
  * `categories`/`topics`/`units`/`edges`, so these baseline-only fields are inert
  * to them. A FUTURE change to either field's shape, or any new top-level field,
  * is a breaking shape change and must bump this constant again.
+ * Bumped 2→3 when `DistilledUnit.kind: UnitKind` became `kinds: UnitKind[]`
+ * (multi-label) and four new kinds were added — an output-shape change on `units`.
  */
-export const GRAPH_SCHEMA_VERSION = 2;
+export const GRAPH_SCHEMA_VERSION = 3;
 
 /** Category id for topics not grouped into any real category. Shared by the full
  * distiller (backfill) and the incremental merge so both bucket the same way. */
@@ -81,11 +137,12 @@ export interface UnitAnchors {
 	readonly commits: string[];
 }
 
-/** A single distilled knowledge unit (one decision / mechanism / fix). */
+/** A single distilled knowledge unit (one decision / mechanism / fix / …). */
 export interface DistilledUnit {
 	readonly id: string;
 	readonly topicSlug: string;
-	readonly kind: UnitKind;
+	/** 1–3 kinds, ordered by salience; `kinds[0]` is the primary (drives colour). */
+	readonly kinds: UnitKind[];
 	readonly shortTitle: string;
 	readonly summary: string;
 	readonly anchors: UnitAnchors;
@@ -211,7 +268,7 @@ export function validateDistilledGraph(graph: DistilledGraph): string[] {
 		if (unitIds.has(u.id)) errors.push(`duplicate unit id ${u.id}`);
 		unitIds.add(u.id);
 		if (!topicSlugs.has(u.topicSlug)) errors.push(`unit ${u.id}: unknown topicSlug ${u.topicSlug}`);
-		if (!UNIT_KINDS.includes(u.kind)) errors.push(`unit ${u.id}: invalid kind ${u.kind}`);
+		if (!isCanonicalKinds(u.kinds)) errors.push(`unit ${u.id}: invalid kinds ${JSON.stringify(u.kinds)}`);
 	}
 
 	const edgePairSeen = new Set<string>();
@@ -474,7 +531,7 @@ function validUnit(u: unknown): boolean {
 	) {
 		return false;
 	}
-	if (!UNIT_KINDS.includes(r.kind as UnitKind)) return false;
+	if (!isCanonicalKinds(r.kinds)) return false;
 	if (typeof r.anchors !== "object" || r.anchors === null) return false;
 	const a = r.anchors as Record<string, unknown>;
 	return isStringArray(a.files) && isStringArray(a.commits);
@@ -539,7 +596,7 @@ export function toDistilled(graph: unknown): DistilledGraph | null {
 		units: us.map((u) => ({
 			id: u.id,
 			topicSlug: u.topicSlug,
-			kind: u.kind,
+			kinds: [...u.kinds],
 			shortTitle: u.shortTitle,
 			summary: u.summary,
 			anchors: { files: [...u.anchors.files], commits: [...u.anchors.commits] },

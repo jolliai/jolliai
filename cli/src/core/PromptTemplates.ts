@@ -759,7 +759,7 @@ Output ONLY a JSON object -- no prose, no markdown fences:
 {"categories":[{"id":"<kebab-id>","shortTitle":"<<=5 words>","summary":"<one sentence>"}],"topics":[{"slug":"<unchanged>","title":"<unchanged>","shortTitle":"<<=5 words>","summary":"<one sentence>","categoryId":"<category id>"}]}
 Include EVERY input topic exactly once. Use [] for empty arrays.`;
 
-const GRAPH_UNITS = `You are distilling ONE wiki topic into its atomic knowledge units. A unit is a single decision, mechanism, or fix that a future contributor must know -- project-specific knowledge, not generic engineering facts.
+const GRAPH_UNITS = `You are distilling ONE wiki topic into its atomic knowledge units. A unit is a single piece of project-specific knowledge a future contributor must know -- not a generic engineering fact.
 
 ## Topic
 {{topicTitle}}
@@ -767,16 +767,34 @@ const GRAPH_UNITS = `You are distilling ONE wiki topic into its atomic knowledge
 ## Page content
 {{content}}
 
+## Kinds
+Each unit carries 1-3 kinds, most salient first. Pick from:
+- decision: a deliberate choice made between options (we chose X over Y).
+- mechanism: how some part of the system works (neutral "how it works").
+- fix: a bug/problem that was resolved and closed (there was a fix action).
+- constraint: a hard rule/invariant that MUST hold; violating it breaks correctness (crash, data loss, broken invariant).
+- gotcha: a non-obvious pitfall or surprising behavior to watch out for (may or may not be fixed; it is a live warning).
+- non-goal: something deliberately NOT done, removed, rejected, or forbidden (the inverse of a decision).
+- convention: an established style/pattern the project always follows; violating it is only an inconsistency, not a correctness bug.
+
+Boundary rules (assign multiple kinds when a unit genuinely spans them):
+- decision vs non-goal: doing X = decision; not doing / removing / rejecting X = non-goal (a "chose X, so dropped Y" unit is [decision, non-goal]).
+- constraint vs convention: correctness red-line = constraint; style/consistency preference = convention.
+- decision + constraint: a choice that also establishes a hard invariant is [decision, constraint] (the choice is the decision; the resulting must-hold rule is the constraint).
+- fix vs gotcha: closed problem with a fix = fix; live warning about a trap = gotcha (a "fixed the trap and left a warning" unit is [fix, gotcha]).
+- mechanism is the fallback: use it only for neutral "how it works". If the unit says WHY it was chosen -> decision; if it says something MUST hold -> constraint.
+- rationale belongs INSIDE a decision's summary ("chose X because Y"), never a separate unit.
+
 ## Task
-- Extract 1-8 units. Each is exactly one decision / mechanism / fix.
-- kind is one of: decision (a deliberate trade-off), mechanism (how something works), fix (a bug or gotcha resolved).
+- Extract 1-8 units.
+- kinds: an array of 1-3 values from the list above, most important first (kinds[0] drives its colour). No duplicates.
 - id: a short kebab-case slug unique within THIS topic (the caller namespaces it globally).
 - shortTitle <= 5 words; summary one sentence.
 - anchors.files: source file paths named in the content (verbatim). anchors.commits: commit hashes named in the content. Use [] when none.
 
 ## Output
 Output ONLY a JSON object -- no prose, no markdown fences:
-{"units":[{"id":"<kebab>","kind":"decision|mechanism|fix","shortTitle":"<<=5 words>","summary":"<one sentence>","anchors":{"files":[],"commits":[]}}]}
+{"units":[{"id":"<kebab>","kinds":["decision","non-goal"],"shortTitle":"<<=5 words>","summary":"<one sentence>","anchors":{"files":[],"commits":[]}}]}
 Use [] for empty arrays.`;
 
 const GRAPH_EDGES = `You are finding typed relationships between knowledge units in a software project's wiki. You are given a flat list of units (id, topic, short title, summary).
@@ -941,7 +959,7 @@ export const TEMPLATES: ReadonlyMap<string, PromptTemplate> = new Map<string, Pr
 	// template's own version bump, not the schema version.
 	["graph-categories", { action: "graph-categories", version: 1, template: GRAPH_CATEGORIES }],
 	["graph-categories-delta", { action: "graph-categories-delta", version: 1, template: GRAPH_CATEGORIES_DELTA }],
-	["graph-units", { action: "graph-units", version: 1, template: GRAPH_UNITS }],
+	["graph-units", { action: "graph-units", version: 2, template: GRAPH_UNITS }],
 	["graph-edges", { action: "graph-edges", version: 1, template: GRAPH_EDGES }],
 	["rank-context", { action: "rank-context", version: 3, template: RANK_CONTEXT }],
 ]);

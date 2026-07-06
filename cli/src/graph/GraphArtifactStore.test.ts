@@ -14,7 +14,7 @@ function tinyDistill(): DistilledGraph {
 			{
 				id: "t1::u1",
 				topicSlug: "t1",
-				kind: "decision",
+				kinds: ["decision"],
 				shortTitle: "U1",
 				summary: "Unit one.",
 				anchors: { files: [], commits: [] },
@@ -68,7 +68,7 @@ describe("readGraph", () => {
 		await writeGraphArtifacts(root, written);
 
 		const got = await readGraph(root);
-		expect(got?.schemaVersion).toBe(2);
+		expect(got?.schemaVersion).toBe(3);
 		expect(got?.topicFingerprints).toEqual({ t1: "fp" });
 		expect(got?.units).toHaveLength(1);
 	});

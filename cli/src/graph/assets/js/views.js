@@ -200,9 +200,20 @@
       html += `<div class="collapsed-hint">${units.length} unit${units.length === 1 ? "" : "s"} hidden — click to expand</div>`;
       html += `<div class="unit-grid">`;
       for (const u of units) {
-        html += `<div class="unit-card${u.id === selectedUnitId ? " selected" : ""}" data-unit="${esc(u.id)}">`;
-        html += `<span class="u-kind ${esc(u.kind)}">${esc(u.kind)}</span>`;
+        // Colour the card by its PRIMARY kind: a left accent bar for at-a-glance
+        // scanning, and `--ukind` so the SELECTED outline uses the kind colour too
+        // (units highlight by kind; topics still highlight by category via --tcolor).
+        // Escape defensively (mirrors kindBadges) and fall back to --accent so an
+        // unknown/tampered kind degrades gracefully instead of emitting an invalid
+        // var() that drops the whole declaration.
+        const primaryKind = Array.isArray(u.kinds) && u.kinds.length ? esc(u.kinds[0]) : "";
+        const accent = primaryKind
+          ? ` style="--ukind:var(--kind-${primaryKind}, var(--accent));border-left-color:var(--kind-${primaryKind}, var(--accent))"`
+          : "";
+        html += `<div class="unit-card${primaryKind ? " kind-accent" : ""}${u.id === selectedUnitId ? " selected" : ""}"${accent} data-unit="${esc(u.id)}">`;
+        // Order mirrors the side panel: title → kinds → summary.
         html += `<h5>${esc(u.shortTitle)}</h5>`;
+        html += window.WikiRender.kindBadges(u.kinds);
         html += `<p>${esc(u.summary)}</p>`;
         html += `</div>`;
       }
@@ -304,9 +315,19 @@
       layoutCategory(board, categoryId)
         .catch((err) => {
           console.error("[wiki] layoutCategory failed, falling back to masonry", err);
-          layoutMasonry(board);
+          try {
+            layoutMasonry(board);
+          } catch (err2) {
+            console.error("[wiki] masonry fallback also failed", err2);
+          }
         })
         .then(() => {
+          // Failsafe: the board is visibility:hidden until `.laid-out`. If BOTH
+          // layout paths bailed (an early return on an empty/edge-case group set,
+          // or a throw in the fallback), the cards would be stranded invisible —
+          // a blank page. Force the class on so content is never stuck hidden.
+          const detail = board.querySelector(".category-detail.masonry");
+          if (detail) detail.classList.add("laid-out");
           drawCategoryEdges(categoryId);
           refreshSpotlight();
           settleCamera();
