@@ -465,6 +465,7 @@ kover {
                     "ai.jolli.jollimemory.toolwindow.SummaryEditorProvider*",
                     "ai.jolli.jollimemory.toolwindow.SummaryFileEditor*",
                     "ai.jolli.jollimemory.toolwindow.SummaryPanel*",
+                    "ai.jolli.jollimemory.toolwindow.ShareDialog*",
                     "ai.jolli.jollimemory.toolwindow.SummaryViewerDialog*",
                     "ai.jolli.jollimemory.toolwindow.SummaryVirtualFile*",
                     "ai.jolli.jollimemory.toolwindow.CommitsPanel*",
