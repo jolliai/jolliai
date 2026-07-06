@@ -315,6 +315,88 @@ describe("ClaudeTranscriptParser", () => {
 			expect(parser.parseTimestamp("{not json", 1)).toBeUndefined();
 		});
 	});
+
+	describe("parseUsageByModel", () => {
+		const turn = (model: string | undefined, usage: Record<string, number>): string =>
+			JSON.stringify({
+				type: "assistant",
+				message: { role: "assistant", content: [{ type: "text", text: "x" }], model, usage },
+			});
+
+		it("buckets by model with the same segment semantics as parseUsageTokens", () => {
+			const line = turn("claude-opus-4-8", {
+				input_tokens: 100,
+				cache_creation_input_tokens: 20,
+				cache_read_input_tokens: 300, // cumulative — must be excluded
+				output_tokens: 5,
+			});
+			expect(parser.parseUsageByModel([line])).toEqual([
+				{ model: "claude-opus-4-8", provider: "anthropic", input: 100, output: 5, cached: 20 },
+			]);
+		});
+
+		it("sums turns of the same model into one bucket", () => {
+			const lines = [
+				turn("claude-opus-4-8", { input_tokens: 10, output_tokens: 1, cache_creation_input_tokens: 2 }),
+				turn("claude-opus-4-8", { input_tokens: 30, output_tokens: 3, cache_creation_input_tokens: 4 }),
+			];
+			expect(parser.parseUsageByModel(lines)).toEqual([
+				{ model: "claude-opus-4-8", provider: "anthropic", input: 40, output: 4, cached: 6 },
+			]);
+		});
+
+		it("splits distinct models into separate buckets (mid-session model switch)", () => {
+			const lines = [
+				turn("claude-opus-4-8", { input_tokens: 10, output_tokens: 1 }),
+				turn("claude-haiku-4-5", { input_tokens: 20, output_tokens: 2 }),
+			];
+			const result = parser.parseUsageByModel(lines);
+			expect(result).toHaveLength(2);
+			expect(result).toContainEqual({
+				model: "claude-opus-4-8",
+				provider: "anthropic",
+				input: 10,
+				output: 1,
+				cached: 0,
+			});
+			expect(result).toContainEqual({
+				model: "claude-haiku-4-5",
+				provider: "anthropic",
+				input: 20,
+				output: 2,
+				cached: 0,
+			});
+		});
+
+		it("segments summed across buckets equal the parseUsageTokens total", () => {
+			const lines = [
+				turn("claude-opus-4-8", { input_tokens: 100, output_tokens: 5, cache_creation_input_tokens: 20 }),
+				turn("claude-haiku-4-5", { input_tokens: 40, output_tokens: 3, cache_creation_input_tokens: 1 }),
+			];
+			const byModel = parser.parseUsageByModel(lines);
+			const modelSum = byModel.reduce((a, m) => a + m.input + m.output + m.cached, 0);
+			const lineSum = lines.reduce((a, l) => {
+				const b = parser.parseUsageTokens(l, 0);
+				return a + b.input + b.output + b.cached;
+			}, 0);
+			expect(modelSum).toBe(lineSum);
+		});
+
+		it("buckets usage-bearing lines with no model under an empty id, and skips lines without usage", () => {
+			const lines = [
+				turn(undefined, { input_tokens: 7, output_tokens: 1 }),
+				JSON.stringify({ type: "user", message: { role: "user", content: "hi" } }),
+				"{not json",
+			];
+			expect(parser.parseUsageByModel(lines)).toEqual([
+				{ model: "", provider: "anthropic", input: 7, output: 1, cached: 0 },
+			]);
+		});
+
+		it("returns an empty array when no line carries usage", () => {
+			expect(parser.parseUsageByModel(["{not json", ""])).toEqual([]);
+		});
+	});
 });
 
 // ─── getParserForSource factory ──────────────────────────────────────────────

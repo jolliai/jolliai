@@ -5,7 +5,7 @@
  * CommitSummary tree. Children are stored newest-first (commitDate descending),
  * so traversal helpers reverse them when chronological order is needed.
  */
-import type { CommitSummary, ConversationTokenBreakdown, DiffStats, TopicSummary } from "../Types.js";
+import type { CommitSummary, ConversationTokenBreakdown, DiffStats, ModelTokenUsage, TopicSummary } from "../Types.js";
 
 /**
  * Discriminator: returns true when the summary node was written by the unified
@@ -150,6 +150,47 @@ export function aggregateConversationTokenBreakdown(node: CommitSummary): Conver
 		},
 		{ input: own.input, output: own.output, cached: own.cached },
 	);
+}
+
+/**
+ * Recursively merges the per-model conversation usage across the entire tree,
+ * one bucket per model summed over own + all descendants. The per-model
+ * counterpart of {@link aggregateConversationTokenBreakdown}: a consolidated
+ * root (amend/squash) must report the models its children consumed, not only its
+ * own, so the cost estimate on the root matches the sum of its rows.
+ */
+export function aggregateConversationModels(node: CommitSummary): ModelTokenUsage[] {
+	const byModel = new Map<string, ModelTokenUsage>();
+	const add = (m: ModelTokenUsage): void => {
+		const existing = byModel.get(m.model);
+		if (existing) {
+			byModel.set(m.model, {
+				...existing,
+				input: existing.input + m.input,
+				output: existing.output + m.output,
+				cached: existing.cached + m.cached,
+			});
+		} else {
+			byModel.set(m.model, { ...m });
+		}
+	};
+	for (const m of node.conversationModels ?? []) add(m);
+	for (const child of node.children ?? []) {
+		for (const m of aggregateConversationModels(child)) add(m);
+	}
+	return [...byModel.values()];
+}
+
+/**
+ * Recursively sums the estimated USD cost across the entire tree — the cost
+ * counterpart of {@link aggregateConversationTokens}. Nodes written before the
+ * field existed (or with no priced usage) contribute 0, so this is a lower bound
+ * on legacy trees, exactly as `estimatedCostUsd` is a lower bound per node.
+ */
+export function aggregateEstimatedCost(node: CommitSummary): number {
+	const own = node.estimatedCostUsd ?? 0;
+	const childCost = (node.children ?? []).reduce((acc, c) => acc + aggregateEstimatedCost(c), 0);
+	return own + childCost;
 }
 
 /** Recursively counts total topics across the entire tree. */

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { CommitSummary } from "../Types.js";
 import {
+	aggregateConversationModels,
 	aggregateConversationTokenBreakdown,
 	aggregateConversationTokens,
+	aggregateEstimatedCost,
 	aggregateStats,
 	aggregateTurns,
 	collectAllTopics,
@@ -234,6 +236,67 @@ describe("SummaryTree", () => {
 				children: [child],
 			};
 			expect(aggregateConversationTokenBreakdown(node)).toEqual({ input: 150, output: 10, cached: 0 });
+		});
+	});
+
+	describe("aggregateConversationModels", () => {
+		it("merges same-model buckets across the tree and keeps distinct models separate", () => {
+			const child1 = leaf({
+				commitHash: "t1",
+				conversationModels: [
+					{ model: "claude-opus-4-8", provider: "anthropic", input: 100, output: 20, cached: 5 },
+				],
+			});
+			const child2 = leaf({
+				commitHash: "t2",
+				conversationModels: [
+					{ model: "claude-opus-4-8", provider: "anthropic", input: 200, output: 40, cached: 10 },
+					{ model: "claude-haiku-4-5", provider: "anthropic", input: 30, output: 3, cached: 0 },
+				],
+			});
+			const node: CommitSummary = {
+				...D,
+				conversationModels: [
+					{ model: "claude-opus-4-8", provider: "anthropic", input: 50, output: 10, cached: 1 },
+				],
+				children: [child1, child2],
+			};
+			const result = aggregateConversationModels(node);
+			expect(result).toContainEqual({
+				model: "claude-opus-4-8",
+				provider: "anthropic",
+				input: 350,
+				output: 70,
+				cached: 16,
+			});
+			expect(result).toContainEqual({
+				model: "claude-haiku-4-5",
+				provider: "anthropic",
+				input: 30,
+				output: 3,
+				cached: 0,
+			});
+			expect(result).toHaveLength(2);
+		});
+
+		it("returns an empty array when no node carries per-model usage", () => {
+			const node: CommitSummary = { ...D, conversationModels: undefined, children: [] };
+			expect(aggregateConversationModels(node)).toEqual([]);
+		});
+	});
+
+	describe("aggregateEstimatedCost", () => {
+		it("sums own and children cost across the tree", () => {
+			const child1 = leaf({ commitHash: "t1", estimatedCostUsd: 0.25 });
+			const child2 = leaf({ commitHash: "t2", estimatedCostUsd: 0.5 });
+			const node: CommitSummary = { ...D, estimatedCostUsd: 0.1, children: [child1, child2] };
+			expect(aggregateEstimatedCost(node)).toBeCloseTo(0.85, 6);
+		});
+
+		it("treats nodes without a cost as 0 (lower bound on legacy trees)", () => {
+			const child = leaf({ commitHash: "t1", estimatedCostUsd: 0.4 });
+			const node: CommitSummary = { ...D, estimatedCostUsd: undefined, children: [child] };
+			expect(aggregateEstimatedCost(node)).toBeCloseTo(0.4, 6);
 		});
 	});
 

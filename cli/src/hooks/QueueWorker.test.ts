@@ -2865,6 +2865,109 @@ describe("QueueWorker", () => {
 			];
 			expect(calledSummary.conversationTokens).toBe(1425);
 		});
+
+		it("merges per-model usage across sessions and writes conversationModels + estimatedCostUsd", async () => {
+			// Both sessions used the same priced model (claude-opus-4-8: $5/1M input).
+			// The reconciliation must merge them into one bucket: 1M + 1M input → $10.
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cost-test.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadAllSessions).mockResolvedValue([
+				{
+					sessionId: "claude-a",
+					transcriptPath: "/tmp/claude-a.jsonl",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "claude" as const,
+				},
+				{
+					sessionId: "claude-b",
+					transcriptPath: "/tmp/claude-b.jsonl",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "claude" as const,
+				},
+			]);
+			vi.mocked(readTranscript).mockImplementation(async (transcriptPath: string) => ({
+				entries: [{ role: "human", content: "ctx", timestamp: "2026-04-01T12:00:00.000Z" }],
+				newCursor: { transcriptPath, lineNumber: 1, updatedAt: "2026-04-01T12:00:00.000Z" },
+				totalLinesRead: 1,
+				usageTokens: 1_000_000,
+				usageBreakdown: { input: 1_000_000, output: 0, cached: 0 },
+				usageByModel: [
+					{
+						model: "claude-opus-4-8",
+						provider: "anthropic" as const,
+						input: 1_000_000,
+						output: 0,
+						cached: 0,
+					},
+				],
+			}));
+
+			await runWorker("/test/cwd");
+
+			const [calledSummary] = vi.mocked(storeSummary).mock.calls[0] as [
+				{
+					conversationModels?: Array<{ model: string; input: number }>;
+					estimatedCostUsd?: number;
+					pricesAsOf?: string;
+				},
+				...unknown[],
+			];
+			expect(calledSummary.conversationModels).toEqual([
+				{ model: "claude-opus-4-8", provider: "anthropic", input: 2_000_000, output: 0, cached: 0 },
+			]);
+			// 2M input tokens × $5/1M = $10.
+			expect(calledSummary.estimatedCostUsd).toBeCloseTo(10, 6);
+			expect(calledSummary.pricesAsOf).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+		});
+
+		it("stores conversationModels but omits estimatedCostUsd for an unpriced model", async () => {
+			// A model absent from the price table keeps its tokens/models recorded but
+			// yields no cost — the reader shows "unknown", not a misleading $0.00.
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/unpriced-test.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadAllSessions).mockResolvedValue([
+				{
+					sessionId: "claude-x",
+					transcriptPath: "/tmp/claude-x.jsonl",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "claude" as const,
+				},
+			]);
+			vi.mocked(readTranscript).mockImplementation(async (transcriptPath: string) => ({
+				entries: [{ role: "human", content: "ctx", timestamp: "2026-04-01T12:00:00.000Z" }],
+				newCursor: { transcriptPath, lineNumber: 1, updatedAt: "2026-04-01T12:00:00.000Z" },
+				totalLinesRead: 1,
+				usageTokens: 500,
+				usageBreakdown: { input: 500, output: 0, cached: 0 },
+				usageByModel: [
+					{ model: "mystery-model", provider: "unknown" as const, input: 500, output: 0, cached: 0 },
+				],
+			}));
+
+			await runWorker("/test/cwd");
+
+			const [calledSummary] = vi.mocked(storeSummary).mock.calls[0] as [
+				{ conversationModels?: unknown[]; estimatedCostUsd?: number; pricesAsOf?: string },
+				...unknown[],
+			];
+			expect(calledSummary.conversationModels).toHaveLength(1);
+			expect(calledSummary.estimatedCostUsd).toBeUndefined();
+			expect(calledSummary.pricesAsOf).toBeUndefined();
+		});
 	});
 
 	// ─── C5: usage tokens counted even when a slice yields 0 merged entries ──────

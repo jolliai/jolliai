@@ -1621,6 +1621,9 @@ describe("SidebarWebviewProvider", () => {
 				total: 500,
 				reporting: 1,
 				memories: 3,
+				// Stored write-time cost: the webview prefers this over its Sonnet-rate
+				// fallback, so it must survive onto the posted payload.
+				estimatedCostUsd: 12.5,
 			}),
 		});
 		provider.resolveWebviewView(view as unknown as never);
@@ -1629,9 +1632,10 @@ describe("SidebarWebviewProvider", () => {
 		const msgs = view.webview.postMessage.mock.calls.map((c) => c[0]) as unknown[];
 		const statsMsg = msgs.find(
 			(m) => typeof m === "object" && m !== null && (m as { type?: unknown }).type === "branch:tokenStats",
-		) as { total?: number } | undefined;
+		) as { total?: number; estimatedCostUsd?: number } | undefined;
 		expect(statsMsg).toBeDefined();
 		expect(statsMsg?.total).toBe(500);
+		expect(statsMsg?.estimatedCostUsd).toBe(12.5);
 	});
 
 	it("handles refresh scope='kb' by re-listing root and refreshing memories", async () => {

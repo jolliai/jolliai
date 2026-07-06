@@ -1067,6 +1067,9 @@ export function buildSidebarScript(): string {
           total: msg.total,
           reporting: msg.reporting || 0,
           memories: msg.memories || 0,
+          // Write-time estimate from the actual model(s); when absent/0 the bar
+          // falls back to the client-side Sonnet-rate calc below.
+          estimatedCostUsd: msg.estimatedCostUsd || 0,
         };
         if (state.activeTab === 'branch') renderBranch();
         break;
@@ -3626,17 +3629,22 @@ export function buildSidebarScript(): string {
     // would contradict the non-zero total — suppress both and show the total
     // alone (the help tooltip already explains the partial reporting).
     var hasBreakdown = stats.input > 0 || stats.output > 0 || cached > 0;
-    // Cost estimate (Sonnet 4.6 pricing, per the mockup tooltip's "assumes
-    // Sonnet pricing"). The per-token rates below are baked in from
-    // SummaryUtils.ts's SONNET_INPUT_PER_TOKEN / SONNET_OUTPUT_PER_TOKEN /
-    // SONNET_CACHE_WRITE_PER_TOKEN — the same constants the Commit Memory
-    // panel's token meter uses — so a pricing update only has to be made once.
-    // The cached segment now carries cache_CREATION tokens (billed at 1.25x the
-    // input rate) — cache_READ is excluded upstream because it is cumulative per
-    // turn and would inflate the total. So this is a floor (a session's re-read of
-    // an already-cached prefix is real spend we deliberately do not count), which
-    // is why the tooltip says "actual spend may be higher".
-    var costUsd = stats.input * ${SONNET_INPUT_PER_TOKEN} + stats.output * ${SONNET_OUTPUT_PER_TOKEN} + cached * ${SONNET_CACHE_WRITE_PER_TOKEN};
+    // Cost: prefer the write-time estimate (stats.estimatedCostUsd), computed
+    // per commit from the ACTUAL conversation model(s) via the host price table,
+    // so a branch of Opus work is no longer priced as if it were Sonnet. Fall
+    // back to a client-side Sonnet-rate estimate only when the stored value is
+    // absent/0 — legacy memories, or models missing from the price table.
+    // The fallback per-token rates come from SummaryUtils.ts's
+    // SONNET_INPUT_PER_TOKEN / SONNET_OUTPUT_PER_TOKEN / SONNET_CACHE_WRITE_PER_TOKEN
+    // — the same constants the Commit Memory panel's token meter uses — so a
+    // pricing update only has to be made once.
+    // The cached segment carries cache_CREATION tokens (billed at 1.25x the input
+    // rate); cache_READ is excluded upstream (cumulative per turn), so either way
+    // this is a floor — hence the tooltip's "actual spend may be higher".
+    var usedStoredCost = (stats.estimatedCostUsd || 0) > 0;
+    var costUsd = usedStoredCost
+      ? stats.estimatedCostUsd
+      : stats.input * ${SONNET_INPUT_PER_TOKEN} + stats.output * ${SONNET_OUTPUT_PER_TOKEN} + cached * ${SONNET_CACHE_WRITE_PER_TOKEN};
     var costLabel = costUsd >= 0.01 ? '≈$' + costUsd.toFixed(2) : '<$0.01';
     var label = el('div', {
       className: 'token-bar-label',
@@ -3651,7 +3659,9 @@ export function buildSidebarScript(): string {
     var reporting = stats.reporting || 0;
     var memories = stats.memories || 0;
     var costSentence = hasBreakdown
-      ? ' The ≈$ cost is a cache-aware estimate; it assumes Sonnet pricing and counts reporting memories only, so actual spend may be higher.'
+      ? (usedStoredCost
+          ? ' The ≈$ cost is a cache-aware estimate priced per model at list rates (no promotional/volume discounts) and counts reporting memories only, so actual spend may be higher.'
+          : ' The ≈$ cost is a cache-aware estimate; it assumes Sonnet pricing and counts reporting memories only, so actual spend may be higher.')
       : '';
     var helpText;
     if (memories > 0 && reporting < memories) {

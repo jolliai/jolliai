@@ -972,5 +972,58 @@ describe("TranscriptReader", () => {
 			// cache_creation only; input + output + cached === usageTokens.
 			expect(result.usageBreakdown).toEqual({ input: 100, output: 5, cached: 20 });
 		});
+
+		it("produces per-model usage buckets from the consumed slice", async () => {
+			const filePath = join(tempDir, "claude-usage-by-model.jsonl");
+			const lines = [
+				JSON.stringify({
+					message: {
+						role: "assistant",
+						model: "claude-opus-4-8",
+						content: [{ type: "text", text: "a" }],
+						usage: { input_tokens: 100, cache_creation_input_tokens: 20, output_tokens: 5 },
+					},
+					timestamp: "2026-03-22T00:00:01Z",
+				}),
+				JSON.stringify({
+					message: {
+						role: "assistant",
+						model: "claude-haiku-4-5",
+						content: [{ type: "text", text: "b" }],
+						usage: { input_tokens: 40, output_tokens: 3 },
+					},
+					timestamp: "2026-03-22T00:00:02Z",
+				}),
+			];
+			await writeFile(filePath, lines.join("\n"), "utf-8");
+
+			const result = await readTranscript(filePath);
+			expect(result.usageByModel).toContainEqual({
+				model: "claude-opus-4-8",
+				provider: "anthropic",
+				input: 100,
+				output: 5,
+				cached: 20,
+			});
+			expect(result.usageByModel).toContainEqual({
+				model: "claude-haiku-4-5",
+				provider: "anthropic",
+				input: 40,
+				output: 3,
+				cached: 0,
+			});
+			// Per-model segments reconcile with the scalar breakdown.
+			const byModelSum = (result.usageByModel ?? []).reduce((a, m) => a + m.input + m.output + m.cached, 0);
+			expect(byModelSum).toBe(result.usageTokens);
+		});
+
+		it("omits usageByModel when the slice carries no usage lines", async () => {
+			const filePath = join(tempDir, "claude-no-usage.jsonl");
+			const lines = [JSON.stringify({ message: { role: "user", content: "hello" } })];
+			await writeFile(filePath, lines.join("\n"), "utf-8");
+
+			const result = await readTranscript(filePath);
+			expect(result.usageByModel).toBeUndefined();
+		});
 	});
 });

@@ -50,6 +50,7 @@ import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeS
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import { evaluatePlanProgress } from "../core/PlanProgressEvaluator.js";
 import { formatPlansBlock } from "../core/PlanPromptFormatter.js";
+import { estimateCostUsd, PRICES_AS_OF } from "../core/Pricing.js";
 import { deleteReferenceMarkdown, readReferenceMarkdown } from "../core/references/ReferenceStore.js";
 import { ALL_ADAPTERS } from "../core/references/sources/index.js";
 import {
@@ -132,6 +133,7 @@ import {
 	isIngestOperation,
 	type JolliMemoryConfig,
 	type LogLevel,
+	type ModelTokenUsage,
 	type NoteReference,
 	type PlanProgressArtifact,
 	type PlanReference,
@@ -1509,8 +1511,14 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// advanced (consumed) but their entries are dropped from the summary. The plans/notes/refs
 	// exclusion read here drives both prompt-block filtering and the discard pass below.
 	const exclusions = await readExclusions(cwd);
-	const { sessionTranscripts, totalEntries, humanEntries, conversationTokens, conversationTokenBreakdown } =
-		await loadSessionTranscripts(cwd, config, op.createdAt);
+	const {
+		sessionTranscripts,
+		totalEntries,
+		humanEntries,
+		conversationTokens,
+		conversationTokenBreakdown,
+		conversationModels,
+	} = await loadSessionTranscripts(cwd, config, op.createdAt);
 
 	// Step 5: Get git diff and stats (moved before guard to enable diff-only summaries)
 	stepStart = now();
@@ -1641,7 +1649,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 				// ADDS the field — it never deletes an already-present 0 — so an
 				// unconditional `conversationTokens: 0` here would survive onto the
 				// stored summary, where the success path omits it entirely.
-				...(conversationTokens > 0 && { conversationTokens, conversationTokenBreakdown }),
+				...conversationUsageFields(conversationTokens, conversationTokenBreakdown, conversationModels),
 				llm: {
 					model: config.model ?? "unknown",
 					inputTokens: 0,
@@ -1784,7 +1792,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		commitSource,
 		...summaryResult,
 		/* v8 ignore next -- conversationTokens=0 arm: only omitted when no usage-aware sessions ran */
-		...(conversationTokens > 0 && { conversationTokens, conversationTokenBreakdown }),
+		...conversationUsageFields(conversationTokens, conversationTokenBreakdown, conversationModels),
 		diffStats,
 		...(llmFailed ? { summaryError: LLM_FAILED } : {}),
 		...(planRefs.length > 0 ? { plans: planRefs } : {}),
@@ -2160,6 +2168,39 @@ interface AmendHoistedFields {
 }
 
 /**
+ * Builds the conversation usage/cost fields to spread onto a CommitSummary,
+ * omitting everything when the slice recorded no usage (so a literal 0 is never
+ * stored — matching the forward-only contract the display readers rely on).
+ *
+ * Single source of truth for the token→cost mapping at write time: given the
+ * per-model buckets it derives `estimatedCostUsd` centrally (via
+ * `core/Pricing.ts`) and stamps `pricesAsOf`, so every pipeline (leaf, amend
+ * short-circuit, amend full, amend fresh-leaf, LLM-failure fallbacks) prices
+ * identically. `estimatedCostUsd`/`pricesAsOf` are added only when the estimate
+ * is > 0 (all-unpriced usage keeps `conversationModels` but no cost, so the
+ * reader shows "unknown" rather than a misleading $0.00).
+ */
+function conversationUsageFields(
+	conversationTokens: number,
+	conversationTokenBreakdown: ConversationTokenBreakdown,
+	conversationModels: ReadonlyArray<ModelTokenUsage>,
+): Partial<
+	Pick<
+		CommitSummary,
+		"conversationTokens" | "conversationTokenBreakdown" | "conversationModels" | "estimatedCostUsd" | "pricesAsOf"
+	>
+> {
+	if (conversationTokens <= 0) return {};
+	const { totalUsd } = estimateCostUsd(conversationModels);
+	return {
+		conversationTokens,
+		conversationTokenBreakdown,
+		...(conversationModels.length > 0 && { conversationModels }),
+		...(totalUsd > 0 && { estimatedCostUsd: totalUsd, pricesAsOf: PRICES_AS_OF }),
+	};
+}
+
+/**
  * Builds the v4 amend root with all 8 Hoist fields populated and the old
  * summary attached as a stripped child. Used by all three amend paths
  * (pre-LLM short-circuit, post-LLM short-circuit, full path); the only
@@ -2185,6 +2226,7 @@ function buildHoistedAmendRoot(
 		readonly conversationTurns?: number;
 		readonly conversationTokens?: number;
 		readonly conversationTokenBreakdown?: ConversationTokenBreakdown;
+		readonly conversationModels?: ReadonlyArray<ModelTokenUsage>;
 	},
 ): CommitSummary {
 	return {
@@ -2205,13 +2247,11 @@ function buildHoistedAmendRoot(
 		...(hoisted.llm && { llm: hoisted.llm }),
 		...(stats?.transcriptEntries !== undefined && { transcriptEntries: stats.transcriptEntries }),
 		...(stats?.conversationTurns !== undefined && { conversationTurns: stats.conversationTurns }),
-		...(stats?.conversationTokens !== undefined &&
-			stats.conversationTokens > 0 && {
-				conversationTokens: stats.conversationTokens,
-				...(stats.conversationTokenBreakdown && {
-					conversationTokenBreakdown: stats.conversationTokenBreakdown,
-				}),
-			}),
+		...conversationUsageFields(
+			stats?.conversationTokens ?? 0,
+			stats?.conversationTokenBreakdown ?? { input: 0, output: 0, cached: 0 },
+			stats?.conversationModels ?? [],
+		),
 		...(hoisted.summaryError && { summaryError: hoisted.summaryError }),
 		/* v8 ignore stop */
 		...hoistMetadataFromOldSummary(oldSummary),
@@ -2256,6 +2296,7 @@ async function applyAmendShortCircuit(
 	humanEntries: number,
 	conversationTokens: number,
 	conversationTokenBreakdown: ConversationTokenBreakdown,
+	conversationModels: ReadonlyArray<ModelTokenUsage>,
 	cwd: string,
 	pipelineStart: number,
 	oldHash: string,
@@ -2282,6 +2323,7 @@ async function applyAmendShortCircuit(
 			conversationTurns: humanEntries,
 			conversationTokens,
 			conversationTokenBreakdown,
+			conversationModels,
 		},
 	);
 
@@ -2339,8 +2381,14 @@ async function handleAmendPipeline(
 	// exclusion read here drives prompt-block filtering and the discard pass below.
 	const amendConfig = await loadConfig();
 	const amendExclusions = await readExclusions(cwd);
-	const { sessionTranscripts, totalEntries, humanEntries, conversationTokens, conversationTokenBreakdown } =
-		await loadSessionTranscripts(cwd, amendConfig, beforeTimestamp);
+	const {
+		sessionTranscripts,
+		totalEntries,
+		humanEntries,
+		conversationTokens,
+		conversationTokenBreakdown,
+		conversationModels,
+	} = await loadSessionTranscripts(cwd, amendConfig, beforeTimestamp);
 
 	// Get git diff and stats. diffOverride (Scenario 1) provides oldHash->newHash
 	// (the actual amend delta); default HEAD~1..HEAD is the full amended diff.
@@ -2432,6 +2480,7 @@ async function handleAmendPipeline(
 			humanEntries,
 			conversationTokens,
 			conversationTokenBreakdown,
+			conversationModels,
 			cwd,
 			pipelineStart,
 			oldHash,
@@ -2532,7 +2581,7 @@ async function handleAmendPipeline(
 				// below, and the assembler's `...(conversationTokens > 0 && …)` spread
 				// only ADDS the field — it cannot delete a literal 0 carried in via
 				// `...delta`, so an unconditional 0 here would survive onto the summary.
-				...(conversationTokens > 0 && { conversationTokens, conversationTokenBreakdown }),
+				...conversationUsageFields(conversationTokens, conversationTokenBreakdown, conversationModels),
 				llm: {
 					model: amendConfig.model ?? "unknown",
 					inputTokens: 0,
@@ -2573,6 +2622,7 @@ async function handleAmendPipeline(
 			humanEntries,
 			conversationTokens,
 			conversationTokenBreakdown,
+			conversationModels,
 			cwd,
 			pipelineStart,
 			oldHash,
@@ -2675,6 +2725,7 @@ async function handleAmendPipeline(
 				conversationTurns: humanEntries,
 				conversationTokens,
 				conversationTokenBreakdown,
+				conversationModels,
 			},
 		);
 		await storeSummary(
@@ -2752,7 +2803,7 @@ async function handleAmendPipeline(
 		...(metadata?.commitSource && { commitSource: metadata.commitSource }),
 		...delta,
 		/* v8 ignore next -- conversationTokens=0 arm: only omitted when no usage-aware sessions ran */
-		...(conversationTokens > 0 && { conversationTokens, conversationTokenBreakdown }),
+		...conversationUsageFields(conversationTokens, conversationTokenBreakdown, conversationModels),
 		diffStats: amendFullDiffStats,
 		...(deltaLlmFailed && { summaryError: LLM_FAILED }),
 		...(freshLeafPlanRefs.length > 0 ? { plans: freshLeafPlanRefs } : {}),
@@ -2810,6 +2861,7 @@ async function loadSessionTranscripts(
 	humanEntries: number;
 	conversationTokens: number;
 	conversationTokenBreakdown: ConversationTokenBreakdown;
+	conversationModels: ModelTokenUsage[];
 }> {
 	const trackedSessions = filterSessionsByEnabledIntegrations(await loadAllSessions(cwd), config);
 
@@ -2968,6 +3020,10 @@ async function loadSessionTranscripts(
 	let ctInput = 0;
 	let ctOutput = 0;
 	let ctCached = 0;
+	// Per-model merge across surviving sessions, keyed by model id, walked in the
+	// SAME overlay-reconciled loop as the scalar/breakdown totals so a pruned
+	// session drops from the cost estimate exactly as it drops from the token bar.
+	const modelMerge = new Map<string, ModelTokenUsage>();
 	for (const [key, bucket] of raw.perSessionTokens) {
 		// A session removed by an overlay has a lower post-overlay entry count than
 		// its pre-overlay count; skip its (now-unattributable) tokens. Sessions the
@@ -2977,12 +3033,27 @@ async function loadSessionTranscripts(
 		ctInput += bucket.breakdown.input;
 		ctOutput += bucket.breakdown.output;
 		ctCached += bucket.breakdown.cached;
+		for (const [model, m] of bucket.byModel) {
+			const prev = modelMerge.get(model);
+			modelMerge.set(
+				model,
+				prev
+					? {
+							...prev,
+							input: prev.input + m.input,
+							output: prev.output + m.output,
+							cached: prev.cached + m.cached,
+						}
+					: { ...m },
+			);
+		}
 	}
 	const conversationTokenBreakdown: ConversationTokenBreakdown = {
 		input: ctInput,
 		output: ctOutput,
 		cached: ctCached,
 	};
+	const conversationModels: ModelTokenUsage[] = [...modelMerge.values()];
 
 	return {
 		allSessions,
@@ -2991,7 +3062,19 @@ async function loadSessionTranscripts(
 		humanEntries,
 		conversationTokens,
 		conversationTokenBreakdown,
+		conversationModels,
 	};
+}
+
+/**
+ * Per-conversation token attribution accumulated in {@link readAllTranscripts}:
+ * the scalar total, the 3-segment breakdown, and the per-model split (keyed by
+ * model id) used to estimate cost. `byModel` segments sum to `breakdown`.
+ */
+interface SessionTokenBucket {
+	tokens: number;
+	breakdown: { input: number; output: number; cached: number };
+	byModel: Map<string, ModelTokenUsage>;
 }
 
 /**
@@ -3018,8 +3101,10 @@ async function readAllTranscripts(
 	 * `loadSessionTranscripts` never re-adds their tokens, and zeroes ONLY the session
 	 * an overlay actually pruned — see the reconciliation comment there. Includes
 	 * zero-entry sessions (usage lines with no merged entries) so their tokens survive.
+	 * `byModel` carries the per-model split (keyed by model id within the session)
+	 * so the caller can aggregate models across surviving sessions for cost.
 	 */
-	perSessionTokens: Map<string, { tokens: number; breakdown: { input: number; output: number; cached: number } }>;
+	perSessionTokens: Map<string, SessionTokenBucket>;
 }> {
 	const sessionTranscripts: SessionTranscript[] = [];
 	let totalEntries = 0;
@@ -3029,10 +3114,7 @@ async function readAllTranscripts(
 	// conversations' tokens from the stored total. Keyed by conversationKey and
 	// populated even when a slice yields zero merged entries (a usage-only slice),
 	// so the subtraction stays exact.
-	const perSessionTokens = new Map<
-		string,
-		{ tokens: number; breakdown: { input: number; output: number; cached: number } }
-	>();
+	const perSessionTokens = new Map<string, SessionTokenBucket>();
 
 	for (const session of sessions) {
 		const cursor = await loadCursorForTranscript(session.transcriptPath, cwd);
@@ -3128,12 +3210,29 @@ async function readAllTranscripts(
 		const bucket = perSessionTokens.get(convKey) ?? {
 			tokens: 0,
 			breakdown: { input: 0, output: 0, cached: 0 },
+			byModel: new Map<string, ModelTokenUsage>(),
 		};
 		bucket.tokens += usage;
 		if (result.usageBreakdown) {
 			bucket.breakdown.input += result.usageBreakdown.input;
 			bucket.breakdown.output += result.usageBreakdown.output;
 			bucket.breakdown.cached += result.usageBreakdown.cached;
+		}
+		// Merge this slice's per-model usage into the session bucket (same model
+		// across slices sums; distinct models stay separate for cost pricing).
+		for (const m of result.usageByModel ?? []) {
+			const prev = bucket.byModel.get(m.model);
+			bucket.byModel.set(
+				m.model,
+				prev
+					? {
+							...prev,
+							input: prev.input + m.input,
+							output: prev.output + m.output,
+							cached: prev.cached + m.cached,
+						}
+					: { ...m },
+			);
 		}
 		perSessionTokens.set(convKey, bucket);
 

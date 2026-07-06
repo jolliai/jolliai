@@ -11,7 +11,7 @@
  */
 
 import { createLogger } from "../Logger.js";
-import type { ConversationTokenBreakdown, TranscriptEntry } from "../Types.js";
+import type { ConversationTokenBreakdown, ModelTokenUsage, TranscriptEntry } from "../Types.js";
 import { parseTranscriptLine } from "./TranscriptReader.js";
 
 const log = createLogger("TranscriptParser");
@@ -26,6 +26,14 @@ export interface TranscriptParser {
 	 *  reader sums these into the scalar `usageTokens` total. Absent method =
 	 *  source exposes no usage (all downstream sums default to 0). */
 	parseUsageTokens?(line: string, lineNum: number): ConversationTokenBreakdown;
+	/** Per-model token usage over a whole consumed slice, one bucket per model
+	 *  the transcript attributed tokens to. Whole-slice (not per-line) because a
+	 *  source may record the model on a *different* line than the usage (e.g.
+	 *  Codex `turn_context` vs `token_count`), needing cross-line state that is
+	 *  cleanest kept local to one call. The summed segments equal the sum of
+	 *  {@link parseUsageTokens} over the same lines. Absent method = no per-model
+	 *  usage (cost estimate is simply skipped for that source). */
+	parseUsageByModel?(lines: ReadonlyArray<string>): ModelTokenUsage[];
 	/** ISO timestamp of a raw line even when {@link parseLine} yields no entry
 	 *  (e.g. a tool-only assistant turn — no text content, but a real timestamp
 	 *  and usage). The reader needs this so the `beforeTimestamp` cutoff can gate
@@ -44,34 +52,42 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 	}
 
 	parseUsageTokens(line: string, _lineNum?: number): ConversationTokenBreakdown {
-		try {
-			const o = JSON.parse(line) as {
-				message?: { usage?: Record<string, unknown> };
-				usage?: Record<string, unknown>;
-			};
-			const u = o.message?.usage ?? o.usage;
-			if (!u || typeof u !== "object") return { input: 0, output: 0, cached: 0 };
-			const n = (k: string) => (typeof u[k] === "number" ? (u[k] as number) : 0);
-			// Per-turn token *delta* only — deliberately EXCLUDES cache_read_input_tokens.
-			// Real Claude transcripts (~/.claude/projects/*/*.jsonl) emit a cumulative
-			// cache_read_input_tokens on every assistant turn: it is the running total of
-			// the cached prefix re-read so far, so it grows monotonically across turns
-			// (e.g. 16036 → 26231 → 50109 → … within one session). Summing it across the
-			// turns of a slice re-counts the cached prefix on every turn and inflates
-			// conversationTokens by an order of magnitude. The genuine new spend per turn
-			// is input (uncached input) + cache_creation (the portion newly written to the
-			// cache this turn) + output; the cache *read* of an already-counted prefix is
-			// not new work and must not be summed. See the fixture-backed test for the
-			// observed cumulative shape. `cached` carries cache_creation so the segment
-			// reflects real cache-write volume without the cumulative cache_read trap.
-			return {
-				input: n("input_tokens"),
-				output: n("output_tokens"),
-				cached: n("cache_creation_input_tokens"),
-			};
-		} catch {
-			return { input: 0, output: 0, cached: 0 };
+		const usage = extractClaudeUsage(line);
+		if (!usage) return { input: 0, output: 0, cached: 0 };
+		return { input: usage.input, output: usage.output, cached: usage.cached };
+	}
+
+	/**
+	 * Per-model split: one bucket per distinct `message.model`, summed over the
+	 * slice. Reuses {@link extractClaudeUsage} so the segment values can never
+	 * drift from {@link parseUsageTokens}. Lines with usage but no model string
+	 * are bucketed under an empty model id (provider "anthropic") — they still
+	 * count toward tokens; pricing will treat an unknown id as unpriced.
+	 */
+	parseUsageByModel(lines: ReadonlyArray<string>): ModelTokenUsage[] {
+		const byModel = new Map<string, ModelTokenUsage>();
+		for (const line of lines) {
+			const usage = extractClaudeUsage(line);
+			if (!usage) continue;
+			const existing = byModel.get(usage.model);
+			if (existing) {
+				byModel.set(usage.model, {
+					...existing,
+					input: existing.input + usage.input,
+					output: existing.output + usage.output,
+					cached: existing.cached + usage.cached,
+				});
+			} else {
+				byModel.set(usage.model, {
+					model: usage.model,
+					provider: "anthropic",
+					input: usage.input,
+					output: usage.output,
+					cached: usage.cached,
+				});
+			}
 		}
+		return [...byModel.values()];
 	}
 
 	parseTimestamp(line: string, _lineNum?: number): string | undefined {
@@ -162,6 +178,47 @@ function parseCodexAgentMessage(
 		return null;
 	}
 	return { role: "assistant", content: message.trim(), timestamp };
+}
+
+/**
+ * Extracts one Claude assistant turn's model + token segments from a JSONL line.
+ * Returns null for lines with no `usage` block (user turns, tool results, etc.).
+ *
+ * Segment semantics (the single source of truth for both `parseUsageTokens` and
+ * `parseUsageByModel`): the per-turn delta only, deliberately EXCLUDING
+ * `cache_read_input_tokens`. Real Claude transcripts emit `cache_read_input_tokens`
+ * as a cumulative running total per turn (it grows monotonically across turns), so
+ * summing it across a slice re-counts the cached prefix every turn and inflates the
+ * total by an order of magnitude. Genuine new spend per turn is `input` (uncached
+ * input) plus `cache_creation` (newly written to cache this turn) plus `output`; a
+ * cache read of an already-counted prefix is not new work. `cached` therefore
+ * carries `cache_creation_input_tokens` only. See the fixture-backed test.
+ *
+ * `model` is `message.model` (falling back to a top-level `model`), or an empty
+ * string when absent; the turn still counts toward tokens and pricing treats an
+ * empty/unknown id as unpriced.
+ */
+function extractClaudeUsage(line: string): { model: string; input: number; output: number; cached: number } | null {
+	try {
+		const o = JSON.parse(line) as {
+			message?: { usage?: Record<string, unknown>; model?: unknown };
+			usage?: Record<string, unknown>;
+			model?: unknown;
+		};
+		const u = o.message?.usage ?? o.usage;
+		if (!u || typeof u !== "object") return null;
+		const n = (k: string) => (typeof u[k] === "number" ? (u[k] as number) : 0);
+		const rawModel = o.message?.model ?? o.model;
+		const model = typeof rawModel === "string" ? rawModel : "";
+		return {
+			model,
+			input: n("input_tokens"),
+			output: n("output_tokens"),
+			cached: n("cache_creation_input_tokens"),
+		};
+	} catch {
+		return null;
+	}
 }
 
 // ─── Singleton instances (stateless parsers, safe to share) ──────────────────
