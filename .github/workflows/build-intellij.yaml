@@ -25,25 +25,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Only IntelliJ (Kotlin/Gradle) changes need this job. cli/vscode/deps changes are
+      # covered by build-vscode, which also asserts the vscode → IntelliJ bundling contract
+      # (vscode/dist/Cli.js exists). The Kotlin tests never exec the bundled Cli.js
+      # (CliIntegrationsTest runs with NO cli-dist on the classpath) and don't depend on the
+      # sandbox, so a bundle-only change can't change this job's outcome — no need to
+      # rebuild the plugin here just because cli/ or vscode/ moved.
       - id: changes
-        uses: ./.github/actions/detect-relevant-paths
-        with:
-          globs: |
-            intellij/*
-            cli/*
-            vscode/*
-            package.json
-            package-lock.json
-            .nvmrc
-            .github/workflows/build-intellij.yaml
-
-      # Narrower flag for the expensive Kotlin `test` + Plugin Verifier steps. Those
-      # exercise only Kotlin code: they never exec the bundled Cli.js (CliIntegrationsTest
-      # runs with NO cli-dist on the classpath) and `test` has no sandbox dependency, so a
-      # cli/vscode/deps-only change cannot change their outcome. On such a change we still
-      # rebuild the plugin below (which re-runs copyCliDistToSandbox — the one thing a
-      # bundle change can break) but skip the ~20 min test suite and the Verifier.
-      - id: intellij-changes
         uses: ./.github/actions/detect-relevant-paths
         with:
           globs: |
@@ -91,11 +79,11 @@ jobs:
         name: Build plugin
         run: ./gradlew buildPlugin
 
-      - if: steps.intellij-changes.outputs.relevant == 'true'
+      - if: steps.changes.outputs.relevant == 'true'
         name: Run tests
         run: ./gradlew test
 
-      - if: steps.intellij-changes.outputs.relevant == 'true'
+      - if: steps.changes.outputs.relevant == 'true'
         name: Run Plugin Verifier
         run: ./gradlew verifyPlugin
 
