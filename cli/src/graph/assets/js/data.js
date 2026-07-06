@@ -125,5 +125,27 @@
     return window.WikiData;
   }
 
+  // Shared unit-kind chip renderer. A unit carries `kinds[]` (1-3, primary first);
+  // the primary drives the colour, the rest render as smaller secondary badges.
+  // Centralised here (loaded first) so views.js and panel.js never drift. Kind
+  // values come from a closed vocabulary in validated graph.json, but escape
+  // defensively anyway. Callers that need spacing around the whole cluster wrap
+  // the return value (see the panel's `.p-kinds`) rather than styling one chip.
+  const kindEsc = (s) =>
+    String(s ?? "").replace(
+      /[&<>"']/g,
+      (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+    );
+  function kindBadges(kinds) {
+    const list = Array.isArray(kinds) ? kinds : [];
+    if (!list.length) return "";
+    let html = `<span class="u-kind ${kindEsc(list[0])}">${kindEsc(list[0])}</span>`;
+    for (let i = 1; i < list.length; i++) {
+      html += `<span class="u-kind u-kind--sec ${kindEsc(list[i])}">${kindEsc(list[i])}</span>`;
+    }
+    return html;
+  }
+  window.WikiRender = { kindBadges };
+
   window.WikiDataLoader = { load };
 })();

@@ -169,10 +169,22 @@ export async function buildKnowledgeGraph(
 		// All topics deleted → the deletion case, taken to zero topics. Overwrite the
 		// stale graph.json with an empty (referentially-trivial) graph so the viz stops
 		// showing phantom topics — NO LLM. A bare skip here would leave the last good
-		// graph on disk forever. Nothing-ever-built (no usable baseline, or a baseline
-		// that is already empty) still skips.
-		if (prevDistill && prevDistill.topics.length > 0) {
-			log.info("All topics deleted (was %d) -- writing empty knowledge graph", prevDistill.topics.length);
+		// graph on disk forever. Nothing-ever-built (no prior graph, or one already
+		// empty) still skips.
+		//
+		// Gate on the RAW prevGraph, NOT prevDistill: after a GRAPH_SCHEMA_VERSION bump
+		// prevDistill is null (schema-mismatch gate above) even though a non-empty
+		// old-schema graph.json is still on disk. Using prevDistill here would let the
+		// "bump + empty index" case fall through to skip and strand that stale
+		// old-schema file (phantom topics) indefinitely. Any non-empty prior graph →
+		// write the fresh empty graph, which also re-stamps the current schemaVersion.
+		const prevTopicCount = prevGraph?.topics?.length ?? 0;
+		const prevUnitCount = prevGraph?.units?.length ?? 0;
+		if (prevTopicCount > 0 || prevUnitCount > 0) {
+			log.info(
+				"All topics deleted (prior graph had %d topic(s)) -- writing empty knowledge graph",
+				prevTopicCount,
+			);
 			const empty = assembleGraph({ categories: [], topics: [], units: [], edges: [] }, new Map(), now, repoName);
 			opts?.onProgress?.("writing graph.json");
 			const { graphJsonPath } = await writeGraphArtifacts(kbRoot, empty);

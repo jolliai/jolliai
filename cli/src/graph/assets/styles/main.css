@@ -43,7 +43,10 @@
   --kind-decision: #6eaaef;
   --kind-mechanism: #4ece8d;
   --kind-fix: #e0ac2b;
-  --kind-migration: #b494f0;
+  --kind-constraint: #f47067;
+  --kind-gotcha: #b494f0;
+  --kind-non-goal: #8a94a6;
+  --kind-convention: #56b6c2;
 
   /* Topic-box fill — OPAQUE (unlike the translucent --surface) so the back edge
      layer is occluded where a cross edge passes over a box. Mapped onto the
@@ -68,7 +71,10 @@ body.vscode-light {
   --kind-decision: #1f5a91;
   --kind-mechanism: #1b6340;
   --kind-fix: #96680e;
-  --kind-migration: #5c35a0;
+  --kind-constraint: #c0392b;
+  --kind-gotcha: #5c35a0;
+  --kind-non-goal: #5a6472;
+  --kind-convention: #1a7f8e;
 }
 
 * { box-sizing: border-box; }
@@ -296,20 +302,43 @@ body {
 .unit-card, .category-card, .portal, .topic-group { cursor: grab; }
 .wiki-dragging { cursor: grabbing !important; z-index: 50 !important; }
 .wiki-dragging.unit-card { transform: none; }
+/* A selected UNIT highlights in its PRIMARY-KIND colour (--ukind, set inline per
+   card); topics still highlight by category (--tcolor, see .topic-group.selected).
+   Falls back to category/accent for a unit with no kind. */
 .unit-card.selected {
-  border-color: var(--tcolor, var(--accent));
-  box-shadow: 0 0 0 1px var(--tcolor, var(--accent)) inset;
+  border-color: var(--ukind, var(--tcolor, var(--accent)));
+  box-shadow: 0 0 0 1px var(--ukind, var(--tcolor, var(--accent))) inset;
 }
 .unit-card.dimmed { opacity: .3; }
-.unit-card .u-kind {
+/* Primary-kind accent bar on the left edge (colour set inline per card). The 3px
+   border replaces the base 1px on the left; trim left padding by 2px so the text
+   column doesn't shift. */
+.unit-card.kind-accent { border-left-width: 3px; padding-left: 9px; }
+/* Chip shape/typography — global (not scoped to .unit-card) so the same pill
+   renders in the panel (p-meta / rel-head) as on board cards, now that a unit
+   can show a primary + secondary kind badges in both places. */
+.u-kind {
   display: inline-block; font-size: 9px; font-weight: 700; letter-spacing: .1em;
-  text-transform: uppercase; padding: 2px 7px; border-radius: 3px; margin-bottom: 7px;
+  text-transform: uppercase; padding: 2px 7px; border-radius: 3px;
   font-family: Consolas, monospace;
 }
-.u-kind.decision   { background: rgba(136,192,216,.16); color: var(--kind-decision); }
-.u-kind.mechanism  { background: rgba(163,181,119,.16); color: var(--kind-mechanism); }
-.u-kind.fix        { background: rgba(204,136,86,.18);  color: var(--kind-fix); }
-.u-kind.migration  { background: rgba(169,149,207,.16); color: var(--kind-migration); }
+/* Chips sit directly under the title (title → kinds → summary), mirroring the
+   side panel. The title's own bottom margin gives the gap above; the chips add a
+   gap below, before the summary. Same in the panel's per-topic unit list rows. */
+.unit-card .u-kind { margin-bottom: 7px; }
+.rel-item .u-kind { margin-bottom: 6px; }
+.u-kind.decision   { background: rgba(110,170,239,.16); color: var(--kind-decision); }
+.u-kind.mechanism  { background: rgba(78,206,141,.16);  color: var(--kind-mechanism); }
+.u-kind.fix        { background: rgba(224,172,43,.18);  color: var(--kind-fix); }
+.u-kind.constraint { background: rgba(244,112,103,.16); color: var(--kind-constraint); }
+.u-kind.gotcha     { background: rgba(180,148,240,.16); color: var(--kind-gotcha); }
+.u-kind.non-goal   { background: rgba(138,148,166,.16); color: var(--kind-non-goal); }
+.u-kind.convention { background: rgba(86,182,194,.16);  color: var(--kind-convention); }
+/* Secondary kinds (kinds[1..]) render smaller and dimmer next to the primary. */
+.u-kind.u-kind--sec { font-size: 8px; opacity: .8; margin-left: 4px; }
+/* Panel header: gap between the whole kind cluster and the trailing "in <topic>"
+   (the margin sits on the cluster, not one chip, so multi-kind units space right). */
+.p-meta .p-kinds { margin-right: 8px; }
 .unit-card h5 { margin: 0 0 5px; font-size: 13.5px; line-height: 1.35; }
 .unit-card p {
   margin: 0; font-size: 11.5px; color: var(--prose); line-height: 1.5;

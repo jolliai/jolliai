@@ -64,7 +64,7 @@
     const topic = D.topicsBySlug.get(u.topicSlug);
     let html = "";
     html += `<h2>${esc(u.shortTitle)}</h2>`;
-    html += `<div class="p-meta"><span class="u-kind ${esc(u.kind)}" style="margin-right:8px">${esc(u.kind)}</span>` +
+    html += `<div class="p-meta"><span class="p-kinds">${window.WikiRender.kindBadges(u.kinds)}</span>` +
       `in <code>${esc(topic.shortTitle)}</code></div>`;
     html += `<p class="summary">${esc(u.summary)}</p>`;
 
@@ -113,8 +113,8 @@
       html += `<h6>Units in this topic — ${units.length}</h6>`;
       for (const u of units) {
         html += `<div class="rel-item" data-goto-unit="${esc(u.id)}">` +
-          `<div class="rel-head"><span class="u-kind ${esc(u.kind)}">${esc(u.kind)}</span>` +
-          `<span class="rel-title">${esc(u.shortTitle)}</span></div>` +
+          `<div class="rel-head"><span class="rel-title">${esc(u.shortTitle)}</span></div>` +
+          window.WikiRender.kindBadges(u.kinds) +
           `<div class="rel-evidence">${esc(u.summary)}</div></div>`;
       }
     }

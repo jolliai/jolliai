@@ -16,6 +16,7 @@ vi.mock("./GraphDistiller.js", () => ({ distillGraph, distillGraphIncremental })
 vi.mock("./GraphArtifactStore.js", () => ({ writeGraphArtifacts, readGraph }));
 
 import { buildKnowledgeGraph, topicFingerprint, topicMetaFingerprint } from "./GraphBuilder.js";
+import { GRAPH_SCHEMA_VERSION } from "./GraphSchema.js";
 
 const ISO = "2026-06-15T00:00:00.000Z";
 const CONFIG = { apiKey: "k" };
@@ -29,7 +30,7 @@ const validDistill = {
 		{
 			id: "t1::u1",
 			topicSlug: "t1",
-			kind: "decision",
+			kinds: ["decision"],
 			shortTitle: "U1",
 			summary: "s",
 			anchors: { files: [], commits: [] },
@@ -251,7 +252,7 @@ describe("buildKnowledgeGraph", () => {
 		topicMetaFingerprints: Record<string, string> = {},
 	) {
 		return {
-			schemaVersion: 2,
+			schemaVersion: GRAPH_SCHEMA_VERSION,
 			generatedAt: "x",
 			source: "x",
 			topicFingerprints,
@@ -281,7 +282,7 @@ describe("buildKnowledgeGraph", () => {
 				{
 					id: "t1::u1",
 					topicSlug: "t1",
-					kind: "decision",
+					kinds: ["decision"],
 					shortTitle: "U1",
 					summary: "s",
 					anchors: { files: [], commits: [] },
@@ -494,5 +495,32 @@ describe("buildKnowledgeGraph", () => {
 		expect(graphArg.topics).toEqual([]);
 		expect(graphArg.units).toEqual([]);
 		expect(graphArg.categories).toEqual([]);
+	});
+
+	it("writes an empty graph on bump + empty index (stale-schema baseline is not stranded)", async () => {
+		readTopicIndex.mockResolvedValue({ schemaVersion: 1, topics: [] }); // all topics gone
+		// Prior graph exists but its schemaVersion no longer matches (a bump happened),
+		// so prevDistill is null. The empty-write gate must key off the RAW prevGraph
+		// (still non-empty) — otherwise this stale old-schema file would be stranded.
+		readGraph.mockResolvedValue({ ...richBaseline({ t1: fpOf("Topic1", "s1", "") }, {}), schemaVersion: 1 });
+
+		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
+
+		expect(r.built).toBe(true);
+		expect(r).toMatchObject({ topics: 0, units: 0, edges: 0 });
+		expect(distillGraph).not.toHaveBeenCalled();
+		expect(distillGraphIncremental).not.toHaveBeenCalled();
+		const [, graphArg] = writeGraphArtifacts.mock.calls[0];
+		expect(graphArg.topics).toEqual([]);
+		expect(graphArg.schemaVersion).toBe(GRAPH_SCHEMA_VERSION); // re-stamped to current
+	});
+
+	it("skips (no write) on empty index when there is no prior graph at all", async () => {
+		readTopicIndex.mockResolvedValue({ schemaVersion: 1, topics: [] });
+		readGraph.mockResolvedValue(null);
+		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
+		expect(r.built).toBe(false);
+		expect(r.reason).toBe("no topics");
+		expect(writeGraphArtifacts).not.toHaveBeenCalled();
 	});
 });

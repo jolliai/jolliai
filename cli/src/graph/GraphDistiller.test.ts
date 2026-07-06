@@ -379,7 +379,7 @@ describe("distillGraphIncremental", () => {
 				{
 					id: "t1::u1",
 					topicSlug: "t1",
-					kind: "decision",
+					kinds: ["decision"],
 					shortTitle: "U1",
 					summary: "s",
 					anchors: { files: [], commits: [] },
@@ -387,7 +387,7 @@ describe("distillGraphIncremental", () => {
 				{
 					id: "t2::uOld",
 					topicSlug: "t2",
-					kind: "fix",
+					kinds: ["fix"],
 					shortTitle: "old",
 					summary: "s",
 					anchors: { files: [], commits: [] },
@@ -702,5 +702,121 @@ describe("distillGraphIncremental", () => {
 		await expect(distillGraphIncremental(input, baseline(), diff, CONFIG)).rejects.toThrow(
 			/graph-edges returned no edges array/,
 		);
+	});
+});
+
+describe("kinds multi-label handling", () => {
+	const oneTopic = { topics: [{ slug: "t1", title: "Topic1", summary: "s", content: "b" }] };
+	const cats = JSON.stringify({
+		categories: [{ id: "c", shortTitle: "C", summary: "c" }],
+		topics: [{ slug: "t1", title: "Topic1", shortTitle: "T1", summary: "s", categoryId: "c" }],
+	});
+
+	it("preserves a canonical kinds[] and dedupes + caps at three, order preserved", async () => {
+		setup({
+			categories: cats,
+			units: {
+				Topic1: JSON.stringify({
+					units: [
+						{
+							id: "u1",
+							kinds: ["fix", "fix", "gotcha", "decision", "constraint"],
+							shortTitle: "U1",
+							summary: "s",
+						},
+					],
+				}),
+			},
+		});
+		const g = await distillGraph(oneTopic, CONFIG);
+		expect(g.units.find((u) => u.id === "t1::u1")?.kinds).toEqual(["fix", "gotcha", "decision"]);
+	});
+
+	it("coerces a legacy scalar kind into a single-element kinds[]", async () => {
+		setup({
+			categories: cats,
+			units: {
+				Topic1: JSON.stringify({ units: [{ id: "u1", kind: "mechanism", shortTitle: "U", summary: "s" }] }),
+			},
+		});
+		const g = await distillGraph(oneTopic, CONFIG);
+		expect(g.units.find((u) => u.id === "t1::u1")?.kinds).toEqual(["mechanism"]);
+	});
+
+	it("full path drops a unit with no valid kind but keeps its valid siblings", async () => {
+		setup({
+			categories: cats,
+			units: {
+				Topic1: JSON.stringify({
+					units: [
+						{ id: "bad", kinds: ["bogus"], shortTitle: "B", summary: "s" },
+						{ id: "ok", kinds: ["decision", "non-goal"], shortTitle: "OK", summary: "s" },
+					],
+				}),
+			},
+		});
+		const g = await distillGraph(oneTopic, CONFIG);
+		expect(g.units.map((u) => u.id)).toEqual(["t1::ok"]);
+		expect(g.units[0].kinds).toEqual(["decision", "non-goal"]);
+	});
+
+	it("incremental (strict) throws when a dirty topic's units are ALL invalid-kind (fail closed)", async () => {
+		callLlm.mockImplementation(async (opts: { action: string }) => {
+			if (opts.action === "graph-categories-delta")
+				return {
+					text: JSON.stringify({
+						newCategories: [],
+						topics: [{ slug: "t1", shortTitle: "T1", summary: "s", categoryId: "c" }],
+					}),
+				};
+			if (opts.action === "graph-units")
+				return {
+					text: JSON.stringify({ units: [{ id: "u1", kinds: ["bogus"], shortTitle: "U", summary: "s" }] }),
+				};
+			return { text: '{"edges":[]}', stopReason: null };
+		});
+		const prev: DistilledGraph = {
+			categories: [{ id: "c", shortTitle: "C", summary: "s" }],
+			topics: [],
+			units: [],
+			edges: [],
+		};
+		const diff: TopicDiff = { clean: [], dirty: ["t1"], added: [], deleted: [] };
+		await expect(distillGraphIncremental(oneTopic, prev, diff, CONFIG)).rejects.toThrow(
+			/none had a valid id \+ kinds/,
+		);
+	});
+
+	it("full path degrades an all-invalid topic to [] (onError) without aborting the build", async () => {
+		callLlm.mockImplementation(async (opts: { action: string; params: Record<string, string> }) => {
+			if (opts.action === "graph-categories")
+				return {
+					text: JSON.stringify({
+						categories: [{ id: "c", shortTitle: "C", summary: "c" }],
+						topics: TWO_TOPICS.topics.map((t) => ({
+							slug: t.slug,
+							title: t.title,
+							shortTitle: t.slug,
+							summary: t.summary,
+							categoryId: "c",
+						})),
+					}),
+				};
+			if (opts.action === "graph-units") {
+				if (opts.params.topicTitle === "Topic1")
+					return {
+						text: JSON.stringify({
+							units: [{ id: "u1", kinds: ["bogus"], shortTitle: "U", summary: "s" }],
+						}),
+					};
+				return {
+					text: JSON.stringify({ units: [{ id: "u9", kinds: ["fix"], shortTitle: "U9", summary: "s" }] }),
+				};
+			}
+			return { text: '{"edges":[]}', stopReason: null };
+		});
+		const g = await distillGraph(TWO_TOPICS, CONFIG);
+		// Topic1 threw (all-invalid) → swallowed to []; Topic2 survives.
+		expect(g.units.map((u) => u.id)).toEqual(["t2::u9"]);
 	});
 });

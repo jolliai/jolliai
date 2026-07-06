@@ -27,10 +27,9 @@ import {
 	type EdgeType,
 	type GraphEdge,
 	mergeCategoryLayer,
+	normalizeKinds,
 	type TopicDiff,
 	UNCATEGORIZED_CATEGORY_ID,
-	UNIT_KINDS,
-	type UnitKind,
 } from "./GraphSchema.js";
 
 const log = createLogger("GraphDistiller");
@@ -119,6 +118,9 @@ interface CategoriesResponse {
 }
 interface RawUnit {
 	id?: unknown;
+	/** Canonical multi-label form. */
+	kinds?: unknown;
+	/** Legacy scalar; still accepted at ingestion and coerced to `[kind]`. */
 	kind?: unknown;
 	shortTitle?: unknown;
 	summary?: unknown;
@@ -243,15 +245,18 @@ async function distillUnitsForTopic(
 	// `{}` / `{"foo":1}` parse fine but would degrade to zero units and overwrite a
 	// dirty topic's baseline units — so a missing/non-array field fails the round too.
 	// `{"units":[]}` (array present, empty) is a legitimate "no units" and does not throw.
-	if (opts?.strict && !Array.isArray(parsed?.units)) {
+	const rawUnits = parsed?.units;
+	if (opts?.strict && !Array.isArray(rawUnits)) {
 		throw new Error(`graph-units returned no units array for topic ${topic.slug}`);
 	}
 	const units: DistilledUnit[] = [];
 	const seenLocal = new Set<string>();
-	for (const u of parsed?.units ?? []) {
+	for (const u of rawUnits ?? []) {
 		const localId = asString(u.id).trim();
-		const kind = asString(u.kind) as UnitKind;
-		if (!localId || !UNIT_KINDS.includes(kind)) continue;
+		// Canonical `kinds[]` (deduped, ≤3); also coerces a legacy scalar `kind`.
+		// A unit with no valid id or no valid kind is unusable → skip it.
+		const kinds = normalizeKinds(u);
+		if (!localId || kinds.length === 0) continue;
 		// Namespace per topic to guarantee global uniqueness; suffix on collision.
 		let local = localId;
 		let n = 2;
@@ -263,11 +268,22 @@ async function distillUnitsForTopic(
 		units.push({
 			id: `${topic.slug}::${local}`,
 			topicSlug: topic.slug,
-			kind,
+			kinds,
 			shortTitle,
 			summary: asNonBlank(u.summary, shortTitle),
 			anchors: { files: asStringArray(u.anchors?.files), commits: asStringArray(u.anchors?.commits) },
 		});
+	}
+	// Fail closed: the LLM returned a NON-EMPTY units array but every entry was
+	// unusable (no id, or no recognizable kind). That is a malformed round, not a
+	// legitimate "no units" (which is an empty `{units:[]}` and is left untouched
+	// above). Throwing keeps the incremental path on its prior good graph; on the
+	// full path the caller's onError degrades this one topic to [] with a warning
+	// instead of silently emitting a topic that lost all its units.
+	if (Array.isArray(rawUnits) && rawUnits.length > 0 && units.length === 0) {
+		throw new Error(
+			`graph-units for topic ${topic.slug}: ${rawUnits.length} raw unit(s) but none had a valid id + kinds`,
+		);
 	}
 	return units;
 }
