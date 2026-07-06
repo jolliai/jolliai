@@ -251,7 +251,7 @@ object PostCommitHook {
             log.warn("Cannot resolve commit %s (rewritten/gone?) — skipping op", op.commitHash.take(8))
             return
         }
-        val infoParts = commitInfoStr.split(" ")
+        val infoParts = commitInfoStr.split("\u0000")
         if (infoParts.size < 4) return
         val commitInfo = CommitInfo(infoParts[0], infoParts[1], infoParts[2], infoParts[3])
         log.info("Processing %s op: %s — %s", op.type, commitInfo.hash.take(8), commitInfo.message.take(60))
