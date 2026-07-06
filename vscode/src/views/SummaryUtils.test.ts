@@ -35,6 +35,8 @@ import {
 	formatDate,
 	formatFullDate,
 	formatProviderLabel,
+	formatSonnetCostEstimate,
+	formatTokensCompact,
 	padIndex,
 	renderCalloutText,
 	sortTopics,
@@ -885,6 +887,50 @@ describe("SummaryUtils", () => {
 		it("returns undefined when nothing is configured", () => {
 			delete process.env.ANTHROPIC_API_KEY;
 			expect(formatActiveProviderLabel({} as never)).toBeUndefined();
+		});
+	});
+
+	// ─── formatTokensCompact / formatSonnetCostEstimate ─────────────────────────
+	// Shared by the sidebar's token bar (as inlined client JS text) and the
+	// Commit Memory panel's token meter (calling these directly) so the two
+	// surfaces never disagree on the same underlying token counts.
+
+	describe("formatTokensCompact", () => {
+		it("renders sub-1000 counts as a bare number", () => {
+			expect(formatTokensCompact(500)).toBe("500");
+			expect(formatTokensCompact(0)).toBe("0");
+		});
+
+		it("renders thousands with a 'k' suffix, rounded", () => {
+			expect(formatTokensCompact(5000)).toBe("5k");
+			expect(formatTokensCompact(96499)).toBe("96k");
+		});
+
+		it("renders millions with an 'M' suffix and one decimal", () => {
+			expect(formatTokensCompact(1443000)).toBe("1.4M");
+		});
+
+		it("strips a trailing '.0' for round millions", () => {
+			expect(formatTokensCompact(2000000)).toBe("2M");
+		});
+
+		it("promotes counts that would round up to 1000k into the 'M' form", () => {
+			// 999_800 / 1000 rounds to 1000 — must render "1M", not "1000k".
+			expect(formatTokensCompact(999_800)).toBe("1M");
+			expect(formatTokensCompact(999_500)).toBe("1M");
+			// Just below the promotion boundary still reads as 999k.
+			expect(formatTokensCompact(999_499)).toBe("999k");
+		});
+	});
+
+	describe("formatSonnetCostEstimate", () => {
+		it("floors sub-cent estimates to '<$0.01'", () => {
+			expect(formatSonnetCostEstimate(0.001)).toBe("<$0.01");
+		});
+
+		it("renders cent-and-above estimates as '≈$X.XX'", () => {
+			expect(formatSonnetCostEstimate(4.329)).toBe("≈$4.33");
+			expect(formatSonnetCostEstimate(0.01)).toBe("≈$0.01");
 		});
 	});
 });

@@ -194,9 +194,10 @@ export interface SerializedTreeItem {
 	/**
 	 * Commits panel only: full URL of the memory article on Jolli Space after
 	 * pushing. Present only when the commit has a memory that has been pushed.
-	 * Drives the SHIPPED group's Push/Synced status row in the expanded memory
-	 * detail (Synced + link when present; "Not pushed — Push to Jolli" action
-	 * when absent). Undefined for commits with no memory or unpushed memories.
+	 * Drives the SHIPPED group's share/synced status row in the expanded memory
+	 * detail ("Shared in Jolli — open article" + link when present; "Not shared —
+	 * Share in Jolli" action when absent). Undefined for commits with no memory
+	 * or unshared memories.
 	 */
 	readonly jolliDocUrl?: string;
 	/**

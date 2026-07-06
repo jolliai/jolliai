@@ -856,6 +856,225 @@ describe("StatusOrchestrator", () => {
 			expect(statusStore.setSyncPhase).toHaveBeenCalledWith(null);
 		});
 	});
+
+	// ── Coverage-completion cases ──────────────────────────────────────────
+	describe("edge cases", () => {
+		function makeStubStatusStore() {
+			return { setSyncPhase: vi.fn() } as const;
+		}
+
+		it("falls back to the real setInterval/clearInterval when no timer seam is provided", () => {
+			// Exercises the default `timer` object literal (the RHS of the `??`)
+			// and both its arrow bodies: `start()` invokes the real setInterval
+			// and `dispose()` the real clearInterval. Without a `lastSuccessAt`
+			// seam no eager round runs, so nothing hits the network.
+			const engine = makeStubEngine();
+			const statusBar = makeStubStatusBar();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+			});
+			orch.start();
+			expect(orch.isPolling).toBe(true);
+			orch.dispose();
+			expect(orch.isPolling).toBe(false);
+			expect(engine.runRound).not.toHaveBeenCalled();
+		});
+
+		it("requestManualSync fires a manual tick directly when no round is in flight", async () => {
+			const engine = makeStubEngine();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			await orch.requestManualSync();
+			expect(engine.runRound).toHaveBeenCalledWith(
+				expect.objectContaining({ reason: "manual" }),
+			);
+			expect(engine.runRound).toHaveBeenCalledTimes(1);
+		});
+
+		it("requestManualSync coalesces onto an in-flight round then fires a manual followup", async () => {
+			// P3-A latch path: a manual click during an in-flight round sets
+			// `pendingManualFollowup`; after the round settles, `tick`'s finally
+			// schedules an unconditional manual followup. requestManualSync
+			// awaits both the in-flight round AND the followup round.
+			let resolveFirst!: () => void;
+			let calls = 0;
+			const synced: SyncResult = {
+				fetched: true,
+				pulled: true,
+				pushed: true,
+				conflicts: [],
+				newState: "synced",
+			};
+			const runRound = vi.fn(() => {
+				calls++;
+				if (calls === 1) {
+					return new Promise<SyncResult>((resolve) => {
+						resolveFirst = () => resolve(synced);
+					});
+				}
+				return Promise.resolve(synced);
+			});
+			const engine = {
+				runRound,
+			} as unknown as import("../../../cli/src/sync/SyncEngine.js").SyncEngine;
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			const first = orch.syncNow();
+			// Drain microtasks so the first tick reaches `engine.runRound` and is
+			// genuinely in flight before the manual click lands.
+			for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+			const followup = orch.requestManualSync();
+			resolveFirst();
+			await first;
+			await followup;
+			expect(runRound).toHaveBeenCalledTimes(2);
+		});
+
+		it("requestManualSync skips the followup await when the round settles with no pending work", async () => {
+			// Implicit-else of the post-await `currentRoundPromise !== null`
+			// guard: disposing mid-flight makes `tick`'s finally skip the
+			// followup (`pendingManualFollowup && !disposed` is false), so
+			// `currentRoundPromise` is null when requestManualSync resumes.
+			let resolveFirst!: () => void;
+			const synced: SyncResult = {
+				fetched: true,
+				pulled: true,
+				pushed: true,
+				conflicts: [],
+				newState: "synced",
+			};
+			const runRound = vi.fn(
+				() =>
+					new Promise<SyncResult>((resolve) => {
+						resolveFirst = () => resolve(synced);
+					}),
+			);
+			const engine = {
+				runRound,
+			} as unknown as import("../../../cli/src/sync/SyncEngine.js").SyncEngine;
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			const first = orch.syncNow();
+			for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+			const followup = orch.requestManualSync();
+			orch.dispose();
+			resolveFirst();
+			await first;
+			await followup;
+			// No followup round ran — dispose suppressed it, so the post-await
+			// guard saw a null currentRoundPromise.
+			expect(runRound).toHaveBeenCalledTimes(1);
+		});
+
+		it("tick bails immediately when the orchestrator is already disposed", async () => {
+			const engine = makeStubEngine();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			orch.dispose();
+			await orch.syncNow();
+			expect(engine.runRound).not.toHaveBeenCalled();
+		});
+
+		it("swallows a throwing lastSuccessAt.set after a synced round", async () => {
+			const engine = makeStubEngine({ newState: "synced" });
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+				lastSuccessAt: {
+					get: () => undefined,
+					set: () => {
+						throw new Error("persist failed");
+					},
+				},
+			});
+			await expect(orch.syncNow()).resolves.toBeUndefined();
+			expect(orch.lastObservedState).toBe("synced");
+		});
+
+		it("logs '(no stack)' when the thrown engine error carries no stack", async () => {
+			const engine = {
+				runRound: vi.fn(async () => {
+					const e = new Error("stackless");
+					e.stack = undefined;
+					throw e;
+				}),
+			} as unknown as import("../../../cli/src/sync/SyncEngine.js").SyncEngine;
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			await orch.syncNow();
+			expect(orch.lastObservedState).toBe("offline");
+		});
+
+		it("proceeds with the round even when readyPromise rejects (KB init failure is non-fatal)", async () => {
+			const engine = makeStubEngine();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+				readyPromise: Promise.reject(new Error("kb init failed")),
+			});
+			await orch.syncNow();
+			expect(engine.runRound).toHaveBeenCalledTimes(1);
+		});
+
+		it("uses the plural fallback label when the conflicts state has an empty conflicts array", async () => {
+			const engine = makeStubEngine({ newState: "conflicts", conflicts: [] });
+			const statusStore = makeStubStatusStore();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: statusStore as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			await orch.syncNow();
+			expect(statusStore.setSyncPhase).toHaveBeenLastCalledWith({
+				label: "Sync: Conflicts need your attention",
+				severity: "info",
+			});
+		});
+
+		it("handlePhase is a no-op after dispose (does not re-set the indicator)", () => {
+			const engine = makeStubEngine();
+			const statusStore = makeStubStatusStore();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: statusStore as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			orch.dispose();
+			statusStore.setSyncPhase.mockClear();
+			orch.handlePhase("downloading");
+			expect(statusStore.setSyncPhase).not.toHaveBeenCalled();
+		});
+	});
 });
 
 describe("buildDetail — SyncRoundResult → SyncStatusDetail (§0.6 UI mapping)", () => {

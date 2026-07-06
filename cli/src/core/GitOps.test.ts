@@ -52,7 +52,9 @@ import {
 	getParentHash,
 	getProjectRootDir,
 	getRepoContributors,
+	getStagedDiffStats,
 	getTreeHash,
+	getWorkingTreeDiffStats,
 	isAncestor,
 	listFilesInBranch,
 	listWorktrees,
@@ -355,6 +357,77 @@ describe("GitOps", () => {
 			expect(stats.filesChanged).toBe(0);
 			expect(stats.insertions).toBe(0);
 			expect(stats.deletions).toBe(0);
+		});
+	});
+
+	describe("getStagedDiffStats", () => {
+		it("parses a staged diff summary line", async () => {
+			mockSuccess(" file.ts | 10 ++++---\n 2 files changed, 14 insertions(+), 3 deletions(-)\n");
+			const stats = await getStagedDiffStats("/repo");
+			expect(stats).toEqual({ filesChanged: 2, insertions: 14, deletions: 3 });
+			expect(mockExecFileAsync).toHaveBeenCalledWith(
+				"git",
+				["diff", "--stat", "--cached"],
+				expect.objectContaining({ cwd: "/repo" }),
+			);
+		});
+
+		it("returns zeros when nothing is staged", async () => {
+			mockSuccess("");
+			const stats = await getStagedDiffStats("/repo");
+			expect(stats).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
+		});
+	});
+
+	describe("getWorkingTreeDiffStats", () => {
+		it("diffs the given paths against HEAD and parses the summary line", async () => {
+			mockSuccess(" a.ts | 4 ++--\n b.ts | 6 +++---\n 2 files changed, 5 insertions(+), 5 deletions(-)\n");
+			const stats = await getWorkingTreeDiffStats(["a.ts", "b.ts"], "/repo");
+			expect(stats).toEqual({ filesChanged: 2, insertions: 5, deletions: 5 });
+			expect(mockExecFileAsync).toHaveBeenCalledWith(
+				"git",
+				["diff", "--stat", "HEAD", "--", "a.ts", "b.ts"],
+				expect.objectContaining({ cwd: "/repo" }),
+			);
+		});
+
+		it("short-circuits to zeros without invoking git for an empty path list", async () => {
+			const stats = await getWorkingTreeDiffStats([], "/repo");
+			expect(stats).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
+			expect(mockExecFileAsync).not.toHaveBeenCalled();
+		});
+
+		it("returns zeros when the selected paths have no changes", async () => {
+			mockSuccess("");
+			const stats = await getWorkingTreeDiffStats(["a.ts"], "/repo");
+			expect(stats).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
+		});
+
+		it("counts untracked selected files' additions on top of the tracked diff", async () => {
+			mockSuccess(" a.ts | 4 ++--\n 1 file changed, 2 insertions(+), 1 deletion(-)\n"); // diff --stat HEAD
+			mockSuccess("new.ts\nlogo.png\n"); // ls-files --others (two untracked)
+			mockSuccess("12\t0\tnew.ts\n"); // numstat new.ts → +12
+			mockSuccess("-\t-\tlogo.png\n"); // numstat binary → additions "-" skipped, still counts as a file
+			const stats = await getWorkingTreeDiffStats(["a.ts", "new.ts", "logo.png"], "/repo");
+			// tracked (1 file, +2, −1) + 2 untracked files, +12 additions from the text one
+			expect(stats).toEqual({ filesChanged: 3, insertions: 14, deletions: 1 });
+			expect(mockExecFileAsync).toHaveBeenCalledWith(
+				"git",
+				["ls-files", "--others", "--exclude-standard", "--", "a.ts", "new.ts", "logo.png"],
+				expect.objectContaining({ cwd: "/repo" }),
+			);
+			expect(mockExecFileAsync).toHaveBeenCalledWith(
+				"git",
+				["diff", "--no-index", "--numstat", "--", "/dev/null", "new.ts"],
+				expect.objectContaining({ cwd: "/repo" }),
+			);
+		});
+
+		it("returns only the tracked stats when the selection has no untracked files", async () => {
+			mockSuccess(" a.ts | 4 ++--\n 1 file changed, 2 insertions(+), 1 deletion(-)\n"); // diff --stat HEAD
+			mockSuccess(""); // ls-files --others → none
+			const stats = await getWorkingTreeDiffStats(["a.ts"], "/repo");
+			expect(stats).toEqual({ filesChanged: 1, insertions: 2, deletions: 1 });
 		});
 	});
 

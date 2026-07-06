@@ -1098,6 +1098,41 @@ describe("HistoryTreeProvider.serialize", () => {
 		expect(lookup).toHaveBeenCalledTimes(2);
 	});
 
+	it("degrades a commit row to a childless node when its file fetch throws", async () => {
+		// serializeNode fans out to getChildren(item) for each collapsible commit;
+		// a git failure there must degrade to the base node (no children) rather
+		// than rejecting the whole serialize pass.
+		const bridge = makeBridge(
+			() => makeResult([makeCommit("aaaa1111", "boom commit")]),
+			() => Promise.reject(new Error("git diff-tree failed")),
+		);
+		const provider = makeHistoryProvider(bridge);
+
+		await provider.refresh();
+		const items = await provider.serialize();
+
+		expect(items).toHaveLength(1);
+		expect(items[0].id).toBe("aaaa1111");
+		expect((items[0] as { children?: unknown }).children).toBeUndefined();
+	});
+
+	it("serialize hover statsLine handles zero insertions and a single deletion", async () => {
+		const commit = {
+			...makeCommit("aaaa1111"),
+			insertions: 0,
+			deletions: 1,
+			filesChanged: 1,
+		};
+		const bridge = makeBridge(() => makeResult([commit]));
+		const provider = makeHistoryProvider(bridge);
+
+		await provider.refresh();
+		const items = await provider.serialize();
+
+		const hover = (items[0] as { hover?: { statsLine?: string } }).hover;
+		expect(hover?.statsLine).toBe("1 file changed, 1 deletion(-)");
+	});
+
 	it("serialize omits e2eCount and conversationTokens when lookupSummary returns only jolliDocUrl", async () => {
 		const commit = { ...makeCommit("abcd1234efgh5678"), hasSummary: true };
 		const bridge = makeBridge(() => makeResult([commit]));

@@ -222,6 +222,19 @@ vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 	storeSummary: mockStoreSummary,
 }));
 
+const { mockResolveSessionTitle } = vi.hoisted(() => ({
+	// Deterministic: echo a title derived from the sessionId so conversation-row
+	// tests can assert the resolver output flows through untouched (real resolver
+	// does IO / never throws — mocked here to keep the panel test hermetic).
+	mockResolveSessionTitle: vi.fn(
+		(session: { sessionId: string }) => Promise.resolve(`title-${session.sessionId}`),
+	),
+}));
+
+vi.mock("../../../cli/src/core/SessionTitleResolver.js", () => ({
+	resolveSessionTitle: mockResolveSessionTitle,
+}));
+
 const { mockDeleteTopicInTree, mockUpdateTopicInTree } = vi.hoisted(() => ({
 	mockDeleteTopicInTree: vi.fn(),
 	mockUpdateTopicInTree: vi.fn(),
@@ -367,6 +380,13 @@ vi.mock("./BindingChooserWebviewPanel.js", () => ({
 	},
 }));
 
+const { mockConversationDetailsShow } = vi.hoisted(() => ({
+	mockConversationDetailsShow: vi.fn(),
+}));
+vi.mock("./ConversationDetailsPanel.js", () => ({
+	ConversationDetailsPanel: { show: mockConversationDetailsShow },
+}));
+
 const {
 	mockHandleCheckPrStatus,
 	mockHandleCreatePr,
@@ -476,7 +496,6 @@ const {
 	mockRenderE2eScenario,
 	mockBuildPlansAndNotesSection,
 	mockBuildJolliRow,
-	mockBuildAllConversationsSection,
 } = vi.hoisted(() => ({
 	mockBuildHtml: vi.fn().mockReturnValue("<html>mock</html>"),
 	mockBuildE2eTestSection: vi.fn().mockReturnValue("<div>e2e</div>"),
@@ -488,9 +507,6 @@ const {
 		.fn()
 		.mockReturnValue("<div>plansAndNotes</div>"),
 	mockBuildJolliRow: vi.fn().mockReturnValue("<div>jolliRow</div>"),
-	mockBuildAllConversationsSection: vi
-		.fn()
-		.mockReturnValue("<div>conversations</div>"),
 }));
 
 vi.mock("./SummaryHtmlBuilder.js", () => ({
@@ -502,7 +518,6 @@ vi.mock("./SummaryHtmlBuilder.js", () => ({
 	renderE2eScenario: mockRenderE2eScenario,
 	buildPlansAndNotesSection: mockBuildPlansAndNotesSection,
 	buildJolliRow: mockBuildJolliRow,
-	buildAllConversationsSection: mockBuildAllConversationsSection,
 }));
 
 const { mockBuildMarkdown, mockBuildPrMarkdown } = vi.hoisted(() => ({
@@ -713,6 +728,10 @@ const stubBridge = {
 	regenerateSummary: vi.fn((summary: unknown, config: unknown) =>
 		mockRegenerateSummary(summary, workspaceRoot, config),
 	),
+	// Files panel (Task 9): per-commit file status for the "Files" panel.
+	// Defaults to empty so existing tests (which never touch the Files panel)
+	// are unaffected; the loadFiles describe block overrides per test.
+	listCommitFiles: vi.fn().mockResolvedValue([]),
 } as unknown as import("../JolliMemoryBridge.js").JolliMemoryBridge;
 const mainBranch = "main";
 
@@ -926,6 +945,30 @@ describe("SummaryWebviewPanel", () => {
 					planTranslateSet: expect.any(Set),
 					noteTranslateSet: expect.any(Set),
 					nonce: "mocknonce1234567=",
+				}),
+			);
+		});
+
+		// Mirrors SidebarWebviewProvider's codicon wiring (Task 11): the panel
+		// must compute a webview URI for assets/codicons/codicon.css and thread
+		// it (plus cspSource) into buildHtml, or the codicon-* icon classes
+		// used by the redesign (ship card, conversation detach, …) render
+		// empty boxes.
+		it("threads a codicon webview URI and cspSource through to buildHtml", async () => {
+			mockBuildHtml.mockReturnValue("<html>test content</html>");
+			const summary = makeSummary();
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+
+			expect(mockBuildHtml).toHaveBeenCalledWith(
+				summary,
+				expect.objectContaining({
+					codiconCssUri: expect.stringContaining("codicon.css"),
 				}),
 			);
 		});
@@ -1354,18 +1397,16 @@ describe("SummaryWebviewPanel", () => {
 						disposed: boolean;
 						refreshPlansAndNotes: (s: unknown) => void;
 						refreshTopicsSection: (s: unknown) => void;
-						refreshConversations: (s: unknown) => void;
 					};
 				}
 			).currentMemoryPanel;
 			instance.disposed = true;
 			postMessage.mockClear();
 
-			// All three helpers must bail before touching the (disposed) webview,
+			// Both helpers must bail before touching the (disposed) webview,
 			// mirroring update()'s disposed guard.
 			instance.refreshPlansAndNotes(summary);
 			instance.refreshTopicsSection(summary);
-			instance.refreshConversations(summary);
 
 			expect(postMessage).not.toHaveBeenCalled();
 		});
@@ -1383,7 +1424,6 @@ describe("SummaryWebviewPanel", () => {
 			transcriptHashSet: Set<string>;
 			refreshPlansAndNotes: (s: CommitSummary) => void;
 			refreshTopicsSection: (s: CommitSummary) => void;
-			refreshConversations: (s: CommitSummary) => void;
 		};
 		async function getPanelInstance(
 			summary: CommitSummary,
@@ -1456,25 +1496,6 @@ describe("SummaryWebviewPanel", () => {
 			expect(mockBuildTopicsSection).toHaveBeenCalledWith(summary, {
 				readOnly: true,
 			});
-		});
-
-		it("refreshConversations passes isForeign=true on a foreign panel", async () => {
-			const summary = makeSummary({ commitHash: "aaa" });
-			const instance = await getPanelInstance(summary);
-			instance.foreignRepoName = "other-repo";
-			instance.transcriptHashSet = new Set(["h1"]);
-			mockBuildAllConversationsSection.mockClear();
-			postMessage.mockClear();
-
-			instance.refreshConversations(summary);
-
-			expect(mockBuildAllConversationsSection).toHaveBeenCalledWith(
-				instance.transcriptHashSet,
-				true,
-			);
-			expect(postMessage.mock.calls.map((c) => c[0].command)).toContain(
-				"conversationsUpdated",
-			);
 		});
 
 		it("refresh helpers still post their partial update during regenerate (in-flight async write must clear its block's loading state)", async () => {
@@ -4812,47 +4833,11 @@ describe("SummaryWebviewPanel", () => {
 			});
 		});
 
-		// ── loadAllTranscripts ───────────────────────────────────────────────
+		// ── loadConversations (inline rows data, Task 7) ─────────────────────
 
-		describe("loadAllTranscripts", () => {
-			it("does nothing when no current summary is set", async () => {
-				// Create a panel, then clear the internal currentSummary to exercise
-				// the `if (!summary) { return; }` guard on line 807-809.
-				const summary = makeSummary();
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-				// Clear the summary from the internal state
-				const panelInstance = firstCommitPanel<{ currentSummary: null }>();
-				panelInstance.currentSummary = null;
-				postMessage.mockClear();
-
-				dispatch({ command: "loadAllTranscripts" });
-				await flushPromises();
-
-				// Should not even post transcriptsLoading
-				const loadingMessages = postMessage.mock.calls.filter(
-					(c: Array<unknown>) =>
-						(c[0] as Record<string, unknown>).command === "transcriptsLoading",
-				);
-				expect(loadingMessages).toHaveLength(0);
-			});
-
-			it("includes sessions from disabled sources in loadAllTranscripts (history is not gated by enable flags)", async () => {
-				// Disable claude — its archived sessions must STILL load, so the
-				// Manage modal shows them and Save All round-trips them. Filtering
-				// here was the visible half of a silent save-time data-loss bug.
-				mockLoadConfig.mockResolvedValue({
-					claudeEnabled: false,
-					codexEnabled: true,
-					geminiEnabled: true,
-				});
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+		describe("loadConversations", () => {
+			it("posts conversationsData with one row per session (title via resolveSessionTitle, merged msg count)", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123", "def456"]));
 				const transcriptMap = new Map([
 					[
 						"abc123",
@@ -4861,33 +4846,31 @@ describe("SummaryWebviewPanel", () => {
 								{
 									sessionId: "s1",
 									source: "claude" as const,
-									transcriptPath: "/path/claude",
-									entries: [
-										{
-											role: "human" as const,
-											content: "X",
-											timestamp: "2025-01-01T00:00:00Z",
-										},
-									],
+									entries: [{ role: "human" as const, content: "A" }],
 								},
 								{
 									sessionId: "cx1",
 									source: "codex" as const,
-									transcriptPath: "/path/codex",
-									entries: [
-										{
-											role: "human" as const,
-											content: "Y",
-											timestamp: "2025-01-01T00:01:00Z",
-										},
-									],
+									entries: [{ role: "human" as const, content: "B" }],
+								},
+							],
+						},
+					],
+					[
+						"def456",
+						{
+							sessions: [
+								// Same session split across a second commit — entries merge.
+								{
+									sessionId: "s1",
+									source: "claude" as const,
+									entries: [{ role: "assistant" as const, content: "C" }],
 								},
 							],
 						},
 					],
 				]);
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
-
 				const summary = makeSummary();
 				await SummaryWebviewPanel.show(
 					summary,
@@ -4898,28 +4881,360 @@ describe("SummaryWebviewPanel", () => {
 				);
 				const dispatch = captureMessageHandler();
 
-				dispatch({ command: "loadAllTranscripts" });
+				dispatch({ command: "loadConversations" });
 				await flushPromises();
 
-				const loadedCall = postMessage.mock.calls.find(
-					(c: Array<unknown>) =>
-						(c[0] as Record<string, unknown>).command ===
-						"allTranscriptsLoaded",
+				const call = postMessage.mock.calls.find(
+					(c) => c[0]?.command === "conversationsData",
 				);
-				expect(loadedCall).toBeDefined();
-				const payload = (loadedCall as Array<unknown>)[0] as {
-					entries: Array<{ source: string }>;
-				};
-				// Both claude (disabled) and codex sessions present — nothing filtered.
-				expect(payload.entries).toHaveLength(2);
-				expect(payload.entries.map((e) => e.source).sort()).toEqual([
-					"claude",
-					"codex",
-				]);
+				expect(call).toBeDefined();
+				const items = call?.[0].items as Array<{
+					sessionId: string;
+					source: string;
+					title: string;
+					messageCount: number;
+					hash: string;
+				}>;
+				expect(items).toHaveLength(2);
+				const s1 = items.find((i) => i.sessionId === "s1");
+				expect(s1).toMatchObject({
+					source: "claude",
+					title: "title-s1",
+					// two commits' entries merged (1 + 1)
+					messageCount: 2,
+					hash: "abc123",
+				});
+				expect(items.find((i) => i.sessionId === "cx1")).toMatchObject({
+					source: "codex",
+					messageCount: 1,
+				});
 			});
 
-			it("loads all transcript entries and sends to webview", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+			it("posts conversationsData with an empty list when there are no transcripts", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set());
+				mockReadTranscriptsForCommits.mockResolvedValue(new Map());
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadConversations" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "conversationsData",
+					items: [],
+				});
+			});
+		});
+
+		// ── loadFiles / openFileDiff (Files panel, Task 9) ────────────────────
+
+		describe("loadFiles", () => {
+			it("posts files:rows with per-file status from listCommitFiles when the commit is reachable", async () => {
+				(
+					stubBridge.listCommitFiles as ReturnType<typeof vi.fn>
+				).mockResolvedValueOnce([
+					{ relativePath: "vscode/src/views/SummaryHtmlBuilder.ts", statusCode: "M" },
+					{ relativePath: "vscode/src/views/NewFile.ts", statusCode: "A" },
+				]);
+				mockIsAncestor.mockResolvedValueOnce(true);
+				const dispatch = await setupPanel({ branch: "feature/test" });
+
+				dispatch({ command: "loadFiles" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "files:rows",
+					rows: [
+						{ path: "vscode/src/views/SummaryHtmlBuilder.ts", dir: "vscode/src/views", status: "M" },
+						{ path: "vscode/src/views/NewFile.ts", dir: "vscode/src/views", status: "A" },
+					],
+					offBranch: false,
+					branch: "feature/test",
+					commitHash: "abc123",
+				});
+			});
+
+			it("includes oldPath on a renamed-file row so the client can offer it back for the diff", async () => {
+				(
+					stubBridge.listCommitFiles as ReturnType<typeof vi.fn>
+				).mockResolvedValueOnce([
+					{ relativePath: "vscode/src/views/NewName.ts", statusCode: "R", oldPath: "vscode/src/views/OldName.ts" },
+				]);
+				mockIsAncestor.mockResolvedValueOnce(true);
+				const dispatch = await setupPanel({ branch: "feature/test" });
+
+				dispatch({ command: "loadFiles" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "files:rows",
+					rows: [
+						{
+							path: "vscode/src/views/NewName.ts",
+							dir: "vscode/src/views",
+							status: "R",
+							oldPath: "vscode/src/views/OldName.ts",
+						},
+					],
+					offBranch: false,
+					branch: "feature/test",
+					commitHash: "abc123",
+				});
+			});
+
+			it("marks offBranch true when the commit is not an ancestor of HEAD", async () => {
+				(
+					stubBridge.listCommitFiles as ReturnType<typeof vi.fn>
+				).mockResolvedValueOnce([
+					{ relativePath: "a.ts", statusCode: "M" },
+				]);
+				mockIsAncestor.mockResolvedValueOnce(false);
+				const dispatch = await setupPanel({ branch: "feature/jolli-1703" });
+
+				dispatch({ command: "loadFiles" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "files:rows",
+					rows: [{ path: "a.ts", dir: "", status: "M" }],
+					offBranch: true,
+					branch: "feature/jolli-1703",
+					commitHash: "abc123",
+				});
+			});
+
+			it("falls back to path-only rows from topic.filesAffected when listCommitFiles returns nothing (foreign summary)", async () => {
+				const summary = makeSummary({
+					branch: "main",
+					topics: [
+						{
+							title: "T1",
+							trigger: "x",
+							response: "y",
+							decisions: "z",
+							filesAffected: ["a/b.ts", "a/c.ts"],
+						},
+						{
+							title: "T2",
+							trigger: "x",
+							response: "y",
+							decisions: "z",
+							// Duplicate path across topics must be deduped.
+							filesAffected: ["a/b.ts"],
+						},
+					],
+				});
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"memory",
+					"other-repo",
+					"https://github.com/other/repo.git",
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadFiles" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "files:rows",
+					rows: [
+						{ path: "a/b.ts", dir: "a", status: "M" },
+						{ path: "a/c.ts", dir: "a", status: "M" },
+					],
+					offBranch: true,
+					branch: "main",
+					commitHash: "abc123",
+				});
+				// Foreign summaries never touch this workspace's git for a
+				// commit that doesn't exist in it.
+				expect(stubBridge.listCommitFiles).not.toHaveBeenCalled();
+				expect(mockIsAncestor).not.toHaveBeenCalled();
+			});
+
+			it("does not call listCommitFiles for a foreign-repo summary", async () => {
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"memory",
+					"other-repo",
+					"https://github.com/other/repo.git",
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadFiles" });
+				await flushPromises();
+
+				expect(stubBridge.listCommitFiles).not.toHaveBeenCalled();
+			});
+
+			it("is a no-op on a disposed instance (post-await race)", async () => {
+				const dispatch = await setupPanel();
+				const instance = firstCommitPanel<{ disposed: boolean }>();
+				instance.disposed = true;
+
+				dispatch({ command: "loadFiles" });
+				await flushPromises();
+
+				expect(postMessage).not.toHaveBeenCalledWith(
+					expect.objectContaining({ command: "files:rows" }),
+				);
+			});
+
+			it("does NOT fall back to topic paths for a same-repo commit that legitimately changed zero files", async () => {
+				(
+					stubBridge.listCommitFiles as ReturnType<typeof vi.fn>
+				).mockResolvedValueOnce([]);
+				mockIsAncestor.mockResolvedValueOnce(true);
+				const dispatch = await setupPanel({
+					branch: "feature/test",
+					topics: [
+						{
+							title: "T1",
+							trigger: "x",
+							response: "y",
+							decisions: "z",
+							filesAffected: ["a/b.ts"],
+						},
+					],
+				});
+
+				dispatch({ command: "loadFiles" });
+				await flushPromises();
+
+				// listCommitFiles resolved successfully (an empty merge commit, say)
+				// — that's git truth, not a lookup failure, so the topic-derived
+				// filesAffected fallback must NOT fire.
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "files:rows",
+					rows: [],
+					offBranch: false,
+					branch: "feature/test",
+					commitHash: "abc123",
+				});
+			});
+
+			it("falls back to topic paths when listCommitFiles rejects", async () => {
+				(
+					stubBridge.listCommitFiles as ReturnType<typeof vi.fn>
+				).mockRejectedValueOnce(new Error("git diff-tree failed"));
+				mockIsAncestor.mockResolvedValueOnce(true);
+				const dispatch = await setupPanel({
+					branch: "feature/test",
+					topics: [
+						{
+							title: "T1",
+							trigger: "x",
+							response: "y",
+							decisions: "z",
+							filesAffected: ["a.ts"],
+						},
+						// No filesAffected at all — exercises the `?? []` default.
+						{ title: "T2", trigger: "x", response: "y", decisions: "z" },
+					],
+				});
+
+				dispatch({ command: "loadFiles" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "files:rows",
+					rows: [{ path: "a.ts", dir: "", status: "M" }],
+					offBranch: false,
+					branch: "feature/test",
+					commitHash: "abc123",
+				});
+			});
+
+			it("does not post files:rows when disposed mid-await (after the reachability check)", async () => {
+				(
+					stubBridge.listCommitFiles as ReturnType<typeof vi.fn>
+				).mockResolvedValueOnce([{ relativePath: "a.ts", statusCode: "M" }]);
+				const dispatch = await setupPanel();
+				const instance = firstCommitPanel<{ disposed: boolean }>();
+				mockIsAncestor.mockImplementationOnce(async () => {
+					// Simulate a concurrent dispose while the reachability check
+					// is in flight (mirrors the update()/refresh* disposed-race
+					// pattern used elsewhere in this file).
+					instance.disposed = true;
+					return true;
+				});
+
+				dispatch({ command: "loadFiles" });
+				await flushPromises();
+
+				expect(postMessage).not.toHaveBeenCalledWith(
+					expect.objectContaining({ command: "files:rows" }),
+				);
+			});
+		});
+
+		describe("openFileDiff", () => {
+			it("opens a diff for the given path, commit hash, and status via jollimemory.openCommitFileChange", async () => {
+				const dispatch = await setupPanel({ commitHash: "abc123" });
+
+				dispatch({
+					command: "openFileDiff",
+					path: "vscode/src/views/SummaryHtmlBuilder.ts",
+					commitHash: "abc123",
+					status: "M",
+				});
+				await flushPromises();
+
+				expect(executeCommand).toHaveBeenCalledWith(
+					"jollimemory.openCommitFileChange",
+					{
+						commitHash: "abc123",
+						relativePath: "vscode/src/views/SummaryHtmlBuilder.ts",
+						statusCode: "M",
+						oldPath: undefined,
+					},
+				);
+			});
+
+			it("forwards oldPath for a rename so jollimemory.openCommitFileChange can diff the pre-rename blob", async () => {
+				const dispatch = await setupPanel({ commitHash: "abc123" });
+
+				dispatch({
+					command: "openFileDiff",
+					path: "vscode/src/views/NewName.ts",
+					commitHash: "abc123",
+					status: "R",
+					oldPath: "vscode/src/views/OldName.ts",
+				});
+				await flushPromises();
+
+				expect(executeCommand).toHaveBeenCalledWith(
+					"jollimemory.openCommitFileChange",
+					{
+						commitHash: "abc123",
+						relativePath: "vscode/src/views/NewName.ts",
+						statusCode: "R",
+						oldPath: "vscode/src/views/OldName.ts",
+					},
+				);
+			});
+		});
+
+		// ── conversationDetach (per-session detach, Task 7) ──────────────────
+
+		describe("conversationDetach", () => {
+			it("rewrites transcripts with the session removed, deletes emptied ones, and acks conversationDetached", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123", "def456"]));
 				const transcriptMap = new Map([
 					[
 						"abc123",
@@ -4928,26 +5243,36 @@ describe("SummaryWebviewPanel", () => {
 								{
 									sessionId: "s1",
 									source: "claude" as const,
-									transcriptPath: "/path/to/transcript",
-									entries: [
-										{
-											role: "human" as const,
-											content: "Q",
-											timestamp: "2025-01-01T00:00:00Z",
-										},
-										{
-											role: "assistant" as const,
-											content: "A",
-											timestamp: "2025-01-01T00:01:00Z",
-										},
-									],
+									entries: [{ role: "human" as const, content: "A" }],
+								},
+								{
+									sessionId: "keep",
+									source: "claude" as const,
+									entries: [{ role: "human" as const, content: "K" }],
+								},
+							],
+						},
+					],
+					[
+						"def456",
+						{
+							sessions: [
+								// Only s1 lives here → this transcript becomes empty → delete.
+								{
+									sessionId: "s1",
+									source: "claude" as const,
+									entries: [{ role: "human" as const, content: "C" }],
 								},
 							],
 						},
 					],
 				]);
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
-				const summary = makeSummary();
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123", "def456"],
+				} as ReturnType<typeof makeSummary>;
 				await SummaryWebviewPanel.show(
 					summary,
 					extensionUri,
@@ -4955,651 +5280,177 @@ describe("SummaryWebviewPanel", () => {
 					stubBridge,
 					mainBranch,
 				);
+				mockSaveTranscriptsBatch.mockClear();
 				const dispatch = captureMessageHandler();
 
-				dispatch({ command: "loadAllTranscripts" });
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
 				await flushPromises();
 
+				// abc123 keeps only "keep"; def456 becomes empty → deleted.
+				const [writes, deletes] = mockSaveTranscriptsBatch.mock.calls[0];
+				expect(deletes).toEqual(["def456"]);
+				expect(writes).toEqual([
+					{
+						hash: "abc123",
+						data: {
+							sessions: [
+								expect.objectContaining({ sessionId: "keep" }),
+							],
+						},
+					},
+				]);
 				expect(postMessage).toHaveBeenCalledWith({
-					command: "transcriptsLoading",
+					command: "conversationDetached",
+					hash: "abc123",
+					sessionId: "s1",
+					source: "claude",
 				});
-				expect(postMessage).toHaveBeenCalledWith(
+			});
+
+			it("openConversation opens the archived transcript in a read-only ConversationDetailsPanel", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										transcriptPath: "/t/s1.jsonl",
+										entries: [{ role: "human" as const, content: "hi" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				mockResolveSessionTitle.mockResolvedValue("My convo");
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				const dispatch = captureMessageHandler();
+				mockConversationDetailsShow.mockClear();
+
+				dispatch({ command: "openConversation", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				expect(mockConversationDetailsShow).toHaveBeenCalledWith(
 					expect.objectContaining({
-						command: "allTranscriptsLoaded",
-						totalCommits: 1,
-						entries: expect.arrayContaining([
-							expect.objectContaining({
-								commitHash: "abc123",
-								sessionId: "s1",
-								role: "human",
-								content: "Q",
-							}),
-						]),
+						sessionId: "s1",
+						source: "claude",
+						title: "My convo",
+						transcriptPath: "/t/s1.jsonl",
+						archivedEntries: [{ role: "human", content: "hi" }],
+						commitHash: summary.commitHash,
 					}),
 				);
 			});
 
-			it("defaults undefined session source to claude in loadAllTranscripts", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
-				const transcriptMap = new Map([
-					[
-						"abc123",
-						{
-							sessions: [
-								{
-									sessionId: "s1",
-									// source is undefined — should default to "claude"
-									transcriptPath: "/path/to/transcript",
-									entries: [
-										{
-											role: "human" as const,
-											content: "Hi",
-											timestamp: "2025-01-01T00:00:00Z",
-										},
-									],
-								},
-							],
-						},
-					],
-				]);
-				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
-				const summary = makeSummary();
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-
-				dispatch({ command: "loadAllTranscripts" });
-				await flushPromises();
-
-				const loadedCall = postMessage.mock.calls.find(
-					(c: Array<unknown>) =>
-						(c[0] as Record<string, unknown>).command ===
-						"allTranscriptsLoaded",
-				);
-				expect(loadedCall).toBeDefined();
-				const payload = (loadedCall as Array<unknown>)[0] as {
-					entries: Array<{ source: string }>;
-				};
-				// Source should be defaulted to "claude"
-				expect(payload.entries[0].source).toBe("claude");
-			});
-		});
-
-		// ── saveAllTranscripts ───────────────────────────────────────────────
-
-		describe("saveAllTranscripts", () => {
-			it("saves edited transcripts back to orphan branch", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+			it("merges a split session's slices in chronological order, not transcript-set order", async () => {
+				// s1 is split across two commits. The transcript map yields the LATER
+				// slice first (a consolidated memory's hash set is not time-ordered),
+				// so a naive append would interleave turns wrong. The slices must be
+				// reordered by first timestamp before flattening — matching the
+				// sidebar's readArchivedSessions.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["later0", "earlier0"]));
 				mockReadTranscriptsForCommits.mockResolvedValue(
 					new Map([
 						[
-							"abc123",
+							"later0",
 							{
 								sessions: [
 									{
 										sessionId: "s1",
 										source: "claude" as const,
-										transcriptPath: "/original/path",
-										entries: [{ role: "human" as const, content: "Old" }],
+										transcriptPath: "/t/s1.jsonl",
+										entries: [{ role: "assistant" as const, content: "SECOND", timestamp: "2026-02-02T00:00:00Z" }],
+									},
+								],
+							},
+						],
+						[
+							"earlier0",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										transcriptPath: "/t/s1.jsonl",
+										entries: [{ role: "human" as const, content: "FIRST", timestamp: "2026-01-01T00:00:00Z" }],
 									},
 								],
 							},
 						],
 					]),
 				);
-				const summary = makeSummary();
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-
-				dispatch({
-					command: "saveAllTranscripts",
-					entries: [
-						{
-							commitHash: "abc123",
-							sessionId: "s1",
-							source: "claude",
-							originalIndex: 0,
-							role: "human",
-							content: "Edited content",
-						},
-					],
-				});
-				await flushPromises();
-
-				expect(mockSaveTranscriptsBatch).toHaveBeenCalled();
-				expect(postMessage).toHaveBeenCalledWith({
-					command: "transcriptsSaved",
-				});
-				// Partial refresh: the All Conversations section is re-rendered
-				// (closing the modal + refreshing stats), AND the legacy
-				// transcriptsSaved message is still posted (existing assertion above).
-				expect(postMessage.mock.calls.map((c) => c[0].command)).toContain(
-					"conversationsUpdated",
-				);
-			});
-		});
-
-		describe("saveAllTranscripts with multiple entries per commit", () => {
-			it("groups multiple entries under the same commitHash in the Map", async () => {
-				// Exercises the `if (list) { list.push(entry); }` branch (line 859-860)
-				// where a second entry for the same commitHash is appended to the existing list.
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
-				mockReadTranscriptsForCommits.mockResolvedValue(
-					new Map([
-						[
-							"abc123",
-							{
-								sessions: [
-									{
-										sessionId: "s1",
-										source: "claude" as const,
-										transcriptPath: "/original/path",
-										entries: [
-											{ role: "human" as const, content: "Q1" },
-											{ role: "assistant" as const, content: "A1" },
-										],
-									},
-								],
-							},
-						],
-					]),
-				);
-				const summary = makeSummary();
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-
-				dispatch({
-					command: "saveAllTranscripts",
-					entries: [
-						{
-							commitHash: "abc123",
-							sessionId: "s1",
-							source: "claude",
-							originalIndex: 0,
-							role: "human",
-							content: "Edited Q1",
-						},
-						{
-							commitHash: "abc123",
-							sessionId: "s1",
-							source: "claude",
-							originalIndex: 1,
-							role: "assistant",
-							content: "Edited A1",
-						},
-					],
-				});
-				await flushPromises();
-
-				expect(mockSaveTranscriptsBatch).toHaveBeenCalled();
-				expect(postMessage).toHaveBeenCalledWith({
-					command: "transcriptsSaved",
-				});
-			});
-		});
-
-		// ── BUG 7 regression: history is not gated by enable flags ───────────
-		describe("saveAllTranscripts preserves disabled-source sessions (BUG 7)", () => {
-			type LoadedEntry = {
-				commitHash: string;
-				sessionId: string;
-				source: string;
-				transcriptPath: string;
-				originalIndex: number;
-				role: "human" | "assistant";
-				content: string;
-				timestamp: string;
-			};
-			type WrittenTranscript = {
-				hash: string;
-				data: {
-					sessions: Array<{
-						source: string;
-						entries: Array<{ content: string }>;
-					}>;
-				};
-			};
-
-			function loadedEntries(): Array<LoadedEntry> {
-				const call = postMessage.mock.calls.find(
-					(c) =>
-						(c[0] as { command: string }).command ===
-						"allTranscriptsLoaded",
-				);
-				return (call?.[0] as { entries: Array<LoadedEntry> }).entries;
-			}
-
-			it("round-trips a codex session through load→save even when codexEnabled is false", async () => {
-				mockLoadConfig.mockResolvedValue({
-					claudeEnabled: true,
-					codexEnabled: false,
-				});
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
-				mockReadTranscriptsForCommits.mockResolvedValue(
-					new Map([
-						[
-							"abc123",
-							{
-								sessions: [
-									{
-										sessionId: "s1",
-										source: "claude" as const,
-										transcriptPath: "/path/claude",
-										entries: [
-											{ role: "human" as const, content: "Claude Q" },
-										],
-									},
-									{
-										sessionId: "cx1",
-										source: "codex" as const,
-										transcriptPath: "/path/codex",
-										entries: [
-											{ role: "human" as const, content: "Codex Q" },
-										],
-									},
-								],
-							},
-						],
-					]),
-				);
-				const summary = makeSummary();
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-
-				// 1) Load — the webview now receives BOTH claude and codex entries.
-				dispatch({ command: "loadAllTranscripts" });
-				await flushPromises();
-				const loaded = loadedEntries();
-				expect(loaded.map((e) => e.source).sort()).toEqual([
-					"claude",
-					"codex",
-				]);
-
-				// 2) User edits only the claude entry, leaves codex untouched, and
-				//    Save All round-trips the full set the webview holds.
-				const roundTripped = loaded.map((e) =>
-					e.source === "claude" ? { ...e, content: "Claude EDITED" } : e,
-				);
-				mockSaveTranscriptsBatch.mockClear();
-				dispatch({ command: "saveAllTranscripts", entries: roundTripped });
-				await flushPromises();
-
-				expect(mockSaveTranscriptsBatch).toHaveBeenCalledTimes(1);
-				const [writes, deletes] = mockSaveTranscriptsBatch.mock.calls[0] as [
-					Array<WrittenTranscript>,
-					Array<string>,
-				];
-				// abc123 is NOT deleted, and the codex session survives verbatim.
-				expect(deletes).not.toContain("abc123");
-				const write = writes.find((w) => w.hash === "abc123");
-				expect(write?.data.sessions.map((s) => s.source).sort()).toEqual([
-					"claude",
-					"codex",
-				]);
-				const codex = write?.data.sessions.find((s) => s.source === "codex");
-				expect(codex?.entries[0]?.content).toBe("Codex Q");
-			});
-
-			it("does not delete a transcript whose sessions are all from a disabled source", async () => {
-				// abc123 = claude only; def456 = codex only. Codex disabled, user
-				// edits the claude transcript and hits Save All. def456 must NOT be
-				// deleted just because every one of its sessions is codex.
-				mockLoadConfig.mockResolvedValue({
-					claudeEnabled: true,
-					codexEnabled: false,
-				});
-				mockGetTranscriptHashes.mockResolvedValue(
-					new Set(["abc123", "def456"]),
-				);
-				mockReadTranscriptsForCommits.mockResolvedValue(
-					new Map([
-						[
-							"abc123",
-							{
-								sessions: [
-									{
-										sessionId: "s1",
-										source: "claude" as const,
-										transcriptPath: "/path/claude",
-										entries: [
-											{ role: "human" as const, content: "Claude Q" },
-										],
-									},
-								],
-							},
-						],
-						[
-							"def456",
-							{
-								sessions: [
-									{
-										sessionId: "cx1",
-										source: "codex" as const,
-										transcriptPath: "/path/codex",
-										entries: [
-											{ role: "human" as const, content: "Codex Q" },
-										],
-									},
-								],
-							},
-						],
-					]),
-				);
-				const summary = makeSummary({
-					children: [makeSummary({ commitHash: "def456" })],
-				});
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-
-				dispatch({ command: "loadAllTranscripts" });
-				await flushPromises();
-				const roundTripped = loadedEntries().map((e) =>
-					e.source === "claude" ? { ...e, content: "Claude EDITED" } : e,
-				);
-				mockSaveTranscriptsBatch.mockClear();
-				dispatch({ command: "saveAllTranscripts", entries: roundTripped });
-				await flushPromises();
-
-				const [writes, deletes] = mockSaveTranscriptsBatch.mock.calls[0] as [
-					Array<WrittenTranscript>,
-					Array<string>,
-				];
-				expect(deletes).not.toContain("def456");
-				const def = writes.find((w) => w.hash === "def456");
-				expect(def?.data.sessions[0]?.source).toBe("codex");
-				expect(def?.data.sessions[0]?.entries[0]?.content).toBe("Codex Q");
-			});
-		});
-
-		describe("saveAllTranscripts with empty commit entries", () => {
-			it("adds commit to delete list when entries array for that commit is empty", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(
-					new Set(["abc123", "def456"]),
-				);
-				mockReadTranscriptsForCommits.mockResolvedValue(
-					new Map([
-						[
-							"abc123",
-							{
-								sessions: [
-									{
-										sessionId: "s1",
-										source: "claude" as const,
-										transcriptPath: "/path/to/transcript",
-										entries: [{ role: "human" as const, content: "Hello" }],
-									},
-								],
-							},
-						],
-						[
-							"def456",
-							{
-								sessions: [
-									{
-										sessionId: "s2",
-										source: "claude" as const,
-										entries: [{ role: "human" as const, content: "World" }],
-									},
-								],
-							},
-						],
-					]),
-				);
-				const summary = makeSummary({
-					children: [makeSummary({ commitHash: "def456" })],
-				});
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-
-				// Send entries only for abc123 — def456 has no entries so should be deleted
-				dispatch({
-					command: "saveAllTranscripts",
-					entries: [
-						{
-							commitHash: "abc123",
-							sessionId: "s1",
-							source: "claude",
-							originalIndex: 0,
-							role: "human",
-							content: "Edited",
-						},
-					],
-				});
-				await flushPromises();
-
-				// saveTranscriptsBatch should be called; the second arg (deletes) should contain "def456"
-				expect(mockSaveTranscriptsBatch).toHaveBeenCalledWith(
-					expect.any(Array),
-					expect.arrayContaining(["def456"]),
-					workspaceRoot,
-				);
-			});
-
-			// ── Failure paths (v5 summary-first ordering) ─────────────────────
-
-			it("posts transcriptsSaveFailed when storeSummary rejects — files NOT touched", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123", "def456"]));
+				mockResolveSessionTitle.mockResolvedValue("My convo");
 				const summary = {
 					...makeSummary(),
 					version: 5,
-					transcripts: ["abc123", "def456"],
+					transcripts: ["later0", "earlier0"],
 				} as ReturnType<typeof makeSummary>;
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
 				const dispatch = captureMessageHandler();
-				mockStoreSummary.mockClear();
-				mockStoreSummary.mockRejectedValueOnce(new Error("orphan lock contention"));
-				mockSaveTranscriptsBatch.mockClear();
+				mockConversationDetailsShow.mockClear();
 
-				// Trigger save with one commit having no entries → goes to deletes,
-				// which forces persistTranscriptIdRemoval to run and fail.
-				dispatch({
-					command: "saveAllTranscripts",
-					entries: [
-						{
-							commitHash: "abc123",
-							sessionId: "s1",
-							source: "claude",
-							originalIndex: 0,
-							role: "human",
-							content: "x",
-						},
-					],
-				});
+				dispatch({ command: "openConversation", sessionId: "s1", source: "claude" });
 				await flushPromises();
 
-				// File batch must NOT run after summary failure
-				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
-				expect(postMessage).toHaveBeenCalledWith(
-					expect.objectContaining({ command: "transcriptsSaveFailed" }),
-				);
-				expect(postMessage).not.toHaveBeenCalledWith({ command: "transcriptsSaved" });
+				const arg = mockConversationDetailsShow.mock.calls[0]?.[0] as {
+					archivedEntries: Array<{ content: string }>;
+				};
+				expect(arg.archivedEntries.map((e) => e.content)).toEqual(["FIRST", "SECOND"]);
 			});
 
-			it("posts transcriptsSaveFailed when file batch rejects after summary updated", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123", "def456"]));
-				const summary = {
-					...makeSummary(),
-					version: 5,
-					transcripts: ["abc123", "def456"],
-				} as ReturnType<typeof makeSummary>;
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-				mockStoreSummary.mockClear();
-				mockSaveTranscriptsBatch.mockClear();
-				// Clear so we can assert the failure path does NOT re-refresh the
-				// cache (P2: refreshing from the already-updated summary would hide
-				// the still-on-disk files and break retry).
-				mockGetTranscriptHashes.mockClear();
-				mockSaveTranscriptsBatch.mockRejectedValueOnce(new Error("io error"));
-
-				dispatch({
-					command: "saveAllTranscripts",
-					entries: [
-						{
-							commitHash: "abc123",
-							sessionId: "s1",
-							source: "claude",
-							originalIndex: 0,
-							role: "human",
-							content: "edited",
-						},
-					],
-				});
-				await flushPromises();
-
-				// Summary was updated; file batch was attempted and failed.
-				expect(mockStoreSummary).toHaveBeenCalled();
-				expect(mockSaveTranscriptsBatch).toHaveBeenCalled();
-				// Failed message posted, NOT success
-				expect(postMessage).toHaveBeenCalledWith(
-					expect.objectContaining({ command: "transcriptsSaveFailed" }),
-				);
-				expect(postMessage).not.toHaveBeenCalledWith({ command: "transcriptsSaved" });
-				// P2: no refresh-from-updated-summary on failure — the pre-operation
-				// `transcriptHashSet` is kept so the affected transcripts stay
-				// visible and the save/delete stays retryable.
-				expect(mockGetTranscriptHashes).not.toHaveBeenCalled();
-			});
-		});
-
-		// ── deleteAllTranscripts ─────────────────────────────────────────────
-
-		describe("deleteAllTranscripts", () => {
-			it("deletes all transcript files for current summary", async () => {
+			it("openConversation ignores an unknown/stale session without opening a panel", async () => {
 				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
-				const summary = makeSummary();
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{ sessions: [{ sessionId: "s1", source: "claude" as const, entries: [] }] },
+						],
+					]),
 				);
-				const dispatch = captureMessageHandler();
-
-				dispatch({ command: "deleteAllTranscripts" });
-				await flushPromises();
-
-				expect(mockSaveTranscriptsBatch).toHaveBeenCalledWith(
-					[],
-					["abc123"],
-					workspaceRoot,
-				);
-				expect(postMessage).toHaveBeenCalledWith({
-					command: "transcriptsDeleted",
-				});
-				// Partial refresh: All Conversations section re-rendered (flips to the
-				// count===0 empty state), alongside the retained transcriptsDeleted message.
-				expect(postMessage.mock.calls.map((c) => c[0].command)).toContain(
-					"conversationsUpdated",
-				);
-				// #5 + #4: the legacy (v3) summary is lazily upgraded to a REAL v5
-				// record — version bumped to 5 and `transcripts` written from the
-				// file-backed set (emptied here by the delete), not left as a
-				// "version<5 but has transcripts" hybrid.
-				expect(mockStoreSummary).toHaveBeenCalledWith(
-					expect.objectContaining({ version: 5, transcripts: [] }),
-					workspaceRoot,
-					true,
-				);
-			});
-
-			it("does nothing when no transcripts exist", async () => {
-				const dispatch = await setupPanel();
-				mockSaveTranscriptsBatch.mockClear();
-
-				dispatch({ command: "deleteAllTranscripts" });
-				await flushPromises();
-
-				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
-			});
-
-			it("skips refresh when currentSummary is null during delete", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
-				const summary = makeSummary();
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				// Clear the summary after showing the panel
-				const panelInstance = firstCommitPanel<{ currentSummary: null }>();
-				panelInstance.currentSummary = null;
-				const dispatch = captureMessageHandler();
-
-				dispatch({ command: "deleteAllTranscripts" });
-				await flushPromises();
-
-				// Delete still runs (transcriptHashSet was populated earlier)
-				expect(mockSaveTranscriptsBatch).toHaveBeenCalledWith(
-					[],
-					["abc123"],
-					workspaceRoot,
-				);
-				// transcriptsDeleted still posted
-				expect(postMessage).toHaveBeenCalledWith({
-					command: "transcriptsDeleted",
-				});
-			});
-
-			// ── Failure paths (v5 summary-first ordering) ─────────────────────
-
-			it("posts transcriptsDeleteFailed when storeSummary rejects — files NOT touched", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
 				const summary = {
 					...makeSummary(),
 					version: 5,
 					transcripts: ["abc123"],
 				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				const dispatch = captureMessageHandler();
+				mockConversationDetailsShow.mockClear();
+
+				dispatch({ command: "openConversation", sessionId: "ghost", source: "claude" });
+				await flushPromises();
+
+				expect(mockConversationDetailsShow).not.toHaveBeenCalled();
+			});
+
+			it("does not detach a same-sessionId session from a different source", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "codex" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = makeSummary();
 				await SummaryWebviewPanel.show(
 					summary,
 					extensionUri,
@@ -5607,29 +5458,284 @@ describe("SummaryWebviewPanel", () => {
 					stubBridge,
 					mainBranch,
 				);
-				mockStoreSummary.mockClear();
+				mockSaveTranscriptsBatch.mockClear();
+				const dispatch = captureMessageHandler();
+
+				// Same sessionId ("s1") but a different source ("claude") than the
+				// stored session ("codex") — must NOT match and detach it.
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "conversationDetached",
+					hash: "abc123",
+					sessionId: "s1",
+					source: "claude",
+				});
+			});
+
+			it("acks without touching files when the session is not found (already-detached / stale row)", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "other",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "X" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				mockSaveTranscriptsBatch.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "ghost", source: "claude" });
+				await flushPromises();
+
+				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "conversationDetached",
+					hash: "abc123",
+					sessionId: "ghost",
+					source: "claude",
+				});
+			});
+
+			it("reports an error and does not mutate the summary when the transcript file batch write fails", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				mockSaveTranscriptsBatch.mockRejectedValueOnce(new Error("disk full"));
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Detach conversation failed"),
+				);
+				expect(postMessage).not.toHaveBeenCalledWith(
+					expect.objectContaining({ command: "conversationDetached" }),
+				);
+			});
+
+			it("reports an error when the transcript file batch rejects with a non-Error", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				mockSaveTranscriptsBatch.mockRejectedValueOnce("disk full");
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Detach conversation failed"),
+				);
+			});
+
+			it("reports an error and leaves the summary untouched when persisting the transcript-ID removal fails", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+				} as ReturnType<typeof makeSummary>;
 				mockStoreSummary.mockRejectedValueOnce(new Error("disk full"));
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				mockSaveTranscriptsBatch.mockClear();
 				const dispatch = captureMessageHandler();
 
-				dispatch({ command: "deleteAllTranscripts" });
+				// The only session in the only transcript → kept.length === 0 →
+				// deletes.length > 0 → persistTranscriptIdRemoval runs (and fails)
+				// before the (never-reached) file batch write.
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
 				await flushPromises();
 
-				// File batch must NOT run when summary update failed first.
-				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
-				// Failure message reaches the user; no Success message is sent.
-				expect(postMessage).toHaveBeenCalledWith(
-					expect.objectContaining({ command: "transcriptsDeleteFailed" }),
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Detach conversation failed"),
 				);
-				expect(postMessage).not.toHaveBeenCalledWith({ command: "transcriptsDeleted" });
+				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
 			});
 
-			it("posts transcriptsDeleteFailed when saveTranscriptsBatch rejects after summary already updated", async () => {
+			it("is denied on a foreign-repo panel", async () => {
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"memory",
+					"other-repo",
+					"https://github.com/x/foreign.git",
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				expect(mockReadTranscriptsForCommits).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("disabled"),
+				);
+			});
+
+			it("rewrites a transcript in place (write only, no delete) when the transcript keeps other sessions", async () => {
 				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+									},
+									{
+										sessionId: "keep",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "K" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				mockSaveTranscriptsBatch.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				// No transcript becomes fully empty, so deletes stays empty and
+				// persistTranscriptIdRemoval never runs (the false branch of the
+				// `deletes.length > 0` guard).
+				expect(mockSaveTranscriptsBatch).toHaveBeenCalledWith(
+					[{ hash: "abc123", data: { sessions: [expect.objectContaining({ sessionId: "keep" })] } }],
+					[],
+					workspaceRoot,
+				);
+			});
+
+			it("no-ops persistTranscriptIdRemoval when the summary already lists no transcripts", async () => {
+				// A stale-mismatch edge case: transcriptHashSet (the read-side cache)
+				// still names a commit, but summary.transcripts (the authoritative
+				// v5 array persistTranscriptIdRemoval reads) is already empty — the
+				// `current.length === 0` fast-path should return the summary as-is
+				// without writing.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+									},
+								],
+							},
+						],
+					]),
+				);
 				const summary = {
 					...makeSummary(),
 					version: 5,
-					transcripts: ["abc123"],
+					transcripts: [],
 				} as ReturnType<typeof makeSummary>;
 				await SummaryWebviewPanel.show(
 					summary,
@@ -5639,36 +5745,102 @@ describe("SummaryWebviewPanel", () => {
 					mainBranch,
 				);
 				mockStoreSummary.mockClear();
-				mockSaveTranscriptsBatch.mockClear();
-				mockSaveTranscriptsBatch.mockRejectedValueOnce(new Error("git push timeout"));
 				const dispatch = captureMessageHandler();
 
-				dispatch({ command: "deleteAllTranscripts" });
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
 				await flushPromises();
 
-				// summary write was attempted (summary-first ordering)
-				expect(mockStoreSummary).toHaveBeenCalled();
-				// file delete was attempted and failed
-				expect(mockSaveTranscriptsBatch).toHaveBeenCalled();
-				// FailureMessage is posted instead of success
+				expect(mockStoreSummary).not.toHaveBeenCalled();
 				expect(postMessage).toHaveBeenCalledWith(
-					expect.objectContaining({ command: "transcriptsDeleteFailed" }),
+					expect.objectContaining({ command: "conversationDetached" }),
 				);
-				expect(postMessage).not.toHaveBeenCalledWith({ command: "transcriptsDeleted" });
+			});
 
-				// P2: the failed delete stays RETRYABLE. The still-on-disk file is
-				// NOT hidden (we don't refresh from the cleared summary), so a
-				// repeat "Delete all transcripts" re-attempts the file removal and
-				// succeeds this time.
+			it("no-ops persistTranscriptIdRemoval when the emptied commit isn't in summary.transcripts", async () => {
+				// Another stale-mismatch edge case: the commit being fully detached
+				// IS in transcriptHashSet (so it's read and matched) but is NOT
+				// listed in summary.transcripts — filtering removes nothing, so the
+				// `filtered.length === current.length` fast-path returns as-is.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["other999"],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "conversationDetached" }),
+				);
+			});
+
+			it("defaults a session's undefined source to claude when matching for detach", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										// source is undefined — should default to "claude" for matching.
+										entries: [{ role: "human" as const, content: "A" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				mockSaveTranscriptsBatch.mockClear();
-				mockSaveTranscriptsBatch.mockResolvedValueOnce(undefined);
-				postMessage.mockClear();
+				const dispatch = captureMessageHandler();
 
-				dispatch({ command: "deleteAllTranscripts" });
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
 				await flushPromises();
 
 				expect(mockSaveTranscriptsBatch).toHaveBeenCalledWith([], ["abc123"], workspaceRoot);
-				expect(postMessage).toHaveBeenCalledWith({ command: "transcriptsDeleted" });
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "conversationDetached",
+					hash: "abc123",
+					sessionId: "s1",
+					source: "claude",
+				});
 			});
 		});
 
@@ -5826,18 +5998,6 @@ describe("SummaryWebviewPanel", () => {
 				await flushPromises();
 
 				expect(mockPushToJolli).not.toHaveBeenCalled();
-			});
-
-			it("saveAllTranscripts skips refresh when currentSummary is null", async () => {
-				const dispatch = await setupPanelWithoutSummary();
-
-				dispatch({ command: "saveAllTranscripts", entries: [] });
-				await flushPromises();
-
-				// transcriptsSaved is still posted, but the refresh guard is skipped
-				expect(postMessage).toHaveBeenCalledWith({
-					command: "transcriptsSaved",
-				});
 			});
 
 			it("handlePush dispatch guard skips call when summary is null", async () => {
@@ -6438,253 +6598,6 @@ describe("SummaryWebviewPanel", () => {
 					expect.stringContaining("Load transcript stats failed"),
 					"string rejection",
 				);
-			});
-		});
-
-		// ── saveAllTranscripts with timestamp ────────────────────────────────
-
-		describe("saveAllTranscripts preserves timestamps", () => {
-			it("includes timestamps in saved transcripts when provided", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
-				mockReadTranscriptsForCommits.mockResolvedValue(
-					new Map([
-						[
-							"abc123",
-							{
-								sessions: [
-									{
-										sessionId: "s1",
-										source: "claude" as const,
-										entries: [
-											{
-												role: "human" as const,
-												content: "Old",
-												timestamp: "2025-01-01T00:00:00Z",
-											},
-										],
-									},
-								],
-							},
-						],
-					]),
-				);
-				const summary = makeSummary();
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-
-				dispatch({
-					command: "saveAllTranscripts",
-					entries: [
-						{
-							commitHash: "abc123",
-							sessionId: "s1",
-							source: "claude",
-							originalIndex: 0,
-							role: "human",
-							content: "Edited",
-							timestamp: "2025-01-01T12:00:00Z",
-						},
-					],
-				});
-				await flushPromises();
-
-				expect(mockSaveTranscriptsBatch).toHaveBeenCalledWith(
-					expect.arrayContaining([
-						expect.objectContaining({
-							data: expect.objectContaining({
-								sessions: expect.arrayContaining([
-									expect.objectContaining({
-										entries: expect.arrayContaining([
-											expect.objectContaining({
-												timestamp: "2025-01-01T12:00:00Z",
-											}),
-										]),
-									}),
-								]),
-							}),
-						}),
-					]),
-					expect.any(Array),
-					workspaceRoot,
-				);
-			});
-		});
-
-		// ── push with trailing slashes on base URL ───────────────────────────
-
-		describe("pushToJolli trims trailing slashes from base URL", () => {
-			it("removes trailing slashes from resolved base URL", async () => {
-				mockLoadConfig.mockResolvedValue({
-					apiKey: "test",
-					jolliApiKey: "jk_valid",
-				});
-				mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app///" });
-				mockPushToJolli.mockResolvedValue({ docId: 42 });
-				const dispatch = await setupPanel();
-
-				dispatch({ command: "push" });
-				await flushPromises();
-
-				// pushToJolli should receive the base URL without trailing slashes
-				expect(mockPushToJolli).toHaveBeenCalledWith(
-					"https://my.jolli.app///",
-					"jk_valid",
-					expect.any(Object),
-				);
-			});
-		});
-
-		// ── push with non-Error throw in catchAndShow ────────────────────────
-
-		describe("push error non-Error from catchAndShow", () => {
-			it("catches non-Error thrown from pushToJolli and displays string", async () => {
-				mockLoadConfig.mockResolvedValue({
-					apiKey: "test",
-					jolliApiKey: "jk_valid",
-				});
-				mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
-				mockPushToJolli.mockRejectedValue("string error");
-				const dispatch = await setupPanel();
-
-				dispatch({ command: "push" });
-				await flushPromises();
-
-				expect(showErrorMessage).toHaveBeenCalledWith(
-					"Push failed: string error",
-				);
-			});
-		});
-
-		// ── loadAllTranscripts with entries missing timestamps ────────────────
-
-		describe("loadAllTranscripts with entries missing timestamps", () => {
-			it("uses empty string for missing timestamps and transcriptPaths", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
-				const transcriptMap = new Map([
-					[
-						"abc123",
-						{
-							sessions: [
-								{
-									sessionId: "s1",
-									source: "claude" as const,
-									// No transcriptPath
-									entries: [
-										{ role: "human" as const, content: "Q" },
-										// No timestamp
-									],
-								},
-							],
-						},
-					],
-				]);
-				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
-				const summary = makeSummary();
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-
-				dispatch({ command: "loadAllTranscripts" });
-				await flushPromises();
-
-				expect(postMessage).toHaveBeenCalledWith(
-					expect.objectContaining({
-						command: "allTranscriptsLoaded",
-						entries: expect.arrayContaining([
-							expect.objectContaining({
-								transcriptPath: "",
-								timestamp: "",
-							}),
-						]),
-					}),
-				);
-			});
-		});
-
-		// ── saveAllTranscripts: entries without source and timestamp ──────────
-
-		describe("saveAllTranscripts defaults", () => {
-			it("defaults source to 'claude' when not provided in entries", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
-				mockReadTranscriptsForCommits.mockResolvedValue(
-					new Map([
-						[
-							"abc123",
-							{
-								sessions: [
-									{
-										sessionId: "s1",
-										entries: [{ role: "human" as const, content: "Old" }],
-									},
-								],
-							},
-						],
-					]),
-				);
-				const summary = makeSummary();
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-
-				dispatch({
-					command: "saveAllTranscripts",
-					entries: [
-						{
-							commitHash: "abc123",
-							sessionId: "s1",
-							originalIndex: 0,
-							role: "human",
-							content: "Edited",
-						},
-					],
-				});
-				await flushPromises();
-
-				expect(mockSaveTranscriptsBatch).toHaveBeenCalledWith(
-					expect.arrayContaining([
-						expect.objectContaining({
-							data: expect.objectContaining({
-								sessions: expect.arrayContaining([
-									expect.objectContaining({ source: "claude" }),
-								]),
-							}),
-						}),
-					]),
-					expect.any(Array),
-					workspaceRoot,
-				);
-			});
-		});
-
-		// ── saveAllTranscripts: no writes and no deletes ─────────────────────
-
-		describe("saveAllTranscripts no-op", () => {
-			it("skips saveTranscriptsBatch when writes and deletes are both empty", async () => {
-				// transcriptHashSet is empty, so no commits to process
-				const dispatch = await setupPanel();
-				mockSaveTranscriptsBatch.mockClear();
-
-				dispatch({ command: "saveAllTranscripts", entries: [] });
-				await flushPromises();
-
-				// With empty transcriptHashSet, no writes or deletes are generated
-				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
 			});
 		});
 
@@ -9172,15 +9085,15 @@ describe("SummaryWebviewPanel", () => {
 			);
 		});
 
-		it("allows read-only display commands (transcript stats/all, plan/note preview) on a foreign panel", async () => {
+		it("allows read-only display commands (transcript stats, plan/note preview) on a foreign panel", async () => {
 			// foreignStorage threading is useless if the dispatch guard
 			// denies these commands before they reach the handler. The
-			// foreign mode is read-only-view: transcripts (stats + Manage
-			// modal) and the rendered Markdown previews for plans / notes
-			// are the four display paths a foreign-panel user can reach.
-			// `loadPlanContent` / `loadNoteContent` are intentionally NOT
-			// pinned here — those drive the inline edit form, which is
-			// CSS-hidden in `.foreign-readonly`.
+			// foreign mode is read-only-view: transcript stats and the
+			// rendered Markdown previews for plans / notes are the display
+			// paths a foreign-panel user can reach. `loadPlanContent` /
+			// `loadNoteContent` are intentionally NOT pinned here — those
+			// drive the inline edit form, which is CSS-hidden in
+			// `.foreign-readonly`.
 			const foreignStorage = {
 				kind: "foreign-storage-stub",
 			} as unknown as import(
@@ -9201,7 +9114,6 @@ describe("SummaryWebviewPanel", () => {
 			const dispatch = captureMessageHandler();
 
 			dispatch({ command: "loadTranscriptStats" });
-			dispatch({ command: "loadAllTranscripts" });
 			dispatch({ command: "previewPlan", slug: "plan-x", title: "Plan X" });
 			dispatch({ command: "previewNote", id: "note-x", title: "Note X" });
 			await flushPromises();
@@ -9212,10 +9124,9 @@ describe("SummaryWebviewPanel", () => {
 			expect(denialCalls).toHaveLength(0);
 		});
 
-		it("handleLoadTranscriptStats and handleLoadAllTranscripts read transcripts through foreignStorage when set", async () => {
-			// Pins the non-bridge branch of the read ternary in both
-			// transcript-load handlers — without this, foreign-mode "All
-			// Conversations" stats and the Manage modal would silently call
+		it("handleLoadTranscriptStats reads transcripts through foreignStorage when set", async () => {
+			// Pins the non-bridge branch of the read ternary — without this,
+			// foreign-mode "All Conversations" stats would silently call
 			// `this.bridge.readTranscriptsForCommits` (cwd storage) and
 			// surface 0 sessions for every cross-repo summary. Setting
 			// transcriptHashSet via a matched commitHash + non-empty
@@ -9246,10 +9157,9 @@ describe("SummaryWebviewPanel", () => {
 			const dispatch = captureMessageHandler();
 
 			dispatch({ command: "loadTranscriptStats" });
-			dispatch({ command: "loadAllTranscripts" });
 			await flushPromises();
 
-			// Both reads went through the direct core helper (3-arg form)
+			// The read went through the direct core helper (3-arg form)
 			// rather than the stub bridge wrapper (1-arg form). The
 			// foreignStorage instance is the load-bearing signal.
 			expect(mockReadTranscriptsForCommits).toHaveBeenCalledWith(
@@ -9519,6 +9429,27 @@ describe("SummaryWebviewPanel", () => {
 			expect(staleRender).toBeDefined();
 			// And the storage write never happened.
 			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks a commit-kind share when the commit was rewritten into a new root", async () => {
+			// The redesign made the Share button always-on + data-foreign-safe, which
+			// exempts it from the .stale-readonly CSS hide rule that used to remove the
+			// whole share modal. shareContext re-asserts the guard for the `commit`
+			// kind so a rewritten commit's read-only link can't be created/revoked.
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "shareBranch", shareKind: "commit" });
+			await flushPromises();
+
+			expectStaleModalShown("rewritten into rootnew0", "abc123", "share this memory");
 		});
 
 		it("walks a multi-hop parent chain to the final live root", async () => {
@@ -10939,7 +10870,7 @@ describe("SummaryWebviewPanel", () => {
 
 		// ── Transcript handlers (P2 #2) ──────────────────────────────────
 
-		it("blocks save all transcripts when the commit was rewritten", async () => {
+		it("blocks detach conversation when the commit was rewritten", async () => {
 			(
 				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
 			).mockResolvedValue(
@@ -10950,28 +10881,10 @@ describe("SummaryWebviewPanel", () => {
 			);
 			const dispatch = await setupCommit("abc123");
 
-			dispatch({ command: "saveAllTranscripts", entries: [] });
+			dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
 			await flushPromises();
 
-			expectStaleModalShown("save transcripts");
-			expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
-		});
-
-		it("blocks delete all transcripts when the commit was rewritten", async () => {
-			(
-				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
-			).mockResolvedValue(
-				buildChainEntryMap([
-					{ hash: "abc123", parent: "rootnew0" },
-					{ hash: "rootnew0", parent: null },
-				]),
-			);
-			const dispatch = await setupCommit("abc123");
-
-			dispatch({ command: "deleteAllTranscripts" });
-			await flushPromises();
-
-			expectStaleModalShown("delete transcripts");
+			expectStaleModalShown("detach conversation");
 			expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
 		});
 	});
@@ -11413,145 +11326,6 @@ describe("SummaryWebviewPanel", () => {
 			});
 		});
 
-		describe("transcript failure: non-Error rejection (String(err) coercion)", () => {
-			it("saveAllTranscripts logs and posts Failed when persistTranscriptIdRemoval rejects with a non-Error", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123", "def456"]));
-				const summary = {
-					...makeSummary(),
-					version: 5,
-					transcripts: ["abc123", "def456"],
-				} as ReturnType<typeof makeSummary>;
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-				mockStoreSummary.mockClear();
-				// Reject with a plain string (non-Error) so the `String(err)` arm runs.
-				mockStoreSummary.mockRejectedValueOnce("string failure");
-				mockSaveTranscriptsBatch.mockClear();
-
-				dispatch({
-					command: "saveAllTranscripts",
-					entries: [
-						{
-							commitHash: "abc123",
-							sessionId: "s1",
-							source: "claude",
-							originalIndex: 0,
-							role: "human",
-							content: "x",
-						},
-					],
-				});
-				await flushPromises();
-
-				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
-				expect(postMessage).toHaveBeenCalledWith(
-					expect.objectContaining({ command: "transcriptsSaveFailed" }),
-				);
-			});
-
-			it("saveAllTranscripts logs and posts Failed when the file batch rejects with a non-Error", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123", "def456"]));
-				const summary = {
-					...makeSummary(),
-					version: 5,
-					transcripts: ["abc123", "def456"],
-				} as ReturnType<typeof makeSummary>;
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-				mockStoreSummary.mockClear();
-				mockSaveTranscriptsBatch.mockClear();
-				mockSaveTranscriptsBatch.mockRejectedValueOnce("string io failure");
-
-				dispatch({
-					command: "saveAllTranscripts",
-					entries: [
-						{
-							commitHash: "abc123",
-							sessionId: "s1",
-							source: "claude",
-							originalIndex: 0,
-							role: "human",
-							content: "edited",
-						},
-					],
-				});
-				await flushPromises();
-
-				expect(mockSaveTranscriptsBatch).toHaveBeenCalled();
-				expect(postMessage).toHaveBeenCalledWith(
-					expect.objectContaining({ command: "transcriptsSaveFailed" }),
-				);
-			});
-
-			it("deleteAllTranscripts logs and posts Failed when persistTranscriptIdRemoval rejects with a non-Error", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
-				const summary = {
-					...makeSummary(),
-					version: 5,
-					transcripts: ["abc123"],
-				} as ReturnType<typeof makeSummary>;
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-				mockStoreSummary.mockClear();
-				mockStoreSummary.mockRejectedValueOnce("string delete failure");
-				mockSaveTranscriptsBatch.mockClear();
-
-				dispatch({ command: "deleteAllTranscripts" });
-				await flushPromises();
-
-				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
-				expect(postMessage).toHaveBeenCalledWith(
-					expect.objectContaining({ command: "transcriptsDeleteFailed" }),
-				);
-			});
-
-			it("deleteAllTranscripts logs and posts Failed when the file delete rejects with a non-Error", async () => {
-				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
-				const summary = {
-					...makeSummary(),
-					version: 5,
-					transcripts: ["abc123"],
-				} as ReturnType<typeof makeSummary>;
-				await SummaryWebviewPanel.show(
-					summary,
-					extensionUri,
-					workspaceRoot,
-					stubBridge,
-					mainBranch,
-				);
-				const dispatch = captureMessageHandler();
-				mockStoreSummary.mockClear();
-				mockSaveTranscriptsBatch.mockClear();
-				mockSaveTranscriptsBatch.mockRejectedValueOnce("string file delete failure");
-
-				dispatch({ command: "deleteAllTranscripts" });
-				await flushPromises();
-
-				expect(mockSaveTranscriptsBatch).toHaveBeenCalled();
-				expect(postMessage).toHaveBeenCalledWith(
-					expect.objectContaining({ command: "transcriptsDeleteFailed" }),
-				);
-			});
-		});
-
 		describe("stale-guard early returns in reference handlers", () => {
 			function staleChain(): Map<
 				string,
@@ -11801,6 +11575,508 @@ describe("SummaryWebviewPanel", () => {
 					expect.stringContaining('"linear:PROJ-Y-bbbbbbbb"'),
 					expect.objectContaining({ modal: true }),
 					"Remove",
+				);
+			});
+		});
+
+		describe("showWithShareModal", () => {
+			it("opens the panel and arms the one-shot share modal (readStorage defaulted)", async () => {
+				const summary = makeSummary({ commitHash: "swm10000" });
+				// readStorage omitted → its default parameter is exercised.
+				await SummaryWebviewPanel.showWithShareModal(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"commit",
+				);
+				const instance = firstCommitPanel<{
+					shareEntryKind: string;
+				}>();
+				// pendingShareOpen is a one-shot flag consumed + reset by update(), so
+				// assert the persistent entry-kind instead.
+				expect(instance.shareEntryKind).toBe("commit");
+			});
+
+			it("is a no-op when show() registers no panel for the hash", async () => {
+				const showSpy = vi
+					.spyOn(SummaryWebviewPanel, "show")
+					.mockResolvedValue(undefined);
+				try {
+					await SummaryWebviewPanel.showWithShareModal(
+						makeSummary({ commitHash: "swm20000" }),
+						extensionUri,
+						workspaceRoot,
+						stubBridge,
+						mainBranch,
+						"commit",
+					);
+					// commitPanels stays empty → instance undefined → early return.
+					expect(
+						(
+							SummaryWebviewPanel as unknown as {
+								commitPanels: Map<string, unknown>;
+							}
+						).commitPanels.size,
+					).toBe(0);
+				} finally {
+					showSpy.mockRestore();
+				}
+			});
+
+			it("falls back to the passed summary when the instance has no currentSummary", async () => {
+				const summary = makeSummary({ commitHash: "swm30000" });
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const instance = firstCommitPanel<{
+					currentSummary: unknown;
+					shareEntryKind: string;
+				}>();
+				instance.currentSummary = undefined;
+				// No-op show so it does not re-run update() and re-set currentSummary;
+				// the instance stays registered with a cleared currentSummary, so the
+				// `instance.currentSummary ?? summary` fallback uses the passed summary.
+				const showSpy = vi
+					.spyOn(SummaryWebviewPanel, "show")
+					.mockResolvedValue(undefined);
+				try {
+					await SummaryWebviewPanel.showWithShareModal(
+						summary,
+						extensionUri,
+						workspaceRoot,
+						stubBridge,
+						mainBranch,
+						"branch",
+					);
+					expect(instance.shareEntryKind).toBe("branch");
+				} finally {
+					showSpy.mockRestore();
+				}
+			});
+		});
+
+		describe("loadConversations branch coverage", () => {
+			it("no-ops on a disposed panel", async () => {
+				const dispatch = await openPanel();
+				firstCommitPanel<{ disposed: boolean }>().disposed = true;
+				postMessage.mockClear();
+
+				dispatch({ command: "loadConversations" });
+				await flushPromises();
+
+				expect(postMessage).not.toHaveBeenCalledWith(
+					expect.objectContaining({ command: "conversationsData" }),
+				);
+			});
+
+			it("reads via foreignStorage for a foreign-repo memory panel", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["c1"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"c1",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const foreignStorage = { listFiles: vi.fn() } as never;
+				// v5 transcript IDs so refreshTranscriptHashes keeps "c1" in the set
+				// (transcriptIds ∩ on-disk IDs — both mocked to contain "c1").
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["c1"],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"memory",
+					"other-repo",
+					"https://github.com/x/foreign.git",
+					foreignStorage,
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadConversations" });
+				await flushPromises();
+
+				expect(mockReadTranscriptsForCommits).toHaveBeenCalledWith(
+					["c1"],
+					workspaceRoot,
+					foreignStorage,
+				);
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "conversationsData" }),
+				);
+			});
+
+			it("tolerates source-less / entries-less sessions and merges duplicates", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["c1", "c2"]));
+				const map = new Map<
+					string,
+					{ sessions: Array<{ sessionId: string; source?: string; entries?: unknown[] }> }
+				>([
+					// First-seen, no source, no entries → source `?? "claude"` + entries `?? []`.
+					["c1", { sessions: [{ sessionId: "su" }] }],
+					// Same composite key "claude:su" → merge path, second entries `?? []`.
+					["c2", { sessions: [{ sessionId: "su" }] }],
+				]);
+				mockReadTranscriptsForCommits.mockResolvedValue(map as never);
+				const dispatch = await openPanel();
+
+				dispatch({ command: "loadConversations" });
+				await flushPromises();
+
+				const call = postMessage.mock.calls.find(
+					(c) => (c[0] as { command?: string })?.command === "conversationsData",
+				);
+				const items = call?.[0].items as Array<{
+					sessionId: string;
+					source: string;
+					messageCount: number;
+				}>;
+				expect(items).toHaveLength(1);
+				expect(items[0]).toMatchObject({
+					sessionId: "su",
+					source: "claude",
+					messageCount: 0,
+				});
+			});
+
+			it("logs a warning when the transcript read rejects (Error and non-Error)", async () => {
+				const dispatch = await openPanel();
+				warn.mockClear();
+
+				mockReadTranscriptsForCommits.mockRejectedValueOnce(new Error("boom"));
+				dispatch({ command: "loadConversations" });
+				await flushPromises();
+
+				mockReadTranscriptsForCommits.mockRejectedValueOnce("boom-string");
+				dispatch({ command: "loadConversations" });
+				await flushPromises();
+
+				const warns = warn.mock.calls.map((c) => c.map(String).join(" "));
+				expect(warns.filter((w) => w.includes("Load conversations failed"))).toHaveLength(2);
+			});
+		});
+
+		describe("loadFiles branch coverage", () => {
+			it("logs a warning when reachability resolution rejects (Error and non-Error)", async () => {
+				const dispatch = await openPanel({ branch: "feature/test" });
+				warn.mockClear();
+
+				// listCommitFiles resolves (default []), then isFilesDiffResolvable's
+				// isAncestor rejects OUTSIDE the inner try → handleLoadFiles rejects →
+				// the dispatch-level `.catch` logs.
+				mockIsAncestor.mockRejectedValueOnce(new Error("git boom"));
+				dispatch({ command: "loadFiles" });
+				await flushPromises();
+
+				mockIsAncestor.mockRejectedValueOnce("git-string");
+				dispatch({ command: "loadFiles" });
+				await flushPromises();
+
+				const warns = warn.mock.calls.map((c) => c.map(String).join(" "));
+				expect(warns.filter((w) => w.includes("Load files failed"))).toHaveLength(2);
+			});
+
+			it("falls back to topic paths when listCommitFiles rejects with a non-Error", async () => {
+				(
+					stubBridge.listCommitFiles as ReturnType<typeof vi.fn>
+				).mockRejectedValueOnce("string failure");
+				mockIsAncestor.mockResolvedValueOnce(true);
+				const dispatch = await openPanel({
+					branch: "feature/test",
+					topics: [
+						{
+							title: "T",
+							trigger: "x",
+							response: "y",
+							decisions: "z",
+							filesAffected: ["a.ts"],
+						},
+					],
+				});
+
+				dispatch({ command: "loadFiles" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						command: "files:rows",
+						rows: [{ path: "a.ts", dir: "", status: "M" }],
+					}),
+				);
+			});
+		});
+
+		describe("regenerate + stale + conversation-detach handler branches", () => {
+			it("handleRegenerateSummary returns early when a regenerate is already in flight (handler guard)", async () => {
+				await openPanel();
+				const instance = firstCommitPanel<{
+					regenerateInProgress: boolean;
+					handleRegenerateSummary: () => Promise<void>;
+				}>();
+				instance.regenerateInProgress = true;
+				mockLoadRegenerateContext.mockClear();
+
+				// Direct call bypasses the dispatch-level regenerate-safe guard so the
+				// handler's own in-flight short-circuit is exercised.
+				await instance.handleRegenerateSummary();
+
+				expect(mockLoadRegenerateContext).not.toHaveBeenCalled();
+			});
+
+			it("regenerate confirm detail handles a null reference count and a notes-only line", async () => {
+				mockLoadRegenerateContext.mockResolvedValue({
+					entryCount: 3,
+					sessionCount: 1,
+					sources: ["Claude"],
+					humanTurns: 1,
+					plansCount: 0,
+					notesCount: 1,
+					// A nullish per-source count exercises the `n ?? 0` reduce default.
+					referenceCountsBySource: { linear: undefined } as never,
+				});
+				showWarningMessage.mockResolvedValueOnce(undefined);
+				const dispatch = await openPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				const [, opts] = showWarningMessage.mock.calls[0];
+				expect((opts as { detail: string }).detail).toContain("1 note");
+			});
+
+			it("skips the pre-modal re-render when currentSummary is cleared during the stale index read", async () => {
+				(
+					stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+				).mockImplementationOnce(async () => {
+					// Simulate a concurrent clear landing during the awaited index read,
+					// so enterStaleReadonlyMode's `if (this.currentSummary)` sees null.
+					firstCommitPanel<{ currentSummary: null }>().currentSummary = null;
+					return new Map([
+						["abc123", { commitHash: "abc123", parentCommitHash: "rootnew0" }],
+						["rootnew0", { commitHash: "rootnew0", parentCommitHash: null }],
+					]);
+				});
+				showWarningMessage.mockResolvedValueOnce(undefined);
+				await openPanel();
+				const instance = firstCommitPanel<{
+					ensureCommitNotRewritten: (op: string) => Promise<boolean>;
+				}>();
+
+				const allowed = await instance.ensureCommitNotRewritten("test op");
+
+				expect(allowed).toBe(false);
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("was rewritten into"),
+					expect.anything(),
+					expect.anything(),
+				);
+			});
+
+			it("prepareCreatePr with a branchless summary skips the cross-branch classifier", async () => {
+				const dispatch = await openPanel({ branch: "" });
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+
+				// summary.branch === "" → the `if (summary.branch)` guard is skipped and
+				// the form is shown directly.
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "prShowCreateForm" }),
+				);
+			});
+
+			it("routes the worker-busy PR status re-check to the foreign repo URL", async () => {
+				await SummaryWebviewPanel.show(
+					makeSummary({ branch: "feature/foreign" }),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"memory",
+					"other-repo",
+					"https://github.com/x/foreign.git",
+				);
+				const instance = (
+					SummaryWebviewPanel as unknown as {
+						currentMemoryPanel: { handlePrepareCreatePr: () => Promise<void> };
+					}
+				).currentMemoryPanel;
+				// Worker busy → handleWorkerBusyOrContinue runs the PR status re-check,
+				// which for a foreign panel passes foreignRepoUrl (the truthy arm of
+				// `this.foreignRepoName ? this.foreignRepoUrl : null`).
+				mockIsWorkerBlockingBusy.mockResolvedValueOnce(true);
+				// Reset (not just clear): an earlier test sets a persistent
+				// mockRejectedValue on this mock, which clearMocks does not undo.
+				mockHandleCheckPrStatus.mockReset();
+				mockHandleCheckPrStatus.mockResolvedValue(undefined);
+
+				// Direct call: prepareCreatePr is denied at dispatch for foreign panels.
+				await instance.handlePrepareCreatePr();
+
+				expect(mockHandleCheckPrStatus).toHaveBeenCalledWith(
+					workspaceRoot,
+					expect.any(Function),
+					"feature/foreign",
+					"https://github.com/x/foreign.git",
+				);
+			});
+
+			it("handleConversationDetach denies a foreign-repo panel at the handler level", async () => {
+				await SummaryWebviewPanel.show(
+					makeSummary(),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"memory",
+					"other-repo",
+					"https://github.com/x/foreign.git",
+				);
+				const instance = (
+					SummaryWebviewPanel as unknown as {
+						currentMemoryPanel: {
+							handleConversationDetach: (
+								h: string,
+								s: string,
+								src: string,
+							) => Promise<void>;
+						};
+					}
+				).currentMemoryPanel;
+
+				// Direct call bypasses the dispatch-level foreign gate so the handler's
+				// own foreign guard is exercised.
+				await instance.handleConversationDetach("abc123", "s1", "claude");
+
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("disabled"),
+				);
+			});
+
+			it("persistTranscriptIdRemoval treats null transcripts as an empty v5 array", async () => {
+				await openPanel();
+				const instance = firstCommitPanel<{
+					persistTranscriptIdRemoval: (
+						s: unknown,
+						ids: ReadonlySet<string>,
+					) => Promise<unknown>;
+				}>();
+				// transcripts: null is not `=== undefined`, so isLegacy is false and the
+				// `summary.transcripts ?? []` fallback yields the empty-array fast path.
+				const summary = { ...makeSummary(), transcripts: null };
+
+				const result = await instance.persistTranscriptIdRemoval(
+					summary,
+					new Set(["x"]),
+				);
+
+				expect(result).toBe(summary);
+			});
+
+			it("reports an error when persisting the transcript-ID removal rejects with a non-Error", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+				} as ReturnType<typeof makeSummary>;
+				mockStoreSummary.mockRejectedValueOnce("string persist failure");
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({
+					command: "conversationDetach",
+					hash: "abc123",
+					sessionId: "s1",
+					source: "claude",
+				});
+				await flushPromises();
+
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Detach conversation failed"),
+				);
+			});
+
+			it("skips the summary refresh when currentSummary was cleared before the detach post-write step", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const dispatch = await openPanel();
+				// Null currentSummary so the `deletes.length > 0 && currentSummary`
+				// persist guard and the post-write `if (this.currentSummary)` refresh
+				// guard both take their false branches.
+				firstCommitPanel<{ currentSummary: null }>().currentSummary = null;
+				mockSaveTranscriptsBatch.mockClear();
+
+				dispatch({
+					command: "conversationDetach",
+					hash: "abc123",
+					sessionId: "s1",
+					source: "claude",
+				});
+				await flushPromises();
+
+				// The only session's transcript empties out → a delete is written.
+				expect(mockSaveTranscriptsBatch).toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "conversationDetached" }),
 				);
 			});
 		});

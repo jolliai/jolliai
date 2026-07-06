@@ -40,7 +40,8 @@ import { planBaseKey } from "../util/PlanGrouping.js";
 import { loadBranchSummaries } from "../views/BranchSummaryLoader.js";
 import { buildBranchRelativePath } from "../views/SummaryUtils.js";
 import type { BindingOutcome, PushAttachmentFailure, PushContext } from "./JolliPushOrchestrator.js";
-import { pushSummaryWithAttachments } from "./JolliPushOrchestrator.js";
+import { pushSummaryWithAttachments, ShareBindingError } from "./JolliPushOrchestrator.js";
+import { PluginOutdatedError } from "./JolliPushService.js";
 import { createLiveShare, type LiveShareResult, updateLiveShare } from "./JolliShareService.js";
 
 /** Raised when the share subject has no generated summaries to push. */
@@ -48,6 +49,23 @@ export class NothingToShareError extends Error {
 	constructor(branch: string) {
 		super(`No memories on "${branch}" yet — make a commit so Jolli can summarize it, then share.`);
 		this.name = "NothingToShareError";
+	}
+}
+
+/**
+ * Raised when a branch push is asked to publish a branch that is no longer the
+ * checked-out one. Every branch-collection path here loads the CURRENT HEAD's
+ * `base..HEAD` (see {@link reconcileLiveShare}); `branch` only names the lock
+ * and the share record. A push runs asynchronously after PR creation, so a
+ * mid-flight `git checkout` would otherwise silently publish another branch's
+ * memories under this branch's identity. Abort loudly instead.
+ */
+export class BranchMismatchError extends Error {
+	constructor(requested: string, current: string) {
+		super(
+			`Branch changed from "${requested}" to "${current}" before sharing could run — skipped so the wrong branch's memories aren't published. Try sharing again from "${requested}".`,
+		);
+		this.name = "BranchMismatchError";
 	}
 }
 
@@ -139,17 +157,21 @@ interface Winner<T> {
 }
 
 /**
- * Pushes the subject's summaries + deduped attachments and builds the live `ref`.
- * Shared by generate + reconcile so create-time and reconcile produce identical refs.
+ * Cross-commit dedup: pick the winner revision per plan base-slug / note id
+ * (latest updatedAt), remember the owner commit + any known docId to reuse, and
+ * assign each winner (docId injected) to its owner commit. Shared by the
+ * live-share push and the Create-PR branch push so both dedup identically.
+ *
+ * Also returns the seed docId maps (winners that already have a known docId) so
+ * `pushSubjectAndBuildRef` can pre-seed its `covered` resolution exactly as
+ * before — the Create-PR path ignores these (it builds no `covered`).
  */
-async function pushSubjectAndBuildRef(
-	subjectSummaries: ReadonlyArray<CommitSummary>,
-	kind: "branch" | "commit",
-	branch: string,
-	ctx: PushContext,
-): Promise<LiveRef> {
-	// 1. Pick the winner revision per plan base-slug / note id (latest updatedAt),
-	//    remembering the owner commit and any known docId to reuse.
+function assignOwnedAttachments(subjectSummaries: ReadonlyArray<CommitSummary>): {
+	ownedPlans: Map<string, PlanReference[]>;
+	ownedNotes: Map<string, NoteReference[]>;
+	seedPlanDocIds: Map<string, number>;
+	seedNoteDocIds: Map<string, number>;
+} {
 	const planWinners = new Map<string, Winner<PlanReference>>();
 	const noteWinners = new Map<string, Winner<NoteReference>>();
 	for (const summary of subjectSummaries) {
@@ -174,7 +196,6 @@ async function pushSubjectAndBuildRef(
 		}
 	}
 
-	// 2. Assign each winner (with its known docId injected) to its owner commit.
 	const ownedPlans = new Map<string, PlanReference[]>();
 	const ownedNotes = new Map<string, NoteReference[]>();
 	const pushInto = <T>(map: Map<string, T[]>, commit: string, item: T): void => {
@@ -189,12 +210,32 @@ async function pushSubjectAndBuildRef(
 		pushInto(ownedNotes, w.ownerCommit, w.seedDocId ? { ...w.ref, jolliNoteDocId: w.seedDocId } : w.ref);
 	}
 
+	const seedPlanDocIds = new Map<string, number>();
+	const seedNoteDocIds = new Map<string, number>();
+	for (const w of planWinners.values()) if (w.seedDocId) seedPlanDocIds.set(planBaseKey(w.ref.slug), w.seedDocId);
+	for (const [id, w] of noteWinners) if (w.seedDocId) seedNoteDocIds.set(id, w.seedDocId);
+
+	return { ownedPlans, ownedNotes, seedPlanDocIds, seedNoteDocIds };
+}
+
+/**
+ * Pushes the subject's summaries + deduped attachments and builds the live `ref`.
+ * Shared by generate + reconcile so create-time and reconcile produce identical refs.
+ */
+async function pushSubjectAndBuildRef(
+	subjectSummaries: ReadonlyArray<CommitSummary>,
+	kind: "branch" | "commit",
+	branch: string,
+	ctx: PushContext,
+): Promise<LiveRef> {
+	// 1–2. Cross-commit dedup: winners + owned attachments + seed docId maps.
+	const { ownedPlans, ownedNotes, seedPlanDocIds, seedNoteDocIds } = assignOwnedAttachments(subjectSummaries);
+
 	// 3. Push each summary oldest→newest with only its owned attachments. Capture the
-	//    pushed summary docId per commit and accumulate the branch-wide attachment map.
-	const planDocIdByBase = new Map<string, number>();
-	const noteDocIdById = new Map<string, number>();
-	for (const w of planWinners.values()) if (w.seedDocId) planDocIdByBase.set(planBaseKey(w.ref.slug), w.seedDocId);
-	for (const [id, w] of noteWinners) if (w.seedDocId) noteDocIdById.set(id, w.seedDocId);
+	//    pushed summary docId per commit and accumulate the branch-wide attachment map,
+	//    pre-seeded with any known docIds so a doc pushed under another commit still links.
+	const planDocIdByBase = new Map<string, number>(seedPlanDocIds);
+	const noteDocIdById = new Map<string, number>(seedNoteDocIds);
 
 	const summaryDocIds: number[] = [];
 	for (const summary of subjectSummaries) {
@@ -423,5 +464,72 @@ export function reconcileLiveShare(deps: LiveShareDeps, branch: string): Promise
 			// Refreshed from the current base..HEAD (the covered set just changed).
 			decisionCount: countDecisions(subjectSummaries),
 		});
+	});
+}
+
+/** Aggregate outcome of a branch content-push (no share link). */
+export interface PushBranchMemoriesResult {
+	readonly pushedCount: number;
+	readonly attachmentCount: number;
+	readonly attachmentFailures: ReadonlyArray<PushAttachmentFailure>;
+	/**
+	 * Summaries whose own article push failed with a non-fatal error (transient
+	 * network / HTTP 5xx). Collected instead of aborting the batch so an early
+	 * success is not lost when a later summary fails — fatal binding/plugin
+	 * errors still propagate and abort. `pushedCount` counts only successes.
+	 */
+	readonly summaryFailures: ReadonlyArray<PushAttachmentFailure>;
+}
+
+/**
+ * Pushes all of a branch's memories (base..HEAD) to the bound Space as articles,
+ * WITHOUT creating a share link. Reuses the same cross-commit plan/note dedup as
+ * {@link generateLiveShare}. Best-effort on attachments (non-strict): a single
+ * unreadable plan/note is collected into `attachmentFailures`, not thrown. Fatal
+ * binding / plugin errors propagate (BindingRequiredError → ShareBindingError via
+ * the injected `resolveBinding`). Throws {@link NothingToShareError} when the
+ * branch has no summaries.
+ */
+export function pushBranchMemoriesToSpace(deps: LiveShareDeps, branch: string): Promise<PushBranchMemoriesResult> {
+	return withSubjectLock(deps.workspaceRoot, branch, async () => {
+		// `loadSubjectSummaries` reads the CURRENT HEAD's base..HEAD, so if HEAD
+		// has moved off `branch` since the caller captured it, we'd push the wrong
+		// branch's memories. Verify just before the load to keep the window minimal.
+		const current = await deps.bridge.getCurrentBranch();
+		if (current !== branch) throw new BranchMismatchError(branch, current);
+		const baseUrl = resolveBaseUrl(deps.apiKey);
+		const repoUrl = await getCanonicalRepoUrl(deps.workspaceRoot);
+		const subjectSummaries = await loadSubjectSummaries(deps.bridge, deps.workspaceRoot, undefined);
+		if (subjectSummaries.length === 0) throw new NothingToShareError(branch);
+
+		const ctx = buildPushContext(deps, baseUrl, repoUrl);
+		const { ownedPlans, ownedNotes } = assignOwnedAttachments(subjectSummaries);
+
+		let pushedCount = 0;
+		let attachmentCount = 0;
+		const attachmentFailures: PushAttachmentFailure[] = [];
+		const summaryFailures: PushAttachmentFailure[] = [];
+		for (const summary of subjectSummaries) {
+			try {
+				const result = await pushSummaryWithAttachments(summary, ctx, {
+					plans: ownedPlans.get(summary.commitHash) ?? [],
+					notes: ownedNotes.get(summary.commitHash) ?? [],
+				});
+				pushedCount += 1;
+				attachmentCount += result.attachmentCount;
+				attachmentFailures.push(...result.attachmentFailures);
+			} catch (err) {
+				// Fatal for the whole batch — a missing Space binding or an outdated
+				// plugin will fail every remaining summary too, so stop here.
+				if (err instanceof ShareBindingError || err instanceof PluginOutdatedError) throw err;
+				// Transient (network / HTTP 5xx): record and keep going so earlier
+				// successes are not discarded by a later failure.
+				summaryFailures.push({
+					label: `memory "${summary.commitMessage.split("\n")[0]}"`,
+					message: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+		return { pushedCount, attachmentCount, attachmentFailures, summaryFailures };
 	});
 }

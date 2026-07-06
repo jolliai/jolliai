@@ -145,6 +145,22 @@ async function tryExecGit(args: Array<string>, cwd: string): Promise<string> {
 	}
 }
 
+/**
+ * Renders an untracked file as a full "new file" diff via `git diff --no-index`
+ * against `/dev/null` (git recognizes `/dev/null` cross-platform in --no-index).
+ * That command exits 1 whenever there IS a diff — which is always here — so
+ * `execGit` rejects even on success; the diff still rides on the error's
+ * `stdout`, so we read it from there. Returns "" if nothing usable came back.
+ */
+async function diffUntrackedFile(relPath: string, cwd: string): Promise<string> {
+	try {
+		return await execGit(["-c", "core.quotepath=false", "diff", "--no-index", "--", "/dev/null", relPath], cwd);
+	} catch (err) {
+		const stdout = (err as { stdout?: unknown }).stdout;
+		return typeof stdout === "string" ? stdout : "";
+	}
+}
+
 function shortHash(hash: string | undefined): string | undefined {
 	return hash ? hash.substring(0, 8) : undefined;
 }
@@ -865,6 +881,65 @@ export class JolliMemoryBridge {
 		});
 		log.info("bridge", "Commit message generated", { result });
 		return result;
+	}
+
+	/**
+	 * Generates a commit message for a specific set of files from the *working
+	 * tree* (`git diff HEAD -- <paths>`, staged + unstaged), rather than the
+	 * current index. This is what the Next Memory review panel needs: it previews
+	 * the title `Commit Memory` will produce for the selected files *before* they
+	 * are staged, so the panel doesn't show "No staged changes" while the Working
+	 * Memory list clearly has changes. Read-only — never mutates the index.
+	 *
+	 * An empty path list yields an empty diff (the LLM still receives the branch
+	 * for context); a bare `git diff HEAD` would otherwise summarize the whole
+	 * working tree, which is not what "selected files" means.
+	 *
+	 * Untracked selected files are included too: `git diff HEAD` never shows
+	 * them, but `Commit Memory` stages them (`git add`) and commits their
+	 * content, so a selection made entirely of new files would otherwise
+	 * produce a title from an empty diff. See {@link diffForSelection}.
+	 */
+	async generateCommitMessageForFiles(relativePaths: ReadonlyArray<string>): Promise<string> {
+		log.info("bridge", `generateCommitMessageForFiles() — ${relativePaths.length} selected file(s)`);
+		const [branch, config] = await Promise.all([this.getCurrentBranch(), loadGlobalConfig()]);
+		const stagedDiff = relativePaths.length > 0 ? await this.diffForSelection([...relativePaths]) : "";
+		const result = await generateCommitMessage({
+			stagedDiff,
+			branch,
+			stagedFiles: [...relativePaths],
+			config,
+		});
+		log.info("bridge", "Commit message generated (selection)", { result });
+		return result;
+	}
+
+	/**
+	 * Diff for a set of selected working-tree paths, combining:
+	 * - tracked changes vs HEAD (`git diff HEAD -- <paths>`), and
+	 * - untracked selected files rendered as full "new file" additions.
+	 *
+	 * `git diff HEAD` silently omits untracked files, but `Commit Memory` stages
+	 * them, so the title preview must see their content. `git ls-files --others`
+	 * finds the untracked subset of the selection; each is diffed against
+	 * `/dev/null`. Entirely read-only — the index is never touched.
+	 */
+	private async diffForSelection(paths: Array<string>): Promise<string> {
+		const [tracked, untrackedRaw] = await Promise.all([
+			tryExecGit(["-c", "core.quotepath=false", "diff", "HEAD", "--", ...paths], this.cwd),
+			tryExecGit(["-c", "core.quotepath=false", "ls-files", "--others", "--exclude-standard", "--", ...paths], this.cwd),
+		]);
+		const untracked = untrackedRaw
+			.split("\n")
+			.map((l) => l.trim())
+			.filter(Boolean);
+		if (untracked.length === 0) return tracked;
+		const parts = tracked ? [tracked] : [];
+		for (const p of untracked) {
+			const diff = await diffUntrackedFile(p, this.cwd);
+			if (diff) parts.push(diff);
+		}
+		return parts.join("");
 	}
 
 	// ── Commit operations ─────────────────────────────────────────────────
@@ -2611,7 +2686,7 @@ export class JolliMemoryBridge {
 		insertions: number;
 		deletions: number;
 		filesChanged: number;
-		files: Array<{ path: string; dir: string; status: string }>;
+		files: Array<{ path: string; dir: string; status: string; oldPath?: string }>;
 	}> {
 		const deltaBase = await this.resolveBranchDeltaBase(mainBranch);
 		if (!deltaBase) {
@@ -2627,6 +2702,48 @@ export class JolliMemoryBridge {
 			filesChanged: stats.filesChanged,
 			files: parseDiffNameStatus(nameStatusRaw),
 		};
+	}
+
+	/**
+	 * Public accessor for the refined branch-vs-main delta base commit — the
+	 * left side of the Create-PR "Files changed" per-file diff. Returns
+	 * `undefined` when there is nothing to diff (branch fully merged with no own
+	 * commits, or no common ancestor). Thin wrapper over the private
+	 * {@link resolveBranchDeltaBase} so `views/` can open an accurate
+	 * `base..HEAD` diff — matching the diffstat computed in {@link getBranchPrStats}
+	 * — without reaching into git plumbing.
+	 */
+	async getBranchDiffBase(mainBranch: string): Promise<string | undefined> {
+		return this.resolveBranchDeltaBase(mainBranch);
+	}
+
+	/**
+	 * Reads a file's contents at a git ref via `git show <ref>:<relPath>`, for
+	 * the two sides of the Create-PR per-file diff.
+	 *
+	 * Returns "" when the path does not exist at that ref — a file added on the
+	 * branch has no content at the base commit, and a deleted file has none at
+	 * HEAD — so the diff simply shows one empty side rather than failing. The
+	 * same empty result covers a too-large blob (`maxBuffer` overflow), which is
+	 * degraded rather than surfaced as a broken diff.
+	 *
+	 * `relPath` is forward-slashed and repo-relative (the `CreatePrFileRow.path`
+	 * form); git accepts forward slashes in a `<ref>:<path>` spec on every
+	 * platform. Uses its own `execFileAsyncHidden` call with a raised
+	 * `maxBuffer` because the shared local {@link execGit} keeps Node's 1 MB
+	 * default, which would silently blank moderately large source files.
+	 */
+	async readFileAtRef(ref: string, relPath: string): Promise<string> {
+		try {
+			const { stdout } = await execFileAsyncHidden("git", ["show", `${ref}:${relPath}`], {
+				cwd: this.cwd,
+				encoding: "utf8",
+				maxBuffer: 16 * 1024 * 1024,
+			});
+			return stdout;
+		} catch {
+			return "";
+		}
 	}
 
 	// ── Private helpers ───────────────────────────────────────────────────
@@ -2801,18 +2918,19 @@ export class JolliMemoryBridge {
  * keep in lockstep with parseNameStatus in CreatePrData.ts — they are
  * byte-identical; any logic change must be applied to both.
  */
-function parseDiffNameStatus(raw: string): Array<{ path: string; dir: string; status: string }> {
-	const rows: Array<{ path: string; dir: string; status: string }> = [];
+function parseDiffNameStatus(raw: string): Array<{ path: string; dir: string; status: string; oldPath?: string }> {
+	const rows: Array<{ path: string; dir: string; status: string; oldPath?: string }> = [];
 	for (const line of raw.split("\n")) {
 		const entry = line.endsWith("\r") ? line.slice(0, -1) : line;
 		if (!entry.trim() || !entry.includes("\t")) continue;
 		const parts = entry.split("\t");
 		const rawStatus = parts[0];
 		const status = rawStatus.startsWith("R") ? "R" : rawStatus;
-		const filePath = toForwardSlash(status === "R" && parts.length >= 3 ? parts[2] : parts[1]);
+		const isRename = status === "R" && parts.length >= 3;
+		const filePath = toForwardSlash(isRename ? parts[2] : parts[1]);
 		const lastSlash = filePath.lastIndexOf("/");
 		const dir = lastSlash >= 0 ? filePath.slice(0, lastSlash) : "";
-		rows.push({ path: filePath, dir, status });
+		rows.push({ path: filePath, dir, status, ...(isRename ? { oldPath: toForwardSlash(parts[1]) } : {}) });
 	}
 	return rows;
 }

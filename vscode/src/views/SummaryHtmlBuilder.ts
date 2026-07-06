@@ -2,18 +2,22 @@
  * SummaryHtmlBuilder
  *
  * Assembles the complete HTML document for the Commit Memory webview.
- * Combines CSS, header, recap, PR section, topic cards, E2E test guide,
- * source commits, footer, and interactive script into a single HTML string.
+ * Combines CSS, header, recap, ship bar, topic cards, E2E test guide,
+ * a flat Context panel (plans/notes/references), a Files panel (per-file
+ * git status + diff), footer, and interactive script into a single HTML
+ * string. The Create PR flow lives in its own pane (CreatePrHtmlBuilder), so
+ * this document does not host a PR section.
  */
 
 import { isSummaryError } from "../../../cli/src/core/SummaryErrorMarker.js";
 import {
-	aggregateTurns,
-	formatDurationLabel,
+	aggregateConversationTokenBreakdown,
+	aggregateConversationTokens,
 	resolveDiffStats,
 } from "../../../cli/src/core/SummaryTree.js";
 import type {
 	CommitSummary,
+	ConversationTokenBreakdown,
 	E2eTestScenario,
 	NoteReference,
 	PlanReference,
@@ -21,7 +25,6 @@ import type {
 	SourceId,
 	TopicCategory,
 } from "../../../cli/src/Types.js";
-import { buildPrSectionHtml } from "../services/PrCommentService.js";
 import { annotatePlans } from "../util/PlanGrouping.js";
 import { SOURCE_TITLES } from "./SourceLabels.js";
 import { buildCss } from "./SummaryCssBuilder.js";
@@ -31,12 +34,16 @@ import {
 	collectSortedTopics,
 	escAttr,
 	escHtml,
-	formatDate,
 	formatFullDate,
 	formatProviderLabel,
+	formatSonnetCostEstimate,
+	formatTokensCompact,
 	getDisplayDate,
 	padIndex,
 	renderCalloutText,
+	SONNET_CACHE_WRITE_PER_TOKEN,
+	SONNET_INPUT_PER_TOKEN,
+	SONNET_OUTPUT_PER_TOKEN,
 	type TopicWithDate,
 	timeAgo,
 } from "./SummaryUtils.js";
@@ -98,6 +105,24 @@ export interface BuildHtmlOptions {
 	 * buttons disappear without knowing why.
 	 */
 	readonly staleRewrittenInto?: string | null;
+	/**
+	 * Webview URI (via `webview.asWebviewUri`) for `assets/codicons/codicon.css`,
+	 * computed by `SummaryWebviewPanel` the same way `SidebarWebviewProvider`
+	 * does for the sidebar. When set, `buildHtml` emits a `<link>` tag loading
+	 * the codicon stylesheet — required for the `codicon-*` classes used by
+	 * the ship card (`codicon-arrow-swap`) and conversation detach
+	 * (`codicon-trash`), which otherwise render as empty boxes. Omitted in
+	 * tests that don't care about icon fonts.
+	 */
+	readonly codiconCssUri?: string;
+	/**
+	 * `webview.cspSource` — the origin the CSP must allow for the codicon
+	 * stylesheet (`style-src`) and the `.ttf` font it loads (`font-src`).
+	 * Only meaningful together with {@link codiconCssUri}; without it the CSP
+	 * stays nonce-only (inline `<style>`/`<script>`), matching pre-codicon
+	 * behavior.
+	 */
+	readonly cspSource?: string;
 }
 
 /**
@@ -129,16 +154,23 @@ export function buildHtml(
 	// CTA text adapts (no "Click Regenerate" promise when the button is
 	// hidden by CSS).
 	const readOnly = !!opts.foreignRepoName || !!opts.staleRewrittenInto;
-	const { sourceNodes } = collectSortedTopics(summary);
-	const stats = resolveDiffStats(summary);
-	const totalInsertions = stats.insertions;
-	const totalDeletions = stats.deletions;
-	const totalFiles = stats.filesChanged;
+	const totalFiles = resolveDiffStats(summary).filesChanged;
 
+	// The codicon stylesheet is an external resource (webview URI, not
+	// inline), so its origin must be added to style-src alongside the nonce;
+	// the .ttf font it @font-face-loads needs the same origin under font-src.
+	// Mirrors SidebarHtmlBuilder's CSP shape. Both style-src and font-src are
+	// omitted entirely when no codiconCssUri is supplied, so panels that
+	// don't pass one (most unit tests) keep the pre-codicon nonce-only CSP.
+	const styleSrc = opts.codiconCssUri && opts.cspSource ? `'nonce-${nonce}' ${opts.cspSource}` : `'nonce-${nonce}'`;
+	const fontSrcDirective = opts.codiconCssUri && opts.cspSource ? ` font-src ${opts.cspSource};` : "";
 	const csp = nonce
-		? `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; img-src data:;" />`
+		? `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${styleSrc}; script-src 'nonce-${nonce}';${fontSrcDirective} img-src data:;" />`
 		: "";
 	const nonceAttr = nonce ? ` nonce="${nonce}"` : "";
+	const codiconLinkTag = opts.codiconCssUri
+		? `<link rel="stylesheet" href="${opts.codiconCssUri}" />`
+		: "";
 
 	// Display short-form (8 chars) for readability; the action button keeps
 	// the full hash in data-target-hash so navigation goes through
@@ -162,25 +194,28 @@ export function buildHtml(
 ${csp}
 <title>Commit Memory</title>
 <style${nonceAttr}>${buildCss()}</style>
+${codiconLinkTag}
 </head>
 <body>
 <div class="${pageClass}">
 ${buildSummaryErrorBanner(summary, { readOnly })}
 ${staleBannerHtml}
-${buildHeader(summary, totalFiles, totalInsertions, totalDeletions, readOnly)}
+${buildPageTitleAndMetaStrip(summary)}
+${buildTokenMeter(summary)}
+${buildPropTable(summary, totalFiles, transcriptHashSet)}
 ${buildShipBar(summary)}
-${buildMemoryPanel(summary, { readOnly })}
+${buildMemoryPanel(summary, { readOnly }, !!opts.foreignRepoName)}
 ${buildE2ePanel(summary)}
 ${buildConversationsSection(transcriptHashSet, !!opts.foreignRepoName)}
-${buildAttachmentsPanel(summary, sourceNodes, planTranslateSet, noteTranslateSet, referenceTranslateSet)}
-${buildFooter(summary)}
+${buildContextPanel(summary, planTranslateSet, noteTranslateSet, referenceTranslateSet)}
+${buildFilesPanelShell()}
+${buildFooter(summary, transcriptHashSet?.size ?? 0)}
 </div>
-${readOnly ? "" : buildShareModal()}
-<script${nonceAttr}>${buildScript(
-		readOnly
-			? {}
-			: { defaultShareKind: opts.shareDefaultKind ?? "commit", autoOpenShare: opts.autoOpenShare ?? false },
-	)}</script>
+${buildShareModal()}
+<script${nonceAttr}>${buildScript({
+		defaultShareKind: opts.shareDefaultKind ?? "commit",
+		autoOpenShare: opts.autoOpenShare ?? false,
+	})}</script>
 </body>
 </html>`;
 }
@@ -314,27 +349,6 @@ function categoryClass(cat: TopicCategory): string {
 	}
 }
 
-/** Builds the optional "Conversations" property row. Returns empty string when turns is 0 or undefined. */
-function buildConversationsRow(totalTurns: number): string {
-	if (totalTurns <= 0) {
-		return "";
-	}
-	return `
-  <div class="prop-row">
-    <div class="prop-label">Conversations</div>
-    <div class="prop-value"><span class="stat-turns">\uD83D\uDCAC ${totalTurns} turn${totalTurns !== 1 ? "s" : ""}</span></div>
-  </div>`;
-}
-
-/** Builds the "Duration" property row HTML. */
-function buildDurationRow(summary: CommitSummary): string {
-	return `
-  <div class="prop-row">
-    <div class="prop-label">Duration</div>
-    <div class="prop-value">${escHtml(formatDurationLabel(summary))}</div>
-  </div>`;
-}
-
 /**
  * Builds the optional "Memory" property row with a clickable article link.
  *
@@ -382,7 +396,7 @@ export function buildJolliRow(
 	}
 	const plansAndNotesHtml =
 		allItems.length > 0
-			? `<div class="jolli-plans-block"><span class="jolli-plans-label">Plans &amp; Notes</span>${allItems.join("")}</div>`
+			? `<div class="jolli-plans-block"><span class="jolli-plans-label">Context</span>${allItems.join("")}</div>`
 			: "";
 	// Standalone block (not a `.prop-row`): lives inside the Jolli ship card.
 	// `jolliRowUpdated` (SummaryScriptBuilder) replaces this element wholesale
@@ -397,21 +411,11 @@ export function buildJolliRow(
 
 // ─── Header ───────────────────────────────────────────────────────────────────
 
-/**
- * Builds the page header: title, a compact meta strip, the collapsible
- * Details property table, and a secondary-action row (Copy Markdown +
- * Regenerate). The Jolli "Share/Update" button and the `#jolliRow` link move
- * to the ship bar (see buildShipBar); Regenerate (`#regenerateSummaryBtn`)
- * moves here from the All Conversations section so the top-level action lives
- * near the export controls.
- *
- * In `isForeign` (cross-repo Memory Bank) mode the Regenerate button is
- * OMITTED from the DOM entirely — regenerating would write the orphan branch
- * of the wrong repo, so we drop the affordance rather than rely on CSS to hide
- * it (matching the old All-Conversations behavior). In stale / regenerating
- * modes it stays in the DOM and is hidden by the readonly CSS rule (it is
- * intentionally not `data-foreign-safe`).
- */
+/** Formats a token count with thousands separators (e.g. `2100` -> `2,100`). */
+function formatTokenCount(n: number): string {
+	return n.toLocaleString("en-US");
+}
+
 /**
  * Renders the "Back-filled" badge shown in the meta strip for summaries produced
  * by the historical back-fill flow (absent on live post-commit summaries). The
@@ -437,24 +441,36 @@ function buildBackfillBadge(summary: CommitSummary): string {
 		default:
 			tip = "Back-filled for an earlier commit, reconstructed from the AI conversation that edited these files.";
 	}
-	return `<span class="meta-sep">&middot;</span><span class="meta-backfill" title="${escAttr(tip)}">Back-filled</span>`;
+	return `<span class="meta-backfill" title="${escAttr(tip)}">Back-filled</span><span class="meta-sep">&middot;</span>`;
 }
 
-function buildHeader(
-	summary: CommitSummary,
-	totalFiles: number,
-	totalInsertions: number,
-	totalDeletions: number,
-	readOnly: boolean = false,
-): string {
-	const changesHtml = `${totalFiles} file${totalFiles !== 1 ? "s" : ""} changed, <span class="stat-add">${totalInsertions} insertion${totalInsertions !== 1 ? "s" : ""}(+)</span>, <span class="stat-del">${totalDeletions} deletion${totalDeletions !== 1 ? "s" : ""}(-)</span>`;
-	const totalTurns = aggregateTurns(summary);
+/**
+ * Builds the page header: title, a compact meta strip (hash · branch · time ·
+ * Details toggle · Share · Export), and the collapsible `.mem-details` table.
+ * The Jolli "Share/Update" button and the `#jolliRow` link live in the ship
+ * bar (see buildShipBar); `.meta-share` here is a lightweight jump-to-ship-card
+ * affordance. Regenerate (`#regenerateSummaryBtn`) lives inside the Export
+ * menu alongside Copy Markdown / Save as Markdown File so every export-ish
+ * action lives behind one disclosure.
+ *
+ * Author / full date / summary-generation metadata / linked-item counts move
+ * OUT of the always-visible meta strip and into the collapsible details table
+ * (`#propTable`, class `.mem-details`) as four rows: Commit, Author, Summary
+ * by, Linked. The old Branch/Date/Duration/Changes rows are dropped — Branch
+ * and relative time already live in the strip, Duration wasn't part of the
+ * mockup, and raw insertion/deletion counts give way to the Linked row's
+ * file count.
+ *
+ * The foreign/stale readonly handling lives in `buildMemoryPanel` (where the
+ * Regenerate button now sits), so this function needs no foreign flag.
+ *
+ * Builds the `<h1 class="page-title">` + `.meta-strip` portion of the header.
+ * Split out from `#propTable` so `buildHtml` can insert `.tmeter` (the token
+ * meter) between the meta strip and the prop table per the mockup order
+ * (page-title → meta-strip → tmeter → propTable).
+ */
+export function buildPageTitleAndMetaStrip(summary: CommitSummary): string {
 	const shortHash = escHtml(summary.commitHash.substring(0, 8));
-	const turnsMeta =
-		totalTurns > 0
-			? `<span class="meta-sep">&middot;</span><span class="stat-turns">\uD83D\uDCAC ${totalTurns}</span>`
-			: "";
-
 	return `
 <h1 class="page-title">${escHtml(summary.commitMessage)}</h1>
 <div class="meta-strip">
@@ -462,97 +478,201 @@ function buildHeader(
   <span class="meta-sep">&middot;</span>
   <span class="meta-branch" title="${escAttr(summary.branch)}">${escHtml(summary.branch)}</span>
   <span class="meta-sep">&middot;</span>
-  <span class="meta-author">${escHtml(summary.commitAuthor)}</span>
-  <span class="meta-sep">&middot;</span>
   <span class="meta-date">${timeAgo(getDisplayDate(summary))}</span>
   <span class="meta-sep">&middot;</span>
-  <span class="meta-changes"><span class="stat-add">+${totalInsertions}</span>/<span class="stat-del">\u2212${totalDeletions}</span></span>
-  ${turnsMeta}
   ${buildBackfillBadge(summary)}
   <button class="details-toggle" id="detailsToggle" data-foreign-safe aria-expanded="false">Details &#x25BE;</button>
-</div>
-<div class="properties collapsed" id="propTable">
-  <div class="prop-row">
-    <div class="prop-label">Commit</div>
-    <div class="prop-value">
-      <span class="hash">${shortHash}</span>
-      <button class="hash-copy" data-hash="${escHtml(summary.commitHash)}" title="Copy full hash" data-foreign-safe>\u29C9</button>
-    </div>
-  </div>
-  <div class="prop-row">
-    <div class="prop-label">Branch</div>
-    <div class="prop-value"><span class="pill">${escHtml(summary.branch)}</span></div>
-  </div>
-  <div class="prop-row">
-    <div class="prop-label">Author</div>
-    <div class="prop-value">${escHtml(summary.commitAuthor)}</div>
-  </div>
-  <div class="prop-row">
-    <div class="prop-label">Date</div>
-    <div class="prop-value">
-      <span class="date-relative">${timeAgo(getDisplayDate(summary))}</span>
-      <span class="date-full">(${formatFullDate(getDisplayDate(summary))})</span>
-    </div>
-  </div>
-  ${buildDurationRow(summary)}
-  <div class="prop-row">
-    <div class="prop-label">Changes</div>
-    <div class="prop-value">${changesHtml}</div>
-  </div>
-  ${buildConversationsRow(totalTurns)}
-</div>
-<div class="header-actions">
-  <div class="split-btn-group">
-    <button class="action-btn" id="copyMdBtn" data-foreign-safe>Copy Markdown</button>
-    <button class="action-btn split-toggle" id="copyMdDropdown" title="More export options" data-foreign-safe>&#x25BE;</button>
-    <div class="split-menu" id="copyMdMenu">
+  <button class="action-btn meta-share" id="metaShareBtn" title="Share to Jolli"><svg class="sico" viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 14.5V4m0 0L8.3 7.7M12 4l3.7 3.7M5 12.5v6A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5v-6"/></svg> Share</button>
+  <div class="export-menu-group">
+    <button class="action-btn meta-export" id="exportMenuToggle" title="Export options" data-foreign-safe><span class="codicon codicon-book"></span> Export <span class="codicon codicon-chevron-down"></span></button>
+    <div class="split-menu" id="exportMenu">
+      <button class="split-menu-item" id="copyMdBtn" data-foreign-safe>Copy Markdown</button>
       <button class="split-menu-item" id="downloadMdBtn" data-foreign-safe>Save as Markdown File</button>
     </div>
   </div>
-  ${
-		readOnly
-			? ""
-			: `<button class="action-btn" id="shareBtn" title="Share this memory as a read-only link">${SHARE_ICON_SVG} Share</button>`
+</div>`;
+}
+
+/**
+ * Builds the collapsed `#propTable` details table (Commit / Author / Summary
+ * by / Linked). Split out from {@link buildPageTitleAndMetaStrip} — see that
+ * function's docstring for why.
+ */
+export function buildPropTable(
+	summary: CommitSummary,
+	totalFiles: number,
+	transcriptHashSet?: ReadonlySet<string>,
+): string {
+	const shortHash = escHtml(summary.commitHash.substring(0, 8));
+
+	const convCount = transcriptHashSet?.size ?? 0;
+	const ctxCount = (summary.plans?.length ?? 0) + (summary.notes?.length ?? 0) + (summary.references?.length ?? 0);
+	// CommitSummary has no commit-level aggregated `filesAffected` (only
+	// per-topic TopicSummary.filesAffected exists — see Search.ts) — the
+	// diff-derived totalFiles (buildHtml's resolveDiffStats().filesChanged)
+	// is the correct file count for the whole commit.
+	const fileCount = totalFiles;
+
+	const summaryByModel = summary.llm?.model ?? "—";
+	// A legacy/partial `llm` object (the orphan branch is append-only, so an old
+	// record can carry an `llm` block predating these fields) would make the sum
+	// NaN and render "NaN tokens" — guard each field the way the conversation
+	// token aggregation already does.
+	const tokenSpan = summary.llm
+		? ` <span class="tok-bd">&middot; ${formatTokenCount((summary.llm.inputTokens ?? 0) + (summary.llm.outputTokens ?? 0))} tokens to write this summary</span>`
+		: "";
+
+	return `
+<div class="mem-details collapsed" id="propTable">
+  <div class="md-row">
+    <div class="md-k">Commit</div>
+    <div class="md-v">
+      <span class="hash">${shortHash}</span>
+      <button class="hash-copy" data-hash="${escHtml(summary.commitHash)}" title="Copy full hash" data-foreign-safe>⧉</button>
+      <span class="md-branch">&middot; ${escHtml(summary.branch)}</span>
+    </div>
+  </div>
+  <div class="md-row">
+    <div class="md-k">Author</div>
+    <div class="md-v">${escHtml(summary.commitAuthor)} &middot; ${formatFullDate(getDisplayDate(summary))}</div>
+  </div>
+  <div class="md-row">
+    <div class="md-k">Summary by</div>
+    <div class="md-v">${escHtml(summaryByModel)}${tokenSpan}</div>
+  </div>
+  <div class="md-row">
+    <div class="md-k">Linked</div>
+    <div class="md-v">${convCount} conversation${convCount !== 1 ? "s" : ""} &middot; ${ctxCount} context &middot; ${fileCount} file${fileCount !== 1 ? "s" : ""}</div>
+  </div>
+</div>`;
+}
+
+// \u2500\u2500\u2500 Token meter \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+/**
+ * Rough cache-aware $ estimate at Sonnet pricing. `cached` (= cache_creation) is
+ * priced at the cache-write rate; input/output at their standard rates. See spec \u00a74.2.
+ * Uses the same per-token constants and "\u2248$"/"<$0.01" formatting the sidebar's
+ * token bar uses (`SummaryUtils.ts`), so the two surfaces never disagree on
+ * the same underlying token counts.
+ */
+function estimateCost(b: ConversationTokenBreakdown | undefined, total: number): string {
+	const cost = b
+		? b.input * SONNET_INPUT_PER_TOKEN + b.output * SONNET_OUTPUT_PER_TOKEN + b.cached * SONNET_CACHE_WRITE_PER_TOKEN
+		: total * SONNET_INPUT_PER_TOKEN;
+	return formatSonnetCostEstimate(cost);
+}
+
+/**
+ * Builds the per-memory token usage meter (`.tmeter`), shown between the page
+ * header and the ship bar. Three states:
+ *   1. `conversationTokenBreakdown` present \u2192 total + 3-segment bar (input /
+ *      output / cached) + a legend spelling out each segment's count.
+ *   2. Breakdown absent but `conversationTokens > 0` \u2192 total + a single
+ *      `.seg-in` segment spanning the full bar (a total-only degrade \u2014 we
+ *      never fabricate a split we don't have).
+ *   3. `conversationTokens` absent or 0 \u2192 the `.tmeter.na` empty state, no
+ *      bar at all ("Task usage not reported").
+ *
+ * Segment widths are carried as `data-pct` attributes rather than inline
+ * `style="width"` \u2014 the webview's CSP has no `unsafe-inline` for styles, so
+ * SummaryScriptBuilder sets `el.style.width` from `data-pct` after load (a
+ * JS property write, not an inline attribute, so CSP allows it).
+ */
+export function buildTokenMeter(summary: CommitSummary): string {
+	// Aggregate across the WHOLE consolidation tree — NOT the root's own scalar.
+	// A squash/amend/rebase memory carries its conversation tokens on the folded
+	// child commits, so reading only `summary.conversationTokens` (the root's own
+	// value) shows "Task usage not reported" for a memory the sidebar row reports
+	// as e.g. 12.4M. The sidebar sums via aggregateConversationTokens per root
+	// (see Extension.getBranchTokenStats), so this meter must walk the same tree
+	// or the two surfaces disagree on the same underlying counts.
+	const total = aggregateConversationTokens(summary);
+	if (total <= 0) {
+		return `
+<div class="tmeter na">
+  <div class="tmeter-head"><span class="tmeter-total">Task usage not reported</span>
+    <span class="tok-help-wrap"><button class="tok-help" type="button" data-foreign-safe>?</button>
+      <span class="tok-pop">No session on this memory reports token usage, so there's nothing to total.</span></span>
+  </div>
+</div>`;
 	}
-  ${readOnly ? "" : `<button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>`}
+	// aggregateConversationTokenBreakdown always returns an object (zeros when no
+	// segment data exists anywhere in the tree). Only render the 3-segment split
+	// when the tree actually carries breakdown data; otherwise degrade to a
+	// single full-width segment (a total we can't split, not a fabricated one).
+	const agg = aggregateConversationTokenBreakdown(summary);
+	const b = agg.input > 0 || agg.output > 0 || agg.cached > 0 ? agg : undefined;
+	// The bar's three segments are widths that must fill it exactly (100%), so
+	// their denominator is the breakdown's OWN total — NOT `total` (the tree-wide
+	// aggregateConversationTokens headline), which can exceed the breakdown sum
+	// when some folded sessions report only a scalar count with no usageBreakdown.
+	// Dividing by `total` there would underfill the bar. The last segment absorbs
+	// the rounding remainder so the three widths always sum to 100.
+	let bar: string;
+	if (b) {
+		const segTotal = b.input + b.output + b.cached; // > 0 since b is defined only when a segment is > 0
+		const wIn = Math.round((b.input / segTotal) * 100);
+		const wOut = Math.round((b.output / segTotal) * 100);
+		const wCache = Math.max(0, 100 - wIn - wOut);
+		bar = `<div class="tmeter-bar">
+    <span class="seg-in" data-pct="${wIn}"></span>
+    <span class="seg-out" data-pct="${wOut}"></span>
+    <span class="seg-cache" data-pct="${wCache}"></span>
+  </div>
+  <div class="tmeter-legend">
+    <span><i class="lg-dot seg-in"></i>${formatTokensCompact(b.input)} input</span>
+    <span><i class="lg-dot seg-out"></i>${formatTokensCompact(b.output)} output</span>
+    <span><i class="lg-dot seg-cache"></i>${formatTokensCompact(b.cached)} cached</span>
+  </div>`;
+	} else {
+		bar = `<div class="tmeter-bar"><span class="seg-in" data-pct="100"></span></div>`;
+	}
+	return `
+<div class="tmeter">
+  <div class="tmeter-head"><span class="tmeter-total">${formatTokensCompact(total)}</span> tokens &middot; <span class="tmeter-cost">${estimateCost(b, total)}</span> &middot; this task
+    <span class="tok-help-wrap"><button class="tok-help" type="button" data-foreign-safe>?</button>
+      <span class="tok-pop">Counts input + output + cache-creation across sessions (cache reads are excluded \u2014 they double-count). The \u2248$ cost is a cache-aware estimate at Sonnet pricing; actual cost varies by model.</span></span>
+  </div>
+  ${bar}
 </div>`;
 }
 
 // \u2500\u2500\u2500 Ship bar + content panels (presentation wrappers) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
 /**
- * Builds the hero "ship bar": the PR card (wraps the existing #prSection) and
- * the Jolli card (the relocated #pushJolliBtn + reshaped #jolliRow + a
- * server-derived synced/not-shared status chip). Both outbound actions sit
- * side-by-side (responsive: stacks to one column on narrow widths via CSS
- * auto-fit). No behavior change \u2014 #prSection and #pushJolliBtn keep their ids
- * and handlers; only their placement and framing change.
+ * Builds the hero "ship bar": a single Jolli card (the relocated
+ * #pushJolliBtn + reshaped #jolliRow + a server-derived SYNCED/LOCAL status
+ * chip). The Create PR flow lives in its own pane (`CreatePrHtmlBuilder`), so
+ * the detail panel no longer hosts a PR card here. #pushJolliBtn keeps its id;
+ * it always posts `push` — when already synced this re-uploads the memory in
+ * place ("Update on Jolli"), otherwise it creates the doc ("Push to Jolli").
+ * The existing article stays reachable via the links in #jolliRow.
  */
-function buildShipBar(summary: CommitSummary): string {
+export function buildShipBar(summary: CommitSummary): string {
 	const synced = !!summary.jolliDocUrl;
-	const pushLabel = synced ? "Update on Jolli" : "Share in Jolli";
-	const jolliChip = synced
-		? `<span class="ship-status is-ok"><span class="led"></span>Synced</span>`
-		: `<span class="ship-status is-warn"><span class="led"></span>Not shared</span>`;
-	const jolliSub = synced
-		? ""
-		: `<div class="ship-sub">Lives only on your machine. Share to publish this memory to your team's Jolli space.</div>`;
+	const chip = synced
+		? `<span class="ship-status is-ok"><span class="led"></span>SYNCED</span>`
+		: `<span class="ship-status local-chip"><span class="led"></span>LOCAL</span>`;
+	const sub = synced
+		? `<div class="ship-sub">Synced to your Jolli Space</div>`
+		: `<div class="ship-sub">Not synced yet.</div>`;
+	// The button always pushes: when synced the push updates the doc in place,
+	// otherwise it creates it. The label reflects which of the two applies.
+	const action = synced
+		? `<button class="action-btn" id="pushJolliBtn">Update on Jolli</button>`
+		: `<button class="action-btn" id="pushJolliBtn">Push to Jolli</button>`;
 	return `
 <div class="ship-bar">
-  <div class="ship-card" id="prCard">
-    ${buildPrSectionHtml()}
-  </div>
-  <div class="ship-card">
+  <div class="ship-card" id="jolliCard">
     <div class="ship-head">
-      <span class="ship-icon">&#x25C6;</span>
-      <span class="ship-name">Jolli Memory</span>
-      ${jolliChip}
+      <span class="ship-icon codicon codicon-arrow-swap"></span>
+      <span class="ship-name">Jolli</span>
+      ${chip}
     </div>
-    ${jolliSub}
+    ${sub}
     ${buildJolliRow(summary.jolliDocUrl, summary.commitMessage, summary.plans, summary.notes)}
-    <div class="ship-actions">
-      <button class="action-btn primary" id="pushJolliBtn">${pushLabel}</button>
-    </div>
+    <div class="ship-actions">${action}</div>
   </div>
 </div>`;
 }
@@ -566,10 +686,21 @@ function buildShipBar(summary: CommitSummary): string {
 function buildMemoryPanel(
 	summary: CommitSummary,
 	options: BuildTopicsSectionOptions = {},
+	isForeign = false,
 ): string {
+	// Regenerate now lives in the Memory panel header (right-aligned), not the
+	// Export menu — it re-runs the LLM that produces the recap + topics rendered
+	// inside this panel, so it belongs here. Same DOM-omission rule as before:
+	// dropped entirely in foreign mode (regenerating would write the wrong
+	// repo's orphan branch); in stale mode it stays and the readonly CSS rule
+	// hides it (it is intentionally NOT data-foreign-safe). The #regenerateSummaryBtn
+	// id is preserved so the delegated click handler (bound on .page) keeps working.
+	const regenerateBtn = isForeign
+		? ""
+		: `<button class="action-btn panel-regenerate" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>`;
 	return `
 <div class="panel" id="memoryPanel">
-  <div class="panel-header"><span class="panel-title">The memory</span></div>
+  <div class="panel-header"><span class="panel-title">Memory</span>${regenerateBtn}</div>
   ${buildRecapSection(summary.recap)}
   ${buildTopicsSection(summary, options)}
 </div>`;
@@ -582,30 +713,41 @@ function buildMemoryPanel(
  */
 function buildE2ePanel(summary: CommitSummary): string {
 	return `
-<div class="panel">
+<div class="panel" id="e2ePanel">
   ${buildE2eTestSection(summary)}
 </div>`;
 }
 
 /**
- * Builds the "Attachments & context" panel containing collapsible cards.
+ * Builds the flat "Context" panel (plans + notes + references), replacing
+ * the former collapsible-card "Attachments & context" panel. Per the mockup,
+ * Context is a single flat `.panel` \u2014 no `.attach-card` wrappers \u2014 with a
+ * header count chip and a `+ Add` affordance, and Source Commits is dropped
+ * entirely (the mockup has no Source Commits section; see buildHtml, which
+ * no longer reads `sourceNodes` for this panel).
  *
- * Each card wrapper (head + chevron) lives OUTSIDE the refreshed section so
- * collapse state survives `plansAndNotesUpdated` rebuilds for free \u2014 the
- * refresh only replaces the inner #plansAndNotesSection, never the card
- * wrapper. As a consequence card boundaries match refresh boundaries:
- * references render inside the "Plans & Notes" card (they share
- * #plansAndNotesSection), and source commits get their own card. Inner
- * section titles are hidden by CSS in favor of the card head.
+ * The inner `#plansAndNotesSection` (built by buildPlansAndNotesSection) is
+ * re-parented here unchanged so the `plansAndNotesUpdated` in-place refresh
+ * (SummaryWebviewPanel.refreshPlansAndNotes) keeps finding it by id \u2014 only
+ * the outer wrapper changed, not the refresh contract. That inner section's
+ * own header is hidden by CSS in favor of this panel's header.
+ *
+ * The Add dropdown + inline snippet form (`#addDropdown` / `#snippetForm`)
+ * are rendered here, in the panel header, rather than inside
+ * `#plansAndNotesSection` \u2014 they carry no plan/note/reference data, so they
+ * don't need to be torn down and rebuilt on every plansAndNotesUpdated
+ * refresh. The `.panel-add` class is layered onto the existing
+ * `.add-dropdown-toggle` button so it reads as the mockup's "+ Add" header
+ * affordance while dispatching through the same `data-action="toggleAddMenu"`
+ * delegated handler (SummaryScriptBuilder) \u2014 no new script wiring needed.
  */
-function buildAttachmentsPanel(
+export function buildContextPanel(
 	summary: CommitSummary,
-	sourceNodes: ReadonlyArray<CommitSummary>,
 	planTranslateSet?: ReadonlySet<string>,
 	noteTranslateSet?: ReadonlySet<string>,
 	referenceTranslateSet?: ReadonlySet<string>,
 ): string {
-	const plansBody = buildPlansAndNotesSection(
+	const plansAndNotesBody = buildPlansAndNotesSection(
 		summary.plans,
 		summary.notes,
 		summary.references ?? [],
@@ -613,42 +755,73 @@ function buildAttachmentsPanel(
 		noteTranslateSet,
 		referenceTranslateSet,
 	);
-	const sourceBody = buildSourceCommits(sourceNodes);
-	const sourceCard = sourceBody
-		? `
-  <div class="attach-card" id="sourceCard">
-    <div class="attach-card-head" data-collapse="sourceCard" role="button" tabindex="0" aria-expanded="true" data-foreign-safe>&#x1F4E6; Source Commits <span class="attach-arrow">&#x25BC;</span></div>
-    <div class="attach-card-body">${sourceBody}</div>
-  </div>`
-		: "";
+	const contextCount =
+		(summary.plans?.length ?? 0) + (summary.notes?.length ?? 0) + (summary.references?.length ?? 0);
 	return `
-<div class="panel">
-  <div class="panel-header"><span class="panel-title">Attachments &amp; context</span></div>
-  <div class="attach-card" id="plansCard">
-    <div class="attach-card-head" data-collapse="plansCard" role="button" tabindex="0" aria-expanded="true" data-foreign-safe>&#x1F4CB; Plans &amp; Notes <span class="attach-arrow">&#x25BC;</span></div>
-    <div class="attach-card-body">${plansBody}</div>
+<div class="panel" id="contextPanel">
+  <div class="panel-header">
+    <span class="panel-title">Context</span>
+    <span class="sec-count">${contextCount}</span>
+    <div class="add-dropdown" id="addDropdown">
+      <button class="action-btn panel-add add-dropdown-toggle" data-action="toggleAddMenu" title="Add plan, file, note, or snippet"><span class="codicon codicon-add"></span></button>
+      <div class="add-dropdown-menu" id="addDropdownMenu">
+        <div class="add-dropdown-item" data-action="addPlan">Add Plan</div>
+        <div class="add-dropdown-item" data-action="addMarkdownNote">Add Markdown File</div>
+        <div class="add-dropdown-item" data-action="addTextSnippet">Add Text Snippet</div>
+      </div>
+    </div>
   </div>
-  ${sourceCard}
+  ${plansAndNotesBody}
+  <div class="snippet-form hidden" id="snippetForm">
+    <div class="snippet-field">
+      <label for="snippetTitle">Title</label>
+      <input type="text" id="snippetTitle" placeholder="My Note" autocomplete="off" spellcheck="false" />
+    </div>
+    <div class="snippet-field">
+      <label for="snippetContent">Content</label>
+      <textarea id="snippetContent" rows="6" placeholder="Enter your snippet..."></textarea>
+    </div>
+    <div class="snippet-actions">
+      <button class="action-btn" data-action="cancelSnippet">Cancel</button>
+      <button class="action-btn primary" id="saveSnippetBtn" data-action="saveSnippet" disabled>Save</button>
+    </div>
+  </div>
 </div>`;
 }
 
 /**
- * Renders the Conversations section as a normal top-level section.
+ * Renders the Conversations panel (mockup-aligned inline rows).
  *
- * Replaces the former private-drawer wrapper — the PRIVATE badge / lock chrome
- * and bottom placement are gone. The inner allConversationsSection content
- * (rows, Open/View transcript action, modal) is preserved unchanged.
+ * The former modal-based "Manage" flow (`.private-zone` + `#transcriptModal`
+ * overlay + Manage/Save All/Mark-Deleted buttons) is gone. This now emits a
+ * `.panel` with a header ("Conversations" + a `.sec-count` chip) and a body
+ * container (`#conversationsBody`) that shows a build-time "Loading…"
+ * placeholder. The actual inline `.row`s are rendered CLIENT-SIDE from the
+ * host's `conversationsData` message (see SummaryScriptBuilder.ts), because
+ * the per-conversation metadata (title via resolveSessionTitle, message count)
+ * is only available at runtime — not at build time, where only the transcript
+ * hash count is known.
+ *
+ * `isForeign` is accepted for call-site compatibility; the panel chrome is
+ * identical either way (the row-level detach control is gated in the client
+ * + host, not here).
  */
-function buildConversationsSection(
+export function buildConversationsSection(
 	transcriptHashSet?: ReadonlySet<string>,
-	isForeign: boolean = false,
+	_isForeign: boolean = false,
 ): string {
+	const count = transcriptHashSet?.size ?? 0;
 	return `
-<div class="section conversations-section">
-  <div class="section-header">
-    <div class="section-title">&#x1F4AC; Conversations</div>
+<div id="allConversationsSection">
+<div class="panel conversations-panel">
+  <div class="panel-header">
+    <span class="panel-title">Conversations</span>
+    <span class="sec-count">${count}</span>
   </div>
-  ${buildAllConversationsSection(transcriptHashSet, isForeign)}
+  <div id="conversationsBody" class="conversations-body">
+    <p class="conv-loading">Loading conversations…</p>
+  </div>
+</div>
 </div>`;
 }
 
@@ -766,21 +939,20 @@ export function buildTopicsSection(
 // ─── Plans & Notes Section ───────────────────────────────────────────────────
 
 /**
- * Builds the unified Plans & Notes section with Add dropdown and inline
- * snippet form.
+ * Builds the Plans & Notes section (`#plansAndNotesSection`).
  *
  * `references` is the multi-source list of external references. Callers pass
  * `summary.references ?? []` directly. References are grouped by source (linear
  * → jira → github → notion) and rendered with the same row layout — every
  * source goes through the source-agnostic `previewReference` /
- * `openReferenceExternal` / `loadReference-
- * Content` / `saveReferenceEdit` / `cancelReferenceEdit` / `removeReference` /
- * `translateReference` data-action attributes. The five-button-plus-inline-edit
- * markup mirrors `buildPlanRow` exactly so the CSS classes (`plan-item`,
- * `plan-header`, `plan-edit-area`, …) are shared.
- */
-/**
- * Builds the Plans & Notes section (`#plansAndNotesSection`).
+ * `openReferenceExternal` / `loadReferenceContent` / `saveReferenceEdit` /
+ * `cancelReferenceEdit` / `removeReference` / `translateReference` data-action
+ * attributes. The row markup mirrors the plan row's shared CSS classes
+ * (`row plan-item`, `plan-header-actions`, `plan-edit-area`, …).
+ *
+ * The Add dropdown + inline snippet form are NOT rendered by this function —
+ * they're static (no plan/note/reference data dependency) and live in the
+ * panel header instead; see buildContextPanel.
  *
  * Exported so the webview panel can re-render just this section after a
  * plan/note/reference add/remove/save/translate, without a full-page rebuild.
@@ -823,17 +995,18 @@ export function buildPlansAndNotesSection(
 				p.jolliPlanDocUrl && !isSuperseded
 					? ` &middot; <a class="jolli-link plan-jolli-link" href="${escHtml(p.jolliPlanDocUrl)}" title="View plan on Jolli">&#x1F517; View on Jolli</a>`
 					: "";
-			const itemClass = isSuperseded ? "plan-item plan-older" : "plan-item";
+			const itemClass = isSuperseded ? "row plan-item plan-older" : "row plan-item";
 			return `
   <div class="${itemClass}" id="plan-${key}">
-    <div class="plan-header">
-      <a class="plan-title plan-title-link" href="#" title="Click to preview" data-action="previewPlan" data-plan-slug="${key}" data-plan-title="${escAttr(p.title)}">${escHtml(p.title)}</a>${latestBadge}
-      <span class="plan-header-actions">
-        ${dateBadge}${translateBtn}<button class="topic-action-btn plan-edit-btn" title="Edit Plan" data-plan-slug="${key}" data-action="loadPlanContent">&#x270E;</button>
-        <button class="topic-action-btn plan-remove-btn" title="Remove Plan" data-plan-slug="${key}" data-plan-title="${escAttr(p.title)}" data-action="removePlan">&#x1F5D1;</button>
-      </span>
+    <span class="kb-tag t-plan">P</span>
+    <div class="r-main">
+      <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewPlan" data-plan-slug="${key}" data-plan-title="${escAttr(p.title)}">${escHtml(p.title)}</a>${latestBadge}
+      <div class="plan-meta">${escHtml(key)}.md${jolliLink}</div>
     </div>
-    <div class="plan-meta">${escHtml(key)}.md${jolliLink}</div>
+    <span class="r-actions plan-header-actions">
+      ${dateBadge}${translateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit Plan" data-plan-slug="${key}" data-action="loadPlanContent">&#x270E;</button>
+      <button class="icon-btn topic-action-btn plan-remove-btn" title="Remove Plan" data-plan-slug="${key}" data-plan-title="${escAttr(p.title)}" data-action="removePlan">&#x1F5D1;</button>
+    </span>
     <div class="plan-edit-area">
       <textarea class="plan-edit-textarea" data-plan-slug="${key}" rows="20"></textarea>
       <div class="plan-edit-actions">
@@ -851,16 +1024,21 @@ export function buildPlansAndNotesSection(
 			const noteTranslateBtn = showNoteTranslate
 				? `<button class="topic-action-btn note-translate-btn" title="Translate to English" data-note-id="${escAttr(n.id)}" data-action="translateNote">&#x1F310;</button>`
 				: "";
+			const noteMeta =
+				n.format === "snippet" && n.content
+					? `<div class="plan-meta plan-meta-snippet">${escHtml(n.content)}</div>`
+					: `<div class="plan-meta">${escHtml(n.id)}.md</div>`;
 			return `
-  <div class="plan-item" id="note-${n.id}">
-    <div class="plan-header">
-      <a class="plan-title plan-title-link" href="#" title="Click to preview" data-action="previewNote" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}">${escHtml(n.title)}</a>
-      <span class="plan-header-actions">
-        ${noteTranslateBtn}<button class="topic-action-btn plan-edit-btn" title="Edit Note" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}" data-note-format="${n.format}" data-action="loadNoteContent">&#x270E;</button>
-        <button class="topic-action-btn plan-remove-btn" title="Remove Note" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}" data-action="removeNote">&#x1F5D1;</button>
-      </span>
+  <div class="row plan-item" id="note-${n.id}">
+    <span class="kb-tag t-note">N</span>
+    <div class="r-main">
+      <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewNote" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}">${escHtml(n.title)}</a>
+      ${noteMeta}
     </div>
-    ${n.format === "snippet" && n.content ? `<div class="plan-meta" style="margin-top:2px;white-space:pre-wrap">${escHtml(n.content)}</div>` : `<div class="plan-meta">${escHtml(n.id)}.md</div>`}
+    <span class="r-actions plan-header-actions">
+      ${noteTranslateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit Note" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}" data-note-format="${n.format}" data-action="loadNoteContent">&#x270E;</button>
+      <button class="icon-btn topic-action-btn plan-remove-btn" title="Remove Note" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}" data-action="removeNote">&#x1F5D1;</button>
+    </span>
     <div class="plan-edit-area">
       <textarea class="plan-edit-textarea" data-note-id="${escAttr(n.id)}" rows="20"></textarea>
       <div class="plan-edit-actions">
@@ -886,37 +1064,61 @@ export function buildPlansAndNotesSection(
 	const countBadge =
 		totalCount > 1 ? ` <span class="section-count">${totalCount}</span>` : "";
 
+	// The Add dropdown + inline snippet form are static (no dependency on
+	// plans/notes/references data) and are rendered by buildContextPanel in the
+	// flat panel's header instead of here — see buildContextPanel. Their ids
+	// (#addDropdown, #addDropdownMenu, #snippetForm, #snippetTitle,
+	// #snippetContent, #saveSnippetBtn) are unchanged, so bindPlansAndNotesSection
+	// and the delegated data-action dispatcher (both keyed on getElementById /
+	// event delegation, not on being inside #plansAndNotesSection) keep working
+	// across `plansAndNotesUpdated` in-place refreshes without re-render.
 	return `
 <div class="section" id="plansAndNotesSection">
   <div class="section-header">
-    <div class="section-title">&#x1F4CB; Plans &amp; Notes${countBadge}</div>
+    <div class="section-title">&#x1F4CB; CONTEXT${countBadge}</div>
   </div>
   ${totalCount > 0 ? allItems : '<p class="e2e-placeholder">No plans or notes associated with this commit yet.</p>'}
-  <div class="add-dropdown" id="addDropdown">
-    <button class="action-btn add-dropdown-toggle" data-action="toggleAddMenu">+ Add</button>
-    <div class="add-dropdown-menu" id="addDropdownMenu">
-      <div class="add-dropdown-item" data-action="addPlan">Add Plan</div>
-      <div class="add-dropdown-item" data-action="addMarkdownNote">Add Markdown File</div>
-      <div class="add-dropdown-item" data-action="addTextSnippet">Add Text Snippet</div>
-    </div>
-  </div>
-  <div class="snippet-form hidden" id="snippetForm">
-    <div class="snippet-field">
-      <label for="snippetTitle">Title</label>
-      <input type="text" id="snippetTitle" placeholder="My Note" autocomplete="off" spellcheck="false" />
-    </div>
-    <div class="snippet-field">
-      <label for="snippetContent">Content</label>
-      <textarea id="snippetContent" rows="6" placeholder="Enter your snippet..."></textarea>
-    </div>
-    <div class="snippet-actions">
-      <button class="action-btn" data-action="cancelSnippet">Cancel</button>
-      <button class="action-btn primary" id="saveSnippetBtn" data-action="saveSnippet" disabled>Save</button>
-    </div>
-  </div>
 </div>
 <hr class="separator" />
 `;
+}
+
+// ─── Files panel ──────────────────────────────────────────────────────────────
+
+/**
+ * One changed-file row for the Files panel: git status + path split into
+ * dir/basename, plus the pre-rename path when the row is a rename. Rows are
+ * rendered client-side by `renderFiles` in SummaryScriptBuilder.ts — this
+ * type is the wire shape of the `files:rows` postMessage payload, not a
+ * server-side rendering contract (there is no server-side row renderer;
+ * `buildFilesPanelShell` below only emits the loading shell).
+ */
+export interface FileRow {
+	readonly path: string;
+	readonly dir: string;
+	readonly status: string;
+	/** Pre-rename path, only set when `status` is `"R"`. */
+	readonly oldPath?: string;
+}
+
+/**
+ * Build-time shell for the Files panel: a `.panel` with a `#filesBody`
+ * container showing a "Loading…" placeholder. Per-file status requires a
+ * `git diff-tree` call (SummaryWebviewPanel.handleLoadFiles), which is async
+ * and not available at synchronous `buildHtml` render time — the actual rows
+ * are rendered CLIENT-SIDE from the host's `files:rows` message (mirrors
+ * buildConversationsSection / conversationsData). The stable `#filesPanel`
+ * wrapper id lets a future in-place refresh target just this block, matching
+ * the Conversations/Context panel convention.
+ */
+export function buildFilesPanelShell(): string {
+	return `
+<div class="panel" id="filesPanel">
+  <div class="panel-header"><span class="panel-title">Files</span><span class="sec-count" id="filesCount">0</span></div>
+  <div id="filesBody" class="files-body">
+    <p class="files-loading">Loading files…</p>
+  </div>
+</div>`;
 }
 
 const HTML_REFERENCE_SOURCE_ORDER: ReadonlyArray<SourceId> = ["linear", "jira", "github", "notion"];
@@ -953,12 +1155,20 @@ function stripSourcePrefix(archivedKey: string, source: SourceId): string {
 	return archivedKey.startsWith(prefix) ? archivedKey.slice(prefix.length) : archivedKey;
 }
 
+/** Single-letter `.kb-tag.t-ref` badge per reference source (mirrors the sidebar's L/J/G/N convention). */
+const REFERENCE_SOURCE_LETTER: Record<SourceId, string> = {
+	linear: "L",
+	jira: "J",
+	github: "G",
+	notion: "N",
+};
+
 /**
- * Renders one reference row. Mirrors the Plan/Note row markup byte-for-byte
- * (same CSS classes: `plan-item`, `plan-header`, `plan-header-actions`,
- * `plan-edit-area`, `plan-edit-textarea`, `plan-edit-actions`) so the inline
- * edit affordances reuse all existing CSS — the row is just "a plan whose
- * source is external".
+ * Renders one reference row. Mirrors the Plan/Note row shape (same shared CSS
+ * classes: `row plan-item`, `plan-header-actions`, `plan-meta`, `plan-edit-area`,
+ * `plan-edit-textarea`, `plan-edit-actions`) so the inline edit affordances
+ * reuse all existing CSS — the row is just "a plan whose source is external",
+ * tagged with a `.kb-tag.t-ref` source-letter badge instead of `.t-plan`/`.t-note`.
  *
  * Five buttons on every row (Linear / Jira / GitHub / Notion):
  *   - Title click → `previewReference` (read-only webview of archived markdown)
@@ -980,6 +1190,7 @@ function buildReferenceRow(
 	referenceTranslateSet?: ReadonlySet<string>,
 ): string {
 	const sourceLabel = SOURCE_TITLES[e.source];
+	const sourceLetter = REFERENCE_SOURCE_LETTER[e.source];
 	// DOM id: strip `<source>:` prefix uniformly across sources so the id
 	// is `reference-<source>-<bareKey>` regardless of source.
 	const domKey = stripSourcePrefix(e.archivedKey, e.source);
@@ -992,16 +1203,17 @@ function buildReferenceRow(
 		? `<button class="topic-action-btn reference-translate-btn" title="Translate to English" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="translateReference">&#x1F310;</button>`
 		: "";
 	return `
-  <div class="plan-item" id="reference-${escAttr(e.source)}-${escAttr(domKey)}">
-    <div class="plan-header">
-      <a class="plan-title plan-title-link" href="#" title="Click to preview" data-action="previewReference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}">${escHtml(e.nativeId)} &mdash; ${escHtml(e.title)}</a>
-      <span class="plan-header-actions">
-        <button class="topic-action-btn" title="Open in ${sourceLabel}" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-url="${escAttr(e.url)}" data-action="openReferenceExternal">&#x1F30D;</button>
-        ${translateBtn}<button class="topic-action-btn plan-edit-btn" title="Edit ${sourceLabel} snapshot" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="loadReferenceContent">&#x270E;</button>
-        <button class="topic-action-btn plan-remove-btn" title="Remove ${sourceLabel} Reference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}" data-action="removeReference">&#x1F5D1;</button>
-      </span>
+  <div class="row plan-item" id="reference-${escAttr(e.source)}-${escAttr(domKey)}">
+    <span class="kb-tag t-ref">${sourceLetter}</span>
+    <div class="r-main">
+      <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewReference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}">${escHtml(e.nativeId)} &mdash; ${escHtml(e.title)}</a>
+      <div class="r-sub plan-meta">${escHtml(e.nativeId)} (${sourceLabel})</div>
     </div>
-    <div class="plan-meta">${escHtml(e.nativeId)} (${sourceLabel})</div>
+    <span class="r-actions plan-header-actions">
+      <button class="icon-btn topic-action-btn" title="Open in ${sourceLabel}" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-url="${escAttr(e.url)}" data-action="openReferenceExternal">&#x1F30D;</button>
+      ${translateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit ${sourceLabel} snapshot" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="loadReferenceContent">&#x270E;</button>
+      <button class="icon-btn topic-action-btn plan-remove-btn" title="Remove ${sourceLabel} Reference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}" data-action="removeReference">&#x1F5D1;</button>
+    </span>
     <div class="plan-edit-area">
       <textarea class="plan-edit-textarea" data-reference-key="${escAttr(e.archivedKey)}" rows="20"></textarea>
       <div class="plan-edit-actions">
@@ -1114,149 +1326,6 @@ export function renderE2eScenario(s: E2eTestScenario, index: number): string {
 </div>`;
 }
 
-// ─── All Conversations ───────────────────────────────────────────────────────
-
-/**
- * Builds the All Conversations section with an Open button and the transcript
- * Modal skeleton.
- *
- * `isForeign` swaps the action chip from the workspace-side "Manage" (opens
- * the editable transcript modal) to a read-only "View" affordance:
- *  - The Regenerate button is dropped entirely (the foreign-readonly CSS
- *    rule already hides it, but emitting the markup would leave a
- *    misleading affordance in the DOM tree the user can spot via DevTools).
- *  - The Manage→View button stays under the same `openTranscriptsBtn` id —
- *    the modal-open click handler is unchanged. It receives the
- *    `data-foreign-safe` attribute so the .foreign-readonly CSS rule
- *    keeps it visible (the rule hides every button without that marker).
- *  - The modal's close-button is also marked foreign-safe so users can
- *    actually exit the modal after browsing transcripts; the modal's
- *    Save/Delete/Cancel buttons stay hidden by the same CSS rule so
- *    nothing destructive is reachable.
- */
-export function buildAllConversationsSection(
-	transcriptHashSet?: ReadonlySet<string>,
-	isForeign: boolean = false,
-): string {
-	const count = transcriptHashSet?.size ?? 0;
-	let inner: string;
-	if (count === 0) {
-		// Regenerate moved to the page header (buildHeader); the conversations
-		// zone no longer renders its own button to avoid a duplicate id.
-		inner = `
-<div class="private-zone">
-  <div class="section-header">
-    <div class="section-title">&#x1F4AC; All Conversations</div>
-  </div>
-  <p class="empty">No conversation transcripts saved for this commit.</p>
-</div>`;
-	} else {
-		const headerActions = isForeign
-			? `      <button class="action-btn" id="openTranscriptsBtn" data-foreign-safe title="Browse transcripts (read-only)">View</button>`
-			: `      <button class="action-btn" id="openTranscriptsBtn">Manage</button>`;
-
-		inner = `
-<div class="private-zone">
-  <div class="section-header">
-    <div class="section-title">&#x1F4AC; All Conversations</div>
-    <span class="conversations-actions">
-${headerActions}
-    </span>
-  </div>
-  <p class="conversations-description">Raw AI conversation transcripts captured during development.</p>
-  <p class="conversations-stats" id="conversationsStats">
-    <span class="stats-loading">Loading stats...</span>
-  </p>
-  <p class="conversations-privacy">&#x1F512; Your private data — stored on your machine only. Nothing is uploaded unless you choose to.</p>
-</div>
-${buildTranscriptModal(isForeign)}`;
-	}
-	// Wrap private-zone + modal in a stable #allConversationsSection container so
-	// the webview can replace just this block on transcript save/delete via
-	// replaceSection (no full-page rebuild). See SummaryWebviewPanel.refreshConversations.
-	return `
-<div id="allConversationsSection">${inner}
-</div>`;
-}
-
-/**
- * Builds the transcript Modal overlay (hidden by default, shown via JS).
- *
- * In foreign-readonly mode the close-button is marked `data-foreign-safe`
- * so the `.page.foreign-readonly button:not([data-foreign-safe])` rule
- * keeps it visible; without this the user would enter the modal and have
- * no clickable exit (ESC and overlay-click still work but are not
- * discoverable). The footer's Save/Delete/Cancel stay un-tagged so the
- * same rule hides them — the modal is browse-only.
- */
-function buildTranscriptModal(isForeign: boolean = false): string {
-	const closeForeignSafe = isForeign ? " data-foreign-safe" : "";
-	return `
-<div class="modal-overlay" id="transcriptModal">
-  <div class="modal-container">
-    <div class="modal-header">
-      <div class="modal-title">
-        <span>&#x1F4AC; All Conversations</span>
-        <span class="modal-subtitle" id="modalSubtitle"></span>
-      </div>
-      <button class="modal-close-btn" id="modalCloseBtn" title="Close"${closeForeignSafe}>&times;</button>
-    </div>
-    <div class="modal-tabs" id="modalTabs"></div>
-    <div class="modal-body" id="modalBody">
-      <div class="modal-loading" id="modalLoading">Loading transcripts...</div>
-    </div>
-    <!--
-      Hidden by default. Shown when the backend posts
-      transcriptsSaveFailed / transcriptsDeleteFailed so the user has a
-      visible recovery hint without leaving the modal. See message handlers
-      in SummaryScriptBuilder.ts.
-    -->
-    <div class="modal-error-banner" id="modalErrorBanner" style="display: none;"></div>
-    <div class="modal-footer">
-      <button class="action-btn danger" id="deleteTranscriptsBtn">Mark All as Deleted</button>
-      <div class="modal-footer-right">
-        <button class="action-btn" id="modalCancelBtn">Cancel</button>
-        <button class="action-btn primary" id="modalSaveBtn" disabled>Save All</button>
-      </div>
-    </div>
-  </div>
-</div>`;
-}
-
-// ─── Source Commits ───────────────────────────────────────────────────────────
-
-/** Builds the Source Commits section. Returns empty string for single-source summaries. */
-function buildSourceCommits(sourceNodes: ReadonlyArray<CommitSummary>): string {
-	if (sourceNodes.length <= 1) {
-		return "";
-	}
-
-	const rows = sourceNodes.map((n) => renderCommitRow(n)).join("\n");
-
-	return `
-<div class="section">
-  <div class="section-title" title="${sourceNodes.length} commits squashed into this summary">&#x1F4E6; Source Commits <span class="section-count">${sourceNodes.length}</span></div>
-  <div class="commit-list">
-    ${rows}
-  </div>
-</div>
-<hr class="separator" />`;
-}
-
-/** Renders a single source commit as a compact row. */
-function renderCommitRow(node: CommitSummary): string {
-	const turns = node.conversationTurns;
-	const turnsSuffix = turns
-		? ` &middot; <span class="stat-turns">${turns} turn${turns !== 1 ? "s" : ""}</span>`
-		: "";
-	const nodeStats = resolveDiffStats(node);
-	return `<div class="commit-row">
-  <span class="hash">${escHtml(node.commitHash.substring(0, 8))}</span>
-  <span class="commit-msg">${escHtml(node.commitMessage)}</span>
-  <span class="commit-meta"><span class="stat-add">+${nodeStats.insertions}</span> <span class="stat-del">\u2212${nodeStats.deletions}</span>${turnsSuffix} &middot; ${formatDate(getDisplayDate(node))}</span>
-</div>`;
-}
-
 // ─── Memories ─────────────────────────────────────────────────────────────────
 
 /** Renders a memory as a Notion-style toggle with callout blocks inside. */
@@ -1328,21 +1397,26 @@ export function renderTopic(t: TopicWithDate, displayIndex: number): string {
 // ─── Footer ───────────────────────────────────────────────────────────────────
 
 /**
- * Builds the page footer with a "Generated by Jolli Memory" attribution and
- * timestamp. When the summary carries provider attribution (`llm.source`,
- * present on summaries generated after this field shipped) the provider name
- * is appended as `· via <provider>` — same shape as the Markdown footer so
- * clipboard export and webview display read consistently. The label is
- * rendered into its own `.footer-provider` span so panel CSS can style it
- * independently from the timestamp.
+ * Builds the page footer: a transcript-privacy note above the retained
+ * "Generated by Jolli Memory" attribution and timestamp. When the summary
+ * carries provider attribution (`llm.source`, present on summaries generated
+ * after this field shipped) the provider name is appended as `· via
+ * <provider>` — same shape as the Markdown footer so clipboard export and
+ * webview display read consistently. The label is rendered into its own
+ * `.footer-provider` span so panel CSS can style it independently from the
+ * timestamp.
+ * @param linkedConversationCount - Count of linked conversation transcripts
+ * (`transcriptHashSet?.size ?? 0`), surfaced in the privacy note so users see
+ * how many transcripts stay local before any shared export.
  */
-function buildFooter(summary: CommitSummary): string {
+function buildFooter(summary: CommitSummary, linkedConversationCount: number): string {
 	const now = formatFullDate(new Date().toISOString());
 	const provider = formatProviderLabel(summary);
 	const providerSpan = provider
 		? ` <span class="footer-provider">&middot; via ${escHtml(provider)}</span>`
 		: "";
 	return `
+<p class="muted transcript-privacy"><span aria-hidden="true">&#x1F512;</span> Full conversation transcripts (${linkedConversationCount}) stay in your repo — never included in shared exports.</p>
 <div class="page-footer">
   <span class="footer-generated">Generated by Jolli Memory &middot; ${escHtml(now)}</span>${providerSpan}
 </div>`;

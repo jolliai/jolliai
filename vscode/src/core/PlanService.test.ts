@@ -401,6 +401,20 @@ describe("PlanService", () => {
 			expect(savePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ plans: {} }), CWD);
 		});
 
+		it("is a no-op when the resolved key maps to a null entry (L231 defensive guard)", async () => {
+			// `plans[slug]` is present but null: key resolves (null !== undefined) yet
+			// `entry` is falsy, so the L231 guard returns null before any delete/save.
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "my-plan": null },
+			});
+
+			await removePlan("my-plan", CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			expect(mockUnlinkSync).not.toHaveBeenCalled();
+		});
+
 		it("still removes the entry when internal file deletion throws", async () => {
 			const internalPath = normalize(
 				`${CWD}/.jolli/jollimemory/notes/inner.md`,
@@ -469,6 +483,22 @@ describe("PlanService", () => {
 			await addPlanToRegistry("missing-plan", CWD);
 
 			expect(savePlansRegistry).not.toHaveBeenCalled();
+		});
+
+		it("omits the branch field when the git branch lookup is unknown (L279 ternary else)", async () => {
+			// getCurrentBranchSafe returns "unknown" when git fails → the branchField
+			// ternary takes its empty-object alternate and no `branch` is stamped.
+			mockExecFileSync.mockImplementation(() => {
+				throw new Error("not a git repo");
+			});
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Fresh Plan");
+
+			await addPlanToRegistry("fresh-plan", CWD);
+
+			const saved = savePlansRegistry.mock.calls[0][0];
+			expect(saved.plans["fresh-plan"].branch).toBeUndefined();
 		});
 
 		it("resets existing commitHash when re-adding an ignored plan", async () => {
@@ -588,6 +618,26 @@ describe("PlanService", () => {
 		});
 
 		it("creates entry when slug is not in registry", async () => {
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# New Plan\nContent");
+
+			const result = await archivePlanForCommit(
+				"new-plan",
+				"aaaa1111bbbb2222",
+				CWD,
+			);
+
+			expect(result).not.toBeNull();
+			expect(result?.slug).toBe("new-plan-aaaa1111");
+		});
+
+		it("omits the branch field on a freshly-created entry when git branch is unknown (L431 ternary else)", async () => {
+			// slug not in registry → a fresh entry is built; getCurrentBranchSafe
+			// returning "unknown" (git failure) takes the ternary's empty-object arm.
+			mockExecFileSync.mockImplementation(() => {
+				throw new Error("no git");
+			});
 			loadPlansRegistry.mockResolvedValue(emptyRegistry());
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# New Plan\nContent");
@@ -772,6 +822,92 @@ describe("PlanService", () => {
 
 			// Deterministic writeback: the cleaned registry is flushed once.
 			expect(savePlansRegistry).toHaveBeenCalledTimes(1);
+		});
+
+		it("skips the in-lock writeback when the fresh re-read is already clean (L97 else)", async () => {
+			// Outer status reports changed=true (enters the lock block), but the
+			// in-lock fresh re-read reports changed=false with no orphans → `mutate`
+			// stays false and the redundant save is skipped (idempotency guard).
+			const entry = makeEntry();
+			loadPlansRegistryWithStatus
+				.mockResolvedValueOnce({
+					registry: { version: 1, plans: { "test-plan": entry } },
+					changed: true,
+				})
+				.mockResolvedValueOnce({
+					registry: { version: 1, plans: { "test-plan": entry } },
+					changed: false,
+				});
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan");
+			mockStatSync.mockReturnValue({ mtime: new Date("2025-06-01T00:00:00.000Z") });
+
+			await detectPlans(CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+		});
+
+		it("filters an uncommitted plan whose file vanishes between cleanup and render (L145 TOCTOU)", async () => {
+			// The cleanup pass sees the file present (survives), but toPlanInfo's
+			// re-check finds it gone → the L145 `commitHash===null && !existsSync`
+			// guard returns null so the row is dropped from the panel.
+			const entry = makeEntry({
+				slug: "toctou",
+				commitHash: null,
+				sourcePath: `${PLANS_DIR}/toctou.md`,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { toctou: entry },
+			});
+			let n = 0;
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p === entry.sourcePath) {
+					n++;
+					return n === 1; // present during cleanup, gone at render
+				}
+				return false;
+			});
+			mockReadFileSync.mockReturnValue("# Toctou");
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans.find((p) => p.slug === "toctou")).toBeUndefined();
+		});
+
+		it("committed guard with changed content skips title/mtime refresh when file vanishes mid-render (L156/L161 else)", async () => {
+			// A committed-then-modified guard row is shown (hash differs). If the
+			// source file disappears after the guard hash check, the title and
+			// lastModified refreshes are skipped and fall back to the registry values.
+			const entry = makeEntry({
+				slug: "toctou2",
+				commitHash: "abc12345",
+				contentHashAtCommit: "stale-hash", // differs from mockCreateHash "mock-hash" → shown
+				sourcePath: `${PLANS_DIR}/toctou2.md`,
+				title: "Frozen Title",
+				updatedAt: "2025-02-02T00:00:00.000Z",
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { toctou2: entry },
+			});
+			let n = 0;
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p === entry.sourcePath) {
+					n++;
+					return n === 1; // present for the guard hash check, gone afterwards
+				}
+				return false;
+			});
+			mockReadFileSync.mockReturnValue("# Changed Content");
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans).toHaveLength(1);
+			expect(plans[0].slug).toBe("toctou2");
+			// File gone at render → title / lastModified fall back to registry values.
+			expect(plans[0].title).toBe("Frozen Title");
+			expect(plans[0].lastModified).toBe("2025-02-02T00:00:00.000Z");
 		});
 
 		it("does not persist when nothing changed and no orphans (changed=false)", async () => {

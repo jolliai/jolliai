@@ -164,6 +164,19 @@ describe("PlansStore — headless (no options)", () => {
 		expect(store.getSnapshot().references).toEqual([]);
 	});
 
+	it("uses the Promise.resolve([]) fallback when the bridge omits listReferences (L164 ?? RHS)", async () => {
+		// makeBridge always defines listReferences; a genuinely older host has no
+		// such method, so `bridge.listReferences?.()` is undefined and the `??`
+		// right-hand fallback promise supplies the empty references array.
+		const bridge = {
+			listPlans: vi.fn(async () => []),
+			listNotes: vi.fn(async () => []),
+		};
+		const store = new PlansStore(bridge as never);
+		await store.refresh();
+		expect(store.getSnapshot().references).toEqual([]);
+	});
+
 	it("refresh loads plans and notes, merged and sorted", async () => {
 		const bridge = makeBridge(
 			[makePlan("old-plan", "2026-01-01T00:00:00Z")],

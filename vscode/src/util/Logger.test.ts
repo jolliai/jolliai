@@ -28,6 +28,14 @@ vi.mock("../../../cli/src/Logger.js", () => ({
 	setLogDir,
 }));
 
+const { getCurrentTraceId } = vi.hoisted(() => ({
+	getCurrentTraceId: vi.fn<() => string | undefined>(() => undefined),
+}));
+
+vi.mock("../../../cli/src/core/TraceContext.js", () => ({
+	getCurrentTraceId,
+}));
+
 import { initLogger, log } from "./Logger.js";
 
 describe("Logger", () => {
@@ -79,5 +87,14 @@ describe("Logger", () => {
 	it("initLogger delegates to setLogDir", () => {
 		initLogger("/workspace/root");
 		expect(setLogDir).toHaveBeenCalledWith("/workspace/root");
+	});
+
+	it("appends the ambient trace tag when a trace id is active", () => {
+		// cond-expr L78 truthy arm: an active `runWithTrace` scope makes
+		// getCurrentTraceId return an id, which is rendered as ` [trace=<id>]`.
+		getCurrentTraceId.mockReturnValueOnce("trace-abc123");
+		log.info("history", "traced line");
+
+		expect(appendLine.mock.calls[0][0]).toContain("[trace=trace-abc123]");
 	});
 });

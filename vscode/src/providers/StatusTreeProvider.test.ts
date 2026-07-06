@@ -305,6 +305,27 @@ describe("StatusTreeProvider", () => {
 		expect((providerRow?.iconPath as { id: string }).id).toBe("warning");
 	});
 
+	it("provider row warns with the Anthropic-specific tooltip when aiProvider='anthropic' but no key is on file", async () => {
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: undefined,
+			jolliApiKey: undefined,
+			aiProvider: "anthropic",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const providerRow = provider
+			.getChildren()
+			.find((it) => it.label === "AI Summary Provider");
+		expect(providerRow?.description).toBe("not configured — click to set");
+		expect((providerRow?.iconPath as { id: string }).id).toBe("warning");
+		expect(providerRow?.tooltip).toContain(
+			"Provider is set to Anthropic but no API key is configured.",
+		);
+	});
+
 	it("tracks worker busy state and sign-in prompt when no Jolli credentials", async () => {
 		const bridge = {
 			cwd: "/repo",

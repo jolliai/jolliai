@@ -10,7 +10,15 @@ const { mockGetShare, mockPutShare } = vi.hoisted(() => ({
 const { mockLoad } = vi.hoisted(() => ({ mockLoad: vi.fn() }));
 const { mockParseKey } = vi.hoisted(() => ({ mockParseKey: vi.fn() }));
 
-vi.mock("./JolliPushOrchestrator.js", () => ({ pushSummaryWithAttachments: mockPush }));
+vi.mock("./JolliPushOrchestrator.js", () => ({
+	pushSummaryWithAttachments: mockPush,
+	ShareBindingError: class ShareBindingError extends Error {
+		constructor(readonly outcome: string) {
+			super(outcome);
+			this.name = "ShareBindingError";
+		}
+	},
+}));
 vi.mock("./JolliShareService.js", () => ({ createLiveShare: mockCreate, updateLiveShare: mockUpdate }));
 vi.mock("../../../cli/src/core/BranchShareStore.js", () => ({
 	getShare: mockGetShare,
@@ -34,11 +42,15 @@ vi.mock("../util/Logger.js", () => ({ log: { info: vi.fn(), warn: vi.fn(), error
 
 import {
 	AttachmentPushError,
+	BranchMismatchError,
 	generateLiveShare,
 	NothingToShareError,
+	pushBranchMemoriesToSpace,
 	reconcileLiveShare,
 	subjectFingerprint,
 } from "./LiveShareController.js";
+import { ShareBindingError } from "./JolliPushOrchestrator.js";
+import { PluginOutdatedError } from "./JolliPushService.js";
 
 // Maps a commit hash to a deterministic summary docId for assertions.
 const SUMMARY_DOC = { A: 1001, B: 1002, C: 1003 } as const;
@@ -581,5 +593,128 @@ describe("reconcileLiveShare", () => {
 		expect(stored.expiresAt).toBe("2026-09-01T00:00:00.000Z");
 		expect(stored.recipients).toEqual(["marta@jolli.ai"]);
 		expect(stored.visibility).toBe("people");
+	});
+});
+
+describe("pushBranchMemoriesToSpace", () => {
+	const deps = (currentBranch = "feature/x") => ({
+		bridge: { storeSummary: vi.fn(), getCurrentBranch: vi.fn().mockResolvedValue(currentBranch) } as never,
+		workspaceRoot: "/repo",
+		apiKey: "sk-jol-x",
+		resolveBinding: vi.fn(),
+	});
+
+	beforeEach(() => {
+		mockParseKey.mockReturnValue({ u: "https://acme.jolli.ai" });
+	});
+
+	it("pushes every branch summary and returns aggregate counts", async () => {
+		mockLoad.mockResolvedValue({ summaries: [summary("A", [plan("p", "2026-01-01")]), summary("B")] });
+		mockPush
+			.mockResolvedValueOnce({
+				pushedDoc: { summaryDocId: 1001, plans: [{ slug: "p", docId: 7, url: "u" }], notes: [] },
+				attachmentFailures: [],
+				attachmentCount: 1,
+			})
+			.mockResolvedValueOnce({
+				pushedDoc: { summaryDocId: 1002, plans: [], notes: [] },
+				attachmentFailures: [],
+				attachmentCount: 0,
+			});
+
+		const result = await pushBranchMemoriesToSpace(deps(), "feature/x");
+
+		expect(mockPush).toHaveBeenCalledTimes(2);
+		expect(result.pushedCount).toBe(2);
+		expect(result.attachmentCount).toBe(1);
+		expect(result.attachmentFailures).toEqual([]);
+	});
+
+	it("dedupes a plan recurring across commits to one owner push (latest revision)", async () => {
+		// Same plan slug on both commits; the newer updatedAt wins and is pushed under its owner only.
+		mockLoad.mockResolvedValue({
+			summaries: [summary("A", [plan("p", "2026-01-01")]), summary("B", [plan("p", "2026-02-01")])],
+		});
+		mockPush.mockResolvedValue({
+			pushedDoc: { summaryDocId: 0, plans: [], notes: [] },
+			attachmentFailures: [],
+			attachmentCount: 0,
+		});
+
+		await pushBranchMemoriesToSpace(deps(), "feature/x");
+
+		// Exactly one of the two summary pushes carries the plan, and it must be commit B's
+		// push (the latest-revision owner) — not A's.
+		const callA = mockPush.mock.calls.find((c) => c[0].commitHash === "A");
+		const callB = mockPush.mock.calls.find((c) => c[0].commitHash === "B");
+		expect(callA?.[2].plans).toEqual([]);
+		expect(callB?.[2].plans).toHaveLength(1);
+	});
+
+	it("is non-strict: omits strictAttachments so attachment failures are collected, not thrown", async () => {
+		mockLoad.mockResolvedValue({ summaries: [summary("A")] });
+		mockPush.mockResolvedValue({
+			pushedDoc: { summaryDocId: 1001, plans: [], notes: [] },
+			attachmentFailures: [{ label: 'plan "x"', message: "unreadable" }],
+			attachmentCount: 0,
+		});
+
+		const result = await pushBranchMemoriesToSpace(deps(), "feature/x");
+
+		// options arg (4th param) must NOT set strictAttachments.
+		const optionsArg = mockPush.mock.calls[0][3] as { strictAttachments?: boolean } | undefined;
+		expect(optionsArg?.strictAttachments).toBeUndefined();
+		expect(result.attachmentFailures).toHaveLength(1);
+		expect(result.pushedCount).toBe(1);
+	});
+
+	it("throws NothingToShareError when the branch has no summaries", async () => {
+		mockLoad.mockResolvedValue({ summaries: [] });
+		await expect(pushBranchMemoriesToSpace(deps(), "feature/x")).rejects.toThrow(NothingToShareError);
+	});
+
+	it("aborts (BranchMismatchError) without loading or pushing when HEAD has moved off the requested branch", async () => {
+		// HEAD is now "other" but the caller asked to share "feature/x". Since the
+		// loader reads the current HEAD's base..HEAD, pushing would publish the
+		// wrong branch's memories — so it must abort before loading or pushing.
+		mockLoad.mockResolvedValue({ summaries: [summary("A")] });
+		await expect(pushBranchMemoriesToSpace(deps("other"), "feature/x")).rejects.toBeInstanceOf(BranchMismatchError);
+		expect(mockLoad).not.toHaveBeenCalled();
+		expect(mockPush).not.toHaveBeenCalled();
+	});
+
+	it("stops and propagates when a summary push throws (e.g. binding cancelled)", async () => {
+		mockLoad.mockResolvedValue({ summaries: [summary("A"), summary("B")] });
+		mockPush.mockRejectedValueOnce(new ShareBindingError("cancelled"));
+
+		await expect(pushBranchMemoriesToSpace(deps(), "feature/x")).rejects.toBeInstanceOf(ShareBindingError);
+		expect(mockPush).toHaveBeenCalledTimes(1);
+	});
+
+	it("collects a transient summary-push failure and keeps going (does not lose earlier successes)", async () => {
+		// A fails with a transient error, B succeeds. The batch must not abort — the
+		// success is recorded and the failure is surfaced via summaryFailures.
+		mockLoad.mockResolvedValue({ summaries: [summary("A"), summary("B")] });
+		mockPush.mockRejectedValueOnce(new Error("HTTP 500")).mockResolvedValueOnce({
+			pushedDoc: { summaryDocId: 1002, plans: [], notes: [] },
+			attachmentFailures: [],
+			attachmentCount: 0,
+		});
+
+		const result = await pushBranchMemoriesToSpace(deps(), "feature/x");
+
+		expect(mockPush).toHaveBeenCalledTimes(2);
+		expect(result.pushedCount).toBe(1);
+		expect(result.summaryFailures).toHaveLength(1);
+		expect(result.summaryFailures[0].label).toContain("commit A");
+		expect(result.summaryFailures[0].message).toContain("HTTP 500");
+	});
+
+	it("propagates a fatal PluginOutdatedError instead of collecting it", async () => {
+		mockLoad.mockResolvedValue({ summaries: [summary("A"), summary("B")] });
+		mockPush.mockRejectedValueOnce(new PluginOutdatedError("outdated"));
+
+		await expect(pushBranchMemoriesToSpace(deps(), "feature/x")).rejects.toBeInstanceOf(PluginOutdatedError);
+		expect(mockPush).toHaveBeenCalledTimes(1);
 	});
 });

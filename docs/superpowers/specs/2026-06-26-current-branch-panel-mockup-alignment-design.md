@@ -89,6 +89,8 @@ Foreign-readonly mode hides the WORKING MEMORY group, the body button pair, and 
 
 ## 6. Unit C — Next Memory preview panel
 
+**Superseded by `2026-07-03-next-memory-review-panel-mockup-alignment-design.md`.** This unit scoped the Review target as a read-only static preview; the mockup's `#pane-working` is fully interactive (checkboxes, ✕/+ exclude, a working Commit Memory button), so the later spec reverses the read-only decision below and rebuilds the panel accordingly. Left as-is for history.
+
 New editor-column webview `NextMemoryPreviewPanel` (host), opened by `jollimemory.reviewNextMemory`.
 
 - **Purpose:** show what the *next* committed memory will capture — the currently **selected** conversations, context (plans/notes/references), and files — so the user can review/adjust before committing. Read-only preview; the actual edit affordances remain the sidebar checkboxes.

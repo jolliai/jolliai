@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "n
 import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as Subprocess from "../util/Subprocess.js";
 import {
 	archiveKBFolder,
 	assertValidLocalFolder,
@@ -128,6 +129,106 @@ describe("KBPathResolver", () => {
 			const wt = join(tempDir, "wt-feature");
 			git(main, ["worktree", "add", "-q", "-b", "feature", wt]);
 			expect(extractRepoName(wt)).toBe("main-repo");
+		});
+
+		// Regression (deterministic, no wall-clock): a *transient* `rev-parse`
+		// timeout must NOT be swallowed as "not a git repo" and drop the resolver
+		// to its last-resort basename layer — that would name the KB folder after
+		// the worktree dir and spawn a parallel KB, the very bug layer 2 prevents.
+		// Under a loaded box the subprocess is merely *scheduled* late; a retry
+		// clears it. We inject ETIMEDOUT rather than racing a real slow git so the
+		// test can't itself flake the way the bug does. Call sequence for a
+		// no-remote worktree: layer 1 `config --get` (fails, no origin), then
+		// layer 2 `rev-parse` (times out once, succeeds on retry).
+		function timeoutError(): Error {
+			return Object.assign(new Error("git: timed out"), { code: "ETIMEDOUT" });
+		}
+		function notARepoError(): Error {
+			return Object.assign(new Error("git: exit 128"), { status: 128 });
+		}
+
+		it("retries a transient rev-parse timeout instead of degrading to the worktree dirname", () => {
+			const spy = vi
+				.spyOn(Subprocess, "execFileSyncHidden")
+				.mockImplementationOnce(() => {
+					throw notARepoError(); // layer 1: no origin remote
+				})
+				.mockImplementationOnce(() => {
+					throw timeoutError(); // layer 2 first attempt: transient timeout
+				})
+				.mockImplementationOnce(() => "/anywhere/main-repo/.git\n"); // retry: real answer
+			try {
+				expect(extractRepoName("/anywhere/wt-feature")).toBe("main-repo");
+				expect(spy).toHaveBeenCalledTimes(3);
+			} finally {
+				spy.mockRestore();
+			}
+		});
+
+		// A *persistent* timeout (initial call AND retry both blow the budget)
+		// means git is genuinely stuck, not merely late-scheduled — degrading to
+		// the basename layer is then correct.
+		it("gives up to the basename layer when a rev-parse timeout persists across the retry", () => {
+			const spy = vi
+				.spyOn(Subprocess, "execFileSyncHidden")
+				.mockImplementationOnce(() => {
+					throw notARepoError(); // layer 1
+				})
+				.mockImplementationOnce(() => {
+					throw timeoutError(); // layer 2 attempt
+				})
+				.mockImplementationOnce(() => {
+					throw timeoutError(); // layer 2 retry — still stuck
+				});
+			try {
+				expect(extractRepoName("/anywhere/wt-feature")).toBe("wt-feature");
+				expect(spy).toHaveBeenCalledTimes(3);
+			} finally {
+				spy.mockRestore();
+			}
+		});
+
+		// A non-timeout failure (real non-git dir → git exits 128) must NOT be
+		// retried — retrying a deterministic failure just doubles the latency.
+		it("does not retry a non-timeout git failure", () => {
+			const spy = vi.spyOn(Subprocess, "execFileSyncHidden").mockImplementation(() => {
+				throw notARepoError();
+			});
+			try {
+				expect(extractRepoName("/anywhere/plain-dir")).toBe("plain-dir");
+				// layer 1 (1 call) + layer 2 (1 call, no retry) = 2, never 3.
+				expect(spy).toHaveBeenCalledTimes(2);
+			} finally {
+				spy.mockRestore();
+			}
+		});
+
+		// JOLLI_GIT_CMD_TIMEOUT_MS overrides the subprocess budget; a non-positive
+		// or non-numeric value falls back to the 30s default.
+		it("honors JOLLI_GIT_CMD_TIMEOUT_MS and defaults on a non-positive value", () => {
+			const spy = vi.spyOn(Subprocess, "execFileSyncHidden").mockReturnValue("https://github.com/o/r.git\n");
+			const old = process.env.JOLLI_GIT_CMD_TIMEOUT_MS;
+			try {
+				process.env.JOLLI_GIT_CMD_TIMEOUT_MS = "1234";
+				expect(extractRepoName("/x")).toBe("r");
+				expect(spy).toHaveBeenLastCalledWith(
+					"git",
+					expect.anything(),
+					expect.objectContaining({ timeout: 1234 }),
+				);
+
+				process.env.JOLLI_GIT_CMD_TIMEOUT_MS = "0"; // non-positive → default
+				extractRepoName("/x");
+				expect(spy).toHaveBeenLastCalledWith(
+					"git",
+					expect.anything(),
+					expect.objectContaining({ timeout: 30_000 }),
+				);
+			} finally {
+				if (old === undefined) delete process.env.JOLLI_GIT_CMD_TIMEOUT_MS;
+				else process.env.JOLLI_GIT_CMD_TIMEOUT_MS = old;
+				spy.mockRestore();
+			}
 		});
 
 		// origin URL exists but doesn't match the trailing-segment regex (no slash).

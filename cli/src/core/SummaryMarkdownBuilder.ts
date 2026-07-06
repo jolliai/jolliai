@@ -134,7 +134,7 @@ export function pushPlansAndNotesSection(
 		return;
 	}
 	const countLabel = totalCount > 1 ? ` (${totalCount})` : "";
-	lines.push("", `## Plans & Notes${countLabel}`, "");
+	lines.push("", `## Context${countLabel}`, "");
 
 	for (const plan of plans) {
 		const planUrl = plan.jolliPlanDocUrl;

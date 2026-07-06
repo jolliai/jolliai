@@ -101,14 +101,14 @@ describe("buildMarkdown", () => {
 				],
 			}),
 		);
-		expect(md).toContain("## Plans & Notes");
+		expect(md).toContain("## Context");
 		expect(md).toContain("[Plan One](https://jolli.app/plan/1)");
 		expect(md).toContain("- Note One");
 	});
 
 	it("omits plans section when no plans or notes", () => {
 		const md = buildMarkdown(leaf());
-		expect(md).not.toContain("## Plans & Notes");
+		expect(md).not.toContain("## Context");
 	});
 
 	it("renders E2E test section", () => {

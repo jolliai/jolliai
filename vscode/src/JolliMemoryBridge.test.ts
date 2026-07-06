@@ -1753,6 +1753,135 @@ describe("JolliMemoryBridge", () => {
 		});
 	});
 
+	// ── generateCommitMessageForFiles ────────────────────────────────────
+
+	describe("generateCommitMessageForFiles()", () => {
+		it("summarizes the selected files' working-tree diff (HEAD), not the index", async () => {
+			// 1) getCurrentBranch (rev-parse --abbrev-ref HEAD)
+			mockExecFileSuccess("feature/test\n");
+			// 2) working-tree diff of the selected paths (git diff HEAD -- <paths>)
+			mockExecFileSuccess("diff HEAD output\n");
+			// 3) untracked probe among the selection — none here.
+			mockExecFileSuccess("");
+			generateCommitMessage.mockResolvedValue("feat: selected");
+
+			const bridge = makeBridge();
+			const result = await bridge.generateCommitMessageForFiles(["src/a.ts", "src/b.ts"]);
+
+			expect(result).toBe("feat: selected");
+			expect(generateCommitMessage).toHaveBeenCalledWith({
+				stagedDiff: expect.any(String),
+				branch: "feature/test",
+				stagedFiles: ["src/a.ts", "src/b.ts"],
+				config: { apiKey: "test-key", model: "claude-3" },
+			});
+			const diffCall = execFileMock.mock.calls.find(
+				(c) => Array.isArray(c[1]) && (c[1] as ReadonlyArray<string>).includes("diff"),
+			);
+			expect(diffCall?.[1]).toEqual(["-c", "core.quotepath=false", "diff", "HEAD", "--", "src/a.ts", "src/b.ts"]);
+		});
+
+		it("includes untracked selected files as full 'new file' additions (git diff HEAD omits them)", async () => {
+			// A selection made entirely of a brand-new file: `git diff HEAD` is empty
+			// for it, but Commit Memory would stage + commit it, so the title preview
+			// must see its content via `git diff --no-index /dev/null <file>`.
+			mockExecFileSuccess("feature/test\n"); // getCurrentBranch
+			mockExecFileSuccess(""); // git diff HEAD -- new.ts (untracked → empty)
+			mockExecFileSuccess("new.ts\n"); // git ls-files --others -- new.ts
+			// `git diff --no-index` exits 1 when it finds a diff → execGit rejects, but
+			// the diff rides on the error's stdout (Node execFile behavior).
+			const NEW_FILE_DIFF =
+				"diff --git a/new.ts b/new.ts\nnew file mode 100644\n--- /dev/null\n+++ b/new.ts\n@@ -0,0 +1 @@\n+hello\n";
+			execFileMock.mockImplementationOnce(
+				(
+					_cmd: string,
+					_args: Array<string>,
+					_opts: unknown,
+					callback: (err: Error & { stdout?: string }) => void,
+				) => {
+					const err = new Error("exit 1") as Error & { stdout?: string };
+					err.stdout = NEW_FILE_DIFF;
+					callback(err);
+				},
+			);
+			generateCommitMessage.mockResolvedValue("feat: add new.ts");
+
+			const result = await makeBridge().generateCommitMessageForFiles(["new.ts"]);
+
+			expect(result).toBe("feat: add new.ts");
+			expect(generateCommitMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ stagedDiff: NEW_FILE_DIFF, stagedFiles: ["new.ts"] }),
+			);
+			// The untracked probe and the --no-index render both ran with the expected args.
+			const lsFilesCall = execFileMock.mock.calls.find(
+				(c) => Array.isArray(c[1]) && (c[1] as ReadonlyArray<string>).includes("ls-files"),
+			);
+			expect(lsFilesCall?.[1]).toEqual([
+				"-c",
+				"core.quotepath=false",
+				"ls-files",
+				"--others",
+				"--exclude-standard",
+				"--",
+				"new.ts",
+			]);
+			const noIndexCall = execFileMock.mock.calls.find(
+				(c) => Array.isArray(c[1]) && (c[1] as ReadonlyArray<string>).includes("--no-index"),
+			);
+			expect(noIndexCall?.[1]).toEqual([
+				"-c",
+				"core.quotepath=false",
+				"diff",
+				"--no-index",
+				"--",
+				"/dev/null",
+				"new.ts",
+			]);
+		});
+
+		it("combines tracked changes with untracked additions when the selection mixes both", async () => {
+			mockExecFileSuccess("feature/test\n"); // getCurrentBranch
+			mockExecFileSuccess("TRACKED-DIFF\n"); // git diff HEAD -- tracked.ts new.ts
+			mockExecFileSuccess("new.ts\n"); // ls-files --others → only new.ts is untracked
+			execFileMock.mockImplementationOnce(
+				(
+					_cmd: string,
+					_args: Array<string>,
+					_opts: unknown,
+					callback: (err: Error & { stdout?: string }) => void,
+				) => {
+					const err = new Error("exit 1") as Error & { stdout?: string };
+					err.stdout = "UNTRACKED-DIFF\n";
+					callback(err);
+				},
+			);
+			generateCommitMessage.mockResolvedValue("feat: mix");
+
+			await makeBridge().generateCommitMessageForFiles(["tracked.ts", "new.ts"]);
+
+			// Tracked diff first, then the synthesized untracked addition, concatenated.
+			expect(generateCommitMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ stagedDiff: "TRACKED-DIFF\nUNTRACKED-DIFF\n" }),
+			);
+		});
+
+		it("passes an empty diff and never calls git diff when nothing is selected", async () => {
+			// Only getCurrentBranch runs; an empty selection short-circuits the diff.
+			mockExecFileSuccess("feature/test\n");
+			generateCommitMessage.mockResolvedValue("chore: none");
+
+			await makeBridge().generateCommitMessageForFiles([]);
+
+			expect(generateCommitMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ stagedDiff: "", stagedFiles: [] }),
+			);
+			const diffCall = execFileMock.mock.calls.find(
+				(c) => Array.isArray(c[1]) && (c[1] as ReadonlyArray<string>)[0] === "diff",
+			);
+			expect(diffCall).toBeUndefined();
+		});
+	});
+
 	// ── commit ───────────────────────────────────────────────────────────
 
 	describe("commit()", () => {
@@ -4515,6 +4644,66 @@ describe("JolliMemoryBridge", () => {
 		});
 	});
 
+	// ── getBranchDiffBase / readFileAtRef ────────────────────────────
+
+	describe("getBranchDiffBase()", () => {
+		it("returns the refined delta base commit for a branch cut directly from main", async () => {
+			// Same resolveBranchDeltaBase sequence as getBranchPrStats' first case,
+			// but without the diffstat/name-status calls — this method only resolves
+			// the base so the diff's left side matches the header counts.
+			// getCurrentBranch
+			mockExecFileSuccess("feature/x\n");
+			// resolveHistoryBaseRef → refExists origin/main
+			mockExecFileSuccess("abc\n");
+			// getHEADHash (≠ merge-base → not merged mode)
+			mockExecFileSuccess("HEAD0000\n");
+			// merge-base
+			mockExecFileSuccess("BASE0000\n");
+			// resolveOwnCommitsBase → findBranchCreationPoint: no reflog entry
+			mockExecFileSuccess("\n");
+
+			const bridge = makeBridge();
+			expect(await bridge.getBranchDiffBase("main")).toBe("BASE0000");
+		});
+
+		it("returns undefined when no merge-base exists (nothing to diff)", async () => {
+			// getCurrentBranch
+			mockExecFileSuccess("orphan-branch\n");
+			// resolveHistoryBaseRef → all refExists fail
+			mockExecFileError("not found");
+			mockExecFileError("not found");
+			mockExecFileError("not found");
+			// getHEADHash
+			mockExecFileSuccess("HEAD0000\n");
+			// merge-base fails (no common ancestor)
+			mockExecFileError("no merge base");
+
+			const bridge = makeBridge();
+			expect(await bridge.getBranchDiffBase("main")).toBeUndefined();
+		});
+	});
+
+	describe("readFileAtRef()", () => {
+		it("returns the file's contents at the given ref via `git show <ref>:<path>`", async () => {
+			mockExecFileSuccess("line1\nline2\n");
+			const bridge = makeBridge();
+			const content = await bridge.readFileAtRef("BASE0000", "src/foo.ts");
+			expect(content).toBe("line1\nline2\n");
+			expect(execFileMock).toHaveBeenCalledWith(
+				"git",
+				["show", "BASE0000:src/foo.ts"],
+				expect.objectContaining({ maxBuffer: 16 * 1024 * 1024 }),
+				expect.any(Function),
+			);
+		});
+
+		it("returns an empty string when the path does not exist at the ref (added/deleted file)", async () => {
+			mockExecFileError("fatal: path 'src/added.ts' does not exist in 'BASE0000'");
+			const bridge = makeBridge();
+			expect(await bridge.readFileAtRef("BASE0000", "src/added.ts")).toBe("");
+		});
+	});
+
 	// ── listBranchMemories ──────────────────────────────────────────
 
 	describe("listBranchMemories()", () => {
@@ -6200,6 +6389,193 @@ describe("JolliMemoryBridge", () => {
 				commitHash: "abc",
 				topics: [],
 			});
+		});
+	});
+
+	// ── Coverage-completion cases ─────────────────────────────────────────
+	describe("coverage completion", () => {
+		it("getDiscoveryCached serves a cached hit within the TTL (no second discoverRepos scan)", async () => {
+			// Two calls on the same bridge within DISCOVERY_CACHE_TTL_MS must
+			// reuse the cached {cfg, repos} — the second call returns from the
+			// cache branch instead of re-running loadConfig + discoverRepos.
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/other",
+					repoName: "other",
+					dirName: "other",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			await bridge.createStorageForRepo("other", null);
+			await bridge.createStorageForRepo("other", null);
+
+			// Cache hit on the second call → discovery ran exactly once.
+			expect(discoverRepos).toHaveBeenCalledTimes(1);
+		});
+
+		it("getStorage resets its cached promise and rethrows when createStorage rejects", async () => {
+			// The write-storage factory (StorageFactory.createStorage) rejects
+			// when KB path resolution throws. getStorage's `.catch` must null out
+			// `storagePromise` and rethrow so the failure surfaces and a later
+			// call can retry rather than await a permanently-rejected promise.
+			// `createFolderStorage` (inside StorageFactory.createStorage) calls
+			// the mocked `extractRepoName`; throwing there rejects createStorage.
+			extractRepoName.mockImplementationOnce(() => {
+				throw new Error("kb boom");
+			});
+
+			const bridge = makeBridge();
+			await expect(bridge.indexNeedsMigration()).rejects.toThrow("kb boom");
+
+			// Cache was reset → the next call retries with a healthy resolver.
+			indexNeedsMigration.mockResolvedValueOnce(false);
+			await expect(bridge.indexNeedsMigration()).resolves.toBe(false);
+		});
+
+		it("findBranchCreationPoint falls back to the oldest reflog entry when no explicit creation record exists (non-strict caller)", async () => {
+			// The non-`requireExplicit` fallback: with no "branch: Created from"
+			// entry, guess the oldest surviving reflog entry's hash.
+			mockExecFileSuccess(
+				"aaa1111 commit: recent work\nbbb2222 checkout: moving from main\nccc3333 reset: older move\n",
+			);
+			const bridge = makeBridge();
+			// biome-ignore lint/suspicious/noExplicitAny: exercising a private method's non-strict fallback
+			const result = await (bridge as any).findBranchCreationPoint("feature/x");
+			expect(result).toBe("ccc3333");
+		});
+
+		it("inspectForcePushSafety wires execGit into the pure divergence probe", async () => {
+			// getCurrentBranch → the ForcePushSafety helper runs fetch + two
+			// rev-list --count via the injected `(args) => execGit(...)` runner.
+			mockExecFileSuccess("feature/x\n"); // getCurrentBranch
+			mockExecFileSuccess(""); // fetch origin feature/x
+			mockExecFileSuccess("2\n"); // rev-list HEAD..origin/feature/x
+			mockExecFileSuccess("0\n"); // rev-list origin/feature/x..HEAD
+
+			const bridge = makeBridge();
+			const result = await bridge.inspectForcePushSafety();
+
+			expect(result).toEqual({
+				branch: "feature/x",
+				remoteOnly: 2,
+				localOnly: 0,
+				behindOnly: true,
+			});
+		});
+
+		it("listBranchMemories returns [] when a foreign repo is not among the discovered repos", async () => {
+			// Foreign route with a successful discovery that simply doesn't
+			// contain the requested repo → `!target` guard returns [].
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/other",
+					repoName: "other",
+					dirName: "other",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.listBranchMemories("foreign-repo", "main");
+			expect(result).toEqual([]);
+		});
+
+		it("listSummaryEntries filter evaluates the empty-string fallback for an entry with no repoName", async () => {
+			// A discovered (foreign) repo whose repoName is undefined pushes
+			// entries with `repoName: undefined`; a non-matching filter forces
+			// evaluation of the `(e.repoName ?? "")` fallback arm.
+			getIndexEntryMap.mockResolvedValueOnce(new Map()); // step 1: current repo empty
+			getIndexEntryMap.mockResolvedValueOnce(
+				new Map([
+					[
+						"aaa",
+						{
+							commitHash: "aaa",
+							commitDate: "2025-01-01T00:00:00Z",
+							commitMessage: "hello",
+							branch: "main",
+							parentCommitHash: null,
+							topicCount: 1,
+						},
+					],
+				]),
+			);
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/x",
+					// biome-ignore lint/suspicious/noExplicitAny: exercising the undefined-repoName fallback
+					repoName: undefined as any,
+					dirName: "x",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.listSummaryEntries(10, 0, "zzz");
+			expect(result.entries).toEqual([]);
+			expect(result.totalCount).toBe(0);
+		});
+
+		it("storeReferences resolves write storage and delegates to SummaryStore.storeReferences", async () => {
+			storeReferences.mockResolvedValue(undefined);
+			const bridge = makeBridge();
+
+			const refs = [
+				{
+					archivedKey: "linear/ABC-1",
+					source: "linear" as never,
+					content: "# note",
+				},
+			];
+			await bridge.storeReferences(refs, "commit message", "feature/x");
+
+			expect(storeReferences).toHaveBeenCalledWith(
+				refs,
+				"commit message",
+				TEST_CWD,
+				"feature/x",
+				expect.anything(),
+			);
+		});
+
+		it("getCurrentUserEmail returns the trimmed git config value", async () => {
+			mockExecFileSuccess("flyer@example.com\n");
+			const bridge = makeBridge();
+
+			const email = await bridge.getCurrentUserEmail();
+			expect(email).toBe("flyer@example.com");
+		});
+
+		it("getBranchPrStats parses rename, CRLF and top-level rows from --name-status", async () => {
+			// Drives parseDiffNameStatus through: a rename status ("R100" → "R",
+			// picking parts[2] as the new path), CRLF line endings, and a
+			// top-level file (no slash → empty dir).
+			mockExecFileSuccess("feature/x\n"); // getCurrentBranch
+			mockExecFileSuccess("abc\n"); // resolveHistoryBaseRef → refExists origin/main
+			mockExecFileSuccess("HEAD0000\n"); // getHEADHash (≠ merge-base → not merged)
+			mockExecFileSuccess("BASE0000\n"); // merge-base
+			mockExecFileSuccess("\n"); // findBranchCreationPoint: no reflog
+			getDiffStats.mockResolvedValueOnce({
+				insertions: 1,
+				deletions: 0,
+				filesChanged: 2,
+			});
+			// name-status: rename (3 parts) with CRLF, plus a top-level add.
+			mockExecFileSuccess("R100\tsrc/old.ts\tsrc/new.ts\r\nA\tREADME.md\r\n");
+
+			const bridge = makeBridge();
+			const result = await bridge.getBranchPrStats("main");
+
+			expect(result.files).toEqual([
+				// Rename retains the base-side path so the per-file diff opens correctly.
+				{ path: "src/new.ts", dir: "src", status: "R", oldPath: "src/old.ts" },
+				{ path: "README.md", dir: "", status: "A" },
+			]);
 		});
 	});
 });

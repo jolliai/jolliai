@@ -101,6 +101,7 @@ import {
 	buildPrSectionHtml,
 	buildPrSectionScript,
 	findOpenPrForBranch,
+	findPrWithHistoryForBranch,
 	handleCheckPrStatus,
 	handleCreatePr,
 	handlePrepareUpdatePr,
@@ -1613,6 +1614,15 @@ describe("PrCommentService", () => {
 			expect(gitPushCalled).toBe(true);
 			expect(prCreateCalled).toBe(true);
 			expect(postMessage).toHaveBeenCalledWith({ command: "prCreating" });
+			// Per-step progress lines drive the text below the disabled buttons.
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prProgress",
+				text: "Pushing branch to origin…",
+			});
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prProgress",
+				text: "Creating pull request…",
+			});
 			// handleCheckPrStatus should post the ready status
 			expect(postMessage).toHaveBeenCalledWith(
 				expect.objectContaining({ command: "prStatus", status: "ready" }),
@@ -2000,6 +2010,74 @@ describe("PrCommentService", () => {
 			expect(showErrorMessage).toHaveBeenCalledWith(
 				expect.stringContaining("Create PR failed — network unreachable"),
 			);
+		});
+	});
+
+	// ─── handleCreatePr return value ─────────────────────────────────────────
+	//
+	// Task 2 of the push-on-submit feature: the panel (Task 3) needs to know
+	// whether the submit actually landed so it can decide whether to run the
+	// push-to-Space engine. Mirrors the mock arrangements from the "pushes
+	// branch, creates PR..." / "branch changed since prepare" / "aborts
+	// quietly when the user declines the force-push confirmation" cases above.
+
+	describe("handleCreatePr return value", () => {
+		it('resolves "succeeded" after a fresh PR is created', async () => {
+			const prUrl = "https://github.com/org/repo/pull/99";
+			let prListCalls = 0;
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") return { stdout: "feature/x\n" };
+				if (cmd === "git" && args[0] === "push") return { stdout: "" };
+				if (cmd === "gh" && args[0] === "--version") return { stdout: "gh 2.40.0\n" };
+				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "create") return { stdout: `${prUrl}\n` };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					prListCalls += 1;
+					return prListCalls === 1
+						? { stdout: "[]" }
+						: {
+								stdout: JSON.stringify([
+									{ number: 99, url: prUrl, title: "New PR", body: "", state: "OPEN" },
+								]),
+							};
+				}
+				return { stdout: "" };
+			});
+			showInformationMessage.mockResolvedValue(undefined);
+
+			const outcome = await handleCreatePr("New PR", "PR body", CWD, postMessage, "feature/x");
+
+			expect(outcome).toBe("succeeded");
+		});
+
+		it('resolves "failed" when blocked by the cross-branch guard', async () => {
+			setupExecFile(
+				buildRouter({
+					"git:rev-parse": () => ({ stdout: "other\n" }),
+				}),
+			);
+
+			const outcome = await handleCreatePr("t", "b", CWD, postMessage, "feature/x");
+
+			expect(outcome).toBe("failed");
+		});
+
+		it('resolves "failed" when the push is cancelled', async () => {
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") return { stdout: "feature/x\n" };
+				if (cmd === "git" && args[0] === "push") {
+					if (args[1] === "--force-with-lease") return { stdout: "" };
+					throw new Error("! [rejected] (non-fast-forward)");
+				}
+				// Pre-push lookup → no open PR, so the create path reaches the push.
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") return { stdout: "[]" };
+				return { stdout: "" };
+			});
+			showWarningMessage.mockResolvedValueOnce(undefined);
+
+			const outcome = await handleCreatePr("t", "b", CWD, postMessage, "feature/x");
+
+			expect(outcome).toBe("failed");
 		});
 	});
 
@@ -2595,6 +2673,57 @@ describe("PrCommentService", () => {
 		});
 	});
 
+	// ─── findPrWithHistoryForBranch ─────────────────────────────────────────
+
+	describe("findPrWithHistoryForBranch", () => {
+		it("returns the open PR plus the closed/merged history (newest-first)", async () => {
+			setupExecFile(
+				buildRouter({
+					"gh:pr:list": () => ({
+						stdout: JSON.stringify([
+							{ number: 300, url: "https://gh/pr/300", title: "T", body: "", state: "OPEN" },
+							{ number: 271, url: "https://gh/pr/271", title: "T", body: "", state: "MERGED" },
+							{ number: 251, url: "https://gh/pr/251", title: "T", body: "", state: "CLOSED" },
+						]),
+					}),
+				}),
+			);
+			const got = await findPrWithHistoryForBranch(CWD, "feature/x");
+			expect(got.existingPr).toEqual({ number: 300, url: "https://gh/pr/300" });
+			expect(got.history).toEqual([
+				{ number: 271, url: "https://gh/pr/271", state: "MERGED" },
+				{ number: 251, url: "https://gh/pr/251", state: "CLOSED" },
+			]);
+		});
+
+		it("returns no open PR but keeps the merged history when only closed PRs exist", async () => {
+			setupExecFile(
+				buildRouter({
+					"gh:pr:list": () => ({
+						stdout: JSON.stringify([
+							{ number: 271, url: "https://gh/pr/271", title: "T", body: "", state: "MERGED" },
+						]),
+					}),
+				}),
+			);
+			const got = await findPrWithHistoryForBranch(CWD, "feature/x");
+			expect(got.existingPr).toBeUndefined();
+			expect(got.history).toEqual([{ number: 271, url: "https://gh/pr/271", state: "MERGED" }]);
+		});
+
+		it("returns empty history on a lookup error", async () => {
+			setupExecFile((cmd, args) => {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					throw ghError({ message: "network", stderr: "boom", code: 1 });
+				}
+				return { stdout: "" };
+			});
+			const got = await findPrWithHistoryForBranch(CWD, "feature/x");
+			expect(got.existingPr).toBeUndefined();
+			expect(got.history).toEqual([]);
+		});
+	});
+
 	// ─── handleUpdatePrWithPush + smart pushBranch ──────────────────────────
 
 	describe("handleUpdatePrWithPush", () => {
@@ -3028,6 +3157,72 @@ describe("PrCommentService", () => {
 			expect(forcePushed).toBe(true);
 			expect(postMessage).not.toHaveBeenCalledWith({ command: "prCreateFailed" });
 			expect(showInformationMessage).toHaveBeenCalledWith("Pull request created!", "Open PR");
+		});
+	});
+
+	// ─── handleUpdatePrWithPush return value ─────────────────────────────────
+	//
+	// Mirrors the mock arrangements from "pushes, edits title+body of the open
+	// PR..." and "aborts with an error and never pushes when the pre-push PR
+	// lookup fails (lookupError)" above.
+
+	describe("handleUpdatePrWithPush return value", () => {
+		it('resolves "succeeded" after an existing PR is updated', async () => {
+			const OPEN_PR = [
+				{ number: 7, url: "https://gh/pr/7", title: "Existing title", body: "", state: "OPEN" },
+			];
+			setupExecFile(
+				buildRouter({
+					"git:rev-parse": () => ({ stdout: "feature/x\n" }),
+					"git:push": () => ({ stdout: "" }),
+					"gh:--version": () => ({ stdout: "gh 2.40\n" }),
+					"gh:auth": () => ({ stdout: "ok\n" }),
+					"gh:pr:list": () => ({ stdout: JSON.stringify(OPEN_PR) }),
+					"gh:pr:edit": () => ({ stdout: "" }),
+				}),
+			);
+			showInformationMessage.mockResolvedValue(undefined);
+
+			const outcome = await handleUpdatePrWithPush("New title", "Body", CWD, postMessage, "feature/x");
+
+			expect(outcome).toBe("succeeded");
+		});
+
+		it('resolves "failed" when lookup errors', async () => {
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") return { stdout: "feature/x\n" };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					// Transient gh failure (auth/ratelimit) → lookupError.
+					throw ghError({ message: "gh exit 4", code: 4, stderr: "HTTP 401: Bad credentials" });
+				}
+				return { stdout: "" };
+			});
+
+			const outcome = await handleUpdatePrWithPush("t", "b", CWD, postMessage, "feature/x");
+
+			expect(outcome).toBe("failed");
+		});
+
+		it('resolves "succeeded" via the noPr→create fallback when the user confirms', async () => {
+			// The open PR vanished (closed/merged) since the panel rendered; the
+			// user confirms the "Create New PR" modal, push + create succeed.
+			// Mirrors "falls back to creating a PR when the open PR vanished".
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") return { stdout: "feature/x\n" };
+				if (cmd === "git" && args[0] === "push") return { stdout: "" };
+				if (cmd === "gh" && args[0] === "--version") return { stdout: "gh 2.40\n" };
+				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "create") return { stdout: "https://gh/pr/9\n" };
+				// Pre-push lookup → no open PR (noPr); post-create refresh also empty.
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") return { stdout: "[]" };
+				return { stdout: "" };
+			});
+			showWarningMessage.mockResolvedValueOnce("Create New PR");
+			showInformationMessage.mockResolvedValue(undefined);
+
+			const outcome = await handleUpdatePrWithPush("t", "b", CWD, postMessage, "feature/x");
+
+			expect(outcome).toBe("succeeded");
 		});
 	});
 });

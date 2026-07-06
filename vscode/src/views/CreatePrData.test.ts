@@ -79,7 +79,7 @@ describe("buildCreatePrViewModel", () => {
 		// title and body come from anchor (last element)
 		expect(vm.title.length).toBeGreaterThan(0);
 		expect(vm.bodyMarkdown).toContain("feat");
-		// e2eScenarios from anchor
+		// e2eScenarios aggregated across memories (here only the anchor has one)
 		expect(vm.e2eScenarios).toHaveLength(1);
 		expect(vm.e2eScenarios[0].title).toBe("Smoke");
 		// file stats from getBranchPrStats
@@ -88,6 +88,19 @@ describe("buildCreatePrViewModel", () => {
 		expect(vm.filesChanged).toBe(2);
 		expect(vm.files).toHaveLength(2);
 		expect(vm.files[0]).toEqual({ path: "src/foo.ts", dir: "src", status: "M" });
+	});
+
+	it("aggregates E2E scenarios across all memories, not just the anchor", async () => {
+		// The older (non-anchor) commit carries a scenario; the anchor has none.
+		// Before aggregation the panel's E2E Test Guide would render empty.
+		const older = summary("bbb2222", "fix: bug", {
+			e2eTestGuide: [{ title: "Older scenario", steps: ["run"], expectedResults: ["pass"] }],
+		});
+		const anchor = summary("aaa1111", "feat: redesign sidebar");
+		h.loadBranchSummaries.mockResolvedValue({ summaries: [older, anchor], missingCount: 0 });
+		const vm = await buildCreatePrViewModel(makeBridge(), "main");
+		if ("empty" in vm) throw new Error("expected a view model");
+		expect(vm.e2eScenarios.map((s) => s.title)).toEqual(["Older scenario"]);
 	});
 
 	it("falls back to getCurrentBranch when anchor.branch is empty", async () => {
@@ -108,12 +121,23 @@ describe("parseNameStatus", () => {
 			{ path: "src/foo.ts", dir: "src", status: "M" },
 			{ path: "README.md", dir: "", status: "A" },
 			{ path: "old/bar.ts", dir: "old", status: "D" },
-			{ path: "new/baz.ts", dir: "new", status: "R" },
+			// Rename keeps BOTH sides: `path` = new, `oldPath` = base-side path so a
+			// per-file diff can read the left side from where the content lived.
+			{ path: "new/baz.ts", dir: "new", status: "R", oldPath: "old/baz.ts" },
 		]);
 	});
 
 	it("returns empty array for empty input", () => {
 		expect(parseNameStatus("")).toEqual([]);
 		expect(parseNameStatus("  \n  ")).toEqual([]);
+	});
+
+	it("strips trailing CR from CRLF-terminated lines", async () => {
+		const { parseNameStatus } = await import("./CreatePrData.js");
+		const rows = parseNameStatus("M\tsrc/foo.ts\r\nA\tREADME.md\r");
+		expect(rows).toEqual([
+			{ path: "src/foo.ts", dir: "src", status: "M" },
+			{ path: "README.md", dir: "", status: "A" },
+		]);
 	});
 });

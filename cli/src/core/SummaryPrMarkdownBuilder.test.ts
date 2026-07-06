@@ -131,7 +131,9 @@ describe("SummaryPrMarkdownBuilder", () => {
 				const md = buildPrMarkdown(summary);
 
 				expect(md).toContain("## Jolli Memory");
-				expect(md).toContain("https://jolli.app/doc/456");
+				// Rendered as a markdown link (not a bare URL) so the Create-PR webview
+				// preview linkifies it — see SummaryPrMarkdownBuilder.buildPrMarkdown.
+				expect(md).toContain("[https://jolli.app/doc/456](https://jolli.app/doc/456)");
 			});
 
 			it("omits memory URL section when jolliDocUrl is not set", () => {
@@ -495,7 +497,7 @@ describe("SummaryPrMarkdownBuilder", () => {
 
 				const md = buildPrMarkdown(summary);
 
-				expect(md).toContain("## Plans & Notes");
+				expect(md).toContain("## Context");
 				expect(md).toContain("- PR Note");
 				expect(md).not.toContain("some text");
 			});

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { buildSidebarScript } from "./SidebarScriptBuilder";
+import {
+	SONNET_CACHE_WRITE_PER_TOKEN,
+	SONNET_INPUT_PER_TOKEN,
+	SONNET_OUTPUT_PER_TOKEN,
+} from "./SummaryUtils";
 
 describe("SidebarScriptBuilder", () => {
 	it("returns a JS string", () => {
@@ -55,6 +60,16 @@ describe("SidebarScriptBuilder", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("data-tab");
 		expect(js).toContain("switchTab");
+	});
+
+	it("honors the host's activeTab only on the first init", () => {
+		// A spurious re-init (e.g. the Working Memory panel's `ready` re-running
+		// the host's handleReady, which re-broadcasts init:'branch') must not yank
+		// a user off the tab they navigated to. The tab reconciliation is gated
+		// behind a first-init flag.
+		const js = buildSidebarScript();
+		expect(js).toContain("didInitTab");
+		expect(js).toMatch(/if \(!didInitTab\)/);
 	});
 
 	it("posts a refresh scope message on toolbar Refresh", () => {
@@ -196,6 +211,18 @@ describe("SidebarScriptBuilder", () => {
 			expect(renderChangeRow).toContain(" excluded");
 			// the destructive discard affordance is untouched
 			expect(renderChangeRow).toContain("'discard'");
+		});
+
+		it("stacks the directory under the filename (change-text column, like committed memories)", () => {
+			const js = buildSidebarScript();
+			const renderChangeRow = js.slice(
+				js.indexOf("function renderChangeRow"),
+				js.indexOf("function renderCommitRow"),
+			);
+			expect(renderChangeRow).toContain("change-text");
+			expect(renderChangeRow).toContain("change-dir");
+			// the dir is no longer an inline .desc sibling
+			expect(renderChangeRow).not.toContain("className: 'desc'");
 		});
 	});
 
@@ -1084,19 +1111,19 @@ describe("SidebarScriptBuilder", () => {
 
 		it("renders dirname-only description (not the full path)", () => {
 			const js = buildSidebarScript();
-			// Visual parity with renderCommitFileRow: changes rows show the
-			// directory portion of relativePath next to the label, not the
-			// full path. The lastIndexOf('/') slice is the truncation marker.
+			// Changes rows show the directory portion of relativePath stacked under
+			// the filename (change-dir), not the full path. The lastIndexOf('/')
+			// slice is the truncation marker.
 			const renderChangeRow = js.slice(
 				js.indexOf("function renderChangeRow"),
 				js.indexOf("function renderCommitRow"),
 			);
-			expect(renderChangeRow).toContain("className: 'desc'");
+			expect(renderChangeRow).toContain("className: 'change-dir'");
 			expect(renderChangeRow).toContain("lastIndexOf('/')");
-			// Must NOT push the full description (would render the basename
-			// twice — once as label, once as desc).
+			// Must NOT render the full description (would show the basename twice —
+			// once as label, once as the dir line).
 			expect(renderChangeRow).not.toMatch(
-				/className:\s*['"]desc['"][^}]*text:\s*item\.description\b/,
+				/className:\s*['"]change-dir['"][^}]*text:\s*item\.description\b/,
 			);
 		});
 
@@ -3044,8 +3071,13 @@ describe("SidebarScriptBuilder", () => {
 		const js = buildSidebarScript();
 		// Sonnet 4.6 rates per million tokens: input 3, output 15, cached (which now
 		// carries cache_creation) at the 1.25x cache-write rate 3.75. Still a floor —
-		// the excluded cumulative cache_read is real but uncounted spend.
-		expect(js).toContain("(stats.input * 3 + stats.output * 15 + cached * 3.75) / 1000000");
+		// the excluded cumulative cache_read is real but uncounted spend. The
+		// per-token constants are baked in from SummaryUtils.ts's
+		// SONNET_INPUT_PER_TOKEN/SONNET_OUTPUT_PER_TOKEN/SONNET_CACHE_WRITE_PER_TOKEN
+		// (shared with the Commit Memory panel's token meter), not re-declared here.
+		expect(js).toContain(
+			`stats.input * ${SONNET_INPUT_PER_TOKEN} + stats.output * ${SONNET_OUTPUT_PER_TOKEN} + cached * ${SONNET_CACHE_WRITE_PER_TOKEN}`,
+		);
 		// Rendered as "≈$X.XX", with a "<$0.01" floor for sub-cent branches.
 		expect(js).toContain("'≈$'");
 		expect(js).toContain("'<$0.01'");

@@ -562,6 +562,16 @@ async function createPr(
 type PostMessageFn = (msg: Record<string, unknown>) => void;
 
 /**
+ * Posts a human-readable progress line the Create-PR webview renders below the
+ * action buttons, so the user can see which step (push / create / update) a
+ * push + create/update is on while the buttons are disabled. The webview clears
+ * it on any settle message (prStatus / prCreateFailed / prCreateBlockedCrossBranch).
+ */
+function postPrProgress(postMessage: PostMessageFn, text: string): void {
+	postMessage({ command: "prProgress", text });
+}
+
+/**
  * Checks the PR status for the summary's branch and sends the result to the webview.
  *
  * PR operations are branch-scoped, not commit-scoped: we look up the PR on
@@ -660,6 +670,9 @@ export async function handleCheckPrStatus(
 
 // ─── Submit-time helpers (create / update PR) ───────────────────────────────
 
+/** Result of a Create/Update-PR submit: whether the branch was pushed and the PR create/update landed. */
+export type PrSubmitOutcome = "succeeded" | "failed";
+
 /** Label for the modal that confirms creating a fresh PR after the old one vanished. */
 const CREATE_NEW_PR_LABEL = "Create New PR";
 /** Label for the modal that confirms updating an existing PR found at submit time. */
@@ -735,7 +748,7 @@ export async function handleCreatePr(
 	cwd: string,
 	postMessage: PostMessageFn,
 	expectedBranch?: string,
-): Promise<void> {
+): Promise<PrSubmitOutcome> {
 	try {
 		const currentBranch = await getCurrentBranchSafe(cwd);
 		if (currentBranch === "HEAD") {
@@ -745,7 +758,7 @@ export async function handleCreatePr(
 				summaryBranch: expectedBranch ?? "",
 				currentBranch,
 			});
-			return;
+			return "failed";
 		}
 		if (expectedBranch && expectedBranch !== currentBranch) {
 			vscode.window.showWarningMessage(
@@ -756,7 +769,7 @@ export async function handleCreatePr(
 				summaryBranch: expectedBranch,
 				currentBranch,
 			});
-			return;
+			return "failed";
 		}
 
 		// Resolve PR existence BEFORE touching the remote. `pushBranch` may
@@ -772,7 +785,7 @@ export async function handleCreatePr(
 			vscode.window.showErrorMessage(
 				`Create PR failed — could not verify the pull request: ${preLookup.reason}`,
 			);
-			return;
+			return "failed";
 		}
 		if (preLookup.kind === "found") {
 			// An open PR already exists (the panel may have rendered "Create"
@@ -785,24 +798,27 @@ export async function handleCreatePr(
 			);
 			if (!confirmed) {
 				postMessage({ command: "prCreateFailed" });
-				return;
+				return "failed";
 			}
 			postMessage({ command: "prCreating" });
+			postPrProgress(postMessage, "Pushing branch to origin…");
 			log.info(TAG, "Pushing branch to origin (create→update fallback)...");
 			const updatePush = await pushBranch(cwd);
 			if (updatePush === "cancelled") {
 				postMessage({ command: "prCreateFailed" });
-				return;
+				return "failed";
 			}
+			postPrProgress(postMessage, `Updating pull request #${preLookup.pr.number}…`);
 			await syncPrTitleBody(preLookup.pr, title, body, cwd);
 			log.info(TAG, `Updated existing PR #${preLookup.pr.number} (create→update fallback)`);
 			await handleCheckPrStatus(cwd, postMessage, expectedBranch);
 			showOpenPrToast(`Updated PR #${preLookup.pr.number}`, preLookup.pr.url);
-			return;
+			return "succeeded";
 		}
 
 		// kind === "noPr": no open PR exists — safe to push + create.
 		postMessage({ command: "prCreating" });
+		postPrProgress(postMessage, "Pushing branch to origin…");
 
 		// Ensure branch is pushed. A normal push is rejected as non-fast-forward
 		// both when this branch's local history was rewritten (rebase / amend /
@@ -818,10 +834,11 @@ export async function handleCreatePr(
 			// blocked the push (remote is ahead — rebase first). Quietly reset the
 			// webview button state without surfacing an error toast.
 			postMessage({ command: "prCreateFailed" });
-			return;
+			return "failed";
 		}
 
 		// Create the PR
+		postPrProgress(postMessage, "Creating pull request…");
 		log.info(TAG, `Creating PR: "${title}"`);
 		const prUrl = await createPr(title, body, cwd);
 		log.info(TAG, `PR created: ${prUrl}`);
@@ -831,11 +848,13 @@ export async function handleCreatePr(
 
 		// Toast with "Open PR" action
 		showOpenPrToast("Pull request created!", prUrl);
+		return "succeeded";
 	} catch (err: unknown) {
 		postMessage({ command: "prCreateFailed" });
 		const msg = err instanceof Error ? err.message : String(err);
 		log.error(TAG, `Create PR failed: ${msg}`);
 		vscode.window.showErrorMessage(`Create PR failed — ${msg}`);
+		return "failed";
 	}
 }
 
@@ -862,6 +881,28 @@ export async function findOpenPrForBranch(
 }
 
 /**
+ * Like {@link findOpenPrForBranch} but also returns the branch's closed /
+ * merged PR history. Used by the Create-PR pane, which surfaces both the open
+ * PR (as an "Update PR" affordance) AND a "Previously: #N (merged) · …" strip
+ * so a branch whose PR was already merged still shows that PR's link.
+ *
+ * `existingPr` is undefined for both `noPr` and `lookupError` (same conflation
+ * rationale as {@link findOpenPrForBranch}); `history` is `[]` on `lookupError`
+ * or when the branch has no closed PRs. Best-effort — the caller renders
+ * whatever it gets and never blocks on a gh failure here.
+ */
+export async function findPrWithHistoryForBranch(
+	cwd: string,
+	branch: string,
+	repoUrl?: string | null,
+): Promise<{ existingPr?: { number: number; url: string }; history: ReadonlyArray<PrHistoryEntry> }> {
+	const lookup = await findPrForBranch(cwd, branch, repoUrl);
+	if (lookup.kind === "lookupError") return { history: [] };
+	const existingPr = lookup.kind === "found" ? { number: lookup.pr.number, url: lookup.pr.url } : undefined;
+	return { existingPr, history: lookup.history };
+}
+
+/**
  * Updates the open PR for the current branch from the Create-PR-panel draft:
  * syncs the PR's title + body to the drafted values, pushing the latest commits
  * (resolving diverged / amended history via {@link pushBranch}) first.
@@ -885,7 +926,7 @@ export async function handleUpdatePrWithPush(
 	cwd: string,
 	postMessage: PostMessageFn,
 	summaryBranch?: string,
-): Promise<void> {
+): Promise<PrSubmitOutcome> {
 	try {
 		// getCurrentBranchSafe (not getCurrentBranch): normalize detached HEAD and
 		// hard git errors (index.lock, permissions) to the "HEAD" sentinel, exactly
@@ -901,7 +942,7 @@ export async function handleUpdatePrWithPush(
 				summaryBranch: summaryBranch ?? "",
 				currentBranch,
 			});
-			return;
+			return "failed";
 		}
 		if (summaryBranch && summaryBranch !== currentBranch) {
 			vscode.window.showWarningMessage(
@@ -912,7 +953,7 @@ export async function handleUpdatePrWithPush(
 				summaryBranch,
 				currentBranch,
 			});
-			return;
+			return "failed";
 		}
 
 		// Resolve the PR state before touching the remote (see docstring).
@@ -923,23 +964,25 @@ export async function handleUpdatePrWithPush(
 			vscode.window.showErrorMessage(
 				`Update PR failed — could not verify the pull request: ${lookup.reason}`,
 			);
-			return;
+			return "failed";
 		}
 
 		if (lookup.kind === "found") {
 			const { pr } = lookup;
 			postMessage({ command: "prCreating" });
+			postPrProgress(postMessage, "Pushing branch to origin…");
 			log.info(TAG, "Pushing branch to origin (update PR)...");
 			const pushResult = await pushBranch(cwd);
 			if (pushResult === "cancelled") {
 				postMessage({ command: "prCreateFailed" });
-				return;
+				return "failed";
 			}
+			postPrProgress(postMessage, `Updating pull request #${pr.number}…`);
 			await syncPrTitleBody(pr, title, body, cwd);
 			log.info(TAG, `Updated PR #${pr.number}`);
 			await handleCheckPrStatus(cwd, postMessage, summaryBranch);
 			showOpenPrToast(`Updated PR #${pr.number}`, pr.url);
-			return;
+			return "succeeded";
 		}
 
 		// noPr — the open PR was closed/merged since the panel rendered. Confirm
@@ -951,24 +994,28 @@ export async function handleUpdatePrWithPush(
 		);
 		if (!confirmed) {
 			postMessage({ command: "prCreateFailed" });
-			return;
+			return "failed";
 		}
 		postMessage({ command: "prCreating" });
+		postPrProgress(postMessage, "Pushing branch to origin…");
 		log.info(TAG, `No open PR for ${currentBranch}; creating a new one (confirmed).`);
 		const pushResult = await pushBranch(cwd);
 		if (pushResult === "cancelled") {
 			postMessage({ command: "prCreateFailed" });
-			return;
+			return "failed";
 		}
+		postPrProgress(postMessage, "Creating pull request…");
 		const prUrl = await createPr(title, body, cwd);
 		log.info(TAG, `PR created: ${prUrl}`);
 		await handleCheckPrStatus(cwd, postMessage, summaryBranch);
 		showOpenPrToast("Pull request created!", prUrl);
+		return "succeeded";
 	} catch (err: unknown) {
 		postMessage({ command: "prCreateFailed" });
 		const msg = err instanceof Error ? err.message : String(err);
 		log.error(TAG, `Update PR failed: ${msg}`);
 		vscode.window.showErrorMessage(`Update PR failed — ${msg}`);
+		return "failed";
 	}
 }
 

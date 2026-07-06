@@ -42,7 +42,13 @@ export function buildAggregatedPrMarkdown(summaries: ReadonlyArray<CommitSummary
 	pushAggregatedE2eSection(lines, summaries, currentLength);
 	pushAggregatedTopicsSection(lines, summaries, currentLength);
 	pushMissingFootnote(lines, missingCount);
-	pushFooter(lines);
+	// Provider attribution across ALL commits in the PR: wrap the summaries as a
+	// synthetic root so formatProviderLabel walks every commit's tree and the
+	// footer reads "· via Anthropic" (single provider) or "· via mixed: …"
+	// (cross-provider). Without a summary, pushFooter drops the provider segment —
+	// which is why the aggregated (multi-memory) PR body was missing it while the
+	// single-summary path (buildPrMarkdown) had it.
+	pushFooter(lines, { children: summaries } as unknown as CommitSummary);
 
 	return lines.join("\n");
 }

@@ -253,20 +253,19 @@ describe("file-row truncation priority (dirname-first, filename last-resort)", (
 		// ~all overflow before the label gives up a single pixel. min-width:0
 		// is load-bearing: flex items default to min-width:auto (content-
 		// based), which would prevent text-overflow:ellipsis from ever firing.
-		// Both selectors must satisfy the rule — they're combined in source.
+		// Only commit-file rows still inline the dirname as .desc; changes rows
+		// now stack it as .change-dir (see the stacked-dir test below).
 		const css = buildSidebarCss();
-		for (const selector of [
-			'\\.tree-node\\[data-context="commitFile"\\]\\s+\\.desc',
-			"\\.tree-node\\.tree-node--changes\\s+\\.desc",
-		]) {
-			expect(css).toMatch(
-				new RegExp(`${selector}[^{]*{[^}]*flex:\\s*0\\s+9999\\s+auto`),
-			);
-			expect(css).toMatch(new RegExp(`${selector}[^{]*{[^}]*min-width:\\s*0`));
-			expect(css).toMatch(
-				new RegExp(`${selector}[^{]*{[^}]*text-overflow:\\s*ellipsis`),
-			);
-		}
+		const selector = '\\.tree-node\\[data-context="commitFile"\\]\\s+\\.desc';
+		expect(css).toMatch(new RegExp(`${selector}[^{]*{[^}]*flex:\\s*0\\s+9999\\s+auto`));
+		expect(css).toMatch(new RegExp(`${selector}[^{]*{[^}]*min-width:\\s*0`));
+		expect(css).toMatch(new RegExp(`${selector}[^{]*{[^}]*text-overflow:\\s*ellipsis`));
+	});
+
+	it("changes rows stack the directory under the filename (.change-text column + .change-dir)", () => {
+		const css = buildSidebarCss();
+		expect(css).toMatch(/\.tree-node\.tree-node--changes\s+\.change-text[^{]*{[^}]*flex-direction:\s*column/);
+		expect(css).toMatch(/\.tree-node\.tree-node--changes\s+\.change-dir[^{]*{[^}]*text-overflow:\s*ellipsis/);
 	});
 });
 

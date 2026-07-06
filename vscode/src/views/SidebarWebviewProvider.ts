@@ -20,6 +20,7 @@ import type {
 	TranscriptSource,
 } from "../../../cli/src/Types.js";
 import { isTranscriptSource } from "../../../cli/src/Types.js";
+import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSessionAggregator.js";
 import type { ActiveSessionsProvider } from "../services/ActiveSessionsProvider.js";
 import type { CommitFileInfo } from "../Types.js";
 import { flushExtensionTelemetry } from "../TelemetryActivation.js";
@@ -43,6 +44,7 @@ import type {
 	SidebarOutboundMsg,
 	SidebarState,
 } from "./SidebarMessages.js";
+import { sliceStartTime } from "./TranscriptSliceOrder.js";
 
 /**
  * Closed set of reference `SourceId`s (mirrors `SourceId` in cli Types.ts).
@@ -434,6 +436,7 @@ export class SidebarWebviewProvider
 	private static readonly CONVERSATIONS_REFRESH_INTERVAL_MS = 60_000;
 
 	private view: vscode.WebviewView | undefined;
+	private readonly broadcastTargets = new Set<vscode.Webview>();
 	private statusSub: { dispose(): void } | undefined;
 	private memoriesSub: { dispose(): void } | undefined;
 	private branchSub: { dispose(): void } | undefined;
@@ -571,10 +574,26 @@ export class SidebarWebviewProvider
 		if (cwd) flushExtensionTelemetry(cwd, !vscode.env.isTelemetryEnabled);
 	}
 
+	/**
+	 * Lets a second webview (the Next Memory review panel) receive the same
+	 * host→webview pushes the sidebar gets, so both surfaces render from one
+	 * data stream and never drift. The panel registers on open, unregisters
+	 * in its onDidDispose.
+	 */
+	registerBroadcastTarget(webview: vscode.Webview): void {
+		this.broadcastTargets.add(webview);
+	}
+
+	unregisterBroadcastTarget(webview: vscode.Webview): void {
+		this.broadcastTargets.delete(webview);
+	}
+
 	/** Send a message to the webview client. No-op when the view is not resolved. */
 	postMessage(msg: SidebarInboundMsg): void {
-		if (!this.view) return;
-		void this.view.webview.postMessage(msg);
+		if (this.view) void this.view.webview.postMessage(msg);
+		for (const target of this.broadcastTargets) {
+			void target.postMessage(msg);
+		}
 	}
 
 	/**
@@ -660,7 +679,7 @@ export class SidebarWebviewProvider
 		if (init.currentRepoName) this.pushBranches(init.currentRepoName);
 	}
 
-	private handleOutbound(raw: unknown): void {
+	handleOutbound(raw: unknown): void {
 		if (!isOutbound(raw)) return;
 		const msg: SidebarOutboundMsg = raw;
 		switch (msg.type) {
@@ -1403,14 +1422,23 @@ export class SidebarWebviewProvider
 							updatedAt: "",
 							source: session.source,
 						},
+						// readArchivedSessions always returns sessions with `entries` set
+						// to an array (`{ ...base, entries: sorted.flat() }`), so the `?? []`
+						// fallback arm here is unreachable defensive code.
+						/* v8 ignore start */
 						session.entries ?? [],
+						/* v8 ignore stop */
 					),
 					...(session.source ? { source: session.source } : {}),
 					...(session.transcriptPath ? { transcriptPath: session.transcriptPath } : {}),
 					// Archived turn count for the trailing "N msgs" evidence-row label.
 					// session.entries is the orphan-branch snapshot consumed into this
 					// commit, so its length is the memory's conversation depth.
+					// `entries` is always an array here (see readArchivedSessions), so the
+					// `?? 0` fallback arm is unreachable defensive code.
+					/* v8 ignore start */
 					messageCount: session.entries?.length ?? 0,
+					/* v8 ignore stop */
 				})),
 			);
 
@@ -2026,51 +2054,33 @@ export class SidebarWebviewProvider
 	}
 
 	/**
-	 * Projects the provider's in-memory feeds into a `NextMemorySelection`
-	 * — the three groups (conversations / context / files) filtered to only
-	 * the items that are currently selected (i.e. `isSelected !== false`).
-	 * Called by the `jollimemory.reviewNextMemory` command handler in
-	 * Extension.ts to populate the NextMemoryPreviewPanel.
+	 * Synchronous snapshot of the current Context selection (plans / notes /
+	 * references), for the Next Memory review panel's ticket detection. Reads
+	 * the same source `pushPlans()` already reads.
 	 */
-	public async getNextMemorySelection(): Promise<{
-		conversations: Array<{ title: string }>;
-		context: Array<{ title: string }>;
-		files: Array<{ path: string }>;
-	}> {
-		const conversations: Array<{ title: string }> = [];
-		if (this.deps.activeSessionsProvider) {
-			try {
-				const { items } = await this.deps.activeSessionsProvider.listWithDiagnostics();
-				for (const item of items) {
-					if (item.isSelected) {
-						conversations.push({ title: item.title });
-					}
-				}
-			} catch {
-				// Non-fatal — return empty conversations on provider error.
-			}
-		}
+	getPlansSnapshot(): ReadonlyArray<SerializedTreeItem> {
+		return this.deps.plansProvider?.serialize() ?? [];
+	}
 
-		const context: Array<{ title: string }> = [];
-		if (this.deps.plansProvider) {
-			for (const item of this.deps.plansProvider.serialize()) {
-				if (item.isSelected !== false) {
-					context.push({ title: item.label });
-				}
-			}
-		}
+	/**
+	 * Synchronous snapshot of the current Changes/Files rows (including their
+	 * `isSelected` flag), for the Next Memory review panel's proposed-title and
+	 * diffstat, both computed over the *selected* files. Reads the same source
+	 * `pushChanges()` already reads.
+	 */
+	getFilesSnapshot(): ReadonlyArray<SerializedTreeItem> {
+		return this.deps.filesProvider?.serialize() ?? [];
+	}
 
-		const files: Array<{ path: string }> = [];
-		if (this.deps.filesProvider) {
-			for (const item of this.deps.filesProvider.serialize()) {
-				if (item.isSelected !== false) {
-					// Use `description` (relativePath) when available, fall back to `label` (basename).
-					files.push({ path: item.description ?? item.label });
-				}
-			}
-		}
-
-		return { conversations, context, files };
+	/**
+	 * Snapshot of the current active-conversation list, for the Next Memory
+	 * review panel's token meter. Reads the same source `pushConversations()`
+	 * already reads.
+	 */
+	async getConversationsSnapshot(): Promise<ReadonlyArray<ActiveConversationItem>> {
+		if (!this.deps.activeSessionsProvider) return [];
+		const { items } = await this.deps.activeSessionsProvider.listWithDiagnostics();
+		return items;
 	}
 
 	dispose(): void {
@@ -2103,23 +2113,6 @@ export class SidebarWebviewProvider
 			this.conversationsRefreshTimer = undefined;
 		}
 	}
-}
-
-/**
- * Epoch ms of the first parseable `timestamp` in a session slice, or undefined
- * when no entry carries one. Used to order a session's slices chronologically
- * when reassembling it across a consolidated memory's transcripts — see
- * `readArchivedSessions`.
- */
-function sliceStartTime(
-	entries: ReadonlyArray<TranscriptEntry>,
-): number | undefined {
-	for (const entry of entries) {
-		if (entry.timestamp === undefined) continue;
-		const ms = Date.parse(entry.timestamp);
-		if (Number.isFinite(ms)) return ms;
-	}
-	return undefined;
 }
 
 function isOutbound(x: unknown): x is SidebarOutboundMsg {

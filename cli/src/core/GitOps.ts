@@ -261,25 +261,93 @@ async function capDiffToBudget(
 }
 
 /**
- * Gets diff statistics (files changed, insertions, deletions).
+ * Parses the summary line of `git diff --stat` output, e.g.
+ * "3 files changed, 45 insertions(+), 12 deletions(-)". Empty diffs (no
+ * matching summary line) yield all-zero stats. Shared by every get*DiffStats
+ * helper so the three call sites can never drift in their parsing.
  */
-export async function getDiffStats(fromRef: string, toRef: string, cwd?: string): Promise<DiffStats> {
-	const result = await execGit(["diff", "--stat", `${fromRef}..${toRef}`], cwd);
-
-	// Parse the last line like: "3 files changed, 45 insertions(+), 12 deletions(-)"
-	/* v8 ignore start - defensive: split() always returns at least one element, pop() never returns undefined */
-	const lastLine = result.stdout.split("\n").pop() ?? "";
-	/* v8 ignore stop */
+function parseDiffStatSummary(stdout: string): DiffStats {
+	const lastLine =
+		stdout
+			.split("\n")
+			.filter((l) => l.trim().length > 0)
+			.pop() ?? "";
 	const filesMatch = lastLine.match(/(\d+)\s+files?\s+changed/);
 	const insertMatch = lastLine.match(/(\d+)\s+insertions?/);
 	const deleteMatch = lastLine.match(/(\d+)\s+deletions?/);
-
-	const stats: DiffStats = {
+	return {
 		filesChanged: filesMatch ? Number.parseInt(filesMatch[1], 10) : 0,
 		insertions: insertMatch ? Number.parseInt(insertMatch[1], 10) : 0,
 		deletions: deleteMatch ? Number.parseInt(deleteMatch[1], 10) : 0,
 	};
-	return stats;
+}
+
+/**
+ * Gets diff statistics (files changed, insertions, deletions).
+ */
+export async function getDiffStats(fromRef: string, toRef: string, cwd?: string): Promise<DiffStats> {
+	const result = await execGit(["diff", "--stat", `${fromRef}..${toRef}`], cwd);
+	return parseDiffStatSummary(result.stdout);
+}
+
+/**
+ * Gets diff statistics for the currently staged (index) changes.
+ * Same parsing as {@link getDiffStats}, against `git diff --stat --cached`
+ * instead of two refs — there is no second ref for a not-yet-committed diff.
+ */
+export async function getStagedDiffStats(cwd?: string): Promise<DiffStats> {
+	const result = await execGit(["diff", "--stat", "--cached"], cwd);
+	return parseDiffStatSummary(result.stdout);
+}
+
+/**
+ * Gets working-tree diff statistics for a specific set of paths, against HEAD
+ * (`git diff --stat HEAD -- <paths>`). This captures staged *and* unstaged
+ * changes to those paths — i.e. what a commit of exactly those files would
+ * record — without touching the index, so it is safe to call for a read-only
+ * preview. An empty path list short-circuits to all-zero stats (a bare
+ * `git diff` would otherwise report the whole working tree).
+ *
+ * `git diff HEAD` silently omits untracked files, but a `Commit Memory` of the
+ * selection *stages* them, so their additions must count too — otherwise a
+ * selection of only new files reports "0 files changed" while the title preview
+ * (JolliMemoryBridge.diffForSelection, which diffs untracked files against
+ * /dev/null) shows their content. We add the untracked subset back via
+ * `ls-files --others` + a per-file `diff --no-index --numstat` so both surfaces
+ * agree. Still entirely read-only — the index is never touched.
+ */
+export async function getWorkingTreeDiffStats(relativePaths: ReadonlyArray<string>, cwd?: string): Promise<DiffStats> {
+	if (relativePaths.length === 0) {
+		return { filesChanged: 0, insertions: 0, deletions: 0 };
+	}
+	const [trackedResult, untrackedRaw] = await Promise.all([
+		execGit(["diff", "--stat", "HEAD", "--", ...relativePaths], cwd),
+		execGit(["ls-files", "--others", "--exclude-standard", "--", ...relativePaths], cwd),
+	]);
+	const tracked = parseDiffStatSummary(trackedResult.stdout);
+	const untrackedPaths = untrackedRaw.stdout
+		.split("\n")
+		.map((l) => l.trim())
+		.filter(Boolean);
+	if (untrackedPaths.length === 0) {
+		return tracked;
+	}
+	let untrackedInsertions = 0;
+	for (const p of untrackedPaths) {
+		// `--no-index` exits 1 whenever there is a diff (always, here); execGit
+		// captures stdout regardless of exit code, so read the numstat off it.
+		// numstat first column = added lines ("-" for binary → NaN → skip count).
+		const numstat = await execGit(["diff", "--no-index", "--numstat", "--", "/dev/null", p], cwd);
+		const added = Number.parseInt(numstat.stdout.split("\t")[0] ?? "", 10);
+		if (Number.isFinite(added)) {
+			untrackedInsertions += added;
+		}
+	}
+	return {
+		filesChanged: tracked.filesChanged + untrackedPaths.length,
+		insertions: tracked.insertions + untrackedInsertions,
+		deletions: tracked.deletions,
+	};
 }
 
 /**

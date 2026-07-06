@@ -21,7 +21,9 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { execFileSyncHidden } from "../../../cli/src/util/Subprocess.js";
+import { isAncestor } from "../../../cli/src/core/GitOps.js";
 import { withPlansLock } from "../../../cli/src/core/Locks.js";
+import { toForwardSlash } from "../../../cli/src/core/PathUtils.js";
 import {
 	loadPlansRegistry,
 	savePlansRegistry,
@@ -32,6 +34,7 @@ import {
 	translateToEnglish,
 } from "../../../cli/src/core/Summarizer.js";
 import { getRepoContributors, type RepoContributor } from "../../../cli/src/core/GitOps.js";
+import { resolveSessionTitle } from "../../../cli/src/core/SessionTitleResolver.js";
 import { runWithTrace } from "../../../cli/src/core/TraceContext.js";
 import {
 	getTranscriptHashes as coreGetTranscriptHashes,
@@ -50,7 +53,9 @@ import type {
 	E2eTestScenario,
 	ReferenceCommitRef,
 	SourceId,
+	StoredSession,
 	StoredTranscript,
+	TranscriptSource,
 } from "../../../cli/src/Types.js";
 import { CURRENT_SCHEMA_VERSION } from "../../../cli/src/Types.js";
 import { removeNote, saveNote } from "../core/NoteService.js";
@@ -76,10 +81,7 @@ import {
 	handlePrepareUpdatePr,
 	handleUpdatePr,
 } from "../services/PrCommentService.js";
-import {
-	deriveRepoNameFromUrl,
-	getCanonicalRepoUrl,
-} from "../util/GitRemoteUtils.js";
+import { deriveRepoNameFromUrl, getCanonicalRepoUrl } from "../util/GitRemoteUtils.js";
 import { isWorkerBlockingBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
 import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
@@ -98,22 +100,25 @@ import {
 } from "../services/BranchShareModal.js";
 import { listOrgMembers } from "../services/JolliShareService.js";
 import { BindingChooserWebviewPanel } from "./BindingChooserWebviewPanel.js";
+import { resolveBindingViaChooser } from "./BindingResolver.js";
 import { loadBranchSummaries } from "./BranchSummaryLoader.js";
+import { sliceStartTime } from "./TranscriptSliceOrder.js";
 import { SOURCE_TITLES } from "./SourceLabels.js";
 import { buildSummaryErrorBanner } from "./SummaryErrorBanner.js";
 import {
-	buildAllConversationsSection,
 	buildE2eTestSection,
 	buildHtml,
 	buildJolliRow,
 	buildPlansAndNotesSection,
 	buildRecapSection,
 	buildTopicsSection,
+	type FileRow,
 	renderE2eScenario,
 	renderTopic,
 } from "./SummaryHtmlBuilder.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
 import { buildPrBodyMarkdown, pickPrTitle, wrapWithMarkers } from "../../../cli/src/core/PrDescription.js";
+import { ConversationDetailsPanel } from "./ConversationDetailsPanel.js";
 import { buildPanelTitle, collectSortedTopics, formatActiveProviderLabel } from "./SummaryUtils.js";
 import type { RegenerateContext } from "../../../cli/src/core/RegenerateContext.js";
 import { isSummaryError } from "../../../cli/src/core/SummaryErrorMarker.js";
@@ -265,13 +270,19 @@ type WebviewMessage =
 	| { command: "prepareUpdatePr" }
 	| { command: "updatePr"; title: string; body: string }
 	| { command: "loadTranscriptStats" }
-	| { command: "translatePlan"; slug: string }
-	| { command: "loadAllTranscripts" }
+	| { command: "loadConversations" }
 	| {
-			command: "saveAllTranscripts";
-			entries: ReadonlyArray<TranscriptEntryUpdate>;
+			command: "conversationDetach";
+			hash: string;
+			sessionId: string;
+			source: TranscriptSource;
 	  }
-	| { command: "deleteAllTranscripts" }
+	| {
+			command: "openConversation";
+			sessionId: string;
+			source: TranscriptSource;
+	  }
+	| { command: "translatePlan"; slug: string }
 	| { command: "editRecap"; recap: string }
 	| { command: "generateRecap" }
 	| { command: "regenerateSummary" }
@@ -286,18 +297,16 @@ type WebviewMessage =
 			shareKind?: ShareKind;
 	  }
 	| { command: "shareRemoveRecipient"; email: string; shareKind?: ShareKind }
-	| { command: "openRewrittenCommit"; hash: string };
-
-/** Entry data sent back from the webview on Save All. */
-interface TranscriptEntryUpdate {
-	readonly commitHash: string;
-	readonly sessionId: string;
-	readonly source?: string;
-	readonly originalIndex: number;
-	readonly role: "human" | "assistant";
-	readonly content: string;
-	readonly timestamp?: string;
-}
+	| { command: "openRewrittenCommit"; hash: string }
+	| { command: "loadFiles" }
+	| {
+			command: "openFileDiff";
+			path: string;
+			commitHash: string;
+			status: string;
+			/** Pre-rename path; only present (and only meaningful) when `status` is `"R"`. */
+			oldPath?: string;
+	  };
 
 /** Source of the panel — determines which static slot it occupies. */
 export type SummaryPanelSource = "memory" | "commit" | "kb";
@@ -324,14 +333,23 @@ const FOREIGN_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set([
 	// path, no workspace coupling beyond opening another panel.
 	"openRewrittenCommit",
 	// Detail-panel read paths reached in foreign (cross-repo) view-only
-	// mode. Transcripts (stats + Manage modal) and the rendered Markdown
-	// previews for plans / notes are pure reads against the foreign repo's
-	// FolderStorage — `loadPlanContent` / `loadNoteContent` (the inline
-	// edit form's data loaders) are intentionally NOT here because edits
-	// to a foreign-repo body are disabled in this mode and the edit
-	// affordances are already CSS-hidden in `.foreign-readonly`.
+	// mode. Transcript stats and the rendered Markdown previews for plans /
+	// notes are pure reads against the foreign repo's FolderStorage —
+	// `loadPlanContent` / `loadNoteContent` (the inline edit form's data
+	// loaders) are intentionally NOT here because edits to a foreign-repo
+	// body are disabled in this mode and the edit affordances are already
+	// CSS-hidden in `.foreign-readonly`.
 	"loadTranscriptStats",
-	"loadAllTranscripts",
+	// Read-only conversation-list load (titles + counts) for the inline
+	// Conversations rows. `conversationDetach` is deliberately NOT here — it
+	// rewrites the orphan-branch transcript via `this.bridge` and must not run
+	// against a foreign-origin memory.
+	"loadConversations",
+	// Opens the archived transcript in a read-only ConversationDetailsPanel.
+	// Pure read (same foreign-storage-aware path as loadConversations); opening
+	// a view-only panel touches neither the current workspace nor the orphan
+	// branch, so it is safe against a foreign-origin memory.
+	"openConversation",
 	"previewPlan",
 	"previewNote",
 	// Reference previews / open-in-browser are read-only against the foreign
@@ -341,10 +359,33 @@ const FOREIGN_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set([
 	// which is bound to the *current* workspace and would corrupt it.
 	"previewReference",
 	"openReferenceExternal",
+	// Files panel: read-only. `loadFiles` computes per-file status for a
+	// foreign summary by rendering the off-branch state (it never diffs the
+	// current workspace's git for a foreign commit); `openFileDiff` only
+	// opens a read-only VS Code diff view, and off-branch rows never carry
+	// `data-path` in the first place so the webview cannot emit it for a
+	// foreign or unreachable commit.
+	"loadFiles",
+	"openFileDiff",
 ]);
 
 function isForeignSafeCommand(command: WebviewMessage["command"]): boolean {
 	return FOREIGN_SAFE_COMMANDS.has(command);
+}
+
+/**
+ * Converts a relative path + git status letter into a Files-panel `FileRow`,
+ * splitting the path into `dir`/basename and normalizing separators via
+ * {@link toForwardSlash} (the `StorageProvider.listFiles` / row-rendering
+ * contract — see PathUtils.ts). `oldPath` (rename source) is forwarded
+ * as-is so a rename row's diff can be opened correctly — see
+ * `handleOpenFileDiff` / `jollimemory.openCommitFileChange`.
+ */
+function toFileRow(relativePath: string, status: string, oldPath?: string): FileRow {
+	const path = toForwardSlash(relativePath);
+	const lastSlash = path.lastIndexOf("/");
+	const dir = lastSlash >= 0 ? path.slice(0, lastSlash) : "";
+	return oldPath !== undefined ? { path, dir, status, oldPath: toForwardSlash(oldPath) } : { path, dir, status };
 }
 
 /**
@@ -366,7 +407,10 @@ const REGENERATE_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set
 	"checkPrStatus",
 	"openRewrittenCommit",
 	"loadTranscriptStats",
-	"loadAllTranscripts",
+	// Read-only conversation-list load. `conversationDetach` is excluded — it
+	// writes the orphan branch and would race the in-flight regenerate's
+	// storeSummary, same reason savePlan is excluded.
+	"loadConversations",
 	"loadPlanContent",
 	"loadNoteContent",
 	"previewPlan",
@@ -1007,28 +1051,46 @@ export class SummaryWebviewPanel {
 					);
 				});
 				break;
-			case "loadAllTranscripts":
+			case "loadConversations":
+				this.handleLoadConversations().catch((err: unknown) => {
+					log.warn(
+						"Load conversations failed: %s",
+						err instanceof Error ? err.message : String(err),
+					);
+				});
+				break;
+			case "conversationDetach":
 				this.catchAndShow(
-					this.handleLoadAllTranscripts(),
-					"Load transcripts failed",
+					this.handleConversationDetach(message.hash, message.sessionId, message.source),
+					"Detach conversation failed",
 				);
 				break;
-			case "saveAllTranscripts":
-				this.catchAndShow(
-					this.handleSaveAllTranscripts(message.entries),
-					"Save transcripts failed",
-				);
-				break;
-			case "deleteAllTranscripts":
-				this.catchAndShow(
-					this.handleDeleteAllTranscripts(),
-					"Delete transcripts failed",
-				);
+			case "openConversation":
+				this.handleOpenConversation(message.sessionId, message.source).catch((err: unknown) => {
+					log.warn(
+						"Open conversation failed: %s",
+						err instanceof Error ? err.message : String(err),
+					);
+				});
 				break;
 			case "openRewrittenCommit":
 				this.catchAndShow(
 					this.openRewrittenCommit(message.hash),
 					"Open rewritten commit failed",
+				);
+				break;
+			case "loadFiles":
+				this.handleLoadFiles().catch((err: unknown) => {
+					log.warn(
+						"Load files failed: %s",
+						err instanceof Error ? err.message : String(err),
+					);
+				});
+				break;
+			case "openFileDiff":
+				this.catchAndShow(
+					this.handleOpenFileDiff(message.path, message.commitHash, message.status, message.oldPath),
+					"Open diff failed",
 				);
 				break;
 		}
@@ -1354,6 +1416,15 @@ export class SummaryWebviewPanel {
 		const nonce = randomBytes(16).toString("base64");
 		const autoOpenShare = this.pendingShareOpen;
 		this.pendingShareOpen = false;
+		// Mirrors SidebarWebviewProvider's codicon wiring: the redesign uses
+		// codicons (ship card's codicon-arrow-swap, conversation detach's
+		// codicon-trash, …) that render empty without this stylesheet loaded.
+		// `localResourceRoots: [extensionUri]` (set at panel construction)
+		// already covers `assets/codicons/`, so no options change is needed
+		// there — only the URI computation + threading into buildHtml.
+		const codiconCssUri = this.panel.webview
+			.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, "assets", "codicons", "codicon.css"))
+			.toString();
 		this.panel.webview.html = buildHtml(summary, {
 			transcriptHashSet: this.transcriptHashSet,
 			planTranslateSet: this.planTranslateSet,
@@ -1364,6 +1435,8 @@ export class SummaryWebviewPanel {
 			staleRewrittenInto: this.staleRewrittenInto ?? null,
 			shareDefaultKind: this.shareEntryKind,
 			autoOpenShare,
+			codiconCssUri,
+			cspSource: this.panel.webview.cspSource,
 		});
 	}
 
@@ -1379,16 +1452,15 @@ export class SummaryWebviewPanel {
 	 * stay in sync.
 	 *
 	 * They deliberately do NOT skip while `regenerateInProgress`: these blocks
-	 * (plans/notes, topics, conversations) are disjoint from what the regenerate
-	 * completion re-renders (topics+recap+banner only re-render via
-	 * `summaryRegenerated`; plans/notes + conversations do not). An in-flight
-	 * async write (e.g. a translate dispatched before regenerate started, landing
-	 * mid-regenerate) MUST still post its partial refresh — it is the only path
-	 * that clears the block's loading state (there is no `*Translated` /
-	 * `transcriptsSaved` DOM-restore in the webview; the section rebuild is the
-	 * restore). Skipping it would strand the translate button on "translating" or
-	 * the transcript modal on "Saving…". The regenerating-readonly CSS still hides
-	 * the freshly-rendered block's buttons, so no readonly affordance leaks.
+	 * (plans/notes, topics) are disjoint from what the regenerate completion
+	 * re-renders (topics+recap+banner only re-render via `summaryRegenerated`;
+	 * plans/notes do not). An in-flight async write (e.g. a translate
+	 * dispatched before regenerate started, landing mid-regenerate) MUST still
+	 * post its partial refresh — it is the only path that clears the block's
+	 * loading state (there is no `*Translated` DOM-restore in the webview; the
+	 * section rebuild is the restore). Skipping it would strand the translate
+	 * button on "translating". The regenerating-readonly CSS still hides the
+	 * freshly-rendered block's buttons, so no readonly affordance leaks.
 	 */
 	private get isReadOnlyPanel(): boolean {
 		return !!this.foreignRepoName || !!this.staleRewrittenInto;
@@ -1442,27 +1514,6 @@ export class SummaryWebviewPanel {
 		this.panel.webview.postMessage({
 			command: "topicsUpdated",
 			html: buildTopicsSection(summary, { readOnly: this.isReadOnlyPanel }),
-		});
-	}
-
-	/**
-	 * Re-renders the whole `#allConversationsSection` (private-zone + modal).
-	 * Caller must refresh `this.transcriptHashSet` first (transcript save/delete
-	 * already does). The header "Conversations N turns" row reads the stored
-	 * `conversationTurns` field, not the transcript files, so it is unaffected
-	 * and needs no companion refresh.
-	 */
-	private refreshConversations(summary: CommitSummary): void {
-		if (this.disposed) {
-			return;
-		}
-		this.currentSummary = summary;
-		this.panel.webview.postMessage({
-			command: "conversationsUpdated",
-			html: buildAllConversationsSection(
-				this.transcriptHashSet,
-				!!this.foreignRepoName,
-			),
 		});
 	}
 
@@ -1842,6 +1893,14 @@ export class SummaryWebviewPanel {
 	private async shareContext(kind: ShareKind = "branch"): Promise<ShareModalContext | undefined> {
 		const summary = this.currentSummary;
 		if (!summary) return undefined;
+		// A rewritten/stale commit's memory no longer exists on the branch, so
+		// sharing it would publish a read-only link for an orphaned commit. Only
+		// the `commit` kind is orphaned by a rewrite; branch shares follow live HEAD,
+		// so leave them reachable. Idempotent + one-shot (fires the "rewritten" modal
+		// only on first detection).
+		if (kind === "commit" && !(await this.ensureCommitNotRewritten("share this memory"))) {
+			return undefined;
+		}
 		const config = await loadGlobalConfig();
 		// Branch shares are sourced from the CURRENT git checkout (base..HEAD), so their
 		// label/key follows HEAD. Commit shares are the open memory itself; keep them
@@ -2052,22 +2111,23 @@ export class SummaryWebviewPanel {
 			storeSummary: (s, syncToCloud) => this.bridge.storeSummary(s, syncToCloud),
 			// On 412 binding_required the orchestrator calls this; we open the chooser
 			// and map its outcome back. Chooser UI stays in the panel layer.
-			resolveBinding: async (repo) => {
-				const outcome = await BindingChooserWebviewPanel.openAndAwait({
-					extensionUri: this.extensionUri,
-					baseUrl,
-					apiKey: jolliApiKey,
-					repoUrl: repo,
-					suggestedRepoName: deriveRepoNameFromUrl(repo),
-				});
-				if (outcome.kind === "selected") return { status: "bound" };
-				if (outcome.kind === "anotherOpen") return { status: "anotherOpen" };
-				return { status: "cancelled" };
-			},
+			resolveBinding: (repo) => resolveBindingViaChooser({ extensionUri: this.extensionUri, baseUrl, apiKey: jolliApiKey, repoUrl: repo }),
 		};
 
+		// Re-read the freshest summary from disk right before pushing. Another
+		// surface — a second summary panel for this commit, the Create PR pane's
+		// branch-wide share, or live share — may have pushed this same commit since
+		// this panel captured `currentSummary`, writing a `jolliDocId` back to disk.
+		// Pushing our stale in-memory copy (which lacks that id) would make the
+		// server mint a DUPLICATE article instead of updating in place, and the
+		// subsequent storeSummary would then clobber the good id with the
+		// duplicate's. Reloading guarantees the push carries the latest jolliDocId;
+		// every edit path persists immediately, so disk is always the authority.
+		const fresh = await this.bridge.getSummary(summary.commitHash);
+		const summaryToPush = fresh ?? summary;
+
 		try {
-			const result = await pushSummaryWithAttachments(summary, ctx);
+			const result = await pushSummaryWithAttachments(summaryToPush, ctx);
 
 			// Adopt the pushed/cleaned summary and fully re-render so the PR section
 			// picks up the new plan/note URLs and jolliDocUrl in its markdown body.
@@ -3342,7 +3402,13 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
-		const updatedReferences = (summary.references ?? []).filter(
+		// `summary.references` is guaranteed a non-empty array here: the
+		// `hasReference` guard above returns early when it is missing or empty, so
+		// the `?? []` fallback branch is unreachable.
+		/* v8 ignore start */
+		const existingReferences = summary.references ?? [];
+		/* v8 ignore stop */
+		const updatedReferences = existingReferences.filter(
 			(e) => e.archivedKey !== archivedKey,
 		);
 		const updatedSummary: CommitSummary = {
@@ -3654,164 +3720,357 @@ export class SummaryWebviewPanel {
 		});
 	}
 
-	/** Loads all transcripts for the current summary tree and sends them to the webview. */
-	private async handleLoadAllTranscripts(): Promise<void> {
-		const summary = this.currentSummary;
-		if (!summary) {
-			return;
-		}
-
-		this.panel.webview.postMessage({ command: "transcriptsLoading" });
-
-		const hashesWithTranscripts = [...this.transcriptHashSet];
+	/**
+	 * Reads the archived transcripts and collapses them into per-conversation
+	 * rows for the inline Conversations panel. One row per `source:sessionId`
+	 * (a session may be split across several commits' transcript files — its
+	 * entries are merged, mirroring SidebarWebviewProvider.readArchivedSessions
+	 * / computeMemoryEvidence). The title goes through the SAME
+	 * `resolveSessionTitle` the sidebar uses, so the two surfaces show identical
+	 * labels — that consistency is the point. Titles/counts are only knowable at
+	 * runtime, so the build-time `buildConversationsSection` only renders the
+	 * panel shell + a Loading placeholder; this fills it.
+	 */
+	/**
+	 * Reads the archived transcripts and collapses the same session across
+	 * transcript files into one entry per `source:sessionId`, keeping first-seen
+	 * order and the first-seen owning commit hash (the row's data-hash). The
+	 * "claude" default mirrors the reader's back-compat for a source-less stored
+	 * session (matches getSourceLabel + the detach match key). Shared by the
+	 * Conversations list render (handleLoadConversations) and the row-click
+	 * open (handleOpenConversation) so both agree on session identity + merged
+	 * entries — that consistency is the point.
+	 */
+	private async readGroupedArchivedSessions(): Promise<{
+		order: string[];
+		grouped: Map<
+			string,
+			{ session: StoredSession; hash: string; entries: StoredSession["entries"][number][] }
+		>;
+	}> {
+		const hashes = [...this.transcriptHashSet];
 		const transcriptMap = this.foreignStorage
-			? await coreReadTranscriptsForCommits(
-					hashesWithTranscripts,
-					this.workspaceRoot,
-					this.foreignStorage,
-				)
-			: await this.bridge.readTranscriptsForCommits(hashesWithTranscripts);
+			? await coreReadTranscriptsForCommits(hashes, this.workspaceRoot, this.foreignStorage)
+			: await this.bridge.readTranscriptsForCommits(hashes);
 
-		// Load every archived session regardless of the current Settings enable
-		// flags. Those flags only gate future capture; the transcripts here were
-		// already recorded at commit time. The Manage modal must show — and Save All
-		// must round-trip — all of them, or disabled-source sessions silently vanish
-		// on save (and whole transcripts get deleted when all their sessions are
-		// from a now-disabled source).
-		// Build tagged entries: each entry carries its commit hash, session info, and original index
-		const taggedEntries: Array<{
-			commitHash: string;
-			sessionId: string;
-			source: string;
-			transcriptPath: string;
-			originalIndex: number;
-			role: string;
-			content: string;
-			timestamp: string;
-		}> = [];
-
+		const order: string[] = [];
+		// Collect each session's slices separately first; a consolidated memory's
+		// transcript set is NOT in time order, so appending slices as they arrive
+		// would interleave turns wrong. We sort the slices chronologically below.
+		const collected = new Map<
+			string,
+			{ session: StoredSession; hash: string; parts: StoredSession["entries"][number][][] }
+		>();
 		for (const [commitHash, transcript] of transcriptMap) {
 			for (const session of transcript.sessions) {
-				const source = session.source ?? "claude";
-				for (let i = 0; i < session.entries.length; i++) {
-					const entry = session.entries[i];
-					taggedEntries.push({
-						commitHash,
-						sessionId: session.sessionId,
-						source,
-						transcriptPath: session.transcriptPath ?? "",
-						originalIndex: i,
-						role: entry.role,
-						content: entry.content,
-						timestamp: entry.timestamp ?? "",
-					});
+				const key = `${session.source ?? "claude"}:${session.sessionId}`;
+				const slice = [...(session.entries ?? [])];
+				const existing = collected.get(key);
+				if (existing) {
+					existing.parts.push(slice);
+				} else {
+					order.push(key);
+					collected.set(key, { session, hash: commitHash, parts: [slice] });
 				}
 			}
 		}
 
-		this.panel.webview.postMessage({
-			command: "allTranscriptsLoaded",
-			entries: taggedEntries,
-			totalCommits: hashesWithTranscripts.length,
+		// Reassemble each session by ordering its slices by first-known timestamp,
+		// then flattening — the same sliceStartTime + stable-sort the sidebar's
+		// readArchivedSessions uses, so the inline Conversations list and its
+		// row-click transcript show turns in true chronological order (slices with
+		// no parseable timestamp keep first-seen order via the 0-return comparator).
+		const grouped = new Map<
+			string,
+			{ session: StoredSession; hash: string; entries: StoredSession["entries"][number][] }
+		>();
+		for (const key of order) {
+			const g = collected.get(key) as NonNullable<ReturnType<typeof collected.get>>;
+			const sorted = [...g.parts].sort((a, b) => {
+				const ta = sliceStartTime(a);
+				const tb = sliceStartTime(b);
+				if (ta === undefined || tb === undefined) return 0;
+				return ta - tb;
+			});
+			grouped.set(key, { session: g.session, hash: g.hash, entries: sorted.flat() });
+		}
+		return { order, grouped };
+	}
+
+	private async handleLoadConversations(): Promise<void> {
+		if (this.disposed) {
+			return;
+		}
+		const { order, grouped } = await this.readGroupedArchivedSessions();
+
+		const items = await Promise.all(
+			order.map(async (key) => {
+				const { session, hash, entries } = grouped.get(key) as NonNullable<
+					ReturnType<typeof grouped.get>
+				>;
+				const source: TranscriptSource = session.source ?? "claude";
+				const title = await resolveSessionTitle(
+					{
+						sessionId: session.sessionId,
+						transcriptPath: session.transcriptPath ?? "",
+						updatedAt: "",
+						source,
+					},
+					entries,
+				);
+				return {
+					sessionId: session.sessionId,
+					hash,
+					source,
+					title,
+					messageCount: entries.length,
+				};
+			}),
+		);
+
+		this.panel.webview.postMessage({ command: "conversationsData", items });
+	}
+
+	/**
+	 * Opens one conversation row's transcript in a read-only
+	 * `ConversationDetailsPanel` (archived snapshot off the orphan branch),
+	 * mirroring the sidebar's `kb:openEvidenceConversation`. The detail panel
+	 * only ever shows a COMMITTED memory, so the live cursor-trimmed read is
+	 * wrong here — we hand the panel the merged archived `entries` directly.
+	 *
+	 * Source crosses the webview trust boundary as `unknown`; a spoofed or stale
+	 * `source`/`sessionId` simply misses the grouped map and degrades to a warn
+	 * (no FS write, no workspace coupling — the archived read is view-only).
+	 */
+	private async handleOpenConversation(sessionId: string, source: TranscriptSource): Promise<void> {
+		if (this.disposed || !this.currentSummary) {
+			return;
+		}
+		const { grouped } = await this.readGroupedArchivedSessions();
+		const entry = grouped.get(`${source}:${sessionId}`);
+		if (!entry) {
+			log.warn("Open conversation: session %s (%s) not found in this memory", sessionId, source);
+			return;
+		}
+		const title = await resolveSessionTitle(
+			{
+				sessionId,
+				transcriptPath: entry.session.transcriptPath ?? "",
+				updatedAt: "",
+				source,
+			},
+			entry.entries,
+		);
+		ConversationDetailsPanel.show({
+			extensionUri: this.extensionUri,
+			sessionId,
+			source,
+			transcriptPath: entry.session.transcriptPath ?? "",
+			title,
+			archivedEntries: entry.entries,
+			commitHash: this.currentSummary.commitHash,
 		});
 	}
 
-	/** Saves edited transcripts back to the orphan branch, deleting empty ones. */
-	private async handleSaveAllTranscripts(
-		entries: ReadonlyArray<TranscriptEntryUpdate>,
-	): Promise<void> {
-		// Stale-commit guard: transcript writes are keyed by the panel's
-		// `transcriptHashSet`, which reflects the stale tree after amend.
-		// Letting these go through would mutate the orphaned commit's
-		// `transcripts/<hash>.json` files instead of the new HEAD's — same
-		// silent-mismatch class the summary handlers guard against.
-		if (!(await this.ensureCommitNotRewritten("save transcripts"))) {
+	/**
+	 * Resolves whether the Files panel's diff affordance is usable: the
+	 * commit must live in THIS workspace's git history (not a foreign Memory
+	 * Bank repo) AND be reachable from the checked-out branch. A foreign
+	 * summary's commit hash simply doesn't exist in the current repo's git
+	 * history; a same-repo summary's commit can still be unreachable if the
+	 * user has switched branches since the memory was recorded (amend/rebase
+	 * on another branch, or the summary just belongs to an unmerged branch
+	 * that isn't checked out right now). Either way `vscode.diff` would be
+	 * given a ref git can't resolve, so both fold into the same off-branch
+	 * rendering (`.is-unresolvable` rows + a "check out `<branch>`" hint).
+	 */
+	private async isFilesDiffResolvable(commitHash: string): Promise<boolean> {
+		if (this.foreignRepoName) {
+			return false;
+		}
+		return isAncestor(commitHash, "HEAD", this.workspaceRoot);
+	}
+
+	/**
+	 * Computes per-file status rows for the Files panel and posts them to the
+	 * webview. Mirrors `handleLoadConversations`'s build-time-shell +
+	 * postMessage pattern: `buildFilesPanelShell` renders a "Loading…"
+	 * placeholder synchronously, and this async handler fills it once the
+	 * git diff resolves.
+	 *
+	 * Row source: `bridge.listCommitFiles(commitHash)` — the same
+	 * `git diff-tree -m --first-parent -M --root` projection the Commits-tree
+	 * view uses, so status codes (added/deleted/renamed) are real git truth
+	 * rather than defaulting everything to "M". Falls back to the summary's
+	 * per-topic `filesAffected` (path-only, deduped, status defaulted to "M")
+	 * only when `listCommitFiles` didn't run at all (foreign-repo summary,
+	 * whose commit was never in this workspace's git) or threw — mirroring
+	 * `SidebarWebviewProvider.pushMemoryEvidence`'s identical fallback for the
+	 * sidebar's FILES evidence group. A same-repo commit that legitimately
+	 * changed zero files (e.g. an empty merge commit) is NOT treated as a
+	 * fallback trigger — an empty git-truth result is trusted as-is.
+	 */
+	private async handleLoadFiles(): Promise<void> {
+		if (this.disposed || !this.currentSummary) {
 			return;
 		}
-		// Group entries by commitHash
-		const byCommit = new Map<string, Array<TranscriptEntryUpdate>>();
-		for (const entry of entries) {
-			const list = byCommit.get(entry.commitHash);
-			if (list) {
-				list.push(entry);
-			} else {
-				byCommit.set(entry.commitHash, [entry]);
+		const summary = this.currentSummary;
+		const commitHash = summary.commitHash;
+
+		let rows: FileRow[] = [];
+		let filesResolved = false;
+		if (!this.foreignRepoName) {
+			try {
+				const commitFiles = await this.bridge.listCommitFiles(commitHash);
+				rows = commitFiles.map((f) => toFileRow(f.relativePath, f.statusCode, f.oldPath));
+				filesResolved = true;
+			} catch (err) {
+				log.warn(
+					"Load files: listCommitFiles failed, falling back to topic paths: %s",
+					err instanceof Error ? err.message : String(err),
+				);
+			}
+		}
+		if (!filesResolved) {
+			const seen = new Set<string>();
+			for (const topic of summary.topics ?? []) {
+				for (const relPath of topic.filesAffected ?? []) {
+					if (!seen.has(relPath)) {
+						seen.add(relPath);
+						rows.push(toFileRow(relPath, "M"));
+					}
+				}
 			}
 		}
 
-		// Re-read originals to preserve session metadata (e.g. transcriptPath) that is not round-tripped via the DOM
-		const originalTranscriptMap = await this.bridge.readTranscriptsForCommits([...this.transcriptHashSet]);
+		const offBranch = !(await this.isFilesDiffResolvable(commitHash));
+		if (this.disposed) {
+			return;
+		}
+		this.panel.webview.postMessage({
+			command: "files:rows",
+			rows,
+			offBranch,
+			branch: summary.branch,
+			commitHash,
+		});
+	}
 
-		// Reconstruct StoredTranscript per commit, merging with original session metadata
+	/**
+	 * Opens the file's diff at the memory's commit via the same VS Code
+	 * `git:` URI + `vscode.diff` plumbing `jollimemory.openCommitFileChange`
+	 * uses for the Commits (history) tree — added files show the
+	 * post-commit content, deleted files show the pre-commit content, and
+	 * modified/renamed files diff parent↔commit. Reusing the registered
+	 * command (rather than duplicating its `toGitUri` calls here) keeps the
+	 * diff-opening behavior in exactly one place.
+	 *
+	 * The webview only emits `openFileDiff` for resolvable rows (off-branch
+	 * rows render without `data-path`, so there's nothing to click), but this
+	 * handler doesn't re-check reachability — `jollimemory.openCommitFileChange`
+	 * simply fails to resolve the git URI if the commit isn't reachable,
+	 * which surfaces as VS Code's own "file not found" editor error.
+	 *
+	 * `oldPath` is forwarded straight through for rename rows (`status ===
+	 * "R"`) — `jollimemory.openCommitFileChange` needs it to diff the
+	 * pre-rename blob against the post-rename one. Without it, a rename
+	 * falls through to the "modified" branch keyed on the new path, which
+	 * has no parent-side blob to diff against.
+	 */
+	private async handleOpenFileDiff(
+		path: string,
+		commitHash: string,
+		status: string,
+		oldPath?: string,
+	): Promise<void> {
+		await vscode.commands.executeCommand("jollimemory.openCommitFileChange", {
+			commitHash,
+			relativePath: path,
+			statusCode: status,
+			oldPath,
+		});
+	}
+
+	/**
+	 * Detaches a single conversation (one `source:sessionId`) from this memory:
+	 * rewrites every transcript file that contains that session with the session
+	 * removed, deleting any transcript that becomes empty (and dropping the empty
+	 * ones from `summary.transcripts`). This is the per-session slice of the old
+	 * modal's "Mark as Deleted" flow, reusing `saveTranscriptsBatch` +
+	 * `persistTranscriptIdRemoval`. On success posts `conversationDetached` so the
+	 * webview removes just that row in place.
+	 *
+	 * Matches on the composite `source:sessionId` key — the same identity
+	 * `handleLoadConversations` groups sessions by — not bare `sessionId`.
+	 * Per-source discoverers (Cursor's composerId,
+	 * Copilot's raw SQLite row id, Codex's session-file id, …) mint IDs with no
+	 * cross-tool namespacing, so two different sources can produce the same raw
+	 * sessionId; matching on sessionId alone could silently detach an unrelated
+	 * conversation from a different source.
+	 */
+	private async handleConversationDetach(
+		hash: string,
+		sessionId: string,
+		source: TranscriptSource,
+	): Promise<void> {
+		if (this.foreignRepoName) {
+			this.notifyForeignDenied("conversationDetach");
+			return;
+		}
+		// Same stale-commit guard the transcript save/delete handlers use: writes
+		// are keyed by `transcriptHashSet`, which reflects the orphaned tree after
+		// an amend/rebase — letting them through would mutate the wrong commit's
+		// transcript files.
+		if (!(await this.ensureCommitNotRewritten("detach conversation"))) {
+			return;
+		}
+
+		const transcriptMap = await this.bridge.readTranscriptsForCommits([
+			...this.transcriptHashSet,
+		]);
+
 		const writes: Array<{ hash: string; data: StoredTranscript }> = [];
 		const deletes: Array<string> = [];
+		let removedAny = false;
 
-		// Determine which commits originally had transcripts but now have 0 entries (should delete)
-		for (const commitHash of this.transcriptHashSet) {
-			const commitEntries = byCommit.get(commitHash);
-			if (!commitEntries || commitEntries.length === 0) {
-				deletes.push(commitHash);
+		for (const [commitHash, transcript] of transcriptMap) {
+			const kept = transcript.sessions.filter(
+				(s) => !(s.sessionId === sessionId && (s.source ?? "claude") === source),
+			);
+			if (kept.length === transcript.sessions.length) {
+				// Session not in this transcript — leave it untouched.
 				continue;
 			}
-
-			const originalTranscript = originalTranscriptMap.get(commitHash);
-
-			// Group entries by source:sessionId to rebuild sessions, restoring transcriptPath from originals
-			const sessionMap = new Map<
-				string,
-				{
-					sessionId: string;
-					source: string;
-					transcriptPath?: string;
-					entries: Array<{
-						role: "human" | "assistant";
-						content: string;
-						timestamp?: string;
-					}>;
-				}
-			>();
-			for (const e of commitEntries) {
-				const key = `${e.source ?? "claude"}:${e.sessionId}`;
-				let session = sessionMap.get(key);
-				if (!session) {
-					const originalSession = originalTranscript?.sessions.find(
-						(s) => `${s.source ?? "claude"}:${s.sessionId}` === key,
-					);
-					session = {
-						sessionId: e.sessionId,
-						source: e.source ?? "claude",
-						transcriptPath: originalSession?.transcriptPath,
-						entries: [],
-					};
-					sessionMap.set(key, session);
-				}
-				session.entries.push({
-					role: e.role,
-					content: e.content,
-					...(e.timestamp ? { timestamp: e.timestamp } : {}),
-				});
+			removedAny = true;
+			if (kept.length === 0) {
+				deletes.push(commitHash);
+			} else {
+				writes.push({ hash: commitHash, data: { sessions: kept } });
 			}
-
-			const storedTranscript: StoredTranscript = {
-				sessions: [...sessionMap.values()].map((s) => ({
-					sessionId: s.sessionId,
-					source: s.source as "claude" | "codex",
-					...(s.transcriptPath !== undefined && {
-						transcriptPath: s.transcriptPath,
-					}),
-					entries: s.entries,
-				})),
-			};
-			writes.push({ hash: commitHash, data: storedTranscript });
 		}
 
-		// Summary-first ordering: if any deletes are in scope, persist the
-		// updated `summary.transcripts` BEFORE touching transcript files.
-		// Earlier code ran the file batch first, then the summary update; a
-		// failure in the second step left the half-migrated state "files
-		// gone but summary still references them", letting future
-		// amend/squash/rebase inherit stale IDs. Now the worst case after a
-		// summary-write failure is "no files touched yet" — clean abort.
+		if (!removedAny) {
+			// Nothing matched (already detached / stale row) — ack anyway so the
+			// webview clears the row rather than leaving it stuck.
+			this.panel.webview.postMessage({
+				command: "conversationDetached",
+				hash,
+				sessionId,
+				source,
+			});
+			return;
+		}
+
+		// Summary-first ordering (same rationale as persistTranscriptIdRemoval's
+		// other callers): if any transcript files become empty, drop their IDs from
+		// `summary.transcripts` BEFORE touching files, so a file-batch failure
+		// leaves at worst "no files touched yet" rather than a dangling reference.
+		// Both steps re-throw on failure (rather than swallowing the error) so
+		// the dispatcher's `catchAndShow` wrapper surfaces a visible error toast
+		// instead of leaving `summary.transcripts` and the on-disk transcript
+		// files silently inconsistent with each other. Unlike the old modal's
+		// Save/Delete buttons, this row has no "in progress" UI state to unstick,
+		// so there's no need for a dedicated webview-side failure message.
 		if (deletes.length > 0 && this.currentSummary) {
 			try {
 				this.currentSummary = await this.persistTranscriptIdRemoval(
@@ -3820,134 +4079,33 @@ export class SummaryWebviewPanel {
 				);
 			} catch (err) {
 				log.warn(
-					"Save aborted — could not persist summary.transcripts: %s",
+					"Detach aborted — could not persist summary.transcripts: %s",
 					err instanceof Error ? err.message : String(err),
 				);
-				this.panel.webview.postMessage({
-					command: "transcriptsSaveFailed",
-					message: "Could not update summary. Transcript files were NOT modified.",
-				});
-				return;
-			}
-		}
-
-		if (writes.length > 0 || deletes.length > 0) {
-			try {
-				await this.bridge.saveTranscriptsBatch(writes, deletes);
-			} catch (err) {
-				// File batch failed AFTER summary already updated. Outcomes:
-				//   - `writes` items: user's edits never reached disk →
-				//     they'll see old content on next read; this is a real
-				//     data-fidelity miss the user must know about.
-				//   - `deletes` items: files still on disk but no longer
-				//     referenced by summary (orphan); from the summary's view
-				//     it's "deleted" but the bytes are still there.
-				// We post Failed (not Saved) so the modal's save button can
-				// reset out of its disabled "Saving..." state and the user
-				// can retry. Better to over-alert than silently lose edits.
-				log.warn(
-					"Summary updated but transcript file batch failed: %s",
-					err instanceof Error ? err.message : String(err),
-				);
-				// Deliberately do NOT `refreshTranscriptHashes` here. The summary
-				// was already cleared of the deleted IDs above, so refreshing from
-				// it would empty `transcriptHashSet` and erase the still-on-disk
-				// files from the panel — leaving the user no way to retry the very
-				// delete that just failed. Keeping the pre-operation set (which
-				// still matches what's on disk, since the batch failed) keeps those
-				// files visible and the retry path live. The Failed message unsticks
-				// the modal buttons on its own.
-				this.panel.webview.postMessage({
-					command: "transcriptsSaveFailed",
-					message: "Some transcript files failed to write. See logs.",
-				});
-				return;
-			}
-		}
-
-		// Refresh cache and webview
-		if (this.currentSummary) {
-			await this.refreshTranscriptHashes(this.currentSummary);
-			this.refreshConversations(this.currentSummary);
-		}
-
-		this.panel.webview.postMessage({ command: "transcriptsSaved" });
-	}
-
-	/** Deletes all transcript files for the current summary tree (scoped by operation boundary). */
-	private async handleDeleteAllTranscripts(): Promise<void> {
-		// Stale-commit guard: same rationale as handleSaveAllTranscripts —
-		// `transcriptHashSet` reflects the orphaned tree post-amend, and a
-		// bulk delete against it would wipe transcripts the new HEAD still
-		// references as descendants of its hoisted tree.
-		if (!(await this.ensureCommitNotRewritten("delete transcripts"))) {
-			return;
-		}
-		const hashes = [...this.transcriptHashSet];
-		if (hashes.length === 0) {
-			return;
-		}
-
-		// Summary-first: clear `summary.transcripts` BEFORE the file delete.
-		// Earlier code deleted files first, then updated the summary; a
-		// failure in the second step left the half-migrated state "files
-		// gone but summary still references them", letting future
-		// amend/squash/rebase inherit stale IDs.
-		if (this.currentSummary) {
-			try {
-				this.currentSummary = await this.persistTranscriptIdRemoval(
-					this.currentSummary,
-					new Set(hashes),
-				);
-			} catch (err) {
-				log.warn(
-					"Delete aborted — could not persist summary.transcripts: %s",
-					err instanceof Error ? err.message : String(err),
-				);
-				this.panel.webview.postMessage({
-					command: "transcriptsDeleteFailed",
-					message: "Could not update summary. Transcript files were NOT deleted.",
-				});
-				return;
+				throw new Error("Could not update summary. Transcript files were NOT modified.");
 			}
 		}
 
 		try {
-			await this.bridge.saveTranscriptsBatch([], hashes);
+			await this.bridge.saveTranscriptsBatch(writes, deletes);
 		} catch (err) {
-			// Summary already cleared but the orphan files weren't removed — the
-			// bytes remain on the orphan branch and could resurface via direct
-			// branch inspection or a future `git push`. For privacy-sensitive
-			// "delete my AI conversations" use cases that is NOT what the user
-			// asked for, so the delete MUST stay retryable.
 			log.warn(
-				"Summary cleared but transcript file delete failed: %s",
+				"Summary updated but transcript file batch failed during detach: %s",
 				err instanceof Error ? err.message : String(err),
 			);
-			// Deliberately do NOT `refreshTranscriptHashes` here. `currentSummary`
-			// was cleared above, so refreshing from it would empty
-			// `transcriptHashSet` and erase the still-on-disk files from the panel
-			// — the user would see "delete failed" with an empty list and no way
-			// to retry the orphaned bytes. Keeping the pre-delete set (which still
-			// matches disk, since the delete failed) keeps those conversations
-			// visible so a repeat "Delete all transcripts" re-attempts the file
-			// removal (the already-cleared v5 summary makes that a summary no-op,
-			// so only the file delete is retried). The Failed message unsticks the
-			// modal buttons on its own.
-			this.panel.webview.postMessage({
-				command: "transcriptsDeleteFailed",
-				message: "Some transcript files failed to delete. See logs.",
-			});
-			return;
+			throw new Error("Some transcript files failed to write. See logs.");
 		}
 
-		// Refresh cache and webview
 		if (this.currentSummary) {
 			await this.refreshTranscriptHashes(this.currentSummary);
-			this.refreshConversations(this.currentSummary);
 		}
 
-		this.panel.webview.postMessage({ command: "transcriptsDeleted" });
+		this.panel.webview.postMessage({
+			command: "conversationDetached",
+			hash,
+			sessionId,
+			source,
+		});
 	}
 
 	/**

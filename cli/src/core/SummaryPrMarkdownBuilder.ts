@@ -55,7 +55,11 @@ export function buildPrMarkdown(summary: CommitSummary): string {
 	// Jolli Memory URL
 	const memoryDocUrl = summary.jolliDocUrl;
 	if (memoryDocUrl) {
-		lines.push("", `## Jolli Memory`, "", `${memoryDocUrl}`);
+		// Emit a markdown link, not a bare URL: GitHub autolinks bare URLs but the
+		// Create-PR webview preview (renderPrBodyMarkdown) only linkifies [text](url),
+		// so a bare URL rendered as dead plain text there. This also matches the
+		// aggregate builder and the memory-detail exporter, which already link it.
+		lines.push("", `## Jolli Memory`, "", `[${memoryDocUrl}](${memoryDocUrl})`);
 	}
 
 	pushPlansAndNotesSection(lines, summary, { includeReferences: true });
