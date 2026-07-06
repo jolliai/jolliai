@@ -857,12 +857,22 @@ class CommitsPanel(
     }
 
     /** Share a memory to the user's Jolli Space (row hover action). */
-    private fun shareMemory(@Suppress("UNUSED_PARAMETER") commit: CommitSummaryBrief) {
-        com.intellij.openapi.ui.Messages.showInfoMessage(
-            project,
-            "Share — push this memory to your Jolli Space (action to be wired).",
-            "Share",
-        )
+    /** Opens the read-only share dialog for this memory (single-commit share). */
+    private fun shareMemory(commit: CommitSummaryBrief) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val summary = service.getSummary(commit.hash)
+            SwingUtilities.invokeLater {
+                if (summary != null) {
+                    ShareLauncher.openForCommit(project, summary)
+                } else {
+                    com.intellij.openapi.ui.Messages.showInfoMessage(
+                        project,
+                        "No summary found for ${commit.hash.take(8)}",
+                        "Share",
+                    )
+                }
+            }
+        }
     }
 
     /** Toggles the expand/collapse state of a commit's memory detail. */

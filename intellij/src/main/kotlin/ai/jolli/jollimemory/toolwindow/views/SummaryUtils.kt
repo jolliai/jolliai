@@ -142,6 +142,16 @@ object SummaryUtils {
         return planTitle
     }
 
+    /** Builds the note document title for pushing to Jolli Space. */
+    fun buildNotePushTitle(@Suppress("UNUSED_PARAMETER") summary: CommitSummary, noteTitle: String): String {
+        return noteTitle
+    }
+
+    /** Path-safe branch identity for the push `relativePath` field (mirrors buildBranchRelativePath). */
+    fun buildBranchRelativePath(branch: String?): String {
+        return ai.jolli.jollimemory.bridge.GitRemoteUtils.sanitizeBranchSlug(branch)
+    }
+
     // ── Topic sorting / grouping ───────────────────────────────────────────
 
     /** Extended TopicWithDate wrapper for display. */
