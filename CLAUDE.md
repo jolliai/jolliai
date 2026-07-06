@@ -128,7 +128,7 @@ Each non-Claude registrar is gated by its host's existing detector (`isCursorIns
 
 ### MCP tool set and CLI↔MCP result parity
 
-The `jolli mcp` server exposes four tools: `search`, `recall`, `get_decision_timeline`, `list_branches`. There is no `load_commits` tool.
+The `jolli mcp` server exposes nine tools (see `TOOL_DEFINITIONS` in [`cli/src/mcp/McpServer.ts`](cli/src/mcp/McpServer.ts)): four read tools `search`, `recall`, `get_decision_timeline`, `list_branches`; `get_pr_description` (build a PR title + body from the current branch) and `queue_status` (is summary generation still draining — call before `get_pr_description`); and three Jolli Space tools `bind_space`, `list_spaces`, `push_memory`. There is no `load_commits` tool.
 
 `recall` (MCP) and `jolli recall --format json` (CLI) both call `resolveRecall()` ([`cli/src/core/RecallResolver.ts`](cli/src/core/RecallResolver.ts)), so they return the identical `type`-tagged union (`recall` | `catalog` | `error`), including catalog fuzzy-match on an unrecognized branch.
 

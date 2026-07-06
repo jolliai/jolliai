@@ -9,6 +9,7 @@ Turns your AI coding sessions into structured development documentation attached
 **What it does:**
 
 - **Automatic capture** — after each commit, reads your AI transcripts + diff, calls the LLM, and stores a structured summary alongside the commit. The commit returns instantly; the summary is generated in a detached background process (~10–20 s).
+- **Catch up on existing history** — `jolli backfill` creates memories for commits you made before enabling Jolli.
 - **Seven supported agents** — Claude Code, Codex, Gemini CLI, OpenCode, Cursor IDE (Composer), GitHub Copilot CLI, and VS Code Copilot Chat.
 - **Dual storage** — every memory is written to a dedicated git orphan branch (`jollimemory/summaries/v3`, the source of truth) **and** to a human-browsable Memory Bank folder on disk (canonical JSON + Markdown).
 - **Worktree-aware** — hooks and summaries work across `git worktree` checkouts.
@@ -119,6 +120,7 @@ Installs all hooks required for automatic summarization:
 - **Git prepare-commit-msg hook** — detects squash operations
 - **Gemini AfterAgent hook** (if Gemini CLI detected) — tracks Gemini sessions
 - **MCP server registration** — adds the JolliMemory MCP server to your project's `.mcp.json` so Claude Code can query your memories (see [`jolli mcp`](#jolli-mcp))
+- **Skill preference** — teaches your AI agent to reach for Jolli by default when creating a PR, searching past work, or recalling a branch.
 
 ```bash
 jolli enable
@@ -244,7 +246,7 @@ Available flags: `--limit` (max hits, default 20), `--branch` (restrict to one b
 
 ### `jolli mcp`
 
-Starts a Model Context Protocol (MCP) server over stdio so AI agents can query your memories directly. It exposes five tools: **search** (full-text search over your historical decisions and implementations), **recall** (load a branch's complete context), **get_decision_timeline** (trace how one decision evolved across commits), **list_branches** (catalog of branches that have memories), and **get_pr_description** (build a PR title and description from a branch's memories).
+Starts a Model Context Protocol (MCP) server over stdio so AI agents can query your memories directly. It exposes nine tools: **search** (full-text search over your historical decisions and implementations), **recall** (load a branch's complete context), **get_decision_timeline** (trace how one decision evolved across commits), **list_branches** (catalog of branches that have memories), **get_pr_description** (build a PR title and description from a branch's memories), **queue_status** (report whether summary generation is still in progress — call before building a PR so fresh commits are included), **bind_space** (bind this repo to a Jolli Space), **list_spaces** (list the Jolli Spaces you can bind to), and **push_memory** (push a branch's memories to the bound Jolli Space as articles).
 
 ```bash
 # Start the server (normally launched by your agent, not by hand)
@@ -379,6 +381,24 @@ jolli heal-folder --cwd /path/to/repo
 ```
 
 Healing is also exposed by the editor extensions; running the CLI form is equivalent.
+
+### `jolli backfill`
+
+Creates memories for commits you made before enabling Jolli, so your existing history shows up too. Each commit is matched to the Claude transcripts recorded around it.
+
+```bash
+# Catch up on your recent commits (last 20 by default)
+jolli backfill
+
+# Go further back, or cover everything
+jolli backfill --last 50
+jolli backfill --all
+
+# See what would be matched, without creating anything
+jolli backfill --dry-run
+```
+
+Claude transcripts for now. Requires an API key (same as summary generation). The editor extensions offer to run this for you when you enable Jolli in a repo that already has commits.
 
 ## Session Context Recall
 

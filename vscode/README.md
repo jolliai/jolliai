@@ -32,7 +32,7 @@ On a fresh install, the sidebar opens to an **onboarding panel** that walks you 
 1. Click the Jolli icon in the activity bar to open the sidebar — git hooks auto-install in the background on first activation (unless you've previously clicked **Disable** in this repo).
 2. In the onboarding panel, either click **Sign In / Sign Up** (browser OAuth) or **Configure API Key** to paste an Anthropic API key inline. Authentication is what summary generation needs — without it, hooks still capture session metadata, but the LLM call at commit time has nothing to authenticate with. (You can also open the **Settings** gear later.)
 3. Restart any active AI agent session (Claude Code / Codex / Gemini / OpenCode / Cursor / Copilot) so hooks take effect.
-4. Make a commit as usual — the summary appears in the **Commits** section of the Branch tab within ~10-20 seconds.
+4. Make a commit as usual — the summary appears in the **Memories** section of the Current Branch view within ~10-20 seconds.
 
 ---
 
@@ -40,13 +40,15 @@ On a fresh install, the sidebar opens to an **onboarding panel** that walks you 
 
 After each commit, Jolli Memory reads your selected AI session transcripts and the code diff, calls the LLM to produce a structured summary, and stores it alongside the commit silently in the background. The VS Code extension surfaces everything in a sidebar so you can manage plans, stage files, write AI-assisted commit messages, review summaries, and share them, without leaving your editor.
 
-### The sidebar has three tabs
+### The sidebar
 
-| Tab | What it shows |
+The panel leads with a segmented **Current Branch / Memory Bank** switch under the "JOLLI MEMORY" title bar, plus a `repo / branch` breadcrumb you can click to jump between repos and branches. Two actions live in the title bar itself — **Settings** (`$(gear)`) and **Status** (`$(pulse)`); Status opens as an overlay rather than a third tab. This is two primary views and one overlay:
+
+| View | What it shows |
 | -- | -- |
-| **Branch tab** *(labeled with the current branch name, e.g. `feature/auth`)* | Four collapsible sections for the current branch: **Conversations** (recent AI coding sessions across every supported tool, with title / agent / message count; the list polls in the background so it stays current), **Plans & Notes** (auto-detected Claude Code plans plus your own text/Markdown notes), **Changes** (all changed files with checkboxes to stage/unstage, plus an exclude filter), and **Commits** (every commit on the current branch not yet in main; click the eye icon (`$(eye)`) to open the full AI summary). Every section has a **Select / Deselect All** toggle, and per-item checkboxes — unchecked items are excluded from the next commit's memory and the exclusion sticks across commits and restarts. |
-| **MEMORY BANK tab** | A cross-branch / cross-repo view of every stored memory on disk. Toggle between **Tree** (folder structure by repo / branch) and **Timeline** (chronological by date) modes from the toolbar, and search across everything. The same data is mirrored on the orphan branch — this tab reads from the dual-written Memory Bank folder, and cross-repo browsing routes reads through the folder layer so opening a memory from a sibling repo never invokes git plumbing in the wrong working tree. |
-| **Status tab** *(icon button on the right)* | Whether Jolli Memory is enabled, active AI agent sessions (Claude, Codex, Gemini, OpenCode, Cursor, Copilot CLI, Copilot Chat), the **AI Summary Provider** row showing what the next commit will actually use (Anthropic / Anthropic (env) / Jolli — clicking it opens Settings), the API-key warning when neither provider has credentials, and per-integration "detected but disabled" rows. The toolbar holds **Settings** (`$(gear)`), either **Sign In to Jolli** or **Sign Out of Jolli** (mutually exclusive based on auth state), **Disable Jolli Memory** (`$(circle-slash)`), and **Refresh** (`$(refresh)`). When the extension is currently disabled, the Status tab is replaced by a single **Enable Jolli Memory** (`$(circle-filled)`) button. A small busy indicator appears while a queue worker is running. |
+| **Current Branch** *(breadcrumb shows the current `repo / branch`)* | Four collapsible sections for the current branch: **Conversations** (recent AI coding sessions across every supported tool, with title / agent / message count; the list polls in the background so it stays current), **Plans & Notes** (auto-detected Claude Code plans plus your own text/Markdown notes), **Changes** (all changed files with checkboxes to stage/unstage, plus an exclude filter), and **Memories** (every commit on the current branch not yet in main; click a row to open the full AI summary, or expand it in place to see the **evidence** — the files and conversations behind it, grouped by type). Every section has a **Select / Deselect All** toggle, and per-item checkboxes — unchecked items are excluded from the next commit's memory and the exclusion sticks across commits and restarts. |
+| **Memory Bank** | A cross-branch / cross-repo view of every stored memory on disk, with the repo you're working in pinned to the top. Toggle between **Tree** (folder structure by repo / branch) and **Timeline** (chronological by date) modes from the toolbar, and search across everything. The same data is mirrored on the orphan branch — this view reads from the dual-written Memory Bank folder, and cross-repo browsing routes reads through the folder layer so opening a memory from a sibling repo never invokes git plumbing in the wrong working tree. |
+| **Status overlay** *(pulse icon in the title bar)* | Whether Jolli Memory is enabled, active AI agent sessions (Claude, Codex, Gemini, OpenCode, Cursor, Copilot CLI, Copilot Chat), the **AI Summary Provider** row showing what the next commit will actually use (Anthropic / Anthropic (env) / Jolli — clicking it opens Settings), the API-key warning when neither provider has credentials, and per-integration "detected but disabled" rows. The overlay's own toolbar holds either **Sign In to Jolli** or **Sign Out of Jolli** (mutually exclusive based on auth state), **Disable Jolli Memory** (`$(circle-slash)`), and **Refresh** (`$(refresh)`). When the extension is currently disabled, an **Enable Jolli Memory** (`$(circle-filled)`) button is shown instead. A small busy indicator appears while a queue worker is running. |
 
 ---
 
@@ -129,7 +131,7 @@ Click **Share in Jolli** to publish the summary to your team's Jolli Space kno
 
 Plans and notes (both Markdown files and text snippets) are each uploaded as separate articles first, so their URLs appear in the summary. The summary itself is published last. 
 
-Requires a Jolli API Key configured via Settings (or auto-filled by **Sign In to Jolli** from the Status tab toolbar).
+Requires a Jolli API Key configured via Settings (or auto-filled by **Sign In to Jolli** from the Status overlay).
 
 ### Local copies of memories
 
@@ -204,11 +206,11 @@ Tab toolbar actions (when the Memory Bank tab is active):
 * **Open in Claude Code** — launches Claude Code with the recall prompt pre-loaded (requires Claude Code installed).
 * **View Memory** — opens the full Summary Webview.
 
-The legacy "Memories" panel and its **Search / Refresh / Open Settings / Enable / Disable** toolbar items have moved: search and reset live on the Memory Bank tab itself, while **Open Settings** and **Enable / Disable** moved to the **Status tab** toolbar. The old in-extension **Export to Markdown** action has been retired — Memory Bank already keeps a Markdown copy of every memory on disk in your `localFolder`, so an explicit "export" step is redundant; if you still want a flat `.md` dump for a single branch, run `jolli export` from the CLI (writes to `~/Documents/jollimemory/`).
+The legacy "Memories" panel and its **Search / Refresh / Open Settings / Enable / Disable** toolbar items have moved: search and reset live on the Memory Bank view itself, **Open Settings** is now in the view's title bar, and **Enable / Disable** moved to the **Status overlay**. The old in-extension **Export to Markdown** action has been retired — Memory Bank already keeps a Markdown copy of every memory on disk in your `localFolder`, so an explicit "export" step is redundant; if you still want a flat `.md` dump for a single branch, run `jolli export` from the CLI (writes to `~/Documents/jollimemory/`).
 
 ### Sign In to Jolli
 
-From the **Status tab** toolbar, click **Sign In to Jolli** to authenticate with a Jolli account via browser OAuth:
+From the **Status overlay**, click **Sign In to Jolli** to authenticate with a Jolli account via browser OAuth:
 
 1. VS Code opens your default browser at the Jolli sign-in page.
 2. After you sign in (or sign up), the browser tab closes automatically.
@@ -220,7 +222,7 @@ Click **Sign Out of Jolli** from the same toolbar to clear the stored credential
 
 ### Settings Panel
 
-Click the gear icon (`$(gear)`) in the Status tab toolbar (or any **Open Settings** action — there's also `Jolli Memory: Open Settings` in the command palette) to open a dedicated Settings webview. The layout is split into five tabs so each task is one-click reachable:
+Click the gear icon (`$(gear)`) in the view's title bar (or any **Open Settings** action — there's also `Jolli Memory: Open Settings` in the command palette) to open a dedicated Settings webview. The layout is split into five tabs so each task is one-click reachable:
 
 | Tab | What it controls |
 | -- | -- |
@@ -242,9 +244,9 @@ The **Changes** section in the Branch tab mirrors VS Code's Source Control view 
 * **Discard Selected Changes** (toolbar, `$(discard)`) — reverts unstaged changes for every checked file after a confirmation prompt.
 * **Exclude filter** — files matching the `excludePatterns` globs (configured in Settings) are hidden and auto-unstaged if they were previously staged.
 
-### Commits section (Branch tab)
+### Memories section (Current Branch view)
 
-The **Commits** section in the Branch tab lists every commit on the current branch that isn't yet in main. Click the eye icon (`$(eye)`) on any commit to open its Summary Webview.
+The **Memories** section in the Current Branch view lists every commit on the current branch that isn't yet in main. Click a row to open its Summary Webview, or expand it in place to see the evidence (files and conversations) behind the memory.
 
 * **Select / Deselect All** (`$(check-all)`) — choose which commits to squash.
 * **Squash** (`$(git-merge)`) — merges selected commits with an LLM-generated message (see above).
@@ -255,13 +257,13 @@ Once your branch is merged into main, the section switches to a **merged (read-o
 
 ### Create & Update PR
 
-At the bottom of every memory panel, Jolli Memory can create or update a GitHub Pull Request:
+Jolli Memory opens a dedicated **Create PR** view where you can review and edit the generated PR before it's opened:
 
-* **Create PR**: pre-fills the PR description with a structured summary: Jolli Memory URL → Plans → E2E Test Guide → Topics (Why → Decisions → What → Future Enhancements → Files). All topic bodies are folded by default so the PR stays scannable.
-* **Update PR**: refreshes the summary section in place (using `<!-- jollimemory-summary -->` markers) without affecting any text you've added manually.
-* **Multi-commit PRs**: when the branch has more than one commit, the PR description aggregates every commit's memory into a single roll-up — Plans, E2E Test Guide, then a Topics section that combines all commits with each topic folded by default.
+* **Create PR**: pre-fills the description from your branch's memories (Plans, an E2E Test Guide, and a topic-by-topic summary, all folded so it stays scannable). Edit the title and body before you open it, and copy the body with one click. Creating the PR also shares the branch's memories with your team.
+* **Update PR**: once the PR exists, the same view becomes **Update PR** and refreshes the summary as you add more work — without touching anything you wrote by hand. The button dims when there's nothing new to push.
+* **Multi-commit PRs**: when a branch has several commits, the description rolls all of them up into one.
 
-Requires the `gh` CLI to be installed and authenticated.
+Jolli won't overwrite commits that only exist on the remote. Requires the `gh` CLI to be installed and authenticated.
 
 ### Memory Bank
 
@@ -288,7 +290,7 @@ If the current branch has no memories, the command shows a catalog of branches t
 
 ## Configuration
 
-Most settings live behind the gear icon on the **Status tab** toolbar. `authToken` is written automatically by **Sign In to Jolli** (also on the Status tab toolbar), and `logLevel` is editable via the `jolli configure` CLI. All settings are stored globally in `~/.jolli/jollimemory/config.json` and shared across every project on your machine:
+Most settings live behind the gear icon in the view's title bar. `authToken` is written automatically by **Sign In to Jolli** (in the Status overlay), and `logLevel` is editable via the `jolli configure` CLI. All settings are stored globally in `~/.jolli/jollimemory/config.json` and shared across every project on your machine:
 
 | Field | Type | Default | Description |
 | -- | -- | -- | -- |

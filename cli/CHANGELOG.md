@@ -1,6 +1,12 @@
 # Changelog
 
-<!-- Last synced commit: 54473e60 | 2026-06-29 -->
+<!-- Last synced commit: 38920160 | 2026-07-06 -->
+
+## 0.99.5
+
+- **Catch up on commits you made before Jolli** — the new `jolli backfill` command creates memories for your existing commit history, so your older work shows up too. (Claude transcripts for now.)
+- **Your agent picks the right skill on its own** — after `jolli enable`, your AI agent knows to use Jolli for creating PRs, searching past work, and recalling a branch — no need to spell it out each time.
+- Bug fixes
 
 ## 0.99.4
 
