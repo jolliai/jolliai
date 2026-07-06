@@ -639,14 +639,29 @@ val sb = StringBuilder()
         val mergeBaseRaw = g.exec("merge-base", "HEAD", baseRef)?.trim()
         val mergeBase = mergeBaseRaw?.takeIf { it.isNotBlank() }
 
-        // If merge-base equals HEAD, we're on main or branch is fully merged.
-        // When on main with a remote, show unpushed commits (origin/main..HEAD).
-        // When on main with no remote or on a fresh branch with no own commits,
-        // return empty — matches VS Code behavior where Commits panel clears on new branch.
-        val range = when {
+        // If merge-base equals HEAD, we're on main or the branch is fully merged.
+        // - With a remote (baseRef = origin/*): show commits not on the remote
+        //   (origin/main..HEAD) — empty when fully synced.
+        // - Without a remote (baseRef = main / upstream/*): enter merged mode and
+        //   list the user's own commits from the reflog creation point, filtered by
+        //   author. This mirrors VS Code listBranchCommits, which shows committed
+        //   memories on main even in a repo with no remote (previously IntelliJ
+        //   returned an empty panel here).
+        var authorFilter: String? = null
+        val range: String? = when {
             mergeBase == null -> null // No common ancestor
             mergeBase == headHash && baseRef.startsWith("origin/") -> "$baseRef..HEAD"
-            mergeBase == headHash -> return emptyList() // On main or fresh branch — no branch-specific commits
+            mergeBase == headHash -> {
+                val branch = g.getCurrentBranch()?.trim()
+                val merged = if (branch.isNullOrBlank()) null else g.resolveMergedHistory(branch)
+                // A branch/main that never authored anything of its own (only
+                // creation + rebase/reset) has no commits to show — clear the panel.
+                if (merged == null || !merged.hasOwnCommit) return emptyList()
+                // Merged mode is author-scoped; without a user.name the filter can't
+                // be applied, so degrade to the empty panel rather than over-listing.
+                authorFilter = g.getCurrentUserName() ?: return emptyList()
+                "${merged.base}..HEAD"
+            }
             else -> {
                 // Narrow the fork point to the branch's true reflog creation point,
                 // so a branch cut from a feature/release branch — including a
@@ -661,9 +676,11 @@ val sb = StringBuilder()
             }
         }
 
-        // Get commits with full metadata
+        // Get commits with full metadata. In merged mode an --author filter scopes
+        // the range to the current user's own commits (matching VS Code).
         val logArgs = if (range != null) {
-            arrayOf("log", range, "--format=%H%x00%s%x00%an%x00%ae%x00%aI%x00%x00", "--no-merges")
+            val base = arrayOf("log", range, "--format=%H%x00%s%x00%an%x00%ae%x00%aI%x00%x00", "--no-merges")
+            if (authorFilter != null) base + "--author=$authorFilter" else base
         } else {
             arrayOf("log", "--format=%H%x00%s%x00%an%x00%ae%x00%aI%x00%x00", "--no-merges", "-20")
         }

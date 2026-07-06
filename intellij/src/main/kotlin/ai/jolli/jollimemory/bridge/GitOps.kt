@@ -331,6 +331,53 @@ class GitOps(private val projectDir: String) {
         return lines.last().substringBefore(" ").takeIf { it.isNotBlank() }
     }
 
+    /** Reflog-derived merged-history result: log-range base + whether the branch authored anything. */
+    data class MergedHistory(val base: String, val hasOwnCommit: Boolean)
+
+    /**
+     * Resolves what the merged-mode history view needs from [branch]'s reflog: the
+     * log-range base (where the branch was created) and whether the branch ever
+     * committed anything of its own.
+     *
+     * Used when HEAD is fully contained in the mainline (`merge-base HEAD base ==
+     * HEAD`) — e.g. on `main` in a repo with no remote — so the panel can still show
+     * the user's own commits (`<base>..HEAD --author=<you>`) instead of an empty
+     * list. [hasOwnCommit] keys on a `commit` reflog op: a branch showing only
+     * creation + rebase/reset/checkout never authored anything itself, so the caller
+     * shows an empty panel rather than re-listing commits that belong to the base.
+     *
+     * Returns null for detached HEAD or when the reflog is unavailable/expired —
+     * same graceful-degradation boundary [findBranchCreationPoint] uses. Mirrors the
+     * VS Code bridge's resolveMergedHistory.
+     */
+    fun resolveMergedHistory(branch: String): MergedHistory? {
+        if (branch == "HEAD") return null
+        val reflog = exec("reflog", "show", branch, "--format=%H %gs") ?: return null
+        val lines = reflog.lines().filter { it.isNotBlank() }
+        if (lines.isEmpty()) return null
+
+        // Base: the explicit "branch: Created from …" entry if present (scan from
+        // oldest), else the oldest surviving entry — the same best-effort fallback
+        // the non-strict findBranchCreationPoint uses.
+        var base: String? = null
+        for (i in lines.indices.reversed()) {
+            if (lines[i].contains("branch: Created from")) {
+                base = lines[i].substringBefore(" ").takeIf { it.isNotBlank() }
+                break
+            }
+        }
+        if (base == null) base = lines.last().substringBefore(" ").takeIf { it.isNotBlank() }
+        val resolvedBase = base ?: return null
+
+        // Own commit = a `commit` reflog op ("commit:", "commit (amend):",
+        // "commit (initial):"). The subject follows the leading "<hash> ".
+        val hasOwnCommit = lines.any { Regex("^[0-9a-f]+ commit\\b").containsMatchIn(it) }
+        return MergedHistory(resolvedBase, hasOwnCommit)
+    }
+
+    /** Current `git config user.name` (for the merged-mode `--author` filter); null when unset/blank. */
+    fun getCurrentUserName(): String? = exec("config", "user.name")?.trim()?.takeIf { it.isNotBlank() }
+
     /**
      * Resolves the base commit that "own commits" on [branch] are measured from.
      *
