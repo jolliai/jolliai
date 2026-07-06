@@ -265,6 +265,45 @@ describe("SidebarWebviewProvider", () => {
 		expect(executeCommand).not.toHaveBeenCalled();
 	});
 
+	it("allows the built-in `vscode.openFolder` command argless (native folder picker)", () => {
+		// The sidebar's "open a Memory Bank folder" affordance dispatches
+		// { command: 'vscode.openFolder' } with no args to raise the native picker.
+		// args === undefined short-circuits the allow check (left side of the ||).
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "command",
+			command: "vscode.openFolder",
+		} as unknown as SidebarOutboundMsg);
+		expect(executeCommand).toHaveBeenCalledWith("vscode.openFolder");
+	});
+
+	it("allows `vscode.openFolder` with an empty args array (right side of the || check)", () => {
+		// args is present ([] ≠ undefined) so the check falls through to
+		// args.length === 0 — an empty array is still argless, so it is allowed.
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "command",
+			command: "vscode.openFolder",
+			args: [],
+		} as unknown as SidebarOutboundMsg);
+		expect(executeCommand).toHaveBeenCalledWith("vscode.openFolder");
+	});
+
+	it("blocks a `vscode.openFolder` command carrying a folder URI arg", () => {
+		// A webview-supplied folder URI would open an arbitrary folder as a trusted
+		// workspace — any args at all are dropped for vscode.openFolder.
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "command",
+			command: "vscode.openFolder",
+			args: ["file:///etc"],
+		} as unknown as SidebarOutboundMsg);
+		expect(executeCommand).not.toHaveBeenCalled();
+	});
+
 	it("ignores malformed outbound messages without throwing", () => {
 		const view = makeMockView();
 		provider.resolveWebviewView(view as unknown as never);
@@ -5680,5 +5719,68 @@ describe("SidebarWebviewProvider — back-fill cold-start handlers", () => {
 			repoHasMemories: true,
 			backfillDismissed: false,
 		});
+	});
+});
+
+describe("broadcast targets", () => {
+	function makeProvider(extraDeps: Record<string, unknown> = {}): SidebarWebviewProvider {
+		return new SidebarWebviewProvider({
+			executeCommand: vi.fn() as never,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			...extraDeps,
+		} as never);
+	}
+
+	it("posts pushed messages to registered broadcast targets in addition to the sidebar view", () => {
+		const provider = makeProvider();
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+
+		const extraPosted: unknown[] = [];
+		const extraWebview = {
+			postMessage: (m: unknown) => {
+				extraPosted.push(m);
+				return Promise.resolve(true);
+			},
+		};
+		provider.registerBroadcastTarget(extraWebview as never);
+
+		provider.postMessage({ type: "branch:branchName", name: "main", detached: false });
+
+		expect(extraPosted).toContainEqual({ type: "branch:branchName", name: "main", detached: false });
+		// Still reaches the sidebar view too.
+		expect(view.webview.postMessage).toHaveBeenCalledWith({ type: "branch:branchName", name: "main", detached: false });
+	});
+
+	it("stops posting to a target after it is unregistered", () => {
+		const provider = makeProvider();
+		const extraPosted: unknown[] = [];
+		const extraWebview = {
+			postMessage: (m: unknown) => {
+				extraPosted.push(m);
+				return Promise.resolve(true);
+			},
+		};
+		provider.registerBroadcastTarget(extraWebview as never);
+		provider.unregisterBroadcastTarget(extraWebview as never);
+
+		provider.postMessage({ type: "branch:branchName", name: "main", detached: false });
+
+		expect(extraPosted).toEqual([]);
+	});
+
+	it("handleOutbound is callable directly and dispatches a toggle to the matching applyXCheckbox dep", () => {
+		const applyPlanCheckbox = vi.fn();
+		const provider = makeProvider({ applyPlanCheckbox });
+		provider.handleOutbound({ type: "branch:togglePlanSelection", planId: "p1", selected: false });
+		expect(applyPlanCheckbox).toHaveBeenCalledWith("p1", false);
 	});
 });

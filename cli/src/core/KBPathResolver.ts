@@ -308,23 +308,69 @@ export function extractRepoName(projectPath: string): string {
 	return basename(projectPath) || "unknown";
 }
 
+// The plumbing commands this helper runs (`config --get`, `rev-parse`,
+// `remote get-url`) are local and near-instant; the timeout exists only to
+// bound a genuinely hung git (e.g. one blocked on a credential prompt), never
+// to cap normal execution. The old 5s cap was too tight: under a loaded box
+// (full test suite + coverage, or a busy CI runner) the subprocess is merely
+// *scheduled* late and blows the budget, and the `catch` below then swallows
+// the ETIMEDOUT as "not a git repo" — silently degrading `extractRepoName` to
+// its last-resort basename layer (a worktree then resolves to its own dir name
+// and spawns a parallel KB folder). Overridable via env so ops / tests can
+// tune it; read per call so a test's override takes effect.
+function gitCommandTimeoutMs(): number {
+	const raw = Number(process.env.JOLLI_GIT_CMD_TIMEOUT_MS);
+	return Number.isFinite(raw) && raw > 0 ? raw : 30_000;
+}
+
+// Timeout for the retry attempt only. The commands run here are local and
+// near-instant, so the sole reason the first attempt can time out is scheduling
+// starvation under load — and a starved process, once it finally gets CPU,
+// completes in milliseconds. So the retry needs only a short window: if it ALSO
+// can't finish quickly, git is genuinely stuck (a corrupt index lock, not a late
+// schedule) and null is the correct answer. This caps the worst-case *synchronous*
+// main-thread block at roughly firstTimeout + retryTimeout instead of 2×
+// firstTimeout. (Never exceeds the first timeout — matters when a test lowers the
+// budget via JOLLI_GIT_CMD_TIMEOUT_MS.) Making these calls fully async/backgrounded
+// is the proper long-term fix, tracked separately.
+function gitRetryTimeoutMs(): number {
+	return Math.min(gitCommandTimeoutMs(), 5_000);
+}
+
+function isTimeoutError(err: unknown): boolean {
+	return typeof err === "object" && err !== null && (err as { code?: unknown }).code === "ETIMEDOUT";
+}
+
+function runGit(cwd: string, args: string[], timeoutMs: number = gitCommandTimeoutMs()): string | null {
+	const out = execFileSyncHidden("git", args, {
+		cwd,
+		encoding: "utf-8",
+		timeout: timeoutMs,
+		// Capture git's stderr instead of inheriting the parent process's
+		// stderr (Node's default for execFileSync). Without this, running
+		// `jolli` in a non-git directory leaks a "fatal: not a git
+		// repository …" line to the user's terminal before any of jolli's
+		// own output — even though the JS catches the non-zero exit and
+		// returns null cleanly.
+		stdio: ["ignore", "pipe", "pipe"],
+	}).trim();
+	return out || null;
+}
+
 function tryGitCommand(cwd: string, args: string[]): string | null {
 	try {
-		const out = execFileSyncHidden("git", args, {
-			cwd,
-			encoding: "utf-8",
-			timeout: 5000,
-			// Capture git's stderr instead of inheriting the parent process's
-			// stderr (Node's default for execFileSync). Without this, running
-			// `jolli` in a non-git directory leaks a "fatal: not a git
-			// repository …" line to the user's terminal before any of jolli's
-			// own output — even though the JS catches the non-zero exit and
-			// returns null cleanly.
-			stdio: ["ignore", "pipe", "pipe"],
-		}).trim();
-		return out || null;
-	} catch {
-		return null;
+		return runGit(cwd, args);
+	} catch (err) {
+		// A timeout is transient (the box was thrashing), unlike a real non-git
+		// directory (git exits 128, no ETIMEDOUT). Retry once so a late schedule
+		// can't masquerade as a missing repo and drop us to the basename layer.
+		if (!isTimeoutError(err)) return null;
+		try {
+			return runGit(cwd, args, gitRetryTimeoutMs());
+		} catch {
+			// A second timeout means git is genuinely stuck → null is correct.
+			return null;
+		}
 	}
 }
 

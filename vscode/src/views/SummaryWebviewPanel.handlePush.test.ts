@@ -80,7 +80,10 @@ vi.mock("vscode", () => ({
 		openExternal,
 	},
 	Uri: {
-		parse: vi.fn((s: string) => ({ toString: () => s })),
+		parse: vi.fn((s: string) => ({
+			scheme: (s.match(/^([a-z][a-z0-9+.-]*):/i)?.[1] ?? "").toLowerCase(),
+			toString: () => s,
+		})),
 		file: vi.fn((s: string) => ({ fsPath: s, toString: () => s })),
 		joinPath: vi.fn((...args: Array<unknown>) => ({
 			toString: () => String(args.join("/")),
@@ -155,10 +158,19 @@ const { mockGetRepoContributors } = vi.hoisted(() => ({
 
 vi.mock("../../../cli/src/core/GitOps.js", async (importActual) => {
 	const actual = await importActual<typeof import("../../../cli/src/core/GitOps.js")>();
-	return {
-		...actual,
-		getRepoContributors: mockGetRepoContributors,
-	};
+	return { ...actual, getRepoContributors: mockGetRepoContributors };
+});
+
+// Wrap the real push orchestrator in a spy so the happy-path push tests keep
+// exercising the genuine `pushSummaryWithAttachments` (it drives the mocked
+// `pushToJolli`), while a single test can `mockRejectedValueOnce` a
+// `ShareBindingError("failed")` to reach the generic bind-failure branch —
+// the panel's own `resolveBinding` only ever yields bound/anotherOpen/cancelled,
+// so "failed" is unreachable through the real integration.
+vi.mock("../services/JolliPushOrchestrator.js", async (importActual) => {
+	const actual =
+		await importActual<typeof import("../services/JolliPushOrchestrator.js")>();
+	return { ...actual, pushSummaryWithAttachments: vi.fn(actual.pushSummaryWithAttachments) };
 });
 
 const { mockGenerateE2eTest, mockTranslateToEnglish } = vi.hoisted(() => ({
@@ -437,6 +449,7 @@ vi.mock("node:crypto", () => ({
 // ── Import under test ────────────────────────────────────────────────────────
 
 import type { CommitSummary } from "../../../cli/src/Types.js";
+import { ShareBindingError, pushSummaryWithAttachments } from "../services/JolliPushOrchestrator.js";
 import { clearContributorsCache, SummaryWebviewPanel } from "./SummaryWebviewPanel.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -580,6 +593,45 @@ describe("SummaryWebviewPanel handlePush", () => {
 					(c[0] as Record<string, unknown>).command === "pushToLocalResult",
 			);
 			expect(localResultCalls).toHaveLength(0);
+		});
+
+		it("re-reads the freshest summary from disk before pushing so a concurrent share can't mint a duplicate article", async () => {
+			// Regression: this panel captured `currentSummary` with NO jolliDocId,
+			// but another surface (the Create PR pane's branch share, or a second
+			// summary panel) has since pushed this same commit and written a
+			// jolliDocId back to disk. Pushing the stale in-memory copy would omit
+			// `docId` → the server mints a DUPLICATE article. The push must carry the
+			// disk copy's jolliDocId so the server updates the existing doc in place.
+			mockLoadConfig.mockResolvedValue({ apiKey: "test", jolliApiKey: "jk_valid" });
+			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
+			mockPushToJolli.mockResolvedValue({ docId: 500 });
+			// Disk holds the freshest copy of the SAME commit — now with a jolliDocId.
+			// `Once` (not a persistent mock): the shared stubBridge is cleared with
+			// vi.clearAllMocks() between tests, which keeps mockResolvedValue
+			// implementations — a persistent value would leak into later push tests
+			// that rely on getSummary defaulting to undefined. The push reads it
+			// exactly once, so a single Once is both sufficient and self-cleaning.
+			(stubBridge.getSummary as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+				makeSummary({
+					commitHash: "abc123",
+					jolliDocId: 500,
+					jolliDocUrl: "https://my.jolli.app/articles?doc=500",
+				}),
+			);
+			// Panel's in-memory summary is stale: same commit, but no jolliDocId.
+			const dispatch = await setupPanel({ commitHash: "abc123" });
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			// The push re-read the disk copy by commit hash...
+			expect(stubBridge.getSummary).toHaveBeenCalledWith("abc123");
+			// ...and the summary upload carried the disk docId, so the server updates
+			// in place instead of minting a duplicate.
+			const summaryCall = mockPushToJolli.mock.calls.find(
+				(c: Array<unknown>) => (c[2] as { docType?: string }).docType === "summary",
+			);
+			expect((summaryCall?.[2] as { docId?: number }).docId).toBe(500);
 		});
 
 		it("uploads only the latest snapshot when same-named plans accumulate after squash", async () => {
@@ -1143,6 +1195,28 @@ describe("SummaryWebviewPanel handlePush", () => {
 					repoUrl: "https://github.com/example/repo",
 					suggestedRepoName: "repo",
 				}),
+			);
+		});
+
+		it("shows a generic bind-failure error when the orchestrator reports outcome 'failed'", async () => {
+			mockLoadConfig.mockResolvedValue({ apiKey: "test", jolliApiKey: "jk_valid" });
+			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
+			// The panel's own resolveBinding only maps to bound/anotherOpen/cancelled,
+			// so drive the "failed" outcome by having the orchestrator itself reject
+			// with ShareBindingError("failed") — the else branch of the outcome fan-out.
+			(pushSummaryWithAttachments as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+				new ShareBindingError("failed"),
+			);
+			const dispatch = await setupPanel();
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining("could not bind a Memory space"),
+			);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ command: "pushToJolliResult", success: false }),
 			);
 		});
 	});

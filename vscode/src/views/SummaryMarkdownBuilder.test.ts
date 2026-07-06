@@ -263,7 +263,7 @@ describe("SummaryMarkdownBuilder", () => {
 
 				const md = buildMarkdown(summary);
 
-				expect(md).toContain("## Plans & Notes");
+				expect(md).toContain("## Context");
 				expect(md).toContain("- [Plan A](https://jolli.app/plan/a)");
 			});
 
@@ -304,7 +304,7 @@ describe("SummaryMarkdownBuilder", () => {
 
 				const md = buildMarkdown(summary);
 
-				expect(md).toContain("## Plans & Notes");
+				expect(md).toContain("## Context");
 				expect(md).toContain("- [Note A](https://jolli.app/note/a)");
 			});
 
@@ -353,7 +353,7 @@ describe("SummaryMarkdownBuilder", () => {
 
 				const md = buildMarkdown(summary);
 
-				expect(md).toContain("## Plans & Notes (2)");
+				expect(md).toContain("## Context (2)");
 			});
 
 			it("renders linear issues with ticketId-prefixed title and upstream URL", () => {
@@ -379,7 +379,7 @@ describe("SummaryMarkdownBuilder", () => {
 
 				const md = buildMarkdown(summary);
 
-				expect(md).toContain("## Plans & Notes");
+				expect(md).toContain("## Context");
 				expect(md).toContain(
 					"- [PROJ-1528 — Treat referenced Linear issues as a first-class panel item](https://linear.app/jolliai/issue/PROJ-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and)",
 				);
@@ -452,7 +452,7 @@ describe("SummaryMarkdownBuilder", () => {
 				const md = buildMarkdown(summary);
 
 				// 1 plan + 0 notes + 2 linear = 3 total — header carries the count.
-				expect(md).toContain("## Plans & Notes (3)");
+				expect(md).toContain("## Context (3)");
 			});
 
 			it("renders section with linear issues alone (no plans, no notes)", () => {
@@ -476,7 +476,7 @@ describe("SummaryMarkdownBuilder", () => {
 
 				const md = buildMarkdown(summary);
 
-				expect(md).toContain("## Plans & Notes");
+				expect(md).toContain("## Context");
 				expect(md).toContain(
 					"- [PROJ-1 — Solo](https://linear.app/x/issue/PROJ-1/solo)",
 				);
@@ -488,7 +488,7 @@ describe("SummaryMarkdownBuilder", () => {
 
 				const md = buildMarkdown(summary);
 
-				expect(md).not.toContain("## Plans & Notes");
+				expect(md).not.toContain("## Context");
 			});
 
 			it("omits section when plans array is empty", () => {
@@ -497,7 +497,7 @@ describe("SummaryMarkdownBuilder", () => {
 
 				const md = buildMarkdown(summary);
 
-				expect(md).not.toContain("## Plans & Notes");
+				expect(md).not.toContain("## Context");
 			});
 
 			it("does not include separator after section", () => {
@@ -514,7 +514,7 @@ describe("SummaryMarkdownBuilder", () => {
 				setupDefaults(summary);
 
 				const md = buildMarkdown(summary);
-				const sectionIdx = md.indexOf("## Plans & Notes");
+				const sectionIdx = md.indexOf("## Context");
 				const nextSection = md.indexOf("##", sectionIdx + 1);
 				const between = md.substring(
 					sectionIdx,
@@ -579,7 +579,7 @@ describe("SummaryMarkdownBuilder", () => {
 				expect(idxJira).toBeGreaterThan(idxLinear);
 				expect(idxGithub).toBeGreaterThan(idxJira);
 				expect(idxNotion).toBeGreaterThan(idxGithub);
-				expect(md).toContain("## Plans & Notes (4)");
+				expect(md).toContain("## Context (4)");
 			});
 
 			it("renders source-prefixed references with archivedKey using the canonical layout", () => {

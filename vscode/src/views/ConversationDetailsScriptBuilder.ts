@@ -5,12 +5,11 @@
 /**
  * Client-side script for ConversationDetailsPanel.
  *
- * Deliberately does NOT reuse buildTranscriptEntriesScript() from
- * TranscriptEntryRenderer.ts — that renderer is summary-modal-specific
- * (depends on scope vars like modalBody / modalTabs / originalTranscripts
- * and helpers like attachSessionDeleteHandler that don't exist here, and
- * implements a tab bar for multi-session views that this single-session
- * panel doesn't need). A self-contained renderer is the right cost.
+ * Self-contained: does not share a renderer with SummaryScriptBuilder.
+ * TranscriptEntryRenderer.ts's buildSourceLabelScript() now only emits the
+ * getSourceLabel() lookup (the modal-based multi-session tab renderer it
+ * used to also emit was retired along with the Commit Memory panel's old
+ * "Manage" modal, in favor of this dedicated single-session panel).
  *
  * State model:
  *   - originalEntries: ReadonlyArray<DisplayEntry> — last payload from

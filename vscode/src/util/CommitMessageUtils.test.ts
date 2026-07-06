@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mergeCommitMessages } from "./CommitMessageUtils.js";
+import { findTicketInContext, mergeCommitMessages } from "./CommitMessageUtils.js";
 
 describe("mergeCommitMessages", () => {
 	it("handles empty and single-message inputs", () => {
@@ -49,5 +49,36 @@ describe("mergeCommitMessages", () => {
 				"Part of PROJ-456: Add tests",
 			]),
 		).toBe("Closes PROJ-123: Fix hook race; Part of PROJ-456: Add tests");
+	});
+});
+
+describe("findTicketInContext", () => {
+	it("returns the ticket from the first selected reference row", () => {
+		const items = [
+			{ id: "p1", label: "Sidebar redesign plan", contextValue: "plan", isSelected: true },
+			{ id: "r1", label: "JOLLI-1620 · Sidebar UX redesign", contextValue: "reference", isSelected: true },
+			{ id: "r2", label: "CX-482 · Density follow-ups", contextValue: "reference", isSelected: true },
+		];
+		expect(findTicketInContext(items)).toBe("JOLLI-1620");
+	});
+
+	it("skips excluded reference rows", () => {
+		const items = [
+			{ id: "r1", label: "JOLLI-1620 · Sidebar UX redesign", contextValue: "reference", isSelected: false },
+			{ id: "r2", label: "CX-482 · Density follow-ups", contextValue: "reference", isSelected: true },
+		];
+		expect(findTicketInContext(items)).toBe("CX-482");
+	});
+
+	it("returns undefined when no selected reference has a ticket-shaped label", () => {
+		const items = [
+			{ id: "n1", label: "VS Code token mapping notes", contextValue: "note", isSelected: true },
+			{ id: "r1", label: "Sidebar redesign spec: Notion", contextValue: "reference", isSelected: true },
+		];
+		expect(findTicketInContext(items)).toBeUndefined();
+	});
+
+	it("returns undefined for an empty list", () => {
+		expect(findTicketInContext([])).toBeUndefined();
 	});
 });

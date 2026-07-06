@@ -46,6 +46,10 @@ const { mockGetCurrentBranch } = vi.hoisted(() => ({
 	mockGetCurrentBranch: vi.fn(() => "feature/test"),
 }));
 
+const { mockGetCurrentBranchSafe } = vi.hoisted(() => ({
+	mockGetCurrentBranchSafe: vi.fn(() => "unknown"),
+}));
+
 const { mockCreateHash, mockRandomBytes } = vi.hoisted(() => ({
 	mockCreateHash: vi.fn(() => ({
 		update: vi.fn().mockReturnThis(),
@@ -97,6 +101,10 @@ vi.mock("node:fs", () => ({
 
 vi.mock("./PlanService.js", () => ({
 	getCurrentBranch: mockGetCurrentBranch,
+}));
+
+vi.mock("../../../cli/src/core/GitBranch.js", () => ({
+	getCurrentBranchSafe: mockGetCurrentBranchSafe,
 }));
 
 vi.mock("node:crypto", () => ({
@@ -187,6 +195,8 @@ describe("NoteService", () => {
 		mockRandomBytes.mockReturnValue({ toString: () => "a1b2" });
 		mockGetCurrentBranch.mockReset();
 		mockGetCurrentBranch.mockReturnValue("main");
+		mockGetCurrentBranchSafe.mockReset();
+		mockGetCurrentBranchSafe.mockReturnValue("unknown");
 		mockUnlinkSync.mockReset();
 	});
 
@@ -948,6 +958,20 @@ describe("NoteService", () => {
 			// Should NOT have called randomBytes since id was provided
 			// (id is provided, so generateNoteSlug is not called)
 		});
+
+		it("stamps the current branch on the saved entry when git resolves a real branch (L139 truthy arm)", async () => {
+			// cond-expr L139: `noteBranch && noteBranch !== "unknown" ? { branch } : {}`
+			// — the consequent arm runs only when git returns a real branch name.
+			mockGetCurrentBranchSafe.mockReturnValue("feature/branchy");
+			mockLoadPlansRegistry.mockResolvedValue(emptyRegistry());
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("content");
+
+			await saveNote(undefined, "Branchy Note", "content", "snippet", CWD);
+
+			const saved = mockSavePlansRegistry.mock.calls[0][0];
+			expect(saved.notes["branchy-note-a1b2"].branch).toBe("feature/branchy");
+		});
 	});
 
 	// ─── removeNote ────────────────────────────────────────────────────────────
@@ -1120,6 +1144,21 @@ describe("NoteService", () => {
 				expect.objectContaining({ notes: {} }),
 				CWD,
 			);
+		});
+
+		it("is a no-op when the resolved key maps to a null entry (L200 defensive guard)", async () => {
+			// `notes[id]` is present but null: key resolves (null !== undefined) yet
+			// `entry` is falsy, so the L200 guard returns null before any delete/save.
+			mockLoadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: {},
+				notes: { "my-note": null },
+			});
+
+			await removeNote("my-note", CWD);
+
+			expect(mockSavePlansRegistry).not.toHaveBeenCalled();
+			expect(mockUnlinkSync).not.toHaveBeenCalled();
 		});
 	});
 
@@ -1339,6 +1378,32 @@ describe("NoteService", () => {
 			await archiveNoteForCommit("test-note", "06d0f729abcdef12", CWD);
 
 			expect(mockUnlinkSync).not.toHaveBeenCalled();
+		});
+
+		it("uses the empty-notes fallback when the in-lock fresh re-read has no notes field (L280 ?? RHS)", async () => {
+			// The guard upsert re-reads inside plans.lock: if that fresh snapshot has
+			// no `notes` field (e.g. a concurrent writer replaced the file), the
+			// `fresh.notes ?? {}` RHS supplies an empty object so the guard still lands.
+			const entry = makeNoteEntry();
+			mockLoadPlansRegistry
+				.mockResolvedValueOnce({
+					version: 1,
+					plans: {},
+					notes: { "test-note": entry },
+				})
+				.mockResolvedValueOnce({ version: 1, plans: {} }); // fresh re-read: no notes field
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("content");
+
+			const result = await archiveNoteForCommit(
+				"test-note",
+				"06d0f729abcdef12",
+				CWD,
+			);
+
+			expect(result).not.toBeNull();
+			const saved = mockSavePlansRegistry.mock.calls[0][0];
+			expect(saved.notes["test-note"]).toBeDefined();
 		});
 
 		it("handles snippet cleanup failure gracefully", async () => {

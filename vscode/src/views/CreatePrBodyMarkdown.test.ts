@@ -49,6 +49,13 @@ describe("renderPrBodyMarkdown", () => {
 		expect(html).toBe('<blockquote class="md-quote">Note: line one<br />line two</blockquote>');
 	});
 
+	it("stops merging blockquote lines at the first non-quote line", () => {
+		const html = renderPrBodyMarkdown("> quoted\ntail");
+		expect(html).toBe(
+			'<blockquote class="md-quote">quoted</blockquote><div class="md-line">tail</div>',
+		);
+	});
+
 	it("renders an unordered list and closes it when a non-item line follows", () => {
 		const html = renderPrBodyMarkdown("- one\n- two\ntail");
 		expect(html).toBe(

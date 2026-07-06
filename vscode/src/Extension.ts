@@ -15,6 +15,7 @@ import {
 } from "../../cli/src/core/CommitSelectionStore.js";
 import { discoverCodexConversations } from "../../cli/src/core/CodexDiscovery.js";
 import type { FolderStorage, ForceRegenerateResult } from "../../cli/src/core/FolderStorage.js";
+import { getDefaultBranch } from "../../cli/src/core/GitOps.js";
 import {
 	extractRepoName,
 	getRemoteUrl,
@@ -698,6 +699,20 @@ export function activate(context: vscode.ExtensionContext): void {
 	});
 	const filesStore = new FilesStore(bridge, workspaceRoot, excludeFilter);
 	const commitsStore = new CommitsStore(bridge);
+	// Seed the store's baseline from the repo's real default branch (origin/HEAD).
+	// CommitsStore defaults to "main", but getMainBranch() is the single baseline
+	// read for amend-safety (CommitCommand), diff bases (SummaryWebviewPanel), and
+	// PR-body aggregation — so on a master/develop/trunk repo it must reflect the
+	// true default, matching the base the Create PR pane resolves via
+	// getDefaultBranch. Fire-and-forget: setMainBranch rebuilds the snapshot when
+	// it resolves, and a failure simply leaves the "main" default in place.
+	void getDefaultBranch(workspaceRoot).then(
+		(branch) => commitsStore.setMainBranch(branch),
+		/* v8 ignore start -- defensive: getDefaultBranch catches all git failures and resolves to "main", so this rejection arm is unreachable; retained in case a future refactor lets it throw */
+		(err: unknown) =>
+			log.warn("activate", `Could not resolve default branch: ${err instanceof Error ? err.message : String(err)}`),
+		/* v8 ignore stop */
+	);
 	context.subscriptions.push(
 		statusStore,
 		memoriesStore,
@@ -1483,7 +1498,11 @@ export function activate(context: vscode.ExtensionContext): void {
 		// "Migrating memories..." affordance every activate() (mirrors the v1→v3 /
 		// index migrations, which gate their UI toggle on a check). A read error →
 		// treat as unknown and let migrateSchemaToV5 (re-checks + short-circuits) decide.
-		const v5State = await readSchemaV5State(workspaceRoot ?? undefined).catch(() => null);
+		const v5State = await readSchemaV5State(
+			/* v8 ignore start -- workspaceRoot is provably non-null here (activate returns early when it is null); the `?? undefined` is a tsc-only coercion whose null branch no input can reach */
+			workspaceRoot ?? undefined,
+			/* v8 ignore stop */
+		).catch(() => null);
 		const v5Pending = v5State?.status !== "completed";
 		if (v5Pending) {
 			statusStore.setMigrating(true);
@@ -1497,7 +1516,11 @@ export function activate(context: vscode.ExtensionContext): void {
 			if (!v5Pending) {
 				log.info("activate", "Schema v5 migration already complete — skipping (no UI toggle)");
 			} else {
-				const v5Result = await migrateSchemaToV5(workspaceRoot ?? undefined);
+				const v5Result = await migrateSchemaToV5(
+					/* v8 ignore start -- workspaceRoot is provably non-null here (activate returns early when it is null); the `?? undefined` is a tsc-only coercion whose null branch no input can reach */
+					workspaceRoot ?? undefined,
+					/* v8 ignore stop */
+				);
 				log.info(
 					"activate",
 					`Schema v5 migration: alreadyDone=${v5Result.alreadyDone} fresh=${v5Result.fresh} migrated=${v5Result.migrated} skipped=${v5Result.skipped}`,
@@ -3464,18 +3487,28 @@ export function activate(context: vscode.ExtensionContext): void {
 
 		// Open the Create PR pane for the current branch.
 		vscode.commands.registerCommand("jollimemory.createPrForBranch", async () => {
+			// Resolve the base via origin/HEAD (the same source the memory push uses
+			// in LiveShareController) rather than CommitsStore's hardcoded "main":
+			// on a repo whose default branch is master/develop/trunk the two diverged,
+			// so the panel counted `main..HEAD` while the push shared
+			// `<defaultBranch>..HEAD` — a different set than the user reviewed.
 			await CreatePrWebviewPanel.show(
 				context.extensionUri,
 				workspaceRoot,
 				bridge,
-				commitsStore.getMainBranch(),
+				await getDefaultBranch(workspaceRoot),
+				currentAuthenticated,
 			);
 		}),
 
-		// Preview the items that will be included in the next memory for this branch.
+		// Open the full-page review of the working (uncommitted) memory draft.
 		vscode.commands.registerCommand("jollimemory.reviewNextMemory", async () => {
-			const selection = await sidebarProvider.getNextMemorySelection();
-			NextMemoryPreviewPanel.show(selection);
+			await NextMemoryPreviewPanel.show(context.extensionUri, workspaceRoot, bridge, sidebarProvider);
+		}),
+
+		// Re-run the AI title draft shown in the review panel's Proposed title panel.
+		vscode.commands.registerCommand("jollimemory.regenerateNextMemoryTitle", async () => {
+			await NextMemoryPreviewPanel.show(context.extensionUri, workspaceRoot, bridge, sidebarProvider);
 		}),
 
 		// Sidebar footer "Share" → the in-panel "Share this branch" modal. The
@@ -3696,6 +3729,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			SettingsWebviewPanel.notifyAuthChanged().catch(
 				handleError("signOut.notifySettings"),
 			);
+			CreatePrWebviewPanel.notifyAuthChanged(false);
 		}),
 	);
 
@@ -3738,6 +3772,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					if (result.success) {
 						currentAuthenticated = true;
 						sidebarProvider.notifyAuthChanged(true);
+						CreatePrWebviewPanel.notifyAuthChanged(true);
 						vscode.window.showInformationMessage(
 							"Signed in to Jolli successfully.",
 						);

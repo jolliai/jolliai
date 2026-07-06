@@ -3,17 +3,15 @@
  *
  * Returns the JavaScript embedded in the webview for interactive behaviors:
  * toggle expand/collapse, copy hash, copy markdown, push to Jolli, memory
- * edit/delete, E2E test guide CRUD, and PR section interactions.
+ * edit/delete, and E2E test guide CRUD. The Create PR flow lives in its own
+ * pane (CreatePrHtmlBuilder/CreatePrWebviewPanel), so this script no longer
+ * wires PR section interactions.
  *
  * Pure string template — no logic dependencies on other view modules.
  */
 
-import {
-	buildPrMessageScript,
-	buildPrSectionScript,
-} from "../services/PrCommentService.js";
 import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
-import { buildTranscriptEntriesScript } from "./TranscriptEntryRenderer.js";
+import { buildSourceLabelScript } from "./TranscriptEntryRenderer.js";
 
 /** Share-entry options threaded from the panel into the webview script. */
 export interface SummaryScriptOptions {
@@ -55,13 +53,9 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
   }
   document.querySelectorAll('.toggle-header').forEach(attachToggleHeader);
 
-  // ── Redesign v2: Details disclosure + panel/card collapse ──
-  // Net-new presentational toggles. The collapse wrapper (.attach-card)
-  // lives OUTSIDE the sections that replaceSection rebuilds, so
-  // its collapsed state survives plansAndNotesUpdated / refreshConversations
-  // refreshes with no state persistence needed. Bound once at load; the heads
-  // are never replaced. Default state is expanded for every collapsible region
-  // except the Details property table (which ships with .collapsed).
+  // ── Redesign v2: Details disclosure ──
+  // Net-new presentational toggle, bound once at load (the header is never
+  // replaced). Ships with .collapsed by default.
   var detailsToggle = document.getElementById('detailsToggle');
   if (detailsToggle) {
     detailsToggle.addEventListener('click', function() {
@@ -72,18 +66,37 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
       detailsToggle.textContent = open ? 'Details \\u25B4' : 'Details \\u25BE';
     });
   }
-  // A head element carrying data-collapse="<targetId>" toggles .collapsed on
-  // that container (attachment cards, private drawer). Keyboard-operable.
-  document.querySelectorAll('[data-collapse]').forEach(function(head) {
-    function toggleCollapse() {
-      var target = document.getElementById(head.getAttribute('data-collapse'));
-      if (!target) { return; }
-      var collapsed = target.classList.toggle('collapsed');
-      head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-    }
-    head.addEventListener('click', toggleCollapse);
-    head.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleCollapse(); }
+  // The generic [data-collapse] head->target collapse binding (formerly used
+  // by the Attachments & context panel's .attach-card wrappers) was removed
+  // alongside that panel — the flat Context panel (buildContextPanel) has no
+  // collapsible cards, and no other markup emits data-collapse.
+
+  // ── Token meter (.tmeter): segment widths + help popover pin ──
+  // Segment widths cannot be inline style="width" — the webview CSP has no
+  // unsafe-inline for styles. buildTokenMeter emits each segment with a
+  // data-pct attribute instead; a JS property write (el.style.width) is
+  // allowed even though an inline style attribute is not, so we set it here.
+  document.querySelectorAll('.tmeter-bar [data-pct]').forEach(function(el) {
+    el.style.width = el.dataset.pct + '%';
+  });
+  // The '?' help button toggles a pinned popover (click-to-pin rather than
+  // hover-only, so it stays reachable on touch/keyboard). Clicking elsewhere
+  // on the page closes any open popover.
+  document.querySelectorAll('.tok-help').forEach(function(btn) {
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var wrap = btn.closest('.tok-help-wrap');
+      if (!wrap) { return; }
+      var wasPinned = wrap.classList.contains('pinned');
+      document.querySelectorAll('.tok-help-wrap.pinned').forEach(function(w) {
+        w.classList.remove('pinned');
+      });
+      if (!wasPinned) { wrap.classList.add('pinned'); }
+    });
+  });
+  document.addEventListener('click', function() {
+    document.querySelectorAll('.tok-help-wrap.pinned').forEach(function(w) {
+      w.classList.remove('pinned');
     });
   });
 
@@ -114,9 +127,11 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
     });
   }
 
-  // Split-button dropdown toggle (Copy Markdown dropdown menu)
-  var dropdownToggle = document.getElementById('copyMdDropdown');
-  var dropdownMenu = document.getElementById('copyMdMenu');
+  // Export menu toggle (meta strip): holds Copy Markdown / Save as Markdown
+  // File / Regenerate. Same open/close mechanics as the old copyMd split
+  // button, just relocated + renamed to match the meta-strip redesign.
+  var dropdownToggle = document.getElementById('exportMenuToggle');
+  var dropdownMenu = document.getElementById('exportMenu');
   if (dropdownToggle && dropdownMenu) {
     dropdownToggle.addEventListener('click', function(e) {
       e.stopPropagation();
@@ -138,6 +153,9 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
   }
 
   // Push button (Jolli only — local push pathway was removed in 2026-05).
+  // Always pushes: on a synced doc this re-uploads it in place ("Update on
+  // Jolli"), otherwise it creates the doc ("Push to Jolli"). The existing
+  // article is opened via the links in #jolliRow, not this button.
   var pushBtn = document.getElementById('pushJolliBtn');
   if (pushBtn) {
     pushBtn.addEventListener('click', function() {
@@ -146,8 +164,11 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
   }
 
   // ── Share popover (live Space-backed share): this memory (commit) or whole branch ──
+  // The redesigned header exposes Share via the meta-strip button (#metaShareBtn);
+  // the old #shareBtn id was retired in the mockup alignment, so the popover
+  // trigger + positioning anchor is #metaShareBtn.
   var shareOverlay = document.getElementById('shareOverlay');
-  var shareBtn = document.getElementById('shareBtn');
+  var shareBtn = document.getElementById('metaShareBtn');
   // Set on open; included in every share message so the host knows which subject
   // (this commit vs whole branch) to act on. Defaults to commit (the primary button).
   var shareKind = 'commit';
@@ -683,7 +704,6 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
       }
     });
   }
-${buildPrSectionScript()}
 
   // Listen for messages from the extension (push + topic edit status updates).
   // The push button is disabled on 'pushStarted' and re-enabled on
@@ -708,7 +728,6 @@ ${buildPrSectionScript()}
     if (pushBtn && msg.command === 'pushToJolliResult') {
       pushBtn.disabled = false;
     }
-${buildPrMessageScript()}
 
     // ── Memory edit status ──
     if (msg.command === 'topicUpdated' && typeof msg.topicIndex === 'number' && msg.html) {
@@ -1576,16 +1595,6 @@ ${buildPrMessageScript()}
           attachE2eHandlers(newSection);
         }
       }
-      // "Generate E2E + Create PR" chain: E2E now exists, so the second PR
-      // button no longer applies — retire it — and if the user launched the
-      // chain, continue to the PR create form (prepareCreatePr now picks up the
-      // freshly generated E2E in the body).
-      var chainE2eBtn = document.getElementById('createPrWithE2eBtn');
-      if (chainE2eBtn) { chainE2eBtn.remove(); }
-      if (window.prChainE2eThenCreate) {
-        window.prChainE2eThenCreate = false;
-        vscode.postMessage({ command: 'prepareCreatePr' });
-      }
     } else if (msg.command === 'e2eScenarioUpdated' && typeof msg.scenarioIndex === 'number' && msg.html) {
       // Surgical per-scenario replacement preserves collapsed state of other scenarios.
       var oldToggle = document.getElementById('e2e-scenario-' + msg.scenarioIndex);
@@ -1622,15 +1631,6 @@ ${buildPrMessageScript()}
           btn.textContent = '\\u2728 Generate';
         }
         btn.disabled = false;
-      }
-      // Abort the "Generate E2E + Create PR" chain and restore its buttons so
-      // the user can retry or fall back to a plain Create PR.
-      if (window.prChainE2eThenCreate) {
-        window.prChainE2eThenCreate = false;
-        var chainErrBtn = document.getElementById('createPrWithE2eBtn');
-        if (chainErrBtn) { chainErrBtn.disabled = false; chainErrBtn.textContent = 'Generate E2E + Create PR'; }
-        var createErrBtn = document.getElementById('createPrBtn');
-        if (createErrBtn) { createErrBtn.disabled = false; }
       }
     }
 
@@ -2042,425 +2042,250 @@ ${buildPrMessageScript()}
   // post-refresh) stats load is kicked off from bindConversationsSection().
   var conversationsStats = document.getElementById('conversationsStats');
 
-  // ── Transcript Modal ──────────────────────────────────────────────────────
+  // ── Inline Conversations rows (mockup) ─────────────────────────────────────
+  // Body container for the inline .row list. Reassigned by
+  // bindConversationsSection after each conversationsUpdated rebuild; the
+  // conversationsData message handler fills whatever it points at.
+  var conversationsBody = document.getElementById('conversationsBody');
 
-  var transcriptModal = document.getElementById('transcriptModal');
-  var modalTabs = document.getElementById('modalTabs');
-  var modalBody = document.getElementById('modalBody');
-  var modalLoading = document.getElementById('modalLoading');
-  var modalSubtitle = document.getElementById('modalSubtitle');
-  var modalSaveBtn = document.getElementById('modalSaveBtn');
-  var modalCancelBtn = document.getElementById('modalCancelBtn');
-  var modalCloseBtn = document.getElementById('modalCloseBtn');
-  var deleteTranscriptsBtn = document.getElementById('deleteTranscriptsBtn');
-  var openTranscriptsBtn = document.getElementById('openTranscriptsBtn');
+  // Per-source brand glyphs for conversation rows — mirrors the sidebar's
+  // SOURCE_ICON_SVG (SidebarScriptBuilder), which ports the IntelliJ source-*.svg
+  // set so all three surfaces stay visually identical. Brand-colored sources
+  // (Claude #D97757, Codex #10A37F, Gemini gradient) carry their own hex; the
+  // neutral marks (Cursor / Copilot / OpenCode) use currentColor so they follow
+  // the badge's icon-foreground on either theme. copilot-chat reuses Copilot.
+  // Each is a fixed first-party constant, injected as inline <svg> (CSP forbids
+  // <img> / data-URI backgrounds, but permits inline SVG markup in innerHTML).
+  var SOURCE_ICON_SVG = {
+    claude:
+      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">' +
+      '<g stroke="#D97757" stroke-width="1.4" stroke-linecap="round">' +
+      '<line x1="8" y1="2" x2="8" y2="14"/><line x1="2" y1="8" x2="14" y2="8"/>' +
+      '<line x1="3.76" y1="3.76" x2="12.24" y2="12.24"/><line x1="12.24" y1="3.76" x2="3.76" y2="12.24"/>' +
+      '<line x1="11" y1="2.8" x2="5" y2="13.2"/><line x1="13.2" y1="5" x2="2.8" y2="11"/>' +
+      '<line x1="5" y1="2.8" x2="11" y2="13.2"/><line x1="2.8" y1="5" x2="13.2" y2="11"/></g></svg>',
+    codex:
+      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">' +
+      '<g fill="none" stroke="#10A37F" stroke-width="1.3">' +
+      '<ellipse cx="8" cy="8" rx="6.4" ry="2.9"/>' +
+      '<ellipse cx="8" cy="8" rx="6.4" ry="2.9" transform="rotate(60 8 8)"/>' +
+      '<ellipse cx="8" cy="8" rx="6.4" ry="2.9" transform="rotate(120 8 8)"/></g></svg>',
+    gemini:
+      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">' +
+      '<defs><linearGradient id="jm-gem-detail" x1="2" y1="2" x2="14" y2="14" gradientUnits="userSpaceOnUse">' +
+      '<stop offset="0" stop-color="#4796E3"/><stop offset="1" stop-color="#9177C7"/></linearGradient></defs>' +
+      '<path fill="url(#jm-gem-detail)" d="M8 1c.3 4.2 2.8 6.7 7 7-4.2.3-6.7 2.8-7 7-.3-4.2-2.8-6.7-7-7 4.2-.3 6.7-2.8 7-7Z"/></svg>',
+    cursor:
+      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">' +
+      '<g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round">' +
+      '<path d="M8 1.5 14 5v6L8 14.5 2 11V5L8 1.5Z"/><path d="M8 1.5V8M8 8l6-3M8 8l-6-3M8 8v6.5"/></g></svg>',
+    copilot:
+      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">' +
+      '<g stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round">' +
+      '<line x1="8" y1="2.5" x2="8" y2="5"/><rect x="2.5" y="5" width="11" height="7" rx="3"/>' +
+      '<line x1="2.5" y1="8.5" x2="1.5" y2="8.5"/><line x1="13.5" y1="8.5" x2="14.5" y2="8.5"/></g>' +
+      '<g fill="currentColor"><circle cx="8" cy="2.2" r="1"/><circle cx="6" cy="8.7" r="1"/><circle cx="10" cy="8.7" r="1"/></g></svg>',
+    opencode:
+      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">' +
+      '<g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">' +
+      '<path d="M3.5 5 7 8l-3.5 3"/><line x1="8.5" y1="11.5" x2="13" y2="11.5"/></g></svg>',
+  };
+  SOURCE_ICON_SVG['copilot-chat'] = SOURCE_ICON_SVG.copilot;
 
-  // State
-  var originalTranscripts = []; // full data from extension, preserved for metadata
-  var rawContentMap = {}; // entryKey → raw text (avoids data-attribute escaping issues)
-  var baseSubtitle = ''; // "147 entries, 4 sessions" — always visible
-  var modifiedCount = 0;
-  var deletedCount = 0;
-  var activeTextarea = null; // only one entry editable at a time
-
-  function openModal() {
-    if (!transcriptModal) return;
-    transcriptModal.classList.add('visible');
-    if (modalLoading) modalLoading.style.display = 'block';
-    // Clear any error banner from a previous failed save/delete attempt so
-    // the new session starts clean.
-    var prevErr = document.getElementById('modalErrorBanner');
-    if (prevErr) prevErr.style.display = 'none';
-    modifiedCount = 0;
-    deletedCount = 0;
-    updateChangeCounter();
-    vscode.postMessage({ command: 'loadAllTranscripts' });
-  }
-
-  function closeModal() {
-    if (!transcriptModal) return;
-    transcriptModal.classList.remove('visible');
-    if (modalBody) modalBody.innerHTML = '<div class="modal-loading" id="modalLoading">Loading transcripts...</div>';
-    if (modalTabs) modalTabs.innerHTML = '';
-    activeTextarea = null;
-    modifiedCount = 0;
-    deletedCount = 0;
-  }
-
-  function updateChangeCounter() {
-    if (modalSubtitle) {
-      var parts = [];
-      if (modifiedCount > 0) parts.push(modifiedCount + ' modified');
-      if (deletedCount > 0) parts.push(deletedCount + ' deleted');
-      var changeText = parts.length > 0 ? ' · ' + parts.join(', ') : '';
-      modalSubtitle.textContent = baseSubtitle + changeText;
+  // Render inline conversation rows from the host's conversationsData payload.
+  // Interpolated host-supplied strings (title/source/ids) go through esc(),
+  // the same HTML-escape helper used for markdown rendering below.
+  function renderConversations(items) {
+    if (!conversationsBody) return;
+    items = items || [];
+    if (items.length === 0) {
+      conversationsBody.innerHTML = '<p class="conv-empty">No conversations linked to this memory.</p>';
+      return;
     }
-    if (modalSaveBtn) {
-      var total = modifiedCount + deletedCount;
-      modalSaveBtn.disabled = total === 0;
-      modalSaveBtn.textContent = total > 0 ? 'Save All (' + total + ')' : 'Save All';
+    var html = '';
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var source = it.source || 'claude';
+      var label = getSourceLabel(source);
+      var msgs = it.messageCount || 0;
+      html += '<div class="row" data-session="' + esc(it.sessionId) + '" data-hash="' + esc(it.hash) + '" data-source="' + esc(source) + '">';
+      var srcSvg = SOURCE_ICON_SVG[source] || '<span class="codicon codicon-comment-discussion"></span>';
+      html += '<span class="badge src-' + esc(source) + '" title="' + esc(label) + '" aria-label="' + esc(label) + '">' + srcSvg + '</span>';
+      html += '<div class="r-main"><div class="r-title">' + esc(it.title) + '</div></div>';
+      html += '<span class="r-meta hide-on-hover">' + msgs + ' msgs</span>';
+      html += '<span class="r-actions"><button class="icon-btn danger conv-detach" title="Detach from this memory"><span class="codicon codicon-trash"></span></button></span>';
+      html += '</div>';
     }
+    conversationsBody.innerHTML = html;
   }
 
-${buildTranscriptEntriesScript()}
-
-  function attachEntryClickHandler(entryEl) {
-    var contentEl = entryEl.querySelector('.entry-content');
-    if (!contentEl) return;
-    contentEl.addEventListener('click', function() {
-      if (entryEl.classList.contains('deleted')) return;
-      if (entryEl.classList.contains('editing')) return;
-      // Readonly modes (foreign repo, stale commit, in-flight regenerate) hide
-      // the entry-delete and modal Save/Cancel buttons via CSS, but the click-
-      // to-edit affordance is an event handler — CSS can't suppress it. Without
-      // this guard a click in cross-repo "View" mode would still pop a textarea
-      // the user can type into and immediately lose on blur (no projectDir to
-      // persist the overlay).
-      if (document.querySelector('.page.foreign-readonly, .page.stale-readonly, .page.regenerating-readonly')) return;
-
-      // Blur any active textarea first
-      if (activeTextarea) activeTextarea.blur();
-
-      var entryKey = entryEl.getAttribute('data-commit') + ':' + entryEl.getAttribute('data-session') + ':' + entryEl.getAttribute('data-index');
-      var originalText = rawContentMap[entryKey] || contentEl.textContent;
-      var textarea = document.createElement('textarea');
-      textarea.className = 'entry-edit-textarea';
-      textarea.value = originalText;
-      textarea.rows = Math.max(3, originalText.split('\\n').length + 1);
-
-      contentEl.style.display = 'none';
-      entryEl.insertBefore(textarea, contentEl.nextSibling);
-      entryEl.classList.add('editing');
-      textarea.focus();
-      activeTextarea = textarea;
-
-      // Auto-resize
-      textarea.addEventListener('input', function() {
-        this.style.height = 'auto';
-        this.style.height = this.scrollHeight + 'px';
-      });
-      textarea.style.height = textarea.scrollHeight + 'px';
-
-      textarea.addEventListener('blur', function() {
-        var newText = textarea.value;
-        rawContentMap[entryKey] = newText;
-        contentEl.innerHTML = renderMarkdown(newText);
-        contentEl.style.display = '';
-        textarea.remove();
-        entryEl.classList.remove('editing');
-        activeTextarea = null;
-
-        if (newText !== originalText) {
-          if (!entryEl.classList.contains('modified')) {
-            entryEl.classList.add('modified');
-            modifiedCount++;
-            updateChangeCounter();
-          }
-        }
-      });
-    });
+  // Detach: event-delegated click on the (reassigned-each-refresh) body, so no
+  // per-row inline handlers (CSP) and no re-bind needed after a rebuild — the
+  // listener is registered ONCE below on document. On the host's ack we remove
+  // just that row in place and decrement the count chip (mirrors the sidebar's
+  // precise in-place update rather than a full-panel rebuild).
+  function detachCountEl() {
+    var section = document.getElementById('allConversationsSection');
+    return section ? section.querySelector('.sec-count') : null;
   }
 
-  /** Sync tab strikethrough state based on whether all entries in the session are deleted. */
-  function syncTabState(sessionEl) {
-    if (!sessionEl || !modalTabs) return;
-    var groupKey = sessionEl.getAttribute('data-group-key');
-    var tabEl = modalTabs.querySelector('.modal-tab[data-tab-key="' + groupKey + '"]');
-    if (!tabEl) return;
-    var total = sessionEl.querySelectorAll('.transcript-entry').length;
-    var deletedInSession = sessionEl.querySelectorAll('.transcript-entry.deleted').length;
-    var allDeleted = total > 0 && deletedInSession === total;
-    var deleteBtn = tabEl.querySelector('.session-delete-btn');
-    if (allDeleted) {
-      tabEl.classList.add('session-deleted');
-      if (deleteBtn) { deleteBtn.innerHTML = '&#x21A9;'; deleteBtn.title = 'Restore entire session'; }
-    } else {
-      tabEl.classList.remove('session-deleted');
-      if (deleteBtn) { deleteBtn.innerHTML = '&#x1F5D1;'; deleteBtn.title = 'Delete entire session'; }
-    }
-  }
+${buildSourceLabelScript()}
 
-  function attachEntryDeleteHandler(btn) {
-    btn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      var entryEl = btn.closest('.transcript-entry');
-      if (!entryEl) return;
-      if (entryEl.classList.contains('deleted')) {
-        entryEl.classList.remove('deleted');
-        btn.innerHTML = '&#x1F5D1;';
-        btn.title = 'Delete entry';
-        deletedCount--;
-      } else {
-        entryEl.classList.add('deleted');
-        btn.innerHTML = '&#x21A9;';
-        btn.title = 'Restore entry';
-        deletedCount++;
-      }
-      // Sync tab state based on session entries
-      var sessionEl = entryEl.closest('.transcript-session');
-      syncTabState(sessionEl);
-      updateChangeCounter();
-    });
-  }
-
-  function attachSessionDeleteHandler(btn) {
-    btn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      var groupKey = btn.getAttribute('data-group-key');
-      var tabEl = btn.closest('.modal-tab');
-      var sessionEl = modalBody ? modalBody.querySelector('.transcript-session[data-group-key="' + groupKey + '"]') : null;
-      if (!sessionEl) return;
-
-      var isDeleted = tabEl && tabEl.classList.contains('session-deleted');
-      if (isDeleted) {
-        // Restore all entries in session
-        if (tabEl) tabEl.classList.remove('session-deleted');
-        btn.innerHTML = '&#x1F5D1;';
-        btn.title = 'Delete entire session';
-        var deletedEntries = sessionEl.querySelectorAll('.transcript-entry.deleted');
-        for (var i = 0; i < deletedEntries.length; i++) {
-          deletedEntries[i].classList.remove('deleted');
-          var entryBtn = deletedEntries[i].querySelector('.entry-delete-btn');
-          if (entryBtn) { entryBtn.innerHTML = '&#x1F5D1;'; entryBtn.title = 'Delete entry'; }
-          deletedCount--;
-        }
-      } else {
-        // Delete all entries in session
-        if (tabEl) tabEl.classList.add('session-deleted');
-        btn.innerHTML = '&#x21A9;';
-        btn.title = 'Restore entire session';
-        var activeEntries = sessionEl.querySelectorAll('.transcript-entry:not(.deleted)');
-        for (var j = 0; j < activeEntries.length; j++) {
-          activeEntries[j].classList.add('deleted');
-          var entryBtn2 = activeEntries[j].querySelector('.entry-delete-btn');
-          if (entryBtn2) { entryBtn2.innerHTML = '&#x21A9;'; entryBtn2.title = 'Restore entry'; }
-          deletedCount++;
-        }
-      }
-      updateChangeCounter();
-    });
-  }
-
-  function collectSaveData() {
-    if (!modalBody) return [];
-    var entries = modalBody.querySelectorAll('.transcript-entry:not(.deleted)');
-    var result = [];
-    for (var i = 0; i < entries.length; i++) {
-      var el = entries[i];
-      var contentEl = el.querySelector('.entry-content');
-      result.push({
-        commitHash: el.getAttribute('data-commit'),
-        sessionId: el.getAttribute('data-session'),
-        source: el.getAttribute('data-source'),
-        originalIndex: parseInt(el.getAttribute('data-index'), 10),
-        role: el.getAttribute('data-role') === 'human' ? 'human' : 'assistant',
-        content: rawContentMap[el.getAttribute('data-commit') + ':' + el.getAttribute('data-session') + ':' + el.getAttribute('data-index')] || (contentEl ? contentEl.textContent : ''),
-        timestamp: el.getAttribute('data-timestamp') || ''
-      });
-    }
-    return result;
-  }
-
-  function formatTime(isoStr) {
-    if (!isoStr) return '';
-    try {
-      var d = new Date(isoStr);
-      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    } catch(e) { return ''; }
-  }
-
+  // Escape helper for interpolating host-supplied strings into innerHTML.
   function esc(str) {
     if (!str) return '';
     return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  /** Lightweight markdown renderer: code blocks, inline code, bold, italic, links, lists, headers. */
-  function renderMarkdown(raw) {
-    if (!raw) return '';
-    var text = esc(raw);
-
-    // Fenced code blocks
-    text = text.replace(/\`\`\`[a-zA-Z]*\\n([\\s\\S]*?)\`\`\`/g, function(_, code) {
-      return '<pre class="md-code-block"><code>' + code.replace(/\\n$/, '') + '</code></pre>';
-    });
-
-    // Split into lines for block-level processing
-    var lines = text.split('\\n');
-    var out = [];
-    var inList = false;
-
-    for (var i = 0; i < lines.length; i++) {
-      var line = lines[i];
-
-      // Skip lines inside code blocks (already handled)
-      if (line.indexOf('<pre class="md-code-block">') !== -1) {
-        if (inList) { out.push('</ul>'); inList = false; }
-        // Collect until </pre>
-        var block = line;
-        while (block.indexOf('</pre>') === -1 && i + 1 < lines.length) {
-          i++;
-          block += '\\n' + lines[i];
-        }
-        out.push(block);
-        continue;
-      }
-
-      // Headers: # to ####
-      var headerMatch = line.match(/^(#{1,4})\\s+(.+)$/);
-      if (headerMatch) {
-        if (inList) { out.push('</ul>'); inList = false; }
-        var level = headerMatch[1].length + 1; // Offset +1 to avoid overly large headers in modal
-        out.push('<h' + level + ' class="md-heading">' + applyInline(headerMatch[2]) + '</h' + level + '>');
-        continue;
-      }
-
-      // Unordered list items: - item or * item
-      var listMatch = line.match(/^[\\-\\*]\\s+(.+)$/);
-      if (listMatch) {
-        if (!inList) { out.push('<ul class="md-list">'); inList = true; }
-        out.push('<li>' + applyInline(listMatch[1]) + '</li>');
-        continue;
-      }
-
-      // Non-list line closes open list
-      if (inList) { out.push('</ul>'); inList = false; }
-
-      // Empty line — small vertical gap
-      if (line.trim() === '') {
-        out.push('<div class="md-blank"></div>');
-        continue;
-      }
-
-      // Regular paragraph line
-      out.push('<div>' + applyInline(line) + '</div>');
-    }
-    if (inList) out.push('</ul>');
-    return out.join('');
-  }
-
-  /** Apply inline markdown: bold, italic, inline code, links. */
-  function applyInline(text) {
-    // Inline code
-    text = text.replace(/\`([^\`]+)\`/g, '<code class="md-inline-code">$1</code>');
-    // Bold: **text** or __text__
-    text = text.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
-    text = text.replace(/__(.+?)__/g, '<strong>$1</strong>');
-    // Italic: *text* or _text_ (not inside bold)
-    text = text.replace(/(?<!\\*)\\*([^*]+)\\*(?!\\*)/g, '<em>$1</em>');
-    text = text.replace(/(?<!_)_([^_]+)_(?!_)/g, '<em>$1</em>');
-    // Links: [text](url) — only allow http/https URLs
-    text = text.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^)]+)\\)/g, '<a href="$2" class="md-link">$1</a>');
-    return text;
-  }
-
   // ── Conversations section binding (init + after conversationsUpdated) ────
-  // After conversationsUpdated replaces #allConversationsSection the old modal +
-  // button nodes are discarded, so we re-grab every ref (reassigning the closure
-  // vars that openModal/closeModal/renderTranscriptEntries/the message listener
-  // all read) and re-wire the per-element button listeners. The GLOBAL keydown +
-  // message listeners are registered ONCE, below, outside this function — they
-  // read the reassignable refs, so they keep working against the new modal
-  // without piling up duplicate registrations on every refresh.
+  // After conversationsUpdated replaces #allConversationsSection the old body
+  // container + stats element are discarded, so we re-grab both refs on every
+  // rebuild (this function is the single re-bind entrypoint).
   function bindConversationsSection() {
-    transcriptModal = document.getElementById('transcriptModal');
-    modalTabs = document.getElementById('modalTabs');
-    modalBody = document.getElementById('modalBody');
-    modalLoading = document.getElementById('modalLoading');
-    modalSubtitle = document.getElementById('modalSubtitle');
-    modalSaveBtn = document.getElementById('modalSaveBtn');
-    modalCancelBtn = document.getElementById('modalCancelBtn');
-    modalCloseBtn = document.getElementById('modalCloseBtn');
-    deleteTranscriptsBtn = document.getElementById('deleteTranscriptsBtn');
-    openTranscriptsBtn = document.getElementById('openTranscriptsBtn');
     conversationsStats = document.getElementById('conversationsStats');
-
-    if (openTranscriptsBtn) openTranscriptsBtn.addEventListener('click', openModal);
-    if (modalCloseBtn) modalCloseBtn.addEventListener('click', function() { closeModal(); });
-    if (modalCancelBtn) modalCancelBtn.addEventListener('click', function() { closeModal(); });
-    if (transcriptModal) {
-      transcriptModal.addEventListener('click', function(e) {
-        if (e.target === transcriptModal) closeModal();
-      });
-    }
-    if (modalSaveBtn) {
-      modalSaveBtn.addEventListener('click', function() {
-        var data = collectSaveData();
-        vscode.postMessage({ command: 'saveAllTranscripts', entries: data });
-        modalSaveBtn.disabled = true;
-        modalSaveBtn.textContent = 'Saving...';
-      });
-    }
-    if (deleteTranscriptsBtn) {
-      deleteTranscriptsBtn.addEventListener('click', function() {
-        // Mark all entries as deleted across all sessions (same as clicking each tab's delete)
-        if (!modalTabs || !modalBody) return;
-        var allTabs = modalTabs.querySelectorAll('.modal-tab:not(.session-deleted)');
-        for (var t = 0; t < allTabs.length; t++) {
-          var tabDeleteBtn = allTabs[t].querySelector('.session-delete-btn');
-          if (tabDeleteBtn) tabDeleteBtn.click();
-        }
-      });
-    }
 
     // Kick off / refresh the async stats line for the (possibly new) element.
     if (conversationsStats) vscode.postMessage({ command: 'loadTranscriptStats' });
+
+    // Inline Conversations rows (mockup): re-grab the body container and request
+    // per-conversation data. Fires on init AND after every conversationsUpdated
+    // rebuild (this function is the single re-bind entrypoint), so the rows are
+    // never left stuck on the build-time "Loading…" placeholder — the
+    // lazy-trigger-on-every-entrypoint rule.
+    conversationsBody = document.getElementById('conversationsBody');
+    if (conversationsBody) vscode.postMessage({ command: 'loadConversations' });
   }
   bindConversationsSection();
 
-  // GLOBAL listener — registered ONCE (NOT inside bindConversationsSection, or
-  // every refresh would stack another). Reads the reassignable transcriptModal
-  // ref + closure closeModal fn, so it stays valid across section rebuilds.
-  document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape' && transcriptModal && transcriptModal.classList.contains('visible')) {
-      closeModal();
+  // ── Files panel (per-file status + diff, Task 9) ─────────────────────────
+  // This document has no tab-switching (unlike the sidebar) — #filesBody is
+  // only ever rebuilt by a full webview.html re-render (update()), never by a
+  // partial replaceSection, so the single init-time bind below is the only
+  // entrypoint that needs the request (still following the
+  // lazy-trigger-on-every-entrypoint rule: one entrypoint here, one request).
+  var filesBody = document.getElementById('filesBody');
+  var filesCommitHash = '';
+
+  // Renders the Files panel body from the host's files:rows payload. This is
+  // the single row renderer for the Files panel — there is no server-side
+  // equivalent; SummaryHtmlBuilder.ts only emits the loading shell
+  // (buildFilesPanelShell) at initial render time. Resolvable rows carry
+  // data-path/data-status (and data-old-path for renames, so a rename's
+  // diff can resolve its pre-rename blob); off-branch rows render inert
+  // (.is-unresolvable, no data-path) with a trailing hint naming the branch.
+  function renderFiles(rows, offBranch, branch) {
+    if (!filesBody) return;
+    rows = rows || [];
+    var countEl = document.getElementById('filesCount');
+    if (countEl) countEl.textContent = String(rows.length);
+    if (rows.length === 0) {
+      filesBody.innerHTML = '<p class="files-loading">No files changed in this commit.</p>';
+      return;
     }
+    var html = '';
+    for (var i = 0; i < rows.length; i++) {
+      var f = rows[i];
+      var fname = f.path.indexOf('/') >= 0 ? f.path.slice(f.path.lastIndexOf('/') + 1) : f.path;
+      var cls = offBranch ? 'row is-unresolvable' : 'row';
+      var dataOldPath = (!offBranch && f.status === 'R' && f.oldPath) ? ' data-old-path="' + esc(f.oldPath) + '"' : '';
+      var dataPath = offBranch ? '' : ' data-path="' + esc(f.path) + '" data-status="' + esc(f.status) + '"' + dataOldPath;
+      var title = offBranch ? ' title="Diffs open only on the checked-out branch"' : '';
+      html += '<div class="' + cls + '"' + dataPath + title + '>' +
+        '<div class="r-main"><div class="r-title fname-' + esc(f.status) + '">' + esc(fname) + '</div>' +
+        '<div class="r-sub">' + esc(f.dir) + '</div></div>' +
+        '<span class="gs gs-' + esc(f.status) + '">' + esc(f.status) + '</span></div>';
+    }
+    if (offBranch) {
+      html += '<p class="muted files-offbranch-hint"><span>Diffs open only on the checked-out branch. Check out <code>' +
+        esc(branch) + '</code> to view these changes.</span></p>';
+    }
+    filesBody.innerHTML = html;
+  }
+
+  function bindFilesSection() {
+    filesBody = document.getElementById('filesBody');
+    if (filesBody) vscode.postMessage({ command: 'loadFiles' });
+  }
+  bindFilesSection();
+
+  // Delegated click for resolvable file rows (registered ONCE — filesBody is
+  // only replaced by a full page re-render, but delegation on document keeps
+  // this robust either way and matches the conv-detach / commitFile pattern).
+  document.addEventListener('click', function(e) {
+    var row = e.target && e.target.closest ? e.target.closest('#filesPanel .row[data-path]') : null;
+    if (!row) return;
+    vscode.postMessage({
+      command: 'openFileDiff',
+      path: row.getAttribute('data-path'),
+      commitHash: filesCommitHash,
+      status: row.getAttribute('data-status') || 'M',
+      oldPath: row.getAttribute('data-old-path') || undefined,
+    });
   });
+
+  // GLOBAL delegated detach click — registered ONCE. Reads the row's data-*
+  // attributes so it survives conversationsData re-renders without re-binding.
+  document.addEventListener('click', function(e) {
+    var btn = e.target && e.target.closest ? e.target.closest('.conv-detach') : null;
+    if (!btn) return;
+    var row = btn.closest('.row');
+    if (!row) return;
+    vscode.postMessage({
+      command: 'conversationDetach',
+      hash: row.getAttribute('data-hash'),
+      sessionId: row.getAttribute('data-session'),
+      source: row.getAttribute('data-source'),
+    });
+  });
+
+  // GLOBAL delegated conversation-row click — opens the transcript in a
+  // read-only ConversationDetailsPanel (archived snapshot off the orphan
+  // branch). Registered ONCE; reads data-* so it survives conversationsData
+  // rebuilds. Guarded against the detach button (its own handler above) so a
+  // detach click doesn't also open the panel.
+  document.addEventListener('click', function(e) {
+    if (!e.target || !e.target.closest) return;
+    if (e.target.closest('.conv-detach')) return;
+    var row = e.target.closest('.conversations-body .row[data-session]');
+    if (!row) return;
+    vscode.postMessage({
+      command: 'openConversation',
+      sessionId: row.getAttribute('data-session'),
+      source: row.getAttribute('data-source'),
+    });
+  });
+
+  // Matches a row by the same 'source:sessionId' composite identity the host
+  // groups sessions by, not bare sessionId — two different sources can mint
+  // the same raw sessionId, so a sessionId-only lookup could resolve to (or
+  // remove) the wrong row.
+  function conversationRowSelector(sessionId, source) {
+    var cssEsc = window.CSS && CSS.escape ? CSS.escape : function(s) { return s; };
+    return '.row[data-session="' + cssEsc(sessionId) + '"][data-source="' + cssEsc(source || 'claude') + '"]';
+  }
 
   // Handle transcript messages from extension
   window.addEventListener('message', function(event) {
     var msg = event.data;
-    if (msg.command === 'allTranscriptsLoaded') {
-      if (modalLoading) modalLoading.style.display = 'none';
-      renderTranscriptEntries(msg.entries || []);
-      var totalEntries = (msg.entries || []).length;
-      var sessions = {};
-      for (var i = 0; i < (msg.entries || []).length; i++) {
-        sessions[(msg.entries[i].source || 'claude') + ':' + msg.entries[i].sessionId] = true;
-      }
-      var sessionCount = Object.keys(sessions).length;
-      baseSubtitle = totalEntries + ' entries, ' + sessionCount + ' session' + (sessionCount !== 1 ? 's' : '');
-      if (modalSubtitle) modalSubtitle.textContent = baseSubtitle;
+    if (msg.command === 'conversationsData') {
+      renderConversations(msg.items || []);
+      var cnt = detachCountEl();
+      if (cnt) cnt.textContent = String((msg.items || []).length);
     }
-    // Success: the host re-renders the whole #allConversationsSection, which
-    // discards the open modal (closing it) and refreshes the stats / empty
-    // state. bindConversationsSection re-grabs refs + re-wires the new buttons.
-    if (msg.command === 'conversationsUpdated' && typeof msg.html === 'string') {
-      replaceSection('allConversationsSection', msg.html);
-      bindConversationsSection();
-    }
-    // transcriptsSaved / transcriptsDeleted are still posted by the host (kept
-    // for existing assertions), but intentionally do NO DOM work here: closing +
-    // refresh is owned by conversationsUpdated above. The former closeModal()
-    // was removed so it doesn't double-handle / race the rebuild.
-    // Failure paths (added 2026-05-22 for v5): backend posts these when summary
-    // update or transcript file batch failed. Without handling them, the Save
-    // button would stay stuck in "Saving..." disabled state forever (the user
-    // would have to reload the webview to continue). Re-enable the button and
-    // surface a non-blocking notification with the backend-provided detail.
-    if (msg.command === 'transcriptsSaveFailed' || msg.command === 'transcriptsDeleteFailed') {
-      if (modalSaveBtn) {
-        modalSaveBtn.disabled = false;
-        modalSaveBtn.textContent = 'Save All';
+    if (msg.command === 'conversationDetached') {
+      // Precise in-place removal (no full-panel rebuild): drop just the acked
+      // row and decrement the count chip.
+      var sid = msg.sessionId;
+      if (conversationsBody && sid != null) {
+        var gone = conversationsBody.querySelector(conversationRowSelector(sid, msg.source));
+        if (gone) gone.remove();
+        var remaining = conversationsBody.querySelectorAll('.row').length;
+        var cntEl = detachCountEl();
+        if (cntEl) cntEl.textContent = String(remaining);
+        if (remaining === 0) {
+          conversationsBody.innerHTML = '<p class="conv-empty">No conversations linked to this memory.</p>';
+        }
       }
-      var errBanner = document.getElementById('modalErrorBanner');
-      if (errBanner) {
-        var defaultMsg = msg.command === 'transcriptsSaveFailed' ? 'Save failed. See logs.' : 'Delete failed. See logs.';
-        errBanner.textContent = msg.message || defaultMsg;
-        errBanner.style.display = 'block';
-      }
-    }
-    if (msg.command === 'transcriptsLoading') {
-      if (modalLoading) modalLoading.style.display = 'block';
     }
     if (msg.command === 'transcriptStatsLoaded') {
       if (conversationsStats) {
@@ -2480,6 +2305,10 @@ ${buildTranscriptEntriesScript()}
         }
         conversationsStats.innerHTML = '<strong>' + msg.totalEntries + '</strong> entries across <strong>' + totalSessions + '</strong> session' + (totalSessions !== 1 ? 's' : '') + ' (' + parts.join(', ') + ')';
       }
+    }
+    if (msg.command === 'files:rows') {
+      filesCommitHash = msg.commitHash || '';
+      renderFiles(msg.rows, !!msg.offBranch, msg.branch || '');
     }
   });
 

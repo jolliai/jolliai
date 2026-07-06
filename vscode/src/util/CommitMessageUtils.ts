@@ -6,7 +6,7 @@
  */
 
 /** Ticket pattern: matches Jira-style ticket IDs like "PROJ-123", "FEAT-42" (case-insensitive) */
-const TICKET_PATTERN = /[A-Z]+-\d+/i;
+export const TICKET_PATTERN = /[A-Z]+-\d+/i;
 
 /**
  * Finds the longest common prefix across all messages, truncated to the
@@ -119,4 +119,23 @@ export function mergeCommitMessages(messages: ReadonlyArray<string>): string {
 
 	// Strategy 3: no common structure — just join
 	return messages.join("; ");
+}
+
+/**
+ * Finds a ticket identifier among the currently included Context rows, for
+ * the Next Memory review panel's "Detected ticket" line. Only looks at
+ * reference rows (not plans/notes), and skips a row only when it is
+ * explicitly deselected (`isSelected === false`) — when selection mode is off
+ * every row has `isSelected` undefined and counts as included. This is a
+ * lookup over already-curated context, not a new detection mechanism.
+ */
+export function findTicketInContext(
+	items: ReadonlyArray<{ readonly label: string; readonly contextValue?: string; readonly isSelected?: boolean }>,
+): string | undefined {
+	for (const item of items) {
+		if (item.contextValue !== "reference" || item.isSelected === false) continue;
+		const match = TICKET_PATTERN.exec(item.label);
+		if (match) return match[0].toUpperCase();
+	}
+	return undefined;
 }

@@ -22,6 +22,11 @@
 import { backfillListRendererSource, COLD_START_CAP } from "./BackfillListRenderer.js";
 import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
 import { SOURCE_TITLES } from "./SourceLabels.js";
+import {
+	SONNET_CACHE_WRITE_PER_TOKEN,
+	SONNET_INPUT_PER_TOKEN,
+	SONNET_OUTPUT_PER_TOKEN,
+} from "./SummaryUtils.js";
 
 export function buildSidebarScript(): string {
 	return `
@@ -181,6 +186,15 @@ export function buildSidebarScript(): string {
   state.backfillProgress = { done: 0, total: 0 };
   state.backfillResult = null;
   function persist() { vscode.setState(state); }
+
+  // Whether an 'init' message has already reconciled the active tab. The host
+  // re-broadcasts init on events that are not sidebar reloads — notably the
+  // Working Memory panel's ready handshake, which re-runs the host's
+  // handleReady and fans init out to this sidebar. Since getInitialState()
+  // always reports activeTab 'branch', an unguarded re-init would yank a user
+  // viewing Memory Bank/Status back to Branch. Only the FIRST init sets the
+  // tab; later ones reconcile the rest of the state but leave the tab alone.
+  var didInitTab = false;
 
   // ---- DOM refs ----
   const root = document.getElementById('sidebar-root');
@@ -709,8 +723,12 @@ export function buildSidebarScript(): string {
         applyConfigured(msg.state.configured !== false);
         // Guard against a stale persisted tab that no longer exists (e.g. the
         // removed 'knowledge' view): fall back to the default 'branch' rather
-        // than switching to a tab with no panel/toolbar.
-        if (msg.state.activeTab && tabContents[msg.state.activeTab]) switchTab(msg.state.activeTab);
+        // than switching to a tab with no panel/toolbar. Only honored on the
+        // first init (see didInitTab) so a spurious re-init can't reset the tab.
+        if (!didInitTab) {
+          didInitTab = true;
+          if (msg.state.activeTab && tabContents[msg.state.activeTab]) switchTab(msg.state.activeTab);
+        }
         if (msg.state.kbMode) state.kbMode = msg.state.kbMode;
         state.branchName = msg.state.branchName;
         state.detached = !!msg.state.detached;
@@ -3535,8 +3553,13 @@ export function buildSidebarScript(): string {
 
   // Humanize a raw token count to "1.8M" / "118k" / "999" format.
   // Added for the token-bar label; reused by renderTokenBar legend items.
+  // Must mirror formatTokensCompact in SummaryUtils.ts (the Commit Memory
+  // panel's token meter uses that TS version server-side; this is the
+  // client-side JS equivalent for the sidebar webview). The 999500 threshold
+  // (not 1000000) must match formatTokensCompact: at 999500 the k-branch would
+  // round up to "1000k", so promote to "1M" first.
   function formatTokens(n) {
-    if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/[.]0$/, '') + 'M';
+    if (n >= 999500) return (n / 1000000).toFixed(1).replace(/[.]0$/, '') + 'M';
     if (n >= 1000) return Math.round(n / 1000) + 'k';
     return String(n);
   }
@@ -3578,13 +3601,16 @@ export function buildSidebarScript(): string {
     // alone (the help tooltip already explains the partial reporting).
     var hasBreakdown = stats.input > 0 || stats.output > 0 || cached > 0;
     // Cost estimate (Sonnet 4.6 pricing, per the mockup tooltip's "assumes
-    // Sonnet pricing"): input 3 / output 15 / cached 3.75 USD per million tokens.
+    // Sonnet pricing"). The per-token rates below are baked in from
+    // SummaryUtils.ts's SONNET_INPUT_PER_TOKEN / SONNET_OUTPUT_PER_TOKEN /
+    // SONNET_CACHE_WRITE_PER_TOKEN — the same constants the Commit Memory
+    // panel's token meter uses — so a pricing update only has to be made once.
     // The cached segment now carries cache_CREATION tokens (billed at 1.25x the
     // input rate) — cache_READ is excluded upstream because it is cumulative per
     // turn and would inflate the total. So this is a floor (a session's re-read of
     // an already-cached prefix is real spend we deliberately do not count), which
     // is why the tooltip says "actual spend may be higher".
-    var costUsd = (stats.input * 3 + stats.output * 15 + cached * 3.75) / 1000000;
+    var costUsd = stats.input * ${SONNET_INPUT_PER_TOKEN} + stats.output * ${SONNET_OUTPUT_PER_TOKEN} + cached * ${SONNET_CACHE_WRITE_PER_TOKEN};
     var costLabel = costUsd >= 0.01 ? '≈$' + costUsd.toFixed(2) : '<$0.01';
     var label = el('div', {
       className: 'token-bar-label',
@@ -4475,19 +4501,21 @@ export function buildSidebarScript(): string {
     // collapses both it and the .twirl so the filename column-aligns with the
     // sub-section title. Functional differences (checkbox, discard) live
     // alongside the shared visual language.
+    // dirname-only, stacked under the filename (matching committed-memory
+    // "Files" rows / .mef-text) rather than inline on the same line.
+    let descDir = '';
+    if (item.description) {
+      const slash = item.description.lastIndexOf('/');
+      descDir = slash > 0 ? item.description.slice(0, slash) : '';
+    }
     const kids = [
       el('span', { className: 'twirl' }),
       el('span', { className: 'row-leading' }, [cb]),
-      el('span', { className: 'label' + (gs ? ' ' + 'gs-' + gs : ''), text: item.label }),
+      el('span', { className: 'change-text' }, [
+        el('span', { className: 'label' + (gs ? ' ' + 'gs-' + gs : ''), text: item.label }),
+        descDir ? el('span', { className: 'change-dir', text: descDir }) : null,
+      ]),
     ];
-    // dirname-only desc — same truncation as commit-file rows.
-    if (item.description) {
-      const slash = item.description.lastIndexOf('/');
-      const descDir = slash > 0 ? item.description.slice(0, slash) : '';
-      if (descDir) {
-        kids.push(el('span', { className: 'desc', text: descDir }));
-      }
-    }
     // Trailing layout: [discard (hover-only)] [gs-letter (always)].
     // Order matters — inline-actions is pushed first so the gs-letter
     // sits at the row's right edge; CSS gives inline-actions the
@@ -4634,7 +4662,7 @@ export function buildSidebarScript(): string {
         'data-hash': hash,
       }, [
         el('i', { className: 'codicon codicon-cloud-upload' }),
-        el('span', { className: 'shipped-label', text: 'Not pushed — Push to Jolli' }),
+        el('span', { className: 'shipped-label', text: 'Not synced — Push to Jolli' }),
       ]);
     }
     shippedRows.push(syncRow);

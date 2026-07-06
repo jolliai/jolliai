@@ -246,6 +246,54 @@ describe("SidebarWebviewProvider edge paths", () => {
 		});
 	});
 
+	describe("archived session slice ordering by timestamp", () => {
+		it("orders a multi-transcript session's slices by their first parseable timestamp", async () => {
+			const summary = {
+				version: 5,
+				commitHash: "tsx1234",
+				commitMessage: "feat: ts ordering",
+				commitAuthor: "Dev",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				transcripts: ["tid-1", "tid-2"],
+				topics: [],
+			};
+			// One session spanning two transcripts. tid-2's slice has a parseable
+			// timestamp (sliceStartTime returns via `Number.isFinite(ms)` → the finite
+			// arm), while tid-1's slice has an UNPARSEABLE timestamp — present, so it
+			// passes the `=== undefined` skip, but Date.parse → NaN, so it falls
+			// through the `Number.isFinite` check (the non-finite arm) and returns
+			// undefined. Together the two slices exercise both arms of that branch.
+			const sliceFor = (tid: string) => ({
+				sessions: [
+					{
+						sessionId: "sess-ts",
+						source: "claude" as const,
+						transcriptPath: "/tmp/ts.jsonl",
+						entries:
+							tid === "tid-1"
+								? [{ role: "assistant" as const, content: "unparseable", timestamp: "not-a-real-timestamp" }]
+								: [{ role: "human" as const, content: "earlier", timestamp: "2024-01-01T00:00:00Z" }],
+					},
+				],
+			});
+			const provider = makeProvider({
+				getSummaryByHash: vi.fn().mockResolvedValue(summary),
+				readTranscriptById: vi.fn().mockImplementation((tid: string) => Promise.resolve(sliceFor(tid))),
+			});
+			const view = makeMockView();
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "tsx1234" });
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const ev = findMsg(sent, "kb:memoryEvidence");
+			// The two slices collapse into one conversation row, merged across transcripts.
+			expect(ev?.evidence.conversations).toHaveLength(1);
+			expect(ev?.evidence.conversations[0]).toMatchObject({ id: "sess-ts", messageCount: 2 });
+		});
+	});
+
 	describe("kb:openEvidenceConversation via the source-aware summary lookup", () => {
 		const provenanceSummary = {
 			version: 5,
@@ -405,66 +453,78 @@ describe("SidebarWebviewProvider edge paths", () => {
 		});
 	});
 
-	describe("getNextMemorySelection", () => {
-		it("projects only the selected items from the three provider feeds", async () => {
-			const listWithDiagnostics = vi.fn().mockResolvedValue({
-				items: [
-					{ title: "conv kept", isSelected: true },
-					{ title: "conv deselected", isSelected: false },
-					// Conversations require an explicit isSelected — absence means excluded.
-					{ title: "conv unset" },
-				],
-				failedSources: [],
-			});
-			const plansProvider = {
-				serialize: () => [
-					{ id: "p1", label: "plan kept", isSelected: true },
-					{ id: "p2", label: "plan deselected", isSelected: false },
-					// Plans/files treat an absent flag as selected (isSelected !== false).
-					{ id: "p3", label: "plan default" },
-				],
-				onDidChangeTreeData: vi.fn(stubDisposable),
-			};
-			const filesProvider = {
-				serialize: () => [
-					{ id: "f1", label: "a.ts", description: "src/a.ts" },
-					// No description → the basename label is the best available path.
-					{ id: "f2", label: "b.ts" },
-					{ id: "f3", label: "c.ts", description: "src/c.ts", isSelected: false },
-				],
-				onDidChangeTreeData: vi.fn(stubDisposable),
-			};
+	describe("branch watcher pin re-push gating", () => {
+		it("skips the pin re-push on a HEAD change while a foreign branch is selected via the breadcrumb", () => {
+			let branchHandler: ((name: string, detached: boolean) => void) | undefined;
 			const provider = makeProvider({
-				activeSessionsProvider: { listWithDiagnostics } as unknown as never,
-				plansProvider,
-				filesProvider,
+				branchWatcher: {
+					current: () => ({ name: "main", detached: false }),
+					onChange: (cb: (name: string, detached: boolean) => void) => {
+						branchHandler = cb;
+						return { dispose: () => {} };
+					},
+				} as unknown as never,
+				// `selection` need only be present for the branchName request path to
+				// set selectedBranchName (it doesn't consult listRepos/listBranches here).
+				selection: { listRepos: () => [], listBranches: () => [] } as unknown as never,
 			});
-			const result = await provider.getNextMemorySelection();
-			expect(result.conversations).toEqual([{ title: "conv kept" }]);
-			expect(result.context).toEqual([{ title: "plan kept" }, { title: "plan default" }]);
-			expect(result.files).toEqual([{ path: "src/a.ts" }, { path: "b.ts" }]);
+			const view = makeMockView();
+			provider.resolveWebviewView(view as unknown as never);
+			// Pick a foreign branch via the breadcrumb → selectedBranchName is now set.
+			view.webview.triggerMessage({ type: "selection:request", branchName: "feature/foreign" });
+			view.webview.postMessage.mockClear();
+			// A workspace HEAD change fires the watcher; because a foreign branch is
+			// selected, the pin re-push is skipped (the `=== undefined` guard is false).
+			branchHandler?.("feature/other", false);
+			const msgs = view.webview.postMessage.mock.calls.map((c) => c[0] as SidebarInboundMsg);
+			// The branch:branchName post still goes out (it precedes the pin gate)…
+			expect(msgs.some((m) => m.type === "branch:branchName")).toBe(true);
+			// …but no fresh pins were pushed while a foreign selection is active.
+			expect(msgs.some((m) => m.type === "branch:pinsData")).toBe(false);
+		});
+	});
+
+	describe("snapshot accessors (Next Memory review panel)", () => {
+		it("getPlansSnapshot returns the plans provider's serialized items", () => {
+			const items = [{ id: "p1", label: "Plan A", contextValue: "plan", isSelected: true }];
+			const provider = makeProvider({
+				plansProvider: {
+					serialize: () => items,
+					onDidChangeTreeData: vi.fn(stubDisposable),
+				} as unknown as never,
+			});
+			expect(provider.getPlansSnapshot()).toEqual(items);
 		});
 
-		it("returns empty groups when no providers are wired", async () => {
+		it("getPlansSnapshot returns an empty array when there is no plans provider", () => {
 			const provider = makeProvider();
-			const result = await provider.getNextMemorySelection();
-			expect(result).toEqual({ conversations: [], context: [], files: [] });
+			expect(provider.getPlansSnapshot()).toEqual([]);
 		});
 
-		it("returns empty conversations when the sessions provider rejects, keeping the other groups", async () => {
-			const listWithDiagnostics = vi.fn().mockRejectedValue(new Error("aggregator down"));
-			const plansProvider = {
-				serialize: () => [{ id: "p1", label: "plan kept" }],
-				onDidChangeTreeData: vi.fn(stubDisposable),
-			};
+		it("getConversationsSnapshot returns the active sessions provider's items", async () => {
+			const items = [
+				{
+					source: "claude",
+					sessionId: "s1",
+					title: "t",
+					messageCount: 1,
+					updatedAt: "2026-01-01",
+					transcriptPath: "/x",
+					isEdited: false,
+					isSelected: true,
+				},
+			];
 			const provider = makeProvider({
-				activeSessionsProvider: { listWithDiagnostics } as unknown as never,
-				plansProvider,
+				activeSessionsProvider: {
+					listWithDiagnostics: async () => ({ items, failedSources: [] }),
+				} as unknown as never,
 			});
-			const result = await provider.getNextMemorySelection();
-			expect(result.conversations).toEqual([]);
-			expect(result.context).toEqual([{ title: "plan kept" }]);
-			expect(result.files).toEqual([]);
+			expect(await provider.getConversationsSnapshot()).toEqual(items);
+		});
+
+		it("getConversationsSnapshot returns an empty array when there is no active sessions provider", async () => {
+			const provider = makeProvider();
+			expect(await provider.getConversationsSnapshot()).toEqual([]);
 		});
 	});
 });

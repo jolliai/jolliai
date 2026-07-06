@@ -368,8 +368,11 @@ const {
 		MockSquashCommand: vi.fn(function MockSquashCommand() {
 			return mockSquashCommand_;
 		}),
-		MockCreatePrWebviewPanel: { show: vi.fn().mockResolvedValue(undefined) },
-		MockSummaryWebviewPanel: { show: vi.fn().mockResolvedValue(undefined) },
+		MockCreatePrWebviewPanel: { show: vi.fn().mockResolvedValue(undefined), notifyAuthChanged: vi.fn() },
+		MockSummaryWebviewPanel: {
+			show: vi.fn().mockResolvedValue(undefined),
+			showWithShareModal: vi.fn().mockResolvedValue(undefined),
+		},
 		MockSettingsWebviewPanel: {
 			show: vi.fn(),
 			notifyAuthChanged: vi.fn().mockResolvedValue(undefined),
@@ -962,6 +965,35 @@ vi.mock("./views/NoteEditorWebviewPanel.js", () => ({
 	NoteEditorWebviewPanel: MockNoteEditorWebviewPanel,
 }));
 
+// Telemetry bootstrap is fire-and-forget from activate(); stub it so tests can
+// capture the options callbacks (showNotice / openExternal) and assert the
+// mid-session telemetry-toggle re-init without running the real bootstrap I/O.
+vi.mock("./TelemetryActivation.js", () => ({
+	activateExtensionTelemetry: vi.fn().mockResolvedValue(undefined),
+	reinitExtensionTelemetry: vi.fn().mockResolvedValue(undefined),
+}));
+
+// Branch-recall command bodies live in their own module (tested directly in
+// Extension.recall.test.ts). Here we only need to assert the command handlers
+// delegate to them, so stub the module to no-ops.
+vi.mock("./commands/BranchRecallCommands.js", () => ({
+	runRecallInClaudeCode: vi.fn().mockResolvedValue(undefined),
+	runCopyBranchRecallPrompt: vi.fn().mockResolvedValue(undefined),
+}));
+
+// NextMemoryPreviewPanel.show creates a real webview panel — stub it so the
+// reviewNextMemory / regenerateNextMemoryTitle command handlers can be driven
+// without a live webview host.
+vi.mock("./views/NextMemoryPreviewPanel.js", () => ({
+	NextMemoryPreviewPanel: { show: vi.fn().mockResolvedValue(undefined) },
+}));
+
+// loadBranchSummaries walks the bridge's storage; stub it so the shareBranch
+// handler's newest-summary selection can be driven deterministically.
+vi.mock("./views/BranchSummaryLoader.js", () => ({
+	loadBranchSummaries: vi.fn().mockResolvedValue({ summaries: [], missingCount: 0 }),
+}));
+
 vi.mock("./views/SummaryMarkdownBuilder.js", () => ({
 	buildClaudeCodeContext,
 }));
@@ -1027,7 +1059,11 @@ vi.mock("node:timers", () => ({
 // ─── Import under test ─────────────────────────────────────────────────────
 
 import * as vscode from "vscode";
+import { runCopyBranchRecallPrompt, runRecallInClaudeCode } from "./commands/BranchRecallCommands.js";
 import { activate, deactivate } from "./Extension.js";
+import { activateExtensionTelemetry, reinitExtensionTelemetry } from "./TelemetryActivation.js";
+import { loadBranchSummaries } from "./views/BranchSummaryLoader.js";
+import { NextMemoryPreviewPanel } from "./views/NextMemoryPreviewPanel.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1465,6 +1501,7 @@ describe("Extension", () => {
 				"jollimemory.openSettings",
 				"jollimemory.toggleStatus",
 				"jollimemory.reviewNextMemory",
+				"jollimemory.regenerateNextMemoryTitle",
 				"jollimemory.shareBranch",
 				"jollimemory.shareMemory",
 			];
@@ -8111,6 +8148,345 @@ describe("Extension", () => {
 			} finally {
 				vi.mocked(resolveKbParent).mockReturnValue("/test/kb-parent");
 			}
+		});
+
+		it("openSettings save: refreshes the KB tree inside the save callback and runs the auto-sync catch", async () => {
+			// Pins line 3410 (the save-callback's own `if (moved) refreshKB()`) plus
+			// the reconcileAutoSync catch arrow. resolveKbParent is driven off its
+			// argument so the KB parent only "moves" once loadConfig reports a new
+			// localFolder — flipped between activate and the save callback so the
+			// save callback's own refresh is the one that fires.
+			const { resolveKbParent } = await import("../../cli/src/core/KBPathResolver.js");
+			const reconcileAutoSync = vi.fn().mockRejectedValue(new Error("reconcile boom"));
+			// mockReset (not Once) so a leaked once-value from a prior test can't be
+			// consumed by this activate — every activateSync call resolves to our
+			// rejecting runtime.
+			activateSyncMock.mockReset();
+			activateSyncMock.mockResolvedValue({
+				runtime: { setOnRoundFinished: vi.fn(), reconcileAutoSync },
+			});
+			try {
+				// Reset both mocks so no leaked once-value from a prior test perturbs
+				// the deferred activate-time refresh vs the save-callback refresh.
+				vi.mocked(resolveKbParent).mockReset();
+				vi.mocked(resolveKbParent).mockImplementation((p?: string) => p ?? "/kb-parent-default");
+				loadConfig.mockReset();
+				loadConfig.mockResolvedValue({});
+				// A prior test leaves a persistent rejecting `load` implementation;
+				// restore a resolving one so the save callback runs past its first await.
+				mockExcludeFilter.load.mockReset();
+				mockExcludeFilter.load.mockResolvedValue(undefined);
+				activate(makeContext());
+				getRegisteredCommand("jollimemory.openSettings")();
+				const showCalls = MockSettingsWebviewPanel.show.mock.calls as [unknown, unknown, () => Promise<void>][];
+				const saveCb = showCalls[showCalls.length - 1][2];
+
+				// Flush the deferred activate-time refreshSidebarKbRoot (still reads the
+				// default parent → no move) before changing loadConfig.
+				await new Promise((r) => setTimeout(r, 0));
+				mockRefreshKnowledgeBaseFolders.mockClear();
+				// Now the user has picked a new localFolder → the save callback's
+				// refreshSidebarKbRoot reports moved === true.
+				loadConfig.mockResolvedValue({ localFolder: "/kb-parent-moved" });
+
+				await saveCb();
+
+				// The save callback's own moved-branch fired the refresh.
+				expect(mockRefreshKnowledgeBaseFolders).toHaveBeenCalled();
+				// The auto-sync reconcile ran and its rejection was swallowed.
+				expect(reconcileAutoSync).toHaveBeenCalled();
+			} finally {
+				vi.mocked(resolveKbParent).mockReset();
+				vi.mocked(resolveKbParent).mockReturnValue("/test/kb-parent");
+				loadConfig.mockReset();
+				loadConfig.mockResolvedValue({});
+				// Restore a benign default sync runtime for subsequent tests.
+				activateSyncMock.mockReset();
+				activateSyncMock.mockResolvedValue({
+					runtime: { setOnRoundFinished: vi.fn(), reconcileAutoSync: vi.fn().mockResolvedValue(undefined) },
+				});
+			}
+		});
+	});
+
+	// ── Telemetry bootstrap callbacks ────────────────────────────────────────
+	describe("telemetry activation wiring", () => {
+		it("passes showNotice / openExternal callbacks that route to vscode, and re-inits on telemetry toggle", async () => {
+			activate(makeContext());
+
+			// The options object handed to activateExtensionTelemetry carries the
+			// inline showNotice / openExternal arrows — invoke them to drive the
+			// arrow bodies that only fire on first-run / URL-open.
+			const opts = vi.mocked(activateExtensionTelemetry).mock.calls[0][1] as {
+				showNotice: (msg: string, ...actions: string[]) => Promise<unknown>;
+				openExternal: (url: string) => void;
+			};
+			await opts.showNotice("Telemetry notice", "Learn more");
+			expect(showInformationMessage).toHaveBeenCalledWith("Telemetry notice", "Learn more");
+
+			opts.openExternal("https://jolli.ai/telemetry");
+			expect(openExternal).toHaveBeenCalled();
+
+			// The IDE telemetry-toggle listener re-evaluates on change.
+			const onChange = vi.mocked(vscode.env.onDidChangeTelemetryEnabled).mock.calls[0][0] as (
+				enabled: boolean,
+			) => void;
+			onChange(false);
+			expect(vi.mocked(reinitExtensionTelemetry)).toHaveBeenCalledWith("/test/workspace", true);
+		});
+	});
+
+	// ── HistoryTreeProvider detail-fetch callback ────────────────────────────
+	describe("history detail callback", () => {
+		function getDetailCallback(): (hash: string) => Promise<unknown> {
+			activate(makeContext());
+			// Second constructor arg is the async detail-fetch callback.
+			return vi.mocked(MockHistoryTreeProvider).mock.calls[0][1] as (hash: string) => Promise<unknown>;
+		}
+
+		it("returns null when the summary is missing", async () => {
+			const detail = getDetailCallback();
+			mockBridge.getSummary.mockResolvedValueOnce(null);
+			await expect(detail("nohash")).resolves.toBeNull();
+		});
+
+		it("includes conversationTokens when the tree token total is > 0", async () => {
+			const detail = getDetailCallback();
+			mockBridge.getSummary.mockResolvedValueOnce({
+				jolliDocUrl: "https://doc/1",
+				e2eTestGuide: ["step-a", "step-b"],
+				conversationTokens: 4200,
+			});
+			await expect(detail("hash1")).resolves.toEqual({
+				jolliDocUrl: "https://doc/1",
+				e2eCount: 2,
+				conversationTokens: 4200,
+			});
+		});
+
+		it("omits conversationTokens when the tree token total is 0", async () => {
+			const detail = getDetailCallback();
+			mockBridge.getSummary.mockResolvedValueOnce({
+				jolliDocUrl: "https://doc/2",
+				conversationTokens: 0,
+			});
+			await expect(detail("hash2")).resolves.toEqual({
+				jolliDocUrl: "https://doc/2",
+				e2eCount: undefined,
+			});
+		});
+	});
+
+	// ── generateMissingSummaries error path ──────────────────────────────────
+	describe("generateMissingSummaries — failure", () => {
+		it("returns ok:false with the error message when the back-fill import/lookup throws", async () => {
+			const { recentCommitHashes } = await import("../../cli/src/backfill/BackfillEngine.js");
+			vi.mocked(recentCommitHashes).mockRejectedValueOnce(new Error("backfill boom"));
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.generateMissingSummaries");
+			const result = await handler();
+			expect(result).toEqual({ ok: false, generated: 0, total: 0, skipped: 0, message: "backfill boom" });
+		});
+
+		it("skips the memories refresh when the memories store has not first-loaded yet", async () => {
+			const { recentCommitHashes, runBackfill } = await import("../../cli/src/backfill/BackfillEngine.js");
+			vi.mocked(recentCommitHashes).mockResolvedValue(["h1"]);
+			vi.mocked(runBackfill).mockResolvedValueOnce({ total: 1, generated: 1, skipped: 0, errors: 0, outcomes: [] });
+			// hasFirstLoaded defaults to false → the if-body is skipped.
+			mockMemoriesStore.refresh.mockClear();
+			activate(makeContext());
+			const result = await getRegisteredCommand("jollimemory.generateMissingSummaries")();
+			expect(result).toEqual(expect.objectContaining({ ok: true, generated: 1 }));
+			expect(mockMemoriesStore.refresh).not.toHaveBeenCalled();
+		});
+	});
+
+	// ── previewCommittedPlan command ─────────────────────────────────────────
+	describe("previewCommittedPlan", () => {
+		it("reads the foreign FolderStorage when a foreign repo name + url are provided", async () => {
+			const foreignStorage = { kind: "foreign" };
+			mockBridge.createStorageForRepo.mockResolvedValueOnce({
+				storage: foreignStorage,
+				kbRoot: "/kb/other",
+			});
+			readPlanFromBranch.mockResolvedValueOnce("# Plan body");
+			activate(makeContext());
+
+			const handler = getRegisteredCommand("jollimemory.previewCommittedPlan");
+			await handler("plan-slug", "Plan Title", "other-repo", "https://github.com/other/repo.git");
+
+			expect(mockBridge.createStorageForRepo).toHaveBeenCalledWith(
+				"other-repo",
+				"https://github.com/other/repo.git",
+			);
+			expect(readPlanFromBranch).toHaveBeenCalledWith("plan-slug", "/test/workspace", foreignStorage);
+		});
+
+		it("coerces a missing foreign url to null when building the foreign read storage", async () => {
+			mockBridge.createStorageForRepo.mockResolvedValueOnce({ storage: {}, kbRoot: "/kb/x" });
+			readPlanFromBranch.mockResolvedValueOnce("# Body");
+			activate(makeContext());
+
+			const handler = getRegisteredCommand("jollimemory.previewCommittedPlan");
+			await handler("s", "T", "other-repo");
+
+			expect(mockBridge.createStorageForRepo).toHaveBeenCalledWith("other-repo", null);
+		});
+
+		it("passes undefined storage (local read) when no foreign repo is given", async () => {
+			readPlanFromBranch.mockResolvedValueOnce("# Local body");
+			activate(makeContext());
+
+			const handler = getRegisteredCommand("jollimemory.previewCommittedPlan");
+			await handler("local-slug", "Local Title");
+
+			expect(mockBridge.createStorageForRepo).not.toHaveBeenCalled();
+			expect(readPlanFromBranch).toHaveBeenCalledWith("local-slug", "/test/workspace", undefined);
+		});
+	});
+
+	// ── Branch-recall command handlers delegate to BranchRecallCommands ──────
+	describe("branch recall command handlers", () => {
+		it("recallBranchInClaudeCode delegates to runRecallInClaudeCode", async () => {
+			activate(makeContext());
+			await getRegisteredCommand("jollimemory.recallBranchInClaudeCode")();
+			expect(vi.mocked(runRecallInClaudeCode)).toHaveBeenCalledWith(mockBridge, "/test/workspace");
+		});
+
+		it("copyBranchRecallPrompt delegates to runCopyBranchRecallPrompt", async () => {
+			activate(makeContext());
+			await getRegisteredCommand("jollimemory.copyBranchRecallPrompt")();
+			expect(vi.mocked(runCopyBranchRecallPrompt)).toHaveBeenCalledWith(mockBridge, "/test/workspace");
+		});
+	});
+
+	// ── createPrForBranch / reviewNextMemory / regenerateNextMemoryTitle ─────
+	describe("panel-opening command handlers", () => {
+		it("createPrForBranch opens the Create PR panel for the main branch", async () => {
+			activate(makeContext());
+			await getRegisteredCommand("jollimemory.createPrForBranch")();
+			expect(MockCreatePrWebviewPanel.show).toHaveBeenCalledWith(
+				expect.anything(),
+				"/test/workspace",
+				mockBridge,
+				"main",
+				// 5th arg: the current signed-in state, driving the share-to-Space notice.
+				expect.any(Boolean),
+			);
+		});
+
+		it("reviewNextMemory opens the NextMemoryPreviewPanel", async () => {
+			activate(makeContext());
+			await getRegisteredCommand("jollimemory.reviewNextMemory")();
+			expect(vi.mocked(NextMemoryPreviewPanel.show)).toHaveBeenCalled();
+		});
+
+		it("regenerateNextMemoryTitle re-opens the NextMemoryPreviewPanel", async () => {
+			activate(makeContext());
+			await getRegisteredCommand("jollimemory.regenerateNextMemoryTitle")();
+			expect(vi.mocked(NextMemoryPreviewPanel.show)).toHaveBeenCalled();
+		});
+	});
+
+	// ── shareBranch command ──────────────────────────────────────────────────
+	describe("shareBranch", () => {
+		it("shows an info message and opens no panel when the branch has no memories", async () => {
+			vi.mocked(loadBranchSummaries).mockResolvedValueOnce({ summaries: [], missingCount: 0 });
+			activate(makeContext());
+			await getRegisteredCommand("jollimemory.shareBranch")();
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringContaining("No memories on this branch to share yet"),
+			);
+			expect(MockSummaryWebviewPanel.showWithShareModal).not.toHaveBeenCalled();
+		});
+
+		it("opens the share modal on the newest memory with null storage when no read storage resolves", async () => {
+			const newest = { hash: "bbb222" };
+			vi.mocked(loadBranchSummaries).mockResolvedValueOnce({
+				summaries: [{ hash: "aaa111" }, newest] as never,
+				missingCount: 0,
+			});
+			mockBridge.createReadStorageForCurrentRepo.mockResolvedValueOnce(null);
+			activate(makeContext());
+			await getRegisteredCommand("jollimemory.shareBranch")();
+			expect(MockSummaryWebviewPanel.showWithShareModal).toHaveBeenCalledWith(
+				newest,
+				expect.anything(),
+				"/test/workspace",
+				mockBridge,
+				"main",
+				"branch",
+				null,
+			);
+		});
+
+		it("threads a resolved read storage into the branch share modal", async () => {
+			const storage = { kind: "cur-repo" };
+			vi.mocked(loadBranchSummaries).mockResolvedValueOnce({
+				summaries: [{ hash: "ccc333" }] as never,
+				missingCount: 0,
+			});
+			mockBridge.createReadStorageForCurrentRepo.mockResolvedValueOnce({ storage, kbRoot: "/kb/cur" });
+			activate(makeContext());
+			await getRegisteredCommand("jollimemory.shareBranch")();
+			expect(MockSummaryWebviewPanel.showWithShareModal).toHaveBeenCalledWith(
+				expect.anything(),
+				expect.anything(),
+				"/test/workspace",
+				mockBridge,
+				"main",
+				"branch",
+				storage,
+			);
+		});
+	});
+
+	// ── shareMemory command ──────────────────────────────────────────────────
+	describe("shareMemory", () => {
+		it("shows an info message when the summary is not in this repo (plain hash arg)", async () => {
+			mockBridge.getSummary.mockResolvedValueOnce(null);
+			activate(makeContext());
+			await getRegisteredCommand("jollimemory.shareMemory")("missinghash");
+			expect(mockBridge.getSummary).toHaveBeenCalledWith("missinghash");
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Sharing works from the memory's own repository"),
+			);
+			expect(MockSummaryWebviewPanel.showWithShareModal).not.toHaveBeenCalled();
+		});
+
+		it("opens the commit share modal for a MemoryItem when the summary resolves (null storage)", async () => {
+			const summary = { hash: "ddd444" };
+			mockBridge.getSummary.mockResolvedValueOnce(summary);
+			mockBridge.createReadStorageForCurrentRepo.mockResolvedValueOnce(null);
+			activate(makeContext());
+			await getRegisteredCommand("jollimemory.shareMemory")({ entry: { commitHash: "ddd4444444" } });
+			expect(mockBridge.getSummary).toHaveBeenCalledWith("ddd4444444");
+			expect(MockSummaryWebviewPanel.showWithShareModal).toHaveBeenCalledWith(
+				summary,
+				expect.anything(),
+				"/test/workspace",
+				mockBridge,
+				"main",
+				"commit",
+				null,
+			);
+		});
+
+		it("threads a resolved read storage into the commit share modal", async () => {
+			const storage = { kind: "cur-repo" };
+			mockBridge.getSummary.mockResolvedValueOnce({ hash: "eee555" });
+			mockBridge.createReadStorageForCurrentRepo.mockResolvedValueOnce({ storage, kbRoot: "/kb/cur" });
+			activate(makeContext());
+			await getRegisteredCommand("jollimemory.shareMemory")({ entry: { commitHash: "eee5555555" } });
+			expect(MockSummaryWebviewPanel.showWithShareModal).toHaveBeenCalledWith(
+				expect.anything(),
+				expect.anything(),
+				"/test/workspace",
+				mockBridge,
+				"main",
+				"commit",
+				storage,
+			);
 		});
 	});
 });

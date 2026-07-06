@@ -811,8 +811,26 @@ export function buildSidebarCss(): string {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .tree-node[data-context="commitFile"] .desc,
-  .tree-node.tree-node--changes .desc {
+  /* Changes rows stack filename over directory (matching committed-memory
+     .mef-text Files rows) instead of the inline dirname commit-file rows use.
+     The column wrapper takes the row's flexible middle; the filename .label
+     inside keeps its own ellipsis, the dir line is muted + smaller below. */
+  .tree-node.tree-node--changes .change-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .tree-node.tree-node--changes .change-text .label { flex: 0 0 auto; max-width: 100%; }
+  .tree-node.tree-node--changes .change-dir {
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tree-node[data-context="commitFile"] .desc {
     flex: 0 9999 auto;
     min-width: 0;
     overflow: hidden;

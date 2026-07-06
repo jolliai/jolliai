@@ -252,6 +252,11 @@
 				"category": "Jolli Memory"
 			},
 			{
+				"command": "jollimemory.regenerateNextMemoryTitle",
+				"title": "Jolli Memory: Regenerate Next Memory Title",
+				"category": "Jolli Memory"
+			},
+			{
 				"command": "jollimemory.shareBranch",
 				"title": "Jolli Memory: Share Branch",
 				"category": "Jolli Memory"

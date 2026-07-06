@@ -41,6 +41,56 @@ function buildMetaStrip(vm: CreatePrViewModel): string {
 		`<span>drafted from ${vm.memoryCount} ${countLabel}</span>` +
 		`<span class="meta-sep">·</span>` +
 		`<span class="ship-status">+${vm.insertions} −${vm.deletions} · ${vm.filesChanged} ${fileLabel}</span>` +
+		`</div>` +
+		buildPrHistoryStrip(vm)
+	);
+}
+
+/**
+ * Lightweight "Previously: #N (merged) · #M (closed)" strip rendered directly
+ * under the meta-strip. Surfaces PRs already opened from this branch (e.g. a
+ * merged one) so their links stay reachable from the Create-PR pane. Each entry
+ * is a role="link" span carrying `data-pr-url`; buildScript wires them to the
+ * same `openPr` host message the open-PR pill uses (CSP forbids inline
+ * handlers). Renders nothing when the branch has no closed/merged PRs.
+ */
+function buildPrHistoryStrip(vm: CreatePrViewModel): string {
+	const history = vm.prHistory ?? [];
+	if (history.length === 0) return "";
+	const links = history
+		.map(
+			(e) =>
+				`<span class="pr-history-link" role="link" tabindex="0" data-pr-url="${esc(e.url)}">` +
+				`#${e.number} (${e.state === "MERGED" ? "merged" : "closed"})</span>`,
+		)
+		.join(`<span class="meta-sep"> · </span>`);
+	return `<div class="pr-history"><span class="pr-history-label">Previously:</span> ${links}</div>`;
+}
+
+function buildShareNotice(vm: CreatePrViewModel): string {
+	// Both variants are rendered up front; the inactive one starts `.hidden`.
+	// When the user signs in from the link below, the host posts an `authChanged`
+	// message and the script toggles `.hidden` in place — a full re-render would
+	// wipe any title/body the user typed into the edit form.
+	const signedIn = vm.signedIn === true;
+	// The Sign In affordance is a role="link" span (not an <a href>): under the
+	// webview CSP the click must post a message the host turns into the
+	// jollimemory.signIn command, mirroring the pr-open-link idiom above.
+	const signInLink =
+		`<span class="share-signin-link" id="pr-signin-link" role="link" tabindex="0">Sign In</span>`;
+	// Leading sync glyph, matching the mockup's `.ship-sub` arrow-swap icon.
+	// Renders only when the codicon font is linked (assets present); an empty
+	// span in icon-free test mode is harmless.
+	const swapIcon = `<span class="codicon codicon-arrow-swap share-icon"></span>`;
+	return (
+		`<div class="share-notice" id="share-notice">` +
+		`<span class="share-signed-in${signedIn ? "" : " hidden"}" id="share-signed-in">` +
+		`${swapIcon}Signed in: creating this PR also shares the included memories to your Jolli Space.` +
+		`</span>` +
+		`<span class="share-signed-out${signedIn ? " hidden" : ""}" id="share-signed-out">` +
+		`${swapIcon}${signInLink} to also share these memories to Jolli Space when you create the PR — ` +
+		`or create the PR now; it stays a normal git PR.` +
+		`</span>` +
 		`</div>`
 	);
 }
@@ -50,7 +100,10 @@ function buildMemoryRows(vm: CreatePrViewModel): string {
 		.map(
 			(m) =>
 				`<div class="row" data-hash="${esc(m.hash)}">` +
-				`<span class="mem-ico">▤</span>` +
+				// Markdown-file glyph tinted blue — same as the sidebar's committed
+				// memory rows (memory-row-icon.kb-icon-memory codicon-markdown),
+				// replacing the flat gray ▤ so a memory reads as a memory doc.
+				`<span class="mem-ico"><span class="codicon codicon-markdown"></span></span>` +
 				`<div class="r-main">` +
 				`<div class="r-title">${esc(m.title)}</div>` +
 				`<div class="r-sub">` +
@@ -66,9 +119,17 @@ function buildMemoryRows(vm: CreatePrViewModel): string {
 function buildFileRows(vm: CreatePrViewModel): string {
 	return vm.files
 		.map((f) => {
+			// `.pop()` on a `.split("/")` result is never undefined — split always
+			// yields at least one element (an empty string for a trailing/empty
+			// path), so the `?? f.path` fallback is unreachable at runtime. It
+			// exists only to satisfy pop()'s `string | undefined` return type.
+			/* v8 ignore start */
 			const fname = f.path.split("/").pop() ?? f.path;
+			/* v8 ignore stop */
 			return (
-				`<div class="row" data-path="${esc(f.path)}">` +
+				// `data-old` carries the rename's base-side path so openDiff can read the
+				// left (base) side from where the content lived; absent for non-renames.
+				`<div class="row" data-path="${esc(f.path)}"${f.oldPath ? ` data-old="${esc(f.oldPath)}"` : ""}>` +
 				`<div class="r-main">` +
 				`<div class="r-title fname-${esc(f.status)}">${esc(fname)}</div>` +
 				`<div class="r-sub">${esc(f.dir)}</div>` +
@@ -129,8 +190,10 @@ function buildCss(nonce: string): string {
     --border-light: rgba(0,0,0,0.06);
     --text-secondary: rgba(0,0,0,0.45);
     --text-tertiary: rgba(0,0,0,0.32);
-    --pill-bg: rgba(0,0,0,0.06);
-    --pill-text: rgba(0,0,0,0.55);
+    /* Branch pill — blue-tinted per the mockup (mock-kit.css .meta-branch), not
+       a neutral gray, so the head → base branches read as branch references. */
+    --pill-bg: rgba(63,133,245,0.12);
+    --pill-text: #2b73ee;
     --panel-bg: rgba(0,0,0,0.012);
     --panel-inner: rgba(0,0,0,0.03);
     --ship-ok: #267f3f;
@@ -142,8 +205,8 @@ function buildCss(nonce: string): string {
     --border-light: rgba(255,255,255,0.06);
     --text-secondary: rgba(255,255,255,0.45);
     --text-tertiary: rgba(255,255,255,0.30);
-    --pill-bg: rgba(255,255,255,0.08);
-    --pill-text: rgba(255,255,255,0.60);
+    --pill-bg: rgba(107,165,248,0.16);
+    --pill-text: #8ab9fa;
     --panel-bg: rgba(255,255,255,0.018);
     --panel-inner: rgba(255,255,255,0.045);
     --ship-ok: #4ece8d;
@@ -179,6 +242,26 @@ function buildCss(nonce: string): string {
     cursor: pointer; color: var(--vscode-textLink-foreground); font-weight: 600;
   }
   .pr-open-link:hover { text-decoration: underline; color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground)); }
+  /* ── Previously-merged PR strip (sits directly under the meta strip) ── */
+  .pr-history {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 3px 6px;
+    font-size: 0.82em; color: var(--text-tertiary);
+    margin-top: -10px; margin-bottom: 16px;
+  }
+  .pr-history .meta-sep { color: var(--text-tertiary); opacity: 0.55; }
+  .pr-history-label { color: var(--text-secondary); }
+  .pr-history-link { cursor: pointer; color: var(--vscode-textLink-foreground); }
+  .pr-history-link:hover { text-decoration: underline; color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground)); }
+  /* ── Share-to-Jolli-Space notice (sits directly under the meta strip) ── */
+  .share-notice {
+    font-size: 0.86em; color: var(--text-secondary); line-height: 1.5;
+    margin: -6px 0 16px;
+  }
+  .share-icon { font-size: 1em; margin-right: 5px; opacity: 0.8; vertical-align: text-bottom; }
+  .share-signin-link {
+    cursor: pointer; color: var(--vscode-textLink-foreground); font-weight: 600;
+  }
+  .share-signin-link:hover { text-decoration: underline; color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground)); }
   /* ── Status chip ── */
   .ship-status {
     margin-left: auto; display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
@@ -197,7 +280,7 @@ function buildCss(nonce: string): string {
   }
   .panel-title { font-size: 0.78em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.09em; color: var(--text-secondary); }
   .sec-count {
-    margin-left: auto; font-size: 0.78em; font-weight: 600; color: var(--text-tertiary);
+    font-size: 0.78em; font-weight: 600; color: var(--text-tertiary);
   }
   /* ── Rows (memories + files) ── */
   .row {
@@ -205,7 +288,8 @@ function buildCss(nonce: string): string {
     padding: 7px 4px; border-radius: 6px; cursor: pointer;
   }
   .row:hover { background: var(--surface-hover); }
-  .mem-ico { font-size: 1em; opacity: 0.5; flex-shrink: 0; }
+  .mem-ico { width: 16px; flex-shrink: 0; text-align: center; }
+  .mem-ico .codicon { font-size: 14px; line-height: 1; color: var(--vscode-charts-blue, #2f7adc); }
   .r-main { flex: 1; min-width: 0; }
   .r-title { font-size: 0.9em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .r-sub { font-size: 0.78em; color: var(--text-secondary); }
@@ -220,6 +304,16 @@ function buildCss(nonce: string): string {
   .gs-R { color: var(--vscode-gitDecoration-renamedResourceForeground); }
   .gs-U { color: var(--vscode-gitDecoration-untrackedResourceForeground); }
   .gs-C { color: var(--vscode-gitDecoration-conflictingResourceForeground); }
+  /* Filename tinted by git-status. The file row already emits
+     .r-title.fname-<code>, but without these rules the name rendered as plain
+     foreground (all-white) — only the trailing letter was colored. Mirrors the
+     mockup + the Working Memory / memory-detail file rows. */
+  .fname-M { color: var(--vscode-gitDecoration-modifiedResourceForeground); }
+  .fname-A { color: var(--vscode-gitDecoration-addedResourceForeground); }
+  .fname-D { color: var(--vscode-gitDecoration-deletedResourceForeground); }
+  .fname-R { color: var(--vscode-gitDecoration-renamedResourceForeground); }
+  .fname-U { color: var(--vscode-gitDecoration-untrackedResourceForeground); }
+  .fname-C { color: var(--vscode-gitDecoration-conflictingResourceForeground); }
   /* ── Body markdown (rendered like the memory detail view) ── */
   .md-body { font-size: 0.9em; line-height: 1.6; color: var(--vscode-foreground); word-break: break-word; }
   .md-body .md-heading {
@@ -268,13 +362,33 @@ function buildCss(nonce: string): string {
      matches that specificity and — loading after the linked stylesheet — wins on
      source order, sizing the pull-request glyph to the button label. */
   .btn .codicon { font-size: 1em; }
-  .btn:hover { background: var(--vscode-button-hoverBackground); }
+  /* Hover is gated on :not(:disabled) so an in-flight (disabled) button never
+     lights up on hover — otherwise it would still read as clickable. */
+  .btn:not(:disabled):hover { background: var(--vscode-button-hoverBackground); }
   .btn.secondary {
     background: var(--vscode-button-secondaryBackground, var(--surface-hover));
     color: var(--vscode-button-secondaryForeground, var(--text-secondary));
     border-color: var(--vscode-button-border, var(--border-light));
   }
-  .btn.secondary:hover { background: var(--vscode-button-secondaryHoverBackground, var(--surface-hover)); color: var(--vscode-foreground); }
+  .btn.secondary:not(:disabled):hover { background: var(--vscode-button-secondaryHoverBackground, var(--surface-hover)); color: var(--vscode-foreground); }
+  /* Disabled state for the in-flight operation: the .btn background/color above
+     override the browser's default greyed-out look, so restore it explicitly —
+     dimmed + a not-allowed cursor make "can't click this yet" obvious. */
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* Progress line shown below the action buttons while a push + create/update is
+     in flight. Host posts prProgress with the current step's text; the settle
+     messages clear it. The pulsing dot signals "still working" without needing
+     the codicon spinner font (which is absent in the icon-free/test render). */
+  .pr-progress {
+    display: flex; align-items: center; gap: 8px; margin-top: 10px;
+    font-size: 0.85em; color: var(--vscode-descriptionForeground, var(--text-secondary));
+  }
+  .pr-progress::before {
+    content: ""; width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto;
+    background: var(--vscode-progressBar-background, var(--vscode-textLink-foreground));
+    animation: pr-progress-pulse 1.1s ease-in-out infinite;
+  }
+  @keyframes pr-progress-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
   /* ── Edit form (revealed by the Edit button) ── */
   /* Mirrors the pr-form-input/pr-form-textarea styling in PrCommentService's
      buildPrSectionCss: theme input bg/fg, full width, comfortable padding. */
@@ -316,14 +430,34 @@ function buildScript(nonce: string): string {
   const submitButtons = ['cmd-create-pr', 'cmd-create-edited']
     .map(function (id) { return document.getElementById(id); })
     .filter(Boolean);
+  // Buttons disabled for the whole operation. Beyond the submit buttons this
+  // includes Edit ('cmd-edit'): once a push + create/update is under way the
+  // user must not switch into the edit form mid-flight, so it greys out too and
+  // re-enables on the same settle messages that free the submit buttons.
+  const disableWhileInFlight = submitButtons.concat(
+    ['cmd-edit'].map(function (id) { return document.getElementById(id); }).filter(Boolean),
+  );
   var inFlight = false;
   function setInFlight(on) {
     inFlight = on;
-    submitButtons.forEach(function (b) { b.disabled = on; });
+    disableWhileInFlight.forEach(function (b) { b.disabled = on; });
+  }
+  // Step text rendered below the action buttons. There is one .pr-progress line
+  // per mode (view / edit); only the one in the visible mode shows, so updating
+  // both is harmless. Empty text hides the line. Cleared on every settle message.
+  function setProgress(text) {
+    document.querySelectorAll('.pr-progress').forEach(function (el) {
+      el.textContent = text || '';
+      el.classList.toggle('hidden', !text);
+    });
   }
   function submit(payload) {
     if (inFlight) return;
     setInFlight(true);
+    // Instant feedback: the host's pre-flight PR lookup can take a second or two
+    // before the first prProgress step arrives — show something immediately so
+    // the disabled buttons don't read as an unresponsive click.
+    setProgress('Starting…');
     vscode.postMessage(payload);
   }
   // The host posts these back as the create/update progresses. Without a
@@ -335,16 +469,50 @@ function buildScript(nonce: string): string {
       case 'prCreating':
         setInFlight(true);
         break;
+      case 'prProgress':
+        // A step of the in-flight operation (push / create / update). Keep the
+        // buttons disabled and surface the step text below them.
+        setInFlight(true);
+        setProgress(msg.text);
+        break;
       case 'prCreateFailed':
       case 'prCreateBlockedCrossBranch':
-      case 'prStatus':
-        // Failure, block, or the post-op status refresh (success) — the
-        // operation has settled, so let the user act again. The host-side
-        // guards now route an existing PR to update, so a re-click is safe.
+        // Failure or cross-branch block. Re-enable the buttons and clear the
+        // progress line, but stay on whichever mode the user submitted from —
+        // if they were in the edit form, keep it open so they can fix + retry.
         setInFlight(false);
+        setProgress('');
         break;
+      case 'prComplete':
+        // The panel signals the WHOLE operation is done — PR create/update AND
+        // the post-success memory push to Jolli Space. prStatus fires mid-flight
+        // (right after the PR, before the memory push), so it is deliberately no
+        // longer a settle signal; only prComplete re-enables the buttons. It also
+        // returns to the read-only view, dismissing the edit form if it was open.
+        setInFlight(false);
+        setProgress('');
+        showViewMode();
+        break;
+      case 'authChanged': {
+        // The user signed in (or out) — likely from the Sign In link in this
+        // very notice. Swap the notice variant in place rather than re-render,
+        // which would wipe any title/body typed into the edit form.
+        var signedInEl = document.getElementById('share-signed-in');
+        var signedOutEl = document.getElementById('share-signed-out');
+        if (signedInEl && signedOutEl) {
+          signedInEl.classList.toggle('hidden', !msg.authenticated);
+          signedOutEl.classList.toggle('hidden', !!msg.authenticated);
+        }
+        break;
+      }
     }
   });
+  // Returns to the read-only view from the edit form. Shared by Cancel and the
+  // post-success prComplete handler so both dismiss the form the same way.
+  function showViewMode() {
+    document.getElementById('edit-form').classList.add('hidden');
+    document.getElementById('view-mode').classList.remove('hidden');
+  }
   document.getElementById('cmd-create-pr').addEventListener('click', function () {
     submit({ command: 'createPr' });
   });
@@ -355,10 +523,7 @@ function buildScript(nonce: string): string {
     document.getElementById('view-mode').classList.add('hidden');
     document.getElementById('edit-form').classList.remove('hidden');
   });
-  document.getElementById('cmd-cancel').addEventListener('click', function () {
-    document.getElementById('edit-form').classList.add('hidden');
-    document.getElementById('view-mode').classList.remove('hidden');
-  });
+  document.getElementById('cmd-cancel').addEventListener('click', showViewMode);
   document.getElementById('cmd-copy-body').addEventListener('click', function () {
     vscode.postMessage({ command: 'copyBody' });
   });
@@ -376,9 +541,23 @@ function buildScript(nonce: string): string {
   });
   document.querySelectorAll('.row[data-path]').forEach(function (r) {
     r.addEventListener('click', function () {
-      vscode.postMessage({ command: 'openDiff', path: r.getAttribute('data-path') });
+      var oldPath = r.getAttribute('data-old');
+      var msg = { command: 'openDiff', path: r.getAttribute('data-path') };
+      if (oldPath) msg.oldPath = oldPath;
+      vscode.postMessage(msg);
     });
   });
+  // Sign In link inside the share notice (signed-out state only). Posts a
+  // message the host turns into the jollimemory.signIn command; on success the
+  // host posts authChanged and the notice swaps to the signed-in variant above.
+  var signinLink = document.getElementById('pr-signin-link');
+  if (signinLink) {
+    var doSignIn = function () { vscode.postMessage({ command: 'signIn' }); };
+    signinLink.addEventListener('click', doSignIn);
+    signinLink.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); doSignIn(); }
+    });
+  }
   var prLink = document.getElementById('pr-open-link');
   if (prLink) {
     var openExisting = function () {
@@ -389,6 +568,17 @@ function buildScript(nonce: string): string {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openExisting(); }
     });
   }
+  // Previously-merged PR links: same openPr host message as the open-PR pill,
+  // but class-based (there can be several). The host's https-only guard applies.
+  document.querySelectorAll('.pr-history-link').forEach(function (link) {
+    var openHistory = function () {
+      vscode.postMessage({ command: 'openPr', url: link.getAttribute('data-pr-url') });
+    };
+    link.addEventListener('click', openHistory);
+    link.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openHistory(); }
+    });
+  });
 })();
 </script>`;
 }
@@ -451,6 +641,7 @@ export function buildCreatePrHtml(vm: CreatePrViewModel, nonce: string, assets?:
   <h1>${heading}</h1>
   <div id="view-mode">
     ${buildMetaStrip(vm)}
+    ${buildShareNotice(vm)}
     <div class="panel">
       <div class="panel-header"><span class="panel-title">Title</span></div>
       <p>${esc(vm.title)}</p>
@@ -479,6 +670,7 @@ export function buildCreatePrHtml(vm: CreatePrViewModel, nonce: string, assets?:
       <button class="btn secondary" id="cmd-edit">Edit</button>
       <button class="btn secondary" id="cmd-copy-body">Copy body</button>
     </div>
+    <p class="pr-progress hidden" role="status" aria-live="polite"></p>
   </div>
   <div class="edit-form hidden" id="edit-form">
     <div class="field">
@@ -493,6 +685,7 @@ export function buildCreatePrHtml(vm: CreatePrViewModel, nonce: string, assets?:
       <button class="btn" id="cmd-create-edited">${prIcon}${primaryLabel}</button>
       <button class="btn secondary" id="cmd-cancel">Cancel</button>
     </div>
+    <p class="pr-progress hidden" role="status" aria-live="polite"></p>
   </div>
 </div>
 ${buildScript(nonce)}

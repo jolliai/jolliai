@@ -1,10 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
-
-// ─── Mock PrCommentService ──────────────────────────────────────────────────
-vi.mock("../services/PrCommentService.js", () => ({
-	buildPrSectionScript: () => "/* pr-script */",
-	buildPrMessageScript: () => "/* pr-msg-script */",
-}));
+import { describe, expect, it } from "vitest";
 
 import { buildScript } from "./SummaryScriptBuilder.js";
 
@@ -98,11 +92,29 @@ describe("SummaryScriptBuilder", () => {
 		expect(script).toContain("copyMarkdown");
 	});
 
+	it("wires the Export button (#exportMenuToggle) to toggle the #exportMenu dropdown by id, not by split-button class", () => {
+		expect(script).toContain("getElementById('exportMenuToggle')");
+		expect(script).toContain("getElementById('exportMenu')");
+		expect(script).toContain("dropdownMenu.classList.toggle('open')");
+		// Wiring must key off ids, never the retired split-btn-group/split-toggle classes.
+		expect(script).not.toContain("split-toggle");
+		expect(script).not.toContain("split-btn-group");
+	});
+
 	it("contains push button handler with 'push' command", () => {
 		expect(script).toContain("pushJolliBtn");
 		expect(script).toContain("command: 'push'");
 		// Old command name should NOT appear anywhere in the script
 		expect(script).not.toContain("command: 'pushToJolli'");
+	});
+
+	it("push button always posts push and never branches to openJolli", () => {
+		// The synced-vs-local distinction is now purely a label ("Update on
+		// Jolli" vs "Push to Jolli"); the click always posts push, which
+		// re-uploads the doc in place when it already exists. The old
+		// data-jolli-open / openJolli open-in-browser path was removed.
+		expect(script).not.toContain("data-jolli-open");
+		expect(script).not.toContain("openJolli");
 	});
 
 	it("re-enables the push button on pushToJolliResult and disables it on pushStarted", () => {
@@ -115,14 +127,6 @@ describe("SummaryScriptBuilder", () => {
 		expect(script).not.toContain("pushToLocalResult");
 		expect(script).not.toContain("pushAction");
 		expect(script).not.toContain("pendingLocal");
-	});
-
-	it("contains the PR section script from buildPrSectionScript()", () => {
-		expect(script).toContain("/* pr-script */");
-	});
-
-	it("contains the PR message script from buildPrMessageScript()", () => {
-		expect(script).toContain("/* pr-msg-script */");
 	});
 
 	it("contains topic edit/delete handlers", () => {
@@ -389,36 +393,126 @@ describe("SummaryScriptBuilder", () => {
 			expect(script).toContain("getElementById('jolliRow')");
 		});
 
-		it("conversationsUpdated replaces the section and re-binds refs + buttons", () => {
-			expect(script).toContain("msg.command === 'conversationsUpdated'");
-			expect(script).toContain(
-				"replaceSection('allConversationsSection', msg.html)",
-			);
-			expect(script).toContain("function bindConversationsSection()");
-		});
-
-		it("transcriptsSaved/Deleted no longer closeModal — close is owned by the conversationsUpdated rebuild", () => {
-			// Guard against regressing to the old `transcriptsSaved') { closeModal() }`
-			// shape; the section rebuild closes the modal instead.
-			expect(script).not.toMatch(
-				/transcriptsSaved'\s*\)\s*\{\s*closeModal\(\)/,
-			);
-		});
-
-		it("the modal ESC keydown is registered once OUTSIDE bindConversationsSection (no per-refresh leak)", () => {
-			const bindStart = script.indexOf("function bindConversationsSection()");
-			const bindEnd = script.indexOf("bindConversationsSection();", bindStart);
-			const bindBody = script.slice(bindStart, bindEnd);
-			expect(bindBody).not.toContain("addEventListener('keydown'");
-			// …but the global keydown handler does exist at top level.
-			expect(script).toContain("addEventListener('keydown'");
-		});
-
 		it("replaceSection strips a stale trailing <hr> only when the new html ends in one (generalized beyond recap)", () => {
 			expect(script).toContain("function replaceSection(id, html)");
 			expect(script).toContain("lastNew.tagName === 'HR'");
 			// The old recap-only special-case (id === 'recapSection') is gone.
 			expect(script).not.toContain("id === 'recapSection'");
+		});
+	});
+
+	// ─── Token meter (.tmeter): segment widths + help popover pin ─────────────
+	describe("token meter", () => {
+		it("sets segment widths from data-pct after load (CSP forbids inline style)", () => {
+			expect(script).toContain(".tmeter-bar [data-pct]");
+			expect(script).toContain("el.style.width = el.dataset.pct + '%'");
+		});
+
+		it("wires the .tok-help button to toggle .pinned on its .tok-help-wrap", () => {
+			expect(script).toContain(".tok-help");
+			expect(script).toContain("closest('.tok-help-wrap')");
+			expect(script).toContain("classList.add('pinned')");
+			expect(script).toContain("classList.remove('pinned')");
+		});
+	});
+
+	// ─── Conversations inline rows (mockup alignment, Task 7) ────────────────
+	describe("conversations inline rows", () => {
+		it("requests conversation data (loadConversations) on bind", () => {
+			expect(script).toContain("command: 'loadConversations'");
+		});
+
+		it("renders inline .row markup with a src badge, title, N msgs and a detach button on conversationsData", () => {
+			expect(script).toContain("msg.command === 'conversationsData'");
+			expect(script).toContain('class="row"');
+			expect(script).toContain("badge src-");
+			expect(script).toContain('class="r-title"');
+			expect(script).toContain(" msgs");
+			expect(script).toContain("conv-detach");
+			// Uses the shared source-label helper for the badge text.
+			expect(script).toContain("getSourceLabel(");
+		});
+
+		it("wires .conv-detach to post conversationDetach with hash + sessionId + source (delegation, no inline handler)", () => {
+			expect(script).toContain("conv-detach");
+			expect(script).toContain("command: 'conversationDetach'");
+			expect(script).toContain("source: row.getAttribute('data-source')");
+		});
+
+		it("renders each row with a data-source attribute so detach can match the source:sessionId composite key", () => {
+			// Two different sources can mint the same raw sessionId, so
+			// matching detach by sessionId alone risks resolving to (or
+			// removing) the wrong row — data-source is the disambiguator.
+			expect(script).toContain('data-source="');
+		});
+
+		// Task 11 gating verification: the detach button is destructive (it
+		// rewrites the orphan-branch transcript via conversationDetach — see
+		// SummaryWebviewPanel's FOREIGN_SAFE_COMMANDS comment), so it must NOT
+		// carry data-foreign-safe. Without that omission the
+		// `.page.foreign-readonly button:not([data-foreign-safe])` CSS rule
+		// (and its stale-readonly twin) would fail to hide it.
+		it("conv-detach button does not carry data-foreign-safe", () => {
+			const detachButtonMatch = script.match(/<button class="icon-btn danger conv-detach"[^>]*>/);
+			expect(detachButtonMatch).not.toBeNull();
+			expect(detachButtonMatch?.[0]).not.toContain("data-foreign-safe");
+		});
+
+		it("removes the row in place and decrements the count on conversationDetached ack", () => {
+			expect(script).toContain("msg.command === 'conversationDetached'");
+			// In-place removal (mirrors sidebar precise update), not a full rebuild.
+			expect(script).toContain(".row[data-session=");
+		});
+
+		it("matches the acked row by the source:sessionId composite key, not sessionId alone", () => {
+			expect(script).toContain("function conversationRowSelector(sessionId, source)");
+			expect(script).toContain('[data-source="');
+			expect(script).toContain("conversationRowSelector(sid, msg.source)");
+		});
+	});
+
+	// ─── Files panel (per-file status + diff, Task 9) ────────────────────────
+	describe("files panel", () => {
+		it("requests file rows (loadFiles) on bind", () => {
+			expect(script).toContain("command: 'loadFiles'");
+		});
+
+		it("renders per-file rows with status badge classes on files:rows", () => {
+			expect(script).toContain("msg.command === 'files:rows'");
+			expect(script).toContain("fname-");
+			expect(script).toContain("gs gs-");
+		});
+
+		it("emits data-path and data-status on resolvable rows", () => {
+			expect(script).toContain("data-path=\"");
+			expect(script).toContain("data-status=\"");
+		});
+
+		it("emits data-old-path only for resolvable rename (status R) rows", () => {
+			expect(script).toContain("f.status === 'R' && f.oldPath");
+			expect(script).toContain("data-old-path=\"");
+		});
+
+		it("renders off-branch rows as .row.is-unresolvable with no data-path and a files-offbranch-hint naming the branch", () => {
+			expect(script).toContain("row is-unresolvable");
+			expect(script).toContain("dataPath = offBranch ? ''");
+			expect(script).toContain("files-offbranch-hint");
+			expect(script).toContain("Check out <code>");
+			expect(script).toContain("esc(branch)");
+		});
+
+		it("wires a resolvable file row click to post openFileDiff with path, commitHash, status, and oldPath", () => {
+			expect(script).toContain("#filesPanel .row[data-path]");
+			expect(script).toContain("command: 'openFileDiff'");
+			expect(script).toContain("oldPath: row.getAttribute('data-old-path') || undefined");
+		});
+	});
+
+	// ─── Dead-code sweep: PR card moved to its own pane in an earlier task ────
+	describe("dead PR/E2E chain remnants", () => {
+		it("does not reference createPrWithE2eBtn or window.prChainE2eThenCreate (PR card lives in CreatePrWebviewPanel now)", () => {
+			expect(script).not.toContain("createPrWithE2eBtn");
+			expect(script).not.toContain("prChainE2eThenCreate");
 		});
 	});
 });

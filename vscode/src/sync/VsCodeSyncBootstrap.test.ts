@@ -686,6 +686,27 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 	});
 });
 
+describe("SyncRuntime.disposeOrchestrator — no-orchestrator guard", () => {
+	it("is safe when no orchestrator was ever built (L134 else-arm), still releasing bar ownership", () => {
+		// Every public caller pre-checks `orchestrator !== null`, so the guard's
+		// false-arm is only reachable by invoking the private method directly. It
+		// must remain idempotent: skip the (absent) orchestrator dispose but still
+		// run the unconditional tail (releaseSyncOwnership).
+		const releaseSyncOwnership = vi.fn();
+		const runtime = new SyncRuntime(
+			{ subscriptions: { push: () => {} } } as never,
+			{ releaseSyncOwnership } as never,
+		);
+		// orchestrator is null (never built) and currentLockedWaitDispose is null.
+		(
+			runtime as unknown as { disposeOrchestrator: () => void }
+		).disposeOrchestrator();
+
+		expect(releaseSyncOwnership).toHaveBeenCalledTimes(1);
+		expect(runtime.get()).toBeNull();
+	});
+});
+
 describe("SyncRuntime.notifyRepoMappingConflicts (P2#3)", () => {
 	beforeEach(() => {
 		showWarningMessage.mockClear();

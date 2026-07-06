@@ -3,32 +3,56 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // ─── Hoisted mocks ──────────────────────────────────────────────────────────
 
 const {
+	aggregateConversationTokenBreakdown,
+	aggregateConversationTokens,
 	aggregateStats,
 	aggregateTurns,
 	formatDurationLabel,
 	resolveDiffStats,
-} = vi.hoisted(() => ({
-	aggregateStats: vi.fn(() => ({
-		insertions: 10,
-		deletions: 5,
-		filesChanged: 3,
-	})),
-	aggregateTurns: vi.fn(() => 0),
-	formatDurationLabel: vi.fn(() => "2 hours"),
-	// resolveDiffStats: new canonical display-stats helper.
-	// Default impl mirrors the real helper's fallback: node.diffStats →
-	// node.stats → zeros. Source-commit rows with stats-less leaves render
-	// as +0 −0, matching the old production behavior.
-	resolveDiffStats: vi.fn((node: { diffStats?: unknown; stats?: unknown }) => {
-		if (node.diffStats) return node.diffStats;
-		if (node.stats) return node.stats;
-		return { insertions: 0, deletions: 0, filesChanged: 0 };
-	}),
-}));
-
-const { buildPrSectionHtml } = vi.hoisted(() => ({
-	buildPrSectionHtml: vi.fn(() => ""),
-}));
+} = vi.hoisted(() => {
+	// Recursive node shape for the token aggregators (types are compile-time
+	// only, so this local declaration is fine inside the hoisted factory).
+	interface TokNode {
+		conversationTokens?: number;
+		conversationTokenBreakdown?: { input: number; output: number; cached: number };
+		children?: ReadonlyArray<TokNode>;
+	}
+	// Mirror the real SummaryTree aggregators: the token meter now sums the whole
+	// consolidation tree (not the root's own scalar), so the mock must recurse or
+	// the meter tests can't exercise the amend/squash-folded-children case.
+	const sumTokens = (node: TokNode): number =>
+		(node.children ?? []).reduce((a, c) => a + sumTokens(c), node.conversationTokens ?? 0);
+	const sumBreakdown = (node: TokNode): { input: number; output: number; cached: number } => {
+		const raw = node.conversationTokenBreakdown;
+		return (node.children ?? []).reduce(
+			(acc, c) => {
+				const ch = sumBreakdown(c);
+				return { input: acc.input + ch.input, output: acc.output + ch.output, cached: acc.cached + ch.cached };
+			},
+			{ input: raw?.input ?? 0, output: raw?.output ?? 0, cached: raw?.cached ?? 0 },
+		);
+	};
+	return {
+		aggregateConversationTokens: vi.fn(sumTokens),
+		aggregateConversationTokenBreakdown: vi.fn(sumBreakdown),
+		aggregateStats: vi.fn(() => ({
+			insertions: 10,
+			deletions: 5,
+			filesChanged: 3,
+		})),
+		aggregateTurns: vi.fn(() => 0),
+		formatDurationLabel: vi.fn(() => "2 hours"),
+		// resolveDiffStats: new canonical display-stats helper.
+		// Default impl mirrors the real helper's fallback: node.diffStats →
+		// node.stats → zeros. Source-commit rows with stats-less leaves render
+		// as +0 −0, matching the old production behavior.
+		resolveDiffStats: vi.fn((node: { diffStats?: unknown; stats?: unknown }) => {
+			if (node.diffStats) return node.diffStats;
+			if (node.stats) return node.stats;
+			return { insertions: 0, deletions: 0, filesChanged: 0 };
+		}),
+	};
+});
 
 const { buildCss } = vi.hoisted(() => ({
 	buildCss: vi.fn(() => "/* css */"),
@@ -45,9 +69,14 @@ const {
 	formatDate,
 	formatFullDate,
 	formatProviderLabel,
+	formatSonnetCostEstimate,
+	formatTokensCompact,
 	getDisplayDate,
 	padIndex,
 	renderCalloutText,
+	SONNET_CACHE_WRITE_PER_TOKEN,
+	SONNET_INPUT_PER_TOKEN,
+	SONNET_OUTPUT_PER_TOKEN,
 	timeAgo,
 } = vi.hoisted(() => ({
 	collectSortedTopics: vi.fn(
@@ -66,26 +95,42 @@ const {
 	// Default to undefined so existing footer assertions stay stable; tests
 	// that exercise provider attribution override via .mockReturnValueOnce.
 	formatProviderLabel: vi.fn((): string | undefined => undefined),
+	// Mirrors the real SummaryUtils.ts implementations — these format visible
+	// token-meter output the tests assert on, so a stub would break every
+	// assertion checking for "1.4M"/"96k"/"≈$X.XX" text in the rendered HTML.
+	formatSonnetCostEstimate: vi.fn((costUsd: number) =>
+		costUsd >= 0.01 ? `≈$${costUsd.toFixed(2)}` : "<$0.01",
+	),
+	formatTokensCompact: vi.fn((n: number) => {
+		if (n >= 1_000_000) {
+			return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+		}
+		if (n >= 1_000) {
+			return `${Math.round(n / 1_000)}k`;
+		}
+		return String(n);
+	}),
 	getDisplayDate: vi.fn(
 		(e: { generatedAt?: string; commitDate: string }) =>
 			e.generatedAt || e.commitDate,
 	),
 	padIndex: vi.fn((i: number) => String(i + 1).padStart(2, "0")),
 	renderCalloutText: vi.fn((s: string) => s),
+	SONNET_CACHE_WRITE_PER_TOKEN: 3.75 / 1_000_000,
+	SONNET_INPUT_PER_TOKEN: 3 / 1_000_000,
+	SONNET_OUTPUT_PER_TOKEN: 15 / 1_000_000,
 	timeAgo: vi.fn(() => "3 hours ago"),
 }));
 
 // ─── vi.mock declarations ───────────────────────────────────────────────────
 
 vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
+	aggregateConversationTokenBreakdown,
+	aggregateConversationTokens,
 	aggregateStats,
 	aggregateTurns,
 	formatDurationLabel,
 	resolveDiffStats,
-}));
-
-vi.mock("../services/PrCommentService.js", () => ({
-	buildPrSectionHtml,
 }));
 
 vi.mock("./SummaryCssBuilder.js", () => ({
@@ -103,9 +148,14 @@ vi.mock("./SummaryUtils.js", () => ({
 	formatDate,
 	formatFullDate,
 	formatProviderLabel,
+	formatSonnetCostEstimate,
+	formatTokensCompact,
 	getDisplayDate,
 	padIndex,
 	renderCalloutText,
+	SONNET_CACHE_WRITE_PER_TOKEN,
+	SONNET_INPUT_PER_TOKEN,
+	SONNET_OUTPUT_PER_TOKEN,
 	timeAgo,
 }));
 
@@ -119,18 +169,34 @@ import type {
 	PlanReference,
 } from "../../../cli/src/Types.js";
 import {
-	buildAllConversationsSection,
+	buildConversationsSection,
+	buildContextPanel,
 	buildE2eTestSection,
 	buildHtml,
 	buildJolliRow,
+	buildPageTitleAndMetaStrip,
 	buildPlansAndNotesSection,
+	buildPropTable,
 	buildRecapSection,
+	buildShipBar,
+	buildTokenMeter,
 	buildTopicsSection,
 	renderTopic,
 } from "./SummaryHtmlBuilder.js";
 import type { TopicWithDate } from "./SummaryUtils.js";
 
 // ─── Test helpers ───────────────────────────────────────────────────────────
+
+/** Combines the two header-building functions the way `buildHtml` composes them (minus the token meter it inserts between them), for tests that pin the combined header/prop-table output. */
+function buildHeader(
+	summary: CommitSummary,
+	totalFiles: number,
+	transcriptHashSet?: ReadonlySet<string>,
+): string {
+	return `
+${buildPageTitleAndMetaStrip(summary)}
+${buildPropTable(summary, totalFiles, transcriptHashSet)}`;
+}
 
 function makeSummary(overrides?: Partial<CommitSummary>): CommitSummary {
 	return {
@@ -228,7 +294,6 @@ describe("SummaryHtmlBuilder", () => {
 		);
 		aggregateTurns.mockReturnValue(0);
 		formatDurationLabel.mockReturnValue("2 hours");
-		buildPrSectionHtml.mockReturnValue("");
 		buildCss.mockReturnValue("/* css */");
 		buildScript.mockReturnValue("// script");
 		collectSortedTopics.mockReturnValue({
@@ -305,19 +370,31 @@ describe("SummaryHtmlBuilder", () => {
 		// refresh handlers bind to. A future refactor that drops or renames one
 		// of these would silently break push / regenerate / section refreshes.
 		it("preserves the structural ids the refresh handlers + redesign depend on", () => {
-			buildPrSectionHtml.mockReturnValue(
-				'<div id="prSection"></div><hr class="separator" />',
-			);
 			const html = buildHtml(makeSummary({ recap: "A recap." }), {
 				transcriptHashSet: new Set(["t1"]),
 			});
 			// New presentation wrappers
-			for (const id of ["prCard", "propTable", "detailsToggle", "memoryPanel", "plansCard"]) {
+			for (const id of [
+				"jolliCard",
+				"propTable",
+				"detailsToggle",
+				"memoryPanel",
+				"e2ePanel",
+				"contextPanel",
+			]) {
 				expect(html).toContain(`id="${id}"`);
 			}
-			// privateDrawer is gone; conversations are now a top-level section
+			// The old collapsible-card wrappers are gone (flat Context panel).
+			expect(html).not.toContain('id="attachmentsPanel"');
+			expect(html).not.toContain('id="plansCard"');
+			expect(html).not.toContain('id="sourceCard"');
+			// The Create PR flow lives in its own pane (CreatePrHtmlBuilder); the
+			// detail panel no longer hosts a PR card.
+			expect(html).not.toContain('id="prCard"');
+			// privateDrawer is gone; conversations are now a .panel with inline rows
 			expect(html).not.toContain('id="privateDrawer"');
-			expect(html).toContain('class="section conversations-section"');
+			expect(html).toContain("conversations-panel");
+			expect(html).toContain('id="conversationsBody"');
 			expect(html).toContain('class="ship-bar"');
 			expect(html).toContain('class="meta-strip"');
 			// Refresh-target sections must keep their ids (replaceSection contract)
@@ -353,6 +430,67 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).not.toContain("nonce=");
 		});
 
+		// Codicon font wiring — the redesign uses codicons (ship card,
+		// conversation detach, …). The webview never had a codicon
+		// stylesheet before this task, so those icons rendered empty.
+		// Mirrors SidebarWebviewProvider/HtmlBuilder's working approach:
+		// the host computes an asWebviewUri for assets/codicons/codicon.css
+		// and threads it in; buildHtml emits the <link> and widens the CSP
+		// so the stylesheet (and the .ttf font it loads) are allowed.
+		it("emits the codicon <link> tag when codiconCssUri is provided", () => {
+			const html = buildHtml(makeSummary(), {
+				codiconCssUri: "https://file+.vscode-resource.vscode-cdn.net/ext/assets/codicons/codicon.css",
+			});
+			expect(html).toContain(
+				'<link rel="stylesheet" href="https://file+.vscode-resource.vscode-cdn.net/ext/assets/codicons/codicon.css" />',
+			);
+		});
+
+		it("omits the codicon <link> tag when codiconCssUri is not provided", () => {
+			const html = buildHtml(makeSummary());
+			expect(html).not.toContain('<link rel="stylesheet"');
+		});
+
+		it("widens the CSP with font-src and the codicon stylesheet source when both nonce and codiconCssUri are provided", () => {
+			const html = buildHtml(makeSummary(), {
+				nonce: "abc123",
+				codiconCssUri: "https://cdn/codicon.css",
+				cspSource: "https://cdn",
+			});
+			expect(html).toContain("style-src 'nonce-abc123' https://cdn");
+			expect(html).toContain("font-src https://cdn");
+			// nonce script/style CSP must remain intact.
+			expect(html).toContain("script-src 'nonce-abc123'");
+			expect(html).toContain('<style nonce="abc123">');
+		});
+
+		// Whole-panel section order (mockup alignment).
+		it("full panel renders sections in mockup order top-to-bottom", () => {
+			const html = buildHtml(
+				makeSummary({ jolliDocUrl: "https://jolli.ai/x", conversationTokens: 143000 }),
+				{ transcriptHashSet: new Set(["a"]) },
+			);
+			const order = [
+				"page-title",
+				"meta-strip",
+				"tmeter",
+				"propTable",
+				"ship-bar",
+				"memoryPanel",
+				"e2ePanel",
+				"Conversations",
+				"Context",
+				"Files",
+				"transcript-privacy",
+			];
+			let last = -1;
+			for (const marker of order) {
+				const i = html.indexOf(marker);
+				expect(i, marker).toBeGreaterThan(last);
+				last = i;
+			}
+		});
+
 		// ─── Foreign-repo read-only mode ──────────────────────────────────────
 		// When the panel renders a summary that came from a non-current repo
 		// (Memory Bank cross-repo lookup), every destructive control must be
@@ -376,72 +514,43 @@ describe("SummaryHtmlBuilder", () => {
 				expect(html).not.toContain("foreign-readonly");
 			});
 
-			// In foreign-readonly mode the All Conversations action chip
-			// switches from the workspace-side "Manage" (editable modal) to
-			// a read-only "View" affordance. The button stays under the same
-			// id (`openTranscriptsBtn`) so the existing modal-open handler is
-			// reused, but it picks up `data-foreign-safe` so the
-			// `.page.foreign-readonly button:not([data-foreign-safe])` rule
-			// keeps it visible. The Regenerate chip is dropped entirely to
-			// avoid leaving an inaccessible DOM affordance.
-			it("foreign mode swaps the 'Manage' chip for a 'View' chip marked data-foreign-safe", () => {
-				const transcriptHashSet = new Set(["t1"]);
-				const html = buildHtml(makeSummary(), {
-					foreignRepoName: "other-repo",
-					transcriptHashSet,
-				});
-				expect(html).toMatch(
-					/id="openTranscriptsBtn"\s+data-foreign-safe[^>]*>View</,
-				);
-				// Manage label must not leak through in foreign mode — otherwise
-				// the user would see a misleading chip that promises edits.
-				expect(html).not.toContain(">Manage<");
-				// Regenerate is unavailable cross-repo (writes the orphan
-				// branch of the wrong repo) — drop it from the DOM rather
-				// than relying solely on CSS to hide it.
-				expect(html).not.toContain('id="regenerateSummaryBtn"');
-			});
-
-			it("non-foreign mode keeps the original 'Manage' + 'Regenerate' chips", () => {
-				const transcriptHashSet = new Set(["t1"]);
-				const html = buildHtml(makeSummary(), { transcriptHashSet });
-				expect(html).toContain(">Manage<");
-				expect(html).toContain('id="regenerateSummaryBtn"');
-				// And the Manage chip stays UN-marked foreign-safe — that
-				// attribute is only meaningful inside .foreign-readonly and
-				// would be dead weight on the workspace path.
-				expect(html).toMatch(/id="openTranscriptsBtn"[^>]*>Manage</);
-				expect(html).not.toMatch(
-					/id="openTranscriptsBtn"\s+data-foreign-safe/,
-				);
-			});
-
-			it("foreign mode drops the empty-state Regenerate chip (no transcripts case)", () => {
-				const html = buildHtml(makeSummary(), {
-					foreignRepoName: "other-repo",
-					// transcriptHashSet omitted → empty branch
-				});
-				expect(html).toContain(
-					"No conversation transcripts saved for this commit.",
-				);
-				expect(html).not.toContain('id="regenerateSummaryBtn"');
-			});
-
-			it("foreign mode marks the modal close button foreign-safe so the user can exit the read-only modal", () => {
-				// Without this the user could open the modal via the View chip
-				// but find the X close button removed by the foreign-readonly
-				// CSS, leaving ESC / overlay-click as the only (non-obvious)
-				// exits. Save / Cancel / Delete intentionally stay un-marked
-				// — they're write paths and must remain hidden.
-				const html = buildHtml(makeSummary(), {
+			// The old modal-based "Manage"/"View" conversations flow is gone
+			// (Task 7 inline rows). Conversations are now inline .row elements
+			// rendered client-side; the panel shell is identical in both modes,
+			// and per-row detach is gated in the client + host, not the markup.
+			// So neither mode emits the modal / Manage / View chip anymore.
+			it("neither mode emits the retired modal / Manage / View conversations chrome", () => {
+				const foreign = buildHtml(makeSummary(), {
 					foreignRepoName: "other-repo",
 					transcriptHashSet: new Set(["t1"]),
 				});
-				expect(html).toMatch(/id="modalCloseBtn"[^>]*data-foreign-safe/);
-				expect(html).not.toMatch(/id="modalSaveBtn"[^>]*data-foreign-safe/);
-				expect(html).not.toMatch(
-					/id="deleteTranscriptsBtn"[^>]*data-foreign-safe/,
-				);
+				const local = buildHtml(makeSummary(), {
+					transcriptHashSet: new Set(["t1"]),
+				});
+				for (const html of [foreign, local]) {
+					expect(html).not.toContain('id="openTranscriptsBtn"');
+					expect(html).not.toContain('id="transcriptModal"');
+					expect(html).not.toContain('id="modalCloseBtn"');
+					expect(html).not.toContain('id="modalSaveBtn"');
+					expect(html).not.toContain('id="deleteTranscriptsBtn"');
+					expect(html).not.toContain(">Manage<");
+					expect(html).not.toContain("private-zone");
+				}
+			});
+
+			it("Regenerate is header-gated: present locally, dropped in foreign mode", () => {
+				const local = buildHtml(makeSummary(), {
+					transcriptHashSet: new Set(["t1"]),
+				});
+				expect(local).toContain('id="regenerateSummaryBtn"');
+				const foreign = buildHtml(makeSummary(), {
+					foreignRepoName: "other-repo",
+					transcriptHashSet: new Set(["t1"]),
+				});
+				// Regenerate writes the orphan branch of the wrong repo cross-repo,
+				// so it's dropped from the DOM (the Memory panel header omits it
+				// when isForeign — see buildMemoryPanel).
+				expect(foreign).not.toContain('id="regenerateSummaryBtn"');
 			});
 
 			it("adds the stale-readonly hook class and stale banner when staleRewrittenInto is set", () => {
@@ -457,6 +566,19 @@ describe("SummaryHtmlBuilder", () => {
 				expect(html).toContain("12345678");
 			});
 
+			it("does NOT mark the Share button foreign-safe, so read-only modes hide it", () => {
+				// The share modal's close button is not foreign-safe, so a Share
+				// trigger left clickable in a read-only mode would open a modal the
+				// user can't dismiss via its X. Sharing is also server-denied for
+				// foreign commits and guarded for stale ones, so the trigger must be
+				// hidden in read-only modes — i.e. it must NOT carry data-foreign-safe
+				// (the .{foreign,stale,regenerating}-readonly CSS then hides it).
+				const html = buildHtml(makeSummary(), { foreignRepoName: "other-repo" });
+				const shareBtnTag = html.match(/<button[^>]*id="metaShareBtn"[^>]*>/)?.[0] ?? "";
+				expect(shareBtnTag).toContain('id="metaShareBtn"');
+				expect(shareBtnTag).not.toContain("data-foreign-safe");
+			});
+
 			it("emits both foreign-readonly and stale-readonly when both options are set", () => {
 				// Cross-product: foreign repo whose source commit was also
 				// rewritten. The class list must include both hooks so the
@@ -466,6 +588,44 @@ describe("SummaryHtmlBuilder", () => {
 					staleRewrittenInto: "feedface0000000000000000000000000000face",
 				});
 				expect(html).toMatch(/class="page foreign-readonly stale-readonly"/);
+			});
+
+			// ─── Task 4–10 new-control gating (Task 11 verification) ────────────
+			// Destructive/write controls added by prior tasks must NOT carry
+			// data-foreign-safe, so the existing CSS rule
+			// `.page.foreign-readonly button:not([data-foreign-safe])` (and the
+			// stale-readonly twin) hides them. `.conv-detach` is rendered
+			// client-side (SummaryScriptBuilder), so it is asserted against the
+			// script source rather than buildHtml's output.
+			it("Context panel's + Add button does not carry data-foreign-safe (destructive: adds plan/note/snippet)", () => {
+				const html = buildHtml(makeSummary());
+				expect(html).toMatch(
+					/<button class="action-btn panel-add add-dropdown-toggle" data-action="toggleAddMenu" title="[^"]*"><span class="codicon codicon-add"><\/span><\/button>/,
+				);
+			});
+
+			it("plan/note/reference remove buttons in the Context panel do not carry data-foreign-safe", () => {
+				const html = buildHtml(
+					makeSummary({
+						plans: [makePlan()],
+						notes: [makeNote()],
+						references: [makeLinear()],
+					}),
+				);
+				const removeButtons = html.match(/<button class="icon-btn topic-action-btn plan-remove-btn"[^>]*>/g) ?? [];
+				expect(removeButtons.length).toBeGreaterThan(0);
+				for (const btn of removeButtons) {
+					expect(btn).not.toContain("data-foreign-safe");
+				}
+			});
+
+			// Read-only controls that must stay usable in foreign/stale mode: the
+			// `?` token-usage help popover is a pure client-side toggle (no
+			// postMessage — see SummaryScriptBuilder's tok-help handler), so it
+			// belongs on the safe list alongside Details/Export/Copy.
+			it("token-meter help toggle (tok-help) carries data-foreign-safe so it stays visible in foreign/stale mode", () => {
+				const html = buildHtml(makeSummary({ conversationTokens: 1000 }));
+				expect(html).toMatch(/<button class="tok-help" type="button" data-foreign-safe>/);
 			});
 		});
 
@@ -543,27 +703,15 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("January 1, 2026 at 12:00 PM");
 		});
 
-		it("does not show conversations row when turns is 0", () => {
-			aggregateTurns.mockReturnValue(0);
-			const html = buildHtml(makeSummary());
-			// The "All Conversations" section header always exists, but the
-			// properties "Conversations" row with stat-turns should be absent.
-			expect(html).not.toContain("stat-turns");
-		});
-
-		it("shows conversations row when turns > 0", () => {
+		it("does not show a turns badge in the header regardless of turn count", () => {
+			// The header redesign drops the inline turns badge entirely — the
+			// Details table's "Linked" row now reports conversation *count*
+			// (transcriptHashSet.size), not turn count. The "All Conversations"
+			// section below the header still exists and is unaffected.
 			aggregateTurns.mockReturnValue(5);
 			const html = buildHtml(makeSummary());
 			expect(html).toContain("Conversations");
-			expect(html).toContain("5 turns");
-		});
-
-		it("shows singular turn label for 1 conversation turn", () => {
-			aggregateTurns.mockReturnValue(1);
-			const html = buildHtml(makeSummary());
-			expect(html).toContain("Conversations");
-			expect(html).toContain("1 turn");
-			expect(html).not.toContain("1 turns");
+			expect(html).not.toContain("stat-turns");
 		});
 
 		it("shows Jolli Memory row when jolliDocUrl is set", () => {
@@ -607,9 +755,20 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("Update on Jolli");
 		});
 
-		it("shows push label 'Share in Jolli' when jolliDocUrl is undefined", () => {
+		it("the synced button carries no data-jolli-open (it pushes/updates, never opens)", () => {
+			const html = buildHtml(makeSummary({ jolliDocUrl: "https://jolli.app/memory/123" }));
+			expect(html).toMatch(/id="pushJolliBtn"/);
+			expect(html).not.toContain("data-jolli-open");
+		});
+
+		it("shows push label 'Push to Jolli' when jolliDocUrl is undefined", () => {
 			const html = buildHtml(makeSummary({ jolliDocUrl: undefined }));
-			expect(html).toContain("Share in Jolli");
+			expect(html).toContain("Push to Jolli");
+		});
+
+		it("omits data-jolli-open when not yet synced (button pushes, not opens)", () => {
+			const html = buildHtml(makeSummary({ jolliDocUrl: undefined }));
+			expect(html).not.toContain("data-jolli-open");
 		});
 
 		it("shows commit message tooltip in Jolli Memory row", () => {
@@ -655,7 +814,7 @@ describe("SummaryHtmlBuilder", () => {
 			);
 			expect(html).toContain("https://jolli.app/note/a");
 			expect(html).toContain("jolli-plans-block");
-			expect(html).toContain("Plans &amp; Notes");
+			expect(html).toContain('<span class="jolli-plans-label">Context</span>');
 		});
 
 		it("omits notes block when no published note URLs", () => {
@@ -668,7 +827,7 @@ describe("SummaryHtmlBuilder", () => {
 				html.indexOf("jolliRow"),
 				html.indexOf("jolliRow") + 500,
 			);
-			expect(jolliSection).not.toContain(">Plans &amp; Notes<");
+			expect(jolliSection).not.toContain("jolli-plans-label");
 		});
 
 		it("plans section is always present with 'No plans or notes' placeholder when empty", () => {
@@ -677,7 +836,7 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain(
 				"No plans or notes associated with this commit yet.",
 			);
-			expect(html).toContain("+ Add");
+			expect(html).toContain('<span class="codicon codicon-add"></span>');
 		});
 
 		it("plans section renders plan items", () => {
@@ -996,16 +1155,10 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("e2e-delete-btn");
 		});
 
-		it("source commits section not shown for single source", () => {
-			collectSortedTopics.mockReturnValue({
-				topics: [],
-				sourceNodes: [makeSummary()],
-			});
-			const html = buildHtml(makeSummary());
-			expect(html).not.toContain("Source Commits");
-		});
-
-		it("source commits section shown for multiple sources", () => {
+		// Source Commits was dropped entirely from the redesigned Context panel
+		// (mockup has no Source Commits section). buildHtml no longer renders it
+		// regardless of how many sourceNodes collectSortedTopics returns.
+		it("never renders Source Commits, even for multi-source summaries", () => {
 			const source1 = makeSummary({
 				commitHash: "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
 				commitMessage: "first commit",
@@ -1022,114 +1175,108 @@ describe("SummaryHtmlBuilder", () => {
 				sourceNodes: [source1, source2],
 			});
 			const html = buildHtml(makeSummary());
-			expect(html).toContain("Source Commits");
-			expect(html).toContain("aaaa1111");
-			expect(html).toContain("ffff6666");
-			expect(html).toContain("first commit");
-			expect(html).toContain("second commit");
+			expect(html).not.toContain("Source Commits");
+			expect(html).not.toContain("commit-list");
 		});
 
-		it("source commit row shows turns when conversationTurns is set", () => {
-			const source = makeSummary({
-				commitHash: "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
-				conversationTurns: 7,
-				stats: { filesChanged: 1, insertions: 1, deletions: 0 },
+		describe("context panel (buildContextPanel)", () => {
+			it("context panel is flat rows with kb-tags and no collapsible cards or source commits", () => {
+				const html = buildContextPanel(
+					makeSummary({ plans: [makePlan()], references: [makeLinear()] }),
+				);
+				expect(html).toContain('class="panel"');
+				expect(html).toContain("Context");
+				expect(html).toContain("kb-tag t-plan");
+				expect(html).toContain("kb-tag t-ref");
+				expect(html).toContain('<span class="codicon codicon-add"></span>');
+				expect(html).not.toContain("attach-card");
+				expect(html).not.toContain("Source Commits");
 			});
-			collectSortedTopics.mockReturnValue({
-				topics: [],
-				sourceNodes: [source, makeSummary()],
+
+			it("keeps the #plansAndNotesSection id re-parented into the flat panel", () => {
+				const html = buildContextPanel(makeSummary({ plans: [makePlan()] }));
+				expect(html).toContain('id="plansAndNotesSection"');
 			});
-			const html = buildHtml(makeSummary());
-			expect(html).toContain("7 turns");
+
+			it("panel header shows the sec-count chip totalling plans + notes + references", () => {
+				const html = buildContextPanel(
+					makeSummary({
+						plans: [makePlan()],
+						notes: [makeNote()],
+						references: [makeLinear()],
+					}),
+				);
+				expect(html).toContain('<span class="sec-count">3</span>');
+			});
+
+			it("renders the translate button for a reference in the referenceTranslateSet", () => {
+				const ref = makeLinear();
+				const html = buildContextPanel(
+					makeSummary({ references: [ref] }),
+					undefined,
+					undefined,
+					new Set([ref.archivedKey]),
+				);
+				// showTranslate === true arm: the 🌐 translate button is emitted.
+				expect(html).toContain("reference-translate-btn");
+				expect(html).toContain('data-action="translateReference"');
+			});
+
+			it("does not render a plansCard or sourceCard wrapper id", () => {
+				const html = buildContextPanel(makeSummary({ plans: [makePlan()] }));
+				expect(html).not.toContain('id="plansCard"');
+				expect(html).not.toContain('id="sourceCard"');
+			});
 		});
 
-		it("source commit row shows singular turn label", () => {
-			const source = makeSummary({
-				commitHash: "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
-				conversationTurns: 1,
-				stats: { filesChanged: 1, insertions: 1, deletions: 0 },
-			});
-			collectSortedTopics.mockReturnValue({
-				topics: [],
-				sourceNodes: [source, makeSummary()],
-			});
+		it("Conversations panel renders the shell + Loading placeholder (rows fill client-side)", () => {
 			const html = buildHtml(makeSummary());
-			expect(html).toContain("1 turn");
-			expect(html).not.toMatch(/1 turns/);
-		});
-
-		it("source commit row omits turns suffix when conversationTurns is falsy", () => {
-			const source = makeSummary({
-				commitHash: "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
-				conversationTurns: 0,
-				stats: { filesChanged: 1, insertions: 1, deletions: 0 },
-			});
-			collectSortedTopics.mockReturnValue({
-				topics: [],
-				sourceNodes: [source, makeSummary()],
-			});
-			const html = buildHtml(makeSummary());
-			expect(html).not.toContain("stat-turns");
-		});
-
-		it("Conversations section shows empty message when no transcripts", () => {
-			const html = buildHtml(makeSummary());
-			// The section title is now "Conversations" (top-level, no PRIVATE badge)
+			// The panel title is now "Conversations" (top-level, no PRIVATE badge).
 			expect(html).toContain("Conversations");
-			expect(html).toContain(
-				"No conversation transcripts saved for this commit.",
-			);
+			expect(html).toContain('id="conversationsBody"');
+			expect(html.toLowerCase()).toContain("loading");
 			expect(html).not.toContain("PRIVATE");
 		});
 
-		it("All Conversations section with empty set shows empty message", () => {
-			const html = buildHtml(makeSummary(), { transcriptHashSet: new Set() });
-			expect(html).toContain(
-				"No conversation transcripts saved for this commit.",
-			);
+		it("Conversations panel emits the same shell regardless of transcript count", () => {
+			const empty = buildHtml(makeSummary(), { transcriptHashSet: new Set() });
+			const withData = buildHtml(makeSummary(), {
+				transcriptHashSet: new Set(["hash1", "hash2"]),
+			});
+			for (const html of [empty, withData]) {
+				expect(html).toContain('id="conversationsBody"');
+				// No modal / manage / private-zone chrome anymore.
+				expect(html).not.toContain("Manage");
+				expect(html).not.toContain("openTranscriptsBtn");
+				expect(html).not.toContain("transcriptModal");
+				expect(html).not.toContain("modalSaveBtn");
+			}
 		});
 
-		it("All Conversations section with transcripts shows Manage button and modal", () => {
-			const transcripts = new Set(["hash1", "hash2"]);
-			const html = buildHtml(makeSummary(), { transcriptHashSet: transcripts });
-			expect(html).toContain("Manage");
-			expect(html).toContain("openTranscriptsBtn");
-			expect(html).toContain("transcriptModal");
-			expect(html).toContain("modal-overlay");
-			expect(html).toContain("modal-container");
-			expect(html).toContain("deleteTranscriptsBtn");
-			expect(html).toContain("modalSaveBtn");
-		});
-
-		it("header shows correct singular/plural for file changes", () => {
+		it("Linked row shows singular file count when filesChanged is 1", () => {
 			resolveDiffStats.mockReturnValue({
 				insertions: 1,
 				deletions: 1,
 				filesChanged: 1,
 			});
 			const html = buildHtml(makeSummary());
-			expect(html).toContain("1 file changed");
-			expect(html).toContain("1 insertion(+)");
-			expect(html).toContain("1 deletion(-)");
+			expect(html).toContain("1 file");
 		});
 
-		it("header shows correct plural for multiple file changes", () => {
+		it("Linked row shows plural file count for multiple file changes", () => {
 			resolveDiffStats.mockReturnValue({
 				insertions: 10,
 				deletions: 5,
 				filesChanged: 3,
 			});
 			const html = buildHtml(makeSummary());
-			expect(html).toContain("3 files changed");
-			expect(html).toContain("10 insertions(+)");
-			expect(html).toContain("5 deletions(-)");
+			expect(html).toContain("3 files");
 		});
 
-		it("includes duration row", () => {
+		it("drops the Duration row from the details table", () => {
 			const html = buildHtml(makeSummary());
-			expect(html).toContain("Duration");
-			expect(html).toContain("2 hours");
-			expect(formatDurationLabel).toHaveBeenCalled();
+			expect(html).not.toContain(">Duration<");
+			expect(formatDurationLabel).not.toHaveBeenCalled();
 		});
 
 		it("includes footer with 'Generated by Jolli Memory'", () => {
@@ -1153,6 +1300,21 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).not.toContain("&middot; via");
 		});
 
+		it("footer shows the transcript privacy note and keeps the attribution", () => {
+			const html = buildHtml(makeSummary(), {
+				transcriptHashSet: new Set(["t1", "t2"]),
+			});
+			expect(html).toContain("stay in your repo");
+			expect(html).toContain("transcript-privacy");
+			expect(html).toContain("Full conversation transcripts (2)");
+			expect(html).toContain("Generated by Jolli Memory"); // attribution kept
+		});
+
+		it("footer privacy note counts zero linked conversations when transcriptHashSet is absent", () => {
+			const html = buildHtml(makeSummary());
+			expect(html).toContain("Full conversation transcripts (0)");
+		});
+
 		it("includes toggleAllBtn", () => {
 			const html = buildHtml(makeSummary());
 			expect(html).toContain("toggleAllBtn");
@@ -1165,11 +1327,6 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("pushJolliBtn");
 		});
 
-		it("calls buildPrSectionHtml with no arguments", () => {
-			buildHtml(makeSummary({ commitMessage: "test msg" }));
-			expect(buildPrSectionHtml).toHaveBeenCalledWith();
-		});
-
 		it("includes hash copy button with full hash in data attribute", () => {
 			const hash = "abcdef1234567890abcdef1234567890abcdef12";
 			const html = buildHtml(makeSummary({ commitHash: hash }));
@@ -1177,18 +1334,271 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("hash-copy");
 		});
 
-		it("source commit row handles missing stats gracefully", () => {
-			const source = makeSummary({
-				commitHash: "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
-				stats: undefined,
+	});
+
+	// ─── buildHeader ─────────────────────────────────────────────────────────
+
+	describe("buildHeader", () => {
+		it("meta strip carries Share and Export and drops author/changes inline", () => {
+			const html = buildHeader(makeSummary(), 3);
+			expect(html).toContain("meta-share");
+			expect(html).toContain("meta-export");
+			expect(html).toContain("details-toggle"); // dotted Details toggle kept
+			// Author / date / ± changes move out of the strip entirely — only
+			// hash · branch · time remain inline before Details/Share/Export.
+			expect(html).not.toContain("meta-author");
+			expect(html).not.toContain("meta-changes");
+		});
+
+		it("Share and Export carry the mockup's leading icons (share SVG + codicon-book/chevron)", () => {
+			const html = buildHeader(makeSummary(), 3);
+			// Share: inline upload SVG (mockup `.sico`), not text-only.
+			expect(html).toMatch(/meta-share[^>]*>\s*<svg class="sico"/);
+			// Export: codicon-book leading glyph + codicon-chevron-down (replacing
+			// the old &#x25BE; text triangle).
+			expect(html).toContain('<span class="codicon codicon-book"></span>');
+			expect(html).toContain('<span class="codicon codicon-chevron-down"></span>');
+		});
+
+		it("Export is a standalone toggle button, not a two-button split-button fragment", () => {
+			const html = buildHeader(makeSummary(), 3);
+			// Export must render as a single "action-btn meta-export" button —
+			// the old split-btn-group/split-toggle skeleton (designed for a
+			// glued two-button pair) must not wrap or decorate it, or the
+			// !important split-toggle rules crush its corners/padding.
+			expect(html).not.toContain("split-btn-group");
+			expect(html).not.toContain("split-toggle");
+			expect(html).toContain('<button class="action-btn meta-export" id="exportMenuToggle"');
+			// The dropdown itself (and its wiring ids) must still be present.
+			expect(html).toContain('class="split-menu" id="exportMenu"');
+			expect(html).toContain('id="copyMdBtn"');
+			expect(html).toContain('id="downloadMdBtn"');
+		});
+
+		it("details table keeps #propTable id and shows the four mem-details rows", () => {
+			const html = buildHeader(
+				makeSummary({ llm: { model: "claude-sonnet-4-6", inputTokens: 1500, outputTokens: 600 } }),
+				3,
+			);
+			expect(html).toContain('id="propTable"');
+			expect(html).toContain("Summary by");
+			expect(html).toContain("Linked");
+			expect(html).not.toContain(">Duration<");
+		});
+
+		it("details table has exactly four .md-row rows: Commit, Author, Summary by, Linked", () => {
+			const html = buildHeader(makeSummary(), 3);
+			expect(html).toContain("mem-details");
+			const rowMatches = html.match(/class="md-row"/g) ?? [];
+			expect(rowMatches).toHaveLength(4);
+			expect(html).toContain(">Commit<");
+			expect(html).toContain(">Author<");
+			expect(html).toContain(">Summary by<");
+			expect(html).toContain(">Linked<");
+			expect(html).not.toContain(">Branch<");
+			expect(html).not.toContain(">Date<");
+			expect(html).not.toContain(">Changes<");
+		});
+
+		it("Summary by row omits the token span when summary.llm is absent", () => {
+			const html = buildHeader(makeSummary({ llm: undefined }), 3);
+			expect(html).not.toContain("tok-bd");
+		});
+
+		it("guards a partial/legacy llm object so the token count never renders NaN", () => {
+			// The orphan branch is append-only, so an old record can carry an `llm`
+			// block predating inputTokens/outputTokens. Summing undefined fields
+			// would render "NaN tokens" without the per-field ?? 0 guard.
+			const html = buildHeader(makeSummary({ llm: { model: "claude-sonnet-4-6" } as never }), 3);
+			expect(html).toContain("tok-bd");
+			expect(html).not.toContain("NaN");
+			expect(html).toContain("0 tokens");
+		});
+
+		it("Summary by row shows model + token count when summary.llm is present", () => {
+			const html = buildHeader(
+				makeSummary({ llm: { model: "claude-sonnet-4-6", inputTokens: 1500, outputTokens: 600, apiLatencyMs: 1000, stopReason: null } }),
+				3,
+			);
+			expect(html).toContain("claude-sonnet-4-6");
+			expect(html).toContain("tok-bd");
+			expect(html).toContain("2,100");
+		});
+
+		it("Linked row counts conversations from transcriptHashSet, context from plans+notes+references, files from totalFiles", () => {
+			const html = buildHeader(
+				makeSummary({
+					plans: [makePlan()],
+					notes: [makeNote()],
+					references: [makeLinear()],
+				}),
+				3,
+				new Set(["t1", "t2"]),
+			);
+			expect(html).toContain("2 conversations");
+			expect(html).toContain("3 context");
+			expect(html).toContain("3 files");
+		});
+
+		it("Linked row uses totalFiles for the file count (no commit-level filesAffected field)", () => {
+			const html = buildHeader(makeSummary(), 7);
+			expect(html).toContain("7 files");
+		});
+
+		it("Export menu retains #copyMdBtn and #downloadMdBtn (Regenerate moved to the Memory panel header)", () => {
+			const html = buildHeader(makeSummary(), 3);
+			expect(html).toContain('id="copyMdBtn"');
+			expect(html).toContain('id="downloadMdBtn"');
+			// Regenerate no longer lives in the Export menu — it moved to the
+			// Memory panel header (see buildMemoryPanel). The header fragment
+			// buildHeader renders therefore carries no #regenerateSummaryBtn.
+			expect(html).not.toContain('id="regenerateSummaryBtn"');
+		});
+
+		it("keeps the .hash-copy button with data-hash in the Commit row", () => {
+			const hash = "abcdef1234567890abcdef1234567890abcdef12";
+			const html = buildHeader(makeSummary({ commitHash: hash }), 3);
+			expect(html).toContain("hash-copy");
+			expect(html).toContain(`data-hash="${hash}"`);
+		});
+
+		it("shows the branch after the hash in the Commit row (mockup: '<hash> · <branch>')", () => {
+			// The mockup's Commit row is `269d1089e3 · feature/…`; the branch renders
+			// as a .md-branch span alongside the hash + copy button.
+			const html = buildHeader(makeSummary({ branch: "feature/memory-panel-ux-redesign" }), 3);
+			expect(html).toContain("md-branch");
+			expect(html).toContain("feature/memory-panel-ux-redesign");
+		});
+	});
+
+	// ─── buildTokenMeter ─────────────────────────────────────────────────────
+
+	describe("buildTokenMeter", () => {
+		it("token meter shows total + segmented bar when a breakdown exists", () => {
+			const html = buildTokenMeter(makeSummary({
+				conversationTokens: 1443000,
+				conversationTokenBreakdown: { input: 96000, output: 47000, cached: 1300000 },
+			}));
+			expect(html).toContain("tmeter");
+			expect(html).toContain("seg-in");
+			expect(html).toContain("seg-out");
+			expect(html).toContain("seg-cache");
+			expect(html).toContain("tmeter-legend");
+			expect(html).not.toContain("tmeter na");
+		});
+
+		it("segment widths always fill the bar (sum to 100%) even when the breakdown sums to less than the aggregate total", () => {
+			// Regression: `conversationTokens` (the tree-wide scalar total) can exceed
+			// the sum of the breakdown fields when some folded sessions report only a
+			// scalar with no usageBreakdown. Dividing each segment by the scalar total
+			// underfilled the bar (here it would fill only ~15%). The segments must be
+			// proportions of the breakdown's OWN sum, with the last absorbing rounding.
+			const html = buildTokenMeter(makeSummary({
+				conversationTokens: 2_000_000,
+				conversationTokenBreakdown: { input: 100000, output: 100000, cached: 100000 },
+			}));
+			const pcts = [...html.matchAll(/data-pct="(\d+)"/g)].map((m) => Number(m[1]));
+			expect(pcts).toHaveLength(3);
+			expect(pcts.reduce((a, b) => a + b, 0)).toBe(100);
+			// The headline still shows the full tree-wide total, not the breakdown sum.
+			expect(html).toContain("2M");
+		});
+
+		it("token meter renders the na state when usage is unreported", () => {
+			const html = buildTokenMeter(makeSummary({ conversationTokens: undefined }));
+			expect(html).toContain("tmeter na");
+			expect(html).toContain("Task usage not reported");
+			expect(html).not.toContain("tmeter-bar");
+		});
+
+		it("token meter degrades to a total-only single segment when breakdown is absent but tokens exist", () => {
+			const html = buildTokenMeter(makeSummary({
+				conversationTokens: 5000,
+				conversationTokenBreakdown: undefined,
+			}));
+			expect(html).toContain("tmeter-bar");
+			expect(html).toContain("seg-in");
+			expect(html).not.toContain("seg-out");
+			expect(html).not.toContain("seg-cache");
+			expect(html).not.toContain("tmeter-legend");
+			expect(html).not.toContain("tmeter na");
+		});
+
+		it("token meter treats conversationTokens of 0 as unreported", () => {
+			const html = buildTokenMeter(makeSummary({ conversationTokens: 0 }));
+			expect(html).toContain("tmeter na");
+			expect(html).toContain("Task usage not reported");
+		});
+
+		// Regression: a consolidated (squash/amend/rebase) memory carries its
+		// conversation tokens on the folded child commits, with the root's OWN
+		// scalar 0/undefined. The meter must aggregate the whole tree — the same
+		// basis the sidebar row uses (aggregateConversationTokens) — or it shows
+		// "Task usage not reported" for a memory the sidebar reports as e.g. 12.4M.
+		it("token meter aggregates across children when the root's own scalar is empty", () => {
+			const child = makeSummary({
+				commitHash: "c0ffee001122334455667788990011223344abcd",
+				conversationTokens: 12400000,
+				conversationTokenBreakdown: { input: 281000, output: 1500000, cached: 10619000 },
 			});
-			collectSortedTopics.mockReturnValue({
-				topics: [],
-				sourceNodes: [source, makeSummary()],
-			});
-			const html = buildHtml(makeSummary());
-			// With undefined stats, insertions/deletions default to 0
-			expect(html).toContain("+0");
+			const html = buildTokenMeter(
+				makeSummary({
+					conversationTokens: undefined,
+					conversationTokenBreakdown: undefined,
+					children: [child],
+				}),
+			);
+			expect(html).not.toContain("Task usage not reported");
+			expect(html).not.toContain("tmeter na");
+			expect(html).toContain("seg-in");
+			expect(html).toContain("seg-out");
+			expect(html).toContain("seg-cache");
+			expect(html).toContain("12.4M");
+		});
+
+		it("formats small token counts (< 1000) without a k/M suffix", () => {
+			const html = buildTokenMeter(makeSummary({
+				conversationTokens: 500,
+				conversationTokenBreakdown: { input: 300, output: 150, cached: 50 },
+			}));
+			expect(html).toContain(">500<");
+		});
+
+		it("shows a <$0.01 floor for very small cost estimates", () => {
+			const html = buildTokenMeter(makeSummary({
+				conversationTokens: 10,
+				conversationTokenBreakdown: { input: 6, output: 3, cached: 1 },
+			}));
+			expect(html).toContain("<$0.01");
+		});
+
+		it("is inserted in buildHtml right after the meta strip and before buildShipBar", () => {
+			const html = buildHtml(makeSummary({ conversationTokens: undefined }));
+			const headerIdx = html.indexOf("meta-strip");
+			const tmeterIdx = html.indexOf("tmeter");
+			const shipBarIdx = html.indexOf("ship-bar");
+			expect(headerIdx).toBeGreaterThan(-1);
+			expect(tmeterIdx).toBeGreaterThan(headerIdx);
+			expect(shipBarIdx).toBeGreaterThan(tmeterIdx);
+		});
+	});
+
+	// ─── buildShipBar ────────────────────────────────────────────────────────
+
+	describe("buildShipBar", () => {
+		it("ship bar renders a single Jolli card and no PR card", () => {
+			const html = buildShipBar(makeSummary({ jolliDocUrl: "https://jolli.ai/x" }));
+			expect(html).toContain('class="ship-card"');
+			expect(html).not.toContain('id="prCard"');
+			expect(html).toContain("codicon-arrow-swap");
+			expect(html).toContain(">Jolli<"); // name, not "Jolli Memory"
+			expect(html).toContain("Update on Jolli");
+		});
+
+		it("ship bar shows LOCAL chip + Push when not synced", () => {
+			const html = buildShipBar(makeSummary({ jolliDocUrl: undefined }));
+			expect(html).toContain("local-chip");
+			expect(html).toContain("Push to Jolli");
 		});
 	});
 
@@ -1250,17 +1660,16 @@ describe("SummaryHtmlBuilder", () => {
 	// ─── buildHtml recap ordering ────────────────────────────────────────────
 
 	describe("buildHtml recap ordering", () => {
-		// Redesign v2: the Ship bar (Create PR is the hero outbound action) sits
-		// at the top of the page; the Quick recap now lives inside the Memory
-		// panel below it. Order is intentionally PR-then-recap.
-		it("renders the Pull Request ship card above the Quick recap", () => {
-			buildPrSectionHtml.mockReturnValue('<div class="pr-marker">PR</div>');
+		// Redesign v2: the Ship bar (the Jolli card is the hero outbound action)
+		// sits at the top of the page; the Quick recap now lives inside the
+		// Memory panel below it. Order is intentionally ship-bar-then-recap.
+		it("renders the Jolli ship card above the Quick recap", () => {
 			const html = buildHtml(makeSummary({ recap: "A short recap." }));
-			const prIdx = html.indexOf("pr-marker");
+			const shipIdx = html.indexOf('id="jolliCard"');
 			const recapIdx = html.indexOf("recapSection");
-			expect(prIdx).toBeGreaterThan(0);
+			expect(shipIdx).toBeGreaterThan(0);
 			expect(recapIdx).toBeGreaterThan(0);
-			expect(prIdx).toBeLessThan(recapIdx);
+			expect(shipIdx).toBeLessThan(recapIdx);
 		});
 
 		it("renders the State 1 placeholder when summary has no recap (so Generate button is reachable)", () => {
@@ -1727,7 +2136,7 @@ describe("buildAllConversationsSection — Regenerate button", () => {
 			expect(newerIdx).toBeGreaterThanOrEqual(0);
 			expect(newerIdx).toBeLessThan(olderIdx);
 			// The superseded (older) snapshot is dimmed.
-			expect(html).toContain('class="plan-item plan-older" id="plan-refactor-auth-1111aaaa"');
+			expect(html).toContain('class="row plan-item plan-older" id="plan-refactor-auth-1111aaaa"');
 			// Every plan item carries a relative date.
 			expect(html.match(/plan-date/g)).toHaveLength(2);
 		});
@@ -1796,20 +2205,61 @@ describe("buildAllConversationsSection — Regenerate button", () => {
 			expect(html.match(/jolli-plan-item/g)).toHaveLength(1);
 		});
 
-		it("buildAllConversationsSection wraps both branches in #allConversationsSection", () => {
+		it("buildJolliRow lists a shared note doc URL only once (note dedup by URL)", () => {
+			const url = "https://jolli.ai/note/shared-2570";
+			const n1 = makeNote({ id: "note-a", title: "Shared", jolliNoteDocUrl: url });
+			const n2 = makeNote({ id: "note-b", title: "Shared", jolliNoteDocUrl: url });
+			const html = buildJolliRow("https://jolli.ai/memory/x", "msg", undefined, [n1, n2]);
+			// Two note snapshots, one doc — the second is a seen-URL dupe and is skipped.
+			expect(html.match(/jolli-plan-item/g)).toHaveLength(1);
+		});
+
+		it("buildConversationsSection keeps the stable #allConversationsSection refresh wrapper", () => {
 			// count === 0 (empty) branch
-			const empty = buildAllConversationsSection(new Set(), false);
+			const empty = buildConversationsSection(new Set(), false);
 			expect(empty).toContain('id="allConversationsSection"');
-			expect(empty).toContain("No conversation transcripts saved");
-			// count > 0 branch (includes the modal)
-			const withData = buildAllConversationsSection(new Set(["h1"]), false);
+			// count > 0 branch — still the same wrapper, no modal
+			const withData = buildConversationsSection(new Set(["h1"]), false);
 			expect(withData).toContain('id="allConversationsSection"');
-			expect(withData).toContain('id="transcriptModal"');
+			expect(withData).not.toContain('id="transcriptModal"');
 		});
 
 		it("buildHtml embeds the #allConversationsSection wrapper", () => {
 			expect(buildHtml(makeSummary())).toContain(
 				'id="allConversationsSection"',
+			);
+		});
+	});
+
+	// ─── Conversations → inline rows (mockup alignment, Task 7) ──────────────
+	describe("buildConversationsSection — inline rows panel", () => {
+		it("renders a .panel with a Conversations header and count chip, not a modal private-zone", () => {
+			const html = buildConversationsSection(new Set(["h1", "h2"]), false);
+			expect(html).toContain("panel conversations-panel");
+			expect(html).toContain('class="panel-header"');
+			expect(html).toContain("Conversations");
+			expect(html).toContain('class="sec-count"');
+			// The modal + manage/save/delete flow is gone.
+			expect(html).not.toContain("private-zone");
+			expect(html).not.toContain('id="transcriptModal"');
+			expect(html).not.toContain('id="openTranscriptsBtn"');
+			expect(html).not.toContain('id="modalSaveBtn"');
+			expect(html).not.toContain('id="deleteTranscriptsBtn"');
+		});
+
+		it("renders a build-time Loading placeholder body populated at runtime", () => {
+			const html = buildConversationsSection(new Set(["h1"]), false);
+			// Body container that the client fills on conversationsData.
+			expect(html).toContain('id="conversationsBody"');
+			expect(html.toLowerCase()).toContain("loading");
+		});
+
+		it("count chip reflects the transcript hash count at build time", () => {
+			expect(buildConversationsSection(new Set(["h1", "h2", "h3"]), false)).toContain(
+				'class="sec-count">3<',
+			);
+			expect(buildConversationsSection(new Set(), false)).toContain(
+				'class="sec-count">0<',
 			);
 		});
 	});

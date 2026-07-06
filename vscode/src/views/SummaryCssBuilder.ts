@@ -37,8 +37,6 @@ export function buildCss(): string {
     --stat-del: #c0392b;
     --stat-turns: #6366f1;
     --stat-turns-bg: rgba(99, 102, 241, 0.08);
-    --private-zone-bg: rgba(34, 139, 34, 0.04);
-    --private-zone-border: rgba(34, 139, 34, 0.2);
   }
 
   /* ── Dark theme callout palette ── */
@@ -68,8 +66,6 @@ export function buildCss(): string {
     --stat-del: #f47067;
     --stat-turns: #a78bfa;
     --stat-turns-bg: rgba(167, 139, 250, 0.10);
-    --private-zone-bg: rgba(76, 206, 141, 0.05);
-    --private-zone-border: rgba(76, 206, 141, 0.2);
   }
 
   /* ── Base ── */
@@ -91,40 +87,6 @@ export function buildCss(): string {
     padding: 36px 28px 48px;
   }
 
-  /* ── Private Zone (All Conversations) ── */
-  .private-zone {
-    position: relative;
-    overflow: hidden;
-    border: 1px dashed var(--private-zone-border);
-    border-radius: 8px;
-    padding: 16px 20px;
-    margin-bottom: 20px;
-    background: var(--private-zone-bg);
-  }
-  .private-zone-watermark {
-    position: absolute;
-    bottom: -4px;
-    right: 12px;
-    font-size: 2.2em;
-    font-weight: 800;
-    letter-spacing: 0.12em;
-    opacity: 0.06;
-    pointer-events: none;
-    white-space: nowrap;
-    user-select: none;
-    color: var(--vscode-foreground);
-  }
-  .private-zone .section-header,
-  .private-zone .conversations-description,
-  .private-zone .conversations-privacy {
-    position: relative;
-    z-index: 1;
-  }
-  .stats-loading {
-    opacity: 0.5;
-    font-style: italic;
-  }
-
   /* ── Header: title + action bar ── */
   .page-title {
     font-size: 1.35em;
@@ -133,11 +95,6 @@ export function buildCss(): string {
     margin: 0 0 10px 0;
     color: var(--vscode-foreground);
     letter-spacing: -0.01em;
-  }
-  .header-actions {
-    display: flex;
-    gap: 6px;
-    margin-bottom: 16px;
   }
   .action-btn {
     font-family: var(--vscode-font-family);
@@ -170,22 +127,10 @@ export function buildCss(): string {
     color: var(--vscode-button-foreground);
   }
 
-  /* ── Split Button (Copy Markdown + Download dropdown) ── */
-  .split-btn-group {
+  /* ── Export menu (single toggle button + dropdown, positioning wrapper) ── */
+  .export-menu-group {
     position: relative;
     display: inline-flex;
-  }
-  .split-btn-group .action-btn:first-child {
-    border-top-right-radius: 0;
-    border-bottom-right-radius: 0;
-    border-right: none;
-  }
-  .split-toggle {
-    border-top-left-radius: 0 !important;
-    border-bottom-left-radius: 0 !important;
-    padding: 5px 7px !important;
-    font-size: 0.75em !important;
-    min-width: 0;
   }
   .split-menu {
     display: none;
@@ -245,6 +190,14 @@ export function buildCss(): string {
     font-size: 0.85em;
     color: var(--vscode-descriptionForeground);
     padding-left: 2px;
+  }
+  /* Text-snippet note preview: whitespace/line breaks in the snippet content
+     must render as authored. Can't be an inline style="" — the webview's CSP
+     has no unsafe-inline for styles (see the .tmeter-bar data-pct comment in
+     SummaryScriptBuilder for the same constraint). */
+  .plan-meta-snippet {
+    margin-top: 2px;
+    white-space: pre-wrap;
   }
   /* Per-snapshot disambiguation: relative date + "Latest" badge let the user
      tell which of several same-named plans (one per pre-squash commit) is the
@@ -321,7 +274,11 @@ export function buildCss(): string {
     display: none;
     position: absolute;
     bottom: 100%;
-    left: 0;
+    /* The "+ Add" button is pinned to the RIGHT edge of the Context panel
+       header (.sec-count margin-left:auto pushes it right), so a left-anchored
+       menu (left: 0) overflowed the panel's right edge and got clipped. Anchor
+       the menu's right edge to the button and let it grow leftward instead. */
+    right: 0;
     margin-bottom: 4px;
     min-width: 180px;
     background: var(--vscode-menu-background, var(--vscode-editor-background));
@@ -477,40 +434,14 @@ export function buildCss(): string {
     justify-content: flex-end;
   }
 
-  /* ── Properties table (Notion-style key-value rows) ── */
-  .properties {
-    display: grid;
-    grid-template-columns: auto 1fr;
-    gap: 0;
-    font-size: 0.93em;
-    margin-bottom: 4px;
-  }
-  .prop-row {
-    display: contents;
-  }
-  .prop-label {
-    padding: 5px 16px 5px 0;
-    color: var(--prop-label);
-    font-weight: 400;
-    white-space: nowrap;
-    border-bottom: 1px solid var(--border-light);
-  }
-  .prop-value {
-    padding: 5px 0;
-    color: var(--vscode-foreground);
-    border-bottom: 1px solid var(--border-light);
-    word-break: break-word;
-  }
-  .prop-row:last-child .prop-label,
-  .prop-row:last-child .prop-value {
-    border-bottom: none;
-  }
-
   /* ── Inline badges ── */
+  /* Commit-row hash (Details table): de-emphasized gray. The blue link accent
+     lives on the meta-strip branch instead; the hash here is copy-only detail
+     (paired with the ⧉ button), so it reads as secondary text. */
   .hash {
     font-family: var(--vscode-editor-font-family);
     font-size: 0.92em;
-    color: var(--vscode-textLink-foreground);
+    color: var(--text-secondary);
   }
   .hash-copy {
     display: inline-flex;
@@ -850,8 +781,19 @@ export function buildCss(): string {
   }
 
   /* ── Footer ── */
-  .page-footer {
+  .muted {
+    color: var(--text-tertiary);
+  }
+  /* Privacy note sits above .page-footer's attribution line — same muted
+     tone, no border of its own so the two read as one footer block. */
+  .transcript-privacy {
     margin-top: 32px;
+    margin-bottom: 0;
+    font-size: 0.8em;
+    letter-spacing: 0.01em;
+  }
+  .page-footer {
+    margin-top: 8px;
     padding-top: 14px;
     border-top: 1px solid var(--border-light);
   }
@@ -958,310 +900,6 @@ export function buildCss(): string {
     font-style: italic;
     font-size: 0.9em;
     padding: 8px 0;
-  }
-
-  /* ── Transcript Modal ── */
-  .modal-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    z-index: 1000;
-    display: none;
-    align-items: center;
-    justify-content: center;
-  }
-  .modal-overlay.visible {
-    display: flex;
-  }
-  .modal-container {
-    background: var(--vscode-editor-background);
-    border: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border, rgba(128,128,128,0.3)));
-    border-radius: 8px;
-    width: 95%;
-    max-width: 1100px;
-    max-height: 90vh;
-    display: flex;
-    flex-direction: column;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-  }
-  .modal-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 10px 20px;
-  }
-  .modal-title {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-  }
-  .modal-title > span:first-child {
-    font-size: 1.05em;
-    font-weight: 600;
-  }
-  .modal-subtitle {
-    font-size: 0.8em;
-    color: var(--vscode-descriptionForeground);
-  }
-  .modal-close-btn {
-    background: none;
-    border: none;
-    color: var(--vscode-foreground);
-    font-size: 1.4em;
-    cursor: pointer;
-    padding: 0 4px;
-    opacity: 0.7;
-  }
-  .modal-close-btn:hover { opacity: 1; }
-  .modal-body {
-    flex: 1;
-    overflow-y: auto;
-    padding: 16px 20px;
-  }
-  .modal-loading {
-    color: var(--vscode-descriptionForeground);
-    font-style: italic;
-    padding: 40px 0;
-    text-align: center;
-  }
-  .modal-footer {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 12px 20px;
-    border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2));
-  }
-  .modal-footer-right {
-    display: flex;
-    gap: 8px;
-  }
-  /* Failure banner above the modal footer — shown when v5 save/delete posts
-     transcriptsSaveFailed / transcriptsDeleteFailed. Uses VS Code's standard
-     error tokens so the visual matches notifications. */
-  .modal-error-banner {
-    padding: 8px 20px;
-    color: var(--vscode-inputValidation-errorForeground, var(--vscode-errorForeground, #f48771));
-    background-color: var(--vscode-inputValidation-errorBackground, rgba(244,135,113,0.12));
-    border-top: 1px solid var(--vscode-inputValidation-errorBorder, rgba(244,135,113,0.4));
-    font-size: 0.9em;
-  }
-
-  /* ── Conversations description, stats & privacy ── */
-  .conversations-description {
-    font-size: 0.92em;
-    color: var(--vscode-descriptionForeground);
-    margin: 6px 0 4px;
-    line-height: 1.4;
-  }
-  .conversations-stats {
-    font-size: 0.92em;
-    color: var(--vscode-descriptionForeground);
-    margin: 4px 0;
-    line-height: 1.4;
-  }
-  .conversations-privacy {
-    font-size: 0.92em;
-    color: var(--vscode-descriptionForeground);
-    margin: 16px 0 0;
-    line-height: 1.4;
-  }
-
-  /* ── Tab bar ── */
-  .modal-tabs {
-    display: flex;
-    gap: 0;
-    border-bottom: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2));
-    padding: 0 20px;
-    overflow-x: auto;
-    flex-shrink: 0;
-  }
-  .modal-tab {
-    padding: 6px 10px;
-    border: none;
-    background: none;
-    cursor: pointer;
-    font-size: 0.85em;
-    color: var(--vscode-descriptionForeground);
-    border-bottom: 2px solid transparent;
-    white-space: nowrap;
-    transition: color 0.15s, border-color 0.15s;
-  }
-  .modal-tab.active {
-    color: var(--vscode-foreground);
-    border-bottom-color: var(--vscode-textLink-foreground);
-    font-weight: 600;
-  }
-  .modal-tab:hover {
-    color: var(--vscode-foreground);
-  }
-  .modal-tab .session-delete-btn {
-    margin-left: 8px;
-    opacity: 0;
-    transition: opacity 0.15s;
-    font-size: 1em;
-    cursor: pointer;
-    color: var(--vscode-errorForeground, #f44);
-  }
-  .modal-tab:hover .session-delete-btn { opacity: 0.7; }
-  .modal-tab .session-delete-btn:hover { opacity: 1; }
-  .modal-tab.session-deleted {
-    text-decoration: line-through;
-    opacity: 0.5;
-  }
-  .modal-tab.session-deleted .session-delete-btn {
-    opacity: 1;
-    color: var(--vscode-textLink-foreground);
-  }
-  /* In every readonly mode (foreign / stale / regenerating) the modal-tab
-     itself stays clickable (it is just session navigation) but the
-     destructive trash affordance must not be reachable. The catch-all
-     button:not([data-foreign-safe]) rule cannot help here — session-delete-btn
-     is a <span> nested inside the tab button, so we hide it explicitly. */
-  .page.foreign-readonly .modal-tab .session-delete-btn,
-  .page.stale-readonly .modal-tab .session-delete-btn,
-  .page.regenerating-readonly .modal-tab .session-delete-btn {
-    display: none !important;
-  }
-  .tab-panel { display: none; }
-  .tab-panel.active { display: block; }
-
-  /* ── Transcript sessions & entries ── */
-  .transcript-session {
-    margin-bottom: 8px;
-  }
-
-  .transcript-entry {
-    position: relative;
-    padding: 8px 12px;
-    margin-bottom: 6px;
-    border-radius: 6px;
-    border-left: 3px solid transparent;
-    transition: background 0.15s;
-    cursor: text;
-  }
-  .transcript-entry:hover .entry-content {
-    background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.08));
-    border-radius: 4px;
-  }
-  .transcript-entry.modified {
-    border-left-color: var(--vscode-textLink-foreground, #3794ff);
-  }
-  .transcript-entry.deleted {
-    opacity: 0.4;
-    cursor: default;
-  }
-  .transcript-entry.deleted .entry-content {
-    text-decoration: line-through;
-    pointer-events: none;
-  }
-  .transcript-entry.deleted .entry-delete-btn {
-    opacity: 0.7;
-    pointer-events: auto;
-    color: var(--vscode-textLink-foreground);
-  }
-  .transcript-entry.editing {
-    background: var(--vscode-editor-background);
-    cursor: default;
-  }
-  .entry-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 4px;
-    font-size: 0.8em;
-  }
-  .entry-role {
-    font-weight: 600;
-    color: var(--vscode-foreground);
-  }
-  .entry-time {
-    color: var(--vscode-descriptionForeground);
-  }
-  .entry-delete-btn {
-    margin-left: auto;
-    background: none;
-    border: none;
-    cursor: pointer;
-    font-size: 1em;
-    opacity: 0;
-    transition: opacity 0.15s;
-    color: var(--vscode-errorForeground, #f44);
-  }
-  .transcript-entry:hover .entry-delete-btn { opacity: 0.7; }
-  .entry-delete-btn:hover { opacity: 1 !important; }
-
-  .entry-content {
-    font-size: 0.9em;
-    line-height: 1.5;
-    word-break: break-word;
-    color: var(--vscode-foreground);
-    padding: 2px 4px;
-    border-radius: 4px;
-    transition: background 0.15s;
-  }
-
-  /* ── Markdown styles in entry content ── */
-  .entry-content .md-code-block {
-    background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.1));
-    border-radius: 4px;
-    padding: 8px 12px;
-    margin: 6px 0;
-    overflow-x: auto;
-    font-family: var(--vscode-editor-font-family, monospace);
-    font-size: 0.9em;
-    line-height: 1.4;
-    white-space: pre-wrap;
-  }
-  .entry-content .md-inline-code {
-    background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.1));
-    border-radius: 3px;
-    padding: 1px 4px;
-    font-family: var(--vscode-editor-font-family, monospace);
-    font-size: 0.9em;
-  }
-  .entry-content .md-heading {
-    margin: 8px 0 4px;
-    font-weight: 600;
-    line-height: 1.3;
-  }
-  .entry-content h2.md-heading { font-size: 1.1em; }
-  .entry-content h3.md-heading { font-size: 1em; }
-  .entry-content h4.md-heading { font-size: 0.95em; }
-  .entry-content h5.md-heading { font-size: 0.9em; }
-  .entry-content .md-list {
-    margin: 4px 0;
-    padding-left: 20px;
-  }
-  .entry-content .md-list li {
-    margin: 2px 0;
-  }
-  .entry-content .md-link {
-    color: var(--vscode-textLink-foreground);
-    text-decoration: none;
-  }
-  .entry-content .md-link:hover {
-    text-decoration: underline;
-  }
-  .entry-content .md-blank {
-    height: 0.5em;
-  }
-
-  .entry-edit-textarea {
-    width: 100%;
-    min-height: 60px;
-    padding: 8px;
-    font-family: var(--vscode-editor-font-family, monospace);
-    font-size: 0.9em;
-    line-height: 1.5;
-    background: var(--vscode-input-background);
-    color: var(--vscode-input-foreground);
-    border: 1px solid var(--vscode-input-border, rgba(128,128,128,0.3));
-    border-radius: 4px;
-    resize: vertical;
-    outline: none;
-  }
-  .entry-edit-textarea:focus {
-    border-color: var(--vscode-focusBorder);
   }
 
   /* Danger button */
@@ -1457,17 +1095,19 @@ export function buildCss(): string {
   /* reading column: cap width for readability, tighten padding for narrow tabs */
   .page { max-width: 820px; padding: 22px 18px 48px; }
 
-  /* ── Meta strip ── */
+  /* ── Meta strip: hash · branch · time · Details · Share · Export ── */
   .meta-strip {
     display: flex; flex-wrap: wrap; align-items: center; gap: 5px 9px;
     font-size: 0.86em; color: var(--text-secondary); margin-bottom: 6px;
   }
   .meta-strip .meta-sep { color: var(--text-tertiary); opacity: 0.55; }
   .meta-strip .meta-hash { font-family: var(--vscode-editor-font-family); color: var(--vscode-textLink-foreground); }
+  /* Branch in the meta-strip: blue link accent (plain text, no pill) — carries
+     the emphasis the commit-row hash gave up above. */
   .meta-branch {
     display: inline-block; max-width: 220px; overflow: hidden; text-overflow: ellipsis;
     white-space: nowrap; vertical-align: bottom;
-    padding: 1px 8px; border-radius: 5px; background: var(--pill-bg); color: var(--pill-text); font-size: 0.92em;
+    color: var(--vscode-textLink-foreground); font-size: 0.92em;
   }
   .meta-backfill {
     padding: 1px 8px; border-radius: 5px; font-size: 0.92em; cursor: help;
@@ -1481,15 +1121,97 @@ export function buildCss(): string {
   }
   .details-toggle:hover { color: var(--vscode-textLink-foreground); }
   .details-toggle:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 1px; }
+  /* Share / Export sit at the tail of the meta strip. Styled to the mockup's
+     .btn.secondary: borderless filled secondary button, inline-flex so a
+     leading icon (Share's upload SVG, Export's codicon-book + chevron) aligns
+     with the label via the gap, semibold, 6px radius. A margin-left:auto on
+     Share (the first of the pair) pushes the Share + Export group to the RIGHT
+     edge of the strip, so hash / branch / time / Details stay left. */
+  .meta-strip .action-btn.meta-share,
+  .meta-strip .action-btn.meta-export {
+    display: inline-flex; align-items: center; gap: 6px;
+    border: none; border-radius: 6px; font-weight: 600;
+    font-size: 11.5px; padding: 5px 12px;
+  }
+  .meta-strip .action-btn.meta-share { margin-left: auto; padding: 4px 10px; }
+  /* Share's inline SVG (mockup .sico) and Export's codicons scale to the
+     compact button rather than the codicon default 16px. */
+  .meta-strip .action-btn .sico { width: 1em; height: 1em; vertical-align: -0.15em; flex-shrink: 0; }
+  .meta-strip .action-btn .codicon { font-size: 13px; }
+  .meta-strip .export-menu-group { display: inline-flex; }
 
-  /* properties → collapsible Details disclosure */
-  .properties.collapsed { display: none; }
-  .properties { margin: 8px 0 4px; border: 1px solid var(--border-light); border-radius: 8px; overflow: hidden; }
-  /* Balanced horizontal padding so the value text isn't flush against the
-     tinted label column (the gap was the reported issue). */
-  .properties .prop-label { padding: 6px 16px; background: var(--panel-inner); }
-  .properties .prop-value { padding: 6px 16px; }
-  .header-actions { margin: 14px 0 20px; }
+  /* ── Details table (#propTable, collapsible via .details-toggle) ──
+     Flat key→value rows (mockup): each row is a flex line with the label left
+     and the value right-aligned in a monospace tint, NOT a two-column grid with
+     a shaded label column. The .collapsed toggle mechanism is unchanged (the
+     client script toggles the class); only the row layout matches the mockup. */
+  .mem-details.collapsed { display: none; }
+  .mem-details {
+    margin: 6px 0 12px; padding: 4px 12px;
+    border: 1px solid var(--border-light); border-radius: 8px; background: var(--panel-bg);
+  }
+  .md-row {
+    display: flex; justify-content: space-between; gap: 14px;
+    font-size: 0.85em; padding: 5px 0; border-bottom: 1px solid var(--border-light);
+  }
+  .md-row:last-child { border-bottom: none; }
+  .md-k { color: var(--text-tertiary); flex-shrink: 0; }
+  .md-v {
+    color: var(--text-secondary); text-align: right; word-break: break-word;
+    font-family: var(--vscode-editor-font-family, monospace); font-size: 0.92em;
+  }
+  .tok-bd { color: var(--text-tertiary); font-size: 0.94em; }
+
+  /* ── Token meter (per-memory usage bar, between header and ship bar) ── */
+  .tmeter {
+    border: 1px solid var(--border-light); border-radius: 10px;
+    padding: 10px 14px; margin: 0 0 14px; background: var(--panel-bg);
+  }
+  .tmeter.na { padding: 8px 14px; }
+  .tmeter-head {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    font-size: 0.86em; color: var(--text-secondary);
+  }
+  .tmeter-total { font-weight: 650; color: var(--vscode-foreground); }
+  .tmeter-cost { color: var(--text-tertiary); }
+  .tmeter-bar {
+    display: flex; width: 100%; height: 6px; border-radius: 3px;
+    overflow: hidden; margin-top: 8px; background: var(--panel-inner);
+  }
+  .tmeter-bar .seg-in,
+  .tmeter-bar .seg-out,
+  .tmeter-bar .seg-cache {
+    height: 100%; width: 0; transition: width 0.2s ease;
+  }
+  .seg-in { background: var(--vscode-charts-green, #4ece8d); }
+  .seg-out { background: var(--vscode-charts-orange, #e0ac2b); }
+  .seg-cache { background: var(--vscode-charts-blue, #6b8299); opacity: 0.7; }
+  .tmeter-legend {
+    display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 7px;
+    font-size: 0.8em; color: var(--text-secondary);
+  }
+  .lg-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 5px; vertical-align: middle; font-style: normal;
+  }
+  /* ── Token meter help popover (pinned via click, not just hover) ── */
+  .tok-help-wrap { position: relative; display: inline-flex; margin-left: auto; }
+  .tok-help {
+    background: none; border: 1px solid var(--border-light); border-radius: 50%;
+    width: 15px; height: 15px; line-height: 1; padding: 0; font-size: 0.72em;
+    color: var(--text-tertiary); cursor: pointer;
+  }
+  .tok-help:hover { color: var(--vscode-foreground); border-color: var(--text-secondary); }
+  .tok-pop {
+    display: none; position: absolute; right: 0; top: calc(100% + 6px);
+    width: 260px; padding: 9px 11px; border-radius: 7px; z-index: 50;
+    background: var(--vscode-menu-background, var(--vscode-editor-background));
+    border: 1px solid var(--vscode-menu-border, var(--border-light));
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    font-size: 0.82em; font-weight: 400; line-height: 1.45; color: var(--text-secondary);
+    white-space: normal;
+  }
+  .tok-help-wrap.pinned .tok-pop { display: block; }
 
   /* ── Ship bar (hero) ── */
   .ship-bar {
@@ -1507,12 +1229,8 @@ export function buildCss(): string {
   .ship-sub { font-size: 0.86em; color: var(--text-secondary); line-height: 1.45; }
   .ship-actions { display: flex; gap: 7px; flex-wrap: wrap; }
   .jolli-status { font-size: 0.9em; }
-  /* PR section reframed as a ship card: drop its standalone section spacing */
-  #prCard #prSection { margin: 0; }
-  #prCard .section-header { margin-bottom: 6px; }
-  #prCard .pr-status-text { margin-top: 0; }
 
-  /* ── Status chip (shared: Jolli synced/not-shared + PR open / loading) ── */
+  /* ── Status chip (shared: Jolli SYNCED/LOCAL + PR open / loading) ── */
   .ship-status {
     margin-left: auto; display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
     font-size: 0.72em; font-weight: 650; letter-spacing: 0.02em; padding: 2px 9px;
@@ -1521,6 +1239,8 @@ export function buildCss(): string {
   .ship-status .led { width: 7px; height: 7px; border-radius: 50%; background: var(--text-tertiary); flex-shrink: 0; }
   .ship-status.is-ok { color: var(--ship-ok); } .ship-status.is-ok .led { background: var(--ship-ok); }
   .ship-status.is-warn { color: var(--ship-warn); } .ship-status.is-warn .led { background: var(--ship-warn); }
+  /* LOCAL chip (not-yet-synced Jolli state) shares the warn tone. */
+  .ship-status.local-chip { color: var(--ship-warn); } .ship-status.local-chip .led { background: var(--ship-warn); }
   .ship-status.is-loading .led { animation: pulse 1.1s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
 
@@ -1535,38 +1255,178 @@ export function buildCss(): string {
     padding-bottom: 8px; margin-bottom: 12px; border-bottom: 1px solid var(--border-light);
   }
   .panel-title { font-size: 0.78em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.09em; color: var(--text-secondary); }
+  /* Regenerate relocated from the Export menu into the Memory panel header
+     (right-aligned). It re-runs the recap + topics rendered in this panel. */
+  #memoryPanel .panel-regenerate { margin-left: auto; font-size: 0.78em; padding: 3px 10px; }
   /* recap inside the memory panel: borderless accent block (no box-in-box) */
   #memoryPanel #recapSection {
     background: var(--panel-inner); border-left: 3px solid var(--vscode-textLink-foreground);
     border-radius: 0 6px 6px 0; padding: 10px 13px; margin-bottom: 14px;
   }
 
-  /* ── Attachment cards (collapse wrapper OUTSIDE the refreshed section so
-     collapse state survives plansAndNotesUpdated rebuilds for free) ── */
-  /* No overflow:hidden — the "+ Add" dropdown opens upward (bottom:100%) and
-     must escape the card bounds; clipping it cut off the first menu item.
-     Collapse uses display:none, so no overflow is needed for it. */
-  .attach-card { border-radius: 8px; background: var(--panel-inner); margin-bottom: 10px; }
-  .attach-card:last-child { margin-bottom: 0; }
-  .attach-card-head {
-    display: flex; align-items: center; gap: 8px; padding: 9px 12px;
-    cursor: pointer; user-select: none; font-size: 0.84em; font-weight: 600;
+  /* ── Context panel (flat rows, mockup — replaces the old collapsible
+     "Attachments & context" cards) ── */
+  /* #plansAndNotesSection's own header is superseded by #contextPanel's
+     .panel-header (title + count chip + "+ Add"); hide it rather than
+     removing it from buildPlansAndNotesSection's output, since that section
+     is also refreshed independently via plansAndNotesUpdated. */
+  #contextPanel #plansAndNotesSection .section-header { display: none; }
+  #contextPanel .panel-header { position: relative; }
+  /* The "+ Add" affordance sits in the panel header (mockup); its dropdown
+     menu is still position:relative to #addDropdown (opens upward, no
+     overflow:hidden anywhere in the ancestor chain so it isn't clipped). */
+  #contextPanel .panel-header .add-dropdown { margin-top: 0; margin-left: auto; }
+  /* "+ Add" collapses to a bare + icon-button pushed to the header's right edge,
+     mirroring the sidebar Working Memory .sec-actions .icon-btn (borderless,
+     hover-filled). The .action-btn base (border/padding) is fully overridden. */
+  .panel-add {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; padding: 0;
+    border: none; background: transparent; border-radius: 4px;
+    color: var(--text-secondary); cursor: pointer;
   }
-  .attach-card-head:hover { background: var(--surface-hover); }
-  .attach-card-head:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: -2px; }
-  .attach-arrow { margin-left: auto; font-size: 0.7em; color: var(--text-secondary); transition: transform 0.18s ease; }
-  .attach-card.collapsed .attach-arrow { transform: rotate(-90deg); }
-  .attach-card.collapsed .attach-card-body { display: none; }
-  .attach-card-body { padding: 4px 12px 12px; }
-  /* inner section titles replaced by the card head */
-  .attach-card-body .section-header { display: none; }
-  .attach-card-body .section-title { display: none; }
+  .panel-add:hover { background: var(--surface-hover); color: var(--vscode-foreground); }
+  .panel-add .codicon { font-size: 16px; }
 
-  /* ── Conversations section (top-level, no private drawer chrome) ── */
-  .conversations-section .private-zone { border: none; background: none; padding: 0; margin: 0; }
-  .conversations-section .private-zone .section-title { display: none; }
-  .conversations-section .private-zone-watermark { display: none; }
-  .conversations-section .section-header { margin-bottom: 8px; }
+  /* Single-letter source/kind badge (P/N plan/note, L/J/G/N reference source). */
+  .kb-tag {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 16px; height: 16px; flex: none;
+    border-radius: 3px; font-size: 10px; font-weight: 700; line-height: 1;
+    color: var(--vscode-button-foreground, #ffffff);
+  }
+  .kb-tag.t-plan { background: var(--vscode-charts-green,  #388a34); }
+  .kb-tag.t-note { background: var(--vscode-charts-orange, #d18616); }
+  .kb-tag.t-ref  { background: #5e6ad2; }
+
+  /* ── Conversations panel (inline rows, mockup) ── */
+  /* Count after the panel title (Conversations / Files / Context share it).
+     Plain dim number — NO pill background — matching the Topics header's
+     .section-count above, and LEFT-aligned (hugs the title). Any right-aligned
+     header affordance (Context's + Add) carries its own margin-left:auto below. */
+  .sec-count {
+    font-size: 0.82em;
+    font-weight: 400;
+    color: var(--text-tertiary);
+  }
+  .conversations-body .conv-loading,
+  .conversations-body .conv-empty {
+    color: var(--text-secondary); font-size: 0.85em; padding: 6px 2px; margin: 0;
+  }
+
+  /* Inline evidence row primitive (shared with Conversations / Context panels). */
+  .conversations-body .row,
+  #contextPanel .row {
+    display: flex; align-items: center; gap: 6px; line-height: 1.35;
+    padding: 3px 6px; border-radius: 6px; min-height: 24px;
+  }
+  /* Conversation rows open the transcript on click (Context rows act via their
+     explicit per-row buttons, so only the conversation row is pointer). */
+  .conversations-body .row { cursor: pointer; }
+  .conversations-body .row:hover,
+  #contextPanel .row:hover { background: var(--surface-hover); }
+  .conversations-body .r-main,
+  #contextPanel .r-main { flex: 1; min-width: 0; }
+  /* Titles wrap to two lines then clamp (mockup .row .r-title), rather than a
+     single-line ellipsis — conversation/plan titles are long and the second
+     line carries useful signal. */
+  .conversations-body .r-title,
+  #contextPanel .r-title {
+    font-size: 12px; white-space: normal; word-break: break-word; line-height: 1.35;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .conversations-body .r-meta { font-size: 10.5px; color: var(--text-secondary); white-space: nowrap; flex-shrink: 0; }
+  /* Hover flicker guard: revealing the detach action must NOT change the row's
+     layout, or a 2-line-clamped title can re-wrap to 1 line, the row height
+     jumps, the cursor leaves the row, and hover oscillates. So r-actions is an
+     absolute overlay (zero layout width) and the hidden .r-meta keeps its width
+     via visibility (not display), so .r-main never reflows on hover. */
+  .conversations-body .row { position: relative; }
+  .conversations-body .r-actions {
+    position: absolute; right: 6px; top: 0; bottom: 0;
+    display: none; align-items: center; flex: none;
+  }
+  .conversations-body .row:hover .r-actions { display: inline-flex; }
+  .conversations-body .row:hover .hide-on-hover { visibility: hidden; }
+  /* Context panel's row actions (Edit/Open/Remove/Translate) stay always-
+     visible rather than hover-reveal — they carry inline-edit / translate
+     state (e.g. .translating spin) that users need to see without hovering. */
+  #contextPanel .r-actions { display: flex; flex: none; align-items: center; gap: 2px; }
+
+  /* Source glyph — per-source brand <svg> logo (mirrors the sidebar's
+     .conv-source-svg), not a text pill. Neutral marks (Cursor/Copilot/OpenCode)
+     inherit icon-foreground via currentColor; brand-colored marks carry hex. */
+  .conversations-body .badge {
+    flex: none; display: inline-flex; align-items: center; justify-content: center;
+    width: 16px; height: 16px; color: var(--vscode-icon-foreground);
+  }
+  .conversations-body .badge svg { width: 16px; height: 16px; display: block; }
+  .conversations-body .badge .codicon { font-size: 15px; }
+
+  /* Icon button used by the detach action (Conversations) and Edit/Open/
+     Remove/Translate actions (Context). */
+  .conversations-body .icon-btn,
+  #contextPanel .icon-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; padding: 0; border: none; border-radius: 4px;
+    background: transparent; color: var(--text-secondary); cursor: pointer;
+  }
+  .conversations-body .icon-btn:hover,
+  #contextPanel .icon-btn:hover { background: var(--surface-hover); }
+  .conversations-body .icon-btn.danger:hover { color: var(--vscode-errorForeground, #f14c4c); }
+
+  /* ── Files panel (per-file git status + diff, mirrors Create PR's file rows) ── */
+  .files-body .files-loading {
+    color: var(--text-secondary); font-size: 0.85em; padding: 6px 2px; margin: 0;
+  }
+  #filesPanel .row {
+    display: flex; align-items: center; gap: 6px; line-height: 1.35;
+    padding: 3px 6px; border-radius: 6px; min-height: 24px; cursor: pointer;
+  }
+  #filesPanel .row:hover { background: var(--surface-hover); }
+  #filesPanel .r-main { flex: 1; min-width: 0; }
+  #filesPanel .r-title {
+    font-size: 0.9em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #filesPanel .r-sub { font-size: 10.5px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+  /* Off-branch rows: the diff can't be resolved on the checked-out branch
+     (foreign Memory Bank repo, or the commit isn't an ancestor of HEAD) —
+     dim the row and drop the pointer cursor since it carries no data-path
+     and the click handler has nothing to bind. */
+  #filesPanel .row.is-unresolvable {
+    cursor: default; opacity: 0.55;
+  }
+  #filesPanel .row.is-unresolvable:hover { background: none; }
+  .files-offbranch-hint {
+    color: var(--text-secondary); font-size: 0.82em; margin: 8px 2px 0; padding-top: 8px;
+    border-top: 1px solid var(--border-light);
+  }
+  .files-offbranch-hint code {
+    font-family: var(--vscode-editor-font-family); background: var(--surface-hover);
+    border-radius: 3px; padding: 1px 4px;
+  }
+  /* Filename tint by git status (added/deleted/renamed read differently from
+     a plain modified file — mirrors the Commits-tree and Create PR panes). */
+  .fname-A { color: var(--vscode-gitDecoration-addedResourceForeground); }
+  .fname-D { color: var(--vscode-gitDecoration-deletedResourceForeground); text-decoration: line-through; }
+  .fname-R { color: var(--vscode-gitDecoration-renamedResourceForeground); }
+  /* Modified filenames take the git-modified decoration hue (yellow on most
+     themes) — matches the sidebar Files tree, not plain foreground. */
+  .fname-M { color: var(--vscode-gitDecoration-modifiedResourceForeground); }
+  .fname-U { color: var(--vscode-gitDecoration-untrackedResourceForeground); }
+  /* Trailing git-status letter badge (shared shape with the Create PR pane's
+     .gs / .gs-<code>; kept as a local copy here since the two documents don't
+     share a CSS module). */
+  .gs {
+    flex-shrink: 0; font-family: ui-monospace, monospace;
+    font-size: 11px; font-weight: 700; width: 12px; text-align: center;
+  }
+  .gs-M { color: var(--vscode-gitDecoration-modifiedResourceForeground); }
+  .gs-A { color: var(--vscode-gitDecoration-addedResourceForeground); }
+  .gs-D { color: var(--vscode-gitDecoration-deletedResourceForeground); }
+  .gs-R { color: var(--vscode-gitDecoration-renamedResourceForeground); }
+  .gs-U { color: var(--vscode-gitDecoration-untrackedResourceForeground); }
+  .gs-C { color: var(--vscode-gitDecoration-conflictingResourceForeground); }
 
   @media (prefers-reduced-motion: reduce) {
     .attach-arrow, .ship-status.is-loading .led { transition: none; animation: none; }

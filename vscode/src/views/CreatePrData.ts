@@ -10,12 +10,21 @@ import { buildPrBodyMarkdown, pickPrTitle } from "../../../cli/src/core/PrDescri
 import { toForwardSlash } from "../../../cli/src/core/PathUtils.js";
 import type { E2eTestScenario } from "../../../cli/src/Types.js";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
+import type { PrHistoryEntry } from "../services/PrCommentService.js";
 import { loadBranchSummaries } from "./BranchSummaryLoader.js";
 
 export interface CreatePrFileRow {
 	path: string;
 	dir: string;
 	status: string;
+	/**
+	 * For a rename (status "R"), the file's path at the diff base. `path` holds
+	 * the *new* path; `oldPath` holds the *old* one so a per-file diff can read
+	 * the left (base) side from where the content actually lived — the new path
+	 * does not exist at the base, so using it there yields an empty "new file"
+	 * diff instead of the real rename. Absent for non-rename rows.
+	 */
+	oldPath?: string;
 }
 
 export interface CreatePrMemoryRow {
@@ -49,6 +58,23 @@ export interface CreatePrViewModel {
 	 * PR"; when undefined the pane is in create mode.
 	 */
 	existingPr?: { number: number; url: string };
+	/**
+	 * Closed (merged / closed-without-merge) PRs previously opened from this
+	 * branch, newest-first. Populated by the panel (not this pure builder) from
+	 * the same gh round-trip as {@link existingPr}. Rendered as a lightweight
+	 * "Previously: #N (merged) · …" strip under the meta-strip so a branch whose
+	 * PR was already merged still surfaces that PR's link here. Empty/undefined
+	 * when the branch has no closed PRs (or the gh lookup failed).
+	 */
+	prHistory?: ReadonlyArray<PrHistoryEntry>;
+	/**
+	 * Whether the user is signed in to Jolli. Populated by the panel (not this
+	 * pure builder) since auth state lives on the VS Code side. Drives the share
+	 * notice above the Title panel: signed-in shows a confirmation that creating
+	 * the PR also shares the memories to Jolli Space; signed-out shows a Sign In
+	 * link. Undefined is treated as signed-out (never falsely claim "signed in").
+	 */
+	signedIn?: boolean;
 }
 
 /**
@@ -59,7 +85,10 @@ export interface CreatePrViewModel {
  *
  * The **anchor** is the newest summary (`summaries[summaries.length - 1]`)
  * because `loadBranchSummaries` returns commits in chronological (oldest-
- * first) order.  Title, body, and e2eScenarios are derived from the anchor.
+ * first) order. Title and body are derived from the anchor; E2E scenarios are
+ * aggregated across ALL included memories (matching the aggregated PR body),
+ * so the panel's E2E Test Guide isn't empty just because the newest commit
+ * happened not to generate scenarios.
  */
 export async function buildCreatePrViewModel(
 	bridge: JolliMemoryBridge,
@@ -91,7 +120,10 @@ export async function buildCreatePrViewModel(
 		bodyMarkdown: buildPrBodyMarkdown(anchor, summaries, missingCount),
 		memories,
 		files: stats.files,
-		e2eScenarios: anchor.e2eTestGuide ?? [],
+		// Aggregate E2E scenarios across every included memory (not just the
+		// anchor) so the panel mirrors the aggregated PR body — a newest commit
+		// without scenarios must not blank out the whole E2E Test Guide section.
+		e2eScenarios: summaries.flatMap((s) => s.e2eTestGuide ?? []),
 	};
 }
 
@@ -116,10 +148,11 @@ export function parseNameStatus(raw: string): CreatePrFileRow[] {
 		const parts = entry.split("\t");
 		const rawStatus = parts[0];
 		const status = rawStatus.startsWith("R") ? "R" : rawStatus;
-		const filePath = toForwardSlash(status === "R" && parts.length >= 3 ? parts[2] : parts[1]);
+		const isRename = status === "R" && parts.length >= 3;
+		const filePath = toForwardSlash(isRename ? parts[2] : parts[1]);
 		const lastSlash = filePath.lastIndexOf("/");
 		const dir = lastSlash >= 0 ? filePath.slice(0, lastSlash) : "";
-		rows.push({ path: filePath, dir, status });
+		rows.push({ path: filePath, dir, status, ...(isRename ? { oldPath: toForwardSlash(parts[1]) } : {}) });
 	}
 	return rows;
 }
