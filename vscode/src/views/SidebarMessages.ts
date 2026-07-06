@@ -11,7 +11,7 @@
 import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSessionAggregator.js";
 import type { PinEntry, PinKind } from "../../../cli/src/core/PinStore.js";
 import type { ReferenceField, SourceId, TranscriptSource } from "../../../cli/src/Types.js";
-import type { WorkerPhase } from "../stores/StatusStore.js";
+import type { IngestPhase } from "../stores/StatusStore.js";
 
 export type SidebarTab = "kb" | "branch" | "status";
 export type KbMode = "folders" | "memories";
@@ -936,15 +936,15 @@ export type SidebarInboundMsg =
 	  }
 	| {
 			/**
-			 * Worker-phase indicator for the Branch-tab toolbar. Selects a
-			 * distinct label per ingest sub-phase: `"ingest:wiki"` → "Building
-			 * knowledge wiki…", `"ingest:graph"` → "Building knowledge graph…"
-			 * (the legacy bare `"ingest"` falls back to the wiki label). `null`
-			 * falls back to the default "AI summary in progress…". Lifetime is
-			 * bound to `worker:busy` on the reader side.
+			 * Ingest indicator for the Branch-tab toolbar's cosmetic pill. `busy`
+			 * drives whether the "Building knowledge …" pill shows; `phase` selects
+			 * the label (`"wiki"` → "Building knowledge wiki…", `"graph"` → "Building
+			 * knowledge graph…"). Fully independent of `worker:busy` — an ingest runs
+			 * under its own lock and can show while no summary is in flight.
 			 */
-			readonly type: "worker:phase";
-			readonly phase: WorkerPhase;
+			readonly type: "ingest:phase";
+			readonly busy: boolean;
+			readonly phase: IngestPhase;
 	  }
 	| {
 			/**

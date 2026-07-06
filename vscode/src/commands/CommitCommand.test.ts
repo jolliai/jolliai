@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { isWorkerBlockingBusy } = vi.hoisted(() => ({
-	isWorkerBlockingBusy: vi.fn(),
+const { isWorkerBusy } = vi.hoisted(() => ({
+	isWorkerBusy: vi.fn(),
 }));
 
 const { info, warn, error, debug } = vi.hoisted(() => ({
@@ -100,7 +100,7 @@ vi.mock("vscode", () => ({
 }));
 
 vi.mock("../util/LockUtils.js", () => ({
-	isWorkerBlockingBusy,
+	isWorkerBusy,
 }));
 
 vi.mock("../util/Logger.js", () => ({
@@ -232,8 +232,8 @@ function makeCommand(deps: ReturnType<typeof makeDeps>): CommitCommand {
 
 describe("CommitCommand", () => {
 	beforeEach(() => {
-		isWorkerBlockingBusy.mockReset();
-		isWorkerBlockingBusy.mockResolvedValue(false);
+		isWorkerBusy.mockReset();
+		isWorkerBusy.mockResolvedValue(false);
 		showWarningMessage.mockReset();
 		showErrorMessage.mockReset();
 		showInformationMessage.mockReset();
@@ -246,7 +246,7 @@ describe("CommitCommand", () => {
 	});
 
 	it("stops immediately when the worker lock is held", async () => {
-		isWorkerBlockingBusy.mockResolvedValue(true);
+		isWorkerBusy.mockResolvedValue(true);
 		const deps = makeDeps();
 		const command = makeCommand(deps);
 
@@ -259,11 +259,11 @@ describe("CommitCommand", () => {
 	});
 
 	it("re-checks the worker gate after the QuickPick and restores the index when it turned busy", async () => {
-		// Click-time check passes (e.g. exempt ingest phase), but the same
-		// drain moves into a blocking summary run during message generation /
+		// Click-time check passes (worker idle), but the same drain moves into
+		// a blocking summary run during message generation /
 		// QuickPick review — the commit (possibly an Amend rewriting HEAD)
 		// must not execute, and the user's index must be restored.
-		isWorkerBlockingBusy
+		isWorkerBusy
 			.mockResolvedValueOnce(false)
 			.mockResolvedValueOnce(true);
 		const deps = makeDeps();
@@ -275,7 +275,7 @@ describe("CommitCommand", () => {
 
 		await command.execute();
 
-		expect(isWorkerBlockingBusy).toHaveBeenCalledTimes(2);
+		expect(isWorkerBusy).toHaveBeenCalledTimes(2);
 		expect(deps.bridge.commit).not.toHaveBeenCalled();
 		expect(deps.bridge.amendCommit).not.toHaveBeenCalled();
 		expect(deps.bridge.restoreIndexTree).toHaveBeenCalledWith("tree-sha");

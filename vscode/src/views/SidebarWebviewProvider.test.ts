@@ -5441,7 +5441,7 @@ describe("SidebarWebviewProvider", () => {
 			}
 		});
 
-		it("posts worker:phase on ready when statusProvider exposes getWorkerPhase", async () => {
+		it("posts ingest:phase on ready when statusProvider exposes getIngest", async () => {
 			const view = makeMockView();
 			const provider = new SidebarWebviewProvider({
 				executeCommand: vi.fn(),
@@ -5458,7 +5458,7 @@ describe("SidebarWebviewProvider", () => {
 					serialize: () => [],
 					onDidChangeTreeData: () => ({ dispose: () => {} }),
 					getWorkerBusy: () => false,
-					getWorkerPhase: () => "ingest",
+					getIngest: () => ({ busy: true, phase: "graph" }),
 				},
 			});
 			provider.resolveWebviewView(view as unknown as never);
@@ -5466,9 +5466,10 @@ describe("SidebarWebviewProvider", () => {
 			await flushReady();
 			const phaseMsg = view.webview.postMessage.mock.calls
 				.map((c) => c[0])
-				.find((m) => m.type === "worker:phase");
+				.find((m) => m.type === "ingest:phase");
 			expect(phaseMsg).toBeDefined();
-			expect(phaseMsg.phase).toBe("ingest");
+			expect(phaseMsg.busy).toBe(true);
+			expect(phaseMsg.phase).toBe("graph");
 		});
 
 		describe("kb:requestPrStatus → kb:prStatus", () => {

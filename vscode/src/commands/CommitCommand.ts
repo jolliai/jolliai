@@ -25,7 +25,7 @@ import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import type { CommitsStore } from "../stores/CommitsStore.js";
 import type { FilesStore } from "../stores/FilesStore.js";
 import type { StatusStore } from "../stores/StatusStore.js";
-import { isWorkerBlockingBusy } from "../util/LockUtils.js";
+import { isWorkerBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
 import type { StatusBarManager } from "../util/StatusBarManager.js";
 
@@ -77,10 +77,10 @@ export class CommitCommand {
 	 * Called when the user clicks [✦] in the Changes panel header.
 	 */
 	async execute(): Promise<void> {
-		// Guard: block while the post-commit Worker holds the lock for a summary
-		// run. The ingest phase (Memory Bank wiki update) is exempt — it never
-		// touches the commit pipeline, so committing during it is safe.
-		if (await isWorkerBlockingBusy(this.workspaceRoot)) {
+		// Guard: block while the post-commit Worker holds worker.lock for a summary
+		// run. Ingest (Memory Bank wiki/graph) runs under its own ingest.lock, so it
+		// does not trip this gate — committing during it is safe.
+		if (await isWorkerBusy(this.workspaceRoot)) {
 			vscode.window.showWarningMessage(
 				"Jolli Memory: AI summary is being generated. Please wait a moment.",
 			);
@@ -182,12 +182,11 @@ export class CommitCommand {
 		}
 
 		// Re-check the worker gate: the click-time check at the top goes stale
-		// during message generation + QuickPick review. A drain that was in the
-		// exempt ingest phase at click time may since have moved on to a blocking
-		// summary entry, and the Amend actions rewrite HEAD under its reads
-		// (same Bug-3 race class as Squash). Restore the index like the cancel
-		// path so the user's staging state survives the abort.
-		if (await isWorkerBlockingBusy(this.workspaceRoot)) {
+		// during message generation + QuickPick review. A summary drain may have
+		// started since click time, and the Amend actions rewrite HEAD under its
+		// reads (same Bug-3 race class as Squash). Restore the index like the
+		// cancel path so the user's staging state survives the abort.
+		if (await isWorkerBusy(this.workspaceRoot)) {
 			log.warn("commit", "Worker became busy during QuickPick — aborting");
 			vscode.window.showWarningMessage(
 				"Jolli Memory: AI summary is being generated. Please wait a moment.",

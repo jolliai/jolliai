@@ -1459,7 +1459,7 @@ describe("SidebarScriptBuilder", () => {
 		it("gates entering squash mode while a background AI summary is in progress", () => {
 			const js = buildSidebarScript();
 			// The "Squash memories…" enter button is disabled during a blocking
-			// worker run (ingest exempt via isWorkerBlocking), mirroring the
+			// worker run (worker.lock held, via isWorkerBlocking), mirroring the
 			// SquashCommand handler gate. The actual confirm lives in the squash
 			// bar (gated on 2+ selected || worker busy — asserted below).
 			expect(js).toMatch(
@@ -1473,14 +1473,12 @@ describe("SidebarScriptBuilder", () => {
 			);
 		});
 
-		it("exempts the ingest phase from disabling commit actions", () => {
+		it("gates commit actions on workerBusy alone (ingest never blocks)", () => {
 			const js = buildSidebarScript();
-			// isWorkerBlocking is the single busy predicate for commit actions:
-			// busy in any phase except an `ingest*` sub-phase (prefix match so
-			// ingest:wiki / ingest:graph both stay exempt).
-			expect(js).toContain(
-				"return state.workerBusy && !(state.workerPhase && state.workerPhase.indexOf('ingest') === 0);",
-			);
+			// isWorkerBlocking is the single busy predicate for commit actions and
+			// mirrors worker.lock only. Ingest runs under its own lock and can
+			// never hold worker.lock, so there is no phase exemption to check.
+			expect(js).toContain("return state.workerBusy;");
 			// Both commit entry points go through it: the Commit-AI icon button
 			// (asserted above) and the body-bar Commit Memory button.
 			expect(js).toMatch(
@@ -2772,7 +2770,7 @@ describe("SidebarScriptBuilder", () => {
 
 	it("renders a compact build pill (Wiki / Graph) for the ingest phase, full label in the title", () => {
 		const js = buildSidebarScript();
-		// Non-blocking Memory Bank build → a compact pill mirroring the ● AI pill:
+		// A live ingest (running alone) → a compact pill mirroring the ● AI pill:
 		// a spinner + a short phase word that never truncates in a narrow header.
 		expect(js).toContain("className: 'section-build-pill'");
 		expect(js).toContain("section-build-spin");
@@ -2781,35 +2779,39 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("const short = isGraph ? 'Graph' : 'Wiki';");
 		expect(js).toContain("Building knowledge graph…");
 		expect(js).toContain("Building knowledge wiki…");
-		// graph is the more specific prefix and must be tested before the wiki
-		// fallback, else 'ingest:graph' would match the wiki branch.
-		expect(js).toContain("state.workerPhase.indexOf('ingest:graph') === 0");
-		expect(js).toContain("state.workerPhase.indexOf('ingest') === 0");
+		// The pill reads the dedicated ingestBusy / ingestPhase state, not the
+		// worker (summary) phase — ingest has its own lock.
+		expect(js).toContain("if (state.ingestBusy)");
+		expect(js).toContain("const isGraph = state.ingestPhase === 'graph';");
 		// The retired single-value label must be gone.
 		expect(js).not.toContain("Updating Memory Bank…");
 	});
 
-	it("keeps the default AI summary label for non-ingest busy state", () => {
+	it("renders a compact '● AI' pill for the blocking summary and gives it priority over the ingest pill", () => {
 		const js = buildSidebarScript();
-		expect(js).toContain("AI summary in progress…");
+		// Summary-first priority: workerBusy returns the "● AI" pill before the
+		// ingestBusy branch is ever reached, so a concurrent ingest is suppressed
+		// while a summary runs. The full phrase survives only as the pill's title.
+		const start = js.indexOf("function renderWorkerSignal(");
+		const end = js.indexOf("function renderSection(", start);
+		const body = js.slice(start, end);
+		expect(start).toBeGreaterThan(-1);
+		// workerBusy check comes first (priority), ingestBusy check comes after.
+		const workerIdx = body.indexOf("if (state.workerBusy)");
+		const ingestIdx = body.indexOf("if (state.ingestBusy)");
+		expect(workerIdx).toBeGreaterThan(-1);
+		expect(ingestIdx).toBeGreaterThan(workerIdx);
+		expect(body).toContain("className: 'section-ai-pill'");
+		expect(body).toContain("className: 'section-ai-dot'");
+		expect(body).toContain("className: 'section-ai-text', text: 'AI'");
 	});
 
-	it("renders a compact '● AI' pill for the blocking summary instead of inline text", () => {
-		const js = buildSidebarScript();
-		// Blocking (non-ingest) branch returns the pill; the full phrase survives
-		// only as the pill's hover title.
-		expect(js).toContain("className: 'section-ai-pill'");
-		expect(js).toContain("className: 'section-ai-dot'");
-		expect(js).toContain("className: 'section-ai-text', text: 'AI'");
-		// The spinner-and-text status is now reserved for the ingest phases only.
-		expect(js).toContain("const isIngest = state.workerPhase && state.workerPhase.indexOf('ingest') === 0;");
-	});
-
-	it("renders the 'Summarizing <hash>…' Working Memory row gated on blocking busy state", () => {
+	it("renders the 'Summarizing <hash>…' Working Memory row gated on workerBusy alone", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("function renderSummarizingRow(");
-		// Only during a blocking worker run (busy && no ingest phase).
-		expect(js).toContain("if (!state.workerBusy || state.workerPhase) return null;");
+		// Only during a summary run (worker.lock held). No phase check — ingest
+		// never holds worker.lock.
+		expect(js).toContain("if (!state.workerBusy) return null;");
 		// Per the redesign mockup the row reads "Summarizing <hash>…", naming the
 		// commit from the host-attached hash and degrading to a bare "Summarizing…".
 		expect(js).toContain("'Summarizing ' + hash + '…'");
@@ -2822,32 +2824,22 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("if (summarizing) bodyKids.push(summarizing);");
 	});
 
-	it("worker:phase keeps any ingest* sub-phase verbatim and clears anything else", () => {
+	it("ingest:phase carries busy + phase and re-renders the Branch tab", () => {
 		const js = buildSidebarScript();
-		const handlerStart = js.indexOf("case 'worker:phase'");
-		const handlerEnd = js.indexOf("case ", handlerStart + 1);
-		const body = js.slice(handlerStart, handlerEnd);
-		// Prefix-gated pass-through: ingest:wiki / ingest:graph survive, summary → null.
-		expect(body).toContain("(msg.phase && msg.phase.indexOf('ingest') === 0) ? msg.phase : null");
-	});
-
-	it("handles the worker:phase message channel", () => {
-		const js = buildSidebarScript();
-		expect(js).toContain("case 'worker:phase'");
-	});
-
-	it("re-renders toolbar AND branch when worker:phase changes on the Branch tab", () => {
-		const js = buildSidebarScript();
-		// The phase drives the commit buttons' disabled state (ingest is exempt
-		// from blocking — isWorkerBlocking), so renderToolbar alone is not
-		// enough: section actions live in renderBranch.
-		const handlerStart = js.indexOf("case 'worker:phase'");
-		const handlerEnd = js.indexOf("case ", handlerStart + 1);
+		const handlerStart = js.indexOf("case 'ingest:phase'");
 		expect(handlerStart).toBeGreaterThan(-1);
+		const handlerEnd = js.indexOf("case ", handlerStart + 1);
 		const body = js.slice(handlerStart, handlerEnd);
-		// Idempotent: skip re-render when the phase did not change.
-		expect(body).toContain("if (state.workerPhase === nextPhase) break;");
-		expect(body).toContain("renderToolbar()");
+		// Busy + phase are read off the message; phase defaults to 'wiki' and is
+		// forced to null when not busy.
+		expect(body).toContain("const nextBusy = !!msg.busy;");
+		expect(body).toContain("const nextPhase = nextBusy ? (msg.phase || 'wiki') : null;");
+		// Idempotent: skip the re-render when neither busy nor phase changed.
+		expect(body).toContain(
+			"if (state.ingestBusy === nextBusy && state.ingestPhase === nextPhase) break;",
+		);
+		// The pill lives in the Committed Memories header, which only re-mounts
+		// via renderBranch().
 		expect(body).toContain("renderBranch()");
 	});
 

@@ -5,7 +5,7 @@ const mocks = vi.hoisted(() => ({
 	handleCreatePr: vi.fn().mockResolvedValue("succeeded"),
 	handleUpdatePrWithPush: vi.fn().mockResolvedValue("succeeded"),
 	findOpenPrForBranch: vi.fn().mockResolvedValue(undefined),
-	isWorkerBlockingBusy: vi.fn().mockResolvedValue(false),
+	isWorkerBusy: vi.fn().mockResolvedValue(false),
 	buildCreatePrViewModel: vi.fn().mockResolvedValue({
 		branch: "feature/x", mainBranch: "main", memoryCount: 1, missingCount: 0,
 		insertions: 1, deletions: 0, filesChanged: 1, title: "feat: x", bodyMarkdown: "B",
@@ -101,7 +101,7 @@ vi.mock("../services/PrCommentService.js", () => ({
 	}),
 }));
 vi.mock("./CreatePrData", () => ({ buildCreatePrViewModel: mocks.buildCreatePrViewModel }));
-vi.mock("../util/LockUtils.js", () => ({ isWorkerBlockingBusy: mocks.isWorkerBlockingBusy }));
+vi.mock("../util/LockUtils.js", () => ({ isWorkerBusy: mocks.isWorkerBusy }));
 vi.mock("../util/Logger.js", () => ({
 	log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), show: vi.fn(), dispose: vi.fn() },
 	initLogger: vi.fn(),
@@ -143,7 +143,7 @@ beforeEach(() => {
 	created.length = 0;
 	CreatePrWebviewPanel.dispose();
 	vi.clearAllMocks();
-	mocks.isWorkerBlockingBusy.mockResolvedValue(false);
+	mocks.isWorkerBusy.mockResolvedValue(false);
 	mocks.handleCreatePr.mockResolvedValue("succeeded");
 	mocks.handleUpdatePrWithPush.mockResolvedValue("succeeded");
 	mocks.pushBranchMemories.mockResolvedValue({ pushedCount: 2, attachmentCount: 0, attachmentFailures: [], summaryFailures: [] });
@@ -218,7 +218,7 @@ describe("CreatePrWebviewPanel", () => {
 	});
 
 	it("worker-busy guard: shows toast and skips handleCreatePr when worker is blocking", async () => {
-		mocks.isWorkerBlockingBusy.mockResolvedValue(true);
+		mocks.isWorkerBusy.mockResolvedValue(true);
 		const vscode = await import("vscode");
 		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "createPr" });
@@ -232,7 +232,7 @@ describe("CreatePrWebviewPanel", () => {
 
 	it("worker-busy guard: update path also posts a settling message (buttons re-enable)", async () => {
 		mocks.findOpenPrForBranch.mockResolvedValueOnce({ number: 7, url: "https://gh/pr/7" });
-		mocks.isWorkerBlockingBusy.mockResolvedValue(true);
+		mocks.isWorkerBusy.mockResolvedValue(true);
 		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "createPr" });
 		await Promise.resolve(); await Promise.resolve();

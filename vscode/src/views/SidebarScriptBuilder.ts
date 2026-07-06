@@ -127,11 +127,12 @@ export function buildSidebarScript(): string {
     // toolbar. Not persisted — start from false on every load and let the next
     // worker:busy or status push correct it.
     workerBusy: false,
-    // Live phase of the running worker ('ingest:wiki' / 'ingest:graph', or the
-    // legacy bare 'ingest'), pushed on the worker:phase channel. Selects the
-    // matching "Building knowledge wiki/graph…" label over the default summary
-    // label. Not persisted -- host re-pushes on reload.
-    workerPhase: null,
+    // Live ingest indicator pushed on the ingest:phase channel — fully independent
+    // of workerBusy (ingest runs under its own lock). ingestBusy drives whether the
+    // "Building knowledge …" pill shows; ingestPhase ('wiki' | 'graph' | null)
+    // selects the label. Not persisted -- host re-pushes on reload.
+    ingestBusy: false,
+    ingestPhase: null,
     // Workspace HEAD short hash attached to worker:busy while the blocking
     // summary runs — drives the "Summarizing <hash>…" Working Memory row.
     // null when idle or when the host can't resolve it. Not persisted.
@@ -169,7 +170,8 @@ export function buildSidebarScript(): string {
   // workerBusy is intentionally reset on load (above), even if persisted state
   // had it set — the lock is process-bound and cannot survive a reload.
   state.workerBusy = false;
-  state.workerPhase = null;
+  state.ingestBusy = false;
+  state.ingestPhase = null;
   state.summarizingHash = null;
   state.syncPhase = null;
   state.tokenStats = null;
@@ -821,19 +823,22 @@ export function buildSidebarScript(): string {
         }
         break;
       }
-      case 'worker:phase': {
-        // Per-phase label for the post-commit Worker. Independent of
-        // worker:busy; any 'ingest'-prefixed sub-phase ('ingest', 'ingest:wiki',
-        // 'ingest:graph') is kept verbatim so renderToolbar can pick the matching
-        // wiki/graph label, anything else clears to the default summary label.
-        // Only the Branch tab reacts. renderBranch runs too because the commit
-        // buttons' disabled state depends on the phase (ingest is exempt from
-        // blocking — see isWorkerBlocking), not just on worker:busy.
-        const nextPhase = (msg.phase && msg.phase.indexOf('ingest') === 0) ? msg.phase : null;
-        if (state.workerPhase === nextPhase) break;
-        state.workerPhase = nextPhase;
+      case 'ingest:phase': {
+        // Cosmetic ingest pill state. Fully independent of worker:busy — an
+        // ingest runs under its own lock, so its pill can show while no summary
+        // is in flight (and is suppressed by renderWorkerSignal's summary-first
+        // priority when one is). Does NOT gate the commit buttons.
+        const nextBusy = !!msg.busy;
+        const nextPhase = nextBusy ? (msg.phase || 'wiki') : null;
+        if (state.ingestBusy === nextBusy && state.ingestPhase === nextPhase) break;
+        state.ingestBusy = nextBusy;
+        state.ingestPhase = nextPhase;
+        // The pill is painted by renderWorkerSignal() inside the Committed
+        // Memories section header, which only re-runs via renderBranch() — NOT
+        // renderToolbar (a no-op for this pill on the Branch tab). Re-render the
+        // branch body so the pill actually appears/clears. setIngest is
+        // equality-checked upstream, so 60s heartbeats don't churn this.
         if (state.activeTab === 'branch') {
-          renderToolbar();
           renderBranch();
         }
         break;
@@ -3527,20 +3532,16 @@ export function buildSidebarScript(): string {
   }
 
   // Read-only summarizing-indicator row shown at the top of Working Memory while
-  // the blocking post-commit worker runs (workerBusy && no ingest phase —
-  // ingest:wiki/graph keep their own header label and add no row).
+  // the post-commit summary worker runs. workerBusy is the worker.lock signal,
+  // which (with ingest split onto its own lock) is held only during summary — so
+  // it maps directly to this row, no phase check needed.
   //
   // Per the redesign mockup this row reads "Summarizing <hash>…" (matching the
-  // .summarizing-row class name and every surrounding reference). worker:busy and
-  // worker:phase are independent channels (busy is lock-file-driven; phase only
-  // ever stores 'ingest'-prefixed values, else null), so "busy && no phase" is
-  // overwhelmingly the blocking summary — a Memory Bank ingest run can briefly
-  // land here before its phase signal arrives, but that transient window is rare
-  // and the mockup accepts the summarize wording over a vaguer neutral label.
-  // The short hash is the workspace HEAD the host attaches to worker:busy;
-  // absent (older host / detached edge) it degrades to a bare "Summarizing…".
+  // .summarizing-row class name and every surrounding reference). The short hash
+  // is the workspace HEAD the host attaches to worker:busy; absent (older host /
+  // detached edge) it degrades to a bare "Summarizing…".
   function renderSummarizingRow() {
-    if (!state.workerBusy || state.workerPhase) return null;
+    if (!state.workerBusy) return null;
     const hash = state.summarizingHash;
     const label = hash ? ('Summarizing ' + hash + '…') : 'Summarizing…';
     return el('div', { className: 'tree-node summarizing-row', title: label }, [
@@ -3834,26 +3835,21 @@ export function buildSidebarScript(): string {
     ]);
   }
 
-  // Inline post-commit worker signal for the Committed Memories header. The
-  // global toolbar that used to host "AI summary in progress…" was removed, so
-  // the signal moved next to the section it describes (a committed memory's
-  // summary is what the Worker is generating). Returns null when idle so the
-  // header stays clean. The phase is the ingest:* family ('ingest:wiki' /
-  // 'ingest:graph', or legacy bare 'ingest') during the non-blocking Memory
-  // Bank build; null/anything else means the blocking AI summary run. Match the
-  // sub-phase via prefix (the host only ever emits the prefixed form — exact
-  // '=== ingest' would never hit) and mirror the worker:phase label contract in
-  // SidebarMessages.ts. The label truncates on narrow sidebars (CSS); the
-  // spinner alone still reads as "working".
+  // Inline worker/ingest signal for the Committed Memories header. The global
+  // toolbar that used to host "AI summary in progress…" was removed, so the
+  // signal moved next to the section it describes. Priority single pill, summary
+  // first (the summary is what the user is actively waiting on):
+  //   - workerBusy (summary running)       → compact "● AI" pill;
+  //   - else ingestBusy (Memory Bank build) → compact "⟳ Wiki/Graph" pill;
+  //   - else                                → null (header stays clean).
+  // So when summary + ingest run concurrently, only "AI" shows; the build pill
+  // appears only while ingest runs alone. The label truncates on narrow sidebars
+  // (CSS); the spinner/dot alone still reads as "working".
   function renderWorkerSignal() {
-    if (!state.workerBusy) return null;
-    const isIngest = state.workerPhase && state.workerPhase.indexOf('ingest') === 0;
-    // Blocking AI summary run: the header carries only a compact "● AI" pill
-    // (the visible text stays short so it never crowds the narrow header). The
-    // hover title names the commit being summarized — "Summarizing <hash>…",
-    // matching the Working Memory row — degrading to a bare "Summarizing…" when
-    // the host attached no hash (older host / detached edge).
-    if (!isIngest) {
+    // Summary first: the blocking AI run the user is waiting on. Hover title
+    // names the commit — "Summarizing <hash>…", matching the Working Memory row,
+    // degrading to a bare "Summarizing…" when the host attached no hash.
+    if (state.workerBusy) {
       const hash = state.summarizingHash;
       const aiTitle = hash ? ('Summarizing ' + hash + '…') : 'Summarizing…';
       return el('span', { className: 'section-ai-pill', title: aiTitle }, [
@@ -3861,19 +3857,20 @@ export function buildSidebarScript(): string {
         el('span', { className: 'section-ai-text', text: 'AI' }),
       ]);
     }
-    // Non-blocking Memory Bank build → a compact pill mirroring the "● AI" pill:
-    // a small spinner + a short phase word (Wiki / Graph) so it never truncates
-    // in a narrow header. The verbose "Building knowledge …" phrasing survives
-    // only as the pill's hover title. graph is the more specific prefix → test
-    // it before the wiki fallback, else 'ingest:graph' would match the bare
-    // 'ingest' branch and mislabel.
-    const isGraph = state.workerPhase.indexOf('ingest:graph') === 0;
-    const label = isGraph ? 'Building knowledge graph…' : 'Building knowledge wiki…';
-    const short = isGraph ? 'Graph' : 'Wiki';
-    return el('span', { className: 'section-build-pill', title: label }, [
-      el('i', { className: 'codicon codicon-loading codicon-modifier-spin section-build-spin', 'aria-hidden': 'true' }),
-      el('span', { className: 'section-build-text', text: short }),
-    ]);
+    // Ingest running alone → a compact pill mirroring the "● AI" pill: a small
+    // spinner + a short phase word (Wiki / Graph) so it never truncates in a
+    // narrow header. The verbose "Building knowledge …" phrasing survives only as
+    // the pill's hover title.
+    if (state.ingestBusy) {
+      const isGraph = state.ingestPhase === 'graph';
+      const label = isGraph ? 'Building knowledge graph…' : 'Building knowledge wiki…';
+      const short = isGraph ? 'Graph' : 'Wiki';
+      return el('span', { className: 'section-build-pill', title: label }, [
+        el('i', { className: 'codicon codicon-loading codicon-modifier-spin section-build-spin', 'aria-hidden': 'true' }),
+        el('span', { className: 'section-build-text', text: short }),
+      ]);
+    }
+    return null;
   }
 
   function renderSection(s) {
@@ -3988,12 +3985,11 @@ export function buildSidebarScript(): string {
   }
 
   function isWorkerBlocking() {
-    // Busy with a phase that must disable commit actions. The ingest family
-    // (Memory Bank wiki update + graph build, ~80s+) is exempt: it never touches
-    // the commit pipeline, so commits landed during it are simply queued for the
-    // next worker. Prefix match so every 'ingest:*' sub-phase stays exempt.
-    // Mirrors isWorkerBlockingBusy in util/LockUtils.ts.
-    return state.workerBusy && !(state.workerPhase && state.workerPhase.indexOf('ingest') === 0);
+    // A summary run (worker.lock) must disable commit actions. Ingest runs under
+    // its own lock and never touches the commit pipeline, so it does not block —
+    // and it isn't reflected in workerBusy at all. Mirrors isWorkerBusy in
+    // util/LockUtils.ts.
+    return state.workerBusy;
   }
 
   function renderCommitReviewBar() {

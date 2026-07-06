@@ -45,8 +45,9 @@ const { mockNotifyEnabledChanged, mockNotifyAuthChanged, mockToggleStatus, mockN
 		mockNotifyColdStart: vi.fn(),
 	}));
 
-const { isWorkerBusy } = vi.hoisted(() => ({
+const { isWorkerBusy, readIngestPhase } = vi.hoisted(() => ({
 	isWorkerBusy: vi.fn(),
+	readIngestPhase: vi.fn(),
 }));
 
 const { loadConfig, getGlobalConfigDir, saveConfig, saveConfigScoped } =
@@ -475,9 +476,9 @@ const {
 		checkboxCallbacks: checkboxCallbacks_,
 		visibilityCallbacks: visibilityCallbacks_,
 		openExternal: vi.fn().mockResolvedValue(true),
-		// Backs `vscode.workspace.fs.readFile` (worker-phase marker reads).
+		// Backs `vscode.workspace.fs.readFile` (ingest-phase marker reads).
 		// Defaults to rejection = file missing, matching the pre-mock behavior
-		// where the absent `fs` property made readWorkerPhase throw-and-catch.
+		// where the absent `fs` property made the phase read throw-and-catch.
 		fsReadFile: vi.fn().mockRejectedValue(new Error("ENOENT")),
 	};
 });
@@ -844,7 +845,7 @@ const {
 			setEnabled: vi.fn(),
 			setMigrating: vi.fn(),
 			setWorkerBusy: vi.fn(),
-			setWorkerPhase: vi.fn(),
+			setIngest: vi.fn(),
 			setExtensionOutdated: vi.fn(),
 			setStatus: vi.fn(),
 			setMainBranch: vi.fn(),
@@ -908,6 +909,7 @@ vi.mock("./util/ExcludeFilterManager.js", () => ({
 
 vi.mock("./util/LockUtils.js", () => ({
 	isWorkerBusy,
+	readIngestPhase,
 }));
 
 vi.mock("./util/Logger.js", () => ({
@@ -1174,6 +1176,7 @@ describe("Extension", () => {
 		indexNeedsMigration.mockResolvedValue(false);
 		cleanupV1IfExpired.mockResolvedValue(undefined);
 		isWorkerBusy.mockResolvedValue(false);
+		readIngestPhase.mockResolvedValue({ busy: false, phase: null });
 		loadConfig.mockResolvedValue({});
 
 		// Reset provider mocks to defaults
@@ -5238,188 +5241,80 @@ describe("Extension", () => {
 			);
 		});
 
-		// The workerBusy context key gates the commitAI / squash commands'
-		// `enablement`. The ingest phase (Memory Bank wiki update) must NOT
-		// block them — only summary runs do — so when the worker-phase marker
-		// reads an `ingest:*` sub-phase the context flips to false even while the
-		// lock is held, and flips back when the marker is deleted (lock still held).
-		it("exempts an ingest sub-phase from the workerBusy context key and forwards the full phase", async () => {
-			// Watcher indices: 0=sessions, 1=head, 2=orphan-ref, 3=lock, 4=phase.
-			const lockWatcher = createFileSystemWatcher.mock.results[3]?.value;
+		// The ingest phase is purely cosmetic: it drives the sidebar
+		// "Building knowledge wiki/graph…" pill via statusStore.setIngest and
+		// never touches the `jollimemory.workerBusy` context key. Ingest runs
+		// under its own `ingest.lock`, so it can never gate Commit/Squash.
+		it("forwards the ingest state to setIngest on create/change and never touches the workerBusy context", async () => {
+			// Watcher indices: 0=sessions, 1=head, 2=orphan-ref, 3=lock, 4=ingest-phase.
 			const phaseWatcher = createFileSystemWatcher.mock.results[4]?.value;
-			const onLockCreate = lockWatcher?.onDidCreate.mock.calls[0]?.[0] as
-				| (() => void)
-				| undefined;
 			const onPhaseCreate = phaseWatcher?.onDidCreate.mock.calls[0]?.[0] as
-				| (() => void)
-				| undefined;
-			const onPhaseDelete = phaseWatcher?.onDidDelete.mock.calls[0]?.[0] as
-				| (() => void)
-				| undefined;
-			expect(onPhaseCreate).toBeDefined();
-			expect(onPhaseDelete).toBeDefined();
-
-			onLockCreate?.();
-			executeCommand.mockClear();
-
-			fsReadFile.mockResolvedValueOnce(Buffer.from("ingest:wiki"));
-			onPhaseCreate?.();
-
-			await vi.waitFor(() => {
-				// The full sub-phase value is forwarded (not collapsed to "ingest"),
-				// so the sidebar can pick the wiki vs graph label.
-				expect(mockStatusStore.setWorkerPhase).toHaveBeenCalledWith("ingest:wiki");
-				expect(executeCommand).toHaveBeenCalledWith(
-					"setContext",
-					"jollimemory.workerBusy",
-					false,
-				);
-			});
-
-			// Phase advances to the graph build — still commit-exempt (ingest prefix),
-			// and the graph value is forwarded verbatim.
-			executeCommand.mockClear();
-			mockStatusStore.setWorkerPhase.mockClear();
-			fsReadFile.mockResolvedValueOnce(Buffer.from("ingest:graph"));
-			onPhaseCreate?.();
-
-			await vi.waitFor(() => {
-				expect(mockStatusStore.setWorkerPhase).toHaveBeenCalledWith("ingest:graph");
-				expect(executeCommand).toHaveBeenCalledWith(
-					"setContext",
-					"jollimemory.workerBusy",
-					false,
-				);
-			});
-
-			// Marker removed (ingest finished) while the lock is still held →
-			// back to blocking semantics for the rest of the drain.
-			executeCommand.mockClear();
-			onPhaseDelete?.();
-
-			expect(mockStatusStore.setWorkerPhase).toHaveBeenCalledWith(null);
-			expect(executeCommand).toHaveBeenCalledWith(
-				"setContext",
-				"jollimemory.workerBusy",
-				true,
-			);
-		});
-
-		// Regression: readWorkerPhase awaits a readFile, and the lock-delete path
-		// clears the phase flag synchronously. A phase read that started during
-		// ingest but resolved AFTER the worker finished used to resurrect a stale
-		// "ingest" flag with no worker running; the next summary run's
-		// setWorkerBusy(true) then computed a non-blocking context and left
-		// Commit/Squash enabled mid-summary. The epoch token must discard the
-		// superseded read.
-		it("discards an in-flight phase read superseded by the lock-delete clear", async () => {
-			const lockWatcher = createFileSystemWatcher.mock.results[3]?.value;
-			const phaseWatcher = createFileSystemWatcher.mock.results[4]?.value;
-			const onLockCreate = lockWatcher?.onDidCreate.mock.calls[0]?.[0] as
-				| (() => void)
-				| undefined;
-			const onLockDelete = lockWatcher?.onDidDelete.mock.calls[0]?.[0] as
 				| (() => void)
 				| undefined;
 			const onPhaseChange = phaseWatcher?.onDidChange.mock.calls[0]?.[0] as
 				| (() => void)
 				| undefined;
-			expect(onLockDelete).toBeDefined();
+			expect(onPhaseCreate).toBeDefined();
 			expect(onPhaseChange).toBeDefined();
 
-			// Worker running an ingest; a phase read kicks off but its readFile
-			// stays pending until after the worker has finished.
-			onLockCreate?.();
-			let resolveRead: ((bytes: Buffer) => void) | undefined;
-			fsReadFile.mockImplementationOnce(
-				() =>
-					new Promise<Buffer>(resolve => {
-						resolveRead = resolve;
-					}),
-			);
+			executeCommand.mockClear();
+			mockStatusStore.setIngest.mockClear();
+			readIngestPhase.mockResolvedValueOnce({ busy: true, phase: "wiki" });
+			onPhaseCreate?.();
+
+			await vi.waitFor(() => {
+				expect(mockStatusStore.setIngest).toHaveBeenCalledWith(true, "wiki");
+			});
+
+			// Phase advances to the graph build — forwarded verbatim.
+			mockStatusStore.setIngest.mockClear();
+			readIngestPhase.mockResolvedValueOnce({ busy: true, phase: "graph" });
 			onPhaseChange?.();
 
-			// Worker finishes: the lock-delete handler clears the phase flag
-			// synchronously and bumps the read epoch.
-			onLockDelete?.();
-			mockStatusStore.setWorkerPhase.mockClear();
+			await vi.waitFor(() => {
+				expect(mockStatusStore.setIngest).toHaveBeenCalledWith(true, "graph");
+			});
 
-			// The stale read resolves with pre-delete content — must be discarded.
-			resolveRead?.(Buffer.from("ingest"));
-			await new Promise(resolve => setTimeout(resolve, 0));
-			expect(mockStatusStore.setWorkerPhase).not.toHaveBeenCalledWith("ingest");
-
-			// Next (non-ingest) summary run: the context must be blocking, proving
-			// the stale ingest flag did not survive into setWorkerBusy(true).
-			executeCommand.mockClear();
-			onLockCreate?.();
-			expect(executeCommand).toHaveBeenCalledWith(
+			// The ingest watcher must never write the workerBusy context key.
+			expect(executeCommand).not.toHaveBeenCalledWith(
 				"setContext",
 				"jollimemory.workerBusy",
-				true,
+				expect.anything(),
 			);
 		});
 
-		it("clears the phase when the marker holds a non-ingest value", async () => {
-			// content !== "ingest" → the false arm of `workerPhaseIsIngest ? ... : null`.
+		it("clears the pill directly with setIngest(false, null) when the marker is deleted", () => {
+			// An explicit delete is authoritative teardown — clear the pill directly
+			// rather than re-reading (the ingest.lock backstop could otherwise
+			// momentarily resurrect a stale pill until the staleness timer fires).
 			const phaseWatcher = createFileSystemWatcher.mock.results[4]?.value;
-			const onPhaseChange = phaseWatcher?.onDidChange.mock.calls[0]?.[0] as (() => void) | undefined;
+			const onPhaseDelete = phaseWatcher?.onDidDelete.mock.calls[0]?.[0] as
+				| (() => void)
+				| undefined;
+			expect(onPhaseDelete).toBeDefined();
+
+			mockStatusStore.setIngest.mockClear();
+			onPhaseDelete?.();
+
+			expect(mockStatusStore.setIngest).toHaveBeenCalledWith(false, null);
+		});
+
+		it("forwards a not-busy ingest read (stale / non-ingest marker) to setIngest(false, null)", async () => {
+			// readIngestPhase resolves not-busy for a stale or non-ingest marker;
+			// whatever it returns is forwarded straight to setIngest.
+			const phaseWatcher = createFileSystemWatcher.mock.results[4]?.value;
+			const onPhaseChange = phaseWatcher?.onDidChange.mock.calls[0]?.[0] as
+				| (() => void)
+				| undefined;
 			expect(onPhaseChange).toBeDefined();
 
-			fsReadFile.mockResolvedValueOnce(Buffer.from("summary"));
-			mockStatusStore.setWorkerPhase.mockClear();
+			mockStatusStore.setIngest.mockClear();
+			readIngestPhase.mockResolvedValueOnce({ busy: false, phase: null });
 			onPhaseChange?.();
 
 			await vi.waitFor(() => {
-				expect(mockStatusStore.setWorkerPhase).toHaveBeenCalledWith(null);
+				expect(mockStatusStore.setIngest).toHaveBeenCalledWith(false, null);
 			});
-		});
-
-		it("clears the phase when the marker read fails (missing / unreadable file)", async () => {
-			// readFile rejection → the catch clears the phase (epoch unchanged).
-			const phaseWatcher = createFileSystemWatcher.mock.results[4]?.value;
-			const onPhaseChange = phaseWatcher?.onDidChange.mock.calls[0]?.[0] as (() => void) | undefined;
-			expect(onPhaseChange).toBeDefined();
-
-			fsReadFile.mockRejectedValueOnce(new Error("ENOENT"));
-			mockStatusStore.setWorkerPhase.mockClear();
-			onPhaseChange?.();
-
-			await vi.waitFor(() => {
-				expect(mockStatusStore.setWorkerPhase).toHaveBeenCalledWith(null);
-			});
-		});
-
-		it("discards a FAILED in-flight phase read superseded by the lock-delete clear", async () => {
-			// The catch path also honours the epoch token: a read that REJECTS after a
-			// lock-delete bumped the epoch must not apply its (now stale) clear.
-			const lockWatcher = createFileSystemWatcher.mock.results[3]?.value;
-			const phaseWatcher = createFileSystemWatcher.mock.results[4]?.value;
-			const onLockCreate = lockWatcher?.onDidCreate.mock.calls[0]?.[0] as (() => void) | undefined;
-			const onLockDelete = lockWatcher?.onDidDelete.mock.calls[0]?.[0] as (() => void) | undefined;
-			const onPhaseChange = phaseWatcher?.onDidChange.mock.calls[0]?.[0] as (() => void) | undefined;
-			expect(onLockDelete).toBeDefined();
-			expect(onPhaseChange).toBeDefined();
-
-			onLockCreate?.();
-			let rejectRead: ((e: Error) => void) | undefined;
-			fsReadFile.mockImplementationOnce(
-				() =>
-					new Promise<Buffer>((_resolve, reject) => {
-						rejectRead = reject;
-					}),
-			);
-			onPhaseChange?.();
-
-			// Worker finishes → epoch bumps before the read settles.
-			onLockDelete?.();
-			mockStatusStore.setWorkerPhase.mockClear();
-
-			rejectRead?.(new Error("read aborted"));
-			await new Promise((resolve) => setTimeout(resolve, 0));
-
-			// epoch changed → the catch early-returns; no stale phase write.
-			expect(mockStatusStore.setWorkerPhase).not.toHaveBeenCalled();
 		});
 
 		it("refreshes status and plans when sessions watcher fires", async () => {

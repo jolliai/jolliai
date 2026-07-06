@@ -63,10 +63,20 @@ vi.mock("../core/Locks.js", () => ({
 	releaseWorkerLock: vi.fn(),
 	refreshWorkerLockMtime: vi.fn(),
 	isWorkerLockHeld: vi.fn(),
+	// ingest.lock: default to "acquired" so the ingest phase runs in tests. The
+	// lock contract itself is covered in Locks.test.ts.
+	acquireIngestLock: vi.fn().mockResolvedValue(true),
+	releaseIngestLock: vi.fn(),
+	refreshIngestLockMtime: vi.fn(),
 	// Passthrough: run the RMW body without touching the real lock file. The
 	// per-worktree lock contract itself is covered in Locks.test.ts.
 	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
-	WORKER_PHASE_FILE: "worker-phase",
+	INGEST_PHASE_FILE: "ingest-phase",
+}));
+
+vi.mock("../sync/PendingIngest.js", () => ({
+	recordPendingIngest: vi.fn().mockResolvedValue(undefined),
+	wakePendingIngest: vi.fn().mockResolvedValue(undefined),
 }));
 
 // `vault-write.lock` integration: the Standalone Hotfix now wraps the worker
@@ -361,7 +371,7 @@ vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
@@ -378,7 +388,7 @@ import { drainIngest } from "../core/IngestPipeline.js";
 import { appendCredentialMissingRun } from "../core/IngestRunStore.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
 import { LlmCredentialError } from "../core/LlmClient.js";
-import { acquireWorkerLock, releaseWorkerLock } from "../core/Locks.js";
+import { acquireIngestLock, acquireWorkerLock, releaseIngestLock, releaseWorkerLock } from "../core/Locks.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import {
@@ -401,6 +411,7 @@ import { storeSummary, withRequiredOrphanWriteLock } from "../core/SummaryStore.
 import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
 import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
+import { recordPendingIngest, wakePendingIngest } from "../sync/PendingIngest.js";
 import { recordPendingWorker, wakePendingWorkers } from "../sync/PendingWorkers.js";
 import { acquireVaultWriteLock, withVaultWriteLock } from "../sync/VaultWriteLock.js";
 import type { CommitGitOperation, IngestOperation } from "../Types.js";
@@ -436,6 +447,9 @@ describe("QueueWorker", () => {
 		vi.resetAllMocks();
 		vi.mocked(acquireWorkerLock).mockResolvedValue(true);
 		vi.mocked(releaseWorkerLock).mockResolvedValue(undefined);
+		// ingest.lock: re-establish "acquired" after resetAllMocks wipes the factory
+		// default, so the queue-driven ingest phase runs (release/refresh are void).
+		vi.mocked(acquireIngestLock).mockResolvedValue(true);
 		// vault-write.lock: re-establish the always-succeed implementation
 		// after `resetAllMocks` wipes the factory default. The handle's
 		// `release` / `refresh` are themselves `vi.fn()` so per-test
@@ -506,7 +520,9 @@ describe("QueueWorker", () => {
 			//       the loop (which broke out after 20), once after finally
 			const { deleteQueueEntry } = await import("../core/SessionTracker.js");
 			expect(vi.mocked(deleteQueueEntry)).toHaveBeenCalledTimes(20);
-			expect(vi.mocked(dequeueAllGitOperations)).toHaveBeenCalledTimes(2);
+			// Three dequeues now: the capped drain (broke at 20), the chain-spawn
+			// probe, and the ingest-phase pre-check (which finds no ingest entries).
+			expect(vi.mocked(dequeueAllGitOperations)).toHaveBeenCalledTimes(3);
 		});
 	});
 
@@ -592,10 +608,11 @@ describe("QueueWorker", () => {
 
 			await runWorker("/test/cwd");
 
-			// The third call to dequeueAllGitOperations happens after the finally block
-			// and returns non-empty, triggering lines 234-235 (log + launchWorker).
-			// launchWorker is in v8 ignore, so we verify by checking dequeue was called 3 times.
-			expect(dequeueAllGitOperations).toHaveBeenCalledTimes(3);
+			// Four dequeues: two in the drain loop (entry, then empty → break), the
+			// chain-spawn probe (returns a remaining summary entry → log + launchWorker),
+			// and the ingest-phase pre-check (empty by default). launchWorker is in a
+			// v8-ignore branch, so we verify via the dequeue count.
+			expect(dequeueAllGitOperations).toHaveBeenCalledTimes(4);
 		});
 	});
 
@@ -2403,74 +2420,6 @@ describe("QueueWorker", () => {
 		});
 	});
 
-	describe("runWorker — stale phase cleanup on lock acquisition", () => {
-		it("removes a worker-phase file left by a crashed worker when it acquires the lock", async () => {
-			const tmp = mkdtempSync(join(tmpdir(), "jolli-stalephase-"));
-			mkdirSync(join(tmp, ".jolli", "jollimemory"), { recursive: true });
-			const phaseFile = join(tmp, ".jolli", "jollimemory", "worker-phase");
-			// Simulate crash residue: a previous worker was SIGKILL'd mid-ingest, so
-			// its `finally` cleanup never ran and the 'ingest' marker persists.
-			writeFileSync(phaseFile, "ingest");
-
-			const { existsSync: realExistsSync } = await vi.importActual<typeof import("node:fs")>("node:fs");
-			expect(realExistsSync(phaseFile)).toBe(true);
-
-			// Minimal storage so setActiveStorage() has something to hold; empty
-			// queue so the worker just acquires the lock and drains nothing.
-			vi.mocked(createStorage).mockResolvedValue({
-				readFile: vi.fn().mockResolvedValue(null),
-				writeFiles: vi.fn().mockResolvedValue(undefined),
-				listFiles: vi.fn().mockResolvedValue([]),
-				exists: vi.fn().mockResolvedValue(true),
-				ensure: vi.fn().mockResolvedValue(undefined),
-			} as never);
-			vi.mocked(dequeueAllGitOperations).mockResolvedValue([]);
-
-			await runWorker(tmp);
-
-			// The fresh worker holds the lock, proving the previous one is gone, so
-			// the stale marker is cleared at the source — not left to mislabel the
-			// next genuine summary run as "Building knowledge wiki…".
-			expect(realExistsSync(phaseFile)).toBe(false);
-
-			rmSync(tmp, { recursive: true, force: true });
-		});
-	});
-
-	describe("clearLeftoverIngestMarker", () => {
-		it("removes an ingest marker that a failed cleanup left behind", async () => {
-			const tmp = mkdtempSync(join(tmpdir(), "jolli-leftover-"));
-			mkdirSync(join(tmp, ".jolli", "jollimemory"), { recursive: true });
-			const phaseFile = join(tmp, ".jolli", "jollimemory", "worker-phase");
-			// Simulate the ingest `finally` rmSync having failed (e.g. Windows AV
-			// briefly holding the file): the marker still reads 'ingest' while the
-			// same drain is about to process a blocking summary entry.
-			writeFileSync(phaseFile, "ingest");
-
-			const { existsSync: realExistsSync } = await vi.importActual<typeof import("node:fs")>("node:fs");
-			vi.mocked(existsSync).mockImplementation(realExistsSync);
-
-			__test__.clearLeftoverIngestMarker(tmp);
-
-			// Gate readers must no longer see an exempt phase.
-			expect(realExistsSync(phaseFile)).toBe(false);
-
-			rmSync(tmp, { recursive: true, force: true });
-		});
-
-		it("is a no-op when no marker exists", async () => {
-			const tmp = mkdtempSync(join(tmpdir(), "jolli-leftover-"));
-			mkdirSync(join(tmp, ".jolli", "jollimemory"), { recursive: true });
-
-			const { existsSync: realExistsSync } = await vi.importActual<typeof import("node:fs")>("node:fs");
-			vi.mocked(existsSync).mockImplementation(realExistsSync);
-
-			expect(() => __test__.clearLeftoverIngestMarker(tmp)).not.toThrow();
-
-			rmSync(tmp, { recursive: true, force: true });
-		});
-	});
-
 	describe("runWorker — ingest dispatch", () => {
 		function makeIngestOp(triggeredBy: IngestOperation["triggeredBy"] = "post-merge"): IngestOperation {
 			return { type: "ingest", triggeredBy, createdAt: new Date().toISOString() };
@@ -2494,10 +2443,10 @@ describe("QueueWorker", () => {
 			vi.mocked(createStorage).mockResolvedValue(storageWithWiki(true));
 		});
 
-		it("writes worker-phase=ingest:wiki during ingest, advances to ingest:graph before the graph build, and removes it after", async () => {
+		it("writes ingest-phase=ingest:wiki during ingest, advances to ingest:graph before the graph build, and removes it after", async () => {
 			const tmp = mkdtempSync(join(tmpdir(), "jolli-phase-"));
 			mkdirSync(join(tmp, ".jolli", "jollimemory"), { recursive: true });
-			const phaseFile = join(tmp, ".jolli", "jollimemory", "worker-phase");
+			const phaseFile = join(tmp, ".jolli", "jollimemory", "ingest-phase");
 
 			// Use the actual fs functions so we can observe real disk writes from
 			// production code (writeFileSync / rmSync are actual in the mock spread).
@@ -2533,7 +2482,7 @@ describe("QueueWorker", () => {
 		it("leaves the marker at ingest:wiki (never ingest:graph) when the graph build is skipped", async () => {
 			const tmp = mkdtempSync(join(tmpdir(), "jolli-phase-"));
 			mkdirSync(join(tmp, ".jolli", "jollimemory"), { recursive: true });
-			const phaseFile = join(tmp, ".jolli", "jollimemory", "worker-phase");
+			const phaseFile = join(tmp, ".jolli", "jollimemory", "ingest-phase");
 
 			const { existsSync: realExistsSync, readFileSync: realReadFileSync } =
 				await vi.importActual<typeof import("node:fs")>("node:fs");
@@ -2558,10 +2507,10 @@ describe("QueueWorker", () => {
 			rmSync(tmp, { recursive: true, force: true });
 		});
 
-		it("removes worker-phase even when ingest throws", async () => {
+		it("removes ingest-phase even when ingest throws", async () => {
 			const tmp = mkdtempSync(join(tmpdir(), "jolli-phase-"));
 			mkdirSync(join(tmp, ".jolli", "jollimemory"), { recursive: true });
-			const phaseFile = join(tmp, ".jolli", "jollimemory", "worker-phase");
+			const phaseFile = join(tmp, ".jolli", "jollimemory", "ingest-phase");
 
 			const { existsSync: realExistsSync } = await vi.importActual<typeof import("node:fs")>("node:fs");
 			vi.mocked(existsSync).mockImplementation(realExistsSync);
@@ -2583,9 +2532,7 @@ describe("QueueWorker", () => {
 			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 2, outcome: "OK", topicFailures: [] });
 
 			const op = makeIngestOp("post-merge");
-			vi.mocked(dequeueAllGitOperations)
-				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
-				.mockResolvedValueOnce([]);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
 
 			await runWorker("/test/cwd");
 
@@ -2601,9 +2548,7 @@ describe("QueueWorker", () => {
 			vi.mocked(buildKnowledgeGraph).mockRejectedValueOnce(new Error("graph boom"));
 
 			const op = makeIngestOp("post-merge");
-			vi.mocked(dequeueAllGitOperations)
-				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
-				.mockResolvedValueOnce([]);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
 
 			// Must not throw despite the graph build rejecting.
 			await expect(runWorker("/test/cwd")).resolves.not.toThrow();
@@ -2638,22 +2583,18 @@ describe("QueueWorker", () => {
 			});
 
 			const op = makeIngestOp("post-merge");
-			vi.mocked(dequeueAllGitOperations)
-				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
-				.mockResolvedValueOnce([]);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
 
 			await runWorker("/test/cwd");
 
 			expect(order).toEqual(["release", "drainIngest"]);
 		});
 
-		it("holds worker.lock THROUGH the ingest LLM phase, releasing it only after the drain", async () => {
-			// Direction-A guarantee: vault-write.lock is dropped before ingest (so
-			// cross-repo summary workers proceed) but the per-repo worker.lock stays
-			// held across the whole ingest. That serialises same-repo workers, so no
-			// concurrent summary run can clear the `ingest` worker-phase marker and no
-			// second ingest can race this one. Hence: drainIngest runs BEFORE
-			// releaseWorkerLock, while vault release happens BEFORE drainIngest.
+		it("releases worker.lock BEFORE the ingest phase so a concurrent summary worker can run", async () => {
+			// The whole point of the ingest.lock split: ingest no longer holds
+			// worker.lock. Both entry-level locks (vault, then worker) are released
+			// BEFORE the ingest phase runs, so a same-repo summary worker can proceed
+			// concurrently. Hence the order: vault-release, worker-release, drainIngest.
 			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
 			const order: string[] = [];
 			vi.mocked(acquireVaultWriteLock).mockResolvedValue({
@@ -2671,13 +2612,14 @@ describe("QueueWorker", () => {
 			});
 
 			const op = makeIngestOp("post-merge");
-			vi.mocked(dequeueAllGitOperations)
-				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
-				.mockResolvedValueOnce([]);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
 
 			await runWorker("/test/cwd");
 
-			expect(order).toEqual(["vault-release", "drainIngest", "worker-release"]);
+			// releaseWorkerLock also runs in the outer finally (idempotent), so assert
+			// the first worker-release lands before drainIngest rather than exact equality.
+			expect(order.indexOf("vault-release")).toBeLessThan(order.indexOf("worker-release"));
+			expect(order.indexOf("worker-release")).toBeLessThan(order.indexOf("drainIngest"));
 		});
 
 		it("passes a per-write guard to drainIngest and renderTopicKBWiki so ingest writes self-lock", async () => {
@@ -2685,9 +2627,7 @@ describe("QueueWorker", () => {
 			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 2, outcome: "OK", topicFailures: [] });
 
 			const op = makeIngestOp("post-merge");
-			vi.mocked(dequeueAllGitOperations)
-				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
-				.mockResolvedValueOnce([]);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
 
 			await runWorker("/test/cwd");
 
@@ -2696,8 +2636,8 @@ describe("QueueWorker", () => {
 			expect(typeof vi.mocked(renderTopicKBWiki).mock.calls[0]?.[2]).toBe("function");
 		});
 
-		it("routes each ingest write through orphan-write.lock (PR1: ingest orphan-ref writes self-lock)", async () => {
-			// PR1 wraps the ingest writeGuard body in `withRequiredOrphanWriteLock`
+		it("routes each ingest write through orphan-write.lock so ingest orphan-ref writes self-lock", async () => {
+			// The ingest writeGuard body is wrapped in `withRequiredOrphanWriteLock`
 			// so ingest's orphan-ref writes serialise against summary writes on the
 			// same lock. Drive the guard with a sentinel write and assert it flowed
 			// through the orphan lock with the "ingest-write" label.
@@ -2711,9 +2651,7 @@ describe("QueueWorker", () => {
 			});
 
 			const op = makeIngestOp("post-merge");
-			vi.mocked(dequeueAllGitOperations)
-				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
-				.mockResolvedValueOnce([]);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
 
 			await runWorker("/test/cwd");
 
@@ -2752,13 +2690,62 @@ describe("QueueWorker", () => {
 			});
 
 			const op = makeIngestOp("post-merge");
-			vi.mocked(dequeueAllGitOperations)
-				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
-				.mockResolvedValueOnce([]);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
 
 			await runWorker("/test/cwd");
 
 			expect(order).toEqual(["vault", "orphan:ingest-write", "write"]);
+		});
+
+		it("records a pending ingest and retries once when ingest.lock is initially lost, then runs", async () => {
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			// Lose the fail-fast acquire, then win the retry after recording intent.
+			vi.mocked(acquireIngestLock).mockResolvedValueOnce(false).mockResolvedValue(true);
+			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 1, outcome: "OK", topicFailures: [] });
+
+			const op = makeIngestOp("post-merge");
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
+
+			await runWorker("/test/cwd");
+
+			expect(vi.mocked(recordPendingIngest)).toHaveBeenCalled();
+			expect(vi.mocked(drainIngest)).toHaveBeenCalledOnce();
+		});
+
+		it("skips the ingest and leaves its entries when ingest.lock stays lost after recording", async () => {
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			vi.mocked(acquireIngestLock).mockResolvedValue(false); // both the fail-fast and the retry miss
+			const { deleteQueueEntry } = await import("../core/SessionTracker.js");
+			vi.mocked(deleteQueueEntry).mockClear();
+
+			const op = makeIngestOp("post-merge");
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
+
+			await runWorker("/test/cwd");
+
+			expect(vi.mocked(recordPendingIngest)).toHaveBeenCalled();
+			// Never ran ingest, and the queued ingest entry is left for the holder's wake.
+			expect(vi.mocked(drainIngest)).not.toHaveBeenCalled();
+			expect(vi.mocked(deleteQueueEntry)).not.toHaveBeenCalled();
+		});
+
+		it("releases ingest.lock BEFORE waking a pending ingest (detached spawn needs a free lock)", async () => {
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			const order: string[] = [];
+			vi.mocked(releaseIngestLock).mockImplementation(async () => {
+				order.push("release-ingest");
+			});
+			vi.mocked(wakePendingIngest).mockImplementation(async () => {
+				order.push("wake-ingest");
+			});
+			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 1, outcome: "OK", topicFailures: [] });
+
+			const op = makeIngestOp("post-merge");
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
+
+			await runWorker("/test/cwd");
+
+			expect(order).toEqual(["release-ingest", "wake-ingest"]);
 		});
 
 		it("skips drainIngest when no API key is configured", async () => {
@@ -2767,9 +2754,7 @@ describe("QueueWorker", () => {
 			delete process.env.ANTHROPIC_API_KEY;
 
 			const op = makeIngestOp("recall-miss");
-			vi.mocked(dequeueAllGitOperations)
-				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
-				.mockResolvedValueOnce([]);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
 
 			await runWorker("/test/cwd");
 
@@ -2785,9 +2770,7 @@ describe("QueueWorker", () => {
 			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 0, outcome: "OK", topicFailures: [] });
 
 			const op = makeIngestOp("manual");
-			vi.mocked(dequeueAllGitOperations)
-				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
-				.mockResolvedValueOnce([]);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
 
 			await runWorker("/test/cwd");
 
@@ -2803,9 +2786,7 @@ describe("QueueWorker", () => {
 			vi.mocked(createStorage).mockResolvedValueOnce(storageWithWiki(false));
 
 			const op = makeIngestOp("manual");
-			vi.mocked(dequeueAllGitOperations)
-				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
-				.mockResolvedValueOnce([]);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
 
 			await runWorker("/test/cwd");
 
@@ -2818,9 +2799,7 @@ describe("QueueWorker", () => {
 			vi.mocked(createStorage).mockResolvedValueOnce(storageWithWiki(true));
 
 			const op = makeIngestOp("manual");
-			vi.mocked(dequeueAllGitOperations)
-				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
-				.mockResolvedValueOnce([]);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
 
 			await runWorker("/test/cwd");
 
@@ -2832,9 +2811,7 @@ describe("QueueWorker", () => {
 			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 2, outcome: "OK", topicFailures: [] });
 
 			const op = makeIngestOp("post-merge");
-			vi.mocked(dequeueAllGitOperations)
-				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
-				.mockResolvedValueOnce([]);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
 
 			await runWorker("/test/cwd");
 

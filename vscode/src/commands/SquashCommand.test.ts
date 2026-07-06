@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { isWorkerBlockingBusy } = vi.hoisted(() => ({
-	isWorkerBlockingBusy: vi.fn(),
+const { isWorkerBusy } = vi.hoisted(() => ({
+	isWorkerBusy: vi.fn(),
 }));
 
 const { info, warn, error, debug } = vi.hoisted(() => ({
@@ -89,7 +89,7 @@ vi.mock("vscode", () => ({
 }));
 
 vi.mock("../util/LockUtils.js", () => ({
-	isWorkerBlockingBusy,
+	isWorkerBusy,
 }));
 
 vi.mock("../util/Logger.js", () => ({
@@ -154,8 +154,8 @@ function makeDeps(selected = [makeCommit("cccc3333"), makeCommit("bbbb2222")]) {
 
 describe("SquashCommand", () => {
 	beforeEach(() => {
-		isWorkerBlockingBusy.mockReset();
-		isWorkerBlockingBusy.mockResolvedValue(false);
+		isWorkerBusy.mockReset();
+		isWorkerBusy.mockResolvedValue(false);
 		showWarningMessage.mockReset();
 		showErrorMessage.mockReset();
 		showInformationMessage.mockReset();
@@ -168,7 +168,7 @@ describe("SquashCommand", () => {
 	});
 
 	it("blocks while the worker is busy", async () => {
-		isWorkerBlockingBusy.mockResolvedValue(true);
+		isWorkerBusy.mockResolvedValue(true);
 		const deps = makeDeps();
 		const command = new SquashCommand(
 			deps.bridge as never,
@@ -187,10 +187,10 @@ describe("SquashCommand", () => {
 	});
 
 	it("re-checks the worker gate after the QuickPick and aborts when it turned busy", async () => {
-		// Click-time check passes (e.g. the worker was in the exempt ingest
-		// phase), but the same drain moves into a blocking summary run while
-		// the user reviews the QuickPick — the squash must not execute.
-		isWorkerBlockingBusy
+		// Click-time check passes (worker idle), but the same drain moves into
+		// a blocking summary run while the user reviews the QuickPick — the
+		// squash must not execute.
+		isWorkerBusy
 			.mockResolvedValueOnce(false)
 			.mockResolvedValueOnce(true);
 		const deps = makeDeps();
@@ -209,7 +209,7 @@ describe("SquashCommand", () => {
 
 		await command.execute();
 
-		expect(isWorkerBlockingBusy).toHaveBeenCalledTimes(2);
+		expect(isWorkerBusy).toHaveBeenCalledTimes(2);
 		expect(deps.bridge.getStagedFilePaths).not.toHaveBeenCalled();
 		expect(deps.bridge.squashCommits).not.toHaveBeenCalled();
 		expect(showWarningMessage).toHaveBeenCalledWith(

@@ -82,7 +82,7 @@ import {
 	handleUpdatePr,
 } from "../services/PrCommentService.js";
 import { deriveRepoNameFromUrl, getCanonicalRepoUrl } from "../util/GitRemoteUtils.js";
-import { isWorkerBlockingBusy } from "../util/LockUtils.js";
+import { isWorkerBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
 import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
 import {
@@ -1798,13 +1798,13 @@ export class SummaryWebviewPanel {
 
 	// Returns true when worker is busy with a blocking (summary) run: shows the
 	// toast and re-runs the status check so the click-time "Loading..." button
-	// gets rebuilt. The ingest phase is exempt, same as the Commit/Squash gates:
-	// PR creation reads already-stored orphan-branch summaries, which ingest
-	// never writes — blocking it for ingest's ~80s+ duration is pure UX damage.
+	// gets rebuilt. Ingest is not gated: it runs under its own ingest.lock, not
+	// worker.lock, and PR creation reads already-stored orphan-branch summaries
+	// that ingest never writes.
 	private async handleWorkerBusyOrContinue(
 		postMessage: (msg: Record<string, unknown>) => void,
 	): Promise<boolean> {
-		if (!(await isWorkerBlockingBusy(this.workspaceRoot))) {
+		if (!(await isWorkerBusy(this.workspaceRoot))) {
 			return false;
 		}
 		vscode.window.showWarningMessage(

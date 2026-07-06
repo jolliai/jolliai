@@ -20,7 +20,7 @@ import type { CommitsStore } from "../stores/CommitsStore.js";
 import type { FilesStore } from "../stores/FilesStore.js";
 import type { StatusStore } from "../stores/StatusStore.js";
 import type { BranchCommit } from "../Types.js";
-import { isWorkerBlockingBusy } from "../util/LockUtils.js";
+import { isWorkerBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
 import type { StatusBarManager } from "../util/StatusBarManager.js";
 
@@ -57,13 +57,11 @@ export class SquashCommand {
 	async execute(): Promise<void> {
 		// Guard: block while the post-commit Worker holds the lock for a summary
 		// run (squashing a commit mid-pipeline races the worker's history reads).
-		// The ingest phase (Memory Bank wiki update) is exempt — it never touches
-		// the code branch; a squash landed during it is enqueued and drained
-		// right after the ingest entry, usually by the SAME worker in the same
-		// lock hold. That worker can therefore move into a blocking summary run
-		// while the user is still mid-flow here, which is why the gate is
-		// re-checked after the QuickPick below.
-		if (await isWorkerBlockingBusy(this.workspaceRoot)) {
+		// Ingest (Memory Bank wiki/graph) runs under its own ingest.lock, so it
+		// never trips this gate. A summary drain can still start while the
+		// user is mid-flow here (message generation + QuickPick), which is why the
+		// gate is re-checked after the QuickPick below.
+		if (await isWorkerBusy(this.workspaceRoot)) {
 			vscode.window.showWarningMessage(
 				"Jolli Memory: AI summary is being generated. Please wait a moment.",
 			);
@@ -138,10 +136,9 @@ export class SquashCommand {
 
 		// Re-check the worker gate: the click-time check at the top goes stale
 		// during LLM message generation + QuickPick review (seconds to minutes).
-		// A drain that was in the exempt ingest phase at click time may since
-		// have moved on to a blocking summary entry — rewriting history under
-		// its reads is exactly the Bug-3 race the gate exists to prevent.
-		if (await isWorkerBlockingBusy(this.workspaceRoot)) {
+		// A summary drain may have started since click time — rewriting history
+		// under its reads is exactly the Bug-3 race the gate exists to prevent.
+		if (await isWorkerBusy(this.workspaceRoot)) {
 			log.warn("squash", "Worker became busy during QuickPick — aborting");
 			vscode.window.showWarningMessage(
 				"Jolli Memory: AI summary is being generated. Please wait a moment.",

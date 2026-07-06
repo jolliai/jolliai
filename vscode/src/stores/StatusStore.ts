@@ -33,7 +33,7 @@ export type StatusChangeReason =
 	| "refresh"
 	| "setStatus"
 	| "workerBusy"
-	| "workerPhase"
+	| "ingest"
 	| "syncPhase"
 	| "extensionOutdated"
 	| "migrating";
@@ -56,20 +56,22 @@ export interface SyncPhaseState {
 }
 
 /**
- * Post-commit worker phase surfaced to the sidebar. The QueueWorker writes the
- * ingest sub-phase (`ingest:wiki` / `ingest:graph`); `"ingest"` is the legacy
- * bare value, still accepted as a wiki-equivalent fallback. All non-null values
- * keep the `ingest` prefix, which the commit/squash gates key off. `null` is the
- * default (blocking) summary phase.
+ * Cosmetic ingest sub-phase surfaced to the sidebar pill. Ingest runs under its
+ * own `ingest.lock` (not `worker.lock`), so this is display-only and fully
+ * decoupled from `workerBusy`/the commit-squash gates. `null` means no ingest is
+ * live.
  */
-export type WorkerPhase = "ingest" | "ingest:wiki" | "ingest:graph" | null;
+export type IngestPhase = "wiki" | "graph" | null;
 
 export interface StatusSnapshot extends Snapshot<StatusChangeReason> {
 	readonly status: StatusInfo | null;
 	readonly config: JolliMemoryConfig | null;
 	readonly derived: StatusDerived;
 	readonly workerBusy: boolean;
-	readonly workerPhase: WorkerPhase;
+	/** An ingest (wiki/graph) is in flight. Independent of `workerBusy`. */
+	readonly ingestBusy: boolean;
+	/** Which ingest sub-phase, for the pill label. `null` when `ingestBusy` is false. */
+	readonly ingestPhase: IngestPhase;
 	readonly syncPhase: SyncPhaseState | null;
 	readonly extensionOutdated: boolean;
 	readonly migrating: boolean;
@@ -87,7 +89,8 @@ const EMPTY: StatusSnapshot = {
 	config: null,
 	derived: INITIAL_DERIVED,
 	workerBusy: false,
-	workerPhase: null,
+	ingestBusy: false,
+	ingestPhase: null,
 	syncPhase: null,
 	extensionOutdated: false,
 	migrating: false,
@@ -99,7 +102,8 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 	private status: StatusInfo | null = null;
 	private config: JolliMemoryConfig | null = null;
 	private workerBusy = false;
-	private workerPhase: WorkerPhase = null;
+	private ingestBusy = false;
+	private ingestPhase: IngestPhase = null;
 	private syncPhase: SyncPhaseState | null = null;
 	private extensionOutdated = false;
 	private migrating = false;
@@ -135,35 +139,31 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 	}
 
 	setWorkerBusy(busy: boolean): void {
-		// Phase lifetime is bound to the lock: whenever the worker is not busy the
-		// phase marker is meaningless, so a (possibly stale, crash-left) phase must
-		// be cleared even when `workerBusy` is already false. Otherwise the equality
-		// early-return below would skip the clear, and a stale 'ingest' marker read
-		// at activation — before `isWorkerBusy()` resolves false — would survive into
-		// the next genuine summary run and mislabel it "Building knowledge wiki…".
-		const staleClear = !busy && this.workerPhase !== null;
-		if (this.workerBusy === busy && !staleClear) {
+		// `workerBusy` is now purely the `worker.lock` (summary) signal — ingest
+		// display state lives in `ingestBusy`/`ingestPhase` and is set independently
+		// (see `setIngest`), so toggling summary-busy no longer touches it.
+		if (this.workerBusy === busy) {
 			return;
 		}
 		this.workerBusy = busy;
-		if (!busy) {
-			this.workerPhase = null;
-		}
 		this.rebuildSnapshot("workerBusy");
 	}
 
 	/**
-	 * Push (or clear) the post-commit worker's phase. Non-null values are the
-	 * `ingest:*` sub-phases (wiki / graph), each selecting a distinct sidebar
-	 * label; `null` is the default "AI summary in progress…" phase. Equality-
-	 * checked so a redundant call is a no-op.
+	 * Push the ingest display state (cosmetic sidebar pill). Fully decoupled from
+	 * `workerBusy`: ingest runs under its own `ingest.lock`, so its pill can show
+	 * while a summary is NOT running (and is suppressed when one IS, by the
+	 * renderer's summary-first priority). Equality-checked so a redundant push is a
+	 * no-op. When `busy` is false, `phase` is forced to `null`.
 	 */
-	setWorkerPhase(phase: WorkerPhase): void {
-		if (this.workerPhase === phase) {
+	setIngest(busy: boolean, phase: IngestPhase): void {
+		const nextPhase = busy ? phase : null;
+		if (this.ingestBusy === busy && this.ingestPhase === nextPhase) {
 			return;
 		}
-		this.workerPhase = phase;
-		this.rebuildSnapshot("workerPhase");
+		this.ingestBusy = busy;
+		this.ingestPhase = nextPhase;
+		this.rebuildSnapshot("ingest");
 	}
 
 	/**
@@ -201,7 +201,8 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 			config: this.config,
 			derived: StatusDataService.derive(this.status, this.config),
 			workerBusy: this.workerBusy,
-			workerPhase: this.workerPhase,
+			ingestBusy: this.ingestBusy,
+			ingestPhase: this.ingestPhase,
 			syncPhase: this.syncPhase,
 			extensionOutdated: this.extensionOutdated,
 			migrating: this.migrating,
