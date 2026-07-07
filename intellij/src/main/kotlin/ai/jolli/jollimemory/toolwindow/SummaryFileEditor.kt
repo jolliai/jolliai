@@ -19,8 +19,8 @@ class SummaryFileEditor(
 
     private val panel = SummaryPanel(project, file.summary, file.readOnly)
 
-    /** Opens the inline share overlay in the embedded webview (Commits-list Share icon). */
-    fun requestOpenShare() = panel.openShare()
+    /** Opens the inline share overlay in the embedded webview (Commits-list / sidebar Share). */
+    fun requestOpenShare(branchShare: Boolean = false) = panel.openShare(branchShare)
 
     override fun getComponent(): JComponent = panel
 

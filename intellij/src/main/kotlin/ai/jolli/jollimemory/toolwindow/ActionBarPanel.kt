@@ -167,14 +167,31 @@ class ActionBarPanel(
 		panel.openCreatePrView()
 	}
 
-	/** Opens the read-only share dialog for the current branch's memories. */
+	/**
+	 * Shares the whole branch. Mirrors VS Code: open (or focus) the newest memory's detail webview
+	 * and reveal its inline share overlay in branch mode — no separate window. When the branch has
+	 * no committed memories there is nothing to open, so we say so.
+	 */
 	private fun handleShare() {
-		val branch = service.getGitOps()?.getCurrentBranch()
-		if (branch.isNullOrBlank()) {
-			Messages.showWarningDialog(project, "Could not determine the current branch.", "Share")
-			return
+		ApplicationManager.getApplication().executeOnPooledThread {
+			val newest = service.getBranchCommits()
+				.firstOrNull { it.hasSummary }
+				?.let { service.getSummary(it.hash) }
+			SwingUtilities.invokeLater {
+				if (newest == null) {
+					Messages.showInfoMessage(
+						project,
+						"No committed memories on this branch to share yet.",
+						"Share",
+					)
+					return@invokeLater
+				}
+				val vFile = SummaryVirtualFile(newest)
+				val editors = com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project)
+					.openFile(vFile, true)
+				editors.filterIsInstance<SummaryFileEditor>().firstOrNull()?.requestOpenShare(branchShare = true)
+			}
 		}
-		ShareLauncher.openForBranch(project, branch)
 	}
 
 	override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
