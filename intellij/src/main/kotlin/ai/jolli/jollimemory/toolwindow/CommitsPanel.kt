@@ -856,14 +856,21 @@ class CommitsPanel(
         }
     }
 
-    /** Share a memory to the user's Jolli Space (row hover action). */
-    /** Opens the read-only share dialog for this memory (single-commit share). */
+    /**
+     * Share this memory (row hover action). Mirrors VS Code's `shareMemory`: open (or focus)
+     * the commit's detail webview, then reveal that view's inline share overlay — rather than a
+     * separate dialog window. The overlay + its state machine live in the summary webview
+     * ([SummaryPanel.openShare]).
+     */
     private fun shareMemory(commit: CommitSummaryBrief) {
         ApplicationManager.getApplication().executeOnPooledThread {
             val summary = service.getSummary(commit.hash)
             SwingUtilities.invokeLater {
                 if (summary != null) {
-                    ShareLauncher.openForCommit(project, summary)
+                    val vFile = SummaryVirtualFile(summary)
+                    val editors = com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project)
+                        .openFile(vFile, true)
+                    editors.filterIsInstance<SummaryFileEditor>().firstOrNull()?.requestOpenShare()
                 } else {
                     com.intellij.openapi.ui.Messages.showInfoMessage(
                         project,
