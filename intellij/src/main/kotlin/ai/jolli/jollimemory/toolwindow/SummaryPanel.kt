@@ -87,6 +87,14 @@ class SummaryPanel(
 
     @Volatile
     private var pendingShareOpen = false
+
+    // Kind for a deferred openShare (true = share the whole branch, false = this memory), and the
+    // mode of the currently-open modal so follow-up copy/access/invite commands match it.
+    @Volatile
+    private var pendingShareBranch = false
+
+    @Volatile
+    private var shareBranchMode = false
     private val gson = Gson()
     private val store: SummaryStore
     private val transcriptHashSet = mutableSetOf<String>()
@@ -224,12 +232,14 @@ class SummaryPanel(
     }
 
     /**
-     * Reveals the inline share overlay in this webview — the Commits-list "Share" icon entry
-     * point, equivalent to clicking the in-view "Share link" button. Runs `shareOpen()` (which
-     * shows the overlay and kicks off the single-slot [ai.jolli.jollimemory.services.BranchShareModal]).
-     * Deferred until [pageLoaded] when the editor was just opened for this click.
+     * Reveals the inline share overlay in this webview — the entry point used by the Commits-list
+     * "Share" icon (commit share) and the sidebar Share button (branch share, [branchShare] = true).
+     * Runs `shareOpen(kind)`, which shows the overlay and kicks off the single-slot
+     * [ai.jolli.jollimemory.services.BranchShareModal]. Deferred until [pageLoaded] when the editor
+     * was just opened for this click.
      */
-    fun openShare() {
+    fun openShare(branchShare: Boolean = false) {
+        pendingShareBranch = branchShare
         pendingShareOpen = true
         maybeOpenShare()
     }
@@ -238,10 +248,11 @@ class SummaryPanel(
     private fun maybeOpenShare() {
         if (pageLoaded && pendingShareOpen) {
             pendingShareOpen = false
+            val kind = if (pendingShareBranch) "branch" else "commit"
             ApplicationManager.getApplication().invokeLater {
                 val b = browser ?: return@invokeLater
                 b.cefBrowser.executeJavaScript(
-                    "if (typeof shareOpen === 'function') shareOpen();",
+                    "if (typeof shareOpen === 'function') shareOpen('$kind');",
                     b.cefBrowser.url ?: "",
                     0,
                 )
@@ -335,7 +346,13 @@ class SummaryPanel(
                 "copyMarkdown" -> handleCopyMarkdown()
                 "downloadMarkdown" -> handleDownloadMarkdown()
                 "pushToJolli" -> handlePushToJolli()
-                "shareBranch" -> handleShareCommand(opensModal = true) { io, ctx -> ai.jolli.jollimemory.services.BranchShareModal.openShareModal(io, ctx) }
+                "shareBranch" -> {
+                    // 'branch' shares the whole branch (commitHash = null); 'commit' (default)
+                    // shares this memory. Remembered so the follow-up copy/access/invite commands
+                    // build the same context.
+                    shareBranchMode = json.get("shareKind")?.asString == "branch"
+                    handleShareCommand(opensModal = true) { io, ctx -> ai.jolli.jollimemory.services.BranchShareModal.openShareModal(io, ctx) }
+                }
                 "shareCopyLink" -> {
                     val v = json.get("visibility")?.asString ?: "public"
                     handleShareCommand { io, ctx -> ai.jolli.jollimemory.services.BranchShareModal.copyShareLinkModal(io, ctx, v) }
@@ -440,19 +457,26 @@ class SummaryPanel(
     // ── In-webview share modal (single-slot, mirrors the VS Code webview modal) ──
 
     /**
-     * Runs a [ai.jolli.jollimemory.services.BranchShareModal] entry point for THIS memory
-     * (a single-commit share) on a pooled thread, driving the webview-backed IO. The context
-     * (owner / org directory / git contributors / binding chooser) is assembled off the EDT.
+     * Runs a [ai.jolli.jollimemory.services.BranchShareModal] entry point on a pooled thread,
+     * driving the webview-backed IO. The context (owner / org directory / git contributors /
+     * binding chooser) is assembled off the EDT. [shareBranchMode] selects a branch-wide share
+     * (commitHash = null) vs. this single memory — set from the opening `shareBranch` message and
+     * reused by the follow-up copy/access/invite commands.
      */
     private fun handleShareCommand(
         opensModal: Boolean = false,
         action: (ai.jolli.jollimemory.services.BranchShareModal.ShareModalIO, ai.jolli.jollimemory.services.BranchShareModal.ShareModalContext) -> Unit,
     ) {
         val summary = currentSummary
+        val branchShare = shareBranchMode
         ApplicationManager.getApplication().executeOnPooledThread {
             TraceContext.withTrace {
                 try {
-                    val ctx = ShareContextFactory.build(project, summary.branch, summary.commitMessage, summary.commitHash, summary)
+                    val ctx = if (branchShare) {
+                        ShareContextFactory.build(project, summary.branch, summary.branch, null, null)
+                    } else {
+                        ShareContextFactory.build(project, summary.branch, summary.commitMessage, summary.commitHash, summary)
+                    }
                     action(shareModalIO(), ctx)
                 } catch (e: Exception) {
                     LOG.warn("Share action failed: ${e.message}", e)

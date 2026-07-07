@@ -3,14 +3,15 @@ package ai.jolli.jollimemory.toolwindow.views
 import ai.jolli.jollimemory.services.BranchShareModal
 
 /**
- * ShareWebview — the single source of the share modal's HTML / CSS / JS, so all three surfaces
- * render the identical webview (mirroring the VS Code webview modal):
- *  - the inline overlay inside the JCEF summary view ([modalHtml] + [renderScript]),
- *  - the standalone JCEF dialog launched from the Swing sidebar / Commits row ([standaloneDocument]).
+ * ShareWebview — the single source of the share modal's HTML / CSS / JS. It renders as an inline
+ * overlay inside the JCEF summary detail view ([modalHtml] + [renderScript] + [css]), mirroring the
+ * VS Code webview modal: there is no separate share window. Both entry points converge here — the
+ * Commits-row Share icon (commit share) and the sidebar Share button (branch share) open the
+ * memory's detail webview and reveal this overlay via `shareOpen('commit' | 'branch')`.
  *
  * The client renders each `shareState` the host posts and sends shareBranch / shareCopyLink /
- * shareSetAccess / shareSendInvite / shareRemoveRecipient back over the JS↔Kotlin bridge. The
- * `window.SHARE_STANDALONE` flag switches open/close behavior between the two hosts.
+ * shareSetAccess / shareSendInvite / shareRemoveRecipient back over the JS↔Kotlin bridge, echoing
+ * the current `shareKind` so the host builds a commit- or branch-scoped context.
  */
 object ShareWebview {
 
@@ -108,12 +109,6 @@ ${panes()}
   </div>
 </div>"""
 
-    /** Standalone modal body for the JCEF dialog (fills the dialog; no dimmed overlay). */
-    private fun standaloneBody(): String = """
-  <div class="share-modal share-standalone" role="dialog" aria-modal="true" aria-labelledby="shareModalTitle">
-${panes()}
-  </div>"""
-
     /** The share CSS block (referenced by SummaryCssBuilder so the inline modal is styled too). */
     fun css(): String = """
   /* ── Share modal (webview, single-slot) ── */
@@ -130,7 +125,6 @@ ${panes()}
     background: var(--bg); border: 1px solid var(--border-light);
     border-radius: 10px; padding: 16px 16px 14px; box-shadow: 0 12px 40px rgba(0,0,0,0.4);
   }
-  .share-standalone { width: 100%; max-width: none; max-height: none; border: none; border-radius: 0; box-shadow: none; padding: 14px 16px; }
   .share-modal-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
   .share-modal-title { font-size: 1.05em; font-weight: 650; display: inline-flex; gap: 6px; align-items: center; }
   .share-modal-close { background: transparent; border: none; color: var(--text-secondary); padding: 4px 7px; border-radius: 4px; cursor: pointer; font-size: 1em; }
@@ -182,14 +176,18 @@ ${panes()}
   .share-nokey { font-size: 0.9em; color: var(--text-secondary); }"""
 
     /**
-     * The shared client JS: render each state + wire controls. `shareOpen`/`shareClose` branch on
-     * `window.SHARE_STANDALONE`. Inline callers (SummaryScriptBuilder) already define `jmSend` and the
-     * `jollimemory` message listener; the standalone document adds those itself.
+     * The shared client JS: render each state + wire controls. `shareOpen(kind)` reveals the
+     * overlay and starts the share for that kind ('commit' | 'branch'); `shareClose` hides it. The
+     * inline caller (SummaryScriptBuilder) already defines `jmSend` and the `jollimemory` message
+     * listener that routes `shareState` / `shareCopyResult` here.
      */
     fun renderScript(): String = """
   var shareOverlay = document.getElementById('shareOverlay');
   var shareState = null;
   var shareInvitePending = [];
+  // 'commit' shares this memory; 'branch' shares the whole branch. Set by shareOpen and
+  // echoed on every shareBranch/retry so the host builds the matching context.
+  var shareCurrentKind = 'commit';
   var SHARE_EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+${'$'}/;
 
   function shareById(id) { return document.getElementById(id); }
@@ -198,13 +196,13 @@ ${panes()}
       var el = shareById(p); if (el) el.hidden = (p !== id);
     });
   }
-  function shareOpen() {
-    if (!window.SHARE_STANDALONE && shareOverlay) shareOverlay.hidden = false;
+  function shareOpen(kind) {
+    shareCurrentKind = (kind === 'branch') ? 'branch' : 'commit';
+    if (shareOverlay) shareOverlay.hidden = false;
     shareShowPane('sharePaneLoading');
-    jmSend({ command: 'shareBranch' });
+    jmSend({ command: 'shareBranch', shareKind: shareCurrentKind });
   }
   function shareClose() {
-    if (window.SHARE_STANDALONE) { jmSend({ command: 'shareCloseDialog' }); return; }
     if (shareOverlay) shareOverlay.hidden = true;
   }
 
@@ -372,44 +370,6 @@ ${panes()}
       if (msgEl && msgEl.value.trim()) payload.message = msgEl.value.trim();
       jmSend(payload);
     });
-    var retry = shareById('shareRetryBtn'); if (retry) retry.addEventListener('click', function(){ shareShowPane('sharePaneLoading'); jmSend({ command: 'shareBranch' }); });
+    var retry = shareById('shareRetryBtn'); if (retry) retry.addEventListener('click', function(){ shareShowPane('sharePaneLoading'); jmSend({ command: 'shareBranch', shareKind: shareCurrentKind }); });
   })();"""
-
-    /**
-     * The full standalone HTML document for the JCEF share dialog. [css] is the summary stylesheet
-     * (which already includes [css]() via SummaryCssBuilder); [bridgeScript] defines `window.__jbQuery`.
-     */
-    fun standaloneDocument(css: String, bridgeScript: String): String = """<!doctype html>
-<html>
-<head><meta charset="UTF-8" />
-<style>
-$css
-html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text-primary); }
-</style>
-</head>
-<body>
-${standaloneBody()}
-<script>$bridgeScript</script>
-<script>
-  window.SHARE_STANDALONE = true;
-  function jmSend(msg) {
-    if (!window.__jbQuery) return;
-    var json = JSON.stringify(msg);
-    var bytes = new TextEncoder().encode(json);
-    var binary = '';
-    for (var i = 0; i < bytes.length; i++) { binary += String.fromCharCode(bytes[i]); }
-    window.__jbQuery(btoa(binary));
-  }
-${renderScript()}
-  window.addEventListener('jollimemory', function(e) {
-    var msg = e.detail;
-    if (msg.command === 'shareState') { shareRender(msg.state); }
-    else if (msg.command === 'shareCopyResult') { shareFlashCopy(msg.ok === true); }
-  });
-  // Show the loading pane immediately; the host drives the first openShareModal from
-  // onLoadEnd (Kotlin → JS), so we don't depend on the JS→Kotlin bridge being ready at load.
-  shareShowPane('sharePaneLoading');
-</script>
-</body>
-</html>"""
 }
