@@ -80,27 +80,26 @@ object CommitMemoryFormat {
 	fun aggregateTokens(commits: List<CommitSummaryBrief>): BranchTokenTotals {
 		var input = 0L
 		var output = 0L
-		var cacheRead = 0L
-		var cacheWrite = 0L
+		var cached = 0L
 		var partial = false
 		// Σ per-commit cost; stays null unless at least one memory carried a priced
 		// estimate, so a branch with no cost data renders tokens only (no "≈$0.00").
 		var cost: Double? = null
 		for (c in commits) {
 			if (!c.hasSummary) continue
-			val u = c.tokenUsage
-			if (u == null) {
+			val bd = c.conversationTokenBreakdown
+			if (bd == null) {
 				// A memory with no recorded usage (old data / unreported source).
 				partial = true
 				continue
 			}
-			input += u.inputTokens
-			output += u.outputTokens
-			cacheRead += u.cacheReadTokens
-			cacheWrite += u.cacheWriteTokens
-			if (u.partial) partial = true
-			u.estimatedCostUsd?.let { cost = (cost ?: 0.0) + it }
+			input += bd.input
+			output += bd.output
+			cached += bd.cached
+			c.estimatedCostUsd?.let { cost = (cost ?: 0.0) + it }
 		}
-		return BranchTokenTotals(input, output, cacheRead, cacheWrite, partial, cost)
+		// cache_read is excluded from the breakdown (see ConversationTokenBreakdown),
+		// so it's always 0 here; `cached` carries cache_creation.
+		return BranchTokenTotals(input, output, cacheRead = 0, cacheWrite = cached, partial = partial, estimatedCostUsd = cost)
 	}
 }

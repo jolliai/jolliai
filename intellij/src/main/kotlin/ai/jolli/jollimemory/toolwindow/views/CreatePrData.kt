@@ -7,6 +7,8 @@ import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliMemoryService
 import ai.jolli.jollimemory.services.PrService
+import ai.jolli.jollimemory.toolwindow.BranchTokenTotals
+import ai.jolli.jollimemory.toolwindow.CommitMemoryFormat
 import com.intellij.openapi.project.Project
 
 /**
@@ -60,6 +62,12 @@ object CreatePrData {
          * (enabled) so create-mode and tests aren't accidentally disabled.
          */
         val hasUnpushedChanges: Boolean = true,
+        /**
+         * Branch-wide token + estimated-cost totals across every committed memory
+         * on the branch (null when none carried usage). Drives the PR banner — the
+         * branch-level counterpart of the per-memory meter in the detail webview.
+         */
+        val branchTokenTotals: BranchTokenTotals? = null,
     )
 
     /**
@@ -72,10 +80,15 @@ object CreatePrData {
         val cwd = service.mainRepoRoot ?: project.basePath ?: return null
         val git = service.getGitOps() ?: return null
 
-        val summaries = service.getBranchCommits()
+        // Keep the brief list: it carries per-commit token breakdown + estimated
+        // cost, which the branch banner aggregates. The full summaries (loaded next)
+        // don't surface those on the list path, so we'd otherwise lose them.
+        val briefs = service.getBranchCommits()
+        val summaries = briefs
             .filter { it.hasSummary }
             .mapNotNull { service.getSummary(it.hash) }
         if (summaries.isEmpty()) return null
+        val tokenTotals = CommitMemoryFormat.aggregateTokens(briefs)
 
         val anchor = summaries.first() // newest-first
         val branch = anchor.branch.ifBlank { git.getCurrentBranch()?.trim() ?: "" }
@@ -93,7 +106,7 @@ object CreatePrData {
         // false, so the Update button dims — matching the commit-level push UI.
         val hasUnpushedChanges = !git.isHeadPushed()
 
-        return assemble(branch, mainBranch, summaries, stats, files, existingPr, signedIn, hasUnpushedChanges)
+        return assemble(branch, mainBranch, summaries, stats, files, existingPr, signedIn, hasUnpushedChanges, tokenTotals)
     }
 
     /** Aggregate insertions/deletions/filesChanged. */
@@ -109,6 +122,7 @@ object CreatePrData {
         existingPr: ExistingPr?,
         signedIn: Boolean,
         hasUnpushedChanges: Boolean = true,
+        branchTokenTotals: BranchTokenTotals? = null,
     ): ViewModel {
         val anchor = summaries.first()
         return ViewModel(
@@ -127,6 +141,7 @@ object CreatePrData {
             signedIn = signedIn,
             includedSummaries = summaries,
             hasUnpushedChanges = hasUnpushedChanges,
+            branchTokenTotals = branchTokenTotals,
         )
     }
 

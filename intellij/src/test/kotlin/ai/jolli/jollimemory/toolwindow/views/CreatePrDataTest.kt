@@ -102,5 +102,32 @@ class CreatePrDataTest {
             vm.existingPr shouldBe CreatePrData.ExistingPr(42, "https://github.com/o/r/pull/42")
             vm.signedIn shouldBe false
         }
+
+        @Test
+        fun `threads branch token totals into the view model`() {
+            val totals = ai.jolli.jollimemory.toolwindow.BranchTokenTotals(
+                input = 100, output = 50, cacheRead = 0, cacheWrite = 10,
+                partial = false, estimatedCostUsd = 0.12,
+            )
+            val vm = CreatePrData.assemble(
+                "feature/x", "main",
+                listOf(summary("h1", "only change")),
+                CreatePrData.Stats(0, 0, 0), emptyList(),
+                existingPr = null, signedIn = true,
+                branchTokenTotals = totals,
+            )
+            vm.branchTokenTotals shouldBe totals
+        }
+
+        @Test
+        fun `defaults branch token totals to null`() {
+            val vm = CreatePrData.assemble(
+                "feature/x", "main",
+                listOf(summary("h1", "only change")),
+                CreatePrData.Stats(0, 0, 0), emptyList(),
+                existingPr = null, signedIn = true,
+            )
+            vm.branchTokenTotals shouldBe null
+        }
     }
 }

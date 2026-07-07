@@ -287,6 +287,8 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
             .takeIf { it.isNotEmpty() }?.let { StoredTranscript(it) }
         val totalEntries = mergedSessions.values.sumOf { it.entries.size }
         val totalTurns = mergedSessions.values.sumOf { s -> s.entries.count { it.role == "human" } }
+        // Canonical (TS-identical) conversation usage: token breakdown + per-model cost.
+        val usage = mergedTranscript?.let { ConversationUsage.aggregate(it.sessions) }
 
         val newSummary = CommitSummary(
             version = SummaryTree.CURRENT_SCHEMA_VERSION, commitHash = newCommitInfo.hash,
@@ -300,7 +302,11 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
             llm = llmMetadata,
             conversationTurns = totalTurns.takeIf { it > 0 },
             transcriptEntries = totalEntries.takeIf { it > 0 },
-            tokenUsage = mergedTranscript?.let { TokenUsage.aggregate(it.sessions) },
+            conversationTokens = usage?.conversationTokens,
+            conversationTokenBreakdown = usage?.breakdown,
+            conversationModels = usage?.models?.takeIf { it.isNotEmpty() },
+            estimatedCostUsd = usage?.estimatedCostUsd,
+            pricesAsOf = usage?.estimatedCostUsd?.let { ModelPricing.PRICES_AS_OF },
             summaryError = summaryError,
             children = children,
         )

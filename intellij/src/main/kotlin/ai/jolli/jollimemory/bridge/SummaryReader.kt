@@ -266,8 +266,10 @@ data class CommitSummaryBrief(
     val commitType: String? = null,
     // ── Memory-detail enrichment (populated from the commit's CommitSummary in
     //    JolliMemoryService.getBranchCommits; absent for code-only commits) ──
-    /** Coding-session token usage captured by this memory; null when not recorded. */
-    val tokenUsage: ai.jolli.jollimemory.core.TokenUsage? = null,
+    /** Per-segment conversation-token breakdown (canonical, TS-identical); null when not recorded. */
+    val conversationTokenBreakdown: ai.jolli.jollimemory.core.ConversationTokenBreakdown? = null,
+    /** Estimated USD cost of this memory's conversation tokens; null when unpriced/unrecorded. */
+    val estimatedCostUsd: Double? = null,
     /** Whether this memory carries an E2E test guide, and how many scenarios. */
     val e2eScenarioCount: Int = 0,
     /** Whether this memory has been pushed to Jolli Space (article exists). */

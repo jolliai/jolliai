@@ -612,8 +612,13 @@ object PostCommitHook {
                 log.info("StoredSession: sessionId=%s, source=%s, entries=%d", st.sessionId.take(8), st.source, st.entries.size)
                 StoredSession(st.sessionId, source = st.source, transcriptPath = st.transcriptPath, entries = st.entries)
             }
-            val tokenUsage = TokenUsage.aggregate(storedSessions)
-            log.info("TokenUsage: %s", tokenUsage?.let { "in=${it.inputTokens} out=${it.outputTokens} cr=${it.cacheReadTokens} cw=${it.cacheWriteTokens} reported=${it.reportedSessions}/${it.totalSessions}" } ?: "none")
+            // Canonical (TS-identical) conversation usage: token breakdown + per-model cost.
+            val usage = ConversationUsage.aggregate(storedSessions)
+            log.info(
+                "ConversationUsage: %s",
+                usage?.let { "tokens=${it.conversationTokens} in=${it.breakdown.input} out=${it.breakdown.output} cached=${it.breakdown.cached} cost=${it.estimatedCostUsd}" }
+                    ?: "none",
+            )
 
             val summary = CommitSummary(
                 version = SummaryTree.CURRENT_SCHEMA_VERSION,
@@ -628,7 +633,11 @@ object PostCommitHook {
                 transcriptEntries = summaryResult.transcriptEntries,
                 conversationTurns = summaryResult.conversationTurns,
                 llm = summaryResult.llm,
-                tokenUsage = tokenUsage,
+                conversationTokens = usage?.conversationTokens,
+                conversationTokenBreakdown = usage?.breakdown,
+                conversationModels = usage?.models?.takeIf { it.isNotEmpty() },
+                estimatedCostUsd = usage?.estimatedCostUsd,
+                pricesAsOf = usage?.estimatedCostUsd?.let { ModelPricing.PRICES_AS_OF },
                 stats = summaryResult.stats,
                 topics = summaryResult.topics,
                 ticketId = summaryResult.ticketId,

@@ -5,7 +5,7 @@ import ai.jolli.jollimemory.core.ActiveSessionAggregator
 import ai.jolli.jollimemory.core.CommitSelectionStore
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.StoredSession
-import ai.jolli.jollimemory.core.TokenUsage
+import ai.jolli.jollimemory.core.ConversationUsage
 import ai.jolli.jollimemory.core.TranscriptReader
 import ai.jolli.jollimemory.core.TranscriptSource
 import ai.jolli.jollimemory.core.references.SourceId
@@ -231,14 +231,17 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             }
             StoredSession(c.sessionId, c.source, c.transcriptPath, entries)
         }
-        val usage = TokenUsage.aggregate(sessions) ?: return null
+        val usage = ConversationUsage.aggregate(sessions) ?: return null
+        // Partial when an included conversation contributed no usage (a source that
+        // doesn't report it, or a read that yielded none) — the total understates reality.
+        val reported = sessions.count { s -> s.entries.any { it.usage != null } }
         return WmTokens(
-            total = usage.total,
-            input = usage.inputTokens,
-            output = usage.outputTokens,
-            cacheRead = usage.cacheReadTokens,
-            cacheWrite = usage.cacheWriteTokens,
-            partial = usage.partial,
+            total = usage.conversationTokens.toLong(),
+            input = usage.breakdown.input,
+            output = usage.breakdown.output,
+            cached = usage.breakdown.cached,
+            partial = reported < included.size,
+            estimatedCostUsd = usage.estimatedCostUsd,
         )
     }
 

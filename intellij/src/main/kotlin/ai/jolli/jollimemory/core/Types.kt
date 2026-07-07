@@ -118,14 +118,12 @@ data class AmendPendingState(
 )
 
 /**
- * Aggregate AI **coding-session** token usage captured by a memory — the tokens
- * the developer's AI tool spent on the work, summed from the transcript's
- * per-message [MessageUsage]. This is distinct from [LlmCallMetadata.llm], which
- * is the cost of Jolli's own summarizer call.
- *
- * `reportedSessions` / `totalSessions` let the UI flag "partial" when some
- * contributing sources don't report usage (e.g. Cursor, Copilot). Cross-impl
- * contract — keep field names identical on the cli/vscode (TS) side.
+ * LEGACY aggregate token usage — retained only to deserialize summaries written
+ * by older IntelliJ plugin versions (which stored a `tokenUsage` object). New
+ * code writes and reads the cross-implementation canonical fields on
+ * [CommitSummary] instead ([CommitSummary.conversationTokenBreakdown] /
+ * [CommitSummary.conversationModels] / [CommitSummary.estimatedCostUsd]), which
+ * are byte-for-byte identical to the CLI/VS Code (TS) schema. Do not write this.
  */
 data class TokenUsage(
     val inputTokens: Long = 0,
@@ -134,63 +132,91 @@ data class TokenUsage(
     val cacheWriteTokens: Long = 0,
     val reportedSessions: Int = 0,
     val totalSessions: Int = 0,
+)
+
+/**
+ * Per-segment conversation-token breakdown. **Cross-implementation contract —
+ * identical to the TS `ConversationTokenBreakdown`; field names are the on-disk
+ * JSON keys and MUST match.** `cached` is `cache_creation` tokens only;
+ * `cache_read` is deliberately excluded (it's a cumulative per-turn running total
+ * that inflates sums), so `input + output + cached` equals [CommitSummary.conversationTokens].
+ */
+data class ConversationTokenBreakdown(
+    val input: Long = 0,
+    val output: Long = 0,
+    val cached: Long = 0,
+)
+
+/**
+ * One conversation model's usage, normalised to the three segments the cost
+ * formula prices. **Cross-implementation contract — identical to the TS
+ * `ModelTokenUsage`.** `cached` is cache_creation (priced at the cache-write
+ * rate); cache_read is excluded. `provider` comes from the price table.
+ */
+data class ModelTokenUsage(
+    val model: String,
+    val provider: String,
+    val input: Long = 0,
+    val output: Long = 0,
+    val cached: Long = 0,
+)
+
+/**
+ * Canonical conversation usage written to the shared summary — the tokens the
+ * developer's AI tool spent on the work (distinct from [LlmCallMetadata], the
+ * summarizer's own call). Mirrors the CLI/VS Code (TS) fields exactly so a Claude
+ * commit is written, read, and priced identically across all three tools.
+ * cache_read is excluded everywhere (see [ConversationTokenBreakdown]).
+ */
+data class ConversationUsage(
+    /** Scalar total = input + output + cached. */
+    val conversationTokens: Int,
+    val breakdown: ConversationTokenBreakdown,
+    /** Per-model split (one bucket per model; sessions can switch models mid-stream). */
+    val models: List<ModelTokenUsage>,
     /**
-     * Per-model split of the usage (one bucket per model seen; sessions can switch
-     * models mid-stream). Feeds [estimatedCostUsd]. Empty for memories created
-     * before per-model capture, or when no assistant turn recorded a model.
+     * Estimated USD cost of [models] via [ModelPricing] (list prices as of
+     * [ModelPricing.PRICES_AS_OF]); null when nothing priced. A lower bound when
+     * some models are absent from the table.
      */
-    val models: List<ModelUsage> = emptyList(),
-    /**
-     * Estimated USD cost of [models] at list prices as of
-     * [ModelPricing.PRICES_AS_OF]. Null when nothing priced (no models, or all
-     * models absent from the price table); a lower bound when some models were
-     * unpriced. Excludes promotional/batch/volume discounts. Prices input +
-     * cache_write + output only (cache_read is excluded — see [ModelPricing]).
-     */
-    val estimatedCostUsd: Double? = null,
+    val estimatedCostUsd: Double?,
 ) {
-    /** All tokens processed (input + output + cache read + cache write). */
-    val total: Long get() = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
-
-    /** True when some contributing sessions didn't report usage (total understates reality). */
-    val partial: Boolean get() = reportedSessions < totalSessions
-
     companion object {
         /**
-         * Sums per-message usage across the given stored sessions. Returns null
-         * when no session reported any usage (so callers render "N/A" rather than
-         * a misleading zero) — e.g. memories created before usage capture, or
-         * sources that don't report it.
-         *
-         * Also buckets usage per model and prices it into [estimatedCostUsd] via
-         * [ModelPricing] (cost excludes cache_read; see that object).
+         * Sums per-message usage across the given stored sessions into the
+         * canonical shape, EXCLUDING cache_read, and prices it per model. Returns
+         * null when no session reported any usage (so callers render "N/A" rather
+         * than a misleading zero).
          */
-        fun aggregate(sessions: List<StoredSession>): TokenUsage? {
+        fun aggregate(sessions: List<StoredSession>): ConversationUsage? {
             if (sessions.isEmpty()) return null
             var input = 0L
             var output = 0L
-            var cacheRead = 0L
-            var cacheWrite = 0L
+            var cached = 0L // cache_creation only; cache_read excluded
             var reported = 0
-            // Per-model buckets keyed by model id; insertion-ordered for stable output.
-            val byModel = LinkedHashMap<String, ModelUsage>()
+            val byModel = LinkedHashMap<String, ModelTokenUsage>()
             for (session in sessions) {
                 var sessionReported = false
                 for (entry in session.entries) {
                     val u = entry.usage ?: continue
                     input += u.inputTokens
                     output += u.outputTokens
-                    cacheRead += u.cacheReadTokens
-                    cacheWrite += u.cacheWriteTokens
+                    cached += u.cacheWriteTokens
                     val prev = byModel[u.model]
                     byModel[u.model] = if (prev != null) {
                         prev.copy(
                             input = prev.input + u.inputTokens,
                             output = prev.output + u.outputTokens,
-                            cacheWrite = prev.cacheWrite + u.cacheWriteTokens,
+                            cached = prev.cached + u.cacheWriteTokens,
                         )
                     } else {
-                        ModelUsage(u.model, ModelPricing.providerOf(u.model), u.inputTokens, u.outputTokens, u.cacheWriteTokens)
+                        ModelTokenUsage(
+                            u.model,
+                            ModelPricing.providerOf(u.model),
+                            u.inputTokens,
+                            u.outputTokens,
+                            u.cacheWriteTokens,
+                        )
                     }
                     sessionReported = true
                 }
@@ -199,23 +225,15 @@ data class TokenUsage(
             if (reported == 0) return null
             val models = byModel.values.toList()
             val cost = ModelPricing.estimateCostUsd(models).takeIf { it > 0.0 }
-            return TokenUsage(input, output, cacheRead, cacheWrite, reported, sessions.size, models, cost)
+            return ConversationUsage(
+                conversationTokens = (input + output + cached).toInt(),
+                breakdown = ConversationTokenBreakdown(input, output, cached),
+                models = models,
+                estimatedCostUsd = cost,
+            )
         }
     }
 }
-
-/**
- * One model's token usage, normalised to the segments the cost formula prices
- * (cache_read is excluded — see [ModelPricing]). `provider` is derived from the
- * price table ("unknown" when the model isn't listed).
- */
-data class ModelUsage(
-    val model: String,
-    val provider: String,
-    val input: Long,
-    val output: Long,
-    val cacheWrite: Long,
-)
 
 /** Metadata from the LLM API call */
 data class LlmCallMetadata(
@@ -264,8 +282,16 @@ data class CommitSummary(
     val transcriptEntries: Int? = null,
     val conversationTurns: Int? = null,
     val conversationTokens: Int? = null,
+    /** Per-segment split of [conversationTokens]. Cross-impl canonical (TS-identical). */
+    val conversationTokenBreakdown: ConversationTokenBreakdown? = null,
+    /** Per-model split of the conversation tokens; feeds [estimatedCostUsd]. Cross-impl canonical. */
+    val conversationModels: List<ModelTokenUsage>? = null,
+    /** Estimated USD cost of [conversationModels] at list prices as of [pricesAsOf]. Cross-impl canonical. */
+    val estimatedCostUsd: Double? = null,
+    /** Date of the price table used for [estimatedCostUsd] (ModelPricing.PRICES_AS_OF). */
+    val pricesAsOf: String? = null,
     val llm: LlmCallMetadata? = null,
-    /** Coding-session token usage captured by this memory (null = not recorded). */
+    /** LEGACY: token usage written by older IntelliJ versions. Read-only fallback; not written. */
     val tokenUsage: TokenUsage? = null,
     val stats: DiffStats? = null,
     val topics: List<TopicSummary>? = null,

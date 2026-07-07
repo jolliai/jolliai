@@ -139,6 +139,45 @@ ${if (isDark) darkVars() else lightVars()}
     opacity: 0; pointer-events: none; transition: all 0.18s ease;
   }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* ── Branch token/cost banner (under the heading) ── */
+  .tmeter {
+    border: 1px solid var(--border-light); border-radius: 10px;
+    padding: 10px 14px; margin: 4px 0 14px; background: var(--panel-bg);
+  }
+  .tmeter-na { padding: 8px 14px; }
+  .tmeter-head {
+    display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
+    font-size: 0.86em; color: var(--text-secondary);
+  }
+  .tmeter-total {
+    font-size: 1.05em; font-weight: 700; color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+  }
+  .tmeter-na .tmeter-total {
+    font-size: 0.9em; font-weight: 400; font-style: italic; color: var(--text-tertiary);
+  }
+  .tmeter-cost { color: var(--text-primary); }
+  .tmeter-note { color: var(--text-tertiary); }
+  .tmeter-help {
+    margin-left: auto; width: 15px; height: 15px; line-height: 15px; text-align: center;
+    border: 1px solid var(--border-light); border-radius: 50%; font-size: 0.78em;
+    color: var(--text-tertiary); cursor: help; flex-shrink: 0;
+  }
+  .tmeter-bar {
+    display: flex; width: 100%; height: 6px; border-radius: 3px; overflow: hidden;
+    margin-top: 8px; background: var(--code-block-bg);
+  }
+  .tmeter-bar > span { display: block; height: 100%; }
+  .tmeter-legend {
+    display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 7px;
+    font-size: 0.8em; color: var(--text-secondary);
+  }
+  .tmeter-legend span { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
+  .lg-dot { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; display: inline-block; }
+  .seg-in { background: var(--gs-added); }
+  .seg-out { background: var(--link-fg); }
+  .seg-cache { background: rgba(128,128,128,0.55); }
 """
 
     private fun darkVars() = """

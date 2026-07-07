@@ -2,6 +2,7 @@ package ai.jolli.jollimemory.toolwindow.views
 
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.E2eTestScenario
+import ai.jolli.jollimemory.toolwindow.BranchTokenTotals
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
@@ -20,6 +21,7 @@ class CreatePrHtmlBuilderTest {
         title: String = "feat: redesign",
         e2e: List<E2eTestScenario> = emptyList(),
         hasUnpushedChanges: Boolean = true,
+        branchTokenTotals: BranchTokenTotals? = null,
     ) = CreatePrData.ViewModel(
         branch = "feature/x",
         mainBranch = "main",
@@ -39,6 +41,7 @@ class CreatePrHtmlBuilderTest {
         signedIn = signedIn,
         includedSummaries = listOf(summary("aaaaaaaa1111", "feat: redesign")),
         hasUnpushedChanges = hasUnpushedChanges,
+        branchTokenTotals = branchTokenTotals,
     )
 
     @Test
@@ -127,5 +130,39 @@ class CreatePrHtmlBuilderTest {
         val html = CreatePrHtmlBuilder.buildHtml(vm(title = "<img src=x onerror=alert(1)>"), true, "")
         html shouldContain "&lt;img src=x onerror=alert(1)&gt;"
         html shouldNotContain "<img src=x onerror=alert(1)>"
+    }
+
+    @Test
+    fun `renders the branch token banner with total, cost, breakdown, and partial note`() {
+        val totals = BranchTokenTotals(
+            input = 123_400, output = 109_800, cacheRead = 0, cacheWrite = 41_200,
+            partial = true, estimatedCostUsd = 0.42,
+        )
+        val html = CreatePrHtmlBuilder.buildHtml(vm(branchTokenTotals = totals), true, "")
+        html shouldContain "274k"
+        html shouldContain "≈$0.42"
+        html shouldContain "this branch"
+        html shouldContain "&middot; partial"
+        html shouldContain "123k input"
+        html shouldContain "41.2k cached"
+        html shouldNotContain "not reported"
+    }
+
+    @Test
+    fun `renders the not-reported banner when the branch has no token totals`() {
+        val html = CreatePrHtmlBuilder.buildHtml(vm(branchTokenTotals = null), true, "")
+        html shouldContain "tmeter-na"
+        html shouldContain "Token usage not reported for this branch"
+    }
+
+    @Test
+    fun `shows cost N-A when totals carry tokens but no priced estimate`() {
+        val totals = BranchTokenTotals(
+            input = 1_000, output = 500, cacheRead = 0, cacheWrite = 0,
+            partial = false, estimatedCostUsd = null,
+        )
+        val html = CreatePrHtmlBuilder.buildHtml(vm(branchTokenTotals = totals), true, "")
+        html shouldContain "cost N/A"
+        html shouldNotContain "not reported"
     }
 }

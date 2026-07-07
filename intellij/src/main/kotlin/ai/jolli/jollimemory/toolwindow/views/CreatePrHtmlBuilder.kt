@@ -1,6 +1,8 @@
 package ai.jolli.jollimemory.toolwindow.views
 
 import ai.jolli.jollimemory.core.E2eTestScenario
+import ai.jolli.jollimemory.toolwindow.BranchTokenTotals
+import ai.jolli.jollimemory.toolwindow.CommitMemoryFormat
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.escAttr
 
 /**
@@ -42,6 +44,7 @@ object CreatePrHtmlBuilder {
 <body>
 <div class="pane" id="pane-pr">
   <h1>$heading</h1>
+  ${buildTokenBanner(vm.branchTokenTotals)}
   ${buildMetaStrip(vm)}
   ${buildShipSub(vm)}
   <div class="panel">
@@ -83,6 +86,60 @@ object CreatePrHtmlBuilder {
 </body>
 </html>"""
     }
+
+    /**
+     * Branch-level token/cost banner shown under the heading — the aggregate
+     * counterpart of the per-memory meter in the detail webview. Sums input +
+     * output + cache-creation tokens and the estimated USD cost across every
+     * committed memory on the branch (via [CommitMemoryFormat.aggregateTokens]).
+     * Three states mirror the detail meter: full breakdown, total-only, and the
+     * "not reported" empty state. Segment widths use inline `style="width"` — the
+     * IntelliJ JCEF webview enforces no CSP (see [CreatePrScriptBuilder]).
+     */
+    private fun buildTokenBanner(totals: BranchTokenTotals?): String {
+        if (totals == null || !totals.hasData) {
+            return """<div class="tmeter tmeter-na">""" +
+                """<div class="tmeter-head">""" +
+                """<span class="tmeter-total">Token usage not reported for this branch</span>""" +
+                """<span class="tmeter-help" title="$USAGE_HELP">?</span>""" +
+                """</div></div>"""
+        }
+        val input = totals.input
+        val output = totals.output
+        val cached = totals.cached
+        val segSum = (input + output + cached).coerceAtLeast(1)
+        val wIn = Math.round(input * 100.0 / segSum).toInt()
+        val wOut = Math.round(output * 100.0 / segSum).toInt()
+        val wCache = maxOf(0, 100 - wIn - wOut)
+        val cost = totals.estimatedCostUsd
+        val costStr = if (cost != null && cost > 0.0) CommitMemoryFormat.formatCost(cost) else "cost N/A"
+        val partial = if (totals.partial) """<span class="tmeter-note">&middot; partial</span>""" else ""
+        return """<div class="tmeter">""" +
+            """<div class="tmeter-head">""" +
+            """<span class="tmeter-total">${CommitMemoryFormat.formatTokens(totals.total)}</span> tokens """ +
+            """<span class="tmeter-cost">&middot; $costStr</span> """ +
+            """<span class="tmeter-note">&middot; this branch</span>""" +
+            partial +
+            """<span class="tmeter-help" title="$USAGE_HELP">?</span>""" +
+            """</div>""" +
+            """<div class="tmeter-bar">""" +
+            """<span class="seg-in" style="width:$wIn%"></span>""" +
+            """<span class="seg-out" style="width:$wOut%"></span>""" +
+            """<span class="seg-cache" style="width:$wCache%"></span>""" +
+            """</div>""" +
+            """<div class="tmeter-legend">""" +
+            """<span><i class="lg-dot seg-in"></i>${CommitMemoryFormat.formatTokens(input)} input</span>""" +
+            """<span><i class="lg-dot seg-out"></i>${CommitMemoryFormat.formatTokens(output)} output</span>""" +
+            """<span><i class="lg-dot seg-cache"></i>${CommitMemoryFormat.formatTokens(cached)} cached</span>""" +
+            """</div></div>"""
+    }
+
+    /** Tooltip explaining what the branch token total counts and how cost is derived. */
+    private const val USAGE_HELP =
+        "Sums input + output + cache-creation tokens across every committed memory on this branch " +
+            "(cache reads are excluded — they double-count). The cost is a cache-aware estimate priced " +
+            "per model at write time; memories from sources that don't report usage are omitted, so both " +
+            "numbers are lower bounds."
 
     private fun buildMetaStrip(vm: CreatePrData.ViewModel): String {
         val countLabel = if (vm.memoryCount == 1) "memory" else "memories"

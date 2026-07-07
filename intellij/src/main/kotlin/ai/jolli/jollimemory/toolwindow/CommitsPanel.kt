@@ -566,9 +566,10 @@ class CommitsPanel(
     private fun buildSubLine(commit: CommitSummaryBrief): String {
         // Always present, so the row reads consistently even with no usage data.
         // Append the per-model cost estimate when this memory carries one.
-        val tokenText = commit.tokenUsage?.let { u ->
-            val base = "${CommitMemoryFormat.formatTokens(u.total)} tokens"
-            u.estimatedCostUsd?.let { "$base · ${CommitMemoryFormat.formatCost(it)}" } ?: base
+        val tokenText = commit.conversationTokenBreakdown?.let { bd ->
+            val total = bd.input + bd.output + bd.cached
+            val base = "${CommitMemoryFormat.formatTokens(total)} tokens"
+            commit.estimatedCostUsd?.let { "$base · ${CommitMemoryFormat.formatCost(it)}" } ?: base
         } ?: "N/A tokens"
         return listOf(formatShortRelativeDate(commit.date), commit.shortHash, tokenText).joinToString(" · ")
     }

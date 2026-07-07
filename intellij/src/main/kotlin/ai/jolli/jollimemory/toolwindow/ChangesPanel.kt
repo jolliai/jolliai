@@ -7,6 +7,7 @@ import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffManager
 import com.intellij.diff.requests.SimpleDiffRequest
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationActivationListener
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.project.Project
@@ -17,6 +18,7 @@ import com.intellij.openapi.vfs.newvfs.BulkFileListener
 import com.intellij.openapi.vfs.newvfs.events.VFileEvent
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
+import com.intellij.openapi.wm.IdeFrame
 import com.intellij.util.messages.MessageBusConnection
 import com.intellij.icons.AllIcons
 import com.intellij.util.ui.JBUI
@@ -77,6 +79,24 @@ class ChangesPanel(
     private var changesExpanded = false
     private var debounceTimer: Timer? = null
     private var gitChangeDebounceTimer: Timer? = null
+    /**
+     * Repeating poll that catches file changes made OUTSIDE the IDE (e.g. Claude
+     * Code editing files from a terminal). IntelliJ's VFS_CHANGES topic only fires
+     * after the IDE refreshes its VFS — which for external writes happens on
+     * window focus-gain, not immediately — so the VFS listener alone misses them.
+     * `refreshFromGit()` reads `git status` off disk directly (independent of the
+     * VFS), so a periodic tick reliably surfaces external changes. Runs only while
+     * the panel is showing; dedupes so an unchanged tree is a cheap no-op.
+     */
+    private var pollTimer: Timer? = null
+    /**
+     * Signature of the changed-file set currently rendered. Refreshes short-circuit
+     * when the new set matches this, so the 2s poll (and unrelated in-IDE saves)
+     * neither flicker the list nor wipe the user's manual selections — the reset
+     * happens only when the set genuinely changes. Null forces the next render
+     * (initial load, and after an initializing/disabled state).
+     */
+    private var lastRenderedSignature: String? = null
     /** Project-level bus for GIT_REPO_CHANGE events. */
     private val projectBusConnection: MessageBusConnection = project.messageBus.connect()
     /** Application-level bus for VFS_CHANGES (application-level topic). */
@@ -126,6 +146,24 @@ class ChangesPanel(
             com.intellij.openapi.vcs.VcsListener { scheduleGitChangeRefresh() },
         )
 
+        // Focus-gain: when the IDE window is re-activated (e.g. the user alt-tabs
+        // back after Claude Code edited files in a terminal), refresh immediately
+        // so the panel is current the moment they look at it.
+        appBusConnection.subscribe(
+            ApplicationActivationListener.TOPIC,
+            object : ApplicationActivationListener {
+                override fun applicationActivated(ideFrame: IdeFrame) = scheduleDebouncedRefresh()
+            },
+        )
+
+        // Live poll for external changes while the panel is on screen (see pollTimer).
+        // The Swing Timer fires on the EDT, so the isShowing check is thread-safe;
+        // refresh() is deduped, making an unchanged tree a cheap no-op.
+        pollTimer = Timer(2000) { if (isShowing) refresh() }.apply {
+            isRepeats = true
+            start()
+        }
+
         // Initial load
         ApplicationManager.getApplication().executeOnPooledThread { refreshFromGit() }
     }
@@ -169,18 +207,41 @@ class ChangesPanel(
             return
         }
 
-        try {
-            changes = service.getChangedFiles()
+        val newChanges = try {
+            service.getChangedFiles()
         } catch (_: Exception) {
-            changes = emptyList()
+            emptyList()
         }
+        // Dedupe: if the changed-file SET is identical to what's already rendered,
+        // do nothing — no re-render (no flicker) and, crucially, no selection reset.
+        // This is what makes the 2s poll and unrelated in-IDE saves cheap and
+        // non-destructive; the reset below runs only on a genuine change.
+        val signature = changesSignature(newChanges)
+        if (signature == lastRenderedSignature) return
+        changes = newChanges
         // Reset selection to each file's default whenever the working tree changes.
         selectedStates.clear()
         changes.forEach { selectedStates.add(it.isSelected) }
-        SwingUtilities.invokeLater { if (refreshVersion == myVersion) updateFileList() }
+        SwingUtilities.invokeLater {
+            if (refreshVersion == myVersion) {
+                lastRenderedSignature = signature
+                updateFileList()
+            }
+        }
     }
 
+    /**
+     * Order-sensitive signature of the changed-file set (status code + path per
+     * file). Two refreshes with the same signature render identically, so the
+     * dedupe in [refreshFromGit] can skip the second one.
+     */
+    private fun changesSignature(list: List<FileChange>): String =
+        list.joinToString("\n") { "${it.statusCode} ${it.relativePath}" }
+
     private fun showInitializing() {
+        // Force the next data refresh to render even if the file set matches what
+        // was shown before this initializing/disabled state (dedupe would else skip it).
+        lastRenderedSignature = null
         removeAll()
         emptyLabel.text = "<html><center>Initializing Jolli Memory...</center></html>"
         add(emptyLabel, BorderLayout.CENTER)
@@ -629,6 +690,7 @@ class ChangesPanel(
         service.removeStatusListener(statusListener)
         debounceTimer?.stop()
         gitChangeDebounceTimer?.stop()
+        pollTimer?.stop()
         projectBusConnection.disconnect()
         appBusConnection.disconnect()
     }
