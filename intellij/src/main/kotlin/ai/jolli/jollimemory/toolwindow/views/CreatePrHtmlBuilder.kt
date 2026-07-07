@@ -137,9 +137,9 @@ object CreatePrHtmlBuilder {
     /** Tooltip explaining what the branch token total counts and how cost is derived. */
     private const val USAGE_HELP =
         "Sums input + output + cache-creation tokens across every committed memory on this branch " +
-            "(cache reads are excluded — they double-count). The cost is a cache-aware estimate priced " +
-            "per model at write time; memories from sources that don't report usage are omitted, so both " +
-            "numbers are lower bounds."
+            "(cache reads are excluded — they double-count). The cost is a cache-aware estimate: priced per " +
+            "model when known, otherwise at Sonnet rates; memories from sources that don't report usage are " +
+            "omitted, so both numbers are approximate."
 
     private fun buildMetaStrip(vm: CreatePrData.ViewModel): String {
         val countLabel = if (vm.memoryCount == 1) "memory" else "memories"

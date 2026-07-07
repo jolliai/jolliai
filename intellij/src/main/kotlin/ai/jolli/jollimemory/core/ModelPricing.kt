@@ -94,4 +94,23 @@ object ModelPricing {
 		}
 		return total
 	}
+
+	/** Model id whose list price backs the model-unknown fallback estimate. */
+	const val FALLBACK_ESTIMATE_MODEL: String = "claude-sonnet-5"
+
+	/**
+	 * Rough cost estimate for a token breakdown when the per-model split is unknown
+	 * (older/legacy summaries recorded tokens but not conversationModels). Prices the
+	 * whole breakdown at Sonnet list rates — matching the VS Code detail meter
+	 * (`SONNET_*_PER_TOKEN` in `SummaryUtils.ts`) so the tools agree on the fallback
+	 * figure. Deliberately approximate: the true model may be cheaper (Haiku) or
+	 * dearer (Opus), so callers use this only when no model is recorded and the UI
+	 * keeps the leading "≈". Returns 0.0 for an empty breakdown.
+	 */
+	fun estimateSonnetCostUsd(breakdown: ConversationTokenBreakdown): Double {
+		val p = MODEL_PRICES.getValue(FALLBACK_ESTIMATE_MODEL)
+		return (breakdown.input * p.inputPerMTok +
+			breakdown.output * p.outputPerMTok +
+			breakdown.cached * p.cacheWritePerMTok) / 1_000_000.0
+	}
 }

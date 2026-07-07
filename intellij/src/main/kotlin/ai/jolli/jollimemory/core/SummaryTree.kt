@@ -114,16 +114,19 @@ object SummaryTree {
     }
 
     /**
-     * Recursively sums the estimated USD cost across the tree. Per node, prefers the stored
-     * [CommitSummary.estimatedCostUsd]; when absent, re-derives it from [CommitSummary.conversationModels]
-     * at current [ModelPricing] rates — the SAME fallback the Commits-list brief applies, so opening a
-     * memory's detail view never loses a cost the list showed. 0.0 only when a node carries neither a
-     * priced estimate nor priced models (a lower bound on legacy/unpriced trees).
+     * Recursively sums the estimated USD cost across the tree. Per node it prefers, in order:
+     * the stored [CommitSummary.estimatedCostUsd]; then a re-price of
+     * [CommitSummary.conversationModels] at current [ModelPricing] rates; then — for a
+     * model-unknown, token-only memory — a Sonnet-rate estimate of the breakdown
+     * ([ModelPricing.estimateSonnetCostUsd], matching the VS Code detail meter). This is the
+     * SAME precedence the Commits-list brief applies, so opening a memory's detail view never
+     * loses a cost the list showed. 0.0 only when a node has no priced estimate, no models, and
+     * no token breakdown.
      */
     fun aggregateEstimatedCost(node: CommitSummary): Double {
         val own = node.estimatedCostUsd
-            ?: node.conversationModels?.let { ModelPricing.estimateCostUsd(it) }
-            ?: 0.0
+            ?: node.conversationModels?.let { ModelPricing.estimateCostUsd(it) }?.takeIf { it > 0.0 }
+            ?: ModelPricing.estimateSonnetCostUsd(ownBreakdown(node))
         return own + (node.children ?: emptyList()).sumOf { aggregateEstimatedCost(it) }
     }
 
