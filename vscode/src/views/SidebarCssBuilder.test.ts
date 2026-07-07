@@ -659,9 +659,12 @@ describe("onboarding panel styles", () => {
 		const css = buildSidebarCss();
 		expect(css).toContain(".token-bar");
 		expect(css).toContain(".token-seg--input");
-		expect(css).toContain(".token-seg--w");
 		// cached segment + legend swatch, plus the "?" help affordance row.
 		expect(css).toContain(".token-seg--cached");
+		// Widths are exact percentages set via el.style.width (CSP-safe property
+		// write), so no bucketed width classes exist anymore.
+		expect(css).not.toContain(".token-seg--w");
+		expect(css).not.toContain(".token-seg--present");
 		expect(css).toContain(".tk-leg--cached::before");
 		expect(css).toContain(".token-bar-help");
 		expect(css).toContain(".token-bar-label-row");

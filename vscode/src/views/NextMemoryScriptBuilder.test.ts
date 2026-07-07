@@ -46,9 +46,13 @@ describe("buildNextMemoryScript", () => {
 		expect(js).toContain("'gs gs-' + item.gitStatus");
 	});
 
-	it("emits CSP-safe bucketed segment width classes for the token bar (no inline style)", () => {
+	it("sets exact token-bar segment widths via the style property, not an inline style attribute (CSP-safe)", () => {
 		const js = buildNextMemoryScript();
-		expect(js).toContain("seg-in seg--w");
+		// Widths are exact percentages set as a JS property write (allowed under
+		// CSP), replacing the old 10%-bucket width classes (which hid sub-10%
+		// segments). No inline style="…" attribute is ever emitted.
+		expect(js).toContain("s.style.width = pct + '%'");
+		expect(js).not.toContain("seg--w");
 		expect(js).not.toContain("style=");
 	});
 

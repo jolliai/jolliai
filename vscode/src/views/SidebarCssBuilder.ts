@@ -1946,8 +1946,10 @@ export function buildSidebarCss(): string {
      .token-bar       horizontal pill bar (input=green / output=blue)
      .token-seg       one colored segment inside the bar
      .token-bar-legend two-item row: "<n> input  <n> output"
-     Width classes .token-seg--wN (N = 0..100 step 10) set the INPUT segment
-     width; the OUTPUT segment (no width class) fills the remainder via flex. */
+     Segment widths are exact percentages set as a JS property (el.style.width)
+     by renderTokenBar — CSP forbids an inline style attribute but allows the
+     property write — so there are no bucketed width classes. Mirrors the
+     memory-detail bar (SummaryHtmlBuilder buildTokenMeter). */
   .token-bar-wrap { padding: 4px 12px 8px; }
   /* Label line + trailing "?" help affordance share one row so the icon hugs
      the right edge (margin-left:auto) without an inline style. */
@@ -1961,23 +1963,10 @@ export function buildSidebarCss(): string {
   .token-seg--input { background: var(--vscode-charts-green, #4ec9b0); }
   /* Cached sits between input and output as a neutral gray segment. */
   .token-seg--cached { background: var(--vscode-descriptionForeground); opacity: 0.5; }
-  .token-seg--output { background: var(--vscode-charts-blue, #4fc1ff); flex: 1 1 auto; }
+  .token-seg--output { background: var(--vscode-charts-blue, #4fc1ff); }
   .token-bar-legend { display: flex; gap: 12px; margin-top: 4px; font-size: 0.8em; color: var(--vscode-descriptionForeground); }
   .tk-leg--input::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-charts-green, #4ec9b0); margin-right: 4px; vertical-align: middle; }
   .tk-leg--output::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-charts-blue, #4fc1ff); margin-right: 4px; vertical-align: middle; }
   .tk-leg--cached::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-descriptionForeground); opacity: 0.5; margin-right: 4px; vertical-align: middle; }
-  /* Bucketed input-segment width classes (0..100 in steps of 10).
-     The input segment gets one of these; output fills the rest via flex:1 1 auto. */
-  .token-seg--w0   { width: 0%; }
-  .token-seg--w10  { width: 10%; }
-  .token-seg--w20  { width: 20%; }
-  .token-seg--w30  { width: 30%; }
-  .token-seg--w40  { width: 40%; }
-  .token-seg--w50  { width: 50%; }
-  .token-seg--w60  { width: 60%; }
-  .token-seg--w70  { width: 70%; }
-  .token-seg--w80  { width: 80%; }
-  .token-seg--w90  { width: 90%; }
-  .token-seg--w100 { width: 100%; }
   `;
 }

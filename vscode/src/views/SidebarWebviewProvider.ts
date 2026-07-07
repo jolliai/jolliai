@@ -376,8 +376,11 @@ export interface SidebarWebviewDeps {
 	 * Returns aggregated LLM token counts across all committed summaries on
 	 * the current branch. Called alongside `pushCommits` so the token bar
 	 * renders immediately when commits data arrives. Optional: when absent,
-	 * no `branch:tokenStats` message is posted and the token bar stays hidden.
-	 * Must never reject — caller uses `.catch(() => undefined)`.
+	 * no `branch:tokenStats` message is posted (the bar keeps whatever it last
+	 * showed). When present, a message is posted on every refresh — INCLUDING a
+	 * zero-total result — so a switch to an empty branch clears any prior bar
+	 * instead of stranding a stale one. Must never reject — caller uses
+	 * `.catch(() => undefined)`.
 	 */
 	getBranchTokenStats?: () => Promise<{
 		input: number;
@@ -1899,19 +1902,23 @@ export class SidebarWebviewProvider
 					// NOT input+output+cached: a branch with legacy roots that carry the
 					// scalar but no breakdown would otherwise read as LESS than the sum of
 					// its own rows. The coloured segments stay a floor of what's attributable.
-					const total = stats.total;
-					if (total > 0) {
-						this.postMessage({
-							type: "branch:tokenStats",
-							input: stats.input,
-							output: stats.output,
-							cached: stats.cached,
-							total,
-							reporting: stats.reporting,
-							memories: stats.memories,
-							scope: "branch",
-						});
-					}
+					// Post unconditionally, INCLUDING total === 0. Skipping the
+					// zero-total case leaves the webview's last `state.tokenStats`
+					// intact — so switching to a fresh/empty branch would keep the
+					// PREVIOUS branch's token bar on screen (a stale 300M+ bar above
+					// the "Start coding" empty state). The webview hides the bar when
+					// total === 0 (renderTokenBar returns null), so posting zeros is
+					// the self-healing reset; withholding the message is the bug.
+					this.postMessage({
+						type: "branch:tokenStats",
+						input: stats.input,
+						output: stats.output,
+						cached: stats.cached,
+						total: stats.total,
+						reporting: stats.reporting,
+						memories: stats.memories,
+						scope: "branch",
+					});
 				})
 				.catch(() => undefined);
 		}
