@@ -66,6 +66,7 @@ const {
 	collectSortedTopics,
 	escAttr,
 	escHtml,
+	estimateConversationCostUsd,
 	formatDate,
 	formatFullDate,
 	formatProviderLabel,
@@ -74,53 +75,62 @@ const {
 	getDisplayDate,
 	padIndex,
 	renderCalloutText,
-	SONNET_CACHE_WRITE_PER_TOKEN,
-	SONNET_INPUT_PER_TOKEN,
-	SONNET_OUTPUT_PER_TOKEN,
 	timeAgo,
-} = vi.hoisted(() => ({
-	collectSortedTopics: vi.fn(
-		(): {
-			topics: Array<unknown>;
-			sourceNodes: Array<unknown>;
-		} => ({
-			topics: [],
-			sourceNodes: [],
+} = vi.hoisted(() => {
+	// Mirrors the real TokenCost.ts constants — used only inside the
+	// estimateConversationCostUsd mock below.
+	const SONNET_INPUT_PER_TOKEN = 3 / 1_000_000;
+	const SONNET_OUTPUT_PER_TOKEN = 15 / 1_000_000;
+	const SONNET_CACHE_WRITE_PER_TOKEN = 3.75 / 1_000_000;
+	return {
+		collectSortedTopics: vi.fn(
+			(): {
+				topics: Array<unknown>;
+				sourceNodes: Array<unknown>;
+			} => ({
+				topics: [],
+				sourceNodes: [],
+			}),
+		),
+		escAttr: vi.fn((s: string) => s),
+		escHtml: vi.fn((s: string) => s),
+		// Mirrors the real TokenCost.ts implementation — these format visible
+		// token-meter output the tests assert on, so a stub would break every
+		// assertion checking for "1.4M"/"96k"/"≈$X.XX" text in the rendered HTML.
+		estimateConversationCostUsd: vi.fn(
+			(b: { input: number; output: number; cached: number } | undefined, total: number) =>
+				b
+					? b.input * SONNET_INPUT_PER_TOKEN +
+						b.output * SONNET_OUTPUT_PER_TOKEN +
+						b.cached * SONNET_CACHE_WRITE_PER_TOKEN
+					: total * SONNET_INPUT_PER_TOKEN,
+		),
+		formatDate: vi.fn(() => "Jan 1, 2026"),
+		formatFullDate: vi.fn(() => "January 1, 2026 at 12:00 PM"),
+		// Default to undefined so existing footer assertions stay stable; tests
+		// that exercise provider attribution override via .mockReturnValueOnce.
+		formatProviderLabel: vi.fn((): string | undefined => undefined),
+		formatSonnetCostEstimate: vi.fn((costUsd: number) =>
+			costUsd >= 0.01 ? `≈$${costUsd.toFixed(2)}` : "<$0.01",
+		),
+		formatTokensCompact: vi.fn((n: number) => {
+			if (n >= 999_500) {
+				return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+			}
+			if (n >= 1_000) {
+				return `${Math.round(n / 1_000)}k`;
+			}
+			return String(n);
 		}),
-	),
-	escAttr: vi.fn((s: string) => s),
-	escHtml: vi.fn((s: string) => s),
-	formatDate: vi.fn(() => "Jan 1, 2026"),
-	formatFullDate: vi.fn(() => "January 1, 2026 at 12:00 PM"),
-	// Default to undefined so existing footer assertions stay stable; tests
-	// that exercise provider attribution override via .mockReturnValueOnce.
-	formatProviderLabel: vi.fn((): string | undefined => undefined),
-	// Mirrors the real SummaryUtils.ts implementations — these format visible
-	// token-meter output the tests assert on, so a stub would break every
-	// assertion checking for "1.4M"/"96k"/"≈$X.XX" text in the rendered HTML.
-	formatSonnetCostEstimate: vi.fn((costUsd: number) =>
-		costUsd >= 0.01 ? `≈$${costUsd.toFixed(2)}` : "<$0.01",
-	),
-	formatTokensCompact: vi.fn((n: number) => {
-		if (n >= 1_000_000) {
-			return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
-		}
-		if (n >= 1_000) {
-			return `${Math.round(n / 1_000)}k`;
-		}
-		return String(n);
-	}),
-	getDisplayDate: vi.fn(
-		(e: { generatedAt?: string; commitDate: string }) =>
-			e.generatedAt || e.commitDate,
-	),
-	padIndex: vi.fn((i: number) => String(i + 1).padStart(2, "0")),
-	renderCalloutText: vi.fn((s: string) => s),
-	SONNET_CACHE_WRITE_PER_TOKEN: 3.75 / 1_000_000,
-	SONNET_INPUT_PER_TOKEN: 3 / 1_000_000,
-	SONNET_OUTPUT_PER_TOKEN: 15 / 1_000_000,
-	timeAgo: vi.fn(() => "3 hours ago"),
-}));
+		getDisplayDate: vi.fn(
+			(e: { generatedAt?: string; commitDate: string }) =>
+				e.generatedAt || e.commitDate,
+		),
+		padIndex: vi.fn((i: number) => String(i + 1).padStart(2, "0")),
+		renderCalloutText: vi.fn((s: string) => s),
+		timeAgo: vi.fn(() => "3 hours ago"),
+	};
+});
 
 // ─── vi.mock declarations ───────────────────────────────────────────────────
 
@@ -145,6 +155,7 @@ vi.mock("./SummaryUtils.js", () => ({
 	collectSortedTopics,
 	escAttr,
 	escHtml,
+	estimateConversationCostUsd,
 	formatDate,
 	formatFullDate,
 	formatProviderLabel,
@@ -153,9 +164,6 @@ vi.mock("./SummaryUtils.js", () => ({
 	getDisplayDate,
 	padIndex,
 	renderCalloutText,
-	SONNET_CACHE_WRITE_PER_TOKEN,
-	SONNET_INPUT_PER_TOKEN,
-	SONNET_OUTPUT_PER_TOKEN,
 	timeAgo,
 }));
 

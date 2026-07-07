@@ -13,6 +13,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
 	aggregateStats: vi.fn(),
 	aggregateTurns: vi.fn(),
+	aggregateConversationTokens: vi.fn(),
+	aggregateConversationTokenBreakdown: vi.fn(),
 	formatDurationLabel: vi.fn(),
 	resolveDiffStats: vi.fn(),
 	collectSortedTopics: vi.fn(),
@@ -26,6 +28,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock("./SummaryTree.js", () => ({
 	aggregateStats: mocks.aggregateStats,
 	aggregateTurns: mocks.aggregateTurns,
+	aggregateConversationTokens: mocks.aggregateConversationTokens,
+	aggregateConversationTokenBreakdown: mocks.aggregateConversationTokenBreakdown,
 	formatDurationLabel: mocks.formatDurationLabel,
 	resolveDiffStats: mocks.resolveDiffStats,
 }));
@@ -101,6 +105,10 @@ function setupDefaults(
 		return { filesChanged: 0, insertions: 0, deletions: 0 };
 	});
 	mocks.aggregateTurns.mockReturnValue(5);
+	// Default to no task-token usage so the Task usage line is omitted, keeping
+	// these PR/clipboard-markdown regression assertions focused on their own concerns.
+	mocks.aggregateConversationTokens.mockReturnValue(0);
+	mocks.aggregateConversationTokenBreakdown.mockReturnValue({ input: 0, output: 0, cached: 0 });
 	mocks.formatDurationLabel.mockReturnValue("1 day (1 commit)");
 	mocks.formatFullDate.mockReturnValue("March 30, 2026 at 10:00 AM");
 	mocks.formatDate.mockReturnValue("Mar 30, 2026");

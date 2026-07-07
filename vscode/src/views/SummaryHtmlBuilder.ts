@@ -34,6 +34,7 @@ import {
 	collectSortedTopics,
 	escAttr,
 	escHtml,
+	estimateConversationCostUsd,
 	formatFullDate,
 	formatProviderLabel,
 	formatSonnetCostEstimate,
@@ -41,9 +42,6 @@ import {
 	getDisplayDate,
 	padIndex,
 	renderCalloutText,
-	SONNET_CACHE_WRITE_PER_TOKEN,
-	SONNET_INPUT_PER_TOKEN,
-	SONNET_OUTPUT_PER_TOKEN,
 	type TopicWithDate,
 	timeAgo,
 } from "./SummaryUtils.js";
@@ -557,10 +555,7 @@ export function buildPropTable(
  * the same underlying token counts.
  */
 function estimateCost(b: ConversationTokenBreakdown | undefined, total: number): string {
-	const cost = b
-		? b.input * SONNET_INPUT_PER_TOKEN + b.output * SONNET_OUTPUT_PER_TOKEN + b.cached * SONNET_CACHE_WRITE_PER_TOKEN
-		: total * SONNET_INPUT_PER_TOKEN;
-	return formatSonnetCostEstimate(cost);
+	return formatSonnetCostEstimate(estimateConversationCostUsd(b, total));
 }
 
 /**

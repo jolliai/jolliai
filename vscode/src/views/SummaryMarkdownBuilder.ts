@@ -13,6 +13,8 @@
  */
 
 import {
+	aggregateConversationTokenBreakdown,
+	aggregateConversationTokens,
 	aggregateTurns,
 	formatDurationLabel,
 	resolveDiffStats,
@@ -24,8 +26,11 @@ import type {
 import { pushFooter, pushPlansAndNotesSection, pushRecapSection } from "../../../cli/src/core/SummaryMarkdownBuilder.js";
 import {
 	collectSortedTopics,
+	estimateConversationCostUsd,
 	formatDate,
+	formatExactCostUsd,
 	formatFullDate,
+	formatTokensExact,
 	getDisplayDate,
 	padIndex,
 	type TopicWithDate,
@@ -85,6 +90,22 @@ function pushPropertiesSection(
 		lines.push(
 			`- **Conversations:** ${totalTurns} turn${totalTurns !== 1 ? "s" : ""}`,
 		);
+	}
+
+	// Task usage: token total + cache-aware cost estimate, aggregated across the
+	// whole consolidation tree (a squash/amend memory carries its tokens on folded
+	// children). Three states mirror the VS Code token meter; omit-when-zero matches
+	// the Conversations line above. The article shows EXACT figures (thousands-
+	// separated counts, precise $) rather than the compact form the UI token bar uses.
+	const totalTokens = aggregateConversationTokens(summary);
+	if (totalTokens > 0) {
+		const agg = aggregateConversationTokenBreakdown(summary);
+		const b = agg.input > 0 || agg.output > 0 || agg.cached > 0 ? agg : undefined;
+		const cost = formatExactCostUsd(estimateConversationCostUsd(b, totalTokens));
+		const split = b
+			? ` (${formatTokensExact(b.input)} input, ${formatTokensExact(b.output)} output, ${formatTokensExact(b.cached)} cached)`
+			: "";
+		lines.push(`- **Task usage:** ${formatTokensExact(totalTokens)} tokens · ${cost}${split}`);
 	}
 
 	const memoryDocUrl = summary.jolliDocUrl;
