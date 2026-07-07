@@ -297,6 +297,31 @@ class SummaryHtmlBuilderTest {
         }
     }
 
+    // ── Meta strip alignment (matches VS Code) ──────────────────────────────
+
+    @Nested
+    inner class MetaStrip {
+        @Test
+        fun `omits author, line changes, and conversation turns from the meta strip`() {
+            val html = SummaryHtmlBuilder.buildHtml(makeSummary(turns = 5))
+            // These no longer live in the sub-title strip.
+            html shouldNotContain "meta-author"
+            html shouldNotContain "meta-changes"
+            // Author still appears in the collapsed Details table.
+            html shouldContain "Alice"
+        }
+
+        @Test
+        fun `hoists the share link and export buttons onto the meta strip`() {
+            val html = SummaryHtmlBuilder.buildHtml(makeSummary())
+            html shouldContain """id="shareLinkBtn""""
+            html shouldContain "meta-share"
+            html shouldContain "meta-export"
+            // The separate header-actions row is gone.
+            html shouldNotContain """class="header-actions""""
+        }
+    }
+
     // ── Token/cost banner ──────────────────────────────────────────────────
 
     @Nested
