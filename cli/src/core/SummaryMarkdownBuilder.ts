@@ -17,7 +17,14 @@ import {
 	padIndex,
 	type TopicWithDate,
 } from "./SummaryFormat.js";
-import { aggregateTurns, formatDurationLabel, resolveDiffStats } from "./SummaryTree.js";
+import {
+	aggregateConversationTokenBreakdown,
+	aggregateConversationTokens,
+	aggregateTurns,
+	formatDurationLabel,
+	resolveDiffStats,
+} from "./SummaryTree.js";
+import { estimateConversationCostUsd, formatExactCostUsd, formatTokensExact } from "./TokenCost.js";
 
 /**
  * Builds a Markdown string from a CommitSummary for clipboard export.
@@ -68,6 +75,23 @@ export function pushPropertiesSection(lines: Array<string>, summary: CommitSumma
 
 	if (totalTurns > 0) {
 		lines.push(`- **Conversations:** ${totalTurns} turn${totalTurns !== 1 ? "s" : ""}`);
+	}
+
+	// Task usage: token total + cache-aware cost estimate, aggregated across the
+	// whole consolidation tree (a squash/amend memory carries its tokens on folded
+	// children). Three states mirror the VS Code token meter; omit-when-zero matches
+	// the Conversations line above (no "not reported" state in a property list).
+	// The article shows EXACT figures (thousands-separated counts, precise $) rather
+	// than the compact form the space-constrained UI token bar uses.
+	const totalTokens = aggregateConversationTokens(summary);
+	if (totalTokens > 0) {
+		const agg = aggregateConversationTokenBreakdown(summary);
+		const b = agg.input > 0 || agg.output > 0 || agg.cached > 0 ? agg : undefined;
+		const cost = formatExactCostUsd(estimateConversationCostUsd(b, totalTokens));
+		const split = b
+			? ` (${formatTokensExact(b.input)} input, ${formatTokensExact(b.output)} output, ${formatTokensExact(b.cached)} cached)`
+			: "";
+		lines.push(`- **Task usage:** ${formatTokensExact(totalTokens)} tokens · ${cost}${split}`);
 	}
 
 	const memoryDocUrl = summary.jolliDocUrl;

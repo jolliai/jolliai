@@ -62,6 +62,42 @@ describe("buildMarkdown", () => {
 		expect(md).not.toContain("1 turns");
 	});
 
+	it("renders Task usage with cost and segment split when a breakdown is present", () => {
+		const md = buildMarkdown(
+			leaf({
+				conversationTokens: 3_000_000,
+				conversationTokenBreakdown: { input: 1_000_000, output: 1_000_000, cached: 1_000_000 },
+			}),
+		);
+		expect(md).toContain(
+			"**Task usage:** 3,000,000 tokens · $21.75 (1,000,000 input, 1,000,000 output, 1,000,000 cached)",
+		);
+	});
+
+	it("renders Task usage total + cost only when no breakdown is present", () => {
+		const md = buildMarkdown(leaf({ conversationTokens: 1_000_000 }));
+		expect(md).toContain("**Task usage:** 1,000,000 tokens · $3.00");
+		expect(md).not.toContain("input,");
+	});
+
+	it("omits Task usage entirely when there are no conversation tokens", () => {
+		const md = buildMarkdown(leaf());
+		expect(md).not.toContain("Task usage");
+	});
+
+	it("aggregates Task usage across the consolidation tree, not the root scalar", () => {
+		const md = buildMarkdown(
+			leaf({
+				conversationTokens: 0,
+				children: [
+					leaf({ commitHash: "child1", conversationTokens: 2_000_000 }),
+					leaf({ commitHash: "child2", conversationTokens: 1_000_000 }),
+				],
+			}),
+		);
+		expect(md).toContain("**Task usage:** 3,000,000 tokens");
+	});
+
 	it("renders Jolli Memory URL when present", () => {
 		const md = buildMarkdown(leaf({ jolliDocUrl: "https://acme.jolli.app/articles?doc=42" }));
 		expect(md).toContain("**Jolli Memory:**");

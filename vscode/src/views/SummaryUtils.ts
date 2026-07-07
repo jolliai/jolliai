@@ -29,6 +29,17 @@ export {
 
 export { escHtml, escMdLinkText, escMdUrl } from "../../../cli/src/core/MarkdownEscape.js";
 
+export {
+	estimateConversationCostUsd,
+	formatExactCostUsd,
+	formatSonnetCostEstimate,
+	formatTokensCompact,
+	formatTokensExact,
+	SONNET_CACHE_WRITE_PER_TOKEN,
+	SONNET_INPUT_PER_TOKEN,
+	SONNET_OUTPUT_PER_TOKEN,
+} from "../../../cli/src/core/TokenCost.js";
+
 import { escHtml } from "../../../cli/src/core/MarkdownEscape.js";
 import { resolveLlmCredentialSource } from "../../../cli/src/core/LlmClient.js";
 import { formatDate as coreFormatDate } from "../../../cli/src/core/SummaryFormat.js";
@@ -82,39 +93,6 @@ export function formatActiveProviderLabel(
  */
 export function buildBranchRelativePath(branch: string | undefined): string {
 	return sanitizeBranchSlug(branch);
-}
-
-// ─── Token/cost formatting (shared by the sidebar's token bar and the Commit
-// Memory panel's token meter, so the two surfaces never disagree on the same
-// number) ────────────────────────────────────────────────────────────────────
-
-/** Formats a token count compactly (e.g. `1443000` -> `1.4M`, `2000000` -> `2M`, `96000` -> `96k`). */
-export function formatTokensCompact(n: number): string {
-	// 999_500 is the point at which `Math.round(n / 1_000)` would round up to
-	// 1000 — promote to the `M` form so a count like 999_800 renders `1M`, not
-	// the nonsensical `1000k`.
-	if (n >= 999_500) {
-		return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
-	}
-	if (n >= 1_000) {
-		return `${Math.round(n / 1_000)}k`;
-	}
-	return String(n);
-}
-
-// Rough per-token $ constants at Sonnet pricing (per token, not per-million).
-// `cached` (= cache_creation) is priced at the cache-write rate, which is
-// pricier than a standard input token but cheaper than treating it as fresh
-// input twice over. This is a ballpark estimate, not a billing-accurate
-// figure — actual cost varies by model and by any cache-read savings not
-// represented here.
-export const SONNET_INPUT_PER_TOKEN = 3 / 1_000_000;
-export const SONNET_OUTPUT_PER_TOKEN = 15 / 1_000_000;
-export const SONNET_CACHE_WRITE_PER_TOKEN = 3.75 / 1_000_000;
-
-/** Formats a cache-aware $ estimate at Sonnet pricing as `"≈$X.XX"` / `"<$0.01"`. */
-export function formatSonnetCostEstimate(costUsd: number): string {
-	return costUsd >= 0.01 ? `≈$${costUsd.toFixed(2)}` : "<$0.01";
 }
 
 // ─── HTML escaping ────────────────────────────────────────────────────────────

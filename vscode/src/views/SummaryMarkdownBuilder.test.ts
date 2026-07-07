@@ -13,7 +13,33 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
 	aggregateStats: vi.fn(),
 	aggregateTurns: vi.fn(),
+	aggregateConversationTokens: vi.fn(),
+	aggregateConversationTokenBreakdown: vi.fn(),
 	formatDurationLabel: vi.fn(),
+	// Real implementations (mirroring cli/src/core/TokenCost.ts) so the "Task
+	// usage" line assertions exercise real Sonnet-pricing math, not a stub.
+	formatTokensExact: vi.fn((n: number) =>
+		Math.round(n)
+			.toString()
+			.replace(/\B(?=(\d{3})+(?!\d))/g, ","),
+	),
+	formatExactCostUsd: vi.fn((costUsd: number) => {
+		if (costUsd >= 0.01) return `$${costUsd.toFixed(2)}`;
+		if (costUsd > 0) return `$${costUsd.toFixed(4)}`;
+		return "$0.00";
+	}),
+	estimateConversationCostUsd: vi.fn(
+		(breakdown: { input: number; output: number; cached: number } | undefined, total: number) => {
+			const SONNET_INPUT_PER_TOKEN = 3 / 1_000_000;
+			const SONNET_OUTPUT_PER_TOKEN = 15 / 1_000_000;
+			const SONNET_CACHE_WRITE_PER_TOKEN = 3.75 / 1_000_000;
+			return breakdown
+				? breakdown.input * SONNET_INPUT_PER_TOKEN +
+						breakdown.output * SONNET_OUTPUT_PER_TOKEN +
+						breakdown.cached * SONNET_CACHE_WRITE_PER_TOKEN
+				: total * SONNET_INPUT_PER_TOKEN;
+		},
+	),
 	// resolveDiffStats: new helper that prefers node.diffStats (new data) and
 	// falls back to aggregateStats (legacy path). Tests that previously set up
 	// aggregateStats return values keep working without change.
@@ -43,8 +69,18 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
 	aggregateStats: mocks.aggregateStats,
 	aggregateTurns: mocks.aggregateTurns,
+	aggregateConversationTokens: mocks.aggregateConversationTokens,
+	aggregateConversationTokenBreakdown: mocks.aggregateConversationTokenBreakdown,
 	formatDurationLabel: mocks.formatDurationLabel,
 	resolveDiffStats: mocks.resolveDiffStats,
+}));
+
+// Mock the core TokenCost module (re-exported by the local SummaryUtils.js) so
+// the "Task usage" row assertions run against real Sonnet-pricing math.
+vi.mock("../../../cli/src/core/TokenCost.js", () => ({
+	formatTokensExact: mocks.formatTokensExact,
+	formatExactCostUsd: mocks.formatExactCostUsd,
+	estimateConversationCostUsd: mocks.estimateConversationCostUsd,
 }));
 
 // Mock the core SummaryFormat module (used by the core SummaryMarkdownBuilder)
@@ -125,6 +161,14 @@ function setupDefaults(
 		return { filesChanged: 0, insertions: 0, deletions: 0 };
 	});
 	mocks.aggregateTurns.mockReturnValue(5);
+	// Task usage line is omitted by default (totalTokens === 0); individual
+	// tests override these to exercise the three rendered states.
+	mocks.aggregateConversationTokens.mockReturnValue(0);
+	mocks.aggregateConversationTokenBreakdown.mockReturnValue({
+		input: 0,
+		output: 0,
+		cached: 0,
+	});
 	mocks.formatDurationLabel.mockReturnValue("1 day (1 commit)");
 	mocks.formatFullDate.mockReturnValue("March 30, 2026 at 10:00 AM");
 	mocks.formatDate.mockReturnValue("Mar 30, 2026");
@@ -219,6 +263,50 @@ describe("SummaryMarkdownBuilder", () => {
 				const md = buildMarkdown(summary);
 
 				expect(md).not.toContain("**Conversations:**");
+			});
+		});
+
+		describe("task usage row", () => {
+			it("renders tokens, cost, and input/output/cached split when a breakdown is present", () => {
+				const summary = makeSummary();
+				setupDefaults(summary);
+				mocks.aggregateConversationTokens.mockReturnValue(3_000_000);
+				mocks.aggregateConversationTokenBreakdown.mockReturnValue({
+					input: 1_000_000,
+					output: 1_000_000,
+					cached: 1_000_000,
+				});
+
+				const md = buildMarkdown(summary);
+
+				expect(md).toContain(
+					"- **Task usage:** 3,000,000 tokens · $21.75 (1,000,000 input, 1,000,000 output, 1,000,000 cached)",
+				);
+			});
+
+			it("renders tokens and cost without a split when the breakdown is all-zero", () => {
+				const summary = makeSummary();
+				setupDefaults(summary);
+				mocks.aggregateConversationTokens.mockReturnValue(1_000_000);
+				mocks.aggregateConversationTokenBreakdown.mockReturnValue({
+					input: 0,
+					output: 0,
+					cached: 0,
+				});
+
+				const md = buildMarkdown(summary);
+
+				expect(md).toContain("- **Task usage:** 1,000,000 tokens · $3.00");
+			});
+
+			it("omits the task usage row when totalTokens is 0", () => {
+				const summary = makeSummary();
+				setupDefaults(summary);
+				mocks.aggregateConversationTokens.mockReturnValue(0);
+
+				const md = buildMarkdown(summary);
+
+				expect(md).not.toContain("**Task usage:**");
 			});
 		});
 
