@@ -125,7 +125,9 @@ ${panes()}
   .share-overlay[hidden] { display: none; }
   .share-modal {
     width: 440px; max-width: 92vw; max-height: 86vh; overflow-y: auto;
-    background: var(--panel-bg); border: 1px solid var(--border-light);
+    /* Opaque surface (the editor background) so the card is fully readable over the dim
+       overlay — --panel-bg is a near-transparent tint meant to sit on top of the page. */
+    background: var(--bg); border: 1px solid var(--border-light);
     border-radius: 10px; padding: 16px 16px 14px; box-shadow: 0 12px 40px rgba(0,0,0,0.4);
   }
   .share-standalone { width: 100%; max-width: none; max-height: none; border: none; border-radius: 0; box-shadow: none; padding: 14px 16px; }
@@ -382,7 +384,7 @@ ${panes()}
 <head><meta charset="UTF-8" />
 <style>
 $css
-html, body { margin: 0; padding: 0; background: var(--panel-bg); color: var(--text-primary); }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text-primary); }
 </style>
 </head>
 <body>
