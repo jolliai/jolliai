@@ -406,7 +406,9 @@ ${renderScript()}
     if (msg.command === 'shareState') { shareRender(msg.state); }
     else if (msg.command === 'shareCopyResult') { shareFlashCopy(msg.ok === true); }
   });
-  shareOpen();
+  // Show the loading pane immediately; the host drives the first openShareModal from
+  // onLoadEnd (Kotlin → JS), so we don't depend on the JS→Kotlin bridge being ready at load.
+  shareShowPane('sharePaneLoading');
 </script>
 </body>
 </html>"""
