@@ -164,6 +164,31 @@ class SummaryTreeTest {
             SummaryTree.aggregateEstimatedCost(root) shouldBe 0.0
             SummaryTree.aggregateConversationTokenBreakdown(root) shouldBe ConversationTokenBreakdown(0, 0, 0)
         }
+
+        @Test
+        fun `re-derives cost from conversationModels when estimatedCostUsd is absent`() {
+            // Mirrors the Commits-list fallback: models recorded but no stored cost must still
+            // price out in the detail view (regression: opening a memory dropped the cost).
+            val node = makeLeaf().copy(
+                conversationTokens = 1_000_000,
+                conversationModels = listOf(
+                    ModelTokenUsage("claude-opus-4-8", ModelPricing.providerOf("claude-opus-4-8"), output = 1_000_000),
+                ),
+                estimatedCostUsd = null,
+            )
+            SummaryTree.aggregateEstimatedCost(node) shouldBe 25.0
+        }
+
+        @Test
+        fun `falls back to legacy tokenUsage for breakdown and total`() {
+            val node = makeLeaf().copy(
+                conversationTokens = null,
+                conversationTokenBreakdown = null,
+                tokenUsage = TokenUsage(inputTokens = 100, outputTokens = 50, cacheWriteTokens = 10),
+            )
+            SummaryTree.aggregateConversationTokenBreakdown(node) shouldBe ConversationTokenBreakdown(100, 50, 10)
+            SummaryTree.aggregateConversationTokens(node) shouldBe 160L
+        }
     }
 
     // ── countTopics ─────────────────────────────────────────────────────
