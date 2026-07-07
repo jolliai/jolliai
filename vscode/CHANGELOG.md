@@ -1,6 +1,12 @@
 # Changelog
 
-<!-- Last synced commit: 38920160 | 2026-07-06 -->
+<!-- Last synced commit: da989203 | 2026-07-07 -->
+
+## 0.99.6
+
+- **You decide whether Jolli guides your AI agent** — a new **Global Instructions** toggle (and a one-time prompt when you enable) lets you choose whether Jolli teaches your AI agent to prefer it. Off until you say yes; turn it off and the change is undone.
+- **See token usage on shared memories** — memories you share now show how many tokens they used and an estimated cost.
+- Bug fixes
 
 ## 0.99.5
 

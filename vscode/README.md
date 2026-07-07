@@ -129,7 +129,7 @@ Action buttons:
 
 Click **Share in Jolli** to publish the summary to your team's Jolli Space knowledge base. Jolli Space allows you to recall individual or shared memory for multiple devices or for different coding agent setups. Space team members can recall specific commits within the team.
 
-Plans and notes (both Markdown files and text snippets) are each uploaded as separate articles first, so their URLs appear in the summary. The summary itself is published last. 
+Plans and notes (both Markdown files and text snippets) are each uploaded as separate articles first, so their URLs appear in the summary. The summary itself is published last. Each shared memory carries a **Task usage** line — total tokens, a cost estimate, and the input / output / cached split, aggregated across squashed and amended commits.
 
 Requires a Jolli API Key configured via Settings (or auto-filled by **Sign In to Jolli** from the Status overlay).
 
@@ -226,7 +226,7 @@ Click the gear icon (`$(gear)`) in the view's title bar (or any **Open Settings*
 
 | Tab | What it controls |
 | -- | -- |
-| **AI Agents** | Per-source toggles for Claude / Codex / Gemini / OpenCode / Cursor / Copilot session tracking. Copilot CLI and VS Code Copilot Chat share a single switch. |
+| **AI Agents** | Per-source toggles for Claude / Codex / Gemini / OpenCode / Cursor / Copilot session tracking. Copilot CLI and VS Code Copilot Chat share a single switch. A **Global Instructions** toggle controls whether Jolli adds its "prefer these skills" note to your machine-global AI instruction files (`~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`, `~/.codex/AGENTS.md`) — off until you turn it on (or accept the one-time notice shown when you enable), and turning it off removes the note. |
 | **AI Summary** | **Provider** dropdown (**Anthropic** vs **Jolli**). The Anthropic card holds `apiKey`, `model`, and `maxTokens`. The Jolli card shows your sign-in state — *Signed-in & ready*, *Signed-in but missing key*, or *Signed-out* — and exposes `jolliApiKey` under an **Advanced** disclosure for power users. |
 | **Sync to Jolli** | Sign-in / sign-out for pushing memories to your Jolli Space. |
 | **Memory Bank** | The on-disk Markdown copy of your memories: pick a folder via **Browse…**, then optionally click **Migrate to Memory Bank** to re-migrate the current repo into a fresh `-N`-suffixed folder (the previous folder is left untouched). |
