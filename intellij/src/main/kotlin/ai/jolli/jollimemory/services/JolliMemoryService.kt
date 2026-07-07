@@ -764,6 +764,11 @@ val sb = StringBuilder()
                         ?: summary.conversationModels?.let {
                             ai.jolli.jollimemory.core.ModelPricing.estimateCostUsd(it).takeIf { c -> c > 0.0 }
                         }
+                        // Model-unknown, token-only memory (legacy / older producer): approximate at
+                        // Sonnet rates like VS Code, so the list shows a rough cost instead of nothing.
+                        ?: tokenBreakdown?.let {
+                            ai.jolli.jollimemory.core.ModelPricing.estimateSonnetCostUsd(it).takeIf { c -> c > 0.0 }
+                        }
                     e2eScenarioCount = summary.e2eTestGuide?.size ?: 0
                     isSyncedToJolli = summary.jolliDocId != null || summary.jolliDocUrl != null
                     jolliDocUrl = summary.jolliDocUrl

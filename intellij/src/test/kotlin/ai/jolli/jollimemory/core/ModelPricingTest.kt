@@ -67,4 +67,17 @@ class ModelPricingTest {
     fun `prices-as-of is an ISO date`() {
         ModelPricing.PRICES_AS_OF.matches(Regex("""\d{4}-\d{2}-\d{2}""")) shouldBe true
     }
+
+    @Test
+    fun `sonnet fallback prices a breakdown at sonnet rates`() {
+        // Sonnet: $3 input, $15 output, $3.75 cacheWrite per 1M.
+        ModelPricing.estimateSonnetCostUsd(
+            ConversationTokenBreakdown(input = 1_000_000, output = 1_000_000, cached = 1_000_000),
+        ) shouldBe (3.0 + 15.0 + 3.75)
+    }
+
+    @Test
+    fun `sonnet fallback is zero for an empty breakdown`() {
+        ModelPricing.estimateSonnetCostUsd(ConversationTokenBreakdown()) shouldBe 0.0
+    }
 }

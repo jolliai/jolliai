@@ -180,6 +180,19 @@ class SummaryTreeTest {
         }
 
         @Test
+        fun `estimates cost at Sonnet rates when neither cost nor models are present`() {
+            // Token-only memory (older producer): no stored cost, no models — the detail view
+            // still shows an approximate cost (Sonnet rates), matching VS Code.
+            val node = makeLeaf().copy(
+                conversationTokens = 3_000_000,
+                conversationTokenBreakdown = ConversationTokenBreakdown(1_000_000, 1_000_000, 1_000_000),
+                conversationModels = null,
+                estimatedCostUsd = null,
+            )
+            SummaryTree.aggregateEstimatedCost(node) shouldBe (3.0 + 15.0 + 3.75)
+        }
+
+        @Test
         fun `falls back to legacy tokenUsage for breakdown and total`() {
             val node = makeLeaf().copy(
                 conversationTokens = null,

@@ -472,8 +472,8 @@ ${buildTranscriptModal()}"""
     /** Tooltip explaining what the token total counts and how the cost is derived. */
     private const val USAGE_HELP =
         "Counts input + output + cache-creation tokens across all AI sessions folded into this memory " +
-            "(cache reads are excluded — they double-count). The cost is a cache-aware estimate priced per " +
-            "model at write time; actual cost varies by model."
+            "(cache reads are excluded — they double-count). The cost is a cache-aware estimate: priced per " +
+            "model when the model is known, otherwise estimated at Sonnet rates. Actual cost varies by model."
 
     /**
      * Builds the Jolli Memory link block. Now lives inside the Jolli ship card
