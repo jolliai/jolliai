@@ -458,7 +458,48 @@ class SettingsDialog(
             .addComponent(createMigrateButton(), 12)
             .panel))
 
+        // Historical memory — the re-entry point for the cold-start "build memory" flow.
+        // Runs a full-scope back-fill regardless of whether the tool-window card was
+        // dismissed; on success BackfillRunner clears the repo-wide dismiss marker, so a
+        // dismissed card can resurface. Mirrors the VS Code Memory Bank settings button.
+        panel.add(Box.createVerticalStrut(16))
+        panel.add(JBLabel("<html><b>Historical memory</b></html>").apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            border = JBUI.Borders.emptyBottom(2)
+        })
+        panel.add(JBLabel("<html><span style='color:gray'>Build memory for past commits that don't have one yet.</span></html>").apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            border = JBUI.Borders.emptyBottom(4)
+        })
+        panel.add(JPanel(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 0, 0)).apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            isOpaque = false
+            add(createGenerateMissingButton())
+        })
+
         return wrapTabContent(panel)
+    }
+
+    /**
+     * "Generate Missing Summaries" — full-scope back-fill (every own commit lacking a
+     * summary). Analog of the VS Code Memory Bank settings button. Shares [BackfillRunner]
+     * with the tool-window cold-start card, so progress + completion behave identically;
+     * an empty hash list maps to the CLI's `--all`. On success the runner clears the card's
+     * dismiss marker, which is how a dismissed repo gets the card back.
+     */
+    private fun createGenerateMissingButton(): JComponent {
+        return JButton("Generate Missing Summaries").apply {
+            toolTipText = "Generate memory for past commits that don't have one yet (uses on-disk Claude transcripts)"
+            addActionListener {
+                isEnabled = false
+                ai.jolli.jollimemory.backfill.BackfillRunner.run(
+                    project = project,
+                    service = service,
+                    hashes = emptyList(),
+                    onComplete = { javax.swing.SwingUtilities.invokeLater { isEnabled = true } },
+                )
+            }
+        }
     }
 
     private fun buildGeneralTab(): JComponent {
