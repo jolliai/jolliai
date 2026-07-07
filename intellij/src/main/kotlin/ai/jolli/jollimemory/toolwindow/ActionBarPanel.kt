@@ -62,10 +62,8 @@ class ActionBarPanel(
 		add(prBtn, BorderLayout.CENTER)
 		val east = JPanel(java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, JBUI.scale(4), 0)).apply {
 			isOpaque = false
-			// "Share" (share branch memories to a Jolli Space) isn't wired yet — keep it
-			// out of the bar until it does something. shareBtn stays constructed so
-			// setForeign() still compiles; it's just not added to the layout.
-			if (FeatureFlags.SHOW_UNFINISHED) add(shareBtn)
+			// "Share" creates a read-only share link for this branch's memories (see handleShare).
+			add(shareBtn)
 			add(moreBtn)
 		}
 		add(east, BorderLayout.EAST)
@@ -169,12 +167,14 @@ class ActionBarPanel(
 		panel.openCreatePrView()
 	}
 
+	/** Opens the read-only share dialog for the current branch's memories. */
 	private fun handleShare() {
-		Messages.showInfoMessage(
-			project,
-			"Share — share this branch's memories to your Jolli Space (action to be wired).",
-			"Share",
-		)
+		val branch = service.getGitOps()?.getCurrentBranch()
+		if (branch.isNullOrBlank()) {
+			Messages.showWarningDialog(project, "Could not determine the current branch.", "Share")
+			return
+		}
+		ShareLauncher.openForBranch(project, branch)
 	}
 
 	override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)

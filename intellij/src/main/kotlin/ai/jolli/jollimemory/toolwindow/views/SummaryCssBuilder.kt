@@ -1579,6 +1579,8 @@ $rootVars
       transition-duration: 0.01ms !important;
     }
   }
+
+${ShareWebview.css()}
 """
     }
 
