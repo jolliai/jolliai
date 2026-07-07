@@ -49,6 +49,18 @@ class JolliMemoryStartupActivity : ProjectActivity {
         log.info("JolliMemory: activating sync for project at $basePath")
         ai.jolli.jollimemory.sync.SyncActivation.activateSync(project, service)
 
+        // Cold-start back-fill signals (Kotlin analog of VS Code's computeColdStartSignals):
+        // decide whether to offer "build memory from your history" in the tool window. Runs
+        // on a pooled thread because it shells out to `jolli backfill --list-candidates`, so
+        // it never delays project startup; the tool window updates via a backfill listener.
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                service.computeColdStartSignals()
+            } catch (e: Exception) {
+                log.warn("Cold-start signal compute failed (ignored): ${e.message}")
+            }
+        }
+
         // Telemetry (JOLLI-1785): bootstrap anonymous, content-free usage
         // telemetry, fire app_installed once per machine, flush anything buffered
         // by prior sessions/hooks, and show the loud first-run notice once.
