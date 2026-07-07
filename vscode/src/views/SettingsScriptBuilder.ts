@@ -37,6 +37,7 @@ export function buildSettingsScript(): string {
   const openCodeEnabledInput = document.getElementById('openCodeEnabled');
   const cursorEnabledInput = document.getElementById('cursorEnabled');
   const copilotEnabledInput = document.getElementById('copilotEnabled');
+  const globalInstructionsInput = document.getElementById('globalInstructions');
   const localFolderInput = document.getElementById('localFolder');
   const browseLocalFolderBtn = document.getElementById('browseLocalFolderBtn');
   const rebuildKbBtn = document.getElementById('rebuildKbBtn');
@@ -332,6 +333,7 @@ export function buildSettingsScript(): string {
       openCodeEnabled: openCodeEnabledInput.checked,
       cursorEnabled: cursorEnabledInput.checked,
       copilotEnabled: copilotEnabledInput.checked,
+      globalInstructions: globalInstructionsInput.checked,
       localFolder: localFolderInput.value,
       excludePatterns: excludePatternsInput.value,
       compileExcludeFolders: compileExcludeFoldersInput.value,
@@ -356,6 +358,7 @@ export function buildSettingsScript(): string {
       openCodeEnabledInput.checked !== initialState.openCodeEnabled ||
       cursorEnabledInput.checked !== initialState.cursorEnabled ||
       copilotEnabledInput.checked !== initialState.copilotEnabled ||
+      globalInstructionsInput.checked !== initialState.globalInstructions ||
       localFolderInput.value !== initialState.localFolder ||
       excludePatternsInput.value !== initialState.excludePatterns ||
       compileExcludeFoldersInput.value !== initialState.compileExcludeFolders ||
@@ -418,7 +421,7 @@ export function buildSettingsScript(): string {
   aiProviderSelect.addEventListener('change', function() {
     checkDirty(); clearSaveFeedback(); syncProviderCard();
   });
-  [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput, cursorEnabledInput, copilotEnabledInput].forEach(function(input) {
+  [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput, cursorEnabledInput, copilotEnabledInput, globalInstructionsInput].forEach(function(input) {
     input.addEventListener('change', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
   });
   dcoSignoffInput.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
@@ -452,6 +455,7 @@ export function buildSettingsScript(): string {
         openCodeEnabled: openCodeEnabledInput.checked,
         cursorEnabled: cursorEnabledInput.checked,
         copilotEnabled: copilotEnabledInput.checked,
+        globalInstructions: globalInstructionsInput.checked,
         localFolder: localFolderInput.value.trim(),
         excludePatterns: excludePatternsInput.value,
         compileExcludeFolders: compileExcludeFoldersInput.value,
@@ -564,6 +568,7 @@ export function buildSettingsScript(): string {
         openCodeEnabledInput.checked = msg.settings.openCodeEnabled;
         cursorEnabledInput.checked = msg.settings.cursorEnabled;
         copilotEnabledInput.checked = msg.settings.copilotEnabled;
+        globalInstructionsInput.checked = !!msg.settings.globalInstructions;
         localFolderInput.value = msg.settings.localFolder || '';
         excludePatternsInput.value = msg.settings.excludePatterns;
         compileExcludeFoldersInput.value = msg.settings.compileExcludeFolders;

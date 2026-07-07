@@ -12,12 +12,24 @@ import { browserLogin } from "../auth/Login.js";
 import { validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { getGlobalConfigDir, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
+import { GLOBAL_INSTRUCTIONS_PROMPT } from "../install/GlobalInstructionsInstaller.js";
 import { install, uninstall } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { JolliMemoryConfig } from "../Types.js";
-import { isInteractive, promptText, resolveProjectDir } from "./CliUtils.js";
+import { isAffirmative, isInteractive, promptText, resolveProjectDir } from "./CliUtils.js";
 
 const log = createLogger("EnableCommand");
+
+/**
+ * Confirms the global-instructions write on an interactive terminal. Wrapped in a
+ * v8-ignore block because it calls promptText, which cannot run under Vitest's piped
+ * (non-TTY) stdin; the yes/no parsing lives in the separately-tested isAffirmative.
+ */
+/* v8 ignore start -- interactive stdin prompt; not exercisable under piped test stdin */
+async function confirmGlobalInstructionsInteractively(): Promise<boolean> {
+	return isAffirmative(await promptText(`\n  ${GLOBAL_INSTRUCTIONS_PROMPT}\n  [Y/n]: `));
+}
+/* v8 ignore stop */
 
 /**
  * Interactive setup flow after hooks are installed.
@@ -145,6 +157,8 @@ export function registerEnableCommand(program: Command): void {
 				source: "cli",
 				integrationsOnly: options.integrationsOnly,
 				sourceTag: options.sourceTag,
+				confirmGlobalInstructions:
+					isInteractive() && !options.yes ? confirmGlobalInstructionsInteractively : undefined,
 			});
 
 			if (result.success) {

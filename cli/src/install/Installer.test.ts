@@ -861,6 +861,72 @@ describe("Installer", () => {
 			expect(result.message).toMatch(/Unexpected .git file content|ENOTDIR|not a directory/i);
 		});
 
+		describe("global instructions confirmation gate", () => {
+			it("does NOT write the global CLAUDE.md block when the switch is undecided and no callback is passed", async () => {
+				const exists = (p: string) =>
+					stat(p)
+						.then(() => true)
+						.catch(() => false);
+				const result = await install(tempDir);
+				expect(result.success).toBe(true);
+				// Undecided (no globalInstructions in config) + no confirm callback → skip.
+				expect(await exists(join(fakeHomeDir, ".claude", "CLAUDE.md"))).toBe(false);
+
+				// The skip path must not persist a `globalInstructions` key either —
+				// either the global config file was never written, or it was written
+				// for unrelated fields and simply omits the key.
+				const globalConfigPath = join(emptyGlobalDir, "config.json");
+				if (await exists(globalConfigPath)) {
+					const cfg = JSON.parse(await readFile(globalConfigPath, "utf-8"));
+					expect(cfg.globalInstructions).toBeUndefined();
+				}
+			});
+
+			it("writes the global block and persists 'enabled' when the confirm callback agrees", async () => {
+				const result = await install(tempDir, { confirmGlobalInstructions: async () => true });
+				expect(result.success).toBe(true);
+
+				const block = await readFile(join(fakeHomeDir, ".claude", "CLAUDE.md"), "utf-8");
+				expect(block).toContain("jolli-recall");
+
+				// getGlobalConfigDir() is mocked (see mockGlobalConfigDir above) to
+				// emptyGlobalDir rather than the real homedir-derived path, so the
+				// persisted config lands there, not under fakeHomeDir.
+				const cfg = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+				expect(cfg.globalInstructions).toBe("enabled");
+			});
+
+			it("persists 'disabled' and skips the write when the confirm callback declines", async () => {
+				const exists = (p: string) =>
+					stat(p)
+						.then(() => true)
+						.catch(() => false);
+				const result = await install(tempDir, { confirmGlobalInstructions: async () => false });
+				expect(result.success).toBe(true);
+				expect(await exists(join(fakeHomeDir, ".claude", "CLAUDE.md"))).toBe(false);
+
+				// See note above: persisted config lands in the mocked emptyGlobalDir.
+				const cfg = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+				expect(cfg.globalInstructions).toBe("disabled");
+			});
+
+			it("writes without prompting when the switch is already 'enabled'", async () => {
+				const exists = (p: string) =>
+					stat(p)
+						.then(() => true)
+						.catch(() => false);
+				// loadConfig()/getGlobalConfigDir() are mocked (see mockGlobalConfigDir
+				// above) to read from emptyGlobalDir, not the real homedir-derived path.
+				await mkdir(emptyGlobalDir, { recursive: true });
+				await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ globalInstructions: "enabled" }));
+				const confirm = vi.fn();
+				const result = await install(tempDir, { confirmGlobalInstructions: confirm });
+				expect(result.success).toBe(true);
+				expect(confirm).not.toHaveBeenCalled();
+				expect(await exists(join(fakeHomeDir, ".claude", "CLAUDE.md"))).toBe(true);
+			});
+		});
+
 		describe("v5 migration source discriminator", () => {
 			// When VSCode calls install() via bridge.enable(), Extension.ts
 			// separately runs migrateSchemaToV5 wrapped in setMigrating(true/
