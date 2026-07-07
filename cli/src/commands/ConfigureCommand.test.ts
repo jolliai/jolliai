@@ -5,7 +5,8 @@
  *   - copilotEnabled accepted as a settable boolean key
  *   - localFolder accepted as a string path key (CLI-only setup parity)
  *   - aiProvider accepted as the "anthropic" | "jolli" enum, rejected otherwise
- *   - All three keys appear in --list-keys output
+ *   - globalInstructions accepted as the "enabled" | "disabled" enum, rejected otherwise
+ *   - All keys appear in --list-keys output
  */
 
 import { Command } from "commander";
@@ -133,6 +134,31 @@ describe("ConfigureCommand — settable keys", () => {
 		}
 	});
 
+	it("accepts globalInstructions with the two allowed values", async () => {
+		await runConfigure(["--set", "globalInstructions=enabled"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ globalInstructions: "enabled" }));
+
+		await runConfigure(["--set", "globalInstructions=disabled"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ globalInstructions: "disabled" }));
+	});
+
+	it("rejects globalInstructions values that aren't in the allowlist", async () => {
+		// Without this guard, `jolli configure --set globalInstructions=on` would
+		// silently persist a value that resolveGlobalInstructionsDecision treats as
+		// undecided — the user would think they opted in but nothing would change.
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const prevExitCode = process.exitCode;
+		try {
+			await runConfigure(["--set", "globalInstructions=on"]);
+			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("enabled, disabled"));
+			expect(process.exitCode).toBe(1);
+			expect(mockSaveConfig).not.toHaveBeenCalled();
+		} finally {
+			errorSpy.mockRestore();
+			process.exitCode = prevExitCode;
+		}
+	});
+
 	it("removes localFolder and aiProvider via --remove", async () => {
 		// --remove writes `undefined` for the field, which saveConfig drops
 		// from the persisted JSON — this is what an "unset" looks like on disk.
@@ -142,11 +168,12 @@ describe("ConfigureCommand — settable keys", () => {
 		);
 	});
 
-	it("lists copilotEnabled, localFolder, and aiProvider in help/description output", async () => {
+	it("lists copilotEnabled, localFolder, aiProvider, and globalInstructions in help/description output", async () => {
 		const help = await runConfigureHelp();
 		expect(help).toContain("copilotEnabled");
 		expect(help).toContain("localFolder");
 		expect(help).toContain("aiProvider");
+		expect(help).toContain("globalInstructions");
 	});
 
 	describe("maxTokens validation (positive integer only)", () => {

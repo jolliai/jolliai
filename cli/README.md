@@ -120,7 +120,7 @@ Installs all hooks required for automatic summarization:
 - **Git prepare-commit-msg hook** — detects squash operations
 - **Gemini AfterAgent hook** (if Gemini CLI detected) — tracks Gemini sessions
 - **MCP server registration** — adds the JolliMemory MCP server to your project's `.mcp.json` so Claude Code can query your memories (see [`jolli mcp`](#jolli-mcp))
-- **Skill preference** — teaches your AI agent to reach for Jolli by default when creating a PR, searching past work, or recalling a branch.
+- **Skill preference** *(with your OK)* — offers to teach your AI agent to reach for Jolli by default when creating a PR, searching past work, or recalling a branch. Interactive runs ask once before writing to your machine-global instruction files (`~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`, `~/.codex/AGENTS.md`); non-interactive and `-y` runs skip it until you opt in (`jolli configure --set globalInstructions=enabled`).
 
 ```bash
 jolli enable
@@ -313,7 +313,7 @@ jolli configure --set excludePatterns=docs/**,*.log,node_modules
 jolli configure --remove jolliApiKey
 ```
 
-Supported keys: `apiKey`, `aiProvider`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `claudeEnabled`, `codexEnabled`, `geminiEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `localFolder`, `logLevel`, `excludePatterns`, `syncTranscripts`. `aiProvider` pins the summarization backend (`"anthropic"` or `"jolli"`); when omitted, the dispatcher falls back to the legacy precedence (`apiKey` > `ANTHROPIC_API_KEY` > `jolliApiKey`). `copilotEnabled` controls both GitHub Copilot CLI and VS Code Copilot Chat as a single switch. `localFolder` is the Memory Bank root on disk where every memory is dual-written. `syncTranscripts` opts raw transcripts into cloud sync — see [Memory Bank cloud sync](#memory-bank-cloud-sync) below; run a round on demand with `jolli sync-memory-bank`. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
+Supported keys: `apiKey`, `aiProvider`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `claudeEnabled`, `codexEnabled`, `geminiEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `globalInstructions`, `localFolder`, `logLevel`, `excludePatterns`, `syncTranscripts`. `globalInstructions` (`enabled` / `disabled`, unset = undecided) records whether you've opted the skill-preference note into your machine-global AI instruction files. `configure` only saves this value — the block itself is written the next time you run `jolli enable`, and only when the value is `enabled`. Leaving it unset means `jolli enable` prompts once before writing anything. `aiProvider` pins the summarization backend (`"anthropic"` or `"jolli"`); when omitted, the dispatcher falls back to the legacy precedence (`apiKey` > `ANTHROPIC_API_KEY` > `jolliApiKey`). `copilotEnabled` controls both GitHub Copilot CLI and VS Code Copilot Chat as a single switch. `localFolder` is the Memory Bank root on disk where every memory is dual-written. `syncTranscripts` opts raw transcripts into cloud sync — see [Memory Bank cloud sync](#memory-bank-cloud-sync) below; run a round on demand with `jolli sync-memory-bank`. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
 
 ### Memory Bank cloud sync
 
@@ -535,7 +535,7 @@ The generated summary is then dual-written locally — to the git orphan branch 
 
 ### Uploads to Jolli Space
 
-The CLI itself does not push summaries to Jolli Space — that action lives in the VS Code and IntelliJ extensions (**Share in Jolli** button). When triggered there, only the **generated summary** and its **associated plans and notes** are uploaded. **Raw transcripts are never sent to Jolli Space.**
+The CLI itself does not push summaries to Jolli Space — that action lives in the VS Code and IntelliJ extensions (**Share in Jolli** button). When triggered there, only the **generated summary** and its **associated plans and notes** are uploaded. The pushed article (and the clipboard export) carries a **Task usage** line — total tokens, a cost estimate, and the input / output / cached split, aggregated across squashed and amended commits. **Raw transcripts are never sent to Jolli Space.**
 
 ### Session metadata
 

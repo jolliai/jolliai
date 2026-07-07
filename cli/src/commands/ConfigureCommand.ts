@@ -21,6 +21,12 @@ const VALID_LOG_LEVELS: ReadonlyArray<LogLevel> = ["debug", "info", "warn", "err
 /** Valid values for the `aiProvider` config key. */
 const VALID_AI_PROVIDERS: ReadonlyArray<NonNullable<JolliMemoryConfig["aiProvider"]>> = ["anthropic", "jolli"];
 
+/** Valid values for the `globalInstructions` config key. */
+const VALID_GLOBAL_INSTRUCTIONS: ReadonlyArray<NonNullable<JolliMemoryConfig["globalInstructions"]>> = [
+	"enabled",
+	"disabled",
+];
+
 /**
  * Valid config keys exposed via `jolli configure --set/--remove`.
  * Must stay in sync with {@link JolliMemoryConfig} in Types.ts.
@@ -37,6 +43,7 @@ const VALID_CONFIG_KEYS = [
 	"openCodeEnabled",
 	"cursorEnabled",
 	"copilotEnabled",
+	"globalInstructions",
 	"logLevel",
 	"excludePatterns",
 	"localFolder",
@@ -121,6 +128,12 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		}
 		return raw;
 	}
+	if (key === "globalInstructions") {
+		if (!(VALID_GLOBAL_INSTRUCTIONS as ReadonlyArray<string>).includes(raw)) {
+			throw new Error(`${key} must be one of: ${VALID_GLOBAL_INSTRUCTIONS.join(", ")} (got: ${raw})`);
+		}
+		return raw;
+	}
 	// Array fields (comma-separated)
 	if (key === "excludePatterns") {
 		return raw
@@ -168,6 +181,12 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "aiProvider",
 		type: "enum",
 		description: "AI summary provider: anthropic | jolli (auto-set on `jolli auth login`)",
+	},
+	{
+		key: "globalInstructions",
+		type: "enum",
+		description:
+			"Skill-preference block in global AI instruction files: enabled | disabled (written on next `jolli enable` when enabled)",
 	},
 	{
 		key: "syncTranscripts",

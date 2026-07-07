@@ -1,6 +1,12 @@
 # Changelog
 
-<!-- Last synced commit: 38920160 | 2026-07-06 -->
+<!-- Last synced commit: da989203 | 2026-07-07 -->
+
+## 0.99.6
+
+- **Jolli asks before changing your AI setup** — `jolli enable` now checks with you first before teaching your AI agent to prefer Jolli. Say no and nothing is changed.
+- **See token usage on shared memories** — memories you share now show how many tokens they used and an estimated cost.
+- Bug fixes
 
 ## 0.99.5
 
