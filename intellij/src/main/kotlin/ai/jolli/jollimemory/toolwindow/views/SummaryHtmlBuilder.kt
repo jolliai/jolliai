@@ -2,6 +2,7 @@ package ai.jolli.jollimemory.toolwindow.views
 
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.E2eTestScenario
+import ai.jolli.jollimemory.core.ModelPricing
 import ai.jolli.jollimemory.core.PlanReference
 import ai.jolli.jollimemory.core.SummaryTree
 import ai.jolli.jollimemory.core.TopicCategory
@@ -456,7 +457,11 @@ ${buildTranscriptModal()}"""
             """
   <div class="tmeter-bar"><span class="seg-in" style="width:100%"></span></div>"""
         }
-        val cost = SummaryTree.aggregateEstimatedCost(summary)
+        // Prefer the accurate write-time per-model cost; when absent (legacy/token-only
+        // memories) fall back to a Sonnet-rate estimate of the breakdown — the same
+        // "prefer stored, else Sonnet" logic the VS Code sidebar uses.
+        val storedCost = SummaryTree.aggregateEstimatedCost(summary)
+        val cost = if (storedCost > 0.0) storedCost else ModelPricing.estimateSonnetCostUsd(bd, total)
         val costStr = if (cost > 0.0) CommitMemoryFormat.formatCost(cost) else "cost N/A"
         return """
 <div class="tmeter">

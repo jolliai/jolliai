@@ -166,30 +166,18 @@ class SummaryTreeTest {
         }
 
         @Test
-        fun `re-derives cost from conversationModels when estimatedCostUsd is absent`() {
-            // Mirrors the Commits-list fallback: models recorded but no stored cost must still
-            // price out in the detail view (regression: opening a memory dropped the cost).
+        fun `aggregateEstimatedCost is a pure stored sum with no fallback`() {
+            // The Sonnet/model fallback lives in the display layer (matching VS Code), so the
+            // aggregate itself stays pure: a node with models/breakdown but no stored cost is 0.
             val node = makeLeaf().copy(
-                conversationTokens = 1_000_000,
+                conversationTokens = 3_000_000,
+                conversationTokenBreakdown = ConversationTokenBreakdown(1_000_000, 1_000_000, 1_000_000),
                 conversationModels = listOf(
                     ModelTokenUsage("claude-opus-4-8", ModelPricing.providerOf("claude-opus-4-8"), output = 1_000_000),
                 ),
                 estimatedCostUsd = null,
             )
-            SummaryTree.aggregateEstimatedCost(node) shouldBe 25.0
-        }
-
-        @Test
-        fun `estimates cost at Sonnet rates when neither cost nor models are present`() {
-            // Token-only memory (older producer): no stored cost, no models — the detail view
-            // still shows an approximate cost (Sonnet rates), matching VS Code.
-            val node = makeLeaf().copy(
-                conversationTokens = 3_000_000,
-                conversationTokenBreakdown = ConversationTokenBreakdown(1_000_000, 1_000_000, 1_000_000),
-                conversationModels = null,
-                estimatedCostUsd = null,
-            )
-            SummaryTree.aggregateEstimatedCost(node) shouldBe (3.0 + 15.0 + 3.75)
+            SummaryTree.aggregateEstimatedCost(node) shouldBe 0.0
         }
 
         @Test

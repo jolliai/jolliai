@@ -760,15 +760,19 @@ val sb = StringBuilder()
                                 it.cacheWriteTokens,
                             )
                         }
-                    estimatedCostUsd = summary.estimatedCostUsd
-                        ?: summary.conversationModels?.let {
-                            ai.jolli.jollimemory.core.ModelPricing.estimateCostUsd(it).takeIf { c -> c > 0.0 }
-                        }
-                        // Model-unknown, token-only memory (legacy / older producer): approximate at
-                        // Sonnet rates like VS Code, so the list shows a rough cost instead of nothing.
-                        ?: tokenBreakdown?.let {
-                            ai.jolli.jollimemory.core.ModelPricing.estimateSonnetCostUsd(it).takeIf { c -> c > 0.0 }
-                        }
+                    // Cost: prefer the accurate write-time per-model estimate (summed across the
+                    // tree); when absent (legacy / token-only memories) fall back to a Sonnet-rate
+                    // estimate of the aggregated breakdown — the same "prefer stored, else Sonnet"
+                    // logic the VS Code sidebar uses, so both tools show the same figure.
+                    val storedCost = ai.jolli.jollimemory.core.SummaryTree.aggregateEstimatedCost(summary)
+                    estimatedCostUsd = if (storedCost > 0.0) {
+                        storedCost
+                    } else {
+                        ai.jolli.jollimemory.core.ModelPricing.estimateSonnetCostUsd(
+                            ai.jolli.jollimemory.core.SummaryTree.aggregateConversationTokenBreakdown(summary),
+                            ai.jolli.jollimemory.core.SummaryTree.aggregateConversationTokens(summary),
+                        ).takeIf { it > 0.0 }
+                    }
                     e2eScenarioCount = summary.e2eTestGuide?.size ?: 0
                     isSyncedToJolli = summary.jolliDocId != null || summary.jolliDocUrl != null
                     jolliDocUrl = summary.jolliDocUrl

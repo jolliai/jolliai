@@ -69,15 +69,22 @@ class ModelPricingTest {
     }
 
     @Test
-    fun `sonnet fallback prices a breakdown at sonnet rates`() {
-        // Sonnet: $3 input, $15 output, $3.75 cacheWrite per 1M.
+    fun `sonnet fallback prices a breakdown at sonnet segment rates`() {
+        // Sonnet: $3 input, $15 output, $3.75 cacheWrite per 1M. Breakdown present -> segments.
         ModelPricing.estimateSonnetCostUsd(
             ConversationTokenBreakdown(input = 1_000_000, output = 1_000_000, cached = 1_000_000),
+            totalTokens = 3_000_000,
         ) shouldBe (3.0 + 15.0 + 3.75)
     }
 
     @Test
-    fun `sonnet fallback is zero for an empty breakdown`() {
-        ModelPricing.estimateSonnetCostUsd(ConversationTokenBreakdown()) shouldBe 0.0
+    fun `sonnet fallback prices a bare total at the input rate when no breakdown`() {
+        // Mirrors VS Code estimateCost's `total * SONNET_INPUT_PER_TOKEN` branch.
+        ModelPricing.estimateSonnetCostUsd(ConversationTokenBreakdown(), totalTokens = 1_000_000) shouldBe 3.0
+    }
+
+    @Test
+    fun `sonnet fallback is zero when there is nothing to price`() {
+        ModelPricing.estimateSonnetCostUsd(ConversationTokenBreakdown(), totalTokens = 0) shouldBe 0.0
     }
 }
