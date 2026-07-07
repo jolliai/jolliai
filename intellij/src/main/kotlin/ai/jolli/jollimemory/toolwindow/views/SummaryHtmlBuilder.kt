@@ -329,10 +329,10 @@ ${buildTranscriptModal()}"""
             """$totalFiles file$filesPlural changed, <span class="stat-add">$totalInsertions insertion$insPlural(+)</span>, <span class="stat-del">$totalDeletions deletion$delPlural(-)</span>"""
         val totalTurns = SummaryTree.aggregateTurns(summary)
         val shortHash = escHtml(summary.commitHash.take(8))
-        val turnsMeta = if (totalTurns > 0)
-            """<span class="meta-sep">&middot;</span><span class="stat-turns">&#x1F4AC; $totalTurns</span>"""
-        else ""
 
+        // Meta strip mirrors the VS Code detail view: hash · branch · date, then the
+        // Details toggle and the Share link + Export actions on the same line (author,
+        // line-change counts, and conversation turns live in the collapsed Details table).
         return """
 <h1 class="page-title">${escHtml(summary.commitMessage)}</h1>
 <div class="meta-strip">
@@ -340,13 +340,16 @@ ${buildTranscriptModal()}"""
   <span class="meta-sep">&middot;</span>
   <span class="meta-branch" title="${escAttr(summary.branch)}">${escHtml(summary.branch)}</span>
   <span class="meta-sep">&middot;</span>
-  <span class="meta-author">${escHtml(summary.commitAuthor)}</span>
-  <span class="meta-sep">&middot;</span>
   <span class="meta-date">${timeAgo(summary.commitDate)}</span>
-  <span class="meta-sep">&middot;</span>
-  <span class="meta-changes"><span class="stat-add">+$totalInsertions</span>/<span class="stat-del">&#x2212;$totalDeletions</span></span>
-  $turnsMeta
   <button class="details-toggle" id="detailsToggle" aria-expanded="false">Details &#x25BE;</button>
+  <button class="action-btn meta-share" id="shareLinkBtn" title="Create a read-only share link">&#x1F517; Share link</button>
+  <div class="export-menu-group">
+    <button class="action-btn meta-export" id="exportMenuToggle" title="Export options">Export &#x25BE;</button>
+    <div class="split-menu" id="exportMenu">
+      <button class="split-menu-item" id="copyMdBtn">Copy Markdown</button>
+      <button class="split-menu-item" id="downloadMdBtn">Save as Markdown File</button>
+    </div>
+  </div>
 </div>
 <div class="properties collapsed" id="propertiesSection">
   <div class="prop-row">
@@ -377,15 +380,6 @@ ${buildTranscriptModal()}"""
     <div class="prop-value">$changesHtml</div>
   </div>
   ${buildConversationsRow(totalTurns)}
-</div>
-<div class="header-actions">
-  <div class="export-menu-group">
-    <button class="action-btn" id="exportMenuToggle" title="Export options">Export &#x25BE;</button>
-    <div class="split-menu" id="exportMenu">
-      <button class="split-menu-item" id="copyMdBtn">Copy Markdown</button>
-      <button class="split-menu-item" id="downloadMdBtn">Save as Markdown File</button>
-    </div>
-  </div>
 </div>"""
     }
 
@@ -602,7 +596,6 @@ $listItems
     ${buildJolliRow(summary.jolliDocUrl, summary.commitMessage, summary.plans)}
     <div class="ship-actions">
       <button class="action-btn primary" id="pushJolliBtn">$pushLabel</button>
-      <button class="action-btn" id="shareLinkBtn" title="Create a read-only share link">&#x1F517; Share link</button>
     </div>
   </div>
 </div>"""

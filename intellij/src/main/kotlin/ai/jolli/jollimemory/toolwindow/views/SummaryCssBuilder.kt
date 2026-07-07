@@ -92,12 +92,6 @@ $rootVars
     color: var(--text-primary);
     letter-spacing: -0.01em;
   }
-  .header-actions {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin: 14px 0 20px;
-  }
   /* ── Export dropdown (Copy / Save as Markdown) ── */
   .export-menu-group { position: relative; display: inline-block; }
   .split-menu {
@@ -147,6 +141,11 @@ $rootVars
     text-decoration: underline; text-underline-offset: 2px; text-decoration-style: dotted;
   }
   .details-toggle:hover { color: var(--link-fg); }
+  /* Share link + Export actions hoisted onto the meta-strip line (right-aligned). */
+  .meta-strip .action-btn { font-size: 0.78em; padding: 3px 10px; }
+  .meta-strip .action-btn.meta-share { margin-left: auto; }
+  .meta-strip .export-menu-group { display: inline-flex; }
+  .meta-strip .split-menu { left: auto; right: 0; }
   .action-btn {
     font-family: $FONT_FAMILY;
     font-size: 0.8em;
