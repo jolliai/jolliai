@@ -71,20 +71,39 @@ object SummaryTree {
     }
 
     /**
+     * A node's OWN token breakdown, applying the same fallback the Commits-list brief uses
+     * ([JolliMemoryService.getBranchCommits]): prefer the canonical [CommitSummary.conversationTokenBreakdown],
+     * else map the legacy `tokenUsage` (cached = cache_creation; cache_read dropped to match TS).
+     * Returns zeros when neither is present. Keeping this in one place stops the detail view and
+     * the list from disagreeing on the same underlying counts.
+     */
+    private fun ownBreakdown(node: CommitSummary): ConversationTokenBreakdown {
+        node.conversationTokenBreakdown?.let { return ConversationTokenBreakdown(it.input, it.output, it.cached) }
+        node.tokenUsage?.let {
+            return ConversationTokenBreakdown(it.inputTokens, it.outputTokens, it.cacheWriteTokens)
+        }
+        return ConversationTokenBreakdown(0, 0, 0)
+    }
+
+    /**
      * Recursively sums conversationTokens across the entire tree. A consolidated
      * (squash/amend/rebase) memory carries its tokens on the folded children, so
      * the detail view must aggregate the whole tree, not read the root's scalar.
+     * Falls back to the node's breakdown total when the scalar is absent, so a
+     * summary that recorded only a breakdown still reports a nonzero total.
      */
     fun aggregateConversationTokens(node: CommitSummary): Long {
-        val own = node.conversationTokens?.toLong() ?: 0L
+        val bd = ownBreakdown(node)
+        val own = node.conversationTokens?.toLong() ?: (bd.input + bd.output + bd.cached)
         return own + (node.children ?: emptyList()).sumOf { aggregateConversationTokens(it) }
     }
 
     /** Recursively sums the per-segment conversation-token breakdown across the tree. */
     fun aggregateConversationTokenBreakdown(node: CommitSummary): ConversationTokenBreakdown {
-        var input = node.conversationTokenBreakdown?.input ?: 0L
-        var output = node.conversationTokenBreakdown?.output ?: 0L
-        var cached = node.conversationTokenBreakdown?.cached ?: 0L
+        val own = ownBreakdown(node)
+        var input = own.input
+        var output = own.output
+        var cached = own.cached
         for (child in node.children ?: emptyList()) {
             val c = aggregateConversationTokenBreakdown(child)
             input += c.input
@@ -95,11 +114,16 @@ object SummaryTree {
     }
 
     /**
-     * Recursively sums the estimated USD cost across the tree. 0.0 when no node
-     * carries a priced estimate (a lower bound on legacy/unpriced trees).
+     * Recursively sums the estimated USD cost across the tree. Per node, prefers the stored
+     * [CommitSummary.estimatedCostUsd]; when absent, re-derives it from [CommitSummary.conversationModels]
+     * at current [ModelPricing] rates — the SAME fallback the Commits-list brief applies, so opening a
+     * memory's detail view never loses a cost the list showed. 0.0 only when a node carries neither a
+     * priced estimate nor priced models (a lower bound on legacy/unpriced trees).
      */
     fun aggregateEstimatedCost(node: CommitSummary): Double {
-        val own = node.estimatedCostUsd ?: 0.0
+        val own = node.estimatedCostUsd
+            ?: node.conversationModels?.let { ModelPricing.estimateCostUsd(it) }
+            ?: 0.0
         return own + (node.children ?: emptyList()).sumOf { aggregateEstimatedCost(it) }
     }
 
