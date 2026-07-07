@@ -274,6 +274,7 @@ class SummaryPanel(
         "deleteE2eTest", "savePlan", "removePlan", "translatePlan", "associatePlan",
         "createPrDirect", "createPrWithE2e", "createPr", "updatePr", "saveAllTranscripts", "deleteAllTranscripts",
         "generateRecap", "editRecap", "saveReferenceEdit", "removeReference",
+        "shareCopyLink", "shareSetAccess", "shareSendInvite", "shareRemoveRecipient",
     )
 
     private fun dispatchWebviewMessage(json: JsonObject) {
@@ -288,7 +289,25 @@ class SummaryPanel(
                 "copyMarkdown" -> handleCopyMarkdown()
                 "downloadMarkdown" -> handleDownloadMarkdown()
                 "pushToJolli" -> handlePushToJolli()
-                "shareMemory" -> ShareLauncher.openForCommit(project, currentSummary)
+                "shareBranch" -> handleShareCommand(opensModal = true) { io, ctx -> ai.jolli.jollimemory.services.BranchShareModal.openShareModal(io, ctx) }
+                "shareCopyLink" -> {
+                    val v = json.get("visibility")?.asString ?: "public"
+                    handleShareCommand { io, ctx -> ai.jolli.jollimemory.services.BranchShareModal.copyShareLinkModal(io, ctx, v) }
+                }
+                "shareSetAccess" -> {
+                    val v = json.get("visibility")?.asString ?: "public"
+                    handleShareCommand { io, ctx -> ai.jolli.jollimemory.services.BranchShareModal.setShareAccessModal(io, ctx, v) }
+                }
+                "shareSendInvite" -> {
+                    val recipients = json.getAsJsonArray("recipients")?.mapNotNull { it.asString } ?: emptyList()
+                    val note = json.get("message")?.asString?.take(2000)
+                    val vis = json.get("visibility")?.asString
+                    handleShareCommand { io, ctx -> ai.jolli.jollimemory.services.BranchShareModal.sendInviteModal(io, ctx, recipients, note, vis) }
+                }
+                "shareRemoveRecipient" -> {
+                    val email = json.get("email")?.asString ?: ""
+                    handleShareCommand { io, ctx -> ai.jolli.jollimemory.services.BranchShareModal.removeRecipientModal(io, ctx, email) }
+                }
                 "editTopic" -> handleEditTopic(json.get("topicIndex").asInt, json.getAsJsonObject("updates"))
                 "deleteTopic" -> handleDeleteTopic(json.get("topicIndex").asInt, json.get("title")?.asString)
                 "generateE2eTest" -> handleGenerateE2eTest()
@@ -372,6 +391,70 @@ class SummaryPanel(
         }
     }
 
+    // ── In-webview share modal (single-slot, mirrors the VS Code webview modal) ──
+
+    /**
+     * Runs a [ai.jolli.jollimemory.services.BranchShareModal] entry point for THIS memory
+     * (a single-commit share) on a pooled thread, driving the webview-backed IO. The context
+     * (owner / org directory / git contributors / binding chooser) is assembled off the EDT.
+     */
+    private fun handleShareCommand(
+        opensModal: Boolean = false,
+        action: (ai.jolli.jollimemory.services.BranchShareModal.ShareModalIO, ai.jolli.jollimemory.services.BranchShareModal.ShareModalContext) -> Unit,
+    ) {
+        val summary = currentSummary
+        ApplicationManager.getApplication().executeOnPooledThread {
+            TraceContext.withTrace {
+                try {
+                    val ctx = ShareContextFactory.build(project, summary.branch, summary.commitMessage, summary.commitHash, summary)
+                    action(shareModalIO(), ctx)
+                } catch (e: Exception) {
+                    LOG.warn("Share action failed: ${e.message}", e)
+                    if (opensModal) {
+                        postToWebview("shareState", mapOf("state" to mapOf("kind" to "error", "message" to (e.message ?: "Share failed"))))
+                    }
+                }
+            }
+        }
+    }
+
+    /** Webview-backed [ai.jolli.jollimemory.services.BranchShareModal.ShareModalIO]. */
+    private fun shareModalIO() = object : ai.jolli.jollimemory.services.BranchShareModal.ShareModalIO {
+        override fun postState(state: ai.jolli.jollimemory.services.BranchShareModal.ShareModalState) {
+            ApplicationManager.getApplication().invokeLater {
+                postToWebview("shareState", mapOf("state" to shareStateToMap(state)))
+            }
+        }
+
+        override fun copyToClipboard(text: String): Boolean = try {
+            Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(text), null)
+            true
+        } catch (_: Exception) {
+            false
+        }
+
+        override fun postCopyResult(result: ai.jolli.jollimemory.services.BranchShareModal.ShareCopyResult) {
+            ApplicationManager.getApplication().invokeLater {
+                postToWebview("shareCopyResult", mapOf("ok" to result.ok))
+            }
+        }
+
+        override fun notifyError(message: String) = shareNotify(message, com.intellij.notification.NotificationType.ERROR)
+        override fun notifyInfo(message: String) = shareNotify(message, com.intellij.notification.NotificationType.INFORMATION)
+    }
+
+    private fun shareNotify(message: String, type: com.intellij.notification.NotificationType) {
+        ApplicationManager.getApplication().invokeLater {
+            com.intellij.notification.NotificationGroupManager.getInstance()
+                .getNotificationGroup("JolliMemory")
+                .createNotification("Jolli Share", message, type)
+                .notify(project)
+        }
+    }
+
+    /** Serializes a modal state to the JSON shape the webview's shareRender() expects. */
+    private fun shareStateToMap(state: ai.jolli.jollimemory.services.BranchShareModal.ShareModalState): Map<String, Any?> =
+        ai.jolli.jollimemory.toolwindow.views.ShareWebview.stateToMap(state)
     private fun handlePushToJolli(retried: Boolean = false) {
         val summary = currentSummary
         val config = SessionTracker.loadConfig(cwd)

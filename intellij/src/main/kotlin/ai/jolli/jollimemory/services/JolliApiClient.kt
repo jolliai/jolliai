@@ -571,10 +571,10 @@ object JolliApiClient {
         val recipients: List<String>? = null,
     )
 
-    /** Response from a successful expiry update (PATCH). */
-    data class ShareExpiryResult(
-        val shareId: String,
-        val expiresAt: String,
+    /** Response from POST /api/share/branch/:shareId/invite — server merges the allowlist, then emails. */
+    data class ShareInviteResult(
+        val sent: List<String>,
+        val failed: List<String>,
     )
 
     /** An org member offered as a recipient candidate (name + deliverable email). */
@@ -710,21 +710,30 @@ object JolliApiClient {
     }
 
     /**
-     * Adjusts an existing share's expiry via `PATCH /api/share/branch/:shareId`.
-     * `expiresAt` is an absolute ISO timestamp. Returns the server-confirmed value.
+     * Sends invite emails and grants access via `POST /api/share/branch/:shareId/invite`.
+     * The server merges the recipients into the allowlist first (granting access to the view
+     * URL), then emails each — mail failures do NOT revoke access. Returns sent/failed lists.
      */
-    fun updateShareExpiry(baseUrl: String?, apiKey: String, shareId: String, expiresAt: String): ShareExpiryResult {
+    fun sendShareInviteAndGrantAccess(
+        baseUrl: String?,
+        apiKey: String,
+        shareId: String,
+        recipients: List<String>,
+        message: String? = null,
+    ): ShareInviteResult {
         val resolved = resolveShareBaseUrl(baseUrl, apiKey)
-        val path = "/api/share/branch/${java.net.URLEncoder.encode(shareId, Charsets.UTF_8)}"
-        val response = sendAuthed("PATCH", resolved, apiKey, path, gson.toJson(mapOf("expiresAt" to expiresAt)))
+        val path = "/api/share/branch/${java.net.URLEncoder.encode(shareId, Charsets.UTF_8)}/invite"
+        val bodyMap = HashMap<String, Any>()
+        bodyMap["recipients"] = recipients
+        if (message != null) bodyMap["message"] = message
+        val response = sendAuthed("POST", resolved, apiKey, path, gson.toJson(bodyMap))
         val raw = response.body() ?: ""
         val status = response.statusCode()
         val json = parseObjectOrNull(raw)
-        val confirmed = json?.str("expiresAt")
-        if (status in 200..299 && confirmed != null) {
-            return ShareExpiryResult(
-                shareId = json.get("shareId")?.takeIf { it.isJsonPrimitive }?.asString ?: shareId,
-                expiresAt = confirmed,
+        if (status in 200..299) {
+            return ShareInviteResult(
+                sent = json?.stringList("sent") ?: emptyList(),
+                failed = json?.stringList("failed") ?: emptyList(),
             )
         }
         throw shareError(status, json, raw)

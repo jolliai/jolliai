@@ -144,19 +144,25 @@ object SummaryScriptBuilder {
     });
   }
 
-  // Create share link button — opens the native share dialog.
+  // Create share link button — opens the in-webview share modal.
   var shareBtn = document.getElementById('shareLinkBtn');
   if (shareBtn) {
     shareBtn.addEventListener('click', function() {
-      jmSend({ command: 'shareMemory' });
+      shareOpen();
     });
   }
+
+${buildShareScript()}
 
 ${buildPrSectionScript()}
 
   // Listen for messages from the IDE (push + topic edit status updates)
   window.addEventListener('jollimemory', function(e) {
     var msg = e.detail;
+
+    // ── Share modal ──
+    if (msg.command === 'shareState') { shareRender(msg.state); return; }
+    if (msg.command === 'shareCopyResult') { shareFlashCopy(msg.ok === true); return; }
 
     // ── Push to Jolli status ──
     if (pushBtn) {
@@ -1544,6 +1550,9 @@ ${buildPrMessageScript()}
     // ── PR Section Script ──
 
     /** Returns the JS for the PR section (auto-trigger + event handlers). */
+    /** In-webview share modal client JS (single source in ShareWebview). */
+    private fun buildShareScript(): String = ShareWebview.renderScript()
+
     private fun buildPrSectionScript(): String {
         return """
   // ── PR Section ──

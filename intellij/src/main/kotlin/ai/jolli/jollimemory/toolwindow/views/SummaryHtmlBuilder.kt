@@ -89,6 +89,7 @@ ${buildAttachmentsPanel(summary.plans, planTranslateSet, sourceNodes, summary.re
 ${buildPrivateDrawer(transcriptHashSet)}
 ${buildFooter(summary)}
 </div>
+${buildShareModal()}
 ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
 <script>${SummaryScriptBuilder.buildScript()}</script>
 </body>
@@ -601,6 +602,12 @@ $listItems
   </div>
 </div>"""
     }
+
+    /**
+     * The in-webview share modal (single-slot). Hidden overlay; the client (SummaryScriptBuilder)
+     * toggles panes and renders each `shareState` the host posts. Mirrors the VS Code webview modal.
+     */
+    private fun buildShareModal(): String = ShareWebview.modalHtml()
 
     /** Wraps recap + topics in a single "The Memory" panel. */
     private fun buildMemoryPanel(

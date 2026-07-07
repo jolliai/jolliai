@@ -11,28 +11,22 @@ import ai.jolli.jollimemory.core.PlanReference
 import ai.jolli.jollimemory.services.JolliPushOrchestrator.AttachmentSelection
 import ai.jolli.jollimemory.services.JolliPushOrchestrator.PushContext
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils
+import java.security.MessageDigest
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 /**
- * LiveShareController — Kotlin port of vscode/src/services/LiveShareController.ts
+ * LiveShareController — Kotlin port of vscode/src/services/LiveShareController.ts (single-slot).
  *
  * Orchestrates a live, Space-backed share for a branch (or a single commit):
- *   1. push every summary on `base..HEAD` (and its plans/notes) to the bound Space
- *      via [JolliPushOrchestrator], and
+ *   1. push every summary on `base..HEAD` (and its plans/notes) to the bound Space, and
  *   2. create/refresh a live share that REFERENCES the resulting doc ids (a `covered`
  *      allowlist) — never a frozen content blob.
  *
  * UI-agnostic: the binding chooser is injected as [Deps.resolveBinding]; loading and
  * persisting summaries are injected too, so this is fully unit-testable.
- *
- * Cross-summary doc-id identity is the crux. A plan/note's docId is persisted onto
- * whichever summary's push first minted it, and the SAME plan (by base slug) / note (by
- * id) recurs across many commits, each mapping to ONE Space doc. So this controller owns
- * a branch-wide map: pushes each unique plan/note exactly once (oldest→newest, newest
- * content wins, reusing the known docId) and builds each commit's `covered` from that map.
  *
  * A per-(workspaceRoot, branch) in-flight lock prevents overlapping generate/reconcile
  * passes from lost-updating `covered` (PATCH replaces it wholesale).
@@ -68,11 +62,6 @@ object LiveShareController {
         val branch: String,
         /** Set for a single-commit share; omit for a whole-branch share. */
         val commitHash: String? = null,
-        /**
-         * The already-open summary for a single-commit share. When present, commit shares
-         * are sourced from this exact memory instead of filtering the current checkout's
-         * `base..HEAD` set, so sharing an open memory is stable across branch switches.
-         */
         val commitSummary: CommitSummary? = null,
         /** "public" | "org" | "people" */
         val visibility: String,
@@ -80,15 +69,11 @@ object LiveShareController {
         val recipients: List<String>? = null,
     )
 
-    // One in-flight pass per (workspaceRoot, branch) — generate/reconcile for the same
-    // subject must not overlap, or a slower pass computed from an older base..HEAD could
-    // PATCH a stale `covered` over a newer one (PATCH replaces it wholesale).
     private val locks = ConcurrentHashMap<String, ReentrantLock>()
 
     private fun <T> withSubjectLock(workspaceRoot: String, branch: String, work: () -> T): T =
         locks.computeIfAbsent("$workspaceRoot $branch") { ReentrantLock() }.withLock(work)
 
-    /** Resolves the site base URL from the API key, or throws if it can't be derived. */
     private fun resolveBaseUrl(apiKey: String): String {
         return JolliApiClient.parseJolliApiKey(apiKey)?.u
             ?: throw RuntimeException(
@@ -97,7 +82,6 @@ object LiveShareController {
             )
     }
 
-    /** Loads the subject's summaries (chronological oldest→newest); a commit share filters to one. */
     private fun loadSubjectSummaries(
         deps: Deps,
         commitHash: String?,
@@ -108,28 +92,20 @@ object LiveShareController {
         return if (commitHash != null) all.filter { it.commitHash == commitHash } else all
     }
 
-    /** Epoch millis for a plan/note `updatedAt`; unparseable → MIN so it sorts oldest. */
     private fun ts(iso: String): Long = try {
         Instant.parse(iso).toEpochMilli()
     } catch (_: Exception) {
         Long.MIN_VALUE
     }
 
-    /** The winner revision of a recurring plan/note + which commit owns its push. */
     private data class Winner<T>(val ref: T, val ownerCommit: String, val seedDocId: Int?)
 
-    /**
-     * Pushes the subject's summaries + deduped attachments and builds the live `ref`.
-     * Shared by generate + reconcile so create-time and reconcile produce identical refs.
-     */
     private fun pushSubjectAndBuildRef(
         subjectSummaries: List<CommitSummary>,
         kind: String,
         branch: String,
         ctx: PushContext,
     ): BranchShareStore.LiveRef {
-        // 1. Pick the winner revision per plan base-slug / note id (latest updatedAt),
-        //    remembering the owner commit and any known docId to reuse.
         val planWinners = LinkedHashMap<String, Winner<PlanReference>>()
         val noteWinners = LinkedHashMap<String, Winner<NoteReference>>()
         for (summary in subjectSummaries) {
@@ -154,7 +130,6 @@ object LiveShareController {
             }
         }
 
-        // 2. Assign each winner (with its known docId injected) to its owner commit.
         val ownedPlans = HashMap<String, MutableList<PlanReference>>()
         val ownedNotes = HashMap<String, MutableList<NoteReference>>()
         for (w in planWinners.values) {
@@ -166,8 +141,6 @@ object LiveShareController {
             ownedNotes.getOrPut(w.ownerCommit) { ArrayList() }.add(item)
         }
 
-        // 3. Push each summary oldest→newest with only its owned attachments. Capture the
-        //    pushed summary docId per commit and accumulate the branch-wide attachment map.
         val planDocIdByBase = HashMap<String, Int>()
         val noteDocIdById = HashMap<String, Int>()
         for (w in planWinners.values) if (w.seedDocId != null) planDocIdByBase[PlanGrouping.planBaseKey(w.ref.slug)] = w.seedDocId
@@ -190,8 +163,6 @@ object LiveShareController {
             for (n in result.pushedDoc.notes) noteDocIdById[n.id] = n.docId
         }
 
-        // 4. Build covered: each commit references its OWN plans/notes' docids (resolved via
-        //    the shared map, so a doc pushed under a different commit is still linked).
         fun coveredFor(summary: CommitSummary): List<Int> {
             val ids = LinkedHashSet<Int>()
             for (plan in summary.plans ?: emptyList()) planDocIdByBase[PlanGrouping.planBaseKey(plan.slug)]?.let { ids.add(it) }
@@ -218,21 +189,28 @@ object LiveShareController {
         }
     }
 
-    private data class Decisions(val decisionCount: Int, val titles: List<String>)
+    private fun decisionCount(summaries: List<CommitSummary>): Int = summaries.sumOf { (it.topics ?: emptyList()).size }
 
     /**
-     * Aggregates the subject's decisions for the share headline/teaser: total topic count
-     * and the first 5 distinct topic titles. Shared by generate + reconcile.
+     * Fingerprints the shared content — topics + recap + plan/note `updatedAt` — so reconcile
+     * can skip a re-push when nothing meaningful changed (doc ids are deliberately excluded).
      */
-    private fun summarizeDecisions(summaries: List<CommitSummary>): Decisions {
-        val topicsByCommit = summaries.map { it.topics ?: emptyList() }
-        val decisionCount = topicsByCommit.sumOf { it.size }
-        val titles = topicsByCommit
-            .flatMap { topics -> topics.map { it.title.trim() } }
-            .filter { it.isNotEmpty() }
-            .distinct()
-            .take(5)
-        return Decisions(decisionCount, titles)
+    private fun computeContentHash(summaries: List<CommitSummary>): String {
+        val sb = StringBuilder()
+        for (s in summaries) {
+            sb.append(s.commitHash).append('')
+            for (t in s.topics ?: emptyList()) {
+                sb.append(t.title).append('').append(t.trigger).append('')
+                    .append(t.response).append('').append(t.decisions).append('')
+                    .append(t.todo ?: "").append('')
+            }
+            sb.append(s.recap ?: "").append('')
+            for (p in s.plans ?: emptyList()) sb.append(p.slug).append('=').append(p.updatedAt).append('')
+            for (n in s.notes ?: emptyList()) sb.append(n.id).append('=').append(n.updatedAt).append('')
+            sb.append('\n')
+        }
+        val digest = MessageDigest.getInstance("SHA-256").digest(sb.toString().toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }
     }
 
     private fun buildPushContext(deps: Deps, baseUrl: String, repoUrl: String): PushContext =
@@ -248,8 +226,9 @@ object LiveShareController {
         )
 
     /**
-     * Creates (or refreshes, idempotent per repo+branch) a live share: pushes the subject's
-     * content to the Space and records a share referencing the live docs.
+     * Creates a live share: pushes the subject's content to the Space and records a share
+     * referencing the live docs. This is the lazy-create moment (called by copy / set-access /
+     * send-invite when no link yet exists).
      */
     fun generateLiveShare(params: GenerateParams): JolliApiClient.LiveShareResult {
         val deps = params.deps
@@ -265,7 +244,7 @@ object LiveShareController {
             val ctx = buildPushContext(deps, baseUrl, repoUrl)
             val ref = pushSubjectAndBuildRef(subjectSummaries, kind, params.branch, ctx)
 
-            val (decisionCount, titles) = summarizeDecisions(subjectSummaries)
+            val decisions = decisionCount(subjectSummaries)
             val headCommitHash = subjectSummaries.last().commitHash
             val commitHashes = subjectSummaries.map { it.commitHash }
 
@@ -277,7 +256,7 @@ object LiveShareController {
                     branch = params.branch,
                     kind = kind,
                     visibility = params.visibility,
-                    decisionCount = decisionCount,
+                    decisionCount = decisions,
                     headCommitHash = headCommitHash,
                     commitHashes = commitHashes,
                     branchSlug = GitRemoteUtils.sanitizeBranchSlug(params.branch),
@@ -293,14 +272,12 @@ object LiveShareController {
                     shareId = result.shareId,
                     shareUrl = result.shareUrl,
                     visibility = result.visibility,
+                    recipients = result.recipients ?: params.recipients,
                     ref = ref,
-                    token8 = result.token?.take(8),
-                    recipients = result.recipients,
                     headCommitHash = headCommitHash,
+                    contentHash = computeContentHash(subjectSummaries),
                     expiresAt = result.expiresAt,
-                    decisionCount = decisionCount,
-                    titles = titles,
-                    commitHash = params.commitHash,
+                    decisionCount = decisions,
                 ),
                 params.commitHash,
             )
@@ -310,29 +287,31 @@ object LiveShareController {
     }
 
     /**
-     * Reconciles the live share for the CURRENT branch (only if one exists): re-pushes the
-     * current `base..HEAD` set and rebuilds `covered` from scratch (so dropped commits /
-     * removed attachments fall out), then PATCHes the server. No-op when there's no live
-     * branch-share record. Current-branch-only is a hard constraint — loadBranchSummaries
-     * reads HEAD's `base..HEAD`.
+     * Reconciles the live branch share (only if one exists): re-pushes the current
+     * `base..HEAD` set and PATCHes the `covered` ref — but SKIPS the re-push when the content
+     * fingerprint is unchanged since the last sync. No-op when there's no live branch share.
      */
     fun reconcileLiveShare(deps: Deps, branch: String) {
         withSubjectLock(deps.workspaceRoot, branch) {
-            val existing = BranchShareStore.getBranchShare(deps.workspaceRoot, branch)
-            // Only branch shares reconcile here; commit shares are a fixed doc list, and a
-            // blank confirmed-public placeholder has no shareId.
+            val existing = BranchShareStore.getShare(deps.workspaceRoot, branch)
             if (existing?.shareId.isNullOrEmpty() || existing?.ref?.kind != BranchShareStore.LiveRef.KIND_BRANCH_COLLECTION) {
                 return@withSubjectLock
             }
 
-            val baseUrl = resolveBaseUrl(deps.apiKey)
-            val repoUrl = GitRemoteUtils.getCanonicalRepoUrl(deps.workspaceRoot)
             val subjectSummaries = loadSubjectSummaries(deps, null, null)
             if (subjectSummaries.isEmpty()) {
                 log.info("reconcile: $branch has no summaries; leaving share untouched")
                 return@withSubjectLock
             }
 
+            val newContentHash = computeContentHash(subjectSummaries)
+            if (existing.contentHash != null && existing.contentHash == newContentHash) {
+                log.info("reconcile: $branch content unchanged; skipping re-push")
+                return@withSubjectLock
+            }
+
+            val baseUrl = resolveBaseUrl(deps.apiKey)
+            val repoUrl = GitRemoteUtils.getCanonicalRepoUrl(deps.workspaceRoot)
             val ctx = buildPushContext(deps, baseUrl, repoUrl)
             val ref = pushSubjectAndBuildRef(subjectSummaries, "branch", branch, ctx)
             val result = JolliApiClient.updateLiveShare(
@@ -340,26 +319,19 @@ object LiveShareController {
                 JolliApiClient.LiveSharePatch(ref = ref),
             )
 
-            // A ref-only PATCH legitimately omits unchanged fields; preserve the existing
-            // values so the cached record stays reopen-able and people-share allowlists aren't
-            // dropped; only `ref` and anything the server actually returned change.
-            val token8 = result.token?.take(8) ?: existing.token8
-            val recipients = result.recipients ?: existing.recipients
-            val (decisionCount, titles) = summarizeDecisions(subjectSummaries)
             BranchShareStore.putBranchShare(
                 deps.workspaceRoot,
                 branch,
-                BranchShareStore.BranchShareRecord(
+                existing.copy(
                     shareId = result.shareId ?: existing.shareId,
                     shareUrl = result.shareUrl?.ifEmpty { null } ?: existing.shareUrl,
                     visibility = result.visibility?.ifEmpty { null } ?: existing.visibility,
+                    recipients = result.recipients ?: existing.recipients,
                     ref = ref,
-                    token8 = token8,
-                    recipients = recipients,
                     headCommitHash = subjectSummaries.last().commitHash,
+                    contentHash = newContentHash,
                     expiresAt = result.expiresAt?.ifEmpty { null } ?: existing.expiresAt,
-                    decisionCount = decisionCount,
-                    titles = titles,
+                    decisionCount = decisionCount(subjectSummaries),
                 ),
             )
         }
