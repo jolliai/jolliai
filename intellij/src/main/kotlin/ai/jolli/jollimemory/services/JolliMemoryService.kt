@@ -752,14 +752,12 @@ val sb = StringBuilder()
                     if (summary.commitType != null && summary.commitType.name != "commit") {
                         commitType = summary.commitType.name
                     }
-                    tokenBreakdown = summary.conversationTokenBreakdown
-                        ?: summary.tokenUsage?.let {
-                            ai.jolli.jollimemory.core.ConversationTokenBreakdown(
-                                it.inputTokens,
-                                it.outputTokens,
-                                it.cacheWriteTokens,
-                            )
-                        }
+                    // Token usage + cost: aggregate the WHOLE tree, exactly like the detail webview.
+                    // A consolidated (squash/amend/rebase/merge) memory carries its tokens on the
+                    // folded children, so reading only the root's own breakdown made the list + branch
+                    // meter show N/A for memories whose detail view shows real usage.
+                    val aggBreakdown = ai.jolli.jollimemory.core.SummaryTree.aggregateConversationTokenBreakdown(summary)
+                    tokenBreakdown = aggBreakdown.takeIf { it.input + it.output + it.cached > 0 }
                     // Cost: prefer the accurate write-time per-model estimate (summed across the
                     // tree); when absent (legacy / token-only memories) fall back to a Sonnet-rate
                     // estimate of the aggregated breakdown — the same "prefer stored, else Sonnet"
@@ -769,7 +767,7 @@ val sb = StringBuilder()
                         storedCost
                     } else {
                         ai.jolli.jollimemory.core.ModelPricing.estimateSonnetCostUsd(
-                            ai.jolli.jollimemory.core.SummaryTree.aggregateConversationTokenBreakdown(summary),
+                            aggBreakdown,
                             ai.jolli.jollimemory.core.SummaryTree.aggregateConversationTokens(summary),
                         ).takeIf { it > 0.0 }
                     }
