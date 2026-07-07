@@ -24,10 +24,13 @@ import org.cef.browser.CefBrowser
 import org.cef.browser.CefFrame
 import org.cef.handler.CefRequestHandlerAdapter
 import org.cef.network.CefRequest
+import com.intellij.openapi.application.ModalityState
 import java.awt.Dimension
+import java.awt.Point
 import java.util.Base64
 import javax.swing.Action
 import javax.swing.JComponent
+import javax.swing.SwingUtilities
 
 /**
  * Renders the share modal as a JCEF **webview** inside a dialog — the same [ShareWebview] HTML/CSS/JS
@@ -87,7 +90,9 @@ class ShareWebviewDialog(
 
             val css = SummaryCssBuilder.buildCss(!JBColor.isBright())
             b.loadHTML(ShareWebview.standaloneDocument(css, bridgeScript))
-            b.component.apply { preferredSize = Dimension(460, 470) }
+            // Initial size — the webview reports its real content size right after DOM renders and
+            // handleResize() re-packs the dialog to fit exactly. Kept small so pack() only grows.
+            b.component.apply { preferredSize = Dimension(460, 260) }
         } catch (e: Exception) {
             log.info("JCEF unavailable for share dialog: ${e.message}")
             JBLabel("Share is unavailable — the JCEF runtime could not start.")
@@ -100,8 +105,20 @@ class ShareWebviewDialog(
 
     private fun dispatch(json: JsonObject) {
         val command = json.get("command")?.asString ?: return
+        log.info("dispatch: received command='$command'")
         if (command == "shareCloseDialog") {
-            ApplicationManager.getApplication().invokeLater { close(OK_EXIT_CODE) }
+            ApplicationManager.getApplication().invokeLater({ close(OK_EXIT_CODE) }, ModalityState.any())
+            return
+        }
+        if (command == "shareResize") {
+            val w = json.get("width")?.asInt ?: return
+            val h = json.get("height")?.asInt ?: return
+            handleResize(w, h)
+            return
+        }
+        if (command == "shareDebug") {
+            val msg = json.get("message")?.asString ?: return
+            log.info("[webview] $msg")
             return
         }
         val io = webviewIO()
@@ -119,6 +136,7 @@ class ShareWebviewDialog(
                         }
                         "shareRemoveRecipient" -> BranchShareModal.removeRecipientModal(io, ctx, json.get("email")?.asString ?: "")
                     }
+                    log.info("dispatch: command='$command' completed")
                 } catch (e: Exception) {
                     log.warn("Share action '$command' failed: ${e.message}", e)
                 }
@@ -148,23 +166,86 @@ class ShareWebviewDialog(
     }
 
     private fun postToWebview(command: String, data: Map<String, Any?>) {
+        log.info("postToWebview: command='$command', browserAlive=${browser != null}")
         val payload = gson.toJson(data + ("command" to command))
         val b64 = Base64.getEncoder().encodeToString(payload.toByteArray(Charsets.UTF_8))
-        ApplicationManager.getApplication().invokeLater {
-            val b = browser ?: return@invokeLater
+        ApplicationManager.getApplication().invokeLater({
+            val b = browser
+            if (b == null) {
+                log.warn("postToWebview: browser is null, dropping command='$command'")
+                return@invokeLater
+            }
+            log.info("postToWebview: executing JS for command='$command'")
             b.cefBrowser.executeJavaScript(
                 "window.dispatchEvent(new CustomEvent('jollimemory', { detail: JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('$b64'), function(c){ return c.charCodeAt(0); }))) }));",
                 b.cefBrowser.url ?: "",
                 0,
             )
-        }
+        }, ModalityState.any())
+    }
+
+    /**
+     * Grows/shrinks the dialog so the webview's real content sits inside without inner scrollbars.
+     * Called for each `shareResize` message (JS ResizeObserver + explicit pane-swap reports).
+     *
+     * Bypasses `pack()` (which was unreliable inside DialogWrapper's layout) by computing the
+     * dialog chrome overhead (`window.size - browser.component.size`) after the initial layout,
+     * then adding the reported content size to it.
+     *
+     * IMPORTANT: The dialog's top-left corner is kept fixed and never re-centered. Reason: a
+     * user's mouse-down opens a dropdown → body grows → this method fires → if we recenter, the
+     * dialog jumps up between mouse-down and mouse-up, so the mouse-up "click" lands on empty
+     * body (not the input) and bubbles to `document`, closing the dropdown they just opened.
+     * Only when the new bottom would fall off-screen do we shift the whole dialog upward.
+     */
+    private fun handleResize(contentWidth: Int, contentHeight: Int) {
+        ApplicationManager.getApplication().invokeLater({
+            val b = browser ?: return@invokeLater
+            val comp = b.component
+            val window = SwingUtilities.getWindowAncestor(comp) ?: return@invokeLater
+            val chromeW = window.width - comp.width
+            val chromeH = window.height - comp.height
+            if (comp.width <= 0 || comp.height <= 0) {
+                log.info("handleResize: dialog not laid out yet (comp=${comp.width}x${comp.height}); skipping")
+                return@invokeLater
+            }
+            val screen = comp.graphicsConfiguration?.bounds
+            val screenX = screen?.x ?: 0
+            val screenY = screen?.y ?: 0
+            val screenW = screen?.width ?: 1600
+            val screenH = screen?.height ?: 1000
+            val maxW = (screenW * 0.9).toInt() - chromeW
+            val maxH = (screenH * 0.9).toInt() - chromeH
+            val w = contentWidth.coerceIn(360, maxW.coerceAtLeast(360))
+            val h = contentHeight.coerceIn(180, maxH.coerceAtLeast(180))
+            val targetW = w + chromeW
+            val targetH = h + chromeH
+            if (window.width == targetW && window.height == targetH) return@invokeLater
+            log.info(
+                "handleResize: content=${contentWidth}x${contentHeight} chrome=${chromeW}x${chromeH} " +
+                    "window=${window.width}x${window.height} -> ${targetW}x${targetH}"
+            )
+            comp.preferredSize = Dimension(w, h)
+            window.setSize(targetW, targetH)
+            // Keep the top-left corner where it was (see doc above). Only shift the dialog up
+            // when the new bottom would fall off the screen.
+            val currentX = window.x
+            val currentY = window.y
+            val screenBottom = screenY + screenH
+            val margin = 20
+            val overflow = (currentY + targetH) - (screenBottom - margin)
+            if (overflow > 0) {
+                val newY = (currentY - overflow).coerceAtLeast(screenY + margin)
+                window.location = Point(currentX, newY)
+            }
+        }, ModalityState.any())
     }
 
     private fun notify(message: String, type: NotificationType) {
-        ApplicationManager.getApplication().invokeLater {
+        ApplicationManager.getApplication().invokeLater({
             NotificationGroupManager.getInstance().getNotificationGroup("JolliMemory")
                 .createNotification("Jolli Share", message, type).notify(project)
-        }
+        }, ModalityState.any())
     }
 
     override fun dispose() {

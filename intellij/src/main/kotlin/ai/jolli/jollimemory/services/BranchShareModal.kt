@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.services
 import ai.jolli.jollimemory.auth.JolliAuthUtils
 import ai.jolli.jollimemory.core.BranchShareStore
 import ai.jolli.jollimemory.core.CommitSummary
+import ai.jolli.jollimemory.core.JmLogger
 import java.net.URI
 
 /**
@@ -19,6 +20,8 @@ import java.net.URI
  * removed is revoked. All entry points run synchronously — invoke from a pooled thread.
  */
 object BranchShareModal {
+
+    private val log = JmLogger.create("BranchShareModal")
 
     /** A directory entry (org member or git contributor) offered as an add-people suggestion / owner row. */
     data class ShareMember(val name: String, val email: String)
@@ -109,20 +112,27 @@ object BranchShareModal {
      * `covered` allowlist against the current `base..HEAD` (best-effort), then renders.
      */
     fun openShareModal(io: ShareModalIO, ctx: ShareModalContext) {
+        log.info("openShareModal: branch=${ctx.branch}, commitHash=${ctx.commitHash}")
         val apiKey = ctx.apiKey
         if (apiKey == null) {
+            log.info("openShareModal: no apiKey, posting NeedsApiKey")
             io.postState(ShareModalState.NeedsApiKey)
             return
         }
         val existing = BranchShareStore.getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash)
-        if (ctx.commitHash == null && existing?.ref?.kind == BranchShareStore.LiveRef.KIND_BRANCH_COLLECTION) {
+        log.info("openShareModal: existing share=${existing?.shareId}, ref.kind=${existing?.ref?.kind}")
+        if (ctx.commitHash == null && isLive(existing, ctx.nowMs) && existing?.ref?.kind == BranchShareStore.LiveRef.KIND_BRANCH_COLLECTION) {
+            log.info("openShareModal: posting Loading state, starting reconcile")
             io.postState(ShareModalState.Loading("Syncing to Jolli…"))
             try {
                 LiveShareController.reconcileLiveShare(buildDeps(ctx, apiKey), ctx.branch)
+                log.info("openShareModal: reconcile completed successfully")
             } catch (e: Exception) {
+                log.warn("openShareModal: reconcile failed: ${e.message}", e)
                 io.notifyError("Couldn't refresh the shared content: ${errMessage(e)}")
             }
         }
+        log.info("openShareModal: calling postReady")
         postReady(io, ctx)
     }
 
@@ -134,22 +144,30 @@ object BranchShareModal {
         val apiKey = ctx.apiKey ?: run {
             io.postState(ShareModalState.NeedsApiKey); io.postCopyResult(ShareCopyResult(false)); return
         }
+        var minted = false
+        var patched = false
         try {
             var existing = BranchShareStore.getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash)
-            if (existing == null) {
+            if (!isLive(existing, ctx.nowMs)) {
                 if (visibility == "people") {
-                    io.notifyError("Add people first, then copy the invite link.")
+                    io.notifyError("No one is invited yet — pick a teammate above first, or switch who can open the link.")
                     io.postCopyResult(ShareCopyResult(false))
-                    postReady(io, ctx)
                     return
                 }
-                generate(ctx, apiKey, visibility, null) // silent mint
+                generate(ctx, apiKey, visibility, null)
+                minted = true
                 existing = BranchShareStore.getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash)
-            } else if (existing.visibility != visibility && visibility != "people") {
+            } else if (existing!!.visibility != visibility) {
+                if (visibility == "people" && (existing.recipients ?: emptyList()).isEmpty()) {
+                    io.notifyError("No one is invited yet — pick a teammate above first, or switch who can open the link.")
+                    io.postCopyResult(ShareCopyResult(false))
+                    return
+                }
                 BranchShareController.patchShareAudience(
                     ctx.workspaceRoot, ctx.branch, apiKey,
                     BranchShareController.ShareAudiencePatch(visibility = visibility), ctx.commitHash,
                 )
+                patched = true
                 existing = BranchShareStore.getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash)
             }
             val url = existing?.shareUrl
@@ -164,21 +182,30 @@ object BranchShareModal {
             io.notifyError("Couldn't copy the share link: ${errMessage(e)}")
             io.postCopyResult(ShareCopyResult(false))
         }
-        postReady(io, ctx)
+        if (minted || patched) postReady(io, ctx)
     }
 
     /** Sets the access tier, flipping the single link in place (or minting/revoking per the model). */
     fun setShareAccessModal(io: ShareModalIO, ctx: ShareModalContext, visibility: String) {
         val apiKey = ctx.apiKey ?: run { io.postState(ShareModalState.NeedsApiKey); return }
+        val existing = BranchShareStore.getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash)
+        if (!isLive(existing, ctx.nowMs)) {
+            if (visibility != "people") {
+                try {
+                    generate(ctx, apiKey, visibility, null)
+                } catch (e: Exception) {
+                    io.postState(ShareModalState.Error(generateErrorMessage(e)))
+                    return
+                }
+            }
+            postReady(io, ctx)
+            return
+        }
         try {
-            val existing = BranchShareStore.getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash)
-            if (existing == null) {
-                // people with no link: wait for Send invite. public/org: silent mint.
-                if (visibility != "people") generate(ctx, apiKey, visibility, null)
-            } else if (visibility == "people" && (existing.recipients.isNullOrEmpty())) {
-                // A people link with no one on it is a dead owner-only link — revoke.
+            if (visibility == "people" && (existing!!.recipients.isNullOrEmpty())) {
                 BranchShareController.revokeShare(ctx.workspaceRoot, ctx.branch, apiKey, ctx.commitHash)
-            } else {
+                io.notifyInfo("Link stopped — no one was invited.")
+            } else if (existing!!.visibility != visibility) {
                 BranchShareController.patchShareAudience(
                     ctx.workspaceRoot, ctx.branch, apiKey,
                     BranchShareController.ShareAudiencePatch(visibility = visibility), ctx.commitHash,
@@ -209,48 +236,60 @@ object BranchShareModal {
             postReady(io, ctx)
             return
         }
-        val targetTier = visibility ?: "people"
-        io.postState(ShareModalState.Loading("Sending invite…"))
-        var mintedNow = false
+        val targetTier = if (visibility == "org") "org" else "people"
+        var mintedForInvite = false
+        var reTieredFrom: String? = null
         try {
             var existing = BranchShareStore.getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash)
-            if (existing == null) {
+            if (!isLive(existing, ctx.nowMs)) {
                 generate(ctx, apiKey, targetTier, if (targetTier == "people") clean else null)
-                mintedNow = true
+                mintedForInvite = true
                 existing = BranchShareStore.getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash)
-            } else if (existing.visibility != targetTier) {
-                BranchShareController.patchShareAudience(
-                    ctx.workspaceRoot, ctx.branch, apiKey,
-                    BranchShareController.ShareAudiencePatch(visibility = targetTier), ctx.commitHash,
-                )
+            } else if (existing!!.visibility != targetTier) {
+                val from = existing.visibility
+                try {
+                    BranchShareController.patchShareAudience(
+                        ctx.workspaceRoot, ctx.branch, apiKey,
+                        BranchShareController.ShareAudiencePatch(visibility = targetTier), ctx.commitHash,
+                    )
+                } catch (e: Exception) {
+                    io.notifyError("Couldn't update the link's access before inviting: ${errMessage(e)}")
+                    postReady(io, ctx)
+                    return
+                }
+                reTieredFrom = from
                 existing = BranchShareStore.getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash)
             }
             val shareId = existing?.shareId
             if (shareId.isNullOrEmpty()) {
-                io.notifyError("Share link could not be created — please try again.")
-                postReady(io, ctx)
+                io.notifyError("The link could not be created — please try again.")
                 return
             }
             val result = JolliApiClient.sendShareInviteAndGrantAccess(null, apiKey, shareId, clean, message)
-            // Server merged all recipients into the allowlist (access granted) before emailing.
             val merged = normalizeRecipients((existing.recipients ?: emptyList()) + clean, ctx.owner.email)
             BranchShareStore.putBranchShare(
                 ctx.workspaceRoot, ctx.branch,
                 existing.copy(recipients = merged), ctx.commitHash,
             )
             if (result.failed.isNotEmpty()) {
-                io.notifyError("Invite sent, but some emails failed: ${result.failed.joinToString(", ")}")
+                io.notifyError("Access granted, but the email couldn't be sent to: ${result.failed.joinToString(", ")}")
             } else {
                 io.notifyInfo("Invite sent to ${clean.size} ${if (clean.size == 1) "person" else "people"}.")
             }
         } catch (e: Exception) {
-            // All-or-nothing for a fresh mint: don't leave a dangling link if the invite failed.
-            if (mintedNow) {
-                try {
-                    BranchShareController.revokeShare(ctx.workspaceRoot, ctx.branch, apiKey, ctx.commitHash)
-                } catch (_: Exception) { }
-            }
             io.notifyError("Couldn't send the invite: ${errMessage(e)}")
+            try {
+                if (mintedForInvite) {
+                    BranchShareController.revokeShare(ctx.workspaceRoot, ctx.branch, apiKey, ctx.commitHash)
+                } else if (reTieredFrom != null) {
+                    BranchShareController.patchShareAudience(
+                        ctx.workspaceRoot, ctx.branch, apiKey,
+                        BranchShareController.ShareAudiencePatch(visibility = reTieredFrom), ctx.commitHash,
+                    )
+                }
+            } catch (rollbackErr: Exception) {
+                io.notifyError("Couldn't restore the previous link access: ${errMessage(rollbackErr)}")
+            }
         }
         postReady(io, ctx)
     }
@@ -268,6 +307,7 @@ object BranchShareModal {
             val remaining = (existing!!.recipients ?: emptyList()).filter { it.trim().lowercase() != target }
             if (existing.visibility == "people" && remaining.isEmpty()) {
                 BranchShareController.revokeShare(ctx.workspaceRoot, ctx.branch, apiKey, ctx.commitHash)
+                io.notifyInfo("Link stopped — no one is invited anymore.")
             } else {
                 BranchShareController.patchShareAudience(
                     ctx.workspaceRoot, ctx.branch, apiKey,
@@ -275,7 +315,7 @@ object BranchShareModal {
                 )
             }
         } catch (e: Exception) {
-            io.notifyError("Couldn't remove that person: ${errMessage(e)}")
+            io.notifyError("Couldn't remove $email: ${errMessage(e)}")
         }
         postReady(io, ctx)
     }
@@ -296,23 +336,19 @@ object BranchShareModal {
 
     /** Renders the current ready state from the stored record (or an absent link). */
     private fun postReady(io: ShareModalIO, ctx: ShareModalContext) {
-        val record = BranchShareStore.getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash)
-        val share: ShareLinkState? = record
-            ?.takeIf { it.shareId.isNotEmpty() && it.shareUrl.isNotEmpty() }
-            ?.let {
-                try {
-                    assertSafeShareUrl(it.shareUrl)
-                    ShareLinkState(it.shareUrl, it.visibility, it.recipients ?: emptyList())
-                } catch (_: Exception) {
-                    null
-                }
-            }
+        val record = presentable(BranchShareStore.getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash), ctx.nowMs)
+        log.info("postReady: record shareId=${record?.shareId}, shareUrl=${record?.shareUrl?.take(40)}")
+        val share: ShareLinkState? = record?.let {
+            ShareLinkState(it.shareUrl, it.visibility, it.recipients ?: emptyList())
+        }
+        val decisionCount = record?.decisionCount ?: subjectDecisionCount(ctx)
+        log.info("postReady: posting Ready state, hasShare=${share != null}, branch=${ctx.branch}")
         io.postState(
             ShareModalState.Ready(
                 branch = ctx.branch,
                 subject = shareSubject(ctx),
                 subjectTitle = ctx.subjectTitle,
-                decisionCount = record?.decisionCount ?: subjectDecisionCount(ctx),
+                decisionCount = decisionCount,
                 canOrg = ctx.canOrg,
                 share = share,
                 accountMembers = ctx.accountMembers,
@@ -320,6 +356,7 @@ object BranchShareModal {
                 owner = ctx.owner,
             )
         )
+        log.info("postReady: Ready state posted to IO")
     }
 
     /** Topic count for the subtitle when no link record caches it yet. Best-effort (0 on failure). */
@@ -347,9 +384,46 @@ object BranchShareModal {
         return out.toList()
     }
 
+    private fun generateErrorMessage(e: Throwable): String {
+        if (e is JolliPushOrchestrator.ShareBindingError) {
+            return when (e.outcome) {
+                JolliPushOrchestrator.BindingOutcome.ANOTHER_OPEN ->
+                    "A Memory space chooser is already open for this repo. Finish there, then share again."
+                JolliPushOrchestrator.BindingOutcome.CANCELLED ->
+                    "Sharing needs a Memory space — none was chosen. Reopen Share to pick one."
+                else -> "Sharing needs a Memory space, but one couldn't be set up. Try again."
+            }
+        }
+        if (e is LiveShareController.NothingToShareError) return e.message ?: errMessage(e)
+        return "Could not create share link: ${errMessage(e)}"
+    }
+
     private fun assertSafeShareUrl(url: String) {
         val uri = URI(url)
         JolliAuthUtils.assertJolliOriginAllowed("${uri.scheme}://${uri.authority}")
+    }
+
+    private fun isExpired(expiresAt: String?, nowMs: Long?): Boolean {
+        if (expiresAt.isNullOrEmpty() || nowMs == null) return false
+        return try {
+            val t = java.time.Instant.parse(expiresAt).toEpochMilli()
+            t <= nowMs
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun isLive(rec: BranchShareStore.BranchShareRecord?, nowMs: Long?): Boolean =
+        rec != null && rec.shareId.isNotEmpty() && rec.shareUrl.isNotEmpty() && !isExpired(rec.expiresAt, nowMs)
+
+    private fun presentable(rec: BranchShareStore.BranchShareRecord?, nowMs: Long?): BranchShareStore.BranchShareRecord? {
+        if (!isLive(rec, nowMs)) return null
+        return try {
+            assertSafeShareUrl(rec!!.shareUrl)
+            rec
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun errMessage(e: Throwable): String = e.message ?: e.toString()
