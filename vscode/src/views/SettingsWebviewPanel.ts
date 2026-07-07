@@ -34,6 +34,7 @@ import {
 	installGeminiHook,
 	removeClaudeHook,
 	removeGeminiHook,
+	syncGlobalInstructions,
 } from "../../../cli/src/install/Installer.js";
 import type { JolliMemoryConfig } from "../../../cli/src/Types.js";
 import type { AuthService } from "../services/AuthService.js";
@@ -53,6 +54,8 @@ interface SettingsPayload {
 	readonly openCodeEnabled: boolean;
 	readonly cursorEnabled: boolean;
 	readonly copilotEnabled: boolean;
+	/** Tri-state config switch (undecided | "enabled" | "disabled") flattened to a checkbox; see handleApplySettings for the enable/disable/preserve-undecided persistence rules. */
+	readonly globalInstructions: boolean;
 	readonly localFolder: string;
 	readonly excludePatterns: string;
 	/** Comma-separated folder names (exact or `*` glob) skipped by `jolli compile`. */
@@ -457,6 +460,7 @@ export class SettingsWebviewPanel {
 			openCodeEnabled: config.openCodeEnabled !== false,
 			cursorEnabled: config.cursorEnabled !== false,
 			copilotEnabled: config.copilotEnabled !== false,
+			globalInstructions: config.globalInstructions === "enabled",
 			localFolder: config.localFolder ?? "",
 			excludePatterns: config.excludePatterns
 				? config.excludePatterns.join(", ")
@@ -568,6 +572,27 @@ export class SettingsWebviewPanel {
 			.map((p) => p.trim())
 			.filter((p) => p.length > 0);
 
+		const configDir = this.resolveConfigDir();
+		// Read the persisted config before building the update so the
+		// globalInstructions tri-state mapping below (enable / disable /
+		// preserve-undecided) can compare the incoming checkbox against what's
+		// actually on disk, not just the payload the webview happens to send.
+		const currentConfig = await loadConfigFromDir(configDir);
+
+		// The checkbox is binary; the config field is tri-state
+		// (undefined | "enabled" | "disabled"). Turning the checkbox off must
+		// NOT clobber an undecided value with an explicit "disabled" — that
+		// would permanently suppress the activation notification for a user
+		// who simply never touched this toggle. Only an explicit enabled ->
+		// off transition writes "disabled"; otherwise the field is omitted
+		// from the update entirely (never written as `undefined`, which would
+		// delete an existing value via saveConfigScoped's merge).
+		const giUpdate: { globalInstructions?: "enabled" | "disabled" } = settings.globalInstructions
+			? { globalInstructions: "enabled" }
+			: currentConfig.globalInstructions === "enabled"
+				? { globalInstructions: "disabled" }
+				: {};
+
 		const update: Partial<JolliMemoryConfig> = {
 			apiKey: resolvedApiKey.length > 0 ? resolvedApiKey : undefined,
 			model: settings.model === "sonnet" ? undefined : settings.model,
@@ -581,6 +606,7 @@ export class SettingsWebviewPanel {
 			openCodeEnabled: settings.openCodeEnabled,
 			cursorEnabled: settings.cursorEnabled,
 			copilotEnabled: settings.copilotEnabled,
+			...giUpdate,
 			localFolder:
 				settings.localFolder && settings.localFolder.length > 0
 					? settings.localFolder
@@ -607,8 +633,21 @@ export class SettingsWebviewPanel {
 		const repoRoot = await getProjectRootDir(this.workspaceRoot);
 		await this.syncHooks(repoRoot, settings);
 
-		const configDir = this.resolveConfigDir();
 		await saveConfigScoped(update, configDir);
+
+		// Act on a global-instructions transition in EITHER direction: the
+		// undecided/disabled -> enabled transition writes the block; the
+		// enabled -> off transition removes it (the checkbox's "off" must
+		// actually undo the write, not just flip the persisted flag). Config
+		// was persisted just above, so syncGlobalInstructions reads the fresh
+		// value and does the right thing. Calling the block-specific sync
+		// (rather than re-running the full installer) keeps host-gating in one
+		// place without redoing hook/MCP work the settings save already did.
+		const giEnabling = settings.globalInstructions && currentConfig.globalInstructions !== "enabled";
+		const giDisabling = !settings.globalInstructions && currentConfig.globalInstructions === "enabled";
+		if (giEnabling || giDisabling) {
+			await syncGlobalInstructions();
+		}
 
 		this.fullApiKey = resolvedApiKey;
 		this.fullJolliApiKey = resolvedJolliApiKey;

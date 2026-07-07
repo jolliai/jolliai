@@ -101,11 +101,13 @@ const {
 	mockRemoveClaudeHook,
 	mockInstallGeminiHook,
 	mockRemoveGeminiHook,
+	mockSyncGlobalInstructions,
 } = vi.hoisted(() => ({
 	mockInstallClaudeHook: vi.fn().mockResolvedValue({}),
 	mockRemoveClaudeHook: vi.fn().mockResolvedValue({}),
 	mockInstallGeminiHook: vi.fn().mockResolvedValue({}),
 	mockRemoveGeminiHook: vi.fn().mockResolvedValue(undefined),
+	mockSyncGlobalInstructions: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../../../cli/src/install/Installer.js", () => ({
@@ -113,6 +115,7 @@ vi.mock("../../../cli/src/install/Installer.js", () => ({
 	removeClaudeHook: mockRemoveClaudeHook,
 	installGeminiHook: mockInstallGeminiHook,
 	removeGeminiHook: mockRemoveGeminiHook,
+	syncGlobalInstructions: mockSyncGlobalInstructions,
 }));
 
 vi.mock("../util/Logger.js", () => ({
@@ -411,6 +414,39 @@ describe("SettingsWebviewPanel", () => {
 					settings: expect.objectContaining({ dcoSignoff: false }),
 				}),
 			);
+		});
+
+		it("maps globalInstructions 'enabled' to true, and undecided/'disabled' to false", async () => {
+			async function loadWithGlobalInstructions(
+				globalInstructions: "enabled" | "disabled" | undefined,
+			): Promise<boolean> {
+				SettingsWebviewPanel.dispose();
+				mockLoadConfigFromDir.mockResolvedValue({
+					apiKey: undefined,
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: undefined,
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: [],
+					globalInstructions,
+				});
+				await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+				const dispatch = captureMessageHandler();
+				postMessage.mockClear();
+				dispatch({ command: "loadSettings" });
+				await flushPromises();
+				const call = postMessage.mock.calls.find(
+					([msg]) => (msg as { command: string }).command === "settingsLoaded",
+				);
+				const msg = call?.[0] as { settings: { globalInstructions: boolean } };
+				return msg.settings.globalInstructions;
+			}
+
+			expect(await loadWithGlobalInstructions("enabled")).toBe(true);
+			expect(await loadWithGlobalInstructions("disabled")).toBe(false);
+			expect(await loadWithGlobalInstructions(undefined)).toBe(false);
 		});
 
 		it("returns short key without known prefix as-is", async () => {
@@ -1691,6 +1727,122 @@ describe("SettingsWebviewPanel", () => {
 				message: "Failed to save settings",
 			});
 			expect(mockSaveConfigScoped).not.toHaveBeenCalled();
+		});
+	});
+
+	// ── applySettings with globalInstructions ───────────────────────────────
+	// Tri-state config (undefined | "enabled" | "disabled") behind a binary
+	// checkbox. See task-settings-brief.md for the mapping rules: turning the
+	// checkbox off must not clobber an "undecided" config value.
+	// syncGlobalInstructions runs on a transition in EITHER direction — enabling
+	// writes the block, disabling removes it — but not on a no-op re-save.
+
+	describe("applySettings with globalInstructions", () => {
+		/** Loads settings to populate cached keys, then returns dispatch fn. */
+		async function setupForGlobalInstructions(
+			configOverrides?: Record<string, unknown>,
+		) {
+			const config = {
+				apiKey: "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234",
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: "",
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+				...configOverrides,
+			};
+			mockLoadConfigFromDir.mockResolvedValue(config);
+			mockInstallClaudeHook.mockResolvedValue({});
+			mockRemoveClaudeHook.mockResolvedValue({});
+			mockInstallGeminiHook.mockResolvedValue({});
+			mockRemoveGeminiHook.mockResolvedValue(undefined);
+
+			SettingsWebviewPanel.dispose();
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			postMessage.mockClear();
+
+			return dispatch;
+		}
+
+		function applyGlobalInstructions(
+			dispatch: (msg: Record<string, unknown>) => void,
+			globalInstructions: boolean,
+		) {
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+					globalInstructions,
+				},
+			});
+		}
+
+		it("toggle ON from undecided persists 'enabled' and syncs the block once", async () => {
+			const dispatch = await setupForGlobalInstructions({ globalInstructions: undefined });
+
+			applyGlobalInstructions(dispatch, true);
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ globalInstructions: "enabled" }),
+				expect.any(String),
+			);
+			expect(mockSyncGlobalInstructions).toHaveBeenCalledTimes(1);
+		});
+
+		it("toggle OFF while currently 'enabled' persists 'disabled' and syncs (removal)", async () => {
+			const dispatch = await setupForGlobalInstructions({ globalInstructions: "enabled" });
+
+			applyGlobalInstructions(dispatch, false);
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ globalInstructions: "disabled" }),
+				expect.any(String),
+			);
+			// The disable transition must run the sync so the block is actually
+			// removed — flipping the flag alone would leave a stale block behind.
+			expect(mockSyncGlobalInstructions).toHaveBeenCalledTimes(1);
+		});
+
+		it("toggle OFF while undecided omits the field entirely (preserve undecided) and does not sync", async () => {
+			const dispatch = await setupForGlobalInstructions({ globalInstructions: undefined });
+
+			applyGlobalInstructions(dispatch, false);
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledTimes(1);
+			const [savedUpdate] = mockSaveConfigScoped.mock.calls[0] as [Record<string, unknown>, string];
+			expect(Object.hasOwn(savedUpdate, "globalInstructions")).toBe(false);
+			expect(mockSyncGlobalInstructions).not.toHaveBeenCalled();
+		});
+
+		it("toggle ON while already 'enabled' does not re-sync", async () => {
+			const dispatch = await setupForGlobalInstructions({ globalInstructions: "enabled" });
+
+			applyGlobalInstructions(dispatch, true);
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ globalInstructions: "enabled" }),
+				expect.any(String),
+			);
+			expect(mockSyncGlobalInstructions).not.toHaveBeenCalled();
 		});
 	});
 

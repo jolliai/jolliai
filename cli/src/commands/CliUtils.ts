@@ -176,6 +176,15 @@ export function isInteractive(): boolean {
 }
 
 /**
+ * Parses a `[Y/n]` answer where the default (Enter → empty string) is YES.
+ * Returns true for "", "y", "yes" (case-insensitive, trimmed); false otherwise.
+ */
+export function isAffirmative(answer: string): boolean {
+	const a = answer.trim().toLowerCase();
+	return a === "" || a === "y" || a === "yes";
+}
+
+/**
  * Hard cap on `--arg-stdin` payload size. The flag only ever carries a branch
  * name or short keyword query (skill templates pipe a single line via here-doc).
  * 64 KiB is many orders of magnitude above any legitimate input but small

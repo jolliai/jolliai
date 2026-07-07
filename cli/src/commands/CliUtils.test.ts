@@ -205,6 +205,23 @@ describe("CliUtils", () => {
 		});
 	});
 
+	describe("isAffirmative", () => {
+		it("treats Enter (empty) as yes — the default", async () => {
+			const { isAffirmative } = await import("./CliUtils.js");
+			expect(isAffirmative("")).toBe(true);
+		});
+
+		it.each(["y", "Y", "yes", "YES", " Yes "])("treats %j as yes", async (input) => {
+			const { isAffirmative } = await import("./CliUtils.js");
+			expect(isAffirmative(input)).toBe(true);
+		});
+
+		it.each(["n", "no", "nope", "x"])("treats %j as no", async (input) => {
+			const { isAffirmative } = await import("./CliUtils.js");
+			expect(isAffirmative(input)).toBe(false);
+		});
+	});
+
 	describe("formatShortDate", () => {
 		it("formats a valid ISO date as 'Mon DD'", async () => {
 			const { formatShortDate } = await import("./CliUtils.js");

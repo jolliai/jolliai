@@ -14,8 +14,12 @@ vi.mock("node:os", async (importOriginal) => {
 
 import {
 	applyInstructionsBlock,
+	GLOBAL_INSTRUCTIONS_PROMPT,
 	installGlobalInstructions,
+	removeGlobalInstructions,
+	removeInstructionsBlock,
 	renderInstructionsBlock,
+	resolveGlobalInstructionsDecision,
 } from "./GlobalInstructionsInstaller.js";
 
 const START = "<!-- >>> jolli memory instructions >>> -->";
@@ -154,5 +158,106 @@ describe("installGlobalInstructions", () => {
 		await installGlobalInstructions({ claude: true, gemini: false, codex: false });
 		const second = await readFile(join(home, ".claude", "CLAUDE.md"), "utf-8");
 		expect(second).toBe(first);
+	});
+});
+
+describe("GLOBAL_INSTRUCTIONS_PROMPT", () => {
+	it("leads with the benefit and names the target files", () => {
+		expect(GLOBAL_INSTRUCTIONS_PROMPT).toContain("use Jolli's memory automatically");
+		expect(GLOBAL_INSTRUCTIONS_PROMPT).toContain("~/.claude/CLAUDE.md");
+		expect(GLOBAL_INSTRUCTIONS_PROMPT).not.toContain("[Y/n]");
+	});
+});
+
+describe("resolveGlobalInstructionsDecision", () => {
+	it("writes without prompting when already enabled", async () => {
+		const confirm = vi.fn();
+		expect(await resolveGlobalInstructionsDecision("enabled", confirm)).toEqual({ write: true });
+		expect(confirm).not.toHaveBeenCalled();
+	});
+
+	it("removes without prompting when already disabled", async () => {
+		const confirm = vi.fn();
+		expect(await resolveGlobalInstructionsDecision("disabled", confirm)).toEqual({ write: false, remove: true });
+		expect(confirm).not.toHaveBeenCalled();
+	});
+
+	it("skips and stays undecided when undecided with no callback", async () => {
+		expect(await resolveGlobalInstructionsDecision(undefined, undefined)).toEqual({ write: false });
+	});
+
+	it("persists enabled and writes when the callback agrees", async () => {
+		expect(await resolveGlobalInstructionsDecision(undefined, async () => true)).toEqual({
+			write: true,
+			persist: "enabled",
+		});
+	});
+
+	it("persists disabled and removes when the callback declines", async () => {
+		expect(await resolveGlobalInstructionsDecision(undefined, async () => false)).toEqual({
+			write: false,
+			remove: true,
+			persist: "disabled",
+		});
+	});
+});
+
+describe("removeInstructionsBlock", () => {
+	const block = renderInstructionsBlock();
+
+	it("returns the input unchanged when no block is present", () => {
+		const existing = "# My global rules\n\nBe concise.\n";
+		expect(removeInstructionsBlock(existing)).toBe(existing);
+	});
+
+	it("strips a marker block and the blank separator it was appended after", () => {
+		const existing = applyInstructionsBlock("# My global rules\n\nBe concise.\n", block);
+		expect(existing).toContain(START);
+		const removed = removeInstructionsBlock(existing);
+		expect(removed).not.toContain(START);
+		expect(removed).not.toContain(END);
+		expect(removed).not.toContain("jolli-pr");
+		// Surrounding user content survives; no dangling blank line at EOF.
+		expect(removed).toContain("# My global rules");
+		expect(removed).toContain("Be concise.");
+		expect(removed.endsWith("\n\n")).toBe(false);
+	});
+
+	it("round-trips: apply then remove restores content around the block", () => {
+		const original = "# Rules\n\nline one\n";
+		const withBlock = applyInstructionsBlock(original, block);
+		expect(removeInstructionsBlock(withBlock)).toContain("line one");
+	});
+});
+
+describe("removeGlobalInstructions", () => {
+	let home: string;
+
+	beforeEach(async () => {
+		home = await mkdtemp(join(tmpdir(), "jolli-global-instr-rm-"));
+		mockHomedir.mockReturnValue(home);
+	});
+
+	afterEach(async () => {
+		await rm(home, { recursive: true, force: true });
+	});
+
+	it("removes the block from every host, ungated, and leaves other content", async () => {
+		// Pre-existing user content around a written block in two hosts.
+		await installGlobalInstructions({ claude: true, gemini: true, codex: false });
+		await mkdir(join(home, ".claude"), { recursive: true });
+
+		await removeGlobalInstructions();
+
+		const claude = await readFile(join(home, ".claude", "CLAUDE.md"), "utf-8");
+		const gemini = await readFile(join(home, ".gemini", "GEMINI.md"), "utf-8");
+		expect(claude).not.toContain("jolli-pr");
+		expect(gemini).not.toContain("jolli-pr");
+	});
+
+	it("is a fail-soft no-op when a host file does not exist", async () => {
+		// No files written; removal must not throw or create files.
+		await expect(removeGlobalInstructions()).resolves.toBeUndefined();
+		await expect(readFile(join(home, ".claude", "CLAUDE.md"), "utf-8")).rejects.toThrow();
 	});
 });

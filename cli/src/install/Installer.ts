@@ -81,7 +81,11 @@ import {
 	removePostRewriteHook,
 	removePrepareMsgHook,
 } from "./GitHookInstaller.js";
-import { installGlobalInstructions } from "./GlobalInstructionsInstaller.js";
+import {
+	installGlobalInstructions,
+	removeGlobalInstructions,
+	resolveGlobalInstructionsDecision,
+} from "./GlobalInstructionsInstaller.js";
 import type { HookOpResult } from "./HookSettingsHelper.js";
 import {
 	buildRegistrars,
@@ -126,6 +130,38 @@ function hasRequiredWorktreeHooks(
 	return claudeReady && geminiReady;
 }
 
+/**
+ * Resolves and applies the machine-global skill-preference block: reads the
+ * persisted `globalInstructions` switch, consults the optional confirm callback,
+ * persists a fresh decision, then writes OR removes the block accordingly.
+ *
+ * Single source of host-gating for the block, shared by `install()` (which passes
+ * pre-computed detection to avoid re-running detectors) and the VS Code settings
+ * panel (which calls it directly after toggling the switch, rather than re-running
+ * the full installer). Fail-soft throughout — see GlobalInstructionsInstaller.
+ */
+export async function syncGlobalInstructions(
+	confirm?: () => Promise<boolean>,
+	detected?: { readonly codexDetected: boolean; readonly geminiDetected: boolean },
+): Promise<void> {
+	const config = await loadConfig();
+	const decision = await resolveGlobalInstructionsDecision(config.globalInstructions, confirm);
+	if (decision.persist) {
+		await saveConfigScoped({ globalInstructions: decision.persist }, getGlobalConfigDir());
+	}
+	if (decision.write) {
+		const codexDetected = detected?.codexDetected ?? (await isCodexInstalled());
+		const geminiDetected = detected?.geminiDetected ?? (await isGeminiInstalled());
+		await installGlobalInstructions({
+			claude: config.claudeEnabled !== false,
+			gemini: geminiDetected && config.geminiEnabled !== false,
+			codex: codexDetected && config.codexEnabled !== false,
+		});
+	} else if (decision.remove) {
+		await removeGlobalInstructions();
+	}
+}
+
 // ─── Install ────────────────────────────────────────────────────────────────
 
 /**
@@ -141,7 +177,12 @@ function hasRequiredWorktreeHooks(
  */
 export async function install(
 	cwd?: string,
-	options?: { source?: "vscode-extension" | "cli"; integrationsOnly?: boolean; sourceTag?: string },
+	options?: {
+		source?: "vscode-extension" | "cli";
+		integrationsOnly?: boolean;
+		sourceTag?: string;
+		confirmGlobalInstructions?: () => Promise<boolean>;
+	},
 ): Promise<InstallResult> {
 	/* v8 ignore next - process.cwd() fallback only used when called without cwd arg */
 	const projectDir = cwd ?? process.cwd();
@@ -328,10 +369,14 @@ export async function install(
 		// whenever Claude isn't explicitly disabled, consistent with the rest of
 		// the installer treating Claude as the primary host. This is an integration
 		// (skill preference), not a hook, so it runs in integrations-only mode too.
-		await installGlobalInstructions({
-			claude: config.claudeEnabled !== false,
-			gemini: geminiDetectedOnce && config.geminiEnabled !== false,
-			codex: codexDetectedOnce && config.codexEnabled !== false,
+		// Ask before writing into the user's machine-global instruction files.
+		// Undecided + no callback (VS Code auto-enable / -y / IntelliJ) → skip and
+		// stay undecided; the interactive CLI passes a callback, VS Code drives its
+		// own notification. Delegated to syncGlobalInstructions so the settings panel
+		// shares identical host-gating and the write/remove/persist decision logic.
+		await syncGlobalInstructions(options?.confirmGlobalInstructions, {
+			codexDetected: codexDetectedOnce,
+			geminiDetected: geminiDetectedOnce,
 		});
 
 		// Git hooks are shared across all worktrees — install once. Skipped in

@@ -936,6 +936,13 @@ export interface JolliMemoryConfig {
 	readonly geminiEnabled?: boolean;
 	/** Enable Claude Code session tracking via Stop hook (default: true) */
 	readonly claudeEnabled?: boolean;
+	/**
+	 * Whether Jolli may write its skill-preference block into the machine-global
+	 * AI instruction files (~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md,
+	 * ~/.codex/AGENTS.md). `undefined` = not yet decided (default: skip until the
+	 * user confirms via the CLI prompt or the VS Code notification).
+	 */
+	readonly globalInstructions?: "enabled" | "disabled";
 	/** Enable OpenCode session discovery at post-commit time (default: auto-detect) */
 	readonly openCodeEnabled?: boolean;
 	/** Enable Cursor Composer session discovery at post-commit time (default: auto-detect) */

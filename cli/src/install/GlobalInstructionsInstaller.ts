@@ -92,6 +92,57 @@ export function renderInstructionsBlock(): string {
 }
 
 /**
+ * Benefit-led confirmation message shown before Jolli writes its skill-preference
+ * block into the machine-global AI instruction files. SINGLE SOURCE OF TRUTH — both
+ * the CLI prompt (append `[Y/n]:`) and the VS Code notification (three buttons) render
+ * this exact string, so the wording can never drift between surfaces.
+ */
+// Keep this path list in sync with the `installGlobalInstructions({ claude, gemini, codex })`
+// targets below (TARGETS) — adding a fourth host must update both.
+export const GLOBAL_INSTRUCTIONS_PROMPT =
+	"Let your AI assistants use Jolli's memory automatically? This adds a small " +
+	"skill-preference block to your global instruction files (~/.claude/CLAUDE.md, " +
+	"~/.gemini/GEMINI.md, ~/.codex/AGENTS.md) so your AI reaches for Jolli when you " +
+	"create PRs, search past decisions, or recall a branch's history — no need to ask each time.";
+
+/** Persisted tri-state: `undefined` = undecided (default), else the user's choice. */
+export type GlobalInstructionsChoice = "enabled" | "disabled" | undefined;
+
+/**
+ * Outcome of consulting the switch:
+ *  - `write`   — write the block now.
+ *  - `persist` — when present, the caller must persist this to the global config's
+ *                `globalInstructions` field (set only when a fresh decision was made).
+ */
+export interface GlobalInstructionsDecision {
+	readonly write: boolean;
+	/** When true, actively remove any previously-written block (opt-out). */
+	readonly remove?: boolean;
+	readonly persist?: "enabled" | "disabled";
+}
+
+/**
+ * Resolves what to do with the global-instructions block from the current switch
+ * value plus an optional confirm callback (supplied only by interactive surfaces):
+ *  - `enabled`   → write, no persist.
+ *  - `disabled`  → remove any existing block, no persist (heals a stale block a
+ *                  now-opted-out user still has from a prior `enabled` run).
+ *  - undecided + callback   → ask; persist + write/remove per the answer.
+ *  - undecided + no callback → skip, stay undecided (safe default for non-interactive).
+ *    Undecided never removes — the block was never written on the user's behalf.
+ */
+export async function resolveGlobalInstructionsDecision(
+	current: GlobalInstructionsChoice,
+	confirm?: () => Promise<boolean>,
+): Promise<GlobalInstructionsDecision> {
+	if (current === "enabled") return { write: true };
+	if (current === "disabled") return { write: false, remove: true };
+	if (!confirm) return { write: false };
+	const agreed = await confirm();
+	return agreed ? { write: true, persist: "enabled" } : { write: false, remove: true, persist: "disabled" };
+}
+
+/**
  * Upserts the managed block into `existing`, preserving all other content
  * verbatim. Resolution order:
  *
@@ -188,5 +239,70 @@ export async function installGlobalInstructions(hosts: InstructionHosts): Promis
 	for (const target of TARGETS) {
 		if (!hosts[target.host]) continue;
 		await upsertTarget(join(home, ...target.relPath), block);
+	}
+}
+
+/**
+ * Removes Jolli's marker-bracketed block from `existing`, preserving all other
+ * content verbatim. The inverse of the marker branch of `applyInstructionsBlock`:
+ * a line-oriented match on the first `BLOCK_START`/`BLOCK_END` pair. Returns the
+ * input unchanged when no block is present (idempotent no-op).
+ */
+export function removeInstructionsBlock(existing: string): string {
+	const lines = existing.split("\n");
+	const startIdx = lines.indexOf(BLOCK_START);
+	const endIdx = lines.indexOf(BLOCK_END);
+	if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
+		return existing;
+	}
+	// Also drop a single blank separator line the block was appended after, so a
+	// removed trailing block doesn't leave a dangling empty line at EOF.
+	const spliceStart = startIdx > 0 && lines[startIdx - 1] === "" ? startIdx - 1 : startIdx;
+	return [...lines.slice(0, spliceStart), ...lines.slice(endIdx + 1)].join("\n");
+}
+
+/**
+ * Strips the managed block from a single absolute file path. Fail-soft: a missing
+ * file (ENOENT) is a no-op; other read/write errors are logged and swallowed.
+ */
+async function removeTarget(absPath: string): Promise<void> {
+	let existing: string;
+	try {
+		existing = await readFile(absPath, "utf-8");
+	} catch (err: unknown) {
+		const code = (err as NodeJS.ErrnoException).code;
+		/* v8 ignore start -- defensive: non-ENOENT read errors (perm denied, EISDIR) */
+		if (code !== "ENOENT") {
+			log.warn("Failed to read %s: %s — skipping", absPath, (err as Error).message);
+		}
+		/* v8 ignore stop */
+		return;
+	}
+
+	const updated = removeInstructionsBlock(existing);
+	if (updated === existing) {
+		return; // No block present.
+	}
+
+	try {
+		await writeFile(absPath, updated, "utf-8");
+		log.info("Removed Jolli Memory instructions from %s", absPath);
+		/* v8 ignore start -- defensive: write failure on read-only fs / EPERM */
+	} catch (err: unknown) {
+		log.warn("Failed to write %s: %s", absPath, (err as Error).message);
+	}
+	/* v8 ignore stop */
+}
+
+/**
+ * Removes the Jolli Memory instruction block from every host's global instruction
+ * file. Unlike `installGlobalInstructions`, removal is NOT host-gated: a user who
+ * opts out must have the block erased everywhere it might have been written, even
+ * from a host they have since disabled. Never creates a file that doesn't exist.
+ */
+export async function removeGlobalInstructions(): Promise<void> {
+	const home = homedir();
+	for (const target of TARGETS) {
+		await removeTarget(join(home, ...target.relPath));
 	}
 }
