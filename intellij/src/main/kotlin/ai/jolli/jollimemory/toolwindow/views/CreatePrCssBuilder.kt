@@ -176,8 +176,8 @@ ${if (isDark) darkVars() else lightVars()}
   .tmeter-legend span { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
   .lg-dot { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; display: inline-block; }
   .seg-in { background: var(--gs-added); }
-  .seg-out { background: var(--link-fg); }
-  .seg-cache { background: rgba(128,128,128,0.55); }
+  .seg-out { background: rgba(128,128,128,0.55); }
+  .seg-cache { background: var(--link-fg); }
 """
 
     private fun darkVars() = """

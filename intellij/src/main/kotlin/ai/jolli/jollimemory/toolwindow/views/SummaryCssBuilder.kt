@@ -1349,8 +1349,8 @@ $rootVars
     display: inline-block;
   }
   .seg-in { background: var(--stat-add); }
-  .seg-out { background: var(--link-fg); }
-  .seg-cache { background: rgba(128, 128, 128, 0.55); }
+  .seg-out { background: rgba(128, 128, 128, 0.55); }
+  .seg-cache { background: var(--link-fg); }
 
   /* ── Ship bar (two-card grid) ── */
   .ship-bar {

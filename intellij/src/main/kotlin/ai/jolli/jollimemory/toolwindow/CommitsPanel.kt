@@ -148,10 +148,11 @@ class CommitsPanel(
         const val ARROW_DOWN = "\u25BC"  // ▼
         const val HOVER_SHOW_DELAY_MS = 1000
         const val HOVER_HIDE_GRACE_MS = 200
-        // Token-meter segment colors (input vs output), dark/light theme aware.
-        val TOK_INPUT_COLOR = JBColor(0x4C84C7, 0x5C94D7)
-        val TOK_OUTPUT_COLOR = JBColor(0x49A06A, 0x59B07A)
-        val TOK_CACHE_COLOR = JBColor(0x9177C7, 0xA98FD9)
+        // Token-meter segment colors, dark/light theme aware. Input = green, output =
+        // grey, cache = blue — matching the webview meters (--stat-add / grey / --link-fg).
+        val TOK_INPUT_COLOR = JBColor(0x267F3F, 0x4ECE8D)
+        val TOK_OUTPUT_COLOR = JBColor(0x808080, 0x808080)
+        val TOK_CACHE_COLOR = JBColor(0x0066BF, 0x3794FF)
         val CHIP_OK_COLOR = JBColor(0x3C8C4E, 0x5BB06E)
         val CHIP_DIM_COLOR = JBColor(0x808080, 0x8C8C8C)
     }
