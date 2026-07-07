@@ -733,7 +733,11 @@ val sb = StringBuilder()
             // read per row at expand time.
             var topicCount = 0
             var commitType: String? = null
-            var tokenUsage: ai.jolli.jollimemory.core.TokenUsage? = null
+            // Canonical (TS-identical) display fields: prefer the shared summary's
+            // top-level breakdown/cost; fall back to a legacy IntelliJ `tokenUsage`
+            // object (mapping cached = cache_creation, dropping cache_read to match TS).
+            var tokenBreakdown: ai.jolli.jollimemory.core.ConversationTokenBreakdown? = null
+            var estimatedCostUsd: Double? = null
             var e2eScenarioCount = 0
             var isSyncedToJolli = false
             var jolliDocUrl: String? = null
@@ -748,7 +752,18 @@ val sb = StringBuilder()
                     if (summary.commitType != null && summary.commitType.name != "commit") {
                         commitType = summary.commitType.name
                     }
-                    tokenUsage = summary.tokenUsage
+                    tokenBreakdown = summary.conversationTokenBreakdown
+                        ?: summary.tokenUsage?.let {
+                            ai.jolli.jollimemory.core.ConversationTokenBreakdown(
+                                it.inputTokens,
+                                it.outputTokens,
+                                it.cacheWriteTokens,
+                            )
+                        }
+                    estimatedCostUsd = summary.estimatedCostUsd
+                        ?: summary.conversationModels?.let {
+                            ai.jolli.jollimemory.core.ModelPricing.estimateCostUsd(it).takeIf { c -> c > 0.0 }
+                        }
                     e2eScenarioCount = summary.e2eTestGuide?.size ?: 0
                     isSyncedToJolli = summary.jolliDocId != null || summary.jolliDocUrl != null
                     jolliDocUrl = summary.jolliDocUrl
@@ -781,7 +796,8 @@ val sb = StringBuilder()
                 isPushed = pushBaseRef != null && hash !in unpushedHashes,
                 hasSummary = hash in summaryHashSet,
                 commitType = commitType,
-                tokenUsage = tokenUsage,
+                conversationTokenBreakdown = tokenBreakdown,
+                estimatedCostUsd = estimatedCostUsd,
                 e2eScenarioCount = e2eScenarioCount,
                 isSyncedToJolli = isSyncedToJolli,
                 jolliDocUrl = jolliDocUrl,

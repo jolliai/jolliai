@@ -6,6 +6,7 @@ import ai.jolli.jollimemory.core.PlanReference
 import ai.jolli.jollimemory.core.SummaryTree
 import ai.jolli.jollimemory.core.TopicCategory
 import ai.jolli.jollimemory.core.references.ReferenceCommitRef
+import ai.jolli.jollimemory.toolwindow.CommitMemoryFormat
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.ViewTopicWithDate
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.categoryClass
@@ -80,6 +81,7 @@ object SummaryHtmlBuilder {
 <body>
 <div class="page">
 ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions)}
+${buildTokenMeter(summary)}
 ${buildShipBar(summary)}
 ${buildMemoryPanel(summary, allTopics, topicsHtml, topicsTitle, topicsLabel)}
 ${buildE2ePanel(summary)}
@@ -375,7 +377,13 @@ ${buildTranscriptModal()}"""
   ${buildConversationsRow(totalTurns)}
 </div>
 <div class="header-actions">
-  <button class="action-btn" id="copyMdBtn">Copy Markdown</button>
+  <div class="export-menu-group">
+    <button class="action-btn" id="exportMenuToggle" title="Export options">Export &#x25BE;</button>
+    <div class="split-menu" id="exportMenu">
+      <button class="split-menu-item" id="copyMdBtn">Copy Markdown</button>
+      <button class="split-menu-item" id="downloadMdBtn">Save as Markdown File</button>
+    </div>
+  </div>
 </div>"""
     }
 
@@ -398,6 +406,73 @@ ${buildTranscriptModal()}"""
     <div class="prop-value">${escHtml(SummaryTree.formatDurationLabel(summary))}</div>
   </div>"""
     }
+
+    /**
+     * Builds the prominent token/cost banner shown between the header and the ship
+     * bar — the detail-view counterpart of the Commits panel's branch meter. Reads
+     * the AI coding-session token total, its per-segment breakdown, and the
+     * estimated USD cost, all aggregated across the whole consolidation tree (a
+     * squash/amend/rebase memory carries its tokens on the folded children, so we
+     * must walk the tree, not read the root's scalar). Three states:
+     *   1. breakdown present  -> total + 3-segment bar (input/output/cached) + legend
+     *   2. tokens > 0 but no breakdown -> total + a single full-width segment
+     *   3. tokens 0 -> the ".tmeter-na" empty state ("Task usage not reported")
+     *
+     * The cost is the stored per-model estimate (never recomputed here); it shows
+     * "cost N/A" when no node in the tree carried a priced estimate. Segment widths
+     * use inline `style="width"` — the IntelliJ JCEF webview enforces no CSP (see
+     * CreatePrScriptBuilder), matching the sibling working-memory meter.
+     */
+    private fun buildTokenMeter(summary: CommitSummary): String {
+        val total = SummaryTree.aggregateConversationTokens(summary)
+        if (total <= 0L) {
+            return """
+<div class="tmeter tmeter-na">
+  <div class="tmeter-head">
+    <span class="tmeter-total">Task usage not reported</span>
+    <span class="tmeter-help" title="$USAGE_HELP">?</span>
+  </div>
+</div>"""
+        }
+        val bd = SummaryTree.aggregateConversationTokenBreakdown(summary)
+        val segSum = bd.input + bd.output + bd.cached
+        val bar = if (segSum > 0) {
+            val wIn = Math.round(bd.input * 100.0 / segSum).toInt()
+            val wOut = Math.round(bd.output * 100.0 / segSum).toInt()
+            val wCache = maxOf(0, 100 - wIn - wOut)
+            """
+  <div class="tmeter-bar">
+    <span class="seg-in" style="width:$wIn%"></span>
+    <span class="seg-out" style="width:$wOut%"></span>
+    <span class="seg-cache" style="width:$wCache%"></span>
+  </div>
+  <div class="tmeter-legend">
+    <span><i class="lg-dot seg-in"></i>${CommitMemoryFormat.formatTokens(bd.input)} input</span>
+    <span><i class="lg-dot seg-out"></i>${CommitMemoryFormat.formatTokens(bd.output)} output</span>
+    <span><i class="lg-dot seg-cache"></i>${CommitMemoryFormat.formatTokens(bd.cached)} cached</span>
+  </div>"""
+        } else {
+            """
+  <div class="tmeter-bar"><span class="seg-in" style="width:100%"></span></div>"""
+        }
+        val cost = SummaryTree.aggregateEstimatedCost(summary)
+        val costStr = if (cost > 0.0) CommitMemoryFormat.formatCost(cost) else "cost N/A"
+        return """
+<div class="tmeter">
+  <div class="tmeter-head">
+    <span class="tmeter-total">${CommitMemoryFormat.formatTokens(total)}</span> tokens
+    <span class="tmeter-cost">&middot; $costStr</span>
+    <span class="tmeter-note">&middot; this task</span>
+    <span class="tmeter-help" title="$USAGE_HELP">?</span>
+  </div>$bar
+</div>"""
+    }
+
+    /** Tooltip explaining what the token total counts and how the cost is derived. */
+    private const val USAGE_HELP =
+        "Counts input + output + cache-creation tokens across all AI sessions folded into this memory " +
+            "(cache reads are excluded — they double-count). The cost is a cache-aware estimate priced per " +
+            "model at write time; actual cost varies by model."
 
     /**
      * Builds the Jolli Memory link block. Now lives inside the Jolli ship card

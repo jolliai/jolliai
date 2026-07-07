@@ -286,6 +286,7 @@ class SummaryPanel(
             when (command) {
                 "editState" -> webviewDirty = json.get("editing")?.asBoolean == true
                 "copyMarkdown" -> handleCopyMarkdown()
+                "downloadMarkdown" -> handleDownloadMarkdown()
                 "pushToJolli" -> handlePushToJolli()
                 "editTopic" -> handleEditTopic(json.get("topicIndex").asInt, json.getAsJsonObject("updates"))
                 "deleteTopic" -> handleDeleteTopic(json.get("topicIndex").asInt, json.get("title")?.asString)
@@ -328,6 +329,46 @@ class SummaryPanel(
         val markdown = SummaryMarkdownBuilder.buildMarkdown(currentSummary)
         val clipboard = Toolkit.getDefaultToolkit().systemClipboard
         clipboard.setContents(StringSelection(markdown), null)
+    }
+
+    /**
+     * "Save as Markdown File" export-menu item. Renders the same Markdown as
+     * [handleCopyMarkdown] and writes it to a user-chosen path via the IDE's
+     * native save dialog (mirrors the VS Code Export → Save as Markdown File).
+     * A read-only export — not gated by [writeCommands] — so it works on stale
+     * or foreign memories too.
+     */
+    private fun handleDownloadMarkdown() {
+        val markdown = SummaryMarkdownBuilder.buildMarkdown(currentSummary)
+        val safeTitle = currentSummary.commitMessage.substringBefore("\n").trim()
+            .replace(Regex("""[<>:"/\\|?*]"""), "-")
+            .take(80)
+            .ifBlank { "memory" }
+        ApplicationManager.getApplication().invokeLater {
+            val descriptor = com.intellij.openapi.fileChooser.FileSaverDescriptor(
+                "Save Memory As Markdown",
+                "Export this memory to a Markdown file.",
+                "md",
+            )
+            val baseDir = project.basePath
+                ?.let { com.intellij.openapi.vfs.LocalFileSystem.getInstance().findFileByPath(it) }
+            val wrapper = com.intellij.openapi.fileChooser.FileChooserFactory.getInstance()
+                .createSaveFileDialog(descriptor, project)
+                .save(baseDir, "$safeTitle.md") ?: return@invokeLater
+            try {
+                wrapper.file.writeText(markdown, Charsets.UTF_8)
+                com.intellij.notification.NotificationGroupManager.getInstance()
+                    .getNotificationGroup("JolliMemory")
+                    .createNotification(
+                        "Memory exported",
+                        "Saved to ${wrapper.file.absolutePath}",
+                        com.intellij.notification.NotificationType.INFORMATION,
+                    )
+                    .notify(project)
+            } catch (e: Exception) {
+                Messages.showErrorDialog(project, "Save failed: ${e.message}", "Export Failed")
+            }
+        }
     }
 
     private fun handlePushToJolli(retried: Boolean = false) {

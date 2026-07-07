@@ -98,6 +98,37 @@ $rootVars
     gap: 6px;
     margin: 14px 0 20px;
   }
+  /* ── Export dropdown (Copy / Save as Markdown) ── */
+  .export-menu-group { position: relative; display: inline-block; }
+  .split-menu {
+    display: none;
+    position: absolute;
+    top: calc(100% + 3px);
+    left: 0;
+    z-index: 30;
+    min-width: 180px;
+    padding: 4px;
+    border: 1px solid var(--border-light);
+    border-radius: 8px;
+    background: var(--panel-inner);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+  }
+  .split-menu.open { display: block; }
+  .split-menu-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    font-family: $FONT_FAMILY;
+    font-size: 0.85em;
+    padding: 6px 10px;
+    border: none;
+    border-radius: 5px;
+    background: none;
+    color: var(--text-primary);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .split-menu-item:hover { background: var(--btn-secondary-hover-bg); }
   /* ── Meta strip ── */
   .meta-strip {
     display: flex; flex-wrap: wrap; align-items: center; gap: 5px 9px;
@@ -1242,6 +1273,85 @@ $rootVars
     margin-top: 8px;
     justify-content: flex-end;
   }
+
+  /* ── Token/cost banner (between header and ship bar) ── */
+  .tmeter {
+    border: 1px solid var(--border-light);
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin: 0 0 16px;
+    background: var(--panel-bg);
+  }
+  .tmeter-na { padding: 8px 14px; }
+  .tmeter-head {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    flex-wrap: wrap;
+    font-size: 0.86em;
+    color: var(--text-secondary);
+  }
+  .tmeter-total {
+    font-size: 1.05em;
+    font-weight: 700;
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+  }
+  .tmeter-na .tmeter-total {
+    font-size: 0.9em;
+    font-weight: 400;
+    font-style: italic;
+    color: var(--text-tertiary);
+  }
+  .tmeter-cost { color: var(--text-primary); }
+  .tmeter-note { color: var(--text-tertiary); }
+  .tmeter-help {
+    margin-left: auto;
+    width: 15px;
+    height: 15px;
+    line-height: 15px;
+    text-align: center;
+    border: 1px solid var(--border-light);
+    border-radius: 50%;
+    font-size: 0.78em;
+    color: var(--text-tertiary);
+    cursor: help;
+    flex-shrink: 0;
+  }
+  .tmeter-bar {
+    display: flex;
+    width: 100%;
+    height: 6px;
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: 8px;
+    background: var(--panel-inner);
+  }
+  .tmeter-bar > span { display: block; height: 100%; }
+  .tmeter-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    margin-top: 7px;
+    font-size: 0.8em;
+    color: var(--text-secondary);
+  }
+  .tmeter-legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .lg-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    flex-shrink: 0;
+    display: inline-block;
+  }
+  .seg-in { background: var(--stat-add); }
+  .seg-out { background: var(--link-fg); }
+  .seg-cache { background: rgba(128, 128, 128, 0.55); }
 
   /* ── Ship bar (two-card grid) ── */
   .ship-bar {

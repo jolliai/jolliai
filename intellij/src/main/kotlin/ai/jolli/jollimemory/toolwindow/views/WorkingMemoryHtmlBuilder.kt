@@ -14,15 +14,20 @@ import ai.jolli.jollimemory.toolwindow.CommitMemoryFormat
  */
 object WorkingMemoryHtmlBuilder {
 
-    /** Aggregate AI token usage captured by the included conversations. */
+    /**
+     * Aggregate AI token usage captured by the included conversations, in the
+     * canonical (TS-identical) shape: `cached` is cache_creation only, cache_read
+     * excluded, so `total = input + output + cached`. [estimatedCostUsd] is the
+     * per-model cost estimate (null when unpriced).
+     */
     data class WmTokens(
         val total: Long,
         val input: Long,
         val output: Long,
-        val cacheRead: Long,
-        val cacheWrite: Long,
+        val cached: Long,
         /** Some included sources didn't report usage — the total understates reality. */
         val partial: Boolean,
+        val estimatedCostUsd: Double? = null,
     )
 
     /**
@@ -175,15 +180,20 @@ object WorkingMemoryHtmlBuilder {
                 </div>
             """.trimIndent()
         }
-        val cache = t.cacheRead + t.cacheWrite
+        val cache = t.cached
         fun pct(n: Long): Int = if (t.total <= 0) 0 else Math.round(n * 100.0 / t.total).toInt()
         val partialNote = if (t.partial) """<span class="wm-tmeter-sub">· partial (some sources don't report)</span>""" else ""
+        // Estimated USD cost next to the total (priced per model; null when unpriced).
+        val costNote = t.estimatedCostUsd?.let {
+            """<span class="wm-tmeter-sub">· ${esc(CommitMemoryFormat.formatCost(it))}</span>"""
+        } ?: ""
         val tip = "${CommitMemoryFormat.formatTokens(t.input)} input · ${CommitMemoryFormat.formatTokens(t.output)} output · " +
-            "${CommitMemoryFormat.formatTokens(t.cacheRead)} cache read · ${CommitMemoryFormat.formatTokens(t.cacheWrite)} cache write"
+            "${CommitMemoryFormat.formatTokens(t.cached)} cache write"
         return """
             <div class="wm-tmeter">
               <div class="wm-tmeter-head">
                 <span class="wm-tmeter-total">${CommitMemoryFormat.formatTokens(t.total)} tokens</span>
+                $costNote
                 <span class="wm-tmeter-sub">· captured by this memory</span>
                 $partialNote
               </div>

@@ -135,6 +135,37 @@ class SummaryTreeTest {
         }
     }
 
+    // ── aggregateConversationTokens / Breakdown / EstimatedCost ─────────
+
+    @Nested
+    inner class AggregateConversationUsage {
+        @Test
+        fun `sums tokens, breakdown, and cost across the tree`() {
+            val c1 = makeLeaf(hash = "c1").copy(
+                conversationTokens = 100,
+                conversationTokenBreakdown = ConversationTokenBreakdown(60, 30, 10),
+                estimatedCostUsd = 0.25,
+            )
+            val c2 = makeLeaf(hash = "c2").copy(
+                conversationTokens = 200,
+                conversationTokenBreakdown = ConversationTokenBreakdown(120, 60, 20),
+                estimatedCostUsd = 0.50,
+            )
+            val root = makeSquash(listOf(c1, c2))
+            SummaryTree.aggregateConversationTokens(root) shouldBe 300L
+            SummaryTree.aggregateConversationTokenBreakdown(root) shouldBe ConversationTokenBreakdown(180, 90, 30)
+            SummaryTree.aggregateEstimatedCost(root) shouldBe 0.75
+        }
+
+        @Test
+        fun `returns zeros when no node carries usage`() {
+            val root = makeSquash(listOf(makeLeaf(hash = "c1")))
+            SummaryTree.aggregateConversationTokens(root) shouldBe 0L
+            SummaryTree.aggregateEstimatedCost(root) shouldBe 0.0
+            SummaryTree.aggregateConversationTokenBreakdown(root) shouldBe ConversationTokenBreakdown(0, 0, 0)
+        }
+    }
+
     // ── countTopics ─────────────────────────────────────────────────────
 
     @Nested

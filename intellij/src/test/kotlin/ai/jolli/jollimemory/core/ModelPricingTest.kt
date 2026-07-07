@@ -8,14 +8,14 @@ import org.junit.jupiter.api.Test
 
 class ModelPricingTest {
 
-    private fun usage(model: String, input: Long = 0, output: Long = 0, cacheWrite: Long = 0) =
-        ModelUsage(model, ModelPricing.providerOf(model), input, output, cacheWrite)
+    private fun usage(model: String, input: Long = 0, output: Long = 0, cached: Long = 0) =
+        ModelTokenUsage(model, ModelPricing.providerOf(model), input, output, cached)
 
     @Test
     fun `prices the three segments at the model's rates`() {
         // Opus 4.8: $5 input, $25 output, $6.25 cacheWrite per 1M.
         val cost = ModelPricing.estimateModelCostUsd(
-            usage("claude-opus-4-8", input = 1_000_000, output = 1_000_000, cacheWrite = 1_000_000),
+            usage("claude-opus-4-8", input = 1_000_000, output = 1_000_000, cached = 1_000_000),
         )!!
         cost shouldBe (5.0 + 25.0 + 6.25)
     }

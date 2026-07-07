@@ -70,6 +70,39 @@ object SummaryTree {
         return own + childTurns
     }
 
+    /**
+     * Recursively sums conversationTokens across the entire tree. A consolidated
+     * (squash/amend/rebase) memory carries its tokens on the folded children, so
+     * the detail view must aggregate the whole tree, not read the root's scalar.
+     */
+    fun aggregateConversationTokens(node: CommitSummary): Long {
+        val own = node.conversationTokens?.toLong() ?: 0L
+        return own + (node.children ?: emptyList()).sumOf { aggregateConversationTokens(it) }
+    }
+
+    /** Recursively sums the per-segment conversation-token breakdown across the tree. */
+    fun aggregateConversationTokenBreakdown(node: CommitSummary): ConversationTokenBreakdown {
+        var input = node.conversationTokenBreakdown?.input ?: 0L
+        var output = node.conversationTokenBreakdown?.output ?: 0L
+        var cached = node.conversationTokenBreakdown?.cached ?: 0L
+        for (child in node.children ?: emptyList()) {
+            val c = aggregateConversationTokenBreakdown(child)
+            input += c.input
+            output += c.output
+            cached += c.cached
+        }
+        return ConversationTokenBreakdown(input, output, cached)
+    }
+
+    /**
+     * Recursively sums the estimated USD cost across the tree. 0.0 when no node
+     * carries a priced estimate (a lower bound on legacy/unpriced trees).
+     */
+    fun aggregateEstimatedCost(node: CommitSummary): Double {
+        val own = node.estimatedCostUsd ?: 0.0
+        return own + (node.children ?: emptyList()).sumOf { aggregateEstimatedCost(it) }
+    }
+
     /** Recursively counts total topics across the entire tree. */
     fun countTopics(node: CommitSummary): Int {
         val own = node.topics?.size ?: 0

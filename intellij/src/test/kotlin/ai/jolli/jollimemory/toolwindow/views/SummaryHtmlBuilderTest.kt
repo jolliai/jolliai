@@ -273,4 +273,67 @@ class SummaryHtmlBuilderTest {
             html shouldContain "&lt;script&gt;"
         }
     }
+
+    // ── Export dropdown ────────────────────────────────────────────────────
+
+    @Nested
+    inner class ExportMenu {
+        @Test
+        fun `renders the export dropdown with copy and save-as-markdown items`() {
+            val html = SummaryHtmlBuilder.buildHtml(makeSummary())
+            html shouldContain """id="exportMenuToggle""""
+            html shouldContain """id="exportMenu""""
+            html shouldContain """id="copyMdBtn""""
+            html shouldContain "Copy Markdown"
+            html shouldContain """id="downloadMdBtn""""
+            html shouldContain "Save as Markdown File"
+        }
+
+        @Test
+        fun `wires the download-markdown command and dropdown toggle in the script`() {
+            val html = SummaryHtmlBuilder.buildHtml(makeSummary())
+            html shouldContain "command: 'downloadMarkdown'"
+            html shouldContain "exportMenu.classList.toggle('open')"
+        }
+    }
+
+    // ── Token/cost banner ──────────────────────────────────────────────────
+
+    @Nested
+    inner class TokenMeter {
+        @Test
+        fun `renders the not-reported state when no usage is recorded`() {
+            val html = SummaryHtmlBuilder.buildHtml(makeSummary())
+            html shouldContain "tmeter-na"
+            html shouldContain "Task usage not reported"
+        }
+
+        @Test
+        fun `renders total, cost, and segmented breakdown when usage is present`() {
+            val summary = makeSummary().copy(
+                conversationTokens = 274_400,
+                conversationTokenBreakdown = ai.jolli.jollimemory.core.ConversationTokenBreakdown(
+                    input = 123_400, output = 109_800, cached = 41_200,
+                ),
+                estimatedCostUsd = 0.42,
+            )
+            val html = SummaryHtmlBuilder.buildHtml(summary)
+            html shouldNotContain "Task usage not reported"
+            html shouldContain "274k"
+            html shouldContain "≈$0.42"
+            html shouldContain "123k input"
+            html shouldContain "110k output"
+            html shouldContain "41.2k cached"
+            html shouldContain """<span class="seg-in" style="width:"""
+        }
+
+        @Test
+        fun `degrades to a single segment and cost N-A when only a total is known`() {
+            val summary = makeSummary().copy(conversationTokens = 5_000)
+            val html = SummaryHtmlBuilder.buildHtml(summary)
+            html shouldContain "5k"
+            html shouldContain "cost N/A"
+            html shouldContain """<span class="seg-in" style="width:100%">"""
+        }
+    }
 }

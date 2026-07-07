@@ -34,20 +34,34 @@ class WorkingMemoryHtmlBuilderTest {
 
     @Test
     fun `renders the token meter with total, segments and legend when usage is reported`() {
-        val html = build(view(token = WmTokens(total = 1_400_000, input = 96_000, output = 47_000, cacheRead = 1_200_000, cacheWrite = 61_000, partial = false)))
-        html shouldContain "1.4M tokens"
+        // Canonical shape: cache_read is excluded; total = input + output + cached.
+        val html = build(
+            view(
+                token = WmTokens(
+                    total = 204_000,
+                    input = 96_000,
+                    output = 47_000,
+                    cached = 61_000,
+                    partial = false,
+                    estimatedCostUsd = 0.42,
+                ),
+            ),
+        )
+        html shouldContain "204k tokens"
         html shouldContain "captured by this memory"
         html shouldContain "wm-tmeter-bar"
         html shouldContain "wm-seg-in"
         html shouldContain "wm-seg-out"
         html shouldContain "wm-seg-cache"
-        // legend numbers (input / output / cached = read+write)
+        // legend numbers (input / output / cached = cache_creation)
         html shouldContain "96k input"
         html shouldContain "47k output"
-        html shouldContain "1.3M cached"
-        // tooltip breaks cache into read + write
-        html shouldContain "cache read"
+        html shouldContain "61k cached"
+        // estimated cost is shown next to the total
+        html shouldContain "≈\$0.42"
+        // cache_read is excluded, so the tooltip only mentions cache write
         html shouldContain "cache write"
+        html shouldNotContain "cache read"
         html shouldNotContain "recorded when you commit"
     }
 
@@ -64,7 +78,7 @@ class WorkingMemoryHtmlBuilderTest {
 
     @Test
     fun `flags partial usage`() {
-        val html = build(view(token = WmTokens(1000, 600, 400, 0, 0, partial = true)))
+        val html = build(view(token = WmTokens(1000, 600, 400, 0, partial = true)))
         html shouldContain "partial"
     }
 

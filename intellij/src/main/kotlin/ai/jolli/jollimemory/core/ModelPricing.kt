@@ -74,11 +74,11 @@ object ModelPricing {
 	fun providerOf(model: String): String = MODEL_PRICES[model]?.provider ?: "unknown"
 
 	/** Estimated USD cost of one model's usage, or null when the model is unpriced. */
-	fun estimateModelCostUsd(usage: ModelUsage): Double? {
+	fun estimateModelCostUsd(usage: ModelTokenUsage): Double? {
 		val price = MODEL_PRICES[usage.model] ?: return null
 		return (usage.input * price.inputPerMTok +
 			usage.output * price.outputPerMTok +
-			usage.cacheWrite * price.cacheWritePerMTok) / 1_000_000.0
+			usage.cached * price.cacheWritePerMTok) / 1_000_000.0
 	}
 
 	/**
@@ -86,7 +86,7 @@ object ModelPricing {
 	 * skipped (never guessed), so the result is a lower bound when [usageByModel]
 	 * contains a model absent from the table. Returns 0.0 for empty/all-unpriced.
 	 */
-	fun estimateCostUsd(usageByModel: List<ModelUsage>): Double {
+	fun estimateCostUsd(usageByModel: List<ModelTokenUsage>): Double {
 		var total = 0.0
 		for (u in usageByModel) {
 			val cost = estimateModelCostUsd(u)

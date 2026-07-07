@@ -1,7 +1,7 @@
 package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.bridge.CommitSummaryBrief
-import ai.jolli.jollimemory.core.TokenUsage
+import ai.jolli.jollimemory.core.ConversationTokenBreakdown
 import io.kotest.matchers.shouldBe
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
@@ -11,7 +11,8 @@ class CommitMemoryFormatTest {
     private fun brief(
         hash: String,
         hasSummary: Boolean = true,
-        tokenUsage: TokenUsage? = null,
+        breakdown: ConversationTokenBreakdown? = null,
+        cost: Double? = null,
     ) = CommitSummaryBrief(
         hash = hash,
         shortHash = hash.take(7),
@@ -19,11 +20,12 @@ class CommitMemoryFormatTest {
         author = "Dev",
         date = "2026-01-01T00:00:00Z",
         hasSummary = hasSummary,
-        tokenUsage = tokenUsage,
+        conversationTokenBreakdown = breakdown,
+        estimatedCostUsd = cost,
     )
 
-    private fun usage(input: Long, output: Long, cacheRead: Long = 0, cacheWrite: Long = 0, reported: Int = 1, total: Int = 1) =
-        TokenUsage(input, output, cacheRead, cacheWrite, reported, total)
+    private fun bd(input: Long, output: Long, cached: Long = 0) =
+        ConversationTokenBreakdown(input, output, cached)
 
     @Nested
     inner class FormatTokens {
@@ -64,19 +66,19 @@ class CommitMemoryFormatTest {
         }
 
         @Test
-        fun `sums input, output and cache across memory commits`() {
+        fun `sums input, output and cache (cache_creation) across memory commits`() {
             val totals = CommitMemoryFormat.aggregateTokens(
                 listOf(
-                    brief("a", tokenUsage = usage(100, 50, cacheRead = 1000, cacheWrite = 200)),
-                    brief("b", tokenUsage = usage(400, 200, cacheRead = 3000, cacheWrite = 0)),
+                    brief("a", breakdown = bd(100, 50, cached = 200)),
+                    brief("b", breakdown = bd(400, 200, cached = 0)),
                 ),
             )
             totals.input shouldBe 500L
             totals.output shouldBe 250L
-            totals.cacheRead shouldBe 4000L
-            totals.cacheWrite shouldBe 200L
-            totals.cached shouldBe 4200L
-            totals.total shouldBe 4950L
+            // cache_read is excluded; `cached` carries cache_creation only.
+            totals.cacheRead shouldBe 0L
+            totals.cached shouldBe 200L
+            totals.total shouldBe 950L
             totals.partial shouldBe false
             totals.hasData shouldBe true
         }
@@ -85,8 +87,8 @@ class CommitMemoryFormatTest {
         fun `flags partial when a memory commit reports no usage`() {
             val totals = CommitMemoryFormat.aggregateTokens(
                 listOf(
-                    brief("a", tokenUsage = usage(100, 50)),
-                    brief("b", tokenUsage = null),
+                    brief("a", breakdown = bd(100, 50)),
+                    brief("b", breakdown = null),
                 ),
             )
             totals.total shouldBe 150L
@@ -94,19 +96,11 @@ class CommitMemoryFormatTest {
         }
 
         @Test
-        fun `flags partial when a commit's own usage is partial`() {
-            val totals = CommitMemoryFormat.aggregateTokens(
-                listOf(brief("a", tokenUsage = usage(100, 50, reported = 1, total = 2))),
-            )
-            totals.partial shouldBe true
-        }
-
-        @Test
         fun `ignores code-only commits entirely`() {
             val totals = CommitMemoryFormat.aggregateTokens(
                 listOf(
-                    brief("a", hasSummary = false, tokenUsage = null),
-                    brief("b", tokenUsage = usage(10, 5)),
+                    brief("a", hasSummary = false, breakdown = null),
+                    brief("b", breakdown = bd(10, 5)),
                 ),
             )
             totals.total shouldBe 15L
@@ -118,8 +112,8 @@ class CommitMemoryFormatTest {
         fun `sums per-commit estimated cost across the branch`() {
             val totals = CommitMemoryFormat.aggregateTokens(
                 listOf(
-                    brief("a", tokenUsage = usage(100, 50).copy(estimatedCostUsd = 0.25)),
-                    brief("b", tokenUsage = usage(400, 200).copy(estimatedCostUsd = 0.50)),
+                    brief("a", breakdown = bd(100, 50), cost = 0.25),
+                    brief("b", breakdown = bd(400, 200), cost = 0.50),
                 ),
             )
             totals.estimatedCostUsd shouldBe 0.75
@@ -128,7 +122,7 @@ class CommitMemoryFormatTest {
         @Test
         fun `cost stays null when no memory carries a priced estimate`() {
             val totals = CommitMemoryFormat.aggregateTokens(
-                listOf(brief("a", tokenUsage = usage(100, 50))),
+                listOf(brief("a", breakdown = bd(100, 50))),
             )
             totals.estimatedCostUsd shouldBe null
         }

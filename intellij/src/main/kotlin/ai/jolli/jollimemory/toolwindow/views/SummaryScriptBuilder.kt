@@ -104,7 +104,18 @@ object SummaryScriptBuilder {
     });
   });
 
-  // Copy Markdown button with brief visual feedback
+  // Export dropdown: toggle open/closed, close on outside click
+  var exportToggle = document.getElementById('exportMenuToggle');
+  var exportMenu = document.getElementById('exportMenu');
+  if (exportToggle && exportMenu) {
+    exportToggle.addEventListener('click', function(e) {
+      e.stopPropagation();
+      exportMenu.classList.toggle('open');
+    });
+    document.addEventListener('click', function() { exportMenu.classList.remove('open'); });
+  }
+
+  // Copy Markdown menu item with brief visual feedback
   var copyBtn = document.getElementById('copyMdBtn');
   if (copyBtn) {
     copyBtn.addEventListener('click', function() {
@@ -112,6 +123,16 @@ object SummaryScriptBuilder {
       var original = copyBtn.textContent;
       copyBtn.textContent = 'Copied \u2713';
       setTimeout(function() { copyBtn.textContent = original; }, 1500);
+      if (exportMenu) exportMenu.classList.remove('open');
+    });
+  }
+
+  // Save as Markdown File menu item
+  var downloadBtn = document.getElementById('downloadMdBtn');
+  if (downloadBtn) {
+    downloadBtn.addEventListener('click', function() {
+      jmSend({ command: 'downloadMarkdown' });
+      if (exportMenu) exportMenu.classList.remove('open');
     });
   }
 
