@@ -22,6 +22,7 @@ import com.intellij.ui.jcef.JBCefBrowserBase
 import com.intellij.ui.jcef.JBCefJSQuery
 import org.cef.browser.CefBrowser
 import org.cef.browser.CefFrame
+import org.cef.handler.CefLoadHandlerAdapter
 import org.cef.handler.CefRequestHandlerAdapter
 import org.cef.network.CefRequest
 import java.awt.Dimension
@@ -44,6 +45,9 @@ class ShareWebviewDialog(
     private val gson = Gson()
     private var browser: JBCefBrowser? = null
     private var jsQuery: JBCefJSQuery? = null
+
+    @Volatile
+    private var initialized = false
 
     init {
         title = if (ctx.commitHash != null) "Share memory" else "Share branch"
@@ -82,6 +86,25 @@ class ShareWebviewDialog(
                         return true
                     }
                     return false
+                }
+            }, b.cefBrowser)
+
+            // Drive the FIRST openShareModal from Kotlin once the page has loaded — the host→JS
+            // channel is reliable post-load, unlike a JS-side auto-open racing the query bridge.
+            b.jbCefClient.addLoadHandler(object : CefLoadHandlerAdapter() {
+                override fun onLoadEnd(browser: CefBrowser?, frame: CefFrame?, httpStatusCode: Int) {
+                    if (frame?.isMain != true || initialized) return
+                    initialized = true
+                    val io = webviewIO()
+                    ApplicationManager.getApplication().executeOnPooledThread {
+                        TraceContext.withTrace {
+                            try {
+                                BranchShareModal.openShareModal(io, ctx)
+                            } catch (e: Exception) {
+                                log.warn("Initial share open failed: ${e.message}", e)
+                            }
+                        }
+                    }
                 }
             }, b.cefBrowser)
 
@@ -180,6 +203,8 @@ class ShareWebviewDialog(
  */
 object ShareLauncher {
 
+    private val log = JmLogger.create("ShareLauncher")
+
     fun openForCommit(project: Project, summary: CommitSummary) =
         open(project, summary.branch, summary.commitMessage, summary.commitHash, summary)
 
@@ -195,7 +220,12 @@ object ShareLauncher {
     ) {
         ApplicationManager.getApplication().executeOnPooledThread {
             TraceContext.withTrace {
-                val ctx = ShareContextFactory.build(project, branch, subjectTitle, commitHash, commitSummary)
+                val ctx = try {
+                    ShareContextFactory.build(project, branch, subjectTitle, commitHash, commitSummary)
+                } catch (e: Exception) {
+                    log.warn("Failed to build share context (${if (commitHash != null) "commit" else "branch"} $branch): ${e.message}", e)
+                    null
+                } ?: return@withTrace
                 ApplicationManager.getApplication().invokeLater { ShareWebviewDialog(project, ctx).show() }
             }
         }
