@@ -6,15 +6,13 @@
  * `#pane-working`. Uses the same VS Code theme CSS variables as the other
  * webviews (SummaryCssBuilder / SidebarCssBuilder) for light/dark parity.
  *
- * Token-meter segment widths use bucketed `.seg--wN` classes (N = 0..100 step
- * 10) rather than an inline `style="width"` — the webview CSP has no
- * `unsafe-inline` for styles. This mirrors the sidebar's own token bar
- * (`token-seg--wN`); the output segment takes the flex remainder.
+ * Token-meter segment widths are set as exact percentages via a JS property
+ * write (el.style.width) in NextMemoryScriptBuilder — the webview CSP forbids an
+ * inline `style="width"` attribute but allows the property write. This mirrors
+ * the memory-detail bar (SummaryHtmlBuilder buildTokenMeter); all three token
+ * bars now share the same exact-width, no-bucket approach.
  */
 export function buildNextMemoryCss(): string {
-	const widthBuckets = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
-		.map((n) => `.seg--w${n} { width: ${n}%; }`)
-		.join("\n");
 	return [
 		// Design tokens shared with the committed-memory panel (SummaryCssBuilder):
 		// subtle pill/chip surfaces + status hues that VS Code doesn't expose as
@@ -125,11 +123,15 @@ export function buildNextMemoryCss(): string {
 		".tmeter-head { font-size: 12px; margin-bottom: 4px; }",
 		".tmeter-total { font-weight: 600; }",
 		".tmeter-sub { color: var(--vscode-descriptionForeground); }",
-		".tmeter-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--vscode-widget-border); }",
+		// Palette + track background mirror the sidebar's Committed Memories bar
+		// (SidebarCssBuilder .token-seg--*): input=green, output=blue, cached=gray.
+		".tmeter-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--vscode-input-background); }",
+		// Exact widths are set as a JS property (el.style.width) by the script —
+		// CSP forbids an inline style attribute but allows the property write — so
+		// no bucketed width classes are needed and sub-10% segments stay visible.
 		".seg-in { background: var(--vscode-charts-green); }",
-		".seg-out { background: var(--vscode-charts-blue); flex: 1; }",
-		".seg-cache { background: var(--vscode-charts-gray); }",
-		widthBuckets,
+		".seg-out { background: var(--vscode-charts-blue); }",
+		".seg-cache { background: var(--vscode-descriptionForeground); opacity: 0.5; }",
 		".tmeter-legend { display: flex; gap: 12px; font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px; }",
 		".lg-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 3px; }",
 		".privacy-note { font-size: 11.5px; display: flex; gap: 6px; color: var(--vscode-descriptionForeground); margin: 10px 0; }",

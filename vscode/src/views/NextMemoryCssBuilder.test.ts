@@ -102,13 +102,14 @@ describe("buildNextMemoryCss", () => {
 		expect(css).toContain(".cc-note");
 	});
 
-	it("defines bucketed segment width classes for the CSP-safe token bar", () => {
+	it("styles token-bar segments without bucketed width classes (exact widths set via JS property)", () => {
 		const css = buildNextMemoryCss();
-		// Mirrors the sidebar's token-seg--wN pattern; the script emits seg--wNN
-		// (floored to 10%) so widths never need an inline style.
-		expect(css).toContain(".seg--w0 { width: 0%; }");
-		expect(css).toContain(".seg--w40 { width: 40%; }");
-		expect(css).toContain(".seg--w100 { width: 100%; }");
+		// Segment colors are defined; widths are set as exact percentages by the
+		// script (el.style.width), so no .seg--wN bucket classes exist anymore.
+		expect(css).toContain(".seg-in { background: var(--vscode-charts-green); }");
+		expect(css).toContain(".seg-cache");
+		expect(css).not.toContain(".seg--w");
+		expect(css).not.toContain(".seg--present");
 	});
 
 	it("styles the anchored add-context dropdown (matching the sidebar menu)", () => {

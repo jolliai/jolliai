@@ -408,11 +408,12 @@ describe("SidebarWebviewProvider edge paths", () => {
 			});
 		});
 
-		it("posts no token stats when the aggregate is zero (token bar stays hidden)", async () => {
+		it("posts a zero-total token stats message so an empty branch clears any stale bar", async () => {
 			const getBranchTokenStats = vi.fn().mockResolvedValue({
 				input: 0,
 				output: 0,
 				cached: 0,
+				total: 0,
 				reporting: 0,
 				memories: 0,
 			});
@@ -429,9 +430,13 @@ describe("SidebarWebviewProvider edge paths", () => {
 			await new Promise((r) => setTimeout(r, 0));
 			await new Promise((r) => setTimeout(r, 0));
 			expect(getBranchTokenStats).toHaveBeenCalled();
-			// …but a zero aggregate must not paint an empty token bar.
+			// …and a zero aggregate MUST still be posted (total 0) — the webview
+			// hides the bar itself, but only if it receives the reset. Withholding
+			// the message strands the previous branch's bar on the empty branch.
 			const all = view.webview.postMessage.mock.calls.map((c) => c[0] as SidebarInboundMsg);
-			expect(findMsg(all, "branch:tokenStats")).toBeUndefined();
+			const msg = findMsg(all, "branch:tokenStats") as { total?: number } | undefined;
+			expect(msg).toBeDefined();
+			expect(msg?.total).toBe(0);
 		});
 
 		it("degrades silently when getBranchTokenStats rejects", async () => {

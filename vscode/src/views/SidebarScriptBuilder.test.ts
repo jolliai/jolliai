@@ -3055,8 +3055,8 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("' \xB7 this branch'");
 		// degrades to hidden when no stats received
 		expect(js).toContain("state.tokenStats");
-		// bucketed CSS width class (not inline style)
-		expect(js).toContain("token-seg--w");
+		// exact segment width via CSP-safe property write (not a bucket class)
+		expect(js).toContain("s.style.width = pct + '%'");
 		// cached is the third segment + legend item, gated on cached > 0.
 		expect(js).toContain("token-seg--cached");
 		expect(js).toContain("' cached'");
@@ -3222,50 +3222,47 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toContain("delete state.subsectionShowAll[s.id];");
 		});
 
-		it("S4: token bar floors buckets and clamps cached so input+cached never crowds out output", () => {
+		it("S4: token bar sets exact segment widths via the style property (no bucket classes)", () => {
 			const js = buildSidebarScript();
 			const fn = js.slice(
 				js.indexOf("function renderTokenBar"),
 				js.indexOf("function renderBranch"),
 			);
-			// Floor, not round — round-up on both segments could push the sum past 100.
-			expect(fn).toContain("Math.floor((n / stats.total) * 100 / 10) * 10");
-			// Cached is clamped to leave at least one 10% slot for the output segment.
-			expect(fn).toContain("Math.min(bucket(cached), 90 - inputW)");
-			// Negative clamp guard.
-			expect(fn).toContain("if (cachedW < 0) cachedW = 0;");
+			// Exact percentages against the breakdown sum, set as a CSP-safe property
+			// write — the 10%-bucket math is gone (it hid sub-10% segments).
+			expect(fn).toContain("s.style.width = pct + '%'");
+			expect(fn).toContain("var segTotal = stats.input + stats.output + cached;");
+			expect(fn).toContain("var wCache = Math.max(0, 100 - wIn - wOut);");
+			expect(fn).not.toContain("token-seg--w");
+			expect(fn).not.toContain("Math.floor");
 		});
 
-		// Pure-function repro for the S4 overflow: simulate the bucket+clamp math the
-		// way the webview computes it and assert the fixed widths can never sum to
-		// >= 100% (which would collapse the flex output segment / overflow the bar).
-		it("S4 repro: input% + cached% bucket+clamp stays <= 90 for adversarial splits", () => {
-			function bucket(n: number, total: number): number {
-				const pct = Math.floor((n / total) * 100 / 10) * 10;
-				return pct < 0 ? 0 : pct > 100 ? 100 : pct;
+		// Pure-function repro of the new exact-width math: the three segments must
+		// always sum to EXACTLY 100 (wCache absorbs the rounding remainder) so the
+		// bar fills without overflow or a gap, for any input/output/cached split.
+		it("S4 repro: exact segment widths always sum to 100 for adversarial splits", () => {
+			function widths(input: number, output: number, cached: number): [number, number, number] {
+				const segTotal = input + output + cached;
+				const wIn = Math.round((input / segTotal) * 100);
+				const wOut = Math.round((output / segTotal) * 100);
+				const wCache = Math.max(0, 100 - wIn - wOut);
+				return [wIn, wOut, wCache];
 			}
-			function widths(input: number, cached: number, total: number): [number, number] {
-				const inputW = bucket(input, total);
-				let cachedW = Math.min(bucket(cached, total), 90 - inputW);
-				if (cachedW < 0) cachedW = 0;
-				return [inputW, cachedW];
-			}
-			// The classic failing case: both segments ~46-49% → old round() gave 50+50=100,
-			// crushing output. floor+clamp keeps room.
 			const cases: Array<[number, number, number]> = [
-				[46, 46, 100],
-				[49, 49, 100],
-				[48, 48, 100],
-				[90, 9, 100],
-				[55, 44, 100],
-				[1, 99, 100],
+				[46, 46, 8],
+				[1, 1, 98],
+				[33, 33, 34],
+				[210, 717, 2600],
+				[1, 999, 0],
+				[0, 0, 5],
 			];
-			for (const [input, cached, total] of cases) {
-				const [iw, cw] = widths(input, cached, total);
-				expect(iw + cw).toBeLessThanOrEqual(90);
-				// Output (flex remainder) always has at least 10% of room.
-				expect(100 - (iw + cw)).toBeGreaterThanOrEqual(10);
+			for (const [input, output, cached] of cases) {
+				const [iw, ow, cw] = widths(input, output, cached);
+				expect(iw + ow + cw).toBe(100);
 			}
+			// The reported bug: input 210k of a 3.527M breakdown (~6%) was floored to
+			// 0% by the old 10% bucket and vanished. Exact rounding keeps it visible.
+			expect(widths(210, 717, 2600)[0]).toBe(6);
 		});
 
 		it("S6: kb:memoryEvidence updates one row in place and only full-renders on miss", () => {

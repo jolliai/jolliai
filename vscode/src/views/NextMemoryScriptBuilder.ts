@@ -13,9 +13,11 @@
  * so toggling a row here and toggling the same row in the sidebar always
  * agree — there is no second, panel-only selection state.
  *
- * Token-meter segment widths use bucketed 'seg--wNN' classes (floored to
- * 10%), matching NextMemoryCssBuilder and the sidebar's own renderTokenBar —
- * the webview CSP forbids inline 'style="width"'.
+ * Token-meter segment widths are exact percentages set via a JS property write
+ * (el.style.width) — the webview CSP forbids an inline style attribute but allows
+ * the property write. Matches the memory-detail bar (SummaryHtmlBuilder
+ * buildTokenMeter) and the sidebar's renderTokenBar; all three share this
+ * exact-width, no-bucket approach so sub-10% segments never disappear.
  */
 export function buildNextMemoryScript(): string {
 	return `
@@ -464,13 +466,15 @@ export function buildNextMemoryScript(): string {
     mount('title-panel', el('div', { className: 'panel env-panel-body' }, kids));
   }
 
-  // Floor a token count to a 10%-of-total bucket, for the CSP-safe seg--wNN
-  // width class (an arbitrary 0-100 percent can't be expressed without an
-  // inline style; buckets match NextMemoryCssBuilder + the sidebar bar).
-  function segBucket(n, total) {
-    if (!total) return 0;
-    const p = Math.floor((n / total) * 100 / 10) * 10;
-    return p < 0 ? 0 : (p > 100 ? 100 : p);
+  // Build one bar segment at an EXACT width. The webview CSP does not exempt
+  // inline styles, so we can't emit an inline style attribute — but a JS property
+  // write (el.style.width) is allowed, so we set it here. Mirrors the
+  // memory-detail bar (SummaryHtmlBuilder buildTokenMeter): exact percentages, no
+  // 10%-bucket rounding, so sub-10% segments stay visible.
+  function seg(cls, pct) {
+    const s = el('span', { className: cls });
+    s.style.width = pct + '%';
+    return s;
   }
 
   function renderTokenMeter(msg) {
@@ -478,19 +482,29 @@ export function buildNextMemoryScript(): string {
       mount('token-meter', el('div', { className: 'muted', text: msg.totalCount > 0 ? 'Token usage not reported for this selection.' : '' }));
       return;
     }
-    const inputW = segBucket(msg.input, msg.total);
-    // Cap cached so input + cached stays <= 90%, leaving the flex output
-    // segment room (same guard the sidebar's renderTokenBar uses).
-    let cachedW = segBucket(msg.cached, msg.total);
-    if (cachedW > 90 - inputW) cachedW = 90 - inputW;
-    if (cachedW < 0) cachedW = 0;
+    // Denominator is the breakdown sum (NOT msg.total, which can exceed it when
+    // sessions report a scalar count with no per-segment usage), so the three
+    // segments fill the bar exactly. wCache absorbs the rounding remainder so
+    // the widths always sum to 100. Segment order matches the legend: in·out·cache.
+    const segTotal = (msg.input || 0) + (msg.output || 0) + (msg.cached || 0);
+    let bar;
+    if (segTotal > 0) {
+      const wIn = Math.round((msg.input / segTotal) * 100);
+      const wOut = Math.round((msg.output / segTotal) * 100);
+      const wCache = Math.max(0, 100 - wIn - wOut);
+      bar = el('div', { className: 'tmeter-bar' }, [
+        seg('seg-in', wIn),
+        seg('seg-out', wOut),
+        seg('seg-cache', wCache),
+      ]);
+    } else {
+      // Total-only degrade: a total with no breakdown fills the bar with a single
+      // input segment rather than fabricating a split we don't have.
+      bar = el('div', { className: 'tmeter-bar' }, [seg('seg-in', 100)]);
+    }
     mount('token-meter', el('div', { className: 'tmeter' }, [
       el('div', { className: 'tmeter-head' }, [el('span', { className: 'tmeter-total', text: formatTokens(msg.total) + ' tokens' }), el('span', { className: 'tmeter-sub', text: ' · captured by this memory' })]),
-      el('div', { className: 'tmeter-bar' }, [
-        el('span', { className: 'seg-in seg--w' + inputW }),
-        el('span', { className: 'seg-cache seg--w' + cachedW }),
-        el('span', { className: 'seg-out' }),
-      ]),
+      bar,
       el('div', { className: 'tmeter-legend' }, [
         el('span', {}, [el('i', { className: 'lg-dot seg-in' }), formatTokens(msg.input) + ' input']),
         el('span', {}, [el('i', { className: 'lg-dot seg-out' }), formatTokens(msg.output) + ' output']),

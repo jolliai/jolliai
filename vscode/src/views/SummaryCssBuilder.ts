@@ -1176,16 +1176,19 @@ export function buildCss(): string {
   .tmeter-cost { color: var(--text-tertiary); }
   .tmeter-bar {
     display: flex; width: 100%; height: 6px; border-radius: 3px;
-    overflow: hidden; margin-top: 8px; background: var(--panel-inner);
+    overflow: hidden; margin-top: 8px; background: var(--vscode-input-background);
   }
   .tmeter-bar .seg-in,
   .tmeter-bar .seg-out,
   .tmeter-bar .seg-cache {
     height: 100%; width: 0; transition: width 0.2s ease;
   }
-  .seg-in { background: var(--vscode-charts-green, #4ece8d); }
-  .seg-out { background: var(--vscode-charts-orange, #e0ac2b); }
-  .seg-cache { background: var(--vscode-charts-blue, #6b8299); opacity: 0.7; }
+  /* Palette + track background mirror the sidebar's Committed Memories bar
+     (SidebarCssBuilder .token-seg--*): input=green, output=blue, cached=gray.
+     The two token bars must read identically across surfaces. */
+  .seg-in { background: var(--vscode-charts-green, #4ec9b0); }
+  .seg-out { background: var(--vscode-charts-blue, #4fc1ff); }
+  .seg-cache { background: var(--vscode-descriptionForeground); opacity: 0.5; }
   .tmeter-legend {
     display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 7px;
     font-size: 0.8em; color: var(--text-secondary);

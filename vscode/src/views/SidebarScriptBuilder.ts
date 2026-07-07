@@ -3566,32 +3566,38 @@ export function buildSidebarScript(): string {
 
   // Builds the horizontal token-usage bar shown at the top of Committed
   // Memories (non-foreign). Returns null when stats are absent or total is 0.
-  // Uses bucketed CSS width classes on the input segment (no inline style).
   function renderTokenBar(stats) {
     if (!stats || !stats.total) return null;
     var cached = stats.cached || 0;
-    // Bucket input + cached to a 10% width class (no inline style — CSP). Output
-    // fills the remainder via flex. The two bucketed widths are FIXED-width
-    // classes, so their sum must stay strictly below 100% or the output segment
-    // (flex remainder) collapses to 0 and the bar can overflow. We FLOOR each to
-    // the nearest 10% (round-up on both could push the sum past 100 even when the
-    // real values sum below it) and clamp the cached segment to whatever width is
-    // left under 100% minus the input segment, guaranteeing output always has room.
-    function bucket(n) {
-      var pct = Math.floor((n / stats.total) * 100 / 10) * 10;
-      return pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+    // Segment widths are EXACT percentages set via a JS property write
+    // (el.style.width) — CSP forbids an inline style="…" attribute but allows the
+    // property write. Denominator is the breakdown sum (NOT stats.total, which can
+    // exceed it when memories report a scalar count with no per-segment usage), so
+    // the three segments fill the bar exactly; wCache absorbs the rounding
+    // remainder. Order matches the legend: input · output · cached. Mirrors the
+    // memory-detail bar (SummaryHtmlBuilder buildTokenMeter) — all three token
+    // bars now share this exact-width, no-bucket approach.
+    function seg(cls, pct) {
+      var s = el('span', { className: cls });
+      s.style.width = pct + '%';
+      return s;
     }
-    var inputW = bucket(stats.input);
-    var segs = [
-      el('span', { className: 'token-seg token-seg--input token-seg--w' + inputW }),
-    ];
-    if (cached > 0) {
-      // Leave at least one 10% slot for output: cap the input + cached sum at 90%.
-      var cachedW = Math.min(bucket(cached), 90 - inputW);
-      if (cachedW < 0) cachedW = 0;
-      segs.push(el('span', { className: 'token-seg token-seg--cached token-seg--w' + cachedW }));
+    var segTotal = stats.input + stats.output + cached;
+    var segs;
+    if (segTotal > 0) {
+      var wIn = Math.round((stats.input / segTotal) * 100);
+      var wOut = Math.round((stats.output / segTotal) * 100);
+      var wCache = Math.max(0, 100 - wIn - wOut);
+      segs = [
+        seg('token-seg token-seg--input', wIn),
+        seg('token-seg token-seg--output', wOut),
+        seg('token-seg token-seg--cached', wCache),
+      ];
+    } else {
+      // Total-only floor: a branch total with no per-segment breakdown fills the
+      // bar with a single input segment rather than fabricating a split.
+      segs = [seg('token-seg token-seg--input', 100)];
     }
-    segs.push(el('span', { className: 'token-seg token-seg--output' }));
     var bar = el('div', { className: 'token-bar' }, segs);
     // 'total' is the scalar floor (includes legacy memories that carry
     // conversationTokens but no per-segment breakdown); the segments/cost derive
