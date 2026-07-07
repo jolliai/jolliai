@@ -99,18 +99,25 @@ object ModelPricing {
 	const val FALLBACK_ESTIMATE_MODEL: String = "claude-sonnet-5"
 
 	/**
-	 * Rough cost estimate for a token breakdown when the per-model split is unknown
-	 * (older/legacy summaries recorded tokens but not conversationModels). Prices the
-	 * whole breakdown at Sonnet list rates — matching the VS Code detail meter
-	 * (`SONNET_*_PER_TOKEN` in `SummaryUtils.ts`) so the tools agree on the fallback
-	 * figure. Deliberately approximate: the true model may be cheaper (Haiku) or
-	 * dearer (Opus), so callers use this only when no model is recorded and the UI
-	 * keeps the leading "≈". Returns 0.0 for an empty breakdown.
+	 * Rough cost estimate for a memory whose per-model split is unknown (legacy
+	 * summaries recorded tokens but not conversationModels). Mirrors the VS Code
+	 * `estimateCost(b, total)` (SummaryHtmlBuilder.ts) exactly so the two tools agree
+	 * on the fallback figure: when a [breakdown] is present, price its three segments
+	 * at Sonnet list rates; otherwise price the scalar [totalTokens] at the input
+	 * rate. Deliberately approximate — the true model may be cheaper (Haiku) or
+	 * dearer (Opus) — so callers use it only when no stored cost exists and the UI
+	 * keeps the leading "≈". Returns 0.0 when there is nothing to price.
 	 */
-	fun estimateSonnetCostUsd(breakdown: ConversationTokenBreakdown): Double {
+	fun estimateSonnetCostUsd(breakdown: ConversationTokenBreakdown, totalTokens: Long): Double {
 		val p = MODEL_PRICES.getValue(FALLBACK_ESTIMATE_MODEL)
-		return (breakdown.input * p.inputPerMTok +
-			breakdown.output * p.outputPerMTok +
-			breakdown.cached * p.cacheWritePerMTok) / 1_000_000.0
+		val hasBreakdown = breakdown.input > 0 || breakdown.output > 0 || breakdown.cached > 0
+		val raw = if (hasBreakdown) {
+			breakdown.input * p.inputPerMTok +
+				breakdown.output * p.outputPerMTok +
+				breakdown.cached * p.cacheWritePerMTok
+		} else {
+			totalTokens * p.inputPerMTok
+		}
+		return raw / 1_000_000.0
 	}
 }

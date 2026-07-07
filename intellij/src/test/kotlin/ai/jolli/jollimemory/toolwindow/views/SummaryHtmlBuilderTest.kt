@@ -328,11 +328,29 @@ class SummaryHtmlBuilderTest {
         }
 
         @Test
-        fun `degrades to a single segment and cost N-A when only a total is known`() {
+        fun `estimates cost at Sonnet rates when a breakdown exists but no stored cost`() {
+            // Legacy/token-only memory: no estimatedCostUsd. Detail view shows an approximate
+            // Sonnet-rate cost (prefer-stored-else-Sonnet), matching the VS Code sidebar.
+            val summary = makeSummary().copy(
+                conversationTokens = 3_000_000,
+                conversationTokenBreakdown = ai.jolli.jollimemory.core.ConversationTokenBreakdown(
+                    input = 1_000_000, output = 1_000_000, cached = 1_000_000,
+                ),
+                estimatedCostUsd = null,
+            )
+            val html = SummaryHtmlBuilder.buildHtml(summary)
+            html shouldNotContain "cost N/A"
+            html shouldContain "≈$21.75" // 1M*3 + 1M*15 + 1M*3.75 per 1M
+        }
+
+        @Test
+        fun `degrades to a single segment and estimates a bare total at Sonnet input rate`() {
             val summary = makeSummary().copy(conversationTokens = 5_000)
             val html = SummaryHtmlBuilder.buildHtml(summary)
             html shouldContain "5k"
-            html shouldContain "cost N/A"
+            // 5000 * $3/1M input rate -> ~$0.015, shown as an ≈ estimate (not N/A).
+            html shouldContain "≈$"
+            html shouldNotContain "cost N/A"
             html shouldContain """<span class="seg-in" style="width:100%">"""
         }
     }
