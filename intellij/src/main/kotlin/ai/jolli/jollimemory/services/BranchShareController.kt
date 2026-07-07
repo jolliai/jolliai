@@ -4,94 +4,68 @@ import ai.jolli.jollimemory.core.BranchShareStore
 
 /**
  * BranchShareController — Kotlin port of vscode/src/services/BranchShareController.ts
- *
- * Share lifecycle helpers shared by the modal: revoke a share, adjust its expiry, and
- * change its audience. Pure orchestration — no IntelliJ/UI dependency — so it is
- * unit-testable. Creation lives in [LiveShareController]. All calls run synchronously;
- * invoke from a pooled thread.
+ * (single-slot). Share lifecycle helpers shared by the modal: revoke a share and PATCH its
+ * audience (access tier + recipients). Pure orchestration — no UI dependency. All calls run
+ * synchronously; invoke from a pooled thread. Creation lives in [LiveShareController].
  */
 object BranchShareController {
 
+    /** Patch for a share's audience: access tier and/or the `people` allowlist. */
+    data class ShareAudiencePatch(
+        val visibility: String? = null,
+        val recipients: List<String>? = null,
+    )
+
     /** Revokes a subject's share (if any) and clears the local record. Idempotent. */
-    fun revokeBranchShareForBranch(
+    fun revokeShare(
         workspaceRoot: String,
         branch: String,
         apiKey: String,
         commitHash: String? = null,
     ) {
-        val existing = BranchShareStore.getBranchShare(workspaceRoot, branch, commitHash)
+        val existing = BranchShareStore.getShare(workspaceRoot, branch, commitHash)
         if (!existing?.shareId.isNullOrEmpty()) {
             JolliApiClient.revokeShare(null, apiKey, existing!!.shareId)
         }
-        BranchShareStore.removeBranchShare(workspaceRoot, branch, commitHash)
+        BranchShareStore.removeShare(workspaceRoot, branch, commitHash)
     }
 
     /**
-     * Adjusts an existing share's expiry (absolute ISO `expiresAt`) via PATCH and mirrors
-     * the server-confirmed value into the local record, **preserving** the live reference
-     * (`ref`), visibility, and local recipient list. Returns the new `expiresAt`, or null
-     * when there is no share to patch.
+     * Changes an existing share's audience — access tier (`public` / `org` / `people`) and,
+     * for `people`, the `recipients` allowlist — via PATCH, mirroring the server-confirmed
+     * values into the local record. Flipping to/from `public` re-mints (or drops) the bearer
+     * link, so the returned `shareUrl` can change. Returns the updated record, or null when
+     * there is no share to patch.
      */
-    fun setBranchShareExpiry(
+    fun patchShareAudience(
         workspaceRoot: String,
         branch: String,
         apiKey: String,
-        expiresAt: String,
+        patch: ShareAudiencePatch,
         commitHash: String? = null,
-    ): String? {
-        val existing = BranchShareStore.getBranchShare(workspaceRoot, branch, commitHash)
-        if (existing?.shareId.isNullOrEmpty()) return null
-        val result = JolliApiClient.updateShareExpiry(null, apiKey, existing!!.shareId, expiresAt)
-        BranchShareStore.putBranchShare(
-            workspaceRoot,
-            branch,
-            existing.copy(expiresAt = result.expiresAt),
-            commitHash,
-        )
-        return result.expiresAt
-    }
-
-    /**
-     * Changes an existing share's audience — access level (`public` / `org` / `people`)
-     * and, for `people`, the `recipients` allowlist — via PATCH, mirroring the
-     * server-confirmed values into the local record. Switching to/from `public` re-mints
-     * (or drops) the bearer link, so the returned `shareUrl`/`token` can change — all are
-     * persisted. Returns the new visibility, or null when there is no share.
-     */
-    fun setBranchShareVisibility(
-        workspaceRoot: String,
-        branch: String,
-        apiKey: String,
-        visibility: String,
-        commitHash: String? = null,
-        recipients: List<String>? = null,
-    ): String? {
-        val existing = BranchShareStore.getBranchShare(workspaceRoot, branch, commitHash)
+    ): BranchShareStore.BranchShareRecord? {
+        val existing = BranchShareStore.getShare(workspaceRoot, branch, commitHash)
         if (existing?.shareId.isNullOrEmpty()) return null
         val result = JolliApiClient.updateLiveShare(
             null, apiKey, existing!!.shareId,
-            JolliApiClient.LiveSharePatch(visibility = visibility, recipients = recipients),
+            JolliApiClient.LiveSharePatch(visibility = patch.visibility, recipients = patch.recipients),
         )
-        val nextVisibility = result.visibility ?: visibility
-        val token8 = result.token?.take(8)
-            ?: if (nextVisibility == "public") existing.token8 else null
-        val nextRecipients = result.recipients
-            ?: if (nextVisibility == "people") (recipients ?: existing.recipients) else null
-        BranchShareStore.putBranchShare(
-            workspaceRoot,
-            branch,
-            existing.copy(
-                shareId = result.shareId ?: existing.shareId,
-                // A recipients-only PATCH doesn't re-mint the link, so the server may omit
-                // `shareUrl` — keep the existing one in that case.
-                shareUrl = result.shareUrl?.ifEmpty { null } ?: existing.shareUrl,
-                visibility = nextVisibility,
-                token8 = token8,
-                recipients = nextRecipients,
-                expiresAt = result.expiresAt?.ifEmpty { null } ?: existing.expiresAt,
-            ),
-            commitHash,
+        // Prefer what we asked for; fall back to the server echo, then existing.
+        val nextVisibility = patch.visibility ?: result.visibility ?: existing.visibility
+        // Public bearer links carry no allowlist.
+        val nextRecipients = if (nextVisibility == "public") {
+            null
+        } else {
+            patch.recipients ?: result.recipients ?: existing.recipients
+        }
+        val updated = existing.copy(
+            shareId = result.shareId ?: existing.shareId,
+            shareUrl = result.shareUrl?.ifEmpty { null } ?: existing.shareUrl,
+            visibility = nextVisibility,
+            recipients = nextRecipients,
+            expiresAt = result.expiresAt?.ifEmpty { null } ?: existing.expiresAt,
         )
-        return nextVisibility
+        BranchShareStore.putBranchShare(workspaceRoot, branch, updated, commitHash)
+        return updated
     }
 }

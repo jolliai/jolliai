@@ -21,66 +21,59 @@ class BranchShareStoreTest {
             visibility = "public",
             expiresAt = "2026-12-31T00:00:00Z",
             decisionCount = 3,
-            titles = listOf("A", "B"),
         )
 
     @Test
-    fun `put then get round-trips a record`() {
+    fun `put then get round-trips the single record`() {
         BranchShareStore.putBranchShare(projectDir, "feature/x", record())
-        val got = BranchShareStore.getBranchShare(projectDir, "feature/x")
+        val got = BranchShareStore.getShare(projectDir, "feature/x")
         got.shouldNotBeNull()
         got.shareId shouldBe "42"
         got.decisionCount shouldBe 3
-        got.titles shouldBe listOf("A", "B")
+    }
+
+    @Test
+    fun `put overwrites in place (single slot per subject)`() {
+        BranchShareStore.putBranchShare(projectDir, "feature/x", record(id = "first"))
+        BranchShareStore.putBranchShare(projectDir, "feature/x", record(id = "second").copy(visibility = "people", recipients = listOf("a@x.com")))
+        val got = BranchShareStore.getShare(projectDir, "feature/x")!!
+        got.shareId shouldBe "second"
+        got.visibility shouldBe "people"
+        got.recipients shouldBe listOf("a@x.com")
     }
 
     @Test
     fun `branch and commit shares key independently`() {
         BranchShareStore.putBranchShare(projectDir, "feature/x", record("branch-share"))
         BranchShareStore.putBranchShare(projectDir, "feature/x", record("commit-share"), commitHash = "abc123")
-        BranchShareStore.getBranchShare(projectDir, "feature/x")!!.shareId shouldBe "branch-share"
-        BranchShareStore.getBranchShare(projectDir, "feature/x", "abc123")!!.shareId shouldBe "commit-share"
+        BranchShareStore.getShare(projectDir, "feature/x")!!.shareId shouldBe "branch-share"
+        BranchShareStore.getShare(projectDir, "feature/x", "abc123")!!.shareId shouldBe "commit-share"
     }
 
     @Test
-    fun `LiveRef branchCollection round-trips through JSON`() {
+    fun `LiveRef branchCollection and contentHash round-trip through JSON`() {
         val ref = BranchShareStore.LiveRef.branchCollection(
             relativePath = "feature-x",
             covered = listOf(BranchShareStore.CoveredEntry("abc123", 7, listOf(8, 9))),
         )
-        BranchShareStore.putBranchShare(projectDir, "feature/x", record().copy(ref = ref))
-        val got = BranchShareStore.getBranchShare(projectDir, "feature/x")!!
+        BranchShareStore.putBranchShare(projectDir, "feature/x", record().copy(ref = ref, contentHash = "deadbeef"))
+        val got = BranchShareStore.getShare(projectDir, "feature/x")!!
         got.ref.shouldNotBeNull()
         got.ref!!.kind shouldBe BranchShareStore.LiveRef.KIND_BRANCH_COLLECTION
-        got.ref!!.relativePath shouldBe "feature-x"
         got.ref!!.covered!!.single().summaryDocId shouldBe 7
-        got.ref!!.covered!!.single().attachmentDocIds shouldBe listOf(8, 9)
+        got.contentHash shouldBe "deadbeef"
     }
 
     @Test
-    fun `remove drops the record when not confirmed-public`() {
+    fun `remove drops the record and is idempotent`() {
         BranchShareStore.putBranchShare(projectDir, "feature/x", record())
-        BranchShareStore.removeBranchShare(projectDir, "feature/x")
-        BranchShareStore.getBranchShare(projectDir, "feature/x").shouldBeNull()
+        BranchShareStore.removeShare(projectDir, "feature/x")
+        BranchShareStore.getShare(projectDir, "feature/x").shouldBeNull()
+        BranchShareStore.removeShare(projectDir, "feature/x") // no throw
     }
 
     @Test
-    fun `confirmed-public survives put and remove`() {
-        BranchShareStore.markPublicConfirmed(projectDir, "feature/x")
-        BranchShareStore.isPublicConfirmed(projectDir, "feature/x") shouldBe true
-
-        // Put preserves the flag even though the incoming record omits it.
-        BranchShareStore.putBranchShare(projectDir, "feature/x", record())
-        BranchShareStore.getBranchShare(projectDir, "feature/x")!!.confirmedPublic shouldBe true
-
-        // Remove keeps a blank placeholder that retains the confirmation.
-        BranchShareStore.removeBranchShare(projectDir, "feature/x")
-        BranchShareStore.isPublicConfirmed(projectDir, "feature/x") shouldBe true
-        BranchShareStore.getBranchShare(projectDir, "feature/x")!!.shareId shouldBe ""
-    }
-
-    @Test
-    fun `getBranchShare returns null for an unknown subject`() {
-        BranchShareStore.getBranchShare(projectDir, "never-shared").shouldBeNull()
+    fun `getShare returns null for an unknown subject`() {
+        BranchShareStore.getShare(projectDir, "never-shared").shouldBeNull()
     }
 }

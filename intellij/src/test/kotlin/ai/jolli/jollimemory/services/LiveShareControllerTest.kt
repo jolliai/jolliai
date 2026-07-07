@@ -6,6 +6,7 @@ import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.KBPathResolver
 import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.mockk.every
 import io.mockk.mockkObject
@@ -52,7 +53,6 @@ class LiveShareControllerTest {
         every { KBPathResolver.extractRepoName(any()) } returns "r"
         every { BranchShareStore.putBranchShare(any(), any(), any(), any()) } returns Unit
 
-        // Each summary push mints a distinct summary docId (100 + index-ish via hash).
         every { JolliPushOrchestrator.pushSummaryWithAttachments(any(), any(), any(), any(), any()) } answers {
             val s = firstArg<CommitSummary>()
             JolliPushOrchestrator.PushSummaryResult(
@@ -76,9 +76,6 @@ class LiveShareControllerTest {
 
     @Test
     fun `generate branch share builds a branchCollection ref covering every commit`() {
-        every { JolliApiClient.createLiveShare(any(), any(), any()) } returns
-            JolliApiClient.LiveShareResult("77", "https://acme.jolli.ai/s/tok", "2999-01-01T00:00:00Z", "public", "tok12345")
-
         val payload = slot<JolliApiClient.LiveSharePayload>()
         every { JolliApiClient.createLiveShare(any(), any(), capture(payload)) } returns
             JolliApiClient.LiveShareResult("77", "https://acme.jolli.ai/s/tok", "2999-01-01T00:00:00Z", "public", "tok12345")
@@ -97,7 +94,7 @@ class LiveShareControllerTest {
         payload.captured.ref.kind shouldBe BranchShareStore.LiveRef.KIND_BRANCH_COLLECTION
         payload.captured.ref.covered!! shouldHaveSize 2
         stored.captured.shareId shouldBe "77"
-        stored.captured.token8 shouldBe "tok12345"
+        stored.captured.contentHash.shouldNotBeNull()
     }
 
     @Test
@@ -133,14 +130,14 @@ class LiveShareControllerTest {
 
     @Test
     fun `reconcile is a no-op when there is no existing share`() {
-        every { BranchShareStore.getBranchShare(root, branch, null) } returns null
+        every { BranchShareStore.getShare(root, branch, null) } returns null
         LiveShareController.reconcileLiveShare(deps(listOf(summary("aaaa1111"))), branch)
         verify(exactly = 0) { JolliApiClient.updateLiveShare(any(), any(), any(), any()) }
     }
 
     @Test
     fun `reconcile is a no-op for a commit-docs share`() {
-        every { BranchShareStore.getBranchShare(root, branch, null) } returns
+        every { BranchShareStore.getShare(root, branch, null) } returns
             BranchShareStore.BranchShareRecord(
                 shareId = "9", shareUrl = "u", visibility = "public",
                 ref = BranchShareStore.LiveRef.commitDocs(listOf(1), emptyList()),
@@ -151,12 +148,12 @@ class LiveShareControllerTest {
     }
 
     @Test
-    fun `reconcile re-pushes and patches an existing branch share`() {
-        every { BranchShareStore.getBranchShare(root, branch, null) } returns
+    fun `reconcile re-pushes and patches when content changed`() {
+        every { BranchShareStore.getShare(root, branch, null) } returns
             BranchShareStore.BranchShareRecord(
                 shareId = "55", shareUrl = "https://acme.jolli.ai/s/tok", visibility = "public",
                 ref = BranchShareStore.LiveRef.branchCollection("feature-x", emptyList()),
-                token8 = "old12345", expiresAt = "2999-01-01T00:00:00Z", decisionCount = 1,
+                contentHash = "stale-hash-does-not-match", expiresAt = "2999-01-01T00:00:00Z", decisionCount = 1,
             )
         every { JolliApiClient.updateLiveShare(any(), any(), "55", any()) } returns
             JolliApiClient.LiveShareUpdateResult(shareId = "55")
