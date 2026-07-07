@@ -72,8 +72,32 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
             .addSeparator()
             .addLabeledComponent(jolliApiKeyLabel!!, jolliApiKeyField!!, 1, false)
             .addTooltip("For pushing summaries to Jolli Space (sk-jol-...). Fallback if not signed in.")
+            .addSeparator()
+            .addLabeledComponent(JBLabel("Historical memory:"), backfillPanel(), 1, false)
+            .addTooltip("Generate summaries for past commits that don't have one yet (uses on-disk Claude transcripts).")
             .addComponentFillVertically(JPanel(), 0)
             .panel
+    }
+
+    /**
+     * "Generate Missing Summaries" — full-scope back-fill for every own commit lacking a
+     * summary. Mirrors the VS Code Settings button (jollimemory.generateMissingSummaries):
+     * shares [BackfillRunner] with the tool-window cold-start card, so both entry points
+     * report progress + completion identically. An empty hash list means full scope.
+     */
+    private fun backfillPanel(): JPanel {
+        val button = JButton("Generate Missing Summaries")
+        button.addActionListener {
+            val service = project.getService(ai.jolli.jollimemory.services.JolliMemoryService::class.java)
+            button.isEnabled = false
+            ai.jolli.jollimemory.backfill.BackfillRunner.run(
+                project = project,
+                service = service,
+                hashes = emptyList(),
+                onComplete = { SwingUtilities.invokeLater { button.isEnabled = true } },
+            )
+        }
+        return JPanel(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 0, 0)).apply { add(button) }
     }
 
     private fun accountPanel(): JPanel {

@@ -210,6 +210,26 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         val memoriesCollapsible = CollapsiblePanel(
             "COMMITTED MEMORIES", "JolliMemory.CommitsActions", commitsPanel,
         )
+        // Cold-start "build memory from your history" card. Visible only when the repo has
+        // no memories yet or has recent own commits lacking one — the panel owns that
+        // decision via shouldBeVisible() (it stays up mid-flow). Fits its content and has
+        // no action toolbar (the id resolves to nothing — CollapsiblePanel tolerates that).
+        lateinit var backfillCollapsible: CollapsiblePanel
+        lateinit var backfillPanel: BackfillPanel
+        val syncBackfillVisibility = {
+            backfillCollapsible.isVisible = backfillPanel.shouldBeVisible()
+            backfillPanel.syncOffer()
+        }
+        backfillPanel = BackfillPanel(project, service) {
+            SwingUtilities.invokeLater { syncBackfillVisibility() }
+        }
+        backfillCollapsible = CollapsiblePanel(
+            "BUILD MEMORY", "JolliMemory.BackfillActions", backfillPanel, fitContent = true,
+            titleIcon = AllIcons.Actions.Refresh,
+        )
+        // Immediate-invoke on add (service fires once when initialized) sets the initial
+        // visibility; later cold-start recomputes / dismissals re-run it on the EDT.
+        service.addBackfillListener { SwingUtilities.invokeLater(syncBackfillVisibility) }
 
         // Live row-count suffix in the section headers, e.g. "PINNED (3)".
         pinnedCollapsible.setCount(pinnedPanel.currentRowCount())
@@ -223,9 +243,11 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         val accordionStack = WidthTrackingPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = false
+            backfillCollapsible.alignmentX = Component.LEFT_ALIGNMENT
             pinnedCollapsible.alignmentX = Component.LEFT_ALIGNMENT
             currentMemoryCollapsible.alignmentX = Component.LEFT_ALIGNMENT
             memoriesCollapsible.alignmentX = Component.LEFT_ALIGNMENT
+            add(backfillCollapsible)
             add(pinnedCollapsible)
             add(currentMemoryCollapsible)
             add(memoriesCollapsible)

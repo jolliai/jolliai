@@ -124,6 +124,93 @@ class JolliMemoryService(private val project: Project) : Disposable {
     fun removeMemoryStateListener(listener: () -> Unit) { memoryStateListeners.remove(listener) }
     fun notifyMemoryStateChanged() { memoryStateListeners.forEach { it() } }
 
+    // ── Back-fill cold-start signals ─────────────────────────────────────
+    // Mirrors the VS Code extension's `computeColdStartSignals()` /
+    // `currentColdStartVariant` host state (vscode/src/Extension.ts). Drives the
+    // "build memory from your history" card in the tool window. Computed off-EDT
+    // by [computeColdStartSignals] via the `jolli backfill --list-candidates`
+    // subprocess (no LLM). The card is visible only when
+    // `coldStartVariant != null && !backfillDismissed`.
+    /** "empty" (repo has zero memories) | "gaps" (recent own commits lack one) | null. */
+    @Volatile
+    var coldStartVariant: String? = null
+        private set
+
+    /** Count of recent (last month, capped) own commits lacking a summary — card copy. */
+    @Volatile
+    var recentMissingCount: Int = 0
+        private set
+
+    /** Whether the user dismissed the card for this repo (repo-wide marker). */
+    @Volatile
+    var backfillDismissed: Boolean = false
+        private set
+
+    private val backfillListeners = CopyOnWriteArrayList<() -> Unit>()
+
+    /** Notified (invoke on the EDT) when cold-start signals or the dismiss flag change. */
+    fun addBackfillListener(listener: () -> Unit) {
+        backfillListeners.add(listener)
+        if (isInitialized) listener()
+    }
+    fun removeBackfillListener(listener: () -> Unit) { backfillListeners.remove(listener) }
+    private fun notifyBackfillListeners() { backfillListeners.forEach { it() } }
+
+    private fun backfillCwd(): String? = mainRepoRoot ?: project.basePath
+
+    /**
+     * Resolves cold-start signals for the card. Best-effort and atomic: on any failure
+     * the prior snapshot is left intact (never a mixed state). Safe to call off the EDT —
+     * it shells out to the CLI. Same window/cap as VS Code (30 days, top 10).
+     */
+    fun computeColdStartSignals() {
+        val cwd = backfillCwd() ?: return
+        when (val r = ai.jolli.jollimemory.backfill.BackfillCli.listCandidates(cwd, sinceDays = 30, limit = 10)) {
+            is ai.jolli.jollimemory.backfill.BackfillCli.Outcome.Ok -> {
+                val s = r.value
+                coldStartVariant = when {
+                    !s.hasAnyMemory -> "empty"
+                    s.candidates.isNotEmpty() -> "gaps"
+                    else -> null
+                }
+                recentMissingCount = s.candidates.size
+                backfillDismissed = ai.jolli.jollimemory.backfill.BackfillDismissFlag.isDismissed(cwd)
+                notifyBackfillListeners()
+            }
+            else -> {
+                log.info("Back-fill cold-start signals unavailable (${r::class.simpleName}); keeping prior snapshot")
+            }
+        }
+    }
+
+    /** True when the tool-window card should be shown. */
+    fun shouldShowBackfillCard(): Boolean = coldStartVariant != null && !backfillDismissed
+
+    /** Records that the user dismissed the card (writes the repo-wide marker). Idempotent. */
+    fun dismissBackfillCard() {
+        val cwd = backfillCwd() ?: return
+        backfillDismissed = true
+        ai.jolli.jollimemory.backfill.BackfillDismissFlag.setDismissed(cwd, true)
+        notifyBackfillListeners()
+    }
+
+    /**
+     * Post-back-fill bookkeeping shared by both entry points (card + Settings), mirroring
+     * VS Code's `runBackfillJob`: once any summary is generated the repo is no longer in
+     * cold start and the dismiss marker is cleared so a future fresh-empty transition
+     * re-surfaces the card.
+     */
+    fun onBackfillCompleted(generatedAny: Boolean) {
+        if (generatedAny) {
+            val cwd = backfillCwd()
+            coldStartVariant = null
+            recentMissingCount = 0
+            backfillDismissed = false
+            if (cwd != null) ai.jolli.jollimemory.backfill.BackfillDismissFlag.setDismissed(cwd, false)
+        }
+        notifyBackfillListeners()
+    }
+
     /**
      * Adds a sync-state listener. If a sync state has already been observed,
      * the listener is invoked immediately with it so late-registering panels

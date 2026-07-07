@@ -4,6 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../backfill/BackfillEngine.js", () => ({
 	runBackfill: vi.fn(),
 	recentCommitHashes: vi.fn(),
+	repoHasAnyMemory: vi.fn(),
+	countMissingSummaries: vi.fn(),
+	listMissingCommits: vi.fn(),
 	DEFAULT_BACKFILL_TIER: "low",
 }));
 vi.mock("../Logger.js", () => ({
@@ -11,7 +14,13 @@ vi.mock("../Logger.js", () => ({
 	createLogger: () => ({ info: vi.fn(), error: vi.fn(), debug: vi.fn(), warn: vi.fn() }),
 }));
 
-import { recentCommitHashes, runBackfill } from "../backfill/BackfillEngine.js";
+import {
+	countMissingSummaries,
+	listMissingCommits,
+	recentCommitHashes,
+	repoHasAnyMemory,
+	runBackfill,
+} from "../backfill/BackfillEngine.js";
 import { registerBackfillCommand } from "./BackfillCommand.js";
 
 function makeProgram(): Command {
@@ -138,5 +147,63 @@ describe("jolli backfill command", () => {
 		await makeProgram().parseAsync(["backfill"], { from: "user" });
 		expect(process.exitCode).toBe(1);
 		expect(vi.mocked(runBackfill)).not.toHaveBeenCalled();
+	});
+
+	it("--hashes passes an explicit subset and skips recentCommitHashes", async () => {
+		vi.mocked(runBackfill).mockResolvedValue({ ...report, outcomes: [] });
+		await makeProgram().parseAsync(["backfill", "--hashes", " h1 , h2 ,,h3 "], { from: "user" });
+		expect(vi.mocked(recentCommitHashes)).not.toHaveBeenCalled();
+		expect(vi.mocked(runBackfill)).toHaveBeenCalledWith(expect.objectContaining({ hashes: ["h1", "h2", "h3"] }));
+	});
+
+	it("--hashes with only blanks falls back to the --last range", async () => {
+		vi.mocked(recentCommitHashes).mockResolvedValue(["h1"]);
+		vi.mocked(runBackfill).mockResolvedValue({ ...report, outcomes: [] });
+		await makeProgram().parseAsync(["backfill", "--hashes", " , ,"], { from: "user" });
+		expect(vi.mocked(recentCommitHashes)).toHaveBeenCalled();
+	});
+
+	it("--stream emits NDJSON progress events then a final report line", async () => {
+		vi.mocked(recentCommitHashes).mockResolvedValue(["h1", "h2"]);
+		vi.mocked(runBackfill).mockImplementation(async (opts) => {
+			opts.onProgress?.(1, 2, { commitHash: "h1", status: "generated" });
+			opts.onProgress?.(2, 2, { commitHash: "h2", status: "error", message: "boom" });
+			return report;
+		});
+		await makeProgram().parseAsync(["backfill", "--stream"], { from: "user" });
+		const lines = logSpy.mock.calls.map((c: unknown[]) => String(c[0]));
+		const parsed = lines.map((l: string) => JSON.parse(l));
+		expect(parsed[0]).toMatchObject({ type: "progress", done: 1, total: 2 });
+		expect(parsed[1]).toMatchObject({ type: "progress", done: 2, total: 2 });
+		expect(parsed[2]).toMatchObject({ type: "report", generated: 1 });
+	});
+
+	it("--list-candidates emits cold-start signals as one JSON line and skips runBackfill", async () => {
+		vi.mocked(repoHasAnyMemory).mockResolvedValue(false);
+		vi.mocked(countMissingSummaries).mockResolvedValue({ missing: 3, total: 5 });
+		vi.mocked(listMissingCommits).mockResolvedValue([{ commitHash: "h1", subject: "fix x", ts: 1000 }]);
+
+		await makeProgram().parseAsync(
+			["backfill", "--cwd", "e:/r", "--list-candidates", "--since-days", "30", "--limit", "10"],
+			{ from: "user" },
+		);
+
+		expect(vi.mocked(runBackfill)).not.toHaveBeenCalled();
+		expect(vi.mocked(listMissingCommits)).toHaveBeenCalledWith("e:/r", 30 * 24 * 60 * 60 * 1000, 10);
+		const out = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
+		expect(JSON.parse(out)).toEqual({
+			hasAnyMemory: false,
+			total: 5,
+			missing: 3,
+			candidates: [{ commitHash: "h1", subject: "fix x", ts: 1000 }],
+		});
+	});
+
+	it("--list-candidates without --since-days passes undefined window", async () => {
+		vi.mocked(repoHasAnyMemory).mockResolvedValue(true);
+		vi.mocked(countMissingSummaries).mockResolvedValue({ missing: 0, total: 2 });
+		vi.mocked(listMissingCommits).mockResolvedValue([]);
+		await makeProgram().parseAsync(["backfill", "--list-candidates"], { from: "user" });
+		expect(vi.mocked(listMissingCommits)).toHaveBeenCalledWith(expect.any(String), undefined, undefined);
 	});
 });
