@@ -43,6 +43,7 @@ import com.intellij.ui.jcef.JBCefJSQuery
 import com.intellij.ide.BrowserUtil
 import org.cef.browser.CefBrowser
 import org.cef.browser.CefFrame
+import org.cef.handler.CefLoadHandlerAdapter
 import org.cef.handler.CefRequestHandlerAdapter
 import org.cef.network.CefRequest
 import java.awt.Dimension
@@ -77,6 +78,15 @@ class SummaryPanel(
     private var browser: JBCefBrowser? = null
     private var jsQuery: JBCefJSQuery? = null
     private var bridgeScript: String = ""
+
+    // Share-overlay auto-open (the Commits-list Share icon opens this editor, then asks the
+    // webview to reveal its inline share modal — mirroring the VS Code showWithShareModal flow).
+    // pageLoaded flips on the first onLoadEnd; a request that arrives before then is deferred.
+    @Volatile
+    private var pageLoaded = false
+
+    @Volatile
+    private var pendingShareOpen = false
     private val gson = Gson()
     private val store: SummaryStore
     private val transcriptHashSet = mutableSetOf<String>()
@@ -179,6 +189,16 @@ class SummaryPanel(
                 }
             }, b.cefBrowser)
 
+            // Note page-load completion so a deferred share-open request (openShare, from the
+            // Commits list) can reveal the inline overlay once the webview JS is defined.
+            b.jbCefClient.addLoadHandler(object : CefLoadHandlerAdapter() {
+                override fun onLoadEnd(browser: CefBrowser?, frame: CefFrame?, httpStatusCode: Int) {
+                    if (frame?.isMain != true) return
+                    pageLoaded = true
+                    maybeOpenShare()
+                }
+            }, b.cefBrowser)
+
             val isDark = !JBColor.isBright()
             val html = SummaryHtmlBuilder.buildHtml(currentSummary, isDark, transcriptHashSet, planTranslateSet, bridgeScript, readOnly)
             b.loadHTML(html)
@@ -201,6 +221,32 @@ class SummaryPanel(
         service?.removeMemoryStateListener(memoryStateListener)
         jsQuery?.dispose()
         browser?.dispose()
+    }
+
+    /**
+     * Reveals the inline share overlay in this webview — the Commits-list "Share" icon entry
+     * point, equivalent to clicking the in-view "Share link" button. Runs `shareOpen()` (which
+     * shows the overlay and kicks off the single-slot [ai.jolli.jollimemory.services.BranchShareModal]).
+     * Deferred until [pageLoaded] when the editor was just opened for this click.
+     */
+    fun openShare() {
+        pendingShareOpen = true
+        maybeOpenShare()
+    }
+
+    @Synchronized
+    private fun maybeOpenShare() {
+        if (pageLoaded && pendingShareOpen) {
+            pendingShareOpen = false
+            ApplicationManager.getApplication().invokeLater {
+                val b = browser ?: return@invokeLater
+                b.cefBrowser.executeJavaScript(
+                    "if (typeof shareOpen === 'function') shareOpen();",
+                    b.cefBrowser.url ?: "",
+                    0,
+                )
+            }
+        }
     }
 
     // ── Webview bridge ──────────────────────────────────────────────────────
