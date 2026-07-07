@@ -337,8 +337,8 @@ object WorkingMemoryHtmlBuilder {
         .wm-tmeter-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; margin: 8px 2px; max-width: 380px; background: rgba(128,128,128,0.16); }
         .wm-tmeter-bar > span { display: block; height: 100%; }
         .wm-seg-in { background: var(--stat-add); }
-        .wm-seg-out { background: var(--link-fg); }
-        .wm-seg-cache { background: rgba(128,128,128,0.55); }
+        .wm-seg-out { background: rgba(128,128,128,0.55); }
+        .wm-seg-cache { background: var(--link-fg); }
         .wm-tmeter-legend { display: flex; flex-wrap: wrap; gap: 13px; font-size: 10.5px; color: var(--text-secondary); }
         .wm-tmeter-legend span { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
         .wm-lg-dot { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; display: inline-block; }
