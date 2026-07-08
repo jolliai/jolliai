@@ -11,6 +11,7 @@ import com.intellij.icons.AllIcons
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
@@ -214,22 +215,32 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         // no memories yet or has recent own commits lacking one — the panel owns that
         // decision via shouldBeVisible() (it stays up mid-flow). Fits its content and has
         // no action toolbar (the id resolves to nothing — CollapsiblePanel tolerates that).
-        lateinit var backfillCollapsible: CollapsiblePanel
-        lateinit var backfillPanel: BackfillPanel
-        val syncBackfillVisibility = {
-            backfillCollapsible.isVisible = backfillPanel.shouldBeVisible()
-            backfillPanel.syncOffer()
+        // Built defensively: a failure constructing this card (e.g. an SDK API drift between
+        // the plugin's build target and the running IDE) must NEVER blank the whole tool
+        // window — so on any throwable we log and simply omit the card. `null` = unavailable.
+        var backfillCollapsible: CollapsiblePanel? = null
+        try {
+            lateinit var bfCollapsible: CollapsiblePanel
+            lateinit var bfPanel: BackfillPanel
+            val syncBackfillVisibility = {
+                bfCollapsible.isVisible = bfPanel.shouldBeVisible()
+                bfPanel.syncOffer()
+            }
+            bfPanel = BackfillPanel(project, service) {
+                SwingUtilities.invokeLater { syncBackfillVisibility() }
+            }
+            bfCollapsible = CollapsiblePanel(
+                "BUILD MEMORY", "JolliMemory.BackfillActions", bfPanel, fitContent = true,
+                titleIcon = AllIcons.Actions.Refresh,
+            )
+            // Immediate-invoke on add (service fires once when initialized) sets the initial
+            // visibility; later cold-start recomputes / dismissals re-run it on the EDT.
+            service.addBackfillListener { SwingUtilities.invokeLater(syncBackfillVisibility) }
+            backfillCollapsible = bfCollapsible
+        } catch (e: Throwable) {
+            Logger.getInstance(JolliMemoryToolWindowFactory::class.java)
+                .warn("Back-fill cold-start card unavailable (rest of the tool window unaffected): ${e.message}", e)
         }
-        backfillPanel = BackfillPanel(project, service) {
-            SwingUtilities.invokeLater { syncBackfillVisibility() }
-        }
-        backfillCollapsible = CollapsiblePanel(
-            "BUILD MEMORY", "JolliMemory.BackfillActions", backfillPanel, fitContent = true,
-            titleIcon = AllIcons.Actions.Refresh,
-        )
-        // Immediate-invoke on add (service fires once when initialized) sets the initial
-        // visibility; later cold-start recomputes / dismissals re-run it on the EDT.
-        service.addBackfillListener { SwingUtilities.invokeLater(syncBackfillVisibility) }
 
         // Live row-count suffix in the section headers, e.g. "PINNED (3)".
         pinnedCollapsible.setCount(pinnedPanel.currentRowCount())
@@ -243,11 +254,11 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         val accordionStack = WidthTrackingPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = false
-            backfillCollapsible.alignmentX = Component.LEFT_ALIGNMENT
+            backfillCollapsible?.alignmentX = Component.LEFT_ALIGNMENT
             pinnedCollapsible.alignmentX = Component.LEFT_ALIGNMENT
             currentMemoryCollapsible.alignmentX = Component.LEFT_ALIGNMENT
             memoriesCollapsible.alignmentX = Component.LEFT_ALIGNMENT
-            add(backfillCollapsible)
+            backfillCollapsible?.let { add(it) }
             add(pinnedCollapsible)
             add(currentMemoryCollapsible)
             add(memoriesCollapsible)
