@@ -131,9 +131,8 @@ object ActiveSessionAggregator {
 			loadCodex(cwd),
 			loadOpenCode(cwd),
 			loadCursor(cwd),
-			// TODO: plug in when Copilot branches land
-			// loadCopilot(cwd),
-			// loadCopilotChat(cwd),
+			loadCopilot(cwd),
+			loadCopilotChat(cwd),
 		)
 		val sessions = batches.flatMap { it.sessions }
 		val failedSources = batches.flatMap { it.failed }
@@ -169,20 +168,19 @@ object ActiveSessionAggregator {
 		log.warn("scanCursorSessions threw: %s", e.message)
 		LoaderResult(emptyList(), listOf(TranscriptSource.cursor))
 	}
-	//
-	// private fun loadCopilot(cwd: String): LoaderResult = try {
-	//     val r = CopilotSupport.discoverSessions(cwd)
-	//     LoaderResult(r, emptyList())
-	// } catch (e: Exception) {
-	//     log.warn("scanCopilotSessions threw: %s", e.message)
-	//     LoaderResult(emptyList(), listOf(TranscriptSource.copilot))
-	// }
-	//
-	// private fun loadCopilotChat(cwd: String): LoaderResult = try {
-	//     val r = CopilotChatSupport.discoverSessions(cwd)
-	//     LoaderResult(r, emptyList())
-	// } catch (e: Exception) {
-	//     log.warn("scanCopilotChatSessions threw: %s", e.message)
-	//     LoaderResult(emptyList(), listOf(TranscriptSource.`copilot-chat`))
-	// }
+	private fun loadCopilot(cwd: String): LoaderResult = try {
+		val scan = CopilotSupport.discoverSessions(cwd)
+		LoaderResult(scan.sessions, if (scan.error != null) listOf(TranscriptSource.copilot) else emptyList())
+	} catch (e: Exception) {
+		log.warn("scanCopilotSessions threw: %s", e.message)
+		LoaderResult(emptyList(), listOf(TranscriptSource.copilot))
+	}
+
+	private fun loadCopilotChat(cwd: String): LoaderResult = try {
+		val scan = CopilotChatSupport.discoverSessions(cwd)
+		LoaderResult(scan.sessions, if (scan.error != null) listOf(TranscriptSource.`copilot-chat`) else emptyList())
+	} catch (e: Exception) {
+		log.warn("scanCopilotChatSessions threw: %s", e.message)
+		LoaderResult(emptyList(), listOf(TranscriptSource.`copilot-chat`))
+	}
 }

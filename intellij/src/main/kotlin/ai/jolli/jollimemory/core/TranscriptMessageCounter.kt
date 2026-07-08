@@ -85,9 +85,8 @@ object TranscriptMessageCounter {
 			TranscriptSource.gemini -> GeminiSupport.readGeminiTranscript(transcriptPath)
 			TranscriptSource.opencode -> OpenCodeSupport.readTranscript(transcriptPath, null).entries
 			TranscriptSource.cursor -> CursorSupport.readTranscript(transcriptPath, null).entries
-			// TODO: plug in when Copilot branches land
-			// TranscriptSource.copilot -> CopilotSupport.readTranscript(transcriptPath, null).entries
-			// TranscriptSource.`copilot-chat` -> CopilotChatSupport.readTranscript(transcriptPath, null).entries
+			TranscriptSource.copilot -> CopilotSupport.readTranscript(transcriptPath, null).entries
+			TranscriptSource.`copilot-chat` -> CopilotChatSupport.readTranscript(transcriptPath, null).entries
 			TranscriptSource.codex -> TranscriptReader.readTranscript(
 				transcriptPath, null, getParserForSource(TranscriptSource.codex),
 			).entries
@@ -102,9 +101,8 @@ object TranscriptMessageCounter {
 		TranscriptSource.gemini -> GeminiSupport.readGeminiTranscript(transcriptPath)
 		TranscriptSource.opencode -> OpenCodeSupport.readTranscript(transcriptPath, cursor).entries
 		TranscriptSource.cursor -> CursorSupport.readTranscript(transcriptPath, cursor).entries
-		// TODO: plug in when Copilot branches land
-		// TranscriptSource.copilot -> CopilotSupport.readTranscript(transcriptPath, cursor).entries
-		// TranscriptSource.`copilot-chat` -> CopilotChatSupport.readTranscript(transcriptPath, cursor).entries
+		TranscriptSource.copilot -> CopilotSupport.readTranscript(transcriptPath, cursor).entries
+		TranscriptSource.`copilot-chat` -> CopilotChatSupport.readTranscript(transcriptPath, cursor).entries
 		TranscriptSource.codex -> TranscriptReader.readTranscript(
 			transcriptPath, cursor, getParserForSource(TranscriptSource.codex),
 		).entries
