@@ -131,17 +131,28 @@ export class NextMemoryPreviewPanel {
 				// extension host process.
 				sidebarProvider.handleOutbound(msg);
 			});
-			sidebarProvider.registerBroadcastTarget(panel.webview);
-			// Capture `panel` (not the module `currentPanel`) so dispose always
-			// unregisters THIS panel's webview and stays safe under double-dispose;
-			// only clear the singleton if it still points at this panel.
+			// Cache the webview reference. `panel.webview` is a getter that throws
+			// "Webview is disposed" once the panel is torn down — and onDidDispose
+			// fires exactly at teardown, so reading `panel.webview` *inside* the
+			// dispose callback throws, aborting the callback before it clears
+			// `currentPanel`. That left a disposed panel lingering as the singleton,
+			// so the next Review click reveal()-ed a dead webview and silently did
+			// nothing. Referencing the cached webview never touches the getter.
+			// (Other webview panels don't hit this because their dispose callbacks
+			// don't read the webview at all — this panel is the only one that must
+			// unregister a broadcast target on dispose.)
+			const webview = panel.webview;
+			sidebarProvider.registerBroadcastTarget(webview);
+			// Capture `panel`/`webview` (not the module `currentPanel`) so dispose
+			// always unregisters THIS panel's webview and stays safe under
+			// double-dispose; only clear the singleton if it still points here.
 			panel.onDidDispose(() => {
 				if (refreshTimer) {
 					clearTimeout(refreshTimer);
 					refreshTimer = undefined;
 				}
 				pendingSections.clear();
-				sidebarProvider.unregisterBroadcastTarget(panel.webview);
+				sidebarProvider.unregisterBroadcastTarget(webview);
 				if (currentPanel === panel) currentPanel = undefined;
 			});
 			currentPanel = panel;

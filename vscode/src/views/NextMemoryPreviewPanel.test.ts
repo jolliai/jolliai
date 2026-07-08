@@ -92,6 +92,35 @@ describe("NextMemoryPreviewPanel.show", () => {
 		);
 	});
 
+	it("reopens a fresh panel after the previous one was disposed", async () => {
+		await NextMemoryPreviewPanel.show("file:///ext" as never, "/repo", makeBridge() as never, makeSidebarProvider() as never);
+		expect(createWebviewPanel).toHaveBeenCalledTimes(1);
+		// Close the panel — onDidDispose must clear the singleton so a re-open works.
+		lastPanel().onDispose();
+		await NextMemoryPreviewPanel.show("file:///ext" as never, "/repo", makeBridge() as never, makeSidebarProvider() as never);
+		expect(createWebviewPanel).toHaveBeenCalledTimes(2);
+	});
+
+	it("clears the singleton on dispose even when the disposed webview getter throws", async () => {
+		// Regression for the real crash (dev-tools log: "Webview is disposed" thrown
+		// from onDidDispose). After teardown, reading panel.webview throws; the
+		// dispose callback must use the cached webview reference so it neither throws
+		// nor leaves a dead panel as the singleton. Otherwise the next Review click
+		// reveal()s a disposed webview and silently does nothing.
+		await NextMemoryPreviewPanel.show("file:///ext" as never, "/repo", makeBridge() as never, makeSidebarProvider() as never);
+		expect(createWebviewPanel).toHaveBeenCalledTimes(1);
+		const panel = lastPanel();
+		// Emulate VS Code: once disposed, the webview getter throws.
+		Object.defineProperty(panel, "webview", {
+			get() {
+				throw new Error("Webview is disposed");
+			},
+		});
+		expect(() => panel.onDispose()).not.toThrow();
+		await NextMemoryPreviewPanel.show("file:///ext" as never, "/repo", makeBridge() as never, makeSidebarProvider() as never);
+		expect(createWebviewPanel).toHaveBeenCalledTimes(2);
+	});
+
 	it("reuses the existing panel on a second show() instead of creating a new one", async () => {
 		const bridge = makeBridge();
 		const sidebarProvider = makeSidebarProvider();
