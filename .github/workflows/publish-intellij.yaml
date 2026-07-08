@@ -1,8 +1,30 @@
+# JolliMemory IntelliJ Plugin Release Workflow
+#
+# Authentication (all already configured as repo secrets):
+#   - CERTIFICATE_CHAIN — plugin signing certificate chain (chain.crt)
+#   - PRIVATE_KEY       — plugin signing private key (private.pem, unencrypted)
+#   - PUBLISH_TOKEN     — JetBrains Marketplace publish token (marketplace-token)
+#
+# Triggering: workflow_dispatch only. A human starts the run from the Actions
+# UI ("Run workflow"). It publishes the version currently in
+# intellij/build.gradle.kts on the ref you select in the branch dropdown — no
+# tag or version input. Pick the branch you want to ship from (e.g.
+# release/0.99.x) before clicking Run.
+#
+# NOTE: JetBrains Marketplace versions are immutable. Bump `version` in
+# intellij/build.gradle.kts before publishing — re-running with a version that
+# is already on the Marketplace will fail at the publishPlugin step.
+
 name: Publish to JetBrains Marketplace
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'If true, run all checks + build + sign but skip the actual Marketplace publish'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -11,8 +33,9 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    permissions:
-      contents: write   # gh release upload attaches the signed plugin to the release
+    concurrency:
+      group: release-intellij
+      cancel-in-progress: false
     defaults:
       run:
         working-directory: intellij
@@ -53,24 +76,49 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: npm run build
 
+      - name: Resolve plugin version from build.gradle.kts
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -E '^version = ' build.gradle.kts | head -1 | sed -E 's/^version = "(.*)"/\1/')"
+          if [ -z "${VERSION}" ]; then
+            echo "::error::could not resolve version from intellij/build.gradle.kts"
+            exit 1
+          fi
+          echo "Publishing IntelliJ plugin version ${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
       - name: Run tests
         run: ./gradlew test
 
       - name: Build plugin
         run: ./gradlew buildPlugin
 
-      - name: Sign and publish plugin
+      - name: Sign plugin
+        env:
+          CERTIFICATE_CHAIN: ${{ secrets.CERTIFICATE_CHAIN }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+        run: ./gradlew signPlugin
+
+      - name: Publish plugin to JetBrains Marketplace
+        if: inputs.dry_run != true
         env:
           CERTIFICATE_CHAIN: ${{ secrets.CERTIFICATE_CHAIN }}
           PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
           PUBLISH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
-        run: ./gradlew signPlugin publishPlugin
+        run: ./gradlew publishPlugin
 
-      - name: Upload signed plugin to release
+      - name: Dry-run summary
+        if: inputs.dry_run == true
         env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          gh release upload "${TAG}" \
-            build/distributions/*.zip \
-            --clobber
+          echo "::notice::DRY RUN — real run would publish IntelliJ plugin ${VERSION} to JetBrains Marketplace"
+          echo "All build + sign steps completed successfully."
+          echo "To perform the real release, re-run this workflow with dry_run=false."
+
+      - name: Upload signed plugin artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jollimemory-intellij-${{ steps.meta.outputs.version }}
+          path: intellij/build/distributions/*.zip
