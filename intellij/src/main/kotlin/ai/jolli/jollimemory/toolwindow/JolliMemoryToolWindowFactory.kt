@@ -225,6 +225,12 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             val syncBackfillVisibility = {
                 bfPanel.isVisible = bfPanel.shouldBeVisible()
                 bfPanel.syncOffer()
+                // Relayout the accordion so hiding the card collapses its space immediately.
+                val stack = bfPanel.parent
+                if (stack != null) {
+                    stack.revalidate()
+                    stack.repaint()
+                }
             }
             bfPanel = BackfillPanel(project, service) {
                 SwingUtilities.invokeLater { syncBackfillVisibility() }

@@ -101,8 +101,15 @@ class BackfillPanel(
 	/** Fit its own height in the accordion's vertical BoxLayout (never stretch vertically). */
 	override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
 
-	/** Mid-flow (LOADING/LIST/PROGRESS/DONE) stays visible; OFFER defers to the service. */
-	fun shouldBeVisible(): Boolean = currentCard != OFFER || service.shouldShowBackfillCard()
+	/**
+	 * A ✕ dismiss always hides the card (matching VS Code, whose visibility is purely
+	 * `!dismissed && …`). Otherwise mid-flow (LOADING/LIST/PROGRESS/DONE) stays visible so a
+	 * signal change can't yank it away, and OFFER defers to the service's cold-start decision.
+	 */
+	fun shouldBeVisible(): Boolean {
+		if (service.backfillDismissed) return false
+		return currentCard != OFFER || service.shouldShowBackfillCard()
+	}
 
 	/** Refreshes the offer copy from current signals without disturbing a mid-flow view. */
 	fun syncOffer() {
@@ -290,6 +297,16 @@ class BackfillPanel(
 		onVisibilityRefresh()
 	}
 
+	/**
+	 * ✕ handler for every state: reset to OFFER (so a later re-show starts clean) and mark the
+	 * card dismissed — which flips [shouldBeVisible] to false and hides it. Works from any state,
+	 * including the LIST/"No commits" view reached by clicking Build.
+	 */
+	private fun onDismiss() {
+		showOffer()
+		service.dismissBackfillCard()
+	}
+
 	private fun openSettings() = SettingsDialog(project, service).show()
 
 	// ── mount + reflow ─────────────────────────────────────────────────────
@@ -351,7 +368,7 @@ class BackfillPanel(
 			isFocusPainted = false
 			margin = JBUI.emptyInsets()
 			cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-			addActionListener { service.dismissBackfillCard() }
+			addActionListener { onDismiss() }
 		}
 		return JPanel(BorderLayout(JBUI.scale(8), 0)).apply {
 			isOpaque = false
