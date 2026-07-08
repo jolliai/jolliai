@@ -338,6 +338,20 @@ export function isLlmCredentialError(err: unknown): err is LlmCredentialError {
 }
 
 /** Direct mode: call Anthropic SDK locally */
+/**
+ * True for the Node ≥24 async-iterator teardown error the Anthropic SDK surfaces from
+ * `stream.finalMessage()` when the HTTP connection closes right after the final SSE event.
+ * Matched by `code` (ERR_STREAM_PREMATURE_CLOSE) or message text, on the error or its `cause`
+ * (undici nests the transport reason there). Kept narrow so only this specific spurious close
+ * is recovered — genuine transport failures still propagate.
+ */
+function isPrematureClose(err: unknown): boolean {
+	const e = err as { code?: unknown; message?: unknown; cause?: { code?: unknown; message?: unknown } };
+	if (e?.code === "ERR_STREAM_PREMATURE_CLOSE" || e?.cause?.code === "ERR_STREAM_PREMATURE_CLOSE") return true;
+	const text = `${String(e?.message ?? "")} ${String(e?.cause?.message ?? "")}`.toLowerCase();
+	return text.includes("premature close");
+}
+
 async function callDirect(
 	options: LlmCallOptions,
 	apiKey: string,
@@ -412,6 +426,17 @@ async function callDirect(
 			// while a wedged socket produces nothing and is aborted — restoring the
 			// fail-fast guarantee without capping valid long responses.
 			const stream = client.messages.stream(body);
+			// Node 24's async-iterator teardown can make `finalMessage()` reject with
+			// ERR_STREAM_PREMATURE_CLOSE *after* the full response was already received (the
+			// `message_stop` event fired) — the socket close races the iterator's own end.
+			// Capture the completed message from the `message` event (emitted on message_stop)
+			// so a call that actually succeeded is recovered rather than failed. VS Code never
+			// hit this because its extension host runs on Electron's Node 22; the IntelliJ
+			// plugin shells out to the user's system Node (24+), which does.
+			let receivedMessage: Anthropic.Message | undefined;
+			stream.on("message", (m) => {
+				receivedMessage = m;
+			});
 			let idleTimer: ReturnType<typeof setTimeout> | undefined;
 			const armIdleWatchdog = (): void => {
 				clearTimeout(idleTimer);
@@ -427,6 +452,20 @@ async function callDirect(
 			hardTimer.unref?.();
 			try {
 				response = await stream.finalMessage();
+			} catch (streamErr) {
+				// Only recover when the message genuinely completed (message_stop → `message`
+				// event). A premature close with no received message is a real truncation and
+				// must propagate so the caller retries.
+				if (receivedMessage !== undefined && isPrematureClose(streamErr)) {
+					log.warn(
+						"stream.finalMessage() threw a premature-close after the response completed; recovering the received message (Node %s async-iterator teardown). action=%s",
+						process.version,
+						options.action,
+					);
+					response = receivedMessage;
+				} else {
+					throw streamErr;
+				}
 			} finally {
 				clearTimeout(idleTimer);
 				clearTimeout(hardTimer);
