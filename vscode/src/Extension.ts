@@ -11,6 +11,7 @@ import { clearTimeout, setTimeout } from "node:timers";
 import * as vscode from "vscode";
 import {
 	conversationKey,
+	removeAiExclusion,
 	setExcluded,
 } from "../../cli/src/core/CommitSelectionStore.js";
 import { discoverCodexConversations } from "../../cli/src/core/CodexDiscovery.js";
@@ -1248,6 +1249,17 @@ export function activate(context: vscode.ExtensionContext): void {
 		},
 		applyNoteCheckbox: async (noteId, selected) => {
 			await setExcluded(workspaceRoot, "notes", noteId, !selected);
+			await plansProvider.refreshExclusions();
+		},
+		applyDismissAiExclude: async (kind, key) => {
+			// Map the single-form context kind to the plural ExclusionKind, then drop this
+			// entry from aiSuggestedExclude so the item lands normally (the worker's
+			// fingerprint reuse then honours the dismiss).
+			const k = kind === "plan" ? "plans" : kind === "note" ? "notes" : "references";
+			await removeAiExclusion(workspaceRoot, k, key);
+			// Reflect the dismiss in the memoized ranking (rather than invalidating it), so
+			// reopening the panel keeps the item included without a re-rank / "Analyzing…".
+			NextMemoryPreviewPanel.dismissInRelevanceCache(key);
 			await plansProvider.refreshExclusions();
 		},
 		// Active Conversations source for the Branch tab (hoisted above so

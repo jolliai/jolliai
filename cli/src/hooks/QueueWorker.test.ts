@@ -37,6 +37,43 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 	};
 });
 
+// ContextRelevance: default is a fail-open passthrough (keep all, no soft-exclude), so
+// the existing pipeline tests (which relied on the real fail-open behaviour) are
+// unaffected. Individual tests override assessContextRelevance via mockResolvedValueOnce
+// to drive the AI soft-exclude → skip-association path. The pure helpers
+// (buildChangeSignal / computeChangeFingerprint / buildDecisionFromAiExcluded) keep
+// their real implementations.
+// CommitSelectionStore: readAiSelection is stubbed so tests can drive executePipeline's
+// fingerprint-reuse arm (buildDecisionFromAiExcluded) vs the recompute arm. Everything
+// else (readExclusions / writeAiSelection / …) keeps its real implementation.
+vi.mock("../core/CommitSelectionStore.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/CommitSelectionStore.js")>();
+	return {
+		...actual,
+		readAiSelection: vi.fn(),
+		clearAiSelection: vi.fn(),
+	};
+});
+
+vi.mock("../core/ContextRelevance.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/ContextRelevance.js")>();
+	return {
+		...actual,
+		// buildChangeSignal touches git plumbing not fully mocked in this suite; if it
+		// throws, the relevance try-block skips assessContextRelevance entirely. Stub it
+		// so assess actually runs. computeChangeFingerprint / buildDecisionFromAiExcluded
+		// keep their real implementations.
+		buildChangeSignal: vi.fn(async () => ({ commitMessage: "", changedFiles: ["src/file.ts"], symbols: [] })),
+		assessContextRelevance: vi.fn(async (raw: Parameters<typeof actual.assessContextRelevance>[0]) => ({
+			plans: raw.plans,
+			notes: raw.notes,
+			references: raw.references,
+			excludedContext: [],
+			results: [],
+		})),
+	};
+});
+
 // ReferenceStore is fs-bound; mock it so QueueWorker tests don't touch disk
 vi.mock("../core/references/ReferenceStore.js", () => ({
 	referencePath: vi.fn(
@@ -71,6 +108,7 @@ vi.mock("../core/Locks.js", () => ({
 	// Passthrough: run the RMW body without touching the real lock file. The
 	// per-worktree lock contract itself is covered in Locks.test.ts.
 	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
+	withCommitSelectionLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
 	INGEST_PHASE_FILE: "ingest-phase",
 }));
 
@@ -371,10 +409,12 @@ vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
+import { clearAiSelection, readAiSelection } from "../core/CommitSelectionStore.js";
+import { assessContextRelevance, buildChangeSignal, computeChangeFingerprint } from "../core/ContextRelevance.js";
 import { isCopilotChatInstalled } from "../core/CopilotChatDetector.js";
 import { discoverCopilotChatSessions } from "../core/CopilotChatSessionDiscoverer.js";
 import { isCopilotInstalled } from "../core/CopilotDetector.js";
@@ -488,6 +528,8 @@ describe("QueueWorker", () => {
 			topics: [{ title: "Test topic", trigger: "test", response: "done", decisions: "none" }],
 		});
 		vi.mocked(storeSummary).mockResolvedValue(undefined);
+		vi.mocked(readAiSelection).mockResolvedValue({ aiExcluded: [] });
+		vi.mocked(clearAiSelection).mockResolvedValue(undefined);
 		vi.mocked(existsSync).mockReturnValue(false);
 		vi.mocked(readFileSync).mockReturnValue("");
 		vi.mocked(spawn).mockReturnValue({ unref: vi.fn(), pid: 12345 } as unknown as ReturnType<typeof spawn>);
@@ -2322,6 +2364,152 @@ describe("QueueWorker", () => {
 
 			expect(storeSummary).toHaveBeenCalledTimes(1);
 			expect(vi.mocked(storeSummary).mock.calls[0][0].branch).toBe("main");
+		});
+
+		it("amend fresh-leaf skips AI soft-excluded items from association (keeps them uncommitted)", async () => {
+			// Mirror executePipeline's normal path: an AI soft-excluded item must NOT be
+			// associated — it keeps no commitHash and stays in the working area for the
+			// next commit. Regression: the amend fresh-leaf path previously honoured only
+			// user hard-excludes, so soft-excluded items were silently committed on amend.
+			const dir = mkdtempSync(join(tmpdir(), "jolli-amend-soft-exclude-"));
+			try {
+				const keptPath = join(dir, "kept.md");
+				const excludedPath = join(dir, "excluded.md");
+				writeFileSync(keptPath, "kept note body");
+				writeFileSync(excludedPath, "excluded note body");
+				// node:fs is mocked in this suite (existsSync defaults to false); restore the
+				// real fns so associateNotesWithCommit can read the temp note source files.
+				const { existsSync: realExistsSync, readFileSync: realReadFileSync } =
+					await vi.importActual<typeof import("node:fs")>("node:fs");
+				vi.mocked(existsSync).mockImplementation(realExistsSync);
+				vi.mocked(readFileSync).mockImplementation(realReadFileSync as typeof readFileSync);
+				const op = makeCommitOp({
+					type: "amend",
+					commitHash: "abc12345def67890",
+					branch: "feature/x",
+					sourceHashes: ["0123456789abcdef0123456789abcdef01234567"],
+				});
+				vi.mocked(dequeueAllGitOperations)
+					.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+					.mockResolvedValueOnce([])
+					.mockResolvedValueOnce([]);
+				setupPipelineMocks("abc12345def67890");
+				vi.mocked(getCurrentBranch).mockResolvedValue("feature/x");
+				// Non-trivial delta so the trivial-amend short-circuit is skipped.
+				vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 60, deletions: 1 });
+				// Two uncommitted notes on the branch → detectUncommittedNoteIds finds both.
+				vi.mocked(loadPlansRegistry).mockResolvedValue({
+					version: 1,
+					plans: {},
+					notes: {
+						"n-kept": {
+							id: "n-kept",
+							title: "Kept",
+							format: "snippet" as const,
+							sourcePath: keptPath,
+							addedAt: "2026-04-01T00:00:00Z",
+							updatedAt: "2026-04-01T00:00:00Z",
+							commitHash: null,
+						},
+						"n-excluded": {
+							id: "n-excluded",
+							title: "Excluded",
+							format: "snippet" as const,
+							sourcePath: excludedPath,
+							addedAt: "2026-04-01T00:00:00Z",
+							updatedAt: "2026-04-01T00:00:00Z",
+							commitHash: null,
+						},
+					},
+				});
+				// AI soft-excludes n-excluded — it must be dropped from association.
+				vi.mocked(assessContextRelevance).mockResolvedValueOnce({
+					plans: [],
+					notes: [],
+					references: [],
+					excludedContext: [
+						{
+							kind: "note",
+							key: "n-excluded",
+							title: "Excluded",
+							reason: "unrelated to this change",
+							tier: "low",
+						},
+					],
+					results: [],
+				});
+
+				await runWorker("/test/cwd");
+
+				expect(storeSummary).toHaveBeenCalledTimes(1);
+				const saved = vi.mocked(storeSummary).mock.calls[0][0];
+				const noteIds = (saved.notes ?? []).map((n) => n.id);
+				// n-kept is associated (id carries the -<shorthash> suffix); n-excluded is
+				// skipped entirely, keeping no commitHash.
+				expect(noteIds.some((id) => id.startsWith("n-kept"))).toBe(true);
+				expect(noteIds.some((id) => id.startsWith("n-excluded"))).toBe(false);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+	});
+
+	describe("executePipeline — context relevance degraded paths", () => {
+		it("falls back to all user-kept context when relevance assessment throws (fail-open)", async () => {
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			// buildChangeSignal throwing drives the relevance try-block's catch → fail-open:
+			// all user-kept context retained, pipeline still completes.
+			vi.mocked(buildChangeSignal).mockRejectedValueOnce(new Error("git diff failed"));
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			// Fail-open keeps everything → no excludedContext audit on the summary.
+			expect(vi.mocked(storeSummary).mock.calls[0][0].excludedContext).toBeUndefined();
+		});
+
+		it("reuses the persisted panel ranking when the change fingerprint matches (no LLM)", async () => {
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			const signal = { commitMessage: "", changedFiles: ["src/file.ts"], symbols: [] as string[] };
+			vi.mocked(buildChangeSignal).mockResolvedValueOnce(signal);
+			// Persisted fingerprint matches this change → executePipeline takes the
+			// buildDecisionFromAiExcluded reuse arm and skips assessContextRelevance.
+			vi.mocked(readAiSelection).mockResolvedValueOnce({
+				aiExcluded: [],
+				changeFingerprint: computeChangeFingerprint(signal),
+			});
+			vi.mocked(assessContextRelevance).mockClear();
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			expect(assessContextRelevance).not.toHaveBeenCalled();
+		});
+
+		it("clears the AI selection layer after consuming it for a commit", async () => {
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			vi.mocked(clearAiSelection).mockClear();
+
+			await runWorker("/test/cwd");
+
+			// The AI layer is cleared post-consume so a later same-file-set commit
+			// can't reuse this now-stale fingerprint/decision.
+			expect(clearAiSelection).toHaveBeenCalledWith("/test/cwd");
 		});
 	});
 

@@ -43,6 +43,7 @@ export function buildMarkdown(summary: CommitSummary): string {
 
 	pushPropertiesSection(lines, summary);
 	pushPlansAndNotesSection(lines, summary);
+	pushExcludedContextSection(lines, summary);
 	pushRecapSection(lines, summary);
 	pushE2eTestSection(lines, summary.e2eTestGuide);
 	pushSourceCommitsSection(lines, sourceNodes);
@@ -188,6 +189,28 @@ export function pushPlansAndNotesSection(
 	for (const e of referencesBySourceOrder(references)) {
 		lines.push(`- [${escMdLinkText(e.nativeId)} — ${escMdLinkText(e.title)}](${escMdUrl(e.url)})`);
 	}
+}
+
+/**
+ * Appends the AI-excluded context as a collapsed <details> block: the CONTEXT
+ * items the relevance ranker judged unrelated to this commit, each with its
+ * reason. Renders nothing when there are no soft-excluded items. Kept separate
+ * from the Context section so it still shows when the Context section is empty.
+ */
+export function pushExcludedContextSection(lines: Array<string>, summary: CommitSummary): void {
+	const excluded = summary.excludedContext ?? [];
+	if (excluded.length === 0) return;
+	lines.push(
+		"",
+		"<details>",
+		`<summary>AI judged ${excluded.length} context item(s) unrelated (not included)</summary>`,
+		"",
+	);
+	for (const e of excluded) {
+		lines.push(`- ${escMdLinkText(e.title)}`);
+		if (e.reason) lines.push(`  — ${escMdLinkText(e.reason)}`);
+	}
+	lines.push("", "</details>");
 }
 
 /** Appends the E2E test guide section (shared between clipboard and PR markdown). */

@@ -32,11 +32,13 @@ export async function formatNotesBlock(
 	const maxPerNote = opts.maxCharsPerNote ?? DEFAULT_MAX_CHARS_PER_NOTE;
 	const maxTotal = opts.maxTotalChars ?? DEFAULT_MAX_TOTAL_CHARS;
 
-	const sorted = [...entries].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+	// Respect the caller's order (relevance-ranked, most relevant first) so
+	// over-budget truncation drops the least relevant, not the oldest.
+	const ordered = entries;
 
 	const selected: Array<{ entry: NoteEntry; body: string }> = [];
 	let totalLen = 0;
-	for (const entry of sorted) {
+	for (const entry of ordered) {
 		const body = await readNoteBody(entry);
 		const rendered = renderOneNote(entry, body, maxPerNote);
 		if (totalLen + rendered.length > maxTotal) break;

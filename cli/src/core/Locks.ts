@@ -118,6 +118,7 @@ export const INGEST_PHASE_FILE = "ingest-phase";
 export const ORPHAN_WRITE_LOCK_FILE = "orphan-write.lock";
 export const SYNC_LOCK_FILE = "sync.lock";
 export const PLANS_LOCK_FILE = "plans.lock";
+export const COMMIT_SELECTION_LOCK_FILE = "commit-selection.lock";
 
 /** Default wait budget for `acquireOrphanWriteLock` (background callers). */
 export const DEFAULT_ORPHAN_WRITE_TIMEOUT_MS = 1000;
@@ -410,5 +411,38 @@ export async function withPlansLock<T>(
 		return await fn();
 	} finally {
 		if (acquired) await releaseIfOwned(lockPath, PLANS_LOCK_FILE);
+	}
+}
+
+/**
+ * Cross-process lock for `commit-selection.json` writes. Both the pre-commit panel
+ * (persists the AI ranking) and the post-commit QueueWorker (clears it after consuming,
+ * so a stale fingerprint can't be reused by a later commit touching the same file set)
+ * write this file, so they must not lose-update each other. Mirrors `withPlansLock`:
+ * worktree-scoped, best-effort (fn still runs if the lock can't be acquired within
+ * `timeoutMs`; the atomic tmp+rename write keeps the file from ever being corrupted).
+ * MUST NOT be nested — wrap leaf RMW functions only.
+ */
+export async function withCommitSelectionLock<T>(
+	cwd: string | undefined,
+	fn: () => Promise<T>,
+	opts: OrphanWriteLockOpts = {},
+): Promise<T> {
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_PLANS_LOCK_TIMEOUT_MS;
+	const pollMs = opts.pollMs ?? DEFAULT_PLANS_LOCK_POLL_MS;
+	const dir = await ensureWorktreeLockDir(cwd);
+	const lockPath = join(dir, COMMIT_SELECTION_LOCK_FILE);
+	const acquired = await acquireWithPoll(lockPath, { timeoutMs, pollMs });
+	if (!acquired) {
+		log.warn(
+			"withCommitSelectionLock: could not acquire %s within %d ms — proceeding best-effort",
+			COMMIT_SELECTION_LOCK_FILE,
+			timeoutMs,
+		);
+	}
+	try {
+		return await fn();
+	} finally {
+		if (acquired) await releaseIfOwned(lockPath, COMMIT_SELECTION_LOCK_FILE);
 	}
 }

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { CommitSummary } from "../Types.js";
 import {
 	buildMarkdown,
+	pushExcludedContextSection,
 	pushFooter,
 	pushPlansAndNotesSection,
 	referencesBySourceOrder,
@@ -468,6 +469,42 @@ describe("pushPlansAndNotesSection references gating", () => {
 		const lines: string[] = [];
 		pushPlansAndNotesSection(lines, summary, { includeReferences: true });
 		expect(lines.join("\n")).toContain("[ENG-1 — Fix](https://l/ENG-1)");
+	});
+});
+
+describe("pushExcludedContextSection", () => {
+	it("renders nothing when there is no excluded context", () => {
+		const lines: string[] = [];
+		pushExcludedContextSection(lines, leaf());
+		expect(lines).toEqual([]);
+	});
+	it("renders a collapsed details block with items and reasons", () => {
+		const lines: string[] = [];
+		pushExcludedContextSection(
+			lines,
+			leaf({
+				excludedContext: [
+					{
+						kind: "note",
+						key: "n1",
+						title: "Cursor Support",
+						reason: "unrelated to graph change",
+					},
+					{ kind: "plan", key: "p1", title: "Backfill Plan", reason: "" },
+				],
+			}),
+		);
+		const out = lines.join("\n");
+		expect(out).toContain("<details>");
+		expect(out).toContain("AI judged 2 context item(s) unrelated");
+		expect(out).toContain("- Cursor Support");
+		expect(out).toContain("— unrelated to graph change");
+		expect(out).toContain("- Backfill Plan");
+		expect(out).toContain("</details>");
+	});
+	it("buildMarkdown includes the excluded-context details block", () => {
+		const md = buildMarkdown(leaf({ excludedContext: [{ kind: "note", key: "n1", title: "T", reason: "r" }] }));
+		expect(md).toContain("AI judged 1 context item(s) unrelated");
 	});
 });
 

@@ -1254,6 +1254,24 @@ describe("SummaryHtmlBuilder", () => {
 				expect(html).not.toContain('id="plansCard"');
 				expect(html).not.toContain('id="sourceCard"');
 			});
+
+			it("renders the AI-excluded context details when excludedContext is present", () => {
+				const html = buildContextPanel(
+					makeSummary({
+						excludedContext: [
+							{ kind: "note", key: "n1", title: "Cursor Support", reason: "unrelated to graph change", tier: "low" },
+						],
+					}),
+				);
+				expect(html).toContain("AI excluded 1 unrelated context item(s)");
+				expect(html).toContain("Cursor Support");
+				expect(html).toContain("unrelated to graph change");
+			});
+
+			it("omits the AI-excluded details when there is no excludedContext", () => {
+				const html = buildContextPanel(makeSummary({ plans: [makePlan()] }));
+				expect(html).not.toContain("AI excluded");
+			});
 		});
 
 		it("Conversations panel renders the shell + Loading placeholder (rows fill client-side)", () => {

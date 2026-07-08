@@ -42,6 +42,7 @@ describe("PromptTemplates", () => {
 			"graph-categories-delta",
 			"graph-units",
 			"graph-edges",
+			"rank-context",
 		]);
 	});
 

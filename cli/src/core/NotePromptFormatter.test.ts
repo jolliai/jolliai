@@ -59,15 +59,16 @@ describe("formatNotesBlock", () => {
 		expect(out).toContain("…[truncated,");
 	});
 
-	it("drops oldest notes when maxTotalChars exceeded", async () => {
+	it("drops tail notes when maxTotalChars exceeded, respecting caller order", async () => {
+		// Caller order is authoritative (relevance-ranked upstream); truncation drops the tail.
 		const notes = [
-			makeNote({ id: "older", updatedAt: "2026-05-14T01:00:00Z" }),
-			makeNote({ id: "newer", updatedAt: "2026-05-14T02:00:00Z" }),
+			makeNote({ id: "first", updatedAt: "2026-05-14T01:00:00Z" }),
+			makeNote({ id: "second", updatedAt: "2026-05-14T02:00:00Z" }),
 		];
 		mockReadFile.mockImplementation(async () => "z".repeat(3000));
 		const out = await formatNotesBlock(notes, { maxCharsPerNote: 4000, maxTotalChars: 3500 });
-		expect(out).toContain('id="newer"');
-		expect(out).not.toContain('id="older"');
+		expect(out).toContain('id="first"');
+		expect(out).not.toContain('id="second"');
 	});
 
 	it("renders without <content> when source file is unreadable", async () => {

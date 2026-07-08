@@ -21,7 +21,13 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
-import { conversationKey, readExclusions } from "../core/CommitSelectionStore.js";
+import { clearAiSelection, conversationKey, readAiSelection, readExclusions } from "../core/CommitSelectionStore.js";
+import {
+	assessContextRelevance,
+	buildChangeSignal,
+	buildDecisionFromAiExcluded,
+	computeChangeFingerprint,
+} from "../core/ContextRelevance.js";
 import { applyOverlaysToSessions, pruneConsumedOverlayRules } from "../core/ConversationOverlayStore.js";
 import { isCopilotChatInstalled } from "../core/CopilotChatDetector.js";
 import { discoverCopilotChatSessions } from "../core/CopilotChatSessionDiscoverer.js";
@@ -129,6 +135,7 @@ import {
 	type ConversationTokenBreakdown,
 	CURRENT_SCHEMA_VERSION,
 	type DiffStats,
+	type ExcludedContextItem,
 	type GitOperation,
 	type IngestOperation,
 	isIngestOperation,
@@ -1241,7 +1248,7 @@ export interface AssociateReferencesResult {
  *   2. Build the per-commit snapshot: a `ReferenceCommitRef` (value snapshot)
  *      for the CommitSummary and a `filesToStore` entry (raw bytes keyed by
  *      `archivedKey = "<mapKey>-<shortHash>"`) for the orphan branch. Under the
- *      commit-deletes-entry model (§13) the reference row does NOT survive in
+ *      commit-deletes-entry model the reference row does NOT survive in
  *      plans.json — but its deletion is DEFERRED, not done here.
  *
  * This function performs NO deletes and NO `savePlansRegistry` write: it only
@@ -1575,21 +1582,61 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		detectActiveNotesForBranch(cwd, branch),
 		getReferenceEntriesForBranch(cwd, branch),
 	]);
-	const activePlanEntries = rawActivePlanEntries.filter((p) => !exclusions.plans.has(p.slug));
-	const activeNoteEntries = rawActiveNoteEntries.filter((n) => !exclusions.notes.has(n.id));
-	// Reference exclusion key is `<source>:<nativeId>` — same shape as the
-	// `plans.json.references` map key, mirroring how plans / notes are keyed.
-	const activeReferenceEntries = rawActiveReferenceEntries.filter(
+	// User hard-excludes first (immediate, unconditional). Reference exclusion key
+	// is `<source>:<nativeId>` — same shape as the plans.json.references map key.
+	const userKeptPlans = rawActivePlanEntries.filter((p) => !exclusions.plans.has(p.slug));
+	const userKeptNotes = rawActiveNoteEntries.filter((n) => !exclusions.notes.has(n.id));
+	const userKeptReferences = rawActiveReferenceEntries.filter(
 		(e) => !exclusions.references.has(`${e.source}:${e.nativeId}`),
 	);
+
+	// AI relevance: rank the user-kept context against this change and soft-exclude
+	// clearly-unrelated items. Wrapped so ANY failure (git / content-read / LLM /
+	// parse) falls back to the full user-kept set — a relevance problem must never
+	// break summary generation. rankContextRelevance is itself fail-open; this guard
+	// additionally covers the git + content-read steps around it. Soft-excluded items
+	// are recorded on the summary's excludedContext (not hard-discarded like user excludes).
+	let activePlanEntries = userKeptPlans;
+	let activeNoteEntries = userKeptNotes;
+	let activeReferenceEntries = userKeptReferences;
+	let excludedContext: ReadonlyArray<ExcludedContextItem> = [];
+	try {
+		const changeSignal = await buildChangeSignal(commitInfo.message, `${op.commitHash}~1`, op.commitHash, cwd);
+		const raw = { plans: userKeptPlans, notes: userKeptNotes, references: userKeptReferences };
+		// Reuse the pre-commit panel's full-text ranking when its change fingerprint
+		// matches (so the excluded set the user saw is exactly what lands, and we skip
+		// a redundant LLM call). Otherwise — panel not opened, or the change moved
+		// since it ran — recompute authoritatively here.
+		const aiSel = await readAiSelection(cwd);
+		const fingerprint = computeChangeFingerprint(changeSignal);
+		const relevance =
+			aiSel.changeFingerprint === fingerprint
+				? buildDecisionFromAiExcluded(raw, aiSel.aiExcluded)
+				: await assessContextRelevance(raw, changeSignal, config);
+		activePlanEntries = [...relevance.plans];
+		activeNoteEntries = [...relevance.notes];
+		activeReferenceEntries = [...relevance.references];
+		excludedContext = relevance.excludedContext;
+	} catch (err) {
+		log.warn("Context relevance assessment failed (%s) — using all user-kept context", (err as Error).message);
+	}
+	// This commit has now consumed the panel's AI ranking (reused it on a fingerprint
+	// hit, or recomputed on a miss). Clear the AI layer so a LATER commit over the SAME
+	// file set can't silently reuse this now-stale fingerprint / exclude decision. Uses
+	// withCommitSelectionLock (via clearAiSelection) so it doesn't race the panel. The
+	// worker writes this file only here — the panel is otherwise its sole writer — so the
+	// lock is what keeps the two processes from lose-updating. Best-effort — a clear
+	// failure must never break summary generation.
+	await clearAiSelection(cwd).catch((err) => log.warn("clearAiSelection failed: %s", (err as Error).message));
 	const plansBlock = await formatPlansBlock(activePlanEntries);
 	const notesBlock = await formatNotesBlock(activeNoteEntries);
 	const referenceBlocks = await assembleReferenceBlocks(activeReferenceEntries);
 	log.info(
-		"Prompt blocks: plans=%d notes=%d references=%d",
+		"Prompt blocks: plans=%d notes=%d references=%d (AI soft-excluded %d)",
 		activePlanEntries.length,
 		activeNoteEntries.length,
 		activeReferenceEntries.length,
+		excludedContext.length,
 	);
 
 	// Step 7: Call AI to generate summary
@@ -1673,8 +1720,22 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// the archive path is a separate registry scan and must be filtered here.
 	// The excluded rows are then DISCARDED by `discardExcludedWorkingItems` below
 	// (removed from the working area, but never archived into committed memory).
+	// AI soft-excluded items must ALSO be skipped from association — otherwise they
+	// get a commitHash (moved out of the working area) while ALSO being listed in
+	// excludedContext. Soft-excluded items must keep NO commitHash and stay in the
+	// working area for re-evaluation on the next commit.
+	// Unlike user hard-excludes they are NOT discarded (discardExcludedWorkingItems
+	// only sees the user `exclusions` set), so they simply remain uncommitted.
+	const aiExcludedKeys = {
+		plan: new Set<string>(),
+		note: new Set<string>(),
+		reference: new Set<string>(),
+	};
+	for (const e of excludedContext) aiExcludedKeys[e.kind].add(e.key);
+
 	const planSlugs = await detectPlanSlugsFromRegistry(cwd, branch);
 	for (const excludedSlug of exclusions.plans) planSlugs.delete(excludedSlug);
+	for (const s of aiExcludedKeys.plan) planSlugs.delete(s);
 	const planAssociation = await associatePlansWithCommit(planSlugs, commitInfo.hash, cwd, branch);
 	const planRefs = planAssociation.refs;
 
@@ -1682,6 +1743,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// Same archive-side exclusion as the plan slugs — see comment above.
 	const noteIds = await detectUncommittedNoteIds(cwd, branch);
 	for (const excludedId of exclusions.notes) noteIds.delete(excludedId);
+	for (const id of aiExcludedKeys.note) noteIds.delete(id);
 	const noteRefs = await associateNotesWithCommit(noteIds, commitInfo.hash, cwd, branch);
 
 	// Read uncommitted reference mapKeys from plans.json.references and
@@ -1692,7 +1754,9 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// references are dropped from archival here and DISCARDED (row + markdown
 	// removed) by `discardExcludedWorkingItems` below.
 	const rawReferenceIds = await detectUncommittedReferenceIds(cwd, branch);
-	const referenceIds = rawReferenceIds.filter((e) => !exclusions.references.has(e.mapKey));
+	const referenceIds = rawReferenceIds.filter(
+		(e) => !exclusions.references.has(e.mapKey) && !aiExcludedKeys.reference.has(e.mapKey),
+	);
 	const {
 		refs: referenceRefs,
 		filesToStore: referenceFiles,
@@ -1799,6 +1863,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		...(planRefs.length > 0 ? { plans: planRefs } : {}),
 		...(noteRefs.length > 0 ? { notes: noteRefs } : {}),
 		...(referenceRefs.length > 0 ? { references: referenceRefs } : {}),
+		...(excludedContext.length > 0 ? { excludedContext } : {}),
 		// v5 contract: `transcripts` is always present on a v5 root (empty array
 		// when no AI sessions were captured). Omitting the field would route the
 		// `getTranscriptIds` fast-path back through `collectAllTranscriptHashes`,
@@ -2524,15 +2589,47 @@ async function handleAmendPipeline(
 		detectActiveNotesForBranch(cwd, branchForBlocks),
 		getReferenceEntriesForBranch(cwd, branchForBlocks),
 	]);
-	const amendPlanEntries = rawAmendPlanEntries.filter((p) => !amendExclusions.plans.has(p.slug));
-	const amendNoteEntries = rawAmendNoteEntries.filter((n) => !amendExclusions.notes.has(n.id));
-	// Mirror plans/notes: drop user-deselected references from the amend prompt so
-	// the LLM regenerates the recap without referring to references the user
-	// removed via the sidebar checkboxes. Without this filter the amend path
-	// re-introduces the reference into the summary even after the user unchecked it.
-	const amendReferenceEntries = rawAmendReferenceEntries.filter(
+	// User hard-excludes first (mirrors executePipeline). Reference key is
+	// `<source>:<nativeId>`, same shape as the plans.json.references map key.
+	const userKeptAmendPlans = rawAmendPlanEntries.filter((p) => !amendExclusions.plans.has(p.slug));
+	const userKeptAmendNotes = rawAmendNoteEntries.filter((n) => !amendExclusions.notes.has(n.id));
+	const userKeptAmendRefs = rawAmendReferenceEntries.filter(
 		(e) => !amendExclusions.references.has(`${e.source}:${e.nativeId}`),
 	);
+	// AI relevance filtering, mirroring executePipeline's Stage 2 (wrapped so any
+	// git / content-read / LLM / parse failure falls back to the full user-kept set).
+	// assessContextRelevance is fail-open and unit-tested; this call site is amend-only,
+	// covered by the same v8-ignore rationale as the surrounding prompt-block assembly.
+	// Soft-excluded items shape the amend prompt AND are skipped from fresh-leaf
+	// association below (so they keep NO commitHash and stay in the working area for
+	// re-evaluation, matching executePipeline). FOLLOW-UP: the authoritative
+	// excludedContext audit is still only recorded on the normal path — amended
+	// summaries omit it, so the "AI excluded these" list won't show for an amend.
+	// `amendExcludedContext` is hoisted out of the try so the fresh-leaf branch
+	// further down can read it.
+	let amendPlanEntries = userKeptAmendPlans;
+	let amendNoteEntries = userKeptAmendNotes;
+	let amendReferenceEntries = userKeptAmendRefs;
+	let amendExcludedContext: ReadonlyArray<ExcludedContextItem> = [];
+	try {
+		const amendChangeSignal = await buildChangeSignal(
+			commitInfo.message,
+			`${commitInfo.hash}~1`,
+			commitInfo.hash,
+			cwd,
+		);
+		const amendRelevance = await assessContextRelevance(
+			{ plans: userKeptAmendPlans, notes: userKeptAmendNotes, references: userKeptAmendRefs },
+			amendChangeSignal,
+			amendConfig,
+		);
+		amendPlanEntries = [...amendRelevance.plans];
+		amendNoteEntries = [...amendRelevance.notes];
+		amendReferenceEntries = [...amendRelevance.references];
+		amendExcludedContext = amendRelevance.excludedContext;
+	} catch (err) {
+		log.warn("Amend context relevance failed (%s) — using all user-kept context", (err as Error).message);
+	}
 	const amendPlansBlock = await formatPlansBlock(amendPlanEntries);
 	const amendNotesBlock = await formatNotesBlock(amendNoteEntries);
 	const amendReferenceBlocks = await assembleReferenceBlocks(amendReferenceEntries);
@@ -2756,19 +2853,34 @@ async function handleAmendPipeline(
 	// commit — the user wouldn't see them in plan-progress aggregation or
 	// reverse-lookups. The oldSummary path handles this via reassociateMetadata;
 	// fresh leaves have no oldSummary to migrate from, so we associate fresh.
+	// AI soft-excluded items must NOT be associated (mirroring executePipeline's
+	// aiExcludedKeys handling): they keep no commitHash and stay in the working area
+	// for re-evaluation on the next commit. Key sets are per-kind, single-form kinds.
+	const amendAiExcluded = {
+		plan: new Set<string>(),
+		note: new Set<string>(),
+		reference: new Set<string>(),
+	};
+	for (const e of amendExcludedContext) amendAiExcluded[e.kind].add(e.key);
+
 	const freshLeafPlanSlugs = await detectPlanSlugsFromRegistry(cwd, branch);
 	for (const excludedSlug of amendExclusions.plans) freshLeafPlanSlugs.delete(excludedSlug);
+	for (const s of amendAiExcluded.plan) freshLeafPlanSlugs.delete(s);
 	const freshLeafPlanAssoc = await associatePlansWithCommit(freshLeafPlanSlugs, commitInfo.hash, cwd, branch);
 	const freshLeafPlanRefs = freshLeafPlanAssoc.refs;
 
 	const freshLeafNoteIds = await detectUncommittedNoteIds(cwd, branch);
 	for (const excludedId of amendExclusions.notes) freshLeafNoteIds.delete(excludedId);
+	for (const id of amendAiExcluded.note) freshLeafNoteIds.delete(id);
 	const freshLeafNoteRefs = await associateNotesWithCommit(freshLeafNoteIds, commitInfo.hash, cwd, branch);
 
 	const rawFreshLeafReferenceIds = await detectUncommittedReferenceIds(cwd, branch);
-	// Mirror plans/notes: honour user deselections from the sidebar so the
-	// amend fresh-leaf doesn't silently re-archive references the user removed.
-	const freshLeafReferenceIds = rawFreshLeafReferenceIds.filter((e) => !amendExclusions.references.has(e.mapKey));
+	// Mirror plans/notes: honour user deselections from the sidebar so the amend
+	// fresh-leaf doesn't silently re-archive references the user removed; and drop
+	// AI soft-excluded references (keyed by mapKey === `source:nativeId`).
+	const freshLeafReferenceIds = rawFreshLeafReferenceIds.filter(
+		(e) => !amendExclusions.references.has(e.mapKey) && !amendAiExcluded.reference.has(e.mapKey),
+	);
 	const {
 		refs: freshLeafReferenceRefs,
 		filesToStore: freshLeafReferenceFiles,

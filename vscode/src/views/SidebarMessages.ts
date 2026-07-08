@@ -690,6 +690,11 @@ export type SidebarOutboundMsg =
 			readonly selected: boolean;
 	  }
 	| {
+			readonly type: "branch:dismissAiExclude";
+			readonly kind: "plan" | "note" | "reference";
+			readonly key: string;
+	  }
+	| {
 			readonly type: "section:toggle";
 			readonly section: string;
 			readonly open: boolean;

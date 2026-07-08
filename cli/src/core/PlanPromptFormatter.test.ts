@@ -66,16 +66,18 @@ describe("formatPlansBlock", () => {
 		expect(out.length).toBeLessThan(big.length);
 	});
 
-	it("drops oldest plans when maxTotalChars exceeded", async () => {
+	it("drops tail (least-relevant) plans when maxTotalChars exceeded, respecting caller order", async () => {
+		// Caller order is authoritative (relevance-ranked upstream); over-budget
+		// truncation drops from the tail regardless of updatedAt.
 		const plans = [
-			makePlan({ slug: "old", updatedAt: "2026-05-14T01:00:00Z" }),
+			makePlan({ slug: "top", updatedAt: "2026-05-14T01:00:00Z" }),
 			makePlan({ slug: "mid", updatedAt: "2026-05-14T02:00:00Z" }),
-			makePlan({ slug: "new", updatedAt: "2026-05-14T03:00:00Z" }),
+			makePlan({ slug: "tail", updatedAt: "2026-05-14T03:00:00Z" }),
 		];
 		mockReadFile.mockImplementation(async () => "y".repeat(2500));
 		const out = await formatPlansBlock(plans, { maxCharsPerPlan: 3000, maxTotalChars: 6000 });
-		expect(out).toContain('slug="new"');
-		expect(out).not.toContain('slug="old"');
+		expect(out).toContain('slug="top"');
+		expect(out).not.toContain('slug="tail"');
 	});
 
 	it("returns empty when total budget cannot fit even a single plan", async () => {

@@ -239,6 +239,16 @@ export interface LlmCallOptions extends LlmCredentials {
 	readonly forceStreaming?: boolean;
 	/** Optional prompt revision to pin (proxy mode only) */
 	readonly version?: number;
+	/**
+	 * Optional per-call wall-clock timeout in ms. When set, overrides the
+	 * module-level fetch/stream hard caps (DIRECT_FETCH_TIMEOUT_MS /
+	 * PROXY_FETCH_TIMEOUT_MS / STREAM_MAX_WALL_CLOCK_MS) for THIS call only.
+	 * Lets latency-sensitive callers (e.g. the context-relevance ranker, which
+	 * must fail-open fast without wedging the post-commit queue) impose a much
+	 * shorter deadline than the default 180s. The streaming idle watchdog is
+	 * unaffected — a short hard cap simply fires before it.
+	 */
+	readonly timeoutMs?: number;
 }
 
 /** Result from an LLM call */
@@ -448,7 +458,7 @@ async function callDirect(
 			stream.on("streamEvent", armIdleWatchdog);
 			// Absolute cap, NOT reset by stream events — bounds a stream that keeps
 			// pinging but never completes, which the idle watchdog alone can't catch.
-			const hardTimer = setTimeout(() => stream.abort(), STREAM_MAX_WALL_CLOCK_MS);
+			const hardTimer = setTimeout(() => stream.abort(), options.timeoutMs ?? STREAM_MAX_WALL_CLOCK_MS);
 			hardTimer.unref?.();
 			try {
 				response = await stream.finalMessage();
@@ -478,7 +488,7 @@ async function callDirect(
 			// holding the caller (e.g. `ConflictResolver.resolveAll`)
 			// indefinitely.
 			response = await client.messages.create(body, {
-				signal: AbortSignal.timeout(DIRECT_FETCH_TIMEOUT_MS),
+				signal: AbortSignal.timeout(options.timeoutMs ?? DIRECT_FETCH_TIMEOUT_MS),
 			});
 		}
 	} catch (err) {
@@ -608,7 +618,7 @@ async function callProxy(
 				[TRACE_HEADER_NAME]: traceHeader,
 			},
 			body,
-			signal: AbortSignal.timeout(PROXY_FETCH_TIMEOUT_MS),
+			signal: AbortSignal.timeout(options.timeoutMs ?? PROXY_FETCH_TIMEOUT_MS),
 		});
 	} catch (err) {
 		// Transport-layer failure (DNS, TLS handshake, connect, reset, timeout).

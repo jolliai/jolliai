@@ -102,6 +102,7 @@ vi.mock("../core/Locks.js", () => ({
 	refreshWorkerLockMtime: vi.fn(),
 	isWorkerLockHeld: vi.fn(),
 	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
+	withCommitSelectionLock: (_projectDir: string, fn: () => Promise<unknown>) => fn(),
 	WORKER_PHASE_FILE: "worker-phase",
 }));
 

@@ -41,6 +41,12 @@ export function buildNextMemoryScript(): string {
   // to commit). Mirrors renderCommitReviewBar in SidebarScriptBuilder, whose
   // disabled expression is 'selectedCount === 0 || isWorkerBlocking()'.
   let isBusy = false;
+  // AI relevance overlay (context:relevance): id -> {tier, reason, autoExclude}.
+  // Additive display data layered on top of the user's own selection.
+  let relevanceById = {};
+  // context:analyzing — pre-commit relevance ranking in flight; disables Commit
+  // and shows a spinner (like isBusy for the post-commit worker).
+  let isAnalyzing = false;
   // Last rendered preview:title payload. The detected ticket arrives on its own
   // preview:ticket message (a reference toggle recomputes the ticket without an
   // LLM title regen), so we merge it into this and re-render the title panel.
@@ -221,6 +227,21 @@ export function buildNextMemoryScript(): string {
     return btn;
   }
 
+  // Like rowIconButton but with a visible text label beside the icon. Used for the
+  // context Dismiss action, where a bare "+" glyph isn't self-explanatory — the
+  // label ("Include") makes the outcome clear at a glance.
+  function rowLabeledButton(icon, label, title, onClick) {
+    const btn = el('button', { type: 'button', className: 'row-act-labeled', title: title }, [
+      el('i', { className: 'codicon ' + icon }),
+      el('span', { text: label }),
+    ]);
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      onClick();
+    });
+    return btn;
+  }
+
   // Wrap a row's hover actions (the ✕/+ toggle plus, for files/context, a
   // destructive discard/remove button) in a .row-actions overlay so they sit
   // absolutely at the row's right edge and never reflow the row content.
@@ -294,7 +315,10 @@ export function buildNextMemoryScript(): string {
   }
 
   function renderContextRow(item) {
-    const row = el('div', { className: 'row' + (item.isSelected ? '' : ' excluded'), 'data-id': item.id });
+    const rel = relevanceById[item.id];
+    const aiExcluded = !!(rel && rel.autoExclude);
+    // Main row: identity (badge + title) + hover-overlay actions only.
+    const row = el('div', { className: 'row', 'data-id': item.id });
     row.appendChild(ctxBadge(item.contextValue, item.iconKey));
     row.appendChild(el('div', { className: 'r-main' }, [el('div', { className: 'r-title', text: item.label })]));
     let toggleMsg;
@@ -307,32 +331,64 @@ export function buildNextMemoryScript(): string {
       removeCmd = 'jollimemory.removeNote';
     } else {
       toggleMsg = { type: 'branch:toggleReferenceSelection', mapKey: item.id };
-      // References aren't deleted, they're ignored (dropped from this memory);
-      // matches the sidebar's inline trash routing for reference rows.
+      // References aren't deleted, they're ignored (dropped from this memory).
       removeCmd = 'jollimemory.ignoreReference';
     }
-    // Destructive Remove (trash) + the reversible ✕/+ exclude toggle, in that
-    // order — the same [remove] [✕] cluster the sidebar's Context rows show.
-    // Remove dispatches the SAME jollimemory.remove* / ignoreReference command
-    // the sidebar's inline trash button dispatches (its own confirm dialog runs
-    // host-side), so there's one delete path, not a panel-specific one.
-    row.appendChild(rowActions([
-      rowIconButton('codicon-trash', 'Remove', function() {
-        vscode.postMessage({ type: 'command', command: removeCmd, args: [item.id] });
-      }),
-      excludeToggle(function(selected) {
-        vscode.postMessage(Object.assign({}, toggleMsg, { selected: selected }));
-      }, !!item.isSelected),
-    ]));
-    // Row click previews the item — plan/note open their markdown preview, a
-    // reference opens its rendered-markdown preview. Same branch:open* messages
-    // the sidebar's Working Memory Context rows post.
+    // Action set differs by state. An AI-excluded row shows ONLY a labeled
+    // "+ Include" button — no 🗑 (removing an item the AI already dropped is
+    // pointless) and no ✕ (the item is already out of the summary, so toggling it
+    // changes nothing). Clicking Include dismisses the AI's exclude suggestion and
+    // brings the item back to its normal tier. A normal row keeps 🗑 + the ✕ exclude
+    // toggle. All sit in the hover overlay.
+    let actions;
+    if (aiExcluded) {
+      actions = [
+        rowLabeledButton('codicon-add', 'Include', "Dismiss the AI's exclude suggestion", function() {
+          vscode.postMessage({ type: 'branch:dismissAiExclude', kind: item.contextValue, key: item.id });
+          // Optimistic: drop it from the AI-excluded set so it immediately falls back
+          // to its normal tier — no persistent state. The host removes it from
+          // aiSuggestedExclude so the worker's fingerprint reuse honours the dismiss.
+          relevanceById[item.id] = Object.assign({}, rel, { autoExclude: false });
+          renderContext();
+        }),
+      ];
+    } else {
+      actions = [
+        rowIconButton('codicon-trash', 'Remove', function() {
+          vscode.postMessage({ type: 'command', command: removeCmd, args: [item.id] });
+        }),
+        excludeToggle(function(selected) {
+          vscode.postMessage(Object.assign({}, toggleMsg, { selected: selected }));
+        }, !!item.isSelected),
+      ];
+    }
+    row.appendChild(rowActions(actions));
     attachRowOpen(row, function() {
       if (item.contextValue === 'plan') vscode.postMessage({ type: 'branch:openPlan', planId: item.id });
       else if (item.contextValue === 'note') vscode.postMessage({ type: 'branch:openNote', noteId: item.id });
       else vscode.postMessage({ type: 'branch:openReferencePreview', mapKey: item.id });
     });
-    return row;
+    // Wrapper: main row + a SECOND meta row for the AI overlay. Keeping the tier /
+    // Excluded chip and the ✨ note OFF the hover-overlay .row-actions means they stay
+    // visible (tags no longer vanish on hover) and the note gets room for two lines.
+    const wrap = el('div', {
+      className: 'ctx-item' + (item.isSelected ? '' : ' user-excluded') + (aiExcluded ? ' ai-excluded' : ''),
+    }, [row]);
+    if (rel && (rel.tier || rel.reason)) {
+      const meta = el('div', { className: 'ctx-meta' });
+      if (aiExcluded) {
+        meta.appendChild(el('span', { className: 'ctx-tier ctx-tier--ex', title: 'AI marked unrelated — excluded from the summary', text: 'Excluded' }));
+      } else if (rel.tier) {
+        const tierLabel = rel.tier === 'high' ? 'High' : rel.tier === 'mid' ? 'Med' : 'Low';
+        const tierTip = rel.tier === 'high'
+          ? 'High relevance to this change'
+          : rel.tier === 'mid' ? 'Medium relevance to this change' : 'Low relevance to this change';
+        meta.appendChild(el('span', { className: 'ctx-tier ctx-tier--' + rel.tier, title: tierTip, text: tierLabel }));
+      }
+      if (rel.reason) meta.appendChild(el('div', { className: 'ai-say', text: '\\u2728 ' + rel.reason }));
+      wrap.appendChild(meta);
+    }
+    return wrap;
   }
 
   function renderFileRow(item) {
@@ -392,11 +448,12 @@ export function buildNextMemoryScript(): string {
     return row;
   }
 
-  function panel(title, count, rows, headerExtra, emptyText) {
+  function panel(title, count, rows, headerExtra, emptyText, headerBadge) {
     const header = el('div', { className: 'panel-header' }, [
       el('span', { className: 'panel-title', text: title }),
       el('span', { className: 'sec-count', text: String(count) }),
     ]);
+    if (headerBadge) header.appendChild(headerBadge);
     if (headerExtra) header.appendChild(headerExtra);
     const body = rows.length
       ? rows
@@ -429,10 +486,21 @@ export function buildNextMemoryScript(): string {
   function renderConversations() {
     mount('conversations-panel', panel('Conversations', conversations.length, conversations.map(renderConversationRow)));
   }
+  // Sort rank: High → Med → Low/unscored → Excluded, so the most relevant read
+  // first and excluded items sink to the bottom. Stable within a rank (JS sort).
+  function ctxTierRank(item) {
+    const r = relevanceById[item.id];
+    if (!r) return 2;
+    if (r.autoExclude) return 3;
+    return r.tier === 'high' ? 0 : r.tier === 'mid' ? 1 : 2;
+  }
   function renderContext() {
-    // Empty copy mirrors SidebarEmptyMessages.plansEmpty (the sidebar's Context
-    // section) rather than the generic "Nothing here yet.".
-    mount('context-panel', panel('Context', contextItems.length, contextItems.map(renderContextRow), addMenuButton(), 'No plans or notes yet. Click + to add a plan or note.'));
+    const ordered = contextItems.slice().sort(function(a, b) { return ctxTierRank(a) - ctxTierRank(b); });
+    const rows = ordered.map(renderContextRow);
+    // Analyzing indicator lives in the panel HEADER (not a list row) so it doesn't
+    // push the list down or read like an item.
+    const badge = isAnalyzing ? el('span', { className: 'ph-analyzing', text: '\\u2728 Analyzing\\u2026' }) : null;
+    mount('context-panel', panel('Context', contextItems.length, rows, addMenuButton(), 'No plans or notes yet. Click + to add a plan or note.', badge));
   }
   function renderFiles() {
     mount('files-panel', panel('Files', files.length, files.map(renderFileRow)));
@@ -546,6 +614,10 @@ export function buildNextMemoryScript(): string {
   function updateCommitEnabled() {
     if (!commitBtn) return;
     const selectedCount = files.filter(function(f) { return !!f.isSelected; }).length;
+    // The pre-commit relevance ranking (isAnalyzing) is a NON-authoritative,
+    // display-only overlay — the authoritative ranking runs post-commit in the
+    // QueueWorker. It must NOT gate Commit (gating blocked commits for up to the
+    // rank timeout on a purely decorative preview). Only worker-busy + file count.
     commitBtn.disabled = selectedCount === 0 || isBusy;
   }
 
@@ -616,6 +688,18 @@ export function buildNextMemoryScript(): string {
         return;
       case 'preview:diffstat':
         renderMetaStrip(msg);
+        return;
+      case 'context:relevance':
+        relevanceById = {};
+        (msg.items || []).forEach(function(r) { relevanceById[r.id] = r; });
+        isAnalyzing = false;
+        renderContext();
+        updateCommitEnabled();
+        return;
+      case 'context:analyzing':
+        isAnalyzing = !!msg.analyzing;
+        renderContext();
+        updateCommitEnabled();
         return;
       default:
         return;
