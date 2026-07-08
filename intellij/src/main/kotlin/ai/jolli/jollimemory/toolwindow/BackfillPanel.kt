@@ -8,6 +8,8 @@ import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
+import com.intellij.ui.JBColor
+import com.intellij.ui.RoundedLineBorder
 import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
@@ -76,7 +78,12 @@ class BackfillPanel(
 
 	init {
 		isOpaque = false
-		border = JBUI.Borders.empty(8, 10, 12, 10)
+		// A bare bordered card (matching VS Code's `.backfill-panel` div), NOT a titled
+		// accordion section — an outer margin, a rounded outline, then inner padding.
+		border = JBUI.Borders.compound(
+			JBUI.Borders.empty(6),
+			JBUI.Borders.compound(RoundedLineBorder(JBColor.border(), JBUI.scale(10), 1), JBUI.Borders.empty(8, 10, 12, 10)),
+		)
 		deck.isOpaque = false
 		deck.add(offerHolder, OFFER)
 		deck.add(loadingHolder, LOADING)
@@ -90,6 +97,9 @@ class BackfillPanel(
 		})
 		showOffer()
 	}
+
+	/** Fit its own height in the accordion's vertical BoxLayout (never stretch vertically). */
+	override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
 
 	/** Mid-flow (LOADING/LIST/PROGRESS/DONE) stays visible; OFFER defers to the service. */
 	fun shouldBeVisible(): Boolean = currentCard != OFFER || service.shouldShowBackfillCard()
