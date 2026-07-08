@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.99.5
+
+### New Features
+
+- **Build memory from your history** — open a repository that has no memory yet (or has recent commits without one) and a **BUILD MEMORY** card now offers to generate summaries for those past commits. Pick which commits to reconstruct — each row shows how many AI conversations were attributed to it — then watch per-commit progress and a final summary. Run a full back-fill any time from **Settings → Memory Bank → Generate Missing Summaries**, and dismiss the card per repository (the choice is shared with the VS Code extension, so a dismiss in one is honored in the other).
+- **Resume a Codex session** — Codex conversations can now be resumed directly, using the correct session-ID lookup.
+
+### Changes
+
+- **Force-push protection** — the push and Create PR flows now detect when the remote branch has been rewritten (a non-fast-forward) and gate the force-push behind a confirmation; the git checks run off the UI thread so the IDE stays responsive.
+
+### Fixes & Improvements
+
+- **Self-healing MCP config** — `.mcp.json` is repaired automatically when it points at an extension dist that has been removed.
+- Fixed a NUL-delimiter parsing bug in the IntelliJ post-commit hook.
+
 ## 0.99.4
 
 ### New Features
