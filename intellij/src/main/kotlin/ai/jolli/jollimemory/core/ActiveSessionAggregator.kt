@@ -148,7 +148,7 @@ object ActiveSessionAggregator {
 	}
 
 	private fun loadCodex(cwd: String): LoaderResult = try {
-		LoaderResult(CodexSessionDiscoverer.discoverSessions(), emptyList())
+		LoaderResult(CodexSessionDiscoverer.discoverSessions(cwd), emptyList())
 	} catch (e: Exception) {
 		log.warn("discoverCodexSessions threw: %s", e.message)
 		LoaderResult(emptyList(), listOf(TranscriptSource.codex))
