@@ -211,32 +211,28 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         val memoriesCollapsible = CollapsiblePanel(
             "COMMITTED MEMORIES", "JolliMemory.CommitsActions", commitsPanel,
         )
-        // Cold-start "build memory from your history" card. Visible only when the repo has
-        // no memories yet or has recent own commits lacking one — the panel owns that
-        // decision via shouldBeVisible() (it stays up mid-flow). Fits its content and has
-        // no action toolbar (the id resolves to nothing — CollapsiblePanel tolerates that).
-        // Built defensively: a failure constructing this card (e.g. an SDK API drift between
-        // the plugin's build target and the running IDE) must NEVER blank the whole tool
-        // window — so on any throwable we log and simply omit the card. `null` = unavailable.
-        var backfillCollapsible: CollapsiblePanel? = null
+        // Cold-start "build memory from your history" card. Rendered as a BARE bordered card
+        // at the top of the stack (matching VS Code's `.backfill-panel` div) — deliberately NOT
+        // a titled accordion section, so there is no persistent "BUILD MEMORY" header: the card
+        // simply appears during cold start and hides on dismiss / once memory exists. The panel
+        // owns its visibility via shouldBeVisible() (it stays up mid-flow).
+        // Built defensively: a failure constructing this card (e.g. an SDK API drift between the
+        // plugin's build target and the running IDE) must NEVER blank the whole tool window — so
+        // on any throwable we log and simply omit the card. `null` = unavailable.
+        var backfillCard: BackfillPanel? = null
         try {
-            lateinit var bfCollapsible: CollapsiblePanel
             lateinit var bfPanel: BackfillPanel
             val syncBackfillVisibility = {
-                bfCollapsible.isVisible = bfPanel.shouldBeVisible()
+                bfPanel.isVisible = bfPanel.shouldBeVisible()
                 bfPanel.syncOffer()
             }
             bfPanel = BackfillPanel(project, service) {
                 SwingUtilities.invokeLater { syncBackfillVisibility() }
             }
-            bfCollapsible = CollapsiblePanel(
-                "BUILD MEMORY", "JolliMemory.BackfillActions", bfPanel, fitContent = true,
-                titleIcon = AllIcons.Actions.Refresh,
-            )
             // Immediate-invoke on add (service fires once when initialized) sets the initial
             // visibility; later cold-start recomputes / dismissals re-run it on the EDT.
             service.addBackfillListener { SwingUtilities.invokeLater(syncBackfillVisibility) }
-            backfillCollapsible = bfCollapsible
+            backfillCard = bfPanel
         } catch (e: Throwable) {
             Logger.getInstance(JolliMemoryToolWindowFactory::class.java)
                 .warn("Back-fill cold-start card unavailable (rest of the tool window unaffected): ${e.message}", e)
@@ -254,11 +250,11 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         val accordionStack = WidthTrackingPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = false
-            backfillCollapsible?.alignmentX = Component.LEFT_ALIGNMENT
+            backfillCard?.alignmentX = Component.LEFT_ALIGNMENT
             pinnedCollapsible.alignmentX = Component.LEFT_ALIGNMENT
             currentMemoryCollapsible.alignmentX = Component.LEFT_ALIGNMENT
             memoriesCollapsible.alignmentX = Component.LEFT_ALIGNMENT
-            backfillCollapsible?.let { add(it) }
+            backfillCard?.let { add(it) }
             add(pinnedCollapsible)
             add(currentMemoryCollapsible)
             add(memoriesCollapsible)
