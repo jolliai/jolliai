@@ -34,6 +34,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createLogger, getJolliMemoryDir } from "../../Logger.js";
 import type { Reference, ReferenceField, SourceId } from "../../Types.js";
+import { getRegistry } from "./SourceDefinitionRegistry.js";
 
 const log = createLogger("ReferenceStore");
 
@@ -55,23 +56,33 @@ export function referencePath(cwd: string, source: SourceId, key: string): strin
 /**
  * Returns the safe file stem for a given source's nativeId.
  *
- * Linear / Jira / Notion: identity — their native ids are already
- * filesystem-safe and globally unique within the source. **The Linear identity
- * is load-bearing** — the archive round-trip relies on
+ * Driven by the registered `SourceDefinition.storage.nativeIdPathSafe`:
+ *
+ * Linear / Jira / Notion (`nativeIdPathSafe: true`): identity — their native
+ * ids are already filesystem-safe and globally unique within the source.
+ * **The Linear identity is load-bearing** — the archive round-trip relies on
  * `sanitizeNativeIdForPath("linear", "PROJ-1234") === "PROJ-1234"` and
  * `"PROJ-1234-abc12345"` (archive form) → identity.
  *
- * GitHub: `<owner>/<repo>#<n>` is collision-prone (`/`, `#` unsafe; two repos
- * could share issue numbers). Replace `[^\w.-]` with `-` then append 8 hex
- * chars of sha256(nativeId) so different repos can never collide.
+ * GitHub (`nativeIdPathSafe: false`): `<owner>/<repo>#<n>` is collision-prone
+ * (`/`, `#` unsafe; two repos could share issue numbers). Replace `[^\w.-]`
+ * with `-` then append 8 hex chars of sha256(nativeId) so different repos can
+ * never collide.
+ *
+ * A `source` unregistered in `SourceDefinitionRegistry` (unknown id, e.g. a
+ * definition removed after a repo already has data on disk for it) is treated
+ * conservatively as if `nativeIdPathSafe: false` — the sha8 form is safe for
+ * any input, whereas defaulting to identity would skip sanitization for a
+ * source whose nativeId shape we know nothing about.
  */
 export function sanitizeNativeIdForPath(source: SourceId, nativeId: string): string {
-	if (source === "github") {
+	const def = getRegistry().byId(source);
+	if (def === undefined || def.storage.nativeIdPathSafe === false) {
 		const safe = nativeId.replace(/[^\w.-]/g, "-");
 		const suffix = sha256(nativeId).slice(0, 8);
 		return `${safe}-${suffix}`;
 	}
-	// linear / jira / notion: identity. See Linear-specific contract above.
+	// nativeIdPathSafe: true (linear / jira / notion). See contract above.
 	// The identity is load-bearing for the archive round-trip, but parseMarkdown
 	// rehydrates nativeId from untrusted orphan-branch markdown with *no*
 	// per-source format check — so the path boundary is guarded here rather than
@@ -268,7 +279,7 @@ function parseMarkdown(content: string): Reference | null {
 
 	const sourceField = readString("source");
 	const nativeIdField = readString("nativeId");
-	if (sourceField === undefined || nativeIdField === undefined || !isSourceId(sourceField)) {
+	if (sourceField === undefined || nativeIdField === undefined || !isPathSafeSourceId(sourceField)) {
 		return null;
 	}
 	const source: SourceId = sourceField;
@@ -311,8 +322,28 @@ function isReferenceField(v: unknown): v is ReferenceField {
 	return true;
 }
 
-export function isSourceId(s: string): s is SourceId {
-	return s === "linear" || s === "jira" || s === "github" || s === "notion";
+/**
+ * Lenient charset check for a persisted `source` value: non-empty and
+ * `[\w-]+`. Used at {@link parseMarkdown} (reading untrusted orphan-branch /
+ * Memory Bank markdown) so a reference written under a source id that has
+ * since been removed from the registry still parses instead of being
+ * silently dropped — data loss on a definition removal would be worse than
+ * keeping a `Reference` whose `source` isn't currently registered.
+ */
+export function isPathSafeSourceId(s: string): boolean {
+	return s.length > 0 && /^[\w-]+$/.test(s);
+}
+
+/**
+ * Strict membership check: `source` names a `SourceDefinition` currently
+ * registered in {@link getRegistry}. Used at the write/read path guard
+ * (`SummaryStore.ts` `orphanPathFor`) where the value is about to be
+ * interpolated into a filesystem path and must name a real, known source —
+ * unlike {@link isPathSafeSourceId}, this rejects a syntactically-safe but
+ * unregistered id.
+ */
+export function isRegisteredSourceId(s: string): boolean {
+	return getRegistry().byId(s) !== undefined;
 }
 
 function sha256(s: string): string {

@@ -482,4 +482,15 @@ describe("referencesBySourceOrder", () => {
 		] as never;
 		expect(referencesBySourceOrder(refs).map((r) => r.nativeId)).toEqual(["l1", "g1", "g2"]);
 	});
+
+	it("appends a source unregistered in SourceDefinitionRegistry after known sources", () => {
+		const refs = [
+			{ source: "linear", nativeId: "l1" },
+			{ source: "zzz-unknown", nativeId: "z1" },
+			{ source: "github", nativeId: "g1" },
+		] as never;
+		// Known-registry order (linear, …, github) first, then the unregistered
+		// "zzz-unknown" appended after — never dropped, never interleaved.
+		expect(referencesBySourceOrder(refs).map((r) => r.nativeId)).toEqual(["l1", "g1", "z1"]);
+	});
 });

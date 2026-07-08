@@ -21,7 +21,7 @@
 
 import { backfillListRendererSource, COLD_START_CAP } from "./BackfillListRenderer.js";
 import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
-import { SOURCE_TITLES } from "./SourceLabels.js";
+import { SOURCE_META, SOURCE_TITLES } from "./SourceLabels.js";
 import {
 	SONNET_CACHE_WRITE_PER_TOKEN,
 	SONNET_INPUT_PER_TOKEN,
@@ -38,6 +38,13 @@ export function buildSidebarScript(): string {
   // so webview JS doesn't hardcode the source list. Keep in lockstep with
   // ./SourceLabels.ts SOURCE_TITLES.
   const SOURCE_TITLES = ${JSON.stringify(SOURCE_TITLES)};
+
+  // Per-source badge letter / codicon / color, injected from the single
+  // ./SourceLabels.ts SOURCE_META table so webview JS never hardcodes a
+  // per-source letter switch. A source id missing from this table (a
+  // phase-2 config-registered source) falls back to its own first letter
+  // uppercased at each lookup site below.
+  const SOURCE_META = ${JSON.stringify(SOURCE_META)};
 
   // Empty-state strings — populated from a JSON <script> tag injected by HtmlBuilder
   // (Task 35 will fully wire this; for now we read it tolerantly with fallbacks).
@@ -2489,11 +2496,8 @@ export function buildSidebarScript(): string {
     else if (kind === 'reference') {
       const s = source || '';
       badgeKind = s || 'reference';
-      if (s === 'linear')      letter = 'L';
-      else if (s === 'jira')   letter = 'J';
-      else if (s === 'github') letter = 'G';
-      else if (s === 'notion') letter = 'N';
-      else                     letter = 'R';
+      const meta = SOURCE_META[s];
+      letter = s ? (meta ? meta.letter : s.slice(0, 1).toUpperCase()) : 'R';
     }
     return el('span', { className: 'mem-ctx-badge mem-ctx-badge--' + badgeKind, text: letter });
   }
@@ -2899,11 +2903,12 @@ export function buildSidebarScript(): string {
   function renderReferenceHoverCard(mapKey, h) {
     if (!h) return null;
     // Title row: bold title plus a tiny source badge so the user can tell
-    // at a glance which provider the reference came from (L / J / GH / N).
+    // at a glance which provider the reference came from (L / J / G / N).
     // Per-source colour is intentionally NOT applied — the Linear-only
     // ancestor of this card explicitly rejected brand tints to keep rows
     // visually uniform; the badge alone is the minimum-viable surfacing.
-    const sourceLabel = ({ linear: 'L', jira: 'J', github: 'GH', notion: 'N' })[h.source] || (h.source || '').slice(0, 2).toUpperCase();
+    const sourceMeta = SOURCE_META[h.source];
+    const sourceLabel = sourceMeta ? sourceMeta.letter : (h.source || '').slice(0, 1).toUpperCase();
     const titleRow = el('div', { className: 'hc-title' }, [
       el('span', { className: 'hc-source-badge', text: sourceLabel }),
       el('span', { text: h.title }),

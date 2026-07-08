@@ -3,8 +3,17 @@
  *
  * Returns the full CSS for the sidebar webview.
  * Uses VSCode theme variables for automatic light/dark theming.
- * Pure string template — no logic dependencies on other view modules.
+ * Mostly a pure string template — the one exception is the per-source
+ * `.mem-ctx-badge--<source>` color rules, generated from the single
+ * ./SourceLabels.ts SOURCE_META table so a new source's color lives in one
+ * place. NOTE: buildSidebarCss's return value is a single template literal —
+ * no unescaped backtick anywhere in it (including inside comments), or the
+ * literal terminates early and breaks the whole file's parsing. The
+ * generated-rules expression below uses plain string concatenation for the
+ * same reason.
  */
+import { SOURCE_META } from "./SourceLabels.js";
+
 export function buildSidebarCss(): string {
 	return `
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1193,10 +1202,10 @@ export function buildSidebarCss(): string {
   }
   .mem-ctx-badge--plan      { background: #3fb950; }
   .mem-ctx-badge--note      { background: #d29922; }
-  .mem-ctx-badge--linear    { background: #5e6ad2; }
-  .mem-ctx-badge--jira      { background: #0052cc; }
-  .mem-ctx-badge--github    { background: #6e7681; }
-  .mem-ctx-badge--notion    { background: #787774; }
+  ${Object.entries(SOURCE_META)
+		// biome-ignore lint/style/useTemplate: must stay backtick-free (see file header re: the backtick trap)
+		.map(([id, meta]) => "  .mem-ctx-badge--" + id + " { background: " + meta.color + "; }")
+		.join("\n  ")}
   .mem-ctx-badge--reference { background: #6e7681; }
   /* Conversation evidence: trailing "N msgs" count. The leading glyph is the
      shared per-source brand icon (.conv-source-icon), so the agent identity

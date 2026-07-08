@@ -1,35 +1,35 @@
 /**
- * CodexBinding — one cohesive declaration per `codex_apps` connector source of
- * how Codex's rollout payloads map onto a shared `SourceAdapter`.
+ * CodexNormalizer — one cohesive declaration per `codex_apps` connector source of
+ * how Codex's rollout payloads map onto the shared `SourceDefinition` shape.
  *
- * This is the Codex MCP **producer** binding. An LLM does NOT always fetch an
- * entity directly — it commonly searches first (`_search_issues`, `_list_*`, …)
- * and the search result carries the entity, often partial (id only in the URL).
- * So each source declares the tool identities it is reached through (fetch AND
- * search), the canonical tool name persisted as `sourceToolName`, and how to
- * normalize its payload (single entity OR collection) into canonical shape.
+ * Match identity (namespace suffix, `function_call` names, `mcp_tool_call_end`
+ * invocation tools) lives in `SourceDefinition.match.codex` and is resolved by
+ * the `SourceDefinitionRegistry`; by the time a `CodexNormalizer` is looked up
+ * (via `getCodexNormalizer(def.id)`), the source is already known. What stays
+ * here is genuine transform logic the declarative DSL can't express: JSON
+ * reshaping, ADF→text conversion, and the malformed-output recovery stitch.
  *
- * Adding a newly-observed tool/shape = extend one binding file (add a tool name,
- * a collection key, or a URL backfill), never touch the parser.
+ * An LLM does NOT always fetch an entity directly — it commonly searches first
+ * (`_search_issues`, `_list_*`, …) and the search result carries the entity,
+ * often partial (id only in the URL). So `normalize` handles both a single
+ * entity AND a search/list collection.
+ *
+ * Adding a newly-observed tool/shape = extend one binding file's `normalize`
+ * (add a collection key, or a URL backfill) plus the registry's match identity;
+ * never touch the parser.
  */
 
 import type { SourceId } from "../../../../Types.js";
 
-export interface CodexBinding {
+export interface CodexNormalizer {
 	readonly id: SourceId;
-	/** namespace suffix after the shared `mcp__codex_apps__` prefix (e.g. "github", "atlassian_rovo"). */
-	readonly namespaceSuffix: string;
-	/** `function_call` short `name`s this source resolves entities through (fetch + search). */
-	readonly functionCallNames: ReadonlySet<string>;
-	/** `mcp_tool_call_end` `invocation.tool`s for the same set of operations. */
-	readonly invocationTools: ReadonlySet<string>;
 	/** Stable synthetic tool name persisted as `Reference.toolName`/`sourceToolName`
-	 *  (the connector's real tool name is mapped to this). Not an adapter guard —
-	 *  the purified adapter no longer inspects tool names. */
+	 *  (the connector's real tool name is mapped to this). Not a match guard —
+	 *  the purified `SourceEngine.extractRef` no longer inspects tool names. */
 	readonly canonicalToolName: string;
 	/**
 	 * Normalize the connector business payload — a single entity OR a search/list
-	 * collection — into the shape the shared adapter reads. Implementations use
+	 * collection — into the shape the shared definition reads. Implementations use
 	 * {@link normalizeEntities} so both shapes are handled uniformly.
 	 */
 	normalize(business: unknown): unknown;

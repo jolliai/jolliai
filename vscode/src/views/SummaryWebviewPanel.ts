@@ -103,7 +103,7 @@ import { BindingChooserWebviewPanel } from "./BindingChooserWebviewPanel.js";
 import { resolveBindingViaChooser } from "./BindingResolver.js";
 import { loadBranchSummaries } from "./BranchSummaryLoader.js";
 import { sliceStartTime } from "./TranscriptSliceOrder.js";
-import { SOURCE_TITLES } from "./SourceLabels.js";
+import { getSourceMeta, SOURCE_META } from "./SourceLabels.js";
 import { buildSummaryErrorBanner } from "./SummaryErrorBanner.js";
 import {
 	buildE2eTestSection,
@@ -2472,13 +2472,21 @@ export class SummaryWebviewPanel {
 			const parts: string[] = [];
 			if (ctx.plansCount > 0) parts.push(`${ctx.plansCount} plan${s(ctx.plansCount)}`);
 			if (ctx.notesCount > 0) parts.push(`${ctx.notesCount} note${s(ctx.notesCount)}`);
-			// Render one segment per source with a positive count, using the
-			// canonical label (e.g. "2 Linear issues", "1 Jira issue"). Order
-			// follows the SOURCE_TITLES key order so the dialog is stable.
-			for (const source of Object.keys(SOURCE_TITLES) as Array<keyof typeof SOURCE_TITLES>) {
-				const n = ctx.referenceCountsBySource[source] ?? 0;
+			// Render one segment per source with a positive count, using the canonical
+			// label (e.g. "2 Linear issues", "1 Jira issue"). Known sources render in
+			// SOURCE_META order for a stable dialog; any source outside SOURCE_META (a
+			// config-registered provider) is appended after so its count still appears
+			// and the breakdown matches referenceTotal. `referenceCountsBySource` is
+			// keyed by insertion order, so we cannot iterate it directly and stay stable.
+			const counts = ctx.referenceCountsBySource;
+			const orderedSources = [
+				...Object.keys(SOURCE_META),
+				...Object.keys(counts).filter((source) => !(source in SOURCE_META)),
+			];
+			for (const source of orderedSources) {
+				const n = counts[source] ?? 0;
 				if (n > 0) {
-					parts.push(`${n} ${SOURCE_TITLES[source]} issue${s(n)}`);
+					parts.push(`${n} ${getSourceMeta(source).label} issue${s(n)}`);
 				}
 			}
 			lines.push(`  • Archived ${parts.join(", ")} attached to this commit`);
@@ -3238,8 +3246,8 @@ export class SummaryWebviewPanel {
 	// consulted by these handlers.
 
 	/**
-	 * Opens the reference's URL in the default browser. Defense-in-depth: each
-	 * SourceAdapter.extractRef already gates incoming URLs through
+	 * Opens the reference's URL in the default browser. Defense-in-depth:
+	 * `SourceEngine.extractRef` already gates incoming URLs through
 	 * `^https?://`, but the URL flows through `data-reference-url` on the
 	 * rendered row (a sink the user can't taint directly but a bug upstream
 	 * could). Re-validate at the sink so `javascript:` / `data:` / `file:`
@@ -3382,7 +3390,7 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
-		const sourceLabel = SOURCE_TITLES[source];
+		const sourceLabel = getSourceMeta(source).label;
 		const dialogTitle = title || nativeId || archivedKey;
 		const choice = await vscode.window.showWarningMessage(
 			`Remove ${sourceLabel} reference "${dialogTitle}" from this commit?`,

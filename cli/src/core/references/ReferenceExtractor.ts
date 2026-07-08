@@ -4,9 +4,11 @@
  * Source-agnostic pipeline: read the JSONL, hand the lines to the per-source
  * envelope parser (ClaudeEnvelopeParser / CodexEnvelopeParser / …, resolved by
  * `getEnvelopeParser(opts.source)`), then walk each normalised payload through
- * the matched `adapter.extractRef` and dedupe. The envelope (how a line encodes
- * "an MCP tool call + its returned payload") is the ONLY source-specific part
- * and lives in the parser; everything here is shared.
+ * `SourceEngine.extractRef` (against the matched `SourceDefinition`) and dedupe.
+ * The envelope (how a line encodes "an MCP tool call + its returned payload") is
+ * the ONLY source-specific part and lives in the parser; everything here is
+ * shared. Identity resolution (which `SourceDefinition` a tool call belongs to)
+ * happens inside the envelope parser via `SourceDefinitionRegistry.match()`.
  *
  * Public surface:
  *   - `extractReferencesFromTranscript` — multi-source entry point.
@@ -27,7 +29,9 @@
 import { readFile } from "node:fs/promises";
 import { createLogger } from "../../Logger.js";
 import type { Reference } from "../../Types.js";
-import type { SourceAdapter } from "./sources/SourceAdapter.js";
+import { isObject } from "./guards.js";
+import type { SourceDefinition } from "./SourceDefinition.js";
+import * as SourceEngine from "./SourceEngine.js";
 import { type ExtractOptions, getEnvelopeParser } from "./TranscriptEnvelopeParser.js";
 
 const log = createLogger("ReferenceExtractor");
@@ -41,14 +45,13 @@ export interface ExtractReferencesResult {
 }
 
 /**
- * Walks one transcript and returns extracted `Reference`s for every adapter in
- * `adapters`. Reads the raw JSONL at `transcriptPath` (NOT a pre-parsed
- * SessionTranscript). The per-source envelope parser is chosen by `opts.source`
- * (default "claude").
+ * Walks one transcript and returns extracted `Reference`s for every source
+ * registered in the `SourceDefinitionRegistry`. Reads the raw JSONL at
+ * `transcriptPath` (NOT a pre-parsed SessionTranscript). The per-source envelope
+ * parser is chosen by `opts.source` (default "claude").
  */
 export async function extractReferencesFromTranscript(
 	transcriptPath: string,
-	adapters: ReadonlyArray<SourceAdapter>,
 	opts: ExtractOptions = {},
 ): Promise<ExtractReferencesResult> {
 	let content: string;
@@ -66,7 +69,7 @@ export async function extractReferencesFromTranscript(
 	/* v8 ignore stop */
 
 	const parser = getEnvelopeParser(opts.source);
-	const { results, lastLineNumberScanned } = parser.parse(lines, opts, adapters);
+	const { results, lastLineNumberScanned } = parser.parse(lines, opts);
 
 	const collected: Reference[] = [];
 	for (const r of results) {
@@ -75,7 +78,7 @@ export async function extractReferencesFromTranscript(
 		// overflow the recursion with a RangeError that aborts extraction for the
 		// *entire* transcript. Contain any throw to this one result.
 		try {
-			walkPayload(r.payload, r.adapter, r.toolName, r.referencedAt, collected);
+			walkPayload(r.payload, r.def, r.toolName, r.referencedAt, collected);
 		} catch (err) {
 			log.warn(
 				"Dropping tool_result on line %d (%s): payload walk failed: %s",
@@ -101,13 +104,13 @@ export async function extractReferencesFromTranscript(
 
 function walkPayload(
 	value: unknown,
-	adapter: SourceAdapter,
+	def: SourceDefinition,
 	toolName: string,
 	referencedAt: string,
 	out: Reference[],
 ): void {
 	if (Array.isArray(value)) {
-		for (const item of value) walkPayload(item, adapter, toolName, referencedAt, out);
+		for (const item of value) walkPayload(item, def, toolName, referencedAt, out);
 		return;
 	}
 	/* v8 ignore start -- caller already JSON-parsed the payload; non-object/non-array primitives are guarded for totality but not reachable via real payloads. */
@@ -115,7 +118,7 @@ function walkPayload(
 	/* v8 ignore stop */
 	const obj = value as Record<string, unknown>;
 
-	const ref = adapter.extractRef(obj, toolName, referencedAt);
+	const ref = SourceEngine.extractRef(def, obj, toolName, referencedAt);
 	if (ref !== null) {
 		out.push(ref);
 		return; // identified as a reference — stop descending
@@ -125,13 +128,13 @@ function walkPayload(
 	// array (e.g. `{items:[…]}`) or a nested object (e.g. Jira's
 	// `{issues:{totalCount,nodes:[…]}}` — the outer `issues` is an object, the
 	// inner `nodes` is the array. The walker recurses into both, finding the
-	// adapter's terminal payloads either way.
-	for (const key of adapter.wrapperKeys) {
+	// definition's terminal payloads either way.
+	for (const key of def.wrapperKeys) {
 		const inner = obj[key];
 		if (Array.isArray(inner)) {
-			for (const item of inner) walkPayload(item, adapter, toolName, referencedAt, out);
+			for (const item of inner) walkPayload(item, def, toolName, referencedAt, out);
 		} else if (isObject(inner)) {
-			walkPayload(inner, adapter, toolName, referencedAt, out);
+			walkPayload(inner, def, toolName, referencedAt, out);
 		}
 	}
 }
@@ -151,20 +154,11 @@ function dedupeKeepLatest(refs: ReadonlyArray<Reference>): Reference[] {
 	return [...byMapKey.values()];
 }
 
-/* v8 ignore start -- defensive type-guard called many places; null and Array negative branches both reachable via fuzz JSON but uninteresting for behavior tests. */
-function isObject(v: unknown): v is Record<string, unknown> {
-	return typeof v === "object" && v !== null && !Array.isArray(v);
-}
 /* v8 ignore stop */
 
 /**
- * Truncates `s` to `maxChars` and appends a "...[truncated, N more chars]"
- * marker so the LLM sees that data was cut. Shared by the regenerate path's
- * prompt-block builder (Regenerator.ts) — same wire format keeps the LLM's
- * cue text identical across first-run and regenerate.
+ * Re-exported from {@link RenderUtils} so existing importers (Regenerator.ts)
+ * keep their import path. The single definition lives in RenderUtils to avoid a
+ * ReferenceExtractor↔SourceEngine cycle while both paths share one wire format.
  */
-export function truncate(s: string, maxChars: number): string {
-	if (s.length <= maxChars) return s;
-	const remaining = s.length - maxChars;
-	return `${s.slice(0, maxChars)}\n…[truncated, ${remaining} more chars]`;
-}
+export { truncate } from "./RenderUtils.js";

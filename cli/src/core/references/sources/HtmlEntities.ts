@@ -1,5 +1,6 @@
 /**
- * HTML entity decoder used by GitHubAdapter.
+ * HTML entity decoder used by the github `SourceDefinition`'s `decodeHtmlEntities`
+ * transform (see `sources/definitions/github.ts`, wired through `SourceEngine`).
  *
  * GitHub's MCP server returns issue/PR bodies with HTML-entity-escaped content
  * (e.g. `&lt;`, `&#x2026;`, `&#960;`). The body must be decoded before it
@@ -16,9 +17,9 @@
  *     lone-surrogate character.
  *   - Decimal numeric: `&#DD…;`, same range guard.
  *
- * This module is owned by GitHubAdapter only — adapter
- * modules must not share helpers across sources. NotionAdapter does NOT call
- * into this file (envelope parsing is its own concern).
+ * Exposed to definitions as the `decodeHtmlEntities` transform (github body
+ * decoding). The notion source does NOT call into this file — it peels its
+ * `<content>` envelope with its own `CONTENT_BLOCK` regex.
  */
 
 const NAMED: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };

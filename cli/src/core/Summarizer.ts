@@ -105,9 +105,9 @@ export interface SummarizeParams {
 	/** Actual conversation turns (count of human-role entries); computed by caller */
 	readonly conversationTurns?: number;
 	/**
-	 * Pre-rendered reference XML blocks (one per registered SourceAdapter, joined
-	 * by "\n"). The caller (QueueWorker) reads plans.json.references + per-reference
-	 * markdown and calls `adapter.renderPromptBlock` per source; the joined
+	 * Pre-rendered reference XML blocks (one per source-definition registry entry,
+	 * joined by "\n"). The caller (QueueWorker) reads plans.json.references + per-reference
+	 * markdown and calls `SourceEngine.renderBlock` per source; the joined
 	 * string is passed through verbatim to the `{{references}}` prompt-template
 	 * placeholder. Optional; defaults to "" so the placeholder collapses cleanly.
 	 */

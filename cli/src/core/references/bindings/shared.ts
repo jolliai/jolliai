@@ -7,9 +7,11 @@
  * Any producer binding (Codex MCP, future CLI, future agents) can reuse these.
  */
 
-export function isObject(v: unknown): v is Record<string, unknown> {
-	return typeof v === "object" && v !== null && !Array.isArray(v);
-}
+import { isObject } from "../guards.js";
+
+// Re-exported so existing binding-layer consumers (CodexJiraBinding, shared.test)
+// keep importing `isObject` from here; the canonical definition lives in guards.ts.
+export { isObject };
 
 /**
  * The common "search-then-resolve" handler. A connector tool returns EITHER a

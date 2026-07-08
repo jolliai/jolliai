@@ -14,13 +14,15 @@
  * `api.atlassian.com` gateway). The event is used only as a fallback for
  * call_ids that produced no `function_call_output`.
  *
- * Tool identity and per-source normalisation are NOT in this file — they live in
- * the `./bindings/codex` producer registry ({@link CodexBinding}). Each binding
- * declares the tool names it is reached through (fetch AND search), the canonical
- * tool name persisted as `sourceToolName`, and how to normalize its payload
- * (single entity or search/list collection) for the UNCHANGED adapters. This
- * parser only correlates lines and delegates identity + normalisation to that
- * registry.
+ * Tool identity now resolves through the `SourceDefinitionRegistry`
+ * (`registry.match("codex", name, namespaceSuffix)` / `registry.match("codex",
+ * invocationTool)`), replacing the `./bindings/codex` registry's own
+ * namespace/name lookup tables. Per-source normalisation (single entity or
+ * search/list collection) and the malformed-output `recover` stitch stay on the
+ * `CodexBinding` objects — {@link getCodexNormalizer} looks those up (plus the
+ * still-binding-only `canonicalToolName`) by the resolved def's id. This parser
+ * only correlates lines and delegates identity to the registry, normalisation to
+ * the binding.
  *
  * Shell CLI fallback: Codex also resolves entities via plain shell, e.g.
  * `gh issue view <n> --json …` (a `function_call` named `shell_command`, no
@@ -36,10 +38,11 @@
  */
 
 import { createLogger } from "../../Logger.js";
-import type { SourceId } from "../../Types.js";
 import { type CliBinding, matchCliCommand } from "./bindings/cli/index.js";
-import { codexBindingFromFunctionCall, codexBindingFromInvocationTool } from "./bindings/codex/index.js";
-import type { SourceAdapter } from "./sources/SourceAdapter.js";
+import { CODEX_APPS_NAMESPACE_PREFIX, getCodexNormalizer } from "./bindings/codex/index.js";
+import { isObject } from "./guards.js";
+import type { SourceDefinition } from "./SourceDefinition.js";
+import { getRegistry } from "./SourceDefinitionRegistry.js";
 import type {
 	EnvelopeParseResult,
 	ExtractOptions,
@@ -72,15 +75,18 @@ interface ToolCallEndRow {
 }
 interface ShellCallRow {
 	readonly binding: CliBinding;
+	/** The shell command, forwarded to `binding.normalize` so it can recover
+	 *  payload-absent fields (e.g. a GitHub issue's `number`/`url`) from the args. */
+	readonly command: string;
 	/** 0-based line index of the request — holds the cursor before an in-flight
 	 *  (output-not-yet-written) shell call, exactly like an MCP fetch. */
 	readonly lineIndex: number;
 }
 
 class CodexEnvelopeParser implements TranscriptEnvelopeParser {
-	parse(lines: string[], opts: ExtractOptions, adapters: readonly SourceAdapter[]): EnvelopeParseResult {
+	parse(lines: string[], opts: ExtractOptions): EnvelopeParseResult {
 		const fromLine = opts.fromLineNumber ?? 0;
-		const adapterFor = (id: SourceId): SourceAdapter | undefined => adapters.find((a) => a.id === id);
+		const registry = getRegistry();
 
 		const calls = new Map<string, FunctionCallRow>();
 		const shellCalls = new Map<string, ShellCallRow>();
@@ -149,7 +155,7 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 						const command = readShellCommand(payload.arguments);
 						if (command !== undefined) {
 							const binding = matchCliCommand(command);
-							if (binding !== null) shellCalls.set(callId, { binding, lineIndex: i });
+							if (binding !== null) shellCalls.set(callId, { binding, command, lineIndex: i });
 						}
 						break;
 					}
@@ -194,17 +200,18 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 		for (const [callId, out] of outputs) {
 			const call = calls.get(callId);
 			if (call === undefined) continue;
-			const binding = codexBindingFromFunctionCall(call.namespace, call.name);
-			if (binding === null) continue;
+			const def = resolveCodexDef(registry, call.namespace, call.name);
+			if (def === undefined) continue;
 			const business = parseFunctionCallOutput(out.output);
 			if (business === null) continue;
-			const adapter = adapterFor(binding.id);
-			/* v8 ignore next -- adapters always include all four sources; guarded for totality. */
-			if (adapter === undefined) continue;
+			const normalizer = getCodexNormalizer(def.id);
+			/* v8 ignore start -- every registry codex definition has a matching CodexBinding; guarded for totality. */
+			if (normalizer === undefined) continue;
+			/* v8 ignore stop */
 			results.push({
-				adapter,
-				toolName: binding.canonicalToolName,
-				payload: binding.normalize(business),
+				def,
+				toolName: normalizer.canonicalToolName,
+				payload: normalizer.normalize(business),
 				lineNumber: out.lineNumber,
 				referencedAt: out.referencedAt,
 			});
@@ -221,13 +228,14 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 			if (readExitCode(out.output) !== 0) continue;
 			const business = parseFunctionCallOutput(out.output);
 			if (business === null) continue;
-			const adapter = adapterFor(shell.binding.id);
-			/* v8 ignore next -- adapters always include all four sources; guarded for totality. */
-			if (adapter === undefined) continue;
+			const def = registry.byId(shell.binding.id);
+			/* v8 ignore start -- every CLI binding's id names a registered built-in source; guarded for totality. */
+			if (def === undefined) continue;
+			/* v8 ignore stop */
 			results.push({
-				adapter,
+				def,
 				toolName: shell.binding.canonicalToolName,
-				payload: shell.binding.normalize(business),
+				payload: shell.binding.normalize(business, shell.command),
 				lineNumber: out.lineNumber,
 				referencedAt: out.referencedAt,
 			});
@@ -236,8 +244,12 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 		// FALLBACK: mcp_tool_call_end events for call_ids without a paired output.
 		for (const ev of events) {
 			if (ev.callId !== undefined && emitted.has(ev.callId)) continue;
-			const binding = codexBindingFromInvocationTool(ev.tool);
-			if (binding === null) continue;
+			const def = registry.match("codex", ev.tool);
+			if (def === undefined) continue;
+			const normalizer = getCodexNormalizer(def.id);
+			/* v8 ignore start -- every registry codex definition has a matching CodexBinding; guarded for totality. */
+			if (normalizer === undefined) continue;
+			/* v8 ignore stop */
 			let business = tryParse(ev.text);
 			if (business === null) continue;
 			// Recovery (NOT the main path): reaching the fallback for a call_id that
@@ -246,20 +258,17 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 			// live ONLY on that malformed output (e.g. Jira's tenant webUrl), so let
 			// the binding stitch them onto this valid event payload. Bindings without
 			// this brittle edge leave `recover` unset.
-			if (binding.recover !== undefined && ev.callId !== undefined) {
+			if (normalizer.recover !== undefined && ev.callId !== undefined) {
 				const rawOutput = outputs.get(ev.callId)?.output;
 				if (rawOutput !== undefined) {
-					const stitched = binding.recover(business, rawOutput);
+					const stitched = normalizer.recover(business, rawOutput);
 					if (stitched !== null) business = stitched;
 				}
 			}
-			const adapter = adapterFor(binding.id);
-			/* v8 ignore next -- adapters always include all four sources; guarded for totality. */
-			if (adapter === undefined) continue;
 			results.push({
-				adapter,
-				toolName: binding.canonicalToolName,
-				payload: binding.normalize(business),
+				def,
+				toolName: normalizer.canonicalToolName,
+				payload: normalizer.normalize(business),
 				lineNumber: ev.lineNumber,
 				referencedAt: ev.referencedAt,
 			});
@@ -294,7 +303,7 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 		let safeCursor = lastConsumed;
 		for (const [callId, call] of calls) {
 			if (satisfied.has(callId)) continue;
-			if (codexBindingFromFunctionCall(call.namespace, call.name) === null) continue;
+			if (resolveCodexDef(registry, call.namespace, call.name) === undefined) continue;
 			if (call.lineIndex < safeCursor) safeCursor = call.lineIndex;
 		}
 		// Same hold for an in-flight shell CLI request (already a CLI match by
@@ -311,6 +320,21 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 /** True when `referencedAt` is a non-empty timestamp strictly after `cutoff`. */
 function afterCutoff(referencedAt: string, cutoff: string | undefined): boolean {
 	return cutoff !== undefined && referencedAt !== "" && referencedAt > cutoff;
+}
+
+/**
+ * Resolve a `function_call`'s (full `namespace`, short `name`) to its
+ * `SourceDefinition` via the registry — the `namespace` carries the shared
+ * `mcp__codex_apps__` prefix, but `SourceMatch.codex.namespaceSuffix` (and
+ * `registry.match`'s `namespace` param) expect just the suffix after it.
+ */
+function resolveCodexDef(
+	registry: ReturnType<typeof getRegistry>,
+	namespace: string,
+	name: string,
+): SourceDefinition | undefined {
+	if (!namespace.startsWith(CODEX_APPS_NAMESPACE_PREFIX)) return undefined;
+	return registry.match("codex", name, namespace.slice(CODEX_APPS_NAMESPACE_PREFIX.length));
 }
 
 export const codexEnvelopeParser: TranscriptEnvelopeParser = new CodexEnvelopeParser();
@@ -407,8 +431,4 @@ function readToolCallEndText(result: unknown): string | undefined {
 	const first = content[0];
 	if (!isObject(first)) return undefined;
 	return first.type === "text" ? readString(first.text) : undefined;
-}
-
-function isObject(v: unknown): v is Record<string, unknown> {
-	return typeof v === "object" && v !== null && !Array.isArray(v);
 }

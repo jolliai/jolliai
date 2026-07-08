@@ -1,0 +1,30 @@
+import { describe, expect, it } from "vitest";
+import { getSourceMeta } from "./SourceLabels";
+
+describe("getSourceMeta", () => {
+	it("returns the table entry for a known source id", () => {
+		const meta = getSourceMeta("github");
+		expect(meta.letter).toBe("G");
+		expect(meta.icon).toBe("issues");
+		expect(meta.color).toBe("#6e7681");
+	});
+
+	it("falls back to a derived letter/neutral icon/color for an unknown id", () => {
+		const meta = getSourceMeta("someUnknownSource");
+		expect(meta.letter).toBe("S");
+		expect(meta.icon).toBe("link");
+		expect(meta.color).toBe("#6e7681");
+	});
+
+	it("treats prototype-chain keys as unknown sources, not inherited members", () => {
+		// With `SourceId` widened to `string`, ids like "toString"/"constructor"
+		// must not resolve to `Object.prototype` members and be returned as a
+		// bogus SourceMeta with `label`/`letter` undefined.
+		for (const id of ["toString", "constructor", "hasOwnProperty"]) {
+			const meta = getSourceMeta(id);
+			expect(meta.label).toBe(id);
+			expect(meta.letter).toBe(id.slice(0, 1).toUpperCase());
+			expect(meta.icon).toBe("link");
+		}
+	});
+});

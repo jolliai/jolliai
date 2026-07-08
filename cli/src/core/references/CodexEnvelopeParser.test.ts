@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { codexEnvelopeParser } from "./CodexEnvelopeParser.js";
 import { extractReferencesFromTranscript } from "./ReferenceExtractor.js";
-import { ALL_ADAPTERS } from "./sources/index.js";
 
 const TS = "2026-06-05T10:24:53.000Z";
 
@@ -148,10 +147,10 @@ describe("CodexEnvelopeParser.parse", () => {
 			fnCall("mcp__codex_apps__atlassian_rovo", "_getjiraissue", "c_jira"),
 			fnOutput("c_jira", JIRA_WRAPPED, { wrap: "bare", prefix: false }),
 		];
-		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {});
 		expect(lastLineNumberScanned).toBe(8);
-		expect(results.map((r) => r.adapter.id).sort()).toEqual(["github", "jira", "linear", "notion"]);
-		const jira = results.find((r) => r.adapter.id === "jira");
+		expect(results.map((r) => r.def.id).sort()).toEqual(["github", "jira", "linear", "notion"]);
+		const jira = results.find((r) => r.def.id === "jira");
 		expect(jira?.toolName).toContain("mcp__claude_ai_Atlassian__");
 	});
 
@@ -164,8 +163,8 @@ describe("CodexEnvelopeParser.parse", () => {
 			fnCall("mcp__codex_apps__linear", "_get_issue", "c_gi"),
 			fnOutput("c_gi", LINEAR, { wrap: "envelope", prefix: true }),
 		];
-		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
-		expect(results.map((r) => r.adapter.id)).toEqual(["linear"]);
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.map((r) => r.def.id)).toEqual(["linear"]);
 		// Payload is the UNWRAPPED issue (id present), not the envelope object.
 		expect((results[0].payload as { id?: string }).id).toBe("JOLLI-1657");
 		expect(results[0].toolName).toBe("mcp__linear__get_issue");
@@ -176,7 +175,7 @@ describe("CodexEnvelopeParser.parse", () => {
 			fnCall("mcp__codex_apps__linear", "_fetch", "c_err"),
 			fnOutputRaw("c_err", 'execution error: Io(Custom { kind: Other, error: "windows sandbox" })'),
 		];
-		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(0);
 	});
 
@@ -185,9 +184,9 @@ describe("CodexEnvelopeParser.parse", () => {
 			fnCall("mcp__codex_apps__linear", "_fetch", "c_only_event"),
 			toolCallEnd("linear_fetch", "c_only_event", LINEAR),
 		];
-		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(1);
-		expect(results[0].adapter.id).toBe("linear");
+		expect(results[0].def.id).toBe("linear");
 	});
 
 	it("does not double-emit when both function_call_output and event exist for the same call_id", () => {
@@ -196,7 +195,7 @@ describe("CodexEnvelopeParser.parse", () => {
 			fnOutput("c_dup", LINEAR, { wrap: "array", prefix: true }),
 			toolCallEnd("linear_fetch", "c_dup", LINEAR),
 		];
-		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(1);
 	});
 
@@ -205,7 +204,7 @@ describe("CodexEnvelopeParser.parse", () => {
 			fnCall("mcp__codex_apps__linear", "_list_teams", "c_list"),
 			fnOutput("c_list", { teams: [] }, { wrap: "array", prefix: true }),
 		];
-		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(0);
 	});
 
@@ -215,11 +214,7 @@ describe("CodexEnvelopeParser.parse", () => {
 			fnCall("mcp__codex_apps__linear", "_fetch", "c_lin"),
 			fnOutput("c_lin", LINEAR, { wrap: "array", prefix: true }),
 		];
-		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(
-			lines,
-			{ fromLineNumber: 2 },
-			ALL_ADAPTERS,
-		);
+		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, { fromLineNumber: 2 });
 		// Line index 0 (the fnCall) is skipped, so the pair can't be correlated.
 		expect(results).toHaveLength(0);
 		expect(lastLineNumberScanned).toBe(3);
@@ -231,9 +226,42 @@ describe("CodexEnvelopeParser.parse", () => {
 			jsonl({ type: "response_item" }),
 			jsonl({ payload: "mcp_tool_call_end" }),
 		];
-		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(0);
 		expect(lastLineNumberScanned).toBe(3);
+	});
+});
+
+describe("CodexEnvelopeParser.parse — normalize still applied once identity resolves via the registry", () => {
+	// Real Codex node (mirrors CodexJiraBinding.test.ts's fixture): NO `fields`,
+	// summary lives under `versionedRepresentations` — this is the shape
+	// `jiraCodexBinding.normalize` (reshapeJiraNode) actually reshapes. Unlike
+	// JIRA_WRAPPED above (already adapter-shaped, so normalize is a no-op on it),
+	// this fixture only produces a valid Reference if `getCodexNormalizer` is
+	// still wired to the def the registry resolves — proving normalize survived
+	// the identity-resolution wiring change (registry.match replacing
+	// codexBindingFromFunctionCall), not just that the parser doesn't throw.
+	const JIRA_NODE_NEEDING_NORMALIZE = {
+		key: "KAN-4",
+		self: "https://api.atlassian.com/ex/jira/x/rest/api/3/issue/10013",
+		webUrl: "https://acme.atlassian.net/browse/KAN-4",
+		versionedRepresentations: { summary: { "1": "Add Jira issue auto-discovery" } },
+	};
+
+	it("derives fields.summary from versionedRepresentations for a Jira function_call pair", () => {
+		const lines = [
+			fnCall("mcp__codex_apps__atlassian_rovo", "_getjiraissue", "c_jira_norm"),
+			fnOutput(
+				"c_jira_norm",
+				{ issues: { totalCount: 1, nodes: [JIRA_NODE_NEEDING_NORMALIZE] } },
+				{ wrap: "bare", prefix: false },
+			),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("jira");
+		const payload = results[0].payload as { issues: { nodes: Array<{ fields?: { summary?: string } }> } };
+		expect(payload.issues.nodes[0].fields?.summary).toBe("Add Jira issue auto-discovery");
 	});
 });
 
@@ -279,7 +307,7 @@ describe("CodexEnvelopeParser.parse — defensive branches", () => {
 			raw({ type: "mcp_tool_call_end", call_id: "f", invocation: { tool: "linear_fetch" }, result: "x" }),
 			raw({ type: "mcp_tool_call_end", call_id: "g", invocation: { tool: "linear_fetch" }, result: { Ok: "x" } }),
 		];
-		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(0);
 	});
 
@@ -298,7 +326,7 @@ describe("CodexEnvelopeParser.parse — defensive branches", () => {
 				output: JSON.stringify([{ type: "text", text: "not json" }]),
 			}),
 		];
-		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse(lines, {});
 		// c1 (null business) is skipped; c2/c3 still emit a result whose payload is the
 		// un-unwrapped junk array — the adapter rejects it downstream (no Reference).
 		expect(results).toHaveLength(2);
@@ -315,7 +343,26 @@ describe("CodexEnvelopeParser.parse — defensive branches", () => {
 				result: { Ok: { content: [{ type: "text", text: "definitely not json" }] } },
 			}),
 		];
-		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(0);
+	});
+
+	it("fallback event whose invocation.tool matches no registered source yields nothing", () => {
+		const lines = [toolCallEnd("some_other_connector_fetch", "evt_unknown", LINEAR)];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(0);
+	});
+
+	it("ignores a function_call whose namespace does not START with the shared codex_apps prefix", () => {
+		// The namespace value below still contains the "mcp__codex_apps__" substring
+		// (so it clears the envelope's cheap per-line pre-filter) but doesn't START
+		// with it — resolveCodexDef must reject on the anchored prefix check rather
+		// than a loose substring match.
+		const lines = [
+			fnCall("not_mcp__codex_apps__linear", "_fetch", "c_wrongns"),
+			fnOutput("c_wrongns", LINEAR, { wrap: "array", prefix: true }),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(0);
 	});
 
@@ -338,7 +385,7 @@ describe("CodexEnvelopeParser.parse — defensive branches", () => {
 			fnCall("mcp__codex_apps__github", "_fetch_issue", "g2"),
 			raw({ type: "function_call_output", call_id: "g2", output: "123" }),
 		];
-		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse(lines, {});
 		// Both emit a result (parser doesn't validate); g2's payload stays 123 and the
 		// adapter rejects it downstream. g1 is reshaped into the canonical GitHub shape.
 		expect(results).toHaveLength(2);
@@ -366,7 +413,7 @@ describe("CodexEnvelopeParser.parse — defensive branches", () => {
 			fnCall("mcp__codex_apps__github", "_search_issues", "s1"),
 			raw({ type: "function_call_output", call_id: "s1", output: JSON.stringify(search) }),
 		];
-		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(1);
 		const payload = results[0].payload as { issues: Array<{ number?: unknown; html_url?: unknown }> };
 		// First hit kept its (non-issue) url but no number; second has neither.
@@ -384,7 +431,7 @@ describe("CodexEnvelopeParser.parse — cross-poll cursor safety (P1)", () => {
 			fnOutput("done", LINEAR, { wrap: "array", prefix: true }),
 			fnCall("mcp__codex_apps__atlassian_rovo", "_getjiraissue", "inflight"), // no output yet
 		];
-		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(1); // only the completed linear call
 		// Cursor is held at the in-flight request's line index (2), NOT EOF (3).
 		expect(lastLineNumberScanned).toBe(2);
@@ -393,7 +440,7 @@ describe("CodexEnvelopeParser.parse — cross-poll cursor safety (P1)", () => {
 	it("recovers the ref on the next poll once the output arrives (two-pass straddle)", () => {
 		// Pass 1: only the request is present → nothing emitted, cursor held at 0.
 		const pass1 = [fnCall("mcp__codex_apps__atlassian_rovo", "_getjiraissue", "j1")];
-		const r1 = codexEnvelopeParser.parse(pass1, {}, ALL_ADAPTERS);
+		const r1 = codexEnvelopeParser.parse(pass1, {});
 		expect(r1.results).toHaveLength(0);
 		expect(r1.lastLineNumberScanned).toBe(0);
 
@@ -402,9 +449,9 @@ describe("CodexEnvelopeParser.parse — cross-poll cursor safety (P1)", () => {
 			fnCall("mcp__codex_apps__atlassian_rovo", "_getjiraissue", "j1"),
 			fnOutput("j1", JIRA_WRAPPED, { wrap: "bare", prefix: false }),
 		];
-		const r2 = codexEnvelopeParser.parse(pass2, { fromLineNumber: r1.lastLineNumberScanned }, ALL_ADAPTERS);
+		const r2 = codexEnvelopeParser.parse(pass2, { fromLineNumber: r1.lastLineNumberScanned });
 		expect(r2.results).toHaveLength(1);
-		expect(r2.results[0].adapter.id).toBe("jira");
+		expect(r2.results[0].def.id).toBe("jira");
 		expect(r2.lastLineNumberScanned).toBe(2);
 	});
 
@@ -414,7 +461,7 @@ describe("CodexEnvelopeParser.parse — cross-poll cursor safety (P1)", () => {
 			fnCall("mcp__codex_apps__linear", "_fetch", "byEvent"),
 			toolCallEnd("linear_fetch", "byEvent", LINEAR), // satisfied via event, no output
 		];
-		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(1); // linear via event
 		expect(lastLineNumberScanned).toBe(3); // EOF — nothing held
 	});
@@ -443,11 +490,7 @@ describe("CodexEnvelopeParser.parse — beforeTimestamp cutoff (P2)", () => {
 			}),
 			row("2026-06-05T11:00:01.000Z", { type: "function_call_output", call_id: "e2", output: arr(late) }),
 		];
-		const { results } = codexEnvelopeParser.parse(
-			lines,
-			{ beforeTimestamp: "2026-06-05T10:30:00.000Z" },
-			ALL_ADAPTERS,
-		);
+		const { results } = codexEnvelopeParser.parse(lines, { beforeTimestamp: "2026-06-05T10:30:00.000Z" });
 		expect(results).toHaveLength(1);
 		expect((results[0].payload as { id?: string }).id).toBe("AAA-1");
 	});
@@ -466,11 +509,9 @@ describe("CodexEnvelopeParser.parse — beforeTimestamp cutoff (P2)", () => {
 			}),
 			row("2026-06-05T11:00:01.000Z", { type: "function_call_output", call_id: "late1", output: arr(late) }),
 		];
-		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(
-			lines,
-			{ beforeTimestamp: "2026-06-05T10:30:00.000Z" },
-			ALL_ADAPTERS,
-		);
+		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {
+			beforeTimestamp: "2026-06-05T10:30:00.000Z",
+		});
 		expect(results).toHaveLength(0); // cutoff-dropped, nothing emitted
 		expect(lastLineNumberScanned).toBe(2); // EOF, NOT pinned back to the request line (0)
 	});
@@ -499,7 +540,7 @@ describe("CodexEnvelopeParser end-to-end via extractReferencesFromTranscript (so
 	afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 	it("extracts correct refs for all four sources through the unchanged adapters", async () => {
-		const { references } = await extractReferencesFromTranscript(file, ALL_ADAPTERS, { source: "codex" });
+		const { references } = await extractReferencesFromTranscript(file, { source: "codex" });
 		const byKey = new Map(references.map((r) => [r.mapKey, r]));
 
 		expect(byKey.get("linear:JOLLI-1657")?.url).toBe(LINEAR.url);
@@ -537,7 +578,7 @@ describe("CodexEnvelopeParser end-to-end — GitHub _search_issues URL-resolutio
 	afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 	it("extracts the github issue with the number derived from the URL", async () => {
-		const { references } = await extractReferencesFromTranscript(file, ALL_ADAPTERS, { source: "codex" });
+		const { references } = await extractReferencesFromTranscript(file, { source: "codex" });
 		const gh = references.find((r) => r.mapKey === "github:jolliai/jolli#959");
 		expect(gh).toBeDefined();
 		expect(gh?.url).toBe("https://github.com/jolliai/jolli/issues/959");
@@ -571,7 +612,7 @@ describe("CodexEnvelopeParser end-to-end — Jira malformed-output recovery", ()
 	afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 	it("recovers a jira ref by stitching the valid event with webUrl salvaged from the malformed output", async () => {
-		const { references } = await extractReferencesFromTranscript(file, ALL_ADAPTERS, { source: "codex" });
+		const { references } = await extractReferencesFromTranscript(file, { source: "codex" });
 		const jira = references.find((r) => r.mapKey === "jira:KAN-7");
 		expect(jira).toBeDefined();
 		expect(jira?.title).toBe("Recovered jira summary");
@@ -620,21 +661,21 @@ const GH_VIEW_CMD = "gh issue view 959 --repo jolliai/jolli --json number,title,
 describe("CodexEnvelopeParser.parse — shell CLI (gh issue view)", () => {
 	it("emits a github ref from a shell gh issue view pair (canonical toolName, exit 0)", () => {
 		const lines = [shellCall(GH_VIEW_CMD, "c_sh"), shellOutput("c_sh", GH_CLI, 0)];
-		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(1);
-		expect(results[0].adapter.id).toBe("github");
+		expect(results[0].def.id).toBe("github");
 		expect(results[0].toolName).toBe("mcp__github__issue_read");
 	});
 
 	it("drops a failed command (non-zero exit) even when stdout is valid issue JSON", () => {
 		const lines = [shellCall(GH_VIEW_CMD, "c_fail"), shellOutput("c_fail", GH_CLI, 1)];
-		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(0);
 	});
 
 	it("ignores a non-gh shell command", () => {
 		const lines = [shellCall("npm test", "c_npm"), shellOutput("c_npm", GH_CLI, 0)];
-		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(0);
 	});
 
@@ -644,7 +685,7 @@ describe("CodexEnvelopeParser.parse — shell CLI (gh issue view)", () => {
 			timestamp: TS,
 			payload: { type: "function_call", name: "shell_command", arguments: "{not json", call_id: "c_bad" },
 		});
-		const { results } = codexEnvelopeParser.parse([badCall, shellOutput("c_bad", GH_CLI, 0)], {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse([badCall, shellOutput("c_bad", GH_CLI, 0)], {});
 		expect(results).toHaveLength(0);
 	});
 
@@ -658,7 +699,7 @@ describe("CodexEnvelopeParser.parse — shell CLI (gh issue view)", () => {
 				output: "Exit code: 0\nWall time: 1s\nOutput:\nnot json",
 			},
 		});
-		const { results } = codexEnvelopeParser.parse([shellCall(GH_VIEW_CMD, "c_txt"), out], {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse([shellCall(GH_VIEW_CMD, "c_txt"), out], {});
 		expect(results).toHaveLength(0);
 	});
 
@@ -668,13 +709,13 @@ describe("CodexEnvelopeParser.parse — shell CLI (gh issue view)", () => {
 			timestamp: TS,
 			payload: { type: "function_call_output", call_id: "c_nopfx", output: JSON.stringify(GH_CLI) },
 		});
-		const { results } = codexEnvelopeParser.parse([shellCall(GH_VIEW_CMD, "c_nopfx"), out], {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse([shellCall(GH_VIEW_CMD, "c_nopfx"), out], {});
 		expect(results).toHaveLength(0);
 	});
 
 	it("holds the cursor before an in-flight shell gh request (output not yet written)", () => {
 		const lines = ["{}", shellCall(GH_VIEW_CMD, "c_inflight")];
-		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(0);
 		// safeCursor pinned to the request's 0-based line index (1), not EOF (2).
 		expect(lastLineNumberScanned).toBe(1);
@@ -682,14 +723,14 @@ describe("CodexEnvelopeParser.parse — shell CLI (gh issue view)", () => {
 
 	it("advances the cursor once the in-flight shell output lands on the next poll", () => {
 		const lines = ["{}", shellCall(GH_VIEW_CMD, "c_inflight"), shellOutput("c_inflight", GH_CLI, 0)];
-		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(1);
 		expect(lastLineNumberScanned).toBe(3);
 	});
 
 	it("holds the cursor at the EARLIEST of multiple in-flight shell requests", () => {
 		const lines = ["{}", shellCall(GH_VIEW_CMD, "c1"), shellCall(GH_VIEW_CMD, "c2")];
-		const { lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		const { lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {});
 		expect(lastLineNumberScanned).toBe(1); // pinned to c1's line, not lowered again by c2
 	});
 
@@ -699,7 +740,7 @@ describe("CodexEnvelopeParser.parse — shell CLI (gh issue view)", () => {
 			timestamp: TS,
 			payload: { type: "function_call", name: "shell_command", arguments: 42, call_id: "c_numargs" },
 		});
-		const { results } = codexEnvelopeParser.parse([badCall, shellOutput("c_numargs", GH_CLI, 0)], {}, ALL_ADAPTERS);
+		const { results } = codexEnvelopeParser.parse([badCall, shellOutput("c_numargs", GH_CLI, 0)], {});
 		expect(results).toHaveLength(0);
 	});
 });
@@ -723,7 +764,7 @@ describe("CodexEnvelopeParser end-to-end — shell gh issue view (state lowercas
 	afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 	it("dedupes gh + MCP search to one rich ref with lowercased state", async () => {
-		const { references } = await extractReferencesFromTranscript(file, ALL_ADAPTERS, { source: "codex" });
+		const { references } = await extractReferencesFromTranscript(file, { source: "codex" });
 		const gh = references.filter((r) => r.mapKey === "github:jolliai/jolli#959");
 		expect(gh).toHaveLength(1);
 		expect(gh[0].fields?.find((f) => f.key === "status")?.value).toBe("closed");

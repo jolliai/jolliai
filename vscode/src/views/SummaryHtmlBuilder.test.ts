@@ -637,6 +637,25 @@ describe("SummaryHtmlBuilder", () => {
 			});
 		});
 
+		// `SourceId` is now `string`, so `getSourceMeta` will hand back the raw id
+		// as the label for an unknown source. That raw id never reaches the DOM
+		// here because `referencesBySourceOrder` renders only the four known
+		// sources — the source-allowlist, not escaping, is what keeps a crafted
+		// source string (from a tampered orphan branch / shared Memory Bank) out
+		// of the webview. Pin that invariant so a future refactor that drops the
+		// allowlist can't silently turn the bare source label into an injection.
+		it("drops an unknown reference source from the HTML view (source allowlist)", () => {
+			const html = buildHtml(
+				makeSummary({
+					references: [makeLinear({ source: 'x"><img src=x onerror=alert(1)>', archivedKey: "x:PROJ-9" })],
+				}),
+			);
+			// Absent in ANY form — raw or escaped. (If the allowlist were dropped
+			// the row would render; the source label is escaped, but "onerror"
+			// itself has no escapable chars, so it would still surface as text.)
+			expect(html).not.toContain("onerror");
+		});
+
 		it('shows "No topics available" message when topics are empty', () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [],

@@ -3,20 +3,19 @@
  * and shared by every producer that yields GitHub issues in a non-canonical
  * shape (the Codex `codex_apps` connector today; the `gh` CLI later).
  *
- * Maps a producer's issue object into the shape `GitHubAdapter.extractRef` reads:
+ * Maps a producer's issue object into the shape the github `SourceDefinition`'s
+ * `extractRef` reads:
  * unwrap `issue.*`, `issue_number`→`number`, `url`→`html_url`, flatten the
  * object-array `labels`/`assignees` into string arrays, and — for search hits
  * that leave `number` null — derive the issue number from the URL.
  *
- * Self-contained (local `isObject`, no cross-layer import) so `sources/` never
- * depends on `bindings/`.
+ * `isObject` comes from the neutral references-root `guards.ts` (never from
+ * `bindings/`), so `sources/` still does not depend on `bindings/`.
  */
 
-const ISSUE_NUMBER_IN_URL = /\/(?:issues|pull)\/(\d+)/;
+import { isObject } from "../guards.js";
 
-function isObject(v: unknown): v is Record<string, unknown> {
-	return typeof v === "object" && v !== null && !Array.isArray(v);
-}
+const ISSUE_NUMBER_IN_URL = /\/(?:issues|pull)\/(\d+)/;
 
 /** Flatten an array of `{[key]: string}` objects (or bare strings) to a string array. */
 function flattenNamed(value: unknown, key: "name" | "login"): string[] | undefined {

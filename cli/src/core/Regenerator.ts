@@ -1,10 +1,11 @@
 import { createLogger } from "../Logger.js";
-import type { CommitSummary, LlmConfig, Reference, ReferenceCommitRef, SourceId } from "../Types.js";
+import type { CommitSummary, LlmConfig, Reference, ReferenceCommitRef } from "../Types.js";
 import { getDiffContent } from "./GitOps.js";
 import { escapeForAttr, escapeForText } from "./PromptXmlEscape.js";
 import { truncate } from "./references/ReferenceExtractor.js";
 import { readReferenceMarkdownFromString } from "./references/ReferenceStore.js";
-import { ALL_ADAPTERS } from "./references/sources/index.js";
+import { getRegistry } from "./references/SourceDefinitionRegistry.js";
+import { renderBlock } from "./references/SourceEngine.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import { generateSummary, type SummaryResult } from "./Summarizer.js";
 import {
@@ -190,10 +191,10 @@ const NOTE_TOTAL_CHARS = 12000;
  *
  * Reads each `ReferenceCommitRef` archived for this commit straight from the
  * orphan branch, parses the markdown frontmatter back to a `Reference`,
- * then groups by source and delegates rendering to the same `SourceAdapter`s
- * the first-run path uses. The resulting blocks are concatenated in stable
- * adapter-registration order (`ALL_ADAPTERS`), so the LLM sees byte-identical
- * output to the first-run path for single-source commits.
+ * then groups by source and delegates rendering to `SourceEngine.renderBlock`
+ * with the same source-definition registry the first-run path uses. The
+ * resulting blocks are concatenated in stable registry order, so the LLM sees
+ * byte-identical output to the first-run path for single-source commits.
  *
  * Missing orphan-branch markdown for a single reference is silently skipped
  * (with a warn log) so a half-migrated archive doesn't fail the whole
@@ -207,7 +208,7 @@ async function rebuildReferenceBlocks(
 	const refs: ReadonlyArray<ReferenceCommitRef> = summary.references ?? [];
 	if (refs.length === 0) return "";
 
-	const bySource = new Map<SourceId, Reference[]>();
+	const bySource = new Map<string, Reference[]>();
 	for (const ref of refs) {
 		const md = await readReferenceFromBranch(ref.source, ref.archivedKey, cwd, storage);
 		if (md === null) {
@@ -229,11 +230,11 @@ async function rebuildReferenceBlocks(
 		const safeToolName = ref.sourceToolName ?? "";
 		let reference: Reference;
 		if (parsed !== null) {
-			// Pass the parsed description through untruncated: the adapter's
-			// renderPromptBlock applies the single per-reference truncation, so
-			// regenerate output stays byte-identical to the first-run path (which
-			// also truncates exactly once, inside the adapter). Pre-truncating
-			// here would double-cut an oversized body and emit a wrong
+			// Pass the parsed description through untruncated: `SourceEngine.renderBlock`
+			// applies the single per-reference truncation, so regenerate output stays
+			// byte-identical to the first-run path (which also truncates exactly once,
+			// inside `renderBlock`). Pre-truncating here would double-cut an oversized
+			// body and emit a wrong
 			// "…[truncated, N more chars]" count.
 			reference = {
 				...parsed,
@@ -274,11 +275,11 @@ async function rebuildReferenceBlocks(
 	}
 
 	const blocks: string[] = [];
-	for (const adapter of ALL_ADAPTERS) {
-		const sourceRefs = bySource.get(adapter.id);
+	for (const def of getRegistry().all()) {
+		const sourceRefs = bySource.get(def.id);
 		if (!sourceRefs || sourceRefs.length === 0) continue;
-		const block = adapter.renderPromptBlock(sourceRefs);
-		/* v8 ignore start -- adapter.renderPromptBlock returns "" only when refs is empty (we skip that above) or when every ref exceeds the total budget; defensive append-guard for a corner case that never fires in practice. */
+		const block = renderBlock(def, sourceRefs);
+		/* v8 ignore start -- renderBlock returns "" only when refs is empty (we skip that above) or when every ref exceeds the total budget; defensive append-guard for a corner case that never fires in practice. */
 		if (block.length > 0) blocks.push(block);
 		/* v8 ignore stop */
 	}

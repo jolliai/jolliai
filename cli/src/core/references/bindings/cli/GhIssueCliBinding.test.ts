@@ -3,6 +3,7 @@ import { ghIssueCliBinding } from "./GhIssueCliBinding.js";
 
 const matches = (cmd: string) => ghIssueCliBinding.matches(cmd);
 const normalize = (b: unknown) => ghIssueCliBinding.normalize(b) as Record<string, unknown>;
+const normalizeWith = (b: unknown, cmd: string) => ghIssueCliBinding.normalize(b, cmd) as Record<string, unknown>;
 
 describe("ghIssueCliBinding", () => {
 	it("has the github identity + canonical tool name", () => {
@@ -81,6 +82,99 @@ describe("ghIssueCliBinding", () => {
 
 		it("passes through a non-object business value", () => {
 			expect(ghIssueCliBinding.normalize(42)).toBe(42);
+		});
+	});
+
+	describe("normalize — command fallback (payload missing number/url)", () => {
+		it("derives number from the positional arg and synthesizes url from --repo", () => {
+			const out = normalizeWith(
+				{ title: "Log Tracing - TEST", state: "OPEN", body: "Body" },
+				"gh issue view 1132 --repo jolliai/jolli --json title,body,state",
+			);
+			expect(out.number).toBe(1132);
+			expect(out.html_url).toBe("https://github.com/jolliai/jolli/issues/1132");
+		});
+
+		it("derives everything from a URL positional arg", () => {
+			const out = normalizeWith(
+				{ title: "t", state: "open" },
+				"gh issue view https://github.com/cli/cli/issues/42 --json title,state",
+			);
+			expect(out.number).toBe(42);
+			expect(out.html_url).toBe("https://github.com/cli/cli/issues/42");
+		});
+
+		it("accepts the -R short form for the repo", () => {
+			const out = normalizeWith({ title: "t" }, "gh -R octo/repo issue view 7 --json title");
+			expect(out.number).toBe(7);
+			expect(out.html_url).toBe("https://github.com/octo/repo/issues/7");
+		});
+
+		it("does not override a number/url already present in the payload", () => {
+			const out = normalizeWith(
+				{ number: 999, url: "https://github.com/real/repo/issues/999", title: "t" },
+				"gh issue view 1132 --repo jolliai/jolli --json number,url,title",
+			);
+			expect(out.number).toBe(999);
+			expect(out.html_url).toBe("https://github.com/real/repo/issues/999");
+		});
+
+		it("leaves number/url absent when the command carries no repo and no URL", () => {
+			const out = normalizeWith({ title: "t" }, "gh issue view 5 --json title");
+			// number alone cannot form a valid reference (no owner/repo, no url) — stays absent.
+			expect(out.number).toBeUndefined();
+			expect(out.html_url).toBeUndefined();
+		});
+
+		it("accepts the --repo=owner/repo equals form", () => {
+			const out = normalizeWith({ title: "t" }, "gh issue view 8 --repo=octo/repo --json title");
+			expect(out.number).toBe(8);
+			expect(out.html_url).toBe("https://github.com/octo/repo/issues/8");
+		});
+
+		it("ignores a --repo value that is not owner/repo", () => {
+			const out = normalizeWith({ title: "t" }, "gh issue view 8 --repo not-a-repo --json title");
+			expect(out.number).toBeUndefined();
+			expect(out.html_url).toBeUndefined();
+		});
+
+		it("finds the gh statement on a later line of a multi-line command", () => {
+			const out = normalizeWith({ title: "t" }, "echo start\ngh issue view 3 --repo o/r --json title");
+			expect(out.number).toBe(3);
+			expect(out.html_url).toBe("https://github.com/o/r/issues/3");
+		});
+
+		it("derives from the --json statement, not an earlier gh line that produced no payload", () => {
+			// The payload came from the SECOND statement (issue 5, the one with --json).
+			// A prior non-JSON `gh issue view 99` must NOT hijack the selector.
+			const out = normalizeWith(
+				{ title: "t" },
+				"gh issue view https://github.com/a/b/issues/99\ngh issue view 5 -R o/r --json title",
+			);
+			expect(out.number).toBe(5);
+			expect(out.html_url).toBe("https://github.com/o/r/issues/5");
+		});
+
+		it("keeps a query string intact in a URL selector (bare & is not a token boundary)", () => {
+			const out = normalizeWith(
+				{ title: "t" },
+				"gh issue view https://github.com/o/r/issues/42?foo=1&bar=2 --json title",
+			);
+			// The `&` inside the URL must not split the token and truncate the selector —
+			// the whole URL (query included) survives to the reshaped payload.
+			expect(out.number).toBe(42);
+			expect(out.html_url).toBe("https://github.com/o/r/issues/42?foo=1&bar=2");
+		});
+
+		it("derives nothing when the command has no issue-number/URL selector", () => {
+			// `gh issue view --json title` uses the current-branch context — no positional.
+			const out = normalizeWith({ title: "t" }, "gh issue view --repo o/r --json title");
+			expect(out.number).toBeUndefined();
+			expect(out.html_url).toBeUndefined();
+		});
+
+		it("passes a non-object business through untouched even with a command", () => {
+			expect(ghIssueCliBinding.normalize(42, "gh issue view 1 --repo o/r --json title")).toBe(42);
 		});
 	});
 });

@@ -26,7 +26,7 @@ import type {
 	TopicCategory,
 } from "../../../cli/src/Types.js";
 import { annotatePlans } from "../util/PlanGrouping.js";
-import { SOURCE_TITLES } from "./SourceLabels.js";
+import { getSourceMeta } from "./SourceLabels.js";
 import { buildCss } from "./SummaryCssBuilder.js";
 import { buildScript } from "./SummaryScriptBuilder.js";
 import { buildSummaryErrorBanner } from "./SummaryErrorBanner.js";
@@ -1150,14 +1150,6 @@ function stripSourcePrefix(archivedKey: string, source: SourceId): string {
 	return archivedKey.startsWith(prefix) ? archivedKey.slice(prefix.length) : archivedKey;
 }
 
-/** Single-letter `.kb-tag.t-ref` badge per reference source (mirrors the sidebar's L/J/G/N convention). */
-const REFERENCE_SOURCE_LETTER: Record<SourceId, string> = {
-	linear: "L",
-	jira: "J",
-	github: "G",
-	notion: "N",
-};
-
 /**
  * Renders one reference row. Mirrors the Plan/Note row shape (same shared CSS
  * classes: `row plan-item`, `plan-header-actions`, `plan-meta`, `plan-edit-area`,
@@ -1184,8 +1176,9 @@ function buildReferenceRow(
 	e: ReferenceCommitRef,
 	referenceTranslateSet?: ReadonlySet<string>,
 ): string {
-	const sourceLabel = SOURCE_TITLES[e.source];
-	const sourceLetter = REFERENCE_SOURCE_LETTER[e.source];
+	const sourceMeta = getSourceMeta(e.source);
+	const sourceLabel = sourceMeta.label;
+	const sourceLetter = sourceMeta.letter;
 	// DOM id: strip `<source>:` prefix uniformly across sources so the id
 	// is `reference-<source>-<bareKey>` regardless of source.
 	const domKey = stripSourcePrefix(e.archivedKey, e.source);
@@ -1199,15 +1192,15 @@ function buildReferenceRow(
 		: "";
 	return `
   <div class="row plan-item" id="reference-${escAttr(e.source)}-${escAttr(domKey)}">
-    <span class="kb-tag t-ref">${sourceLetter}</span>
+    <span class="kb-tag t-ref">${escHtml(sourceLetter)}</span>
     <div class="r-main">
       <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewReference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}">${escHtml(e.nativeId)} &mdash; ${escHtml(e.title)}</a>
-      <div class="r-sub plan-meta">${escHtml(e.nativeId)} (${sourceLabel})</div>
+      <div class="r-sub plan-meta">${escHtml(e.nativeId)} (${escHtml(sourceLabel)})</div>
     </div>
     <span class="r-actions plan-header-actions">
-      <button class="icon-btn topic-action-btn" title="Open in ${sourceLabel}" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-url="${escAttr(e.url)}" data-action="openReferenceExternal">&#x1F30D;</button>
-      ${translateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit ${sourceLabel} snapshot" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="loadReferenceContent">&#x270E;</button>
-      <button class="icon-btn topic-action-btn plan-remove-btn" title="Remove ${sourceLabel} Reference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}" data-action="removeReference">&#x1F5D1;</button>
+      <button class="icon-btn topic-action-btn" title="Open in ${escAttr(sourceLabel)}" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-url="${escAttr(e.url)}" data-action="openReferenceExternal">&#x1F30D;</button>
+      ${translateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit ${escAttr(sourceLabel)} snapshot" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="loadReferenceContent">&#x270E;</button>
+      <button class="icon-btn topic-action-btn plan-remove-btn" title="Remove ${escAttr(sourceLabel)} Reference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}" data-action="removeReference">&#x1F5D1;</button>
     </span>
     <div class="plan-edit-area">
       <textarea class="plan-edit-textarea" data-reference-key="${escAttr(e.archivedKey)}" rows="20"></textarea>

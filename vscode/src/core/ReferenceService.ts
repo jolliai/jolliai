@@ -135,7 +135,7 @@ export async function removeReference(cwd: string, mapKey: string): Promise<void
 /**
  * Opens the reference's URL in the default browser.
  *
- * Defense-in-depth: each SourceAdapter.extractRef already gates incoming
+ * Defense-in-depth: `SourceEngine.extractRef` already gates incoming
  * payloads through `^https?://`, but the URL flows through plans.json (a
  * local user-editable file). Re-validate the scheme at the sink so a
  * hand-edited `javascript:` / `data:` / `file:` URL can't smuggle through

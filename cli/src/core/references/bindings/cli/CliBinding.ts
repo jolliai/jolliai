@@ -10,8 +10,10 @@
  * registry — recognition lives here, the prefix/exit-code handling stays in each
  * envelope (Codex's `Exit code:`/`Wall time:` vs Claude's bare stdout).
  *
- * The binding receives the already-parsed business JSON (envelope-stripped); it
- * never touches the transcript shape.
+ * The binding receives the already-parsed business JSON (envelope-stripped) and,
+ * optionally, the originating command string — some fields the adapter needs
+ * (e.g. a GitHub issue's `number`/`url`) may be absent from the payload but
+ * recoverable from the command's arguments. It never touches the transcript shape.
  */
 
 import type { SourceId } from "../../../../Types.js";
@@ -22,6 +24,11 @@ export interface CliBinding {
 	matches(command: string): boolean;
 	/** Stable synthetic tool name persisted as `Reference.toolName`/`sourceToolName`. */
 	readonly canonicalToolName: string;
-	/** Normalize the already-parsed business JSON into the shape the adapter reads. */
-	normalize(business: unknown): unknown;
+	/**
+	 * Normalize the already-parsed business JSON into the shape the adapter reads.
+	 * `command` is the originating shell command; a binding may mine it to fill
+	 * fields the payload omitted (command-derived values fill gaps only — a payload
+	 * value always wins). Omit it and normalization uses the payload alone.
+	 */
+	normalize(business: unknown, command?: string): unknown;
 }

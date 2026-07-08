@@ -42,7 +42,7 @@ import { CURRENT_SCHEMA_VERSION } from "../Types.js";
 import { getDiffStats, getTreeHash } from "./GitOps.js";
 import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
-import { isSourceId, sanitizeNativeIdForPath } from "./references/ReferenceStore.js";
+import { isRegisteredSourceId, sanitizeNativeIdForPath } from "./references/ReferenceStore.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import type { SquashConsolidationSource } from "./Summarizer.js";
 import { isSummaryError, LLM_FAILED } from "./SummaryErrorMarker.js";
@@ -2432,16 +2432,27 @@ export async function readNoteFromBranch(id: string, cwd?: string, storage?: Sto
  * `"jira:KAN-4-abc12345"`). We strip the leading `<source>:` prefix then run
  * the same {@link sanitizeNativeIdForPath} ReferenceStore uses for on-disk
  * filenames — keeps GitHub's `<owner>/<repo>#<n>` collisions impossible.
+ *
+ * This guard is strict (registry-membership, via `isRegisteredSourceId`), not
+ * lenient (path-safety, via `isPathSafeSourceId`): an archived reference whose
+ * `source` was later removed from `SourceDefinitionRegistry` will throw here
+ * on write and, on regenerate, fail to resolve — falling into the caller's
+ * existing "missing markdown → skip with warn" path rather than being
+ * recovered. The "no data loss for a since-removed source" guarantee
+ * documented on {@link isPathSafeSourceId} covers only the active-reference
+ * parse path (`ReferenceStore.parseMarkdown`), not this archived-regenerate
+ * path.
  */
 function orphanPathFor(source: SourceId, archivedKey: string): string {
-	// Defense-in-depth path-traversal guard. `source` is typed SourceId, but at
-	// runtime it can originate from untrusted data (a webview `data-reference-
-	// source` attribute, a poisoned orphan branch / synced Memory Bank). Since
-	// it is interpolated raw into the filesystem path below, reject anything
-	// that isn't a known SourceId so a `../`-laden value can't escape the
+	// Defense-in-depth path-traversal guard. `source` is typed SourceId (now a
+	// plain string), but at runtime it can originate from untrusted data (a
+	// webview `data-reference-source` attribute, a poisoned orphan branch /
+	// synced Memory Bank). Since it is interpolated raw into the filesystem
+	// path below, reject anything that isn't a source currently registered in
+	// `SourceDefinitionRegistry` so a `../`-laden value can't escape the
 	// references/ directory. Read callers catch and return null; write callers
 	// surface the error.
-	if (!isSourceId(source)) {
+	if (!isRegisteredSourceId(source)) {
 		throw new Error(`orphanPathFor: refusing unknown reference source ${JSON.stringify(source)}`);
 	}
 	const prefix = `${source}:`;
