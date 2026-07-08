@@ -30,6 +30,12 @@ const VALID_GLOBAL_INSTRUCTIONS: ReadonlyArray<NonNullable<JolliMemoryConfig["gl
 /**
  * Valid config keys exposed via `jolli configure --set/--remove`.
  * Must stay in sync with {@link JolliMemoryConfig} in Types.ts.
+ *
+ * `"slack.workspaceUrl"` is the one exception: it's a dotted pseudo-key for
+ * the nested `slack.workspaceUrl` field, not a top-level `keyof
+ * JolliMemoryConfig`. It's coerced and validated like any other key, then
+ * folded into a nested `{ slack: { workspaceUrl } }` update just before
+ * `saveConfig` — see the flattening step in the `--set`/`--remove` handler.
  */
 const VALID_CONFIG_KEYS = [
 	"apiKey",
@@ -50,9 +56,15 @@ const VALID_CONFIG_KEYS = [
 	"aiProvider",
 	"syncTranscripts",
 	"syncPollIntervalSec",
-] as const satisfies ReadonlyArray<keyof JolliMemoryConfig>;
+	"slack.workspaceUrl",
+] as const satisfies ReadonlyArray<keyof JolliMemoryConfig | "slack.workspaceUrl">;
 
 type ConfigKey = (typeof VALID_CONFIG_KEYS)[number];
+
+/** Hosts allowed for `slack.workspaceUrl`: `slack.com` or any subdomain of it. */
+function isAllowedSlackHost(hostname: string): boolean {
+	return hostname === "slack.com" || hostname.endsWith(".slack.com");
+}
 
 /** Keys whose values should be masked when displayed (contain secrets). */
 const SENSITIVE_KEYS: ReadonlySet<string> = new Set(["apiKey", "jolliApiKey", "authToken"]);
@@ -141,6 +153,23 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 			.map((s) => s.trim())
 			.filter(Boolean);
 	}
+	// Nested field: validated like the JolliApiUtils origin allowlist —
+	// HTTPS-only, suffix-boundary host check — before it's ever persisted.
+	if (key === "slack.workspaceUrl") {
+		let parsed: URL;
+		try {
+			parsed = new URL(raw);
+		} catch {
+			throw new Error(`slack.workspaceUrl must be an https://<workspace>.slack.com URL (got: ${raw})`);
+		}
+		if (parsed.protocol !== "https:" || !isAllowedSlackHost(parsed.hostname)) {
+			throw new Error(`slack.workspaceUrl must be an https://<workspace>.slack.com URL (got: ${raw})`);
+		}
+		// Persist the normalized origin (scheme + host, no trailing slash or path)
+		// so the reference extractor's `${workspaceUrl}/archives/...` permalink
+		// reconstruction can't produce a double slash from a trailing-slash input.
+		return parsed.origin;
+	}
 	// String fields (apiKey, model, jolliApiKey, authToken, localFolder)
 	return raw;
 }
@@ -197,6 +226,12 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "syncPollIntervalSec",
 		type: "number",
 		description: "Sync poll interval in seconds (5400-86400; default + floor = 90 min, ceiling = 24h; plugin only)",
+	},
+	{
+		key: "slack.workspaceUrl",
+		type: "string",
+		description:
+			"Slack workspace base URL (https://<workspace>.slack.com) — fallback for thread permalinks when none was pasted",
 	},
 ];
 
@@ -280,6 +315,18 @@ export function registerConfigureCommand(program: Command): void {
 						return;
 					}
 					update[key] = undefined;
+				}
+
+				// Fold the dotted "slack.workspaceUrl" pseudo-key into a nested update.
+				// saveConfig/saveConfigScoped only shallow-merge top-level keys, so a
+				// bare `update.slack = { workspaceUrl }` would clobber sibling `slack`
+				// fields on disk — read the current config and spread its `slack`
+				// object first.
+				if ("slack.workspaceUrl" in update) {
+					const workspaceUrl = update["slack.workspaceUrl"] as string | undefined;
+					delete update["slack.workspaceUrl"];
+					const existing = await loadConfig();
+					update.slack = { ...existing.slack, workspaceUrl };
 				}
 
 				await saveConfig(update as Partial<JolliMemoryConfig>);

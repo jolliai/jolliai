@@ -1149,7 +1149,7 @@ export function buildFilesPanelShell(): string {
 </div>`;
 }
 
-const HTML_REFERENCE_SOURCE_ORDER: ReadonlyArray<SourceId> = ["linear", "jira", "github", "notion"];
+const HTML_REFERENCE_SOURCE_ORDER: ReadonlyArray<SourceId> = ["linear", "jira", "github", "notion", "slack"];
 
 /**
  * Returns references ordered by source (linear → jira → github → notion),
@@ -1231,7 +1231,7 @@ function buildReferenceRow(
       <div class="r-sub plan-meta">${escHtml(e.nativeId)} (${escHtml(sourceLabel)})</div>
     </div>
     <span class="r-actions plan-header-actions">
-      <button class="icon-btn topic-action-btn" title="Open in ${escAttr(sourceLabel)}" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-url="${escAttr(e.url)}" data-action="openReferenceExternal">&#x1F30D;</button>
+      <button class="icon-btn topic-action-btn" title="Open in ${escAttr(sourceLabel)}" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-url="${escAttr(e.url ?? "")}" data-action="openReferenceExternal">&#x1F30D;</button>
       ${translateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit ${escAttr(sourceLabel)} snapshot" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="loadReferenceContent">&#x270E;</button>
       <button class="icon-btn topic-action-btn plan-remove-btn" title="Remove ${escAttr(sourceLabel)} Reference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}" data-action="removeReference">&#x1F5D1;</button>
     </span>

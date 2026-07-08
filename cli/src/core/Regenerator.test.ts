@@ -971,11 +971,11 @@ describe("regenerateSummary", () => {
 		expect(params.notes).toContain("NB");
 	});
 
-	it("uses empty string for ref.url when ReferenceCommitRef.url is missing", async () => {
+	it("omits the <url> line when ReferenceCommitRef.url is missing", async () => {
 		// Legacy/corrupt ReferenceCommitRef may lack the url field — the
-		// adapter's renderPromptBlock receives an Reference whose url is "" so
-		// escapeForText doesn't choke. Output renders `<url></url>` (empty
-		// inner text) the same as the first-run LinearAdapter path.
+		// adapter's renderPromptBlock receives a Reference whose url is "" so
+		// escapeForText doesn't choke. renderOne omits the <url> line entirely
+		// for an empty/undefined url rather than emitting `<url></url>`.
 		const noUrl: CommitSummary = {
 			...baseSummary,
 			references: [
@@ -995,7 +995,8 @@ describe("regenerateSummary", () => {
 		await regenerateSummary(noUrl, "/repo", config);
 
 		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
-		expect(params.referenceBlocks).toContain("<url></url>");
+		expect(params.referenceBlocks).not.toContain("<url>");
+		expect(params.referenceBlocks).toContain('<issue id="JOLLI-9">');
 	});
 
 	it("caps the total <plans> block at PLAN_TOTAL_CHARS (60000) and drops the oldest plan when exceeded", async () => {

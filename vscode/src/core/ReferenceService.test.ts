@@ -233,6 +233,27 @@ describe("detectReferences", () => {
 		expect(await detectReferences("/repo")).toEqual([]);
 	});
 
+	it("defaults url to empty string for a linkless Slack entry (no permalink/workspace configured)", async () => {
+		mockLoadPlansRegistry.mockResolvedValue({
+			version: 1,
+			plans: {},
+			references: {
+				"slack:C0-123.456": makeEntry({
+					source: "slack",
+					nativeId: "C0-123.456",
+					title: "Thread about the release",
+					url: undefined,
+					sourcePath: "/repo/.jolli/jollimemory/references/slack/C0-123.456.md",
+					sourceToolName: "mcp__claude_ai_Slack__slack_read_thread",
+				}),
+			},
+		});
+
+		const result = await detectReferences("/repo");
+
+		expect(result[0].url).toBe("");
+	});
+
 	it("sorts by lastModified descending", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,

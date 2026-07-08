@@ -22,12 +22,12 @@ describe("SourceDefinitionRegistry", () => {
 		expect(r.match("codex", "linear.get_issue")?.id).toBe("linear"); // invocation-tool path (no namespace)
 	});
 
-	it("all() is stable order linear,jira,github,notion", () => {
+	it("all() is stable order linear,jira,github,notion,slack", () => {
 		expect(
 			getRegistry()
 				.all()
 				.map((d) => d.id),
-		).toEqual(["linear", "jira", "github", "notion"]);
+		).toEqual(["linear", "jira", "github", "notion", "slack"]);
 	});
 
 	it("byId() finds a known definition and returns undefined for unknown ids", () => {

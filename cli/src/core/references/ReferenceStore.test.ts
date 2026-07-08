@@ -30,6 +30,19 @@ function linearRef(overrides: Partial<Reference> = {}): Reference {
 	};
 }
 
+function slackRef(overrides: Partial<Reference> = {}): Reference {
+	return {
+		mapKey: "slack:C1-1700000000.000001",
+		source: "slack",
+		nativeId: "C1-1700000000.000001",
+		title: "t",
+		description: "body",
+		toolName: "tool",
+		referencedAt: "2026-01-01T00:00:00Z",
+		...overrides,
+	};
+}
+
 function githubRef(overrides: Partial<Reference> = {}): Reference {
 	return {
 		mapKey: "github:owner/repo#42",
@@ -198,6 +211,28 @@ describe("ReferenceStore", () => {
 			const after = await readFile(sourcePath, "utf-8");
 			expect(after).not.toBe(before);
 			expect(after).toContain('"new"');
+		});
+
+		it("round-trips a Slack ref with no url (no permalink)", async () => {
+			// Slack references may legitimately lack a url — no configured
+			// workspace / no permalink in the payload. renderMarkdown must omit
+			// the `url:` line, and parseMarkdown must come back with `undefined`
+			// (not `""`) rather than rejecting the reference for a missing url.
+			const ref = slackRef();
+			const { sourcePath } = await writeReferenceMarkdown(ref, tempDir);
+			const raw = await readFile(sourcePath, "utf-8");
+			expect(raw).not.toMatch(/^url:/m);
+			const back = await readReferenceMarkdown(sourcePath);
+			expect(back).toEqual({
+				mapKey: "slack:C1-1700000000.000001",
+				source: "slack",
+				nativeId: "C1-1700000000.000001",
+				title: "t",
+				referencedAt: ref.referencedAt,
+				toolName: ref.toolName,
+				description: "body",
+			});
+			expect(back?.url).toBeUndefined();
 		});
 
 		it("writes GitHub markdown under sanitized filename", async () => {

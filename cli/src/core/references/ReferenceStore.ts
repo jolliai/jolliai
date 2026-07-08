@@ -192,7 +192,13 @@ function renderMarkdown(ref: Reference): string {
 	lines.push(`source: ${JSON.stringify(ref.source)}`);
 	lines.push(`nativeId: ${JSON.stringify(ref.nativeId)}`);
 	lines.push(`title: ${JSON.stringify(ref.title)}`);
-	lines.push(`url: ${JSON.stringify(ref.url)}`);
+	// Absent only for sources whose `url` FieldSpec is optional and the payload
+	// carried none (e.g. Slack with no permalink) — omit the frontmatter line
+	// entirely rather than writing `url: undefined` / `url: ""`, so parseMarkdown's
+	// missing-key path (→ undefined) is what round-trips it back.
+	if (ref.url !== undefined && ref.url.length > 0) {
+		lines.push(`url: ${JSON.stringify(ref.url)}`);
+	}
 	if (ref.fields !== undefined && ref.fields.length > 0) {
 		lines.push("fields:");
 		for (const f of ref.fields) lines.push(`  - ${JSON.stringify(f)}`);
@@ -211,8 +217,11 @@ function renderMarkdown(ref: Reference): string {
 /**
  * Parse markdown frontmatter into a Reference.
  *
- * Requires `source` and `nativeId` frontmatter (plus title / url / referencedAt /
- * sourceToolName). Returns null on malformed input or missing required fields.
+ * Requires `source`, `nativeId`, `title`, `referencedAt`, and `sourceToolName`
+ * frontmatter. `url` is optional — a missing `url:` key parses as `undefined`
+ * (Slack references may legitimately lack a permalink), not an empty string,
+ * and does not fail the reference. Returns null on malformed input or missing
+ * required fields.
  */
 function parseMarkdown(content: string): Reference | null {
 	/* v8 ignore start -- defensive typeof guard: callers (readReferenceMarkdown / parseFrontmatter callers) already pass `string` per the function signature; this branch only triggers if a future caller hands in `undefined`/`null` via an untyped path. */
@@ -286,19 +295,22 @@ function parseMarkdown(content: string): Reference | null {
 	const nativeId: string = nativeIdField;
 
 	const title = readString("title");
+	// A missing `url` key parses as `undefined`, not `""` — Slack references may
+	// legitimately lack a permalink, so url is NOT part of the required-field guard
+	// below (only nativeId/title stay required, per the frontmatter contract).
 	const url = readString("url");
 	const referencedAt = readString("referencedAt");
 	const sourceToolName = readString("sourceToolName");
-	if (!title || !url || referencedAt === undefined || !sourceToolName) return null;
+	if (!title || referencedAt === undefined || !sourceToolName) return null;
 
 	const ref: Reference = {
 		mapKey: `${source}:${nativeId}`,
 		source,
 		nativeId,
 		title,
-		url,
 		referencedAt,
 		toolName: sourceToolName,
+		...(url !== undefined ? { url } : {}),
 		...(refFields.length > 0 ? { fields: refFields } : {}),
 		...(body.length > 0 ? { description: body } : {}),
 	};

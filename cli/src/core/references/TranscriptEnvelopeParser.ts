@@ -38,6 +38,13 @@ export interface ExtractOptions {
 	 * passing this. The Codex polling path passes "codex".
 	 */
 	readonly source?: TranscriptSource;
+	/**
+	 * The user's configured Slack workspace URL (`config.slack.workspaceUrl`),
+	 * used to reconstruct a thread permalink when the transcript never had one
+	 * pasted into it. Threaded in by `extractReferencesFromTranscript` (which
+	 * does the async `loadConfig()` read) since `parse()` itself is sync.
+	 */
+	readonly slackWorkspaceUrl?: string;
 }
 
 /**

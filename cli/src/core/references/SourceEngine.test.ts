@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { Reference } from "../../Types.js";
 import type { SourceDefinition } from "./SourceDefinition.js";
 import { evalPipe, extractRef, renderBlock, TRANSFORMS } from "./SourceEngine.js";
+import { linearDefinition } from "./sources/definitions/linear.js";
+import { slackDefinition } from "./sources/definitions/slack.js";
 
 function miniLinearDef(): SourceDefinition {
 	return {
@@ -481,6 +483,18 @@ describe("extractRef", () => {
 	});
 });
 
+describe("extractRef optional url", () => {
+	const canonNoUrl = { channelId: "C1", parentTs: "1700000000.000001", title: "t", text: "body", replyCount: 0 };
+	it("produces a reference with url absent when url.optional and missing", () => {
+		const ref = extractRef(slackDefinition, canonNoUrl, "tool", "2026-01-01T00:00:00Z");
+		expect(ref).not.toBeNull();
+		expect(ref?.url).toBeUndefined();
+	});
+	it("still voids a source whose url is required and missing (linear)", () => {
+		expect(extractRef(linearDefinition, { id: "PROJ-1", title: "x" }, "tool", "2026-01-01T00:00:00Z")).toBeNull();
+	});
+});
+
 describe("renderBlock", () => {
 	it("renderBlock reproduces the Linear XML byte-for-byte", () => {
 		const def = miniLinearDef();
@@ -517,6 +531,20 @@ describe("renderBlock", () => {
 		expect(out).toBe(
 			'<notion-pages>\n<page id="36c4fc101d34805ab1fdfb3e69144580">\n  <title>Page</title>\n  <url>https://www.notion.so/36c4fc101d34805ab1fdfb3e69144580</url>\n</page>\n</notion-pages>',
 		);
+	});
+
+	it("renderBlock omits the <url> line entirely when a reference has no url (Slack linkless capture)", () => {
+		const def = miniLinearDef();
+		const ref: Reference = {
+			mapKey: "linear:X-1",
+			source: "linear",
+			nativeId: "X-1",
+			title: "T",
+			toolName: "t",
+			referencedAt: "2026-01-01",
+		};
+		const out = renderBlock(def, [ref]);
+		expect(out).not.toContain("<url>");
 	});
 
 	it("renderBlock returns an empty string for an empty ref list", () => {

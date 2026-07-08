@@ -29,6 +29,7 @@ import { log } from "../util/Logger.js";
 import { ConversationDetailsPanel } from "./ConversationDetailsPanel.js";
 import { SIDEBAR_EMPTY_STRINGS } from "./SidebarEmptyMessages.js";
 import { buildSidebarHtml } from "./SidebarHtmlBuilder.js";
+import { SOURCE_META } from "./SourceLabels.js";
 import type {
 	BackfillCandidate,
 	BackfillResultRow,
@@ -47,12 +48,17 @@ import type {
 import { sliceStartTime } from "./TranscriptSliceOrder.js";
 
 /**
- * Closed set of reference `SourceId`s (mirrors `SourceId` in cli Types.ts).
- * Used to validate the `source` on an inbound `kb:openEvidenceReference`
- * message — webview messages cross a trust boundary, so an unknown source is
- * dropped rather than forwarded into the archived-snapshot read path.
+ * Closed set of reference `SourceId`s. Used to validate the `source` on an
+ * inbound `kb:openEvidenceReference` message — webview messages cross a trust
+ * boundary, so an unknown source is dropped rather than forwarded into the
+ * archived-snapshot read path.
+ *
+ * Derived from {@link SOURCE_META}'s keys (the `KnownSourceId` single source of
+ * truth) rather than a hand-written literal, so a newly added built-in source
+ * (e.g. `slack`) can never silently fall out of this allowlist and have its
+ * committed-reference rows become un-openable.
  */
-const REFERENCE_SOURCE_IDS = new Set<string>(["linear", "jira", "github", "notion"]);
+const REFERENCE_SOURCE_IDS: ReadonlySet<string> = new Set<string>(Object.keys(SOURCE_META));
 
 /**
  * Built-in VS Code commands the sidebar webview is allowed to dispatch, in

@@ -90,6 +90,11 @@ export function buildNextMemoryCss(): string {
 		".r-main { flex: 1; min-width: 0; }",
 		".r-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
 		".r-meta { flex-shrink: 0; font-size: 11.5px; color: var(--vscode-descriptionForeground); }",
+		// Config-needed hint (e.g. a linkless Slack reference): a static, muted
+		// gear glyph — not a button — with the reason on its native tooltip
+		// (title attribute). No hover/active states: it isn't clickable.
+		".ref-config-hint { flex-shrink: 0; display: inline-flex; align-items: center; color: var(--text-tertiary); }",
+		".ref-config-hint .codicon { font-size: 13px; }",
 		// Conversation source icon — the per-source brand glyph (convSourceIcon),
 		// matching the sidebar's Working Memory card rather than a text badge.
 		".conv-source-icon { flex-shrink: 0; width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; color: var(--vscode-icon-foreground); }",

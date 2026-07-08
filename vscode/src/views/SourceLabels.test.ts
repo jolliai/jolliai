@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { getSourceMeta } from "./SourceLabels";
+import { getSourceMeta, SOURCE_META } from "./SourceLabels";
+
+describe("SOURCE_META", () => {
+	it("has slack metadata", () => {
+		expect(SOURCE_META.slack).toEqual({ label: "Slack", letter: "S", icon: "comment-discussion", color: "#4a154b" });
+		expect(getSourceMeta("slack").label).toBe("Slack");
+	});
+});
 
 describe("getSourceMeta", () => {
 	it("returns the table entry for a known source id", () => {

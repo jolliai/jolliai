@@ -11,5 +11,12 @@ import { githubDefinition } from "./github.js";
 import { jiraDefinition } from "./jira.js";
 import { linearDefinition } from "./linear.js";
 import { notionDefinition } from "./notion.js";
+import { slackDefinition } from "./slack.js";
 
-export const BUILTIN_DEFINITIONS = [linearDefinition, jiraDefinition, githubDefinition, notionDefinition] as const;
+export const BUILTIN_DEFINITIONS = [
+	linearDefinition,
+	jiraDefinition,
+	githubDefinition,
+	notionDefinition,
+	slackDefinition,
+] as const;
