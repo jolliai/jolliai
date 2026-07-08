@@ -5,6 +5,8 @@
 ### New Features
 
 - **Build memory from your history** — open a repository that has no memory yet (or has recent commits without one) and a **BUILD MEMORY** card now offers to generate summaries for those past commits. Pick which commits to reconstruct — each row shows how many AI conversations were attributed to it — then watch per-commit progress and a final summary. Run a full back-fill any time from **Settings → Memory Bank → Generate Missing Summaries**, and dismiss the card per repository (the choice is shared with the VS Code extension, so a dismiss in one is honored in the other).
+- **Share a memory to Jolli** — share an individual commit memory to your Jolli site straight from the memory detail view via an inline overlay (no separate dialog). Creating a pull request continues to share that PR's memories in the same step, so sharing works at both the single-memory and the PR level.
+- **Token usage & estimated cost** — the memory detail view and the Committed Memories list now show token usage (input / output / cached) and an estimated USD cost — your stored per-model figure when available, otherwise a Sonnet-rate estimate for token-only memories — aggregated across squash/amend trees. The same **Task usage** line is now included in the memory you share or export to Jolli, so the cost estimate travels with the memory.
 - **Resume a Codex session** — Codex conversations can now be resumed directly, using the correct session-ID lookup.
 
 ### Changes

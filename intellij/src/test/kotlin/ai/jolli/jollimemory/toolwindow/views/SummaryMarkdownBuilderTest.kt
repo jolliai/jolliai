@@ -1,6 +1,7 @@
 package ai.jolli.jollimemory.toolwindow.views
 
 import ai.jolli.jollimemory.core.CommitSummary
+import ai.jolli.jollimemory.core.ConversationTokenBreakdown
 import ai.jolli.jollimemory.core.DiffStats
 import ai.jolli.jollimemory.core.E2eTestScenario
 import ai.jolli.jollimemory.core.LlmCallMetadata
@@ -90,6 +91,33 @@ class SummaryMarkdownBuilderTest {
         fun `includes conversations when turns greater than 0`() {
             val md = SummaryMarkdownBuilder.buildMarkdown(makeSummary())
             md shouldContain "**Conversations:**"
+        }
+
+        // Token/cost "Task usage" line shared to the Jolli site — must match the VS Code
+        // SummaryMarkdownBuilder output verbatim (exact counts, Sonnet-rate $) so a memory
+        // reads the same whichever editor pushed it.
+        @Test
+        fun `includes Task usage with cost and segment split when a breakdown is present`() {
+            val summary = makeSummary().copy(
+                conversationTokenBreakdown = ConversationTokenBreakdown(1_000_000, 1_000_000, 1_000_000),
+            )
+            val md = SummaryMarkdownBuilder.buildMarkdown(summary)
+            md shouldContain
+                "- **Task usage:** 3,000,000 tokens · \$21.75 (1,000,000 input, 1,000,000 output, 1,000,000 cached)"
+        }
+
+        @Test
+        fun `Task usage prices a breakdown-less token total at the input rate, no split`() {
+            val summary = makeSummary().copy(conversationTokens = 1_000_000)
+            val md = SummaryMarkdownBuilder.buildMarkdown(summary)
+            md shouldContain "- **Task usage:** 1,000,000 tokens · \$3.00"
+            md shouldNotContain "input, "
+        }
+
+        @Test
+        fun `Task usage omitted when there are no conversation tokens`() {
+            val md = SummaryMarkdownBuilder.buildMarkdown(makeSummary())
+            md shouldNotContain "**Task usage:**"
         }
 
         @Test
