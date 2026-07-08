@@ -434,6 +434,16 @@ describe("SummaryScriptBuilder", () => {
 			expect(script).toContain("bindPlansAndNotesSection()");
 		});
 
+		it("plansAndNotesUpdated syncs the CONTEXT chip in #contextPanel's header (outside the replaced section)", () => {
+			// The visible "CONTEXT N" count is #contextPanel's panel-header .sec-count,
+			// which sits OUTSIDE #plansAndNotesSection (that section's own header is
+			// CSS-hidden), so replaceSection can't touch it — it must be updated from
+			// the message's count field.
+			expect(script).toContain("getElementById('contextPanel')");
+			expect(script).toContain(".panel-header .sec-count");
+			expect(script).toContain("String(msg.count)");
+		});
+
 		it("jolliRowUpdated targets the header row by id", () => {
 			expect(script).toContain("msg.command === 'jolliRowUpdated'");
 			expect(script).toContain("getElementById('jolliRow')");

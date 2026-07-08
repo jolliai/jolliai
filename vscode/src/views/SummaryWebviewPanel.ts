@@ -112,6 +112,7 @@ import {
 	buildPlansAndNotesSection,
 	buildRecapSection,
 	buildTopicsSection,
+	contextChipCount,
 	type FileRow,
 	renderE2eScenario,
 	renderTopic,
@@ -1487,6 +1488,12 @@ export class SummaryWebviewPanel {
 				this.noteTranslateSet,
 				this.referenceTranslateSet,
 			),
+			// The visible "CONTEXT N" chip lives in #contextPanel's panel-header
+			// (buildContextPanel), OUTSIDE the #plansAndNotesSection HTML above —
+			// so it can't be refreshed by the section replace. Carry the recomputed
+			// count along so the client can sync the chip. Shared with
+			// buildContextPanel via contextChipCount so the two can't drift.
+			count: contextChipCount(summary),
 		});
 		this.panel.webview.postMessage({
 			command: "jolliRowUpdated",
