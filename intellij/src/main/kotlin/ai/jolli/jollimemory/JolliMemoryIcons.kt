@@ -30,6 +30,9 @@ object JolliMemoryIcons {
     /** Sparkle — matches VSCode codicon "sparkle" for AI commit. */
     val Sparkle: Icon = IconLoader.getIcon("/icons/sparkle.svg", JolliMemoryIcons::class.java)
 
+    /** Database cylinder — matches VSCode codicon "database" for the back-fill build action. */
+    val Database: Icon = IconLoader.getIcon("/icons/database.svg", JolliMemoryIcons::class.java)
+
     /** Git merge — matches VSCode codicon "git-merge" for squash. */
     val GitMerge: Icon = IconLoader.getIcon("/icons/git-merge.svg", JolliMemoryIcons::class.java)
 
