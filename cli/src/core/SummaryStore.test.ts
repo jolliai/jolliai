@@ -3665,7 +3665,7 @@ describe("SummaryStore", () => {
 			expect(files[0].content).toBe("body");
 		});
 
-		it("storeReferences rejects a path-traversal source (orphanPathFor isSourceId guard)", async () => {
+		it("storeReferences rejects a path-traversal source (orphanPathFor isRegisteredSourceId guard)", async () => {
 			// A poisoned `source` (e.g. from a tampered orphan branch / synced
 			// Memory Bank) must not be interpolated raw into the on-disk path.
 			await expect(
@@ -3674,6 +3674,27 @@ describe("SummaryStore", () => {
 						{
 							archivedKey: "x:PROJ-1-abc12345",
 							source: "../../../../etc" as unknown as SourceId,
+							content: "b",
+						},
+					],
+					"malicious",
+				),
+			).rejects.toThrow(/unknown reference source/);
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+
+		it("storeReferences rejects a benign but unregistered source, independent of path-safety (orphanPathFor isRegisteredSourceId guard)", async () => {
+			// "someRemovedSource" is a syntactically-safe `[\w-]+` string — it would
+			// pass the lenient isPathSafeSourceId check used at parse time — but it
+			// isn't registered in SourceDefinitionRegistry, so the strict write/read
+			// guard must still reject it. Proves the throw is a registry-membership
+			// contract, not just a path-traversal filter.
+			await expect(
+				storeReferences(
+					[
+						{
+							archivedKey: "someRemovedSource:PROJ-1-abc12345",
+							source: "someRemovedSource" as unknown as SourceId,
 							content: "b",
 						},
 					],

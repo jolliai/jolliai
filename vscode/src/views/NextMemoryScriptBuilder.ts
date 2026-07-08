@@ -19,9 +19,18 @@
  * buildTokenMeter) and the sidebar's renderTokenBar; all three share this
  * exact-width, no-bucket approach so sub-10% segments never disappear.
  */
+import { SOURCE_META } from "./SourceLabels.js";
+
 export function buildNextMemoryScript(): string {
 	return `
   const vscode = acquireVsCodeApi();
+
+  // Per-source badge letter, injected from the single ./SourceLabels.ts
+  // SOURCE_META table (mirrors SidebarScriptBuilder's own injection) so this
+  // standalone panel script never hardcodes a per-source letter switch. A
+  // source id missing from this table falls back to its own first letter
+  // uppercased at the lookup site below.
+  const SOURCE_META = ${JSON.stringify(SOURCE_META)};
   let conversations = [];
   let contextItems = [];
   let files = [];
@@ -239,11 +248,8 @@ export function buildNextMemoryScript(): string {
     else if (kind === 'reference') {
       const s = source || '';
       badgeKind = s || 'reference';
-      if (s === 'linear') letter = 'L';
-      else if (s === 'jira') letter = 'J';
-      else if (s === 'github') letter = 'G';
-      else if (s === 'notion') letter = 'N';
-      else letter = 'R';
+      const meta = SOURCE_META[s];
+      letter = s ? (meta ? meta.letter : s.slice(0, 1).toUpperCase()) : 'R';
     }
     return el('span', { className: 'kb-tag mem-ctx-badge mem-ctx-badge--' + badgeKind, text: letter });
   }

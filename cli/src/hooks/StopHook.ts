@@ -16,7 +16,7 @@
  *      .jolli/jollimemory/plans.json — so the VSCode PLANS panel can display them
  *      without expensive full-transcript scans.
  *   3. Incrementally scans the transcript for reference refs across every
- *      registered SourceAdapter (Linear / Jira / GitHub / Notion / …) via the
+ *      registered `SourceDefinition` (Linear / Jira / GitHub / Notion / …) via the
  *      generic `extractReferencesFromTranscript` loop. Each ref is persisted via
  *      `upsertReferenceEntry` into the `plans.json.references` map and rendered
  *      to per-reference markdown by `ReferenceStore`, so the VSCode panel surfaces

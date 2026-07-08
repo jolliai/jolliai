@@ -14,14 +14,14 @@ import type { TranscriptSource } from "../../Types.js";
 import { getCurrentBranchSafe } from "../GitBranch.js";
 import { upsertReferenceEntry } from "../SessionTracker.js";
 import { extractReferencesFromTranscript } from "./ReferenceExtractor.js";
-import { getAdaptersForSource } from "./sources/index.js";
 
 const log = createLogger("ReferenceDiscovery");
 
 /**
- * Scans the transcript for ALL adapters applicable to `source` from `fromLine`
- * and persists discovered references. Pure scan + upsert — the caller owns the
- * discovery cursor. Returns the furthest line scanned (EOF).
+ * Scans the transcript for every source registered in the
+ * `SourceDefinitionRegistry` from `fromLine` and persists discovered
+ * references. Pure scan + upsert — the caller owns the discovery cursor.
+ * Returns the furthest line scanned (EOF).
  */
 export async function scanReferencesFrom(
 	transcriptPath: string,
@@ -29,11 +29,10 @@ export async function scanReferencesFrom(
 	cwd: string,
 	source: TranscriptSource,
 ): Promise<number> {
-	const { references, lastLineNumberScanned } = await extractReferencesFromTranscript(
-		transcriptPath,
-		getAdaptersForSource(source),
-		{ fromLineNumber: fromLine, source },
-	);
+	const { references, lastLineNumberScanned } = await extractReferencesFromTranscript(transcriptPath, {
+		fromLineNumber: fromLine,
+		source,
+	});
 
 	if (references.length === 0) {
 		return lastLineNumberScanned;

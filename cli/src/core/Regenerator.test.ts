@@ -1557,9 +1557,10 @@ describe("regenerateSummary", () => {
 			expect(params.referenceBlocks).not.toContain("<description>");
 		});
 
-		it("renders one block per source in ALL_ADAPTERS order (currently linear-only registered)", async () => {
-			// The ALL_ADAPTERS loop is order-stable; until Jira/GitHub/Notion
-			// adapters land, only the linear block is produced. This test
+		it("renders one block per source in registry order (currently linear-only referenced)", async () => {
+			// The registry-driven render loop (`getRegistry().all()` +
+			// `SourceEngine.renderBlock`) is order-stable; with only a linear
+			// reference present, only the linear block is produced. This test
 			// pins the iteration shape so a future jira entity in the same
 			// summary won't change the linear block's byte position.
 			const linearOnly: CommitSummary = {

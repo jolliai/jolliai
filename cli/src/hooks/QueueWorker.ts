@@ -52,7 +52,8 @@ import { evaluatePlanProgress } from "../core/PlanProgressEvaluator.js";
 import { formatPlansBlock } from "../core/PlanPromptFormatter.js";
 import { estimateCostUsd, PRICES_AS_OF } from "../core/Pricing.js";
 import { deleteReferenceMarkdown, readReferenceMarkdown } from "../core/references/ReferenceStore.js";
-import { ALL_ADAPTERS } from "../core/references/sources/index.js";
+import { getRegistry } from "../core/references/SourceDefinitionRegistry.js";
+import { renderBlock } from "../core/references/SourceEngine.js";
 import {
 	associateNoteWithCommit,
 	associatePlanWithCommit,
@@ -1431,20 +1432,20 @@ async function readMarkdownFileContent(absPath: string): Promise<string> {
 
 /**
  * Bucket active reference entries by SourceId, parse each markdown back into a
- * Reference, and render one XML block per registered adapter in `ALL_ADAPTERS`
- * order. Empty source buckets are skipped (adapter.renderPromptBlock returns
+ * Reference, and render one XML block per definition in the source-definition
+ * registry. Empty source buckets are skipped (SourceEngine.renderBlock returns
  * "" for empty input, and we filter empty strings before joining).
  *
- * Iteration order = ALL_ADAPTERS registration order, so the prompt's
- * `<linear-issues>` / `<jira-issues>` / `<github-issues>` / `<notion-pages>`
- * sections appear in a stable order across runs — important for the LLM's
- * caching to hit on the prompt prefix.
+ * Iteration order = registry order, so the prompt's `<linear-issues>` /
+ * `<jira-issues>` / `<github-issues>` / `<notion-pages>` sections appear in a
+ * stable order across runs — important for the LLM's caching to hit on the
+ * prompt prefix.
  *
  * Shared between executePipeline and the amend delta-step path so
  * both flows render the reference context identically.
  */
 async function assembleReferenceBlocks(activeReferenceEntries: ReadonlyArray<ReferenceEntry>): Promise<string> {
-	const refsBySource = new Map<SourceId, Reference[]>();
+	const refsBySource = new Map<string, Reference[]>();
 	for (const entry of activeReferenceEntries) {
 		const ref = await readReferenceMarkdown(entry.sourcePath);
 		/* v8 ignore start -- null-ref branch fires only when the markdown file vanishes between StopHook write and this read (rare race); prompt assembly gracefully skips those entries. */
@@ -1455,9 +1456,9 @@ async function assembleReferenceBlocks(activeReferenceEntries: ReadonlyArray<Ref
 		refsBySource.set(ref.source, arr);
 	}
 	const parts: string[] = [];
-	for (const adapter of ALL_ADAPTERS) {
-		const refs = refsBySource.get(adapter.id) ?? [];
-		const block = adapter.renderPromptBlock(refs);
+	for (const def of getRegistry().all()) {
+		const refs = refsBySource.get(def.id) ?? [];
+		const block = renderBlock(def, refs);
 		if (block.length > 0) parts.push(block);
 	}
 	return parts.join("\n");
@@ -1566,9 +1567,9 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// Assemble the structured prompt blocks (plans / notes / references).
 	// Pure registry-driven: no transcript re-scan. User's Ignore on the panel
 	// takes effect immediately on the next commit. References are bucketed by
-	// SourceId and rendered through `adapter.renderPromptBlock` per registered
-	// SourceAdapter — adding a new source = registering an adapter, no code
-	// change here.
+	// SourceId and rendered through `SourceEngine.renderBlock` per definition in
+	// the source-definition registry — adding a new source = registering a
+	// definition, no code change here.
 	const [rawActivePlanEntries, rawActiveNoteEntries, rawActiveReferenceEntries] = await Promise.all([
 		detectActivePlansForBranch(cwd, branch),
 		detectActiveNotesForBranch(cwd, branch),

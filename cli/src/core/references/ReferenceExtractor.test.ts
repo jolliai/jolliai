@@ -11,9 +11,8 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 
 import type { Reference } from "../../Types.js";
 import { extractReferencesFromTranscript } from "./ReferenceExtractor.js";
-import { GitHubAdapter } from "./sources/GitHubAdapter.js";
-import { LinearAdapter } from "./sources/LinearAdapter.js";
-import type { SourceAdapter } from "./sources/SourceAdapter.js";
+import * as SourceEngine from "./SourceEngine.js";
+import { linearDefinition } from "./sources/definitions/linear.js";
 
 const fieldVal = (r: Reference | null | undefined, key: string): string | undefined =>
 	r?.fields?.find((f) => f.key === key)?.value;
@@ -110,9 +109,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references, lastLineNumberScanned } = await extractReferencesFromTranscript("/fake.jsonl", [
-			LinearAdapter,
-		]);
+		const { references, lastLineNumberScanned } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(1);
 		expect(references[0]).toMatchObject({
@@ -145,7 +142,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references.map((i) => i.nativeId)).toEqual(["PROJ-1528", "PROJ-1404"]);
 		expect(references.every((i) => i.toolName === "mcp__linear__list_issues")).toBe(true);
@@ -178,7 +175,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(1);
 		expect(references[0].title).toBe(SAMPLE_ISSUE_PAYLOAD.title);
@@ -197,7 +194,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(0);
 	});
@@ -227,7 +224,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(1);
 		expect(references[0].nativeId).toBe("PROJ-1528");
@@ -251,7 +248,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(0);
 	});
@@ -272,7 +269,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(0);
 	});
@@ -302,7 +299,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter], {
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", {
 			beforeTimestamp: "2026-05-14T06:30:00.000Z",
 		});
 
@@ -329,13 +326,9 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references, lastLineNumberScanned } = await extractReferencesFromTranscript(
-			"/fake.jsonl",
-			[LinearAdapter],
-			{
-				fromLineNumber: 90,
-			},
-		);
+		const { references, lastLineNumberScanned } = await extractReferencesFromTranscript("/fake.jsonl", {
+			fromLineNumber: 90,
+		});
 
 		expect(references).toHaveLength(1);
 		expect(lastLineNumberScanned).toBe(92);
@@ -357,7 +350,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(1);
 	});
@@ -386,7 +379,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(1);
 		expect(references[0].description).toContain("mcp__linear__list_issues");
@@ -408,7 +401,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(0);
 	});
@@ -427,7 +420,7 @@ describe("extractReferencesFromTranscript", () => {
 			}),
 		);
 		mockReadFile.mockResolvedValue(jsonl);
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 		expect(references).toHaveLength(0);
 	});
 
@@ -446,7 +439,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(0);
 	});
@@ -466,7 +459,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(1);
 		expect(references[0].nativeId).toBe("PROJ-1528");
@@ -492,7 +485,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(2);
 		expect(references.map((i) => i.nativeId).sort()).toEqual(["PROJ-1404", "PROJ-1528"]);
@@ -514,7 +507,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(1);
 	});
@@ -536,7 +529,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(1);
 	});
@@ -564,7 +557,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(1);
 	});
@@ -572,9 +565,7 @@ describe("extractReferencesFromTranscript", () => {
 	it("returns empty when transcript file is missing or unreadable", async () => {
 		mockReadFile.mockRejectedValue(new Error("ENOENT"));
 
-		const { references, lastLineNumberScanned } = await extractReferencesFromTranscript("/missing.jsonl", [
-			LinearAdapter,
-		]);
+		const { references, lastLineNumberScanned } = await extractReferencesFromTranscript("/missing.jsonl");
 
 		expect(references).toHaveLength(0);
 		expect(lastLineNumberScanned).toBe(0);
@@ -595,7 +586,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(fieldVal(references[0], "priority")).toBe("Urgent");
 	});
@@ -614,7 +605,7 @@ describe("extractReferencesFromTranscript", () => {
 			}),
 		);
 		mockReadFile.mockResolvedValue(jsonl);
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 		expect(fieldVal(references[0], "priority")).toBeUndefined();
 	});
 
@@ -633,7 +624,7 @@ describe("extractReferencesFromTranscript", () => {
 			}),
 		);
 		mockReadFile.mockResolvedValue(jsonl);
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 		expect(fieldVal(references[0], "labels")).toBeUndefined();
 	});
 
@@ -662,7 +653,7 @@ describe("extractReferencesFromTranscript", () => {
 			}),
 		);
 		mockReadFile.mockResolvedValue(jsonl);
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 		expect(references).toHaveLength(1);
 		expect(references[0].title).toBe("newer");
 	});
@@ -692,7 +683,7 @@ describe("extractReferencesFromTranscript", () => {
 		});
 		mockReadFile.mockResolvedValue(makeJsonl(toolUseLineStr, toolResultStringContent));
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 		expect(references).toHaveLength(1);
 		expect(references[0].nativeId).toBe("PROJ-1528");
 	});
@@ -721,7 +712,7 @@ describe("extractReferencesFromTranscript", () => {
 		});
 		mockReadFile.mockResolvedValue(makeJsonl(toolUseWithoutTs, toolResultLineStr));
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 		expect(references).toHaveLength(1);
 	});
 
@@ -756,7 +747,7 @@ describe("extractReferencesFromTranscript", () => {
 		});
 		mockReadFile.mockResolvedValue(makeJsonl(linearUse, unrelatedToolResult, linearResult));
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 		expect(references).toHaveLength(1);
 	});
 
@@ -790,51 +781,56 @@ describe("extractReferencesFromTranscript", () => {
 		});
 		mockReadFile.mockResolvedValue(makeJsonl(linearUse, malformedPayload, linearUse2, goodPayload));
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 		expect(references).toHaveLength(1);
 		expect(references[0].nativeId).toBe("PROJ-1528");
 	});
 
 	it("contains a throw from walkPayload to the offending tool_result and keeps scanning", async () => {
 		// The module contract promises every payload walk is wrapped: a throw
-		// from deep inside the walk (here a deliberately throwing adapter; in
-		// the wild, a RangeError from a pathologically deep payload) must NOT
+		// from deep inside the walk (here a deliberately throwing SourceEngine.extractRef;
+		// in the wild, a RangeError from a pathologically deep payload) must NOT
 		// abort extraction for the whole transcript. The pending entry is
-		// dropped and a later well-formed pair on a sane adapter still resolves.
-		const throwingAdapter: SourceAdapter = {
-			...LinearAdapter,
-			extractRef(payload, toolName, referencedAt) {
-				if ((payload as { id?: unknown }).id === SAMPLE_ISSUE_PAYLOAD.id) {
-					throw new Error("boom from adapter");
-				}
-				return LinearAdapter.extractRef(payload, toolName, referencedAt);
-			},
-		};
-		const badUse = toolUseLine({
-			toolUseId: "toolu_throw",
-			toolName: "mcp__linear__get_issue",
-			timestamp: "2026-05-14T06:00:00.000Z",
+		// dropped and a later well-formed pair on a sane definition still resolves.
+		// Matching/extraction is registry-driven now (no adapter array to swap in a
+		// custom implementation), so the throw is injected by spying on the shared
+		// SourceEngine.extractRef entry point instead.
+		const realExtractRef = SourceEngine.extractRef;
+		const spy = vi.spyOn(SourceEngine, "extractRef").mockImplementation((def, payload, toolName, referencedAt) => {
+			if ((payload as { id?: unknown }).id === SAMPLE_ISSUE_PAYLOAD.id) {
+				throw new Error("boom from adapter");
+			}
+			return realExtractRef(def, payload, toolName, referencedAt);
 		});
-		const badPayload = toolResultLine({
-			toolUseId: "toolu_throw",
-			timestamp: "2026-05-14T06:00:00.500Z",
-			payload: SAMPLE_ISSUE_PAYLOAD,
-		});
-		const goodUse = toolUseLine({
-			toolUseId: "toolu_ok",
-			toolName: "mcp__linear__get_issue",
-			timestamp: "2026-05-14T06:00:01.000Z",
-		});
-		const goodPayload = toolResultLine({
-			toolUseId: "toolu_ok",
-			timestamp: "2026-05-14T06:00:01.500Z",
-			payload: SAMPLE_ISSUE_PAYLOAD_2,
-		});
-		mockReadFile.mockResolvedValue(makeJsonl(badUse, badPayload, goodUse, goodPayload));
+		try {
+			const badUse = toolUseLine({
+				toolUseId: "toolu_throw",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			});
+			const badPayload = toolResultLine({
+				toolUseId: "toolu_throw",
+				timestamp: "2026-05-14T06:00:00.500Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			});
+			const goodUse = toolUseLine({
+				toolUseId: "toolu_ok",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:01.000Z",
+			});
+			const goodPayload = toolResultLine({
+				toolUseId: "toolu_ok",
+				timestamp: "2026-05-14T06:00:01.500Z",
+				payload: SAMPLE_ISSUE_PAYLOAD_2,
+			});
+			mockReadFile.mockResolvedValue(makeJsonl(badUse, badPayload, goodUse, goodPayload));
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [throwingAdapter]);
-		expect(references).toHaveLength(1);
-		expect(references[0].nativeId).toBe("PROJ-1404");
+			const { references } = await extractReferencesFromTranscript("/fake.jsonl");
+			expect(references).toHaveLength(1);
+			expect(references[0].nativeId).toBe("PROJ-1404");
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	it("ignores a tool_use line whose role is reported as something other than assistant or user", async () => {
@@ -846,7 +842,7 @@ describe("extractReferencesFromTranscript", () => {
 			timestamp: "2026-05-14T06:00:00.000Z",
 		});
 		mockReadFile.mockResolvedValue(makeJsonl(systemLine));
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 		expect(references).toHaveLength(0);
 	});
 
@@ -865,7 +861,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(1);
 		expect(references[0].description).toBeUndefined();
@@ -901,7 +897,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(1);
 		expect(references[0].nativeId).toBe("PROJ-1528");
@@ -924,7 +920,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter], {
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", {
 			beforeTimestamp: "2026-05-14T06:30:00.000Z",
 		});
 
@@ -955,7 +951,7 @@ describe("extractReferencesFromTranscript", () => {
 		});
 		mockReadFile.mockResolvedValue(makeJsonl(toolUseLineStr, toolResultNoTs));
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
 		expect(references).toHaveLength(1);
 		expect(references[0].referencedAt).toBe("");
@@ -963,15 +959,24 @@ describe("extractReferencesFromTranscript", () => {
 });
 
 // Local shim for the old formatLinearIssuesBlock surface — now delegates to
-// LinearAdapter.renderPromptBlock so existing test assertions keep working.
+// SourceEngine.renderBlock against the linear definition so existing test
+// assertions keep working.
 function formatReferencesBlock(
 	refs: ReadonlyArray<Reference>,
 	opts: { maxCharsPerIssue?: number; maxTotalChars?: number } = {},
 ): string {
-	const renderOpts: { maxCharsPerReference?: number; maxTotalChars?: number } = {};
-	if (opts.maxCharsPerIssue !== undefined) renderOpts.maxCharsPerReference = opts.maxCharsPerIssue;
-	if (opts.maxTotalChars !== undefined) renderOpts.maxTotalChars = opts.maxTotalChars;
-	return LinearAdapter.renderPromptBlock(refs, renderOpts);
+	const def =
+		opts.maxCharsPerIssue !== undefined || opts.maxTotalChars !== undefined
+			? {
+					...linearDefinition,
+					render: {
+						...linearDefinition.render,
+						...(opts.maxCharsPerIssue !== undefined ? { maxCharsPerReference: opts.maxCharsPerIssue } : {}),
+						...(opts.maxTotalChars !== undefined ? { maxTotalChars: opts.maxTotalChars } : {}),
+					},
+				}
+			: linearDefinition;
+	return SourceEngine.renderBlock(def, refs);
 }
 
 // ─── formatReferencesBlock ─────────────────────────────────────────────────
@@ -1174,7 +1179,7 @@ describe("extractReferencesFromTranscript — Claude Bash gh issue view CLI fall
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [GitHubAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 		expect(references).toHaveLength(1);
 		expect(references[0]).toMatchObject({
 			mapKey: "github:jolliai/jolli#959",
@@ -1196,7 +1201,7 @@ describe("extractReferencesFromTranscript — Claude Bash gh issue view CLI fall
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [GitHubAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 		expect(references).toHaveLength(0);
 	});
 
@@ -1207,8 +1212,59 @@ describe("extractReferencesFromTranscript — Claude Bash gh issue view CLI fall
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [GitHubAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 		expect(references).toHaveLength(0);
+	});
+
+	it("ignores a Bash tool_use with a missing or malformed input.command", async () => {
+		const jsonl = makeJsonl(
+			JSON.stringify({
+				message: {
+					role: "assistant",
+					content: [
+						// input entirely absent (typeof input !== "object" branch)
+						{ type: "tool_use", id: "tu_noinput", name: "Bash", input: undefined },
+						// input is an object but has no command field
+						{ type: "tool_use", id: "tu_nocmd", name: "Bash", input: { description: "x" } },
+					],
+				},
+				timestamp: "2026-06-09T10:00:00.000Z",
+			}),
+			bashResultLine({ toolUseId: "tu_noinput", stdout: GH_CLI_STDOUT, timestamp: "2026-06-09T10:00:01.000Z" }),
+			bashResultLine({ toolUseId: "tu_nocmd", stdout: GH_CLI_STDOUT, timestamp: "2026-06-09T10:00:02.000Z" }),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
+		expect(references).toHaveLength(0);
+	});
+
+	it("ignores an unrecognised, non-Bash tool_use alongside a recognised MCP call in the same message", async () => {
+		// Real transcripts commonly carry parallel tool calls in one assistant
+		// message — a `Read`/`Edit`/etc. block must be silently skipped without
+		// disturbing a sibling MCP block that IS a reference source.
+		const jsonl = makeJsonl(
+			JSON.stringify({
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "tool_use", id: "tu_read", name: "Read", input: { file_path: "/x" } },
+						{ type: "tool_use", id: "tu_lin", name: "mcp__linear__get_issue", input: {} },
+					],
+				},
+				timestamp: "2026-06-09T10:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "tu_lin",
+				timestamp: "2026-06-09T10:00:01.000Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
+		expect(references).toHaveLength(1);
+		expect(references[0].nativeId).toBe("PROJ-1528");
 	});
 
 	it("byte-equivalence: an MCP github result with is_error true is STILL extracted (gate is CLI-only)", async () => {
@@ -1245,7 +1301,7 @@ describe("extractReferencesFromTranscript — Claude Bash gh issue view CLI fall
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [GitHubAdapter]);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 		expect(references).toHaveLength(1);
 		expect(references[0].mapKey).toBe("github:jolliai/jolli#959");
 	});

@@ -700,21 +700,27 @@ export interface NoteReference {
 /**
  * SourceId — stable id naming each external-reference provider.
  *
- * Add a new id only by registering a corresponding `SourceAdapter` in
- * `cli/src/core/references/sources/index.ts`. Persistence layers (the
+ * Ids are registered via `BUILTIN_DEFINITIONS`
+ * (`cli/src/core/references/sources/definitions/index.ts`) and resolved
+ * through `SourceDefinitionRegistry`, not a closed string union — phase-2
+ * config can register additional sources at runtime. Persistence layers (the
  * `plans.json` `references` map, orphan-branch `references/<source>/…`) key off
  * this string directly.
  */
-export type SourceId = "linear" | "jira" | "github" | "notion";
+export type SourceId = string;
+
+/** The four source ids that ship as built-in `SourceDefinition`s. Docs/reference only — not an exhaustive runtime set. */
+export type KnownSourceId = "linear" | "jira" | "github" | "notion";
 
 /**
- * ReferenceField — one displayable field produced by a `SourceAdapter`.
+ * ReferenceField — one displayable field produced by a `SourceDefinition`'s `fields` pipes.
  *
  * The opaque carrier for everything source-specific. The common layer
  * (persistence, commit snapshot, panel, tooltip) only **passes it through** —
- * it NEVER interprets `key`. Each adapter owns which fields exist, their
- * display labels, icons, and order. Adding Slack/Zoom means adding an adapter
- * that builds these; no common-layer type or code changes.
+ * it NEVER interprets `key`. Each `SourceDefinition`'s `fields` pipes decide
+ * which fields exist, their display labels, icons, and order. Adding
+ * Slack/Zoom means adding a `SourceDefinition`; no common-layer type or code
+ * changes.
  */
 export interface ReferenceField {
 	/** Stable key — doubles as the frontmatter key and the prompt XML attribute name (e.g. "status", "channel"). */
@@ -728,7 +734,7 @@ export interface ReferenceField {
 }
 
 /**
- * Reference — ephemeral, in-memory shape produced by a `SourceAdapter.extractRef`
+ * Reference — ephemeral, in-memory shape produced by a `SourceEngine.extractRef`
  * call. Carries the cross-source core fields + an opaque `fields` bag for every
  * source-specific attribute. Persisted as markdown frontmatter by
  * `ReferenceStore.writeReferenceMarkdown`; metadata is split into `ReferenceEntry`

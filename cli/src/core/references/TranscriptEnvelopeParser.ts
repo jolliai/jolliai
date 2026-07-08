@@ -8,10 +8,10 @@
  * can stay identical across Claude, Codex, and any future agent.
  *
  * A parser turns raw JSONL lines into a flat, transcript-ordered sequence of
- * NormalizedToolResult — each carrying the matched SourceAdapter, the (already
+ * NormalizedToolResult — each carrying the matched SourceDefinition, the (already
  * JSON-parsed, envelope-stripped) payload, and the line/timestamp metadata the
  * driver needs for the incremental cursor and dedupe. The driver then walks each
- * payload through `adapter.extractRef` exactly as before.
+ * payload through `SourceEngine.extractRef` exactly as before.
  *
  * No runtime import cycle: ClaudeEnvelopeParser imports only the *types* below
  * (erased at compile time), while this module imports the parser *value*.
@@ -20,7 +20,7 @@
 import type { TranscriptSource } from "../../Types.js";
 import { claudeEnvelopeParser } from "./ClaudeEnvelopeParser.js";
 import { codexEnvelopeParser } from "./CodexEnvelopeParser.js";
-import type { SourceAdapter } from "./sources/SourceAdapter.js";
+import type { SourceDefinition } from "./SourceDefinition.js";
 
 /**
  * Options threaded from `extractReferencesFromTranscript` into the parser.
@@ -46,13 +46,12 @@ export interface ExtractOptions {
  */
 export interface NormalizedToolResult {
 	/**
-	 * The adapter that matched this tool call. The producer binding resolves the
-	 * tool identity to a `SourceId` (e.g. Claude's `mcp__claude_ai_Atlassian__`→jira,
-	 * `mcp__claude_ai_Notion__`→notion — prefix≠SourceId) and the parser maps that
-	 * to the adapter via `adapters.find(a => a.id === id)`, carrying it here so the
-	 * driver never has to re-derive it.
+	 * The `SourceDefinition` that matched this tool call, resolved via
+	 * `SourceDefinitionRegistry.match()` (Claude: tool-name prefix; Codex:
+	 * namespace+name or invocation tool). Carried here so the driver never has to
+	 * re-derive it.
 	 */
-	readonly adapter: SourceAdapter;
+	readonly def: SourceDefinition;
 	/**
 	 * The tool name carried through to `Reference.toolName` (persisted as
 	 * `sourceToolName`). Claude: the raw `block.name` (e.g.
@@ -92,7 +91,7 @@ export interface TranscriptEnvelopeParser {
 	 *    timestamp ties; reordering changes results),
 	 *  - return `lastLineNumberScanned` = the last line index traversed.
 	 */
-	parse(lines: string[], opts: ExtractOptions, adapters: readonly SourceAdapter[]): EnvelopeParseResult;
+	parse(lines: string[], opts: ExtractOptions): EnvelopeParseResult;
 }
 
 /**

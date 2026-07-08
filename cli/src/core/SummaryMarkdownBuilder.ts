@@ -8,6 +8,7 @@
 
 import type { CommitSummary, E2eTestScenario, ReferenceCommitRef, SourceId } from "../Types.js";
 import { escMdLinkText, escMdUrl } from "./MarkdownEscape.js";
+import { getRegistry } from "./references/SourceDefinitionRegistry.js";
 import {
 	collectSortedTopics,
 	formatDate,
@@ -113,12 +114,15 @@ export function pushRecapSection(lines: Array<string>, summary: CommitSummary): 
 	lines.push("", "## Quick recap", "", recap, "", "---");
 }
 
-const REFERENCE_SOURCE_ORDER: ReadonlyArray<SourceId> = ["linear", "jira", "github", "notion"];
-
 /**
- * Returns references ordered by source (linear → jira → github → notion),
- * preserving within-source order, so the section reads deterministically
- * across regenerations.
+ * Returns references ordered by source (registration order in
+ * `SourceDefinitionRegistry` — linear → jira → github → notion for the 4
+ * built-ins), preserving within-source order, so the section reads
+ * deterministically across regenerations.
+ *
+ * A `source` not currently registered (e.g. a definition removed after a repo
+ * already has references archived under it) is appended after the known
+ * sources, in first-seen order, rather than silently dropped.
  */
 export function referencesBySourceOrder(
 	references: ReadonlyArray<ReferenceCommitRef>,
@@ -129,11 +133,18 @@ export function referencesBySourceOrder(
 		arr.push(e);
 		bySource.set(e.source, arr);
 	}
+	const knownOrder = getRegistry()
+		.all()
+		.map((d) => d.id);
 	const out: Array<ReferenceCommitRef> = [];
-	for (const source of REFERENCE_SOURCE_ORDER) {
+	for (const source of knownOrder) {
 		const arr = bySource.get(source);
-		if (arr) out.push(...arr);
+		if (arr) {
+			out.push(...arr);
+			bySource.delete(source);
+		}
 	}
+	for (const arr of bySource.values()) out.push(...arr);
 	return out;
 }
 

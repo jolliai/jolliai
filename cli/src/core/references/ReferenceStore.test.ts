@@ -115,6 +115,17 @@ describe("ReferenceStore", () => {
 			expect(() => sanitizeNativeIdForPath("notion", "a\\b")).toThrow(/unsafe/);
 			expect(() => sanitizeNativeIdForPath("notion", "..")).toThrow(/unsafe/);
 		});
+
+		it("defaults an unregistered source to the sha8-safe path, conservatively", () => {
+			// A source not in `SourceDefinitionRegistry` is treated as
+			// `nativeIdPathSafe: false` — same shape as github's fallback — rather
+			// than identity, since nothing is known about its nativeId charset.
+			const sanitized = sanitizeNativeIdForPath("someRemovedSource", "weird/native id");
+			expect(sanitized).toMatch(/^weird-native-id-[0-9a-f]{8}$/);
+			// Also handles a traversal-shaped nativeId without throwing — the sha8
+			// scheme escapes unsafe characters instead of rejecting them.
+			expect(() => sanitizeNativeIdForPath("someRemovedSource", "../../etc/passwd")).not.toThrow();
+		});
 	});
 
 	describe("writeReferenceMarkdown + readReferenceMarkdown round-trip", () => {
@@ -239,13 +250,38 @@ describe("ReferenceStore", () => {
 			expect(await readReferenceMarkdown(file)).toBeNull();
 		});
 
-		it("returns null when source value is unknown", async () => {
-			const file = join(tempDir, "bogus-source.md");
+		it("still parses a path-safe source unknown to the registry (e.g. a removed definition)", async () => {
+			// Lenient parse: `isPathSafeSourceId` only checks the charset, not
+			// registry membership, so historical markdown for a since-removed
+			// source doesn't silently disappear on read.
+			const file = join(tempDir, "unregistered-source.md");
 			await writeFile(
 				file,
 				[
 					"---",
-					'source: "blockchain"',
+					'source: "someRemovedSource"',
+					'nativeId: "X-1"',
+					'title: "t"',
+					'url: "u"',
+					'referencedAt: ""',
+					'sourceToolName: "mcp__x"',
+					"---",
+					"",
+				].join("\n"),
+				"utf-8",
+			);
+			const ref = await readReferenceMarkdown(file);
+			expect(ref?.source).toBe("someRemovedSource");
+			expect(ref?.nativeId).toBe("X-1");
+		});
+
+		it("returns null when source value is not path-safe", async () => {
+			const file = join(tempDir, "unsafe-source.md");
+			await writeFile(
+				file,
+				[
+					"---",
+					'source: "not a source"',
 					'nativeId: "X-1"',
 					'title: "t"',
 					'url: "u"',

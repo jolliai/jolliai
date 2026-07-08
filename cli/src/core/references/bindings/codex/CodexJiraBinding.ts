@@ -1,7 +1,7 @@
 /**
- * CodexJiraBinding — Jira `codex_apps` connector binding (namespace suffix
- * `atlassian_rovo`, tool `_getjiraissue` / invocation `atlassian rovo_getjiraissue`
- * — note the space).
+ * CodexJiraBinding — Jira `codex_apps` connector normalizer (reached through
+ * `_getjiraissue` / invocation `atlassian rovo_getjiraissue` — note the space;
+ * match identity lives in the registry).
  *
  * Codex's `_getjiraissue` payload is `{ issues: { nodes: [ node ] } }`, and each
  * node — unlike Claude's Atlassian MCP — has **NO `fields` object**: `key` +
@@ -9,12 +9,12 @@
  * `versionedRepresentations` (`{ "<version>": <value> }`), where `summary` is a
  * string and `description` is an ADF document. So:
  *   - `normalize` (main path) reshapes each node, deriving `fields.summary` and
- *     `fields.description` (ADF → markdown) so the unchanged JiraAdapter accepts it.
+ *     `fields.description` (ADF → markdown) so the jira `SourceDefinition` accepts it.
  *   - `recover` (NOT the main path) handles the malformed-output edge — see below.
  */
 
 import { isObject } from "../shared.js";
-import type { CodexBinding } from "./CodexBinding.js";
+import type { CodexNormalizer } from "./CodexBinding.js";
 
 /**
  * Tenant browse URL from the output's `webUrl` field (e.g.
@@ -129,11 +129,8 @@ function recoverJiraWebUrl(eventPayload: unknown, rawOutput: string): unknown {
 	return { ...eventPayload, webUrl: urlMatch[1] };
 }
 
-export const jiraCodexBinding: CodexBinding = {
+export const jiraCodexBinding: CodexNormalizer = {
 	id: "jira",
-	namespaceSuffix: "atlassian_rovo",
-	functionCallNames: new Set(["_getjiraissue"]),
-	invocationTools: new Set(["atlassian rovo_getjiraissue"]),
 	canonicalToolName: "mcp__claude_ai_Atlassian__getJiraIssue",
 	normalize: normalizeJira,
 	recover: recoverJiraWebUrl,

@@ -2385,17 +2385,23 @@ describe("SidebarScriptBuilder", () => {
 			expect(body).toContain("item.referenceHover.source");
 		});
 
-		it("ctxBadge maps kind/source to the mem-ctx-badge variant + letter", () => {
+		it("ctxBadge maps kind/source to the mem-ctx-badge variant + letter via SOURCE_META", () => {
 			const js = buildSidebarScript();
 			const fnStart = js.indexOf("function ctxBadge");
 			const fnEnd = js.indexOf("function renderMemoryEvidence", fnStart);
 			const body = js.slice(fnStart, fnEnd);
 			expect(body).toContain("'mem-ctx-badge mem-ctx-badge--' + badgeKind");
-			// Per-source reference letters live here now (L / J / G / N / R).
-			expect(body).toContain("'linear'");
-			expect(body).toContain("'jira'");
-			expect(body).toContain("'github'");
-			expect(body).toContain("'notion'");
+			// Per-source reference letters are looked up from the injected
+			// SOURCE_META table rather than a hardcoded per-source switch.
+			expect(body).toContain("SOURCE_META[s]");
+			expect(body).not.toContain("'linear'");
+			expect(body).not.toContain("'github'");
+			// The injected table (single ./SourceLabels.ts source of truth) still
+			// carries all four known sources + their letters.
+			expect(js).toContain('"linear":{"label":"Linear","letter":"L"');
+			expect(js).toContain('"jira":{"label":"Jira","letter":"J"');
+			expect(js).toContain('"github":{"label":"GitHub","letter":"G"');
+			expect(js).toContain('"notion":{"label":"Notion","letter":"N"');
 		});
 	});
 
@@ -2451,16 +2457,20 @@ describe("SidebarScriptBuilder", () => {
 		});
 
 		it("includes a per-source badge in the title row so users can disambiguate Linear / Jira / GitHub / Notion at a glance", () => {
-			// The badge is the minimum-viable source-surfacing — single
-			// letter (L / J / GH / N) rather than a full brand icon. Source
-			// label lookup is a literal object so a regression that drops
-			// a source key would also trip this test.
+			// The badge is the minimum-viable source-surfacing — single letter
+			// (L / J / G / N), looked up from the injected SOURCE_META table
+			// (single ./SourceLabels.ts source of truth) rather than a
+			// hardcoded per-call-site object.
 			const js = buildSidebarScript();
 			expect(js).toContain("hc-source-badge");
-			expect(js).toContain("linear: 'L'");
-			expect(js).toContain("jira: 'J'");
-			expect(js).toContain("github: 'GH'");
-			expect(js).toContain("notion: 'N'");
+			const fnStart = js.indexOf("function renderReferenceHoverCard");
+			const body = js.slice(fnStart, fnStart + 700);
+			expect(body).toContain("SOURCE_META[h.source]");
+			expect(body).not.toContain("github: 'GH'");
+			expect(js).toContain('"linear":{"label":"Linear","letter":"L"');
+			expect(js).toContain('"jira":{"label":"Jira","letter":"J"');
+			expect(js).toContain('"github":{"label":"GitHub","letter":"G"');
+			expect(js).toContain('"notion":{"label":"Notion","letter":"N"');
 		});
 	});
 
