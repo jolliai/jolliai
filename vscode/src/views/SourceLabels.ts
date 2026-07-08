@@ -28,17 +28,21 @@ export interface SourceMeta {
 }
 
 /**
- * Metadata for the four built-in sources. Colors match the prior per-file
+ * Metadata for the five built-in sources. Colors match the prior per-file
  * `.mem-ctx-badge--<source>` CSS rules byte-for-byte; letters match the prior
  * per-file switch statements, with one intentional normalization: the
  * hover-card badge previously showed 'GH' for GitHub while every other call
- * site showed 'G' — this table standardizes on 'G' everywhere.
+ * site showed 'G' — this table standardizes on 'G' everywhere. `slack`'s
+ * color is Slack's official aubergine brand hue; the icon mirrors the
+ * `comment-discussion` codicon used by the CLI's `slackDefinition.icon`
+ * (references/sources/definitions/slack.ts) so the two stay in visual lockstep.
  */
 export const SOURCE_META: Record<KnownSourceId, SourceMeta> = {
 	linear: { label: "Linear", letter: "L", icon: "issues", color: "#5e6ad2" },
 	jira: { label: "Jira", letter: "J", icon: "issues", color: "#0052cc" },
 	github: { label: "GitHub", letter: "G", icon: "issues", color: "#6e7681" },
 	notion: { label: "Notion", letter: "N", icon: "file-text", color: "#787774" },
+	slack: { label: "Slack", letter: "S", icon: "comment-discussion", color: "#4a154b" },
 };
 
 /** Neutral badge color for a source outside {@link SOURCE_META} (matches the prior `.mem-ctx-badge--reference` fallback hue). */

@@ -198,7 +198,9 @@ export function extractRef(
 	const titleR = evalField(def.reference.title, payload);
 	const urlR = evalField(def.reference.url, payload);
 	if (!nativeIdR.ok || !titleR.ok || !urlR.ok) return null;
-	if (nativeIdR.value === undefined || titleR.value === undefined || urlR.value === undefined) return null;
+	if (nativeIdR.value === undefined || titleR.value === undefined) return null;
+	// url may be undefined only when the definition marks it optional (Slack);
+	// evalField already voided a required-but-missing url via urlR.ok === false.
 
 	const descR = def.reference.description
 		? evalField(def.reference.description, payload)
@@ -217,7 +219,7 @@ export function extractRef(
 		source: def.id,
 		nativeId: nativeIdR.value,
 		title: titleR.value,
-		url: urlR.value,
+		...(urlR.value !== undefined ? { url: urlR.value } : {}),
 		...(descR.value !== undefined ? { description: descR.value } : {}),
 		...(fields.length > 0 ? { fields } : {}),
 		toolName,
@@ -236,7 +238,7 @@ function renderOne(def: SourceDefinition, ref: Reference): string {
 	}
 	const lines = [`<${def.render.itemTag} ${attrs.join(" ")}>`];
 	lines.push(`  <title>${escapeForText(ref.title)}</title>`);
-	lines.push(`  <url>${escapeForText(ref.url)}</url>`);
+	if (ref.url !== undefined && ref.url.length > 0) lines.push(`  <url>${escapeForText(ref.url)}</url>`);
 	if (ref.description !== undefined && ref.description.length > 0) {
 		lines.push(`  <${def.render.bodyTag}>`);
 		lines.push(escapeForText(truncate(ref.description, def.render.maxCharsPerReference)));

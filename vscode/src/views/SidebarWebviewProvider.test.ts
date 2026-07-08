@@ -4377,6 +4377,27 @@ describe("SidebarWebviewProvider", () => {
 			);
 		});
 
+		it("kb:openEvidenceReference routes a Slack committed reference through (source in the allowlist)", () => {
+			// Regression: REFERENCE_SOURCE_IDS is derived from SOURCE_META keys, so
+			// `slack` (added as a built-in reference source) is in the allowlist and
+			// its committed-memory evidence rows dispatch instead of being dropped.
+			const { view, executeCommand } = makeEvidenceProvider();
+			view.webview.triggerMessage({
+				type: "kb:openEvidenceReference",
+				archivedKey: "slack:C0-123.456-ab12cd34",
+				source: "slack",
+				sourceRepoName: null,
+				sourceRemoteUrl: null,
+			});
+			expect(executeCommand).toHaveBeenCalledWith(
+				"jollimemory.previewCommittedReference",
+				"slack:C0-123.456-ab12cd34",
+				"slack",
+				null,
+				null,
+			);
+		});
+
 		it("kb:openEvidenceReference drops an unknown source without dispatching", () => {
 			const { view, executeCommand } = makeEvidenceProvider();
 			view.webview.triggerMessage({

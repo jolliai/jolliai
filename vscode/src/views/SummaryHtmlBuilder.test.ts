@@ -1006,7 +1006,7 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).not.toContain("entity-linear-linear:PROJ-7");
 		});
 
-		it("renders multi-source entities (linear → jira → github → notion) with grouped order", () => {
+		it("renders multi-source entities (linear → jira → github → notion → slack) with grouped order", () => {
 			// Multi-source replacement for the legacy linearIssues path: the
 			// renderer consumes summary.entities and groups by source so the
 			// row order is deterministic across regenerations.
@@ -1047,6 +1047,15 @@ describe("SummaryHtmlBuilder", () => {
 					referencedAt: "2026-01-15T10:00:00Z",
 					sourceToolName: "mcp__github__issue_read",
 				},
+				{
+					archivedKey: "slack:1704067200.000100-aaaa1111",
+					source: "slack",
+					nativeId: "1704067200.000100",
+					title: "Slack message",
+					url: "https://example.slack.com/archives/C123456/p1704067200000100",
+					referencedAt: "2026-01-15T10:00:00Z",
+					sourceToolName: "mcp__claude_ai_Slack__slack_read_thread",
+				},
 			];
 			const html = buildHtml(makeSummary({ references: entities }));
 
@@ -1056,16 +1065,19 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain('id="reference-jira-KAN-5-aaaa1111"');
 			expect(html).toContain('id="reference-github-owner/repo#42-aaaa1111"');
 			expect(html).toContain('id="reference-notion-abcdef12-aaaa1111"');
+			expect(html).toContain('id="reference-slack-1704067200.000100-aaaa1111"');
 
-			// Order: linear < jira < github < notion regardless of input order.
+			// Order: linear < jira < github < notion < slack regardless of input order.
 			const iLinear = html.indexOf("PROJ-7 ");
 			const iJira = html.indexOf("KAN-5 ");
 			const iGithub = html.indexOf("owner/repo#42 ");
 			const iNotion = html.indexOf("abcdef12 ");
+			const iSlack = html.indexOf("1704067200.000100 ");
 			expect(iLinear).toBeGreaterThan(-1);
 			expect(iJira).toBeGreaterThan(iLinear);
 			expect(iGithub).toBeGreaterThan(iJira);
 			expect(iNotion).toBeGreaterThan(iGithub);
+			expect(iSlack).toBeGreaterThan(iNotion);
 
 			// Every row now goes through previewEntity (title click) +
 			// openEntityExternal (🌍 button) — the upstream URL flows as
@@ -1078,6 +1090,9 @@ describe("SummaryHtmlBuilder", () => {
 				'data-reference-url="https://github.com/owner/repo/issues/42"',
 			);
 			expect(html).toContain('data-reference-url="https://notion.so/abcdef12"');
+			expect(html).toContain(
+				'data-reference-url="https://example.slack.com/archives/C123456/p1704067200000100"',
+			);
 		});
 
 		it("linear issues count rolls into the section header count badge", () => {
@@ -1247,6 +1262,16 @@ describe("SummaryHtmlBuilder", () => {
 				// showTranslate === true arm: the 🌐 translate button is emitted.
 				expect(html).toContain("reference-translate-btn");
 				expect(html).toContain('data-action="translateReference"');
+			});
+
+			it("renders a linkless reference (url absent — e.g. a Slack thread with no permalink/workspace configured) with an empty data-reference-url", () => {
+				// ReferenceCommitRef.url is optional (absent only for a source whose
+				// Reference.url was absent — today only Slack with no permalink) —
+				// buildReferenceRow must not blow up or emit the literal string
+				// "undefined" into the Open-in-<Source> button's data attribute.
+				const html = buildHtml(makeSummary({ references: [makeLinear({ url: undefined })] }));
+				expect(html).toContain('data-reference-url=""');
+				expect(html).not.toContain('data-reference-url="undefined"');
 			});
 
 			it("does not render a plansCard or sourceCard wrapper id", () => {

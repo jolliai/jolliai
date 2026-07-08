@@ -27,8 +27,10 @@ import { createLogger } from "../../Logger.js";
 import { CLAUDE_SHELL_TOOL_NAMES, CLAUDE_TOOL_PREFIXES } from "./bindings/claude/index.js";
 import { matchCliCommand } from "./bindings/cli/index.js";
 import { isObject } from "./guards.js";
+import { scanUserPermalinks } from "./SlackPermalink.js";
 import type { SourceDefinition } from "./SourceDefinition.js";
 import { getRegistry } from "./SourceDefinitionRegistry.js";
+import { normalizeSlackThread } from "./sources/SlackNormalize.js";
 import type {
 	EnvelopeParseResult,
 	ExtractOptions,
@@ -64,6 +66,14 @@ interface PendingEntry {
 	/** CLI (shell) entries require a successful command — drop the result if
 	 *  `is_error: true`. MCP entries set this false to keep prior behaviour. */
 	readonly requireSuccess: boolean;
+	/**
+	 * The tool_use `input`, retained only for Slack (`def.id === "slack"`).
+	 * Slack's `normalize` needs both the tool result payload AND out-of-payload
+	 * context (`channel_id` / `message_ts` from the originating tool_use) that no
+	 * other source needs — every other MCP source's `normalize` is `identity`
+	 * and never looks at this field.
+	 */
+	readonly toolInput?: unknown;
 }
 
 class ClaudeEnvelopeParser implements TranscriptEnvelopeParser {
@@ -72,6 +82,11 @@ class ClaudeEnvelopeParser implements TranscriptEnvelopeParser {
 		const pending = new Map<string, PendingEntry>();
 		const results: NormalizedToolResult[] = [];
 		let lastConsumed = fromLine;
+		// Slack's normalize needs a url no MCP payload carries; the pasted
+		// permalink (if any) is the only place it lives. Scanned once up front so
+		// every user text line is visited exactly once regardless of how many
+		// Slack tool_results follow it.
+		const permalinks = scanUserPermalinks(lines);
 
 		for (let i = fromLine; i < lines.length; i++) {
 			const line = lines[i];
@@ -107,7 +122,7 @@ class ClaudeEnvelopeParser implements TranscriptEnvelopeParser {
 				/* v8 ignore start -- readRole returns only "assistant" | "user" | undefined; undefined is filtered above, so the else-if's false branch is unreachable. */
 			} else if (role === "user") {
 				/* v8 ignore stop */
-				collectToolResults(blocks, i + 1, timestamp, opts.beforeTimestamp, pending, results);
+				collectToolResults(blocks, i + 1, timestamp, opts.beforeTimestamp, pending, results, permalinks, opts);
 			}
 		}
 
@@ -168,7 +183,17 @@ function collectToolUses(
 		// `notion-fetch`) live in the registry's `match.claude` rules.
 		const mcpDef = registry.match("claude", name);
 		if (mcpDef !== undefined) {
-			pending.set(b.id, { toolName: name, timestamp, def: mcpDef, normalize: identity, requireSuccess: false });
+			pending.set(b.id, {
+				toolName: name,
+				timestamp,
+				def: mcpDef,
+				normalize: identity,
+				requireSuccess: false,
+				// Only Slack's normalize needs the tool_use input (channel_id /
+				// message_ts); every other source's `normalize` is `identity` and
+				// never reads `toolInput`, so it's left undefined for them.
+				...(mcpDef.id === "slack" ? { toolInput: b.input } : {}),
+			});
 			continue;
 		}
 		// CLI/shell fallback (e.g. `Bash` running `gh issue view … --json`): the
@@ -195,6 +220,17 @@ function collectToolUses(
 	}
 }
 
+/** `{channel_id, message_ts}` off a Slack tool_use's `input`, or undefined if malformed. */
+function readSlackToolInput(input: unknown): { channelId: string; messageTs: string } | undefined {
+	/* v8 ignore start -- defensive: real `slack_read_thread` tool_use input always carries both string fields; guarded for totality against a malformed/future MCP shape. */
+	if (!isObject(input)) return undefined;
+	const channelId = (input as { channel_id?: unknown }).channel_id;
+	const messageTs = (input as { message_ts?: unknown }).message_ts;
+	if (typeof channelId !== "string" || typeof messageTs !== "string") return undefined;
+	/* v8 ignore stop */
+	return { channelId, messageTs };
+}
+
 function collectToolResults(
 	blocks: readonly unknown[],
 	lineNumber: number,
@@ -202,6 +238,8 @@ function collectToolResults(
 	beforeTimestamp: string | undefined,
 	pending: Map<string, PendingEntry>,
 	results: NormalizedToolResult[],
+	permalinks: Map<string, string>,
+	opts: ExtractOptions,
 ): void {
 	if (beforeTimestamp !== undefined && timestamp !== undefined && timestamp > beforeTimestamp) return;
 	for (const block of blocks) {
@@ -241,6 +279,43 @@ function collectToolResults(
 			pending.delete(b.tool_use_id);
 			continue;
 		}
+
+		// Slack needs both the payload AND out-of-payload context (channel_id /
+		// message_ts from the tool_use, url from the permalink map or config) that
+		// no other source's `normalize` (all `identity`) reads — handled as a
+		// distinct branch rather than folding into `pendingEntry.normalize` so
+		// that hook stays a pure `(payload, command) => payload` shape for every
+		// other source.
+		if (pendingEntry.def.id === "slack") {
+			const slackInput = readSlackToolInput(pendingEntry.toolInput);
+			/* v8 ignore start -- defensive: paired with a real slack_read_thread tool_use, input is always well-formed. */
+			if (slackInput === undefined) {
+				pending.delete(b.tool_use_id);
+				continue;
+			}
+			/* v8 ignore stop */
+			const { channelId, messageTs } = slackInput;
+			const url =
+				permalinks.get(`${channelId}:${messageTs}`) ??
+				(opts.slackWorkspaceUrl !== undefined
+					? `${opts.slackWorkspaceUrl}/archives/${channelId}/p${messageTs.replace(".", "")}`
+					: undefined);
+			const canonical = normalizeSlackThread(parsedPayload, { channelId, url });
+			if (canonical === null) {
+				pending.delete(b.tool_use_id);
+				continue;
+			}
+			results.push({
+				def: pendingEntry.def,
+				toolName: pendingEntry.toolName,
+				payload: canonical,
+				lineNumber,
+				referencedAt: timestamp ?? "",
+			});
+			pending.delete(b.tool_use_id);
+			continue;
+		}
+
 		results.push({
 			def: pendingEntry.def,
 			toolName: pendingEntry.toolName,

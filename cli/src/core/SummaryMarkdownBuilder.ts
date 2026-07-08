@@ -187,7 +187,8 @@ export function pushPlansAndNotesSection(
 	}
 
 	for (const e of referencesBySourceOrder(references)) {
-		lines.push(`- [${escMdLinkText(e.nativeId)} — ${escMdLinkText(e.title)}](${escMdUrl(e.url)})`);
+		const label = `${escMdLinkText(e.nativeId)} — ${escMdLinkText(e.title)}`;
+		lines.push(e.url ? `- [${label}](${escMdUrl(e.url)})` : `- ${label}`);
 	}
 }
 

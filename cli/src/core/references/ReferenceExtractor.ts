@@ -29,6 +29,7 @@
 import { readFile } from "node:fs/promises";
 import { createLogger } from "../../Logger.js";
 import type { Reference } from "../../Types.js";
+import { loadConfig } from "../SessionTracker.js";
 import { isObject } from "./guards.js";
 import type { SourceDefinition } from "./SourceDefinition.js";
 import * as SourceEngine from "./SourceEngine.js";
@@ -69,7 +70,22 @@ export async function extractReferencesFromTranscript(
 	/* v8 ignore stop */
 
 	const parser = getEnvelopeParser(opts.source);
-	const { results, lastLineNumberScanned } = parser.parse(lines, opts);
+	// Slack's normalize needs the workspace URL to reconstruct a permalink when
+	// none was pasted into the transcript. `parse()` is sync, so the one async
+	// config read happens here, once per call, and is threaded down via
+	// `ExtractOptions`. Tolerate a throw (e.g. an exotic mocked `readFile` in a
+	// caller's test) by falling back to undefined — never let a config-read
+	// failure abort reference extraction.
+	let slackWorkspaceUrl: string | undefined;
+	try {
+		slackWorkspaceUrl = (await loadConfig()).slack?.workspaceUrl;
+	} catch (err) {
+		log.debug("Failed to load config for Slack workspace URL: %s", (err as Error).message);
+	}
+	const { results, lastLineNumberScanned } = parser.parse(lines, {
+		...opts,
+		slackWorkspaceUrl: opts.slackWorkspaceUrl ?? slackWorkspaceUrl,
+	});
 
 	const collected: Reference[] = [];
 	for (const r of results) {

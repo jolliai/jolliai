@@ -176,6 +176,122 @@ describe("ConfigureCommand — settable keys", () => {
 		expect(help).toContain("globalInstructions");
 	});
 
+	describe("slack.workspaceUrl validation", () => {
+		it("accepts an https://<workspace>.slack.com URL and persists it nested under slack", async () => {
+			// Fallback source for the reference extractor's thread permalinks when
+			// the user never pasted one into the transcript (see Slack capture).
+			await runConfigure(["--set", "slack.workspaceUrl=https://flyer-q4r7867.slack.com"]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(
+				expect.objectContaining({ slack: { workspaceUrl: "https://flyer-q4r7867.slack.com" } }),
+			);
+			expect((await loadConfig()).slack?.workspaceUrl).toBe("https://flyer-q4r7867.slack.com");
+		});
+
+		it("normalizes a trailing-slash URL to its origin (no double slash on permalink reconstruction)", async () => {
+			await runConfigure(["--set", "slack.workspaceUrl=https://flyer-q4r7867.slack.com/"]);
+			expect((await loadConfig()).slack?.workspaceUrl).toBe("https://flyer-q4r7867.slack.com");
+		});
+
+		it("merges with an existing slack object instead of clobbering it", async () => {
+			mockLoadConfig.mockResolvedValue({ slack: { workspaceUrl: "https://old-team.slack.com" } });
+			await runConfigure(["--set", "slack.workspaceUrl=https://new-team.slack.com"]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(
+				expect.objectContaining({ slack: { workspaceUrl: "https://new-team.slack.com" } }),
+			);
+		});
+
+		it("rejects a non-slack.com host", async () => {
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prevExitCode = process.exitCode;
+			try {
+				await runConfigure(["--set", "slack.workspaceUrl=https://evil.example"]);
+				expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("slack.com"));
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prevExitCode;
+			}
+		});
+
+		it("rejects a non-https URL", async () => {
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prevExitCode = process.exitCode;
+			try {
+				await runConfigure(["--set", "slack.workspaceUrl=http://team.slack.com"]);
+				expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("slack.com"));
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prevExitCode;
+			}
+		});
+
+		it("lists slack.workspaceUrl in help/description output", async () => {
+			const help = await runConfigureHelp();
+			expect(help).toContain("slack.workspaceUrl");
+		});
+
+		it("rejects a malformed URL (not-a-url string)", async () => {
+			// Closes the untested `catch` branch in coerceConfigValue when
+			// `new URL(raw)` throws. Confirms the error is propagated and config
+			// is not persisted.
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prevExitCode = process.exitCode;
+			try {
+				await runConfigure(["--set", "slack.workspaceUrl=not-a-url"]);
+				expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("slack.com"));
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prevExitCode;
+			}
+		});
+
+		it("rejects a spoof host matching .slack.com suffix but with evil prefix", async () => {
+			// https://evilslack.com does not end with `.slack.com`, so the
+			// suffix-boundary host check in isAllowedSlackHost rejects it.
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prevExitCode = process.exitCode;
+			try {
+				await runConfigure(["--set", "slack.workspaceUrl=https://evilslack.com"]);
+				expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("slack.com"));
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prevExitCode;
+			}
+		});
+
+		it("rejects a URL with .slack.com in the domain but evil TLD", async () => {
+			// https://x.slack.com.evil.com has `.slack.com` in the name but ends
+			// with `.evil.com`, so the suffix boundary check rejects it.
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prevExitCode = process.exitCode;
+			try {
+				await runConfigure(["--set", "slack.workspaceUrl=https://x.slack.com.evil.com"]);
+				expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("slack.com"));
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prevExitCode;
+			}
+		});
+
+		it("removes slack.workspaceUrl via --remove", async () => {
+			// Set a valid workspace URL first, then remove it.
+			mockLoadConfig.mockResolvedValue({ slack: { workspaceUrl: "https://team.slack.com" } });
+			await runConfigure(["--remove", "slack.workspaceUrl"]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(
+				expect.objectContaining({ slack: { workspaceUrl: undefined } }),
+			);
+		});
+	});
+
 	describe("maxTokens validation (positive integer only)", () => {
 		async function expectMaxTokensRejected(value: string): Promise<void> {
 			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});

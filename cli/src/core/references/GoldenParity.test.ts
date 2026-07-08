@@ -23,6 +23,7 @@ import { githubDefinition } from "./sources/definitions/github.js";
 import { jiraDefinition } from "./sources/definitions/jira.js";
 import { linearDefinition } from "./sources/definitions/linear.js";
 import { notionDefinition } from "./sources/definitions/notion.js";
+import { slackDefinition } from "./sources/definitions/slack.js";
 
 const ts = "2026-05-27T00:00:00.000Z";
 const tsOld = "2026-01-01T00:00:00Z";
@@ -670,5 +671,110 @@ Body text from the page.</content>
 
 	it("renders an empty string for no refs", () => {
 		expect(renderBlock(notionDefinition, [])).toBe("");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slack
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("GoldenParity: slack", () => {
+	const tool = "mcp__claude_ai_Slack__slack_read_thread";
+
+	// The literal `=== THREAD PARENT MESSAGE ===` blob shape produced by the real
+	// `slack_read_thread` tool, already trimmed the way `normalizeSlackThread`
+	// trims it. The engine here only ever sees the POST-normalize canonical
+	// object below (channelId/parentTs/title/text/replyCount/url), never this
+	// raw blob — SlackNormalize.test.ts covers the raw-blob → canonical parse.
+	const THREAD_TEXT = `=== THREAD PARENT MESSAGE ===
+From: Flyer Li (U0BGFSM16DN)
+Time: 2026-07-07 16:46:24 CST
+Message TS: 1783413984.700009
+Consolidate the existing Linear / Jira / GitHub / Notion …
+
+=== THREAD REPLIES (2 total) ===
+
+--- Reply 1 of 2 ---
+From: Flyer Li (U0BGFSM16DN)
+Time: 2026-07-07 17:18:37 CST
+Message TS: 1783415917.422609
+Config-driven MCP integration
+
+--- Reply 2 of 2 ---
+From: Flyer Li (U0BGFSM16DN)
+Time: 2026-07-07 17:23:48 CST
+Message TS: 1783416228.715669
+How to do?`;
+
+	const CANON = {
+		channelId: "C0BFF9UHBD1",
+		parentTs: "1783413984.700009",
+		title: "Consolidate the existing Linear / Jira / GitHub / Notion …",
+		text: THREAD_TEXT,
+		replyCount: 2,
+		url: "https://flyer-q4r7867.slack.com/archives/C0BFF9UHBD1/p1783413984700009",
+	};
+	const GOLDEN_HAPPY_REF: Reference = {
+		mapKey: "slack:C0BFF9UHBD1-1783413984.700009",
+		source: "slack",
+		nativeId: "C0BFF9UHBD1-1783413984.700009",
+		title: "Consolidate the existing Linear / Jira / GitHub / Notion …",
+		url: "https://flyer-q4r7867.slack.com/archives/C0BFF9UHBD1/p1783413984700009",
+		fields: [
+			{ key: "entity-type", label: "Type", value: "thread", icon: "comment-discussion" },
+			{ key: "replies", label: "Replies", value: "2", icon: "reply" },
+			{ key: "channel", label: "Channel", value: "C0BFF9UHBD1", icon: "symbol-namespace" },
+		],
+		description: THREAD_TEXT,
+		toolName: tool,
+		referencedAt: ts,
+	};
+	const GOLDEN_HAPPY_XML = `<slack-threads>\n<thread id="C0BFF9UHBD1-1783413984.700009" entity-type="thread" replies="2" channel="C0BFF9UHBD1">\n  <title>Consolidate the existing Linear / Jira / GitHub / Notion …</title>\n  <url>https://flyer-q4r7867.slack.com/archives/C0BFF9UHBD1/p1783413984700009</url>\n  <messages>\n${THREAD_TEXT}\n  </messages>\n</thread>\n</slack-threads>`;
+
+	it("extracts and renders the real captured thread payload", () => {
+		const ref = extractRef(slackDefinition, CANON, tool, ts);
+		expect(ref).toEqual(GOLDEN_HAPPY_REF);
+		expect(renderBlock(slackDefinition, [ref as Reference])).toBe(GOLDEN_HAPPY_XML);
+	});
+
+	it("voids on a nativeId that doesn't match the channel-dash-ts shape", () => {
+		expect(extractRef(slackDefinition, { ...CANON, channelId: "not valid!" }, tool, ts)).toBeNull();
+	});
+
+	it("voids on missing title", () => {
+		expect(extractRef(slackDefinition, { ...CANON, title: "" }, tool, ts)).toBeNull();
+	});
+
+	it("captures a linkless thread (no url, no url field, no <url> line) when the canonical object has no url", () => {
+		const canonNoUrl = {
+			channelId: "C0BFF9UHBD1",
+			parentTs: "1783413984.700009",
+			title: "Consolidate the existing Linear / Jira / GitHub / Notion …",
+			text: THREAD_TEXT,
+			replyCount: 2,
+		};
+		const ref = extractRef(slackDefinition, canonNoUrl, tool, ts);
+		expect(ref).toEqual({
+			mapKey: "slack:C0BFF9UHBD1-1783413984.700009",
+			source: "slack",
+			nativeId: "C0BFF9UHBD1-1783413984.700009",
+			title: "Consolidate the existing Linear / Jira / GitHub / Notion …",
+			fields: [
+				{ key: "entity-type", label: "Type", value: "thread", icon: "comment-discussion" },
+				{ key: "replies", label: "Replies", value: "2", icon: "reply" },
+				{ key: "channel", label: "Channel", value: "C0BFF9UHBD1", icon: "symbol-namespace" },
+			],
+			description: THREAD_TEXT,
+			toolName: tool,
+			referencedAt: ts,
+		});
+		expect(ref?.url).toBeUndefined();
+		expect(renderBlock(slackDefinition, [ref as Reference])).toBe(
+			`<slack-threads>\n<thread id="C0BFF9UHBD1-1783413984.700009" entity-type="thread" replies="2" channel="C0BFF9UHBD1">\n  <title>Consolidate the existing Linear / Jira / GitHub / Notion …</title>\n  <messages>\n${THREAD_TEXT}\n  </messages>\n</thread>\n</slack-threads>`,
+		);
+	});
+
+	it("renders an empty string for no refs", () => {
+		expect(renderBlock(slackDefinition, [])).toBe("");
 	});
 });

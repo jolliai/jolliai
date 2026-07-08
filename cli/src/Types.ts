@@ -732,7 +732,7 @@ export interface NoteReference {
 export type SourceId = string;
 
 /** The four source ids that ship as built-in `SourceDefinition`s. Docs/reference only — not an exhaustive runtime set. */
-export type KnownSourceId = "linear" | "jira" | "github" | "notion";
+export type KnownSourceId = "linear" | "jira" | "github" | "notion" | "slack";
 
 /**
  * ReferenceField — one displayable field produced by a `SourceDefinition`'s `fields` pipes.
@@ -769,7 +769,8 @@ export interface Reference {
 	/** Stable id native to the source (Linear ticket id, Jira key, `owner/repo#number`, 32-hex Notion page id). */
 	readonly nativeId: string;
 	readonly title: string;
-	readonly url: string;
+	/** Absent only when the definition's `url` FieldSpec is marked `optional` and the payload has no url (e.g. Slack with no permalink and no configured workspace). */
+	readonly url?: string;
 	readonly description?: string;
 	/** Opaque, source-specific display fields. Built and consumed only by the adapter. */
 	readonly fields?: ReadonlyArray<ReferenceField>;
@@ -792,7 +793,8 @@ export interface ReferenceEntry {
 	readonly source: SourceId;
 	readonly nativeId: string;
 	readonly title: string;
-	readonly url: string;
+	/** Absent only when the source `Reference.url` was absent (e.g. Slack with no permalink). */
+	readonly url?: string;
 	/** Absolute path to `<jolliMemoryDir>/references/<source>/<sanitized-key>.md`. */
 	readonly sourcePath: string;
 	readonly addedAt: string;
@@ -815,7 +817,8 @@ export interface ReferenceCommitRef {
 	readonly source: SourceId;
 	readonly nativeId: string;
 	readonly title: string;
-	readonly url: string;
+	/** Absent only when the source `Reference.url` was absent (e.g. Slack with no permalink). */
+	readonly url?: string;
 	/** Opaque, source-specific display fields — snapshot of the Reference's `fields` at archive time. */
 	readonly fields?: ReadonlyArray<ReferenceField>;
 	readonly referencedAt: string;
@@ -1150,6 +1153,15 @@ export interface JolliMemoryConfig {
 	 * and skew the AI-source-mix view. Source names only (e.g. "codex"), no PII.
 	 */
 	readonly telemetrySeenSources?: ReadonlyArray<string>;
+	/**
+	 * Slack integration config. `workspaceUrl` (e.g. "https://my-team.slack.com")
+	 * lets the reference extractor reconstruct a thread permalink when the user
+	 * never pasted one into the transcript — the `slack_read_thread` MCP result
+	 * carries neither a url nor the workspace subdomain.
+	 */
+	readonly slack?: {
+		readonly workspaceUrl?: string;
+	};
 }
 
 /** Result of enable/disable operations */

@@ -4,7 +4,7 @@ import { CLAUDE_SHELL_TOOL_NAMES, CLAUDE_TOOL_PREFIXES } from "./index.js";
 describe("Claude producer binding", () => {
 	describe("CLAUDE_TOOL_PREFIXES", () => {
 		it("lists every vendor prefix for the envelope pre-filter (both Linear prefixes included)", () => {
-			// Order follows BUILTIN_DEFINITIONS (linear, jira, github, notion) —
+			// Order follows BUILTIN_DEFINITIONS (linear, jira, github, notion, slack) —
 			// derived from the SourceDefinitionRegistry. Order is not semantically
 			// significant here (the needles are only used via `.some()`), so this
 			// pins the registry-driven order for regression visibility rather than a
@@ -15,6 +15,7 @@ describe("Claude producer binding", () => {
 				"mcp__claude_ai_Atlassian__",
 				"mcp__github__",
 				"mcp__claude_ai_Notion__",
+				"mcp__claude_ai_Slack__",
 			]);
 		});
 	});
