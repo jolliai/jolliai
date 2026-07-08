@@ -149,6 +149,15 @@ describe("jolli backfill command", () => {
 		expect(vi.mocked(runBackfill)).not.toHaveBeenCalled();
 	});
 
+	it("--stream with no commits emits an empty report and does NOT exit non-zero", async () => {
+		vi.mocked(recentCommitHashes).mockResolvedValue([]);
+		await makeProgram().parseAsync(["backfill", "--stream"], { from: "user" });
+		expect(process.exitCode).toBeUndefined();
+		expect(vi.mocked(runBackfill)).not.toHaveBeenCalled();
+		const out = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
+		expect(JSON.parse(out)).toMatchObject({ type: "report", total: 0, generated: 0, skipped: 0, errors: 0 });
+	});
+
 	it("--hashes passes an explicit subset and skips recentCommitHashes", async () => {
 		vi.mocked(runBackfill).mockResolvedValue({ ...report, outcomes: [] });
 		await makeProgram().parseAsync(["backfill", "--hashes", " h1 , h2 ,,h3 "], { from: "user" });

@@ -154,6 +154,15 @@ export function registerBackfillCommand(program: Command): void {
 
 			const hashes = await resolveHashes(opts);
 			if (hashes.length === 0) {
+				// A machine consumer (`--stream`, e.g. the IntelliJ plugin) expects a terminal
+				// report even when there is nothing to do — a repo with no own-authored commits.
+				// Emit an empty report and exit 0 so the host renders "nothing to build" instead
+				// of a spurious "no report emitted (exit 1)". The human text path still errors.
+				if (opts.stream) {
+					const empty: BackfillReport = { total: 0, generated: 0, skipped: 0, errors: 0, outcomes: [] };
+					console.log(JSON.stringify({ type: "report", ...empty }));
+					return;
+				}
 				console.error("  No commits found to back-fill.");
 				process.exitCode = 1;
 				return;
