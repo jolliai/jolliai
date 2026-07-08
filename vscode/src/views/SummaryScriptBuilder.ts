@@ -1726,6 +1726,15 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
   if (msg.command === 'plansAndNotesUpdated' && typeof msg.html === 'string') {
     replaceSection('plansAndNotesSection', msg.html);
     bindPlansAndNotesSection();
+    // The visible "CONTEXT N" chip is #contextPanel's panel-header .sec-count,
+    // which sits OUTSIDE the just-replaced #plansAndNotesSection (that section's
+    // own header is CSS-hidden), so replaceSection can't update it — sync it here
+    // from the recomputed count the host sent alongside the html.
+    if (typeof msg.count === 'number') {
+      var ctxPanel = document.getElementById('contextPanel');
+      var ctxCount = ctxPanel ? ctxPanel.querySelector('.panel-header .sec-count') : null;
+      if (ctxCount) ctxCount.textContent = String(msg.count);
+    }
   }
 
   // ── Header Jolli row (published Plans & Notes link list) ──

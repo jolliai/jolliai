@@ -504,7 +504,7 @@ export function buildPropTable(
 	const shortHash = escHtml(summary.commitHash.substring(0, 8));
 
 	const convCount = transcriptHashSet?.size ?? 0;
-	const ctxCount = (summary.plans?.length ?? 0) + (summary.notes?.length ?? 0) + (summary.references?.length ?? 0);
+	const ctxCount = contextChipCount(summary);
 	// CommitSummary has no commit-level aggregated `filesAffected` (only
 	// per-topic TopicSummary.filesAffected exists — see Search.ts) — the
 	// diff-derived totalFiles (buildHtml's resolveDiffStats().filesChanged)
@@ -714,6 +714,17 @@ function buildE2ePanel(summary: CommitSummary): string {
 }
 
 /**
+ * The "CONTEXT N" chip count: plans + notes + references on the summary.
+ * Single source of truth for both the initial render (buildContextPanel) and
+ * the in-place `plansAndNotesUpdated` refresh (SummaryWebviewPanel.refreshPlansAndNotes),
+ * which must agree — the chip lives in #contextPanel's header, outside the
+ * #plansAndNotesSection HTML that the refresh replaces.
+ */
+export function contextChipCount(summary: CommitSummary): number {
+	return (summary.plans?.length ?? 0) + (summary.notes?.length ?? 0) + (summary.references?.length ?? 0);
+}
+
+/**
  * Builds the flat "Context" panel (plans + notes + references), replacing
  * the former collapsible-card "Attachments & context" panel. Per the mockup,
  * Context is a single flat `.panel` \u2014 no `.attach-card` wrappers \u2014 with a
@@ -750,8 +761,7 @@ export function buildContextPanel(
 		noteTranslateSet,
 		referenceTranslateSet,
 	);
-	const contextCount =
-		(summary.plans?.length ?? 0) + (summary.notes?.length ?? 0) + (summary.references?.length ?? 0);
+	const contextCount = contextChipCount(summary);
 	return `
 <div class="panel" id="contextPanel">
   <div class="panel-header">

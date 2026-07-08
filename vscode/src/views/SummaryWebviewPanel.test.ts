@@ -509,16 +509,23 @@ const {
 	mockBuildJolliRow: vi.fn().mockReturnValue("<div>jolliRow</div>"),
 }));
 
-vi.mock("./SummaryHtmlBuilder.js", () => ({
-	buildHtml: mockBuildHtml,
-	buildE2eTestSection: mockBuildE2eTestSection,
-	buildRecapSection: mockBuildRecapSection,
-	buildTopicsSection: mockBuildTopicsSection,
-	renderTopic: mockRenderTopic,
-	renderE2eScenario: mockRenderE2eScenario,
-	buildPlansAndNotesSection: mockBuildPlansAndNotesSection,
-	buildJolliRow: mockBuildJolliRow,
-}));
+vi.mock("./SummaryHtmlBuilder.js", async (importActual) => {
+	// contextChipCount is a pure helper with no side effects — use the real one
+	// so the "CONTEXT N" count assertion exercises the actual formula rather than
+	// a hand-copied stub that could silently drift from production.
+	const actual = await importActual<typeof import("./SummaryHtmlBuilder.js")>();
+	return {
+		buildHtml: mockBuildHtml,
+		buildE2eTestSection: mockBuildE2eTestSection,
+		buildRecapSection: mockBuildRecapSection,
+		buildTopicsSection: mockBuildTopicsSection,
+		renderTopic: mockRenderTopic,
+		renderE2eScenario: mockRenderE2eScenario,
+		buildPlansAndNotesSection: mockBuildPlansAndNotesSection,
+		buildJolliRow: mockBuildJolliRow,
+		contextChipCount: actual.contextChipCount,
+	};
+});
 
 const { mockBuildMarkdown, mockBuildPrMarkdown } = vi.hoisted(() => ({
 	mockBuildMarkdown: vi.fn().mockReturnValue("# Markdown Output"),
@@ -1465,6 +1472,37 @@ describe("SummaryWebviewPanel", () => {
 			expect(commands).toContain("jolliRowUpdated");
 			// references (3rd positional arg) forwarded, not dropped.
 			expect(mockBuildPlansAndNotesSection.mock.calls[0][2]).toEqual([reference]);
+		});
+
+		it("refreshPlansAndNotes carries the context count so the CONTEXT chip (outside #plansAndNotesSection) stays in sync", async () => {
+			// The visible "CONTEXT N" chip lives in #contextPanel's panel-header,
+			// which is NOT part of the #plansAndNotesSection HTML that plansAndNotesUpdated
+			// replaces — so the count must ride along the message to be re-applied.
+			const summary = makeSummary({
+				commitHash: "aaa",
+				plans: [{ slug: "plan-1", title: "p", status: "active", commitHash: "aaa" }],
+				notes: [{ id: "note-1", title: "n", format: "markdown", commitHash: "aaa" }],
+				references: [
+					{
+						source: "linear" as const,
+						archivedKey: "linear:ENG-1",
+						nativeId: "ENG-1",
+						title: "Ref",
+						url: "https://linear.app/x/ENG-1",
+						referencedAt: "2025-01-01T00:00:00Z",
+						sourceToolName: "Linear",
+					},
+				],
+			});
+			const instance = await getPanelInstance(summary);
+			postMessage.mockClear();
+
+			instance.refreshPlansAndNotes(summary);
+
+			const call = postMessage.mock.calls.find(
+				(c) => c[0].command === "plansAndNotesUpdated",
+			);
+			expect(call?.[0].count).toBe(3);
 		});
 
 		it("refreshTopicsSection threads readOnly=true on a foreign panel", async () => {
