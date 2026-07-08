@@ -434,6 +434,86 @@ describe("LlmClient", () => {
 			);
 		});
 
+		// A streaming MessageStream whose finalMessage() rejects with [err]; when
+		// [received] is provided it fires the `message` event (as message_stop would),
+		// simulating "response fully arrived, then the socket close raced the iterator".
+		const rejectingStream = (err: unknown, received?: unknown) => ({
+			finalMessage: vi.fn().mockRejectedValue(err),
+			on: vi.fn((event: string, cb: (m: unknown) => void) => {
+				if (event === "message" && received !== undefined) cb(received);
+			}),
+			abort: vi.fn(),
+		});
+		const streamedMessage = {
+			content: [{ type: "text", text: "recovered response" }],
+			model: "claude-sonnet-4-6",
+			usage: { input_tokens: 1000, output_tokens: 5000 },
+			stop_reason: "end_turn",
+		};
+
+		it("recovers the received message when finalMessage() premature-closes after message_stop (Node 24)", async () => {
+			// Node 24's async-iterator teardown rejects finalMessage() with a premature
+			// close even though the full response arrived. The call must succeed by
+			// recovering the message captured from the `message` event, not fail.
+			const err = Object.assign(new Error("Premature close"), { code: "ERR_STREAM_PREMATURE_CLOSE" });
+			mockStream.mockReturnValueOnce(rejectingStream(err, streamedMessage));
+
+			const result = await callLlm({
+				action: "translate",
+				params: { content: "x" },
+				apiKey: "sk-ant-test",
+				maxTokens: 8192,
+			});
+
+			expect(result.text).toBe("recovered response");
+			expect(result.outputTokens).toBe(5000);
+			expect(mockLogWarn).toHaveBeenCalledWith(
+				expect.stringContaining("premature-close after the response completed"),
+				expect.any(String),
+				"translate",
+			);
+		});
+
+		it("recognizes a premature close nested in error.cause and recovers", async () => {
+			const err = Object.assign(new Error("fetch failed"), { cause: { code: "ERR_STREAM_PREMATURE_CLOSE" } });
+			mockStream.mockReturnValueOnce(rejectingStream(err, streamedMessage));
+			const result = await callLlm({
+				action: "translate",
+				params: { content: "x" },
+				apiKey: "sk-ant-test",
+				maxTokens: 8192,
+			});
+			expect(result.text).toBe("recovered response");
+		});
+
+		it("recognizes a premature close by message text (no code) and recovers", async () => {
+			mockStream.mockReturnValueOnce(rejectingStream(new Error("terminated: Premature close"), streamedMessage));
+			const result = await callLlm({
+				action: "translate",
+				params: { content: "x" },
+				apiKey: "sk-ant-test",
+				maxTokens: 8192,
+			});
+			expect(result.text).toBe("recovered response");
+		});
+
+		it("does not recover a non-premature streaming error even if a message was received", async () => {
+			// A 500 is a real failure; recovering the partial message would mask it.
+			const err = Object.assign(new Error("500 server error"), { status: 500 });
+			mockStream.mockReturnValueOnce(rejectingStream(err, streamedMessage));
+			await expect(
+				callLlm({ action: "translate", params: { content: "x" }, apiKey: "sk-ant-test", maxTokens: 8192 }),
+			).rejects.toThrow("500 server error");
+		});
+
+		it("rethrows a premature close when no message was received (genuine truncation)", async () => {
+			const err = Object.assign(new Error("Premature close"), { code: "ERR_STREAM_PREMATURE_CLOSE" });
+			mockStream.mockReturnValueOnce(rejectingStream(err)); // no `message` event → nothing to recover
+			await expect(
+				callLlm({ action: "translate", params: { content: "x" }, apiKey: "sk-ant-test", maxTokens: 8192 }),
+			).rejects.toThrow(/premature close/i);
+		});
+
 		it("uses streaming when maxTokens exceeds the SDK's non-streaming guardrail", async () => {
 			// The Anthropic SDK refuses non-streaming requests whose estimated
 			// duration exceeds 10 minutes. The topic-KB `reconcile` action raises
