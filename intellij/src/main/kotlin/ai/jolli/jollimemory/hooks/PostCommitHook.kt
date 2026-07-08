@@ -281,7 +281,7 @@ object PostCommitHook {
             // sessions and is silently skipped at commit time. Mirrors the CLI worker
             // and the sidebar aggregator, which both discover Codex this way.
             if (config.codexEnabled != false && CodexSessionDiscoverer.isCodexInstalled()) {
-                allSessions.addAll(CodexSessionDiscoverer.discoverSessions())
+                allSessions.addAll(CodexSessionDiscoverer.discoverSessions(cwd))
             }
 
             // On-demand discovery: OpenCode (SQLite-backed, no hook)
