@@ -428,11 +428,16 @@ class SummaryPanel(
             .take(80)
             .ifBlank { "memory" }
         ApplicationManager.getApplication().invokeLater {
+            // 2-arg constructor + withExtensionFilter is the non-deprecated form (2025.1+);
+            // the vararg-extensions constructor is deprecated and flagged by the Marketplace
+            // verifier. withExtensionFilter mutates the descriptor in place and returns the
+            // FileChooserDescriptor base, so call it as a statement and keep `descriptor` typed
+            // as FileSaverDescriptor for createSaveFileDialog.
             val descriptor = com.intellij.openapi.fileChooser.FileSaverDescriptor(
                 "Save Memory As Markdown",
                 "Export this memory to a Markdown file.",
-                "md",
             )
+            descriptor.withExtensionFilter("Markdown", "md")
             val baseDir = project.basePath
                 ?.let { com.intellij.openapi.vfs.LocalFileSystem.getInstance().findFileByPath(it) }
             val wrapper = com.intellij.openapi.fileChooser.FileChooserFactory.getInstance()
