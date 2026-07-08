@@ -33,6 +33,31 @@ vi.mock("vscode", () => ({
 	Uri: { joinPath: (...parts: unknown[]) => parts.join("/") },
 }));
 
+const { assessMock, detectPlansMock, writeAiMock } = vi.hoisted(() => ({
+	assessMock: vi.fn(),
+	detectPlansMock: vi.fn(),
+	writeAiMock: vi.fn(),
+}));
+vi.mock("../../../cli/src/core/ContextRelevance.js", () => ({
+	assessContextRelevance: assessMock,
+	computeChangeFingerprint: () => "fp",
+}));
+vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
+	loadConfig: vi.fn().mockResolvedValue({}),
+	detectActivePlansForBranch: detectPlansMock,
+	detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
+	getReferenceEntriesForBranch: vi.fn().mockResolvedValue([]),
+}));
+vi.mock("../../../cli/src/core/CommitSelectionStore.js", () => ({
+	readExclusions: vi.fn().mockResolvedValue({
+		conversations: new Set(),
+		plans: new Set(),
+		notes: new Set(),
+		references: new Set(),
+	}),
+	writeAiSelection: writeAiMock,
+}));
+
 import { NextMemoryPreviewPanel } from "./NextMemoryPreviewPanel.js";
 
 function makeSidebarProvider(overrides: Record<string, unknown> = {}) {
@@ -79,6 +104,10 @@ afterEach(() => {
 	last?.onDispose?.();
 	createWebviewPanel.mockClear();
 	postMessage.mockClear();
+	// The relevance cache is module-scoped, so it survives across tests; clear it so
+	// one test's ranking can't be replayed as another's (the mocked fingerprint is a
+	// constant, so keys would otherwise collide).
+	NextMemoryPreviewPanel.invalidateRelevanceCache();
 });
 
 describe("NextMemoryPreviewPanel.show", () => {
@@ -392,5 +421,112 @@ describe("NextMemoryPreviewPanel.show", () => {
 		const toggle = { type: "branch:togglePlanSelection", planId: "p1", selected: false };
 		panelInstance.webview.messageHandler(toggle);
 		expect(sidebarProvider.handleOutbound).toHaveBeenCalledWith(toggle);
+	});
+});
+
+describe("NextMemoryPreviewPanel — context relevance overlay", () => {
+	it("ranks against selected files, persists the result, and posts context:relevance", async () => {
+		postMessage.mockClear();
+		detectPlansMock.mockResolvedValue([{ slug: "p1", title: "P1" }]);
+		assessMock.mockResolvedValue({
+			plans: [],
+			notes: [],
+			references: [],
+			excludedContext: [{ kind: "plan", key: "p1", title: "P1", reason: "unrelated" }],
+			results: [
+				{ id: "p1", kind: "plan", relevant: false, score: 0.1, tier: "low", reason: "unrelated", rank: 1, autoExclude: true },
+			],
+		});
+		const sidebar = makeSidebarProvider({
+			getFilesSnapshot: vi.fn().mockReturnValue([{ id: "f1", description: "src/a.ts", isSelected: true }]),
+		});
+		await openAndReady(makeBridge(), sidebar);
+		await vi.waitFor(() =>
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					type: "context:relevance",
+					items: [expect.objectContaining({ id: "p1", tier: "low", autoExclude: true })],
+				}),
+			),
+		);
+		expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "context:analyzing", analyzing: true }));
+		// Persisted for the post-commit worker to reuse.
+		expect(writeAiMock).toHaveBeenCalled();
+	});
+
+	it("posts an empty context:relevance (no LLM) when no files are selected", async () => {
+		postMessage.mockClear();
+		assessMock.mockClear();
+		await openAndReady(makeBridge(), makeSidebarProvider());
+		await vi.waitFor(() => expect(postMessage).toHaveBeenCalledWith({ type: "context:relevance", items: [] }));
+		expect(assessMock).not.toHaveBeenCalled();
+	});
+
+	it("reuses the cached ranking on reopen (same files + items) — no second LLM call", async () => {
+		postMessage.mockClear();
+		assessMock.mockClear();
+		detectPlansMock.mockResolvedValue([{ slug: "p1", title: "P1" }]);
+		assessMock.mockResolvedValue({
+			plans: [],
+			notes: [],
+			references: [],
+			excludedContext: [],
+			results: [{ id: "p1", kind: "plan", relevant: true, score: 0.9, tier: "high", reason: "related", rank: 1, autoExclude: false }],
+		});
+		const sidebar = makeSidebarProvider({
+			getFilesSnapshot: vi.fn().mockReturnValue([{ id: "f1", description: "src/a.ts", isSelected: true }]),
+		});
+		await openAndReady(makeBridge(), sidebar);
+		await vi.waitFor(() => expect(assessMock).toHaveBeenCalledTimes(1));
+		// Reopen the panel (existed branch → refreshPreview → pushContextRelevance) with
+		// the SAME files + items: the ranking is served from cache — no second LLM call,
+		// no "Analyzing…" flash.
+		assessMock.mockClear();
+		postMessage.mockClear();
+		await NextMemoryPreviewPanel.show("file:///ext" as never, "/repo", makeBridge() as never, sidebar as never);
+		await vi.waitFor(() =>
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					type: "context:relevance",
+					items: [expect.objectContaining({ id: "p1", tier: "high" })],
+				}),
+			),
+		);
+		expect(assessMock).not.toHaveBeenCalled();
+		expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "context:analyzing", analyzing: true }));
+	});
+
+	it("dismiss updates the cached ranking in place — reopen keeps it dismissed, no re-rank", async () => {
+		postMessage.mockClear();
+		assessMock.mockClear();
+		detectPlansMock.mockResolvedValue([{ slug: "p1", title: "P1" }]);
+		assessMock.mockResolvedValue({
+			plans: [],
+			notes: [],
+			references: [],
+			excludedContext: [{ kind: "plan", key: "p1", title: "P1", reason: "unrelated" }],
+			results: [{ id: "p1", kind: "plan", relevant: false, score: 0.1, tier: "low", reason: "unrelated", rank: 1, autoExclude: true }],
+		});
+		const sidebar = makeSidebarProvider({
+			getFilesSnapshot: vi.fn().mockReturnValue([{ id: "f1", description: "src/a.ts", isSelected: true }]),
+		});
+		await openAndReady(makeBridge(), sidebar);
+		await vi.waitFor(() => expect(assessMock).toHaveBeenCalledTimes(1));
+		// User dismisses p1: the cache is updated IN PLACE (not invalidated), so reopening
+		// hits the cache — no re-rank / "Analyzing…" — and p1 comes back non-excluded.
+		NextMemoryPreviewPanel.dismissInRelevanceCache("p1");
+		assessMock.mockClear();
+		postMessage.mockClear();
+		await NextMemoryPreviewPanel.show("file:///ext" as never, "/repo", makeBridge() as never, sidebar as never);
+		await vi.waitFor(() =>
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					type: "context:relevance",
+					items: [expect.objectContaining({ id: "p1", autoExclude: false })],
+				}),
+			),
+		);
+		expect(assessMock).not.toHaveBeenCalled();
+		expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "context:analyzing", analyzing: true }));
 	});
 });

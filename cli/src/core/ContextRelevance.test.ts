@@ -1,0 +1,445 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { LlmConfig } from "../Types.js";
+import type { LlmCallResult } from "./LlmClient.js";
+
+vi.mock("./LlmClient.js", () => ({ callLlm: vi.fn() }));
+vi.mock("./GitOps.js", () => ({ execGit: vi.fn(), getDiffContent: vi.fn() }));
+vi.mock("node:fs/promises", () => ({ readFile: vi.fn() }));
+
+import { readFile } from "node:fs/promises";
+import {
+	assessContextRelevance,
+	buildChangeBlock,
+	buildChangeSignal,
+	buildDecisionFromAiExcluded,
+	buildItemsBlock,
+	type ContextItem,
+	computeChangeFingerprint,
+	extractCandidateRepr,
+	extractSymbols,
+	parseRankContextResponse,
+	rankContextRelevance,
+	stripFrontmatter,
+} from "./ContextRelevance.js";
+import { execGit, getDiffContent } from "./GitOps.js";
+import { callLlm } from "./LlmClient.js";
+
+const mockCallLlm = vi.mocked(callLlm);
+const mockExecGit = vi.mocked(execGit);
+const mockGetDiff = vi.mocked(getDiffContent);
+const mockReadFile = vi.mocked(readFile);
+
+const config = { apiKey: "sk-ant-test" } as LlmConfig;
+
+function llmText(text: string): LlmCallResult {
+	return {
+		text,
+		inputTokens: 0,
+		outputTokens: 0,
+		cachedTokens: 0,
+		apiLatencyMs: 0,
+		source: "direct",
+	} as unknown as LlmCallResult;
+}
+
+function item(kind: ContextItem["kind"], id: string, title: string, content: string): ContextItem {
+	return { kind, id, title, content };
+}
+
+beforeEach(() => {
+	vi.clearAllMocks();
+});
+
+describe("stripFrontmatter", () => {
+	it("removes a leading YAML frontmatter block", () => {
+		expect(stripFrontmatter('---\ntitle: "x"\n---\nBody here')).toBe("Body here");
+	});
+	it("leaves content without frontmatter untouched", () => {
+		expect(stripFrontmatter("No frontmatter\nline two")).toBe("No frontmatter\nline two");
+	});
+});
+
+describe("extractSymbols", () => {
+	it("extracts declared symbols from added lines only, deduped", () => {
+		const diff = [
+			"+++ b/x.ts",
+			"+export function doThing() {}",
+			"-function removed() {}",
+			" const ctx = 1;",
+			"+class Foo {}",
+			"+function doThing() {}",
+		].join("\n");
+		expect(extractSymbols(diff)).toEqual(["doThing", "Foo"]);
+	});
+	it("respects the max cap", () => {
+		const diff = Array.from({ length: 10 }, (_, i) => `+const v${i} = ${i};`).join("\n");
+		expect(extractSymbols(diff, 3)).toHaveLength(3);
+	});
+});
+
+describe("extractCandidateRepr", () => {
+	it("returns small plan/note content whole", () => {
+		const repr = extractCandidateRepr(item("note", "n1", "Note", "short body"));
+		expect(repr).toBe("short body");
+	});
+	it("strips frontmatter for references", () => {
+		const ref = item("reference", "linear:X-1", "X-1", '---\nsource: "linear"\n---\n## Problem\nfoo');
+		expect(extractCandidateRepr(ref)).toBe("## Problem\nfoo");
+	});
+	it("skeletonizes large documents with meta/title/sections/files, fence-aware", () => {
+		const big = [
+			"Intro paragraph describing the plan goal.",
+			"",
+			"## Section One",
+			"First sentence of one. More text.",
+			"```ts",
+			"## not-a-heading-inside-fence",
+			"const inFence = require('./ignored.ts');",
+			"```",
+			"## Section Two",
+			"Touches src/core/Real.ts here.",
+			"x".repeat(7000),
+		].join("\n");
+		const repr = extractCandidateRepr(item("plan", "p1", "Big Plan", big));
+		expect(repr).toContain("mechanical skeleton");
+		expect(repr).toContain("Title: Big Plan");
+		expect(repr).toContain("Section One");
+		expect(repr).toContain("Section Two");
+		// fence contents excluded from headings and file paths
+		expect(repr).not.toContain("not-a-heading-inside-fence");
+		expect(repr).not.toContain("ignored.ts");
+		expect(repr).toContain("src/core/Real.ts");
+	});
+});
+
+describe("buildItemsBlock", () => {
+	it("assigns 1-based index and maps back to ids", () => {
+		const { block, indexToId, dropped } = buildItemsBlock([
+			item("plan", "p1", "A", "aa"),
+			item("note", "n1", "B", "bb"),
+		]);
+		expect(block).toContain("[1] (plan) A");
+		expect(block).toContain("[2] (note) B");
+		expect(indexToId.get(1)).toBe("p1");
+		expect(indexToId.get(2)).toBe("n1");
+		expect(dropped).toBe(0);
+	});
+	it("drops tail items beyond the total budget", () => {
+		const items = [item("note", "n1", "First", "x".repeat(50)), item("note", "n2", "Second", "y".repeat(50))];
+		const { indexToId, dropped } = buildItemsBlock(items, 60);
+		expect(indexToId.size).toBe(1);
+		expect(dropped).toBe(1);
+	});
+});
+
+describe("buildChangeBlock", () => {
+	it("renders message, files, and symbols", () => {
+		const block = buildChangeBlock({ commitMessage: "Fix X", changedFiles: ["a/b.ts"], symbols: ["doThing"] });
+		expect(block).toContain("Commit message: Fix X");
+		expect(block).toContain("a/b.ts");
+		expect(block).toContain("doThing");
+	});
+	it("handles empty message/files/symbols", () => {
+		expect(buildChangeBlock({ commitMessage: "", changedFiles: [], symbols: [] })).toBe("Commit message: (none)");
+	});
+});
+
+describe("parseRankContextResponse", () => {
+	it("parses well-formed item blocks", () => {
+		const text = [
+			"===ITEM===",
+			"index: 1",
+			"relevant: yes",
+			"score: 0.9",
+			"reason: overlaps graph",
+			"===ITEM===",
+			"index: 2",
+			"relevant: no",
+			"score: 0.1",
+			"reason: unrelated",
+		].join("\n");
+		const parsed = parseRankContextResponse(text);
+		expect(parsed).toEqual([
+			{ index: 1, relevant: true, score: 0.9, reason: "overlaps graph" },
+			{ index: 2, relevant: false, score: 0.1, reason: "unrelated" },
+		]);
+	});
+	it("skips blocks with no parseable index and defaults missing fields", () => {
+		const text = ["===ITEM===", "relevant: yes", "===ITEM===", "index: 3"].join("\n");
+		const parsed = parseRankContextResponse(text);
+		expect(parsed).toEqual([{ index: 3, relevant: true, score: 0.7, reason: "" }]);
+	});
+	it("clamps out-of-range scores", () => {
+		const parsed = parseRankContextResponse(
+			["===ITEM===", "index: 1", "relevant: yes", "score: 5", "reason: x"].join("\n"),
+		);
+		expect(parsed[0].score).toBe(1);
+	});
+});
+
+describe("rankContextRelevance", () => {
+	it("returns [] for no items", async () => {
+		expect(
+			await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, [], { config }),
+		).toEqual([]);
+	});
+
+	it("ranks by score desc with tier and autoExclude", async () => {
+		mockCallLlm.mockResolvedValue(
+			llmText(
+				[
+					"===ITEM===",
+					"index: 1",
+					"relevant: no",
+					"score: 0.1",
+					"reason: unrelated",
+					"===ITEM===",
+					"index: 2",
+					"relevant: yes",
+					"score: 0.95",
+					"reason: direct hit",
+				].join("\n"),
+			),
+		);
+		const items = [item("plan", "p1", "Low", "aa"), item("note", "n1", "High", "bb")];
+		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
+			config,
+		});
+		expect(res[0]).toMatchObject({ id: "n1", rank: 1, tier: "high", relevant: true });
+		expect(res[1]).toMatchObject({ id: "p1", rank: 2, tier: "low", autoExclude: true });
+	});
+
+	it("conservatively keeps items the LLM omitted", async () => {
+		mockCallLlm.mockResolvedValue(
+			llmText(["===ITEM===", "index: 1", "relevant: yes", "score: 0.8", "reason: x"].join("\n")),
+		);
+		const items = [item("plan", "p1", "Has", "aa"), item("note", "n1", "Omitted", "bb")];
+		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
+			config,
+		});
+		const omitted = res.find((r) => r.id === "n1");
+		expect(omitted?.relevant).toBe(true);
+		expect(omitted?.autoExclude).toBe(false);
+	});
+
+	it("fails open (keeps all) when the LLM call throws", async () => {
+		mockCallLlm.mockRejectedValue(new Error("boom"));
+		const items = [item("plan", "p1", "A", "aa"), item("note", "n1", "B", "bb")];
+		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
+			config,
+		});
+		expect(res).toHaveLength(2);
+		expect(res.every((r) => r.relevant && !r.autoExclude)).toBe(true);
+		expect(res.map((r) => r.id)).toEqual(["p1", "n1"]);
+	});
+});
+
+describe("buildChangeSignal", () => {
+	it("collects changed files and symbols", async () => {
+		mockExecGit.mockResolvedValue({ stdout: "cli/src/a.ts\ncli/src/b.ts", stderr: "", exitCode: 0 });
+		mockGetDiff.mockResolvedValue("+export function newFn() {}");
+		const sig = await buildChangeSignal("Fix a", "HEAD~1", "HEAD", "/repo");
+		expect(sig.changedFiles).toEqual(["cli/src/a.ts", "cli/src/b.ts"]);
+		expect(sig.symbols).toContain("newFn");
+		expect(sig.commitMessage).toBe("Fix a");
+	});
+	it("leaves fields empty when git fails", async () => {
+		mockExecGit.mockResolvedValue({ stdout: "", stderr: "bad", exitCode: 1 });
+		mockGetDiff.mockRejectedValue(new Error("no diff"));
+		const sig = await buildChangeSignal("m", "a", "b", "/repo");
+		expect(sig.changedFiles).toEqual([]);
+		expect(sig.symbols).toEqual([]);
+	});
+});
+
+describe("review-fix regressions", () => {
+	it("treats No. / nope / not relevant / none as not relevant", () => {
+		for (const v of ["No.", "nope", "not relevant", "none", "false"]) {
+			const p = parseRankContextResponse(
+				["===ITEM===", "index: 1", `relevant: ${v}`, "score: 0.4", "reason: r"].join("\n"),
+			);
+			expect(p[0].relevant).toBe(false);
+		}
+	});
+
+	it("assigns tiers by rank position, not absolute score", async () => {
+		mockCallLlm.mockResolvedValue(
+			llmText(
+				[
+					"===ITEM===",
+					"index: 1",
+					"relevant: yes",
+					"score: 0.9",
+					"reason: a",
+					"===ITEM===",
+					"index: 2",
+					"relevant: yes",
+					"score: 0.8",
+					"reason: b",
+					"===ITEM===",
+					"index: 3",
+					"relevant: no",
+					"score: 0.7",
+					"reason: c",
+				].join("\n"),
+			),
+		);
+		const items = [
+			item("plan", "p1", "A", "x"),
+			item("note", "n1", "B", "y"),
+			item("reference", "linear:R", "C", "z"),
+		];
+		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
+			config,
+		});
+		expect(res.map((r) => r.tier)).toEqual(["high", "mid", "low"]);
+		// bottom-rank + not relevant → autoExclude; higher ranks never auto-excluded
+		expect(res[2].autoExclude).toBe(true);
+		expect(res[0].autoExclude).toBe(false);
+	});
+
+	it("captures the lead paragraph as Overview even when a title is present", () => {
+		const big = ["Lead prose about the goal.", "", "## S1", "body", "z".repeat(7000)].join("\n");
+		const repr = extractCandidateRepr(item("note", "n1", "Titled Note", big));
+		expect(repr).toContain("Overview: Lead prose about the goal.");
+	});
+
+	it("does not close a ``` fence on a ~~~ line inside it", () => {
+		const big = [
+			"## Real",
+			"text.",
+			"```",
+			"~~~",
+			"## fake-in-fence",
+			"```",
+			"## After",
+			`more. ${"q".repeat(7000)}`,
+		].join("\n");
+		const repr = extractCandidateRepr(item("plan", "p1", "P", big));
+		expect(repr).not.toContain("fake-in-fence");
+		expect(repr).toContain("After");
+	});
+
+	it("skeletonizes a large reference no larger than the reference whole-cap", () => {
+		const big = `---\nsource: linear\n---\n## H\n${"z".repeat(8000)}`;
+		const repr = extractCandidateRepr(item("reference", "linear:R", "R", big));
+		expect(repr.length).toBeLessThanOrEqual(4000 + 16);
+	});
+	it("defaults score to 0.2 for a not-relevant item without a score", () => {
+		const p = parseRankContextResponse(["===ITEM===", "index: 1", "relevant: no", "reason: x"].join("\n"));
+		expect(p[0].score).toBe(0.2);
+	});
+});
+
+describe("assessContextRelevance", () => {
+	function planEntry(slug: string, title: string) {
+		return { slug, title, sourcePath: `/x/${slug}.md`, addedAt: "", updatedAt: "", commitHash: null } as never;
+	}
+	const twoPlans = () => ({ plans: [planEntry("p1", "P1"), planEntry("p2", "P2")], notes: [], references: [] });
+	const rankTwo = () =>
+		llmText(
+			[
+				"===ITEM===",
+				"index: 1",
+				"relevant: yes",
+				"score: 0.9",
+				"reason: hit",
+				"===ITEM===",
+				"index: 2",
+				"relevant: no",
+				"score: 0.1",
+				"reason: unrelated",
+			].join("\n"),
+		);
+	beforeEach(() => {
+		mockReadFile.mockResolvedValue("some content");
+	});
+
+	it("soft-excludes the bottom-ranked not-relevant item into excludedContext", async () => {
+		mockCallLlm.mockResolvedValue(rankTwo());
+		const decision = await assessContextRelevance(
+			twoPlans(),
+			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [] },
+			config,
+		);
+		expect(decision.plans.map((p) => p.slug)).toEqual(["p1"]);
+		expect(decision.excludedContext).toEqual([
+			{ kind: "plan", key: "p2", title: "P2", reason: "unrelated", tier: "low" },
+		]);
+	});
+
+	it("falls back to title content when the source file is unreadable", async () => {
+		mockReadFile.mockRejectedValue(new Error("ENOENT"));
+		mockCallLlm.mockResolvedValue(
+			llmText(["===ITEM===", "index: 1", "relevant: yes", "score: 0.8", "reason: x"].join("\n")),
+		);
+		const decision = await assessContextRelevance(
+			{ plans: [planEntry("p1", "P1")], notes: [], references: [] },
+			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [] },
+			config,
+		);
+		expect(decision.plans).toHaveLength(1);
+	});
+
+	it("returns raw entries and empty results when there are no items", async () => {
+		const decision = await assessContextRelevance(
+			{ plans: [], notes: [], references: [] },
+			{ commitMessage: "m", changedFiles: [], symbols: [] },
+			config,
+		);
+		expect(decision.results).toEqual([]);
+		expect(decision.excludedContext).toEqual([]);
+	});
+});
+
+describe("computeChangeFingerprint", () => {
+	it("is stable regardless of changed-file order", () => {
+		expect(computeChangeFingerprint({ commitMessage: "m", changedFiles: ["a.ts", "b.ts"], symbols: [] })).toBe(
+			computeChangeFingerprint({ commitMessage: "m", changedFiles: ["b.ts", "a.ts"], symbols: [] }),
+		);
+	});
+	it("ignores the commit message (panel has none pre-commit) and keys only on files", () => {
+		// Same files, different message → same fingerprint (so panel↔worker match).
+		expect(computeChangeFingerprint({ commitMessage: "m1", changedFiles: ["a.ts"], symbols: [] })).toBe(
+			computeChangeFingerprint({ commitMessage: "m2", changedFiles: ["a.ts"], symbols: [] }),
+		);
+		// Different files → different fingerprint.
+		expect(computeChangeFingerprint({ commitMessage: "m", changedFiles: ["a.ts"], symbols: [] })).not.toBe(
+			computeChangeFingerprint({ commitMessage: "m", changedFiles: ["b.ts"], symbols: [] }),
+		);
+	});
+});
+
+describe("buildDecisionFromAiExcluded (worker reuse of the panel ranking)", () => {
+	const pe = (slug: string, title: string) =>
+		({ slug, title, sourcePath: "", addedAt: "", updatedAt: "", commitHash: null }) as never;
+
+	it("excludes the AI-suggested keys and keeps the rest in registry order", () => {
+		const raw = { plans: [pe("p1", "P1"), pe("p2", "P2")], notes: [], references: [] };
+		const decision = buildDecisionFromAiExcluded(raw, [{ kind: "plans", key: "p2", reason: "unrelated" }]);
+		expect(decision.plans.map((p) => p.slug)).toEqual(["p1"]);
+		expect(decision.excludedContext).toEqual([{ kind: "plan", key: "p2", title: "P2", reason: "unrelated" }]);
+		expect(decision.results).toEqual([]);
+	});
+
+	it("prefixes a reference's excludedContext title with the nativeId (matches the sidebar label)", () => {
+		const ref = {
+			source: "linear",
+			nativeId: "JOLLI-776",
+			title: "JolliMemory: array-based",
+			sourcePath: "",
+		} as never;
+		const raw = { plans: [], notes: [], references: [ref] };
+		const decision = buildDecisionFromAiExcluded(raw, [
+			{ kind: "references", key: "linear:JOLLI-776", reason: "unrelated" },
+		]);
+		expect(decision.excludedContext).toEqual([
+			{
+				kind: "reference",
+				key: "linear:JOLLI-776",
+				title: "JOLLI-776 — JolliMemory: array-based",
+				reason: "unrelated",
+			},
+		]);
+	});
+});

@@ -2,7 +2,15 @@ import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSessionAggregator.js";
 import { sumConversationTokens } from "../../../cli/src/core/ConversationTokenTotals.js";
+import { assessContextRelevance, computeChangeFingerprint } from "../../../cli/src/core/ContextRelevance.js";
+import { type AiExclusion, readExclusions, writeAiSelection } from "../../../cli/src/core/CommitSelectionStore.js";
 import { getWorkingTreeDiffStats } from "../../../cli/src/core/GitOps.js";
+import {
+	detectActiveNotesForBranch,
+	detectActivePlansForBranch,
+	getReferenceEntriesForBranch,
+	loadConfig,
+} from "../../../cli/src/core/SessionTracker.js";
 import { findTicketInContext } from "../util/CommitMessageUtils.js";
 import { buildNextMemoryHtml } from "./NextMemoryHtmlBuilder.js";
 import type { SerializedTreeItem } from "./SidebarMessages.js";
@@ -32,6 +40,28 @@ let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 const pendingSections = new Set<PreviewSection>();
 const REFRESH_DEBOUNCE_MS = 400;
 
+// Memoized context-relevance ranking, keyed by the file fingerprint + the candidate
+// item set. Reopening the panel or switching editor tabs re-invokes
+// pushContextRelevance; when neither the selected files nor the candidate items
+// changed, reuse this instead of calling the LLM again. Module-scoped (the panel is a
+// singleton). A Keep/userInclude override changes neither key, so applyContextInclude
+// invalidates this explicitly (invalidateRelevanceCache). Cleared on window reload
+// (fresh module state) — the first open per session re-ranks, which is acceptable.
+interface ContextRelevancePreviewItem {
+	readonly id: string;
+	readonly tier?: "high" | "mid" | "low";
+	readonly reason?: string;
+	readonly autoExclude: boolean;
+}
+let relevanceCache: { readonly key: string; readonly items: ContextRelevancePreviewItem[] } | undefined;
+
+// Monotonic generation for pushContextRelevance. Several refreshes can be in flight
+// (ready / re-show call refreshPreview directly; file toggles debounce) and the LLM
+// rank can take up to RANK_TIMEOUT_MS. Each call claims a gen and only writes the
+// cache / posts / persists if it is still the latest — so a slow earlier call can't
+// clobber a faster later one (turns last-writer-by-completion into by-start-order).
+let relevanceGen = 0;
+
 // CSP nonce: crypto-random, matching every other webview panel in the extension
 // (see SummaryWebviewPanel / SidebarWebviewProvider / SettingsWebviewPanel …).
 // A predictable (Math.random) nonce would weaken the injection guarantee the
@@ -44,7 +74,7 @@ function makeNonce(): string {
 // invalidates the ones it actually feeds, so each message maps to the minimal
 // set to recompute — recomputing more wastes work (an LLM title call) or shows
 // stale data (a ticket that never refreshes).
-type PreviewSection = "title" | "diffstat" | "tokens" | "ticket";
+type PreviewSection = "title" | "diffstat" | "tokens" | "ticket" | "context";
 
 // Which preview sections a selection message invalidates. Returns [] for
 // messages that change nothing derived (plan/note toggles: the ticket comes from
@@ -52,8 +82,9 @@ type PreviewSection = "title" | "diffstat" | "tokens" | "ticket";
 function sectionsForMessage(m: { type?: string }): ReadonlyArray<PreviewSection> {
 	switch (m?.type) {
 		case "branch:toggleFileSelection":
-			// Files are the LLM title's input and the diffstat's source.
-			return ["title", "diffstat"];
+			// Files feed the LLM title, the diffstat, and the change signal the
+			// context-relevance ranker scores each CONTEXT item against.
+			return ["title", "diffstat", "context"];
 		case "branch:toggleConversationSelection":
 			// Conversations only feed the token meter. They are NOT a title input,
 			// so regenerating the title here would re-run a non-deterministic LLM
@@ -90,7 +121,14 @@ export class NextMemoryPreviewPanel {
 				"jollimemory.nextMemoryPreview",
 				"Working Memory",
 				vscode.ViewColumn.Active,
-				{ enableScripts: true },
+				// retainContextWhenHidden keeps the webview (its DOM + script state — the
+				// relevance overlay and any optimistic dismiss) alive when the user
+				// switches to another editor tab. Without it VS Code destroys the hidden
+				// webview and rebuilds it on return, which re-fires `ready` → re-ranks
+				// (the "Analyzing…" flash) and drops the user's dismisses. This panel is
+				// user-opened and frequently tab-switched, so the retained-memory cost is
+				// worth it; the memoized relevanceCache still covers true re-opens.
+				{ enableScripts: true, retainContextWhenHidden: true },
 			);
 			const codiconCssUri = panel.webview.asWebviewUri(
 				vscode.Uri.joinPath(extensionUri, "assets", "codicons", "codicon.css"),
@@ -206,7 +244,7 @@ export class NextMemoryPreviewPanel {
 			workspaceRoot,
 			bridge,
 			sidebarProvider,
-			new Set(["title", "diffstat", "tokens"]),
+			new Set(["title", "diffstat", "tokens", "context"]),
 		);
 	}
 
@@ -246,6 +284,9 @@ export class NextMemoryPreviewPanel {
 		}
 		if (sections.has("ticket")) {
 			tasks.push(NextMemoryPreviewPanel.pushTicket(webview, sidebarProvider));
+		}
+		if (sections.has("context")) {
+			tasks.push(NextMemoryPreviewPanel.pushContextRelevance(webview, workspaceRoot, bridge, sidebarProvider));
 		}
 		await Promise.allSettled(tasks);
 	}
@@ -326,5 +367,140 @@ export class NextMemoryPreviewPanel {
 			conversations.filter((c) => c.isSelected).map((c) => ({ source: c.source, transcriptPath: c.transcriptPath })),
 		);
 		void webview.postMessage({ type: "preview:tokenStats", ...totals });
+	}
+
+	/**
+	 * Ranks the current CONTEXT items' relevance to the selected-file change set and
+	 * pushes per-item {tier, reason, autoExclude} for the inline AI notes + tier dots.
+	 * Best-effort: rankContextRelevance is fail-open, and any setup failure (config
+	 * load etc.) posts an empty result so the panel simply shows no overlay. Snapshot
+	 * rows carry no body, so this preview scores on titles + the changed-file signal;
+	 * the authoritative scoring runs post-commit in the QueueWorker with full content.
+	 */
+	/**
+	 * Ranks CONTEXT relevance against the selected-file change set and pushes per-item
+	 * {tier, reason, autoExclude} for the overlay. AUTHORITATIVE: it reads full registry
+	 * content (like the QueueWorker) and PERSISTS the result (aiSuggestedExclude + a
+	 * file-based change fingerprint) so the post-commit worker reuses it verbatim when
+	 * the fingerprint matches — one ranking, panel == final. Best-effort: any failure
+	 * posts an empty overlay. No selected files → no change signal → empty (avoids
+	 * ranking against an empty signal, which would spuriously exclude everything).
+	 */
+	private static async pushContextRelevance(
+		webview: vscode.Webview,
+		workspaceRoot: string,
+		bridge: Bridge,
+		sidebarProvider: SidebarBroadcastHost,
+	): Promise<void> {
+		const myGen = ++relevanceGen;
+		const isStale = () => myGen !== relevanceGen;
+		const changedFiles = NextMemoryPreviewPanel.selectedFilePaths(sidebarProvider);
+		if (changedFiles.length === 0) {
+			// Do NOT clear the cache here. A transient empty snapshot — e.g. the sidebar
+			// re-deriving its file list right as the panel reopens — would otherwise wipe a
+			// valid ranking and force a re-rank (the "Analyzing…" flash on reopen). Same
+			// files later → same key → cache hit. A genuine deselect-all just shows an empty
+			// overlay; leaving the stale cache is harmless (a different file set has a
+			// different key → miss → re-rank anyway).
+			void webview.postMessage({ type: "context:relevance", items: [] });
+			return;
+		}
+		try {
+			const branch = await bridge.getCurrentBranch();
+			const [config, exclusions, plans, notes, refs] = await Promise.all([
+				loadConfig(),
+				readExclusions(workspaceRoot),
+				detectActivePlansForBranch(workspaceRoot, branch),
+				detectActiveNotesForBranch(workspaceRoot, branch),
+				getReferenceEntriesForBranch(workspaceRoot, branch),
+			]);
+			// Same user-hard-exclude filter the worker applies, so the candidate set
+			// (and thus the reused decision) matches.
+			const raw = {
+				plans: plans.filter((p) => !exclusions.plans.has(p.slug)),
+				notes: notes.filter((n) => !exclusions.notes.has(n.id)),
+				references: refs.filter((e) => !exclusions.references.has(`${e.source}:${e.nativeId}`)),
+			};
+			const changeSignal = { commitMessage: "", changedFiles, symbols: [] };
+			const fingerprint = computeChangeFingerprint(changeSignal);
+			// Cache key = file fingerprint + candidate item set. Reopening the panel or
+			// switching editor tabs re-invokes this; when both are unchanged, reuse the
+			// last ranking and skip the LLM entirely (no "Analyzing…" flash). File and
+			// hard-exclude toggles already move the key; only a Keep override needs the
+			// explicit invalidateRelevanceCache() in applyContextInclude.
+			// Sort the item keys so the cache key is order-independent — the registry
+			// read order isn't guaranteed stable across refreshes, and an otherwise
+			// identical candidate set in a different order must still hit the cache.
+			const itemsKey = [
+				fingerprint,
+				...[
+					...raw.plans.map((p) => `p:${p.slug}`),
+					...raw.notes.map((n) => `n:${n.id}`),
+					...raw.references.map((e) => `r:${e.source}:${e.nativeId}`),
+				].sort(),
+			].join("|");
+			if (relevanceCache && relevanceCache.key === itemsKey) {
+				if (!isStale()) void webview.postMessage({ type: "context:relevance", items: relevanceCache.items });
+				return;
+			}
+			// A newer refresh started while we read the registry — let it own the
+			// ranking; don't fire a redundant LLM call or post a stale overlay.
+			if (isStale()) return;
+			void webview.postMessage({ type: "context:analyzing", analyzing: true });
+			const decision = await assessContextRelevance(raw, changeSignal, config);
+			// Superseded during the (up-to-45s) LLM call → discard, so this stale file
+			// set's ranking can't clobber the newer result's cache/overlay/fingerprint.
+			if (isStale()) return;
+			const aiExcluded: AiExclusion[] = decision.excludedContext.map((e) => ({
+				kind: e.kind === "plan" ? "plans" : e.kind === "note" ? "notes" : "references",
+				key: e.key,
+				reason: e.reason,
+			}));
+			await writeAiSelection(workspaceRoot, aiExcluded, fingerprint);
+			// autoExclude reflects the final exclude set (excludedContext). There's no
+			// persistent "kept" state: a dismiss just drops the item from that set
+			// (optimistically in the panel + persisted via removeAiExclusion), so it
+			// falls back to showing its normal tier.
+			const excludedKeys = new Set(decision.excludedContext.map((e) => `${e.kind}:${e.key}`));
+			const items: ContextRelevancePreviewItem[] = decision.results.map((r) => ({
+				id: r.id,
+				tier: r.tier,
+				reason: r.reason,
+				autoExclude: excludedKeys.has(`${r.kind}:${r.id}`),
+			}));
+			// writeAiSelection above is an async yield point, so re-check we're still the
+			// latest refresh before caching / posting — otherwise a slower earlier call
+			// could clobber a newer one's cache + overlay here (the pre-/post-LLM isStale
+			// guards don't cover this trailing await).
+			if (isStale()) return;
+			relevanceCache = { key: itemsKey, items };
+			void webview.postMessage({ type: "context:relevance", items });
+		} catch {
+			if (!isStale()) void webview.postMessage({ type: "context:relevance", items: [] });
+		}
+	}
+
+	/**
+	 * Drop the memoized context-relevance ranking. Called when a user "Keep" override
+	 * is recorded (applyContextInclude): the override flips the exclude decision
+	 * without changing the cache key (same files, same candidate items), so the next
+	 * refresh must re-rank rather than replay the pre-Keep result.
+	 */
+	static invalidateRelevanceCache(): void {
+		relevanceCache = undefined;
+	}
+
+	/**
+	 * Reflect a user dismiss in the cached ranking instead of invalidating it: flip the
+	 * dismissed item to non-excluded in place. Reopening the panel then hits the cache
+	 * (no re-rank, no "Analyzing…") AND preserves the dismiss, rather than re-ranking and
+	 * letting the AI re-exclude it.
+	 */
+	static dismissInRelevanceCache(key: string): void {
+		if (!relevanceCache) return;
+		relevanceCache = {
+			key: relevanceCache.key,
+			items: relevanceCache.items.map((it) => (it.id === key ? { ...it, autoExclude: false } : it)),
+		};
 	}
 }

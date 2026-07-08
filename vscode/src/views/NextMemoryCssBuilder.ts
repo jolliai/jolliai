@@ -54,6 +54,39 @@ export function buildNextMemoryCss(): string {
 		".row.excluded .r-title { text-decoration: line-through; }",
 		".row.excluded { opacity: 0.55; }",
 		".row.excluded:hover { opacity: 1; }",
+		// AI relevance overlay lives on a SECOND row (.ctx-meta) under the title, so it
+		// stays visible (not covered by the hover .row-actions) and can wrap to two
+		// lines. .ctx-item wraps the main row + this meta row.
+		".ctx-item + .ctx-item { border-top: 1px solid var(--vscode-widget-border); }",
+		".ctx-item.user-excluded .r-title { text-decoration: line-through; }",
+		".ctx-item.user-excluded { opacity: 0.55; }",
+		".ctx-item.user-excluded:hover { opacity: 1; }",
+		// Excluded = de-emphasised (it's being dropped from the summary), NOT
+		// highlighted: dim the whole item and strike the title. No accent
+		// background/rail — those read as "important", the opposite of excluded.
+		".ctx-item.ai-excluded { opacity: 0.5; }",
+		".ctx-item.ai-excluded .r-title { text-decoration: line-through; }",
+		// Hover the WHOLE item (main + meta row) as one unit. Neutralise the per-row
+		// hover tint inside .ctx-item so the item-level tint isn't doubled on the top
+		// half (which read as "only the first line hovers"); reveal the row-actions
+		// overlay from anywhere in the item; and lift a dimmed excluded row back to
+		// full opacity while hovered so it stays readable.
+		".ctx-item .row:hover { background: transparent; }",
+		".ctx-item:hover { background: var(--surface-hover); }",
+		".ctx-item.ai-excluded:hover { opacity: 1; }",
+		".ctx-item:hover .row-actions { visibility: visible; }",
+		".ctx-meta { display: flex; align-items: flex-start; gap: 8px; padding: 0 10px 7px 34px; }",
+		".ctx-tier { flex-shrink: 0; font-size: 10px; font-weight: 650; letter-spacing: 0.02em; padding: 1px 7px; border-radius: 10px; }",
+		".ctx-tier--high { background: rgba(27,138,79,0.16); color: var(--ship-ok); }",
+		".ctx-tier--mid { background: rgba(150,104,14,0.16); color: var(--ship-warn); }",
+		".ctx-tier--low { background: var(--surface-hover); color: var(--text-secondary); }",
+		// Excluded chip: neutral/muted, matching the dimmed row (not an accent color).
+		".ctx-tier--ex { background: var(--surface-hover); color: var(--text-tertiary); }",
+		// One-line note that wraps to at most two lines (was single-line ellipsis).
+		".ai-say { flex: 1; min-width: 0; font-size: 11px; color: #6b5bd2; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }",
+		"body.vscode-dark .ai-say, body.vscode-high-contrast .ai-say { color: #a99cf0; }",
+		".ph-analyzing { font-size: 10px; font-weight: 600; letter-spacing: 0.02em; color: #6b5bd2; }",
+		"body.vscode-dark .ph-analyzing, body.vscode-high-contrast .ph-analyzing { color: #a99cf0; }",
 		".r-main { flex: 1; min-width: 0; }",
 		".r-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
 		".r-meta { flex-shrink: 0; font-size: 11.5px; color: var(--vscode-descriptionForeground); }",
@@ -112,6 +145,11 @@ export function buildNextMemoryCss(): string {
 		".row-excl, .row-act-btn { width: 20px; height: 18px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid transparent; border-radius: 4px; color: var(--vscode-icon-foreground, var(--vscode-foreground)); cursor: pointer; padding: 0; }",
 		".row-excl:hover, .row-act-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15)); }",
 		".row-excl .codicon, .row-act-btn .codicon { font-size: 12px; }",
+		// Labeled action (icon + text), used for the context "+ Include" dismiss button
+		// so a bare glyph isn't relied on. Same transparent/hover look as .row-act-btn.
+		".row-act-labeled { display: inline-flex; align-items: center; gap: 4px; height: 18px; padding: 0 8px; background: transparent; border: 1px solid transparent; border-radius: 4px; color: var(--vscode-icon-foreground, var(--vscode-foreground)); cursor: pointer; font-size: 11px; font-weight: 600; }",
+		".row-act-labeled:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15)); }",
+		".row-act-labeled .codicon { font-size: 12px; }",
 		// Context "+" — neutral icon color (matching the sidebar's .iconbtn add
 		// button), NOT the link-blue that read as an accent color here.
 		".panel-add { margin-left: auto; background: none; border: none; color: var(--vscode-icon-foreground, var(--vscode-foreground)); cursor: pointer; font-size: 11.5px; }",

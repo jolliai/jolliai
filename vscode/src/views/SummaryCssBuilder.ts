@@ -399,6 +399,11 @@ export function buildCss(): string {
   .e2e-scenario .callout.steps .callout-label { color: var(--callout-response-label); }
   .e2e-scenario .callout.expectedResults { background: var(--callout-decisions-bg); }
   .e2e-scenario .callout.expectedResults .callout-label { color: var(--callout-decisions-label); }
+  .ai-excluded { margin: 6px 0 2px; }
+  .ai-excluded-summary { cursor: pointer; font-size: 12px; color: #8a63d2; user-select: none; padding: 4px 0; }
+  .ai-ex-list { margin: 4px 0 8px; padding-left: 18px; list-style: none; }
+  .ai-ex-item { font-size: 12.5px; color: var(--vscode-foreground); margin: 3px 0; }
+  .ai-ex-reason { color: var(--vscode-descriptionForeground); }
   .e2e-scenario .callout ol {
     margin: 0; padding-left: 1.4em;
   }

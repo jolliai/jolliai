@@ -300,6 +300,12 @@ export interface SidebarWebviewDeps {
 		selected: boolean,
 	) => void | Promise<void>;
 	/**
+	 * Dismiss one AI soft-exclude suggestion — removes it from aiSuggestedExclude so
+	 * the item lands normally. `kind` is the single-form context kind; the handler
+	 * maps it to the plural ExclusionKind for removeAiExclusion.
+	 */
+	applyDismissAiExclude?: (kind: "plan" | "note" | "reference", key: string) => void | Promise<void>;
+	/**
 	 * Resolves once the host has finished its first-pass initial load — in
 	 * particular once `statusStore.refresh()` has run so `getInitialState()`
 	 * returns the real `configured` / `enabled` flags rather than their
@@ -1012,6 +1018,9 @@ export class SidebarWebviewProvider
 				return;
 			case "branch:toggleNoteSelection":
 				void this.deps.applyNoteCheckbox?.(msg.noteId, msg.selected);
+				return;
+			case "branch:dismissAiExclude":
+				void this.deps.applyDismissAiExclude?.(msg.kind, msg.key);
 				return;
 			case "refresh":
 				this.handleRefresh(msg.scope);

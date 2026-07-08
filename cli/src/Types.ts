@@ -550,6 +550,28 @@ export interface CommitSummary {
 	 * no-session path). Only meaningful when `backfilled`.
 	 */
 	readonly backfillMethod?: "file-overlap" | "branch-match" | "time-window" | "diff-only";
+	/**
+	 * CONTEXT items the AI relevance ranker judged unrelated to this commit and
+	 * soft-excluded — kept OUT of the summary prompt but recorded here for
+	 * traceability (CLI / sidebar can show "AI excluded N items + why"). Distinct
+	 * from user manual excludes, which are hard-discarded and never stored.
+	 */
+	readonly excludedContext?: ReadonlyArray<ExcludedContextItem>;
+}
+
+/**
+ * One CONTEXT item the AI relevance ranker soft-excluded from a commit summary,
+ * with the reason it was judged unrelated. Stored on CommitSummary.excludedContext.
+ */
+export interface ExcludedContextItem {
+	readonly kind: "plan" | "note" | "reference";
+	/** slug (plan) / note id / reference mapKey. */
+	readonly key: string;
+	readonly title: string;
+	/** One-line AI reason it was judged unrelated to this change. */
+	readonly reason: string;
+	/** Relevance tier; soft-excluded items are always the lowest ("low"). */
+	readonly tier?: "low";
 }
 
 /** A single E2E test scenario for one feature or bug fix */

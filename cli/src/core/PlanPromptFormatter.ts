@@ -32,12 +32,14 @@ export async function formatPlansBlock(
 	const maxPerPlan = opts.maxCharsPerPlan ?? DEFAULT_MAX_CHARS_PER_PLAN;
 	const maxTotal = opts.maxTotalChars ?? DEFAULT_MAX_TOTAL_CHARS;
 
-	// Sort by updatedAt descending; greedy select within budget.
-	const sorted = [...entries].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+	// Respect the caller's order (the relevance ranker sorts most-relevant-first);
+	// greedy select within budget so over-budget truncation drops the LEAST
+	// relevant, not the oldest. An unranked caller gets insertion order.
+	const ordered = entries;
 
 	const selected: Array<{ entry: PlanEntry; body: string }> = [];
 	let totalLen = 0;
-	for (const entry of sorted) {
+	for (const entry of ordered) {
 		const body = await readPlanBody(entry.sourcePath);
 		const rendered = renderOnePlan(entry, body, maxPerPlan);
 		if (totalLen + rendered.length > maxTotal) break;
@@ -47,7 +49,7 @@ export async function formatPlansBlock(
 
 	if (selected.length === 0) return "";
 
-	// Render in updatedAt-descending order (most recent first — what the LLM sees first).
+	// Render in the caller's order (relevance-ranked when the ranker ran).
 	const inner = selected.map(({ entry, body }) => renderOnePlan(entry, body, maxPerPlan)).join("\n");
 	return `<plans>\n${inner}\n</plans>`;
 }

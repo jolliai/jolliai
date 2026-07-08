@@ -19,6 +19,7 @@ import type {
 	CommitSummary,
 	ConversationTokenBreakdown,
 	E2eTestScenario,
+	ExcludedContextItem,
 	NoteReference,
 	PlanReference,
 	ReferenceCommitRef,
@@ -747,6 +748,27 @@ export function contextChipCount(summary: CommitSummary): number {
  * affordance while dispatching through the same `data-action="toggleAddMenu"`
  * delegated handler (SummaryScriptBuilder) \u2014 no new script wiring needed.
  */
+/**
+ * Renders the AI-excluded context as a native <details> disclosure (collapsed by
+ * default; native <details> needs no script and is CSP-safe). Lists the CONTEXT
+ * items the relevance ranker judged unrelated, each with its reason. Empty -> "".
+ */
+function buildExcludedContextSection(excluded: ReadonlyArray<ExcludedContextItem>): string {
+	if (excluded.length === 0) return "";
+	const items = excluded
+		.map((e) => {
+			const reason = e.reason ? ` <span class="ai-ex-reason">&mdash; ${escHtml(e.reason)}</span>` : "";
+			return `<li class="ai-ex-item"><span class="ai-ex-title">${escHtml(e.title)}</span>${reason}</li>`;
+		})
+		.join("\n");
+	return `<details class="ai-excluded">
+  <summary class="ai-excluded-summary">&#x2728; AI excluded ${excluded.length} unrelated context item(s)</summary>
+  <ul class="ai-ex-list">
+${items}
+  </ul>
+</details>`;
+}
+
 export function buildContextPanel(
 	summary: CommitSummary,
 	planTranslateSet?: ReadonlySet<string>,
@@ -777,6 +799,7 @@ export function buildContextPanel(
     </div>
   </div>
   ${plansAndNotesBody}
+  ${buildExcludedContextSection(summary.excludedContext ?? [])}
   <div class="snippet-form hidden" id="snippetForm">
     <div class="snippet-field">
       <label for="snippetTitle">Title</label>
