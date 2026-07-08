@@ -1,6 +1,7 @@
 package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.bridge.CommitSummaryBrief
+import java.util.Locale
 
 /**
  * Pure (UI-free, git-free) helpers backing the redesigned Committed Memories
@@ -70,6 +71,28 @@ object CommitMemoryFormat {
 	 */
 	fun formatCost(usd: Double): String =
 		if (usd >= 0.01) "≈$" + "%.2f".format(usd) else "<$0.01"
+
+	/**
+	 * Exact token count with thousands separators (`3000000` → `"3,000,000"`), for the
+	 * pushed/shared-memory Markdown "Task usage" line — which shows precise figures rather
+	 * than the compact `formatTokens` form the space-constrained UI bar uses. Mirrors the
+	 * CLI/VS Code `formatTokensExact`.
+	 */
+	fun formatTokensExact(n: Long): String = String.format(Locale.US, "%,d", n)
+
+	/**
+	 * Exact USD cost for the shared-memory "Task usage" line: two decimals at/above a cent
+	 * (`"$21.75"`), four for a sub-cent value (`"$0.0034"`), and the floor `"<$0.0001"` for a
+	 * real amount too small to survive four decimals — so a real cost never shows as all-zeros.
+	 * No `≈` prefix (the article surfaces the precise computed figure). Mirrors the CLI/VS Code
+	 * `formatExactCostUsd`; the value is still a Sonnet-rate estimate.
+	 */
+	fun formatExactCostUsd(usd: Double): String = when {
+		usd >= 0.01 -> "$" + String.format(Locale.US, "%.2f", usd)
+		usd >= 0.00005 -> "$" + String.format(Locale.US, "%.4f", usd)
+		usd > 0 -> "<$0.0001"
+		else -> "$0.00"
+	}
 
 	/**
 	 * Sum input/output tokens over the branch's commits. A commit contributes

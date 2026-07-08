@@ -2,7 +2,9 @@ package ai.jolli.jollimemory.toolwindow.views
 
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.E2eTestScenario
+import ai.jolli.jollimemory.core.ModelPricing
 import ai.jolli.jollimemory.core.SummaryTree
+import ai.jolli.jollimemory.toolwindow.CommitMemoryFormat
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.ViewTopicWithDate
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.collectSortedTopics
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.formatDate
@@ -69,6 +71,26 @@ object SummaryMarkdownBuilder {
 
         if (totalTurns > 0) {
             lines.add("- **Conversations:** $totalTurns turn${if (totalTurns != 1) "s" else ""}")
+        }
+
+        // Task usage: token total + cache-aware Sonnet-rate cost, aggregated across the whole
+        // consolidation tree (a squash/amend memory carries its tokens on folded children).
+        // Exact figures (thousands-separated counts, precise $) — the shared article shows more
+        // precision than the compact UI token bar. Omit-when-zero mirrors the Conversations line.
+        // Matches vscode SummaryMarkdownBuilder.pushPropertiesSection so both tools push the same line.
+        val totalTokens = SummaryTree.aggregateConversationTokens(summary)
+        if (totalTokens > 0) {
+            val agg = SummaryTree.aggregateConversationTokenBreakdown(summary)
+            val hasBreakdown = agg.input > 0 || agg.output > 0 || agg.cached > 0
+            val cost = CommitMemoryFormat.formatExactCostUsd(ModelPricing.estimateSonnetCostUsd(agg, totalTokens))
+            val split = if (hasBreakdown) {
+                " (${CommitMemoryFormat.formatTokensExact(agg.input)} input, " +
+                    "${CommitMemoryFormat.formatTokensExact(agg.output)} output, " +
+                    "${CommitMemoryFormat.formatTokensExact(agg.cached)} cached)"
+            } else {
+                ""
+            }
+            lines.add("- **Task usage:** ${CommitMemoryFormat.formatTokensExact(totalTokens)} tokens · $cost$split")
         }
 
         val memoryDocUrl = summary.jolliDocUrl
