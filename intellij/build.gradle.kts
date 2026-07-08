@@ -34,12 +34,14 @@ val hooksRuntime: Configuration by configurations.creating
 
 dependencies {
     intellijPlatform {
-        intellijIdeaCommunity("2024.3")
+        // 2025.1 is the minimum: the non-deprecated FileSaverDescriptor(title, description) +
+        // withExtensionFilter API only exists from 2025.1 (2024.3 had only the vararg ctor that
+        // 2025.1 deprecates), so building against 2025.1 lets us avoid the deprecated API.
+        intellijIdeaCommunity("2025.1")
         bundledPlugin("com.intellij.java")
         bundledPlugin("Git4Idea")
         bundledPlugin("org.jetbrains.plugins.terminal")
         pluginVerifier()
-        instrumentationTools()
         // Use the JetBrains Runtime for runIde/tests so JCEF is available — the
         // commit-memory panel renders via JBCefBrowser and otherwise falls back to
         // a raw-markdown text view (e.g. when launched on a plain Homebrew JDK).
@@ -174,15 +176,18 @@ intellijPlatform {
             email = "support@jolli.ai"
         }
         ideaVersion {
-            sinceBuild = "243"
+            sinceBuild = "251"
             untilBuild = "262.*"
         }
     }
 
     pluginVerification {
+        // Verify the supported range only (sinceBuild = 251). 2024.3 was dropped because the
+        // non-deprecated FileSaverDescriptor API doesn't exist before 2025.1. Cover the low end
+        // (2025.1) and a recent build so both ends of 251–262.* are checked.
         ides {
-            ide(IntelliJPlatformType.IntellijIdeaCommunity, "2024.3")
             ide(IntelliJPlatformType.IntellijIdeaCommunity, "2025.1.3")
+            ide(IntelliJPlatformType.IntellijIdeaCommunity, "2025.2")
         }
     }
 

@@ -12,6 +12,7 @@
 ### Changes
 
 - **Force-push protection** — the push and Create PR flows now detect when the remote branch has been rewritten (a non-fast-forward) and gate the force-push behind a confirmation; the git checks run off the UI thread so the IDE stays responsive.
+- **Minimum IDE is now IntelliJ IDEA 2025.1** (build 251). This lets the plugin use current, non-deprecated platform APIs (e.g. the file-save dialog), clearing a Marketplace compatibility warning.
 
 ### Fixes & Improvements
 
