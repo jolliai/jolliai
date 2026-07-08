@@ -84,18 +84,24 @@ object BackfillCli {
 	}
 
 	/**
-	 * Resolves a runnable `Cli.js`, preferring the already-extracted integrations dist
-	 * (`~/.jolli/jollimemory/dist-intellij/Cli.js`) so a normal back-fill never re-copies
-	 * the bundle. Falls back to extracting it, then to the plugin-bundled copy.
+	 * Resolves a runnable `Cli.js`, preferring the plugin's OWN bundled copy
+	 * (`<plugin>/cli-dist/Cli.js`) because it always matches the running plugin's code —
+	 * it therefore always understands the CLI flags this class emits (`--list-candidates`,
+	 * `--stream`, …).
+	 *
+	 * We deliberately do NOT prefer the extracted `~/.jolli/jollimemory/dist-intellij/Cli.js`:
+	 * that copy is refreshed only on a plugin **version change** (via `enableIntegrations`),
+	 * so a same-version rebuild — or an upgrade whose bundled CLI gained new flags without a
+	 * matching re-extract — leaves it stale. A stale copy silently rejects the new flags
+	 * (exit 1), which manifests as "the cold-start card never appears." The extracted dist
+	 * exists for the hook/MCP dispatch indirection, not for the plugin's own subprocess
+	 * calls; it is only a fallback here for the rare layout where the bundle can't be found.
 	 */
 	private fun resolveCliJs(): File? {
+		CliIntegrations.resolveBundledCliJs()?.let { return it }
 		val installed = File(CliIntegrations.distIntellijDir(), "Cli.js")
 		if (installed.exists()) return installed
-		CliIntegrations.extractCliDist()?.let { dist ->
-			val f = File(dist, "Cli.js")
-			if (f.exists()) return f
-		}
-		return CliIntegrations.resolveBundledCliJs()
+		return CliIntegrations.extractCliDist()?.let { File(it, "Cli.js").takeIf(File::exists) }
 	}
 
 	/** Common prefix `[node, Cli.js, "backfill"]`, or an Outcome explaining why it can't run. */
