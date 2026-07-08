@@ -67,7 +67,7 @@ class BackfillPanel(
 	private val doneHolder = holder()
 
 	private val checkboxes = mutableListOf<Pair<JBCheckBox, BackfillCli.Candidate>>()
-	private val generateButton = blueButton("", whiteIcon(DATABASE_ICON)) { onGenerate() }
+	private val generateButton = blueButton("", white(DATABASE_ICON)) { onGenerate() }
 	private val progressBar = JProgressBar(0, 100)
 
 	/** Width-tracking text blocks for the currently mounted card: (label, leftIndentPx, htmlBody). */
@@ -108,16 +108,16 @@ class BackfillPanel(
 			isOpaque = false
 			alignmentX = LEFT
 			for ((i, b) in BENEFITS.withIndex()) {
-				add(iconRow(blueIcon(BENEFIT_ICONS[i]), "<b>${b.first}</b> ${b.second}"))
+				add(iconRow(blue(BENEFIT_ICONS[i]), "<b>${b.first}</b> ${b.second}"))
 				if (i < BENEFITS.lastIndex) add(Box.createVerticalStrut(JBUI.scale(4)))
 			}
 		}
 		return listOf(
-			header("Never re-explain a decision again", blueIcon(JolliMemoryIcons.Sparkle)),
+			header("Never re-explain a decision again", blue(JolliMemoryIcons.Sparkle, TITLE_ICON_PX)),
 			grayWrap("The conversations, plans and the why behind every commit, replayed into your next session — in any AI tool.", 0),
 			benefits,
-			iconRow(JolliMemoryIcons.Check, coldStartNote(service.coldStartVariant, service.recentMissingCount, COLD_START_CAP)),
-			blueButton("Build memories from commits", whiteIcon(DATABASE_ICON)) { onBuildNow() },
+			iconRow(sized(JolliMemoryIcons.Check), coldStartNote(service.coldStartVariant, service.recentMissingCount, COLD_START_CAP)),
+			blueButton("Build memories from commits", white(DATABASE_ICON)) { onBuildNow() },
 			grayWrap("🔒 Runs locally on your machine: nothing leaves unless you Share or Sync.", 0),
 		)
 	}
@@ -254,8 +254,8 @@ class BackfillPanel(
 				header("Couldn't build memories", null),
 				iconRow(JolliMemoryIcons.Warning, "$nErr commit${plural(nErr)} couldn't be built. Check your AI credentials, then try again."),
 			)
-			for (r in report.rows) children.add(iconRow(JolliMemoryIcons.Warning, "${escape(trim(r.subject))} — failed"))
-			children.add(blueButton("Try again", whiteIcon(JolliMemoryIcons.Refresh)) { onBuildNow() })
+			for (r in report.rows) children.add(iconRow(sized(JolliMemoryIcons.Warning), "${escape(trim(r.subject))} — failed"))
+			children.add(blueButton("Try again", white(JolliMemoryIcons.Refresh)) { onBuildNow() })
 			mount(doneHolder, DONE, children)
 			onVisibilityRefresh()
 			return
@@ -268,9 +268,9 @@ class BackfillPanel(
 		for (r in report.rows) {
 			val icon = if (r.status == "error") JolliMemoryIcons.Warning else JolliMemoryIcons.Sparkle
 			val meta = if (r.status == "error") "failed" else backfillResult(r.sessions, r.topics)
-			children.add(iconRow(icon, "${escape(trim(r.subject))} — $meta"))
+			children.add(iconRow(sized(icon), "${escape(trim(r.subject))} — $meta"))
 		}
-		children.add(blueButton("Open your Memory Bank", whiteIcon(JolliMemoryIcons.Book)) { closeToOffer() })
+		children.add(blueButton("Open your Memory Bank", white(JolliMemoryIcons.Book)) { closeToOffer() })
 		mount(doneHolder, DONE, children)
 		onVisibilityRefresh()
 	}
@@ -355,7 +355,7 @@ class BackfillPanel(
 	/** A leading icon (top-aligned) beside a width-tracking HTML body. */
 	private fun iconRow(icon: Icon, body: String): JComponent {
 		val label = wrapLabelFor(0)
-		val indent = JBUI.scale(16 + 8)
+		val indent = icon.iconWidth + JBUI.scale(8)
 		setWrap(label, body, indent)
 		return JPanel(BorderLayout(JBUI.scale(8), 0)).apply {
 			isOpaque = false
@@ -451,14 +451,21 @@ class BackfillPanel(
 		// exists across versions; tinted blue it reads the same.
 		private val BENEFIT_ICONS = listOf(AllIcons.Actions.Execute, JolliMemoryIcons.Eye, JolliMemoryIcons.Book)
 
-		/** Blue accent tint for the title + benefit icons (the tick stays its own green). */
-		private fun blueIcon(icon: Icon): Icon = TintIcon(icon, Color(0x35, 0x74, 0xF0))
+		/** Leading icons are sized to the adjacent text's font height so they don't tower over it. */
+		private val BODY_ICON_PX: Int = UIUtil.getLabelFont().size
+		private val TITLE_ICON_PX: Int = BODY_ICON_PX + 1
 
-		/** White tint so an icon reads on the blue accent button. */
-		private fun whiteIcon(icon: Icon): Icon = TintIcon(icon, Color.WHITE)
+		/** Blue accent, sized to text (title + benefit icons; the tick keeps its own green). */
+		private fun blue(icon: Icon, size: Int = BODY_ICON_PX): Icon = CardIcon(icon, Color(0x35, 0x74, 0xF0), size)
 
-		/** Database icon for the "build memories" action (mirrors VS Code's codicon-database). */
-		private val DATABASE_ICON: Icon = AllIcons.Nodes.DataTables
+		/** White, sized to text — reads on the blue accent button. */
+		private fun white(icon: Icon, size: Int = BODY_ICON_PX): Icon = CardIcon(icon, Color.WHITE, size)
+
+		/** Untinted but sized to text (e.g. the green tick, the done-row status icons). */
+		private fun sized(icon: Icon, size: Int = BODY_ICON_PX): Icon = CardIcon(icon, null, size)
+
+		/** Database cylinder for the "build memories" action (mirrors VS Code's codicon-database). */
+		private val DATABASE_ICON: Icon = JolliMemoryIcons.Database
 
 		private fun plural(n: Int): String = if (n == 1) "" else "s"
 
@@ -491,28 +498,35 @@ class BackfillPanel(
 }
 
 /**
- * Recolors an icon to a solid [color] (keeping its alpha/shape), using only core AWT so it
- * is stable across IntelliJ platform versions. Replaces `IconUtil.colorize`, whose signature
- * drifts between SDKs (a NoSuchMethodError from that call crashed the whole tool window when
- * the plugin was built against one IDE version and run on another).
+ * Renders [base] optionally recolored to [tint] (keeping its alpha/shape) and scaled to a
+ * [size]×[size] logical box — so a leading icon can match the height of the text beside it.
+ * Uses only core AWT so it is stable across IntelliJ platform versions; this replaces
+ * `IconUtil.colorize`, whose signature drifts between SDKs (a NoSuchMethodError from that
+ * call once crashed the whole tool window when the build SDK and runtime IDE differed).
  */
-private class TintIcon(private val base: Icon, private val color: Color) : Icon {
-	override fun getIconWidth(): Int = base.iconWidth
-	override fun getIconHeight(): Int = base.iconHeight
+private class CardIcon(private val base: Icon, private val tint: Color?, private val size: Int) : Icon {
+	override fun getIconWidth(): Int = size
+	override fun getIconHeight(): Int = size
 	override fun paintIcon(c: Component?, g: Graphics, x: Int, y: Int) {
-		val w = iconWidth
-		val h = iconHeight
-		if (w <= 0 || h <= 0) return
-		// HiDPI-aware buffer so retina rendering stays crisp.
-		val img = UIUtil.createImage(c, w, h, BufferedImage.TYPE_INT_ARGB)
-		val g2 = img.createGraphics()
+		val bw = base.iconWidth.coerceAtLeast(1)
+		val bh = base.iconHeight.coerceAtLeast(1)
+		// Render (and tint) the base at its natural size into a HiDPI-aware buffer …
+		val buf = UIUtil.createImage(c, bw, bh, BufferedImage.TYPE_INT_ARGB)
+		val bg = buf.createGraphics()
+		bg.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+		base.paintIcon(c, bg, 0, 0)
+		if (tint != null) {
+			// Paint the tint only where the icon has pixels (SrcAtop preserves alpha).
+			bg.composite = AlphaComposite.SrcAtop
+			bg.color = tint
+			bg.fillRect(0, 0, bw, bh)
+		}
+		bg.dispose()
+		// … then blit it scaled to the target square, centered if the source isn't square.
+		val g2 = g.create() as Graphics2D
+		g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR)
 		g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
-		base.paintIcon(c, g2, 0, 0)
-		// Paint the tint only where the icon already has pixels (SrcAtop preserves alpha).
-		g2.composite = AlphaComposite.SrcAtop
-		g2.color = color
-		g2.fillRect(0, 0, w, h)
+		g2.drawImage(buf, x, y, size, size, null)
 		g2.dispose()
-		g.drawImage(img, x, y, null)
 	}
 }
