@@ -219,6 +219,9 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         // Built defensively: a failure constructing this card (e.g. an SDK API drift between the
         // plugin's build target and the running IDE) must NEVER blank the whole tool window — so
         // on any throwable we log and simply omit the card. `null` = unavailable.
+        // Assigned once the view switcher exists (below): navigates the tool window to the
+        // Memory Bank view. The card's "Open your Memory Bank" button invokes it via this var.
+        var openMemoryBank: () -> Unit = {}
         var backfillCard: BackfillPanel? = null
         try {
             lateinit var bfPanel: BackfillPanel
@@ -232,9 +235,12 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
                     stack.repaint()
                 }
             }
-            bfPanel = BackfillPanel(project, service) {
-                SwingUtilities.invokeLater { syncBackfillVisibility() }
-            }
+            bfPanel = BackfillPanel(
+                project,
+                service,
+                onVisibilityRefresh = { SwingUtilities.invokeLater { syncBackfillVisibility() } },
+                onOpenMemoryBank = { openMemoryBank() },
+            )
             // Immediate-invoke on add (service fires once when initialized) sets the initial
             // visibility; later cold-start recomputes / dismissals re-run it on the EDT.
             service.addBackfillListener { SwingUtilities.invokeLater(syncBackfillVisibility) }
@@ -369,7 +375,9 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         )
 
         // View switch (Current Branch / Memory Bank / Knowledge) above the breadcrumb.
-        val viewSwitch = ViewSwitchPanel { view ->
+        // The switch logic is a named function so the back-fill card's "Open your Memory Bank"
+        // button can drive it too (via `openMemoryBank`), keeping the switcher UI in sync.
+        fun applyView(view: ViewSwitchPanel.View) {
             // Switching views replaces the status card with a real view card.
             statusShown = false
             ai.jolli.jollimemory.core.telemetry.Telemetry.track(
@@ -394,6 +402,13 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
                     actionBar.isVisible = false
                 }
             }
+        }
+        val viewSwitch = ViewSwitchPanel { view -> applyView(view) }
+        // Wire the back-fill card's "Open your Memory Bank" button: select the Bank tab in the
+        // switcher (updates its highlight) and apply the view (switches the content card).
+        openMemoryBank = {
+            viewSwitch.setSelected(ViewSwitchPanel.View.BANK)
+            applyView(ViewSwitchPanel.View.BANK)
         }
 
         // Auto-switch to the STATUS card when Jolli Memory is disabled (preserves

@@ -17,7 +17,6 @@ import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import java.awt.AlphaComposite
 import java.awt.BorderLayout
-import java.awt.CardLayout
 import java.awt.Color
 import java.awt.Component
 import java.awt.Cursor
@@ -45,7 +44,8 @@ import javax.swing.SwingConstants
  * Styling mirrors the plugin's own onboarding card (OnboardingPanel): a blue accent CTA,
  * a title/benefit icon column, and copy that reads the same as VS Code.
  *
- * States (CardLayout): OFFER → LOADING → LIST → PROGRESS → DONE. Every state has a header
+ * States: OFFER → LOADING → LIST → PROGRESS → DONE (one content panel rebuilt per state, so
+ * the card sizes to the current state). Every state has a header
  * ✕ that dismisses (writes the repo-wide marker). Text blocks reflow to the current tool-
  * window width via [reflow] (registered [wrapEntries] re-set their HTML width on resize),
  * so content tracks the sidebar rather than a fixed column. Row/note wording lives in the
@@ -55,18 +55,14 @@ class BackfillPanel(
 	private val project: Project,
 	private val service: JolliMemoryService,
 	private val onVisibilityRefresh: () -> Unit = {},
+	private val onOpenMemoryBank: () -> Unit = {},
 ) : JPanel(BorderLayout()) {
 
 	private val log = JmLogger.create("BackfillPanel")
-	private val cards = CardLayout()
-	private val deck = JPanel(cards)
+	// A single content panel rebuilt per state — NOT a CardLayout, which would size to the
+	// tallest card (the offer) and leave the short "No commits" state in an over-tall box.
+	private val content = holder()
 	private var currentCard = OFFER
-
-	private val offerHolder = holder()
-	private val loadingHolder = holder()
-	private val listHolder = holder()
-	private val progressHolder = holder()
-	private val doneHolder = holder()
 
 	private val checkboxes = mutableListOf<Pair<JBCheckBox, BackfillCli.Candidate>>()
 	private val generateButton = blueButton("", white(DATABASE_ICON)) { onGenerate() }
@@ -84,13 +80,8 @@ class BackfillPanel(
 			JBUI.Borders.empty(6),
 			JBUI.Borders.compound(RoundedLineBorder(JBColor.border(), JBUI.scale(10), 1), JBUI.Borders.empty(8, 10, 12, 10)),
 		)
-		deck.isOpaque = false
-		deck.add(offerHolder, OFFER)
-		deck.add(loadingHolder, LOADING)
-		deck.add(listHolder, LIST)
-		deck.add(progressHolder, PROGRESS)
-		deck.add(doneHolder, DONE)
-		add(deck, BorderLayout.CENTER)
+		content.isOpaque = false
+		add(content, BorderLayout.CENTER)
 		// Reflow wrapped copy whenever the tool window is resized so it fills the sidebar.
 		addComponentListener(object : ComponentAdapter() {
 			override fun componentResized(e: ComponentEvent) = reflow()
@@ -113,11 +104,11 @@ class BackfillPanel(
 
 	/** Refreshes the offer copy from current signals without disturbing a mid-flow view. */
 	fun syncOffer() {
-		if (currentCard == OFFER) mount(offerHolder, OFFER, offerChildren())
+		if (currentCard == OFFER) mount(OFFER, offerChildren())
 	}
 
 	// ── OFFER ────────────────────────────────────────────────────────────
-	private fun showOffer() = mount(offerHolder, OFFER, offerChildren())
+	private fun showOffer() = mount(OFFER, offerChildren())
 
 	private fun offerChildren(): List<JComponent> {
 		val benefits = JPanel().apply {
@@ -141,7 +132,7 @@ class BackfillPanel(
 
 	private fun onBuildNow() {
 		val cwd = service.mainRepoRoot ?: project.basePath ?: return
-		mount(loadingHolder, LOADING, listOf(
+		mount(LOADING, listOf(
 			header("Scanning your recent commits…", null),
 			grayWrap("Looking for the conversations behind each commit. This stays on your machine.", 0),
 		))
@@ -167,7 +158,7 @@ class BackfillPanel(
 	// ── LIST ─────────────────────────────────────────────────────────────
 	private fun showList(candidates: List<BackfillCli.Candidate>, totalMissing: Int) {
 		if (candidates.isEmpty()) {
-			mount(listHolder, LIST, listOf(
+			mount(LIST, listOf(
 				header("No commits to build from", null),
 				grayWrap("No commits from the last month need a memory. Keep coding — new commits capture automatically.", 0),
 			))
@@ -209,7 +200,7 @@ class BackfillPanel(
 		if (more > 0) children.add(linkLabel("$more more commit${plural(more)} without a memory — manage all in Settings") { openSettings() })
 		children.add(generateButton)
 		children.add(grayWrap("Runs one AI call per commit, locally. Nothing leaves unless you Share or Sync.", 0))
-		mount(listHolder, LIST, children)
+		mount(LIST, children)
 	}
 
 	private fun rowText(c: BackfillCli.Candidate): String =
@@ -245,7 +236,7 @@ class BackfillPanel(
 		progressBar.isStringPainted = false
 		progressBar.alignmentX = LEFT
 		setWrap(progressText, "<b>0</b> / $total built", 0)
-		mount(progressHolder, PROGRESS, listOf(
+		mount(PROGRESS, listOf(
 			header("Building memories from your commits…", null),
 			progressText,
 			progressBar,
@@ -273,7 +264,7 @@ class BackfillPanel(
 			)
 			for (r in report.rows) children.add(iconRow(sized(JolliMemoryIcons.Warning), "${escape(trim(r.subject))} — failed"))
 			children.add(blueButton("Try again", white(JolliMemoryIcons.Refresh)) { onBuildNow() })
-			mount(doneHolder, DONE, children)
+			mount(DONE, children)
 			onVisibilityRefresh()
 			return
 		}
@@ -287,8 +278,8 @@ class BackfillPanel(
 			val meta = if (r.status == "error") "failed" else backfillResult(r.sessions, r.topics)
 			children.add(iconRow(sized(icon), "${escape(trim(r.subject))} — $meta"))
 		}
-		children.add(blueButton("Open your Memory Bank", white(JolliMemoryIcons.Book)) { closeToOffer() })
-		mount(doneHolder, DONE, children)
+		children.add(blueButton("Open your Memory Bank", white(JolliMemoryIcons.Book)) { onOpenMemoryBank(); closeToOffer() })
+		mount(DONE, children)
 		onVisibilityRefresh()
 	}
 
@@ -310,21 +301,25 @@ class BackfillPanel(
 	private fun openSettings() = SettingsDialog(project, service).show()
 
 	// ── mount + reflow ─────────────────────────────────────────────────────
-	/** Replaces [holder]'s contents, switches to it, and reflows wrapped copy to the width. */
-	private fun mount(holder: JPanel, card: String, comps: List<JComponent>) {
+	/**
+	 * Rebuilds the single content panel with [comps] so the card sizes to the CURRENT state's
+	 * content (a CardLayout would instead reserve the tallest card's height). Reflows wrapped
+	 * copy to the width afterward.
+	 */
+	private fun mount(card: String, comps: List<JComponent>) {
 		currentCard = card
-		holder.removeAll()
+		content.removeAll()
 		for (c in comps) {
 			c.alignmentX = LEFT
-			holder.add(c)
-			holder.add(Box.createVerticalStrut(JBUI.scale(6)))
+			content.add(c)
+			content.add(Box.createVerticalStrut(JBUI.scale(6)))
 		}
-		// Drop wrap-labels detached by this holder's removeAll (labels still mounted in
-		// other holders keep their parent and stay registered).
+		// Prior components were detached by removeAll → drop their now-parentless wrap labels.
 		wrapEntries.removeAll { it.label.parent == null }
-		holder.revalidate()
-		holder.repaint()
-		cards.show(deck, card)
+		content.revalidate()
+		content.repaint()
+		revalidate()
+		repaint()
 		ApplicationManager.getApplication().invokeLater { reflow() }
 	}
 

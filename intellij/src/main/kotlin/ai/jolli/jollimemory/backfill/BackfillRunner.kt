@@ -73,7 +73,15 @@ object BackfillRunner {
 				service.onBackfillCompleted(r.generated > 0)
 				// Refresh the surfaces that render summary state (Committed Memories list, etc.).
 				service.notifyMemoryStateChanged()
-				if (r.errors > 0) {
+				if (r.total == 0) {
+					// No candidate commits — e.g. a repo where none of the commits are yours.
+					notify(
+						project,
+						"Jolli Memory: nothing to back-fill",
+						"No commits authored by you are missing a memory.",
+						NotificationType.INFORMATION,
+					)
+				} else if (r.errors > 0) {
 					notify(
 						project,
 						"Jolli Memory: back-fill finished with errors",

@@ -203,10 +203,18 @@ object BackfillCli {
 			var report: Report? = null
 			val acted = ArrayList<Progress>()
 			var cancelled = false
+			// Keep the last few non-JSON lines (stderr merged in) so a genuine failure surfaces
+			// the real reason instead of a bare exit code.
+			val diagnostics = ArrayDeque<String>()
 			proc.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines ->
 				for (line in lines) {
 					val trimmed = line.trim()
-					if (trimmed.isEmpty() || !trimmed.startsWith("{")) continue
+					if (trimmed.isEmpty()) continue
+					if (!trimmed.startsWith("{")) {
+						diagnostics.addLast(trimmed)
+						while (diagnostics.size > 5) diagnostics.removeFirst()
+						continue
+					}
 					val obj = try {
 						JsonParser.parseString(trimmed).asJsonObject
 					} catch (_: Exception) {
@@ -232,7 +240,11 @@ object BackfillCli {
 				proc.destroyForcibly()
 				return Outcome.Failed("back-fill timed out")
 			}
-			report?.let { Outcome.Ok(it) } ?: Outcome.Failed("no report emitted (exit ${proc.exitValue()})")
+			report?.let { Outcome.Ok(it) } ?: run {
+				val detail = diagnostics.lastOrNull()?.let { ": $it" } ?: ""
+				log.warn("backfill emitted no report (exit %d)%s", proc.exitValue(), detail)
+				Outcome.Failed("back-fill did not complete (exit ${proc.exitValue()})$detail")
+			}
 		} catch (e: Exception) {
 			log.warn("backfill run failed: %s", e.message)
 			Outcome.Failed(e.message ?: "unknown error")
