@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.toolwindow.views
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.DiffStats
 import ai.jolli.jollimemory.core.E2eTestScenario
+import ai.jolli.jollimemory.core.ExcludedContext
 import ai.jolli.jollimemory.core.PlanReference
 import ai.jolli.jollimemory.core.SummaryTree
 import ai.jolli.jollimemory.core.TopicCategory
@@ -377,6 +378,36 @@ class SummaryHtmlBuilderTest {
             html shouldContain "≈$"
             html shouldNotContain "cost N/A"
             html shouldContain """<span class="seg-in" style="width:100%">"""
+        }
+    }
+
+    @Nested
+    inner class ExcludedContextSection {
+        @Test
+        fun `renders a collapsed details disclosure with count, title, and reason`() {
+            val summary = makeSummary().copy(
+                excludedContext = listOf(
+                    ExcludedContext(kind = "plan", key = "p1", title = "Unrelated Plan", reason = "different feature area"),
+                    ExcludedContext(kind = "reference", key = "linear:JOLLI-9", title = "JOLLI-9 — Old ticket", reason = ""),
+                ),
+            )
+            val html = SummaryHtmlBuilder.buildHtml(summary)
+            html shouldContain """<details class="excluded-context">"""
+            html shouldContain "AI judged 2 context item(s) unrelated (not included)"
+            html shouldContain "Unrelated Plan"
+            html shouldContain "different feature area"
+            html shouldContain "JOLLI-9 — Old ticket"
+        }
+
+        @Test
+        fun `renders nothing when excludedContext is null`() {
+            SummaryHtmlBuilder.buildHtml(makeSummary()) shouldNotContain "unrelated (not included)"
+        }
+
+        @Test
+        fun `renders nothing when excludedContext is empty`() {
+            val summary = makeSummary().copy(excludedContext = emptyList())
+            SummaryHtmlBuilder.buildHtml(summary) shouldNotContain "unrelated (not included)"
         }
     }
 }

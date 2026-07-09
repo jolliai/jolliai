@@ -1519,6 +1519,31 @@ $rootVars
   }
   .attach-card-body .section-header { display: none; }
 
+  /* ── AI-excluded context disclosure ── */
+  .excluded-context {
+    margin-bottom: 16px;
+    font-size: 0.85em;
+  }
+  .excluded-context > summary {
+    cursor: pointer;
+    user-select: none;
+    padding: 6px 2px;
+    color: var(--text-secondary);
+  }
+  .excluded-context > summary:hover { color: var(--text-primary); }
+  .excluded-list {
+    list-style: none;
+    margin: 4px 0 0;
+    padding: 0 0 0 14px;
+  }
+  .excluded-item { margin: 6px 0; }
+  .excluded-title { color: var(--text-primary); }
+  .excluded-reason {
+    color: var(--text-secondary);
+    font-style: italic;
+    margin-top: 2px;
+  }
+
   /* ── Private drawer (collapsed by default) ── */
   .private-drawer {
     border: 1px dashed var(--private-zone-border);

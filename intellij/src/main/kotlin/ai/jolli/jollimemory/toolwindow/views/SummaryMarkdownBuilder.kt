@@ -35,6 +35,7 @@ object SummaryMarkdownBuilder {
 
         pushPropertiesSection(lines, summary)
         pushPlansSection(lines, summary, includeEditInfo = true)
+        pushExcludedContextSection(lines, summary)
         pushRecapSection(lines, summary)
         pushE2eTestSection(lines, summary.e2eTestGuide)
         pushSourceCommitsSection(lines, sourceNodes)
@@ -153,6 +154,34 @@ object SummaryMarkdownBuilder {
             lines.add(if (noteUrl != null) "- [${note.title}]($noteUrl)" else "- ${note.title}")
         }
     }
+
+    /**
+     * Appends the AI-excluded context as a collapsed <details> block: the CONTEXT
+     * items the relevance ranker judged unrelated to this commit, each with its
+     * reason. Renders nothing when there are no soft-excluded items. Kept separate
+     * from the Plans/Context section so it still shows when that section is empty.
+     */
+    internal fun pushExcludedContextSection(lines: MutableList<String>, summary: CommitSummary) {
+        val excluded = summary.excludedContext ?: return
+        if (excluded.isEmpty()) return
+        lines.addAll(
+            listOf(
+                "",
+                "<details>",
+                "<summary>AI judged ${excluded.size} context item(s) unrelated (not included)</summary>",
+                "",
+            )
+        )
+        for (e in excluded) {
+            lines.add("- ${escMdText(e.title)}")
+            if (e.reason.isNotBlank()) lines.add("  — ${escMdText(e.reason)}")
+        }
+        lines.addAll(listOf("", "</details>"))
+    }
+
+    /** Neutralizes newlines in Markdown list text so a multi-line title/reason
+     *  can't break the surrounding list structure. */
+    private fun escMdText(s: String): String = s.replace(Regex("\\s*\\r?\\n\\s*"), " ").trim()
 
     /** Appends the Quick Recap section if present. */
     private fun pushRecapSection(lines: MutableList<String>, summary: CommitSummary) {

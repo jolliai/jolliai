@@ -213,6 +213,20 @@ class GitOps(private val projectDir: String) {
         else exec("show", "--format=", ref)
     }
 
+    /**
+     * Returns the changed file paths for a commit (defaults to HEAD), forward-slash
+     * separated (git already emits forward slashes). Empty list on failure or when a
+     * root commit has no parent diff. Used by the context-relevance change signal.
+     */
+    fun getChangedFileNames(ref: String = "HEAD"): List<String> {
+        val output = if (hasParent(ref)) {
+            exec("diff", "--name-only", "$ref~1..$ref")
+        } else {
+            exec("show", "--name-only", "--format=", ref)
+        } ?: return emptyList()
+        return output.lines().map { it.trim() }.filter { it.isNotEmpty() }
+    }
+
     /** Get diff stats for a commit (defaults to HEAD). See [getDiffContent] for the [ref] rationale. */
     fun getDiffStats(ref: String = "HEAD"): String? {
         return if (hasParent(ref)) exec("diff", "--stat", "--numstat", "$ref~1..$ref")

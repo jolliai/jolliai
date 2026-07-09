@@ -2,6 +2,7 @@ package ai.jolli.jollimemory.toolwindow.views
 
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.E2eTestScenario
+import ai.jolli.jollimemory.core.ExcludedContext
 import ai.jolli.jollimemory.core.ModelPricing
 import ai.jolli.jollimemory.core.PlanReference
 import ai.jolli.jollimemory.core.SummaryTree
@@ -87,6 +88,7 @@ ${buildShipBar(summary)}
 ${buildMemoryPanel(summary, allTopics, topicsHtml, topicsTitle, topicsLabel)}
 ${buildE2ePanel(summary)}
 ${buildAttachmentsPanel(summary.plans, planTranslateSet, sourceNodes, summary.references)}
+${buildExcludedContextSection(summary)}
 ${buildPrivateDrawer(transcriptHashSet)}
 ${buildFooter(summary)}
 </div>
@@ -681,6 +683,37 @@ $listItems
   </div>
   <div class="private-body">${buildAllConversationsSection(transcriptHashSet)}</div>
 </div>"""
+    }
+
+    // ── AI-excluded context ───────────────────────────────────────────────
+
+    /**
+     * Renders the AI-excluded context disclosure — the committed-summary
+     * counterpart of the folder-markdown `pushExcludedContextSection`. A native
+     * collapsed `<details>` listing each CONTEXT item the relevance ranker judged
+     * unrelated (title, plus its one-line reason when present). Returns "" when
+     * `excludedContext` is null or empty so nothing renders.
+     */
+    private fun buildExcludedContextSection(summary: CommitSummary): String {
+        val excluded = summary.excludedContext?.takeIf { it.isNotEmpty() } ?: return ""
+        val items = excluded.joinToString("\n") { e: ExcludedContext ->
+            val reason = if (e.reason.isNotBlank()) {
+                """
+      <div class="excluded-reason">${escHtml(e.reason)}</div>"""
+            } else {
+                ""
+            }
+            """    <li class="excluded-item">
+      <div class="excluded-title">${escHtml(e.title)}</div>$reason
+    </li>"""
+        }
+        return """
+<details class="excluded-context">
+  <summary>AI judged ${excluded.size} context item(s) unrelated (not included)</summary>
+  <ul class="excluded-list">
+$items
+  </ul>
+</details>"""
     }
 
     // ── Plans Section ─────────────────────────────────────────────────────
