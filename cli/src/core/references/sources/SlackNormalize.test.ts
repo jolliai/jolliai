@@ -28,11 +28,23 @@ describe("normalizeSlackThread", () => {
 		expect(c).toMatchObject({
 			channelId: "C0BFF9UHBD1",
 			parentTs: "1783413984.700009",
-			title: "Consolidate the existing Linear / Jira / GitHub / Notion …",
+			// Parent body is 58 chars → truncated to 50 + … (see truncateTitle).
+			title: "Consolidate the existing Linear / Jira / GitHub /…",
 			replyCount: 2,
 			url: "https://x",
 		});
 		expect(c?.text).toContain("Config-driven MCP integration");
+	});
+	it("truncates a long parent-message title to 50 chars + …", () => {
+		const longBody = "X".repeat(60);
+		const blob = `=== THREAD PARENT MESSAGE ===\nMessage TS: 1783413984.700009\n${longBody}`;
+		const c = normalizeSlackThread({ messages: blob }, { channelId: "C1", url: "https://x" });
+		expect(c?.title).toBe(`${"X".repeat(50)}…`);
+	});
+	it("leaves a title at/under 50 chars untouched (no ellipsis)", () => {
+		const blob = `=== THREAD PARENT MESSAGE ===\nMessage TS: 1783413984.700009\nShort thread title`;
+		const c = normalizeSlackThread({ messages: blob }, { channelId: "C1", url: "https://x" });
+		expect(c?.title).toBe("Short thread title");
 	});
 	it("returns null (never throws) on a blob with no parent ts", () => {
 		expect(normalizeSlackThread({ messages: "garbage" }, { channelId: "C1" })).toBeNull();

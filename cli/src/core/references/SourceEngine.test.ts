@@ -483,12 +483,10 @@ describe("extractRef", () => {
 	});
 });
 
-describe("extractRef optional url", () => {
+describe("extractRef required url", () => {
 	const canonNoUrl = { channelId: "C1", parentTs: "1700000000.000001", title: "t", text: "body", replyCount: 0 };
-	it("produces a reference with url absent when url.optional and missing", () => {
-		const ref = extractRef(slackDefinition, canonNoUrl, "tool", "2026-01-01T00:00:00Z");
-		expect(ref).not.toBeNull();
-		expect(ref?.url).toBeUndefined();
+	it("voids Slack when its (now-required) url is missing", () => {
+		expect(extractRef(slackDefinition, canonNoUrl, "tool", "2026-01-01T00:00:00Z")).toBeNull();
 	});
 	it("still voids a source whose url is required and missing (linear)", () => {
 		expect(extractRef(linearDefinition, { id: "PROJ-1", title: "x" }, "tool", "2026-01-01T00:00:00Z")).toBeNull();
@@ -533,7 +531,7 @@ describe("renderBlock", () => {
 		);
 	});
 
-	it("renderBlock omits the <url> line entirely when a reference has no url (Slack linkless capture)", () => {
+	it("renderBlock omits the <url> line entirely when a reference has no url", () => {
 		const def = miniLinearDef();
 		const ref: Reference = {
 			mapKey: "linear:X-1",

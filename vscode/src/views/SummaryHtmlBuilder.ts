@@ -9,6 +9,7 @@
  * this document does not host a PR section.
  */
 
+import { labelLeadsWithNativeId, referenceDisplayTitle } from "../../../cli/src/core/references/ReferenceDisplay.js";
 import { isSummaryError } from "../../../cli/src/core/SummaryErrorMarker.js";
 import {
 	aggregateConversationTokenBreakdown,
@@ -1219,6 +1220,14 @@ function buildReferenceRow(
 	// by the dispatcher). The earlier Linear-only `data-linear-*` attributes
 	// were removed alongside the openLinearIssue* / removeLinearIssue
 	// data-actions in favour of the `*Reference` names.
+	// The `<nativeId> (Source)` sub-line only carries meaning for the issue
+	// trackers (whose key the user recognizes); for machine-id sources (Notion /
+	// Slack / phase-2) it is a meaningless blob already dropped from the title,
+	// and the source is conveyed by the left badge + "Open in <Source>" button —
+	// so the whole metaline is omitted rather than rendered as noise.
+	const subLine = labelLeadsWithNativeId(e.source)
+		? `\n      <div class="r-sub plan-meta">${escHtml(e.nativeId)} (${escHtml(sourceLabel)})</div>`
+		: "";
 	const showTranslate = referenceTranslateSet?.has(e.archivedKey) ?? false;
 	const translateBtn = showTranslate
 		? `<button class="topic-action-btn reference-translate-btn" title="Translate to English" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="translateReference">&#x1F310;</button>`
@@ -1227,8 +1236,7 @@ function buildReferenceRow(
   <div class="row plan-item" id="reference-${escAttr(e.source)}-${escAttr(domKey)}">
     <span class="kb-tag t-ref">${escHtml(sourceLetter)}</span>
     <div class="r-main">
-      <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewReference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}">${escHtml(e.nativeId)} &mdash; ${escHtml(e.title)}</a>
-      <div class="r-sub plan-meta">${escHtml(e.nativeId)} (${escHtml(sourceLabel)})</div>
+      <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewReference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}">${escHtml(referenceDisplayTitle(e))}</a>${subLine}
     </div>
     <span class="r-actions plan-header-actions">
       <button class="icon-btn topic-action-btn" title="Open in ${escAttr(sourceLabel)}" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-url="${escAttr(e.url ?? "")}" data-action="openReferenceExternal">&#x1F30D;</button>

@@ -321,21 +321,6 @@ export function buildNextMemoryScript(): string {
     const row = el('div', { className: 'row', 'data-id': item.id });
     row.appendChild(ctxBadge(item.contextValue, item.iconKey));
     row.appendChild(el('div', { className: 'r-main' }, [el('div', { className: 'r-title', text: item.label })]));
-    // A Slack thread captured with no configured workspace URL (and no pasted
-    // permalink) has nothing to jump to (see the CLI's slackDefinition.reference.url,
-    // which is optional for this source only). Surface a small, non-interactive
-    // affordance instead of silently having no open-in-source action at all. This
-    // is intentionally NOT wired to a click handler: there is no VS Code settings
-    // UI field for slack.workspaceUrl (jolli configure is CLI-only today), so a
-    // postMessage here would have no host-side handler to land on. A working
-    // "jump straight to Settings" click is left as a follow-up once that field exists.
-    const rh = item.referenceHover;
-    if (item.contextValue === 'reference' && rh && rh.source === 'slack' && !rh.url) {
-      row.appendChild(el('span', {
-        className: 'ref-config-hint',
-        title: 'Set slack.workspaceUrl to enable jump-to-thread',
-      }, [el('i', { className: 'codicon codicon-gear' })]));
-    }
     let toggleMsg;
     let removeCmd;
     if (item.contextValue === 'plan') {

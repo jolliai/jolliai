@@ -1407,6 +1407,16 @@ export function buildSidebarCss(): string {
     margin-bottom: 6px;
     word-break: break-word;
   }
+  /* The reference card reuses the sidebar's per-source context badge
+     (.mem-ctx-badge, coloured by SOURCE_META hue) so the provider chip looks
+     identical here and on the context rows. .hc-title stays a plain block (the
+     three text-only memory / plan / note cards share it), so nudge the inline
+     badge to sit centred against the first title line with a little breathing
+     room before the title text. */
+  .hover-card .hc-title .mem-ctx-badge {
+    margin-right: 6px;
+    vertical-align: middle;
+  }
   .hover-card .hc-row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
   .hover-card .hc-row .codicon { color: var(--vscode-icon-foreground); flex-shrink: 0; }
   .hover-card hr {

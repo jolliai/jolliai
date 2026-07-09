@@ -33,4 +33,10 @@ describe("slack definition", () => {
 		});
 		expect(ref?.fields?.find((f) => f.key === "channel")?.value).toBe("C0BFF9UHBD1");
 	});
+	it("voids the reference when url is absent — a thread with no resolvable url is not stored", () => {
+		const { url: _url, ...canonNoUrl } = CANON;
+		expect(
+			extractRef(slackDefinition, canonNoUrl, "mcp__claude_ai_Slack__slack_read_thread", "2026-07-08T00:00:00Z"),
+		).toBeNull();
+	});
 });

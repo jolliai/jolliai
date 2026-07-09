@@ -143,15 +143,6 @@ describe("buildNextMemoryScript", () => {
 		expect(js).toContain("rowActions([excludeToggle(");
 	});
 
-	it("renders a config-needed hint for a linkless Slack reference, with no click handler", () => {
-		const js = buildNextMemoryScript();
-		expect(js).toContain("rh.source === 'slack' && !rh.url");
-		expect(js).toContain("'ref-config-hint'");
-		expect(js).toContain("Set slack.workspaceUrl to enable jump-to-thread");
-		// Non-interactive: the hint carries no addEventListener/postMessage of its
-		// own — it's title-attribute-only (see the file-level comment on why).
-		expect(js).not.toContain("openSetting");
-	});
 });
 
 describe("click-to-open parity with the sidebar Working Memory rows", () => {

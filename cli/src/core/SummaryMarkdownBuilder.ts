@@ -8,6 +8,7 @@
 
 import type { CommitSummary, E2eTestScenario, ReferenceCommitRef, SourceId } from "../Types.js";
 import { escMdLinkText, escMdUrl } from "./MarkdownEscape.js";
+import { referenceDisplayTitle } from "./references/ReferenceDisplay.js";
 import { getRegistry } from "./references/SourceDefinitionRegistry.js";
 import {
 	collectSortedTopics,
@@ -187,7 +188,7 @@ export function pushPlansAndNotesSection(
 	}
 
 	for (const e of referencesBySourceOrder(references)) {
-		const label = `${escMdLinkText(e.nativeId)} — ${escMdLinkText(e.title)}`;
+		const label = escMdLinkText(referenceDisplayTitle(e));
 		lines.push(e.url ? `- [${label}](${escMdUrl(e.url)})` : `- ${label}`);
 	}
 }

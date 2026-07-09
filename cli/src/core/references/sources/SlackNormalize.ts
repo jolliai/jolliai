@@ -32,6 +32,17 @@ const REPLY_COUNT_RE = /=== THREAD REPLIES \((\d+) total\) ===/;
  */
 const PARENT_BODY_RE = /Message TS:\s*\d{7,}\.\d+\r?\n([^\r\n]+)/;
 
+/**
+ * The "title" is the parent message's first line, which — unlike an issue title
+ * or page name — is free-form message text with no length bound. Cap it so the
+ * stored title stays a short label across every surface (sidebar row, PR bullet,
+ * committed-memory HTML); the full text is preserved in `text`/`description`.
+ */
+const MAX_TITLE_LEN = 50;
+function truncateTitle(title: string): string {
+	return title.length > MAX_TITLE_LEN ? `${title.slice(0, MAX_TITLE_LEN).trimEnd()}…` : title;
+}
+
 function readMessages(rawResult: unknown): string | undefined {
 	if (typeof rawResult !== "object" || rawResult === null) return undefined;
 	const m = (rawResult as { messages?: unknown }).messages;
@@ -54,7 +65,7 @@ export function normalizeSlackThread(
 	const replyIdx = blob.indexOf(REPLY_MARKER);
 	const parentSegment = replyIdx === -1 ? blob : blob.slice(0, replyIdx);
 	const titleMatch = PARENT_BODY_RE.exec(parentSegment);
-	const title = titleMatch !== null ? titleMatch[1].trim() : `Slack thread ${parentTs}`;
+	const title = titleMatch !== null ? truncateTitle(titleMatch[1].trim()) : `Slack thread ${parentTs}`;
 	const replyMatch = REPLY_COUNT_RE.exec(blob);
 	const replyCount = replyMatch !== null ? Number(replyMatch[1]) : 0;
 

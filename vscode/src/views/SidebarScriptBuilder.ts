@@ -2902,15 +2902,13 @@ export function buildSidebarScript(): string {
   // opaque per-source fields rows, and an Open-in-<Source> link.
   function renderReferenceHoverCard(mapKey, h) {
     if (!h) return null;
-    // Title row: bold title plus a tiny source badge so the user can tell
-    // at a glance which provider the reference came from (L / J / G / N).
-    // Per-source colour is intentionally NOT applied — the Linear-only
-    // ancestor of this card explicitly rejected brand tints to keep rows
-    // visually uniform; the badge alone is the minimum-viable surfacing.
-    const sourceMeta = SOURCE_META[h.source];
-    const sourceLabel = sourceMeta ? sourceMeta.letter : (h.source || '').slice(0, 1).toUpperCase();
+    // Title row: bold title prefixed by the shared per-source context badge
+    // (ctxBadge) so the provider reads identically here and on the sidebar
+    // context rows (same solid letter chip, same brand hue). The Linear-only
+    // ancestor's "no brand tints" rule was reversed in favour of matching
+    // committed-memory styling — see the ctxBadge comment above.
     const titleRow = el('div', { className: 'hc-title' }, [
-      el('span', { className: 'hc-source-badge', text: sourceLabel }),
+      ctxBadge('reference', h.source),
       el('span', { text: h.title }),
     ]);
     const kids = [titleRow];

@@ -745,7 +745,7 @@ How to do?`;
 		expect(extractRef(slackDefinition, { ...CANON, title: "" }, tool, ts)).toBeNull();
 	});
 
-	it("captures a linkless thread (no url, no url field, no <url> line) when the canonical object has no url", () => {
+	it("voids a thread with no resolvable url — linkless threads are not stored", () => {
 		const canonNoUrl = {
 			channelId: "C0BFF9UHBD1",
 			parentTs: "1783413984.700009",
@@ -753,25 +753,7 @@ How to do?`;
 			text: THREAD_TEXT,
 			replyCount: 2,
 		};
-		const ref = extractRef(slackDefinition, canonNoUrl, tool, ts);
-		expect(ref).toEqual({
-			mapKey: "slack:C0BFF9UHBD1-1783413984.700009",
-			source: "slack",
-			nativeId: "C0BFF9UHBD1-1783413984.700009",
-			title: "Consolidate the existing Linear / Jira / GitHub / Notion …",
-			fields: [
-				{ key: "entity-type", label: "Type", value: "thread", icon: "comment-discussion" },
-				{ key: "replies", label: "Replies", value: "2", icon: "reply" },
-				{ key: "channel", label: "Channel", value: "C0BFF9UHBD1", icon: "symbol-namespace" },
-			],
-			description: THREAD_TEXT,
-			toolName: tool,
-			referencedAt: ts,
-		});
-		expect(ref?.url).toBeUndefined();
-		expect(renderBlock(slackDefinition, [ref as Reference])).toBe(
-			`<slack-threads>\n<thread id="C0BFF9UHBD1-1783413984.700009" entity-type="thread" replies="2" channel="C0BFF9UHBD1">\n  <title>Consolidate the existing Linear / Jira / GitHub / Notion …</title>\n  <messages>\n${THREAD_TEXT}\n  </messages>\n</thread>\n</slack-threads>`,
-		);
+		expect(extractRef(slackDefinition, canonNoUrl, tool, ts)).toBeNull();
 	});
 
 	it("renders an empty string for no refs", () => {
