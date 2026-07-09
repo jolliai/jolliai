@@ -28,7 +28,7 @@ export interface SourceMeta {
 }
 
 /**
- * Metadata for the five built-in sources. Colors match the prior per-file
+ * Metadata for the seven built-in sources. Colors match the prior per-file
  * `.mem-ctx-badge--<source>` CSS rules byte-for-byte; letters match the prior
  * per-file switch statements, with one intentional normalization: the
  * hover-card badge previously showed 'GH' for GitHub while every other call
@@ -43,6 +43,8 @@ export const SOURCE_META: Record<KnownSourceId, SourceMeta> = {
 	github: { label: "GitHub", letter: "G", icon: "issues", color: "#6e7681" },
 	notion: { label: "Notion", letter: "N", icon: "file-text", color: "#787774" },
 	slack: { label: "Slack", letter: "S", icon: "comment-discussion", color: "#4a154b" },
+	"zoom-meeting": { label: "Zoom Meeting", letter: "Z", icon: "device-camera-video", color: "#2D8CFF" },
+	"zoom-doc": { label: "Zoom Doc", letter: "Z", icon: "file", color: "#2D8CFF" },
 };
 
 /** Neutral badge color for a source outside {@link SOURCE_META} (matches the prior `.mem-ctx-badge--reference` fallback hue). */

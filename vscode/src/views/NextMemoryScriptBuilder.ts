@@ -319,7 +319,13 @@ export function buildNextMemoryScript(): string {
     const aiExcluded = !!(rel && rel.autoExclude);
     // Main row: identity (badge + title) + hover-overlay actions only.
     const row = el('div', { className: 'row', 'data-id': item.id });
-    row.appendChild(ctxBadge(item.contextValue, item.iconKey));
+    // A reference badge's letter/hue keys off the SOURCE id (forwarded via
+    // referenceHover.source), NOT item.iconKey. iconKey is the codicon id (e.g.
+    // 'device-camera-video' for zoom-meeting), which misses SOURCE_META and
+    // falls back to a neutral 'D' badge. Mirrors the sidebar's renderPlanRow so
+    // both surfaces show the identical per-source square (e.g. 'Z' for Zoom).
+    const badgeSource = item.contextValue === 'reference' && item.referenceHover ? item.referenceHover.source : '';
+    row.appendChild(ctxBadge(item.contextValue, badgeSource));
     row.appendChild(el('div', { className: 'r-main' }, [el('div', { className: 'r-title', text: item.label })]));
     let toggleMsg;
     let removeCmd;

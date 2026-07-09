@@ -23,6 +23,8 @@
  * layer was deleted once this parser became the only caller.
  */
 
+import { lstatSync, readFileSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { createLogger } from "../../Logger.js";
 import { CLAUDE_SHELL_TOOL_NAMES, CLAUDE_TOOL_PREFIXES } from "./bindings/claude/index.js";
 import { matchCliCommand } from "./bindings/cli/index.js";
@@ -31,6 +33,7 @@ import { scanUserPermalinks } from "./SlackPermalink.js";
 import type { SourceDefinition } from "./SourceDefinition.js";
 import { getRegistry } from "./SourceDefinitionRegistry.js";
 import { normalizeSlackThread } from "./sources/SlackNormalize.js";
+import { normalizeZoomDoc } from "./sources/ZoomDocNormalize.js";
 import type {
 	EnvelopeParseResult,
 	ExtractOptions,
@@ -67,11 +70,12 @@ interface PendingEntry {
 	 *  `is_error: true`. MCP entries set this false to keep prior behaviour. */
 	readonly requireSuccess: boolean;
 	/**
-	 * The tool_use `input`, retained only for Slack (`def.id === "slack"`).
-	 * Slack's `normalize` needs both the tool result payload AND out-of-payload
-	 * context (`channel_id` / `message_ts` from the originating tool_use) that no
-	 * other source needs — every other MCP source's `normalize` is `identity`
-	 * and never looks at this field.
+	 * The tool_use `input`, retained only for sources with a registered
+	 * {@link CONTEXT_NORMALIZERS} entry (Slack, zoom-doc). Those need the tool
+	 * result payload AND out-of-payload context from the originating tool_use —
+	 * Slack's `channel_id` / `message_ts`, zoom-doc's `fileId` — that no other
+	 * source needs; every other MCP source's `normalize` is `identity` and never
+	 * looks at this field.
 	 */
 	readonly toolInput?: unknown;
 }
@@ -189,10 +193,11 @@ function collectToolUses(
 				def: mcpDef,
 				normalize: identity,
 				requireSuccess: false,
-				// Only Slack's normalize needs the tool_use input (channel_id /
-				// message_ts); every other source's `normalize` is `identity` and
+				// Only sources with a registered context-normalizer read the
+				// tool_use input (Slack's channel_id/message_ts, zoom-doc's
+				// fileId); every other source's `normalize` is `identity` and
 				// never reads `toolInput`, so it's left undefined for them.
-				...(mcpDef.id === "slack" ? { toolInput: b.input } : {}),
+				...(CONTEXT_NORMALIZER_IDS.has(mcpDef.id) ? { toolInput: b.input } : {}),
 			});
 			continue;
 		}
@@ -230,6 +235,70 @@ function readSlackToolInput(input: unknown): { channelId: string; messageTs: str
 	/* v8 ignore stop */
 	return { channelId, messageTs };
 }
+
+/** `{fileId}` off a zoom-doc tool_use's `input`, or undefined if malformed. */
+function readZoomDocToolInput(input: unknown): { fileId: string } | undefined {
+	/* v8 ignore start -- defensive: real `hub_get_file_content` tool_use input always carries fileId; guarded for totality against a malformed/future MCP shape. */
+	if (!isObject(input)) return undefined;
+	const fileId = (input as { fileId?: unknown }).fileId;
+	if (typeof fileId !== "string" || fileId.length === 0) return undefined;
+	/* v8 ignore stop */
+	return { fileId };
+}
+
+/**
+ * Parse-scoped context a context-aware normalizer may read beyond the tool
+ * result payload: the pasted-permalink map and the caller's `ExtractOptions`
+ * (workspace url, etc.).
+ */
+interface ContextNormalizeEnv {
+	readonly permalinks: Map<string, string>;
+	readonly opts: ExtractOptions;
+}
+
+/**
+ * Closed registry of context-aware normalizers, keyed by source id. A source
+ * belongs here IFF its canonical shape needs out-of-payload context — the
+ * originating tool_use `input`, and/or parse-scoped state (permalink map,
+ * workspace url) — that the default `identity` path cannot supply. Every other
+ * MCP source's `normalize` is `identity` and never appears here.
+ *
+ * Returning null voids the reference. Adding a fourth such source is one entry
+ * here, not a new `def.id === …` branch in `collectToolResults`.
+ */
+const CONTEXT_NORMALIZERS: Record<
+	string,
+	(payload: unknown, toolInput: unknown, env: ContextNormalizeEnv) => object | null
+> = {
+	slack: (payload, toolInput, env) => {
+		const slackInput = readSlackToolInput(toolInput);
+		/* v8 ignore start -- defensive: paired with a real slack_read_thread tool_use, input is always well-formed. */
+		if (slackInput === undefined) return null;
+		/* v8 ignore stop */
+		const { channelId, messageTs } = slackInput;
+		const url =
+			env.permalinks.get(`${channelId}:${messageTs}`) ??
+			(env.opts.slackWorkspaceUrl !== undefined
+				? `${env.opts.slackWorkspaceUrl}/archives/${channelId}/p${messageTs.replace(".", "")}`
+				: undefined);
+		return normalizeSlackThread(payload, { channelId, url });
+	},
+	"zoom-doc": (payload, toolInput) => {
+		const zoomInput = readZoomDocToolInput(toolInput);
+		/* v8 ignore start -- defensive: paired with a real hub_get_file_content tool_use, input is always well-formed. */
+		if (zoomInput === undefined) return null;
+		/* v8 ignore stop */
+		return normalizeZoomDoc(payload, { fileId: zoomInput.fileId });
+	},
+};
+
+/**
+ * Own-key ids of {@link CONTEXT_NORMALIZERS}. Membership is checked through this
+ * set (own enumerable keys only) so a prototype-chain id (`toString`,
+ * `constructor`) can never resolve a normalizer — the same closed-registry
+ * boundary as SourceEngine's `TRANSFORM_NAMES`.
+ */
+const CONTEXT_NORMALIZER_IDS: ReadonlySet<string> = new Set(Object.keys(CONTEXT_NORMALIZERS));
 
 function collectToolResults(
 	blocks: readonly unknown[],
@@ -269,38 +338,45 @@ function collectToolResults(
 		try {
 			parsedPayload = JSON.parse(payloadText);
 		} catch (err) {
-			log.warn(
-				"Dropping tool_result for %s (%s): payload JSON.parse failed: %s | preview=%s",
-				b.tool_use_id,
-				pendingEntry.toolName,
-				(err as Error).message,
-				payloadText.slice(0, 200),
-			);
-			pending.delete(b.tool_use_id);
-			continue;
-		}
-
-		// Slack needs both the payload AND out-of-payload context (channel_id /
-		// message_ts from the tool_use, url from the permalink map or config) that
-		// no other source's `normalize` (all `identity`) reads — handled as a
-		// distinct branch rather than folding into `pendingEntry.normalize` so
-		// that hook stays a pure `(payload, command) => payload` shape for every
-		// other source.
-		if (pendingEntry.def.id === "slack") {
-			const slackInput = readSlackToolInput(pendingEntry.toolInput);
-			/* v8 ignore start -- defensive: paired with a real slack_read_thread tool_use, input is always well-formed. */
-			if (slackInput === undefined) {
+			// A result whose JSON exceeded Claude Code's tool-output cap is not in
+			// the transcript at all — the harness offloads it to a file and leaves
+			// only an "Output has been saved to <path>" pointer here. Recover the
+			// real payload from that file before giving up (e.g. get_meeting_assets,
+			// whose bundled transcript routinely blows the cap).
+			const recovered = recoverOffloadedPayload(payloadText);
+			if (recovered === undefined) {
+				log.warn(
+					"Dropping tool_result for %s (%s): payload JSON.parse failed: %s | preview=%s",
+					b.tool_use_id,
+					pendingEntry.toolName,
+					(err as Error).message,
+					payloadText.slice(0, 200),
+				);
 				pending.delete(b.tool_use_id);
 				continue;
 			}
-			/* v8 ignore stop */
-			const { channelId, messageTs } = slackInput;
-			const url =
-				permalinks.get(`${channelId}:${messageTs}`) ??
-				(opts.slackWorkspaceUrl !== undefined
-					? `${opts.slackWorkspaceUrl}/archives/${channelId}/p${messageTs.replace(".", "")}`
-					: undefined);
-			const canonical = normalizeSlackThread(parsedPayload, { channelId, url });
+			log.info(
+				"Recovered offloaded tool_result for %s (%s) from %s",
+				b.tool_use_id,
+				pendingEntry.toolName,
+				recovered.path,
+			);
+			parsedPayload = recovered.payload;
+		}
+
+		// A source whose canonical shape needs out-of-payload context (the
+		// tool_use input, and/or parse-scoped state like the permalink map /
+		// workspace url) runs its registered context-normalizer here instead of
+		// the identity path — a single data-driven branch rather than one
+		// `def.id === …` block per such source. Membership goes through
+		// CONTEXT_NORMALIZER_IDS (own keys only) so a prototype-chain id can
+		// never resolve a function, and every other source's `normalize` stays a
+		// pure `(payload, command) => payload` hook.
+		const contextNormalize = CONTEXT_NORMALIZER_IDS.has(pendingEntry.def.id)
+			? CONTEXT_NORMALIZERS[pendingEntry.def.id]
+			: undefined;
+		if (contextNormalize !== undefined) {
+			const canonical = contextNormalize(parsedPayload, pendingEntry.toolInput, { permalinks, opts });
 			if (canonical === null) {
 				pending.delete(b.tool_use_id);
 				continue;
@@ -339,4 +415,64 @@ function extractResultPayloadText(content: unknown): string | undefined {
 	}
 	return parts.length > 0 ? parts.join("") : undefined;
 	/* v8 ignore stop */
+}
+
+/** Cap on an offloaded file we'll read back — generous vs. observed ~130 KB bundles, but bounds a pathological read. */
+const MAX_OFFLOAD_BYTES = 10 * 1024 * 1024;
+/**
+ * Claude Code offloads an oversized tool result to a file and leaves only a
+ * pointer in the transcript — and it does so with TWO distinct wordings:
+ *  1. Oversized-result error path: "…exceeds maximum allowed tokens. Output has
+ *     been saved to <path>." (e.g. a ~120 KB get_meeting_assets bundle).
+ *  2. Large non-error persistence path: a `<persisted-output>` wrapper reading
+ *     "Output too large (N KB). Full output saved to: <path>" then a truncated
+ *     preview (e.g. a ~65 KB hub_get_file_content doc).
+ * Each capture group is the path (to end-of-line); recovery tries all patterns
+ * so neither wording silently drops the reference.
+ */
+const OFFLOAD_POINTER_RES: readonly RegExp[] = [
+	/exceeds maximum allowed tokens\. Output has been saved to (.+)/,
+	/Output too large \([^)]*\)\. Full output saved to: (.+)/,
+];
+
+/**
+ * When a tool result exceeds Claude Code's output cap, the transcript carries a
+ * pointer string instead of the JSON; the real payload is on disk. Detect that
+ * pointer, read the file back, and JSON-parse it. Returns undefined for any
+ * non-offload parse failure, a path not sitting directly in the harness
+ * `tool-results/` offload dir, a traversal attempt, a symlink, a
+ * missing/oversized file, or a still-unparseable body — every such case falls
+ * through to the caller's existing drop.
+ */
+function recoverOffloadedPayload(payloadText: string): { payload: unknown; path: string } | undefined {
+	let match: RegExpExecArray | null = null;
+	for (const re of OFFLOAD_POINTER_RES) {
+		match = re.exec(payloadText);
+		if (match !== null) break;
+	}
+	if (match === null) return undefined;
+	// The pointer sits on its own line and ends the sentence, so trim the line
+	// and strip a single trailing period before the "Format: …" schema hint.
+	let path = match[1].split("\n")[0].trim();
+	if (path.endsWith(".")) path = path.slice(0, -1);
+	// Containment: only read a file sitting DIRECTLY in Claude Code's
+	// `tool-results/` offload dir, and never a traversal path. Requiring
+	// `tool-results` as the immediate parent (not merely a segment somewhere in
+	// the path) keeps a crafted pointer from walking us into an unrelated tree
+	// that happens to contain a `tool-results` component. The config/transcript
+	// is not trusted with an arbitrary read.
+	if (!isAbsolute(path)) return undefined;
+	if (path.includes("..")) return undefined;
+	const segments = path.split(/[\\/]/);
+	if (segments[segments.length - 2] !== "tool-results") return undefined;
+	try {
+		// `lstatSync` (not `statSync`): a symlinked offload file reports
+		// `isFile() === false` here, so the existing guard rejects it — the real
+		// path Claude Code writes is a plain file, never a link.
+		const stat = lstatSync(path);
+		if (!stat.isFile() || stat.size > MAX_OFFLOAD_BYTES) return undefined;
+		return { payload: JSON.parse(readFileSync(path, "utf8")), path };
+	} catch {
+		return undefined;
+	}
 }
