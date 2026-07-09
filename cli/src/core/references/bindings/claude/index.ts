@@ -23,8 +23,16 @@ export const CLAUDE_SHELL_TOOL_NAMES: ReadonlySet<string> = new Set(["Bash"]);
 /**
  * Tool-name prefixes for the envelope's cheap per-line substring pre-filter.
  * Derived from the `SourceDefinitionRegistry` so match identity has a single
- * source of truth.
+ * source of truth. De-duplicated: two definitions can share the same MCP
+ * prefix (e.g. zoom-meeting and zoom-doc both live under
+ * `mcp__claude_ai_Zoom_for_Claude__`, disambiguated later by `acceptSuffix`),
+ * and this list only feeds a `.some()` pre-filter, so a repeated needle would
+ * be redundant rather than incorrect — dedupe keeps it a clean prefix set.
  */
-export const CLAUDE_TOOL_PREFIXES: ReadonlyArray<string> = getRegistry()
-	.all()
-	.flatMap((d) => d.match.claude?.prefixes ?? []);
+export const CLAUDE_TOOL_PREFIXES: ReadonlyArray<string> = [
+	...new Set(
+		getRegistry()
+			.all()
+			.flatMap((d) => d.match.claude?.prefixes ?? []),
+	),
+];

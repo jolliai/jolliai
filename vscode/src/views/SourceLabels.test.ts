@@ -34,4 +34,14 @@ describe("getSourceMeta", () => {
 			expect(meta.icon).toBe("link");
 		}
 	});
+
+	it("has bespoke Zoom Meeting badge metadata", () => {
+		const m = getSourceMeta("zoom-meeting");
+		expect(m).toEqual({ label: "Zoom Meeting", letter: "Z", icon: "device-camera-video", color: "#2D8CFF" });
+	});
+
+	it("has bespoke Zoom Doc badge metadata", () => {
+		const m = getSourceMeta("zoom-doc");
+		expect(m).toEqual({ label: "Zoom Doc", letter: "Z", icon: "file", color: "#2D8CFF" });
+	});
 });

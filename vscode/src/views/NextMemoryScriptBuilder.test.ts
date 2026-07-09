@@ -41,6 +41,15 @@ describe("buildNextMemoryScript", () => {
 		expect(js).toContain("mem-ctx-badge");
 	});
 
+	it("derives the reference badge from referenceHover.source, not the codicon iconKey", () => {
+		// Regression: passing item.iconKey (e.g. 'device-camera-video' for a
+		// zoom-meeting) into ctxBadge misses SOURCE_META and falls back to a
+		// neutral 'D' badge; the sidebar keys off referenceHover.source ('Z').
+		const js = buildNextMemoryScript();
+		expect(js).toContain("item.referenceHover ? item.referenceHover.source");
+		expect(js).not.toContain("ctxBadge(item.contextValue, item.iconKey)");
+	});
+
 	it("renders file rows with the git-status letter", () => {
 		const js = buildNextMemoryScript();
 		expect(js).toContain("'gs gs-' + item.gitStatus");

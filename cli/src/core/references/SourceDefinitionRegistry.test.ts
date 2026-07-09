@@ -22,12 +22,12 @@ describe("SourceDefinitionRegistry", () => {
 		expect(r.match("codex", "linear.get_issue")?.id).toBe("linear"); // invocation-tool path (no namespace)
 	});
 
-	it("all() is stable order linear,jira,github,notion,slack", () => {
+	it("all() is stable order linear,jira,github,notion,slack,zoom-meeting,zoom-doc", () => {
 		expect(
 			getRegistry()
 				.all()
 				.map((d) => d.id),
-		).toEqual(["linear", "jira", "github", "notion", "slack"]);
+		).toEqual(["linear", "jira", "github", "notion", "slack", "zoom-meeting", "zoom-doc"]);
 	});
 
 	it("byId() finds a known definition and returns undefined for unknown ids", () => {
@@ -281,5 +281,22 @@ describe("SourceDefinitionRegistry", () => {
 			],
 		};
 		expect(validateDefinition(ok).ok).toBe(true);
+	});
+
+	describe("zoom-meeting registration", () => {
+		it("resolves get_meeting_assets to zoom-meeting", () => {
+			const def = getRegistry().match("claude", "mcp__claude_ai_Zoom_for_Claude__get_meeting_assets");
+			expect(def?.id).toBe("zoom-meeting");
+		});
+		it("does NOT match other Zoom tools (suffix gate)", () => {
+			expect(getRegistry().match("claude", "mcp__claude_ai_Zoom_for_Claude__search_meetings")).toBeUndefined();
+		});
+	});
+
+	describe("zoom-doc registration", () => {
+		it("resolves hub_get_file_content to zoom-doc", () => {
+			const def = getRegistry().match("claude", "mcp__claude_ai_Zoom_for_Claude__hub_get_file_content");
+			expect(def?.id).toBe("zoom-doc");
+		});
 	});
 });
