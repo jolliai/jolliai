@@ -38,6 +38,7 @@ object ClaudeBinding {
 		Rule("mcp__linear__", SourceId.linear),
 		Rule("mcp__claude_ai_Linear__", SourceId.linear),
 		Rule("mcp__claude_ai_Notion__", SourceId.notion, accept = { it.endsWith("notion-fetch") }),
+		Rule("mcp__claude_ai_Slack__", SourceId.slack, accept = { it.endsWith("slack_read_thread") }),
 	)
 
 	/** Tool-name prefixes for the envelope's cheap per-line substring pre-filter. */

@@ -317,6 +317,7 @@ object SessionTracker {
             knowledgeBasePath = update.knowledgeBasePath ?: existing.knowledgeBasePath,
             knowledgeBaseSort = update.knowledgeBaseSort ?: existing.knowledgeBaseSort,
             storageMode = update.storageMode ?: existing.storageMode,
+            slack = update.slack ?: existing.slack,
         )
         atomicWrite(File(dir, CONFIG_FILE), gson.toJson(merged))
         writeSharedCredentials(dir, merged.jolliApiKey, merged.authToken)

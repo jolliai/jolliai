@@ -75,7 +75,7 @@ object NotionAdapter : SourceAdapter {
 	private fun renderOne(ref: Reference, maxChars: Int): String = buildString {
 		appendLine("<page id=\"${PromptXmlEscape.escapeForAttr(ref.nativeId)}\">")
 		appendLine("  <title>${PromptXmlEscape.escapeForText(ref.title)}</title>")
-		appendLine("  <url>${PromptXmlEscape.escapeForText(ref.url)}</url>")
+		appendLine("  <url>${PromptXmlEscape.escapeForText(ref.url.orEmpty())}</url>")
 		if (ref.description != null) {
 			appendLine("  <content>")
 			appendLine(PromptXmlEscape.escapeForText(truncate(ref.description, maxChars)))

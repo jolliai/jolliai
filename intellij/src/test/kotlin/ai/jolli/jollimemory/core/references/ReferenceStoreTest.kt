@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.core.references
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 import io.kotest.matchers.string.shouldStartWith
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
@@ -147,6 +148,42 @@ class ReferenceStoreTest {
 			val md = ReferenceStore.renderMarkdown(minimalRef)
 			md shouldStartWith "---\n"
 			md shouldContain "\n---\n"
+		}
+
+		@Test
+		fun `omits url line for a linkless reference and parses back as null`() {
+			val linkless = Reference(
+				mapKey = "slack:C0123ABCD-1699999999.001200",
+				source = SourceId.slack,
+				nativeId = "C0123ABCD-1699999999.001200",
+				title = "Deploy plan discussion",
+				url = null,
+				toolName = "mcp__claude_ai_Slack__slack_read_thread",
+				referencedAt = "2024-06-01T12:00:00Z",
+			)
+			val md = ReferenceStore.renderMarkdown(linkless)
+			md shouldNotContain "url:"
+			val parsed = ReferenceStore.readReferenceMarkdownFromString(md)
+			parsed shouldNotBe null
+			parsed!!.source shouldBe SourceId.slack
+			parsed.nativeId shouldBe "C0123ABCD-1699999999.001200"
+			parsed.url shouldBe null
+		}
+
+		@Test
+		fun `round-trips a slack reference with url`() {
+			val ref = Reference(
+				mapKey = "slack:C1-1699999999.000100",
+				source = SourceId.slack,
+				nativeId = "C1-1699999999.000100",
+				title = "Topic",
+				url = "https://my-team.slack.com/archives/C1/p1699999999000100",
+				toolName = "mcp__claude_ai_Slack__slack_read_thread",
+				referencedAt = "2024-06-01T12:00:00Z",
+			)
+			val parsed = ReferenceStore.readReferenceMarkdownFromString(ReferenceStore.renderMarkdown(ref))
+			parsed shouldNotBe null
+			parsed!!.url shouldBe "https://my-team.slack.com/archives/C1/p1699999999000100"
 		}
 
 		@Test

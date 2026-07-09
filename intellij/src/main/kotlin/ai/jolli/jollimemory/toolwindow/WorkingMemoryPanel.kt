@@ -360,6 +360,7 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
         SourceId.jira -> "J"
         SourceId.github -> "GH"
         SourceId.notion -> "No"
+        SourceId.slack -> "S"
     }
 
     fun dispose() {

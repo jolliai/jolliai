@@ -25,6 +25,14 @@ object ClaudeEnvelopeParser : TranscriptEnvelopeParser {
 		val normalize: (JsonElement?) -> JsonElement?,
 		/** CLI (shell) entries require a successful command. */
 		val requireSuccess: Boolean,
+		/**
+		 * The tool_use `input`, retained only for Slack (`adapter.id == slack`).
+		 * Slack's normalize needs both the payload AND out-of-payload context
+		 * (`channel_id` / `message_ts` from the originating tool_use) that no other
+		 * source needs — every other MCP source's normalize is identity and never
+		 * looks at this field.
+		 */
+		val toolInput: JsonObject? = null,
 	)
 
 	override fun parse(lines: List<String>, opts: ExtractOptions, adapters: List<SourceAdapter>): EnvelopeParseResult {
@@ -38,6 +46,11 @@ object ClaudeEnvelopeParser : TranscriptEnvelopeParser {
 		val pending = mutableMapOf<String, PendingEntry>()
 		val results = mutableListOf<NormalizedToolResult>()
 		var lastConsumed = fromLine
+		// Slack's normalize needs a url no MCP payload carries; the pasted permalink
+		// (if any) is the only place it lives. Scanned once up front so every user
+		// text line is visited exactly once regardless of how many Slack
+		// tool_results follow it.
+		val permalinks = SlackPermalink.scanUserPermalinks(lines)
 
 		for (i in fromLine until lines.size) {
 			val line = lines[i]
@@ -64,7 +77,7 @@ object ClaudeEnvelopeParser : TranscriptEnvelopeParser {
 
 			when (role) {
 				"assistant" -> collectToolUses(blocks, timestamp, opts.beforeTimestamp, pending, adapterFor)
-				"user" -> collectToolResults(blocks, i + 1, timestamp, opts.beforeTimestamp, pending, results)
+				"user" -> collectToolResults(blocks, i + 1, timestamp, opts.beforeTimestamp, pending, results, permalinks, opts)
 			}
 		}
 
@@ -107,8 +120,20 @@ object ClaudeEnvelopeParser : TranscriptEnvelopeParser {
 				adapter = adapter,
 				normalize = resolved.normalize,
 				requireSuccess = resolved.kind == ClaudeBinding.Kind.cli,
+				// Only Slack's normalize needs the tool_use input (channel_id /
+				// message_ts); every other source's normalize is identity and never
+				// reads toolInput, so it's left null for them.
+				toolInput = if (adapter.id == SourceId.slack) input else null,
 			)
 		}
+	}
+
+	/** `{channelId, messageTs}` off a Slack tool_use's `input`, or null if malformed. */
+	private fun readSlackToolInput(input: JsonObject?): Pair<String, String>? {
+		if (input == null) return null
+		val channelId = input.stringOrNull("channel_id") ?: return null
+		val messageTs = input.stringOrNull("message_ts") ?: return null
+		return channelId to messageTs
 	}
 
 	private fun collectToolResults(
@@ -118,6 +143,8 @@ object ClaudeEnvelopeParser : TranscriptEnvelopeParser {
 		beforeTimestamp: String?,
 		pending: MutableMap<String, PendingEntry>,
 		results: MutableList<NormalizedToolResult>,
+		permalinks: Map<String, String>,
+		opts: ExtractOptions,
 	) {
 		if (beforeTimestamp != null && timestamp != null && timestamp > beforeTimestamp) return
 		for (block in blocks) {
@@ -144,6 +171,45 @@ object ClaudeEnvelopeParser : TranscriptEnvelopeParser {
 				pending.remove(toolUseId)
 				continue
 			}
+
+			// Slack needs both the payload AND out-of-payload context (channel_id /
+			// message_ts from the tool_use, url from the permalink map or config) that
+			// no other source's identity normalize reads. Handled as a distinct branch:
+			// build a synthetic canonical payload the SlackAdapter reads with plain
+			// paths, keeping SourceAdapter.extractRef's signature unchanged.
+			if (pendingEntry.adapter.id == SourceId.slack) {
+				val slackInput = readSlackToolInput(pendingEntry.toolInput)
+				if (slackInput == null) {
+					pending.remove(toolUseId)
+					continue
+				}
+				val (channelId, messageTs) = slackInput
+				val url = permalinks["$channelId:$messageTs"]
+					?: opts.slackWorkspaceUrl?.let { "$it/archives/$channelId/p${messageTs.replace(".", "")}" }
+				val canonical = SlackNormalize.normalizeSlackThread(parsedPayload, channelId, url)
+				if (canonical == null) {
+					pending.remove(toolUseId)
+					continue
+				}
+				val synthetic = JsonObject().apply {
+					addProperty("channelId", canonical.channelId)
+					addProperty("parentTs", canonical.parentTs)
+					addProperty("title", canonical.title)
+					addProperty("text", canonical.text)
+					addProperty("replyCount", canonical.replyCount)
+					if (canonical.url != null) addProperty("url", canonical.url)
+				}
+				results.add(NormalizedToolResult(
+					adapter = pendingEntry.adapter,
+					toolName = pendingEntry.toolName,
+					payload = synthetic,
+					lineNumber = lineNumber,
+					referencedAt = timestamp ?: "",
+				))
+				pending.remove(toolUseId)
+				continue
+			}
+
 			results.add(NormalizedToolResult(
 				adapter = pendingEntry.adapter,
 				toolName = pendingEntry.toolName,

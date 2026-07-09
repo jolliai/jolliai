@@ -1064,7 +1064,7 @@ class CommitsPanel(
             })
         }
         summary?.references?.forEach { ref ->
-            val url = ref.url.ifBlank { null }
+            val url = ref.url?.ifBlank { null }
             contextRows.add(contextRow(referenceTag(ref.source), ref.title, isLink = url != null) {
                 trackItemOpened("reference")
                 if (url != null) BrowserUtil.browse(url) else if (commit.hasSummary) viewSummary(commit.hash)
@@ -1461,6 +1461,7 @@ class CommitsPanel(
         ai.jolli.jollimemory.core.references.SourceId.jira -> "J"
         ai.jolli.jollimemory.core.references.SourceId.github -> "GH"
         ai.jolli.jollimemory.core.references.SourceId.notion -> "No"
+        ai.jolli.jollimemory.core.references.SourceId.slack -> "S"
     }
 
     /**

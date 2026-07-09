@@ -93,7 +93,7 @@ object LinearAdapter : SourceAdapter {
 		ref.fields?.forEach { f -> attrs.add("${f.key}=\"${PromptXmlEscape.escapeForAttr(f.value)}\"") }
 		appendLine("<issue ${attrs.joinToString(" ")}>")
 		appendLine("  <title>${PromptXmlEscape.escapeForText(ref.title)}</title>")
-		appendLine("  <url>${PromptXmlEscape.escapeForText(ref.url)}</url>")
+		appendLine("  <url>${PromptXmlEscape.escapeForText(ref.url.orEmpty())}</url>")
 		if (ref.description != null) {
 			appendLine("  <description>")
 			appendLine(PromptXmlEscape.escapeForText(truncate(ref.description, maxChars)))

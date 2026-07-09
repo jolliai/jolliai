@@ -113,7 +113,8 @@ class ClaudeBindingTest {
 	fun `TOOL_PREFIXES has all rule prefixes`() {
 		ClaudeBinding.TOOL_PREFIXES shouldBe listOf(
 			"mcp__github__", "mcp__claude_ai_GitHub__", "mcp__claude_ai_Atlassian__",
-			"mcp__linear__", "mcp__claude_ai_Linear__", "mcp__claude_ai_Notion__"
+			"mcp__linear__", "mcp__claude_ai_Linear__", "mcp__claude_ai_Notion__",
+			"mcp__claude_ai_Slack__"
 		)
 	}
 }

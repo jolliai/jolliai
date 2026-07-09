@@ -105,6 +105,7 @@ class PlansPanel(
         val TAG_GITHUB = JBColor(0x6E7681, 0x8B949E)
         val TAG_JIRA = JBColor(0x2A78C8, 0x3B82D6)
         val TAG_NOTION = JBColor(0x6B6B6B, 0x9B9B9B)
+        val TAG_SLACK = JBColor(0x611F69, 0x9B4D96)
     }
     private val emptyLabel = JBLabel("No plans or notes yet.", SwingConstants.CENTER)
     private var excludedReferences: Set<String> = emptySet()
@@ -275,6 +276,7 @@ class PlansPanel(
                 SourceId.github -> "GH"
                 SourceId.jira -> "J"
                 SourceId.notion -> "No"
+                SourceId.slack -> "S"
             }
         }
         val cwd = service.mainRepoRoot ?: project.basePath ?: return
@@ -606,9 +608,10 @@ class PlansPanel(
         val popup = JPopupMenu()
         if (item is ListItem.ReferenceItem) {
             popup.add(JMenuItem("Preview", JolliMemoryIcons.Eye).apply { addActionListener { openReference(item.ref) } })
-            if (item.ref.url.isNotBlank()) {
+            val refUrl = item.ref.url
+            if (!refUrl.isNullOrBlank()) {
                 popup.add(JMenuItem("Open in Browser", JolliMemoryIcons.Globe).apply {
-                    addActionListener { openReferenceInBrowser(item.ref.url) }
+                    addActionListener { openReferenceInBrowser(refUrl) }
                 })
             }
             popup.add(JSeparator())
@@ -627,6 +630,7 @@ class PlansPanel(
             SourceId.github -> "GH" to TAG_GITHUB
             SourceId.jira -> "J" to TAG_JIRA
             SourceId.notion -> "No" to TAG_NOTION
+            SourceId.slack -> "S" to TAG_SLACK
         }
     }
 
@@ -794,6 +798,7 @@ class PlansPanel(
             SourceId.jira -> "Jira"
             SourceId.github -> "GitHub"
             SourceId.notion -> "Notion"
+            SourceId.slack -> "Slack"
         }
 
         // Title
@@ -818,12 +823,13 @@ class PlansPanel(
         }
 
         // "Open in <Source>" link
-        if (ref.url.isNotBlank()) {
+        val refUrl = ref.url
+        if (!refUrl.isNullOrBlank()) {
             content.add(Box.createVerticalStrut(JBUI.scale(4)))
             content.add(JSeparator().apply { alignmentX = Component.LEFT_ALIGNMENT; maximumSize = Dimension(Int.MAX_VALUE, 1) })
             content.add(Box.createVerticalStrut(JBUI.scale(4)))
             val linkColor = JBUI.CurrentTheme.Link.Foreground.ENABLED
-            val url = ref.url
+            val url = refUrl
             content.add(JBLabel("Open in $sourceLabel").apply {
                 foreground = linkColor
                 cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)

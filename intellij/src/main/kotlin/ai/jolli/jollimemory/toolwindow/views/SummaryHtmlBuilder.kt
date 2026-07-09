@@ -725,9 +725,10 @@ $items
         SourceId.jira to "Jira",
         SourceId.github to "GitHub",
         SourceId.notion to "Notion",
+        SourceId.slack to "Slack",
     )
 
-    private val SOURCE_ORDER = listOf(SourceId.linear, SourceId.jira, SourceId.github, SourceId.notion)
+    private val SOURCE_ORDER = listOf(SourceId.linear, SourceId.jira, SourceId.github, SourceId.notion, SourceId.slack)
 
     /** Strips the `<source>:` prefix from archivedKey for DOM id use. */
     private fun stripSourcePrefix(archivedKey: String, source: SourceId): String {
@@ -746,12 +747,20 @@ $items
     private fun buildReferenceRow(e: ReferenceCommitRef): String {
         val sourceLabel = SOURCE_TITLES[e.source] ?: e.source.name
         val domKey = stripSourcePrefix(e.archivedKey, e.source)
+        // A reference may be linkless (Slack thread with no permalink / workspace URL) —
+        // omit the "Open in <source>" button entirely when there's no url to open.
+        val url = e.url
+        val openButton = if (!url.isNullOrEmpty()) {
+            """<button class="topic-action-btn" title="Open in $sourceLabel" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source.name)}" data-reference-url="${escAttr(url)}" data-action="openReferenceExternal">&#x1F30D;</button>"""
+        } else {
+            ""
+        }
         return """
   <div class="plan-item" id="reference-${escAttr(e.source.name)}-${escAttr(domKey)}">
     <div class="plan-header">
       <a class="plan-title plan-title-link" href="#" title="Click to preview" data-action="previewReference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source.name)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}">${escHtml(e.nativeId)} &mdash; ${escHtml(e.title)}</a>
       <span class="plan-header-actions">
-        <button class="topic-action-btn" title="Open in $sourceLabel" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source.name)}" data-reference-url="${escAttr(e.url)}" data-action="openReferenceExternal">&#x1F30D;</button>
+        $openButton
         <button class="topic-action-btn plan-edit-btn" title="Edit $sourceLabel snapshot" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source.name)}" data-action="loadReferenceContent">&#x270E;</button>
         <button class="topic-action-btn plan-remove-btn" title="Remove $sourceLabel Reference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source.name)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}" data-action="removeReference">&#x1F5D1;</button>
       </span>

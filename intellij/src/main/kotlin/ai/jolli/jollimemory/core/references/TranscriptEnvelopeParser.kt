@@ -19,6 +19,14 @@ data class ExtractOptions(
 	val fromLineNumber: Int? = null,
 	/** Which envelope parser to use. Defaults to claude. */
 	val source: TranscriptSource? = null,
+	/**
+	 * Configured Slack workspace base URL (normalized origin, e.g.
+	 * `https://my-team.slack.com`). Used to reconstruct a thread permalink for a
+	 * `slack_read_thread` result when the user never pasted one — the MCP payload
+	 * carries neither a url nor the workspace subdomain. Slack-only; ignored by
+	 * every other source.
+	 */
+	val slackWorkspaceUrl: String? = null,
 )
 
 /** One MCP tool result, normalised across agents and ready for the shared payload walk. */

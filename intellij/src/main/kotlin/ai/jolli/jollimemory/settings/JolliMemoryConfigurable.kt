@@ -33,10 +33,12 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
     private var jolliApiKeyLabel: JBLabel? = null
     private var accountStatusLabel: JBLabel? = null
     private var accountButton: JButton? = null
+    private var slackWorkspaceUrlField: JBTextField? = null
 
     private var savedApiKey: String? = null
     private var savedModel: String? = null
     private var savedJolliApiKey: String? = null
+    private var savedSlackWorkspaceUrl: String? = null
 
     override fun getDisplayName(): String = "Jolli Memory"
 
@@ -44,6 +46,7 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
         apiKeyField = JBPasswordField()
         modelField = JBTextField()
         jolliApiKeyField = JBPasswordField()
+        slackWorkspaceUrlField = JBTextField()
         jolliApiKeyLabel = JBLabel("Jolli API Key:")
         accountStatusLabel = JBLabel()
         accountButton = JButton()
@@ -73,6 +76,9 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
             .addSeparator()
             .addLabeledComponent(jolliApiKeyLabel!!, jolliApiKeyField!!, 1, false)
             .addTooltip("For pushing summaries to Jolli Space (sk-jol-...). Fallback if not signed in.")
+            .addSeparator()
+            .addLabeledComponent(JBLabel("Slack Workspace URL:"), slackWorkspaceUrlField!!, 1, false)
+            .addTooltip("https://<workspace>.slack.com — reconstructs thread permalinks when none was pasted")
             .addComponentFillVertically(JPanel(), 0)
             .panel
     }
@@ -139,7 +145,8 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
     override fun isModified(): Boolean {
         return getApiKeyFieldText() != (savedApiKey ?: "") ||
             (modelField?.text ?: "") != (savedModel ?: "") ||
-            getJolliApiKeyFieldText() != (savedJolliApiKey ?: "")
+            getJolliApiKeyFieldText() != (savedJolliApiKey ?: "") ||
+            (slackWorkspaceUrlField?.text ?: "") != (savedSlackWorkspaceUrl ?: "")
     }
 
     override fun apply() {
@@ -148,12 +155,27 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
         val model = modelField?.text?.trim()?.ifBlank { null }
         val jolliApiKey = getJolliApiKeyFieldText().ifBlank { null }
 
+        // Slack workspace URL: blank clears it; otherwise validate + persist the
+        // normalized origin. A present-but-invalid value blocks the save (keeps the
+        // Settings dialog open) with a visible error rather than silently dropping it.
+        val slackRaw = slackWorkspaceUrlField?.text?.trim().orEmpty()
+        val slackWorkspaceUrl: String? = if (slackRaw.isEmpty()) {
+            null
+        } else {
+            SlackWorkspaceUrl.normalizeOrNull(slackRaw)
+                ?: throw com.intellij.openapi.options.ConfigurationException(
+                    "Slack Workspace URL must be an https://<workspace>.slack.com URL (got: $slackRaw)",
+                )
+        }
+
         val globalDir = SessionTracker.getGlobalConfigDir()
         val existing = SessionTracker.loadConfigFromDir(globalDir)
         val merged = existing.copy(
             apiKey = apiKey,
             model = model,
             jolliApiKey = jolliApiKey,
+            // Preserve any sibling slack fields; only workspaceUrl is user-editable here.
+            slack = (existing.slack ?: ai.jolli.jollimemory.core.SlackConfig()).copy(workspaceUrl = slackWorkspaceUrl),
         )
         SessionTracker.saveConfigToDir(merged, globalDir)
 
@@ -161,6 +183,9 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
         savedApiKey = apiKey ?: ""
         savedModel = model ?: ""
         savedJolliApiKey = jolliApiKey ?: ""
+        savedSlackWorkspaceUrl = slackWorkspaceUrl ?: ""
+        // Reflect the normalized origin back into the field so the user sees what was saved.
+        slackWorkspaceUrlField?.text = savedSlackWorkspaceUrl
     }
 
     override fun reset() {
@@ -174,10 +199,12 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
         savedApiKey = config.apiKey ?: ""
         savedModel = config.model ?: ""
         savedJolliApiKey = config.jolliApiKey ?: ""
+        savedSlackWorkspaceUrl = config.slack?.workspaceUrl ?: ""
 
         apiKeyField?.text = savedApiKey
         modelField?.text = savedModel
         jolliApiKeyField?.text = savedJolliApiKey
+        slackWorkspaceUrlField?.text = savedSlackWorkspaceUrl
     }
 
     private fun getApiKeyFieldText(): String {

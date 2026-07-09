@@ -8,7 +8,7 @@ import ai.jolli.jollimemory.core.TranscriptSource
  * [ALL_ADAPTERS] is the canonical list driven by the shared extractor.
  * Adding a new source = implementing a [SourceAdapter] and appending it here.
  */
-val ALL_ADAPTERS: List<SourceAdapter> = listOf(LinearAdapter, JiraAdapter, GitHubAdapter, NotionAdapter)
+val ALL_ADAPTERS: List<SourceAdapter> = listOf(LinearAdapter, JiraAdapter, GitHubAdapter, NotionAdapter, SlackAdapter)
 
 /**
  * Adapters applicable to a transcript source. Same instances for every source
