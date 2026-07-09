@@ -308,6 +308,28 @@ data class CommitSummary(
     val references: List<ReferenceCommitRef>? = null,
     val summaryError: String? = null,
     val transcripts: List<String>? = null,
+    /**
+     * CONTEXT items the AI relevance ranker judged unrelated to this commit and
+     * soft-excluded — kept OUT of the summary prompt but recorded here for
+     * traceability (the folder Markdown shows "AI judged N items unrelated").
+     * Distinct from user manual excludes, which are hard-discarded and never stored.
+     * Nullable + default null so Gson omits it and older summaries still deserialize.
+     */
+    val excludedContext: List<ExcludedContext>? = null,
+)
+
+/**
+ * One CONTEXT item the AI relevance ranker soft-excluded from a commit summary,
+ * with the reason it was judged unrelated. Stored on [CommitSummary.excludedContext].
+ */
+data class ExcludedContext(
+    /** "plan" | "note" | "reference". */
+    val kind: String,
+    /** slug (plan) / note id / reference mapKey. */
+    val key: String,
+    val title: String,
+    /** One-line AI reason it was judged unrelated to this change. */
+    val reason: String,
 )
 
 /** A single E2E test scenario */

@@ -435,20 +435,68 @@ object PostCommitHook {
                 return
             }
 
-            // 7b. Assemble reference blocks for prompt injection — branch-scoped to
-            //     this commit's branch (legacy blank-branch rows allowed) so the
-            //     summary prompt never sees another branch's references.
+            // 7b. Assemble CONTEXT (plans + notes + references) for prompt injection —
+            //     branch-scoped to this commit's branch for references (legacy blank-branch
+            //     rows allowed); plans/notes follow the user across branches (matching the
+            //     WorkingMemoryPanel gather + CLI). User hard-excludes are removed first.
             val branch = op.branch ?: git.getCurrentBranch() ?: "unknown"
             val registry = SessionTracker.loadPlansRegistry(cwd)
-            val referenceBlocks = PromptRenderer.assembleReferenceBlocks(
-                (registry.references ?: emptyMap()).filter { (_, entry) ->
-                    entry.branch.isNullOrBlank() || entry.branch == branch
-                },
-                exclusions.references,
-            )
-            if (referenceBlocks.isNotEmpty()) {
-                log.info("Reference blocks assembled: %d chars", referenceBlocks.length)
+
+            val userKeptPlans = registry.plans.values
+                .filter { it.commitHash == null && it.ignored != true && File(it.sourcePath).exists() && it.slug !in exclusions.plans }
+                .toList()
+            val userKeptNotes = (registry.notes ?: emptyMap()).values
+                .filter { it.commitHash == null && it.ignored != true && it.id !in exclusions.notes }
+                .toList()
+            val branchRefEntries = (registry.references ?: emptyMap()).filter { (_, entry) ->
+                entry.branch.isNullOrBlank() || entry.branch == branch
             }
+            val userKeptRefs = branchRefEntries
+                .filterKeys { it !in exclusions.references }
+                .values.toList()
+
+            // AI relevance: rank the user-kept CONTEXT against this change and soft-exclude
+            // clearly-unrelated items. Fully fail-open — ANY failure (git / content-read /
+            // LLM / parse) falls back to the full user-kept set with empty excludedContext.
+            // assessContextRelevance is itself fail-open (its ranker keeps all on error);
+            // this guard additionally covers the change-signal + partition steps around it.
+            // Soft-excluded plans/notes are recorded on the summary's excludedContext AND
+            // skipped from archival below, so they keep NO commitHash and stay in the working
+            // area for re-evaluation on the next commit (they are NOT hard-discarded).
+            var relevancePlans: List<PlanEntry> = userKeptPlans
+            var relevanceNotes: List<NoteEntry> = userKeptNotes
+            var excludedContext: List<ExcludedContext> = emptyList()
+            var aiExcludedRefKeys: Set<String> = emptySet()
+            var aiExcludedPlanSlugs: Set<String> = emptySet()
+            var aiExcludedNoteIds: Set<String> = emptySet()
+            try {
+                val changeSignal = ContextRelevance.buildChangeSignal(
+                    commitInfo.message, git.getChangedFileNames(op.commitHash), diff,
+                )
+                val decision = ContextRelevance.assessContextRelevance(
+                    ContextRelevance.RawContextEntries(userKeptPlans, userKeptNotes, userKeptRefs),
+                    changeSignal, config,
+                )
+                relevancePlans = decision.plans
+                relevanceNotes = decision.notes
+                excludedContext = decision.excludedContext
+                aiExcludedPlanSlugs = excludedContext.filter { it.kind == "plan" }.map { it.key }.toSet()
+                aiExcludedNoteIds = excludedContext.filter { it.kind == "note" }.map { it.key }.toSet()
+                aiExcludedRefKeys = excludedContext.filter { it.kind == "reference" }.map { it.key }.toSet()
+            } catch (e: Exception) {
+                log.warn("Context relevance assessment failed (%s) — using all user-kept context", e.message ?: e.toString())
+            }
+
+            val plansBlock = PlanPromptFormatter.formatPlansBlock(relevancePlans)
+            val notesBlock = NotePromptFormatter.formatNotesBlock(relevanceNotes)
+            val referenceBlocks = PromptRenderer.assembleReferenceBlocks(
+                branchRefEntries,
+                exclusions.references + aiExcludedRefKeys,
+            )
+            log.info(
+                "Prompt blocks: plans=%d notes=%d references(kept)=%d (AI soft-excluded %d)",
+                relevancePlans.size, relevanceNotes.size, userKeptRefs.size - aiExcludedRefKeys.size, excludedContext.size,
+            )
 
             log.info("Step 8: Calling LLM for summary generation (conversation=%d chars)", conversation.length)
             val summaryResult = Summarizer.generateSummary(Summarizer.SummarizeParams(
@@ -463,6 +511,8 @@ object PostCommitHook {
                 jolliApiKey = config.jolliApiKey,
                 aiProvider = config.aiProvider,
                 referenceBlocks = referenceBlocks.takeIf { it.isNotBlank() },
+                plansBlock = plansBlock.takeIf { it.isNotBlank() },
+                notesBlock = notesBlock.takeIf { it.isNotBlank() },
             ))
             log.info("Step 8: LLM call completed, topics=%d, recap=%s", summaryResult.topics?.size ?: 0, if (summaryResult.recap != null) "${summaryResult.recap!!.length} chars" else "null")
 
@@ -470,7 +520,9 @@ object PostCommitHook {
             val planRefs = mutableListOf<PlanReference>()
             val planProgressArtifacts = mutableListOf<PlanProgressArtifact>()
 
-            val uncommittedSlugs = detectUncommittedPlanSlugs(cwd, exclusions.plans)
+            // AI soft-excluded plans are skipped from archival (union with user excludes)
+            // so they keep NO commitHash and stay in the working area for re-evaluation.
+            val uncommittedSlugs = detectUncommittedPlanSlugs(cwd, exclusions.plans + aiExcludedPlanSlugs)
             if (uncommittedSlugs.isNotEmpty()) {
                 log.info("Detected %d uncommitted plan(s): %s", uncommittedSlugs.size, uncommittedSlugs.joinToString(", "))
                 val plansDir = File(System.getProperty("user.home"), ".claude/plans")
@@ -528,7 +580,8 @@ object PostCommitHook {
             val referenceFilesToStore = mutableListOf<FileWrite>()
             val referenceCommitted = mutableListOf<Triple<String, String, String>>() // mapKey, sourcePath, updatedAt
 
-            val uncommittedRefResult = detectUncommittedReferences(cwd, exclusions.references)
+            // AI soft-excluded references are skipped from archival (see plan path above).
+            val uncommittedRefResult = detectUncommittedReferences(cwd, exclusions.references + aiExcludedRefKeys)
             if (uncommittedRefResult.isNotEmpty()) {
                 log.info("Detected %d uncommitted reference(s)", uncommittedRefResult.size)
                 val shortHash = commitInfo.hash.substring(0, 8)
@@ -589,7 +642,7 @@ object PostCommitHook {
             run {
                 val noteNow = Instant.now().toString()
                 val shortHash = commitInfo.hash.take(8)
-                val uncommittedNotes = detectUncommittedNotes(cwd, exclusions.notes)
+                val uncommittedNotes = detectUncommittedNotes(cwd, exclusions.notes + aiExcludedNoteIds)
                 if (uncommittedNotes.isNotEmpty()) {
                     log.info("Detected %d uncommitted note(s): %s", uncommittedNotes.size, uncommittedNotes.keys.joinToString(", "))
                     for ((id, entry) in uncommittedNotes) {
@@ -659,6 +712,7 @@ object PostCommitHook {
                 plans = planRefs.takeIf { it.isNotEmpty() },
                 notes = noteRefs.takeIf { it.isNotEmpty() },
                 references = referenceCommitRefs.takeIf { it.isNotEmpty() },
+                excludedContext = excludedContext.takeIf { it.isNotEmpty() },
             )
 
             val storedTranscript = StoredTranscript(storedSessions)
