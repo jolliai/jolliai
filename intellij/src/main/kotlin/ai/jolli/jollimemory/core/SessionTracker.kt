@@ -213,10 +213,50 @@ object SessionTracker {
         // shared credentials on read so a re-login on any surface is picked up here (no
         // stale-key drift). Falls back to this file's own values when config.json is absent.
         val (sharedKey, sharedAuth) = readSharedCredentials(dir)
+        // The global-instructions consent is also account-level and cross-surface — the
+        // CLI/VS Code read + write it in the shared config.json. Overlay it the same way
+        // so a decision made on any surface (or by the CLI shell-out) is honored here.
+        val sharedGi = readSharedGlobalInstructions(dir)
         return base.copy(
             jolliApiKey = sharedKey ?: base.jolliApiKey,
             authToken = sharedAuth ?: base.authToken,
+            globalInstructions = sharedGi ?: base.globalInstructions,
         )
+    }
+
+    /** Reads globalInstructions from the shared config.json (or null if absent/unset). */
+    private fun readSharedGlobalInstructions(dir: String): String? {
+        val shared = File(dir, LEGACY_CONFIG_FILE)
+        if (!shared.exists()) return null
+        return try {
+            val obj = com.google.gson.JsonParser.parseString(shared.readText(Charsets.UTF_8)).asJsonObject
+            obj.get("globalInstructions")?.takeIf { !it.isJsonNull }?.asString?.takeIf { it.isNotBlank() }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Merges the global-instructions consent ("enabled" / "disabled") into the shared
+     * config.json at the JSON level — preserving every other field, mirroring
+     * [writeSharedCredentials] — so a decision made in IntelliJ propagates to the CLI
+     * and VS Code. A null value clears the key (back to undecided).
+     */
+    fun saveGlobalInstructions(value: String?) {
+        val dir = getGlobalConfigDir()
+        val shared = File(dir, LEGACY_CONFIG_FILE)
+        val obj = try {
+            if (shared.exists()) {
+                com.google.gson.JsonParser.parseString(shared.readText(Charsets.UTF_8)).asJsonObject
+            } else {
+                com.google.gson.JsonObject()
+            }
+        } catch (_: Exception) {
+            com.google.gson.JsonObject()
+        }
+        if (value != null) obj.addProperty("globalInstructions", value) else obj.remove("globalInstructions")
+        File(dir).mkdirs()
+        atomicWrite(shared, gson.toJson(obj))
     }
 
     /** Reads jolliApiKey/authToken from the shared config.json (or null/null if absent). */

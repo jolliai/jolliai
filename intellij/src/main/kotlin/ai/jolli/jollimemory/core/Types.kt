@@ -456,6 +456,13 @@ data class JolliMemoryConfig(
     val openCodeEnabled: Boolean? = null,
     val cursorEnabled: Boolean? = null,
     val copilotEnabled: Boolean? = null,
+    /**
+     * Tri-state consent for the machine-global skill-preference block written into
+     * ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md, ~/.codex/AGENTS.md: "enabled" /
+     * "disabled" / null (undecided). Cross-surface: persisted in the shared
+     * config.json so CLI / VS Code / IntelliJ agree. See GlobalInstructionsInstaller.
+     */
+    val globalInstructions: String? = null,
     /** AI summarization provider: "jolli" (proxy) or "anthropic" (direct). null defers to legacy "Anthropic wins" routing. */
     val aiProvider: String? = null,
     val logLevel: String? = null,

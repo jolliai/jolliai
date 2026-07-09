@@ -82,7 +82,45 @@ object JolliApiClient {
         val docId: Int? = null,
         val repoUrl: String? = null,
         val relativePath: String? = null,
+        /**
+         * Structured twin of [content] for `docType == "summary"` pushes: the enriched
+         * summary JSON carrying the raw `conversationTokens` / breakdown the "Task usage"
+         * markdown line renders, so the server receives exact numbers, not just prose.
+         * Null (and omitted by Gson) for plan/note pushes or when the JSON exceeds the
+         * server cap — see [serializeSummaryJson]. Mirrors the CLI/VS Code `summaryJson`
+         * field (cli/src/core/JolliMemoryPushOrchestrator.ts).
+         */
+        val summaryJson: String? = null,
     )
+
+    /**
+     * Byte cap for the serialized summary JSON riding on a summary push. The server
+     * rejects `summaryJson` above 2 MB; staying well under leaves headroom for the
+     * markdown `content` sharing the same request body. Oversized JSON is simply
+     * omitted — the markdown push must never fail on account of the sidecar. Matches
+     * `MAX_SUMMARY_JSON_BYTES` in cli/src/core/JolliMemoryPushOrchestrator.ts.
+     */
+    private const val MAX_SUMMARY_JSON_BYTES = 1_572_864
+
+    /**
+     * Serializes a summary for the [JolliPushPayload.summaryJson] field: the enriched
+     * summary (plan/note URLs woven in) minus the client push-state fields —
+     * `jolliDocId` / `jolliDocUrl` churn per push and `orphanedDocIds` is cleanup
+     * bookkeeping, none of which is commit content the share page should see. Returns
+     * null above [MAX_SUMMARY_JSON_BYTES] (push markdown only). Byte-for-byte port of
+     * the CLI `serializeSummaryJson`; keep in lockstep.
+     */
+    fun serializeSummaryJson(summary: ai.jolli.jollimemory.core.CommitSummary): String? {
+        val stripped = summary.copy(jolliDocId = null, jolliDocUrl = null, orphanedDocIds = null)
+        val json = gson.toJson(stripped)
+        if (json.toByteArray(Charsets.UTF_8).size > MAX_SUMMARY_JSON_BYTES) {
+            log.warn(
+                "Summary JSON for ${summary.commitHash.take(8)} exceeds $MAX_SUMMARY_JSON_BYTES bytes — pushing markdown only",
+            )
+            return null
+        }
+        return json
+    }
 
     /** Response from a successful push. */
     data class JolliPushResult(

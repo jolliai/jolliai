@@ -100,6 +100,7 @@ object JolliShareService {
                 docId = summary.jolliDocId,
                 repoUrl = repoUrl,
                 relativePath = relativePath,
+                summaryJson = JolliApiClient.serializeSummaryJson(summaryForMarkdown),
             ),
         )
 

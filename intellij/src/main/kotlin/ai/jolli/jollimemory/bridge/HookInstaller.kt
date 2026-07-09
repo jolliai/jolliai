@@ -193,9 +193,21 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             installGitHook("pre-push", PRE_PUSH_START, PRE_PUSH_END, prePushScript())
             installLog.appendLine("Git hooks installed")
 
-            // Install Claude Code skill file (.claude/skills/jolli-recall/SKILL.md)
+            // Install Jolli skill files (jolli-recall / jolli-search / jolli-pr) into both
+            // .claude/skills and the cross-platform .agents/skills.
             SkillInstaller(mainRepoRoot).updateSkillIfNeeded()
-            installLog.appendLine("Skill installed")
+            installLog.appendLine("Skills installed")
+
+            // Re-apply the machine-global skill-preference block per the user's saved consent.
+            // confirm=null → never prompts here (the Settings checkbox is the consent surface);
+            // this only writes when the user already opted in, removes when they opted out, and
+            // is a no-op while undecided. Fail-soft — never breaks enable.
+            try {
+                GlobalInstructionsInstaller.sync()
+                installLog.appendLine("Global instructions synced")
+            } catch (e: Exception) {
+                installLog.appendLine("Global instructions sync failed (non-fatal): ${e.message}")
+            }
 
             // Light up MCP + the full skill set (recall/search/pr) by shelling the bundled
             // CLI's integrations-only enable. Node-only: when Node is absent this is a clean

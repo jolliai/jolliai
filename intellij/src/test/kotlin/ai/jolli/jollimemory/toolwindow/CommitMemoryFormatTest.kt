@@ -141,4 +141,44 @@ class CommitMemoryFormatTest {
             CommitMemoryFormat.formatCost(0.004) shouldBe "<$0.01"
         }
     }
+
+    @Nested
+    inner class FormatTokensExact {
+        @Test
+        fun `renders raw counts below 1000 without separators`() {
+            CommitMemoryFormat.formatTokensExact(0) shouldBe "0"
+            CommitMemoryFormat.formatTokensExact(999) shouldBe "999"
+        }
+
+        @Test
+        fun `inserts comma thousands separators`() {
+            CommitMemoryFormat.formatTokensExact(1_000) shouldBe "1,000"
+            CommitMemoryFormat.formatTokensExact(1_000_000) shouldBe "1,000,000"
+            CommitMemoryFormat.formatTokensExact(3_000_000) shouldBe "3,000,000"
+        }
+    }
+
+    @Nested
+    inner class FormatExactCostUsd {
+        @Test
+        fun `renders two decimals at or above a cent`() {
+            CommitMemoryFormat.formatExactCostUsd(21.75) shouldBe "$21.75"
+            CommitMemoryFormat.formatExactCostUsd(0.01) shouldBe "$0.01"
+        }
+
+        @Test
+        fun `renders four decimals for a sub-cent value`() {
+            CommitMemoryFormat.formatExactCostUsd(0.0034) shouldBe "$0.0034"
+        }
+
+        @Test
+        fun `renders the floor for a value too small for four decimals`() {
+            CommitMemoryFormat.formatExactCostUsd(0.00001) shouldBe "<$0.0001"
+        }
+
+        @Test
+        fun `renders zero as all-zeros`() {
+            CommitMemoryFormat.formatExactCostUsd(0.0) shouldBe "$0.00"
+        }
+    }
 }
