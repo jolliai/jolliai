@@ -15,7 +15,7 @@ object TranscriptReferenceDiscovery {
 
 	private val log = JmLogger.create("ReferenceDiscovery")
 
-	private val allAdapters = listOf(LinearAdapter, JiraAdapter, GitHubAdapter, NotionAdapter)
+	private val allAdapters = listOf(LinearAdapter, JiraAdapter, GitHubAdapter, NotionAdapter, SlackAdapter)
 
 	/**
 	 * Scans the transcript for all adapters applicable to `source` from `fromLine`
@@ -31,9 +31,17 @@ object TranscriptReferenceDiscovery {
 			TranscriptSource.codex -> ai.jolli.jollimemory.core.TranscriptSource.codex
 			else -> ai.jolli.jollimemory.core.TranscriptSource.claude
 		}
+		// Slack thread references need the configured workspace URL to reconstruct a
+		// permalink when none was pasted into the transcript. Read once per scan.
+		val slackWorkspaceUrl = try {
+			SessionTracker.loadConfig(cwd).slack?.workspaceUrl
+		} catch (_: Exception) {
+			null
+		}
 		val opts = ExtractOptions(
 			fromLineNumber = fromLine,
 			source = extractSource,
+			slackWorkspaceUrl = slackWorkspaceUrl,
 		)
 		log.debug("scanReferencesFrom: extracting from %s (fromLine=%d, source=%s)", transcriptPath, fromLine, source)
 		val result = ReferenceExtractor.extractFromTranscript(transcriptPath, allAdapters, opts)

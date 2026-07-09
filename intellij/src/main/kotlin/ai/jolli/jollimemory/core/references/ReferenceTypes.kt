@@ -8,7 +8,7 @@ package ai.jolli.jollimemory.core.references
  */
 
 /** Stable id naming each external-reference provider. */
-enum class SourceId { linear, jira, github, notion }
+enum class SourceId { linear, jira, github, notion, slack }
 
 /**
  * One displayable field produced by a [SourceAdapter].
@@ -41,7 +41,8 @@ data class Reference(
 	/** Stable id native to the source (e.g. "JOLLI-1762", "owner/repo#123", 32-hex Notion page id). */
 	val nativeId: String,
 	val title: String,
-	val url: String,
+	/** Absent only for sources whose `url` is optional (Slack with no permalink and no configured workspace). */
+	val url: String? = null,
 	val description: String? = null,
 	/** Opaque, source-specific display fields. Built and consumed only by the adapter. */
 	val fields: List<ReferenceField>? = null,
@@ -60,7 +61,8 @@ data class ReferenceEntry(
 	val source: SourceId,
 	val nativeId: String,
 	val title: String,
-	val url: String,
+	/** Absent only when the source `Reference.url` was absent (e.g. Slack with no permalink). */
+	val url: String? = null,
 	val sourcePath: String,
 	val addedAt: String,
 	val updatedAt: String,
@@ -86,7 +88,8 @@ data class ReferenceCommitRef(
 	val source: SourceId,
 	val nativeId: String,
 	val title: String,
-	val url: String,
+	/** Absent only when the source `Reference.url` was absent (e.g. Slack with no permalink). */
+	val url: String? = null,
 	val fields: List<ReferenceField>? = null,
 	val referencedAt: String,
 	val sourceToolName: String,

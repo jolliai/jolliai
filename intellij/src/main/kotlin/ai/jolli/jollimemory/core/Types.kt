@@ -504,6 +504,18 @@ data class JolliMemoryConfig(
     val localFolder: String? = null,
     /** Folder names (or `*`-glob patterns) under the Memory Bank root to skip when building the wiki. */
     val compileExcludeFolders: List<String>? = null,
+    /**
+     * Slack integration config. `workspaceUrl` (e.g. "https://my-team.slack.com")
+     * lets the reference extractor reconstruct a thread permalink when the user
+     * never pasted one into the transcript — the `slack_read_thread` MCP result
+     * carries neither a url nor the workspace subdomain.
+     */
+    val slack: SlackConfig? = null,
+)
+
+/** Nested Slack integration config. See [JolliMemoryConfig.slack]. */
+data class SlackConfig(
+    val workspaceUrl: String? = null,
 )
 
 /** Registry of all active sessions */

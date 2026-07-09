@@ -52,7 +52,7 @@ object PromptRenderer {
 		}
 		val lines = mutableListOf("<issue ${attrs.joinToString(" ")}>")
 		lines.add("  <title>${escapeForText(ref.title)}</title>")
-		lines.add("  <url>${escapeForText(ref.url)}</url>")
+		lines.add("  <url>${escapeForText(ref.url.orEmpty())}</url>")
 		if (ref.description != null) {
 			lines.add("  <description>")
 			lines.add(escapeForText(truncate(ref.description, maxChars)))
@@ -62,11 +62,29 @@ object PromptRenderer {
 		return lines.joinToString("\n")
 	}
 
+	/** Render a Slack thread reference as XML. `url` may be absent (linkless thread). */
+	private fun renderThread(ref: Reference, maxChars: Int): String {
+		val attrs = mutableListOf("id=\"${escapeForAttr(ref.nativeId)}\"")
+		for (f in ref.fields ?: emptyList()) {
+			attrs.add("${f.key}=\"${escapeForAttr(f.value)}\"")
+		}
+		val lines = mutableListOf("<thread ${attrs.joinToString(" ")}>")
+		lines.add("  <title>${escapeForText(ref.title)}</title>")
+		if (!ref.url.isNullOrEmpty()) lines.add("  <url>${escapeForText(ref.url)}</url>")
+		if (ref.description != null) {
+			lines.add("  <messages>")
+			lines.add(escapeForText(truncate(ref.description, maxChars)))
+			lines.add("  </messages>")
+		}
+		lines.add("</thread>")
+		return lines.joinToString("\n")
+	}
+
 	/** Render a Notion page reference as XML. */
 	private fun renderPage(ref: Reference, maxChars: Int): String {
 		val lines = mutableListOf("<page id=\"${escapeForAttr(ref.nativeId)}\">")
 		lines.add("  <title>${escapeForText(ref.title)}</title>")
-		lines.add("  <url>${escapeForText(ref.url)}</url>")
+		lines.add("  <url>${escapeForText(ref.url.orEmpty())}</url>")
 		if (ref.description != null) {
 			lines.add("  <content>")
 			lines.add(escapeForText(truncate(ref.description, maxChars)))
@@ -88,6 +106,7 @@ object PromptRenderer {
 		SourceId.jira to SourceConfig("jira-issues", ::renderIssue),
 		SourceId.github to SourceConfig("github-issues", ::renderIssue),
 		SourceId.notion to SourceConfig("notion-pages", ::renderPage),
+		SourceId.slack to SourceConfig("slack-threads", ::renderThread),
 	)
 
 	/** Render all references for a single source into an XML block. */
@@ -124,7 +143,7 @@ object PromptRenderer {
 	// ── Full assembly ───────────────────────────────────────────────────────
 
 	/** Source ordering for prompt blocks — matches CLI's ALL_ADAPTERS order. */
-	private val SOURCE_ORDER = listOf(SourceId.linear, SourceId.jira, SourceId.github, SourceId.notion)
+	private val SOURCE_ORDER = listOf(SourceId.linear, SourceId.jira, SourceId.github, SourceId.notion, SourceId.slack)
 
 	/**
 	 * Load reference markdown files, parse back to [Reference], filter exclusions,

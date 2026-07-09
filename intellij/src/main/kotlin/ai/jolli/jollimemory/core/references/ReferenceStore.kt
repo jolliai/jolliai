@@ -108,7 +108,10 @@ object ReferenceStore {
 		lines.add("source: ${jsonString(ref.source.name)}")
 		lines.add("nativeId: ${jsonString(ref.nativeId)}")
 		lines.add("title: ${jsonString(ref.title)}")
-		lines.add("url: ${jsonString(ref.url)}")
+		// url is optional (Slack can be linkless): omit the line entirely when absent
+		// so parseMarkdown reads it back as null rather than an empty string.
+		val url = ref.url
+		if (!url.isNullOrEmpty()) lines.add("url: ${jsonString(url)}")
 		if (!ref.fields.isNullOrEmpty()) {
 			lines.add("fields:")
 			for (f in ref.fields) lines.add("  - ${jsonField(f)}")
@@ -178,7 +181,8 @@ object ReferenceStore {
 		val source = try { SourceId.valueOf(sourceStr) } catch (_: Exception) { return null }
 		val nativeId = readString("nativeId") ?: return null
 		val title = readString("title") ?: return null
-		val url = readString("url") ?: return null
+		// url is optional (Slack can be linkless) — a missing url does not void the reference.
+		val url = readString("url")
 		val referencedAt = readString("referencedAt") ?: return null
 		val sourceToolName = readString("sourceToolName") ?: return null
 
