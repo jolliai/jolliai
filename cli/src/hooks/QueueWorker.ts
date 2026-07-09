@@ -1471,6 +1471,111 @@ async function assembleReferenceBlocks(activeReferenceEntries: ReadonlyArray<Ref
 	return parts.join("\n");
 }
 
+/** Result of consuming the working-area Context for one commit. */
+export interface ConsumedWorkspaceContext {
+	readonly planAssociation: PlanAssociationResult;
+	readonly noteRefs: ReadonlyArray<NoteReference>;
+	readonly referenceRefs: ReadonlyArray<ReferenceCommitRef>;
+}
+
+/**
+ * Consumes the checked working-area Context (plans / notes / references) for a
+ * commit: associates each kind with `commitHash` (moving it out of the working
+ * area, i.e. setting the registry `commitHash` for plans/notes and archiving
+ * references to the orphan branch), then discards the user's hard-excluded rows.
+ *
+ * Apply per-item exclusions BEFORE associate* — these helpers have side effects
+ * (savePlansRegistry archive entry + orphan-branch store), so a post-filter on
+ * the returned refs would still leave an excluded item archived on disk. The
+ * prompt-block filter only governs LLM input; this archive path is a separate
+ * registry scan and must be filtered here.
+ *
+ * AI soft-excluded items (`excludedContext`) are skipped from association too —
+ * otherwise they'd get a commitHash (moved out of the working area) while ALSO
+ * being listed in excludedContext. Soft-excluded items must keep NO commitHash
+ * and stay in the working area for re-evaluation on the next commit. Unlike user
+ * hard-excludes they are NOT discarded (discardExcludedWorkingItems only sees the
+ * `exclusions` set), so they simply remain uncommitted.
+ *
+ * Extracted from the normal commit pipeline so all four amend paths consume
+ * Context identically — the old bug was that only the normal path and the amend
+ * fresh-leaf did this, so `git commit --amend` on the short-circuit / full paths
+ * left checked items stuck on the panel. Deliberately does NOT run
+ * evaluatePlanProgress (normal-path-only, caller-owned) and does NOT call
+ * clearAiSelection (caller-owned — see the LLM-window race note at its call site).
+ *
+ * `archiveLabel` only flavours the orphan-branch storeReferences commit message.
+ */
+async function consumeWorkspaceContext(args: {
+	readonly cwd: string;
+	readonly branch: string;
+	readonly commitHash: string;
+	readonly exclusions: {
+		readonly plans: ReadonlySet<string>;
+		readonly notes: ReadonlySet<string>;
+		readonly references: ReadonlySet<string>;
+	};
+	readonly excludedContext: ReadonlyArray<ExcludedContextItem>;
+	readonly archiveLabel?: "commit" | "amend";
+}): Promise<ConsumedWorkspaceContext> {
+	const { cwd, branch, commitHash, exclusions, excludedContext, archiveLabel = "commit" } = args;
+
+	const aiExcludedKeys = {
+		plan: new Set<string>(),
+		note: new Set<string>(),
+		reference: new Set<string>(),
+	};
+	for (const e of excludedContext) aiExcludedKeys[e.kind].add(e.key);
+
+	const planSlugs = await detectPlanSlugsFromRegistry(cwd, branch);
+	for (const excludedSlug of exclusions.plans) planSlugs.delete(excludedSlug);
+	for (const s of aiExcludedKeys.plan) planSlugs.delete(s);
+	const planAssociation = await associatePlansWithCommit(planSlugs, commitHash, cwd, branch);
+
+	const noteIds = await detectUncommittedNoteIds(cwd, branch);
+	for (const excludedId of exclusions.notes) noteIds.delete(excludedId);
+	for (const id of aiExcludedKeys.note) noteIds.delete(id);
+	const noteRefs = await associateNotesWithCommit(noteIds, commitHash, cwd, branch);
+
+	// Reference mapKeys across every source (linear / jira / github / notion). The
+	// returned filesToStore is forwarded directly to storeReferences — captured
+	// BEFORE the local rename so the orphan-branch snapshot is independent of
+	// rename success.
+	const rawReferenceIds = await detectUncommittedReferenceIds(cwd, branch);
+	const referenceIds = rawReferenceIds.filter(
+		(e) => !exclusions.references.has(e.mapKey) && !aiExcludedKeys.reference.has(e.mapKey),
+	);
+	const {
+		refs: referenceRefs,
+		filesToStore: referenceFiles,
+		committed: referenceCommitted,
+	} = await associateReferencesWithCommit(referenceIds, commitHash, cwd, branch);
+	if (referenceFiles.length > 0) {
+		// Write-ahead: persist the orphan-branch snapshot FIRST, then tear down
+		// local state. If storeReferences throws, the active rows stay in
+		// plans.json and re-archive on the next commit (no permanent loss).
+		await storeReferences(
+			referenceFiles,
+			`Archive ${referenceFiles.length} reference ref(s) for ${archiveLabel} ${commitHash.substring(0, 8)}`,
+			cwd,
+			branch,
+		);
+		await finalizeReferenceArchive(referenceCommitted, cwd);
+	}
+
+	// Discard the unchecked working items: the CHECKED ones were archived above;
+	// the excluded ones are useless per the user's selection, so remove their
+	// registry rows (+ .jolli-owned backing files) WITHOUT writing them into the
+	// committed memory. Runs after associate* so the checked-item archival (which
+	// reloads the registry under lock) has already settled.
+	await discardExcludedWorkingItems(
+		{ plans: exclusions.plans, notes: exclusions.notes, references: exclusions.references },
+		cwd,
+	);
+
+	return { planAssociation, noteRefs, referenceRefs };
+}
+
 /**
  * The core LLM summarization pipeline. Now driven by a GitOperation from the queue.
  *
@@ -1712,78 +1817,19 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	}
 	log.info("API summary generated (%s)", formatElapsed(stepStart));
 
-	// Read uncommitted plan slugs from plans.json registry.
-	// Apply per-item exclusions BEFORE associate* — these helpers have side effects
-	// (savePlansRegistry archive entry + storePlans to the orphan branch), so a
-	// post-filter on `planAssociation.refs` would still leave the excluded plan
-	// archived on disk. The prompt-block filter only governs LLM input;
-	// the archive path is a separate registry scan and must be filtered here.
-	// The excluded rows are then DISCARDED by `discardExcludedWorkingItems` below
-	// (removed from the working area, but never archived into committed memory).
-	// AI soft-excluded items must ALSO be skipped from association — otherwise they
-	// get a commitHash (moved out of the working area) while ALSO being listed in
-	// excludedContext. Soft-excluded items must keep NO commitHash and stay in the
-	// working area for re-evaluation on the next commit.
-	// Unlike user hard-excludes they are NOT discarded (discardExcludedWorkingItems
-	// only sees the user `exclusions` set), so they simply remain uncommitted.
-	const aiExcludedKeys = {
-		plan: new Set<string>(),
-		note: new Set<string>(),
-		reference: new Set<string>(),
-	};
-	for (const e of excludedContext) aiExcludedKeys[e.kind].add(e.key);
-
-	const planSlugs = await detectPlanSlugsFromRegistry(cwd, branch);
-	for (const excludedSlug of exclusions.plans) planSlugs.delete(excludedSlug);
-	for (const s of aiExcludedKeys.plan) planSlugs.delete(s);
-	const planAssociation = await associatePlansWithCommit(planSlugs, commitInfo.hash, cwd, branch);
-	const planRefs = planAssociation.refs;
-
-	// Read uncommitted note IDs from plans.json registry.
-	// Same archive-side exclusion as the plan slugs — see comment above.
-	const noteIds = await detectUncommittedNoteIds(cwd, branch);
-	for (const excludedId of exclusions.notes) noteIds.delete(excludedId);
-	for (const id of aiExcludedKeys.note) noteIds.delete(id);
-	const noteRefs = await associateNotesWithCommit(noteIds, commitInfo.hash, cwd, branch);
-
-	// Read uncommitted reference mapKeys from plans.json.references and
-	// archive them across every source (linear / jira / github / notion). The
-	// returned filesToStore is forwarded directly to storeReferences — captured
-	// BEFORE the local rename so the orphan-branch snapshot is independent of
-	// rename success. Mirrors the plans / notes archive-side filter — excluded
-	// references are dropped from archival here and DISCARDED (row + markdown
-	// removed) by `discardExcludedWorkingItems` below.
-	const rawReferenceIds = await detectUncommittedReferenceIds(cwd, branch);
-	const referenceIds = rawReferenceIds.filter(
-		(e) => !exclusions.references.has(e.mapKey) && !aiExcludedKeys.reference.has(e.mapKey),
-	);
-	const {
-		refs: referenceRefs,
-		filesToStore: referenceFiles,
-		committed: referenceCommitted,
-	} = await associateReferencesWithCommit(referenceIds, commitInfo.hash, cwd, branch);
-	if (referenceFiles.length > 0) {
-		// Write-ahead: persist the orphan-branch snapshot FIRST, then tear down
-		// local state. If storeReferences throws, the active rows stay in
-		// plans.json and re-archive on the next commit (no permanent loss).
-		await storeReferences(
-			referenceFiles,
-			`Archive ${referenceFiles.length} reference ref(s) for commit ${commitInfo.hash.substring(0, 8)}`,
-			cwd,
-			branch,
-		);
-		await finalizeReferenceArchive(referenceCommitted, cwd);
-	}
-
-	// Discard the unchecked working items: the CHECKED ones were archived above;
-	// the excluded ones are useless per the user's selection, so remove their
-	// registry rows (+ .jolli-owned backing files) WITHOUT writing them into the
-	// committed memory. Runs after associate* so the checked-item archival (which
-	// reloads the registry under lock) has already settled.
-	await discardExcludedWorkingItems(
-		{ plans: exclusions.plans, notes: exclusions.notes, references: exclusions.references },
+	// Consume the checked working-area Context (plans / notes / references):
+	// associate with this commit + discard user hard-excludes. AI soft-excludes
+	// (excludedContext) stay uncommitted. See consumeWorkspaceContext for the full
+	// archive-side-exclusion rationale.
+	const { planAssociation, noteRefs, referenceRefs } = await consumeWorkspaceContext({
 		cwd,
-	);
+		branch,
+		commitHash: commitInfo.hash,
+		exclusions,
+		excludedContext,
+		archiveLabel: "commit",
+	});
+	const planRefs = planAssociation.refs;
 
 	// Step 8b: Evaluate plan progress for each linked plan (Haiku calls parallelized)
 	const planProgressArtifacts: PlanProgressArtifact[] = [];
@@ -2219,7 +2265,7 @@ function isTrivialAmendDelta(deltaStats: DiffStats): boolean {
  * — inherited IDs plus the newly written delta's ID if amend captured new
  * sessions. Short-circuit paths that don't write a delta pass only inherited.
  */
-interface AmendHoistedFields {
+export interface AmendHoistedFields {
 	readonly topics: ReadonlyArray<TopicSummary>;
 	readonly recap?: string;
 	readonly ticketId?: string;
@@ -2266,6 +2312,30 @@ function conversationUsageFields(
 	};
 }
 
+/** Trailing `-<8 hex>` short-hash suffix that association appends to plan slugs / note ids. */
+const REF_HASH_SUFFIX = /-[0-9a-f]{8}$/;
+
+/**
+ * Unions old (hoisted) refs with newly-associated refs, deduped by BASE key,
+ * with **new refs winning** on collision. Base key strips the per-commit
+ * `-<shortHash>` suffix (plans/notes) or uses `<source>:<nativeId>` (references),
+ * so a revived guard that re-archives `foo-<oldHash>` as `foo-<newHash>` lists
+ * once — as the NEW ref. New-wins is a data-integrity requirement: the new ref
+ * is the one whose markdown was just written to the orphan branch, so dropping
+ * it in favour of the old ref would leave an orphan-branch file with no summary
+ * pointer (the exact bug this consumption fix exists to prevent).
+ */
+function mergeRefsNewWins<T>(
+	oldRefs: ReadonlyArray<T> | undefined,
+	newRefs: ReadonlyArray<T> | undefined,
+	baseKey: (ref: T) => string,
+): T[] {
+	const byKey = new Map<string, T>();
+	for (const ref of oldRefs ?? []) byKey.set(baseKey(ref), ref);
+	for (const ref of newRefs ?? []) byKey.set(baseKey(ref), ref);
+	return [...byKey.values()];
+}
+
 /**
  * Builds the v4 amend root with all 8 Hoist fields populated and the old
  * summary attached as a stripped child. Used by all three amend paths
@@ -2277,6 +2347,14 @@ function conversationUsageFields(
  * the user amended a commit that was never summarised). In that case the
  * new root is effectively a fresh leaf -- still v4, no children, no Hoist
  * source -- and `hoisted` is whatever the caller derived from delta alone.
+ *
+ * `newRefs` are the plans/notes/references this amend just associated (via
+ * consumeWorkspaceContext). They are merged into the hoisted old refs with
+ * NEW winning per base key (see mergeRefsNewWins) — without this, the newly
+ * archived orphan-branch snapshots would have no pointer in the summary root.
+ * `excludedContext` is the AI soft-exclude audit, written only on the paths
+ * that generate a new summary (full path / fresh leaf), mirroring the normal
+ * commit pipeline; the short-circuit paths pass `[]`.
  */
 function buildHoistedAmendRoot(
 	// All three call sites are gated on `if (oldSummary)` so a non-undefined
@@ -2294,7 +2372,35 @@ function buildHoistedAmendRoot(
 		readonly conversationTokenBreakdown?: ConversationTokenBreakdown;
 		readonly conversationModels?: ReadonlyArray<ModelTokenUsage>;
 	},
+	newRefs?: {
+		readonly plans?: ReadonlyArray<PlanReference>;
+		readonly notes?: ReadonlyArray<NoteReference>;
+		readonly references?: ReadonlyArray<ReferenceCommitRef>;
+	},
+	excludedContext?: ReadonlyArray<ExcludedContextItem>,
 ): CommitSummary {
+	// Old (hoisted) refs ∪ new refs, deduped by base key with new winning.
+	const hoistedMeta = hoistMetadataFromOldSummary(oldSummary);
+	const mergedPlans = mergeRefsNewWins(hoistedMeta.plans, newRefs?.plans, (p) => p.slug.replace(REF_HASH_SUFFIX, ""));
+	const mergedNotes = mergeRefsNewWins(hoistedMeta.notes, newRefs?.notes, (n) => n.id.replace(REF_HASH_SUFFIX, ""));
+	const mergedReferences = mergeRefsNewWins(
+		hoistedMeta.references,
+		newRefs?.references,
+		(r) => `${r.source}:${r.nativeId}`,
+	);
+	// Drop from the AI-exclude audit any item that is nonetheless ATTACHED to this
+	// summary via a hoisted (inherited) ref — otherwise the same item would appear
+	// in BOTH the attached list and the "AI excluded" list, a self-contradiction.
+	// Only references collide in practice: a re-referenced item that was committed
+	// earlier has no guard row, so it can re-enter the soft-exclude set while its
+	// old snapshot is still hoisted. plans/notes skip committed guards upstream
+	// (detectActive*ForBranch), but we filter all three kinds for symmetry.
+	const attachedBaseKeys: Record<ExcludedContextItem["kind"], ReadonlySet<string>> = {
+		plan: new Set(mergedPlans.map((p) => p.slug.replace(REF_HASH_SUFFIX, ""))),
+		note: new Set(mergedNotes.map((n) => n.id.replace(REF_HASH_SUFFIX, ""))),
+		reference: new Set(mergedReferences.map((r) => `${r.source}:${r.nativeId}`)),
+	};
+	const auditedExclusions = (excludedContext ?? []).filter((e) => !attachedBaseKeys[e.kind].has(e.key));
 	return {
 		version: CURRENT_SCHEMA_VERSION,
 		commitHash: newInfo.hash,
@@ -2320,7 +2426,15 @@ function buildHoistedAmendRoot(
 		),
 		...(hoisted.summaryError && { summaryError: hoisted.summaryError }),
 		/* v8 ignore stop */
-		...hoistMetadataFromOldSummary(oldSummary),
+		// hoistedMeta carries the non-ref hoist fields (jolliDocId, e2eTestGuide, …)
+		// plus the OLD plans/notes/references; the merged overrides below replace the
+		// three ref fields with "old ∪ new" (new wins). Set only when non-empty so the
+		// "omit when absent" contract the hoist spread already honoured is preserved.
+		...hoistedMeta,
+		...(mergedPlans.length > 0 ? { plans: mergedPlans } : {}),
+		...(mergedNotes.length > 0 ? { notes: mergedNotes } : {}),
+		...(mergedReferences.length > 0 ? { references: mergedReferences } : {}),
+		...(auditedExclusions.length > 0 ? { excludedContext: auditedExclusions } : {}),
 		topics: hoisted.topics,
 		/* v8 ignore next */
 		...(hoisted.recap && { recap: hoisted.recap }),
@@ -2351,6 +2465,18 @@ async function applyAmendShortCircuit(
 	commitInfo: CommitInfo,
 	metadata: { readonly commitType?: CommitType; readonly commitSource?: CommitSource } | undefined,
 	amendFullDiffStats: DiffStats,
+	// Branch + user exclusions so the short-circuit can consume its working-area
+	// Context like the other paths (the old bug: it didn't, so amend left checked
+	// plans/notes/references stuck on the panel). Both short-circuit call sites pass
+	// an EMPTY excludedContext: they don't generate a new summary, so relevance
+	// filtering (which serves "keep the new summary focused") is moot — the user's
+	// panel selection is fully associated (minus hard-excludes).
+	branch: string,
+	exclusions: {
+		readonly plans: ReadonlySet<string>;
+		readonly notes: ReadonlySet<string>;
+		readonly references: ReadonlySet<string>;
+	},
 	// v5: the caller hoists transcript-artifact construction so the same delta
 	// ID can be stamped on both the stored artifact and the new root's
 	// `transcripts` field. `amendTranscripts` already contains the inherited
@@ -2369,6 +2495,16 @@ async function applyAmendShortCircuit(
 	label: string,
 	markError: boolean,
 ): Promise<void> {
+	// Consume the working-area Context BEFORE building the root so the newly
+	// associated refs can be merged in (empty excludedContext → full associate).
+	const consumed = await consumeWorkspaceContext({
+		cwd,
+		branch,
+		commitHash: commitInfo.hash,
+		exclusions,
+		excludedContext: [],
+		archiveLabel: "amend",
+	});
 	const root = buildHoistedAmendRoot(
 		oldSummary,
 		commitInfo,
@@ -2391,9 +2527,15 @@ async function applyAmendShortCircuit(
 			conversationTokenBreakdown,
 			conversationModels,
 		},
+		{ plans: consumed.planAssociation.refs, notes: consumed.noteRefs, references: consumed.referenceRefs },
+		// No excludedContext audit on short-circuit: it associates the full user
+		// selection, so there is no AI soft-exclude set to record.
 	);
 
 	await storeSummary(root, cwd, false, transcriptArtifact ? { transcript: transcriptArtifact } : undefined);
+	// Associate (above) runs BEFORE reassociateMetadata so a revived guard's
+	// commitHash has already moved to the new hash — reassociate's old-short-hash
+	// guard is then a no-op for it, avoiding a double migration.
 	await reassociateMetadata([oldSummary], commitInfo.hash, cwd);
 	log.info(
 		"Amend short-circuit (%s) complete: %s -> %s (%s)",
@@ -2447,6 +2589,21 @@ async function handleAmendPipeline(
 	// exclusion read here drives prompt-block filtering and the discard pass below.
 	const amendConfig = await loadConfig();
 	const amendExclusions = await readExclusions(cwd);
+	// Resolve the branch once for every amend path that consumes Context (both
+	// short-circuits, full path, fresh leaf). Prefer the captured hint over a live
+	// read for the same reason as executePipeline; see line 1529.
+	const amendBranch = branchHint ?? (await getCurrentBranch(cwd));
+
+	// Invalidate the panel's cached AI ranking up front, for EVERY amend path. A
+	// `git commit --amend` always moves HEAD, so the panel's change fingerprint is
+	// now stale and a LATER commit must not reuse it. Clearing here (before any LLM)
+	// matches the normal pipeline's "clear before the LLM window" placement — so a
+	// user re-ranking the panel DURING amend summarisation isn't clobbered (see the
+	// race note at executePipeline's clearAiSelection). This does NOT read the
+	// selection file, so it's independent of the per-path consumeWorkspaceContext
+	// (which takes its excludedContext as an argument). Best-effort — a clear failure
+	// must never break summary generation.
+	await clearAiSelection(cwd).catch((err) => log.warn("clearAiSelection failed: %s", (err as Error).message));
 	const {
 		sessionTranscripts,
 		totalEntries,
@@ -2540,6 +2697,8 @@ async function handleAmendPipeline(
 			commitInfo,
 			metadata,
 			amendFullDiffStats,
+			amendBranch,
+			amendExclusions,
 			transcriptArtifact,
 			amendTranscripts,
 			totalEntries,
@@ -2582,12 +2741,10 @@ async function handleAmendPipeline(
 
 	// Same registry-driven prompt assembly as executePipeline (see Stage 2 wiring).
 	/* v8 ignore start -- amend-pipeline prompt-block assembly mirrors executePipeline's Stage 2 path. The amend path is exercised via PostCommitHook.helpers tests but not the prompt-block content specifically; the helpers and shapes are covered by their own dedicated tests. */
-	// Prefer the captured branch over a live read for the same reason as executePipeline; see line 1529.
-	const branchForBlocks = branchHint ?? (await getCurrentBranch(cwd));
 	const [rawAmendPlanEntries, rawAmendNoteEntries, rawAmendReferenceEntries] = await Promise.all([
-		detectActivePlansForBranch(cwd, branchForBlocks),
-		detectActiveNotesForBranch(cwd, branchForBlocks),
-		getReferenceEntriesForBranch(cwd, branchForBlocks),
+		detectActivePlansForBranch(cwd, amendBranch),
+		detectActiveNotesForBranch(cwd, amendBranch),
+		getReferenceEntriesForBranch(cwd, amendBranch),
 	]);
 	// User hard-excludes first (mirrors executePipeline). Reference key is
 	// `<source>:<nativeId>`, same shape as the plans.json.references map key.
@@ -2600,13 +2757,12 @@ async function handleAmendPipeline(
 	// git / content-read / LLM / parse failure falls back to the full user-kept set).
 	// assessContextRelevance is fail-open and unit-tested; this call site is amend-only,
 	// covered by the same v8-ignore rationale as the surrounding prompt-block assembly.
-	// Soft-excluded items shape the amend prompt AND are skipped from fresh-leaf
-	// association below (so they keep NO commitHash and stay in the working area for
-	// re-evaluation, matching executePipeline). FOLLOW-UP: the authoritative
-	// excludedContext audit is still only recorded on the normal path — amended
-	// summaries omit it, so the "AI excluded these" list won't show for an amend.
-	// `amendExcludedContext` is hoisted out of the try so the fresh-leaf branch
-	// further down can read it.
+	// Soft-excluded items shape the amend prompt AND are skipped from association
+	// on the summary-generating paths below (consumeWorkspaceContext with this
+	// excludedContext), so they keep NO commitHash and stay in the working area for
+	// re-evaluation — and they're recorded on the amend summary's excludedContext
+	// audit, matching executePipeline. `amendExcludedContext` is hoisted out of the
+	// try so the full path and fresh-leaf branch further down can read it.
 	let amendPlanEntries = userKeptAmendPlans;
 	let amendNoteEntries = userKeptAmendNotes;
 	let amendReferenceEntries = userKeptAmendRefs;
@@ -2714,6 +2870,8 @@ async function handleAmendPipeline(
 			commitInfo,
 			metadata,
 			amendFullDiffStats,
+			amendBranch,
+			amendExclusions,
 			transcriptArtifact,
 			amendTranscripts,
 			totalEntries,
@@ -2796,6 +2954,18 @@ async function handleAmendPipeline(
 		);
 		/* v8 ignore stop */
 
+		// Consume the working-area Context BEFORE building the root: the full path
+		// generates a new summary, so it honours the AI soft-exclude set computed for
+		// the prompt (amendExcludedContext) — soft-excluded items keep NO commitHash
+		// and stay in the working area, matching the normal commit pipeline.
+		const consumed = await consumeWorkspaceContext({
+			cwd,
+			branch: amendBranch,
+			commitHash: commitInfo.hash,
+			exclusions: amendExclusions,
+			excludedContext: amendExcludedContext,
+			archiveLabel: "amend",
+		});
 		const root = buildHoistedAmendRoot(
 			oldSummary,
 			commitInfo,
@@ -2825,6 +2995,8 @@ async function handleAmendPipeline(
 				conversationTokenBreakdown,
 				conversationModels,
 			},
+			{ plans: consumed.planAssociation.refs, notes: consumed.noteRefs, references: consumed.referenceRefs },
+			amendExcludedContext,
 		);
 		await storeSummary(
 			root,
@@ -2834,6 +3006,9 @@ async function handleAmendPipeline(
 				? { transcript: transcriptArtifact }
 				: undefined,
 		);
+		// Associate (above) runs BEFORE reassociateMetadata so a revived guard's
+		// commitHash has already moved to the new hash — reassociate is then a no-op
+		// for it (its old-short-hash guard no longer matches), avoiding a double migration.
 		await reassociateMetadata([oldSummary], commitInfo.hash, cwd);
 		log.info("=== Amend full path completed in %s ===", formatElapsed(pipelineStart));
 		log.info("=== Summary content (%d topics) ===", finalConsolidated.topics.length);
@@ -2844,65 +3019,27 @@ async function handleAmendPipeline(
 	}
 
 	// ── No old summary AND non-trivial delta -> store delta as a fresh leaf ────
-	// Prefer the captured branch over a live read for the same reason as executePipeline; see line 1529.
-	const branch = branchHint ?? (await getCurrentBranch(cwd));
+	const branch = amendBranch;
 
-	// Associate plans/notes/references on the branch with this amend commit,
-	// mirroring executePipeline. Without this the fresh leaf silently drops
-	// references for plans/notes authored before the previous (un-summarised)
-	// commit — the user wouldn't see them in plan-progress aggregation or
-	// reverse-lookups. The oldSummary path handles this via reassociateMetadata;
-	// fresh leaves have no oldSummary to migrate from, so we associate fresh.
-	// AI soft-excluded items must NOT be associated (mirroring executePipeline's
-	// aiExcludedKeys handling): they keep no commitHash and stay in the working area
-	// for re-evaluation on the next commit. Key sets are per-kind, single-form kinds.
-	const amendAiExcluded = {
-		plan: new Set<string>(),
-		note: new Set<string>(),
-		reference: new Set<string>(),
-	};
-	for (const e of amendExcludedContext) amendAiExcluded[e.kind].add(e.key);
-
-	const freshLeafPlanSlugs = await detectPlanSlugsFromRegistry(cwd, branch);
-	for (const excludedSlug of amendExclusions.plans) freshLeafPlanSlugs.delete(excludedSlug);
-	for (const s of amendAiExcluded.plan) freshLeafPlanSlugs.delete(s);
-	const freshLeafPlanAssoc = await associatePlansWithCommit(freshLeafPlanSlugs, commitInfo.hash, cwd, branch);
-	const freshLeafPlanRefs = freshLeafPlanAssoc.refs;
-
-	const freshLeafNoteIds = await detectUncommittedNoteIds(cwd, branch);
-	for (const excludedId of amendExclusions.notes) freshLeafNoteIds.delete(excludedId);
-	for (const id of amendAiExcluded.note) freshLeafNoteIds.delete(id);
-	const freshLeafNoteRefs = await associateNotesWithCommit(freshLeafNoteIds, commitInfo.hash, cwd, branch);
-
-	const rawFreshLeafReferenceIds = await detectUncommittedReferenceIds(cwd, branch);
-	// Mirror plans/notes: honour user deselections from the sidebar so the amend
-	// fresh-leaf doesn't silently re-archive references the user removed; and drop
-	// AI soft-excluded references (keyed by mapKey === `source:nativeId`).
-	const freshLeafReferenceIds = rawFreshLeafReferenceIds.filter(
-		(e) => !amendExclusions.references.has(e.mapKey) && !amendAiExcluded.reference.has(e.mapKey),
-	);
-	const {
-		refs: freshLeafReferenceRefs,
-		filesToStore: freshLeafReferenceFiles,
-		committed: freshLeafReferenceCommitted,
-	} = await associateReferencesWithCommit(freshLeafReferenceIds, commitInfo.hash, cwd, branch);
-	// CRITICAL: the generic associateReferencesWithCommit does NOT call
-	// storeReferences itself (unlike the legacy Linear-only path which was
-	// self-contained). The amend fresh-leaf path MUST explicitly drive the
-	// orphan-branch write — otherwise Regenerator can't read back the
-	// archived markdown at recall time. Write-ahead: store first, then finalize
-	// the local-state teardown (so a store failure leaves the rows recoverable).
-	/* v8 ignore start -- amend fresh-leaf reference-files write path: only hit when a `git commit --amend` lands without an existing summary AND active references exist on the branch. Both arms (files-present vs files-absent) are tested mechanically through the StopHook → PostCommit happy path; this defensive branch in the amend-only fresh-leaf code path is reachable only via a race (StopHook upserted between detect and commit), and that race resolves the same way either way. */
-	if (freshLeafReferenceFiles.length > 0) {
-		await storeReferences(
-			freshLeafReferenceFiles,
-			`Archive ${freshLeafReferenceFiles.length} reference ref(s) for amend ${commitInfo.hash.substring(0, 8)}`,
-			cwd,
-			branch,
-		);
-		await finalizeReferenceArchive(freshLeafReferenceCommitted, cwd);
-	}
-	/* v8 ignore stop */
+	// Consume the working-area Context for this amend, mirroring executePipeline.
+	// Without this the fresh leaf silently drops plans/notes/references authored
+	// before the previous (un-summarised) commit — the user wouldn't see them in
+	// plan-progress aggregation or reverse-lookups. The oldSummary paths associate
+	// via consumeWorkspaceContext + reassociateMetadata; fresh leaves have no
+	// oldSummary to migrate from, so they associate fresh. This is a summary-
+	// generating path, so it honours the AI soft-exclude set (amendExcludedContext):
+	// soft-excluded items keep NO commitHash and stay in the working area.
+	const consumed = await consumeWorkspaceContext({
+		cwd,
+		branch,
+		commitHash: commitInfo.hash,
+		exclusions: amendExclusions,
+		excludedContext: amendExcludedContext,
+		archiveLabel: "amend",
+	});
+	const freshLeafPlanRefs = consumed.planAssociation.refs;
+	const freshLeafNoteRefs = consumed.noteRefs;
+	const freshLeafReferenceRefs = consumed.referenceRefs;
 
 	const freshLeaf: CommitSummary = {
 		version: CURRENT_SCHEMA_VERSION,
@@ -2921,9 +3058,10 @@ async function handleAmendPipeline(
 		...(deltaLlmFailed && { summaryError: LLM_FAILED }),
 		...(freshLeafPlanRefs.length > 0 ? { plans: freshLeafPlanRefs } : {}),
 		...(freshLeafNoteRefs.length > 0 ? { notes: freshLeafNoteRefs } : {}),
-		/* v8 ignore start -- amend fresh-leaf references spread: same race-only path as the reference-files write above; truthy arm only fires when active references are present on the branch at amend time, which the StopHook → PostCommit happy path exercises elsewhere. */
 		...(freshLeafReferenceRefs.length > 0 ? { references: freshLeafReferenceRefs } : {}),
-		/* v8 ignore stop */
+		// AI soft-exclude audit, mirroring the normal commit pipeline: this path
+		// generated a new summary, so record what the relevance layer set aside.
+		...(amendExcludedContext.length > 0 ? { excludedContext: amendExcludedContext } : {}),
 		// v5 contract: always present, even if empty. Fresh leaf has no
 		// inherited IDs; only the new delta (if any).
 		transcripts: amendDeltaTranscriptId !== undefined ? [amendDeltaTranscriptId] : [],
@@ -2935,13 +3073,6 @@ async function handleAmendPipeline(
 		/* v8 ignore next -- defensive: transcriptArtifact is set when sessions exist; falsy arm only fires when there are no sessions, which the empty-transcript guard upstream already short-circuits. */ transcriptArtifact
 			? { transcript: transcriptArtifact }
 			: undefined,
-	);
-	// Discard the unchecked working items on the amend fresh-leaf path too — the
-	// checked ones were archived above; the excluded ones are removed from the
-	// working area without entering committed memory.
-	await discardExcludedWorkingItems(
-		{ plans: amendExclusions.plans, notes: amendExclusions.notes, references: amendExclusions.references },
-		cwd,
 	);
 
 	log.info(
@@ -3401,6 +3532,9 @@ export const __test__ = {
 	detectPlanSlugsFromRegistry,
 	detectUncommittedNoteIds,
 	hoistMetadataFromOldSummary,
+	mergeRefsNewWins,
+	buildHoistedAmendRoot,
+	consumeWorkspaceContext,
 	associatePlansWithCommit,
 	finalizeReferenceArchive,
 	executePipeline,
