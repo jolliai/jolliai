@@ -36,15 +36,18 @@ describe("revokeShare", () => {
 		const commitHash = "c".repeat(40);
 		h.getShare.mockResolvedValue({ shareId: "sh_2" });
 		await revokeShare("/repo", "feature/x", "KEY", commitHash);
-		expect(h.getShare).toHaveBeenCalledWith("/repo", "feature/x", commitHash);
+		// "KEY" is not a decodable sk-jol- key, so the derived env key is undefined.
+		expect(h.getShare).toHaveBeenCalledWith("/repo", "feature/x", undefined, commitHash);
 		expect(h.removeShare).toHaveBeenCalledWith("/repo", "feature/x", commitHash);
 	});
 
-	it("skips the server call when there is no stored share (still clears locally)", async () => {
+	it("skips the server call AND the local delete when no matching share (foreign/absent record preserved)", async () => {
+		// getShare is env-scoped: a foreign-backend record reads as undefined. Deleting it
+		// locally would orphan a still-live link, so the record is left on disk.
 		h.getShare.mockResolvedValue(undefined);
 		await revokeShare("/repo", "feature/x", "KEY");
 		expect(h.revokeBranchShare).not.toHaveBeenCalled();
-		expect(h.removeShare).toHaveBeenCalledWith("/repo", "feature/x", undefined);
+		expect(h.removeShare).not.toHaveBeenCalled();
 	});
 });
 
@@ -174,7 +177,7 @@ describe("patchShareAudience", () => {
 		h.getShare.mockResolvedValue({ ...MEMBER, commitHash });
 		h.updateLiveShare.mockResolvedValue({ shareId: "sh_1", visibility: "people" });
 		await patchShareAudience("/repo", "feature/x", "KEY", { visibility: "people" }, commitHash);
-		expect(h.getShare).toHaveBeenCalledWith("/repo", "feature/x", commitHash);
+		expect(h.getShare).toHaveBeenCalledWith("/repo", "feature/x", undefined, commitHash);
 		expect(h.putBranchShare).toHaveBeenCalledWith("/repo", "feature/x", expect.any(Object), commitHash);
 	});
 });

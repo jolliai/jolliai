@@ -19,6 +19,7 @@ import {
 	putBranchShare,
 	removeShare,
 } from "../../../cli/src/core/BranchShareStore.js";
+import { deriveJolliBackendKeyFromApiKey } from "../../../cli/src/core/JolliApiUtils.js";
 import { revokeBranchShare, updateLiveShare } from "./JolliShareService.js";
 
 /** A subject's access change: the visibility tier and/or the invited-people allowlist. */
@@ -29,18 +30,31 @@ export interface ShareAudiencePatch {
 	readonly recipients?: ReadonlyArray<string>;
 }
 
-/** Revokes a subject's link (if present) and clears its record. Idempotent. */
+/**
+ * Revokes a subject's link (if present) and clears its record. Idempotent.
+ *
+ * Only touches the local record when it belongs to the CURRENT backend (the env-scoped
+ * `getShare` resolves it). A record minted against a DIFFERENT backend reads as absent
+ * here and is left on disk rather than deleted, so its still-live link stays revocable
+ * after switching the API key back — deleting it would orphan the link server-side.
+ */
 export async function revokeShare(
 	workspaceRoot: string,
 	branch: string,
 	apiKey: string,
 	commitHash?: string,
 ): Promise<void> {
-	const existing = await getShare(workspaceRoot, branch, commitHash);
+	const existing = await getShare(workspaceRoot, branch, deriveJolliBackendKeyFromApiKey(apiKey), commitHash);
 	if (existing?.shareId) {
 		await revokeBranchShare(undefined, apiKey, existing.shareId);
 	}
-	await removeShare(workspaceRoot, branch, commitHash);
+	// Clear the local record whenever it belongs to the CURRENT backend (getShare
+	// only returns current-backend records) — including a partial record that never
+	// got a shareId — so a stale entry never lingers. A foreign-backend record reads
+	// as absent (existing === undefined) and is deliberately left on disk.
+	if (existing) {
+		await removeShare(workspaceRoot, branch, commitHash);
+	}
 }
 
 /**
@@ -58,7 +72,7 @@ export async function patchShareAudience(
 	patch: ShareAudiencePatch,
 	commitHash?: string,
 ): Promise<BranchShareRecord | undefined> {
-	const existing = await getShare(workspaceRoot, branch, commitHash);
+	const existing = await getShare(workspaceRoot, branch, deriveJolliBackendKeyFromApiKey(apiKey), commitHash);
 	if (!existing?.shareId) return undefined;
 	const result = await updateLiveShare(undefined, apiKey, existing.shareId, {
 		...(patch.visibility && { visibility: patch.visibility }),

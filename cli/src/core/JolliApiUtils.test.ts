@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { assertJolliOriginAllowed, parseBaseUrl, parseJolliApiKey } from "./JolliApiUtils";
+import {
+	assertJolliOriginAllowed,
+	deriveJolliBackendKey,
+	deriveJolliBackendKeyFromApiKey,
+	deriveJolliEnvKey,
+	deriveJolliEnvKeyFromApiKey,
+	parseBaseUrl,
+	parseJolliApiKey,
+	resolveArticleUrl,
+} from "./JolliApiUtils";
 
 describe("JolliApiUtils", () => {
 	describe("parseBaseUrl", () => {
@@ -150,6 +159,94 @@ describe("JolliApiUtils", () => {
 
 		it("rejects credentials-in-url disguising attacker host", () => {
 			expect(() => assertJolliOriginAllowed("https://app.jolli.ai@evil.com")).toThrow(/evil\.com/);
+		});
+	});
+
+	describe("deriveJolliEnvKey", () => {
+		it("is the lowercased origin, ignoring any tenant path segment", () => {
+			expect(deriveJolliEnvKey("https://Tenant1.jolli.dev/acme")).toBe("https://tenant1.jolli.dev");
+		});
+
+		it("keys on origin so different backends differ but same-origin orgs collapse", () => {
+			expect(deriveJolliEnvKey("https://jolli-local.me")).toBe("https://jolli-local.me");
+			expect(deriveJolliEnvKey("https://jolli.ai")).toBe("https://jolli.ai");
+			// Same origin, different tenant path → same backend key (org/tenant intentionally ignored).
+			expect(deriveJolliEnvKey("https://jolli.ai/org-a")).toBe(deriveJolliEnvKey("https://jolli.ai/org-b"));
+		});
+
+		it("returns undefined when there is no base URL", () => {
+			expect(deriveJolliEnvKey(undefined)).toBeUndefined();
+		});
+	});
+
+	describe("deriveJolliEnvKeyFromApiKey", () => {
+		function keyWith(meta: Record<string, unknown>): string {
+			return `sk-jol-${Buffer.from(JSON.stringify(meta)).toString("base64url")}.secret`;
+		}
+
+		it("derives the env key from the key's embedded `.u` claim alone", () => {
+			const key = keyWith({ t: "t1", u: "https://tenant1.jolli.dev/acme", o: "engineering" });
+			expect(deriveJolliEnvKeyFromApiKey(key)).toBe("https://tenant1.jolli.dev");
+		});
+
+		it("returns undefined for an absent or undecodable key (no base URL to key on)", () => {
+			expect(deriveJolliEnvKeyFromApiKey(undefined)).toBeUndefined();
+			expect(deriveJolliEnvKeyFromApiKey("sk-jol-plain")).toBeUndefined();
+		});
+	});
+
+	describe("deriveJolliBackendKey", () => {
+		it("strips the tenant subdomain to the registrable domain (all tenants of a backend collapse)", () => {
+			expect(deriveJolliBackendKey("https://acme.jolli.ai")).toBe("https://jolli.ai");
+			expect(deriveJolliBackendKey("https://beta.jolli.ai/o/x/articles/y-5")).toBe("https://jolli.ai");
+			expect(deriveJolliBackendKey("https://acme.jolli.ai")).toBe(deriveJolliBackendKey("https://beta.jolli.ai"));
+		});
+
+		it("keeps a bare registrable domain, dot-less hosts, and IPv4 whole; preserves port", () => {
+			expect(deriveJolliBackendKey("https://jolli-local.me/7o423e4x/share/x")).toBe("https://jolli-local.me");
+			expect(deriveJolliBackendKey("http://localhost:8034/dev")).toBe("http://localhost:8034");
+			expect(deriveJolliBackendKey("https://192.168.0.1:9000/x")).toBe("https://192.168.0.1:9000");
+		});
+
+		it("returns undefined for a missing or unparseable input", () => {
+			expect(deriveJolliBackendKey(undefined)).toBeUndefined();
+			expect(deriveJolliBackendKey("not-a-url")).toBeUndefined();
+		});
+	});
+
+	describe("deriveJolliBackendKeyFromApiKey", () => {
+		it("derives the backend key from the key's embedded `.u` claim (subdomain stripped)", () => {
+			const key = `sk-jol-${Buffer.from(JSON.stringify({ t: "t1", u: "https://tenant1.jolli.dev/acme" })).toString("base64url")}.secret`;
+			expect(deriveJolliBackendKeyFromApiKey(key)).toBe("https://jolli.dev");
+		});
+
+		it("returns undefined for an absent or undecodable key", () => {
+			expect(deriveJolliBackendKeyFromApiKey(undefined)).toBeUndefined();
+			expect(deriveJolliBackendKeyFromApiKey("sk-jol-plain")).toBeUndefined();
+		});
+	});
+
+	describe("resolveArticleUrl", () => {
+		const base = "https://jolli-local.me/7o423e4x";
+
+		it("resolves the server-returned relative slug path against the display base (matches the web app)", () => {
+			expect(resolveArticleUrl(base, "/o/default/articles/my-summary-839", 839)).toBe(
+				"https://jolli-local.me/7o423e4x/o/default/articles/my-summary-839",
+			);
+			// org-less slug path (backend before it adds /o/<org>) still resolves.
+			expect(resolveArticleUrl(base, "/articles/my-summary-839", 839)).toBe(
+				"https://jolli-local.me/7o423e4x/articles/my-summary-839",
+			);
+		});
+
+		it("uses an already-absolute server url verbatim", () => {
+			expect(resolveArticleUrl(base, "https://jolli.ai/x/articles/s-5", 5)).toBe(
+				"https://jolli.ai/x/articles/s-5",
+			);
+		});
+
+		it("falls back to the ?doc=<id> deep-link when the server url is missing", () => {
+			expect(resolveArticleUrl(base, "", 839)).toBe("https://jolli-local.me/7o423e4x/articles?doc=839");
 		});
 	});
 });

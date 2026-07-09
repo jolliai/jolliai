@@ -27,7 +27,7 @@ import {
 	putBranchShare,
 	revokeShare,
 } from "./BranchShareController.js";
-import { assertJolliOriginAllowed } from "../../../cli/src/core/JolliApiUtils.js";
+import { assertJolliOriginAllowed, deriveJolliBackendKeyFromApiKey } from "../../../cli/src/core/JolliApiUtils.js";
 import type { BindingOutcome } from "./JolliPushOrchestrator.js";
 import type { BranchShareRecord } from "../../../cli/src/core/BranchShareStore.js";
 import { countSubjectDecisions, generateLiveShare, NothingToShareError, reconcileLiveShare } from "./LiveShareController.js";
@@ -152,7 +152,7 @@ export async function openShareModal(io: ShareModalIO, ctx: ShareModalContext): 
 		io.postState({ kind: "needsApiKey" });
 		return;
 	}
-	const existing = await getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash);
+	const existing = await getShare(ctx.workspaceRoot, ctx.branch, backendKeyOf(ctx), ctx.commitHash);
 	// Only reconcile a LIVE (unexpired) branch share — reconciling an expired one
 	// would re-push all content + PATCH a dead link (and could resurrect it), only
 	// for postReadyState to then render it as absent.
@@ -190,7 +190,7 @@ export async function copyShareLinkModal(io: ShareModalIO, ctx: ShareModalContex
 		io.postCopyResult({ ok: false });
 		return;
 	}
-	let record = await getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash);
+	let record = await getShare(ctx.workspaceRoot, ctx.branch, backendKeyOf(ctx), ctx.commitHash);
 	// Copying an EXISTING link must not repaint the pane (mockup: copy + flash only);
 	// only a lazy mint swaps to loading and needs the ready re-render afterwards.
 	let minted = false;
@@ -209,7 +209,7 @@ export async function copyShareLinkModal(io: ShareModalIO, ctx: ShareModalContex
 			return;
 		}
 		minted = true;
-		record = await getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash);
+		record = await getShare(ctx.workspaceRoot, ctx.branch, backendKeyOf(ctx), ctx.commitHash);
 	} else if (record.visibility !== visibility) {
 		if (visibility === "people" && (record.recipients ?? []).length === 0) {
 			io.notifyError("No one is invited yet — pick a teammate above first, or switch who can open the link.");
@@ -242,7 +242,7 @@ export async function setShareAccessModal(io: ShareModalIO, ctx: ShareModalConte
 		io.postState({ kind: "needsApiKey" });
 		return;
 	}
-	const existing = await getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash);
+	const existing = await getShare(ctx.workspaceRoot, ctx.branch, backendKeyOf(ctx), ctx.commitHash);
 	if (!existing?.shareId) {
 		// No link yet: `people` needs an invitee first (mint on Send invite); `public`
 		// and `org` mint immediately so the dropdown choice yields a copyable link.
@@ -302,7 +302,7 @@ export async function sendInviteModal(
 	// invitees layered on (grants union); anything else (people, or public — which
 	// can't carry an allowlist) resolves to a `people` link.
 	const targetTier: ShareVisibility = visibility === "org" ? "org" : "people";
-	let record = await getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash);
+	let record = await getShare(ctx.workspaceRoot, ctx.branch, backendKeyOf(ctx), ctx.commitHash);
 	let mintedForInvite = false;
 	let reTieredFrom: ShareVisibility | undefined;
 	if (!isLive(record, ctx.nowMs)) {
@@ -315,7 +315,7 @@ export async function sendInviteModal(
 			return;
 		}
 		mintedForInvite = true;
-		record = await getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash);
+		record = await getShare(ctx.workspaceRoot, ctx.branch, backendKeyOf(ctx), ctx.commitHash);
 	} else if (record.visibility !== targetTier) {
 		// The live link's tier differs from the one the invite targets — flip it in
 		// place FIRST so access matches the selection, not just the recipient list.
@@ -331,7 +331,7 @@ export async function sendInviteModal(
 			return;
 		}
 		reTieredFrom = from;
-		record = await getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash);
+		record = await getShare(ctx.workspaceRoot, ctx.branch, backendKeyOf(ctx), ctx.commitHash);
 	}
 	if (!record?.shareId) {
 		// Popover already closed (see above) — a toast is the only visible channel.
@@ -381,7 +381,7 @@ export async function removeRecipientModal(io: ShareModalIO, ctx: ShareModalCont
 		io.postState({ kind: "needsApiKey" });
 		return;
 	}
-	const record = await getShare(ctx.workspaceRoot, ctx.branch, ctx.commitHash);
+	const record = await getShare(ctx.workspaceRoot, ctx.branch, backendKeyOf(ctx), ctx.commitHash);
 	if (record?.shareId) {
 		const lower = email.trim().toLowerCase();
 		const next = (record.recipients ?? []).filter((r) => r.toLowerCase() !== lower);
@@ -475,6 +475,7 @@ async function postReadyState(io: ShareModalIO, ctx: ShareModalContext): Promise
 	const { record: rawRecord, seed: rawSeed } = await getShareWithBranchLatest(
 		ctx.workspaceRoot,
 		ctx.branch,
+		backendKeyOf(ctx),
 		ctx.commitHash,
 	);
 	const record = presentable(rawRecord, ctx.nowMs);
@@ -517,6 +518,15 @@ async function postReadyState(io: ShareModalIO, ctx: ShareModalContext): Promise
 		gitCollaborators: ctx.gitCollaborators,
 		owner: ctx.owner,
 	});
+}
+
+/**
+ * The current backend key (see {@link BranchShareRecord.shareUrl}) used to scope store
+ * reads: a cached share minted against a DIFFERENT backend (a since-swapped API key) is
+ * treated as absent, so its foreign `shareId` never reaches the current server.
+ */
+function backendKeyOf(ctx: ShareModalContext): string | undefined {
+	return deriveJolliBackendKeyFromApiKey(ctx.apiKey);
 }
 
 /** A record that is live (unexpired) — expired links are dead links and render as absent. */

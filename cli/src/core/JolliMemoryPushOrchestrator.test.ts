@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { CommitSummary, NoteReference, PlanReference } from "../Types.js";
+import type { CommitSummary, NoteReference, PlanReference, ReferenceCommitRef } from "../Types.js";
 
 vi.mock("./GitOps.js", () => ({ getDefaultBranch: vi.fn() }));
 vi.mock("./PrDescription.js", () => ({ loadBranchSummaries: vi.fn() }));
@@ -10,6 +10,7 @@ vi.mock("./SummaryStore.js", () => ({
 	getSummary: vi.fn(),
 	readNoteFromBranch: vi.fn(),
 	readPlanFromBranch: vi.fn(),
+	readReferenceFromBranch: vi.fn(),
 	storeSummary: vi.fn(),
 }));
 vi.mock("./GitRemoteUtils.js", async (importOriginal) => {
@@ -31,12 +32,15 @@ import {
 import {
 	applyNoteUrls,
 	applyPlanUrls,
+	applyReferenceUrls,
 	assignOwnedAttachments,
 	buildPushMarkdown,
+	canReuseDocId,
 	latestPlanPerName,
 	type PushContext,
 	pushBranchToJolli,
 	pushSummary,
+	referenceBaseKey,
 	resolveSpaceId,
 	serializeSummaryJson,
 } from "./JolliMemoryPushOrchestrator.js";
@@ -49,6 +53,7 @@ import {
 	getSummary,
 	readNoteFromBranch,
 	readPlanFromBranch,
+	readReferenceFromBranch,
 	storeSummary,
 } from "./SummaryStore.js";
 
@@ -89,6 +94,19 @@ function plan(overrides: Partial<PlanReference> = {}): PlanReference {
 	};
 }
 
+function reference(overrides: Partial<ReferenceCommitRef> = {}): ReferenceCommitRef {
+	return {
+		archivedKey: "linear:ENG-1-a1b2c3d4",
+		source: "linear",
+		nativeId: "ENG-1",
+		title: "Fix login bug",
+		url: "https://linear.app/acme/issue/ENG-1",
+		referencedAt: "2026-01-01T00:00:00.000Z",
+		sourceToolName: "Claude Code",
+		...overrides,
+	};
+}
+
 function note(overrides: Partial<NoteReference> = {}): NoteReference {
 	return {
 		id: "n1",
@@ -119,6 +137,20 @@ describe("serializeSummaryJson", () => {
 		expect(json.commitHash).toBe("a");
 	});
 
+	it("keeps nested plan/note/reference docId/url (needed for rendering the article links)", () => {
+		const s = {
+			commitHash: "a",
+			plans: [{ slug: "p1", jolliPlanDocId: 9, jolliPlanDocUrl: "pu" }],
+			notes: [{ id: "n1", jolliNoteDocId: 8, jolliNoteDocUrl: "nu" }],
+			references: [{ archivedKey: "linear:E-1-abcd1234", jolliReferenceDocId: 7, jolliReferenceDocUrl: "ru" }],
+		} as unknown as CommitSummary;
+		const json = JSON.parse(serializeSummaryJson(s) ?? "{}");
+		expect(json.plans[0].jolliPlanDocId).toBe(9);
+		expect(json.plans[0].jolliPlanDocUrl).toBe("pu");
+		expect(json.notes[0].jolliNoteDocUrl).toBe("nu");
+		expect(json.references[0].jolliReferenceDocUrl).toBe("ru");
+	});
+
 	it("returns undefined when serialized JSON exceeds the byte cap", () => {
 		const huge = "x".repeat(2_000_000);
 		const s = { commitHash: "a", commitMessage: huge } as unknown as CommitSummary;
@@ -129,7 +161,7 @@ describe("serializeSummaryJson", () => {
 // ─── applyPlanUrls / applyNoteUrls ──────────────────────────────────────────
 
 describe("applyPlanUrls", () => {
-	it("merges docId/url by slug", () => {
+	it("merges docId/url by slug (the URL's origin is the minting env)", () => {
 		const plans = [plan({ slug: "p1" })];
 		const out = applyPlanUrls(plans, [{ slug: "p1", url: "https://j/articles?doc=9", docId: 9 }]);
 		expect(out?.[0].jolliPlanDocId).toBe(9);
@@ -140,6 +172,7 @@ describe("applyPlanUrls", () => {
 		const plans = [plan({ slug: "p1" })];
 		const out = applyPlanUrls(plans, [{ slug: "other", url: "u", docId: 1 }]);
 		expect(out?.[0].jolliPlanDocId).toBeUndefined();
+		expect(out?.[0].jolliPlanDocUrl).toBeUndefined();
 	});
 
 	it("returns the input unchanged when plans is undefined or planUrls is empty", () => {
@@ -150,7 +183,7 @@ describe("applyPlanUrls", () => {
 });
 
 describe("applyNoteUrls", () => {
-	it("merges docId/url by id", () => {
+	it("merges docId/url by id (the URL's origin is the minting env)", () => {
 		const notes = [note({ id: "n1" })];
 		const out = applyNoteUrls(notes, [{ id: "n1", url: "https://j/articles?doc=3", docId: 3 }]);
 		expect(out[0].jolliNoteDocId).toBe(3);
@@ -161,6 +194,56 @@ describe("applyNoteUrls", () => {
 		const notes = [note({ id: "n1" })];
 		const out = applyNoteUrls(notes, [{ id: "other", url: "u", docId: 1 }]);
 		expect(out[0].jolliNoteDocId).toBeUndefined();
+		expect(out[0].jolliNoteDocUrl).toBeUndefined();
+	});
+});
+
+describe("applyReferenceUrls", () => {
+	it("merges docId/url by archivedKey (the URL's origin is the minting env)", () => {
+		const refs = [reference({ archivedKey: "linear:ENG-1-aaaa1111" })];
+		const out = applyReferenceUrls(refs, [
+			{ archivedKey: "linear:ENG-1-aaaa1111", url: "https://j/articles?doc=5", docId: 5 },
+		]);
+		expect(out[0].jolliReferenceDocId).toBe(5);
+		expect(out[0].jolliReferenceDocUrl).toBe("https://j/articles?doc=5");
+	});
+
+	it("leaves references unmatched by archivedKey untouched", () => {
+		const refs = [reference({ archivedKey: "linear:ENG-1-aaaa1111" })];
+		const out = applyReferenceUrls(refs, [{ archivedKey: "linear:ENG-9-zzzz9999", url: "u", docId: 1 }]);
+		expect(out[0].jolliReferenceDocId).toBeUndefined();
+		expect(out[0].jolliReferenceDocUrl).toBeUndefined();
+	});
+
+	it("returns the input unchanged when referenceUrls is empty", () => {
+		const refs = [reference()];
+		expect(applyReferenceUrls(refs, [])).toBe(refs);
+	});
+});
+
+describe("referenceBaseKey", () => {
+	it("keys on the stable <source>:<nativeId> (ignoring the per-commit archivedKey suffix)", () => {
+		expect(
+			referenceBaseKey(reference({ source: "linear", nativeId: "ENG-1", archivedKey: "linear:ENG-1-aaaa1111" })),
+		).toBe("linear:ENG-1");
+	});
+});
+
+describe("canReuseDocId", () => {
+	it("reuses when the stored doc URL's origin matches the current env", () => {
+		expect(canReuseDocId("https://jolli.ai/acme/o/eng/articles/x-5", "https://jolli.ai")).toBe(true);
+	});
+
+	it("does NOT reuse when the stored doc URL is from a different backend", () => {
+		expect(canReuseDocId("https://jolli-local.me/t/articles/x-5", "https://jolli.ai")).toBe(false);
+	});
+
+	it("reuses legacy (url-less) data so an upgrade doesn't orphan already-pushed docs", () => {
+		expect(canReuseDocId(undefined, "https://jolli.ai")).toBe(true);
+	});
+
+	it("treats an unparseable stored URL as env-agnostic rather than throwing", () => {
+		expect(canReuseDocId("not-a-url", "https://jolli.ai")).toBe(true);
 	});
 });
 
@@ -411,6 +494,57 @@ describe("assignOwnedAttachments", () => {
 		expect(ownedNotes.has("c2")).toBe(false);
 		expect(seedNoteDocIds.get("n1")).toBe(20);
 	});
+
+	it("dedupes a reference recurring across commits to ONE owner commit (latest referencedAt wins)", () => {
+		// Same ticket (ENG-1) referenced on two commits — different per-commit archivedKeys.
+		const older = leaf({
+			commitHash: "c1",
+			references: [reference({ archivedKey: "linear:ENG-1-c1", referencedAt: "2026-01-01T00:00:00.000Z" })],
+		});
+		const newer = leaf({
+			commitHash: "c2",
+			references: [reference({ archivedKey: "linear:ENG-1-c2", referencedAt: "2026-02-01T00:00:00.000Z" })],
+		});
+		const { ownedReferences } = assignOwnedAttachments([older, newer]);
+		// Only the newest-referencedAt commit owns the single push.
+		expect(ownedReferences.get("c2")?.[0].archivedKey).toBe("linear:ENG-1-c2");
+		expect(ownedReferences.has("c1")).toBe(false);
+	});
+
+	it("carries a prior commit's reference docId forward to the winner that lacks one (seeded)", () => {
+		const winner = leaf({
+			commitHash: "c1",
+			references: [reference({ archivedKey: "linear:ENG-1-c1", referencedAt: "2026-03-01T00:00:00.000Z" })],
+		});
+		const olderWithDocId = leaf({
+			commitHash: "c2",
+			references: [
+				reference({
+					archivedKey: "linear:ENG-1-c2",
+					referencedAt: "2026-02-01T00:00:00.000Z",
+					jolliReferenceDocId: 55,
+					jolliReferenceDocUrl: "https://jolli.ai/articles?doc=55",
+				}),
+			],
+		});
+		const { ownedReferences, seedReferenceDocIds } = assignOwnedAttachments([winner, olderWithDocId]);
+		expect(ownedReferences.get("c1")?.[0].jolliReferenceDocId).toBe(55);
+		// The seed URL rides with the seed docId so the woven URL matches the id it points at.
+		expect(ownedReferences.get("c1")?.[0].jolliReferenceDocUrl).toBe("https://jolli.ai/articles?doc=55");
+		expect(ownedReferences.has("c2")).toBe(false);
+		expect(seedReferenceDocIds.get("linear:ENG-1")).toBe(55);
+	});
+
+	it("keeps distinct references (different <source>:<nativeId>) as separate owned pushes", () => {
+		const summary = leaf({
+			references: [
+				reference({ source: "linear", nativeId: "ENG-1", archivedKey: "linear:ENG-1-c1" }),
+				reference({ source: "github", nativeId: "acme/repo#7", archivedKey: "github:acme/repo#7-c1" }),
+			],
+		});
+		const { ownedReferences } = assignOwnedAttachments([summary]);
+		expect(ownedReferences.get(summary.commitHash)).toHaveLength(2);
+	});
 });
 
 // ─── buildPushMarkdown ──────────────────────────────────────────────────────
@@ -474,6 +608,24 @@ describe("buildPushMarkdown", () => {
 		);
 		expect(md).toContain("## Context");
 		expect(md).toContain("PROJ-123");
+	});
+
+	it("links the Context reference row to the Space article when jolliReferenceDocUrl is set", () => {
+		const md = buildPushMarkdown(
+			leaf({
+				references: [
+					reference({
+						nativeId: "ENG-7",
+						title: "Ship it",
+						url: "https://linear.app/x",
+						jolliReferenceDocUrl: "https://jolli.ai/articles?doc=77",
+					}),
+				],
+			}),
+		);
+		// Points at the pushed Space article, not the external link.
+		expect(md).toContain("(https://jolli.ai/articles?doc=77)");
+		expect(md).not.toContain("(https://linear.app/x)");
 	});
 
 	it("renders the source commits section for multi-record summaries", () => {
@@ -566,9 +718,13 @@ describe("buildPushMarkdown", () => {
 // ─── pushSummary ────────────────────────────────────────────────────────────
 
 const BASE = "https://jolli.ai";
+const ENV_KEY = "https://jolli.ai";
 
+// `url: ""` (falsy) makes resolveArticleUrl fall back to the `?doc=<id>` form, which
+// keeps the URL-shape assertions below stable; the slug branch is covered directly
+// in the `resolveArticleUrl` describe. A test that needs the slug shape overrides `url`.
 function fakePushResult(overrides: Partial<PushResult> = {}): PushResult {
-	return { url: "unused", docId: 42, jrn: "jrn:1", created: true, ...overrides };
+	return { url: "", docId: 42, jrn: "jrn:1", created: true, ...overrides };
 }
 
 /** Builds a stub client — only the methods `pushSummary`/`pushBranchToJolli` call are ever invoked. */
@@ -586,6 +742,7 @@ function fakeClient(
 		}>;
 		deleteDoc: (docId: number) => Promise<void>;
 		resolveBaseUrl: () => Promise<string>;
+		resolveEnvKey: () => Promise<string>;
 	}> = {},
 ): JolliMemoryPushClient {
 	return {
@@ -594,6 +751,7 @@ function fakeClient(
 		createBinding: vi.fn(overrides.createBinding ?? (async () => ({ bindingId: 1, jmSpaceId: 1, repoName: "r" }))),
 		deleteDoc: vi.fn(overrides.deleteDoc ?? (async () => undefined)),
 		resolveBaseUrl: vi.fn(overrides.resolveBaseUrl ?? (async () => BASE)),
+		resolveEnvKey: vi.fn(overrides.resolveEnvKey ?? (async () => ENV_KEY)),
 	} as unknown as JolliMemoryPushClient;
 }
 
@@ -608,6 +766,7 @@ describe("pushSummary", () => {
 		vi.mocked(readNoteFromBranch).mockReset().mockResolvedValue(null);
 		vi.mocked(loadPushPending).mockReset().mockResolvedValue({ version: 1, entries: {} });
 		vi.mocked(getIndexEntryMap).mockReset().mockResolvedValue(new Map());
+		vi.mocked(readReferenceFromBranch).mockReset().mockResolvedValue(null);
 	});
 
 	it("deletes the freshly-pushed article and skips force-store when the commit became a child mid-push", async () => {
@@ -723,6 +882,36 @@ describe("pushSummary", () => {
 
 		const payload = vi.mocked(client.push).mock.calls[0][0];
 		expect(payload.docId).toBeUndefined();
+	});
+
+	it("writes back a doc URL whose origin keys to the current push env", async () => {
+		const client = fakeClient();
+		const { summary: pushed } = await pushSummary(leaf(), baseCtx(client));
+		// No separate env tag — the written-back URL's origin IS the env, so a
+		// same-env re-push would reuse this docId.
+		expect(canReuseDocId(pushed.jolliDocUrl, ENV_KEY)).toBe(true);
+	});
+
+	it("reuses the docId when the summary's stored URL origin matches the current env", async () => {
+		const client = fakeClient();
+		const summary = leaf({ jolliDocId: 7, jolliDocUrl: `${BASE}/articles?doc=7` });
+		await pushSummary(summary, baseCtx(client));
+		expect(client.push).toHaveBeenCalledWith(expect.objectContaining({ docId: 7 }));
+	});
+
+	it("does NOT reuse the docId when the summary was pushed to a different backend (creates fresh)", async () => {
+		const client = fakeClient();
+		const summary = leaf({
+			jolliDocId: 7,
+			jolliDocUrl: "https://jolli-local.me/t/articles?doc=7",
+		});
+		const { summary: pushed } = await pushSummary(summary, baseCtx(client));
+
+		const payload = vi.mocked(client.push).mock.calls[0][0];
+		expect(payload.docId).toBeUndefined();
+		// Write-back carries the freshly-created docId and a current-env URL.
+		expect(canReuseDocId(pushed.jolliDocUrl, ENV_KEY)).toBe(true);
+		expect(pushed.jolliDocId).toBe(42);
 	});
 
 	it("pushes an owned plan attachment once and writes its docId/url back onto the summary's plans", async () => {
@@ -1084,6 +1273,56 @@ describe("pushSummary", () => {
 
 		expect(client.deleteDoc).toHaveBeenCalledWith(100);
 		expect(client.deleteDoc).toHaveBeenCalledWith(201);
+	});
+
+	it("pushes a reference as a standalone `reference` article and writes its docId/url back", async () => {
+		const client = fakeClient({
+			push: async (payload) =>
+				payload.docType === "reference" ? fakePushResult({ docId: 77 }) : fakePushResult({ docId: 42 }),
+		});
+		const ref = reference({ archivedKey: "linear:ENG-1-a1b2c3d4" });
+		const summary = leaf({ references: [ref] });
+
+		const { summary: pushed } = await pushSummary(summary, baseCtx(client), {
+			plans: [],
+			notes: [],
+			references: [ref],
+		});
+
+		expect(client.push).toHaveBeenCalledWith(
+			expect.objectContaining({ docType: "reference", commitHash: summary.commitHash }),
+		);
+		expect(pushed.references?.[0].jolliReferenceDocId).toBe(77);
+		expect(pushed.references?.[0].jolliReferenceDocUrl).toBe(`${BASE}/articles?doc=77`);
+	});
+
+	it("reuses the reference docId when its stored URL origin matches the current env", async () => {
+		const client = fakeClient();
+		const ref = reference({ jolliReferenceDocId: 77, jolliReferenceDocUrl: `${BASE}/articles?doc=77` });
+		const summary = leaf({ references: [ref] });
+		await pushSummary(summary, baseCtx(client), { plans: [], notes: [], references: [ref] });
+
+		expect(client.push).toHaveBeenCalledWith(expect.objectContaining({ docType: "reference", docId: 77 }));
+	});
+
+	it("does NOT reuse the reference docId when it was minted against a different backend", async () => {
+		const client = fakeClient();
+		const ref = reference({
+			jolliReferenceDocId: 77,
+			jolliReferenceDocUrl: "https://jolli-local.me/t/articles?doc=77",
+		});
+		const summary = leaf({ references: [ref] });
+		await pushSummary(summary, baseCtx(client), { plans: [], notes: [], references: [ref] });
+
+		const refPayload = vi.mocked(client.push).mock.calls.find((c) => c[0].docType === "reference")?.[0];
+		expect(refPayload?.docId).toBeUndefined();
+	});
+
+	it("pushes the summary's own references when no attachment selection is given", async () => {
+		const client = fakeClient();
+		const summary = leaf({ references: [reference()] });
+		await pushSummary(summary, baseCtx(client));
+		expect(client.push).toHaveBeenCalledWith(expect.objectContaining({ docType: "reference" }));
 	});
 });
 

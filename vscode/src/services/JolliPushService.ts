@@ -20,7 +20,7 @@
  * - Sends `repoUrl` (canonical, normalized — see GitRemoteUtils) and
  *   `relativePath` (flat — `<branchSlug>` for all kinds) in the body so the
  *   server can place the doc under `repoFolder → branchSlug`.
- * - Sends `docType: "summary" | "plan" | "note"` in the body. With the flat
+ * - Sends `docType: "summary" | "plan" | "note" | "reference"` in the body. With the flat
  *   path layout this is the sole disambiguator the server uses to set
  *   `sourceMetadata.docType` and route TreeItem icons on the frontend.
  * - Maps `412 binding_required` → `BindingRequiredError` and
@@ -97,7 +97,7 @@ export interface JolliPushPayload {
 	 * server uses to set `sourceMetadata.docType` and to drive TreeItem icons.
 	 * Required: a missing value would silently mis-tag every push.
 	 */
-	readonly docType: "summary" | "plan" | "note";
+	readonly docType: "summary" | "plan" | "note" | "reference";
 	readonly branch?: string;
 	/** Server-side document ID for direct update on subsequent pushes. */
 	readonly docId?: number;

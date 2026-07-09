@@ -31,7 +31,10 @@ vi.mock("../util/GitRemoteUtils.js", async (importActual) => ({
 	getCanonicalRepoUrl: vi.fn().mockResolvedValue("https://github.com/acme/repo"),
 }));
 vi.mock("../../../cli/src/core/KBPathResolver.js", () => ({ extractRepoName: () => "repo" }));
-vi.mock("../../../cli/src/core/JolliApiUtils.js", () => ({ parseJolliApiKey: mockParseKey }));
+vi.mock("../../../cli/src/core/JolliApiUtils.js", () => ({
+	parseJolliApiKey: mockParseKey,
+	deriveJolliBackendKeyFromApiKey: vi.fn(() => "https://jolli.ai"),
+}));
 vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 	resolveEffectiveTopics: (s: CommitSummary) => s.topics ?? [],
 	resolveEffectiveRecap: (s: CommitSummary) => s.recap,
@@ -112,7 +115,11 @@ beforeEach(() => {
 	mockGetShare.mockResolvedValue(undefined);
 	mockPutShare.mockResolvedValue(undefined);
 	// Default push: echo a docId for the chosen plan/note attachments; summary doc per commit.
-	type Att = { plans: PlanReference[]; notes: Array<{ id: string; title: string; jolliNoteDocId?: number }> };
+	type Att = {
+		plans: PlanReference[];
+		notes: Array<{ id: string; title: string; jolliNoteDocId?: number }>;
+		references?: Array<{ archivedKey: string; source: string; nativeId: string; jolliReferenceDocId?: number }>;
+	};
 	mockPush.mockImplementation((s: CommitSummary, _ctx: unknown, attachments?: Att) => {
 		const plans = (attachments?.plans ?? []).map((p) => ({
 			slug: p.slug,
@@ -126,17 +133,25 @@ beforeEach(() => {
 			docId: n.jolliNoteDocId ?? 8000 + n.id.length,
 			url: "u",
 		}));
+		const references = (attachments?.references ?? []).map((r) => ({
+			archivedKey: r.archivedKey,
+			baseKey: `${r.source}:${r.nativeId}`,
+			title: r.nativeId,
+			docId: r.jolliReferenceDocId ?? 7000 + r.archivedKey.length,
+			url: "u",
+		}));
 		return Promise.resolve({
 			pushedDoc: {
 				commitHash: s.commitHash,
 				summaryDocId: SUMMARY_DOC[s.commitHash as keyof typeof SUMMARY_DOC],
 				plans,
 				notes,
+				references,
 			},
 			updatedSummary: s,
 			attachmentFailures: [],
 			isUpdate: false,
-			attachmentCount: plans.length + notes.length,
+			attachmentCount: plans.length + notes.length + references.length,
 		});
 	});
 });
@@ -212,7 +227,7 @@ describe("generateLiveShare", () => {
 		// A (older) owns nothing; B (newer) owns the winner, pushed with the seed docId 500 so it updates in place.
 		const callA = mockPush.mock.calls.find((c) => c[0].commitHash === "A");
 		const callB = mockPush.mock.calls.find((c) => c[0].commitHash === "B");
-		expect(callA?.[2]).toEqual({ plans: [], notes: [] });
+		expect(callA?.[2]).toEqual({ plans: [], notes: [], references: [] });
 		expect(callB?.[2].plans).toEqual([
 			expect.objectContaining({ slug: "p-bbbbbbbb", jolliPlanDocId: 500 }),
 		]);
@@ -287,7 +302,7 @@ describe("generateLiveShare", () => {
 		mockPush.mockImplementation((s: CommitSummary, ctx: { storeSummary: (x: unknown, b: boolean) => Promise<void> }) => {
 			ctx.storeSummary(s, true); // exercise the buildPushContext passthrough
 			return Promise.resolve({
-				pushedDoc: { commitHash: s.commitHash, summaryDocId: 1, plans: [], notes: [] },
+				pushedDoc: { commitHash: s.commitHash, summaryDocId: 1, plans: [], notes: [], references: [] },
 				updatedSummary: s,
 				attachmentFailures: [],
 				isUpdate: false,
@@ -319,7 +334,7 @@ describe("generateLiveShare", () => {
 
 		await generateLiveShare({ ...deps(), branch: "feature/x", visibility: "public" });
 
-		expect(mockPush.mock.calls[0][2]).toEqual({ plans: [], notes: [] });
+		expect(mockPush.mock.calls[0][2]).toEqual({ plans: [], notes: [], references: [] });
 		const ref = mockCreate.mock.calls[0][2].ref;
 		expect(ref.covered).toEqual([{ commitHash: "A", summaryDocId: 1001, attachmentDocIds: [] }]);
 	});
@@ -338,7 +353,7 @@ describe("generateLiveShare", () => {
 		expect(callA?.[2].plans).toEqual([expect.objectContaining({ slug: "p-aaaaaaaa" })]);
 		expect(callA?.[2].plans[0].jolliPlanDocId).toBeUndefined();
 		expect(callA?.[2].notes[0].jolliNoteDocId).toBeUndefined();
-		expect(callB?.[2]).toEqual({ plans: [], notes: [] });
+		expect(callB?.[2]).toEqual({ plans: [], notes: [], references: [] });
 
 		// B's covered still references the docs pushed under A (same live docs).
 		const ref = mockCreate.mock.calls[0][2].ref;
@@ -365,7 +380,7 @@ describe("generateLiveShare", () => {
 		const a = summary("A", [plan("p-aaaaaaaa", "2026-01-01T00:00:00Z")], [note("n1", "2026-01-01T00:00:00Z")]);
 		mockLoad.mockResolvedValue({ summaries: [a], missingCount: 0 });
 		mockPush.mockResolvedValue({
-			pushedDoc: { commitHash: "A", summaryDocId: 1001, plans: [], notes: [] },
+			pushedDoc: { commitHash: "A", summaryDocId: 1001, plans: [], notes: [], references: [] },
 			updatedSummary: a,
 			attachmentFailures: [],
 			isUpdate: false,
@@ -382,7 +397,7 @@ describe("generateLiveShare", () => {
 		const a = summary("A", [plan("p-aaaaaaaa", "2026-01-01T00:00:00Z")], [note("n1", "2026-01-01T00:00:00Z")]);
 		mockLoad.mockResolvedValue({ summaries: [a], missingCount: 0 });
 		mockPush.mockResolvedValue({
-			pushedDoc: { commitHash: "A", summaryDocId: 1001, plans: [], notes: [] },
+			pushedDoc: { commitHash: "A", summaryDocId: 1001, plans: [], notes: [], references: [] },
 			updatedSummary: a,
 			attachmentFailures: [
 				{ label: 'plan "Plan"', message: "Network error: socket hang up" },
@@ -422,6 +437,8 @@ describe("generateLiveShare", () => {
 		const stored = mockPutShare.mock.calls[0][2];
 		expect(stored.visibility).toBe("people");
 		expect(stored.recipients).toEqual(["marta@jolli.ai"]);
+		// No separate env tag — the record's shareUrl origin identifies its backend.
+		expect(stored.shareUrl).toBe("https://acme.jolli.ai/b/x");
 	});
 
 	it("builds a commitDocs ref for a single-commit share", async () => {
@@ -596,7 +613,7 @@ describe("reconcileLiveShare", () => {
 		});
 		mockLoad.mockResolvedValue({ summaries: [a], missingCount: 0 });
 		mockPush.mockResolvedValue({
-			pushedDoc: { commitHash: "A", summaryDocId: 1001, plans: [], notes: [] },
+			pushedDoc: { commitHash: "A", summaryDocId: 1001, plans: [], notes: [], references: [] },
 			updatedSummary: a,
 			attachmentFailures: [{ label: 'plan "Plan"', message: "unauthorized (HTTP 401)" }],
 			isUpdate: false,

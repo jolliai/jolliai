@@ -484,7 +484,12 @@ export interface CommitSummary {
 	 * - Normal commit: absent (leaf node)
 	 */
 	readonly children?: ReadonlyArray<CommitSummary>;
-	/** Full URL of the memory article on Jolli Space after pushing */
+	/**
+	 * Full URL of the memory article on Jolli Space after pushing. Its origin also
+	 * IS the env the `jolliDocId` was minted against: `jolliDocId` is reused as an
+	 * update target only when `deriveJolliEnvKey(jolliDocUrl)` matches the current
+	 * push env (see `canReuseDocId`), so an id from another backend is never reused.
+	 */
 	readonly jolliDocUrl?: string;
 	/** Server-side article ID for direct update on subsequent pushes (set after first push) */
 	readonly jolliDocId?: number;
@@ -604,7 +609,7 @@ export interface PlanReference {
 	readonly addedAt: string;
 	/** ISO 8601 — when this plan was last modified */
 	readonly updatedAt: string;
-	/** Full URL of the plan article on Jolli Space after pushing */
+	/** Full URL of the plan article on Jolli Space after pushing; its origin keys the reuse gate (see `CommitSummary.jolliDocUrl`). */
 	readonly jolliPlanDocUrl?: string;
 	/** Server-side article ID for direct plan update on subsequent pushes */
 	readonly jolliPlanDocId?: number;
@@ -719,7 +724,7 @@ export interface NoteReference {
 	readonly content?: string;
 	readonly addedAt: string;
 	readonly updatedAt: string;
-	/** Full URL of the note article on Jolli Space after pushing */
+	/** Full URL of the note article on Jolli Space after pushing; its origin keys the reuse gate (see `CommitSummary.jolliDocUrl`). */
 	readonly jolliNoteDocUrl?: string;
 	/** Server-side article ID for direct update on subsequent pushes */
 	readonly jolliNoteDocId?: number;
@@ -831,6 +836,10 @@ export interface ReferenceCommitRef {
 	readonly fields?: ReadonlyArray<ReferenceField>;
 	readonly referencedAt: string;
 	readonly sourceToolName: string;
+	/** Full URL of the reference article on Jolli Space after pushing (docType `reference`); its origin keys the reuse gate (see `CommitSummary.jolliDocUrl`). */
+	readonly jolliReferenceDocUrl?: string;
+	/** Server-side article ID for direct update on subsequent pushes of this reference. */
+	readonly jolliReferenceDocId?: number;
 }
 
 // ─── Knowledge Compilation types ────────────────────────────────────────────

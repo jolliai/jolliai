@@ -1533,10 +1533,6 @@ export function buildCss(): string {
   /* "What travels" banner */
   .share-travel-banner { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: 8px; background: var(--vscode-textBlockQuote-background, rgba(127,127,127,0.06)); font-size: 0.83em; line-height: 1.5; margin-bottom: 12px; }
   .share-travel-icon { flex: 0 0 auto; color: var(--vscode-textLink-foreground); font-size: 1.05em; }
-  /* Transcript opt-in (disabled mock) */
-  .share-transcript-opt { display: flex; align-items: center; gap: 8px; font-size: 0.85em; color: var(--text-secondary); cursor: not-allowed; }
-  .share-transcript-opt input { margin: 0; }
-  .share-optin-badge { font-size: 0.7em; font-weight: 700; letter-spacing: 0.04em; padding: 1px 6px; border-radius: 4px; background: rgba(127,127,127,0.16); color: var(--text-secondary); text-transform: uppercase; }
   /* Shared panes (loading / error / no-key) */
   .share-loading { display: flex; align-items: center; gap: 10px; color: var(--text-secondary); }
   .share-spinner { width: 14px; height: 14px; border: 2px solid var(--text-secondary); border-top-color: transparent; border-radius: 50%; animation: share-spin 0.8s linear infinite; }

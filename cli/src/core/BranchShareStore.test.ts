@@ -13,6 +13,13 @@ import {
 
 let cwd: string;
 
+// Backend key (`deriveJolliBackendKey` form — registrable domain) a record's
+// `shareUrl` resolves to. Fixtures' shareUrl lives on `acme.jolli.ai`, whose backend
+// is `https://jolli.ai`; reads pass ENV so they resolve. OTHER_ENV models a
+// since-swapped API key pointing at a different backend.
+const ENV = "https://jolli.ai";
+const OTHER_ENV = "https://jolli-local.me";
+
 beforeEach(async () => {
 	cwd = join(tmpdir(), `branch-share-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	await mkdir(join(cwd, JOLLI_DIR, JOLLIMEMORY_DIR), { recursive: true });
@@ -46,12 +53,12 @@ const MEMBER: BranchShareRecord = {
 
 describe("BranchShareStore", () => {
 	it("returns undefined for a missing file", async () => {
-		expect(await getShare(cwd, "feature/x")).toBeUndefined();
+		expect(await getShare(cwd, "feature/x", ENV)).toBeUndefined();
 	});
 
 	it("round-trips a public record", async () => {
 		await putBranchShare(cwd, "feature/x", PUB);
-		const got = await getShare(cwd, "feature/x");
+		const got = await getShare(cwd, "feature/x", ENV);
 		expect(got?.shareId).toBe("sh_pub");
 		expect(got?.visibility).toBe("public");
 	});
@@ -59,7 +66,7 @@ describe("BranchShareStore", () => {
 	it("single-slot: a re-put overwrites the subject's one record (flip public → member)", async () => {
 		await putBranchShare(cwd, "feature/x", PUB);
 		await putBranchShare(cwd, "feature/x", MEMBER);
-		const got = await getShare(cwd, "feature/x");
+		const got = await getShare(cwd, "feature/x", ENV);
 		expect(got?.shareId).toBe("sh_member");
 		expect(got?.visibility).toBe("org");
 		expect(got?.recipients).toEqual(["ada@example.com"]);
@@ -68,7 +75,7 @@ describe("BranchShareStore", () => {
 	it("flips the tier in place (org → people) without spawning a second record", async () => {
 		await putBranchShare(cwd, "feature/x", MEMBER); // org
 		await putBranchShare(cwd, "feature/x", { ...MEMBER, visibility: "people", recipients: ["tom@jolli.ai"] });
-		const got = await getShare(cwd, "feature/x");
+		const got = await getShare(cwd, "feature/x", ENV);
 		expect(got?.visibility).toBe("people");
 		expect(got?.recipients).toEqual(["tom@jolli.ai"]);
 	});
@@ -76,28 +83,28 @@ describe("BranchShareStore", () => {
 	it("keeps separate subjects per branch", async () => {
 		await putBranchShare(cwd, "feature/x", PUB);
 		await putBranchShare(cwd, "feature/y", { ...PUB, shareId: "sh_2" });
-		expect((await getShare(cwd, "feature/x"))?.shareId).toBe("sh_pub");
-		expect((await getShare(cwd, "feature/y"))?.shareId).toBe("sh_2");
+		expect((await getShare(cwd, "feature/x", ENV))?.shareId).toBe("sh_pub");
+		expect((await getShare(cwd, "feature/y", ENV))?.shareId).toBe("sh_2");
 	});
 
 	it("keeps a commit share separate from the branch share on the same branch", async () => {
 		const commitHash = "c".repeat(40);
 		await putBranchShare(cwd, "feature/x", PUB); // branch share
 		await putBranchShare(cwd, "feature/x", { ...PUB, shareId: "sh_commit" }, commitHash); // commit share
-		expect((await getShare(cwd, "feature/x"))?.shareId).toBe("sh_pub");
-		expect((await getShare(cwd, "feature/x", commitHash))?.shareId).toBe("sh_commit");
+		expect((await getShare(cwd, "feature/x", ENV))?.shareId).toBe("sh_pub");
+		expect((await getShare(cwd, "feature/x", ENV, commitHash))?.shareId).toBe("sh_commit");
 		// removing the commit share leaves the branch share intact
 		await removeShare(cwd, "feature/x", commitHash);
-		expect(await getShare(cwd, "feature/x", commitHash)).toBeUndefined();
-		expect((await getShare(cwd, "feature/x"))?.shareId).toBe("sh_pub");
+		expect(await getShare(cwd, "feature/x", ENV, commitHash)).toBeUndefined();
+		expect((await getShare(cwd, "feature/x", ENV))?.shareId).toBe("sh_pub");
 	});
 
 	it("removes a subject's record; idempotent for already-removed / never-shared", async () => {
 		await putBranchShare(cwd, "feature/x", PUB);
 		await putBranchShare(cwd, "feature/y", { ...PUB, shareId: "sh_y" });
 		await removeShare(cwd, "feature/x");
-		expect(await getShare(cwd, "feature/x")).toBeUndefined();
-		expect((await getShare(cwd, "feature/y"))?.shareId).toBe("sh_y"); // untouched
+		expect(await getShare(cwd, "feature/x", ENV)).toBeUndefined();
+		expect((await getShare(cwd, "feature/y", ENV))?.shareId).toBe("sh_y"); // untouched
 		// idempotent — already-removed and never-shared are both no-ops
 		await removeShare(cwd, "feature/x");
 		await removeShare(cwd, "never-shared");
@@ -120,10 +127,39 @@ describe("BranchShareStore", () => {
 			},
 		};
 		await putBranchShare(cwd, "feature/x", live);
-		const got = await getShare(cwd, "feature/x");
+		const got = await getShare(cwd, "feature/x", ENV);
 		expect(got?.visibility).toBe("org");
 		expect(got?.recipients).toEqual(["ada@example.com"]);
 		expect(got?.ref).toEqual(live.ref);
+	});
+
+	describe("env scoping", () => {
+		it("treats a record minted against a DIFFERENT backend as absent (foreign shareId never reused)", async () => {
+			await putBranchShare(cwd, "feature/x", PUB); // minted against ENV
+			// A since-swapped API key now targets OTHER_ENV — the cached ENV record is a
+			// cross-environment stale entry and must not surface (else its shareId 404s).
+			expect(await getShare(cwd, "feature/x", OTHER_ENV)).toBeUndefined();
+			// The original backend still resolves it.
+			expect((await getShare(cwd, "feature/x", ENV))?.shareId).toBe("sh_pub");
+		});
+
+		it("treats a record as absent when the current env key is undefined/blank (unknown backend)", async () => {
+			await putBranchShare(cwd, "feature/x", PUB);
+			expect(await getShare(cwd, "feature/x", undefined)).toBeUndefined();
+			expect(await getShare(cwd, "feature/x", "")).toBeUndefined();
+		});
+
+		it("does not seed a fresh subject from a stranded record on a different backend", async () => {
+			await putBranchShare(
+				cwd,
+				"feature/x",
+				{ ...MEMBER, shareId: "foreign", shareUrl: "https://jolli-local.me/share/x" },
+				"a".repeat(40),
+			);
+			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", ENV, "b".repeat(40));
+			expect(record).toBeUndefined();
+			expect(seed).toBeUndefined(); // the stranded record belongs to another backend
+		});
 	});
 
 	it("persists a single record per subject on disk (no slot nesting)", async () => {
@@ -139,20 +175,36 @@ describe("BranchShareStore", () => {
 
 	it("treats a malformed file as empty", async () => {
 		await writeFile(filePath(), "{not json", "utf8");
-		expect(await getShare(cwd, "feature/x")).toBeUndefined();
+		expect(await getShare(cwd, "feature/x", ENV)).toBeUndefined();
 	});
 
 	it("ignores a file with an unrecognized version (no migration)", async () => {
-		// Older two-slot (v3) and single-record (v2) shapes were never released; any
+		// Only the dev-only shapes (v2/v3) are unrecognized; v4 is the current shape. A
 		// non-current version is ignored and re-created on the next share.
-		await writeFile(filePath(), JSON.stringify({ version: 3, subjects: { "feature/x": { public: PUB } } }), "utf8");
-		expect(await getShare(cwd, "feature/x")).toBeUndefined();
+		await writeFile(filePath(), JSON.stringify({ version: 3, subjects: { "feature/x": PUB } }), "utf8");
+		expect(await getShare(cwd, "feature/x", ENV)).toBeUndefined();
+	});
+
+	it("matches a record purely by its shareUrl backend (no separate env field)", async () => {
+		// An older record that also carried an `envKey` field still reads fine — the field
+		// is ignored and the backend is derived from shareUrl.
+		await writeFile(
+			filePath(),
+			JSON.stringify({
+				version: 4,
+				subjects: { "feature/x": { ...PUB, envKey: "https://stale.example" } },
+			}),
+			"utf8",
+		);
+		expect((await getShare(cwd, "feature/x", ENV))?.shareId).toBe("sh_pub");
+		// A since-swapped key on a different backend still reads it as foreign.
+		expect(await getShare(cwd, "feature/x", OTHER_ENV)).toBeUndefined();
 	});
 
 	it("ignores a file whose subjects field is not an object", async () => {
 		// Current version so it reaches the shape check (not short-circuited by version mismatch).
 		await writeFile(filePath(), JSON.stringify({ version: 4, subjects: "nope" }), "utf8");
-		expect(await getShare(cwd, "feature/x")).toBeUndefined();
+		expect(await getShare(cwd, "feature/x", ENV)).toBeUndefined();
 	});
 
 	it("cleans up and propagates when the atomic rename fails", async () => {
@@ -168,14 +220,14 @@ describe("BranchShareStore", () => {
 			putBranchShare(cwd, "b", { ...PUB, shareId: "b" }),
 			putBranchShare(cwd, "c", { ...PUB, shareId: "c" }),
 		]);
-		expect((await getShare(cwd, "a"))?.shareId).toBe("a");
-		expect((await getShare(cwd, "b"))?.shareId).toBe("b");
-		expect((await getShare(cwd, "c"))?.shareId).toBe("c");
+		expect((await getShare(cwd, "a", ENV))?.shareId).toBe("a");
+		expect((await getShare(cwd, "b", ENV))?.shareId).toBe("b");
+		expect((await getShare(cwd, "c", ENV))?.shareId).toBe("c");
 	});
 
 	describe("getShareWithBranchLatest", () => {
 		it("both undefined when the branch has no subjects at all", async () => {
-			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x");
+			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", ENV);
 			expect(record).toBeUndefined();
 			expect(seed).toBeUndefined();
 		});
@@ -183,7 +235,7 @@ describe("BranchShareStore", () => {
 		it("returns a commit subject's own record and no seed when it's the only commit share", async () => {
 			const hash = "a".repeat(40);
 			await putBranchShare(cwd, "feature/x", { ...MEMBER, shareId: "own" }, hash);
-			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", hash);
+			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", ENV, hash);
 			expect(record?.shareId).toBe("own");
 			expect(seed).toBeUndefined(); // no OTHER commit share to seed from
 		});
@@ -202,7 +254,7 @@ describe("BranchShareStore", () => {
 				"b".repeat(40),
 			);
 			// Open a brand-new commit subject (no record): seed is the newest stranded commit share.
-			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", "c".repeat(40));
+			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", ENV, "c".repeat(40));
 			expect(record).toBeUndefined();
 			expect(seed?.shareId).toBe("new");
 			expect(seed?.recipients).toEqual(["tom@jolli.ai"]);
@@ -213,7 +265,7 @@ describe("BranchShareStore", () => {
 			// auto-staging its people would double-grant. A commit subject only seeds from
 			// other commit shares.
 			await putBranchShare(cwd, "feature/x", { ...MEMBER, shareId: "branch", recipients: ["ada@jolli.ai"] });
-			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", "a".repeat(40));
+			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", ENV, "a".repeat(40));
 			expect(record).toBeUndefined();
 			expect(seed).toBeUndefined(); // the branch share is not a seed source for a commit subject
 		});
@@ -221,7 +273,7 @@ describe("BranchShareStore", () => {
 		it("a branch subject never seeds (its key is stable, never stranded)", async () => {
 			await putBranchShare(cwd, "feature/x", { ...MEMBER, shareId: "branch" });
 			await putBranchShare(cwd, "feature/x", { ...MEMBER, shareId: "commit" }, "a".repeat(40));
-			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x");
+			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", ENV);
 			expect(record?.shareId).toBe("branch"); // its own record
 			expect(seed).toBeUndefined(); // does not seed from the commit share (cross-kind)
 		});
@@ -241,14 +293,14 @@ describe("BranchShareStore", () => {
 			);
 			// Query the newer subject: its own record is returned; the seed is the OTHER one,
 			// even though the queried subject has a later expiry.
-			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", "a".repeat(40));
+			const { record, seed } = await getShareWithBranchLatest(cwd, "feature/x", ENV, "a".repeat(40));
 			expect(record?.shareId).toBe("self");
 			expect(seed?.shareId).toBe("other");
 		});
 
 		it("does not match a branch whose name is a prefix of another (feat vs feature/x)", async () => {
 			await putBranchShare(cwd, "feature/x", PUB, "a".repeat(40));
-			const { seed } = await getShareWithBranchLatest(cwd, "feat", "b".repeat(40));
+			const { seed } = await getShareWithBranchLatest(cwd, "feat", ENV, "b".repeat(40));
 			expect(seed).toBeUndefined();
 		});
 	});

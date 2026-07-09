@@ -70,8 +70,10 @@ beforeEach(() => {
 	vi.mocked(assignOwnedAttachments).mockReturnValue({
 		ownedPlans: new Map(),
 		ownedNotes: new Map(),
+		ownedReferences: new Map(),
 		seedPlanDocIds: new Map(),
 		seedNoteDocIds: new Map(),
+		seedReferenceDocIds: new Map(),
 	});
 	vi.mocked(pushSummary).mockResolvedValue({ summary: summary(HASH_A), summaryUrl: "https://acme.jolli.ai/a" });
 	vi.mocked(updateBatch).mockResolvedValue(undefined);
@@ -259,8 +261,10 @@ describe("processPushPending", () => {
 		vi.mocked(assignOwnedAttachments).mockReturnValue({
 			ownedPlans: new Map([[HASH_A, [{ slug: "p-1234abcd" }]]]) as never,
 			ownedNotes: new Map(),
+			ownedReferences: new Map(),
 			seedPlanDocIds: new Map(),
 			seedNoteDocIds: new Map(),
+			seedReferenceDocIds: new Map(),
 		});
 		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
 		await processPushPending(CWD, { source: "pre-push", client: fakeClient() });
@@ -290,8 +294,10 @@ describe("processPushPending", () => {
 		vi.mocked(assignOwnedAttachments).mockReturnValue({
 			ownedPlans: new Map([[HASH_A, [{ slug: "off-plan" }]]]) as never,
 			ownedNotes: new Map(),
+			ownedReferences: new Map(),
 			seedPlanDocIds: new Map(),
 			seedNoteDocIds: new Map(),
+			seedReferenceDocIds: new Map(),
 		});
 		vi.mocked(loadPushPending).mockResolvedValue({
 			version: 1,

@@ -655,7 +655,12 @@ export interface JolliMetaHoistResult {
 
 /** Recursively collects jolliDocId/jolliDocUrl from children, picks newest as winner. */
 export function collectChildJolliMeta(nodes: ReadonlyArray<CommitSummary>): JolliMetaHoistResult {
-	const candidates: Array<{ jolliDocId: number; jolliDocUrl: string; commitDate: string; generatedAt: string }> = [];
+	const candidates: Array<{
+		jolliDocId: number;
+		jolliDocUrl: string;
+		commitDate: string;
+		generatedAt: string;
+	}> = [];
 	for (const node of nodes) {
 		const url = node.jolliDocUrl;
 		if (node.jolliDocId && url) {
@@ -1126,7 +1131,10 @@ async function mergeManyToOneLocked(
 		...(hoistedPlans.length > 0 && { plans: hoistedPlans }),
 		...(hoistedNotes.length > 0 && { notes: hoistedNotes }),
 		...(hoistedReferences.length > 0 && { references: hoistedReferences }),
-		...(jolliMeta.winner && { jolliDocId: jolliMeta.winner.jolliDocId, jolliDocUrl: jolliMeta.winner.jolliDocUrl }),
+		...(jolliMeta.winner && {
+			jolliDocId: jolliMeta.winner.jolliDocId,
+			jolliDocUrl: jolliMeta.winner.jolliDocUrl,
+		}),
 		...(allOrphanedDocIds.length > 0 && { orphanedDocIds: allOrphanedDocIds }),
 		...(unresolvedOrphanHashes.length > 0 && { unresolvedOrphanHashes }),
 		topics: consolidatedTopics,

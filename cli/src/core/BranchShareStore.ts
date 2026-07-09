@@ -28,15 +28,21 @@ import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createLogger, errMsg, isEnoent, JOLLI_DIR, JOLLIMEMORY_DIR } from "../Logger.js";
 import { atomicWriteFile } from "./AtomicWrite.js";
+import { deriveJolliBackendKey } from "./JolliApiUtils.js";
 
 const log = createLogger("BranchShare");
 
 const SHARES_FILE = "branch-shares.json";
-// One share record per subject (single-slot). Branch sharing never shipped with an
-// older on-disk shape (v2/v3 existed only on unreleased dev builds), so there is no
-// migration: a file whose `version` or shape doesn't match is ignored (treated as
-// empty) and re-created on the next share. The number stays MONOTONIC past the
-// dev-only v2/v3 so an older file is never mistaken for the current shape.
+// One share record per subject (single-slot). The on-disk shape is v4, shared with
+// the IntelliJ plugin, which reads/writes the SAME file (via Gson, which ignores
+// unknown fields). The backend a share was minted against is recovered from its
+// `shareUrl` origin (see `matchesEnv`), so no separate env field is stored; a v4 file
+// written by an older build that also carried an `envKey` field still reads fine (the
+// extra field is ignored). The version is deliberately NOT bumped for this: bumping
+// it would make the two tools discard each other's file and silently drop live
+// shares. A genuinely unrecognized version (the dev-only v2/v3) is still ignored
+// (treated as empty) and re-created on the next share; the number stays MONOTONIC
+// past those so an older file is never mistaken for the current shape.
 const SHARES_VERSION = 4 as const;
 
 /**
@@ -63,6 +69,18 @@ export type LiveRef =
 /** One share record (branch share or single-commit share). Every share is live. */
 export interface BranchShareRecord {
 	readonly shareId: string;
+	/**
+	 * Neutral base-domain share link (`https://<baseDomain>/share/<token>`). Its
+	 * origin also identifies the BACKEND the share was minted against: a record whose
+	 * `shareUrl` backend (`deriveJolliBackendKey`) doesn't match the current API key's
+	 * backend is a cross-environment stale entry (its `shareId` belongs to a server the
+	 * current key never talks to) and is treated as absent (see `matchesEnv`), so the
+	 * next Copy/Invite mints a fresh link instead of 404-ing (`share_not_found`) against
+	 * a foreign `shareId`. Mirrors the `jolliDocId` URL-origin reuse guard
+	 * (`canReuseDocId`), but at backend (registrable-domain) granularity because the
+	 * share link is tenant-free — a rare same-deployment cross-tenant switch is treated
+	 * as the same backend.
+	 */
 	readonly shareUrl: string;
 	/**
 	 * Access level: `public` (anyone-with-link bearer), `org` (auth-gated: any
@@ -114,6 +132,20 @@ const COMMIT_KEY_SEP = ":";
  */
 function subjectKey(branch: string, commitHash?: string): string {
 	return commitHash ? `${branch}${COMMIT_KEY_SEP}${commitHash}` : branch;
+}
+
+/**
+ * Whether a record belongs to the backend the current API key targets — decided by
+ * comparing the record's `shareUrl` backend (`deriveJolliBackendKey`) against
+ * `currentBackendKey` (the current API key's backend, same derivation). A record on a
+ * DIFFERENT backend stays foreign (its `shareId` would 404); a record read with a
+ * blank/undefined `currentBackendKey` (underivable backend) or a `shareUrl` that
+ * doesn't parse is not trusted. Backend (registrable-domain) granularity — see
+ * {@link BranchShareRecord.shareUrl}.
+ */
+function matchesEnv(rec: BranchShareRecord, currentBackendKey: string | undefined): boolean {
+	const recBackend = deriveJolliBackendKey(rec.shareUrl);
+	return Boolean(currentBackendKey) && recBackend === currentBackendKey;
 }
 
 interface PersistedShape {
@@ -179,15 +211,19 @@ function serialize<T>(projectDir: string, work: () => Promise<T>): Promise<T> {
 
 /**
  * Returns a subject's single share record, or undefined. Pass `commitHash` for a
- * commit share; omit it for a branch share.
+ * commit share; omit it for a branch share. `currentBackendKey` is the current API
+ * key's backend (`deriveJolliBackendKey`); a record on a different backend reads as
+ * absent (see {@link matchesEnv}).
  */
 export async function getShare(
 	projectDir: string,
 	branch: string,
+	currentBackendKey: string | undefined,
 	commitHash?: string,
 ): Promise<BranchShareRecord | undefined> {
 	const all = await readAll(projectDir);
-	return all.subjects[subjectKey(branch, commitHash)];
+	const rec = all.subjects[subjectKey(branch, commitHash)];
+	return rec && matchesEnv(rec, currentBackendKey) ? rec : undefined;
 }
 
 /**
@@ -221,19 +257,23 @@ export async function putBranchShare(
  * stable (never stranded), so it has no same-kind prior and gets no seed.
  *
  * Expiry is NOT filtered here (the store has no clock); the caller passes the result
- * through its liveness check so an intentionally-lapsed grant never seeds.
+ * through its liveness check so an intentionally-lapsed grant never seeds. Records
+ * minted against a different backend (`shareUrl` backend mismatch) are skipped — a
+ * foreign shareId must never seed a subject on the current server.
  */
 function pickSeedForSubject(
 	subjects: Readonly<Record<string, BranchShareRecord>>,
 	branch: string,
 	commitHash: string | undefined,
 	currentKey: string,
+	currentBackendKey: string | undefined,
 ): BranchShareRecord | undefined {
 	const wantCommit = commitHash !== undefined;
 	let seed: BranchShareRecord | undefined;
 	let seedAt = Number.NEGATIVE_INFINITY;
 	for (const [key, record] of Object.entries(subjects)) {
 		if (key === currentKey) continue; // never seed a subject from itself
+		if (!matchesEnv(record, currentBackendKey)) continue; // never seed from a foreign backend
 		const sameKind = wantCommit ? key.startsWith(branch + COMMIT_KEY_SEP) : key === branch;
 		if (!sameKind) continue;
 		const parsed = Date.parse(record.expiresAt);
@@ -257,13 +297,15 @@ function pickSeedForSubject(
 export async function getShareWithBranchLatest(
 	projectDir: string,
 	branch: string,
+	currentBackendKey: string | undefined,
 	commitHash?: string,
 ): Promise<{ record: BranchShareRecord | undefined; seed: BranchShareRecord | undefined }> {
 	const all = await readAll(projectDir);
 	const currentKey = subjectKey(branch, commitHash);
+	const own = all.subjects[currentKey];
 	return {
-		record: all.subjects[currentKey],
-		seed: pickSeedForSubject(all.subjects, branch, commitHash, currentKey),
+		record: own && matchesEnv(own, currentBackendKey) ? own : undefined,
+		seed: pickSeedForSubject(all.subjects, branch, commitHash, currentKey, currentBackendKey),
 	};
 }
 

@@ -11,11 +11,29 @@
  * leads with the title alone. The default is title-only; the three trackers
  * opt in, so a new source needs no change here to render sensibly.
  */
+import { getRegistry } from "./SourceDefinitionRegistry.js";
+
 const NATIVE_ID_TRACKER_SOURCES: ReadonlySet<string> = new Set(["linear", "jira", "github"]);
 
 /** True when a reference label should lead with `<nativeId> — ` before its title. */
 export function labelLeadsWithNativeId(source: string): boolean {
 	return NATIVE_ID_TRACKER_SOURCES.has(source);
+}
+
+/**
+ * Human display name for a reference source (`Linear`, `GitHub`, …), read from
+ * the source's registered {@link SourceDefinition.label} — the single place the
+ * name is defined, so built-in and phase-2 config sources both resolve with no
+ * per-source code here. Used to prefix the pushed article title so it's
+ * recognizable in the Space tree AND its slug lands in a source-scoped
+ * namespace (a `reference` never collides with a same-titled plan/note/summary).
+ * Falls back to a capitalized `source` only for an unregistered id (defensive —
+ * stored references always carry a registered source).
+ */
+export function referenceSourceLabel(source: string): string {
+	const label = getRegistry().byId(source)?.label;
+	if (label !== undefined) return label;
+	return source ? source.charAt(0).toUpperCase() + source.slice(1) : source;
 }
 
 /** The minimal shape {@link referenceDisplayTitle} reads — satisfied by both the cli `Reference`/`ReferenceCommitRef` and the vscode `ReferenceInfo`. */

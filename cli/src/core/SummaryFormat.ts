@@ -7,6 +7,11 @@
  */
 
 import type { CommitSummary, LlmCredentialSource, NoteReference, PlanReference } from "../Types.js";
+import {
+	type DisplayableReference,
+	referenceDisplayTitle,
+	referenceSourceLabel,
+} from "./references/ReferenceDisplay.js";
 import { collectDisplayTopics, collectSourceNodes, type TopicWithDate } from "./SummaryTree.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -209,6 +214,20 @@ export function buildPlanPushTitle(_summary: CommitSummary, planTitle: string): 
 /** Builds the note document title for pushing to Jolli Space. */
 export function buildNotePushTitle(_summary: CommitSummary, noteTitle: string): string {
 	return sanitizeTitle(noteTitle);
+}
+
+/**
+ * Builds the reference document title for pushing to Jolli Space. Leads with the
+ * human source label (`Linear: …`, `Slack: …`) followed by the unified display
+ * title ({@link referenceDisplayTitle} — which itself prefixes the nativeId for
+ * the trackers). The source prefix keeps the article recognizable in the Space
+ * tree AND scopes its generated slug into a per-source namespace, so a reference
+ * never collides with a plan/note/summary sharing the same base title.
+ */
+export function buildReferencePushTitle(ref: DisplayableReference): string {
+	// Middle-dot (not a colon — sanitizeTitle strips `:`) so the source label stays
+	// visually distinct from the ` — ` referenceDisplayTitle puts before the title.
+	return sanitizeTitle(`${referenceSourceLabel(ref.source)} · ${referenceDisplayTitle(ref)}`);
 }
 
 // ─── Topic collection ─────────────────────────────────────────────────────────
