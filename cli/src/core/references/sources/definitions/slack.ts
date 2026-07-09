@@ -1,9 +1,11 @@
 /**
  * Slack built-in source definition. Operates on the POST-normalize canonical
  * object from `SlackNormalize.normalizeSlackThread` (channelId + parentTs +
- * title + text + replyCount + optional url), NOT the raw MCP blob. `url` is
- * OPTIONAL here (unique among sources): when no permalink was pasted and no
- * `slack.workspaceUrl` is configured, the thread is still captured, linkless.
+ * title + text + replyCount + url), NOT the raw MCP blob. `url` is REQUIRED:
+ * a thread whose url could not be resolved (no permalink pasted AND no
+ * `slack.workspaceUrl` configured — e.g. the user pasted a bare channel URL,
+ * which carries no message ts) is voided by `extractRef` and never stored,
+ * since a linkless reference has nothing to jump to.
  */
 
 import type { SourceDefinition } from "../../SourceDefinition.js";
@@ -33,7 +35,7 @@ export const slackDefinition: SourceDefinition = {
 			require: "^[A-Z0-9]+-\\d{7,}\\.\\d+$",
 		},
 		title: { pipe: [{ op: "path", path: "title" }], require: ".+" },
-		url: { pipe: [{ op: "path", path: "url" }], require: "^https://", optional: true },
+		url: { pipe: [{ op: "path", path: "url" }], require: "^https://" },
 		description: { pipe: [{ op: "path", path: "text" }], optional: true },
 	},
 	fields: [

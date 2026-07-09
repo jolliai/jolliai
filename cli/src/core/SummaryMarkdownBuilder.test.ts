@@ -470,6 +470,28 @@ describe("pushPlansAndNotesSection references gating", () => {
 		pushPlansAndNotesSection(lines, summary, { includeReferences: true });
 		expect(lines.join("\n")).toContain("[ENG-1 — Fix](https://l/ENG-1)");
 	});
+	it("drops the nativeId lead for non-tracker sources (Slack / Notion) but keeps it for trackers", () => {
+		const lines: string[] = [];
+		pushPlansAndNotesSection(
+			lines,
+			{
+				plans: [],
+				notes: [],
+				references: [
+					{ source: "linear", nativeId: "ENG-1", title: "Fix", url: "https://l/ENG-1" },
+					{ source: "slack", nativeId: "C1-1700000000.1", title: "Thread title", url: "https://s/t" },
+					{ source: "notion", nativeId: "abcdef12", title: "Page title", url: "https://n/p" },
+				],
+			} as never,
+			{ includeReferences: true },
+		);
+		const out = lines.join("\n");
+		expect(out).toContain("[ENG-1 — Fix](https://l/ENG-1)");
+		expect(out).toContain("[Thread title](https://s/t)");
+		expect(out).toContain("[Page title](https://n/p)");
+		expect(out).not.toContain("C1-1700000000.1 —");
+		expect(out).not.toContain("abcdef12 —");
+	});
 });
 
 describe("pushExcludedContextSection", () => {

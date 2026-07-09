@@ -769,7 +769,7 @@ export interface Reference {
 	/** Stable id native to the source (Linear ticket id, Jira key, `owner/repo#number`, 32-hex Notion page id). */
 	readonly nativeId: string;
 	readonly title: string;
-	/** Absent only when the definition's `url` FieldSpec is marked `optional` and the payload has no url (e.g. Slack with no permalink and no configured workspace). */
+	/** Optional in the type as a forward-compat allowance for a url-optional source definition; every source shipping today marks `url` as required in its FieldSpec, so an extracted reference always carries one. */
 	readonly url?: string;
 	readonly description?: string;
 	/** Opaque, source-specific display fields. Built and consumed only by the adapter. */

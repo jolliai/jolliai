@@ -11,6 +11,7 @@ import {
 	type CommitExclusions,
 	readExclusions,
 } from "../../../cli/src/core/CommitSelectionStore.js";
+import { referenceDisplayTitle } from "../../../cli/src/core/references/ReferenceDisplay.js";
 import type { ReferenceField, SourceId } from "../../../cli/src/Types.js";
 import type { PlansStore } from "../stores/PlansStore.js";
 import type { NoteInfo, PlanInfo, ReferenceInfo } from "../Types.js";
@@ -139,7 +140,7 @@ export class ReferenceItem extends vscode.TreeItem {
 	};
 
 	constructor(reference: ReferenceInfo) {
-		super(buildReferenceLabel(reference), vscode.TreeItemCollapsibleState.None);
+		super(referenceDisplayTitle(reference), vscode.TreeItemCollapsibleState.None);
 		this.reference = reference;
 		this.description = buildReferenceDescription(reference);
 		this.iconPath = new vscode.ThemeIcon(buildReferenceIconKey(reference.source));
@@ -158,7 +159,7 @@ export class ReferenceItem extends vscode.TreeItem {
 		// multi-paragraph blobs that bloat the popover). Users who want the
 		// full text click "Open in <Source>".
 		this.referenceHover = {
-			title: buildReferenceLabel(reference),
+			title: referenceDisplayTitle(reference),
 			source: reference.source,
 			...(reference.fields && reference.fields.length > 0 ? { fields: reference.fields } : {}),
 			url: reference.url,
@@ -344,18 +345,6 @@ function buildNoteTooltip(note: NoteInfo): vscode.MarkdownString {
 
 // ─── Reference label / tooltip helpers ──────────────────────────────────────
 
-/**
- * Reference row label. Linear / Jira / GitHub issues all carry a stable native id
- * (PROJ-1234, KAN-5, owner/repo#42) that users recognize at a glance, so the
- * label leads with it. Notion pages are nameless beyond their title (the 32-hex
- * page id is meaningless to the user), so the label drops the prefix and just
- * shows the title.
- */
-function buildReferenceLabel(reference: ReferenceInfo): string {
-	if (reference.source === "notion") return reference.title;
-	return `${reference.nativeId} — ${reference.title}`;
-}
-
 function buildReferenceIconKey(source: SourceId): string {
 	// Per-source codicon id, from the single SOURCE_META table (SourceLabels.ts).
 	// Notion references are pages, not tickets — `file-text` matches the
@@ -382,11 +371,7 @@ function buildReferenceTooltip(reference: ReferenceInfo): string {
 	// MarkdownString here would render its escaped source verbatim.
 	// Plain text round-trips identically through both surfaces.
 	const lines: Array<string> = [];
-	if (reference.source === "notion") {
-		lines.push(reference.title);
-	} else {
-		lines.push(`${reference.nativeId} — ${reference.title}`);
-	}
+	lines.push(referenceDisplayTitle(reference));
 	const refFields = reference.fields ?? [];
 	if (refFields.length > 0) {
 		lines.push("");

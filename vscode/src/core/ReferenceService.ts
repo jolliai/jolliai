@@ -186,10 +186,9 @@ function toReferenceInfo(mapKey: string, entry: ReferenceEntry): ReferenceInfo {
 		nativeId: entry.nativeId,
 		mapKey,
 		title: entry.title,
-		// entry.url is absent only for a Slack reference captured with no
-		// permalink/workspace URL (ReferenceEntry doc comment); ReferenceInfo.url
-		// stays a required string end-to-end (empty = "no url"), matching how the
-		// Next Memory panel's config-needed hint checks for a falsy url.
+		// entry.url is optional in the model, but every shipping source requires
+		// it, so it is effectively always present; ReferenceInfo.url stays a
+		// required string end-to-end (empty = "no url") as a defensive default.
 		url: entry.url ?? "",
 		sourcePath: entry.sourcePath,
 		...(frontmatter.fields !== undefined ? { fields: frontmatter.fields } : {}),

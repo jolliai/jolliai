@@ -213,11 +213,12 @@ describe("ReferenceStore", () => {
 			expect(after).toContain('"new"');
 		});
 
-		it("round-trips a Slack ref with no url (no permalink)", async () => {
-			// Slack references may legitimately lack a url — no configured
-			// workspace / no permalink in the payload. renderMarkdown must omit
-			// the `url:` line, and parseMarkdown must come back with `undefined`
-			// (not `""`) rather than rejecting the reference for a missing url.
+		it("round-trips a ref with no url line", async () => {
+			// Storage is source-agnostic: the frontmatter contract keeps only
+			// nativeId/title required (url may be absent for a legacy or
+			// hand-built ref), so renderMarkdown must omit the `url:` line and
+			// parseMarkdown must come back with `undefined` (not `""`) rather
+			// than rejecting the reference for a missing url.
 			const ref = slackRef();
 			const { sourcePath } = await writeReferenceMarkdown(ref, tempDir);
 			const raw = await readFile(sourcePath, "utf-8");

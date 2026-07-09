@@ -613,8 +613,9 @@ describe("SummaryMarkdownBuilder", () => {
 
 			it("renders summary.entities (v5+) across multiple sources in deterministic order", () => {
 				// Order in input: jira, notion, linear, github — must come out as
-				// linear → jira → github → notion per REFERENCE_SOURCE_ORDER. Each
-				// bullet uses `nativeId — title` (URL = upstream).
+				// linear → jira → github → notion per REFERENCE_SOURCE_ORDER. Tracker
+				// bullets use `nativeId — title`; Notion uses the title alone (URL =
+				// upstream).
 				const summary = makeSummary({
 					references: [
 						{
@@ -662,7 +663,9 @@ describe("SummaryMarkdownBuilder", () => {
 				const idxLinear = md.indexOf("PROJ-1 — Linear ticket");
 				const idxJira = md.indexOf("KAN-5 — Jira ticket");
 				const idxGithub = md.indexOf("owner/repo#42 — GitHub issue");
-				const idxNotion = md.indexOf("abcdef12 — Notion page");
+				// Notion leads with the title alone — its 32-hex nativeId is dropped
+				// (only Linear/Jira/GitHub keep the recognizable key prefix).
+				const idxNotion = md.indexOf("Notion page");
 				expect(idxLinear).toBeGreaterThan(-1);
 				expect(idxJira).toBeGreaterThan(idxLinear);
 				expect(idxGithub).toBeGreaterThan(idxJira);

@@ -310,6 +310,20 @@ describe("ReferenceItem", () => {
 		expect(item.contextValue).toBe("reference");
 	});
 
+	it("Slack entities render title-only label (the <channel>-<ts> nativeId is meaningless to users)", () => {
+		const item = new ReferenceItem(
+			makeReference({
+				source: "slack",
+				nativeId: "C0BFF9UHBD1-1783413984.700009",
+				title: "Consolidate the existing Linear /…",
+				mapKey: "slack:C0BFF9UHBD1-1783413984.700009",
+				url: "https://x.slack.com/archives/C0BFF9UHBD1/p1783413984700009",
+			}),
+		);
+		expect(item.label).toBe("Consolidate the existing Linear /…");
+		expect(item.tooltip).not.toContain("C0BFF9UHBD1-1783413984.700009");
+	});
+
 	it("Jira and GitHub entities use the issues icon with prefixed labels", () => {
 		const jira = new ReferenceItem(
 			makeReference({

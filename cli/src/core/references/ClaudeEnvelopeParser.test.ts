@@ -45,7 +45,11 @@ describe("ClaudeEnvelopeParser slack", () => {
 		});
 		expect((results[0].payload as { url?: string }).url).toBe(PERMALINK);
 	});
-	it("captures linklessly when neither permalink nor config present", () => {
+	it("emits a urlless canonical when neither permalink nor config present (extractRef voids it downstream)", () => {
+		// The parser is a lower layer than extractRef: it still surfaces the
+		// canonical thread object with no url. The slack definition marks url
+		// required, so `SourceEngine.extractRef` is where this urlless payload
+		// is voided (see slack.test.ts / SourceEngine.test.ts) — nothing is stored.
 		const { results } = claudeEnvelopeParser.parse(lines().slice(1), {});
 		expect((results[0].payload as { url?: string }).url).toBeUndefined();
 	});

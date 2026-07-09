@@ -1068,11 +1068,11 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain('id="reference-slack-1704067200.000100-aaaa1111"');
 
 			// Order: linear < jira < github < notion < slack regardless of input order.
-			const iLinear = html.indexOf("PROJ-7 ");
-			const iJira = html.indexOf("KAN-5 ");
-			const iGithub = html.indexOf("owner/repo#42 ");
-			const iNotion = html.indexOf("abcdef12 ");
-			const iSlack = html.indexOf("1704067200.000100 ");
+			const iLinear = html.indexOf("reference-linear-");
+			const iJira = html.indexOf("reference-jira-");
+			const iGithub = html.indexOf("reference-github-");
+			const iNotion = html.indexOf("reference-notion-");
+			const iSlack = html.indexOf("reference-slack-");
 			expect(iLinear).toBeGreaterThan(-1);
 			expect(iJira).toBeGreaterThan(iLinear);
 			expect(iGithub).toBeGreaterThan(iJira);
@@ -1093,6 +1093,22 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain(
 				'data-reference-url="https://example.slack.com/archives/C123456/p1704067200000100"',
 			);
+
+			// The r-title leads with the nativeId only for the issue trackers.
+			// escHtml leaves the em-dash literal (it is not an HTML metachar).
+			expect(html).toContain(">PROJ-7 — Linear ticket</a>");
+			expect(html).toContain(">owner/repo#42 — GitHub issue</a>");
+			// Notion / Slack lead with the title alone (machine-id nativeId dropped
+			// from the r-title — and the `<nativeId> (Source)` metaline is omitted too).
+			expect(html).toContain(">Notion page</a>");
+			expect(html).toContain(">Slack message</a>");
+				// The `<nativeId> (Source)` metaline is kept only for the trackers;
+				// omitted entirely for machine-id sources (Notion / Slack).
+				expect(html).toContain(">PROJ-7 (Linear)</div>");
+				expect(html).not.toContain("(Notion)");
+				expect(html).not.toContain("(Slack)");
+			expect(html).not.toContain("abcdef12 — Notion page");
+			expect(html).not.toContain("1704067200.000100 — Slack message");
 		});
 
 		it("linear issues count rolls into the section header count badge", () => {
@@ -1264,11 +1280,11 @@ describe("SummaryHtmlBuilder", () => {
 				expect(html).toContain('data-action="translateReference"');
 			});
 
-			it("renders a linkless reference (url absent — e.g. a Slack thread with no permalink/workspace configured) with an empty data-reference-url", () => {
-				// ReferenceCommitRef.url is optional (absent only for a source whose
-				// Reference.url was absent — today only Slack with no permalink) —
-				// buildReferenceRow must not blow up or emit the literal string
-				// "undefined" into the Open-in-<Source> button's data attribute.
+			it("renders a reference with no url (defensive — no shipping source emits one) with an empty data-reference-url", () => {
+				// ReferenceCommitRef.url is optional in the type but every shipping
+				// source requires it, so this is a defensive case — buildReferenceRow
+				// must not blow up or emit the literal string "undefined" into the
+				// Open-in-<Source> button's data attribute.
 				const html = buildHtml(makeSummary({ references: [makeLinear({ url: undefined })] }));
 				expect(html).toContain('data-reference-url=""');
 				expect(html).not.toContain('data-reference-url="undefined"');

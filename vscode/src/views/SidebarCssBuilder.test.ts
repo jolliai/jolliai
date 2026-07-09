@@ -560,6 +560,23 @@ describe("onboarding panel styles", () => {
 		});
 	});
 
+	// Same class of bug as BUG 4: the reference hover-card's source badge shipped
+	// as a bare unstyled letter glued to the title ("SConsolidate…"). The card now
+	// reuses the shared context-row chip (.mem-ctx-badge, per-source brand hue) so
+	// it matches the sidebar context rows; .hc-title stays a plain block, so the
+	// only card-scoped tweak is spacing/alignment of the inline chip.
+	describe(".mem-ctx-badge inside the reference hover-card title", () => {
+		it("nudges the reused context chip with spacing + inline alignment", () => {
+			const css = buildSidebarCss();
+			expect(css).toMatch(
+				/\.hover-card\s+\.hc-title\s+\.mem-ctx-badge\s*\{[^}]*margin-right/,
+			);
+			expect(css).toMatch(
+				/\.hover-card\s+\.hc-title\s+\.mem-ctx-badge\s*\{[^}]*vertical-align/,
+			);
+		});
+	});
+
 	describe(".edited-icon — applies to both conversation rows and KB folder file rows", () => {
 		it("declares the visual block under both scopes with the same color token", () => {
 			// The KB folders tree renders the same codicon-edit ✎ glyph that

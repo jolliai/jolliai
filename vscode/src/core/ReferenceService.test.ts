@@ -233,7 +233,7 @@ describe("detectReferences", () => {
 		expect(await detectReferences("/repo")).toEqual([]);
 	});
 
-	it("defaults url to empty string for a linkless Slack entry (no permalink/workspace configured)", async () => {
+	it("defaults url to empty string for a persisted entry with no url (defensive — no shipping source emits one)", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},

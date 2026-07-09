@@ -2457,15 +2457,14 @@ describe("SidebarScriptBuilder", () => {
 		});
 
 		it("includes a per-source badge in the title row so users can disambiguate Linear / Jira / GitHub / Notion at a glance", () => {
-			// The badge is the minimum-viable source-surfacing — single letter
-			// (L / J / G / N), looked up from the injected SOURCE_META table
-			// (single ./SourceLabels.ts source of truth) rather than a
-			// hardcoded per-call-site object.
+			// The title badge reuses the shared context-row chip (ctxBadge →
+			// .mem-ctx-badge) so the provider glyph + brand hue read identically
+			// here and on the sidebar context rows, rather than a bespoke
+			// hover-card-only badge.
 			const js = buildSidebarScript();
-			expect(js).toContain("hc-source-badge");
 			const fnStart = js.indexOf("function renderReferenceHoverCard");
 			const body = js.slice(fnStart, fnStart + 700);
-			expect(body).toContain("SOURCE_META[h.source]");
+			expect(body).toContain("ctxBadge('reference', h.source)");
 			expect(body).not.toContain("github: 'GH'");
 			expect(js).toContain('"linear":{"label":"Linear","letter":"L"');
 			expect(js).toContain('"jira":{"label":"Jira","letter":"J"');
