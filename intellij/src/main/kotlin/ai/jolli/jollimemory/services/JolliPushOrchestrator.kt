@@ -128,6 +128,7 @@ object JolliPushOrchestrator {
                     docId = summary.jolliDocId,
                     repoUrl = ctx.repoUrl,
                     relativePath = SummaryUtils.buildBranchRelativePath(summary.branch),
+                    summaryJson = JolliApiClient.serializeSummaryJson(summaryForMarkdown),
                 ),
             )
 

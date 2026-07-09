@@ -127,7 +127,7 @@ describe("recall template frontmatter", () => {
 		const recall = readRecall();
 		expect(recall).toMatch(/^---\nname: jolli-recall\n/);
 		expect(recall).toMatch(/description: Recall prior development context/);
-		expect(recall).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}vendor: "jolli\.ai"/);
+		expect(recall).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}revision: \d+\n {2}vendor: "jolli\.ai"/);
 	});
 
 	it("does NOT contain Claude-private top-level frontmatter fields", async () => {
@@ -158,7 +158,7 @@ describe("search template frontmatter", () => {
 		const search = readSearch();
 		expect(search).toMatch(/^---\nname: jolli-search\n/);
 		expect(search).toMatch(/description: Search structured commit memories/);
-		expect(search).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}vendor: "jolli\.ai"/);
+		expect(search).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}revision: \d+\n {2}vendor: "jolli\.ai"/);
 	});
 
 	it("does NOT contain Claude-private top-level frontmatter fields", async () => {
@@ -176,7 +176,7 @@ describe("pr template frontmatter", () => {
 		const pr = readPr();
 		expect(pr).toMatch(/^---\nname: jolli-pr\n/);
 		expect(pr).toMatch(/description: Create or update a pull request using a Jolli Memory-generated description/);
-		expect(pr).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}vendor: "jolli\.ai"/);
+		expect(pr).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}revision: \d+\n {2}vendor: "jolli\.ai"/);
 	});
 
 	it("does NOT contain Claude-private top-level frontmatter fields", async () => {
@@ -194,7 +194,7 @@ describe("jolli menu template frontmatter", () => {
 		const jolli = readJolli();
 		expect(jolli).toMatch(/^---\nname: jolli\n/);
 		expect(jolli).toMatch(/description: The Jolli action menu/);
-		expect(jolli).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}vendor: "jolli\.ai"/);
+		expect(jolli).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}revision: \d+\n {2}vendor: "jolli\.ai"/);
 	});
 
 	it("does NOT contain Claude-private top-level frontmatter fields", async () => {
@@ -773,47 +773,47 @@ describe("legacy directories", () => {
 	});
 });
 
-// ─── Version-line recognition (legacy keys still respected on read) ─────────
+// ─── Revision-based idempotency (cross-tool churn guard) ────────────────────
 
-describe("version-line compatibility", () => {
-	it("recognizes a SKILL.md with the legacy `jolli-skill-version` key as up-to-date if the version matches", async () => {
-		// Plant a SKILL.md using the legacy top-level key at the CURRENT version.
-		// The installer should treat it as already up-to-date and not rewrite,
-		// even though the template now uses `metadata.version`. This protects
-		// users from a needless rewrite on upgrade.
+describe("revision-based idempotency", () => {
+	it("is idempotent — a second install at the same revision does not rewrite", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const first = readRecall();
+		await updateSkillsIfNeeded(tempDir);
+		// Same revision on disk (equal) → skipped, content unchanged.
+		expect(readRecall()).toBe(first);
+	});
+
+	it("upgrades a legacy `jolli-skill-version` file (no revision → prehistoric)", async () => {
+		// Even at the CURRENT release version, a legacy file has no `metadata.revision`,
+		// so it is treated as prehistoric and upgraded once to gain a revision. This is
+		// the one-time migration onto revision-based tracking.
 		const fs = await import("node:fs");
 		const planted = `---\nname: jolli-recall\njolli-skill-version: ${CURRENT_VERSION}\n---\nlegacy body`;
 		fs.mkdirSync(join(tempDir, ".claude/skills/jolli-recall"), { recursive: true });
 		fs.writeFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), planted, "utf-8");
 		await updateSkillsIfNeeded(tempDir);
-		// .claude path was up-to-date: the legacy file was preserved verbatim.
+		expect(readRecall()).not.toBe(planted);
+		expect(readRecall()).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}revision: \d+/);
+	});
+
+	it("overwrites a file whose revision is lower than ours", async () => {
+		const fs = await import("node:fs");
+		const planted = `---\nname: jolli-recall\nmetadata:\n  version: "0.0.0"\n  revision: 0\n  vendor: "jolli.ai"\n---\nold body`;
+		fs.mkdirSync(join(tempDir, ".claude/skills/jolli-recall"), { recursive: true });
+		fs.writeFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), planted, "utf-8");
+		await updateSkillsIfNeeded(tempDir);
+		expect(readRecall()).not.toBe(planted);
+		expect(readRecall()).toMatch(/Every commit deserves a Memory/);
+	});
+
+	it("does NOT downgrade a file whose revision is higher than ours (newer tool wins)", async () => {
+		const fs = await import("node:fs");
+		const planted = `---\nname: jolli-recall\nmetadata:\n  version: "9.9.9"\n  revision: 999\n  vendor: "jolli.ai"\n---\ncontent from a newer tool`;
+		fs.mkdirSync(join(tempDir, ".claude/skills/jolli-recall"), { recursive: true });
+		fs.writeFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), planted, "utf-8");
+		await updateSkillsIfNeeded(tempDir);
+		// Left untouched — never downgrade a newer revision.
 		expect(readRecall()).toBe(planted);
-		// .agents path didn't exist at all — installer creates it fresh.
-		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
-	});
-
-	it("rewrites when the file contains an unrecognized version line", async () => {
-		const fs = await import("node:fs");
-		const planted = `---\nname: jolli-recall\njolli-skill-version: 0.0.0-old\n---\nold body`;
-		fs.mkdirSync(join(tempDir, ".claude/skills/jolli-recall"), { recursive: true });
-		fs.writeFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), planted, "utf-8");
-		await updateSkillsIfNeeded(tempDir);
-		// Was rewritten — content no longer matches the plant.
-		expect(readRecall()).not.toBe(planted);
-		// And it now carries the new metadata.version form.
-		expect(readRecall()).toMatch(/metadata:\n {2}version:/);
-	});
-
-	it("rewrites when the existing file has no recognizable version line at all", async () => {
-		// No `version:` / `jolli-skill-version:` / `jollimemory-version:` anywhere
-		// → the version-match regex returns null (the `if (versionMatch)` false
-		// branch) and the installer falls through to a fresh write.
-		const fs = await import("node:fs");
-		const planted = `---\nname: jolli-recall\n---\nbody with no version key`;
-		fs.mkdirSync(join(tempDir, ".claude/skills/jolli-recall"), { recursive: true });
-		fs.writeFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), planted, "utf-8");
-		await updateSkillsIfNeeded(tempDir);
-		expect(readRecall()).not.toBe(planted);
-		expect(readRecall()).toMatch(/metadata:\n {2}version:/);
 	});
 });

@@ -103,6 +103,11 @@ class SettingsDialog(
     private val openCodeEnabledCheckbox = JBCheckBox("OpenCode — Session discovery via SQLite database scan", true)
     private val cursorEnabledCheckbox = JBCheckBox("Cursor IDE — Composer session discovery via SQLite database scan", true)
     private val copilotEnabledCheckbox = JBCheckBox("GitHub Copilot — CLI session-store scan + VS Code Chat workspace storage", true)
+    private val globalInstructionsCheckbox = JBCheckBox(
+        "Let AI assistants use Jolli's skills automatically " +
+            "(adds a preference block to ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md, ~/.codex/AGENTS.md)",
+        false,
+    )
     private val excludePatternsField = JBTextField()
     private val pauseCheckbox = JBCheckBox("Pause Jolli Memory (temporarily disable hooks without losing configuration)")
     private val telemetryCheckbox =
@@ -179,6 +184,16 @@ class SettingsDialog(
             .addComponent(openCodeEnabledCheckbox, 4)
             .addComponent(cursorEnabledCheckbox, 4)
             .addComponent(copilotEnabledCheckbox, 4)
+            .panel))
+
+        panel.add(JBLabel(
+            "<html><span style='color:gray'>Skill preference — steer your AI assistants toward Jolli.</span></html>",
+        ).apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            border = JBUI.Borders.empty(12, 0, 4, 0)
+        })
+        panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
+            .addComponent(globalInstructionsCheckbox, 4)
             .panel))
 
         return wrapTabContent(panel)
@@ -769,6 +784,17 @@ class SettingsDialog(
         val projectPath = service.mainRepoRoot ?: project.basePath
         val kbCustomPath = config.knowledgeBasePath
 
+        // Resolve the tri-state global-instructions consent. Checked → "enabled". Unchecked
+        // is an explicit opt-out ("disabled") ONLY when it was previously enabled; otherwise
+        // (undecided, or already disabled) leave it unchanged so merely opening Settings never
+        // silently opts a fresh user out. null means "no change to persist".
+        val prevGlobalInstructions = existing.globalInstructions
+        val newGlobalInstructions: String? = when {
+            globalInstructionsCheckbox.isSelected -> "enabled"
+            prevGlobalInstructions == "enabled" -> "disabled"
+            else -> null
+        }
+
         super.doOKAction()
 
         ProgressManager.getInstance().run(
@@ -805,6 +831,19 @@ class SettingsDialog(
                             folder.ensure()
                             MigrationEngine(orphan, folder, mm).runMigration()
                         }
+                    }
+
+                    // 2b. Apply the global-instructions consent: persist a fresh decision to
+                    // the shared config, then write or remove the skill-preference block. sync()
+                    // reads the just-persisted value; confirm=null so it never prompts here.
+                    if (newGlobalInstructions != null && newGlobalInstructions != prevGlobalInstructions) {
+                        indicator.text = "Updating AI assistant instructions…"
+                        SessionTracker.saveGlobalInstructions(newGlobalInstructions)
+                    }
+                    try {
+                        ai.jolli.jollimemory.bridge.GlobalInstructionsInstaller.sync()
+                    } catch (e: Exception) {
+                        // Fail-soft — a read-only global file must never break settings save.
                     }
 
                     // 3. Refresh status once, after everything settled.
@@ -864,6 +903,9 @@ class SettingsDialog(
         claudeEnabledCheckbox.isSelected = config.claudeEnabled != false
         codexEnabledCheckbox.isSelected = config.codexEnabled != false
         geminiEnabledCheckbox.isSelected = config.geminiEnabled != false
+        // Tri-state consent: checked only when explicitly "enabled". "disabled" and
+        // undecided (null) both render unchecked — see doOKAction for how each is persisted.
+        globalInstructionsCheckbox.isSelected = config.globalInstructions == "enabled"
         openCodeEnabledCheckbox.isSelected = config.openCodeEnabled != false
         cursorEnabledCheckbox.isSelected = config.cursorEnabled != false
         copilotEnabledCheckbox.isSelected = config.copilotEnabled != false

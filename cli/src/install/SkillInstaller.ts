@@ -23,11 +23,28 @@
  * recipe, a 1-in-2^64 delimiter collision, a host that strips here-docs from
  * the command before execution) are accepted trade-offs of this design.
  *
- * Each skill is upserted **independently** by hash of its template content
- * compared with the version recorded in the file. This avoids the trap where
- * a single skill's version match short-circuits the whole installer and
- * prevents a newer skill (e.g. `jolli-search`) from ever being installed on
- * projects whose `jolli-recall` already matches the current version.
+ * Each skill is upserted **independently** by its content revision
+ * (`metadata.revision`). This avoids the trap where a single skill's match
+ * short-circuits the whole installer and prevents a newer skill (e.g.
+ * `jolli-search`) from ever being installed on projects whose `jolli-recall`
+ * is already current.
+ *
+ * **Cross-tool idempotency — `metadata.revision`.** The write guard keys on a
+ * monotonic integer that is DECOUPLED from any tool's release version (npm
+ * package version / IntelliJ plugin version) and kept in **lockstep across CLI,
+ * VS Code, and IntelliJ** — bumped whenever a skill's body changes. Using a
+ * shared, comparable revision (rather than each tool's own version string) is
+ * what stops two tools that co-manage the same `SKILL.md` from endlessly
+ * rewriting each other's file. Precedence: disk revision greater than ours →
+ * skip (a newer tool wrote it, never downgrade); equal → skip (same content by
+ * the lockstep contract); less → overwrite (we're newer); absent/unparseable
+ * (legacy `jolli-skill-version:` files) → treated as {@link PREHISTORIC_REVISION}
+ * so it upgrades once and then converges. A content hash was rejected: it would
+ * make churn-freedom depend on byte-identical content across tools, so one stray
+ * byte would reignite the rewrite war. **When you change a skill's body, bump its
+ * `revision` in ALL THREE implementations in the same change** (same lockstep
+ * rule as `parseJolliApiKey`). The Kotlin port lives at
+ * `intellij/src/main/kotlin/ai/jolli/jollimemory/bridge/SkillInstaller.kt`.
  */
 
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -164,34 +181,47 @@ export async function updateSkillIfNeeded(projectDir: string, config: { claudeEn
 }
 
 /**
- * Matches the version line in a SKILL.md frontmatter. Accepts:
- *   - `metadata.version: "x.y.z"` (current — spec compliant, nested under
- *     `metadata:` two-space-indented block).
- *   - Legacy top-level `jolli-skill-version: x.y.z` /
- *     `jollimemory-version: x.y.z` (kept so an old SKILL.md on disk is still
- *     recognized as "up-to-date" and not needlessly rewritten on every install).
- *
- * Multi-line mode so `^  version:` matches the nested form. Captured group is
- * the version string with surrounding whitespace and quotes trimmed downstream.
+ * Matches the shared content revision in a SKILL.md frontmatter
+ * (`metadata.revision`, a two-space-indented integer). The whole-file match is
+ * safe because no shipped skill body contains a `revision:` line, so the first
+ * match is the frontmatter's.
  */
-const SKILL_VERSION_LINE = /(?:^|\n)(?:[ \t]+version|jolli-skill-version|jollimemory-version):\s*([^\r\n]+)/;
+const SKILL_REVISION_LINE = /(?:^|\n)[ \t]*revision:\s*(\d+)/;
 
 /**
- * Writes one skill's SKILL.md file when its content version differs from
- * what's on disk. Idempotent.
+ * Revision assigned to a SKILL.md that carries no parseable `revision` (a legacy
+ * `jolli-skill-version:` file, or a hand-broken frontmatter). Lower than any real
+ * revision, so such a file is always upgraded once (then it has a revision and
+ * converges).
+ */
+const PREHISTORIC_REVISION = -1;
+
+/** Parses the shared `metadata.revision` integer, or {@link PREHISTORIC_REVISION} when absent. */
+function parseRevision(content: string): number {
+	const match = content.match(SKILL_REVISION_LINE);
+	const parsed = match ? Number.parseInt(match[1], 10) : Number.NaN;
+	return Number.isFinite(parsed) ? parsed : PREHISTORIC_REVISION;
+}
+
+/**
+ * Writes one skill's SKILL.md when this tool's revision is newer than what's on
+ * disk. Idempotent; never downgrades a file a newer tool wrote. See the module
+ * header for the precedence rule.
  */
 async function upsertSkill(skillsDir: string, name: string, content: string): Promise<void> {
 	const skillDir = join(skillsDir, name);
 	const skillPath = join(skillDir, "SKILL.md");
 
+	// "My revision" is the literal baked into the rendered template — the file is
+	// the single source of truth, so there is no separate constant to keep in sync.
+	const myRevision = parseRevision(content);
+
 	try {
 		const existing = await readFile(skillPath, "utf-8");
-		const versionMatch = existing.match(SKILL_VERSION_LINE);
-		if (versionMatch) {
-			const found = versionMatch[1].trim().replace(/^["']|["']$/g, "");
-			if (found === SKILL_VERSION) {
-				return; // Up to date
-			}
+		if (parseRevision(existing) >= myRevision) {
+			// Equal → same content by contract; greater → a newer tool wrote it.
+			// Either way, leave it untouched (never downgrade).
+			return;
 		}
 	} catch {
 		// File doesn't exist — will create
@@ -200,7 +230,7 @@ async function upsertSkill(skillsDir: string, name: string, content: string): Pr
 	try {
 		await mkdir(skillDir, { recursive: true });
 		await writeFile(skillPath, content, "utf-8");
-		log.info("Wrote SKILL.md (version %s) to %s", SKILL_VERSION, skillPath);
+		log.info("Wrote SKILL.md (revision %d) to %s", myRevision, skillPath);
 		/* v8 ignore start - defensive: mkdir/writeFile failure on read-only filesystem */
 	} catch (error: unknown) {
 		log.warn("Failed to write %s SKILL.md: %s", name, (error as Error).message);
@@ -278,6 +308,7 @@ name: jolli-recall
 description: Recall prior development context from Jolli for the current branch. Use when the user wants to recall, remember, or resume prior work on a branch.
 metadata:
   version: "${SKILL_VERSION}"
+  revision: 1
   vendor: "jolli.ai"
 ---
 
@@ -498,6 +529,7 @@ name: jolli-pr
 description: Create or update a pull request using a Jolli Memory-generated description. Detects whether the branch already has an open PR, calls the get_pr_description MCP tool, then runs gh to open or update the PR.
 metadata:
   version: "${SKILL_VERSION}"
+  revision: 1
   vendor: "jolli.ai"
 ---
 
@@ -815,6 +847,7 @@ name: jolli-search
 description: Search structured commit memories across all branches — decisions, topics, files. Use when the user wants to find prior decisions, related commits, or how a topic was handled before.
 metadata:
   version: "${SKILL_VERSION}"
+  revision: 1
   vendor: "jolli.ai"
 ---
 
@@ -959,6 +992,7 @@ name: jolli
 description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, pr) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
+  revision: 1
   vendor: "jolli.ai"
 ---
 

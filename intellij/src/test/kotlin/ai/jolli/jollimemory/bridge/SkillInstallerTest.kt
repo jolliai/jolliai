@@ -9,72 +9,115 @@ import java.io.File
 
 class SkillInstallerTest {
 
+    private fun expectedVersion(): String =
+        SkillInstaller::class.java
+            .getResourceAsStream("/jollimemory-plugin-version.txt")
+            ?.bufferedReader(Charsets.UTF_8)?.use { it.readText().trim() }
+            ?.takeUnless { it.isEmpty() || it.contains("\${") } ?: "dev"
+
     // ── updateSkillIfNeeded ─────────────────────────────────────────────
 
     @Nested
     inner class UpdateSkillIfNeeded {
 
         @Test
-        fun `creates SKILL_md when it does not exist`(@TempDir tempDir: File) {
+        fun `creates all three SKILL_md files in both target dirs`(@TempDir tempDir: File) {
             SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
 
-            val skillFile = File(tempDir, ".claude/skills/jolli-recall/SKILL.md")
-            skillFile.exists() shouldBe true
-            val content = skillFile.readText()
+            for (root in listOf(".claude/skills", ".agents/skills")) {
+                for (name in SkillInstaller.SKILL_NAMES) {
+                    val skillFile = File(tempDir, "$root/$name/SKILL.md")
+                    skillFile.exists() shouldBe true
+                    skillFile.readText() shouldContain "name: $name"
+                }
+            }
+        }
+
+        @Test
+        fun `recall template carries spec-compliant frontmatter`(@TempDir tempDir: File) {
+            SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
+
+            val content = File(tempDir, ".claude/skills/jolli-recall/SKILL.md").readText()
             content shouldContain "name: jolli-recall"
-            content shouldContain "jolli-skill-version:"
+            content shouldContain "description:"
+            content shouldContain "metadata:"
+            content shouldContain "vendor: \"jolli.ai\""
+            content shouldContain "version: \"${expectedVersion()}\""
+            content shouldContain "revision: 1"
             content shouldContain "Every commit deserves a Memory"
+        }
+
+        @Test
+        fun `claudeEnabled false skips claude target but still writes agents target`(@TempDir tempDir: File) {
+            SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded(claudeEnabled = false)
+
+            File(tempDir, ".claude/skills/jolli-recall/SKILL.md").exists() shouldBe false
+            File(tempDir, ".agents/skills/jolli-recall/SKILL.md").exists() shouldBe true
         }
 
         @Test
         fun `skips write when version matches`(@TempDir tempDir: File) {
             val installer = SkillInstaller(tempDir.absolutePath)
 
-            // First write
             installer.updateSkillIfNeeded()
             val skillFile = File(tempDir, ".claude/skills/jolli-recall/SKILL.md")
             val firstContent = skillFile.readText()
             val lastModified = skillFile.lastModified()
 
-            // Small delay to detect timestamp change
             Thread.sleep(50)
 
-            // Second write — should be a no-op
+            // Second write — should be a no-op (version unchanged).
             installer.updateSkillIfNeeded()
             skillFile.readText() shouldBe firstContent
             skillFile.lastModified() shouldBe lastModified
         }
 
         @Test
-        fun `overwrites when version differs`(@TempDir tempDir: File) {
+        fun `upgrades a legacy revisionless file (prehistoric revision)`(@TempDir tempDir: File) {
             val skillDir = File(tempDir, ".claude/skills/jolli-recall")
             skillDir.mkdirs()
             val skillFile = File(skillDir, "SKILL.md")
-            skillFile.writeText("""---
+            // Legacy format: no metadata.revision → treated as PREHISTORIC_REVISION → upgraded.
+            skillFile.writeText(
+                """---
 name: jolli-recall
 jolli-skill-version: 0.0.1-old
 ---
 Old content
-""")
+""",
+            )
 
             SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
 
             val content = skillFile.readText()
             content shouldContain "Every commit deserves a Memory"
-            // Should have the current version (resolved from the baked-in
-            // /jollimemory-plugin-version.txt resource, the same source
-            // SkillInstaller reads), not the old one. Derive the expected value
-            // the same way so this stays correct across version bumps.
-            val expectedVersion = SkillInstaller::class.java
-                .getResourceAsStream("/jollimemory-plugin-version.txt")
-                ?.bufferedReader(Charsets.UTF_8)?.use { it.readText().trim() }
-                ?.takeUnless { it.isEmpty() || it.contains("\${") } ?: "dev"
-            content shouldContain "jolli-skill-version: $expectedVersion"
+            content shouldContain "revision: 1"
+        }
+
+        @Test
+        fun `does not downgrade a SKILL_md written by a newer revision`(@TempDir tempDir: File) {
+            val skillDir = File(tempDir, ".claude/skills/jolli-recall")
+            skillDir.mkdirs()
+            val skillFile = File(skillDir, "SKILL.md")
+            val newerContent = """---
+name: jolli-recall
+metadata:
+  version: "9.9.9"
+  revision: 999
+  vendor: "jolli.ai"
+---
+Content from a newer tool.
+"""
+            skillFile.writeText(newerContent)
+
+            SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
+
+            // A newer revision on disk must be left untouched (no downgrade).
+            skillFile.readText() shouldBe newerContent
         }
 
         @Test
         fun `deletes legacy skill directories`(@TempDir tempDir: File) {
-            // Create legacy directories
             val legacy1 = File(tempDir, ".claude/skills/jollimemory-recall")
             val legacy2 = File(tempDir, ".claude/skills/jolli-memory-recall")
             legacy1.mkdirs()
@@ -86,35 +129,21 @@ Old content
 
             legacy1.exists() shouldBe false
             legacy2.exists() shouldBe false
-            // And the new skill should exist
             File(tempDir, ".claude/skills/jolli-recall/SKILL.md").exists() shouldBe true
         }
 
         @Test
-        fun `handles missing claude skills directory gracefully`(@TempDir tempDir: File) {
-            // No .claude/ directory exists — should create it
+        fun `handles missing skills directory gracefully`(@TempDir tempDir: File) {
             SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
-            File(tempDir, ".claude/skills/jolli-recall/SKILL.md").exists() shouldBe true
-        }
-
-        @Test
-        fun `template contains required frontmatter fields`(@TempDir tempDir: File) {
-            SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
-
-            val content = File(tempDir, ".claude/skills/jolli-recall/SKILL.md").readText()
-            content shouldContain "name: jolli-recall"
-            content shouldContain "description:"
-            content shouldContain "argument-hint:"
-            content shouldContain "user-invocable: true"
-            content shouldContain "jolli-skill-version:"
+            File(tempDir, ".claude/skills/jolli-pr/SKILL.md").exists() shouldBe true
         }
     }
 
     // ── Constants ────────────────────────────────────────────────────────
 
     @Test
-    fun `SKILL_NAME is jolli-recall`() {
-        SkillInstaller.SKILL_NAME shouldBe "jolli-recall"
+    fun `SKILL_NAMES lists the three shipped skills`() {
+        SkillInstaller.SKILL_NAMES shouldBe listOf("jolli-recall", "jolli-search", "jolli-pr")
     }
 
     @Test
