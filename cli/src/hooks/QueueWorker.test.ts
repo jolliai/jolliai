@@ -454,7 +454,15 @@ import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { recordPendingIngest, wakePendingIngest } from "../sync/PendingIngest.js";
 import { recordPendingWorker, wakePendingWorkers } from "../sync/PendingWorkers.js";
 import { acquireVaultWriteLock, withVaultWriteLock } from "../sync/VaultWriteLock.js";
-import type { CommitGitOperation, IngestOperation } from "../Types.js";
+import type {
+	CommitGitOperation,
+	CommitInfo,
+	CommitSummary,
+	ExcludedContextItem,
+	IngestOperation,
+	PlanReference,
+	ReferenceCommitRef,
+} from "../Types.js";
 import { __test__, buildWorkerStartupBanner, launchWorker, runWorker } from "./QueueWorker.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -3359,6 +3367,330 @@ describe("QueueWorker", () => {
 			} finally {
 				rmSync(cwd, { recursive: true, force: true });
 			}
+		});
+	});
+
+	// ─── amend Context consumption: new-wins ref union, audit filter, plan soft-exclude, fresh-leaf refs ───
+	describe("amend workspace-Context consumption", () => {
+		const bySlug = (r: { slug: string }) => r.slug;
+
+		describe("mergeRefsNewWins", () => {
+			it("returns [] for empty / undefined inputs", () => {
+				expect(__test__.mergeRefsNewWins(undefined, undefined, bySlug)).toEqual([]);
+				expect(__test__.mergeRefsNewWins([], [], bySlug)).toEqual([]);
+			});
+
+			it("keeps old refs when there are no new refs", () => {
+				const old = [{ slug: "a" }, { slug: "b" }];
+				expect(__test__.mergeRefsNewWins(old, undefined, bySlug)).toEqual(old);
+			});
+
+			it("unions non-colliding new refs after the old ones", () => {
+				const merged = __test__.mergeRefsNewWins([{ slug: "a" }], [{ slug: "b" }], bySlug);
+				expect(merged.map(bySlug)).toEqual(["a", "b"]);
+			});
+
+			it("new ref wins on base-key collision (drops the stale old snapshot)", () => {
+				const merged = __test__.mergeRefsNewWins(
+					[{ slug: "a", tag: "old" }],
+					[{ slug: "a", tag: "new" }],
+					bySlug,
+				);
+				expect(merged).toEqual([{ slug: "a", tag: "new" }]);
+			});
+		});
+
+		describe("buildHoistedAmendRoot ref merge + audit", () => {
+			const newInfo: CommitInfo = {
+				hash: "new67890abcdef12",
+				message: "Amended commit",
+				author: "Jane",
+				date: "2026-04-02T10:00:00.000Z",
+			};
+			const hoisted = {
+				topics: [{ title: "T", trigger: "x", response: "y", decisions: "z" }],
+				transcripts: [] as string[],
+			};
+			const fullDiffStats = { filesChanged: 1, insertions: 2, deletions: 1 };
+			const refABCold: ReferenceCommitRef = {
+				archivedKey: "linear:ABC-old12345",
+				source: "linear",
+				nativeId: "ABC",
+				title: "Issue ABC",
+				url: "https://linear.app/x/ABC",
+				referencedAt: "2026-04-01T00:00:00Z",
+				sourceToolName: "mcp__linear__get_issue",
+			};
+
+			function makeOld(over: Partial<CommitSummary> = {}): CommitSummary {
+				return {
+					version: 5,
+					commitHash: "old12345",
+					commitMessage: "Old",
+					commitAuthor: "Jane",
+					commitDate: "2026-04-01T10:00:00.000Z",
+					branch: "feature/test",
+					generatedAt: "2026-04-01T10:00:00.000Z",
+					topics: [{ title: "Old", trigger: "t", response: "r", decisions: "d" }],
+					transcripts: [],
+					...over,
+				} as CommitSummary;
+			}
+
+			it("hoists old references into the merged root (references truthy arm)", () => {
+				const root = __test__.buildHoistedAmendRoot(
+					makeOld({ references: [refABCold] }),
+					newInfo,
+					hoisted,
+					{},
+					fullDiffStats,
+				);
+				expect(root.references?.map((r) => `${r.source}:${r.nativeId}`)).toEqual(["linear:ABC"]);
+			});
+
+			it("unions old + new references with new winning on collision", () => {
+				const refABCnew: ReferenceCommitRef = { ...refABCold, archivedKey: "linear:ABC-new67890" };
+				const refXYZnew: ReferenceCommitRef = {
+					...refABCold,
+					archivedKey: "linear:XYZ-new67890",
+					nativeId: "XYZ",
+				};
+				const root = __test__.buildHoistedAmendRoot(
+					makeOld({ references: [refABCold] }),
+					newInfo,
+					hoisted,
+					{},
+					fullDiffStats,
+					undefined,
+					{ references: [refABCnew, refXYZnew] },
+				);
+				expect(root.references?.map((r) => `${r.source}:${r.nativeId}`)).toEqual(["linear:ABC", "linear:XYZ"]);
+				// new wins: the ABC ref carries the NEW archivedKey, not the old snapshot.
+				expect(root.references?.find((r) => r.nativeId === "ABC")?.archivedKey).toBe("linear:ABC-new67890");
+			});
+
+			it("merges new plans with new winning on slug base-key collision", () => {
+				// Both slugs share base "foo" after the `-<8 hex>` suffix strip → collision.
+				const planOld: PlanReference = { slug: "foo-0abc1234", title: "Foo", addedAt: "a", updatedAt: "a" };
+				const planNew: PlanReference = { slug: "foo-9def5678", title: "Foo", addedAt: "a", updatedAt: "b" };
+				const root = __test__.buildHoistedAmendRoot(
+					makeOld({ plans: [planOld] }),
+					newInfo,
+					hoisted,
+					{},
+					fullDiffStats,
+					undefined,
+					{ plans: [planNew] },
+				);
+				expect(root.plans?.map((p) => p.slug)).toEqual(["foo-9def5678"]);
+			});
+
+			it("writes the excludedContext audit when the soft-excluded item is NOT attached", () => {
+				const excluded: ExcludedContextItem[] = [
+					{ kind: "note", key: "n-unrelated", title: "N", reason: "unrelated", tier: "low" },
+				];
+				const root = __test__.buildHoistedAmendRoot(
+					makeOld(),
+					newInfo,
+					hoisted,
+					{},
+					fullDiffStats,
+					undefined,
+					undefined,
+					excluded,
+				);
+				expect(root.excludedContext).toEqual(excluded);
+			});
+
+			it("drops a soft-excluded item from the audit when it is attached via a hoisted ref", () => {
+				// Re-referenced linear:ABC: committed earlier (hoisted), then soft-excluded now.
+				// It must appear in references (attached) but NOT also in excludedContext.
+				const excluded: ExcludedContextItem[] = [
+					{ kind: "reference", key: "linear:ABC", title: "Issue ABC", reason: "unrelated", tier: "low" },
+				];
+				const root = __test__.buildHoistedAmendRoot(
+					makeOld({ references: [refABCold] }),
+					newInfo,
+					hoisted,
+					{},
+					fullDiffStats,
+					undefined,
+					undefined,
+					excluded,
+				);
+				expect(root.references?.map((r) => `${r.source}:${r.nativeId}`)).toEqual(["linear:ABC"]);
+				expect(root.excludedContext).toBeUndefined();
+			});
+		});
+
+		it("consumeWorkspaceContext skips an AI soft-excluded plan from association", async () => {
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {
+					foo: {
+						slug: "foo",
+						title: "Foo",
+						sourcePath: "/x/foo.md",
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						commitHash: null,
+					},
+				},
+			} as Awaited<ReturnType<typeof loadPlansRegistry>>);
+
+			const result = await __test__.consumeWorkspaceContext({
+				cwd: "/test/cwd",
+				branch: "feature/test",
+				commitHash: "new67890abcdef12",
+				exclusions: { plans: new Set(), notes: new Set(), references: new Set() },
+				excludedContext: [{ kind: "plan", key: "foo", title: "Foo", reason: "unrelated", tier: "low" }],
+			});
+
+			// foo was detected (commitHash null) but soft-excluded → dropped before associate.
+			expect(result.planAssociation.refs).toEqual([]);
+		});
+
+		it("amend fresh-leaf attaches an active reference to the summary (references spread)", async () => {
+			const op = makeCommitOp({
+				type: "amend",
+				commitHash: "abc12345def67890",
+				branch: "feature/x",
+				sourceHashes: ["0123456789abcdef0123456789abcdef01234567"],
+			});
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+			vi.mocked(getCurrentBranch).mockResolvedValue("feature/x");
+			// Non-trivial delta + no old summary → fresh-leaf path.
+			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 60, deletions: 1 });
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{ mapKey: "linear:PROJ-1", source: "linear", sourcePath: "/ref.md" },
+			]);
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				references: {
+					"linear:PROJ-1": {
+						source: "linear",
+						nativeId: "PROJ-1",
+						title: "Proj one",
+						url: "https://linear.app/x/PROJ-1",
+						sourcePath: "/ref.md",
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				},
+			});
+			const { readReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+			vi.mocked(readReferenceMarkdown).mockResolvedValue({
+				mapKey: "linear:PROJ-1",
+				source: "linear",
+				nativeId: "PROJ-1",
+				title: "Proj one",
+				url: "https://linear.app/x/PROJ-1",
+				toolName: "mcp__linear__get_issue",
+				referencedAt: "2026-05-14T06:06:01.123Z",
+			});
+			const { readFile } = await import("node:fs/promises");
+			(readFile as unknown as { mockResolvedValue: (v: string) => void }).mockResolvedValue("file content");
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			const saved = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(saved.references?.[0].archivedKey).toBe("linear:PROJ-1-abc12345");
+		});
+
+		it("clears the AI selection layer once, up front, on an amend", async () => {
+			// A `git commit --amend` moves HEAD → the panel's cached fingerprint is
+			// stale, so every amend path invalidates it (mirrors the normal pipeline's
+			// pre-LLM clear). Verified here via the fresh-leaf path.
+			const op = makeCommitOp({
+				type: "amend",
+				commitHash: "abc12345def67890",
+				branch: "feature/x",
+				sourceHashes: ["0123456789abcdef0123456789abcdef01234567"],
+			});
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+			vi.mocked(getCurrentBranch).mockResolvedValue("feature/x");
+			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 60, deletions: 1 });
+			vi.mocked(clearAiSelection).mockClear();
+
+			await runWorker("/test/cwd");
+
+			expect(clearAiSelection).toHaveBeenCalledWith("/test/cwd");
+		});
+
+		it("amend pre-LLM short-circuit inherits a v5 oldSummary's transcripts into the hoisted root", async () => {
+			// Exercises the whole short-circuit consume+hoist path end-to-end with a real
+			// oldSummary, and covers the `oldSummary.transcripts !== undefined` (v5) arm.
+			const { getSummary } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 5,
+				commitHash: "old12345",
+				commitMessage: "Old",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/x",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Old", trigger: "t", response: "r", decisions: "d" }],
+				transcripts: ["t-existing"],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			const op = makeCommitOp({
+				type: "amend",
+				commitHash: "abc12345def67890",
+				branch: "feature/x",
+				sourceHashes: ["0123456789abcdef0123456789abcdef01234567"],
+			});
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			// setupPipelineMocks' default diff (7 lines) is ≤ TRIVIAL_AMEND_DELTA_LINES → pre-LLM short-circuit.
+			setupPipelineMocks("abc12345def67890");
+			vi.mocked(getCurrentBranch).mockResolvedValue("feature/x");
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			expect(vi.mocked(storeSummary).mock.calls[0][0].transcripts).toContain("t-existing");
+		});
+
+		it("normal commit writes the excludedContext audit onto the summary", async () => {
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			vi.mocked(assessContextRelevance).mockResolvedValueOnce({
+				plans: [],
+				notes: [],
+				references: [],
+				excludedContext: [{ kind: "note", key: "n-x", title: "N", reason: "unrelated", tier: "low" }],
+				results: [],
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			expect(vi.mocked(storeSummary).mock.calls[0][0].excludedContext).toEqual([
+				{ kind: "note", key: "n-x", title: "N", reason: "unrelated", tier: "low" },
+			]);
+		});
+
+		it("finalizeReferenceArchive returns early when nothing was committed", async () => {
+			vi.mocked(loadPlansRegistry).mockClear();
+			await __test__.finalizeReferenceArchive([], "/test/cwd");
+			// Early return before the registry read — no lock/registry work for an empty set.
+			expect(loadPlansRegistry).not.toHaveBeenCalled();
 		});
 	});
 });
