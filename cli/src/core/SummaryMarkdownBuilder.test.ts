@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { CommitSummary } from "../Types.js";
+import type { CommitSummary, ReferenceCommitRef } from "../Types.js";
 import {
 	buildMarkdown,
+	buildReferencePushMarkdown,
 	pushExcludedContextSection,
 	pushFooter,
 	pushPlansAndNotesSection,
@@ -492,6 +493,24 @@ describe("pushPlansAndNotesSection references gating", () => {
 		expect(out).not.toContain("C1-1700000000.1 —");
 		expect(out).not.toContain("abcdef12 —");
 	});
+	it("links to the pushed Space article when jolliReferenceDocUrl is present", () => {
+		const pushed = {
+			plans: [],
+			notes: [],
+			references: [
+				{
+					source: "linear",
+					nativeId: "ENG-1",
+					title: "Fix",
+					url: "https://l/ENG-1",
+					jolliReferenceDocUrl: "https://jolli.ai/articles?doc=9",
+				},
+			],
+		} as never;
+		const lines: string[] = [];
+		pushPlansAndNotesSection(lines, pushed, { includeReferences: true });
+		expect(lines.join("\n")).toContain("[ENG-1 — Fix](https://jolli.ai/articles?doc=9)");
+	});
 });
 
 describe("pushExcludedContextSection", () => {
@@ -527,6 +546,60 @@ describe("pushExcludedContextSection", () => {
 	it("buildMarkdown includes the excluded-context details block", () => {
 		const md = buildMarkdown(leaf({ excludedContext: [{ kind: "note", key: "n1", title: "T", reason: "r" }] }));
 		expect(md).toContain("AI judged 1 context item(s) unrelated");
+	});
+});
+
+// ─── buildReferencePushMarkdown ──────────────────────────────────────────────
+
+describe("buildReferencePushMarkdown", () => {
+	const ref: ReferenceCommitRef = {
+		archivedKey: "linear:ENG-1-a1b2c3d4",
+		source: "linear",
+		nativeId: "ENG-1",
+		title: "Fix login bug",
+		url: "https://linear.app/acme/issue/ENG-1",
+		referencedAt: "2026-01-01T00:00:00.000Z",
+		sourceToolName: "Claude Code",
+	};
+
+	it("renders the external link and source as an article body", () => {
+		const md = buildReferencePushMarkdown(ref);
+		expect(md).toContain("**Link:** [https://linear.app/acme/issue/ENG-1](https://linear.app/acme/issue/ENG-1)");
+		expect(md).toContain("**Source:** Claude Code");
+	});
+
+	it("renders source-specific fields as a table, escaping pipes/newlines", () => {
+		const withFields = {
+			...ref,
+			fields: [
+				{ key: "status", label: "Status", value: "In Progress" },
+				{ key: "assignee", label: "Assignee", value: "a | b\nnext" },
+				{ key: "path", label: "Path", value: "C:\\repo|x" },
+			],
+		} as never;
+		const md = buildReferencePushMarkdown(withFields);
+		expect(md).toContain("| Field | Value |");
+		expect(md).toContain("| Status | In Progress |");
+		// Pipe escaped, newline flattened so the row can't break the table.
+		expect(md).toContain("| Assignee | a \\| b next |");
+		// Backslash escaped BEFORE the pipe, so a trailing `\` can't revive the separator.
+		expect(md).toContain("| Path | C:\\\\repo\\|x |");
+	});
+
+	it("omits the table when there are no fields", () => {
+		expect(buildReferencePushMarkdown(ref)).not.toContain("| Field | Value |");
+	});
+
+	it("appends the stored description body (trimmed) below the header when provided", () => {
+		const md = buildReferencePushMarkdown(ref, "\n\nFull issue description.\nSecond line.\n\n");
+		expect(md).toContain("**Source:** Claude Code");
+		expect(md).toContain("Full issue description.\nSecond line.");
+		// Edge newlines trimmed so the render is stable.
+		expect(md.endsWith("Second line.")).toBe(true);
+	});
+
+	it("omits the body when the description is empty/absent (header only)", () => {
+		expect(buildReferencePushMarkdown(ref, "")).toBe(buildReferencePushMarkdown(ref));
 	});
 });
 

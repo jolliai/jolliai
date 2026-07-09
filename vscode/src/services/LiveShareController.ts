@@ -26,10 +26,10 @@
  */
 
 import { createHash } from "node:crypto";
-import type { CommitSummary, PlanReference, NoteReference } from "../../../cli/src/Types.js";
+import type { CommitSummary, PlanReference, NoteReference, ReferenceCommitRef } from "../../../cli/src/Types.js";
 import { type LiveRef, getShare, putBranchShare } from "../../../cli/src/core/BranchShareStore.js";
 import { getDefaultBranch } from "../../../cli/src/core/GitOps.js";
-import { parseJolliApiKey } from "../../../cli/src/core/JolliApiUtils.js";
+import { deriveJolliBackendKeyFromApiKey, parseJolliApiKey } from "../../../cli/src/core/JolliApiUtils.js";
 import { extractRepoName } from "../../../cli/src/core/KBPathResolver.js";
 import { slugify } from "../../../cli/src/core/SummaryExporter.js";
 import { resolveEffectiveRecap, resolveEffectiveTopics } from "../../../cli/src/core/SummaryStore.js";
@@ -154,6 +154,8 @@ interface Winner<T> {
 	readonly ownerCommit: string;
 	/** A known docId for this plan/note (from any commit's prior push) so the push updates in place. */
 	readonly seedDocId?: number;
+	/** Article URL the `seedDocId` was minted with — rides with the id so the reuse gate (`canReuseDocId`, keyed on the URL's origin) can tell which backend it belongs to, and so the woven URL matches the id. */
+	readonly seedDocUrl?: string;
 }
 
 /**
@@ -169,11 +171,14 @@ interface Winner<T> {
 function assignOwnedAttachments(subjectSummaries: ReadonlyArray<CommitSummary>): {
 	ownedPlans: Map<string, PlanReference[]>;
 	ownedNotes: Map<string, NoteReference[]>;
+	ownedReferences: Map<string, ReferenceCommitRef[]>;
 	seedPlanDocIds: Map<string, number>;
 	seedNoteDocIds: Map<string, number>;
+	seedReferenceDocIds: Map<string, number>;
 } {
 	const planWinners = new Map<string, Winner<PlanReference>>();
 	const noteWinners = new Map<string, Winner<NoteReference>>();
+	const referenceWinners = new Map<string, Winner<ReferenceCommitRef>>();
 	for (const summary of subjectSummaries) {
 		for (const plan of summary.plans ?? []) {
 			const key = planBaseKey(plan.slug);
@@ -186,15 +191,17 @@ function assignOwnedAttachments(subjectSummaries: ReadonlyArray<CommitSummary>):
 			if (!prev || byUpdatedAtDesc(plan, prev.ref) < 0) {
 				// This revision wins (or is the first seen). Its own docId is
 				// authoritative for the latest article; fall back to a docId a prior
-				// revision surfaced only when this one carries none.
+				// revision surfaced only when this one carries none. The URL tracks
+				// whichever revision actually supplied the docId.
 				const seedDocId = plan.jolliPlanDocId ?? prev?.seedDocId;
-				planWinners.set(key, { ref: plan, ownerCommit: summary.commitHash, seedDocId });
+				const seedDocUrl = plan.jolliPlanDocId !== undefined ? plan.jolliPlanDocUrl : prev?.seedDocUrl;
+				planWinners.set(key, { ref: plan, ownerCommit: summary.commitHash, seedDocId, seedDocUrl });
 			} else if (prev.seedDocId === undefined && plan.jolliPlanDocId !== undefined) {
 				// A losing (older) revision only fills in a docId the winner didn't
 				// already have. It must NEVER overwrite the winner's own docId —
 				// doing so would push the latest content to an older article and
 				// orphan (leak) the winner's real one.
-				planWinners.set(key, { ...prev, seedDocId: plan.jolliPlanDocId });
+				planWinners.set(key, { ...prev, seedDocId: plan.jolliPlanDocId, seedDocUrl: plan.jolliPlanDocUrl });
 			}
 		}
 		for (const note of summary.notes ?? []) {
@@ -204,33 +211,70 @@ function assignOwnedAttachments(subjectSummaries: ReadonlyArray<CommitSummary>):
 			// deterministic and NaN-free for a malformed/missing updatedAt.
 			if (!prev || note.updatedAt > prev.ref.updatedAt) {
 				const seedDocId = note.jolliNoteDocId ?? prev?.seedDocId;
-				noteWinners.set(note.id, { ref: note, ownerCommit: summary.commitHash, seedDocId });
+				const seedDocUrl = note.jolliNoteDocId !== undefined ? note.jolliNoteDocUrl : prev?.seedDocUrl;
+				noteWinners.set(note.id, { ref: note, ownerCommit: summary.commitHash, seedDocId, seedDocUrl });
 			} else if (prev.seedDocId === undefined && note.jolliNoteDocId !== undefined) {
-				noteWinners.set(note.id, { ...prev, seedDocId: note.jolliNoteDocId });
+				noteWinners.set(note.id, { ...prev, seedDocId: note.jolliNoteDocId, seedDocUrl: note.jolliNoteDocUrl });
+			}
+		}
+		for (const ref of summary.references ?? []) {
+			// A reference is identified across commits by its stable `<source>:<nativeId>`,
+			// NOT its per-commit `archivedKey`, so the same ticket on two commits pushes to
+			// ONE Space article. Recency by `referencedAt` (newest wins, first-seen on tie).
+			const key = `${ref.source}:${ref.nativeId}`;
+			const prev = referenceWinners.get(key);
+			if (!prev || ref.referencedAt > prev.ref.referencedAt) {
+				const seedDocId = ref.jolliReferenceDocId ?? prev?.seedDocId;
+				const seedDocUrl = ref.jolliReferenceDocId !== undefined ? ref.jolliReferenceDocUrl : prev?.seedDocUrl;
+				referenceWinners.set(key, { ref, ownerCommit: summary.commitHash, seedDocId, seedDocUrl });
+			} else if (prev.seedDocId === undefined && ref.jolliReferenceDocId !== undefined) {
+				referenceWinners.set(key, {
+					...prev,
+					seedDocId: ref.jolliReferenceDocId,
+					seedDocUrl: ref.jolliReferenceDocUrl,
+				});
 			}
 		}
 	}
 
 	const ownedPlans = new Map<string, PlanReference[]>();
 	const ownedNotes = new Map<string, NoteReference[]>();
+	const ownedReferences = new Map<string, ReferenceCommitRef[]>();
 	const pushInto = <T>(map: Map<string, T[]>, commit: string, item: T): void => {
 		const arr = map.get(commit);
 		if (arr) arr.push(item);
 		else map.set(commit, [item]);
 	};
 	for (const w of planWinners.values()) {
-		pushInto(ownedPlans, w.ownerCommit, w.seedDocId ? { ...w.ref, jolliPlanDocId: w.seedDocId } : w.ref);
+		pushInto(
+			ownedPlans,
+			w.ownerCommit,
+			w.seedDocId ? { ...w.ref, jolliPlanDocId: w.seedDocId, jolliPlanDocUrl: w.seedDocUrl } : w.ref,
+		);
 	}
 	for (const w of noteWinners.values()) {
-		pushInto(ownedNotes, w.ownerCommit, w.seedDocId ? { ...w.ref, jolliNoteDocId: w.seedDocId } : w.ref);
+		pushInto(
+			ownedNotes,
+			w.ownerCommit,
+			w.seedDocId ? { ...w.ref, jolliNoteDocId: w.seedDocId, jolliNoteDocUrl: w.seedDocUrl } : w.ref,
+		);
+	}
+	for (const w of referenceWinners.values()) {
+		pushInto(
+			ownedReferences,
+			w.ownerCommit,
+			w.seedDocId ? { ...w.ref, jolliReferenceDocId: w.seedDocId, jolliReferenceDocUrl: w.seedDocUrl } : w.ref,
+		);
 	}
 
 	const seedPlanDocIds = new Map<string, number>();
 	const seedNoteDocIds = new Map<string, number>();
+	const seedReferenceDocIds = new Map<string, number>();
 	for (const w of planWinners.values()) if (w.seedDocId) seedPlanDocIds.set(planBaseKey(w.ref.slug), w.seedDocId);
 	for (const [id, w] of noteWinners) if (w.seedDocId) seedNoteDocIds.set(id, w.seedDocId);
+	for (const [key, w] of referenceWinners) if (w.seedDocId) seedReferenceDocIds.set(key, w.seedDocId);
 
-	return { ownedPlans, ownedNotes, seedPlanDocIds, seedNoteDocIds };
+	return { ownedPlans, ownedNotes, ownedReferences, seedPlanDocIds, seedNoteDocIds, seedReferenceDocIds };
 }
 
 /**
@@ -244,19 +288,22 @@ async function pushSubjectAndBuildRef(
 	ctx: PushContext,
 ): Promise<LiveRef> {
 	// 1–2. Cross-commit dedup: winners + owned attachments + seed docId maps.
-	const { ownedPlans, ownedNotes, seedPlanDocIds, seedNoteDocIds } = assignOwnedAttachments(subjectSummaries);
+	const { ownedPlans, ownedNotes, ownedReferences, seedPlanDocIds, seedNoteDocIds, seedReferenceDocIds } =
+		assignOwnedAttachments(subjectSummaries);
 
 	// 3. Push each summary oldest→newest with only its owned attachments. Capture the
 	//    pushed summary docId per commit and accumulate the branch-wide attachment map,
 	//    pre-seeded with any known docIds so a doc pushed under another commit still links.
 	const planDocIdByBase = new Map<string, number>(seedPlanDocIds);
 	const noteDocIdById = new Map<string, number>(seedNoteDocIds);
+	const referenceDocIdByBase = new Map<string, number>(seedReferenceDocIds);
 
 	const summaryDocIds: number[] = [];
 	for (const summary of subjectSummaries) {
 		const result = await pushSummaryWithAttachments(summary, ctx, {
 			plans: ownedPlans.get(summary.commitHash) ?? [],
 			notes: ownedNotes.get(summary.commitHash) ?? [],
+			references: ownedReferences.get(summary.commitHash) ?? [],
 		}, {
 			strictAttachments: true,
 		});
@@ -266,10 +313,12 @@ async function pushSubjectAndBuildRef(
 		summaryDocIds.push(result.pushedDoc.summaryDocId);
 		for (const p of result.pushedDoc.plans) planDocIdByBase.set(planBaseKey(p.slug), p.docId);
 		for (const n of result.pushedDoc.notes) noteDocIdById.set(n.id, n.docId);
+		for (const r of result.pushedDoc.references) referenceDocIdByBase.set(r.baseKey, r.docId);
 	}
 
-	// 4. Build covered: each commit references its OWN plans/notes' docids (resolved
-	//    via the shared map, so a doc pushed under a different commit is still linked).
+	// 4. Build covered: each commit references its OWN plans/notes/references' docids
+	//    (resolved via the shared maps, so a doc pushed under a different commit is
+	//    still linked — a reference keys on its stable `<source>:<nativeId>`).
 	const coveredFor = (summary: CommitSummary): number[] => {
 		const ids = new Set<number>();
 		for (const plan of summary.plans ?? []) {
@@ -278,6 +327,10 @@ async function pushSubjectAndBuildRef(
 		}
 		for (const note of summary.notes ?? []) {
 			const docId = noteDocIdById.get(note.id);
+			if (docId) ids.add(docId);
+		}
+		for (const ref of summary.references ?? []) {
+			const docId = referenceDocIdByBase.get(`${ref.source}:${ref.nativeId}`);
 			if (docId) ids.add(docId);
 		}
 		return [...ids];
@@ -344,6 +397,9 @@ export function subjectFingerprint(summaries: ReadonlyArray<CommitSummary>): str
 		r: resolveEffectiveRecap(s) ?? null,
 		p: (s.plans ?? []).map((pl) => [pl.slug, pl.updatedAt]),
 		n: (s.notes ?? []).map((nt) => [nt.id, nt.updatedAt]),
+		// References ride the share as first-class docs, so a new/updated reference
+		// (its `referencedAt` bumps) must move the hash and trigger a re-push.
+		f: (s.references ?? []).map((r) => [r.archivedKey, r.referencedAt]),
 	}));
 	return createHash("sha1").update(JSON.stringify(projection)).digest("hex").slice(0, 16);
 }
@@ -460,7 +516,8 @@ export function generateLiveShare(params: GenerateLiveShareParams): Promise<Live
  */
 export function reconcileLiveShare(deps: LiveShareDeps, branch: string): Promise<void> {
 	return withSubjectLock(deps.workspaceRoot, branch, async () => {
-		const existing = await getShare(deps.workspaceRoot, branch);
+		const backendKey = deriveJolliBackendKeyFromApiKey(deps.apiKey);
+		const existing = await getShare(deps.workspaceRoot, branch, backendKey);
 		// Only a branch (branchCollection) share reconciles here; commit shares are a fixed doc list.
 		if (!existing?.shareId || existing.ref?.kind !== "branchCollection") return;
 
@@ -548,7 +605,7 @@ export function pushBranchMemoriesToSpace(deps: LiveShareDeps, branch: string): 
 		if (subjectSummaries.length === 0) throw new NothingToShareError(branch);
 
 		const ctx = buildPushContext(deps, baseUrl, repoUrl);
-		const { ownedPlans, ownedNotes } = assignOwnedAttachments(subjectSummaries);
+		const { ownedPlans, ownedNotes, ownedReferences } = assignOwnedAttachments(subjectSummaries);
 
 		let pushedCount = 0;
 		let attachmentCount = 0;
@@ -559,6 +616,7 @@ export function pushBranchMemoriesToSpace(deps: LiveShareDeps, branch: string): 
 				const result = await pushSummaryWithAttachments(summary, ctx, {
 					plans: ownedPlans.get(summary.commitHash) ?? [],
 					notes: ownedNotes.get(summary.commitHash) ?? [],
+					references: ownedReferences.get(summary.commitHash) ?? [],
 				});
 				pushedCount += 1;
 				attachmentCount += result.attachmentCount;

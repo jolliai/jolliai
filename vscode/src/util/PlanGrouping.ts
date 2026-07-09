@@ -87,7 +87,9 @@ export function annotatePlans(plans: ReadonlyArray<PlanReference>): ReadonlyArra
  */
 export function latestPlanPerName(plans: ReadonlyArray<PlanReference>): ReadonlyArray<PlanReference> {
 	const sorted = [...plans].sort(byUpdatedAtDesc);
-	// Newest already-pushed docId/url per base name (first hit wins = newest).
+	// Newest already-pushed docId/url per base name (first hit wins = newest). The
+	// URL rides with the docId so the reuse gate downstream (`canReuseDocId`, keyed
+	// on the URL's origin) can tell which backend the inherited id belongs to.
 	const pushedDoc = new Map<string, { docId: number; url: string | undefined }>();
 	for (const plan of sorted) {
 		const key = planBaseKey(plan.slug);
@@ -106,7 +108,11 @@ export function latestPlanPerName(plans: ReadonlyArray<PlanReference>): Readonly
 		if (plan.jolliPlanDocId === undefined) {
 			const inherited = pushedDoc.get(key);
 			if (inherited) {
-				result.push({ ...plan, jolliPlanDocId: inherited.docId, jolliPlanDocUrl: inherited.url });
+				result.push({
+					...plan,
+					jolliPlanDocId: inherited.docId,
+					jolliPlanDocUrl: inherited.url,
+				});
 				continue;
 			}
 		}

@@ -17,7 +17,7 @@
  */
 
 import { JOLLI_CLIENT_HEADER } from "./ClientHeader.js";
-import { type JolliApiKeyMeta, parseBaseUrl, parseJolliApiKey } from "./JolliApiUtils.js";
+import { deriveJolliEnvKey, type JolliApiKeyMeta, parseBaseUrl, parseJolliApiKey } from "./JolliApiUtils.js";
 import { loadConfig } from "./SessionTracker.js";
 import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "./TraceContext.js";
 
@@ -114,7 +114,7 @@ export interface PushPayload {
 	readonly title: string;
 	readonly content: string;
 	readonly commitHash: string;
-	readonly docType: "summary" | "plan" | "note";
+	readonly docType: "summary" | "plan" | "note" | "reference";
 	readonly branch?: string;
 	readonly docId?: number;
 	readonly repoUrl?: string;
@@ -271,6 +271,18 @@ export class JolliMemoryPushClient {
 	async resolveBaseUrl(): Promise<string> {
 		const { baseUrl } = await this.resolveAuth();
 		return baseUrl;
+	}
+
+	/**
+	 * Resolves the env key (`deriveJolliEnvKey`) of the tenant this client pushes
+	 * to — the orchestrator tags each minted `jolliDocId` with it and only reuses
+	 * an id as an update target when the tag matches. Same no-network auth resolve
+	 * as {@link resolveBaseUrl}; `resolveAuth` guarantees a base URL, so the key is
+	 * always defined here.
+	 */
+	async resolveEnvKey(): Promise<string> {
+		const { baseUrl } = await this.resolveAuth();
+		return deriveJolliEnvKey(baseUrl) ?? "";
 	}
 
 	private async resolveAuth(): Promise<{

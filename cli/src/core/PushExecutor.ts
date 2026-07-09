@@ -185,6 +185,7 @@ async function buildAttachmentOwnership(
 ): Promise<{
 	ownedPlans: Map<string, NonNullable<CommitSummary["plans"]>>;
 	ownedNotes: Map<string, NonNullable<CommitSummary["notes"]>>;
+	ownedReferences: Map<string, NonNullable<CommitSummary["references"]>>;
 }> {
 	const branches = new Set(hashes.map((hash) => pendingEntries[hash].branch));
 	const contexts = new Map<string, Map<string, CommitSummary>>();
@@ -219,13 +220,15 @@ async function buildAttachmentOwnership(
 
 	const ownedPlans = new Map<string, NonNullable<CommitSummary["plans"]>>();
 	const ownedNotes = new Map<string, NonNullable<CommitSummary["notes"]>>();
+	const ownedReferences = new Map<string, NonNullable<CommitSummary["references"]>>();
 	for (const context of contexts.values()) {
 		const summaries = [...context.values()].sort((a, b) => a.generatedAt.localeCompare(b.generatedAt));
 		const owned = assignOwnedAttachments(summaries);
 		for (const [hash, plans] of owned.ownedPlans) ownedPlans.set(hash, plans);
 		for (const [hash, notes] of owned.ownedNotes) ownedNotes.set(hash, notes);
+		for (const [hash, references] of owned.ownedReferences) ownedReferences.set(hash, references);
 	}
-	return { ownedPlans, ownedNotes };
+	return { ownedPlans, ownedNotes, ownedReferences };
 }
 
 /**
@@ -366,7 +369,7 @@ export async function processPushPending(
 		return { ...empty, skippedNoMemory, skippedRetryExhausted, deletedChildren, note };
 	}
 
-	const { ownedPlans, ownedNotes } = await buildAttachmentOwnership(
+	const { ownedPlans, ownedNotes, ownedReferences } = await buildAttachmentOwnership(
 		cwd,
 		storage,
 		claimedEntries,
@@ -400,6 +403,7 @@ export async function processPushPending(
 			const attachments: AttachmentSelection = {
 				plans: ownedPlans.get(hash) ?? [],
 				notes: ownedNotes.get(hash) ?? [],
+				references: ownedReferences.get(hash) ?? [],
 			};
 			try {
 				await pushSummary(summary, ctx, attachments);

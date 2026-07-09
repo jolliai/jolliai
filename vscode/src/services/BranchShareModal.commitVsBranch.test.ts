@@ -46,6 +46,11 @@ vi.mock("../views/SummaryUtils.js", () => ({ buildBranchRelativePath: (b: string
 vi.mock("../../../cli/src/core/JolliApiUtils.js", () => ({
 	parseJolliApiKey: () => ({ u: "https://acme.jolli.ai" }),
 	assertJolliOriginAllowed: vi.fn(),
+	// Real store: matchesEnv derives the record's backend from its shareUrl and compares
+	// it to the current key's backend. A single constant for both keeps them in lockstep
+	// regardless of the actual shareUrl, so cached records resolve on read.
+	deriveJolliBackendKey: () => "https://acme.jolli.ai",
+	deriveJolliBackendKeyFromApiKey: () => "https://acme.jolli.ai",
 }));
 vi.mock("../util/Logger.js", () => ({ log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
@@ -53,6 +58,7 @@ import { getShare } from "../../../cli/src/core/BranchShareStore.js";
 import { copyShareLinkModal, openShareModal, type ShareModalContext, type ShareModalIO } from "./BranchShareModal.js";
 
 const BRANCH = "feature/x";
+const ENV = "https://acme.jolli.ai"; // matches the mocked deriveJolliEnvKey(FromApiKey)
 const TIP = "z".repeat(40);
 const OLDER = "x".repeat(40);
 const COMMIT_URL = "https://acme.jolli.ai/b/COMMIT";
@@ -99,7 +105,7 @@ beforeEach(async () => {
 	h.loadBranchSummaries.mockResolvedValue({ summaries: [summary(OLDER), summary(TIP)], missingCount: 0 });
 	h.push.mockImplementation((s: CommitSummary) =>
 		Promise.resolve({
-			pushedDoc: { commitHash: s.commitHash, summaryDocId: 100, plans: [], notes: [] },
+			pushedDoc: { commitHash: s.commitHash, summaryDocId: 100, plans: [], notes: [], references: [] },
 			updatedSummary: s,
 			attachmentFailures: [],
 			isUpdate: false,
@@ -131,8 +137,8 @@ describe("commit share then branch share (live)", () => {
 		expect(h.createLiveShare.mock.calls[1][2]).toMatchObject({ kind: "branch", headCommitHash: TIP });
 
 		// Distinct persisted records: commit-keyed vs branch-keyed, with distinct URLs.
-		expect((await getShare(cwd, BRANCH, OLDER))?.shareUrl).toBe(COMMIT_URL);
-		expect((await getShare(cwd, BRANCH))?.shareUrl).toBe(BRANCH_URL);
+		expect((await getShare(cwd, BRANCH, ENV, OLDER))?.shareUrl).toBe(COMMIT_URL);
+		expect((await getShare(cwd, BRANCH, ENV))?.shareUrl).toBe(BRANCH_URL);
 	});
 
 	it("reopening the branch share re-serves the BRANCH url (not the commit's)", async () => {

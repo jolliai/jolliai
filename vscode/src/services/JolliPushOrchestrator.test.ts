@@ -5,9 +5,10 @@ const { mockPushToJolli, mockDeleteFromJolli } = vi.hoisted(() => ({
 	mockPushToJolli: vi.fn(),
 	mockDeleteFromJolli: vi.fn(),
 }));
-const { mockReadPlan, mockReadNote } = vi.hoisted(() => ({
+const { mockReadPlan, mockReadNote, mockReadReference } = vi.hoisted(() => ({
 	mockReadPlan: vi.fn(),
 	mockReadNote: vi.fn(),
+	mockReadReference: vi.fn(),
 }));
 
 // Stub only the network functions; keep BindingRequiredError / PluginOutdatedError real (instanceof).
@@ -18,6 +19,7 @@ vi.mock("./JolliPushService.js", async (importActual) => {
 vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 	readPlanFromBranch: mockReadPlan,
 	readNoteFromBranch: mockReadNote,
+	readReferenceFromBranch: mockReadReference,
 }));
 vi.mock("../views/SummaryMarkdownBuilder.js", () => ({ buildMarkdown: () => "# markdown" }));
 vi.mock("../../../cli/src/core/Telemetry.js", () => ({ track: vi.fn() }));
@@ -62,6 +64,7 @@ beforeEach(() => {
 	vi.clearAllMocks();
 	mockReadPlan.mockResolvedValue("plan body");
 	mockReadNote.mockResolvedValue("note body");
+	mockReadReference.mockResolvedValue(null);
 });
 
 describe("pushSummaryWithAttachments", () => {
@@ -75,6 +78,36 @@ describe("pushSummaryWithAttachments", () => {
 		expect(result.isUpdate).toBe(false);
 		expect(result.attachmentCount).toBe(0);
 		expect(ctx.storeSummary).toHaveBeenCalledWith(expect.objectContaining({ jolliDocId: 100 }), true);
+	});
+
+	it("writes back a doc URL whose origin keys to the current push env", async () => {
+		mockPushToJolli.mockResolvedValue({ docId: 100 });
+		const ctx = makeContext();
+		await pushSummaryWithAttachments(makeSummary(), ctx);
+		// No separate env tag — the written-back URL's origin IS the env.
+		expect(ctx.storeSummary).toHaveBeenCalledWith(
+			expect.objectContaining({ jolliDocId: 100, jolliDocUrl: "https://acme.jolli.ai/articles?doc=100" }),
+			true,
+		);
+	});
+
+	it("reuses the docId when the summary's stored URL origin matches the current env", async () => {
+		mockPushToJolli.mockResolvedValue({ docId: 100 });
+		const summary = makeSummary({ jolliDocId: 7, jolliDocUrl: "https://acme.jolli.ai/articles?doc=7" });
+		await pushSummaryWithAttachments(summary, makeContext());
+		expect(mockPushToJolli).toHaveBeenCalledWith(
+			expect.anything(),
+			expect.anything(),
+			expect.objectContaining({ docType: "summary", docId: 7 }),
+		);
+	});
+
+	it("does NOT reuse the docId when the summary was pushed to a different backend", async () => {
+		mockPushToJolli.mockResolvedValue({ docId: 100 });
+		const summary = makeSummary({ jolliDocId: 7, jolliDocUrl: "https://jolli-local.me/t/articles?doc=7" });
+		await pushSummaryWithAttachments(summary, makeContext());
+		const payload = mockPushToJolli.mock.calls[0][2] as { docId?: number };
+		expect(payload.docId).toBeUndefined();
 	});
 
 	it("pushes only the caller-chosen attachments (empty selection → no plan/note pushes)", async () => {
@@ -125,6 +158,85 @@ describe("pushSummaryWithAttachments", () => {
 		const result = await pushSummaryWithAttachments(makeSummary(), makeContext(), { plans: [], notes: [note] });
 		expect(result.pushedDoc.summaryDocId).toBe(100);
 		expect(result.attachmentFailures).toEqual([{ label: 'note "Note"', message: "note 500" }]);
+	});
+
+	it("pushes a reference as a standalone `reference` article and returns it keyed by archivedKey", async () => {
+		mockPushToJolli.mockImplementation((_b, _k, p: { docType: string }) =>
+			Promise.resolve({ docId: p.docType === "summary" ? 100 : 400 }),
+		);
+		const ref = {
+			archivedKey: "linear:ENG-1-a1b2c3d4",
+			source: "linear",
+			nativeId: "ENG-1",
+			title: "Fix bug",
+			url: "https://linear.app/x",
+			referencedAt: "t",
+			sourceToolName: "Claude Code",
+		};
+		const summary = makeSummary({ references: [ref] });
+		const result = await pushSummaryWithAttachments(summary, makeContext(), { plans: [], notes: [], references: [ref] });
+
+		expect(mockPushToJolli).toHaveBeenCalledWith(
+			expect.anything(),
+			expect.anything(),
+			expect.objectContaining({ docType: "reference", title: "Linear · ENG-1 — Fix bug" }),
+		);
+		expect(result.pushedDoc.references).toEqual([
+			{ archivedKey: "linear:ENG-1-a1b2c3d4", baseKey: "linear:ENG-1", title: "Linear · ENG-1 — Fix bug", docId: 400, url: "https://acme.jolli.ai/articles?doc=400" },
+		]);
+		expect(result.updatedSummary.references?.[0].jolliReferenceDocId).toBe(400);
+		expect(result.attachmentCount).toBe(1);
+	});
+
+	it("reuses a reference docId only when its env tag matches the current env", async () => {
+		mockPushToJolli.mockImplementation((_b, _k, p: { docType: string }) =>
+			Promise.resolve({ docId: p.docType === "summary" ? 100 : 400 }),
+		);
+		const ref = {
+			archivedKey: "linear:ENG-1-a1b2c3d4",
+			source: "linear",
+			nativeId: "ENG-1",
+			title: "Fix bug",
+			url: "https://linear.app/x",
+			referencedAt: "t",
+			sourceToolName: "Claude Code",
+			jolliReferenceDocId: 400,
+			jolliReferenceDocUrl: "https://jolli-local.me/t/articles?doc=400", // different backend
+		};
+		await pushSummaryWithAttachments(makeSummary({ references: [ref] }), makeContext(), {
+			plans: [],
+			notes: [],
+			references: [ref],
+		});
+		const refCall = mockPushToJolli.mock.calls.find((c) => (c[2] as { docType: string }).docType === "reference");
+		expect((refCall?.[2] as { docId?: number }).docId).toBeUndefined();
+	});
+
+	it("treats a reference push failure as best-effort — skipped, NOT a fatal attachment failure", async () => {
+		mockPushToJolli.mockImplementation((_b, _k, p: { docType: string }) => {
+			if (p.docType === "reference") return Promise.reject(new Error("ref 500"));
+			return Promise.resolve({ docId: 100 });
+		});
+		const ref = {
+			archivedKey: "linear:ENG-1-a1b2c3d4",
+			source: "linear",
+			nativeId: "ENG-1",
+			title: "Fix bug",
+			url: "https://linear.app/x",
+			referencedAt: "t",
+			sourceToolName: "Claude Code",
+		};
+		const result = await pushSummaryWithAttachments(makeSummary({ references: [ref] }), makeContext(), {
+			plans: [],
+			notes: [],
+			references: [ref],
+		});
+		expect(result.pushedDoc.summaryDocId).toBe(100);
+		// The summary still succeeds; the failed reference is simply absent from the
+		// pushed set and does NOT enter attachmentFailures (which the strict branch-share
+		// path would turn into a fatal AttachmentPushError).
+		expect(result.pushedDoc.references).toEqual([]);
+		expect(result.attachmentFailures).toEqual([]);
 	});
 
 	it("skips a snippet note with no content and pushes a markdown note's body", async () => {
@@ -348,13 +460,33 @@ describe("pushSummaryWithAttachments", () => {
 describe("serializeSummaryJson", () => {
 	it("strips jolliDocId/jolliDocUrl/orphanedDocIds and keeps content fields", () => {
 		const json = serializeSummaryJson(
-			makeSummary({ jolliDocId: 55, jolliDocUrl: "https://x", orphanedDocIds: [1], recap: "did things" }),
+			makeSummary({
+				jolliDocId: 55,
+				jolliDocUrl: "https://x",
+				orphanedDocIds: [1],
+				recap: "did things",
+			}),
 		);
 		const parsed = JSON.parse(json ?? "");
 		expect(parsed).toEqual(expect.objectContaining({ commitHash: "abc123", recap: "did things" }));
 		expect(Object.keys(parsed)).not.toEqual(
 			expect.arrayContaining(["jolliDocId", "jolliDocUrl", "orphanedDocIds"]),
 		);
+	});
+
+	it("keeps nested plan/note/reference docId/url (needed to render the article links)", () => {
+		const json = serializeSummaryJson(
+			makeSummary({
+				plans: [{ slug: "p1", jolliPlanDocId: 9, jolliPlanDocUrl: "pu" }],
+				notes: [{ id: "n1", jolliNoteDocId: 8, jolliNoteDocUrl: "nu" }],
+				references: [{ archivedKey: "linear:E-1-abcd1234", jolliReferenceDocId: 7, jolliReferenceDocUrl: "ru" }],
+			} as unknown as Partial<CommitSummary>),
+		);
+		const parsed = JSON.parse(json ?? "");
+		expect(parsed.plans[0].jolliPlanDocId).toBe(9);
+		expect(parsed.plans[0].jolliPlanDocUrl).toBe("pu");
+		expect(parsed.notes[0].jolliNoteDocUrl).toBe("nu");
+		expect(parsed.references[0].jolliReferenceDocUrl).toBe("ru");
 	});
 
 	it("returns undefined for a summary that serializes over the byte cap", () => {

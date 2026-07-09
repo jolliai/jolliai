@@ -42,6 +42,10 @@ vi.mock("./JolliPushOrchestrator.js", () => ({
 }));
 vi.mock("../../../cli/src/core/JolliApiUtils.js", () => ({
 	assertJolliOriginAllowed: h.assertJolliOriginAllowed,
+	// A truthy key resolves to a stable backend tag; the store reads are mocked, so
+	// the exact value only needs to be consistent across a test (real derivation is
+	// covered in JolliApiUtils.test.ts).
+	deriveJolliBackendKeyFromApiKey: vi.fn((apiKey?: string) => (apiKey ? "env-key" : undefined)),
 }));
 vi.mock("../util/Logger.js", () => ({
 	log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -121,10 +125,12 @@ beforeEach(() => {
 	// so existing setups keep driving it. `getLatestShareForBranch` here is a test double
 	// standing in for the store's subject-scoped seed pick (real filtering is covered in
 	// BranchShareStore.test.ts); the modal then applies its own expiry filter to it.
-	h.getShareWithBranchLatest.mockImplementation(async (cwd: string, branch: string, commit?: string) => ({
-		record: await h.getShare(cwd, branch, commit),
-		seed: await h.getLatestShareForBranch(cwd, branch),
-	}));
+	h.getShareWithBranchLatest.mockImplementation(
+		async (cwd: string, branch: string, envKey: string | undefined, commit?: string) => ({
+			record: await h.getShare(cwd, branch, envKey, commit),
+			seed: await h.getLatestShareForBranch(cwd, branch),
+		}),
+	);
 });
 
 describe("openShareModal", () => {

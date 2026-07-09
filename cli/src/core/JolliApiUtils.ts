@@ -40,6 +40,21 @@ export function parseBaseUrl(baseUrl: string): ParsedBaseUrl {
 }
 
 /**
+ * Resolves the browsable article URL for a pushed doc.
+ *
+ * Prefers the server-returned `serverUrl` (absolute is used as-is; relative is
+ * prefixed with `displayBase`). Falls back to the `?doc=<id>` alias only when
+ * the server returned no URL. Shared by the CLI and VS Code push orchestrators
+ * so the stored/displayed URL matches the web app's canonical article path.
+ */
+export function resolveArticleUrl(displayBase: string, serverUrl: string | undefined, docId: number): string {
+	if (!serverUrl) return `${displayBase}/articles?doc=${docId}`;
+	return /^https?:\/\//i.test(serverUrl)
+		? serverUrl
+		: `${displayBase}${serverUrl.startsWith("/") ? "" : "/"}${serverUrl}`;
+}
+
+/**
  * Parses a Jolli API key (sk-jol-...) and extracts its metadata.
  * Returns null for old-format (no-dot) keys and for unrecognized shapes.
  *
@@ -78,6 +93,76 @@ export function parseJolliApiKey(key: string): JolliApiKeyMeta | null {
 		}
 	}
 	return null;
+}
+
+/**
+ * Derives a stable "environment key" identifying the BACKEND a push targets:
+ * the lowercased origin (e.g. `https://jolli.ai`). A server-minted id (`jolliDocId`,
+ * branch `shareId`) is only reused as an update/reopen target when the current
+ * push's env key matches the one it was minted against — otherwise the id belongs
+ * to a different backend and must not be sent.
+ *
+ * Origin only — deliberately NOT org/tenant. The id namespaces are per-backend
+ * (each of jolli-local.me / jolli.ai / jolli.cloud is its own database), so origin
+ * is what distinguishes them, and it's the only cross-environment switch that
+ * actually happens (local↔prod). The server still re-validates space/repo/owner on
+ * every push (`isValidJolliDoc`), so this key is a cleanliness optimization, never a
+ * correctness guard: the worst a mismatch can do is skip a reuse and let the server
+ * create a fresh doc. Keying on the mutable org/tenant slugs instead would only add
+ * rename-fragility (a renamed org would spuriously look like a new environment) for
+ * a same-origin org-switch case the server backstop already handles safely.
+ *
+ * Returns undefined when there is no base URL to key on; callers treat "no current
+ * env key" as "don't reuse a tagged id". Throws on an unparseable non-empty input
+ * (callers feeding stored/untrusted URLs — e.g. `canReuseDocId` — guard for it).
+ */
+export function deriveJolliEnvKey(baseUrl: string | undefined): string | undefined {
+	return baseUrl ? parseBaseUrl(baseUrl).origin.toLowerCase() : undefined;
+}
+
+/**
+ * Convenience over {@link deriveJolliEnvKey} for callers that hold only an API key:
+ * the key's embedded `.u` claim IS the base URL. Returns undefined when the key is
+ * absent or can't be decoded.
+ */
+export function deriveJolliEnvKeyFromApiKey(apiKey: string | undefined): string | undefined {
+	return deriveJolliEnvKey(apiKey ? parseJolliApiKey(apiKey)?.u : undefined);
+}
+
+/**
+ * Coarser sibling of {@link deriveJolliEnvKey}: the DEPLOYMENT backend key, reduced
+ * to the registrable domain so every tenant of a backend collapses to one key
+ * (`acme.jolli.ai` → `https://jolli.ai`, `jolli-local.me` → `https://jolli-local.me`).
+ *
+ * Used where the only URL available is the tenant-free base-domain form — the branch
+ * share `shareUrl` (built from the server's `BASE_DOMAIN`, never a tenant host). A
+ * share minted on any tenant of a backend must match the current key targeting that
+ * same backend, so the tenant subdomain is stripped. Trade-off vs the tenant-precise
+ * `deriveJolliEnvKey`: a same-deployment cross-tenant switch is treated as the same
+ * backend (an accepted, rare case). The allowlisted backends use a single-label public
+ * suffix, so the registrable domain is the last two labels; dot-less hosts (`localhost`)
+ * and IPv4 are kept whole; scheme and non-default port are preserved.
+ *
+ * Returns undefined for a missing/unparseable input.
+ */
+export function deriveJolliBackendKey(url: string | undefined): string | undefined {
+	if (!url) return undefined;
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return undefined;
+	}
+	const labels = parsed.hostname.split(".");
+	const isIpv4 = /^\d+$/.test(labels[labels.length - 1]);
+	const registrable = labels.length > 2 && !isIpv4 ? labels.slice(-2).join(".") : parsed.hostname;
+	const port = parsed.port ? `:${parsed.port}` : "";
+	return `${parsed.protocol}//${registrable}${port}`.toLowerCase();
+}
+
+/** Convenience over {@link deriveJolliBackendKey} for callers that hold only an API key. */
+export function deriveJolliBackendKeyFromApiKey(apiKey: string | undefined): string | undefined {
+	return deriveJolliBackendKey(apiKey ? parseJolliApiKey(apiKey)?.u : undefined);
 }
 
 /**

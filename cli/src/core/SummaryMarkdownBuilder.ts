@@ -188,8 +188,11 @@ export function pushPlansAndNotesSection(
 	}
 
 	for (const e of referencesBySourceOrder(references)) {
+		// Prefer the pushed Space article; fall back to the external link when the
+		// reference hasn't been pushed (or the push failed) so the row is never dead.
 		const label = escMdLinkText(referenceDisplayTitle(e));
-		lines.push(e.url ? `- [${label}](${escMdUrl(e.url)})` : `- ${label}`);
+		const target = e.jolliReferenceDocUrl ?? e.url;
+		lines.push(target ? `- [${label}](${escMdUrl(target)})` : `- ${label}`);
 	}
 }
 
@@ -213,6 +216,44 @@ export function pushExcludedContextSection(lines: Array<string>, summary: Commit
 		if (e.reason) lines.push(`  — ${escMdLinkText(e.reason)}`);
 	}
 	lines.push("", "</details>");
+}
+
+/**
+ * Builds the article body pushed for a single archived reference (docType
+ * `reference`). The header — the external link, the originating tool, and the
+ * source-specific `fields` as a table — is synthesized from the `ReferenceCommitRef`
+ * value snapshot (native id + title become the article TITLE, see
+ * `buildReferencePushTitle`, so they aren't repeated). `description` is the stored
+ * markdown body (the issue/PR/page content) that the caller reads back from the
+ * orphan-branch snapshot (`readReferenceFromBranch`) so the pushed article carries
+ * the SAME body VS Code shows locally, rather than a thinner card. Omitted (header
+ * only) when the snapshot has no body or can't be read.
+ */
+export function buildReferencePushMarkdown(ref: ReferenceCommitRef, description?: string): string {
+	const lines: Array<string> = [];
+	// `url` is optional (e.g. Slack references may carry none) — omit the row rather than emit a dead link.
+	if (ref.url) {
+		lines.push(`- **Link:** [${escMdLinkText(ref.url)}](${escMdUrl(ref.url)})`);
+	}
+	lines.push(`- **Source:** ${escMdLinkText(ref.sourceToolName)}`);
+	const fields = ref.fields ?? [];
+	if (fields.length > 0) {
+		lines.push("", "| Field | Value |", "| --- | --- |");
+		for (const f of fields) {
+			// Escape backslashes first, then pipes, and normalize newlines so a field
+			// value can't break the table layout (a trailing `\` must not turn the
+			// escaped `\|` back into a literal cell separator).
+			const cell = (s: string) => s.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+			lines.push(`| ${cell(f.label)} | ${cell(f.value)} |`);
+		}
+	}
+	// The stored body (source content) below the header, matching the local reference
+	// markdown VS Code renders. Trim edges so the render stays stable.
+	const body = description?.replace(/^\n+/, "").replace(/\n+$/, "");
+	if (body) {
+		lines.push("", body);
+	}
+	return lines.join("\n");
 }
 
 /** Appends the E2E test guide section (shared between clipboard and PR markdown). */

@@ -5,6 +5,7 @@ import {
 	buildPanelTitle,
 	buildPlanPushTitle,
 	buildPushTitle,
+	buildReferencePushTitle,
 	collectAllNotes,
 	collectAllNotesWithHosts,
 	collectAllPlans,
@@ -243,6 +244,29 @@ describe("buildNotePushTitle", () => {
 	it("returns the note title without metadata prefix", () => {
 		const title = buildNotePushTitle(leaf(), "My Note");
 		expect(title).toBe("My Note");
+	});
+});
+
+describe("buildReferencePushTitle", () => {
+	it("leads with the source label + nativeId for tracker sources", () => {
+		expect(buildReferencePushTitle({ source: "linear", nativeId: "ENG-123", title: "Fix login bug" })).toBe(
+			"Linear · ENG-123 — Fix login bug",
+		);
+		expect(buildReferencePushTitle({ source: "github", nativeId: "owner/repo#42", title: "Bug" })).toBe(
+			// `/` in the nativeId is stripped by sanitizeTitle (path-unsafe), leaving a space.
+			"GitHub · owner repo#42 — Bug",
+		);
+	});
+
+	it("leads with the source label alone for machine-id sources (no ugly id prefix)", () => {
+		// Slack/Notion nativeIds are machine ids, so the display title is title-only;
+		// the source label still scopes the slug into a per-source namespace.
+		expect(buildReferencePushTitle({ source: "slack", nativeId: "C1-1700000000.1", title: "Deploy thread" })).toBe(
+			"Slack · Deploy thread",
+		);
+		expect(buildReferencePushTitle({ source: "notion", nativeId: "abcdef12", title: "Onboarding doc" })).toBe(
+			"Notion · Onboarding doc",
+		);
 	});
 });
 

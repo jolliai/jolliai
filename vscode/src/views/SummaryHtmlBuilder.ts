@@ -233,8 +233,8 @@ const SHARE_ICON_SVG = `<svg class="share-icon" width="14" height="14" viewBox="
  * with a SINGLE link created lazily on first use. The main pane has a "General access"
  * select (public bearer / anyone-at-site / only invited people) that sets the one
  * link's tier — Copy mints it on first use and changing the select flips the same
- * link in place — plus the invited-people list, the "what travels" banner, and a
- * disabled transcript opt-in. A separate Send-invite pane stages people (grouped
+ * link in place — plus the invited-people list and the "what travels" banner. A
+ * separate Send-invite pane stages people (grouped
  * suggestions: jolli account members / git collaborators) with an optional note; the
  * server grants access AND emails in one step. The card is anchored under the Share
  * button by the client script (`getBoundingClientRect`); the overlay is a transparent
@@ -278,12 +278,6 @@ export function buildShareModal(): string {
         <span class="share-travel-icon" aria-hidden="true">&#x21C4;</span>
         <span>Summaries + decisions + linked refs travel.<br /><strong>Conversation transcripts stay on your machine.</strong></span>
       </div>
-
-      <label class="share-transcript-opt" title="Not available — transcripts stay on your machine.">
-        <input type="checkbox" disabled />
-        <span>Include conversation transcripts</span>
-        <span class="share-optin-badge">opt-in</span>
-      </label>
 
       <div class="share-modal-actions share-actions-main">
         <button class="action-btn primary" id="shareCopyBtn" title="Copy the link for the selected access level (created on first copy)">&#x1F4CB; Copy link</button>

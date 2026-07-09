@@ -340,6 +340,20 @@ describe("resolveBaseUrl", () => {
 	});
 });
 
+describe("resolveEnvKey", () => {
+	it("derives an env key from the resolved base URL + api key (no network)", async () => {
+		const c = client(async () => jsonResponse(200, {}));
+		await expect(c.resolveEnvKey()).resolves.toBe("https://jolli.ai");
+	});
+	it("throws NotAuthenticatedError when no api key is configured", async () => {
+		const c = new JolliMemoryPushClient({
+			fetchImpl: async () => jsonResponse(200, {}),
+			apiKeyProvider: async () => undefined,
+		});
+		await expect(c.resolveEnvKey()).rejects.toBeInstanceOf(NotAuthenticatedError);
+	});
+});
+
 describe("constructor defaults", () => {
 	it("falls back to the SessionTracker config loader when no apiKeyProvider is given", async () => {
 		let capturedHeaders: Record<string, string> = {};
