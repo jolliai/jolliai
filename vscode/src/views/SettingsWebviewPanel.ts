@@ -580,13 +580,13 @@ export class SettingsWebviewPanel {
 		const currentConfig = await loadConfigFromDir(configDir);
 
 		// The checkbox is binary; the config field is tri-state
-		// (undefined | "enabled" | "disabled"). Turning the checkbox off must
-		// NOT clobber an undecided value with an explicit "disabled" — that
-		// would permanently suppress the activation notification for a user
-		// who simply never touched this toggle. Only an explicit enabled ->
-		// off transition writes "disabled"; otherwise the field is omitted
-		// from the update entirely (never written as `undefined`, which would
-		// delete an existing value via saveConfigScoped's merge).
+		// (undefined | "enabled" | "disabled"). Turning the checkbox off from an
+		// undecided state must NOT clobber it with an explicit "disabled" — that
+		// would make syncGlobalInstructions actively try to REMOVE a block that was
+		// never written for a user who simply never touched this toggle. Only an
+		// explicit enabled -> off transition writes "disabled"; otherwise the field
+		// is omitted from the update entirely (never written as `undefined`, which
+		// would delete an existing value via saveConfigScoped's merge).
 		const giUpdate: { globalInstructions?: "enabled" | "disabled" } = settings.globalInstructions
 			? { globalInstructions: "enabled" }
 			: currentConfig.globalInstructions === "enabled"

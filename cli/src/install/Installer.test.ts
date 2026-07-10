@@ -173,6 +173,7 @@ vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
 import { installSessionStartHook } from "./ClaudeHookInstaller.js";
+import { renderInstructionsBlock } from "./GlobalInstructionsInstaller.js";
 import { getStatus, install, isGeminiHookInstalled, uninstall } from "./Installer.js";
 
 describe("Installer", () => {
@@ -861,15 +862,16 @@ describe("Installer", () => {
 			expect(result.message).toMatch(/Unexpected .git file content|ENOTDIR|not a directory/i);
 		});
 
-		describe("global instructions confirmation gate", () => {
-			it("does NOT write the global CLAUDE.md block when the switch is undecided and no callback is passed", async () => {
-				const exists = (p: string) =>
-					stat(p)
-						.then(() => true)
-						.catch(() => false);
+		describe("global instructions (applied from the persisted switch, never prompted)", () => {
+			const exists = (p: string) =>
+				stat(p)
+					.then(() => true)
+					.catch(() => false);
+
+			it("does NOT write the global CLAUDE.md block when the switch is undecided", async () => {
 				const result = await install(tempDir);
 				expect(result.success).toBe(true);
-				// Undecided (no globalInstructions in config) + no confirm callback → skip.
+				// Undecided (no globalInstructions in config) → skip; enable never prompts.
 				expect(await exists(join(fakeHomeDir, ".claude", "CLAUDE.md"))).toBe(false);
 
 				// The skip path must not persist a `globalInstructions` key either —
@@ -882,48 +884,32 @@ describe("Installer", () => {
 				}
 			});
 
-			it("writes the global block and persists 'enabled' when the confirm callback agrees", async () => {
-				const result = await install(tempDir, { confirmGlobalInstructions: async () => true });
-				expect(result.success).toBe(true);
-
-				const block = await readFile(join(fakeHomeDir, ".claude", "CLAUDE.md"), "utf-8");
-				expect(block).toContain("jolli-recall");
-
-				// getGlobalConfigDir() is mocked (see mockGlobalConfigDir above) to
-				// emptyGlobalDir rather than the real homedir-derived path, so the
-				// persisted config lands there, not under fakeHomeDir.
-				const cfg = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
-				expect(cfg.globalInstructions).toBe("enabled");
-			});
-
-			it("persists 'disabled' and skips the write when the confirm callback declines", async () => {
-				const exists = (p: string) =>
-					stat(p)
-						.then(() => true)
-						.catch(() => false);
-				const result = await install(tempDir, { confirmGlobalInstructions: async () => false });
-				expect(result.success).toBe(true);
-				expect(await exists(join(fakeHomeDir, ".claude", "CLAUDE.md"))).toBe(false);
-
-				// See note above: persisted config lands in the mocked emptyGlobalDir.
-				const cfg = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
-				expect(cfg.globalInstructions).toBe("disabled");
-			});
-
-			it("writes without prompting when the switch is already 'enabled'", async () => {
-				const exists = (p: string) =>
-					stat(p)
-						.then(() => true)
-						.catch(() => false);
+			it("writes the block when the switch is already 'enabled'", async () => {
 				// loadConfig()/getGlobalConfigDir() are mocked (see mockGlobalConfigDir
 				// above) to read from emptyGlobalDir, not the real homedir-derived path.
 				await mkdir(emptyGlobalDir, { recursive: true });
 				await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ globalInstructions: "enabled" }));
-				const confirm = vi.fn();
-				const result = await install(tempDir, { confirmGlobalInstructions: confirm });
+
+				const result = await install(tempDir);
 				expect(result.success).toBe(true);
-				expect(confirm).not.toHaveBeenCalled();
-				expect(await exists(join(fakeHomeDir, ".claude", "CLAUDE.md"))).toBe(true);
+				const block = await readFile(join(fakeHomeDir, ".claude", "CLAUDE.md"), "utf-8");
+				expect(block).toContain("jolli-recall");
+			});
+
+			it("removes a previously-written block when the switch is 'disabled'", async () => {
+				await mkdir(emptyGlobalDir, { recursive: true });
+				await writeFile(
+					join(emptyGlobalDir, "config.json"),
+					JSON.stringify({ globalInstructions: "disabled" }),
+				);
+				// Seed a stale block a now-opted-out user still has from a prior 'enabled' run.
+				await mkdir(join(fakeHomeDir, ".claude"), { recursive: true });
+				await writeFile(join(fakeHomeDir, ".claude", "CLAUDE.md"), renderInstructionsBlock(), "utf-8");
+
+				const result = await install(tempDir);
+				expect(result.success).toBe(true);
+				const after = await readFile(join(fakeHomeDir, ".claude", "CLAUDE.md"), "utf-8");
+				expect(after).not.toContain("jolli-recall");
 			});
 		});
 
