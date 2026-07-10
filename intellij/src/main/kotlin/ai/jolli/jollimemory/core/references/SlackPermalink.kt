@@ -57,14 +57,23 @@ object SlackPermalink {
 			if (!parsed.isJsonObject) continue
 			val msg = parsed.asJsonObject.objectOrNull("message") ?: continue
 			if (msg.stringOrNull("role") != "user") continue
-			val content = msg.arrayOrNull("content") ?: continue
-			for (block in content) {
-				if (!block.isJsonObject) continue
-				val b = block.asJsonObject
-				if (b.stringOrNull("type") != "text") continue
-				val text = b.stringOrNull("text") ?: continue
-				val link = parseSlackPermalink(text) ?: continue
-				out["${link.channel}:${link.parentTs}"] = link.url
+			// `message.content` is EITHER an array of blocks OR a plain string. A
+			// directly-typed user prompt (the common case for a pasted permalink)
+			// serializes `content` as a plain string, not a text-block array — so
+			// handle both forms, else typed permalinks are silently missed and every
+			// capture falls back to linkless.
+			val contentArr = msg.arrayOrNull("content")
+			if (contentArr != null) {
+				for (block in contentArr) {
+					if (!block.isJsonObject) continue
+					val b = block.asJsonObject
+					if (b.stringOrNull("type") != "text") continue
+					val text = b.stringOrNull("text") ?: continue
+					parseSlackPermalink(text)?.let { out["${it.channel}:${it.parentTs}"] = it.url }
+				}
+			} else {
+				val text = msg.stringOrNull("content") ?: continue
+				parseSlackPermalink(text)?.let { out["${it.channel}:${it.parentTs}"] = it.url }
 			}
 		}
 		return out
