@@ -20,6 +20,20 @@ export function escMdLinkText(str: string): string {
 }
 
 /**
+ * Escapes text for safe use INSIDE a `~~…~~` strikethrough span: everything
+ * escMdLinkText covers PLUS `~`, so a literal `~~` in the text cannot close
+ * the span early. One single-pass character class with the backslash included
+ * — escaping `\` in the same pass as the characters we prefix with it is what
+ * keeps a pre-existing backslash from combining with an added `\~` into an
+ * ambiguous sequence. Kept separate from escMdLinkText on purpose: adding `~`
+ * there would change the output bytes of every existing consumer (PR bodies
+ * must stay byte-identical).
+ */
+export function escMdStrikeText(str: string): string {
+	return str.replace(/[\\[\]~]/g, "\\$&").replace(/[\r\n]+/g, " ");
+}
+
+/**
  * Escapes an untrusted URL for safe use inside a Markdown link target `(…)`.
  * Percent-encodes the structure-breaking characters (parens, whitespace,
  * angle brackets, quote) so a crafted URL cannot close the link early or be

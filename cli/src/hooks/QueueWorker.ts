@@ -25,8 +25,9 @@ import { clearAiSelection, conversationKey, readAiSelection, readExclusions } fr
 import {
 	assessContextRelevance,
 	buildChangeSignal,
-	buildDecisionFromAiExcluded,
+	buildDecisionFromAiRelevance,
 	computeChangeFingerprint,
+	keptContextRelevanceRefs,
 } from "../core/ContextRelevance.js";
 import { applyOverlaysToSessions, pruneConsumedOverlayRules } from "../core/ConversationOverlayStore.js";
 import { isCopilotChatInstalled } from "../core/CopilotChatDetector.js";
@@ -132,6 +133,7 @@ import {
 	type CommitSource,
 	type CommitSummary,
 	type CommitType,
+	type ContextRelevanceRef,
 	type ConversationTokenBreakdown,
 	CURRENT_SCHEMA_VERSION,
 	type DiffStats,
@@ -1718,6 +1720,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	let activeNoteEntries = userKeptNotes;
 	let activeReferenceEntries = userKeptReferences;
 	let excludedContext: ReadonlyArray<ExcludedContextItem> = [];
+	let contextRelevance: ReadonlyArray<ContextRelevanceRef> = [];
 	try {
 		const changeSignal = await buildChangeSignal(commitInfo.message, `${op.commitHash}~1`, op.commitHash, cwd);
 		const raw = { plans: userKeptPlans, notes: userKeptNotes, references: userKeptReferences };
@@ -1729,12 +1732,17 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		const fingerprint = computeChangeFingerprint(changeSignal);
 		const relevance =
 			aiSel.changeFingerprint === fingerprint
-				? buildDecisionFromAiExcluded(raw, aiSel.aiExcluded)
+				? buildDecisionFromAiRelevance(raw, aiSel.aiRelevance)
 				: await assessContextRelevance(raw, changeSignal, config);
 		activePlanEntries = [...relevance.plans];
 		activeNoteEntries = [...relevance.notes];
 		activeReferenceEntries = [...relevance.references];
 		excludedContext = relevance.excludedContext;
+		// Kept items' tier+reason for the summary artifact (a user-dismissed
+		// exclusion lands here with its ORIGINAL verdict attached). Empty when the
+		// reuse path read a legacy selection file with no aiRelevance — the summary
+		// then simply has no per-item relevance (display falls back).
+		contextRelevance = keptContextRelevanceRefs(relevance);
 	} catch (err) {
 		log.warn("Context relevance assessment failed (%s) — using all user-kept context", (err as Error).message);
 	}
@@ -1923,6 +1931,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		...(noteRefs.length > 0 ? { notes: noteRefs } : {}),
 		...(referenceRefs.length > 0 ? { references: referenceRefs } : {}),
 		...(excludedContext.length > 0 ? { excludedContext } : {}),
+		...(contextRelevance.length > 0 ? { contextRelevance } : {}),
 		// v5 contract: `transcripts` is always present on a v5 root (empty array
 		// when no AI sessions were captured). Omitting the field would route the
 		// `getTranscriptIds` fast-path back through `collectAllTranscriptHashes`,
@@ -2368,6 +2377,10 @@ function mergeRefsNewWins<T>(
  * `excludedContext` is the AI soft-exclude audit, written only on the paths
  * that generate a new summary (full path / fresh leaf), mirroring the normal
  * commit pipeline; the short-circuit paths pass `[]`.
+ * `contextRelevance` is the kept items' tier+reason (same summary-generating
+ * paths; `[]` on short-circuit). Its keys are working-area identities (plan
+ * slug / note id without the archive hash suffix) — display layers match
+ * archived refs by exact key first, then by stripping REF_HASH_SUFFIX.
  */
 function buildHoistedAmendRoot(
 	// All three call sites are gated on `if (oldSummary)` so a non-undefined
@@ -2391,6 +2404,7 @@ function buildHoistedAmendRoot(
 		readonly references?: ReadonlyArray<ReferenceCommitRef>;
 	},
 	excludedContext?: ReadonlyArray<ExcludedContextItem>,
+	contextRelevance?: ReadonlyArray<ContextRelevanceRef>,
 ): CommitSummary {
 	// Old (hoisted) refs ∪ new refs, deduped by base key with new winning.
 	const hoistedMeta = hoistMetadataFromOldSummary(oldSummary);
@@ -2448,6 +2462,7 @@ function buildHoistedAmendRoot(
 		...(mergedNotes.length > 0 ? { notes: mergedNotes } : {}),
 		...(mergedReferences.length > 0 ? { references: mergedReferences } : {}),
 		...(auditedExclusions.length > 0 ? { excludedContext: auditedExclusions } : {}),
+		...((contextRelevance ?? []).length > 0 ? { contextRelevance } : {}),
 		topics: hoisted.topics,
 		/* v8 ignore next */
 		...(hoisted.recap && { recap: hoisted.recap }),
@@ -2782,6 +2797,7 @@ async function handleAmendPipeline(
 	let amendNoteEntries = userKeptAmendNotes;
 	let amendReferenceEntries = userKeptAmendRefs;
 	let amendExcludedContext: ReadonlyArray<ExcludedContextItem> = [];
+	let amendContextRelevance: ReadonlyArray<ContextRelevanceRef> = [];
 	try {
 		const amendChangeSignal = await buildChangeSignal(
 			commitInfo.message,
@@ -2798,6 +2814,9 @@ async function handleAmendPipeline(
 		amendNoteEntries = [...amendRelevance.notes];
 		amendReferenceEntries = [...amendRelevance.references];
 		amendExcludedContext = amendRelevance.excludedContext;
+		// Kept items' tier+reason for the amend summary artifact (amend always
+		// re-ranks fresh, so results are always populated on success).
+		amendContextRelevance = keptContextRelevanceRefs(amendRelevance);
 	} catch (err) {
 		log.warn("Amend context relevance failed (%s) — using all user-kept context", (err as Error).message);
 	}
@@ -3012,6 +3031,7 @@ async function handleAmendPipeline(
 			},
 			{ plans: consumed.planAssociation.refs, notes: consumed.noteRefs, references: consumed.referenceRefs },
 			amendExcludedContext,
+			amendContextRelevance,
 		);
 		await storeSummary(
 			root,
@@ -3077,6 +3097,7 @@ async function handleAmendPipeline(
 		// AI soft-exclude audit, mirroring the normal commit pipeline: this path
 		// generated a new summary, so record what the relevance layer set aside.
 		...(amendExcludedContext.length > 0 ? { excludedContext: amendExcludedContext } : {}),
+		...(amendContextRelevance.length > 0 ? { contextRelevance: amendContextRelevance } : {}),
 		// v5 contract: always present, even if empty. Fresh leaf has no
 		// inherited IDs; only the new delta (if any).
 		transcripts: amendDeltaTranscriptId !== undefined ? [amendDeltaTranscriptId] : [],

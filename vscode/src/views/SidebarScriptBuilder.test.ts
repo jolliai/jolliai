@@ -2449,10 +2449,11 @@ describe("SidebarScriptBuilder", () => {
 			const fnEnd = js.indexOf("function gitStatusToCodicon", fnStart);
 			const body = js.slice(fnStart, fnEnd);
 			// Plan / note / entity rows all route through the shared hover-card
-			// mouseover handler now, so the native title attribute is
-			// universally nulled — keeping it would surface a duplicate
-			// tooltip on an independent timer.
-			expect(body).toContain("title: null");
+			// mouseover handler now, so the native title attribute is nulled —
+			// keeping it would surface a duplicate tooltip on an independent
+			// timer. Sole exception (A+): an AI-excluded row carries the AI's
+			// one-line reason as its native tooltip; normal rows stay null.
+			expect(body).toContain("title: aiEx ? (aiReasonById[item.id] || null) : null");
 			expect(body).not.toContain("title: item.tooltip");
 		});
 
@@ -3375,6 +3376,51 @@ describe("SidebarScriptBuilder", () => {
 			// conditional child was null → replaceChildren stringified it to "null".
 			const js = buildSidebarScript();
 			expect(js).toMatch(/function mountIn\(container, nodes\)[\s\S]*?\.filter\(function\(n\)\s*\{\s*return n != null;/);
+		});
+	});
+
+	// AI context-relevance sync (Review panel → sidebar CONTEXT rows). The
+	// stateful bits live in the emitted script string; these pin the wiring so a
+	// regression (dropping the handler, conflating the AI axis with isSelected,
+	// or losing the stale-overlay clear) fails a test.
+	describe("AI relevance overlay wiring (source assertions)", () => {
+		it("handles context:relevance by rebuilding the AI-excluded id set (autoExclude only)", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("case 'context:relevance':");
+			expect(js).toContain("aiExcludedIds = new Set()");
+			expect(js).toContain("if (r.autoExclude)");
+			expect(js).toContain("aiExcludedIds.add(r.id)");
+		});
+		it("renderPlanRow strikes AI-excluded rows via an independent class + reason tooltip", () => {
+			const js = buildSidebarScript();
+			// The AI axis must NOT flow through isSelected — it's its own class...
+			expect(js).toContain("aiExcludedIds.has(item.id)");
+			expect(js).toContain("(aiEx ? ' ai-excluded' : '')");
+			// ...and the A+ tooltip carries the AI's one-line reason on struck rows only.
+			expect(js).toContain("title: aiEx ? (aiReasonById[item.id] || null) : null");
+		});
+		it("exclude toggle unifies both axes: struck rows offer +, clearing user AND AI excludes", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("row.classList.contains('ai-excluded')");
+			// Add-back dismisses the AI suggestion through the same round-trip the
+			// Review panel uses, so the worker's fingerprint reuse honors it.
+			expect(js).toContain("type: 'branch:dismissAiExclude'");
+			expect(js).toContain("kind: row.getAttribute('data-context')");
+			// The toggle's initial glyph reads both axes.
+			expect(js).toContain("excludeToggle(!!item.isSelected && !aiEx)");
+		});
+		it("clears the AI overlay when the file selection changes (stale-ranking guard)", () => {
+			const js = buildSidebarScript();
+			expect(js).toMatch(/branch:toggleFileSelection[\s\S]{0,900}?aiExcludedIds = new Set\(\)/);
+		});
+		it("clears the AI overlay when a summary run starts (worker consumed the ranking)", () => {
+			const js = buildSidebarScript();
+			expect(js).toMatch(/case 'worker:busy':[\s\S]{0,900}?aiExcludedIds = new Set\(\)/);
+		});
+		it("reason lookup uses a prototype-less object (a 'constructor' slug must not hit Object internals)", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("aiReasonById = Object.create(null)");
+			expect(js).not.toContain("aiReasonById = {}");
 		});
 	});
 });

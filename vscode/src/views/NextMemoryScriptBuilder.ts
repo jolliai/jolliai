@@ -344,16 +344,18 @@ export function buildNextMemoryScript(): string {
     // "+ Include" button — no 🗑 (removing an item the AI already dropped is
     // pointless) and no ✕ (the item is already out of the summary, so toggling it
     // changes nothing). Clicking Include dismisses the AI's exclude suggestion and
-    // brings the item back to its normal tier. A normal row keeps 🗑 + the ✕ exclude
-    // toggle. All sit in the hover overlay.
+    // brings the item back to its original tier + note. A normal row keeps 🗑 + the
+    // ✕ exclude toggle. All sit in the hover overlay.
     let actions;
     if (aiExcluded) {
       actions = [
         rowLabeledButton('codicon-add', 'Include', "Dismiss the AI's exclude suggestion", function() {
           vscode.postMessage({ type: 'branch:dismissAiExclude', kind: item.contextValue, key: item.id });
-          // Optimistic: drop it from the AI-excluded set so it immediately falls back
-          // to its normal tier — no persistent state. The host removes it from
-          // aiSuggestedExclude so the worker's fingerprint reuse honours the dismiss.
+          // Optimistic: a dismiss vetoes only the EXCLUDE ACTION, not the AI's
+          // judgment — the row falls back to its original tier + ✨ note (nothing
+          // the AI concluded is lost). The host persists the same veto as a
+          // dismissed-flag (dismissAiExclusion), keeps the verdict, and
+          // re-pushes context:relevance to both surfaces.
           relevanceById[item.id] = Object.assign({}, rel, { autoExclude: false });
           renderContext();
         }),

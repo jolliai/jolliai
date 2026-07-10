@@ -567,9 +567,36 @@ export interface CommitSummary {
 	 * CONTEXT items the AI relevance ranker judged unrelated to this commit and
 	 * soft-excluded — kept OUT of the summary prompt but recorded here for
 	 * traceability (CLI / sidebar can show "AI excluded N items + why"). Distinct
-	 * from user manual excludes, which are hard-discarded and never stored.
+	 * from user manual excludes, which are skipped from association but never
+	 * recorded on the summary.
 	 */
 	readonly excludedContext?: ReadonlyArray<ExcludedContextItem>;
+	/**
+	 * AI relevance tier + one-line reason for every KEPT context item, keyed by
+	 * (kind, key) onto `plans` / `notes` / `references`. Complements
+	 * `excludedContext` (the soft-excluded items): together they preserve the
+	 * full relevance picture the pre-commit panel showed. Absent on summaries
+	 * generated without a relevance ranking (no context, fail-open, or a
+	 * fingerprint-reuse from a selection file that predates this field) — the
+	 * display layers then fall back to plain title rows. Per-node like
+	 * `excludedContext` (each commit states its own judgment; NOT a
+	 * Consolidate-Hoist field).
+	 */
+	readonly contextRelevance?: ReadonlyArray<ContextRelevanceRef>;
+}
+
+/**
+ * AI relevance verdict for one KEPT context item on a commit summary. `key`
+ * matches the working-area identity: plan slug / note id / reference
+ * `<source>:<nativeId>` mapKey (NOT the shortHash-suffixed archivedKey —
+ * renderers match references via `${source}:${nativeId}`).
+ */
+export interface ContextRelevanceRef {
+	readonly kind: "plan" | "note" | "reference";
+	readonly key: string;
+	readonly tier: "high" | "mid" | "low";
+	/** One-line AI note on how the item relates to this change. */
+	readonly reason: string;
 }
 
 /**

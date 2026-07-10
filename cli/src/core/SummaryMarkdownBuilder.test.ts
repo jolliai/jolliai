@@ -3,7 +3,6 @@ import type { CommitSummary, ReferenceCommitRef } from "../Types.js";
 import {
 	buildMarkdown,
 	buildReferencePushMarkdown,
-	pushExcludedContextSection,
 	pushFooter,
 	pushPlansAndNotesSection,
 	referencesBySourceOrder,
@@ -513,39 +512,113 @@ describe("pushPlansAndNotesSection references gating", () => {
 	});
 });
 
-describe("pushExcludedContextSection", () => {
-	it("renders nothing when there is no excluded context", () => {
+describe("pushPlansAndNotesSection withRelevance", () => {
+	const relevanceSummary = () =>
+		leaf({
+			plans: [
+				{
+					slug: "graph-plan-ab12cd34",
+					title: "Graph Plan",
+					addedAt: "2026-03-01T09:00:00.000Z",
+					updatedAt: "2026-03-01T09:30:00.000Z",
+				},
+			],
+			notes: [
+				{
+					id: "n1",
+					title: "Cursor Support",
+					format: "markdown",
+					addedAt: "2026-03-01T09:00:00.000Z",
+					updatedAt: "2026-03-01T09:30:00.000Z",
+				},
+			],
+			contextRelevance: [
+				// Working-area key (no archive hash suffix) — must still match the
+				// archived plan slug via the stripped-suffix fallback.
+				{ kind: "plan", key: "graph-plan", tier: "high", reason: "plan lists the changed files" },
+				{ kind: "note", key: "n1", tier: "mid", reason: "note touches adjacent module" },
+			],
+			excludedContext: [
+				{ kind: "note", key: "n2", title: "Unrelated Note", reason: "different subsystem" },
+				{ kind: "plan", key: "p9", title: "Old Plan", reason: "" },
+			],
+		});
+
+	it("adds tier + reason suffixes to kept rows (archive-suffix keys resolve)", () => {
 		const lines: string[] = [];
-		pushExcludedContextSection(lines, leaf());
-		expect(lines).toEqual([]);
+		pushPlansAndNotesSection(lines, relevanceSummary(), { withRelevance: true });
+		const out = lines.join("\n");
+		expect(out).toContain("- Graph Plan — High · plan lists the changed files");
+		expect(out).toContain("- Cursor Support — Med · note touches adjacent module");
 	});
-	it("renders a collapsed details block with items and reasons", () => {
+
+	it("inlines excluded items as struck-through read-only rows (reason optional)", () => {
 		const lines: string[] = [];
-		pushExcludedContextSection(
+		pushPlansAndNotesSection(lines, relevanceSummary(), { withRelevance: true });
+		const out = lines.join("\n");
+		expect(out).toContain("- ~~Unrelated Note~~ — Excluded · different subsystem");
+		expect(out).toContain("- ~~Old Plan~~ — Excluded");
+		expect(out).not.toContain("<details>");
+	});
+
+	it("renders the Context section for an excluded-only summary", () => {
+		const lines: string[] = [];
+		pushPlansAndNotesSection(
 			lines,
-			leaf({
-				excludedContext: [
-					{
-						kind: "note",
-						key: "n1",
-						title: "Cursor Support",
-						reason: "unrelated to graph change",
-					},
-					{ kind: "plan", key: "p1", title: "Backfill Plan", reason: "" },
-				],
-			}),
+			leaf({ excludedContext: [{ kind: "note", key: "n1", title: "T", reason: "r" }] }),
+			{ withRelevance: true },
 		);
 		const out = lines.join("\n");
-		expect(out).toContain("<details>");
-		expect(out).toContain("AI judged 2 context item(s) unrelated");
-		expect(out).toContain("- Cursor Support");
-		expect(out).toContain("— unrelated to graph change");
-		expect(out).toContain("- Backfill Plan");
-		expect(out).toContain("</details>");
+		expect(out).toContain("## Context");
+		expect(out).toContain("- ~~T~~ — Excluded · r");
 	});
-	it("buildMarkdown includes the excluded-context details block", () => {
-		const md = buildMarkdown(leaf({ excludedContext: [{ kind: "note", key: "n1", title: "T", reason: "r" }] }));
-		expect(md).toContain("AI judged 1 context item(s) unrelated");
+
+	it("omits relevance + excluded rows without the flag (PR-builder parity)", () => {
+		const lines: string[] = [];
+		pushPlansAndNotesSection(lines, relevanceSummary());
+		const out = lines.join("\n");
+		expect(out).toContain("- Graph Plan");
+		expect(out).not.toContain("High ·");
+		expect(out).not.toContain("Excluded");
+	});
+
+	it("kept rows without a persisted verdict render plain (legacy summaries)", () => {
+		const lines: string[] = [];
+		pushPlansAndNotesSection(lines, leaf({ notes: relevanceSummary().notes }), { withRelevance: true });
+		expect(lines.join("\n")).toContain("- Cursor Support");
+		expect(lines.join("\n")).not.toContain("·");
+	});
+
+	it("an empty-reason verdict renders no suffix (no dangling 'High · ')", () => {
+		const lines: string[] = [];
+		pushPlansAndNotesSection(
+			lines,
+			leaf({
+				notes: relevanceSummary().notes,
+				contextRelevance: [{ kind: "note", key: "n1", tier: "high", reason: "" }],
+			}),
+			{ withRelevance: true },
+		);
+		const out = lines.join("\n");
+		expect(out).toContain("- Cursor Support");
+		expect(out).not.toContain("High");
+		expect(out).not.toContain("·");
+	});
+
+	it("escapes tildes in an excluded title so `~~` inside it can't break the strikethrough", () => {
+		const lines: string[] = [];
+		pushPlansAndNotesSection(
+			lines,
+			leaf({ excludedContext: [{ kind: "note", key: "n1", title: "weird ~~title~~", reason: "r" }] }),
+			{ withRelevance: true },
+		);
+		expect(lines.join("\n")).toContain("- ~~weird \\~\\~title\\~\\~~~ — Excluded · r");
+	});
+
+	it("buildMarkdown shows the relevance picture (kept tiers + inlined excluded)", () => {
+		const md = buildMarkdown(relevanceSummary());
+		expect(md).toContain("- Graph Plan — High · plan lists the changed files");
+		expect(md).toContain("- ~~Unrelated Note~~ — Excluded · different subsystem");
 	});
 });
 

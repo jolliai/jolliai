@@ -1053,6 +1053,24 @@ export type SidebarInboundMsg =
 	  }
 	| {
 			/**
+			 * AI context-relevance overlay for the Working Memory CONTEXT rows.
+			 * Pushed by the Review panel's relevance ranking (via the host) so the
+			 * sidebar strikes through AI soft-excluded items in sync with the
+			 * panel. In-memory only: it exists while the panel has ranked this
+			 * session; an empty `items` clears the overlay. `id` is the plan slug /
+			 * note id / reference mapKey (same key the row's data-id carries);
+			 * `reason` feeds the row's native tooltip. Extra fields the panel
+			 * includes for its own overlay (tier etc.) are ignored here.
+			 */
+			readonly type: "context:relevance";
+			readonly items: ReadonlyArray<{
+				readonly id: string;
+				readonly autoExclude: boolean;
+				readonly reason?: string;
+			}>;
+	  }
+	| {
+			/**
 			 * Aggregated LLM token usage across all committed summaries on the current
 			 * branch. Posted alongside `branch:commitsData` when at least one summary
 			 * carries token metadata. Drives the horizontal token-usage bar rendered

@@ -1487,6 +1487,10 @@ export class SummaryWebviewPanel {
 				this.planTranslateSet,
 				this.noteTranslateSet,
 				this.referenceTranslateSet,
+				// Keep the AI relevance rows across in-place section refreshes —
+				// without this the tier chips + inlined excluded rows would vanish
+				// after any plan/note/reference mutation re-render.
+				{ refs: summary.contextRelevance, excluded: summary.excludedContext },
 			),
 			// The visible "CONTEXT N" chip lives in #contextPanel's panel-header
 			// (buildContextPanel), OUTSIDE the #plansAndNotesSection HTML above —

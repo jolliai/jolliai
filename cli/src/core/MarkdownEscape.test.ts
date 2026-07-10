@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { escHtml, escMdLinkText, escMdUrl } from "./MarkdownEscape.js";
+import { escHtml, escMdLinkText, escMdStrikeText, escMdUrl } from "./MarkdownEscape.js";
 
 describe("escHtml", () => {
 	it('escapes &, <, >, "', () => {
@@ -10,6 +10,17 @@ describe("escHtml", () => {
 describe("escMdLinkText", () => {
 	it("backslash-escapes brackets and folds newlines", () => {
 		expect(escMdLinkText("x](y)\nz")).toBe("x\\](y) z");
+	});
+});
+
+describe("escMdStrikeText", () => {
+	it("escapes tildes on top of the link-text set so `~~` can't close a strikethrough span", () => {
+		expect(escMdStrikeText("weird ~~title~~ [x]\ny")).toBe("weird \\~\\~title\\~\\~ \\[x\\] y");
+	});
+	it("escapes pre-existing backslashes in the same pass, so `\\~` input can't forge an escape", () => {
+		// Input `\~`: the backslash becomes `\\` and the tilde `\~` — the tilde's
+		// escaping backslash is always the one WE added, never attacker-supplied.
+		expect(escMdStrikeText("a\\~b")).toBe("a\\\\\\~b");
 	});
 });
 

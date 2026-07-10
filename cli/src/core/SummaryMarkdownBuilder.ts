@@ -7,7 +7,7 @@
  */
 
 import type { CommitSummary, E2eTestScenario, ReferenceCommitRef, SourceId } from "../Types.js";
-import { escMdLinkText, escMdUrl } from "./MarkdownEscape.js";
+import { escMdLinkText, escMdStrikeText, escMdUrl } from "./MarkdownEscape.js";
 import { referenceDisplayTitle } from "./references/ReferenceDisplay.js";
 import { getRegistry } from "./references/SourceDefinitionRegistry.js";
 import {
@@ -43,8 +43,11 @@ export function buildMarkdown(summary: CommitSummary): string {
 	const lines: Array<string> = [];
 
 	pushPropertiesSection(lines, summary);
-	pushPlansAndNotesSection(lines, summary);
-	pushExcludedContextSection(lines, summary);
+	// withRelevance: the memory/summary export shows the AI relevance picture —
+	// per-item tier+reason on kept rows plus the AI-excluded items inlined as
+	// read-only rows. PR builders call pushPlansAndNotesSection WITHOUT the flag
+	// so PR bodies keep their original, relevance-free Context section.
+	pushPlansAndNotesSection(lines, summary, { withRelevance: true });
 	pushRecapSection(lines, summary);
 	pushE2eTestSection(lines, summary.e2eTestGuide);
 	pushSourceCommitsSection(lines, sourceNodes);
@@ -150,6 +153,32 @@ export function referencesBySourceOrder(
 	return out;
 }
 
+/** Archive suffix on committed plan slugs / note ids (`slug-<hash8>`). Relevance
+ *  keys are working-area identities (pre-archive), so lookups try the exact key
+ *  first and then this stripped form. Mirrors QueueWorker's REF_HASH_SUFFIX. */
+const ARCHIVE_HASH_SUFFIX = /-[0-9a-f]{8}$/;
+
+/** Relevance lookup for one archived ref: exact key first (covers unarchived or
+ *  naturally-hex-ending working keys), then the archive-suffix-stripped base. */
+function lookupRelevance(
+	map: ReadonlyMap<string, { tier: "high" | "mid" | "low"; reason: string }>,
+	kind: "plan" | "note" | "reference",
+	key: string,
+): { tier: "high" | "mid" | "low"; reason: string } | undefined {
+	return map.get(`${kind}:${key}`) ?? map.get(`${kind}:${key.replace(ARCHIVE_HASH_SUFFIX, "")}`);
+}
+
+const TIER_LABEL = { high: "High", mid: "Med", low: "Low" } as const;
+
+/** ` — High · reason` suffix for a kept row; empty when the item has no verdict
+ *  (legacy summaries, fail-open runs). An empty reason (fabricated fail-open
+ *  verdict that slipped into an artifact) renders no suffix rather than a
+ *  dangling `High · `. */
+function relevanceSuffix(rel: { tier: "high" | "mid" | "low"; reason: string } | undefined): string {
+	if (!rel || rel.reason === "") return "";
+	return ` — ${TIER_LABEL[rel.tier]} · ${escMdLinkText(rel.reason)}`;
+}
+
 /**
  * Appends a combined Plans & Notes section — title + URL for each item.
  * External references (Linear/Jira/GitHub/Notion) are rendered only when
@@ -157,17 +186,32 @@ export function referencesBySourceOrder(
  * path leaves it off, so the *references* output is the only part that differs
  * between the two paths (plan/note titles are escaped on both). Exported so PR
  * builders reuse it.
+ *
+ * `opts.withRelevance` (memory/summary export only — PR builders leave it off)
+ * additionally renders the AI relevance picture: each kept row gains a
+ * ` — High/Med/Low · reason` suffix from `summary.contextRelevance`, and the
+ * AI-excluded items (`summary.excludedContext`) are inlined as read-only rows
+ * at the end (struck-through title + `Excluded` tag + reason, no links). This
+ * replaced the old collapsed `<details>` block so kept and excluded items read
+ * as one list.
  */
 export function pushPlansAndNotesSection(
 	lines: Array<string>,
 	summary: CommitSummary,
-	opts?: { includeReferences?: boolean },
+	opts?: { includeReferences?: boolean; withRelevance?: boolean },
 ): void {
 	const plans = summary.plans ?? [];
 	const notes = summary.notes ?? [];
 	const references: ReadonlyArray<ReferenceCommitRef> = opts?.includeReferences ? (summary.references ?? []) : [];
+	const excluded = opts?.withRelevance ? (summary.excludedContext ?? []) : [];
+	const relevanceMap = new Map<string, { tier: "high" | "mid" | "low"; reason: string }>();
+	if (opts?.withRelevance) {
+		for (const r of summary.contextRelevance ?? []) {
+			relevanceMap.set(`${r.kind}:${r.key}`, { tier: r.tier, reason: r.reason });
+		}
+	}
 	const totalCount = plans.length + notes.length + references.length;
-	if (totalCount === 0) {
+	if (totalCount === 0 && excluded.length === 0) {
 		return;
 	}
 	const countLabel = totalCount > 1 ? ` (${totalCount})` : "";
@@ -175,15 +219,19 @@ export function pushPlansAndNotesSection(
 
 	for (const plan of plans) {
 		const planUrl = plan.jolliPlanDocUrl;
+		const suffix = relevanceSuffix(lookupRelevance(relevanceMap, "plan", plan.slug));
 		lines.push(
-			planUrl ? `- [${escMdLinkText(plan.title)}](${escMdUrl(planUrl)})` : `- ${escMdLinkText(plan.title)}`,
+			(planUrl ? `- [${escMdLinkText(plan.title)}](${escMdUrl(planUrl)})` : `- ${escMdLinkText(plan.title)}`) +
+				suffix,
 		);
 	}
 
 	for (const note of notes) {
 		const noteUrl = note.jolliNoteDocUrl;
+		const suffix = relevanceSuffix(lookupRelevance(relevanceMap, "note", note.id));
 		lines.push(
-			noteUrl ? `- [${escMdLinkText(note.title)}](${escMdUrl(noteUrl)})` : `- ${escMdLinkText(note.title)}`,
+			(noteUrl ? `- [${escMdLinkText(note.title)}](${escMdUrl(noteUrl)})` : `- ${escMdLinkText(note.title)}`) +
+				suffix,
 		);
 	}
 
@@ -192,30 +240,18 @@ export function pushPlansAndNotesSection(
 		// reference hasn't been pushed (or the push failed) so the row is never dead.
 		const label = escMdLinkText(referenceDisplayTitle(e));
 		const target = e.jolliReferenceDocUrl ?? e.url;
-		lines.push(target ? `- [${label}](${escMdUrl(target)})` : `- ${label}`);
+		const suffix = relevanceSuffix(lookupRelevance(relevanceMap, "reference", `${e.source}:${e.nativeId}`));
+		lines.push((target ? `- [${label}](${escMdUrl(target)})` : `- ${label}`) + suffix);
 	}
-}
 
-/**
- * Appends the AI-excluded context as a collapsed <details> block: the CONTEXT
- * items the relevance ranker judged unrelated to this commit, each with its
- * reason. Renders nothing when there are no soft-excluded items. Kept separate
- * from the Context section so it still shows when the Context section is empty.
- */
-export function pushExcludedContextSection(lines: Array<string>, summary: CommitSummary): void {
-	const excluded = summary.excludedContext ?? [];
-	if (excluded.length === 0) return;
-	lines.push(
-		"",
-		"<details>",
-		`<summary>AI judged ${excluded.length} context item(s) unrelated (not included)</summary>`,
-		"",
-	);
+	// AI-excluded items, inlined read-only after the kept rows: struck-through
+	// title, an `Excluded` tag in place of a tier, and the AI's reason. No links
+	// — a soft-excluded item was never archived into this commit, so there is
+	// nothing to open. escMdStrikeText additionally escapes tildes so a literal
+	// `~~` inside the title can't close the strikethrough early.
 	for (const e of excluded) {
-		lines.push(`- ${escMdLinkText(e.title)}`);
-		if (e.reason) lines.push(`  — ${escMdLinkText(e.reason)}`);
+		lines.push(`- ~~${escMdStrikeText(e.title)}~~ — Excluded${e.reason ? ` · ${escMdLinkText(e.reason)}` : ""}`);
 	}
-	lines.push("", "</details>");
 }
 
 /**

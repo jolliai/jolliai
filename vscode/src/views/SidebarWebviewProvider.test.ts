@@ -192,6 +192,39 @@ describe("SidebarWebviewProvider", () => {
 		expect(executeCommand).toHaveBeenCalledWith("jollimemory.openSettings");
 	});
 
+	it("pushContextRelevanceToSidebar posts to the sidebar view ONLY — never to broadcast targets", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		// A registered broadcast target (the Review panel) must NOT receive this
+		// push — the panel already posts context:relevance to its own webview, so
+		// fanning out would deliver a duplicate.
+		const target = { postMessage: vi.fn() };
+		provider.registerBroadcastTarget(target as never);
+		const items = [{ id: "p1", autoExclude: true, reason: "unrelated" }];
+		provider.pushContextRelevanceToSidebar(items);
+		expect(view.webview.postMessage).toHaveBeenCalledWith({ type: "context:relevance", items });
+		expect(target.postMessage).not.toHaveBeenCalled();
+	});
+
+	it("pushContextRelevanceToSidebar is a no-op before the view resolves", () => {
+		// No resolveWebviewView — must not throw.
+		expect(() => provider.pushContextRelevanceToSidebar([])).not.toThrow();
+	});
+
+	it("pushContextRelevanceToSidebar swallows a disposed view's webview-getter throw", () => {
+		// VS Code disposes hidden sidebar views; their `webview` getter then
+		// throws synchronously. That throw must not escape into the Review
+		// panel's relevance catch (which would wipe the panel's own overlay).
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		Object.defineProperty(view, "webview", {
+			get() {
+				throw new Error("Webview is disposed");
+			},
+		});
+		expect(() => provider.pushContextRelevanceToSidebar([{ id: "p1", autoExclude: true }])).not.toThrow();
+	});
+
 	it("blocks a `command` message whose command is not a jollimemory.* command", () => {
 		const view = makeMockView();
 		provider.resolveWebviewView(view as unknown as never);

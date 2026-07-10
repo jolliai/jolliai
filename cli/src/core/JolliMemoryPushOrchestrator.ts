@@ -388,7 +388,11 @@ export function buildPushMarkdown(summary: CommitSummary): string {
 	const lines: Array<string> = [];
 
 	pushPropertiesSection(lines, summary);
-	pushPlansAndNotesSection(lines, summary, { includeReferences: true });
+	// withRelevance: the pushed Jolli Space article shows the same relevance
+	// picture as every other summary surface (webview, clipboard, Memory Bank
+	// .md) — only PR bodies stay relevance-free. Without it the cli and vscode
+	// push paths would also diverge from each other.
+	pushPlansAndNotesSection(lines, summary, { includeReferences: true, withRelevance: true });
 	pushRecapSection(lines, summary);
 	pushE2eTestSection(lines, summary.e2eTestGuide);
 	pushSourceCommitsSection(lines, sourceNodes);

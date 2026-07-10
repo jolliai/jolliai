@@ -3,7 +3,7 @@ import * as vscode from "vscode";
 import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSessionAggregator.js";
 import { sumConversationTokens } from "../../../cli/src/core/ConversationTokenTotals.js";
 import { assessContextRelevance, computeChangeFingerprint } from "../../../cli/src/core/ContextRelevance.js";
-import { type AiExclusion, readExclusions, writeAiSelection } from "../../../cli/src/core/CommitSelectionStore.js";
+import { type AiRelevanceEntry, readExclusions, writeAiSelection } from "../../../cli/src/core/CommitSelectionStore.js";
 import { getWorkingTreeDiffStats } from "../../../cli/src/core/GitOps.js";
 import {
 	detectActiveNotesForBranch,
@@ -27,6 +27,14 @@ interface SidebarBroadcastHost {
 	getPlansSnapshot(): ReadonlyArray<SerializedTreeItem>;
 	getFilesSnapshot(): ReadonlyArray<SerializedTreeItem>;
 	getConversationsSnapshot(): Promise<ReadonlyArray<ActiveConversationItem>>;
+	/**
+	 * Mirror the relevance overlay onto the sidebar's own view (NOT the broadcast
+	 * fan-out, which would echo it back to this panel). Keeps the sidebar's
+	 * CONTEXT strikethroughs in sync with the panel's Excluded rows.
+	 */
+	pushContextRelevanceToSidebar(
+		items: ReadonlyArray<{ readonly id: string; readonly autoExclude: boolean; readonly reason?: string }>,
+	): void;
 }
 
 let currentPanel: vscode.WebviewPanel | undefined;
@@ -380,11 +388,12 @@ export class NextMemoryPreviewPanel {
 	/**
 	 * Ranks CONTEXT relevance against the selected-file change set and pushes per-item
 	 * {tier, reason, autoExclude} for the overlay. AUTHORITATIVE: it reads full registry
-	 * content (like the QueueWorker) and PERSISTS the result (aiSuggestedExclude + a
-	 * file-based change fingerprint) so the post-commit worker reuses it verbatim when
-	 * the fingerprint matches — one ranking, panel == final. Best-effort: any failure
-	 * posts an empty overlay. No selected files → no change signal → empty (avoids
-	 * ranking against an empty signal, which would spuriously exclude everything).
+	 * content (like the QueueWorker) and PERSISTS the result (the full aiRelevance list
+	 * + a file-based change fingerprint) so the post-commit worker reuses it verbatim
+	 * when the fingerprint matches — one ranking, panel == final. Best-effort: any
+	 * failure posts an empty overlay. No selected files → no change signal → empty
+	 * (avoids ranking against an empty signal, which would spuriously exclude
+	 * everything).
 	 */
 	private static async pushContextRelevance(
 		webview: vscode.Webview,
@@ -403,6 +412,7 @@ export class NextMemoryPreviewPanel {
 			// overlay; leaving the stale cache is harmless (a different file set has a
 			// different key → miss → re-rank anyway).
 			void webview.postMessage({ type: "context:relevance", items: [] });
+			sidebarProvider.pushContextRelevanceToSidebar([]);
 			return;
 		}
 		try {
@@ -440,7 +450,10 @@ export class NextMemoryPreviewPanel {
 				].sort(),
 			].join("|");
 			if (relevanceCache && relevanceCache.key === itemsKey) {
-				if (!isStale()) void webview.postMessage({ type: "context:relevance", items: relevanceCache.items });
+				if (!isStale()) {
+					void webview.postMessage({ type: "context:relevance", items: relevanceCache.items });
+					sidebarProvider.pushContextRelevanceToSidebar(relevanceCache.items);
+				}
 				return;
 			}
 			// A newer refresh started while we read the registry — let it own the
@@ -451,16 +464,29 @@ export class NextMemoryPreviewPanel {
 			// Superseded during the (up-to-45s) LLM call → discard, so this stale file
 			// set's ranking can't clobber the newer result's cache/overlay/fingerprint.
 			if (isStale()) return;
-			const aiExcluded: AiExclusion[] = decision.excludedContext.map((e) => ({
-				kind: e.kind === "plan" ? "plans" : e.kind === "note" ? "notes" : "references",
-				key: e.key,
-				reason: e.reason,
-			}));
-			await writeAiSelection(workspaceRoot, aiExcluded, fingerprint);
+			// Persist EVERY item's full verdict (tier + reason + the AI's exclude
+			// decision) as ONE list: the post-commit worker's fingerprint-reuse path
+			// rebuilds both the effective exclude set and the kept items' relevance
+			// (CommitSummary.contextRelevance) from it without an LLM call.
+			// Empty-reason entries are NOT verdicts — the fail-open keepAll fallback
+			// fabricates tier:"high", reason:"" for every item — so they're dropped,
+			// mirroring keptContextRelevanceRefs, or the reuse path would stamp the
+			// fabricated "all High" onto the artifact. A fresh ranking carries no
+			// user veto — `dismissed` only ever appears via dismissAiExclusion.
+			const aiEntries: AiRelevanceEntry[] = decision.results
+				.filter((r) => r.reason !== "")
+				.map((r) => ({
+					kind: r.kind === "plan" ? "plans" : r.kind === "note" ? "notes" : "references",
+					key: r.id,
+					tier: r.tier,
+					reason: r.reason,
+					excluded: r.autoExclude,
+				}));
+			await writeAiSelection(workspaceRoot, aiEntries, fingerprint);
 			// autoExclude reflects the final exclude set (excludedContext). There's no
-			// persistent "kept" state: a dismiss just drops the item from that set
-			// (optimistically in the panel + persisted via removeAiExclusion), so it
-			// falls back to showing its normal tier.
+			// persistent "kept" state: a dismiss vetoes the exclusion (optimistically
+			// in the panel + persisted as a `dismissed` flag via dismissAiExclusion),
+			// so the item falls back to showing its original tier + note.
 			const excludedKeys = new Set(decision.excludedContext.map((e) => `${e.kind}:${e.key}`));
 			const items: ContextRelevancePreviewItem[] = decision.results.map((r) => ({
 				id: r.id,
@@ -475,8 +501,12 @@ export class NextMemoryPreviewPanel {
 			if (isStale()) return;
 			relevanceCache = { key: itemsKey, items };
 			void webview.postMessage({ type: "context:relevance", items });
+			sidebarProvider.pushContextRelevanceToSidebar(items);
 		} catch {
-			if (!isStale()) void webview.postMessage({ type: "context:relevance", items: [] });
+			if (!isStale()) {
+				void webview.postMessage({ type: "context:relevance", items: [] });
+				sidebarProvider.pushContextRelevanceToSidebar([]);
+			}
 		}
 	}
 
@@ -495,6 +525,12 @@ export class NextMemoryPreviewPanel {
 	 * dismissed item to non-excluded in place. Reopening the panel then hits the cache
 	 * (no re-rank, no "Analyzing…") AND preserves the dismiss, rather than re-ranking and
 	 * letting the AI re-exclude it.
+	 *
+	 * The tier + reason are deliberately KEPT: a dismiss vetoes only the exclude
+	 * action, not the AI's judgment — the item falls back to showing its original
+	 * tier + note (mirroring the persisted layer, where dismissAiExclusion sets a
+	 * flag and leaves the verdict intact, and the summary artifact, which records
+	 * the original verdict on the kept item).
 	 */
 	static dismissInRelevanceCache(key: string): void {
 		if (!relevanceCache) return;
@@ -502,5 +538,16 @@ export class NextMemoryPreviewPanel {
 			key: relevanceCache.key,
 			items: relevanceCache.items.map((it) => (it.id === key ? { ...it, autoExclude: false } : it)),
 		};
+	}
+
+	/**
+	 * Current cached ranking items (undefined when no ranking ran this session).
+	 * Used by the host's dismiss handler to re-push the post-dismiss overlay to
+	 * BOTH surfaces — without it, a dismiss from one surface leaves the other
+	 * showing the stale Excluded strikethrough indefinitely (neither webview
+	 * re-derives the overlay on its own; only a `context:relevance` push does).
+	 */
+	static getRelevanceCacheItems(): ReadonlyArray<ContextRelevancePreviewItem> | undefined {
+		return relevanceCache?.items;
 	}
 }

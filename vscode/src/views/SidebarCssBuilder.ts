@@ -1067,10 +1067,14 @@ export function buildSidebarCss(): string {
      Discard icon stacked over it, making it unclickable). */
   /* Excluded row: struck through + dimmed so "left out of this memory" reads
      at a glance. The label carries the line-through; the whole row dims. The
-     hover action overlay is exempted so its icons stay legible. */
-  .tree-node.excluded .label { text-decoration: line-through; }
-  .tree-node.excluded { opacity: 0.6; }
-  .tree-node.excluded:hover { opacity: 1; }
+     hover action overlay is exempted so its icons stay legible.
+     .ai-excluded is the AI soft-exclude axis (Review-panel relevance ranking),
+     deliberately identical in look — both mean "won't go into the next memory"
+     — but an independent class: it must never flow through isSelected /
+     .excluded, whose axis is the user's manual exclude. */
+  .tree-node.excluded .label, .tree-node.ai-excluded .label { text-decoration: line-through; }
+  .tree-node.excluded, .tree-node.ai-excluded { opacity: 0.6; }
+  .tree-node.excluded:hover, .tree-node.ai-excluded:hover { opacity: 1; }
   /* Twirl chevron that toggles evidence expansion — sits at the very left
      of the memory row (before the M icon). Vertically centered; cursor pointer
      since it is a toggle target, not a full-row action. */

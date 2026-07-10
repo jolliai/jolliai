@@ -68,6 +68,7 @@ function makeSidebarProvider(overrides: Record<string, unknown> = {}) {
 		getPlansSnapshot: vi.fn().mockReturnValue([]),
 		getFilesSnapshot: vi.fn().mockReturnValue([]),
 		getConversationsSnapshot: vi.fn().mockResolvedValue([]),
+		pushContextRelevanceToSidebar: vi.fn(),
 		...overrides,
 	};
 }
@@ -450,16 +451,84 @@ describe("NextMemoryPreviewPanel — context relevance overlay", () => {
 			),
 		);
 		expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "context:analyzing", analyzing: true }));
-		// Persisted for the post-commit worker to reuse.
-		expect(writeAiMock).toHaveBeenCalled();
+		// Persisted for the post-commit worker to reuse — ONE list carrying every
+		// item's full verdict (tier + reason + the AI's exclude decision).
+		expect(writeAiMock).toHaveBeenCalledWith(
+			"/repo",
+			[{ kind: "plans", key: "p1", tier: "low", reason: "unrelated", excluded: true }],
+			"fp",
+		);
+		// The overlay is mirrored to the sidebar (view-only push) so its CONTEXT
+		// rows strike through in sync.
+		expect(sidebar.pushContextRelevanceToSidebar).toHaveBeenCalledWith([
+			expect.objectContaining({ id: "p1", autoExclude: true }),
+		]);
+	});
+
+	it("does not persist fabricated empty-reason verdicts (fail-open keepAll)", async () => {
+		postMessage.mockClear();
+		writeAiMock.mockClear();
+		detectPlansMock.mockResolvedValue([{ slug: "p1", title: "P1" }]);
+		// keepAll shape: every item tier:"high", reason:"" — not a real verdict.
+		assessMock.mockResolvedValue({
+			plans: [{ slug: "p1", title: "P1" }],
+			notes: [],
+			references: [],
+			excludedContext: [],
+			results: [
+				{ id: "p1", kind: "plan", relevant: true, score: 0, tier: "high", reason: "", rank: 1, autoExclude: false },
+			],
+		});
+		const sidebar = makeSidebarProvider({
+			getFilesSnapshot: vi.fn().mockReturnValue([{ id: "f1", description: "src/a.ts", isSelected: true }]),
+		});
+		await openAndReady(makeBridge(), sidebar);
+		await vi.waitFor(() => expect(writeAiMock).toHaveBeenCalled());
+		// The fabricated empty-reason entries are filtered to nothing — the reuse
+		// path must not stamp "all High" onto the artifact.
+		expect(writeAiMock).toHaveBeenCalledWith("/repo", [], "fp");
+	});
+
+	it("getRelevanceCacheItems exposes the cached ranking; dismiss updates it in place", async () => {
+		postMessage.mockClear();
+		detectPlansMock.mockResolvedValue([{ slug: "p1", title: "P1" }]);
+		assessMock.mockResolvedValue({
+			plans: [],
+			notes: [],
+			references: [],
+			excludedContext: [{ kind: "plan", key: "p1", title: "P1", reason: "unrelated" }],
+			results: [
+				{ id: "p1", kind: "plan", relevant: false, score: 0.1, tier: "low", reason: "unrelated", rank: 1, autoExclude: true },
+			],
+		});
+		const sidebar = makeSidebarProvider({
+			getFilesSnapshot: vi.fn().mockReturnValue([{ id: "f1", description: "src/a.ts", isSelected: true }]),
+		});
+		await openAndReady(makeBridge(), sidebar);
+		await vi.waitFor(() =>
+			expect(NextMemoryPreviewPanel.getRelevanceCacheItems()).toEqual([
+				expect.objectContaining({ id: "p1", autoExclude: true }),
+			]),
+		);
+		// The host's dismiss handler reads this to re-push the post-dismiss
+		// overlay to both surfaces — it must reflect the dismissal immediately,
+		// with the AI's ORIGINAL tier + reason preserved (a dismiss vetoes only
+		// the exclude action, never the verdict).
+		NextMemoryPreviewPanel.dismissInRelevanceCache("p1");
+		expect(NextMemoryPreviewPanel.getRelevanceCacheItems()).toEqual([
+			{ id: "p1", tier: "low", reason: "unrelated", autoExclude: false },
+		]);
 	});
 
 	it("posts an empty context:relevance (no LLM) when no files are selected", async () => {
 		postMessage.mockClear();
 		assessMock.mockClear();
-		await openAndReady(makeBridge(), makeSidebarProvider());
+		const sidebar = makeSidebarProvider();
+		await openAndReady(makeBridge(), sidebar);
 		await vi.waitFor(() => expect(postMessage).toHaveBeenCalledWith({ type: "context:relevance", items: [] }));
 		expect(assessMock).not.toHaveBeenCalled();
+		// The sidebar overlay is cleared too.
+		expect(sidebar.pushContextRelevanceToSidebar).toHaveBeenCalledWith([]);
 	});
 
 	it("reuses the cached ranking on reopen (same files + items) — no second LLM call", async () => {
@@ -494,6 +563,11 @@ describe("NextMemoryPreviewPanel — context relevance overlay", () => {
 		);
 		expect(assessMock).not.toHaveBeenCalled();
 		expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "context:analyzing", analyzing: true }));
+		// The cache-hit path mirrors to the sidebar too — a reopened panel must not
+		// leave the sidebar's strikethroughs stale.
+		expect(sidebar.pushContextRelevanceToSidebar).toHaveBeenCalledWith([
+			expect.objectContaining({ id: "p1", tier: "high" }),
+		]);
 	});
 
 	it("dismiss updates the cached ranking in place — reopen keeps it dismissed, no re-rank", async () => {
