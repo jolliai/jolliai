@@ -25,11 +25,15 @@ export const linearDefinition: SourceDefinition = {
 	label: "Linear",
 	icon: "issues",
 	match: {
-		claude: { prefixes: ["mcp__linear__", "mcp__claude_ai_Linear__"] },
+		claude: {
+			prefixes: ["mcp__linear__", "mcp__claude_ai_Linear__"],
+			// Enumeration tools bulk-capture every returned issue; exclude them.
+			denySuffixes: ["list_issues", "search_issues"],
+		},
 		codex: {
 			namespaceSuffix: "linear",
-			functionCallNames: ["_fetch", "_get_issue", "_list_issues", "_search"],
-			invocationTools: ["linear_fetch", "linear.get_issue", "linear.list_issues", "linear.search"],
+			functionCallNames: ["_fetch", "_get_issue"],
+			invocationTools: ["linear_fetch", "linear.get_issue"],
 		},
 	},
 	wrapperKeys: ["items", "issues", "nodes", "results"],

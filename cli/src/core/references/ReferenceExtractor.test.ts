@@ -126,7 +126,7 @@ describe("extractReferencesFromTranscript", () => {
 		expect(lastLineNumberScanned).toBe(2);
 	});
 
-	it("extracts all issues from a list_issues array result, preserving order", async () => {
+	it("captures zero references from a list_issues enumeration result", async () => {
 		const jsonl = makeJsonl(
 			toolUseLine({
 				toolUseId: "toolu_2",
@@ -144,31 +144,30 @@ describe("extractReferencesFromTranscript", () => {
 
 		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
 
-		expect(references.map((i) => i.nativeId)).toEqual(["PROJ-1528", "PROJ-1404"]);
-		expect(references.every((i) => i.toolName === "mcp__linear__list_issues")).toBe(true);
+		expect(references).toEqual([]);
 	});
 
-	it("dedupes same nativeId across multiple references, keeping the latest referencedAt", async () => {
+	it("dedupes same nativeId across two get_issue results, keeping the latest referencedAt", async () => {
 		const jsonl = makeJsonl(
-			// First: list result (no description)
+			// First: sparse get_issue (old title, no description), earlier timestamp
 			toolUseLine({
-				toolUseId: "toolu_list",
-				toolName: "mcp__linear__list_issues",
+				toolUseId: "toolu_get1",
+				toolName: "mcp__linear__get_issue",
 				timestamp: "2026-05-14T06:00:00.000Z",
 			}),
 			toolResultLine({
-				toolUseId: "toolu_list",
+				toolUseId: "toolu_get1",
 				timestamp: "2026-05-14T06:00:01.000Z",
-				payload: [{ id: "PROJ-1528", title: "old title", url: SAMPLE_ISSUE_PAYLOAD.url }],
+				payload: { id: "PROJ-1528", title: "old title", url: SAMPLE_ISSUE_PAYLOAD.url },
 			}),
-			// Then: get_issue with full description, later timestamp
+			// Then: full get_issue, later timestamp
 			toolUseLine({
-				toolUseId: "toolu_get",
+				toolUseId: "toolu_get2",
 				toolName: "mcp__linear__get_issue",
 				timestamp: "2026-05-14T07:00:00.000Z",
 			}),
 			toolResultLine({
-				toolUseId: "toolu_get",
+				toolUseId: "toolu_get2",
 				timestamp: "2026-05-14T07:00:01.000Z",
 				payload: SAMPLE_ISSUE_PAYLOAD,
 			}),
@@ -448,7 +447,7 @@ describe("extractReferencesFromTranscript", () => {
 		const jsonl = makeJsonl(
 			toolUseLine({
 				toolUseId: "toolu_w",
-				toolName: "mcp__linear__list_issues",
+				toolName: "mcp__linear__get_issue",
 				timestamp: "2026-05-14T06:00:00.000Z",
 			}),
 			toolResultLine({
@@ -474,7 +473,7 @@ describe("extractReferencesFromTranscript", () => {
 		const jsonl = makeJsonl(
 			toolUseLine({
 				toolUseId: "toolu_obj",
-				toolName: "mcp__linear__list_issues",
+				toolName: "mcp__linear__get_issue",
 				timestamp: "2026-05-14T06:00:00.000Z",
 			}),
 			toolResultLine({

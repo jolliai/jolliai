@@ -36,6 +36,13 @@ export interface MatchClaude {
 	readonly prefixes: ReadonlyArray<string>;
 	/** Optional suffix accept (e.g. Notion "notion-fetch"). */
 	readonly acceptSuffix?: string;
+	/**
+	 * After a prefix match (and any `acceptSuffix`), reject if the tool name ends
+	 * with any of these. Enumeration tools (`list_issues` / `search_issues`)
+	 * bulk-capture their whole result array — one reference per element — flooding
+	 * Working Memory → Context, so they are excluded from reference extraction.
+	 */
+	readonly denySuffixes?: ReadonlyArray<string>;
 }
 export interface MatchCodex {
 	readonly namespaceSuffix: string;
