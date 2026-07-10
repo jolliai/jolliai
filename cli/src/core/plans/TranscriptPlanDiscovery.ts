@@ -11,7 +11,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../../Logger.js";
 import type { PlanEntry, TranscriptSource } from "../../Types.js";
@@ -44,18 +44,63 @@ const EXTERNAL_EXCLUDE_BASENAMES = new Set([
 ]);
 
 /**
- * Decide whether an external .md path is a plan candidate. Excludes any path
- * under `.claude/`, `node_modules/`, or `.github/`, plus common non-plan
- * filenames (README.md, CLAUDE.md, etc.) at any depth.
+ * Basename suffix patterns for transient agent scratch artifacts that are not
+ * plans — PR review scratch files (`pr320-review.md`, `code-review.md`) and
+ * task/status report dumps (`task-report.md`, `task_report.md`, `report.md`).
+ * Applied to the already-lowercased basename, so no `i` flag is needed. The
+ * `[-_]` separator alternative covers both dash- and underscore-delimited
+ * naming; `(?:^|…)` also matches the bare `review.md` / `report.md`. This
+ * complements the exact-basename denylist above — see JOLLI-1918.
  */
-function isExternalPlanCandidate(absPath: string): boolean {
+const EXTERNAL_EXCLUDE_BASENAME_PATTERNS = [/(?:^|[-_])review\.md$/, /(?:^|[-_])report\.md$/];
+
+/**
+ * Temp roots whose contents are throwaway scratch output — an agent writing a
+ * `.md` into the OS temp dir or a session scratchpad is not authoring a plan.
+ * Normalized once at load. `tmpdir()` covers Windows `%TEMP%` and macOS
+ * `/var/folders/…`; the POSIX literals cover `/tmp` and `/private/tmp` (the
+ * macOS scratchpad root, which `tmpdir()` does NOT return).
+ */
+const EXTERNAL_EXCLUDE_TEMP_ROOTS = [tmpdir(), "/tmp", "/private/tmp", "/var/tmp"].map(normalizePathForCompare);
+
+/**
+ * True when `absPath` lives under `dir`. A plan candidate is always a `.md` file
+ * path and `dir` is the workspace root, so the two are never equal — only the
+ * strict-descendant (`dir/…`) case is meaningful here.
+ */
+function isWithinDir(absPath: string, dir: string): boolean {
+	return normalizePathForCompare(absPath).startsWith(`${normalizePathForCompare(dir)}/`);
+}
+
+/**
+ * True when `absPath` is a scratch temp file: under a known temp/scratchpad root
+ * AND outside the project workspace (`cwd`). The workspace caveat is essential —
+ * a project checkout can itself live under a temp root (test sandboxes via
+ * `mkdtemp`, or a repo cloned into `/tmp`), and files inside such a workspace are
+ * real project content, not scratch.
+ */
+function isScratchTempFile(absPath: string, cwd: string): boolean {
+	const norm = normalizePathForCompare(absPath);
+	if (!EXTERNAL_EXCLUDE_TEMP_ROOTS.some((root) => norm.startsWith(`${root}/`))) return false;
+	return !isWithinDir(absPath, cwd);
+}
+
+/**
+ * Decide whether an external .md path is a plan candidate. Excludes any path
+ * under `.claude/`, `node_modules/`, or `.github/`; scratch temp files outside
+ * the workspace; common non-plan filenames (README.md, CLAUDE.md, etc.); and
+ * transient scratch artifacts (`*-review.md`, `*-report.md`) at any depth.
+ */
+function isExternalPlanCandidate(absPath: string, cwd: string): boolean {
 	if (EXTERNAL_EXCLUDE_SEGMENTS.some((re) => re.test(absPath))) return false;
+	if (isScratchTempFile(absPath, cwd)) return false;
 	// `split` on a non-empty string always returns ≥1 element, so `pop()` is
 	// never undefined here. The non-null assertion drops the dead `?? ""`
 	// fallback that v8 otherwise counts as an uncovered branch arm.
 	// biome-ignore lint/style/noNonNullAssertion: split-then-pop is provably non-null
 	const base = absPath.split(/[/\\]/).pop()!.toLowerCase();
-	return !EXTERNAL_EXCLUDE_BASENAMES.has(base);
+	if (EXTERNAL_EXCLUDE_BASENAMES.has(base)) return false;
+	return !EXTERNAL_EXCLUDE_BASENAME_PATTERNS.some((re) => re.test(base));
 }
 
 /**
@@ -155,7 +200,7 @@ export async function scanPlansFrom(
 	// every source inherits the same README/AGENTS.md/etc. filter. Filter BEFORE
 	// the early-exit so "only excluded files were touched" still skips the registry
 	// read — byte-equivalent to the pre-refactor Claude behaviour.
-	const filteredExternal = new Set([...externalPlans].filter(isExternalPlanCandidate));
+	const filteredExternal = new Set([...externalPlans].filter((p) => isExternalPlanCandidate(p, cwd)));
 
 	if (slugs.size === 0 && filteredExternal.size === 0) {
 		return totalLines;
