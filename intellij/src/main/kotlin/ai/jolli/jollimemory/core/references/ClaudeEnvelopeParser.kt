@@ -52,9 +52,16 @@ object ClaudeEnvelopeParser : TranscriptEnvelopeParser {
 		// tool_results follow it.
 		val permalinks = SlackPermalink.scanUserPermalinks(lines)
 
-		for (i in fromLine until lines.size) {
+		// Scan tool_uses from line 0 — NOT from `fromLine`. A tool_use written just
+		// before the cursor (e.g. an incremental discovery tick fires in the gap
+		// between a tool_use and its tool_result mid-turn) must still land in
+		// `pending`, or its result can never pair and the reference is silently
+		// dropped. Only tool_RESULTS at or beyond `fromLine` are emitted, so
+		// already-reported references are not re-collected; downstream dedup by
+		// mapKey absorbs any overlap.
+		for (i in lines.indices) {
 			val line = lines[i]
-			lastConsumed = i + 1
+			if (i >= fromLine) lastConsumed = i + 1
 			if (line.isBlank()) continue
 
 			val hasAdapterNeedle = nameNeedles.any { line.contains(it) }
@@ -77,7 +84,10 @@ object ClaudeEnvelopeParser : TranscriptEnvelopeParser {
 
 			when (role) {
 				"assistant" -> collectToolUses(blocks, timestamp, opts.beforeTimestamp, pending, adapterFor)
-				"user" -> collectToolResults(blocks, i + 1, timestamp, opts.beforeTimestamp, pending, results, permalinks, opts)
+				"user" ->
+					if (i >= fromLine) {
+						collectToolResults(blocks, i + 1, timestamp, opts.beforeTimestamp, pending, results, permalinks, opts)
+					}
 			}
 		}
 
