@@ -106,6 +106,16 @@ describe("ConfigureCommand — settable keys", () => {
 		expect((await loadConfig()).copilotEnabled).toBe(false);
 	});
 
+	it("accepts syncOnPush as a boolean key", async () => {
+		await runConfigure(["--set", "syncOnPush=false"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncOnPush: false }));
+		expect((await loadConfig()).syncOnPush).toBe(false);
+
+		await runConfigure(["--set", "syncOnPush=true"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncOnPush: true }));
+		expect((await loadConfig()).syncOnPush).toBe(true);
+	});
+
 	it("accepts localFolder as a string path key", async () => {
 		// CLI-only setups (no VS Code Settings panel) need a way to point Memory
 		// Bank at a folder; without this key the only option was hand-editing

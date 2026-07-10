@@ -223,6 +223,9 @@ export class JolliMemoryPushClient {
 		if (status === 409 && json.error === "binding_already_exists") {
 			throw new BindingAlreadyExistsError(json.message ?? "binding_already_exists");
 		}
+		if (status === 401 || status === 403) {
+			throw new NotAuthenticatedError();
+		}
 		if (status < 200 || status >= 300) {
 			// Read `message ?? error` like listSpaces/createBinding (and the vscode
 			// parent) — the server may carry the human-readable reason in `message`.
@@ -251,6 +254,9 @@ export class JolliMemoryPushClient {
 	 */
 	async deleteDoc(docId: number): Promise<void> {
 		const { status } = await this.call("DELETE", `/api/push/jollimemory/${docId}`);
+		if (status === 401 || status === 403) {
+			throw new NotAuthenticatedError();
+		}
 		if (status < 200 || status >= 300) {
 			throw new Error(`delete failed: HTTP ${status}`);
 		}

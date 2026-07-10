@@ -57,6 +57,7 @@ const VALID_CONFIG_KEYS = [
 	"aiProvider",
 	"syncTranscripts",
 	"syncPollIntervalSec",
+	"syncOnPush",
 	"slack.workspaceUrl",
 ] as const satisfies ReadonlyArray<keyof JolliMemoryConfig | "slack.workspaceUrl">;
 
@@ -121,7 +122,8 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		key === "openCodeEnabled" ||
 		key === "cursorEnabled" ||
 		key === "copilotEnabled" ||
-		key === "syncTranscripts"
+		key === "syncTranscripts" ||
+		key === "syncOnPush"
 	) {
 		const lower = raw.toLowerCase();
 		if (lower === "true" || lower === "1" || lower === "yes") return true;
@@ -222,6 +224,11 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "syncTranscripts",
 		type: "boolean",
 		description: "Include raw AI conversation transcripts in cloud sync (default: false)",
+	},
+	{
+		key: "syncOnPush",
+		type: "boolean",
+		description: "Auto-sync pushed commits' memory to Jolli Space on every git push (default: true when signed in)",
 	},
 	{
 		key: "syncPollIntervalSec",

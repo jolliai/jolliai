@@ -32,6 +32,9 @@ const PREPARE_MSG_MARKER_END = "# <<< JolliMemory prepare-commit-msg hook <<<";
 export const POST_MERGE_MARKER_START = "# >>> JolliMemory post-merge hook >>>";
 const POST_MERGE_MARKER_END = "# <<< JolliMemory post-merge hook <<<";
 
+export const PRE_PUSH_MARKER_START = "# >>> JolliMemory pre-push hook >>>";
+const PRE_PUSH_MARKER_END = "# <<< JolliMemory pre-push hook <<<";
+
 // ─── Install ────────────────────────────────────────────────────────────────
 
 /**
@@ -136,6 +139,32 @@ export async function installPostMergeHook(projectDir: string): Promise<HookOpRe
 	const hookSection = [POST_MERGE_MARKER_START, hookCommandLine, POST_MERGE_MARKER_END].join("\n");
 
 	return installGenericGitHook(projectDir, "post-merge", hookSection, hookCommandLine, POST_MERGE_MARKER_START);
+}
+
+/**
+ * Installs the git pre-push hook (auto-syncs pushed commits' memory to Jolli
+ * Space). If a hook already exists, appends Jolli Memory's section.
+ *
+ * pre-push receives `<remote-name> <url>` as $1/$2 and the ref lines on stdin;
+ * `"$@"` forwards the args and `exec` inherits stdin, so PrePushHook.js sees
+ * both.
+ */
+export async function installPrePushHook(projectDir: string): Promise<HookOpResult> {
+	// pre-push is the only hook where non-zero exit aborts the git operation.
+	// Guard with [ -x ] + || true so a missing run-hook or absent Node can
+	// NEVER block the user's push (aligned with IntelliJ's prePushScript).
+	// Preserve the status of the existing hook content: this section is appended,
+	// so letting our best-effort command become the script's final status would
+	// turn a preceding failure into success and incorrectly allow the push.
+	const runHook = '"$HOME/.jolli/jollimemory/run-hook"';
+	const hookCommandLine = [
+		"__jolli_pre_push_previous_status=$?",
+		`if [ -x ${runHook} ]; then ${runHook} pre-push "$@" || true; fi`,
+		'(exit "$__jolli_pre_push_previous_status")',
+	].join("\n");
+	const hookSection = [PRE_PUSH_MARKER_START, hookCommandLine, PRE_PUSH_MARKER_END].join("\n");
+
+	return installGenericGitHook(projectDir, "pre-push", hookSection, hookCommandLine, PRE_PUSH_MARKER_START);
 }
 
 /**
@@ -262,6 +291,13 @@ export async function removePrepareMsgHook(projectDir: string): Promise<void> {
  */
 export async function removePostMergeHook(projectDir: string): Promise<void> {
 	await removeGenericGitHook(projectDir, "post-merge", POST_MERGE_MARKER_START, POST_MERGE_MARKER_END);
+}
+
+/**
+ * Removes the Jolli Memory section from the git pre-push hook.
+ */
+export async function removePrePushHook(projectDir: string): Promise<void> {
+	await removeGenericGitHook(projectDir, "pre-push", PRE_PUSH_MARKER_START, PRE_PUSH_MARKER_END);
 }
 
 /**

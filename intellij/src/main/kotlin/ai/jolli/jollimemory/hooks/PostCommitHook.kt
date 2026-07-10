@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.hooks
 
+import ai.jolli.jollimemory.bridge.CliIntegrations
 import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.core.*
 import ai.jolli.jollimemory.core.references.PromptRenderer
@@ -228,6 +229,19 @@ object PostCommitHook {
             }
             refresher.shutdownNow()
             SessionTracker.releaseLock(cwd)
+            // Pre-push sync catch-up (JOLLI-1900): a `git push` may have raced ahead
+            // of summary generation, leaving its commit in push-pending.json. Now that
+            // this drain has (re)generated summaries, drain the pending queue so those
+            // commits sync to Jolli Space without waiting for the next plugin startup —
+            // the IntelliJ analog of the TS QueueWorker's triggerPushForNewSummaries.
+            // Runs after releaseLock (never holds the drain lock over a network push;
+            // the push worker takes its own push-pending lock) and blocks (bounded)
+            // because this JVM is already a detached background process. Gated on
+            // `processed > 0` + the cheap no-pending short-circuit inside the callee,
+            // so a normal commit with nothing pending never spawns Node.
+            if (processed > 0) {
+                CliIntegrations.retryPendingPushes(cwd, waitForCompletion = true)
+            }
             ai.jolli.jollimemory.core.telemetry.Telemetry.track(
                 "queue_drained",
                 mapOf("ops" to processed, "duration_ms" to (System.currentTimeMillis() - drainStart)),

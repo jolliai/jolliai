@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.services
 
+import ai.jolli.jollimemory.bridge.CliIntegrations
 import ai.jolli.jollimemory.bridge.CommitSummaryBrief
 import ai.jolli.jollimemory.bridge.ConversationBrief
 import ai.jolli.jollimemory.bridge.GitOps
@@ -360,6 +361,15 @@ val sb = StringBuilder()
                     log.warn("Integrations catch-up failed (non-fatal): ${e.message}")
                 }
             }
+        }
+
+        // Pre-push sync catch-up (JOLLI-1900): retry any commits left in
+        // push-pending.json from a previous session — an offline push, or a push
+        // that raced ahead of summary generation. Off the EDT; fully guarded and
+        // fire-and-forget (no-ops when nothing is pending, Node is absent, or the
+        // user isn't signed in). Mirrors VS Code's Extension.activate retry.
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            CliIntegrations.retryPendingPushes(basePath)
         }
 
         isInitialized = true

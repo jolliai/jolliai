@@ -118,7 +118,7 @@ function buildFullStatusItems(
 ): Array<StatusItem> {
 	const hookParts: Array<string> = [];
 	if (s.gitHookInstalled) {
-		hookParts.push("3 Git");
+		hookParts.push(`${s.prePushHookInstalled ? 5 : 4} Git`);
 	}
 	if (s.claudeHookInstalled) {
 		hookParts.push("2 Claude");
@@ -133,8 +133,10 @@ function buildFullStatusItems(
 		? `${s.hookSource}${s.hookVersion && s.hookVersion !== "unknown" ? `@${s.hookVersion}` : ""}`
 		: undefined;
 
+	const gitHookCount = s.gitHookInstalled ? (s.prePushHookInstalled ? 5 : 4) : 0;
+	const gitHookList = `post-commit, post-rewrite, prepare-commit-msg, post-merge${s.prePushHookInstalled ? ", pre-push" : ""}`;
 	const hooksTooltipLines = [
-		`Git hooks: ${s.gitHookInstalled ? "3 installed" : "not installed"} (post-commit, post-rewrite, prepare-commit-msg)`,
+		`Git hooks: ${gitHookCount > 0 ? `${gitHookCount} installed` : "not installed"} (${gitHookList})`,
 		`Claude Code hooks: ${s.claudeHookInstalled ? "2 installed" : "not installed"} (Stop, SessionStart)`,
 		`Gemini CLI hook: ${s.geminiHookInstalled ? "installed" : "not installed"} (AfterAgent)`,
 	];

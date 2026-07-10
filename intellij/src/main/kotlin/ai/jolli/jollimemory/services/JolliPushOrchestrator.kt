@@ -6,6 +6,7 @@ import ai.jolli.jollimemory.core.NoteFormat
 import ai.jolli.jollimemory.core.NoteReference
 import ai.jolli.jollimemory.core.PlanGrouping
 import ai.jolli.jollimemory.core.PlanReference
+import ai.jolli.jollimemory.core.PushPendingReader
 import ai.jolli.jollimemory.core.telemetry.Telemetry
 import ai.jolli.jollimemory.toolwindow.views.SummaryMarkdownBuilder
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils
@@ -79,6 +80,8 @@ object JolliPushOrchestrator {
         val readPlanFromBranch: (String) -> String?,
         /** Reads a note body from the orphan branch. */
         val readNoteBody: (String) -> String?,
+        /** Reads a summary by its original commit hash for delayed orphan cleanup. */
+        val readSummary: (String) -> CommitSummary? = { null },
         /** Opens the binding chooser and reports the outcome. */
         val resolveBinding: (String) -> BindingOutcome,
     )
@@ -141,9 +144,46 @@ object JolliPushOrchestrator {
             )
             ctx.storeSummary(updatedSummary, true)
 
+            var summaryForCleanup = updatedSummary
+            val unresolvedHashes = summary.unresolvedOrphanHashes ?: emptyList()
+            if (unresolvedHashes.isNotEmpty()) {
+                // Conservative retention: mirrors the TS port. Any hash that
+                // cannot be positively resolved to a docId is retained so a
+                // worker that crashed post-network-push does not leave an
+                // orphan Space article un-referenced. The push-pending file is
+                // consulted only for the in-flight log counter.
+                val pendingHashes = PushPendingReader.loadHashes(ctx.workspaceRoot)
+                val resolvedDocIds = ArrayList<Int>()
+                val remainingHashes = ArrayList<String>()
+                var stillInFlight = 0
+                for (hash in unresolvedHashes) {
+                    val fresh = ctx.readSummary(hash)
+                    if (fresh?.commitHash == hash && fresh.jolliDocId != null) {
+                        resolvedDocIds.add(fresh.jolliDocId)
+                    } else {
+                        remainingHashes.add(hash)
+                        if (pendingHashes != null && hash in pendingHashes) stillInFlight++
+                    }
+                }
+                if (resolvedDocIds.isNotEmpty() || remainingHashes.size != unresolvedHashes.size) {
+                    if (resolvedDocIds.isNotEmpty()) {
+                        log.info(
+                            "Resolved ${resolvedDocIds.size} orphan hashes → docIds for cleanup " +
+                                "(${remainingHashes.size} retained, $stillInFlight still in-flight)",
+                        )
+                    }
+                    summaryForCleanup = updatedSummary.copy(
+                        orphanedDocIds = ((updatedSummary.orphanedDocIds ?: emptyList()) + resolvedDocIds)
+                            .distinct().ifEmpty { null },
+                        unresolvedOrphanHashes = remainingHashes.distinct().ifEmpty { null },
+                    )
+                    ctx.storeSummary(summaryForCleanup, true)
+                }
+            }
+
             // Clean up orphaned articles (best-effort — never surfaces as a failed push).
             val cleanedSummary = try {
-                cleanupOrphanedDocs(summary, updatedSummary, displayBase, ctx)
+                cleanupOrphanedDocs(summaryForCleanup, summaryForCleanup, displayBase, ctx)
             } catch (e: Exception) {
                 log.warn("Orphan cleanup failed after a successful push: ${e.message}")
                 null
@@ -157,7 +197,7 @@ object JolliPushOrchestrator {
                     plans = planUrls,
                     notes = noteUrls,
                 ),
-                updatedSummary = cleanedSummary ?: updatedSummary,
+                updatedSummary = cleanedSummary ?: summaryForCleanup,
                 attachmentFailures = attachmentFailures,
                 isUpdate = isUpdate,
                 attachmentCount = planUrls.size + noteUrls.size,

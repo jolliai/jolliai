@@ -186,8 +186,10 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
             commitDate = newCommitInfo.date, branch = oldSummary.branch,
             generatedAt = Instant.now().toString(), commitType = CommitType.rebase,
             jolliDocId = oldSummary.jolliDocId, jolliDocUrl = oldSummary.jolliDocUrl,
+            orphanedDocIds = oldSummary.orphanedDocIds,
+            unresolvedOrphanHashes = oldSummary.unresolvedOrphanHashes,
             plans = oldSummary.plans, e2eTestGuide = oldSummary.e2eTestGuide, recap = oldSummary.recap,
-            children = listOf(oldSummary.copy(jolliDocId = null, jolliDocUrl = null, plans = null, e2eTestGuide = null, recap = null)),
+            children = listOf(stripMergedMetadata(oldSummary)),
         )
         storeSummary(newSummary, force = true)
     }
@@ -201,10 +203,22 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
         aiProvider: String? = null,
     ) {
         val children = oldSummaries.sortedByDescending { it.commitDate }
-            .map { it.copy(jolliDocId = null, jolliDocUrl = null, plans = null, e2eTestGuide = null, recap = null) }
+            .map(::stripMergedMetadata)
         val allPlans = oldSummaries.flatMap { it.plans ?: emptyList() }
             .groupBy { it.slug }.mapNotNull { (_, p) -> p.maxByOrNull { it.updatedAt } }
         val allE2e = oldSummaries.flatMap { it.e2eTestGuide ?: emptyList() }
+        val jolliCandidates = collectJolliCandidates(oldSummaries)
+        val jolliWinner = jolliCandidates.maxWithOrNull(
+            compareBy<JolliCandidate> { it.generatedAt }.thenBy { it.commitDate },
+        )
+        val orphanedDocIds = (
+            jolliCandidates.filter { it !== jolliWinner }.map { it.docId } +
+                collectOrphanedDocIds(oldSummaries)
+            ).distinct().filter { it != jolliWinner?.docId }
+        val unresolvedOrphanHashes = (
+            oldSummaries.filter { it.jolliDocId == null }.map { it.commitHash } +
+                collectUnresolvedOrphanHashes(oldSummaries)
+            ).distinct()
 
         // Build consolidation sources from old summaries
         val sources = oldSummaries.map { s ->
@@ -296,6 +310,10 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
             commitDate = newCommitInfo.date, branch = oldSummaries.firstOrNull()?.branch ?: "unknown",
             generatedAt = Instant.now().toString(), commitType = CommitType.squash,
             plans = allPlans.takeIf { it.isNotEmpty() }, e2eTestGuide = allE2e.takeIf { it.isNotEmpty() },
+            jolliDocId = jolliWinner?.docId,
+            jolliDocUrl = jolliWinner?.docUrl,
+            orphanedDocIds = orphanedDocIds.takeIf { it.isNotEmpty() },
+            unresolvedOrphanHashes = unresolvedOrphanHashes.takeIf { it.isNotEmpty() },
             topics = mergedTopics?.takeIf { it.isNotEmpty() },
             recap = mergedRecap,
             ticketId = mergedTicketId,
@@ -423,6 +441,41 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
     }
 
     // ── Internal helpers ────────────────────────────────────────────────────
+
+    private data class JolliCandidate(
+        val docId: Int,
+        val docUrl: String,
+        val commitDate: String,
+        val generatedAt: String,
+    )
+
+    private fun collectJolliCandidates(nodes: List<CommitSummary>): List<JolliCandidate> = nodes.flatMap { node ->
+        val own = if (node.jolliDocId != null && node.jolliDocUrl != null) {
+            listOf(JolliCandidate(node.jolliDocId, node.jolliDocUrl, node.commitDate, node.generatedAt))
+        } else {
+            emptyList()
+        }
+        own + collectJolliCandidates(node.children ?: emptyList())
+    }
+
+    private fun collectOrphanedDocIds(nodes: List<CommitSummary>): List<Int> = nodes.flatMap { node ->
+        (node.orphanedDocIds ?: emptyList()) + collectOrphanedDocIds(node.children ?: emptyList())
+    }
+
+    private fun collectUnresolvedOrphanHashes(nodes: List<CommitSummary>): List<String> = nodes.flatMap { node ->
+        (node.unresolvedOrphanHashes ?: emptyList()) + collectUnresolvedOrphanHashes(node.children ?: emptyList())
+    }
+
+    private fun stripMergedMetadata(node: CommitSummary): CommitSummary = node.copy(
+        jolliDocId = null,
+        jolliDocUrl = null,
+        orphanedDocIds = null,
+        unresolvedOrphanHashes = null,
+        plans = null,
+        e2eTestGuide = null,
+        recap = null,
+        children = node.children?.map(::stripMergedMetadata),
+    )
 
     private fun flattenSummaryTree(node: CommitSummary, parentHash: String?): List<SummaryIndexEntry> {
         val treeHash = git.exec("cat-file", "-p", node.commitHash)?.let { output ->

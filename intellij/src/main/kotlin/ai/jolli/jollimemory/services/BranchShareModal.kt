@@ -85,6 +85,7 @@ object BranchShareModal {
         val storeSummary: (CommitSummary, Boolean) -> Unit,
         val readPlanFromBranch: (String) -> String?,
         val readNoteBody: (String) -> String?,
+        val readSummary: (String) -> CommitSummary? = { null },
         val resolveBinding: (String) -> JolliPushOrchestrator.BindingOutcome,
         val nowMs: Long? = null,
     )
@@ -97,6 +98,7 @@ object BranchShareModal {
             storeSummary = ctx.storeSummary,
             readPlanFromBranch = ctx.readPlanFromBranch,
             readNoteBody = ctx.readNoteBody,
+            readSummary = ctx.readSummary,
             resolveBinding = ctx.resolveBinding,
         )
 

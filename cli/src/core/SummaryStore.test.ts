@@ -775,6 +775,21 @@ describe("SummaryStore", () => {
 	});
 
 	describe("migrateOneToOne", () => {
+		it("preserves unresolved orphan hashes on a one-to-one rewrite", async () => {
+			const oldSummary: CommitSummary = {
+				...createMockSummary("oldhash", "Old message"),
+				unresolvedOrphanHashes: ["pending-child"],
+			};
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
+
+			await migrateOneToOne(oldSummary, createMockCommitInfo("newhash", "New message"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const migrated = JSON.parse(files[0].content) as CommitSummary;
+			expect(migrated.unresolvedOrphanHashes).toEqual(["pending-child"]);
+			expect(migrated.children?.[0].unresolvedOrphanHashes).toBeUndefined();
+		});
+
 		it("hoists recap from a v3 squash root's children (recap not dropped on rebase-pick)", async () => {
 			// A v3 squash root keeps its recap on children, not the root. Reading
 			// oldSummary.recap directly would drop it; resolveEffectiveRecap picks
@@ -861,7 +876,7 @@ describe("SummaryStore", () => {
 			expect(newSummaryContent.topics).toEqual(oldSummary.topics);
 			expect(newSummaryContent.stats).toBeUndefined();
 			expect(newSummaryContent.diffStats).toEqual({ filesChanged: 1, insertions: 5, deletions: 2 });
-			// Old summary preserved as the sole child, with all 8 Hoist fields stripped.
+			// Old summary preserved as the sole child, with all Hoist fields stripped.
 			expect(newSummaryContent.children).toHaveLength(1);
 			expect(newSummaryContent.children?.[0].commitHash).toBe(oldHash);
 			// Topics are now stripped from the embedded child under the unified Hoist contract.
@@ -1911,6 +1926,57 @@ describe("SummaryStore", () => {
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
 			expect(merged.orphanedDocIds).toBeUndefined();
+		});
+
+		it("should record unresolvedOrphanHashes for children without jolliDocId", async () => {
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+
+			await mergeManyToOne(
+				[createMockSummary("old1"), createMockSummary("old2")],
+				createMockCommitInfo("newhash"),
+			);
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			expect(merged.unresolvedOrphanHashes).toEqual(["old1", "old2"]);
+		});
+
+		it("carries inherited unresolved orphan hashes through a later resquash", async () => {
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+			const old1 = {
+				...createMockSummary("old1"),
+				jolliDocId: 101,
+				jolliDocUrl: "https://x.jolli.ai/articles?doc=101",
+				unresolvedOrphanHashes: ["pending-grandchild"],
+			};
+
+			await mergeManyToOne([old1, createMockSummary("old2")], createMockCommitInfo("newhash"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			expect(merged.unresolvedOrphanHashes).toEqual(["old2", "pending-grandchild"]);
+			expect(merged.children?.[0].unresolvedOrphanHashes).toBeUndefined();
+		});
+
+		it("should not record unresolvedOrphanHashes for children that have jolliDocId", async () => {
+			const s1: CommitSummary = {
+				...createMockSummary("old1"),
+				jolliDocId: 101,
+				jolliDocUrl: "https://x.jolli.ai/articles?doc=101",
+			};
+			const s2: CommitSummary = {
+				...createMockSummary("old2"),
+				jolliDocId: 102,
+				jolliDocUrl: "https://x.jolli.ai/articles?doc=102",
+			};
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+
+			await mergeManyToOne([s1, s2], createMockCommitInfo("newhash"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			expect(merged.unresolvedOrphanHashes).toBeUndefined();
+			expect(merged.orphanedDocIds).toEqual([102]);
 		});
 
 		it("should keep the existing note when a duplicate appears with an older updatedAt", async () => {

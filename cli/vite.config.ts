@@ -35,6 +35,8 @@ export default defineConfig({
 				GeminiAfterAgentHook: resolve(__dirname, "src/hooks/GeminiAfterAgentHook.ts"),
 				SessionStartHook: resolve(__dirname, "src/hooks/SessionStartHook.ts"),
 				PostMergeHook: resolve(__dirname, "src/hooks/PostMergeHook.ts"),
+				PrePushHook: resolve(__dirname, "src/hooks/PrePushHook.ts"),
+				PrePushWorker: resolve(__dirname, "src/hooks/PrePushWorker.ts"),
 				QueueWorker: resolve(__dirname, "src/hooks/QueueWorker.ts"),
 			},
 			formats: ["es"],

@@ -14,9 +14,12 @@ import java.io.File
  *   2. Git post-commit hook in .git/hooks/post-commit
  *   3. Git post-rewrite hook in .git/hooks/post-rewrite
  *   4. Git prepare-commit-msg hook in .git/hooks/prepare-commit-msg
+ *   5. Git pre-push hook in .git/hooks/pre-push (JOLLI-1900)
  *
- * The hook scripts themselves call Node.js (for AI summarization), but the
- * INSTALLATION is pure file I/O — no Node.js needed on the plugin side.
+ * The git-hook INSTALLATION is pure file I/O — no Node.js needed on the plugin
+ * side. Hooks 2–4 run via the Kotlin fat JAR; the pre-push hook (5) is the one
+ * exception — it reuses the shared Node `run-hook` dispatcher (see
+ * [prePushScript]) because the Space-sync engine has no Kotlin port.
  */
 class HookInstaller(private val projectDir: String, private val mainRepoRoot: String = projectDir) {
 
@@ -76,6 +79,8 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
         private const val POST_REWRITE_END = "# <<< JolliMemory post-rewrite hook <<<"
         private const val PREPARE_MSG_START = "# >>> JolliMemory prepare-commit-msg hook >>>"
         private const val PREPARE_MSG_END = "# <<< JolliMemory prepare-commit-msg hook <<<"
+        private const val PRE_PUSH_START = "# >>> JolliMemory pre-push hook >>>"
+        private const val PRE_PUSH_END = "# <<< JolliMemory pre-push hook <<<"
     }
 
     /** Check if Claude Code Stop hook is installed (checks main repo's .claude/). */
@@ -136,7 +141,8 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
         return isClaudeHookInstalled() &&
             isGitHookInstalled("post-commit", POST_COMMIT_START) &&
             isGitHookInstalled("post-rewrite", POST_REWRITE_START) &&
-            isGitHookInstalled("prepare-commit-msg", PREPARE_MSG_START)
+            isGitHookInstalled("prepare-commit-msg", PREPARE_MSG_START) &&
+            isGitHookInstalled("pre-push", PRE_PUSH_START)
     }
 
     /**
@@ -184,6 +190,7 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             installGitHook("post-commit", POST_COMMIT_START, POST_COMMIT_END, postCommitScript())
             installGitHook("post-rewrite", POST_REWRITE_START, POST_REWRITE_END, postRewriteScript())
             installGitHook("prepare-commit-msg", PREPARE_MSG_START, PREPARE_MSG_END, prepareMsgScript())
+            installGitHook("pre-push", PRE_PUSH_START, PRE_PUSH_END, prePushScript())
             installLog.appendLine("Git hooks installed")
 
             // Install Claude Code skill file (.claude/skills/jolli-recall/SKILL.md)
@@ -263,6 +270,7 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             removeGitHookSection("post-commit", POST_COMMIT_START, POST_COMMIT_END)
             removeGitHookSection("post-rewrite", POST_REWRITE_START, POST_REWRITE_END)
             removeGitHookSection("prepare-commit-msg", PREPARE_MSG_START, PREPARE_MSG_END)
+            removeGitHookSection("pre-push", PRE_PUSH_START, PRE_PUSH_END)
             // Mirror of enable: tear down the MCP registration via the bundled CLI
             // (best-effort, node-only). Leaves hooks/skills/dist-paths per the CLI's
             // conservative uninstall policy. Never fails the disable over this.
@@ -654,6 +662,36 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
         val jar = findHooksJar() ?: return "echo 'jollimemory-hooks.jar not found' >&2"
         val java = resolveJavaPath()
         return """"$java" -jar "$jar" prepare-commit-msg "$@""""
+    }
+
+    /**
+     * pre-push (JOLLI-1900): sync the pushed commits' memory to Jolli Space.
+     *
+     * Unlike every other IntelliJ hook, this does NOT go through the Kotlin fat
+     * JAR — the pre-push sync engine (the `push-pending.json` queue + the Jolli
+     * Space doc upload) lives only in the Node CLI, with no Kotlin port. Instead
+     * it reuses the SAME shared `run-hook` dispatcher the CLI and VS Code install
+     * (written by [CliIntegrations.enableIntegrations] → the bundled `jolli enable
+     * --integrations-only`), so IntelliJ gets byte-identical per-push behaviour via
+     * the same `PrePushHook.js` + `PrePushWorker.js` (JOLLI-1900 requirement 3 —
+     * reuse the existing push path, don't re-implement it).
+     *
+     * The absolute `run-hook` path is baked at install time (same convention as the
+     * `java -jar <jar>` paths in the other scripts). Guarded two ways so a missing
+     * dispatcher or absent Node can NEVER abort the push: the `[ -x … ]` test skips
+     * when `run-hook` isn't there (integrations not enabled / Node absent), and
+     * `|| true` swallows any non-zero exit from Jolli itself. Because this section is
+     * appended to an existing hook, it also captures the preceding command's status and
+     * restores it with a subshell exit: an existing validation failure must still abort
+     * the push, while the parent shell remains available to later appended sections.
+     */
+    private fun prePushScript(): String {
+        val runHook = File(System.getProperty("user.home"), ".jolli/jollimemory/run-hook").absolutePath
+        return """
+            __jolli_pre_push_previous_status=${'$'}?
+            if [ -x "$runHook" ]; then "$runHook" pre-push "$@" || true; fi
+            (exit "${'$'}__jolli_pre_push_previous_status")
+        """.trimIndent()
     }
 }
 

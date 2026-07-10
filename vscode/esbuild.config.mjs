@@ -86,6 +86,8 @@ const cliOptions = {
 		{ in: `${jmSrc}/hooks/QueueWorker.ts`,             out: "QueueWorker" },
 		{ in: `${jmSrc}/hooks/PostRewriteHook.ts`,         out: "PostRewriteHook" },
 		{ in: `${jmSrc}/hooks/PrepareMsgHook.ts`,          out: "PrepareMsgHook" },
+		{ in: `${jmSrc}/hooks/PrePushHook.ts`,             out: "PrePushHook" },
+		{ in: `${jmSrc}/hooks/PrePushWorker.ts`,           out: "PrePushWorker" },
 		{ in: `${jmSrc}/hooks/GeminiAfterAgentHook.ts`,   out: "GeminiAfterAgentHook" },
 		{ in: `${jmSrc}/hooks/SessionStartHook.ts`,       out: "SessionStartHook" },
 	],

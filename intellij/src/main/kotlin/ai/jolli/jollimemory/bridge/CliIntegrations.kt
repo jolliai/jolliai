@@ -303,6 +303,55 @@ object CliIntegrations {
     }
 
     /**
+     * Best-effort catch-up for the pre-push memory sync (JOLLI-1900). Spawns the
+     * bundled `PrePushWorker.js` to drain `push-pending.json` to Jolli Space. Two
+     * callers:
+     *   - plugin startup ([JolliMemoryService.initialize]) — fire-and-forget, for
+     *     commits left pending by an offline push in a previous session;
+     *   - the post-commit drain ([PostCommitHook.drainWorker], `waitForCompletion=true`)
+     *     — the IntelliJ analog of the TS `QueueWorker.triggerPushForNewSummaries`,
+     *     so a push that raced ahead of summary generation syncs as soon as the
+     *     summary lands, without waiting for the next plugin start.
+     *
+     * Cheap pre-check: returns immediately when there is no `push-pending.json`
+     * (`PushPendingStore` unlinks the file when it's empty), so the common commit —
+     * nothing pending — never pays a Node spawn.
+     *
+     * Never throws: a missing worker, absent Node, non-git dir, or offline network
+     * just leaves the pending entries for the next trigger. The worker self-no-ops
+     * when the user isn't signed in.
+     *
+     * @param waitForCompletion when true, block (bounded) until the drain worker
+     *   exits — safe here because the caller is already a detached background
+     *   process (git has returned); ensures the push finishes within the caller's
+     *   lifetime instead of orphaning the child when the JVM exits.
+     */
+    fun retryPendingPushes(projectDir: String, waitForCompletion: Boolean = false) {
+        try {
+            // Nothing pending → skip without spawning Node (the hot path for a
+            // normal commit). PushPendingStore removes the file when it's empty,
+            // so mere existence means there is at least one entry to try.
+            val pending = File(projectDir, ".jolli/jollimemory/push-pending.json")
+            if (!pending.exists() || pending.length() == 0L) return
+
+            val node = resolveNode() ?: return
+            val worker = File(distIntellijDir(), "PrePushWorker.js")
+            if (!worker.exists()) return
+            val proc = ProcessBuilder(node, worker.absolutePath, "--cwd", projectDir)
+                .directory(File(projectDir))
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start()
+            if (waitForCompletion) {
+                if (!proc.waitFor(120, TimeUnit.SECONDS)) proc.destroyForcibly()
+            }
+            log.info("Ran pre-push retry worker for %s (wait=%s)", projectDir, waitForCompletion)
+        } catch (e: Exception) {
+            log.warn("Pre-push retry spawn failed (non-fatal): %s", e.message)
+        }
+    }
+
+    /**
      * Tears down the MCP registration via `disable --integrations-only` (best-effort).
      * No-op when Node or the bundle is missing — nothing to undo that we could reach.
      */

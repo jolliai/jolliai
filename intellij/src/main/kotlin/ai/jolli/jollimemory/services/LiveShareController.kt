@@ -54,6 +54,7 @@ object LiveShareController {
         val storeSummary: (CommitSummary, Boolean) -> Unit,
         val readPlanFromBranch: (String) -> String?,
         val readNoteBody: (String) -> String?,
+        val readSummary: (String) -> CommitSummary? = { null },
         val resolveBinding: (String) -> JolliPushOrchestrator.BindingOutcome,
     )
 
@@ -222,6 +223,7 @@ object LiveShareController {
             storeSummary = deps.storeSummary,
             readPlanFromBranch = deps.readPlanFromBranch,
             readNoteBody = deps.readNoteBody,
+            readSummary = deps.readSummary,
             resolveBinding = deps.resolveBinding,
         )
 

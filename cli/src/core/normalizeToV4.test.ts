@@ -183,12 +183,14 @@ describe("normalizeToV4", () => {
 					commitHash: "c1",
 					version: 3,
 					orphanedDocIds: [2, 3],
+					unresolvedOrphanHashes: ["pending-child"],
 					children: [
 						{
 							...baseNode,
 							commitHash: "g1",
 							version: 3,
 							orphanedDocIds: [4],
+							unresolvedOrphanHashes: ["pending-grandchild"],
 						},
 					],
 				},
@@ -196,6 +198,8 @@ describe("normalizeToV4", () => {
 		} as CommitSummary;
 		const normalized = normalizeToV4(v3WithChildOrphans);
 		expect(new Set(normalized.orphanedDocIds ?? [])).toEqual(new Set([1, 2, 3, 4]));
+		expect(normalized.unresolvedOrphanHashes).toEqual(["pending-child", "pending-grandchild"]);
+		expect(normalized.children?.[0].unresolvedOrphanHashes).toBeUndefined();
 	});
 
 	it("dedups duplicated plans (by slug) by picking the newest updatedAt", () => {

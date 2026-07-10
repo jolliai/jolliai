@@ -72,6 +72,7 @@ object ShareContextFactory {
             storeSummary = { s, _ -> store.storeSummary(s, force = true) },
             readPlanFromBranch = { slug -> store.readPlanFromBranch(slug) },
             readNoteBody = { id -> service?.readArchivedNote(id) },
+            readSummary = { hash -> store.getSummary(hash) },
             resolveBinding = { repoUrl -> resolveBindingViaChooser(project, repoUrl, keyMeta?.u, apiKey) },
             nowMs = System.currentTimeMillis(),
         )

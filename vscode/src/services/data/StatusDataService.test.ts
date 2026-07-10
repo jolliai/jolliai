@@ -40,14 +40,14 @@ describe("StatusDataService.derive", () => {
 			geminiHookInstalled: true,
 		});
 		const derived = StatusDataService.derive(status, null);
-		expect(derived.hooksDescription).toBe("3 Git + 2 Claude + 1 Gemini CLI");
+		expect(derived.hooksDescription).toBe("4 Git + 2 Claude + 1 Gemini CLI");
 		expect(derived.allHooksInstalled).toBe(true);
 	});
 
 	it("reports only some hooks when partial", () => {
 		const status = makeStatus({ gitHookInstalled: true });
 		const derived = StatusDataService.derive(status, null);
-		expect(derived.hooksDescription).toBe("3 Git");
+		expect(derived.hooksDescription).toBe("4 Git");
 		expect(derived.allHooksInstalled).toBe(true);
 	});
 

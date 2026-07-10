@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.settings
 
+import ai.jolli.jollimemory.bridge.CliIntegrations
 import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliAuthService
@@ -108,6 +109,18 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
                         SwingUtilities.invokeLater {
                             loadFromConfig()
                             updateAccountUI()
+                        }
+                        // Pre-push sync catch-up (JOLLI-1900): drain any commits
+                        // left in push-pending.json from pushes made while signed
+                        // out. Mirrors VS Code's post-login retry in Extension.ts.
+                        val basePath = project.getService(
+                            ai.jolli.jollimemory.services.JolliMemoryService::class.java
+                        ).mainRepoRoot ?: project.basePath
+                        if (basePath != null) {
+                            com.intellij.openapi.application.ApplicationManager
+                                .getApplication().executeOnPooledThread {
+                                    CliIntegrations.retryPendingPushes(basePath)
+                                }
                         }
                     },
                     onError = { msg ->

@@ -1522,6 +1522,7 @@ describe("QueueWorker", () => {
 				jolliDocId: 42,
 				jolliDocUrl: "https://jolli.app/d/42",
 				orphanedDocIds: [1, 2],
+				unresolvedOrphanHashes: ["pending-child"],
 				plans: [{ slug: "p", title: "P", addedAt: "x", updatedAt: "y" }],
 				notes: [{ id: "n", title: "N", format: "markdown" as const, addedAt: "x", updatedAt: "y" }],
 				e2eTestGuide: [{ title: "T", steps: ["s"], expectedResults: ["r"] }],
@@ -1530,6 +1531,7 @@ describe("QueueWorker", () => {
 			expect(out.jolliDocId).toBe(42);
 			expect(out.jolliDocUrl).toBe("https://jolli.app/d/42");
 			expect(out.orphanedDocIds).toEqual([1, 2]);
+			expect(out.unresolvedOrphanHashes).toEqual(["pending-child"]);
 			expect(out.plans).toHaveLength(1);
 			expect(out.notes).toHaveLength(1);
 			expect(out.e2eTestGuide).toHaveLength(1);

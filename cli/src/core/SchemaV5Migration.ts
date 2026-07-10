@@ -408,7 +408,8 @@ async function migrateSchemaToV5Locked(
  *
  * v3 → v4: delegated to `normalizeToV4`, now lossless (preserves topics,
  *          recap, plans, notes, linearIssues, e2eTestGuide, jolliDoc fields,
- *          orphanedDocIds, and migrates legacy `stats` to `diffStats`).
+ *          orphanedDocIds, unresolvedOrphanHashes, and migrates legacy
+ *          `stats` to `diffStats`).
  *
  * v4 → v5: stamp `version: 5` and compute the transcripts array. We
  *          enumerate every commit hash in the (already-v4) tree via

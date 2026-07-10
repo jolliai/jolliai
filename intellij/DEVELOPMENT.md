@@ -78,6 +78,7 @@ These hooks track which AI sessions are active. They only record session metadat
 | **prepare-commit-msg** | Before commit | Detects squash/amend scenarios and writes pending files for the Worker |
 | **post-commit** | After commit | Spawns a background Worker that reads transcripts + diff, calls the LLM, and writes the summary to the orphan branch |
 | **post-rewrite** | After rebase/amend | Migrates existing summaries to match new commit hashes (1:1 hash remapping) |
+| **pre-push** | Before push | Syncs the pushed commits' memory to Jolli Space. **Does not use the Kotlin JAR**: the sync engine (`push-pending.json` queue + Space doc upload) lives only in the Node CLI, so this hook reuses the shared `run-hook pre-push` dispatcher (written by `enableIntegrations` → bundled `jolli enable --integrations-only`), guarded so a missing dispatcher / absent Node never aborts the push. `CliIntegrations.retryPendingPushes` drains any pending commits for catch-up — from both plugin startup (offline pushes) and the **post-commit drain's tail** (blocking), so a push that raced ahead of summary generation syncs once the summary lands, without a restart (the Kotlin QueueWorker's analog of the TS `triggerPushForNewSummaries`). |
 
 Summaries are stored in a git orphan branch (`jollimemory/summaries/v3`) using a v3 tree format.
 

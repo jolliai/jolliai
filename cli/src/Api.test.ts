@@ -765,7 +765,7 @@ describe("CLI", () => {
 				calls.some(
 					(s) =>
 						s.includes("Hooks:") &&
-						s.includes("3 Git") &&
+						s.includes("4 Git") &&
 						s.includes("2 Claude") &&
 						s.includes("1 Gemini CLI"),
 				),

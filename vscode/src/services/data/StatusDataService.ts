@@ -27,7 +27,7 @@ export class StatusDataService {
 	): StatusDerived {
 		const parts: Array<string> = [];
 		if (status?.gitHookInstalled) {
-			parts.push("3 Git");
+			parts.push(`${status.prePushHookInstalled ? 5 : 4} Git`);
 		}
 		if (status?.claudeHookInstalled) {
 			parts.push("2 Claude");

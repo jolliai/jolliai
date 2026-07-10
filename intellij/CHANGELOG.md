@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.99.6
+
+### New Features
+
+- **Auto-sync on push** — `git push` now automatically syncs the pushed commits' summaries to your Jolli Space in the background. The pre-push hook is lightweight (config read, stdin parse, one JSON write, spawn) and never blocks the push; the actual network sync runs in a detached worker. Failed syncs are retried on the next push, after the queue worker finishes a post-commit drain, and each time the IDE or CLI activates — so nothing is lost even if the network is flaky. Opt out with `syncOnPush: false` in config.
+
+### Fixes & Improvements
+
+- Stale push-pending entries are pruned automatically after 7 days, keeping the state directory clean between pushes
+
 ## 0.99.5
 
 ### New Features

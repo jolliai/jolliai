@@ -70,15 +70,18 @@ import {
 	installGitHook,
 	installPostMergeHook,
 	installPostRewriteHook,
+	installPrePushHook,
 	installPrepareMsgHook,
 	isGitHookInstalled,
 	isHookSectionInstalled,
 	POST_MERGE_MARKER_START,
 	POST_REWRITE_MARKER_START,
+	PRE_PUSH_MARKER_START,
 	PREPARE_MSG_MARKER_START,
 	removeGitHook,
 	removePostMergeHook,
 	removePostRewriteHook,
+	removePrePushHook,
 	removePrepareMsgHook,
 } from "./GitHookInstaller.js";
 import {
@@ -386,6 +389,7 @@ export async function install(
 		let postRewriteResult: HookOpResult = {};
 		let prepareMsgResult: HookOpResult = {};
 		let postMergeResult: HookOpResult = {};
+		let prePushResult: HookOpResult = {};
 		if (!integrationsOnly) {
 			gitResult = await installGitHook(projectDir);
 			if (gitResult.warning) {
@@ -408,6 +412,12 @@ export async function install(
 			postMergeResult = await installPostMergeHook(projectDir);
 			if (postMergeResult.warning) {
 				warnings.push(postMergeResult.warning);
+			}
+
+			// Install Git pre-push hook (auto-syncs pushed commits' memory to Jolli Space)
+			prePushResult = await installPrePushHook(projectDir);
+			if (prePushResult.warning) {
+				warnings.push(prePushResult.warning);
 			}
 		}
 
@@ -519,6 +529,7 @@ export async function install(
 			postRewriteHookPath: postRewriteResult.path,
 			prepareMsgHookPath: prepareMsgResult.path,
 			postMergeHookPath: postMergeResult.path,
+			prePushHookPath: prePushResult.path,
 			geminiSettingsPath,
 		};
 		/* v8 ignore start -- defensive: internal functions handle their own errors */
@@ -708,6 +719,7 @@ export async function uninstall(cwd?: string, options?: { integrationsOnly?: boo
 		await removePostRewriteHook(projectDir);
 		await removePrepareMsgHook(projectDir);
 		await removePostMergeHook(projectDir);
+		await removePrePushHook(projectDir);
 
 		// Conservative skill-cleanup policy: leave the generated SKILL.md files
 		// AND the `.git/info/exclude` block alone. Users sometimes ship their
@@ -762,6 +774,7 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		(await isHookSectionInstalled(projectDir, "post-rewrite", POST_REWRITE_MARKER_START)) &&
 		(await isHookSectionInstalled(projectDir, "prepare-commit-msg", PREPARE_MSG_MARKER_START)) &&
 		(await isHookSectionInstalled(projectDir, "post-merge", POST_MERGE_MARKER_START));
+	const prePushHookInstalled = await isHookSectionInstalled(projectDir, "pre-push", PRE_PUSH_MARKER_START);
 	const sessions = await loadAllSessions(projectDir);
 	const branchExists = await orphanBranchExists(ORPHAN_BRANCH, projectDir);
 	const summaryCount = branchExists ? await getSummaryCount(projectDir, storage) : 0;
@@ -920,6 +933,7 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		enabled: gitHookInstalled,
 		claudeHookInstalled,
 		gitHookInstalled,
+		prePushHookInstalled,
 		geminiHookInstalled,
 		worktreeHooksInstalled,
 		activeSessions: allEnabledSessions.length,

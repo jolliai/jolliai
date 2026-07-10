@@ -723,6 +723,8 @@ vi.mock("../../cli/src/core/MigrationEngine.js", () => ({
 
 vi.mock("../../cli/src/Logger.js", () => ({
 	ORPHAN_BRANCH: "jollimemory",
+	JOLLI_DIR: ".jolli",
+	JOLLIMEMORY_DIR: "jollimemory",
 	createLogger: vi.fn(() => ({
 		info: vi.fn(),
 		warn: vi.fn(),
@@ -730,6 +732,8 @@ vi.mock("../../cli/src/Logger.js", () => ({
 		debug: vi.fn(),
 	})),
 	getJolliMemoryDir: vi.fn((cwd: string) => `${cwd}/.jolli/jollimemory`),
+	errMsg: vi.fn((err: unknown) => (err instanceof Error ? err.message : String(err))),
+	isEnoent: vi.fn((err: unknown) => (err as NodeJS.ErrnoException)?.code === "ENOENT"),
 }));
 
 vi.mock("../../cli/src/backfill/BackfillEngine.js", () => ({

@@ -398,9 +398,8 @@ async function migrateOneToOneLocked(
 	);
 
 	// Wrap the old summary as a child rather than replacing its hash.
-	// stripFunctionalMetadata strips all 9 Hoist fields (the original 8 plus
-	// the Linear-issues field added when that integration shipped) so the
-	// root is solely authoritative.
+	// stripFunctionalMetadata strips all 10 Hoist fields, including delayed
+	// orphan cleanup hashes, so the root is solely authoritative.
 	const strippedOld = stripFunctionalMetadata(oldSummary);
 	const docUrl = oldSummary.jolliDocUrl;
 
@@ -442,6 +441,7 @@ async function migrateOneToOneLocked(
 		...(oldSummary.jolliDocId && { jolliDocId: oldSummary.jolliDocId }),
 		...(docUrl && { jolliDocUrl: docUrl }),
 		...(oldSummary.orphanedDocIds && { orphanedDocIds: oldSummary.orphanedDocIds }),
+		...(oldSummary.unresolvedOrphanHashes && { unresolvedOrphanHashes: oldSummary.unresolvedOrphanHashes }),
 		...(oldSummary.plans && { plans: oldSummary.plans }),
 		...(oldSummary.notes && { notes: oldSummary.notes }),
 		// References — same Copy-Hoist treatment as plans / notes. Without this
@@ -630,7 +630,7 @@ export function collectChildReferences(nodes: ReadonlyArray<CommitSummary>): Rea
 
 /** Returns a deep copy of the summary tree with Jolli metadata stripped from all nodes. */
 function stripJolliMetadata(node: CommitSummary): CommitSummary {
-	const { jolliDocId: _d, jolliDocUrl: _u, orphanedDocIds: _o, ...rest } = node;
+	const { jolliDocId: _d, jolliDocUrl: _u, orphanedDocIds: _o, unresolvedOrphanHashes: _h, ...rest } = node;
 	if (!rest.children) return rest as CommitSummary;
 	return { ...rest, children: rest.children.map(stripJolliMetadata) } as CommitSummary;
 }
@@ -701,6 +701,16 @@ function collectDescendantOrphanedDocIds(children: ReadonlyArray<CommitSummary> 
 	return ids;
 }
 
+/** Recursively collects unresolved article hashes already queued on descendants. */
+function collectDescendantUnresolvedOrphanHashes(children: ReadonlyArray<CommitSummary> | undefined): string[] {
+	const hashes: string[] = [];
+	for (const child of children ?? []) {
+		if (child.unresolvedOrphanHashes) hashes.push(...child.unresolvedOrphanHashes);
+		hashes.push(...collectDescendantUnresolvedOrphanHashes(child.children));
+	}
+	return hashes;
+}
+
 /**
  * Pure in-memory v3 → v4 (unified Hoist) normalization. No I/O — caller
  * persists the result via storeSummary if it wants the migration to stick.
@@ -710,7 +720,7 @@ function collectDescendantOrphanedDocIds(children: ReadonlyArray<CommitSummary> 
  *   - version: 4
  *   - root holds the authoritative Copy-Hoist fields (plans / notes /
  *     references / e2eTestGuide / jolliDocId / jolliDocUrl /
- *     orphanedDocIds), unioned across the whole tree via the same
+ *     orphanedDocIds / unresolvedOrphanHashes), unioned across the whole tree via the same
  *     `collectChild*` helpers
  *   - root holds authoritative `topics` and `recap` collected from the
  *     entire tree via `resolveEffectiveTopics` / `resolveEffectiveRecap`
@@ -752,6 +762,12 @@ export function normalizeToV4(summary: CommitSummary): CommitSummary {
 			...jolliMeta.orphanedDocIds,
 			...(summary.orphanedDocIds ?? []),
 			...collectDescendantOrphanedDocIds(summary.children),
+		]),
+	);
+	const allUnresolvedOrphanHashes = Array.from(
+		new Set<string>([
+			...(summary.unresolvedOrphanHashes ?? []),
+			...collectDescendantUnresolvedOrphanHashes(summary.children),
 		]),
 	);
 
@@ -801,6 +817,7 @@ export function normalizeToV4(summary: CommitSummary): CommitSummary {
 				}
 			: {}),
 		...(allOrphanedDocIds.length > 0 ? { orphanedDocIds: allOrphanedDocIds } : {}),
+		...(allUnresolvedOrphanHashes.length > 0 ? { unresolvedOrphanHashes: allUnresolvedOrphanHashes } : {}),
 		...(summary.children !== undefined ? { children: summary.children.map(stripFunctionalMetadata) } : {}),
 	};
 }
@@ -951,11 +968,11 @@ export function expandSourcesForConsolidation(oldSummary: CommitSummary): Readon
 }
 
 /**
- * Strips all 9 Hoist-managed fields from a summary node and its descendants.
+ * Strips all 10 Hoist-managed fields from a summary node and its descendants.
  *
- * Hoist family (9 fields):
- *   - Copy-Hoist (7): jolliDocId, jolliDocUrl, orphanedDocIds, plans, notes,
- *                    references, e2eTestGuide
+ * Hoist family (10 fields):
+ *   - Copy-Hoist (8): jolliDocId, jolliDocUrl, orphanedDocIds,
+ *                    unresolvedOrphanHashes, plans, notes, references, e2eTestGuide
  *   - Consolidate-Hoist (2): topics, recap
  *
  * `version` is intentionally NOT stripped -- it's an identity field, like
@@ -1046,6 +1063,18 @@ async function mergeManyToOneLocked(
 	const jolliMeta = collectChildJolliMeta(children);
 	const inheritedOrphanIds = children.flatMap((c) => c.orphanedDocIds ?? []);
 	const allOrphanedDocIds = [...jolliMeta.orphanedDocIds, ...inheritedOrphanIds];
+
+	// Children without jolliDocId may have been pushed to Space by a
+	// concurrent PrePushWorker that hasn't written back the docId yet (race).
+	// Record their hashes so pushSummary can resolve them at push time and
+	// clean up the orphaned Space articles.
+	const unresolvedOrphanHashes = Array.from(
+		new Set<string>([
+			...children.filter((child) => !child.jolliDocId).map((child) => child.commitHash),
+			...collectDescendantUnresolvedOrphanHashes(children),
+		]),
+	);
+
 	const strippedChildren = children.map(stripFunctionalMetadata);
 
 	// Compute the real `git diff {squashHash}^..{squashHash}` for the persisted
@@ -1099,6 +1128,7 @@ async function mergeManyToOneLocked(
 		...(hoistedReferences.length > 0 && { references: hoistedReferences }),
 		...(jolliMeta.winner && { jolliDocId: jolliMeta.winner.jolliDocId, jolliDocUrl: jolliMeta.winner.jolliDocUrl }),
 		...(allOrphanedDocIds.length > 0 && { orphanedDocIds: allOrphanedDocIds }),
+		...(unresolvedOrphanHashes.length > 0 && { unresolvedOrphanHashes }),
 		topics: consolidatedTopics,
 		...(consolidatedRecap && { recap: consolidatedRecap }),
 		// v5 contract: always present, even if empty (see migrateOneToOne note).
@@ -1140,11 +1170,12 @@ async function mergeManyToOneLocked(
 	const store = resolveStorage(storage, cwd);
 	await store.writeFiles(files, `Merge summaries [${oldHashesStr}] → ${newCommitInfo.hash.substring(0, 8)}`);
 	log.info(
-		"Summaries merged: [%s] → %s (%d children, %d orphaned docs)",
+		"Summaries merged: [%s] → %s (%d children, %d orphaned docs, %d unresolved orphan hashes)",
 		oldHashesStr,
 		newCommitInfo.hash.substring(0, 8),
 		children.length,
 		allOrphanedDocIds.length,
+		unresolvedOrphanHashes.length,
 	);
 	return { orphanedDocIds: allOrphanedDocIds };
 }
