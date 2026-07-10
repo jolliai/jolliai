@@ -11,14 +11,16 @@
  *      (QueueWorker, PlansTreeProvider, SelectAllSelection) treat it as
  *      "user unchecked these" — do not change what it returns.
  *
- *   2. AI suggestion (`aiSuggestedExclude` + `changeFingerprint`) — the
- *      relevance ranker's soft-exclude list with a per-item reason, written
- *      by the pre-commit Review panel so the post-commit QueueWorker can reuse
- *      it when the fingerprint matches (otherwise QueueWorker recomputes). The
- *      user dismisses a single AI suggestion via `removeAiExclusion` (drops that
- *      entry so the item lands normally). There is NO separate "user include"
- *      layer — dismissing edits this list directly, so a dismiss is a per-change
- *      (non-persistent across a re-rank) override, which is the intended model.
+ *   2. AI relevance layer (`aiRelevance` + `changeFingerprint`) — the relevance
+ *      ranker's FULL per-item verdict list (tier + reason + the AI's exclude
+ *      decision, one entry per ranked item), written by the pre-commit Review
+ *      panel so the post-commit QueueWorker can reuse it when the fingerprint
+ *      matches (otherwise QueueWorker recomputes). The user vetoes a single AI
+ *      exclusion via `dismissAiExclusion`, which sets that entry's `dismissed`
+ *      flag — the AI's original judgment is never rewritten, so nothing is
+ *      lost. There is NO separate "user include" layer; a dismiss is a
+ *      per-change (non-persistent across a re-rank) override, which is the
+ *      intended model.
  *
  * Version stays at 2 ON PURPOSE. Bumping to 3 would make an older CLI/extension
  * reader (which hard-rejects unknown versions and returns an empty set) silently
@@ -28,17 +30,19 @@
  * fields are written only when non-empty so the file shape is unchanged for
  * users who never touch the AI-relevance feature.
  *
- * Sticky semantics: entries persist until explicitly changed by the user. The
- * QueueWorker only READS this file; it never writes AI results back here (it
- * writes the audit trail to CommitSummary.excludedContext instead), which keeps
- * a cross-process file lock unnecessary.
+ * Sticky semantics: entries persist until explicitly changed by the user (or
+ * consumed: the QueueWorker clears the AI layer post-commit via
+ * clearAiSelection; all writes serialize under withCommitSelectionLock).
  *
  * Schema versions (all read at version 2):
  *   - v1: { conversations, plans, notes } (references migrates to empty)
  *   - v2: + references
- *   - v2+ (this file): + optional aiSuggestedExclude / changeFingerprint.
- *         Transparent to older readers. (A legacy `userIncluded` key from an
- *         earlier build is ignored on read and dropped on the next write.)
+ *   - v2+ (this file): + optional aiRelevance / changeFingerprint.
+ *         Transparent to older readers. (Legacy `userIncluded` /
+ *         `aiSuggestedExclude` / `aiRelevanceResults` keys from earlier builds
+ *         of this in-development feature are ignored on read and dropped on the
+ *         next write — this file is a short-lived local relay, so the sole cost
+ *         is one fallback re-rank.)
  */
 
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
@@ -62,19 +66,46 @@ export interface CommitExclusions {
 	readonly references: ReadonlySet<string>;
 }
 
-/** One AI-suggested soft-exclusion with its reason (panel reuse by the worker). No
- *  score: the LLM's numeric score lives only in the panel's in-process relevanceCache
- *  (surfaced as the tier); the worker only needs kind/key/reason to reconstruct the
- *  exclude set, so persisting a score here was dead weight (always written as 0). */
-export interface AiExclusion {
+/**
+ * One ranked item's full AI relevance verdict — tier + one-line reason + the
+ * AI's soft-exclude decision. ONE list carries the whole ranking (kept and
+ * excluded alike), which removes the alignment/lifecycle drift an earlier
+ * two-list shape (separate exclude list + verdict list) suffered from. This is
+ * what lets the QueueWorker's fingerprint-reuse path rebuild the full decision
+ * — effective exclude set AND kept items' tier/reason for
+ * `CommitSummary.contextRelevance` — without re-running the LLM.
+ *
+ * Two independent facts, two fields, each with a single writer:
+ * - `excluded` — the AI's ORIGINAL judgment. Written once by the ranking,
+ *   never rewritten (a dismiss must not erase what the AI concluded).
+ * - `dismissed` — the user's veto of that exclusion (the panel/sidebar
+ *   "Include" / "+" action). Only meaningful when `excluded` is true.
+ * The effective exclude decision is `isEffectivelyExcluded` (excluded &&
+ * !dismissed). Nothing is ever lost: the AI's tier + reason survive a dismiss,
+ * and "AI suggested excluding this but the user kept it" stays reconstructable.
+ *
+ * No score: the LLM's numeric score is uncalibrated display noise; the
+ * rank-derived tier is the surfaced signal.
+ */
+export interface AiRelevanceEntry {
 	readonly kind: ExclusionKind;
 	readonly key: string;
+	readonly tier: "high" | "mid" | "low";
 	readonly reason: string;
+	/** The AI's original soft-exclude judgment — never rewritten. */
+	readonly excluded: boolean;
+	/** User veto of the exclusion (Include / "+"). Absent = false. */
+	readonly dismissed?: boolean;
+}
+
+/** The effective exclude decision: AI excluded it AND the user has not vetoed. */
+export function isEffectivelyExcluded(e: AiRelevanceEntry): boolean {
+	return e.excluded && e.dismissed !== true;
 }
 
 /** The AI-relevance layer read back for reuse by the QueueWorker / panel. */
 export interface AiSelection {
-	readonly aiExcluded: ReadonlyArray<AiExclusion>;
+	readonly aiRelevance: ReadonlyArray<AiRelevanceEntry>;
 	readonly changeFingerprint?: string;
 }
 
@@ -84,7 +115,7 @@ interface PersistedShape {
 	readonly notes: readonly string[];
 	readonly plans: readonly string[];
 	readonly references: readonly string[];
-	readonly aiSuggestedExclude?: readonly AiExclusion[];
+	readonly aiRelevance?: readonly AiRelevanceEntry[];
 	readonly changeFingerprint?: string;
 }
 
@@ -105,10 +136,11 @@ function asStringArray(v: unknown): readonly string[] {
 	return v.filter((x): x is string => typeof x === "string");
 }
 
-function asAiExclusions(v: unknown): readonly AiExclusion[] {
+function asAiRelevanceEntries(v: unknown): readonly AiRelevanceEntry[] {
 	if (!Array.isArray(v)) return [];
 	const kinds = new Set<ExclusionKind>(["conversations", "plans", "notes", "references"]);
-	const out: AiExclusion[] = [];
+	const tiers = new Set(["high", "mid", "low"]);
+	const out: AiRelevanceEntry[] = [];
 	for (const x of v) {
 		if (x === null || typeof x !== "object") continue;
 		const o = x as Record<string, unknown>;
@@ -116,10 +148,19 @@ function asAiExclusions(v: unknown): readonly AiExclusion[] {
 			typeof o.kind === "string" &&
 			kinds.has(o.kind as ExclusionKind) &&
 			typeof o.key === "string" &&
-			typeof o.reason === "string"
+			typeof o.tier === "string" &&
+			tiers.has(o.tier) &&
+			typeof o.reason === "string" &&
+			typeof o.excluded === "boolean"
 		) {
-			// Extract only kind/key/reason — a legacy `score` from an older file is dropped.
-			out.push({ kind: o.kind as ExclusionKind, key: o.key, reason: o.reason });
+			out.push({
+				kind: o.kind as ExclusionKind,
+				key: o.key,
+				tier: o.tier as AiRelevanceEntry["tier"],
+				reason: o.reason,
+				excluded: o.excluded,
+				...(o.dismissed === true ? { dismissed: true } : {}),
+			});
 		}
 	}
 	return out;
@@ -157,16 +198,18 @@ async function readPersisted(projectDir: string): Promise<PersistedShape> {
 		log.warn("readPersisted version mismatch (got %s) — ignoring file", String(parsed.version));
 		return empty;
 	}
-	// A legacy `userIncluded` key (from an earlier build) is intentionally not read
-	// — the dismiss model edits aiSuggestedExclude directly, so it's simply dropped
-	// on the next write.
+	// Legacy keys from earlier builds of this in-development feature —
+	// `userIncluded`, `aiSuggestedExclude`, `aiRelevanceResults` — are
+	// intentionally not read: this file is a short-lived local relay (cleared by
+	// the worker after each commit), so the sole cost is one fingerprint miss →
+	// one fallback re-rank. They're simply dropped on the next write.
 	return {
 		version: SELECTION_VERSION,
 		conversations: asStringArray(parsed.conversations),
 		notes: asStringArray(parsed.notes),
 		plans: asStringArray(parsed.plans),
 		references: asStringArray(parsed.references),
-		...(parsed.aiSuggestedExclude ? { aiSuggestedExclude: asAiExclusions(parsed.aiSuggestedExclude) } : {}),
+		...(parsed.aiRelevance ? { aiRelevance: asAiRelevanceEntries(parsed.aiRelevance) } : {}),
 		...(typeof parsed.changeFingerprint === "string" ? { changeFingerprint: parsed.changeFingerprint } : {}),
 	};
 }
@@ -182,11 +225,11 @@ export async function readExclusions(projectDir: string): Promise<CommitExclusio
 	};
 }
 
-/** Reads the AI-relevance layer (AI exclude suggestions + change fingerprint). */
+/** Reads the AI-relevance layer (the full per-item ranking + change fingerprint). */
 export async function readAiSelection(projectDir: string): Promise<AiSelection> {
 	const p = await readPersisted(projectDir);
 	return {
-		aiExcluded: p.aiSuggestedExclude ?? [],
+		aiRelevance: p.aiRelevance ?? [],
 		...(p.changeFingerprint !== undefined ? { changeFingerprint: p.changeFingerprint } : {}),
 	};
 }
@@ -200,9 +243,7 @@ function serializePersisted(p: PersistedShape): PersistedShape {
 		plans: p.plans,
 		notes: p.notes,
 		references: p.references,
-		...(p.aiSuggestedExclude && p.aiSuggestedExclude.length > 0
-			? { aiSuggestedExclude: p.aiSuggestedExclude }
-			: {}),
+		...(p.aiRelevance && p.aiRelevance.length > 0 ? { aiRelevance: p.aiRelevance } : {}),
 		...(p.changeFingerprint ? { changeFingerprint: p.changeFingerprint } : {}),
 	};
 }
@@ -280,52 +321,65 @@ export async function setAllExcluded(
 }
 
 /**
- * Dismisses one AI soft-exclude suggestion: removes the matching (kind, key) entry
- * from `aiSuggestedExclude` so the item lands normally in the summary. This is the
- * whole "user overrides the AI" mechanism — there is no separate persistent include
- * layer; the user edits the AI list directly. Preserves the rest of the list + the
- * change fingerprint so the QueueWorker's fingerprint reuse still holds.
+ * Records the user's veto of one AI soft-exclusion (the panel/sidebar "Include" /
+ * "+" action): sets `dismissed: true` on the matching (kind, key) entry so it is
+ * no longer EFFECTIVELY excluded, while the AI's original judgment — `excluded`,
+ * tier, reason — stays intact (nothing is lost; the item lands in the summary
+ * with its original verdict attached). There is no separate persistent include
+ * layer; the veto is a flag on the ranking itself. Idempotent; preserves the
+ * rest of the list + the change fingerprint so the QueueWorker's fingerprint
+ * reuse still holds.
  */
-export async function removeAiExclusion(projectDir: string, kind: ExclusionKind, key: string): Promise<void> {
+export async function dismissAiExclusion(projectDir: string, kind: ExclusionKind, key: string): Promise<void> {
 	return serialize(projectDir, async () => {
 		const p = await readPersisted(projectDir);
-		const filtered = (p.aiSuggestedExclude ?? []).filter((e) => !(e.kind === kind && e.key === key));
-		await writePersisted(projectDir, { ...p, aiSuggestedExclude: filtered });
+		const updated = (p.aiRelevance ?? []).map((e) =>
+			e.kind === kind && e.key === key ? { ...e, dismissed: true } : e,
+		);
+		await writePersisted(projectDir, { ...p, aiRelevance: updated });
 	});
 }
 
 /**
- * Writes the AI suggestion layer (soft-exclude list + change fingerprint) for the
- * QueueWorker to reuse when its fingerprint matches. Called by the pre-commit panel.
- * (The worker doesn't call THIS one, but it DOES clear the layer post-consume via
- * clearAiSelection — both go through withCommitSelectionLock.) Passing an empty list
- * and no fingerprint clears the layer.
+ * Writes the AI-relevance layer (the full per-item ranking + change fingerprint)
+ * for the QueueWorker to reuse when its fingerprint matches. Called by the
+ * pre-commit panel. (The worker doesn't call THIS one, but it DOES clear the
+ * layer post-consume via clearAiSelection — both go through
+ * withCommitSelectionLock.) Passing an empty list and no fingerprint clears the
+ * layer. Entries carry EVERY ranked item's tier + reason + exclude decision —
+ * the single source for both the effective exclude set and
+ * CommitSummary.contextRelevance on the reuse path.
  */
 export async function writeAiSelection(
 	projectDir: string,
-	aiExcluded: readonly AiExclusion[],
+	aiRelevance: readonly AiRelevanceEntry[],
 	changeFingerprint?: string,
 ): Promise<void> {
 	return serialize(projectDir, async () => {
 		const p = await readPersisted(projectDir);
 		await writePersisted(projectDir, {
 			...p,
-			aiSuggestedExclude: aiExcluded,
+			aiRelevance,
 			...(changeFingerprint !== undefined ? { changeFingerprint } : { changeFingerprint: undefined }),
 		});
 	});
 }
 
 /**
- * Clears the AI-relevance layer (aiSuggestedExclude + changeFingerprint) while keeping
- * the user manual exclude set. Called by the QueueWorker AFTER it consumes the ranking
- * for a commit, so a later commit over the SAME file set can't reuse a stale fingerprint
- * / exclude decision. Runs under withCommitSelectionLock via serialize.
+ * Clears the AI-relevance layer (aiRelevance + changeFingerprint) while keeping
+ * the user manual exclude set. Called by the QueueWorker AFTER it consumes the
+ * ranking for a commit, so a later commit over the SAME file set can't reuse a
+ * stale fingerprint / exclude decision. Runs under withCommitSelectionLock via
+ * serialize.
  */
 export async function clearAiSelection(projectDir: string): Promise<void> {
 	return serialize(projectDir, async () => {
 		const p = await readPersisted(projectDir);
-		await writePersisted(projectDir, { ...p, aiSuggestedExclude: [], changeFingerprint: undefined });
+		await writePersisted(projectDir, {
+			...p,
+			aiRelevance: [],
+			changeFingerprint: undefined,
+		});
 	});
 }
 

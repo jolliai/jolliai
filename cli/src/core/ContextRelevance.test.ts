@@ -11,12 +11,13 @@ import {
 	assessContextRelevance,
 	buildChangeBlock,
 	buildChangeSignal,
-	buildDecisionFromAiExcluded,
+	buildDecisionFromAiRelevance,
 	buildItemsBlock,
 	type ContextItem,
 	computeChangeFingerprint,
 	extractCandidateRepr,
 	extractSymbols,
+	keptContextRelevanceRefs,
 	parseRankContextResponse,
 	rankContextRelevance,
 	stripFrontmatter,
@@ -390,6 +391,80 @@ describe("assessContextRelevance", () => {
 		expect(decision.results).toEqual([]);
 		expect(decision.excludedContext).toEqual([]);
 	});
+
+	it("ranks notes and references too: kept ones land in their kind arrays with full results", async () => {
+		mockCallLlm.mockResolvedValue(
+			llmText(
+				[
+					"===ITEM===",
+					"index: 1",
+					"relevant: yes",
+					"score: 0.9",
+					"reason: note matches",
+					"===ITEM===",
+					"index: 2",
+					"relevant: yes",
+					"score: 0.8",
+					"reason: ref matches",
+				].join("\n"),
+			),
+		);
+		const note = {
+			id: "n1",
+			title: "N1",
+			format: "markdown",
+			sourcePath: "/x/n1.md",
+			addedAt: "",
+			updatedAt: "",
+			commitHash: null,
+		} as never;
+		const ref = { source: "linear", nativeId: "X-1", title: "Ref", sourcePath: "/x/r.md" } as never;
+		const decision = await assessContextRelevance(
+			{ plans: [], notes: [note], references: [ref] },
+			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [] },
+			config,
+		);
+		expect(decision.notes).toEqual([note]);
+		expect(decision.references).toEqual([ref]);
+		expect(decision.results.map((r) => `${r.kind}:${r.id}`)).toEqual(["note:n1", "reference:linear:X-1"]);
+	});
+
+	it("soft-excludes a bottom-ranked note into excludedContext with its note title", async () => {
+		mockCallLlm.mockResolvedValue(rankTwo());
+		const note = {
+			id: "n1",
+			title: "N1",
+			format: "markdown",
+			sourcePath: "/x/n1.md",
+			addedAt: "",
+			updatedAt: "",
+			commitHash: null,
+		} as never;
+		const decision = await assessContextRelevance(
+			{ plans: [planEntry("p1", "P1")], notes: [note], references: [] },
+			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [] },
+			config,
+		);
+		expect(decision.notes).toEqual([]);
+		expect(decision.excludedContext).toEqual([
+			{ kind: "note", key: "n1", title: "N1", reason: "unrelated", tier: "low" },
+		]);
+	});
+
+	it("soft-excludes a bottom-ranked reference with the nativeId-lead audit title", async () => {
+		mockCallLlm.mockResolvedValue(rankTwo());
+		const ref = { source: "linear", nativeId: "X-1", title: "Ref", sourcePath: "/x/r.md" } as never;
+		const decision = await assessContextRelevance(
+			{ plans: [planEntry("p1", "P1")], notes: [], references: [ref] },
+			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [] },
+			config,
+		);
+		expect(decision.references).toEqual([]);
+		expect(decision.excludedContext).toEqual([
+			// The reference's audit title carries the nativeId lead (sidebar label parity).
+			{ kind: "reference", key: "linear:X-1", title: "X-1 — Ref", reason: "unrelated", tier: "low" },
+		]);
+	});
 });
 
 describe("computeChangeFingerprint", () => {
@@ -410,15 +485,76 @@ describe("computeChangeFingerprint", () => {
 	});
 });
 
-describe("buildDecisionFromAiExcluded (worker reuse of the panel ranking)", () => {
+describe("buildDecisionFromAiRelevance (worker reuse of the panel ranking)", () => {
 	const pe = (slug: string, title: string) =>
 		({ slug, title, sourcePath: "", addedAt: "", updatedAt: "", commitHash: null }) as never;
+	const ne = (id: string, title: string) =>
+		({ id, title, format: "markdown", addedAt: "", updatedAt: "", commitHash: null }) as never;
 
-	it("excludes the AI-suggested keys and keeps the rest in registry order", () => {
+	it("routes items by the entries' exclude decision, keeping registry order", () => {
 		const raw = { plans: [pe("p1", "P1"), pe("p2", "P2")], notes: [], references: [] };
-		const decision = buildDecisionFromAiExcluded(raw, [{ kind: "plans", key: "p2", reason: "unrelated" }]);
+		const decision = buildDecisionFromAiRelevance(raw, [
+			{ kind: "plans", key: "p1", tier: "high", reason: "direct hit", excluded: false },
+			{ kind: "plans", key: "p2", tier: "low", reason: "unrelated", excluded: true },
+		]);
 		expect(decision.plans.map((p) => p.slug)).toEqual(["p1"]);
 		expect(decision.excludedContext).toEqual([{ kind: "plan", key: "p2", title: "P2", reason: "unrelated" }]);
+		expect(decision.results).toEqual([
+			{
+				id: "p1",
+				kind: "plan",
+				relevant: true,
+				score: 0,
+				tier: "high",
+				reason: "direct hit",
+				rank: 1,
+				autoExclude: false,
+			},
+			{
+				id: "p2",
+				kind: "plan",
+				relevant: false,
+				score: 0,
+				tier: "low",
+				reason: "unrelated",
+				rank: 2,
+				autoExclude: true,
+			},
+		]);
+	});
+
+	it("a dismissed exclusion lands KEPT with its ORIGINAL tier + reason (user veto, verdict preserved)", () => {
+		const raw = { plans: [], notes: [ne("n1", "N1")], references: [] };
+		const decision = buildDecisionFromAiRelevance(raw, [
+			{ kind: "notes", key: "n1", tier: "low", reason: "different subsystem", excluded: true, dismissed: true },
+		]);
+		// Not excluded (the veto wins) …
+		expect(decision.notes).toHaveLength(1);
+		expect(decision.excludedContext).toEqual([]);
+		// … and the AI's original verdict rides along, so the summary shows
+		// "Low · different subsystem" on the kept item (nothing is lost).
+		expect(decision.results).toEqual([
+			{
+				id: "n1",
+				kind: "note",
+				relevant: true,
+				score: 0,
+				tier: "low",
+				reason: "different subsystem",
+				rank: 1,
+				autoExclude: false,
+			},
+		]);
+		expect(keptContextRelevanceRefs(decision)).toEqual([
+			{ kind: "note", key: "n1", tier: "low", reason: "different subsystem" },
+		]);
+	});
+
+	it("items with no persisted entry are kept plain (no result entry)", () => {
+		const raw = { plans: [pe("p1", "P1")], notes: [], references: [] };
+		const decision = buildDecisionFromAiRelevance(raw, []);
+		expect(decision.plans).toHaveLength(1);
+		expect(decision.excludedContext).toEqual([]);
 		expect(decision.results).toEqual([]);
 	});
 
@@ -430,8 +566,8 @@ describe("buildDecisionFromAiExcluded (worker reuse of the panel ranking)", () =
 			sourcePath: "",
 		} as never;
 		const raw = { plans: [], notes: [], references: [ref] };
-		const decision = buildDecisionFromAiExcluded(raw, [
-			{ kind: "references", key: "linear:JOLLI-776", reason: "unrelated" },
+		const decision = buildDecisionFromAiRelevance(raw, [
+			{ kind: "references", key: "linear:JOLLI-776", tier: "low", reason: "unrelated", excluded: true },
 		]);
 		expect(decision.excludedContext).toEqual([
 			{
@@ -440,6 +576,20 @@ describe("buildDecisionFromAiExcluded (worker reuse of the panel ranking)", () =
 				title: "JOLLI-776 — JolliMemory: array-based",
 				reason: "unrelated",
 			},
+		]);
+		expect(decision.references).toEqual([]);
+	});
+
+	it("keptContextRelevanceRefs projects kept results only and drops empty-reason entries", () => {
+		const raw = { plans: [pe("p1", "P1"), pe("p2", "P2")], notes: [ne("n1", "N1")], references: [] };
+		const decision = buildDecisionFromAiRelevance(raw, [
+			{ kind: "plans", key: "p1", tier: "high", reason: "direct hit", excluded: false },
+			{ kind: "plans", key: "p2", tier: "low", reason: "unrelated", excluded: true },
+			// Fabricated fail-open shape (empty reason) must not reach the artifact.
+			{ kind: "notes", key: "n1", tier: "high", reason: "", excluded: false },
+		]);
+		expect(keptContextRelevanceRefs(decision)).toEqual([
+			{ kind: "plan", key: "p1", tier: "high", reason: "direct hit" },
 		]);
 	});
 });

@@ -51,7 +51,10 @@ export function buildMarkdown(summary: CommitSummary): string {
 	const lines: Array<string> = [];
 
 	pushPropertiesSection(lines, summary);
-	pushPlansAndNotesSection(lines, summary, { includeReferences: true });
+	// withRelevance keeps the exported markdown consistent with what the summary
+	// webview SHOWS (tier chips + inlined AI-excluded rows) — "what you copy is
+	// what you saw". PR bodies stay relevance-free via their own builders.
+	pushPlansAndNotesSection(lines, summary, { includeReferences: true, withRelevance: true });
 	pushRecapSection(lines, summary);
 	pushE2eTestSection(lines, summary.e2eTestGuide);
 	pushSourceCommitsSection(lines, sourceNodes);

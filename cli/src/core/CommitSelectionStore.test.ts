@@ -4,14 +4,15 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { JOLLI_DIR, JOLLIMEMORY_DIR } from "../Logger.js";
 import {
-	type AiExclusion,
+	type AiRelevanceEntry,
 	type CommitExclusions,
 	clearAiSelection,
 	conversationKey,
 	deleteSelectionFile,
+	dismissAiExclusion,
+	isEffectivelyExcluded,
 	readAiSelection,
 	readExclusions,
-	removeAiExclusion,
 	setAllExcluded,
 	setExcluded,
 	writeAiSelection,
@@ -262,50 +263,86 @@ describe("CommitSelectionStore", () => {
 });
 
 describe("CommitSelectionStore — AI relevance layer", () => {
+	const entry = (over: Partial<AiRelevanceEntry> = {}): AiRelevanceEntry => ({
+		kind: "plans",
+		key: "p1",
+		tier: "low",
+		reason: "unrelated",
+		excluded: true,
+		...over,
+	});
+
 	it("readAiSelection returns an empty layer when the file is missing", async () => {
 		const ai = await readAiSelection(cwd);
-		expect(ai.aiExcluded).toEqual([]);
+		expect(ai.aiRelevance).toEqual([]);
 		expect(ai.changeFingerprint).toBeUndefined();
 	});
 
-	it("writeAiSelection persists suggestions + fingerprint, readable via readAiSelection", async () => {
-		const ex: AiExclusion = { kind: "plans", key: "p1", reason: "unrelated" };
-		await writeAiSelection(cwd, [ex], "fp-abc");
+	it("writeAiSelection persists the full ranking + fingerprint, readable via readAiSelection", async () => {
+		const entries = [
+			entry({ kind: "plans", key: "p1", tier: "high", reason: "plan lists changed files", excluded: false }),
+			entry({
+				kind: "references",
+				key: "linear:X-1",
+				tier: "low",
+				reason: "different subsystem",
+				excluded: true,
+			}),
+		];
+		await writeAiSelection(cwd, entries, "fp-abc");
 		const ai = await readAiSelection(cwd);
-		expect(ai.aiExcluded).toEqual([ex]);
+		expect(ai.aiRelevance).toEqual(entries);
 		expect(ai.changeFingerprint).toBe("fp-abc");
 	});
 
 	it("writeAiSelection does not disturb the user manual exclude set", async () => {
 		await setExcluded(cwd, "plans", "manual", true);
-		await writeAiSelection(cwd, [{ kind: "notes", key: "n1", reason: "x" }], "fp");
+		await writeAiSelection(cwd, [entry({ kind: "notes", key: "n1" })], "fp");
 		const ex = await readExclusions(cwd);
 		expect(ex.plans.has("manual")).toBe(true);
-		expect((await readAiSelection(cwd)).aiExcluded).toHaveLength(1);
+		expect((await readAiSelection(cwd)).aiRelevance).toHaveLength(1);
 	});
 
-	it("removeAiExclusion drops one AI suggestion, preserving the rest + fingerprint", async () => {
+	it("dismissAiExclusion sets the dismissed flag IN PLACE — the AI's verdict survives", async () => {
 		await writeAiSelection(
 			cwd,
-			[
-				{ kind: "references", key: "linear:X-1", reason: "unrelated" },
-				{ kind: "plans", key: "p1", reason: "unrelated" },
-			],
+			[entry({ kind: "references", key: "linear:X-1" }), entry({ kind: "plans", key: "p1" })],
 			"fp-1",
 		);
-		await removeAiExclusion(cwd, "references", "linear:X-1");
+		await dismissAiExclusion(cwd, "references", "linear:X-1");
 		const ai = await readAiSelection(cwd);
-		expect(ai.aiExcluded).toEqual([{ kind: "plans", key: "p1", reason: "unrelated" }]);
+		// The entry is still there with its original tier + reason + excluded
+		// judgment; only the user's veto was added. The other entry + the
+		// fingerprint are untouched.
+		expect(ai.aiRelevance).toEqual([
+			entry({ kind: "references", key: "linear:X-1", dismissed: true }),
+			entry({ kind: "plans", key: "p1" }),
+		]);
 		expect(ai.changeFingerprint).toBe("fp-1");
+		expect(isEffectivelyExcluded(ai.aiRelevance[0])).toBe(false);
+		expect(isEffectivelyExcluded(ai.aiRelevance[1])).toBe(true);
+	});
+
+	it("dismissAiExclusion is idempotent and a harmless no-op for unknown keys / empty layer", async () => {
+		await setExcluded(cwd, "plans", "manual", true);
+		await dismissAiExclusion(cwd, "plans", "ghost");
+		expect((await readAiSelection(cwd)).aiRelevance).toEqual([]);
+		await writeAiSelection(cwd, [entry()], "fp");
+		await dismissAiExclusion(cwd, "plans", "p1");
+		await dismissAiExclusion(cwd, "plans", "p1");
+		expect((await readAiSelection(cwd)).aiRelevance).toEqual([entry({ dismissed: true })]);
+		expect((await readExclusions(cwd)).plans.has("manual")).toBe(true);
 	});
 
 	it("clearAiSelection wipes the AI layer but keeps the user manual excludes", async () => {
 		await setExcluded(cwd, "plans", "kept-exclude", true);
-		await writeAiSelection(cwd, [{ kind: "plans", key: "p1", reason: "unrelated" }], "fp-1");
+		await writeAiSelection(cwd, [entry()], "fp-1");
 		await clearAiSelection(cwd);
 		const ai = await readAiSelection(cwd);
-		expect(ai.aiExcluded).toEqual([]);
+		expect(ai.aiRelevance).toEqual([]);
 		expect(ai.changeFingerprint).toBeUndefined();
+		const raw = JSON.parse(await readFile(filePath(), "utf8"));
+		expect(raw.aiRelevance).toBeUndefined();
 		// The user's manual exclude survives — clearAiSelection only touches the AI layer.
 		expect((await readExclusions(cwd)).plans.has("kept-exclude")).toBe(true);
 	});
@@ -317,7 +354,13 @@ describe("CommitSelectionStore — AI relevance layer", () => {
 		expect(Object.keys(raw).sort()).toEqual(["conversations", "notes", "plans", "references", "version"]);
 	});
 
-	it("drops malformed aiSuggestedExclude entries on read", async () => {
+	it("writeAiSelection without a fingerprint clears any previously stored one", async () => {
+		await writeAiSelection(cwd, [entry()], "fp-old");
+		await writeAiSelection(cwd, [entry()]);
+		expect((await readAiSelection(cwd)).changeFingerprint).toBeUndefined();
+	});
+
+	it("coerces a non-array aiRelevance to empty on read", async () => {
 		await writeFile(
 			filePath(),
 			JSON.stringify({
@@ -326,21 +369,43 @@ describe("CommitSelectionStore — AI relevance layer", () => {
 				plans: [],
 				notes: [],
 				references: [],
-				aiSuggestedExclude: [
-					{ kind: "plans", key: "ok", score: 0.5, reason: "r" },
-					{ bad: true },
-					{ kind: "bogus", key: "x", score: 1, reason: "" },
+				aiRelevance: "garbage",
+			}),
+			"utf8",
+		);
+		expect((await readAiSelection(cwd)).aiRelevance).toEqual([]);
+	});
+
+	it("drops malformed aiRelevance entries on read (bad kind / tier / missing fields); a stray dismissed value coerces to absent", async () => {
+		await writeFile(
+			filePath(),
+			JSON.stringify({
+				version: 2,
+				conversations: [],
+				plans: [],
+				notes: [],
+				references: [],
+				aiRelevance: [
+					{ kind: "plans", key: "ok", tier: "high", reason: "r", excluded: false },
+					{ kind: "plans", key: "ok2", tier: "low", reason: "r", excluded: true, dismissed: true },
+					{ kind: "plans", key: "ok3", tier: "low", reason: "r", excluded: true, dismissed: "yes" },
+					{ kind: "bogus", key: "x", tier: "high", reason: "r", excluded: true },
+					{ kind: "notes", key: "n", tier: "extreme", reason: "r", excluded: true },
+					{ kind: "notes", key: "n2", tier: "low", reason: "r" },
+					"garbage",
+					null,
 				],
 			}),
 			"utf8",
 		);
-		expect((await readAiSelection(cwd)).aiExcluded).toEqual([
-			// A legacy `score` in the file is dropped on read (only kind/key/reason kept).
-			{ kind: "plans", key: "ok", reason: "r" },
+		expect((await readAiSelection(cwd)).aiRelevance).toEqual([
+			{ kind: "plans", key: "ok", tier: "high", reason: "r", excluded: false },
+			{ kind: "plans", key: "ok2", tier: "low", reason: "r", excluded: true, dismissed: true },
+			{ kind: "plans", key: "ok3", tier: "low", reason: "r", excluded: true },
 		]);
 	});
 
-	it("forward-compat: a v2 file with extra AI keys still yields the exclude sets; a legacy userIncluded key is ignored", async () => {
+	it("forward-compat: legacy userIncluded / aiSuggestedExclude / aiRelevanceResults keys are ignored", async () => {
 		await writeFile(
 			filePath(),
 			JSON.stringify({
@@ -350,7 +415,8 @@ describe("CommitSelectionStore — AI relevance layer", () => {
 				notes: [],
 				references: [],
 				userIncluded: { plans: ["kept"] },
-				aiSuggestedExclude: [{ kind: "plans", key: "p1", score: 0.1, reason: "x" }],
+				aiSuggestedExclude: [{ kind: "plans", key: "p1", reason: "x" }],
+				aiRelevanceResults: [{ kind: "plans", key: "p1", tier: "low", reason: "x" }],
 				changeFingerprint: "fp",
 			}),
 			"utf8",
@@ -358,10 +424,10 @@ describe("CommitSelectionStore — AI relevance layer", () => {
 		const ex = await readExclusions(cwd);
 		expect(ex.conversations.has("c1")).toBe(true);
 		expect(ex.plans.has("p1")).toBe(true);
-		// The legacy userIncluded key is dropped from the model (dismiss edits
-		// aiSuggestedExclude directly); readAiSelection surfaces only ai + fingerprint.
+		// The legacy two-list keys are dropped from the model — the AI layer reads
+		// empty (one fallback re-rank), while the fingerprint passes through.
 		const ai = await readAiSelection(cwd);
-		expect(ai.aiExcluded).toHaveLength(1);
+		expect(ai.aiRelevance).toEqual([]);
 		expect(ai.changeFingerprint).toBe("fp");
 	});
 });

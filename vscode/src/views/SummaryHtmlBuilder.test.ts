@@ -1296,7 +1296,7 @@ describe("SummaryHtmlBuilder", () => {
 				expect(html).not.toContain('id="sourceCard"');
 			});
 
-			it("renders the AI-excluded context details when excludedContext is present", () => {
+			it("inlines an AI-excluded item as a read-only row (Excluded chip + reason, no actions)", () => {
 				const html = buildContextPanel(
 					makeSummary({
 						excludedContext: [
@@ -1304,14 +1304,71 @@ describe("SummaryHtmlBuilder", () => {
 						],
 					}),
 				);
-				expect(html).toContain("AI excluded 1 unrelated context item(s)");
+				// Inline row replaces the old collapsed "AI excluded N" details block.
+				expect(html).not.toContain("AI excluded 1 unrelated context item(s)");
+				expect(html).toContain('class="row plan-item ai-ex-row"');
 				expect(html).toContain("Cursor Support");
 				expect(html).toContain("unrelated to graph change");
+				expect(html).toContain('class="ctx-tier ctx-tier--ex"');
+				// Read-only: no preview link, no edit/remove actions on the row.
+				const row = html.slice(html.indexOf("ai-ex-row"), html.indexOf("snippet-form"));
+				expect(row).not.toContain("data-action=");
 			});
 
-			it("omits the AI-excluded details when there is no excludedContext", () => {
+			it("renders the Context section for an excluded-only summary (no kept rows)", () => {
+				const html = buildContextPanel(
+					makeSummary({
+						excludedContext: [{ kind: "plan", key: "p1", title: "Old Plan", reason: "different subsystem" }],
+					}),
+				);
+				expect(html).toContain("ai-ex-row");
+				expect(html).not.toContain("No plans or notes associated with this commit yet");
+			});
+
+			it("excluded reference rows derive their badge letter from the key's source segment", () => {
+				const html = buildContextPanel(
+					makeSummary({
+						excludedContext: [
+							{ kind: "reference", key: "linear:ENG-1", title: "ENG-1 — Fix", reason: "unrelated" },
+						],
+					}),
+				);
+				expect(html).toContain('class="kb-tag t-ref"');
+			});
+
+			it("omits AI rows entirely when there is no excludedContext", () => {
 				const html = buildContextPanel(makeSummary({ plans: [makePlan()] }));
-				expect(html).not.toContain("AI excluded");
+				expect(html).not.toContain("ai-ex-row");
+			});
+
+			it("kept rows show a tier chip + reason from contextRelevance (archive-suffix keys resolve)", () => {
+				const html = buildContextPanel(
+					makeSummary({
+						plans: [makePlan({ slug: "graph-plan-ab12cd34" })],
+						contextRelevance: [
+							// Working-area key (no archive suffix) still matches the archived slug.
+							{ kind: "plan", key: "graph-plan", tier: "high", reason: "plan lists the changed files" },
+						],
+					}),
+				);
+				expect(html).toContain('class="ctx-tier ctx-tier--high"');
+				expect(html).toContain("plan lists the changed files");
+			});
+
+			it("kept rows without a persisted verdict render no relevance line (legacy summaries)", () => {
+				const html = buildContextPanel(makeSummary({ plans: [makePlan()] }));
+				expect(html).not.toContain("ctx-rel");
+			});
+
+			it("an empty-reason verdict renders no relevance line (fabricated fail-open entry)", () => {
+				const html = buildContextPanel(
+					makeSummary({
+						plans: [makePlan()],
+						contextRelevance: [{ kind: "plan", key: "test-plan", tier: "high", reason: "" }],
+					}),
+				);
+				expect(html).not.toContain("ctx-rel");
+				expect(html).not.toContain("ctx-tier--high");
 			});
 		});
 

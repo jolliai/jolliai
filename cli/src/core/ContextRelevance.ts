@@ -25,8 +25,15 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createLogger } from "../Logger.js";
-import type { ExcludedContextItem, LlmConfig, NoteEntry, PlanEntry, ReferenceEntry } from "../Types.js";
-import type { AiExclusion } from "./CommitSelectionStore.js";
+import type {
+	ContextRelevanceRef,
+	ExcludedContextItem,
+	LlmConfig,
+	NoteEntry,
+	PlanEntry,
+	ReferenceEntry,
+} from "../Types.js";
+import { type AiRelevanceEntry, isEffectivelyExcluded } from "./CommitSelectionStore.js";
 import { execGit, getDiffContent } from "./GitOps.js";
 import { callLlm } from "./LlmClient.js";
 import { toForwardSlash } from "./PathUtils.js";
@@ -562,10 +569,10 @@ async function readEntryContent(sourcePath: string | undefined, fallback: string
  * returns kept entries in relevance order plus the soft-excluded items for the
  * summary's `excludedContext`.
  *
- * Always recomputes: the panel's persisted aiSuggestedExclude drives pre-commit
- * display; fingerprint-based reuse here is a later optimization ("recompute is
- * the common case"). Never throws — rankContextRelevance fails open, so any
- * failure yields "keep everything, exclude nothing".
+ * Always recomputes: fingerprint-based reuse of the panel's persisted
+ * aiRelevance list lives in buildDecisionFromAiRelevance, not here. Never
+ * throws — rankContextRelevance fails open, so any failure yields "keep
+ * everything, exclude nothing".
  */
 export async function assessContextRelevance(
 	raw: RawContextEntries,
@@ -644,50 +651,96 @@ export async function assessContextRelevance(
 }
 
 /**
- * Reconstructs a decision from a previously-persisted AI suggestion. The pre-commit
- * panel writes `aiSuggestedExclude` + a change fingerprint (full-text ranking); the
- * QueueWorker reuses it here when the fingerprint matches, INSTEAD of re-running the
- * LLM — so the excluded set the user saw in the panel is exactly what lands, and the
- * common path costs only one LLM call. Registry order is kept (no re-ranking: the
- * authoritative match is the exclude SET; top-N ordering is secondary). A user who
- * dismissed an AI suggestion already had it removed from `aiExcluded` (the panel edits
- * that list directly), so there's no separate include set to apply here. Pure — no I/O.
+ * Projects a decision's per-item results into the summary-artifact shape: one
+ * `{kind, key, tier, reason}` entry per KEPT item (excluded items live on
+ * `excludedContext` instead — no duplication). This is what lands on
+ * `CommitSummary.contextRelevance`. Works for both ranking sources: a fresh
+ * `assessContextRelevance` (full results) and a fingerprint-reuse
+ * `buildDecisionFromAiRelevance` (results rebuilt from the persisted
+ * aiRelevance list; empty on legacy selection files → returns []).
+ *
+ * Empty-reason entries are dropped: the fail-open `keepAll` fallback fabricates
+ * `tier:"high", reason:""` for EVERY item when the ranking LLM fails, and a
+ * per-item LLM omission defaults to `reason:""` too — neither is a real
+ * verdict, and persisting them would stamp "all High" onto the artifact
+ * (contradicting the field's "absent on fail-open" contract) and render
+ * dangling `· ` separators.
  */
-export function buildDecisionFromAiExcluded(
+export function keptContextRelevanceRefs(decision: ContextRelevanceDecision): ContextRelevanceRef[] {
+	return decision.results
+		.filter((r) => !r.autoExclude && r.reason !== "")
+		.map((r) => ({ kind: r.kind, key: r.id, tier: r.tier, reason: r.reason }));
+}
+
+/**
+ * Reconstructs a decision from the previously-persisted AI ranking. The pre-commit
+ * panel writes the full per-item `aiRelevance` list + a change fingerprint
+ * (full-text ranking); the QueueWorker reuses it here when the fingerprint
+ * matches, INSTEAD of re-running the LLM — so what the user saw in the panel is
+ * exactly what lands, and the common path costs only one LLM call. Registry order
+ * is kept (no re-ranking: the authoritative data is the per-item entries; top-N
+ * ordering is secondary).
+ *
+ * Membership comes from `isEffectivelyExcluded`: the AI's original `excluded`
+ * judgment minus the user's `dismissed` veto. A dismissed entry therefore lands
+ * as a KEPT item carrying its ORIGINAL tier + reason (nothing the AI concluded
+ * is lost — display layers decide what to show). Items with no persisted entry
+ * (legacy file, or added after the ranking) get no result entry — the display
+ * layers fall back to plain title rows. Pure — no I/O.
+ */
+export function buildDecisionFromAiRelevance(
 	raw: RawContextEntries,
-	aiExcluded: readonly AiExclusion[],
+	aiRelevance: readonly AiRelevanceEntry[],
 ): ContextRelevanceDecision {
-	const reasonByKind = {
-		plans: new Map<string, string>(),
-		notes: new Map<string, string>(),
-		references: new Map<string, string>(),
+	const entryByKind = {
+		plans: new Map<string, AiRelevanceEntry>(),
+		notes: new Map<string, AiRelevanceEntry>(),
+		references: new Map<string, AiRelevanceEntry>(),
 	};
-	for (const e of aiExcluded) {
-		if (e.kind === "plans" || e.kind === "notes" || e.kind === "references")
-			reasonByKind[e.kind].set(e.key, e.reason);
+	for (const e of aiRelevance) {
+		if (e.kind === "plans" || e.kind === "notes" || e.kind === "references") entryByKind[e.kind].set(e.key, e);
 	}
 	const keptPlans: PlanEntry[] = [];
 	const keptNotes: NoteEntry[] = [];
 	const keptRefs: ReferenceEntry[] = [];
 	const excludedContext: ExcludedContextItem[] = [];
+	const results: ContextRelevanceResult[] = [];
+	// Reconstructed results carry no meaningful score/rank (those never persist);
+	// rank re-numbers in registry order purely to keep the field monotonic.
+	// Returns whether the item is EFFECTIVELY excluded so the caller can route it.
+	const pushResult = (kind: ContextKind, id: string, entry: AiRelevanceEntry | undefined): boolean => {
+		if (!entry) return false; // no persisted verdict for this item → kept, plain
+		const excluded = isEffectivelyExcluded(entry);
+		results.push({
+			id,
+			kind,
+			relevant: !excluded,
+			score: 0,
+			tier: entry.tier,
+			reason: entry.reason,
+			rank: results.length + 1,
+			autoExclude: excluded,
+		});
+		return excluded;
+	};
 	for (const p of raw.plans) {
-		const reason = reasonByKind.plans.get(p.slug);
-		if (reason !== undefined) {
-			excludedContext.push({ kind: "plan", key: p.slug, title: p.title, reason });
+		const entry = entryByKind.plans.get(p.slug);
+		if (pushResult("plan", p.slug, entry)) {
+			excludedContext.push({ kind: "plan", key: p.slug, title: p.title, reason: entry?.reason ?? "" });
 		} else keptPlans.push(p);
 	}
 	for (const n of raw.notes) {
-		const reason = reasonByKind.notes.get(n.id);
-		if (reason !== undefined) {
-			excludedContext.push({ kind: "note", key: n.id, title: n.title, reason });
+		const entry = entryByKind.notes.get(n.id);
+		if (pushResult("note", n.id, entry)) {
+			excludedContext.push({ kind: "note", key: n.id, title: n.title, reason: entry?.reason ?? "" });
 		} else keptNotes.push(n);
 	}
 	for (const r of raw.references) {
 		const key = referenceKey(r);
-		const reason = reasonByKind.references.get(key);
-		if (reason !== undefined) {
-			excludedContext.push({ kind: "reference", key, title: referenceLabel(r), reason });
+		const entry = entryByKind.references.get(key);
+		if (pushResult("reference", key, entry)) {
+			excludedContext.push({ kind: "reference", key, title: referenceLabel(r), reason: entry?.reason ?? "" });
 		} else keptRefs.push(r);
 	}
-	return { plans: keptPlans, notes: keptNotes, references: keptRefs, excludedContext, results: [] };
+	return { plans: keptPlans, notes: keptNotes, references: keptRefs, excludedContext, results };
 }

@@ -18,6 +18,7 @@ import {
 } from "../../../cli/src/core/SummaryTree.js";
 import type {
 	CommitSummary,
+	ContextRelevanceRef,
 	ConversationTokenBreakdown,
 	E2eTestScenario,
 	ExcludedContextItem,
@@ -743,25 +744,76 @@ export function contextChipCount(summary: CommitSummary): number {
  * affordance while dispatching through the same `data-action="toggleAddMenu"`
  * delegated handler (SummaryScriptBuilder) \u2014 no new script wiring needed.
  */
+/** Per-item AI relevance data threaded into buildPlansAndNotesSection: kept
+ *  items' tier+reason (`refs`) plus the soft-excluded items rendered as inline
+ *  read-only rows (`excluded`). Both optional — legacy summaries render plain
+ *  title rows. */
+export interface ContextRelevanceDisplay {
+	readonly refs?: ReadonlyArray<ContextRelevanceRef>;
+	readonly excluded?: ReadonlyArray<ExcludedContextItem>;
+}
+
+/** Archive suffix on committed plan slugs / note ids (`slug-<hash8>`). Relevance
+ *  keys are working-area identities (pre-archive), so lookups try the exact key
+ *  first, then this stripped form. Mirrors QueueWorker's REF_HASH_SUFFIX. */
+const ARCHIVE_HASH_SUFFIX = /-[0-9a-f]{8}$/;
+
+const TIER_LABEL = { high: "High", mid: "Med", low: "Low" } as const;
+const TIER_TIP = {
+	high: "High relevance to this change",
+	mid: "Medium relevance to this change",
+	low: "Low relevance to this change",
+} as const;
+
+function buildRelevanceLookup(refs: ReadonlyArray<ContextRelevanceRef> | undefined): Map<string, ContextRelevanceRef> {
+	const map = new Map<string, ContextRelevanceRef>();
+	for (const r of refs ?? []) map.set(`${r.kind}:${r.key}`, r);
+	return map;
+}
+
+function lookupRelevance(
+	map: ReadonlyMap<string, ContextRelevanceRef>,
+	kind: "plan" | "note" | "reference",
+	key: string,
+): ContextRelevanceRef | undefined {
+	return map.get(`${kind}:${key}`) ?? map.get(`${kind}:${key.replace(ARCHIVE_HASH_SUFFIX, "")}`);
+}
+
+/** Second meta line under a kept row's title: tier chip + the AI's one-line
+ *  reason. Empty string when the item has no persisted verdict — or when the
+ *  verdict carries an empty reason (a fabricated fail-open entry that slipped
+ *  into an artifact), which would otherwise render a chip + dangling ✨. */
+function buildRelevanceLine(rel: ContextRelevanceRef | undefined): string {
+	if (!rel || rel.reason === "") return "";
+	return `
+      <div class="ctx-rel"><span class="ctx-tier ctx-tier--${rel.tier}" title="${escAttr(TIER_TIP[rel.tier])}">${TIER_LABEL[rel.tier]}</span><span class="ai-say">&#x2728; ${escHtml(rel.reason)}</span></div>`;
+}
+
 /**
- * Renders the AI-excluded context as a native <details> disclosure (collapsed by
- * default; native <details> needs no script and is CSP-safe). Lists the CONTEXT
- * items the relevance ranker judged unrelated, each with its reason. Empty -> "".
+ * One inline READ-ONLY row for an AI soft-excluded context item: badge +
+ * struck-through title + `Excluded` chip + reason. Deliberately no preview /
+ * edit / remove actions and no title link — a soft-excluded item was never
+ * archived into this commit, so there is no snapshot to open. Rendered after
+ * the kept rows (replaces the old collapsed "AI excluded N" details block).
  */
-function buildExcludedContextSection(excluded: ReadonlyArray<ExcludedContextItem>): string {
-	if (excluded.length === 0) return "";
-	const items = excluded
-		.map((e) => {
-			const reason = e.reason ? ` <span class="ai-ex-reason">&mdash; ${escHtml(e.reason)}</span>` : "";
-			return `<li class="ai-ex-item"><span class="ai-ex-title">${escHtml(e.title)}</span>${reason}</li>`;
-		})
-		.join("\n");
-	return `<details class="ai-excluded">
-  <summary class="ai-excluded-summary">&#x2728; AI excluded ${excluded.length} unrelated context item(s)</summary>
-  <ul class="ai-ex-list">
-${items}
-  </ul>
-</details>`;
+function buildExcludedRow(e: ExcludedContextItem): string {
+	let tag = `<span class="kb-tag t-plan">P</span>`;
+	if (e.kind === "note") tag = `<span class="kb-tag t-note">N</span>`;
+	else if (e.kind === "reference") {
+		const source = e.key.includes(":") ? e.key.slice(0, e.key.indexOf(":")) : e.key;
+		tag = `<span class="kb-tag t-ref">${escHtml(getSourceMeta(source).letter)}</span>`;
+	}
+	const reason = e.reason
+		? `
+      <div class="ctx-rel"><span class="ctx-tier ctx-tier--ex" title="AI marked unrelated &mdash; excluded from the summary">Excluded</span><span class="ai-say">&#x2728; ${escHtml(e.reason)}</span></div>`
+		: "";
+	return `
+  <div class="row plan-item ai-ex-row">
+    ${tag}
+    <div class="r-main">
+      <span class="r-title ai-ex-title">${escHtml(e.title)}</span>${reason}
+    </div>
+  </div>`;
 }
 
 export function buildContextPanel(
@@ -777,6 +829,7 @@ export function buildContextPanel(
 		planTranslateSet,
 		noteTranslateSet,
 		referenceTranslateSet,
+		{ refs: summary.contextRelevance, excluded: summary.excludedContext },
 	);
 	const contextCount = contextChipCount(summary);
 	return `
@@ -794,7 +847,6 @@ export function buildContextPanel(
     </div>
   </div>
   ${plansAndNotesBody}
-  ${buildExcludedContextSection(summary.excludedContext ?? [])}
   <div class="snippet-form hidden" id="snippetForm">
     <div class="snippet-field">
       <label for="snippetTitle">Title</label>
@@ -991,6 +1043,7 @@ export function buildPlansAndNotesSection(
 	planTranslateSet?: ReadonlySet<string>,
 	noteTranslateSet?: ReadonlySet<string>,
 	referenceTranslateSet?: ReadonlySet<string>,
+	relevance?: ContextRelevanceDisplay,
 ): string {
 	const planList = plans ?? [];
 	const noteList = notes ?? [];
@@ -1000,6 +1053,8 @@ export function buildPlansAndNotesSection(
 	// practice.
 	/* v8 ignore next -- references is always defined by the buildHtml caller (see L139). */
 	const referenceList = references ?? [];
+	const relevanceMap = buildRelevanceLookup(relevance?.refs);
+	const excludedList = relevance?.excluded ?? [];
 	const totalCount = planList.length + noteList.length + referenceList.length;
 
 	const planItems = annotatePlans(planList)
@@ -1024,7 +1079,7 @@ export function buildPlansAndNotesSection(
     <span class="kb-tag t-plan">P</span>
     <div class="r-main">
       <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewPlan" data-plan-slug="${key}" data-plan-title="${escAttr(p.title)}">${escHtml(p.title)}</a>${latestBadge}
-      <div class="plan-meta">${escHtml(key)}.md${jolliLink}</div>
+      <div class="plan-meta">${escHtml(key)}.md${jolliLink}</div>${buildRelevanceLine(lookupRelevance(relevanceMap, "plan", key))}
     </div>
     <span class="r-actions plan-header-actions">
       ${dateBadge}${translateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit Plan" data-plan-slug="${key}" data-action="loadPlanContent">&#x270E;</button>
@@ -1056,7 +1111,7 @@ export function buildPlansAndNotesSection(
     <span class="kb-tag t-note">N</span>
     <div class="r-main">
       <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewNote" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}">${escHtml(n.title)}</a>
-      ${noteMeta}
+      ${noteMeta}${buildRelevanceLine(lookupRelevance(relevanceMap, "note", n.id))}
     </div>
     <span class="r-actions plan-header-actions">
       ${noteTranslateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit Note" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}" data-note-format="${n.format}" data-action="loadNoteContent">&#x270E;</button>
@@ -1080,10 +1135,17 @@ export function buildPlansAndNotesSection(
 	// commit. All sources share the same `*Reference` data-action names; the
 	// host dispatches by `data-reference-source`.
 	const referenceItems = referencesBySourceOrder(referenceList)
-		.map((e) => buildReferenceRow(e, referenceTranslateSet))
+		.map((e) =>
+			buildReferenceRow(e, referenceTranslateSet, lookupRelevance(relevanceMap, "reference", `${e.source}:${e.nativeId}`)),
+		)
 		.join("\n");
 
-	const allItems = planItems + noteItems + referenceItems;
+	// AI soft-excluded items, inlined read-only after the kept rows (the old
+	// collapsed "AI excluded N" details block is gone — one unified list).
+	const excludedItems = excludedList.map((e) => buildExcludedRow(e)).join("\n");
+
+	const allItems = planItems + noteItems + referenceItems + excludedItems;
+	const hasAnyRow = totalCount > 0 || excludedList.length > 0;
 	const countBadge =
 		totalCount > 1 ? ` <span class="section-count">${totalCount}</span>` : "";
 
@@ -1100,7 +1162,7 @@ export function buildPlansAndNotesSection(
   <div class="section-header">
     <div class="section-title">&#x1F4CB; CONTEXT${countBadge}</div>
   </div>
-  ${totalCount > 0 ? allItems : '<p class="e2e-placeholder">No plans or notes associated with this commit yet.</p>'}
+  ${hasAnyRow ? allItems : '<p class="e2e-placeholder">No plans or notes associated with this commit yet.</p>'}
 </div>
 <hr class="separator" />
 `;
@@ -1203,6 +1265,7 @@ function stripSourcePrefix(archivedKey: string, source: SourceId): string {
 function buildReferenceRow(
 	e: ReferenceCommitRef,
 	referenceTranslateSet?: ReadonlySet<string>,
+	relevance?: ContextRelevanceRef,
 ): string {
 	const sourceMeta = getSourceMeta(e.source);
 	const sourceLabel = sourceMeta.label;
@@ -1230,7 +1293,7 @@ function buildReferenceRow(
   <div class="row plan-item" id="reference-${escAttr(e.source)}-${escAttr(domKey)}">
     <span class="kb-tag t-ref">${escHtml(sourceLetter)}</span>
     <div class="r-main">
-      <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewReference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}">${escHtml(referenceDisplayTitle(e))}</a>${subLine}
+      <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewReference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}">${escHtml(referenceDisplayTitle(e))}</a>${subLine}${buildRelevanceLine(relevance)}
     </div>
     <span class="r-actions plan-header-actions">
       <button class="icon-btn topic-action-btn" title="Open in ${escAttr(sourceLabel)}" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-url="${escAttr(e.url ?? "")}" data-action="openReferenceExternal">&#x1F30D;</button>

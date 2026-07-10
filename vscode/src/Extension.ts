@@ -11,7 +11,7 @@ import { clearTimeout, setTimeout } from "node:timers";
 import * as vscode from "vscode";
 import {
 	conversationKey,
-	removeAiExclusion,
+	dismissAiExclusion,
 	setExcluded,
 } from "../../cli/src/core/CommitSelectionStore.js";
 import { discoverCodexConversations } from "../../cli/src/core/CodexDiscovery.js";
@@ -1252,14 +1252,24 @@ export function activate(context: vscode.ExtensionContext): void {
 			await plansProvider.refreshExclusions();
 		},
 		applyDismissAiExclude: async (kind, key) => {
-			// Map the single-form context kind to the plural ExclusionKind, then drop this
-			// entry from aiSuggestedExclude so the item lands normally (the worker's
-			// fingerprint reuse then honours the dismiss).
+			// Map the single-form context kind to the plural ExclusionKind, then set the
+			// entry's `dismissed` flag so it is no longer effectively excluded — the AI's
+			// original tier + reason stay intact and ride onto the summary with the kept
+			// item (the worker's fingerprint reuse honours the veto).
 			const k = kind === "plan" ? "plans" : kind === "note" ? "notes" : "references";
-			await removeAiExclusion(workspaceRoot, k, key);
+			await dismissAiExclusion(workspaceRoot, k, key);
 			// Reflect the dismiss in the memoized ranking (rather than invalidating it), so
 			// reopening the panel keeps the item included without a re-rank / "Analyzing…".
 			NextMemoryPreviewPanel.dismissInRelevanceCache(key);
+			// Mirror the post-dismiss overlay to BOTH surfaces. A dismiss can originate
+			// from either the Review panel or the sidebar, and only the originator
+			// updates itself optimistically — without this push the OTHER surface keeps
+			// its stale Excluded strikethrough indefinitely (no code path re-derives the
+			// overlay until the file selection changes or the panel reopens). The
+			// broadcast fan-out is safe here precisely because the panel does NOT post
+			// its own copy for dismisses: each surface receives exactly one update.
+			const items = NextMemoryPreviewPanel.getRelevanceCacheItems();
+			if (items) sidebarProvider.postMessage({ type: "context:relevance", items });
 			await plansProvider.refreshExclusions();
 		},
 		// Active Conversations source for the Branch tab (hoisted above so

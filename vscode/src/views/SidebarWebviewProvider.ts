@@ -306,9 +306,10 @@ export interface SidebarWebviewDeps {
 		selected: boolean,
 	) => void | Promise<void>;
 	/**
-	 * Dismiss one AI soft-exclude suggestion — removes it from aiSuggestedExclude so
-	 * the item lands normally. `kind` is the single-form context kind; the handler
-	 * maps it to the plural ExclusionKind for removeAiExclusion.
+	 * Dismiss one AI soft-exclude suggestion — sets the entry's `dismissed` flag so
+	 * the item lands normally while the AI's original tier + reason survive. `kind`
+	 * is the single-form context kind; the handler maps it to the plural
+	 * ExclusionKind for dismissAiExclusion.
 	 */
 	applyDismissAiExclude?: (kind: "plan" | "note" | "reference", key: string) => void | Promise<void>;
 	/**
@@ -616,6 +617,31 @@ export class SidebarWebviewProvider
 		if (this.view) void this.view.webview.postMessage(msg);
 		for (const target of this.broadcastTargets) {
 			void target.postMessage(msg);
+		}
+	}
+
+	/**
+	 * Push the AI context-relevance overlay to the sidebar view ONLY — deliberately
+	 * NOT `postMessage`, whose broadcast fan-out would echo a second copy back to
+	 * the Review panel (the panel already posts `context:relevance` to its own
+	 * webview). Called by the panel after each ranking so the sidebar's CONTEXT
+	 * rows strike through AI soft-excluded items in sync. Empty `items` clears
+	 * the sidebar overlay.
+	 *
+	 * Best-effort by contract: `this.view` is never cleared on dispose, and a
+	 * hidden/disposed sidebar view's `webview` getter THROWS synchronously. The
+	 * try keeps that throw from escaping into the panel's relevance catch block,
+	 * which would wrongly post an empty overlay and wipe the panel's own
+	 * freshly-rendered chips.
+	 */
+	pushContextRelevanceToSidebar(
+		items: ReadonlyArray<{ readonly id: string; readonly autoExclude: boolean; readonly reason?: string }>,
+	): void {
+		try {
+			if (this.view) void this.view.webview.postMessage({ type: "context:relevance", items });
+		} catch {
+			// Disposed view — the sidebar will simply have no overlay until the
+			// panel's next push after the view re-resolves.
 		}
 	}
 

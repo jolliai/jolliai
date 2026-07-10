@@ -535,7 +535,7 @@ describe("QueueWorker", () => {
 			topics: [{ title: "Test topic", trigger: "test", response: "done", decisions: "none" }],
 		});
 		vi.mocked(storeSummary).mockResolvedValue(undefined);
-		vi.mocked(readAiSelection).mockResolvedValue({ aiExcluded: [] });
+		vi.mocked(readAiSelection).mockResolvedValue({ aiRelevance: [] });
 		vi.mocked(clearAiSelection).mockResolvedValue(undefined);
 		vi.mocked(existsSync).mockReturnValue(false);
 		vi.mocked(readFileSync).mockReturnValue("");
@@ -2494,7 +2494,7 @@ describe("QueueWorker", () => {
 			// Persisted fingerprint matches this change → executePipeline takes the
 			// buildDecisionFromAiExcluded reuse arm and skips assessContextRelevance.
 			vi.mocked(readAiSelection).mockResolvedValueOnce({
-				aiExcluded: [],
+				aiRelevance: [],
 				changeFingerprint: computeChangeFingerprint(signal),
 			});
 			vi.mocked(assessContextRelevance).mockClear();
@@ -3684,6 +3684,120 @@ describe("QueueWorker", () => {
 			expect(storeSummary).toHaveBeenCalledTimes(1);
 			expect(vi.mocked(storeSummary).mock.calls[0][0].excludedContext).toEqual([
 				{ kind: "note", key: "n-x", title: "N", reason: "unrelated", tier: "low" },
+			]);
+		});
+
+		it("normal commit writes contextRelevance (kept items' tier+reason) onto the summary", async () => {
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			vi.mocked(assessContextRelevance).mockResolvedValueOnce({
+				plans: [],
+				notes: [],
+				references: [],
+				excludedContext: [],
+				results: [
+					{
+						id: "p-kept",
+						kind: "plan",
+						relevant: true,
+						score: 0.9,
+						tier: "high",
+						reason: "plan covers the change",
+						rank: 1,
+						autoExclude: false,
+					},
+					{
+						id: "n-dropped",
+						kind: "note",
+						relevant: false,
+						score: 0.1,
+						tier: "low",
+						reason: "unrelated",
+						rank: 2,
+						autoExclude: true,
+					},
+				],
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			// Only the KEPT item's verdict lands on contextRelevance (excluded ones
+			// live on excludedContext instead).
+			expect(vi.mocked(storeSummary).mock.calls[0][0].contextRelevance).toEqual([
+				{ kind: "plan", key: "p-kept", tier: "high", reason: "plan covers the change" },
+			]);
+		});
+
+		it("fingerprint reuse writes contextRelevance from the persisted aiRelevanceResults (no LLM)", async () => {
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			const signal = { commitMessage: "", changedFiles: ["src/file.ts"], symbols: [] as string[] };
+			vi.mocked(buildChangeSignal).mockResolvedValueOnce(signal);
+			// Matching fingerprint → the reuse arm runs (no LLM). This suite's
+			// default mocks detect no plans/notes/refs, so the meaningful assertion
+			// is the legacy-file shape: empty persisted results must yield NO
+			// contextRelevance field (not an empty array).
+			vi.mocked(readAiSelection).mockResolvedValueOnce({
+				aiRelevance: [],
+				changeFingerprint: computeChangeFingerprint(signal),
+			});
+			vi.mocked(assessContextRelevance).mockClear();
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			expect(assessContextRelevance).not.toHaveBeenCalled();
+			// Empty persisted results (legacy selection file) → no contextRelevance
+			// on the summary rather than a bogus empty array.
+			expect(vi.mocked(storeSummary).mock.calls[0][0].contextRelevance).toBeUndefined();
+		});
+
+		it("fingerprint reuse threads a persisted kept-item verdict onto summary.contextRelevance", async () => {
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			// One detected working note; the panel's persisted layer carries its verdict.
+			vi.mocked(detectActiveNotesForBranch).mockResolvedValue([
+				{
+					id: "n-kept",
+					title: "Kept",
+					format: "snippet",
+					sourcePath: "/x/kept.md",
+					addedAt: "2026-04-01T00:00:00Z",
+					updatedAt: "2026-04-01T00:00:00Z",
+					commitHash: null,
+				} as never,
+			]);
+			const signal = { commitMessage: "", changedFiles: ["src/file.ts"], symbols: [] as string[] };
+			vi.mocked(buildChangeSignal).mockResolvedValueOnce(signal);
+			vi.mocked(readAiSelection).mockResolvedValueOnce({
+				aiRelevance: [
+					{ kind: "notes", key: "n-kept", tier: "high", reason: "note covers the change", excluded: false },
+				],
+				changeFingerprint: computeChangeFingerprint(signal),
+			});
+			vi.mocked(assessContextRelevance).mockClear();
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			expect(assessContextRelevance).not.toHaveBeenCalled();
+			// The panel's persisted verdict rides through buildDecisionFromAiExcluded
+			// onto the artifact — the reuse path's whole point.
+			expect(vi.mocked(storeSummary).mock.calls[0][0].contextRelevance).toEqual([
+				{ kind: "note", key: "n-kept", tier: "high", reason: "note covers the change" },
 			]);
 		});
 

@@ -822,6 +822,15 @@ export function buildSidebarScript(): string {
         // Memory "Summarizing <hash>…" row can name the commit being summarized.
         const nextHash = next ? (msg.commit || null) : null;
         if (state.workerBusy === next && state.summarizingHash === nextHash) break;
+        // A summary run starting means the QueueWorker is consuming (and then
+        // clearing) the persisted AI ranking — the overlay's verdicts are spent.
+        // Clear the strikethroughs so they don't linger on the still-working
+        // items after the commit (with the Review panel open, its post-commit
+        // refresh re-ranks and re-pushes a fresh overlay).
+        if (next && aiExcludedIds.size > 0) {
+          aiExcludedIds = new Set();
+          aiReasonById = Object.create(null);
+        }
         state.workerBusy = next;
         state.summarizingHash = nextHash;
         // Only the Branch tab reacts to workerBusy: the toolbar shows the
@@ -1044,6 +1053,20 @@ export function buildSidebarScript(): string {
       }
       case 'branch:plansData':
         branchData.plans = msg.items.slice();
+        if (state.activeTab === 'branch') renderBranch();
+        break;
+      case 'context:relevance':
+        // Wholesale replace: each push is a complete ranking for the current
+        // file set (an empty items list clears the overlay). Only autoExclude
+        // rows matter here — kept items' tiers are panel-only UI.
+        aiExcludedIds = new Set();
+        aiReasonById = Object.create(null);
+        (msg.items || []).forEach(function(r) {
+          if (r.autoExclude) {
+            aiExcludedIds.add(r.id);
+            if (r.reason) aiReasonById[r.id] = r.reason;
+          }
+        });
         if (state.activeTab === 'branch') renderBranch();
         break;
       case 'branch:changesData':
@@ -3397,6 +3420,18 @@ export function buildSidebarScript(): string {
 
   // ---- Branch tab renderer ----
   let branchData = { plans: [], changes: [], commits: [], commitsMode: 'empty', conversations: [], conversationsFailedSources: [] };
+  // AI context-relevance overlay (in-memory, session-scoped). Populated by the
+  // Review panel's ranking via the host's 'context:relevance' push; ids are the
+  // CONTEXT rows' data-id keys (plan slug / note id / reference mapKey). Rows in
+  // aiExcludedIds render struck-through + dimmed (same look as user excludes but
+  // an independent axis — user excludes live on item.isSelected). aiReasonById
+  // feeds the row's native tooltip. Cleared when the file selection changes (the
+  // ranking was computed against the old file set) and replaced wholesale on
+  // each push. A window reload drops it — the panel re-ranks on next open.
+  // Object.create(null): a plan slug like "constructor" must not hit a
+  // prototype-chain key and surface Object internals as a tooltip.
+  let aiExcludedIds = new Set();
+  let aiReasonById = Object.create(null);
   // How many committed memories are currently shown. Grows by COMMITS_PAGE each
   // time "Show N more" is clicked; reset to the page size whenever the commit
   // sequence changes (new branch / new commit) so a fresh list starts collapsed.
@@ -4266,19 +4301,29 @@ export function buildSidebarScript(): string {
     // Strikethrough-exclude toggle joins the hover action cluster (after the
     // trash Remove). Distinct from Remove: exclude just leaves the item out of
     // the next memory (reversible), Remove deletes the note/plan/reference.
-    planActions.push(excludeToggle(!!item.isSelected));
+    // The toggle's initial glyph reads BOTH strike axes (user exclude via
+    // isSelected, AI soft-exclude via aiExcludedIds): any struck row shows "+"
+    // (add back); only a fully-normal row shows the "✕" leave-out.
+    const aiEx = aiExcludedIds.has(item.id);
+    planActions.push(excludeToggle(!!item.isSelected && !aiEx));
     kids.push(el('span', { className: 'inline-actions' }, planActions));
     // Suppress the native title= on every row type that drives the .hover-card
     // popover (plan / note / reference — see the tabContents.branch mouseover
     // handler). A title= would surface a duplicate native tooltip showing the
     // MarkdownString-source plain text, and worse it would trigger on a
     // different timer than the card so the two tooltips would compete.
+    // Exception: an AI-excluded row carries the AI's one-line reason as its
+    // native tooltip — the sidebar shows no tier chips / inline notes, so this
+    // is the only place the "why" surfaces. The row is dimmed and struck, so the
+    // occasional overlap with the hover-card reads acceptably.
     return el('div', {
-      className: 'tree-node tree-node--hover-actions' + (item.isSelected ? '' : ' excluded'),
+      className: 'tree-node tree-node--hover-actions'
+        + (item.isSelected ? '' : ' excluded')
+        + (aiEx ? ' ai-excluded' : ''),
       'data-indent': String(depth),
       'data-context': item.contextValue || '',
       'data-id': item.id,
-      title: null,
+      title: aiEx ? (aiReasonById[item.id] || null) : null,
     }, kids);
   }
 
@@ -5564,18 +5609,55 @@ export function buildSidebarScript(): string {
     e.stopPropagation();
     const row = toggle.closest('.tree-node');
     if (!row) return;
-    const nowExcluded = row.classList.toggle('excluded');
-    const cb = row.querySelector('input[data-checkbox="1"]');
-    if (cb) {
-      cb.checked = !nowExcluded;
-      cb.dispatchEvent(new Event('change', { bubbles: true }));
+    // Unified two-axis semantics: a row struck by EITHER axis (user exclude via
+    // .excluded / AI soft-exclude via .ai-excluded) offers "+" = add back, which
+    // clears BOTH axes at once — the user's intent is "make this item normal
+    // again", not "flip one internal layer". An unstruck row offers "✕" = user
+    // leave-out (unchanged behavior; AI exclusion is never set from here).
+    const wasUser = row.classList.contains('excluded');
+    const wasAi = row.classList.contains('ai-excluded');
+    const struck = wasUser || wasAi;
+    if (struck) {
+      if (wasUser) {
+        // Restore the user axis through the hidden checkbox so the existing
+        // per-kind change handler posts the same toggle*Selection message.
+        row.classList.remove('excluded');
+        const cb = row.querySelector('input[data-checkbox="1"]');
+        if (cb) {
+          cb.checked = true;
+          cb.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+      if (wasAi) {
+        // Dismiss the AI suggestion: optimistic local clear + the same
+        // branch:dismissAiExclude round-trip the Review panel uses (host sets the
+        // entry's dismissed-flag via dismissAiExclusion — the AI's verdict is
+        // kept — so the worker's fingerprint reuse honors the veto).
+        row.classList.remove('ai-excluded');
+        row.removeAttribute('title');
+        const id = row.getAttribute('data-id');
+        aiExcludedIds.delete(id);
+        delete aiReasonById[id];
+        vscode.postMessage({
+          type: 'branch:dismissAiExclude',
+          kind: row.getAttribute('data-context'),
+          key: id,
+        });
+      }
+    } else {
+      row.classList.add('excluded');
+      const cb = row.querySelector('input[data-checkbox="1"]');
+      if (cb) {
+        cb.checked = false;
+        cb.dispatchEvent(new Event('change', { bubbles: true }));
+      }
     }
     const ic = toggle.querySelector('.codicon');
     if (ic) {
-      ic.classList.toggle('codicon-close', !nowExcluded);
-      ic.classList.toggle('codicon-add', nowExcluded);
+      ic.classList.toggle('codicon-close', struck);
+      ic.classList.toggle('codicon-add', !struck);
     }
-    toggle.setAttribute('aria-label', nowExcluded ? 'Add back to this memory' : 'Leave out of this memory');
+    toggle.setAttribute('aria-label', struck ? 'Leave out of this memory' : 'Add back to this memory');
   });
 
   // Squash confirm-bar actions (Select-all / Squash / Cancel). The bar lives in
@@ -5669,6 +5751,16 @@ export function buildSidebarScript(): string {
         filePath: filePath,
         selected: !!cb.checked,
       });
+      // The AI relevance overlay was ranked against the OLD file selection —
+      // clear it so no stale strikethrough lingers. With the Review panel open
+      // its debounced refresh re-ranks and re-pushes within ~400ms; with the
+      // panel closed the overlay stays cleared (correct: no ranking exists for
+      // the new file set).
+      if (aiExcludedIds.size > 0) {
+        aiExcludedIds = new Set();
+        aiReasonById = Object.create(null);
+        if (state.activeTab === 'branch') renderBranch();
+      }
     }
   });
 

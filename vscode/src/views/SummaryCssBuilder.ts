@@ -399,11 +399,23 @@ export function buildCss(): string {
   .e2e-scenario .callout.steps .callout-label { color: var(--callout-response-label); }
   .e2e-scenario .callout.expectedResults { background: var(--callout-decisions-bg); }
   .e2e-scenario .callout.expectedResults .callout-label { color: var(--callout-decisions-label); }
-  .ai-excluded { margin: 6px 0 2px; }
-  .ai-excluded-summary { cursor: pointer; font-size: 12px; color: #8a63d2; user-select: none; padding: 4px 0; }
-  .ai-ex-list { margin: 4px 0 8px; padding-left: 18px; list-style: none; }
-  .ai-ex-item { font-size: 12.5px; color: var(--vscode-foreground); margin: 3px 0; }
-  .ai-ex-reason { color: var(--vscode-descriptionForeground); }
+  /* AI relevance meta line under a kept context row: tier chip + ✨ reason.
+     Chip colors mirror the Review panel's ctx-tier--* (green/amber/neutral),
+     restated with theme-safe rgba/vscode vars for this webview. */
+  .ctx-rel { display: flex; align-items: baseline; gap: 6px; margin-top: 2px; min-width: 0; }
+  .ctx-tier { flex-shrink: 0; font-size: 10px; font-weight: 650; letter-spacing: 0.02em; padding: 1px 7px; border-radius: 10px; }
+  .ctx-tier--high { background: rgba(27,138,79,0.16); color: var(--vscode-charts-green, #1b8a4f); }
+  .ctx-tier--mid { background: rgba(150,104,14,0.16); color: var(--vscode-charts-yellow, #96680e); }
+  .ctx-tier--low { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-descriptionForeground); }
+  .ctx-tier--ex { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-disabledForeground, var(--vscode-descriptionForeground)); }
+  .ai-say { flex: 1; min-width: 0; font-size: 11px; color: #8a63d2; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  body.vscode-dark .ai-say, body.vscode-high-contrast .ai-say { color: #a99cf0; }
+  /* AI soft-excluded context item, inlined read-only after the kept rows:
+     dimmed + struck-through title, no hover actions (nothing to open — the
+     item was never archived into this commit). */
+  .ai-ex-row { opacity: 0.55; }
+  .ai-ex-row:hover { opacity: 1; }
+  .ai-ex-row .ai-ex-title { text-decoration: line-through; }
   .e2e-scenario .callout ol {
     margin: 0; padding-left: 1.4em;
   }
