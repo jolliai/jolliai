@@ -15,6 +15,27 @@ describe("SourceDefinitionRegistry", () => {
 		expect(r.match("claude", "mcp__claude_ai_Notion__notion-search")).toBeUndefined(); // acceptSuffix gate
 	});
 
+	it("match rejects Claude enumeration tools via denySuffixes, keeps single-entity fetches", () => {
+		const r = getRegistry();
+		// Enumeration tools are excluded (bulk-capture guard):
+		expect(r.match("claude", "mcp__linear__list_issues")).toBeUndefined();
+		expect(r.match("claude", "mcp__linear__search_issues")).toBeUndefined();
+		expect(r.match("claude", "mcp__claude_ai_Linear__list_issues")).toBeUndefined();
+		// Single-entity fetches still resolve:
+		expect(r.match("claude", "mcp__linear__get_issue")?.id).toBe("linear");
+	});
+
+	it("no longer matches Codex Linear enumeration tools", () => {
+		const r = getRegistry();
+		expect(r.match("codex", "_list_issues", "linear")).toBeUndefined();
+		expect(r.match("codex", "_search", "linear")).toBeUndefined();
+		expect(r.match("codex", "linear.list_issues")).toBeUndefined();
+		expect(r.match("codex", "linear.search")).toBeUndefined();
+		// Single-entity Codex Linear tools still resolve:
+		expect(r.match("codex", "_get_issue", "linear")?.id).toBe("linear");
+		expect(r.match("codex", "linear.get_issue")?.id).toBe("linear");
+	});
+
 	it("match resolves Codex by namespaceSuffix + name, and by invocation tool", () => {
 		const r = getRegistry();
 		expect(r.match("codex", "_fetch", "linear")?.id).toBe("linear"); // function_call path

@@ -8,7 +8,9 @@
  *   - claude: first definition whose `match.claude.prefixes` has a prefix the
  *     tool name starts with; if that definition also declares `acceptSuffix`,
  *     the tool name must end with it too (Notion's "notion-fetch" gate — a
- *     prefix match with the wrong suffix is not a match at all).
+ *     prefix match with the wrong suffix is not a match at all); and if it
+ *     declares `denySuffixes`, a tool name ending in any of them is rejected
+ *     (enumeration tools like `list_issues` that would bulk-capture results).
  *   - codex, with a namespace (function_call path): first definition whose
  *     `match.codex.namespaceSuffix` equals the namespace AND whose
  *     `functionCallNames` includes the tool name (disambiguates names like
@@ -182,7 +184,7 @@ export class SourceDefinitionRegistry {
 
 	/**
 	 * Resolves the definition that owns a tool invocation.
-	 * - `agent === "claude"`: prefix + optional `acceptSuffix` match.
+	 * - `agent === "claude"`: prefix + optional `acceptSuffix` accept + optional `denySuffixes` reject.
 	 * - `agent === "codex"` with `namespace`: `namespaceSuffix` + `functionCallNames` match.
 	 * - `agent === "codex"` without `namespace`: `invocationTools` match.
 	 */
@@ -191,7 +193,9 @@ export class SourceDefinitionRegistry {
 			return this.definitions.find((d) => {
 				const m = d.match.claude;
 				if (m === undefined || !m.prefixes.some((prefix) => toolName.startsWith(prefix))) return false;
-				return m.acceptSuffix === undefined || toolName.endsWith(m.acceptSuffix);
+				if (m.acceptSuffix !== undefined && !toolName.endsWith(m.acceptSuffix)) return false;
+				if (m.denySuffixes?.some((suffix) => toolName.endsWith(suffix))) return false;
+				return true;
 			});
 		}
 
