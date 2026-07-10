@@ -1279,6 +1279,51 @@ describe("StopHook — plan discovery", () => {
 		expect(savePlansRegistry).not.toHaveBeenCalled();
 	});
 
+	it("should not register agent scratch review markdown (pr320-review.md / code-review.md / pr_review.md)", async () => {
+		vi.mocked(existsSync).mockReturnValue(true);
+
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/repo/pr320-review.md"}}',
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/repo/docs/code-review.md"}}',
+			'{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/pr_review.md"}}',
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/repo/review.md"}}',
+		]);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(savePlansRegistry).not.toHaveBeenCalled();
+	});
+
+	it("should not register agent scratch report markdown (task-report.md / task_report.md / report.md)", async () => {
+		vi.mocked(existsSync).mockReturnValue(true);
+
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/repo/task-report.md"}}',
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/repo/docs/task_report.md"}}',
+			'{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/report.md"}}',
+		]);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(savePlansRegistry).not.toHaveBeenCalled();
+	});
+
+	it("should not register .md files written under temp dirs (/tmp, /private/tmp scratchpad)", async () => {
+		vi.mocked(existsSync).mockReturnValue(true);
+
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/tmp/scratch-plan.md"}}',
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/private/tmp/claude-501/session/scratchpad/notes.md"}}',
+		]);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(savePlansRegistry).not.toHaveBeenCalled();
+	});
+
 	it("should register an external .md edited multiple times as a single plan entry", async () => {
 		vi.mocked(existsSync)
 			.mockReturnValueOnce(true) // transcript file

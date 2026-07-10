@@ -110,8 +110,9 @@ const { getNotesDir } = vi.hoisted(() => ({
 	getNotesDir: vi.fn(() => "/test/workspace/.jolli/jollimemory/notes"),
 }));
 
-const { homedir } = vi.hoisted(() => ({
+const { homedir, tmpdir } = vi.hoisted(() => ({
 	homedir: vi.fn(() => "/home/user"),
+	tmpdir: vi.fn(() => "/tmp"),
 }));
 
 const { existsSync, readFileSync } = vi.hoisted(() => ({
@@ -1049,6 +1050,7 @@ vi.mock("./services/ManualDisableFlag.js", () => ({
 
 vi.mock("node:os", () => ({
 	homedir,
+	tmpdir,
 }));
 
 vi.mock("node:fs", () => ({
