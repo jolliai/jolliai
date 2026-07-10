@@ -65,7 +65,6 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		associateNoteWithCommit: vi.fn().mockResolvedValue(undefined),
 		associateReferenceWithCommit: vi.fn().mockResolvedValue(undefined),
 		detectUncommittedReferenceIds: vi.fn().mockResolvedValue([]),
-		discardExcludedWorkingItems: vi.fn().mockResolvedValue({ plans: 0, notes: 0, references: 0 }),
 		detectActivePlansForBranch: vi.fn().mockResolvedValue([]),
 		detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
 		getReferenceEntriesForBranch: vi.fn().mockResolvedValue([]),
@@ -86,6 +85,7 @@ vi.mock("../core/references/ReferenceStore.js", () => ({
 	readReferenceMarkdownFromString: vi.fn().mockReturnValue(null),
 	writeReferenceMarkdown: vi.fn().mockResolvedValue({ sourcePath: "/x", contentHash: "fakehash" }),
 	hashReferenceContent: vi.fn().mockReturnValue("fakehash"),
+	deleteReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../core/PlanPromptFormatter.js", () => ({
@@ -269,13 +269,13 @@ import {
 	detectActiveNotesForBranch,
 	detectActivePlansForBranch,
 	detectUncommittedReferenceIds,
-	discardExcludedWorkingItems,
 	getReferenceEntriesForBranch,
 	loadAllSessions,
 	loadConfig,
 	loadCursorForTranscript,
 	loadPlansRegistry,
 	saveCursor,
+	savePlansRegistry,
 } from "../core/SessionTracker.js";
 import type { SummaryResult } from "../core/Summarizer.js";
 import { generateSummary } from "../core/Summarizer.js";
@@ -494,22 +494,164 @@ describe("QueueWorker selection filter", () => {
 		expect(vi.mocked(readTranscript)).toHaveBeenCalled();
 	});
 
-	it("discards excluded plans/notes/references after archival (commit path)", async () => {
+	it("keeps user-excluded plans/notes/references uncommitted instead of discarding them", async () => {
+		// "Leave out of this memory" is a one-commit skip, NOT a discard: an excluded
+		// plan/note/reference must never be associated with the commit, so it keeps
+		// commitHash === null and stays visible on the panel for the user to re-check on
+		// a later commit. A KEEP control alongside each SKIP proves the association path
+		// is live (so the SKIP absence is meaningful, not a mock-off no-op). The row is
+		// never removed from the working area — the old discard pass is gone.
 		seedGitMocks(projectDir);
 		vi.mocked(loadAllSessions).mockResolvedValue([]);
 		vi.mocked(buildMultiSessionContext).mockReturnValue("");
 
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: {
+				"plan-keep": {
+					slug: "plan-keep",
+					title: "Keep Plan",
+					sourcePath: "/fake/plan-keep.md",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					commitHash: null,
+				},
+				"plan-skip": {
+					slug: "plan-skip",
+					title: "Skip Plan",
+					sourcePath: "/fake/plan-skip.md",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					commitHash: null,
+				},
+			},
+			notes: {
+				"note-keep": {
+					id: "note-keep",
+					title: "Keep Note",
+					format: "markdown",
+					sourcePath: "/fake/note-keep.md",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					commitHash: null,
+				},
+				"note-skip": {
+					id: "note-skip",
+					title: "Skip Note",
+					format: "markdown",
+					sourcePath: "/fake/note-skip.md",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					commitHash: null,
+				},
+			},
+			// Seed the excluded reference as an active registry row so the survival
+			// assertions below are non-vacuous: a re-added discard pass would look the
+			// excluded key up HERE and unlink its backing markdown.
+			references: {
+				"linear:L-SKIP": {
+					source: "linear",
+					nativeId: "L-SKIP",
+					title: "Skip Ref",
+					url: "https://linear.app/x/issue/L-SKIP",
+					sourcePath: "/fake/linear/L-SKIP.md",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					sourceToolName: "mcp__linear__get_issue",
+				},
+			},
+		});
+
+		// Make the seeded plan/note source files "exist" so associate* actually reaches
+		// them — otherwise every entry is skipped as missing-on-disk and the SKIP
+		// assertions below would pass vacuously.
+		const fs = await import("node:fs");
+		vi.mocked(fs.existsSync).mockImplementation((p) => {
+			const s = String(p);
+			return (
+				s.endsWith("plan-keep.md") ||
+				s.endsWith("plan-skip.md") ||
+				s.endsWith("note-keep.md") ||
+				s.endsWith("note-skip.md")
+			);
+		});
+		vi.mocked(fs.readFileSync).mockImplementation(() => "# body\ncontent");
+
+		// References: seed a keep/skip pair on the branch and track which sourcePaths the
+		// Step-6b loop reads (via readReferenceMarkdown), so the kept ref IS read and the
+		// excluded one is not.
+		const keepRef: ReferenceEntry = {
+			source: "linear",
+			nativeId: "L-KEEP",
+			title: "Keep Ref",
+			url: "https://linear.app/x/issue/L-KEEP",
+			sourcePath: "/fake/linear/L-KEEP.md",
+			addedAt: "2026-01-01T00:00:00Z",
+			updatedAt: "2026-01-01T00:00:00Z",
+			sourceToolName: "mcp__linear__get_issue",
+		};
+		const skipRef: ReferenceEntry = {
+			source: "linear",
+			nativeId: "L-SKIP",
+			title: "Skip Ref",
+			url: "https://linear.app/x/issue/L-SKIP",
+			sourcePath: "/fake/linear/L-SKIP.md",
+			addedAt: "2026-01-01T00:00:00Z",
+			updatedAt: "2026-01-01T00:00:00Z",
+			sourceToolName: "mcp__linear__get_issue",
+		};
+		vi.mocked(getReferenceEntriesForBranch).mockResolvedValue([keepRef, skipRef]);
+		const referenceStore = await import("../core/references/ReferenceStore.js");
+		const refReadPaths: string[] = [];
+		vi.mocked(referenceStore.readReferenceMarkdown).mockImplementation(async (p) => {
+			refReadPaths.push(String(p));
+			return null;
+		});
+
 		await setExcluded(projectDir, "plans", "plan-skip", true);
 		await setExcluded(projectDir, "notes", "note-skip", true);
-		await setExcluded(projectDir, "references", "linear:L-9", true);
+		await setExcluded(projectDir, "references", "linear:L-SKIP", true);
 
 		await executePipeline(projectDir, makeCommitOp());
 
-		expect(vi.mocked(discardExcludedWorkingItems)).toHaveBeenCalledTimes(1);
-		const arg = vi.mocked(discardExcludedWorkingItems).mock.calls[0][0];
-		expect(arg.plans.has("plan-skip")).toBe(true);
-		expect(arg.notes.has("note-skip")).toBe(true);
-		expect(arg.references.has("linear:L-9")).toBe(true);
+		expect(vi.mocked(storeSummary)).toHaveBeenCalledTimes(1);
+		const summaryArg = vi.mocked(storeSummary).mock.calls[0][0];
+		// KEEP items ARE archived (slug/id carries the `-abc12345` commit suffix);
+		// SKIP items are NOT — they keep commitHash === null and stay on the panel.
+		const planSlugs = (summaryArg.plans ?? []).map((p) => p.slug);
+		const noteIds = (summaryArg.notes ?? []).map((n) => n.id);
+		expect(planSlugs).toContain("plan-keep-abc12345");
+		expect(planSlugs.some((s) => s.startsWith("plan-skip"))).toBe(false);
+		expect(noteIds).toContain("note-keep-abc12345");
+		expect(noteIds.some((s) => s.startsWith("note-skip"))).toBe(false);
+		// The excluded reference is dropped from the archive read; the kept one is read.
+		expect(refReadPaths).toContain("/fake/linear/L-KEEP.md");
+		expect(refReadPaths).not.toContain("/fake/linear/L-SKIP.md");
+
+		// ── Regression pin: the skip rows must SURVIVE, not be discarded. ──────────
+		// Absence from summary.plans/notes (above) is NOT enough: the pre-fix bug
+		// (discardExcludedWorkingItems) also kept the excluded items out of the
+		// summary — it filtered them from association AND then deleted their registry
+		// rows + backing files. So the assertions above would stay green even if that
+		// discard pass were re-added. The contract that actually pins this fix is that
+		// the skip rows keep commitHash === null in every plans.json write and their
+		// backing markdown is never unlinked. loadPlansRegistry is mocked, so we assert
+		// on what got WRITTEN (savePlansRegistry) rather than re-reading — which is the
+		// stronger check anyway, since the regression's tell is the removing write.
+		const savedRegistries = vi.mocked(savePlansRegistry).mock.calls.map((c) => c[0]);
+		expect(savedRegistries.length).toBeGreaterThan(0);
+		for (const reg of savedRegistries) {
+			// plan-skip / note-skip stay present and unassociated in EVERY write. A
+			// re-added discard pass would emit a write with these rows removed.
+			expect(reg.plans["plan-skip"]).toBeDefined();
+			expect(reg.plans["plan-skip"]?.commitHash).toBeNull();
+			expect(reg.notes?.["note-skip"]).toBeDefined();
+			expect(reg.notes?.["note-skip"]?.commitHash).toBeNull();
+			// The active reference row is never torn down.
+			expect(reg.references?.["linear:L-SKIP"]).toBeDefined();
+		}
+		// The excluded reference's backing markdown is never unlinked.
+		expect(vi.mocked(referenceStore.deleteReferenceMarkdown)).not.toHaveBeenCalledWith("/fake/linear/L-SKIP.md");
 	});
 
 	it("filters excluded plans out of the plans block input", async () => {

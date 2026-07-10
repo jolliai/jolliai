@@ -68,7 +68,6 @@ import {
 	detectActiveNotesForBranch,
 	detectActivePlansForBranch,
 	detectUncommittedReferenceIds,
-	discardExcludedWorkingItems,
 	filterSessionsByEnabledIntegrations,
 	getReferenceEntriesForBranch,
 	loadAllSessions,
@@ -1482,7 +1481,7 @@ export interface ConsumedWorkspaceContext {
  * Consumes the checked working-area Context (plans / notes / references) for a
  * commit: associates each kind with `commitHash` (moving it out of the working
  * area, i.e. setting the registry `commitHash` for plans/notes and archiving
- * references to the orphan branch), then discards the user's hard-excluded rows.
+ * references to the orphan branch).
  *
  * Apply per-item exclusions BEFORE associate* — these helpers have side effects
  * (savePlansRegistry archive entry + orphan-branch store), so a post-filter on
@@ -1490,12 +1489,11 @@ export interface ConsumedWorkspaceContext {
  * prompt-block filter only governs LLM input; this archive path is a separate
  * registry scan and must be filtered here.
  *
- * AI soft-excluded items (`excludedContext`) are skipped from association too —
- * otherwise they'd get a commitHash (moved out of the working area) while ALSO
- * being listed in excludedContext. Soft-excluded items must keep NO commitHash
- * and stay in the working area for re-evaluation on the next commit. Unlike user
- * hard-excludes they are NOT discarded (discardExcludedWorkingItems only sees the
- * `exclusions` set), so they simply remain uncommitted.
+ * Both user hard-excludes (`exclusions`) and AI soft-excludes (`excludedContext`)
+ * are only skipped from association — they are NOT discarded. They keep NO
+ * commitHash, their registry rows + backing files stay intact, and they remain on
+ * the panel for the user to re-check on a later commit. "Leave out of this memory"
+ * is a one-commit skip, not a delete.
  *
  * Extracted from the normal commit pipeline so all four amend paths consume
  * Context identically — the old bug was that only the normal path and the amend
@@ -1563,16 +1561,11 @@ async function consumeWorkspaceContext(args: {
 		await finalizeReferenceArchive(referenceCommitted, cwd);
 	}
 
-	// Discard the unchecked working items: the CHECKED ones were archived above;
-	// the excluded ones are useless per the user's selection, so remove their
-	// registry rows (+ .jolli-owned backing files) WITHOUT writing them into the
-	// committed memory. Runs after associate* so the checked-item archival (which
-	// reloads the registry under lock) has already settled.
-	await discardExcludedWorkingItems(
-		{ plans: exclusions.plans, notes: exclusions.notes, references: exclusions.references },
-		cwd,
-	);
-
+	// Excluded working items are intentionally NOT discarded: "Leave out of this
+	// memory" means "skip this commit but keep the item on the panel so the user can
+	// re-check it later." Because they were filtered out of association above, they
+	// keep commitHash === null and their registry rows + backing files stay intact,
+	// so detectActive*ForBranch surfaces them again on the next refresh.
 	return { planAssociation, noteRefs, referenceRefs };
 }
 
@@ -1622,7 +1615,9 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// Step 3+4: Load sessions and read transcripts with time cutoff for queue-driven attribution.
 	// Excluded conversations are DISCARDED inside `loadSessionTranscripts` — their cursor is
 	// advanced (consumed) but their entries are dropped from the summary. The plans/notes/refs
-	// exclusion read here drives both prompt-block filtering and the discard pass below.
+	// exclusion read here only drives prompt-block filtering and skip-from-association; those
+	// items are NOT discarded — they stay in the working area (commitHash === null) and remain
+	// on the panel for the user to re-check on a later commit.
 	const exclusions = await readExclusions(cwd);
 	const {
 		sessionTranscripts,
@@ -1699,8 +1694,9 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// clearly-unrelated items. Wrapped so ANY failure (git / content-read / LLM /
 	// parse) falls back to the full user-kept set — a relevance problem must never
 	// break summary generation. rankContextRelevance is itself fail-open; this guard
-	// additionally covers the git + content-read steps around it. Soft-excluded items
-	// are recorded on the summary's excludedContext (not hard-discarded like user excludes).
+	// additionally covers the git + content-read steps around it. Soft-excluded items are
+	// recorded on the summary's excludedContext; like user hard-excludes they are skipped
+	// from association but kept in the working area (never discarded).
 	let activePlanEntries = userKeptPlans;
 	let activeNoteEntries = userKeptNotes;
 	let activeReferenceEntries = userKeptReferences;
@@ -1818,9 +1814,9 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	log.info("API summary generated (%s)", formatElapsed(stepStart));
 
 	// Consume the checked working-area Context (plans / notes / references):
-	// associate with this commit + discard user hard-excludes. AI soft-excludes
-	// (excludedContext) stay uncommitted. See consumeWorkspaceContext for the full
-	// archive-side-exclusion rationale.
+	// associate with this commit. User hard-excludes and AI soft-excludes
+	// (excludedContext) are skipped from association and stay uncommitted (kept on
+	// the panel). See consumeWorkspaceContext for the full archive-side rationale.
 	const { planAssociation, noteRefs, referenceRefs } = await consumeWorkspaceContext({
 		cwd,
 		branch,
@@ -2586,7 +2582,9 @@ async function handleAmendPipeline(
 
 	// Load sessions and read transcripts with time cutoff. Excluded conversations are
 	// DISCARDED inside `loadSessionTranscripts` (cursor advanced, entries dropped). The
-	// exclusion read here drives prompt-block filtering and the discard pass below.
+	// plans/notes/refs exclusion read here only drives prompt-block filtering and
+	// skip-from-association; those items are NOT discarded — they stay in the working area
+	// (commitHash === null) and remain on the panel for the user to re-check later.
 	const amendConfig = await loadConfig();
 	const amendExclusions = await readExclusions(cwd);
 	// Resolve the branch once for every amend path that consumes Context (both

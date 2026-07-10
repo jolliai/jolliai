@@ -26,7 +26,6 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		associatePlanWithCommit: vi.fn(),
 		associateNoteWithCommit: vi.fn(),
 		detectUncommittedReferenceIds: vi.fn().mockResolvedValue([]),
-		discardExcludedWorkingItems: vi.fn().mockResolvedValue({ plans: 0, notes: 0, references: 0 }),
 		detectActivePlansForBranch: vi.fn().mockResolvedValue([]),
 		detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
 		getReferenceEntriesForBranch: vi.fn().mockResolvedValue([]),

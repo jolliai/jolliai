@@ -35,8 +35,7 @@ import {
 } from "../Types.js";
 import { atomicWriteFile as atomicWrite } from "./AtomicWrite.js";
 import { withPlansLock } from "./Locks.js";
-import { isPathInside } from "./PathUtils.js";
-import { deleteReferenceMarkdown, writeReferenceMarkdown } from "./references/ReferenceStore.js";
+import { writeReferenceMarkdown } from "./references/ReferenceStore.js";
 
 const log = createLogger("SessionTracker");
 
@@ -1148,107 +1147,6 @@ export async function associatePlanWithCommit(archivedSlug: string, commitHash: 
 		await savePlansRegistry(updated, cwd);
 		log.info("associatePlanWithCommit: migrated guard %s → %s", split.baseKey, commitHash.substring(0, 8));
 	});
-}
-
-/**
- * Discards the working-area items the user left UNCHECKED at commit time.
- *
- * Selection semantics: checked items are archived into committed memory (elsewhere);
- * unchecked items are "useless" and must leave the working area WITHOUT being written
- * into committed memory. This removes the excluded rows from plans.json and deletes
- * their `.jolli`-owned backing files.
- *
- * - Plans: registry row removed; the external `~/.claude/plans/<slug>.md` is left
- *   untouched (user-owned — a later edit legitimately re-discovers it).
- * - Notes: registry row removed; backing file deleted only when it lives inside
- *   `.jolli/jollimemory/` (external note sources are preserved).
- * - References: registry row removed; backing markdown (always under `.jolli`) deleted.
- *
- * Only uncommitted rows (`commitHash === null` and no `contentHashAtCommit`) are
- * touched, so a stale exclusion key can never clobber a committed guard row.
- * References carry no commit state, so any matching key is an active row.
- */
-export async function discardExcludedWorkingItems(
-	exclusions: {
-		readonly plans: ReadonlySet<string>;
-		readonly notes: ReadonlySet<string>;
-		readonly references: ReadonlySet<string>;
-	},
-	cwd?: string,
-): Promise<{ plans: number; notes: number; references: number }> {
-	const removed = { plans: 0, notes: 0, references: 0 };
-	const noteFilesToDelete: string[] = [];
-	const refFilesToDelete: string[] = [];
-
-	await withPlansLock(cwd, async () => {
-		const registry = await loadPlansRegistry(cwd);
-		const plans = { ...registry.plans };
-		const notes = { ...(registry.notes ?? {}) };
-		const references = { ...(registry.references ?? {}) };
-
-		for (const slug of exclusions.plans) {
-			const entry = plans[slug];
-			if (entry && entry.commitHash === null && entry.contentHashAtCommit === undefined) {
-				delete plans[slug];
-				removed.plans++;
-			}
-		}
-		for (const id of exclusions.notes) {
-			const entry = notes[id];
-			if (entry && entry.commitHash === null && entry.contentHashAtCommit === undefined) {
-				if (entry.sourcePath) noteFilesToDelete.push(entry.sourcePath);
-				delete notes[id];
-				removed.notes++;
-			}
-		}
-		for (const key of exclusions.references) {
-			const entry = references[key];
-			if (entry) {
-				if (entry.sourcePath) refFilesToDelete.push(entry.sourcePath);
-				delete references[key];
-				removed.references++;
-			}
-		}
-
-		if (removed.plans > 0 || removed.notes > 0 || removed.references > 0) {
-			await savePlansRegistry(
-				{
-					...registry,
-					plans,
-					notes: Object.keys(notes).length > 0 ? notes : undefined,
-					references: Object.keys(references).length > 0 ? references : undefined,
-				},
-				cwd,
-			);
-		}
-	});
-
-	// Backing-file cleanup AFTER the lock — the rows are already gone, so a failed
-	// unlink can never strand registry state. Note sources outside `.jolli` (the
-	// user's own markdown files added via "Add Markdown File") are never deleted.
-	const jolliDir = getJolliMemoryDir(cwd);
-	for (const p of noteFilesToDelete) {
-		if (isPathInside(p, jolliDir)) {
-			try {
-				await rm(p, { force: true });
-			} catch {
-				/* best-effort */
-			}
-		}
-	}
-	for (const p of refFilesToDelete) {
-		await deleteReferenceMarkdown(p);
-	}
-
-	if (removed.plans > 0 || removed.notes > 0 || removed.references > 0) {
-		log.info(
-			"Discarded excluded working items: %d plan(s), %d note(s), %d reference(s)",
-			removed.plans,
-			removed.notes,
-			removed.references,
-		);
-	}
-	return removed;
 }
 
 /**
