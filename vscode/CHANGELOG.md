@@ -1,6 +1,16 @@
 # Changelog
 
-<!-- Last synced commit: da989203 | 2026-07-07 -->
+<!-- Last synced commit: 17e671be | 2026-07-10 -->
+
+## 0.99.7
+
+- **Slack & Zoom references** — Slack threads and Zoom meetings or docs mentioned in your AI conversations now appear in your memories, PR descriptions, and exports, right alongside Linear, Jira, GitHub, and Notion.
+- **Smarter about what goes into a memory** — a relevance check keeps only the plans, notes, and references that actually relate to your commit, so your memories stay on-topic.
+- **Global Instructions live in Settings** — the pop-up that asked when you enabled Jolli is gone. Turn Jolli's agent guidance on or off any time from the **Global Instructions** toggle in **Settings → AI Agents**.
+- **A tidier memories list** — long branches now show 6 memories at a time with a **Show more** link, and the CONTEXT count stays in sync as you toggle plans and notes.
+- **More accurate cost estimates** — each memory is now priced by the model that actually generated it (Opus / Sonnet / Haiku) instead of a flat Sonnet rate.
+- **Safer pushing** — a new pre-push step tidies up leftover memory data and retries the sync if a push races with it, so nothing gets left behind.
+- Bug fixes
 
 ## 0.99.6
 
