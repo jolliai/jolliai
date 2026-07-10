@@ -96,6 +96,28 @@ export type FrontDoorResult =
 	  }
 	| { readonly status: "no_spaces" };
 
+/** How to reach a platform tool's backend endpoint, as advertised by the manifest. */
+export interface PlatformToolBinding {
+	readonly method: string;
+	readonly path: string;
+}
+
+/**
+ * A backend-defined Jolli-platform tool as advertised by `GET /api/mcp/manifest`.
+ * The `name` / `description` / `inputSchema` triple structurally matches the MCP
+ * server's tool definition so the server can splice these straight into its tool
+ * registry (the extra `binding` field is internal routing metadata, not part of
+ * the advertised tool schema). Declared here — with no MCP-SDK coupling — because
+ * this client owns the fetch, field validation, and the generic executor.
+ */
+export interface PlatformToolManifestEntry {
+	readonly name: string;
+	readonly description: string;
+	readonly inputSchema: { type: "object"; properties: Record<string, unknown>; required?: string[] };
+	/** REST binding the generic executor calls. Falls back to POST /api/mcp/tools/<name> when absent. */
+	readonly binding?: PlatformToolBinding;
+}
+
 /** Test seam — swap in a stub `fetch` / api key / base URL to drive unit tests deterministically. */
 export interface JolliMemoryPushClientOpts {
 	readonly fetchImpl?: typeof fetch;
@@ -108,6 +130,14 @@ export interface JolliMemoryPushClientOpts {
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * Manifest fetch runs at MCP-server startup, so it uses a much tighter timeout
+ * than a normal request: a reachable-but-slow backend must not stall server
+ * startup for the full default window. A timeout collapses to "no platform
+ * tools" like any other manifest failure.
+ */
+const MANIFEST_TIMEOUT_MS = 5_000;
 
 /** Raw shape of `GET /api/jolli-memory/spaces` — validated field-by-field at parse time. */
 interface ListSpacesResponseBody {
@@ -365,6 +395,68 @@ export class JolliMemoryPushClient {
 		return deriveJolliEnvKey(baseUrl) ?? "";
 	}
 
+	/**
+	 * Fetches the tenant's backend-defined Jolli-platform tool manifest
+	 * (`GET /api/mcp/manifest`). Best-effort by contract: EVERY failure mode —
+	 * a non-2xx status (including 404 when the surface is off and 403 when the
+	 * key lacks permission to invoke it), no api key configured, a network /
+	 * abort / timeout error, a non-JSON body, or a missing / empty tool array —
+	 * resolves to `[]` and NEVER throws, so a disabled or older backend silently
+	 * degrades to "no platform tools" instead of breaking MCP-server startup.
+	 * Malformed individual entries are dropped rather than failing the whole
+	 * manifest. Accepts either a `{ tools: [...] }` envelope or a bare array.
+	 */
+	async fetchManifest(): Promise<PlatformToolManifestEntry[]> {
+		try {
+			const { status, json, parseFailed } = await this.call<unknown>(
+				"GET",
+				"/api/mcp/manifest",
+				undefined,
+				MANIFEST_TIMEOUT_MS,
+			);
+			if (status < 200 || status >= 300 || parseFailed) {
+				return [];
+			}
+			return extractManifestTools(json)
+				.map(toPlatformToolEntry)
+				.filter((entry): entry is PlatformToolManifestEntry => entry !== null);
+		} catch {
+			// NotAuthenticatedError (no key / no resolvable URL), a rejected fetch,
+			// or an abort — all collapse to "no platform tools".
+			return [];
+		}
+	}
+
+	/**
+	 * Relays a Jolli-platform tool call to the endpoint the manifest advertised
+	 * for it (its `binding`), falling back to `POST /api/mcp/tools/<name>` when no
+	 * binding is present. Args are forwarded as-is — the backend validates them
+	 * against the tool's manifest schema, so the CLI does not re-validate.
+	 * Deliberately asymmetric to {@link fetchManifest}: a failed INVOCATION must
+	 * surface, so this THROWS on a non-2xx status or a 2xx body that isn't JSON
+	 * (the loud-fail pattern `push` / `listSpaces` use), letting the MCP server's
+	 * existing catch wrap it as an error response. A 2xx JSON body is returned
+	 * verbatim so the server's own envelope rules (a `type: "error"` result is an
+	 * error; a "needs input" result is not) apply to the backend's response shape
+	 * unchanged.
+	 */
+	async invokePlatformTool(tool: PlatformToolManifestEntry, args: Record<string, unknown>): Promise<unknown> {
+		const { baseUrl } = await this.resolveAuth();
+		const { origin } = parseBaseUrl(baseUrl);
+		const { method, path } = resolveToolEndpoint(tool, origin);
+		const { status, json, parseFailed } = await this.call<unknown>(method, path, args);
+		if (status === 426) {
+			throw new ClientOutdatedError(errorMessage(json));
+		}
+		if (status < 200 || status >= 300) {
+			throw new Error(errorMessage(json) ?? `HTTP ${status}`);
+		}
+		if (parseFailed) {
+			throw new Error(`Malformed (non-JSON) response from ${path} (HTTP ${status})`);
+		}
+		return json;
+	}
+
 	private async resolveAuth(): Promise<{
 		apiKey: string;
 		baseUrl: string;
@@ -410,14 +502,15 @@ export class JolliMemoryPushClient {
 	}
 
 	private async call<T>(
-		method: "GET" | "POST" | "DELETE",
+		method: string,
 		path: string,
 		body?: unknown,
+		timeoutMs: number = this.timeoutMs,
 	): Promise<{ status: number; json: T; parseFailed: boolean }> {
 		const { apiKey, baseUrl, keyMeta, tenantSlug } = await this.resolveAuth();
 		const { origin } = parseBaseUrl(baseUrl);
 		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+		const timer = setTimeout(() => controller.abort(), timeoutMs);
 		try {
 			const res = await this.fetchImpl(new URL(path, origin).toString(), {
 				method,
@@ -449,6 +542,126 @@ export class JolliMemoryPushClient {
 
 function isErrorBody(value: unknown): value is ErrorResponseBody {
 	return typeof value === "object" && value !== null;
+}
+
+/** HTTP methods a platform tool binding may use; anything else falls back to the conventional endpoint. */
+const ALLOWED_TOOL_METHODS: ReadonlySet<string> = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
+
+/**
+ * Resolves the endpoint for a platform tool call. Honors the manifest-advertised
+ * `binding` only when, after full WHATWG URL normalization against the tenant
+ * origin, it stays same-origin AND its method is a known HTTP method — otherwise
+ * it falls back to the conventional `POST /api/mcp/tools/<name>`. Comparing the
+ * *resolved* origin (not the raw string) is essential: a prefix check is defeated
+ * by inputs the URL parser rewrites — e.g. `/\host` (backslash becomes `/`) or a
+ * path with an embedded tab/CR/LF — which would otherwise smuggle an off-origin
+ * host and leak the bearer token. Mirrors the origin-allowlist comparison done at
+ * key-save time.
+ */
+function resolveToolEndpoint(tool: PlatformToolManifestEntry, origin: string): { method: string; path: string } {
+	const fallback = { method: "POST", path: `/api/mcp/tools/${encodeURIComponent(tool.name)}` };
+	const binding = tool.binding;
+	if (!binding) {
+		return fallback;
+	}
+	const method = binding.method.toUpperCase();
+	if (!ALLOWED_TOOL_METHODS.has(method)) {
+		return fallback;
+	}
+	try {
+		const resolved = new URL(binding.path, origin);
+		if (resolved.origin !== origin) {
+			return fallback;
+		}
+		return { method, path: resolved.pathname + resolved.search };
+	} catch {
+		return fallback;
+	}
+}
+
+/** Pulls the tool array out of a manifest body — `{ tools: [...] }` or a bare array. */
+function extractManifestTools(json: unknown): unknown[] {
+	if (Array.isArray(json)) {
+		return json;
+	}
+	if (json !== null && typeof json === "object") {
+		const tools = (json as { tools?: unknown }).tools;
+		if (Array.isArray(tools)) {
+			return tools;
+		}
+	}
+	return [];
+}
+
+/**
+ * Validates and normalizes one raw manifest entry, mirroring the MCP tool-input
+ * schema contract. Requires a non-empty string `name`, a string `description`,
+ * and an `inputSchema` object whose `type` is `"object"`. `properties` is
+ * OPTIONAL (a zero-arg tool omits it) and is defaulted to `{}` so the advertised
+ * schema always carries one; when present it must be a plain (non-array) object.
+ * `required`, when present, must be an array of strings. An optional `binding`
+ * must be a `{ method, path }` string pair. Any other shape is rejected (returns
+ * `null`) so a single malformed tool can neither survive into the advertised
+ * registry — where it could make the whole `tools/list` response fail a client's
+ * schema validation — nor drop a valid neighbor. Other JSON-Schema keywords on
+ * `inputSchema` are preserved.
+ */
+function toPlatformToolEntry(value: unknown): PlatformToolManifestEntry | null {
+	if (typeof value !== "object" || value === null) {
+		return null;
+	}
+	const { name, description, inputSchema, binding } = value as {
+		name?: unknown;
+		description?: unknown;
+		inputSchema?: unknown;
+		binding?: unknown;
+	};
+	if (typeof name !== "string" || name.trim() === "" || typeof description !== "string") {
+		return null;
+	}
+	if (typeof inputSchema !== "object" || inputSchema === null || Array.isArray(inputSchema)) {
+		return null;
+	}
+	const schema = inputSchema as Record<string, unknown>;
+	if (schema.type !== "object") {
+		return null;
+	}
+	// `properties` is optional; when present it must be a plain object, not an array.
+	if (
+		schema.properties !== undefined &&
+		(typeof schema.properties !== "object" || schema.properties === null || Array.isArray(schema.properties))
+	) {
+		return null;
+	}
+	// `required`, when present, must be an array of strings.
+	if (
+		schema.required !== undefined &&
+		(!Array.isArray(schema.required) || (schema.required as unknown[]).some((item) => typeof item !== "string"))
+	) {
+		return null;
+	}
+	let normalizedBinding: PlatformToolBinding | undefined;
+	if (binding !== undefined) {
+		if (typeof binding !== "object" || binding === null) {
+			return null;
+		}
+		const { method, path } = binding as { method?: unknown; path?: unknown };
+		if (typeof method !== "string" || typeof path !== "string") {
+			return null;
+		}
+		normalizedBinding = { method, path };
+	}
+	// A zero-arg tool omits `properties`; default it to `{}` without dropping any
+	// other schema keywords the backend supplied.
+	const inputSchemaOut = (
+		schema.properties === undefined ? { ...schema, properties: {} } : schema
+	) as PlatformToolManifestEntry["inputSchema"];
+	return {
+		name,
+		description,
+		inputSchema: inputSchemaOut,
+		...(normalizedBinding ? { binding: normalizedBinding } : {}),
+	};
 }
 
 function errorMessage(body: unknown): string | undefined {

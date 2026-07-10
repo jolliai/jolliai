@@ -50,6 +50,7 @@ const VALID_CONFIG_KEYS = [
 	"openCodeEnabled",
 	"cursorEnabled",
 	"copilotEnabled",
+	"mcpPlatformToolsEnabled",
 	"globalInstructions",
 	"logLevel",
 	"excludePatterns",
@@ -122,6 +123,7 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		key === "openCodeEnabled" ||
 		key === "cursorEnabled" ||
 		key === "copilotEnabled" ||
+		key === "mcpPlatformToolsEnabled" ||
 		key === "syncTranscripts" ||
 		key === "syncOnPush"
 	) {
@@ -201,6 +203,11 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "copilotEnabled",
 		type: "boolean",
 		description: "Enable Copilot CLI session discovery (true/false; requires Node 22.5+ at runtime)",
+	},
+	{
+		key: "mcpPlatformToolsEnabled",
+		type: "boolean",
+		description: "Register backend-defined Jolli-platform tools in the MCP server (true/false; off by default)",
 	},
 	{ key: "logLevel", type: "enum", description: "Log level: debug | info | warn | error" },
 	{ key: "excludePatterns", type: "string[]", description: "Glob patterns for file exclusion (comma-separated)" },

@@ -8,9 +8,12 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { VERSION } from "../commands/CliUtils.js";
+import { JolliMemoryPushClient, type PlatformToolManifestEntry } from "../core/JolliMemoryPushClient.js";
+import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { createLogger } from "../Logger.js";
+import type { JolliMemoryConfig } from "../Types.js";
 import {
 	runBindSpace,
 	runDecisionTimeline,
@@ -22,6 +25,7 @@ import {
 	runRecall,
 	runSearch,
 } from "./McpTools.js";
+import { isPlatformToolsEnabled } from "./PlatformTools.js";
 
 const log = createLogger("McpServer");
 
@@ -173,25 +177,85 @@ export async function dispatchTool(cwd: string, name: string, args: Record<strin
 	}
 }
 
+/**
+ * The slice of the backend client the platform-tool path uses. Declared as an
+ * interface so tests can inject a fake without constructing a live HTTP client.
+ */
+export interface PlatformToolClient {
+	fetchManifest(): Promise<PlatformToolManifestEntry[]>;
+	invokePlatformTool(tool: PlatformToolManifestEntry, args: Record<string, unknown>): Promise<unknown>;
+}
+
+/** Injectable dependencies for {@link startMcpServer}; the defaults wire the real implementations. */
+export interface StartMcpServerDeps {
+	/** Loads the config that gates platform-tool registration. Defaults to the machine-global config loader. */
+	readonly loadConfig?: () => Promise<Pick<JolliMemoryConfig, "mcpPlatformToolsEnabled">>;
+	/** Builds the backend client that fetches the manifest and relays tool calls. Defaults to a real client. */
+	readonly createPlatformClient?: () => PlatformToolClient;
+}
+
 /** Start the stdio MCP server. Resolves when the transport closes. */
-export async function startMcpServer(cwd: string): Promise<void> {
+export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {}): Promise<void> {
 	// Establish the configured storage backend up front. The tool handlers read
 	// through the store APIs without threading `storage`, so without this they'd
 	// fall through resolveStorage to the orphan branch — wrong for folder-mode
 	// users and a per-read WARN in this long-lived process.
 	setActiveStorage(await createStorage(cwd, cwd));
 
+	// Optionally register the backend-defined platform tools alongside the
+	// built-in git-memory tools. Opt-in and off by default: when the gate is
+	// closed we never construct a client or touch the network, so the server
+	// behaves exactly as a git-memory-only server.
+	const config = await (deps.loadConfig ?? loadConfig)();
+	let platformClient: PlatformToolClient | undefined;
+	let platformTools: PlatformToolManifestEntry[] = [];
+	if (isPlatformToolsEnabled(config)) {
+		platformClient = (deps.createPlatformClient ?? (() => new JolliMemoryPushClient()))();
+		const builtInNames = new Set(TOOL_DEFINITIONS.map((t) => t.name));
+		const seenNames = new Set<string>();
+		platformTools = (await platformClient.fetchManifest()).filter((tool) => {
+			if (builtInNames.has(tool.name)) {
+				// A built-in tool always wins a name collision: drop the backend tool
+				// so the built-in handler stays reachable and its wire contract is
+				// never shadowed by a same-named backend tool.
+				log.warn("Ignoring platform tool whose name collides with a built-in tool: %s", tool.name);
+				return false;
+			}
+			if (seenNames.has(tool.name)) {
+				// Keep only the first entry per name so the advertised list and the
+				// dispatch map agree — otherwise `tools/list` would show a duplicate a
+				// client could select while `tools/call` always ran a different one.
+				log.warn("Ignoring duplicate platform tool name from the manifest: %s", tool.name);
+				return false;
+			}
+			seenNames.add(tool.name);
+			return true;
+		});
+	}
+	const platformByName = new Map(platformTools.map((t) => [t.name, t] as const));
+	// Advertise the built-ins plus any platform tools. Build the list locally and
+	// leave the static built-in registry untouched; with no platform tools the
+	// static array is returned directly.
+	const toolDefinitions: ToolDefinition[] =
+		platformTools.length > 0 ? [...TOOL_DEFINITIONS, ...platformTools] : TOOL_DEFINITIONS;
+
 	const server = new Server({ name: "jollimemory", version: VERSION }, { capabilities: { tools: {} } });
 
-	server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_DEFINITIONS }));
+	server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: toolDefinitions }));
 
 	server.setRequestHandler(CallToolRequestSchema, async (req) => {
 		const { name, arguments: args } = req.params;
 		try {
-			const result = await dispatchTool(cwd, name, args ?? {});
-			// Unify the error contract across tools. `push_memory` reports failure
-			// as a structured `{ type: "error" }` result (its CLI caller branches on
-			// that) rather than throwing, so flag it `isError` here to match the
+			// Route backend-defined tools through the generic executor; everything
+			// else is a built-in handled by the local dispatch table.
+			const platformTool = platformByName.get(name);
+			const result =
+				platformClient && platformTool
+					? await platformClient.invokePlatformTool(platformTool, args ?? {})
+					: await dispatchTool(cwd, name, args ?? {});
+			// Unify the error contract across tools. `push_memory` (and any backend
+			// platform tool) reports failure as a structured `{ type: "error" }`
+			// result rather than throwing, so flag it `isError` here to match the
 			// thrown-error path that `list_spaces` / `bind_space` take. A
 			// `binding_required` result is a legitimate "needs input" outcome, not
 			// an error, so it stays a normal result.
