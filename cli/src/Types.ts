@@ -1053,6 +1053,16 @@ export interface JolliMemoryConfig {
 	readonly compileExcludeFolders?: ReadonlyArray<string>;
 	/** Jolli Space API key for pushing summaries and proxy LLM calls (sk-jol-...) */
 	readonly jolliApiKey?: string;
+	/**
+	 * Opt-in gate for the manifest-driven Jolli-platform MCP tools. When `true`,
+	 * the `jolli mcp` server also registers the backend-defined platform tools
+	 * (fetched from the tenant's tool manifest at startup) alongside the built-in
+	 * git-memory tools. Off by default — when absent or `false`, the server stays
+	 * git-memory-only and never contacts the backend for a manifest. Opt-in
+	 * polarity, unlike the `*Enabled` source-discovery flags below which default
+	 * to on. The `JOLLI_MCP_PLATFORM_TOOLS=1` env var overrides it at read time.
+	 */
+	readonly mcpPlatformToolsEnabled?: boolean;
 	/** Enable Codex CLI session discovery at post-commit time (default: auto-detect) */
 	readonly codexEnabled?: boolean;
 	/** Enable Gemini CLI session tracking via AfterAgent hook (default: auto-detect) */

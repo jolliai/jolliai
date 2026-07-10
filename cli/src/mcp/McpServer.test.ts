@@ -45,10 +45,33 @@ vi.mock("@modelcontextprotocol/sdk/types.js", () => ({
 	CallToolRequestSchema: { kind: "call" },
 }));
 
+// Gate the platform-tool path deterministically: default to "disabled" so the
+// pre-existing tests exercise the dormant (git-memory-only) path without reading
+// a real config off disk. Preserve every other SessionTracker export.
+const { loadConfigMock } = vi.hoisted(() => ({ loadConfigMock: vi.fn() }));
+vi.mock("../core/SessionTracker.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/SessionTracker.js")>();
+	return { ...actual, loadConfig: loadConfigMock };
+});
+
+// Stub the backend client so the default `new JolliMemoryPushClient()` factory
+// used when no createPlatformClient dep is supplied never opens a real socket.
+const { fetchManifestMock, invokePlatformToolMock } = vi.hoisted(() => ({
+	fetchManifestMock: vi.fn(),
+	invokePlatformToolMock: vi.fn(),
+}));
+vi.mock("../core/JolliMemoryPushClient.js", () => ({
+	JolliMemoryPushClient: class {
+		fetchManifest = fetchManifestMock;
+		invokePlatformTool = invokePlatformToolMock;
+	},
+}));
+
 import { VERSION } from "../commands/CliUtils.js";
+import type { PlatformToolManifestEntry } from "../core/JolliMemoryPushClient.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
-import { dispatchTool, startMcpServer, TOOL_DEFINITIONS } from "./McpServer.js";
+import { dispatchTool, type PlatformToolClient, startMcpServer, TOOL_DEFINITIONS } from "./McpServer.js";
 import {
 	runBindSpace,
 	runDecisionTimeline,
@@ -146,6 +169,9 @@ describe("startMcpServer", () => {
 	beforeEach(() => {
 		capturedHandlers.length = 0;
 		connectMock.mockClear();
+		loadConfigMock.mockReset().mockResolvedValue({});
+		fetchManifestMock.mockReset();
+		invokePlatformToolMock.mockReset();
 	});
 
 	it("connects the stdio transport and registers two request handlers", async () => {
@@ -247,5 +273,160 @@ describe("startMcpServer", () => {
 	it("names the server with the package version, not a hardcoded string", async () => {
 		await startMcpServer("/repo");
 		expect(serverInfo).toMatchObject({ name: "jollimemory", version: VERSION });
+	});
+});
+
+describe("startMcpServer — platform tools", () => {
+	const platA: PlatformToolManifestEntry = {
+		name: "create_ticket",
+		description: "Create a ticket",
+		inputSchema: { type: "object", properties: {} },
+	};
+	const platB: PlatformToolManifestEntry = {
+		name: "list_projects",
+		description: "List projects",
+		inputSchema: { type: "object", properties: {} },
+	};
+
+	function stubClient(tools: PlatformToolManifestEntry[]): PlatformToolClient {
+		return { fetchManifest: async () => tools, invokePlatformTool: invokePlatformToolMock };
+	}
+
+	beforeEach(() => {
+		capturedHandlers.length = 0;
+		connectMock.mockClear();
+		loadConfigMock.mockReset().mockResolvedValue({});
+		fetchManifestMock.mockReset();
+		invokePlatformToolMock.mockReset();
+		vi.mocked(runSearch).mockClear();
+	});
+
+	it("dormant by default: advertises exactly 9 tools and never constructs a client", async () => {
+		const createPlatformClient = vi.fn();
+		await startMcpServer("/repo", { loadConfig: async () => ({}), createPlatformClient });
+		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: unknown[] };
+		expect(list.tools).toBe(TOOL_DEFINITIONS);
+		expect(list.tools).toHaveLength(9);
+		expect(createPlatformClient).not.toHaveBeenCalled();
+		// A built-in still dispatches through the local table.
+		await capturedHandlers[1]({ params: { name: "search", arguments: { query: "x" } } });
+		expect(runSearch).toHaveBeenCalledWith("/repo", { query: "x" });
+	});
+
+	it("enabled: advertises the built-ins plus the manifest's platform tools", async () => {
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([platA, platB]),
+		});
+		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
+		expect(list.tools).toHaveLength(11);
+		expect(list.tools.map((t) => t.name)).toEqual(
+			expect.arrayContaining(["create_ticket", "list_projects", "search"]),
+		);
+	});
+
+	it("enabled: routes a platform tool call through the generic executor and wraps the result", async () => {
+		invokePlatformToolMock.mockResolvedValue({ ok: true });
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([platA]),
+		});
+		const result = (await capturedHandlers[1]({
+			params: { name: "create_ticket", arguments: { title: "x" } },
+		})) as { content: { text: string }[]; isError?: boolean };
+		expect(invokePlatformToolMock).toHaveBeenCalledWith(platA, { title: "x" });
+		expect(result.isError).toBeUndefined();
+		expect(JSON.parse(result.content[0].text)).toEqual({ ok: true });
+	});
+
+	it("enabled: flags a platform tool's {type:'error'} result as isError", async () => {
+		invokePlatformToolMock.mockResolvedValue({ type: "error", message: "bad args" });
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([platA]),
+		});
+		const result = (await capturedHandlers[1]({ params: { name: "create_ticket", arguments: {} } })) as {
+			content: { text: string }[];
+			isError?: boolean;
+		};
+		expect(result.isError).toBe(true);
+		expect(JSON.parse(result.content[0].text)).toEqual({ type: "error", message: "bad args" });
+	});
+
+	it("enabled: wraps a thrown platform tool error as an isError response", async () => {
+		invokePlatformToolMock.mockRejectedValue(new Error("relay failed"));
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([platA]),
+		});
+		const result = (await capturedHandlers[1]({ params: { name: "create_ticket", arguments: {} } })) as {
+			content: { text: string }[];
+			isError?: boolean;
+		};
+		expect(result.isError).toBe(true);
+		expect(JSON.parse(result.content[0].text)).toEqual({ error: "relay failed" });
+	});
+
+	it("enabled but empty/failed manifest: falls back to exactly the 9 built-ins and still connects", async () => {
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([]),
+		});
+		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: unknown[] };
+		expect(list.tools).toBe(TOOL_DEFINITIONS);
+		expect(list.tools).toHaveLength(9);
+		expect(connectMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("enabled: drops a platform tool that collides with a built-in name; the built-in stays reachable", async () => {
+		const collide: PlatformToolManifestEntry = {
+			name: "search",
+			description: "backend search",
+			inputSchema: { type: "object", properties: {} },
+		};
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([collide, platA]),
+		});
+		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
+		expect(list.tools).toHaveLength(10);
+		expect(list.tools.filter((t) => t.name === "search")).toHaveLength(1);
+		// "search" hits the built-in handler, not the generic executor.
+		await capturedHandlers[1]({ params: { name: "search", arguments: { query: "x" } } });
+		expect(runSearch).toHaveBeenCalledWith("/repo", { query: "x" });
+		expect(invokePlatformToolMock).not.toHaveBeenCalled();
+	});
+
+	it("enabled: dedupes duplicate platform tool names (first wins in both list and dispatch)", async () => {
+		const first: PlatformToolManifestEntry = {
+			name: "create_ticket",
+			description: "first",
+			inputSchema: { type: "object", properties: {} },
+		};
+		const second: PlatformToolManifestEntry = {
+			name: "create_ticket",
+			description: "second (duplicate)",
+			inputSchema: { type: "object", properties: {} },
+		};
+		invokePlatformToolMock.mockResolvedValue({ ok: true });
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([first, second]),
+		});
+		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
+		// Exactly one create_ticket advertised (9 built-ins + 1) — no duplicate in tools/list.
+		expect(list.tools).toHaveLength(10);
+		expect(list.tools.filter((t) => t.name === "create_ticket")).toHaveLength(1);
+		// tools/call runs the FIRST entry, matching what a client sees in tools/list.
+		await capturedHandlers[1]({ params: { name: "create_ticket", arguments: {} } });
+		expect(invokePlatformToolMock).toHaveBeenCalledWith(first, {});
+	});
+
+	it("enabled without a client dep: uses the default real-client factory to fetch the manifest", async () => {
+		fetchManifestMock.mockResolvedValue([platA]);
+		await startMcpServer("/repo", { loadConfig: async () => ({ mcpPlatformToolsEnabled: true }) });
+		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: unknown[] };
+		expect(fetchManifestMock).toHaveBeenCalled();
+		expect(list.tools).toHaveLength(10);
 	});
 });

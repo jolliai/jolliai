@@ -12,6 +12,7 @@ import {
 	ClientOutdatedError,
 	JolliMemoryPushClient,
 	NotAuthenticatedError,
+	type PlatformToolManifestEntry,
 } from "./JolliMemoryPushClient.js";
 
 const KEY = "sk-jol-test"; // parseJolliApiKey may return null for a plain key → baseUrlOverride supplies the URL
@@ -493,5 +494,317 @@ describe("constructor defaults", () => {
 		);
 		const r = await c.listSpaces();
 		expect(r).toEqual({ spaces: [], defaultSpaceId: null });
+	});
+});
+
+const TOOL_A = {
+	name: "create_ticket",
+	description: "Create a ticket",
+	inputSchema: { type: "object", properties: { title: { type: "string" } }, required: ["title"] },
+};
+const TOOL_B = {
+	name: "list_projects",
+	description: "List projects",
+	inputSchema: { type: "object", properties: {} },
+};
+
+describe("fetchManifest", () => {
+	it("returns the validated tools from a { tools: [...] } envelope", async () => {
+		const c = client(async () => jsonResponse(200, { tools: [TOOL_A, TOOL_B] }));
+		const tools = await c.fetchManifest();
+		expect(tools.map((t) => t.name)).toEqual(["create_ticket", "list_projects"]);
+	});
+
+	it("accepts a bare top-level array manifest", async () => {
+		const c = client(async () => jsonResponse(200, [TOOL_A]));
+		const tools = await c.fetchManifest();
+		expect(tools.map((t) => t.name)).toEqual(["create_ticket"]);
+	});
+
+	it("returns [] on an empty manifest ({} or { tools: [] })", async () => {
+		expect(await client(async () => jsonResponse(200, {})).fetchManifest()).toEqual([]);
+		expect(await client(async () => jsonResponse(200, { tools: [] })).fetchManifest()).toEqual([]);
+	});
+
+	it("returns [] on 404 (surface disabled) without throwing", async () => {
+		const c = client(async () => jsonResponse(404, { error: "not_found" }));
+		await expect(c.fetchManifest()).resolves.toEqual([]);
+	});
+
+	it("returns [] on 403 (key lacks the invoke scope) without throwing", async () => {
+		const c = client(async () => jsonResponse(403, { error: "forbidden" }));
+		await expect(c.fetchManifest()).resolves.toEqual([]);
+	});
+
+	it("returns [] on a generic non-2xx without throwing", async () => {
+		const c = client(async () => jsonResponse(500, { error: "boom" }));
+		await expect(c.fetchManifest()).resolves.toEqual([]);
+	});
+
+	it("returns [] on a non-JSON 200 body (parse failure)", async () => {
+		const c = client(async () => textResponse(200, "<html>200 OK</html>"));
+		await expect(c.fetchManifest()).resolves.toEqual([]);
+	});
+
+	it("returns [] when the fetch rejects (network error / abort)", async () => {
+		const c = client(async () => {
+			throw new Error("network down");
+		});
+		await expect(c.fetchManifest()).resolves.toEqual([]);
+	});
+
+	it("returns [] (not a throw) when no api key is configured", async () => {
+		const c = new JolliMemoryPushClient({
+			fetchImpl: async () => jsonResponse(200, { tools: [TOOL_A] }),
+			apiKeyProvider: async () => undefined,
+		});
+		await expect(c.fetchManifest()).resolves.toEqual([]);
+	});
+
+	it("drops malformed entries but keeps the valid ones", async () => {
+		const c = client(async () =>
+			jsonResponse(200, {
+				tools: [
+					TOOL_A,
+					{ name: "", description: "empty name", inputSchema: { type: "object", properties: {} } },
+					{ name: "bad_desc", description: 123, inputSchema: { type: "object", properties: {} } },
+					{ description: "no name", inputSchema: { type: "object", properties: {} } },
+					{ name: "no_schema", description: "missing schema" },
+					{ name: "bad_schema", description: "wrong type", inputSchema: { type: "array", properties: {} } },
+					{
+						name: "arr_props",
+						description: "properties is an array",
+						inputSchema: { type: "object", properties: [] },
+					},
+					{
+						name: "bad_required",
+						description: "required is not an array",
+						inputSchema: { type: "object", properties: {}, required: "title" },
+					},
+					{
+						name: "bad_required_elems",
+						description: "required has non-string members",
+						inputSchema: { type: "object", properties: {}, required: [123] },
+					},
+					{
+						name: "bad_binding",
+						description: "binding missing path",
+						inputSchema: { type: "object", properties: {} },
+						binding: { method: "POST" },
+					},
+					"not-an-object",
+					TOOL_B,
+				],
+			}),
+		);
+		const tools = await c.fetchManifest();
+		expect(tools.map((t) => t.name)).toEqual(["create_ticket", "list_projects"]);
+	});
+
+	it("accepts a zero-arg tool with no `properties` and defaults it to {}", async () => {
+		// MCP treats `{ type: "object" }` (no properties) as a valid no-arg schema;
+		// the validator must keep it and normalize the advertised schema.
+		const c = client(async () =>
+			jsonResponse(200, {
+				tools: [{ name: "ping", description: "no-arg tool", inputSchema: { type: "object" } }],
+			}),
+		);
+		const [tool] = await c.fetchManifest();
+		expect(tool.name).toBe("ping");
+		expect(tool.inputSchema).toEqual({ type: "object", properties: {} });
+	});
+
+	it("preserves extra JSON-Schema keywords on inputSchema", async () => {
+		const c = client(async () =>
+			jsonResponse(200, {
+				tools: [
+					{
+						name: "t",
+						description: "d",
+						inputSchema: {
+							type: "object",
+							properties: { x: { type: "string" } },
+							required: ["x"],
+							additionalProperties: false,
+						},
+					},
+				],
+			}),
+		);
+		const [tool] = await c.fetchManifest();
+		expect(tool.inputSchema).toMatchObject({
+			type: "object",
+			properties: { x: { type: "string" } },
+			required: ["x"],
+			additionalProperties: false,
+		});
+	});
+
+	it("preserves a valid binding on a fetched entry", async () => {
+		const withBinding = {
+			name: "list_workflow_definitions",
+			description: "List workflow definitions",
+			inputSchema: { type: "object", properties: {} },
+			binding: { method: "POST", path: "/api/mcp/tools/list_workflow_definitions" },
+		};
+		const c = client(async () => jsonResponse(200, { tools: [withBinding] }));
+		const [tool] = await c.fetchManifest();
+		expect(tool.binding).toEqual({ method: "POST", path: "/api/mcp/tools/list_workflow_definitions" });
+	});
+
+	it("sends Bearer auth to /api/mcp/manifest", async () => {
+		let capturedUrl: string | undefined;
+		let capturedHeaders: Record<string, string> = {};
+		const c = client(async (url, init) => {
+			capturedUrl = String(url);
+			capturedHeaders = init?.headers as Record<string, string>;
+			return jsonResponse(200, { tools: [] });
+		});
+		await c.fetchManifest();
+		expect(capturedUrl).toBe("https://jolli.ai/api/mcp/manifest");
+		expect(capturedHeaders.Authorization).toBe(`Bearer ${KEY}`);
+	});
+});
+
+describe("invokePlatformTool", () => {
+	function entry(name: string, binding?: { method: string; path: string }): PlatformToolManifestEntry {
+		return {
+			name,
+			description: "d",
+			inputSchema: { type: "object", properties: {} },
+			...(binding ? { binding } : {}),
+		};
+	}
+
+	it("returns a 2xx JSON body verbatim", async () => {
+		const c = client(async () => jsonResponse(200, { type: "ok", result: 42 }));
+		await expect(c.invokePlatformTool(entry("create_ticket"), { title: "x" })).resolves.toEqual({
+			type: "ok",
+			result: 42,
+		});
+	});
+
+	it("returns a backend {type:'error'} body as-is (does NOT throw — the server flags it)", async () => {
+		const c = client(async () => jsonResponse(200, { type: "error", message: "bad args" }));
+		await expect(c.invokePlatformTool(entry("create_ticket"), {})).resolves.toEqual({
+			type: "error",
+			message: "bad args",
+		});
+	});
+
+	it("throws on a non-2xx status so the server surfaces it", async () => {
+		const c = client(async () => jsonResponse(500, { error: "boom" }));
+		await expect(c.invokePlatformTool(entry("create_ticket"), {})).rejects.toThrow("boom");
+	});
+
+	it("falls back to `HTTP <status>` when a non-2xx body carries no message", async () => {
+		const c = client(async () => jsonResponse(400, {}));
+		await expect(c.invokePlatformTool(entry("create_ticket"), {})).rejects.toThrow("HTTP 400");
+	});
+
+	it("maps 426 to ClientOutdatedError", async () => {
+		const c = client(async () => jsonResponse(426, { error: "client_outdated" }));
+		await expect(c.invokePlatformTool(entry("create_ticket"), {})).rejects.toBeInstanceOf(ClientOutdatedError);
+	});
+
+	it("throws on a 2xx body that isn't JSON (proxy page)", async () => {
+		const c = client(async () => textResponse(200, "<html>OK</html>"));
+		await expect(c.invokePlatformTool(entry("create_ticket"), {})).rejects.toThrow(/Malformed/);
+	});
+
+	it("falls back to POST /api/mcp/tools/<name> (URL-encoded) with the args as the JSON body when no binding", async () => {
+		let capturedUrl: string | undefined;
+		let capturedBody: string | undefined;
+		let capturedMethod: string | undefined;
+		let capturedHeaders: Record<string, string> = {};
+		const c = client(async (url, init) => {
+			capturedUrl = String(url);
+			capturedBody = init?.body as string;
+			capturedMethod = init?.method;
+			capturedHeaders = init?.headers as Record<string, string>;
+			return jsonResponse(200, { ok: true });
+		});
+		await c.invokePlatformTool(entry("weird/name space"), { a: 1 });
+		expect(capturedMethod).toBe("POST");
+		expect(capturedUrl).toBe("https://jolli.ai/api/mcp/tools/weird%2Fname%20space");
+		expect(capturedBody).toBe(JSON.stringify({ a: 1 }));
+		expect(capturedHeaders.Authorization).toBe(`Bearer ${KEY}`);
+		expect(capturedHeaders["Content-Type"]).toBe("application/json");
+	});
+
+	it("honors the manifest binding's method and path when present", async () => {
+		let capturedUrl: string | undefined;
+		let capturedMethod: string | undefined;
+		const c = client(async (url, init) => {
+			capturedUrl = String(url);
+			capturedMethod = init?.method;
+			return jsonResponse(200, { ok: true });
+		});
+		await c.invokePlatformTool(
+			entry("list_workflow_definitions", { method: "POST", path: "/api/mcp/tools/list_workflow_definitions" }),
+			{},
+		);
+		expect(capturedMethod).toBe("POST");
+		expect(capturedUrl).toBe("https://jolli.ai/api/mcp/tools/list_workflow_definitions");
+	});
+
+	it("ignores an off-origin binding path (including URL-parser bypass vectors) and falls back", async () => {
+		// A manifest must never redirect the bearer token off-origin. A raw string
+		// prefix check is not enough: the WHATWG URL parser rewrites `\` to `/` and
+		// strips embedded tab/CR/LF, so each of these normalizes to an off-origin
+		// host. The guard must compare the RESOLVED origin, not the raw string.
+		const vectors = [
+			"https://evil.example/steal",
+			"//evil.example/steal",
+			"/\\evil.example/steal",
+			"/\t/evil.example",
+			"/\r/evil.example",
+			"/\n/evil.example",
+		];
+		for (const evil of vectors) {
+			let capturedUrl: string | undefined;
+			const c = client(async (url) => {
+				capturedUrl = String(url);
+				return jsonResponse(200, { ok: true });
+			});
+			await c.invokePlatformTool(entry("create_ticket", { method: "POST", path: evil }), {});
+			expect(capturedUrl).toBe("https://jolli.ai/api/mcp/tools/create_ticket");
+		}
+	});
+
+	it("honors a same-origin binding supplied as an absolute URL", async () => {
+		let capturedUrl: string | undefined;
+		const c = client(async (url) => {
+			capturedUrl = String(url);
+			return jsonResponse(200, { ok: true });
+		});
+		await c.invokePlatformTool(
+			entry("create_ticket", { method: "POST", path: "https://jolli.ai/api/mcp/tools/custom" }),
+			{},
+		);
+		expect(capturedUrl).toBe("https://jolli.ai/api/mcp/tools/custom");
+	});
+
+	it("honors a valid non-POST method case-insensitively on a same-origin binding", async () => {
+		let capturedMethod: string | undefined;
+		const c = client(async (_url, init) => {
+			capturedMethod = init?.method;
+			return jsonResponse(200, { ok: true });
+		});
+		await c.invokePlatformTool(entry("create_ticket", { method: "put", path: "/api/mcp/tools/create_ticket" }), {});
+		expect(capturedMethod).toBe("PUT");
+	});
+
+	it("falls back to the conventional POST endpoint when the binding method is not a known HTTP method", async () => {
+		let capturedUrl: string | undefined;
+		let capturedMethod: string | undefined;
+		const c = client(async (url, init) => {
+			capturedUrl = String(url);
+			capturedMethod = init?.method;
+			return jsonResponse(200, { ok: true });
+		});
+		await c.invokePlatformTool(entry("create_ticket", { method: "FETCH", path: "/api/mcp/tools/x" }), {});
+		expect(capturedMethod).toBe("POST");
+		expect(capturedUrl).toBe("https://jolli.ai/api/mcp/tools/create_ticket");
 	});
 });

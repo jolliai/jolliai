@@ -448,4 +448,40 @@ describe("ConfigureCommand — settable keys", () => {
 			await expectSetRejected("-30", /positive integer/);
 		});
 	});
+
+	describe("mcpPlatformToolsEnabled boolean coercion via --set", () => {
+		it("accepts true/false/yes/no/1/0 forms", async () => {
+			for (const truthy of ["true", "yes", "1"]) {
+				mockSaveConfig.mockClear();
+				await runConfigure(["--set", `mcpPlatformToolsEnabled=${truthy}`]);
+				expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ mcpPlatformToolsEnabled: true }));
+			}
+			for (const falsy of ["false", "no", "0"]) {
+				mockSaveConfig.mockClear();
+				await runConfigure(["--set", `mcpPlatformToolsEnabled=${falsy}`]);
+				expect(mockSaveConfig).toHaveBeenCalledWith(
+					expect.objectContaining({ mcpPlatformToolsEnabled: false }),
+				);
+			}
+		});
+
+		it("rejects garbage boolean values", async () => {
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prev = process.exitCode;
+			try {
+				await runConfigure(["--set", "mcpPlatformToolsEnabled=maybe"]);
+				expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/true\/false/));
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prev;
+			}
+		});
+
+		it("lists mcpPlatformToolsEnabled in --list-keys output", async () => {
+			const help = await runConfigureHelp();
+			expect(help).toContain("mcpPlatformToolsEnabled");
+		});
+	});
 });
