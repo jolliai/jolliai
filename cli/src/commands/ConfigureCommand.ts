@@ -10,6 +10,7 @@ import type { Command } from "commander";
 import { validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { getGlobalConfigDir, loadConfig, saveConfig } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
+import { syncGlobalInstructions } from "../install/Installer.js";
 import { createLogger } from "../Logger.js";
 import type { JolliMemoryConfig, LogLevel } from "../Types.js";
 
@@ -215,7 +216,7 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "globalInstructions",
 		type: "enum",
 		description:
-			"Skill-preference block in global AI instruction files: enabled | disabled (written on next `jolli enable` when enabled)",
+			"Skill-preference block in global AI instruction files: enabled | disabled (applied immediately — written when enabled, removed when disabled)",
 	},
 	{
 		key: "syncTranscripts",
@@ -332,6 +333,15 @@ export function registerConfigureCommand(program: Command): void {
 				await saveConfig(update as Partial<JolliMemoryConfig>);
 				if (typeof update.aiProvider === "string") {
 					track("ai_provider_selected", { provider: update.aiProvider });
+				}
+				// Apply a globalInstructions change immediately, mirroring the VS Code
+				// Settings toggle: "enabled" writes the skill-preference block now,
+				// "disabled" removes it. This is the CLI's opt-in surface — the block is
+				// only ever written because the user explicitly set it here, never on a
+				// bare `jolli enable`. (`--remove globalInstructions` leaves the switch
+				// undecided, which syncGlobalInstructions treats as a no-op.)
+				if ("globalInstructions" in update) {
+					await syncGlobalInstructions();
 				}
 				console.log(`\n  Config updated: ${join(getGlobalConfigDir(), "config.json")}\n`);
 				return;

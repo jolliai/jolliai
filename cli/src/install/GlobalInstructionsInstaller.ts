@@ -92,10 +92,10 @@ export function renderInstructionsBlock(): string {
 }
 
 /**
- * Benefit-led confirmation message shown before Jolli writes its skill-preference
- * block into the machine-global AI instruction files. SINGLE SOURCE OF TRUTH — both
- * the CLI prompt (append `[Y/n]:`) and the VS Code notification (three buttons) render
- * this exact string, so the wording can never drift between surfaces.
+ * Benefit-led description of what enabling the skill-preference block does.
+ * Rendered as the VS Code Settings "Global Instructions" toggle helptext — the
+ * single surface that now turns the block on. Kept as an exported constant so the
+ * wording lives in one place next to the block it describes.
  */
 // Keep this path list in sync with the `installGlobalInstructions({ claude, gemini, codex })`
 // targets below (TARGETS) — adding a fourth host must update both.
@@ -109,37 +109,31 @@ export const GLOBAL_INSTRUCTIONS_PROMPT =
 export type GlobalInstructionsChoice = "enabled" | "disabled" | undefined;
 
 /**
- * Outcome of consulting the switch:
+ * Outcome of consulting the persisted switch:
  *  - `write`   — write the block now.
- *  - `persist` — when present, the caller must persist this to the global config's
- *                `globalInstructions` field (set only when a fresh decision was made).
+ *  - `remove`  — actively remove any previously-written block (opt-out).
  */
 export interface GlobalInstructionsDecision {
 	readonly write: boolean;
 	/** When true, actively remove any previously-written block (opt-out). */
 	readonly remove?: boolean;
-	readonly persist?: "enabled" | "disabled";
 }
 
 /**
- * Resolves what to do with the global-instructions block from the current switch
- * value plus an optional confirm callback (supplied only by interactive surfaces):
- *  - `enabled`   → write, no persist.
- *  - `disabled`  → remove any existing block, no persist (heals a stale block a
- *                  now-opted-out user still has from a prior `enabled` run).
- *  - undecided + callback   → ask; persist + write/remove per the answer.
- *  - undecided + no callback → skip, stay undecided (safe default for non-interactive).
- *    Undecided never removes — the block was never written on the user's behalf.
+ * Resolves what to do with the global-instructions block purely from the persisted
+ * switch value. The block is never written on enable — the user opts in explicitly
+ * (VS Code Settings toggle / `jolli configure --set globalInstructions=enabled`),
+ * so this only ever applies a decision the user already made:
+ *  - `enabled`   → write.
+ *  - `disabled`  → remove any existing block (heals a stale block from a prior
+ *                  `enabled` run the user has since turned off).
+ *  - undecided   → skip. Undecided never removes — the block was never written on
+ *                  the user's behalf.
  */
-export async function resolveGlobalInstructionsDecision(
-	current: GlobalInstructionsChoice,
-	confirm?: () => Promise<boolean>,
-): Promise<GlobalInstructionsDecision> {
+export function resolveGlobalInstructionsDecision(current: GlobalInstructionsChoice): GlobalInstructionsDecision {
 	if (current === "enabled") return { write: true };
 	if (current === "disabled") return { write: false, remove: true };
-	if (!confirm) return { write: false };
-	const agreed = await confirm();
-	return agreed ? { write: true, persist: "enabled" } : { write: false, remove: true, persist: "disabled" };
+	return { write: false };
 }
 
 /**

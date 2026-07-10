@@ -95,7 +95,6 @@ import { StatusTreeProvider } from "./providers/StatusTreeProvider.js";
 import { ActiveSessionsProvider } from "./services/ActiveSessionsProvider.js";
 import { AuthService } from "./services/AuthService.js";
 import { readBackfillDismissFlag, writeBackfillDismissFlag } from "./services/BackfillDismissFlag.js";
-import { maybePromptGlobalInstructions } from "./services/GlobalInstructionsPrompt.js";
 import { KbFoldersService } from "./services/KbFoldersService.js";
 import {
 	readManualDisableFlag,
@@ -3982,7 +3981,6 @@ export function activate(context: vscode.ExtensionContext): void {
 			// sessions.json / cursors.json), so a fresh project / fresh worktree
 			// has no marker → falsy → install.
 			const manuallyDisabled = await readManualDisableFlag(workspaceRoot);
-			let projectEnabled = status.enabled;
 			if (!status.enabled && !manuallyDisabled) {
 				log.info(
 					"activate",
@@ -4007,19 +4005,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					);
 					currentEnabled = refreshed.enabled;
 					sidebarProvider.notifyEnabledChanged(refreshed.enabled);
-					projectEnabled = refreshed.enabled;
 				}
-			}
-
-			// If Jolli is enabled but the user has not yet decided whether to add the
-			// skill-preference block to their global AI instructions, ask once (per
-			// session). Fire-and-forget so activation never blocks on the dialog.
-			if (projectEnabled) {
-				void maybePromptGlobalInstructions(bridge).catch((err: unknown) => {
-					log.warn("activate", "global-instructions prompt failed", {
-						message: err instanceof Error ? err.message : String(err),
-					});
-				});
 			}
 		})
 		.catch((err: unknown) => {

@@ -131,24 +131,24 @@ function hasRequiredWorktreeHooks(
 }
 
 /**
- * Resolves and applies the machine-global skill-preference block: reads the
- * persisted `globalInstructions` switch, consults the optional confirm callback,
- * persists a fresh decision, then writes OR removes the block accordingly.
+ * Applies the machine-global skill-preference block from the persisted
+ * `globalInstructions` switch: writes the block when `enabled`, removes it when
+ * `disabled`, does nothing when undecided. Never prompts — the block is only ever
+ * written because the user explicitly opted in (VS Code Settings toggle or
+ * `jolli configure --set globalInstructions=enabled`).
  *
  * Single source of host-gating for the block, shared by `install()` (which passes
- * pre-computed detection to avoid re-running detectors) and the VS Code settings
- * panel (which calls it directly after toggling the switch, rather than re-running
- * the full installer). Fail-soft throughout — see GlobalInstructionsInstaller.
+ * pre-computed detection to avoid re-running detectors), the VS Code settings panel,
+ * and `jolli configure` (which call it directly after persisting the switch, rather
+ * than re-running the full installer). Fail-soft throughout — see
+ * GlobalInstructionsInstaller.
  */
-export async function syncGlobalInstructions(
-	confirm?: () => Promise<boolean>,
-	detected?: { readonly codexDetected: boolean; readonly geminiDetected: boolean },
-): Promise<void> {
+export async function syncGlobalInstructions(detected?: {
+	readonly codexDetected: boolean;
+	readonly geminiDetected: boolean;
+}): Promise<void> {
 	const config = await loadConfig();
-	const decision = await resolveGlobalInstructionsDecision(config.globalInstructions, confirm);
-	if (decision.persist) {
-		await saveConfigScoped({ globalInstructions: decision.persist }, getGlobalConfigDir());
-	}
+	const decision = resolveGlobalInstructionsDecision(config.globalInstructions);
 	if (decision.write) {
 		const codexDetected = detected?.codexDetected ?? (await isCodexInstalled());
 		const geminiDetected = detected?.geminiDetected ?? (await isGeminiInstalled());
@@ -181,7 +181,6 @@ export async function install(
 		source?: "vscode-extension" | "cli";
 		integrationsOnly?: boolean;
 		sourceTag?: string;
-		confirmGlobalInstructions?: () => Promise<boolean>;
 	},
 ): Promise<InstallResult> {
 	/* v8 ignore next - process.cwd() fallback only used when called without cwd arg */
@@ -369,12 +368,13 @@ export async function install(
 		// whenever Claude isn't explicitly disabled, consistent with the rest of
 		// the installer treating Claude as the primary host. This is an integration
 		// (skill preference), not a hook, so it runs in integrations-only mode too.
-		// Ask before writing into the user's machine-global instruction files.
-		// Undecided + no callback (VS Code auto-enable / -y / IntelliJ) → skip and
-		// stay undecided; the interactive CLI passes a callback, VS Code drives its
-		// own notification. Delegated to syncGlobalInstructions so the settings panel
-		// shares identical host-gating and the write/remove/persist decision logic.
-		await syncGlobalInstructions(options?.confirmGlobalInstructions, {
+		// Never prompts: enable only APPLIES a decision the user already made. An
+		// undecided switch (fresh install, before the user opts in via the VS Code
+		// Settings toggle or `jolli configure`) is a no-op; `enabled` re-writes the
+		// block idempotently, `disabled` heals any stale block. Delegated to
+		// syncGlobalInstructions so every surface shares identical host-gating and
+		// the write/remove decision logic.
+		await syncGlobalInstructions({
 			codexDetected: codexDetectedOnce,
 			geminiDetected: geminiDetectedOnce,
 		});

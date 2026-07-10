@@ -15,9 +15,10 @@ import type { JolliMemoryConfig } from "../Types.js";
 
 // ─── Hoist mocks ─────────────────────────────────────────────────────────────
 
-const { mockLoadConfig, mockSaveConfig } = vi.hoisted(() => ({
+const { mockLoadConfig, mockSaveConfig, mockSyncGlobalInstructions } = vi.hoisted(() => ({
 	mockLoadConfig: vi.fn(),
 	mockSaveConfig: vi.fn(),
+	mockSyncGlobalInstructions: vi.fn(),
 }));
 
 vi.mock("../core/SessionTracker.js", () => ({
@@ -28,6 +29,12 @@ vi.mock("../core/SessionTracker.js", () => ({
 
 vi.mock("../core/JolliApiUtils.js", () => ({
 	validateJolliApiKey: vi.fn(),
+}));
+
+// Configure applies a globalInstructions change immediately via syncGlobalInstructions.
+// Stub it so the test never touches the real installer / global instruction files.
+vi.mock("../install/Installer.js", () => ({
+	syncGlobalInstructions: mockSyncGlobalInstructions,
 }));
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -134,12 +141,23 @@ describe("ConfigureCommand — settable keys", () => {
 		}
 	});
 
-	it("accepts globalInstructions with the two allowed values", async () => {
+	it("accepts globalInstructions with the two allowed values and applies the change immediately", async () => {
 		await runConfigure(["--set", "globalInstructions=enabled"]);
 		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ globalInstructions: "enabled" }));
+		// Persisting is not enough: configure must apply it now (write the block),
+		// mirroring the VS Code Settings toggle — no `jolli enable` round-trip needed.
+		expect(mockSyncGlobalInstructions).toHaveBeenCalled();
 
+		mockSyncGlobalInstructions.mockClear();
 		await runConfigure(["--set", "globalInstructions=disabled"]);
 		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ globalInstructions: "disabled" }));
+		expect(mockSyncGlobalInstructions).toHaveBeenCalled();
+	});
+
+	it("does NOT apply global instructions for unrelated config keys", async () => {
+		await runConfigure(["--set", "model=claude-sonnet-4-20250514"]);
+		expect(mockSaveConfig).toHaveBeenCalled();
+		expect(mockSyncGlobalInstructions).not.toHaveBeenCalled();
 	});
 
 	it("rejects globalInstructions values that aren't in the allowlist", async () => {

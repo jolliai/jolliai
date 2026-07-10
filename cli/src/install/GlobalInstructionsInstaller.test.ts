@@ -170,35 +170,16 @@ describe("GLOBAL_INSTRUCTIONS_PROMPT", () => {
 });
 
 describe("resolveGlobalInstructionsDecision", () => {
-	it("writes without prompting when already enabled", async () => {
-		const confirm = vi.fn();
-		expect(await resolveGlobalInstructionsDecision("enabled", confirm)).toEqual({ write: true });
-		expect(confirm).not.toHaveBeenCalled();
+	it("writes when the switch is enabled", () => {
+		expect(resolveGlobalInstructionsDecision("enabled")).toEqual({ write: true });
 	});
 
-	it("removes without prompting when already disabled", async () => {
-		const confirm = vi.fn();
-		expect(await resolveGlobalInstructionsDecision("disabled", confirm)).toEqual({ write: false, remove: true });
-		expect(confirm).not.toHaveBeenCalled();
+	it("removes when the switch is disabled", () => {
+		expect(resolveGlobalInstructionsDecision("disabled")).toEqual({ write: false, remove: true });
 	});
 
-	it("skips and stays undecided when undecided with no callback", async () => {
-		expect(await resolveGlobalInstructionsDecision(undefined, undefined)).toEqual({ write: false });
-	});
-
-	it("persists enabled and writes when the callback agrees", async () => {
-		expect(await resolveGlobalInstructionsDecision(undefined, async () => true)).toEqual({
-			write: true,
-			persist: "enabled",
-		});
-	});
-
-	it("persists disabled and removes when the callback declines", async () => {
-		expect(await resolveGlobalInstructionsDecision(undefined, async () => false)).toEqual({
-			write: false,
-			remove: true,
-			persist: "disabled",
-		});
+	it("skips when the switch is undecided — the block is never written on the user's behalf", () => {
+		expect(resolveGlobalInstructionsDecision(undefined)).toEqual({ write: false });
 	});
 });
 
