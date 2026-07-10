@@ -68,4 +68,19 @@ class SlackEnvelopeParserTest {
 		ref.shouldNotBeNull()
 		ref.url.shouldBeNull()
 	}
+
+	@Test
+	fun `pairs a tool_use before the cursor with a result after it (incremental scan boundary)`() {
+		// Regression: a discovery tick landed between the tool_use (index 1) and its
+		// tool_result (index 2), so the cursor sits at index 2. The tool_use before
+		// the cursor must still be scanned or the result can never pair and the
+		// reference is silently dropped. Before the fix this returned 0 results.
+		val lines = listOf(permalinkUserLine(), toolUseLine(), toolResultLine())
+		val result = ClaudeEnvelopeParser.parse(lines, ExtractOptions(fromLineNumber = 2), adapters)
+		result.results.size shouldBe 1
+		val ref = slackRef(result.results[0])
+		ref.shouldNotBeNull()
+		ref.nativeId shouldBe "$channel-$ts"
+		ref.url shouldBe permalink
+	}
 }
