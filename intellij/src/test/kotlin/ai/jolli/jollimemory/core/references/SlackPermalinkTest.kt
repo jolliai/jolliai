@@ -70,5 +70,18 @@ class SlackPermalinkTest {
 			val map = SlackPermalink.scanUserPermalinks(listOf("not json but has .slack.com/archives/ text"))
 			map.isEmpty() shouldBe true
 		}
+
+		@Test
+		fun `harvests permalink from a string-form user content (directly-typed prompt)`() {
+			// A directly-typed prompt serializes `content` as a plain string, not a
+			// text-block array. This is the common real-world shape for a pasted
+			// permalink; before the fix it was silently missed (linkless capture).
+			val line =
+				"""{"message":{"role":"user","content":"Read this Slack thread and summarize it: https://my-team.slack.com/archives/C0123ABCD/p1699999999001200"}}"""
+			val map = SlackPermalink.scanUserPermalinks(listOf(line))
+			map shouldContainExactly mapOf(
+				"C0123ABCD:1699999999.001200" to "https://my-team.slack.com/archives/C0123ABCD/p1699999999001200",
+			)
+		}
 	}
 }
