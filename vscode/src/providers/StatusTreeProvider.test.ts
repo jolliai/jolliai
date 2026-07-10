@@ -207,7 +207,7 @@ describe("StatusTreeProvider", () => {
 			"Codex Integration",
 			"Gemini Integration",
 		]);
-		expect(items[0].description).toBe("3 Git + 2 Claude");
+		expect(items[0].description).toBe("4 Git + 2 Claude");
 		// Hooks icon is OK because gitHookInstalled is true
 		expect((items[0].iconPath as { id: string }).id).toBe("check");
 		// Provider row uses dispatcher's resolveLlmCredentialSource — config
@@ -414,7 +414,7 @@ describe("StatusTreeProvider", () => {
 
 		const items = provider.getChildren();
 		const hooksItem = items.find((item) => item.label === "Hooks");
-		expect(hooksItem?.description).toBe("3 Git + 2 Claude");
+		expect(hooksItem?.description).toBe("4 Git + 2 Claude");
 		// Hooks icon is OK because git hooks are installed (Gemini hook status doesn't affect it)
 		expect((hooksItem?.iconPath as { id: string }).id).toBe("check");
 	});
@@ -440,7 +440,7 @@ describe("StatusTreeProvider", () => {
 
 		const items = provider.getChildren();
 		const hooksItem = items.find((item) => item.label === "Hooks");
-		expect(hooksItem?.description).toBe("3 Git");
+		expect(hooksItem?.description).toBe("4 Git");
 
 		const sessionsItem = items.find((item) => item.label === "Sessions");
 		expect(sessionsItem?.description).toBe("1");
@@ -547,7 +547,7 @@ describe("StatusTreeProvider", () => {
 
 		const items = provider.getChildren();
 		const hooksItem = items.find((item) => item.label === "Hooks");
-		expect(hooksItem?.description).toBe("3 Git + 2 Claude + 1 Gemini CLI");
+		expect(hooksItem?.description).toBe("4 Git + 2 Claude + 1 Gemini CLI");
 	});
 
 	it("shows 'none installed' when no hooks are installed", async () => {

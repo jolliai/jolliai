@@ -39,7 +39,8 @@ export interface RegenerateResult {
  *                         conversationTurns, llm, generatedAt
  * Fields preserved:       ticketId, e2eTestGuide, plans, notes, references,
  *                         commitType, commitSource, jolliDocUrl, jolliDocId,
- *                         orphanedDocIds, everything else on root.
+ *                         orphanedDocIds, unresolvedOrphanHashes, everything
+ *                         else on root.
  *
  * The function opens by calling `normalizeToV4(summary)` — a pure helper
  * that collapses every v3-special-case into the v4 unified-Hoist invariant

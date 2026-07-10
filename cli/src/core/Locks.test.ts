@@ -37,6 +37,7 @@ import {
 	LOCK_TIMEOUT_MS,
 	ORPHAN_WRITE_LOCK_FILE,
 	PLANS_LOCK_FILE,
+	PUSH_PENDING_LOCK_FILE,
 	refreshIngestLockMtime,
 	refreshWorkerLockMtime,
 	releaseIngestLock,
@@ -44,6 +45,7 @@ import {
 	releaseWorkerLock,
 	WORKER_LOCK_FILE,
 	withPlansLock,
+	withPushPendingLock,
 } from "./Locks.js";
 
 /**
@@ -66,6 +68,11 @@ function orphanWriteLockPath(tempDir: string): string {
 /** plans.lock dir = per-worktree (`<cwd>/.jolli/jollimemory/`), like worker.lock. */
 function plansLockPath(tempDir: string): string {
 	return join(tempDir, ".jolli", "jollimemory", PLANS_LOCK_FILE);
+}
+
+/** push-pending.lock dir = per-worktree (`<cwd>/.jolli/jollimemory/`), like worker.lock. */
+function pushPendingLockPath(tempDir: string): string {
+	return join(tempDir, ".jolli", "jollimemory", PUSH_PENDING_LOCK_FILE);
 }
 
 describe("Locks", () => {
@@ -584,6 +591,55 @@ describe("Locks", () => {
 			expect(result).toBe("best-effort");
 			// The foreign-owned lock is untouched.
 			await expect(stat(plansLockPath(tempDir))).resolves.toBeDefined();
+		});
+	});
+
+	describe("withPushPendingLock — per-worktree push-pending.json RMW serialisation", () => {
+		it("acquires, runs the body, returns its value, then releases the lock", async () => {
+			let lockHeldDuringBody = false;
+			const result = await withPushPendingLock(tempDir, async () => {
+				lockHeldDuringBody = await stat(pushPendingLockPath(tempDir)).then(
+					() => true,
+					() => false,
+				);
+				return 7;
+			});
+			expect(result).toBe(7);
+			expect(lockHeldDuringBody).toBe(true);
+			await expect(stat(pushPendingLockPath(tempDir))).rejects.toThrow();
+		});
+
+		it("releases the lock even when the body throws", async () => {
+			await expect(
+				withPushPendingLock(tempDir, async () => {
+					throw new Error("boom");
+				}),
+			).rejects.toThrow("boom");
+			await expect(stat(pushPendingLockPath(tempDir))).rejects.toThrow();
+		});
+
+		it("serialises two overlapping holders", async () => {
+			const order: string[] = [];
+			let releaseFirst: () => void = () => {};
+			const firstBodyEntered = new Promise<void>((resolve) => {
+				void withPushPendingLock(tempDir, async () => {
+					order.push("first-enter");
+					resolve();
+					await new Promise<void>((r) => {
+						releaseFirst = r;
+					});
+					order.push("first-exit");
+				});
+			});
+			await firstBodyEntered;
+			const second = withPushPendingLock(tempDir, async () => {
+				order.push("second-enter");
+			});
+			await new Promise((r) => setTimeout(r, 60));
+			expect(order).toEqual(["first-enter"]);
+			releaseFirst();
+			await second;
+			expect(order).toEqual(["first-enter", "first-exit", "second-enter"]);
 		});
 	});
 

@@ -3,8 +3,11 @@ import type { CommitSummary, NoteReference, PlanReference } from "../Types.js";
 
 vi.mock("./GitOps.js", () => ({ getDefaultBranch: vi.fn() }));
 vi.mock("./PrDescription.js", () => ({ loadBranchSummaries: vi.fn() }));
+vi.mock("./PushPendingStore.js", () => ({ loadPushPending: vi.fn() }));
 vi.mock("./SummaryStore.js", () => ({
 	getActiveStorage: vi.fn(),
+	getIndexEntryMap: vi.fn(async () => new Map()),
+	getSummary: vi.fn(),
 	readNoteFromBranch: vi.fn(),
 	readPlanFromBranch: vi.fn(),
 	storeSummary: vi.fn(),
@@ -38,8 +41,16 @@ import {
 	serializeSummaryJson,
 } from "./JolliMemoryPushOrchestrator.js";
 import { loadBranchSummaries } from "./PrDescription.js";
+import { loadPushPending } from "./PushPendingStore.js";
 import { buildPushTitle } from "./SummaryFormat.js";
-import { getActiveStorage, readNoteFromBranch, readPlanFromBranch, storeSummary } from "./SummaryStore.js";
+import {
+	getActiveStorage,
+	getIndexEntryMap,
+	getSummary,
+	readNoteFromBranch,
+	readPlanFromBranch,
+	storeSummary,
+} from "./SummaryStore.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -93,11 +104,18 @@ function note(overrides: Partial<NoteReference> = {}): NoteReference {
 
 describe("serializeSummaryJson", () => {
 	it("strips push-state fields", () => {
-		const s = { commitHash: "a", jolliDocId: 5, jolliDocUrl: "u", orphanedDocIds: [1] } as unknown as CommitSummary;
+		const s = {
+			commitHash: "a",
+			jolliDocId: 5,
+			jolliDocUrl: "u",
+			orphanedDocIds: [1],
+			unresolvedOrphanHashes: ["old-hash"],
+		} as unknown as CommitSummary;
 		const json = JSON.parse(serializeSummaryJson(s) ?? "{}");
 		expect(json.jolliDocId).toBeUndefined();
 		expect(json.jolliDocUrl).toBeUndefined();
 		expect(json.orphanedDocIds).toBeUndefined();
+		expect(json.unresolvedOrphanHashes).toBeUndefined();
 		expect(json.commitHash).toBe("a");
 	});
 
@@ -588,6 +606,79 @@ describe("pushSummary", () => {
 		vi.mocked(storeSummary).mockReset().mockResolvedValue(undefined);
 		vi.mocked(readPlanFromBranch).mockReset().mockResolvedValue(null);
 		vi.mocked(readNoteFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(loadPushPending).mockReset().mockResolvedValue({ version: 1, entries: {} });
+		vi.mocked(getIndexEntryMap).mockReset().mockResolvedValue(new Map());
+	});
+
+	it("deletes the freshly-pushed article and skips force-store when the commit became a child mid-push", async () => {
+		const client = fakeClient();
+		const summary = leaf();
+		vi.mocked(getIndexEntryMap).mockResolvedValue(
+			new Map<
+				string,
+				{
+					readonly commitHash: string;
+					readonly parentCommitHash: string | null;
+					readonly commitMessage: string;
+					readonly commitDate: string;
+					readonly branch: string;
+					readonly generatedAt: string;
+				}
+			>([
+				[
+					summary.commitHash,
+					{
+						commitHash: summary.commitHash,
+						parentCommitHash: "def4567890",
+						commitMessage: "",
+						commitDate: "",
+						branch: summary.branch,
+						generatedAt: "",
+					},
+				],
+			]),
+		);
+
+		await pushSummary(summary, baseCtx(client));
+
+		expect(client.push).toHaveBeenCalledTimes(1);
+		expect(client.deleteDoc).toHaveBeenCalledWith(42);
+		expect(storeSummary).not.toHaveBeenCalled();
+	});
+
+	it("tolerates a best-effort deleteDoc failure when unwinding a mid-push re-parent", async () => {
+		const client = fakeClient({ deleteDoc: async () => Promise.reject(new Error("network")) });
+		const summary = leaf();
+		vi.mocked(getIndexEntryMap).mockResolvedValue(
+			new Map<
+				string,
+				{
+					readonly commitHash: string;
+					readonly parentCommitHash: string | null;
+					readonly commitMessage: string;
+					readonly commitDate: string;
+					readonly branch: string;
+					readonly generatedAt: string;
+				}
+			>([
+				[
+					summary.commitHash,
+					{
+						commitHash: summary.commitHash,
+						parentCommitHash: "def4567890",
+						commitMessage: "",
+						commitDate: "",
+						branch: summary.branch,
+						generatedAt: "",
+					},
+				],
+			]),
+		);
+
+		await expect(pushSummary(summary, baseCtx(client))).resolves.toEqual(
+			expect.objectContaining({ summaryUrl: `${BASE}/articles?doc=42` }),
+		);
+		expect(storeSummary).not.toHaveBeenCalled();
 	});
 
 	it("pushes the summary payload and writes the docId/docUrl back via storeSummary(force=true)", async () => {
@@ -915,6 +1006,84 @@ describe("pushSummary", () => {
 
 		const { summaryUrl } = await pushSummary(summary, baseCtx(client));
 		expect(summaryUrl).toBe(`${BASE}/articles?doc=42`);
+	});
+
+	it("resolves unresolvedOrphanHashes into orphanedDocIds for cleanup", async () => {
+		const client = fakeClient();
+		const summary = leaf({ unresolvedOrphanHashes: ["child1hash", "child2hash"] });
+		vi.mocked(getSummary)
+			.mockResolvedValueOnce(leaf({ commitHash: "child1hash", jolliDocId: 201 }))
+			.mockResolvedValueOnce(leaf({ commitHash: "child2hash", jolliDocId: 202 }));
+
+		await pushSummary(summary, baseCtx(client));
+
+		expect(client.deleteDoc).toHaveBeenCalledWith(201);
+		expect(client.deleteDoc).toHaveBeenCalledWith(202);
+		const resolveStoreCall = vi.mocked(storeSummary).mock.calls[1];
+		expect(resolveStoreCall?.[0].unresolvedOrphanHashes).toBeUndefined();
+		expect(resolveStoreCall?.[0].orphanedDocIds).toEqual([201, 202]);
+	});
+
+	it("discards unresolvedOrphanHashes that still have no jolliDocId (never pushed)", async () => {
+		const client = fakeClient();
+		const summary = leaf({ unresolvedOrphanHashes: ["child1hash", "child2hash"] });
+		vi.mocked(getSummary)
+			.mockResolvedValueOnce(leaf({ commitHash: "child1hash" }))
+			.mockResolvedValueOnce(null);
+
+		await pushSummary(summary, baseCtx(client));
+
+		expect(client.deleteDoc).not.toHaveBeenCalled();
+		const resolveStoreCall = vi.mocked(storeSummary).mock.calls[1];
+		expect(resolveStoreCall?.[0].unresolvedOrphanHashes).toBeUndefined();
+		expect(resolveStoreCall?.[0].orphanedDocIds).toBeUndefined();
+	});
+
+	it("retains an unresolved hash while its pre-push worker is still pending", async () => {
+		const client = fakeClient();
+		const summary = leaf({ unresolvedOrphanHashes: ["child1hash", "child2hash"] });
+		vi.mocked(loadPushPending).mockResolvedValue({
+			version: 1,
+			entries: {
+				child1hash: {
+					branch: "feature/x",
+					enqueuedAt: "2026-01-01T00:00:00.000Z",
+					retryCount: 0,
+				},
+			},
+		});
+		vi.mocked(getSummary).mockResolvedValue(null);
+
+		await pushSummary(summary, baseCtx(client));
+
+		const resolveStoreCall = vi.mocked(storeSummary).mock.calls[1];
+		expect(resolveStoreCall?.[0].unresolvedOrphanHashes).toEqual(["child1hash"]);
+	});
+
+	it("conservatively retains unresolved hashes when the pending file cannot be read", async () => {
+		const client = fakeClient();
+		const summary = leaf({ unresolvedOrphanHashes: ["child1hash"] });
+		vi.mocked(loadPushPending).mockRejectedValue(new Error("lock unavailable"));
+		vi.mocked(getSummary).mockResolvedValue(null);
+
+		const result = await pushSummary(summary, baseCtx(client));
+
+		expect(result.summary.unresolvedOrphanHashes).toEqual(["child1hash"]);
+		expect(storeSummary).toHaveBeenCalledTimes(1);
+	});
+
+	it("merges resolved orphan hashes with existing orphanedDocIds", async () => {
+		const client = fakeClient();
+		const summary = leaf({
+			orphanedDocIds: [100],
+			unresolvedOrphanHashes: ["child1hash"],
+		});
+		vi.mocked(getSummary).mockResolvedValueOnce(leaf({ commitHash: "child1hash", jolliDocId: 201 }));
+
+		await pushSummary(summary, baseCtx(client));
+
+		expect(client.deleteDoc).toHaveBeenCalledWith(100);
+		expect(client.deleteDoc).toHaveBeenCalledWith(201);
 	});
 });
 

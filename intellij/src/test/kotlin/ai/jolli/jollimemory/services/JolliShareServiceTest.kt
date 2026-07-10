@@ -2,6 +2,7 @@ package ai.jolli.jollimemory.services
 
 import ai.jolli.jollimemory.bridge.GitRemoteUtils
 import ai.jolli.jollimemory.core.CommitSummary
+import ai.jolli.jollimemory.core.PushPendingReader
 import ai.jolli.jollimemory.core.SummaryStore
 import ai.jolli.jollimemory.core.telemetry.Telemetry
 import io.kotest.matchers.shouldBe
@@ -21,10 +22,11 @@ class JolliShareServiceTest {
     private val baseUrl = "https://acme.jolli.ai"
     private val apiKey = "sk-jol-test"
 
-    private fun summary(orphaned: List<Int>? = null) = CommitSummary(
+    private fun summary(orphaned: List<Int>? = null, unresolved: List<String>? = null) = CommitSummary(
         commitHash = "abc12345", commitMessage = "feat: change", commitAuthor = "Dev",
         commitDate = "t", branch = "feature/x", generatedAt = "t",
         jolliDocId = null, orphanedDocIds = orphaned,
+        unresolvedOrphanHashes = unresolved,
     )
 
     @BeforeEach
@@ -34,11 +36,13 @@ class JolliShareServiceTest {
 
         mockkObject(JolliApiClient)
         mockkObject(GitRemoteUtils)
+        mockkObject(PushPendingReader)
         mockkObject(Telemetry)
         every { GitRemoteUtils.getCanonicalRepoUrl(any()) } returns "https://github.com/o/r"
         every { GitRemoteUtils.sanitizeBranchSlug(any()) } returns "feature-x"
         every { Telemetry.track(any(), any()) } returns Unit
         every { Telemetry.bucket(any()) } returns "0"
+        every { PushPendingReader.loadHashes(any()) } returns emptySet()
     }
 
     @AfterEach
@@ -69,6 +73,26 @@ class JolliShareServiceTest {
 
         verify { JolliApiClient.deleteFromJolli(baseUrl, apiKey, 7) }
         res.updatedSummary.orphanedDocIds shouldBe null
+    }
+
+    @Test
+    fun `resolves delayed child doc ids before orphan cleanup`() {
+        every { JolliApiClient.pushToJolli(any(), any(), any()) } returns
+            JolliApiClient.JolliPushResult(url = "ignored", docId = 5, jrn = "jrn:2", created = false)
+        every { JolliApiClient.deleteFromJolli(any(), any(), any()) } returns Unit
+        every { store.getSummary("childHash") } returns summary().copy(commitHash = "childHash", jolliDocId = 77)
+        every { PushPendingReader.loadHashes("/repo") } returns setOf("stillPending")
+
+        val res = JolliShareService.shareSummary(
+            store,
+            summary(unresolved = listOf("childHash", "stillPending")),
+            "/repo",
+            apiKey,
+            baseUrl,
+        )
+
+        verify { JolliApiClient.deleteFromJolli(baseUrl, apiKey, 77) }
+        res.updatedSummary.unresolvedOrphanHashes shouldBe listOf("stillPending")
     }
 
     @Test

@@ -119,6 +119,7 @@ export const ORPHAN_WRITE_LOCK_FILE = "orphan-write.lock";
 export const SYNC_LOCK_FILE = "sync.lock";
 export const PLANS_LOCK_FILE = "plans.lock";
 export const COMMIT_SELECTION_LOCK_FILE = "commit-selection.lock";
+export const PUSH_PENDING_LOCK_FILE = "push-pending.lock";
 
 /** Default wait budget for `acquireOrphanWriteLock` (background callers). */
 export const DEFAULT_ORPHAN_WRITE_TIMEOUT_MS = 1000;
@@ -135,6 +136,16 @@ export const DEFAULT_PLANS_LOCK_TIMEOUT_MS = 5000;
 
 /** Default poll interval while waiting for `plans.lock`. */
 export const DEFAULT_PLANS_LOCK_POLL_MS = 25;
+
+/**
+ * Default wait budget for `withPushPendingLock`. Same rationale as
+ * `withPlansLock`: the guarded section is a sub-millisecond read-modify-write of
+ * `push-pending.json`, so a peer holder clears almost instantly.
+ */
+export const DEFAULT_PUSH_PENDING_LOCK_TIMEOUT_MS = 5000;
+
+/** Default poll interval while waiting for `push-pending.lock`. */
+export const DEFAULT_PUSH_PENDING_LOCK_POLL_MS = 25;
 
 /** Optional knobs for `acquireOrphanWriteLock`. */
 export interface OrphanWriteLockOpts {
@@ -444,5 +455,36 @@ export async function withCommitSelectionLock<T>(
 		return await fn();
 	} finally {
 		if (acquired) await releaseIfOwned(lockPath, COMMIT_SELECTION_LOCK_FILE);
+	}
+}
+
+/**
+ * Guards a read-modify-write of `push-pending.json`. Same shape as
+ * `withPlansLock`: per-worktree; best-effort fallback so writes that MUST land
+ * (pre-push enqueue, worker success/failure accounting) are never silently
+ * dropped. Callers re-read inside `fn` so a lost-update is avoided even under
+ * the best-effort fallback. MUST NOT be nested.
+ */
+export async function withPushPendingLock<T>(
+	cwd: string | undefined,
+	fn: () => Promise<T>,
+	opts: OrphanWriteLockOpts = {},
+): Promise<T> {
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_PUSH_PENDING_LOCK_TIMEOUT_MS;
+	const pollMs = opts.pollMs ?? DEFAULT_PUSH_PENDING_LOCK_POLL_MS;
+	const dir = await ensureWorktreeLockDir(cwd);
+	const lockPath = join(dir, PUSH_PENDING_LOCK_FILE);
+	const acquired = await acquireWithPoll(lockPath, { timeoutMs, pollMs });
+	if (!acquired) {
+		log.warn(
+			"withPushPendingLock: could not acquire %s within %d ms — proceeding best-effort",
+			PUSH_PENDING_LOCK_FILE,
+			timeoutMs,
+		);
+	}
+	try {
+		return await fn();
+	} finally {
+		if (acquired) await releaseIfOwned(lockPath, PUSH_PENDING_LOCK_FILE);
 	}
 }

@@ -57,6 +57,7 @@ import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import { evaluatePlanProgress } from "../core/PlanProgressEvaluator.js";
 import { formatPlansBlock } from "../core/PlanPromptFormatter.js";
 import { estimateCostUsd, PRICES_AS_OF } from "../core/Pricing.js";
+import { triggerPushForNewSummaries } from "../core/PushExecutor.js";
 import { deleteReferenceMarkdown, readReferenceMarkdown } from "../core/references/ReferenceStore.js";
 import { getRegistry } from "../core/references/SourceDefinitionRegistry.js";
 import { renderBlock } from "../core/references/SourceEngine.js";
@@ -207,7 +208,8 @@ async function reassociateMetadata(
 /**
  * Extracts hoisted metadata fields from an old summary for inclusion in a new
  * summary root node. The full hoist set is: jolliDocId, jolliDocUrl,
- * orphanedDocIds, plans, notes, references, e2eTestGuide. Keep this list
+ * orphanedDocIds, unresolvedOrphanHashes, plans, notes, references,
+ * e2eTestGuide. Keep this list
  * synced with the spread block below — drift is the bug we're avoiding by
  * enumerating it here.
  *
@@ -221,6 +223,7 @@ function hoistMetadataFromOldSummary(oldSummary: CommitSummary | null | undefine
 		...(oldSummary.jolliDocId != null && { jolliDocId: oldSummary.jolliDocId }),
 		...(oldSummary.jolliDocUrl && { jolliDocUrl: oldSummary.jolliDocUrl }),
 		...(oldSummary.orphanedDocIds && { orphanedDocIds: oldSummary.orphanedDocIds }),
+		...(oldSummary.unresolvedOrphanHashes && { unresolvedOrphanHashes: oldSummary.unresolvedOrphanHashes }),
 		...(oldSummary.plans && { plans: oldSummary.plans }),
 		...(oldSummary.notes && { notes: oldSummary.notes }),
 		...(oldSummary.references && { references: oldSummary.references }),
@@ -499,6 +502,10 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 			// debounce-trigger a repo-wide topic-KB ingest after the drain (SP3).
 			// Ingest ops do NOT set it — that would self-perpetuate the trigger.
 			let committedThisRun = false;
+			// Commit hashes whose summary was (re)generated this drain. Fed to the
+			// pre-push sync trigger below so a `git push` that raced ahead of summary
+			// generation still gets its memory pushed once the summary lands.
+			const newlyGeneratedHashes = new Set<string>();
 			const MAX_ENTRIES_PER_RUN = 20; // Safety limit to prevent infinite loops
 
 			while (processedCount < MAX_ENTRIES_PER_RUN) {
@@ -533,6 +540,7 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 							processQueueEntry(op, cwd, activeStorage, force),
 						);
 						committedThisRun = true;
+						newlyGeneratedHashes.add(op.commitHash);
 					} catch (error: unknown) {
 						// Queue entries are deleted regardless of success or failure (fire-and-forget).
 						// Retry is intentionally not implemented: pipeline steps (transcript cursor
@@ -568,6 +576,15 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 			// a manual `jolli compile`, so commit-heavy workflows went stale.
 			if (committedThisRun) {
 				await enqueueIngestOperation(cwd, "post-commit");
+			}
+
+			// Pre-push sync follow-up (JOLLI-1900): if any of the commits summarized
+			// this drain are waiting in push-pending.json (a `git push` fired before
+			// their memory existed), push them now. Fire-and-forget on the next tick —
+			// it must never extend this worker's lock hold or delay the ingest phase,
+			// and a slow/offline push just leaves the entries for the next trigger.
+			if (newlyGeneratedHashes.size > 0) {
+				triggerPushForNewSummaries(cwd, [...newlyGeneratedHashes]);
 			}
 			/* v8 ignore start -- catch block only reached if dequeueAllGitOperations throws unexpectedly */
 		} catch (error: unknown) {

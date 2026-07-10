@@ -148,6 +148,7 @@ case "$HOOK_TYPE" in
   post-merge)         exec node "$DIST/PostMergeHook.js" "$@" ;;
   post-rewrite)       exec node "$DIST/PostRewriteHook.js" "$@" ;;
   prepare-commit-msg) exec node "$DIST/PrepareMsgHook.js" "$@" ;;
+  pre-push)           exec node "$DIST/PrePushHook.js" "$@" ;;
   stop)               exec node "$DIST/StopHook.js" "$@" ;;
   session-start)      exec node "$DIST/SessionStartHook.js" "$@" ;;
   gemini-after-agent) exec node "$DIST/GeminiAfterAgentHook.js" "$@" ;;

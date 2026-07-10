@@ -530,9 +530,10 @@ describe("Installer", () => {
 			// Override the mocks so they return the correct worktree-aware paths
 			const { getGitCommonDir, resolveGitHooksDir } = await import("../core/GitOps.js");
 			vi.mocked(getGitCommonDir).mockResolvedValueOnce(mainGitDir);
-			// install() calls resolveGitHooksDir 4× (post-commit, post-rewrite, prepare-commit-msg, post-merge)
+			// install() calls resolveGitHooksDir 5× (post-commit, post-rewrite, prepare-commit-msg, post-merge, pre-push)
 			const mainHooksDir = join(mainGitDir, "hooks");
 			vi.mocked(resolveGitHooksDir)
+				.mockResolvedValueOnce(mainHooksDir)
 				.mockResolvedValueOnce(mainHooksDir)
 				.mockResolvedValueOnce(mainHooksDir)
 				.mockResolvedValueOnce(mainHooksDir)
@@ -564,9 +565,10 @@ describe("Installer", () => {
 			const { getGitCommonDir, getProjectRootDir, resolveGitHooksDir } = await import("../core/GitOps.js");
 			vi.mocked(getGitCommonDir).mockResolvedValueOnce(gitDir);
 			vi.mocked(getProjectRootDir).mockResolvedValueOnce(tempDir);
-			// install() calls resolveGitHooksDir 4× (post-commit, post-rewrite, prepare-commit-msg, post-merge)
+			// install() calls resolveGitHooksDir 5× (post-commit, post-rewrite, prepare-commit-msg, post-merge, pre-push)
 			const gitHooksDir = join(gitDir, "hooks");
 			vi.mocked(resolveGitHooksDir)
+				.mockResolvedValueOnce(gitHooksDir)
 				.mockResolvedValueOnce(gitHooksDir)
 				.mockResolvedValueOnce(gitHooksDir)
 				.mockResolvedValueOnce(gitHooksDir)

@@ -35,6 +35,8 @@ class SummaryStoreTest {
         e2e: List<E2eTestScenario>? = null,
         jolliDocId: Int? = null,
         jolliDocUrl: String? = null,
+        orphanedDocIds: List<Int>? = null,
+        unresolvedOrphanHashes: List<String>? = null,
     ) = CommitSummary(
         commitHash = hash,
         commitMessage = "Test commit",
@@ -48,6 +50,8 @@ class SummaryStoreTest {
         e2eTestGuide = e2e,
         jolliDocId = jolliDocId,
         jolliDocUrl = jolliDocUrl,
+        orphanedDocIds = orphanedDocIds,
+        unresolvedOrphanHashes = unresolvedOrphanHashes,
     )
 
     private fun makeIndexEntry(hash: String, parent: String? = null, treeHash: String? = null) =
@@ -308,8 +312,13 @@ class SummaryStoreTest {
         fun `creates rebase summary with old as child`() {
             stubGitWritePipeline()
             every { git.readBranchFile(any(), "index.json") } returns null
+            val writtenBlobs = mutableListOf<String>()
+            every {
+                git.execWithStdin("hash-object", "-w", "--stdin", input = capture(writtenBlobs), timeoutSeconds = any())
+            } returns "blobhash123"
 
             val oldSummary = makeSummary("oldHash", jolliDocId = 42, jolliDocUrl = "https://jolli.ai/42",
+                orphanedDocIds = listOf(7), unresolvedOrphanHashes = listOf("pendingChild"),
                 plans = listOf(PlanReference("p1", "Plan", 1, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")),
                 e2e = listOf(E2eTestScenario("Test", steps = listOf("Step 1"), expectedResults = listOf("Result 1"))))
             val newInfo = CommitInfo("newHash", "New message", "Alice", "2026-01-16T10:00:00Z")
@@ -317,6 +326,14 @@ class SummaryStoreTest {
             store.migrateOneToOne(oldSummary, newInfo)
 
             verify { git.exec("rev-parse", match { it.startsWith("refs/heads/") }, timeoutSeconds = any()) }
+            val persisted = gson.fromJson(
+                writtenBlobs.first { it.contains("\"commitHash\": \"newHash\"") && it.contains("\"children\"") },
+                CommitSummary::class.java,
+            )
+            persisted.orphanedDocIds shouldBe listOf(7)
+            persisted.unresolvedOrphanHashes shouldBe listOf("pendingChild")
+            persisted.children!!.first().orphanedDocIds shouldBe null
+            persisted.children!!.first().unresolvedOrphanHashes shouldBe null
         }
     }
 
@@ -354,6 +371,40 @@ class SummaryStoreTest {
             // Verify commit was created
             // Verify a commit was created (writeFilesToBranch succeeded)
             verify { git.exec("rev-parse", match { it.startsWith("refs/heads/") }, timeoutSeconds = any()) }
+        }
+
+        @Test
+        fun `hoists jolli cleanup metadata while merging summaries`() {
+            stubGitWritePipeline()
+            every { git.readBranchFile(any(), "index.json") } returns null
+            val writtenBlobs = mutableListOf<String>()
+            every {
+                git.execWithStdin("hash-object", "-w", "--stdin", input = capture(writtenBlobs), timeoutSeconds = any())
+            } returns "blobhash123"
+
+            val older = makeSummary(
+                "s1", jolliDocId = 11, jolliDocUrl = "https://jolli.ai/11",
+                orphanedDocIds = listOf(7), unresolvedOrphanHashes = listOf("pendingChild"),
+                children = listOf(makeSummary("nested", unresolvedOrphanHashes = listOf("nestedPending"))),
+            ).copy(generatedAt = "2026-01-01T00:00:00Z")
+            val newer = makeSummary(
+                "s2", jolliDocId = 22, jolliDocUrl = "https://jolli.ai/22",
+            ).copy(generatedAt = "2026-01-02T00:00:00Z")
+
+            store.mergeManyToOne(
+                listOf(older, newer),
+                CommitInfo("squashHash", "Squash", "Bob", "2026-01-20T10:00:00Z"),
+            )
+
+            val persisted = gson.fromJson(
+                writtenBlobs.first { it.contains("\"commitHash\": \"squashHash\"") && it.contains("\"children\"") },
+                CommitSummary::class.java,
+            )
+            persisted.jolliDocId shouldBe 22
+            persisted.orphanedDocIds shouldBe listOf(11, 7)
+            persisted.unresolvedOrphanHashes shouldBe listOf("pendingChild", "nestedPending")
+            persisted.children!!.all { it.jolliDocId == null && it.unresolvedOrphanHashes == null } shouldBe true
+            persisted.children!!.first().children!!.first().unresolvedOrphanHashes shouldBe null
         }
     }
 

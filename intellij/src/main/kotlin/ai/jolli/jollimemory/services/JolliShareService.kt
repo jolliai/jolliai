@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.services
 import ai.jolli.jollimemory.bridge.GitRemoteUtils
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.JmLogger
+import ai.jolli.jollimemory.core.PushPendingReader
 import ai.jolli.jollimemory.core.SummaryStore
 import ai.jolli.jollimemory.core.telemetry.Telemetry
 import ai.jolli.jollimemory.toolwindow.views.SummaryMarkdownBuilder
@@ -106,7 +107,8 @@ object JolliShareService {
         val updatedSummary = summary.copy(jolliDocUrl = fullUrl, jolliDocId = result.docId, plans = plansWithUrls)
         store.storeSummary(updatedSummary, force = true)
 
-        val cleanedSummary = cleanupOrphanedDocs(store, summary, updatedSummary, baseUrl, apiKey) ?: updatedSummary
+        val resolvedSummary = resolveUnresolvedOrphans(store, updatedSummary, cwd)
+        val cleanedSummary = cleanupOrphanedDocs(store, resolvedSummary, resolvedSummary, baseUrl, apiKey) ?: resolvedSummary
 
         Telemetry.track(
             "memory_pushed",
@@ -118,6 +120,50 @@ object JolliShareService {
         )
 
         return ShareResult(cleanedSummary, result.created, planUrls.size)
+    }
+
+    /**
+     * Promotes delayed child article ids into the normal cleanup queue.
+     *
+     * Retention policy: any hash that cannot be positively resolved to a
+     * docId is retained. Dropping unresolved hashes purely because they are
+     * not in `push-pending.json` is unsafe — a worker that succeeded on the
+     * network but crashed before writing the docId back would have left an
+     * orphan Space article whose only local trace is this hash. The pending
+     * file is still read so we can log how many retained hashes look
+     * in-flight vs. abandoned; it does not gate retention.
+     */
+    private fun resolveUnresolvedOrphans(store: SummaryStore, summary: CommitSummary, cwd: String): CommitSummary {
+        val hashes = summary.unresolvedOrphanHashes ?: return summary
+        if (hashes.isEmpty()) return summary
+
+        val pendingHashes = PushPendingReader.loadHashes(cwd)
+        val resolvedDocIds = ArrayList<Int>()
+        val remainingHashes = ArrayList<String>()
+        var stillInFlight = 0
+        for (hash in hashes) {
+            val fresh = store.getSummary(hash)
+            if (fresh?.commitHash == hash && fresh.jolliDocId != null) {
+                resolvedDocIds.add(fresh.jolliDocId)
+            } else {
+                remainingHashes.add(hash)
+                if (pendingHashes != null && hash in pendingHashes) stillInFlight++
+            }
+        }
+        if (resolvedDocIds.isEmpty() && remainingHashes.size == hashes.size) return summary
+
+        if (resolvedDocIds.isNotEmpty()) {
+            log.info(
+                "Resolved ${resolvedDocIds.size} orphan hashes → docIds for cleanup " +
+                    "(${remainingHashes.size} retained, $stillInFlight still in-flight)",
+            )
+        }
+        val resolved = summary.copy(
+            orphanedDocIds = ((summary.orphanedDocIds ?: emptyList()) + resolvedDocIds).distinct().ifEmpty { null },
+            unresolvedOrphanHashes = remainingHashes.distinct().ifEmpty { null },
+        )
+        store.storeSummary(resolved, force = true)
+        return resolved
     }
 
     /**

@@ -128,6 +128,14 @@ class HookInstallerTest {
             File(tempDir, ".git/hooks").mkdirs()
             HookInstaller(tempDir.absolutePath).isGitHookInstalled("post-commit", "marker") shouldBe false
         }
+
+        @Test
+        fun `detects the pre-push marker`(@TempDir tempDir: File) {
+            File(tempDir, ".git/hooks").mkdirs()
+            File(tempDir, ".git/hooks/pre-push").writeText(
+                "#!/bin/sh\n# >>> JolliMemory pre-push hook >>>\nscript\n# <<< JolliMemory pre-push hook <<<\n")
+            HookInstaller(tempDir.absolutePath).isGitHookInstalled("pre-push", "# >>> JolliMemory pre-push hook >>>") shouldBe true
+        }
     }
 
     // ── areAllHooksInstalled ────────────────────────────────────────────
@@ -135,6 +143,16 @@ class HookInstallerTest {
     @Test
     fun `areAllHooksInstalled returns false when no hooks`() {
         HookInstaller("/nonexistent/path").areAllHooksInstalled() shouldBe false
+    }
+
+    @Test
+    fun `pre-push script preserves the preceding hook status`() {
+        val method = HookInstaller::class.java.getDeclaredMethod("prePushScript")
+        method.isAccessible = true
+        val script = method.invoke(HookInstaller("/fake")) as String
+
+        script shouldContain "__jolli_pre_push_previous_status=${'$'}?"
+        script shouldContain """(exit "${'$'}__jolli_pre_push_previous_status")"""
     }
 
     // ── getDebugInfo ────────────────────────────────────────────────────
@@ -192,6 +210,20 @@ class HookInstallerTest {
 
             // Should either delete or clean the file
             val hookFile = File(tempDir, ".git/hooks/post-commit")
+            if (hookFile.exists()) {
+                hookFile.readText() shouldNotContain "JolliMemory"
+            }
+        }
+
+        @Test
+        fun `removes the pre-push hook section`(@TempDir tempDir: File) {
+            File(tempDir, ".git/hooks").mkdirs()
+            File(tempDir, ".git/hooks/pre-push").writeText(
+                "#!/bin/sh\n\n# >>> JolliMemory pre-push hook >>>\nsome script\n# <<< JolliMemory pre-push hook <<<\n")
+
+            HookInstaller(tempDir.absolutePath).uninstall()
+
+            val hookFile = File(tempDir, ".git/hooks/pre-push")
             if (hookFile.exists()) {
                 hookFile.readText() shouldNotContain "JolliMemory"
             }

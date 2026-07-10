@@ -494,6 +494,14 @@ export interface CommitSummary {
 	 * Plan articles are never orphaned — plan slugs include commit hashes and are all kept.
 	 */
 	readonly orphanedDocIds?: ReadonlyArray<number>;
+	/**
+	 * Commit hashes whose summaries had no `jolliDocId` at squash/merge time
+	 * (race: PrePushWorker hadn't written back the ID yet). Consumed at push
+	 * time: re-read each hash, promote any now-present docId into
+	 * `orphanedDocIds` for cleanup, retain hashes still present in the shared
+	 * push-pending queue, and discard only hashes known not to be in flight.
+	 */
+	readonly unresolvedOrphanHashes?: ReadonlyArray<string>;
 	/** Git tree hash for this commit; used for cross-branch summary matching */
 	readonly treeHash?: string;
 	/** On-demand E2E test scenarios for PR reviewers (generated via SummaryWebviewPanel) */
@@ -1058,6 +1066,14 @@ export interface JolliMemoryConfig {
 	 */
 	readonly dcoSignoff?: boolean;
 	/**
+	 * Auto-push memory to Jolli Space on every `git push`. `undefined` = enabled
+	 * (default when logged in); `false` = disabled. The pre-push hook records
+	 * pushed commits into `.jolli/jollimemory/push-pending.json` and a detached
+	 * PrePushWorker syncs them to the bound Space. Complementary to the
+	 * PR-level `push_memory` flow — same idempotent server path, no duplicates.
+	 */
+	readonly syncOnPush?: boolean;
+	/**
 	 * Whether to **auto-sync** Memory Bank to the user's private Personal
 	 * Space vault on a recurring schedule. Plan §0.7 made manual sync the
 	 * always-available default (the "Sync to Personal Space Now" button +
@@ -1179,6 +1195,8 @@ export interface InstallResult {
 	readonly prepareMsgHookPath?: string;
 	/** Absolute path to the git post-merge hook file (set on successful install) */
 	readonly postMergeHookPath?: string;
+	/** Absolute path to the git pre-push hook file (set on successful install) */
+	readonly prePushHookPath?: string;
 	/** Absolute path to the Gemini CLI settings file (set on successful install when Gemini detected) */
 	readonly geminiSettingsPath?: string;
 }
@@ -1200,6 +1218,8 @@ export interface StatusInfo {
 	readonly enabled: boolean;
 	readonly claudeHookInstalled: boolean;
 	readonly gitHookInstalled: boolean;
+	/** Whether the pre-push hook section is installed (additive, not required for `enabled`) */
+	readonly prePushHookInstalled?: boolean;
 	/** Whether the Gemini AfterAgent hook is installed in .gemini/settings.json */
 	readonly geminiHookInstalled: boolean;
 	/**

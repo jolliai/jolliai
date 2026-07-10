@@ -22,6 +22,7 @@ import {
 	NotAuthenticatedError,
 } from "./JolliMemoryPushClient.js";
 import { loadBranchSummaries } from "./PrDescription.js";
+import { loadPushPending } from "./PushPendingStore.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import { buildNotePushTitle, buildPlanPushTitle, buildPushTitle, collectSortedTopics } from "./SummaryFormat.js";
 import {
@@ -34,7 +35,14 @@ import {
 	pushTopicBody,
 	pushTopicsSection,
 } from "./SummaryMarkdownBuilder.js";
-import { getActiveStorage, readNoteFromBranch, readPlanFromBranch, storeSummary } from "./SummaryStore.js";
+import {
+	getActiveStorage,
+	getIndexEntryMap,
+	getSummary,
+	readNoteFromBranch,
+	readPlanFromBranch,
+	storeSummary,
+} from "./SummaryStore.js";
 
 const log = createLogger("JolliMemoryPushOrchestrator");
 
@@ -49,15 +57,22 @@ const MAX_SUMMARY_JSON_BYTES = 1_572_864;
 /**
  * Serializes a summary for the `summaryJson` push field: the enriched
  * `summaryForMarkdown` copy (plan/note URLs woven in) minus the client push-state
- * fields — `jolliDocId`/`jolliDocUrl` churn per push and `orphanedDocIds` is
- * cleanup bookkeeping, none of which is commit content the share page should see
+ * fields — `jolliDocId`/`jolliDocUrl` churn per push, while `orphanedDocIds`
+ * and `unresolvedOrphanHashes` are cleanup bookkeeping. None of them are
+ * commit content the share page should see
  * (stripping them also keeps the top-level fields of a re-push byte-identical for
  * unchanged content, so the server upsert can no-op — per-plan/note `jolliPlan*`/
  * `jolliNote*` ids nested inside `plans[]`/`notes[]` are untouched and can still
  * churn). Returns undefined above {@link MAX_SUMMARY_JSON_BYTES}.
  */
 export function serializeSummaryJson(summary: CommitSummary): string | undefined {
-	const { jolliDocId: _docId, jolliDocUrl: _docUrl, orphanedDocIds: _orphaned, ...content } = summary;
+	const {
+		jolliDocId: _docId,
+		jolliDocUrl: _docUrl,
+		orphanedDocIds: _orphaned,
+		unresolvedOrphanHashes: _unresolved,
+		...content
+	} = summary;
 	const json = JSON.stringify(content);
 	if (Buffer.byteLength(json, "utf-8") > MAX_SUMMARY_JSON_BYTES) {
 		log.warn(
@@ -374,6 +389,36 @@ export async function pushSummary(
 
 	const summaryUrl = `${displayBase}/articles?doc=${result.docId}`;
 
+	// Post-push race check: `processPushPending` already skipped hashes that
+	// were children at claim time, but the user could have amend/squashed this
+	// commit while we were on the network. Force-writing a child back as a root
+	// (storeSummary force=true below) would create a zombie index entry that
+	// duplicates the merged root's content. Instead, best-effort delete the
+	// freshly-published article and return — the merged root remains the sole
+	// authority for this commit's memory.
+	const postPushIndex = await getIndexEntryMap(ctx.cwd, ctx.storage).catch(() => new Map<string, unknown>());
+	const currentIndexEntry = postPushIndex.get(summary.commitHash) as
+		| { readonly parentCommitHash?: string | null }
+		| undefined;
+	if (currentIndexEntry?.parentCommitHash != null) {
+		log.warn(
+			"Commit %s became a child mid-push (parent=%s); deleting freshly-pushed article %d and skipping force-store",
+			summary.commitHash.substring(0, 8),
+			currentIndexEntry.parentCommitHash.substring(0, 8),
+			result.docId,
+		);
+		try {
+			await ctx.client.deleteDoc(result.docId);
+		} catch (err) {
+			log.warn(
+				"Best-effort delete of newly-orphaned article %d failed: %s",
+				result.docId,
+				err instanceof Error ? err.message : String(err),
+			);
+		}
+		return { summary, summaryUrl };
+	}
+
 	const updatedSummary: CommitSummary = {
 		...summary,
 		jolliDocUrl: summaryUrl,
@@ -383,12 +428,72 @@ export async function pushSummary(
 	};
 	await storeSummary(updatedSummary, ctx.cwd, true, undefined, ctx.storage);
 
+	// Resolve unresolvedOrphanHashes: re-read each hash's summary from the
+	// orphan branch. If PrePushWorker has since written back a jolliDocId,
+	// promote it into orphanedDocIds for cleanup.
+	//
+	// Retention is gated by the shared push-pending queue:
+	//   * hash present in pending → retain (a worker is still in flight and
+	//     may yet resolve it)
+	//   * hash absent from pending → discard (it was never pushed, or the
+	//     worker already finished without producing a docId — either way the
+	//     hash has no Space article to clean up)
+	//
+	// When `loadPushPending` itself fails (lock unavailable, transient IO
+	// error) we fall back to conservative retention: keep every unresolved
+	// hash so a crashed worker's article can still be cleaned up on the next
+	// push.
+	let summaryForCleanup = updatedSummary;
+	if (summary.unresolvedOrphanHashes && summary.unresolvedOrphanHashes.length > 0) {
+		const pending = await loadPushPending(ctx.cwd).catch((err: unknown) => {
+			log.warn(
+				"Could not read push-pending state while resolving orphan hashes: %s",
+				err instanceof Error ? err.message : String(err),
+			);
+			return undefined;
+		});
+		const resolvedDocIds: number[] = [];
+		const remainingHashes: string[] = [];
+		let stillInFlight = 0;
+		for (const hash of summary.unresolvedOrphanHashes) {
+			const fresh = await getSummary(hash, ctx.cwd, ctx.storage);
+			// Guard against tree-hash fallback: if the child's own summary
+			// file was cleaned, getSummary may resolve to the merged summary
+			// (same tree) — whose jolliDocId is the article we just pushed.
+			// Without this check we'd delete our own freshly-published article.
+			if (fresh?.jolliDocId && fresh.commitHash === hash) {
+				resolvedDocIds.push(fresh.jolliDocId);
+			} else if (pending === undefined) {
+				remainingHashes.push(hash);
+			} else if (pending.entries[hash]) {
+				remainingHashes.push(hash);
+				stillInFlight++;
+			}
+		}
+		if (resolvedDocIds.length > 0 || remainingHashes.length !== summary.unresolvedOrphanHashes.length) {
+			if (resolvedDocIds.length > 0)
+				log.info(
+					"Resolved %d orphan hashes → docIds for cleanup (%d retained, %d still in-flight)",
+					resolvedDocIds.length,
+					remainingHashes.length,
+					stillInFlight,
+				);
+			const mergedOrphanIds = [...new Set([...(updatedSummary.orphanedDocIds ?? []), ...resolvedDocIds])];
+			summaryForCleanup = {
+				...updatedSummary,
+				orphanedDocIds: mergedOrphanIds.length > 0 ? mergedOrphanIds : undefined,
+				unresolvedOrphanHashes: remainingHashes.length > 0 ? [...new Set(remainingHashes)] : undefined,
+			};
+			await storeSummary(summaryForCleanup, ctx.cwd, true, undefined, ctx.storage);
+		}
+	}
+
 	// Clean up orphaned articles, then persist which ones were actually deleted.
 	// Best-effort: the summary + jolliDocId are already pushed and stored above, so a
 	// cleanup/bookkeeping failure must not surface to the caller as a failed push.
-	let finalSummary = updatedSummary;
+	let finalSummary = summaryForCleanup;
 	try {
-		const cleaned = await cleanupOrphanedDocs(summary, updatedSummary, ctx);
+		const cleaned = await cleanupOrphanedDocs(summaryForCleanup, summaryForCleanup, ctx);
 		if (cleaned) finalSummary = cleaned;
 	} catch (err) {
 		log.warn("Orphan cleanup failed after a successful push: %s", err instanceof Error ? err.message : String(err));

@@ -96,7 +96,7 @@ export function registerStatusCommand(program: Command): void {
 
 			// Build hooks description matching VSCode STATUS panel format
 			const hookParts: string[] = [];
-			if (status.gitHookInstalled) hookParts.push("3 Git");
+			if (status.gitHookInstalled) hookParts.push(`${status.prePushHookInstalled ? 5 : 4} Git`);
 			if (status.claudeHookInstalled) hookParts.push("2 Claude");
 			if (status.geminiHookInstalled) hookParts.push("1 Gemini CLI");
 			const hooksDesc = hookParts.length > 0 ? hookParts.join(" + ") : "none installed";

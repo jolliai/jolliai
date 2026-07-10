@@ -12,6 +12,7 @@ import { browserLogin } from "../auth/Login.js";
 import { validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { getGlobalConfigDir, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
+import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
 import { install, uninstall } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { JolliMemoryConfig } from "../Types.js";
@@ -161,6 +162,8 @@ export function registerEnableCommand(program: Command): void {
 					console.log(
 						`    - Git prepare-commit-msg hook (${result.prepareMsgHookPath ?? ".git/hooks/prepare-commit-msg"})`,
 					);
+					console.log(`    - Git post-merge hook (${result.postMergeHookPath ?? ".git/hooks/post-merge"})`);
+					console.log(`    - Git pre-push hook (${result.prePushHookPath ?? ".git/hooks/pre-push"})`);
 					console.log(
 						`    - Claude Code hooks (${result.claudeSettingsPath ?? ".claude/settings.local.json"})`,
 					);
@@ -193,6 +196,15 @@ export function registerEnableCommand(program: Command): void {
 					console.log("\n  Configure API keys to enable summarization:");
 					console.log(`    Edit: ${join(configDir, "config.json")}`);
 					console.log('    Set "apiKey" (Anthropic) and/or "jolliApiKey" (Jolli Space)\n');
+				}
+
+				// Pre-push sync catch-up (JOLLI-1900): retry any commits left in
+				// push-pending.json from a previous session. Runs after promptSetup so a
+				// user who just signed in gets their backlog pushed. Skipped in
+				// integrations-only mode (IntelliJ manages its own hook/worker). Fully
+				// guarded — never throws, no-ops when nothing is pending or not signed in.
+				if (!options.integrationsOnly) {
+					void triggerPendingPushRetry(options.cwd);
 				}
 
 				// Historical back-fill is no longer kicked off automatically at enable

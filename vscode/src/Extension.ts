@@ -25,6 +25,7 @@ import {
 import type { ManifestEntry } from "../../cli/src/core/KBTypes.js";
 import { isPathInside, toForwardSlash } from "../../cli/src/core/PathUtils.js";
 import { assertJolliOriginAllowed } from "../../cli/src/core/JolliApiUtils.js";
+import { triggerPendingPushRetry } from "../../cli/src/hooks/PushCompensation.js";
 import { exportSharedBranch } from "./services/JolliShareService.js";
 import { importSharedBranchForDisplay } from "./services/SharedBranchImporter.js";
 import { activateExtensionTelemetry, reinitExtensionTelemetry } from "./TelemetryActivation.js";
@@ -1708,6 +1709,11 @@ export function activate(context: vscode.ExtensionContext): void {
 	initializeKB().finally(() => {
 		clearTimeout(kbInitWatchdog);
 		resolveKbInit();
+		// Pre-push sync catch-up (JOLLI-1900): retry any commits left in
+		// push-pending.json from a previous session, now that storage is
+		// initialized. Fire-and-forget; fully guarded (never throws, no-ops when
+		// nothing is pending or the user isn't signed in).
+		void triggerPendingPushRetry(workspaceRoot);
 	});
 
 	// ── sessions.json watcher ─────────────────────────────────────────────────
@@ -3758,6 +3764,9 @@ export function activate(context: vscode.ExtensionContext): void {
 						await activation?.runtime
 							.reconcileAutoSync()
 							.catch(handleError("uriHandler.reconcileAutoSync"));
+						// Pre-push sync catch-up: drain any commits left in
+						// push-pending.json from pushes made while signed out.
+						void triggerPendingPushRetry(workspaceRoot);
 					} else {
 						vscode.window.showErrorMessage(
 							`Jolli sign-in failed: ${result.error}`,

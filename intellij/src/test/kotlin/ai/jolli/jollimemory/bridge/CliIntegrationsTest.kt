@@ -35,6 +35,25 @@ class CliIntegrationsTest {
         result.shouldBeInstanceOf<CliIntegrations.Result>()
     }
 
+    @Test
+    fun `retryPendingPushes no-ops (no throw) when there is nothing pending`() {
+        // No push-pending.json → the cheap pre-check returns before any Node work,
+        // so a normal commit never pays a spawn. Must not throw, either mode.
+        File(tempDir, ".jolli/jollimemory").mkdirs()
+        CliIntegrations.retryPendingPushes(tempDir.absolutePath)
+        CliIntegrations.retryPendingPushes(tempDir.absolutePath, waitForCompletion = true)
+    }
+
+    @Test
+    fun `retryPendingPushes degrades gracefully when a pending file exists but no node`() {
+        // With push-pending.json present the guard passes; with no node/bundle on the
+        // test classpath it still returns cleanly (never throws) rather than erroring.
+        File(tempDir, ".jolli/jollimemory").mkdirs()
+        File(tempDir, ".jolli/jollimemory/push-pending.json")
+            .writeText("""{"version":1,"entries":{"abc":{"branch":"x","enqueuedAt":"2026-01-01T00:00:00Z","retryCount":0}}}""")
+        CliIntegrations.retryPendingPushes(tempDir.absolutePath, waitForCompletion = true)
+    }
+
     // ── warningFor — every non-Ok result yields a user-facing message ──────
 
     @Test
