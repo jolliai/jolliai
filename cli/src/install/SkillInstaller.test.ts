@@ -57,17 +57,24 @@ function readPr(target: "claude" | "agents" = "claude"): string {
 	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
 }
 
+function readJolli(target: "claude" | "agents" = "claude"): string {
+	const dir = target === "claude" ? ".claude/skills/jolli" : ".agents/skills/jolli";
+	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
+}
+
 // ─── Dual-target write ──────────────────────────────────────────────────────
 
 describe("updateSkillsIfNeeded — target dimension", () => {
-	it("writes all three skills into both .claude/skills/ and .agents/skills/", async () => {
+	it("writes all four skills into both .claude/skills/ and .agents/skills/", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli/SKILL.md"))).toBe(true);
 	});
 
 	it("writes byte-identical SKILL.md to .claude/skills/ and .agents/skills/", async () => {
@@ -75,6 +82,7 @@ describe("updateSkillsIfNeeded — target dimension", () => {
 		expect(readRecall("claude")).toBe(readRecall("agents"));
 		expect(readSearch("claude")).toBe(readSearch("agents"));
 		expect(readPr("claude")).toBe(readPr("agents"));
+		expect(readJolli("claude")).toBe(readJolli("agents"));
 	});
 
 	it("with claudeEnabled=false, skips .claude/skills/ but still writes .agents/skills/", async () => {
@@ -82,9 +90,11 @@ describe("updateSkillsIfNeeded — target dimension", () => {
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(false);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli/SKILL.md"))).toBe(true);
 	});
 
 	it("with claudeEnabled=undefined (default), writes both targets for all skills", async () => {
@@ -95,14 +105,16 @@ describe("updateSkillsIfNeeded — target dimension", () => {
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
 	});
 
-	it("exports the 6 git-exclude paths for the three skills × two targets", () => {
+	it("exports the 8 git-exclude paths for the four skills × two targets", () => {
 		expect(SKILL_GIT_EXCLUDE_PATHS).toEqual([
 			"/.claude/skills/jolli-recall/",
 			"/.claude/skills/jolli-search/",
 			"/.claude/skills/jolli-pr/",
+			"/.claude/skills/jolli/",
 			"/.agents/skills/jolli-recall/",
 			"/.agents/skills/jolli-search/",
 			"/.agents/skills/jolli-pr/",
+			"/.agents/skills/jolli/",
 		]);
 	});
 });
@@ -173,6 +185,36 @@ describe("pr template frontmatter", () => {
 		expect(pr).not.toMatch(/^argument-hint:/m);
 		expect(pr).not.toMatch(/^user-invocable:/m);
 		expect(pr).not.toMatch(/^disable-model-invocation:/m);
+	});
+});
+
+describe("jolli menu template frontmatter", () => {
+	it("uses spec-compliant fields only — name, description, metadata.version, metadata.vendor", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const jolli = readJolli();
+		expect(jolli).toMatch(/^---\nname: jolli\n/);
+		expect(jolli).toMatch(/description: The Jolli action menu/);
+		expect(jolli).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}vendor: "jolli\.ai"/);
+	});
+
+	it("does NOT contain Claude-private top-level frontmatter fields", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const jolli = readJolli();
+		expect(jolli).not.toMatch(/^argument-hint:/m);
+		expect(jolli).not.toMatch(/^user-invocable:/m);
+		expect(jolli).not.toMatch(/^disable-model-invocation:/m);
+	});
+
+	it("routes to the sibling skills and the Jolli MCP tools without re-deriving backend curation", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const jolli = readJolli();
+		// Static local-skill menu entries.
+		expect(jolli).toMatch(/jolli-recall/);
+		expect(jolli).toMatch(/jolli-search/);
+		expect(jolli).toMatch(/jolli-pr/);
+		// Surfaces session-registered MCP tools, not a hardcoded manifest fetch.
+		expect(jolli).toMatch(/mcp__jollimemory__/);
+		expect(jolli).toMatch(/AskUserQuestion/);
 	});
 });
 
