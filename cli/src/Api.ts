@@ -31,6 +31,7 @@ import { registerSearchCommand } from "./commands/SearchCommand.js";
 import { registerStatusCommand } from "./commands/StatusCommand.js";
 import { registerSyncCommand } from "./commands/SyncCommand.js";
 import { registerTelemetryCommand } from "./commands/TelemetryCommand.js";
+import { registerUninstallCommand } from "./commands/UninstallCommand.js";
 import { registerViewCommand } from "./commands/ViewCommand.js";
 // _parseJolliApiKey / _parseBaseUrl: re-exposed at the bottom of this file.
 // See the `parseJolliApiKey` export for the rationale (Vite tree-shaker drops
@@ -154,6 +155,7 @@ function isHiddenCommand(c: Command): boolean {
 const MEMORY_COMMAND_NAMES = new Set([
 	"enable",
 	"disable",
+	"uninstall",
 	"status",
 	"configure",
 	"clean",
@@ -335,6 +337,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 
 	registerEnableCommand(program);
 	registerDisableCommand(program);
+	registerUninstallCommand(program);
 	registerStatusCommand(program);
 	registerConfigureCommand(program);
 	registerCleanCommand(program);
