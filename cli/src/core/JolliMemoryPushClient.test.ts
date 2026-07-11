@@ -652,6 +652,85 @@ describe("fetchManifest", () => {
 		expect(tool.binding).toEqual({ method: "POST", path: "/api/mcp/tools/list_workflow_definitions" });
 	});
 
+	it("preserves a valid menu block on a fetched entry", async () => {
+		const withMenu = {
+			name: "create_ticket",
+			description: "Create a ticket",
+			inputSchema: { type: "object", properties: {} },
+			menu: { label: "Create ticket", description: "Open a new ticket", order: 2 },
+		};
+		const c = client(async () => jsonResponse(200, { tools: [withMenu] }));
+		const [tool] = await c.fetchManifest();
+		expect(tool.menu).toEqual({ label: "Create ticket", description: "Open a new ticket", order: 2 });
+	});
+
+	it("keeps only the label when a menu block omits description/order", async () => {
+		const c = client(async () =>
+			jsonResponse(200, {
+				tools: [
+					{
+						name: "t",
+						description: "d",
+						inputSchema: { type: "object", properties: {} },
+						menu: { label: "Just a label" },
+					},
+				],
+			}),
+		);
+		const [tool] = await c.fetchManifest();
+		expect(tool.menu).toEqual({ label: "Just a label" });
+	});
+
+	it("drops a malformed menu block WITHOUT dropping the tool (unlike binding)", async () => {
+		// Each of these entries has a bad menu but must remain a usable tool with no
+		// menu — a partially-rolled-out backend must never lose a working tool.
+		const c = client(async () =>
+			jsonResponse(200, {
+				tools: [
+					{
+						name: "not_object",
+						description: "d",
+						inputSchema: { type: "object", properties: {} },
+						menu: "nope",
+					},
+					{ name: "menu_array", description: "d", inputSchema: { type: "object", properties: {} }, menu: [] },
+					{
+						name: "no_label",
+						description: "d",
+						inputSchema: { type: "object", properties: {} },
+						menu: { description: "no label here" },
+					},
+					{
+						name: "blank_label",
+						description: "d",
+						inputSchema: { type: "object", properties: {} },
+						menu: { label: "   " },
+					},
+				],
+			}),
+		);
+		const tools = await c.fetchManifest();
+		expect(tools.map((t) => t.name)).toEqual(["not_object", "menu_array", "no_label", "blank_label"]);
+		expect(tools.every((t) => t.menu === undefined)).toBe(true);
+	});
+
+	it("drops only the malformed description/order fields, keeping the label", async () => {
+		const c = client(async () =>
+			jsonResponse(200, {
+				tools: [
+					{
+						name: "t",
+						description: "d",
+						inputSchema: { type: "object", properties: {} },
+						menu: { label: "Keep me", description: 123, order: "high" },
+					},
+				],
+			}),
+		);
+		const [tool] = await c.fetchManifest();
+		expect(tool.menu).toEqual({ label: "Keep me" });
+	});
+
 	it("sends Bearer auth to /api/mcp/manifest", async () => {
 		let capturedUrl: string | undefined;
 		let capturedHeaders: Record<string, string> = {};

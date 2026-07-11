@@ -103,6 +103,19 @@ export interface PlatformToolBinding {
 }
 
 /**
+ * Opt-in metadata that surfaces a platform tool in the curated `/jolli` menu
+ * prompt. The backend flags a tool for the menu by attaching this block; an entry
+ * without it is a normal, directly-callable tool that simply never appears in the
+ * menu. `label` is the human-facing menu entry, `description` overrides the tool's
+ * own description in the menu, and `order` is an optional sort hint.
+ */
+export interface PlatformToolMenuEntry {
+	readonly label: string;
+	readonly description?: string;
+	readonly order?: number;
+}
+
+/**
  * A backend-defined Jolli-platform tool as advertised by `GET /api/mcp/manifest`.
  * The `name` / `description` / `inputSchema` triple structurally matches the MCP
  * server's tool definition so the server can splice these straight into its tool
@@ -116,6 +129,8 @@ export interface PlatformToolManifestEntry {
 	readonly inputSchema: { type: "object"; properties: Record<string, unknown>; required?: string[] };
 	/** REST binding the generic executor calls. Falls back to POST /api/mcp/tools/<name> when absent. */
 	readonly binding?: PlatformToolBinding;
+	/** Present only when the backend flags this tool for the curated `/jolli` menu. */
+	readonly menu?: PlatformToolMenuEntry;
 }
 
 /** Test seam — swap in a stub `fetch` / api key / base URL to drive unit tests deterministically. */
@@ -605,16 +620,23 @@ function extractManifestTools(json: unknown): unknown[] {
  * registry — where it could make the whole `tools/list` response fail a client's
  * schema validation — nor drop a valid neighbor. Other JSON-Schema keywords on
  * `inputSchema` are preserved.
+ *
+ * An optional `menu` block is validated at FIELD granularity (see
+ * `toPlatformMenuEntry`): unlike `binding`, a malformed `menu` never drops the
+ * whole entry — the tool stays callable, it just doesn't appear in the `/jolli`
+ * menu. This lets a partially-rolled-out backend add menu metadata without any
+ * risk of dropping a working tool.
  */
 function toPlatformToolEntry(value: unknown): PlatformToolManifestEntry | null {
 	if (typeof value !== "object" || value === null) {
 		return null;
 	}
-	const { name, description, inputSchema, binding } = value as {
+	const { name, description, inputSchema, binding, menu } = value as {
 		name?: unknown;
 		description?: unknown;
 		inputSchema?: unknown;
 		binding?: unknown;
+		menu?: unknown;
 	};
 	if (typeof name !== "string" || name.trim() === "" || typeof description !== "string") {
 		return null;
@@ -656,11 +678,37 @@ function toPlatformToolEntry(value: unknown): PlatformToolManifestEntry | null {
 	const inputSchemaOut = (
 		schema.properties === undefined ? { ...schema, properties: {} } : schema
 	) as PlatformToolManifestEntry["inputSchema"];
+	const normalizedMenu = toPlatformMenuEntry(menu);
 	return {
 		name,
 		description,
 		inputSchema: inputSchemaOut,
 		...(normalizedBinding ? { binding: normalizedBinding } : {}),
+		...(normalizedMenu ? { menu: normalizedMenu } : {}),
+	};
+}
+
+/**
+ * Normalizes an optional `menu` block, degrading at field granularity so a bad
+ * block never drops the parent tool. A missing/non-object `menu`, or one without a
+ * non-empty string `label`, yields `undefined` (the tool is simply absent from the
+ * menu). A valid `label` with a malformed `description` / `order` keeps the label
+ * and drops only the offending field.
+ */
+function toPlatformMenuEntry(value: unknown): PlatformToolMenuEntry | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		return undefined;
+	}
+	const { label, description, order } = value as { label?: unknown; description?: unknown; order?: unknown };
+	if (typeof label !== "string" || label.trim() === "") {
+		return undefined;
+	}
+	const validDescription = typeof description === "string" ? description : undefined;
+	const validOrder = typeof order === "number" && Number.isFinite(order) ? order : undefined;
+	return {
+		label,
+		...(validDescription !== undefined ? { description: validDescription } : {}),
+		...(validOrder !== undefined ? { order: validOrder } : {}),
 	};
 }
 
