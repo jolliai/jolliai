@@ -19,16 +19,27 @@ vi.mock("../core/SummaryStore.js", () => ({ setActiveStorage: vi.fn() }));
 // Capture the request handlers the server registers so the test can invoke them directly.
 type RequestHandler = (req: { params: { name: string; arguments?: Record<string, unknown> } }) => Promise<unknown>;
 const capturedHandlers: RequestHandler[] = [];
+// Parallel to capturedHandlers: the (mocked) schema marker each handler was registered with.
+const capturedSchemas: Array<{ kind: string }> = [];
 const connectMock = vi.fn().mockResolvedValue(undefined);
-// Capture the Server constructor's first arg so the test can assert name/version.
+// Capture the Server constructor's args so the test can assert name/version + capabilities.
 let serverInfo: { name: string; version: string } | undefined;
+let serverCapabilities: { tools?: unknown; prompts?: unknown } | undefined;
+
+// Find the handler registered for a given schema marker kind (e.g. "listPrompts").
+function handlerForKind(kind: string): RequestHandler | undefined {
+	const idx = capturedSchemas.findIndex((s) => s?.kind === kind);
+	return idx >= 0 ? capturedHandlers[idx] : undefined;
+}
 
 vi.mock("@modelcontextprotocol/sdk/server/index.js", () => ({
 	Server: class {
-		constructor(info: { name: string; version: string }) {
+		constructor(info: { name: string; version: string }, options?: { capabilities?: typeof serverCapabilities }) {
 			serverInfo = info;
+			serverCapabilities = options?.capabilities;
 		}
-		setRequestHandler(_schema: unknown, handler: RequestHandler) {
+		setRequestHandler(schema: { kind: string }, handler: RequestHandler) {
+			capturedSchemas.push(schema);
 			capturedHandlers.push(handler);
 		}
 		connect = connectMock;
@@ -43,6 +54,8 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
 vi.mock("@modelcontextprotocol/sdk/types.js", () => ({
 	ListToolsRequestSchema: { kind: "list" },
 	CallToolRequestSchema: { kind: "call" },
+	ListPromptsRequestSchema: { kind: "listPrompts" },
+	GetPromptRequestSchema: { kind: "getPrompt" },
 }));
 
 // Gate the platform-tool path deterministically: default to "disabled" so the
@@ -168,6 +181,8 @@ describe("dispatchTool", () => {
 describe("startMcpServer", () => {
 	beforeEach(() => {
 		capturedHandlers.length = 0;
+		capturedSchemas.length = 0;
+		serverCapabilities = undefined;
 		connectMock.mockClear();
 		loadConfigMock.mockReset().mockResolvedValue({});
 		fetchManifestMock.mockReset();
@@ -178,6 +193,11 @@ describe("startMcpServer", () => {
 		await startMcpServer("/repo");
 		expect(connectMock).toHaveBeenCalledTimes(1);
 		expect(capturedHandlers).toHaveLength(2);
+	});
+
+	it("advertises the tools capability only when no menu is active", async () => {
+		await startMcpServer("/repo");
+		expect(serverCapabilities).toEqual({ tools: {} });
 	});
 
 	it("ListTools handler returns the tool definitions", async () => {
@@ -294,6 +314,8 @@ describe("startMcpServer — platform tools", () => {
 
 	beforeEach(() => {
 		capturedHandlers.length = 0;
+		capturedSchemas.length = 0;
+		serverCapabilities = undefined;
 		connectMock.mockClear();
 		loadConfigMock.mockReset().mockResolvedValue({});
 		fetchManifestMock.mockReset();
@@ -337,6 +359,16 @@ describe("startMcpServer — platform tools", () => {
 		expect(invokePlatformToolMock).toHaveBeenCalledWith(platA, { title: "x" });
 		expect(result.isError).toBeUndefined();
 		expect(JSON.parse(result.content[0].text)).toEqual({ ok: true });
+	});
+
+	it("enabled: a platform tool call with no arguments defaults to {}", async () => {
+		invokePlatformToolMock.mockResolvedValue({ ok: true });
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([platA]),
+		});
+		await capturedHandlers[1]({ params: { name: "create_ticket" } });
+		expect(invokePlatformToolMock).toHaveBeenCalledWith(platA, {});
 	});
 
 	it("enabled: flags a platform tool's {type:'error'} result as isError", async () => {
@@ -428,5 +460,85 @@ describe("startMcpServer — platform tools", () => {
 		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: unknown[] };
 		expect(fetchManifestMock).toHaveBeenCalled();
 		expect(list.tools).toHaveLength(10);
+	});
+
+	// --- /jolli menu prompt (JOLLI-1925) ---
+
+	const platMenu: PlatformToolManifestEntry = {
+		name: "create_ticket",
+		description: "Create a ticket",
+		inputSchema: { type: "object", properties: {} },
+		menu: { label: "Create ticket", description: "Open a new ticket" },
+	};
+
+	it("enabled + a menu-flagged tool: advertises the prompts capability and lists exactly [jolli]", async () => {
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([platMenu, platB]),
+		});
+		expect(serverCapabilities).toEqual({ tools: {}, prompts: {} });
+		const listPrompts = handlerForKind("listPrompts");
+		expect(listPrompts).toBeDefined();
+		const result = (await listPrompts?.({ params: { name: "" } })) as {
+			prompts: { name: string; arguments: { name: string; required?: boolean }[] }[];
+		};
+		expect(result.prompts).toHaveLength(1);
+		expect(result.prompts[0].name).toBe("jolli");
+		expect(result.prompts[0].arguments).toEqual([expect.objectContaining({ name: "request", required: false })]);
+	});
+
+	it("GetPrompt with no request: returns a picker steering message listing the menu", async () => {
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([platMenu]),
+		});
+		const getPrompt = handlerForKind("getPrompt");
+		const result = (await getPrompt?.({ params: { name: "jolli" } })) as {
+			messages: { role: string; content: { type: string; text: string } }[];
+		};
+		const text = result.messages[0].content.text;
+		expect(result.messages[0].role).toBe("user");
+		expect(text).toContain("without a specific request");
+		expect(text).toContain("Create ticket — Open a new ticket (call tool `create_ticket`)");
+	});
+
+	it("GetPrompt with a request: returns a direct-invoke steering message", async () => {
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([platMenu]),
+		});
+		const getPrompt = handlerForKind("getPrompt");
+		const result = (await getPrompt?.({
+			params: { name: "jolli", arguments: { request: "make a ticket" } },
+		})) as { messages: { content: { text: string } }[] };
+		expect(result.messages[0].content.text).toContain('with this request: "make a ticket"');
+		expect(result.messages[0].content.text).toContain("invoke its MCP tool directly");
+	});
+
+	it("GetPrompt rejects an unknown prompt name", async () => {
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([platMenu]),
+		});
+		const getPrompt = handlerForKind("getPrompt");
+		await expect(getPrompt?.({ params: { name: "nope" } })).rejects.toThrow(/unknown prompt/i);
+	});
+
+	it("enabled but no menu-flagged tools: no prompts capability and no prompt handlers", async () => {
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([platA, platB]),
+		});
+		expect(serverCapabilities).toEqual({ tools: {} });
+		expect(handlerForKind("listPrompts")).toBeUndefined();
+		expect(handlerForKind("getPrompt")).toBeUndefined();
+		expect(capturedHandlers).toHaveLength(2);
+	});
+
+	it("gate off: no prompts capability even if a manifest tool would be menu-flagged", async () => {
+		const createPlatformClient = vi.fn();
+		await startMcpServer("/repo", { loadConfig: async () => ({}), createPlatformClient });
+		expect(serverCapabilities).toEqual({ tools: {} });
+		expect(handlerForKind("getPrompt")).toBeUndefined();
 	});
 });

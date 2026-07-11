@@ -6,7 +6,13 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+	CallToolRequestSchema,
+	GetPromptRequestSchema,
+	ListPromptsRequestSchema,
+	ListToolsRequestSchema,
+	type Prompt,
+} from "@modelcontextprotocol/sdk/types.js";
 import { VERSION } from "../commands/CliUtils.js";
 import { JolliMemoryPushClient, type PlatformToolManifestEntry } from "../core/JolliMemoryPushClient.js";
 import { loadConfig } from "../core/SessionTracker.js";
@@ -14,6 +20,13 @@ import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { createLogger } from "../Logger.js";
 import type { JolliMemoryConfig } from "../Types.js";
+import {
+	buildJolliMenu,
+	buildJolliPromptText,
+	JOLLI_PROMPT_ARGUMENT,
+	JOLLI_PROMPT_NAME,
+	type JolliMenuItem,
+} from "./JolliMenu.js";
 import {
 	runBindSpace,
 	runDecisionTimeline,
@@ -209,6 +222,9 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 	const config = await (deps.loadConfig ?? loadConfig)();
 	let platformClient: PlatformToolClient | undefined;
 	let platformTools: PlatformToolManifestEntry[] = [];
+	// The curated `/jolli` menu is computed only inside the platform-tools gate, so
+	// with the gate closed it stays empty and no prompt is ever registered.
+	let menu: JolliMenuItem[] = [];
 	if (isPlatformToolsEnabled(config)) {
 		platformClient = (deps.createPlatformClient ?? (() => new JolliMemoryPushClient()))();
 		const builtInNames = new Set(TOOL_DEFINITIONS.map((t) => t.name));
@@ -231,6 +247,9 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 			seenNames.add(tool.name);
 			return true;
 		});
+		// Menu = menu-flagged platform tools ∪ the local-tools inclusion list
+		// (empty for now). Every item is one of the tools advertised below.
+		menu = buildJolliMenu(platformTools, TOOL_DEFINITIONS);
 	}
 	const platformByName = new Map(platformTools.map((t) => [t.name, t] as const));
 	// Advertise the built-ins plus any platform tools. Build the list locally and
@@ -239,7 +258,14 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 	const toolDefinitions: ToolDefinition[] =
 		platformTools.length > 0 ? [...TOOL_DEFINITIONS, ...platformTools] : TOOL_DEFINITIONS;
 
-	const server = new Server({ name: "jollimemory", version: VERSION }, { capabilities: { tools: {} } });
+	// Advertise the `prompts` capability only when the menu is non-empty. With an
+	// empty menu (gate off, empty manifest, or no menu-flagged tools) the server is
+	// byte-identical to a tools-only server: no capability, no handlers, no prompt.
+	const promptsEnabled = menu.length > 0;
+	const server = new Server(
+		{ name: "jollimemory", version: VERSION },
+		{ capabilities: promptsEnabled ? { tools: {}, prompts: {} } : { tools: {} } },
+	);
 
 	server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: toolDefinitions }));
 
@@ -268,6 +294,38 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 			return { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true };
 		}
 	});
+
+	if (promptsEnabled) {
+		// One prompt, `jolli`, that steers the agent to the curated menu. `ListPrompts`
+		// returns exactly this prompt; `GetPrompt` returns a steering message built
+		// from the menu. The menu items are already-registered tools, so the prompt is
+		// not a second execution path — it only tells the agent which tool to call.
+		const jolliPrompt: Prompt = {
+			name: JOLLI_PROMPT_NAME,
+			description: "Browse and run Jolli actions from a curated menu.",
+			arguments: [
+				{
+					name: JOLLI_PROMPT_ARGUMENT,
+					description:
+						"Optional free-text request; matched against a menu item so the agent can invoke it directly.",
+					required: false,
+				},
+			],
+		};
+		server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [jolliPrompt] }));
+		server.setRequestHandler(GetPromptRequestSchema, async (req) => {
+			const { name, arguments: promptArgs } = req.params;
+			if (name !== JOLLI_PROMPT_NAME) {
+				throw new Error(`Unknown prompt: ${name}`);
+			}
+			const rawRequest = promptArgs?.[JOLLI_PROMPT_ARGUMENT];
+			const request = typeof rawRequest === "string" ? rawRequest : undefined;
+			return {
+				description: "Curated Jolli action menu.",
+				messages: [{ role: "user", content: { type: "text", text: buildJolliPromptText(menu, request) } }],
+			};
+		});
+	}
 
 	const transport = new StdioServerTransport();
 	await server.connect(transport);
