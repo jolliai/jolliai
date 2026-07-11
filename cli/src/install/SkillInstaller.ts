@@ -102,11 +102,12 @@ const SKILLS: ReadonlyArray<SkillRegistration> = [
 	{ name: "jolli-recall", build: buildRecallSkillTemplate },
 	{ name: "jolli-search", build: buildSearchSkillTemplate },
 	{ name: "jolli-pr", build: buildPrSkillTemplate },
+	{ name: "jolli", build: buildJolliMenuSkillTemplate },
 ];
 
 /**
  * Skill paths recorded in `.git/info/exclude` so they don't pollute
- * `git status` in user repositories. Always 6 entries: 3 skills × 2 targets.
+ * `git status` in user repositories. Always 8 entries: 4 skills × 2 targets.
  * Path format follows git's gitignore syntax — leading `/` anchors to the
  * repo root, trailing `/` matches the directory and its contents.
  */
@@ -930,5 +931,90 @@ hit you have:
 
 **Empty hits** → tell the user nothing matched; suggest broader keywords or a
 different phrasing. Do NOT mention BM25 or index internals.
+`;
+}
+
+/**
+ * The `jolli` umbrella-menu skill — surfaces as a bare `/jolli` and acts as the
+ * single friendly front door over the sibling Jolli skills plus whatever
+ * `mcp__jollimemory__*` tools are registered in the session. It only steers the
+ * agent to invoke an already-existing skill or tool; it is never a second
+ * execution path for any action, and it does NOT re-derive the backend's curated
+ * `menu` metadata (a static SKILL.md cannot fetch the manifest — curation of which
+ * platform tools belong in the menu stays authoritative in the server-side MCP
+ * `jolli` prompt). Byte-identical across every {@link SKILL_TARGETS} entry, with
+ * spec-compliant frontmatter only.
+ *
+ * The menu-interaction contract mirrors the MCP `jolli` prompt (see
+ * `cli/src/mcp/JolliMenu.ts`): argument provided → match to one action and invoke
+ * it directly, asking only when ambiguous or unmatched; argument absent → present
+ * the menu via an interactive single-select tool where the host provides one (e.g.
+ * Claude Code's AskUserQuestion), otherwise a plain-text list, then invoke the
+ * chosen action. Host-agnostic by design — the AskUserQuestion mention is only an
+ * example and the text-list fallback keeps `/jolli` usable on every host.
+ */
+export function buildJolliMenuSkillTemplate(): string {
+	return `---
+name: jolli
+description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, pr) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
+metadata:
+  version: "${SKILL_VERSION}"
+  vendor: "jolli.ai"
+---
+
+# Jolli
+
+The single umbrella action menu for Jolli. It ties together the standalone Jolli
+skills and whatever Jolli MCP tools are registered in this session, and routes the
+user's choice to the right one. It is a friendly front door — it **never**
+re-implements any action, it only invokes an existing skill or an existing MCP
+tool. The standalone \`/jolli-recall\`, \`/jolli-search\`, \`/jolli-pr\` commands and
+the \`/mcp__jollimemory__jolli\` prompt all keep working unchanged; this is layered
+on top of them, not a replacement.
+
+## Step 1 — build the unified menu
+
+Assemble ONE combined list of actions from two sources.
+
+### Local Jolli skills (always present)
+
+- **jolli-recall** — Recall prior development context for the current branch.
+  Route by invoking the \`jolli-recall\` skill.
+- **jolli-search** — Search structured commit memories across branches
+  (decisions, topics, files). Route by invoking the \`jolli-search\` skill.
+- **jolli-pr** — Create or update a pull request using a Jolli Memory-generated
+  description. Route by invoking the \`jolli-pr\` skill.
+
+Route a local choice by invoking that skill through your host's skill-invocation
+mechanism (for example, the Skill tool in Claude Code).
+
+### Jolli MCP tools (whatever is registered this session)
+
+Surface every tool whose name starts with \`mcp__jollimemory__\` that is available
+in the current session — for example \`recall\`, \`search\`, \`get_pr_description\`,
+\`queue_status\`, and any manifest-driven platform tools (workflow, space, article,
+and the like). Route a choice by calling the matching \`mcp__jollimemory__*\` tool.
+
+Do NOT assume a fixed list — enumerate the Jolli MCP tools that are actually
+registered right now. Do NOT try to fetch or re-derive any backend "menu"
+curation; a skill cannot read the manifest, so simply surface the Jolli MCP tools
+present in the session. If no Jolli MCP tools are registered, present just the
+local skills above.
+
+## Step 2 — route the request
+
+This skill takes one optional free-text argument.
+
+- **Argument provided** → match it to exactly one menu action and invoke that
+  action directly (invoke the skill, or call the MCP tool). Only ask the user to
+  choose if the request is ambiguous or matches no menu action.
+- **Argument absent** → present the unified menu and let the user pick one, using
+  an interactive single-select tool if your host provides one (for example
+  AskUserQuestion in Claude Code); otherwise list the options as plain text and
+  ask the user to choose. After the user selects, invoke the corresponding skill
+  or MCP tool.
+
+Host-agnostic by design: the AskUserQuestion mention is only an example; the
+text-list fallback keeps \`/jolli\` usable on every host that loads skills.
 `;
 }
