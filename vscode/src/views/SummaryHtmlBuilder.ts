@@ -10,6 +10,7 @@
  */
 
 import { labelLeadsWithNativeId, referenceDisplayTitle } from "../../../cli/src/core/references/ReferenceDisplay.js";
+import { getRegistry } from "../../../cli/src/core/references/SourceDefinitionRegistry.js";
 import { isSummaryError } from "../../../cli/src/core/SummaryErrorMarker.js";
 import {
 	aggregateConversationTokenBreakdown,
@@ -1206,12 +1207,22 @@ export function buildFilesPanelShell(): string {
 </div>`;
 }
 
-const HTML_REFERENCE_SOURCE_ORDER: ReadonlyArray<SourceId> = ["linear", "jira", "github", "notion", "slack"];
-
 /**
- * Returns references ordered by source (linear → jira → github → notion),
- * preserving within-source order. Mirrors `referencesBySourceOrder` in
- * SummaryMarkdownBuilder so the HTML and Markdown views agree on item order.
+ * Orders references by source for the webview, using the built-in
+ * `SourceDefinition` registry as the render allowlist: only sources that ship
+ * as a built-in definition are rendered, in registry order (linear → jira →
+ * github → notion → slack → zoom-meeting → zoom-doc → asana → …), preserving
+ * within-source order.
+ *
+ * Deriving the allowlist from `getRegistry()` — rather than a hand-maintained
+ * subset — keeps every registered source visible (a new source appears here the
+ * moment it joins `BUILTIN_DEFINITIONS`, no second edit) while preserving the
+ * security property the previous hardcoded list provided: a `source` that is
+ * NOT a registered built-in (e.g. a crafted string from a tampered orphan
+ * branch / shared Memory Bank) is dropped, never rendered into the webview DOM.
+ * Unlike `SummaryMarkdownBuilder.referencesBySourceOrder` (LLM-prompt path,
+ * which appends unknown sources), this webview path deliberately does not append
+ * leftovers.
  */
 function referencesBySourceOrder(
 	references: ReadonlyArray<ReferenceCommitRef>,
@@ -1223,8 +1234,8 @@ function referencesBySourceOrder(
 		bySource.set(e.source, arr);
 	}
 	const out: Array<ReferenceCommitRef> = [];
-	for (const source of HTML_REFERENCE_SOURCE_ORDER) {
-		const arr = bySource.get(source);
+	for (const def of getRegistry().all()) {
+		const arr = bySource.get(def.id);
 		if (arr) out.push(...arr);
 	}
 	return out;

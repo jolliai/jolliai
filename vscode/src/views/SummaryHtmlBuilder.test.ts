@@ -639,11 +639,12 @@ describe("SummaryHtmlBuilder", () => {
 
 		// `SourceId` is now `string`, so `getSourceMeta` will hand back the raw id
 		// as the label for an unknown source. That raw id never reaches the DOM
-		// here because `referencesBySourceOrder` renders only the four known
-		// sources — the source-allowlist, not escaping, is what keeps a crafted
-		// source string (from a tampered orphan branch / shared Memory Bank) out
-		// of the webview. Pin that invariant so a future refactor that drops the
-		// allowlist can't silently turn the bare source label into an injection.
+		// here because `referencesBySourceOrder` renders only sources in the
+		// built-in `SourceDefinition` registry — the source-allowlist, not
+		// escaping, is what keeps a crafted source string (from a tampered orphan
+		// branch / shared Memory Bank) out of the webview. Pin that invariant so a
+		// future refactor that drops the allowlist can't silently turn the bare
+		// source label into an injection.
 		it("drops an unknown reference source from the HTML view (source allowlist)", () => {
 			const html = buildHtml(
 				makeSummary({
@@ -654,6 +655,29 @@ describe("SummaryHtmlBuilder", () => {
 			// the row would render; the source label is escaped, but "onerror"
 			// itself has no escapable chars, so it would still surface as text.)
 			expect(html).not.toContain("onerror");
+		});
+
+		// Counterpart to the allowlist test above: a source that IS a registered
+		// built-in but was NOT in the original hardcoded five (asana, zoom-*) must
+		// render. Pins that the allowlist is derived from the registry, so a new
+		// source appears here the moment it joins BUILTIN_DEFINITIONS.
+		it("renders a reference whose source is a registered built-in beyond the original hardcoded set (asana)", () => {
+			const html = buildHtml(
+				makeSummary({
+					references: [
+						{
+							source: "asana",
+							title: "Add Asana MCP integration",
+							url: "https://app.asana.com/1/1216474500374769/task/1216474542361983",
+							referencedAt: "2026-07-12T10:00:00Z",
+							sourceToolName: "mcp__claude_ai_Asana__get_task",
+							archivedKey: "asana:1216474542361983",
+							nativeId: "1216474542361983",
+						},
+					],
+				}),
+			);
+			expect(html).toContain("Add Asana MCP integration");
 		});
 
 		it('shows "No topics available" message when topics are empty', () => {
