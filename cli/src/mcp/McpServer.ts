@@ -254,9 +254,18 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 	const platformByName = new Map(platformTools.map((t) => [t.name, t] as const));
 	// Advertise the built-ins plus any platform tools. Build the list locally and
 	// leave the static built-in registry untouched; with no platform tools the
-	// static array is returned directly.
+	// static array is returned directly. Project each platform tool down to the
+	// public tool schema (name / description / inputSchema): a manifest entry also
+	// carries `binding` (backend routing) and `menu` (curation) metadata that are
+	// internal-only and must never reach a client's `tools/list`. Dispatch still
+	// uses the full entries via `platformByName`, so routing is unaffected.
+	const advertisedPlatformTools: ToolDefinition[] = platformTools.map(({ name, description, inputSchema }) => ({
+		name,
+		description,
+		inputSchema,
+	}));
 	const toolDefinitions: ToolDefinition[] =
-		platformTools.length > 0 ? [...TOOL_DEFINITIONS, ...platformTools] : TOOL_DEFINITIONS;
+		advertisedPlatformTools.length > 0 ? [...TOOL_DEFINITIONS, ...advertisedPlatformTools] : TOOL_DEFINITIONS;
 
 	// Advertise the `prompts` capability only when the menu is non-empty. With an
 	// empty menu (gate off, empty manifest, or no menu-flagged tools) the server is

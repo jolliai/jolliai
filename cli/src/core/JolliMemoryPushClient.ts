@@ -614,18 +614,22 @@ function extractManifestTools(json: unknown): unknown[] {
  * and an `inputSchema` object whose `type` is `"object"`. `properties` is
  * OPTIONAL (a zero-arg tool omits it) and is defaulted to `{}` so the advertised
  * schema always carries one; when present it must be a plain (non-array) object.
- * `required`, when present, must be an array of strings. An optional `binding`
- * must be a `{ method, path }` string pair. Any other shape is rejected (returns
+ * `required`, when present, must be an array of strings. A malformed *advertised
+ * schema* field — a missing/blank name, a non-string description, or an
+ * `inputSchema` that is not an object schema — rejects the whole entry (returns
  * `null`) so a single malformed tool can neither survive into the advertised
  * registry — where it could make the whole `tools/list` response fail a client's
  * schema validation — nor drop a valid neighbor. Other JSON-Schema keywords on
  * `inputSchema` are preserved.
  *
- * An optional `menu` block is validated at FIELD granularity (see
- * `toPlatformMenuEntry`): unlike `binding`, a malformed `menu` never drops the
- * whole entry — the tool stays callable, it just doesn't appear in the `/jolli`
- * menu. This lets a partially-rolled-out backend add menu metadata without any
- * risk of dropping a working tool.
+ * The optional `binding` and `menu` blocks are internal routing / curation
+ * metadata, never part of the advertised tool schema, so — unlike the schema
+ * fields above — a malformed one degrades at FIELD granularity and never drops
+ * the tool (see `toPlatformBinding` / `toPlatformMenuEntry`): a bad `binding` is
+ * discarded and the generic executor falls back to the conventional
+ * `POST /api/mcp/tools/<name>` endpoint; a bad `menu` just leaves the tool absent
+ * from the `/jolli` menu. This lets a partially-rolled-out backend ship either
+ * without any risk of dropping a working tool.
  */
 function toPlatformToolEntry(value: unknown): PlatformToolManifestEntry | null {
 	if (typeof value !== "object" || value === null) {
@@ -662,22 +666,12 @@ function toPlatformToolEntry(value: unknown): PlatformToolManifestEntry | null {
 	) {
 		return null;
 	}
-	let normalizedBinding: PlatformToolBinding | undefined;
-	if (binding !== undefined) {
-		if (typeof binding !== "object" || binding === null) {
-			return null;
-		}
-		const { method, path } = binding as { method?: unknown; path?: unknown };
-		if (typeof method !== "string" || typeof path !== "string") {
-			return null;
-		}
-		normalizedBinding = { method, path };
-	}
 	// A zero-arg tool omits `properties`; default it to `{}` without dropping any
 	// other schema keywords the backend supplied.
 	const inputSchemaOut = (
 		schema.properties === undefined ? { ...schema, properties: {} } : schema
 	) as PlatformToolManifestEntry["inputSchema"];
+	const normalizedBinding = toPlatformBinding(binding);
 	const normalizedMenu = toPlatformMenuEntry(menu);
 	return {
 		name,
@@ -686,6 +680,27 @@ function toPlatformToolEntry(value: unknown): PlatformToolManifestEntry | null {
 		...(normalizedBinding ? { binding: normalizedBinding } : {}),
 		...(normalizedMenu ? { menu: normalizedMenu } : {}),
 	};
+}
+
+/**
+ * Normalizes an optional `binding` block. Like `menu`, a malformed binding never
+ * drops the parent tool: `binding` is internal routing metadata, never part of the
+ * advertised tool schema, so a bad one can't poison `tools/list`. A missing,
+ * non-object, or array `binding`, or one whose `method`/`path` are not both
+ * strings, yields `undefined` — the tool stays callable and the generic executor
+ * falls back to the conventional `POST /api/mcp/tools/<name>` endpoint (which is
+ * also where a structurally-valid but off-origin/unknown-method binding lands at
+ * call time), so a working tool is never lost to a broken binding.
+ */
+function toPlatformBinding(value: unknown): PlatformToolBinding | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		return undefined;
+	}
+	const { method, path } = value as { method?: unknown; path?: unknown };
+	if (typeof method !== "string" || typeof path !== "string") {
+		return undefined;
+	}
+	return { method, path };
 }
 
 /**
