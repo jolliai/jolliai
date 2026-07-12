@@ -347,6 +347,35 @@ describe("startMcpServer — platform tools", () => {
 		);
 	});
 
+	it("enabled: advertises only the public schema — never the internal binding/menu metadata", async () => {
+		const withMeta: PlatformToolManifestEntry = {
+			name: "create_ticket",
+			description: "Create a ticket",
+			inputSchema: { type: "object", properties: {} },
+			binding: { method: "POST", path: "/api/mcp/tools/create_ticket" },
+			menu: { label: "Create ticket", description: "Open a new ticket", order: 1 },
+		};
+		invokePlatformToolMock.mockResolvedValue({ ok: true });
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: () => stubClient([withMeta]),
+		});
+		const list = (await capturedHandlers[0]({ params: { name: "" } })) as {
+			tools: Record<string, unknown>[];
+		};
+		const advertised = list.tools.find((t) => t.name === "create_ticket");
+		expect(advertised).toEqual({
+			name: "create_ticket",
+			description: "Create a ticket",
+			inputSchema: { type: "object", properties: {} },
+		});
+		expect(advertised).not.toHaveProperty("binding");
+		expect(advertised).not.toHaveProperty("menu");
+		// Dispatch still uses the FULL entry (with binding) — routing is unaffected.
+		await capturedHandlers[1]({ params: { name: "create_ticket", arguments: { title: "x" } } });
+		expect(invokePlatformToolMock).toHaveBeenCalledWith(withMeta, { title: "x" });
+	});
+
 	it("enabled: routes a platform tool call through the generic executor and wraps the result", async () => {
 		invokePlatformToolMock.mockResolvedValue({ ok: true });
 		await startMcpServer("/repo", {

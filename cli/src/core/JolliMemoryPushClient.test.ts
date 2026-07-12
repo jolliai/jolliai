@@ -586,12 +586,6 @@ describe("fetchManifest", () => {
 						description: "required has non-string members",
 						inputSchema: { type: "object", properties: {}, required: [123] },
 					},
-					{
-						name: "bad_binding",
-						description: "binding missing path",
-						inputSchema: { type: "object", properties: {} },
-						binding: { method: "POST" },
-					},
 					"not-an-object",
 					TOOL_B,
 				],
@@ -652,6 +646,57 @@ describe("fetchManifest", () => {
 		expect(tool.binding).toEqual({ method: "POST", path: "/api/mcp/tools/list_workflow_definitions" });
 	});
 
+	it("drops a malformed binding WITHOUT dropping the tool (like menu)", async () => {
+		// `binding` is internal routing metadata, never advertised, so a bad one can
+		// never poison tools/list — drop only the binding and keep the tool callable
+		// (the generic executor then falls back to POST /api/mcp/tools/<name>).
+		const c = client(async () =>
+			jsonResponse(200, {
+				tools: [
+					{
+						name: "not_object",
+						description: "d",
+						inputSchema: { type: "object", properties: {} },
+						binding: "nope",
+					},
+					{
+						name: "arr_binding",
+						description: "d",
+						inputSchema: { type: "object", properties: {} },
+						binding: [],
+					},
+					{
+						name: "no_path",
+						description: "d",
+						inputSchema: { type: "object", properties: {} },
+						binding: { method: "POST" },
+					},
+					{
+						name: "no_method",
+						description: "d",
+						inputSchema: { type: "object", properties: {} },
+						binding: { path: "/api/mcp/tools/x" },
+					},
+					{
+						name: "non_string_method",
+						description: "d",
+						inputSchema: { type: "object", properties: {} },
+						binding: { method: 1, path: "/api/mcp/tools/x" },
+					},
+				],
+			}),
+		);
+		const tools = await c.fetchManifest();
+		expect(tools.map((t) => t.name)).toEqual([
+			"not_object",
+			"arr_binding",
+			"no_path",
+			"no_method",
+			"non_string_method",
+		]);
+		expect(tools.every((t) => t.binding === undefined)).toBe(true);
+	});
+
 	it("preserves a valid menu block on a fetched entry", async () => {
 		const withMenu = {
 			name: "create_ticket",
@@ -681,7 +726,7 @@ describe("fetchManifest", () => {
 		expect(tool.menu).toEqual({ label: "Just a label" });
 	});
 
-	it("drops a malformed menu block WITHOUT dropping the tool (unlike binding)", async () => {
+	it("drops a malformed menu block WITHOUT dropping the tool (like binding)", async () => {
 		// Each of these entries has a bad menu but must remain a usable tool with no
 		// menu — a partially-rolled-out backend must never lose a working tool.
 		const c = client(async () =>
