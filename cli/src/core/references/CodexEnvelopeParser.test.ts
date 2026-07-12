@@ -159,6 +159,41 @@ const ZOOM_MEETING = {
 	},
 	my_notes: { has_my_notes: false },
 };
+// Real Codex built-in "Atlassian Rovo" app shapes, captured from a live rollout
+// (2026-07-12). Rovo has NO `_getjiraissue`: Confluence uses a dedicated
+// `_getconfluencepage` whose output is the SAME `{content:{nodes}}` shape as
+// Claude's getConfluencePage, while Jira comes through the generic `_fetch`
+// returning the `{id,title,text,url,type,metadata}` entity envelope (NOT the
+// `{key,fields,webUrl}` shape the older fabricated fixtures assumed).
+const ROVO_CONFLUENCE = {
+	content: {
+		totalCount: 1,
+		nodes: [
+			{
+				id: "131076",
+				type: "page",
+				title: "数据库访问架构变更设计：Per-Provider 连接池",
+				space: { key: "KAN", name: "My Kanban Space" },
+				author: { displayName: "Flyer Li" },
+				body: "## TL;DR\n\n1. 现状：per-(tenant, org) 连接池。",
+				webUrl: "https://lichengbin2008.atlassian.net/wiki/spaces/KAN/pages/131076/Per-Provider",
+			},
+		],
+	},
+};
+const ROVO_JIRA_FETCH = {
+	id: "ari:cloud:jira:e8d56e41-d65c-44d9-822d-96fb42c56007:issue/KAN-1",
+	title: "Trace Log",
+	text: "1. Background\n\nThe backend uses pino for logging.",
+	url: "https://api.atlassian.com/ex/jira/e8d56e41-d65c-44d9-822d-96fb42c56007/rest/api/3/issue/10000",
+	type: "jira-issue",
+	metadata: {
+		cloudId: "e8d56e41-d65c-44d9-822d-96fb42c56007",
+		status: "To Do",
+		priority: "Medium",
+		issueType: "Task",
+	},
+};
 
 describe("CodexEnvelopeParser.parse", () => {
 	it("emits one NormalizedToolResult per source via the PRIMARY function_call pair, with canonical toolName + matched adapter", () => {
@@ -177,6 +212,29 @@ describe("CodexEnvelopeParser.parse", () => {
 		expect(results.map((r) => r.def.id).sort()).toEqual(["github", "jira", "linear", "notion"]);
 		const jira = results.find((r) => r.def.id === "jira");
 		expect(jira?.toolName).toContain("mcp__claude_ai_Atlassian__");
+	});
+
+	it("extracts a Confluence reference from the real Rovo _getconfluencepage function_call", () => {
+		const lines = [
+			fnCall("mcp__codex_apps__atlassian_rovo", "_getconfluencepage", "c_conf"),
+			fnOutput("c_conf", ROVO_CONFLUENCE, { wrap: "bare", prefix: true }),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.map((r) => r.def.id)).toEqual(["confluence"]);
+		expect((results[0].payload as { pageId?: string }).pageId).toBe("131076");
+		expect(results[0].toolName).toBe("mcp__claude_ai_Atlassian__getConfluencePage");
+	});
+
+	it("extracts a Jira reference from the real Rovo generic _fetch entity envelope", () => {
+		const lines = [
+			fnCall("mcp__codex_apps__atlassian_rovo", "_fetch", "c_jf"),
+			fnOutput("c_jf", ROVO_JIRA_FETCH, { wrap: "bare", prefix: true }),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.map((r) => r.def.id)).toEqual(["jira"]);
+		const payload = results[0].payload as { key?: string; fields?: { summary?: string } };
+		expect(payload.key).toBe("KAN-1");
+		expect(payload.fields?.summary).toBe("Trace Log");
 	});
 
 	it("unwraps the object-envelope function_call_output ({content:[{text}]}) — newer Linear _get_issue connector", () => {

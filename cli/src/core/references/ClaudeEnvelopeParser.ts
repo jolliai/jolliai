@@ -32,6 +32,7 @@ import { isObject } from "./guards.js";
 import { scanUserPermalinks } from "./SlackPermalink.js";
 import type { SourceDefinition } from "./SourceDefinition.js";
 import { getRegistry } from "./SourceDefinitionRegistry.js";
+import { normalizeConfluence } from "./sources/ConfluenceNormalize.js";
 import { normalizeSlackThread } from "./sources/SlackNormalize.js";
 import { normalizeZoomDoc } from "./sources/ZoomDocNormalize.js";
 import type {
@@ -258,10 +259,13 @@ interface ContextNormalizeEnv {
 
 /**
  * Closed registry of context-aware normalizers, keyed by source id. A source
- * belongs here IFF its canonical shape needs out-of-payload context — the
- * originating tool_use `input`, and/or parse-scoped state (permalink map,
- * workspace url) — that the default `identity` path cannot supply. Every other
- * MCP source's `normalize` is `identity` and never appears here.
+ * belongs here IFF the default `identity` path cannot produce its canonical
+ * shape — either because that shape needs out-of-payload context (the
+ * originating tool_use `input`, and/or parse-scoped state like the permalink
+ * map / workspace url), OR because it requires a payload-internal shape
+ * coercion the DSL cannot express (e.g. Confluence's ADF-object → string body
+ * flattening). Every other MCP source's `normalize` is `identity` and never
+ * appears here.
  *
  * Returning null voids the reference. Adding a fourth such source is one entry
  * here, not a new `def.id === …` branch in `collectToolResults`.
@@ -290,6 +294,7 @@ const CONTEXT_NORMALIZERS: Record<
 		/* v8 ignore stop */
 		return normalizeZoomDoc(payload, { fileId: zoomInput.fileId });
 	},
+	confluence: (payload) => normalizeConfluence(payload),
 };
 
 /**
@@ -364,11 +369,14 @@ function collectToolResults(
 			parsedPayload = recovered.payload;
 		}
 
-		// A source whose canonical shape needs out-of-payload context (the
-		// tool_use input, and/or parse-scoped state like the permalink map /
-		// workspace url) runs its registered context-normalizer here instead of
-		// the identity path — a single data-driven branch rather than one
-		// `def.id === …` block per such source. Membership goes through
+		// A source whose canonical shape the identity path cannot produce runs
+		// its registered context-normalizer here — either because that shape
+		// needs out-of-payload context (the tool_use input, and/or parse-scoped
+		// state like the permalink map / workspace url), or because it needs a
+		// payload-internal shape coercion the DSL cannot express (e.g.
+		// Confluence's ADF-object → string body flattening). A single
+		// data-driven branch rather than one `def.id === …` block per such
+		// source. Membership goes through
 		// CONTEXT_NORMALIZER_IDS (own keys only) so a prototype-chain id can
 		// never resolve a function, and every other source's `normalize` stays a
 		// pure `(payload, command) => payload` hook.

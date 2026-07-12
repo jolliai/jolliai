@@ -39,6 +39,7 @@ export interface SourceMeta {
  */
 export const SOURCE_META: Record<KnownSourceId, SourceMeta> = {
 	linear: { label: "Linear", letter: "L", icon: "issues", color: "#5e6ad2" },
+	confluence: { label: "Confluence", letter: "C", icon: "book", color: "#1868DB" },
 	jira: { label: "Jira", letter: "J", icon: "issues", color: "#0052cc" },
 	github: { label: "GitHub", letter: "G", icon: "issues", color: "#6e7681" },
 	notion: { label: "Notion", letter: "N", icon: "file-text", color: "#787774" },
