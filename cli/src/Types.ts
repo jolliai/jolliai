@@ -772,7 +772,15 @@ export interface NoteReference {
 export type SourceId = string;
 
 /** The source ids that ship as built-in `SourceDefinition`s. Docs/reference only — not an exhaustive runtime set. */
-export type KnownSourceId = "linear" | "jira" | "github" | "notion" | "slack" | "zoom-meeting" | "zoom-doc";
+export type KnownSourceId =
+	| "linear"
+	| "confluence"
+	| "jira"
+	| "github"
+	| "notion"
+	| "slack"
+	| "zoom-meeting"
+	| "zoom-doc";
 
 /**
  * ReferenceField — one displayable field produced by a `SourceDefinition`'s `fields` pipes.

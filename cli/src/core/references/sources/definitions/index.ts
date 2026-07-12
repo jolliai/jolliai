@@ -5,8 +5,15 @@
  * github, notion) — preserved for continuity with `SourceDefinitionRegistry`
  * consumers that pin this order (e.g. `CLAUDE_TOOL_PREFIXES`). `slack`,
  * `zoom-meeting` and `zoom-doc` are appended after the migrated four.
+ *
+ * `confluence` is inserted BEFORE `jira` deliberately: both share the
+ * `mcp__claude_ai_Atlassian__` tool prefix, jira's `match.claude` is a
+ * prefix-only catch-all, and the registry returns the first array match — so
+ * confluence's narrower `acceptSuffix` must be checked first or every
+ * Confluence tool call would silently resolve to jira.
  */
 
+import { confluenceDefinition } from "./confluence.js";
 import { githubDefinition } from "./github.js";
 import { jiraDefinition } from "./jira.js";
 import { linearDefinition } from "./linear.js";
@@ -17,6 +24,7 @@ import { zoomMeetingDefinition } from "./zoom-meeting.js";
 
 export const BUILTIN_DEFINITIONS = [
 	linearDefinition,
+	confluenceDefinition,
 	jiraDefinition,
 	githubDefinition,
 	notionDefinition,

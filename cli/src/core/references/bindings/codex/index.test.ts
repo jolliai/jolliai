@@ -11,6 +11,9 @@ describe("Codex producer normalizer registry", () => {
 			expect(getCodexNormalizer("zoom-meeting")?.canonicalToolName).toBe(
 				"mcp__claude_ai_Zoom_for_Claude__get_meeting_assets",
 			);
+			expect(getCodexNormalizer("confluence")?.canonicalToolName).toBe(
+				"mcp__claude_ai_Atlassian__getConfluencePage",
+			);
 		});
 
 		it("returns undefined for an id with no registered normalizer", () => {
@@ -34,6 +37,15 @@ describe("Codex producer normalizer registry", () => {
 			expect(getCodexNormalizer("notion")?.normalize(payload)).toBe(payload);
 			expect(getCodexNormalizer("jira")?.normalize(payload)).toBe(payload);
 			expect(getCodexNormalizer("zoom-meeting")?.normalize(payload)).toBe(payload);
+		});
+
+		it("confluence normalizer reshapes the {content:{nodes}} page into the canonical shape", () => {
+			const out = getCodexNormalizer("confluence")?.normalize({
+				content: { nodes: [{ id: "131076", title: "P", webUrl: "https://x.atlassian.net/wiki/p/131076" }] },
+			}) as { pageId?: string; title?: string; url?: string };
+			expect(out.pageId).toBe("131076");
+			expect(out.title).toBe("P");
+			expect(out.url).toBe("https://x.atlassian.net/wiki/p/131076");
 		});
 	});
 });

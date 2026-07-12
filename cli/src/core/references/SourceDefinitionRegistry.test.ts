@@ -43,12 +43,18 @@ describe("SourceDefinitionRegistry", () => {
 		expect(r.match("codex", "linear.get_issue")?.id).toBe("linear"); // invocation-tool path (no namespace)
 	});
 
-	it("all() is stable order linear,jira,github,notion,slack,zoom-meeting,zoom-doc", () => {
+	it("all() is stable order linear,confluence,jira,github,notion,slack,zoom-meeting,zoom-doc", () => {
 		expect(
 			getRegistry()
 				.all()
 				.map((d) => d.id),
-		).toEqual(["linear", "jira", "github", "notion", "slack", "zoom-meeting", "zoom-doc"]);
+		).toEqual(["linear", "confluence", "jira", "github", "notion", "slack", "zoom-meeting", "zoom-doc"]);
+	});
+
+	it("routes getConfluencePage to confluence and getJiraIssue to jira", () => {
+		const r = getRegistry();
+		expect(r.match("claude", "mcp__claude_ai_Atlassian__getConfluencePage")?.id).toBe("confluence");
+		expect(r.match("claude", "mcp__claude_ai_Atlassian__getJiraIssue")?.id).toBe("jira");
 	});
 
 	it("byId() finds a known definition and returns undefined for unknown ids", () => {

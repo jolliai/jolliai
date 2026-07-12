@@ -1,18 +1,31 @@
 /**
- * CodexJiraBinding — Jira `codex_apps` connector normalizer (reached through
- * `_getjiraissue` / invocation `atlassian rovo_getjiraissue` — note the space;
- * match identity lives in the registry).
+ * CodexJiraBinding — Jira `codex_apps` connector normalizer (match identity lives
+ * in `jira`'s `SourceDefinition.match.codex`).
  *
- * Codex's `_getjiraissue` payload is `{ issues: { nodes: [ node ] } }`, and each
- * node — unlike Claude's Atlassian MCP — has **NO `fields` object**: `key` +
- * gateway `self` + tenant `webUrl` are top-level, and the field VALUES live under
- * `versionedRepresentations` (`{ "<version>": <value> }`), where `summary` is a
- * string and `description` is an ADF document. So:
- *   - `normalize` (main path) reshapes each node, deriving `fields.summary` and
- *     `fields.description` (ADF → markdown) so the jira `SourceDefinition` accepts it.
- *   - `recover` (NOT the main path) handles the malformed-output edge — see below.
+ * Two payload shapes are handled, both reshaped into the `{ key, fields, webUrl }`
+ * the jira `SourceDefinition` reads:
+ *
+ *   1. Generic `_fetch` entity envelope (VERIFIED from a live "Atlassian Rovo"
+ *      rollout, 2026-07-12): a FLAT object
+ *      `{ id: "ari:cloud:jira:…:issue/<KEY>", title, text, url, type:"jira-issue",
+ *      metadata:{ status, priority, … } }`. The issue key is the ARI's trailing
+ *      `issue/<KEY>` segment; `title`→`fields.summary`, `text`→`fields.description`,
+ *      `metadata.status`/`priority`→`fields.*`, `url`→`webUrl`. Note `url` is the
+ *      `api.atlassian.com/.../rest/api/3/issue/<id>` REST endpoint — NOT a
+ *      human-browsable `/browse/<KEY>` link. It is the only URL Rovo returns, and
+ *      the tenant site name needed to build a browse link is absent from the
+ *      envelope (only `cloudId` is present), so it is kept as-is rather than
+ *      voiding the otherwise-useful reference. `type:"jira-issue"` gates this branch.
+ *
+ *   2. `{ issues: { nodes: [ node ] } }` with per-node field VALUES under
+ *      `versionedRepresentations` (`{ "<version>": <value> }`; `summary` a string,
+ *      `description` an ADF document). UNVERIFIED legacy shape retained pending a
+ *      real transcript — `normalize` derives `fields.summary`/`description` (ADF →
+ *      markdown), and `recover` (NOT the main path) handles its malformed-output
+ *      edge (see below).
  */
 
+import { adfToText } from "../../sources/AdfToText.js";
 import { isObject } from "../shared.js";
 import type { CodexNormalizer } from "./CodexBinding.js";
 
@@ -41,44 +54,46 @@ function latestRepresentation(versioned: unknown, field: string): unknown {
 	return best;
 }
 
-/**
- * Minimal ADF (Atlassian Document Format) → markdown-ish plain text. Handles the
- * node types Jira descriptions actually use (heading/paragraph/list/blockquote/
- * codeBlock/text); unknown nodes just concatenate their children. Good enough for
- * a reference body; the adapter truncates it.
- */
-function adfToText(node: unknown): string {
-	if (!isObject(node)) return "";
-	if (node.type === "text") return typeof node.text === "string" ? node.text : "";
-	const children = Array.isArray(node.content) ? node.content : [];
-	const inline = children.map(adfToText).join("");
-	switch (node.type) {
-		case "heading": {
-			const level = isObject(node.attrs) && typeof node.attrs.level === "number" ? node.attrs.level : 1;
-			return `${"#".repeat(Math.min(Math.max(level, 1), 6))} ${inline}`;
-		}
-		case "paragraph":
-		case "codeBlock":
-			return inline;
-		case "blockquote":
-			return children.map((c) => `> ${adfToText(c)}`).join("\n");
-		case "bulletList":
-			return children.map((c) => `- ${adfToText(c)}`).join("\n");
-		case "orderedList":
-			return children.map((c, i) => `${i + 1}. ${adfToText(c)}`).join("\n");
-		case "doc":
-			return children.map(adfToText).join("\n\n");
-		default:
-			return inline;
-	}
-}
-
 /** Derive a plain-text description from `versionedRepresentations.description` (a string or ADF doc). */
 function descriptionFromVersionedRepresentations(versioned: unknown): string | undefined {
 	const value = latestRepresentation(versioned, "description");
 	const text = typeof value === "string" ? value : adfToText(value);
 	const trimmed = text.trim();
 	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * Issue key from a Jira ARI's trailing `issue/<KEY>` segment
+ * (`ari:cloud:jira:<cloudId>:issue/KAN-1` → `KAN-1`). Returns undefined when
+ * `id` is absent or has no path segment; a non-key trailing value (e.g. a
+ * numeric id) simply fails the def's `JIRA_KEY_REGEX` require and voids.
+ */
+function issueKeyFromAri(id: unknown): string | undefined {
+	if (typeof id !== "string") return undefined;
+	const slash = id.lastIndexOf("/");
+	return slash >= 0 ? id.slice(slash + 1) : undefined;
+}
+
+/**
+ * Reshape the generic `_fetch` entity envelope (`type:"jira-issue"`) into the
+ * canonical `{ key, fields, webUrl }`. Fields absent from the envelope are simply
+ * omitted (the def treats each as optional except the required `summary`/`key`).
+ */
+function reshapeFetchEnvelope(env: { [key: string]: unknown }): unknown {
+	const metadata = isObject(env.metadata) ? env.metadata : {};
+	const key = issueKeyFromAri(env.id);
+	const description = typeof env.text === "string" && env.text.trim().length > 0 ? env.text : undefined;
+	const fields = {
+		...(typeof env.title === "string" ? { summary: env.title } : {}),
+		...(description !== undefined ? { description } : {}),
+		...(typeof metadata.status === "string" ? { status: metadata.status } : {}),
+		...(typeof metadata.priority === "string" ? { priority: metadata.priority } : {}),
+	};
+	return {
+		...(key !== undefined ? { key } : {}),
+		...(typeof env.url === "string" ? { webUrl: env.url } : {}),
+		fields,
+	};
 }
 
 /** Reshape one Jira node so the adapter's `fields.summary` (+ description) is present. */
@@ -105,6 +120,11 @@ function reshapeJiraNode(node: unknown): unknown {
  */
 function normalizeJira(business: unknown): unknown {
 	if (!isObject(business)) return business;
+	// Generic `_fetch` entity envelope — the real Rovo shape. Gated on
+	// `type:"jira-issue"` so a non-Jira `_fetch` (e.g. a Confluence entity fetched
+	// through the same generic tool) passes through unreshaped and voids on the
+	// def's `key`/`summary` requires rather than being mis-attributed to Jira.
+	if (business.type === "jira-issue") return reshapeFetchEnvelope(business);
 	const issues = business.issues;
 	if (isObject(issues) && Array.isArray(issues.nodes)) {
 		return { ...business, issues: { ...issues, nodes: issues.nodes.map(reshapeJiraNode) } };

@@ -82,6 +82,61 @@ describe("jiraCodexBinding.normalize (derive fields.summary from versionedRepres
 	});
 });
 
+describe("jiraCodexBinding.normalize — generic _fetch entity envelope (type:'jira-issue')", () => {
+	// Real Rovo `_fetch` output shape (2026-07-12): flat, no `fields`/`key`.
+	const ENVELOPE = {
+		id: "ari:cloud:jira:e8d56e41:issue/KAN-1",
+		title: "Trace Log",
+		text: "1. Background\n\nThe backend uses pino.",
+		url: "https://api.atlassian.com/ex/jira/e8d56e41/rest/api/3/issue/10000",
+		type: "jira-issue",
+		metadata: { status: "To Do", priority: "Medium", issueType: "Task" },
+	};
+
+	it("maps id/title/text/url/metadata into the canonical {key, fields, webUrl}", () => {
+		const out = normalize(ENVELOPE) as {
+			key: string;
+			webUrl: string;
+			fields: { summary: string; description: string; status: string; priority: string };
+		};
+		expect(out.key).toBe("KAN-1");
+		expect(out.webUrl).toBe("https://api.atlassian.com/ex/jira/e8d56e41/rest/api/3/issue/10000");
+		expect(out.fields.summary).toBe("Trace Log");
+		expect(out.fields.description).toBe("1. Background\n\nThe backend uses pino.");
+		expect(out.fields.status).toBe("To Do");
+		expect(out.fields.priority).toBe("Medium");
+	});
+
+	it("omits every optional field when the envelope carries only type + id", () => {
+		const out = normalize({ type: "jira-issue", id: "ari:cloud:jira:x:issue/KAN-2" }) as {
+			key: string;
+			webUrl?: string;
+			fields: Record<string, unknown>;
+		};
+		expect(out.key).toBe("KAN-2");
+		expect(out.webUrl).toBeUndefined();
+		expect(out.fields).toEqual({});
+	});
+
+	it("omits key when the id has no path segment, and drops whitespace-only text", () => {
+		const noSlash = normalize({ type: "jira-issue", id: "notanari", text: "   " }) as {
+			key?: string;
+			fields: { description?: string };
+		};
+		expect(noSlash.key).toBeUndefined(); // lastIndexOf('/') === -1 → no key
+		expect(noSlash.fields.description).toBeUndefined();
+	});
+
+	it("omits key and coerces non-object metadata to empty when the id is absent", () => {
+		const noId = normalize({ type: "jira-issue", metadata: 42 }) as {
+			key?: string;
+			fields: Record<string, unknown>;
+		};
+		expect(noId.key).toBeUndefined();
+		expect(noId.fields).toEqual({});
+	});
+});
+
 describe("jiraCodexBinding.normalize — description (ADF → markdown)", () => {
 	const withDescription = (description: unknown) =>
 		normalize({ key: "KAN-4", versionedRepresentations: { summary: { "1": "S" }, description } }) as {
