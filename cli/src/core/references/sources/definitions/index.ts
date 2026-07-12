@@ -13,6 +13,7 @@
  * Confluence tool call would silently resolve to jira.
  */
 
+import { asanaDefinition } from "./asana.js";
 import { confluenceDefinition } from "./confluence.js";
 import { githubDefinition } from "./github.js";
 import { jiraDefinition } from "./jira.js";
@@ -31,4 +32,5 @@ export const BUILTIN_DEFINITIONS = [
 	slackDefinition,
 	zoomMeetingDefinition,
 	zoomDocDefinition,
+	asanaDefinition,
 ] as const;

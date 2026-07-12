@@ -43,12 +43,22 @@ describe("SourceDefinitionRegistry", () => {
 		expect(r.match("codex", "linear.get_issue")?.id).toBe("linear"); // invocation-tool path (no namespace)
 	});
 
-	it("all() is stable order linear,confluence,jira,github,notion,slack,zoom-meeting,zoom-doc", () => {
+	it("all() is stable order linear,confluence,jira,github,notion,slack,zoom-meeting,zoom-doc,asana", () => {
 		expect(
 			getRegistry()
 				.all()
 				.map((d) => d.id),
-		).toEqual(["linear", "confluence", "jira", "github", "notion", "slack", "zoom-meeting", "zoom-doc"]);
+		).toEqual([
+			"linear",
+			"confluence",
+			"jira",
+			"github",
+			"notion",
+			"slack",
+			"zoom-meeting",
+			"zoom-doc",
+			"asana",
+		]);
 	});
 
 	it("routes getConfluencePage to confluence and getJiraIssue to jira", () => {
@@ -336,6 +346,19 @@ describe("SourceDefinitionRegistry", () => {
 		it("resolves hub_get_file_content to zoom-doc", () => {
 			const def = getRegistry().match("claude", "mcp__claude_ai_Zoom_for_Claude__hub_get_file_content");
 			expect(def?.id).toBe("zoom-doc");
+		});
+	});
+
+	describe("asana registration", () => {
+		it("resolves get_task to asana", () => {
+			expect(getRegistry().match("claude", "mcp__claude_ai_Asana__get_task")?.id).toBe("asana");
+		});
+		it("does NOT match enumeration or write tools (suffix gate)", () => {
+			const r = getRegistry();
+			expect(r.match("claude", "mcp__claude_ai_Asana__get_tasks")).toBeUndefined();
+			expect(r.match("claude", "mcp__claude_ai_Asana__get_my_tasks")).toBeUndefined();
+			expect(r.match("claude", "mcp__claude_ai_Asana__search_tasks")).toBeUndefined();
+			expect(r.match("claude", "mcp__claude_ai_Asana__create_task_confirm")).toBeUndefined();
 		});
 	});
 });
