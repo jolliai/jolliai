@@ -74,6 +74,28 @@ export interface JolliMemorySpace {
 	readonly slug: string;
 }
 
+/**
+ * Outcome of `POST /api/jolli-memory/front-door` — the single round-trip
+ * "binding status + setup-if-needed" call the guided front door makes on every
+ * bare `jolli`. `bound` covers both a pre-existing binding and the server-side
+ * auto-bind when exactly one Space is bindable. `jmSpaceId` and `spaceName` are
+ * `null` when the caller lacks `spaces.view` on the bound Space; the server
+ * withholds the Space details but not the bound-ness. `unbound` means several
+ * Spaces are bindable and the caller should prompt, then bind via
+ * {@link JolliMemoryPushClient.createBinding}.
+ */
+export type FrontDoorResult =
+	| {
+			readonly status: "bound";
+			readonly binding: { readonly jmSpaceId: number | null; readonly spaceName: string | null };
+	  }
+	| {
+			readonly status: "unbound";
+			readonly spaces: JolliMemorySpace[];
+			readonly defaultSpaceId: number | null;
+	  }
+	| { readonly status: "no_spaces" };
+
 /** Test seam — swap in a stub `fetch` / api key / base URL to drive unit tests deterministically. */
 export interface JolliMemoryPushClientOpts {
 	readonly fetchImpl?: typeof fetch;
@@ -97,6 +119,14 @@ interface ListSpacesResponseBody {
 interface CreateBindingResponseBody {
 	readonly binding?: { readonly id: number; readonly jmSpaceId: number; readonly repoName: string };
 	readonly repoFolder?: unknown;
+}
+
+/** Raw shape of `POST /api/jolli-memory/front-door` — validated field-by-field at parse time. */
+interface FrontDoorResponseBody {
+	readonly status?: "bound" | "unbound" | "no_spaces";
+	readonly binding?: { readonly jmSpaceId?: number | null; readonly spaceName?: string | null };
+	readonly spaces?: ReadonlyArray<{ readonly id: number; readonly name: string; readonly slug: string }>;
+	readonly defaultSpaceId?: number | null;
 }
 
 /** Generic error-shaped JSON body: `{ error?: string; message?: string }`. */
@@ -181,6 +211,56 @@ export class JolliMemoryPushClient {
 		}
 		const spaces = (json.spaces ?? []).map((s) => ({ id: s.id, name: s.name, slug: s.slug }));
 		return { spaces, defaultSpaceId: json.defaultSpaceId ?? null };
+	}
+
+	/**
+	 * Resolves the repo's Space-binding state in one round-trip (see
+	 * {@link FrontDoorResult}). The server auto-binds when exactly one Space is
+	 * bindable, so callers only ever follow up with `createBinding` after an
+	 * `unbound` (several Spaces → user picked one).
+	 */
+	async frontDoor(args: { repoUrl: string; repoName: string }): Promise<FrontDoorResult> {
+		const { status, json, parseFailed } = await this.call<FrontDoorResponseBody>(
+			"POST",
+			"/api/jolli-memory/front-door",
+			args,
+		);
+		if (status === 426) {
+			throw new ClientOutdatedError(errorMessage(json));
+		}
+		if (status === 401 || status === 403) {
+			throw new NotAuthenticatedError();
+		}
+		if (status < 200 || status >= 300) {
+			throw new Error(errorMessage(json) ?? `HTTP ${status}`);
+		}
+		if (parseFailed) {
+			// Same rationale as listSpaces: a 2xx with an HTML/plain-text body
+			// (proxy/gateway) must fail loudly, not read as an empty/unknown state.
+			throw new Error(`Malformed (non-JSON) response from /api/jolli-memory/front-door (HTTP ${status})`);
+		}
+		if (
+			json.status === "bound" &&
+			json.binding &&
+			(json.binding.jmSpaceId === undefined ||
+				json.binding.jmSpaceId === null ||
+				typeof json.binding.jmSpaceId === "number")
+		) {
+			return {
+				status: "bound",
+				binding: { jmSpaceId: json.binding.jmSpaceId ?? null, spaceName: json.binding.spaceName ?? null },
+			};
+		}
+		if (json.status === "unbound") {
+			const spaces = (json.spaces ?? []).map((s) => ({ id: s.id, name: s.name, slug: s.slug }));
+			return { status: "unbound", spaces, defaultSpaceId: json.defaultSpaceId ?? null };
+		}
+		if (json.status === "no_spaces") {
+			return { status: "no_spaces" };
+		}
+		// A 2xx whose body carries no recognizable status (field renamed, contract
+		// drift) — fail loudly rather than have the caller misread the repo state.
+		throw new Error(`Unexpected front-door response shape (HTTP ${status})`);
 	}
 
 	/** Binds a repo to a Jolli Memory space. Server response has no `jmSpaceName` — only `{ binding, repoFolder }`. */
