@@ -931,4 +931,26 @@ describe("invokePlatformTool", () => {
 		expect(capturedMethod).toBe("POST");
 		expect(capturedUrl).toBe("https://jolli.ai/api/mcp/tools/create_ticket");
 	});
+
+	it("falls back to POST for a GET binding — GET cannot carry the args body", async () => {
+		// The invocation contract always relays `args` as a JSON body, and a real
+		// `fetch` throws `Request with GET/HEAD method cannot have body`. GET is
+		// therefore not an allowed binding method: a GET-natured tool routes through
+		// the conventional POST endpoint (with the args body) instead of throwing.
+		let capturedMethod: string | undefined;
+		let capturedUrl: string | undefined;
+		let capturedBody: unknown;
+		const c = client(async (url, init) => {
+			capturedUrl = String(url);
+			capturedMethod = init?.method;
+			capturedBody = init?.body;
+			return jsonResponse(200, { ok: true });
+		});
+		await c.invokePlatformTool(entry("list_tickets", { method: "GET", path: "/api/mcp/tools/list_tickets" }), {
+			status: "open",
+		});
+		expect(capturedMethod).toBe("POST");
+		expect(capturedUrl).toBe("https://jolli.ai/api/mcp/tools/list_tickets");
+		expect(capturedBody).toBe(JSON.stringify({ status: "open" }));
+	});
 });
