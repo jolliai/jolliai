@@ -382,7 +382,14 @@ export function buildNextMemoryScript(): string {
     const wrap = el('div', {
       className: 'ctx-item' + (item.isSelected ? '' : ' user-excluded') + (aiExcluded ? ' ai-excluded' : ''),
     }, [row]);
-    if (rel && (rel.tier || rel.reason)) {
+    // Only render the tier/reason meta line when there is a REAL verdict — a
+    // non-empty reason, or an AI soft-exclude. A fail-open keepAll result (LLM
+    // 404 / timeout / parse error) carries a tier but an EMPTY reason; painting
+    // its chip would stamp a bogus "Med" (formerly "High") on every row for any
+    // ranking failure. Mirrors SummaryHtmlBuilder.buildRelevanceLine (reason===""
+    // → renders nothing) so all surfaces fail-open identically: keep everything,
+    // label nothing.
+    if (rel && (rel.reason || aiExcluded)) {
       const meta = el('div', { className: 'ctx-meta' });
       if (aiExcluded) {
         meta.appendChild(el('span', { className: 'ctx-tier ctx-tier--ex', title: 'AI marked unrelated — excluded from the summary', text: 'Excluded' }));

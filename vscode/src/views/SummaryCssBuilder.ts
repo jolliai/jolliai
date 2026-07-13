@@ -166,8 +166,12 @@ export function buildCss(): string {
   }
 
   /* ── Plans Section ── */
+  /* Outer container for a Context item: an inner .row (badge + title/filename +
+     actions) plus a full-width .ctx-rel relevance line as its sibling. The
+     padding here is the per-item breathing room (no divider between items — a
+     deliberate difference from the NextMemory panel). */
   .plan-item {
-    padding: 6px 0;
+    padding: 4px 0;
   }
   .plan-header {
     display: flex;
@@ -401,8 +405,12 @@ export function buildCss(): string {
   .e2e-scenario .callout.expectedResults .callout-label { color: var(--callout-decisions-label); }
   /* AI relevance meta line under a kept context row: tier chip + ✨ reason.
      Chip colors mirror the Review panel's ctx-tier--* (green/amber/neutral),
-     restated with theme-safe rgba/vscode vars for this webview. */
-  .ctx-rel { display: flex; align-items: baseline; gap: 6px; margin-top: 2px; min-width: 0; }
+     restated with theme-safe rgba/vscode vars for this webview.
+     Rendered as a full-width sibling of .row (not inside .r-main), so a long
+     reason spans the whole card instead of sharing the narrow r-main column
+     with the always-visible date + actions. padding-left indents it under the
+     title, clearing the badge column (.row padding 6 + badge 16 + gap 6 = 28). */
+  .ctx-rel { display: flex; align-items: baseline; gap: 6px; min-width: 0; padding: 3px 6px 0 28px; }
   .ctx-tier { flex-shrink: 0; font-size: 10px; font-weight: 650; letter-spacing: 0.02em; padding: 1px 7px; border-radius: 10px; }
   .ctx-tier--high { background: rgba(27,138,79,0.16); color: var(--vscode-charts-green, #1b8a4f); }
   .ctx-tier--mid { background: rgba(150,104,14,0.16); color: var(--vscode-charts-yellow, #96680e); }
@@ -1343,8 +1351,12 @@ export function buildCss(): string {
   /* Conversation rows open the transcript on click (Context rows act via their
      explicit per-row buttons, so only the conversation row is pointer). */
   .conversations-body .row { cursor: pointer; }
-  .conversations-body .row:hover,
-  #contextPanel .row:hover { background: var(--surface-hover); }
+  .conversations-body .row:hover { background: var(--surface-hover); }
+  /* Hover highlights the WHOLE context item — the inner .row (title/filename/
+     actions) AND its sibling .ctx-rel relevance line below. Hovering the inner
+     .row alone would leave the High/Excluded + reason line un-highlighted, since
+     it lives outside .row. Radius on the item so the tinted block stays rounded. */
+  #contextPanel .plan-item:hover { background: var(--surface-hover); border-radius: 6px; }
   .conversations-body .r-main,
   #contextPanel .r-main { flex: 1; min-width: 0; }
   /* Titles wrap to two lines then clamp (mockup .row .r-title), rather than a
@@ -1372,6 +1384,14 @@ export function buildCss(): string {
      visible rather than hover-reveal — they carry inline-edit / translate
      state (e.g. .translating spin) that users need to see without hovering. */
   #contextPanel .r-actions { display: flex; flex: none; align-items: center; gap: 2px; }
+  /* A kept Context row's .r-main stacks title + filename (the AI-relevance line
+     is a full-width sibling of .row, not inside it), so #contextPanel .row's
+     align-items:center would sink the leading P/N badge and the trailing actions
+     to the row's vertical middle (fine on a one-line row, adrift on a two-line
+     one). Pin both to the top so they sit against the title's first line —
+     matching the NextMemory review panel. */
+  #contextPanel .row > .kb-tag,
+  #contextPanel .row > .r-actions { align-self: flex-start; }
 
   /* Source glyph — per-source brand <svg> logo (mirrors the sidebar's
      .conv-source-svg), not a text pill. Neutral marks (Cursor/Copilot/OpenCode)

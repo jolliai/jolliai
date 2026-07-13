@@ -272,3 +272,15 @@ describe("row destructive actions (discard on files, remove on context)", () => 
 		expect(js).toContain("className: 'row-act-btn'");
 	});
 });
+
+describe("AI relevance overlay fail-open (no bogus tier chip)", () => {
+	it("gates the ctx-meta tier/reason line on a real verdict (non-empty reason or AI exclude)", () => {
+		const js = buildNextMemoryScript();
+		// A fail-open keepAll result carries a tier but an EMPTY reason (LLM 404 /
+		// timeout / parse error). Gating the meta line on reason (or aiExcluded)
+		// keeps a ranking failure from stamping a bogus "Med" chip on every row —
+		// matching SummaryHtmlBuilder.buildRelevanceLine (reason==="" → nothing).
+		expect(js).toContain("if (rel && (rel.reason || aiExcluded))");
+		expect(js).not.toContain("if (rel && (rel.tier || rel.reason))");
+	});
+});

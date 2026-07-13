@@ -99,11 +99,13 @@ export interface ContextRelevanceResult {
 	readonly id: string;
 	readonly kind: ContextKind;
 	readonly relevant: boolean;
-	/** 0..1 confidence the item is relevant. */
+	/** Nominal 0..1 score derived from `tier` (audit/telemetry only — the model
+	 *  returns a tier directly, not a score; nothing ranks or filters by this). */
 	readonly score: number;
 	readonly tier: RelevanceTier;
 	readonly reason: string;
-	/** 1-based rank by score descending (1 = most relevant). */
+	/** 1-based position after ordering by tier (high → mid → low), ties by
+	 *  original order. Display order only — nothing thresholds on it. */
 	readonly rank: number;
 	/** true when the item should be soft-excluded (clearly unrelated). */
 	readonly autoExclude: boolean;
@@ -293,15 +295,15 @@ const ITEM_DELIMITER_RE = /^\s*===ITEM===\s*$/m;
 
 interface ParsedItem {
 	index: number;
-	relevant: boolean;
-	score: number;
+	tier: RelevanceTier;
 	reason: string;
 }
 
 /**
  * Parses the rank-context response (===ITEM=== blocks) into per-index records.
  * Tolerant of missing/garbled fields: an item with an unparseable index is
- * skipped; missing relevant/score/reason default to conservative "keep".
+ * skipped; a missing/unrecognized tier defaults to "mid" (a conservative keep —
+ * not auto-excluded like "low", and never a false "high").
  */
 export function parseRankContextResponse(text: string): ParsedItem[] {
 	const segments = text
@@ -312,17 +314,26 @@ export function parseRankContextResponse(text: string): ParsedItem[] {
 	for (const seg of segments) {
 		const index = intField(seg, "index");
 		if (index === undefined) continue;
-		const relevantRaw = strField(seg, "relevant");
-		const scoreRaw = strField(seg, "score");
 		const reason = strField(seg, "reason") ?? "";
-		// Treat any answer starting with no / nope / none / not / false as "not
-		// relevant"; everything else (incl. omitted) defaults to relevant (conservative).
-		const relevant = relevantRaw ? !/^\s*(no?|nope|none|not\b|false)/i.test(relevantRaw.trim()) : true;
-		const scoreNum = scoreRaw !== undefined ? Number.parseFloat(scoreRaw) : Number.NaN;
-		const score = Number.isFinite(scoreNum) ? clamp01(scoreNum) : relevant ? 0.7 : 0.2;
-		out.push({ index, relevant, score, reason: reason.trim() });
+		out.push({ index, tier: normalizeTier(strField(seg, "tier")), reason: reason.trim() });
 	}
 	return out;
+}
+
+/** Normalizes the model's tier token to high/mid/low. Missing or unrecognized
+ *  → "mid": a conservative keep (not auto-excluded like "low", never a false
+ *  "high") when the model omits or garbles the field. */
+function normalizeTier(raw: string | undefined): RelevanceTier {
+	if (!raw) return "mid";
+	const s = raw.trim().toLowerCase();
+	if (s.startsWith("high")) return "high";
+	if (s.startsWith("low")) return "low";
+	// The prompt constrains output to high/mid/low, but if the model slips back
+	// into the old free-text "not relevant" vocabulary, honor the exclude intent
+	// (→ low, which is the soft-exclude tier) rather than silently keeping it as
+	// a "mid". Everything else (mid, med, medium, unknown) → conservative "mid".
+	if (/^(no|none|not|false|unrelated|irrelevant|exclude)/.test(s)) return "low";
+	return "mid";
 }
 
 function strField(segment: string, name: string): string | undefined {
@@ -338,39 +349,35 @@ function intField(segment: string, name: string): number | undefined {
 	return Number.isInteger(n) ? n : undefined;
 }
 
-function clamp01(n: number): number {
-	return n < 0 ? 0 : n > 1 ? 1 : n;
+/** Nominal 0..1 score derived from the model's tier, retained on the result for
+ *  audit only. The model no longer returns a raw score — tier is authoritative
+ *  (see rank-context prompt v3) — so this is a display/telemetry convenience,
+ *  never a ranking input. */
+function tierScore(tier: RelevanceTier): number {
+	return tier === "high" ? 0.9 : tier === "mid" ? 0.6 : 0.2;
 }
 
-/** Maps a 1-based rank (within `total` items) to a tier by POSITION, not by the
- *  model's uncalibrated absolute score (which drifts across commits, so absolute
- *  cutoffs aren't comparable run-to-run).
- *  Top third → high, middle → mid, bottom third → low. */
-function tierForRank(rank: number, total: number): RelevanceTier {
-	if (total <= 1) return "high";
-	const frac = (rank - 1) / (total - 1);
-	if (frac <= 1 / 3) return "high";
-	if (frac <= 2 / 3) return "mid";
-	return "low";
-}
-
-/** True when a rank sits in the bottom third — the only band eligible for
- *  auto-exclude (and only when the item is also judged not relevant). */
-function isBottomRank(rank: number, total: number): boolean {
-	if (total <= 1) return false;
-	return (rank - 1) / (total - 1) > 2 / 3;
-}
+/** Sort priority for a tier: high first, low last. */
+const TIER_ORDER: Record<RelevanceTier, number> = { high: 0, mid: 1, low: 2 };
 
 // -- Orchestrator -------------------------------------------------------------
 
-/** Builds a "keep everything" fail-open result (used on any error). */
+/** Builds a "keep everything" fail-open result (used on any error). Every item
+ *  gets tier:"mid", reason:"", autoExclude:false. The empty reason is what makes
+ *  a failure render as nothing: all three surfaces gate the tier chip on a
+ *  non-empty reason (or an AI exclude) — Summary's buildRelevanceLine, the
+ *  NextMemory overlay, and the sidebar — so a fail-open row shows no chip at all
+ *  (see the fail-open-static handling), and keptContextRelevanceRefs drops these
+ *  from the persisted artifact. tier is "mid" rather than "high" purely as a
+ *  neutral data-layer default (nothing over-claimed) should any future surface
+ *  render it without the reason gate. */
 function keepAll(items: readonly ContextItem[]): ContextRelevanceResult[] {
 	return items.map((item, i) => ({
 		id: item.id,
 		kind: item.kind,
 		relevant: true,
-		score: 0.7,
-		tier: "high" as const,
+		score: tierScore("mid"),
+		tier: "mid" as const,
 		reason: "",
 		rank: i + 1,
 		autoExclude: false,
@@ -379,9 +386,9 @@ function keepAll(items: readonly ContextItem[]): ContextRelevanceResult[] {
 
 /**
  * Assesses relevance of every item against the change with one LLM call.
- * Returns per-item {relevant, score, tier, reason, rank, autoExclude}, ranked
- * by score descending. Never throws: on any failure returns keepAll (fail-open).
- * Returns [] for an empty item list (0 items → no analysis).
+ * Returns per-item {relevant, score, tier, reason, rank, autoExclude}, ordered
+ * by tier (high → mid → low), ties by original order. Never throws: on any
+ * failure returns keepAll (fail-open). Returns [] for an empty item list.
  */
 export async function rankContextRelevance(
 	change: ChangeSignal,
@@ -414,33 +421,33 @@ export async function rankContextRelevance(
 			// dropped tail; find this item's block index via indexToId.
 			const blockIndex = findIndexForId(indexToId, item.id) ?? i + 1;
 			const p = byIndex.get(blockIndex);
-			const relevant = p?.relevant ?? true;
-			const score = p?.score ?? 0.5;
+			// Omitted item → conservative "mid" keep (never a false high, never excluded).
+			const tier = p?.tier ?? "mid";
 			const reason = p?.reason ?? "";
-			return { item, relevant, score, reason };
+			return { item, tier, reason };
 		});
 
-		// Rank by score desc (stable on ties by original order).
+		// Order by tier (high → mid → low), stable on ties by original order.
+		// Ranking is now purely for kept-item display order; the model's tier is
+		// authoritative (no score binning by rank position anymore).
 		const ranked = merged
 			.map((m, i) => ({ ...m, origin: i }))
-			.sort((a, b) => b.score - a.score || a.origin - b.origin);
+			.sort((a, b) => TIER_ORDER[a.tier] - TIER_ORDER[b.tier] || a.origin - b.origin);
 
-		const total = ranked.length;
-		return ranked.map((m, i) => {
-			const rank = i + 1;
-			return {
-				id: m.item.id,
-				kind: m.item.kind,
-				relevant: m.relevant,
-				score: m.score,
-				// Tier and auto-exclude are driven by RANK (position), not the raw
-				// score — score is retained on the result for audit only.
-				tier: tierForRank(rank, total),
-				reason: m.reason,
-				rank,
-				autoExclude: !m.relevant && isBottomRank(rank, total),
-			};
-		});
+		return ranked.map((m, i) => ({
+			id: m.item.id,
+			kind: m.item.kind,
+			// "low" is the soft-exclude tier: an item the model judged unrelated.
+			// relevant mirrors it (kept iff not low). autoExclude drives
+			// excludedContext; a user "+ Include" later vetoes it
+			// (isEffectivelyExcluded), leaving the item kept at its "low" tier.
+			relevant: m.tier !== "low",
+			score: tierScore(m.tier),
+			tier: m.tier,
+			reason: m.reason,
+			rank: i + 1,
+			autoExclude: m.tier === "low",
+		}));
 	} catch (err) {
 		log.warn(
 			"rankContextRelevance failed (%s) — keeping all items",
@@ -660,11 +667,12 @@ export async function assessContextRelevance(
  * aiRelevance list; empty on legacy selection files → returns []).
  *
  * Empty-reason entries are dropped: the fail-open `keepAll` fallback fabricates
- * `tier:"high", reason:""` for EVERY item when the ranking LLM fails, and a
+ * `tier:"mid", reason:""` for EVERY item when the ranking LLM fails, and a
  * per-item LLM omission defaults to `reason:""` too — neither is a real
- * verdict, and persisting them would stamp "all High" onto the artifact
+ * verdict, and persisting them would stamp a fabricated tier onto the artifact
  * (contradicting the field's "absent on fail-open" contract) and render
- * dangling `· ` separators.
+ * dangling `· ` separators. (Excluded items are unaffected — they live on
+ * `excludedContext`, which keeps a low-tier entry even with an empty reason.)
  */
 export function keptContextRelevanceRefs(decision: ContextRelevanceDecision): ContextRelevanceRef[] {
 	return decision.results
@@ -726,20 +734,32 @@ export function buildDecisionFromAiRelevance(
 	for (const p of raw.plans) {
 		const entry = entryByKind.plans.get(p.slug);
 		if (pushResult("plan", p.slug, entry)) {
-			excludedContext.push({ kind: "plan", key: p.slug, title: p.title, reason: entry?.reason ?? "" });
+			excludedContext.push({
+				kind: "plan",
+				key: p.slug,
+				title: p.title,
+				reason: entry?.reason ?? "",
+				tier: "low",
+			});
 		} else keptPlans.push(p);
 	}
 	for (const n of raw.notes) {
 		const entry = entryByKind.notes.get(n.id);
 		if (pushResult("note", n.id, entry)) {
-			excludedContext.push({ kind: "note", key: n.id, title: n.title, reason: entry?.reason ?? "" });
+			excludedContext.push({ kind: "note", key: n.id, title: n.title, reason: entry?.reason ?? "", tier: "low" });
 		} else keptNotes.push(n);
 	}
 	for (const r of raw.references) {
 		const key = referenceKey(r);
 		const entry = entryByKind.references.get(key);
 		if (pushResult("reference", key, entry)) {
-			excludedContext.push({ kind: "reference", key, title: referenceLabel(r), reason: entry?.reason ?? "" });
+			excludedContext.push({
+				kind: "reference",
+				key,
+				title: referenceLabel(r),
+				reason: entry?.reason ?? "",
+				tier: "low",
+			});
 		} else keptRefs.push(r);
 	}
 	return { plans: keptPlans, notes: keptNotes, references: keptRefs, excludedContext, results };
