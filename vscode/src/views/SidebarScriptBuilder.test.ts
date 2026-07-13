@@ -2443,17 +2443,20 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toContain("codicon-link-external");
 		});
 
-		it("renderPlanRow suppresses native title= on every row type (all three drive the hover card)", () => {
+		it("renderPlanRow sets NO native title= on the row (all route through the hover card, including AI-excluded)", () => {
 			const js = buildSidebarScript();
 			const fnStart = js.indexOf("function renderPlanRow");
 			const fnEnd = js.indexOf("function gitStatusToCodicon", fnStart);
 			const body = js.slice(fnStart, fnEnd);
 			// Plan / note / entity rows all route through the shared hover-card
-			// mouseover handler now, so the native title attribute is nulled —
-			// keeping it would surface a duplicate tooltip on an independent
-			// timer. Sole exception (A+): an AI-excluded row carries the AI's
-			// one-line reason as its native tooltip; normal rows stay null.
-			expect(body).toContain("title: aiEx ? (aiReasonById[item.id] || null) : null");
+			// mouseover handler, so the row's native title attribute is never
+			// set — keeping it would surface a duplicate tooltip on an
+			// independent timer. The former AI-excluded exception (title carried
+			// the AI's one-line reason) is gone: the reason now rides inside the
+			// hover card via appendAiReasonRow, so the row emits no native title
+			// keyed on the AI overlay.
+			expect(body).not.toContain("aiReasonById[item.id]");
+			expect(body).not.toContain("title: aiEx");
 			expect(body).not.toContain("title: item.tooltip");
 		});
 
@@ -3391,13 +3394,55 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toContain("if (r.autoExclude)");
 			expect(js).toContain("aiExcludedIds.add(r.id)");
 		});
-		it("renderPlanRow strikes AI-excluded rows via an independent class + reason tooltip", () => {
+		it("renderPlanRow strikes AI-excluded rows via an independent class (reason moved into the hover card)", () => {
 			const js = buildSidebarScript();
 			// The AI axis must NOT flow through isSelected — it's its own class...
 			expect(js).toContain("aiExcludedIds.has(item.id)");
 			expect(js).toContain("(aiEx ? ' ai-excluded' : '')");
-			// ...and the A+ tooltip carries the AI's one-line reason on struck rows only.
-			expect(js).toContain("title: aiEx ? (aiReasonById[item.id] || null) : null");
+			// ...and the row no longer carries a native title: the AI's one-line
+			// reason now renders inside the hover card via appendAiReasonRow,
+			// eliminating the native-tooltip / hover-card double-tooltip.
+			const fnStart = js.indexOf("function renderPlanRow");
+			const fnEnd = js.indexOf("function gitStatusToCodicon", fnStart);
+			const body = js.slice(fnStart, fnEnd);
+			expect(body).not.toContain("title: aiEx");
+		});
+
+		it("appendAiReasonRow injects the AI reason into all three branch hover cards, gated on the current overlay", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("function appendAiReasonRow");
+			const fnStart = js.indexOf("function appendAiReasonRow");
+			const fnEnd = js.indexOf("function renderPlanHoverCard", fnStart);
+			const body = js.slice(fnStart, fnEnd);
+			// Read the overlay at call time (mouseover), so a row the user added
+			// back — which clears aiExcludedIds — stops rendering the block with
+			// no explicit restore step.
+			expect(body).toContain("aiExcludedIds.has(rowId)");
+			expect(body).toContain("aiReasonById[rowId]");
+			// Mirrors the Review panel's buildExcludedRow: an "Excluded" tier
+			// chip + the sparkle reason, sharing its ctx-tier--ex / ai-say class
+			// names so both surfaces read identically. The chip stacks on its own
+			// row above the reason (the sidebar card is narrow).
+			expect(body).toContain("'hc-row hc-ai-exclude'");
+			expect(body).toContain("'ctx-tier ctx-tier--ex'");
+			expect(body).toContain("text: 'Excluded'");
+			// Reason uses the U+2728 sparkles EMOJI (native multi-colour glyph),
+			// matching the Review panel — NOT codicon-sparkle, which the .ai-say
+			// purple would flatten into a single tint.
+			expect(body).toContain("'ai-say', text: '✨ ' + reason");
+			// Match the rendered form (class prefix) so the word "codicon-sparkle"
+			// in the function's own explanatory comment doesn't trip this.
+			expect(body).not.toContain("codicon codicon-sparkle");
+			// A trailing hr closes the reason block so it doesn't crowd the
+			// hc-actions link below — pushed inside the fn so only excluded rows
+			// get it. (Two el('hr') in the body: the assertion is order-agnostic,
+			// but the block is bracketed by the caller's hr above + this one.)
+			expect(body).toContain("el('hr')");
+			// All three renderers call it with THEIR id key (slug / noteId /
+			// mapKey) so the reason keys line up with aiExcludedIds' entries.
+			expect(js).toContain("appendAiReasonRow(kids, slug)");
+			expect(js).toContain("appendAiReasonRow(kids, noteId)");
+			expect(js).toContain("appendAiReasonRow(kids, mapKey)");
 		});
 		it("exclude toggle unifies both axes: struck rows offer +, clearing user AND AI excludes", () => {
 			const js = buildSidebarScript();
