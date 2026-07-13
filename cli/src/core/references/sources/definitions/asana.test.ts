@@ -40,6 +40,11 @@ describe("asana definition", () => {
 		expect(extractRef(def, { ...CANONICAL, permalink_url: "https://evil.example/task/1" }, TOOL, AT)).toBeNull();
 	});
 
+	it("accepts a mixed-case Asana host (URL hosts are case-insensitive)", () => {
+		const url = "https://App.Asana.com/1/1216474500374769/task/1216474542361983";
+		expect(extractRef(def, { ...CANONICAL, permalink_url: url }, TOOL, AT)?.url).toBe(url);
+	});
+
 	it("renders an <asana-tasks> block", () => {
 		const ref = extractRef(def, CANONICAL, TOOL, AT);
 		if (ref === null) throw new Error("expected ref");

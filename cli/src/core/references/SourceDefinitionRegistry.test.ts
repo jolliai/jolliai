@@ -48,17 +48,7 @@ describe("SourceDefinitionRegistry", () => {
 			getRegistry()
 				.all()
 				.map((d) => d.id),
-		).toEqual([
-			"linear",
-			"confluence",
-			"jira",
-			"github",
-			"notion",
-			"slack",
-			"zoom-meeting",
-			"zoom-doc",
-			"asana",
-		]);
+		).toEqual(["linear", "confluence", "jira", "github", "notion", "slack", "zoom-meeting", "zoom-doc", "asana"]);
 	});
 
 	it("routes getConfluencePage to confluence and getJiraIssue to jira", () => {
@@ -359,6 +349,18 @@ describe("SourceDefinitionRegistry", () => {
 			expect(r.match("claude", "mcp__claude_ai_Asana__get_my_tasks")).toBeUndefined();
 			expect(r.match("claude", "mcp__claude_ai_Asana__search_tasks")).toBeUndefined();
 			expect(r.match("claude", "mcp__claude_ai_Asana__create_task_confirm")).toBeUndefined();
+		});
+		it("resolves the codex get_task via both the function_call and invocation paths", () => {
+			const r = getRegistry();
+			expect(r.match("codex", "_get_task", "asana")?.id).toBe("asana"); // function_call path
+			expect(r.match("codex", "asana.get_task")?.id).toBe("asana"); // invocation-tool path (dotted, verbatim)
+		});
+		it("does NOT match codex enumeration/write tools or a mistyped invocation name", () => {
+			const r = getRegistry();
+			expect(r.match("codex", "_get_tasks", "asana")).toBeUndefined();
+			expect(r.match("codex", "_get_my_tasks", "asana")).toBeUndefined();
+			expect(r.match("codex", "_search_tasks", "asana")).toBeUndefined();
+			expect(r.match("codex", "asana_get_task")).toBeUndefined(); // underscore, not the real dotted tool
 		});
 	});
 });
