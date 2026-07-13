@@ -3,7 +3,6 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 const h = vi.hoisted(() => ({
 	loadAuthToken: vi.fn(),
 	loadConfig: vi.fn(),
-	orphanBranchExists: vi.fn(),
 	getSummaryCount: vi.fn(),
 	track: vi.fn(),
 	triggerPendingPushRetry: vi.fn(),
@@ -15,11 +14,16 @@ const h = vi.hoisted(() => ({
 	runSpaceSyncStep: vi.fn(),
 	createStorage: vi.fn(),
 	setActiveStorage: vi.fn(),
+	saveConfigScoped: vi.fn(),
+	getGlobalConfigDir: vi.fn(),
 }));
 
 vi.mock("../auth/AuthConfig.js", () => ({ loadAuthToken: h.loadAuthToken }));
-vi.mock("../core/SessionTracker.js", () => ({ loadConfig: h.loadConfig }));
-vi.mock("../core/GitOps.js", () => ({ orphanBranchExists: h.orphanBranchExists }));
+vi.mock("../core/SessionTracker.js", () => ({
+	loadConfig: h.loadConfig,
+	saveConfigScoped: h.saveConfigScoped,
+	getGlobalConfigDir: h.getGlobalConfigDir,
+}));
 vi.mock("../core/StorageFactory.js", () => ({ createStorage: h.createStorage }));
 vi.mock("../core/SummaryStore.js", () => ({
 	getSummaryCount: h.getSummaryCount,
@@ -68,10 +72,11 @@ describe("GuidedFrontDoor", () => {
 		// Defaults: signed in via OAuth, enabled, no memories yet.
 		h.resolveProjectDir.mockReturnValue("/repo");
 		h.createStorage.mockResolvedValue({});
+		h.getGlobalConfigDir.mockReturnValue("/global/config");
+		h.saveConfigScoped.mockResolvedValue(undefined);
 		h.loadAuthToken.mockResolvedValue("oauth-token");
 		h.loadConfig.mockResolvedValue({ jolliUrl: "https://acme.jolli.ai", jolliApiKey: "sk-jol-default" });
 		h.isGitHookInstalled.mockResolvedValue(true);
-		h.orphanBranchExists.mockResolvedValue(true);
 		h.getSummaryCount.mockResolvedValue(0);
 		h.install.mockResolvedValue({ success: true, warnings: [] });
 		h.promptText.mockResolvedValue("");
@@ -124,9 +129,11 @@ describe("GuidedFrontDoor", () => {
 		h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x" });
 		await runGuidedFrontDoor();
 		expect(h.promptSetup).not.toHaveBeenCalled();
-		expect(out()).toContain("configured (not signed in via OAuth)");
+		expect(out()).toContain("Jolli API key set (not signed in to Jolli)");
 		expect(out()).not.toContain("signed in ·");
 		expect(out()).toContain("Jolli is listening");
+		// Has a jolliApiKey (can already sync) → must NOT nudge sign-in.
+		expect(out()).not.toContain("sync memories to a Space");
 	});
 
 	it("ANTHROPIC_API_KEY env counts as a credential", async () => {
@@ -136,7 +143,7 @@ describe("GuidedFrontDoor", () => {
 		try {
 			await runGuidedFrontDoor();
 			expect(h.promptSetup).not.toHaveBeenCalled();
-			expect(out()).toContain("configured (not signed in via OAuth)");
+			expect(out()).toContain("Anthropic API key set (not signed in to Jolli)");
 		} finally {
 			delete process.env.ANTHROPIC_API_KEY;
 		}
@@ -155,6 +162,16 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).toContain("5 memories");
 		expect(out()).toContain("signed in");
 		expect(out()).toContain("Restart your AI agent session");
+	});
+
+	it("just enabled a fresh repo (no memories yet) → 0 memories", async () => {
+		h.isGitHookInstalled.mockResolvedValue(false);
+		h.promptText.mockResolvedValue("y");
+		h.getSummaryCount.mockResolvedValue(0); // fresh repo, empty index
+		await runGuidedFrontDoor();
+		expect(h.install).toHaveBeenCalled();
+		expect(h.getSummaryCount).toHaveBeenCalled();
+		expect(out()).toContain("0 memories");
 	});
 
 	it("not enabled + [Y/n]=n → no install, early return", async () => {
@@ -227,13 +244,15 @@ describe("GuidedFrontDoor", () => {
 		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo");
 	});
 
-	it("config.apiKey alone counts as a credential", async () => {
+	it("config.apiKey alone (no Jolli credential) → generates locally + nudges sign-in", async () => {
 		h.loadAuthToken.mockResolvedValue(undefined);
 		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x" });
 		await runGuidedFrontDoor();
 		expect(h.promptSetup).not.toHaveBeenCalled();
-		expect(out()).toContain("configured (not signed in via OAuth)");
+		expect(out()).toContain("Anthropic API key set (not signed in to Jolli)");
 		expect(out()).toContain("Jolli is listening");
+		// Pure-Anthropic user with no Jolli credential — soft nudge to sign in.
+		expect(out()).toContain("sync memories to a Space");
 	});
 
 	it("not enabled + empty answer (Enter) defaults to Yes → installs", async () => {
@@ -243,30 +262,113 @@ describe("GuidedFrontDoor", () => {
 		expect(h.install).toHaveBeenCalledWith("/repo", { source: "cli" });
 	});
 
-	it("signed in via OAuth but no LLM credential → no 'listening', prompts to configure a key", async () => {
+	it("signed in but no usable key → offers a fix, no false 'listening'", async () => {
 		h.loadAuthToken.mockResolvedValue("oauth-token");
-		h.loadConfig.mockResolvedValue({ jolliUrl: "https://acme.jolli.ai" }); // no jolliApiKey / apiKey
+		h.loadConfig.mockResolvedValue({ jolliUrl: "https://acme.jolli.ai" }); // no key at all
+		h.promptText.mockResolvedValue(""); // menu default → enter key → empty → skip
 		await runGuidedFrontDoor();
 		expect(out()).toContain("signed in");
 		expect(out()).not.toContain("Jolli is listening");
-		expect(out()).toContain("Configure an API key");
+		expect(out()).toContain("no usable key");
+	});
+
+	it("choose 'switch to Jolli' → saves aiProvider jolli; listening reflects existing memory count", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x", aiProvider: "anthropic" });
+		h.getSummaryCount.mockResolvedValue(163); // returning repo with history
+		h.promptText.mockResolvedValue("2");
+		await runGuidedFrontDoor();
+		expect(h.saveConfigScoped).toHaveBeenCalledWith({ aiProvider: "jolli" }, "/global/config");
+		expect(out()).toContain("switched to Jolli");
+		// Must NOT claim "first memory" when the repo already has memories.
+		expect(out()).toContain("last memory saved");
+		expect(out()).not.toContain("first memory");
+	});
+
+	it("choose 'enter Anthropic key' → saves apiKey + provider anthropic; listening reflects memory count", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x", aiProvider: "anthropic" });
+		h.getSummaryCount.mockResolvedValue(163);
+		h.promptText.mockResolvedValueOnce("1").mockResolvedValueOnce("sk-ant-new");
+		await runGuidedFrontDoor();
+		expect(h.saveConfigScoped).toHaveBeenCalledWith(
+			{ apiKey: "sk-ant-new", aiProvider: "anthropic" },
+			"/global/config",
+		);
+		expect(out()).toContain("Anthropic key saved");
+		expect(out()).toContain("last memory saved");
+		expect(out()).not.toContain("first memory");
+	});
+
+	it("provider=anthropic + jolliApiKey, press Enter at menu → defaults to entering an Anthropic key", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x", aiProvider: "anthropic" });
+		h.promptText.mockResolvedValueOnce("").mockResolvedValueOnce("sk-ant-y");
+		await runGuidedFrontDoor();
+		expect(h.saveConfigScoped).toHaveBeenCalledWith(
+			{ apiKey: "sk-ant-y", aiProvider: "anthropic" },
+			"/global/config",
+		);
+	});
+
+	it("provider=anthropic + jolliApiKey, choose 'skip' → no config change", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x", aiProvider: "anthropic" });
+		h.promptText.mockResolvedValue("3");
+		await runGuidedFrontDoor();
+		expect(h.saveConfigScoped).not.toHaveBeenCalled();
+		expect(out()).not.toContain("Jolli is listening");
+	});
+
+	it("no jolliApiKey path: enter Anthropic key → saved", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({ aiProvider: "anthropic" }); // no jolliApiKey
+		h.promptText.mockResolvedValueOnce("1").mockResolvedValueOnce("sk-ant-x");
+		await runGuidedFrontDoor();
+		expect(h.saveConfigScoped).toHaveBeenCalledWith(
+			{ apiKey: "sk-ant-x", aiProvider: "anthropic" },
+			"/global/config",
+		);
+	});
+
+	it("no jolliApiKey path: skip → no change", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({ aiProvider: "anthropic" });
+		h.promptText.mockResolvedValue("2"); // skip in the no-Jolli menu
+		await runGuidedFrontDoor();
+		expect(h.saveConfigScoped).not.toHaveBeenCalled();
+	});
+
+	it("enter Anthropic key but press Enter (empty) → skipped, no save", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({ aiProvider: "anthropic" });
+		h.promptText.mockResolvedValueOnce("1").mockResolvedValueOnce("");
+		await runGuidedFrontDoor();
+		expect(h.saveConfigScoped).not.toHaveBeenCalled();
 	});
 
 	describe("getGuidedFrontDoorStatus", () => {
-		it("no orphan branch → summaryCount 0, does not call getSummaryCount", async () => {
-			h.isGitHookInstalled.mockResolvedValue(true);
-			h.orphanBranchExists.mockResolvedValue(false);
-			const status = await getGuidedFrontDoorStatus("/repo");
-			expect(status).toEqual({ enabled: true, summaryCount: 0 });
-			expect(h.getSummaryCount).not.toHaveBeenCalled();
-		});
-
-		it("orphan branch exists → counts summaries", async () => {
+		it("counts summaries from the active storage", async () => {
 			h.isGitHookInstalled.mockResolvedValue(false);
-			h.orphanBranchExists.mockResolvedValue(true);
 			h.getSummaryCount.mockResolvedValue(7);
 			const status = await getGuidedFrontDoorStatus("/repo");
 			expect(status).toEqual({ enabled: false, summaryCount: 7 });
+		});
+
+		it("folder-only repo with no orphan branch still reports its memories", async () => {
+			// Regression: previously gated on orphanBranchExists, so folder-mode
+			// repos (memories on disk, no orphan branch) wrongly reported 0.
+			h.isGitHookInstalled.mockResolvedValue(true);
+			h.getSummaryCount.mockResolvedValue(4);
+			const status = await getGuidedFrontDoorStatus("/repo");
+			expect(status).toEqual({ enabled: true, summaryCount: 4 });
+		});
+
+		it("empty index → 0 memories", async () => {
+			h.isGitHookInstalled.mockResolvedValue(true);
+			h.getSummaryCount.mockResolvedValue(0);
+			const status = await getGuidedFrontDoorStatus("/repo");
+			expect(status).toEqual({ enabled: true, summaryCount: 0 });
 		});
 	});
 });

@@ -27,6 +27,11 @@
  */
 export async function runSpaceSyncStep(cwd: string): Promise<void> {
 	void cwd;
-	// Development placeholder — remove when the real sync / binding lands.
-	console.log("\n  [space-sync] cloud sync / Space binding placeholder — not yet implemented");
+	// Development-only placeholder so the front door's call site / timing can be
+	// exercised by hand (`JOLLI_DEV=1 jolli`). Gated behind JOLLI_DEV so it never
+	// reaches end users if a release ships before the real sync/binding replaces
+	// this stub. Remove the whole guard when implementing the real logic.
+	if (process.env.JOLLI_DEV) {
+		console.log("\n  [space-sync] cloud sync / Space binding placeholder — not yet implemented");
+	}
 }
