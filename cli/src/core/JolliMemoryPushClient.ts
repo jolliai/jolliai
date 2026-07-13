@@ -559,14 +559,23 @@ function isErrorBody(value: unknown): value is ErrorResponseBody {
 	return typeof value === "object" && value !== null;
 }
 
-/** HTTP methods a platform tool binding may use; anything else falls back to the conventional endpoint. */
-const ALLOWED_TOOL_METHODS: ReadonlySet<string> = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
+/**
+ * HTTP methods a platform-tool binding may use; anything else falls back to the
+ * conventional endpoint. GET (and HEAD) are deliberately excluded: the tool-call
+ * contract always relays the invocation's `args` as a JSON request body, and those
+ * methods cannot carry one (Node's `fetch` throws `Request with GET/HEAD method
+ * cannot have body`). A GET/HEAD-natured binding therefore falls back to the
+ * conventional `POST /api/mcp/tools/<name>` endpoint that every tool supports,
+ * rather than advertising a method that would throw before reaching the network.
+ */
+const ALLOWED_TOOL_METHODS: ReadonlySet<string> = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 /**
  * Resolves the endpoint for a platform tool call. Honors the manifest-advertised
  * `binding` only when, after full WHATWG URL normalization against the tenant
- * origin, it stays same-origin AND its method is a known HTTP method — otherwise
- * it falls back to the conventional `POST /api/mcp/tools/<name>`. Comparing the
+ * origin, it stays same-origin AND its method is a body-carrying HTTP method
+ * (POST/PUT/PATCH/DELETE) — otherwise it falls back to the conventional
+ * `POST /api/mcp/tools/<name>` (see {@link ALLOWED_TOOL_METHODS}). Comparing the
  * *resolved* origin (not the raw string) is essential: a prefix check is defeated
  * by inputs the URL parser rewrites — e.g. `/\host` (backslash becomes `/`) or a
  * path with an embedded tab/CR/LF — which would otherwise smuggle an off-origin
