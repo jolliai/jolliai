@@ -9,6 +9,18 @@
  * Guard: require a non-empty meeting_summary.summary_markdown — a meeting with no
  * AI summary voids rather than producing an empty-bodied reference.
  * url: prefer the summary doc; fall back to the always-present deep_url.
+ *
+ * Codex: the `codex_apps/zoom` connector's `_get_meeting_assets` returns a payload
+ * with the identical shape (verified against a real 2026-07-13 rollout —
+ * meeting_uuid / topic / start_time / meeting_number / deep_url /
+ * meeting_summary.{summary_markdown,summary_doc_url} all present), so this same
+ * DSL reads it verbatim via an identity `CodexZoomMeetingBinding`. Enumeration
+ * tools (`_search_meetings`, `_recordings_list`) and `_get_recording_resource`
+ * are omitted from the match — allow-list semantics mean they never match. Note
+ * that the real `_get_meeting_assets` `function_call_output` is frequently
+ * malformed JSON (a bad escape mid-transcript on long meetings); extraction then
+ * succeeds through the parser's `mcp_tool_call_end` fallback, whose event carries
+ * a complete, valid copy (unlike Jira, it already holds the URL — no `recover`).
  */
 
 import type { SourceDefinition } from "../../SourceDefinition.js";
@@ -19,6 +31,11 @@ export const zoomMeetingDefinition: SourceDefinition = {
 	icon: "device-camera-video",
 	match: {
 		claude: { prefixes: ["mcp__claude_ai_Zoom_for_Claude__"], acceptSuffix: "get_meeting_assets" },
+		codex: {
+			namespaceSuffix: "zoom",
+			functionCallNames: ["_get_meeting_assets"],
+			invocationTools: ["zoom.get_meeting_assets"],
+		},
 	},
 	wrapperKeys: [],
 	reference: {

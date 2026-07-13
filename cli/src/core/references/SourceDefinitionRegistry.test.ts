@@ -312,6 +312,18 @@ describe("SourceDefinitionRegistry", () => {
 		it("does NOT match other Zoom tools (suffix gate)", () => {
 			expect(getRegistry().match("claude", "mcp__claude_ai_Zoom_for_Claude__search_meetings")).toBeUndefined();
 		});
+		it("resolves the Codex zoom connector by namespace+name and by invocation tool", () => {
+			const r = getRegistry();
+			expect(r.match("codex", "_get_meeting_assets", "zoom")?.id).toBe("zoom-meeting"); // function_call path
+			expect(r.match("codex", "zoom.get_meeting_assets")?.id).toBe("zoom-meeting"); // invocation-tool path
+		});
+		it("does NOT match Codex zoom enumeration / recording-resource tools", () => {
+			const r = getRegistry();
+			expect(r.match("codex", "_search_meetings", "zoom")).toBeUndefined();
+			expect(r.match("codex", "_recordings_list", "zoom")).toBeUndefined();
+			expect(r.match("codex", "_get_recording_resource", "zoom")).toBeUndefined();
+			expect(r.match("codex", "zoom.search_meetings")).toBeUndefined();
+		});
 	});
 
 	describe("zoom-doc registration", () => {
