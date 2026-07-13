@@ -30,8 +30,9 @@ export const confluenceDefinition: SourceDefinition = {
 		// Codex's built-in "Atlassian Rovo" app fetches a page through a dedicated
 		// `_getconfluencepage` tool (namespace `mcp__codex_apps__atlassian_rovo`,
 		// invocation `atlassian_rovo.getConfluencePage`) — verified from a live
-		// rollout. Its output is the SAME `{content:{nodes}}` shape as the Claude
-		// tool, so `CodexConfluenceBinding` reuses `normalizeConfluence` verbatim.
+		// rollout. Its extracted `content[0].text` is a FLAT page node, NOT the
+		// Claude tool's `{content:{nodes}}` wrapper (see CodexConfluenceBinding);
+		// `normalizeConfluence` accepts both, so the binding reuses it verbatim.
 		// This def ONLY claims the dedicated `_getconfluencepage`; a page fetched via
 		// the generic `_fetch` routes to the jira def and is dropped (see the KNOWN
 		// GAP note in jira.ts). Jira's `_fetch` therefore never collides with this def.

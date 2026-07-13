@@ -2,11 +2,22 @@
  * ConfluenceNormalize — reshape a `getConfluencePage` MCP result into a canonical
  * object the `confluence` SourceDefinition reads with plain `path` ops.
  *
- * The raw payload is `{ content: { nodes: [ node ] } }`; a single-page fetch
- * yields exactly one node. The only field the DSL cannot handle itself is `body`,
- * which is a markdown STRING under the default/"markdown" contentFormat but an
- * ADF document OBJECT under "adf" — so this flattens ADF to text (the DSL's
- * `path`/`transform` cannot: `transform` fns are `(string) => string`).
+ * TWO envelope shapes reach this layer, both carrying the same logical page:
+ *   - WRAPPED `{ content: { nodes: [ node ] } }` — Claude's `getConfluencePage`
+ *     tool result body (and a single-page fetch yields exactly one node). The
+ *     node carries `space:{name}` / `author:{displayName}` objects.
+ *   - FLAT `{ id, title, webUrl, body, spaceId, authorId, … }` — Codex's Rovo
+ *     `_getconfluencepage`, whose `content[0].text` (the string the Codex envelope
+ *     layer extracts) is the page node itself, NOT the wrapper. Its wrapped twin
+ *     lives in the connector's `structuredContent`, which the envelope discards
+ *     (verified against live 2026-07 rollouts). The flat node has NO `space` /
+ *     `author` objects — only `spaceId` / `authorId` IDs — so those display fields
+ *     are deliberately left undefined rather than surfaced as opaque IDs.
+ * {@link resolveNode} accepts either. The only field the DSL cannot handle itself
+ * is `body`, which is a markdown STRING under the default/"markdown" contentFormat
+ * but an ADF document OBJECT under "adf" (true in BOTH shapes) — so this flattens
+ * ADF to text (the DSL's `path`/`transform` cannot: `transform` fns are
+ * `(string) => string`).
  *
  * "Normalize only normalizes": missing `title`/`url` are left undefined so the
  * definition's `require` regexes void the reference — this layer only returns
@@ -33,14 +44,35 @@ function bodyToString(body: unknown): string | undefined {
 	return trimmed.length > 0 ? text : undefined;
 }
 
+/**
+ * Extract the page node from either envelope shape. A top-level `content` key is
+ * the unambiguous marker of the WRAPPED shape (a flat page node keeps its body
+ * under `body`, never a top-level `content`), so once `content` is an object we
+ * commit to `content.nodes[0]` and never fall through. Otherwise, a top-level
+ * object that looks like a page node (`id` plus a `title` or `webUrl`) is treated
+ * as the FLAT Codex shape. Anything else is unparseable.
+ */
+function resolveNode(rawResult: { [k: string]: unknown }): { [k: string]: unknown } | null {
+	const content = rawResult.content;
+	if (isObject(content)) {
+		const nodes = content.nodes;
+		if (!Array.isArray(nodes) || nodes.length === 0) return null;
+		const node = nodes[0];
+		return isObject(node) ? node : null;
+	}
+	if (
+		typeof rawResult.id === "string" &&
+		(typeof rawResult.title === "string" || typeof rawResult.webUrl === "string")
+	) {
+		return rawResult;
+	}
+	return null;
+}
+
 export function normalizeConfluence(rawResult: unknown): ConfluenceCanonical | null {
 	if (!isObject(rawResult)) return null;
-	const content = rawResult.content;
-	if (!isObject(content)) return null;
-	const nodes = content.nodes;
-	if (!Array.isArray(nodes) || nodes.length === 0) return null;
-	const node = nodes[0];
-	if (!isObject(node)) return null;
+	const node = resolveNode(rawResult);
+	if (node === null) return null;
 
 	const pageId = typeof node.id === "string" ? node.id : undefined;
 	const title = typeof node.title === "string" ? node.title : undefined;

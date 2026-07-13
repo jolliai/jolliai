@@ -137,6 +137,51 @@ describe("jiraCodexBinding.normalize — generic _fetch entity envelope (type:'j
 	});
 });
 
+describe("jiraCodexBinding.normalize — dedicated getJiraIssue REST issue (self → webUrl)", () => {
+	// Real Rovo `atlassian_rovo.getJiraIssue` content[0].text (captured 2026-07-13):
+	// the standard Jira REST v3 issue — `{ key, fields:{summary,…}, self }` with NO
+	// top-level `webUrl`, only the api.atlassian.com REST endpoint under `self`.
+	const REST_ISSUE = {
+		expand: "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
+		id: "10000",
+		self: "https://api.atlassian.com/ex/jira/e8d56e41-d65c-44d9-822d-96fb42c56007/rest/api/3/issue/10000",
+		key: "KAN-1",
+		fields: {
+			summary: "Trace Log",
+			status: { name: "To Do", statusCategory: { name: "To Do" } },
+			priority: { name: "Medium" },
+			issuetype: { name: "Task" },
+			description: "1. Background\n\nThe backend uses pino for logging.",
+			labels: [],
+		},
+	};
+
+	it("maps self → webUrl so the issue is captured (Rovo returns no browsable url)", () => {
+		const out = normalize(REST_ISSUE) as {
+			key: string;
+			webUrl?: string;
+			fields: { summary: string; status: { name: string } };
+		};
+		expect(out.key).toBe("KAN-1");
+		expect(out.fields.summary).toBe("Trace Log");
+		expect(out.fields.status.name).toBe("To Do");
+		// self kept as-is (api endpoint) — the tenant site for a /browse/ link is absent.
+		expect(out.webUrl).toBe(
+			"https://api.atlassian.com/ex/jira/e8d56e41-d65c-44d9-822d-96fb42c56007/rest/api/3/issue/10000",
+		);
+	});
+
+	it("does not overwrite an existing webUrl with self", () => {
+		const out = normalize({
+			key: "KAN-4",
+			self: "https://api.atlassian.com/ex/jira/x/rest/api/3/issue/10013",
+			webUrl: "https://acme.atlassian.net/browse/KAN-4",
+			fields: { summary: "S" },
+		}) as { webUrl: string };
+		expect(out.webUrl).toBe("https://acme.atlassian.net/browse/KAN-4");
+	});
+});
+
 describe("jiraCodexBinding.normalize — description (ADF → markdown)", () => {
 	const withDescription = (description: unknown) =>
 		normalize({ key: "KAN-4", versionedRepresentations: { summary: { "1": "S" }, description } }) as {

@@ -159,27 +159,27 @@ const ZOOM_MEETING = {
 	},
 	my_notes: { has_my_notes: false },
 };
-// Real Codex built-in "Atlassian Rovo" app shapes, captured from a live rollout
-// (2026-07-12). Rovo has NO `_getjiraissue`: Confluence uses a dedicated
-// `_getconfluencepage` whose output is the SAME `{content:{nodes}}` shape as
-// Claude's getConfluencePage, while Jira comes through the generic `_fetch`
-// returning the `{id,title,text,url,type,metadata}` entity envelope (NOT the
-// `{key,fields,webUrl}` shape the older fabricated fixtures assumed).
+// Real Codex built-in "Atlassian Rovo" app shapes, captured from live rollouts
+// (2026-07). Confluence uses a dedicated `_getconfluencepage`; Jira is reachable
+// BOTH through the generic `_fetch` (`{id,title,text,url,type,metadata}` entity
+// envelope) AND a dedicated `_getjiraissue` (standard REST issue — see
+// ROVO_JIRA_REST). The older fixtures fabricated a `{key,fields,webUrl}` _fetch
+// shape and a mis-spelled `_getjiraissue` name, neither matching reality.
+//
+// Rovo's `_getconfluencepage` `content[0].text` — the string the Codex envelope
+// layer extracts — is a FLAT page node, NOT Claude's `{content:{nodes:[…]}}`
+// wrapper (that wrapped twin lives only in the discarded `structuredContent`).
+// The flat node carries `spaceId`/`authorId` IDs, NO `space`/`author` objects.
 const ROVO_CONFLUENCE = {
-	content: {
-		totalCount: 1,
-		nodes: [
-			{
-				id: "131076",
-				type: "page",
-				title: "数据库访问架构变更设计：Per-Provider 连接池",
-				space: { key: "KAN", name: "My Kanban Space" },
-				author: { displayName: "Flyer Li" },
-				body: "## TL;DR\n\n1. 现状：per-(tenant, org) 连接池。",
-				webUrl: "https://lichengbin2008.atlassian.net/wiki/spaces/KAN/pages/131076/Per-Provider",
-			},
-		],
-	},
+	id: "131076",
+	type: "page",
+	status: "current",
+	title: "数据库访问架构变更设计：Per-Provider 连接池",
+	spaceId: 98307,
+	parentId: "98415",
+	authorId: "712020:bb39bcb3-833a-4d6e-8605-5cfaad3e2172",
+	body: "## TL;DR\n\n1. 现状：per-(tenant, org) 连接池。",
+	webUrl: "https://lichengbin2008.atlassian.net/wiki/spaces/KAN/pages/131076/Per-Provider",
 };
 const ROVO_JIRA_FETCH = {
 	id: "ari:cloud:jira:e8d56e41-d65c-44d9-822d-96fb42c56007:issue/KAN-1",
@@ -192,6 +192,22 @@ const ROVO_JIRA_FETCH = {
 		status: "To Do",
 		priority: "Medium",
 		issueType: "Task",
+	},
+};
+// Real dedicated `atlassian_rovo.getJiraIssue` content[0].text (2026-07-13): the
+// standard Jira REST v3 issue — `{key, fields:{summary,…}, self}` with NO webUrl.
+const ROVO_JIRA_REST = {
+	expand: "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
+	id: "10000",
+	self: "https://api.atlassian.com/ex/jira/e8d56e41-d65c-44d9-822d-96fb42c56007/rest/api/3/issue/10000",
+	key: "KAN-1",
+	fields: {
+		summary: "Trace Log",
+		status: { name: "To Do", statusCategory: { name: "To Do" } },
+		priority: { name: "Medium" },
+		issuetype: { name: "Task" },
+		description: "1. Background\n\nThe backend uses pino for logging.",
+		labels: [],
 	},
 };
 
@@ -214,14 +230,22 @@ describe("CodexEnvelopeParser.parse", () => {
 		expect(jira?.toolName).toContain("mcp__claude_ai_Atlassian__");
 	});
 
-	it("extracts a Confluence reference from the real Rovo _getconfluencepage function_call", () => {
+	it("extracts a Confluence reference from the real Rovo _getconfluencepage (flat content[0].text via mcp_tool_call_end)", () => {
+		// Faithful to the live rollout: the page fetch produced only a
+		// mcp_tool_call_end event (no function_call_output), and its
+		// `result.Ok.content[0].text` is the FLAT node — the shape that used to
+		// slip past normalizeConfluence's `content.nodes` gate and get dropped.
 		const lines = [
 			fnCall("mcp__codex_apps__atlassian_rovo", "_getconfluencepage", "c_conf"),
-			fnOutput("c_conf", ROVO_CONFLUENCE, { wrap: "bare", prefix: true }),
+			toolCallEnd("atlassian_rovo.getConfluencePage", "c_conf", ROVO_CONFLUENCE),
 		];
 		const { results } = codexEnvelopeParser.parse(lines, {});
 		expect(results.map((r) => r.def.id)).toEqual(["confluence"]);
-		expect((results[0].payload as { pageId?: string }).pageId).toBe("131076");
+		const payload = results[0].payload as { pageId?: string; space?: string; author?: string };
+		expect(payload.pageId).toBe("131076");
+		// Flat node has only spaceId/authorId → these display fields stay undefined.
+		expect(payload.space).toBeUndefined();
+		expect(payload.author).toBeUndefined();
 		expect(results[0].toolName).toBe("mcp__claude_ai_Atlassian__getConfluencePage");
 	});
 
@@ -235,6 +259,28 @@ describe("CodexEnvelopeParser.parse", () => {
 		const payload = results[0].payload as { key?: string; fields?: { summary?: string } };
 		expect(payload.key).toBe("KAN-1");
 		expect(payload.fields?.summary).toBe("Trace Log");
+	});
+
+	it("extracts a Jira reference from the real Rovo dedicated getJiraIssue (REST issue via mcp_tool_call_end)", () => {
+		// Faithful to the live rollout: the dedicated tool fires a `_getjiraissue`
+		// function_call and an `atlassian_rovo.getJiraIssue` event whose
+		// content[0].text is the standard Jira REST issue — `{key,fields,self}`, NO
+		// webUrl. Before the fix the event name did not match and, even if it had, the
+		// missing webUrl voided the ref.
+		const lines = [
+			fnCall("mcp__codex_apps__atlassian_rovo", "_getjiraissue", "c_gji"),
+			toolCallEnd("atlassian_rovo.getJiraIssue", "c_gji", ROVO_JIRA_REST),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.map((r) => r.def.id)).toEqual(["jira"]);
+		const payload = results[0].payload as { key?: string; webUrl?: string; fields?: { summary?: string } };
+		expect(payload.key).toBe("KAN-1");
+		expect(payload.fields?.summary).toBe("Trace Log");
+		// self mapped to webUrl (no browsable url from Rovo).
+		expect(payload.webUrl).toBe(
+			"https://api.atlassian.com/ex/jira/e8d56e41-d65c-44d9-822d-96fb42c56007/rest/api/3/issue/10000",
+		);
+		expect(results[0].toolName).toBe("mcp__claude_ai_Atlassian__getJiraIssue");
 	});
 
 	it("unwraps the object-envelope function_call_output ({content:[{text}]}) — newer Linear _get_issue connector", () => {
@@ -615,8 +661,9 @@ describe("CodexEnvelopeParser end-to-end via extractReferencesFromTranscript (so
 			fnOutput("c_gh", GITHUB, { wrap: "bare", prefix: true }),
 			fnCall("mcp__codex_apps__atlassian_rovo", "_getjiraissue", "c_jira"),
 			fnOutput("c_jira", JIRA_WRAPPED, { wrap: "bare", prefix: false }),
-			// A jira call with no webUrl (bare, via event) must NOT yield a ref.
-			toolCallEnd("atlassian rovo_getjiraissue", "c_jira_nourl", JIRA_BARE_NO_URL),
+			// A dedicated getJiraIssue with only `self` (no webUrl), via the real
+			// `atlassian_rovo.getJiraIssue` event — captured with self mapped to url.
+			toolCallEnd("atlassian_rovo.getJiraIssue", "c_jira_nourl", JIRA_BARE_NO_URL),
 		];
 		writeFileSync(file, `${lines.join("\n")}\n`, "utf-8");
 	});
@@ -639,8 +686,9 @@ describe("CodexEnvelopeParser end-to-end via extractReferencesFromTranscript (so
 		expect(jira?.url).toBe("https://jolli-team-kr0v9z0x.atlassian.net/browse/KAN-4");
 		expect(jira?.title).toBe("My Jira task");
 
-		// The webUrl-less jira event produced no ref.
-		expect(byKey.has("jira:KAN-9")).toBe(false);
+		// The getJiraIssue with only `self` is now captured, with `self` as its url
+		// (the api.atlassian.com endpoint — no browsable link is available).
+		expect(byKey.get("jira:KAN-9")?.url).toBe("https://api.atlassian.com/ex/jira/29e34fb0/rest/api/3/issue/10099");
 	});
 });
 
@@ -747,7 +795,7 @@ describe("CodexEnvelopeParser end-to-end — Jira malformed-output recovery", ()
 		const lines = [
 			fnCall("mcp__codex_apps__atlassian_rovo", "_getjiraissue", "j1"),
 			fnOutputRaw("j1", malformedOutput),
-			toolCallEnd("atlassian rovo_getjiraissue", "j1", {
+			toolCallEnd("atlassian_rovo.getJiraIssue", "j1", {
 				key: "KAN-7",
 				self: "https://api.atlassian.com/ex/jira/x/rest/api/3/issue/10099",
 				versionedRepresentations: { summary: { "1": "Recovered jira summary" } },

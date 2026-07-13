@@ -30,23 +30,28 @@ export const jiraDefinition: SourceDefinition = {
 	icon: "issues",
 	match: {
 		claude: { prefixes: ["mcp__claude_ai_Atlassian__"] },
-		// Codex's built-in "Atlassian Rovo" app has NO dedicated Jira tool: an issue
-		// is fetched through the generic `_fetch` (namespace
-		// `mcp__codex_apps__atlassian_rovo`, invocation `atlassian_rovo.fetch`),
-		// returning a flat `{id,title,text,url,type:"jira-issue",metadata}` envelope
-		// that `CodexJiraBinding` reshapes into `{key,fields,webUrl}`. Verified from a
-		// live rollout (2026-07-12). Confluence's dedicated `_getconfluencepage` is
-		// owned by the confluence def, so that path never collides. KNOWN GAP: the
-		// generic `_fetch` can also fetch a Confluence page (a `confluence-page`
-		// entity); it routes here by tool name, passes through `normalizeJira`
-		// unreshaped (type !== "jira-issue"), and voids on the jira `key`/`summary`
-		// requires — i.e. such a page is DROPPED, not captured as confluence. Proper
-		// per-payload-`type` dispatch of the shared `_fetch` is deferred. `_getjiraissue`
-		// is retained as an UNVERIFIED legacy shape (no real transcript confirms it).
+		// Codex's built-in "Atlassian Rovo" app reaches a Jira issue TWO ways, both
+		// claimed here (namespace `mcp__codex_apps__atlassian_rovo`):
+		//   - Generic `_fetch` (invocation `atlassian_rovo.fetch`) → flat
+		//     `{id,title,text,url,type:"jira-issue",metadata}` envelope, `url`→`webUrl`.
+		//   - Dedicated `getJiraIssue` (function_call `_getjiraissue`, invocation
+		//     `atlassian_rovo.getJiraIssue`) → standard Jira REST issue
+		//     `{key,fields:{summary,…},self}` with NO webUrl (self→webUrl mapped in the
+		//     binding). Both VERIFIED from live rollouts (2026-07-12 / -13). The
+		//     invocation name MUST be the dotted `atlassian_rovo.getJiraIssue`; an
+		//     earlier `"atlassian rovo_getjiraissue"` was a fabricated guess that never
+		//     matched a real event, so getJiraIssue fetches were silently dropped.
+		// Confluence's dedicated `_getconfluencepage` is owned by the confluence def,
+		// so that path never collides. KNOWN GAP: the generic `_fetch` can also fetch a
+		// Confluence page (a `confluence-page` entity); it routes here by tool name,
+		// passes through `normalizeJira` unreshaped (type !== "jira-issue"), and voids
+		// on the jira `key`/`summary` requires — i.e. such a page is DROPPED, not
+		// captured as confluence. Proper per-payload-`type` dispatch of the shared
+		// `_fetch` is deferred.
 		codex: {
 			namespaceSuffix: "atlassian_rovo",
 			functionCallNames: ["_fetch", "_getjiraissue"],
-			invocationTools: ["atlassian_rovo.fetch", "atlassian rovo_getjiraissue"],
+			invocationTools: ["atlassian_rovo.fetch", "atlassian_rovo.getJiraIssue"],
 		},
 	},
 	wrapperKeys: ["nodes", "issues", "items", "results"],
