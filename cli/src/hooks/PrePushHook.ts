@@ -13,7 +13,7 @@
  *   <local-ref> <local-sha> <remote-ref> <remote-sha>
  */
 
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mergeEntries, type PushTarget } from "../core/PushPendingStore.js";
 import { loadConfig } from "../core/SessionTracker.js";
@@ -127,7 +127,13 @@ export async function prePushEntry(cwd: string, stdin: string, remote?: string):
 function isMainScript(): boolean {
 	const argv1 = process.argv[1];
 	if (process.env.VITEST || !argv1) return false;
-	return resolve(argv1) === resolve(fileURLToPath(import.meta.url));
+
+	const resolvedArgv = resolve(argv1);
+	const resolvedScript = resolve(fileURLToPath(import.meta.url));
+	if (resolvedArgv !== resolvedScript) return false;
+
+	const entryName = basename(resolvedArgv).toLowerCase();
+	return entryName === "prepushhook.js" || entryName === "prepushhook.ts";
 }
 
 if (isMainScript()) {

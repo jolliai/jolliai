@@ -83,6 +83,7 @@ import { handleStopHook } from "./StopHook.js";
 function mockStdin(content: string): void {
 	const mockStream = {
 		setEncoding: vi.fn(),
+		destroy: vi.fn(),
 		on: vi.fn((event: string, callback: (...args: unknown[]) => void) => {
 			if (event === "data") {
 				callback(content);
@@ -100,6 +101,7 @@ function mockStdin(content: string): void {
 function mockStdinError(errorMessage: string): void {
 	const mockStream = {
 		setEncoding: vi.fn(),
+		destroy: vi.fn(),
 		on: vi.fn((event: string, callback: (...args: unknown[]) => void) => {
 			if (event === "error") {
 				setTimeout(() => callback(new Error(errorMessage)), 0);
@@ -114,6 +116,7 @@ function mockStdinError(errorMessage: string): void {
 function mockEmptyStdin(): void {
 	const mockStream = {
 		setEncoding: vi.fn(),
+		destroy: vi.fn(),
 		on: vi.fn((event: string, callback: (...args: unknown[]) => void) => {
 			if (event === "end") {
 				setTimeout(() => callback(), 0);
