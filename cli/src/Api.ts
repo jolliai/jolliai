@@ -18,6 +18,7 @@ import { registerDoctorCommand } from "./commands/DoctorCommand.js";
 import { registerDisableCommand, registerEnableCommand } from "./commands/EnableCommand.js";
 import { registerExportCommand, registerExportPromptCommand } from "./commands/ExportCommand.js";
 import { registerGraphCommand } from "./commands/GraphCommand.js";
+import { runGuidedFrontDoor } from "./commands/GuidedFrontDoor.js";
 import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { getHelpGroup } from "./commands/HelpGroups.js";
 import { registerBindCommand, registerPushCommand, registerSpacesCommand } from "./commands/JolliCloudCommands.js";
@@ -385,7 +386,17 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	// check doesn't trigger a second discovery walk on the startup hot path.
 	await checkVersionMismatch({ pluginDiagnostics });
 
+	// Bare `jolli` (no subcommand) on an interactive terminal becomes the guided
+	// front door instead of a help wall. Requires BOTH stdin and stdout to be a
+	// TTY: piped (`jolli | cat`) or CI runs fall through to `parseAsync`, which
+	// prints the grouped help and never blocks or prompts.
+	const userArgs = args ?? process.argv.slice(2);
+	if (userArgs.length === 0 && process.stdin.isTTY === true && process.stdout.isTTY === true) {
+		await runGuidedFrontDoor();
+		return;
+	}
+
 	/* v8 ignore start - process.argv branch only used when running as script, not in tests */
-	await program.parseAsync(args ? ["node", "jolli", ...args] : process.argv);
+	await program.parseAsync(args !== undefined ? ["node", "jolli", ...args] : process.argv);
 	/* v8 ignore stop */
 }

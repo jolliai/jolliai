@@ -31,6 +31,10 @@ const { mockQuestion } = vi.hoisted(() => ({
 	mockQuestion: vi.fn((_q: string, cb: (a: string) => void) => cb("")),
 }));
 
+const { mockRunGuidedFrontDoor } = vi.hoisted(() => ({
+	mockRunGuidedFrontDoor: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("node:child_process", () => ({
 	execFileSync: mockExecFileSync,
 }));
@@ -42,6 +46,10 @@ vi.mock("node:fs", async (importOriginal) => {
 
 vi.mock("node:readline", () => ({
 	createInterface: mockCreateInterface,
+}));
+
+vi.mock("./commands/GuidedFrontDoor.js", () => ({
+	runGuidedFrontDoor: mockRunGuidedFrontDoor,
 }));
 
 vi.mock("./core/SessionTracker.js", () => ({
@@ -333,6 +341,80 @@ describe("CLI", () => {
 		mockCreateInterface.mockReturnValue({
 			question: mockQuestion,
 			close: vi.fn(),
+		});
+	});
+
+	describe("bare `jolli` guided front door", () => {
+		const setTty = (stdin: boolean, stdout: boolean): void => {
+			Object.defineProperty(process.stdin, "isTTY", { value: stdin, configurable: true });
+			Object.defineProperty(process.stdout, "isTTY", { value: stdout, configurable: true });
+		};
+		let priorIn: unknown;
+		let priorOut: unknown;
+
+		beforeEach(() => {
+			priorIn = process.stdin.isTTY;
+			priorOut = process.stdout.isTTY;
+		});
+
+		afterEach(() => {
+			Object.defineProperty(process.stdin, "isTTY", { value: priorIn, configurable: true });
+			Object.defineProperty(process.stdout, "isTTY", { value: priorOut, configurable: true });
+		});
+
+		it("runs the front door with no args when stdin+stdout are TTY", async () => {
+			setTty(true, true);
+			await main([]);
+			expect(mockRunGuidedFrontDoor).toHaveBeenCalledTimes(1);
+		});
+
+		it("does NOT run the front door when stdin is not a TTY", async () => {
+			setTty(false, true);
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main([]);
+			} catch {
+				// bare + non-TTY falls through to parseAsync → grouped help → exit(1)
+			} finally {
+				// It must NOT enter the front door, and it MUST fall through to
+				// parseAsync's help-and-exit path (positive proof of the fallback).
+				expect(mockRunGuidedFrontDoor).not.toHaveBeenCalled();
+				expect(exitSpy).toHaveBeenCalled();
+				exitSpy.mockRestore();
+			}
+		});
+
+		it("does NOT run the front door when stdout is piped (not a TTY)", async () => {
+			setTty(true, false);
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main([]);
+			} catch {
+				// piped stdout falls through to parseAsync → grouped help
+			} finally {
+				expect(mockRunGuidedFrontDoor).not.toHaveBeenCalled();
+				expect(exitSpy).toHaveBeenCalled();
+				exitSpy.mockRestore();
+			}
+		});
+
+		it("does NOT run the front door when a subcommand is given, even on a full TTY", async () => {
+			setTty(true, true);
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main(["--version"]);
+			} catch {
+				// --version prints and exits via commander; never enters the front door
+			} finally {
+				expect(mockRunGuidedFrontDoor).not.toHaveBeenCalled();
+				exitSpy.mockRestore();
+			}
 		});
 	});
 
