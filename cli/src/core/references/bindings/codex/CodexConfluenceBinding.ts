@@ -3,12 +3,15 @@
  * through the "Atlassian Rovo" app's `_getconfluencepage` tool; match identity
  * lives in `confluence`'s `SourceDefinition.match.codex`).
  *
- * Verified from a live rollout (2026-07-12): Rovo's `_getconfluencepage` output
- * is byte-identical in shape to Claude's `getConfluencePage` — the same
- * `{ content: { nodes: [ node ] } }` wrapper with `id` / `title` / `webUrl` /
- * `space` / `author` / `body`. So `normalize` is just `normalizeConfluence`, the
- * exact function the Claude path already runs (see `ClaudeEnvelopeParser`'s
- * context-normalizer registry); no Rovo-specific reshaping is needed.
+ * Verified from live rollouts (2026-07): Rovo's `_getconfluencepage` result is
+ * the full MCP CallToolResult, and the Codex envelope layer extracts its
+ * `content[0].text` — which is a FLAT page node (`id` / `title` / `webUrl` /
+ * `body` / `spaceId` / `authorId`), NOT Claude's `{ content: { nodes: [ node ] } }`
+ * wrapper. That wrapped twin exists only in the sibling `structuredContent`, which
+ * the envelope discards. `normalizeConfluence` now accepts BOTH shapes, so this
+ * binding still reuses it verbatim — but the two paths are NOT byte-identical, and
+ * the flat node has no `space` / `author` objects (only IDs), so those fields come
+ * back undefined here.
  */
 
 import { normalizeConfluence } from "../../sources/ConfluenceNormalize.js";

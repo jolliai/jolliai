@@ -2,7 +2,7 @@
  * CodexJiraBinding — Jira `codex_apps` connector normalizer (match identity lives
  * in `jira`'s `SourceDefinition.match.codex`).
  *
- * Two payload shapes are handled, both reshaped into the `{ key, fields, webUrl }`
+ * Three payload shapes are handled, all reshaped into the `{ key, fields, webUrl }`
  * the jira `SourceDefinition` reads:
  *
  *   1. Generic `_fetch` entity envelope (VERIFIED from a live "Atlassian Rovo"
@@ -17,12 +17,20 @@
  *      envelope (only `cloudId` is present), so it is kept as-is rather than
  *      voiding the otherwise-useful reference. `type:"jira-issue"` gates this branch.
  *
- *   2. `{ issues: { nodes: [ node ] } }` with per-node field VALUES under
+ *   2. Dedicated `getJiraIssue` REST issue (VERIFIED from a live rollout,
+ *      2026-07-13): the standard Jira REST v3 object `{ id, self, key, fields:{
+ *      summary, status:{name}, priority:{name}, description, labels, … } }`. It is
+ *      already `{key, fields}`-shaped, so `reshapeJiraNode` leaves fields alone —
+ *      but it has NO top-level `webUrl`, only `self` (the api.atlassian.com REST
+ *      endpoint), so {@link withWebUrlFromSelf} maps `self`→`webUrl` (same api-URL
+ *      tradeoff as shape 1). Without that the whole reference voided on the def's
+ *      `url` require — the bug this binding was extended to fix.
+ *
+ *   3. `{ issues: { nodes: [ node ] } }` with per-node field VALUES under
  *      `versionedRepresentations` (`{ "<version>": <value> }`; `summary` a string,
- *      `description` an ADF document). UNVERIFIED legacy shape retained pending a
- *      real transcript — `normalize` derives `fields.summary`/`description` (ADF →
- *      markdown), and `recover` (NOT the main path) handles its malformed-output
- *      edge (see below).
+ *      `description` an ADF document). Retained for the heavy-`expand` variant —
+ *      `normalize` derives `fields.summary`/`description` (ADF → markdown), and
+ *      `recover` (NOT the main path) handles its malformed-output edge (see below).
  */
 
 import { adfToText } from "../../sources/AdfToText.js";
@@ -96,9 +104,26 @@ function reshapeFetchEnvelope(env: { [key: string]: unknown }): unknown {
 	};
 }
 
+/**
+ * Ensure a `webUrl` for the def's `url` require. The dedicated `getJiraIssue`
+ * returns the standard Jira REST issue with NO top-level `webUrl` — only `self`,
+ * the `api.atlassian.com/…/rest/api/3/issue/<id>` endpoint (verified from a live
+ * Rovo rollout, 2026-07-13). Fall back `self` → `webUrl` so the issue is captured
+ * rather than voided; like the generic `_fetch` path this keeps the non-browsable
+ * api URL, since the tenant site name needed for a `/browse/<KEY>` link is absent
+ * from the payload. Returns the input unchanged when a `webUrl` is already present
+ * (so a real browse link always wins) or when there is no `self` to borrow.
+ */
+function withWebUrlFromSelf(node: { [key: string]: unknown }): { [key: string]: unknown } {
+	if (typeof node.webUrl === "string" && node.webUrl.length > 0) return node;
+	if (typeof node.self === "string" && node.self.length > 0) return { ...node, webUrl: node.self };
+	return node;
+}
+
 /** Reshape one Jira node so the adapter's `fields.summary` (+ description) is present. */
-function reshapeJiraNode(node: unknown): unknown {
-	if (!isObject(node)) return node;
+function reshapeJiraNode(rawNode: unknown): unknown {
+	if (!isObject(rawNode)) return rawNode;
+	const node = withWebUrlFromSelf(rawNode);
 	const existing = isObject(node.fields) ? node.fields : undefined;
 	// Already adapter-shaped (Claude / a future fields-bearing payload): leave it.
 	if (existing !== undefined && typeof existing.summary === "string" && existing.summary.length > 0) return node;
