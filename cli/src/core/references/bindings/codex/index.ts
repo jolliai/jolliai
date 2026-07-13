@@ -15,6 +15,7 @@ import { githubCodexBinding } from "./CodexGitHubBinding.js";
 import { jiraCodexBinding } from "./CodexJiraBinding.js";
 import { linearCodexBinding } from "./CodexLinearBinding.js";
 import { notionCodexBinding } from "./CodexNotionBinding.js";
+import { zoomMeetingCodexBinding } from "./CodexZoomMeetingBinding.js";
 
 /** `mcp__codex_apps__` — the shared connector namespace prefix for all sources. */
 export const CODEX_APPS_NAMESPACE_PREFIX = "mcp__codex_apps__";
@@ -24,6 +25,7 @@ const CODEX_NORMALIZERS: readonly CodexNormalizer[] = [
 	notionCodexBinding,
 	githubCodexBinding,
 	jiraCodexBinding,
+	zoomMeetingCodexBinding,
 ];
 
 const BY_ID: ReadonlyMap<SourceId, CodexNormalizer> = new Map(CODEX_NORMALIZERS.map((n) => [n.id, n]));

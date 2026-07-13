@@ -134,6 +134,31 @@ const GITHUB_SEARCH = {
 		},
 	],
 };
+// Real `codex_apps/zoom._get_meeting_assets` shape (2026-07-13 rollout): the
+// business payload is a single meeting object identical to the Claude
+// get_meeting_assets result, read directly by the zoom-meeting definition.
+const ZOOM_MEETING = {
+	from_server: true,
+	meeting_uuid: "CB9D57D1-D6B0-4ECC-A6C2-E00449DF9B8D",
+	meeting_number: 98668434129,
+	topic: "US/China sync meeting",
+	start_time: "2026-07-09T01:30:00Z",
+	end_time: "2026-07-09T02:00:00Z",
+	deep_url: "https://jolli.zoom.us/launch/edl?muid=b69e8f55-b001-420f-a02d-ba19b3bc9416",
+	meeting_category: "history",
+	meeting_summary: {
+		summary_plain_text: "Quick recap ...",
+		summary_markdown: "## Quick recap\n\nThe team reviewed the 1.0 release plan.",
+		summary_doc_url: "https://docs.zoom.us/doc/BL6P4Z-qRv-5Tpj3svUONw",
+		has_permission: true,
+		has_summary: true,
+	},
+	meeting_transcript: {
+		primary_language: "en",
+		transcript_items: [{ start: "00:01:58.000", text: "Hi", end: "00:01:59.000" }],
+	},
+	my_notes: { has_my_notes: false },
+};
 
 describe("CodexEnvelopeParser.parse", () => {
 	it("emits one NormalizedToolResult per source via the PRIMARY function_call pair, with canonical toolName + matched adapter", () => {
@@ -558,6 +583,69 @@ describe("CodexEnvelopeParser end-to-end via extractReferencesFromTranscript (so
 
 		// The webUrl-less jira event produced no ref.
 		expect(byKey.has("jira:KAN-9")).toBe(false);
+	});
+});
+
+describe("CodexEnvelopeParser — Zoom meeting connector", () => {
+	it("emits a zoom-meeting ref via the PRIMARY function_call pair (identity normalize)", () => {
+		const lines = [
+			fnCall("mcp__codex_apps__zoom", "_get_meeting_assets", "c_zoom"),
+			fnOutput("c_zoom", ZOOM_MEETING, { wrap: "bare", prefix: true }),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("zoom-meeting");
+		expect(results[0].toolName).toBe("mcp__claude_ai_Zoom_for_Claude__get_meeting_assets");
+	});
+
+	it("recovers a zoom-meeting ref from the mcp_tool_call_end event when the output is malformed", () => {
+		// Real 2026-07-13 case: on a long meeting the function_call_output is invalid
+		// JSON (a bad escape mid-transcript), but the paired event carries a complete,
+		// valid copy that already includes the URLs — no `recover` hook is needed.
+		const lines = [
+			fnCall("mcp__codex_apps__zoom", "_get_meeting_assets", "c_zoom_bad"),
+			fnOutputRaw("c_zoom_bad", `Wall time: 10.06s\nOutput:\n{"topic":"US/China sync",bad json`),
+			toolCallEnd("zoom.get_meeting_assets", "c_zoom_bad", ZOOM_MEETING),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("zoom-meeting");
+	});
+
+	it("ignores zoom enumeration / recording-resource connector calls", () => {
+		const lines = [
+			fnCall("mcp__codex_apps__zoom", "_search_meetings", "c_zsearch"),
+			fnOutput("c_zsearch", { meetings: [] }, { wrap: "bare", prefix: true }),
+			fnCall("mcp__codex_apps__zoom", "_get_recording_resource", "c_zrec"),
+			fnOutput("c_zrec", { recording: {} }, { wrap: "bare", prefix: true }),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(0);
+	});
+});
+
+describe("CodexEnvelopeParser end-to-end — Zoom meeting fallback path via extractReferencesFromTranscript", () => {
+	let dir: string;
+	let file: string;
+	beforeAll(() => {
+		dir = mkdtempSync(join(tmpdir(), "codex-zoom-"));
+		file = join(dir, "rollout.jsonl");
+		const lines = [
+			fnCall("mcp__codex_apps__zoom", "_get_meeting_assets", "c_zoom_e2e"),
+			fnOutputRaw("c_zoom_e2e", `Wall time: 10.06s\nOutput:\n{"topic":"US/China sync",bad json`),
+			toolCallEnd("zoom.get_meeting_assets", "c_zoom_e2e", ZOOM_MEETING),
+		];
+		writeFileSync(file, `${lines.join("\n")}\n`, "utf-8");
+	});
+	afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+	it("extracts the meeting ref (title, summary-doc url, mapKey) through the unchanged definition", async () => {
+		const { references } = await extractReferencesFromTranscript(file, { source: "codex" });
+		const zoom = references.find((r) => r.mapKey === "zoom-meeting:CB9D57D1-D6B0-4ECC-A6C2-E00449DF9B8D");
+		expect(zoom).toBeDefined();
+		expect(zoom?.title).toBe("US/China sync meeting");
+		expect(zoom?.url).toBe("https://docs.zoom.us/doc/BL6P4Z-qRv-5Tpj3svUONw");
+		expect(zoom?.description).toContain("Quick recap");
 	});
 });
 
