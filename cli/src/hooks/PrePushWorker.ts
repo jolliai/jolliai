@@ -9,7 +9,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { processPushPending } from "../core/PushExecutor.js";
 import { getCurrentTraceId, runWithTrace, TRACE_ID_ENV, traceIdFromEnv } from "../core/TraceContext.js";
@@ -61,7 +61,18 @@ export function launchPrePushWorker(cwd: string): void {
 function isMainScript(): boolean {
 	const argv1 = process.argv[1];
 	if (process.env.VITEST || !argv1) return false;
-	return resolve(argv1) === resolve(fileURLToPath(import.meta.url));
+
+	const resolvedArgv = resolve(argv1);
+	const resolvedScript = resolve(fileURLToPath(import.meta.url));
+	if (resolvedArgv !== resolvedScript) return false;
+
+	// Only auto-run when the entrypoint itself is PrePushWorker.
+	// esbuild (CJS, no code splitting) inlines this module into PrePushHook.js,
+	// where import.meta.url is aliased to the same __jmImportMetaUrl — without
+	// the basename check both guards fire and PushExecutor runs in-process,
+	// blocking git push. Same pattern as QueueWorker/PostCommitHook.
+	const entryName = basename(resolvedArgv).toLowerCase();
+	return entryName === "prepushworker.js" || entryName === "prepushworker.ts";
 }
 
 if (isMainScript()) {
