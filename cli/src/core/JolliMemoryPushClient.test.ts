@@ -143,6 +143,104 @@ describe("createBinding", () => {
 	});
 });
 
+describe("frontDoor", () => {
+	const args = { repoUrl: "https://github.com/o/r", repoName: "r" };
+
+	it("POSTs the repo identity to /api/jolli-memory/front-door", async () => {
+		let capturedUrl: string | undefined;
+		let capturedInit: RequestInit | undefined;
+		const c = client(async (url, init) => {
+			capturedUrl = String(url);
+			capturedInit = init;
+			return jsonResponse(200, { status: "no_spaces" });
+		});
+		await c.frontDoor(args);
+		expect(capturedUrl).toBe("https://jolli.ai/api/jolli-memory/front-door");
+		expect(capturedInit?.method).toBe("POST");
+		expect(JSON.parse(String(capturedInit?.body))).toEqual(args);
+	});
+	it("returns bound with the space name", async () => {
+		const c = client(async () =>
+			jsonResponse(200, { status: "bound", binding: { jmSpaceId: 7, spaceName: "Eng" } }),
+		);
+		await expect(c.frontDoor(args)).resolves.toEqual({
+			status: "bound",
+			binding: { jmSpaceId: 7, spaceName: "Eng" },
+		});
+	});
+	it("coalesces missing bound Space details to null", async () => {
+		const c = client(async () => jsonResponse(200, { status: "bound", binding: {} }));
+		await expect(c.frontDoor(args)).resolves.toEqual({
+			status: "bound",
+			binding: { jmSpaceId: null, spaceName: null },
+		});
+	});
+	it("accepts explicit null Space details on a bound response", async () => {
+		const c = client(async () =>
+			jsonResponse(200, { status: "bound", binding: { jmSpaceId: null, spaceName: null } }),
+		);
+		await expect(c.frontDoor(args)).resolves.toEqual({
+			status: "bound",
+			binding: { jmSpaceId: null, spaceName: null },
+		});
+	});
+	it("coalesces a missing spaceName to null when the Space id is visible", async () => {
+		const c = client(async () => jsonResponse(200, { status: "bound", binding: { jmSpaceId: 7 } }));
+		await expect(c.frontDoor(args)).resolves.toEqual({
+			status: "bound",
+			binding: { jmSpaceId: 7, spaceName: null },
+		});
+	});
+	it("returns unbound with the space list and defaultSpaceId", async () => {
+		const c = client(async () =>
+			jsonResponse(200, {
+				status: "unbound",
+				spaces: [{ id: 1, name: "Eng", slug: "eng" }],
+				defaultSpaceId: 1,
+			}),
+		);
+		await expect(c.frontDoor(args)).resolves.toEqual({
+			status: "unbound",
+			spaces: [{ id: 1, name: "Eng", slug: "eng" }],
+			defaultSpaceId: 1,
+		});
+	});
+	it("defaults spaces to [] and defaultSpaceId to null on a sparse unbound body", async () => {
+		const c = client(async () => jsonResponse(200, { status: "unbound" }));
+		await expect(c.frontDoor(args)).resolves.toEqual({ status: "unbound", spaces: [], defaultSpaceId: null });
+	});
+	it("returns no_spaces", async () => {
+		const c = client(async () => jsonResponse(200, { status: "no_spaces" }));
+		await expect(c.frontDoor(args)).resolves.toEqual({ status: "no_spaces" });
+	});
+	it("maps 426 to ClientOutdatedError", async () => {
+		const c = client(async () => jsonResponse(426, { error: "client_outdated" }));
+		await expect(c.frontDoor(args)).rejects.toBeInstanceOf(ClientOutdatedError);
+	});
+	it("maps 401/403 to NotAuthenticatedError", async () => {
+		const c401 = client(async () => jsonResponse(401, { error: "unauthorized" }));
+		await expect(c401.frontDoor(args)).rejects.toBeInstanceOf(NotAuthenticatedError);
+		const c403 = client(async () => jsonResponse(403, { error: "forbidden" }));
+		await expect(c403.frontDoor(args)).rejects.toBeInstanceOf(NotAuthenticatedError);
+	});
+	it("throws a plain Error on a generic non-2xx", async () => {
+		const c = client(async () => jsonResponse(500, { error: "boom" }));
+		await expect(c.frontDoor(args)).rejects.toThrow("boom");
+	});
+	it("throws on a 2xx response with a non-JSON body instead of misreading the repo state", async () => {
+		const c = client(async () => textResponse(200, "<html>200 OK</html>"));
+		await expect(c.frontDoor(args)).rejects.toThrow(/Malformed/);
+	});
+	it("throws on a 2xx body with an unrecognized status", async () => {
+		const c = client(async () => jsonResponse(200, { status: "??" }));
+		await expect(c.frontDoor(args)).rejects.toThrow(/Unexpected front-door response shape/);
+	});
+	it("throws on a bound body whose binding object is missing", async () => {
+		const c = client(async () => jsonResponse(200, { status: "bound" }));
+		await expect(c.frontDoor(args)).rejects.toThrow(/Unexpected front-door response shape/);
+	});
+});
+
 describe("header plumbing", () => {
 	it("sends Bearer auth, x-jolli-client, x-org-slug, and resolves base URL from keyMeta.u", async () => {
 		// Realistic key: meta segment base64url-decodes to JSON {t,u,o}; secret segment after the dot.

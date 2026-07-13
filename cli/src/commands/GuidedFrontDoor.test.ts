@@ -109,6 +109,25 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).toContain("last memory saved");
 	});
 
+	it("waits for Space sync before retrying pending pushes", async () => {
+		let completeSpaceSync!: () => void;
+		h.runSpaceSyncStep.mockImplementationOnce(
+			() =>
+				new Promise<void>((resolve) => {
+					completeSpaceSync = resolve;
+				}),
+		);
+
+		const frontDoor = runGuidedFrontDoor();
+		await vi.waitFor(() => expect(h.runSpaceSyncStep).toHaveBeenCalledWith("/repo"));
+		expect(h.triggerPendingPushRetry).not.toHaveBeenCalled();
+
+		completeSpaceSync();
+		await frontDoor;
+
+		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo");
+	});
+
 	it("no credential → runs promptSetup", async () => {
 		h.loadAuthToken.mockResolvedValue(undefined);
 		h.loadConfig.mockResolvedValue({});

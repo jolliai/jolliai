@@ -124,12 +124,13 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	}
 	console.log(`  ✓ enabled · ${summaryCount} ${summaryCount === 1 ? "memory" : "memories"}`);
 
-	// ── Cloud sync + push catch-up: whenever enabled. triggerPendingPushRetry is
-	// idempotent and no-ops when not signed in, so a returning user who just
-	// signed in still gets their backlog pushed (matches `jolli enable`). ──
+	// ── Cloud sync + push catch-up: whenever enabled. Resolve or create the repo
+	// binding before retrying pending pushes so the first retry cannot race ahead
+	// and fail with `binding_required`. The retry remains fire-and-forget after
+	// setup and no-ops when not signed in. ──
 	if (enabled) {
-		void triggerPendingPushRetry(cwd);
 		await runSpaceSyncStep(cwd);
+		void triggerPendingPushRetry(cwd);
 	}
 
 	// ── Confirmation: only promise "listening" when memories can be generated ──
