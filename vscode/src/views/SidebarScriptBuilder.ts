@@ -2804,6 +2804,47 @@ export function buildSidebarScript(): string {
     return kids;
   }
 
+  // Appends the AI soft-exclude "why" block to an already-built hover-card
+  // kids array, IF this row was ranked Low by the Review panel. Shared by all
+  // three branch-row cards (plan / note / reference) so the reason surfaces
+  // identically wherever a CONTEXT row lives — extracting it also keeps the
+  // three call sites in lockstep (the previous native title= carried this and
+  // collided with the card's own popover; the card is now the sole surface).
+  // Reads aiExcludedIds / aiReasonById at CALL time (mouseover), not attach
+  // time, so the block follows the current overlay: a row the user has added
+  // back (or whose ranking was cleared by a file-selection change) simply
+  // stops rendering it on the next hover — no explicit "restore" step, unlike
+  // the static title= it replaces. Call after the kids' own content but before
+  // the hc-actions row so the note reads as a footnote above the actions.
+  //
+  // Structure + class names deliberately mirror the Review panel's
+  // buildExcludedRow (.ctx-rel > .ctx-tier--ex "Excluded" chip + .ai-say
+  // sparkle reason, SummaryHtmlBuilder.ts): a soft-excluded item reads
+  // identically whether the user sees it here (live sidebar) or there
+  // (committed-memory review), and the sidebar CSS mirrors those same rules.
+  function appendAiReasonRow(kids, rowId) {
+    if (!aiExcludedIds.has(rowId)) return;
+    const reason = aiReasonById[rowId];
+    if (!reason) return;
+    // Two stacked rows (the sidebar card is narrow): the "Excluded" chip on its
+    // own line, then the reason below. The reason is prefixed with the U+2728
+    // sparkles EMOJI (not codicon-sparkle) to match the Review panel's
+    // buildExcludedRow verbatim — the emoji keeps its native multi-colour glyph
+    // instead of being tinted a flat purple like a codicon would be.
+    kids.push(el('div', { className: 'hc-row hc-ai-exclude' }, [
+      attachTextTip(
+        el('span', { className: 'ctx-tier ctx-tier--ex', text: 'Excluded' }),
+        'AI marked unrelated — excluded from the next memory',
+      ),
+    ]));
+    kids.push(el('div', { className: 'ai-say', text: '✨ ' + reason }));
+    // Trailing rule so the reason reads as a self-contained block between two
+    // hr's (the caller already pushed one above it) rather than crowding the
+    // hc-actions link directly below. Lives inside this fn so it only appears
+    // when a reason was actually rendered — a normal row keeps its single hr.
+    kids.push(el('hr'));
+  }
+
   // Renders the .hover-card body for a Plan row. Same shape as the Memories
   // card (hc-title + hc-row stack + hc-actions) so the shared popover element
   // and CSS work unchanged. Action set differs by committed/uncommitted state:
@@ -2854,6 +2895,7 @@ export function buildSidebarScript(): string {
       ]),
       'Open plan',
     ));
+    appendAiReasonRow(kids, slug);
     kids.push(el('div', { className: 'hc-actions' }, actions));
     return kids;
   }
@@ -2913,6 +2955,7 @@ export function buildSidebarScript(): string {
       ]),
       'Open note',
     ));
+    appendAiReasonRow(kids, noteId);
     kids.push(el('div', { className: 'hc-actions' }, actions));
     return kids;
   }
@@ -2963,6 +3006,7 @@ export function buildSidebarScript(): string {
       ]),
       openLabel,
     );
+    appendAiReasonRow(kids, mapKey);
     kids.push(el('div', { className: 'hc-actions' }, [openLink]));
     return kids;
   }
@@ -4311,11 +4355,11 @@ export function buildSidebarScript(): string {
     // popover (plan / note / reference — see the tabContents.branch mouseover
     // handler). A title= would surface a duplicate native tooltip showing the
     // MarkdownString-source plain text, and worse it would trigger on a
-    // different timer than the card so the two tooltips would compete.
-    // Exception: an AI-excluded row carries the AI's one-line reason as its
-    // native tooltip — the sidebar shows no tier chips / inline notes, so this
-    // is the only place the "why" surfaces. The row is dimmed and struck, so the
-    // occasional overlap with the hover-card reads acceptably.
+    // different timer than the card so the two tooltips would compete. This
+    // includes AI-excluded rows: the AI's one-line "why" now rides INSIDE the
+    // hover card (appendAiReasonRow), so no row needs a native title. Keeping
+    // the old title= exception here re-created exactly the double-tooltip the
+    // card was meant to avoid.
     return el('div', {
       className: 'tree-node tree-node--hover-actions'
         + (item.isSelected ? '' : ' excluded')
@@ -4323,7 +4367,6 @@ export function buildSidebarScript(): string {
       'data-indent': String(depth),
       'data-context': item.contextValue || '',
       'data-id': item.id,
-      title: aiEx ? (aiReasonById[item.id] || null) : null,
     }, kids);
   }
 
@@ -5634,7 +5677,10 @@ export function buildSidebarScript(): string {
         // entry's dismissed-flag via dismissAiExclusion — the AI's verdict is
         // kept — so the worker's fingerprint reuse honors the veto).
         row.classList.remove('ai-excluded');
-        row.removeAttribute('title');
+        // No row.removeAttribute('title') needed: AI-excluded rows no longer
+        // carry a native title (the reason moved into the hover card via
+        // appendAiReasonRow). Clearing aiExcludedIds/aiReasonById below is what
+        // makes the next hover drop the reason block.
         const id = row.getAttribute('data-id');
         aiExcludedIds.delete(id);
         delete aiReasonById[id];

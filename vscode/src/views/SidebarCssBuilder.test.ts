@@ -83,6 +83,24 @@ describe("SidebarCssBuilder", () => {
 		expect(css).toMatch(/\.iconbtn--sm\s+\.codicon\s*{[^}]*font-size:\s*12px/);
 	});
 
+	it("styles the AI soft-exclude reason inside the hover card, mirroring the Review panel's Excluded chip + sparkle reason", () => {
+		// appendAiReasonRow renders .ctx-rel > .ctx-tier--ex "Excluded" chip +
+		// .ai-say sparkle reason inside the hover card (replacing the old native
+		// title= that collided with the card). Class names + colours match the
+		// Review panel's buildExcludedRow so a soft-excluded item reads the same
+		// in the live sidebar and the committed-memory review.
+		const css = buildSidebarCss();
+		// Pill chip with the same neutral/dim treatment as SummaryCssBuilder.
+		expect(css).toContain(".hover-card .ctx-tier--ex");
+		expect(css).toMatch(
+			/\.hover-card\s+\.ctx-tier--ex\s*{[^}]*background:\s*var\(--vscode-toolbar-hoverBackground\)/,
+		);
+		expect(css).toMatch(/\.hover-card\s+\.ctx-tier\s*{[^}]*border-radius:\s*10px/);
+		// Reason in the shared sparkle-purple, with a dark-theme override.
+		expect(css).toMatch(/\.hover-card\s+\.ai-say\s*{[^}]*color:\s*#8a63d2/);
+		expect(css).toContain("body.vscode-dark .hover-card .ai-say");
+	});
+
 	it("bolds repo nodes (no longer has the dead repo-root banner styling)", () => {
 		// There's no Memory Bank header / banner row — repos sit at the top of
 		// the tree directly. The only surviving repo-level cue is

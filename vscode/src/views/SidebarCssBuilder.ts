@@ -1423,6 +1423,34 @@ export function buildSidebarCss(): string {
   }
   .hover-card .hc-row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
   .hover-card .hc-row .codicon { color: var(--vscode-icon-foreground); flex-shrink: 0; }
+  /* AI soft-exclude reason (appendAiReasonRow). Colours + the .ctx-tier--ex /
+     .ai-say class names mirror the Review panel's buildExcludedRow
+     (SummaryCssBuilder.ts) so a soft-excluded item reads identically in the
+     live sidebar and the committed-memory review. The sidebar card is narrow,
+     so unlike the Review panel's single .ctx-rel line these stack: the pill
+     "Excluded" chip on its own row, then the reason below in the shared
+     sparkle-purple, wrapping (not clipping) a sentence-length note. */
+  .hover-card .hc-row.hc-ai-exclude { margin-top: 4px; }
+  .hover-card .ctx-tier {
+    flex-shrink: 0;
+    font-size: 10px;
+    font-weight: 650;
+    letter-spacing: 0.02em;
+    padding: 1px 7px;
+    border-radius: 10px;
+  }
+  .hover-card .ctx-tier--ex {
+    background: var(--vscode-toolbar-hoverBackground);
+    color: var(--vscode-disabledForeground, var(--vscode-descriptionForeground));
+  }
+  .hover-card .ai-say {
+    margin-top: 2px;
+    font-size: 11px;
+    color: #8a63d2;
+    word-break: break-word;
+  }
+  body.vscode-dark .hover-card .ai-say,
+  body.vscode-high-contrast .hover-card .ai-say { color: #a99cf0; }
   .hover-card hr {
     border: none;
     border-top: 1px solid var(--vscode-editorHoverWidget-border);
