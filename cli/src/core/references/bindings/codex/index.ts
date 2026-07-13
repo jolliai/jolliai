@@ -10,6 +10,7 @@
  */
 
 import type { SourceId } from "../../../../Types.js";
+import { asanaCodexBinding } from "./CodexAsanaBinding.js";
 import type { CodexNormalizer } from "./CodexBinding.js";
 import { confluenceCodexBinding } from "./CodexConfluenceBinding.js";
 import { githubCodexBinding } from "./CodexGitHubBinding.js";
@@ -28,6 +29,7 @@ const CODEX_NORMALIZERS: readonly CodexNormalizer[] = [
 	jiraCodexBinding,
 	zoomMeetingCodexBinding,
 	confluenceCodexBinding,
+	asanaCodexBinding,
 ];
 
 const BY_ID: ReadonlyMap<SourceId, CodexNormalizer> = new Map(CODEX_NORMALIZERS.map((n) => [n.id, n]));

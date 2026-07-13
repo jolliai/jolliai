@@ -13,12 +13,22 @@
  * so only a constant entity-type and the assignee's name (an object subpath)
  * are surfaced.
  *
- * Claude-only: no Codex connector exposes Asana today, so no `match.codex`.
+ * Codex: the `codex_apps` Asana connector's `get_task` produces the SAME
+ * `{ data: { …task… } }` shape (verified against a real rollout — function_call
+ * `name="_get_task"` under namespace `mcp__codex_apps__asana`; invocation
+ * `asana.get_task`; the `function_call_output` unwraps to the identical task
+ * object), so no reshaping is needed — see `CodexAsanaBinding` (identity
+ * normalize). `match.codex` mirrors `notion.ts`: the dotted `invocationTool`
+ * value (`asana.get_task`) is taken verbatim from the rollout, not guessed.
  */
 
 import type { SourceDefinition } from "../../SourceDefinition.js";
 
-/** Asana web host — task permalinks are always under app.asana.com. */
+/**
+ * Asana web host — task permalinks are always under app.asana.com. Matched
+ * case-insensitively (`requireFlags: "i"`, mirroring `notion.ts`): URL hosts are
+ * case-insensitive, so a mixed-case host must not silently void the reference.
+ */
 const ASANA_URL = "^https://app\\.asana\\.com/";
 
 export const asanaDefinition: SourceDefinition = {
@@ -27,12 +37,13 @@ export const asanaDefinition: SourceDefinition = {
 	icon: "checklist",
 	match: {
 		claude: { prefixes: ["mcp__claude_ai_Asana__"], acceptSuffix: "get_task" },
+		codex: { namespaceSuffix: "asana", functionCallNames: ["_get_task"], invocationTools: ["asana.get_task"] },
 	},
 	wrapperKeys: ["data"],
 	reference: {
 		nativeId: { pipe: [{ op: "path", path: "gid" }], require: "^\\d+$" },
 		title: { pipe: [{ op: "path", path: "name" }], require: ".+" },
-		url: { pipe: [{ op: "path", path: "permalink_url" }], require: ASANA_URL },
+		url: { pipe: [{ op: "path", path: "permalink_url" }], require: ASANA_URL, requireFlags: "i" },
 		description: { pipe: [{ op: "path", path: "notes" }], optional: true },
 	},
 	fields: [

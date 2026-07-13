@@ -7,33 +7,29 @@
 ## Summary
 
 Add Asana as a built-in reference-extraction source so that when a user's Claude
-Code session calls the Asana MCP connector's `get_task` tool, the referenced task
-(title, notes, URL) is captured as a Jolli reference — exactly like the existing
-Linear / Jira / GitHub / Notion / Zoom sources.
+Code **or Codex** session calls the Asana connector's `get_task` tool, the
+referenced task (title, notes, URL) is captured as a Jolli reference — exactly
+like the existing Linear / Jira / GitHub / Notion / Zoom sources.
 
-This is a **declarative `SourceDefinition`** addition. It follows the
-`zoom-doc` template (the most recently added source) end-to-end. No changes to
+This is a **declarative `SourceDefinition`** addition. The Claude half follows the
+`zoom-doc` template end-to-end; the Codex half adds a `match.codex` block plus an
+identity `CodexAsanaBinding` (mirroring `CodexNotionBinding`). No changes to
 `SourceEngine`, the envelope parsers, or the DSL vocabulary are required.
 
 ## Scope decisions
 
-Two scope questions were resolved with the requester before design:
+1. **Claude Code first, then Codex (both now shipped).**
+   The task text names "Claude Code and Codex". The Claude half shipped first
+   (commit 11734a5c). Codex was **initially deferred** because at design time no
+   Asana connector existed on disk and the prior precedent (the Codex Rovo Jira
+   matcher was hallucinated and never matched; JOLLI-1921 shipped only the
+   verified Linear half) forbids shipping a guessed `match.codex` block.
 
-1. **Claude Code only this round; Codex deferred.**
-   The task text names "Claude Code and Codex", but the Codex half has **no
-   truth source** and cannot get one right now:
-   - `~/.codex/config.toml` has no Asana MCP server.
-   - The real Codex MCP tools observed in on-disk rollouts are `codex_apps` →
-     `atlassian_rovo.*` and `notion.fetch` — **no Asana**.
-   - Codex itself, in a rollout, stated it had no Asana connection capability.
-
-   Per prior precedent (the Codex Rovo Jira matcher was hallucinated and never
-   matched; JOLLI-1921 shipped only the verified Linear half), we do **not**
-   ship an unverified `match.codex` block. Shipping a guessed Codex matcher
-   produces dead code, not working coverage.
-
-   **Codex is recorded as a follow-up** (see "Deferred: Codex" below) with an
-   explicit precondition: a real `codex_apps` Asana rollout captured on disk.
+   **That precondition is now met.** The machine has the `openai-curated-remote`
+   Asana plugin (`~/.codex/plugins/cache/.../asana/7.0.0/`) installed, and a real
+   rollout captured a live `get_task` call. The Codex half is implemented against
+   that real rollout — see "Codex support" below. No value in `match.codex` is
+   guessed; every field is transcribed from the on-disk envelope.
 
 2. **Task entity only (`get_task`).**
    Asana projects and other entities are out of scope. Only single-task fetches
@@ -69,6 +65,7 @@ id:      "asana"
 label:   "Asana"
 icon:    "checklist"           // codicon; finalize in TDD
 match.claude: { prefixes: ["mcp__claude_ai_Asana__"], acceptSuffix: "get_task" }
+match.codex:  { namespaceSuffix: "asana", functionCallNames: ["_get_task"], invocationTools: ["asana.get_task"] }
 wrapperKeys: ["data"]          // descends {data:{task}}; also iterates {data:[...]}
 reference:
   nativeId:    path "gid"            require ^\d+$
@@ -142,21 +139,68 @@ Verified against the current subsystem. Ordering downstream (`CLAUDE_TOOL_PREFIX
 - `npm run all` must pass (CLI 97% coverage floor). New code is a data literal +
   tests, so coverage is met by the definition test exercising every field/require.
 
-## Deferred: Codex
+## Codex support
 
-Not implemented this round. Preconditions to add it later:
+### Observed Reality (real rollout, not a fixture)
 
-1. A real Codex rollout on disk showing an Asana call under the `codex_apps`
-   server — the exact `server`/`tool` naming (e.g. `asana.get_task` vs
-   `asana.fetch`) must be read from that rollout, not guessed.
-2. Then add a `match.codex` block to `asanaDefinition` and a
-   `CodexAsanaBinding` (identity normalize, mirroring `CodexNotionBinding.ts`),
-   registered in `bindings/codex/index.ts` `CODEX_NORMALIZERS`, plus a
-   `CodexEnvelopeParser.test.ts` case built from the real rollout JSONL.
+Captured from `~/.codex/sessions/2026/07/12/rollout-…T20-21-42-…019f5646….jsonl`,
+where the user asked Codex to capture an Asana task URL and it called `get_task`.
+The connector spans the standard three `codex_apps` line types:
+
+- **`function_call`** (request): `name: "_get_task"`,
+  `namespace: "mcp__codex_apps__asana"`, `arguments` a JSON string.
+- **`mcp_tool_call_end`** (event): `invocation.server: "codex_apps"`,
+  `invocation.tool: "asana.get_task"` — **dotted**, taken verbatim (contrast the
+  Notion connector's underscore `notion_fetch`; the tool name is the connector's
+  own, not a normalized form). `result.Ok.content[0].text` and
+  `result.Ok.structuredContent.data` both carry the task.
+- **`function_call_output`** (result): `output` is
+  `"Wall time: …\nOutput:\n{\"data\":{…}}"`. After the parser strips the prefix
+  the payload is `{ data: { gid, name, notes, permalink_url, assignee, … } }` —
+  **byte-identical to the Claude Asana MCP shape.**
+
+The full Asana Codex tool surface (namespace `codex_apps__asana`, `tool_name`
+with a leading underscore / `tool.name` prefixed `asana.`) lives in
+`~/.codex/cache/codex_apps_tools/*.json`; `_get_task` / `asana.get_task` is the
+single-task fetch, alongside `_get_my_tasks`, `_search_tasks`, `_create_tasks`,
+etc. (all excluded).
+
+Because the result payload matches the Claude shape, the existing
+`wrapperKeys:["data"]` + reference DSL consume it unchanged — **no reshaping**.
+
+### Implementation
+
+1. **`asanaDefinition.match.codex`** (mirrors `notion.ts`):
+   ```
+   codex: { namespaceSuffix: "asana", functionCallNames: ["_get_task"], invocationTools: ["asana.get_task"] }
+   ```
+   - `namespaceSuffix: "asana"` + `functionCallNames: ["_get_task"]` — the
+     PRIMARY (function_call) match path; `registry.match` strips the shared
+     `mcp__codex_apps__` prefix before comparing the suffix.
+   - `invocationTools: ["asana.get_task"]` — the FALLBACK (`mcp_tool_call_end`)
+     match path, compared against the raw dotted `invocation.tool`.
+2. **`CodexAsanaBinding.ts`** — `asanaCodexBinding` with identity `normalize`
+   (the payload already matches the def) and
+   `canonicalToolName: "mcp__claude_ai_Asana__get_task"` (so a Codex-sourced
+   Asana ref persists the same synthetic tool name as the Claude one).
+   Registered in `bindings/codex/index.ts` `CODEX_NORMALIZERS` (appended).
+3. **Tests**:
+   - `CodexEnvelopeParser.test.ts`: an `ASANA` fixture (the real `{data:{…}}`
+     output), a PRIMARY-path test, a FALLBACK-path (dotted invocation) test, an
+     enumeration-guard test (`_get_my_tasks` yields nothing), and an end-to-end
+     `extractReferencesFromTranscript` assertion (`asana:<gid>` → title + url).
+   - `SourceDefinitionRegistry.test.ts` `asana registration`: both codex match
+     paths resolve; enumeration/write tools and an underscore invocation name do
+     not.
+   - `bindings/codex/index.test.ts`: `canonicalToolName` + identity `normalize`.
+
+**No edit needed** beyond the above: `SourceEngine`, `CodexEnvelopeParser`, the
+DSL vocabulary, and storage/render are untouched — the payload is self-contained,
+so no `CONTEXT_NORMALIZERS` / `recover` hook is required (unlike Jira).
 
 ## Non-goals
 
 - Asana projects, portfolios, users, or any non-task entity.
-- Codex support (deferred, above).
+- Codex Asana enumeration/search/write tools (only `get_task` is extracted).
 - Any change to the DSL vocabulary, the envelope parsers, or storage/render
   common layers.

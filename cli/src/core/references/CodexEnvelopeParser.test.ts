@@ -210,6 +210,23 @@ const ROVO_JIRA_REST = {
 		labels: [],
 	},
 };
+// Real `codex_apps` Asana `get_task` output (2026-07-12 rollout, trimmed to the
+// fields the asana def reads plus a couple of the extra keys that ride along):
+// the connector wraps the task in a top-level `data` key — byte-identical to the
+// Claude Asana MCP shape — so it is fed BARE (no text-envelope) and consumed via
+// the def's own `wrapperKeys:["data"]`. `assignee` is null here (verbatim from the
+// rollout); the assignee-present branch is covered by asana.test.ts.
+const ASANA = {
+	data: {
+		gid: "1216474542361983",
+		name: "Add Asana MCP integration",
+		notes: "Add Asana MCP integration for Claude Code and Codex",
+		permalink_url: "https://app.asana.com/1/1216474500374769/project/1216474339608643/task/1216474542361983",
+		assignee: null,
+		completed: false,
+		resource_type: "task",
+	},
+};
 
 describe("CodexEnvelopeParser.parse", () => {
 	it("emits one NormalizedToolResult per source via the PRIMARY function_call pair, with canonical toolName + matched adapter", () => {
@@ -332,6 +349,40 @@ describe("CodexEnvelopeParser.parse", () => {
 		const lines = [
 			fnCall("mcp__codex_apps__linear", "_list_teams", "c_list"),
 			fnOutput("c_list", { teams: [] }, { wrap: "array", prefix: true }),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(0);
+	});
+
+	it("resolves the codex Asana get_task pair (PRIMARY path) to the asana def with canonical toolName", () => {
+		// Real rollout shape: name `_get_task` under namespace `mcp__codex_apps__asana`,
+		// bare `{data:{…}}` output behind the `Wall time:` prefix.
+		const lines = [
+			fnCall("mcp__codex_apps__asana", "_get_task", "c_asana"),
+			fnOutput("c_asana", ASANA, { wrap: "bare", prefix: true }),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("asana");
+		expect(results[0].toolName).toBe("mcp__claude_ai_Asana__get_task");
+		// normalize is identity — the `{data:{…}}` wrapper is preserved for the def's wrapperKeys.
+		expect((results[0].payload as { data?: { gid?: string } }).data?.gid).toBe("1216474542361983");
+	});
+
+	it("falls back to the mcp_tool_call_end event for Asana via the dotted invocation tool", () => {
+		const lines = [
+			fnCall("mcp__codex_apps__asana", "_get_task", "c_asana_evt"),
+			toolCallEnd("asana.get_task", "c_asana_evt", ASANA),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("asana");
+	});
+
+	it("ignores an Asana enumeration call (get_my_tasks) even under the asana namespace", () => {
+		const lines = [
+			fnCall("mcp__codex_apps__asana", "_get_my_tasks", "c_asana_list"),
+			fnOutput("c_asana_list", { data: [] }, { wrap: "bare", prefix: true }),
 		];
 		const { results } = codexEnvelopeParser.parse(lines, {});
 		expect(results).toHaveLength(0);
@@ -664,12 +715,14 @@ describe("CodexEnvelopeParser end-to-end via extractReferencesFromTranscript (so
 			// A dedicated getJiraIssue with only `self` (no webUrl), via the real
 			// `atlassian_rovo.getJiraIssue` event — captured with self mapped to url.
 			toolCallEnd("atlassian_rovo.getJiraIssue", "c_jira_nourl", JIRA_BARE_NO_URL),
+			fnCall("mcp__codex_apps__asana", "_get_task", "c_asana"),
+			fnOutput("c_asana", ASANA, { wrap: "bare", prefix: true }),
 		];
 		writeFileSync(file, `${lines.join("\n")}\n`, "utf-8");
 	});
 	afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
-	it("extracts correct refs for all four sources through the unchanged adapters", async () => {
+	it("extracts correct refs for all five sources through the unchanged adapters", async () => {
 		const { references } = await extractReferencesFromTranscript(file, { source: "codex" });
 		const byKey = new Map(references.map((r) => [r.mapKey, r]));
 
@@ -689,6 +742,12 @@ describe("CodexEnvelopeParser end-to-end via extractReferencesFromTranscript (so
 		// The getJiraIssue with only `self` is now captured, with `self` as its url
 		// (the api.atlassian.com endpoint — no browsable link is available).
 		expect(byKey.get("jira:KAN-9")?.url).toBe("https://api.atlassian.com/ex/jira/29e34fb0/rest/api/3/issue/10099");
+
+		// Asana: the `{data:{…}}` output flows through the identity binding and the
+		// def's wrapperKeys to a task ref with title/url/nativeId from gid.
+		const asana = byKey.get("asana:1216474542361983");
+		expect(asana?.title).toBe("Add Asana MCP integration");
+		expect(asana?.url).toBe(ASANA.data.permalink_url);
 	});
 });
 
