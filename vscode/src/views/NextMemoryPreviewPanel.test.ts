@@ -469,14 +469,15 @@ describe("NextMemoryPreviewPanel — context relevance overlay", () => {
 		postMessage.mockClear();
 		writeAiMock.mockClear();
 		detectPlansMock.mockResolvedValue([{ slug: "p1", title: "P1" }]);
-		// keepAll shape: every item tier:"high", reason:"" — not a real verdict.
+		// keepAll shape: every item tier:"mid", reason:"", autoExclude:false — not a
+		// real verdict (fail-open keeps everything without labeling it).
 		assessMock.mockResolvedValue({
 			plans: [{ slug: "p1", title: "P1" }],
 			notes: [],
 			references: [],
 			excludedContext: [],
 			results: [
-				{ id: "p1", kind: "plan", relevant: true, score: 0, tier: "high", reason: "", rank: 1, autoExclude: false },
+				{ id: "p1", kind: "plan", relevant: true, score: 0, tier: "mid", reason: "", rank: 1, autoExclude: false },
 			],
 		});
 		const sidebar = makeSidebarProvider({
@@ -484,9 +485,39 @@ describe("NextMemoryPreviewPanel — context relevance overlay", () => {
 		});
 		await openAndReady(makeBridge(), sidebar);
 		await vi.waitFor(() => expect(writeAiMock).toHaveBeenCalled());
-		// The fabricated empty-reason entries are filtered to nothing — the reuse
-		// path must not stamp "all High" onto the artifact.
+		// The fabricated empty-reason KEEP entries are filtered to nothing — the
+		// reuse path must not stamp a fabricated tier onto the artifact.
 		expect(writeAiMock).toHaveBeenCalledWith("/repo", [], "fp");
+	});
+
+	it("persists an auto-excluded item even when its reason is empty (low tier, no reason)", async () => {
+		postMessage.mockClear();
+		writeAiMock.mockClear();
+		detectPlansMock.mockResolvedValue([{ slug: "p1", title: "P1" }]);
+		// A real exclude verdict the model gave WITHOUT a reason (tier low +
+		// autoExclude, reason ""). It must still persist as excluded — otherwise the
+		// reuse path would KEEP an item the fresh (assessContextRelevance) path drops,
+		// diverging the two paths' excluded sets. Distinct from the keepAll case
+		// above (which is autoExclude:false and correctly filtered out).
+		assessMock.mockResolvedValue({
+			plans: [],
+			notes: [],
+			references: [],
+			excludedContext: [{ kind: "plan", key: "p1", title: "P1", reason: "" }],
+			results: [
+				{ id: "p1", kind: "plan", relevant: false, score: 0.2, tier: "low", reason: "", rank: 1, autoExclude: true },
+			],
+		});
+		const sidebar = makeSidebarProvider({
+			getFilesSnapshot: vi.fn().mockReturnValue([{ id: "f1", description: "src/a.ts", isSelected: true }]),
+		});
+		await openAndReady(makeBridge(), sidebar);
+		await vi.waitFor(() => expect(writeAiMock).toHaveBeenCalled());
+		expect(writeAiMock).toHaveBeenCalledWith(
+			"/repo",
+			[{ kind: "plans", key: "p1", tier: "low", reason: "", excluded: true }],
+			"fp",
+		);
 	});
 
 	it("getRelevanceCacheItems exposes the cached ranking; dismiss updates it in place", async () => {

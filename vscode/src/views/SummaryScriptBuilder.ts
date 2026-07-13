@@ -1862,6 +1862,17 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
       case 'removePlan':
         vscode.postMessage({ command: 'removePlan', slug: slug, title: title });
         break;
+      case 'removeExcludedContext':
+        // Excluded (soft-excluded) rows carry kind/key/title on data-excluded-*.
+        // Removes the entry from THIS commit's excludedContext only — does not
+        // touch the working registry (sidebar/worktree unaffected).
+        vscode.postMessage({
+          command: 'removeExcludedContext',
+          kind: target.getAttribute('data-excluded-kind') || '',
+          key: target.getAttribute('data-excluded-key') || '',
+          title: target.getAttribute('data-excluded-title') || '',
+        });
+        break;
       case 'savePlanEdit': {
         var planItem = document.getElementById('plan-' + slug);
         if (!planItem) break;

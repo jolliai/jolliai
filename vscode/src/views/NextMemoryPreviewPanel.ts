@@ -468,13 +468,17 @@ export class NextMemoryPreviewPanel {
 			// decision) as ONE list: the post-commit worker's fingerprint-reuse path
 			// rebuilds both the effective exclude set and the kept items' relevance
 			// (CommitSummary.contextRelevance) from it without an LLM call.
-			// Empty-reason entries are NOT verdicts — the fail-open keepAll fallback
-			// fabricates tier:"high", reason:"" for every item — so they're dropped,
-			// mirroring keptContextRelevanceRefs, or the reuse path would stamp the
-			// fabricated "all High" onto the artifact. A fresh ranking carries no
-			// user veto — `dismissed` only ever appears via dismissAiExclusion.
+			// Keep an entry if it has a reason OR is an auto-exclude. A fresh
+			// ranking's excluded (tier:"low") items must persist their exclude even
+			// when the model gave no reason — otherwise the reuse path would silently
+			// KEEP an item the fresh (assessContextRelevance) path drops, diverging
+			// the two paths' excluded sets. Empty-reason, NON-excluded entries are
+			// the fail-open keepAll fallback (tier:"mid", reason:"") — not real
+			// verdicts — so they're dropped, mirroring keptContextRelevanceRefs, or
+			// the reuse path would stamp a fabricated tier onto the artifact. A fresh
+			// ranking carries no user veto — `dismissed` only appears via dismissAiExclusion.
 			const aiEntries: AiRelevanceEntry[] = decision.results
-				.filter((r) => r.reason !== "")
+				.filter((r) => r.reason !== "" || r.autoExclude)
 				.map((r) => ({
 					kind: r.kind === "plan" ? "plans" : r.kind === "note" ? "notes" : "references",
 					key: r.id,

@@ -3635,6 +3635,81 @@ describe("SummaryWebviewPanel", () => {
 			});
 		});
 
+		// ── removeExcludedContext (this commit only; working set untouched) ────
+		describe("removeExcludedContext", () => {
+			it("drops the entry from excludedContext + re-persists, WITHOUT touching the working registry", async () => {
+				showWarningMessage.mockResolvedValue("Remove");
+				const dispatch = await setupPanel({
+					excludedContext: [
+						{ kind: "plan", key: "p1", title: "Unrelated Plan", reason: "different feature", tier: "low" },
+						{ kind: "note", key: "n1", title: "Other Note", reason: "unrelated", tier: "low" },
+					],
+				});
+
+				dispatch({ command: "removeExcludedContext", kind: "plan", key: "p1", title: "Unrelated Plan" });
+				await flushPromises();
+
+				// Re-persisted (dual-write) with p1 gone, n1 kept.
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({
+						excludedContext: [expect.objectContaining({ kind: "note", key: "n1" })],
+					}),
+					workspaceRoot,
+					true,
+				);
+				// Crucially: the working registry is NOT touched — sidebar/worktree intact.
+				expect(mockRemovePlan).not.toHaveBeenCalled();
+				expect(mockRemoveNote).not.toHaveBeenCalled();
+				expect(mockRemoveReference).not.toHaveBeenCalled();
+			});
+
+			it("clears excludedContext to undefined when the last entry is removed", async () => {
+				showWarningMessage.mockResolvedValue("Remove");
+				const dispatch = await setupPanel({
+					excludedContext: [
+						{ kind: "reference", key: "linear:X-1", title: "Ref", reason: "unrelated", tier: "low" },
+					],
+				});
+
+				dispatch({ command: "removeExcludedContext", kind: "reference", key: "linear:X-1", title: "Ref" });
+				await flushPromises();
+
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({ excludedContext: undefined }),
+					workspaceRoot,
+					true,
+				);
+				expect(mockRemoveReference).not.toHaveBeenCalled();
+			});
+
+			it("does nothing when the user cancels", async () => {
+				showWarningMessage.mockResolvedValue(undefined);
+				const dispatch = await setupPanel({
+					excludedContext: [{ kind: "plan", key: "p1", title: "P", reason: "r", tier: "low" }],
+				});
+
+				dispatch({ command: "removeExcludedContext", kind: "plan", key: "p1", title: "P" });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				// Cancel must also leave the working registry untouched.
+				expect(mockRemovePlan).not.toHaveBeenCalled();
+				expect(mockRemoveNote).not.toHaveBeenCalled();
+				expect(mockRemoveReference).not.toHaveBeenCalled();
+			});
+
+			it("no-ops (no confirm, no write) when the summary has no excludedContext", async () => {
+				showWarningMessage.mockResolvedValue("Remove");
+				const dispatch = await setupPanel({}); // makeSummary default: excludedContext undefined
+
+				dispatch({ command: "removeExcludedContext", kind: "plan", key: "p1", title: "P" });
+				await flushPromises();
+
+				expect(showWarningMessage).not.toHaveBeenCalled();
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+			});
+		});
+
 		// ── addPlan ──────────────────────────────────────────────────────────
 
 		describe("addPlan", () => {

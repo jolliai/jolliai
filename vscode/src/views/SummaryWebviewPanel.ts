@@ -225,6 +225,7 @@ type WebviewMessage =
 	| { command: "savePlan"; slug: string; content: string }
 	| { command: "previewPlan"; slug: string; title: string }
 	| { command: "removePlan"; slug: string; title: string }
+	| { command: "removeExcludedContext"; kind: string; key: string; title: string }
 	| { command: "addPlan" }
 	| { command: "addMarkdownNote" }
 	| { command: "saveSnippet"; title: string; content: string }
@@ -856,6 +857,12 @@ export class SummaryWebviewPanel {
 				this.catchAndShow(
 					this.handleRemovePlan(message.slug, message.title),
 					"Remove plan failed",
+				);
+				break;
+			case "removeExcludedContext":
+				this.catchAndShow(
+					this.handleRemoveExcludedContext(message.kind, message.key, message.title),
+					"Remove failed",
 				);
 				break;
 			case "translatePlan":
@@ -2952,6 +2959,63 @@ export class SummaryWebviewPanel {
 		// does not install setActiveStorage; only QueueWorker does).
 		await this.bridge.cleanupVisiblePlanArtifact(slug, summary.branch);
 
+		this.refreshPlansAndNotes(updatedSummary);
+	}
+
+	/**
+	 * Removes a soft-excluded (AI-unrelated) context entry from THIS commit's
+	 * summary — and ONLY that. It drops the entry from `excludedContext` and
+	 * re-persists the summary (dual-write: orphan branch + Memory Bank folder,
+	 * regenerating the visible md). It deliberately does NOT touch the working
+	 * registry: the plan/note/reference stays in the sidebar and can still inform
+	 * future commits. (A soft-excluded item was never archived into this commit,
+	 * so there is no plan-markdown snapshot to delete — only the audit entry in
+	 * `excludedContext` and the regenerated visible summary.)
+	 *
+	 * Distinct from handleRemovePlan/Note/Reference, which dissociate an item that
+	 * WAS archived into this commit; those touch working state, this does not.
+	 */
+	private async handleRemoveExcludedContext(kind: string, key: string, title: string): Promise<void> {
+		const summary = this.currentSummary;
+		if (!summary?.excludedContext) {
+			return;
+		}
+		// Stale-tab guard (mirrors handleRemovePlan/Note): if the commit was amended
+		// or rebased while this panel stayed open, bail rather than force-writing a
+		// summary keyed to the now-rewritten commit. This handler is itself a
+		// destructive action that should trip the guard, so without this explicit
+		// check the guard would never fire on this path.
+		if (!(await this.ensureCommitNotRewritten("remove excluded item"))) {
+			return;
+		}
+		const remaining = summary.excludedContext.filter((x) => !(x.kind === kind && x.key === key));
+		// Stale DOM: the key is already gone (removed by a prior action) — no-op
+		// instead of popping a confirm and dual-writing an unchanged summary.
+		if (remaining.length === summary.excludedContext.length) {
+			return;
+		}
+		const choice = await vscode.window.showWarningMessage(
+			`Remove "${title}" from this commit's excluded list?`,
+			{
+				modal: true,
+				detail:
+					"This drops the AI-excluded entry from THIS commit's summary only (orphan branch + Memory Bank folder). It does NOT touch your working set — the item stays in the sidebar and can still inform future commits.",
+			},
+			"Remove",
+		);
+		if (choice !== "Remove") {
+			return;
+		}
+		// Race-window re-check: an amend can land while the confirm modal is open.
+		if (!(await this.ensureCommitNotRewritten("remove excluded item"))) {
+			return;
+		}
+		const updatedSummary: CommitSummary = {
+			...summary,
+			excludedContext: remaining.length > 0 ? remaining : undefined,
+		};
+		await this.bridge.storeSummary(updatedSummary, true);
+		this.currentSummary = updatedSummary;
 		this.refreshPlansAndNotes(updatedSummary);
 	}
 

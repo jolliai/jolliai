@@ -1320,7 +1320,7 @@ describe("SummaryHtmlBuilder", () => {
 				expect(html).not.toContain('id="sourceCard"');
 			});
 
-			it("inlines an AI-excluded item as a read-only row (Excluded chip + reason, no actions)", () => {
+			it("inlines an AI-excluded item as a row with ONE action: delete-from-working-set (no preview/edit)", () => {
 				const html = buildContextPanel(
 					makeSummary({
 						excludedContext: [
@@ -1330,13 +1330,36 @@ describe("SummaryHtmlBuilder", () => {
 				);
 				// Inline row replaces the old collapsed "AI excluded N" details block.
 				expect(html).not.toContain("AI excluded 1 unrelated context item(s)");
-				expect(html).toContain('class="row plan-item ai-ex-row"');
+				expect(html).toContain('class="plan-item ai-ex-row"');
 				expect(html).toContain("Cursor Support");
 				expect(html).toContain("unrelated to graph change");
 				expect(html).toContain('class="ctx-tier ctx-tier--ex"');
-				// Read-only: no preview link, no edit/remove actions on the row.
 				const row = html.slice(html.indexOf("ai-ex-row"), html.indexOf("snippet-form"));
-				expect(row).not.toContain("data-action=");
+				// The ONLY action is delete-from-working-set (a soft-excluded item has
+				// no commit snapshot, so no preview/edit) — carrying kind/key/title.
+				expect(row).toContain('data-action="removeExcludedContext"');
+				expect(row).toContain('data-excluded-kind="note"');
+				expect(row).toContain('data-excluded-key="n1"');
+				expect(row).not.toContain("previewNote");
+				expect(row).not.toContain("loadNoteContent");
+				expect(row).not.toContain("removeNote"); // uses removeExcludedContext, not the commit-dissociate path
+			});
+
+			it("shows the Excluded chip even when the excluded item has an empty reason (low tier, no reason)", () => {
+				const html = buildContextPanel(
+					makeSummary({
+						excludedContext: [{ kind: "plan", key: "p9", title: "No-reason Plan", reason: "", tier: "low" }],
+					}),
+				);
+				const row = html.slice(html.indexOf("ai-ex-row"), html.indexOf("snippet-form"));
+				// The Excluded chip lives OUTSIDE the reason block, so an empty-reason
+				// exclude still reads as "Excluded" rather than a bare struck title.
+				expect(row).toContain('class="ctx-tier ctx-tier--ex"');
+				expect(row).toContain("Excluded");
+				// ...but there is no ✨ note when the reason is empty.
+				expect(row).not.toContain("ai-say");
+				// Still deletable.
+				expect(row).toContain('data-action="removeExcludedContext"');
 			});
 
 			it("renders the Context section for an excluded-only summary (no kept rows)", () => {
@@ -2303,7 +2326,7 @@ describe("buildAllConversationsSection — Regenerate button", () => {
 			expect(newerIdx).toBeGreaterThanOrEqual(0);
 			expect(newerIdx).toBeLessThan(olderIdx);
 			// The superseded (older) snapshot is dimmed.
-			expect(html).toContain('class="row plan-item plan-older" id="plan-refactor-auth-1111aaaa"');
+			expect(html).toContain('class="plan-item plan-older" id="plan-refactor-auth-1111aaaa"');
 			// Every plan item carries a relative date.
 			expect(html.match(/plan-date/g)).toHaveLength(2);
 		});

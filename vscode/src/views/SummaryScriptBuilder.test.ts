@@ -571,4 +571,16 @@ describe("SummaryScriptBuilder", () => {
 			expect(script).not.toContain("prChainE2eThenCreate");
 		});
 	});
+
+	// ─── Excluded-context delete dispatch (guards the HtmlBuilder ↔ host wiring) ──
+	describe("removeExcludedContext dispatch", () => {
+		it("reads data-excluded-* and posts the command (a typo in any attribute name would silently break the button)", () => {
+			expect(script).toContain("case 'removeExcludedContext'");
+			// Attribute names must match SummaryHtmlBuilder.buildExcludedRow exactly.
+			expect(script).toContain("data-excluded-kind");
+			expect(script).toContain("data-excluded-key");
+			expect(script).toContain("data-excluded-title");
+			expect(script).toContain("command: 'removeExcludedContext'");
+		});
+	});
 });

@@ -68,6 +68,34 @@ describe("SummaryCssBuilder", () => {
 		expect(css).toContain(".meta-strip .action-btn .codicon");
 	});
 
+	it("pins the Context row's badge + actions to the top so a 3-line row (title/filename/AI-relevance) doesn't sink them to the middle", () => {
+		// #contextPanel .row is align-items:center; a kept row stacks title +
+		// filename + relevance line inside .r-main, so without this the leading
+		// P/N badge and the trailing edit/remove actions float to the row's
+		// vertical middle. align-self:flex-start keeps them against the title's
+		// first line (matching the NextMemory review panel).
+		expect(css).toMatch(
+			/#contextPanel \.row > \.kb-tag,\s*#contextPanel \.row > \.r-actions\s*{\s*align-self:\s*flex-start/,
+		);
+	});
+
+	it("indents the AI-relevance line so it spans the card as a full-width sibling of .row (not boxed in the narrow r-main column)", () => {
+		// The relevance line moved out of .r-main to a sibling of .row, so a long
+		// reason no longer shares the narrow title column with the always-visible
+		// date + actions. padding-left keeps it aligned under the title, past the
+		// badge column (.row padding 6 + badge 16 + gap 6 = 28px).
+		expect(css).toMatch(/\.ctx-rel\s*{[^}]*padding:\s*3px 6px 0 28px/);
+	});
+
+	it("hover-highlights the whole context item (row + relevance line), not just the inner row", () => {
+		// The relevance line is a sibling of .row, so a .row:hover would leave it
+		// un-tinted. Hover lives on .plan-item so the tint spans the full item.
+		expect(css).toMatch(/#contextPanel \.plan-item:hover\s*{[^}]*background:\s*var\(--surface-hover\)/);
+		// The old inner-row hover must be gone for the context panel (a stray
+		// #contextPanel .row:hover would double-tint / bound the highlight early).
+		expect(css).not.toContain("#contextPanel .row:hover");
+	});
+
 	it("contains the PR section CSS from buildPrSectionCss()", () => {
 		expect(css).toContain("/* pr-css */");
 	});

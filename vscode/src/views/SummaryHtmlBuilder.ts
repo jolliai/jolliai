@@ -791,11 +791,14 @@ function buildRelevanceLine(rel: ContextRelevanceRef | undefined): string {
 }
 
 /**
- * One inline READ-ONLY row for an AI soft-excluded context item: badge +
- * struck-through title + `Excluded` chip + reason. Deliberately no preview /
- * edit / remove actions and no title link — a soft-excluded item was never
- * archived into this commit, so there is no snapshot to open. Rendered after
- * the kept rows (replaces the old collapsed "AI excluded N" details block).
+ * One inline row for an AI soft-excluded context item: badge + struck-through
+ * title + `Excluded` chip + reason, plus a SINGLE trailing action — a trash
+ * button that drops this entry from THIS commit's excludedContext (see
+ * removeExcludedContext / handleRemoveExcludedContext). No preview/edit and no
+ * title link: a soft-excluded item was never archived into this commit, so there
+ * is no snapshot to open — and the trash does NOT touch the working registry
+ * (the plan/note stays in the sidebar). Rendered after the kept rows (replaces
+ * the old collapsed "AI excluded N" details block).
  */
 function buildExcludedRow(e: ExcludedContextItem): string {
 	let tag = `<span class="kb-tag t-plan">P</span>`;
@@ -804,16 +807,30 @@ function buildExcludedRow(e: ExcludedContextItem): string {
 		const source = e.key.includes(":") ? e.key.slice(0, e.key.indexOf(":")) : e.key;
 		tag = `<span class="kb-tag t-ref">${escHtml(getSourceMeta(source).letter)}</span>`;
 	}
-	const reason = e.reason
-		? `
-      <div class="ctx-rel"><span class="ctx-tier ctx-tier--ex" title="AI marked unrelated &mdash; excluded from the summary">Excluded</span><span class="ai-say">&#x2728; ${escHtml(e.reason)}</span></div>`
-		: "";
+	// The "Excluded" chip renders ALWAYS (even with an empty reason) — the ✨ note
+	// is the only optional part. A low-tier item can reach here with no reason
+	// (the model omitted it, or normalizeTier derived "low" from a bare "none"),
+	// and if the chip lived inside the reason block that row would show just a
+	// struck title + trash with no "Excluded" marker at all.
+	const relBlock = `
+      <div class="ctx-rel"><span class="ctx-tier ctx-tier--ex" title="AI marked unrelated &mdash; excluded from the summary">Excluded</span>${
+				e.reason ? `<span class="ai-say">&#x2728; ${escHtml(e.reason)}</span>` : ""
+			}</div>`;
+	// Single action: remove this AI-excluded entry from THIS commit's summary.
+	// A soft-excluded item was never archived into the commit (no snapshot to
+	// preview/edit); this drops it from excludedContext only and does NOT touch
+	// the working registry — the plan/note/reference stays in the sidebar.
+	// Handled by removeExcludedContext (host: handleRemoveExcludedContext).
+	const removeBtn = `<span class="r-actions"><button class="icon-btn topic-action-btn plan-remove-btn" title="Remove from this commit's excluded list" data-action="removeExcludedContext" data-excluded-kind="${e.kind}" data-excluded-key="${escAttr(e.key)}" data-excluded-title="${escAttr(e.title)}">&#x1F5D1;</button></span>`;
 	return `
-  <div class="row plan-item ai-ex-row">
-    ${tag}
-    <div class="r-main">
-      <span class="r-title ai-ex-title">${escHtml(e.title)}</span>${reason}
-    </div>
+  <div class="plan-item ai-ex-row">
+    <div class="row">
+      ${tag}
+      <div class="r-main">
+        <span class="r-title ai-ex-title">${escHtml(e.title)}</span>
+      </div>
+      ${removeBtn}
+    </div>${relBlock}
   </div>`;
 }
 
@@ -1074,18 +1091,26 @@ export function buildPlansAndNotesSection(
 				p.jolliPlanDocUrl && !isSuperseded
 					? ` &middot; <a class="jolli-link plan-jolli-link" href="${escHtml(p.jolliPlanDocUrl)}" title="View plan on Jolli">&#x1F517; View on Jolli</a>`
 					: "";
-			const itemClass = isSuperseded ? "row plan-item plan-older" : "row plan-item";
+			const itemClass = isSuperseded ? "plan-item plan-older" : "plan-item";
+			// The AI-relevance line is pulled OUT of .r-main and rendered as a
+			// sibling of .row (full-width, indented under the title) so its
+			// reason text is no longer boxed into the narrow r-main column that
+			// the always-visible date + edit/remove actions share — a long reason
+			// can now use the whole card width instead of wrapping early. Mirrors
+			// the NextMemory review panel's .ctx-meta placement.
 			return `
   <div class="${itemClass}" id="plan-${key}">
-    <span class="kb-tag t-plan">P</span>
-    <div class="r-main">
-      <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewPlan" data-plan-slug="${key}" data-plan-title="${escAttr(p.title)}">${escHtml(p.title)}</a>${latestBadge}
-      <div class="plan-meta">${escHtml(key)}.md${jolliLink}</div>${buildRelevanceLine(lookupRelevance(relevanceMap, "plan", key))}
-    </div>
-    <span class="r-actions plan-header-actions">
-      ${dateBadge}${translateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit Plan" data-plan-slug="${key}" data-action="loadPlanContent">&#x270E;</button>
-      <button class="icon-btn topic-action-btn plan-remove-btn" title="Remove Plan" data-plan-slug="${key}" data-plan-title="${escAttr(p.title)}" data-action="removePlan">&#x1F5D1;</button>
-    </span>
+    <div class="row">
+      <span class="kb-tag t-plan">P</span>
+      <div class="r-main">
+        <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewPlan" data-plan-slug="${key}" data-plan-title="${escAttr(p.title)}">${escHtml(p.title)}</a>${latestBadge}
+        <div class="plan-meta">${escHtml(key)}.md${jolliLink}</div>
+      </div>
+      <span class="r-actions plan-header-actions">
+        ${dateBadge}${translateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit Plan" data-plan-slug="${key}" data-action="loadPlanContent">&#x270E;</button>
+        <button class="icon-btn topic-action-btn plan-remove-btn" title="Remove Plan" data-plan-slug="${key}" data-plan-title="${escAttr(p.title)}" data-action="removePlan">&#x1F5D1;</button>
+      </span>
+    </div>${buildRelevanceLine(lookupRelevance(relevanceMap, "plan", key))}
     <div class="plan-edit-area">
       <textarea class="plan-edit-textarea" data-plan-slug="${key}" rows="20"></textarea>
       <div class="plan-edit-actions">
@@ -1108,16 +1133,18 @@ export function buildPlansAndNotesSection(
 					? `<div class="plan-meta plan-meta-snippet">${escHtml(n.content)}</div>`
 					: `<div class="plan-meta">${escHtml(n.id)}.md</div>`;
 			return `
-  <div class="row plan-item" id="note-${n.id}">
-    <span class="kb-tag t-note">N</span>
-    <div class="r-main">
-      <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewNote" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}">${escHtml(n.title)}</a>
-      ${noteMeta}${buildRelevanceLine(lookupRelevance(relevanceMap, "note", n.id))}
-    </div>
-    <span class="r-actions plan-header-actions">
-      ${noteTranslateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit Note" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}" data-note-format="${n.format}" data-action="loadNoteContent">&#x270E;</button>
-      <button class="icon-btn topic-action-btn plan-remove-btn" title="Remove Note" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}" data-action="removeNote">&#x1F5D1;</button>
-    </span>
+  <div class="plan-item" id="note-${n.id}">
+    <div class="row">
+      <span class="kb-tag t-note">N</span>
+      <div class="r-main">
+        <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewNote" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}">${escHtml(n.title)}</a>
+        ${noteMeta}
+      </div>
+      <span class="r-actions plan-header-actions">
+        ${noteTranslateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit Note" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}" data-note-format="${n.format}" data-action="loadNoteContent">&#x270E;</button>
+        <button class="icon-btn topic-action-btn plan-remove-btn" title="Remove Note" data-note-id="${escAttr(n.id)}" data-note-title="${escAttr(n.title)}" data-action="removeNote">&#x1F5D1;</button>
+      </span>
+    </div>${buildRelevanceLine(lookupRelevance(relevanceMap, "note", n.id))}
     <div class="plan-edit-area">
       <textarea class="plan-edit-textarea" data-note-id="${escAttr(n.id)}" rows="20"></textarea>
       <div class="plan-edit-actions">
@@ -1301,16 +1328,18 @@ function buildReferenceRow(
 		? `<button class="topic-action-btn reference-translate-btn" title="Translate to English" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="translateReference">&#x1F310;</button>`
 		: "";
 	return `
-  <div class="row plan-item" id="reference-${escAttr(e.source)}-${escAttr(domKey)}">
-    <span class="kb-tag t-ref">${escHtml(sourceLetter)}</span>
-    <div class="r-main">
-      <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewReference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}">${escHtml(referenceDisplayTitle(e))}</a>${subLine}${buildRelevanceLine(relevance)}
-    </div>
-    <span class="r-actions plan-header-actions">
-      <button class="icon-btn topic-action-btn" title="Open in ${escAttr(sourceLabel)}" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-url="${escAttr(e.url ?? "")}" data-action="openReferenceExternal">&#x1F30D;</button>
-      ${translateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit ${escAttr(sourceLabel)} snapshot" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="loadReferenceContent">&#x270E;</button>
-      <button class="icon-btn topic-action-btn plan-remove-btn" title="Remove ${escAttr(sourceLabel)} Reference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}" data-action="removeReference">&#x1F5D1;</button>
-    </span>
+  <div class="plan-item" id="reference-${escAttr(e.source)}-${escAttr(domKey)}">
+    <div class="row">
+      <span class="kb-tag t-ref">${escHtml(sourceLetter)}</span>
+      <div class="r-main">
+        <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewReference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}">${escHtml(referenceDisplayTitle(e))}</a>${subLine}
+      </div>
+      <span class="r-actions plan-header-actions">
+        <button class="icon-btn topic-action-btn" title="Open in ${escAttr(sourceLabel)}" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-url="${escAttr(e.url ?? "")}" data-action="openReferenceExternal">&#x1F30D;</button>
+        ${translateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit ${escAttr(sourceLabel)} snapshot" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="loadReferenceContent">&#x270E;</button>
+        <button class="icon-btn topic-action-btn plan-remove-btn" title="Remove ${escAttr(sourceLabel)} Reference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}" data-action="removeReference">&#x1F5D1;</button>
+      </span>
+    </div>${buildRelevanceLine(relevance)}
     <div class="plan-edit-area">
       <textarea class="plan-edit-textarea" data-reference-key="${escAttr(e.archivedKey)}" rows="20"></textarea>
       <div class="plan-edit-actions">

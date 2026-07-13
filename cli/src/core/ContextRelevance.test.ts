@@ -146,35 +146,41 @@ describe("buildChangeBlock", () => {
 });
 
 describe("parseRankContextResponse", () => {
-	it("parses well-formed item blocks", () => {
+	it("parses well-formed item blocks (index + tier + reason)", () => {
 		const text = [
 			"===ITEM===",
 			"index: 1",
-			"relevant: yes",
-			"score: 0.9",
+			"tier: high",
 			"reason: overlaps graph",
 			"===ITEM===",
 			"index: 2",
-			"relevant: no",
-			"score: 0.1",
+			"tier: low",
 			"reason: unrelated",
 		].join("\n");
 		const parsed = parseRankContextResponse(text);
 		expect(parsed).toEqual([
-			{ index: 1, relevant: true, score: 0.9, reason: "overlaps graph" },
-			{ index: 2, relevant: false, score: 0.1, reason: "unrelated" },
+			{ index: 1, tier: "high", reason: "overlaps graph" },
+			{ index: 2, tier: "low", reason: "unrelated" },
 		]);
 	});
-	it("skips blocks with no parseable index and defaults missing fields", () => {
-		const text = ["===ITEM===", "relevant: yes", "===ITEM===", "index: 3"].join("\n");
+	it("skips blocks with no parseable index and defaults a missing tier to mid", () => {
+		const text = ["===ITEM===", "tier: high", "===ITEM===", "index: 3"].join("\n");
 		const parsed = parseRankContextResponse(text);
-		expect(parsed).toEqual([{ index: 3, relevant: true, score: 0.7, reason: "" }]);
+		expect(parsed).toEqual([{ index: 3, tier: "mid", reason: "" }]);
 	});
-	it("clamps out-of-range scores", () => {
-		const parsed = parseRankContextResponse(
-			["===ITEM===", "index: 1", "relevant: yes", "score: 5", "reason: x"].join("\n"),
-		);
-		expect(parsed[0].score).toBe(1);
+	it("normalizes tier tokens (high/low prefixes kept; med / medium / unknown → mid)", () => {
+		const mk = (t: string) =>
+			parseRankContextResponse(["===ITEM===", "index: 1", `tier: ${t}`, "reason: x"].join("\n"))[0].tier;
+		expect(mk("HIGH")).toBe("high");
+		expect(mk("Low")).toBe("low");
+		expect(mk("med")).toBe("mid");
+		expect(mk("medium")).toBe("mid");
+		expect(mk("banana")).toBe("mid");
+		// Defensive: if the model slips into the old free-text "not relevant"
+		// vocabulary, it maps to low (the soft-exclude tier), not a kept "mid".
+		expect(mk("none")).toBe("low");
+		expect(mk("not relevant")).toBe("low");
+		expect(mk("unrelated")).toBe("low");
 	});
 });
 
@@ -191,13 +197,11 @@ describe("rankContextRelevance", () => {
 				[
 					"===ITEM===",
 					"index: 1",
-					"relevant: no",
-					"score: 0.1",
+					"tier: low",
 					"reason: unrelated",
 					"===ITEM===",
 					"index: 2",
-					"relevant: yes",
-					"score: 0.95",
+					"tier: high",
 					"reason: direct hit",
 				].join("\n"),
 			),
@@ -211,9 +215,7 @@ describe("rankContextRelevance", () => {
 	});
 
 	it("conservatively keeps items the LLM omitted", async () => {
-		mockCallLlm.mockResolvedValue(
-			llmText(["===ITEM===", "index: 1", "relevant: yes", "score: 0.8", "reason: x"].join("\n")),
-		);
+		mockCallLlm.mockResolvedValue(llmText(["===ITEM===", "index: 1", "tier: high", "reason: x"].join("\n")));
 		const items = [item("plan", "p1", "Has", "aa"), item("note", "n1", "Omitted", "bb")];
 		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
 			config,
@@ -231,6 +233,9 @@ describe("rankContextRelevance", () => {
 		});
 		expect(res).toHaveLength(2);
 		expect(res.every((r) => r.relevant && !r.autoExclude)).toBe(true);
+		// fail-open keeps everything at neutral "mid" — never a fabricated "high"
+		// (which the live overlay would render as a green High chip on all items).
+		expect(res.every((r) => r.tier === "mid")).toBe(true);
 		expect(res.map((r) => r.id)).toEqual(["p1", "n1"]);
 	});
 });
@@ -254,33 +259,21 @@ describe("buildChangeSignal", () => {
 });
 
 describe("review-fix regressions", () => {
-	it("treats No. / nope / not relevant / none as not relevant", () => {
-		for (const v of ["No.", "nope", "not relevant", "none", "false"]) {
-			const p = parseRankContextResponse(
-				["===ITEM===", "index: 1", `relevant: ${v}`, "score: 0.4", "reason: r"].join("\n"),
-			);
-			expect(p[0].relevant).toBe(false);
-		}
-	});
-
-	it("assigns tiers by rank position, not absolute score", async () => {
+	it("uses the model's tier directly (high/mid/low), ordering high → low", async () => {
 		mockCallLlm.mockResolvedValue(
 			llmText(
 				[
 					"===ITEM===",
 					"index: 1",
-					"relevant: yes",
-					"score: 0.9",
+					"tier: mid",
 					"reason: a",
 					"===ITEM===",
 					"index: 2",
-					"relevant: yes",
-					"score: 0.8",
+					"tier: high",
 					"reason: b",
 					"===ITEM===",
 					"index: 3",
-					"relevant: no",
-					"score: 0.7",
+					"tier: low",
 					"reason: c",
 				].join("\n"),
 			),
@@ -293,10 +286,47 @@ describe("review-fix regressions", () => {
 		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
 			config,
 		});
+		// Ordered by tier (high → mid → low), not input order.
+		expect(res.map((r) => r.id)).toEqual(["n1", "p1", "linear:R"]);
 		expect(res.map((r) => r.tier)).toEqual(["high", "mid", "low"]);
-		// bottom-rank + not relevant → autoExclude; higher ranks never auto-excluded
-		expect(res[2].autoExclude).toBe(true);
-		expect(res[0].autoExclude).toBe(false);
+		// "low" is the soft-exclude tier; high/mid are kept.
+		expect(res.map((r) => r.autoExclude)).toEqual([false, false, true]);
+		expect(res.find((r) => r.id === "linear:R")?.relevant).toBe(false);
+	});
+
+	it("all-unrelated context: every item is low → every item auto-excludes (no fabricated High)", async () => {
+		// The reported bug: several plans that merely share foundational files with
+		// the change are all unrelated. The model now returns "low" for each, and
+		// "low" is the soft-exclude tier — so positional tiering no longer fabricates
+		// a High out of the least-unrelated one.
+		mockCallLlm.mockResolvedValue(
+			llmText(
+				[
+					"===ITEM===",
+					"index: 1",
+					"tier: low",
+					"reason: only shares a CSS file",
+					"===ITEM===",
+					"index: 2",
+					"tier: low",
+					"reason: different feature",
+					"===ITEM===",
+					"index: 3",
+					"tier: low",
+					"reason: unrelated bug",
+				].join("\n"),
+			),
+		);
+		const items = [
+			item("plan", "p1", "A", "x"),
+			item("note", "n1", "B", "y"),
+			item("reference", "linear:R", "C", "z"),
+		];
+		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
+			config,
+		});
+		expect(res.map((r) => r.tier)).toEqual(["low", "low", "low"]);
+		expect(res.every((r) => r.autoExclude)).toBe(true);
 	});
 
 	it("captures the lead paragraph as Overview even when a title is present", () => {
@@ -326,9 +356,9 @@ describe("review-fix regressions", () => {
 		const repr = extractCandidateRepr(item("reference", "linear:R", "R", big));
 		expect(repr.length).toBeLessThanOrEqual(4000 + 16);
 	});
-	it("defaults score to 0.2 for a not-relevant item without a score", () => {
-		const p = parseRankContextResponse(["===ITEM===", "index: 1", "relevant: no", "reason: x"].join("\n"));
-		expect(p[0].score).toBe(0.2);
+	it("defaults an item with no tier field to mid (conservative keep, not excluded)", () => {
+		const p = parseRankContextResponse(["===ITEM===", "index: 1", "reason: x"].join("\n"));
+		expect(p[0].tier).toBe("mid");
 	});
 });
 
@@ -342,13 +372,11 @@ describe("assessContextRelevance", () => {
 			[
 				"===ITEM===",
 				"index: 1",
-				"relevant: yes",
-				"score: 0.9",
+				"tier: high",
 				"reason: hit",
 				"===ITEM===",
 				"index: 2",
-				"relevant: no",
-				"score: 0.1",
+				"tier: low",
 				"reason: unrelated",
 			].join("\n"),
 		);
@@ -371,9 +399,7 @@ describe("assessContextRelevance", () => {
 
 	it("falls back to title content when the source file is unreadable", async () => {
 		mockReadFile.mockRejectedValue(new Error("ENOENT"));
-		mockCallLlm.mockResolvedValue(
-			llmText(["===ITEM===", "index: 1", "relevant: yes", "score: 0.8", "reason: x"].join("\n")),
-		);
+		mockCallLlm.mockResolvedValue(llmText(["===ITEM===", "index: 1", "tier: high", "reason: x"].join("\n")));
 		const decision = await assessContextRelevance(
 			{ plans: [planEntry("p1", "P1")], notes: [], references: [] },
 			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [] },
@@ -398,13 +424,11 @@ describe("assessContextRelevance", () => {
 				[
 					"===ITEM===",
 					"index: 1",
-					"relevant: yes",
-					"score: 0.9",
+					"tier: high",
 					"reason: note matches",
 					"===ITEM===",
 					"index: 2",
-					"relevant: yes",
-					"score: 0.8",
+					"tier: high",
 					"reason: ref matches",
 				].join("\n"),
 			),
@@ -498,7 +522,9 @@ describe("buildDecisionFromAiRelevance (worker reuse of the panel ranking)", () 
 			{ kind: "plans", key: "p2", tier: "low", reason: "unrelated", excluded: true },
 		]);
 		expect(decision.plans.map((p) => p.slug)).toEqual(["p1"]);
-		expect(decision.excludedContext).toEqual([{ kind: "plan", key: "p2", title: "P2", reason: "unrelated" }]);
+		expect(decision.excludedContext).toEqual([
+			{ kind: "plan", key: "p2", title: "P2", reason: "unrelated", tier: "low" },
+		]);
 		expect(decision.results).toEqual([
 			{
 				id: "p1",
@@ -575,6 +601,7 @@ describe("buildDecisionFromAiRelevance (worker reuse of the panel ranking)", () 
 				key: "linear:JOLLI-776",
 				title: "JOLLI-776 — JolliMemory: array-based",
 				reason: "unrelated",
+				tier: "low",
 			},
 		]);
 		expect(decision.references).toEqual([]);
