@@ -43,12 +43,23 @@ describe("SourceDefinitionRegistry", () => {
 		expect(r.match("codex", "linear.get_issue")?.id).toBe("linear"); // invocation-tool path (no namespace)
 	});
 
-	it("all() is stable order linear,confluence,jira,github,notion,slack,zoom-meeting,zoom-doc,asana", () => {
+	it("all() is stable order linear,confluence,jira,github,notion,slack,zoom-meeting,zoom-doc,asana,monday", () => {
 		expect(
 			getRegistry()
 				.all()
 				.map((d) => d.id),
-		).toEqual(["linear", "confluence", "jira", "github", "notion", "slack", "zoom-meeting", "zoom-doc", "asana"]);
+		).toEqual([
+			"linear",
+			"confluence",
+			"jira",
+			"github",
+			"notion",
+			"slack",
+			"zoom-meeting",
+			"zoom-doc",
+			"asana",
+			"monday",
+		]);
 	});
 
 	it("routes getConfluencePage to confluence and getJiraIssue to jira", () => {
@@ -361,6 +372,24 @@ describe("SourceDefinitionRegistry", () => {
 			expect(r.match("codex", "_get_my_tasks", "asana")).toBeUndefined();
 			expect(r.match("codex", "_search_tasks", "asana")).toBeUndefined();
 			expect(r.match("codex", "asana_get_task")).toBeUndefined(); // underscore, not the real dotted tool
+		});
+	});
+
+	describe("monday registration", () => {
+		it("resolves the Claude item-fetch tool", () => {
+			expect(getRegistry().match("claude", "mcp__claude_ai_monday_com__get_board_items_page")?.id).toBe("monday");
+		});
+		it("resolves both Codex match paths", () => {
+			const r = getRegistry();
+			expect(r.match("codex", "_get_board_items_page", "monday_com")?.id).toBe("monday"); // function_call path
+			expect(r.match("codex", "monday_com.get_board_items_page")?.id).toBe("monday"); // invocation-tool path
+		});
+		it("does NOT match monday write/enumeration/other tools", () => {
+			const r = getRegistry();
+			expect(r.match("claude", "mcp__claude_ai_monday_com__create_item")).toBeUndefined();
+			expect(r.match("claude", "mcp__claude_ai_monday_com__get_board_info")).toBeUndefined();
+			expect(r.match("claude", "mcp__claude_ai_monday_com__get_updates")).toBeUndefined();
+			expect(r.match("codex", "_get_board_info", "monday_com")).toBeUndefined();
 		});
 	});
 });

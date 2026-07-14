@@ -269,3 +269,57 @@ describe("ClaudeEnvelopeParser oversized/offloaded tool result", () => {
 		expect(claudeEnvelopeParser.parse(meetingResultLines(offloadPointer(badJson)), {}).results).toHaveLength(0);
 	});
 });
+
+describe("ClaudeEnvelopeParser monday", () => {
+	const PAYLOAD = {
+		board: { id: "18421599187", name: "Tasks" },
+		items: [
+			{
+				id: "12511130115",
+				name: "Add monday MCP integration",
+				url: "https://jolli-squad.monday.com/boards/18421599187/pulses/12511130115",
+				created_at: "2026-07-12T11:05:25Z",
+				updated_at: "2026-07-14T08:30:22Z",
+				item_description: {
+					blocks: [{ content: '{"deltaFormat":[{"insert":"Use MCP to get monday task info."}]}' }],
+				},
+			},
+		],
+		pagination: { count: 1 },
+	};
+	const TOOL = "mcp__claude_ai_monday_com__get_board_items_page";
+
+	function mondayLines(input: Record<string, unknown>): string[] {
+		return [
+			JSON.stringify({
+				message: {
+					role: "assistant",
+					content: [{ type: "tool_use", id: "m1", name: TOOL, input }],
+				},
+			}),
+			JSON.stringify({
+				message: {
+					role: "user",
+					content: [{ type: "tool_result", tool_use_id: "m1", content: JSON.stringify(PAYLOAD) }],
+				},
+			}),
+		];
+	}
+
+	it("normalizes a targeted itemIds fetch into the { items } wrapper", () => {
+		const { results } = claudeEnvelopeParser.parse(
+			mondayLines({ boardId: 18421599187, itemIds: [12511130115] }),
+			{},
+		);
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("monday");
+		const p = results[0].payload as { items: Array<{ id: string; description?: string }> };
+		expect(p.items[0].id).toBe("12511130115");
+		expect(p.items[0].description).toBe("Use MCP to get monday task info.");
+	});
+
+	it("produces nothing for a board browse (no itemIds)", () => {
+		const { results } = claudeEnvelopeParser.parse(mondayLines({ boardId: 18421599187 }), {});
+		expect(results.filter((r) => r.def.id === "monday")).toHaveLength(0);
+	});
+});

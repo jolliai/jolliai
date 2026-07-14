@@ -15,6 +15,9 @@ describe("Codex producer normalizer registry", () => {
 				"mcp__claude_ai_Atlassian__getConfluencePage",
 			);
 			expect(getCodexNormalizer("asana")?.canonicalToolName).toBe("mcp__claude_ai_Asana__get_task");
+			expect(getCodexNormalizer("monday")?.canonicalToolName).toBe(
+				"mcp__claude_ai_monday_com__get_board_items_page",
+			);
 		});
 
 		it("returns undefined for an id with no registered normalizer", () => {
@@ -48,6 +51,34 @@ describe("Codex producer normalizer registry", () => {
 			expect(out.pageId).toBe("131076");
 			expect(out.title).toBe("P");
 			expect(out.url).toBe("https://x.atlassian.net/wiki/p/131076");
+		});
+
+		it("monday normalizer gates on itemIds from the threaded tool input", () => {
+			const business = {
+				board: { name: "Tasks" },
+				items: [
+					{
+						id: "9",
+						name: "T",
+						url: "https://x.monday.com/boards/1/pulses/9",
+						created_at: "t",
+						updated_at: "t",
+					},
+				],
+			};
+			const out = getCodexNormalizer("monday")?.normalize(business, { itemIds: [9] }) as {
+				items: Array<Record<string, unknown>>;
+			};
+			expect(out.items[0]).toEqual({
+				id: "9",
+				name: "T",
+				url: "https://x.monday.com/boards/1/pulses/9",
+				board: "Tasks",
+			});
+		});
+
+		it("monday normalizer voids (null) a board browse with no itemIds", () => {
+			expect(getCodexNormalizer("monday")?.normalize({ items: [] }, {})).toBeNull();
 		});
 	});
 });

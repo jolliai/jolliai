@@ -781,7 +781,8 @@ export type KnownSourceId =
 	| "slack"
 	| "zoom-meeting"
 	| "zoom-doc"
-	| "asana";
+	| "asana"
+	| "monday";
 
 /**
  * ReferenceField — one displayable field produced by a `SourceDefinition`'s `fields` pipes.

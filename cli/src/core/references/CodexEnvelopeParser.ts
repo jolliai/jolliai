@@ -60,6 +60,9 @@ interface FunctionCallRow {
 	/** 0-based line index of the request — used to hold the cursor before an
 	 *  in-flight (output-not-yet-written) fetch call so the next poll re-reads it. */
 	readonly lineIndex: number;
+	/** Raw JSON-string `arguments` from the request, threaded to a gating
+	 *  normalizer (monday's `itemIds`); undefined when absent. */
+	readonly arguments?: string;
 }
 interface FunctionOutputRow {
 	readonly output: string;
@@ -70,6 +73,11 @@ interface ToolCallEndRow {
 	readonly callId: string | undefined;
 	readonly tool: string;
 	readonly text: string;
+	/** The event's own `invocation.arguments` (real codex_apps events carry the
+	 *  request pre-parsed as an object). In the exec/apps sandbox mode there is NO
+	 *  paired function_call row, so this is the ONLY place a gating normalizer can
+	 *  read itemIds; undefined when absent. */
+	readonly arguments?: unknown;
 	readonly lineNumber: number;
 	readonly referencedAt: string;
 }
@@ -160,7 +168,7 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 						break;
 					}
 					if (callId !== undefined && namespace !== undefined && name !== undefined) {
-						calls.set(callId, { namespace, name, lineIndex: i });
+						calls.set(callId, { namespace, name, lineIndex: i, arguments: readString(payload.arguments) });
 					}
 					break;
 				}
@@ -184,7 +192,8 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 					const tool = readInvocationTool(payload.invocation);
 					const text = readToolCallEndText(payload.result);
 					if (tool !== undefined && text !== undefined) {
-						events.push({ callId, tool, text, lineNumber: i + 1, referencedAt });
+						const args = readInvocationArguments(payload.invocation);
+						events.push({ callId, tool, text, arguments: args, lineNumber: i + 1, referencedAt });
 					}
 					break;
 				}
@@ -208,14 +217,20 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 			/* v8 ignore start -- every registry codex definition has a matching CodexBinding; guarded for totality. */
 			if (normalizer === undefined) continue;
 			/* v8 ignore stop */
+			emitted.add(callId);
+			// A gating normalizer (monday's itemIds gate) returns null to void — skip
+			// it rather than push a null payload, mirroring the Claude envelope's
+			// context-normalizer null handling. The call is still marked emitted so
+			// the FALLBACK never re-processes it.
+			const payload = normalizer.normalize(business, parseArguments(call.arguments));
+			if (payload === null) continue;
 			results.push({
 				def,
 				toolName: normalizer.canonicalToolName,
-				payload: normalizer.normalize(business),
+				payload,
 				lineNumber: out.lineNumber,
 				referencedAt: out.referencedAt,
 			});
-			emitted.add(callId);
 		}
 
 		// PRIMARY (CLI): shell_command + function_call_output pairs. Gated on
@@ -265,10 +280,23 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 					if (stitched !== null) business = stitched;
 				}
 			}
+			// Gating normalizers (monday) read the call's `arguments` to tell a
+			// targeted `itemIds` fetch from a 500-item board browse. Prefer the event's
+			// OWN `invocation.arguments`: in the codex_apps exec/apps sandbox mode the
+			// rollout carries ONLY this event — there is NO paired function_call row —
+			// so reading solely from `calls` there yielded undefined, failed the gate
+			// CLOSED, and silently dropped every exec-mode monday reference. Fall back to
+			// the paired request's arguments for older events that lack their own (and
+			// when the request landed but its output failed to parse). Still fails closed
+			// when NEITHER is present — dropping is safer than flooding a whole board.
+			const toolInput =
+				ev.arguments ?? (ev.callId !== undefined ? parseArguments(calls.get(ev.callId)?.arguments) : undefined);
+			const payload = normalizer.normalize(business, toolInput);
+			if (payload === null) continue;
 			results.push({
 				def,
 				toolName: normalizer.canonicalToolName,
-				payload: normalizer.normalize(business),
+				payload,
 				lineNumber: ev.lineNumber,
 				referencedAt: ev.referencedAt,
 			});
@@ -360,6 +388,13 @@ function parseFunctionCallOutput(output: string): unknown {
 	return unwrapTextEnvelope(parsed);
 }
 
+/** Parse a function_call's JSON-string `arguments` to an object, or undefined. */
+function parseArguments(args: string | undefined): unknown {
+	if (args === undefined) return undefined;
+	const parsed = tryParse(args);
+	return parsed === null ? undefined : parsed;
+}
+
 /** Parse the `command` field from a shell `function_call`'s JSON-string `arguments`. */
 function readShellCommand(args: unknown): string | undefined {
 	if (typeof args !== "string") return undefined;
@@ -419,6 +454,19 @@ function readString(v: unknown): string | undefined {
 function readInvocationTool(invocation: unknown): string | undefined {
 	if (!isObject(invocation)) return undefined;
 	return readString(invocation.tool);
+}
+
+/**
+ * The `invocation.arguments` an `mcp_tool_call_end` event carries — the request
+ * object a gating normalizer (monday's `itemIds`) reads. Real codex_apps events
+ * carry it pre-parsed as an object; a JSON-string variant is parsed too (that is
+ * how the sibling `function_call` serializes its `arguments`), so both shapes
+ * yield the same object downstream. Returns undefined when absent/unparsable.
+ */
+function readInvocationArguments(invocation: unknown): unknown {
+	if (!isObject(invocation)) return undefined;
+	const args = invocation.arguments;
+	return typeof args === "string" ? parseArguments(args) : args;
 }
 
 /** Extract `result.Ok.content[0].text` (the business JSON string) defensively. */
