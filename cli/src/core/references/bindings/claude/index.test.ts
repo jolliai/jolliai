@@ -5,7 +5,7 @@ describe("Claude producer binding", () => {
 	describe("CLAUDE_TOOL_PREFIXES", () => {
 		it("lists every vendor prefix for the envelope pre-filter, de-duplicated (both Linear prefixes included; Zoom prefix appears once even though zoom-meeting and zoom-doc both declare it)", () => {
 			// Order follows BUILTIN_DEFINITIONS (linear, jira, github, notion, slack,
-			// zoom-meeting, zoom-doc, asana) — derived from the SourceDefinitionRegistry.
+			// zoom-meeting, zoom-doc, asana, monday) — derived from the SourceDefinitionRegistry.
 			// zoom-meeting and zoom-doc share the same Claude MCP prefix, so
 			// CLAUDE_TOOL_PREFIXES de-dupes via a Set; the shared prefix still
 			// appears exactly once here. Order is not semantically significant
@@ -21,6 +21,7 @@ describe("Claude producer binding", () => {
 				"mcp__claude_ai_Slack__",
 				"mcp__claude_ai_Zoom_for_Claude__",
 				"mcp__claude_ai_Asana__",
+				"mcp__claude_ai_monday_com__",
 			]);
 		});
 	});

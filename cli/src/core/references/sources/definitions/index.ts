@@ -18,6 +18,7 @@ import { confluenceDefinition } from "./confluence.js";
 import { githubDefinition } from "./github.js";
 import { jiraDefinition } from "./jira.js";
 import { linearDefinition } from "./linear.js";
+import { mondayDefinition } from "./monday.js";
 import { notionDefinition } from "./notion.js";
 import { slackDefinition } from "./slack.js";
 import { zoomDocDefinition } from "./zoom-doc.js";
@@ -33,4 +34,5 @@ export const BUILTIN_DEFINITIONS = [
 	zoomMeetingDefinition,
 	zoomDocDefinition,
 	asanaDefinition,
+	mondayDefinition,
 ] as const;

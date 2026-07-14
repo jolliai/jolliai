@@ -47,6 +47,7 @@ export const SOURCE_META: Record<KnownSourceId, SourceMeta> = {
 	"zoom-meeting": { label: "Zoom Meeting", letter: "Z", icon: "device-camera-video", color: "#2D8CFF" },
 	"zoom-doc": { label: "Zoom Doc", letter: "Z", icon: "file", color: "#2D8CFF" },
 	asana: { label: "Asana", letter: "A", icon: "checklist", color: "#f06a6a" },
+	monday: { label: "monday.com", letter: "M", icon: "table", color: "#ff3d57" },
 };
 
 /** Neutral badge color for a source outside {@link SOURCE_META} (matches the prior `.mem-ctx-badge--reference` fallback hue). */

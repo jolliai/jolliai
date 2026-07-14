@@ -33,6 +33,7 @@ import { scanUserPermalinks } from "./SlackPermalink.js";
 import type { SourceDefinition } from "./SourceDefinition.js";
 import { getRegistry } from "./SourceDefinitionRegistry.js";
 import { normalizeConfluence } from "./sources/ConfluenceNormalize.js";
+import { normalizeMonday, readItemIds } from "./sources/MondayNormalize.js";
 import { normalizeSlackThread } from "./sources/SlackNormalize.js";
 import { normalizeZoomDoc } from "./sources/ZoomDocNormalize.js";
 import type {
@@ -295,6 +296,7 @@ const CONTEXT_NORMALIZERS: Record<
 		return normalizeZoomDoc(payload, { fileId: zoomInput.fileId });
 	},
 	confluence: (payload) => normalizeConfluence(payload),
+	monday: (payload, toolInput) => normalizeMonday(payload, { itemIds: readItemIds(toolInput) }),
 };
 
 /**

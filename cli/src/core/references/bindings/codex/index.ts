@@ -16,6 +16,7 @@ import { confluenceCodexBinding } from "./CodexConfluenceBinding.js";
 import { githubCodexBinding } from "./CodexGitHubBinding.js";
 import { jiraCodexBinding } from "./CodexJiraBinding.js";
 import { linearCodexBinding } from "./CodexLinearBinding.js";
+import { mondayCodexBinding } from "./CodexMondayBinding.js";
 import { notionCodexBinding } from "./CodexNotionBinding.js";
 import { zoomMeetingCodexBinding } from "./CodexZoomMeetingBinding.js";
 
@@ -30,6 +31,7 @@ const CODEX_NORMALIZERS: readonly CodexNormalizer[] = [
 	zoomMeetingCodexBinding,
 	confluenceCodexBinding,
 	asanaCodexBinding,
+	mondayCodexBinding,
 ];
 
 const BY_ID: ReadonlyMap<SourceId, CodexNormalizer> = new Map(CODEX_NORMALIZERS.map((n) => [n.id, n]));

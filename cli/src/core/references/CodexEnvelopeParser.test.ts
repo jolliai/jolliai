@@ -59,15 +59,22 @@ function fnOutputRaw(callId: string, output: string): string {
 	});
 }
 
-/** mcp_tool_call_end event row. `inner` is the business object (single-stringed). */
-function toolCallEnd(tool: string, callId: string, inner: unknown): string {
+/** mcp_tool_call_end event row. `inner` is the business object (single-stringed).
+ *  `invocationArgs` is the pre-parsed request object real codex_apps events carry
+ *  on `invocation.arguments` (present in exec/apps mode where there is no paired
+ *  function_call row); omitted when absent. */
+function toolCallEnd(tool: string, callId: string, inner: unknown, invocationArgs?: unknown): string {
 	return jsonl({
 		type: "event_msg",
 		timestamp: TS,
 		payload: {
 			type: "mcp_tool_call_end",
 			call_id: callId,
-			invocation: { server: "codex_apps", tool },
+			invocation: {
+				server: "codex_apps",
+				tool,
+				...(invocationArgs !== undefined ? { arguments: invocationArgs } : {}),
+			},
 			result: { Ok: { content: [{ type: "text", text: JSON.stringify(inner) }] } },
 		},
 	});
@@ -1022,5 +1029,95 @@ describe("CodexEnvelopeParser end-to-end — shell gh issue view (state lowercas
 		expect(gh).toHaveLength(1);
 		expect(gh[0].fields?.find((f) => f.key === "status")?.value).toBe("closed");
 		expect(gh[0].fields?.some((f) => f.key === "labels")).toBe(true);
+	});
+});
+
+describe("CodexEnvelopeParser.parse — monday (itemIds gate from event or function_call arguments)", () => {
+	const MONDAY = {
+		board: { id: "18421599187", name: "Tasks" },
+		items: [
+			{
+				id: "12511130115",
+				name: "Add monday MCP integration",
+				url: "https://jolli-squad.monday.com/boards/18421599187/pulses/12511130115",
+				created_at: "2026-07-12T11:05:25Z",
+				updated_at: "2026-07-14T08:30:22Z",
+				item_description: {
+					blocks: [{ content: '{"deltaFormat":[{"insert":"Use MCP to get monday task info."}]}' }],
+				},
+			},
+		],
+		pagination: { count: 1 },
+	};
+	// Real 2026-07-14 rollout arguments for a targeted fetch.
+	const ARGS_TARGETED = '{"boardId":18421599187,"itemIds":[12511130115],"includeItemDescription":true,"limit":1}';
+	const ARGS_BROWSE = '{"boardId":18421599187,"limit":25}';
+
+	it("PRIMARY path: function_call(arguments.itemIds) + function_call_output → monday reference", () => {
+		const lines = [
+			fnCall("mcp__codex_apps__monday_com", "_get_board_items_page", "c_mon", ARGS_TARGETED),
+			fnOutput("c_mon", MONDAY, { wrap: "bare", prefix: true }),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.map((r) => r.def.id)).toEqual(["monday"]);
+		const p = results[0].payload as { items: Array<{ id: string; description?: string }> };
+		expect(p.items[0].id).toBe("12511130115");
+		expect(p.items[0].description).toBe("Use MCP to get monday task info.");
+		expect(results[0].toolName).toBe("mcp__claude_ai_monday_com__get_board_items_page");
+	});
+
+	it("FALLBACK path: mcp_tool_call_end still gates on the paired request's itemIds", () => {
+		const lines = [
+			fnCall("mcp__codex_apps__monday_com", "_get_board_items_page", "c_mon2", ARGS_TARGETED),
+			toolCallEnd("monday_com.get_board_items_page", "c_mon2", MONDAY),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.map((r) => r.def.id)).toEqual(["monday"]);
+		expect((results[0].payload as { items: Array<{ id: string }> }).items[0].id).toBe("12511130115");
+	});
+
+	it("captures nothing for a board browse (arguments without itemIds), PRIMARY path", () => {
+		const lines = [
+			fnCall("mcp__codex_apps__monday_com", "_get_board_items_page", "c_mon3", ARGS_BROWSE),
+			fnOutput("c_mon3", MONDAY, { wrap: "bare", prefix: true }),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.filter((r) => r.def.id === "monday")).toHaveLength(0);
+	});
+
+	it("captures nothing for a board browse (arguments without itemIds), FALLBACK path", () => {
+		const lines = [
+			fnCall("mcp__codex_apps__monday_com", "_get_board_items_page", "c_mon4", ARGS_BROWSE),
+			toolCallEnd("monday_com.get_board_items_page", "c_mon4", MONDAY),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.filter((r) => r.def.id === "monday")).toHaveLength(0);
+	});
+
+	// exec/apps sandbox mode: the codex_apps connector routes the MCP call so that
+	// the rollout carries ONLY an mcp_tool_call_end event — no paired function_call
+	// row — with itemIds pre-parsed on `invocation.arguments`. Grounded on the real
+	// 2026-07-14 rollout event shape (invocation.arguments is an object, itemIds are
+	// numbers). Before the gate read the event's own arguments, this voided → the
+	// monday reference silently vanished from the sidebar.
+	it("FALLBACK exec/apps mode: mcp_tool_call_end alone (no function_call) gates on invocation.arguments.itemIds", () => {
+		const lines = [
+			toolCallEnd("monday_com.get_board_items_page", "c_exec", MONDAY, {
+				boardId: 18421599187,
+				itemIds: [12511130115],
+				limit: 1,
+			}),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.map((r) => r.def.id)).toEqual(["monday"]);
+		expect((results[0].payload as { items: Array<{ id: string }> }).items[0].id).toBe("12511130115");
+	});
+
+	it("FALLBACK exec/apps mode: board browse event (invocation.arguments without itemIds) voids", () => {
+		const lines = [
+			toolCallEnd("monday_com.get_board_items_page", "c_exec2", MONDAY, { boardId: 18421599187, limit: 25 }),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.filter((r) => r.def.id === "monday")).toHaveLength(0);
 	});
 });

@@ -29,10 +29,13 @@ export interface CodexNormalizer {
 	readonly canonicalToolName: string;
 	/**
 	 * Normalize the connector business payload — a single entity OR a search/list
-	 * collection — into the shape the shared definition reads. Implementations use
-	 * {@link normalizeEntities} so both shapes are handled uniformly.
+	 * collection — into the shape the shared definition reads. `toolInput` is the
+	 * parsed `function_call` `arguments` (undefined when absent); only sources that
+	 * gate on their input read it (monday's `itemIds`). Every other binding ignores
+	 * it. Implementations use {@link normalizeEntities} so both shapes are handled
+	 * uniformly.
 	 */
-	normalize(business: unknown): unknown;
+	normalize(business: unknown, toolInput?: unknown): unknown;
 
 	/**
 	 * OPTIONAL recovery — **not** the main path. The normal path is: parse the
