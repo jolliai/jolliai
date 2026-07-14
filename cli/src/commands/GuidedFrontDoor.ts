@@ -1,30 +1,40 @@
 /**
  * The guided front door — what bare `jolli` (no args, interactive TTY) runs.
  *
- * It reads two axes of state — auth (global sign-in / credentials) and enable
- * (per-repo hooks) — and offers the next step: sign in, enable the repo, then
- * confirm "Jolli is listening". It replaces having to run `auth login`, `auth
- * status`, `enable`, and `status` by hand, without removing those commands.
+ * It reads two orthogonal capabilities and guides the next step:
+ *   - can generate — is there a usable LLM key (`resolveLlmCredentialSource`)?
+ *   - can sync     — is there any Jolli credential (OAuth token or jolliApiKey)
+ *                    to push memories to a Space?
+ * `signedIn` (an OAuth token) is display-only — it decides the status-line
+ * wording, never the control flow.
  *
- * Everything about the cloud side (pushing memories to a Jolli Space, binding,
- * sync prompts) is delegated to `runSpaceSyncStep` — the front door only calls
- * it once the repo is enabled and prints nothing about push/sync itself.
+ * Flow: opening status line → capability ladder (fix generation if broken, then
+ * offer sign-in if memories can't sync) → cloud side-effects with the settled
+ * credentials → a closing "Jolli is listening" when generation works. It
+ * replaces running `auth login`, `auth status`, `enable`, and `status` by hand
+ * without removing those commands. Everything about the cloud side (pushing to a
+ * Space, binding, sync prompts) is delegated to `runSpaceSyncStep`.
  */
 
-import { loadAuthToken } from "../auth/AuthConfig.js";
+import { getJolliUrl, loadAuthToken } from "../auth/AuthConfig.js";
+import { browserLogin } from "../auth/Login.js";
+import { validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { getGlobalConfigDir, loadConfig, saveConfigScoped } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { getSummaryCount, setActiveStorage } from "../core/SummaryStore.js";
 import { track } from "../core/Telemetry.js";
+import { loadUserProfile, saveUserProfile } from "../core/UserProfile.js";
 import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
 import { isGitHookInstalled } from "../install/GitHookInstaller.js";
 import { install } from "../install/Installer.js";
-import { setLogDir } from "../Logger.js";
+import { createLogger, setLogDir } from "../Logger.js";
 import type { JolliMemoryConfig } from "../Types.js";
 import { isAffirmative, promptText, resolveProjectDir } from "./CliUtils.js";
 import { promptSetup } from "./EnableCommand.js";
 import { runSpaceSyncStep } from "./SpaceSyncStep.js";
+
+const log = createLogger("GuidedFrontDoor");
 
 /** Lightweight front-door status. Deliberately avoids the heavy `getStatus()`. */
 export interface GuidedFrontDoorStatus {
@@ -75,6 +85,7 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	// Any of these counts as "has some credential" and skips the sign-in guide.
 	const hasCredential = (): boolean =>
 		Boolean(token || config.jolliApiKey || config.apiKey || process.env.ANTHROPIC_API_KEY);
+
 	// ── Auth axis: no credential at all → run the existing sign-in / config guide ──
 	if (!hasCredential()) {
 		await promptSetup();
@@ -108,11 +119,12 @@ export async function runGuidedFrontDoor(): Promise<void> {
 		summaryCount = await getSummaryCount(cwd);
 	}
 
-	// ── Status line: reflect the real credential state, never a blanket sign-in ──
-	// `credSource` uses the authoritative resolver (honours the chosen aiProvider),
-	// so it can name the actual key in play and also gates "listening" below. A
-	// bare OAuth token alone is not an LLM credential, hence null → "not signed in".
+	// ── Two orthogonal capabilities. `signedIn` (a token) is display-only. ──
 	const credSource = resolveLlmCredentialSource(config);
+	let canGenerate = credSource !== null;
+	let canSync = Boolean(token || config.jolliApiKey);
+
+	// ── Status line (opening snapshot; the token picks the wording only) ──
 	if (token) {
 		const site = siteHost(config.jolliUrl);
 		console.log(site ? `\n  ✓ signed in · ${site}` : "\n  ✓ signed in");
@@ -124,80 +136,99 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	}
 	console.log(`  ✓ enabled · ${summaryCount} ${summaryCount === 1 ? "memory" : "memories"}`);
 
-	// ── Cloud sync + push catch-up: whenever enabled. Resolve or create the repo
-	// binding before retrying pending pushes so the first retry cannot race ahead
-	// and fail with `binding_required`. The retry remains fire-and-forget after
-	// setup and no-ops when not signed in. ──
-	if (enabled) {
-		await runSpaceSyncStep(cwd);
-		void triggerPendingPushRetry(cwd);
+	// ── Rung 1 (blocking): a credential exists but the chosen provider can't use
+	// it → repair the provider/key mismatch. `hasCredential()` excludes the fresh
+	// user who just skipped setup (nothing to repair — don't re-ask). ──
+	if (!canGenerate && hasCredential()) {
+		canGenerate = await promptGenerationFix(config);
+		// A key entered / provider switched above may now allow sync too.
+		config = await loadConfig();
+		canSync = Boolean(token || config.jolliApiKey);
 	}
 
-	// ── Confirmation: only promise "listening" when memories can be generated ──
-	let generatable = credSource !== null;
-	if (!generatable && token) {
-		// Signed in, but the chosen provider has no usable key. Offer an in-place
-		// fix; it returns whether we can generate now (a key was set / provider switched).
-		generatable = await promptGenerationFix(config);
-		// NOTE: promptGenerationFix may have persisted config changes (via
-		// saveConfigScoped); the in-memory `config` / `credSource` are now stale.
-		// Nothing below re-reads them — re-read config if you add logic that does.
+	// ── Rung 2 (non-blocking): generation works, but memories can't leave the
+	// machine → offer sign-in once, defaulting to Yes. A prior decline (persisted
+	// in profile.json) suppresses it. Read the profile lazily — only here. ──
+	if (canGenerate && !canSync) {
+		const profile = await loadUserProfile();
+		if (!profile.signInPromptDeclined) {
+			await promptOptionalLogin();
+			token = await loadAuthToken();
+			config = await loadConfig();
+			canSync = Boolean(token || config.jolliApiKey);
+		}
 	}
-	if (generatable) {
+
+	// ── Cloud side-effects: only after credentials are settled, so a sign-in or
+	// key established above is picked up this run. We are always enabled by here
+	// (the enable axis above either enabled the repo or returned early). Bind the
+	// Space first (runSpaceSyncStep), then push the backlog to it —
+	// triggerPendingPushRetry is idempotent and no-ops when not signed in. ──
+	await runSpaceSyncStep(cwd);
+	void triggerPendingPushRetry(cwd);
+
+	// ── Closing confirmation: only promise "listening" when generation works. ──
+	if (canGenerate) {
 		const listening =
 			summaryCount === 0
 				? "Jolli is listening — your next commit is your first memory"
 				: "Jolli is listening — last memory saved.";
-		// Generating locally via an Anthropic key but with no Jolli credential at
-		// all — nudge (never force) sign-in so memories can sync to a Space.
-		const nudge =
-			!token && !config.jolliApiKey
-				? "\n  Not signed in to Jolli — run `jolli auth login` to sync memories to a Space."
-				: "";
-		console.log(`\n  ${listening}${nudge}\n`);
+		console.log(`\n  ${listening}\n`);
 	}
 }
 
 /**
- * Signed in, but the active provider has no usable key. Offer to fix it in place:
- * enter an Anthropic key, or — when the user already has a Jolli sign-in key —
- * switch to the Jolli provider. The provider is only ever changed by an explicit
- * choice here, never silently. Each choice writes `aiProvider` so the saved
- * credential and the chosen provider can't drift out of sync.
+ * Reached only when generation is broken while a credential exists: the chosen
+ * `aiProvider` has no usable key. Offer the zero-typing fix first — switch to
+ * whichever provider a key already exists for — then entering the missing key,
+ * then skip. The provider is only ever changed by an explicit choice here.
+ * Returns whether generation can now proceed (a key was set / provider switched).
  */
 async function promptGenerationFix(config: JolliMemoryConfig): Promise<boolean> {
 	const configDir = getGlobalConfigDir();
-	// Reaching here means canGenerate() was false. If a jolliApiKey exists the
-	// provider cannot be "jolli" (that would already generate), so offering to
-	// switch to Jolli is always safe when a jolliApiKey is present.
-	const canUseJolli = Boolean(config.jolliApiKey);
+	const provider = config.aiProvider === "jolli" ? "jolli" : "anthropic";
+	const providerName = provider === "jolli" ? "Jolli" : "Anthropic";
+	const hasJolliKey = Boolean(config.jolliApiKey);
+	const hasAnthropicKey = Boolean(config.apiKey || process.env.ANTHROPIC_API_KEY);
+	// The *other* provider already has a key → switching to it fixes generation
+	// with no typing. Symmetric: covers both provider directions.
+	const otherHasKey = provider === "anthropic" ? hasJolliKey : hasAnthropicKey;
+	const otherProvider = provider === "anthropic" ? "jolli" : "anthropic";
+	const otherName = otherProvider === "jolli" ? "Jolli" : "Anthropic";
+	const enterKeyLabel = provider === "anthropic" ? "an Anthropic key" : "a Jolli key";
+	const enterMissingKey = (): Promise<boolean> =>
+		provider === "anthropic" ? promptAndSaveAnthropicKey(configDir) : promptAndSaveJolliKey(configDir);
 
-	console.log("\n  Signed in, but the current AI provider has no usable key — memories won't be generated.\n");
-	if (canUseJolli) {
-		console.log("    1. Enter an Anthropic API key          (keeps Anthropic)");
-		console.log("    2. Switch to Jolli (use your sign-in)");
+	console.log(
+		`\n  AI provider is set to ${providerName} but no ${providerName} key is available — memories won't be generated.\n`,
+	);
+
+	if (otherHasKey) {
+		const switchHint = otherProvider === "jolli" ? "use your sign-in" : "use existing key";
+		console.log(`    1. Switch to ${otherName} (${switchHint})`);
+		console.log(`    2. Enter ${enterKeyLabel}`);
 		console.log("    3. Skip for now");
 		const choice = (await promptText("\n  Choice [1]: ")) || "1";
 		if (choice === "3") {
 			console.log("\n  Skipped. Set a key in settings or run `jolli configure` later.\n");
 			return false;
 		}
-		if (choice === "2") {
-			await saveConfigScoped({ aiProvider: "jolli" }, configDir);
-			console.log("\n  ✓ switched to Jolli");
+		if (choice === "1") {
+			await saveConfigScoped({ aiProvider: otherProvider }, configDir);
+			console.log(`\n  ✓ switched to ${otherName}`);
 			return true;
 		}
-		return promptAndSaveAnthropicKey(configDir);
+		return enterMissingKey();
 	}
 
-	console.log("    1. Enter an Anthropic API key");
+	console.log(`    1. Enter ${enterKeyLabel}`);
 	console.log("    2. Skip for now");
 	const choice = (await promptText("\n  Choice [1]: ")) || "1";
 	if (choice === "2") {
 		console.log("\n  Skipped. Set a key in settings or run `jolli configure` later.\n");
 		return false;
 	}
-	return promptAndSaveAnthropicKey(configDir);
+	return enterMissingKey();
 }
 
 /** Prompts for an Anthropic API key, saves it, and pins the provider to Anthropic. Returns whether a key was saved. */
@@ -210,4 +241,51 @@ async function promptAndSaveAnthropicKey(configDir: string): Promise<boolean> {
 	await saveConfigScoped({ apiKey: key, aiProvider: "anthropic" }, configDir);
 	console.log("\n  ✓ Anthropic key saved");
 	return true;
+}
+
+/** Prompts for a Jolli API key, validates + saves it, and pins the provider to Jolli. Returns whether a key was saved. */
+async function promptAndSaveJolliKey(configDir: string): Promise<boolean> {
+	const key = await promptText("\n  Jolli API Key (press Enter to skip): ");
+	if (!key) {
+		console.log("  Skipped. Set a key in settings or run `jolli configure` later.\n");
+		return false;
+	}
+	try {
+		validateJolliApiKey(key);
+	} catch (err) {
+		console.error(`\n  Error: ${(err as Error).message}\n`);
+		return false;
+	}
+	await saveConfigScoped({ jolliApiKey: key, aiProvider: "jolli" }, configDir);
+	console.log("\n  ✓ Jolli key saved");
+	return true;
+}
+
+/**
+ * Generation works locally, but there's no Jolli credential to sync memories to
+ * a Space. Offer to sign in — default Yes, asked once. On an explicit "no" we
+ * persist the decline (profile.json) so this never reappears; a login failure is
+ * NOT a decline, so it stays unrecorded and the next run can offer again.
+ */
+async function promptOptionalLogin(): Promise<void> {
+	const answer = await promptText("\n  Not signed in to Jolli. Sign in now to sync memories to a Space? [Y/n] ");
+	if (!isAffirmative(answer)) {
+		// Persisting the decline is best-effort: a cosmetic "don't ask again" flag
+		// must never abort the front door if the profile dir isn't writable — we
+		// just offer again next run.
+		try {
+			await saveUserProfile({ signInPromptDeclined: true });
+		} catch {
+			log.debug("Could not persist the sign-in decline; will offer again next run");
+		}
+		console.log("  You can sign in anytime with `jolli auth login`.\n");
+		return;
+	}
+	try {
+		await browserLogin(getJolliUrl());
+		console.log("\n  ✓ signed in — memories will sync to your Space.\n");
+	} catch (err) {
+		console.error(`\n  Login failed: ${err instanceof Error ? err.message : String(err)}`);
+		console.log("  You can try again with `jolli auth login`.\n");
+	}
 }
