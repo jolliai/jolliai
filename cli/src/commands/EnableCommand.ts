@@ -204,7 +204,7 @@ export function registerEnableCommand(program: Command): void {
 				// integrations-only mode (IntelliJ manages its own hook/worker). Fully
 				// guarded — never throws, no-ops when nothing is pending or not signed in.
 				if (!options.integrationsOnly) {
-					void triggerPendingPushRetry(options.cwd);
+					triggerPendingPushRetry(options.cwd, "cli-enable");
 				}
 
 				// Historical back-fill is no longer kicked off automatically at enable

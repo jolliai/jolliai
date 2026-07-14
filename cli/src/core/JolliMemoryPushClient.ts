@@ -16,10 +16,13 @@
  * VS Code `BindingInfo` type suggesting one.
  */
 
+import { createLogger } from "../Logger.js";
 import { JOLLI_CLIENT_HEADER } from "./ClientHeader.js";
 import { deriveJolliEnvKey, type JolliApiKeyMeta, parseBaseUrl, parseJolliApiKey } from "./JolliApiUtils.js";
 import { loadConfig } from "./SessionTracker.js";
 import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "./TraceContext.js";
+
+const log = createLogger("JolliMemoryPushClient");
 
 /** No `jolliApiKey` configured, or no Jolli URL could be resolved from it. */
 export class NotAuthenticatedError extends Error {
@@ -64,6 +67,32 @@ export class BindingRequiredError extends Error {
 		super(message ?? "binding_required");
 		this.name = "BindingRequiredError";
 		this.repoUrl = repoUrl;
+	}
+}
+
+/**
+ * `POST /api/push/jollimemory/batch` returned 404 — the server predates the
+ * batch endpoint. Callers leave their pending entries untouched (no retry
+ * burn) so a later server deploy picks them up.
+ */
+export class BatchUnsupportedError extends Error {
+	constructor(message?: string) {
+		super(message ?? "Jolli server does not support batch push yet");
+		this.name = "BatchUnsupportedError";
+	}
+}
+
+/**
+ * Server returned 403 — the API key is valid but lacks permission to write
+ * (no `articles.edit` on the bound Space, or a key scope restriction).
+ * Distinct from {@link NotAuthenticatedError} so user-facing surfaces (the
+ * pre-push result list) don't mislabel a permission problem as "not signed
+ * in". Config-class: retrying without a permission change cannot succeed.
+ */
+export class PermissionDeniedError extends Error {
+	constructor(message?: string) {
+		super(message ?? "No permission to write to the bound Jolli Space.");
+		this.name = "PermissionDeniedError";
 	}
 }
 
@@ -222,6 +251,96 @@ interface PushResponseBody {
 	readonly repoUrl?: string;
 }
 
+// ─── Batch push (POST /api/push/jollimemory/batch) ──────────────────────────
+
+/**
+ * Max commits per batch request. MUST stay in lockstep with the server's
+ * `BATCH_MAX_ITEMS` (`backend/src/router/PushRouter.ts`) — the server rejects
+ * larger payloads with 400.
+ */
+export const BATCH_MAX_ITEMS = 30;
+
+/**
+ * Remaining batch request limits. These MUST stay in lockstep with
+ * `BatchPushRequestSchema` in the server's `PushRouter.ts`.
+ */
+export const BATCH_MAX_ATTACHMENTS_PER_ITEM = 50;
+export const BATCH_MAX_CONTENT_CHARS = 2_000_000;
+export const BATCH_MAX_TOTAL_CONTENT_CHARS = 8_000_000;
+
+/** One attachment (plan/note/reference) inside a batch item. */
+export interface BatchPushAttachment {
+	readonly clientKey: string;
+	readonly docType: "plan" | "note" | "reference";
+	readonly title: string;
+	readonly content: string;
+	readonly relativePath?: string;
+	readonly docId?: number;
+}
+
+/** One commit's summary + owned attachments inside a batch payload. */
+export interface BatchPushItem {
+	readonly commitHash: string;
+	readonly branch?: string;
+	readonly summary: {
+		readonly title: string;
+		readonly content: string;
+		readonly relativePath?: string;
+		readonly docId?: number;
+		readonly summaryJson?: string;
+	};
+	readonly attachments: ReadonlyArray<BatchPushAttachment>;
+}
+
+/** Payload for `POST /api/push/jollimemory/batch`. */
+export interface BatchPushPayload {
+	readonly repoUrl?: string;
+	readonly items: ReadonlyArray<BatchPushItem>;
+}
+
+/** Per-attachment entry in a batch item result. */
+export interface BatchAttachmentResult {
+	readonly clientKey: string;
+	readonly ok: boolean;
+	readonly docId?: number;
+	readonly url?: string;
+	readonly jrn?: string;
+	readonly created?: boolean;
+	readonly error?: string;
+}
+
+/** Doc fields reported for a successfully pushed batch summary. */
+export interface BatchDocResult {
+	readonly docId: number;
+	readonly url: string;
+	readonly jrn: string;
+	readonly created: boolean;
+	readonly summaryJsonDocId?: number;
+}
+
+/** Per-item (= per-commit) entry of the batch response, in request order. */
+export interface BatchItemResult {
+	readonly commitHash: string;
+	readonly ok: boolean;
+	readonly summary?: BatchDocResult;
+	readonly attachments: ReadonlyArray<BatchAttachmentResult>;
+	readonly error?: string;
+	readonly errorCode?: string;
+}
+
+/** Validated response of `POST /api/push/jollimemory/batch`. */
+export interface BatchPushResult {
+	readonly results: ReadonlyArray<BatchItemResult>;
+}
+
+/** Raw shape of `POST /api/push/jollimemory/batch` — validated entry-by-entry. */
+interface BatchPushResponseBody {
+	readonly results?: unknown;
+	readonly error?: string;
+	readonly message?: string;
+	readonly repoUrl?: string;
+}
+
 export class JolliMemoryPushClient {
 	private readonly fetchImpl: typeof fetch;
 	private readonly baseUrlOverride?: string;
@@ -348,8 +467,11 @@ export class JolliMemoryPushClient {
 		if (status === 409 && json.error === "binding_already_exists") {
 			throw new BindingAlreadyExistsError(json.message ?? "binding_already_exists");
 		}
-		if (status === 401 || status === 403) {
+		if (status === 401) {
 			throw new NotAuthenticatedError();
+		}
+		if (status === 403) {
+			throw new PermissionDeniedError(errorMessage(json));
 		}
 		if (status < 200 || status >= 300) {
 			// Read `message ?? error` like listSpaces/createBinding (and the vscode
@@ -370,6 +492,59 @@ export class JolliMemoryPushClient {
 			created: json.created,
 			summaryJsonDocId: json.summaryJsonDocId,
 		};
+	}
+
+	/**
+	 * Pushes up to {@link BATCH_MAX_ITEMS} commits (one summary + its owned
+	 * plans/notes/references each) in a single `POST /api/push/jollimemory/batch`
+	 * request. Whole-request error taxonomy mirrors {@link push}; 404 maps to
+	 * {@link BatchUnsupportedError} so the pre-push flow can leave its entries
+	 * pending instead of burning retries against a server that predates the
+	 * endpoint. Per-item success/failure is reported in `results` (request
+	 * order), HTTP 200 even on partial failure.
+	 */
+	async pushBatch(payload: BatchPushPayload): Promise<BatchPushResult> {
+		const { status, json } = await this.call<BatchPushResponseBody>("POST", "/api/push/jollimemory/batch", payload);
+		if (status === 404) {
+			throw new BatchUnsupportedError();
+		}
+		if (status === 426) {
+			throw new ClientOutdatedError(errorMessage(json) ?? "Client outdated — update the CLI/extension.");
+		}
+		if (status === 412 && json.error === "binding_required") {
+			throw new BindingRequiredError(json.repoUrl ?? payload.repoUrl ?? "", json.message);
+		}
+		if (status === 401) {
+			throw new NotAuthenticatedError();
+		}
+		if (status === 403) {
+			throw new PermissionDeniedError(errorMessage(json));
+		}
+		if (status < 200 || status >= 300) {
+			throw new Error(errorMessage(json) ?? `HTTP ${status}`);
+		}
+		if (!Array.isArray(json.results)) {
+			// Same rationale as push(): a 2xx with a gateway/HTML body must not be
+			// mistaken for "everything pushed" — the caller would delete pending
+			// entries it never actually synced.
+			throw new Error(`Batch push returned HTTP ${status} but the response was missing results`);
+		}
+		const results: BatchItemResult[] = [];
+		for (const entry of json.results) {
+			const item = toBatchItemResult(entry);
+			if (!item) {
+				throw new Error(`Batch push returned HTTP ${status} but a result entry was malformed`);
+			}
+			results.push(item);
+		}
+		const okCount = results.filter((r) => r.ok).length;
+		log.debug(
+			"pushBatch: %d item(s) sent — ok=%d failed=%d",
+			payload.items.length,
+			okCount,
+			results.length - okCount,
+		);
+		return { results };
 	}
 
 	/**
@@ -553,6 +728,123 @@ export class JolliMemoryPushClient {
 			clearTimeout(timer);
 		}
 	}
+}
+
+/** Field-by-field validation of one batch summary doc result; undefined on shape mismatch. */
+function toBatchDocResult(value: unknown): BatchDocResult | undefined {
+	if (typeof value !== "object" || value === null) {
+		return undefined;
+	}
+	const raw = value as {
+		docId?: unknown;
+		url?: unknown;
+		jrn?: unknown;
+		created?: unknown;
+		summaryJsonDocId?: unknown;
+	};
+	if (typeof raw.docId !== "number" || typeof raw.url !== "string" || typeof raw.jrn !== "string") {
+		return undefined;
+	}
+	return {
+		docId: raw.docId,
+		url: raw.url,
+		jrn: raw.jrn,
+		created: raw.created === true,
+		...(typeof raw.summaryJsonDocId === "number" && { summaryJsonDocId: raw.summaryJsonDocId }),
+	};
+}
+
+/**
+ * Field-by-field validation of one batch attachment result; undefined on shape
+ * mismatch. An `ok: true` entry without a usable docId/url is DOWNGRADED to a
+ * failure — same rationale as {@link toBatchItemResult}'s summary downgrade: a
+ * malformed success would silently skip the write-back and re-CREATE the
+ * attachment on the next push.
+ */
+function toBatchAttachmentResult(value: unknown): BatchAttachmentResult | undefined {
+	if (typeof value !== "object" || value === null) {
+		return undefined;
+	}
+	const raw = value as {
+		clientKey?: unknown;
+		ok?: unknown;
+		docId?: unknown;
+		url?: unknown;
+		jrn?: unknown;
+		created?: unknown;
+		error?: unknown;
+	};
+	if (typeof raw.clientKey !== "string" || typeof raw.ok !== "boolean") {
+		return undefined;
+	}
+	if (raw.ok && (typeof raw.docId !== "number" || typeof raw.url !== "string")) {
+		return {
+			clientKey: raw.clientKey,
+			ok: false,
+			error: "Batch attachment result was missing docId/url",
+		};
+	}
+	return {
+		clientKey: raw.clientKey,
+		ok: raw.ok,
+		...(typeof raw.docId === "number" && { docId: raw.docId }),
+		...(typeof raw.url === "string" && { url: raw.url }),
+		...(typeof raw.jrn === "string" && { jrn: raw.jrn }),
+		...(typeof raw.created === "boolean" && { created: raw.created }),
+		...(typeof raw.error === "string" && { error: raw.error }),
+	};
+}
+
+/**
+ * Field-by-field validation of one batch item result. An `ok: true` entry whose
+ * summary fields are unusable is DOWNGRADED to a failure (not dropped): the
+ * caller must keep that commit pending rather than delete it blind on a
+ * malformed success. Returns undefined only when the entry itself is garbage.
+ */
+function toBatchItemResult(value: unknown): BatchItemResult | undefined {
+	if (typeof value !== "object" || value === null) {
+		return undefined;
+	}
+	const raw = value as {
+		commitHash?: unknown;
+		ok?: unknown;
+		summary?: unknown;
+		attachments?: unknown;
+		error?: unknown;
+		errorCode?: unknown;
+	};
+	if (typeof raw.commitHash !== "string" || typeof raw.ok !== "boolean") {
+		return undefined;
+	}
+	const attachments: BatchAttachmentResult[] = [];
+	if (Array.isArray(raw.attachments)) {
+		for (const entry of raw.attachments) {
+			const attachment = toBatchAttachmentResult(entry);
+			if (attachment) {
+				attachments.push(attachment);
+			}
+		}
+	}
+	if (raw.ok) {
+		const summary = toBatchDocResult(raw.summary);
+		if (!summary) {
+			return {
+				commitHash: raw.commitHash,
+				ok: false,
+				attachments,
+				errorCode: "malformed_response",
+				error: "Batch item result was missing docId/url",
+			};
+		}
+		return { commitHash: raw.commitHash, ok: true, summary, attachments };
+	}
+	return {
+		commitHash: raw.commitHash,
+		ok: false,
+		attachments,
+		...(typeof raw.error === "string" && { error: raw.error }),
+		...(typeof raw.errorCode === "string" && { errorCode: raw.errorCode }),
+	};
 }
 
 function isErrorBody(value: unknown): value is ErrorResponseBody {

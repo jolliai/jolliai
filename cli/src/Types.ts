@@ -501,7 +501,7 @@ export interface CommitSummary {
 	readonly orphanedDocIds?: ReadonlyArray<number>;
 	/**
 	 * Commit hashes whose summaries had no `jolliDocId` at squash/merge time
-	 * (race: PrePushWorker hadn't written back the ID yet). Consumed at push
+	 * (race: the pre-push sync hadn't written back the ID yet). Consumed at push
 	 * time: re-read each hash, promote any now-present docId into
 	 * `orphanedDocIds` for cleanup, retain hashes still present in the shared
 	 * push-pending queue, and discard only hashes known not to be in flight.
@@ -1124,9 +1124,11 @@ export interface JolliMemoryConfig {
 	/**
 	 * Auto-push memory to Jolli Space on every `git push`. `undefined` = enabled
 	 * (default when logged in); `false` = disabled. The pre-push hook records
-	 * pushed commits into `.jolli/jollimemory/push-pending.json` and a detached
-	 * PrePushWorker syncs them to the bound Space. Complementary to the
-	 * PR-level `push_memory` flow — same idempotent server path, no duplicates.
+	 * pushed commits into `.jolli/jollimemory/push-pending.json` and syncs the
+	 * ones with generated memory to the bound Space synchronously (budget-bound
+	 * batch request); the rest follow via the compensation channels.
+	 * Complementary to the PR-level `push_memory` flow — same idempotent server
+	 * path, no duplicates.
 	 */
 	readonly syncOnPush?: boolean;
 	/**

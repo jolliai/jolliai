@@ -21,6 +21,8 @@ vi.mock("./GitRemoteUtils.js", async (importOriginal) => {
 import { getDefaultBranch } from "./GitOps.js";
 import { buildBranchRelativePath, getCanonicalRepoUrl } from "./GitRemoteUtils.js";
 import {
+	BATCH_MAX_ATTACHMENTS_PER_ITEM,
+	type BatchItemResult,
 	BindingAlreadyExistsError,
 	BindingRequiredError,
 	ClientOutdatedError,
@@ -30,12 +32,15 @@ import {
 	type PushResult,
 } from "./JolliMemoryPushClient.js";
 import {
+	applyBatchResult,
 	applyNoteUrls,
 	applyPlanUrls,
 	applyReferenceUrls,
 	assignOwnedAttachments,
+	buildBatchItems,
 	buildPushMarkdown,
 	canReuseDocId,
+	docUrlPlaceholder,
 	latestPlanPerName,
 	type PushContext,
 	pushBranchToJolli,
@@ -1593,5 +1598,399 @@ describe("pushBranchToJolli", () => {
 		vi.mocked(getCanonicalRepoUrl).mockRejectedValue(new Error("stop before any network call"));
 		const result = await pushBranchToJolli({ cwd: "/repo" });
 		expect(result.type).toBe("error");
+	});
+});
+
+// ─── Batch push helpers ──────────────────────────────────────────────────────
+
+describe("docUrlPlaceholder", () => {
+	it("builds the lockstep placeholder shape", () => {
+		expect(docUrlPlaceholder("plan-0")).toBe("{{jolli:doc:plan-0}}");
+	});
+});
+
+describe("buildBatchItems", () => {
+	beforeEach(() => {
+		vi.mocked(readPlanFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(readNoteFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(readReferenceFromBranch).mockReset().mockResolvedValue(null);
+	});
+
+	function owned(overrides: {
+		plans?: Map<string, ReadonlyArray<PlanReference>>;
+		notes?: Map<string, ReadonlyArray<NoteReference>>;
+		references?: Map<string, ReadonlyArray<ReferenceCommitRef>>;
+	}) {
+		return {
+			ownedPlans: overrides.plans ?? new Map(),
+			ownedNotes: overrides.notes ?? new Map(),
+			ownedReferences: overrides.references ?? new Map(),
+		};
+	}
+
+	it("builds one item per summary with placeholder-woven markdown and attachment keys", async () => {
+		const summary = leaf({ plans: [plan()] });
+		vi.mocked(readPlanFromBranch).mockResolvedValue("# Plan body");
+		const ctx = baseCtx(fakeClient());
+
+		const built = await buildBatchItems(
+			[summary],
+			owned({ plans: new Map([[summary.commitHash, [plan()]]]) }),
+			ctx,
+		);
+
+		expect(built).toHaveLength(1);
+		const item = built[0].item;
+		expect(item.commitHash).toBe(summary.commitHash);
+		expect(item.branch).toBe(summary.branch);
+		expect(item.attachments).toHaveLength(1);
+		expect(item.attachments[0]).toMatchObject({ clientKey: "plan-0", docType: "plan", content: "# Plan body" });
+		// The placeholder is woven into the summary markdown where the plan URL goes.
+		expect(item.summary.content).toContain(docUrlPlaceholder("plan-0"));
+		// Write-back bookkeeping maps the clientKey to the plan's slug.
+		expect(built[0].attachmentKeys.get("plan-0")).toEqual({ kind: "plan", key: "p1" });
+		expect(built[0].batchContentChars).toBe(
+			item.summary.content.length + (item.summary.summaryJson?.length ?? 0) + item.attachments[0].content.length,
+		);
+		expect(built[0].batchIneligibleReason).toBeUndefined();
+	});
+
+	it("marks an item with too many attachments for the per-commit fallback", async () => {
+		const plans = Array.from({ length: BATCH_MAX_ATTACHMENTS_PER_ITEM + 1 }, (_, index) =>
+			plan({ slug: `p-${index}` }),
+		);
+		const summary = leaf({ plans });
+		vi.mocked(readPlanFromBranch).mockResolvedValue("# Plan body");
+
+		const built = await buildBatchItems(
+			[summary],
+			owned({ plans: new Map([[summary.commitHash, plans]]) }),
+			baseCtx(fakeClient()),
+		);
+
+		expect(built[0].item.attachments).toHaveLength(BATCH_MAX_ATTACHMENTS_PER_ITEM + 1);
+		expect(built[0].batchIneligibleReason).toBe("attachment count exceeds the batch limit");
+	});
+
+	it("skips a plan whose content is unreadable (no attachment, no placeholder)", async () => {
+		const summary = leaf({ plans: [plan()] });
+		vi.mocked(readPlanFromBranch).mockResolvedValue(null);
+		const ctx = baseCtx(fakeClient());
+
+		const built = await buildBatchItems(
+			[summary],
+			owned({ plans: new Map([[summary.commitHash, [plan()]]]) }),
+			ctx,
+		);
+
+		expect(built[0].item.attachments).toHaveLength(0);
+		expect(built[0].item.summary.content).not.toContain("{{jolli:doc:");
+	});
+
+	it("carries a reusable docId when the stored doc URL matches the push env", async () => {
+		const summary = leaf({ plans: [plan()] });
+		vi.mocked(readPlanFromBranch).mockResolvedValue("# Plan body");
+		const reusable = plan({ jolliPlanDocId: 42, jolliPlanDocUrl: `${BASE}/articles/p-42` });
+		const ctx = baseCtx(fakeClient());
+
+		const built = await buildBatchItems(
+			[summary],
+			owned({ plans: new Map([[summary.commitHash, [reusable]]]) }),
+			ctx,
+		);
+
+		expect(built[0].item.attachments[0].docId).toBe(42);
+	});
+
+	it("drops a docId minted on a different backend (env mismatch)", async () => {
+		const summary = leaf({ plans: [plan()] });
+		vi.mocked(readPlanFromBranch).mockResolvedValue("# Plan body");
+		const foreign = plan({ jolliPlanDocId: 42, jolliPlanDocUrl: "https://other.jolli.dev/articles/p-42" });
+		const ctx = baseCtx(fakeClient());
+
+		const built = await buildBatchItems(
+			[summary],
+			owned({ plans: new Map([[summary.commitHash, [foreign]]]) }),
+			ctx,
+		);
+
+		expect(built[0].item.attachments[0].docId).toBeUndefined();
+	});
+
+	it("carries the summary's own reusable docId and summaryJson", async () => {
+		const summary = leaf({ jolliDocId: 7, jolliDocUrl: `${BASE}/articles/s-7` });
+		const ctx = baseCtx(fakeClient());
+
+		const built = await buildBatchItems([summary], owned({}), ctx);
+
+		expect(built[0].item.summary.docId).toBe(7);
+		expect(built[0].item.summary.summaryJson).toBeDefined();
+	});
+
+	it("reads note bodies from the inline content field without hitting storage", async () => {
+		const summary = leaf({ notes: [note({ content: "inline note body" })] });
+		const ctx = baseCtx(fakeClient());
+
+		const built = await buildBatchItems(
+			[summary],
+			owned({ notes: new Map([[summary.commitHash, [note({ content: "inline note body" })]]]) }),
+			ctx,
+		);
+
+		expect(built[0].item.attachments[0]).toMatchObject({
+			clientKey: "note-0",
+			docType: "note",
+			content: "inline note body",
+		});
+		expect(readNoteFromBranch).not.toHaveBeenCalled();
+	});
+});
+
+describe("applyBatchResult", () => {
+	beforeEach(() => {
+		vi.mocked(storeSummary).mockReset().mockResolvedValue(undefined);
+		vi.mocked(getIndexEntryMap).mockReset().mockResolvedValue(new Map());
+		vi.mocked(getSummary).mockReset().mockResolvedValue(null);
+		vi.mocked(loadPushPending).mockReset().mockResolvedValue({ version: 1, entries: {} });
+		vi.mocked(readPlanFromBranch).mockReset().mockResolvedValue("# Plan body");
+		vi.mocked(readNoteFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(readReferenceFromBranch).mockReset().mockResolvedValue(null);
+	});
+
+	async function buildOne(summary: CommitSummary, plans: ReadonlyArray<PlanReference> = []) {
+		const ctx = baseCtx(fakeClient());
+		const built = await buildBatchItems(
+			[summary],
+			{
+				ownedPlans: new Map(plans.length > 0 ? [[summary.commitHash, plans]] : []),
+				ownedNotes: new Map(),
+				ownedReferences: new Map(),
+			},
+			ctx,
+		);
+		return { ctx, built };
+	}
+
+	function okResult(summary: CommitSummary, attachments: BatchItemResult["attachments"] = []): BatchItemResult {
+		return {
+			commitHash: summary.commitHash,
+			ok: true,
+			summary: { docId: 9, url: "/articles/s-9", jrn: "jrn:9", created: true },
+			attachments,
+		};
+	}
+
+	it("writes back the summary docId/url and woven attachment URLs on success", async () => {
+		const summary = leaf({ plans: [plan()] });
+		const { ctx, built } = await buildOne(summary, [plan()]);
+
+		const outcome = await applyBatchResult(
+			built,
+			[okResult(summary, [{ clientKey: "plan-0", ok: true, docId: 11, url: "/articles/p-11" }])],
+			ctx,
+		);
+
+		expect(outcome).toEqual({ writtenBack: 1, childSkipped: 0 });
+		expect(storeSummary).toHaveBeenCalledTimes(1);
+		const stored = vi.mocked(storeSummary).mock.calls[0][0] as CommitSummary;
+		expect(stored.jolliDocId).toBe(9);
+		expect(stored.jolliDocUrl).toBe(`${BASE}/articles/s-9`);
+		expect(stored.plans?.[0]).toMatchObject({ jolliPlanDocId: 11, jolliPlanDocUrl: `${BASE}/articles/p-11` });
+	});
+
+	it("deletes the freshly-pushed article and skips write-back when the commit became a child mid-push", async () => {
+		const summary = leaf();
+		const { ctx, built } = await buildOne(summary);
+		vi.mocked(getIndexEntryMap).mockResolvedValue(
+			new Map([
+				[
+					summary.commitHash,
+					{
+						commitHash: summary.commitHash,
+						parentCommitHash: "def4567890",
+						commitMessage: "",
+						commitDate: "",
+						branch: summary.branch,
+						generatedAt: "",
+					},
+				],
+			]),
+		);
+
+		const outcome = await applyBatchResult(built, [okResult(summary)], ctx);
+
+		expect(outcome).toEqual({ writtenBack: 0, childSkipped: 1 });
+		expect(ctx.client.deleteDoc).toHaveBeenCalledWith(9);
+		expect(storeSummary).not.toHaveBeenCalled();
+	});
+
+	it("deletes only the CREATEd attachments alongside the article on the mid-push child guard", async () => {
+		const summary = leaf();
+		const { ctx, built } = await buildOne(summary);
+		vi.mocked(getIndexEntryMap).mockResolvedValue(
+			new Map([
+				[
+					summary.commitHash,
+					{
+						commitHash: summary.commitHash,
+						parentCommitHash: "def4567890",
+						commitMessage: "",
+						commitDate: "",
+						branch: summary.branch,
+						generatedAt: "",
+					},
+				],
+			]),
+		);
+
+		const outcome = await applyBatchResult(
+			built,
+			[
+				okResult(summary, [
+					{ clientKey: "plan-0", ok: true, docId: 11, url: "/articles/p-11", created: true },
+					{ clientKey: "note-0", ok: true, docId: 12, url: "/articles/n-12", created: false },
+					{ clientKey: "note-1", ok: true, created: true },
+					{ clientKey: "ref-0", ok: false, error: "boom" },
+				]),
+			],
+			ctx,
+		);
+
+		expect(outcome).toEqual({ writtenBack: 0, childSkipped: 1 });
+		expect(ctx.client.deleteDoc).toHaveBeenCalledWith(9);
+		expect(ctx.client.deleteDoc).toHaveBeenCalledWith(11);
+		expect(ctx.client.deleteDoc).toHaveBeenCalledTimes(2);
+		expect(storeSummary).not.toHaveBeenCalled();
+	});
+
+	it("tolerates a best-effort delete failure on the mid-push child guard", async () => {
+		const summary = leaf();
+		const ctx = baseCtx(fakeClient({ deleteDoc: async () => Promise.reject(new Error("network")) }));
+		const built = await buildBatchItems(
+			[summary],
+			{ ownedPlans: new Map(), ownedNotes: new Map(), ownedReferences: new Map() },
+			ctx,
+		);
+		vi.mocked(getIndexEntryMap).mockResolvedValue(
+			new Map([
+				[
+					summary.commitHash,
+					{
+						commitHash: summary.commitHash,
+						parentCommitHash: "def4567890",
+						commitMessage: "",
+						commitDate: "",
+						branch: summary.branch,
+						generatedAt: "",
+					},
+				],
+			]),
+		);
+
+		// The created attachment's delete fails too — both stay best-effort.
+		await expect(
+			applyBatchResult(
+				built,
+				[
+					okResult(summary, [
+						{ clientKey: "plan-0", ok: true, docId: 11, url: "/articles/p-11", created: true },
+					]),
+				],
+				ctx,
+			),
+		).resolves.toEqual({
+			writtenBack: 0,
+			childSkipped: 1,
+		});
+	});
+
+	it("skips failed items and items with no matching built entry", async () => {
+		const summary = leaf();
+		const { ctx, built } = await buildOne(summary);
+
+		const outcome = await applyBatchResult(
+			built,
+			[
+				{ commitHash: summary.commitHash, ok: false, attachments: [], error: "boom" },
+				{ ...okResult(summary), commitHash: "f".repeat(40) },
+			],
+			ctx,
+		);
+
+		expect(outcome).toEqual({ writtenBack: 0, childSkipped: 0 });
+		expect(storeSummary).not.toHaveBeenCalled();
+	});
+
+	it("reports a per-item write-back failure with the minted ids (article is already published)", async () => {
+		const summary = leaf();
+		const { ctx, built } = await buildOne(summary);
+		vi.mocked(storeSummary).mockRejectedValue(new Error("disk full"));
+
+		const outcome = await applyBatchResult(built, [okResult(summary)], ctx);
+
+		expect(outcome).toEqual({
+			writtenBack: 0,
+			childSkipped: 0,
+			writeBackFailures: [{ commitHash: summary.commitHash, docId: 9, url: `${BASE}/articles/s-9` }],
+		});
+	});
+
+	it("treats every commit as a root when the summary index cannot be read", async () => {
+		const summary = leaf();
+		const { ctx, built } = await buildOne(summary);
+		vi.mocked(getIndexEntryMap).mockRejectedValue(new Error("index unavailable"));
+
+		const outcome = await applyBatchResult(built, [okResult(summary)], ctx);
+
+		expect(outcome).toEqual({ writtenBack: 1, childSkipped: 0 });
+		expect(ctx.client.deleteDoc).not.toHaveBeenCalled();
+		expect(storeSummary).toHaveBeenCalledTimes(1);
+	});
+
+	it("deletes orphaned articles when cleanupOrphans is set (compensation path)", async () => {
+		const summary = leaf({ orphanedDocIds: [42] });
+		const { ctx, built } = await buildOne(summary);
+
+		const outcome = await applyBatchResult(built, [okResult(summary)], ctx, { cleanupOrphans: true });
+
+		expect(outcome).toEqual({ writtenBack: 1, childSkipped: 0 });
+		expect(ctx.client.deleteDoc).toHaveBeenCalledWith(42);
+		// Two persists: the docId/url write-back, then the cleaned orphan list.
+		expect(storeSummary).toHaveBeenCalledTimes(2);
+	});
+
+	it("skips orphan cleanup by default (budget-bound inline pre-push path)", async () => {
+		const summary = leaf({ orphanedDocIds: [42] });
+		const { ctx, built } = await buildOne(summary);
+
+		const outcome = await applyBatchResult(built, [okResult(summary)], ctx);
+
+		expect(ctx.client.deleteDoc).not.toHaveBeenCalled();
+		expect(outcome).toEqual({ writtenBack: 1, childSkipped: 0, cleanupPendingHashes: [summary.commitHash] });
+	});
+
+	it("keeps the write-back result when orphan cleanup itself fails", async () => {
+		const summary = leaf({ orphanedDocIds: [42] });
+		const ctx = baseCtx(fakeClient({ deleteDoc: async () => Promise.reject(new Error("network")) }));
+		const built = await buildBatchItems(
+			[summary],
+			{ ownedPlans: new Map(), ownedNotes: new Map(), ownedReferences: new Map() },
+			ctx,
+		);
+
+		const outcome = await applyBatchResult(built, [okResult(summary)], ctx, { cleanupOrphans: true });
+
+		expect(outcome).toEqual({ writtenBack: 1, childSkipped: 0, cleanupPendingHashes: [summary.commitHash] });
+	});
+
+	it("resolves orphan hashes before cleanup on the compensation batch path", async () => {
+		const summary = leaf({ unresolvedOrphanHashes: ["child1hash"] });
+		const { ctx, built } = await buildOne(summary);
+		vi.mocked(getSummary).mockResolvedValueOnce(leaf({ commitHash: "child1hash", jolliDocId: 201 }));
+
+		const outcome = await applyBatchResult(built, [okResult(summary)], ctx, { cleanupOrphans: true });
+
+		expect(ctx.client.deleteDoc).toHaveBeenCalledWith(201);
+		expect(outcome).toEqual({ writtenBack: 1, childSkipped: 0 });
 	});
 });

@@ -87,6 +87,9 @@ const cliOptions = {
 		{ in: `${jmSrc}/hooks/PostRewriteHook.ts`,         out: "PostRewriteHook" },
 		{ in: `${jmSrc}/hooks/PrepareMsgHook.ts`,          out: "PrepareMsgHook" },
 		{ in: `${jmSrc}/hooks/PrePushHook.ts`,             out: "PrePushHook" },
+		// NOT spawned by PrePushHook anymore (inline batch sync). Kept as the
+		// detached pending-push compensation drain used by the bundled CLI, the
+		// extension, and IntelliJ's CliIntegrations.retryPendingPushes.
 		{ in: `${jmSrc}/hooks/PrePushWorker.ts`,           out: "PrePushWorker" },
 		{ in: `${jmSrc}/hooks/GeminiAfterAgentHook.ts`,   out: "GeminiAfterAgentHook" },
 		{ in: `${jmSrc}/hooks/SessionStartHook.ts`,       out: "SessionStartHook" },

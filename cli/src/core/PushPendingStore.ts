@@ -13,6 +13,8 @@
  *         "lastAttemptAt": "ISO-8601"?,   // set on every push attempt (success or fail)
  *         "retryCount": number,           // increments only on "operational" failure
  *         "lastError": "string"?,         // truncated to PUSH_ERROR_MSG_MAX_LEN chars
+ *         "pushedDocId": number?,         // article id minted by a push whose local write-back failed
+ *         "pushedUrl": "string"?,         // article url matching pushedDocId (carries the tenant gate)
  *         "pushTargets": [{                // remote refs that can confirm the push succeeded
  *           "remote": "origin",
  *           "remoteRef": "refs/heads/feature/xxx",
@@ -89,6 +91,16 @@ export interface PushPendingEntry {
 	readonly lastAttemptAt?: string;
 	readonly retryCount: number;
 	readonly lastError?: string;
+	/**
+	 * Article docId/url minted by a successful push whose local write-back
+	 * failed. The next drain reuses them as the update target, so the retry
+	 * UPDATEs the already-created article instead of CREATEing a duplicate,
+	 * and the write-back gets another chance. Cleared implicitly — a
+	 * successful write-back deletes the whole entry.
+	 */
+	readonly pushedDocId?: number;
+	/** Article url matching {@link pushedDocId}; carries the tenant gate (`canReuseDocId`). */
+	readonly pushedUrl?: string;
 	/** Successful confirmation of any target proves this commit reached the remote. */
 	readonly pushTargets?: ReadonlyArray<PushTarget>;
 	/**
@@ -114,6 +126,8 @@ export interface PushPendingEntryPatch {
 	readonly lastAttemptAt?: string;
 	readonly retryCount?: number;
 	readonly lastError?: string | null;
+	readonly pushedDocId?: number;
+	readonly pushedUrl?: string;
 }
 
 export type BatchUpdate =
@@ -385,6 +399,8 @@ export async function updateBatch(cwd: string, updates: ReadonlyMap<string, Batc
 						: patch.lastError !== undefined
 							? truncateError(patch.lastError)
 							: existing.lastError,
+				pushedDocId: patch.pushedDocId ?? existing.pushedDocId,
+				pushedUrl: patch.pushedUrl ?? existing.pushedUrl,
 				// Explicit: clear the claim on every patch so the entry can be
 				// retried by any process. Written as `undefined` (not omitted) so
 				// this stays load-bearing under future field additions — a new

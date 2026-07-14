@@ -15,6 +15,12 @@ import { getDefaultBranch } from "./GitOps.js";
 import { buildBranchRelativePath, deriveRepoNameFromUrl, getCanonicalRepoUrl } from "./GitRemoteUtils.js";
 import { deriveJolliEnvKey, resolveArticleUrl } from "./JolliApiUtils.js";
 import {
+	BATCH_MAX_ATTACHMENTS_PER_ITEM,
+	BATCH_MAX_CONTENT_CHARS,
+	BATCH_MAX_TOTAL_CONTENT_CHARS,
+	type BatchItemResult,
+	type BatchPushAttachment,
+	type BatchPushItem,
 	BindingAlreadyExistsError,
 	BindingRequiredError,
 	ClientOutdatedError,
@@ -402,6 +408,423 @@ export function buildPushMarkdown(summary: CommitSummary): string {
 	return lines.join("\n");
 }
 
+// ── Batch push helpers ───────────────────────────────────────────────────────
+
+/**
+ * Builds the article-URL placeholder embedded in batch summary content where an
+ * attachment's final URL will go. The server substitutes the real URLs after
+ * minting the doc ids — in a single-request protocol the client cannot know
+ * them up front.
+ *
+ * MUST stay byte-for-byte in lockstep with the server's `docUrlPlaceholder`
+ * (`backend/src/router/PushRouter.ts`) — same spirit as the `parseJolliApiKey`
+ * lockstep rule.
+ */
+export function docUrlPlaceholder(clientKey: string): string {
+	return `{{jolli:doc:${clientKey}}}`;
+}
+
+/** Identity of one batch attachment for the post-push URL write-back. */
+export interface BatchAttachmentKey {
+	readonly kind: "plan" | "note" | "reference";
+	/** Plan slug / note id / reference archivedKey. */
+	readonly key: string;
+}
+
+/** One built batch item plus the bookkeeping `applyBatchResult` needs. */
+export interface BuiltBatchItem {
+	readonly item: BatchPushItem;
+	readonly summary: CommitSummary;
+	readonly attachmentKeys: ReadonlyMap<string, BatchAttachmentKey>;
+	/** Character count used by the server's batch-wide content limit. */
+	readonly batchContentChars: number;
+	/** Set when this item must use the legacy per-commit push path. */
+	readonly batchIneligibleReason?: string;
+}
+
+/** Owner-assigned attachments per commit hash (see {@link assignOwnedAttachments}). */
+export interface OwnedAttachmentMaps {
+	readonly ownedPlans: ReadonlyMap<string, ReadonlyArray<PlanReference>>;
+	readonly ownedNotes: ReadonlyMap<string, ReadonlyArray<NoteReference>>;
+	readonly ownedReferences: ReadonlyMap<string, ReadonlyArray<ReferenceCommitRef>>;
+}
+
+/**
+ * Builds one `BatchPushItem` per summary for `pushBatch`: reads attachment
+ * bodies, assigns per-item clientKeys, weaves placeholder URLs into the
+ * summary markdown (+ summaryJson), and carries existing docIds (env-gated by
+ * {@link canReuseDocId}) so the server updates instead of creating.
+ *
+ * Only URL fields carry placeholders — attachment docId fields inside the
+ * summaryJson stay numeric/absent (a placeholder string there would break the
+ * sidecar schema); the local write-back (`applyBatchResult`) records the real
+ * ids for the next push.
+ *
+ * Unreadable/empty attachment bodies are skipped like `pushPlanList` — their
+ * placeholder is never minted, so the woven copy keeps whatever URL state the
+ * reference already had.
+ */
+export async function buildBatchItems(
+	summaries: ReadonlyArray<CommitSummary>,
+	owned: OwnedAttachmentMaps,
+	ctx: PushContext,
+): Promise<Array<BuiltBatchItem>> {
+	const envKey = await ctx.client.resolveEnvKey();
+	const built: Array<BuiltBatchItem> = [];
+	for (const summary of summaries) {
+		built.push(await buildOneBatchItem(summary, owned, ctx, envKey));
+	}
+	const attachmentCount = built.reduce((sum, item) => sum + item.item.attachments.length, 0);
+	const fallbackCount = built.filter((item) => item.batchIneligibleReason !== undefined).length;
+	log.debug(
+		"buildBatchItems: built %d item(s) with %d attachment(s), individualFallback=%d",
+		built.length,
+		attachmentCount,
+		fallbackCount,
+	);
+	return built;
+}
+
+/** Mirrors the server's batch content accounting exactly. */
+function countBatchContentChars(item: BatchPushItem): number {
+	let total = item.summary.content.length + (item.summary.summaryJson?.length ?? 0);
+	for (const attachment of item.attachments) total += attachment.content.length;
+	return total;
+}
+
+/** Returns why an item cannot pass the server's batch schema, if any. */
+function getBatchIneligibleReason(item: BatchPushItem, contentChars: number): string | undefined {
+	if (item.summary.content.length > BATCH_MAX_CONTENT_CHARS) return "summary content exceeds the batch limit";
+	if ((item.summary.summaryJson?.length ?? 0) > BATCH_MAX_CONTENT_CHARS)
+		return "summary JSON exceeds the batch limit";
+	if (item.attachments.length > BATCH_MAX_ATTACHMENTS_PER_ITEM) return "attachment count exceeds the batch limit";
+	if (item.attachments.some((attachment) => attachment.content.length > BATCH_MAX_CONTENT_CHARS))
+		return "attachment content exceeds the batch limit";
+	if (contentChars > BATCH_MAX_TOTAL_CONTENT_CHARS) return "item content exceeds the batch total limit";
+	return undefined;
+}
+
+async function buildOneBatchItem(
+	summary: CommitSummary,
+	owned: OwnedAttachmentMaps,
+	ctx: PushContext,
+	envKey: string,
+): Promise<BuiltBatchItem> {
+	const attachments: Array<BatchPushAttachment> = [];
+	const attachmentKeys = new Map<string, BatchAttachmentKey>();
+	const relativePath = buildBranchRelativePath(summary.branch);
+	const placeholderBySlug = new Map<string, string>();
+	const placeholderByNoteId = new Map<string, string>();
+	const placeholderByArchivedKey = new Map<string, string>();
+
+	const plans = owned.ownedPlans.get(summary.commitHash) ?? [];
+	for (const [index, plan] of plans.entries()) {
+		const content = (await readPlanFromBranch(plan.slug, ctx.cwd, ctx.storage)) ?? "";
+		if (!content) {
+			log.info("Plan %s: no content found, skipping", plan.slug);
+			continue;
+		}
+		const clientKey = `plan-${index}`;
+		attachments.push({
+			clientKey,
+			docType: "plan",
+			title: buildPlanPushTitle(summary, plan.title),
+			content,
+			relativePath,
+			...(plan.jolliPlanDocId !== undefined &&
+				canReuseDocId(plan.jolliPlanDocUrl, envKey) && { docId: plan.jolliPlanDocId }),
+		});
+		attachmentKeys.set(clientKey, { kind: "plan", key: plan.slug });
+		placeholderBySlug.set(plan.slug, docUrlPlaceholder(clientKey));
+	}
+
+	const notes = owned.ownedNotes.get(summary.commitHash) ?? [];
+	for (const [index, note] of notes.entries()) {
+		const content = note.content ?? (await readNoteFromBranch(note.id, ctx.cwd, ctx.storage)) ?? "";
+		if (!content) {
+			log.info("Note %s: no content found, skipping", note.id);
+			continue;
+		}
+		const clientKey = `note-${index}`;
+		attachments.push({
+			clientKey,
+			docType: "note",
+			title: buildNotePushTitle(summary, note.title),
+			content,
+			relativePath,
+			...(note.jolliNoteDocId !== undefined &&
+				canReuseDocId(note.jolliNoteDocUrl, envKey) && { docId: note.jolliNoteDocId }),
+		});
+		attachmentKeys.set(clientKey, { kind: "note", key: note.id });
+		placeholderByNoteId.set(note.id, docUrlPlaceholder(clientKey));
+	}
+
+	const references = owned.ownedReferences.get(summary.commitHash) ?? [];
+	for (const [index, ref] of references.entries()) {
+		const storedMd = await readReferenceFromBranch(ref.source, ref.archivedKey, ctx.cwd, ctx.storage);
+		const description = storedMd
+			? (readReferenceMarkdownFromString(storedMd)?.description ?? undefined)
+			: undefined;
+		const clientKey = `ref-${index}`;
+		attachments.push({
+			clientKey,
+			docType: "reference",
+			title: buildReferencePushTitle(ref),
+			content: buildReferencePushMarkdown(ref, description),
+			relativePath,
+			...(ref.jolliReferenceDocId !== undefined &&
+				canReuseDocId(ref.jolliReferenceDocUrl, envKey) && { docId: ref.jolliReferenceDocId }),
+		});
+		attachmentKeys.set(clientKey, { kind: "reference", key: ref.archivedKey });
+		placeholderByArchivedKey.set(ref.archivedKey, docUrlPlaceholder(clientKey));
+	}
+
+	// Weave placeholder URLs into the enriched copy the markdown + summaryJson
+	// are built from — mirrors pushSummary's real-URL weave, minus docIds.
+	const dedupedPlans = latestPlanPerName(summary.plans ?? []);
+	const plansWithUrls = dedupedPlans.map((p) => {
+		const placeholder = placeholderBySlug.get(p.slug);
+		return placeholder ? { ...p, jolliPlanDocUrl: placeholder } : p;
+	});
+	const notesWithUrls = summary.notes?.map((n) => {
+		const placeholder = placeholderByNoteId.get(n.id);
+		return placeholder ? { ...n, jolliNoteDocUrl: placeholder } : n;
+	});
+	const referencesWithUrls = summary.references?.map((r) => {
+		const placeholder = placeholderByArchivedKey.get(r.archivedKey);
+		return placeholder ? { ...r, jolliReferenceDocUrl: placeholder } : r;
+	});
+	const summaryForMarkdown: CommitSummary = {
+		...summary,
+		plans: plansWithUrls,
+		...(notesWithUrls !== undefined && { notes: notesWithUrls }),
+		...(referencesWithUrls !== undefined && { references: referencesWithUrls }),
+	};
+	const markdown = buildPushMarkdown(summaryForMarkdown);
+	const summaryJson = serializeSummaryJson(summaryForMarkdown);
+
+	const item: BatchPushItem = {
+		commitHash: summary.commitHash,
+		branch: summary.branch,
+		summary: {
+			title: buildPushTitle(summary),
+			content: markdown,
+			relativePath,
+			...(summary.jolliDocId !== undefined &&
+				canReuseDocId(summary.jolliDocUrl, envKey) && { docId: summary.jolliDocId }),
+			...(summaryJson && { summaryJson }),
+		},
+		attachments,
+	};
+	const batchContentChars = countBatchContentChars(item);
+	const batchIneligibleReason = getBatchIneligibleReason(item, batchContentChars);
+	return {
+		summary,
+		attachmentKeys,
+		item,
+		batchContentChars,
+		...(batchIneligibleReason !== undefined && { batchIneligibleReason }),
+	};
+}
+
+/**
+ * A pushed item whose local docId/url write-back failed. Carries the minted
+ * ids so the caller can persist them in the pending entry — the next drain
+ * then retries as an UPDATE of the same article instead of a duplicate CREATE.
+ */
+export interface BatchWriteBackFailure {
+	readonly commitHash: string;
+	readonly docId: number;
+	readonly url: string;
+}
+
+/** Outcome counts of {@link applyBatchResult}, for the caller's logging. */
+export interface ApplyBatchResultOutcome {
+	readonly writtenBack: number;
+	readonly childSkipped: number;
+	/** Successful items that still need confirmed post-push orphan cleanup. */
+	readonly cleanupPendingHashes?: ReadonlyArray<string>;
+	/** Successful items whose write-back failed — keep pending with the minted ids recorded. */
+	readonly writeBackFailures?: ReadonlyArray<BatchWriteBackFailure>;
+}
+
+/**
+ * Post-batch write-back: for every `ok` item, resolves the final article URL,
+ * weaves attachment URLs/docIds into the stored summary and persists it so the
+ * next push updates instead of creating. Mirrors `pushSummary`'s write-back
+ * including its mid-push child guard: a commit that became a child (squash)
+ * while the request was on the network gets its freshly-minted article deleted
+ * best-effort instead of a force-store that would resurrect a zombie root —
+ * along with any attachments this same batch item CREATEd (attachments that
+ * UPDATEd a pre-existing doc keep their article).
+ * Best-effort per item — a failed write-back is logged and never fails the
+ * caller (the article is already published). Each failed item is reported in
+ * `writeBackFailures` with its minted docId/url so the caller can keep the
+ * pending entry and retry as an UPDATE instead of a duplicate CREATE.
+ *
+ * `opts.cleanupOrphans` additionally resolves `unresolvedOrphanHashes` and
+ * deletes the orphaned articles recorded on each written-back summary. The
+ * compensation drain opts in; the budget-bound pre-push flow leaves it off and
+ * receives `cleanupPendingHashes` so those pending entries are preserved.
+ */
+export async function applyBatchResult(
+	built: ReadonlyArray<BuiltBatchItem>,
+	results: ReadonlyArray<BatchItemResult>,
+	ctx: PushContext,
+	opts?: { readonly cleanupOrphans?: boolean },
+): Promise<ApplyBatchResultOutcome> {
+	const displayBase = ctx.baseUrl.replace(/\/+$/, "");
+	const builtByHash = new Map(built.map((b) => [b.item.commitHash, b]));
+	const postPushIndex = await getIndexEntryMap(ctx.cwd, ctx.storage).catch((err: unknown) => {
+		// Degrading to "no commit is a child" keeps parity with pushSummary, but
+		// it also disarms the mid-push child guard below — say so in the log.
+		log.warn(
+			"Could not read the summary index for the mid-push child guard — treating every commit as a root: %s",
+			err instanceof Error ? err.message : String(err),
+		);
+		return new Map<string, unknown>();
+	});
+	let writtenBack = 0;
+	let childSkipped = 0;
+	const cleanupPendingHashes: string[] = [];
+	const writeBackFailures: BatchWriteBackFailure[] = [];
+	for (const result of results) {
+		const summaryDoc = result.ok ? result.summary : undefined;
+		if (!summaryDoc) continue;
+		const entry = builtByHash.get(result.commitHash);
+		if (!entry) continue;
+		const indexEntry = postPushIndex.get(result.commitHash) as
+			| { readonly parentCommitHash?: string | null }
+			| undefined;
+		if (indexEntry?.parentCommitHash != null) {
+			childSkipped++;
+			log.warn(
+				"Commit %s became a child mid-push (parent=%s); deleting freshly-pushed article %d and skipping write-back",
+				result.commitHash.substring(0, 8),
+				indexEntry.parentCommitHash.substring(0, 8),
+				summaryDoc.docId,
+			);
+			try {
+				await ctx.client.deleteDoc(summaryDoc.docId);
+			} catch (err) {
+				log.warn(
+					"Best-effort delete of newly-orphaned article %d failed: %s",
+					summaryDoc.docId,
+					err instanceof Error ? err.message : String(err),
+				);
+			}
+			// Attachments this same batch item CREATEd must go too, or they leak
+			// as stray docs of a commit that no longer exists as a root. Only the
+			// created ones: an attachment that UPDATEd a pre-existing doc keeps
+			// its article — that doc predates this push and is cleaned up by the
+			// squash consolidation's own orphan machinery.
+			for (const att of result.attachments) {
+				if (!att.ok || att.created !== true || att.docId === undefined) continue;
+				try {
+					await ctx.client.deleteDoc(att.docId);
+				} catch (err) {
+					log.warn(
+						"Best-effort delete of newly-orphaned attachment %d failed: %s",
+						att.docId,
+						err instanceof Error ? err.message : String(err),
+					);
+				}
+			}
+			continue;
+		}
+		try {
+			const updated = await writeBackBatchItem(entry, result, displayBase, ctx);
+			writtenBack++;
+			let finalUpdated = updated;
+			if (opts?.cleanupOrphans && finalUpdated && hasPendingOrphanCleanup(finalUpdated)) {
+				try {
+					finalUpdated = await resolveUnresolvedOrphanHashes(finalUpdated, ctx);
+					const cleaned = await cleanupOrphanedDocs(finalUpdated, finalUpdated, ctx);
+					if (cleaned) finalUpdated = cleaned;
+				} catch (err) {
+					log.warn(
+						"Orphan cleanup after batch push failed for %s: %s",
+						result.commitHash.substring(0, 8),
+						err instanceof Error ? err.message : String(err),
+					);
+				}
+			}
+			if (finalUpdated && hasPendingOrphanCleanup(finalUpdated)) {
+				cleanupPendingHashes.push(result.commitHash);
+			}
+		} catch (err) {
+			// The article exists server-side but its id never reached local
+			// storage — report the minted ids so the caller keeps the pending
+			// entry and the retry UPDATEs instead of CREATEing a duplicate.
+			writeBackFailures.push({
+				commitHash: result.commitHash,
+				docId: summaryDoc.docId,
+				url: resolveArticleUrl(displayBase, summaryDoc.url, summaryDoc.docId),
+			});
+			log.warn(
+				"Write-back after batch push failed for %s: %s",
+				result.commitHash.substring(0, 8),
+				err instanceof Error ? err.message : String(err),
+			);
+		}
+	}
+	log.debug(
+		"applyBatchResult: writtenBack=%d childSkipped=%d cleanupPending=%d writeBackFailed=%d cleanupOrphans=%s",
+		writtenBack,
+		childSkipped,
+		cleanupPendingHashes.length,
+		writeBackFailures.length,
+		opts?.cleanupOrphans === true,
+	);
+	return {
+		writtenBack,
+		childSkipped,
+		...(cleanupPendingHashes.length > 0 && { cleanupPendingHashes }),
+		...(writeBackFailures.length > 0 && { writeBackFailures }),
+	};
+}
+
+async function writeBackBatchItem(
+	entry: BuiltBatchItem,
+	result: BatchItemResult,
+	displayBase: string,
+	ctx: PushContext,
+): Promise<CommitSummary | undefined> {
+	const summaryDoc = result.summary;
+	/* v8 ignore next -- callers only pass ok results, which always carry summary */
+	if (!summaryDoc) return undefined;
+	const summaryUrl = resolveArticleUrl(displayBase, summaryDoc.url, summaryDoc.docId);
+	const planUrls: Array<{ slug: string; url: string; docId: number }> = [];
+	const noteUrls: Array<{ id: string; url: string; docId: number }> = [];
+	const referenceUrls: Array<{ archivedKey: string; url: string; docId: number }> = [];
+	for (const att of result.attachments) {
+		if (!att.ok || att.docId === undefined || att.url === undefined) continue;
+		const identity = entry.attachmentKeys.get(att.clientKey);
+		if (!identity) continue;
+		const url = resolveArticleUrl(displayBase, att.url, att.docId);
+		if (identity.kind === "plan") {
+			planUrls.push({ slug: identity.key, url, docId: att.docId });
+		} else if (identity.kind === "note") {
+			noteUrls.push({ id: identity.key, url, docId: att.docId });
+		} else {
+			referenceUrls.push({ archivedKey: identity.key, url, docId: att.docId });
+		}
+	}
+	const summary = entry.summary;
+	const updatedSummary: CommitSummary = {
+		...summary,
+		jolliDocUrl: summaryUrl,
+		jolliDocId: summaryDoc.docId,
+		...(planUrls.length > 0 ? { plans: applyPlanUrls(summary.plans, planUrls) } : {}),
+		...(noteUrls.length > 0 && summary.notes ? { notes: applyNoteUrls(summary.notes, noteUrls) } : {}),
+		...(referenceUrls.length > 0 && summary.references
+			? { references: applyReferenceUrls(summary.references, referenceUrls) }
+			: {}),
+	};
+	await storeSummary(updatedSummary, ctx.cwd, true, undefined, ctx.storage);
+	return updatedSummary;
+}
+
 // ── Push orchestration (network I/O) ─────────────────────────────────────────
 
 /**
@@ -553,65 +976,7 @@ export async function pushSummary(
 	};
 	await storeSummary(updatedSummary, ctx.cwd, true, undefined, ctx.storage);
 
-	// Resolve unresolvedOrphanHashes: re-read each hash's summary from the
-	// orphan branch. If PrePushWorker has since written back a jolliDocId,
-	// promote it into orphanedDocIds for cleanup.
-	//
-	// Retention is gated by the shared push-pending queue:
-	//   * hash present in pending → retain (a worker is still in flight and
-	//     may yet resolve it)
-	//   * hash absent from pending → discard (it was never pushed, or the
-	//     worker already finished without producing a docId — either way the
-	//     hash has no Space article to clean up)
-	//
-	// When `loadPushPending` itself fails (lock unavailable, transient IO
-	// error) we fall back to conservative retention: keep every unresolved
-	// hash so a crashed worker's article can still be cleaned up on the next
-	// push.
-	let summaryForCleanup = updatedSummary;
-	if (summary.unresolvedOrphanHashes && summary.unresolvedOrphanHashes.length > 0) {
-		const pending = await loadPushPending(ctx.cwd).catch((err: unknown) => {
-			log.warn(
-				"Could not read push-pending state while resolving orphan hashes: %s",
-				err instanceof Error ? err.message : String(err),
-			);
-			return undefined;
-		});
-		const resolvedDocIds: number[] = [];
-		const remainingHashes: string[] = [];
-		let stillInFlight = 0;
-		for (const hash of summary.unresolvedOrphanHashes) {
-			const fresh = await getSummary(hash, ctx.cwd, ctx.storage);
-			// Guard against tree-hash fallback: if the child's own summary
-			// file was cleaned, getSummary may resolve to the merged summary
-			// (same tree) — whose jolliDocId is the article we just pushed.
-			// Without this check we'd delete our own freshly-published article.
-			if (fresh?.jolliDocId && fresh.commitHash === hash) {
-				resolvedDocIds.push(fresh.jolliDocId);
-			} else if (pending === undefined) {
-				remainingHashes.push(hash);
-			} else if (pending.entries[hash]) {
-				remainingHashes.push(hash);
-				stillInFlight++;
-			}
-		}
-		if (resolvedDocIds.length > 0 || remainingHashes.length !== summary.unresolvedOrphanHashes.length) {
-			if (resolvedDocIds.length > 0)
-				log.info(
-					"Resolved %d orphan hashes → docIds for cleanup (%d retained, %d still in-flight)",
-					resolvedDocIds.length,
-					remainingHashes.length,
-					stillInFlight,
-				);
-			const mergedOrphanIds = [...new Set([...(updatedSummary.orphanedDocIds ?? []), ...resolvedDocIds])];
-			summaryForCleanup = {
-				...updatedSummary,
-				orphanedDocIds: mergedOrphanIds.length > 0 ? mergedOrphanIds : undefined,
-				unresolvedOrphanHashes: remainingHashes.length > 0 ? [...new Set(remainingHashes)] : undefined,
-			};
-			await storeSummary(summaryForCleanup, ctx.cwd, true, undefined, ctx.storage);
-		}
-	}
+	const summaryForCleanup = await resolveUnresolvedOrphanHashes(updatedSummary, ctx);
 
 	// Clean up orphaned articles, then persist which ones were actually deleted.
 	// Best-effort: the summary + jolliDocId are already pushed and stored above, so a
@@ -769,6 +1134,64 @@ async function pushReferenceList(
 		});
 	}
 	return results;
+}
+
+function hasPendingOrphanCleanup(summary: CommitSummary): boolean {
+	return (summary.orphanedDocIds?.length ?? 0) > 0 || (summary.unresolvedOrphanHashes?.length ?? 0) > 0;
+}
+
+/**
+ * Resolves hashes recorded during a squash/push race into article ids that can
+ * be deleted. Shared by single and batch push paths so batch-first compensation
+ * preserves the same cleanup behavior as `pushSummary`.
+ */
+async function resolveUnresolvedOrphanHashes(summary: CommitSummary, ctx: PushContext): Promise<CommitSummary> {
+	const unresolved = summary.unresolvedOrphanHashes;
+	if (!unresolved || unresolved.length === 0) return summary;
+
+	// Retain hashes still present in push-pending because another worker may yet
+	// write back their docId. If the pending file cannot be read, retain every
+	// unresolved hash conservatively instead of risking an orphan leak.
+	const pending = await loadPushPending(ctx.cwd).catch((err: unknown) => {
+		log.warn(
+			"Could not read push-pending state while resolving orphan hashes: %s",
+			err instanceof Error ? err.message : String(err),
+		);
+		return undefined;
+	});
+	const resolvedDocIds: number[] = [];
+	const remainingHashes: string[] = [];
+	let stillInFlight = 0;
+	for (const hash of unresolved) {
+		const fresh = await getSummary(hash, ctx.cwd, ctx.storage);
+		// Guard against tree-hash fallback resolving to the merged summary itself.
+		if (fresh?.jolliDocId && fresh.commitHash === hash) {
+			resolvedDocIds.push(fresh.jolliDocId);
+		} else if (pending === undefined) {
+			remainingHashes.push(hash);
+		} else if (pending.entries[hash]) {
+			remainingHashes.push(hash);
+			stillInFlight++;
+		}
+	}
+
+	if (resolvedDocIds.length === 0 && remainingHashes.length === unresolved.length) return summary;
+	if (resolvedDocIds.length > 0) {
+		log.info(
+			"Resolved %d orphan hashes → docIds for cleanup (%d retained, %d still in-flight)",
+			resolvedDocIds.length,
+			remainingHashes.length,
+			stillInFlight,
+		);
+	}
+	const mergedOrphanIds = [...new Set([...(summary.orphanedDocIds ?? []), ...resolvedDocIds])];
+	const resolvedSummary: CommitSummary = {
+		...summary,
+		orphanedDocIds: mergedOrphanIds.length > 0 ? mergedOrphanIds : undefined,
+		unresolvedOrphanHashes: remainingHashes.length > 0 ? [...new Set(remainingHashes)] : undefined,
+	};
+	await storeSummary(resolvedSummary, ctx.cwd, true, undefined, ctx.storage);
+	return resolvedSummary;
 }
 
 /**

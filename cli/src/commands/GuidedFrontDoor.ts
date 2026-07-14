@@ -165,7 +165,7 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	// Space first (runSpaceSyncStep), then push the backlog to it —
 	// triggerPendingPushRetry is idempotent and no-ops when not signed in. ──
 	await runSpaceSyncStep(cwd);
-	void triggerPendingPushRetry(cwd);
+	triggerPendingPushRetry(cwd, "cli-front-door");
 
 	// ── Closing confirmation: only promise "listening" when generation works. ──
 	if (canGenerate) {

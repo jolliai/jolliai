@@ -1723,7 +1723,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		// push-pending.json from a previous session, now that storage is
 		// initialized. Fire-and-forget; fully guarded (never throws, no-ops when
 		// nothing is pending or the user isn't signed in).
-		void triggerPendingPushRetry(workspaceRoot);
+		triggerPendingPushRetry(workspaceRoot, "vscode-activation");
 	});
 
 	// ── sessions.json watcher ─────────────────────────────────────────────────
@@ -3776,7 +3776,7 @@ export function activate(context: vscode.ExtensionContext): void {
 							.catch(handleError("uriHandler.reconcileAutoSync"));
 						// Pre-push sync catch-up: drain any commits left in
 						// push-pending.json from pushes made while signed out.
-						void triggerPendingPushRetry(workspaceRoot);
+						triggerPendingPushRetry(workspaceRoot, "vscode-sign-in");
 					} else {
 						vscode.window.showErrorMessage(
 							`Jolli sign-in failed: ${result.error}`,

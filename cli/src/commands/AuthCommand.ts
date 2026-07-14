@@ -8,6 +8,8 @@ import { clearAuthCredentials, getJolliUrl, loadAuthToken } from "../auth/AuthCo
 import { browserLogin } from "../auth/Login.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
+import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
+import { resolveProjectDir } from "./CliUtils.js";
 
 export function registerAuthCommands(program: Command): void {
 	const auth = program
@@ -22,6 +24,7 @@ export function registerAuthCommands(program: Command): void {
 			try {
 				await browserLogin(getJolliUrl());
 				const config = await loadConfig();
+				triggerPendingPushRetry(resolveProjectDir(), "cli-auth-login");
 				console.log("\n  Signed in successfully!");
 				console.log("  Auth token:        saved ✓");
 				if (config.jolliApiKey) {

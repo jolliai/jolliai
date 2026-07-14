@@ -120,7 +120,7 @@ describe("GuidedFrontDoor", () => {
 		await runGuidedFrontDoor();
 
 		expect(h.install).not.toHaveBeenCalled();
-		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo");
+		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo", "cli-front-door");
 		expect(h.runSpaceSyncStep).toHaveBeenCalledWith("/repo");
 		expect(out()).toContain("signed in · acme.jolli.ai");
 		expect(out()).toContain("3 memories");
@@ -143,7 +143,7 @@ describe("GuidedFrontDoor", () => {
 		completeSpaceSync();
 		await frontDoor;
 
-		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo");
+		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo", "cli-front-door");
 	});
 
 	it("first-run copy when summaryCount is 0", async () => {
@@ -221,7 +221,7 @@ describe("GuidedFrontDoor", () => {
 
 		expect(h.install).toHaveBeenCalledWith("/repo", { source: "cli" });
 		expect(h.track).toHaveBeenCalledWith("surface_enabled", { trigger: "cli" });
-		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo");
+		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo", "cli-front-door");
 		expect(h.runSpaceSyncStep).toHaveBeenCalledWith("/repo");
 		expect(out()).toContain("5 memories");
 		expect(out()).toContain("signed in");
@@ -303,7 +303,7 @@ describe("GuidedFrontDoor", () => {
 		expect(h.promptSetup).toHaveBeenCalledTimes(1);
 		expect(out()).toContain("signed in");
 		expect(out()).toContain("Jolli is listening");
-		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo");
+		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo", "cli-front-door");
 	});
 
 	// ── Rung 2: optional sign-in nudge (local key, cannot sync) ──

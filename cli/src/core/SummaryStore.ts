@@ -1070,7 +1070,7 @@ async function mergeManyToOneLocked(
 	const allOrphanedDocIds = [...jolliMeta.orphanedDocIds, ...inheritedOrphanIds];
 
 	// Children without jolliDocId may have been pushed to Space by a
-	// concurrent PrePushWorker that hasn't written back the docId yet (race).
+	// concurrent pre-push sync that hasn't written back the docId yet (race).
 	// Record their hashes so pushSummary can resolve them at push time and
 	// clean up the orphaned Space articles.
 	const unresolvedOrphanHashes = Array.from(
