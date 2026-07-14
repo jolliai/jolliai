@@ -2,6 +2,9 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 
 const h = vi.hoisted(() => ({
 	loadAuthToken: vi.fn(),
+	getJolliUrl: vi.fn(),
+	browserLogin: vi.fn(),
+	validateJolliApiKey: vi.fn(),
 	loadConfig: vi.fn(),
 	getSummaryCount: vi.fn(),
 	track: vi.fn(),
@@ -16,9 +19,13 @@ const h = vi.hoisted(() => ({
 	setActiveStorage: vi.fn(),
 	saveConfigScoped: vi.fn(),
 	getGlobalConfigDir: vi.fn(),
+	loadUserProfile: vi.fn(),
+	saveUserProfile: vi.fn(),
 }));
 
-vi.mock("../auth/AuthConfig.js", () => ({ loadAuthToken: h.loadAuthToken }));
+vi.mock("../auth/AuthConfig.js", () => ({ loadAuthToken: h.loadAuthToken, getJolliUrl: h.getJolliUrl }));
+vi.mock("../auth/Login.js", () => ({ browserLogin: h.browserLogin }));
+vi.mock("../core/JolliApiUtils.js", () => ({ validateJolliApiKey: h.validateJolliApiKey }));
 vi.mock("../core/SessionTracker.js", () => ({
 	loadConfig: h.loadConfig,
 	saveConfigScoped: h.saveConfigScoped,
@@ -30,6 +37,10 @@ vi.mock("../core/SummaryStore.js", () => ({
 	setActiveStorage: h.setActiveStorage,
 }));
 vi.mock("../core/Telemetry.js", () => ({ track: h.track }));
+vi.mock("../core/UserProfile.js", () => ({
+	loadUserProfile: h.loadUserProfile,
+	saveUserProfile: h.saveUserProfile,
+}));
 vi.mock("../hooks/PushCompensation.js", () => ({ triggerPendingPushRetry: h.triggerPendingPushRetry }));
 vi.mock("../install/GitHookInstaller.js", () => ({ isGitHookInstalled: h.isGitHookInstalled }));
 vi.mock("../install/Installer.js", () => ({ install: h.install }));
@@ -69,11 +80,14 @@ describe("GuidedFrontDoor", () => {
 			warns.push(a.map(String).join(" "));
 		});
 
-		// Defaults: signed in via OAuth, enabled, no memories yet.
+		// Defaults: signed in via OAuth, enabled, no memories yet, no prior decline.
 		h.resolveProjectDir.mockReturnValue("/repo");
 		h.createStorage.mockResolvedValue({});
 		h.getGlobalConfigDir.mockReturnValue("/global/config");
 		h.saveConfigScoped.mockResolvedValue(undefined);
+		h.getJolliUrl.mockReturnValue("https://acme.jolli.ai");
+		h.browserLogin.mockResolvedValue(undefined);
+		h.validateJolliApiKey.mockReturnValue(undefined);
 		h.loadAuthToken.mockResolvedValue("oauth-token");
 		h.loadConfig.mockResolvedValue({ jolliUrl: "https://acme.jolli.ai", jolliApiKey: "sk-jol-default" });
 		h.isGitHookInstalled.mockResolvedValue(true);
@@ -83,6 +97,8 @@ describe("GuidedFrontDoor", () => {
 		h.triggerPendingPushRetry.mockResolvedValue(undefined);
 		h.runSpaceSyncStep.mockResolvedValue(undefined);
 		h.promptSetup.mockResolvedValue(undefined);
+		h.loadUserProfile.mockResolvedValue({});
+		h.saveUserProfile.mockResolvedValue(undefined);
 	});
 
 	afterEach(() => {
@@ -97,6 +113,8 @@ describe("GuidedFrontDoor", () => {
 
 	const out = (): string => logs.join("\n");
 
+	// ── Steady state / status line ──
+
 	it("returning user (signed in + enabled): status line + delegates, no install", async () => {
 		h.getSummaryCount.mockResolvedValue(3);
 		await runGuidedFrontDoor();
@@ -109,7 +127,7 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).toContain("last memory saved");
 	});
 
-	it("waits for Space sync before retrying pending pushes", async () => {
+	it("binds the Space before retrying pending pushes", async () => {
 		let completeSpaceSync!: () => void;
 		h.runSpaceSyncStep.mockImplementationOnce(
 			() =>
@@ -128,22 +146,33 @@ describe("GuidedFrontDoor", () => {
 		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo");
 	});
 
-	it("no credential → runs promptSetup", async () => {
-		h.loadAuthToken.mockResolvedValue(undefined);
-		h.loadConfig.mockResolvedValue({});
+	it("first-run copy when summaryCount is 0", async () => {
+		h.getSummaryCount.mockResolvedValue(0);
 		await runGuidedFrontDoor();
-		expect(h.promptSetup).toHaveBeenCalledTimes(1);
+		expect(out()).toContain("your next commit is your first memory");
 	});
 
-	it("still no credential after promptSetup → no success/listening line", async () => {
-		h.loadAuthToken.mockResolvedValue(undefined);
-		h.loadConfig.mockResolvedValue({});
+	it("singular 'memory' when summaryCount is 1", async () => {
+		h.getSummaryCount.mockResolvedValue(1);
 		await runGuidedFrontDoor();
-		expect(out()).toContain("not signed in");
-		expect(out()).not.toContain("Jolli is listening");
+		expect(out()).toContain("1 memory");
+		expect(out()).not.toContain("1 memories");
 	});
 
-	it("manual jolliApiKey (no OAuth) → shows 'configured', not 'signed in'", async () => {
+	it("invalid jolliUrl → plain 'signed in' without a host", async () => {
+		h.loadConfig.mockResolvedValue({ jolliUrl: "not a url", jolliApiKey: "sk-jol-x" });
+		await runGuidedFrontDoor();
+		expect(out()).toContain("signed in");
+		expect(out()).not.toContain("signed in ·");
+	});
+
+	it("missing jolliUrl → plain 'signed in'", async () => {
+		h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x" });
+		await runGuidedFrontDoor();
+		expect(out()).not.toContain("signed in ·");
+	});
+
+	it("manual jolliApiKey (no OAuth) → 'Jolli API key set', can already sync so no nudge", async () => {
 		h.loadAuthToken.mockResolvedValue(undefined);
 		h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x" });
 		await runGuidedFrontDoor();
@@ -151,13 +180,14 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).toContain("Jolli API key set (not signed in to Jolli)");
 		expect(out()).not.toContain("signed in ·");
 		expect(out()).toContain("Jolli is listening");
-		// Has a jolliApiKey (can already sync) → must NOT nudge sign-in.
-		expect(out()).not.toContain("sync memories to a Space");
+		expect(h.browserLogin).not.toHaveBeenCalled();
+		expect(h.promptText).not.toHaveBeenCalledWith(expect.stringContaining("Sign in now to sync"));
 	});
 
-	it("ANTHROPIC_API_KEY env counts as a credential", async () => {
+	it("ANTHROPIC_API_KEY env counts as a credential (status line names Anthropic)", async () => {
 		h.loadAuthToken.mockResolvedValue(undefined);
 		h.loadConfig.mockResolvedValue({});
+		h.loadUserProfile.mockResolvedValue({ signInPromptDeclined: true }); // suppress the nudge
 		process.env.ANTHROPIC_API_KEY = "sk-ant-x";
 		try {
 			await runGuidedFrontDoor();
@@ -167,6 +197,21 @@ describe("GuidedFrontDoor", () => {
 			delete process.env.ANTHROPIC_API_KEY;
 		}
 	});
+
+	it("both keys, not signed in, provider=anthropic → Anthropic label, no nudge", async () => {
+		// The status-line label follows credSource (the key that would actually be
+		// used), so it names Anthropic even though a jolliApiKey is also present;
+		// and canSync is true via that jolliApiKey, so no sign-in nudge fires.
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x", jolliApiKey: "sk-jol-x", aiProvider: "anthropic" });
+		await runGuidedFrontDoor();
+		expect(out()).toContain("Anthropic API key set (not signed in to Jolli)");
+		expect(h.promptText).not.toHaveBeenCalledWith(expect.stringContaining("Sign in now to sync"));
+		expect(h.browserLogin).not.toHaveBeenCalled();
+		expect(out()).toContain("Jolli is listening");
+	});
+
+	// ── Enable axis ──
 
 	it("not enabled + [Y/n]=y → install + track + push retry + delegate", async () => {
 		h.isGitHookInstalled.mockResolvedValue(false);
@@ -186,11 +231,17 @@ describe("GuidedFrontDoor", () => {
 	it("just enabled a fresh repo (no memories yet) → 0 memories", async () => {
 		h.isGitHookInstalled.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("y");
-		h.getSummaryCount.mockResolvedValue(0); // fresh repo, empty index
+		h.getSummaryCount.mockResolvedValue(0);
 		await runGuidedFrontDoor();
 		expect(h.install).toHaveBeenCalled();
-		expect(h.getSummaryCount).toHaveBeenCalled();
 		expect(out()).toContain("0 memories");
+	});
+
+	it("not enabled + empty answer (Enter) defaults to Yes → installs", async () => {
+		h.isGitHookInstalled.mockResolvedValue(false);
+		h.promptText.mockResolvedValue("");
+		await runGuidedFrontDoor();
+		expect(h.install).toHaveBeenCalledWith("/repo", { source: "cli" });
 	});
 
 	it("not enabled + [Y/n]=n → no install, early return", async () => {
@@ -224,35 +275,27 @@ describe("GuidedFrontDoor", () => {
 		expect(warns.join("\n")).toContain("heads up");
 	});
 
-	it("first-run copy when summaryCount is 0", async () => {
-		h.getSummaryCount.mockResolvedValue(0);
-		await runGuidedFrontDoor();
-		expect(out()).toContain("your next commit is your first memory");
-	});
+	// ── Fresh onboarding (promptSetup) ──
 
-	it("singular 'memory' when summaryCount is 1", async () => {
-		h.getSummaryCount.mockResolvedValue(1);
-		await runGuidedFrontDoor();
-		expect(out()).toContain("1 memory");
-		expect(out()).not.toContain("1 memories");
-	});
-
-	it("invalid jolliUrl → plain 'signed in' without a host", async () => {
-		h.loadConfig.mockResolvedValue({ jolliUrl: "not a url" });
-		await runGuidedFrontDoor();
-		expect(out()).toContain("signed in");
-		expect(out()).not.toContain("signed in ·");
-	});
-
-	it("missing jolliUrl → plain 'signed in'", async () => {
+	it("no credential → runs promptSetup", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
 		h.loadConfig.mockResolvedValue({});
 		await runGuidedFrontDoor();
-		expect(out()).not.toContain("signed in ·");
+		expect(h.promptSetup).toHaveBeenCalledTimes(1);
+	});
+
+	it("skipped setup (still nothing) → 'not signed in', no listening, no re-ask", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({});
+		await runGuidedFrontDoor();
+		expect(out()).toContain("not signed in");
+		expect(out()).not.toContain("Jolli is listening");
+		// Fresh user with nothing must not be re-prompted by the repair rung.
+		expect(out()).not.toContain("no Anthropic key is available");
+		expect(h.saveConfigScoped).not.toHaveBeenCalled();
 	});
 
 	it("promptSetup turns no-credential into signed in + listening, and pushes backlog", async () => {
-		// Enabled returning repo, but the user has no credential until they sign in
-		// now. The enable branch is skipped, yet backlog catch-up must still fire.
 		h.loadAuthToken.mockResolvedValueOnce(undefined).mockResolvedValueOnce("new-token");
 		h.loadConfig.mockResolvedValueOnce({}).mockResolvedValueOnce({ jolliApiKey: "sk-jol-new" });
 		await runGuidedFrontDoor();
@@ -263,74 +306,132 @@ describe("GuidedFrontDoor", () => {
 		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo");
 	});
 
-	it("config.apiKey alone (no Jolli credential) → generates locally + nudges sign-in", async () => {
+	// ── Rung 2: optional sign-in nudge (local key, cannot sync) ──
+
+	it("local Anthropic key, Enter (default Yes) → browser login, sync confirmation, listening", async () => {
 		h.loadAuthToken.mockResolvedValue(undefined);
 		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x" });
+		h.getSummaryCount.mockResolvedValue(2);
+		h.promptText.mockResolvedValue(""); // Enter → default Yes
 		await runGuidedFrontDoor();
-		expect(h.promptSetup).not.toHaveBeenCalled();
+
 		expect(out()).toContain("Anthropic API key set (not signed in to Jolli)");
-		expect(out()).toContain("Jolli is listening");
-		// Pure-Anthropic user with no Jolli credential — soft nudge to sign in.
-		expect(out()).toContain("sync memories to a Space");
+		expect(h.promptText).toHaveBeenCalledWith(expect.stringContaining("Sign in now to sync memories to a Space"));
+		expect(h.browserLogin).toHaveBeenCalledWith("https://acme.jolli.ai");
+		expect(out()).toContain("memories will sync to your Space");
+		expect(h.saveUserProfile).not.toHaveBeenCalled();
+		expect(out()).toContain("last memory saved");
 	});
 
-	it("not enabled + empty answer (Enter) defaults to Yes → installs", async () => {
-		h.isGitHookInstalled.mockResolvedValue(false);
-		h.promptText.mockResolvedValue("");
+	it("local Anthropic key, answer 'n' → records the decline, no login, still listening", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x" });
+		h.promptText.mockResolvedValue("n");
 		await runGuidedFrontDoor();
-		expect(h.install).toHaveBeenCalledWith("/repo", { source: "cli" });
+
+		expect(h.browserLogin).not.toHaveBeenCalled();
+		expect(h.saveUserProfile).toHaveBeenCalledWith({ signInPromptDeclined: true });
+		expect(out()).toContain("You can sign in anytime");
+		expect(out()).toContain("Jolli is listening");
 	});
 
-	it("signed in but no usable key → offers a fix, no false 'listening'", async () => {
+	it("local Anthropic key, login fails → error, no decline recorded, still listening", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x" });
+		h.promptText.mockResolvedValue(""); // Enter → Yes → browserLogin
+		h.browserLogin.mockRejectedValue(new Error("network down"));
+		await runGuidedFrontDoor();
+
+		expect(errors.join("\n")).toContain("network down");
+		expect(out()).toContain("try again with");
+		expect(h.saveUserProfile).not.toHaveBeenCalled();
+		expect(out()).toContain("Jolli is listening");
+	});
+
+	it("local Anthropic key, decline but persisting the flag fails → swallowed, front door still finishes", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x" });
+		h.promptText.mockResolvedValue("n");
+		h.saveUserProfile.mockRejectedValue(new Error("EACCES: read-only home"));
+		await runGuidedFrontDoor();
+
+		expect(h.saveUserProfile).toHaveBeenCalledWith({ signInPromptDeclined: true });
+		expect(out()).toContain("You can sign in anytime");
+		expect(out()).toContain("Jolli is listening");
+	});
+
+	it("local Anthropic key, login rejects with a non-Error value → still reported", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x" });
+		h.promptText.mockResolvedValue("");
+		h.browserLogin.mockRejectedValue("odd failure");
+		await runGuidedFrontDoor();
+
+		expect(errors.join("\n")).toContain("odd failure");
+		expect(out()).toContain("try again with");
+	});
+
+	it("local Anthropic key but sign-in previously declined → nudge suppressed", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x" });
+		h.loadUserProfile.mockResolvedValue({ signInPromptDeclined: true });
+		await runGuidedFrontDoor();
+
+		expect(h.promptText).not.toHaveBeenCalledWith(expect.stringContaining("Sign in now to sync"));
+		expect(h.browserLogin).not.toHaveBeenCalled();
+		expect(h.saveUserProfile).not.toHaveBeenCalled();
+		expect(out()).toContain("Jolli is listening");
+	});
+
+	// ── Rung 1: provider/key mismatch repair ──
+
+	it("signed in but no usable key → repair menu, no false 'listening' when skipped", async () => {
 		h.loadAuthToken.mockResolvedValue("oauth-token");
 		h.loadConfig.mockResolvedValue({ jolliUrl: "https://acme.jolli.ai" }); // no key at all
 		h.promptText.mockResolvedValue(""); // menu default → enter key → empty → skip
 		await runGuidedFrontDoor();
 		expect(out()).toContain("signed in");
+		expect(out()).toContain("no Anthropic key is available");
 		expect(out()).not.toContain("Jolli is listening");
-		expect(out()).toContain("no usable key");
 	});
 
-	it("choose 'switch to Jolli' → saves aiProvider jolli; listening reflects existing memory count", async () => {
+	it("provider=anthropic + jolliApiKey, choose 'switch to Jolli' → saves aiProvider, listening reflects count", async () => {
 		h.loadAuthToken.mockResolvedValue("oauth-token");
-		h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x", aiProvider: "anthropic" });
-		h.getSummaryCount.mockResolvedValue(163); // returning repo with history
-		h.promptText.mockResolvedValue("2");
+		h.loadConfig.mockResolvedValue({
+			jolliApiKey: "sk-jol-x",
+			aiProvider: "anthropic",
+			jolliUrl: "https://acme.jolli.ai",
+		});
+		h.getSummaryCount.mockResolvedValue(163);
+		h.promptText.mockResolvedValue("1");
 		await runGuidedFrontDoor();
 		expect(h.saveConfigScoped).toHaveBeenCalledWith({ aiProvider: "jolli" }, "/global/config");
 		expect(out()).toContain("switched to Jolli");
-		// Must NOT claim "first memory" when the repo already has memories.
 		expect(out()).toContain("last memory saved");
 		expect(out()).not.toContain("first memory");
 	});
 
-	it("choose 'enter Anthropic key' → saves apiKey + provider anthropic; listening reflects memory count", async () => {
+	it("provider=anthropic + jolliApiKey, Enter at menu → defaults to 'switch to Jolli'", async () => {
 		h.loadAuthToken.mockResolvedValue("oauth-token");
 		h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x", aiProvider: "anthropic" });
-		h.getSummaryCount.mockResolvedValue(163);
-		h.promptText.mockResolvedValueOnce("1").mockResolvedValueOnce("sk-ant-new");
+		h.promptText.mockResolvedValue(""); // Enter → default [1] = switch
+		await runGuidedFrontDoor();
+		expect(h.saveConfigScoped).toHaveBeenCalledWith({ aiProvider: "jolli" }, "/global/config");
+	});
+
+	it("provider=anthropic + jolliApiKey, choose 'enter Anthropic key' → saves apiKey + provider", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x", aiProvider: "anthropic" });
+		h.promptText.mockResolvedValueOnce("2").mockResolvedValueOnce("sk-ant-new");
 		await runGuidedFrontDoor();
 		expect(h.saveConfigScoped).toHaveBeenCalledWith(
 			{ apiKey: "sk-ant-new", aiProvider: "anthropic" },
 			"/global/config",
 		);
 		expect(out()).toContain("Anthropic key saved");
-		expect(out()).toContain("last memory saved");
-		expect(out()).not.toContain("first memory");
 	});
 
-	it("provider=anthropic + jolliApiKey, press Enter at menu → defaults to entering an Anthropic key", async () => {
-		h.loadAuthToken.mockResolvedValue("oauth-token");
-		h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x", aiProvider: "anthropic" });
-		h.promptText.mockResolvedValueOnce("").mockResolvedValueOnce("sk-ant-y");
-		await runGuidedFrontDoor();
-		expect(h.saveConfigScoped).toHaveBeenCalledWith(
-			{ apiKey: "sk-ant-y", aiProvider: "anthropic" },
-			"/global/config",
-		);
-	});
-
-	it("provider=anthropic + jolliApiKey, choose 'skip' → no config change", async () => {
+	it("provider=anthropic + jolliApiKey, choose 'skip' → no config change, no listening", async () => {
 		h.loadAuthToken.mockResolvedValue("oauth-token");
 		h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x", aiProvider: "anthropic" });
 		h.promptText.mockResolvedValue("3");
@@ -339,9 +440,9 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).not.toContain("Jolli is listening");
 	});
 
-	it("no jolliApiKey path: enter Anthropic key → saved", async () => {
+	it("provider=anthropic, no other key: enter Anthropic key → saved", async () => {
 		h.loadAuthToken.mockResolvedValue("oauth-token");
-		h.loadConfig.mockResolvedValue({ aiProvider: "anthropic" }); // no jolliApiKey
+		h.loadConfig.mockResolvedValue({ aiProvider: "anthropic", jolliUrl: "https://acme.jolli.ai" });
 		h.promptText.mockResolvedValueOnce("1").mockResolvedValueOnce("sk-ant-x");
 		await runGuidedFrontDoor();
 		expect(h.saveConfigScoped).toHaveBeenCalledWith(
@@ -350,19 +451,74 @@ describe("GuidedFrontDoor", () => {
 		);
 	});
 
-	it("no jolliApiKey path: skip → no change", async () => {
+	it("provider=anthropic, no other key: skip → no change", async () => {
 		h.loadAuthToken.mockResolvedValue("oauth-token");
-		h.loadConfig.mockResolvedValue({ aiProvider: "anthropic" });
-		h.promptText.mockResolvedValue("2"); // skip in the no-Jolli menu
+		h.loadConfig.mockResolvedValue({ aiProvider: "anthropic", jolliUrl: "https://acme.jolli.ai" });
+		h.promptText.mockResolvedValue("2"); // skip in the 2-option menu
 		await runGuidedFrontDoor();
 		expect(h.saveConfigScoped).not.toHaveBeenCalled();
 	});
 
 	it("enter Anthropic key but press Enter (empty) → skipped, no save", async () => {
 		h.loadAuthToken.mockResolvedValue("oauth-token");
-		h.loadConfig.mockResolvedValue({ aiProvider: "anthropic" });
+		h.loadConfig.mockResolvedValue({ aiProvider: "anthropic", jolliUrl: "https://acme.jolli.ai" });
 		h.promptText.mockResolvedValueOnce("1").mockResolvedValueOnce("");
 		await runGuidedFrontDoor();
+		expect(h.saveConfigScoped).not.toHaveBeenCalled();
+	});
+
+	it("provider=jolli, only an Anthropic key → 'switch to Anthropic', then offers sign-in", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		// Second load reflects the just-written aiProvider switch (rung 1 reloads config).
+		h.loadConfig
+			.mockResolvedValueOnce({ apiKey: "sk-ant-x", aiProvider: "jolli" })
+			.mockResolvedValueOnce({ apiKey: "sk-ant-x", aiProvider: "anthropic" });
+		h.getSummaryCount.mockResolvedValue(3);
+		h.promptText.mockResolvedValueOnce("1").mockResolvedValueOnce("n"); // switch, then decline login
+		await runGuidedFrontDoor();
+		expect(out()).toContain("no Jolli key is available");
+		expect(h.saveConfigScoped).toHaveBeenCalledWith({ aiProvider: "anthropic" }, "/global/config");
+		expect(out()).toContain("switched to Anthropic");
+		expect(h.saveUserProfile).toHaveBeenCalledWith({ signInPromptDeclined: true });
+		expect(out()).toContain("last memory saved");
+	});
+
+	it("provider=jolli, only an Anthropic key, choose 'enter a Jolli key' → validated + saved", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig
+			.mockResolvedValueOnce({ apiKey: "sk-ant-x", aiProvider: "jolli" })
+			.mockResolvedValueOnce({ apiKey: "sk-ant-x", jolliApiKey: "sk-jol-new", aiProvider: "jolli" });
+		h.promptText.mockResolvedValueOnce("2").mockResolvedValueOnce("sk-jol-new");
+		await runGuidedFrontDoor();
+		expect(h.validateJolliApiKey).toHaveBeenCalledWith("sk-jol-new");
+		expect(h.saveConfigScoped).toHaveBeenCalledWith(
+			{ jolliApiKey: "sk-jol-new", aiProvider: "jolli" },
+			"/global/config",
+		);
+		expect(out()).toContain("Jolli key saved");
+		// jolliApiKey now present → can sync → no sign-in nudge.
+		expect(h.browserLogin).not.toHaveBeenCalled();
+	});
+
+	it("enter a Jolli key that fails validation → error, no save, no listening", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x", aiProvider: "jolli" });
+		h.promptText.mockResolvedValueOnce("2").mockResolvedValueOnce("bad-key");
+		h.validateJolliApiKey.mockImplementation(() => {
+			throw new Error("invalid key");
+		});
+		await runGuidedFrontDoor();
+		expect(errors.join("\n")).toContain("invalid key");
+		expect(h.saveConfigScoped).not.toHaveBeenCalled();
+		expect(out()).not.toContain("Jolli is listening");
+	});
+
+	it("enter a Jolli key but press Enter (empty) → skipped, no save", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x", aiProvider: "jolli" });
+		h.promptText.mockResolvedValueOnce("2").mockResolvedValueOnce("");
+		await runGuidedFrontDoor();
+		expect(h.validateJolliApiKey).not.toHaveBeenCalled();
 		expect(h.saveConfigScoped).not.toHaveBeenCalled();
 	});
 
@@ -375,8 +531,6 @@ describe("GuidedFrontDoor", () => {
 		});
 
 		it("folder-only repo with no orphan branch still reports its memories", async () => {
-			// Regression: previously gated on orphanBranchExists, so folder-mode
-			// repos (memories on disk, no orphan branch) wrongly reported 0.
 			h.isGitHookInstalled.mockResolvedValue(true);
 			h.getSummaryCount.mockResolvedValue(4);
 			const status = await getGuidedFrontDoorStatus("/repo");
