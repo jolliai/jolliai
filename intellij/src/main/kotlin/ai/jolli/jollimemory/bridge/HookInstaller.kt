@@ -673,8 +673,11 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
      * it reuses the SAME shared `run-hook` dispatcher the CLI and VS Code install
      * (written by [CliIntegrations.enableIntegrations] → the bundled `jolli enable
      * --integrations-only`), so IntelliJ gets byte-identical per-push behaviour via
-     * the same `PrePushHook.js` + `PrePushWorker.js` (JOLLI-1900 requirement 3 —
-     * reuse the existing push path, don't re-implement it).
+     * the same `PrePushHook.js` (JOLLI-1900 requirement 3 — reuse the existing
+     * push path, don't re-implement it). The hook itself syncs inline with a
+     * budget-bound batch request and spawns no worker; the bundled
+     * `PrePushWorker.js` remains only as the standalone compensation drain
+     * [CliIntegrations.retryPendingPushes] spawns.
      *
      * The absolute `run-hook` path is baked at install time (same convention as the
      * `java -jar <jar>` paths in the other scripts). Guarded two ways so a missing

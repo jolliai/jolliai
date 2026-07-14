@@ -28,6 +28,10 @@ const { mockNotifyApiKeySaveError } = vi.hoisted(() => ({
 	mockNotifyApiKeySaveError: vi.fn(),
 }));
 
+const { triggerPendingPushRetry } = vi.hoisted(() => ({
+	triggerPendingPushRetry: vi.fn(),
+}));
+
 const { mockRefreshConversationsPanel } = vi.hoisted(() => ({
 	mockRefreshConversationsPanel: vi.fn(() => Promise.resolve()),
 }));
@@ -736,6 +740,10 @@ vi.mock("../../cli/src/Logger.js", () => ({
 	isEnoent: vi.fn((err: unknown) => (err as NodeJS.ErrnoException)?.code === "ENOENT"),
 }));
 
+vi.mock("../../cli/src/hooks/PushCompensation.js", () => ({
+	triggerPendingPushRetry,
+}));
+
 vi.mock("../../cli/src/backfill/BackfillEngine.js", () => ({
 	recentCommitHashes: vi.fn(),
 	runBackfill: vi.fn(),
@@ -1348,6 +1356,17 @@ describe("Extension", () => {
 	// ── activate: normal activation ───────────────────────────────────────
 
 	describe("activate — normal activation", () => {
+		it("starts detached push compensation after storage initialization", async () => {
+			activate(makeContext());
+
+			await vi.waitFor(() => {
+				expect(triggerPendingPushRetry).toHaveBeenCalledWith(
+					"/test/workspace",
+					"vscode-activation",
+				);
+			});
+		});
+
 		it("creates providers and pushes disposables to context.subscriptions", () => {
 			const ctx = makeContext();
 
@@ -7068,6 +7087,10 @@ describe("Extension", () => {
 				"Signed in to Jolli successfully.",
 			);
 			expect(mockStatusStore.refresh).toHaveBeenCalled();
+			expect(triggerPendingPushRetry).toHaveBeenCalledWith(
+				"/test/workspace",
+				"vscode-sign-in",
+			);
 		});
 
 		it("shows error message on failed auth callback", async () => {
@@ -7097,6 +7120,10 @@ describe("Extension", () => {
 
 			expect(showErrorMessage).toHaveBeenCalledWith(
 				"Jolli sign-in failed: No authorization code received",
+			);
+			expect(triggerPendingPushRetry).not.toHaveBeenCalledWith(
+				"/test/workspace",
+				"vscode-sign-in",
 			);
 		});
 

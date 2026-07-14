@@ -241,6 +241,22 @@ describe("updateBatch / updateEntry / deleteEntry", () => {
 		expect(file.entries[HASH_A].lastError).toBeUndefined();
 	});
 
+	it("records pushedDocId/pushedUrl and preserves them across later patches", async () => {
+		await updateEntry(cwd, HASH_A, {
+			pushedDocId: 123,
+			pushedUrl: "https://acme.jolli.ai/articles?doc=123",
+		});
+		await updateEntry(cwd, HASH_A, { retryCount: 1, lastError: "boom" });
+
+		const file = await loadPushPending(cwd);
+		expect(file.entries[HASH_A]).toMatchObject({
+			pushedDocId: 123,
+			pushedUrl: "https://acme.jolli.ai/articles?doc=123",
+			retryCount: 1,
+			lastError: "boom",
+		});
+	});
+
 	it("ignores updates for hashes no longer present", async () => {
 		await deleteEntry(cwd, HASH_A);
 		await updateEntry(cwd, HASH_A, { retryCount: 5 }); // gone — no-op

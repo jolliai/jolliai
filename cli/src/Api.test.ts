@@ -142,6 +142,10 @@ vi.mock("./auth/Login.js", () => ({
 	browserLogin: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("./hooks/PushCompensation.js", () => ({
+	triggerPendingPushRetry: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Mock all dependencies
 vi.mock("./install/Installer.js", () => ({
 	install: vi.fn().mockResolvedValue({
@@ -302,6 +306,26 @@ vi.mock("./core/TopicIndexStore.js", () => ({
 }));
 vi.mock("./core/TopicPageStore.js", () => ({
 	purgeTopicPagesExcept: vi.fn(async () => []),
+}));
+
+vi.mock("./sync/VaultWriteLock.js", () => {
+	class VaultWriteBusyError extends Error {}
+	return {
+		DEFAULT_VAULT_WRITE_WAIT_MS: 0,
+		VaultWriteBusyError,
+		withVaultWriteLock: vi.fn(async (_root: string, _mode: unknown, body: () => Promise<unknown>) => ({
+			ran: true,
+			value: await body(),
+		})),
+	};
+});
+
+vi.mock("./sync/SyncBootstrap.js", () => ({
+	deriveMemoryBankRoot: vi.fn(() => "/mock/vault"),
+}));
+
+vi.mock("./hooks/QueueWorker.js", () => ({
+	launchWorker: vi.fn(),
 }));
 
 vi.mock("./core/StorageFactory.js", () => ({
@@ -729,8 +753,10 @@ describe("CLI", () => {
 
 	describe("enable command", () => {
 		it("should call install", async () => {
+			const { triggerPendingPushRetry } = await import("./hooks/PushCompensation.js");
 			await main(["enable"]);
 			expect(install).toHaveBeenCalled();
+			expect(triggerPendingPushRetry).toHaveBeenCalledWith("/mock/project", "cli-enable");
 		});
 
 		it("should set exit code on failure", async () => {
@@ -5102,8 +5128,9 @@ describe("CLI", () => {
 			}
 		});
 
-		it("should call browserLogin on auth login", async () => {
+		it("should log in and trigger pending push compensation", async () => {
 			const { browserLogin } = await import("./auth/Login.js");
+			const { triggerPendingPushRetry } = await import("./hooks/PushCompensation.js");
 			vi.mocked(browserLogin).mockResolvedValueOnce(undefined);
 
 			await main(["auth", "login"]);
@@ -5112,6 +5139,7 @@ describe("CLI", () => {
 			// it appends `/login` and the cli_callback params internally.
 			expect(browserLogin).toHaveBeenCalledTimes(1);
 			expect(browserLogin).toHaveBeenCalledWith(expect.stringMatching(/^https:\/\/[^/]+$/));
+			expect(triggerPendingPushRetry).toHaveBeenCalledWith("/mock/project", "cli-auth-login");
 		});
 
 		it("should report Jolli API Key saved when login yields jolliApiKey", async () => {
@@ -5130,6 +5158,7 @@ describe("CLI", () => {
 
 		it("should handle login failure gracefully", async () => {
 			const { browserLogin } = await import("./auth/Login.js");
+			const { triggerPendingPushRetry } = await import("./hooks/PushCompensation.js");
 			vi.mocked(browserLogin).mockRejectedValueOnce(new Error("Connection refused"));
 			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -5138,6 +5167,7 @@ describe("CLI", () => {
 
 				expect(errorSpy).toHaveBeenCalledWith("\n  Login failed:", "Connection refused");
 				expect(process.exitCode).toBe(1);
+				expect(triggerPendingPushRetry).not.toHaveBeenCalled();
 			} finally {
 				errorSpy.mockRestore();
 			}
