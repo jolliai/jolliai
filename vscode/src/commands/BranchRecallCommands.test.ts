@@ -24,6 +24,9 @@ vi.mock("../views/BranchRecall.js", () => ({
 	buildBranchRecallPrompt,
 }));
 
+const { track } = vi.hoisted(() => ({ track: vi.fn() }));
+vi.mock("../../../cli/src/core/Telemetry.js", () => ({ track }));
+
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import { runCopyBranchRecallPrompt, runRecallInClaudeCode } from "./BranchRecallCommands.js";
 
@@ -90,6 +93,8 @@ describe("runCopyBranchRecallPrompt — detached HEAD guard", () => {
 
 		expect(buildBranchRecallPrompt).toHaveBeenCalledWith("/repo", "main");
 		expect(writeText).toHaveBeenCalledWith("RECALL");
+		// JOLLI-1904: emits recall_prompt_copied after a successful copy.
+		expect(track).toHaveBeenCalledWith("recall_prompt_copied");
 	});
 
 	it("shows the empty message (not the detached message) when a real branch has no records", async () => {

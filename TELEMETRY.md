@@ -74,7 +74,7 @@ disk **before** they are sent.
 | `sync_completed` | A memory-bank sync round finished. Props: outcome (discriminator), duration_ms. |
 | `toolwindow_opened` | The memory tool window was opened. Props: view. |
 | `view_switched` | Tool window view switched (current/bank/knowledge). Props: view (discriminator). |
-| `memory_committed` | User committed a memory via the Commit button. Props: none. |
+| `memory_committed` | User committed a memory via the Commit button. Props: files_bucket (bucketed changed-file count), has_conversations (bool), context_bucket (bucketed plans/context count). |
 | `memory_expanded` | A committed memory's details were expanded. Props: expanded. |
 | `memory_item_opened` | An item inside a memory was opened. Props: item_type (discriminator: conversation/file/context/shipped). |
 | `session_resumed` | A conversation session was resumed in a terminal. Props: source (discriminator). |

@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { track } from "../../../cli/src/core/Telemetry.js";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import { buildBranchRecallPrompt } from "../views/BranchRecall.js";
 
@@ -48,5 +49,7 @@ export async function runCopyBranchRecallPrompt(bridge: JolliMemoryBridge, cwd: 
 		return;
 	}
 	await vscode.env.clipboard.writeText(prompt);
+	// JOLLI-1904: recall prompt copied to clipboard (mirrors IntelliJ; no props).
+	track("recall_prompt_copied");
 	await vscode.window.showInformationMessage("Recall prompt copied — paste it into Codex, Cursor, or any AI tool.");
 }
