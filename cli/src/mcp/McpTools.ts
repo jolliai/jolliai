@@ -20,6 +20,7 @@ import { type RecallResult, resolveRecall } from "../core/RecallResolver.js";
 import { searchHits } from "../core/SearchHits.js";
 import type { SearchHitResult } from "../core/SearchIndex.js";
 import { compareSourceRefs } from "../core/SourceTimeline.js";
+import { clearSpaceBindingCache } from "../core/SpaceBindingCache.js";
 import { getActiveStorage } from "../core/SummaryStore.js";
 import { readTopicPage } from "../core/TopicPageStore.js";
 
@@ -130,6 +131,9 @@ export async function runBindSpace(cwd: string, args: { space: string }): Promis
 	const repoName = deriveRepoNameFromUrl(repoUrl);
 	try {
 		const binding = await client.createBinding({ repoUrl, repoName, jmSpaceId });
+		// Bind-only entry point: drop the local binding cache — the next probe
+		// (or push echo) rebuilds it with the authoritative Space details.
+		await clearSpaceBindingCache(cwd);
 		return { type: "bound", ...binding };
 	} catch (err) {
 		if (err instanceof BindingAlreadyExistsError) {

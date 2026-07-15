@@ -109,18 +109,32 @@ export interface JolliMemorySpace {
  * bare `jolli`. `bound` covers both a pre-existing binding and the server-side
  * auto-bind when exactly one Space is bindable. `jmSpaceId` and `spaceName` are
  * `null` when the caller lacks `spaces.view` on the bound Space; the server
- * withholds the Space details but not the bound-ness. `unbound` means several
- * Spaces are bindable and the caller should prompt, then bind via
- * {@link JolliMemoryPushClient.createBinding}.
+ * withholds the Space details but not the bound-ness. `canPush` mirrors the
+ * server-side `articles.edit` check on the bound Space — the exact permission
+ * the push endpoint enforces — so `false` means the next push will 403 (e.g.
+ * the caller was demoted to viewer); `null` means an older server that
+ * predates the flag (unknown, not broken). A degraded bound response
+ * (`canPush === false`) additionally carries the caller's bindable pool in
+ * `spaces` + `defaultSpaceId` — the same list `unbound` returns — so a client
+ * can offer a rebind (`createBinding` with `replace: true`) without a second
+ * read call; both stay `[]`/null on healthy bindings and older servers.
+ * `unbound` means several Spaces are bindable and the caller should prompt,
+ * then bind via {@link JolliMemoryPushClient.createBinding}.
  */
 export type FrontDoorResult =
 	| {
 			readonly status: "bound";
-			readonly binding: { readonly jmSpaceId: number | null; readonly spaceName: string | null };
+			readonly binding: {
+				readonly jmSpaceId: number | null;
+				readonly spaceName: string | null;
+				readonly canPush: boolean | null;
+			};
+			readonly spaces: ReadonlyArray<JolliMemorySpace>;
+			readonly defaultSpaceId: number | null;
 	  }
 	| {
 			readonly status: "unbound";
-			readonly spaces: JolliMemorySpace[];
+			readonly spaces: ReadonlyArray<JolliMemorySpace>;
 			readonly defaultSpaceId: number | null;
 	  }
 	| { readonly status: "no_spaces" };
@@ -183,6 +197,16 @@ const DEFAULT_TIMEOUT_MS = 30_000;
  */
 const MANIFEST_TIMEOUT_MS = 5_000;
 
+/**
+ * Space-binding probes on interactive paths (`jolli status`, the bare-`jolli`
+ * front door) use a much tighter timeout than the 30 s default — same
+ * rationale as {@link MANIFEST_TIMEOUT_MS}: a slow-but-reachable server must
+ * not stall a command a human is waiting on. A timeout renders as the
+ * existing unreachable/skip copy. Background workers (pre-push sync) keep the
+ * default — nobody waits on them, and the wider window helps weak networks.
+ */
+export const SPACE_PROBE_TIMEOUT_MS = 5_000;
+
 /** Raw shape of `GET /api/jolli-memory/spaces` — validated field-by-field at parse time. */
 interface ListSpacesResponseBody {
 	readonly spaces?: ReadonlyArray<{ readonly id: number; readonly name: string; readonly slug: string }>;
@@ -198,7 +222,11 @@ interface CreateBindingResponseBody {
 /** Raw shape of `POST /api/jolli-memory/front-door` — validated field-by-field at parse time. */
 interface FrontDoorResponseBody {
 	readonly status?: "bound" | "unbound" | "no_spaces";
-	readonly binding?: { readonly jmSpaceId?: number | null; readonly spaceName?: string | null };
+	readonly binding?: {
+		readonly jmSpaceId?: number | null;
+		readonly spaceName?: string | null;
+		readonly canPush?: boolean | null;
+	};
 	readonly spaces?: ReadonlyArray<{ readonly id: number; readonly name: string; readonly slug: string }>;
 	readonly defaultSpaceId?: number | null;
 }
@@ -233,6 +261,13 @@ export interface PushResult {
 	readonly jrn: string;
 	readonly created: boolean;
 	readonly summaryJsonDocId?: number;
+	/**
+	 * The bound Space the push landed in, echoed by newer servers on
+	 * repoUrl-routed pushes. Callers persist it as the local binding cache
+	 * (`SpaceBindingCache`) — a successful push proves both the binding and
+	 * push rights. Absent on older servers and on legacy default-space pushes.
+	 */
+	readonly jmSpace?: { readonly id: number; readonly name: string };
 }
 
 /**
@@ -246,9 +281,23 @@ interface PushResponseBody {
 	readonly jrn: string;
 	readonly created: boolean;
 	readonly summaryJsonDocId?: number;
+	readonly jmSpace?: { readonly id?: unknown; readonly name?: unknown };
 	readonly error?: string;
 	readonly message?: string;
 	readonly repoUrl?: string;
+}
+
+/**
+ * Validates the optional Space echo of a push/pushBatch 2xx body field-by-field
+ * so a drifted shape degrades to "absent" rather than poisoning the caller's
+ * binding cache.
+ */
+function parseJmSpaceEcho(
+	raw: { readonly id?: unknown; readonly name?: unknown } | undefined,
+): { readonly id: number; readonly name: string } | undefined {
+	return raw && typeof raw.id === "number" && typeof raw.name === "string" && raw.name.length > 0
+		? { id: raw.id, name: raw.name }
+		: undefined;
 }
 
 // ─── Batch push (POST /api/push/jollimemory/batch) ──────────────────────────
@@ -331,11 +380,21 @@ export interface BatchItemResult {
 /** Validated response of `POST /api/push/jollimemory/batch`. */
 export interface BatchPushResult {
 	readonly results: ReadonlyArray<BatchItemResult>;
+	/**
+	 * The bound Space the batch landed in, echoed once at the top level by
+	 * newer servers on repoUrl-routed pushes (the server resolves the binding
+	 * and checks push rights before processing any item, so the echo holds even
+	 * when individual items fail). Callers persist it as the local binding
+	 * cache (`SpaceBindingCache`). Absent on older servers and on legacy
+	 * default-space pushes.
+	 */
+	readonly jmSpace?: { readonly id: number; readonly name: string };
 }
 
 /** Raw shape of `POST /api/push/jollimemory/batch` — validated entry-by-entry. */
 interface BatchPushResponseBody {
 	readonly results?: unknown;
+	readonly jmSpace?: { readonly id?: unknown; readonly name?: unknown };
 	readonly error?: string;
 	readonly message?: string;
 	readonly repoUrl?: string;
@@ -412,7 +471,16 @@ export class JolliMemoryPushClient {
 		) {
 			return {
 				status: "bound",
-				binding: { jmSpaceId: json.binding.jmSpaceId ?? null, spaceName: json.binding.spaceName ?? null },
+				binding: {
+					jmSpaceId: json.binding.jmSpaceId ?? null,
+					spaceName: json.binding.spaceName ?? null,
+					// Anything but a real boolean (older server, drifted value)
+					// collapses to null = unknown, so it can never false-alarm.
+					canPush: typeof json.binding.canPush === "boolean" ? json.binding.canPush : null,
+				},
+				// The rebind pool, present only on degraded bound responses.
+				spaces: (json.spaces ?? []).map((s) => ({ id: s.id, name: s.name, slug: s.slug })),
+				defaultSpaceId: json.defaultSpaceId ?? null,
 			};
 		}
 		if (json.status === "unbound") {
@@ -427,8 +495,13 @@ export class JolliMemoryPushClient {
 		throw new Error(`Unexpected front-door response shape (HTTP ${status})`);
 	}
 
-	/** Binds a repo to a Jolli Memory space. Server response has no `jmSpaceName` — only `{ binding, repoFolder }`. */
-	async createBinding(args: { repoUrl: string; repoName: string; jmSpaceId: number }): Promise<{
+	/**
+	 * Binds a repo to a Jolli Memory space. Server response has no `jmSpaceName` — only `{ binding, repoFolder }`.
+	 * `replace: true` is the rebind escape hatch: the server honors it only when
+	 * the existing binding is unusable for the caller (no `articles.edit` on its
+	 * Space) and answers 409 `binding_replace_not_allowed` otherwise.
+	 */
+	async createBinding(args: { repoUrl: string; repoName: string; jmSpaceId: number; replace?: boolean }): Promise<{
 		bindingId: number;
 		jmSpaceId: number;
 		repoName: string;
@@ -485,12 +558,15 @@ export class JolliMemoryPushClient {
 			// an UPDATE on the next push. Fail loudly rather than persist a bad docId.
 			throw new Error(`Push returned HTTP ${status} but the response was missing a docId/url`);
 		}
+		// Optional Space echo (newer servers, repoUrl-routed pushes only).
+		const jmSpace = parseJmSpaceEcho(json.jmSpace);
 		return {
 			url: json.url,
 			docId: json.docId,
 			jrn: json.jrn,
 			created: json.created,
 			summaryJsonDocId: json.summaryJsonDocId,
+			...(jmSpace !== undefined ? { jmSpace } : {}),
 		};
 	}
 
@@ -544,7 +620,9 @@ export class JolliMemoryPushClient {
 			okCount,
 			results.length - okCount,
 		);
-		return { results };
+		// Optional top-level Space echo (newer servers, repoUrl-routed pushes only).
+		const jmSpace = parseJmSpaceEcho(json.jmSpace);
+		return { results, ...(jmSpace !== undefined ? { jmSpace } : {}) };
 	}
 
 	/**

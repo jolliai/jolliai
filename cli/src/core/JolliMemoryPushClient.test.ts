@@ -109,6 +109,23 @@ describe("createBinding", () => {
 		const r = await c.createBinding({ repoUrl: "https://github.com/o/r", repoName: "repo", jmSpaceId: 7 });
 		expect(r).toEqual({ bindingId: 3, jmSpaceId: 7, repoName: "repo" });
 	});
+	it("forwards the replace flag in the request body (rebind escape hatch)", async () => {
+		let capturedBody: unknown;
+		const c = client(async (_url, init) => {
+			capturedBody = JSON.parse(String(init?.body));
+			return jsonResponse(201, {
+				binding: { id: 3, jmSpaceId: 7, repoName: "repo" },
+				repoFolder: { id: 9, jrn: "jrn:..." },
+			});
+		});
+		await c.createBinding({ repoUrl: "https://github.com/o/r", repoName: "repo", jmSpaceId: 7, replace: true });
+		expect(capturedBody).toEqual({
+			repoUrl: "https://github.com/o/r",
+			repoName: "repo",
+			jmSpaceId: 7,
+			replace: true,
+		});
+	});
 	it("maps 409 to BindingAlreadyExistsError", async () => {
 		const c = client(async () => jsonResponse(409, { error: "binding_already_exists" }));
 		await expect(c.createBinding({ repoUrl: "u", repoName: "r", jmSpaceId: 7 })).rejects.toBeInstanceOf(
@@ -163,36 +180,82 @@ describe("frontDoor", () => {
 		expect(capturedInit?.method).toBe("POST");
 		expect(JSON.parse(String(capturedInit?.body))).toEqual(args);
 	});
-	it("returns bound with the space name", async () => {
+	it("returns bound with the space name (canPush null when the server omits it)", async () => {
 		const c = client(async () =>
 			jsonResponse(200, { status: "bound", binding: { jmSpaceId: 7, spaceName: "Eng" } }),
 		);
 		await expect(c.frontDoor(args)).resolves.toEqual({
 			status: "bound",
-			binding: { jmSpaceId: 7, spaceName: "Eng" },
+			binding: { jmSpaceId: 7, spaceName: "Eng", canPush: null },
+			spaces: [],
+			defaultSpaceId: null,
+		});
+	});
+	it("passes through a boolean canPush on a bound response", async () => {
+		const c = client(async () =>
+			jsonResponse(200, { status: "bound", binding: { jmSpaceId: 7, spaceName: "Eng", canPush: false } }),
+		);
+		await expect(c.frontDoor(args)).resolves.toEqual({
+			status: "bound",
+			binding: { jmSpaceId: 7, spaceName: "Eng", canPush: false },
+			spaces: [],
+			defaultSpaceId: null,
+		});
+	});
+	it("returns the rebind pool attached to a degraded bound response", async () => {
+		const c = client(async () =>
+			jsonResponse(200, {
+				status: "bound",
+				binding: { jmSpaceId: null, spaceName: null, canPush: false },
+				spaces: [{ id: 2, name: "Sandbox", slug: "sandbox" }],
+				defaultSpaceId: 2,
+			}),
+		);
+		await expect(c.frontDoor(args)).resolves.toEqual({
+			status: "bound",
+			binding: { jmSpaceId: null, spaceName: null, canPush: false },
+			spaces: [{ id: 2, name: "Sandbox", slug: "sandbox" }],
+			defaultSpaceId: 2,
+		});
+	});
+	it("collapses a non-boolean canPush to null (contract drift must not false-alarm)", async () => {
+		const c = client(async () =>
+			jsonResponse(200, { status: "bound", binding: { jmSpaceId: 7, spaceName: "Eng", canPush: "nope" } }),
+		);
+		await expect(c.frontDoor(args)).resolves.toEqual({
+			status: "bound",
+			binding: { jmSpaceId: 7, spaceName: "Eng", canPush: null },
+			spaces: [],
+			defaultSpaceId: null,
 		});
 	});
 	it("coalesces missing bound Space details to null", async () => {
 		const c = client(async () => jsonResponse(200, { status: "bound", binding: {} }));
 		await expect(c.frontDoor(args)).resolves.toEqual({
 			status: "bound",
-			binding: { jmSpaceId: null, spaceName: null },
+			binding: { jmSpaceId: null, spaceName: null, canPush: null },
+			spaces: [],
+			defaultSpaceId: null,
 		});
 	});
 	it("accepts explicit null Space details on a bound response", async () => {
 		const c = client(async () =>
-			jsonResponse(200, { status: "bound", binding: { jmSpaceId: null, spaceName: null } }),
+			jsonResponse(200, { status: "bound", binding: { jmSpaceId: null, spaceName: null, canPush: false } }),
 		);
 		await expect(c.frontDoor(args)).resolves.toEqual({
 			status: "bound",
-			binding: { jmSpaceId: null, spaceName: null },
+			binding: { jmSpaceId: null, spaceName: null, canPush: false },
+			spaces: [],
+			defaultSpaceId: null,
 		});
 	});
 	it("coalesces a missing spaceName to null when the Space id is visible", async () => {
 		const c = client(async () => jsonResponse(200, { status: "bound", binding: { jmSpaceId: 7 } }));
 		await expect(c.frontDoor(args)).resolves.toEqual({
 			status: "bound",
-			binding: { jmSpaceId: 7, spaceName: null },
+			binding: { jmSpaceId: 7, spaceName: null, canPush: null },
+			spaces: [],
+			defaultSpaceId: null,
 		});
 	});
 	it("returns unbound with the space list and defaultSpaceId", async () => {
@@ -334,6 +397,40 @@ describe("push", () => {
 		});
 		expect(r.docId).toBe(42);
 		expect(r.created).toBe(true);
+		// Older servers echo no Space — the field is simply absent.
+		expect(r.jmSpace).toBeUndefined();
+	});
+	it("passes the server's jmSpace echo through on a 2xx", async () => {
+		const c = client(async () =>
+			jsonResponse(201, {
+				url: "/articles/x",
+				docId: 42,
+				jrn: "jrn",
+				created: true,
+				jmSpace: { id: 7, name: "Acme Core" },
+			}),
+		);
+		const r = await c.push({
+			title: "t",
+			content: "c",
+			commitHash: "abc1234",
+			docType: "summary",
+			repoUrl: "https://github.com/o/r",
+		});
+		expect(r.jmSpace).toEqual({ id: 7, name: "Acme Core" });
+	});
+	it("drops a malformed jmSpace echo instead of poisoning the result", async () => {
+		const c = client(async () =>
+			jsonResponse(201, {
+				url: "/articles/x",
+				docId: 42,
+				jrn: "jrn",
+				created: true,
+				jmSpace: { id: "7", name: "" },
+			}),
+		);
+		const r = await c.push({ title: "t", content: "c", commitHash: "abc1234", docType: "summary" });
+		expect(r.jmSpace).toBeUndefined();
 	});
 	it("maps 412 binding_required to BindingRequiredError carrying repoUrl", async () => {
 		const c = client(async () =>
@@ -999,6 +1096,44 @@ describe("pushBatch", () => {
 		expect(r.results[0]).toMatchObject({ commitHash: "a".repeat(40), ok: true });
 		expect(r.results[0].summary).toEqual({ docId: 9, url: "/articles/one-9", jrn: "jrn:9", created: true });
 		expect(r.results[0].attachments[0]).toMatchObject({ clientKey: "plan-0", ok: true, docId: 10 });
+		// Older servers echo no Space — the field is simply absent.
+		expect(r.jmSpace).toBeUndefined();
+	});
+
+	it("passes the top-level jmSpace echo through on a 200", async () => {
+		const c = client(async () =>
+			jsonResponse(200, {
+				results: [
+					{
+						commitHash: "a".repeat(40),
+						ok: true,
+						summary: { docId: 9, url: "/articles/one-9", jrn: "jrn:9", created: true },
+						attachments: [],
+					},
+				],
+				jmSpace: { id: 7, name: "Acme Core" },
+			}),
+		);
+		const r = await c.pushBatch(payload);
+		expect(r.jmSpace).toEqual({ id: 7, name: "Acme Core" });
+	});
+
+	it("drops a malformed top-level jmSpace echo instead of poisoning the binding cache", async () => {
+		const c = client(async () =>
+			jsonResponse(200, {
+				results: [
+					{
+						commitHash: "a".repeat(40),
+						ok: true,
+						summary: { docId: 9, url: "/articles/one-9", jrn: "jrn:9", created: true },
+						attachments: [],
+					},
+				],
+				jmSpace: { id: "7", name: "" },
+			}),
+		);
+		const r = await c.pushBatch(payload);
+		expect(r.jmSpace).toBeUndefined();
 	});
 
 	it("downgrades an ok:true attachment without docId/url to a failure (contract drift guard)", async () => {

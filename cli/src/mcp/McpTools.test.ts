@@ -26,6 +26,8 @@ vi.mock("../core/JolliMemoryPushClient.js", async () => {
 	);
 	return { ...actual, JolliMemoryPushClient: vi.fn() };
 });
+// Mocked so these tests never touch a real `.jolli/jollimemory/space-binding.json`.
+vi.mock("../core/SpaceBindingCache.js", () => ({ clearSpaceBindingCache: vi.fn() }));
 vi.mock("../core/GitRemoteUtils.js", () => ({
 	getCanonicalRepoUrl: vi.fn(),
 	deriveRepoNameFromUrl: vi.fn(),
@@ -37,6 +39,7 @@ import { BindingAlreadyExistsError, JolliMemoryPushClient } from "../core/JolliM
 import { pushBranchToJolli, resolveSpaceId } from "../core/JolliMemoryPushOrchestrator.js";
 import { buildPrDescription } from "../core/PrDescription.js";
 import { SearchIndex } from "../core/SearchIndex.js";
+import { clearSpaceBindingCache } from "../core/SpaceBindingCache.js";
 import { getActiveStorage } from "../core/SummaryStore.js";
 import { readTopicPage } from "../core/TopicPageStore.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
@@ -301,6 +304,7 @@ describe("runBindSpace", () => {
 		vi.mocked(getCanonicalRepoUrl).mockReset();
 		vi.mocked(deriveRepoNameFromUrl).mockReset();
 		vi.mocked(resolveSpaceId).mockReset();
+		vi.mocked(clearSpaceBindingCache).mockReset();
 	});
 
 	it("resolves the repo + space and returns the bound result", async () => {
@@ -316,6 +320,9 @@ describe("runBindSpace", () => {
 			jmSpaceId: 2,
 		});
 		expect(out).toEqual({ type: "bound", bindingId: 9, jmSpaceId: 2, repoName: "widgets" });
+		// Bind-only entry point: the local binding cache is dropped so the next
+		// probe (or push echo) rebuilds it authoritatively.
+		expect(clearSpaceBindingCache).toHaveBeenCalledWith("/repo");
 	});
 
 	it("returns type:already_bound instead of throwing when the repo is already bound", async () => {
@@ -328,6 +335,8 @@ describe("runBindSpace", () => {
 		setClientStub({ createBinding });
 		const out = await runBindSpace("/repo", { space: "acme" });
 		expect(out).toEqual({ type: "already_bound", message: "binding_already_exists" });
+		// The binding did not change, so the cache is left untouched.
+		expect(clearSpaceBindingCache).not.toHaveBeenCalled();
 	});
 
 	it("rejects an empty space", async () => {

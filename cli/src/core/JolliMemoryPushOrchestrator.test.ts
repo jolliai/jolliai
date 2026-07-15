@@ -17,6 +17,12 @@ vi.mock("./GitRemoteUtils.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./GitRemoteUtils.js")>();
 	return { ...actual, getCanonicalRepoUrl: vi.fn() };
 });
+// Mocked so these tests never touch a real `.jolli/jollimemory/space-binding.json`
+// (cwd is a fake path); the cache's own behavior is covered by SpaceBindingCache.test.ts.
+vi.mock("./SpaceBindingCache.js", () => ({
+	clearSpaceBindingCache: vi.fn(),
+	saveSpaceBindingCache: vi.fn(),
+}));
 
 import { getDefaultBranch } from "./GitOps.js";
 import { buildBranchRelativePath, getCanonicalRepoUrl } from "./GitRemoteUtils.js";
@@ -51,6 +57,7 @@ import {
 } from "./JolliMemoryPushOrchestrator.js";
 import { loadBranchSummaries } from "./PrDescription.js";
 import { loadPushPending } from "./PushPendingStore.js";
+import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
 import { buildPushTitle } from "./SummaryFormat.js";
 import {
 	getActiveStorage,
@@ -772,6 +779,20 @@ describe("pushSummary", () => {
 		vi.mocked(loadPushPending).mockReset().mockResolvedValue({ version: 1, entries: {} });
 		vi.mocked(getIndexEntryMap).mockReset().mockResolvedValue(new Map());
 		vi.mocked(readReferenceFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(saveSpaceBindingCache).mockReset().mockResolvedValue(undefined);
+		vi.mocked(clearSpaceBindingCache).mockReset().mockResolvedValue(undefined);
+	});
+
+	it("passes the server's jmSpace echo through on the result (absent on older servers)", async () => {
+		const withEcho = fakeClient({
+			push: async () => fakePushResult({ jmSpace: { id: 7, name: "Acme Core" } }),
+		});
+		const echoed = await pushSummary(leaf(), baseCtx(withEcho));
+		expect(echoed.jmSpace).toEqual({ id: 7, name: "Acme Core" });
+
+		const withoutEcho = fakeClient();
+		const plain = await pushSummary(leaf(), baseCtx(withoutEcho));
+		expect(plain.jmSpace).toBeUndefined();
 	});
 
 	it("deletes the freshly-pushed article and skips force-store when the commit became a child mid-push", async () => {
@@ -1342,6 +1363,47 @@ describe("pushBranchToJolli", () => {
 		vi.mocked(getCanonicalRepoUrl).mockReset().mockResolvedValue("https://github.com/jolliai/jolli");
 		vi.mocked(getDefaultBranch).mockReset().mockResolvedValue("main");
 		vi.mocked(loadBranchSummaries).mockReset();
+		vi.mocked(saveSpaceBindingCache).mockReset().mockResolvedValue(undefined);
+		vi.mocked(clearSpaceBindingCache).mockReset().mockResolvedValue(undefined);
+	});
+
+	it("persists the binding cache when a pushed summary echoes the bound Space", async () => {
+		vi.mocked(loadBranchSummaries).mockResolvedValue({ summaries: [leaf()], missingCount: 0 });
+		const client = fakeClient({
+			push: async () => fakePushResult({ jmSpace: { id: 7, name: "Acme Core" } }),
+		});
+
+		const result = await pushBranchToJolli({ cwd: "/repo", client });
+
+		expect(result.type).toBe("pushed");
+		expect(saveSpaceBindingCache).toHaveBeenCalledWith("/repo", {
+			repoUrl: "https://github.com/jolliai/jolli",
+			origin: BASE,
+			jmSpaceId: 7,
+			spaceName: "Acme Core",
+			canPush: true,
+		});
+	});
+
+	it("leaves the binding cache untouched when the server echoes no Space (older server)", async () => {
+		vi.mocked(loadBranchSummaries).mockResolvedValue({ summaries: [leaf()], missingCount: 0 });
+		const client = fakeClient();
+
+		await pushBranchToJolli({ cwd: "/repo", client });
+
+		expect(saveSpaceBindingCache).not.toHaveBeenCalled();
+		expect(clearSpaceBindingCache).not.toHaveBeenCalled();
+	});
+
+	it("clears the binding cache after an explicit --space bind (rebuilt by the push echo / next probe)", async () => {
+		vi.mocked(loadBranchSummaries).mockResolvedValue({ summaries: [leaf()], missingCount: 0 });
+		const client = fakeClient({
+			listSpaces: async () => ({ spaces: [{ id: 5, name: "Eng", slug: "eng" }], defaultSpaceId: null }),
+		});
+
+		await pushBranchToJolli({ cwd: "/repo", client, space: "eng" });
+
+		expect(clearSpaceBindingCache).toHaveBeenCalledWith("/repo");
 	});
 
 	it("pushes every summary on base..HEAD and returns their urls", async () => {

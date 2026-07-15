@@ -39,9 +39,13 @@ vi.mock("../core/GitRemoteUtils.js", () => ({
 	deriveRepoNameFromUrl: vi.fn(() => "widgets"),
 }));
 
+// Mocked so these tests never touch a real `.jolli/jollimemory/space-binding.json`.
+vi.mock("../core/SpaceBindingCache.js", () => ({ clearSpaceBindingCache: vi.fn() }));
+
 import { deriveRepoNameFromUrl, getCanonicalRepoUrl } from "../core/GitRemoteUtils.js";
 import { BindingAlreadyExistsError, JolliMemoryPushClient } from "../core/JolliMemoryPushClient.js";
 import { pushBranchToJolli } from "../core/JolliMemoryPushOrchestrator.js";
+import { clearSpaceBindingCache } from "../core/SpaceBindingCache.js";
 import { registerBindCommand, registerPushCommand, registerSpacesCommand } from "./JolliCloudCommands.js";
 
 const mockPushBranchToJolli = vi.mocked(pushBranchToJolli);
@@ -107,6 +111,7 @@ describe("jolli push / spaces / bind commands", () => {
 	beforeEach(() => {
 		mockPushBranchToJolli.mockReset();
 		MockClient.mockReset();
+		vi.mocked(clearSpaceBindingCache).mockReset();
 		setClientStub(makeClientStub());
 		mockGetCanonicalRepoUrl.mockClear();
 		mockDeriveRepoNameFromUrl.mockClear();
@@ -299,6 +304,9 @@ describe("jolli push / spaces / bind commands", () => {
 				jmSpaceId: 2,
 			});
 			expect(JSON.parse(stdout.trim())).toMatchObject({ type: "bound", jmSpaceId: 2, repoName: "widgets" });
+			// Bind-only entry point: the local binding cache is dropped so the
+			// next probe (or push echo) rebuilds it authoritatively.
+			expect(clearSpaceBindingCache).toHaveBeenCalledWith("/tmp/x");
 		});
 
 		it("resolves a slug --space by listing spaces first", async () => {

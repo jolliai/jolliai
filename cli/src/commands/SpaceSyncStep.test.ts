@@ -12,6 +12,10 @@ const h = vi.hoisted(() => ({
 	deriveRepoNameFromUrl: vi.fn(),
 	parseJolliApiKey: vi.fn(),
 	promptText: vi.fn(),
+	loadCache: vi.fn(),
+	saveCache: vi.fn(),
+	clearCache: vi.fn(),
+	tenantOrigin: vi.fn(),
 }));
 
 vi.mock("../core/SessionTracker.js", () => ({ loadConfig: h.loadConfig }));
@@ -27,6 +31,15 @@ vi.mock("../core/JolliApiUtils.js", () => ({
 	deriveJolliEnvKey: vi.fn(),
 }));
 vi.mock("./CliUtils.js", () => ({ promptText: h.promptText }));
+// Mocked wholesale so these tests never touch a real
+// `.jolli/jollimemory/space-binding.json`; the cache's own read/write/expiry
+// behavior is covered by SpaceBindingCache.test.ts.
+vi.mock("../core/SpaceBindingCache.js", () => ({
+	loadSpaceBindingCache: h.loadCache,
+	saveSpaceBindingCache: h.saveCache,
+	clearSpaceBindingCache: h.clearCache,
+	tenantOriginForKey: h.tenantOrigin,
+}));
 
 const spaceA = { id: 1, name: "Acme Core", slug: "acme-core" };
 const spaceB = { id: 2, name: "Sandbox", slug: "sandbox" };
@@ -56,6 +69,10 @@ describe("runSpaceSyncStep", () => {
 		h.getCanonicalRepoUrl.mockResolvedValue("https://github.com/acme/widgets");
 		h.deriveRepoNameFromUrl.mockReturnValue("widgets");
 		h.parseJolliApiKey.mockReturnValue({ u: "https://acme.jolli.ai" });
+		// Default: tenant resolvable, cache miss — every pre-cache test keeps
+		// exercising the live front-door probe exactly as before.
+		h.tenantOrigin.mockReturnValue("https://acme.jolli.ai");
+		h.loadCache.mockResolvedValue(null);
 	});
 
 	afterEach(() => {
@@ -77,26 +94,215 @@ describe("runSpaceSyncStep", () => {
 		const { client, frontDoor, createBinding } = makeClient({
 			frontDoor: vi.fn().mockResolvedValue({
 				status: "bound",
-				binding: { jmSpaceId: spaceA.id, spaceName: spaceA.name },
+				binding: { jmSpaceId: spaceA.id, spaceName: spaceA.name, canPush: true },
 			}),
 		});
 
 		await runSpaceSyncStep("/repo", { client });
 
 		expect(frontDoor).toHaveBeenCalledWith({ repoUrl: "https://github.com/acme/widgets", repoName: "widgets" });
-		expect(logSpy).toHaveBeenCalledWith("  ✓ syncing to Acme Core");
+		expect(logSpy).toHaveBeenCalledWith('  ✓ syncing · Space "Acme Core"');
 		expect(createBinding).not.toHaveBeenCalled();
 		expect(h.promptText).not.toHaveBeenCalled();
 	});
 
-	it("prints a generic label when the server withholds the bound Space name", async () => {
+	it("keeps the green check when an older server omits canPush (null = unknown)", async () => {
 		const { client } = makeClient({
-			frontDoor: vi.fn().mockResolvedValue({ status: "bound", binding: { jmSpaceId: 7, spaceName: null } }),
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: spaceA.id, spaceName: spaceA.name, canPush: null },
+			}),
 		});
 
 		await runSpaceSyncStep("/repo", { client });
 
-		expect(logSpy).toHaveBeenCalledWith("  ✓ syncing to your Jolli Space");
+		expect(logSpy).toHaveBeenCalledWith('  ✓ syncing · Space "Acme Core"');
+	});
+
+	it("warns instead of claiming to sync when the server withholds the bound Space name (no spaces.view)", async () => {
+		const { client } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: 7, spaceName: null, canPush: false },
+				spaces: [],
+				defaultSpaceId: null,
+			}),
+		});
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(logSpy).toHaveBeenCalledWith(
+			"  ⚠ bound · no access to the Space — memories won't sync (ask for access)",
+		);
+	});
+
+	it("warns with the Space name when the caller can view but not push (canPush false)", async () => {
+		const { client } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: spaceA.id, spaceName: spaceA.name, canPush: false },
+				spaces: [],
+				defaultSpaceId: null,
+			}),
+		});
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(logSpy).toHaveBeenCalledWith(
+			'  ⚠ bound · Space "Acme Core" — read-only access, memories won\'t sync (ask for access)',
+		);
+	});
+
+	it("does not offer a rebind when the degraded binding has no bindable pool", async () => {
+		const { client } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: 7, spaceName: null, canPush: false },
+				spaces: [],
+				defaultSpaceId: null,
+			}),
+		});
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(h.promptText).not.toHaveBeenCalled();
+	});
+
+	it("offers a single-target rebind on a degraded binding and rebinds on yes", async () => {
+		const { client, createBinding } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: 7, spaceName: null, canPush: false },
+				spaces: [spaceB],
+				defaultSpaceId: null,
+			}),
+			createBinding: vi.fn().mockResolvedValue({ bindingId: 9, jmSpaceId: spaceB.id, repoName: "widgets" }),
+		});
+		h.promptText.mockResolvedValue("y");
+
+		await runSpaceSyncStep("/repo", { client });
+
+		// The warning must not say "ask for access" when the very next line
+		// offers the rebind way out.
+		expect(logSpy).toHaveBeenCalledWith("  ⚠ bound · no access to the Space — memories won't sync");
+		expect(h.promptText).toHaveBeenCalledWith('\n  Rebind this repo to Space "Sandbox"? [y/N] ');
+		expect(createBinding).toHaveBeenCalledWith({
+			repoUrl: "https://github.com/acme/widgets",
+			repoName: "widgets",
+			jmSpaceId: spaceB.id,
+			replace: true,
+		});
+		expect(logSpy).toHaveBeenCalledWith('  ✓ syncing · Space "Sandbox"');
+	});
+
+	it("drops the ask-for-access hint on a named read-only binding when the rebind offer follows", async () => {
+		const { client } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: spaceA.id, spaceName: spaceA.name, canPush: false },
+				spaces: [spaceB],
+				defaultSpaceId: null,
+			}),
+		});
+		h.promptText.mockResolvedValue("");
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(logSpy).toHaveBeenCalledWith('  ⚠ bound · Space "Acme Core" — read-only access, memories won\'t sync');
+		expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("ask for access"));
+	});
+
+	it("defaults the rebind offer to No — an empty answer changes nothing", async () => {
+		const { client, createBinding } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: 7, spaceName: null, canPush: false },
+				spaces: [spaceB],
+				defaultSpaceId: null,
+			}),
+		});
+		h.promptText.mockResolvedValue("");
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(createBinding).not.toHaveBeenCalled();
+		expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("✓ syncing"));
+	});
+
+	it("prompts a choice when several rebind targets are available", async () => {
+		const { client, createBinding } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: 7, spaceName: null, canPush: false },
+				spaces: [spaceA, spaceB],
+				defaultSpaceId: spaceB.id,
+			}),
+			createBinding: vi.fn().mockResolvedValue({ bindingId: 9, jmSpaceId: spaceA.id, repoName: "widgets" }),
+		});
+		h.promptText.mockResolvedValueOnce("y").mockResolvedValueOnce("1");
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(h.promptText).toHaveBeenCalledWith("\n  Rebind this repo to another Space? [y/N] ");
+		expect(h.promptText).toHaveBeenCalledWith("\n  Choice [2]: ");
+		expect(createBinding).toHaveBeenCalledWith(expect.objectContaining({ jmSpaceId: spaceA.id, replace: true }));
+		expect(logSpy).toHaveBeenCalledWith('  ✓ syncing · Space "Acme Core"');
+	});
+
+	it("prints a retry hint when the rebind call fails", async () => {
+		const { client } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: 7, spaceName: null, canPush: false },
+				spaces: [spaceB],
+				defaultSpaceId: null,
+			}),
+			createBinding: vi.fn().mockRejectedValue(new Error("binding_replace_not_allowed")),
+		});
+		h.promptText.mockResolvedValue("yes");
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(logSpy).toHaveBeenCalledWith("  ⚠ rebind failed — re-run `jolli` to retry");
+		expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("✓ syncing"));
+	});
+
+	it("treats a rebind 409 whose existing binding matches the pick as success", async () => {
+		// A concurrent rebind that landed on the same Space — same tolerance as
+		// the main bind flow.
+		const { client } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: 7, spaceName: null, canPush: false },
+				spaces: [spaceB],
+				defaultSpaceId: null,
+			}),
+			createBinding: vi.fn().mockRejectedValue(new BindingAlreadyExistsError("exists", spaceB.id)),
+		});
+		h.promptText.mockResolvedValue("y");
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(logSpy).toHaveBeenCalledWith('  ✓ syncing · Space "Sandbox"');
+		expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("rebind failed"));
+	});
+
+	it("prints the retry hint when the rebind 409 existing binding differs from the pick", async () => {
+		const { client } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: 7, spaceName: null, canPush: false },
+				spaces: [spaceB],
+				defaultSpaceId: null,
+			}),
+			createBinding: vi.fn().mockRejectedValue(new BindingAlreadyExistsError("exists", spaceA.id)),
+		});
+		h.promptText.mockResolvedValue("y");
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(logSpy).toHaveBeenCalledWith("  ⚠ rebind failed — re-run `jolli` to retry");
+		expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("✓ syncing"));
 	});
 
 	it("prints the tenant site in the no-Spaces hint", async () => {
@@ -104,7 +310,7 @@ describe("runSpaceSyncStep", () => {
 
 		await runSpaceSyncStep("/repo", { client });
 
-		expect(logSpy).toHaveBeenCalledWith("  No Jolli Spaces available yet — create one at acme.jolli.ai");
+		expect(logSpy).toHaveBeenCalledWith("  No Jolli Spaces available to you — create one at acme.jolli.ai");
 	});
 
 	it("falls back to a generic no-Spaces hint when the api key encodes no site URL", async () => {
@@ -113,7 +319,7 @@ describe("runSpaceSyncStep", () => {
 
 		await runSpaceSyncStep("/repo", { client });
 
-		expect(logSpy).toHaveBeenCalledWith("  No Jolli Spaces available yet — create one in the Jolli web app");
+		expect(logSpy).toHaveBeenCalledWith("  No Jolli Spaces available to you — create one in the Jolli web app");
 	});
 
 	it("falls back to a generic no-Spaces hint when the api key site URL is unparseable", async () => {
@@ -122,7 +328,7 @@ describe("runSpaceSyncStep", () => {
 
 		await runSpaceSyncStep("/repo", { client });
 
-		expect(logSpy).toHaveBeenCalledWith("  No Jolli Spaces available yet — create one in the Jolli web app");
+		expect(logSpy).toHaveBeenCalledWith("  No Jolli Spaces available to you — create one in the Jolli web app");
 	});
 
 	it("treats an unbound response with an empty Space list as no Spaces", async () => {
@@ -134,7 +340,7 @@ describe("runSpaceSyncStep", () => {
 
 		await runSpaceSyncStep("/repo", { client });
 
-		expect(logSpy).toHaveBeenCalledWith("  No Jolli Spaces available yet — create one at acme.jolli.ai");
+		expect(logSpy).toHaveBeenCalledWith("  No Jolli Spaces available to you — create one at acme.jolli.ai");
 		expect(h.promptText).not.toHaveBeenCalled();
 		expect(createBinding).not.toHaveBeenCalled();
 	});
@@ -155,7 +361,7 @@ describe("runSpaceSyncStep", () => {
 			repoName: "widgets",
 			jmSpaceId: spaceA.id,
 		});
-		expect(logSpy).toHaveBeenCalledWith("  ✓ syncing to Acme Core");
+		expect(logSpy).toHaveBeenCalledWith('  ✓ syncing · Space "Acme Core"');
 	});
 
 	it("prompts, binds the picked Space, and prints it when several Spaces are bindable", async () => {
@@ -171,7 +377,7 @@ describe("runSpaceSyncStep", () => {
 
 		await runSpaceSyncStep("/repo", { client });
 
-		expect(logSpy).toHaveBeenCalledWith("\n  2 Spaces on your tenant. Which Space should this repo sync to?");
+		expect(logSpy).toHaveBeenCalledWith("\n  2 Spaces available to you. Which Space should this repo sync to?");
 		expect(logSpy).toHaveBeenCalledWith("    1) Acme Core (default)");
 		expect(logSpy).toHaveBeenCalledWith("    2) Sandbox");
 		expect(h.promptText).toHaveBeenCalledWith("\n  Choice [1]: ");
@@ -180,7 +386,7 @@ describe("runSpaceSyncStep", () => {
 			repoName: "widgets",
 			jmSpaceId: spaceB.id,
 		});
-		expect(logSpy).toHaveBeenCalledWith("  ✓ syncing to Sandbox");
+		expect(logSpy).toHaveBeenCalledWith('  ✓ syncing · Space "Sandbox"');
 	});
 
 	it("defaults to the tenant default Space on empty input", async () => {
@@ -198,7 +404,7 @@ describe("runSpaceSyncStep", () => {
 
 		expect(h.promptText).toHaveBeenCalledWith("\n  Choice [2]: ");
 		expect(createBinding).toHaveBeenCalledWith(expect.objectContaining({ jmSpaceId: spaceB.id }));
-		expect(logSpy).toHaveBeenCalledWith("  ✓ syncing to Sandbox");
+		expect(logSpy).toHaveBeenCalledWith('  ✓ syncing · Space "Sandbox"');
 	});
 
 	it("defaults to the first Space when the tenant has no default", async () => {
@@ -263,7 +469,7 @@ describe("runSpaceSyncStep", () => {
 
 		await runSpaceSyncStep("/repo", { client });
 
-		expect(logSpy).toHaveBeenCalledWith("  ✓ syncing to Sandbox");
+		expect(logSpy).toHaveBeenCalledWith('  ✓ syncing · Space "Sandbox"');
 	});
 
 	it("fails closed when the 409 existing binding differs from the pick", async () => {
@@ -280,7 +486,7 @@ describe("runSpaceSyncStep", () => {
 		await runSpaceSyncStep("/repo", { client });
 
 		expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("already bound to a different Jolli Space"));
-		expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("✓ syncing to"));
+		expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("✓ syncing"));
 	});
 
 	it("fails closed when the 409 carries no existing space id", async () => {
@@ -297,7 +503,7 @@ describe("runSpaceSyncStep", () => {
 		await runSpaceSyncStep("/repo", { client });
 
 		expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("already bound to a different Jolli Space"));
-		expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("✓ syncing to"));
+		expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("✓ syncing"));
 	});
 
 	it("stays silent when the front-door call fails", async () => {
@@ -323,7 +529,7 @@ describe("runSpaceSyncStep", () => {
 
 		await expect(runSpaceSyncStep("/repo", { client })).resolves.toBeUndefined();
 
-		expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("✓ syncing to"));
+		expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("✓ syncing"));
 	});
 
 	it("swallows non-Error throwables without crashing the front door", async () => {
@@ -344,5 +550,136 @@ describe("runSpaceSyncStep", () => {
 		await expect(runSpaceSyncStep("/repo")).resolves.toBeUndefined();
 
 		expect(logSpy).not.toHaveBeenCalled();
+	});
+
+	it("prints the sync line straight from a fresh cache entry with zero network I/O", async () => {
+		h.loadCache.mockResolvedValue({
+			version: 1,
+			repoUrl: "https://github.com/acme/widgets",
+			origin: "https://acme.jolli.ai",
+			jmSpaceId: spaceA.id,
+			spaceName: spaceA.name,
+			canPush: true,
+			boundAt: "2026-07-01T00:00:00.000Z",
+			checkedAt: "2026-07-15T00:00:00.000Z",
+		});
+		const { client, frontDoor } = makeClient();
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(frontDoor).not.toHaveBeenCalled();
+		expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('✓ syncing · Space "Acme Core"'));
+	});
+
+	it("skips the cache read (but still probes) when the key carries no resolvable origin", async () => {
+		h.tenantOrigin.mockReturnValue(null);
+		const { client, frontDoor } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: spaceA.id, spaceName: spaceA.name, canPush: true },
+				spaces: [],
+				defaultSpaceId: null,
+			}),
+		});
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(h.loadCache).not.toHaveBeenCalled();
+		expect(h.saveCache).not.toHaveBeenCalled();
+		expect(frontDoor).toHaveBeenCalledTimes(1);
+		expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('✓ syncing · Space "Acme Core"'));
+	});
+
+	it("writes the cache after a healthy bound answer", async () => {
+		const { client } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: spaceA.id, spaceName: spaceA.name, canPush: true },
+				spaces: [],
+				defaultSpaceId: null,
+			}),
+		});
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(h.saveCache).toHaveBeenCalledWith("/repo", {
+			repoUrl: "https://github.com/acme/widgets",
+			origin: "https://acme.jolli.ai",
+			jmSpaceId: spaceA.id,
+			spaceName: spaceA.name,
+			canPush: true,
+		});
+	});
+
+	it("clears (and never writes) the cache on a degraded bound answer", async () => {
+		h.promptText.mockResolvedValue("");
+		const { client } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: spaceA.id, spaceName: spaceA.name, canPush: false },
+				spaces: [spaceB],
+				defaultSpaceId: null,
+			}),
+		});
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(h.saveCache).not.toHaveBeenCalled();
+		expect(h.clearCache).toHaveBeenCalledWith("/repo");
+	});
+
+	it("clears the cache on a no-Spaces answer", async () => {
+		const { client } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({ status: "no_spaces" }),
+		});
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(h.clearCache).toHaveBeenCalledWith("/repo");
+	});
+
+	it("writes the cache after binding the picked Space", async () => {
+		const { client } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "unbound",
+				spaces: [spaceA, spaceB],
+				defaultSpaceId: null,
+			}),
+			createBinding: vi.fn().mockResolvedValue({ bindingId: 1, jmSpaceId: spaceB.id, repoName: "widgets" }),
+		});
+		h.promptText.mockResolvedValue("2");
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(h.saveCache).toHaveBeenCalledWith("/repo", {
+			repoUrl: "https://github.com/acme/widgets",
+			origin: "https://acme.jolli.ai",
+			jmSpaceId: spaceB.id,
+			spaceName: spaceB.name,
+			canPush: true,
+		});
+	});
+
+	it("writes the cache after a successful rebind", async () => {
+		const { client } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({
+				status: "bound",
+				binding: { jmSpaceId: spaceA.id, spaceName: spaceA.name, canPush: false },
+				spaces: [spaceB],
+				defaultSpaceId: null,
+			}),
+			createBinding: vi.fn().mockResolvedValue({ bindingId: 2, jmSpaceId: spaceB.id, repoName: "widgets" }),
+		});
+		h.promptText.mockResolvedValue("y");
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(h.saveCache).toHaveBeenCalledWith("/repo", {
+			repoUrl: "https://github.com/acme/widgets",
+			origin: "https://acme.jolli.ai",
+			jmSpaceId: spaceB.id,
+			spaceName: spaceB.name,
+			canPush: true,
+		});
 	});
 });

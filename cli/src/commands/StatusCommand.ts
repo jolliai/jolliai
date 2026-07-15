@@ -2,12 +2,26 @@
  * Status command for Jolli CLI.
  *
  * `jolli status` — Show current Jolli Memory installation status,
- * including hooks, sessions, stored memories, and Jolli Site info.
+ * including hooks, sessions, stored memories, the repo's Jolli Space
+ * binding, and Jolli Site info.
  */
 
 import type { Command } from "commander";
 import { loadAuthToken } from "../auth/AuthConfig.js";
+import { deriveRepoNameFromUrl, getCanonicalRepoUrl } from "../core/GitRemoteUtils.js";
+import {
+	ClientOutdatedError,
+	JolliMemoryPushClient,
+	NotAuthenticatedError,
+	SPACE_PROBE_TIMEOUT_MS,
+} from "../core/JolliMemoryPushClient.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
+import {
+	clearSpaceBindingCache,
+	loadSpaceBindingCache,
+	saveSpaceBindingCache,
+	tenantOriginForKey,
+} from "../core/SpaceBindingCache.js";
 import { getStatus } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { StatusInfo } from "../Types.js";
@@ -38,6 +52,168 @@ const log = createLogger("StatusCommand");
  */
 export function describeSchemaV5Status(state: StatusInfo["schemaV5"]): string {
 	return state === "completed" ? "Up to date (v5)" : "Not migrated — run jolli migrate";
+}
+
+/**
+ * Repo→Space binding state behind the `Jolli Space:` status row.
+ *
+ * Cache-first since the SpaceBindingCache landed: a fresh healthy entry in
+ * `<projectDir>/.jolli/jollimemory/space-binding.json` renders the row with
+ * zero network I/O (`--refresh` forces a live re-check). On a cache miss the
+ * state is resolved by ONE best-effort `POST /api/jolli-memory/front-door`
+ * round-trip — the same single call the guided front door makes, reused
+ * deliberately so `jolli status` and bare `jolli` can never disagree about
+ * bound-ness — and the answer maintains the cache: a healthy bound writes it,
+ * an unbound / no-spaces / degraded answer clears it, and network/auth
+ * failures leave it untouched. No request at all is made without a
+ * `jolliApiKey` (`no_key`) or in `--json` mode (the VS Code extension polls
+ * that path; it must stay offline-safe and fast — it neither reads nor writes
+ * the cache).
+ *
+ * Server-side caveat inherited from the endpoint: when the repo is unbound and
+ * exactly one Space is bindable, the server auto-binds during the call — on
+ * such tenants status reports the resulting `bound` state rather than
+ * `unbound`. There is no read-only variant of the endpoint today (the backend's
+ * `GET /api/jolli-memory/bindings` is marked unused/slated for removal, returns
+ * no Space name, and masks a forbidden binding as 404 — so it cannot replace
+ * the front-door call here).
+ *
+ * Server semantics pinned down against the backend's `JolliMemoryRouter`:
+ * `no_spaces` is caller-relative — the bindable pool is filtered by the key
+ * creator's Space visibility plus per-Space `articles.edit`, so a tenant full
+ * of Spaces the caller cannot access still answers `no_spaces`. A binding
+ * whose target Space was deleted is reported through the unbound path (the
+ * stale row is preserved server-side), and a bound Space the caller lacks
+ * `spaces.view` on comes back `bound` with null name/id.
+ */
+export type SpaceBindingStatus =
+	| {
+			readonly kind: "bound";
+			readonly spaceName: string | null;
+			readonly canPush: boolean | null;
+			/** True when the server attached a bindable pool — i.e. `jolli` can actually offer a rebind. */
+			readonly canRebind: boolean;
+	  }
+	| { readonly kind: "unbound"; readonly spaceCount: number }
+	| { readonly kind: "no_spaces" }
+	| { readonly kind: "no_key" }
+	| { readonly kind: "auth_rejected" }
+	| { readonly kind: "outdated" }
+	| { readonly kind: "unreachable" };
+
+/** Resolves the repo's Space-binding state for the status display. See {@link SpaceBindingStatus}. */
+async function fetchSpaceBindingStatus(
+	cwd: string,
+	jolliApiKey: string | undefined,
+	refresh = false,
+): Promise<SpaceBindingStatus> {
+	if (!jolliApiKey) {
+		return { kind: "no_key" };
+	}
+	try {
+		const repoUrl = await getCanonicalRepoUrl(cwd);
+		const origin = tenantOriginForKey(jolliApiKey);
+		// Cache-first: a fresh healthy binding renders with zero network I/O.
+		// canRebind false is safe — the rebind hint only matters on degraded
+		// bindings, which are never cached.
+		if (!refresh && origin) {
+			const cached = await loadSpaceBindingCache(cwd, { repoUrl, origin });
+			if (cached) {
+				return { kind: "bound", spaceName: cached.spaceName, canPush: cached.canPush, canRebind: false };
+			}
+		}
+		const client = new JolliMemoryPushClient({
+			apiKeyProvider: async () => jolliApiKey,
+			timeoutMs: SPACE_PROBE_TIMEOUT_MS,
+		});
+		const result = await client.frontDoor({ repoUrl, repoName: deriveRepoNameFromUrl(repoUrl) });
+		if (result.status === "bound") {
+			const healthy = result.binding.canPush !== false && result.binding.spaceName !== null;
+			if (healthy && origin) {
+				await saveSpaceBindingCache(cwd, {
+					repoUrl,
+					origin,
+					jmSpaceId: result.binding.jmSpaceId,
+					spaceName: result.binding.spaceName as string,
+					canPush: result.binding.canPush === true ? true : null,
+				});
+			} else {
+				// Degraded bindings must never be served from cache.
+				await clearSpaceBindingCache(cwd);
+			}
+			return {
+				kind: "bound",
+				spaceName: result.binding.spaceName,
+				canPush: result.binding.canPush,
+				canRebind: result.spaces.length > 0,
+			};
+		}
+		// The server says unbound/no_spaces — drop any stale bound cache.
+		await clearSpaceBindingCache(cwd);
+		// An `unbound` whose list came back empty is contract drift (the server
+		// answers `no_spaces` when nothing is bindable) — fold it into
+		// `no_spaces`, mirroring SpaceSyncStep, so the row can never point at a
+		// bind with zero options.
+		if (result.status === "unbound" && result.spaces.length > 0) {
+			return { kind: "unbound", spaceCount: result.spaces.length };
+		}
+		return { kind: "no_spaces" };
+	} catch (error) {
+		if (error instanceof ClientOutdatedError) {
+			return { kind: "outdated" };
+		}
+		if (error instanceof NotAuthenticatedError) {
+			return { kind: "auth_rejected" };
+		}
+		log.debug(`space binding probe failed: ${error instanceof Error ? error.message : String(error)}`);
+		return { kind: "unreachable" };
+	}
+}
+
+/**
+ * Formats the `Jolli Space:` row value. The bound Space name is labelled and
+ * quoted (`Space "Acme Core"`) for the same reason as the front door's sync
+ * line: a name that reads like a product name (e.g. a Space called "Jolli
+ * Memory") must still be recognizably a Space.
+ *
+ * Two bound shapes degrade to a warning — both mean pushes 403 until access
+ * is restored: a null name (caller has no `spaces.view`, i.e. no role at all)
+ * and `canPush === false` (Space visible, but the push gate `articles.edit`
+ * is gone — e.g. demoted to viewer). When the server attached a bindable pool
+ * (`canRebind`), the hint points at `jolli`, whose front door offers the
+ * interactive rebind escape hatch (status itself stays read-only); with no
+ * pool a rebind would offer zero choices, so the only way out is restored
+ * access — same wording as the front door's own warning. A null `canPush`
+ * (older server) renders as healthy: unknown must not false-alarm.
+ */
+export function describeSpaceBinding(state: SpaceBindingStatus): string {
+	switch (state.kind) {
+		case "bound": {
+			const fix = state.canRebind ? "run jolli to rebind" : "ask for access";
+			if (!state.spaceName) {
+				return `Bound — no access to the Space (memories won't sync; ${fix})`;
+			}
+			if (state.canPush === false) {
+				return `Bound to Space "${state.spaceName}" — read-only (memories won't sync; ${fix})`;
+			}
+			return `Bound to Space "${state.spaceName}"`;
+		}
+		case "unbound":
+			return `Not bound — ${state.spaceCount} Space${state.spaceCount === 1 ? "" : "s"} available (run jolli to bind)`;
+		case "no_spaces":
+			// Caller-relative on the server: also the answer when Spaces exist
+			// but none are visible/bindable to this key — don't claim "the
+			// tenant has none".
+			return "Not bound — no Spaces available to you";
+		case "no_key":
+			return "Not connected — run jolli auth login";
+		case "auth_rejected":
+			return "Not connected — key rejected (run jolli auth login)";
+		case "outdated":
+			return "Unknown — client outdated, update the CLI";
+		case "unreachable":
+			return "Unknown — Jolli not reachable (offline?)";
+	}
 }
 
 /** Inputs to describeIntegrationStatus — one row in the CLI integration block. */
@@ -83,7 +259,8 @@ export function registerStatusCommand(program: Command): void {
 		.description("Show Jolli Memory installation status")
 		.option("--cwd <dir>", "Project directory (default: git repo root)", resolveProjectDir())
 		.option("--json", "Output status as JSON (used by the VSCode extension)")
-		.action(async (options: { cwd: string; json?: boolean }) => {
+		.option("--refresh", "Re-check the Jolli Space binding against the server (bypass the local cache)")
+		.action(async (options: { cwd: string; json?: boolean; refresh?: boolean }) => {
 			setLogDir(options.cwd);
 
 			log.info("Running 'status' command");
@@ -119,6 +296,13 @@ export function registerStatusCommand(program: Command): void {
 			const jolliSite = config?.jolliUrl;
 			// Use loadAuthToken() so JOLLI_AUTH_TOKEN env var is honored, matching `jolli auth status`.
 			const authToken = await loadAuthToken();
+			// Cache-first, at most one best-effort round-trip, human-readable
+			// output only (see SpaceBindingStatus).
+			const spaceBinding = await fetchSpaceBindingStatus(
+				options.cwd,
+				config?.jolliApiKey,
+				options.refresh === true,
+			);
 
 			console.log(`\n  Jolli Memory Status (v${VERSION})`);
 			console.log("  ──────────────────────────────────────");
@@ -130,6 +314,7 @@ export function registerStatusCommand(program: Command): void {
 			/* v8 ignore next -- ternary: auth token presence depends on external config/env */
 			console.log(`  Jolli Account:    ${authToken ? "Signed in" : "Not signed in"}`);
 			console.log(`  Jolli API Key:    ${config?.jolliApiKey ? "Configured" : "Not configured"}`);
+			console.log(`  Jolli Space:      ${describeSpaceBinding(spaceBinding)}`);
 			/* v8 ignore next 2 -- ternary: env var presence depends on external environment */
 			console.log(
 				`  Anthropic Key:    ${config?.apiKey || process.env.ANTHROPIC_API_KEY ? "Configured" : "Not configured"}`,

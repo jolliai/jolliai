@@ -98,7 +98,7 @@ Display and write paths in `SummaryStore.ts` / `LocalSearchProvider.ts` go throu
 Local non-summary state is split across **two** `.jolli/jollimemory/` directories — don't conflate them:
 
 - `~/.jolli/jollimemory/` — **machine-global**: `config.json` (authToken / apiKey), `dist-paths/` (per-source dist-path indirection), `run-hook` / `run-cli` / `resolve-dist-path` hook entry scripts. Resolved by `getGlobalConfigDir()`.
-- `<projectDir>/.jolli/jollimemory/` — **per-project, gitignored**: `sessions.json`, `cursors.json`, `git-op-queue/`, `notes/`, `plans.json`, `briefing-cache.json`, `debug.log`, and the manual-disable marker (VS Code, written by `ManualDisableFlag` — durable per-repo opt-out from auto-enable; once set, never auto-cleared by anything other than an explicit re-enable). Resolved by `getJolliMemoryDir(cwd)` in [`cli/src/Logger.ts`](cli/src/Logger.ts).
+- `<projectDir>/.jolli/jollimemory/` — **per-project, gitignored**: `sessions.json`, `cursors.json`, `git-op-queue/`, `notes/`, `plans.json`, `briefing-cache.json`, `space-binding.json` (cached repo→Space binding, 7 d TTL — see `SpaceBindingCache.ts`), `debug.log`, and the manual-disable marker (VS Code, written by `ManualDisableFlag` — durable per-repo opt-out from auto-enable; once set, never auto-cleared by anything other than an explicit re-enable). Resolved by `getJolliMemoryDir(cwd)` in [`cli/src/Logger.ts`](cli/src/Logger.ts).
 
 ### VS Code extension bundles the CLI
 

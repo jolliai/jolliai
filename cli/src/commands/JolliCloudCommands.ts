@@ -17,6 +17,7 @@ import {
 	type JolliMemorySpace,
 } from "../core/JolliMemoryPushClient.js";
 import { pushBranchToJolli, resolveSpaceId } from "../core/JolliMemoryPushOrchestrator.js";
+import { clearSpaceBindingCache } from "../core/SpaceBindingCache.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { setLogDir } from "../Logger.js";
@@ -151,6 +152,9 @@ export function registerBindCommand(program: Command): void {
 				const repoName = options.repoName ?? deriveRepoNameFromUrl(repoUrl);
 
 				const binding = await client.createBinding({ repoUrl, repoName, jmSpaceId });
+				// Bind-only entry point: drop the local binding cache — the next
+				// probe (or push echo) rebuilds it with the authoritative details.
+				await clearSpaceBindingCache(projectDir);
 
 				if (options.format === "json") {
 					console.log(JSON.stringify({ type: "bound", ...binding }));

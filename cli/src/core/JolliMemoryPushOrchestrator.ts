@@ -13,7 +13,7 @@ import { createLogger } from "../Logger.js";
 import type { CommitSummary, NoteReference, PlanReference, ReferenceCommitRef } from "../Types.js";
 import { getDefaultBranch } from "./GitOps.js";
 import { buildBranchRelativePath, deriveRepoNameFromUrl, getCanonicalRepoUrl } from "./GitRemoteUtils.js";
-import { deriveJolliEnvKey, resolveArticleUrl } from "./JolliApiUtils.js";
+import { deriveJolliEnvKey, parseBaseUrl, resolveArticleUrl } from "./JolliApiUtils.js";
 import {
 	BATCH_MAX_ATTACHMENTS_PER_ITEM,
 	BATCH_MAX_CONTENT_CHARS,
@@ -31,6 +31,7 @@ import {
 import { loadBranchSummaries } from "./PrDescription.js";
 import { loadPushPending } from "./PushPendingStore.js";
 import { readReferenceMarkdownFromString } from "./references/ReferenceStore.js";
+import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import {
 	buildNotePushTitle,
@@ -859,6 +860,12 @@ export interface AttachmentSelection {
 export interface PushSummaryResult {
 	readonly summary: CommitSummary;
 	readonly summaryUrl: string;
+	/**
+	 * The server's Space echo from the summary push (newer servers,
+	 * repoUrl-routed pushes only) — callers persist it as the local binding
+	 * cache. Absent on older servers.
+	 */
+	readonly jmSpace?: { readonly id: number; readonly name: string };
 }
 
 /**
@@ -961,7 +968,7 @@ export async function pushSummary(
 				err instanceof Error ? err.message : String(err),
 			);
 		}
-		return { summary, summaryUrl };
+		return { summary, summaryUrl, ...(result.jmSpace !== undefined ? { jmSpace: result.jmSpace } : {}) };
 	}
 
 	const updatedSummary: CommitSummary = {
@@ -989,7 +996,7 @@ export async function pushSummary(
 		log.warn("Orphan cleanup failed after a successful push: %s", err instanceof Error ? err.message : String(err));
 	}
 
-	return { summary: finalSummary, summaryUrl };
+	return { summary: finalSummary, summaryUrl, ...(result.jmSpace !== undefined ? { jmSpace: result.jmSpace } : {}) };
 }
 
 /**
@@ -1298,6 +1305,10 @@ export async function pushBranchToJolli(opts: PushBranchOpts): Promise<PushBranc
 					};
 				}
 			}
+			// This bind site only knows the id/slug the user typed — drop the
+			// local cache and let the push echo below (or the next probe)
+			// rebuild it with the authoritative Space details.
+			await clearSpaceBindingCache(cwd);
 		}
 
 		const base = opts.baseBranch ?? (await getDefaultBranch(cwd));
@@ -1311,6 +1322,7 @@ export async function pushBranchToJolli(opts: PushBranchOpts): Promise<PushBranc
 		// unused here — seeds are already applied to the owned plan/note refs.
 		const { ownedPlans, ownedNotes, ownedReferences } = assignOwnedAttachments(summaries);
 		const urls: string[] = [];
+		let confirmedSpace: { id: number; name: string } | undefined;
 		for (const s of summaries) {
 			const attachments: AttachmentSelection = {
 				plans: ownedPlans.get(s.commitHash) ?? [],
@@ -1318,8 +1330,30 @@ export async function pushBranchToJolli(opts: PushBranchOpts): Promise<PushBranc
 				references: ownedReferences.get(s.commitHash) ?? [],
 			};
 			// BindingRequiredError propagates — fatal for the whole batch.
-			const { summaryUrl } = await pushSummary(s, ctx, attachments);
+			const { summaryUrl, jmSpace } = await pushSummary(s, ctx, attachments);
+			if (jmSpace) {
+				confirmedSpace = jmSpace;
+			}
 			urls.push(summaryUrl);
+		}
+		// A successful push proves both the binding and push rights — persist
+		// the server's Space echo so status/front-door render with zero network
+		// I/O. Best-effort: a cache hiccup must not fail a completed push.
+		if (confirmedSpace) {
+			try {
+				await saveSpaceBindingCache(cwd, {
+					repoUrl,
+					origin: parseBaseUrl(ctx.baseUrl).origin,
+					jmSpaceId: confirmedSpace.id,
+					spaceName: confirmedSpace.name,
+					canPush: true,
+				});
+			} catch (err) {
+				log.debug(
+					"binding cache update after push failed: %s",
+					err instanceof Error ? err.message : String(err),
+				);
+			}
 		}
 		return { type: "pushed", pushed: summaries.length, skipped: missingCount, urls };
 	} catch (err) {
