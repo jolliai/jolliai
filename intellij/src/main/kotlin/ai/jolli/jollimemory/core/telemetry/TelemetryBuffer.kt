@@ -51,6 +51,13 @@ data class TelemetryEnvelope(
  *
  * Append is synchronous and append-only so it never blocks the <5ms hooks; the
  * ring cap (`MAX_EVENTS`, drop-oldest) is enforced lazily on read/replace.
+ *
+ * Cwd contract (JOLLI-1957): the path uses a LITERAL cwd (no git-root
+ * normalization), so the cwd is the buffer identity — a writer and a flusher for
+ * the same project must pass the same cwd or events are stranded. IntelliJ
+ * satisfies this by always using `project.basePath` (bootstrap, the startup +
+ * background flush, the tool-window tick, and the Stop/Gemini hooks' resolved
+ * cwd). See the TS TelemetryBuffer header for the full contract.
  */
 object TelemetryBuffer {
     const val MAX_EVENTS = 500
