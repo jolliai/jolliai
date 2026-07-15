@@ -201,6 +201,10 @@ class ActiveConversationsPanel(
 		val cwd = service.mainRepoRoot ?: project.basePath ?: return
 		val key = CommitSelectionStore.conversationKey(item.source, item.sessionId)
 		val title = item.title.ifBlank { "${item.source.name} conversation" }
+		// Pinning a conversation mirrors PlansPanel/CommitsPanel pins (memory_pinned);
+		// without this, conversation pins were the one pin path with no telemetry
+		// (unpin was already tracked in PinnedPanel — this restores the symmetry).
+		ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_pinned", mapOf("kind" to "conversations"))
 		ApplicationManager.getApplication().executeOnPooledThread {
 			ai.jolli.jollimemory.core.PinStore.pin(cwd, "conversations", key, title, item.source.name)
 			SwingUtilities.invokeLater { service.panelRegistry?.pinnedPanel?.refresh() }

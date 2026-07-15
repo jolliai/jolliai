@@ -128,6 +128,12 @@ vi.mock("./BindingChooserWebviewPanel.js", () => ({
 	BindingChooserWebviewPanel: { openAndAwait: mocks.openAndAwait, dispose: vi.fn() },
 }));
 
+const { track } = vi.hoisted(() => ({ track: vi.fn() }));
+vi.mock("../../../cli/src/core/Telemetry.js", async (importActual) => ({
+	...(await importActual<typeof import("../../../cli/src/core/Telemetry.js")>()),
+	track,
+}));
+
 import { CreatePrWebviewPanel } from "./CreatePrWebviewPanel.js";
 
 const uri = { fsPath: "/ext" } as never;
@@ -172,6 +178,14 @@ describe("CreatePrWebviewPanel", () => {
 		expect(mocks.handleCreatePr.mock.calls[0][0]).toBe("feat: x"); // title
 		expect(mocks.handleCreatePr.mock.calls[0][1]).toContain("B"); // wrapped body contains drafted bodyMarkdown
 		expect(mocks.handleCreatePr.mock.calls[0][4]).toBe("feature/x"); // branch arg
+	});
+
+	it("emits pr_created{action:'created'} on a successful create submit (JOLLI-1904)", async () => {
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
+		track.mockClear();
+		created[0].onMsg({ command: "createPr" });
+		await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+		expect(track).toHaveBeenCalledWith("pr_created", { action: "created" });
 	});
 
 	it("createPr: the post callback passed to handleCreatePr forwards messages to the webview", async () => {

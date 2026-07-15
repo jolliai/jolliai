@@ -15,6 +15,7 @@
  */
 
 import * as vscode from "vscode";
+import { bucket, track } from "../../../cli/src/core/Telemetry.js";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import type { CommitsStore } from "../stores/CommitsStore.js";
 import type { FilesStore } from "../stores/FilesStore.js";
@@ -133,6 +134,10 @@ export class SquashCommand {
 			log.info("squash", "QuickPick cancelled by user");
 			return;
 		}
+
+		// JOLLI-1904: user confirmed a squash (mirrors IntelliJ SquashAction — fires at
+		// confirm, count bucketed for privacy). surface=vscode auto-injected.
+		track("squash_performed", { count_bucket: bucket(orderedHashes.length) });
 
 		// Re-check the worker gate: the click-time check at the top goes stale
 		// during LLM message generation + QuickPick review (seconds to minutes).

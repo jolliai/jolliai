@@ -11,6 +11,13 @@ const { info, warn, error, debug } = vi.hoisted(() => ({
 	debug: vi.fn(),
 }));
 
+// Spy on track() but keep the real bucket() so we assert on real bucket labels.
+const { track } = vi.hoisted(() => ({ track: vi.fn() }));
+vi.mock("../../../cli/src/core/Telemetry.js", async (importActual) => ({
+	...(await importActual<typeof import("../../../cli/src/core/Telemetry.js")>()),
+	track,
+}));
+
 type QuickPickController = {
 	qp: {
 		value: string;
@@ -165,6 +172,31 @@ describe("SquashCommand", () => {
 		warn.mockClear();
 		error.mockClear();
 		debug.mockClear();
+	});
+
+	it("emits squash_performed{count_bucket} once the QuickPick is confirmed (JOLLI-1904)", async () => {
+		// 2 commits (makeDeps default) → bucket = "1-5". Worker turns busy right after
+		// the QuickPick, aborting before the real git work — but squash_performed fires
+		// at confirmation (before the re-check), so it's already recorded.
+		const deps = makeDeps();
+		const command = new SquashCommand(
+			deps.bridge as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
+			deps.statusBar as never,
+			"/repo",
+		);
+		vi.spyOn(command as never, "showSquashQuickPick").mockResolvedValue({
+			item: { label: "$(git-merge) Squash" },
+			message: "feat: squash",
+		});
+		isWorkerBusy.mockReset().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+		track.mockClear();
+
+		await command.execute();
+
+		expect(track).toHaveBeenCalledWith("squash_performed", { count_bucket: "1-5" });
 	});
 
 	it("blocks while the worker is busy", async () => {

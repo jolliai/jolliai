@@ -245,10 +245,13 @@ class CreatePrPanel(
                         // wrapWithMarkers would delete that custom text (mirrors SummaryPanel.handleUpdatePr).
                         val mergedBody = PrService.replaceSummaryInBody(lookup.pr.body, rawBody)
                         PrService.updatePr(lookup.pr.number, title, mergedBody, cwd)
+                        ai.jolli.jollimemory.core.telemetry.Telemetry.track("pr_created", mapOf("action" to "updated"))
                         lookup.pr.url
                     } else {
                         // Create: no existing body to preserve — wrap the summary in markers.
-                        PrService.createPr(title, PrService.wrapWithMarkers(rawBody), cwd)
+                        val created = PrService.createPr(title, PrService.wrapWithMarkers(rawBody), cwd)
+                        ai.jolli.jollimemory.core.telemetry.Telemetry.track("pr_created", mapOf("action" to "created"))
+                        created
                     }
 
                     // One-click share: when signed in, push the included memories to Jolli.

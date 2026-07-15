@@ -1296,6 +1296,9 @@ export class SidebarWebviewProvider
 			const target = repos.find((r) => r.repoName === repoName);
 			if (!target) return;
 			this.selectedRepoName = target.repoName;
+			// JOLLI-1904: user switched repo in the breadcrumb (mirrors IntelliJ
+			// BreadcrumbHeaderPanel.onRepoSelected). is_foreign = not the workspace repo.
+			track("repo_switched", { is_foreign: !target.isCurrent });
 			const branches = this.deps.selection.listBranches(target.repoName);
 			this.selectedBranchName = branches[0];
 			this.postMessage({
@@ -1313,6 +1316,12 @@ export class SidebarWebviewProvider
 		}
 		if (branchName) {
 			this.selectedBranchName = branchName;
+			// JOLLI-1904: user switched branch in the breadcrumb (mirrors IntelliJ
+			// onBranchSelected). is_foreign = foreign repo, or a branch other than HEAD.
+			const state = this.deps.getInitialState();
+			const repoForeign = this.selectedRepoName != null && this.selectedRepoName !== state.currentRepoName;
+			const currentBranch = this.deps.branchWatcher?.current().name ?? state.branchName;
+			track("branch_switched", { is_foreign: repoForeign || branchName !== currentBranch });
 			this.postMessage({
 				type: "selection:set",
 				repoName: this.selectedRepoName,
