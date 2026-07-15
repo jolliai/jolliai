@@ -28,7 +28,7 @@ import { assertJolliOriginAllowed } from "../../cli/src/core/JolliApiUtils.js";
 import { triggerPendingPushRetry } from "../../cli/src/hooks/PushCompensation.js";
 import { exportSharedBranch } from "./services/JolliShareService.js";
 import { importSharedBranchForDisplay } from "./services/SharedBranchImporter.js";
-import { activateExtensionTelemetry, reinitExtensionTelemetry } from "./TelemetryActivation.js";
+import { activateExtensionTelemetry, flushExtensionTelemetry, reinitExtensionTelemetry } from "./TelemetryActivation.js";
 import {
 	getGlobalConfigDir,
 	loadConfig,
@@ -466,6 +466,16 @@ export function activate(context: vscode.ExtensionContext): void {
 			void reinitExtensionTelemetry(workspaceRoot, !enabled);
 		}),
 	);
+	// JOLLI-1956: UI-decoupled background telemetry flush. The sidebar's 60s tick
+	// only drains the shared buffer while the panel is visible, so a user who keeps
+	// it closed would never upload. Flush once now (drains anything a prior session
+	// left buffered) and then on a fixed interval, regardless of panel state.
+	// Best-effort — `flushExtensionTelemetry` re-gates consent and never throws;
+	// the live platform opt-out is passed each call so a mid-session toggle wins.
+	const flushTelemetry = (): void => flushExtensionTelemetry(workspaceRoot, !vscode.env.isTelemetryEnabled);
+	flushTelemetry();
+	const telemetryFlushTimer = setInterval(flushTelemetry, 60_000);
+	context.subscriptions.push({ dispose: () => clearInterval(telemetryFlushTimer) });
 
 	// ── Core bridge ──────────────────────────────────────────────────────────
 	// Bridge now calls Installer functions directly — no CLI subprocess needed.

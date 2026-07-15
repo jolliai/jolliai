@@ -5,8 +5,12 @@ import com.intellij.ide.BrowserUtil
 import com.intellij.notification.NotificationAction
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
+import com.intellij.openapi.util.Disposer
+import com.intellij.util.concurrency.AppExecutorUtil
+import java.util.concurrent.TimeUnit
 
 /**
  * Runs after project opens — initializes the JolliMemory service
@@ -89,6 +93,25 @@ class JolliMemoryStartupActivity : ProjectActivity {
             }
         } catch (e: Exception) {
             log.warn("Telemetry bootstrap failed (ignored): ${e.message}")
+        }
+
+        // JOLLI-1956: periodic telemetry flush, decoupled from the tool window's
+        // visibility. The Active Conversations 60s tick only flushes while that
+        // panel is showing, so a user who keeps the tool window closed would never
+        // drain the shared buffer. Schedule a background flush tied to the project
+        // lifecycle (cancelled on project close). Runs off the EDT — flushNow does
+        // blocking HTTP — and is best-effort (flushNow re-gates consent, never throws).
+        try {
+            val flushFuture =
+                AppExecutorUtil.getAppScheduledExecutorService().scheduleWithFixedDelay(
+                    { ai.jolli.jollimemory.core.telemetry.TelemetryActivation.flushNow(basePath) },
+                    60L,
+                    60L,
+                    TimeUnit.SECONDS,
+                )
+            Disposer.register(project, Disposable { flushFuture.cancel(false) })
+        } catch (e: Exception) {
+            log.warn("Telemetry flush scheduling failed (ignored): ${e.message}")
         }
 
         log.info("JolliMemory: startup complete for project at $basePath")

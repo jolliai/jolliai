@@ -1000,6 +1000,8 @@ vi.mock("./views/NoteEditorWebviewPanel.js", () => ({
 vi.mock("./TelemetryActivation.js", () => ({
 	activateExtensionTelemetry: vi.fn().mockResolvedValue(undefined),
 	reinitExtensionTelemetry: vi.fn().mockResolvedValue(undefined),
+	// JOLLI-1956: activate() flushes once immediately and on a background interval.
+	flushExtensionTelemetry: vi.fn(),
 }));
 
 // Branch-recall command bodies live in their own module (tested directly in
