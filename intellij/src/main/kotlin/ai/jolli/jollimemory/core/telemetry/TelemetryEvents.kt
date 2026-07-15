@@ -16,46 +16,46 @@ object TelemetryEvents {
     val TELEMETRY_EVENTS: Map<String, String> =
         linkedMapOf(
             // ── lifecycle & conversion funnel (the primary goal) ──
-            "app_installed" to "First run after install; installId minted (once per machine).",
+            "app_installed" to "First run after install; installId minted (once per machine). Props: none — count distinct install_id.",
             "client_activated" to
                 "A GUI surface activated (VS Code activate / IntelliJ project open), carrying `surface_version`. " +
                 "First-seen (install_id, surface_version) ≈ new + upgrade installs that launched.",
-            "surface_enabled" to "A surface was enabled in a repo.",
-            "surface_disabled" to "A surface was disabled / opted out.",
-            "signin_started" to "User initiated OAuth sign-in.",
-            "signin_completed" to "jolliApiKey minted — the conversion event.",
-            "signed_out" to "User logged out.",
-            "ai_provider_selected" to "User chose jolli vs anthropic for LLM.",
-            "memory_bank_migrated" to "Migrate-to-Memory-Bank run.",
+            "surface_enabled" to "A surface was enabled in a repo. Props: trigger.",
+            "surface_disabled" to "A surface was disabled / opted out. Props: trigger, reason.",
+            "signin_started" to "User initiated OAuth sign-in. Props: trigger.",
+            "signin_completed" to "jolliApiKey minted — the conversion event. Props: api_key_minted.",
+            "signed_out" to "User logged out. Props: none.",
+            "ai_provider_selected" to "User chose jolli vs anthropic for LLM. Props: provider (discriminator).",
+            "memory_bank_migrated" to "Migrate-to-Memory-Bank run. Props: outcome, repos, entries_bucket.",
             // ── feature usage / adoption ──
-            "command_invoked" to "Any CLI command ran (auto-emitted).",
-            "recall_performed" to "A recall was run.",
-            "search_performed" to "A search was run.",
-            "memory_pushed" to "Memories pushed.",
-            "export_performed" to "Export run.",
-            "ai_source_detected" to "A new AI source transcript was detected.",
-            "settings_opened" to "Settings UI opened (vscode/intellij).",
+            "command_invoked" to "Any CLI command ran (auto-emitted). Props: command (discriminator), ok, duration_ms.",
+            "recall_performed" to "A recall was run. Props: hit, result_count_bucket.",
+            "search_performed" to "A search was run. Props: query_len_bucket, result_count_bucket.",
+            "memory_pushed" to "Memories pushed to a Space. Props: kind, created, plans_bucket.",
+            "export_performed" to "Export run. Props: format (discriminator).",
+            "ai_source_detected" to "A new AI source transcript was detected. Props: source (discriminator).",
+            "settings_opened" to "Settings UI opened (vscode/intellij). Props: tab (discriminator).",
             // ── pipeline health ──
             "ingest_completed" to
-                "A drainIngest run finished. Carries `idle:true` for a no-op drain (ingested=0); " +
-                "filter those out for real-ingest latency/health metrics.",
+                "A drainIngest run finished. Props: outcome, ingested, idle (no-op when ingested=0), batches, " +
+                "route_calls, reconcile_calls, touched_slugs, topic_failures, duration_ms. Filter idle=true out for real-ingest metrics.",
             "error_occurred" to
                 "A structured error was raised. Content-free schema: { where, code, source?, retryable? }. " +
                 "Emitted via Telemetry.trackError(); never carries a message/stack/path.",
-            "queue_drained" to "QueueWorker finished a drain.",
-            "sync_completed" to "A memory-bank sync round finished.",
+            "queue_drained" to "QueueWorker finished a drain. Props: ops, duration_ms.",
+            "sync_completed" to "A memory-bank sync round finished. Props: outcome (discriminator), duration_ms.",
             // ── IDE tool-window UI / engagement (IntelliJ, VS Code) ──
-            "toolwindow_opened" to "The memory tool window was opened.",
-            "view_switched" to "Tool window view switched (current/bank/knowledge).",
-            "memory_committed" to "User committed a memory via the Commit button.",
-            "memory_expanded" to "A committed memory's details were expanded.",
-            "memory_item_opened" to "An item inside a memory was opened (conversation/file/context/shipped).",
-            "session_resumed" to "A conversation session was resumed in a terminal.",
-            "recall_prompt_copied" to "A recall prompt was copied to the clipboard.",
-            "memory_pinned" to "An item was pinned.",
-            "memory_unpinned" to "An item was unpinned.",
-            "key_rejected" to "The server rejected the API key (401/403).",
-            "reauth_completed" to "Re-authentication after a rejected key finished.",
+            "toolwindow_opened" to "The memory tool window was opened. Props: view.",
+            "view_switched" to "Tool window view switched (current/bank/knowledge). Props: view (discriminator).",
+            "memory_committed" to "User committed a memory via the Commit button. Props: none.",
+            "memory_expanded" to "A committed memory's details were expanded. Props: expanded.",
+            "memory_item_opened" to "An item inside a memory was opened. Props: item_type (discriminator).",
+            "session_resumed" to "A conversation session was resumed in a terminal. Props: source (discriminator).",
+            "recall_prompt_copied" to "A recall prompt was copied to the clipboard. Props: none.",
+            "memory_pinned" to "An item was pinned. Props: kind (discriminator).",
+            "memory_unpinned" to "An item was unpinned. Props: kind (discriminator).",
+            "key_rejected" to "The server rejected the API key (401/403). Props: retried, where.",
+            "reauth_completed" to "Re-authentication after a rejected key finished. Props: outcome.",
         )
 
     /** `object_action`: lowercase snake_case with at least two words. */
