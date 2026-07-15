@@ -279,7 +279,7 @@ object IngestPipeline {
         // (JOLLI-1962). Mirrors cli INGEST_NON_ERROR_OUTCOMES — IntelliJ's enum lacks
         // CREDENTIAL_MISSING / PAGE_WRITE_CONFLICT, so its benign set is just these.
         if (outcome !in setOf(IngestCode.OK, IngestCode.NO_PENDING, IngestCode.NO_SOURCE_CONTENT)) {
-            ai.jolli.jollimemory.core.telemetry.Telemetry.track("error_occurred", mapOf("code" to outcome.name, "where" to "ingest"))
+            ai.jolli.jollimemory.core.telemetry.Telemetry.trackError("ingest", outcome.name)
         }
         return DrainResult(batches, ingested, outcome, topicFailures)
     }

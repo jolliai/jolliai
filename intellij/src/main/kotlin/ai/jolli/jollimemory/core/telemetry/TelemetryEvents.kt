@@ -37,7 +37,9 @@ object TelemetryEvents {
             "settings_opened" to "Settings UI opened (vscode/intellij).",
             // ── pipeline health ──
             "ingest_completed" to "A drainIngest run finished.",
-            "error_occurred" to "A structured error code was raised.",
+            "error_occurred" to
+                "A structured error was raised. Content-free schema: { where, code, source?, retryable? }. " +
+                "Emitted via Telemetry.trackError(); never carries a message/stack/path.",
             "queue_drained" to "QueueWorker finished a drain.",
             "sync_completed" to "A memory-bank sync round finished.",
             // ── IDE tool-window UI / engagement (IntelliJ, VS Code) ──

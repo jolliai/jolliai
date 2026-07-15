@@ -605,7 +605,7 @@ class SummaryPanel(
                         if (choice == Messages.YES) reauthenticateAndRetry()
                     }
                 } catch (e: Exception) {
-                    ai.jolli.jollimemory.core.telemetry.Telemetry.track("error_occurred", mapOf("code" to "push_failed", "where" to "push"))
+                    ai.jolli.jollimemory.core.telemetry.Telemetry.trackError("push", "push_failed")
                     ApplicationManager.getApplication().invokeLater {
                         postToWebview("pushFailed")
                         Messages.showErrorDialog(project, "Push failed: ${e.message}", "Push Error")
