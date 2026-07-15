@@ -31,9 +31,12 @@ function makeKey(u: string): string {
 }
 
 const okFetch = () => vi.fn<typeof fetch>(async () => ({ ok: true }) as Response);
-const seed = (n: number) => {
-	for (let i = 0; i < n; i++) appendTelemetryEvent(cwd, env({ installId: `i-${i}` }));
+// Seed n events under ONE install_id (so they form a single batch group), each
+// tagged with a distinct `seq` so identity-based assertions stay unambiguous.
+const seed = (n: number, installId = "install-1") => {
+	for (let i = 0; i < n; i++) appendTelemetryEvent(cwd, env({ installId, properties: { seq: i } }));
 };
+const seqOf = (e: TelemetryEnvelope) => (e.properties as { seq: number }).seq;
 
 beforeEach(async () => {
 	cwd = await mkdtemp(join(tmpdir(), "telemetry-flush-"));
@@ -139,7 +142,7 @@ describe("flushTelemetry", () => {
 		const result = await flushTelemetry({ cwd, origin: "https://jolli.ai", fetchImpl, maxBatch: 2 });
 		expect(result).toEqual({ sent: 2, remaining: 3 });
 		const kept = await readTelemetryEvents(cwd);
-		expect(kept.map((e) => e.installId)).toEqual(["i-2", "i-3", "i-4"]);
+		expect(kept.map(seqOf)).toEqual([2, 3, 4]);
 	});
 
 	it("treats a network throw as failure and leaves the buffer intact", async () => {
@@ -147,6 +150,24 @@ describe("flushTelemetry", () => {
 		const fetchImpl = vi.fn<typeof fetch>().mockRejectedValue(new Error("ECONNREFUSED"));
 		expect(await flushTelemetry({ cwd, origin: "https://jolli.ai", fetchImpl })).toEqual({ sent: 0, remaining: 2 });
 		expect(await readTelemetryEvents(cwd)).toHaveLength(2);
+	});
+
+	it("backfills a stable eventId for legacy buffered events across retries", async () => {
+		appendTelemetryEvent(cwd, { ...env({ installId: "legacy" }), eventId: undefined as never });
+		const fetchImpl = vi
+			.fn<typeof fetch>()
+			.mockResolvedValueOnce({ ok: false } as Response)
+			.mockResolvedValueOnce({ ok: true } as Response);
+
+		expect(await flushTelemetry({ cwd, origin: "https://jolli.ai", fetchImpl })).toEqual({ sent: 0, remaining: 1 });
+		const firstBody = JSON.parse(fetchImpl.mock.calls[0]?.[1]?.body as string);
+		const firstEventId = firstBody.events[0].eventId;
+		expect(firstEventId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+		expect(await flushTelemetry({ cwd, origin: "https://jolli.ai", fetchImpl })).toEqual({ sent: 1, remaining: 0 });
+		const secondBody = JSON.parse(fetchImpl.mock.calls[1]?.[1]?.body as string);
+		expect(secondBody.events[0].eventId).toBe(firstEventId);
+		expect(await readTelemetryEvents(cwd)).toEqual([]);
 	});
 
 	it("preserves events appended concurrently during the flush", async () => {
@@ -160,6 +181,41 @@ describe("flushTelemetry", () => {
 		expect(result.sent).toBe(3);
 		const kept = await readTelemetryEvents(cwd);
 		expect(kept.map((e) => e.installId)).toEqual(["late"]);
+	});
+
+	it("groups by install_id so every POST batch carries exactly one install_id", async () => {
+		appendTelemetryEvent(cwd, env({ installId: "A", properties: { seq: 0 } }));
+		appendTelemetryEvent(cwd, env({ installId: "B", properties: { seq: 1 } }));
+		appendTelemetryEvent(cwd, env({ installId: "A", properties: { seq: 2 } }));
+		const fetchImpl = okFetch();
+		const result = await flushTelemetry({ cwd, origin: "https://jolli.ai", fetchImpl });
+		expect(result).toEqual({ sent: 3, remaining: 0 });
+		// One batch per install_id group (A has 2, B has 1) — never a mixed batch.
+		expect(fetchImpl).toHaveBeenCalledTimes(2);
+		for (const call of fetchImpl.mock.calls) {
+			const body = JSON.parse((call[1] as RequestInit).body as string) as { events: TelemetryEnvelope[] };
+			expect(new Set(body.events.map((e) => e.installId)).size).toBe(1);
+		}
+		expect(await readTelemetryEvents(cwd)).toEqual([]);
+	});
+
+	it("a stray install_id that 400s does not block delivery of the others", async () => {
+		// Reproduces the JOLLI ibe jam: one stray event from a prior install sits at
+		// the buffer head; the backend 400s any batch that includes it. Grouping must
+		// isolate it so the current install's events still deliver.
+		appendTelemetryEvent(cwd, env({ installId: "stray", properties: { seq: 0 } }));
+		appendTelemetryEvent(cwd, env({ installId: "current", properties: { seq: 1 } }));
+		appendTelemetryEvent(cwd, env({ installId: "current", properties: { seq: 2 } }));
+		// Server rejects the stray group (mixed-install 400 analogue), accepts the rest.
+		const fetchImpl = vi.fn<typeof fetch>(async (_url, init) => {
+			const body = JSON.parse((init as RequestInit).body as string) as { events: TelemetryEnvelope[] };
+			return { ok: body.events[0].installId !== "stray" } as Response;
+		});
+		const result = await flushTelemetry({ cwd, origin: "https://jolli.ai", fetchImpl });
+		expect(result).toEqual({ sent: 2, remaining: 1 });
+		// Only the poisoned stray event remains; the current install's events delivered.
+		const kept = await readTelemetryEvents(cwd);
+		expect(kept.map((e) => e.installId)).toEqual(["stray"]);
 	});
 
 	it("returns remaining without sending when the origin is unparseable", async () => {

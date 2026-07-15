@@ -2,9 +2,10 @@
  * TelemetryFlusher — drains the on-disk telemetry buffer to the jolli backend
  * (JOLLI-1785 Phase 2). Batched, fire-and-forget, and best-effort:
  *
- *   - POSTs to `<origin>/api/telemetry/events` in chunks of at most
- *     `maxBatch` (the backend enforces its own `TELEMETRY_MAX_BATCH` cap, so
- *     we chunk below it). HTTP scaffolding mirrors `sync/BackendClient.ts`:
+ *   - POSTs to `<origin>/api/telemetry/events` grouped by `install_id` (the
+ *     backend rejects mixed-install_id batches) and chunked at most `maxBatch`
+ *     within each group (the backend enforces its own `TELEMETRY_MAX_BATCH` cap,
+ *     so we chunk below it). HTTP scaffolding mirrors `sync/BackendClient.ts`:
  *     `x-jolli-client` header, injected `fetchImpl` test seam, `AbortController`
  *     timeout.
  *   - **Anonymous vs signed-in**: when a `jolliApiKey` is supplied it is sent
@@ -93,25 +94,43 @@ export async function flushTelemetry(opts: FlushOptions): Promise<FlushResult> {
 		return { sent: 0, remaining: events.length };
 	}
 
-	let sent = 0;
-	for (let i = 0; i < events.length; i += maxBatch) {
-		const batch = events.slice(i, i + maxBatch);
-		const ok = await postBatch(url, batch, authKey, fetchImpl, timeoutMs);
-		if (!ok) break;
-		sent += batch.length;
+	// Group by install_id before batching: the backend rejects a batch that
+	// mixes install_ids with 400 ("batch must carry a single install_id"). If the
+	// buffer ever holds >1 install_id — e.g. after an install_id rotation leaves a
+	// stray event from a prior install — a count-only batching scheme puts both in
+	// one batch and that 400 permanently jams delivery for EVERY event. Grouping
+	// keeps each batch homogeneous, and a failing group is skipped without blocking
+	// the others, so one poisoned install_id can't strand the rest.
+	const groups = new Map<string, TelemetryEnvelope[]>();
+	for (const e of events) {
+		const arr = groups.get(e.installId);
+		if (arr) arr.push(e);
+		else groups.set(e.installId, [e]);
 	}
 
-	if (sent === 0) return { sent: 0, remaining: events.length };
+	const acked: TelemetryEnvelope[] = [];
+	for (const group of groups.values()) {
+		for (let i = 0; i < group.length; i += maxBatch) {
+			const batch = group.slice(i, i + maxBatch);
+			// A failed batch stops THIS install_id's remaining batches (the next
+			// would fail the same way) but not the other groups' — continue the loop.
+			if (!(await postBatch(url, batch, authKey, fetchImpl, timeoutMs))) break;
+			acked.push(...batch);
+		}
+	}
+
+	if (acked.length === 0) return { sent: 0, remaining: events.length };
 
 	// Re-read so events appended during the flush survive, then remove the exact
 	// envelopes we acked by identity rather than by count: under the ring cap a
-	// concurrent append can trim the buffer head, so a positional `slice(sent)`
-	// would discard the wrong (newest) events. Identity removal is correct
-	// regardless of trimming and tolerant of acked events already dropped by the cap.
+	// concurrent append can trim the buffer head, and grouping means acked events
+	// are no longer a contiguous prefix, so a positional slice would drop the wrong
+	// events. Identity removal is correct regardless of order/trimming and tolerant
+	// of acked events already dropped by the cap.
 	const current = await readTelemetryEvents(opts.cwd);
-	const remaining = removeAcked(current, events.slice(0, sent));
+	const remaining = removeAcked(current, acked);
 	await replaceTelemetryEvents(opts.cwd, remaining);
-	return { sent, remaining: remaining.length };
+	return { sent: acked.length, remaining: remaining.length };
 }
 
 /**

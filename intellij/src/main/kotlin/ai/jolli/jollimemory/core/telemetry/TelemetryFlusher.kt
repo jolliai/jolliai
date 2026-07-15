@@ -1,10 +1,12 @@
 package ai.jolli.jollimemory.core.telemetry
 
 import ai.jolli.jollimemory.services.JolliApiClient
+import com.google.gson.JsonParser
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.security.MessageDigest
 import java.time.Duration
 
 /**
@@ -30,6 +32,11 @@ object TelemetryFlusher {
     const val DEFAULT_MAX_BATCH = 100
     private const val TELEMETRY_PATH = "/api/telemetry/events"
     private val TIMEOUT: Duration = Duration.ofSeconds(10)
+    private val UUID_RE = Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", RegexOption.IGNORE_CASE)
+
+    // JOLLI-1966 diagnostics: the flush path is otherwise silent, so a delivery
+    // outage is invisible. Log the resolved target + per-batch HTTP status.
+    private val log = ai.jolli.jollimemory.core.JmLogger.create("TelemetryFlusher")
 
     data class FlushResult(val sent: Int, val remaining: Int)
 
@@ -52,8 +59,11 @@ object TelemetryFlusher {
                         .POST(HttpRequest.BodyPublishers.ofString(body))
                 if (bearer != null) builder.header("Authorization", "Bearer $bearer")
                 val response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.discarding())
-                response.statusCode() in 200..299
-            } catch (_: Exception) {
+                val ok = response.statusCode() in 200..299
+                log.info("telemetry POST $url -> HTTP ${response.statusCode()} (bearer=${bearer != null}, ok=$ok)")
+                ok
+            } catch (e: Exception) {
+                log.warn("telemetry POST $url threw ${e.javaClass.simpleName}: ${e.message}")
                 false
             }
         }
@@ -77,16 +87,21 @@ object TelemetryFlusher {
             }
         }
 
-        val lines = TelemetryBuffer.readLines(cwd)
+        val lines = TelemetryBuffer.readLines(cwd).map { ensureEventIdLine(it) }
         if (lines.isEmpty()) return FlushResult(0, 0)
-        if (resolvedOrigin.isNullOrEmpty()) return FlushResult(0, lines.size)
+        log.info("telemetry flush: ${lines.size} buffered, resolvedOrigin=$resolvedOrigin, bearer=${bearer != null}")
+        if (resolvedOrigin.isNullOrEmpty()) {
+            log.warn("telemetry flush: no origin resolved — ${lines.size} events stranded")
+            return FlushResult(0, lines.size)
+        }
 
         // Defense-in-depth: never POST telemetry (or a Bearer key) to a non-Jolli
         // host. The flusher re-derives origin from raw config, so re-assert the
         // HTTPS + allowlist boundary here (parity with the CLI flusher).
         try {
             ai.jolli.jollimemory.auth.JolliAuthUtils.assertJolliOriginAllowed(resolvedOrigin)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            log.warn("telemetry flush: origin rejected by allowlist ($resolvedOrigin): ${e.message}")
             return FlushResult(0, lines.size)
         }
 
@@ -99,28 +114,89 @@ object TelemetryFlusher {
                 return FlushResult(0, lines.size)
             }
 
+        // Group by install_id before batching: the backend rejects a batch that
+        // mixes install_ids with 400 ("batch must carry a single install_id"). If
+        // the buffer holds >1 install_id — e.g. after an install_id rotation leaves
+        // a stray event from a prior install — count-only batching puts both in one
+        // batch and that 400 permanently jams delivery for EVERY event. Grouping
+        // keeps each batch homogeneous; a failing group is skipped without blocking
+        // the others, so one poisoned install_id can't strand the rest.
+        val groups = LinkedHashMap<String, MutableList<String>>()
+        for (line in lines) groups.getOrPut(installIdOf(line)) { mutableListOf() }.add(line)
+
         val batchSize = maxOf(1, maxBatch)
-        var sent = 0
-        var i = 0
-        while (i < lines.size) {
-            val batch = lines.subList(i, minOf(i + batchSize, lines.size))
-            val body = """{"events":[${batch.joinToString(",")}]}"""
-            if (!sender.send(url, body, bearer)) break
-            sent += batch.size
-            i += batchSize
+        val acked = ArrayList<String>()
+        for (group in groups.values) {
+            var i = 0
+            while (i < group.size) {
+                val batch = group.subList(i, minOf(i + batchSize, group.size))
+                val body = """{"events":[${batch.joinToString(",")}]}"""
+                // A failed batch stops THIS install_id's remaining batches (the next
+                // would fail the same way) but not the other groups' — break inner only.
+                if (!sender.send(url, body, bearer)) break
+                acked.addAll(batch)
+                i += batchSize
+            }
         }
 
-        if (sent == 0) return FlushResult(0, lines.size)
+        if (acked.isEmpty()) {
+            log.warn("telemetry flush: all batches failed — ${lines.size} events remain buffered (url=$url)")
+            return FlushResult(0, lines.size)
+        }
+        log.info("telemetry flush: sent ${acked.size}/${lines.size} event(s) to $url")
 
         // Re-read so events appended during the flush survive, then remove the
         // acked lines by identity rather than by count: under the ring cap a
-        // concurrent append can trim the buffer head, so a positional sublist
-        // would drop the wrong (newest) lines. Identity removal is correct
-        // regardless of trimming (lines are stored verbatim, so equality is exact).
-        val current = TelemetryBuffer.readLines(cwd)
-        val remaining = removeAcked(current, lines.subList(0, sent))
+        // concurrent append can trim the buffer head, and grouping means acked
+        // lines are no longer a contiguous prefix, so a positional sublist would
+        // drop the wrong lines. Identity removal is correct regardless of
+        // order/trimming (lines are stored verbatim, so equality is exact).
+        val current = TelemetryBuffer.readLines(cwd).map { ensureEventIdLine(it) }
+        val remaining = removeAcked(current, acked)
         TelemetryBuffer.replaceLines(cwd, remaining)
-        return FlushResult(sent, remaining.size)
+        return FlushResult(acked.size, remaining.size)
+    }
+
+    /** The `installId` of a buffered line, for batch grouping; "" when absent/unparseable. */
+    private fun installIdOf(line: String): String =
+        try {
+            JsonParser.parseString(line).asJsonObject.get("installId")?.asString ?: ""
+        } catch (_: Exception) {
+            ""
+        }
+
+    /**
+     * Backfill a stable UUID for telemetry lines buffered by older clients before
+     * `eventId` existed. The id is deterministic from the exact stored line, so a
+     * failed flush/retry keeps the same id even though the legacy file is unchanged.
+     */
+    private fun ensureEventIdLine(line: String): String {
+        return try {
+            val obj = JsonParser.parseString(line).asJsonObject
+            val hasEventId = obj.has("eventId")
+            val eventId = runCatching { obj.get("eventId")?.asString }.getOrNull()
+            if (eventId != null && UUID_RE.matches(eventId)) {
+                line
+            } else {
+                val trimmed = line.trim()
+                if (!hasEventId && trimmed.startsWith("{")) {
+                    """{"eventId":"${legacyEventId(trimmed)}",${trimmed.substring(1)}"""
+                } else {
+                    obj.addProperty("eventId", legacyEventId(trimmed))
+                    obj.toString()
+                }
+            }
+        } catch (_: Exception) {
+            line
+        }
+    }
+
+    private fun legacyEventId(rawLine: String): String {
+        val hex = MessageDigest.getInstance("SHA-256").digest(rawLine.toByteArray(Charsets.UTF_8)).joinToString("") {
+            "%02x".format(it)
+        }
+        val variant = ((hex.substring(16, 18).toInt(16) and 0x3f) or 0x80).toString(16).padStart(2, '0')
+        return "${hex.substring(0, 8)}-${hex.substring(8, 12)}-5${hex.substring(13, 16)}-$variant${hex.substring(18, 20)}-${hex.substring(20, 32)}"
     }
 
     /**

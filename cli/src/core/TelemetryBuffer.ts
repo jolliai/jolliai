@@ -33,6 +33,7 @@
  * other surfaces write to). Do not introduce a flush call site that resolves cwd
  * differently from where the events were written.
  */
+import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -41,6 +42,7 @@ import { atomicWriteFile } from "./AtomicWrite.js";
 import type { TelemetryEventName } from "./TelemetryEvents.js";
 
 const QUEUE_FILE = "telemetry-queue.ndjson";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 /**
  * Hard ceiling on buffered events. At the cap, the oldest events are dropped
@@ -99,6 +101,28 @@ function queuePath(cwd: string): string {
 	return join(getJolliMemoryDir(cwd), QUEUE_FILE);
 }
 
+function hasUsableEventId(eventId: unknown): eventId is string {
+	return typeof eventId === "string" && UUID_RE.test(eventId);
+}
+
+/**
+ * Backfill a stable UUID for telemetry lines buffered by older clients before
+ * `eventId` existed. The id is deterministic from the exact stored line, so a
+ * failed flush/retry keeps the same id even though the legacy file is unchanged.
+ */
+function legacyEventId(rawLine: string): string {
+	const hex = createHash("sha256").update(rawLine).digest("hex");
+	const variant = ((Number.parseInt(hex.slice(16, 18), 16) & 0x3f) | 0x80).toString(16).padStart(2, "0");
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-${variant}${hex.slice(18, 20)}-${hex.slice(20, 32)}`;
+}
+
+function normalizeTelemetryEnvelope(parsed: unknown, rawLine: string): TelemetryEnvelope | null {
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+	const event = parsed as Record<string, unknown>;
+	if (hasUsableEventId(event.eventId)) return event as unknown as TelemetryEnvelope;
+	return { ...event, eventId: legacyEventId(rawLine) } as unknown as TelemetryEnvelope;
+}
+
 /**
  * Synchronously append one event as an NDJSON line. Creates the directory if
  * needed. Designed to be called from the synchronous `track()` choke-point;
@@ -142,7 +166,8 @@ export async function readTelemetryEvents(cwd: string): Promise<TelemetryEnvelop
 		const trimmed = line.trim();
 		if (trimmed.length === 0) continue;
 		try {
-			events.push(JSON.parse(trimmed) as TelemetryEnvelope);
+			const event = normalizeTelemetryEnvelope(JSON.parse(trimmed), trimmed);
+			if (event) events.push(event);
 		} catch {
 			// Skip a torn/corrupt line; the rest of the buffer is still good.
 		}
