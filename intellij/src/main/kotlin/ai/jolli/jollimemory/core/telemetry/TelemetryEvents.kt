@@ -36,7 +36,9 @@ object TelemetryEvents {
             "ai_source_detected" to "A new AI source transcript was detected.",
             "settings_opened" to "Settings UI opened (vscode/intellij).",
             // ── pipeline health ──
-            "ingest_completed" to "A drainIngest run finished.",
+            "ingest_completed" to
+                "A drainIngest run finished. Carries `idle:true` for a no-op drain (ingested=0); " +
+                "filter those out for real-ingest latency/health metrics.",
             "error_occurred" to
                 "A structured error was raised. Content-free schema: { where, code, source?, retryable? }. " +
                 "Emitted via Telemetry.trackError(); never carries a message/stack/path.",

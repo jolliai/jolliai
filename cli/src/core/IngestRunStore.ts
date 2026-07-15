@@ -60,6 +60,10 @@ function emitIngestTelemetry(record: IngestRunRecord): void {
 		duration_ms: record.durationMs,
 		batches: record.batches,
 		ingested: record.ingested,
+		// JOLLI-1964: explicit idle flag so latency/health dashboards can drop no-op
+		// drains (nothing pending → p50 ~ms) without knowing the `ingested` semantics.
+		// ~27% of runs are idle and would otherwise dilute real-ingest metrics.
+		idle: record.ingested === 0,
 		touched_slugs: record.touchedSlugs,
 		route_calls: record.routeCalls,
 		reconcile_calls: record.reconcileCalls,

@@ -122,4 +122,11 @@ describe("IngestRunStore telemetry — error_occurred gating (JOLLI-1962)", () =
 		expect(errs).toHaveLength(failures.length);
 		expect(errs.every((e) => (e.properties as { where?: string }).where === "ingest")).toBe(true);
 	});
+
+	it("flags idle (ingested=0) vs real ingests on ingest_completed (JOLLI-1964)", async () => {
+		await appendIngestRun(cwd, rec({ outcome: INGEST_CODES.NO_PENDING, ingested: 0 }));
+		await appendIngestRun(cwd, rec({ outcome: INGEST_CODES.OK, ingested: 3 }));
+		const completed = await eventsOfType("ingest_completed");
+		expect(completed.map((e) => (e.properties as { idle?: boolean }).idle)).toEqual([true, false]);
+	});
 });

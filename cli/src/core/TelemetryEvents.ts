@@ -45,7 +45,8 @@ export const TELEMETRY_EVENTS = {
 	ai_source_detected: "A new AI source transcript was detected.",
 	settings_opened: "Settings UI opened (vscode/intellij).",
 	// ── pipeline health ──
-	ingest_completed: "A drainIngest run finished.",
+	ingest_completed:
+		"A drainIngest run finished. Carries `idle:true` for a no-op drain (ingested=0); filter those out for real-ingest latency/health metrics.",
 	error_occurred:
 		"A structured error was raised. Content-free schema: { where (stage/subsystem), code (enumerated), source? , retryable? }. Emitted via trackError(); never carries a message/stack/path.",
 	queue_drained: "QueueWorker finished a drain.",
