@@ -16,6 +16,22 @@
  *
  * Resilience: a corrupt line is skipped, not fatal — the rest of the buffer is
  * still readable (line-level, unlike IngestRunStore's whole-file fallback).
+ *
+ * Cwd contract (JOLLI-1957 — read this before adding a writer or a flusher):
+ * the buffer path is `join(cwd, ".jolli/jollimemory", QUEUE_FILE)` — a LITERAL
+ * `cwd`, with no git-root normalization (see `getJolliMemoryDir`). So the `cwd`
+ * IS the buffer identity: two different `cwd` strings (a repo root vs one of its
+ * subdirectories, or two surfaces resolving the root differently) are two
+ * SEPARATE buffers. Therefore every writer (`track()` via `initTelemetry`'s
+ * cwd) and every flusher (`flushTelemetryNow`) for a given project MUST pass the
+ * SAME cwd — the project/workspace root — or events written under one cwd are
+ * stranded in a buffer no trigger for the other cwd will ever drain. Current
+ * surfaces satisfy this by construction: CLI (`Cli.ts`) uses `process.cwd()` for
+ * both bootstrap and the exit flush; the git-hook QueueWorker uses one `cwd` for
+ * both; VS Code uses `workspaceRoot`; IntelliJ uses `project.basePath`; the AI
+ * Stop hooks flush `CLAUDE_PROJECT_DIR ?? hookData.cwd` (the same repo root the
+ * other surfaces write to). Do not introduce a flush call site that resolves cwd
+ * differently from where the events were written.
  */
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, rm } from "node:fs/promises";

@@ -44,6 +44,31 @@ afterEach(async () => {
 });
 
 describe("TelemetryBuffer", () => {
+	// JOLLI-1957 — the cwd IS the buffer identity: `join(cwd, .jolli/jollimemory,
+	// telemetry-queue.ndjson)` with no git-root normalization. Two cwds are two
+	// separate buffers, so a writer and a flusher for the same project must pass
+	// the same cwd or events are stranded. Lock that invariant here.
+	it("keeps buffers isolated per cwd — a different cwd is a different buffer", async () => {
+		const otherCwd = await mkdtemp(join(tmpdir(), "telemetry-buffer-other-"));
+		try {
+			appendTelemetryEvent(cwd, env({ installId: "in-a" }));
+			appendTelemetryEvent(otherCwd, env({ installId: "in-b" }));
+
+			// Each cwd sees only its own events (distinct files, distinct content).
+			expect((await readTelemetryEvents(cwd)).map((e) => e.installId)).toEqual(["in-a"]);
+			expect((await readTelemetryEvents(otherCwd)).map((e) => e.installId)).toEqual(["in-b"]);
+			expect(queueFile(cwd)).not.toBe(queueFile(otherCwd));
+
+			// Draining/clearing one cwd must not touch the other's buffer — this is
+			// what guarantees a mismatched-cwd flush can't strand the other's events.
+			await clearTelemetryBuffer(cwd);
+			expect(await readTelemetryEvents(cwd)).toEqual([]);
+			expect((await readTelemetryEvents(otherCwd)).map((e) => e.installId)).toEqual(["in-b"]);
+		} finally {
+			await rm(otherCwd, { recursive: true, force: true });
+		}
+	});
+
 	it("round-trips appended events (missing file starts empty)", async () => {
 		expect(await readTelemetryEvents(cwd)).toEqual([]);
 		appendTelemetryEvent(cwd, env({ properties: { hit: true } }));
