@@ -23,6 +23,7 @@ import { isTranscriptSource } from "../../../cli/src/Types.js";
 import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSessionAggregator.js";
 import type { ActiveSessionsProvider } from "../services/ActiveSessionsProvider.js";
 import type { CommitFileInfo } from "../Types.js";
+import { track } from "../../../cli/src/core/Telemetry.js";
 import { flushExtensionTelemetry } from "../TelemetryActivation.js";
 import type { IngestPhase } from "../stores/StatusStore.js";
 import { log } from "../util/Logger.js";
@@ -59,6 +60,21 @@ import { sliceStartTime } from "./TranscriptSliceOrder.js";
  * committed-reference rows become un-openable.
  */
 const REFERENCE_SOURCE_IDS: ReadonlySet<string> = new Set<string>(Object.keys(SOURCE_META));
+
+/**
+ * JOLLI-1904 memory_pinned/memory_unpinned `kind` alignment. VS Code's PinStore
+ * uses singular kinds; IntelliJ's uses the plural form of the same five. Both
+ * surfaces must emit the SAME `kind` value or the cross-surface metric can't be
+ * joined, so we translate to IntelliJ's plural vocabulary at the telemetry edge
+ * (the on-disk PinStore keys are untouched).
+ */
+const PIN_KIND_TELEMETRY: Readonly<Record<PinKind, string>> = {
+	conversation: "conversations",
+	plan: "plans",
+	note: "notes",
+	memory: "memories",
+	reference: "references",
+};
 
 /**
  * Built-in VS Code commands the sidebar webview is allowed to dispatch, in
@@ -693,6 +709,12 @@ export class SidebarWebviewProvider
 			// fall through
 		}
 		this.postMessage({ type: "init", state: this.deps.getInitialState() });
+		// JOLLI-1904 (VS Code funnel telemetry). Hidden webview views reload — and
+		// re-post `ready` — each time the sidebar is revealed, so this fires once
+		// per open, matching IntelliJ's createFullContent → toolwindow_opened. The
+		// view is hardcoded "current" to mirror IntelliJ verbatim (it always opens
+		// on the Current view); `view_switched` reports later user navigation.
+		track("toolwindow_opened", { view: "current" });
 		// Trigger lazy-loaded data sources on first visibility. Idempotent —
 		// `firstVisibleFired` guards against re-firing on view re-resolves
 		// (e.g. user collapses + reopens the sidebar).
@@ -734,6 +756,22 @@ export class SidebarWebviewProvider
 		switch (msg.type) {
 			case "ready":
 				void this.handleReady();
+				return;
+			case "tab:switched": {
+				// JOLLI-1904 view_switched: only a real view-switcher click emits
+				// (userInitiated), matching IntelliJ's applyView. VS Code's two
+				// memory views map to IntelliJ's discriminator values: Current
+				// Branch → "current", Memory Bank → "bank". The Status overlay has
+				// no IntelliJ analog, so it is deliberately not reported.
+				if (msg.userInitiated) {
+					const view = msg.tab === "branch" ? "current" : msg.tab === "kb" ? "bank" : undefined;
+					if (view) track("view_switched", { view });
+				}
+				return;
+			}
+			case "kb:memoryToggled":
+				// JOLLI-1904 memory_expanded — both directions, mirroring IntelliJ.
+				track("memory_expanded", { expanded: msg.expanded });
 				return;
 			case "command":
 				// Defense-in-depth (confused-deputy): the webview can only ask the
@@ -791,6 +829,10 @@ export class SidebarWebviewProvider
 				void this.pushMemoryEvidence(msg.commitHash);
 				return;
 			case "kb:openEvidenceNote":
+				// JOLLI-1904 memory_item_opened — an item inside a committed memory
+				// (mirrors IntelliJ CommitsPanel.trackItemOpened). item_type matches
+				// IntelliJ's singular vocabulary verbatim.
+				track("memory_item_opened", { item_type: "note" });
 				// Committed-memory note evidence row. Routes to the orphan-only
 				// previewNote (the same command the detail panel uses for committed
 				// notes), passing the memory's provenance so a foreign-repo note
@@ -805,6 +847,7 @@ export class SidebarWebviewProvider
 				);
 				return;
 			case "kb:openEvidencePlan":
+				track("memory_item_opened", { item_type: "plan" });
 				// Foreign-repo committed-memory plan evidence row. Routes to
 				// previewCommittedPlan, passing the memory's provenance so the plan
 				// body reads from the owning repo's FolderStorage. The live
@@ -830,6 +873,7 @@ export class SidebarWebviewProvider
 					});
 					return;
 				}
+				track("memory_item_opened", { item_type: "reference" });
 				void this.deps.executeCommand(
 					"jollimemory.previewCommittedReference",
 					msg.archivedKey,
@@ -991,6 +1035,11 @@ export class SidebarWebviewProvider
 					);
 					return;
 				}
+				// JOLLI-1904 memory_item_opened. Committed evidence is always the
+				// archived snapshot, so render is "stored" (mirrors IntelliJ's
+				// stored-conversation branch, which also carries render + source).
+				// TranscriptSource ids are already lowercase, matching IntelliJ.
+				track("memory_item_opened", { item_type: "conversation", render: "stored", source: msg.source });
 				void this.openEvidenceConversation(msg.commitHash, msg.sessionId, msg.source, msg.title);
 				return;
 			case "branch:discardFile":
@@ -1074,6 +1123,10 @@ export class SidebarWebviewProvider
 					this.selectedBranchName ?? this.deps.branchWatcher?.current().name ?? state.branchName;
 				const projectDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 				if (projectDir && repo && this.deps.pinStore) {
+					// JOLLI-1904: fire at the pin action (matches IntelliJ PlansPanel /
+					// CommitsPanel, which track before the async persist). kind is
+					// translated to IntelliJ's plural vocabulary for cross-surface joins.
+					track("memory_pinned", { kind: PIN_KIND_TELEMETRY[msg.kind] });
 					void this.deps.pinStore
 						.addPin(projectDir, repo, branch, {
 							kind: msg.kind,
@@ -1113,6 +1166,9 @@ export class SidebarWebviewProvider
 					this.selectedBranchName ?? this.deps.branchWatcher?.current().name ?? state.branchName;
 				const projectDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 				if (projectDir && repo && this.deps.pinStore) {
+					// JOLLI-1904: mirror IntelliJ PinnedPanel — track the unpin action,
+					// kind translated to the shared plural vocabulary.
+					track("memory_unpinned", { kind: PIN_KIND_TELEMETRY[msg.kind] });
 					void this.deps.pinStore
 						.removePin(projectDir, repo, branch, msg.kind, msg.id)
 						.then(() => this.pushPins())
