@@ -63,9 +63,13 @@ async function resolvePaths(cwd: string): Promise<ProfilePaths> {
 	// — this shared common dir is exactly why we use it rather than
 	// `--show-toplevel` (which returns the CURRENT worktree, breaking sharing).
 	// Edge case: inside a git submodule the common dir is `<super>/.git/modules/<name>`,
-	// so the profile lands under `.git/` rather than a working-tree root. That is
-	// harmless and self-consistent (reads/writes resolve identically, and it matches
-	// where the pre-RepoProfile marker already lived), just not the out-of-`.git` ideal.
+	// and dirname drops the `<name>` segment, so the profile lands at
+	// `<super>/.git/modules/.jolli/...`, shared by every submodule of that super-repo.
+	// Reads/writes stay self-consistent, but sibling submodules then share one profile,
+	// so a dismiss in one submodule suppresses the offer in the others. Known,
+	// low-severity limitation (no data loss); git submodules are rare enough that a
+	// per-submodule special-case isn't worth it. Note the legacy marker below is anchored
+	// at the full commonDir (with `<name>`), so it was per-submodule.
 	const mainRoot = dirname(commonDir);
 	return {
 		profilePath: join(getJolliMemoryDir(mainRoot), PROFILE_FILE),
