@@ -272,7 +272,9 @@ object IngestPipeline {
         // JOLLI-1785: pipeline-health telemetry (no-op until telemetry is bootstrapped).
         ai.jolli.jollimemory.core.telemetry.Telemetry.track(
             "ingest_completed",
-            mapOf("outcome" to outcome.name, "batches" to batches, "ingested" to ingested, "topic_failures" to topicFailures.size),
+            // JOLLI-1964: `idle` flags a no-op drain (nothing pending) so dashboards
+            // can drop them from latency/health metrics. Mirrors cli.
+            mapOf("outcome" to outcome.name, "batches" to batches, "ingested" to ingested, "idle" to (ingested == 0), "topic_failures" to topicFailures.size),
         )
         // Only genuine failures raise error_occurred. Success and benign/expected
         // terminal states are excluded so they don't inflate the ingest error rate

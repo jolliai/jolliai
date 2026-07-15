@@ -68,7 +68,7 @@ disk **before** they are sent.
 | `export_performed` | Export run. |
 | `ai_source_detected` | A new AI source transcript was detected. |
 | `settings_opened` | Settings UI opened (vscode/intellij). |
-| `ingest_completed` | A drainIngest run finished. |
+| `ingest_completed` | A drainIngest run finished. Carries `idle:true` for a no-op drain (ingested=0); filter those out for real-ingest latency/health metrics. |
 | `error_occurred` | A structured error was raised. Content-free schema: { where (stage/subsystem), code (enumerated), source? , retryable? }. Emitted via trackError(); never carries a message/stack/path. |
 | `queue_drained` | QueueWorker finished a drain. |
 | `sync_completed` | A memory-bank sync round finished. |
