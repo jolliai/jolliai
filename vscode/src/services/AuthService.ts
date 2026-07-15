@@ -25,6 +25,7 @@ import {
 import { exchangeCliCode } from "../../../cli/src/auth/CliExchange.js";
 import { getDeviceLabel } from "../../../cli/src/auth/DeviceLabel.js";
 import { loadConfig } from "../../../cli/src/core/SessionTracker.js";
+import { track } from "../../../cli/src/core/Telemetry.js";
 import type { JolliMemoryConfig } from "../../../cli/src/Types.js";
 import { log } from "../util/Logger.js";
 import { EXTENSION_ID, resolveUriScheme } from "../util/UriSchemeResolver.js";
@@ -278,6 +279,10 @@ export class AuthService {
 		} catch (err: unknown) {
 			log.warn("AuthService", "Failed to update signedIn context key: %s", err);
 		}
+		// JOLLI-1904 (funnel): the conversion event. `api_key_minted` mirrors
+		// IntelliJ — whether this sign-in provisioned a jolliApiKey. surface=vscode
+		// is auto-injected. No-op if telemetry is off.
+		track("signin_completed", { api_key_minted: credentials.jolliApiKey != null });
 		log.info("AuthService", "Sign-in successful");
 		return { success: true };
 	}
@@ -296,11 +301,15 @@ export class AuthService {
 			"jollimemory.signedIn",
 			false,
 		);
+		track("signed_out");
 		log.info("AuthService", "Signed out");
 	}
 
 	/** Opens the browser to the Jolli login page with a VSCode callback URI. */
 	async openSignInPage(): Promise<void> {
+		// JOLLI-1904 (funnel): sign-in initiated. `trigger` mirrors IntelliJ's
+		// surface-tagged value; surface=vscode is auto-injected. No-op if off.
+		track("signin_started", { trigger: "vscode" });
 		// Derive the callback scheme from the host IDE. `vscode.env.uriScheme`
 		// is unreliable here — most forks inherit upstream's "vscode" default
 		// for that API even though they register their own scheme at the OS

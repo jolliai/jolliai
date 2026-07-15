@@ -28,6 +28,7 @@ import { assertJolliOriginAllowed } from "../../cli/src/core/JolliApiUtils.js";
 import { triggerPendingPushRetry } from "../../cli/src/hooks/PushCompensation.js";
 import { exportSharedBranch } from "./services/JolliShareService.js";
 import { importSharedBranchForDisplay } from "./services/SharedBranchImporter.js";
+import { track } from "../../cli/src/core/Telemetry.js";
 import { activateExtensionTelemetry, flushExtensionTelemetry, reinitExtensionTelemetry } from "./TelemetryActivation.js";
 import {
 	getGlobalConfigDir,
@@ -2225,6 +2226,9 @@ export function activate(context: vscode.ExtensionContext): void {
 					// usual. Done only on success — a failed install means the
 					// previous (manuallyDisabled) state is still the user's intent.
 					await writeManualDisableFlag(workspaceRoot, false);
+					// JOLLI-1904 (funnel): surface enabled. Mirrors IntelliJ
+					// surface_enabled { trigger }; surface=vscode auto-injected.
+					track("surface_enabled", { trigger: "command" });
 					log.info("cmd", "enable succeeded — refreshing all panels");
 					// ORDER MATTERS:
 					//   1. refreshStatusBar flips every store's enabled flag
@@ -2290,6 +2294,9 @@ export function activate(context: vscode.ExtensionContext): void {
 					log.error("cmd", "disable failed", { message: result.message });
 					vscode.window.showErrorMessage(`Jolli Memory: ${result.message}`);
 				} else {
+					// JOLLI-1904 (funnel): surface disabled. Mirrors IntelliJ
+					// surface_disabled { trigger }; surface=vscode auto-injected.
+					track("surface_disabled", { trigger: "command" });
 					log.info("cmd", "disable succeeded");
 					await statusStore.refresh();
 					const status = await refreshStatusBar(
