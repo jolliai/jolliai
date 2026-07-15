@@ -15,6 +15,7 @@ const h = vi.hoisted(() => ({
 	resolveProjectDir: vi.fn(),
 	promptSetup: vi.fn(),
 	runSpaceSyncStep: vi.fn(),
+	runBackfillFrontDoorStep: vi.fn(),
 	createStorage: vi.fn(),
 	setActiveStorage: vi.fn(),
 	saveConfigScoped: vi.fn(),
@@ -46,6 +47,7 @@ vi.mock("../install/GitHookInstaller.js", () => ({ isGitHookInstalled: h.isGitHo
 vi.mock("../install/Installer.js", () => ({ install: h.install }));
 vi.mock("./EnableCommand.js", () => ({ promptSetup: h.promptSetup }));
 vi.mock("./SpaceSyncStep.js", () => ({ runSpaceSyncStep: h.runSpaceSyncStep }));
+vi.mock("./BackfillFrontDoorStep.js", () => ({ runBackfillFrontDoorStep: h.runBackfillFrontDoorStep }));
 vi.mock("./CliUtils.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./CliUtils.js")>();
 	return { ...actual, promptText: h.promptText, resolveProjectDir: h.resolveProjectDir };
@@ -96,6 +98,7 @@ describe("GuidedFrontDoor", () => {
 		h.promptText.mockResolvedValue("");
 		h.triggerPendingPushRetry.mockResolvedValue(undefined);
 		h.runSpaceSyncStep.mockResolvedValue(undefined);
+		h.runBackfillFrontDoorStep.mockResolvedValue(undefined);
 		h.promptSetup.mockResolvedValue(undefined);
 		h.loadUserProfile.mockResolvedValue({});
 		h.saveUserProfile.mockResolvedValue(undefined);
@@ -122,9 +125,20 @@ describe("GuidedFrontDoor", () => {
 		expect(h.install).not.toHaveBeenCalled();
 		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo", "cli-front-door");
 		expect(h.runSpaceSyncStep).toHaveBeenCalledWith("/repo");
+		expect(h.runBackfillFrontDoorStep).toHaveBeenCalledWith("/repo");
 		expect(out()).toContain("signed in · acme.jolli.ai");
 		expect(out()).toContain("3 memories");
 		expect(out()).toContain("last memory saved");
+	});
+
+	it("offers cold-start back-fill then re-reads the count so 'listening' reflects new memories", async () => {
+		// Status line reads 0 memories; the back-fill step builds some; the re-read
+		// after it returns 2, so the listening line no longer says "first memory".
+		h.getSummaryCount.mockResolvedValueOnce(0).mockResolvedValue(2);
+		await runGuidedFrontDoor();
+		expect(h.runBackfillFrontDoorStep).toHaveBeenCalledWith("/repo");
+		expect(out()).toContain("last memory saved");
+		expect(out()).not.toContain("first memory");
 	});
 
 	it("binds the Space before retrying pending pushes", async () => {
@@ -393,6 +407,8 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).toContain("signed in");
 		expect(out()).toContain("no Anthropic key is available");
 		expect(out()).not.toContain("Jolli is listening");
+		// Not generatable (fix declined) → the back-fill offer is skipped this run.
+		expect(h.runBackfillFrontDoorStep).not.toHaveBeenCalled();
 	});
 
 	it("provider=anthropic + jolliApiKey, choose 'switch to Jolli' → saves aiProvider, listening reflects count", async () => {

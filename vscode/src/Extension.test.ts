@@ -7604,7 +7604,7 @@ describe("Extension", () => {
 			expect(res.items).toEqual([]);
 		});
 
-		it("run streams progress, returns result rows, and clears the dismiss marker on success", async () => {
+		it("run streams progress, returns result rows, and does NOT clear the sticky dismiss flag on success", async () => {
 			const { runBackfill } = await import("../../cli/src/backfill/BackfillEngine.js");
 			const { writeBackfillDismissFlag } = await import("./services/BackfillDismissFlag.js");
 			vi.mocked(runBackfill).mockImplementation(async (opts) => {
@@ -7623,7 +7623,9 @@ describe("Extension", () => {
 			expect(progress).toEqual([1]);
 			expect(res.generated).toBe(1);
 			expect(res.rows).toEqual([{ commitHash: "h1", subject: "fix a", sessions: 2, topics: 3, status: "generated" }]);
-			expect(vi.mocked(writeBackfillDismissFlag)).toHaveBeenCalledWith("/test/workspace", false);
+			// Dismiss is a sticky, explicit opt-out — generating a memory must never touch it
+			// (neither clear it nor, worse, set it). The success path writes the flag not at all.
+			expect(vi.mocked(writeBackfillDismissFlag)).not.toHaveBeenCalled();
 		});
 
 		it("run maps an errored outcome to a failed result row", async () => {
@@ -7656,7 +7658,7 @@ describe("Extension", () => {
 			expect(state.backfillDismissed).toBe(true);
 		});
 
-		it("the Settings full-scope command also leaves cold start (clears the dismiss marker on generated>0)", async () => {
+		it("the Settings full-scope command runs back-fill but does NOT clear the sticky dismiss flag", async () => {
 			const { recentCommitHashes, runBackfill } = await import("../../cli/src/backfill/BackfillEngine.js");
 			const { writeBackfillDismissFlag } = await import("./services/BackfillDismissFlag.js");
 			vi.mocked(recentCommitHashes).mockResolvedValue(["h1"]);
@@ -7673,9 +7675,9 @@ describe("Extension", () => {
 			expect(handler).toBeDefined();
 			await handler?.();
 			expect(vi.mocked(runBackfill)).toHaveBeenCalled();
-			// Regression: the cold-start state update lives in runBackfillJob so BOTH
-			// entry points (card + Settings) clear the dismiss marker on generated>0.
-			expect(vi.mocked(writeBackfillDismissFlag)).toHaveBeenCalledWith("/test/workspace", false);
+			// Regression: neither entry point (card nor Settings) touches the sticky
+			// dismiss flag on generated>0 — dismiss is a permanent, explicit opt-out.
+			expect(vi.mocked(writeBackfillDismissFlag)).not.toHaveBeenCalled();
 		});
 
 		it("tolerates a failure resolving the cold-start signals (activate still completes)", async () => {

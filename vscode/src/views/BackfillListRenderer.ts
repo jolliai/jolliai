@@ -19,18 +19,17 @@
  * commit with no attributed conversation shows "Code change only".
  */
 
+import { COLD_START_CAP, COLD_START_WINDOW_MS } from "../../../cli/src/backfill/ColdStart.js";
+
 const s = (n: number): string => (n === 1 ? "" : "s");
 
 /**
- * Cold-start scope, shared by the host (Extension.ts: `listMissingCommits` window
- * + cap) and the note copy below, so a single change stays consistent everywhere.
- * `COLD_START_CAP` is the max commits the cold-start card lists (the rest go to
- * Settings via the card's "manage all" link). NOTE: temporarily lowered to 1 for
- * manual testing of the capped / "N more in Settings" flow — restore to 10 for
- * release.
+ * Cold-start scope constants now live in the CLI (`cli/src/backfill/ColdStart.ts`)
+ * so the guided front door and this VS Code renderer share one source of truth.
+ * Re-exported here so existing VS Code importers (Extension.ts, SidebarScriptBuilder)
+ * keep resolving them from this module.
  */
-export const COLD_START_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
-export const COLD_START_CAP = 10;
+export { COLD_START_CAP, COLD_START_WINDOW_MS };
 
 /** Candidate-row meta: "3 sessions · 12 turns", or "Code change only" when diff-only. */
 export function formatBackfillMeta(sessions: number, conversationTurns: number): string {

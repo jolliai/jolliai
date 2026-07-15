@@ -114,6 +114,23 @@ export interface BackfillOptions {
 	readonly projectsRoot?: string;
 	/** Progress callback fired after each commit is processed. */
 	readonly onProgress?: (done: number, total: number, outcome: BackfillOutcome) => void;
+	/**
+	 * Fired right BEFORE a commit's summary is generated (before its LLM call),
+	 * unlike `onProgress` which fires after. Lets a UI show "now working on commit
+	 * N/total" the instant that commit's (potentially slow) generation starts,
+	 * instead of leaving the screen frozen until the first commit completes.
+	 * `index` is 1-based over the commits that lack a summary.
+	 */
+	readonly onCommitStart?: (index: number, total: number, hash: string, subject?: string) => void;
+	/**
+	 * Cooperative cancellation. Checked at each commit boundary (before starting a
+	 * commit's LLM call), so an abort stops the loop cleanly between commits — the
+	 * commit in flight always finishes and stores, and the loop never leaves a
+	 * half-written summary. Already-generated commits stay on the orphan branch, so
+	 * a re-run resumes with only the still-missing commits. Used by the guided front
+	 * door's Ctrl-C handler to make a long back-fill interruptible + resumable.
+	 */
+	readonly signal?: AbortSignal;
 }
 
 /** Returns the repo's worktree roots (for scoping transcripts by cwd). */
@@ -216,7 +233,16 @@ async function generateAndStore(
  * failure — per-commit errors become `error` outcomes so a batch always finishes.
  */
 export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport> {
-	const { cwd, hashes, dryRun = false, minTier = DEFAULT_BACKFILL_TIER, projectsRoot, onProgress } = opts;
+	const {
+		cwd,
+		hashes,
+		dryRun = false,
+		minTier = DEFAULT_BACKFILL_TIER,
+		projectsRoot,
+		onProgress,
+		onCommitStart,
+		signal,
+	} = opts;
 	const outcomes: BackfillOutcome[] = [];
 
 	log.info("Back-fill start: cwd=%s candidates=%d dryRun=%s minTier=%s", cwd, hashes.length, dryRun, minTier);
@@ -273,14 +299,25 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 
 	let done = 0;
 	for (const hash of missing) {
+		// Cooperative cancellation at the commit boundary: never mid-LLM. The commit
+		// already generated is stored; we simply stop before starting the next one.
+		// A re-run drops already-summarized commits (step 1) and resumes the rest.
+		if (signal?.aborted) {
+			log.info("Back-fill aborted at %d/%d commits (signal)", done, missing.length);
+			break;
+		}
 		// `null` attribution → diff-only summary (no conversation confidently found),
-		// mirroring the live pipeline's no-session path. 宁缺毋滥 only blocks *attaching*
-		// an unsure conversation; every own-commit still gets at least a diff summary.
+		// mirroring the live pipeline's no-session path. The "better none than a wrong
+		// one" rule only blocks *attaching* an unsure conversation; every own-commit
+		// still gets at least a diff summary.
 		const attr = attributed.get(hash) ?? null;
 		const method = attr?.method ?? "diff-only";
 		// Subject is already in the target index (no extra git call) — carry it so
 		// progress UIs can show the commit's one-line message instead of a bare hash.
 		const subject = index.commitMeta.get(hash)?.subject;
+		// Announce the commit BEFORE its (slow) generation so a UI isn't frozen during
+		// the first commit's LLM call. Skipped on dry-run (no generation to wait on).
+		if (!dryRun) onCommitStart?.(done + 1, missing.length, hash, subject);
 		let outcome: BackfillOutcome;
 		if (dryRun) {
 			outcome = {
