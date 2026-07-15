@@ -133,6 +133,12 @@ export interface FlushNowDeps {
 	readonly platformDisabled?: boolean;
 	/** Env for the `DO_NOT_TRACK` check. Defaults to `process.env`. */
 	readonly env?: NodeJS.ProcessEnv;
+	/**
+	 * Per-POST timeout override, forwarded to `flushTelemetry`. Latency-sensitive
+	 * callers (the CLI command-exit flush, JOLLI-1955) pass a short cap so a slow
+	 * network can't stall the process; omit to use the flusher's default (10s).
+	 */
+	readonly timeoutMs?: number;
 }
 
 /**
@@ -156,7 +162,13 @@ export async function flushTelemetryNow(cwd: string, deps?: FlushNowDeps): Promi
 			return;
 		}
 		const origin = resolveTelemetryOrigin(config, getJolliUrl);
-		await flushTelemetry({ cwd, origin, jolliApiKey: config.jolliApiKey, fetchImpl: deps?.fetchImpl });
+		await flushTelemetry({
+			cwd,
+			origin,
+			jolliApiKey: config.jolliApiKey,
+			fetchImpl: deps?.fetchImpl,
+			timeoutMs: deps?.timeoutMs,
+		});
 	} catch {
 		// Flush is best-effort — never propagate into the worker / exit path.
 	}
