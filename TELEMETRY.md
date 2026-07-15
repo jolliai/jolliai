@@ -76,7 +76,7 @@ disk **before** they are sent.
 | `view_switched` | Tool window view switched (current/bank/knowledge). Props: view (discriminator). |
 | `memory_committed` | User committed a memory via the Commit button. Props: files_bucket (bucketed changed-file count), has_conversations (bool), context_bucket (bucketed plans/context count). |
 | `memory_expanded` | A committed memory's details were expanded. Props: expanded. |
-| `memory_item_opened` | An item inside a memory was opened. Props: item_type (discriminator: conversation/file/context/shipped). |
+| `memory_item_opened` | An item inside a memory was opened. Props: item_type (discriminator: conversation/file/plan/note/reference/shipped). |
 | `session_resumed` | A conversation session was resumed in a terminal. Props: source (discriminator). |
 | `recall_prompt_copied` | A recall prompt was copied to the clipboard. Props: none. |
 | `memory_pinned` | An item was pinned. Props: kind (discriminator). |
