@@ -60,7 +60,7 @@ disk **before** they are sent.
 | `signed_out` | User logged out. |
 | `ai_provider_selected` | User chose jolli vs anthropic for LLM. |
 | `memory_bank_migrated` | Migrate-to-Memory-Bank run. |
-| `command_invoked` | Any CLI command ran (auto-emitted). |
+| `command_invoked` | Any CLI command ran (auto-emitted). MCP tool calls carry a `tool` property and are emitted per call (not per session); the session-level `command:"mcp"` event is suppressed. |
 | `recall_performed` | A recall was run. |
 | `search_performed` | A search was run. |
 | `memory_pushed` | Memories pushed. |

@@ -18,6 +18,7 @@ import { JolliMemoryPushClient, type PlatformToolManifestEntry } from "../core/J
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
+import { track } from "../core/Telemetry.js";
 import { createLogger } from "../Logger.js";
 import type { JolliMemoryConfig } from "../Types.js";
 import {
@@ -280,6 +281,7 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 
 	server.setRequestHandler(CallToolRequestSchema, async (req) => {
 		const { name, arguments: args } = req.params;
+		const start = Date.now();
 		try {
 			// Route backend-defined tools through the generic executor; everything
 			// else is a built-in handled by the local dispatch table.
@@ -296,8 +298,17 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 			// an error, so it stays a normal result.
 			const isError =
 				typeof result === "object" && result !== null && (result as { type?: unknown }).type === "error";
+			// Per-tool-call telemetry (JOLLI-1959). The session-level `command:"mcp"`
+			// event (fired once at stdio disconnect) can't tell which tool the AI used;
+			// emit one event per call, tagged with the tool `name`. NEVER include
+			// `arguments` — they may carry user content. `ok` folds in push_memory's
+			// structured `{type:"error"}` result, not just thrown errors. The
+			// session-level mcp event is suppressed in TelemetryCommandHook so this
+			// does not double-count.
+			track("command_invoked", { command: "mcp", tool: name, duration_ms: Date.now() - start, ok: !isError });
 			return { content: [{ type: "text", text: JSON.stringify(result) }], ...(isError ? { isError: true } : {}) };
 		} catch (err) {
+			track("command_invoked", { command: "mcp", tool: name, duration_ms: Date.now() - start, ok: false });
 			const message = err instanceof Error ? err.message : String(err);
 			log.warn("Tool %s failed: %s", name, message);
 			return { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true };
