@@ -12,6 +12,7 @@ import {
 	scrubProperties,
 	shutdownTelemetry,
 	track,
+	trackError,
 } from "./Telemetry.js";
 import { readTelemetryEvents } from "./TelemetryBuffer.js";
 
@@ -232,5 +233,31 @@ describe("track / initTelemetry", () => {
 		expect(getTelemetryContext()).toBeNull();
 		track("recall_performed");
 		expect(await readTelemetryEvents(cwd)).toEqual([]);
+	});
+});
+
+describe("trackError (JOLLI-1961)", () => {
+	const baseInit = () => ({ cwd, installId: "install-1", origin: "https://acme.jolli.ai", config: {} });
+
+	it("emits error_occurred with the full content-free schema", async () => {
+		initTelemetry(baseInit());
+		trackError("ingest", "ROUTE_FAILED", { source: "claude", retryable: true });
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.eventName).toBe("error_occurred");
+		expect(e.properties).toEqual({ where: "ingest", code: "ROUTE_FAILED", source: "claude", retryable: true });
+	});
+
+	it("omits absent optional fields (where + code only)", async () => {
+		initTelemetry(baseInit());
+		trackError("push", "push_failed");
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).toEqual({ where: "push", code: "push_failed" });
+	});
+
+	it("includes retryable:false when explicitly false", async () => {
+		initTelemetry(baseInit());
+		trackError("sync", "conflict", { retryable: false });
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).toEqual({ where: "sync", code: "conflict", retryable: false });
 	});
 });

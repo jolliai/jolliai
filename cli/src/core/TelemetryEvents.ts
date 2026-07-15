@@ -46,7 +46,8 @@ export const TELEMETRY_EVENTS = {
 	settings_opened: "Settings UI opened (vscode/intellij).",
 	// ── pipeline health ──
 	ingest_completed: "A drainIngest run finished.",
-	error_occurred: "A structured error code was raised.",
+	error_occurred:
+		"A structured error was raised. Content-free schema: { where (stage/subsystem), code (enumerated), source? , retryable? }. Emitted via trackError(); never carries a message/stack/path.",
 	queue_drained: "QueueWorker finished a drain.",
 	sync_completed: "A memory-bank sync round finished.",
 	// ── IDE tool-window UI / engagement (IntelliJ, VS Code) ──

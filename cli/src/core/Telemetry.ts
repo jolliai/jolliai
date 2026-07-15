@@ -135,6 +135,30 @@ export function track(eventName: TelemetryEventName, properties: Readonly<Record
 	}
 }
 
+/**
+ * Emit a structured, content-free `error_occurred` (JOLLI-1961). The one schema
+ * every surface uses is `{ where, code, source?, retryable? }`:
+ *   - `where`      — the pipeline stage / subsystem (e.g. "ingest", "push", "sync").
+ *   - `code`       — a stable, enumerated error code — NEVER a message, stack, or path.
+ *   - `source?`    — the source/subsystem enum, when relevant (content-free).
+ *   - `retryable?` — whether a retry may succeed, when known.
+ * All values must be fixed identifiers from our own code, never user content.
+ * Routing every error through here keeps the shape consistent (in particular it
+ * avoids a property literally named `name`, which the backend scrubber drops).
+ */
+export function trackError(
+	where: string,
+	code: string,
+	opts?: { readonly source?: string; readonly retryable?: boolean },
+): void {
+	track("error_occurred", {
+		where,
+		code,
+		...(opts?.source !== undefined ? { source: opts.source } : {}),
+		...(opts?.retryable !== undefined ? { retryable: opts.retryable } : {}),
+	});
+}
+
 // ─────────────────────────── helpers ───────────────────────────
 
 /** Map a raw count to a coarse bucket. Non-positive / non-finite → "0". */

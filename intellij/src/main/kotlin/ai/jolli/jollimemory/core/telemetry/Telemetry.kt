@@ -120,6 +120,22 @@ object Telemetry {
         }
     }
 
+    /**
+     * Emit a structured, content-free `error_occurred` (JOLLI-1961). One schema
+     * across every surface: `{ where, code, source?, retryable? }` — `where` is the
+     * stage/subsystem, `code` an enumerated error code (never a message/stack/path),
+     * `source?`/`retryable?` optional content-free extras. Mirrors cli trackError().
+     */
+    fun trackError(where: String, code: String, source: String? = null, retryable: Boolean? = null) {
+        val props = buildMap<String, Any?> {
+            put("where", where)
+            put("code", code)
+            if (source != null) put("source", source)
+            if (retryable != null) put("retryable", retryable)
+        }
+        track("error_occurred", props)
+    }
+
     // ─────────────────────────── helpers ───────────────────────────
 
     enum class Bucket(val label: String) {

@@ -11,7 +11,7 @@ import { getJolliMemoryDir } from "../Logger.js";
 import type { IngestOperation } from "../Types.js";
 import { atomicWriteFile } from "./AtomicWrite.js";
 import { INGEST_CODES, INGEST_NON_ERROR_OUTCOMES, type IngestCode } from "./IngestErrors.js";
-import { track } from "./Telemetry.js";
+import { track, trackError } from "./Telemetry.js";
 
 const RUNS_FILE = "ingest-runs.json";
 const MAX_RUNS = 20;
@@ -72,7 +72,7 @@ function emitIngestTelemetry(record: IngestRunRecord): void {
 	// "not signed in" and benign-retry noise (JOLLI-1962). The outcome is still
 	// recorded on `ingest_completed`; only real failures raise the error event.
 	if (!INGEST_NON_ERROR_OUTCOMES.has(record.outcome)) {
-		track("error_occurred", { code: record.outcome, where: "ingest" });
+		trackError("ingest", record.outcome);
 	}
 }
 

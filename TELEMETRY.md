@@ -69,7 +69,7 @@ disk **before** they are sent.
 | `ai_source_detected` | A new AI source transcript was detected. |
 | `settings_opened` | Settings UI opened (vscode/intellij). |
 | `ingest_completed` | A drainIngest run finished. |
-| `error_occurred` | A structured error code was raised. |
+| `error_occurred` | A structured error was raised. Content-free schema: { where (stage/subsystem), code (enumerated), source? , retryable? }. Emitted via trackError(); never carries a message/stack/path. |
 | `queue_drained` | QueueWorker finished a drain. |
 | `sync_completed` | A memory-bank sync round finished. |
 | `toolwindow_opened` | The memory tool window was opened. |
