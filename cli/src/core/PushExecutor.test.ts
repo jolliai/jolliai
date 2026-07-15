@@ -24,6 +24,7 @@ import { loadBranchSummaries } from "./PrDescription.js";
 import { classifyError, processPrePushInline, processPushPending, triggerPushForNewSummaries } from "./PushExecutor.js";
 import { claimForPush, loadPushPending, type PushPendingEntry, updateBatch } from "./PushPendingStore.js";
 import { loadConfig } from "./SessionTracker.js";
+import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
 import { createStorage } from "./StorageFactory.js";
 import { getActiveStorage, getIndexEntryMap, getSummary, setActiveStorage } from "./SummaryStore.js";
 
@@ -52,6 +53,12 @@ vi.mock("./JolliMemoryPushOrchestrator.js", async (importOriginal) => {
 		applyBatchResult: vi.fn(),
 	};
 });
+// Mocked so these tests never touch a real `.jolli/jollimemory/space-binding.json`
+// (CWD is a fake path); the cache's own behavior is covered by SpaceBindingCache.test.ts.
+vi.mock("./SpaceBindingCache.js", () => ({
+	clearSpaceBindingCache: vi.fn(),
+	saveSpaceBindingCache: vi.fn(),
+}));
 
 const CWD = "/repo";
 const HASH_A = "a".repeat(40);
@@ -67,7 +74,7 @@ function summary(hash: string, branch = "feature/x"): CommitSummary {
 }
 
 /** pushBatch mock that succeeds for every item in the payload, per-item docIds 100+. */
-function okPushBatch() {
+function okPushBatch(jmSpace?: { id: number; name: string }) {
 	return vi.fn(async (payload: { items: Array<{ commitHash: string }> }) => ({
 		results: payload.items.map((item, index) => ({
 			commitHash: item.commitHash,
@@ -80,6 +87,7 @@ function okPushBatch() {
 			},
 			attachments: [],
 		})),
+		...(jmSpace !== undefined ? { jmSpace } : {}),
 	}));
 }
 
@@ -407,6 +415,120 @@ describe("processPushPending", () => {
 		expect(pushSummary).not.toHaveBeenCalled();
 		const batch = vi.mocked(updateBatch).mock.calls[0][1];
 		expect(batch.get(HASH_A)).toEqual({ kind: "delete" });
+	});
+
+	it("persists the server's Space echo as the binding cache after a successful individual push", async () => {
+		// Only the per-commit fallback carries the echo — batch responses have none.
+		vi.mocked(pushSummary).mockResolvedValue({
+			summary: summary(HASH_A),
+			summaryUrl: "https://acme.jolli.ai/a",
+			jmSpace: { id: 7, name: "Acme Core" },
+		});
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		const pushBatch = vi.fn(async () => {
+			throw new BatchUnsupportedError();
+		});
+
+		await processPushPending(CWD, { source: "activation", client: fakeClient(pushBatch) });
+
+		expect(saveSpaceBindingCache).toHaveBeenCalledWith(CWD, {
+			repoUrl: "https://github.com/acme/repo",
+			origin: "https://acme.jolli.ai",
+			jmSpaceId: 7,
+			spaceName: "Acme Core",
+			canPush: true,
+		});
+	});
+
+	it("leaves the binding cache untouched when the server echoes no Space (older server)", async () => {
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		const pushBatch = vi.fn(async () => {
+			throw new BatchUnsupportedError();
+		});
+
+		await processPushPending(CWD, { source: "activation", client: fakeClient(pushBatch) });
+
+		expect(saveSpaceBindingCache).not.toHaveBeenCalled();
+		expect(clearSpaceBindingCache).not.toHaveBeenCalled();
+	});
+
+	it("leaves the binding cache untouched after a successful batch push with no Space echo (older server)", async () => {
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+
+		const r = await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		expect(r.pushed).toBe(1);
+		expect(saveSpaceBindingCache).not.toHaveBeenCalled();
+		expect(clearSpaceBindingCache).not.toHaveBeenCalled();
+	});
+
+	it("persists the batch top-level Space echo as the binding cache", async () => {
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+
+		const r = await processPushPending(CWD, {
+			source: "activation",
+			client: fakeClient(okPushBatch({ id: 7, name: "Acme Core" })),
+		});
+
+		expect(r.pushed).toBe(1);
+		expect(saveSpaceBindingCache).toHaveBeenCalledWith(CWD, {
+			repoUrl: "https://github.com/acme/repo",
+			origin: "https://acme.jolli.ai",
+			jmSpaceId: 7,
+			spaceName: "Acme Core",
+			canPush: true,
+		});
+	});
+
+	it("clears the binding cache when a batch push is rejected with binding_required", async () => {
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		const pushBatch = vi.fn(async () => {
+			throw new BindingRequiredError("https://github.com/acme/repo");
+		});
+
+		const r = await processPushPending(CWD, { source: "activation", client: fakeClient(pushBatch) });
+
+		expect(r.failed).toBe(1);
+		expect(clearSpaceBindingCache).toHaveBeenCalledWith(CWD);
+		expect(saveSpaceBindingCache).not.toHaveBeenCalled();
+		// The 412 stays a held (non-counted) retry, exactly as before the cache.
+		const batch = vi.mocked(updateBatch).mock.calls[0][1];
+		expect(batch.get(HASH_A)).toMatchObject({ kind: "patch", patch: { lastError: "binding-required" } });
+	});
+
+	it("clears the binding cache when a batch push is rejected with permission denied", async () => {
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		const pushBatch = vi.fn(async () => {
+			throw new PermissionDeniedError();
+		});
+
+		await processPushPending(CWD, { source: "activation", client: fakeClient(pushBatch) });
+
+		expect(clearSpaceBindingCache).toHaveBeenCalledWith(CWD);
+	});
+
+	it("clears the binding cache when an individual push is rejected as unauthenticated", async () => {
+		vi.mocked(pushSummary).mockRejectedValue(new NotAuthenticatedError());
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		const pushBatch = vi.fn(async () => {
+			throw new BatchUnsupportedError();
+		});
+
+		await processPushPending(CWD, { source: "activation", client: fakeClient(pushBatch) });
+
+		expect(clearSpaceBindingCache).toHaveBeenCalledWith(CWD);
+	});
+
+	it("does not clear the binding cache on an operational (network) failure", async () => {
+		vi.mocked(pushSummary).mockRejectedValue(new Error("ECONNRESET"));
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		const pushBatch = vi.fn(async () => {
+			throw new BatchUnsupportedError();
+		});
+
+		await processPushPending(CWD, { source: "activation", client: fakeClient(pushBatch) });
+
+		expect(clearSpaceBindingCache).not.toHaveBeenCalled();
 	});
 
 	it("waits for remote confirmation before publishing a newly pushed commit", async () => {
@@ -833,6 +955,39 @@ describe("processPrePushInline", () => {
 		]);
 	});
 
+	it("persists the batch top-level Space echo as the binding cache", async () => {
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		const pushBatch = vi.fn(async () => ({ ...okBatchResult(HASH_A), jmSpace: { id: 7, name: "Acme Core" } }));
+
+		await processPrePushInline(CWD, {
+			priorityHashes: [HASH_A],
+			deadlineAt: farDeadline(),
+			client: fakeBatchClient(pushBatch),
+		});
+
+		expect(saveSpaceBindingCache).toHaveBeenCalledWith(CWD, {
+			repoUrl: "https://github.com/acme/repo",
+			origin: "https://acme.jolli.ai",
+			jmSpaceId: 7,
+			spaceName: "Acme Core",
+			canPush: true,
+		});
+	});
+
+	it("leaves the binding cache untouched when the batch echoes no Space (older server)", async () => {
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		const pushBatch = vi.fn(async () => okBatchResult(HASH_A));
+
+		await processPrePushInline(CWD, {
+			priorityHashes: [HASH_A],
+			deadlineAt: farDeadline(),
+			client: fakeBatchClient(pushBatch),
+		});
+
+		expect(saveSpaceBindingCache).not.toHaveBeenCalled();
+		expect(clearSpaceBindingCache).not.toHaveBeenCalled();
+	});
+
 	it("defers inline overflow beyond the server's total-content limit", async () => {
 		vi.mocked(loadPushPending).mockResolvedValue({
 			version: 1,
@@ -1041,6 +1196,8 @@ describe("processPrePushInline", () => {
 		}
 		// The result list shows the friendly wording, not the raw error code.
 		expect(r.commits).toEqual([{ hash: HASH_A, status: "failed", reason: "not signed in to Jolli" }]);
+		// The server just contradicted any cached binding — the inline drain drops it too.
+		expect(clearSpaceBindingCache).toHaveBeenCalledWith(CWD);
 	});
 
 	it("labels a space-permission failure distinctly in the result list (no retry burn)", async () => {
@@ -1062,6 +1219,8 @@ describe("processPrePushInline", () => {
 			expect(update.patch.retryCount).toBeUndefined();
 			expect(update.patch.lastError).toBe("permission-denied");
 		}
+		// A 403 also invalidates the cached binding (canPush flipped server-side).
+		expect(clearSpaceBindingCache).toHaveBeenCalledWith(CWD);
 	});
 
 	it("releases claims without retry burn when the server lacks batch support", async () => {

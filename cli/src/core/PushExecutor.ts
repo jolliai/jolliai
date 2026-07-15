@@ -26,6 +26,14 @@
  * `base..HEAD`; off-current branches are reconstructed from root summaries in
  * the summary index. Every pending commit therefore gets the plans/notes it
  * owns even when the user checked out another branch before the drain runs.
+ *
+ * Binding-cache maintenance rides along: a successful push persists the
+ * server's `jmSpace` echo via SpaceBindingCache (a push proves the binding and
+ * push rights — and the server auto-binds single-Space tenants during the push
+ * itself; `pushBatch` echoes once at the top level, `pushSummary` per commit),
+ * while a 412/401/403 rejection clears the cache on every drain flavor. Older
+ * servers echo nothing and the cache is left as-is. The push chain never adds
+ * extra requests for this.
  */
 
 import { createLogger, errMsg } from "../Logger.js";
@@ -33,7 +41,7 @@ import type { CommitSummary } from "../Types.js";
 import { mapWithConcurrency } from "./Concurrency.js";
 import { execGit, getCurrentBranch, getDefaultBranch } from "./GitOps.js";
 import { getCanonicalRepoUrl } from "./GitRemoteUtils.js";
-import { resolveArticleUrl } from "./JolliApiUtils.js";
+import { parseBaseUrl, resolveArticleUrl } from "./JolliApiUtils.js";
 import {
 	BATCH_MAX_ITEMS,
 	BATCH_MAX_TOTAL_CONTENT_CHARS,
@@ -67,6 +75,7 @@ import {
 	updateBatch,
 } from "./PushPendingStore.js";
 import { loadConfig } from "./SessionTracker.js";
+import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
 import { createStorage } from "./StorageFactory.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import { getActiveStorage, getIndexEntryMap, getSummary, setActiveStorage } from "./SummaryStore.js";
@@ -319,6 +328,32 @@ function withRecoveredDocId(summary: CommitSummary, entry: PushPendingEntry | un
 }
 
 /**
+ * Persists the server's Space echo as the local binding cache — an accepted
+ * push proves both the binding and push rights (`canPush: true`), so
+ * `jolli status` / bare `jolli` can render the bound row with zero network
+ * I/O. No-op when the server echoed nothing (older server, legacy
+ * default-space push): the cache is left as-is. Best-effort: a cache hiccup
+ * must not fail a completed sync run.
+ */
+async function persistConfirmedSpace(
+	ctx: PushContext,
+	confirmedSpace: { readonly id: number; readonly name: string } | undefined,
+): Promise<void> {
+	if (!confirmedSpace) return;
+	try {
+		await saveSpaceBindingCache(ctx.cwd, {
+			repoUrl: ctx.repoUrl,
+			origin: parseBaseUrl(ctx.baseUrl).origin,
+			jmSpaceId: confirmedSpace.id,
+			spaceName: confirmedSpace.name,
+			canPush: true,
+		});
+	} catch (err) {
+		log.debug("binding cache update after push failed: %s", errMsg(err));
+	}
+}
+
+/**
  * Drains eligible entries from `push-pending.json` to the bound Jolli Space.
  * Idempotent and safe to call concurrently across processes — every state
  * mutation goes through `updateBatch` (locked + re-read).
@@ -504,6 +539,11 @@ export async function processPushPending(
 
 	const updates = new Map<string, BatchUpdate>();
 	const counters = { pushed: 0, failed: 0 };
+	// The server's Space echo from any accepted batch request this run
+	// (concurrent writers all observe the same binding, so last-write-wins is
+	// fine). The per-commit fallback persists its own echo inside
+	// pushCandidatesIndividually.
+	let confirmedSpace: { readonly id: number; readonly name: string } | undefined;
 
 	// Batch-first: candidate windows are capped by item count, then split again
 	// by the server's total-content limit. Items that cannot pass the batch schema
@@ -563,6 +603,16 @@ export async function processPushPending(
 					break batchLoop;
 				}
 				const { increment, message } = classifyError(err);
+				if (
+					err instanceof BindingRequiredError ||
+					err instanceof NotAuthenticatedError ||
+					err instanceof PermissionDeniedError
+				) {
+					// The server just contradicted any cached binding (unbound
+					// elsewhere, or auth/permission revoked) — drop the cache so
+					// `jolli status` / bare `jolli` stop rendering a stale bound row.
+					await clearSpaceBindingCache(cwd);
+				}
 				const failedAtIso = new Date().toISOString();
 				// Config failures affect every unsent item identically, so release all
 				// remaining claims without wasting more network requests.
@@ -598,6 +648,9 @@ export async function processPushPending(
 				continue;
 			}
 
+			if (batchResult.jmSpace) {
+				confirmedSpace = batchResult.jmSpace;
+			}
 			const resultByHash = new Map(batchResult.results.map((result) => [result.commitHash, result]));
 			const nowIso = new Date().toISOString();
 			for (const hash of batchHashes) {
@@ -656,6 +709,7 @@ export async function processPushPending(
 	}
 
 	await updateBatch(cwd, updates);
+	await persistConfirmedSpace(ctx, confirmedSpace);
 	log.info("processPushPending(%s): pushed=%d failed=%d", options.source, counters.pushed, counters.failed);
 
 	return {
@@ -673,7 +727,9 @@ export async function processPushPending(
  * predate the batch endpoint. Identical semantics to the pre-batch drain:
  * re-reads each summary right before the network call (stale-summary race
  * guard), pushes via `pushSummary` (orphan cleanup included), and fills
- * `updates`/`counters` in place.
+ * `updates`/`counters` in place. Binding-cache maintenance matches the batch
+ * path: the `jmSpace` echo of a successful `pushSummary` is persisted, a
+ * 412/401/403 rejection clears the cache.
  */
 async function pushCandidatesIndividually(args: {
 	readonly cwd: string;
@@ -691,6 +747,9 @@ async function pushCandidatesIndividually(args: {
 }): Promise<void> {
 	const { cwd, storage, hashes, ownership, claimedEntries, ctx, updates, counters } = args;
 	const nowIso = new Date().toISOString();
+	// The server's Space echo from any successful push this run (concurrent
+	// writers all observe the same binding, so last-write-wins is fine).
+	let confirmedSpace: { readonly id: number; readonly name: string } | undefined;
 	const results = await mapWithConcurrency(hashes, PUSH_CONCURRENCY, async (hash): Promise<"pushed" | "failed"> => {
 		// Re-read immediately before the network call so a concurrent rewrite or
 		// cleanup cannot make us publish a stale summary captured earlier.
@@ -708,11 +767,24 @@ async function pushCandidatesIndividually(args: {
 			references: ownership.ownedReferences.get(hash) ?? [],
 		};
 		try {
-			await pushSummary(summary, ctx, attachments);
+			const { jmSpace } = await pushSummary(summary, ctx, attachments);
+			if (jmSpace) {
+				confirmedSpace = jmSpace;
+			}
 			updates.set(hash, { kind: "delete" });
 			return "pushed";
 		} catch (err) {
 			const { increment, message } = classifyError(err);
+			if (
+				err instanceof BindingRequiredError ||
+				err instanceof NotAuthenticatedError ||
+				err instanceof PermissionDeniedError
+			) {
+				// The server just contradicted any cached binding (unbound
+				// elsewhere, or auth/permission revoked) — drop the cache so
+				// `jolli status` / bare `jolli` stop rendering a stale bound row.
+				await clearSpaceBindingCache(cwd);
+			}
 			const entry = claimedEntries[hash];
 			updates.set(hash, {
 				kind: "patch",
@@ -735,6 +807,7 @@ async function pushCandidatesIndividually(args: {
 		if (result === "pushed") counters.pushed++;
 		else counters.failed++;
 	}
+	await persistConfirmedSpace(ctx, confirmedSpace);
 }
 
 // ─── Inline pre-push drain (synchronous, budget-bound, single batch request) ─
@@ -1145,6 +1218,16 @@ export async function processPrePushInline(
 			};
 		}
 		const { increment, message } = classifyError(err);
+		if (
+			err instanceof BindingRequiredError ||
+			err instanceof NotAuthenticatedError ||
+			err instanceof PermissionDeniedError
+		) {
+			// The server just contradicted any cached binding (unbound
+			// elsewhere, or auth/permission revoked) — drop the cache so
+			// `jolli status` / bare `jolli` stop rendering a stale bound row.
+			await clearSpaceBindingCache(cwd);
+		}
 		const failureUpdates = new Map<string, BatchUpdate>();
 		const failedAtIso = new Date().toISOString();
 		const reason = friendlyPushFailure(message);
@@ -1226,6 +1309,9 @@ export async function processPrePushInline(
 		log.warn("processPrePushInline: write-back failed: %s", errMsg(err));
 	}
 	await updateBatch(cwd, updates);
+	// The server accepted the batch request (binding + push rights verified),
+	// so the top-level Space echo is trustworthy even on per-item failures.
+	await persistConfirmedSpace(requestCtx, batchResult.jmSpace);
 
 	log.info("processPrePushInline: pushed=%d failed=%d", pushed, failed);
 	return {
