@@ -22,7 +22,7 @@
  * The Kotlin port (`Telemetry.kt`, Phase 3) mirrors this module — keep them in
  * lockstep.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { JOLLI_CLIENT_HEADER } from "./ClientHeader.js";
 import { appendTelemetryEvent, type TelemetryEnvelope } from "./TelemetryBuffer.js";
 import { resolveTelemetryConsent } from "./TelemetryConsent.js";
@@ -110,6 +110,10 @@ export function track(eventName: TelemetryEventName, properties: Readonly<Record
 	try {
 		const envelope: TelemetryEnvelope = {
 			schemaVersion: SCHEMA_VERSION,
+			// Idempotency key minted once here, at buffer time. Written to disk and
+			// re-read verbatim on flush, so a re-sent event keeps the same id and the
+			// backend dedups on (event_id, ts) — see TelemetryEnvelope (JOLLI-1966).
+			eventId: randomUUID(),
 			eventName,
 			surface: ctx.surface,
 			surfaceVersion: ctx.surfaceVersion,

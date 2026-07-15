@@ -30,6 +30,7 @@ class TelemetryFlusherTest {
     private fun env(installId: String) =
         TelemetryEnvelope(
             schemaVersion = 1,
+            eventId = "33333333-3333-4333-8333-333333333333",
             eventName = "app_installed",
             surface = "intellij",
             surfaceVersion = "1.0.0",

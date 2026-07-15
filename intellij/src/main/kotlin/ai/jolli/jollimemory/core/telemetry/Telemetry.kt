@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.core.telemetry
 import java.net.URI
 import java.security.MessageDigest
 import java.time.Instant
+import java.util.UUID
 
 /**
  * Telemetry — the single `track()` choke-point for the IntelliJ plugin
@@ -94,6 +95,10 @@ object Telemetry {
             val envelope =
                 TelemetryEnvelope(
                     schemaVersion = SCHEMA_VERSION,
+                    // Idempotency key minted once here, at buffer time. Written to disk
+                    // and re-read verbatim on flush, so a re-sent event keeps the same id
+                    // and the backend dedups on (event_id, ts) — see TelemetryEnvelope.
+                    eventId = UUID.randomUUID().toString(),
                     eventName = eventName,
                     surface = "intellij",
                     surfaceVersion = ctx.surfaceVersion,

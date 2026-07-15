@@ -33,6 +33,7 @@ const run = async (...argv: string[]): Promise<void> => {
 
 const env = (over: Partial<TelemetryEnvelope> = {}): TelemetryEnvelope => ({
 	schemaVersion: 1,
+	eventId: "44444444-4444-4444-8444-444444444444",
 	eventName: "recall_performed",
 	surface: "cli",
 	surfaceVersion: "1.0.0",
