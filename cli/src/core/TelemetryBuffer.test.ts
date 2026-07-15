@@ -18,6 +18,7 @@ let cwd: string;
 
 const env = (over: Partial<TelemetryEnvelope> = {}): TelemetryEnvelope => ({
 	schemaVersion: 1,
+	eventId: "22222222-2222-4222-8222-222222222222",
 	eventName: "recall_performed",
 	surface: "cli",
 	surfaceVersion: "1.2.0",

@@ -15,6 +15,14 @@ import java.nio.file.StandardCopyOption
  */
 data class TelemetryEnvelope(
     val schemaVersion: Int,
+    /**
+     * Client-generated idempotency key (UUID), minted once when the event is
+     * buffered and preserved verbatim across re-sends. Delivery is at-least-once,
+     * so the backend dedups on `(event_id, ts)` — `INSERT … ON CONFLICT DO NOTHING`
+     * — to keep a retry from creating a duplicate row (JOLLI-1966). Must NOT be
+     * regenerated on re-send. Mirrors cli/src/core/TelemetryBuffer.ts.
+     */
+    val eventId: String,
     val eventName: String,
     val surface: String,
     val surfaceVersion: String,

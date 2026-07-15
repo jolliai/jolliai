@@ -178,6 +178,7 @@ describe("track / initTelemetry", () => {
 		expect(e.os).toBe(process.platform);
 		expect(e.runtimeVersion).toBe(`node-${process.versions.node}`);
 		expect(e.tsIso).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+		expect(e.eventId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
 	});
 
 	it("omits sessionId when none is provided", async () => {
@@ -185,6 +186,18 @@ describe("track / initTelemetry", () => {
 		track("search_performed");
 		const [e] = await readTelemetryEvents(cwd);
 		expect(e).not.toHaveProperty("sessionId");
+	});
+
+	it("mints a distinct eventId per event (idempotency key)", async () => {
+		initTelemetry(baseInit());
+		track("search_performed");
+		track("search_performed");
+		const events = await readTelemetryEvents(cwd);
+		expect(events).toHaveLength(2);
+		expect(events[0].eventId).not.toBe(events[1].eventId);
+		for (const e of events) {
+			expect(e.eventId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+		}
 	});
 
 	it("does not emit when consent is off (config)", async () => {

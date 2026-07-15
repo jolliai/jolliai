@@ -48,6 +48,15 @@ export const MAX_BYTES = 1_000_000;
  */
 export interface TelemetryEnvelope {
 	readonly schemaVersion: number;
+	/**
+	 * Client-generated idempotency key (UUID), minted once when the event is
+	 * buffered and preserved verbatim across re-sends. Telemetry delivery is
+	 * at-least-once (a lost ack after a successful insert, or overlapping flush
+	 * triggers, re-sends buffered events), so the backend dedups on
+	 * `(event_id, ts)` — `INSERT … ON CONFLICT DO NOTHING` — to keep a retry from
+	 * creating a duplicate row (JOLLI-1966). Must NOT be regenerated on re-send.
+	 */
+	readonly eventId: string;
 	readonly eventName: TelemetryEventName;
 	readonly surface: string;
 	readonly surfaceVersion: string;
