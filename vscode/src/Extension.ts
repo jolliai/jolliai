@@ -30,6 +30,7 @@ import { exportSharedBranch } from "./services/JolliShareService.js";
 import { importSharedBranchForDisplay } from "./services/SharedBranchImporter.js";
 import { track } from "../../cli/src/core/Telemetry.js";
 import { activateExtensionTelemetry, flushExtensionTelemetry, reinitExtensionTelemetry } from "./TelemetryActivation.js";
+import { trackMemoryCommitted } from "./telemetry/UiTelemetry.js";
 import {
 	getGlobalConfigDir,
 	loadConfig,
@@ -2373,6 +2374,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
 		vscode.commands.registerCommand("jollimemory.commitAI", () => {
 			log.info("cmd", "commitAI invoked");
+			// JOLLI-1904: memory_committed engagement event (mirrors IntelliJ). Gather
+			// the counts off the click path so telemetry never delays the commit.
+			void trackMemoryCommitted({
+				getFilesCount: () => filesStore.getSnapshot().files.length,
+				getContextCount: () => plansStore.getSnapshot().plans.length,
+				listConversations: () => activeSessionsProvider.list(),
+			});
 			commitCommand.execute().catch(handleError("commitAI"));
 		}),
 

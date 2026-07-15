@@ -56,7 +56,8 @@ export const TELEMETRY_EVENTS = {
 	// ── IDE tool-window UI / engagement (IntelliJ, VS Code) ──
 	toolwindow_opened: "The memory tool window was opened. Props: view.",
 	view_switched: "Tool window view switched (current/bank/knowledge). Props: view (discriminator).",
-	memory_committed: "User committed a memory via the Commit button. Props: none.",
+	memory_committed:
+		"User committed a memory via the Commit button. Props: files_bucket (bucketed changed-file count), has_conversations (bool), context_bucket (bucketed plans/context count).",
 	memory_expanded: "A committed memory's details were expanded. Props: expanded.",
 	memory_item_opened:
 		"An item inside a memory was opened. Props: item_type (discriminator: conversation/file/context/shipped).",
