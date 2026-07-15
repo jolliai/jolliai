@@ -3540,6 +3540,8 @@ export function activate(context: vscode.ExtensionContext): void {
 				);
 				return;
 			}
+			// JOLLI-1904: user invoked branch Share (mirrors IntelliJ ActionBarPanel.handleShare).
+			track("memory_shared");
 			const readStorageResult = await bridge.createReadStorageForCurrentRepo();
 			await SummaryWebviewPanel.showWithShareModal(
 				newest,

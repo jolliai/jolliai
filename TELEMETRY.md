@@ -81,6 +81,11 @@ disk **before** they are sent.
 | `recall_prompt_copied` | A recall prompt was copied to the clipboard. Props: none. |
 | `memory_pinned` | An item was pinned. Props: kind (discriminator). |
 | `memory_unpinned` | An item was unpinned. Props: kind (discriminator). |
+| `repo_switched` | User switched the active repo in the tool window's breadcrumb. Props: is_foreign (bool). |
+| `branch_switched` | User switched the active branch in the tool window's breadcrumb. Props: is_foreign (bool). |
+| `squash_performed` | User squashed commits. Props: count_bucket (bucketed number of commits squashed). |
+| `pr_created` | User created or updated a PR from the tool window. Props: action (discriminator: created/updated). |
+| `memory_shared` | User invoked Share for a branch's memories (read-only share link). Props: none. |
 | `key_rejected` | The server rejected the API key (401/403). Props: retried, where. |
 | `reauth_completed` | Re-authentication after a rejected key finished. Props: outcome. |
 

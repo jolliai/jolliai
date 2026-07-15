@@ -136,6 +136,12 @@ class SquashAction : AnAction() {
                         val shouldPush = dialog.shouldPush()
                         if (edited.isBlank()) return@invokeLater
 
+                        // User confirmed a squash of `commits.size` commits (count bucketed for privacy).
+                        ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+                            "squash_performed",
+                            mapOf("count_bucket" to ai.jolli.jollimemory.core.telemetry.Telemetry.bucket(commits.size)),
+                        )
+
                         ApplicationManager.getApplication().executeOnPooledThread {
                             indicator.text = "Squashing commits..."
 

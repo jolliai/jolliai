@@ -3055,6 +3055,36 @@ describe("SidebarWebviewProvider", () => {
 		});
 	}
 
+	it("emits repo_switched{is_foreign} on a breadcrumb repo pick (JOLLI-1904)", () => {
+		const view = makeMockView();
+		const provider = makeSelectionProvider({
+			listRepos: vi.fn().mockReturnValue([
+				{ repoName: "workspace-repo", isCurrent: true },
+				{ repoName: "other-repo", isCurrent: false, remoteUrl: "git@x:y" },
+			]),
+			listBranches: vi.fn().mockReturnValue(["main"]),
+			currentRepoName: "workspace-repo",
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		track.mockClear();
+		view.webview.triggerMessage({ type: "selection:request", repoName: "other-repo" });
+		expect(track).toHaveBeenCalledWith("repo_switched", { is_foreign: true });
+	});
+
+	it("emits branch_switched{is_foreign} on a breadcrumb branch pick (JOLLI-1904)", () => {
+		const view = makeMockView();
+		const provider = makeSelectionProvider({
+			listRepos: vi.fn().mockReturnValue([{ repoName: "workspace-repo", isCurrent: true }]),
+			listBranches: vi.fn().mockReturnValue(["main", "feature-x"]),
+			currentRepoName: "workspace-repo",
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		track.mockClear();
+		// Different from the workspace HEAD ("main") → foreign.
+		view.webview.triggerMessage({ type: "selection:request", branchName: "feature-x" });
+		expect(track).toHaveBeenCalledWith("branch_switched", { is_foreign: true });
+	});
+
 	it("pushes selection:repos and selection:branches for the current repo on ready", async () => {
 		const view = makeMockView();
 		const listRepos = vi.fn().mockReturnValue([

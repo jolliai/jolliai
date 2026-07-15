@@ -88,6 +88,7 @@ class ActionBarPanel(
 		}
 		val prompt = "Invoke the \"jolli-recall\" skill with args \"$branch\"."
 		Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(prompt), null)
+		ai.jolli.jollimemory.core.telemetry.Telemetry.track("recall_prompt_copied")
 		Messages.showInfoMessage(
 			project,
 			"Recall prompt copied — paste it into your AI coding tool.",
@@ -186,6 +187,7 @@ class ActionBarPanel(
 					)
 					return@invokeLater
 				}
+				ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_shared")
 				val vFile = SummaryVirtualFile(newest)
 				val editors = com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project)
 					.openFile(vFile, true)

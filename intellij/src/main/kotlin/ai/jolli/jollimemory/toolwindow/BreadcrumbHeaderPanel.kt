@@ -132,6 +132,10 @@ class BreadcrumbHeaderPanel(
 	}
 
 	private fun onRepoSelected() {
+		// User picked a repo in the breadcrumb (setSelectedSilently doesn't fire onPick,
+		// so this is genuinely user-driven). is_foreign = not the workspace's own repo.
+		val isForeign = repos.find { it.repoName == repoPicker.selected }?.isCurrentRepo != true
+		ai.jolli.jollimemory.core.telemetry.Telemetry.track("repo_switched", mapOf("is_foreign" to isForeign))
 		refreshBranches()
 	}
 
@@ -158,17 +162,24 @@ class BreadcrumbHeaderPanel(
 				} else {
 					branchPicker.setSelectedSilently(branches.firstOrNull())
 				}
-				onBranchSelected()
+				// Cascade from a repo switch — repo_switched already fired, so don't
+				// also emit branch_switched (would double-count one user action).
+				onBranchSelected(trackSwitch = false)
 			}
 		}
 	}
 
-	private fun onBranchSelected() {
+	private fun onBranchSelected(trackSwitch: Boolean = true) {
 		val selectedRepo = repoPicker.selected ?: return
 		val selectedBranch = branchPicker.selected ?: return
 		val isCurrentRepo = repos.find { it.repoName == selectedRepo }?.isCurrentRepo == true
 		val isForeign = !isCurrentRepo || selectedBranch != currentBranch
 
+		// Only a genuine branch pick emits branch_switched; the repo-cascade path
+		// passes trackSwitch=false (see refreshBranches).
+		if (trackSwitch) {
+			ai.jolli.jollimemory.core.telemetry.Telemetry.track("branch_switched", mapOf("is_foreign" to isForeign))
+		}
 		onSelectionChanged(
 			if (isForeign) selectedRepo else null,
 			if (isForeign) selectedBranch else null,

@@ -22,6 +22,7 @@ import * as nodePath from "node:path";
 import * as vscode from "vscode";
 import { isPathInside } from "../../../cli/src/core/PathUtils.js";
 import { wrapWithMarkers } from "../../../cli/src/core/PrDescription.js";
+import { track } from "../../../cli/src/core/Telemetry.js";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import { pushBranchMemoriesToSpace } from "../services/LiveShareController.js";
 import { ShareBindingError } from "../services/JolliPushOrchestrator.js";
@@ -275,6 +276,8 @@ export class CreatePrWebviewPanel {
 					// Same webview message for both modes; the host is the source of
 					// truth for whether an open PR exists. Update pushes + syncs the
 					// draft into the existing PR; otherwise create a fresh one.
+					// Capture create-vs-update before the call (the vm may be rebuilt after).
+					const prAction = this.vm.existingPr ? "updated" : "created";
 					const outcome = this.vm.existingPr
 						? await handleUpdatePrWithPush(title, body, this.workspaceRoot, post, this.vm.branch)
 						: await handleCreatePr(title, body, this.workspaceRoot, post, this.vm.branch);
@@ -282,6 +285,8 @@ export class CreatePrWebviewPanel {
 					// prCreateBlockedCrossBranch — the webview has re-enabled its buttons
 					// and stays put (edit form kept open for a retry). Nothing more to do.
 					if (outcome === "succeeded") {
+						// JOLLI-1904: mirrors IntelliJ CreatePrPanel — pr_created{action}.
+						track("pr_created", { action: prAction });
 						// The full operation isn't done at PR-live: when signed in we then
 						// share the branch's memories to the user's Jolli Space (the pane's
 						// share notice promises this). The handler's mid-flight prStatus is
