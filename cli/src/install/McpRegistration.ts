@@ -20,30 +20,51 @@ interface McpServerEntry {
 }
 
 /**
- * The `command`/`args` an MCP host should spawn to start the server.
- *
- * The MCP host spawns `command` DIRECTLY (no shell), so the platform matters:
+ * The platform-correct `{ command, args }` to launch the jolli CLI with the given
+ * subcommand `args`. The launcher spawns `command` DIRECTLY (no shell), so the
+ * platform matters:
  * - POSIX: the `run-cli` dispatch script has a `#!/bin/bash` shebang and is +x,
  *   so a direct spawn honors it — and we keep the dist-path indirection (a
  *   version bump that moves the dist still resolves at spawn time).
  * - Windows: `run-cli` is an extension-less bash script; a direct spawn is
  *   ENOENT (no shebang support, not on PATHEXT). So we spawn `node` (already a
  *   hard requirement for the hooks, hence on PATH) on the resolved `Cli.js`.
- *   This bakes in an absolute path, but `registerMcpInClaude` re-runs on every
- *   install/activate, so a moved dist is re-resolved then.
+ *   This bakes in an absolute path, but callers re-run on every install/activate,
+ *   so a moved dist is re-resolved then.
  *
  *   If the dist can't be resolved yet on Windows there is no launchable command:
  *   `run-cli` is returned only as a last resort and is itself NOT launchable on
  *   win32 (same ENOENT) — i.e. it does NOT "avoid a broken entry", it just defers
- *   the breakage. This branch is effectively unreachable on the normal install
- *   path: `Installer.install()` writes this source's dist-path entry (and aborts
- *   on failure) BEFORE any MCP registration runs, so `resolveCliJs` resolves by
- *   then. If it were ever hit, the host would surface a spawn error (not silent)
- *   and the next install/activate would re-register with the real `node Cli.js`.
+ *   the breakage. On the normal install path `Installer.install()` writes this
+ *   source's dist-path entry (aborting on failure) BEFORE any registration runs,
+ *   so `resolveCliJs` resolves by then.
  */
+export function cliInvocation(
+	platform: NodeJS.Platform,
+	runCli: string,
+	cliJs: string | undefined,
+	args: string[],
+): McpServerEntry {
+	if (platform === "win32" && cliJs) return { command: "node", args: [cliJs, ...args] };
+	return { command: runCli, args: [...args] };
+}
+
+/** The `command`/`args` an MCP host should spawn to start the server (`<cli> mcp`). */
 export function mcpServerEntry(platform: NodeJS.Platform, runCli: string, cliJs: string | undefined): McpServerEntry {
-	if (platform === "win32" && cliJs) return { command: "node", args: [cliJs, "mcp"] };
-	return { command: runCli, args: ["mcp"] };
+	return cliInvocation(platform, runCli, cliJs, ["mcp"]);
+}
+
+/**
+ * Resolves the `{ command, args }` to spawn the jolli CLI with `args`, via the
+ * machine-global `run-cli` indirection host registration already writes (POSIX)
+ * or `node <Cli.js>` (win32). Deliberately NEVER a bare `jolli` on PATH — under
+ * GUI-launched hosts and the VS Code bundle (which by design needs no global CLI
+ * install) a bare-PATH spawn misfires. `globalDir` is injectable for tests.
+ */
+export function resolveCliInvocation(args: string[], globalDir: string = getGlobalConfigDir()): McpServerEntry {
+	const runCli = join(globalDir, "run-cli");
+	const cliJs = process.platform === "win32" ? resolveCliJs(globalDir) : undefined;
+	return cliInvocation(process.platform, runCli, cliJs, args);
 }
 
 /**

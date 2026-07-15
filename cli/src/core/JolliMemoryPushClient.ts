@@ -19,6 +19,7 @@
 import { createLogger } from "../Logger.js";
 import { JOLLI_CLIENT_HEADER } from "./ClientHeader.js";
 import { deriveJolliEnvKey, type JolliApiKeyMeta, parseBaseUrl, parseJolliApiKey } from "./JolliApiUtils.js";
+import type { WorkflowSummary } from "./LocalRunEligibility.js";
 import { loadConfig } from "./SessionTracker.js";
 import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "./TraceContext.js";
 
@@ -725,6 +726,45 @@ export class JolliMemoryPushClient {
 		return json;
 	}
 
+	/**
+	 * Fetches the candidate local-run workflows by invoking the backend-defined
+	 * `list_workflows` platform tool through the manifest path (there is no bespoke
+	 * REST endpoint). Best-effort by contract, mirroring {@link fetchManifest}'s
+	 * posture: EVERY degrade — platform tools disabled or the tool absent from the
+	 * manifest (both yield an empty manifest so the tool is not found), a failed
+	 * invocation (non-2xx, network / abort / timeout, a non-JSON body, or an
+	 * outdated client), or a malformed workflow body — resolves to `[]` and NEVER
+	 * throws. Because it rides the platform-tool path, an empty result is the
+	 * normal state when the surface is off or the backend does not yet serve the
+	 * tool. Individual malformed workflow entries are dropped rather than failing
+	 * the whole list. Accepts either a `{ workflows: [...] }` envelope or a bare
+	 * array.
+	 *
+	 * Deliberately asymmetric to {@link invokePlatformTool} (which throws on a
+	 * failed invocation): the eligibility path treats "can't list workflows" as
+	 * "nothing to offer", never as an error, so the try/catch here swallows the
+	 * invocation throw.
+	 */
+	async listWorkflows(): Promise<WorkflowSummary[]> {
+		// fetchManifest is itself best-effort ([] on every failure, never throws),
+		// so an unauthenticated / disabled / unreachable backend simply yields no
+		// `list_workflows` entry here.
+		const manifest = await this.fetchManifest();
+		const tool = manifest.find((entry) => entry.name === LIST_WORKFLOWS_TOOL_NAME);
+		if (!tool) {
+			return [];
+		}
+		try {
+			const raw = await this.invokePlatformTool(tool, {});
+			return parseWorkflowList(raw);
+		} catch {
+			// A failed invocation (non-2xx / network / abort / malformed body /
+			// ClientOutdated) degrades to "no workflows" — unlike a direct platform
+			// tool call, the eligibility path must never surface an error.
+			return [];
+		}
+	}
+
 	private async resolveAuth(): Promise<{
 		apiKey: string;
 		baseUrl: string;
@@ -971,6 +1011,96 @@ function resolveToolEndpoint(tool: PlatformToolManifestEntry, origin: string): {
 	} catch {
 		return fallback;
 	}
+}
+
+/** Backend tool name that lists the candidate local-run workflows. */
+const LIST_WORKFLOWS_TOOL_NAME = "list_workflows";
+
+/**
+ * Parses the `list_workflows` invocation body into validated {@link WorkflowSummary}
+ * entries, mirroring the defensive manifest parse: a `{ workflows: [...] }`
+ * envelope or a bare array is accepted, and any entry that is not a well-formed
+ * workflow (no usable `id`/`slug`, or a `destination` lacking a string
+ * `syncProtocol`, a boolean `autoApply`, or a non-empty string `jrn`) is dropped
+ * rather than failing the whole list.
+ */
+function parseWorkflowList(json: unknown): WorkflowSummary[] {
+	return extractWorkflowArray(json)
+		.map(toWorkflowSummary)
+		.filter((workflow): workflow is WorkflowSummary => workflow !== null);
+}
+
+/** Pulls the workflow array out of the body — `{ workflows: [...] }` or a bare array. */
+function extractWorkflowArray(json: unknown): unknown[] {
+	if (Array.isArray(json)) {
+		return json;
+	}
+	if (json !== null && typeof json === "object") {
+		const workflows = (json as { workflows?: unknown }).workflows;
+		if (Array.isArray(workflows)) {
+			return workflows;
+		}
+	}
+	return [];
+}
+
+/**
+ * Validates one raw workflow entry into a {@link WorkflowSummary}, or `null` if it
+ * is malformed. The identifier is read from `id` (a finite number — the backend's
+ * shape — or a non-empty string), falling back to a non-empty `slug`; the
+ * `destination` must carry a string `syncProtocol`, a boolean `autoApply`, and a
+ * non-empty string `jrn`. A non-empty string `name` is carried through for display
+ * (advisory only); any other extra fields (type, sources, …) are ignored.
+ */
+function toWorkflowSummary(value: unknown): WorkflowSummary | null {
+	if (typeof value !== "object" || value === null) {
+		return null;
+	}
+	const { id, slug, name, destination } = value as {
+		id?: unknown;
+		slug?: unknown;
+		name?: unknown;
+		destination?: unknown;
+	};
+	const identifier = resolveWorkflowId(id, slug);
+	if (identifier === null) {
+		return null;
+	}
+	if (typeof destination !== "object" || destination === null || Array.isArray(destination)) {
+		return null;
+	}
+	const { syncProtocol, autoApply, jrn } = destination as {
+		syncProtocol?: unknown;
+		autoApply?: unknown;
+		jrn?: unknown;
+	};
+	if (typeof syncProtocol !== "string" || typeof autoApply !== "boolean") {
+		return null;
+	}
+	if (typeof jrn !== "string" || jrn.trim() === "") {
+		return null;
+	}
+	const displayName = typeof name === "string" && name.trim() !== "" ? name : undefined;
+	return { id: identifier, name: displayName, destination: { syncProtocol, autoApply, jrn } };
+}
+
+/**
+ * The workflow identifier for `start_local_run`: a finite numeric `id` (the
+ * backend's shape — carried as a number so it stays usable as the integer the
+ * tool expects), else a non-empty string `id`, else a non-empty `slug`, else
+ * `null` (malformed).
+ */
+function resolveWorkflowId(id: unknown, slug: unknown): string | number | null {
+	if (typeof id === "number" && Number.isFinite(id)) {
+		return id;
+	}
+	if (typeof id === "string" && id.trim() !== "") {
+		return id;
+	}
+	if (typeof slug === "string" && slug.trim() !== "") {
+		return slug;
+	}
+	return null;
 }
 
 /** Pulls the tool array out of a manifest body — `{ tools: [...] }` or a bare array. */

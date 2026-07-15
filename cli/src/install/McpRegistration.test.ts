@@ -2,7 +2,14 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mcpServerEntry, registerMcpInClaude, removeMcpFromClaude, resolveCliJs } from "./McpRegistration.js";
+import {
+	cliInvocation,
+	mcpServerEntry,
+	registerMcpInClaude,
+	removeMcpFromClaude,
+	resolveCliInvocation,
+	resolveCliJs,
+} from "./McpRegistration.js";
 
 let dir: string;
 beforeEach(async () => {
@@ -82,6 +89,59 @@ describe("mcpServerEntry", () => {
 		// path (installDistPath runs, and aborts on failure, before registration),
 		// and re-registration replaces it with `node Cli.js` once a dist is known.
 		expect(mcpServerEntry("win32", runCli, undefined)).toEqual({ command: runCli, args: ["mcp"] });
+	});
+});
+
+describe("cliInvocation", () => {
+	const runCli = "/home/u/.jolli/jollimemory/run-cli";
+	const cliJs = "/abs/dist/Cli.js";
+
+	it("spawns the run-cli wrapper with the given args on POSIX", () => {
+		expect(cliInvocation("darwin", runCli, cliJs, ["space", "clones", "--json"])).toEqual({
+			command: runCli,
+			args: ["space", "clones", "--json"],
+		});
+		expect(cliInvocation("linux", runCli, cliJs, ["mcp"])).toEqual({ command: runCli, args: ["mcp"] });
+	});
+
+	it("spawns node on the resolved Cli.js with the given args on Windows", () => {
+		expect(cliInvocation("win32", runCli, cliJs, ["space", "clones", "--json"])).toEqual({
+			command: "node",
+			args: [cliJs, "space", "clones", "--json"],
+		});
+	});
+
+	it("falls back to the run-cli last resort on Windows when Cli.js can't be resolved", () => {
+		expect(cliInvocation("win32", runCli, undefined, ["mcp"])).toEqual({ command: runCli, args: ["mcp"] });
+	});
+});
+
+describe("resolveCliInvocation", () => {
+	it("resolves the run-cli indirection (never a bare `jolli`) with the given args on the host platform", () => {
+		const globalDir = "/home/u/.jolli/jollimemory";
+		const entry = resolveCliInvocation(["space", "clones", "--json"], globalDir);
+		expect(entry.args).toEqual(["space", "clones", "--json"]);
+		expect(entry.command).not.toBe("jolli");
+		// On POSIX hosts the run-cli wrapper is spawned directly; on win32 CI it is
+		// `node <Cli.js>` (or the run-cli last resort with no dist).
+		expect(entry.command === "node" || entry.command.endsWith("run-cli")).toBe(true);
+	});
+
+	it("consults resolveCliJs on Windows (no dist ⇒ run-cli last resort)", async () => {
+		const globalDir = await mkdtemp(join(tmpdir(), "jolli-global-"));
+		const original = process.platform;
+		Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+		try {
+			// No dist-paths dir under globalDir ⇒ resolveCliJs returns undefined ⇒ the
+			// win32 branch falls back to the run-cli path (exercises the win32 ternary).
+			expect(resolveCliInvocation(["mcp"], globalDir)).toEqual({
+				command: join(globalDir, "run-cli"),
+				args: ["mcp"],
+			});
+		} finally {
+			Object.defineProperty(process, "platform", { value: original, configurable: true });
+			await rm(globalDir, { recursive: true, force: true });
+		}
 	});
 });
 

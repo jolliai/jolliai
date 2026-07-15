@@ -119,6 +119,7 @@ const SKILLS: ReadonlyArray<SkillRegistration> = [
 	{ name: "jolli-recall", build: buildRecallSkillTemplate },
 	{ name: "jolli-search", build: buildSearchSkillTemplate },
 	{ name: "jolli-pr", build: buildPrSkillTemplate },
+	{ name: "jolli-local-run", build: buildLocalRunSkillTemplate },
 	{ name: "jolli", build: buildJolliMenuSkillTemplate },
 ];
 
@@ -241,6 +242,32 @@ async function upsertSkill(skillsDir: string, name: string, content: string): Pr
 // ─── Skill Templates ────────────────────────────────────────────────────────
 
 /**
+ * The Windows shell-prerequisite block shared by every shell-backed skill. It
+ * pins Git Bash on Windows because the `run-cli` entry script is written via
+ * Windows Node's `os.homedir()` to `%USERPROFILE%\\.jolli\\jollimemory\\run-cli`,
+ * and only Git Bash's `$HOME` aligns with `%USERPROFILE%` — PowerShell / WSL bash
+ * see a different home and won't find the script. Reused verbatim by both the
+ * arg-carrying here-doc skills ({@link heredocInvocation}) and the local-run
+ * recipe (fixed `run-cli` subcommands, no here-doc), so the guidance lives in one
+ * place instead of drifting per skill.
+ */
+const SHELL_PREREQUISITE_BLOCK = `### Shell prerequisite
+
+This block requires a POSIX bash shell. On Linux/macOS the system bash works.
+**On Windows, use Git Bash** (the bash bundled with Git for Windows). Other
+Windows "bash" options — \`C:\\Windows\\System32\\bash.exe\`, the WindowsApps
+alias, or any WSL bash — see a separate Linux home directory and will not
+find the Jolli entry script that lives under \`%USERPROFILE%\`.
+
+If Git Bash is not available on Windows, STOP and tell the user:
+"Jolli skill needs Git Bash on Windows. Install Git for Windows from
+https://git-scm.com/download/win and retry."
+
+Do NOT fall back to \`npm run\`, \`npx\`, \`node\` directly, PowerShell-native
+commands, WSL bash, or any workspace-local script — those bypass the
+security recipe and the dist resolver and will not produce valid output.`;
+
+/**
  * Shared Step-1 preamble — instructs the LLM to invoke the CLI via a here-doc
  * with a freshly-generated 16-char hex delimiter, and to STOP if the host
  * can't support that recipe rather than fall back to an `argv` interpolation
@@ -257,21 +284,7 @@ async function upsertSkill(skillsDir: string, name: string, content: string): Pr
  * prompt-injection payloads useless.
  */
 function heredocInvocation(subcommand: "recall" | "search" | "pr-description", flagSuffix: string): string {
-	return `### Shell prerequisite
-
-This block requires a POSIX bash shell. On Linux/macOS the system bash works.
-**On Windows, use Git Bash** (the bash bundled with Git for Windows). Other
-Windows "bash" options — \`C:\\Windows\\System32\\bash.exe\`, the WindowsApps
-alias, or any WSL bash — see a separate Linux home directory and will not
-find the Jolli entry script that lives under \`%USERPROFILE%\`.
-
-If Git Bash is not available on Windows, STOP and tell the user:
-"Jolli skill needs Git Bash on Windows. Install Git for Windows from
-https://git-scm.com/download/win and retry."
-
-Do NOT fall back to \`npm run\`, \`npx\`, \`node\` directly, PowerShell-native
-commands, WSL bash, or any workspace-local script — those bypass the
-security recipe and the dist resolver and will not produce valid output.
+	return `${SHELL_PREREQUISITE_BLOCK}
 
 ### Invocation
 
@@ -968,6 +981,154 @@ different phrasing. Do NOT mention BM25 or index internals.
 }
 
 /**
+ * Local-workflow-run recipe skill — walks the calling agent through running a
+ * Jolli workflow locally: discover the runnable workflows via the eligibility CLI
+ * helper, start the run and drive the destination clone through the `docs`
+ * (space-cli) commands, gate on a human review with lease heartbeats bracketing
+ * the blocking approval, then publish + complete (or abandon). Prefers the Jolli
+ * MCP platform tools for the run lifecycle; the eligibility check and the git
+ * operations go through the `jolli` CLI (run-cli entry script), matching the
+ * sibling skills. Byte-identical across every {@link SKILL_TARGETS} entry,
+ * spec-compliant frontmatter only.
+ */
+export function buildLocalRunSkillTemplate(): string {
+	return `---
+name: jolli-local-run
+description: Run a Jolli workflow locally — your own agent executes the workflow's recipe (no Jolli LLM budget) and its file writes land in a git-backed Jolli Space via a branch and pull request that space-cli opens on this machine. Use when the user wants to run a Jolli workflow locally.
+metadata:
+  version: "${SKILL_VERSION}"
+  vendor: "jolli.ai"
+---
+
+# Jolli Local Run
+
+Run a Jolli **workflow** locally: *your* agent executes the workflow's recipe on
+this machine (so it spends no Jolli LLM budget), Jolli supplies the recipe and
+tracks the run, and the workflow's file writes are published to a git-backed
+Jolli Space through an agent branch + pull request that space-cli commits and
+pushes locally.
+
+A workflow can be run locally only when its destination Space is **git-backed**
+AND already **cloned** on this machine. Before starting, the user is told whether
+the resulting PR will **auto-merge** or **open for team review**.
+
+Drive the steps below in order. Prefer the Jolli MCP tools for the run lifecycle;
+the eligibility check and the git operations go through the \`jolli\` CLI (via the
+run-cli entry script the sibling skills also use).
+
+${SHELL_PREREQUISITE_BLOCK}
+
+## Step 1 — discover the runnable workflows
+
+Run the eligibility helper and read its JSON:
+
+\`\`\`bash
+"$HOME/.jolli/jollimemory/run-cli" local-run-workflows
+\`\`\`
+
+- \`{ "type": "workflows", "workflows": [ { "id": 7, "name": "Impact Analysis", "autoMerges": true|false }, ... ] }\`
+  — the workflows runnable right now. **Offer only these.** Present each one to
+  the user by its \`name\` (fall back to the \`id\` when \`name\` is absent), and tell
+  them up front whether it will **auto-merge** the PR (\`autoMerges: true\`) or
+  **open the PR for team review** (\`autoMerges: false\`). If the array is empty,
+  tell the user there are no locally-runnable workflows (a workflow's destination
+  must be a git-backed, already-cloned Space) and stop.
+- \`{ "type": "space_cli_required", ... }\` — the space-cli plugin is missing. Tell
+  the user to install it and stop:
+
+  \`\`\`bash
+  npm i -g @jolli.ai/cli @jolli.ai/space-cli
+  \`\`\`
+
+- \`{ "type": "error", "message": "..." }\` — report the message and stop.
+
+Have the user pick one workflow — list them by \`name\` (use your host's
+interactive single-select tool if it has one — e.g. AskUserQuestion on Claude
+Code — otherwise list them as text). Keep the chosen workflow's \`id\` for Step 2.
+
+## Step 2 — start the run
+
+Call the \`start_local_run\` tool (on Claude Code
+\`mcp__jollimemory__start_local_run\`) with the chosen workflow's id, passed
+**exactly as the helper returned it** — the backend's id is a number, so it stays
+an unquoted number: \`{ "id": <workflow id> }\` (a string id/slug stays quoted).
+Capture from its result:
+
+- \`runId\` — the run handle for every later call.
+- \`plan\` — the recipe steps your agent will execute.
+- \`writeTarget\` — carries the server-derived \`workBranch\`, the destination Space,
+  and the destination folder.
+
+## Step 3 — check out the agent branch
+
+Pull the destination clone onto the server-derived work branch:
+
+\`\`\`bash
+"$HOME/.jolli/jollimemory/run-cli" docs pull --branch <writeTarget.workBranch>
+\`\`\`
+
+**Always \`--branch\`. NEVER \`--agent\`.** The \`--agent\` mode runs a destructive
+\`git clean -fdx\` that wipes untracked files; \`--branch\` checks out the
+server-derived branch without cleaning. Do not substitute \`--agent\` under any
+circumstances. \`docs pull\` fetches the destination write token internally — you
+do **not** fetch or handle any token yourself.
+
+## Step 4 — write the workflow's output
+
+Execute the workflow's \`plan\` from Step 2, writing the output files under the
+destination folder from \`writeTarget\`, inside the checked-out clone.
+
+## Step 5 — local review gate (with heartbeats)
+
+Nothing is committed or pushed until the human explicitly approves.
+
+1. Send a heartbeat so the run's lease stays alive while the human reviews: call
+   \`report_local_run_progress\` (on Claude Code
+   \`mcp__jollimemory__report_local_run_progress\`) with \`{ "runId": "<runId>" }\`.
+2. Show the working-tree diff of what the workflow wrote, and ask the user to
+   review, edit if needed, and **explicitly approve** (or cancel).
+3. When the user answers, send \`report_local_run_progress\` again.
+
+Send the heartbeat **immediately before** asking and **immediately after** the
+answer. Your turn is blocked while you wait for the human, so you cannot
+heartbeat *during* the review — bracketing the approval prompt keeps the lease
+fresh across the wait.
+
+## Step 6 — on approval: publish and complete
+
+1. Publish the branch as a pull request and capture the machine-readable result:
+
+   \`\`\`bash
+   "$HOME/.jolli/jollimemory/run-cli" docs publish --json
+   \`\`\`
+
+   Read \`prNumber\` and \`prUrl\` from its JSON output.
+2. Call \`complete_local_run\` (on Claude Code
+   \`mcp__jollimemory__complete_local_run\`) with
+   \`{ "runId": "<runId>", "prNumber": <prNumber>, "prUrl": "<prUrl>" }\`.
+3. Read \`autoMerges\` from its result and tell the user which happened: **"PR
+   auto-merged"** (\`autoMerges: true\`) or **"PR left open for team review"**
+   (\`autoMerges: false\`).
+
+## Step 7 — on cancel: abandon
+
+If the user cancels at the review gate (or you must abort), release the run: call
+\`abandon_local_run\` (on Claude Code \`mcp__jollimemory__abandon_local_run\`) with
+\`{ "runId": "<runId>" }\`.
+
+## If space-cli is missing at any point
+
+Any \`docs\` command that prints an install hint (or the eligibility helper's
+\`space_cli_required\` result) means the space-cli plugin is not installed. Tell the
+user to install it and stop:
+
+\`\`\`bash
+npm i -g @jolli.ai/cli @jolli.ai/space-cli
+\`\`\`
+`;
+}
+
+/**
  * The `jolli` umbrella-menu skill — surfaces as a bare `/jolli` and acts as the
  * single friendly front door over the sibling Jolli skills plus whatever
  * `mcp__jollimemory__*` tools are registered in the session. It only steers the
@@ -989,7 +1150,7 @@ different phrasing. Do NOT mention BM25 or index internals.
 export function buildJolliMenuSkillTemplate(): string {
 	return `---
 name: jolli
-description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, pr) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
+description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, pr, local-run) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
   revision: 1
@@ -1018,6 +1179,9 @@ Assemble ONE combined list of actions from two sources.
   (decisions, topics, files). Route by invoking the \`jolli-search\` skill.
 - **jolli-pr** — Create or update a pull request using a Jolli Memory-generated
   description. Route by invoking the \`jolli-pr\` skill.
+- **jolli-local-run** — Run a Jolli workflow locally (your agent executes the
+  recipe; the writes land in a git-backed Space via a branch + PR). Route by
+  invoking the \`jolli-local-run\` skill.
 
 Route a local choice by invoking that skill through your host's skill-invocation
 mechanism (for example, the Skill tool in Claude Code).

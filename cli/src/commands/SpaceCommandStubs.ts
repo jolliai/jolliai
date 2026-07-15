@@ -5,13 +5,13 @@
  * Why this exists
  * ----------------
  *
- * The space / sync / source / impact / agent commands live in the
+ * The space / sync / source / impact / docs / agent commands live in the
  * `@jolli.ai/space-cli` plugin package. The host CLI discovers it through
  * `PluginLoader` (allow-listed by `jolliPluginId`, not by name). When the
  * plugin is installed alongside the host CLI, its `register()` adds the real
- * `init` / `space` / `source` / `impact` / `sync` / `agent` commands. When it
- * isn't installed, `PluginLoader` falls back to registering the stubs in this
- * file so:
+ * `init` / `space` / `source` / `impact` / `sync` / `docs` / `agent` commands.
+ * When it isn't installed, `PluginLoader` falls back to registering the stubs
+ * in this file so:
  *
  *   - `jolli --help` still shows the Space commands under the "Jolli Space"
  *     section, so users discover the feature exists.
@@ -50,6 +50,7 @@ const SPACE_COMMAND_STUBS: ReadonlyArray<StubSpec> = [
 	{ name: "source", description: "Manage source repositories for impact analysis" },
 	{ name: "impact", description: "Documentation impact analysis tools" },
 	{ name: "sync", description: "Sync markdown files with the server" },
+	{ name: "docs", description: "Pull and publish documents for a git-backed space" },
 	{ name: "agent", description: "Interactive LLM agent with local tool execution" },
 ];
 
