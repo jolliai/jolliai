@@ -51,5 +51,9 @@ object GeminiAfterAgentHook {
 
         SessionTracker.saveSession(sessionInfo, cwd)
         log.info("Gemini session saved: %s", hookInput.session_id)
+
+        // JOLLI-1954: flush the shared telemetry buffer on every agent turn end
+        // (mirrors the Claude Stop hook). flushNow re-gates consent, never throws.
+        ai.jolli.jollimemory.core.telemetry.TelemetryActivation.flushNow(cwd)
     }
 }

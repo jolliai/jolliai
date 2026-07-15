@@ -68,6 +68,12 @@ object StopHook {
         } catch (t: Throwable) {
             log.error("discoverFromTranscript crashed: %s: %s", t.javaClass.name, t.message)
         }
+
+        // JOLLI-1954: the Stop hook fires on every agent turn end — far more often
+        // than commits — so drain the shared telemetry buffer here too. Covers the
+        // "using the agent but not committing" case. flushNow re-gates consent and
+        // never throws. Mirrors cli/src/hooks/StopHook.ts.
+        ai.jolli.jollimemory.core.telemetry.TelemetryActivation.flushNow(cwd)
     }
 
     /**

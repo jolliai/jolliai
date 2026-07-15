@@ -21,6 +21,7 @@
 import { resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { saveSession } from "../core/SessionTracker.js";
+import { flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { ClaudeHookInput, SessionInfo } from "../Types.js";
 import { readStdin } from "./HookUtils.js";
@@ -99,6 +100,11 @@ export async function handleGeminiAfterAgentHook(): Promise<void> {
 	} catch (error: unknown) {
 		log.error("Failed to save session: %s", (error as Error).message);
 	}
+
+	// JOLLI-1954: flush the shared telemetry buffer on every agent turn end
+	// (mirrors the Claude Stop hook). Awaited so the short-lived hook process
+	// doesn't exit before the POST; best-effort, re-gates consent, never throws.
+	await flushTelemetryNow(projectDir);
 
 	// Always write JSON response — Gemini CLI requires it
 	writeStdout();
