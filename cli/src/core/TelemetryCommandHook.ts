@@ -37,23 +37,48 @@ export function commandPath(cmd: Command): string {
 	return parts.join(" ");
 }
 
+/**
+ * The command that started but hasn't completed. `preAction` sets it; the
+ * `postAction` success path clears it. Commander skips `postAction` when the
+ * action throws, so a still-set `pending` after `parseAsync` rejects means the
+ * command FAILED — `trackCommandFailureIfPending()` records that. A CLI runs one
+ * command per process, so a single slot suffices.
+ */
+let pending: { readonly command: string; readonly start: number } | null = null;
+
 /** Register the `command_invoked` auto-emit hooks on the root program. */
 export function installCommandTelemetryHooks(program: Command): void {
-	const starts = new WeakMap<Command, number>();
 	program.hook("preAction", (_thisCommand, actionCommand) => {
-		starts.set(actionCommand, Date.now());
+		pending = { command: commandPath(actionCommand), start: Date.now() };
 	});
 	program.hook("postAction", (_thisCommand, actionCommand) => {
+		const start = pending?.start;
+		pending = null; // success — recorded below (or intentionally skipped for mcp)
 		// `mcp` is emitted per tool call by the MCP server's CallTool handler
 		// (JOLLI-1959, tagged with `tool`). The generic session-level event here
 		// would be a coarse duplicate (`command:"mcp"` with no tool, once at stdio
 		// disconnect), so skip it — the CallTool handler is the source of truth.
 		if (commandPath(actionCommand) === "mcp") return;
-		const start = starts.get(actionCommand);
 		track("command_invoked", {
 			command: commandPath(actionCommand),
 			duration_ms: start === undefined ? undefined : Date.now() - start,
 			ok: true,
 		});
 	});
+}
+
+/**
+ * Emit a failed `command_invoked{ ok: false }` when an action started but never
+ * completed. Commander skips `postAction` on a thrown action, so this is the
+ * only place a command *failure* is recorded (JOLLI-1960) — otherwise every
+ * `command_invoked` would report `ok: true` and the failure would be invisible.
+ * Call from the CLI's top-level catch. No-op when the last command succeeded,
+ * none ran, or it was `mcp` (tracked per tool call by the MCP server). Never
+ * throws — telemetry must not mask the original command error.
+ */
+export function trackCommandFailureIfPending(): void {
+	const p = pending;
+	pending = null;
+	if (!p || p.command === "mcp") return;
+	track("command_invoked", { command: p.command, duration_ms: Date.now() - p.start, ok: false });
 }
