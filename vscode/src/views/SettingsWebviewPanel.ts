@@ -635,6 +635,13 @@ export class SettingsWebviewPanel {
 
 		await saveConfigScoped(update, configDir);
 
+		// JOLLI-1904 (funnel): record an explicit AI-provider change, not every
+		// settings save. Mirrors IntelliJ ai_provider_selected { provider };
+		// surface=vscode is auto-injected.
+		if (settings.aiProvider !== this.resolveProvider(currentConfig)) {
+			track("ai_provider_selected", { provider: settings.aiProvider });
+		}
+
 		// Act on a global-instructions transition in EITHER direction: the
 		// undecided/disabled -> enabled transition writes the block; the
 		// enabled -> off transition removes it (the checkbox's "off" must

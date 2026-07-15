@@ -25,6 +25,8 @@ const { getDeviceLabel } = vi.hoisted(() => ({
 	getDeviceLabel: vi.fn(),
 }));
 
+const { track } = vi.hoisted(() => ({ track: vi.fn() }));
+
 const {
 	executeCommand,
 	openExternal,
@@ -129,6 +131,8 @@ vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	loadConfig,
 }));
 
+vi.mock("../../../cli/src/core/Telemetry.js", () => ({ track }));
+
 vi.mock("../util/Logger.js", () => ({
 	log: { info, warn, error: logError },
 }));
@@ -206,11 +210,24 @@ describe("AuthService", () => {
 				jolliApiKey: "sk-jol-test",
 			});
 			expect(saveAuthCredentials).toHaveBeenCalledTimes(1);
+			// JOLLI-1904 funnel: conversion event, api_key_minted=true.
+			expect(track).toHaveBeenCalledWith("signin_completed", { api_key_minted: true });
 			expect(executeCommand).toHaveBeenCalledWith(
 				"setContext",
 				"jollimemory.signedIn",
 				true,
 			);
+		});
+
+		it("emits signin_completed with api_key_minted=false when no key is provisioned", async () => {
+			exchangeCliCode.mockResolvedValueOnce({ token: "test-token" });
+			const state = await primeStateViaSignIn(service);
+			const uri = makeUri("/auth-callback", `code=abc123&state=${state}`);
+
+			const result = await service.handleAuthCallback(uri as never);
+
+			expect(result).toEqual({ success: true });
+			expect(track).toHaveBeenCalledWith("signin_completed", { api_key_minted: false });
 		});
 
 		it("persists the minted key's tenant as jolliUrl, not the sign-in origin", async () => {
@@ -731,6 +748,8 @@ describe("AuthService", () => {
 			// clearAuthCredentials removes authToken AND jolliApiKey in a single write.
 			expect(clearAuthCredentials).toHaveBeenCalledTimes(1);
 			expect(saveAuthCredentials).not.toHaveBeenCalled();
+			// JOLLI-1904 funnel.
+			expect(track).toHaveBeenCalledWith("signed_out");
 		});
 
 		it("should set signedIn context key to false", async () => {
@@ -750,6 +769,8 @@ describe("AuthService", () => {
 		it("should open browser with correct login URL", async () => {
 			await service.openSignInPage();
 
+			// JOLLI-1904 funnel: sign-in initiated.
+			expect(track).toHaveBeenCalledWith("signin_started", { trigger: "vscode" });
 			expect(openExternal).toHaveBeenCalledTimes(1);
 			expect(uriParse).toHaveBeenCalledTimes(1);
 			const parsed = uriParse.mock.calls[0]?.[0];
