@@ -14,7 +14,7 @@
  * CLI core functions are imported from the bundled `cli/src/**`.
  */
 import { loadConfig, saveConfig } from "../../cli/src/core/SessionTracker.js";
-import { shutdownTelemetry } from "../../cli/src/core/Telemetry.js";
+import { shutdownTelemetry, track } from "../../cli/src/core/Telemetry.js";
 import { shouldShowTelemetryNotice } from "../../cli/src/core/TelemetryConsent.js";
 import { bootstrapTelemetry, flushTelemetryNow } from "../../cli/src/core/TelemetryStartup.js";
 
@@ -37,6 +37,11 @@ export interface TelemetryActivationDeps {
 /** Bootstrap telemetry for the extension and show the first-run notice once. Never throws. */
 export async function activateExtensionTelemetry(cwd: string, deps: TelemetryActivationDeps): Promise<void> {
 	await bootstrapTelemetry({ cwd, platformDisabled: deps.platformDisabled });
+	// JOLLI-1963: count new + upgrade installs. Fires once per extension activation
+	// (a real session), carrying `surface_version` in the envelope; the metric dedups
+	// on first-seen (install_id, surface_version). No-op when telemetry is off — track
+	// re-gates consent. Unlike `app_installed` (once per machine), this catches upgrades.
+	track("client_activated");
 	try {
 		const config = await loadConfig();
 		if (shouldShowTelemetryNotice({ config, platformDisabled: deps.platformDisabled })) {

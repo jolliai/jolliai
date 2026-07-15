@@ -70,6 +70,12 @@ class JolliMemoryStartupActivity : ProjectActivity {
         // by prior sessions/hooks, and show the loud first-run notice once.
         try {
             val showNotice = ai.jolli.jollimemory.core.telemetry.TelemetryActivation.bootstrap(basePath)
+            // JOLLI-1963: count new + upgrade installs. Fires once per project open
+            // (a real session), carrying surface_version; first-seen (install_id,
+            // surface_version) ≈ new + upgrade installs. Emitted here (not in
+            // TelemetryActivation.bootstrap, which the git hooks also call) so hook
+            // runs don't flood it. No-op when telemetry is off.
+            ai.jolli.jollimemory.core.telemetry.Telemetry.track("client_activated")
             ai.jolli.jollimemory.core.telemetry.TelemetryActivation.flushNow(basePath)
             if (showNotice) {
                 ai.jolli.jollimemory.core.telemetry.TelemetrySharedConfig.markNoticeShown()

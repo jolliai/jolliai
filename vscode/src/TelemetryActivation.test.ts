@@ -6,6 +6,7 @@ const loadConfig = vi.fn(async () => ({}) as Record<string, unknown>);
 const saveConfig = vi.fn(async () => {});
 const shouldShowTelemetryNotice = vi.fn(() => false);
 const shutdownTelemetry = vi.fn();
+const track = vi.fn();
 
 vi.mock("../../cli/src/core/TelemetryStartup.js", () => ({
 	bootstrapTelemetry: (...args: unknown[]) => bootstrapTelemetry(...(args as [])),
@@ -16,6 +17,7 @@ vi.mock("../../cli/src/core/TelemetryConsent.js", () => ({
 }));
 vi.mock("../../cli/src/core/Telemetry.js", () => ({
 	shutdownTelemetry: (...args: unknown[]) => shutdownTelemetry(...(args as [])),
+	track: (...args: unknown[]) => track(...(args as [])),
 }));
 vi.mock("../../cli/src/core/SessionTracker.js", () => ({
 	loadConfig: (...args: unknown[]) => loadConfig(...(args as [])),
@@ -52,6 +54,12 @@ beforeEach(() => {
 });
 
 describe("activateExtensionTelemetry", () => {
+	it("emits client_activated once on activation (JOLLI-1963)", async () => {
+		const { deps } = makeDeps();
+		await activateExtensionTelemetry("/repo", deps);
+		expect(track).toHaveBeenCalledWith("client_activated");
+	});
+
 	it("bootstraps with the platform opt-out signal", async () => {
 		const { deps } = makeDeps({ platformDisabled: true });
 		await activateExtensionTelemetry("/repo", deps);
