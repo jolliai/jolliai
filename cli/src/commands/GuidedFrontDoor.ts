@@ -30,6 +30,7 @@ import { isGitHookInstalled } from "../install/GitHookInstaller.js";
 import { install } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { JolliMemoryConfig } from "../Types.js";
+import { runBackfillFrontDoorStep } from "./BackfillFrontDoorStep.js";
 import { isAffirmative, promptText, resolveProjectDir } from "./CliUtils.js";
 import { promptSetup } from "./EnableCommand.js";
 import { runSpaceSyncStep } from "./SpaceSyncStep.js";
@@ -158,7 +159,6 @@ export async function runGuidedFrontDoor(): Promise<void> {
 			canSync = Boolean(token || config.jolliApiKey);
 		}
 	}
-
 	// ── Cloud side-effects: only after credentials are settled, so a sign-in or
 	// key established above is picked up this run. We are always enabled by here
 	// (the enable axis above either enabled the repo or returned early). Bind the
@@ -169,6 +169,12 @@ export async function runGuidedFrontDoor(): Promise<void> {
 
 	// ── Closing confirmation: only promise "listening" when generation works. ──
 	if (canGenerate) {
+		// Cold-start back-fill offer. Runs after the capability ladder + cloud
+		// side-effects (so it benefits from any key/sign-in just established) and
+		// re-reads the count so the "listening" line reflects memories just built.
+		// Best-effort — the step never throws into the front door. See BackfillFrontDoorStep.
+		await runBackfillFrontDoorStep(cwd);
+		summaryCount = await getSummaryCount(cwd);
 		const listening =
 			summaryCount === 0
 				? "Jolli is listening — your next commit is your first memory"

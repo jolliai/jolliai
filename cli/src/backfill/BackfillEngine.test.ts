@@ -157,6 +157,84 @@ describe("runBackfill", () => {
 		expect(vi.mocked(launchWorker)).not.toHaveBeenCalled();
 	});
 
+	it("fires onCommitStart before generating each commit (index is 1-based, carries the subject)", async () => {
+		const { buildCommitTargetIndex } = await import("./CommitTargetIndex.js");
+		vi.mocked(buildCommitTargetIndex).mockResolvedValue({
+			commitMeta: new Map([["c1", { ts: 1, subject: "First subject" }]]),
+			commitFiles: new Map(),
+			fileToCommits: new Map(),
+			baseToCommits: new Map(),
+		} as never);
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+		const starts: Array<[number, number, string, string | undefined]> = [];
+		let startedBeforeGenerate = false;
+		vi.mocked(generateSummary).mockImplementation(async () => {
+			startedBeforeGenerate = starts.length === 1; // onCommitStart ran before the LLM call
+			return summaryResult as never;
+		});
+
+		await runBackfill({
+			cwd: CWD,
+			hashes: ["c1"],
+			onCommitStart: (index, total, hash, subject) => starts.push([index, total, hash, subject]),
+		});
+
+		expect(starts).toEqual([[1, 1, "c1", "First subject"]]);
+		expect(startedBeforeGenerate).toBe(true);
+	});
+
+	it("does not fire onCommitStart in dry-run (no generation to wait on)", async () => {
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+		const onCommitStart = vi.fn();
+		await runBackfill({ cwd: CWD, hashes: ["c1"], dryRun: true, onCommitStart });
+		expect(onCommitStart).not.toHaveBeenCalled();
+	});
+
+	it("an already-aborted signal stops before any commit is generated", async () => {
+		vi.mocked(attributeCommits).mockReturnValue({
+			attributed: new Map([
+				["c1", attrFor("c1")],
+				["c2", attrFor("c2")],
+			]),
+			skipped: [],
+		});
+		const controller = new AbortController();
+		controller.abort();
+
+		const report = await runBackfill({ cwd: CWD, hashes: ["c1", "c2"], signal: controller.signal });
+
+		expect(report.generated).toBe(0);
+		expect(vi.mocked(generateSummary)).not.toHaveBeenCalled();
+		// Nothing generated → no ingest for the batch.
+		expect(vi.mocked(enqueueIngestOperation)).not.toHaveBeenCalled();
+		expect(vi.mocked(launchWorker)).not.toHaveBeenCalled();
+	});
+
+	it("aborting after a commit stops at the boundary (rest skipped) and still ingests what was built", async () => {
+		vi.mocked(attributeCommits).mockReturnValue({
+			attributed: new Map([
+				["c1", attrFor("c1")],
+				["c2", attrFor("c2")],
+			]),
+			skipped: [],
+		});
+		const controller = new AbortController();
+		// Abort as soon as the first commit completes — the boundary check then
+		// stops the loop before the second commit starts.
+		const report = await runBackfill({
+			cwd: CWD,
+			hashes: ["c1", "c2"],
+			signal: controller.signal,
+			onProgress: () => controller.abort(),
+		});
+
+		expect(report.generated).toBe(1);
+		expect(vi.mocked(generateSummary)).toHaveBeenCalledTimes(1);
+		// The one generated commit still triggers exactly one repo-wide ingest.
+		expect(vi.mocked(enqueueIngestOperation)).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(launchWorker)).toHaveBeenCalledTimes(1);
+	});
+
 	it("skips commits that already have a summary", async () => {
 		vi.mocked(getIndexEntryMap).mockResolvedValue(new Map([["c1", {} as never]]));
 		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map(), skipped: [] });

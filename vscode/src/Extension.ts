@@ -951,10 +951,12 @@ export function activate(context: vscode.ExtensionContext): void {
 		// Cold-start bookkeeping is done HERE (not in the sidebar `run` dep) so BOTH
 		// entry points — the cold-start card AND the Settings "Generate Missing
 		// Summaries" button — leave cold start consistently: once any back-fill
-		// produces a memory, the repo is no longer empty, and the per-repo dismiss
-		// marker is cleared so a future fresh-empty transition re-shows the card.
+		// produces a memory, the repo is no longer empty.
 		// (An already-open sidebar card flips to its own done view via `backfill:done`;
 		// this only fixes the host-side state a later sidebar reload reads.)
+		// NOTE: the per-repo dismiss flag is deliberately NOT cleared here — dismiss is
+		// now a sticky, explicit opt-out (shared with the CLI front door). Generating a
+		// memory must not resurrect a card the user permanently dismissed.
 		if (report.generated > 0) {
 			currentRepoHasMemories = true;
 			// Optimistically clear the card variant: the user just acted, so don't
@@ -964,7 +966,6 @@ export function activate(context: vscode.ExtensionContext): void {
 			// will re-surface 'gaps' if a partial back-fill left recent gaps.
 			currentColdStartVariant = null;
 			currentRecentMissingCount = 0;
-			void writeBackfillDismissFlag(workspaceRoot, false).catch(handleError("backfill.clearDismiss"));
 		}
 		// Card result list shows only the commits acted on (generated / errored);
 		// already-summarized neighbors in a full-scope run are not interesting rows.
@@ -1110,8 +1111,9 @@ export function activate(context: vscode.ExtensionContext): void {
 			},
 			// Real generation for the selected hashes. Streams per-commit progress
 			// to the card AND to the native notification (via runBackfillJob).
-			// Cold-start host state (repoHasMemories / dismiss marker) is updated
-			// inside runBackfillJob so this path and the Settings command agree.
+			// Cold-start host state (repoHasMemories) is updated inside runBackfillJob
+			// so this path and the Settings command agree. The dismiss flag is sticky
+			// and intentionally never cleared by a generation.
 			run: async (hashes, onProgress) => {
 				const r = await runBackfillJob(hashes, onProgress);
 				return { rows: r.rows, generated: r.generated, skipped: r.skipped, errors: r.errors };
