@@ -44,6 +44,11 @@ export function installCommandTelemetryHooks(program: Command): void {
 		starts.set(actionCommand, Date.now());
 	});
 	program.hook("postAction", (_thisCommand, actionCommand) => {
+		// `mcp` is emitted per tool call by the MCP server's CallTool handler
+		// (JOLLI-1959, tagged with `tool`). The generic session-level event here
+		// would be a coarse duplicate (`command:"mcp"` with no tool, once at stdio
+		// disconnect), so skip it — the CallTool handler is the source of truth.
+		if (commandPath(actionCommand) === "mcp") return;
 		const start = starts.get(actionCommand);
 		track("command_invoked", {
 			command: commandPath(actionCommand),

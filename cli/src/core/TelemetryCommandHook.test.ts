@@ -25,6 +25,7 @@ function programWith(action: () => void | Promise<void>): Command {
 	program.command("recall").action(async () => action());
 	const auth = program.command("auth");
 	auth.command("login").action(async () => action());
+	program.command("mcp").action(async () => action());
 	return program;
 }
 
@@ -63,6 +64,12 @@ describe("installCommandTelemetryHooks", () => {
 			throw new Error("boom");
 		});
 		await expect(program.parseAsync(["node", "jolli", "recall"])).rejects.toThrow("boom");
+		expect(await readTelemetryEvents(cwd)).toEqual([]);
+	});
+
+	it("skips the session-level command_invoked for `mcp` (JOLLI-1959 — the MCP server emits per-tool events)", async () => {
+		const program = programWith(() => {});
+		await program.parseAsync(["node", "jolli", "mcp"]);
 		expect(await readTelemetryEvents(cwd)).toEqual([]);
 	});
 });

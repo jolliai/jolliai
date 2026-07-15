@@ -15,6 +15,8 @@ vi.mock("./McpTools.js", () => ({
 const { mockStorage } = vi.hoisted(() => ({ mockStorage: { kind: "mock-storage" } }));
 vi.mock("../core/StorageFactory.js", () => ({ createStorage: vi.fn().mockResolvedValue(mockStorage) }));
 vi.mock("../core/SummaryStore.js", () => ({ setActiveStorage: vi.fn() }));
+// JOLLI-1959: the CallTool handler emits per-tool telemetry; spy on track().
+vi.mock("../core/Telemetry.js", () => ({ track: vi.fn() }));
 
 // Capture the request handlers the server registers so the test can invoke them directly.
 type RequestHandler = (req: { params: { name: string; arguments?: Record<string, unknown> } }) => Promise<unknown>;
@@ -84,6 +86,7 @@ import { VERSION } from "../commands/CliUtils.js";
 import type { PlatformToolManifestEntry } from "../core/JolliMemoryPushClient.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
+import { track } from "../core/Telemetry.js";
 import { dispatchTool, type PlatformToolClient, startMcpServer, TOOL_DEFINITIONS } from "./McpServer.js";
 import {
 	runBindSpace,
@@ -187,6 +190,7 @@ describe("startMcpServer", () => {
 		loadConfigMock.mockReset().mockResolvedValue({});
 		fetchManifestMock.mockReset();
 		invokePlatformToolMock.mockReset();
+		vi.mocked(track).mockClear();
 	});
 
 	it("connects the stdio transport and registers two request handlers", async () => {
@@ -244,6 +248,40 @@ describe("startMcpServer", () => {
 		};
 		expect(result.isError).toBe(true);
 		expect(JSON.parse(result.content[0].text)).toEqual({ type: "error", message: "Not signed in" });
+	});
+
+	it("CallTool emits per-tool telemetry (tool name + ok=true), never the arguments (JOLLI-1959)", async () => {
+		await startMcpServer("/repo");
+		await capturedHandlers[1]({ params: { name: "search", arguments: { query: "acme-secret/repo/path" } } });
+		expect(track).toHaveBeenCalledWith(
+			"command_invoked",
+			expect.objectContaining({ command: "mcp", tool: "search", ok: true }),
+		);
+		const props = vi.mocked(track).mock.calls[0][1] as Record<string, unknown>;
+		expect(typeof props.duration_ms).toBe("number");
+		// The tool's arguments must never reach telemetry (they may carry user content).
+		expect(props).not.toHaveProperty("arguments");
+		expect(JSON.stringify(props)).not.toContain("acme-secret");
+	});
+
+	it("CallTool telemetry reports ok=false when the tool throws (JOLLI-1959)", async () => {
+		vi.mocked(runSearch).mockRejectedValueOnce(new Error("boom"));
+		await startMcpServer("/repo");
+		await capturedHandlers[1]({ params: { name: "search", arguments: {} } });
+		expect(track).toHaveBeenCalledWith(
+			"command_invoked",
+			expect.objectContaining({ command: "mcp", tool: "search", ok: false }),
+		);
+	});
+
+	it("CallTool telemetry reports ok=false for a structured {type:'error'} result (JOLLI-1959)", async () => {
+		vi.mocked(runPushMemory).mockResolvedValueOnce({ type: "error", message: "Not signed in" });
+		await startMcpServer("/repo");
+		await capturedHandlers[1]({ params: { name: "push_memory", arguments: {} } });
+		expect(track).toHaveBeenCalledWith(
+			"command_invoked",
+			expect.objectContaining({ command: "mcp", tool: "push_memory", ok: false }),
+		);
 	});
 
 	it("CallTool handler does NOT flag a binding_required result as isError (it's a needs-input outcome)", async () => {
