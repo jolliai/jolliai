@@ -79,8 +79,11 @@ object TelemetryActivation {
             }
             val jolliApiKey = SessionTracker.loadConfig().jolliApiKey
             TelemetryFlusher.flush(cwd, origin = resolveOrigin(jolliApiKey), jolliApiKey = jolliApiKey)
-        } catch (_: Exception) {
-            // best-effort
+        } catch (e: Exception) {
+            // best-effort — but log it (JOLLI-1966): a silently-swallowed flush
+            // failure made a delivery outage impossible to diagnose.
+            ai.jolli.jollimemory.core.JmLogger.create("TelemetryActivation")
+                .warn("flushNow failed: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 

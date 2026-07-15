@@ -27,7 +27,7 @@ class TelemetryFlusherTest {
         }
     }
 
-    private fun env(installId: String) =
+    private fun env(installId: String, seq: Int? = null) =
         TelemetryEnvelope(
             schemaVersion = 1,
             eventId = "33333333-3333-4333-8333-333333333333",
@@ -41,11 +41,13 @@ class TelemetryFlusherTest {
             env = "local",
             tsIso = "2026-06-20T00:00:00.000Z",
             accountId = null,
-            properties = emptyMap(),
+            properties = if (seq != null) mapOf("seq" to seq.toString()) else emptyMap(),
         )
 
-    private fun seed(n: Int) {
-        for (i in 0 until n) TelemetryBuffer.append(cwd, env("i-$i"))
+    // Seed n events under ONE install_id (so they form a single batch group), each
+    // tagged with a distinct `seq` so identity-based assertions stay unambiguous.
+    private fun seed(n: Int, installId: String = "install-1") {
+        for (i in 0 until n) TelemetryBuffer.append(cwd, env(installId, seq = i))
     }
 
     private fun makeKey(u: String): String {
@@ -143,7 +145,7 @@ class TelemetryFlusherTest {
             }
         val result = TelemetryFlusher.flush(cwd, origin = "https://jolli.ai", maxBatch = 2, sender = sender)
         result shouldBe TelemetryFlusher.FlushResult(2, 3)
-        TelemetryBuffer.read(cwd).map { it.installId } shouldBe listOf("i-2", "i-3", "i-4")
+        TelemetryBuffer.read(cwd).map { it.properties["seq"] } shouldBe listOf("2", "3", "4")
     }
 
     @Test
@@ -153,5 +155,70 @@ class TelemetryFlusherTest {
         val result = TelemetryFlusher.flush(cwd, origin = "https://jolli.ai", maxBatch = 10, sender = sender)
         result.sent shouldBe 3
         TelemetryBuffer.read(cwd).map { it.installId } shouldBe listOf("late")
+    }
+
+    @Test
+    fun `backfills a stable eventId for legacy buffered events across retries`() {
+        val queue = File("$cwd/.jolli/jollimemory/telemetry-queue.ndjson")
+        queue.parentFile.mkdirs()
+        queue.writeText(
+            """{"schemaVersion":1,"eventName":"app_installed","surface":"intellij","surfaceVersion":"1.0.0","installId":"legacy","os":"mac","arch":"arm64","runtimeVersion":"jvm-21","env":"local","tsIso":"2026-06-20T00:00:00.000Z","accountId":null,"properties":{}}""" + "\n",
+            Charsets.UTF_8,
+        )
+        val sender =
+            object : TelemetryFlusher.Sender {
+                val calls = mutableListOf<String>()
+
+                override fun send(url: String, body: String, bearer: String?): Boolean {
+                    calls.add(body)
+                    return calls.size == 2
+                }
+            }
+
+        TelemetryFlusher.flush(cwd, origin = "https://jolli.ai", sender = sender) shouldBe TelemetryFlusher.FlushResult(0, 1)
+        val firstEventId = Regex(""""eventId":"([^"]+)"""").find(sender.calls[0])!!.groupValues[1]
+        Regex("""^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$""", RegexOption.IGNORE_CASE).matches(firstEventId) shouldBe true
+
+        TelemetryFlusher.flush(cwd, origin = "https://jolli.ai", sender = sender) shouldBe TelemetryFlusher.FlushResult(1, 0)
+        val secondEventId = Regex(""""eventId":"([^"]+)"""").find(sender.calls[1])!!.groupValues[1]
+        secondEventId shouldBe firstEventId
+        TelemetryBuffer.readLines(cwd) shouldHaveSize 0
+    }
+
+    @Test
+    fun `groups by install_id so every batch carries a single install_id`() {
+        TelemetryBuffer.append(cwd, env("A", seq = 0))
+        TelemetryBuffer.append(cwd, env("B", seq = 1))
+        TelemetryBuffer.append(cwd, env("A", seq = 2))
+        val sender = CapturingSender(ok = true)
+        val result = TelemetryFlusher.flush(cwd, origin = "https://jolli.ai", sender = sender)
+        result shouldBe TelemetryFlusher.FlushResult(3, 0)
+        // One batch per install_id group (A has 2, B has 1) — never a mixed batch.
+        sender.calls shouldHaveSize 2
+        for (call in sender.calls) {
+            val ids = Regex(""""installId":"([^"]+)"""").findAll(call.body).map { it.groupValues[1] }.toSet()
+            ids shouldHaveSize 1
+        }
+        TelemetryBuffer.readLines(cwd) shouldHaveSize 0
+    }
+
+    @Test
+    fun `a stray install_id that fails does not block delivery of the others`() {
+        // Reproduces the ibe jam: one stray event from a prior install sits at the
+        // buffer head; the backend 400s any batch containing it. Grouping must
+        // isolate it so the current install's events still deliver.
+        TelemetryBuffer.append(cwd, env("stray", seq = 0))
+        TelemetryBuffer.append(cwd, env("current", seq = 1))
+        TelemetryBuffer.append(cwd, env("current", seq = 2))
+        val sender =
+            object : TelemetryFlusher.Sender {
+                override fun send(url: String, body: String, bearer: String?): Boolean =
+                    // reject the stray group (mixed-install 400 analogue), accept the rest
+                    !body.contains(""""installId":"stray"""")
+            }
+        val result = TelemetryFlusher.flush(cwd, origin = "https://jolli.ai", sender = sender)
+        result shouldBe TelemetryFlusher.FlushResult(2, 1)
+        // Only the poisoned stray event remains; the current install's events delivered.
+        TelemetryBuffer.read(cwd).map { it.installId } shouldBe listOf("stray")
     }
 }
