@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
 	SidebarInboundMsg,
 	SidebarOutboundMsg,
@@ -64,6 +64,16 @@ vi.mock("vscode", () => ({
 			return mockWorkspaceFolders.length > 0 ? mockWorkspaceFolders : undefined;
 		},
 	},
+}));
+
+// Spy on track() (funnel telemetry, JOLLI-1904) but keep every other real
+// export — transitive code paths still call bucket()/flush helpers. Mocking
+// here also keeps `handleReady`'s toolwindow_opened emit from touching disk in
+// the many "ready" tests below.
+const { track } = vi.hoisted(() => ({ track: vi.fn() }));
+vi.mock("../../../cli/src/core/Telemetry.js", async (importActual) => ({
+	...(await importActual<typeof import("../../../cli/src/core/Telemetry.js")>()),
+	track,
 }));
 
 // Stub ConversationDetailsPanel.show so happy-path branch:openConversation
@@ -135,6 +145,7 @@ describe("SidebarWebviewProvider", () => {
 	let executeCommand: ReturnType<typeof vi.fn>;
 
 	beforeEach(() => {
+		track.mockClear();
 		executeCommand = vi.fn().mockResolvedValue(undefined);
 		provider = new SidebarWebviewProvider({
 			executeCommand: executeCommand as never,
@@ -190,6 +201,160 @@ describe("SidebarWebviewProvider", () => {
 			command: "jollimemory.openSettings",
 		});
 		expect(executeCommand).toHaveBeenCalledWith("jollimemory.openSettings");
+	});
+
+	// ── JOLLI-1904 funnel telemetry (mirrors IntelliJ event names + props) ──
+
+	it("emits toolwindow_opened {view:'current'} once per ready cycle", async () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
+		expect(track).toHaveBeenCalledWith("toolwindow_opened", { view: "current" });
+	});
+
+	it("maps a user tab switch to view_switched: branch→current, kb→bank", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "tab:switched", tab: "branch", userInitiated: true });
+		expect(track).toHaveBeenCalledWith("view_switched", { view: "current" });
+		track.mockClear();
+		view.webview.triggerMessage({ type: "tab:switched", tab: "kb", userInitiated: true });
+		expect(track).toHaveBeenCalledWith("view_switched", { view: "bank" });
+	});
+
+	it("never emits view_switched for programmatic switches or the Status overlay", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		// Programmatic switch (init-restore, breadcrumb, onboarding) — no flag.
+		view.webview.triggerMessage({ type: "tab:switched", tab: "kb" });
+		// Status overlay has no IntelliJ view, even when user-initiated.
+		view.webview.triggerMessage({ type: "tab:switched", tab: "status", userInitiated: true });
+		expect(track).not.toHaveBeenCalledWith("view_switched", expect.anything());
+	});
+
+	it("emits memory_expanded with the toggled state in both directions", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "kb:memoryToggled", expanded: true });
+		expect(track).toHaveBeenCalledWith("memory_expanded", { expanded: true });
+		track.mockClear();
+		view.webview.triggerMessage({ type: "kb:memoryToggled", expanded: false });
+		expect(track).toHaveBeenCalledWith("memory_expanded", { expanded: false });
+	});
+
+	// ── Phase 4: memory_item_opened (committed-memory evidence rows) ──
+	// item_type values match IntelliJ's CommitsPanel.trackItemOpened verbatim.
+
+	it.each([
+		[
+			"kb:openEvidenceNote",
+			{ noteId: "n1", title: "N", sourceRepoName: "r", sourceRemoteUrl: null },
+			{ item_type: "note" },
+		],
+		[
+			"kb:openEvidencePlan",
+			{ planId: "p1", title: "P", sourceRepoName: "r", sourceRemoteUrl: null },
+			{ item_type: "plan" },
+		],
+		[
+			"kb:openEvidenceReference",
+			{ archivedKey: "linear:X-1-ab12cd34", source: "linear", sourceRepoName: null, sourceRemoteUrl: null },
+			{ item_type: "reference" },
+		],
+	])("emits memory_item_opened from %s", (type, fields, expected) => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type, ...fields } as never);
+		expect(track).toHaveBeenCalledWith("memory_item_opened", expected);
+	});
+
+	it("emits memory_item_opened{conversation, render:stored, source} for evidence conversations", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "kb:openEvidenceConversation",
+			commitHash: "c1",
+			sessionId: "s1",
+			source: "claude",
+			title: "Chat",
+		});
+		expect(track).toHaveBeenCalledWith("memory_item_opened", {
+			item_type: "conversation",
+			render: "stored",
+			source: "claude",
+		});
+	});
+
+	it("does NOT emit memory_item_opened when an evidence reference source is rejected", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "kb:openEvidenceReference",
+			archivedKey: "bogus:1",
+			source: "not-a-source",
+			sourceRepoName: null,
+			sourceRemoteUrl: null,
+		} as never);
+		expect(track).not.toHaveBeenCalledWith("memory_item_opened", expect.anything());
+	});
+
+	// ── Phase 4: memory_pinned / memory_unpinned (kind → IntelliJ plural) ──
+
+	describe("pin/unpin telemetry", () => {
+		beforeEach(() => {
+			mockWorkspaceFolders.length = 0;
+			mockWorkspaceFolders.push({ uri: { fsPath: "/abs/proj" } });
+		});
+		afterEach(() => {
+			mockWorkspaceFolders.length = 0;
+		});
+
+		function makePinProvider(): SidebarWebviewProvider {
+			return new SidebarWebviewProvider({
+				executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "branch",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+					currentRepoName: "myrepo",
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				pinStore: {
+					addPin: vi.fn().mockResolvedValue(undefined),
+					removePin: vi.fn().mockResolvedValue(undefined),
+					listPins: vi.fn().mockResolvedValue([]),
+				} as never,
+			});
+		}
+
+		it("maps a conversation pin to memory_pinned{kind:'conversations'}", () => {
+			const p = makePinProvider();
+			const view = makeMockView();
+			p.resolveWebviewView(view as unknown as never);
+			view.webview.triggerMessage({ type: "branch:pin", kind: "conversation", id: "s1", title: "T" });
+			expect(track).toHaveBeenCalledWith("memory_pinned", { kind: "conversations" });
+		});
+
+		it("maps a memory unpin to memory_unpinned{kind:'memories'}", () => {
+			const p = makePinProvider();
+			const view = makeMockView();
+			p.resolveWebviewView(view as unknown as never);
+			view.webview.triggerMessage({ type: "branch:unpin", kind: "memory", id: "abc123" });
+			expect(track).toHaveBeenCalledWith("memory_unpinned", { kind: "memories" });
+		});
+
+		it("does not emit when the pin store is absent (no projectDir/repo/store guard)", () => {
+			// The default `provider` has no pinStore — the guard must skip both the
+			// write and the telemetry so we never claim a pin that never happened.
+			const view = makeMockView();
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.triggerMessage({ type: "branch:pin", kind: "plan", id: "p1", title: "T" });
+			expect(track).not.toHaveBeenCalledWith("memory_pinned", expect.anything());
+		});
 	});
 
 	it("pushContextRelevanceToSidebar posts to the sidebar view ONLY — never to broadcast targets", () => {

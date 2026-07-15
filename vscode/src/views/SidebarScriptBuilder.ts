@@ -356,7 +356,7 @@ export function buildSidebarScript(): string {
   // "JOLLI MEMORY" title-bar Status icon (jollimemory.toggleStatus → the
   // 'status:toggle' inbound message) toggles the Status overlay open and
   // collapses back to Branch on a second click.
-  function switchTab(tab) {
+  function switchTab(tab, userInitiated) {
     if (state.activeTab === tab) return;
     const outgoing = tabContents[state.activeTab];
     if (outgoing) state.scrollTops[state.activeTab] = outgoing.scrollTop;
@@ -390,7 +390,11 @@ export function buildSidebarScript(): string {
         renderMemories();
       }
     }
-    vscode.postMessage({ type: 'tab:switched', tab: tab });
+    // userInitiated distinguishes a real view-switcher click (→ view_switched
+    // telemetry, matching IntelliJ's applyView) from the programmatic switches
+    // (init-restore, onboarding auto-land, breadcrumb context change) that must
+    // not emit. Only branch/kb map to an IntelliJ view; status has no analog.
+    vscode.postMessage({ type: 'tab:switched', tab: tab, userInitiated: !!userInitiated });
     // switchTab unconditionally reveals the target tab content. If the cold-start
     // card should own the viewport (e.g. init posts activeTab:'branch' after the
     // card was shown, or onboarding lands on 'status'), re-assert it so the card
@@ -415,7 +419,7 @@ export function buildSidebarScript(): string {
   // collapse — that behavior is reserved for the Status overlay).
   document.querySelectorAll('.view-tab[data-tab]').forEach(function(elBtn) {
     elBtn.addEventListener('click', function() {
-      switchTab(elBtn.getAttribute('data-tab'));
+      switchTab(elBtn.getAttribute('data-tab'), true);
     });
   });
 
@@ -1551,7 +1555,9 @@ export function buildSidebarScript(): string {
       state.backfillMode = 'offer';
       persist();
       applyBackfillCard();
-      switchTab('kb');
+      // User-driven (mirrors IntelliJ's "Open your Memory Bank" → applyView(BANK)),
+      // so this counts as a view_switched to the bank.
+      switchTab('kb', true);
     });
     return [
       bfHeader(r.generated + ' memor' + (r.generated === 1 ? 'y' : 'ies') + ' built from your history', null),
@@ -3407,6 +3413,10 @@ export function buildSidebarScript(): string {
       const toggleHash = memToggle.getAttribute('data-memory-toggle');
       state.memoriesExpanded[toggleHash] = !state.memoriesExpanded[toggleHash];
       persist();
+      // Report both directions (matches IntelliJ memory_expanded{expanded}). This
+      // is the user toggle; kb:expandMemory is only a lazy evidence fetch and
+      // can't stand in for it (it never fires on collapse or on a cache hit).
+      vscode.postMessage({ type: 'kb:memoryToggled', expanded: state.memoriesExpanded[toggleHash] });
       renderMemories();
       e.stopPropagation();
       return;

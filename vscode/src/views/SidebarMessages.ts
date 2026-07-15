@@ -550,7 +550,7 @@ export interface RepoChoice {
 
 export type SidebarOutboundMsg =
 	| { readonly type: "ready" }
-	| { readonly type: "tab:switched"; readonly tab: SidebarTab }
+	| { readonly type: "tab:switched"; readonly tab: SidebarTab; readonly userInitiated?: boolean }
 	| {
 			/**
 			 * Webview asks the host to materialize the breadcrumb selection
@@ -578,6 +578,7 @@ export type SidebarOutboundMsg =
 	| { readonly type: "kb:openFile"; readonly path: string }
 	| { readonly type: "kb:openMemory"; readonly commitHash: string }
 	| { readonly type: "kb:expandMemory"; readonly commitHash: string }
+	| { readonly type: "kb:memoryToggled"; readonly expanded: boolean }
 	| { readonly type: "kb:loadMore" }
 	| { readonly type: "kb:search"; readonly query: string }
 	| { readonly type: "kb:clearSearch" }
