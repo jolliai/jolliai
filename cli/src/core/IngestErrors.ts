@@ -37,3 +37,29 @@ export const INGEST_CODES = {
 } as const;
 
 export type IngestCode = (typeof INGEST_CODES)[keyof typeof INGEST_CODES];
+
+/**
+ * Ingest outcomes that are NOT pipeline errors and therefore must NOT raise an
+ * `error_occurred` telemetry event (JOLLI-1962). `ingest_completed` still records
+ * the outcome for all of them; they just aren't double-counted as errors.
+ *
+ *   - `OK` / `NO_PENDING` — success / nothing pending.
+ *   - `CREDENTIAL_MISSING` — the user isn't signed in, so the drain can't run yet.
+ *     An expected "can't run" state, not a failure — it dominated (~87%) the old
+ *     apparent ingest error rate.
+ *   - `NO_SOURCE_CONTENT` — the batch's sources vanished / were empty; nothing to
+ *     fold in.
+ *   - `PAGE_WRITE_CONFLICT` — a benign, self-resolving concurrent-write hold (see
+ *     its code doc above); sources are just retried on the next drain.
+ *
+ * Genuine failures (`ROUTE_FAILED`, `RECONCILE_TRUNCATED`, `RECONCILE_PARSE_FAILED`,
+ * `RECONCILE_CALL_FAILED`, `ITERATION_GUARD`, `PAGE_WRITE_ERROR`) are absent here,
+ * so they still surface as `error_occurred`.
+ */
+export const INGEST_NON_ERROR_OUTCOMES: ReadonlySet<string> = new Set([
+	INGEST_CODES.OK,
+	INGEST_CODES.NO_PENDING,
+	INGEST_CODES.CREDENTIAL_MISSING,
+	INGEST_CODES.NO_SOURCE_CONTENT,
+	INGEST_CODES.PAGE_WRITE_CONFLICT,
+]);
