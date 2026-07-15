@@ -53,6 +53,7 @@ disk **before** they are sent.
 | Event | Description |
 | -- | -- |
 | `app_installed` | First run after install; installId minted (once per machine). |
+| `client_activated` | A GUI surface activated (VS Code activate / IntelliJ project open), carrying `surface_version`. First-seen (install_id, surface_version) ≈ new + upgrade installs that launched. GUI-only — CLI new/upgrade is read from any event's surface_version. |
 | `surface_enabled` | A surface was enabled in a repo. |
 | `surface_disabled` | A surface was disabled / opted out. |
 | `signin_started` | User initiated OAuth sign-in. |

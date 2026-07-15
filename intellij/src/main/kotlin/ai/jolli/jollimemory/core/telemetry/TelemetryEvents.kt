@@ -17,6 +17,9 @@ object TelemetryEvents {
         linkedMapOf(
             // ── lifecycle & conversion funnel (the primary goal) ──
             "app_installed" to "First run after install; installId minted (once per machine).",
+            "client_activated" to
+                "A GUI surface activated (VS Code activate / IntelliJ project open), carrying `surface_version`. " +
+                "First-seen (install_id, surface_version) ≈ new + upgrade installs that launched.",
             "surface_enabled" to "A surface was enabled in a repo.",
             "surface_disabled" to "A surface was disabled / opted out.",
             "signin_started" to "User initiated OAuth sign-in.",
