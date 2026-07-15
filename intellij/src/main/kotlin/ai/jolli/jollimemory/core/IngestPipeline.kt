@@ -274,7 +274,11 @@ object IngestPipeline {
             "ingest_completed",
             mapOf("outcome" to outcome.name, "batches" to batches, "ingested" to ingested, "topic_failures" to topicFailures.size),
         )
-        if (outcome != IngestCode.OK && outcome != IngestCode.NO_PENDING) {
+        // Only genuine failures raise error_occurred. Success and benign/expected
+        // terminal states are excluded so they don't inflate the ingest error rate
+        // (JOLLI-1962). Mirrors cli INGEST_NON_ERROR_OUTCOMES — IntelliJ's enum lacks
+        // CREDENTIAL_MISSING / PAGE_WRITE_CONFLICT, so its benign set is just these.
+        if (outcome !in setOf(IngestCode.OK, IngestCode.NO_PENDING, IngestCode.NO_SOURCE_CONTENT)) {
             ai.jolli.jollimemory.core.telemetry.Telemetry.track("error_occurred", mapOf("code" to outcome.name, "where" to "ingest"))
         }
         return DrainResult(batches, ingested, outcome, topicFailures)

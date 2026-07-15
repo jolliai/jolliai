@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getJolliMemoryDir } from "../Logger.js";
 import { INGEST_CODES } from "./IngestErrors.js";
 import { appendCredentialMissingRun, appendIngestRun, type IngestRunRecord, readIngestRuns } from "./IngestRunStore.js";
+import { initTelemetry, shutdownTelemetry } from "./Telemetry.js";
+import { readTelemetryEvents } from "./TelemetryBuffer.js";
 
 let cwd: string;
 const rec = (over: Partial<IngestRunRecord> = {}): IngestRunRecord => ({
@@ -76,5 +78,48 @@ describe("IngestRunStore", () => {
 		expect(runs[0].outcome).toBe(INGEST_CODES.CREDENTIAL_MISSING);
 		expect(runs[0].triggeredBy).toBe("post-merge");
 		expect(runs[0].batches).toBe(0);
+	});
+});
+
+describe("IngestRunStore telemetry — error_occurred gating (JOLLI-1962)", () => {
+	beforeEach(() => {
+		initTelemetry({
+			cwd,
+			installId: "11111111-1111-4111-8111-111111111111",
+			origin: "https://jolli.ai",
+			config: {},
+		});
+	});
+	afterEach(() => shutdownTelemetry());
+
+	const eventsOfType = async (name: string) => (await readTelemetryEvents(cwd)).filter((e) => e.eventName === name);
+
+	it("does NOT raise error_occurred for success or benign/expected outcomes", async () => {
+		const benign = [
+			INGEST_CODES.OK,
+			INGEST_CODES.NO_PENDING,
+			INGEST_CODES.CREDENTIAL_MISSING,
+			INGEST_CODES.NO_SOURCE_CONTENT,
+			INGEST_CODES.PAGE_WRITE_CONFLICT,
+		];
+		for (const outcome of benign) await appendIngestRun(cwd, rec({ outcome }));
+		// Every run still records a completion event; none is counted as an error.
+		expect(await eventsOfType("ingest_completed")).toHaveLength(benign.length);
+		expect(await eventsOfType("error_occurred")).toEqual([]);
+	});
+
+	it("raises one error_occurred(where=ingest) per genuine failure outcome", async () => {
+		const failures = [
+			INGEST_CODES.ROUTE_FAILED,
+			INGEST_CODES.RECONCILE_TRUNCATED,
+			INGEST_CODES.RECONCILE_PARSE_FAILED,
+			INGEST_CODES.RECONCILE_CALL_FAILED,
+			INGEST_CODES.ITERATION_GUARD,
+			INGEST_CODES.PAGE_WRITE_ERROR,
+		];
+		for (const outcome of failures) await appendIngestRun(cwd, rec({ outcome }));
+		const errs = await eventsOfType("error_occurred");
+		expect(errs).toHaveLength(failures.length);
+		expect(errs.every((e) => (e.properties as { where?: string }).where === "ingest")).toBe(true);
 	});
 });

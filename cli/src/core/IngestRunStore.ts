@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { getJolliMemoryDir } from "../Logger.js";
 import type { IngestOperation } from "../Types.js";
 import { atomicWriteFile } from "./AtomicWrite.js";
-import { INGEST_CODES, type IngestCode } from "./IngestErrors.js";
+import { INGEST_CODES, INGEST_NON_ERROR_OUTCOMES, type IngestCode } from "./IngestErrors.js";
 import { track } from "./Telemetry.js";
 
 const RUNS_FILE = "ingest-runs.json";
@@ -65,9 +65,13 @@ function emitIngestTelemetry(record: IngestRunRecord): void {
 		reconcile_calls: record.reconcileCalls,
 		topic_failures: record.topicFailures.length,
 	});
-	// A genuine failure outcome also raises a structured error event. OK and
-	// NO_PENDING are normal terminal states, not errors.
-	if (record.outcome !== INGEST_CODES.OK && record.outcome !== INGEST_CODES.NO_PENDING) {
+	// A genuine failure outcome also raises a structured error event. Success and
+	// benign/expected terminal states (OK, NO_PENDING, CREDENTIAL_MISSING,
+	// NO_SOURCE_CONTENT, PAGE_WRITE_CONFLICT) are NOT errors — raising
+	// `error_occurred` for them inflated the apparent ingest error rate with
+	// "not signed in" and benign-retry noise (JOLLI-1962). The outcome is still
+	// recorded on `ingest_completed`; only real failures raise the error event.
+	if (!INGEST_NON_ERROR_OUTCOMES.has(record.outcome)) {
 		track("error_occurred", { code: record.outcome, where: "ingest" });
 	}
 }
