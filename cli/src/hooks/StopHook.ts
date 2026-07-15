@@ -37,6 +37,7 @@ import {
 	saveDiscoveryCursor,
 	saveSession,
 } from "../core/SessionTracker.js";
+import { flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { ClaudeHookInput, SessionInfo } from "../Types.js";
 import { readStdin } from "./HookUtils.js";
@@ -127,6 +128,15 @@ export async function handleStopHook(): Promise<void> {
 	// its own errors so one failing discovery never blocks the other or the
 	// cursor advance.
 	await discoverFromTranscript(sessionInfo, projectDir);
+
+	// JOLLI-1954: the Stop hook fires on every agent turn end — far more often
+	// than commits — so piggyback it to drain the shared telemetry buffer. Covers
+	// the "using the agent but not committing" case that the post-commit flush
+	// misses. Awaited (not fire-and-forget) so the short-lived hook process does
+	// not exit before the POST completes; the hook runs `async: true`, so this
+	// never blocks the agent. `flushTelemetryNow` re-gates consent, has its own
+	// timeout, no-ops on an empty buffer, and never throws.
+	await flushTelemetryNow(projectDir);
 }
 
 // ─── Discovery orchestration ────────────────────────────────────────────────

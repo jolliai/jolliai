@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Mock SessionTracker
+// Mock SessionTracker (loadConfig is reached transitively via the JOLLI-1954
+// telemetry flush at the end of the hook; return an empty config so consent
+// resolves on and the flush no-ops against the empty test buffer).
 vi.mock("../core/SessionTracker.js", () => ({
 	saveSession: vi.fn(),
+	loadConfig: vi.fn().mockResolvedValue({}),
 }));
 
 // Suppress console output
