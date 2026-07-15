@@ -169,6 +169,26 @@ describe("runBackfillFrontDoorStep", () => {
 		expect(loggedText()).toContain("Built 1 memory from your history");
 	});
 
+	it("does not claim success when every commit failed", async () => {
+		h.promptText.mockResolvedValue("y");
+		h.runBackfill.mockResolvedValue(report({ total: 2, generated: 0, errors: 2 }));
+		await runBackfillFrontDoorStep(CWD);
+		const text = loggedText();
+		expect(text).not.toContain("✓");
+		expect(text).toContain("all 2 failed");
+		expect(text).toContain("jolli backfill");
+	});
+
+	it("reports partial success with a retry hint when some commits failed", async () => {
+		h.promptText.mockResolvedValue("y");
+		h.runBackfill.mockResolvedValue(report({ total: 3, generated: 2, errors: 1 }));
+		await runBackfillFrontDoorStep(CWD);
+		const text = loggedText();
+		expect(text).toContain("✓ Built 2 memories from your history");
+		expect(text).toContain("1 failed");
+		expect(text).toContain("jolli backfill");
+	});
+
 	it("skips without building or dismissing on 'not now'", async () => {
 		h.promptText.mockResolvedValue("n");
 		await runBackfillFrontDoorStep(CWD);

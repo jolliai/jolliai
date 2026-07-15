@@ -161,6 +161,7 @@ async function buildWithProgress(cwd: string, hashes: string[]): Promise<void> {
 		console.log("\n  Building memories… one AI call per commit, locally. This may take a while.");
 		console.log("  Press Ctrl-C anytime to stop — progress is saved and you can resume later.\n");
 		let generated: number;
+		let errors: number;
 		try {
 			const report = await runBackfill({
 				cwd,
@@ -176,6 +177,7 @@ async function buildWithProgress(cwd: string, hashes: string[]): Promise<void> {
 				},
 			});
 			generated = report.generated;
+			errors = report.errors;
 		} catch (err) {
 			log.debug(`back-fill run failed: ${errMsg(err)}`);
 			console.log("\n  Couldn't build memories right now — run `jolli backfill` to try again.\n");
@@ -184,6 +186,14 @@ async function buildWithProgress(cwd: string, hashes: string[]): Promise<void> {
 		const memories = `${generated} ${generated === 1 ? "memory" : "memories"}`;
 		if (controller.signal.aborted) {
 			console.log(`\n  Stopped — ${memories} built and saved. Run \`jolli\` again to build the rest.\n`);
+		} else if (generated === 0 && errors > 0) {
+			// Every candidate failed (e.g. an API or storage outage) — don't wear a
+			// success check; point the user at a retry instead.
+			console.log(`\n  Couldn't build memories — all ${errors} failed. Run \`jolli backfill\` to retry.\n`);
+		} else if (errors > 0) {
+			console.log(
+				`\n  ✓ Built ${memories} from your history — ${errors} failed. Run \`jolli backfill\` to retry.\n`,
+			);
 		} else {
 			console.log(`\n  ✓ Built ${memories} from your history.\n`);
 		}
