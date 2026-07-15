@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	buildLocalRunSkillTemplate,
 	buildRecallSkillTemplate,
 	buildSearchSkillTemplate,
 	SKILL_GIT_EXCLUDE_PATHS,
@@ -62,18 +63,25 @@ function readJolli(target: "claude" | "agents" = "claude"): string {
 	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
 }
 
+function readLocalRun(target: "claude" | "agents" = "claude"): string {
+	const dir = target === "claude" ? ".claude/skills/jolli-local-run" : ".agents/skills/jolli-local-run";
+	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
+}
+
 // ─── Dual-target write ──────────────────────────────────────────────────────
 
 describe("updateSkillsIfNeeded — target dimension", () => {
-	it("writes all four skills into both .claude/skills/ and .agents/skills/", async () => {
+	it("writes all five skills into both .claude/skills/ and .agents/skills/", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-local-run/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-local-run/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli/SKILL.md"))).toBe(true);
 	});
 
@@ -82,6 +90,7 @@ describe("updateSkillsIfNeeded — target dimension", () => {
 		expect(readRecall("claude")).toBe(readRecall("agents"));
 		expect(readSearch("claude")).toBe(readSearch("agents"));
 		expect(readPr("claude")).toBe(readPr("agents"));
+		expect(readLocalRun("claude")).toBe(readLocalRun("agents"));
 		expect(readJolli("claude")).toBe(readJolli("agents"));
 	});
 
@@ -90,10 +99,12 @@ describe("updateSkillsIfNeeded — target dimension", () => {
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(false);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-local-run/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-local-run/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli/SKILL.md"))).toBe(true);
 	});
 
@@ -105,15 +116,17 @@ describe("updateSkillsIfNeeded — target dimension", () => {
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
 	});
 
-	it("exports the 8 git-exclude paths for the four skills × two targets", () => {
+	it("exports the 10 git-exclude paths for the five skills × two targets", () => {
 		expect(SKILL_GIT_EXCLUDE_PATHS).toEqual([
 			"/.claude/skills/jolli-recall/",
 			"/.claude/skills/jolli-search/",
 			"/.claude/skills/jolli-pr/",
+			"/.claude/skills/jolli-local-run/",
 			"/.claude/skills/jolli/",
 			"/.agents/skills/jolli-recall/",
 			"/.agents/skills/jolli-search/",
 			"/.agents/skills/jolli-pr/",
+			"/.agents/skills/jolli-local-run/",
 			"/.agents/skills/jolli/",
 		]);
 	});
@@ -212,9 +225,97 @@ describe("jolli menu template frontmatter", () => {
 		expect(jolli).toMatch(/jolli-recall/);
 		expect(jolli).toMatch(/jolli-search/);
 		expect(jolli).toMatch(/jolli-pr/);
+		expect(jolli).toMatch(/jolli-local-run/);
 		// Surfaces session-registered MCP tools, not a hardcoded manifest fetch.
 		expect(jolli).toMatch(/mcp__jollimemory__/);
 		expect(jolli).toMatch(/AskUserQuestion/);
+	});
+});
+
+describe("jolli-local-run template", () => {
+	it("uses spec-compliant frontmatter (name/description/metadata only)", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toMatch(/^---\nname: jolli-local-run\n/);
+		expect(t).toMatch(/description: Run a Jolli workflow locally/);
+		expect(t).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}vendor: "jolli\.ai"/);
+		expect(t).not.toMatch(/^argument-hint:/m);
+		expect(t).not.toMatch(/^user-invocable:/m);
+	});
+
+	it("drives the run lifecycle tools", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("start_local_run");
+		expect(t).toContain("report_local_run_progress");
+		expect(t).toContain("complete_local_run");
+		expect(t).toContain("abandon_local_run");
+	});
+
+	it("uses the eligibility helper and offers only runnable workflows, announcing auto-merge vs team review", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("local-run-workflows");
+		expect(t).toMatch(/auto-merge/i);
+		expect(t).toMatch(/team review/i);
+	});
+
+	it("pins docs pull to --branch and explicitly forbids the destructive --agent", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("docs pull --branch");
+		expect(t).toContain("--agent");
+		expect(t).toMatch(/NEVER `--agent`/);
+		expect(t).toContain("git clean -fdx");
+	});
+
+	it("does NOT instruct the agent to call fetchSpaceBacking (docs pull fetches the token internally)", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).not.toContain("fetchSpaceBacking");
+		expect(t).toMatch(/fetches the destination write token internally/);
+	});
+
+	it("brackets the blocking review with heartbeats (before and after, not during)", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toMatch(/immediately before/);
+		expect(t).toMatch(/immediately after/);
+		expect(t).toMatch(/explicitly approve/);
+	});
+
+	it("captures the docs publish {prNumber, prUrl} and passes them to complete_local_run", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("docs publish --json");
+		expect(t).toContain("prNumber");
+		expect(t).toContain("prUrl");
+	});
+
+	it("surfaces the combined space-cli install hint when the plugin is missing", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("npm i -g @jolli.ai/cli @jolli.ai/space-cli");
+	});
+
+	it("prefers MCP tools but shells the jolli CLI (run-cli) for the helper and git ops", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("mcp__jollimemory__start_local_run");
+		expect(t).toContain("$HOME/.jolli/jollimemory/run-cli");
+	});
+
+	it("shows the start_local_run id verbatim as an unquoted number (not a misleading quoted string)", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain('{ "id": <workflow id> }');
+		expect(t).not.toContain('{ "id": "<workflow id>" }');
+		expect(t).toMatch(/exactly as the helper returned it/);
+	});
+
+	it("presents workflows by name and shows the real numeric id shape in the Step 1 example", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain('"id": 7');
+		expect(t).toContain('"name": "Impact Analysis"');
+		expect(t).toMatch(/by its `name`/);
+		expect(t).not.toContain('"id": "..."');
+	});
+
+	it("carries the Windows Git Bash shell prerequisite (its run-cli bash steps hit %USERPROFILE%)", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("### Shell prerequisite");
+		expect(t).toMatch(/Git Bash/);
+		expect(t).toContain("%USERPROFILE%");
 	});
 });
 
@@ -734,6 +835,11 @@ describe("English-only", () => {
 	it("pr template contains no CJK characters", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		expect(readPr()).not.toMatch(CJK_AND_OTHER_NON_LATIN);
+	});
+
+	it("local-run template contains no CJK characters", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		expect(readLocalRun()).not.toMatch(CJK_AND_OTHER_NON_LATIN);
 	});
 });
 

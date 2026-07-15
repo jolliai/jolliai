@@ -1234,3 +1234,189 @@ describe("pushBatch", () => {
 		expect(r.results[0].attachments[0]).toMatchObject({ clientKey: "k", ok: false, error: "att boom" });
 	});
 });
+
+describe("listWorkflows", () => {
+	const LIST_WF_ENTRY = {
+		name: "list_workflows",
+		description: "List runnable workflows",
+		inputSchema: { type: "object", properties: {} },
+	};
+	// The REAL backend `list_workflows` entry shape (captured live): numeric `id`,
+	// a human-readable `name`, `destination.syncProtocol` (not backingType), and a
+	// JRN identity (no numeric spaceId). `name` is carried through for display;
+	// other extra fields (type, …) are ignored by the parser.
+	const WF_JRN = "jrn:/global:spaces:space/impact-1783452586552";
+	const WF = {
+		id: 7,
+		name: "Impact Analysis",
+		destination: { type: "space", jrn: WF_JRN, syncProtocol: "git", autoApply: true },
+	};
+
+	/**
+	 * Routes the two round-trips listWorkflows makes: the manifest fetch
+	 * (`GET /api/mcp/manifest`) and the tool invocation
+	 * (`POST /api/mcp/tools/list_workflows`, the conventional endpoint since the
+	 * entry carries no binding). `invoke` omitted ⇒ the invocation must not fire.
+	 */
+	function routed(manifest: () => Response, invoke?: () => Response): typeof fetch {
+		return (async (url: string | URL | Request) => {
+			const u = String(url);
+			if (u.endsWith("/api/mcp/manifest")) {
+				return manifest();
+			}
+			if (u.includes("/api/mcp/tools/list_workflows")) {
+				if (!invoke) {
+					throw new Error(`unexpected invocation of ${u}`);
+				}
+				return invoke();
+			}
+			throw new Error(`unexpected url ${u}`);
+		}) as typeof fetch;
+	}
+
+	it("returns the parsed workflows from a { workflows: [...] } invocation body", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_WF_ENTRY] }),
+				() => jsonResponse(200, { workflows: [WF] }),
+			),
+		);
+		const workflows = await c.listWorkflows();
+		expect(workflows).toEqual([
+			{ id: 7, name: "Impact Analysis", destination: { syncProtocol: "git", autoApply: true, jrn: WF_JRN } },
+		]);
+		// The numeric id is preserved as a number (start_local_run's schema wants an integer).
+		expect(typeof workflows[0].id).toBe("number");
+	});
+
+	it("carries a non-empty string `name` for display, and omits it when absent, blank, or non-string", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_WF_ENTRY] }),
+				() =>
+					jsonResponse(200, {
+						workflows: [
+							WF,
+							{ id: 8, name: "  ", destination: { syncProtocol: "git", autoApply: true, jrn: WF_JRN } },
+							{ id: 9, name: 42, destination: { syncProtocol: "git", autoApply: true, jrn: WF_JRN } },
+							{ id: 10, destination: { syncProtocol: "git", autoApply: true, jrn: WF_JRN } },
+						],
+					}),
+			),
+		);
+		const workflows = await c.listWorkflows();
+		expect(workflows.map((w) => w.name)).toEqual(["Impact Analysis", undefined, undefined, undefined]);
+	});
+
+	it("accepts a bare top-level array invocation body", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_WF_ENTRY] }),
+				() => jsonResponse(200, [WF]),
+			),
+		);
+		const workflows = await c.listWorkflows();
+		expect(workflows.map((w) => w.id)).toEqual([7]);
+	});
+
+	it("returns [] (without invoking) when `list_workflows` is absent from the manifest", async () => {
+		const other = { name: "other_tool", description: "d", inputSchema: { type: "object", properties: {} } };
+		const c = client(routed(() => jsonResponse(200, { tools: [other] })));
+		await expect(c.listWorkflows()).resolves.toEqual([]);
+	});
+
+	it("returns [] when platform tools are off / the manifest is empty", async () => {
+		const c = client(routed(() => jsonResponse(200, {})));
+		await expect(c.listWorkflows()).resolves.toEqual([]);
+	});
+
+	it("returns [] when the manifest fetch itself fails (404 surface disabled)", async () => {
+		const c = client(routed(() => jsonResponse(404, { error: "not_found" })));
+		await expect(c.listWorkflows()).resolves.toEqual([]);
+	});
+
+	it("returns [] when the invocation is a non-2xx", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_WF_ENTRY] }),
+				() => jsonResponse(500, { error: "boom" }),
+			),
+		);
+		await expect(c.listWorkflows()).resolves.toEqual([]);
+	});
+
+	it("returns [] when the invocation fetch rejects (network error / abort / timeout)", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_WF_ENTRY] }),
+				() => {
+					throw new Error("network down");
+				},
+			),
+		);
+		await expect(c.listWorkflows()).resolves.toEqual([]);
+	});
+
+	it("returns [] when the invocation body isn't JSON (proxy page)", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_WF_ENTRY] }),
+				() => textResponse(200, "<html>OK</html>"),
+			),
+		);
+		await expect(c.listWorkflows()).resolves.toEqual([]);
+	});
+
+	it("drops malformed workflow entries but keeps the valid ones", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_WF_ENTRY] }),
+				() =>
+					jsonResponse(200, {
+						workflows: [
+							WF,
+							"not-an-object",
+							{ id: "", destination: { syncProtocol: "git", autoApply: true, jrn: "jrn:x" } }, // empty id, no slug
+							{ id: 8, name: "no_dest" },
+							{ id: 8, destination: null },
+							{ id: 8, destination: [] },
+							{ id: 8, destination: { syncProtocol: 1, autoApply: true, jrn: "jrn:x" } }, // bad syncProtocol
+							{ id: 8, destination: { syncProtocol: "git", autoApply: "yes", jrn: "jrn:x" } }, // bad autoApply
+							{ id: 8, destination: { syncProtocol: "git", autoApply: true, jrn: "" } }, // empty jrn
+							{ id: 8, destination: { syncProtocol: "git", autoApply: true } }, // missing jrn
+						],
+					}),
+			),
+		);
+		const workflows = await c.listWorkflows();
+		expect(workflows.map((w) => w.id)).toEqual([7]);
+	});
+
+	it("reads the identifier from `slug` when `id` is absent", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_WF_ENTRY] }),
+				() =>
+					jsonResponse(200, {
+						workflows: [
+							{
+								slug: "wf-slug",
+								destination: {
+									syncProtocol: "git",
+									autoApply: false,
+									jrn: "jrn:/global:spaces:space/s2",
+								},
+							},
+						],
+					}),
+			),
+		);
+		const workflows = await c.listWorkflows();
+		expect(workflows).toEqual([
+			{
+				id: "wf-slug",
+				destination: { syncProtocol: "git", autoApply: false, jrn: "jrn:/global:spaces:space/s2" },
+			},
+		]);
+	});
+});

@@ -22,6 +22,7 @@ import { runGuidedFrontDoor } from "./commands/GuidedFrontDoor.js";
 import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { getHelpGroup } from "./commands/HelpGroups.js";
 import { registerBindCommand, registerPushCommand, registerSpacesCommand } from "./commands/JolliCloudCommands.js";
+import { registerLocalRunOfferCommand } from "./commands/LocalRunOfferCommand.js";
 import { registerMcpCommand } from "./commands/McpCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
 import { registerPrDescriptionCommand } from "./commands/PrDescriptionCommand.js";
@@ -166,6 +167,7 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"backfill",
 	"pr-description",
 	"queue-status",
+	"local-run-workflows",
 	"compile",
 	"graph",
 	"export",
@@ -351,6 +353,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerSpacesCommand(program);
 	registerBindCommand(program);
 	registerQueueStatusCommand(program);
+	registerLocalRunOfferCommand(program);
 	registerCompileCommand(program);
 	registerGraphCommand(program);
 	registerMigrateCommand(program);
