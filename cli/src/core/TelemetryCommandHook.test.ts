@@ -5,7 +5,7 @@ import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { initTelemetry, shutdownTelemetry } from "./Telemetry.js";
 import { readTelemetryEvents } from "./TelemetryBuffer.js";
-import { commandPath, installCommandTelemetryHooks } from "./TelemetryCommandHook.js";
+import { commandPath, installCommandTelemetryHooks, trackCommandFailureIfPending } from "./TelemetryCommandHook.js";
 
 let cwd: string;
 
@@ -70,6 +70,39 @@ describe("installCommandTelemetryHooks", () => {
 	it("skips the session-level command_invoked for `mcp` (JOLLI-1959 — the MCP server emits per-tool events)", async () => {
 		const program = programWith(() => {});
 		await program.parseAsync(["node", "jolli", "mcp"]);
+		expect(await readTelemetryEvents(cwd)).toEqual([]);
+	});
+
+	it("trackCommandFailureIfPending records command_invoked{ok:false} after a thrown action (JOLLI-1960)", async () => {
+		const program = programWith(() => {
+			throw new Error("boom");
+		});
+		await expect(program.parseAsync(["node", "jolli", "recall"])).rejects.toThrow("boom");
+		// postAction was skipped, so nothing is buffered yet…
+		expect(await readTelemetryEvents(cwd)).toEqual([]);
+		// …until the CLI's top-level catch records the failure.
+		trackCommandFailureIfPending();
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.eventName).toBe("command_invoked");
+		expect(e.properties).toMatchObject({ command: "recall", ok: false });
+		expect(typeof e.properties.duration_ms).toBe("number");
+	});
+
+	it("trackCommandFailureIfPending is a no-op after a successful command", async () => {
+		const program = programWith(() => {});
+		await program.parseAsync(["node", "jolli", "recall"]);
+		trackCommandFailureIfPending();
+		const events = await readTelemetryEvents(cwd);
+		expect(events).toHaveLength(1); // only the success event, no extra failure row
+		expect(events[0].properties.ok).toBe(true);
+	});
+
+	it("trackCommandFailureIfPending skips a failed `mcp` (per-tool events come from the MCP server)", async () => {
+		const program = programWith(() => {
+			throw new Error("boom");
+		});
+		await expect(program.parseAsync(["node", "jolli", "mcp"])).rejects.toThrow("boom");
+		trackCommandFailureIfPending();
 		expect(await readTelemetryEvents(cwd)).toEqual([]);
 	});
 });
