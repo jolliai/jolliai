@@ -8,12 +8,19 @@ vi.mock("../core/SessionTracker.js", () => ({
 	loadConfig: vi.fn().mockResolvedValue({}),
 }));
 
+// Mock the telemetry flush so tests can assert the hook writes the required
+// JSON response BEFORE flushing, and passes a short per-batch timeout.
+vi.mock("../core/TelemetryStartup.js", () => ({
+	flushTelemetryNow: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Suppress console output
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
 import { saveSession } from "../core/SessionTracker.js";
+import { flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { handleGeminiAfterAgentHook } from "./GeminiAfterAgentHook.js";
 
 /** Helper to mock stdin with given content */
@@ -110,6 +117,25 @@ describe("GeminiAfterAgentHook", () => {
 
 		// Gemini hooks must write JSON to stdout
 		expect(writes.some((w) => w.includes("{}"))).toBe(true);
+	});
+
+	it("writes the JSON response before flushing telemetry, with a short per-batch timeout", async () => {
+		const order: string[] = [];
+		vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+			order.push(`stdout:${String(chunk).trim()}`);
+			return true;
+		});
+		vi.mocked(flushTelemetryNow).mockImplementationOnce(async () => {
+			order.push("flush");
+		});
+		mockStdin(JSON.stringify({ session_id: "s", transcript_path: "/p", cwd: "/c" }));
+
+		await handleGeminiAfterAgentHook();
+
+		// Response first, flush second — a slow network must not delay the reply
+		// Gemini is waiting on.
+		expect(order).toEqual(["stdout:{}", "flush"]);
+		expect(flushTelemetryNow).toHaveBeenCalledWith("/c", { timeoutMs: 2_000 });
 	});
 
 	it("should prefer GEMINI_PROJECT_DIR over hookData.cwd", async () => {

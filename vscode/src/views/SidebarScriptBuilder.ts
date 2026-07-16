@@ -5258,13 +5258,21 @@ export function buildSidebarScript(): string {
     // branches[0]); second message overrides that pick with the workspace
     // branch. Net effect: webview state.selectedRepoName / selectedBranchName
     // collapse back to the workspace identity and the chrome lifts.
+    // The two messages are ONE user action, so the second carries silent:true
+    // to suppress its branch_switched telemetry — otherwise a single reset
+    // would emit both repo_switched and branch_switched and inflate the switch
+    // metrics (mirrors IntelliJ's onBranchSelected(trackSwitch=false) cascade).
+    // If there's no current repo to reset to, the branch message is the only
+    // one sent, so it must stay non-silent to still count as one switch.
     const resetBtn = e.target.closest('[data-action="reset-to-workspace"]');
     if (resetBtn) {
+      var sentRepoReset = false;
       if (state.currentRepoName) {
         vscode.postMessage({ type: 'selection:request', repoName: state.currentRepoName });
+        sentRepoReset = true;
       }
       if (state.branchName) {
-        vscode.postMessage({ type: 'selection:request', branchName: state.branchName });
+        vscode.postMessage({ type: 'selection:request', branchName: state.branchName, silent: sentRepoReset });
       }
       e.stopPropagation();
       return;

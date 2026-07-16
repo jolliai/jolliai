@@ -142,9 +142,11 @@ export async function handleStopHook(): Promise<void> {
 	// the "using the agent but not committing" case that the post-commit flush
 	// misses. Awaited (not fire-and-forget) so the short-lived hook process does
 	// not exit before the POST completes; the hook runs `async: true`, so this
-	// never blocks the agent. `flushTelemetryNow` re-gates consent, has its own
-	// timeout, no-ops on an empty buffer, and never throws.
-	await flushTelemetryNow(projectDir);
+	// never blocks the agent. `flushTelemetryNow` re-gates consent, no-ops on an
+	// empty buffer, and never throws. Pass a short per-batch timeout (matching the
+	// CLI exit path) so a slow network can't keep the hook process alive on the
+	// flusher's 10s default.
+	await flushTelemetryNow(projectDir, { timeoutMs: 2_000 });
 }
 
 // ─── Discovery orchestration ────────────────────────────────────────────────

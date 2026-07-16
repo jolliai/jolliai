@@ -186,6 +186,29 @@ class TelemetryFlusherTest {
     }
 
     @Test
+    fun `backfilling eventId onto an empty-object line produces valid JSON (no trailing comma)`() {
+        // A compact `{}` line would hit the string-splice fast path and produce
+        // `{"eventId":"…",}` — a trailing comma → invalid JSON → the whole batch
+        // is rejected by the backend forever. Guard: empty objects fall to the
+        // parser-based path instead. Defensive only (normal writes never emit
+        // `{}`), but a poisoned line must not be able to jam delivery.
+        val queue = File("$cwd/.jolli/jollimemory/telemetry-queue.ndjson")
+        queue.parentFile.mkdirs()
+        queue.writeText("{}\n{ }\n", Charsets.UTF_8)
+
+        val sender = CapturingSender(ok = true)
+        TelemetryFlusher.flush(cwd, origin = "https://jolli.ai", sender = sender)
+
+        sender.calls shouldHaveSize 1
+        // The batch body must be parseable — the pre-fix trailing comma made it not.
+        val body = com.google.gson.JsonParser.parseString(sender.calls[0].body).asJsonObject
+        val events = body.getAsJsonArray("events")
+        events shouldHaveSize 2
+        for (e in events) e.asJsonObject.get("eventId").asString.isNotEmpty() shouldBe true
+        TelemetryBuffer.readLines(cwd) shouldHaveSize 0
+    }
+
+    @Test
     fun `groups by install_id so every batch carries a single install_id`() {
         TelemetryBuffer.append(cwd, env("A", seq = 0))
         TelemetryBuffer.append(cwd, env("B", seq = 1))

@@ -51,7 +51,7 @@ object TelemetryEvents {
                 "User committed a memory via the Commit button. Props: files_bucket (bucketed changed-file count), " +
                 "has_conversations (bool), context_bucket (bucketed plans/context count).",
             "memory_expanded" to "A committed memory's details were expanded. Props: expanded.",
-            "memory_item_opened" to "An item inside a memory was opened. Props: item_type (discriminator).",
+            "memory_item_opened" to "An item inside a memory was opened. Props: item_type (discriminator: conversation/file/plan/note/reference/shipped); render (conversation only: live/stored); source (conversation only: transcript source); status (file only: git status code).",
             "session_resumed" to "A conversation session was resumed in a terminal. Props: source (discriminator).",
             "recall_prompt_copied" to "A recall prompt was copied to the clipboard. Props: none.",
             "memory_pinned" to "An item was pinned. Props: kind (discriminator).",

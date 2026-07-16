@@ -46,10 +46,32 @@ export function commandPath(cmd: Command): string {
  */
 let pending: { readonly command: string; readonly start: number } | null = null;
 
+/**
+ * Root-level name of the command commander actually resolved this run (e.g.
+ * `telemetry` for `telemetry inspect`, `recall` for `recall`). Set by
+ * `preAction`, so it reflects the parsed command tree rather than an argv
+ * position — robust even if global options are ever added before the
+ * subcommand. `null` when no action ran. See `shouldSkipExitFlush`.
+ */
+let invokedRootCommand: string | null = null;
+
+/**
+ * True when the resolved command belongs to the `telemetry` group, so the CLI's
+ * exit-flush should be skipped: `telemetry off` clears the buffer and
+ * `telemetry inspect` must not transmit. Derived from the commander-parsed
+ * command (via `preAction`), not `process.argv[2]` — the positional check broke
+ * silently the moment a global option preceded the subcommand.
+ */
+export function shouldSkipExitFlush(): boolean {
+	return invokedRootCommand === "telemetry";
+}
+
 /** Register the `command_invoked` auto-emit hooks on the root program. */
 export function installCommandTelemetryHooks(program: Command): void {
 	program.hook("preAction", (_thisCommand, actionCommand) => {
-		pending = { command: commandPath(actionCommand), start: Date.now() };
+		const command = commandPath(actionCommand);
+		pending = { command, start: Date.now() };
+		invokedRootCommand = command.split(" ")[0] ?? null;
 	});
 	program.hook("postAction", (_thisCommand, actionCommand) => {
 		const start = pending?.start;

@@ -179,7 +179,14 @@ object TelemetryFlusher {
                 line
             } else {
                 val trimmed = line.trim()
-                if (!hasEventId && trimmed.startsWith("{")) {
+                // The fast path splices `"eventId":...,` right after the opening
+                // brace, so it only produces valid JSON when at least one more
+                // property follows. An empty object (`{}`, or `{ }` with padding)
+                // would splice to `{"eventId":"…",}` (trailing comma → invalid
+                // JSON → the whole batch is rejected forever). Only take the fast
+                // path when the object already has a property; empty objects fall
+                // to the parser-based path, which re-serializes cleanly.
+                if (!hasEventId && trimmed.startsWith("{") && !obj.entrySet().isEmpty()) {
                     """{"eventId":"${legacyEventId(trimmed)}",${trimmed.substring(1)}"""
                 } else {
                     obj.addProperty("eventId", legacyEventId(trimmed))

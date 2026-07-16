@@ -3085,6 +3085,37 @@ describe("SidebarWebviewProvider", () => {
 		expect(track).toHaveBeenCalledWith("branch_switched", { is_foreign: true });
 	});
 
+	it("silent:true suppresses branch_switched (the reset-to-workspace cascade — one action, one event)", () => {
+		const view = makeMockView();
+		const provider = makeSelectionProvider({
+			listRepos: vi.fn().mockReturnValue([{ repoName: "workspace-repo", isCurrent: true }]),
+			listBranches: vi.fn().mockReturnValue(["main", "feature-x"]),
+			currentRepoName: "workspace-repo",
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		track.mockClear();
+		// The second message of a reset-to-workspace click carries silent:true so it
+		// doesn't double-count with the repo_switched from the first message.
+		view.webview.triggerMessage({ type: "selection:request", branchName: "main", silent: true });
+		expect(track).not.toHaveBeenCalledWith("branch_switched", expect.anything());
+	});
+
+	it("silent:true suppresses repo_switched (defensive: same cascade flag on the repo message)", () => {
+		const view = makeMockView();
+		const provider = makeSelectionProvider({
+			listRepos: vi.fn().mockReturnValue([
+				{ repoName: "workspace-repo", isCurrent: true },
+				{ repoName: "other-repo", isCurrent: false, remoteUrl: "git@x:y" },
+			]),
+			listBranches: vi.fn().mockReturnValue(["main"]),
+			currentRepoName: "workspace-repo",
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		track.mockClear();
+		view.webview.triggerMessage({ type: "selection:request", repoName: "other-repo", silent: true });
+		expect(track).not.toHaveBeenCalledWith("repo_switched", expect.anything());
+	});
+
 	it("pushes selection:repos and selection:branches for the current repo on ready", async () => {
 		const view = makeMockView();
 		const listRepos = vi.fn().mockReturnValue([
