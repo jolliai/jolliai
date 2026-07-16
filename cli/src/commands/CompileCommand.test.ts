@@ -175,7 +175,7 @@ describe("registerCompileCommand", () => {
 		expect(mockRenderTopicKBWiki).toHaveBeenCalledOnce();
 		expect(mockCompileAllRepos).not.toHaveBeenCalled();
 		expect(stdout).toContain("Done:");
-		expect(stdout).toContain("3 source(s)");
+		expect(stdout).toContain("3 new commit summaries");
 	});
 
 	it("--cwd: drains with a per-write writeGuard (lock released during the LLM phase, not held across the whole drain)", async () => {

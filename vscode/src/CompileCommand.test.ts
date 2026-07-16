@@ -142,7 +142,23 @@ describe("registerCompileCommand", () => {
 
 		await registeredHandlers.get("jollimemory.compileNow")?.();
 
-		expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("5 source(s) across 2 repo(s)"));
+		expect(showInformationMessage).toHaveBeenCalledWith(
+			expect.stringContaining("added 5 new commit summaries across 2 repo(s)"),
+		);
+	});
+
+	it("shows 'already up to date' when nothing new was ingested", async () => {
+		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test", localFolder: "/mb" });
+		mockCompileAllRepos.mockResolvedValue({
+			repos: [{ folder: "jolli", ingested: 0, batches: 0 }],
+			totalIngested: 0,
+			failed: 0,
+		});
+		registerCompileCommand(makeOpts());
+
+		await registeredHandlers.get("jollimemory.compileNow")?.();
+
+		expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("already up to date"));
 	});
 
 	it("surfaces failed count in the success toast", async () => {

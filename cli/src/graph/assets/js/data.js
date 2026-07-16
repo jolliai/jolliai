@@ -105,6 +105,66 @@
       categoryAgg.get(key).edges.push(e);
     }
 
+    // --- Deterministic co-change topic↔topic edges (parallel to graph.edges) ---
+    // A separate layer with TOPIC endpoints (fromTopic/toTopic), NOT unit ids — so
+    // it gets its own indexes and its own resolve/draw path. Older graph.json (pre
+    // schema v4) lacks the field; default to [] so the viz stays a no-op there.
+    const coChangeTopicEdges = graph.coChangeTopicEdges || [];
+    // topic slug -> [{ peerTopic, edge }] adjacency.
+    const coChangeByTopic = new Map();
+    for (const e of coChangeTopicEdges) {
+      if (!coChangeByTopic.has(e.fromTopic)) coChangeByTopic.set(e.fromTopic, []);
+      if (!coChangeByTopic.has(e.toTopic)) coChangeByTopic.set(e.toTopic, []);
+      coChangeByTopic.get(e.fromTopic).push({ peerTopic: e.toTopic, edge: e });
+      coChangeByTopic.get(e.toTopic).push({ peerTopic: e.fromTopic, edge: e });
+    }
+    // Category-pair aggregation of co-change edges (its own map — NEVER merged into
+    // categoryAgg, whose entries are unit edges the panel reads via unitsById).
+    const coChangeCategoryAgg = new Map(); // "a|b" sorted -> { a, b, edges: [] }
+    for (const e of coChangeTopicEdges) {
+      const ca = topicsBySlug.get(e.fromTopic)?.categoryId;
+      const cb = topicsBySlug.get(e.toTopic)?.categoryId;
+      if (!ca || !cb || ca === cb) continue;
+      const [a, b] = ca < cb ? [ca, cb] : [cb, ca];
+      const key = a + "|" + b;
+      if (!coChangeCategoryAgg.has(key)) coChangeCategoryAgg.set(key, { a, b, edges: [] });
+      coChangeCategoryAgg.get(key).edges.push(e);
+    }
+
+    // Unified overview pairs: typed cross-category unit edges AND deterministic
+    // co-change edges, merged per category pair so the overview draws ONE bubble
+    // per pair regardless of which layer(s) connect them. After per-category edge
+    // batching, typed cross-category edges vanish and these become co-change-only —
+    // the overview still shows the cross-category structure via this merge.
+    const overviewPairs = [];
+    {
+      const merged = new Map(); // "a|b" -> { a, b, typed: [], coChange: [] }
+      const bucket = (a, b) => {
+        const k = a + "|" + b;
+        let p = merged.get(k);
+        if (!p) { p = { a, b, typed: [], coChange: [] }; merged.set(k, p); }
+        return p;
+      };
+      for (const agg of categoryAgg.values()) bucket(agg.a, agg.b).typed = agg.edges;
+      for (const agg of coChangeCategoryAgg.values()) bucket(agg.a, agg.b).coChange = agg.edges;
+      for (const p of merged.values()) {
+        const count = p.typed.length + p.coChange.length;
+        // Color by dominant TYPED type; co-change-only pairs use the neutral type.
+        let type = "co-change";
+        if (p.typed.length) {
+          const c = {};
+          for (const e of p.typed) c[e.type] = (c[e.type] || 0) + 1;
+          type = Object.entries(c).sort((x, y) => y[1] - x[1])[0][0];
+        }
+        // ELK rank direction: majority direction of typed edges (a→b when most
+        // point from a). Co-change is undirected → default a→b.
+        let ab = 0;
+        for (const e of p.typed) if (unitCategory(unitsById.get(e.from)) === p.a) ab++;
+        const src = ab >= p.typed.length - ab ? p.a : p.b;
+        overviewPairs.push({ a: p.a, b: p.b, count, type, src, dst: src === p.a ? p.b : p.a });
+      }
+    }
+
     window.WikiData = {
       graph,
       categories: graph.categories,
@@ -118,7 +178,13 @@
       topicsByCategory,
       adj,
       categoryAgg: [...categoryAgg.values()],
+      overviewPairs,
       categoryOfUnit: (unitId) => unitCategory(unitsById.get(unitId)),
+      categoryOfTopic: (slug) => topicsBySlug.get(slug)?.categoryId,
+      // Deterministic co-change layer (topic↔topic). See above.
+      coChangeTopicEdges,
+      coChangeByTopic,
+      coChangeCategoryAgg: [...coChangeCategoryAgg.values()],
       // Relationship types with no direction — drawn as a single line, no arrow.
       symmetricTypes: SYMMETRIC,
     };

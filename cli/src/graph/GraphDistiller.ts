@@ -9,7 +9,9 @@
  * Three phases:
  *   1. graph-categories — one call: group all topics into categories.
  *   2. graph-units      — one call per topic (fanned out): distil units.
- *   3. graph-edges      — one call: typed relationships across all units.
+ *   3. graph-edges      — one call PER CATEGORY (fanned out): typed relationships
+ *      among that category's units only. Cross-category relationships are NOT an
+ *      LLM job — they are the deterministic co-change layer (`CoChangeEdges.ts`).
  */
 
 import { mapWithConcurrency } from "../core/Concurrency.js";
@@ -38,6 +40,12 @@ const CATEGORIES_MAX_TOKENS = 16_384;
 const UNITS_MAX_TOKENS = 4_096;
 const EDGES_MAX_TOKENS = 32_000;
 const UNITS_CONCURRENCY = 4;
+const EDGES_CONCURRENCY = 4;
+/** graph-units attempts per topic. A malformed / unparseable body (or one whose
+ * every unit is unusable) is retried — the failures are independent, so 2 retries
+ * cut the observed ~20% single-topic miss rate to ~1%. A genuine `{units:[]}` is
+ * accepted on the first try, never retried. */
+const UNITS_MAX_ATTEMPTS = 3;
 
 /**
  * Reports a one-line, human-readable progress message for UI surfaces (the VS
@@ -219,39 +227,13 @@ async function distillCategories(
 }
 
 /**
- * Phase 2: units for one topic. Returns globally-namespaced units.
- *
- * `strict` (incremental path) turns an UNPARSEABLE response into a throw so the
- * caller fails the round and keeps the prior good graph — a dirty topic's units
- * must never be silently overwritten with nothing. On the full path `strict` is
- * off: a parse failure degrades to no units for that topic (there is no prior
- * graph to protect). A response that parses to `{units:[]}` (a topic the LLM
- * legitimately found no units in) is NOT a failure and never throws.
+ * Builds canonical units from a raw `units[]`, skipping any entry with no id or no
+ * recognizable kind. Shared across every attempt of {@link distillUnitsForTopic}.
  */
-async function distillUnitsForTopic(
-	topic: DistillTopicInput,
-	config: LlmConfig,
-	opts?: { readonly strict?: boolean },
-): Promise<DistilledUnit[]> {
-	const result = await callLlm({
-		action: "graph-units",
-		params: { topicTitle: topic.title, content: topic.content || "(empty)" },
-		model: resolveModelId(config.model),
-		maxTokens: UNITS_MAX_TOKENS,
-		...llmCredentials(config),
-	});
-	const parsed = parseJsonObject<UnitsResponse>(result.text);
-	// Strict (incremental): require an actual `units` ARRAY, not merely parseable JSON.
-	// `{}` / `{"foo":1}` parse fine but would degrade to zero units and overwrite a
-	// dirty topic's baseline units — so a missing/non-array field fails the round too.
-	// `{"units":[]}` (array present, empty) is a legitimate "no units" and does not throw.
-	const rawUnits = parsed?.units;
-	if (opts?.strict && !Array.isArray(rawUnits)) {
-		throw new Error(`graph-units returned no units array for topic ${topic.slug}`);
-	}
+function buildUnitsFromRaw(topic: DistillTopicInput, rawUnits: RawUnit[]): DistilledUnit[] {
 	const units: DistilledUnit[] = [];
 	const seenLocal = new Set<string>();
-	for (const u of rawUnits ?? []) {
+	for (const u of rawUnits) {
 		const localId = asString(u.id).trim();
 		// Canonical `kinds[]` (deduped, ≤3); also coerces a legacy scalar `kind`.
 		// A unit with no valid id or no valid kind is unusable → skip it.
@@ -274,18 +256,75 @@ async function distillUnitsForTopic(
 			anchors: { files: asStringArray(u.anchors?.files), commits: asStringArray(u.anchors?.commits) },
 		});
 	}
-	// Fail closed: the LLM returned a NON-EMPTY units array but every entry was
-	// unusable (no id, or no recognizable kind). That is a malformed round, not a
-	// legitimate "no units" (which is an empty `{units:[]}` and is left untouched
-	// above). Throwing keeps the incremental path on its prior good graph; on the
-	// full path the caller's onError degrades this one topic to [] with a warning
-	// instead of silently emitting a topic that lost all its units.
-	if (Array.isArray(rawUnits) && rawUnits.length > 0 && units.length === 0) {
+	return units;
+}
+
+/**
+ * Phase 2: units for one topic. Returns globally-namespaced units.
+ *
+ * graph-units occasionally returns an unparseable body (or one whose every unit is
+ * unusable) for a large, code-heavy topic even when the same page distills fine on
+ * the next try — the failures are independent, so we retry up to
+ * {@link UNITS_MAX_ATTEMPTS} times. A parseable `{units:[]}` is a legitimate "no
+ * units" answer, returned immediately and never retried.
+ *
+ * After the last attempt still yields nothing usable, this THROWS. The CALLER
+ * decides fatality by whether it passes an onError to mapWithConcurrency:
+ *   - full build (`distillGraph`) passes one that logs a VISIBLE warning and
+ *     degrades this one topic to [] — so a distillation miss is no longer a silent
+ *     0-units topic;
+ *   - incremental (`distillGraphIncremental`) passes none, so the throw aborts the
+ *     round and the prior good graph is kept (a dirty topic's units are never
+ *     silently overwritten with nothing).
+ */
+async function distillUnitsForTopic(topic: DistillTopicInput, config: LlmConfig): Promise<DistilledUnit[]> {
+	for (let attempt = 1; attempt <= UNITS_MAX_ATTEMPTS; attempt++) {
+		const result = await callLlm({
+			action: "graph-units",
+			params: { topicTitle: topic.title, content: topic.content || "(empty)" },
+			model: resolveModelId(config.model),
+			maxTokens: UNITS_MAX_TOKENS,
+			...llmCredentials(config),
+		});
+		const rawUnits = parseJsonObject<UnitsResponse>(result.text)?.units;
+
+		if (Array.isArray(rawUnits)) {
+			const units = buildUnitsFromRaw(topic, rawUnits);
+			if (units.length > 0) return units;
+			// `{units:[]}` (array present, empty) is a legitimate "no units" — accept it.
+			if (rawUnits.length === 0) return units;
+			// Array present and non-empty, but every entry was unusable (no id / no kind).
+			if (attempt < UNITS_MAX_ATTEMPTS) {
+				log.warn(
+					"graph-units for topic %s: %d raw unit(s) but none had a valid id + kinds (attempt %d/%d) -- retrying",
+					topic.slug,
+					rawUnits.length,
+					attempt,
+					UNITS_MAX_ATTEMPTS,
+				);
+				continue;
+			}
+			throw new Error(
+				`graph-units for topic ${topic.slug}: ${rawUnits.length} raw unit(s) but none had a valid id + kinds (after ${UNITS_MAX_ATTEMPTS} attempts)`,
+			);
+		}
+
+		// Unparseable JSON, or a parseable object with no `units` array.
+		if (attempt < UNITS_MAX_ATTEMPTS) {
+			log.warn(
+				"graph-units for topic %s returned no units array (attempt %d/%d) -- retrying",
+				topic.slug,
+				attempt,
+				UNITS_MAX_ATTEMPTS,
+			);
+			continue;
+		}
 		throw new Error(
-			`graph-units for topic ${topic.slug}: ${rawUnits.length} raw unit(s) but none had a valid id + kinds`,
+			`graph-units returned no units array for topic ${topic.slug} (after ${UNITS_MAX_ATTEMPTS} attempts)`,
 		);
 	}
-	return units;
+	// Unreachable: each loop iteration returns or throws. Present for the type checker.
+	throw new Error(`graph-units for topic ${topic.slug}: exhausted ${UNITS_MAX_ATTEMPTS} attempts`);
 }
 
 /**
@@ -356,6 +395,66 @@ async function distillEdges(
 	return edges;
 }
 
+/** Groups units by their topic's category id. Units whose topic is absent from
+ * `topics` are dropped (defensive; assembleGraph would reject a dangling unit). */
+function groupUnitsByCategory(
+	units: ReadonlyArray<DistilledUnit>,
+	topics: ReadonlyArray<DistilledTopic>,
+): Map<string, DistilledUnit[]> {
+	const categoryOf = new Map(topics.map((t) => [t.slug, t.categoryId]));
+	const groups = new Map<string, DistilledUnit[]>();
+	for (const u of units) {
+		const c = categoryOf.get(u.topicSlug);
+		if (c === undefined) continue;
+		let arr = groups.get(c);
+		if (!arr) {
+			arr = [];
+			groups.set(c, arr);
+		}
+		arr.push(u);
+	}
+	return groups;
+}
+
+/**
+ * Phase 3 (per-category): runs the edge LLM once per category, over ONLY that
+ * category's units, and concatenates the results. This replaces the old single
+ * global call. Two consequences fall out of the structure, not extra logic:
+ *   - each call is bounded by one category's unit count (no single call grows
+ *     with the whole graph → no truncation on large repos);
+ *   - cross-category unit edges are impossible (the LLM never sees two categories
+ *     at once) — those relationships are the deterministic co-change layer
+ *     (`CoChangeEdges.ts`) instead. `distillEdges` further drops any returned edge
+ *     whose endpoint is outside the category batch, so this is enforced twice.
+ *
+ * `onlyCategories`, when given, restricts the calls to those category ids (the
+ * incremental path's "affected categories"); otherwise every category runs (full
+ * build). `strict` propagates to each `distillEdges` call: strict means a thrown
+ * error fails the whole round (incremental keeps the prior graph); non-strict
+ * degrades a failed category to no edges (full build has no prior graph to keep).
+ */
+async function distillEdgesForCategories(
+	units: ReadonlyArray<DistilledUnit>,
+	topics: ReadonlyArray<DistilledTopic>,
+	config: LlmConfig,
+	opts?: { readonly strict?: boolean; readonly onlyCategories?: ReadonlyArray<string> },
+): Promise<GraphEdge[]> {
+	const groups = groupUnitsByCategory(units, topics);
+	const targets = opts?.onlyCategories ?? [...groups.keys()];
+	const perCategory = await mapWithConcurrency(
+		targets,
+		EDGES_CONCURRENCY,
+		(catId) => distillEdges(groups.get(catId) ?? [], config, { strict: opts?.strict }),
+		opts?.strict
+			? undefined // strict: a throw must fail the round (keep prior graph) — never swallow
+			: (catId, err) => {
+					log.warn("Edge distillation failed for category %s (non-fatal): %s", catId, (err as Error).message);
+					return [];
+				},
+	);
+	return perCategory.flat();
+}
+
 /** Runs the full three-phase distillation, logging + reporting each phase. */
 export async function distillGraph(
 	input: DistillInput,
@@ -405,14 +504,18 @@ export async function distillGraph(
 		Math.round(performance.now() - t1),
 	);
 
-	// Phase 3/3 — edges (single call over all units; the long pole on big repos).
+	// Phase 3/3 — edges (one call per category, fanned out; intra-category only).
 	const t2 = performance.now();
-	onProgress?.(`linking edges across ${units.length} unit(s)`);
-	const edges = await distillEdges(units, config);
+	onProgress?.(
+		`distilling intra-category edges (${categories.length} categor${categories.length === 1 ? "y" : "ies"})`,
+	);
+	const edges = await distillEdgesForCategories(units, topics, config);
 	log.info(
-		"graph phase 3/3 edges: %d edge(s) over %d unit(s) (%dms)",
+		"graph phase 3/3 edges: %d edge(s) over %d unit(s) in %d categor%s (%dms)",
 		edges.length,
 		units.length,
+		categories.length,
+		categories.length === 1 ? "y" : "ies",
 		Math.round(performance.now() - t2),
 	);
 
@@ -496,8 +599,11 @@ async function distillCategoriesDelta(
  * Incremental distillation. Reuses clean topics' units verbatim from the
  * baseline, re-distills only dirty/new topics, re-categorizes the changed topics
  * via the delta call (clean topics keep their baseline assignment → stable
- * layout), and — when any topic changed — recomputes edges in full over the final
- * unit set (full edges sidesteps unit-id instability and edge merge entirely).
+ * layout), and recomputes edges ONLY for the categories that contain a changed
+ * topic ("affected categories"), merging the fresh edges with the baseline:
+ * clean–clean edges (neither endpoint's topic changed) are kept from the baseline
+ * verbatim so unchanged links never re-shuffle (keep / drop / recompute at edge
+ * granularity); only edges touching a changed topic take the fresh LLM result.
  *
  * A pure-deletion change (dirty ∪ new empty) runs NO LLM: it filters out the
  * deleted topics' units and drops any edge whose endpoint disappeared.
@@ -528,17 +634,18 @@ export async function distillGraphIncremental(
 		let done = 0;
 		const report = (): void => onProgress?.(`extracting units ${done}/${changedTopics.length}`);
 		report();
-		// Fail closed: NO onError swallow + `strict: true`. A dirty/new topic's unit
-		// re-distillation that throws (LLM error) or returns unparseable JSON must
-		// abort the round so `buildKnowledgeGraph`'s non-fatal catch keeps the prior
-		// good graph. Swallowing to `[]` would emit a topic with zero units over a
-		// baseline that had them — data loss, not degradation. (The full path
-		// deliberately tolerates this: it has no prior graph to protect.)
+		// Fail closed: NO onError swallow. A dirty/new topic's unit re-distillation
+		// that throws (LLM error, or an unparseable / all-invalid response that
+		// survived distillUnitsForTopic's retries) must abort the round so
+		// `buildKnowledgeGraph`'s non-fatal catch keeps the prior good graph.
+		// Swallowing to `[]` would emit a topic with zero units over a baseline that
+		// had them — data loss, not degradation. (The full path deliberately tolerates
+		// this via its own onError: it has no prior graph to protect.)
 		const perTopic = await mapWithConcurrency(
 			changedTopics,
 			llmFanoutLimit(UNITS_CONCURRENCY, config),
 			async (topic) => {
-				const r = await distillUnitsForTopic(topic, config, { strict: true });
+				const r = await distillUnitsForTopic(topic, config);
 				done++;
 				report();
 				return r;
@@ -567,8 +674,52 @@ export async function distillGraphIncremental(
 	// --- edges ---
 	let edges: GraphEdge[];
 	if (changedTopics.length > 0) {
-		onProgress?.(`linking edges across ${units.length} unit(s)`);
-		edges = await distillEdges(units, config, { strict: true });
+		// Affected categories = categories that (after re-categorization) contain a
+		// changed topic. Only these are re-run through the edge LLM; every other
+		// category's intra edges are clean–clean and reused from the baseline.
+		const categoryOf = new Map(topics.map((t) => [t.slug, t.categoryId]));
+		const affected = new Set<string>();
+		for (const t of topics) if (changedSlugs.has(t.slug)) affected.add(t.categoryId);
+		onProgress?.(
+			`distilling intra-category edges (${affected.size} affected categor${affected.size === 1 ? "y" : "ies"})`,
+		);
+		const fresh = await distillEdgesForCategories(units, topics, config, {
+			strict: true,
+			onlyCategories: [...affected],
+		});
+
+		// Merge baseline + fresh at edge granularity (keep / drop / recompute):
+		//   - KEEP a baseline edge that is clean–clean (neither endpoint's topic
+		//     changed), intra-category, and whose endpoints still exist → no flicker;
+		//   - TAKE a fresh edge only when it TOUCHES a changed topic (drop fresh
+		//     clean–clean: the baseline copy wins, so untouched links never reshuffle).
+		// Fresh edges are already intra-category (per-category batch). Filtering kept
+		// baseline edges to intra-category too guarantees no stale cross-category unit
+		// edge survives from an older baseline (cross-category is the co-change layer).
+		const unitTopic = new Map(units.map((u) => [u.id, u.topicSlug]));
+		const unitIds = new Set(units.map((u) => u.id));
+		const isCleanClean = (e: GraphEdge): boolean => {
+			const tf = unitTopic.get(e.from);
+			const tt = unitTopic.get(e.to);
+			return tf !== undefined && tt !== undefined && !changedSlugs.has(tf) && !changedSlugs.has(tt);
+		};
+		const isIntraCategory = (e: GraphEdge): boolean => {
+			const cf = categoryOf.get(unitTopic.get(e.from) ?? "");
+			const ct = categoryOf.get(unitTopic.get(e.to) ?? "");
+			return cf !== undefined && cf === ct;
+		};
+		const keptBaseline = prev.edges.filter(
+			(e) => unitIds.has(e.from) && unitIds.has(e.to) && isCleanClean(e) && isIntraCategory(e),
+		);
+		const freshTouching = fresh.filter((e) => !isCleanClean(e));
+		const seen = new Set<string>();
+		edges = [];
+		for (const e of [...keptBaseline, ...freshTouching]) {
+			const key = `${e.from}|${e.to}|${e.type}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			edges.push(e);
+		}
 	} else {
 		// Pure deletion: removing units can only invalidate edges, never create
 		// them. Drop any edge whose endpoint no longer exists; no LLM.

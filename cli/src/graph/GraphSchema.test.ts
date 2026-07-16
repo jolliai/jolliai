@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
 	assembleGraph,
 	type CategoriesDelta,
+	type CoChangeTopicEdge,
 	type DistilledCategory,
 	type DistilledGraph,
 	type DistilledTopic,
 	diffTopics,
 	dropSubsumedRelatedTo,
+	GRAPH_SCHEMA_VERSION,
 	type GraphEdge,
 	isCanonicalKinds,
 	isFingerprintMap,
@@ -19,6 +21,7 @@ import {
 	toDistilled,
 	UNCATEGORIZED_CATEGORY_ID,
 	UNIT_KINDS,
+	validateCoChangeTopicEdges,
 	validateDistilledGraph,
 } from "./GraphSchema.js";
 
@@ -263,7 +266,7 @@ describe("assembleGraph", () => {
 		const graph = assembleGraph(validGraph(), sources, "2026-06-15T00:00:00.000Z", "");
 
 		expect(graph.generatedAt).toBe("2026-06-15T00:00:00.000Z");
-		expect(graph.schemaVersion).toBe(3);
+		expect(graph.schemaVersion).toBe(GRAPH_SCHEMA_VERSION);
 
 		const t1 = graph.topics.find((t) => t.slug === "t1");
 		expect(t1?.sourceBranches).toEqual(["main", "feature/x"]);
@@ -290,11 +293,10 @@ describe("assembleGraph", () => {
 			edges: 2,
 			intraTopicEdges: 1,
 			crossTopicEdges: 1,
-			crossCategoryEdges: 1,
 		});
 	});
 
-	it("counts a same-category cross-topic edge as crossTopic but not crossCategory, and rolls up zero-unit topics", () => {
+	it("counts a same-category cross-topic edge as crossTopic, and rolls up zero-unit topics", () => {
 		const distill: DistilledGraph = {
 			categories: [{ id: "cat-a", shortTitle: "A", summary: "A." }],
 			topics: [
@@ -324,7 +326,6 @@ describe("assembleGraph", () => {
 		};
 		const graph = assembleGraph(distill, new Map(), "2026-06-15T00:00:00.000Z", "");
 		expect(graph.stats.crossTopicEdges).toBe(1);
-		expect(graph.stats.crossCategoryEdges).toBe(0);
 		// t3 has no units — the `?? 0` rollup path.
 		expect(graph.topics.find((t) => t.slug === "t3")?.unitCount).toBe(0);
 	});
@@ -702,5 +703,125 @@ describe("isCanonicalKinds", () => {
 		expect(isCanonicalKinds("decision")).toBe(false);
 		expect(isCanonicalKinds(undefined)).toBe(false);
 		expect(isCanonicalKinds([1, 2])).toBe(false);
+	});
+});
+
+describe("validateCoChangeTopicEdges", () => {
+	const topics: DistilledTopic[] = [
+		{ slug: "a", shortTitle: "A", summary: "s", title: "A", categoryId: "c1" },
+		{ slug: "b", shortTitle: "B", summary: "s", title: "B", categoryId: "c2" },
+		{ slug: "c", shortTitle: "C", summary: "s", title: "C", categoryId: "c1" },
+	];
+	const good: CoChangeTopicEdge = {
+		fromTopic: "a",
+		toTopic: "b",
+		kind: "co-change",
+		sharedFiles: ["x.ts"],
+		sharedFileCount: 1,
+	};
+
+	it("accepts a well-formed cross-category edge", () => {
+		expect(validateCoChangeTopicEdges([good], topics)).toEqual([]);
+		expect(validateCoChangeTopicEdges([{ ...good, semanticType: "extends" }], topics)).toEqual([]);
+	});
+
+	it("flags an unknown endpoint (either side)", () => {
+		expect(validateCoChangeTopicEdges([{ ...good, toTopic: "ghost" }], topics).join()).toMatch(
+			/unknown toTopic ghost/,
+		);
+		// fromTopic unknown: use a slug that still sorts before toTopic so the only
+		// error raised is the unknown-endpoint one (not a canonical-ordering one).
+		expect(validateCoChangeTopicEdges([{ ...good, fromTopic: "aa-ghost" }], topics).join()).toMatch(
+			/unknown fromTopic aa-ghost/,
+		);
+	});
+
+	it("flags a non-array sharedFiles (count mismatch via the -1 sentinel)", () => {
+		const bad = { ...good, sharedFiles: undefined as unknown as string[], sharedFileCount: 1 };
+		const errs = validateCoChangeTopicEdges([bad], topics).join();
+		expect(errs).toMatch(/sharedFiles must be non-empty/);
+		expect(errs).toMatch(/sharedFileCount 1 != sharedFiles.length -1/);
+	});
+
+	it("flags a self-edge", () => {
+		const errs = validateCoChangeTopicEdges([{ ...good, fromTopic: "a", toTopic: "a" }], topics);
+		expect(errs.join()).toMatch(/self-edge/);
+	});
+
+	it("flags non-canonical ordering", () => {
+		const errs = validateCoChangeTopicEdges([{ ...good, fromTopic: "b", toTopic: "a" }], topics);
+		expect(errs.join()).toMatch(/not canonically ordered/);
+	});
+
+	it("flags two endpoints in the same category", () => {
+		// a and c are both c1.
+		const errs = validateCoChangeTopicEdges([{ ...good, fromTopic: "a", toTopic: "c" }], topics);
+		expect(errs.join()).toMatch(/both endpoints in category c1/);
+	});
+
+	it("flags empty sharedFiles and a count mismatch", () => {
+		expect(validateCoChangeTopicEdges([{ ...good, sharedFiles: [], sharedFileCount: 0 }], topics).join()).toMatch(
+			/sharedFiles must be non-empty/,
+		);
+		expect(validateCoChangeTopicEdges([{ ...good, sharedFileCount: 5 }], topics).join()).toMatch(
+			/sharedFileCount 5 != sharedFiles.length 1/,
+		);
+	});
+
+	it("flags an invalid kind and an invalid semanticType", () => {
+		expect(
+			validateCoChangeTopicEdges([{ ...good, kind: "nope" as CoChangeTopicEdge["kind"] }], topics).join(),
+		).toMatch(/invalid kind nope/);
+		expect(
+			validateCoChangeTopicEdges(
+				[{ ...good, semanticType: "bogus" as CoChangeTopicEdge["semanticType"] }],
+				topics,
+			).join(),
+		).toMatch(/invalid semanticType bogus/);
+	});
+
+	it("flags a duplicate pair", () => {
+		const errs = validateCoChangeTopicEdges([good, good], topics);
+		expect(errs.join()).toMatch(/duplicate pair/);
+	});
+});
+
+describe("assembleGraph (co-change edges)", () => {
+	const distill: DistilledGraph = {
+		categories: [
+			{ id: "c1", shortTitle: "C1", summary: "s" },
+			{ id: "c2", shortTitle: "C2", summary: "s" },
+		],
+		topics: [
+			{ slug: "a", shortTitle: "A", summary: "s", title: "A", categoryId: "c1" },
+			{ slug: "b", shortTitle: "B", summary: "s", title: "B", categoryId: "c2" },
+		],
+		units: [],
+		edges: [],
+	};
+	const coChange: CoChangeTopicEdge = {
+		fromTopic: "a",
+		toTopic: "b",
+		kind: "co-change",
+		sharedFiles: ["x.ts"],
+		sharedFileCount: 1,
+	};
+
+	it("embeds co-change edges and counts them in stats", () => {
+		const graph = assembleGraph(distill, new Map(), "t", "repo", {}, {}, [coChange]);
+		expect(graph.coChangeTopicEdges).toEqual([coChange]);
+		expect(graph.stats.coChangeTopicEdgeCount).toBe(1);
+	});
+
+	it("defaults to an empty co-change layer when none is passed", () => {
+		const graph = assembleGraph(distill, new Map(), "t", "repo", {}, {});
+		expect(graph.coChangeTopicEdges).toEqual([]);
+		expect(graph.stats.coChangeTopicEdgeCount).toBe(0);
+	});
+
+	it("throws when a co-change edge is invalid", () => {
+		expect(() =>
+			assembleGraph(distill, new Map(), "t", "repo", {}, {}, [{ ...coChange, toTopic: "ghost" }]),
+		).toThrow(/validation failed/);
 	});
 });

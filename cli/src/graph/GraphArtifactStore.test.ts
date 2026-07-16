@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { graphJsonPath, readGraph, writeGraphArtifacts } from "./GraphArtifactStore.js";
-import { assembleGraph, type DistilledGraph } from "./GraphSchema.js";
+import { assembleGraph, type DistilledGraph, GRAPH_SCHEMA_VERSION } from "./GraphSchema.js";
 
 function tinyDistill(): DistilledGraph {
 	return {
@@ -68,7 +68,7 @@ describe("readGraph", () => {
 		await writeGraphArtifacts(root, written);
 
 		const got = await readGraph(root);
-		expect(got?.schemaVersion).toBe(3);
+		expect(got?.schemaVersion).toBe(GRAPH_SCHEMA_VERSION);
 		expect(got?.topicFingerprints).toEqual({ t1: "fp" });
 		expect(got?.units).toHaveLength(1);
 	});

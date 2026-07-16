@@ -106,8 +106,14 @@ export function isCanonicalKinds(v: unknown): v is UnitKind[] {
  * is a breaking shape change and must bump this constant again.
  * Bumped 2→3 when `DistilledUnit.kind: UnitKind` became `kinds: UnitKind[]`
  * (multi-label) and four new kinds were added — an output-shape change on `units`.
+ * Bumped 3→4 when the parallel `coChangeTopicEdges` array (deterministic
+ * topic↔topic co-change edges, alongside the LLM `edges`) and the
+ * `coChangeTopicEdgeCount` stat were added. New top-level field ⇒ a baseline
+ * written under v3 lacks it; the version mismatch forces a one-time full rebuild
+ * that regenerates graph.json in the v4 shape (no migration script — the array
+ * is recomputed deterministically every build, never reused from the baseline).
  */
-export const GRAPH_SCHEMA_VERSION = 3;
+export const GRAPH_SCHEMA_VERSION = 4;
 
 /** Category id for topics not grouped into any real category. Shared by the full
  * distiller (backfill) and the incremental merge so both bucket the same way. */
@@ -155,6 +161,32 @@ export interface GraphEdge {
 	readonly type: EdgeType;
 	readonly confidence: number;
 	readonly evidence: string;
+}
+
+/**
+ * A deterministic, topic-to-topic co-change relationship — the parallel edge
+ * layer to {@link GraphEdge}. Produced WITHOUT the LLM (`computeCoChangeTopicEdges`
+ * in `CoChangeEdges.ts`) by intersecting the file anchors of two topics in
+ * DIFFERENT categories. Kept in its own top-level array so the unit-edge schema,
+ * validation, and existing consumers stay untouched (rather than overloading
+ * `GraphEdge` with a topic/unit discriminator).
+ *
+ * - `kind` is the FIXED literal `"co-change"` — the frontend keys "this is a
+ *   deterministic structural edge" off `kind`, never off a mutable type, so a
+ *   later semantic backfill can't make that check brittle.
+ * - `sharedFileCount` is the edge weight (line-width source); it always equals
+ *   `sharedFiles.length`. An IDF-weighted score, if ever added, is a SEPARATE
+ *   field — never folded into this count.
+ * - `semanticType` is an OPTIONAL slow-sweep backfill (extends / caused-by / …);
+ *   absent by default. Its presence never changes the `kind` discriminator.
+ */
+export interface CoChangeTopicEdge {
+	readonly fromTopic: string;
+	readonly toTopic: string;
+	readonly kind: "co-change";
+	readonly sharedFiles: string[];
+	readonly sharedFileCount: number;
+	readonly semanticType?: EdgeType;
 }
 
 /** The raw LLM output: the distilled graph before source-metadata joins / stats. */
@@ -205,8 +237,19 @@ export interface GraphStats {
 	readonly units: number;
 	readonly edges: number;
 	readonly intraTopicEdges: number;
+	/**
+	 * Typed unit↔unit edges spanning two topics. Under per-category edge batching
+	 * the distiller never produces a typed edge across two categories, so every
+	 * cross-topic typed edge is within ONE category — there is no separate
+	 * cross-category count (cross-category coupling is the co-change layer below).
+	 */
 	readonly crossTopicEdges: number;
-	readonly crossCategoryEdges: number;
+	/**
+	 * Count of deterministic topic↔topic co-change edges ({@link CoChangeTopicEdge}).
+	 * ADDITIVE — kept separate from the typed-unit-edge counts above so the panel's
+	 * "links by scope" buckets never mix the two edge populations.
+	 */
+	readonly coChangeTopicEdgeCount: number;
 }
 
 export interface KnowledgeGraph {
@@ -242,6 +285,13 @@ export interface KnowledgeGraph {
 	readonly topics: GraphTopic[];
 	readonly units: DistilledUnit[];
 	readonly edges: GraphEdge[];
+	/**
+	 * Deterministic topic↔topic co-change edges — the parallel layer to `edges`.
+	 * Recomputed in full every build (never reused from the baseline), so it is
+	 * NOT part of the `toDistilled` baseline subset. Inert to older consumers that
+	 * read only `edges`; the new viz renders it as a distinct (dashed) edge class.
+	 */
+	readonly coChangeTopicEdges: CoChangeTopicEdge[];
 }
 
 // -- Validation ---------------------------------------------------------------
@@ -281,6 +331,56 @@ export function validateDistilledGraph(graph: DistilledGraph): string[] {
 		edgePairSeen.add(key);
 	}
 
+	return errors;
+}
+
+/**
+ * Referential + structural check over the deterministic co-change topic edges —
+ * the parallel-layer analogue of {@link validateDistilledGraph}, kept separate so
+ * the unit-edge validator stays untouched. Returns a (possibly empty) list of
+ * human-readable errors; never throws. A non-empty result means the graph must
+ * not ship. Rules:
+ *   - both endpoints are known topic slugs;
+ *   - no self-edge, and the two topics are in DIFFERENT categories (co-change
+ *     topic edges exist ONLY across categories — within a category, relationships
+ *     are expressed as unit↔unit edges);
+ *   - canonical ordering `fromTopic < toTopic`, and no duplicate unordered pair;
+ *   - `kind === "co-change"`; `semanticType` (when present) is a valid EdgeType;
+ *   - `sharedFiles` non-empty and `sharedFileCount === sharedFiles.length`.
+ */
+export function validateCoChangeTopicEdges(
+	edges: ReadonlyArray<CoChangeTopicEdge>,
+	topics: ReadonlyArray<DistilledTopic>,
+): string[] {
+	const errors: string[] = [];
+	const categoryOf = new Map(topics.map((t) => [t.slug, t.categoryId]));
+	const pairSeen = new Set<string>();
+	for (const e of edges) {
+		const tag = `co-change edge ${e.fromTopic}->${e.toTopic}`;
+		if (e.kind !== "co-change") errors.push(`${tag}: invalid kind ${e.kind}`);
+		if (!categoryOf.has(e.fromTopic)) errors.push(`${tag}: unknown fromTopic ${e.fromTopic}`);
+		if (!categoryOf.has(e.toTopic)) errors.push(`${tag}: unknown toTopic ${e.toTopic}`);
+		if (e.fromTopic === e.toTopic) errors.push(`${tag}: self-edge`);
+		else if (e.fromTopic > e.toTopic) errors.push(`${tag}: not canonically ordered (fromTopic < toTopic)`);
+		const ca = categoryOf.get(e.fromTopic);
+		const cb = categoryOf.get(e.toTopic);
+		if (ca !== undefined && cb !== undefined && ca === cb) {
+			errors.push(`${tag}: both endpoints in category ${ca} (co-change edges are cross-category only)`);
+		}
+		if (!Array.isArray(e.sharedFiles) || e.sharedFiles.length === 0) {
+			errors.push(`${tag}: sharedFiles must be non-empty`);
+		}
+		const fileCount = Array.isArray(e.sharedFiles) ? e.sharedFiles.length : -1;
+		if (e.sharedFileCount !== fileCount) {
+			errors.push(`${tag}: sharedFileCount ${e.sharedFileCount} != sharedFiles.length ${fileCount}`);
+		}
+		if (e.semanticType !== undefined && !EDGE_TYPES.includes(e.semanticType)) {
+			errors.push(`${tag}: invalid semanticType ${e.semanticType}`);
+		}
+		const key = `${e.fromTopic}|${e.toTopic}`;
+		if (pairSeen.has(key)) errors.push(`${tag}: duplicate pair`);
+		pairSeen.add(key);
+	}
 	return errors;
 }
 
@@ -364,6 +464,7 @@ export function assembleGraph(
 	repoName: string,
 	topicFingerprints: Record<string, string> = {},
 	topicMetaFingerprints: Record<string, string> = {},
+	coChangeTopicEdges: CoChangeTopicEdge[] = [],
 ): KnowledgeGraph {
 	// Normalize edges BEFORE validation, stats, and emit so graph.json never
 	// carries the distiller's redundant duplicates:
@@ -375,7 +476,10 @@ export function assembleGraph(
 	// Directed/specific edges are otherwise untouched.
 	const edges = dropSubsumedRelatedTo(normalizeSymmetricEdges(distill.edges));
 
-	const errors = validateDistilledGraph({ ...distill, edges });
+	const errors = [
+		...validateDistilledGraph({ ...distill, edges }),
+		...validateCoChangeTopicEdges(coChangeTopicEdges, distill.topics),
+	];
 	if (errors.length > 0) {
 		throw new Error(`knowledge graph validation failed (${errors.length}): ${errors.join("; ")}`);
 	}
@@ -422,23 +526,15 @@ export function assembleGraph(
 		.filter((c) => c.topicCount > 0);
 
 	// Edge rollups (for stats / the panel header; the view recomputes its own
-	// aggregates at render time from expansion state).
+	// aggregates at render time from expansion state). Edges are partitioned only
+	// into within-topic vs across-topic: per-category batching means a typed edge
+	// never spans two categories, so a cross-category count would be a constant 0.
 	const unitToTopic = new Map(distill.units.map((u) => [u.id, u.topicSlug]));
-	const topicToCategory = new Map(distill.topics.map((t) => [t.slug, t.categoryId]));
 	let intraTopicEdges = 0;
 	let crossTopicEdges = 0;
-	let crossCategoryEdges = 0;
 	for (const e of edges) {
-		const ta = unitToTopic.get(e.from);
-		const tb = unitToTopic.get(e.to);
-		if (ta === tb) {
-			intraTopicEdges++;
-			continue;
-		}
-		crossTopicEdges++;
-		// Post-validation both endpoints are known units, so unitToTopic always
-		// resolved them — the casts can't be undefined here.
-		if (topicToCategory.get(ta as string) !== topicToCategory.get(tb as string)) crossCategoryEdges++;
+		if (unitToTopic.get(e.from) === unitToTopic.get(e.to)) intraTopicEdges++;
+		else crossTopicEdges++;
 	}
 
 	const stats: GraphStats = {
@@ -448,7 +544,7 @@ export function assembleGraph(
 		edges: edges.length,
 		intraTopicEdges,
 		crossTopicEdges,
-		crossCategoryEdges,
+		coChangeTopicEdgeCount: coChangeTopicEdges.length,
 	};
 
 	return {
@@ -463,6 +559,7 @@ export function assembleGraph(
 		topics,
 		units: distill.units,
 		edges,
+		coChangeTopicEdges,
 	};
 }
 
