@@ -2962,6 +2962,23 @@ describe("QueueWorker", () => {
 			if (origKey !== undefined) process.env.ANTHROPIC_API_KEY = origKey;
 		});
 
+		it("does not skip drainIngest when aiProvider is local-agent, even with no stored key", async () => {
+			vi.mocked(loadConfig).mockResolvedValue({ aiProvider: "local-agent" } as never);
+			const origKey2 = process.env.ANTHROPIC_API_KEY;
+			delete process.env.ANTHROPIC_API_KEY;
+			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 1, outcome: "OK", topicFailures: [] });
+
+			const op = makeIngestOp("recall-miss");
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([{ op, filePath: "/tmp/queue/ingest.json" }]);
+
+			await runWorker("/test/cwd");
+
+			expect(vi.mocked(drainIngest)).toHaveBeenCalledOnce();
+			expect(vi.mocked(appendCredentialMissingRun)).not.toHaveBeenCalled();
+
+			if (origKey2 !== undefined) process.env.ANTHROPIC_API_KEY = origKey2;
+		});
+
 		it("skips renderTopicKBWiki when drainIngest reports 0 ingested", async () => {
 			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
 			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 0, outcome: "OK", topicFailures: [] });

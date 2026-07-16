@@ -1,0 +1,15 @@
+{
+	"type": "result",
+	"subtype": "success",
+	"is_error": false,
+	"result": "PONG",
+	"stop_reason": "end_turn",
+	"session_id": "e550af2b-fef4-4dbc-9bf0-83ce285e4f77",
+	"total_cost_usd": 0.010476,
+	"usage": {
+		"input_tokens": 10,
+		"cache_creation_input_tokens": 4738,
+		"cache_read_input_tokens": 0,
+		"output_tokens": 198
+	}
+}

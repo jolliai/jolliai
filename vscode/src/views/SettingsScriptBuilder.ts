@@ -27,6 +27,7 @@ export function buildSettingsScript(): string {
   const modelSelect = document.getElementById('model');
   const maxTokensInput = document.getElementById('maxTokens');
   const aiProviderSelect = document.getElementById('aiProvider');
+  const localAgentToolSelect = document.getElementById('localAgentTool');
   // Two Jolli API key inputs (jolli-ok and jolli-nokey cards) — kept in sync.
   const jolliApiKeyInput = document.getElementById('jolliApiKey');
   const jolliApiKeyNoKeyInput = document.getElementById('jolliApiKeyNoKey');
@@ -104,6 +105,8 @@ export function buildSettingsScript(): string {
     var which;
     if (provider === 'anthropic') {
       which = 'anthropic';
+    } else if (provider === 'local-agent') {
+      which = 'local-agent';
     } else if (signedIn && hasJolliKey) {
       which = 'jolli-ok';
     } else if (signedIn && !hasJolliKey) {
@@ -326,6 +329,7 @@ export function buildSettingsScript(): string {
       model: modelSelect.value,
       maxTokens: maxTokensInput.value,
       aiProvider: aiProviderSelect.value,
+      localAgentTool: localAgentToolSelect.value,
       jolliApiKey: getActiveJolliApiKeyValue(),
       claudeEnabled: claudeEnabledInput.checked,
       codexEnabled: codexEnabledInput.checked,
@@ -351,6 +355,7 @@ export function buildSettingsScript(): string {
       modelSelect.value !== initialState.model ||
       maxTokensInput.value !== initialState.maxTokens ||
       aiProviderSelect.value !== initialState.aiProvider ||
+      localAgentToolSelect.value !== initialState.localAgentTool ||
       getActiveJolliApiKeyValue() !== initialState.jolliApiKey ||
       claudeEnabledInput.checked !== initialState.claudeEnabled ||
       codexEnabledInput.checked !== initialState.codexEnabled ||
@@ -418,6 +423,7 @@ export function buildSettingsScript(): string {
     rebuildKbStatus.textContent = '';
   });
   modelSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
+  localAgentToolSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
   aiProviderSelect.addEventListener('change', function() {
     checkDirty(); clearSaveFeedback(); syncProviderCard();
   });
@@ -448,6 +454,7 @@ export function buildSettingsScript(): string {
         model: modelSelect.value,
         maxTokens: maxVal.length > 0 ? Number(maxVal) : null,
         aiProvider: aiProviderSelect.value,
+        localAgentTool: localAgentToolSelect.value,
         jolliApiKey: getActiveJolliApiKeyValue().trim(),
         claudeEnabled: claudeEnabledInput.checked,
         codexEnabled: codexEnabledInput.checked,
@@ -560,6 +567,7 @@ export function buildSettingsScript(): string {
         modelSelect.value = msg.settings.model || 'sonnet';
         maxTokensInput.value = msg.settings.maxTokens != null ? String(msg.settings.maxTokens) : '';
         aiProviderSelect.value = msg.settings.aiProvider || 'anthropic';
+        localAgentToolSelect.value = msg.settings.localAgentTool || 'claude-code';
         jolliApiKeyInput.value = msg.maskedJolliApiKey;
         jolliApiKeyNoKeyInput.value = msg.maskedJolliApiKey;
         claudeEnabledInput.checked = msg.settings.claudeEnabled;

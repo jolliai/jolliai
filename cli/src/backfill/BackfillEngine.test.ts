@@ -271,6 +271,17 @@ describe("runBackfill", () => {
 		expect(vi.mocked(generateSummary)).not.toHaveBeenCalled();
 	});
 
+	it("treats aiProvider 'local-agent' as having credentials, even with no apiKey/jolliApiKey/ANTHROPIC_API_KEY", async () => {
+		// A local-agent user relies on the tool's own subscription login, not a
+		// jollimemory-held credential — the presence check must not block them.
+		vi.mocked(loadConfig).mockResolvedValue({ aiProvider: "local-agent" } as never);
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+		const report = await runBackfill({ cwd: CWD, hashes: ["c1"] });
+		expect(report.generated).toBe(1);
+		expect(report.errors).toBe(0);
+		expect(vi.mocked(generateSummary)).toHaveBeenCalledTimes(1);
+	});
+
 	it("turns a per-commit LLM failure into an error outcome and keeps going", async () => {
 		vi.mocked(attributeCommits).mockReturnValue({
 			attributed: new Map([

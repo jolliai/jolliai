@@ -2425,22 +2425,41 @@ export class SummaryWebviewPanel {
 					const work = this.bridge.regenerateSummary(summary, config);
 					const outcome = await Promise.race([work, cancelled]);
 					if (outcome === "cancelled") {
-						this.panel.webview.postMessage({
-							command: "summaryRegenerateError",
-						});
+						// Skip the webview write on a disposed panel — `panel.webview`
+						// is a getter that throws "Webview is disposed" once torn down,
+						// which would surface as a false "Regenerate failed".
+						if (!this.disposed) {
+							this.panel.webview.postMessage({
+								command: "summaryRegenerateError",
+							});
+						}
 						return;
 					}
 
-					// Race-window re-check: amend can land during the 30 s LLM call.
+					// Race-window re-check: amend can land during the LLM call. This
+					// window is much wider with a local CLI agent (multi-minute) than
+					// the API (~30 s), so the disposed / rewritten races below fire
+					// far more often under the local-agent provider.
 					if (!(await this.ensureCommitNotRewritten("regenerate summary"))) {
-						this.panel.webview.postMessage({
-							command: "summaryRegenerateError",
-						});
+						if (!this.disposed) {
+							this.panel.webview.postMessage({
+								command: "summaryRegenerateError",
+							});
+						}
 						return;
 					}
 
 					await this.bridge.storeSummary(outcome.updated, true);
 					this.currentSummary = outcome.updated;
+					// The store above is the system of record and must complete
+					// regardless of whether anyone is listening. But the user can
+					// close this panel during the (minutes-long, for a local CLI
+					// agent) LLM call; `panel.webview` then throws "Webview is
+					// disposed" and `catchAndShow` reports a false "Regenerate
+					// failed" even though the summary was persisted. Once stored,
+					// a disposed panel just has no webview to update — silently skip
+					// the UI writes (mirrors update() / refresh* disposed guards).
+					if (this.disposed) return;
 					this.panel.webview.postMessage({
 						command: "summaryRegenerated",
 						topicsHtml: buildTopicsSection(outcome.updated),

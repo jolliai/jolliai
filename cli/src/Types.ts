@@ -251,7 +251,7 @@ export function isIngestOperation(op: GitOperation): op is IngestOperation {
  *   - "anthropic-env":    ANTHROPIC_API_KEY environment variable (direct mode)
  *   - "jolli-proxy":      jolliApiKey (sk-jol-…) routed through the Jolli backend
  */
-export type LlmCredentialSource = "anthropic-config" | "anthropic-env" | "jolli-proxy";
+export type LlmCredentialSource = "anthropic-config" | "anthropic-env" | "jolli-proxy" | "local-agent";
 
 /** Metadata from the LLM API call that generated this summary */
 export interface LlmCallMetadata {
@@ -1041,7 +1041,10 @@ export interface CommitCatalog {
  * Callers load the full config and pass this subset to Summarizer functions,
  * so those functions don't need to know *how* config was loaded.
  */
-export type LlmConfig = Pick<JolliMemoryConfig, "apiKey" | "model" | "jolliApiKey" | "aiProvider">;
+export type LlmConfig = Pick<
+	JolliMemoryConfig,
+	"apiKey" | "model" | "jolliApiKey" | "aiProvider" | "localAgentTool" | "localAgentPath"
+>;
 
 /** Configuration stored in .jolli/jollimemory/config.json */
 export interface JolliMemoryConfig {
@@ -1113,7 +1116,15 @@ export interface JolliMemoryConfig {
 	 * Optional — when missing, surfaces derive a default (Jolli when signed in,
 	 * Anthropic otherwise) so existing configs keep working.
 	 */
-	readonly aiProvider?: "anthropic" | "jolli";
+	readonly aiProvider?: "anthropic" | "jolli" | "local-agent";
+	/**
+	 * Which local Agent CLI tool to drive when `aiProvider` is "local-agent".
+	 * v1 supports only Claude Code; the enum is reserved for future tools
+	 * (Codex, Cursor). Ignored unless `aiProvider === "local-agent"`.
+	 */
+	readonly localAgentTool?: "claude-code";
+	/** Optional explicit path to the local agent binary, overriding PATH discovery. */
+	readonly localAgentPath?: string;
 	/**
 	 * When true, plugin-initiated `git commit` / `--amend` / squash invocations
 	 * pass `-s` to add a DCO `Signed-off-by:` trailer. Off by default. Read at

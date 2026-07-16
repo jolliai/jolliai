@@ -17,6 +17,7 @@
 
 import { execGit } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
+import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
 import { createLogger, setLogDir } from "../Logger.js";
@@ -112,7 +113,7 @@ export async function handlePostMerge(cwd: string): Promise<void> {
 	// would just no-op each entry anyway, and we'd rather not spin up the
 	// worker (or burn an enqueue file) when there's nothing to do.
 	const config = await loadConfig();
-	if (!config.apiKey && !config.jolliApiKey && !process.env.ANTHROPIC_API_KEY) {
+	if (resolveLlmCredentialSource(config) === null) {
 		log.info("No API key configured -- skipping compile enqueue");
 		return;
 	}

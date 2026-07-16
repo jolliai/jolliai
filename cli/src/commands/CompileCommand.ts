@@ -13,6 +13,7 @@
 import type { Command } from "commander";
 import { drainIngest } from "../core/IngestPipeline.js";
 import { appendCredentialMissingRun } from "../core/IngestRunStore.js";
+import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { compileAllRepos } from "../core/MultiRepoCompile.js";
 import { emptyProcessedSet, saveProcessedSet } from "../core/ProcessedSourceStore.js";
 import { loadConfig } from "../core/SessionTracker.js";
@@ -34,7 +35,7 @@ export type CompileOptions = { rebuild?: boolean; cwd?: string };
 async function compileSingleRepo(cwd: string, rebuild: boolean): Promise<void> {
 	setLogDir(cwd);
 	const config = await loadConfig();
-	if (!config.apiKey && !config.jolliApiKey && !process.env.ANTHROPIC_API_KEY) {
+	if (resolveLlmCredentialSource(config) === null) {
 		console.error("\n  Error: No API key configured. Run 'jolli enable' to set up.\n");
 		await appendCredentialMissingRun(cwd, "manual");
 		process.exitCode = 1;
@@ -187,7 +188,7 @@ async function compileSingleRepo(cwd: string, rebuild: boolean): Promise<void> {
 /** Sweep every repo under the Memory Bank folder. */
 async function compileSweep(): Promise<void> {
 	const config = await loadConfig();
-	if (!config.apiKey && !config.jolliApiKey && !process.env.ANTHROPIC_API_KEY) {
+	if (resolveLlmCredentialSource(config) === null) {
 		console.error("\n  Error: No API key configured. Run 'jolli enable' to set up.\n");
 		process.exitCode = 1;
 		return;

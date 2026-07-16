@@ -137,6 +137,7 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 		"anthropic-config": "Anthropic API key (config)",
 		"anthropic-env": "Anthropic API key (ANTHROPIC_API_KEY env)",
 		"jolli-proxy": "Jolli proxy key",
+		"local-agent": "local agent (Claude Code subscription)",
 	};
 	checks.push({
 		name: "Config",

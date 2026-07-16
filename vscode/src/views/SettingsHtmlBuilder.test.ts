@@ -91,6 +91,13 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain('data-card="jolli-signin"');
 	});
 
+	it("renders the local-agent provider option and its card", () => {
+		expect(html).toContain('value="local-agent"');
+		expect(html).toContain('data-card="local-agent"');
+		expect(html).toContain('id="localAgentTool"');
+		expect(html).toContain('value="claude-code"');
+	});
+
 	it("Anthropic card carries API key, model, and max tokens fields", () => {
 		expect(html).toContain('id="apiKey"');
 		expect(html).toContain('id="model"');

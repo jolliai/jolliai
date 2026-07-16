@@ -129,6 +129,8 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	if (token) {
 		const site = siteHost(config.jolliUrl);
 		console.log(site ? `\n  ✓ signed in · ${site}` : "\n  ✓ signed in");
+	} else if (credSource === "local-agent") {
+		console.log("\n  ✓ local agent set (not signed in to Jolli)");
 	} else if (credSource) {
 		const keyLabel = credSource === "jolli-proxy" ? "Jolli API key" : "Anthropic API key";
 		console.log(`\n  ✓ ${keyLabel} set (not signed in to Jolli)`);

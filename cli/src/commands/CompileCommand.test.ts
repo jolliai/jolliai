@@ -359,6 +359,34 @@ describe("registerCompileCommand", () => {
 		expect(vi.mocked(appendCredentialMissingRun)).toHaveBeenCalledWith("/repo", "manual");
 	});
 
+	it("local-agent (sweep): does not skip compile even with no stored key", async () => {
+		mockLoadConfig.mockResolvedValue({ aiProvider: "local-agent", localFolder: "/mb" } as never);
+		const prevEnv = process.env.ANTHROPIC_API_KEY;
+		delete process.env.ANTHROPIC_API_KEY;
+		try {
+			const { stderr } = await runCompile([]);
+			expect(stderr).toBe("");
+		} finally {
+			if (prevEnv !== undefined) process.env.ANTHROPIC_API_KEY = prevEnv;
+		}
+		expect(process.exitCode).not.toBe(1);
+		expect(mockCompileAllRepos).toHaveBeenCalledOnce();
+	});
+
+	it("local-agent (--cwd): does not skip drain even with no stored key", async () => {
+		mockLoadConfig.mockResolvedValue({ aiProvider: "local-agent" } as never);
+		const prevEnv = process.env.ANTHROPIC_API_KEY;
+		delete process.env.ANTHROPIC_API_KEY;
+		try {
+			const { stderr } = await runCompile(["--cwd", "/repo"]);
+			expect(stderr).toBe("");
+		} finally {
+			if (prevEnv !== undefined) process.env.ANTHROPIC_API_KEY = prevEnv;
+		}
+		expect(mockDrainIngest).toHaveBeenCalledOnce();
+		expect(vi.mocked(appendCredentialMissingRun)).not.toHaveBeenCalled();
+	});
+
 	it("--cwd --rebuild: purges to the index's stable slugs (purge runs ONLY on rebuild)", async () => {
 		// Purge is gated to --rebuild: a routine compile must not purge (a concurrent
 		// ingest could have added a page not yet in our index snapshot — deleting it

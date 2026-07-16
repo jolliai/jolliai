@@ -223,6 +223,7 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 				apiKey: config.apiKey,
 				model: resolveModelId(config.model),
 				jolliApiKey: config.jolliApiKey,
+				aiProvider: config.aiProvider,
 			});
 			const retryText = retryResult.text ?? "";
 			log.debug("=== LLM strict-retry response START ===");
@@ -1404,6 +1405,7 @@ export async function generateSquashConsolidation(
 			apiKey: config.apiKey,
 			model: resolveModelId(config.model),
 			jolliApiKey: config.jolliApiKey,
+			aiProvider: config.aiProvider,
 		});
 		const responseText = llmResult.text ?? "";
 		log.debug("=== %s raw response START ===", action);

@@ -61,6 +61,7 @@ const PROVIDER_LABELS: Record<LlmCredentialSource, string> = {
 	"anthropic-config": "Anthropic",
 	"anthropic-env": "Anthropic (env)",
 	"jolli-proxy": "Jolli proxy",
+	"local-agent": "Local agent",
 };
 
 /**

@@ -178,6 +178,12 @@ describe("SettingsScriptBuilder", () => {
 		expect(script).toContain("msg.settings.aiProvider");
 	});
 
+	it("gates the local-agent card and round-trips the agent tool", () => {
+		expect(script).toContain("provider === 'local-agent'");
+		expect(script).toContain("localAgentTool: localAgentToolSelect.value");
+		expect(script).toContain("localAgentToolSelect.value = msg.settings.localAgentTool");
+	});
+
 	// ── Advanced toggle ──
 
 	it("wires the Advanced links to data-advanced-panel siblings", () => {

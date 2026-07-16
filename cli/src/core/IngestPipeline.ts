@@ -103,6 +103,7 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 		forceStreaming: true,
 		apiKey: config.apiKey,
 		jolliApiKey: config.jolliApiKey,
+		aiProvider: config.aiProvider,
 	});
 	const plan = parseRoutePlan(routeResult.text ?? "", routeResult.stopReason, batch);
 	if (plan.error) {
@@ -166,6 +167,7 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 				maxTokens: RECONCILE_MAX_TOKENS,
 				apiKey: config.apiKey,
 				jolliApiKey: config.jolliApiKey,
+				aiProvider: config.aiProvider,
 			});
 			if (result.stopReason === "max_tokens") {
 				log.error("Reconcile truncated for topic %s -- keeping old page, holding sources", slug);

@@ -305,6 +305,26 @@ describe("StatusTreeProvider", () => {
 		expect((providerRow?.iconPath as { id: string }).id).toBe("warning");
 	});
 
+	it("provider row shows 'Local agent' (not 'not configured') when aiProvider='local-agent'", async () => {
+		// Regression: the provider-row switch had no `case "local-agent"`, so a
+		// resolved local-agent source fell into the default → "not configured",
+		// even though the dispatcher would happily drive the local CLI agent.
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: "sk-ant-present-but-ignored",
+			aiProvider: "local-agent",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const providerRow = provider
+			.getChildren()
+			.find((it) => it.label === "AI Summary Provider");
+		expect(providerRow?.description).toBe("Local agent");
+		expect((providerRow?.iconPath as { id: string }).id).not.toBe("warning");
+	});
+
 	it("provider row warns with the Anthropic-specific tooltip when aiProvider='anthropic' but no key is on file", async () => {
 		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
 		loadConfigFromDir.mockResolvedValue({
