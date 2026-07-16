@@ -43,11 +43,16 @@
     html += row("Categories", g.stats.categories);
     html += row("Topics", g.stats.topics);
     html += row("Units", g.stats.units);
-    // Typed links by scope (the three buckets sum to the total): both endpoints in
-    // one topic; across topics but inside one category; across categories.
+    // Typed (LLM) links by scope. Under per-category edge batching the LLM never
+    // sees two categories at once, so cross-category typed edges no longer exist —
+    // there is no cross-category typed count (the old always-zero row + its stat
+    // field were removed). The remaining typed links are within a topic, or across
+    // topics inside one category (= crossTopicEdges, since none span categories now).
     html += row("Links within a topic", g.stats.intraTopicEdges);
-    html += row("Links within a category", g.stats.crossTopicEdges - g.stats.crossCategoryEdges);
-    html += row("Links across categories", g.stats.crossCategoryEdges);
+    html += row("Links within a category", g.stats.crossTopicEdges);
+    // Cross-category coupling now lives entirely in the deterministic co-change
+    // layer — a separate, additive bucket. `?? 0` tolerates a pre-v4 graph.json.
+    html += row("Co-change links (cross-category)", g.stats.coChangeTopicEdgeCount ?? 0);
     html += `</div>`;
     html += `<h6>How to read this</h6>`;
     html += `<p class="summary">Each big card is a <strong>category</strong>. Click one to see its knowledge topics and the units inside. Lines with numbers show how many links connect two categories — click a line to list them.</p>`;
@@ -119,6 +124,22 @@
       }
     }
 
+    // Co-change links: deterministic cross-category coupling for THIS topic
+    // (topics in other categories whose units touch the same files).
+    const coChange = (D.coChangeByTopic && D.coChangeByTopic.get(slug)) || [];
+    if (coChange.length) {
+      html += `<h6>Co-change links — ${coChange.length}</h6>`;
+      for (const { peerTopic, edge } of coChange) {
+        const pt = D.topicsBySlug.get(peerTopic);
+        const n = edge.sharedFileCount ?? (edge.sharedFiles ? edge.sharedFiles.length : 0);
+        const label = edge.semanticType ? `${esc(edge.semanticType)} · co-change` : "co-change";
+        html += `<div class="rel-item" data-goto-topic="${esc(peerTopic)}">` +
+          `<div class="rel-head"><span class="rel-type co-change">${label}</span>` +
+          `<span class="rel-title">${esc(pt ? pt.shortTitle : peerTopic)}</span></div>` +
+          `<div class="rel-evidence">${n} shared file${n === 1 ? "" : "s"}</div></div>`;
+      }
+    }
+
     return html;
   }
 
@@ -141,19 +162,43 @@
     const D = window.WikiData;
     const [a, b] = pairId.split("|");
     const agg = D.categoryAgg.find((x) => x.a === a && x.b === b);
-    if (!agg) return renderEmpty();
+    const coAgg = (D.coChangeCategoryAgg || []).find((x) => x.a === a && x.b === b);
     const ta = D.categoriesById.get(a), tb = D.categoriesById.get(b);
+    // A pair may exist via typed unit edges, co-change edges, or both.
+    if ((!agg && !coAgg) || !ta || !tb) return renderEmpty();
+    const typedCount = agg ? agg.edges.length : 0;
+    const coCount = coAgg ? coAgg.edges.length : 0;
     let html = "";
     html += `<h2>${esc(ta.shortTitle)} ↔ ${esc(tb.shortTitle)}</h2>`;
-    html += `<div class="p-meta">${agg.edges.length} cross-category link${agg.edges.length === 1 ? "" : "s"}</div>`;
-    for (const e of agg.edges) {
-      const fu = D.unitsById.get(e.from), tu = D.unitsById.get(e.to);
-      // Symmetric relationships are undirected → a non-directional connector.
-      const conn = window.WikiData.symmetricTypes.has(e.type) ? "↔" : "→";
-      html += `<div class="rel-item" data-goto-unit="${esc(e.from)}">` +
-        `<div class="rel-head"><span class="rel-type ${esc(e.type)}">${esc(e.type)}</span>${confPill(e.confidence)}</div>` +
-        `<div class="rel-title" style="margin-bottom:3px">${esc(fu.shortTitle)} ${conn} ${esc(tu.shortTitle)}</div>` +
-        `<div class="rel-evidence">${esc(e.evidence)}</div></div>`;
+    html += `<div class="p-meta">${typedCount} typed link${typedCount === 1 ? "" : "s"} · ` +
+      `${coCount} co-change link${coCount === 1 ? "" : "s"}</div>`;
+    if (agg) {
+      for (const e of agg.edges) {
+        const fu = D.unitsById.get(e.from), tu = D.unitsById.get(e.to);
+        if (!fu || !tu) continue;
+        // Symmetric relationships are undirected → a non-directional connector.
+        const conn = D.symmetricTypes.has(e.type) ? "↔" : "→";
+        html += `<div class="rel-item" data-goto-unit="${esc(e.from)}">` +
+          `<div class="rel-head"><span class="rel-type ${esc(e.type)}">${esc(e.type)}</span>${confPill(e.confidence)}</div>` +
+          `<div class="rel-title" style="margin-bottom:3px">${esc(fu.shortTitle)} ${conn} ${esc(tu.shortTitle)}</div>` +
+          `<div class="rel-evidence">${esc(e.evidence)}</div></div>`;
+      }
+    }
+    // Co-change links: topic↔topic, evidence is the shared-file list (no confidence,
+    // no semantic type unless a slow sweep backfilled `semanticType`).
+    if (coAgg && coAgg.edges.length) {
+      html += `<h6>Co-change links — ${coAgg.edges.length}</h6>`;
+      for (const e of coAgg.edges) {
+        const ft = D.topicsBySlug.get(e.fromTopic), tt = D.topicsBySlug.get(e.toTopic);
+        const label = e.semanticType ? `${esc(e.semanticType)} · co-change` : "co-change";
+        const files = (e.sharedFiles || []).map((f) => `<code>${esc(f)}</code>`).join("");
+        const n = e.sharedFileCount ?? (e.sharedFiles ? e.sharedFiles.length : 0);
+        html += `<div class="rel-item" data-goto-topic="${esc(e.fromTopic)}">` +
+          `<div class="rel-head"><span class="rel-type co-change">${label}</span></div>` +
+          `<div class="rel-title" style="margin-bottom:3px">${esc(ft ? ft.shortTitle : e.fromTopic)} ↔ ` +
+          `${esc(tt ? tt.shortTitle : e.toTopic)}</div>` +
+          `<div class="rel-evidence">${n} shared file${n === 1 ? "" : "s"}: <span class="anchor-list">${files}</span></div></div>`;
+      }
     }
     return html;
   }

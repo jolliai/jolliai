@@ -81,20 +81,22 @@
     // Category cards are opaque, so the aggregated overview edges go on the back
     // layer (behind the board) — same "tucked behind the cards" look as before.
     const { back } = window.WikiEdges.clear();
-    for (const agg of D.categoryAgg) {
-      const elA = board.querySelector(`[data-category="${agg.a}"]`);
-      const elB = board.querySelector(`[data-category="${agg.b}"]`);
+    for (const p of D.overviewPairs) {
+      const elA = board.querySelector(`[data-category="${p.a}"]`);
+      const elB = board.querySelector(`[data-category="${p.b}"]`);
       if (!elA || !elB) continue;
-      const key = "agg:" + agg.a + "|" + agg.b;
+      const key = "agg:" + p.a + "|" + p.b;
       window.WikiEdges.draw(back, {
         fromEl: elA, toEl: elB,
-        type: dominantType(agg.edges),
-        width: Math.min(3.5, 1 + agg.edges.length * 0.35),
+        type: p.type,
+        width: Math.min(3.5, 1 + p.count * 0.35),
         opacity: 0.5,
         arrow: false,
-        count: agg.edges.length,
+        // Co-change-only pairs render dashed (the deterministic, non-semantic layer).
+        dashed: p.type === "co-change",
+        count: p.count,
         key,
-        onClick: () => window.WikiState.set({ selected: { kind: "category-pair", id: agg.a + "|" + agg.b } }),
+        onClick: () => window.WikiState.set({ selected: { kind: "category-pair", id: p.a + "|" + p.b } }),
         onHover: (on) => {
           if (on) window.WikiEdges.dimAllExcept((k) => k === key);
           else window.WikiEdges.undim();
@@ -121,12 +123,11 @@
       width: CARD_W,
       height: c.offsetHeight,
     }));
-    const edges = D.categoryAgg.map((agg, i) => {
-      let ab = 0;
-      for (const e of agg.edges) if (D.categoryOfUnit(e.from) === agg.a) ab++;
-      const [s, t] = ab >= agg.edges.length - ab ? [agg.a, agg.b] : [agg.b, agg.a];
-      return { id: "oe" + i, sources: ["c:" + s], targets: ["c:" + t] };
-    });
+    const edges = D.overviewPairs.map((p, i) => ({
+      id: "oe" + i,
+      sources: ["c:" + p.src],
+      targets: ["c:" + p.dst],
+    }));
     const elk = sharedElk();
     return elk.layout({
       id: "root",
@@ -159,11 +160,6 @@
     });
   }
 
-  function dominantType(edges) {
-    const counts = {};
-    for (const e of edges) counts[e.type] = (counts[e.type] || 0) + 1;
-    return Object.entries(counts).sort((x, y) => y[1] - x[1])[0][0];
-  }
 
   // ── Level 2: Category detail ─────────────────────────────────────────
   function renderCategory(categoryId) {
@@ -626,6 +622,13 @@
       if (ta === categoryId && tb !== categoryId) counts.set(tb, (counts.get(tb) || 0) + 1);
       else if (tb === categoryId && ta !== categoryId) counts.set(ta, (counts.get(ta) || 0) + 1);
     }
+    // Co-change edges also reach other categories; a portal must exist for each so
+    // resolveTopicEl can promote the far endpoint onto it (else the edge can't draw).
+    for (const e of D.coChangeTopicEdges || []) {
+      const ca = D.categoryOfTopic(e.fromTopic), cb = D.categoryOfTopic(e.toTopic);
+      if (ca === categoryId && cb && cb !== categoryId) counts.set(cb, (counts.get(cb) || 0) + 1);
+      else if (cb === categoryId && ca && ca !== categoryId) counts.set(ca, (counts.get(ca) || 0) + 1);
+    }
     return [...counts.entries()]
       .map(([id, count]) => ({ categoryId: id, count }))
       .sort((a, b) => b.count - a.count);
@@ -649,6 +652,19 @@
     // so visibility is decided by the group's collapsed class, not offsetParent.
     if (card && !card.closest(".topic-group.collapsed")) return card;
     return board.querySelector(`[data-topic="${t.slug}"]`); // collapsed group
+  }
+
+  // Resolve a TOPIC (the endpoint kind of a co-change edge) to its visible element:
+  //   topic in this category → its topic-group box
+  //   topic in another category → that category's portal box
+  // Always the topic-group box (never a unit card): co-change edges are topic-level.
+  function resolveTopicEl(topicSlug, categoryId) {
+    const D = window.WikiData;
+    const board = document.getElementById("board");
+    const cat = D.categoryOfTopic(topicSlug);
+    if (cat === undefined) return null;
+    if (cat !== categoryId) return board.querySelector(`[data-portal="${cat}"]`);
+    return board.querySelector(`[data-topic="${topicSlug}"]`);
   }
 
   function drawCategoryEdges(categoryId) {
@@ -693,6 +709,50 @@
         onClick: () => window.WikiState.set({ selected: { kind: "unit", id: e.from } }),
         onHover: (on) => {
           if (on) window.WikiEdges.dimAllExcept((k) => k === e.from + ">" + e.to);
+          else refreshSpotlight();
+        },
+      });
+    }
+
+    // Deterministic co-change edges (topic↔topic). Visually distinct from the
+    // typed unit edges: dashed, neutral color (type "co-change" has no edge-color
+    // CSS var → edges.js falls back to grey), no arrowhead (undirected), width by
+    // shared-file count. Both endpoints are topic boxes / portals (no unit card),
+    // so they ride the BACK layer like other promoted-box edges.
+    //
+    // Multiple co-change edges from the SAME near-topic to DIFFERENT topics in the
+    // SAME far category collapse onto one promoted line (near box → far portal).
+    // Aggregate their shared-file counts FIRST so the drawn line's width reflects
+    // the total coupling across that pair, not just whichever edge happened first.
+    const coChangeGroups = new Map(); // pairKey -> { fromEl, toEl, total, sample }
+    for (const e of D.coChangeTopicEdges || []) {
+      const ca = D.categoryOfTopic(e.fromTopic), cb = D.categoryOfTopic(e.toTopic);
+      if (ca !== categoryId && cb !== categoryId) continue;
+      const fromEl = resolveTopicEl(e.fromTopic, categoryId);
+      const toEl = resolveTopicEl(e.toTopic, categoryId);
+      if (!fromEl || !toEl || fromEl === toEl) continue;
+      const pairKey = pk(fromEl) + ">" + pk(toEl) + ":co-change";
+      const n = e.sharedFileCount || (e.sharedFiles ? e.sharedFiles.length : 1) || 1;
+      const g = coChangeGroups.get(pairKey);
+      if (g) g.total += n;
+      else coChangeGroups.set(pairKey, { fromEl, toEl, total: n, sample: e });
+    }
+    for (const [pairKey, g] of coChangeGroups) {
+      drawn.add(pairKey); // keep the shared dedupe set consistent (the :co-change suffix can't collide with a typed edge)
+      const e = g.sample;
+      const key = "cc:" + e.fromTopic + ">" + e.toTopic;
+      window.WikiEdges.draw(back, {
+        fromEl: g.fromEl, toEl: g.toEl,
+        type: "co-change",
+        width: 1 + Math.min(g.total, 5) * 0.4, // aggregate shared-file count → 1.4 → 3.0
+        opacity: 0.4,
+        dashed: true,
+        arrow: false,
+        label: "co-change",
+        key,
+        onClick: () => window.WikiState.set({ selected: { kind: "topic", id: e.fromTopic } }),
+        onHover: (on) => {
+          if (on) window.WikiEdges.dimAllExcept((k) => k === key);
           else refreshSpotlight();
         },
       });

@@ -63,14 +63,18 @@ describe("distillGraph", () => {
 				}),
 				Topic2: JSON.stringify({ units: [{ id: "u9", kind: "mechanism", shortTitle: "U9", summary: "s" }] }),
 			},
+			// All filter cases are INTRA-category (between t1's two units): per-category
+			// batching only sees one category's units per call, so a cross-category edge
+			// (t1::* → t2::*) would be dropped for "endpoint not in this batch" — which
+			// would mask the self / bad-type / dup / clamp filters we mean to assert here.
 			edges: JSON.stringify({
 				edges: [
 					{ from: "t1::u1", to: "t1::u1-2", type: "extends", confidence: 0.9, evidence: "ok" },
 					{ from: "t1::u1", to: "t1::u1", type: "extends", confidence: 0.9, evidence: "self" },
 					{ from: "t1::u1", to: "ghost", type: "extends", confidence: 0.9, evidence: "dangling" },
-					{ from: "t1::u1", to: "t2::u9", type: "bogus", confidence: 0.9, evidence: "bad type" },
+					{ from: "t1::u1", to: "t1::u1-2", type: "bogus", confidence: 0.9, evidence: "bad type" },
 					{ from: "t1::u1", to: "t1::u1-2", type: "extends", confidence: 0.9, evidence: "dup" },
-					{ from: "t1::u1", to: "t2::u9", type: "related-to", confidence: 5, evidence: "clamp" },
+					{ from: "t1::u1", to: "t1::u1-2", type: "related-to", confidence: 5, evidence: "clamp" },
 				],
 			}),
 		});
@@ -258,7 +262,7 @@ describe("distillGraph", () => {
 		expect(messages[0]).toBe("categorizing 2 topic(s)");
 		expect(messages).toContain("extracting units 0/2");
 		expect(messages).toContain("extracting units 2/2"); // both topics counted, incl. the failed one
-		expect(messages).toContain("linking edges across 2 unit(s)"); // the surviving topic's 2 units
+		expect(messages).toContain("distilling intra-category edges (1 category)"); // both topics share category "c"
 	});
 
 	it("drops hallucinated topic slugs, substitutes empty content, and tolerates unparseable edges", async () => {
@@ -365,6 +369,48 @@ describe("distillGraph", () => {
 		expect(g.units).toEqual([]);
 		expect(g.edges).toEqual([]);
 	});
+
+	it("is non-fatal when ONE category's edge call throws (full build)", async () => {
+		callLlm.mockImplementation(async (opts: { action: string; params: Record<string, string> }) => {
+			if (opts.action === "graph-categories")
+				return {
+					text: JSON.stringify({
+						categories: [
+							{ id: "c1", shortTitle: "C1", summary: "s" },
+							{ id: "c2", shortTitle: "C2", summary: "s" },
+						],
+						topics: [
+							{ slug: "t1", title: "Topic1", shortTitle: "T1", summary: "s", categoryId: "c1" },
+							{ slug: "t2", title: "Topic2", shortTitle: "T2", summary: "s", categoryId: "c2" },
+						],
+					}),
+				};
+			if (opts.action === "graph-units")
+				return {
+					text: JSON.stringify({
+						units: [
+							{ id: "ua", kind: "decision", shortTitle: "Ua", summary: "s" },
+							{ id: "ub", kind: "fix", shortTitle: "Ub", summary: "s" },
+						],
+					}),
+				};
+			// c2's batch (units namespaced t2::) throws; c1's succeeds.
+			if (opts.action === "graph-edges") {
+				if (opts.params.units.includes("t2::")) throw new Error("boom");
+				return {
+					text: JSON.stringify({
+						edges: [{ from: "t1::ua", to: "t1::ub", type: "extends", confidence: 0.9, evidence: "ok" }],
+					}),
+					stopReason: null,
+				};
+			}
+			throw new Error(`unexpected ${opts.action}`);
+		});
+
+		const g = await distillGraph(TWO_TOPICS, CONFIG);
+		// The failed c2 batch degrades to no edges; c1's edge survives, no throw.
+		expect(g.edges).toEqual([{ from: "t1::ua", to: "t1::ub", type: "extends", confidence: 0.9, evidence: "ok" }]);
+	});
 });
 
 describe("distillGraphIncremental", () => {
@@ -397,7 +443,7 @@ describe("distillGraphIncremental", () => {
 		};
 	}
 
-	it("reuses clean units, re-distills changed topics, re-categorizes, and recomputes edges in full", async () => {
+	it("reuses clean units, re-distills changed topics, re-categorizes, and merges edges by affected category", async () => {
 		callLlm.mockImplementation(async (opts: { action: string; params: Record<string, string> }) => {
 			if (opts.action === "graph-categories-delta")
 				return {
@@ -443,8 +489,129 @@ describe("distillGraphIncremental", () => {
 		// dirty topic got the delta's refreshed shortTitle; categories merged.
 		expect(g.topics.find((t) => t.slug === "t2")?.shortTitle).toBe("T2new");
 		expect(g.topics.map((t) => t.slug).sort()).toEqual(["t1", "t2", "t3"]);
-		// edges recomputed in full (old edge discarded, fresh one kept).
+		// the stale edge TOUCHING the changed topic is discarded; the fresh one kept.
 		expect(g.edges).toEqual([{ from: "t1::u1", to: "t2::u", type: "extends", confidence: 0.9, evidence: "fresh" }]);
+	});
+
+	it("preserves a clean–clean edge from the baseline and only recomputes affected categories", async () => {
+		// c1: t1, t2 (both clean). c2: t3 (dirty), t4 (clean). Only c2 is affected.
+		const base: DistilledGraph = {
+			categories: [
+				{ id: "c1", shortTitle: "C1", summary: "s" },
+				{ id: "c2", shortTitle: "C2", summary: "s" },
+			],
+			topics: [
+				{ slug: "t1", shortTitle: "T1", summary: "s", title: "Topic1", categoryId: "c1" },
+				{ slug: "t2", shortTitle: "T2", summary: "s", title: "Topic2", categoryId: "c1" },
+				{ slug: "t3", shortTitle: "T3old", summary: "old", title: "Topic3", categoryId: "c2" },
+				{ slug: "t4", shortTitle: "T4", summary: "s", title: "Topic4", categoryId: "c2" },
+			],
+			units: [
+				{
+					id: "t1::u1",
+					topicSlug: "t1",
+					kinds: ["decision"],
+					shortTitle: "U1",
+					summary: "s",
+					anchors: { files: [], commits: [] },
+				},
+				{
+					id: "t2::u2",
+					topicSlug: "t2",
+					kinds: ["fix"],
+					shortTitle: "U2",
+					summary: "s",
+					anchors: { files: [], commits: [] },
+				},
+				{
+					id: "t3::uOld",
+					topicSlug: "t3",
+					kinds: ["fix"],
+					shortTitle: "old",
+					summary: "s",
+					anchors: { files: [], commits: [] },
+				},
+				{
+					id: "t4::u4",
+					topicSlug: "t4",
+					kinds: ["mechanism"],
+					shortTitle: "U4",
+					summary: "s",
+					anchors: { files: [], commits: [] },
+				},
+			],
+			edges: [
+				// clean–clean inside c1 (must survive verbatim, no recompute):
+				{ from: "t1::u1", to: "t2::u2", type: "extends", confidence: 0.8, evidence: "BASELINE-C1" },
+				// touches t3 (dirty) inside c2 (must be replaced by the fresh result):
+				{ from: "t3::uOld", to: "t4::u4", type: "related-to", confidence: 0.6, evidence: "stale-c2" },
+			],
+		};
+
+		const graphEdgesParams: string[] = [];
+		callLlm.mockImplementation(async (opts: { action: string; params: Record<string, string> }) => {
+			if (opts.action === "graph-categories-delta")
+				return {
+					text: JSON.stringify({
+						newCategories: [],
+						topics: [
+							{ slug: "t3", title: "Topic3", shortTitle: "T3new", summary: "new", categoryId: "c2" },
+						],
+					}),
+				};
+			if (opts.action === "graph-units")
+				return {
+					text: JSON.stringify({ units: [{ id: "u", kind: "decision", shortTitle: "U", summary: "s" }] }),
+				};
+			if (opts.action === "graph-edges") {
+				graphEdgesParams.push(opts.params.units);
+				return {
+					text: JSON.stringify({
+						edges: [
+							{ from: "t3::u", to: "t4::u4", type: "caused-by", confidence: 0.9, evidence: "fresh-c2" },
+						],
+					}),
+					stopReason: null,
+				};
+			}
+			throw new Error(`unexpected ${opts.action}`);
+		});
+
+		const input: DistillInput = {
+			topics: [
+				{ slug: "t1", title: "Topic1", summary: "s", content: "c1" },
+				{ slug: "t2", title: "Topic2", summary: "s", content: "c2" },
+				{ slug: "t3", title: "Topic3", summary: "new", content: "c3" },
+				{ slug: "t4", title: "Topic4", summary: "s", content: "c4" },
+			],
+		};
+		const diff: TopicDiff = { clean: ["t1", "t2", "t4"], dirty: ["t3"], added: [], deleted: [] };
+		const g = await distillGraphIncremental(input, base, diff, CONFIG);
+
+		// graph-edges ran exactly once — for the affected category c2 (its units only),
+		// never for the untouched c1.
+		expect(graphEdgesParams).toHaveLength(1);
+		expect(graphEdgesParams[0]).toContain("t3::u");
+		expect(graphEdgesParams[0]).toContain("t4::u4");
+		expect(graphEdgesParams[0]).not.toContain("t1::u1");
+
+		// The clean–clean c1 edge survived VERBATIM (same confidence + evidence — proof
+		// it was reused, not regenerated). The stale c2 edge was replaced by the fresh one.
+		expect(g.edges).toContainEqual({
+			from: "t1::u1",
+			to: "t2::u2",
+			type: "extends",
+			confidence: 0.8,
+			evidence: "BASELINE-C1",
+		});
+		expect(g.edges).toContainEqual({
+			from: "t3::u",
+			to: "t4::u4",
+			type: "caused-by",
+			confidence: 0.9,
+			evidence: "fresh-c2",
+		});
+		expect(g.edges).not.toContainEqual(expect.objectContaining({ evidence: "stale-c2" }));
 	});
 
 	it("admits a genuinely-new delta category while dropping empty / duplicate / existing-id proposals", async () => {
@@ -702,6 +869,185 @@ describe("distillGraphIncremental", () => {
 		await expect(distillGraphIncremental(input, baseline(), diff, CONFIG)).rejects.toThrow(
 			/graph-edges returned no edges array/,
 		);
+	});
+
+	it("on a topic moving categories: drops its stale old-category edge, recomputes the new category, keeps untouched clean–clean edges", async () => {
+		const base: DistilledGraph = {
+			categories: [
+				{ id: "c1", shortTitle: "C1", summary: "s" },
+				{ id: "c2", shortTitle: "C2", summary: "s" },
+			],
+			topics: [
+				{ slug: "t1", shortTitle: "T1", summary: "s", title: "Topic1", categoryId: "c1" }, // clean
+				{ slug: "t4", shortTitle: "T4", summary: "s", title: "Topic4", categoryId: "c1" }, // clean
+				{ slug: "t2", shortTitle: "T2old", summary: "old", title: "Topic2", categoryId: "c1" }, // dirty → moves
+				{ slug: "t3", shortTitle: "T3", summary: "s", title: "Topic3", categoryId: "c2" }, // clean
+			],
+			units: [
+				{
+					id: "t1::u1",
+					topicSlug: "t1",
+					kinds: ["decision"],
+					shortTitle: "U1",
+					summary: "s",
+					anchors: { files: [], commits: [] },
+				},
+				{
+					id: "t4::u4",
+					topicSlug: "t4",
+					kinds: ["fix"],
+					shortTitle: "U4",
+					summary: "s",
+					anchors: { files: [], commits: [] },
+				},
+				{
+					id: "t2::uOld",
+					topicSlug: "t2",
+					kinds: ["fix"],
+					shortTitle: "old",
+					summary: "s",
+					anchors: { files: [], commits: [] },
+				},
+				{
+					id: "t3::u3",
+					topicSlug: "t3",
+					kinds: ["mechanism"],
+					shortTitle: "U3",
+					summary: "s",
+					anchors: { files: [], commits: [] },
+				},
+			],
+			edges: [
+				{ from: "t1::u1", to: "t2::uOld", type: "related-to", confidence: 0.6, evidence: "stale-old-cat" }, // touches t2
+				{ from: "t1::u1", to: "t4::u4", type: "extends", confidence: 0.8, evidence: "CLEAN-C1" }, // clean–clean c1
+			],
+		};
+		callLlm.mockImplementation(async (opts: { action: string; params: Record<string, string> }) => {
+			if (opts.action === "graph-categories-delta")
+				return {
+					text: JSON.stringify({
+						newCategories: [],
+						// t2 MOVES from c1 to c2.
+						topics: [
+							{ slug: "t2", title: "Topic2", shortTitle: "T2new", summary: "new", categoryId: "c2" },
+						],
+					}),
+				};
+			if (opts.action === "graph-units")
+				return {
+					text: JSON.stringify({ units: [{ id: "u", kind: "decision", shortTitle: "U", summary: "s" }] }),
+				};
+			if (opts.action === "graph-edges")
+				return {
+					text: JSON.stringify({
+						edges: [
+							{ from: "t2::u", to: "t3::u3", type: "caused-by", confidence: 0.9, evidence: "fresh-c2" },
+						],
+					}),
+					stopReason: null,
+				};
+			throw new Error(`unexpected ${opts.action}`);
+		});
+		const input: DistillInput = {
+			topics: [
+				{ slug: "t1", title: "Topic1", summary: "s", content: "c1" },
+				{ slug: "t4", title: "Topic4", summary: "s", content: "c4" },
+				{ slug: "t2", title: "Topic2", summary: "new", content: "c2new" },
+				{ slug: "t3", title: "Topic3", summary: "s", content: "c3" },
+			],
+		};
+		const diff: TopicDiff = { clean: ["t1", "t4", "t3"], dirty: ["t2"], added: [], deleted: [] };
+		const g = await distillGraphIncremental(input, base, diff, CONFIG);
+
+		expect(g.topics.find((t) => t.slug === "t2")?.categoryId).toBe("c2"); // moved
+		// t2's stale edge in its OLD category is gone (its old unit vanished + it touches a changed topic).
+		expect(g.edges).not.toContainEqual(expect.objectContaining({ evidence: "stale-old-cat" }));
+		// the untouched clean–clean c1 edge survived verbatim (c1 was never recomputed).
+		expect(g.edges).toContainEqual({
+			from: "t1::u1",
+			to: "t4::u4",
+			type: "extends",
+			confidence: 0.8,
+			evidence: "CLEAN-C1",
+		});
+		// the fresh edge in t2's NEW category is present.
+		expect(g.edges).toContainEqual({
+			from: "t2::u",
+			to: "t3::u3",
+			type: "caused-by",
+			confidence: 0.9,
+			evidence: "fresh-c2",
+		});
+	});
+
+	it("drops a clean–clean baseline edge that is cross-category (never carries a stale cross-category unit edge forward)", async () => {
+		const base: DistilledGraph = {
+			categories: [
+				{ id: "c1", shortTitle: "C1", summary: "s" },
+				{ id: "c2", shortTitle: "C2", summary: "s" },
+			],
+			topics: [
+				{ slug: "t1", shortTitle: "T1", summary: "s", title: "Topic1", categoryId: "c1" }, // clean
+				{ slug: "t2", shortTitle: "T2", summary: "s", title: "Topic2", categoryId: "c2" }, // clean
+				{ slug: "t3", shortTitle: "T3old", summary: "old", title: "Topic3", categoryId: "c1" }, // dirty
+			],
+			units: [
+				{
+					id: "t1::u1",
+					topicSlug: "t1",
+					kinds: ["decision"],
+					shortTitle: "U1",
+					summary: "s",
+					anchors: { files: [], commits: [] },
+				},
+				{
+					id: "t2::u2",
+					topicSlug: "t2",
+					kinds: ["fix"],
+					shortTitle: "U2",
+					summary: "s",
+					anchors: { files: [], commits: [] },
+				},
+				{
+					id: "t3::uOld",
+					topicSlug: "t3",
+					kinds: ["mechanism"],
+					shortTitle: "old",
+					summary: "s",
+					anchors: { files: [], commits: [] },
+				},
+			],
+			// clean–clean (t1,t2 untouched) but CROSS-category (c1↔c2) — a relic an older
+			// baseline could hold. Must be dropped by the isIntraCategory filter.
+			edges: [{ from: "t1::u1", to: "t2::u2", type: "related-to", confidence: 0.7, evidence: "cross-cat-relic" }],
+		};
+		callLlm.mockImplementation(async (opts: { action: string; params: Record<string, string> }) => {
+			if (opts.action === "graph-categories-delta")
+				return {
+					text: JSON.stringify({
+						newCategories: [],
+						topics: [
+							{ slug: "t3", title: "Topic3", shortTitle: "T3new", summary: "new", categoryId: "c1" },
+						],
+					}),
+				};
+			if (opts.action === "graph-units")
+				return {
+					text: JSON.stringify({ units: [{ id: "u", kind: "decision", shortTitle: "U", summary: "s" }] }),
+				};
+			if (opts.action === "graph-edges") return { text: '{"edges":[]}', stopReason: null };
+			throw new Error(`unexpected ${opts.action}`);
+		});
+		const input: DistillInput = {
+			topics: [
+				{ slug: "t1", title: "Topic1", summary: "s", content: "c1" },
+				{ slug: "t2", title: "Topic2", summary: "s", content: "c2" },
+				{ slug: "t3", title: "Topic3", summary: "new", content: "c3new" },
+			],
+		};
+		const diff: TopicDiff = { clean: ["t1", "t2"], dirty: ["t3"], added: [], deleted: [] };
+		const g = await distillGraphIncremental(input, base, diff, CONFIG);
+		expect(g.edges).not.toContainEqual(expect.objectContaining({ evidence: "cross-cat-relic" }));
 	});
 });
 

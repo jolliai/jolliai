@@ -175,7 +175,13 @@ async function compileSingleRepo(cwd: string, rebuild: boolean): Promise<void> {
 		}
 
 		const { batches, ingested, outcome, topicFailures } = drainResult;
-		let summary = `\n  Done: ${ingested} source(s) folded in ${batches} batch(es). Wiki rebuilt. [${outcome}]`;
+		// User-facing wording: say "commit summaries" (not the internal "sources"), and
+		// let 0 read as "already up to date" rather than "0 sources". Mirrors the VS Code toast.
+		const addedNote =
+			ingested === 0
+				? "already up to date -- no new commit summaries to add"
+				: `added ${ingested} new commit summar${ingested === 1 ? "y" : "ies"} (${batches} batch(es))`;
+		let summary = `\n  Done: ${addedNote}. Wiki rebuilt. [${outcome}]`;
 		if (topicFailures.length > 0) {
 			summary += `\n  ${topicFailures.length} topic(s) held: ${topicFailures.map((f) => `${f.slug} (${f.code})`).join(", ")}`;
 		}
@@ -198,13 +204,20 @@ async function compileSweep(): Promise<void> {
 		process.exitCode = 1;
 		return;
 	}
-	console.log("\n  Ingesting pending sources across all Memory Bank repos...");
+	console.log("\n  Adding pending commit summaries across all Memory Bank repos...");
 	const result = await compileAllRepos(config.localFolder, config);
 	for (const r of result.repos) {
-		console.log(r.error ? `    ✗ ${r.folder}: ${r.error}` : `    ✓ ${r.folder}: ${r.ingested} source(s)`);
+		const perRepo =
+			r.ingested === 0 ? "up to date" : `${r.ingested} new commit summar${r.ingested === 1 ? "y" : "ies"}`;
+		console.log(r.error ? `    ✗ ${r.folder}: ${r.error}` : `    ✓ ${r.folder}: ${perRepo}`);
 	}
 	const failedNote = result.failed ? `, ${result.failed} failed` : "";
-	console.log(`\n  Done: ${result.totalIngested} source(s) across ${result.repos.length} repo(s)${failedNote}.\n`);
+	const repos = `${result.repos.length} repo(s)`;
+	const summary =
+		result.totalIngested === 0
+			? `all ${repos} already up to date -- no new commit summaries to add`
+			: `added ${result.totalIngested} new commit summar${result.totalIngested === 1 ? "y" : "ies"} across ${repos}`;
+	console.log(`\n  Done: ${summary}${failedNote}.\n`);
 	if (result.failed > 0) process.exitCode = 1;
 }
 

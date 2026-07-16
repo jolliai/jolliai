@@ -38,6 +38,8 @@
   --edge-supersedes: #f47067;
   --edge-related-to: #4ece8d;
   --edge-contradicts: #b494f0;
+  /* deterministic co-change edges — neutral grey, distinct from the typed family */
+  --edge-co-change: #9a9aa8;
 
   /* unit kind chips (aligned to the same accent family) */
   --kind-decision: #6eaaef;
@@ -67,6 +69,7 @@ body.vscode-light {
   --edge-supersedes: #c0392b;
   --edge-related-to: #1b6340;
   --edge-contradicts: #5c35a0;
+  --edge-co-change: #6b6b76;
 
   --kind-decision: #1f5a91;
   --kind-mechanism: #1b6340;
@@ -503,6 +506,7 @@ body {
 .rel-type.supersedes  { background: rgba(255,107,107,.16); color: var(--edge-supersedes); }
 .rel-type.related-to  { background: rgba(95,208,156,.15);  color: var(--edge-related-to); }
 .rel-type.contradicts { background: rgba(192,138,255,.15); color: var(--edge-contradicts); }
+.rel-type.co-change   { background: rgba(154,154,168,.15); color: var(--edge-co-change); }
 .conf-pill {
   font: 600 9.5px Consolas, monospace; padding: 1.5px 5px; border-radius: 3px;
 }

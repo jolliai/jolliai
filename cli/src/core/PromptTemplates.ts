@@ -786,7 +786,7 @@ Boundary rules (assign multiple kinds when a unit genuinely spans them):
 - rationale belongs INSIDE a decision's summary ("chose X because Y"), never a separate unit.
 
 ## Task
-- Extract 1-8 units.
+- Extract only load-bearing units -- knowledge a future contributor would otherwise get wrong or waste time rediscovering. Most topics yield 2-5; go higher only when the topic is genuinely rich, and never more than 8. Do NOT pad to a count -- a topic with one real decision returns one unit. Skip anything generic or that merely restates what the code obviously does.
 - kinds: an array of 1-3 values from the list above, most important first (kinds[0] drives its colour). No duplicates.
 - id: a short kebab-case slug unique within THIS topic (the caller namespaces it globally).
 - shortTitle <= 5 words; summary one sentence.
@@ -797,9 +797,9 @@ Output ONLY a JSON object -- no prose, no markdown fences:
 {"units":[{"id":"<kebab>","kinds":["decision","non-goal"],"shortTitle":"<<=5 words>","summary":"<one sentence>","anchors":{"files":[],"commits":[]}}]}
 Use [] for empty arrays.`;
 
-const GRAPH_EDGES = `You are finding typed relationships between knowledge units in a software project's wiki. You are given a flat list of units (id, topic, short title, summary).
+const GRAPH_EDGES = `You are finding typed relationships between knowledge units WITHIN ONE CATEGORY (a single subsystem) of a software project's wiki. Every unit listed below belongs to that same category; your job is to find the genuine relationships among THEM.
 
-## Units
+## Units (all in one category)
 {{units}}
 
 ## Edge types
@@ -811,6 +811,7 @@ const GRAPH_EDGES = `You are finding typed relationships between knowledge units
 
 ## Task
 - Emit edges ONLY between unit ids in the list above. from and to must both be exact ids from the list.
+- These units are already scoped to one category, so look for relationships among them -- both within a single topic and across the different topics of this category. Relationships to units in OTHER categories are computed separately and are NOT your job here: do not speculate about anything outside this list.
 - Prefer the most specific type. Use related-to sparingly.
 - confidence is a number in [0.5, 1.0]. evidence is one sentence citing the basis (a file, commit, or quoted phrase).
 - Do not emit an edge from a unit to itself, and do not repeat a (from, to, type) triple.
@@ -959,7 +960,7 @@ export const TEMPLATES: ReadonlyMap<string, PromptTemplate> = new Map<string, Pr
 	// template's own version bump, not the schema version.
 	["graph-categories", { action: "graph-categories", version: 1, template: GRAPH_CATEGORIES }],
 	["graph-categories-delta", { action: "graph-categories-delta", version: 1, template: GRAPH_CATEGORIES_DELTA }],
-	["graph-units", { action: "graph-units", version: 2, template: GRAPH_UNITS }],
-	["graph-edges", { action: "graph-edges", version: 1, template: GRAPH_EDGES }],
+	["graph-units", { action: "graph-units", version: 3, template: GRAPH_UNITS }],
+	["graph-edges", { action: "graph-edges", version: 2, template: GRAPH_EDGES }],
 	["rank-context", { action: "rank-context", version: 3, template: RANK_CONTEXT }],
 ]);

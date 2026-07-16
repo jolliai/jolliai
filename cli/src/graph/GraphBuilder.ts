@@ -21,6 +21,7 @@ import type { SourceRef } from "../core/TopicKBTypes.js";
 import { readTopicPage } from "../core/TopicPageStore.js";
 import { createLogger } from "../Logger.js";
 import type { LlmConfig } from "../Types.js";
+import { computeCoChangeTopicEdges } from "./CoChangeEdges.js";
 import { readGraph, writeGraphArtifacts } from "./GraphArtifactStore.js";
 import {
 	type DistillTopicInput,
@@ -236,7 +237,8 @@ export async function buildKnowledgeGraph(
 			log.info("Knowledge graph content unchanged but source metadata/repoName drifted -- reassembling (no LLM)");
 			mode = "incremental";
 			distill = prevDistill;
-			const graph = assembleGraph(distill, sources, now, repoName, fingerprints, metaFingerprints);
+			const coChange = computeCoChangeTopicEdges(distill.units, distill.topics);
+			const graph = assembleGraph(distill, sources, now, repoName, fingerprints, metaFingerprints, coChange);
 			opts?.onProgress?.("writing graph.json");
 			const { graphJsonPath } = await writeGraphArtifacts(kbRoot, graph);
 			log.info(
@@ -289,7 +291,8 @@ export async function buildKnowledgeGraph(
 		distill = await distillGraph({ topics: topicsInput }, config, opts?.onProgress);
 	}
 
-	const graph = assembleGraph(distill, sources, now, repoName, fingerprints, metaFingerprints);
+	const coChangeTopicEdges = computeCoChangeTopicEdges(distill.units, distill.topics);
+	const graph = assembleGraph(distill, sources, now, repoName, fingerprints, metaFingerprints, coChangeTopicEdges);
 
 	opts?.onProgress?.("writing graph.json");
 	const { graphJsonPath } = await writeGraphArtifacts(kbRoot, graph);

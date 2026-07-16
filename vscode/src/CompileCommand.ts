@@ -75,9 +75,16 @@ export function registerCompileCommand(opts: CompileCommandOpts): vscode.Disposa
 					}),
 			);
 			const failedNote = result.failed ? ` (${result.failed} failed)` : "";
-			await vscode.window.showInformationMessage(
-				`Knowledge wiki updated: ${result.totalIngested} source(s) across ${result.repos.length} repo(s)${failedNote}.`,
-			);
+			const n = result.totalIngested;
+			const repos = `${result.repos.length} repo(s)`;
+			// User-facing wording: say "commit summaries" (not the internal "sources"),
+			// and special-case 0 as "already up to date" so it never reads as
+			// "0 sources / nothing found".
+			const summary =
+				n === 0
+					? `Knowledge wiki already up to date — no new commit summaries to add (${repos})${failedNote}.`
+					: `Knowledge wiki updated — added ${n} new commit summar${n === 1 ? "y" : "ies"} across ${repos}${failedNote}.`;
+			await vscode.window.showInformationMessage(summary);
 		} catch (err) {
 			await vscode.window.showErrorMessage(
 				`Knowledge wiki build failed: ${err instanceof Error ? err.message : String(err)}`,
