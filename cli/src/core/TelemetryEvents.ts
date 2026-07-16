@@ -60,7 +60,7 @@ export const TELEMETRY_EVENTS = {
 		"User committed a memory via the Commit button. Props: files_bucket (bucketed changed-file count), has_conversations (bool), context_bucket (bucketed plans/context count).",
 	memory_expanded: "A committed memory's details were expanded. Props: expanded.",
 	memory_item_opened:
-		"An item inside a memory was opened. Props: item_type (discriminator: conversation/file/plan/note/reference/shipped).",
+		"An item inside a memory was opened. Props: item_type (discriminator: conversation/file/plan/note/reference/shipped); render (conversation only: live/stored — whether the source transcript was reopened or the stored copy was shown); source (conversation only: the transcript source, e.g. claude/codex); status (file only: the git status code, e.g. A/M/D).",
 	session_resumed: "A conversation session was resumed in a terminal. Props: source (discriminator).",
 	recall_prompt_copied: "A recall prompt was copied to the clipboard. Props: none.",
 	memory_pinned: "An item was pinned. Props: kind (discriminator).",

@@ -561,6 +561,15 @@ export type SidebarOutboundMsg =
 			readonly type: "selection:request";
 			readonly repoName?: string;
 			readonly branchName?: string;
+			/**
+			 * Suppress the `repo_switched` / `branch_switched` telemetry for this
+			 * message. Set on the second message of the "reset to workspace" pair
+			 * (repo + branch sent together): the two messages are one user action,
+			 * so only the first should be counted — otherwise the reset inflates
+			 * the switch metrics by double-counting. Mirrors IntelliJ's
+			 * `onBranchSelected(trackSwitch = false)` for the repo→branch cascade.
+			 */
+			readonly silent?: boolean;
 	  }
 	| {
 			/**

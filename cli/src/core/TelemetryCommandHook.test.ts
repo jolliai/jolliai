@@ -5,7 +5,12 @@ import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { initTelemetry, shutdownTelemetry } from "./Telemetry.js";
 import { readTelemetryEvents } from "./TelemetryBuffer.js";
-import { commandPath, installCommandTelemetryHooks, trackCommandFailureIfPending } from "./TelemetryCommandHook.js";
+import {
+	commandPath,
+	installCommandTelemetryHooks,
+	shouldSkipExitFlush,
+	trackCommandFailureIfPending,
+} from "./TelemetryCommandHook.js";
 
 let cwd: string;
 
@@ -104,5 +109,41 @@ describe("installCommandTelemetryHooks", () => {
 		await expect(program.parseAsync(["node", "jolli", "mcp"])).rejects.toThrow("boom");
 		trackCommandFailureIfPending();
 		expect(await readTelemetryEvents(cwd)).toEqual([]);
+	});
+});
+
+describe("shouldSkipExitFlush", () => {
+	// Mirrors the real CLI shape: a `telemetry` group with a default subcommand,
+	// plus a global option registered on the root before parsing.
+	function programWithTelemetry(): Command {
+		const program = new Command();
+		program.name("jolli").exitOverride();
+		program.option("--verbose"); // a global option that precedes the subcommand
+		installCommandTelemetryHooks(program);
+		program.command("recall").action(() => {});
+		const telemetry = program.command("telemetry");
+		telemetry.command("status", { isDefault: true }).action(() => {});
+		telemetry.command("inspect").action(() => {});
+		return program;
+	}
+
+	it("returns false for a non-telemetry command", async () => {
+		await programWithTelemetry().parseAsync(["node", "jolli", "recall"]);
+		expect(shouldSkipExitFlush()).toBe(false);
+	});
+
+	it("returns true for a telemetry subcommand", async () => {
+		await programWithTelemetry().parseAsync(["node", "jolli", "telemetry", "inspect"]);
+		expect(shouldSkipExitFlush()).toBe(true);
+	});
+
+	it("returns true for bare `telemetry` (default subcommand still fires preAction)", async () => {
+		await programWithTelemetry().parseAsync(["node", "jolli", "telemetry"]);
+		expect(shouldSkipExitFlush()).toBe(true);
+	});
+
+	it("stays correct when a global option precedes the subcommand (unlike an argv-position check)", async () => {
+		await programWithTelemetry().parseAsync(["node", "jolli", "--verbose", "telemetry", "inspect"]);
+		expect(shouldSkipExitFlush()).toBe(true);
 	});
 });

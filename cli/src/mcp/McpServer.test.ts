@@ -287,6 +287,20 @@ describe("startMcpServer", () => {
 		);
 	});
 
+	it("CallTool telemetry folds an unknown (client-controlled) tool name to 'unknown' (JOLLI-1961)", async () => {
+		await startMcpServer("/repo");
+		// `name` is free text chosen by the MCP client; an unknown tool throws
+		// `Unknown tool: …` and hits the catch path. The raw name must never reach
+		// telemetry — only our own fixed identifiers, or "unknown".
+		await capturedHandlers[1]({ params: { name: "acme-secret-exfil-tool", arguments: {} } });
+		expect(track).toHaveBeenCalledWith(
+			"command_invoked",
+			expect.objectContaining({ command: "mcp", tool: "unknown", ok: false }),
+		);
+		const props = vi.mocked(track).mock.calls[0][1] as Record<string, unknown>;
+		expect(JSON.stringify(props)).not.toContain("acme-secret-exfil-tool");
+	});
+
 	it("CallTool handler does NOT flag a binding_required result as isError (it's a needs-input outcome)", async () => {
 		vi.mocked(runPushMemory).mockResolvedValueOnce({
 			type: "binding_required",

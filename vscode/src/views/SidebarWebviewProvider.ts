@@ -1107,7 +1107,7 @@ export class SidebarWebviewProvider
 				this.handleRefresh(msg.scope);
 				return;
 			case "selection:request":
-				this.handleSelectionRequest(msg.repoName, msg.branchName);
+				this.handleSelectionRequest(msg.repoName, msg.branchName, msg.silent);
 				return;
 			case "selection:requestBranchMemories":
 				void this.handleBranchMemoriesRequest(msg.repoName, msg.branchName);
@@ -1289,6 +1289,10 @@ export class SidebarWebviewProvider
 	private handleSelectionRequest(
 		repoName: string | undefined,
 		branchName: string | undefined,
+		// Suppress telemetry for the cascade message of a "reset to workspace"
+		// click (see the `silent` field on the selection:request message): the
+		// repo + branch pair is one user action, so only the first message counts.
+		silent = false,
 	): void {
 		if (!this.deps.selection) return;
 		if (repoName) {
@@ -1298,7 +1302,7 @@ export class SidebarWebviewProvider
 			this.selectedRepoName = target.repoName;
 			// JOLLI-1904: user switched repo in the breadcrumb (mirrors IntelliJ
 			// BreadcrumbHeaderPanel.onRepoSelected). is_foreign = not the workspace repo.
-			track("repo_switched", { is_foreign: !target.isCurrent });
+			if (!silent) track("repo_switched", { is_foreign: !target.isCurrent });
 			const branches = this.deps.selection.listBranches(target.repoName);
 			this.selectedBranchName = branches[0];
 			this.postMessage({
@@ -1321,7 +1325,7 @@ export class SidebarWebviewProvider
 			const state = this.deps.getInitialState();
 			const repoForeign = this.selectedRepoName != null && this.selectedRepoName !== state.currentRepoName;
 			const currentBranch = this.deps.branchWatcher?.current().name ?? state.branchName;
-			track("branch_switched", { is_foreign: repoForeign || branchName !== currentBranch });
+			if (!silent) track("branch_switched", { is_foreign: repoForeign || branchName !== currentBranch });
 			this.postMessage({
 				type: "selection:set",
 				repoName: this.selectedRepoName,

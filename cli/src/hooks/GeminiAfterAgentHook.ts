@@ -101,13 +101,17 @@ export async function handleGeminiAfterAgentHook(): Promise<void> {
 		log.error("Failed to save session: %s", (error as Error).message);
 	}
 
+	// Always write the required JSON response first — Gemini CLI needs it, and
+	// emitting it before the (best-effort) telemetry flush means a slow network
+	// can't delay the response Gemini is waiting on.
+	writeStdout();
+
 	// JOLLI-1954: flush the shared telemetry buffer on every agent turn end
 	// (mirrors the Claude Stop hook). Awaited so the short-lived hook process
 	// doesn't exit before the POST; best-effort, re-gates consent, never throws.
-	await flushTelemetryNow(projectDir);
-
-	// Always write JSON response — Gemini CLI requires it
-	writeStdout();
+	// Short per-batch timeout (matching the CLI exit path) instead of the
+	// flusher's 10s default so a slow network can't keep the process alive.
+	await flushTelemetryNow(projectDir, { timeoutMs: 2_000 });
 }
 
 // Auto-execute only when run directly (not when imported)

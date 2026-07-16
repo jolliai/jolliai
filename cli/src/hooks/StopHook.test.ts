@@ -19,6 +19,12 @@ vi.mock("../core/references/ReferenceExtractor.js", () => ({
 	extractReferencesFromTranscript: vi.fn().mockResolvedValue({ references: [], lastLineNumberScanned: 0 }),
 }));
 
+// Mock the telemetry flush so the terminal JOLLI-1954 flush is a no-op and its
+// arguments (short timeout) can be asserted.
+vi.mock("../core/TelemetryStartup.js", () => ({
+	flushTelemetryNow: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Mock Locks — these unit tests run with synthetic cwds (e.g. "/project"), so
 // the real per-worktree lock would create junk dirs off the drive root. Run the
 // plans.json RMW body inline; the lock contract is covered in Locks.test.ts.
@@ -75,6 +81,7 @@ import {
 	saveSession,
 	upsertReferenceEntry,
 } from "../core/SessionTracker.js";
+import { flushTelemetryNow } from "../core/TelemetryStartup.js";
 import type { PlanEntry } from "../Types.js";
 import { withPlatform } from "../testUtils/withPlatform.js";
 import { handleStopHook } from "./StopHook.js";
@@ -237,6 +244,18 @@ describe("StopHook", () => {
 			}),
 			"/my/project",
 		);
+	});
+
+	it("flushes telemetry with a short per-batch timeout (not the flusher's 10s default)", async () => {
+		mockStdin(
+			JSON.stringify({
+				session_id: "s",
+				transcript_path: "/home/user/.claude/projects/abc/session.jsonl",
+				cwd: "/my/project",
+			}),
+		);
+		await handleStopHook();
+		expect(flushTelemetryNow).toHaveBeenCalledWith("/my/project", { timeoutMs: 2_000 });
 	});
 
 	it("should prefer CLAUDE_PROJECT_DIR over hookData.cwd", async () => {

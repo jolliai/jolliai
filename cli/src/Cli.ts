@@ -8,7 +8,7 @@
  */
 
 import { main } from "./Api.js";
-import { trackCommandFailureIfPending } from "./core/TelemetryCommandHook.js";
+import { shouldSkipExitFlush, trackCommandFailureIfPending } from "./core/TelemetryCommandHook.js";
 import { bootstrapTelemetry, flushTelemetryNow, maybeShowCliTelemetryNotice } from "./core/TelemetryStartup.js";
 import { runWithTrace, traceIdFromEnv } from "./core/TraceContext.js";
 import { setSilentConsole } from "./Logger.js";
@@ -51,9 +51,11 @@ if (!process.env.VITEST) {
 			// usage that never commits or runs an agent still uploads (and, on the
 			// failure path, so the ok:false event above is sent before we exit). Skip
 			// the `telemetry` command group — `off` clears the buffer and `inspect`
-			// must not send. Bounded timeout (not the flusher's 10s default) so a slow
+			// must not send. The skip keys off the commander-parsed command, not an
+			// argv position, so it survives any future global option before the
+			// subcommand. Bounded timeout (not the flusher's 10s default) so a slow
 			// network can't stall the prompt; best-effort and never throws.
-			if (process.argv[2] !== "telemetry") {
+			if (!shouldSkipExitFlush()) {
 				await flushTelemetryNow(process.cwd(), { timeoutMs: 2_000 });
 			}
 			if (failed) process.exit(1);

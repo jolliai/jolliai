@@ -253,6 +253,14 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 		menu = buildJolliMenu(platformTools, TOOL_DEFINITIONS);
 	}
 	const platformByName = new Map(platformTools.map((t) => [t.name, t] as const));
+	// Allowlist of tool names we may put in telemetry. `req.params.name` is
+	// client-controlled free text (the AI picks it), so an unknown-tool call
+	// would otherwise leak that arbitrary string into `command_invoked{tool}`
+	// via the catch path below — the same "external content in telemetry" leak
+	// JOLLI-1961 forbids for `arguments`. Fold any unrecognized name to
+	// "unknown" so only our own fixed identifiers are ever reported.
+	const knownToolNames = new Set<string>([...TOOL_DEFINITIONS.map((t) => t.name), ...platformByName.keys()]);
+	const telemetryToolName = (name: string): string => (knownToolNames.has(name) ? name : "unknown");
 	// Advertise the built-ins plus any platform tools. Build the list locally and
 	// leave the static built-in registry untouched; with no platform tools the
 	// static array is returned directly. Project each platform tool down to the
@@ -305,10 +313,20 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 			// structured `{type:"error"}` result, not just thrown errors. The
 			// session-level mcp event is suppressed in TelemetryCommandHook so this
 			// does not double-count.
-			track("command_invoked", { command: "mcp", tool: name, duration_ms: Date.now() - start, ok: !isError });
+			track("command_invoked", {
+				command: "mcp",
+				tool: telemetryToolName(name),
+				duration_ms: Date.now() - start,
+				ok: !isError,
+			});
 			return { content: [{ type: "text", text: JSON.stringify(result) }], ...(isError ? { isError: true } : {}) };
 		} catch (err) {
-			track("command_invoked", { command: "mcp", tool: name, duration_ms: Date.now() - start, ok: false });
+			track("command_invoked", {
+				command: "mcp",
+				tool: telemetryToolName(name),
+				duration_ms: Date.now() - start,
+				ok: false,
+			});
 			const message = err instanceof Error ? err.message : String(err);
 			log.warn("Tool %s failed: %s", name, message);
 			return { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true };

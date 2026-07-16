@@ -1993,6 +1993,13 @@ describe("SidebarScriptBuilder", () => {
 			expect(handler).toMatch(
 				/selection:request[\s\S]{0,200}branchName:\s*state\.branchName/,
 			);
+			// The branch message is the cascade of a single user action, so it
+			// carries silent (suppressing branch_switched) whenever the repo reset
+			// already fired repo_switched — otherwise one click double-counts as two
+			// switch events (mirrors IntelliJ onBranchSelected(trackSwitch=false)).
+			expect(handler).toMatch(
+				/branchName:\s*state\.branchName,\s*silent:\s*sentRepoReset/,
+			);
 		});
 
 		it("Changes section is dropped entirely in foreign-readonly mode (renderBranch only pushes plans/changes when !foreign)", () => {
