@@ -26,6 +26,7 @@ describe("classifyVaultPath — positive cases", () => {
 		["myrepo/.jolli/plans/my-feature.md", "plan"],
 		["myrepo/.jolli/plan-progress/my-feature.json", "plan-progress"],
 		["myrepo/.jolli/notes/note-xyz.md", "note"],
+		["myrepo/.jolli/graph/graph.json", "graph"],
 		[`myrepo/main/fix-auth-${HASH8}.md`, "visible-summary"],
 		["myrepo/main/plan--my-feature.md", "visible-plan"],
 		["myrepo/main/note--note-xyz.md", "visible-note"],
@@ -142,6 +143,16 @@ describe("classifyVaultPath — negative cases", () => {
 		expect(classifyVaultPath("myrepo/migration.json")).toBe("user-content");
 		expect(classifyVaultPath("myrepo/.jolli/migration.txt")).toBeNull();
 		expect(classifyVaultPath("myrepo/.jolli/sub/migration.json")).toBeNull();
+	});
+
+	it("classifies only the exact graph/graph.json leaf; other names + deeper nesting stay null", () => {
+		// GraphArtifactStore writes exactly one file: `.jolli/graph/graph.json`.
+		// The classifier matches that name and nothing else, keeping the canary
+		// strict for any stray file that appears under the graph dir.
+		expect(classifyVaultPath("myrepo/.jolli/graph/graph.json")).toBe("graph");
+		expect(classifyVaultPath("myrepo/.jolli/graph/other.json")).toBeNull();
+		expect(classifyVaultPath("myrepo/.jolli/graph/graph.txt")).toBeNull();
+		expect(classifyVaultPath("myrepo/.jolli/graph/nested/x.json")).toBeNull();
 	});
 
 	it("rejects shadow-status.json (per-device dirty-write recovery state — never synced)", () => {

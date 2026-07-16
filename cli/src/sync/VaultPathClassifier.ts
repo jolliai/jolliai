@@ -43,7 +43,8 @@
  *       │   ├── transcripts/<hash>.json         ← transcript (gated by syncTranscripts)
  *       │   ├── plans/<slug>.md                 ← plan (markdown, not JSON)
  *       │   ├── plan-progress/<slug>.json       ← plan-progress
- *       │   └── notes/<id>.md                   ← note (markdown)
+ *       │   ├── notes/<id>.md                   ← note (markdown)
+ *       │   └── graph/graph.json                ← graph (regenerable KB-graph data)
  *       └── <branch>/
  *           ├── <slug>-<hex8>.md                ← visible-summary
  *           ├── plan--<slug>.md                 ← visible-plan
@@ -241,6 +242,12 @@ function classifyStrict(relPath: string): OwnedPathKind | null {
 					const base = stripExt(file, ".md");
 					return base !== null && PLAN_NOTE_ID_RE.test(base) ? "note" : null;
 				}
+				// `graph/graph.json` — the single regenerable knowledge-graph
+				// data file (GraphArtifactStore writes exactly one file here).
+				// Only that exact name classifies; any other leaf stays `null`
+				// so the canary keeps its strictness.
+				case "graph":
+					return file === "graph.json" ? "graph" : null;
 				default:
 					return null;
 			}
