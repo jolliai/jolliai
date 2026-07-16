@@ -128,6 +128,30 @@ describe("ingestPendingBatch", () => {
 		expect(sources.indexOf("content cOld")).toBeLessThan(sources.indexOf("content cNew"));
 	});
 
+	it("threads the configured aiProvider into both the route and reconcile calls", async () => {
+		// Regression: these two callLlm sites used to omit aiProvider, so a user
+		// who picked "local-agent" but had an ANTHROPIC key on disk was silently
+		// routed to Anthropic (resolveLlmCredentialSource's legacy fallback),
+		// surfacing as a "via Anthropic" footer on topic-KB content.
+		vi.mocked(listPendingSources).mockResolvedValue([s("c0", "2026-01-01T00:00:00Z")]);
+		vi.mocked(callLlm)
+			.mockResolvedValueOnce(
+				llmText(
+					"route",
+					JSON.stringify({
+						updates: [],
+						newTopics: [{ stableSlug: "auth", title: "Auth", sourceIndexes: [0] }],
+					}),
+				),
+			)
+			.mockResolvedValueOnce(llmText("reconcile", reconcileOut("auth")));
+		await ingestPendingBatch("/tmp/x", { apiKey: "k", aiProvider: "local-agent" });
+		const routeCall = vi.mocked(callLlm).mock.calls[0]?.[0];
+		const reconcileCall = vi.mocked(callLlm).mock.calls[1]?.[0];
+		expect(routeCall?.aiProvider).toBe("local-agent");
+		expect(reconcileCall?.aiProvider).toBe("local-agent");
+	});
+
 	it("routes + reconciles + marks all sources on the happy path", async () => {
 		vi.mocked(listPendingSources).mockResolvedValue([s("c0", "2026-01-01T00:00:00Z")]);
 		vi.mocked(callLlm)

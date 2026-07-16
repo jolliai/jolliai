@@ -2604,6 +2604,40 @@ describe("SummaryWebviewPanel", () => {
 				);
 			});
 
+			it("persists but skips UI writes (no false failure) when the panel is disposed during the LLM call", async () => {
+				// Regression for the local-agent report: `claude` CLI regenerate
+				// takes minutes, so the user often closes the panel mid-call. The
+				// summary stores fine, but the post-store `panel.webview` getter
+				// throws "Webview is disposed", which catchAndShow surfaced as a
+				// bogus "Regenerate failed" toast. Store must still happen; UI
+				// writes must be skipped, and no error must be shown.
+				mockLoadRegenerateContext.mockResolvedValue(stubCtx());
+				showWarningMessage.mockResolvedValueOnce("Regenerate");
+				const dispatch = await setupPanel();
+				const instance = firstCommitPanel<{ disposed: boolean }>();
+				// Disposal lands while the (multi-minute) regenerate is in flight.
+				mockRegenerateSummary.mockImplementationOnce(async () => {
+					instance.disposed = true;
+					return { updated: stubUpdated(), result: {} as never };
+				});
+				postMessage.mockClear();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				// Summary was still persisted — the store is the system of record.
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({ recap: "regenerated" }),
+					workspaceRoot,
+					true,
+				);
+				// No webview write (would throw on the disposed getter in prod) …
+				const commands = postMessage.mock.calls.map((c) => (c[0] as { command?: string }).command);
+				expect(commands).not.toContain("summaryRegenerated");
+				// … and crucially no false failure surfaced to the user.
+				expect(showErrorMessage).not.toHaveBeenCalled();
+			});
+
 			it("includes a non-empty summaryErrorBannerHtml when regenerate still produces a degraded summary", async () => {
 				// Defensive: if the regenerate result itself somehow carries
 				// summaryError (e.g. user clicks Regenerate while creds are still

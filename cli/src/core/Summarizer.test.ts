@@ -922,6 +922,35 @@ ${delimited({
 				expect(record.topics[0].title).toBe("Recovered topic");
 			});
 
+			it("threads the configured aiProvider into the strict-retry call", async () => {
+				// Regression: the strict-retry callLlm site omitted aiProvider, so a
+				// summary whose first attempt was malformed retried on Anthropic even
+				// under a local-agent config — and `source: retryResult.source` then
+				// stamped the whole summary "anthropic-config" (footer "via Anthropic").
+				mockCallLlm
+					.mockResolvedValueOnce(summaryLlmResult(malformedMarkdown))
+					.mockResolvedValueOnce(
+						summaryLlmResult(
+							delimited({ title: "Recovered topic", trigger: "t", response: "r", decisions: "d" }),
+						),
+					);
+
+				await generateSummary({
+					conversation: "transcript with markdown that confused the model",
+					diff: "diff",
+					commitInfo: mockCommitInfo,
+					diffStats: mockDiffStats,
+					transcriptEntries: 5,
+					config: { apiKey: "test-key", aiProvider: "local-agent" },
+				});
+
+				const calls = mockCallLlm.mock.calls as unknown as ReadonlyArray<
+					[{ action: string; aiProvider?: string }]
+				>;
+				expect(calls[1][0].action).toBe("summarize-strict");
+				expect(calls[1][0].aiProvider).toBe("local-agent");
+			});
+
 			it("sums LLM metadata across the two calls when retry succeeds", async () => {
 				mockCallLlm
 					.mockResolvedValueOnce(

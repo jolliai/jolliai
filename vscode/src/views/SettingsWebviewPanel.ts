@@ -46,7 +46,8 @@ interface SettingsPayload {
 	readonly apiKey: string;
 	readonly model: string;
 	readonly maxTokens: number | null;
-	readonly aiProvider: "anthropic" | "jolli";
+	readonly aiProvider: "anthropic" | "jolli" | "local-agent";
+	readonly localAgentTool?: "claude-code";
 	readonly jolliApiKey: string;
 	readonly claudeEnabled: boolean;
 	readonly codexEnabled: boolean;
@@ -429,8 +430,8 @@ export class SettingsWebviewPanel {
 	 * present, else "jolli" if signed in (matches IntelliJ's default-derivation
 	 * in `populateFields`), else "anthropic".
 	 */
-	private resolveProvider(config: JolliMemoryConfig): "anthropic" | "jolli" {
-		if (config.aiProvider === "anthropic" || config.aiProvider === "jolli") {
+	private resolveProvider(config: JolliMemoryConfig): "anthropic" | "jolli" | "local-agent" {
+		if (config.aiProvider === "anthropic" || config.aiProvider === "jolli" || config.aiProvider === "local-agent") {
 			return config.aiProvider;
 		}
 		const signedIn = this.authService?.isSignedIn(config) ?? false;
@@ -453,6 +454,7 @@ export class SettingsWebviewPanel {
 			model: config.model ?? "sonnet",
 			maxTokens: config.maxTokens ?? null,
 			aiProvider: this.resolveProvider(config),
+			localAgentTool: config.localAgentTool ?? "claude-code",
 			jolliApiKey: maskedJolliApiKey,
 			claudeEnabled: config.claudeEnabled !== false,
 			codexEnabled: config.codexEnabled !== false,
@@ -530,6 +532,7 @@ export class SettingsWebviewPanel {
 			signedIn,
 			hasJolliKey,
 			aiProvider: this.resolveProvider(config),
+			localAgentTool: config.localAgentTool ?? "claude-code",
 			jolliSiteLabel: buildJolliSiteLabel(config.jolliApiKey, config.jolliUrl),
 		});
 	}
@@ -598,6 +601,7 @@ export class SettingsWebviewPanel {
 			model: settings.model === "sonnet" ? undefined : settings.model,
 			maxTokens: settings.maxTokens ?? undefined,
 			aiProvider: settings.aiProvider,
+			localAgentTool: settings.localAgentTool ?? "claude-code",
 			jolliApiKey:
 				resolvedJolliApiKey.length > 0 ? resolvedJolliApiKey : undefined,
 			claudeEnabled: settings.claudeEnabled,

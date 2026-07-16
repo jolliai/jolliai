@@ -720,6 +720,33 @@ describe("SettingsWebviewPanel", () => {
 			);
 		});
 
+		it("persists local-agent provider + tool to config", async () => {
+			const dispatch = await setupWithLoadedConfig();
+			dispatch({
+				command: "applySettings",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					aiProvider: "local-agent",
+					localAgentTool: "claude-code",
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+				},
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ aiProvider: "local-agent", localAgentTool: "claude-code" }),
+				expect.any(String),
+			);
+		});
+
 		it("preserves original jolli API key when masked value is unchanged", async () => {
 			const jolliKey =
 				"sk-jol-eyJ0IjoidGVuYW50IiwidSI6Imh0dHBzOi8vdGVuYW50LmpvbGxpLmFpIn0.secret";

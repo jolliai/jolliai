@@ -145,7 +145,15 @@ async function worktreeRoots(cwd: string): Promise<string[]> {
 	return [...roots];
 }
 
-function hasLlmCredentials(config: { apiKey?: string; jolliApiKey?: string }): boolean {
+function hasLlmCredentials(config: {
+	apiKey?: string;
+	jolliApiKey?: string;
+	aiProvider?: "anthropic" | "jolli" | "local-agent";
+}): boolean {
+	// local-agent drives the tool's own subscription login, not a
+	// jollimemory-held credential — presence of apiKey/jolliApiKey/ANTHROPIC_API_KEY
+	// is not the blocker for it (mirrors resolveLlmCredentialSource in LlmClient.ts).
+	if (config.aiProvider === "local-agent") return true;
 	return Boolean(config.apiKey || config.jolliApiKey || process.env.ANTHROPIC_API_KEY);
 }
 
@@ -173,7 +181,12 @@ async function generateAndStore(
 	hash: string,
 	attr: AttributedCommit | null,
 	cwd: string,
-	llmConfig: { apiKey?: string; model?: string; jolliApiKey?: string; aiProvider?: "anthropic" | "jolli" },
+	llmConfig: {
+		apiKey?: string;
+		model?: string;
+		jolliApiKey?: string;
+		aiProvider?: "anthropic" | "jolli" | "local-agent";
+	},
 	storage: StorageProvider,
 ): Promise<number> {
 	const commitInfo = await getCommitInfo(hash, cwd);

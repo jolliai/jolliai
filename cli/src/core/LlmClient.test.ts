@@ -1,3 +1,7 @@
+import type { rmSync as rmSyncType } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	callLlm,
@@ -12,16 +16,37 @@ import {
 	STREAM_IDLE_TIMEOUT_MS,
 	STREAM_MAX_WALL_CLOCK_MS,
 } from "./LlmClient.js";
+import { registerBackend } from "./localagent/BackendRegistry.js";
+import type { LocalAgentBackend } from "./localagent/Types.js";
 import { COMMIT_MSG_DIFF_BUDGET } from "./Summarizer.js";
 import { runWithTrace } from "./TraceContext.js";
 
-const { mockCreate, mockStream, mockLogInfo, mockLogWarn, mockLogError } = vi.hoisted(() => ({
+const { mockCreate, mockStream, mockLogInfo, mockLogWarn, mockLogError, mockRmSync, fsActual } = vi.hoisted(() => ({
 	mockCreate: vi.fn(),
 	mockStream: vi.fn(),
 	mockLogInfo: vi.fn(),
 	mockLogWarn: vi.fn(),
 	mockLogError: vi.fn(),
+	mockRmSync: vi.fn(),
+	// Populated with the real rmSync once the mock factory below runs, so a
+	// test that fakes an rmSync failure can still clean up the real temp dir
+	// it created (bypassing its own mockRmSync override).
+	fsActual: {} as { rmSync?: typeof rmSyncType },
 }));
+
+// Passthrough mock of node:fs's rmSync only — every other export (existsSync,
+// mkdtempSync, ...) stays the real implementation. Default behavior forwards
+// to the actual rmSync so the "removes the real temp dir" tests below still
+// touch the filesystem for real; one test overrides this with
+// mockImplementationOnce to exercise the catch-and-warn path around a
+// failing removal (e.g. EACCES) without needing to fabricate an unremovable
+// real directory.
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	fsActual.rmSync = actual.rmSync;
+	mockRmSync.mockImplementation((...args: Parameters<typeof rmSyncType>) => actual.rmSync(...args));
+	return { ...actual, rmSync: mockRmSync };
+});
 
 // Mock Anthropic SDK — must use `function` (not arrow) so `new Anthropic()` works in Vitest 4.x
 vi.mock("@anthropic-ai/sdk", () => ({
@@ -1279,6 +1304,21 @@ describe("LlmClient", () => {
 				}),
 			).toBe("anthropic-config");
 		});
+
+		describe("local-agent", () => {
+			it("returns local-agent when aiProvider is local-agent, regardless of keys", () => {
+				expect(resolveLlmCredentialSource({ aiProvider: "local-agent" })).toBe("local-agent");
+				// A stray Anthropic key must NOT redirect away from the explicit choice.
+				expect(resolveLlmCredentialSource({ aiProvider: "local-agent", apiKey: "sk-ant-x" })).toBe(
+					"local-agent",
+				);
+			});
+
+			it("does not pick local-agent by presence — only the explicit choice selects it", () => {
+				// No aiProvider set → legacy precedence, never local-agent.
+				expect(resolveLlmCredentialSource({ apiKey: "sk-ant-x" })).toBe("anthropic-config");
+			});
+		});
 	});
 
 	// Dispatch-site logging — every callLlm leaves a single info trace
@@ -1415,6 +1455,183 @@ describe("LlmClient", () => {
 			// two constants live in different modules; bumping the budget past the
 			// limit would silently re-route every commit-message onto streaming.
 			expect(COMMIT_MSG_DIFF_BUDGET).toBeLessThan(NONSTREAM_MAX_PROMPT_CHARS);
+		});
+	});
+});
+
+describe("callLlm — local-agent", () => {
+	it("routes to the claude-code backend and maps the outcome to LlmCallResult", async () => {
+		const stub: LocalAgentBackend = {
+			id: "claude-code",
+			discoverExecutable: async () => ({ file: "/x/claude", version: "2.1.210" }),
+			buildInvocation: () => ({ file: "/x/claude", args: [], stdin: "P", env: {}, cwd: "/tmp" }),
+			parseResult: () => ({
+				text: "SUMMARY",
+				inputTokens: 5,
+				outputTokens: 9,
+				cachedTokens: 4738,
+				costUsd: 0.01,
+				stopReason: "end_turn",
+			}),
+		};
+		registerBackend(stub); // replaces the real claude-code backend for this test
+
+		const result = await callLlm({
+			action: "recap",
+			params: { branch: "main", summaries: "x" },
+			aiProvider: "local-agent",
+			localAgentTool: "claude-code",
+			// test seam: skip the real spawn, feed canned stdout the stub ignores
+			__localAgentRun: async () => "ignored-by-stub",
+		});
+
+		expect(result.source).toBe("local-agent");
+		expect(result.text).toBe("SUMMARY");
+		expect(result.inputTokens).toBe(5);
+		expect(result.outputTokens).toBe(9);
+		expect(result.cachedTokens).toBe(4738);
+	});
+
+	it("throws when the action has no known template", async () => {
+		await expect(
+			callLlm({
+				action: "unknown-action",
+				params: {},
+				aiProvider: "local-agent",
+				localAgentTool: "claude-code",
+				__localAgentRun: async () => "ignored",
+			}),
+		).rejects.toThrow('Unknown LLM action: "unknown-action"');
+	});
+
+	describe("temp cwd cleanup", () => {
+		it("removes the real mkdtemp'd cwd after a successful run", async () => {
+			const realCwd = mkdtempSync(join(tmpdir(), "jolli-localagent-"));
+			expect(existsSync(realCwd)).toBe(true);
+
+			const stub: LocalAgentBackend = {
+				id: "claude-code",
+				discoverExecutable: async () => ({ file: "/x/claude", version: "2.1.210" }),
+				buildInvocation: () => ({ file: "/x/claude", args: [], stdin: "P", env: {}, cwd: realCwd }),
+				parseResult: () => ({
+					text: "SUMMARY",
+					inputTokens: 1,
+					outputTokens: 1,
+					cachedTokens: 0,
+					costUsd: 0,
+					stopReason: "end_turn",
+				}),
+			};
+			registerBackend(stub);
+
+			await callLlm({
+				action: "recap",
+				params: { branch: "main", summaries: "x" },
+				aiProvider: "local-agent",
+				localAgentTool: "claude-code",
+				__localAgentRun: async () => "ignored-by-stub",
+			});
+
+			expect(existsSync(realCwd)).toBe(false);
+		});
+
+		it("does not remove a stub cwd lacking the jolli-localagent- prefix", async () => {
+			// This mirrors the "routes to the claude-code backend" test above, which
+			// uses a bare "/tmp" cwd — the guard must never touch a directory it did
+			// not create, even one that happens to live under the OS temp root.
+			const stub: LocalAgentBackend = {
+				id: "claude-code",
+				discoverExecutable: async () => ({ file: "/x/claude", version: "2.1.210" }),
+				buildInvocation: () => ({ file: "/x/claude", args: [], stdin: "P", env: {}, cwd: "/tmp" }),
+				parseResult: () => ({
+					text: "SUMMARY",
+					inputTokens: 1,
+					outputTokens: 1,
+					cachedTokens: 0,
+					costUsd: 0,
+					stopReason: "end_turn",
+				}),
+			};
+			registerBackend(stub);
+
+			await callLlm({
+				action: "recap",
+				params: { branch: "main", summaries: "x" },
+				aiProvider: "local-agent",
+				localAgentTool: "claude-code",
+				__localAgentRun: async () => "ignored-by-stub",
+			});
+
+			// "/tmp" itself must still exist — the guard must not have rmSync'd it.
+			expect(existsSync("/tmp")).toBe(true);
+		});
+
+		it("removes the temp cwd even when the run throws", async () => {
+			const realCwd = mkdtempSync(join(tmpdir(), "jolli-localagent-"));
+
+			const stub: LocalAgentBackend = {
+				id: "claude-code",
+				discoverExecutable: async () => ({ file: "/x/claude", version: "2.1.210" }),
+				buildInvocation: () => ({ file: "/x/claude", args: [], stdin: "P", env: {}, cwd: realCwd }),
+				parseResult: () => {
+					throw new Error("should not be reached");
+				},
+			};
+			registerBackend(stub);
+
+			await expect(
+				callLlm({
+					action: "recap",
+					params: { branch: "main", summaries: "x" },
+					aiProvider: "local-agent",
+					localAgentTool: "claude-code",
+					__localAgentRun: async () => {
+						throw new Error("run failed");
+					},
+				}),
+			).rejects.toThrow("run failed");
+
+			expect(existsSync(realCwd)).toBe(false);
+		});
+
+		it("logs a warning but does not throw when removing the temp cwd fails", async () => {
+			const realCwd = mkdtempSync(join(tmpdir(), "jolli-localagent-"));
+			mockRmSync.mockImplementationOnce(() => {
+				throw new Error("EACCES: permission denied");
+			});
+
+			const stub: LocalAgentBackend = {
+				id: "claude-code",
+				discoverExecutable: async () => ({ file: "/x/claude", version: "2.1.210" }),
+				buildInvocation: () => ({ file: "/x/claude", args: [], stdin: "P", env: {}, cwd: realCwd }),
+				parseResult: () => ({
+					text: "SUMMARY",
+					inputTokens: 1,
+					outputTokens: 1,
+					cachedTokens: 0,
+					costUsd: 0,
+					stopReason: "end_turn",
+				}),
+			};
+			registerBackend(stub);
+
+			const result = await callLlm({
+				action: "recap",
+				params: { branch: "main", summaries: "x" },
+				aiProvider: "local-agent",
+				localAgentTool: "claude-code",
+				__localAgentRun: async () => "ignored-by-stub",
+			});
+
+			expect(result.text).toBe("SUMMARY");
+			expect(mockLogWarn).toHaveBeenCalledWith(
+				"Failed to remove local-agent temp cwd %s: %s",
+				realCwd,
+				"EACCES: permission denied",
+			);
+
+			// Clean up for real — the mocked rmSync above swallowed the actual removal.
+			fsActual.rmSync?.(realCwd, { recursive: true, force: true });
 		});
 	});
 });

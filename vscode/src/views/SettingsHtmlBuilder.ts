@@ -67,6 +67,7 @@ export function buildSettingsHtml(nonce: string): string {
         <select id="aiProvider">
           <option value="anthropic">Anthropic</option>
           <option value="jolli">Jolli</option>
+          <option value="local-agent">Local Agent (subscription)</option>
         </select>
       </div>
       <p class="section-hint">Choose how AI summaries are generated for each commit.</p>
@@ -148,6 +149,15 @@ export function buildSettingsHtml(nonce: string): string {
       <div class="card-panel hidden" data-card="jolli-signin">
         <p class="section-hint">Sign in to use Jolli for AI summarization.</p>
         <button type="button" class="primary-btn" id="summarySignInBtn">Sign In to Jolli</button>
+      </div>
+
+      <!-- Shown only when provider is local-agent. Uses subscription OAuth of the chosen tool; no API key needed. -->
+      <div class="card-panel hidden" data-card="local-agent">
+        <label class="settings-label" for="localAgentTool">Agent tool</label>
+        <select id="localAgentTool">
+          <option value="claude-code">Claude Code</option>
+        </select>
+        <p class="section-hint">Uses your local Claude Code login (subscription). Sign in with the claude CLI if prompted.</p>
       </div>
     </section>
 

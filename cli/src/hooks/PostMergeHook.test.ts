@@ -100,6 +100,23 @@ describe("handlePostMerge", () => {
 		if (origKey) process.env.ANTHROPIC_API_KEY = origKey;
 	});
 
+	it("does not skip the compile enqueue when aiProvider is local-agent, even with no stored key", async () => {
+		mockExecGit.mockResolvedValue({
+			stdout: "Merge branch 'feature/oauth' into main",
+			stderr: "",
+			exitCode: 0,
+		});
+		mockLoadConfig.mockResolvedValue({ aiProvider: "local-agent" });
+		const origKey = process.env.ANTHROPIC_API_KEY;
+		delete process.env.ANTHROPIC_API_KEY;
+
+		await handlePostMerge("/test");
+
+		expect(mockEnqueueIngest).toHaveBeenCalledOnce();
+		expect(mockLaunchWorker).toHaveBeenCalledOnce();
+		if (origKey) process.env.ANTHROPIC_API_KEY = origKey;
+	});
+
 	it("enqueues ONE ingest op (not N compile ops) for N merged branches + launches the worker once", async () => {
 		mockExecGit.mockResolvedValue({
 			stdout: "Merge branch 'feature/oauth' into main",

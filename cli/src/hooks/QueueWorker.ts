@@ -42,6 +42,7 @@ import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
+import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import {
 	acquireIngestLock,
 	acquireWorkerLock,
@@ -870,7 +871,7 @@ async function runIngestFromQueue(
 	const { renderTopicKBWiki } = await import("../core/TopicWikiRenderer.js");
 	const { appendCredentialMissingRun } = await import("../core/IngestRunStore.js");
 	const config = await loadConfig();
-	if (!config.apiKey && !config.jolliApiKey && !process.env.ANTHROPIC_API_KEY) {
+	if (resolveLlmCredentialSource(config) === null) {
 		log.info("No API key configured — skipping ingest (%s)", op.triggeredBy);
 		await appendCredentialMissingRun(cwd, op.triggeredBy);
 		return;

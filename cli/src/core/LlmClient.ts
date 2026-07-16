@@ -7,14 +7,24 @@
  * 3. Neither -> throw error
  */
 
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { createLogger } from "../Logger.js";
 import type { LlmCredentialSource } from "../Types.js";
 import { JOLLI_CLIENT_HEADER } from "./ClientHeader.js";
 import { parseBaseUrl, parseJolliApiKey } from "./JolliApiUtils.js";
+import { getBackend, registerBackend } from "./localagent/BackendRegistry.js";
+import { ClaudeCodeBackend, LOCAL_AGENT_TMP_PREFIX } from "./localagent/ClaudeCodeBackend.js";
+import { runInvocation as defaultRunInvocation } from "./localagent/LocalAgentRunner.js";
 import { fillTemplate, findUnfilledPlaceholders, TEMPLATES } from "./PromptTemplates.js";
 import { resolveModelId } from "./Summarizer.js";
 import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "./TraceContext.js";
+
+// Register the v1 backend once at module load. The registry is the extension
+// point for future tools (Codex, Cursor) — add a `registerBackend(...)` here.
+registerBackend(new ClaudeCodeBackend());
 
 // Re-export so existing imports of LlmCredentialSource from this module keep
 // working — the source-of-truth definition lives in Types.ts because
@@ -183,7 +193,11 @@ interface LlmCredentials {
 	 * Optional — legacy configs without this field fall through to the
 	 * credential-presence precedence below.
 	 */
-	readonly aiProvider?: "anthropic" | "jolli";
+	readonly aiProvider?: "anthropic" | "jolli" | "local-agent";
+	/** Which local agent tool to drive when aiProvider === "local-agent" (v1: "claude-code"). */
+	readonly localAgentTool?: "claude-code";
+	/** Optional explicit path to the local agent binary, overriding PATH discovery. */
+	readonly localAgentPath?: string;
 }
 
 /**
@@ -198,14 +212,23 @@ interface LlmCredentials {
  *      only the matching credential is considered. If that credential is
  *      missing, returns `null` rather than silently falling back to the other
  *      provider — silent cross-provider fallback was the root cause of the
- *      "Settings says Jolli, doctor reports Anthropic" mismatch.
+ *      "Settings says Jolli, doctor reports Anthropic" mismatch. `"local-agent"`
+ *      is always honored the moment it's chosen: it drives the local agent
+ *      tool's own login rather than a jollimemory-held credential, so there is
+ *      no presence check to fail.
  *   2. **Legacy precedence** (apiKey > ANTHROPIC_API_KEY env > jolliApiKey),
  *      used when `aiProvider` is undefined so existing configs continue to
- *      work unchanged.
+ *      work unchanged. `"local-agent"` is never selected by this fallback —
+ *      only the explicit choice above can pick it.
  */
 export function resolveLlmCredentialSource(
 	credentials: Pick<LlmCredentials, "apiKey" | "jolliApiKey" | "aiProvider">,
 ): LlmCredentialSource | null {
+	if (credentials.aiProvider === "local-agent") {
+		// The local agent uses the tool's own login (subscription OAuth); no
+		// jollimemory-held credential is required, so presence checks don't apply.
+		return "local-agent";
+	}
 	if (credentials.aiProvider === "jolli") {
 		return credentials.jolliApiKey ? "jolli-proxy" : null;
 	}
@@ -249,6 +272,12 @@ export interface LlmCallOptions extends LlmCredentials {
 	 * unaffected — a short hard cap simply fires before it.
 	 */
 	readonly timeoutMs?: number;
+	/**
+	 * Test-only override for the local-agent child-process runner. Double
+	 * underscore marks it as a test seam, not a user-facing option; never set
+	 * from config. Ignored outside the `local-agent` path.
+	 */
+	readonly __localAgentRun?: typeof defaultRunInvocation;
 }
 
 /** Result from an LLM call */
@@ -310,6 +339,8 @@ export async function callLlm(options: LlmCallOptions): Promise<LlmCallResult> {
 			}
 			return callProxy(options, baseUrl, source);
 		}
+		case "local-agent":
+			return callLocalAgent(options, source);
 		default:
 			throw new LlmCredentialError();
 	}
@@ -360,6 +391,69 @@ function isPrematureClose(err: unknown): boolean {
 	if (e?.code === "ERR_STREAM_PREMATURE_CLOSE" || e?.cause?.code === "ERR_STREAM_PREMATURE_CLOSE") return true;
 	const text = `${String(e?.message ?? "")} ${String(e?.cause?.message ?? "")}`.toLowerCase();
 	return text.includes("premature close");
+}
+
+/**
+ * Local-agent mode: drive a locally-installed agent CLI (v1: Claude Code)
+ * headless, using the tool's own subscription login. Mirrors callDirect's
+ * template-fill + model-resolution preamble, then delegates spawning to the
+ * selected backend. On failure it throws (LocalAgent*Error) — NEVER falls back
+ * to another provider, so the user is never silently billed on their API key.
+ */
+async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSource): Promise<LlmCallResult> {
+	const entry = TEMPLATES.get(options.action);
+	if (!entry) {
+		throw new Error(`Unknown LLM action: "${options.action}". Available: ${[...TEMPLATES.keys()].join(", ")}`);
+	}
+	const missing = findUnfilledPlaceholders(entry.template, options.params);
+	if (missing.length > 0) {
+		log.warn("Local-agent call has unfilled placeholders for action=%s: %s", options.action, missing.join(", "));
+	}
+	const prompt = fillTemplate(entry.template, options.params);
+	const model = resolveModelId(options.model);
+	// NOTE: options.maxTokens is intentionally NOT threaded here — the Claude
+	// Code CLI has no per-call output-token cap flag, so the API path's
+	// max_tokens budget (and the resulting `stopReason === "max_tokens"`
+	// truncation signal) simply does not apply under the local-agent provider.
+
+	const backend = getBackend(options.localAgentTool ?? "claude-code");
+	const exe = await backend.discoverExecutable(options.localAgentPath);
+	const invocation = backend.buildInvocation(exe, {
+		prompt,
+		model,
+		systemPrompt: "You output only what the prompt asks for, with no preamble or commentary.",
+	});
+
+	const run = options.__localAgentRun ?? defaultRunInvocation;
+	const startTime = Date.now();
+	try {
+		const stdout = await run(invocation, { timeoutMs: options.timeoutMs });
+		const outcome = backend.parseResult(stdout);
+
+		return {
+			text: outcome.text,
+			model,
+			inputTokens: outcome.inputTokens,
+			outputTokens: outcome.outputTokens,
+			cachedTokens: outcome.cachedTokens,
+			apiLatencyMs: Date.now() - startTime,
+			stopReason: outcome.stopReason,
+			source,
+		};
+	} finally {
+		// Only remove a cwd WE created (buildInvocation's mkdtemp under tmpdir with
+		// our prefix); callLocalAgent is backend-generic and tests inject stubs
+		// with arbitrary cwds (e.g. a bare "/tmp"), so a blind rmSync here could
+		// delete an unrelated directory. LOCAL_AGENT_TMP_PREFIX is the single
+		// source of truth shared with ClaudeCodeBackend.buildInvocation.
+		if (invocation.cwd.startsWith(tmpdir()) && basename(invocation.cwd).startsWith(LOCAL_AGENT_TMP_PREFIX)) {
+			try {
+				rmSync(invocation.cwd, { recursive: true, force: true });
+			} catch (err) {
+				log.warn("Failed to remove local-agent temp cwd %s: %s", invocation.cwd, (err as Error).message);
+			}
+		}
+	}
 }
 
 async function callDirect(
