@@ -39,6 +39,10 @@ export type OwnedPathKind =
 	| "plan" // <repoFolder>/.jolli/plans/<slug>.md
 	| "plan-progress" // <repoFolder>/.jolli/plan-progress/<slug>.json
 	| "note" // <repoFolder>/.jolli/notes/<id>.md
+	// <repoFolder>/.jolli/graph/graph.json — the knowledge-graph data the Space
+	// viz renders. Regenerable (rebuilt by `jolli compile`), so a torn/stale
+	// copy self-heals; synced so the Space renders the graph without a rebuild.
+	| "graph"
 	// Per-repo visible markdown (under <repoFolder>/<branch>/...):
 	| "visible-summary" // <repoFolder>/<branch>/<slug>-<hex8>.md
 	| "visible-plan" // <repoFolder>/<branch>/plan--<slug>.md

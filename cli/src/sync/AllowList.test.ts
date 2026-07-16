@@ -246,6 +246,27 @@ describe("isAllowedPath — .jolli/plans / plan-progress / notes", () => {
 	});
 });
 
+describe("isAllowedPath — .jolli/graph/", () => {
+	const opts = { syncTranscripts: false };
+
+	it("accepts the exact graph/graph.json leaf", () => {
+		expect(isAllowedPath(".jolli/graph/graph.json", opts)).toBe(true);
+		// Graph is not the transcripts toggle's concern.
+		expect(isAllowedPath(".jolli/graph/graph.json", { syncTranscripts: true })).toBe(true);
+	});
+
+	it("rejects any other name / extension under graph/", () => {
+		expect(isAllowedPath(".jolli/graph/foo.json", opts)).toBe(false);
+		expect(isAllowedPath(".jolli/graph/graph.txt", opts)).toBe(false);
+		expect(isAllowedPath(".jolli/graph/graph.md", opts)).toBe(false);
+	});
+
+	it("rejects the bare graph directory and deeper nesting", () => {
+		expect(isAllowedPath(".jolli/graph", opts)).toBe(false);
+		expect(isAllowedPath(".jolli/graph/sub/graph.json", opts)).toBe(false);
+	});
+});
+
 describe("isAllowedPath — windows-style separators", () => {
 	const opts = { syncTranscripts: true };
 

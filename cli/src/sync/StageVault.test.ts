@@ -96,6 +96,24 @@ describe("stageVault — basic flow", () => {
 		expect(stageRm).not.toHaveBeenCalled();
 	});
 
+	it("stages the knowledge-graph data file (.jolli/graph/graph.json)", async () => {
+		mkdirSync(join(vault, "myrepo", ".jolli", "graph"), { recursive: true });
+		writeFileSync(join(vault, "myrepo", ".jolli", "graph", "graph.json"), "{}");
+		// A stray non-graph.json leaf under graph/ stays unowned.
+		writeFileSync(join(vault, "myrepo", ".jolli", "graph", "stray.json"), "{}");
+
+		const { client, stageAdd } = makeClient([
+			entry({ path: "myrepo/.jolli/graph/graph.json" }),
+			entry({ path: "myrepo/.jolli/graph/stray.json" }),
+		]);
+
+		const report = await stageVault(client as GitClient, vault, { syncTranscripts: true });
+		expect(report.added).toBe(1);
+		expect(report.unowned).toEqual(["myrepo/.jolli/graph/stray.json"]);
+		expect(report.byKind.get("graph")).toBe(1);
+		expect(stageAdd.mock.calls[0]?.[0]).toEqual(["myrepo/.jolli/graph/graph.json"]);
+	});
+
 	it("does NOT print the unowned canary to the console (info-level, file-only)", async () => {
 		// Regression guard: `unowned` routinely holds intentionally-unstaged
 		// engine content (e.g. `.jolli-bootstrap-stash/…` survivors), so the

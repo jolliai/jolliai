@@ -13,6 +13,8 @@
  *     `jolli-1316-aggregate-merge-design.md §1`)
  *   - `.jolli/summaries/<commitHash>.json` allowed (content-addressed per-commit
  *     summaries; hash must be 7-64 lowercase hex)
+ *   - `.jolli/graph/graph.json` allowed — the regenerable knowledge-graph data
+ *     the Space viz renders (only the exact `graph.json` leaf)
  *   - `.jolli/config.json` allowed — carries cross-device identity
  *     (`remoteUrl`, `repoName`). Originally treated as per-device prefs and
  *     excluded, which caused phantom `<repo>-N` folders on the receiving
@@ -145,6 +147,12 @@ export function isAllowedPath(relPath: string, opts: AllowListOpts): boolean {
 		}
 		if (segments.length === 3 && segments[1] === "notes") {
 			return PLAN_OR_NOTE_REGEX.test(segments[2] as string);
+		}
+		// `.jolli/graph/graph.json` — the single regenerable knowledge-graph
+		// data file. Synced so the Space renders the graph without a rebuild.
+		// Only the exact `graph.json` leaf is allowed.
+		if (segments.length === 3 && segments[1] === "graph") {
+			return segments[2] === "graph.json";
 		}
 		return false;
 	}

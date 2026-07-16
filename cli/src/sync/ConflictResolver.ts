@@ -80,6 +80,13 @@ export interface ConflictResolutionReport {
 	readonly binaryPicked: ReadonlyArray<{ readonly path: string; readonly pick: "mine" | "theirs" }>;
 	/** Tier 1.5 — paths auto-merged by `AggregateMerge` without AI / user. */
 	readonly aggregateMerged: ReadonlyArray<string>;
+	/**
+	 * Tier 1.6 — regenerable artifacts (`.jolli/graph/graph.json`) resolved
+	 * deterministically by keeping the side with the newer embedded
+	 * `generatedAt`. No AI / user prompt; the loser regenerates on the next
+	 * ingest anyway.
+	 */
+	readonly regenerablePicked: ReadonlyArray<{ readonly path: string; readonly pick: "mine" | "theirs" }>;
 	/** True when `git rebase --continue` succeeded; false when aborted. */
 	readonly rebaseAdvanced: boolean;
 }
@@ -168,6 +175,7 @@ export class ConflictResolver {
 		const aiMerged: { path: string; model: string }[] = [];
 		const binaryPicked: { path: string; pick: "mine" | "theirs" }[] = [];
 		const aggregateMerged: string[] = [];
+		const regenerablePicked: { path: string; pick: "mine" | "theirs" }[] = [];
 
 		for (const path of paths) {
 			const ours = await this.client.readIndexStage(path, 2);
@@ -198,6 +206,29 @@ export class ConflictResolver {
 				// recover manually instead of losing the file. This is rare
 				// (means on-disk JSON is corrupt) and the loud UI prompt is
 				// the right signal.
+			}
+
+			// Tier 1.6 — regenerable artifact (`.jolli/graph/graph.json`). The
+			// knowledge graph is rewritten on every ingest (new `generatedAt`,
+			// reordered content), so two devices reliably diverge it into a
+			// conflict. It is NOT structurally mergeable, but it IS regenerable:
+			// keeping the side with the newer embedded `generatedAt` is a
+			// deterministic, lossless choice (the loser rebuilds on its next
+			// ingest). This must run BEFORE Tier 2 (AI) and Tier 3 (prompt) so a
+			// generated file never burns an LLM call or asks the user to pick a
+			// side on a machine-authored artifact.
+			if (isRegenerableGraphPath(path)) {
+				const pick = pickNewerByGeneratedAt(ours, theirs);
+				if (pick !== null) {
+					if (pick === "mine") await this.client.checkoutOurs(path);
+					else await this.client.checkoutTheirs(path);
+					resolved.push(path);
+					regenerablePicked.push({ path, pick });
+					log.info("Tier 1.6 resolved regenerable %s via newest generatedAt (%s)", path, pick);
+					continue;
+				}
+				// Both sides missing/unparseable — degenerate/corrupt; fall
+				// through to Tier 2/3 rather than guess.
 			}
 
 			// Tier 2.7 — safe deterministic heuristics. All rules are lossless
@@ -261,11 +292,19 @@ export class ConflictResolver {
 
 		if (skipped.length > 0) {
 			await this.client.rebaseAbort();
-			return { resolved, skipped, aiMerged, binaryPicked, aggregateMerged, rebaseAdvanced: false };
+			return {
+				resolved,
+				skipped,
+				aiMerged,
+				binaryPicked,
+				aggregateMerged,
+				regenerablePicked,
+				rebaseAdvanced: false,
+			};
 		}
 
 		await this.client.rebaseContinue(this.author);
-		return { resolved, skipped, aiMerged, binaryPicked, aggregateMerged, rebaseAdvanced: true };
+		return { resolved, skipped, aiMerged, binaryPicked, aggregateMerged, regenerablePicked, rebaseAdvanced: true };
 	}
 
 	private async tryAiMerge(
@@ -550,6 +589,66 @@ export function isAggregatePath(path: string): boolean {
 	const parent = segments[segments.length - 2] ?? "";
 	/* v8 ignore stop */
 	return parent === ".jolli" && AGGREGATE_BASENAMES.has(basename);
+}
+
+/**
+ * True if `path` (vault-relative, forward-slash) is the regenerable
+ * knowledge-graph data file — `<repoFolder>/.jolli/graph/graph.json` (or the
+ * bare `.jolli/graph/graph.json` at the root, for symmetry with
+ * `isAggregatePath`). GraphArtifactStore writes exactly this one file; it is
+ * device-regenerated and non-deterministic, so it is resolved by Tier 1.6
+ * (newest-`generatedAt` wins) rather than the structural aggregate merge.
+ *
+ * Exported for testing.
+ */
+export function isRegenerableGraphPath(path: string): boolean {
+	const segments = path.split("/");
+	if (segments.length < 3) return false;
+	const basename = segments[segments.length - 1];
+	const parent = segments[segments.length - 2];
+	const grandparent = segments[segments.length - 3];
+	return grandparent === ".jolli" && parent === "graph" && basename === "graph.json";
+}
+
+/**
+ * Picks the side of a regenerable graph conflict to keep, by comparing the
+ * embedded `generatedAt` ISO timestamp — "keep the newest, overwrite the
+ * older". Returns:
+ *
+ *   - `"mine"` / `"theirs"` — the side with the newer `generatedAt` (ties go
+ *     to `"mine"`, deterministically). When one side is missing (add/delete
+ *     conflict) or unparseable, the other side wins so a delete/corruption
+ *     never clobbers a good graph.
+ *   - `null` — both sides are missing/unparseable (degenerate); caller falls
+ *     through to Tier 2/3.
+ *
+ * Unlike the removed committer-timestamp `"newest"` policy, this reads the
+ * timestamp from the file *content*, so the engine's implicit reconcile
+ * commit can't skew it.
+ *
+ * Exported for testing.
+ */
+export function pickNewerByGeneratedAt(ours: string | null, theirs: string | null): "mine" | "theirs" | null {
+	const oursTs = parseGeneratedAt(ours);
+	const theirsTs = parseGeneratedAt(theirs);
+	if (oursTs === null && theirsTs === null) return null;
+	if (theirsTs === null) return "mine";
+	if (oursTs === null) return "theirs";
+	return oursTs >= theirsTs ? "mine" : "theirs";
+}
+
+/**
+ * Parses a graph blob and returns its `generatedAt` as epoch-ms, or `null`
+ * when the blob is missing, unparseable, or has no valid ISO `generatedAt`.
+ */
+function parseGeneratedAt(blob: string | null): number | null {
+	if (blob === null) return null;
+	const doc = parseJson(blob);
+	if (doc === null || typeof doc !== "object") return null;
+	const generatedAt = (doc as { generatedAt?: unknown }).generatedAt;
+	if (typeof generatedAt !== "string") return null;
+	const ts = Date.parse(generatedAt);
+	return Number.isNaN(ts) ? null : ts;
 }
 
 /**

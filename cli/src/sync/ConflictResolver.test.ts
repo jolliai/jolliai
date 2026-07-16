@@ -18,6 +18,8 @@ import {
 	emptyAggregateEnvelope,
 	isAggregatePath,
 	isMemoryBankAppendOnlyPath,
+	isRegenerableGraphPath,
+	pickNewerByGeneratedAt,
 	type Tier3Pick,
 	tryAggregateMerge,
 	unionMarkdown,
@@ -400,6 +402,90 @@ describe("ConflictResolver — skip aborts the rebase", () => {
 		expect(report.rebaseAdvanced).toBe(false);
 		expect(stub.continued).toBe(0);
 		expect(stub.aborted).toBe(1);
+	});
+});
+
+describe("ConflictResolver — Tier 1.6 regenerable graph (newest generatedAt wins)", () => {
+	const graphPath = "myrepo/.jolli/graph/graph.json";
+	const graph = (generatedAt: string) => JSON.stringify({ schemaVersion: 2, generatedAt, topics: [] });
+
+	it("keeps ours when ours has the newer generatedAt (no AI, no prompt)", async () => {
+		const stub = makeStubVault(
+			new Map([[graphPath, { 2: graph("2026-07-16T10:00:00.000Z"), 3: graph("2026-07-16T09:00:00.000Z") }]]),
+		);
+		// ai + ui MUST NOT be consulted — pass throwing stubs to prove it.
+		const ai = {
+			merge: async () => {
+				throw new Error("Tier 2 must not run");
+			},
+		} as unknown as AiMergeProvider;
+		const ui: ConflictUi = {
+			promptBinaryPick: async () => {
+				throw new Error("Tier 3 must not run");
+			},
+		};
+		const resolver = new ConflictResolver({ client: stub.client, ai, ui });
+		const report = await resolver.resolveAll([graphPath]);
+		expect(report.regenerablePicked).toEqual([{ path: graphPath, pick: "mine" }]);
+		expect(report.resolved).toEqual([graphPath]);
+		expect(report.aiMerged).toEqual([]);
+		expect(report.binaryPicked).toEqual([]);
+		expect(stub.checkoutsOurs).toEqual([graphPath]);
+		expect(stub.checkoutsTheirs).toEqual([]);
+		expect(report.rebaseAdvanced).toBe(true);
+	});
+
+	it("keeps theirs when theirs has the newer generatedAt", async () => {
+		const stub = makeStubVault(
+			new Map([[graphPath, { 2: graph("2026-07-16T08:00:00.000Z"), 3: graph("2026-07-16T09:30:00.000Z") }]]),
+		);
+		const resolver = new ConflictResolver({ client: stub.client, ai: null, ui: makeStubUi([]).ui });
+		const report = await resolver.resolveAll([graphPath]);
+		expect(report.regenerablePicked).toEqual([{ path: graphPath, pick: "theirs" }]);
+		expect(stub.checkoutsTheirs).toEqual([graphPath]);
+		expect(stub.checkoutsOurs).toEqual([]);
+	});
+
+	it("falls through to Tier 3 when neither side has a usable generatedAt", async () => {
+		const stub = makeStubVault(new Map([[graphPath, { 2: "not json", 3: "{}" }]]));
+		const ui = makeStubUi(["mine"]);
+		const resolver = new ConflictResolver({ client: stub.client, ai: null, ui: ui.ui });
+		const report = await resolver.resolveAll([graphPath]);
+		// No deterministic pick; the path drops to the Tier 3 prompt.
+		expect(report.regenerablePicked).toEqual([]);
+		expect(report.binaryPicked).toEqual([{ path: graphPath, pick: "mine" }]);
+	});
+});
+
+describe("isRegenerableGraphPath", () => {
+	it("matches only <repo>/.jolli/graph/graph.json (and the root form)", () => {
+		expect(isRegenerableGraphPath("myrepo/.jolli/graph/graph.json")).toBe(true);
+		expect(isRegenerableGraphPath(".jolli/graph/graph.json")).toBe(true);
+	});
+	it("rejects other names, dirs, and depths", () => {
+		expect(isRegenerableGraphPath("myrepo/.jolli/graph/other.json")).toBe(false);
+		expect(isRegenerableGraphPath("myrepo/.jolli/graph.json")).toBe(false);
+		expect(isRegenerableGraphPath("myrepo/.jolli/summaries/graph.json")).toBe(false);
+		expect(isRegenerableGraphPath("myrepo/.jolli/graph/sub/graph.json")).toBe(false);
+	});
+});
+
+describe("pickNewerByGeneratedAt", () => {
+	const g = (t: string) => JSON.stringify({ generatedAt: t });
+	it("picks the newer side; ties go to mine", () => {
+		expect(pickNewerByGeneratedAt(g("2026-07-16T10:00:00Z"), g("2026-07-16T09:00:00Z"))).toBe("mine");
+		expect(pickNewerByGeneratedAt(g("2026-07-16T09:00:00Z"), g("2026-07-16T10:00:00Z"))).toBe("theirs");
+		expect(pickNewerByGeneratedAt(g("2026-07-16T10:00:00Z"), g("2026-07-16T10:00:00Z"))).toBe("mine");
+	});
+	it("keeps the present/parseable side when the other is missing or invalid", () => {
+		expect(pickNewerByGeneratedAt(g("2026-07-16T10:00:00Z"), null)).toBe("mine");
+		expect(pickNewerByGeneratedAt(null, g("2026-07-16T10:00:00Z"))).toBe("theirs");
+		expect(pickNewerByGeneratedAt("garbage", g("2026-07-16T10:00:00Z"))).toBe("theirs");
+		expect(pickNewerByGeneratedAt(g("not-a-date"), g("2026-07-16T10:00:00Z"))).toBe("theirs");
+	});
+	it("returns null when both sides are unusable", () => {
+		expect(pickNewerByGeneratedAt(null, null)).toBe(null);
+		expect(pickNewerByGeneratedAt("garbage", "{}")).toBe(null);
 	});
 });
 
