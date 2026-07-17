@@ -3,11 +3,14 @@
  *
  * The `jolli mcp` server registers backend-defined platform tools only when
  * this gate is open; otherwise it stays git-memory-only and never contacts the
- * backend for a tool manifest. The feature is opt-in (off by default): the
- * config flag `mcpPlatformToolsEnabled` must be explicitly `true`, OR the
- * escape-hatch env var `JOLLI_MCP_PLATFORM_TOOLS` must be exactly `"1"` (for
+ * backend for a tool manifest. The feature is **on by default** (matching the
+ * other `*Enabled` config keys): an unset config flag counts as enabled, so the
+ * gate is open unless the config flag `mcpPlatformToolsEnabled` is explicitly
+ * `false`, OR — regardless of the config value — the escape-hatch env var
+ * `JOLLI_MCP_PLATFORM_TOOLS` is exactly `"1"` (which still force-enables for
  * CI / debugging without touching config.json — same strict `=== "1"` shape as
- * the other CLI env gates).
+ * the other CLI env gates). The manifest fetch is best-effort, so defaulting on
+ * degrades silently to "no platform tools" when no key is configured.
  */
 
 import type { JolliMemoryConfig } from "../Types.js";
@@ -17,13 +20,14 @@ export const PLATFORM_TOOLS_ENV_FLAG = "JOLLI_MCP_PLATFORM_TOOLS";
 
 /**
  * Returns true when the manifest-driven Jolli-platform tools should be
- * registered. Opt-in: the config flag must be `true`, or the env flag must be
- * the literal `"1"`. `env` is injectable so the decision is unit-testable
- * without mutating `process.env`.
+ * registered. On by default: enabled unless the config flag is explicitly
+ * `false`, or force-enabled when the env flag is the literal `"1"` (the env
+ * flag wins even over an explicit `false`). `env` is injectable so the decision
+ * is unit-testable without mutating `process.env`.
  */
 export function isPlatformToolsEnabled(
 	config: Pick<JolliMemoryConfig, "mcpPlatformToolsEnabled">,
 	env: Record<string, string | undefined> = process.env,
 ): boolean {
-	return config.mcpPlatformToolsEnabled === true || env[PLATFORM_TOOLS_ENV_FLAG] === "1";
+	return config.mcpPlatformToolsEnabled !== false || env[PLATFORM_TOOLS_ENV_FLAG] === "1";
 }

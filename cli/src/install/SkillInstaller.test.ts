@@ -230,6 +230,43 @@ describe("jolli menu template frontmatter", () => {
 		expect(jolli).toMatch(/mcp__jollimemory__/);
 		expect(jolli).toMatch(/AskUserQuestion/);
 	});
+
+	it("run-a-workflow action asks local vs remote, defaulting to local", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const jolli = readJolli();
+		expect(jolli).toMatch(/Run a workflow/);
+		expect(jolli).toMatch(/local vs remote/i);
+		// Default is local.
+		expect(jolli).toMatch(/default.*local|local.*default/i);
+		// Local routes to the jolli-local-run skill; remote to the renamed MCP tool.
+		expect(jolli).toContain("jolli-local-run");
+		expect(jolli).toContain("run_remote_workflow");
+	});
+
+	it("mentions canceling an in-flight remote run via cancel_remote_workflow", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const jolli = readJolli();
+		expect(jolli).toContain("cancel_remote_workflow");
+		expect(jolli).toMatch(/cancel/i);
+	});
+
+	it("hides list_workflow_definitions and does not list the remote workflow tools raw", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const jolli = readJolli();
+		// list_workflow_definitions is plumbing — never a standalone menu item.
+		expect(jolli).toContain("list_workflow_definitions");
+		expect(jolli).toMatch(/Exclusions/);
+		// The exclusion instruction must name it as excluded, not surface it.
+		expect(jolli).toMatch(/do NOT surface/i);
+	});
+
+	it("uses the renamed remote_* backend tool names, not the old pre-rename names", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const jolli = readJolli();
+		// No lingering old names in the menu template body.
+		expect(jolli).not.toMatch(/\brun_workflow\b/);
+		expect(jolli).not.toMatch(/`run_workflow`/);
+	});
 });
 
 describe("jolli-local-run template", () => {
@@ -283,6 +320,16 @@ describe("jolli-local-run template", () => {
 		expect(t).toContain("docs publish --json");
 		expect(t).toContain("prNumber");
 		expect(t).toContain("prUrl");
+	});
+
+	it("completes a private Jolli-managed destination WITHOUT a PR reference", () => {
+		const t = buildLocalRunSkillTemplate();
+		// The publish JSON withholds prNumber/prUrl for private destinations
+		// (`private: true`); the run must still complete, just without a PR ref.
+		expect(t).toContain('"private": true');
+		expect(t).toContain("WITHOUT a PR reference");
+		// And it reads the completion result's `willAutoMerge` (not the offer's `autoMerges`).
+		expect(t).toContain("willAutoMerge");
 	});
 
 	it("surfaces the combined space-cli install hint when the plugin is missing", () => {

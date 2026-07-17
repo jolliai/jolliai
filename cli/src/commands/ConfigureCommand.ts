@@ -207,7 +207,7 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 	{
 		key: "mcpPlatformToolsEnabled",
 		type: "boolean",
-		description: "Register backend-defined Jolli-platform tools in the MCP server (true/false; off by default)",
+		description: "Register backend-defined Jolli-platform tools in the MCP server (true/false; on by default)",
 	},
 	{ key: "logLevel", type: "enum", description: "Log level: debug | info | warn | error" },
 	{ key: "excludePatterns", type: "string[]", description: "Glob patterns for file exclusion (comma-separated)" },

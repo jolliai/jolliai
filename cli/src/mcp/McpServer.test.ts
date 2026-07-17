@@ -187,7 +187,10 @@ describe("startMcpServer", () => {
 		capturedSchemas.length = 0;
 		serverCapabilities = undefined;
 		connectMock.mockClear();
-		loadConfigMock.mockReset().mockResolvedValue({});
+		// Platform tools are on by default, so pin these built-in-only tests to the
+		// dormant (git-memory-only) path with an explicit opt-out; otherwise the
+		// default-on gate would open and hit the unstubbed manifest fetch.
+		loadConfigMock.mockReset().mockResolvedValue({ mcpPlatformToolsEnabled: false });
 		fetchManifestMock.mockReset();
 		invokePlatformToolMock.mockReset();
 		vi.mocked(track).mockClear();
@@ -361,9 +364,12 @@ describe("startMcpServer — platform tools", () => {
 		vi.mocked(runSearch).mockClear();
 	});
 
-	it("dormant by default: advertises exactly 9 tools and never constructs a client", async () => {
+	it("explicit opt-out: advertises exactly 9 tools and never constructs a client", async () => {
 		const createPlatformClient = vi.fn();
-		await startMcpServer("/repo", { loadConfig: async () => ({}), createPlatformClient });
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: false }),
+			createPlatformClient,
+		});
 		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: unknown[] };
 		expect(list.tools).toBe(TOOL_DEFINITIONS);
 		expect(list.tools).toHaveLength(9);
@@ -371,6 +377,15 @@ describe("startMcpServer — platform tools", () => {
 		// A built-in still dispatches through the local table.
 		await capturedHandlers[1]({ params: { name: "search", arguments: { query: "x" } } });
 		expect(runSearch).toHaveBeenCalledWith("/repo", { query: "x" });
+	});
+
+	it("on by default: an unset config flag opens the gate and fetches the manifest", async () => {
+		const createPlatformClient = vi.fn(() => stubClient([platA]));
+		await startMcpServer("/repo", { loadConfig: async () => ({}), createPlatformClient });
+		expect(createPlatformClient).toHaveBeenCalledTimes(1);
+		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
+		expect(list.tools).toHaveLength(10);
+		expect(list.tools.map((t) => t.name)).toContain("create_ticket");
 	});
 
 	it("enabled: advertises the built-ins plus the manifest's platform tools", async () => {
@@ -602,9 +617,12 @@ describe("startMcpServer — platform tools", () => {
 		expect(capturedHandlers).toHaveLength(2);
 	});
 
-	it("gate off: no prompts capability even if a manifest tool would be menu-flagged", async () => {
+	it("gate off (explicit opt-out): no prompts capability even if a manifest tool would be menu-flagged", async () => {
 		const createPlatformClient = vi.fn();
-		await startMcpServer("/repo", { loadConfig: async () => ({}), createPlatformClient });
+		await startMcpServer("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: false }),
+			createPlatformClient,
+		});
 		expect(serverCapabilities).toEqual({ tools: {} });
 		expect(handlerForKind("getPrompt")).toBeUndefined();
 	});
