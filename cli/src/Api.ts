@@ -34,6 +34,7 @@ import { registerStatusCommand } from "./commands/StatusCommand.js";
 import { registerSyncCommand } from "./commands/SyncCommand.js";
 import { registerTelemetryCommand } from "./commands/TelemetryCommand.js";
 import { registerUninstallCommand } from "./commands/UninstallCommand.js";
+import { registerVerifyPublishBranchCommand } from "./commands/VerifyPublishBranchCommand.js";
 import { registerViewCommand } from "./commands/ViewCommand.js";
 import { registerWorkflowRunStatusCommand } from "./commands/WorkflowRunStatusCommand.js";
 import { registerWorkflowRunsCommand } from "./commands/WorkflowRunsCommand.js";
@@ -172,6 +173,7 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"queue-status",
 	"local-run-workflows",
 	"open-url",
+	"verify-publish-branch",
 	"workflow-run-status",
 	"workflow-runs",
 	"compile",
@@ -361,6 +363,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerQueueStatusCommand(program);
 	registerLocalRunOfferCommand(program);
 	registerOpenUrlCommand(program);
+	registerVerifyPublishBranchCommand(program);
 	registerWorkflowRunStatusCommand(program);
 	registerWorkflowRunsCommand(program);
 	registerCompileCommand(program);

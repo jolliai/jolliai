@@ -368,6 +368,18 @@ describe("jolli-local-run template", () => {
 		expect(t).toContain("prUrl");
 	});
 
+	it("cross-checks the published headBranch against writeTarget.workBranch and stops on mismatch", () => {
+		const t = buildLocalRunSkillTemplate();
+		// Deterministic branch check via the CLI, not an LLM string comparison.
+		expect(t).toContain(
+			'"$HOME/.jolli/jollimemory/run-cli" verify-publish-branch <writeTarget.workBranch> <headBranch>',
+		);
+		expect(t).toContain("headBranch");
+		// On mismatch the recipe must fail loudly and NOT complete the run as success.
+		expect(t).toMatch(/run-to-PR link is broken/);
+		expect(t).toMatch(/do NOT call `complete_local_run` as if the run succeeded/);
+	});
+
 	it("completes a private Jolli-managed destination WITHOUT a PR reference", () => {
 		const t = buildLocalRunSkillTemplate();
 		// The publish JSON withholds prNumber/prUrl for private destinations
