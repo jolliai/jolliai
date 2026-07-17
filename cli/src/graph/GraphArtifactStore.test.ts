@@ -40,7 +40,7 @@ async function freshDir(): Promise<string> {
 describe("writeGraphArtifacts", () => {
 	it("writes graph.json (the only artifact) under the hidden .jolli/graph layer", async () => {
 		const root = await freshDir();
-		const graph = assembleGraph(tinyDistill(), new Map(), ISO, { t1: "fp" });
+		const graph = assembleGraph(tinyDistill(), new Map(), ISO, "", { t1: "fp" });
 
 		const result = await writeGraphArtifacts(root, graph);
 
@@ -54,7 +54,7 @@ describe("writeGraphArtifacts", () => {
 
 	it("writes atomically, leaving no .tmp sibling behind", async () => {
 		const root = await freshDir();
-		await writeGraphArtifacts(root, assembleGraph(tinyDistill(), new Map(), ISO));
+		await writeGraphArtifacts(root, assembleGraph(tinyDistill(), new Map(), ISO, ""));
 
 		// atomicWriteFile renames tmp → final, so no half-written sibling lingers.
 		expect(existsSync(join(root, ".jolli", "graph", "graph.json.tmp"))).toBe(false);
@@ -64,7 +64,7 @@ describe("writeGraphArtifacts", () => {
 describe("readGraph", () => {
 	it("round-trips a written graph", async () => {
 		const root = await freshDir();
-		const written = assembleGraph(tinyDistill(), new Map(), ISO, { t1: "fp" });
+		const written = assembleGraph(tinyDistill(), new Map(), ISO, "", { t1: "fp" });
 		await writeGraphArtifacts(root, written);
 
 		const got = await readGraph(root);
@@ -81,7 +81,7 @@ describe("readGraph", () => {
 	it("returns null when graph.json is unparseable (corrupt → full rebuild)", async () => {
 		const root = await freshDir();
 		// Write a valid graph first so the .jolli/graph dir exists, then corrupt it.
-		await writeGraphArtifacts(root, assembleGraph(tinyDistill(), new Map(), ISO));
+		await writeGraphArtifacts(root, assembleGraph(tinyDistill(), new Map(), ISO, ""));
 		await writeFile(graphJsonPath(root), "{ not valid json", "utf8");
 		expect(await readGraph(root)).toBeNull();
 	});

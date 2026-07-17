@@ -16,6 +16,9 @@
     let graph;
     if (window.__EMBEDDED_GRAPH__) {
       graph = window.__EMBEDDED_GRAPH__;
+    } else if (window.WikiHost && window.WikiHost.embedded) {
+      // Embedded in a host page (iframe): the host posts the graph (and theme) to us.
+      graph = await window.WikiHost.requestGraph();
     } else {
       const res = await fetch("../data/wiki-graph.json");
       if (!res.ok) throw new Error("wiki-graph.json: " + res.status);

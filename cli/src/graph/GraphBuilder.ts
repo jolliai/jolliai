@@ -13,6 +13,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { basename } from "node:path";
 import { createFolderStorageAtRoot } from "../core/StorageFactory.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
 import { readTopicIndex } from "../core/TopicIndexStore.js";
@@ -131,6 +132,8 @@ export async function buildKnowledgeGraph(
 	}
 
 	const kbRoot = storage.kbRoot ?? cwd;
+	// Repo display name stamped into graph.json → the viz breadcrumb root.
+	const repoName = basename(kbRoot);
 	const now = opts?.nowIso ?? new Date().toISOString();
 	const startedAt = performance.now();
 
@@ -170,7 +173,7 @@ export async function buildKnowledgeGraph(
 		// that is already empty) still skips.
 		if (prevDistill && prevDistill.topics.length > 0) {
 			log.info("All topics deleted (was %d) -- writing empty knowledge graph", prevDistill.topics.length);
-			const empty = assembleGraph({ categories: [], topics: [], units: [], edges: [] }, new Map(), now, {}, {});
+			const empty = assembleGraph({ categories: [], topics: [], units: [], edges: [] }, new Map(), now, repoName);
 			opts?.onProgress?.("writing graph.json");
 			const { graphJsonPath } = await writeGraphArtifacts(kbRoot, empty);
 			return { built: true, mode: "incremental", topics: 0, units: 0, edges: 0, graphJsonPath };
@@ -214,14 +217,14 @@ export async function buildKnowledgeGraph(
 			const prevMeta = isFingerprintMap(prevGraph?.topicMetaFingerprints)
 				? prevGraph.topicMetaFingerprints
 				: null;
-			if (prevMeta && sameFingerprints(prevMeta, metaFingerprints)) {
+			if (prevMeta && sameFingerprints(prevMeta, metaFingerprints) && prevGraph?.repoName === repoName) {
 				log.info("Knowledge graph unchanged (%d topics) -- skipping rebuild", index.topics.length);
 				return { built: false, reason: "no changes", topics: index.topics.length };
 			}
-			log.info("Knowledge graph content unchanged but source metadata drifted -- reassembling (no LLM)");
+			log.info("Knowledge graph content unchanged but source metadata/repoName drifted -- reassembling (no LLM)");
 			mode = "incremental";
 			distill = prevDistill;
-			const graph = assembleGraph(distill, sources, now, fingerprints, metaFingerprints);
+			const graph = assembleGraph(distill, sources, now, repoName, fingerprints, metaFingerprints);
 			opts?.onProgress?.("writing graph.json");
 			const { graphJsonPath } = await writeGraphArtifacts(kbRoot, graph);
 			log.info(
@@ -274,7 +277,7 @@ export async function buildKnowledgeGraph(
 		distill = await distillGraph({ topics: topicsInput }, config, opts?.onProgress);
 	}
 
-	const graph = assembleGraph(distill, sources, now, fingerprints, metaFingerprints);
+	const graph = assembleGraph(distill, sources, now, repoName, fingerprints, metaFingerprints);
 
 	opts?.onProgress?.("writing graph.json");
 	const { graphJsonPath } = await writeGraphArtifacts(kbRoot, graph);

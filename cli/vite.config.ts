@@ -1,17 +1,62 @@
-import { cpSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { cpSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, extname, join, relative, resolve } from "node:path";
+import { transform } from "esbuild";
 import { defineConfig } from "vite";
 
 const pkg = JSON.parse(readFileSync(resolve(__dirname, "package.json"), "utf-8"));
 
 // The knowledge-graph viz runtime (HTML/CSS/JS/vendor) is read at runtime by
 // `jolli graph --export`, relative to the bundle. Copy it next to dist/ as
-// graph-assets/ so it ships in the published package. (The VS Code extension
-// has its own copy step; this one is CLI-only.)
+// graph-assets/ — this is the CANONICAL, compressed source of the viz: authored
+// JS/CSS are esbuild-minified here; vendor/ + index.html are copied verbatim
+// (index.html keeps its `<!-- scripts:start -->` / charset / stylesheet markers;
+// vendor is already in distributed form — elk is GWT-compiled and barely
+// minifies). Both this CLI (for `graph --export`) and downstream consumers (the
+// VS Code extension and the Jolli web app) copy FROM this output — no one
+// re-minifies, so compression lives in exactly one place (DRY).
+const graphAssetsSrc = resolve(__dirname, "src/graph/assets");
+const graphAssetsDest = resolve(__dirname, "dist/graph-assets");
+
+function walkGraphAssets(dir: string): Array<string> {
+	const out: Array<string> = [];
+	for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		const abs = join(dir, entry.name);
+		if (entry.isDirectory()) {
+			out.push(...walkGraphAssets(abs));
+		} else {
+			out.push(abs);
+		}
+	}
+	return out;
+}
+
+/** Minify the code we author (js/ + css); ship vendor/ + html verbatim. */
+function shouldMinifyGraphAsset(file: string): boolean {
+	if (file.replaceAll("\\", "/").includes("/vendor/")) {
+		return false;
+	}
+	const ext = extname(file);
+	return ext === ".css" || ext === ".js";
+}
+
 const copyGraphAssets = {
 	name: "copy-graph-assets",
-	closeBundle() {
-		cpSync(resolve(__dirname, "src/graph/assets"), resolve(__dirname, "dist/graph-assets"), { recursive: true });
+	async closeBundle() {
+		rmSync(graphAssetsDest, { recursive: true, force: true });
+		for (const abs of walkGraphAssets(graphAssetsSrc)) {
+			const out = join(graphAssetsDest, relative(graphAssetsSrc, abs));
+			mkdirSync(dirname(out), { recursive: true });
+			if (shouldMinifyGraphAsset(abs)) {
+				const { code } = await transform(readFileSync(abs, "utf8"), {
+					minify: true,
+					loader: extname(abs) === ".css" ? "css" : "js",
+					legalComments: "inline", // preserve @license / @preserve banners
+				});
+				writeFileSync(out, code, "utf8");
+			} else {
+				cpSync(abs, out);
+			}
+		}
 	},
 };
 
