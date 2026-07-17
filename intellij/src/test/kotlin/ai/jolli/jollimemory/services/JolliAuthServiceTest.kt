@@ -18,7 +18,17 @@ import java.net.InetSocketAddress
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import org.junit.jupiter.api.parallel.Isolated
+import org.junit.jupiter.api.parallel.Execution
+import org.junit.jupiter.api.parallel.ExecutionMode
 
+// Temporary guard while this class still mutates JVM globals (System.setProperty/
+// setOut, mockkStatic/mockkObject). Remove when migrated to HookEnv injection.
+@Isolated
+// MockK's recorder is JVM-global; @Nested classes are scheduled as independent
+// parallel units, so intra-class concurrency corrupts stubbing too. SAME_THREAD
+// is inherited by all nested classes and serializes this whole file.
+@Execution(ExecutionMode.SAME_THREAD)
 class JolliAuthServiceTest {
 
     // --- parseQuery tests ---

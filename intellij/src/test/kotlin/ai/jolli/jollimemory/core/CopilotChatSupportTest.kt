@@ -5,11 +5,8 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldHaveSize
-import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
-import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -17,35 +14,12 @@ import java.io.File
 
 class CopilotChatSupportTest {
 
-	private var originalHome: String? = null
-	private var originalCodeOverride: String? = null
-
-	@BeforeEach
-	fun setup() {
-		originalHome = System.getProperty("user.home")
-		originalCodeOverride = System.getProperty("code.appdata.override")
-	}
-
-	@AfterEach
-	fun teardown() {
-		originalHome?.let { System.setProperty("user.home", it) }
-		if (originalCodeOverride != null) {
-			System.setProperty("code.appdata.override", originalCodeOverride!!)
-		} else {
-			System.clearProperty("code.appdata.override")
-		}
-	}
-
 	/**
-	 * Points `user.home` at [home] and redirects the Code flavor's Windows %APPDATA%
-	 * lookup into `<home>/AppData/Roaming` (the layout [codeUserDataDir] writes to), so
-	 * Scan B discovery reads our fixtures instead of the developer's real %APPDATA%.
-	 * On macOS/Linux the override system property is ignored by production.
+	 * Env pinned to macOS so the fixture layout below is deterministic on any
+	 * host. Scan A reads `<home>/.copilot/session-state`; Scan B reads the
+	 * macOS user-data dir created by [codeUserDataDir].
 	 */
-	private fun useHome(home: File) {
-		System.setProperty("user.home", home.absolutePath)
-		System.setProperty("code.appdata.override", File(home, "AppData/Roaming").absolutePath)
-	}
+	private fun macEnv(home: File): HookEnv = fakeHookEnv(userHome = home, osName = "Mac OS X")
 
 	/**
 	 * Builds a `file:///...` URI matching what VS Code actually writes in workspace.json.
@@ -56,15 +30,8 @@ class CopilotChatSupportTest {
 		return if (abs.startsWith("/")) "file://$abs" else "file:///$abs"
 	}
 
-	/** Returns the platform-correct VS Code user-data dir under the given home. */
-	private fun codeUserDataDir(home: File): File {
-		val osName = System.getProperty("os.name").lowercase()
-		return when {
-			osName.contains("mac") -> File(home, "Library/Application Support/Code")
-			osName.contains("win") -> File(home, "AppData/Roaming/Code")
-			else -> File(home, ".config/Code")
-		}
-	}
+	/** Returns the macOS VS Code user-data dir under the given home (matches [macEnv]). */
+	private fun codeUserDataDir(home: File): File = File(home, "Library/Application Support/Code")
 
 	/** Creates ~/.copilot/session-state/<sid>/ with vscode.metadata.json and events.jsonl. */
 	private fun setupSessionState(
@@ -103,22 +70,19 @@ class CopilotChatSupportTest {
 
 		@Test
 		fun `false when neither root exists`(@TempDir home: File) {
-			useHome(home)
-			CopilotChatSupport.isCopilotChatInstalled() shouldBe false
+			CopilotChatSupport.isCopilotChatInstalled(macEnv(home)) shouldBe false
 		}
 
 		@Test
 		fun `true when session-state dir exists`(@TempDir home: File) {
-			useHome(home)
 			File(home, ".copilot/session-state").mkdirs()
-			CopilotChatSupport.isCopilotChatInstalled() shouldBe true
+			CopilotChatSupport.isCopilotChatInstalled(macEnv(home)) shouldBe true
 		}
 
 		@Test
 		fun `true when github_copilot-chat globalStorage exists`(@TempDir home: File) {
-			useHome(home)
 			File(codeUserDataDir(home), "User/globalStorage/github.copilot-chat").mkdirs()
-			CopilotChatSupport.isCopilotChatInstalled() shouldBe true
+			CopilotChatSupport.isCopilotChatInstalled(macEnv(home)) shouldBe true
 		}
 	}
 
@@ -127,12 +91,11 @@ class CopilotChatSupportTest {
 
 		@Test
 		fun `picks events_jsonl whose metadata folderPath matches`(@TempDir home: File, @TempDir projectDir: File) {
-			useHome(home)
 			val events = listOf(
 				"""{"type":"user.message","timestamp":"2026-05-01T00:00:00Z","data":{"content":"hi"}}""",
 			)
 			setupSessionState(home, "sid-1", projectDir.absolutePath, events)
-			val sessions = CopilotChatSupport.discoverSessions(projectDir.absolutePath).sessions
+			val sessions = CopilotChatSupport.discoverSessions(projectDir.absolutePath, macEnv(home)).sessions
 			sessions.shouldHaveSize(1)
 			sessions[0].sessionId shouldBe "sid-1"
 			sessions[0].source shouldBe TranscriptSource.`copilot-chat`
@@ -140,18 +103,16 @@ class CopilotChatSupportTest {
 
 		@Test
 		fun `skips events_jsonl whose folderPath does not match`(@TempDir home: File, @TempDir projectDir: File, @TempDir otherDir: File) {
-			useHome(home)
 			setupSessionState(home, "wrong", otherDir.absolutePath, listOf("""{"type":"x"}"""))
-			CopilotChatSupport.discoverSessions(projectDir.absolutePath).sessions.shouldBeEmpty()
+			CopilotChatSupport.discoverSessions(projectDir.absolutePath, macEnv(home)).sessions.shouldBeEmpty()
 		}
 
 		@Test
 		fun `skips sessions with malformed metadata`(@TempDir home: File, @TempDir projectDir: File) {
-			useHome(home)
 			val sessionDir = File(home, ".copilot/session-state/bad").also { it.mkdirs() }
 			File(sessionDir, "vscode.metadata.json").writeText("not json")
 			File(sessionDir, "events.jsonl").writeText("")
-			CopilotChatSupport.discoverSessions(projectDir.absolutePath).sessions.shouldBeEmpty()
+			CopilotChatSupport.discoverSessions(projectDir.absolutePath, macEnv(home)).sessions.shouldBeEmpty()
 		}
 	}
 
@@ -160,30 +121,29 @@ class CopilotChatSupportTest {
 
 		@Test
 		fun `picks chatSessions_jsonl under matched workspace hash`(@TempDir home: File, @TempDir projectDir: File) {
-			useHome(home)
 			setupChatSessions(home, projectDir, "hash-A", "sid-2", listOf("""{"kind":0,"v":{}}"""))
-			val sessions = CopilotChatSupport.discoverSessions(projectDir.absolutePath).sessions
+			val sessions = CopilotChatSupport.discoverSessions(projectDir.absolutePath, macEnv(home)).sessions
 			sessions.shouldHaveSize(1)
 			sessions[0].sessionId shouldBe "sid-2"
 		}
 
 		@Test
 		fun `skips _json snapshot files`(@TempDir home: File, @TempDir projectDir: File) {
-			useHome(home)
 			val ws = File(codeUserDataDir(home), "User/workspaceStorage/h").also { it.mkdirs() }
 			File(ws, "workspace.json").writeText("""{"folder": "${fileUri(projectDir)}"}""")
 			val chatDir = File(ws, "chatSessions").also { it.mkdirs() }
 			File(chatDir, "snap.json").writeText("{}") // deprecated snapshot — must be ignored
-			CopilotChatSupport.discoverSessions(projectDir.absolutePath).sessions.shouldBeEmpty()
+			CopilotChatSupport.discoverSessions(projectDir.absolutePath, macEnv(home)).sessions.shouldBeEmpty()
 		}
 	}
 
+	// readTranscript takes an absolute file path and never consults the env,
+	// so the reader suites below need no HookEnv at all.
 	@Nested
 	inner class ReadEventsJsonl {
 
 		@Test
 		fun `picks user_message and assistant_message, skips other types`(@TempDir home: File, @TempDir projectDir: File) {
-			useHome(home)
 			val events = listOf(
 				"""{"type":"user.message","timestamp":"2026-05-01T00:00:00Z","data":{"content":"q"}}""",
 				"""{"type":"tool.call","timestamp":"2026-05-01T00:00:01Z","data":{"content":"ignored"}}""",
@@ -200,7 +160,6 @@ class CopilotChatSupportTest {
 
 		@Test
 		fun `malformed line skipped but cursor advances`(@TempDir home: File, @TempDir projectDir: File) {
-			useHome(home)
 			val events = listOf(
 				"not json",
 				"""{"type":"user.message","timestamp":"2026-05-01T00:00:00Z","data":{"content":"q"}}""",
@@ -213,7 +172,6 @@ class CopilotChatSupportTest {
 
 		@Test
 		fun `beforeTimestamp gate defers events past cutoff`(@TempDir home: File, @TempDir projectDir: File) {
-			useHome(home)
 			val events = listOf(
 				"""{"type":"user.message","timestamp":"2026-05-01T00:00:00Z","data":{"content":"before"}}""",
 				"""{"type":"assistant.message","timestamp":"2026-05-01T01:00:00Z","data":{"content":"after"}}""",
@@ -235,7 +193,6 @@ class CopilotChatSupportTest {
 
 		@Test
 		fun `replays requests array into entries`(@TempDir home: File, @TempDir projectDir: File) {
-			useHome(home)
 			val patch = listOf(
 				"""{"kind":0,"v":{"requests":[{"message":{"text":"q1"},"response":[{"value":"a1"}],"timestamp":1700000000000}]}}""",
 				"""{"kind":1,"k":["requests",1],"v":{"message":{"text":"q2"},"response":[{"value":"a2"}],"timestamp":1700000060000}}""",
@@ -251,7 +208,6 @@ class CopilotChatSupportTest {
 
 		@Test
 		fun `cursor resumption skips already-consumed requests`(@TempDir home: File, @TempDir projectDir: File) {
-			useHome(home)
 			val patch = listOf(
 				"""{"kind":0,"v":{"requests":[{"message":{"text":"q1"},"response":[{"value":"a1"}]},{"message":{"text":"q2"},"response":[{"value":"a2"}]}]}}""",
 			)

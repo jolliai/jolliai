@@ -3,7 +3,6 @@ package ai.jolli.jollimemory.core
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
-import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
@@ -30,27 +29,19 @@ class ActiveSessionAggregatorTest {
 	private val HOUR = 3_600_000L
 	private val DAY = 24 * HOUR
 
-	private var originalHome: String? = null
+	/**
+	 * Hermetic isolation. The aggregator fans out to the Codex / Cursor / OpenCode
+	 * discoverers, which scan machine-global session dirs derived from the home dir
+	 * (~/.codex/sessions, ~/Library/Application Support/Cursor, ~/.local/share/opencode).
+	 * Injecting a HookEnv whose userHome is an empty temp dir (and whose getenv returns
+	 * null for XDG_DATA_HOME) makes those sources find nothing, so assertions see only
+	 * the SessionTracker sessions this test registers.
+	 */
+	private fun env(): HookEnv = fakeHookEnv(userHome = homeDir, userDir = tempDir)
 
 	@BeforeEach
 	fun setUp() {
-		// Hermetic isolation. The aggregator fans out to the Codex / Cursor / OpenCode
-		// discoverers, which scan machine-global session dirs derived from `user.home`
-		// (~/.codex/sessions, ~/Library/Application Support/Cursor, ~/.local/share/opencode)
-		// — they ignore the `cwd` temp dir. Without this, real sessions on the developer's
-		// machine pollute the assertions (and opening the real SQLite DBs leaks JDBC
-		// threads onto the next test class). Point user.home at an empty temp dir so those
-		// sources find nothing; the assertions then see only the SessionTracker sessions
-		// this test registers. Mirrors CursorSupportTest / VscodeWorkspaceLocatorTest.
-		// (OpenCode also honors XDG_DATA_HOME; this assumes it is unset, as on CI.)
-		originalHome = System.getProperty("user.home")
-		System.setProperty("user.home", homeDir.absolutePath)
 		File(tempDir, ".jolli/jollimemory").mkdirs()
-	}
-
-	@AfterEach
-	fun tearDown() {
-		originalHome?.let { System.setProperty("user.home", it) } ?: System.clearProperty("user.home")
 	}
 
 	private fun iso(offsetMs: Long): String =
@@ -87,7 +78,7 @@ class ActiveSessionAggregatorTest {
 			registerSession("fresh", path, iso(-HOUR))
 			registerSession("old", path, iso(-3 * DAY))
 
-			val result = ActiveSessionAggregator.listActiveConversationsWithDiagnostics(cwd, 2 * DAY)
+			val result = ActiveSessionAggregator.listActiveConversationsWithDiagnostics(cwd, 2 * DAY, env())
 			result.items.map { it.sessionId } shouldBe listOf("fresh")
 		}
 	}
@@ -103,7 +94,7 @@ class ActiveSessionAggregatorTest {
 			registerSession("s1", path, iso(-2 * HOUR))
 			registerSession("s1", path, iso(-HOUR))
 
-			val result = ActiveSessionAggregator.listActiveConversations(cwd, 2 * DAY)
+			val result = ActiveSessionAggregator.listActiveConversations(cwd, 2 * DAY, env())
 			result shouldHaveSize 1
 		}
 	}
@@ -121,7 +112,7 @@ class ActiveSessionAggregatorTest {
 			// Hide it before its last update
 			HiddenConversationsStore.hideConversation(cwd, TranscriptSource.claude, "s1")
 
-			val result = ActiveSessionAggregator.listActiveConversations(cwd, 2 * DAY)
+			val result = ActiveSessionAggregator.listActiveConversations(cwd, 2 * DAY, env())
 			result.shouldBeEmpty()
 		}
 	}
@@ -138,7 +129,7 @@ class ActiveSessionAggregatorTest {
 			registerSession("a", path, sameTime)
 			registerSession("c", path, iso(-2 * HOUR))
 
-			val result = ActiveSessionAggregator.listActiveConversations(cwd, 2 * DAY)
+			val result = ActiveSessionAggregator.listActiveConversations(cwd, 2 * DAY, env())
 			result.map { it.sessionId } shouldBe listOf("a", "b", "c")
 		}
 	}
@@ -149,7 +140,7 @@ class ActiveSessionAggregatorTest {
 	inner class Diagnostics {
 		@Test
 		fun `returns empty items and no failed sources when no sessions exist`() {
-			val result = ActiveSessionAggregator.listActiveConversationsWithDiagnostics(cwd, 2 * DAY)
+			val result = ActiveSessionAggregator.listActiveConversationsWithDiagnostics(cwd, 2 * DAY, env())
 			result.items.shouldBeEmpty()
 			result.failedSources.shouldBeEmpty()
 		}

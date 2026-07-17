@@ -88,11 +88,8 @@ jobs:
           echo "Publishing IntelliJ plugin version ${VERSION}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Run tests
-        run: ./gradlew test
-
-      - name: Build plugin
-        run: ./gradlew buildPlugin
+      - name: Test and build plugin
+        run: ./gradlew test buildPlugin
 
       - name: Sign plugin
         env:

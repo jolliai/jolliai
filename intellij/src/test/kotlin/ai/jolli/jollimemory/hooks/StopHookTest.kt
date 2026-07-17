@@ -1,16 +1,10 @@
 package ai.jolli.jollimemory.hooks
 
-import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.core.SessionInfo
 import ai.jolli.jollimemory.core.TranscriptSource
+import ai.jolli.jollimemory.core.fakeHookEnv
+import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.shouldBe
-import io.mockk.every
-import io.mockk.mockkObject
-import io.mockk.mockkStatic
-import io.mockk.slot
-import io.mockk.unmockkAll
-import io.mockk.verify
-import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
@@ -20,17 +14,14 @@ class StopHookTest {
     @TempDir
     lateinit var tempDir: File
 
-    @BeforeEach
-    fun setUp() {
-        mockkObject(SessionTracker)
-        mockkStatic(::readStdin)
-        every { SessionTracker.ensureDir(any()) } returns tempDir.resolve(".jolli/jollimemory").apply { mkdirs() }.absolutePath
-        every { SessionTracker.saveSession(any(), any()) } returns Unit
-    }
-
-    @AfterEach
-    fun tearDown() {
-        unmockkAll()
+    /** Runs the hook with a fake env; returns the sessions handed to saveSession. */
+    private fun runHook(readStdin: () -> String): List<SessionInfo> {
+        val saved = mutableListOf<SessionInfo>()
+        StopHook.run(
+            env = fakeHookEnv(readStdin = readStdin, userHome = tempDir, userDir = tempDir),
+            saveSession = { info, _ -> saved.add(info) },
+        )
+        return saved
     }
 
     @Test
@@ -38,36 +29,31 @@ class StopHookTest {
         // Escape backslashes for JSON — tempDir.absolutePath on Windows contains \\ which
         // would otherwise produce illegal JSON escape sequences (\U, \A, \L, ...).
         val cwdJson = tempDir.absolutePath.replace("\\", "\\\\")
-        val json = """{"session_id":"sess-123","transcript_path":"/tmp/transcript.jsonl","cwd":"$cwdJson"}"""
-        every { readStdin() } returns json
+        // transcript_path points inside tempDir and does not exist, so the
+        // post-save discovery scan exits early without touching shared state.
+        val transcriptPath = File(tempDir, "no-such-transcript.jsonl").absolutePath
+        val transcriptJson = transcriptPath.replace("\\", "\\\\")
+        val json = """{"session_id":"sess-123","transcript_path":"$transcriptJson","cwd":"$cwdJson"}"""
 
-        StopHook.run()
+        val saved = runHook { json }
 
-        val sessionSlot = slot<ai.jolli.jollimemory.core.SessionInfo>()
-        verify { SessionTracker.saveSession(capture(sessionSlot), any()) }
-        sessionSlot.captured.sessionId shouldBe "sess-123"
-        sessionSlot.captured.transcriptPath shouldBe "/tmp/transcript.jsonl"
-        sessionSlot.captured.source shouldBe TranscriptSource.claude
+        saved.single().sessionId shouldBe "sess-123"
+        saved.single().transcriptPath shouldBe transcriptPath
+        saved.single().source shouldBe TranscriptSource.claude
     }
 
     @Test
     fun `returns early on empty stdin`() {
-        every { readStdin() } returns ""
-        StopHook.run()
-        verify(exactly = 0) { SessionTracker.saveSession(any(), any()) }
+        runHook { "" }.shouldBeEmpty()
     }
 
     @Test
     fun `returns early on invalid JSON`() {
-        every { readStdin() } returns "not json"
-        StopHook.run()
-        verify(exactly = 0) { SessionTracker.saveSession(any(), any()) }
+        runHook { "not json" }.shouldBeEmpty()
     }
 
     @Test
     fun `returns early on stdin read failure`() {
-        every { readStdin() } throws RuntimeException("pipe broken")
-        StopHook.run()
-        verify(exactly = 0) { SessionTracker.saveSession(any(), any()) }
+        runHook { throw RuntimeException("pipe broken") }.shouldBeEmpty()
     }
 }

@@ -29,29 +29,27 @@ enum class VscodeFlavor(val dirName: String) {
  *   darwin   ~/Library/Application Support/<flavor>
  *   linux    ~/.config/<flavor>
  *   win32    %APPDATA%/<flavor>  (fallback to ~/AppData/Roaming/<flavor>)
+ *
+ * All platform lookups (home dir, OS name, %APPDATA%) come from [env] so tests
+ * can exercise every platform branch on any host without mutating JVM globals.
  */
-fun getVscodeUserDataDir(flavor: VscodeFlavor, home: String = System.getProperty("user.home")): String {
-	val osName = System.getProperty("os.name").lowercase()
+fun getVscodeUserDataDir(flavor: VscodeFlavor, env: HookEnv = HookEnv()): String {
+	val osName = env.osName.lowercase()
+	val home = env.userHome.path
 	return when {
 		osName.contains("mac") ->
 			home + File.separator + "Library" + File.separator + "Application Support" + File.separator + flavor.dirName
-		osName.contains("win") -> {
-			// `<flavor>.appdata.override` (e.g. `cursor.appdata.override`, `code.appdata.override`)
-			// is a per-flavor test hook: Java cannot unset env vars, so tests that need to
-			// redirect away from the real %APPDATA% set this system property instead. Production
-			// never sets it, so the real %APPDATA% (or the ~/AppData/Roaming fallback) is used.
-			val appData = System.getProperty("${flavor.dirName.lowercase()}.appdata.override")
-			(appData ?: System.getenv("APPDATA") ?: (home + File.separator + "AppData" + File.separator + "Roaming")) +
+		osName.contains("win") ->
+			(env.getenv("APPDATA") ?: (home + File.separator + "AppData" + File.separator + "Roaming")) +
 				File.separator + flavor.dirName
-		}
 		else ->
 			home + File.separator + ".config" + File.separator + flavor.dirName
 	}
 }
 
 /** Returns the workspaceStorage dir for the given flavor. */
-fun getVscodeWorkspaceStorageDir(flavor: VscodeFlavor, home: String = System.getProperty("user.home")): String =
-	getVscodeUserDataDir(flavor, home) + File.separator + "User" + File.separator + "workspaceStorage"
+fun getVscodeWorkspaceStorageDir(flavor: VscodeFlavor, env: HookEnv = HookEnv()): String =
+	getVscodeUserDataDir(flavor, env) + File.separator + "User" + File.separator + "workspaceStorage"
 
 /**
  * Normalises a filesystem path for workspace matching:
@@ -59,10 +57,10 @@ fun getVscodeWorkspaceStorageDir(flavor: VscodeFlavor, home: String = System.get
  *   - Strip trailing slashes
  *   - Lowercase on macOS and Windows (case-insensitive filesystems)
  */
-fun normalizePathForMatch(p: String): String {
+fun normalizePathForMatch(p: String, env: HookEnv = HookEnv()): String {
 	val fwd = p.replace('\\', '/')
 	val trimmed = fwd.trimEnd('/')
-	val osName = System.getProperty("os.name").lowercase()
+	val osName = env.osName.lowercase()
 	return if (osName.contains("mac") || osName.contains("win")) trimmed.lowercase() else trimmed
 }
 
@@ -74,14 +72,14 @@ fun normalizePathForMatch(p: String): String {
  * Single-folder workspaces only — entries with a `workspace` field instead of
  * `folder` (multi-root .code-workspace files) are skipped silently.
  */
-fun findVscodeWorkspaceHash(flavor: VscodeFlavor, projectDir: String): String? {
-	val wsStorageDir = File(getVscodeWorkspaceStorageDir(flavor))
+fun findVscodeWorkspaceHash(flavor: VscodeFlavor, projectDir: String, env: HookEnv = HookEnv()): String? {
+	val wsStorageDir = File(getVscodeWorkspaceStorageDir(flavor, env))
 	if (!wsStorageDir.isDirectory) {
 		log.debug("%s workspaceStorage not readable at %s", flavor, wsStorageDir.path)
 		return null
 	}
 
-	val target = normalizePathForMatch(projectDir)
+	val target = normalizePathForMatch(projectDir, env)
 	val entries = wsStorageDir.listFiles() ?: return null
 
 	for (entry in entries) {
@@ -104,7 +102,7 @@ fun findVscodeWorkspaceHash(flavor: VscodeFlavor, projectDir: String): String? {
 			continue
 		}
 
-		if (normalizePathForMatch(folderPath) == target) {
+		if (normalizePathForMatch(folderPath, env) == target) {
 			return entry.name
 		}
 	}

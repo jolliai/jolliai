@@ -12,9 +12,12 @@ object HookRunner {
 
     @JvmStatic
     fun main(args: Array<String>) {
+        // Composition root: the ONE place a real HookEnv is born for the hooks
+        // JAR. Hooks receive it as a parameter; tests pass fakes instead.
+        val env = ai.jolli.jollimemory.core.HookEnv()
         if (args.isEmpty()) {
-            System.err.println("Usage: java -jar jollimemory-hooks.jar <hook> [args...]")
-            System.err.println("Hooks: post-commit, post-rewrite, prepare-commit-msg, stop, gemini-after-agent")
+            env.stderr.println("Usage: java -jar jollimemory-hooks.jar <hook> [args...]")
+            env.stderr.println("Hooks: post-commit, post-rewrite, prepare-commit-msg, stop, gemini-after-agent")
             System.exit(1)
             return
         }
@@ -43,12 +46,12 @@ object HookRunner {
                 PostCommitHook.drainWorker(cwd)
                 ai.jolli.jollimemory.core.telemetry.TelemetryActivation.flushNow(cwd)
             }
-            "post-rewrite" -> PostRewriteHook.run(hookArgs)
-            "prepare-commit-msg" -> PrepareMsgHook.run(hookArgs)
-            "stop" -> StopHook.run()
-            "gemini-after-agent" -> GeminiAfterAgentHook.run()
+            "post-rewrite" -> PostRewriteHook.run(hookArgs, env)
+            "prepare-commit-msg" -> PrepareMsgHook.run(hookArgs, env)
+            "stop" -> StopHook.run(env)
+            "gemini-after-agent" -> GeminiAfterAgentHook.run(env)
             else -> {
-                System.err.println("Unknown hook: $hook")
+                env.stderr.println("Unknown hook: $hook")
                 System.exit(1)
             }
         }

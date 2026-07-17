@@ -1,6 +1,7 @@
 package ai.jolli.jollimemory.hooks
 
 import ai.jolli.jollimemory.bridge.GitOps
+import ai.jolli.jollimemory.core.HookEnv
 import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.core.SessionTracker
 import java.io.File
@@ -17,8 +18,8 @@ object PrepareMsgHook {
 
     private val log = JmLogger.create("PrepareMsgHook")
 
-    fun run(args: Array<String>) {
-        val cwd = System.getProperty("user.dir")
+    fun run(args: Array<String>, env: HookEnv = HookEnv()) {
+        val cwd = env.userDir.path
         JmLogger.setLogDir(cwd)
         log.info("=== Prepare-commit-msg hook started (source: %s) ===", args.getOrNull(1) ?: "unknown")
 

@@ -1,29 +1,34 @@
 package ai.jolli.jollimemory.core
 
-import ai.jolli.jollimemory.bridge.GitOps
+import ai.jolli.jollimemory.bridge.FakeGit
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import io.kotest.matchers.collections.shouldBeEmpty
+import io.kotest.matchers.collections.shouldContain
+import io.kotest.matchers.collections.shouldHaveAtLeastSize
 import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.collections.shouldNotBeEmpty
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
-import io.mockk.every
-import io.mockk.mockk
-import io.mockk.slot
-import io.mockk.verify
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 
+/**
+ * Uses [FakeGit] (a plain per-test object) instead of MockK, so this class
+ * needs no isolation annotations and runs fully parallel — there is no shared
+ * mutable state and no bytecode instrumentation involved. See GitCommands.kt
+ * for the history behind the migration.
+ */
 class SummaryStoreTest {
 
     private val gson: Gson = GsonBuilder().setPrettyPrinting().create()
-    private lateinit var git: GitOps
+    private lateinit var git: FakeGit
     private lateinit var store: SummaryStore
 
     @BeforeEach
     fun setUp() {
-        git = mockk(relaxed = true)
+        git = FakeGit()
         store = SummaryStore("/fake/cwd", git)
     }
 
@@ -60,17 +65,20 @@ class SummaryStoreTest {
     private fun makeIndex(entries: List<SummaryIndexEntry> = emptyList(), aliases: Map<String, String>? = null) =
         SummaryIndex(version = 3, entries = entries, commitAliases = aliases)
 
-    /** Set up git mocks so write operations (ensureOrphanBranch, writeFilesToBranch) succeed. */
+    /** Configure the fake so write operations (ensureOrphanBranch, writeFilesToBranch) succeed. */
     private fun stubGitWritePipeline() {
-        every { git.branchExists(any()) } returns true
-        // exec() is vararg, so use *anyVararg() for flexible matching
-        every { git.exec(*anyVararg(), timeoutSeconds = any()) } returns ""
-        // Override specific patterns we care about
-        every { git.exec("rev-parse", match { it.startsWith("refs/heads/") }, timeoutSeconds = any()) } returns "parentcommit"
-        every { git.exec("rev-parse", match { it.contains("^{tree}") }, timeoutSeconds = any()) } returns "basetree"
-        every { git.exec("cat-file", "-p", any(), timeoutSeconds = any()) } returns "tree sometreehash\nparent someparent"
-        every { git.execWithStdin(*anyVararg(), input = any(), timeoutSeconds = any()) } returns "newtreehash"
-        every { git.execWithStdin("hash-object", "-w", "--stdin", input = any(), timeoutSeconds = any()) } returns "blobhash123"
+        git.branchPresent = true
+        git.onExec = { args ->
+            when {
+                args.getOrNull(0) == "rev-parse" && args.getOrNull(1)?.startsWith("refs/heads/") == true -> "parentcommit"
+                args.getOrNull(0) == "rev-parse" && args.getOrNull(1)?.contains("^{tree}") == true -> "basetree"
+                args.getOrNull(0) == "cat-file" -> "tree sometreehash\nparent someparent"
+                else -> ""
+            }
+        }
+        git.onExecWithStdin = { args, _ ->
+            if (args.firstOrNull() == "hash-object") "blobhash123" else "newtreehash"
+        }
     }
 
     // ── loadIndex ───────────────────────────────────────────────────────
@@ -79,14 +87,13 @@ class SummaryStoreTest {
     inner class LoadIndex {
         @Test
         fun `returns null when branch file does not exist`() {
-            every { git.readBranchFile(any(), "index.json") } returns null
             store.loadIndex() shouldBe null
         }
 
         @Test
         fun `parses valid index JSON`() {
             val index = makeIndex(entries = listOf(makeIndexEntry("hash1")))
-            every { git.readBranchFile(any(), "index.json") } returns gson.toJson(index)
+            git.files["index.json"] = gson.toJson(index)
             val result = store.loadIndex()
             result shouldNotBe null
             result!!.entries shouldHaveSize 1
@@ -94,7 +101,7 @@ class SummaryStoreTest {
 
         @Test
         fun `returns null for invalid JSON`() {
-            every { git.readBranchFile(any(), "index.json") } returns "invalid json"
+            git.files["index.json"] = "invalid json"
             store.loadIndex() shouldBe null
         }
     }
@@ -105,19 +112,18 @@ class SummaryStoreTest {
     inner class GetSummary {
         @Test
         fun `returns summary when file exists`() {
-            every { git.readBranchFile(any(), "summaries/deadbeef.json") } returns gson.toJson(makeSummary("deadbeef"))
+            git.files["summaries/deadbeef.json"] = gson.toJson(makeSummary("deadbeef"))
             store.getSummary("deadbeef")!!.commitHash shouldBe "deadbeef"
         }
 
         @Test
         fun `returns null when file does not exist`() {
-            every { git.readBranchFile(any(), any()) } returns null
             store.getSummary("nonexistent") shouldBe null
         }
 
         @Test
         fun `returns null for invalid JSON`() {
-            every { git.readBranchFile(any(), "summaries/bad.json") } returns "not json"
+            git.files["summaries/bad.json"] = "not json"
             store.getSummary("bad") shouldBe null
         }
     }
@@ -126,13 +132,13 @@ class SummaryStoreTest {
 
     @Test
     fun `getSummaryCount counts files`() {
-        every { git.listBranchFiles(any(), "summaries/") } returns listOf("summaries/a.json", "summaries/b.json")
+        git.files["summaries/a.json"] = "{}"
+        git.files["summaries/b.json"] = "{}"
         store.getSummaryCount() shouldBe 2
     }
 
     @Test
     fun `getSummaryCount returns 0 when empty`() {
-        every { git.listBranchFiles(any(), "summaries/") } returns emptyList()
         store.getSummaryCount() shouldBe 0
     }
 
@@ -143,20 +149,19 @@ class SummaryStoreTest {
         @Test
         fun `returns matching commit hashes`() {
             val index = makeIndex(entries = listOf(makeIndexEntry("hash1"), makeIndexEntry("hash2")))
-            every { git.readBranchFile(any(), "index.json") } returns gson.toJson(index)
+            git.files["index.json"] = gson.toJson(index)
             store.filterCommitsWithSummary(listOf("hash1", "hash3")) shouldBe setOf("hash1")
         }
 
         @Test
         fun `matches via aliases`() {
             val index = makeIndex(entries = listOf(makeIndexEntry("original")), aliases = mapOf("alias1" to "original"))
-            every { git.readBranchFile(any(), "index.json") } returns gson.toJson(index)
+            git.files["index.json"] = gson.toJson(index)
             store.filterCommitsWithSummary(listOf("alias1")) shouldBe setOf("alias1")
         }
 
         @Test
         fun `returns empty set when no index`() {
-            every { git.readBranchFile(any(), "index.json") } returns null
             store.filterCommitsWithSummary(listOf("hash1")).shouldBeEmpty()
         }
     }
@@ -165,13 +170,13 @@ class SummaryStoreTest {
 
     @Test
     fun `resolveAlias returns alias target`() {
-        every { git.readBranchFile(any(), "index.json") } returns gson.toJson(makeIndex(aliases = mapOf("new" to "original")))
+        git.files["index.json"] = gson.toJson(makeIndex(aliases = mapOf("new" to "original")))
         store.resolveAlias("new") shouldBe "original"
     }
 
     @Test
     fun `resolveAlias returns original when no alias`() {
-        every { git.readBranchFile(any(), "index.json") } returns gson.toJson(makeIndex())
+        git.files["index.json"] = gson.toJson(makeIndex())
         store.resolveAlias("hash1") shouldBe "hash1"
     }
 
@@ -181,20 +186,20 @@ class SummaryStoreTest {
     inner class FindRootHash {
         @Test
         fun `returns hash when no parent`() {
-            every { git.readBranchFile(any(), "index.json") } returns gson.toJson(makeIndex(entries = listOf(makeIndexEntry("root"))))
+            git.files["index.json"] = gson.toJson(makeIndex(entries = listOf(makeIndexEntry("root"))))
             store.findRootHash("root") shouldBe "root"
         }
 
         @Test
         fun `follows parent chain`() {
             val index = makeIndex(entries = listOf(makeIndexEntry("root"), makeIndexEntry("child", parent = "root")))
-            every { git.readBranchFile(any(), "index.json") } returns gson.toJson(index)
+            git.files["index.json"] = gson.toJson(index)
             store.findRootHash("child") shouldBe "root"
         }
 
         @Test
         fun `returns null for unknown hash`() {
-            every { git.readBranchFile(any(), "index.json") } returns gson.toJson(makeIndex())
+            git.files["index.json"] = gson.toJson(makeIndex())
             store.findRootHash("unknown") shouldBe null
         }
     }
@@ -203,38 +208,37 @@ class SummaryStoreTest {
 
     @Test
     fun `getTranscriptHashes extracts hashes`() {
-        every { git.listBranchFiles(any(), "transcripts/") } returns listOf("transcripts/abc.json", "transcripts/def.json")
+        git.files["transcripts/abc.json"] = "{}"
+        git.files["transcripts/def.json"] = "{}"
         store.getTranscriptHashes() shouldBe setOf("abc", "def")
     }
 
     @Test
     fun `readTranscript returns null when missing`() {
-        every { git.readBranchFile(any(), any()) } returns null
         store.readTranscript("hash1") shouldBe null
     }
 
     @Test
     fun `readTranscript parses valid JSON`() {
         val transcript = StoredTranscript(sessions = listOf(StoredSession("s1", entries = listOf(TranscriptEntry("human", "Hello")))))
-        every { git.readBranchFile(any(), "transcripts/hash1.json") } returns gson.toJson(transcript)
+        git.files["transcripts/hash1.json"] = gson.toJson(transcript)
         store.readTranscript("hash1")!!.sessions shouldHaveSize 1
     }
 
     @Test
     fun `readTranscript returns null for invalid JSON`() {
-        every { git.readBranchFile(any(), "transcripts/bad.json") } returns "bad"
+        git.files["transcripts/bad.json"] = "bad"
         store.readTranscript("bad") shouldBe null
     }
 
     @Test
     fun `readPlanFromBranch reads correct path`() {
-        every { git.readBranchFile(any(), "plans/my-plan.md") } returns "# Plan"
+        git.files["plans/my-plan.md"] = "# Plan"
         store.readPlanFromBranch("my-plan") shouldBe "# Plan"
     }
 
     @Test
     fun `listSummaries returns empty when no index`() {
-        every { git.readBranchFile(any(), "index.json") } returns null
         store.listSummaries().shouldBeEmpty()
     }
 
@@ -245,62 +249,58 @@ class SummaryStoreTest {
         @Test
         fun `stores new summary and updates index`() {
             stubGitWritePipeline()
-            every { git.readBranchFile(any(), "index.json") } returns null
 
             val summary = makeSummary("newcommit123")
             store.storeSummary(summary)
 
             // Should write summary JSON + index.json
-            verify(atLeast = 2) { git.execWithStdin("hash-object", "-w", "--stdin", input = any(), timeoutSeconds = any()) }
+            git.writtenBlobs() shouldHaveAtLeastSize 2
         }
 
         @Test
         fun `skips duplicate when not forced`() {
             stubGitWritePipeline()
             val existing = makeIndex(entries = listOf(makeIndexEntry("existing123")))
-            every { git.readBranchFile(any(), "index.json") } returns gson.toJson(existing)
+            git.files["index.json"] = gson.toJson(existing)
 
             store.storeSummary(makeSummary("existing123"))
 
-            // Should NOT write — rev-parse for branch tip should not be called
-            verify(exactly = 0) { git.exec("rev-parse", match { it.startsWith("refs/heads/") }, timeoutSeconds = any()) }
+            // Should NOT write — the branch tip (rev-parse refs/heads/...) is never read
+            git.branchTipReads().shouldBeEmpty()
         }
 
         @Test
         fun `overwrites duplicate when force is true`() {
             stubGitWritePipeline()
             val existing = makeIndex(entries = listOf(makeIndexEntry("existing123")))
-            every { git.readBranchFile(any(), "index.json") } returns gson.toJson(existing)
+            git.files["index.json"] = gson.toJson(existing)
 
             store.storeSummary(makeSummary("existing123"), force = true)
 
-            verify(atLeast = 1) { git.execWithStdin("hash-object", "-w", "--stdin", input = any(), timeoutSeconds = any()) }
+            git.writtenBlobs().shouldNotBeEmpty()
         }
 
         @Test
         fun `stores transcript alongside summary`() {
             stubGitWritePipeline()
-            every { git.readBranchFile(any(), "index.json") } returns null
 
             val transcript = StoredTranscript(sessions = listOf(StoredSession("s1", entries = listOf(TranscriptEntry("human", "Hi")))))
             store.storeSummary(makeSummary("withtr"), transcript = transcript)
 
             // Should write 3 blobs: summary.json + index.json + transcript.json
-            verify(atLeast = 3) { git.execWithStdin("hash-object", "-w", "--stdin", input = any()) }
+            git.writtenBlobs() shouldHaveAtLeastSize 3
         }
 
         @Test
         fun `flattens children into index entries`() {
             stubGitWritePipeline()
-            every { git.readBranchFile(any(), "index.json") } returns null
 
             val child = makeSummary("child1")
             val parent = makeSummary("parent1", children = listOf(child))
             store.storeSummary(parent)
 
-            // Verify commit was created (index should contain both parent and child entries)
-            // Verify a commit was created (writeFilesToBranch succeeded)
-            verify { git.exec("rev-parse", match { it.startsWith("refs/heads/") }, timeoutSeconds = any()) }
+            // A commit was created (writeFilesToBranch read the branch tip)
+            git.branchTipReads().shouldNotBeEmpty()
         }
     }
 
@@ -311,11 +311,6 @@ class SummaryStoreTest {
         @Test
         fun `creates rebase summary with old as child`() {
             stubGitWritePipeline()
-            every { git.readBranchFile(any(), "index.json") } returns null
-            val writtenBlobs = mutableListOf<String>()
-            every {
-                git.execWithStdin("hash-object", "-w", "--stdin", input = capture(writtenBlobs), timeoutSeconds = any())
-            } returns "blobhash123"
 
             val oldSummary = makeSummary("oldHash", jolliDocId = 42, jolliDocUrl = "https://jolli.ai/42",
                 orphanedDocIds = listOf(7), unresolvedOrphanHashes = listOf("pendingChild"),
@@ -325,9 +320,9 @@ class SummaryStoreTest {
 
             store.migrateOneToOne(oldSummary, newInfo)
 
-            verify { git.exec("rev-parse", match { it.startsWith("refs/heads/") }, timeoutSeconds = any()) }
+            git.branchTipReads().shouldNotBeEmpty()
             val persisted = gson.fromJson(
-                writtenBlobs.first { it.contains("\"commitHash\": \"newHash\"") && it.contains("\"children\"") },
+                git.writtenBlobs().first { it.contains("\"commitHash\": \"newHash\"") && it.contains("\"children\"") },
                 CommitSummary::class.java,
             )
             persisted.orphanedDocIds shouldBe listOf(7)
@@ -344,7 +339,6 @@ class SummaryStoreTest {
         @Test
         fun `merges multiple summaries into squash`() {
             stubGitWritePipeline()
-            every { git.readBranchFile(any(), "index.json") } returns null
 
             val s1 = makeSummary("s1", topics = listOf(TopicSummary("T1", "trigger", "response", "decisions")))
             val s2 = makeSummary("s2", topics = listOf(TopicSummary("T2", "trigger", "response", "decisions")))
@@ -352,13 +346,12 @@ class SummaryStoreTest {
 
             store.mergeManyToOne(listOf(s1, s2), newInfo)
 
-            verify { git.exec("rev-parse", match { it.startsWith("refs/heads/") }, timeoutSeconds = any()) }
+            git.branchTipReads().shouldNotBeEmpty()
         }
 
         @Test
         fun `deduplicates plans by slug keeping newest`() {
             stubGitWritePipeline()
-            every { git.readBranchFile(any(), "index.json") } returns null
 
             val plan1 = PlanReference("p1", "Plan v1", 1, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
             val plan2 = PlanReference("p1", "Plan v2", 2, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")
@@ -368,19 +361,13 @@ class SummaryStoreTest {
 
             store.mergeManyToOne(listOf(s1, s2), newInfo)
 
-            // Verify commit was created
-            // Verify a commit was created (writeFilesToBranch succeeded)
-            verify { git.exec("rev-parse", match { it.startsWith("refs/heads/") }, timeoutSeconds = any()) }
+            // A commit was created (writeFilesToBranch read the branch tip)
+            git.branchTipReads().shouldNotBeEmpty()
         }
 
         @Test
         fun `hoists jolli cleanup metadata while merging summaries`() {
             stubGitWritePipeline()
-            every { git.readBranchFile(any(), "index.json") } returns null
-            val writtenBlobs = mutableListOf<String>()
-            every {
-                git.execWithStdin("hash-object", "-w", "--stdin", input = capture(writtenBlobs), timeoutSeconds = any())
-            } returns "blobhash123"
 
             val older = makeSummary(
                 "s1", jolliDocId = 11, jolliDocUrl = "https://jolli.ai/11",
@@ -397,7 +384,7 @@ class SummaryStoreTest {
             )
 
             val persisted = gson.fromJson(
-                writtenBlobs.first { it.contains("\"commitHash\": \"squashHash\"") && it.contains("\"children\"") },
+                git.writtenBlobs().first { it.contains("\"commitHash\": \"squashHash\"") && it.contains("\"children\"") },
                 CommitSummary::class.java,
             )
             persisted.jolliDocId shouldBe 22
@@ -418,13 +405,13 @@ class SummaryStoreTest {
             val files = listOf(FileWrite("plans/test.md", "# Content"))
             store.storePlanFiles(files, "Store plan")
 
-            verify { git.execWithStdin("hash-object", "-w", "--stdin", input = "# Content") }
+            git.writtenBlobs() shouldContain "# Content"
         }
 
         @Test
         fun `storePlanFiles does nothing for empty list`() {
             store.storePlanFiles(emptyList(), "Empty")
-            verify(exactly = 0) { git.exec("rev-parse", match { it.startsWith("refs/heads/") }, timeoutSeconds = any()) }
+            git.branchTipReads().shouldBeEmpty()
         }
 
         @Test
@@ -432,7 +419,7 @@ class SummaryStoreTest {
             stubGitWritePipeline()
             store.writePlanToBranch("my-plan", "# My Plan", "Save plan")
 
-            verify { git.execWithStdin("hash-object", "-w", "--stdin", input = "# My Plan") }
+            git.writtenBlobs() shouldContain "# My Plan"
         }
     }
 
@@ -449,13 +436,13 @@ class SummaryStoreTest {
 
             store.writeTranscriptBatch(writes, deletes)
 
-            verify { git.exec("rev-parse", match { it.startsWith("refs/heads/") }, timeoutSeconds = any()) }
+            git.branchTipReads().shouldNotBeEmpty()
         }
 
         @Test
         fun `does nothing when both maps empty`() {
             store.writeTranscriptBatch(emptyMap(), emptySet())
-            verify(exactly = 0) { git.exec("rev-parse", match { it.startsWith("refs/heads/") }, timeoutSeconds = any()) }
+            git.branchTipReads().shouldBeEmpty()
         }
     }
 
@@ -470,26 +457,27 @@ class SummaryStoreTest {
 
         @Test
         fun `returns false when no index`() {
-            every { git.readBranchFile(any(), "index.json") } returns null
             store.scanTreeHashAliases(listOf("hash1")) shouldBe false
         }
 
         @Test
         fun `returns false when exec returns null for cat-file`() {
-            // exec returns null for unrecognized hashes (relaxed mock default)
+            // onExec defaults to null — the fake's equivalent of a failing git
+            // command — so cat-file yields no tree hash and no alias is found.
             val index = makeIndex(
                 entries = listOf(makeIndexEntry("original", treeHash = "treehash123")),
             )
-            every { git.readBranchFile(any(), "index.json") } returns gson.toJson(index)
-            // Relaxed mock returns null for exec, so cat-file returns null → no alias found
+            git.files["index.json"] = gson.toJson(index)
             store.scanTreeHashAliases(listOf("newhash")) shouldBe false
         }
 
         @Test
         fun `returns false when no tree hash matches`() {
             val index = makeIndex(entries = listOf(makeIndexEntry("original", treeHash = "treehash123")))
-            every { git.readBranchFile(any(), "index.json") } returns gson.toJson(index)
-            every { git.exec("cat-file", "-p", "newhash", timeoutSeconds = any()) } returns "tree differenthash\nparent abcdef"
+            git.files["index.json"] = gson.toJson(index)
+            git.onExec = { args ->
+                if (args.getOrNull(0) == "cat-file") "tree differenthash\nparent abcdef" else null
+            }
 
             store.scanTreeHashAliases(listOf("newhash")) shouldBe false
         }
@@ -500,7 +488,7 @@ class SummaryStoreTest {
                 entries = listOf(makeIndexEntry("original", treeHash = "treehash123")),
                 aliases = mapOf("newhash" to "original"),
             )
-            every { git.readBranchFile(any(), "index.json") } returns gson.toJson(index)
+            git.files["index.json"] = gson.toJson(index)
 
             store.scanTreeHashAliases(listOf("newhash")) shouldBe false
         }
@@ -508,7 +496,7 @@ class SummaryStoreTest {
         @Test
         fun `returns false when no entries have tree hashes`() {
             val index = makeIndex(entries = listOf(makeIndexEntry("original")))
-            every { git.readBranchFile(any(), "index.json") } returns gson.toJson(index)
+            git.files["index.json"] = gson.toJson(index)
 
             store.scanTreeHashAliases(listOf("newhash")) shouldBe false
         }
@@ -520,26 +508,31 @@ class SummaryStoreTest {
     inner class EnsureOrphanBranch {
         @Test
         fun `creates orphan branch when it does not exist`() {
-            every { git.branchExists(any()) } returns false
-            every { git.readBranchFile(any(), "index.json") } returns null
-            every { git.execWithStdin("hash-object", "-w", "--stdin", input = any()) } returns "blobhash"
-            every { git.execWithStdin("mktree", input = any()) } returns "treehash"
-            every { git.exec("commit-tree", "treehash", "-m", any()) } returns "commithash"
-            every { git.exec("update-ref", any(), "commithash") } returns ""
-            // After creation, the branch now exists for the actual write
-            every { git.exec("rev-parse", match { it.startsWith("refs/heads/") }) } returns "commithash"
-            every { git.exec("rev-parse", match { it.contains("^{tree}") }) } returns "treehash"
-            every { git.exec("ls-tree", any()) } returns ""
-            every { git.exec("ls-tree", any(), any()) } returns ""
-            every { git.exec("commit-tree", any(), "-p", any(), "-m", any()) } returns "newcommit"
-            every { git.exec("update-ref", any(), any()) } returns ""
-            every { git.exec("cat-file", "-p", any()) } returns "tree sometreehash"
+            git.branchPresent = false
+            git.onExecWithStdin = { args, _ ->
+                when (args.firstOrNull()) {
+                    "hash-object" -> "blobhash"
+                    "mktree" -> "treehash"
+                    else -> null
+                }
+            }
+            git.onExec = { args ->
+                when {
+                    // Initial commit-tree has no -p; the write pipeline's does.
+                    args.getOrNull(0) == "commit-tree" -> if (args.getOrNull(2) == "-p") "newcommit" else "commithash"
+                    args.getOrNull(0) == "update-ref" -> ""
+                    args.getOrNull(0) == "rev-parse" && args.getOrNull(1)?.startsWith("refs/heads/") == true -> "commithash"
+                    args.getOrNull(0) == "rev-parse" && args.getOrNull(1)?.contains("^{tree}") == true -> "treehash"
+                    args.getOrNull(0) == "ls-tree" -> ""
+                    args.getOrNull(0) == "cat-file" -> "tree sometreehash"
+                    else -> null
+                }
+            }
 
             store.storeSummary(makeSummary("first"))
 
-            // Should have called commit-tree to create orphan (no parent)
-            // Verify orphan branch creation (mktree was called for initial tree)
-            verify { git.execWithStdin("mktree", input = any(), timeoutSeconds = any()) }
+            // Orphan branch creation wrote its initial tree via mktree
+            git.wroteTree() shouldBe true
         }
     }
 
@@ -552,9 +545,9 @@ class SummaryStoreTest {
             SummaryIndexEntry("older", null, null, null, "msg", "2026-01-10T00:00:00Z", "main", "2026-01-10T00:00:00Z"),
             SummaryIndexEntry("child", "newer", null, null, "msg", "2026-01-15T00:00:00Z", "main", "2026-01-15T00:00:00Z"),
         ))
-        every { git.readBranchFile(any(), "index.json") } returns gson.toJson(index)
-        every { git.readBranchFile(any(), "summaries/newer.json") } returns gson.toJson(makeSummary("newer"))
-        every { git.readBranchFile(any(), "summaries/older.json") } returns gson.toJson(makeSummary("older"))
+        git.files["index.json"] = gson.toJson(index)
+        git.files["summaries/newer.json"] = gson.toJson(makeSummary("newer"))
+        git.files["summaries/older.json"] = gson.toJson(makeSummary("older"))
 
         val result = store.listSummaries()
         result shouldHaveSize 2

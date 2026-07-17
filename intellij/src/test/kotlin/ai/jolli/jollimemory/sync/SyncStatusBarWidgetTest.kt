@@ -6,6 +6,9 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.parallel.Execution
+import org.junit.jupiter.api.parallel.ExecutionMode
+import org.junit.jupiter.api.parallel.Isolated
 
 /**
  * Unit tests for the status-bar widget's render states, focused on
@@ -16,6 +19,17 @@ import org.junit.jupiter.api.Test
  * enough to drive the pure state → text mapping. `statusBar` stays null
  * (install() is never called), so `updateWidget` is a no-op.
  */
+// MockK stays here because IntelliJ's Project is a huge platform interface a
+// hand-written fake cannot reasonably cover. MockK's recorder is process-global
+// and its instrumentation window raced with concurrent tests even under a
+// shared "mockk" ResourceLock (stubs silently vanished — see GitCommands.kt),
+// so mockk users now run @Isolated: the rest of the test plan is suspended
+// while this class executes. Temporary guard — remove when migrated off MockK.
+@Isolated
+// MockK's recorder is JVM-global; @Nested classes are scheduled as independent
+// parallel units, so intra-class concurrency corrupts stubbing too. SAME_THREAD
+// is inherited by all nested classes and serializes this whole file.
+@Execution(ExecutionMode.SAME_THREAD)
 class SyncStatusBarWidgetTest {
 
 	private fun widget(): SyncStatusBarWidget = SyncStatusBarWidget(mockk<Project>(relaxed = true))

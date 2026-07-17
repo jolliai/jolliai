@@ -2,6 +2,7 @@ package ai.jolli.jollimemory.hooks
 
 import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.core.CommitInfo
+import ai.jolli.jollimemory.core.HookEnv
 import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.core.StorageFactory
 import ai.jolli.jollimemory.core.SummaryStore
@@ -16,13 +17,13 @@ object PostRewriteHook {
 
     private val log = JmLogger.create("PostRewriteHook")
 
-    fun run(args: Array<String>) {
-        val cwd = System.getProperty("user.dir")
+    fun run(args: Array<String>, env: HookEnv = HookEnv()) {
+        val cwd = env.userDir.path
         JmLogger.setLogDir(cwd)
         val command = args.getOrNull(0) ?: "unknown"
         log.info("=== Post-rewrite hook started (command: %s) ===", command)
 
-        val input = try { readStdin() } catch (e: Exception) {
+        val input = try { env.readStdin() } catch (e: Exception) {
             log.warn("Failed to read stdin: %s", e.message)
             return
         }

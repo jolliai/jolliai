@@ -1,6 +1,7 @@
 package ai.jolli.jollimemory.hooks
 
 import ai.jolli.jollimemory.core.ClaudeHookInput
+import ai.jolli.jollimemory.core.HookEnv
 import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.core.LogLevel
 import ai.jolli.jollimemory.core.SessionInfo
@@ -19,20 +20,28 @@ import java.time.Instant
  * Invoked by Claude Code when the agent completes a response turn.
  * Receives JSON via stdin, saves session info to sessions.json,
  * then incrementally scans the transcript for references.
+ *
+ * JVM-global dependencies (stdin, env vars) arrive via [HookEnv] and the
+ * session sink via [run]'s `saveSession` parameter, so tests inject fakes
+ * instead of mutating process-wide state. Defaults are the real
+ * implementations — production callers pass a shared env or nothing.
  */
 object StopHook {
 
     private val log = JmLogger.create("StopHook")
     private val gson = Gson()
 
-    fun run() {
+    fun run(
+        env: HookEnv = HookEnv(),
+        saveSession: (SessionInfo, String) -> Unit = SessionTracker::saveSession,
+    ) {
         JmLogger.setLogLevel(LogLevel.debug)
-        val envProjectDir = System.getenv("CLAUDE_PROJECT_DIR")
+        val envProjectDir = env.getenv("CLAUDE_PROJECT_DIR")
         if (envProjectDir != null) JmLogger.setLogDir(envProjectDir)
         log.info("StopHook.run() started (JAR v3 with reference discovery)")
 
         val input = try {
-            readStdin()
+            env.readStdin()
         } catch (e: Exception) {
             log.error("Failed to read stdin: %s", e.message)
             return
@@ -60,7 +69,7 @@ object StopHook {
             source = TranscriptSource.claude,
         )
 
-        SessionTracker.saveSession(sessionInfo, cwd)
+        saveSession(sessionInfo, cwd)
         log.info("Session saved: %s", hookInput.session_id)
 
         try {

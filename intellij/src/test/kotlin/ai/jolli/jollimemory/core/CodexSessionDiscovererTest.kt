@@ -2,8 +2,6 @@ package ai.jolli.jollimemory.core
 
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
-import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
@@ -20,18 +18,8 @@ class CodexSessionDiscovererTest {
 
     @TempDir
     lateinit var tempHome: Path
-    private var originalHome: String? = null
 
-    @BeforeEach
-    fun setUp() {
-        originalHome = System.getProperty("user.home")
-        System.setProperty("user.home", tempHome.toString())
-    }
-
-    @AfterEach
-    fun tearDown() {
-        originalHome?.let { System.setProperty("user.home", it) }
-    }
+    private fun env(): HookEnv = fakeHookEnv(userHome = tempHome.toFile())
 
     /** Writes a Codex rollout file under today's date dir with the given id + optional cwd. */
     private fun writeSession(id: String, cwd: String?) {
@@ -51,7 +39,7 @@ class CodexSessionDiscovererTest {
         writeSession("other-1", "/repo/b") // different repo — must be excluded
         writeSession("nocwd-1", null) // unattributable — must be excluded
 
-        val result = CodexSessionDiscoverer.discoverSessions("/repo/a")
+        val result = CodexSessionDiscoverer.discoverSessions("/repo/a", env())
 
         result shouldHaveSize 1
         result[0].sessionId shouldBe "match-1"
@@ -61,17 +49,17 @@ class CodexSessionDiscovererTest {
     @Test
     fun `normalizes trailing slashes when matching cwd`() {
         writeSession("match-2", "/repo/a/")
-        CodexSessionDiscoverer.discoverSessions("/repo/a") shouldHaveSize 1
+        CodexSessionDiscoverer.discoverSessions("/repo/a", env()) shouldHaveSize 1
     }
 
     @Test
     fun `returns empty when no session belongs to the project`() {
         writeSession("other-2", "/some/other/repo")
-        CodexSessionDiscoverer.discoverSessions("/repo/a") shouldHaveSize 0
+        CodexSessionDiscoverer.discoverSessions("/repo/a", env()) shouldHaveSize 0
     }
 
     @Test
     fun `returns empty when the sessions directory is absent`() {
-        CodexSessionDiscoverer.discoverSessions("/repo/a") shouldHaveSize 0
+        CodexSessionDiscoverer.discoverSessions("/repo/a", env()) shouldHaveSize 0
     }
 }

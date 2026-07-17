@@ -1,6 +1,6 @@
 package ai.jolli.jollimemory.core
 
-import ai.jolli.jollimemory.bridge.GitOps
+import ai.jolli.jollimemory.bridge.GitCommands
 import com.google.gson.GsonBuilder
 
 /**
@@ -12,7 +12,7 @@ import com.google.gson.GsonBuilder
  *
  * Extracted from SummaryStore as part of JOLLI-1309 storage abstraction.
  */
-open class OrphanBranchStorage(private val git: GitOps) : StorageProvider {
+open class OrphanBranchStorage(private val git: GitCommands) : StorageProvider {
 
     private val log = JmLogger.create("OrphanBranchStorage")
     private val gson = GsonBuilder().setPrettyPrinting().create()

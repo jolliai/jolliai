@@ -55,7 +55,10 @@ dependencies {
     hooksRuntime("com.google.code.gson:gson:2.12.1")
     hooksRuntime("org.jetbrains.kotlin:kotlin-stdlib:2.1.20")
     hooksRuntime("org.xerial:sqlite-jdbc:3.49.1.0")
-    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+    // 5.12+ is required for junit.jupiter.extensions.autodetection.exclude — the
+    // filter that keeps the IDE testFramework.jar's global JUnit extensions out
+    // of this suite (see the test task's doFirst below).
+    testImplementation("org.junit.jupiter:junit-jupiter:5.13.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testImplementation("io.mockk:mockk:1.13.16")
     testImplementation("io.kotest:kotest-assertions-core:5.9.1")
@@ -530,20 +533,39 @@ tasks {
         }
     }
 
+    // Global-state gate: fails the build when production code touches JVM
+    // globals outside core/HookEnv.kt, or a test mutates global state (or uses
+    // mockk) without the required guards. Wired as a dependency of `test`, so
+    // it runs on every local test invocation AND in CI (build-intellij.yaml
+    // calls `./gradlew test`) with no extra pipeline step. Ratcheting
+    // baselines live in scripts/; see check-global-state.sh for the rules.
+    val checkGlobalState = register<Exec>("checkGlobalState") {
+        group = "verification"
+        description = "Enforce HookEnv / global-state / mockk-guard rules"
+        commandLine("bash", "scripts/check-global-state.sh")
+        // The gate is a bash script; skip on Windows dev machines (CI is Linux).
+        onlyIf { !System.getProperty("os.name").lowercase().contains("win") }
+    }
+
     test {
         useJUnitPlatform()
-        // Run test classes across several JVMs in parallel. The suite is ~1094 plain
-        // unit tests in one sequential JVM by default (~20 min); separate forks give
-        // full isolation (each fork has its own System.out and mockk global state, so
-        // the System.out-swapping and mockkStatic/mockkObject tests can't race), unlike
-        // in-JVM JUnit parallelism. These are plain unit tests (no IDE boot), so use ALL
-        // available cores, capped at 6 to bound heap on large dev machines. (The old
-        // `processors / 2` left CI's 4-core public runner at 2 forks — a ~20 min run;
-        // full utilization fits comfortably in the 16 GB runner and roughly halves it.)
-        // Partitioning captured output per fork (vs. one shared buffer) also avoids the
-        // Gradle "Could not write XML test results" failure that the serial run hit when a
-        // test emitted a NUL byte that is illegal in XML 1.0. Cuts a full run to ~5 min.
-        maxParallelForks = Runtime.getRuntime().availableProcessors().coerceIn(1, 6)
+        dependsOn(checkGlobalState)
+        // Parallelism now lives INSIDE one JVM: JUnit 5 runs test classes
+        // concurrently on a work-stealing pool (src/test/resources/
+        // junit-platform.properties). This is safe because tests no longer
+        // mutate JVM-global state — global dependencies are injected via
+        // HookEnv (core/HookEnv.kt) and tests pass fakes (TestEnvs.kt);
+        // legacy offenders carry @Isolated until migrated, and
+        // scripts/check-global-state.sh keeps new offenders out. One fork
+        // means a single classloader/JIT warm-up and one heap instead of six.
+        // (History: the previous multi-fork setup existed precisely because
+        // tests swapped System.out / used mockkStatic — that constraint is
+        // being removed at the root. A NUL byte in test output once broke
+        // Gradle's XML report on the serial single-fork run; tests emitting
+        // raw binary to stdout should keep it out of assertions.)
+        maxParallelForks = 1
+        // One heap now hosts N concurrent test classes; size it accordingly.
+        maxHeapSize = "2g"
         javaLauncher.set(
             project.the<JavaToolchainService>().launcherFor {
                 languageVersion.set(JavaLanguageVersion.of(21))
@@ -558,6 +580,30 @@ tasks {
         // elsewhere and keep the pure-logic unit tests green on Windows.
         systemProperty("java.awt.headless", "true")
         systemProperty("sun.java2d.uiScale.enabled", "false")
+        // Keep the IntelliJ platform's auto-detected JUnit5 extensions OUT of
+        // this suite. They are built for serial full-IDE integration tests and
+        // misbehave here: UncaughtExceptionExtension swaps the JVM-global
+        // default uncaught-exception handler (races under parallel execution),
+        // and ThreadLeakTracker fails whatever innocent test happens to finish
+        // while a background thread (e.g. jollimemory-log-writer) is alive —
+        // waiting 10s per check on top.
+        //
+        // "enabled=false" alone CANNOT hold: the IDE's lib/testFramework.jar
+        // ships JUnit5TestEnvironmentInitializer, a LauncherSessionListener
+        // that JUnit loads unconditionally via ServiceLoader (session listeners
+        // ignore the autodetection flag) and that force-resets the property to
+        // "true" from INSIDE the test JVM at session start — after every
+        // Gradle-side write, doFirst included. The line that actually holds is
+        // the exclude filter (JUnit 5.12+): it is applied at extension
+        // registration time and is out of that listener's reach, so the
+        // com.intellij.* extensions stay out even with autodetection forced
+        // on. Keep enabled=false as defence in depth. Both properties are
+        // asserted by JUnitConfigurationGateTest; applied in doFirst so
+        // nothing in the configuration phase can overwrite them.
+        doFirst {
+            systemProperty("junit.jupiter.extensions.autodetection.enabled", "false")
+            systemProperty("junit.jupiter.extensions.autodetection.exclude", "com.intellij.*")
+        }
         // Surface failures (and the full stack trace) in the console; pass `-i` for a
         // live per-test ticker. Deliberately no "passed" event — 1094 lines is noise.
         testLogging {

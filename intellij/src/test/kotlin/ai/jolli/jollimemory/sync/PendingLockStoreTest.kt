@@ -3,9 +3,15 @@ package ai.jolli.jollimemory.sync
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import org.junit.jupiter.api.parallel.ResourceLock
 import java.nio.file.Files
 import java.nio.file.Path
 
+// PendingLockStore.write() names its tmp file after the PID, which every class
+// in the single-JVM parallel run shares — two concurrent writers use the same
+// tmp path and the loser's rename throws NoSuchFileException. The lock
+// serialises this class against SyncEngineTest, the other writer of that file.
+@ResourceLock("pending-lock")
 class PendingLockStoreTest {
 
 	// NOTE: PendingLockStore uses a hardcoded path under ~/.jolli/jollimemory/.

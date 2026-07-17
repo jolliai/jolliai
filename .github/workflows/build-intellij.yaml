@@ -76,16 +76,8 @@ jobs:
         run: npm run build
 
       - if: steps.changes.outputs.relevant == 'true'
-        name: Build plugin
-        run: ./gradlew buildPlugin
-
-      - if: steps.changes.outputs.relevant == 'true'
-        name: Run tests
-        run: ./gradlew test
-
-      - if: steps.changes.outputs.relevant == 'true'
-        name: Run Plugin Verifier
-        run: ./gradlew verifyPlugin
+        name: Build, test, and verify plugin
+        run: ./gradlew buildPlugin test verifyPlugin -x buildSearchableOptions
 
       - if: steps.changes.outputs.relevant == 'true'
         name: Upload plugin artifact

@@ -4,8 +4,6 @@ import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
-import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -16,17 +14,8 @@ import java.time.Instant
 
 class CopilotSupportTest {
 
-	private var originalHome: String? = null
-
-	@BeforeEach
-	fun setup() {
-		originalHome = System.getProperty("user.home")
-	}
-
-	@AfterEach
-	fun teardown() {
-		originalHome?.let { System.setProperty("user.home", it) }
-	}
+	/** Env pinned to macOS so platform-dependent branches are deterministic on any host. */
+	private fun macEnv(home: File): HookEnv = fakeHookEnv(userHome = home, osName = "Mac OS X")
 
 	/** Creates the ~/.copilot/session-store.db with Copilot's schema and seeded rows. */
 	private fun createCopilotDb(home: File): File {
@@ -108,15 +97,13 @@ class CopilotSupportTest {
 
 		@Test
 		fun `isCopilotInstalled false when DB missing`(@TempDir home: File) {
-			System.setProperty("user.home", home.absolutePath)
-			CopilotSupport.isCopilotInstalled() shouldBe false
+			CopilotSupport.isCopilotInstalled(macEnv(home)) shouldBe false
 		}
 
 		@Test
 		fun `isCopilotInstalled true when DB present`(@TempDir home: File) {
-			System.setProperty("user.home", home.absolutePath)
 			createCopilotDb(home)
-			CopilotSupport.isCopilotInstalled() shouldBe true
+			CopilotSupport.isCopilotInstalled(macEnv(home)) shouldBe true
 		}
 	}
 
@@ -125,20 +112,18 @@ class CopilotSupportTest {
 
 		@Test
 		fun `returns empty when DB missing`(@TempDir home: File, @TempDir projectDir: File) {
-			System.setProperty("user.home", home.absolutePath)
-			val result = CopilotSupport.discoverSessions(projectDir.absolutePath)
+			val result = CopilotSupport.discoverSessions(projectDir.absolutePath, macEnv(home))
 			result.sessions.shouldBeEmpty()
 			result.error shouldBe null
 		}
 
 		@Test
 		fun `finds session matching cwd`(@TempDir home: File, @TempDir projectDir: File) {
-			System.setProperty("user.home", home.absolutePath)
 			val db = createCopilotDb(home)
 			val recent = Instant.now().toString()
 			insertSession(db, "s-1", projectDir.absolutePath, recent)
 
-			val result = CopilotSupport.discoverSessions(projectDir.absolutePath)
+			val result = CopilotSupport.discoverSessions(projectDir.absolutePath, macEnv(home))
 			result.sessions.shouldHaveSize(1)
 			result.sessions[0].sessionId shouldBe "s-1"
 			result.sessions[0].source shouldBe TranscriptSource.copilot
@@ -147,34 +132,29 @@ class CopilotSupportTest {
 
 		@Test
 		fun `excludes sessions older than 48 hours`(@TempDir home: File, @TempDir projectDir: File) {
-			System.setProperty("user.home", home.absolutePath)
 			val db = createCopilotDb(home)
 			val old = Instant.now().minusSeconds(49 * 60 * 60).toString()
 			insertSession(db, "stale", projectDir.absolutePath, old)
-			CopilotSupport.discoverSessions(projectDir.absolutePath).sessions.shouldBeEmpty()
+			CopilotSupport.discoverSessions(projectDir.absolutePath, macEnv(home)).sessions.shouldBeEmpty()
 		}
 
 		@Test
 		fun `case-insensitive cwd match on darwin and win32`(@TempDir home: File, @TempDir projectDir: File) {
-			System.setProperty("user.home", home.absolutePath)
 			val db = createCopilotDb(home)
 			val recent = Instant.now().toString()
-			val osName = System.getProperty("os.name").lowercase()
-			val storedCwd = if (osName.contains("mac") || osName.contains("win")) {
-				projectDir.absolutePath.uppercase()
-			} else projectDir.absolutePath
-			insertSession(db, "s-1", storedCwd, recent)
+			// macEnv pins osName to macOS, so the case-insensitive SQL branch is
+			// always taken: a stored cwd differing only by case must still match.
+			insertSession(db, "s-1", projectDir.absolutePath.uppercase(), recent)
 
-			val sessions = CopilotSupport.discoverSessions(projectDir.absolutePath).sessions
+			val sessions = CopilotSupport.discoverSessions(projectDir.absolutePath, macEnv(home)).sessions
 			sessions.shouldHaveSize(1)
 		}
 
 		@Test
 		fun `skips sessions with unparseable updated_at`(@TempDir home: File, @TempDir projectDir: File) {
-			System.setProperty("user.home", home.absolutePath)
 			val db = createCopilotDb(home)
 			insertSession(db, "bad", projectDir.absolutePath, "not-a-date")
-			CopilotSupport.discoverSessions(projectDir.absolutePath).sessions.shouldBeEmpty()
+			CopilotSupport.discoverSessions(projectDir.absolutePath, macEnv(home)).sessions.shouldBeEmpty()
 		}
 	}
 
@@ -183,7 +163,6 @@ class CopilotSupportTest {
 
 		@Test
 		fun `expands turn rows into human-assistant pairs`(@TempDir home: File, @TempDir projectDir: File) {
-			System.setProperty("user.home", home.absolutePath)
 			val db = createCopilotDb(home)
 			val recent = Instant.now().toString()
 			insertSession(db, "s-1", projectDir.absolutePath, recent)
@@ -201,7 +180,6 @@ class CopilotSupportTest {
 
 		@Test
 		fun `skips empty messages`(@TempDir home: File, @TempDir projectDir: File) {
-			System.setProperty("user.home", home.absolutePath)
 			val db = createCopilotDb(home)
 			val recent = Instant.now().toString()
 			insertSession(db, "s-1", projectDir.absolutePath, recent)
@@ -219,7 +197,6 @@ class CopilotSupportTest {
 
 		@Test
 		fun `cursor resumption skips already-consumed turns`(@TempDir home: File, @TempDir projectDir: File) {
-			System.setProperty("user.home", home.absolutePath)
 			val db = createCopilotDb(home)
 			val recent = Instant.now().toString()
 			insertSession(db, "s-1", projectDir.absolutePath, recent)
@@ -235,7 +212,6 @@ class CopilotSupportTest {
 
 		@Test
 		fun `beforeTimestamp stops at first turn past cutoff`(@TempDir home: File, @TempDir projectDir: File) {
-			System.setProperty("user.home", home.absolutePath)
 			val db = createCopilotDb(home)
 			val base = Instant.parse("2026-01-01T00:00:00Z")
 			insertSession(db, "s-1", projectDir.absolutePath, Instant.now().toString())
@@ -253,7 +229,6 @@ class CopilotSupportTest {
 
 		@Test
 		fun `throws on missing synthetic separator`(@TempDir home: File) {
-			System.setProperty("user.home", home.absolutePath)
 			createCopilotDb(home)
 			val ex = try {
 				CopilotSupport.readTranscript("no-hash-here", null)

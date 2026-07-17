@@ -1,6 +1,6 @@
 package ai.jolli.jollimemory.core
 
-import ai.jolli.jollimemory.bridge.GitOps
+import ai.jolli.jollimemory.bridge.GitCommands
 import ai.jolli.jollimemory.core.references.ReferenceStore
 import ai.jolli.jollimemory.core.references.SourceId
 import com.google.gson.Gson
@@ -16,10 +16,10 @@ import java.time.Instant
  * GitOps is still needed for non-storage git operations (e.g. cat-file
  * for tree hash extraction).
  */
-class SummaryStore(private val cwd: String, private val git: GitOps, private val storage: StorageProvider) {
+class SummaryStore(private val cwd: String, private val git: GitCommands, private val storage: StorageProvider) {
 
-    /** Backward-compatible constructor: creates OrphanBranchStorage from GitOps. */
-    constructor(cwd: String, git: GitOps) : this(cwd, git, OrphanBranchStorage(git))
+    /** Backward-compatible constructor: creates OrphanBranchStorage from GitCommands. */
+    constructor(cwd: String, git: GitCommands) : this(cwd, git, OrphanBranchStorage(git))
 
     private val log = JmLogger.create("SummaryStore")
     private val gson: Gson = GsonBuilder().setPrettyPrinting().create()

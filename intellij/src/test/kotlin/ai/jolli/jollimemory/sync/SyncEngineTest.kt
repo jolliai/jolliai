@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.sync
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import org.junit.jupiter.api.parallel.ResourceLock
 import java.io.IOException
 import java.net.URI
 import java.net.http.HttpClient
@@ -22,7 +23,14 @@ import javax.net.ssl.SSLSession
  *
  * Uses a fake [HttpClient] for backend calls and a scripted [ProcessRunner]
  * for git commands to verify the full pipeline without network or git.
+ *
+ * Rounds that mint credentials write the real `~/.jolli/jollimemory/pending-lock.json`
+ * through [PendingLockStore], whose tmp-file name is derived from the PID — shared by
+ * every class in the single-JVM parallel run, so concurrent writers steal each other's
+ * tmp file. The lock serialises this class against [PendingLockStoreTest] only;
+ * everything else stays parallel.
  */
+@ResourceLock("pending-lock")
 class SyncEngineTest {
 
 	@TempDir

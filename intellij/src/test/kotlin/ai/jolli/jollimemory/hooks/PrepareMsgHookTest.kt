@@ -1,7 +1,9 @@
 package ai.jolli.jollimemory.hooks
 
 import ai.jolli.jollimemory.bridge.GitOps
+import ai.jolli.jollimemory.core.HookEnv
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.core.fakeHookEnv
 import io.kotest.matchers.shouldBe
 import io.mockk.every
 import io.mockk.mockkConstructor
@@ -15,15 +17,27 @@ import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
+import org.junit.jupiter.api.parallel.Isolated
+import org.junit.jupiter.api.parallel.Execution
+import org.junit.jupiter.api.parallel.ExecutionMode
 
+// Temporary guard: mockkObject(SessionTracker) + mockkConstructor(GitOps) are
+// still JVM-global swaps. Remove when those collaborators become injectable.
+@Isolated
+// MockK's recorder is JVM-global; @Nested classes are scheduled as independent
+// parallel units, so intra-class concurrency corrupts stubbing too. SAME_THREAD
+// is inherited by all nested classes and serializes this whole file.
+@Execution(ExecutionMode.SAME_THREAD)
 class PrepareMsgHookTest {
 
     @TempDir
     lateinit var tempDir: File
 
+    /** Env whose cwd is the test's temp dir. */
+    private fun env(): HookEnv = fakeHookEnv(userDir = tempDir, userHome = tempDir)
+
     @BeforeEach
     fun setUp() {
-        System.setProperty("user.dir", tempDir.absolutePath)
         File(tempDir, ".jolli/jollimemory").mkdirs()
         File(tempDir, ".git").mkdirs()
         mockkObject(SessionTracker)
@@ -50,7 +64,7 @@ commit abc1234567890123456789012345678901234567890
 commit def4567890123456789012345678901234567890abc
             """.trimIndent())
 
-            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "squash"))
+            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "squash"), env())
 
             val hashesSlot = slot<List<String>>()
             verify { SessionTracker.saveSquashPending(capture(hashesSlot), any(), any()) }
@@ -59,14 +73,14 @@ commit def4567890123456789012345678901234567890abc
 
         @Test
         fun `does nothing when SQUASH_MSG is missing`() {
-            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "squash"))
+            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "squash"), env())
             verify(exactly = 0) { SessionTracker.saveSquashPending(any(), any(), any()) }
         }
 
         @Test
         fun `does nothing when SQUASH_MSG has no hashes`() {
             File(tempDir, ".git/SQUASH_MSG").writeText("Some text without commit hashes")
-            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "squash"))
+            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "squash"), env())
             verify(exactly = 0) { SessionTracker.saveSquashPending(any(), any(), any()) }
         }
     }
@@ -78,7 +92,7 @@ commit def4567890123456789012345678901234567890abc
             val headHash = "headhash123456789012345678901234567890"
             every { anyConstructed<GitOps>().getHeadHash() } returns headHash
 
-            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "commit", headHash))
+            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "commit", headHash), env())
 
             verify { SessionTracker.saveAmendPending(headHash, any()) }
         }
@@ -86,27 +100,27 @@ commit def4567890123456789012345678901234567890abc
         @Test
         fun `does nothing when oldHash differs from HEAD`() {
             every { anyConstructed<GitOps>().getHeadHash() } returns "headhash1234"
-            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "commit", "differenthash"))
+            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "commit", "differenthash"), env())
             verify(exactly = 0) { SessionTracker.saveAmendPending(any(), any()) }
         }
 
         @Test
         fun `does nothing when oldHash is null`() {
-            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "commit"))
+            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "commit"), env())
             verify(exactly = 0) { SessionTracker.saveAmendPending(any(), any()) }
         }
     }
 
     @Test
     fun `does nothing for regular commit source`() {
-        PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "message"))
+        PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "message"), env())
         verify(exactly = 0) { SessionTracker.saveSquashPending(any(), any(), any()) }
         verify(exactly = 0) { SessionTracker.saveAmendPending(any(), any()) }
     }
 
     @Test
     fun `does nothing when source is absent`() {
-        PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG"))
+        PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG"), env())
         verify(exactly = 0) { SessionTracker.saveSquashPending(any(), any(), any()) }
         verify(exactly = 0) { SessionTracker.saveAmendPending(any(), any()) }
     }
@@ -120,7 +134,7 @@ commit def4567890123456789012345678901234567890abc
             File(tempDir, ".git").writeText("gitdir: ${worktreeGitDir.absolutePath}")
             File(worktreeGitDir, "SQUASH_MSG").writeText("commit abc1234567890123456789012345678901234567890")
 
-            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "squash"))
+            PrepareMsgHook.run(arrayOf("COMMIT_EDITMSG", "squash"), env())
 
             verify { SessionTracker.saveSquashPending(any(), any(), any()) }
         }

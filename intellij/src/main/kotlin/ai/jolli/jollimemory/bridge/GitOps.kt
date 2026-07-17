@@ -9,8 +9,12 @@ import java.util.concurrent.TimeUnit
  *
  * Git is universally available on developer machines — no Node.js needed.
  * Uses IntelliJ's bundled git if available, falls back to system git.
+ *
+ * The real (and only production) implementation of [GitCommands]; consumers
+ * that only need that surface depend on the interface so tests can inject a
+ * hand-written fake instead of bytecode-mocking this final class.
  */
-class GitOps(private val projectDir: String) {
+class GitOps(private val projectDir: String) : GitCommands {
 
     private val log = JmLogger.create("GitOps")
 
@@ -122,24 +126,24 @@ class GitOps(private val projectDir: String) {
      * Runs a git command and returns stdout, or null on failure.
      * Delegates to [execWithResult] — use that directly when stderr is needed.
      */
-    fun exec(vararg args: String, timeoutSeconds: Long = 15, trim: Boolean = true): String? {
+    override fun exec(vararg args: String, timeoutSeconds: Long, trim: Boolean): String? {
         val result = execWithResult(*args, timeoutSeconds = timeoutSeconds, trim = trim)
         return if (result.exitCode == 0) result.stdout else null
     }
 
     /** Check if a branch exists. */
-    fun branchExists(branchName: String): Boolean {
+    override fun branchExists(branchName: String): Boolean {
         return exec("rev-parse", "--verify", "refs/heads/$branchName") != null
     }
 
     /** List files in an orphan branch under a prefix. */
-    fun listBranchFiles(branch: String, prefix: String): List<String> {
+    override fun listBranchFiles(branch: String, prefix: String): List<String> {
         val output = exec("ls-tree", "-r", "--name-only", branch, prefix) ?: return emptyList()
         return output.lines().filter { it.isNotBlank() }
     }
 
     /** Read a file from an orphan branch. */
-    fun readBranchFile(branch: String, path: String): String? {
+    override fun readBranchFile(branch: String, path: String): String? {
         return exec("show", "$branch:$path")
     }
 
@@ -166,7 +170,7 @@ class GitOps(private val projectDir: String) {
     }
 
     /** Execute a git command with stdin input and return stdout. */
-    fun execWithStdin(vararg args: String, input: String, timeoutSeconds: Long = 15): String? {
+    override fun execWithStdin(vararg args: String, input: String, timeoutSeconds: Long): String? {
         return try {
             val cmdArgs = mutableListOf("git")
             cmdArgs.addAll(args)
