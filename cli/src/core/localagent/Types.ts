@@ -62,7 +62,13 @@ export class LocalAgentAuthError extends Error {
 	}
 }
 
-/** Timeout / rate-limit / overloaded — safe to retry later. */
+/**
+ * Timeout / rate-limit / overloaded — a transient condition, as opposed to a
+ * setup/auth fault. This labels the failure for the diagnostic message; it does
+ * NOT today drive a distinct retry-later path — the QueueWorker treats every
+ * LLM failure uniformly (one immediate retry, then a "llm-failed" placeholder
+ * the user re-triggers via Regenerate).
+ */
 export class LocalAgentTransientError extends Error {
 	constructor(message: string) {
 		super(message);

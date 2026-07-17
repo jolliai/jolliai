@@ -35,7 +35,7 @@ import type {
 } from "../Types.js";
 import { type AiRelevanceEntry, isEffectivelyExcluded } from "./CommitSelectionStore.js";
 import { execGit, getDiffContent } from "./GitOps.js";
-import { callLlm } from "./LlmClient.js";
+import { callLlm, llmCredentials } from "./LlmClient.js";
 import { toForwardSlash } from "./PathUtils.js";
 import { resolveModelId } from "./Summarizer.js";
 
@@ -397,6 +397,18 @@ export async function rankContextRelevance(
 ): Promise<ContextRelevanceResult[]> {
 	if (items.length === 0) return [];
 
+	// The ranker is a latency-sensitive, fail-open optimization: its short
+	// RANK_TIMEOUT_MS exists so a wedged call never holds the post-commit queue
+	// lock. A local CLI agent runs a full multi-minute agentic turn, so under the
+	// local-agent provider this call could never finish inside that budget — it
+	// would cold-spawn `claude` only to be SIGKILLed on every commit. Skip
+	// straight to the conservative keep-all result (identical to the fail-open
+	// branch below) without spawning anything.
+	if (opts.config.aiProvider === "local-agent") {
+		log.info("Skipping context-relevance ranking under local-agent provider — keeping all items");
+		return keepAll(items);
+	}
+
 	try {
 		const { block, indexToId } = buildItemsBlock(items, opts.totalBudget ?? TOTAL_ITEMS_CHAR_BUDGET);
 		const llmResult = await callLlm({
@@ -404,10 +416,8 @@ export async function rankContextRelevance(
 			params: { changeSignal: buildChangeBlock(change), items: block },
 			maxTokens: RANK_MAX_TOKENS,
 			timeoutMs: opts.timeoutMs ?? RANK_TIMEOUT_MS,
-			apiKey: opts.config.apiKey,
 			model: resolveModelId(opts.config.model),
-			jolliApiKey: opts.config.jolliApiKey,
-			aiProvider: opts.config.aiProvider,
+			...llmCredentials(opts.config),
 		});
 		const parsed = parseRankContextResponse(llmResult.text ?? "");
 

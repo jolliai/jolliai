@@ -1,6 +1,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { LOCAL_AGENT_CHILD_ENV } from "../AgentReentry.js";
 import { resolveClaudeExecutable } from "./ClaudeExecutableResolver.js";
 import {
 	type Invocation,
@@ -62,6 +63,11 @@ export class ClaudeCodeBackend implements LocalAgentBackend {
 	buildInvocation(exe: ResolvedExecutable, req: LocalAgentRequest): Invocation {
 		const env: NodeJS.ProcessEnv = { ...process.env };
 		for (const key of SCRUBBED_ENV_VARS) delete env[key];
+		// Mark the child (and everything IT spawns — hooks inherit env) as a
+		// jollimemory-spawned agent, so jollimemory's own Claude integration
+		// (SessionStart/Stop hooks, `jolli enable`, MCP storage init) no-ops
+		// instead of re-entering against this throwaway temp cwd. See AgentReentry.
+		env[LOCAL_AGENT_CHILD_ENV] = "1";
 		// Fresh empty cwd: `claude` auto-discovers a CLAUDE.md from cwd and folds
 		// it into the system prompt. Running in the repo would inject the repo's
 		// CLAUDE.md — polluting the summary and burning tokens. An empty temp dir
@@ -106,9 +112,19 @@ export class ClaudeCodeBackend implements LocalAgentBackend {
 		}
 		if (env.is_error) {
 			const status = env.api_error_status ?? 0;
-			const msg = `Claude Code returned an error (status ${status}): ${env.result ?? env.subtype ?? "unknown"}`;
+			const detail = env.result ?? env.subtype ?? "unknown";
+			const msg = `Claude Code returned an error (status ${status}): ${detail}`;
 			if (status === 401 || status === 403) throw new LocalAgentAuthError(msg);
 			if (status === 429 || (status >= 500 && status < 600)) throw new LocalAgentTransientError(msg);
+			// A not-signed-in failure in print+json mode surfaces as an is_error
+			// envelope, sometimes WITHOUT an HTTP status (a local "run `claude` to
+			// log in" rather than a proxied 401). Detect the stable auth phrasings
+			// so the user gets sign-in guidance instead of a generic setup error.
+			// Both classes are non-retryable, so a miss only degrades the message,
+			// never the queue's retry decision.
+			if (/log ?in|logged in|unauthori|authenticat|invalid api key/i.test(detail)) {
+				throw new LocalAgentAuthError(msg);
+			}
 			throw new LocalAgentSetupError(msg);
 		}
 		const usage = env.usage ?? {};

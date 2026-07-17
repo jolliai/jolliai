@@ -29,11 +29,15 @@ export function registerCompileCommand(opts: CompileCommandOpts): vscode.Disposa
 		const { sidebarProvider } = opts;
 
 		const { loadConfig } = await import("../../cli/src/core/SessionTracker.js");
+		const { resolveLlmCredentialSource } = await import("../../cli/src/core/LlmClient.js");
 		const config = await loadConfig();
-		if (!config.apiKey && !config.jolliApiKey && !process.env.ANTHROPIC_API_KEY) {
-			log.info("CompileCommand", "No API key configured — showing info message");
+		// Gate on a usable generation path, not on a raw key: the Local Agent provider
+		// generates through the agent tool's own login and holds no API key, so a
+		// key-only check would wrongly block it. Mirrors the CLI compile gate.
+		if (resolveLlmCredentialSource(config) === null) {
+			log.info("CompileCommand", "No usable LLM provider — showing info message");
 			await vscode.window.showInformationMessage(
-				"Building the knowledge wiki needs an API key. Open Settings → Memory Bank to sign in or configure a key, then try again.",
+				"Building the knowledge wiki needs an AI provider. Open Settings → Memory Bank to sign in, configure a key, or select the Local Agent, then try again.",
 			);
 			return;
 		}

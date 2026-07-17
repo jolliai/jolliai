@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { callLlm } = vi.hoisted(() => ({ callLlm: vi.fn() }));
-vi.mock("../core/LlmClient.js", () => ({ callLlm }));
+vi.mock("../core/LlmClient.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../core/LlmClient.js")>()),
+	callLlm,
+}));
 vi.mock("../core/Summarizer.js", () => ({ resolveModelId: (m?: string) => m ?? "model" }));
 
 import { type DistillInput, distillGraph, distillGraphIncremental } from "./GraphDistiller.js";

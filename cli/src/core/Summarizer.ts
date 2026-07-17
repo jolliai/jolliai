@@ -28,7 +28,7 @@ import type {
 	TopicImportance,
 	TopicSummary,
 } from "../Types.js";
-import { callLlm } from "./LlmClient.js";
+import { callLlm, llmCredentials } from "./LlmClient.js";
 
 const log = createLogger("Summarizer");
 
@@ -170,10 +170,8 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 		action: "summarize",
 		params: sharedParams,
 		maxTokens: DEFAULT_MAX_TOKENS,
-		apiKey: config.apiKey,
 		model: resolveModelId(config.model),
-		jolliApiKey: config.jolliApiKey,
-		aiProvider: config.aiProvider,
+		...llmCredentials(config),
 	});
 
 	// Parse raw LLM text (both direct and proxy modes return raw text)
@@ -220,10 +218,8 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 					previousResponse: truncateForRetry(responseText),
 				},
 				maxTokens: DEFAULT_MAX_TOKENS,
-				apiKey: config.apiKey,
 				model: resolveModelId(config.model),
-				jolliApiKey: config.jolliApiKey,
-				aiProvider: config.aiProvider,
+				...llmCredentials(config),
 			});
 			const retryText = retryResult.text ?? "";
 			log.debug("=== LLM strict-retry response START ===");
@@ -707,10 +703,8 @@ export async function generateCommitMessage(params: CommitMessageParams): Promis
 			fileList,
 		},
 		maxTokens: 256,
-		apiKey: config.apiKey,
 		model: resolveModelId(config.model),
-		jolliApiKey: config.jolliApiKey,
-		aiProvider: config.aiProvider,
+		...llmCredentials(config),
 	});
 
 	const message = (llmResult.text ?? "").trim().replace(/^["']|["']$/g, "");
@@ -786,10 +780,8 @@ export async function generateSquashMessage(params: SquashMessageParams): Promis
 		action: "squash-message",
 		params: { ticketLine, commitsBlock, scopeLine },
 		maxTokens: 256,
-		apiKey: config.apiKey,
 		model: resolveModelId(config.model),
-		jolliApiKey: config.jolliApiKey,
-		aiProvider: config.aiProvider,
+		...llmCredentials(config),
 	});
 
 	const message = (llmResult.text ?? "").trim().replace(/^["']|["']$/g, "");
@@ -955,10 +947,8 @@ export async function generateE2eTest(params: E2eTestParams): Promise<ReadonlyAr
 			diff: params.diff,
 		},
 		maxTokens: DEFAULT_MAX_TOKENS,
-		apiKey: config.apiKey,
 		model: resolveModelId(config.model),
-		jolliApiKey: config.jolliApiKey,
-		aiProvider: config.aiProvider,
+		...llmCredentials(config),
 	});
 
 	const scenarios = parseE2eTestResponse(llmResult.text ?? "");
@@ -1038,10 +1028,8 @@ export async function generateRecap(params: RecapParams): Promise<string> {
 			topicsSummary,
 		},
 		maxTokens: DEFAULT_MAX_TOKENS,
-		apiKey: config.apiKey,
 		model: resolveModelId(config.model),
-		jolliApiKey: config.jolliApiKey,
-		aiProvider: config.aiProvider,
+		...llmCredentials(config),
 	});
 
 	const recap = parseRecapResponse(llmResult.text ?? "");
@@ -1071,10 +1059,8 @@ export async function translateToEnglish(params: TranslateParams): Promise<strin
 		action: "translate",
 		params: { content: params.content },
 		maxTokens: DEFAULT_MAX_TOKENS,
-		apiKey: config.apiKey,
 		model: resolveModelId(config.model),
-		jolliApiKey: config.jolliApiKey,
-		aiProvider: config.aiProvider,
+		...llmCredentials(config),
 	});
 
 	return llmResult.text ?? "";
@@ -1402,10 +1388,8 @@ export async function generateSquashConsolidation(
 			action,
 			params: { ...baseParams, ...extraParams },
 			maxTokens: DEFAULT_MAX_TOKENS,
-			apiKey: config.apiKey,
 			model: resolveModelId(config.model),
-			jolliApiKey: config.jolliApiKey,
-			aiProvider: config.aiProvider,
+			...llmCredentials(config),
 		});
 		const responseText = llmResult.text ?? "";
 		log.debug("=== %s raw response START ===", action);

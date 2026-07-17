@@ -8,6 +8,8 @@ import {
 	DIRECT_FETCH_TIMEOUT_MS,
 	isLlmCredentialError,
 	LlmCredentialError,
+	llmCredentials,
+	llmFanoutLimit,
 	NO_LLM_PROVIDER_MESSAGE,
 	NONSTREAM_MAX_OUTPUT_TOKENS,
 	NONSTREAM_MAX_PROMPT_CHARS,
@@ -1321,6 +1323,48 @@ describe("LlmClient", () => {
 		});
 	});
 
+	describe("llmCredentials", () => {
+		it("carries all credential dimensions, including the local-agent fields", () => {
+			expect(
+				llmCredentials({
+					apiKey: "sk-ant-x",
+					jolliApiKey: "sk-jol-y",
+					aiProvider: "local-agent",
+					localAgentTool: "claude-code",
+					localAgentPath: "/custom/claude",
+				}),
+			).toEqual({
+				apiKey: "sk-ant-x",
+				jolliApiKey: "sk-jol-y",
+				aiProvider: "local-agent",
+				localAgentTool: "claude-code",
+				localAgentPath: "/custom/claude",
+			});
+		});
+
+		it("passes undefined fields through untouched", () => {
+			expect(llmCredentials({ apiKey: "sk-ant-x" })).toEqual({
+				apiKey: "sk-ant-x",
+				jolliApiKey: undefined,
+				aiProvider: undefined,
+				localAgentTool: undefined,
+				localAgentPath: undefined,
+			});
+		});
+	});
+
+	describe("llmFanoutLimit", () => {
+		it("keeps the caller's limit for API/proxy providers", () => {
+			expect(llmFanoutLimit(4, { aiProvider: "anthropic" })).toBe(4);
+			expect(llmFanoutLimit(4, { aiProvider: "jolli" })).toBe(4);
+			expect(llmFanoutLimit(4, {})).toBe(4);
+		});
+
+		it("serializes to 1 under local-agent so N-wide fan-out never spawns N CLI turns", () => {
+			expect(llmFanoutLimit(4, { aiProvider: "local-agent" })).toBe(1);
+		});
+	});
+
 	// Dispatch-site logging — every callLlm leaves a single info trace
 	// identifying the resolved provider, so users can grep `debug.log` after
 	// a commit and verify Settings UI's choice was actually honored. Pinned
@@ -1502,6 +1546,38 @@ describe("callLlm — local-agent", () => {
 				__localAgentRun: async () => "ignored",
 			}),
 		).rejects.toThrow('Unknown LLM action: "unknown-action"');
+	});
+
+	it("forwards the configured localAgentPath to discoverExecutable (regression: override was dropped)", async () => {
+		let seenOverride: string | undefined = "UNSET";
+		const stub: LocalAgentBackend = {
+			id: "claude-code",
+			discoverExecutable: async (overridePath?: string) => {
+				seenOverride = overridePath;
+				return { file: overridePath ?? "/x/claude", version: "2.1.210" };
+			},
+			buildInvocation: () => ({ file: "/x/claude", args: [], stdin: "P", env: {}, cwd: "/tmp" }),
+			parseResult: () => ({
+				text: "OK",
+				inputTokens: 0,
+				outputTokens: 0,
+				cachedTokens: 0,
+				costUsd: 0,
+				stopReason: "end_turn",
+			}),
+		};
+		registerBackend(stub);
+
+		await callLlm({
+			action: "recap",
+			params: { branch: "main", summaries: "x" },
+			aiProvider: "local-agent",
+			localAgentTool: "claude-code",
+			localAgentPath: "/custom/path/to/claude",
+			__localAgentRun: async () => "ignored-by-stub",
+		});
+
+		expect(seenOverride).toBe("/custom/path/to/claude");
 	});
 
 	describe("temp cwd cleanup", () => {

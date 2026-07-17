@@ -88,6 +88,20 @@ describe("SessionStartHook", () => {
 
 	// ─── Skip conditions ────────────────────────────────────────────────────
 
+	it("should no-op when spawned by the local-agent backend (re-entry guard)", async () => {
+		process.env.JOLLI_LOCAL_AGENT_CHILD = "1";
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		try {
+			await main();
+			// Bails before resolving the branch — no briefing, no self-recursion.
+			expect(mockExecFileSync).not.toHaveBeenCalled();
+			expect(writeSpy).not.toHaveBeenCalled();
+		} finally {
+			writeSpy.mockRestore();
+			delete process.env.JOLLI_LOCAL_AGENT_CHILD;
+		}
+	});
+
 	it("should skip main/master/develop branches", async () => {
 		mockExecFileSync.mockReturnValue("main\n" as never);
 		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);

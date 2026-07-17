@@ -81,14 +81,26 @@ describe("registerCompileCommand", () => {
 		expect(ids).toContain("jollimemory.compileNow");
 	});
 
-	it("shows info and skips compile when no API key", async () => {
+	it("shows info and skips compile when no usable provider", async () => {
 		mockLoadConfig.mockResolvedValue({ localFolder: "/mb" });
 		registerCompileCommand(makeOpts());
 
 		await registeredHandlers.get("jollimemory.compileNow")?.();
 
-		expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("API key"));
+		expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("AI provider"));
 		expect(mockCompileAllRepos).not.toHaveBeenCalled();
+	});
+
+	it("compiles when the Local Agent provider is selected without any API key", async () => {
+		// Local Agent generates through the agent tool's own login — a key-only gate
+		// would wrongly block it. resolveLlmCredentialSource honors the choice.
+		mockLoadConfig.mockResolvedValue({ aiProvider: "local-agent", localFolder: "/mb" });
+		registerCompileCommand(makeOpts());
+
+		await registeredHandlers.get("jollimemory.compileNow")?.();
+
+		expect(mockCompileAllRepos).toHaveBeenCalled();
+		expect(showInformationMessage).not.toHaveBeenCalledWith(expect.stringContaining("AI provider"));
 	});
 
 	it("shows info and skips compile when no localFolder", async () => {

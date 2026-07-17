@@ -79,6 +79,10 @@ export function runInvocation(inv: Invocation, opts: RunOpts = {}): Promise<stri
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			// Flush any bytes the decoder buffered mid-codepoint so the last
+			// (often most relevant) character of the error message survives in the
+			// tail instead of being silently dropped.
+			stderr = (stderr + stderrDecoder.end()).slice(-STDERR_TAIL_MAX_CHARS);
 			if (code === 0) {
 				resolve(Buffer.concat(stdoutChunks).toString("utf8"));
 			} else {

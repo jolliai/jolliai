@@ -38,6 +38,7 @@ import {
 } from "../../cli/src/core/SessionTracker.js";
 import { createStorage } from "../../cli/src/core/StorageFactory.js";
 import type { StorageProvider } from "../../cli/src/core/StorageProvider.js";
+import { resolveLlmCredentialSource } from "../../cli/src/core/LlmClient.js";
 import {
 	generateCommitMessage,
 	generateSquashMessage,
@@ -1709,7 +1710,11 @@ export class JolliMemoryBridge {
 		hashes: ReadonlyArray<string>,
 	): Promise<string> {
 		const config = await loadGlobalConfig();
-		if (!config.apiKey && !config.jolliApiKey) {
+		// Gate on a usable generation path, not on a raw key: the Local Agent provider
+		// generates through the agent tool's own login and holds no API key, so a
+		// key-only check would silently drop the LLM squash path for it. The backing
+		// generateSquashMessage routes through callLlm, which supports local-agent.
+		if (resolveLlmCredentialSource(config) === null) {
 			log.warn(
 				"bridge",
 				"No LLM provider — falling back to string-merge squash message",

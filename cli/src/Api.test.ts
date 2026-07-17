@@ -328,6 +328,15 @@ vi.mock("./hooks/QueueWorker.js", () => ({
 	launchWorker: vi.fn(),
 }));
 
+// Doctor's local-agent liveness probe calls getBackend(...).discoverExecutable().
+// Mock the registry so the probe is deterministic instead of shelling out to a
+// real `claude` binary that may or may not exist on the test host. registerBackend
+// is stubbed too since LlmClient registers the real backend at module load.
+vi.mock("./core/localagent/BackendRegistry.js", () => ({
+	getBackend: vi.fn(),
+	registerBackend: vi.fn(),
+}));
+
 vi.mock("./core/StorageFactory.js", () => ({
 	createStorage: vi.fn().mockResolvedValue({
 		readFile: vi.fn().mockResolvedValue(null),
@@ -791,6 +800,19 @@ describe("CLI", () => {
 		it("should pass cwd to install", async () => {
 			await main(["enable", "--cwd", "/tmp/test-project"]);
 			expect(vi.mocked(install)).toHaveBeenCalledWith("/tmp/test-project", { source: "cli" });
+		});
+
+		it("should no-op when spawned by the local-agent backend (re-entry guard)", async () => {
+			process.env.JOLLI_LOCAL_AGENT_CHILD = "1";
+			try {
+				await main(["enable"]);
+				// The jolli plugin's SessionStart hook runs `jolli enable` inside the
+				// nested claude's temp cwd — installing there would claim a junk
+				// Memory Bank repo. Guard bails before install().
+				expect(install).not.toHaveBeenCalled();
+			} finally {
+				delete process.env.JOLLI_LOCAL_AGENT_CHILD;
+			}
 		});
 	});
 
@@ -3301,8 +3323,8 @@ describe("CLI", () => {
 		});
 
 		it("should run promptSetup after install when interactive", async () => {
-			// Choose "3" (skip), then skip Anthropic key
-			mockUserInput("3", "");
+			// Choose "4" (skip), then skip Anthropic key
+			mockUserInput("4", "");
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 
@@ -3363,8 +3385,8 @@ describe("CLI", () => {
 		});
 
 		it("should display no-API-keys warning when setup is skipped", async () => {
-			// Choose "3" (skip), then skip Anthropic key
-			mockUserInput("3", "");
+			// Choose "4" (skip), then skip Anthropic key
+			mockUserInput("4", "");
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 			const origKey = process.env.ANTHROPIC_API_KEY;
@@ -3378,6 +3400,31 @@ describe("CLI", () => {
 			} finally {
 				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
 				if (origKey !== undefined) process.env.ANTHROPIC_API_KEY = origKey;
+			}
+		});
+
+		it("should select the Local Agent provider on choice 3 (no key, no Anthropic prompt)", async () => {
+			const { saveConfigScoped } = await import("./core/SessionTracker.js");
+			// Choose "3" (Local Agent). No further input — a fallthrough to the
+			// Anthropic prompt would hang on a missing second answer, so reaching the
+			// end proves the self-sufficient early return.
+			mockUserInput("3");
+			mockExistsSync.mockReturnValue(false);
+			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+
+			try {
+				await main(["enable"]);
+
+				expect(saveConfigScoped).toHaveBeenCalledWith(
+					expect.objectContaining({ aiProvider: "local-agent", localAgentTool: "claude-code" }),
+					expect.any(String),
+				);
+				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+				expect(calls.some((s) => s.includes("Local Agent (Claude Code subscription)"))).toBe(true);
+				// Self-sufficient: the Anthropic-key prompt must NOT run.
+				expect(calls.some((s) => s.includes("Anthropic API Key"))).toBe(false);
+			} finally {
+				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
 			}
 		});
 
@@ -4036,6 +4083,8 @@ describe("CLI", () => {
 				lockStale?: boolean;
 				activeQueue?: number;
 				apiKey?: string;
+				/** Full config override; when set, replaces the apiKey-only default. */
+				config?: Record<string, unknown>;
 				orphanBranch?: boolean;
 				/** Per-source registry entries. Empty array = no sources registered. */
 				distPaths?: Array<{ source: string; version: string; distDir: string; available: boolean }>;
@@ -4079,7 +4128,9 @@ describe("CLI", () => {
 			});
 			vi.mocked(isWorkerLockStale).mockResolvedValue(overrides.lockStale ?? false);
 			vi.mocked(countActiveQueueEntries).mockResolvedValue(overrides.activeQueue ?? 0);
-			vi.mocked(loadConfig).mockResolvedValue(overrides.apiKey ? { apiKey: overrides.apiKey } : {});
+			vi.mocked(loadConfig).mockResolvedValue(
+				overrides.config ?? (overrides.apiKey ? { apiKey: overrides.apiKey } : {}),
+			);
 			vi.mocked(loadAllSessions).mockResolvedValue([]);
 			vi.mocked(orphanBranchExists).mockResolvedValue(overrides.orphanBranch ?? true);
 			// Default: one healthy `dist-paths/cli` entry. Tests can override.
@@ -4149,6 +4200,36 @@ describe("CLI", () => {
 				if (original === undefined) delete process.env.ANTHROPIC_API_KEY;
 				else process.env.ANTHROPIC_API_KEY = original;
 			}
+		});
+
+		it("should probe the local-agent binary and report it OK when resolvable", async () => {
+			const { getBackend } = await import("./core/localagent/BackendRegistry.js");
+			vi.mocked(getBackend).mockReturnValue({
+				id: "claude-code",
+				discoverExecutable: vi.fn().mockResolvedValue({ file: "/usr/local/bin/claude", version: "2.1.210" }),
+				buildInvocation: vi.fn(),
+				parseResult: vi.fn(),
+			});
+			const output = (await runDoctor(["doctor"], { config: { aiProvider: "local-agent" } })).join("\n");
+			expect(output).toContain("✓ Config");
+			expect(output).toContain("local agent (Claude Code subscription)");
+			expect(output).toContain("✓ Local agent CLI");
+			expect(output).toContain("/usr/local/bin/claude (v2.1.210)");
+		});
+
+		it("should fail the local-agent check when the binary cannot be resolved", async () => {
+			const { getBackend } = await import("./core/localagent/BackendRegistry.js");
+			vi.mocked(getBackend).mockReturnValue({
+				id: "claude-code",
+				discoverExecutable: vi.fn().mockRejectedValue(new Error("No compatible Claude Code CLI found.")),
+				buildInvocation: vi.fn(),
+				parseResult: vi.fn(),
+			});
+			const output = (await runDoctor(["doctor"], { config: { aiProvider: "local-agent" } })).join("\n");
+			// Config is still "selected" (green), but the liveness probe fails loudly.
+			expect(output).toContain("✓ Config");
+			expect(output).toContain("✗ Local agent CLI");
+			expect(output).toContain("No compatible Claude Code CLI found.");
 		});
 
 		it("should warn when orphan branch does not exist", async () => {
@@ -5692,7 +5773,9 @@ describe("CLI", () => {
 		it("should print non-interactive config guide with --yes flag", async () => {
 			await main(["enable", "--yes", "--cwd", "/tmp/test-project"]);
 
-			expect(console.log).toHaveBeenCalledWith(expect.stringContaining("Configure API keys"));
+			expect(console.log).toHaveBeenCalledWith(expect.stringContaining("Configure a provider to enable"));
+			// The guide now surfaces the keyless local-agent path too.
+			expect(console.log).toHaveBeenCalledWith(expect.stringContaining('"aiProvider": "local-agent"'));
 		});
 
 		it("should print gemini settings path when present", async () => {

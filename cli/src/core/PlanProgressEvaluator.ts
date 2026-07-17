@@ -13,7 +13,7 @@
 
 import { createLogger } from "../Logger.js";
 import type { JolliMemoryConfig, LlmCallMetadata, PlanProgressEvalResult, PlanStep, TopicSummary } from "../Types.js";
-import { callLlm } from "./LlmClient.js";
+import { callLlm, llmCredentials } from "./LlmClient.js";
 import { resolveModelId } from "./Summarizer.js";
 
 const log = createLogger("PlanProgressEvaluator");
@@ -81,10 +81,8 @@ export async function evaluatePlanProgress(
 				conversation,
 			},
 			maxTokens: MAX_TOKENS,
-			apiKey: config.apiKey,
 			model: resolveModelId(config.model ?? "haiku"),
-			jolliApiKey: config.jolliApiKey,
-			aiProvider: config.aiProvider,
+			...llmCredentials(config),
 		});
 	} catch (error: unknown) {
 		log.warn("Plan progress LLM call failed: %s", (error as Error).message);

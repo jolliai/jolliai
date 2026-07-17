@@ -186,6 +186,8 @@ async function generateAndStore(
 		model?: string;
 		jolliApiKey?: string;
 		aiProvider?: "anthropic" | "jolli" | "local-agent";
+		localAgentTool?: "claude-code";
+		localAgentPath?: string;
 	},
 	storage: StorageProvider,
 ): Promise<number> {
@@ -307,6 +309,8 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 		model: config.model,
 		jolliApiKey: config.jolliApiKey,
 		aiProvider: config.aiProvider,
+		localAgentTool: config.localAgentTool,
+		localAgentPath: config.localAgentPath,
 	};
 	const credsOk = hasLlmCredentials(config);
 

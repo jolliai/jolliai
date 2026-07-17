@@ -26,6 +26,9 @@ interface ResolveOpts {
 	readonly probe?: ProbeFn;
 	readonly candidates?: () => string[];
 	readonly now?: () => number;
+	/** Test seam; defaults to `process.platform`. Selects `which` vs `where`
+	 * discovery and the POSIX vs `.exe` candidate shape. */
+	readonly platform?: NodeJS.Platform;
 }
 
 // Cache is keyed by the override path (empty string = default PATH discovery)
@@ -39,17 +42,19 @@ export function __resetResolverCacheForTest(): void {
 	cached = null;
 }
 
-/** Default candidate enumeration: `which -a claude` + known install locations. */
-function defaultCandidates(): string[] {
+/** Splits command output into trimmed, non-empty lines (CRLF-safe). */
+function toLines(out: string): string[] {
+	return out
+		.split("\n")
+		.map((l) => l.trim())
+		.filter(Boolean);
+}
+
+/** POSIX candidates: `which -a claude` + known extensionless install locations. */
+function posixCandidates(): string[] {
 	const found: string[] = [];
 	try {
-		const out = execFileSyncHidden("which", ["-a", "claude"], { encoding: "utf8" });
-		for (const line of out
-			.split("\n")
-			.map((l) => l.trim())
-			.filter(Boolean)) {
-			found.push(line);
-		}
+		found.push(...toLines(execFileSyncHidden("which", ["-a", "claude"], { encoding: "utf8" })));
 	} catch {
 		// `which` miss is not fatal — fall through to known locations.
 	}
@@ -57,6 +62,38 @@ function defaultCandidates(): string[] {
 		if (existsSync(p)) found.push(p);
 	}
 	return [...new Set(found)];
+}
+
+/**
+ * Windows candidates: `where claude` + known install locations, filtered to
+ * `.exe` only.
+ *
+ * `where` (not POSIX `which`) is the native PATH lookup and returns real Windows
+ * paths with extensions. We keep ONLY `.exe`: since CVE-2024-27980, Node's
+ * execFile/spawn reject `.cmd`/`.bat` launchers without `shell: true` (EINVAL),
+ * and an extensionless shim isn't resolved through `PATHEXT` (ENOENT). Both the
+ * capability probe here and the real run in LocalAgentRunner spawn with no shell,
+ * so a non-`.exe` candidate would be discovered only to fail at spawn — and
+ * routing dynamic prompt args through a shell to accept `.cmd` would open an
+ * injection surface. So an npm-installed `claude.cmd`-only setup is intentionally
+ * not auto-discovered; such users point `localAgentPath` at a real `.exe`.
+ */
+function windowsCandidates(): string[] {
+	const found: string[] = [];
+	try {
+		found.push(...toLines(execFileSyncHidden("where", ["claude"], { encoding: "utf8" })));
+	} catch {
+		// `where` exits non-zero when nothing matches — not fatal.
+	}
+	for (const p of [join(homedir(), ".local/bin/claude.exe"), join(homedir(), ".claude/local/claude.exe")]) {
+		if (existsSync(p)) found.push(p);
+	}
+	return [...new Set(found.filter((f) => f.toLowerCase().endsWith(".exe")))];
+}
+
+/** Default candidate enumeration, platform-dispatched. */
+function defaultCandidates(platform: NodeJS.Platform): string[] {
+	return platform === "win32" ? windowsCandidates() : posixCandidates();
 }
 
 /** Default probe: run the capability args via execFile (never shell). */
@@ -96,7 +133,8 @@ export function resolveClaudeExecutable(opts: ResolveOpts = {}): ResolvedExecuta
 	if (cached && cached.key === cacheKey && now() - cached.at < RESOLUTION_CACHE_TTL_MS) return cached.result;
 
 	const probe = opts.probe ?? defaultProbe;
-	const list = opts.overridePath ? [opts.overridePath] : (opts.candidates ?? defaultCandidates)();
+	const platform = opts.platform ?? process.platform;
+	const list = opts.overridePath ? [opts.overridePath] : (opts.candidates ?? (() => defaultCandidates(platform)))();
 
 	let best: ResolvedExecutable | null = null;
 	for (const file of list) {
