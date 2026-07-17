@@ -77,6 +77,13 @@ export const MODEL_PRICES: Readonly<Record<string, ModelPrice>> = {
 	"claude-sonnet-4-6": { provider: "anthropic", inputPerMTok: 3, outputPerMTok: 15, cachedPerMTok: 3.75 },
 	"claude-sonnet-4-5": { provider: "anthropic", inputPerMTok: 3, outputPerMTok: 15, cachedPerMTok: 3.75 },
 	"claude-haiku-4-5": { provider: "anthropic", inputPerMTok: 1, outputPerMTok: 5, cachedPerMTok: 1.25 },
+	// Date-suffixed twin of the row above. Two lookups reach this key: the compile
+	// estimate resolves the `haiku` alias to this exact id (see MODEL_ALIAS_MAP in
+	// Summarizer), and an agent transcript that ran Haiku records it verbatim.
+	// Without the entry both fall through — the estimate to the sonnet fallback
+	// (~3× over) and the transcript cost to "unpriced". opus/sonnet aliases resolve
+	// to un-suffixed ids already in the table, so only haiku needs the twin today.
+	"claude-haiku-4-5-20251001": { provider: "anthropic", inputPerMTok: 1, outputPerMTok: 5, cachedPerMTok: 1.25 },
 	// ── OpenAI / Codex (PROVISIONAL — re-verify before shipping) ──────────────
 	// cached = cache-read rate (~0.1× input). gpt-5.4 / gpt-5.5 are post-cutoff;
 	// numbers mirror the GPT-5 list tier and must be confirmed against OpenAI's

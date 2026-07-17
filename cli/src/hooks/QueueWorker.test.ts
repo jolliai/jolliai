@@ -111,6 +111,27 @@ vi.mock("../core/Locks.js", () => ({
 	INGEST_PHASE_FILE: "ingest-phase",
 }));
 
+vi.mock("./CommitCaptureLock.js", () => ({
+	COMMIT_CAPTURE_LOCK_WAIT_MS: 1000,
+	withCommitCaptureLock: vi.fn(async (_cwd: string, _hash: string, _mode: unknown, body: () => Promise<unknown>) => ({
+		ran: true,
+		value: await body(),
+	})),
+}));
+
+// CaptureProgress: keep the real progress-file helpers (readEvents / format /
+// prune) but spy on emitCaptureProgress so tests can assert the lifecycle events
+// the squash / rebase handlers emit. This is the fix that makes an interactive
+// watcher report a completed squash / rebase-pick / rebase-squash capture
+// instead of the "analysis continues in the background…" fallback.
+vi.mock("./CaptureProgress.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./CaptureProgress.js")>();
+	return {
+		...actual,
+		emitCaptureProgress: vi.fn(),
+	};
+});
+
 vi.mock("../sync/PendingIngest.js", () => ({
 	recordPendingIngest: vi.fn().mockResolvedValue(undefined),
 	wakePendingIngest: vi.fn().mockResolvedValue(undefined),
@@ -287,6 +308,13 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 	};
 });
 
+// Spy on the checkpoint archive tail step; keep commitSecondUpperBound real so the
+// `before` resolver (when reached) still computes a genuine bound. Default no-op.
+vi.mock("../core/CheckpointStore.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../core/CheckpointStore.js")>()),
+	archiveSupersededCheckpoints: vi.fn(async () => 0),
+}));
+
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	return {
@@ -456,6 +484,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { archiveSupersededCheckpoints } from "../core/CheckpointStore.js";
 import { isClineCliInstalled } from "../core/ClineCliDetector.js";
 import { discoverClineCliSessions } from "../core/ClineCliSessionDiscoverer.js";
 import { readClineCliTranscript } from "../core/ClineCliTranscriptReader.js";
@@ -515,6 +544,7 @@ import type {
 	PlanReference,
 	ReferenceCommitRef,
 } from "../Types.js";
+import { emitCaptureProgress } from "./CaptureProgress.js";
 import { __test__, buildWorkerStartupBanner, launchWorker, runWorker } from "./QueueWorker.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -810,6 +840,82 @@ describe("QueueWorker", () => {
 			expect(storeSummary).toHaveBeenCalledTimes(1);
 			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
 			expect(savedSummary.branch).toBe("feature/live");
+		});
+	});
+
+	describe("runWorker — capture skip guard + checkpoint archive gate", () => {
+		const storageWithKb = () => ({
+			readFile: vi.fn().mockResolvedValue(null),
+			writeFiles: vi.fn().mockResolvedValue(undefined),
+			listFiles: vi.fn().mockResolvedValue([]),
+			exists: vi.fn().mockResolvedValue(true),
+			ensure: vi.fn().mockResolvedValue(undefined),
+			kbRoot: "/kb/test-repo",
+		});
+
+		it("regenerates when only a back-filled summary exists — live capture supersedes it, and archives", async () => {
+			const { getSummary } = await import("../core/SummaryStore.js");
+			const op = makeCommitOp({ branch: "feature/x" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/e.json" }])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			vi.mocked(createStorage).mockResolvedValue(storageWithKb() as never);
+			vi.mocked(getSummary).mockResolvedValue({ commitHash: op.commitHash, backfilled: true } as never);
+
+			await runWorker("/test/cwd");
+
+			// A back-fill is a placeholder → it does NOT short-circuit: the pipeline runs
+			// and stores the live summary, and the durable summary then supersedes the
+			// branch's checkpoints.
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			expect(vi.mocked(archiveSupersededCheckpoints)).toHaveBeenCalledTimes(1);
+		});
+
+		it("skips regeneration when a live (non-back-filled) summary already exists, but still archives", async () => {
+			const { getSummary } = await import("../core/SummaryStore.js");
+			const op = makeCommitOp({ branch: "feature/x" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/e.json" }])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			vi.mocked(createStorage).mockResolvedValue(storageWithKb() as never);
+			vi.mocked(getSummary).mockResolvedValue({ commitHash: op.commitHash } as never);
+
+			await runWorker("/test/cwd");
+
+			// A live summary exists → skip the LLM pipeline, but archiving is still
+			// correct because the summary is present.
+			expect(storeSummary).not.toHaveBeenCalled();
+			expect(vi.mocked(archiveSupersededCheckpoints)).toHaveBeenCalledTimes(1);
+		});
+
+		it("does NOT archive checkpoints when the pipeline stored no summary (empty diff + no transcript)", async () => {
+			const { getSummary } = await import("../core/SummaryStore.js");
+			const op = makeCommitOp({ branch: "feature/x" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/e.json" }])
+				.mockResolvedValueOnce([]);
+			vi.mocked(getCommitInfo).mockResolvedValue({
+				hash: op.commitHash,
+				message: "m",
+				author: "a",
+				date: "2026-04-01T12:00:00.000Z",
+			});
+			vi.mocked(getCurrentBranch).mockResolvedValue("feature/x");
+			// Empty diff + no transcript → executePipeline skips without storing.
+			vi.mocked(getDiffContent).mockResolvedValue("");
+			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 0, insertions: 0, deletions: 0 });
+			vi.mocked(loadAllSessions).mockResolvedValue([]);
+			vi.mocked(createStorage).mockResolvedValue(storageWithKb() as never);
+			vi.mocked(getSummary).mockResolvedValue(null as never);
+
+			await runWorker("/test/cwd");
+
+			// Nothing durable landed for this commit, so the checkpoint tail step must
+			// NOT retire the branch's live checkpoints.
+			expect(storeSummary).not.toHaveBeenCalled();
+			expect(vi.mocked(archiveSupersededCheckpoints)).not.toHaveBeenCalled();
 		});
 	});
 
@@ -2490,6 +2596,169 @@ describe("QueueWorker", () => {
 			expect(mergeManyToOne).toHaveBeenCalledTimes(1);
 			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][4];
 			expect(consolidatedArg?.summaryError).toBe("llm-failed");
+		});
+	});
+
+	// Regression: squash / rebase-pick / rebase-squash used to emit only `start`
+	// + the terminal `end`, never a `stored`/`skipped` content event — so after a
+	// SUCCESSFUL consolidation an interactive watcher wrongly printed "analysis
+	// continues in the background…". Each handler must now emit `stored` on a
+	// produced summary and `skipped` on a no-op, matching executePipeline's shape.
+	describe("capture-progress feedback for squash / rebase handlers", () => {
+		function makeSummary(topics: number): CommitSummary {
+			return {
+				version: 3,
+				commitHash: "oldhash",
+				commitMessage: "Old",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: Array.from({ length: topics }, (_, i) => ({
+					title: `T${i}`,
+					trigger: "t",
+					response: "r",
+					decisions: "d",
+				})),
+			} as CommitSummary;
+		}
+
+		it("squash emits a `stored` event on a successful consolidation", async () => {
+			const { getSummary } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue(makeSummary(1));
+			setupPipelineMocks("sq-stored");
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "sq-stored", sourceHashes: ["oldhash"] }),
+				"/test/cwd",
+			);
+
+			expect(emitCaptureProgress).toHaveBeenCalledWith("/test/cwd", "sq-stored", "stored", {
+				data: { topics: expect.any(Number) },
+			});
+			expect(emitCaptureProgress).not.toHaveBeenCalledWith(
+				"/test/cwd",
+				"sq-stored",
+				"skipped",
+				expect.anything(),
+			);
+		});
+
+		it("squash emits a terminal `skipped` event when there are no source hashes", async () => {
+			await __test__.handleSquashFromQueue(makeCommitOp({ commitHash: "sq-none" }), "/test/cwd");
+			expect(emitCaptureProgress).toHaveBeenCalledWith("/test/cwd", "sq-none", "skipped", { terminal: true });
+		});
+
+		it("squash emits a `skipped` event when no source summaries exist", async () => {
+			const { getSummary } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue(null);
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "sq-empty", sourceHashes: ["missing"] }),
+				"/test/cwd",
+			);
+			expect(emitCaptureProgress).toHaveBeenCalledWith("/test/cwd", "sq-empty", "skipped", { terminal: true });
+		});
+
+		it("rebase-pick emits a `stored` event carrying the migrated topic count", async () => {
+			const { getSummary, migrateOneToOne } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue(makeSummary(2));
+			setupPipelineMocks("rp-new");
+
+			await __test__.handleRebasePickFromQueue(
+				// commitSource set so the forwarded-source spread arm is exercised too.
+				makeCommitOp({
+					type: "rebase-pick",
+					commitHash: "rp-new",
+					sourceHashes: ["oldhash"],
+					commitSource: "plugin",
+				}),
+				"/test/cwd",
+			);
+
+			expect(emitCaptureProgress).toHaveBeenCalledWith("/test/cwd", "rp-new", "stored", { data: { topics: 2 } });
+			expect(migrateOneToOne).toHaveBeenCalledWith(
+				expect.anything(),
+				expect.objectContaining({ hash: "rp-new" }),
+				"/test/cwd",
+				expect.objectContaining({ commitType: "rebase", commitSource: "plugin" }),
+			);
+		});
+
+		it("rebase-pick `stored` defaults topics to 0 for a container root with no own topics", async () => {
+			// Container/hoist roots have `topics` absent — the `?? 0` fallback must
+			// not throw and still reports a completed (not background) capture.
+			const { getSummary } = await import("../core/SummaryStore.js");
+			const containerRoot = {
+				version: 3,
+				commitHash: "oldhash",
+				commitMessage: "Old",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+			} as CommitSummary;
+			vi.mocked(getSummary).mockResolvedValue(containerRoot);
+			setupPipelineMocks("rp-container");
+
+			await __test__.handleRebasePickFromQueue(
+				makeCommitOp({ type: "rebase-pick", commitHash: "rp-container", sourceHashes: ["oldhash"] }),
+				"/test/cwd",
+			);
+
+			expect(emitCaptureProgress).toHaveBeenCalledWith("/test/cwd", "rp-container", "stored", {
+				data: { topics: 0 },
+			});
+		});
+
+		it("rebase-pick emits a terminal `skipped` event when there is no source hash", async () => {
+			await __test__.handleRebasePickFromQueue(
+				makeCommitOp({ type: "rebase-pick", commitHash: "rp-none" }),
+				"/test/cwd",
+			);
+			expect(emitCaptureProgress).toHaveBeenCalledWith("/test/cwd", "rp-none", "skipped", { terminal: true });
+		});
+
+		it("rebase-pick emits a `skipped` event when the source summary is missing", async () => {
+			const { getSummary } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue(null);
+			await __test__.handleRebasePickFromQueue(
+				makeCommitOp({ type: "rebase-pick", commitHash: "rp-miss", sourceHashes: ["gone"] }),
+				"/test/cwd",
+			);
+			expect(emitCaptureProgress).toHaveBeenCalledWith("/test/cwd", "rp-miss", "skipped", { terminal: true });
+		});
+
+		it("rebase-squash emits a `stored` event on a successful consolidation", async () => {
+			const { getSummary } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue(makeSummary(1));
+			setupPipelineMocks("rs-stored");
+
+			await __test__.handleRebaseSquashFromQueue(
+				makeCommitOp({ type: "rebase-squash", commitHash: "rs-stored", sourceHashes: ["oldhash"] }),
+				"/test/cwd",
+			);
+
+			expect(emitCaptureProgress).toHaveBeenCalledWith("/test/cwd", "rs-stored", "stored", {
+				data: { topics: expect.any(Number) },
+			});
+		});
+
+		it("rebase-squash emits a terminal `skipped` event when there are no source hashes", async () => {
+			await __test__.handleRebaseSquashFromQueue(
+				makeCommitOp({ type: "rebase-squash", commitHash: "rs-none" }),
+				"/test/cwd",
+			);
+			expect(emitCaptureProgress).toHaveBeenCalledWith("/test/cwd", "rs-none", "skipped", { terminal: true });
+		});
+
+		it("rebase-squash emits a `skipped` event when no source summaries exist", async () => {
+			const { getSummary } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue(null);
+			await __test__.handleRebaseSquashFromQueue(
+				makeCommitOp({ type: "rebase-squash", commitHash: "rs-empty", sourceHashes: ["missing"] }),
+				"/test/cwd",
+			);
+			expect(emitCaptureProgress).toHaveBeenCalledWith("/test/cwd", "rs-empty", "skipped", { terminal: true });
 		});
 	});
 

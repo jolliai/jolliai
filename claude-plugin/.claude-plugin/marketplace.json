@@ -1,0 +1,14 @@
+{
+	"name": "jolli-marketplace",
+	"description": "Jolli Memory tools for Claude Code — recall prior context, search decisions, author memory-rich PRs.",
+	"owner": { "name": "jolli.ai" },
+	"plugins": [
+		{
+			"name": "jolli",
+			"source": "./plugins/jolli",
+			"description": "Recall prior dev context for a branch, search past decisions, and build memory-rich PR descriptions. Bundles the jolli CLI as an MCP server plus session hooks.",
+			"category": "development",
+			"keywords": ["memory", "recall", "pr", "git", "context"]
+		}
+	]
+}

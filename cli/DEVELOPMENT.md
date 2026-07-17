@@ -205,11 +205,15 @@ All git operations (commit, amend, squash, rebase, cherry-pick, revert) go throu
 ### Operation Flow
 
 ```
-post-commit hook (synchronous, <5ms):
+post-commit hook (enqueue + spawn is synchronous, <5ms):
   1. Detect operation type via GitOperationDetector
   2. If amend/rebase → skip (post-rewrite handles these)
   3. If commit/squash → enqueue {type, commitHash, sourceHashes, createdAt}
   4. Spawn detached QueueWorker process
+  5. Interactive TTY / AI-agent session only (commitFeedback "auto" default):
+     foreground-tail the worker's capture-progress and print it inline,
+     blocking until a terminal event / dead-worker / 90s timeout
+     (GUI git clients skip this and return immediately). See CaptureProgress.ts.
 
 post-rewrite hook (synchronous):
   1. Read old→new hash mappings from git stdin
@@ -357,7 +361,7 @@ The write is **purely opt-in through settings** (0.99.7). A tri-state `globalIns
 - **File lock**: `.jolli/jollimemory/lock` prevents concurrent worker runs. Uses `writeFile` with `wx` flag (exclusive create). Stale locks (>5 min) are auto-removed.
 - **Per-vault write lock**: `~/.jolli/jollimemory/locks/vault-<sha256>.lock` (separate from the per-worktree worker lock) serialises Memory Bank writes between a `QueueWorker` drain and a sync round that share one vault. See [Memory Bank Cloud Sync → Vault-write lock](#vault-write-lock-sync--worker).
 - **Operation queue**: Each git operation gets its own queue file — no single-slot overwriting.
-- **Detached worker**: The post-commit hook spawns a detached child process so `git commit` returns instantly.
+- **Detached worker**: The post-commit hook spawns a detached child process so summary generation never blocks the queue. `git commit` returns instantly in GUI clients; in an interactive TTY / AI-agent session it lingers to print live capture feedback (see the operation-flow note above).
 - **Chain spawn**: After draining the queue, the worker checks for new entries and spawns a successor if needed.
 - **Idempotent operations**: Orphan branch creation, index updates, and hook installation are all idempotent.
 - **Stale session pruning**: Sessions older than 48 hours are automatically pruned.

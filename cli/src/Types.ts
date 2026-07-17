@@ -141,6 +141,10 @@ export interface StoredSession {
 	/** Original JSONL file path, preserved for re-summarize (future) */
 	readonly transcriptPath?: string;
 	readonly entries: ReadonlyArray<TranscriptEntry>;
+	/** Branch the session was recorded on, when the producer captured it — set by
+	 *  the desktop `ActiveTranscriptScanner`; absent for orphan-branch reads. Read
+	 *  by `TranscriptStats.firstBranch` as a branch-resolution fallback. */
+	readonly gitBranch?: string;
 }
 
 /** Structured transcript data for a commit, stored as `transcripts/{commitHash}.json` in the orphan branch */
@@ -1147,6 +1151,17 @@ export interface JolliMemoryConfig {
 	readonly localAgentTool?: "claude-code";
 	/** Optional explicit path to the local agent binary, overriding PATH discovery. */
 	readonly localAgentPath?: string;
+	/**
+	 * Whether the post-commit hook prints live memory-capture progress to stdout
+	 * (so a `git commit` driven from a terminal or AI-agent session shows the
+	 * capture lifecycle inline, and blocks until it drains).
+	 *  - "auto" (default): show only in an interactive place — a TTY, or an
+	 *    AI-agent session (Claude Code etc.). GUI git clients stay silent + fast.
+	 *  - "on":  always show (and block) — any commit surface.
+	 *  - "off": never show; keep the fast, silent, non-blocking behavior.
+	 * The `JOLLI_COMMIT_FEEDBACK` env var overrides this per-invocation.
+	 */
+	readonly commitFeedback?: "auto" | "on" | "off";
 	/**
 	 * When true, plugin-initiated `git commit` / `--amend` / squash invocations
 	 * pass `-s` to add a DCO `Signed-off-by:` trailer. Off by default. Read at

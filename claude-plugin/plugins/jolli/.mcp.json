@@ -1,0 +1,8 @@
+{
+	"mcpServers": {
+		"jollimemory": {
+			"command": "node",
+			"args": ["${CLAUDE_PLUGIN_ROOT}/dist/Cli.js", "mcp"]
+		}
+	}
+}

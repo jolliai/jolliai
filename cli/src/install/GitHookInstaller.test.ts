@@ -38,6 +38,27 @@ describe("installPrePushHook / removePrePushHook", () => {
 		expect(content).toContain('(exit "$__jolli_pre_push_previous_status")');
 	});
 
+	it("soft-prefers the given dist source when distSource is set", async () => {
+		await installPrePushHook(cwd, "claude-plugin");
+		const content = await readFile(hookPath(), "utf-8");
+		// Only the invocation is prefixed — the [ -x run-hook ] guard is untouched.
+		expect(content).toContain(
+			"JOLLI_DIST_PREFER_SOURCE='claude-plugin' \"$HOME/.jolli/jollimemory/run-hook\" pre-push",
+		);
+		// The former hard pin is gone.
+		expect(content).not.toContain("JOLLI_DIST_SOURCE=");
+	});
+
+	it("omits the prefer prefix when distSource is absent", async () => {
+		await installPrePushHook(cwd);
+		const content = await readFile(hookPath(), "utf-8");
+		expect(content).not.toContain("JOLLI_DIST_PREFER_SOURCE");
+	});
+
+	it("throws rather than emit an unsafe pre-push line for a malformed source", async () => {
+		await expect(installPrePushHook(cwd, "bad tag")).rejects.toThrow(/unsafe source tag/);
+	});
+
 	it("is idempotent — installing twice leaves a single section", async () => {
 		await installPrePushHook(cwd);
 		await installPrePushHook(cwd);

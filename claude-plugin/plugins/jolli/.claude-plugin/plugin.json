@@ -1,0 +1,10 @@
+{
+	"name": "jolli",
+	"displayName": "Jolli Memory",
+	"version": "1.0.5",
+	"description": "Recall prior development context, search past decisions, and author memory-rich pull requests — backed by the jolli CLI bundled as an MCP server.",
+	"author": { "name": "jolli.ai", "url": "https://jolli.ai" },
+	"homepage": "https://jolli.ai",
+	"license": "Apache-2.0",
+	"keywords": ["memory", "recall", "pr", "git", "context"]
+}

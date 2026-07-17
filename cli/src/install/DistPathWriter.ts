@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createLogger } from "../Logger.js";
+import { isValidSourceTag } from "./DistPathResolver.js";
 
 const log = createLogger("DistPathWriter");
 
@@ -43,6 +44,13 @@ const log = createLogger("DistPathWriter");
  * @returns `true` on success, `false` on filesystem failure (logged as warning).
  */
 export async function installDistPath(sourceTag: string, distDir?: string, version?: string): Promise<boolean> {
+	// The tag becomes a filename under `dist-paths/`. Re-validate at this write
+	// boundary (not only at the `--source-tag` CLI flag) so a `/` or `..` can never
+	// traverse out of the directory, regardless of which caller supplied it.
+	if (!isValidSourceTag(sourceTag)) {
+		log.warn("Refusing to write dist-paths entry for unsafe source tag: %s", JSON.stringify(sourceTag));
+		return false;
+	}
 	const currentDir = distDir ?? dirname(fileURLToPath(import.meta.url));
 	/* v8 ignore start -- compile-time ternary: __CLI_PKG_VERSION__ is always defined in bundled builds */
 	const ver = version ?? (typeof __CLI_PKG_VERSION__ !== "undefined" ? __CLI_PKG_VERSION__ : "dev");

@@ -32,6 +32,32 @@ function matchesAny(name: string, patterns: ReadonlyArray<string>): boolean {
 	});
 }
 
+/**
+ * Whether `pattern` is a well-formed folder-exclude glob. Same dialect
+ * `discoverRepos` matches against (exact string, or `*` wildcards — no `?`,
+ * `**`, or bracket classes). UI surfaces (desktop Settings, VS Code
+ * preferences) call this to validate user input before persisting a stray
+ * value into `compileExcludeFolders`. Never throws; the boolean + optional
+ * `error` are for inline form-field messages.
+ */
+export function validateExcludeGlob(pattern: string): { readonly valid: boolean; readonly error?: string } {
+	if (typeof pattern !== "string") return { valid: false, error: "pattern must be a string" };
+	const trimmed = pattern.trim();
+	if (trimmed.length === 0) return { valid: false, error: "pattern must not be empty" };
+	// Reject path separators — the matcher only sees the leaf folder name, so
+	// `foo/bar` or `foo\bar` would never match anything and would silently
+	// mislead the user.
+	if (trimmed.includes("/") || trimmed.includes("\\")) {
+		return { valid: false, error: "path separators are not allowed — match on the folder name only" };
+	}
+	// Reject glob features we don't implement so the user isn't surprised by
+	// a `?` or `**` pattern that silently degrades to a literal.
+	if (trimmed.includes("?") || trimmed.includes("[") || trimmed.includes("]") || trimmed.includes("**")) {
+		return { valid: false, error: "only exact names and `*` wildcards are supported" };
+	}
+	return { valid: true };
+}
+
 function readRepoIdentities(localFolder: string): Map<string, string> {
 	const out = new Map<string, string>();
 	try {

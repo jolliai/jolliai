@@ -281,6 +281,24 @@ export function llmFanoutLimit(baseLimit: number, config: Pick<LlmCredentials, "
 	return config.aiProvider === "local-agent" ? 1 : baseLimit;
 }
 
+/**
+ * True when any LLM credential is available — an Anthropic key (config or
+ * `ANTHROPIC_API_KEY` env) or a Jolli Space key — or the provider is
+ * `local-agent`, which drives the tool's own subscription login rather than a
+ * jollimemory-held credential (so it needs no jollimemory-held key; mirrors
+ * resolveLlmCredentialSource). The single predicate every generation entry point
+ * guards on before doing LLM work, so the check can't drift between the
+ * summarizer siblings, compile, and backfill.
+ */
+export function hasLlmCredentials(config: {
+	readonly apiKey?: string;
+	readonly jolliApiKey?: string;
+	readonly aiProvider?: "anthropic" | "jolli" | "local-agent";
+}): boolean {
+	if (config.aiProvider === "local-agent") return true;
+	return Boolean(config.apiKey || config.jolliApiKey || process.env.ANTHROPIC_API_KEY);
+}
+
 /** Options for making an LLM call */
 export interface LlmCallOptions extends LlmCredentials {
 	/** Template key (e.g. "summarize", "commit-message") */
@@ -316,6 +334,15 @@ export interface LlmCallOptions extends LlmCredentials {
 	 * from config. Ignored outside the `local-agent` path.
 	 */
 	readonly __localAgentRun?: typeof defaultRunInvocation;
+	/**
+	 * Optional caller abort signal. When it fires, the in-flight request (SDK
+	 * stream, `messages.create`, or proxy `fetch`) is aborted immediately — the
+	 * same teardown the internal wall-clock/idle watchdogs use — so a UI can
+	 * cancel a long call and free the socket without waiting out the timeout.
+	 * Additive and independent of `timeoutMs`: existing callers that omit it are
+	 * unaffected; when both are present, whichever fires first wins.
+	 */
+	readonly signal?: AbortSignal;
 }
 
 /** Result from an LLM call */
@@ -508,6 +535,30 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 	}
 }
 
+/**
+ * The wall-clock timeout signal for a request, optionally merged with the
+ * caller's external abort signal so either can tear the request down. Kept
+ * separate from the streaming path, which aborts via `stream.abort()`.
+ */
+function timeoutSignal(externalSignal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+	const timeout = AbortSignal.timeout(timeoutMs);
+	if (!externalSignal) return timeout;
+	// `AbortSignal.any` lands in Node 18.17, but this module is bundled into the
+	// VS Code extension whose esbuild target is `node18` — a host on 18.0–18.16
+	// would throw the moment a caller passes a signal. Prefer the native combinator
+	// when present; fall back to a manual merge so the floor stays at Node 17.3
+	// (`AbortSignal.timeout`).
+	if (typeof AbortSignal.any === "function") return AbortSignal.any([externalSignal, timeout]);
+	const merged = new AbortController();
+	if (externalSignal.aborted) merged.abort(externalSignal.reason);
+	else if (timeout.aborted) merged.abort(timeout.reason);
+	else {
+		externalSignal.addEventListener("abort", () => merged.abort(externalSignal.reason), { once: true });
+		timeout.addEventListener("abort", () => merged.abort(timeout.reason), { once: true });
+	}
+	return merged.signal;
+}
+
 async function callDirect(
 	options: LlmCallOptions,
 	apiKey: string,
@@ -582,6 +633,13 @@ async function callDirect(
 			// while a wedged socket produces nothing and is aborted — restoring the
 			// fail-fast guarantee without capping valid long responses.
 			const stream = client.messages.stream(body);
+			// Caller-initiated cancel: tear the stream down the same way the
+			// watchdogs do, releasing the socket without waiting out the hard cap.
+			const onExternalAbort = (): void => stream.abort();
+			if (options.signal) {
+				if (options.signal.aborted) stream.abort();
+				else options.signal.addEventListener("abort", onExternalAbort, { once: true });
+			}
 			// Node 24's async-iterator teardown can make `finalMessage()` reject with
 			// ERR_STREAM_PREMATURE_CLOSE *after* the full response was already received (the
 			// `message_stop` event fired) — the socket close races the iterator's own end.
@@ -625,6 +683,7 @@ async function callDirect(
 			} finally {
 				clearTimeout(idleTimer);
 				clearTimeout(hardTimer);
+				options.signal?.removeEventListener("abort", onExternalAbort);
 			}
 		} else {
 			// Hard cap on the in-flight HTTP request — see `DIRECT_FETCH_TIMEOUT_MS`.
@@ -634,10 +693,22 @@ async function callDirect(
 			// holding the caller (e.g. `ConflictResolver.resolveAll`)
 			// indefinitely.
 			response = await client.messages.create(body, {
-				signal: AbortSignal.timeout(options.timeoutMs ?? DIRECT_FETCH_TIMEOUT_MS),
+				signal: timeoutSignal(options.signal, options.timeoutMs ?? DIRECT_FETCH_TIMEOUT_MS),
 			});
 		}
 	} catch (err) {
+		// A caller-initiated cancel (the external signal fired) must surface as a
+		// Web-standard AbortError, not a wrapped generic Error. The SDK rejects an
+		// aborted stream/request with APIUserAbortError (name !== "AbortError"), and
+		// wrapping that below would defeat the compile pipeline's
+		// `err.name === "AbortError"` check — misreading a user cancel as an internal
+		// failure and recording the repo as failed. An INTERNAL idle/hard-cap watchdog
+		// abort leaves `options.signal` unaborted, so it correctly falls through to
+		// the failure path below (a timeout is a failure, not a cancel). The proxy
+		// path already re-throws its fetch AbortError unwrapped; this restores parity.
+		if (options.signal?.aborted) {
+			throw new DOMException("LLM direct request aborted", "AbortError");
+		}
 		// Surface the effective baseURL so users can tell whether a 3rd-party relay
 		// (e.g. an ANTHROPIC_BASE_URL override) returned the error versus Anthropic itself.
 		// Also surface error.cause: undici wraps transport-layer reasons (DNS, TLS,
@@ -764,7 +835,7 @@ async function callProxy(
 				[TRACE_HEADER_NAME]: traceHeader,
 			},
 			body,
-			signal: AbortSignal.timeout(options.timeoutMs ?? PROXY_FETCH_TIMEOUT_MS),
+			signal: timeoutSignal(options.signal, options.timeoutMs ?? PROXY_FETCH_TIMEOUT_MS),
 		});
 	} catch (err) {
 		// Transport-layer failure (DNS, TLS handshake, connect, reset, timeout).

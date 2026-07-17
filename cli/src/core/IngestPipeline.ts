@@ -26,6 +26,15 @@ import { readTopicPage, saveTopicPage } from "./TopicPageStore.js";
 
 const log = createLogger("IngestPipeline");
 
+/**
+ * The Web-standard AbortError. Callers detect cancel with `err.name ===
+ * "AbortError"` so this matches what `fetch(..., { signal })` throws — no
+ * bespoke error class the outer layers would need to import.
+ */
+function abortError(): DOMException {
+	return new DOMException("Ingest cancelled", "AbortError");
+}
+
 const DEFAULT_BATCH_SIZE = 50;
 // The route call can run long, so it takes LlmClient's streaming path (no fixed
 // 180s direct-call cap, just the idle + wall-clock watchdogs). We request it
@@ -35,6 +44,47 @@ const DEFAULT_BATCH_SIZE = 50;
 const ROUTE_MAX_TOKENS = 16_384;
 const RECONCILE_MAX_TOKENS = 64_000;
 const RECONCILE_CONCURRENCY = 4; // fan out reconcile LLM calls; writes stay serial
+
+/**
+ * Per-batch progress tick. Every field carries a real value on every tick — no
+ * field is ever a placeholder the consumer must second-guess which to trust.
+ * Two ticks fire per batch: a PRE-ROUTE tick right before the route LLM call
+ * (`topicsInBatch` absent — the plan isn't known yet) and a POST-ROUTE tick once
+ * route returns (`topicsInBatch` present). `drainIngest` then fires ONE terminal
+ * tick after the loop so a UI can move from "batch N running" to a final state.
+ * `pendingCount` is the pre-slice snapshot for THIS batch (0 on the terminal
+ * tick — nothing further is in flight); `ingestedSoFar` is the drain-wide running
+ * total at the moment of the tick.
+ */
+export interface BatchProgress {
+	readonly batchIndex: number; // 1-based
+	readonly pendingCount: number;
+	readonly ingestedSoFar: number;
+	/**
+	 * Count of topics being reconciled in THIS batch, known only once route has
+	 * returned. Present on the post-route tick; absent on the pre-route tick
+	 * (before the plan exists) and on the terminal tick. Consumers use it
+	 * alongside `TopicProgress.done` to render "N of M topics" bars.
+	 */
+	readonly topicsInBatch?: number;
+}
+
+/**
+ * Fine-grained per-topic progress within a single batch's reconcile fan-out.
+ * Fires immediately after each reconcile LLM call returns — successful or
+ * held. UIs can show "reconciled 5 of 12 in batch 3" without polling.
+ */
+export interface TopicProgress {
+	readonly batchIndex: number; // 1-based, same as BatchProgress.batchIndex
+	/** How many topics finished so far in this batch (1..N). */
+	readonly done: number;
+	/** How many topics total in this batch. */
+	readonly of: number;
+	/** The slug that just finished. */
+	readonly slug: string;
+	/** Outcome discriminant so a UI can color-code held topics. */
+	readonly outcome: "ok" | "held";
+}
 
 export interface IngestOptions {
 	readonly batchSize?: number;
@@ -58,6 +108,48 @@ export interface IngestOptions {
 	 * `cli/src/sync/VaultWriteLock.ts`). Defaults to identity for unit tests only.
 	 */
 	readonly writeGuard?: (fn: () => Promise<void>) => Promise<void>;
+	/**
+	 * Cooperative cancellation. Checked between batches (an abort between batches
+	 * never pays for another route+reconcile call) AND forwarded into the route
+	 * and reconcile `callLlm` calls, so an in-flight LLM request is torn down
+	 * promptly instead of running out its own per-request timeout. Reconcile writes
+	 * happen strictly after the LLM fan-out resolves, so a cancelled reconcile
+	 * leaves no partial write — its sources are simply held for the next drain.
+	 * Throws a DOMException of name `AbortError` when triggered mid-drain; a signal
+	 * aborted before the first batch throws before any work starts.
+	 */
+	readonly signal?: AbortSignal;
+	/**
+	 * Per-batch progress emitter. Fires twice per batch — a pre-route tick right
+	 * before the route LLM call and a post-route tick once the plan is known (see
+	 * BatchProgress) — then ONCE MORE at drain end (after the loop exits) so a UI
+	 * can transition from "batch N running" to a final state. Every tick carries
+	 * all BatchProgress fields with real values. Errors thrown by the callback are
+	 * logged and swallowed — progress display MUST NOT be able to fail a compile.
+	 */
+	readonly onBatch?: (progress: BatchProgress) => void;
+	/**
+	 * Per-topic progress callback fired within a batch as each reconcile LLM
+	 * call finishes. Called `topicsInBatch` times per batch (or not at all
+	 * when route returns nothing). Errors thrown by the callback are logged
+	 * and swallowed — progress display MUST NOT be able to fail a compile.
+	 * Absent by default; hosts that don't need per-source granularity omit it.
+	 */
+	readonly onTopic?: (progress: TopicProgress) => void;
+	/**
+	 * Internal seam: `drainIngest` sets this on each call to `ingestPendingBatch`
+	 * so `onTopic` events carry the correct batch index. Callers of
+	 * `ingestPendingBatch` directly can leave it as 1 (or unset); it never
+	 * affects control flow, only the value threaded into `onTopic`.
+	 */
+	readonly currentBatchIndex?: number;
+	/**
+	 * Internal seam: `drainIngest` sets this to its running ingested total so the
+	 * `onBatch` ticks emitted here carry the correct drain-wide `ingestedSoFar`.
+	 * Direct callers of `ingestPendingBatch` leave it 0; it only affects the value
+	 * threaded into `onBatch`, never control flow.
+	 */
+	readonly ingestedSoFar?: number;
 }
 
 export interface IngestResult {
@@ -90,6 +182,21 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 		return { ingested: 0, touchedSlugs: [], done: true, pendingCount: 0, reconcileCalls: 0, topicFailures: [] };
 
 	const batch = pending.slice(0, batchSize);
+	const currentBatchIndex = opts?.currentBatchIndex ?? 1;
+	const ingestedSoFar = opts?.ingestedSoFar ?? 0;
+	// Progress emitter: wrapped so a throwing callback can never sink the batch.
+	// Every tick carries all BatchProgress fields with real values.
+	const emitBatch = (progress: BatchProgress): void => {
+		try {
+			opts?.onBatch?.(progress);
+		} catch (e) {
+			log.warn("onBatch threw (ignored): %s", e instanceof Error ? e.message : String(e));
+		}
+	};
+	// Pre-route tick: pendingCount is the real pre-slice snapshot; topicsInBatch is
+	// unknown until route returns. Fires immediately before the route LLM call so a
+	// UI shows "batch N starting" while the call is in flight.
+	emitBatch({ batchIndex: currentBatchIndex, pendingCount: pending.length, ingestedSoFar });
 
 	// -- Route -----------------------------------------------------------------
 	const index = await readTopicIndex(cwd, readStorage);
@@ -102,6 +209,10 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 		maxTokens: ROUTE_MAX_TOKENS,
 		forceStreaming: true,
 		...llmCredentials(config),
+		// Forward the caller signal so an in-flight route call is torn down on abort
+		// rather than running out its own timeout. Nothing is written before route
+		// completes, so a cancelled route leaves no partial state.
+		signal: opts?.signal,
 	});
 	const plan = parseRoutePlan(routeResult.text ?? "", routeResult.stopReason, batch);
 	if (plan.error) {
@@ -132,6 +243,26 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 		| { kind: "failed"; slug: string; refs: SourceRef[]; code: IngestCode };
 
 	const assignments = [...plan.assignments];
+	const topicsInBatch = assignments.length;
+	// Post-route tick: same running totals as the pre-route tick, now carrying
+	// `topicsInBatch` so a UI can size its "N of M topics" bar as soon as route
+	// returns. `TopicProgress.done` follows as each reconcile finishes.
+	emitBatch({ batchIndex: currentBatchIndex, pendingCount: pending.length, ingestedSoFar, topicsInBatch });
+	let topicsDone = 0;
+	const emitTopic = (slug: string, outcome: "ok" | "held") => {
+		topicsDone++;
+		try {
+			opts?.onTopic?.({
+				batchIndex: currentBatchIndex,
+				done: topicsDone,
+				of: topicsInBatch,
+				slug,
+				outcome,
+			});
+		} catch (e) {
+			log.warn("onTopic threw (ignored): %s", e instanceof Error ? e.message : String(e));
+		}
+	};
 	const outcomes = await mapWithConcurrency<[string, (typeof assignments)[number][1]], ReconcileOutcome>(
 		assignments,
 		llmFanoutLimit(RECONCILE_CONCURRENCY, config),
@@ -164,6 +295,10 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 				model: resolveModelId(config.model),
 				maxTokens: RECONCILE_MAX_TOKENS,
 				...llmCredentials(config),
+				// Safe to forward: the reconcile phase is pure — every write happens
+				// strictly AFTER this fan-out resolves — so a cancelled call leaves no
+				// partial write, only sources held for the next drain.
+				signal: opts?.signal,
 			});
 			if (result.stopReason === "max_tokens") {
 				log.error("Reconcile truncated for topic %s -- keeping old page, holding sources", slug);
@@ -204,9 +339,21 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 		// text didn't parse): mislabeling a transient transport error as a
 		// deterministic content problem hides the real failure class in telemetry.
 		([slug, assignment], err) => {
-			log.error("Reconcile call threw for topic %s: %s -- holding sources", slug, (err as Error).message);
+			// A cancelled drain tears down every in-flight reconcile call at once —
+			// those are cancellations, not reconcile faults, so log them quietly. The
+			// returned CALL-failure code is never persisted on cancel: the post-loop
+			// signal check in drainIngest aborts before appendIngestRun.
+			if (opts?.signal?.aborted) {
+				log.debug("Reconcile call cancelled for topic %s -- holding sources", slug);
+			} else {
+				log.error("Reconcile call threw for topic %s: %s -- holding sources", slug, (err as Error).message);
+			}
 			return { kind: "failed", slug, refs: [...assignment.refs], code: INGEST_CODES.RECONCILE_CALL_FAILED };
 		},
+		// Per-topic progress fires the moment each reconcile resolves (ok or held),
+		// so UIs render "N of M topics" in near-real-time instead of waiting for
+		// the whole batch's LLM phase to finish.
+		(outcome) => emitTopic(outcome.slug, outcome.kind === "ok" ? "ok" : "held"),
 	);
 
 	// -- Classify outcomes (pure, lock-free) -----------------------------------
@@ -380,8 +527,25 @@ export async function drainIngest(
 	let outcome: IngestCode = INGEST_CODES.OK;
 	// Adaptive guard from the first batch's pending count: ceil(pending/N)+2 slack.
 	let maxIterations = Number.POSITIVE_INFINITY;
+	// A pre-drain aborted signal short-circuits without any batch work — matches
+	// the "no side-effects on cancelled call" contract callers expect.
+	if (opts?.signal?.aborted) throw abortError();
 	while (batches < maxIterations) {
-		const r = await ingestPendingBatch(cwd, config, opts);
+		// Signal check runs at the loop head so an abort BETWEEN batches never
+		// pays for another route+reconcile call. Inside a batch we don't
+		// interrupt — the LLM call has its own timeout and its writes are
+		// guarded, so letting a batch complete is safer than yanking mid-write.
+		if (opts?.signal?.aborted) throw abortError();
+		// Thread the running batch index + ingested total into ingestPendingBatch so
+		// the onBatch ticks it emits (pre-route + post-route) carry the right batch
+		// number and drain-wide `ingestedSoFar` without a global. The "batch N
+		// starting" tick now fires INSIDE ingestPendingBatch — once the real pending
+		// count is known — instead of here with a placeholder count.
+		const r = await ingestPendingBatch(cwd, config, {
+			...opts,
+			currentBatchIndex: batches + 1,
+			ingestedSoFar: ingested,
+		});
 		if (batches === 0) {
 			maxIterations = Math.ceil(r.pendingCount / batchSize) + 2;
 			if (r.pendingCount === 0) outcome = INGEST_CODES.NO_PENDING;
@@ -423,6 +587,34 @@ export async function drainIngest(
 	if (batches >= maxIterations) {
 		log.error("drainIngest hit iteration guard (%d) -- pipeline not draining, stopping", maxIterations);
 		outcome = INGEST_CODES.ITERATION_GUARD;
+	}
+
+	// A drain cancelled DURING a batch reaches here via the no-progress / done
+	// break rather than the loop-head abort check: the reconcile fan-out converts
+	// each aborted call to a held CALL failure (it never throws), so the batch
+	// returns ingested===0 instead of propagating the cancel. Re-check the signal
+	// before the terminal tick + appendIngestRun so a cancel throws (and is caught
+	// by the caller's isAbortError check as "cancelled") instead of persisting a
+	// misleading RECONCILE_CALL_FAILED ingest-run. Matches the loop-head checks.
+	//
+	// This is NOT a full "cancel writes nothing" rollback (only the PRE-drain
+	// check at the top is): reconciles that RESOLVED before the cancel arrived
+	// were already persisted by the batch's write phase — atomically, page+index
+	// together — and their sources marked processed. That is deliberate and
+	// progress-preserving: completed LLM work is kept, only in-flight calls are
+	// held and the telemetry run is skipped. So "no side-effects on cancel" holds
+	// for a pre-drain abort; a mid-drain cancel keeps whatever already finished.
+	if (opts?.signal?.aborted) throw abortError();
+
+	// Terminal onBatch tick: the loop is done (drained, error-stopped, or
+	// guard-tripped). One final tick lets a UI move from "batch N running" to a
+	// final state. `pendingCount: 0` marks "nothing further in flight";
+	// `ingestedSoFar` is the drain-wide total. Wrapped like the per-batch ticks so
+	// a throwing callback can't fail the run.
+	try {
+		opts?.onBatch?.({ batchIndex: batches, pendingCount: 0, ingestedSoFar: ingested });
+	} catch (e) {
+		log.warn("onBatch threw (ignored): %s", e instanceof Error ? e.message : String(e));
 	}
 
 	await appendIngestRun(cwd, {

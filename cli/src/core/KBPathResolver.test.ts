@@ -778,6 +778,116 @@ esac
 		});
 	});
 
+	describe("remote-less base gains a remote (Case C2 adopt-in-place, no -2 split)", () => {
+		// A repo that recorded memory before its git remote existed writes a
+		// remote-LESS config (repoName, no remoteUrl). When the remote later
+		// appears, isSameRepo rejects the folder (one side has a remote, the
+		// other doesn't) and the old code allocated `<repo>-2`, splitting the
+		// Memory Bank in two. Case C2 upgrades the existing folder's identity in
+		// place instead — but only when it is unambiguously the same repo.
+
+		function seedRemoteless(dir: string, repoName: string): void {
+			initializeKBFolder(dir, repoName, null);
+			// Real repos carry content. The adopt decision keys on config identity,
+			// not emptiness, so seed a summary to prove content survives the upgrade.
+			mkdirSync(join(dir, ".jolli", "summaries"), { recursive: true });
+			writeFileSync(join(dir, ".jolli", "summaries", "abc.json"), JSON.stringify({ commitHash: "abc" }), "utf-8");
+		}
+
+		it("adopts the remote-less base in place instead of allocating -2", () => {
+			seedRemoteless(join(tempDir, "repo"), "repo");
+
+			const result = resolveKBPath("repo", "git@github.com:jolliai/repo.git", tempDir);
+
+			expect(result).toBe(join(tempDir, "repo"));
+			expect(existsSync(join(tempDir, "repo-2"))).toBe(false);
+			const config = JSON.parse(readFileSync(join(result, ".jolli", "config.json"), "utf-8"));
+			expect(config.remoteUrl).toBe("git@github.com:jolliai/repo.git");
+			expect(config.repoName).toBe("repo");
+			// Content survived the identity upgrade — the whole point of adopting.
+			expect(existsSync(join(result, ".jolli", "summaries", "abc.json"))).toBe(true);
+		});
+
+		it("peekKBPath predicts the base without writing identity", () => {
+			seedRemoteless(join(tempDir, "repo"), "repo");
+
+			const peeked = peekKBPath("repo", "git@github.com:jolliai/repo.git", tempDir);
+
+			expect(peeked).toBe(join(tempDir, "repo"));
+			// Pure read — config stays remote-less until resolveKBPath runs.
+			const config = JSON.parse(readFileSync(join(tempDir, "repo", ".jolli", "config.json"), "utf-8"));
+			expect(config.remoteUrl).toBeUndefined();
+		});
+
+		it("peek and resolve agree on the adopted path", () => {
+			seedRemoteless(join(tempDir, "repo"), "repo");
+			const peeked = peekKBPath("repo", "git@github.com:jolliai/repo.git", tempDir);
+			const resolved = resolveKBPath("repo", "git@github.com:jolliai/repo.git", tempDir);
+			expect(peeked).toBe(resolved);
+		});
+
+		it("reuses a suffixed folder that already claims the remote rather than adopting the base", () => {
+			// base `repo` is a DIFFERENT remote-less repo; `repo-2` already holds
+			// the caller's remote. Reuse -2; never touch the base's identity.
+			seedRemoteless(join(tempDir, "repo"), "repo");
+			initializeKBFolder(join(tempDir, "repo-2"), "repo", "git@github.com:jolliai/repo.git");
+
+			const result = resolveKBPath("repo", "git@github.com:jolliai/repo.git", tempDir);
+
+			expect(result).toBe(join(tempDir, "repo-2"));
+			const baseCfg = JSON.parse(readFileSync(join(tempDir, "repo", ".jolli", "config.json"), "utf-8"));
+			expect(baseCfg.remoteUrl).toBeUndefined();
+		});
+
+		it("does not adopt when the base repoName does not match the caller", () => {
+			// Folder named `repo`, but its config identifies a different repoName —
+			// not our repo. Fall through to -N allocation; base stays untouched.
+			initializeKBFolder(join(tempDir, "repo"), "other", null);
+
+			const result = resolveKBPath("repo", "git@github.com:jolliai/repo.git", tempDir);
+
+			expect(result).toBe(join(tempDir, "repo-2"));
+			const baseCfg = JSON.parse(readFileSync(join(tempDir, "repo", ".jolli", "config.json"), "utf-8"));
+			expect(baseCfg.remoteUrl).toBeUndefined();
+			expect(baseCfg.repoName).toBe("other");
+		});
+
+		describe("false-merge guard: two distinct remote-less repos share a name", () => {
+			// Two genuinely different repos share a name and neither had a remote,
+			// so both sit on disk remote-less (`repo`, `repo-2`). A remote now
+			// arrives — we cannot know which of the two it belongs to, so adopting
+			// either would risk merging distinct repos. Allocate a fresh slot.
+			function seedTwoRemoteless(): void {
+				seedRemoteless(join(tempDir, "repo"), "repo");
+				seedRemoteless(join(tempDir, "repo-2"), "repo");
+			}
+
+			it("resolveKBPath allocates a fresh -3 rather than adopting either", () => {
+				seedTwoRemoteless();
+
+				const result = resolveKBPath("repo", "git@github.com:jolliai/repo.git", tempDir);
+
+				expect(result).toBe(join(tempDir, "repo-3"));
+				// Neither remote-less folder was mutated.
+				const base = JSON.parse(readFileSync(join(tempDir, "repo", ".jolli", "config.json"), "utf-8"));
+				const two = JSON.parse(readFileSync(join(tempDir, "repo-2", ".jolli", "config.json"), "utf-8"));
+				expect(base.remoteUrl).toBeUndefined();
+				expect(two.remoteUrl).toBeUndefined();
+				const fresh = JSON.parse(readFileSync(join(tempDir, "repo-3", ".jolli", "config.json"), "utf-8"));
+				expect(fresh.remoteUrl).toBe("git@github.com:jolliai/repo.git");
+			});
+
+			it("peekKBPath predicts the same fresh -3 without writing", () => {
+				seedTwoRemoteless();
+
+				const peeked = peekKBPath("repo", "git@github.com:jolliai/repo.git", tempDir);
+
+				expect(peeked).toBe(join(tempDir, "repo-3"));
+				expect(existsSync(join(tempDir, "repo-3"))).toBe(false);
+			});
+		});
+	});
+
 	describe("resolveKBPath claims allocated paths", () => {
 		// resolveKBPath now always returns a path with identity written.
 		// Callers no longer need to pair it with initializeKBFolder.

@@ -125,6 +125,23 @@ export function resolveKBPath(repoName: string, remoteUrl: string | null, custom
 		return basePath;
 	}
 
+	// Case C2: basePath holds a remote-LESS config whose `repoName` matches and
+	// the caller now supplies a remote. That is a repo which recorded memory
+	// before its git remote existed, then gained one — `isSameRepo` (Case B)
+	// rejects it because one side has a remote and the other doesn't, so it
+	// would otherwise split into `<repo>-2`. Upgrade the base folder's identity
+	// in place instead. Guarded against false merges: skip when a suffixed
+	// folder already claims this remote (reuse that in Case D) or when a second
+	// remote-less same-name folder exists (we can't tell which remote-less repo
+	// the remote belongs to — leave both untouched and allocate a fresh slot).
+	if (existingConfig && isAdoptableRemotelessBase(existingConfig, remoteUrl, repoName)) {
+		const scan = scanRepoSuffixes(parent, repoName, remoteUrl);
+		if (!scan.match && scan.remotelessSameName.length === 0) {
+			writeKBIdentity(basePath, repoName, remoteUrl);
+			return basePath;
+		}
+	}
+
 	// Case D: basePath truly belongs to a different repo → allocate `-N`.
 	return findAvailablePathAndClaim(parent, repoName, remoteUrl);
 }
@@ -160,6 +177,17 @@ export function peekKBPath(repoName: string, remoteUrl: string | null, customPat
 	// repo — that is what made the Migrate archive gate target a phantom slot and
 	// spawn duplicate <repo>-N folders.
 	const scan = scanRepoSuffixes(parent, repoName, remoteUrl);
+	// Mirror `resolveKBPath` Case C2: a remote-less same-name base is adopted in
+	// place (not split into `<repo>-N`) when no suffixed folder claims this remote
+	// and the base is the unique remote-less candidate. `peek` must predict that.
+	if (
+		existingConfig &&
+		isAdoptableRemotelessBase(existingConfig, remoteUrl, repoName) &&
+		!scan.match &&
+		scan.remotelessSameName.length === 0
+	) {
+		return basePath;
+	}
 	return scan.match ?? scan.stub ?? scan.firstUnused ?? join(parent, `${repoName}-${Date.now()}`);
 }
 
@@ -470,6 +498,14 @@ interface SuffixScan {
 	stub: string | null;
 	/** Lowest `<repo>-N` slot that does not exist on disk. */
 	firstUnused: string | null;
+	/**
+	 * `<repo>-N` folders that are remote-less but carry this exact `repoName`.
+	 * A non-empty list means the base is NOT the unique remote-less candidate,
+	 * so Case C2 must not adopt it (ambiguous — which remote-less repo does the
+	 * caller's remote belong to?). Only populated meaningfully when the caller
+	 * has a remote; a remote-less caller matches these via `isSameRepo` instead.
+	 */
+	remotelessSameName: string[];
 }
 
 /**
@@ -483,6 +519,7 @@ function scanRepoSuffixes(parent: string, repoName: string, remoteUrl: string | 
 	let match: string | null = null;
 	let stub: string | null = null;
 	let firstUnused: string | null = null;
+	const remotelessSameName: string[] = [];
 	for (let suffix = 2; suffix <= 99; suffix++) {
 		const candidate = join(parent, `${repoName}-${suffix}`);
 		if (!existsSync(candidate)) {
@@ -495,8 +532,9 @@ function scanRepoSuffixes(parent: string, repoName: string, remoteUrl: string | 
 			break;
 		}
 		if (config && stub === null && isUnclaimedStub(candidate, config)) stub = candidate;
+		if (config && config.remoteUrl == null && config.repoName === repoName) remotelessSameName.push(candidate);
 	}
-	return { match, stub, firstUnused };
+	return { match, stub, firstUnused, remotelessSameName };
 }
 
 function findAvailablePathAndClaim(parent: string, repoName: string, remoteUrl: string | null): string {
@@ -540,6 +578,24 @@ function writeKBIdentity(kbRoot: string, repoName: string, remoteUrl: string | n
  */
 function isUnclaimedStub(_kbRoot: string, config: KBConfig): boolean {
 	return config.remoteUrl == null && config.repoName == null;
+}
+
+/**
+ * Detects a base folder eligible for Case C2 adopt-in-place: it carries this
+ * exact `repoName` but NO `remoteUrl`, and the caller now supplies one. This is
+ * a repo that recorded memory before its git remote existed and later gained
+ * it — adopting upgrades the folder's identity rather than spawning a
+ * `<repo>-N` sibling for the "same" repo.
+ *
+ * Narrower than `isUnclaimedStub` on purpose: a stub has neither field and is
+ * adopted by any caller (Case C); this requires a *matching name*, so a folder
+ * for a genuinely different repo (different name, or a name that doesn't match)
+ * is never adopted here. The remaining ambiguity — two distinct remote-less
+ * repos sharing one name — is resolved by the caller, which only adopts when
+ * this is the unique remote-less same-name candidate (`SuffixScan.remotelessSameName`).
+ */
+function isAdoptableRemotelessBase(config: KBConfig, remoteUrl: string | null, repoName: string): boolean {
+	return Boolean(remoteUrl) && config.remoteUrl == null && config.repoName === repoName;
 }
 
 function readKBConfig(kbRoot: string): KBConfig | null {

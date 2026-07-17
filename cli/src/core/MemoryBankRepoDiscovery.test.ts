@@ -2,7 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { discoverRepos } from "./MemoryBankRepoDiscovery.js";
+import { discoverRepos, validateExcludeGlob } from "./MemoryBankRepoDiscovery.js";
 
 function makeLocalFolder(): string {
 	const root = join(tmpdir(), `mbrd-${Math.random().toString(36).slice(2)}`);
@@ -75,5 +75,39 @@ describe("discoverRepos", () => {
 		roots.push(root);
 		const repos = await discoverRepos(root, []);
 		expect(repos.map((r) => r.folder)).toEqual(["alpha", "bravo", "delta", "mike", "yankee", "zeta"]);
+	});
+});
+
+describe("validateExcludeGlob", () => {
+	it("accepts exact names and `*` wildcards", () => {
+		for (const p of ["node_modules", "temp", "*-archive", "test*", "a*b*c", "*"]) {
+			expect(validateExcludeGlob(p)).toEqual({ valid: true });
+		}
+	});
+
+	// The six rejection cases the desktop Settings form relies on for inline errors.
+	it("rejects a non-string", () => {
+		expect(validateExcludeGlob(42 as unknown as string).valid).toBe(false);
+	});
+	it("rejects empty / whitespace-only", () => {
+		expect(validateExcludeGlob("").valid).toBe(false);
+		expect(validateExcludeGlob("   ").valid).toBe(false);
+	});
+	it("rejects a forward-slash path", () => {
+		const r = validateExcludeGlob("foo/bar");
+		expect(r.valid).toBe(false);
+		expect(r.error).toMatch(/separator/i);
+	});
+	it("rejects a backslash path", () => {
+		expect(validateExcludeGlob("foo\\bar").valid).toBe(false);
+	});
+	it("rejects `?` and bracket classes", () => {
+		expect(validateExcludeGlob("foo?").valid).toBe(false);
+		expect(validateExcludeGlob("foo[abc]").valid).toBe(false);
+	});
+	it("rejects `**`", () => {
+		const r = validateExcludeGlob("**");
+		expect(r.valid).toBe(false);
+		expect(r.error).toMatch(/exact names|wildcard/i);
 	});
 });

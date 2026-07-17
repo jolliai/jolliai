@@ -725,6 +725,19 @@ describe("SyncEngine.runRound — conflicts surface", () => {
 });
 
 describe("SyncEngine.runRound — onRoundComplete (P2 #1 chain-spawn hook)", () => {
+	it("runs a vault-only round without a source-repo mapping", async () => {
+		const { engine } = makeEngine({
+			context: {
+				memoryBankRoot: join(tempDir, "vault"),
+				author: { name: "Tester", email: "t@x" },
+			},
+		});
+
+		const result = await engine.runRound({ reason: "manual", transcripts: false });
+
+		expect(result.newState).toBe("synced");
+	});
+
 	it("fires onRoundComplete with the round cwd after a successful round", async () => {
 		const onRoundComplete = vi.fn();
 		const { engine } = makeEngine();

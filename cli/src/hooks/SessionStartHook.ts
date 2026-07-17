@@ -23,11 +23,11 @@
  *   - .jolli/jollimemory/plans.json → associated plan names
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { readFileFromBranch } from "../core/GitOps.js";
-import { normalizePlansRegistry } from "../core/SessionTracker.js";
+import { loadConfig, normalizePlansRegistry } from "../core/SessionTracker.js";
 import { getDisplayDate } from "../core/SummaryFormat.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
@@ -50,6 +50,73 @@ interface BriefingCache {
 	readonly generatedAt: string;
 }
 
+// ─── Login reminder (Claude Code plugin only) ────────────────────────────────
+
+/**
+ * Per-repo marker that silences the not-signed-in reminder. Lives beside the
+ * other per-project state (`.jolli/jollimemory/`) so it is worktree-scoped.
+ * Created on the user's request ("stop reminding me"); auto-removed once a
+ * credential appears (see {@link getLoginReminder}).
+ */
+const LOGIN_REMINDER_DISMISS_MARKER = "login-reminder-dismissed";
+
+/**
+ * Shown at session start when the Claude Code plugin has no way to generate
+ * memories yet. Plain text — Claude Code displays it to the user AND injects it
+ * into Claude's context, so it doubles as an instruction the agent can act on.
+ */
+const LOGIN_REMINDER_TEXT = [
+	"[Jolli Memory] Not signed in — no memories are being generated for your commits.",
+	"→ Run /jolli:login to sign in to Jolli (AI summaries, no Anthropic API key needed).",
+	"(To stop this reminder without signing in, create an empty file at" +
+		" .jolli/jollimemory/login-reminder-dismissed in this repo.)",
+].join("\n");
+
+/**
+ * Pure decision for whether to surface the not-signed-in reminder. Kept
+ * side-effect-free so every branch is unit-testable regardless of the build's
+ * `__JOLLI_CLIENT_KIND__` value (which is fixed to `"cli"` in the CLI build).
+ *
+ * Only the Claude Code plugin shows this: the CLI and VS Code surfaces have
+ * their own sign-in UX, and gating here keeps the reminder out of their
+ * session-start output.
+ */
+export function computeLoginReminder(clientKind: string, hasCredential: boolean, dismissed: boolean): string | null {
+	if (clientKind !== "claude-plugin") return null;
+	if (hasCredential) return null;
+	if (dismissed) return null;
+	return LOGIN_REMINDER_TEXT;
+}
+
+/**
+ * Wiring for {@link computeLoginReminder}: resolves the build's client kind,
+ * whether any LLM credential is configured (Jolli or Anthropic), and whether the
+ * dismiss marker is present — then returns the reminder text or null. Also cleans
+ * up a stale dismiss marker once a credential exists, so a later sign-out re-arms
+ * the reminder cleanly.
+ */
+export async function getLoginReminder(projectDir: string): Promise<string | null> {
+	/* v8 ignore next -- compile-time global fallback: vite (tests) and esbuild (builds) always define __JOLLI_CLIENT_KIND__, so the `: "cli"` arm is unreachable from unit tests; mirrors ClientHeader.ts / QueueWorker.ts */
+	const clientKind = typeof __JOLLI_CLIENT_KIND__ !== "undefined" ? __JOLLI_CLIENT_KIND__ : "cli";
+	const config = await loadConfig();
+	const hasCredential = Boolean(config.apiKey || config.jolliApiKey || process.env.ANTHROPIC_API_KEY);
+	const markerPath = join(projectDir, ".jolli", "jollimemory", LOGIN_REMINDER_DISMISS_MARKER);
+	const dismissed = existsSync(markerPath);
+
+	// Once a credential is present, a leftover dismiss marker is moot — remove it
+	// so signing out later starts from a clean slate.
+	if (hasCredential && dismissed) {
+		try {
+			rmSync(markerPath);
+		} catch {
+			// Non-fatal — a stale marker only suppresses a reminder that a present
+			// credential already suppresses.
+		}
+	}
+
+	return computeLoginReminder(clientKind, hasCredential, dismissed);
+}
+
 /**
  * Main entry point — called when this script is executed by Claude Code SessionStart hook.
  */
@@ -70,16 +137,28 @@ export async function main(): Promise<void> {
 
 		log.info("SessionStartHook invoked (cwd=%s)", projectDir);
 
-		const result = await Promise.race([generateBriefing(projectDir), timeout(HARD_TIMEOUT_MS)]);
+		const briefing = await Promise.race([generateBriefing(projectDir), timeout(HARD_TIMEOUT_MS)]);
+		// Compute the reminder defensively so it can never discard an
+		// already-computed briefing. getLoginReminder does only guarded I/O today,
+		// but isolating it keeps a future change from coupling the two outputs.
+		let reminder: string | null = null;
+		try {
+			reminder = await getLoginReminder(projectDir);
+			/* v8 ignore next 3 -- defensive: getLoginReminder's I/O is already guarded, so this catch is unreachable in tests */
+		} catch (err: unknown) {
+			log.info("Login reminder failed (non-fatal): %s", (err as Error).message);
+		}
 
-		if (result) {
-			log.info("Briefing generated (%d chars)", result.length);
-			// Output plain text — Claude Code displays it to the user AND
-			// injects it into Claude's context. JSON hookSpecificOutput is
-			// invisible to users, so we use plain text for visibility.
-			process.stdout.write(result);
+		// Output plain text — Claude Code displays it to the user AND injects it
+		// into Claude's context. JSON hookSpecificOutput is invisible to users, so
+		// we use plain text for visibility. The reminder leads (it is actionable);
+		// the branch briefing follows.
+		const sections = [reminder, briefing].filter((s): s is string => Boolean(s));
+		if (sections.length > 0) {
+			log.info("SessionStart output (%d sections)", sections.length);
+			process.stdout.write(sections.join("\n\n"));
 		} else {
-			log.info("No briefing generated (skipped or timed out)");
+			log.info("No briefing or reminder generated (skipped or timed out)");
 		}
 	} catch (error: unknown) {
 		/* v8 ignore next 2 - defensive: main() catches unexpected errors to never block session startup */

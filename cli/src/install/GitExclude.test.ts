@@ -13,7 +13,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { normalizeGitPathOutput, resolveGitExcludePath, updateGitExclude } from "./GitExclude.js";
+import {
+	addGitExcludePaths,
+	normalizeGitPathOutput,
+	removeGitExcludePaths,
+	resolveGitExcludePath,
+	updateGitExclude,
+} from "./GitExclude.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -218,6 +224,71 @@ describe("updateGitExclude — idempotency", () => {
 	});
 });
 
+// ─── addGitExcludePaths — union / merge semantics ──────────────────────────
+
+describe("addGitExcludePaths", () => {
+	it("creates the managed block when none exists", async () => {
+		await gitInit(tempDir);
+		const ok = await addGitExcludePaths(tempDir, ["/.claude/skills/jolli/"]);
+		expect(ok).toBe(true);
+
+		const excludePath = (await resolveGitExcludePath(tempDir)) as string;
+		const written = readFileSync(excludePath, "utf-8");
+		expect(written).toContain("# >>> jolli skill exclude >>>");
+		expect(written).toContain("/.claude/skills/jolli/");
+	});
+
+	it("unions new paths in WITHOUT dropping existing managed paths", async () => {
+		await gitInit(tempDir);
+		// A prior full `jolli enable` populated a larger block.
+		const full = ["/.agents/skills/jolli-recall/", "/.agents/skills/jolli-search/", "/.claude/skills/jolli/"];
+		await updateGitExclude(tempDir, full);
+
+		// The plugin's git-hooks-only path adds only its umbrella entry.
+		await addGitExcludePaths(tempDir, ["/.claude/skills/jolli/"]);
+
+		const excludePath = (await resolveGitExcludePath(tempDir)) as string;
+		const written = readFileSync(excludePath, "utf-8");
+		// Every prior entry survives — the block was NOT shrunk to the one added.
+		for (const p of full) {
+			expect(written).toContain(p);
+		}
+		// Still exactly one managed block.
+		expect(written.match(/# >>> jolli skill exclude >>>/g)?.length).toBe(1);
+	});
+
+	it("is a no-op when the added path is already present (no churn each SessionStart)", async () => {
+		await gitInit(tempDir);
+		// Full-install set already contains the plugin umbrella entry.
+		await updateGitExclude(tempDir, ["/.agents/skills/jolli-recall/", "/.claude/skills/jolli/"]);
+		const excludePath = (await resolveGitExcludePath(tempDir)) as string;
+		const before = readFileSync(excludePath, "utf-8");
+
+		const ok = await addGitExcludePaths(tempDir, ["/.claude/skills/jolli/"]);
+		expect(ok).toBe(true);
+		const after = readFileSync(excludePath, "utf-8");
+		// Byte-identical: the M1 regression — the plugin re-running enable on every
+		// SessionStart must not rewrite the file.
+		expect(after).toBe(before);
+	});
+
+	it("appends a genuinely new path after the existing ones", async () => {
+		await gitInit(tempDir);
+		await addGitExcludePaths(tempDir, ["/.claude/skills/jolli/"]);
+		await addGitExcludePaths(tempDir, ["/.agents/skills/jolli/"]);
+
+		const excludePath = (await resolveGitExcludePath(tempDir)) as string;
+		const written = readFileSync(excludePath, "utf-8");
+		expect(written.indexOf("/.claude/skills/jolli/")).toBeLessThan(written.indexOf("/.agents/skills/jolli/"));
+		expect(written.match(/# >>> jolli skill exclude >>>/g)?.length).toBe(1);
+	});
+
+	it("returns false (no throw) when projectDir is not a git repo", async () => {
+		const ok = await addGitExcludePaths(tempDir, ["/.claude/skills/jolli/"]);
+		expect(ok).toBe(false);
+	});
+});
+
 // ─── updateGitExclude — failure modes ──────────────────────────────────────
 
 describe("updateGitExclude — failure modes", () => {
@@ -264,5 +335,75 @@ describe("updateGitExclude — linked worktree", () => {
 
 		const written = readFileSync(wtExcludePath, "utf-8");
 		expect(written).toContain("/.agents/skills/jolli-recall/");
+	});
+});
+
+// ─── removeGitExcludePaths ─────────────────────────────────────────────────
+
+describe("removeGitExcludePaths", () => {
+	it("removes only the named paths, keeping the other managed entries", async () => {
+		await gitInit(tempDir);
+		await updateGitExclude(tempDir, [
+			"/.claude/skills/jolli/",
+			"/.agents/skills/jolli/",
+			"/.claude/skills/jolli-recall/",
+			"/.agents/skills/jolli-recall/",
+		]);
+
+		const ok = await removeGitExcludePaths(tempDir, ["/.claude/skills/jolli/", "/.agents/skills/jolli/"]);
+		expect(ok).toBe(true);
+
+		const excludePath = (await resolveGitExcludePath(tempDir)) as string;
+		const written = readFileSync(excludePath, "utf-8");
+		// Umbrella lines gone…
+		expect(written).not.toContain("/.claude/skills/jolli/\n");
+		expect(written).not.toContain("/.agents/skills/jolli/\n");
+		// …siblings and markers preserved.
+		expect(written).toContain("/.claude/skills/jolli-recall/");
+		expect(written).toContain("/.agents/skills/jolli-recall/");
+		expect(written).toContain("# >>> jolli skill exclude >>>");
+		expect(written).toContain("# <<< jolli skill exclude <<<");
+	});
+
+	it("drops the whole block (markers included) when the last managed path is removed", async () => {
+		await gitInit(tempDir);
+		const excludePath = (await resolveGitExcludePath(tempDir)) as string;
+		await writeFile(excludePath, "my-personal-ignore\n", "utf-8");
+		await updateGitExclude(tempDir, ["/.claude/skills/jolli/"]);
+
+		const ok = await removeGitExcludePaths(tempDir, ["/.claude/skills/jolli/", "/.agents/skills/jolli/"]);
+		expect(ok).toBe(true);
+
+		const written = readFileSync(excludePath, "utf-8");
+		expect(written).not.toContain("# >>> jolli skill exclude >>>");
+		expect(written).not.toContain("# <<< jolli skill exclude <<<");
+		// Unrelated user content survives.
+		expect(written).toContain("my-personal-ignore");
+	});
+
+	it("is a no-op when there is no managed block", async () => {
+		await gitInit(tempDir);
+		const excludePath = (await resolveGitExcludePath(tempDir)) as string;
+		await writeFile(excludePath, "just-user-content\n", "utf-8");
+
+		const ok = await removeGitExcludePaths(tempDir, ["/.claude/skills/jolli/"]);
+		expect(ok).toBe(true);
+		expect(readFileSync(excludePath, "utf-8")).toBe("just-user-content\n");
+	});
+
+	it("returns true when the exclude file does not exist", async () => {
+		await gitInit(tempDir);
+		const fs = await import("node:fs/promises");
+		const excludePath = (await resolveGitExcludePath(tempDir)) as string;
+		await fs.rm(excludePath, { force: true });
+
+		const ok = await removeGitExcludePaths(tempDir, ["/.claude/skills/jolli/"]);
+		expect(ok).toBe(true);
+	});
+
+	it("returns false when projectDir is not a git repo", async () => {
+		// No gitInit — resolveGitExcludePath returns null.
+		const ok = await removeGitExcludePaths(tempDir, ["/.claude/skills/jolli/"]);
+		expect(ok).toBe(false);
 	});
 });

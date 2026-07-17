@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	compareSemver,
 	deriveSourceTag,
+	isValidSourceTag,
 	migrateLegacyDistPath,
 	pickBestDistPath,
 	pruneStaleDistPaths,
@@ -247,6 +248,44 @@ describe("DistPathResolver", () => {
 
 		it("should normalize Windows-style backslash paths", () => {
 			expect(deriveSourceTag("C:\\Users\\x\\.cursor\\extensions\\jolli.foo\\dist")).toBe("cursor");
+		});
+
+		it("always produces a tag that passes isValidSourceTag", () => {
+			for (const p of [
+				"/Users/x/.vscode/extensions/jolli.foo/dist",
+				"/Users/x/.newide/extensions/jolli.foo/dist",
+				"/opt/custom/jollimemory/dist",
+			]) {
+				expect(isValidSourceTag(deriveSourceTag(p))).toBe(true);
+			}
+		});
+	});
+
+	// ── isValidSourceTag ─────────────────────────────────────────────────
+
+	describe("isValidSourceTag", () => {
+		it("accepts lowercase alphanumerics and hyphens", () => {
+			for (const ok of ["cli", "vscode", "claude-plugin", "intellij", "a1b2c3d4", "x"]) {
+				expect(isValidSourceTag(ok)).toBe(true);
+			}
+		});
+
+		it("rejects shell-metacharacter, whitespace, path-traversal and empty tags", () => {
+			for (const bad of [
+				"",
+				"bad tag",
+				"a;rm -rf /",
+				"a$(whoami)",
+				"a`id`",
+				"a|b",
+				"../evil",
+				"a/b",
+				"-leading-hyphen",
+				"UPPER",
+				"emoji😀",
+			]) {
+				expect(isValidSourceTag(bad)).toBe(false);
+			}
 		});
 	});
 

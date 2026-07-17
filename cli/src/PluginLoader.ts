@@ -44,6 +44,7 @@ import { Command } from "commander";
 import { satisfies } from "semver";
 import type { PluginContext, PluginRegister } from "./Api.js";
 import { setHelpGroup } from "./commands/HelpGroups.js";
+import { isClaudePluginBuild } from "./core/ClientHeader.js";
 import { getGlobalConfigDir } from "./core/SessionTracker.js";
 import { KNOWN_PLUGINS, type KnownPlugin } from "./KnownPlugins.js";
 import { createLogger, errMsg } from "./Logger.js";
@@ -177,6 +178,24 @@ interface DiscoveryResult {
  */
 async function discoverKnownPlugins(opts?: LoadPluginsOptions): Promise<DiscoveryResult> {
 	const known = opts?.knownPluginsOverride ?? KNOWN_PLUGINS;
+	// The Claude Code plugin bundles this CLI purely to run `mcp` and
+	// `enable --git-hooks-only` — it is a fixed command surface, not a plugin host.
+	// Left un-gated, every invocation of the plugin's bundled Cli.js would scan the
+	// user's global npm root (`npm root -g`) and try to load whatever host-CLI
+	// plugins (site-cli / space-cli) happen to be installed there — emitting a
+	// peer-mismatch skip warning plus a version-upgrade notice for a plugin this
+	// surface never uses. Kill discovery for that bundle (same effect as
+	// JOLLI_NO_PLUGINS=1). `isClaudePluginBuild()` reads the build-define
+	// `__JOLLI_CLIENT_KIND__` through a `typeof` guard so an unbundled `tsx`
+	// run (`npm run cli`) doesn't throw; it is fixed to "cli" in the cli
+	// test/prod build, so the branch below is unreachable under coverage —
+	// hence the ignore, matching how the repo handles other build-define
+	// branches.
+	/* v8 ignore start -- build-define branch: __JOLLI_CLIENT_KIND__ === "cli" in the cli build */
+	if (isClaudePluginBuild()) {
+		return { known, found: [], skipped: true };
+	}
+	/* v8 ignore stop */
 	if (process.env.JOLLI_NO_PLUGINS === "1") {
 		return { known, found: [], skipped: true };
 	}

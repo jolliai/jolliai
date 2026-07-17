@@ -16,6 +16,7 @@ vi.mock("node:os", async (importOriginal) => {
 // Mock GitOps for status check and multi-worktree support
 vi.mock("../core/GitOps.js", () => ({
 	orphanBranchExists: vi.fn().mockResolvedValue(false),
+	isInsideGitRepo: vi.fn().mockResolvedValue(true),
 	listWorktrees: vi.fn().mockImplementation(async (cwd: string) => [cwd]),
 	getGitCommonDir: vi.fn().mockImplementation(async (cwd: string) => join(cwd, ".git")),
 	getProjectRootDir: vi.fn().mockImplementation(async (cwd: string) => cwd),
@@ -301,6 +302,124 @@ describe("Installer", () => {
 			expect(await exists(join(distPaths, "cli"))).toBe(false);
 		});
 
+		it("git-hooks-only installs git hooks but no MCP/skills/agent hooks", async () => {
+			const exists = (p: string) =>
+				stat(p)
+					.then(() => true)
+					.catch(() => false);
+
+			// Seed leftovers a prior full `jolli enable` would have written: the
+			// unnamespaced Claude skill, the cross-platform copy, and a user's own
+			// skill. git-hooks-only must leave ALL of them untouched (it no longer
+			// deletes another surface's skills).
+			await mkdir(join(tempDir, ".claude", "skills", "jolli-recall"), { recursive: true });
+			await writeFile(join(tempDir, ".claude", "skills", "jolli-recall", "SKILL.md"), "stale", "utf-8");
+			await mkdir(join(tempDir, ".claude", "skills", "my-custom-skill"), { recursive: true });
+			await writeFile(join(tempDir, ".claude", "skills", "my-custom-skill", "SKILL.md"), "mine", "utf-8");
+			await mkdir(join(tempDir, ".agents", "skills", "jolli-recall"), { recursive: true });
+			await writeFile(join(tempDir, ".agents", "skills", "jolli-recall", "SKILL.md"), "keep", "utf-8");
+
+			const result = await install(tempDir, { gitHooksOnly: true, sourceTag: "claude-plugin" });
+			expect(result.success).toBe(true);
+
+			// Git hooks ARE installed — the whole point of the mode (mirror of integrations-only).
+			expect(await exists(join(tempDir, ".git", "hooks", "post-commit"))).toBe(true);
+			expect(await exists(join(tempDir, ".git", "hooks", "post-rewrite"))).toBe(true);
+			expect(await exists(join(tempDir, ".git", "hooks", "prepare-commit-msg"))).toBe(true);
+			expect(await exists(join(tempDir, ".git", "hooks", "post-merge"))).toBe(true);
+			expect(await exists(join(tempDir, ".git", "hooks", "pre-push"))).toBe(true);
+			expect(result.gitHookPath).toBeDefined();
+
+			// Soft prefer: every git hook the plugin installs carries
+			// JOLLI_DIST_PREFER_SOURCE=<sourceTag>, so its dist wins a version tie at
+			// resolve time but a strictly-higher-version vscode/cursor dist can still
+			// win (the former hard JOLLI_DIST_SOURCE pin is gone — all sources compete).
+			for (const hook of ["post-commit", "post-rewrite", "prepare-commit-msg", "post-merge", "pre-push"]) {
+				const body = await readFile(join(tempDir, ".git", "hooks", hook), "utf-8");
+				expect(body, `${hook} should soft-prefer its source`).toContain(
+					"JOLLI_DIST_PREFER_SOURCE='claude-plugin'",
+				);
+				expect(body, `${hook} must not carry the old hard pin`).not.toContain("JOLLI_DIST_SOURCE=");
+			}
+
+			// No integrations: MCP registration and Claude agent hooks are skipped, and
+			// git-hooks-only writes NONE of the unnamespaced skill set — only the bare
+			// `/jolli` umbrella (asserted below). `jolli-search` is never seeded, and its
+			// continued absence proves the full skill set is not installed here.
+			expect(await exists(join(tempDir, ".mcp.json"))).toBe(false);
+			expect(await exists(join(tempDir, ".claude", "settings.local.json"))).toBe(false);
+			expect(await exists(join(tempDir, ".agents", "skills", "jolli-search", "SKILL.md"))).toBe(false);
+			expect(await exists(join(tempDir, ".claude", "skills", "jolli-search", "SKILL.md"))).toBe(false);
+
+			// The dispatch scripts + dist-path entry the git hooks resolve through ARE written,
+			// under the explicit source tag so the plugin coexists with a CLI install.
+			const distPaths = join(fakeHomeDir, ".jolli", "jollimemory", "dist-paths");
+			expect(await exists(join(distPaths, "claude-plugin"))).toBe(true);
+
+			// The plugin bootstrap must NOT write ~/.claude/CLAUDE.md — it never
+			// silently edits the user's global instruction file. Nothing seeded a
+			// block here, so removeGlobalInstructions is a no-op and the file is
+			// never created. (A separate test seeds a block to prove removal.)
+			const claudeMd = join(fakeHomeDir, ".claude", "CLAUDE.md");
+			expect(await exists(claudeMd)).toBe(false);
+
+			// No skill deletion: the plugin no longer purges the unnamespaced
+			// .claude/skills/jolli-* a prior full `jolli enable` may have written — one
+			// surface must not stomp another's state. The seeded stale copy, the
+			// .agents/ copy, and the user's own skill are ALL left intact.
+			expect(await exists(join(tempDir, ".claude", "skills", "jolli-recall", "SKILL.md"))).toBe(true);
+			expect(await exists(join(tempDir, ".agents", "skills", "jolli-recall", "SKILL.md"))).toBe(true);
+			expect(await exists(join(tempDir, ".claude", "skills", "my-custom-skill", "SKILL.md"))).toBe(true);
+
+			// Bare `/jolli` umbrella: a non-plugin project skill (a plugin skill could
+			// only ever be `/jolli:<name>`). Written to the Claude Code target ONLY,
+			// routing to the plugin's own namespaced skills. (Its .git/info/exclude
+			// registration is exercised too but not asserted here — this fixture's
+			// `.git` is a bare hooks dir, not a real repo, so git rev-parse no-ops.)
+			const umbrella = join(tempDir, ".claude", "skills", "jolli", "SKILL.md");
+			expect(await exists(umbrella)).toBe(true);
+			expect(await readFile(umbrella, "utf-8")).toContain("jolli:recall");
+			expect(await exists(join(tempDir, ".agents", "skills", "jolli", "SKILL.md"))).toBe(false);
+		});
+
+		it("git-hooks-only removes a CLAUDE.md block a prior plugin version wrote, keeping other content", async () => {
+			const exists = (p: string) =>
+				stat(p)
+					.then(() => true)
+					.catch(() => false);
+
+			// Seed ~/.claude/CLAUDE.md with the Jolli block wrapped in the user's own content.
+			const claudeMd = join(fakeHomeDir, ".claude", "CLAUDE.md");
+			await mkdir(join(fakeHomeDir, ".claude"), { recursive: true });
+			const userContent = "# My own global instructions\n\nKeep me.\n";
+			await writeFile(claudeMd, `${userContent}\n${renderInstructionsBlock()}`, "utf-8");
+
+			const result = await install(tempDir, { gitHooksOnly: true, sourceTag: "claude-plugin" });
+			expect(result.success).toBe(true);
+
+			// The marker-bracketed Jolli block is stripped; the user's content survives.
+			expect(await exists(claudeMd)).toBe(true);
+			const after = await readFile(claudeMd, "utf-8");
+			expect(after).toContain("Keep me.");
+			expect(after).not.toContain("jolli-recall");
+		});
+
+		it("rejects integrations-only and git-hooks-only together", async () => {
+			const result = await install(tempDir, { integrationsOnly: true, gitHooksOnly: true });
+			expect(result.success).toBe(false);
+			expect(result.message).toContain("mutually exclusive");
+		});
+
+		it("skips early with a clear reason when the target is not a git repository", async () => {
+			const { isInsideGitRepo, listWorktrees } = await import("../core/GitOps.js");
+			vi.mocked(isInsideGitRepo).mockResolvedValueOnce(false);
+			const result = await install(tempDir);
+			expect(result.success).toBe(false);
+			expect(result.message).toContain("Not a git repository");
+			// Bailed before enumerating worktrees — no confusing deep git failure.
+			expect(vi.mocked(listWorktrees)).not.toHaveBeenCalled();
+		});
+
 		it("should auto-enable Codex discovery when Codex is detected and not configured", async () => {
 			const { isCodexInstalled } = await import("../core/CodexSessionDiscoverer.js");
 			vi.mocked(isCodexInstalled).mockResolvedValueOnce(true);
@@ -549,6 +668,9 @@ describe("Installer", () => {
 			expect(content).toContain("JolliMemory");
 			expect(content).toContain("run-hook");
 			expect(content).toContain("post-commit");
+			// A shared (non-git-hooks-only) install keeps the cross-source resolver —
+			// no source pin, so it can pick up a newer dist from any surface.
+			expect(content).not.toContain("JOLLI_DIST_SOURCE");
 		});
 
 		it("should create git post-rewrite hook", async () => {
@@ -1102,6 +1224,45 @@ describe("Installer", () => {
 			const content = await readFile(settingsPath, "utf-8");
 			const settings = JSON.parse(content);
 			expect(settings.hooks).toBeUndefined();
+		});
+
+		it("removes the bare /jolli umbrella menu on uninstall, keeping jolli-* siblings", async () => {
+			const exists = (p: string) =>
+				stat(p)
+					.then(() => true)
+					.catch(() => false);
+
+			await install(tempDir);
+			// A full install writes the umbrella (vendor-marked) to BOTH host targets.
+			expect(await exists(join(tempDir, ".claude", "skills", "jolli", "SKILL.md"))).toBe(true);
+			expect(await exists(join(tempDir, ".agents", "skills", "jolli", "SKILL.md"))).toBe(true);
+
+			const result = await uninstall(tempDir);
+			expect(result.success).toBe(true);
+
+			// The bare umbrella is removed from every target — it lives outside the
+			// plugin and would otherwise orphan into a broken menu.
+			expect(await exists(join(tempDir, ".claude", "skills", "jolli"))).toBe(false);
+			expect(await exists(join(tempDir, ".agents", "skills", "jolli"))).toBe(false);
+			// …but the unnamespaced jolli-* siblings are left in place (conservative policy).
+			expect(await exists(join(tempDir, ".agents", "skills", "jolli-recall", "SKILL.md"))).toBe(true);
+		});
+
+		it("leaves a user's own `jolli` skill (no vendor marker) untouched on uninstall", async () => {
+			const exists = (p: string) =>
+				stat(p)
+					.then(() => true)
+					.catch(() => false);
+
+			await install(tempDir);
+			// Simulate the user replacing the generated umbrella with their own skill.
+			await writeFile(join(tempDir, ".claude", "skills", "jolli", "SKILL.md"), "# my own jolli skill\n", "utf-8");
+
+			await uninstall(tempDir);
+
+			// Ours (agents copy, vendor-marked) is gone; the user's Claude copy stays.
+			expect(await exists(join(tempDir, ".claude", "skills", "jolli", "SKILL.md"))).toBe(true);
+			expect(await exists(join(tempDir, ".agents", "skills", "jolli"))).toBe(false);
 		});
 
 		it("integrations-only uninstall removes repo MCP but leaves hooks + skills", async () => {

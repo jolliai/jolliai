@@ -38,6 +38,7 @@ import {
 	runQueueStatus,
 	runRecall,
 	runSearch,
+	runStatus,
 } from "./McpTools.js";
 import { isPlatformToolsEnabled } from "./PlatformTools.js";
 
@@ -160,6 +161,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 			},
 		},
 	},
+	{
+		name: "status",
+		description:
+			"Report Jolli Memory's installation & configuration health for this repo: which hooks are installed, the active hook runtime, data-migration state, account / API-key configuration, detected AI integrations with their session counts, the stored-memory count, and the orphan branch. This is the environment health check — pair it with queue_status (generation progress), not list_branches (recorded memory).",
+		inputSchema: { type: "object", properties: {} },
+	},
 ];
 
 /** Route a validated tool call to its handler. Throws on unknown tool. */
@@ -180,6 +187,8 @@ export async function dispatchTool(cwd: string, name: string, args: Record<strin
 			return runGetPrDescription(cwd, args as { baseBranch?: string; includeMarkers?: boolean });
 		case "queue_status":
 			return runQueueStatus(cwd, args as { wait?: boolean; timeoutMs?: number });
+		case "status":
+			return runStatus(cwd);
 		case "push_memory":
 			return runPushMemory(cwd, args as { baseBranch?: string; space?: string });
 		case "list_spaces":

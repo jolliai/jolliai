@@ -14,8 +14,11 @@ import { dirname, join, resolve } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { CommitInfo, DiffStats, FileWrite, GitCommandResult } from "../Types.js";
 import { execFileAsyncHidden, spawnHidden } from "../util/Subprocess.js";
+import { mapWithConcurrency } from "./Concurrency.js";
 
 const MAX_GIT_BUFFER_BYTES = 10 * 1024 * 1024; // 10MB
+/** Max concurrent `git diff --no-index` spawns when capturing untracked files. */
+const UNTRACKED_DIFF_CONCURRENCY = 8;
 /** NUL byte — used as entry separator in `git ls-tree -z` output. */
 const NUL = "\x00";
 
@@ -322,13 +325,13 @@ export async function getWorkingTreeDiffStats(relativePaths: ReadonlyArray<strin
 	}
 	const [trackedResult, untrackedRaw] = await Promise.all([
 		execGit(["diff", "--stat", "HEAD", "--", ...relativePaths], cwd),
-		execGit(["ls-files", "--others", "--exclude-standard", "--", ...relativePaths], cwd),
+		// `-z` emits raw NUL-separated paths (no C-style quoting), so a filename
+		// with non-ASCII bytes or embedded whitespace isn't mangled and then
+		// silently dropped from the untracked set.
+		execGit(["ls-files", "-z", "--others", "--exclude-standard", "--", ...relativePaths], cwd),
 	]);
 	const tracked = parseDiffStatSummary(trackedResult.stdout);
-	const untrackedPaths = untrackedRaw.stdout
-		.split("\n")
-		.map((l) => l.trim())
-		.filter(Boolean);
+	const untrackedPaths = untrackedRaw.stdout.split(NUL).filter((p) => p.length > 0);
 	if (untrackedPaths.length === 0) {
 		return tracked;
 	}
@@ -348,6 +351,71 @@ export async function getWorkingTreeDiffStats(relativePaths: ReadonlyArray<strin
 		insertions: tracked.insertions + untrackedInsertions,
 		deletions: tracked.deletions,
 	};
+}
+
+/** A working-tree capture: the full diff body plus its parsed stat totals. */
+export interface WorkingTreeDiff {
+	readonly content: string;
+	readonly stats: DiffStats;
+}
+
+/**
+ * Captures the whole *working tree* as a diff against HEAD — staged + unstaged
+ * tracked changes plus untracked files — for the pre-commit "checkpoint" capture
+ * (transcript + working-tree diff → topics). Read-only: the index is never
+ * touched, so it is safe to call at any time during a live session.
+ *
+ * Tracked changes come from `git diff HEAD`. Untracked files are added back as
+ * full "new file" additions (`git diff --no-index -- /dev/null <path>`) because
+ * `git diff HEAD` silently omits them, yet they are part of the uncommitted work
+ * a checkpoint is meant to preserve. This mirrors {@link getWorkingTreeDiffStats}
+ * (same `/dev/null` numstat trick) so content and stats agree.
+ *
+ * `content` is capped to `maxChars` the same way {@link getDiffContent} caps a
+ * ref-to-ref diff (full `--stat` list prepended, head of body within budget), so
+ * a large working tree can't blow the summarizer's prompt budget.
+ */
+export async function getWorkingTreeDiff(cwd?: string, maxChars = 150000): Promise<WorkingTreeDiff> {
+	const [trackedDiff, untrackedRaw, trackedStatRes] = await Promise.all([
+		execGit(["diff", "HEAD"], cwd),
+		// `-z`: raw NUL-separated paths so untracked files with non-ASCII bytes or
+		// embedded whitespace aren't quoted-then-dropped (mirrors
+		// getWorkingTreeDiffStats).
+		execGit(["ls-files", "-z", "--others", "--exclude-standard"], cwd),
+		execGit(["diff", "--stat", "HEAD"], cwd),
+	]);
+	const untrackedPaths = untrackedRaw.stdout.split(NUL).filter((p) => p.length > 0);
+
+	const parts: string[] = [];
+	if (trackedDiff.stdout) parts.push(trackedDiff.stdout);
+	// Diff each untracked file in bounded parallel rather than sequentially — a
+	// working tree with many new files would otherwise pay O(N) serial git spawns.
+	// mapWithConcurrency preserves input order, so the assembled patch is stable.
+	let untrackedInsertions = 0;
+	const untrackedResults = await mapWithConcurrency(untrackedPaths, UNTRACKED_DIFF_CONCURRENCY, async (p) => {
+		// `--no-index` exits 1 whenever there is a diff (always, for a new file);
+		// execGit captures stdout regardless of exit code. `/dev/null` is a git-ism
+		// honoured cross-platform, matching getWorkingTreeDiffStats's numstat call.
+		const [patch, numstat] = await Promise.all([
+			execGit(["diff", "--no-index", "--", "/dev/null", p], cwd),
+			execGit(["diff", "--no-index", "--numstat", "--", "/dev/null", p], cwd),
+		]);
+		const added = Number.parseInt(numstat.stdout.split("\t")[0] ?? "", 10);
+		return { patch: patch.stdout, added: Number.isFinite(added) ? added : 0 };
+	});
+	for (const r of untrackedResults) {
+		if (r.patch) parts.push(r.patch);
+		untrackedInsertions += r.added;
+	}
+
+	const content = await capDiffToBudget(parts.join("\n"), ["diff", "--stat", "HEAD"], cwd, maxChars);
+	const trackedStats = parseDiffStatSummary(trackedStatRes.stdout);
+	const stats: DiffStats = {
+		filesChanged: trackedStats.filesChanged + untrackedPaths.length,
+		insertions: trackedStats.insertions + untrackedInsertions,
+		deletions: trackedStats.deletions,
+	};
+	return { content, stats };
 }
 
 /**
@@ -844,6 +912,20 @@ export async function getGitCommonDir(cwd: string): Promise<string> {
 export async function getProjectRootDir(cwd: string): Promise<string> {
 	const gitCommonDir = await getGitCommonDir(cwd);
 	return dirname(gitCommonDir);
+}
+
+/**
+ * Whether `cwd` is inside any git repository (`git rev-parse --git-dir` exits 0).
+ * Cheap guard for operations that only make sense in a repo (hook install,
+ * worktree enumeration): lets callers bail with a clear reason instead of
+ * failing deep inside a git subcommand. Never throws — a non-repo `cwd` (or a
+ * missing `git`) resolves to `false`. Intentionally returns `true` for any git
+ * context — including a bare repo that hosts linked worktrees — so it only
+ * blocks genuinely-non-git directories and never a valid `git worktree` setup.
+ */
+export async function isInsideGitRepo(cwd: string): Promise<boolean> {
+	const result = await execGit(["rev-parse", "--git-dir"], cwd);
+	return result.exitCode === 0;
 }
 
 /**

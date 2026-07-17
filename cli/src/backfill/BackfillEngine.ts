@@ -16,6 +16,7 @@
 
 import { execGit, getCommitInfo, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
+import { hasLlmCredentials } from "../core/LlmClient.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
@@ -23,6 +24,7 @@ import { generateSummary } from "../core/Summarizer.js";
 import { getIndexEntryMap, setActiveStorage, storeSummary } from "../core/SummaryStore.js";
 import { generateTranscriptId } from "../core/TranscriptId.js";
 import { buildMultiSessionContext } from "../core/TranscriptReader.js";
+import { withCommitCaptureLock } from "../hooks/CommitCaptureLock.js";
 import { launchWorker } from "../hooks/QueueWorker.js";
 import { createLogger } from "../Logger.js";
 import { type CommitSummary, CURRENT_SCHEMA_VERSION, type StoredTranscript } from "../Types.js";
@@ -63,7 +65,7 @@ const CURSOR_BACK_MARGIN_MS = 7 * 24 * 60 * 60 * 1000;
  */
 export const DEFAULT_BACKFILL_TIER: "high" | "medium" | "low" = "low";
 
-export type BackfillStatus = "generated" | "would-generate" | "skipped-has-summary" | "error";
+export type BackfillStatus = "generated" | "would-generate" | "skipped-has-summary" | "skipped-in-progress" | "error";
 
 export interface BackfillOutcome {
 	readonly commitHash: string;
@@ -143,18 +145,6 @@ async function worktreeRoots(cwd: string): Promise<string[]> {
 		}
 	}
 	return [...roots];
-}
-
-function hasLlmCredentials(config: {
-	apiKey?: string;
-	jolliApiKey?: string;
-	aiProvider?: "anthropic" | "jolli" | "local-agent";
-}): boolean {
-	// local-agent drives the tool's own subscription login, not a
-	// jollimemory-held credential — presence of apiKey/jolliApiKey/ANTHROPIC_API_KEY
-	// is not the blocker for it (mirrors resolveLlmCredentialSource in LlmClient.ts).
-	if (config.aiProvider === "local-agent") return true;
-	return Boolean(config.apiKey || config.jolliApiKey || process.env.ANTHROPIC_API_KEY);
 }
 
 /** Converts an attributed commit's sessions into the orphan-branch transcript artifact. */
@@ -349,17 +339,29 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 			outcome = { commitHash: hash, status: "error", message: "no LLM credentials configured" };
 		} else {
 			try {
-				const topics = await generateAndStore(hash, attr, cwd, llmConfig, storage);
-				log.info("Back-fill generated %s via %s (%d topics)", hash.substring(0, 8), method, topics);
-				outcome = {
-					commitHash: hash,
-					status: "generated",
-					method,
-					topics,
-					sessions: attr?.sessions.length ?? 0,
-					conversationTurns: attr?.conversationTurns ?? 0,
-					...(attr ? { confidence: attr.confidence } : {}),
-				};
+				const capture = await withCommitCaptureLock(cwd, hash, "fail-fast", async () => {
+					const latest = await getIndexEntryMap(cwd, storage);
+					if (latest.has(hash)) return null;
+					return generateAndStore(hash, attr, cwd, llmConfig, storage);
+				});
+				if (!capture.ran) {
+					log.info("Back-fill skipped %s: live capture in progress", hash.substring(0, 8));
+					outcome = { commitHash: hash, status: "skipped-in-progress" };
+				} else if (capture.value === null) {
+					outcome = { commitHash: hash, status: "skipped-has-summary" };
+				} else {
+					const topics = capture.value;
+					log.info("Back-fill generated %s via %s (%d topics)", hash.substring(0, 8), method, topics);
+					outcome = {
+						commitHash: hash,
+						status: "generated",
+						method,
+						topics,
+						sessions: attr?.sessions.length ?? 0,
+						conversationTurns: attr?.conversationTurns ?? 0,
+						...(attr ? { confidence: attr.confidence } : {}),
+					};
+				}
 			} catch (err) {
 				outcome = { commitHash: hash, status: "error", message: (err as Error).message };
 				log.error("Back-fill failed for %s: %s", hash.substring(0, 8), (err as Error).message);

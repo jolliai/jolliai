@@ -32,18 +32,40 @@ vi.mock("../core/GitRemoteUtils.js", () => ({
 	getCanonicalRepoUrl: vi.fn(),
 	deriveRepoNameFromUrl: vi.fn(),
 }));
+// Partial mocks: `runStatus` needs these three overridden, but the real
+// `QueueStatus`/`SourceTimeline` handlers exercised elsewhere in this file still
+// need the other `SessionTracker` exports, so preserve them via importOriginal.
+vi.mock("../install/Installer.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../install/Installer.js")>()),
+	getStatus: vi.fn(),
+}));
+vi.mock("../core/SessionTracker.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../core/SessionTracker.js")>()),
+	loadConfigFromDir: vi.fn(),
+	getGlobalConfigDir: vi.fn(),
+}));
+vi.mock("../auth/AuthConfig.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../auth/AuthConfig.js")>()),
+	loadAuthToken: vi.fn(),
+}));
 
+import { loadAuthToken } from "../auth/AuthConfig.js";
+import { VERSION } from "../commands/CliUtils.js";
 import { buildRecallPayload, compileTaskContext, listBranchCatalog } from "../core/ContextCompiler.js";
 import { deriveRepoNameFromUrl, getCanonicalRepoUrl } from "../core/GitRemoteUtils.js";
 import { BindingAlreadyExistsError, JolliMemoryPushClient } from "../core/JolliMemoryPushClient.js";
 import { pushBranchToJolli, resolveSpaceId } from "../core/JolliMemoryPushOrchestrator.js";
 import { buildPrDescription } from "../core/PrDescription.js";
 import { SearchIndex } from "../core/SearchIndex.js";
+import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import { clearSpaceBindingCache } from "../core/SpaceBindingCache.js";
 import { getActiveStorage } from "../core/SummaryStore.js";
 import { readTopicPage } from "../core/TopicPageStore.js";
+import { getStatus } from "../install/Installer.js";
+import type { StatusInfo } from "../Types.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import {
+	buildStatusSummary,
 	runBindSpace,
 	runDecisionTimeline,
 	runGetPrDescription,
@@ -53,6 +75,7 @@ import {
 	runQueueStatus,
 	runRecall,
 	runSearch,
+	runStatus,
 } from "./McpTools.js";
 
 const MockClient = vi.mocked(JolliMemoryPushClient);
@@ -352,5 +375,243 @@ describe("runBindSpace", () => {
 		});
 		setClientStub({ createBinding });
 		await expect(runBindSpace("/repo", { space: "acme" })).rejects.toThrow("HTTP 500");
+	});
+});
+
+/** Builds a StatusInfo fixture; override only the fields a case cares about. */
+function makeStatus(over: Partial<StatusInfo> = {}): StatusInfo {
+	return {
+		enabled: true,
+		claudeHookInstalled: false,
+		gitHookInstalled: false,
+		geminiHookInstalled: false,
+		activeSessions: 0,
+		mostRecentSession: null,
+		summaryCount: 0,
+		orphanBranch: "jollimemory/summaries/v3",
+		...over,
+	};
+}
+
+describe("buildStatusSummary", () => {
+	const account = {
+		signedIn: true,
+		jolliApiKeyConfigured: true,
+		anthropicKeyConfigured: true,
+		site: "https://acme.jolli.ai",
+		diskBacked: true,
+		claudeEnabled: true,
+	};
+
+	it("summarises a full install (5 Git, runtime, migrated, disk-backed site, one integration)", () => {
+		const r = buildStatusSummary(
+			makeStatus({
+				gitHookInstalled: true,
+				prePushHookInstalled: true,
+				claudeHookInstalled: true,
+				geminiHookInstalled: true,
+				claudeDetected: true,
+				hookSource: "cli",
+				hookVersion: "1.0.0",
+				schemaV5: "completed",
+				activeSessions: 3,
+				summaryCount: 42,
+				sessionsBySource: { claude: 3 },
+			}),
+			{ version: "9.9.9", account, isClaudePlugin: false },
+		);
+		expect(r.version).toBe("9.9.9");
+		expect(r.hooks).toEqual({
+			summary: "5 Git + 2 Claude + 1 Gemini CLI",
+			git: true,
+			prePush: true,
+			claude: true,
+			gemini: true,
+			runtime: "cli@1.0.0",
+		});
+		expect(r.dataMigration).toBe("Up to date (v5)");
+		expect(r.account).toEqual({
+			signedIn: true,
+			jolliApiKeyConfigured: true,
+			anthropicKeyConfigured: true,
+			site: "acme.jolli.ai",
+			siteLabel: "Jolli Site",
+		});
+		expect(r.integrations).toEqual([
+			{ name: "Claude", detected: true, status: "hook installed (3 sessions)", sessionCount: 3 },
+		]);
+		expect(r.sessions).toBe(3);
+		expect(r.storedMemories).toBe(42);
+		expect(r.orphanBranch).toBe("jollimemory/summaries/v3");
+	});
+
+	it("renders 4 Git, drops the @version for an unknown runtime, and labels a non-disk-backed site", () => {
+		const r = buildStatusSummary(
+			makeStatus({
+				gitHookInstalled: true,
+				prePushHookInstalled: false,
+				hookSource: "cli",
+				hookVersion: "unknown",
+			}),
+			{
+				version: "1",
+				account: { ...account, diskBacked: false, site: "https://x.jolli.dev" },
+				isClaudePlugin: false,
+			},
+		);
+		expect(r.hooks.summary).toBe("4 Git");
+		expect(r.hooks.runtime).toBe("cli");
+		// schemaV5 omitted → pending
+		expect(r.dataMigration).toBe("Not migrated — run jolli migrate");
+		expect(r.account.site).toBe("x.jolli.dev");
+		expect(r.account.siteLabel).toBe("Last signed-in site");
+	});
+
+	it("reports no hooks, no runtime, no site, and no integrations", () => {
+		const r = buildStatusSummary(makeStatus({ enabled: false }), {
+			version: "1",
+			account: { ...account, site: null, diskBacked: false },
+			isClaudePlugin: false,
+		});
+		expect(r.enabled).toBe(false);
+		expect(r.hooks.summary).toBe("none installed");
+		expect(r.hooks.runtime).toBeNull();
+		expect(r.account.site).toBeNull();
+		expect(r.account.siteLabel).toBeNull();
+		expect(r.integrations).toEqual([]);
+	});
+
+	it("treats the Claude hook as active in plugin mode even when settings.json has no hook", () => {
+		// Claude Code plugin: hooks come from the manifest, so claudeHookInstalled
+		// (a settings-file probe) is false — but isClaudePlugin flips it to active.
+		const r = buildStatusSummary(
+			makeStatus({
+				gitHookInstalled: true,
+				prePushHookInstalled: true,
+				claudeHookInstalled: false,
+				claudeDetected: true,
+				sessionsBySource: { claude: 4 },
+			}),
+			{ version: "1", account, isClaudePlugin: true },
+		);
+		expect(r.hooks.summary).toBe("5 Git + 2 Claude");
+		expect(r.hooks.claude).toBe(true);
+		expect(r.integrations).toEqual([
+			{ name: "Claude", detected: true, status: "hook installed (4 sessions)", sessionCount: 4 },
+		]);
+	});
+
+	it("describes each detected integration and combines Copilot CLI + Chat session counts", () => {
+		const r = buildStatusSummary(
+			makeStatus({
+				claudeDetected: true, // enabled, hook not installed
+				codexDetected: true,
+				codexEnabled: false, // detected but disabled
+				geminiDetected: true, // enabled, hook not installed
+				openCodeDetected: true,
+				openCodeScanError: { kind: "corrupt", message: "bad db" }, // unavailable
+				cursorDetected: true, // enabled, no hook concept, 0 sessions
+				copilotChatDetected: true, // Copilot row via Chat only
+				sessionsBySource: { copilot: 2, "copilot-chat": 3 },
+			}),
+			{ version: "1", account, isClaudePlugin: false },
+		);
+		expect(r.integrations).toEqual([
+			{ name: "Claude", detected: true, status: "hook not installed", sessionCount: 0 },
+			{ name: "Codex", detected: true, status: "detected but disabled", sessionCount: 0 },
+			{ name: "Gemini", detected: true, status: "hook not installed", sessionCount: 0 },
+			{ name: "OpenCode", detected: true, status: "unavailable — corrupt", sessionCount: 0 },
+			{ name: "Cursor", detected: true, status: "detected & enabled", sessionCount: 0 },
+			{ name: "Copilot", detected: true, status: "detected & enabled (5 sessions)", sessionCount: 5 },
+		]);
+	});
+});
+
+describe("runStatus", () => {
+	beforeEach(() => {
+		// Clear any stale return values set by earlier tests (e.g. runSearch stubs
+		// getActiveStorage) so each case controls its own inputs.
+		vi.mocked(getStatus).mockReset();
+		vi.mocked(loadConfigFromDir).mockReset();
+		vi.mocked(getGlobalConfigDir).mockReset();
+		vi.mocked(loadAuthToken).mockReset();
+		vi.mocked(getActiveStorage)
+			.mockReset()
+			.mockReturnValue(undefined as never);
+	});
+
+	it("wires getStatus + global config + auth token into a summary", async () => {
+		vi.mocked(getStatus).mockResolvedValue(
+			makeStatus({ summaryCount: 7, hookSource: "cli", hookVersion: "2.0.0", schemaV5: "completed" }),
+		);
+		vi.mocked(getGlobalConfigDir).mockReturnValue("/glob");
+		vi.mocked(loadConfigFromDir).mockResolvedValue({
+			jolliApiKey: "sk-jol-x",
+			apiKey: "anthropic-key",
+			jolliUrl: "https://acme.jolli.ai",
+			authToken: "tok",
+			claudeEnabled: true,
+		});
+		vi.mocked(loadAuthToken).mockResolvedValue("authtok");
+
+		const r = await runStatus("/repo");
+
+		// getActiveStorage() is mocked (undefined) → getStatus reads via the default backend.
+		expect(getStatus).toHaveBeenCalledWith("/repo", undefined);
+		expect(loadConfigFromDir).toHaveBeenCalledWith("/glob");
+		expect(r.version).toBe(VERSION);
+		expect(r.storedMemories).toBe(7);
+		expect(r.account).toEqual({
+			signedIn: true,
+			jolliApiKeyConfigured: true,
+			anthropicKeyConfigured: true,
+			site: "acme.jolli.ai",
+			siteLabel: "Jolli Site",
+		});
+	});
+
+	it("falls back to ANTHROPIC_API_KEY and reports an empty config as unconfigured", async () => {
+		const prev = process.env.ANTHROPIC_API_KEY;
+		process.env.ANTHROPIC_API_KEY = "env-key";
+		try {
+			vi.mocked(getStatus).mockResolvedValue(makeStatus());
+			vi.mocked(getGlobalConfigDir).mockReturnValue("/glob");
+			vi.mocked(loadConfigFromDir).mockResolvedValue({});
+			vi.mocked(loadAuthToken).mockResolvedValue(undefined);
+
+			const r = await runStatus("/repo");
+
+			expect(r.account.signedIn).toBe(false);
+			expect(r.account.jolliApiKeyConfigured).toBe(false);
+			expect(r.account.anthropicKeyConfigured).toBe(true); // from the env var
+			expect(r.account.site).toBeNull();
+			expect(r.account.siteLabel).toBeNull();
+		} finally {
+			if (prev === undefined) delete process.env.ANTHROPIC_API_KEY;
+			else process.env.ANTHROPIC_API_KEY = prev;
+		}
+	});
+
+	it("treats a disabled Claude and a key-only (no anthropic) config correctly", async () => {
+		const prev = process.env.ANTHROPIC_API_KEY;
+		delete process.env.ANTHROPIC_API_KEY;
+		try {
+			vi.mocked(getStatus).mockResolvedValue(makeStatus({ claudeDetected: true }));
+			vi.mocked(getGlobalConfigDir).mockReturnValue("/glob");
+			// jolliApiKey present but no authToken → diskBacked via the API key; claudeEnabled false.
+			vi.mocked(loadConfigFromDir).mockResolvedValue({ jolliApiKey: "sk-jol-x", claudeEnabled: false });
+			vi.mocked(loadAuthToken).mockResolvedValue(undefined);
+
+			const r = await runStatus("/repo");
+
+			expect(r.account.anthropicKeyConfigured).toBe(false);
+			expect(r.account.jolliApiKeyConfigured).toBe(true);
+			expect(r.integrations).toEqual([
+				{ name: "Claude", detected: true, status: "detected but disabled", sessionCount: 0 },
+			]);
+		} finally {
+			if (prev === undefined) delete process.env.ANTHROPIC_API_KEY;
+			else process.env.ANTHROPIC_API_KEY = prev;
+		}
 	});
 });

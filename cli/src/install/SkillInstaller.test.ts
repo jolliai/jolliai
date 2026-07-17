@@ -13,14 +13,19 @@
  * - The Claude-target gate (`config.claudeEnabled === false`) skips
  *   `.claude/skills/` but still writes `.agents/skills/`.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	buildLocalRunSkillTemplate,
+	buildPluginJolliMenuSkillTemplate,
 	buildRecallSkillTemplate,
 	buildSearchSkillTemplate,
+	installPluginJolliMenu,
+	JOLLI_MENU_GIT_EXCLUDE_PATHS,
+	PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS,
+	removePluginJolliMenu,
 	SKILL_GIT_EXCLUDE_PATHS,
 	updateSkillIfNeeded,
 	updateSkillsIfNeeded,
@@ -330,6 +335,93 @@ describe("jolli-local-run template", () => {
 		expect(t).toContain("WITHOUT a PR reference");
 		// And it reads the completion result's `willAutoMerge` (not the offer's `autoMerges`).
 		expect(t).toContain("willAutoMerge");
+	});
+
+	it("surfaces the combined space-cli install hint when the plugin is missing", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("npm i -g @jolli.ai/cli @jolli.ai/space-cli");
+	});
+
+	it("prefers MCP tools but shells the jolli CLI (run-cli) for the helper and git ops", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("mcp__jollimemory__start_local_run");
+		expect(t).toContain("$HOME/.jolli/jollimemory/run-cli");
+	});
+
+	it("shows the start_local_run id verbatim as an unquoted number (not a misleading quoted string)", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain('{ "id": <workflow id> }');
+		expect(t).not.toContain('{ "id": "<workflow id>" }');
+		expect(t).toMatch(/exactly as the helper returned it/);
+	});
+
+	it("presents workflows by name and shows the real numeric id shape in the Step 1 example", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain('"id": 7');
+		expect(t).toContain('"name": "Impact Analysis"');
+		expect(t).toMatch(/by its `name`/);
+		expect(t).not.toContain('"id": "..."');
+	});
+
+	it("carries the Windows Git Bash shell prerequisite (its run-cli bash steps hit %USERPROFILE%)", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("### Shell prerequisite");
+		expect(t).toMatch(/Git Bash/);
+		expect(t).toContain("%USERPROFILE%");
+	});
+});
+
+describe("jolli-local-run template", () => {
+	it("uses spec-compliant frontmatter (name/description/metadata only)", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toMatch(/^---\nname: jolli-local-run\n/);
+		expect(t).toMatch(/description: Run a Jolli workflow locally/);
+		expect(t).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}vendor: "jolli\.ai"/);
+		expect(t).not.toMatch(/^argument-hint:/m);
+		expect(t).not.toMatch(/^user-invocable:/m);
+	});
+
+	it("drives the run lifecycle tools", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("start_local_run");
+		expect(t).toContain("report_local_run_progress");
+		expect(t).toContain("complete_local_run");
+		expect(t).toContain("abandon_local_run");
+	});
+
+	it("uses the eligibility helper and offers only runnable workflows, announcing auto-merge vs team review", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("local-run-workflows");
+		expect(t).toMatch(/auto-merge/i);
+		expect(t).toMatch(/team review/i);
+	});
+
+	it("pins docs pull to --branch and explicitly forbids the destructive --agent", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("docs pull --branch");
+		expect(t).toContain("--agent");
+		expect(t).toMatch(/NEVER `--agent`/);
+		expect(t).toContain("git clean -fdx");
+	});
+
+	it("does NOT instruct the agent to call fetchSpaceBacking (docs pull fetches the token internally)", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).not.toContain("fetchSpaceBacking");
+		expect(t).toMatch(/fetches the destination write token internally/);
+	});
+
+	it("brackets the blocking review with heartbeats (before and after, not during)", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toMatch(/immediately before/);
+		expect(t).toMatch(/immediately after/);
+		expect(t).toMatch(/explicitly approve/);
+	});
+
+	it("captures the docs publish {prNumber, prUrl} and passes them to complete_local_run", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("docs publish --json");
+		expect(t).toContain("prNumber");
+		expect(t).toContain("prUrl");
 	});
 
 	it("surfaces the combined space-cli install hint when the plugin is missing", () => {
@@ -968,5 +1060,93 @@ describe("revision-based idempotency", () => {
 		await updateSkillsIfNeeded(tempDir);
 		// Left untouched — never downgrade a newer revision.
 		expect(readRecall()).toBe(planted);
+	});
+});
+
+// ─── Plugin bare /jolli umbrella ────────────────────────────────────────────
+
+describe("buildPluginJolliMenuSkillTemplate", () => {
+	it("is spec-compliant and routes to the plugin's namespaced /jolli:* skills", () => {
+		const tpl = buildPluginJolliMenuSkillTemplate();
+		expect(tpl).toMatch(/^---\nname: jolli\n/);
+		expect(tpl).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}revision: \d+\n {2}vendor: "jolli\.ai"/);
+		// Routes to the namespaced plugin skills, not the unnamespaced siblings.
+		for (const s of ["jolli:init", "jolli:recall", "jolli:search", "jolli:pr", "jolli:push"]) {
+			expect(tpl).toContain(s);
+		}
+		// No Claude-private frontmatter fields.
+		expect(tpl).not.toMatch(/^argument-hint:/m);
+		expect(tpl).not.toMatch(/^user-invocable:/m);
+	});
+});
+
+describe("installPluginJolliMenu", () => {
+	it("writes the bare /jolli umbrella to the Claude target only", async () => {
+		await installPluginJolliMenu(tempDir);
+		const umbrella = join(tempDir, ".claude", "skills", "jolli", "SKILL.md");
+		expect(existsSync(umbrella)).toBe(true);
+		expect(readFileSync(umbrella, "utf-8")).toContain("jolli:recall");
+		// NOT written to the cross-platform target (those hosts lack `jolli:*`).
+		expect(existsSync(join(tempDir, ".agents", "skills", "jolli", "SKILL.md"))).toBe(false);
+		// And it writes ONLY the umbrella — not the unnamespaced sibling skills.
+		expect(existsSync(join(tempDir, ".claude", "skills", "jolli-recall", "SKILL.md"))).toBe(false);
+	});
+
+	it("exports a single Claude-target git-exclude path for the umbrella", () => {
+		expect(PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS).toEqual(["/.claude/skills/jolli/"]);
+	});
+});
+
+describe("buildPluginJolliMenuSkillTemplate self-guard", () => {
+	it("instructs the model to verify a routing target exists before routing", () => {
+		const tpl = buildPluginJolliMenuSkillTemplate();
+		// A Step 0 gate must exist and mention self-removal for the leftover case.
+		expect(tpl).toContain("Step 0");
+		expect(tpl).toContain("rm -rf .claude/skills/jolli");
+		// The old "always present" claim (which routed to now-missing skills) is gone.
+		expect(tpl).not.toContain("Jolli plugin skills (always present)");
+	});
+
+	it("distinguishes a still-working CLI from a full uninstall (no false 'uninstalled')", () => {
+		const tpl = buildPluginJolliMenuSkillTemplate();
+		// Must probe the bundled CLI so a working CLI is never mis-reported as gone
+		// just because the plugin's menu isn't loaded in this session.
+		expect(tpl).toContain("$HOME/.jolli/jollimemory/run-cli");
+		// Both branches are spelled out explicitly.
+		expect(tpl).toContain("CLI present");
+		expect(tpl).toContain("CLI absent");
+	});
+});
+
+describe("removePluginJolliMenu", () => {
+	it("removes the umbrella from every target when it carries our vendor marker", async () => {
+		// A full `jolli enable` writes the umbrella to BOTH targets.
+		for (const dir of [".claude/skills/jolli", ".agents/skills/jolli"]) {
+			mkdirSync(join(tempDir, dir), { recursive: true });
+			writeFileSync(join(tempDir, dir, "SKILL.md"), 'metadata:\n  vendor: "jolli.ai"\n', "utf-8");
+		}
+
+		await removePluginJolliMenu(tempDir);
+
+		expect(existsSync(join(tempDir, ".claude", "skills", "jolli"))).toBe(false);
+		expect(existsSync(join(tempDir, ".agents", "skills", "jolli"))).toBe(false);
+	});
+
+	it("leaves a user's own `jolli` skill (no vendor marker) untouched", async () => {
+		const dir = join(tempDir, ".claude", "skills", "jolli");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "SKILL.md"), "# my own jolli skill\n", "utf-8");
+
+		await removePluginJolliMenu(tempDir);
+
+		expect(existsSync(join(dir, "SKILL.md"))).toBe(true);
+	});
+
+	it("is a no-op when no umbrella is present", async () => {
+		await expect(removePluginJolliMenu(tempDir)).resolves.toBeUndefined();
+	});
+
+	it("exports the umbrella exclude paths for every host target", () => {
+		expect(JOLLI_MENU_GIT_EXCLUDE_PATHS).toEqual(["/.claude/skills/jolli/", "/.agents/skills/jolli/"]);
 	});
 });

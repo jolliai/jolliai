@@ -118,6 +118,11 @@ export interface SummarizeParams {
 	readonly notes?: string;
 	/** LLM credentials and model selection loaded by the caller */
 	readonly config: LlmConfig;
+	/**
+	 * Optional caller abort signal, forwarded to the LLM call so a UI can cancel
+	 * a long summary in flight. Additive; omitting it preserves prior behavior.
+	 */
+	readonly signal?: AbortSignal;
 }
 
 /**
@@ -172,6 +177,7 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 		maxTokens: DEFAULT_MAX_TOKENS,
 		model: resolveModelId(config.model),
 		...llmCredentials(config),
+		signal: params.signal,
 	});
 
 	// Parse raw LLM text (both direct and proxy modes return raw text)
@@ -220,6 +226,7 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 				maxTokens: DEFAULT_MAX_TOKENS,
 				model: resolveModelId(config.model),
 				...llmCredentials(config),
+				signal: params.signal,
 			});
 			const retryText = retryResult.text ?? "";
 			log.debug("=== LLM strict-retry response START ===");
