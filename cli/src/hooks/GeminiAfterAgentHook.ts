@@ -119,8 +119,12 @@ function isMainScript(): boolean {
 }
 
 if (isMainScript()) {
-	handleGeminiAfterAgentHook().catch((error: unknown) => {
-		console.error("[GeminiAfterAgentHook] Fatal error:", error);
+	handleGeminiAfterAgentHook().catch((_error: unknown) => {
+		// Log a static message only — never anything derived from the error.
+		// In the flush/sync chain an error can carry a jolliApiKey (e.g. in
+		// request headers), so nothing error-derived may reach the log sink
+		// (CodeQL js/clear-text-logging).
+		console.error("[GeminiAfterAgentHook] Fatal error: after-agent handler failed.");
 		process.exit(1);
 	});
 }

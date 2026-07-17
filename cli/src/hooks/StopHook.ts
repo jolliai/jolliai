@@ -195,8 +195,12 @@ function isMainScript(): boolean {
 }
 
 if (isMainScript()) {
-	handleStopHook().catch((error: unknown) => {
-		console.error("[StopHook] Fatal error:", error);
+	handleStopHook().catch((_error: unknown) => {
+		// Log a static message only — never anything derived from the error.
+		// In the flush/sync chain an error can carry a jolliApiKey (e.g. in
+		// request headers), so nothing error-derived may reach the log sink
+		// (CodeQL js/clear-text-logging).
+		console.error("[StopHook] Fatal error: stop-hook handler failed.");
 		process.exit(1);
 	});
 }
