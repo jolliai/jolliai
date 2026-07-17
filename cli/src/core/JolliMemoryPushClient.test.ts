@@ -1420,3 +1420,395 @@ describe("listWorkflows", () => {
 		]);
 	});
 });
+
+describe("getRunStatus", () => {
+	const GET_RUN_STATUS_ENTRY = {
+		name: "get_run_status",
+		description: "Get one run's status",
+		inputSchema: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] },
+	};
+	const RUN = {
+		id: "run-1",
+		workflowId: 7,
+		createdAt: "2026-07-16T00:00:00Z",
+		status: "completed",
+		triggeredBy: "manual",
+		executionMode: "server",
+		workflowUrl: "https://jolli.ai/w/7",
+		runUrl: "https://jolli.ai/w/7/r/run-1",
+	};
+
+	/** Routes the manifest fetch and the get_run_status invocation. */
+	function routed(manifest: () => Response, invoke?: (body: unknown) => Response): typeof fetch {
+		return (async (url: string | URL | Request, init?: RequestInit) => {
+			const u = String(url);
+			if (u.endsWith("/api/mcp/manifest")) {
+				return manifest();
+			}
+			if (u.includes("/api/mcp/tools/get_run_status")) {
+				if (!invoke) {
+					throw new Error(`unexpected invocation of ${u}`);
+				}
+				return invoke(init?.body ? JSON.parse(String(init.body)) : undefined);
+			}
+			throw new Error(`unexpected url ${u}`);
+		}) as typeof fetch;
+	}
+
+	it("unwraps the { run } envelope and returns the parsed run, sending { runId }", async () => {
+		let sentBody: unknown;
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [GET_RUN_STATUS_ENTRY] }),
+				(body) => {
+					sentBody = body;
+					return jsonResponse(200, { run: RUN });
+				},
+			),
+		);
+		const run = await c.getRunStatus("run-1");
+		expect(sentBody).toEqual({ runId: "run-1" });
+		expect(run).toEqual({
+			id: "run-1",
+			workflowId: 7,
+			createdAt: "2026-07-16T00:00:00Z",
+			status: "completed",
+			triggeredBy: "manual",
+			executionMode: "server",
+			workflowUrl: "https://jolli.ai/w/7",
+			runUrl: "https://jolli.ai/w/7/r/run-1",
+		});
+	});
+
+	it("tolerates a bare run object (no { run } envelope)", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [GET_RUN_STATUS_ENTRY] }),
+				() => jsonResponse(200, RUN),
+			),
+		);
+		const run = await c.getRunStatus("run-1");
+		expect(run.id).toBe("run-1");
+		expect(run.status).toBe("completed");
+	});
+
+	it("throws when get_run_status is absent from the manifest (platform tools off)", async () => {
+		const c = client(routed(() => jsonResponse(200, {})));
+		await expect(c.getRunStatus("run-1")).rejects.toThrow(/get_run_status.*unavailable/);
+	});
+
+	it("throws when the manifest fetch itself fails (404 surface disabled)", async () => {
+		const c = client(routed(() => jsonResponse(404, { error: "not_found" })));
+		await expect(c.getRunStatus("run-1")).rejects.toThrow(/get_run_status.*unavailable/);
+	});
+
+	it("throws (loud) on a non-2xx invocation", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [GET_RUN_STATUS_ENTRY] }),
+				() => jsonResponse(500, { error: "boom" }),
+			),
+		);
+		await expect(c.getRunStatus("run-1")).rejects.toThrow("boom");
+	});
+
+	it("throws ClientOutdatedError on a 426 invocation", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [GET_RUN_STATUS_ENTRY] }),
+				() => jsonResponse(426, { error: "too old" }),
+			),
+		);
+		await expect(c.getRunStatus("run-1")).rejects.toBeInstanceOf(ClientOutdatedError);
+	});
+
+	it("throws on a non-JSON invocation body (proxy page)", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [GET_RUN_STATUS_ENTRY] }),
+				() => textResponse(200, "<html>OK</html>"),
+			),
+		);
+		await expect(c.getRunStatus("run-1")).rejects.toThrow(/Malformed/);
+	});
+
+	it("throws on a malformed run payload (empty envelope, bad id, or unknown status)", async () => {
+		const empty = client(
+			routed(
+				() => jsonResponse(200, { tools: [GET_RUN_STATUS_ENTRY] }),
+				() => jsonResponse(200, {}),
+			),
+		);
+		await expect(empty.getRunStatus("run-1")).rejects.toThrow(/malformed run payload/);
+
+		const badStatus = client(
+			routed(
+				() => jsonResponse(200, { tools: [GET_RUN_STATUS_ENTRY] }),
+				() => jsonResponse(200, { run: { id: "run-1", status: "bogus" } }),
+			),
+		);
+		await expect(badStatus.getRunStatus("run-1")).rejects.toThrow(/malformed run payload/);
+	});
+});
+
+describe("listWorkflowRuns", () => {
+	const LIST_RUNS_ENTRY = {
+		name: "list_workflow_runs",
+		description: "List a workflow's runs",
+		inputSchema: { type: "object", properties: { id: { type: "number" } }, required: ["id"] },
+	};
+
+	/** Routes the manifest fetch and the list_workflow_runs invocation. */
+	function routed(manifest: () => Response, invoke?: (body: unknown) => Response): typeof fetch {
+		return (async (url: string | URL | Request, init?: RequestInit) => {
+			const u = String(url);
+			if (u.endsWith("/api/mcp/manifest")) {
+				return manifest();
+			}
+			if (u.includes("/api/mcp/tools/list_workflow_runs")) {
+				if (!invoke) {
+					throw new Error(`unexpected invocation of ${u}`);
+				}
+				return invoke(init?.body ? JSON.parse(String(init.body)) : undefined);
+			}
+			throw new Error(`unexpected url ${u}`);
+		}) as typeof fetch;
+	}
+
+	it("parses the { runs: [...] } envelope and sends the numeric workflow id as { id }", async () => {
+		let sentBody: unknown;
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_RUNS_ENTRY] }),
+				(body) => {
+					sentBody = body;
+					return jsonResponse(200, {
+						runs: [
+							{ id: "r2", status: "active" },
+							{ id: "r1", status: "completed" },
+						],
+					});
+				},
+			),
+		);
+		const runs = await c.listWorkflowRuns(7);
+		expect(sentBody).toEqual({ id: 7 });
+		expect(runs.map((r) => r.id)).toEqual(["r2", "r1"]);
+	});
+
+	it("accepts a bare top-level array invocation body and passes a string id verbatim", async () => {
+		let sentBody: unknown;
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_RUNS_ENTRY] }),
+				(body) => {
+					sentBody = body;
+					return jsonResponse(200, [{ id: "r1", status: "queued" }]);
+				},
+			),
+		);
+		const runs = await c.listWorkflowRuns("42");
+		expect(sentBody).toEqual({ id: "42" });
+		expect(runs.map((r) => r.id)).toEqual(["r1"]);
+	});
+
+	it("carries every host-consumed field through when well-typed", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_RUNS_ENTRY] }),
+				() =>
+					jsonResponse(200, {
+						runs: [
+							{
+								id: "r1",
+								workflowId: 7,
+								createdAt: "2026-07-16T00:00:00Z",
+								status: "completed",
+								triggeredBy: "schedule",
+								executionMode: "local",
+								startedAt: "2026-07-16T00:00:01Z",
+								completedAt: "2026-07-16T00:00:09Z",
+								completionInfo: { message: "done", extra: "ignored" },
+								writtenArticles: [
+									{
+										operation: "created",
+										path: "a.md",
+										url: "https://jolli.ai/a",
+										active: true,
+										docId: 3,
+										title: "A",
+									},
+									{ operation: "deleted", path: "b.md", url: null, active: false },
+								],
+								pullRequest: { number: 5, url: "https://gh/pr/5", state: "open" },
+								workflowUrl: "https://jolli.ai/w/7",
+								runUrl: "https://jolli.ai/w/7/r/r1",
+								canceledBy: "Dev",
+								canceledAt: "2026-07-16T00:00:05Z",
+								outputSummary: "never read",
+								stats: { prNumber: 9 },
+							},
+						],
+					}),
+			),
+		);
+		const [run] = await c.listWorkflowRuns(7);
+		expect(run).toEqual({
+			id: "r1",
+			workflowId: 7,
+			createdAt: "2026-07-16T00:00:00Z",
+			status: "completed",
+			triggeredBy: "schedule",
+			executionMode: "local",
+			startedAt: "2026-07-16T00:00:01Z",
+			completedAt: "2026-07-16T00:00:09Z",
+			completionInfo: { message: "done" },
+			writtenArticles: [
+				{ operation: "created", path: "a.md", url: "https://jolli.ai/a", active: true, docId: 3, title: "A" },
+				{ operation: "deleted", path: "b.md", url: null, active: false },
+			],
+			pullRequest: { number: 5, url: "https://gh/pr/5", state: "open" },
+			workflowUrl: "https://jolli.ai/w/7",
+			runUrl: "https://jolli.ai/w/7/r/r1",
+			canceledBy: "Dev",
+			canceledAt: "2026-07-16T00:00:05Z",
+		});
+		// outputSummary/stats are never modeled.
+		expect("outputSummary" in run).toBe(false);
+		expect("stats" in run).toBe(false);
+	});
+
+	it("drops ill-typed optional fields at field granularity (keeps the run)", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_RUNS_ENTRY] }),
+				() =>
+					jsonResponse(200, {
+						runs: [
+							{
+								id: "r1",
+								status: "failed",
+								workflowId: "7", // not a number → dropped
+								createdAt: 123, // not a string → dropped
+								triggeredBy: "bogus", // unknown trigger → dropped
+								executionMode: "cloud", // unknown mode → dropped
+								error: "code=X: boom",
+								completionInfo: { message: 5 }, // non-string message → dropped
+								writtenArticles: "nope", // non-array → field absent
+								pullRequest: { number: 5, url: "https://gh/pr/5", state: "weird" }, // bad state → absent
+								workflowUrl: 9, // not a string → dropped
+							},
+						],
+					}),
+			),
+		);
+		const [run] = await c.listWorkflowRuns(7);
+		expect(run).toEqual({ id: "r1", status: "failed", error: "code=X: boom" });
+	});
+
+	it("drops malformed run entries but keeps the valid ones", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_RUNS_ENTRY] }),
+				() =>
+					jsonResponse(200, {
+						runs: [
+							{ id: "ok", status: "completed" },
+							"not-an-object",
+							null,
+							[],
+							{ id: "", status: "completed" }, // empty id
+							{ id: "no-status" }, // missing status
+							{ id: "bad-status", status: "running" }, // "running" is a report status, not a wire status
+							{ status: "completed" }, // missing id
+						],
+					}),
+			),
+		);
+		const runs = await c.listWorkflowRuns(7);
+		expect(runs.map((r) => r.id)).toEqual(["ok"]);
+	});
+
+	it("drops malformed article entries within a run's manifest", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_RUNS_ENTRY] }),
+				() =>
+					jsonResponse(200, {
+						runs: [
+							{
+								id: "r1",
+								status: "completed",
+								writtenArticles: [
+									{ operation: "created", path: "keep.md", url: "https://jolli.ai/a", active: true },
+									{ operation: "moved", path: "bad-op.md", url: null, active: true }, // bad op
+									{ operation: "edited", url: null, active: true }, // missing path
+									{ operation: "edited", path: "no-active.md", url: null }, // missing active
+									"not-an-object",
+									{ operation: "edited", path: "coerced.md", active: false }, // url missing → null
+								],
+							},
+						],
+					}),
+			),
+		);
+		const [run] = await c.listWorkflowRuns(7);
+		expect(run.writtenArticles).toEqual([
+			{ operation: "created", path: "keep.md", url: "https://jolli.ai/a", active: true },
+			{ operation: "edited", path: "coerced.md", url: null, active: false },
+		]);
+	});
+
+	it("drops a pullRequest whose number is not numeric (field-granular, keeps the run)", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_RUNS_ENTRY] }),
+				() =>
+					jsonResponse(200, {
+						runs: [
+							{
+								id: "r1",
+								status: "completed",
+								pullRequest: { number: "5", url: "https://gh/pr/5", state: "open" },
+							},
+						],
+					}),
+			),
+		);
+		const [run] = await c.listWorkflowRuns(7);
+		expect(run).toEqual({ id: "r1", status: "completed" });
+	});
+
+	it("returns [] when the invocation body has no runs array", async () => {
+		const emptyObj = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_RUNS_ENTRY] }),
+				() => jsonResponse(200, {}),
+			),
+		);
+		await expect(emptyObj.listWorkflowRuns(7)).resolves.toEqual([]);
+
+		const nonArrayRuns = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_RUNS_ENTRY] }),
+				() => jsonResponse(200, { runs: "nope" }),
+			),
+		);
+		await expect(nonArrayRuns.listWorkflowRuns(7)).resolves.toEqual([]);
+	});
+
+	it("throws when list_workflow_runs is absent from the manifest", async () => {
+		const c = client(routed(() => jsonResponse(200, {})));
+		await expect(c.listWorkflowRuns(7)).rejects.toThrow(/list_workflow_runs.*unavailable/);
+	});
+
+	it("throws (loud) on a non-2xx invocation so the command can degrade", async () => {
+		const c = client(
+			routed(
+				() => jsonResponse(200, { tools: [LIST_RUNS_ENTRY] }),
+				() => jsonResponse(500, { error: "boom" }),
+			),
+		);
+		await expect(c.listWorkflowRuns(7)).rejects.toThrow("boom");
+	});
+});

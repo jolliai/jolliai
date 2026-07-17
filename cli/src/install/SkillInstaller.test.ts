@@ -20,6 +20,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	buildLocalRunSkillTemplate,
 	buildRecallSkillTemplate,
+	buildRemoteRunSkillTemplate,
 	buildSearchSkillTemplate,
 	SKILL_GIT_EXCLUDE_PATHS,
 	updateSkillIfNeeded,
@@ -68,20 +69,27 @@ function readLocalRun(target: "claude" | "agents" = "claude"): string {
 	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
 }
 
+function readRemoteRun(target: "claude" | "agents" = "claude"): string {
+	const dir = target === "claude" ? ".claude/skills/jolli-remote-run" : ".agents/skills/jolli-remote-run";
+	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
+}
+
 // ─── Dual-target write ──────────────────────────────────────────────────────
 
 describe("updateSkillsIfNeeded — target dimension", () => {
-	it("writes all five skills into both .claude/skills/ and .agents/skills/", async () => {
+	it("writes all six skills into both .claude/skills/ and .agents/skills/", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-local-run/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-remote-run/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-local-run/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-remote-run/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli/SKILL.md"))).toBe(true);
 	});
 
@@ -91,6 +99,7 @@ describe("updateSkillsIfNeeded — target dimension", () => {
 		expect(readSearch("claude")).toBe(readSearch("agents"));
 		expect(readPr("claude")).toBe(readPr("agents"));
 		expect(readLocalRun("claude")).toBe(readLocalRun("agents"));
+		expect(readRemoteRun("claude")).toBe(readRemoteRun("agents"));
 		expect(readJolli("claude")).toBe(readJolli("agents"));
 	});
 
@@ -100,11 +109,13 @@ describe("updateSkillsIfNeeded — target dimension", () => {
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli-local-run/SKILL.md"))).toBe(false);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-remote-run/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".claude/skills/jolli/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-local-run/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-remote-run/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli/SKILL.md"))).toBe(true);
 	});
 
@@ -116,19 +127,34 @@ describe("updateSkillsIfNeeded — target dimension", () => {
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
 	});
 
-	it("exports the 10 git-exclude paths for the five skills × two targets", () => {
+	it("exports the 12 git-exclude paths for the six skills × two targets", () => {
 		expect(SKILL_GIT_EXCLUDE_PATHS).toEqual([
 			"/.claude/skills/jolli-recall/",
 			"/.claude/skills/jolli-search/",
 			"/.claude/skills/jolli-pr/",
 			"/.claude/skills/jolli-local-run/",
+			"/.claude/skills/jolli-remote-run/",
 			"/.claude/skills/jolli/",
 			"/.agents/skills/jolli-recall/",
 			"/.agents/skills/jolli-search/",
 			"/.agents/skills/jolli-pr/",
 			"/.agents/skills/jolli-local-run/",
+			"/.agents/skills/jolli-remote-run/",
 			"/.agents/skills/jolli/",
 		]);
+	});
+
+	it("renders a parseable metadata.revision for every installed skill", async () => {
+		// A skill whose template omits `revision` parses as PREHISTORIC_REVISION (-1),
+		// so the upsert guard (existing >= mine) freezes it after first install and a
+		// later body fix never reaches existing installs. Every SKILLS template must
+		// therefore carry a real, parseable revision.
+		await updateSkillsIfNeeded(tempDir);
+		const revisionLine = /\n {2}revision: \d+\n/;
+		for (const read of [readRecall, readSearch, readPr, readLocalRun, readRemoteRun, readJolli]) {
+			expect(read("claude")).toMatch(revisionLine);
+			expect(read("agents")).toMatch(revisionLine);
+		}
 	});
 });
 
@@ -226,21 +252,39 @@ describe("jolli menu template frontmatter", () => {
 		expect(jolli).toMatch(/jolli-search/);
 		expect(jolli).toMatch(/jolli-pr/);
 		expect(jolli).toMatch(/jolli-local-run/);
+		expect(jolli).toMatch(/jolli-remote-run/);
 		// Surfaces session-registered MCP tools, not a hardcoded manifest fetch.
 		expect(jolli).toMatch(/mcp__jollimemory__/);
 		expect(jolli).toMatch(/AskUserQuestion/);
 	});
 
-	it("run-a-workflow action asks local vs remote, defaulting to local", async () => {
+	it("run-a-workflow action asks local vs remote, defaulting to local, routing both to recipe skills", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const jolli = readJolli();
 		expect(jolli).toMatch(/Run a workflow/);
 		expect(jolli).toMatch(/local vs remote/i);
 		// Default is local.
 		expect(jolli).toMatch(/default.*local|local.*default/i);
-		// Local routes to the jolli-local-run skill; remote to the renamed MCP tool.
+		// Both paths route to a recipe skill — local to jolli-local-run, remote to
+		// jolli-remote-run (which drives run_remote_workflow), not the raw tool.
 		expect(jolli).toContain("jolli-local-run");
+		expect(jolli).toContain("jolli-remote-run");
 		expect(jolli).toContain("run_remote_workflow");
+		expect(jolli).toMatch(/not by calling the raw tool/);
+	});
+
+	it("adds a Workflow history action that shells workflow-runs and offers open-url", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const jolli = readJolli();
+		expect(jolli).toMatch(/Workflow history/);
+		expect(jolli).toContain('"$HOME/.jolli/jollimemory/run-cli" workflow-runs <workflowId>');
+		expect(jolli).toContain('"type": "runs"');
+		// An empty history is a normal outcome, not an error.
+		expect(jolli).toMatch(/no history yet/);
+		// Offers to open any listed URL via the open-url helper.
+		expect(jolli).toContain('"$HOME/.jolli/jollimemory/run-cli" open-url <url>');
+		// The history action shells run-cli, so the menu carries the shell prerequisite.
+		expect(jolli).toContain("### Shell prerequisite");
 	});
 
 	it("mentions canceling an in-flight remote run via cancel_remote_workflow", async () => {
@@ -274,7 +318,9 @@ describe("jolli-local-run template", () => {
 		const t = buildLocalRunSkillTemplate();
 		expect(t).toMatch(/^---\nname: jolli-local-run\n/);
 		expect(t).toMatch(/description: Run a Jolli workflow locally/);
-		expect(t).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}vendor: "jolli\.ai"/);
+		// Carries a parseable metadata.revision so a corrected body reaches existing
+		// installs (a revision-less template is frozen at PREHISTORIC forever).
+		expect(t).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}revision: \d+\n {2}vendor: "jolli\.ai"/);
 		expect(t).not.toMatch(/^argument-hint:/m);
 		expect(t).not.toMatch(/^user-invocable:/m);
 	});
@@ -332,6 +378,48 @@ describe("jolli-local-run template", () => {
 		expect(t).toContain("willAutoMerge");
 	});
 
+	it("Step 6 surfaces the completion result URLs and offers to open each via open-url", () => {
+		const t = buildLocalRunSkillTemplate();
+		// Auto-apply ON reports the article URLs (writtenArticles); OFF reports the PR URL.
+		expect(t).toContain("writtenArticles");
+		expect(t).toMatch(/article URLs/);
+		// `willAutoMerge: true` is framed as the destination's INTENT, not a confirmation the
+		// merge completed — the recipe must not flatly claim the PR auto-merged (it can't
+		// verify it, and for a private jolli-git dest the merge can silently not happen).
+		expect(t).toMatch(/set to auto-merge/);
+		expect(t).toMatch(/not a\s+confirmation/i);
+		expect(t).toMatch(/PR left open for team review/);
+		// Both the workflow and run deep-links are surfaced, read verbatim off the result.
+		expect(t).toContain("workflowUrl");
+		expect(t).toContain("runUrl");
+		// Offers to open each reported URL via the open-url helper (Step 3 of JOLLI-1947).
+		expect(t).toMatch(/open any reported URL/);
+		expect(t).toContain('"$HOME/.jolli/jollimemory/run-cli" open-url <url>');
+	});
+
+	it("only offers an article URL when still openable (active + non-null url) and never fabricates one", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toMatch(/active: true/);
+		expect(t).toMatch(/non-null/);
+		expect(t).toMatch(/not yet available/);
+		expect(t).toMatch(/never invent a URL/);
+	});
+
+	it("for a private Jolli-managed destination surfaces article URLs only, never a repo/PR link", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toMatch(/article URLs only/);
+		expect(t).toContain("never surface a repo or PR link the result did not carry");
+	});
+
+	it("describes the destination by Space name/folder and never narrates the backing repo owner/name or work branch as the write target", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("Space name / folder");
+		expect(t).toContain("Do **not** announce a backing repo");
+		expect(t).toContain('do **not** present the `workBranch` as "the write target"');
+		// An empty writeTarget.repo (private destinations) is normal, never an error.
+		expect(t).toMatch(/may be\s+\*\*empty\*\* for a private Jolli-managed destination/);
+	});
+
 	it("surfaces the combined space-cli install hint when the plugin is missing", () => {
 		const t = buildLocalRunSkillTemplate();
 		expect(t).toContain("npm i -g @jolli.ai/cli @jolli.ai/space-cli");
@@ -360,6 +448,93 @@ describe("jolli-local-run template", () => {
 
 	it("carries the Windows Git Bash shell prerequisite (its run-cli bash steps hit %USERPROFILE%)", () => {
 		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("### Shell prerequisite");
+		expect(t).toMatch(/Git Bash/);
+		expect(t).toContain("%USERPROFILE%");
+	});
+});
+
+describe("jolli-remote-run template", () => {
+	it("uses spec-compliant frontmatter (name/description/metadata, with a parseable revision)", () => {
+		const t = buildRemoteRunSkillTemplate();
+		expect(t).toMatch(/^---\nname: jolli-remote-run\n/);
+		expect(t).toMatch(/description: Run a Jolli workflow remotely/);
+		// Carries a parseable metadata.revision so a corrected body reaches existing
+		// installs (a revision-less template is frozen at PREHISTORIC forever).
+		expect(t).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}revision: \d+\n {2}vendor: "jolli\.ai"/);
+		expect(t).not.toMatch(/^argument-hint:/m);
+		expect(t).not.toMatch(/^user-invocable:/m);
+	});
+
+	it("triggers the remote run via run_remote_workflow and captures the runId", () => {
+		const t = buildRemoteRunSkillTemplate();
+		expect(t).toContain("run_remote_workflow");
+		expect(t).toContain("mcp__jollimemory__run_remote_workflow");
+		expect(t).toContain("runId");
+		// The workflow id is an unquoted number, matching the frozen tool contract.
+		expect(t).toContain('{ "id": <workflow id> }');
+	});
+
+	it("offers workflow discovery via list_workflows when it is registered", () => {
+		const t = buildRemoteRunSkillTemplate();
+		expect(t).toContain("list_workflows");
+		expect(t).toContain("mcp__jollimemory__list_workflows");
+	});
+
+	it("shells the deterministic workflow-run-status monitor with the runId", () => {
+		const t = buildRemoteRunSkillTemplate();
+		expect(t).toContain('"$HOME/.jolli/jollimemory/run-cli" workflow-run-status <runId>');
+		// Documents the report shape the recipe parses.
+		expect(t).toContain("openableUrls");
+		expect(t).toMatch(/"succeeded"/);
+		expect(t).toMatch(/"failed"/);
+		expect(t).toMatch(/"cancelled"/);
+	});
+
+	it("reports failed, cancelled, succeeded, and still-running outcomes", () => {
+		const t = buildRemoteRunSkillTemplate();
+		expect(t).toMatch(/troubleshooting/);
+		expect(t).toMatch(/cancel\.by/);
+		expect(t).toMatch(/article/);
+		// A timed-out poll means the run is still progressing server-side, not failed.
+		expect(t).toContain("timedOut");
+		expect(t).toMatch(/still\s+running server-side/);
+	});
+
+	it("degrades cleanly when the monitor cannot reach the run", () => {
+		const t = buildRemoteRunSkillTemplate();
+		expect(t).toContain('{ "type": "error", "message": "..." }');
+		expect(t).toMatch(/degraded outcome, not a\s+crash/);
+	});
+
+	it("never fabricates a withheld link and reads every URL verbatim off the report", () => {
+		const t = buildRemoteRunSkillTemplate();
+		expect(t).toMatch(/verbatim/);
+		expect(t).toMatch(/never construct, guess, or\s+look/);
+		expect(t).toMatch(/withheld/);
+	});
+
+	it("offers to open any reported URL via open-url with a headless-safe fallback", () => {
+		const t = buildRemoteRunSkillTemplate();
+		expect(t).toContain('"$HOME/.jolli/jollimemory/run-cli" open-url <url>');
+		expect(t).toMatch(/headless/);
+		expect(t).toContain("Only `https` URLs are accepted");
+	});
+
+	it("notes that an in-flight remote run can be cancelled via cancel_remote_workflow", () => {
+		const t = buildRemoteRunSkillTemplate();
+		expect(t).toContain("cancel_remote_workflow");
+		expect(t).toContain("mcp__jollimemory__cancel_remote_workflow");
+	});
+
+	it("prefers the MCP run tools but shells the jolli CLI (run-cli) for the monitor and open", () => {
+		const t = buildRemoteRunSkillTemplate();
+		expect(t).toMatch(/no CLI\s+mirror/);
+		expect(t).toContain("$HOME/.jolli/jollimemory/run-cli");
+	});
+
+	it("carries the Windows Git Bash shell prerequisite (its run-cli bash steps hit %USERPROFILE%)", () => {
+		const t = buildRemoteRunSkillTemplate();
 		expect(t).toContain("### Shell prerequisite");
 		expect(t).toMatch(/Git Bash/);
 		expect(t).toContain("%USERPROFILE%");
@@ -887,6 +1062,11 @@ describe("English-only", () => {
 	it("local-run template contains no CJK characters", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		expect(readLocalRun()).not.toMatch(CJK_AND_OTHER_NON_LATIN);
+	});
+
+	it("remote-run template contains no CJK characters", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		expect(readRemoteRun()).not.toMatch(CJK_AND_OTHER_NON_LATIN);
 	});
 });
 
