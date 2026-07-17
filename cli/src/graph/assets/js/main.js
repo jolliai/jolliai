@@ -179,6 +179,14 @@
     wireSearch();
     wireCanvasClear();
     wireResize();
+
+    // Tell an embedding host the themed graph is on screen, so it can reveal the
+    // iframe (it keeps us hidden until now to avoid a dark→light flash while the
+    // vendor scripts load). Inert standalone / in the VS Code webview: only posts
+    // when framed, and the parent ignores unknown message types.
+    if (window.WikiHost && window.WikiHost.embedded) {
+      window.WikiHost.notifyRendered();
+    }
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);

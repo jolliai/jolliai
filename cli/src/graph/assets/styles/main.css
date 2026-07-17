@@ -91,8 +91,7 @@ body {
   flex-shrink: 0;
 }
 .brand { display: flex; align-items: baseline; gap: 6px; }
-.brand-name { font-weight: 700; font-size: 17px; color: var(--accent); }
-.brand-sub { font-size: 11px; letter-spacing: 0.18em; color: var(--muted); }
+.brand-name { font-weight: 600; font-size: 13px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
 
 .breadcrumb { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .breadcrumb .crumb {
@@ -114,6 +113,17 @@ body {
 }
 .searchbox:focus { border-color: var(--accent-soft); width: 340px; }
 .searchbox::placeholder { color: var(--muted); }
+
+/* Host-activated topbar controls (see index.html / host-bridge.js). Hidden until
+   a hosting page reveals them; [hidden] must win over the inline-flex default. */
+.host-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; padding: 0; flex-shrink: 0;
+  border: none; border-radius: 6px; background: transparent;
+  color: var(--muted); cursor: pointer; transition: background .15s, color .15s;
+}
+.host-btn:hover { background: var(--surface-hover); color: var(--ink); }
+.host-btn[hidden] { display: none; }
 
 /* ── Layout ─────────────────────────────────────────────── */
 .layout { display: flex; flex: 1; min-height: 0; }

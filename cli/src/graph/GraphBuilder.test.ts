@@ -131,6 +131,8 @@ describe("buildKnowledgeGraph", () => {
 		// Source metadata is joined onto the assembled graph; artifacts go to kbRoot.
 		const [rootArg, graphArg] = writeGraphArtifacts.mock.calls[0];
 		expect(rootArg).toBe("/kb");
+		// The full-build exit stamps the repo name (breadcrumb root) — basename("/kb") === "kb".
+		expect(graphArg.repoName).toBe("kb");
 		const t1 = graphArg.topics.find((t: { slug: string }) => t.slug === "t1");
 		expect(t1.fullBody).toBe("page body\n\nsecond para");
 		expect(t1.overview).toBe("page body"); // first non-heading paragraph
@@ -300,13 +302,21 @@ describe("buildKnowledgeGraph", () => {
 		expect(r.mode).toBe("incremental");
 		expect(distillGraphIncremental).toHaveBeenCalled();
 		expect(distillGraph).not.toHaveBeenCalled();
+		// The incremental-LLM exit shares assembleGraph with the full path — it must stamp
+		// repoName too (basename("/kb") === "kb"), else a content change reverts the breadcrumb.
+		const [, graphArg] = writeGraphArtifacts.mock.calls[0];
+		expect(graphArg.repoName).toBe("kb");
 	});
 
 	it("skips entirely (no LLM, no write) when both content and metadata fingerprints are unchanged", async () => {
 		readTopicIndex.mockResolvedValue(ONE_TOPIC_INDEX);
 		readTopicPage.mockResolvedValue(null); // content = "", no branches/commits
-		// Baseline matches BOTH the content fingerprint and the (empty) metadata one.
-		readGraph.mockResolvedValue(baselineGraph({ t1: fpOf("Topic1", "s1", "") }, { t1: metaOf([], []) }));
+		// Baseline matches the content fingerprint, the (empty) metadata one, AND the
+		// build-stamped repoName — only then is it a true no-op. basename("/kb") === "kb".
+		readGraph.mockResolvedValue({
+			...baselineGraph({ t1: fpOf("Topic1", "s1", "") }, { t1: metaOf([], []) }),
+			repoName: "kb",
+		});
 
 		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
 
@@ -380,6 +390,28 @@ describe("buildKnowledgeGraph", () => {
 		expect(r.built).toBe(true);
 		expect(r.mode).toBe("incremental");
 		expect(writeGraphArtifacts).toHaveBeenCalled();
+	});
+
+	it("reassembles without LLM when content and metadata match but repoName is stale (heals repoName)", async () => {
+		readTopicIndex.mockResolvedValue(ONE_TOPIC_INDEX);
+		readTopicPage.mockResolvedValue(null); // content + metadata both unchanged
+		// Content AND metadata fingerprints match, so the only drift is the build-stamped
+		// repoName. Here it is stale ("old-name" from a rename); an absent field behaves the
+		// same. Either way a no-LLM reassemble must run and stamp the current basename("/kb").
+		readGraph.mockResolvedValue({
+			...richBaseline({ t1: fpOf("Topic1", "s1", "") }, { t1: metaOf([], []) }),
+			repoName: "old-name",
+		});
+
+		const r = await buildKnowledgeGraph("/cwd", folderStorage, CONFIG, { nowIso: ISO });
+
+		expect(r.built).toBe(true);
+		expect(r.mode).toBe("incremental");
+		expect(distillGraph).not.toHaveBeenCalled();
+		expect(distillGraphIncremental).not.toHaveBeenCalled();
+		expect(writeGraphArtifacts).toHaveBeenCalled();
+		const [, graphArg] = writeGraphArtifacts.mock.calls[0];
+		expect(graphArg.repoName).toBe("kb"); // refreshed to basename("/kb")
 	});
 
 	it("rebuilds fully when the baseline schemaVersion does not match", async () => {

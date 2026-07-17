@@ -157,6 +157,13 @@ export interface KnowledgeGraph {
 	readonly generatedAt: string;
 	readonly source: string;
 	/**
+	 * Repo/knowledge-base display name (the repo directory's basename), stamped at
+	 * build time. Consumed by the viz breadcrumb root (falls back to "Project" when
+	 * absent — e.g. graph.json built before this field existed). Optional so older
+	 * graph.json stays valid without a schema-version bump.
+	 */
+	readonly repoName?: string;
+	/**
 	 * Per-topic content fingerprint, keyed by `stableSlug`. The incremental
 	 * baseline: GraphBuilder diffs the previous graph.json's fingerprints against
 	 * the freshly-computed ones to find dirty/new/deleted topics. Empty `{}` on a
@@ -286,11 +293,18 @@ export function dropSubsumedRelatedTo(edges: ReadonlyArray<GraphEdge>): GraphEdg
  * rather than failing the compile).
  *
  * Topics absent from `sources` get empty source metadata (still rendered).
+ *
+ * `repoName` is required (the breadcrumb root, e.g. "jolli") and precedes the
+ * optional fingerprint maps so every caller must supply it — the stamp was
+ * previously an optional trailing arg that the full/incremental build paths
+ * silently dropped, reverting the breadcrumb to "Project". An empty string
+ * omits the field.
  */
 export function assembleGraph(
 	distill: DistilledGraph,
 	sources: ReadonlyMap<string, TopicSourceMeta>,
 	generatedAt: string,
+	repoName: string,
 	topicFingerprints: Record<string, string> = {},
 	topicMetaFingerprints: Record<string, string> = {},
 ): KnowledgeGraph {
@@ -384,6 +398,7 @@ export function assembleGraph(
 		schemaVersion: GRAPH_SCHEMA_VERSION,
 		generatedAt,
 		source: "topic KB distillation (LLM categories/topics/units/edges + computed joins)",
+		...(repoName ? { repoName } : {}),
 		topicFingerprints,
 		topicMetaFingerprints,
 		stats,

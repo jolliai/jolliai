@@ -250,7 +250,7 @@ describe("assembleGraph", () => {
 	]);
 
 	it("joins source metadata, computes rollups + stats", () => {
-		const graph = assembleGraph(validGraph(), sources, "2026-06-15T00:00:00.000Z");
+		const graph = assembleGraph(validGraph(), sources, "2026-06-15T00:00:00.000Z", "");
 
 		expect(graph.generatedAt).toBe("2026-06-15T00:00:00.000Z");
 		expect(graph.schemaVersion).toBe(2);
@@ -312,7 +312,7 @@ describe("assembleGraph", () => {
 			],
 			edges: [{ from: "t1::u1", to: "t2::u2", type: "related-to", confidence: 0.7, evidence: "same cat" }],
 		};
-		const graph = assembleGraph(distill, new Map(), "2026-06-15T00:00:00.000Z");
+		const graph = assembleGraph(distill, new Map(), "2026-06-15T00:00:00.000Z", "");
 		expect(graph.stats.crossTopicEdges).toBe(1);
 		expect(graph.stats.crossCategoryEdges).toBe(0);
 		// t3 has no units — the `?? 0` rollup path.
@@ -325,7 +325,7 @@ describe("assembleGraph", () => {
 		// symmetric collapse is isolated from the related-to subsumption rule.
 		g.edges.push({ from: "t1::u2", to: "t2::u3", type: "related-to", confidence: 0.6, evidence: "fwd" });
 		g.edges.push({ from: "t2::u3", to: "t1::u2", type: "related-to", confidence: 0.9, evidence: "rev" });
-		const graph = assembleGraph(g, sources, "2026-06-15T00:00:00.000Z");
+		const graph = assembleGraph(g, sources, "2026-06-15T00:00:00.000Z", "");
 		// 2 original directed + 1 collapsed symmetric = 3 (not 4).
 		expect(graph.stats.edges).toBe(3);
 		expect(graph.edges).toHaveLength(3);
@@ -339,7 +339,7 @@ describe("assembleGraph", () => {
 		// Distiller also emitted a generic related-to for the same pair (reversed) at
 		// higher confidence — it must be dropped in favor of the specific extends.
 		g.edges.push({ from: "t1::u2", to: "t1::u1", type: "related-to", confidence: 0.95, evidence: "generic" });
-		const graph = assembleGraph(g, sources, "2026-06-15T00:00:00.000Z");
+		const graph = assembleGraph(g, sources, "2026-06-15T00:00:00.000Z", "");
 		// extends (t1) + caused-by (cross) survive; the related-to is subsumed.
 		expect(graph.stats.edges).toBe(2);
 		expect(graph.edges.some((x) => x.type === "related-to")).toBe(false);
@@ -349,7 +349,7 @@ describe("assembleGraph", () => {
 	it("throws on a graph that fails validation", () => {
 		const g = validGraph();
 		g.edges.push({ from: "ghost", to: "t1::u1", type: "extends", confidence: 0.6, evidence: "x" });
-		expect(() => assembleGraph(g, sources, "2026-06-15T00:00:00.000Z")).toThrow(/validation failed/);
+		expect(() => assembleGraph(g, sources, "2026-06-15T00:00:00.000Z", "")).toThrow(/validation failed/);
 	});
 
 	it("embeds the passed topicFingerprints / topicMetaFingerprints (and defaults both to {})", () => {
@@ -357,21 +357,30 @@ describe("assembleGraph", () => {
 			validGraph(),
 			sources,
 			"2026-06-15T00:00:00.000Z",
+			"",
 			{ t1: "a", t2: "b" },
 			{ t1: "m" },
 		);
 		expect(withFp.topicFingerprints).toEqual({ t1: "a", t2: "b" });
 		expect(withFp.topicMetaFingerprints).toEqual({ t1: "m" });
-		const withoutFp = assembleGraph(validGraph(), sources, "2026-06-15T00:00:00.000Z");
+		const withoutFp = assembleGraph(validGraph(), sources, "2026-06-15T00:00:00.000Z", "");
 		expect(withoutFp.topicFingerprints).toEqual({});
 		expect(withoutFp.topicMetaFingerprints).toEqual({});
+	});
+
+	it("stamps repoName when provided and omits the field for an empty name", () => {
+		const withRepo = assembleGraph(validGraph(), sources, "2026-06-15T00:00:00.000Z", "jolli");
+		expect(withRepo.repoName).toBe("jolli");
+		// Empty repo name (e.g. an unexpected root basename) omits the field rather than stamping "".
+		const withoutRepo = assembleGraph(validGraph(), sources, "2026-06-15T00:00:00.000Z", "");
+		expect(withoutRepo.repoName).toBeUndefined();
 	});
 
 	it("prunes a category that ends up with zero topics", () => {
 		const distill = validGraph();
 		// Add an extra category no topic references → must be pruned by assembleGraph.
 		distill.categories.push({ id: "orphan-cat", shortTitle: "Orphan", summary: "Nobody here." });
-		const graph = assembleGraph(distill, sources, "2026-06-15T00:00:00.000Z");
+		const graph = assembleGraph(distill, sources, "2026-06-15T00:00:00.000Z", "");
 		expect(graph.categories.map((c) => c.id).sort()).toEqual(["cat-a", "cat-b"]);
 		expect(graph.stats.categories).toBe(2);
 	});
@@ -414,7 +423,7 @@ describe("diffTopics", () => {
 describe("toDistilled", () => {
 	function priorGraph(): unknown {
 		// A real emitted KnowledgeGraph (the incremental baseline shape).
-		return assembleGraph(validGraph(), new Map(), "2026-06-15T00:00:00.000Z", { t1: "a", t2: "b" });
+		return assembleGraph(validGraph(), new Map(), "2026-06-15T00:00:00.000Z", "", { t1: "a", t2: "b" });
 	}
 
 	it("strips derived fields and restores the DistilledGraph subset", () => {

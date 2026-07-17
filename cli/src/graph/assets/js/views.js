@@ -769,11 +769,16 @@
     const s = S.get();
     const bc = document.getElementById("breadcrumb");
     let html = "";
+    // Breadcrumb root: a host (the Jolli web app) can override with the repo name;
+    // otherwise use the repoName stamped into graph.json (works in the VS Code
+    // webview / standalone too); fall back to "Project" for graph.json built before
+    // that field existed.
+    const rootLabel = (window.WikiHost && window.WikiHost.rootLabel) || (D.graph && D.graph.repoName) || null;
     if (s.level === "overview") {
-      html = `<span class="crumb current">Project Overview</span>`;
+      html = `<span class="crumb current">${rootLabel ? esc(rootLabel) : "Project Overview"}</span>`;
     } else {
       const th = D.categoriesById.get(s.categoryId);
-      html = `<span class="crumb" data-nav="overview">Project</span>` +
+      html = `<span class="crumb" data-nav="overview">${rootLabel ? esc(rootLabel) : "Project"}</span>` +
         `<span class="sep">›</span>` +
         `<span class="crumb current">${esc(th ? th.shortTitle : s.categoryId)}</span>` +
         `<span class="esc-hint">(Esc to go back)</span>`;

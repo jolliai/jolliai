@@ -9,10 +9,19 @@
 <body>
   <div class="app">
     <header class="topbar">
-      <div class="brand"><span class="brand-name">Jolli</span><span class="brand-sub">GRAPH</span></div>
+      <!-- Host-activated controls: hidden by default; a hosting page (the Jolli
+           web app) reveals them over the postMessage handshake (see host-bridge.js).
+           Standalone / VS Code webview never handshake, so they stay hidden. -->
+      <button type="button" class="host-btn" id="host-btn-expand-tree" title="Show sidebar" aria-label="Show sidebar" hidden>
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"></rect><path d="M9 3v18"></path></svg>
+      </button>
+      <div class="brand"><span class="brand-name">Graph</span></div>
       <nav class="breadcrumb" id="breadcrumb"></nav>
       <div class="topbar-spacer"></div>
       <input type="search" class="searchbox" id="searchbox" placeholder="Search topics & units…" autocomplete="off" />
+      <button type="button" class="host-btn" id="host-btn-close" title="Close graph" aria-label="Close graph" hidden>
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"></path></svg>
+      </button>
     </header>
 
     <div class="layout">
@@ -46,6 +55,7 @@
   <script src="vendor/panzoom.min.js"></script>
   <script src="vendor/elk.bundled.js"></script>
   <script src="vendor/marked.min.js"></script>
+  <script src="js/host-bridge.js"></script>
   <script src="js/data.js"></script>
   <script src="js/state.js"></script>
   <script src="js/edges.js"></script>
