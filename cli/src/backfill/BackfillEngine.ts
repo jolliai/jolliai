@@ -16,13 +16,15 @@
 
 import { execGit, getCommitInfo, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
+import { hasLlmCredentials } from "../core/LlmClient.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
 import { generateSummary } from "../core/Summarizer.js";
-import { getIndexEntryMap, setActiveStorage, storeSummary } from "../core/SummaryStore.js";
+import { getIndexEntryMap, storeSummary } from "../core/SummaryStore.js";
 import { generateTranscriptId } from "../core/TranscriptId.js";
 import { buildMultiSessionContext } from "../core/TranscriptReader.js";
+import { withCommitCaptureLock } from "../hooks/CommitCaptureLock.js";
 import { launchWorker } from "../hooks/QueueWorker.js";
 import { createLogger } from "../Logger.js";
 import { type CommitSummary, CURRENT_SCHEMA_VERSION, type StoredTranscript } from "../Types.js";
@@ -63,7 +65,7 @@ const CURSOR_BACK_MARGIN_MS = 7 * 24 * 60 * 60 * 1000;
  */
 export const DEFAULT_BACKFILL_TIER: "high" | "medium" | "low" = "low";
 
-export type BackfillStatus = "generated" | "would-generate" | "skipped-has-summary" | "error";
+export type BackfillStatus = "generated" | "would-generate" | "skipped-has-summary" | "skipped-in-progress" | "error";
 
 export interface BackfillOutcome {
 	readonly commitHash: string;
@@ -143,18 +145,6 @@ async function worktreeRoots(cwd: string): Promise<string[]> {
 		}
 	}
 	return [...roots];
-}
-
-function hasLlmCredentials(config: {
-	apiKey?: string;
-	jolliApiKey?: string;
-	aiProvider?: "anthropic" | "jolli" | "local-agent";
-}): boolean {
-	// local-agent drives the tool's own subscription login, not a
-	// jollimemory-held credential — presence of apiKey/jolliApiKey/ANTHROPIC_API_KEY
-	// is not the blocker for it (mirrors resolveLlmCredentialSource in LlmClient.ts).
-	if (config.aiProvider === "local-agent") return true;
-	return Boolean(config.apiKey || config.jolliApiKey || process.env.ANTHROPIC_API_KEY);
 }
 
 /** Converts an attributed commit's sessions into the orphan-branch transcript artifact. */
@@ -262,8 +252,14 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 
 	log.info("Back-fill start: cwd=%s candidates=%d dryRun=%s minTier=%s", cwd, hashes.length, dryRun, minTier);
 
+	// `storage` is threaded explicitly through every read/write below
+	// (getIndexEntryMap / storeSummary / generateAndStore), so we deliberately do
+	// NOT install the process-global `setActiveStorage` override. Back-fill can run
+	// inside the long-lived VS Code host, concurrently with a compile sweep whose
+	// IngestPipeline writes resolve THROUGH that global; installing (or leaking) it
+	// here would misdirect the sweep's writes to this repo. Mirrors the invariant
+	// CommitSummarizer documents: thread `storage`, never swap the global.
 	const storage = await createStorage(cwd, cwd);
-	setActiveStorage(storage);
 
 	// 1. Drop commits that already have a summary.
 	const existing = await getIndexEntryMap(cwd, storage);
@@ -349,17 +345,29 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 			outcome = { commitHash: hash, status: "error", message: "no LLM credentials configured" };
 		} else {
 			try {
-				const topics = await generateAndStore(hash, attr, cwd, llmConfig, storage);
-				log.info("Back-fill generated %s via %s (%d topics)", hash.substring(0, 8), method, topics);
-				outcome = {
-					commitHash: hash,
-					status: "generated",
-					method,
-					topics,
-					sessions: attr?.sessions.length ?? 0,
-					conversationTurns: attr?.conversationTurns ?? 0,
-					...(attr ? { confidence: attr.confidence } : {}),
-				};
+				const capture = await withCommitCaptureLock(cwd, hash, "fail-fast", async () => {
+					const latest = await getIndexEntryMap(cwd, storage);
+					if (latest.has(hash)) return null;
+					return generateAndStore(hash, attr, cwd, llmConfig, storage);
+				});
+				if (!capture.ran) {
+					log.info("Back-fill skipped %s: live capture in progress", hash.substring(0, 8));
+					outcome = { commitHash: hash, status: "skipped-in-progress" };
+				} else if (capture.value === null) {
+					outcome = { commitHash: hash, status: "skipped-has-summary" };
+				} else {
+					const topics = capture.value;
+					log.info("Back-fill generated %s via %s (%d topics)", hash.substring(0, 8), method, topics);
+					outcome = {
+						commitHash: hash,
+						status: "generated",
+						method,
+						topics,
+						sessions: attr?.sessions.length ?? 0,
+						conversationTurns: attr?.conversationTurns ?? 0,
+						...(attr ? { confidence: attr.confidence } : {}),
+					};
+				}
 			} catch (err) {
 				outcome = { commitHash: hash, status: "error", message: (err as Error).message };
 				log.error("Back-fill failed for %s: %s", hash.substring(0, 8), (err as Error).message);
@@ -511,8 +519,10 @@ async function gatherCursorCandidates(
  */
 export async function countMissingSummaries(cwd: string): Promise<{ missing: number; total: number }> {
 	const hashes = await recentCommitHashes(cwd);
+	// Thread `storage` explicitly; never install the setActiveStorage global here —
+	// this runs in the long-lived VS Code host and would race a concurrent compile
+	// sweep's global-resolved writes (see runBackfill above / CommitSummarizer).
 	const storage = await createStorage(cwd, cwd);
-	setActiveStorage(storage);
 	const existing = await getIndexEntryMap(cwd, storage);
 	let missing = 0;
 	for (const h of hashes) if (!existing.has(h)) missing++;
@@ -527,8 +537,10 @@ export async function countMissingSummaries(cwd: string): Promise<{ missing: num
  * memories is not in cold start.
  */
 export async function repoHasAnyMemory(cwd: string): Promise<boolean> {
+	// Thread `storage` explicitly; never install the setActiveStorage global here —
+	// this runs in the long-lived VS Code host and would race a concurrent compile
+	// sweep's global-resolved writes (see runBackfill above / CommitSummarizer).
 	const storage = await createStorage(cwd, cwd);
-	setActiveStorage(storage);
 	const existing = await getIndexEntryMap(cwd, storage);
 	return existing.size > 0;
 }
@@ -590,8 +602,10 @@ export async function listMissingCommits(cwd: string, sinceMs?: number, limit?: 
 	const windowed = typeof sinceMs === "number" ? rows.filter((r) => r.ts >= newest - sinceMs) : rows;
 
 	// Drop the ones that already have a summary (index membership — no transcript scan).
+	// Thread `storage` explicitly; never install the setActiveStorage global here —
+	// this runs in the long-lived VS Code host and would race a concurrent compile
+	// sweep's global-resolved writes (see runBackfill above / CommitSummarizer).
 	const storage = await createStorage(cwd, cwd);
-	setActiveStorage(storage);
 	const existing = await getIndexEntryMap(cwd, storage);
 	const missing = windowed.filter((r) => !existing.has(r.commitHash));
 	// Cap to the newest `limit` when requested (rows are already newest-first).

@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { isAntigravityInstalled } from "../core/AntigravityDetector.js";
 import { discoverAntigravitySessions } from "../core/AntigravitySessionDiscoverer.js";
 import { readAntigravityTranscript } from "../core/AntigravityTranscriptReader.js";
+import { archiveSupersededCheckpoints, commitSecondUpperBound } from "../core/CheckpointStore.js";
 import { isClineCliInstalled } from "../core/ClineCliDetector.js";
 import { discoverClineCliSessions } from "../core/ClineCliSessionDiscoverer.js";
 import { readClineCliTranscript } from "../core/ClineCliTranscriptReader.js";
@@ -170,6 +171,8 @@ import {
 	type TranscriptSource,
 } from "../Types.js";
 import { spawnHidden } from "../util/Subprocess.js";
+import { CAPTURE_PROGRESS_MAX_AGE_MS, emitCaptureProgress, pruneStaleCaptureProgress } from "./CaptureProgress.js";
+import { withCommitCaptureLock } from "./CommitCaptureLock.js";
 
 const log = createLogger("QueueWorker");
 
@@ -509,6 +512,13 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 		}, WORKER_LOCK_REFRESH_INTERVAL_MS);
 		/* v8 ignore stop */
 
+		// Queue entries deferred this run because another live capture held their
+		// commit lock (contention, not failure). Left ON DISK for a later worker to
+		// retry; tracked here so this run neither re-blocks on them (filtered out of
+		// each dequeue below) nor immediately chain-spawns a successor for them.
+		// Declared in the outer scope so the chain-spawn decision below can see it.
+		const deferredContentionPaths = new Set<string>();
+
 		try {
 			// Drain the queue: process all entries, then check for new ones (added during processing)
 			let processedCount = 0;
@@ -531,7 +541,8 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 				// an ingest-only queue yields an empty `summaryEntries` and we break,
 				// leaving the ingest entries intact for the ingest phase to consume.
 				const summaryEntries = entries.filter(
-					(e): e is { op: CommitGitOperation; filePath: string } => !isIngestOperation(e.op),
+					(e): e is { op: CommitGitOperation; filePath: string } =>
+						!isIngestOperation(e.op) && !deferredContentionPaths.has(e.filePath),
 				);
 				if (summaryEntries.length === 0) break;
 
@@ -556,10 +567,26 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 						committedThisRun = true;
 						newlyGeneratedHashes.add(op.commitHash);
 					} catch (error: unknown) {
-						// Queue entries are deleted regardless of success or failure (fire-and-forget).
-						// Retry is intentionally not implemented: pipeline steps (transcript cursor
-						// advancement, summary writes) are not idempotent, so naive retry could cause
-						// duplicate summaries or corrupted metadata.
+						if (error instanceof CommitCaptureContentionError) {
+							// Lock contention, NOT a pipeline failure — nothing ran. Leave the
+							// entry on disk (don't delete) and defer it so this run doesn't
+							// immediately re-dequeue and re-block on the same held lock. A
+							// later worker (next commit / SessionStart / pre-push, or the
+							// chain-spawn below for non-deferred leftovers) retries it. This
+							// replaces the old "delete on timeout", which permanently lost the
+							// summary for a commit whose lock was held for the full window.
+							log.warn(
+								"Deferring queue entry ref=%s: %s",
+								op.commitHash.substring(0, 8),
+								(error as Error).message,
+							);
+							deferredContentionPaths.add(filePath);
+							continue;
+						}
+						// Other failures: entry is deleted regardless (fire-and-forget).
+						// Retry is intentionally not implemented for these: pipeline steps
+						// (transcript cursor advancement, summary writes) are not idempotent, so
+						// naive retry could cause duplicate summaries or corrupted metadata.
 						// TODO: Support re-summarize for specific commits (e.g., after LLM quota
 						// replenishment). Requires persisting transcripts to the orphan branch BEFORE
 						// the LLM call so re-summarize can read them back without cursor dependency.
@@ -620,9 +647,12 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 		// MAX_ENTRIES cap or during the drain. Ingest entries are deliberately NOT a
 		// chain-spawn trigger — they're consumed by the ingest phase below (and its
 		// `wakePendingIngest` hand-off), so spawning for them would double-run.
+		// Entries deferred for lock contention are excluded too: a successor spawned
+		// now would just re-block on the same held lock, so leave them for the next
+		// organic trigger instead of a tight retry chain.
 		const remaining = await dequeueAllGitOperations(cwd);
 		/* v8 ignore start -- chain spawn only occurs when new summary entries arrive during processing */
-		if (remaining.some(({ op }) => !isIngestOperation(op))) {
+		if (remaining.some(({ op, filePath }) => !isIngestOperation(op) && !deferredContentionPaths.has(filePath))) {
 			log.info("Queue has remaining summary entries — spawning chain worker");
 			launchWorker(cwd);
 		}
@@ -791,6 +821,28 @@ async function runIngestEntry(
 }
 
 /**
+ * Thrown by {@link processQueueEntry} when the per-commit capture lock is already
+ * held — another live capture (an in-process `CommitSummarizer` in the desktop
+ * cockpit, or a `jolli backfill`) is producing this commit's summary. Distinct
+ * from a pipeline failure: nothing ran, so the drain loop leaves the queue entry
+ * in place for a later worker to retry rather than deleting it (which would lose
+ * the summary).
+ *
+ * The worker acquires this lock FAIL-FAST, not with a wait window. Reason: the
+ * drain holds the vault-wide `vault-write.lock` (which serialises writes across
+ * every repo in the Memory Bank). Blocking here for the full capture-lock window
+ * (up to 15 min) would keep that vault lock held the whole time, starving every
+ * OTHER repo's worker (60 s wait → record-pending + exit) and any concurrent
+ * `jolli compile` (VaultWriteBusyError). Failing fast releases the vault lock
+ * promptly; the deferred entry is retried later, by which point the concurrent
+ * holder has stored the summary and the re-check-under-lock skip (or
+ * storeSummary's dedup) makes the retry a cheap no-op. The in-process
+ * `CommitSummarizer` still WAITS on this lock — it holds no vault lock, so it
+ * can afford to.
+ */
+class CommitCaptureContentionError extends Error {}
+
+/**
  * Processes a single commit-typed queue entry. Ingest entries are consumed by
  * runWorker's ingest phase and never reach here.
  * Called by runWorker() for each entry in the queue.
@@ -804,29 +856,122 @@ async function processQueueEntry(
 	const commitOp = op as CommitGitOperation;
 	log.info("Processing queue entry: type=%s hash=%s", commitOp.type, commitOp.commitHash.substring(0, 8));
 
-	switch (commitOp.type) {
-		case "commit":
-		case "cherry-pick":
-		case "revert":
-		case "amend":
-			// These all go through the LLM pipeline
-			await executePipeline(cwd, commitOp, force);
-			break;
+	const capture = await withCommitCaptureLock(
+		cwd,
+		commitOp.commitHash,
+		// Fail-fast, NOT a wait window: this runs while the drain holds the
+		// vault-wide vault-write.lock, so blocking here would starve every other
+		// repo. See CommitCaptureContentionError's doc for the full rationale.
+		"fail-fast",
+		async () => {
+			// Live-feedback progress stream, consumed by an interactive post-commit
+			// watcher (see CaptureProgress). Best-effort and independent of generation.
+			// Prune stale files first, then always bracket the work with start/end so a
+			// watcher can never hang: the `finally` emits a terminal event on every path.
+			pruneStaleCaptureProgress(cwd, CAPTURE_PROGRESS_MAX_AGE_MS);
+			emitCaptureProgress(cwd, commitOp.commitHash, "start");
+			try {
+				// Skip a plain commit whose durable LIVE summary already exists — e.g. a
+				// concurrent capture won this commit's lock first, generated the summary,
+				// and released before we acquired it. Re-running the pipeline would redo
+				// the LLM call + metadata reassociation. Mirrors backfill's own
+				// re-check-under-lock. `amend` intentionally regenerates, `force` always
+				// regenerates, and cherry-pick/revert produce new hashes.
+				//
+				// A BACKFILLED summary is deliberately NOT treated as a skip: back-fill
+				// is a lower-fidelity placeholder (no live transcript), so this live
+				// capture should supersede it. Falling through to executePipeline →
+				// storeSummary lets storeSummary's `promotesBackfill` replace it.
+				if (commitOp.type === "commit" && !force) {
+					const existing = await getSummary(commitOp.commitHash, cwd, storage);
+					if (existing && existing.backfilled !== true) {
+						log.info("Skipping %s: live summary already exists", commitOp.commitHash.substring(0, 8));
+						emitCaptureProgress(cwd, commitOp.commitHash, "skipped", { terminal: true });
+						return;
+					}
+				}
+				switch (commitOp.type) {
+					case "commit":
+					case "cherry-pick":
+					case "revert":
+					case "amend":
+						await executePipeline(cwd, commitOp, force);
+						break;
 
-		case "squash":
-			await handleSquashFromQueue(commitOp, cwd);
-			break;
+					case "squash":
+						await handleSquashFromQueue(commitOp, cwd);
+						break;
 
-		case "rebase-pick":
-			await handleRebasePickFromQueue(commitOp, cwd);
-			break;
+					case "rebase-pick":
+						await handleRebasePickFromQueue(commitOp, cwd);
+						break;
 
-		case "rebase-squash":
-			await handleRebaseSquashFromQueue(commitOp, cwd);
-			break;
+					case "rebase-squash":
+						await handleRebaseSquashFromQueue(commitOp, cwd);
+						break;
 
-		default:
-			log.warn("Unknown queue entry type: %s", commitOp.type);
+					default:
+						// An unrecognized entry type stores nothing — mark it a failure so
+						// the interactive watcher doesn't report "analysis continues in the
+						// background" for work that never will.
+						log.warn("Unknown queue entry type: %s", commitOp.type);
+						emitCaptureProgress(cwd, commitOp.commitHash, "failed");
+				}
+			} catch (err) {
+				// A hard throw (e.g. getCommitInfo/storeSummary) escapes before any
+				// stored/skipped milestone. Emit a terminal-state `failed` so the
+				// watcher prints an accurate outcome, then rethrow so the worker's own
+				// error handling (logging, next-entry drain) is unchanged.
+				emitCaptureProgress(cwd, commitOp.commitHash, "failed");
+				throw err;
+			} finally {
+				emitCaptureProgress(cwd, commitOp.commitHash, "end", { terminal: true });
+			}
+		},
+	);
+	if (!capture.ran) {
+		throw new CommitCaptureContentionError(
+			`another capture of ${commitOp.commitHash.substring(0, 8)} is in progress — deferring`,
+		);
+	}
+
+	// Tail step: retire this branch's volatile checkpoints — a durable commit
+	// summary now supersedes them (concept §03). No-op (a single readdir) when the
+	// repo has no `.jolli/checkpoints/`, which is every checkpoint-free repo, so
+	// the common CLI/VS Code path pays nothing. Folder-only, so it needs a
+	// folder-backed storage (`kbRoot`); pure orphan mode has no folder and no
+	// checkpoints. Failures MUST NOT roll back the op — same contract as the
+	// stale-child cleanup below.
+	//
+	// Scope archival to the commit's own second (matches CommitSummarizer): the
+	// bound keeps a rebase-pick/rebase-squash replay of an OLDER commit — or the
+	// async drain window between commit and worker — from wiping fresher
+	// checkpoints captured for the NEXT commit. The date lookup is a lazy resolver
+	// so a checkpoint-free repo never pays the git call.
+	//
+	// Gate on a durable summary ACTUALLY existing for this commit, not merely on
+	// `capture.ran`. Several capture paths complete the lock body without storing
+	// anything — an empty diff + empty transcript skip, a squash / rebase-squash
+	// that found no source summaries, an unknown entry type — and archiving there
+	// would retire the branch's live checkpoints with no summary superseding them.
+	// `getSummary` is truthy exactly when a root landed under this hash (commit /
+	// amend via storeSummary, squash via mergeManyToOne, rebase-* via
+	// migrateOneToOne, or the already-summarized skip), so it precisely matches the
+	// tail step's premise. Mirrors CommitSummarizer, which retires only after
+	// storeSummary succeeds.
+	if (commitOp.branch && storage.kbRoot && (await getSummary(commitOp.commitHash, cwd, storage))) {
+		try {
+			await archiveSupersededCheckpoints(storage.kbRoot, commitOp.branch, {
+				before: () => getCommitInfo(commitOp.commitHash, cwd).then((info) => commitSecondUpperBound(info.date)),
+				supersededBy: commitOp.commitHash,
+			});
+		} catch (err) {
+			log.warn(
+				"Checkpoint archive tail step failed for %s: %s",
+				commitOp.commitHash.substring(0, 8),
+				errMsg(err),
+			);
+		}
 	}
 
 	// Tail step: prune visible .md files for hoisted older versions
@@ -1690,11 +1835,19 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		diffStats.deletions,
 		formatElapsed(stepStart),
 	);
+	emitCaptureProgress(cwd, op.commitHash, "diff", {
+		data: {
+			filesChanged: diffStats.filesChanged,
+			insertions: diffStats.insertions,
+			deletions: diffStats.deletions,
+		},
+	});
 
 	// Guard: skip only if BOTH transcript is empty AND diff has no file changes
 	// (Summarizer Rule 5 can infer topics from diff alone when transcript is empty)
 	if (totalEntries === 0 && diffStats.filesChanged === 0) {
 		log.info("No new transcript entries and no file changes. Skipping summary generation.");
+		emitCaptureProgress(cwd, op.commitHash, "skipped", { terminal: true });
 		return;
 	}
 
@@ -1776,9 +1929,16 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		activeReferenceEntries.length,
 		excludedContext.length,
 	);
+	emitCaptureProgress(cwd, op.commitHash, "references", {
+		data: {
+			references: [...activePlanEntries.map((p) => p.slug), ...activeReferenceEntries.map((e) => e.nativeId)],
+			notes: activeNoteEntries.length,
+		},
+	});
 
 	// Step 7: Call AI to generate summary
 	stepStart = now();
+	emitCaptureProgress(cwd, op.commitHash, "analyzing");
 	const summaryParams = {
 		conversation,
 		diff,
@@ -1867,6 +2027,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// Step 8b: Evaluate plan progress for each linked plan (Haiku calls parallelized)
 	const planProgressArtifacts: PlanProgressArtifact[] = [];
 	if (planRefs.length > 0) {
+		emitCaptureProgress(cwd, op.commitHash, "plan-progress");
 		/* v8 ignore start -- defensive: SummaryResult.topics is always set by generateSummary, but retain the nullish guard in case the type relaxes */
 		const topics: ReadonlyArray<TopicSummary> = summaryResult.topics ?? [];
 		/* v8 ignore stop */
@@ -1985,6 +2146,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		noteRefs.length,
 		referenceRefs.length,
 	);
+	emitCaptureProgress(cwd, op.commitHash, "stored", { data: { topics: summaryResult.topics.length } });
 
 	// Note: Old Step 10 (amend-pending Scenario 1) has been removed.
 	// Amend operations are now handled through the unified git operation queue.
@@ -2034,7 +2196,7 @@ async function runSquashPipeline(
 	commitInfo: CommitInfo,
 	cwd: string,
 	metadata: { readonly commitType: CommitType; readonly commitSource: CommitSource },
-): Promise<void> {
+): Promise<number> {
 	// Expand each source via expandSourcesForConsolidation: preserves per-commit
 	// grouping for nested squash roots (so the LLM can apply rule 4 evidence).
 	const sources: ReadonlyArray<SquashConsolidationSource> = oldSummaries.flatMap(expandSourcesForConsolidation);
@@ -2125,6 +2287,11 @@ async function runSquashPipeline(
 
 	// Re-associate plans and notes with the new squash commit hash.
 	await reassociateMetadata(oldSummaries, commitInfo.hash, cwd);
+
+	// Consolidated topic count for the caller's `stored` progress event — mirrors
+	// executePipeline's `{ data: { topics } }` shape so an interactive watcher
+	// reports the squash/rebase-squash capture as completed, not "background".
+	return consolidated.topics.length;
 }
 
 /**
@@ -2172,22 +2339,25 @@ async function loadSourceSummaries(
 async function handleSquashFromQueue(op: CommitGitOperation, cwd: string): Promise<void> {
 	if (!op.sourceHashes || op.sourceHashes.length === 0) {
 		log.warn("Squash queue entry has no sourceHashes — skipping");
+		emitCaptureProgress(cwd, op.commitHash, "skipped", { terminal: true });
 		return;
 	}
 
 	const oldSummaries = await loadSourceSummaries(op.sourceHashes, cwd, "Squash");
 	if (oldSummaries.length === 0) {
 		log.warn("Squash: no source summaries found for %s -- skipping", op.commitHash.substring(0, 8));
+		emitCaptureProgress(cwd, op.commitHash, "skipped", { terminal: true });
 		return;
 	}
 
 	const commitInfo = await getCommitInfo(op.commitHash, cwd);
 	/* v8 ignore start -- commitSource is always set by the enqueue path; fallback is defensive */
-	await runSquashPipeline(oldSummaries, commitInfo, cwd, {
+	const topics = await runSquashPipeline(oldSummaries, commitInfo, cwd, {
 		commitType: "squash",
 		commitSource: op.commitSource ?? "cli",
 	});
 	/* v8 ignore stop */
+	emitCaptureProgress(cwd, op.commitHash, "stored", { data: { topics } });
 }
 
 /**
@@ -2197,6 +2367,7 @@ async function handleSquashFromQueue(op: CommitGitOperation, cwd: string): Promi
 async function handleRebasePickFromQueue(op: CommitGitOperation, cwd: string): Promise<void> {
 	if (!op.sourceHashes?.[0]) {
 		log.warn("Rebase-pick queue entry has no sourceHash — skipping");
+		emitCaptureProgress(cwd, op.commitHash, "skipped", { terminal: true });
 		return;
 	}
 
@@ -2204,6 +2375,7 @@ async function handleRebasePickFromQueue(op: CommitGitOperation, cwd: string): P
 	const oldSummary = await getSummary(oldHash, cwd);
 	if (!oldSummary) {
 		log.warn("Rebase-pick: no summary found for old hash %s — skipping", oldHash.substring(0, 8));
+		emitCaptureProgress(cwd, op.commitHash, "skipped", { terminal: true });
 		return;
 	}
 
@@ -2220,6 +2392,10 @@ async function handleRebasePickFromQueue(op: CommitGitOperation, cwd: string): P
 	await reassociateMetadata([oldSummary], op.commitHash, cwd);
 
 	log.info("Rebase-pick: migrated %s → %s", oldHash.substring(0, 8), op.commitHash.substring(0, 8));
+	// The 1:1 migration produced a summary at the new hash, so report the capture
+	// as stored (topic count carried from the migrated summary; container roots
+	// may have no own topics, hence the `?? 0`).
+	emitCaptureProgress(cwd, op.commitHash, "stored", { data: { topics: oldSummary.topics?.length ?? 0 } });
 }
 
 /**
@@ -2233,20 +2409,23 @@ async function handleRebasePickFromQueue(op: CommitGitOperation, cwd: string): P
 async function handleRebaseSquashFromQueue(op: CommitGitOperation, cwd: string): Promise<void> {
 	if (!op.sourceHashes || op.sourceHashes.length === 0) {
 		log.warn("Rebase-squash queue entry has no sourceHashes — skipping");
+		emitCaptureProgress(cwd, op.commitHash, "skipped", { terminal: true });
 		return;
 	}
 
 	const oldSummaries = await loadSourceSummaries(op.sourceHashes, cwd, "Rebase-squash");
 	if (oldSummaries.length === 0) {
 		log.warn("Rebase-squash: no source summaries found for %s — skipping", op.commitHash.substring(0, 8));
+		emitCaptureProgress(cwd, op.commitHash, "skipped", { terminal: true });
 		return;
 	}
 
 	const newCommitInfo = await getCommitInfo(op.commitHash, cwd);
-	await runSquashPipeline(oldSummaries, newCommitInfo, cwd, {
+	const topics = await runSquashPipeline(oldSummaries, newCommitInfo, cwd, {
 		commitType: "squash",
 		commitSource: (op.commitSource ?? "cli") as CommitSource,
 	});
+	emitCaptureProgress(cwd, op.commitHash, "stored", { data: { topics } });
 }
 
 /**
@@ -3650,6 +3829,8 @@ export const __test__ = {
 	executePipeline,
 	handleAmendPipeline,
 	handleSquashFromQueue,
+	handleRebasePickFromQueue,
+	handleRebaseSquashFromQueue,
 	loadSessionTranscripts,
 	buildStoredTranscript,
 	processQueueEntry,

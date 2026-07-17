@@ -362,6 +362,144 @@ describe("LlmClient", () => {
 			expect(requestOptions?.signal).toBeInstanceOf(AbortSignal);
 		});
 
+		it("re-raises a caller-cancel as an AbortError, not a wrapped internal error", async () => {
+			// Regression for the direct-path cancel misclassification: the SDK rejects an
+			// aborted request with APIUserAbortError (name !== "AbortError"). callDirect must
+			// surface a standard AbortError when the CALLER's signal aborted, so the compile
+			// pipeline's `err.name === "AbortError"` check reports "cancelled" (not a repo
+			// failure). Mirrors the proxy path, which already re-throws its abort unwrapped.
+			const controller = new AbortController();
+			controller.abort();
+			mockCreate.mockRejectedValueOnce(
+				Object.assign(new Error("Request was aborted."), { name: "APIUserAbortError" }),
+			);
+			await expect(
+				callLlm({
+					action: "translate",
+					params: { content: "test" },
+					apiKey: "sk-ant-test",
+					model: "claude-sonnet-4-6",
+					maxTokens: 256,
+					signal: controller.signal,
+				}),
+			).rejects.toMatchObject({ name: "AbortError" });
+		});
+
+		it("wraps an INTERNAL (non-caller) abort as a normal failure, not an AbortError", async () => {
+			// A watchdog/timeout abort leaves the caller signal unaborted, so it must stay a
+			// retryable failure — NOT be misread as a user cancel.
+			mockCreate.mockRejectedValueOnce(
+				Object.assign(new Error("Request was aborted."), { name: "APIUserAbortError" }),
+			);
+			await expect(
+				callLlm({
+					action: "translate",
+					params: { content: "test" },
+					apiKey: "sk-ant-test",
+					model: "claude-sonnet-4-6",
+					maxTokens: 256,
+					// no signal (or an unaborted one) → internal abort path
+				}),
+			).rejects.toMatchObject({ name: "Error" });
+		});
+
+		it("still passes a signal on the direct path when the caller supplies one (merged with the timeout)", async () => {
+			// Exercises timeoutSignal's externalSignal-present branch: caller signal
+			// is merged with the internal wall-clock timeout via AbortSignal.any.
+			await callLlm({
+				action: "translate",
+				params: { content: "test" },
+				apiKey: "sk-ant-test",
+				maxTokens: 256,
+				signal: new AbortController().signal,
+			});
+			const requestOptions = mockCreate.mock.calls.at(-1)?.[1] as { signal?: unknown } | undefined;
+			expect(requestOptions?.signal).toBeInstanceOf(AbortSignal);
+		});
+
+		it("falls back to a manual signal merge when AbortSignal.any is unavailable (Node <18.17)", async () => {
+			// The VS Code bundle targets node18; on 18.0–18.16 `AbortSignal.any` is
+			// absent. Simulate that and assert the merged signal still forwards the
+			// caller's abort (and starts un-aborted).
+			const originalDesc = Object.getOwnPropertyDescriptor(AbortSignal, "any");
+			Object.defineProperty(AbortSignal, "any", { value: undefined, configurable: true, writable: true });
+			try {
+				const controller = new AbortController();
+				await callLlm({
+					action: "translate",
+					params: { content: "test" },
+					apiKey: "sk-ant-test",
+					maxTokens: 256,
+					signal: controller.signal,
+				});
+				const merged = (mockCreate.mock.calls.at(-1)?.[1] as { signal?: AbortSignal } | undefined)?.signal;
+				expect(merged).toBeInstanceOf(AbortSignal);
+				expect(merged?.aborted).toBe(false);
+				controller.abort(new Error("caller cancelled"));
+				expect(merged?.aborted).toBe(true);
+			} finally {
+				if (originalDesc) Object.defineProperty(AbortSignal, "any", originalDesc);
+			}
+		});
+
+		const okMessage = {
+			content: [{ type: "text", text: "streamed" }],
+			model: "claude-sonnet-4-6",
+			usage: { input_tokens: 1, output_tokens: 1 },
+			stop_reason: "end_turn",
+		};
+
+		it("aborts the in-flight stream immediately when the caller's signal is already aborted", async () => {
+			const abort = vi.fn();
+			mockStream.mockReturnValueOnce({
+				finalMessage: vi.fn().mockResolvedValue(okMessage),
+				on: vi.fn(),
+				abort,
+			});
+			await callLlm({
+				action: "translate",
+				params: { content: "x" },
+				apiKey: "sk-ant-test",
+				maxTokens: 8192,
+				signal: AbortSignal.abort(),
+			});
+			expect(abort).toHaveBeenCalled();
+		});
+
+		it("wires a live caller signal to abort the stream mid-flight and removes the listener on completion", async () => {
+			const controller = new AbortController();
+			const addSpy = vi.spyOn(controller.signal, "addEventListener");
+			const removeSpy = vi.spyOn(controller.signal, "removeEventListener");
+			const abort = vi.fn();
+			let resolveFinal: (m: unknown) => void = () => {};
+			mockStream.mockReturnValueOnce({
+				finalMessage: vi.fn().mockReturnValue(
+					new Promise((res) => {
+						resolveFinal = res;
+					}),
+				),
+				on: vi.fn(),
+				abort,
+			});
+
+			const pending = callLlm({
+				action: "translate",
+				params: { content: "x" },
+				apiKey: "sk-ant-test",
+				maxTokens: 8192,
+				signal: controller.signal,
+			});
+			// Listener registered as a one-shot while the signal is not yet aborted.
+			expect(addSpy).toHaveBeenCalledWith("abort", expect.any(Function), { once: true });
+			// Firing the caller signal cancels the in-flight stream.
+			controller.abort();
+			expect(abort).toHaveBeenCalled();
+			resolveFinal(okMessage);
+			await pending;
+			// Cleanup in the finally so the completed call leaves no dangling listener.
+			expect(removeSpy).toHaveBeenCalledWith("abort", expect.any(Function));
+		});
+
 		it("logs model, maxTokens, promptChars, elapsedMs plus errorName/httpStatus/requestId so timeout-vs-size-vs-server is diagnosable", async () => {
 			// A large call streams; when it aborts on the wall-clock/idle timeout the
 			// catch must log enough to tell "prompt too big for the budget" from a

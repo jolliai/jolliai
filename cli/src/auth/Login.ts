@@ -15,7 +15,7 @@ import { URL } from "node:url";
 import open from "open";
 import { getOrCreateInstallId, loadConfig } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
-import { resolveSignInJolliUrl, saveAuthCredentials, shouldRequestFreshApiKey } from "./AuthConfig.js";
+import { getJolliUrl, resolveSignInJolliUrl, saveAuthCredentials, shouldRequestFreshApiKey } from "./AuthConfig.js";
 import { exchangeCliCode } from "./CliExchange.js";
 import { getDeviceLabel } from "./DeviceLabel.js";
 
@@ -32,23 +32,121 @@ const CLIENT_VERSION = typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ 
 /* v8 ignore stop */
 
 /**
+ * Options for {@link runBrowserLoginFlow}. Every field is optional — omit to
+ * get the CLI's default behavior. Non-CLI surfaces (desktop, VS Code, IntelliJ)
+ * override what makes sense for their host platform: `openBrowser` to use the
+ * host's native URL opener, `notify` to route status text somewhere other than
+ * stdout, `clientKind`/`clientVersion` to identify their surface, and
+ * `loginTimeoutMs` to bound how long a user has to complete sign-in.
+ */
+export interface BrowserLoginOptions {
+	/**
+	 * Jolli origin (e.g. `https://app.jolli.ai`). Defaults to the current
+	 * config's `jolliUrl` via `getJolliUrl()`. The same origin drives the login
+	 * page URL AND the server-to-server exchange, so the two halves of the flow
+	 * can't disagree on which tenant is being signed into.
+	 */
+	readonly jolliUrl?: string;
+	/**
+	 * Called with the login URL to hand it to a browser. Default: the `open`
+	 * npm package (matches CLI behavior). Desktop passes Electron's
+	 * `shell.openExternal`; the returned promise should resolve as soon as the
+	 * OS accepts the URL — the callback loopback below owns waiting for the
+	 * user to complete sign-in.
+	 */
+	readonly openBrowser?: (url: string) => Promise<void>;
+	/**
+	 * Surface identifier for the `client=` query param on the login URL. The
+	 * server gates min-version and records signin_started attribution per
+	 * client. Default: `"cli"`. Desktop currently also passes `"cli"` so it
+	 * inherits the CLI's min-version policy — server-side surface distinction
+	 * happens at a later step, via `x-jolli-client` on subsequent API calls.
+	 */
+	readonly clientKind?: string;
+	/**
+	 * Value for `client_version=` on the login URL. Default: build-time
+	 * `__PKG_VERSION__` (the CLI's own package version in bundled builds).
+	 * Desktop passes `app.getVersion()` so the min-version gate operates on
+	 * the desktop's own release version.
+	 */
+	readonly clientVersion?: string;
+	/**
+	 * User-facing status messages emitted at each step of the flow. Default:
+	 * `console.log`. Desktop suppresses (no-op) so its GUI-side status UI owns
+	 * the messaging surface.
+	 */
+	readonly notify?: (message: string) => void;
+	/**
+	 * Whether to emit the `signin_started` telemetry event when the browser
+	 * opens. Default: `true` for CLI. Desktop leaves it as-is — the join row
+	 * is written by the backend regardless.
+	 */
+	readonly emitStartTelemetry?: boolean;
+	/**
+	 * Hard timeout — reject with `new Error("Sign-in timed out.")` after this
+	 * many ms if the user hasn't completed OAuth. Default: no timeout (CLI
+	 * blocks until the user finishes or Ctrl+C's out). Desktop passes 5 min so
+	 * an unattended login doesn't leak a listening socket forever.
+	 */
+	readonly loginTimeoutMs?: number;
+}
+
+/**
  * Opens the browser to `${jolliUrl}/login` with a CLI callback URL, waits for
  * the OAuth redirect, redeems the exchange code, and saves the resulting
  * credentials.
  *
  * Uses port 0 so the OS assigns a free port — avoids EADDRINUSE conflicts.
  *
- * @param jolliUrl Origin of the Jolli server (e.g. `https://app.jolli.ai`).
- *   The same origin is used to build the login page URL and to redeem the
- *   exchange code, so the two halves of the flow can never disagree on which
- *   tenant is being signed into.
+ * This is the parameterised entry point every Jolli surface consumes — CLI,
+ * desktop, VS Code, IntelliJ. The legacy {@link browserLogin} wrapper
+ * (unchanged signature) forwards to this with all defaults. All security-
+ * critical logic (CSRF state check, tenant allowlist, credential persistence)
+ * lives in the shared helpers this composes; per-surface options only steer
+ * platform integration (browser opener, notification sink, telemetry, timeout).
  */
-export function browserLogin(jolliUrl: string): Promise<void> {
+export function runBrowserLoginFlow(opts: BrowserLoginOptions = {}): Promise<void> {
+	const openBrowser =
+		opts.openBrowser ??
+		(async (url: string) => {
+			// Detach the browser process so it doesn't block Node from exiting.
+			const child = await open(url);
+			child.unref();
+		});
+	const clientKind = opts.clientKind ?? "cli";
+	const clientVersion = opts.clientVersion ?? CLIENT_VERSION;
+	const notify = opts.notify ?? ((message: string) => console.log(message));
+	const emitStartTelemetry = opts.emitStartTelemetry ?? true;
+	const loginTimeoutMs = opts.loginTimeoutMs;
+
 	return new Promise((resolve, reject) => {
+		// Resolve the tenant URL INSIDE the executor: `getJolliUrl()` calls
+		// `assertJolliOriginAllowed` and throws on a disallowed origin (e.g. a
+		// poisoned JOLLI_URL). Resolving it here means that throw rejects the
+		// returned promise — so a caller that omits `opts.jolliUrl` and relies on
+		// `.catch()` (external integrators) sees a rejection, not a synchronous
+		// throw that escapes it.
+		let jolliUrl: string;
+		try {
+			jolliUrl = opts.jolliUrl ?? getJolliUrl();
+		} catch (err) {
+			reject(err instanceof Error ? err : new Error(String(err)));
+			return;
+		}
 		// 256-bit CSRF nonce per RFC 6749 §10.12. Sent on the login URL and
 		// echoed back unchanged on the `?code=` callback; mismatch means the
 		// callback didn't originate from the login flow we just opened.
 		const expectedState = randomBytes(32).toString("hex");
+		let timeoutHandle: NodeJS.Timeout | null = null;
+		let settled = false;
+
+		const settle = (fn: () => void) => {
+			if (settled) return;
+			settled = true;
+			if (timeoutHandle) clearTimeout(timeoutHandle);
+			fn();
+		};
+
 		const server = createLoginServer({
 			port: 0,
 			jolliUrl,
@@ -62,16 +160,14 @@ export function browserLogin(jolliUrl: string): Promise<void> {
 
 					const callbackUrl = `http://127.0.0.1:${actualPort}/callback`;
 
-					// `client=cli` always identifies the originating surface to the
-					// server (telemetry, surface-aware behavior). `client_version`
+					// `client=<kind>` identifies the originating surface. `client_version`
 					// pairs with it so server-side min-version gating can run at
-					// sign-in, not only on later API calls. `generate_api_key=true`
-					// is gated by `shouldRequestFreshApiKey` — asked for when no
-					// key is on disk, or the on-disk key targets a different
-					// tenant than `jolliUrl` (so cross-tenant switch completes
-					// in one sign-in instead of two).
+					// sign-in, not only on later API calls. `generate_api_key=true` is
+					// gated by `shouldRequestFreshApiKey` — asked for when no key is on
+					// disk, or the on-disk key targets a different tenant than
+					// `jolliUrl` (so cross-tenant switch completes in one sign-in).
 					const config = await loadConfig();
-					let loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUrl)}&state=${expectedState}&client=cli&client_version=${encodeURIComponent(CLIENT_VERSION)}`;
+					let loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUrl)}&state=${expectedState}&client=${encodeURIComponent(clientKind)}&client_version=${encodeURIComponent(clientVersion)}`;
 					// JOLLI-1785: carry the anonymous installId through OAuth so the
 					// backend can write the install→account conversion-join row when it
 					// mints the key (it reads `install_id`, strict lowercase UUID, and
@@ -92,23 +188,37 @@ export function browserLogin(jolliUrl: string): Promise<void> {
 						}
 					}
 
-					track("signin_started", { trigger: "cli" });
+					if (emitStartTelemetry) track("signin_started", { trigger: clientKind });
 
-					console.log("Opening browser to login...");
-					console.log(`If the browser doesn't open automatically, visit: ${loginUrl}`);
+					notify("Opening browser to login...");
+					notify(`If the browser doesn't open automatically, visit: ${loginUrl}`);
 
-					// Detach the browser process so it doesn't block Node.js from exiting
-					const child = await open(loginUrl);
-					child.unref();
+					await openBrowser(loginUrl);
 				} catch (err) {
 					closeServer(server);
-					reject(err instanceof Error ? err : new Error(String(err)));
+					settle(() => reject(err instanceof Error ? err : new Error(String(err))));
 				}
 			},
-			onSuccess: resolve,
-			onError: reject,
+			onSuccess: () => settle(resolve),
+			onError: (err) => settle(() => reject(err)),
 		});
+
+		if (typeof loginTimeoutMs === "number" && loginTimeoutMs > 0) {
+			timeoutHandle = setTimeout(() => {
+				closeServer(server);
+				settle(() => reject(new Error("Sign-in timed out.")));
+			}, loginTimeoutMs);
+		}
 	});
+}
+
+/**
+ * Legacy positional wrapper — kept so cli's own callers (`commands/AuthLogin.ts`)
+ * don't need to migrate right now. New callers should use
+ * {@link runBrowserLoginFlow} which accepts overrides.
+ */
+export function browserLogin(jolliUrl: string): Promise<void> {
+	return runBrowserLoginFlow({ jolliUrl });
 }
 
 interface LoginServerOptions {

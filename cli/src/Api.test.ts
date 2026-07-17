@@ -132,6 +132,7 @@ vi.mock("./install/DistPathResolver.js", () => ({
 	traverseDistPaths: vi.fn().mockReturnValue([]),
 	migrateLegacyDistPath: vi.fn().mockResolvedValue(false),
 	deriveSourceTag: vi.fn().mockReturnValue("cli"),
+	isValidSourceTag: (tag: string) => /^[a-z0-9][a-z0-9-]*$/.test(tag),
 }));
 
 vi.mock("open", () => ({
@@ -813,6 +814,44 @@ describe("CLI", () => {
 			} finally {
 				delete process.env.JOLLI_LOCAL_AGENT_CHILD;
 			}
+		});
+
+		it("rejects an unsafe --source-tag before calling install", async () => {
+			await main(["enable", "--cwd", "/tmp/test-project", "--source-tag", "bad tag; rm -rf /"]);
+			expect(process.exitCode).toBe(1);
+			expect(install).not.toHaveBeenCalled();
+			expect(console.error).toHaveBeenCalledWith(expect.stringContaining("--source-tag"));
+		});
+
+		it("forwards a valid --source-tag to install", async () => {
+			await main(["enable", "--cwd", "/tmp/test-project", "--source-tag", "intellij"]);
+			expect(vi.mocked(install)).toHaveBeenCalledWith(
+				"/tmp/test-project",
+				expect.objectContaining({ sourceTag: "intellij" }),
+			);
+		});
+
+		it("emits a reloadSkills SessionStart signal on --git-hooks-only success with --reload-skills", async () => {
+			await main(["enable", "--git-hooks-only", "--reload-skills", "--cwd", "/tmp/test-project"]);
+			const signal = vi
+				.mocked(process.stdout.write)
+				.mock.calls.map((c) => String(c[0]))
+				.find((w) => w.includes("reloadSkills"));
+			expect(signal).toBeDefined();
+			// Pure JSON on exit 0 — Claude Code parses it as structured hook output
+			// (not injected into context) and re-scans skills after SessionStart hooks.
+			expect(JSON.parse(signal as string)).toEqual({
+				hookSpecificOutput: { hookEventName: "SessionStart", reloadSkills: true },
+			});
+		});
+
+		it("stays silent (no reloadSkills signal) on --git-hooks-only without --reload-skills", async () => {
+			await main(["enable", "--git-hooks-only", "--cwd", "/tmp/test-project"]);
+			const wroteSignal = vi
+				.mocked(process.stdout.write)
+				.mock.calls.map((c) => String(c[0]))
+				.some((w) => w.includes("reloadSkills"));
+			expect(wroteSignal).toBe(false);
 		});
 	});
 

@@ -1,0 +1,29 @@
+{
+	"hooks": {
+		"Stop": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"async": true,
+						"command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/StopHook.js\""
+					}
+				]
+			}
+		],
+		"SessionStart": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/SessionStartHook.js\""
+					},
+					{
+						"type": "command",
+						"command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/Cli.js\" enable --git-hooks-only --source-tag claude-plugin --reload-skills"
+					}
+				]
+			}
+		]
+	}
+}

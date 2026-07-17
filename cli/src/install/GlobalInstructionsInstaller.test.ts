@@ -34,6 +34,21 @@ describe("renderInstructionsBlock", () => {
 		expect(block).toContain("jolli-search");
 		expect(block).toContain("jolli-recall");
 	});
+
+	it("includes the memory-routing heuristic (consult memory first for why/history questions)", () => {
+		const block = renderInstructionsBlock();
+		expect(block).toContain("memory-shaped");
+		// Biases toward using memory (high recall) ...
+		expect(block).toContain("lean toward consulting memory");
+		expect(block).toContain("run a quick `jolli-search` first");
+		// ... while excluding pure code/mechanical questions (precision).
+		expect(block).toContain("answer those from the code directly");
+		// A whole-feature "how does it work / how is it designed" question is
+		// design-shaped, so it must route TO memory, not be swallowed by the
+		// current-state exclusion (the gap that skipped memory on a design question).
+		expect(block).toContain("How it works / design");
+		expect(block).toContain("design-shaped");
+	});
 });
 
 describe("applyInstructionsBlock", () => {

@@ -17,6 +17,7 @@ import { getCurrentTraceId, runWithTrace, traceIdFromEnv } from "../core/TraceCo
 import { createLogger } from "../Logger.js";
 import type { CommitSource, GitOperation } from "../Types.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
+import { runCommitFeedback } from "./CaptureProgress.js";
 import { detectCommitOperation, isRebaseInProgress, resolveGitDir } from "./GitOperationDetector.js";
 import { launchWorker } from "./QueueWorker.js";
 
@@ -26,18 +27,18 @@ export { runWorker } from "./QueueWorker.js";
 const log = createLogger("PostCommitHook");
 
 /* v8 ignore start - postCommitEntry reads git state and spawns a child process */
-export function postCommitEntry(cwd: string): void {
+export function postCommitEntry(cwd: string): { commitHash: string } | null {
 	const detected = detectCommitOperation(cwd);
 	log.info("Detected operation: %s", detected.type);
 
 	// Rebase and amend are handled by post-rewrite hook — skip here
 	if (detected.type === "rebase") {
 		log.info("Rebase in progress — skipping (post-rewrite will handle)");
-		return;
+		return null;
 	}
 	if (detected.type === "amend") {
 		log.info("Amend detected — skipping (post-rewrite will handle)");
-		return;
+		return null;
 	}
 
 	// Read commit hash (HEAD is the just-created commit)
@@ -46,7 +47,7 @@ export function postCommitEntry(cwd: string): void {
 		commitHash = execFileSyncHidden("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf-8" }).trim();
 	} catch (err: unknown) {
 		log.error("Failed to read HEAD hash: %s", (err as Error).message);
-		return;
+		return null;
 	}
 
 	// Capture branch at hook time. The worker's tail cleanup targets this
@@ -130,7 +131,7 @@ export function postCommitEntry(cwd: string): void {
 		log.info("Enqueued: type=%s hash=%s", opType, commitHash.substring(0, 8));
 	} catch (err: unknown) {
 		log.error("Failed to enqueue git operation: %s", (err as Error).message);
-		return;
+		return null;
 	}
 
 	// Delete plugin-source marker (consumed by queue entry's commitSource field)
@@ -145,6 +146,8 @@ export function postCommitEntry(cwd: string): void {
 
 	// Spawn Worker
 	launchWorker(cwd);
+
+	return { commitHash };
 }
 
 /* v8 ignore stop */
@@ -185,6 +188,23 @@ if (isMainScript()) {
 	// Post-commit hook entry: detect operation type, enqueue, and spawn Worker.
 	// Adopt a parent-supplied trace id (JOLLI_TRACE_ID) if present, else mint
 	// one; the whole entry — including the GitOperation we enqueue — runs under it.
-	runWithTrace(traceIdFromEnv(), () => postCommitEntry(process.cwd()));
+	//
+	// After enqueue, when this commit is driven from an interactive place (a TTY
+	// or an AI-agent session), block on `runCommitFeedback` to tail the detached
+	// worker's capture progress and print it inline — the pending watch timer
+	// keeps the process alive until the worker signals done or the watch times
+	// out. Non-interactive commits (GUI git clients) short-circuit immediately,
+	// preserving the original fast, silent behavior. The detached worker runs
+	// regardless of whether we watch.
+	void runWithTrace(traceIdFromEnv(), async () => {
+		const result = postCommitEntry(process.cwd());
+		if (result) {
+			try {
+				await runCommitFeedback(process.cwd(), result.commitHash);
+			} catch (err: unknown) {
+				log.warn("Commit feedback watch failed: %s", (err as Error).message);
+			}
+		}
+	});
 }
 /* v8 ignore stop */

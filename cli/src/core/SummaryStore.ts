@@ -275,13 +275,25 @@ export async function storeSummary(
 			}
 		}
 
-		// Duplicate guard: skip if root already indexed and force=false
+		// Duplicate guard: a live capture supersedes a lower-fidelity back-fill for
+		// the same commit. Other duplicates keep the first writer unless forced.
 		if (!force && entryMap.has(summary.commitHash)) {
+			const writeExisting = await readSummaryFile(summary.commitHash, cwd, storage);
+			const existing =
+				writeExisting ??
+				(hasDistinctReadStorage ? await readSummaryFile(summary.commitHash, cwd, readStorage) : null);
+			const promotesBackfill = existing?.backfilled === true && summary.backfilled !== true;
+			if (!promotesBackfill) {
+				log.info(
+					"Summary for commit %s already exists — skipping (use force to overwrite)",
+					summary.commitHash.substring(0, 8),
+				);
+				return;
+			}
 			log.info(
-				"Summary for commit %s already exists — skipping (use force to overwrite)",
+				"Replacing back-filled summary for commit %s with live capture",
 				summary.commitHash.substring(0, 8),
 			);
-			return;
 		}
 
 		// Flatten the entire tree into index entries and upsert

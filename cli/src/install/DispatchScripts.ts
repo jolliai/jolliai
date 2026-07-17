@@ -53,13 +53,40 @@ const RESOLVE_DIST_PATH_CONTENT = `#!/bin/bash
 # the bundled @jolli.ai/cli core is identical at equal versions — the tie-break
 # only makes the winner deterministic and favours the canonical CLI build.
 #
+# When JOLLI_DIST_PREFER_SOURCE is set (the Claude Code plugin's git hooks and CLI
+# commands set it to "claude-plugin"), that source is SOFT-preferred: it wins a
+# version TIE — selected only if present, complete, and already at the top version
+# BEST_VER — but never beats a strictly-higher version from another source, and a
+# missing / incomplete / older prefer silently falls through to normal cross-source
+# selection below. This replaces the former hard pin (resolve-only-that-source-or-
+# fail) so every install source competes on version.
+#
+# Optional arg $1 = a required script filename (e.g. "PrepareMsgHook.js"). When
+# given, a candidate dist is eligible ONLY if it actually contains that file, so
+# an INCOMPLETE source that wins on version is skipped and resolution falls
+# through to the next-best complete source. Without this, a source registered
+# with a partial dist (e.g. the Claude Code plugin before it bundled the git-hook
+# scripts) would win, and run-hook would 'node <dist>/PrepareMsgHook.js' a
+# missing file — non-zero exit that BLOCKS the commit. Callers that don't care
+# (run-cli baking, external tools) omit the arg and get the legacy dir-only check.
+#
 # Stable public API: run-hook, run-cli, legacy hooks still on disk, and
 # third-party tools all rely on this script's "output a path, exit 0/1"
 # contract.
 
 DIR="$HOME/.jolli/jollimemory"
+REQUIRED="$1"
+PREFER="$JOLLI_DIST_PREFER_SOURCE"
 BEST_PATH=""
 BEST_VER="0.0.0"
+
+# has_required <distDir> — true when no file is required, or the required file
+# exists inside the candidate dist. Keeps the eligibility test in one place so
+# both passes stay in lockstep.
+has_required() {
+  [ -z "$REQUIRED" ] && return 0
+  [ -f "$1/$REQUIRED" ]
+}
 
 # Pass 1 — highest core version wins. Selection uses 'sort -V', which agrees with
 # the in-process compareSemver (cli/src/install/DistPathResolver.ts) on every
@@ -74,6 +101,7 @@ if [ -d "$DIR/dist-paths" ]; then
     CANDIDATE=$(sed -n '2p' "$f")
     [ -z "$VER" ] && continue
     [ -d "$CANDIDATE" ] || continue
+    has_required "$CANDIDATE" || continue
     case "$VER" in
       dev|unknown) VER_CMP="0.0.0" ;;
       *)           VER_CMP="$VER" ;;
@@ -89,10 +117,31 @@ if [ -d "$DIR/dist-paths" ]; then
   done
 fi
 
+# Soft prefer — when JOLLI_DIST_PREFER_SOURCE names a source (the Claude Code plugin
+# sets it to "claude-plugin" on its git hooks and CLI recipes), that source WINS a
+# version tie ahead of the global preference order below: it is chosen only if it is
+# present, complete, AND already at the top version BEST_VER. A strictly-higher
+# version elsewhere has already won BEST_VER in Pass 1, so prefer never overrides it;
+# a missing / incomplete / older prefer falls through to Pass 2. This is the soft
+# replacement for the former hard pin — every source still competes on version.
+if [ -n "$BEST_PATH" ] && [ -n "$PREFER" ]; then
+  pf="$DIR/dist-paths/$PREFER"
+  if [ -f "$pf" ]; then
+    PVER=$(sed -n '1p' "$pf")
+    PPATH=$(sed -n '2p' "$pf")
+    case "$PVER" in dev|unknown) PVER="0.0.0" ;; esac
+    if [ -d "$PPATH" ] && has_required "$PPATH" && [ "$PVER" = "$BEST_VER" ]; then
+      echo "$PPATH"
+      exit 0
+    fi
+  fi
+fi
+
 # Pass 2 — among sources tied at BEST_VER, prefer the order below (kept in lockstep
 # with SOURCE_PREFERENCE_ORDER in DistPathResolver.ts). Only overrides when the
-# preferred source carries the same top version, so a strictly-higher non-preferred
-# source still wins.
+# preferred source carries the same top version AND is itself complete (has the
+# required file, if any) — a preferred-but-incomplete source must not displace the
+# complete pass-1 winner.
 if [ -n "$BEST_PATH" ]; then
   for pref in ${SOURCE_PREFERENCE_ORDER.join(" ")}; do
     pf="$DIR/dist-paths/$pref"
@@ -100,6 +149,7 @@ if [ -n "$BEST_PATH" ]; then
     PVER=$(sed -n '1p' "$pf")
     PPATH=$(sed -n '2p' "$pf")
     [ -d "$PPATH" ] || continue
+    has_required "$PPATH" || continue
     case "$PVER" in dev|unknown) PVER="0.0.0" ;; esac
     if [ "$PVER" = "$BEST_VER" ]; then
       BEST_PATH="$PPATH"
@@ -133,27 +183,35 @@ const RUN_HOOK_CONTENT = `#!/bin/bash
 # JolliMemory hook runner.
 # Takes a hook-type argument; execs the corresponding node hook entry in the
 # winning dist (selected by resolve-dist-path).
+#
+# The hook-type → script name is resolved FIRST, then passed to resolve-dist-path
+# so it can skip any winning-but-incomplete dist that lacks this specific script
+# and fall through to a complete source. This is what stops a partial source
+# (e.g. a plugin bundle missing PrepareMsgHook.js) from turning a commit hook into
+# 'node <missing file>' — a non-zero exit that would BLOCK the git operation.
 
 HOOK_TYPE="$1"
 shift
 
-DIST=$("$HOME/.jolli/jollimemory/resolve-dist-path") || exit 0
+case "$HOOK_TYPE" in
+  post-commit)        SCRIPT="PostCommitHook.js" ;;
+  post-merge)         SCRIPT="PostMergeHook.js" ;;
+  post-rewrite)       SCRIPT="PostRewriteHook.js" ;;
+  prepare-commit-msg) SCRIPT="PrepareMsgHook.js" ;;
+  pre-push)           SCRIPT="PrePushHook.js" ;;
+  stop)               SCRIPT="StopHook.js" ;;
+  session-start)      SCRIPT="SessionStartHook.js" ;;
+  gemini-after-agent) SCRIPT="GeminiAfterAgentHook.js" ;;
+  *)                  echo "ERROR: unknown hook type '$HOOK_TYPE'" >&2; exit 0 ;;
+esac
+
+DIST=$("$HOME/.jolli/jollimemory/resolve-dist-path" "$SCRIPT") || exit 0
 if ! command -v node >/dev/null 2>&1; then
   echo "ERROR: node runtime not found. Jolli Memory hooks require Node.js." >&2
   exit 0
 fi
 
-case "$HOOK_TYPE" in
-  post-commit)        exec node "$DIST/PostCommitHook.js" "$@" ;;
-  post-merge)         exec node "$DIST/PostMergeHook.js" "$@" ;;
-  post-rewrite)       exec node "$DIST/PostRewriteHook.js" "$@" ;;
-  prepare-commit-msg) exec node "$DIST/PrepareMsgHook.js" "$@" ;;
-  pre-push)           exec node "$DIST/PrePushHook.js" "$@" ;;
-  stop)               exec node "$DIST/StopHook.js" "$@" ;;
-  session-start)      exec node "$DIST/SessionStartHook.js" "$@" ;;
-  gemini-after-agent) exec node "$DIST/GeminiAfterAgentHook.js" "$@" ;;
-  *)                  echo "ERROR: unknown hook type '$HOOK_TYPE'" >&2; exit 0 ;;
-esac
+exec node "$DIST/$SCRIPT" "$@"
 `;
 
 /**
@@ -167,8 +225,10 @@ esac
 const RUN_CLI_CONTENT = `#!/bin/bash
 # JolliMemory CLI runner.
 # Execs node on the winning dist's Cli.js with all args passed through.
+# Requires the winning dist to actually contain Cli.js (every real dist does),
+# so a partial source can't win run-cli either.
 
-DIST=$("$HOME/.jolli/jollimemory/resolve-dist-path") || exit 1
+DIST=$("$HOME/.jolli/jollimemory/resolve-dist-path" Cli.js) || exit 1
 if ! command -v node >/dev/null 2>&1; then
   echo "ERROR: node runtime not found. Jolli Memory CLI requires Node.js." >&2
   exit 1

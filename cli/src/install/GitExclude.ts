@@ -147,6 +147,118 @@ export async function updateGitExclude(projectDir: string, paths: ReadonlyArray<
 }
 
 /**
+ * Adds `paths` to Jolli's managed `.git/info/exclude` block as a UNION — every
+ * path already in the block is preserved and only genuinely-new entries are
+ * appended (in the order given). Idempotent — running it twice is a no-op.
+ *
+ * This is the additive sibling of {@link updateGitExclude}, which REPLACES the
+ * whole block. Both exist because the two install surfaces own different path
+ * sets:
+ *   - A full `jolli enable` owns the complete skill/MCP set and uses REPLACE so
+ *     dropping a skill from {@link SKILL_GIT_EXCLUDE_PATHS} removes its line.
+ *   - The Claude Code plugin's `enable --git-hooks-only` re-runs on every
+ *     SessionStart and only knows its own one umbrella entry. If it used REPLACE
+ *     it would shrink a block a prior full `jolli enable` populated, un-hiding
+ *     those paths in `git status` and churning the file every session. UNION
+ *     keeps both surfaces' entries intact.
+ *
+ * **Never throws.** Same fail-soft contract as {@link updateGitExclude}: logs
+ * and returns false on any I/O / git error.
+ */
+export async function addGitExcludePaths(projectDir: string, paths: ReadonlyArray<string>): Promise<boolean> {
+	const excludePath = await resolveGitExcludePath(projectDir);
+	if (!excludePath) {
+		log.warn("Skipping .git/info/exclude update for %s: not a git repo or git unavailable", projectDir);
+		return false;
+	}
+
+	let existing = "";
+	try {
+		existing = await readFile(excludePath, "utf-8");
+	} catch (err: unknown) {
+		const code = (err as NodeJS.ErrnoException).code;
+		/* v8 ignore start -- defensive: non-ENOENT read errors (perm denied, EISDIR) */
+		if (code !== "ENOENT") {
+			log.warn("Failed to read %s: %s — skipping update", excludePath, (err as Error).message);
+			return false;
+		}
+		/* v8 ignore stop */
+	}
+
+	const updated = mergeBlockPaths(existing, paths);
+	if (updated === existing) {
+		return true; // No change needed (all paths already present).
+	}
+
+	try {
+		await mkdir(dirname(excludePath), { recursive: true });
+		await writeFile(excludePath, updated, "utf-8");
+		log.info("Merged %d Jolli skill exclude path(s) into %s", paths.length, excludePath);
+		return true;
+		/* v8 ignore start -- defensive: write failure on read-only fs / EPERM */
+	} catch (err: unknown) {
+		log.warn("Failed to write %s: %s", excludePath, (err as Error).message);
+		return false;
+	}
+	/* v8 ignore stop */
+}
+
+/**
+ * Removes specific paths from Jolli's managed `.git/info/exclude` block while
+ * preserving every other managed path and all content outside the block. When
+ * the block ends up empty (the last managed path was removed), the whole block
+ * — markers included — is deleted so we don't leave a hollow pair of markers
+ * behind.
+ *
+ * Used by uninstall to drop the bare `/jolli` umbrella's exclude entry without
+ * disturbing the `jolli-*` sibling entries a full `jolli enable` may have added
+ * to the same block (those skill files are left in place by policy, so their
+ * exclude lines stay too).
+ *
+ * **Never throws.** Mirrors {@link updateGitExclude}: logs and returns false on
+ * any I/O / git error, true when there was nothing to remove or the removal
+ * succeeded.
+ */
+export async function removeGitExcludePaths(
+	projectDir: string,
+	pathsToRemove: ReadonlyArray<string>,
+): Promise<boolean> {
+	const excludePath = await resolveGitExcludePath(projectDir);
+	if (!excludePath) {
+		log.warn("Skipping .git/info/exclude cleanup for %s: not a git repo or git unavailable", projectDir);
+		return false;
+	}
+
+	let existing: string;
+	try {
+		existing = await readFile(excludePath, "utf-8");
+	} catch (err: unknown) {
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return true; // No exclude file — nothing to clean.
+		/* v8 ignore start -- defensive: non-ENOENT read errors (perm denied, EISDIR) */
+		log.warn("Failed to read %s: %s — skipping cleanup", excludePath, (err as Error).message);
+		return false;
+		/* v8 ignore stop */
+	}
+
+	const updated = removeBlockPaths(existing, pathsToRemove);
+	if (updated === existing) {
+		return true; // No managed block, or none of the paths were present.
+	}
+
+	try {
+		await writeFile(excludePath, updated, "utf-8");
+		log.info("Removed %d Jolli exclude path(s) from %s", pathsToRemove.length, excludePath);
+		return true;
+		/* v8 ignore start -- defensive: write failure on read-only fs / EPERM */
+	} catch (err: unknown) {
+		log.warn("Failed to write %s: %s", excludePath, (err as Error).message);
+		return false;
+	}
+	/* v8 ignore stop */
+}
+
+/**
  * Renders the managed block including marker lines and a trailing newline.
  * Lines are joined with `\n` (git is happy with LF on every platform; using
  * the platform EOL here would diverge between developers on a team).
@@ -185,4 +297,57 @@ function applyBlock(existing: string, managedBlock: string): string {
 	}
 	const sep = existing.endsWith("\n") ? "" : "\n";
 	return `${existing}${sep}${managedBlock}`;
+}
+
+/**
+ * Returns `existing` with `pathsToAdd` unioned into the managed block: existing
+ * managed paths are kept in place and any not-yet-present path is appended after
+ * them. When no block exists yet, a new one is appended via {@link applyBlock}.
+ * Line-oriented, matching {@link applyBlock}'s marker scan.
+ */
+function mergeBlockPaths(existing: string, pathsToAdd: ReadonlyArray<string>): string {
+	const lines = existing.split("\n");
+	const startIdx = lines.indexOf(BLOCK_START);
+	const endIdx = lines.indexOf(BLOCK_END);
+	const current = startIdx !== -1 && endIdx !== -1 && endIdx > startIdx ? lines.slice(startIdx + 1, endIdx) : [];
+
+	const seen = new Set(current);
+	const union = [...current];
+	for (const p of pathsToAdd) {
+		if (!seen.has(p)) {
+			seen.add(p);
+			union.push(p);
+		}
+	}
+	return applyBlock(existing, renderBlock(union));
+}
+
+/**
+ * Returns `existing` with `pathsToRemove` stripped from the managed block.
+ *
+ * Line-oriented, matching {@link applyBlock}'s marker scan. If there is no
+ * managed block the input is returned unchanged. If removing the paths empties
+ * the block, the markers are dropped as well so nothing hollow is left behind;
+ * otherwise the block is re-emitted with the surviving paths in their original
+ * order. Content before and after the block is preserved verbatim.
+ */
+function removeBlockPaths(existing: string, pathsToRemove: ReadonlyArray<string>): string {
+	const lines = existing.split("\n");
+	const startIdx = lines.indexOf(BLOCK_START);
+	const endIdx = lines.indexOf(BLOCK_END);
+
+	if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+		return existing; // No managed block to touch.
+	}
+
+	const toRemove = new Set(pathsToRemove);
+	const kept = lines.slice(startIdx + 1, endIdx).filter((line) => !toRemove.has(line));
+	const before = lines.slice(0, startIdx);
+	const after = lines.slice(endIdx + 1);
+
+	if (kept.length === 0) {
+		// Whole block goes, markers included.
+		return [...before, ...after].join("\n");
+	}
+	return [...before, BLOCK_START, ...kept, BLOCK_END, ...after].join("\n");
 }

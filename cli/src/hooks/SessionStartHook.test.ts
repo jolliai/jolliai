@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommitSummary, PlansRegistry, SummaryIndex } from "../Types.js";
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
@@ -12,7 +12,16 @@ vi.mock("node:fs", () => ({
 	readFileSync: vi.fn().mockReturnValue("{}"),
 	writeFileSync: vi.fn(),
 	mkdirSync: vi.fn(),
+	rmSync: vi.fn(),
 }));
+
+// Partial mock — keep the real `normalizePlansRegistry` (used by the briefing
+// path) but control `loadConfig` so the login-reminder credential check is
+// deterministic and never reads the dev machine's real config.
+vi.mock("../core/SessionTracker.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/SessionTracker.js")>();
+	return { ...actual, loadConfig: vi.fn().mockResolvedValue({}) };
+});
 
 vi.mock("../core/SummaryStore.js", () => ({
 	getIndex: vi.fn(),
@@ -42,8 +51,9 @@ vi.mock("../Logger.js", () => ({
 }));
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readFileFromBranch } from "../core/GitOps.js";
+import { loadConfig } from "../core/SessionTracker.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
 
@@ -53,6 +63,8 @@ const mockReadFileFromBranch = vi.mocked(readFileFromBranch);
 const mockCollectAllTopics = vi.mocked(collectAllTopics);
 const mockExistsSync = vi.mocked(existsSync);
 const mockReadFileSync = vi.mocked(readFileSync);
+const mockRmSync = vi.mocked(rmSync);
+const mockLoadConfig = vi.mocked(loadConfig);
 
 function makeIndex(entries: SummaryIndex["entries"]): SummaryIndex {
 	return { version: 3, entries };
@@ -74,7 +86,7 @@ function makeSummary(overrides: Partial<CommitSummary> = {}): CommitSummary {
 }
 
 // Import after mocks
-const { main } = await import("./SessionStartHook.js");
+const { main, computeLoginReminder, getLoginReminder } = await import("./SessionStartHook.js");
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
@@ -1864,5 +1876,95 @@ describe("SessionStartHook", () => {
 		expect(output).toContain("1 commits (unknown ~ unknown)");
 		expect(output).toContain("(unknown)");
 		writeSpy.mockRestore();
+	});
+});
+
+// ─── Login reminder ──────────────────────────────────────────────────────────
+
+describe("computeLoginReminder", () => {
+	it("returns the reminder for the claude-plugin surface with no credential and no dismiss", () => {
+		const text = computeLoginReminder("claude-plugin", false, false);
+		expect(text).toContain("/jolli:login");
+		expect(text).toContain("Not signed in");
+	});
+
+	it("returns null for non-plugin surfaces (cli / vscode) even without a credential", () => {
+		expect(computeLoginReminder("cli", false, false)).toBeNull();
+		expect(computeLoginReminder("vscode-plugin", false, false)).toBeNull();
+	});
+
+	it("returns null when a credential is configured", () => {
+		expect(computeLoginReminder("claude-plugin", true, false)).toBeNull();
+	});
+
+	it("returns null when the reminder has been dismissed", () => {
+		expect(computeLoginReminder("claude-plugin", false, true)).toBeNull();
+	});
+});
+
+describe("getLoginReminder", () => {
+	const savedAnthropicKey = process.env.ANTHROPIC_API_KEY;
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		delete process.env.ANTHROPIC_API_KEY;
+		mockLoadConfig.mockResolvedValue({});
+		mockExistsSync.mockReturnValue(false);
+	});
+
+	afterEach(() => {
+		if (savedAnthropicKey === undefined) {
+			delete process.env.ANTHROPIC_API_KEY;
+		} else {
+			process.env.ANTHROPIC_API_KEY = savedAnthropicKey;
+		}
+	});
+
+	// The CLI test build fixes __JOLLI_CLIENT_KIND__ to "cli", so the returned
+	// value is always null here — these tests exercise the credential/marker
+	// wiring and side effects (the reminder text itself is covered above).
+	it("removes a stale dismiss marker once a credential is present", async () => {
+		mockLoadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
+		mockExistsSync.mockReturnValue(true);
+
+		const result = await getLoginReminder("/test");
+
+		expect(mockRmSync).toHaveBeenCalledWith(expect.stringContaining("login-reminder-dismissed"));
+		expect(result).toBeNull();
+	});
+
+	it("treats the local-agent provider as credentialed (no key needed)", async () => {
+		// local-agent drives the tool's own subscription login, so it has NO
+		// apiKey/jolliApiKey/ANTHROPIC_API_KEY yet still generates memories. It must
+		// count as credentialed — proven here by the stale marker being cleaned up
+		// (the `hasCredential === true` side effect), not left in place.
+		mockLoadConfig.mockResolvedValue({ aiProvider: "local-agent" });
+		mockExistsSync.mockReturnValue(true);
+
+		const result = await getLoginReminder("/test");
+
+		expect(mockRmSync).toHaveBeenCalledWith(expect.stringContaining("login-reminder-dismissed"));
+		expect(result).toBeNull();
+	});
+
+	it("tolerates a marker-cleanup failure", async () => {
+		mockLoadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
+		mockExistsSync.mockReturnValue(true);
+		mockRmSync.mockImplementation(() => {
+			throw new Error("EACCES");
+		});
+
+		await expect(getLoginReminder("/test")).resolves.toBeNull();
+		expect(mockRmSync).toHaveBeenCalled();
+	});
+
+	it("does not remove the marker when no credential is present", async () => {
+		mockLoadConfig.mockResolvedValue({});
+		mockExistsSync.mockReturnValue(true);
+
+		const result = await getLoginReminder("/test");
+
+		expect(mockRmSync).not.toHaveBeenCalled();
+		expect(result).toBeNull();
 	});
 });

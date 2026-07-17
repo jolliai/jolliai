@@ -32,7 +32,7 @@ vi.mock("./IngestRunStore.js", () => ({ appendIngestRun: vi.fn() }));
 vi.mock("./ReadStorageResolver.js", () => ({ createReadStorage: vi.fn(async () => ({})) }));
 
 import { VaultWriteBusyError } from "../sync/VaultWriteLock.js";
-import { drainIngest, ingestPendingBatch } from "./IngestPipeline.js";
+import { type BatchProgress, drainIngest, ingestPendingBatch } from "./IngestPipeline.js";
 import { appendIngestRun } from "./IngestRunStore.js";
 import { callLlm } from "./LlmClient.js";
 import { emptyProcessedSet, readProcessedSet, saveProcessedSet } from "./ProcessedSourceStore.js";
@@ -106,6 +106,61 @@ describe("ingestPendingBatch", () => {
 		const routeCall = vi.mocked(callLlm).mock.calls[0]?.[0];
 		expect(routeCall?.action).toBe("route");
 		expect(routeCall?.forceStreaming).toBe(true);
+	});
+
+	it("forwards opts.signal into BOTH the route and reconcile callLlm calls so an in-flight call is cancellable", async () => {
+		// LlmClient now honors a caller signal (tears the in-flight request down on
+		// abort). The pipeline must pass it through at both LLM sites, otherwise a
+		// cancel can't reach the socket until the call's own timeout fires.
+		const controller = new AbortController();
+		vi.mocked(listPendingSources).mockResolvedValue([s("c0", "2026-01-01T00:00:00Z")]);
+		vi.mocked(callLlm)
+			.mockResolvedValueOnce(
+				llmText(
+					"route",
+					JSON.stringify({
+						updates: [],
+						newTopics: [{ stableSlug: "auth", title: "Auth", sourceIndexes: [0] }],
+					}),
+				),
+			)
+			.mockResolvedValueOnce(llmText("reconcile", reconcileOut("auth")));
+		await ingestPendingBatch("/tmp/x", cfg, { signal: controller.signal });
+		expect(vi.mocked(callLlm).mock.calls[0]?.[0]?.signal).toBe(controller.signal); // route
+		expect(vi.mocked(callLlm).mock.calls[1]?.[0]?.signal).toBe(controller.signal); // reconcile
+	});
+
+	it("emits a pre-route tick (no topicsInBatch) then a post-route tick (with topicsInBatch), both with real fields", async () => {
+		// Each tick must carry ALL BatchProgress fields with real values — never a
+		// placeholder 0 the consumer has to reverse-engineer. `currentBatchIndex` /
+		// `ingestedSoFar` are the internal seams drainIngest threads; passing them
+		// here proves the tick carries them verbatim (post-route ingestedSoFar is 7,
+		// not a hardcoded 0; pre-route pendingCount is the real 2, not a hardcoded 0).
+		vi.mocked(listPendingSources).mockResolvedValue([
+			s("c0", "2026-01-01T00:00:00Z"),
+			s("c1", "2026-01-02T00:00:00Z"),
+		]);
+		vi.mocked(callLlm)
+			.mockResolvedValueOnce(
+				llmText(
+					"route",
+					JSON.stringify({
+						updates: [],
+						newTopics: [{ stableSlug: "auth", title: "Auth", sourceIndexes: [0, 1] }],
+					}),
+				),
+			)
+			.mockResolvedValueOnce(llmText("reconcile", reconcileOut("auth")));
+		const ticks: BatchProgress[] = [];
+		await ingestPendingBatch("/tmp/x", cfg, {
+			onBatch: (bp) => ticks.push(bp),
+			currentBatchIndex: 3,
+			ingestedSoFar: 7,
+		});
+		expect(ticks).toEqual([
+			{ batchIndex: 3, pendingCount: 2, ingestedSoFar: 7 },
+			{ batchIndex: 3, pendingCount: 2, ingestedSoFar: 7, topicsInBatch: 1 },
+		]);
 	});
 
 	it("feeds reconcile source bodies in chronological order (old -> new)", async () => {
@@ -882,5 +937,94 @@ describe("drainIngest", () => {
 		expect(out.outcome).toBe("ROUTE_FAILED");
 		expect(out.batches).toBe(1); // loop broke on the first batch's errorCode
 		expect(vi.mocked(appendIngestRun).mock.calls[0]?.[1].outcome).toBe("ROUTE_FAILED");
+	});
+
+	it("throws (cancelled) and records NO run when aborted mid-reconcile", async () => {
+		// Cancel lands while the reconcile fan-out is in flight: the fan-out converts
+		// the aborted call to a held CALL failure (it never throws), so the batch
+		// returns ingested===0 and the loop breaks via the no-progress path WITHOUT
+		// re-hitting the loop-head abort check. The post-loop signal check must still
+		// abort so a cancellation is surfaced (thrown) and NO misleading
+		// RECONCILE_CALL_FAILED ingest-run is persisted.
+		vi.mocked(appendIngestRun).mockReset();
+		const controller = new AbortController();
+		vi.mocked(listPendingSources).mockResolvedValue([s("c0", "2026-01-01T00:00:00Z")]);
+		vi.mocked(callLlm).mockImplementation(async (o) => {
+			if (o.action === "route") {
+				return llmText(
+					"route",
+					JSON.stringify({ updates: [], newTopics: [{ stableSlug: "t", title: "T", sourceIndexes: [0] }] }),
+				);
+			}
+			// Reconcile: the user cancels, tearing the in-flight call down.
+			controller.abort();
+			throw new DOMException("Ingest cancelled", "AbortError");
+		});
+
+		await expect(drainIngest("/tmp/x", cfg, { batchSize: 1, signal: controller.signal })).rejects.toThrow(
+			/cancel/i,
+		);
+		expect(vi.mocked(appendIngestRun)).not.toHaveBeenCalled();
+	});
+
+	it("onBatch: every per-batch tick carries real pendingCount + ingestedSoFar, and a terminal tick fires at drain end", async () => {
+		// Two batches (batchSize 1). The finding: the old drain-side pre-batch tick
+		// hardcoded pendingCount:0 while the ingest-side post-route tick hardcoded
+		// ingestedSoFar:0 — so no single tick was internally consistent, and the
+		// promised final tick never fired. Assert the WHOLE tick sequence: both
+		// ticks per batch carry the true pendingCount + running ingestedSoFar (batch
+		// 2's ingestedSoFar is 1, not 0), plus one terminal tick after the loop.
+		vi.mocked(listPendingSources)
+			.mockResolvedValueOnce([s("c0", "2026-01-01T00:00:00Z"), s("c1", "2026-01-02T00:00:00Z")])
+			.mockResolvedValueOnce([s("c1", "2026-01-02T00:00:00Z")]);
+		vi.mocked(callLlm).mockImplementation(async (o) =>
+			o.action === "route"
+				? llmText(
+						"route",
+						JSON.stringify({
+							updates: [],
+							newTopics: [{ stableSlug: "t", title: "T", sourceIndexes: [0] }],
+						}),
+					)
+				: llmText("reconcile", reconcileOut("t")),
+		);
+		const ticks: BatchProgress[] = [];
+		const r = await drainIngest("/tmp/x", cfg, { batchSize: 1, onBatch: (bp) => ticks.push(bp) });
+		expect(r.batches).toBe(2);
+		expect(r.ingested).toBe(2);
+		expect(ticks).toEqual([
+			{ batchIndex: 1, pendingCount: 2, ingestedSoFar: 0 }, // batch 1 pre-route
+			{ batchIndex: 1, pendingCount: 2, ingestedSoFar: 0, topicsInBatch: 1 }, // batch 1 post-route
+			{ batchIndex: 2, pendingCount: 1, ingestedSoFar: 1 }, // batch 2 pre-route: ingestedSoFar advanced (not 0)
+			{ batchIndex: 2, pendingCount: 1, ingestedSoFar: 1, topicsInBatch: 1 }, // batch 2 post-route
+			{ batchIndex: 2, pendingCount: 0, ingestedSoFar: 2 }, // terminal tick at drain end
+		]);
+	});
+
+	it("swallows an onBatch callback that throws — progress can never fail the drain", async () => {
+		// Guard behavior at all three emission sites: the pre-route + post-route ticks
+		// inside ingestPendingBatch AND the terminal tick in drainIngest each wrap the
+		// callback so a throwing progress UI is logged-and-ignored, never fatal.
+		vi.mocked(listPendingSources)
+			.mockResolvedValueOnce([s("c0", "2026-01-01T00:00:00Z")])
+			.mockResolvedValueOnce([]);
+		vi.mocked(callLlm).mockImplementation(async (o) =>
+			o.action === "route"
+				? llmText(
+						"route",
+						JSON.stringify({
+							updates: [],
+							newTopics: [{ stableSlug: "t", title: "T", sourceIndexes: [0] }],
+						}),
+					)
+				: llmText("reconcile", reconcileOut("t")),
+		);
+		const r = await drainIngest("/tmp/x", cfg, {
+			onBatch: () => {
+				throw new Error("ui boom");
+			},
+		});
+		expect(r.ingested).toBe(1);
+		expect(r.outcome).toBe("OK");
 	});
 });

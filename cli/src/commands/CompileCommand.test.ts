@@ -231,11 +231,20 @@ describe("registerCompileCommand", () => {
 		expect(mockDrainIngest).not.toHaveBeenCalled();
 	});
 
-	it("--cwd --rebuild: a non-lock error during store reset propagates (not swallowed as 'busy')", async () => {
+	it("--cwd --rebuild: a non-lock error during store reset surfaces distinctly (not swallowed as 'busy')", async () => {
 		// A real write failure (disk, corruption) is NOT a VaultWriteBusyError, so the
-		// busy-exit catch must rethrow it rather than masquerade it as lock contention.
+		// busy-exit catch must NOT masquerade it as lock contention. The library API
+		// (compileSingleRepo) turns this into a structured `internal` failure; the CLI
+		// wrapper renders it to stderr with `kind=internal` and exits 1. The old
+		// behaviour was a raw rethrow — the shape changed with the library refactor
+		// but the semantic (error surfaces distinctly, drain does NOT run) is preserved.
 		mockSaveTopicIndex.mockRejectedValueOnce(new Error("disk full"));
-		await expect(runCompile(["--cwd", "/repo", "--rebuild"])).rejects.toThrow("disk full");
+		const { stderr } = await runCompile(["--cwd", "/repo", "--rebuild"]);
+		expect(stderr).toContain("disk full");
+		expect(stderr).toMatch(/kind=internal/);
+		expect(stderr).not.toMatch(/busy/i);
+		expect(process.exitCode).toBe(1);
+		expect(mockDrainIngest).not.toHaveBeenCalled();
 	});
 
 	it("--cwd: render lock contention is non-fatal — the ingest already persisted, command still reports Done", async () => {
@@ -344,13 +353,17 @@ describe("registerCompileCommand", () => {
 		expect(mockCompileAllRepos).not.toHaveBeenCalled();
 	});
 
-	it("missing API key (--cwd): error + exitCode=1, skips drain", async () => {
+	it("missing API key (--cwd): error + exitCode=1, skips drain, no progress line printed first", async () => {
 		mockLoadConfig.mockResolvedValue({} as never);
 		const prevEnv = process.env.ANTHROPIC_API_KEY;
 		delete process.env.ANTHROPIC_API_KEY;
 		try {
-			const { stderr } = await runCompile(["--cwd", "/repo"]);
+			const { stdout, stderr } = await runCompile(["--cwd", "/repo"]);
 			expect(stderr).toContain("No API key configured");
+			// The cosmetic "Ingesting…/Rebuilding…" progress line must NOT precede the
+			// no-credential error — the credential check now runs before it prints.
+			expect(stdout).not.toContain("Ingesting");
+			expect(stdout).not.toContain("Rebuilding");
 		} finally {
 			if (prevEnv !== undefined) process.env.ANTHROPIC_API_KEY = prevEnv;
 		}
