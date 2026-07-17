@@ -120,12 +120,13 @@ const SKILLS: ReadonlyArray<SkillRegistration> = [
 	{ name: "jolli-search", build: buildSearchSkillTemplate },
 	{ name: "jolli-pr", build: buildPrSkillTemplate },
 	{ name: "jolli-local-run", build: buildLocalRunSkillTemplate },
+	{ name: "jolli-remote-run", build: buildRemoteRunSkillTemplate },
 	{ name: "jolli", build: buildJolliMenuSkillTemplate },
 ];
 
 /**
  * Skill paths recorded in `.git/info/exclude` so they don't pollute
- * `git status` in user repositories. Always 8 entries: 4 skills × 2 targets.
+ * `git status` in user repositories. Always 12 entries: 6 skills × 2 targets.
  * Path format follows git's gitignore syntax — leading `/` anchors to the
  * repo root, trailing `/` matches the directory and its contents.
  */
@@ -997,6 +998,7 @@ name: jolli-local-run
 description: Run a Jolli workflow locally — your own agent executes the workflow's recipe (no Jolli LLM budget) and its file writes land in a git-backed Jolli Space via a branch and pull request that space-cli opens on this machine. Use when the user wants to run a Jolli workflow locally.
 metadata:
   version: "${SKILL_VERSION}"
+  revision: 2
   vendor: "jolli.ai"
 ---
 
@@ -1057,7 +1059,14 @@ Capture from its result:
 - \`runId\` — the run handle for every later call.
 - \`plan\` — the recipe steps your agent will execute.
 - \`writeTarget\` — carries the server-derived \`workBranch\`, the destination Space,
-  and the destination folder.
+  and the destination folder. Refer to the destination in user-facing prose by its
+  **Space name / folder** only. Do **not** announce a backing repo \`owner/name\`, and
+  do **not** present the \`workBranch\` as "the write target" — those are internal
+  plumbing, not the destination's identity. The \`workBranch\` is passed verbatim to
+  \`docs pull --branch\` in Step 3, but keep it framed as an internal detail. Do not
+  inspect the clone's git remotes to name the destination. \`writeTarget.repo\` may be
+  **empty** for a private Jolli-managed destination — that is normal, never an error,
+  and never something to look up or narrate.
 
 ## Step 3 — check out the agent branch
 
@@ -1117,9 +1126,42 @@ fresh across the wait.
    - **Nothing published** (\`"pushed": false\`, e.g. \`"reason": "no-changes"\`): no PR
      was opened, so there is nothing to complete — tell the user the workflow produced
      no changes and release the run with \`abandon_local_run\` (Step 7).
-3. Read \`willAutoMerge\` from \`complete_local_run\`'s result and tell the user which
-   happened: **"PR auto-merged"** (\`willAutoMerge: true\`) or **"PR left open for team
-   review"** (\`willAutoMerge: false\`).
+3. Read the outcome and its links off \`complete_local_run\`'s result and report them.
+   Every URL is read **verbatim** off the result — never construct, guess, or look up
+   one. The result carries \`willAutoMerge\`, \`workflowUrl\`, \`runUrl\`, and (auto-apply
+   ON only) a \`writtenArticles\` list of \`{ operation, path, url, active, ... }\`.
+   - **Auto-apply on** (\`willAutoMerge: true\`): the destination auto-applies, so the PR
+     is **set to auto-merge** and — once it does — the created/edited **articles are the
+     artifact**. Treat \`willAutoMerge: true\` as the destination's *intent*, NOT a
+     confirmation that the merge already completed — so do **not** flatly tell the user
+     "PR auto-merged". Report what actually published, judged by each article's own state:
+     for every \`writtenArticles\` entry that is still openable (\`active: true\` **and** a
+     non-null \`url\`), present its URL as a published article. If an article is
+     \`active: false\` or has \`url: null\`, publishing has **not** completed yet (the
+     auto-merge and reindex may still be in progress) — tell the user that article is
+     **not yet available**, never invent a URL, and note they can re-check shortly via the
+     run URL or by re-running \`workflow-run-status <runId>\`. Then present the workflow URL
+     (\`workflowUrl\`) and the run URL (\`runUrl\`).
+   - **PR left open for team review** (\`willAutoMerge: false\` — auto-apply off): the
+     open **PR is the artifact**. Tell the user "PR left open for team review" and
+     present the PR URL (\`prUrl\`), the workflow URL (\`workflowUrl\`), and the run URL
+     (\`runUrl\`).
+   - **Private Jolli-managed destination** (the result carries no \`prUrl\`): present the
+     **article URLs only** (same \`active: true\` + non-null \`url\` rule) plus the workflow
+     URL and run URL — never surface a repo or PR link the result did not carry. As with
+     any auto-apply run, an article that is not yet \`active\` / lacks a \`url\` is **not yet
+     available** (publishing still completing), not an error — say it will appear once
+     published and offer the run URL to re-check.
+4. Offer to open any reported URL in the user's default browser. For each URL the user
+   chooses, shell:
+
+   \`\`\`bash
+   "$HOME/.jolli/jollimemory/run-cli" open-url <url>
+   \`\`\`
+
+   It prints one JSON line \`{ "opened": true|false, "url": "..." }\`. When \`opened\` is
+   \`false\` (headless / no browser available) the URL is printed for the user to copy
+   instead — that is normal, not a failure. Only \`https\` URLs are accepted.
 
 ## Step 7 — on cancel: abandon
 
@@ -1136,6 +1178,134 @@ user to install it and stop:
 \`\`\`bash
 npm i -g @jolli.ai/cli @jolli.ai/space-cli
 \`\`\`
+`;
+}
+
+/**
+ * Remote-workflow-run recipe skill — walks the calling agent through running a
+ * Jolli workflow on the Jolli backend: identify the workflow, trigger the run via
+ * the `run_remote_workflow` platform tool, then shell the deterministic
+ * `workflow-run-status` monitor (host code polls to a terminal state) and report
+ * the outcome — failed (troubleshooting + workflow URL), cancelled (who/when +
+ * workflow URL), or succeeded (still-active article URLs + workflow URL) — and
+ * offer to open any reported URL. Prefers the Jolli MCP platform tools for the run
+ * lifecycle (there is no CLI mirror for them); the monitor and the browser-open
+ * primitive go through the `jolli` CLI (run-cli entry script). Byte-identical
+ * across every {@link SKILL_TARGETS} entry, spec-compliant frontmatter only.
+ */
+export function buildRemoteRunSkillTemplate(): string {
+	return `---
+name: jolli-remote-run
+description: Run a Jolli workflow remotely — the Jolli backend executes the workflow server-side; this recipe triggers the run, monitors it to completion, reports the outcome (failed / cancelled / succeeded) with its article, PR, and workflow links, and offers to open any in your browser. Use when the user wants to run a Jolli workflow remotely (on the Jolli backend).
+metadata:
+  version: "${SKILL_VERSION}"
+  revision: 1
+  vendor: "jolli.ai"
+---
+
+# Jolli Remote Run
+
+Run a Jolli **workflow** remotely: the Jolli backend executes the workflow
+server-side (it spends Jolli LLM budget, unlike a local run), and this recipe
+triggers the run, monitors it to a terminal state, and reports what it produced —
+the still-active article URLs, the pull-request URL when the destination is
+git-backed, and the workflow/run deep-links — then offers to open any of them.
+
+Drive the steps below in order. Prefer the Jolli MCP tools for the run lifecycle —
+the run tools (\`run_remote_workflow\`, \`cancel_remote_workflow\`) have **no CLI
+mirror** — and shell the \`jolli\` CLI (via the run-cli entry script the sibling
+skills also use) only for the deterministic monitor and the browser-open helper.
+
+Every URL is read **verbatim** off the run report — never construct, guess, or
+look one up. A link that is not in the report was withheld on purpose (for
+example, a private Jolli-managed destination omits the PR link but keeps the
+article URLs); treat its absence as normal, never an error.
+
+${SHELL_PREREQUISITE_BLOCK}
+
+## Step 1 — identify the workflow to run
+
+Determine which workflow the user wants to run and keep its numeric \`id\`.
+
+- If the \`list_workflows\` tool is registered this session (on Claude Code
+  \`mcp__jollimemory__list_workflows\`), call it to list the available workflows and
+  present them to the user by \`name\` (use your host's interactive single-select
+  tool if it has one — e.g. AskUserQuestion on Claude Code — otherwise list them as
+  text). Keep the chosen workflow's \`id\`.
+- Otherwise, ask the user which workflow to run and get its numeric \`id\`.
+
+## Step 2 — trigger the remote run
+
+Call the \`run_remote_workflow\` tool (on Claude Code
+\`mcp__jollimemory__run_remote_workflow\`) with the chosen workflow's id, passed as
+an **unquoted number**: \`{ "id": <workflow id> }\` (add \`templateVariables\` only if
+the workflow needs them). Capture \`runId\` from its result (\`{ "runId": "..." }\`) —
+that handle drives the monitor in Step 3.
+
+## Step 3 — monitor the run to completion
+
+Shell the deterministic monitor with the captured \`runId\`:
+
+\`\`\`bash
+"$HOME/.jolli/jollimemory/run-cli" workflow-run-status <runId>
+\`\`\`
+
+It polls the run to a terminal state (with backoff, so you do not drive the poll
+loop yourself) and prints exactly one JSON line — the run report. Parse it:
+
+- \`status\` — one of \`"succeeded"\`, \`"failed"\`, \`"cancelled"\`, \`"running"\`.
+- \`openableUrls\` — an array of \`{ "kind": "workflow" | "run" | "article" | "pr", "url": "...", "label": "..." }\`.
+  Only openable URLs appear here (active articles with a non-null url, a PR only
+  when the payload carried one) — present exactly these, nothing more.
+- \`cancel\` (cancelled runs) — \`{ "by": "...", "at": "..." }\` when known.
+- \`troubleshooting\` (failed runs) — the actionable error detail.
+- \`timedOut\` — \`true\` when the monitor stopped polling before the run reached a
+  terminal state (see the "still running" case below).
+
+If the command instead prints \`{ "type": "error", "message": "..." }\` (the run
+could not be reached — platform tools off, or a transport failure), tell the user
+the run status could not be retrieved and stop. That is a degraded outcome, not a
+crash — the run may still be progressing server-side.
+
+## Step 4 — report the outcome
+
+Report based on \`status\`:
+
+- **succeeded** (\`status: "succeeded"\`): the run finished. Present the \`article\`
+  URLs from \`openableUrls\` (each by its \`label\`), the \`pr\` URL if one is present,
+  and the \`workflow\` and \`run\` deep-links. Never surface a link that is not in
+  \`openableUrls\` — a missing PR link means the destination withheld it (a private
+  Jolli-managed destination), which is normal.
+- **failed** (\`status: "failed"\`): the run failed. Present the \`troubleshooting\`
+  detail (the actionable error) and the \`workflow\` URL.
+- **cancelled** (\`status: "cancelled"\`): the run was cancelled. Report who
+  (\`cancel.by\`) and when (\`cancel.at\`) when present, plus the \`workflow\` URL.
+- **still running** (\`status: "running"\` with \`timedOut: true\`): the monitor
+  stopped polling before the run reached a terminal state — the run is **still
+  running server-side**, not failed. Tell the user it is still in progress, present
+  the \`workflow\` URL so they can watch it, and note they can re-check later by
+  re-running \`workflow-run-status <runId>\`.
+
+## Step 5 — offer to open any reported URL
+
+Offer to open any URL from the report in the user's default browser. For each URL
+the user chooses, shell:
+
+\`\`\`bash
+"$HOME/.jolli/jollimemory/run-cli" open-url <url>
+\`\`\`
+
+It prints one JSON line \`{ "opened": true|false, "url": "..." }\`. When \`opened\` is
+\`false\` (headless / no browser available) the URL is printed for the user to copy
+instead — that is normal, not a failure. Only \`https\` URLs are accepted.
+
+## Cancelling an in-flight run
+
+While a remote run is still in progress, the user can stop it: call
+\`cancel_remote_workflow\` (on Claude Code
+\`mcp__jollimemory__cancel_remote_workflow\`) with the workflow's numeric id —
+\`{ "id": <workflow id> }\`. After cancelling, re-run \`workflow-run-status <runId>\`
+to report the cancelled outcome (who/when + workflow URL).
 `;
 }
 
@@ -1161,10 +1331,10 @@ npm i -g @jolli.ai/cli @jolli.ai/space-cli
 export function buildJolliMenuSkillTemplate(): string {
 	return `---
 name: jolli
-description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, pr, run a workflow local or remote) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
+description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, pr, run a workflow local or remote, workflow history) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 1
+  revision: 2
   vendor: "jolli.ai"
 ---
 
@@ -1177,6 +1347,11 @@ re-implements any action, it only invokes an existing skill or an existing MCP
 tool. The standalone \`/jolli-recall\`, \`/jolli-search\`, \`/jolli-pr\` commands and
 the \`/mcp__jollimemory__jolli\` prompt all keep working unchanged; this is layered
 on top of them, not a replacement.
+
+The **Workflow history** action below shells the \`jolli\` CLI (via the run-cli
+entry script), so the shell prerequisite applies when that action is used.
+
+${SHELL_PREREQUISITE_BLOCK}
 
 ## Step 1 — build the unified menu
 
@@ -1195,16 +1370,38 @@ Assemble ONE combined list of actions from two sources.
   - **local (default)** — your agent executes the workflow's recipe on this
     machine (no Jolli LLM budget); the writes land in a git-backed Space via a
     branch + PR. Route by invoking the \`jolli-local-run\` skill.
-  - **remote** — the Jolli backend executes the workflow server-side. Route by
-    calling the \`run_remote_workflow\` MCP tool
-    (\`mcp__jollimemory__run_remote_workflow\`).
+  - **remote** — the Jolli backend executes the workflow server-side, and the run
+    is monitored to completion and its result reported. Route by invoking the
+    \`jolli-remote-run\` skill (which drives the \`run_remote_workflow\` tool for
+    you) — not by calling the raw tool.
 
   A running **remote** run can be canceled with the \`cancel_remote_workflow\` MCP
   tool (\`mcp__jollimemory__cancel_remote_workflow\`) — offer this if the user
   wants to stop an in-flight remote run.
+- **Workflow history** — Show a workflow's past runs. When the user picks this,
+  identify the workflow's numeric id (if the \`list_workflows\` tool is registered
+  this session, use it to let the user pick one by name; otherwise ask for the
+  id), then shell:
 
-Route a local choice by invoking that skill through your host's skill-invocation
-mechanism (for example, the Skill tool in Claude Code).
+  \`\`\`bash
+  "$HOME/.jolli/jollimemory/run-cli" workflow-runs <workflowId>
+  \`\`\`
+
+  It prints \`{ "type": "runs", "runs": [ ... ] }\` — one entry per run with its
+  \`status\`, \`timestamp\`, and any \`workflowUrl\` / \`runUrl\` / \`prUrl\` /
+  \`articleUrls\`. An empty \`runs\` list is the normal "no history yet" outcome, not
+  an error. Offer to open any listed URL via the \`open-url\` helper:
+
+  \`\`\`bash
+  "$HOME/.jolli/jollimemory/run-cli" open-url <url>
+  \`\`\`
+
+  (\`{ "opened": true|false, "url": "..." }\`; \`opened: false\` on a headless host
+  just prints the URL — normal, not a failure. Only \`https\` URLs are accepted.)
+
+Route a local, remote, or history choice by invoking that skill through your
+host's skill-invocation mechanism (for example, the Skill tool in Claude Code);
+the Workflow history action runs its \`run-cli\` commands directly as shown above.
 
 ### Jolli MCP tools (whatever is registered this session)
 

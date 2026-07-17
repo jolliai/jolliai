@@ -22,6 +22,12 @@ import { deriveJolliEnvKey, type JolliApiKeyMeta, parseBaseUrl, parseJolliApiKey
 import type { WorkflowSummary } from "./LocalRunEligibility.js";
 import { loadConfig } from "./SessionTracker.js";
 import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "./TraceContext.js";
+import type {
+	JobStatus,
+	WorkflowRunPayload,
+	WorkflowRunPullRequest,
+	WorkflowRunWrittenArticle,
+} from "./WorkflowRunReport.js";
 
 const log = createLogger("JolliMemoryPushClient");
 
@@ -765,6 +771,56 @@ export class JolliMemoryPushClient {
 		}
 	}
 
+	/**
+	 * Fetches one workflow run's enriched status by invoking the backend-defined
+	 * `get_run_status` platform tool through the manifest path, unwrapping the
+	 * `{ run }` envelope (a bare run object is tolerated defensively).
+	 *
+	 * Deliberately LOUD-FAIL (unlike {@link listWorkflows}): every failure — the
+	 * tool absent from the manifest (platform tools off / older backend), a failed
+	 * invocation (non-2xx / 426 / network / abort / non-JSON body), or a
+	 * malformed run payload — THROWS, so the remote-run monitor can distinguish
+	 * "still running" from "fetch failed" and own retry/terminal/degrade itself.
+	 */
+	async getRunStatus(runId: string): Promise<WorkflowRunPayload> {
+		const manifest = await this.fetchManifest();
+		const tool = manifest.find((entry) => entry.name === GET_RUN_STATUS_TOOL_NAME);
+		if (!tool) {
+			throw new Error(
+				`Platform tool "${GET_RUN_STATUS_TOOL_NAME}" is unavailable (platform tools off or backend too old).`,
+			);
+		}
+		const raw = await this.invokePlatformTool(tool, { runId });
+		const run = toWorkflowRun(unwrapRun(raw));
+		if (!run) {
+			throw new Error(`"${GET_RUN_STATUS_TOOL_NAME}" returned a malformed run payload.`);
+		}
+		return run;
+	}
+
+	/**
+	 * Lists a workflow's run history (newest first) by invoking the backend-defined
+	 * `list_workflow_runs` platform tool through the manifest path, parsing the
+	 * `{ runs: [...] }` envelope (a bare array is tolerated defensively) and
+	 * dropping malformed entries, mirroring {@link parseWorkflowList}.
+	 *
+	 * The tool takes the workflow's numeric `id` (NOT a `workflowId` key). LOUD-FAIL
+	 * like {@link getRunStatus}: the tool absent from the manifest or a failed
+	 * invocation THROWS, and the history command catches and degrades to an empty
+	 * list — the failure posture lives in the command, not here.
+	 */
+	async listWorkflowRuns(workflowId: string | number): Promise<WorkflowRunPayload[]> {
+		const manifest = await this.fetchManifest();
+		const tool = manifest.find((entry) => entry.name === LIST_WORKFLOW_RUNS_TOOL_NAME);
+		if (!tool) {
+			throw new Error(
+				`Platform tool "${LIST_WORKFLOW_RUNS_TOOL_NAME}" is unavailable (platform tools off or backend too old).`,
+			);
+		}
+		const raw = await this.invokePlatformTool(tool, { id: workflowId });
+		return parseRunList(raw);
+	}
+
 	private async resolveAuth(): Promise<{
 		apiKey: string;
 		baseUrl: string;
@@ -1015,6 +1071,172 @@ function resolveToolEndpoint(tool: PlatformToolManifestEntry, origin: string): {
 
 /** Backend tool name that lists the candidate local-run workflows. */
 const LIST_WORKFLOWS_TOOL_NAME = "list_workflows";
+
+/** Backend tool name that returns one run's enriched status (an `{ run }` envelope). */
+const GET_RUN_STATUS_TOOL_NAME = "get_run_status";
+
+/** Backend tool name that lists a workflow's runs (a `{ runs }` envelope, newest first). */
+const LIST_WORKFLOW_RUNS_TOOL_NAME = "list_workflow_runs";
+
+/** The frozen set of valid wire run statuses; anything else rejects the run entry. */
+const RUN_STATUSES: ReadonlySet<string> = new Set<JobStatus>(["queued", "active", "completed", "failed", "cancelled"]);
+
+/** The frozen set of valid run triggers; an unrecognized value is dropped (field-granular). */
+const RUN_TRIGGERS: ReadonlySet<string> = new Set(["manual", "schedule", "event"]);
+
+/** The frozen set of valid execution modes; an unrecognized value is dropped (field-granular). */
+const RUN_EXECUTION_MODES: ReadonlySet<string> = new Set(["server", "local"]);
+
+/** The frozen set of valid article operations; an unrecognized op drops the article entry. */
+const ARTICLE_OPERATIONS: ReadonlySet<string> = new Set(["created", "edited", "deleted"]);
+
+/** The frozen set of valid PR states; an unrecognized state drops the (field-granular) PR. */
+const PR_STATES: ReadonlySet<string> = new Set(["open", "merged", "closed"]);
+
+/** Unwraps a `get_run_status` body's `{ run }` envelope; a bare run object is tolerated. */
+function unwrapRun(json: unknown): unknown {
+	if (json !== null && typeof json === "object" && !Array.isArray(json)) {
+		const run = (json as { run?: unknown }).run;
+		if (run !== undefined) {
+			return run;
+		}
+	}
+	return json;
+}
+
+/**
+ * Parses a `list_workflow_runs` invocation body into validated
+ * {@link WorkflowRunPayload} entries, mirroring {@link parseWorkflowList}: a
+ * `{ runs: [...] }` envelope or a bare array is accepted, and any entry that is
+ * not a well-formed run (no usable string `id`, or an unrecognized `status`) is
+ * dropped rather than failing the whole list.
+ */
+function parseRunList(json: unknown): WorkflowRunPayload[] {
+	return extractRunArray(json)
+		.map(toWorkflowRun)
+		.filter((run): run is WorkflowRunPayload => run !== null);
+}
+
+/** Pulls the run array out of the body — `{ runs: [...] }` or a bare array. */
+function extractRunArray(json: unknown): unknown[] {
+	if (Array.isArray(json)) {
+		return json;
+	}
+	if (json !== null && typeof json === "object") {
+		const runs = (json as { runs?: unknown }).runs;
+		if (Array.isArray(runs)) {
+			return runs;
+		}
+	}
+	return [];
+}
+
+/**
+ * Validates one raw run entry into a {@link WorkflowRunPayload}, or `null` if it is
+ * malformed. The two load-bearing fields are required: a non-empty string `id` and
+ * a `status` in the frozen vocabulary (an unclassifiable status can't be shaped).
+ * Every other field is carried through at FIELD granularity — a bad optional value
+ * is simply dropped, never failing the whole run — and the never-consumed wire
+ * fields (`outputSummary`, `stats`) are ignored. Nested `writtenArticles` entries
+ * and the `pullRequest` are each validated the same way (a malformed article is
+ * dropped from the manifest; a malformed PR leaves the field absent).
+ */
+function toWorkflowRun(value: unknown): WorkflowRunPayload | null {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		return null;
+	}
+	const raw = value as Record<string, unknown>;
+	if (typeof raw.id !== "string" || raw.id.trim() === "") {
+		return null;
+	}
+	if (typeof raw.status !== "string" || !RUN_STATUSES.has(raw.status)) {
+		return null;
+	}
+	const completionInfo = toCompletionInfo(raw.completionInfo);
+	const pullRequest = toPullRequest(raw.pullRequest);
+	return {
+		id: raw.id,
+		status: raw.status as JobStatus,
+		...(typeof raw.workflowId === "number" && Number.isFinite(raw.workflowId) && { workflowId: raw.workflowId }),
+		...(typeof raw.createdAt === "string" && { createdAt: raw.createdAt }),
+		...(typeof raw.triggeredBy === "string" &&
+			RUN_TRIGGERS.has(raw.triggeredBy) && { triggeredBy: raw.triggeredBy as WorkflowRunPayload["triggeredBy"] }),
+		...(typeof raw.executionMode === "string" &&
+			RUN_EXECUTION_MODES.has(raw.executionMode) && {
+				executionMode: raw.executionMode as WorkflowRunPayload["executionMode"],
+			}),
+		...(typeof raw.startedAt === "string" && { startedAt: raw.startedAt }),
+		...(typeof raw.completedAt === "string" && { completedAt: raw.completedAt }),
+		...(typeof raw.error === "string" && { error: raw.error }),
+		...(completionInfo !== undefined && { completionInfo }),
+		...(Array.isArray(raw.writtenArticles) && { writtenArticles: toWrittenArticles(raw.writtenArticles) }),
+		...(pullRequest !== undefined && { pullRequest }),
+		...(typeof raw.workflowUrl === "string" && { workflowUrl: raw.workflowUrl }),
+		...(typeof raw.runUrl === "string" && { runUrl: raw.runUrl }),
+		...(typeof raw.canceledBy === "string" && { canceledBy: raw.canceledBy }),
+		...(typeof raw.canceledAt === "string" && { canceledAt: raw.canceledAt }),
+	};
+}
+
+/** Validates the success-only `completionInfo` — an object with a string `message` — else undefined. */
+function toCompletionInfo(value: unknown): { message: string } | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		return undefined;
+	}
+	const message = (value as { message?: unknown }).message;
+	return typeof message === "string" ? { message } : undefined;
+}
+
+/** Maps a raw `writtenArticles` array to validated entries, dropping malformed ones. */
+function toWrittenArticles(value: unknown[]): WorkflowRunWrittenArticle[] {
+	return value.map(toWrittenArticle).filter((article): article is WorkflowRunWrittenArticle => article !== null);
+}
+
+/**
+ * Validates one raw `writtenArticles` entry, or `null` if malformed. Requires a
+ * valid `operation`, a string `path`, and a boolean `active`; `url` must be a
+ * string or `null` (an absent/other value is normalized to `null` — not-yet-
+ * openable). `docId` / `title` are carried through only when well-typed.
+ */
+function toWrittenArticle(value: unknown): WorkflowRunWrittenArticle | null {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		return null;
+	}
+	const raw = value as Record<string, unknown>;
+	if (typeof raw.operation !== "string" || !ARTICLE_OPERATIONS.has(raw.operation)) {
+		return null;
+	}
+	if (typeof raw.path !== "string" || typeof raw.active !== "boolean") {
+		return null;
+	}
+	return {
+		operation: raw.operation as WorkflowRunWrittenArticle["operation"],
+		path: raw.path,
+		active: raw.active,
+		url: typeof raw.url === "string" ? raw.url : null,
+		...(typeof raw.docId === "number" && Number.isFinite(raw.docId) && { docId: raw.docId }),
+		...(typeof raw.title === "string" && { title: raw.title }),
+	};
+}
+
+/**
+ * Validates the `pullRequest` reference, or undefined when absent/malformed (a
+ * withheld or no-PR run — normal, never an error). Requires a numeric `number`, a
+ * string `url`, and a `state` in the frozen set.
+ */
+function toPullRequest(value: unknown): WorkflowRunPullRequest | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		return undefined;
+	}
+	const raw = value as Record<string, unknown>;
+	if (typeof raw.number !== "number" || !Number.isFinite(raw.number)) {
+		return undefined;
+	}
+	if (typeof raw.url !== "string" || typeof raw.state !== "string" || !PR_STATES.has(raw.state)) {
+		return undefined;
+	}
+	return { number: raw.number, url: raw.url, state: raw.state as WorkflowRunPullRequest["state"] };
+}
 
 /**
  * Parses the `list_workflows` invocation body into validated {@link WorkflowSummary}

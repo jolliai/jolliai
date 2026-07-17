@@ -25,6 +25,7 @@ import { registerBindCommand, registerPushCommand, registerSpacesCommand } from 
 import { registerLocalRunOfferCommand } from "./commands/LocalRunOfferCommand.js";
 import { registerMcpCommand } from "./commands/McpCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
+import { registerOpenUrlCommand } from "./commands/OpenUrlCommand.js";
 import { registerPrDescriptionCommand } from "./commands/PrDescriptionCommand.js";
 import { registerQueueStatusCommand } from "./commands/QueueStatusCommand.js";
 import { registerRecallCommand } from "./commands/RecallCommand.js";
@@ -34,6 +35,8 @@ import { registerSyncCommand } from "./commands/SyncCommand.js";
 import { registerTelemetryCommand } from "./commands/TelemetryCommand.js";
 import { registerUninstallCommand } from "./commands/UninstallCommand.js";
 import { registerViewCommand } from "./commands/ViewCommand.js";
+import { registerWorkflowRunStatusCommand } from "./commands/WorkflowRunStatusCommand.js";
+import { registerWorkflowRunsCommand } from "./commands/WorkflowRunsCommand.js";
 // _parseJolliApiKey / _parseBaseUrl: re-exposed at the bottom of this file.
 // See the `parseJolliApiKey` export for the rationale (Vite tree-shaker drops
 // pure re-exports from the entry bundle when nothing inside the entry
@@ -168,6 +171,9 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"pr-description",
 	"queue-status",
 	"local-run-workflows",
+	"open-url",
+	"workflow-run-status",
+	"workflow-runs",
 	"compile",
 	"graph",
 	"export",
@@ -354,6 +360,9 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerBindCommand(program);
 	registerQueueStatusCommand(program);
 	registerLocalRunOfferCommand(program);
+	registerOpenUrlCommand(program);
+	registerWorkflowRunStatusCommand(program);
+	registerWorkflowRunsCommand(program);
 	registerCompileCommand(program);
 	registerGraphCommand(program);
 	registerMigrateCommand(program);
