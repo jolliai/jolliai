@@ -19,7 +19,7 @@ Turns your AI coding sessions into structured development documentation attached
 - **MCP server for AI agents** — `jolli mcp` exposes your history to Claude Code (and any MCP-aware agent) so it can search memories, recall a branch, and trace a decision's history without leaving the chat. Registered automatically on `jolli enable`.
 - **Knowledge wiki** — `jolli compile` folds the work scattered across many commits into per-topic pages and a browsable `_wiki/` folder in your Memory Bank, updated automatically after each commit.
 - **Knowledge graph** — `jolli graph` exports the wiki's topics as an interactive, self-contained HTML map of categories, knowledge units, and the typed links between them. Built incrementally alongside the wiki on every commit.
-- **Issue, page & conversation references** — Linear, Jira, GitHub, Notion, Slack, and Zoom items mentioned in your AI conversations are captured and attached to the relevant memory.
+- **Issue, page & conversation references** — Linear, Jira, GitHub, Notion, Slack, Zoom, Confluence, Asana, and monday.com items mentioned in your AI conversations are captured and attached to the relevant memory.
 - **Privacy-first** — transcripts and diff go straight to Anthropic (with your `apiKey`) or via the Jolli LLM proxy (in-memory, never persisted). Raw transcripts are never uploaded to Jolli Space.
 
 Jump to: [Jolli Memory](#jolli-memory) · [How It Works](#how-it-works) · [Installation](#installation) · [CLI Commands](#cli-commands) · [Session Context Recall](#session-context-recall) · [Configuration](#configuration) · [Privacy](#privacy)
@@ -60,7 +60,7 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | -- | -- |
 | **Claude Code** | A lightweight `StopHook` fires after each AI response; a `SessionStartHook` injects a mini-briefing at session start |
 | **Gemini CLI** | An `AfterAgent` hook fires after each agent completion |
-| **Codex CLI** | No hook needed — sessions are discovered automatically by scanning the filesystem. Linear/Jira/GitHub/Notion/Slack/Zoom references in Codex MCP calls are extracted on the VS Code sidebar's 60s polling tick (not at commit time) |
+| **Codex CLI** | No hook needed — sessions are discovered automatically by scanning the filesystem. Linear/Jira/GitHub/Notion/Slack/Zoom/Confluence/Asana/monday.com references in Codex MCP calls are extracted on the VS Code sidebar's 60s polling tick (not at commit time) |
 | **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database at `~/.local/share/opencode/opencode.db` (requires Node 22.5+) |
 | **Cursor IDE** (Composer) | No hook needed — sessions are discovered automatically by reading Cursor's local SQLite stores (`globalStorage/state.vscdb` plus per-workspace `workspaceStorage/` databases under your platform's Cursor user-data directory) |
 | **GitHub Copilot CLI** | No hook needed — sessions are discovered automatically by scanning Copilot CLI's session log |
@@ -132,6 +132,20 @@ Removes all Jolli Memory hooks. Existing summaries are preserved in the orphan b
 
 ```bash
 jolli disable
+```
+
+### `jolli uninstall`
+
+Machine-wide cleanup: finds and removes Jolli Memory installs and configuration across surfaces — VS Code–family extensions (including forks like Cursor, Windsurf, VSCodium), JetBrains/Android Studio plugins, the global `@jolli.ai/cli` package and `jolli` shim, the machine-global `~/.jolli/jollimemory/` and per-project `.jolli/jollimemory/` state, and the current repo's hooks and **repo-scoped** MCP registration. Prints a grouped inventory first and supports interactive selection.
+
+A few shared artifacts are deliberately left in place: **global-scope MCP registrations** (the Gemini / Codex / OpenCode / Copilot host files) and the **global instruction blocks** in `~/.claude/CLAUDE.md` / `~/.gemini/GEMINI.md` / `~/.codex/AGENTS.md` are shared by every repo on the machine, so removing them during one uninstall would break Jolli for your other repos; and the generated `SKILL.md` files are left untouched because they may sit alongside skills of your own. Remove those by hand if you want a completely bare machine.
+
+Your memories are never touched — the summaries orphan branch and Memory Bank content are excluded by construction.
+
+```bash
+jolli uninstall              # preview + interactive selection
+jolli uninstall --dry-run    # show what would be removed, change nothing
+jolli uninstall --yes --scope all   # remove everything without prompting
 ```
 
 ### `jolli auth`
@@ -256,6 +270,8 @@ jolli mcp
 jolli mcp --reindex
 ```
 
+On top of these nine built-in tools, the server also surfaces **platform tools** defined by the Jolli backend (on by default), so a connected agent can act on your Jolli Space directly. Turn them off with `jolli configure --set mcpPlatformToolsEnabled=false`.
+
 `jolli enable` registers this server automatically in your project's `.mcp.json`, so Claude Code picks it up on its next start — no manual setup. The search index is a disposable local cache (never written to the orphan branch); `--reindex` forces a fresh rebuild if you ever want to clear it.
 
 ### `jolli compile`
@@ -313,7 +329,7 @@ jolli configure --set excludePatterns=docs/**,*.log,node_modules
 jolli configure --remove jolliApiKey
 ```
 
-Supported keys: `apiKey`, `aiProvider`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `claudeEnabled`, `codexEnabled`, `geminiEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `globalInstructions`, `localFolder`, `logLevel`, `excludePatterns`, `syncTranscripts`. `globalInstructions` (`enabled` / `disabled`, unset = undecided) records whether the skill-preference note is written into your machine-global AI instruction files. Setting it to `enabled` writes the block immediately; `disabled` removes it. `jolli enable` never prompts — it only applies the current value (`enabled` → write, `disabled` → remove, unset → no change). `aiProvider` pins the summarization backend (`"anthropic"` or `"jolli"`); when omitted, the dispatcher falls back to the legacy precedence (`apiKey` > `ANTHROPIC_API_KEY` > `jolliApiKey`). `copilotEnabled` controls both GitHub Copilot CLI and VS Code Copilot Chat as a single switch. `localFolder` is the Memory Bank root on disk where every memory is dual-written. `syncTranscripts` opts raw transcripts into cloud sync — see [Memory Bank cloud sync](#memory-bank-cloud-sync) below; run a round on demand with `jolli sync-memory-bank`. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
+Supported keys: `apiKey`, `aiProvider`, `localAgentTool`, `localAgentPath`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `claudeEnabled`, `codexEnabled`, `geminiEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `globalInstructions`, `mcpPlatformToolsEnabled`, `localFolder`, `logLevel`, `excludePatterns`, `syncTranscripts`. `globalInstructions` (`enabled` / `disabled`, unset = undecided) records whether the skill-preference note is written into your machine-global AI instruction files. Setting it to `enabled` writes the block immediately; `disabled` removes it. `jolli enable` never prompts — it only applies the current value (`enabled` → write, `disabled` → remove, unset → no change). `aiProvider` pins the summarization backend (`"anthropic"`, `"jolli"`, or `"local-agent"`); when omitted, the dispatcher falls back to the legacy precedence (`apiKey` > `ANTHROPIC_API_KEY` > `jolliApiKey`). `local-agent` drives a locally-installed AI CLI (Claude Code today) to generate memories instead of calling an API — `localAgentTool` selects the tool (currently only `claude-code`) and `localAgentPath` optionally points at the binary when it isn't on your `PATH`. `copilotEnabled` controls both GitHub Copilot CLI and VS Code Copilot Chat as a single switch. `mcpPlatformToolsEnabled` (boolean, on by default) controls whether the `jolli mcp` server surfaces the backend-defined platform tools; set it to `false` to expose only the built-in tools. `localFolder` is the Memory Bank root on disk where every memory is dual-written. `syncTranscripts` opts raw transcripts into cloud sync — see [Memory Bank cloud sync](#memory-bank-cloud-sync) below; run a round on demand with `jolli sync-memory-bank`. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
 
 ### Memory Bank cloud sync
 
@@ -419,7 +435,9 @@ Settings are stored globally in `~/.jolli/jollimemory/config.json`. The recommen
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `apiKey` | string | `$ANTHROPIC_API_KEY` | Anthropic API key for summarization ([get one here](https://platform.anthropic.com/)) |
-| `aiProvider` | enum | (auto) | Pin which provider generates summaries: `"anthropic"` (use `apiKey` / `$ANTHROPIC_API_KEY`) or `"jolli"` (use `jolliApiKey`). When unset, the resolver falls back to the legacy precedence (`apiKey` → `$ANTHROPIC_API_KEY` → `jolliApiKey`). Each generated summary records the chosen source in its `LlmCallMetadata.source` field (`anthropic-config` / `anthropic-env` / `jolli-proxy`). |
+| `aiProvider` | enum | (auto) | Pin which provider generates summaries: `"anthropic"` (use `apiKey` / `$ANTHROPIC_API_KEY`), `"jolli"` (use `jolliApiKey`), or `"local-agent"` (drive a locally-installed AI CLI). When unset, the resolver falls back to the legacy precedence (`apiKey` → `$ANTHROPIC_API_KEY` → `jolliApiKey`). Each generated summary records the chosen source in its `LlmCallMetadata.source` field (`anthropic-config` / `anthropic-env` / `jolli-proxy` / `local-agent`). |
+| `localAgentTool` | enum | `claude-code` | Which local Agent CLI to drive when `aiProvider` is `"local-agent"`. Currently only `claude-code`; reserved for future tools (Codex, Cursor). Ignored otherwise. |
+| `localAgentPath` | string | (PATH) | Explicit path to the local agent binary, overriding `PATH` discovery. Used only when `aiProvider` is `"local-agent"`. |
 | `model` | string | `claude-sonnet-4-6` | Model used for summarization. Accepts an alias (`sonnet`, `haiku`) or a full model ID. |
 | `maxTokens` | integer | model default | Max output tokens per summarization call |
 | `jolliApiKey` | string | — | Jolli Space API key for pushing summaries to your team knowledge base |

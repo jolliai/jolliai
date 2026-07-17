@@ -1,6 +1,20 @@
 # Changelog
 
-<!-- Last synced commit: 17e671be | 2026-07-10 -->
+<!-- Last synced commit: 9f11cdf0 | 2026-07-17 -->
+
+## 0.99.8
+
+- **Generate memories with your local AI CLI** — a new `local-agent` AI provider drives a locally-installed Claude Code to write your memories, so summarization runs through the agent you already have — no API key and no Jolli proxy call. Turn it on with `jolli configure --set aiProvider=local-agent`; if the binary isn't on your `PATH`, point at it with `jolli configure --set localAgentPath=/path/to/claude`.
+- **A guided first run** — type `jolli` on its own in a terminal and it walks you through getting set up: sign in, pick which AI provider generates your memories (and fix a missing key on the spot), bind the repo to a Jolli Space, and offer to back-fill memories for commits you made before Jolli.
+- **Run Jolli workflows from your agent** — a new `/jolli-local-run` skill lets your AI agent run a Jolli workflow on your own machine (it executes the recipe itself, so it never spends Jolli AI credits); the results land in a git-backed Jolli Space through a branch and pull request. Remote runs are supported too.
+- **A `/jolli` menu** — one front door that lists the Jolli skills (recall, search, PR, run a workflow) plus whatever Jolli tools your agent has, then routes your pick to the right one.
+- **Three more places your references come from** — issues, pages, tasks, and items from **Confluence, Asana, and monday.com** mentioned in your AI conversations now show up in your memories, PR descriptions, and exports, alongside Linear, Jira, GitHub, Notion, Slack, and Zoom. Slack thread links and more permalink formats are picked up too, and Jira detection from Codex is more reliable.
+- **`jolli uninstall`** — a new command that finds and removes Jolli's installs and configuration across your editors and the global CLI, with a preview, interactive selection, `--dry-run`, and `--scope`. Machine-global entries that other repos still rely on (global-scope MCP registrations and instruction blocks) and the generated skill files are deliberately left in place; your memories are never touched.
+- **Your agent can reach Jolli platform tools** — the `jolli mcp` server now also surfaces backend-defined platform tools (on by default), so agents can act on your Jolli Space directly. Turn them off with `jolli configure --set mcpPlatformToolsEnabled=false`.
+- **Knowledge graph across devices** — graphs now sync between the machines you sign in to with deterministic conflict resolution, and can be embedded on the web.
+- **Sharper memory relevance** — the check that decides what belongs in each memory moved from a simple keep/drop list to tier-based ranking, so plans, notes, and references are chosen more precisely.
+- **Safer, faster pushing** — memories are pushed in a single synchronous batch on pre-push, and a fix keeps references from being dropped when a conversation is split across a scan boundary.
+- Bug fixes
 
 ## 0.99.7
 
