@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.99.8
+
+### New Features
+
+- **Slack thread references** — Slack threads read through the Slack MCP server in your AI conversations are now captured as a fifth reference source, right alongside Linear, Jira, GitHub, and Notion, and shown in the committed-memory and working-memory views. A pasted thread permalink is picked up with zero configuration (including from plain-text messages); without one, a `slack.workspaceUrl` configured in Settings reconstructs the link — the URL is validated (HTTPS, `slack.com` host) when you save it.
+- **Smarter about what goes into a memory** — plans, notes, and references are now ranked for relevance against your change in one batched AI call before summarizing. Items judged clearly unrelated are left out of the summary and kept in the working area for a later commit; excluded items stay visible in the memory detail view and the folder Markdown for traceability. If the ranking call fails, summarization proceeds with the full set — it never blocks a commit.
+- **Agent guidance is now opt-in** — Jolli only teaches your AI agents to prefer it (via a managed block in `~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`, and `~/.codex/AGENTS.md`) once you turn it on under **Settings → Agents**. The decision is stored in the shared config, so the CLI, VS Code, and IntelliJ all honor the same choice. All three skills (`jolli-recall`, `jolli-search`, `jolli-pr`) are now installed with the current MCP-preferring content.
+- **Token usage travels with pushed memories** — the article pushed to your Jolli Space now carries the same **Task usage** line as the CLI and VS Code (token total, estimated cost, input/output/cached split), and the raw token figures are sent along with the push.
+
+### Fixes & Improvements
+
+- Auto-sync on push can now sync the queued summaries synchronously in one batch during `git push`, instead of only handing them to the background worker
+- Reference discovery no longer drops tool calls split across a scan boundary, so references near chunk edges are reliably captured
+- The CLI, VS Code, and IntelliJ stopped rewriting each other's installed skill files — skill updates are now guarded by a shared revision number instead of per-tool version strings
+- More reliable anonymous usage telemetry (still content-free): events carry deduplication ids, are batched and flushed in the background and at exit, benign no-op ingests are no longer reported as errors, and new or upgraded installs and key panel actions are counted
+
 ## 0.99.7
 
 ### New Features
