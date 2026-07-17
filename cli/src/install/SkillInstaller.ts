@@ -998,7 +998,7 @@ name: jolli-local-run
 description: Run a Jolli workflow locally — your own agent executes the workflow's recipe (no Jolli LLM budget) and its file writes land in a git-backed Jolli Space via a branch and pull request that space-cli opens on this machine. Use when the user wants to run a Jolli workflow locally.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 2
+  revision: 3
   vendor: "jolli.ai"
 ---
 
@@ -1113,7 +1113,27 @@ fresh across the wait.
 
    \`--json\` prints exactly one JSON object on stdout (all human-readable progress
    goes to stderr) — parse that object; never scrape the human log for a PR number.
-2. Call \`complete_local_run\` (on Claude Code
+2. Verify the pull request landed on the server-derived work branch. \`docs publish\`
+   reports the branch the PR was actually opened on as \`headBranch\` (present on both
+   the public and the private/withheld paths); the run's server work branch is
+   \`writeTarget.workBranch\` from Step 2. **When \`pushed\` is true, cross-check them
+   deterministically** — do not eyeball it yourself:
+
+   \`\`\`bash
+   "$HOME/.jolli/jollimemory/run-cli" verify-publish-branch <writeTarget.workBranch> <headBranch>
+   \`\`\`
+
+   It prints \`{ "match": true|false, "expected": "...", "actual": "..." }\` and exits
+   non-zero when the branches differ or \`headBranch\` is missing. **If \`match\` is
+   false, STOP** — the PR was opened on the wrong branch (usually because \`docs pull
+   --branch <workBranch>\` in Step 3 was skipped, so space-cli generated its own
+   \`jolli-<hex>\` branch). The backend cannot link the run to that PR, so it will
+   **not** auto-merge and the articles will **never** publish. Tell the user the
+   run-to-PR link is broken (published on \`<actual>\` instead of the expected
+   \`<expected>\`) and **do NOT call \`complete_local_run\` as if the run succeeded** —
+   release the run with \`abandon_local_run\` (Step 7) or ask the user how to proceed.
+   Skip this check only when \`pushed\` is false (nothing was published).
+3. Call \`complete_local_run\` (on Claude Code
    \`mcp__jollimemory__complete_local_run\`), branching on what the publish JSON
    contained:
    - **PR refs present** (the JSON has a \`prNumber\` — a user-accessible
@@ -1126,7 +1146,7 @@ fresh across the wait.
    - **Nothing published** (\`"pushed": false\`, e.g. \`"reason": "no-changes"\`): no PR
      was opened, so there is nothing to complete — tell the user the workflow produced
      no changes and release the run with \`abandon_local_run\` (Step 7).
-3. Read the outcome and its links off \`complete_local_run\`'s result and report them.
+4. Read the outcome and its links off \`complete_local_run\`'s result and report them.
    Every URL is read **verbatim** off the result — never construct, guess, or look up
    one. The result carries \`willAutoMerge\`, \`workflowUrl\`, \`runUrl\`, and (auto-apply
    ON only) a \`writtenArticles\` list of \`{ operation, path, url, active, ... }\`.
@@ -1152,7 +1172,7 @@ fresh across the wait.
      any auto-apply run, an article that is not yet \`active\` / lacks a \`url\` is **not yet
      available** (publishing still completing), not an error — say it will appear once
      published and offer the run URL to re-check.
-4. Offer to open any reported URL in the user's default browser. For each URL the user
+5. Offer to open any reported URL in the user's default browser. For each URL the user
    chooses, shell:
 
    \`\`\`bash
