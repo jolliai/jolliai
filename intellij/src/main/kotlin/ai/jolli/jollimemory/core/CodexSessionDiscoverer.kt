@@ -15,9 +15,8 @@ object CodexSessionDiscoverer {
     private val log = JmLogger.create("CodexSessionDiscoverer")
 
     /** Check if Codex CLI sessions directory exists. */
-    fun isCodexInstalled(): Boolean {
-        val home = System.getProperty("user.home")
-        return File("$home/.codex/sessions").isDirectory
+    fun isCodexInstalled(env: HookEnv = HookEnv()): Boolean {
+        return File(env.userHome, ".codex/sessions").isDirectory
     }
 
     /**
@@ -31,12 +30,11 @@ object CodexSessionDiscoverer {
      * A session with no recorded cwd can't be attributed, so it is skipped. Mirrors
      * the CLI/VS Code `discoverCodexSessions(projectDir)` filter.
      */
-    fun discoverSessions(projectDir: String): List<SessionInfo> {
-        val home = System.getProperty("user.home")
-        val sessionsDir = File("$home/.codex/sessions")
+    fun discoverSessions(projectDir: String, env: HookEnv = HookEnv()): List<SessionInfo> {
+        val sessionsDir = File(env.userHome, ".codex/sessions")
         if (!sessionsDir.isDirectory) return emptyList()
 
-        val target = normalizePathForMatch(projectDir)
+        val target = normalizePathForMatch(projectDir, env)
         val sessions = mutableListOf<SessionInfo>()
         val today = LocalDate.now()
         val fmt = DateTimeFormatter.ofPattern("yyyy/MM/dd")
@@ -52,7 +50,7 @@ object CodexSessionDiscoverer {
                 // Scope to the current repo. A session whose cwd is absent or points
                 // at another repo must not leak into this project's conversation list.
                 val cwd = meta.cwd ?: continue
-                if (normalizePathForMatch(cwd) != target) continue
+                if (normalizePathForMatch(cwd, env) != target) continue
                 sessions.add(SessionInfo(
                     sessionId = meta.id,
                     transcriptPath = file.absolutePath,

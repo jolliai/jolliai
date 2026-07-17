@@ -1,26 +1,29 @@
 package ai.jolli.jollimemory.bridge
 
-import ai.jolli.jollimemory.core.CommitSummary
 import com.google.gson.Gson
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
-import io.mockk.every
-import io.mockk.mockk
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 
+/**
+ * Uses [FakeGit] (a plain per-test object) instead of MockK, so this class
+ * needs no isolation annotations and runs fully parallel — there is no shared
+ * mutable state and no bytecode instrumentation involved. See GitCommands.kt
+ * for the history behind the migration.
+ */
 class SummaryReaderTest {
 
     private val gson = Gson()
-    private lateinit var git: GitOps
+    private lateinit var git: FakeGit
     private lateinit var reader: SummaryReader
 
     @BeforeEach
     fun setUp() {
-        git = mockk(relaxed = true)
+        git = FakeGit()
         reader = SummaryReader("/fake/project", git)
     }
 
@@ -52,9 +55,8 @@ class SummaryReaderTest {
     inner class ListSummaries {
         @Test
         fun `returns parsed summaries sorted by date`() {
-            every { git.listBranchFiles(any(), "summaries/") } returns listOf("summaries/abc.json", "summaries/def.json")
-            every { git.readBranchFile(any(), "summaries/abc.json") } returns makeSummaryJson("abc12345", "First commit", 2)
-            every { git.readBranchFile(any(), "summaries/def.json") } returns makeSummaryJson("def67890", "Second commit", 1)
+            git.files["summaries/abc.json"] = makeSummaryJson("abc12345", "First commit", 2)
+            git.files["summaries/def.json"] = makeSummaryJson("def67890", "Second commit", 1)
 
             val summaries = reader.listSummaries()
             summaries shouldHaveSize 2
@@ -66,14 +68,12 @@ class SummaryReaderTest {
 
         @Test
         fun `returns empty list when no summary files`() {
-            every { git.listBranchFiles(any(), "summaries/") } returns emptyList()
             reader.listSummaries().shouldBeEmpty()
         }
 
         @Test
         fun `skips invalid JSON files`() {
-            every { git.listBranchFiles(any(), "summaries/") } returns listOf("summaries/bad.json")
-            every { git.readBranchFile(any(), "summaries/bad.json") } returns "not json"
+            git.files["summaries/bad.json"] = "not json"
 
             reader.listSummaries().shouldBeEmpty()
         }
@@ -85,8 +85,7 @@ class SummaryReaderTest {
     inner class GetSummary {
         @Test
         fun `returns full CommitSummary when file exists`() {
-            val json = makeSummaryJson("abc123", "Test commit")
-            every { git.readBranchFile(any(), "summaries/abc123.json") } returns json
+            git.files["summaries/abc123.json"] = makeSummaryJson("abc123", "Test commit")
 
             val summary = reader.getSummary("abc123")
             summary shouldNotBe null
@@ -95,7 +94,6 @@ class SummaryReaderTest {
 
         @Test
         fun `returns null when file does not exist`() {
-            every { git.readBranchFile(any(), any()) } returns null
             reader.getSummary("nonexistent") shouldBe null
         }
     }
@@ -105,7 +103,7 @@ class SummaryReaderTest {
     @Test
     fun `getSummaryJson returns raw JSON string`() {
         val expected = """{"commitHash":"abc"}"""
-        every { git.readBranchFile(any(), "summaries/abc.json") } returns expected
+        git.files["summaries/abc.json"] = expected
         reader.getSummaryJson("abc") shouldBe expected
     }
 

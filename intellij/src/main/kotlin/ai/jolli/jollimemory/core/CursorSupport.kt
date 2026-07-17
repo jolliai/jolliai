@@ -46,13 +46,13 @@ object CursorSupport {
 	private val BUBBLE_TYPE_TO_ROLE = mapOf(1 to "human", 2 to "assistant")
 
 	/** Returns the path to Cursor's global SQLite database. */
-	fun getGlobalDbPath(): String =
-		getVscodeUserDataDir(VscodeFlavor.Cursor) + File.separator + "User" +
+	fun getGlobalDbPath(env: HookEnv = HookEnv()): String =
+		getVscodeUserDataDir(VscodeFlavor.Cursor, env) + File.separator + "User" +
 			File.separator + "globalStorage" + File.separator + "state.vscdb"
 
 	/** Checks whether Cursor's global database file exists. */
-	fun isCursorInstalled(): Boolean {
-		val dbPath = getGlobalDbPath()
+	fun isCursorInstalled(env: HookEnv = HookEnv()): Boolean {
+		val dbPath = getGlobalDbPath(env)
 		val exists = File(dbPath).isFile
 		return exists
 	}
@@ -61,8 +61,8 @@ object CursorSupport {
 	 * Lightweight DB health check — opens the database and runs a trivial query
 	 * to detect locked/corrupt/permission errors without scanning all rows.
 	 */
-	fun checkDbHealth(): SqliteScanError? {
-		val dbPath = getGlobalDbPath()
+	fun checkDbHealth(env: HookEnv = HookEnv()): SqliteScanError? {
+		val dbPath = getGlobalDbPath(env)
 		if (!File(dbPath).isFile) return null
 		return try {
 			withReadOnlyDb(dbPath) { conn ->
@@ -78,20 +78,20 @@ object CursorSupport {
 	 * Discovers Cursor Composer sessions relevant to the given project directory.
 	 * Uses the anchor-only algorithm with staleness cutoff; see class kdoc for details.
 	 */
-	fun discoverSessions(projectDir: String): ScanResult {
-		val globalDbPath = getGlobalDbPath()
+	fun discoverSessions(projectDir: String, env: HookEnv = HookEnv()): ScanResult {
+		val globalDbPath = getGlobalDbPath(env)
 		val globalDbFile = File(globalDbPath)
 		if (!globalDbFile.isFile) return ScanResult(emptyList())
 
 		// Step 1: Workspace lookup
-		val wsHash = findVscodeWorkspaceHash(VscodeFlavor.Cursor, projectDir)
+		val wsHash = findVscodeWorkspaceHash(VscodeFlavor.Cursor, projectDir, env)
 		if (wsHash == null) {
 			log.debug("No Cursor workspace found matching %s", projectDir)
 			return ScanResult(emptyList())
 		}
 
 		// Step 2: Anchor extraction (never throws — workspace-level failure degrades gracefully)
-		val anchorIds = readAnchorComposerIds(wsHash)
+		val anchorIds = readAnchorComposerIds(wsHash, env)
 		val anchorSet = anchorIds.toHashSet()
 
 		// Step 3 + 4: Time-window scan + union/dedupe on the global DB
@@ -294,8 +294,8 @@ object CursorSupport {
 	 * `composer.composerData` row in ItemTable. Returns an empty list on any failure —
 	 * workspace-level errors do NOT abort the broader scan.
 	 */
-	private fun readAnchorComposerIds(wsHash: String): List<String> {
-		val wsDbPath = getVscodeWorkspaceStorageDir(VscodeFlavor.Cursor) +
+	private fun readAnchorComposerIds(wsHash: String, env: HookEnv): List<String> {
+		val wsDbPath = getVscodeWorkspaceStorageDir(VscodeFlavor.Cursor, env) +
 			File.separator + wsHash + File.separator + "state.vscdb"
 		if (!File(wsDbPath).isFile) {
 			log.debug("Cursor workspace DB not found at %s — skipping anchor extraction", wsDbPath)

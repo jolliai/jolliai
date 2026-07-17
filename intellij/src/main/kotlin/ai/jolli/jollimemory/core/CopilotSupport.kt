@@ -28,18 +28,18 @@ object CopilotSupport {
 	private const val SESSION_STALE_MS = 48 * 60 * 60 * 1000L
 
 	/** Returns the absolute path to Copilot CLI's session-store database. */
-	fun getDbPath(): String =
-		System.getProperty("user.home") + File.separator + ".copilot" + File.separator + "session-store.db"
+	fun getDbPath(env: HookEnv = HookEnv()): String =
+		env.userHome.path + File.separator + ".copilot" + File.separator + "session-store.db"
 
 	/** Returns true when the Copilot CLI session DB is present on disk. */
-	fun isCopilotInstalled(): Boolean = File(getDbPath()).isFile
+	fun isCopilotInstalled(env: HookEnv = HookEnv()): Boolean = File(getDbPath(env)).isFile
 
 	/**
 	 * Lightweight DB health check — opens the database and runs a trivial query
 	 * to detect locked/corrupt/permission errors without scanning all rows.
 	 */
-	fun checkDbHealth(): SqliteScanError? {
-		val dbPath = getDbPath()
+	fun checkDbHealth(env: HookEnv = HookEnv()): SqliteScanError? {
+		val dbPath = getDbPath(env)
 		if (!File(dbPath).isFile) return null
 		return try {
 			withReadOnlyDb(dbPath) { conn ->
@@ -58,12 +58,12 @@ object CopilotSupport {
 	 * SQL `>` would be lexicographic and only correct if every row used canonical
 	 * UTC ISO-8601. [Instant.parse] tolerates any format Java date parsing accepts.
 	 */
-	fun discoverSessions(projectDir: String): ScanResult {
-		val dbPath = getDbPath()
+	fun discoverSessions(projectDir: String, env: HookEnv = HookEnv()): ScanResult {
+		val dbPath = getDbPath(env)
 		if (!File(dbPath).isFile) return ScanResult(emptyList())
 
 		val cutoffMs = System.currentTimeMillis() - SESSION_STALE_MS
-		val osName = System.getProperty("os.name").lowercase()
+		val osName = env.osName.lowercase()
 		val caseInsensitive = osName.contains("mac") || osName.contains("win")
 
 		return try {

@@ -1,6 +1,6 @@
 package ai.jolli.jollimemory.core
 
-import ai.jolli.jollimemory.bridge.GitOps
+import ai.jolli.jollimemory.bridge.GitCommands
 import java.nio.file.Path
 
 /**
@@ -20,11 +20,11 @@ object StorageFactory {
     /**
      * Creates a StorageProvider based on the configured storage mode.
      *
-     * @param git GitOps instance for OrphanBranchStorage
+     * @param git Git command surface for OrphanBranchStorage (production: GitOps)
      * @param projectPath The resolved repo root path (for resolving KB folder)
      * @param config The user's JolliMemoryConfig (contains storageMode, knowledgeBasePath)
      */
-    fun create(git: GitOps, projectPath: String, config: JolliMemoryConfig = SessionTracker.loadConfig()): StorageProvider {
+    fun create(git: GitCommands, projectPath: String, config: JolliMemoryConfig = SessionTracker.loadConfig()): StorageProvider {
         val mode = config.storageMode ?: "dual-write"
         log.info("StorageFactory.create: storageMode=%s, projectPath=%s", mode, projectPath)
 

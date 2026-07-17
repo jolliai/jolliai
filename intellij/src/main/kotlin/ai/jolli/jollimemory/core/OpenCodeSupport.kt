@@ -22,15 +22,15 @@ object OpenCodeSupport {
 	private const val SESSION_STALE_MS = 48 * 60 * 60 * 1000L
 
 	/** Returns the path to the global OpenCode database file. */
-	fun getDbPath(): String {
-		val xdgDataHome = System.getenv("XDG_DATA_HOME")
-			?: (System.getProperty("user.home") + File.separator + ".local" + File.separator + "share")
+	fun getDbPath(env: HookEnv = HookEnv()): String {
+		val xdgDataHome = env.getenv("XDG_DATA_HOME")
+			?: (env.userHome.path + File.separator + ".local" + File.separator + "share")
 		return xdgDataHome + File.separator + "opencode" + File.separator + "opencode.db"
 	}
 
 	/** Checks whether the OpenCode database exists. */
-	fun isOpenCodeInstalled(): Boolean {
-		val dbPath = getDbPath()
+	fun isOpenCodeInstalled(env: HookEnv = HookEnv()): Boolean {
+		val dbPath = getDbPath(env)
 		val exists = File(dbPath).isFile
 		return exists
 	}
@@ -39,8 +39,8 @@ object OpenCodeSupport {
 	 * Lightweight DB health check — opens the database and runs a trivial query
 	 * to detect locked/corrupt/permission errors without scanning all rows.
 	 */
-	fun checkDbHealth(): SqliteScanError? {
-		val dbPath = getDbPath()
+	fun checkDbHealth(env: HookEnv = HookEnv()): SqliteScanError? {
+		val dbPath = getDbPath(env)
 		if (!File(dbPath).isFile) return null
 		return try {
 			withReadOnlyDb(dbPath) { conn ->
@@ -56,14 +56,14 @@ object OpenCodeSupport {
 	 * Discovers OpenCode sessions relevant to the given project directory.
 	 * Queries the global DB for recent sessions (within 48h) matching projectDir.
 	 */
-	fun discoverSessions(projectDir: String): ScanResult {
-		val dbPath = getDbPath()
+	fun discoverSessions(projectDir: String, env: HookEnv = HookEnv()): ScanResult {
+		val dbPath = getDbPath(env)
 		val dbFile = File(dbPath)
 		if (!dbFile.isFile) return ScanResult(emptyList())
 
 		val cutoffMs = System.currentTimeMillis() - SESSION_STALE_MS
-		val isWindows = System.getProperty("os.name").lowercase().contains("win")
-		val isMac = System.getProperty("os.name").lowercase().contains("mac")
+		val isWindows = env.osName.lowercase().contains("win")
+		val isMac = env.osName.lowercase().contains("mac")
 		val caseInsensitive = isWindows || isMac
 
 		return try {

@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.sync
 
+import ai.jolli.jollimemory.core.HookEnv
 import java.nio.file.Files
 import java.nio.file.Path
 
@@ -28,12 +29,12 @@ object SyncLock {
 	 * Returns the absolute path to `sync.lock`.
 	 * Respects `JOLLI_SYNC_LOCK_DIR` env override for test isolation.
 	 */
-	fun getSyncLockPath(): Path {
-		val override = System.getenv("JOLLI_SYNC_LOCK_DIR")
+	fun getSyncLockPath(env: HookEnv = HookEnv()): Path {
+		val override = env.getenv("JOLLI_SYNC_LOCK_DIR")
 		val dir = if (!override.isNullOrEmpty()) {
 			Path.of(override)
 		} else {
-			Path.of(System.getProperty("user.home"), ".jolli", "jollimemory")
+			env.userHome.toPath().resolve(".jolli").resolve("jollimemory")
 		}
 		return dir.resolve(SYNC_LOCK_FILE)
 	}
@@ -42,8 +43,8 @@ object SyncLock {
 	 * Acquires `sync.lock`, waiting up to [opts] timeout. Returns true on
 	 * success, false on timeout. Creates parent directory if needed.
 	 */
-	fun acquire(opts: SyncLockOpts = SyncLockOpts()): Boolean {
-		val lockPath = getSyncLockPath()
+	fun acquire(opts: SyncLockOpts = SyncLockOpts(), env: HookEnv = HookEnv()): Boolean {
+		val lockPath = getSyncLockPath(env)
 		Files.createDirectories(lockPath.parent)
 		return LockPrimitives.acquireWithPoll(lockPath, opts.timeoutMs, opts.pollMs)
 	}
@@ -51,13 +52,13 @@ object SyncLock {
 	/**
 	 * Releases `sync.lock` — only if the lock file's PID matches us.
 	 */
-	fun release() {
-		LockPrimitives.releaseIfOwned(getSyncLockPath(), "sync.lock")
+	fun release(env: HookEnv = HookEnv()) {
+		LockPrimitives.releaseIfOwned(getSyncLockPath(env), "sync.lock")
 	}
 
 	/** Bumps mtime so a long-running round doesn't get reclaimed. */
-	fun refreshMtime() {
-		LockPrimitives.refreshLockMtime(getSyncLockPath())
+	fun refreshMtime(env: HookEnv = HookEnv()) {
+		LockPrimitives.refreshLockMtime(getSyncLockPath(env))
 	}
 
 	/** Returns true when `sync.lock` exists and is fresh. */

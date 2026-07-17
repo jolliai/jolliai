@@ -14,9 +14,6 @@ import io.kotest.matchers.collections.shouldNotContain
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
-import io.mockk.every
-import io.mockk.mockkObject
-import io.mockk.unmockkObject
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 
@@ -284,17 +281,12 @@ class ContextRelevanceTest {
         @Test
         fun `fails open to keepAll when the LLM call throws`() {
             val items = listOf(item(ContextKind.plan, "p1", "T", "x"), item(ContextKind.note, "n1", "T", "y"))
-            mockkObject(LlmClient)
-            try {
-                every { LlmClient.callLlm(any(), any(), any(), any(), any(), any(), any(), any()) } throws RuntimeException("boom")
-                val result = ContextRelevance.rankContextRelevance(
-                    ContextRelevance.ChangeSignal("m", emptyList(), emptyList()), items, JolliMemoryConfig(),
-                )
-                result shouldHaveSize 2
-                result.all { it.relevant && !it.autoExclude } shouldBe true
-            } finally {
-                unmockkObject(LlmClient)
-            }
+            val result = ContextRelevance.rankContextRelevance(
+                ContextRelevance.ChangeSignal("m", emptyList(), emptyList()), items, JolliMemoryConfig(),
+                llmCall = { throw RuntimeException("boom") },
+            )
+            result shouldHaveSize 2
+            result.all { it.relevant && !it.autoExclude } shouldBe true
         }
 
         @Test
@@ -321,18 +313,12 @@ class ContextRelevanceTest {
                 score: 0.55
                 reason: adjacent
             """.trimIndent()
-            mockkObject(LlmClient)
-            try {
-                every { LlmClient.callLlm(any(), any(), any(), any(), any(), any(), any(), any()) } returns
-                    LlmClient.LlmCallResult(response, "m", 1, 1, 1L, "end_turn")
-                val result = ContextRelevance.rankContextRelevance(
-                    ContextRelevance.ChangeSignal("m", listOf("a.kt"), emptyList()), items, JolliMemoryConfig(apiKey = "sk-x"),
-                )
-                result.map { it.id } shouldContainExactly listOf("n1", "r1", "p1")
-                result.first { it.id == "p1" }.autoExclude shouldBe true
-            } finally {
-                unmockkObject(LlmClient)
-            }
+            val result = ContextRelevance.rankContextRelevance(
+                ContextRelevance.ChangeSignal("m", listOf("a.kt"), emptyList()), items, JolliMemoryConfig(apiKey = "sk-x"),
+                llmCall = { LlmClient.LlmCallResult(response, "m", 1, 1, 1L, "end_turn") },
+            )
+            result.map { it.id } shouldContainExactly listOf("n1", "r1", "p1")
+            result.first { it.id == "p1" }.autoExclude shouldBe true
         }
     }
 

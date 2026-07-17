@@ -36,28 +36,28 @@ object CopilotChatSupport {
 	private const val SESSION_STALE_MS = 48 * 60 * 60 * 1000L
 
 	/** Returns vscode's `globalStorage/github.copilot-chat` directory path. */
-	fun getCopilotChatStorageDir(): String =
-		getVscodeUserDataDir(VscodeFlavor.Code) + File.separator + "User" +
+	fun getCopilotChatStorageDir(env: HookEnv = HookEnv()): String =
+		getVscodeUserDataDir(VscodeFlavor.Code, env) + File.separator + "User" +
 			File.separator + "globalStorage" + File.separator + "github.copilot-chat"
 
 	/** Returns `~/.copilot/session-state` directory path (Copilot CLI agent backend). */
-	fun getCopilotCliSessionStateDir(): String =
-		System.getProperty("user.home") + File.separator + ".copilot" + File.separator + "session-state"
+	fun getCopilotCliSessionStateDir(env: HookEnv = HookEnv()): String =
+		env.userHome.path + File.separator + ".copilot" + File.separator + "session-state"
 
 	/**
 	 * Returns true when either of the two known Copilot Chat data roots exists
 	 * as a directory.
 	 */
-	fun isCopilotChatInstalled(): Boolean =
-		File(getCopilotChatStorageDir()).isDirectory || File(getCopilotCliSessionStateDir()).isDirectory
+	fun isCopilotChatInstalled(env: HookEnv = HookEnv()): Boolean =
+		File(getCopilotChatStorageDir(env)).isDirectory || File(getCopilotCliSessionStateDir(env)).isDirectory
 
 	/**
 	 * Runs Scan A then Scan B; concatenates sessions; returns the first error
 	 * encountered (subsequent are debug-logged).
 	 */
-	fun discoverSessions(projectDir: String): CopilotChatScanResult {
-		val a = scanSessionState(projectDir)
-		val b = scanChatSessions(projectDir)
+	fun discoverSessions(projectDir: String, env: HookEnv = HookEnv()): CopilotChatScanResult {
+		val a = scanSessionState(projectDir, env)
+		val b = scanChatSessions(projectDir, env)
 		val sessions = a.sessions + b.sessions
 		val error = a.error ?: b.error
 		if (a.error != null && b.error != null) {
@@ -98,12 +98,12 @@ object CopilotChatSupport {
 
 	// ── Scan A: ~/.copilot/session-state/<sid>/events.jsonl ────────────────
 
-	private fun scanSessionState(projectDir: String): CopilotChatScanResult {
-		val root = File(getCopilotCliSessionStateDir())
+	private fun scanSessionState(projectDir: String, env: HookEnv): CopilotChatScanResult {
+		val root = File(getCopilotCliSessionStateDir(env))
 		if (!root.isDirectory) return CopilotChatScanResult(emptyList())
 
 		val cutoffMs = System.currentTimeMillis() - SESSION_STALE_MS
-		val target = normalizePathForMatch(projectDir)
+		val target = normalizePathForMatch(projectDir, env)
 		val sessions = mutableListOf<SessionInfo>()
 
 		val entries = root.listFiles() ?: return CopilotChatScanResult(
@@ -126,7 +126,7 @@ object CopilotChatSupport {
 				continue
 			}
 			if (folderPath.isNullOrEmpty()) continue
-			if (normalizePathForMatch(folderPath) != target) continue
+			if (normalizePathForMatch(folderPath, env) != target) continue
 
 			if (!eventsFile.isFile) continue
 			val mtimeMs = eventsFile.lastModified()
@@ -144,13 +144,13 @@ object CopilotChatSupport {
 
 	// ── Scan B: <wsHash>/chatSessions/<sid>.jsonl ──────────────────────────
 
-	private fun scanChatSessions(projectDir: String): CopilotChatScanResult {
-		val wsHash = findVscodeWorkspaceHash(VscodeFlavor.Code, projectDir) ?: run {
+	private fun scanChatSessions(projectDir: String, env: HookEnv): CopilotChatScanResult {
+		val wsHash = findVscodeWorkspaceHash(VscodeFlavor.Code, projectDir, env) ?: run {
 			log.debug("No vscode workspace matched %s", projectDir)
 			return CopilotChatScanResult(emptyList())
 		}
 		val dir = File(
-			getVscodeWorkspaceStorageDir(VscodeFlavor.Code) + File.separator + wsHash + File.separator + "chatSessions"
+			getVscodeWorkspaceStorageDir(VscodeFlavor.Code, env) + File.separator + wsHash + File.separator + "chatSessions"
 		)
 		if (!dir.isDirectory) return CopilotChatScanResult(emptyList())
 

@@ -1,0 +1,9 @@
+src/test/kotlin/ai/jolli/jollimemory/core/plans/TranscriptPlanDiscoveryTest.kt
+src/test/kotlin/ai/jolli/jollimemory/core/references/TranscriptReferenceDiscoveryTest.kt
+src/test/kotlin/ai/jolli/jollimemory/hooks/PostRewriteHookTest.kt
+src/test/kotlin/ai/jolli/jollimemory/hooks/PrepareMsgHookTest.kt
+src/test/kotlin/ai/jolli/jollimemory/services/BranchShareControllerTest.kt
+src/test/kotlin/ai/jolli/jollimemory/services/BranchShareModalTest.kt
+src/test/kotlin/ai/jolli/jollimemory/services/JolliAuthServiceTest.kt
+src/test/kotlin/ai/jolli/jollimemory/services/JolliShareServiceTest.kt
+src/test/kotlin/ai/jolli/jollimemory/services/LiveShareControllerTest.kt

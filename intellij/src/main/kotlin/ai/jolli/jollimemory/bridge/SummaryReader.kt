@@ -16,7 +16,7 @@ import com.google.gson.JsonParser
 /**
  * Reads JolliMemory data from the filesystem and git — pure Kotlin, no Node.js.
  */
-class SummaryReader(private val projectDir: String, private val git: GitOps) {
+class SummaryReader(private val projectDir: String, private val git: GitCommands) {
 
     private val log = JmLogger.create("SummaryReader")
     private val gson = Gson()

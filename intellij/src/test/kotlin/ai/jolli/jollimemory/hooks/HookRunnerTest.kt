@@ -2,8 +2,6 @@ package ai.jolli.jollimemory.hooks
 
 import io.kotest.matchers.shouldBe
 import org.junit.jupiter.api.Test
-import java.io.ByteArrayOutputStream
-import java.io.PrintStream
 
 class HookRunnerTest {
 
@@ -13,19 +11,6 @@ class HookRunnerTest {
         methods.contains("main") shouldBe true
     }
 
-    @Test
-    fun `unknown hook prints error to stderr`() {
-        val originalErr = System.err
-        val captured = ByteArrayOutputStream()
-        System.setErr(PrintStream(captured))
-
-        try {
-            // Capture the System.exit call by catching SecurityException,
-            // or just verify the stderr output. We can't easily test System.exit
-            // without a SecurityManager, so just verify the method exists.
-            // The actual dispatch logic is tested in individual hook tests.
-        } finally {
-            System.setErr(originalErr)
-        }
-    }
+    // The unknown-hook branch calls System.exit and cannot be exercised in-JVM;
+    // dispatch behavior is covered by the individual hook tests.
 }

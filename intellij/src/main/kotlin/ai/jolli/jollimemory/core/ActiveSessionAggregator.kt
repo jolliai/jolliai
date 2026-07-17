@@ -24,16 +24,18 @@ object ActiveSessionAggregator {
 	fun listActiveConversations(
 		cwd: String,
 		windowMs: Long = DEFAULT_WINDOW_MS,
+		env: HookEnv = HookEnv(),
 	): List<ActiveConversationItem> =
-		listActiveConversationsWithDiagnostics(cwd, windowMs).items
+		listActiveConversationsWithDiagnostics(cwd, windowMs, env).items
 
 	fun listActiveConversationsWithDiagnostics(
 		cwd: String,
 		windowMs: Long = DEFAULT_WINDOW_MS,
+		env: HookEnv = HookEnv(),
 	): ActiveConversationsResult {
 		val cutoff = System.currentTimeMillis() - windowMs
 
-		val collected = collectFromAllSources(cwd)
+		val collected = collectFromAllSources(cwd, env)
 		val hidden = HiddenConversationsStore.loadHiddenConversations(cwd)
 
 		// Filter by recency
@@ -125,14 +127,14 @@ object ActiveSessionAggregator {
 		val failed: List<TranscriptSource>,
 	)
 
-	private fun collectFromAllSources(cwd: String): CollectResult {
+	private fun collectFromAllSources(cwd: String, env: HookEnv): CollectResult {
 		val batches = listOf(
 			loadClaudeAndGemini(cwd),
-			loadCodex(cwd),
-			loadOpenCode(cwd),
-			loadCursor(cwd),
-			loadCopilot(cwd),
-			loadCopilotChat(cwd),
+			loadCodex(cwd, env),
+			loadOpenCode(cwd, env),
+			loadCursor(cwd, env),
+			loadCopilot(cwd, env),
+			loadCopilotChat(cwd, env),
 		)
 		val sessions = batches.flatMap { it.sessions }
 		val failedSources = batches.flatMap { it.failed }
@@ -146,38 +148,38 @@ object ActiveSessionAggregator {
 		LoaderResult(emptyList(), listOf(TranscriptSource.claude, TranscriptSource.gemini))
 	}
 
-	private fun loadCodex(cwd: String): LoaderResult = try {
-		LoaderResult(CodexSessionDiscoverer.discoverSessions(cwd), emptyList())
+	private fun loadCodex(cwd: String, env: HookEnv): LoaderResult = try {
+		LoaderResult(CodexSessionDiscoverer.discoverSessions(cwd, env), emptyList())
 	} catch (e: Exception) {
 		log.warn("discoverCodexSessions threw: %s", e.message)
 		LoaderResult(emptyList(), listOf(TranscriptSource.codex))
 	}
 
-	private fun loadOpenCode(cwd: String): LoaderResult = try {
-		val scan = OpenCodeSupport.discoverSessions(cwd)
+	private fun loadOpenCode(cwd: String, env: HookEnv): LoaderResult = try {
+		val scan = OpenCodeSupport.discoverSessions(cwd, env)
 		LoaderResult(scan.sessions, if (scan.error != null) listOf(TranscriptSource.opencode) else emptyList())
 	} catch (e: Exception) {
 		log.warn("scanOpenCodeSessions threw: %s", e.message)
 		LoaderResult(emptyList(), listOf(TranscriptSource.opencode))
 	}
 
-	private fun loadCursor(cwd: String): LoaderResult = try {
-		val scan = CursorSupport.discoverSessions(cwd)
+	private fun loadCursor(cwd: String, env: HookEnv): LoaderResult = try {
+		val scan = CursorSupport.discoverSessions(cwd, env)
 		LoaderResult(scan.sessions, if (scan.error != null) listOf(TranscriptSource.cursor) else emptyList())
 	} catch (e: Exception) {
 		log.warn("scanCursorSessions threw: %s", e.message)
 		LoaderResult(emptyList(), listOf(TranscriptSource.cursor))
 	}
-	private fun loadCopilot(cwd: String): LoaderResult = try {
-		val scan = CopilotSupport.discoverSessions(cwd)
+	private fun loadCopilot(cwd: String, env: HookEnv): LoaderResult = try {
+		val scan = CopilotSupport.discoverSessions(cwd, env)
 		LoaderResult(scan.sessions, if (scan.error != null) listOf(TranscriptSource.copilot) else emptyList())
 	} catch (e: Exception) {
 		log.warn("scanCopilotSessions threw: %s", e.message)
 		LoaderResult(emptyList(), listOf(TranscriptSource.copilot))
 	}
 
-	private fun loadCopilotChat(cwd: String): LoaderResult = try {
-		val scan = CopilotChatSupport.discoverSessions(cwd)
+	private fun loadCopilotChat(cwd: String, env: HookEnv): LoaderResult = try {
+		val scan = CopilotChatSupport.discoverSessions(cwd, env)
 		LoaderResult(scan.sessions, if (scan.error != null) listOf(TranscriptSource.`copilot-chat`) else emptyList())
 	} catch (e: Exception) {
 		log.warn("scanCopilotChatSessions threw: %s", e.message)

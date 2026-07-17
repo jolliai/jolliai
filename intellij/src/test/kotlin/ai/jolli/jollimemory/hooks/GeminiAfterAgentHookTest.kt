@@ -1,16 +1,10 @@
 package ai.jolli.jollimemory.hooks
 
-import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.core.SessionInfo
 import ai.jolli.jollimemory.core.TranscriptSource
+import ai.jolli.jollimemory.core.fakeHookEnv
+import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.shouldBe
-import io.mockk.every
-import io.mockk.mockkObject
-import io.mockk.mockkStatic
-import io.mockk.slot
-import io.mockk.unmockkAll
-import io.mockk.verify
-import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.ByteArrayOutputStream
@@ -22,22 +16,17 @@ class GeminiAfterAgentHookTest {
     @TempDir
     lateinit var tempDir: File
 
-    private val originalOut = System.out
-    private val capturedOut = ByteArrayOutputStream()
+    private class HookRun(val saved: List<SessionInfo>, val stdout: String)
 
-    @BeforeEach
-    fun setUp() {
-        System.setOut(PrintStream(capturedOut))
-        mockkObject(SessionTracker)
-        mockkStatic(::readStdin)
-        every { SessionTracker.ensureDir(any()) } returns tempDir.resolve(".jolli/jollimemory").apply { mkdirs() }.absolutePath
-        every { SessionTracker.saveSession(any(), any()) } returns Unit
-    }
-
-    @AfterEach
-    fun tearDown() {
-        System.setOut(originalOut)
-        unmockkAll()
+    /** Runs the hook with a fake env; captures saved sessions and stdout. */
+    private fun runHook(readStdin: () -> String): HookRun {
+        val out = ByteArrayOutputStream()
+        val saved = mutableListOf<SessionInfo>()
+        GeminiAfterAgentHook.run(
+            env = fakeHookEnv(readStdin = readStdin, stdout = PrintStream(out), userHome = tempDir, userDir = tempDir),
+            saveSession = { info, _ -> saved.add(info) },
+        )
+        return HookRun(saved, out.toString())
     }
 
     @Test
@@ -46,36 +35,30 @@ class GeminiAfterAgentHookTest {
         // would otherwise produce illegal JSON escape sequences (\U, \A, \L, ...).
         val cwdJson = tempDir.absolutePath.replace("\\", "\\\\")
         val json = """{"session_id":"gem-456","transcript_path":"/tmp/gemini.json","cwd":"$cwdJson"}"""
-        every { readStdin() } returns json
 
-        GeminiAfterAgentHook.run()
+        val run = runHook { json }
 
-        val sessionSlot = slot<ai.jolli.jollimemory.core.SessionInfo>()
-        verify { SessionTracker.saveSession(capture(sessionSlot), any()) }
-        sessionSlot.captured.sessionId shouldBe "gem-456"
-        sessionSlot.captured.source shouldBe TranscriptSource.gemini
+        run.saved.single().sessionId shouldBe "gem-456"
+        run.saved.single().source shouldBe TranscriptSource.gemini
     }
 
     @Test
     fun `always writes empty JSON to stdout`() {
-        every { readStdin() } returns ""
-        GeminiAfterAgentHook.run()
-        capturedOut.toString().trim() shouldBe "{}"
+        val run = runHook { "" }
+        run.stdout.trim() shouldBe "{}"
     }
 
     @Test
     fun `writes empty JSON even on stdin failure`() {
-        every { readStdin() } throws RuntimeException("broken")
-        GeminiAfterAgentHook.run()
-        capturedOut.toString().trim() shouldBe "{}"
-        verify(exactly = 0) { SessionTracker.saveSession(any(), any()) }
+        val run = runHook { throw RuntimeException("broken") }
+        run.stdout.trim() shouldBe "{}"
+        run.saved.shouldBeEmpty()
     }
 
     @Test
     fun `does not save session on invalid JSON`() {
-        every { readStdin() } returns "not json"
-        GeminiAfterAgentHook.run()
-        verify(exactly = 0) { SessionTracker.saveSession(any(), any()) }
-        capturedOut.toString().trim() shouldBe "{}"
+        val run = runHook { "not json" }
+        run.saved.shouldBeEmpty()
+        run.stdout.trim() shouldBe "{}"
     }
 }

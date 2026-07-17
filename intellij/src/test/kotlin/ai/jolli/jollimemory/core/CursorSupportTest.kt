@@ -7,8 +7,6 @@ import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
-import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -18,41 +16,14 @@ import java.time.Instant
 
 class CursorSupportTest {
 
-    private var originalHome: String? = null
-    private var originalCursorOverride: String? = null
+    /**
+     * Env pinned to macOS so the fixture layout below is deterministic on any
+     * host; [cursorUserDataDir] mirrors the same layout.
+     */
+    private fun macEnv(home: File): HookEnv = fakeHookEnv(userHome = home, osName = "Mac OS X")
 
-    @BeforeEach
-    fun setup() {
-        originalHome = System.getProperty("user.home")
-        originalCursorOverride = System.getProperty("cursor.appdata.override")
-    }
-
-    @AfterEach
-    fun teardown() {
-        originalHome?.let { System.setProperty("user.home", it) }
-        // On Windows the production code reads %APPDATA% (env var); we redirect it via the
-        // `cursor.appdata.override` system property in helpers below. Clear it between tests.
-        if (originalCursorOverride != null) {
-            System.setProperty("cursor.appdata.override", originalCursorOverride!!)
-        } else {
-            System.clearProperty("cursor.appdata.override")
-        }
-    }
-
-    /** Returns the platform-correct Cursor user-data dir under the given home. */
-    private fun cursorUserDataDir(home: File): File {
-        val osName = System.getProperty("os.name").lowercase()
-        return when {
-            osName.contains("mac") -> File(home, "Library/Application Support/Cursor")
-            osName.contains("win") -> {
-                // On Windows the production code uses %APPDATA% (env var) which we cannot unset
-                // from Java; redirect it via the `cursor.appdata.override` system property hook.
-                System.setProperty("cursor.appdata.override", File(home, "AppData/Roaming").absolutePath)
-                File(home, "AppData/Roaming/Cursor")
-            }
-            else -> File(home, ".config/Cursor")
-        }
-    }
+    /** Returns the macOS Cursor user-data dir under the given home (matches [macEnv]). */
+    private fun cursorUserDataDir(home: File): File = File(home, "Library/Application Support/Cursor")
 
     /** Creates the Cursor user-data dir layout under `home` and returns the workspaceStorage subdir. */
     private fun setupCursorHome(home: File): File {
@@ -138,20 +109,14 @@ class CursorSupportTest {
     inner class IsCursorInstalled {
         @Test
         fun `false when global DB does not exist`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
-            // On Windows the production resolver uses %APPDATA% (which points at a real path
-            // on dev machines that may have Cursor installed). Redirect via the override so
-            // the resolver lands in the empty tempDir.
-            System.setProperty("cursor.appdata.override", File(tempDir, "AppData/Roaming").absolutePath)
-            CursorSupport.isCursorInstalled() shouldBe false
+            CursorSupport.isCursorInstalled(macEnv(tempDir)) shouldBe false
         }
 
         @Test
         fun `true when global DB exists`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val db = globalDbFile(tempDir)
             createGlobalDb(db, emptyList())
-            CursorSupport.isCursorInstalled() shouldBe true
+            CursorSupport.isCursorInstalled(macEnv(tempDir)) shouldBe true
         }
     }
 
@@ -160,7 +125,6 @@ class CursorSupportTest {
 
         @Test
         fun `no matching workspace returns empty`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val projectDir = File(tempDir, "my-project").also { it.mkdirs() }
             val otherProject = File(tempDir, "other-project").also { it.mkdirs() }
             val wsStorage = setupCursorHome(tempDir)
@@ -169,14 +133,13 @@ class CursorSupportTest {
                 "composerData:c1" to composerData("c1", System.currentTimeMillis())
             ))
 
-            val result = CursorSupport.discoverSessions(projectDir.absolutePath)
+            val result = CursorSupport.discoverSessions(projectDir.absolutePath, macEnv(tempDir))
             result.sessions.shouldBeEmpty()
             result.error.shouldBeNull()
         }
 
         @Test
         fun `anchor composer older than 48h is excluded`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val projectDir = File(tempDir, "my-project").also { it.mkdirs() }
             val wsStorage = setupCursorHome(tempDir)
             createWorkspaceDb(File(wsStorage, "ws1/state.vscdb"), fileUri(projectDir),
@@ -186,14 +149,13 @@ class CursorSupportTest {
                 "composerData:ancient-composer" to composerData("ancient-composer", ancientTime),
             ))
 
-            val result = CursorSupport.discoverSessions(projectDir.absolutePath)
+            val result = CursorSupport.discoverSessions(projectDir.absolutePath, macEnv(tempDir))
             result.error.shouldBeNull()
             result.sessions.shouldBeEmpty()
         }
 
         @Test
         fun `anchor-only filtering with staleness cutoff and dedupe`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val projectDir = File(tempDir, "my-project").also { it.mkdirs() }
             val wsStorage = setupCursorHome(tempDir)
             createWorkspaceDb(File(wsStorage, "ws1/state.vscdb"), fileUri(projectDir),
@@ -211,7 +173,7 @@ class CursorSupportTest {
                 "composerData:anchorStale" to composerData("anchorStale", ancient), // anchored but stale — excluded
             ))
 
-            val result = CursorSupport.discoverSessions(projectDir.absolutePath)
+            val result = CursorSupport.discoverSessions(projectDir.absolutePath, macEnv(tempDir))
             result.error.shouldBeNull()
             // Only anchored + recent sessions returned; unanchored "fresh" must NOT leak in
             result.sessions.map { it.sessionId } shouldContainExactlyInAnyOrder
@@ -220,7 +182,6 @@ class CursorSupportTest {
 
         @Test
         fun `corrupt global DB returns ScanResult with corrupt error`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val projectDir = File(tempDir, "my-project").also { it.mkdirs() }
             val wsStorage = setupCursorHome(tempDir)
             createWorkspaceDb(File(wsStorage, "ws1/state.vscdb"), fileUri(projectDir))
@@ -228,7 +189,7 @@ class CursorSupportTest {
             val globalDb = globalDbFile(tempDir)
             globalDb.writeBytes(ByteArray(64) { 0xFF.toByte() })
 
-            val result = CursorSupport.discoverSessions(projectDir.absolutePath)
+            val result = CursorSupport.discoverSessions(projectDir.absolutePath, macEnv(tempDir))
             result.sessions.shouldBeEmpty()
             result.error.shouldNotBeNull()
             // Either corrupt (clean SQLite check) or unknown (depending on how JDBC reports it)
@@ -237,7 +198,6 @@ class CursorSupportTest {
 
         @Test
         fun `malformed composer row is silently skipped`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val projectDir = File(tempDir, "my-project").also { it.mkdirs() }
             val wsStorage = setupCursorHome(tempDir)
             createWorkspaceDb(File(wsStorage, "ws1/state.vscdb"), fileUri(projectDir),
@@ -248,14 +208,13 @@ class CursorSupportTest {
                 "composerData:good" to composerData("good", now - 1000),
             ))
 
-            val result = CursorSupport.discoverSessions(projectDir.absolutePath)
+            val result = CursorSupport.discoverSessions(projectDir.absolutePath, macEnv(tempDir))
             result.error.shouldBeNull()
             result.sessions.map { it.sessionId } shouldContainExactly listOf("good")
         }
 
         @Test
         fun `composer with missing composerId is skipped`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val projectDir = File(tempDir, "my-project").also { it.mkdirs() }
             val wsStorage = setupCursorHome(tempDir)
             createWorkspaceDb(File(wsStorage, "ws1/state.vscdb"), fileUri(projectDir),
@@ -266,14 +225,13 @@ class CursorSupportTest {
                 "composerData:ok" to composerData("ok", now - 1000),
             ))
 
-            val result = CursorSupport.discoverSessions(projectDir.absolutePath)
+            val result = CursorSupport.discoverSessions(projectDir.absolutePath, macEnv(tempDir))
             result.error.shouldBeNull()
             result.sessions.map { it.sessionId } shouldContainExactly listOf("ok")
         }
 
         @Test
         fun `composer with non-finite lastUpdatedAt is skipped`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val projectDir = File(tempDir, "my-project").also { it.mkdirs() }
             val wsStorage = setupCursorHome(tempDir)
             createWorkspaceDb(File(wsStorage, "ws1/state.vscdb"), fileUri(projectDir),
@@ -284,14 +242,13 @@ class CursorSupportTest {
                 "composerData:good" to composerData("good", now - 1000),
             ))
 
-            val result = CursorSupport.discoverSessions(projectDir.absolutePath)
+            val result = CursorSupport.discoverSessions(projectDir.absolutePath, macEnv(tempDir))
             result.error.shouldBeNull()
             result.sessions.map { it.sessionId } shouldContainExactly listOf("good")
         }
 
         @Test
         fun `synthetic transcript path encodes composer id`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val projectDir = File(tempDir, "my-project").also { it.mkdirs() }
             val wsStorage = setupCursorHome(tempDir)
             createWorkspaceDb(File(wsStorage, "ws1/state.vscdb"), fileUri(projectDir),
@@ -300,7 +257,7 @@ class CursorSupportTest {
                 "composerData:my-composer" to composerData("my-composer", System.currentTimeMillis())
             ))
 
-            val result = CursorSupport.discoverSessions(projectDir.absolutePath)
+            val result = CursorSupport.discoverSessions(projectDir.absolutePath, macEnv(tempDir))
             val s = result.sessions.single()
             s.transcriptPath.endsWith("#my-composer") shouldBe true
             s.source shouldBe TranscriptSource.cursor
@@ -312,7 +269,6 @@ class CursorSupportTest {
 
         @Test
         fun `parses bubbles and maps type to role`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val db = globalDbFile(tempDir)
             createGlobalDb(db, listOf(
                 "composerData:c1" to composerData("c1", 1_700_000_000_000L, listOf("b1" to 1, "b2" to 2)),
@@ -330,7 +286,6 @@ class CursorSupportTest {
 
         @Test
         fun `consecutive same-role entries are merged`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val db = globalDbFile(tempDir)
             createGlobalDb(db, listOf(
                 "composerData:c1" to composerData("c1", 1_700_000_000_000L, listOf("b1" to 1, "b2" to 1, "b3" to 2)),
@@ -347,7 +302,6 @@ class CursorSupportTest {
 
         @Test
         fun `empty-text bubble is skipped`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val db = globalDbFile(tempDir)
             createGlobalDb(db, listOf(
                 "composerData:c1" to composerData("c1", 1_700_000_000_000L, listOf("b1" to 1, "b2" to 2)),
@@ -362,7 +316,6 @@ class CursorSupportTest {
 
         @Test
         fun `missing bubble row advances index without producing entry`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val db = globalDbFile(tempDir)
             createGlobalDb(db, listOf(
                 "composerData:c1" to composerData("c1", 1_700_000_000_000L, listOf("missing" to 1, "present" to 2)),
@@ -377,7 +330,6 @@ class CursorSupportTest {
 
         @Test
         fun `malformed bubble JSON is skipped`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val db = globalDbFile(tempDir)
             createGlobalDb(db, listOf(
                 "composerData:c1" to composerData("c1", 1_700_000_000_000L, listOf("bad" to 1, "good" to 2)),
@@ -392,7 +344,6 @@ class CursorSupportTest {
 
         @Test
         fun `cursor-based incremental read skips already-processed bubbles`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val db = globalDbFile(tempDir)
             createGlobalDb(db, listOf(
                 "composerData:c1" to composerData("c1", 1_700_000_000_000L, listOf("b1" to 1, "b2" to 2, "b3" to 1)),
@@ -408,7 +359,6 @@ class CursorSupportTest {
 
         @Test
         fun `unknown bubble type is skipped`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val db = globalDbFile(tempDir)
             createGlobalDb(db, listOf(
                 "composerData:c1" to composerData("c1", 1_700_000_000_000L, listOf("b1" to 99, "b2" to 1)),
@@ -422,7 +372,6 @@ class CursorSupportTest {
 
         @Test
         fun `composer not found throws`(@TempDir tempDir: File) {
-            System.setProperty("user.home", tempDir.absolutePath)
             val db = globalDbFile(tempDir)
             createGlobalDb(db, emptyList())
 

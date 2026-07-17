@@ -400,6 +400,7 @@ object ContextRelevance {
         items: List<ContextItem>,
         config: JolliMemoryConfig,
         totalBudget: Int = TOTAL_ITEMS_CHAR_BUDGET,
+        llmCall: ((prompt: String) -> LlmClient.LlmCallResult)? = null,
     ): List<ContextRelevanceResult> {
         if (items.isEmpty()) return emptyList()
 
@@ -407,16 +408,20 @@ object ContextRelevance {
             val itemsBlock = buildItemsBlock(items, totalBudget)
             val changeBlock = buildChangeBlock(change)
             val prompt = Summarizer.buildRankContextPrompt(changeBlock, itemsBlock.block)
-            val llmResult = LlmClient.callLlm(
-                action = "rank-context",
-                params = mapOf("changeSignal" to changeBlock, "items" to itemsBlock.block),
-                apiKey = config.apiKey,
-                jolliApiKey = config.jolliApiKey,
-                model = Summarizer.resolveModelId(config.model),
-                maxTokens = RANK_MAX_TOKENS,
-                prompt = prompt,
-                aiProvider = config.aiProvider,
-            )
+            val llmResult = if (llmCall != null) {
+                llmCall(prompt)
+            } else {
+                LlmClient.callLlm(
+                    action = "rank-context",
+                    params = mapOf("changeSignal" to changeBlock, "items" to itemsBlock.block),
+                    apiKey = config.apiKey,
+                    jolliApiKey = config.jolliApiKey,
+                    model = Summarizer.resolveModelId(config.model),
+                    maxTokens = RANK_MAX_TOKENS,
+                    prompt = prompt,
+                    aiProvider = config.aiProvider,
+                )
+            }
             val parsed = parseRankContextResponse(llmResult.text ?: "")
             mergeAndRank(items, itemsBlock.indexToId, parsed)
         } catch (err: Exception) {

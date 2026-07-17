@@ -1,6 +1,7 @@
 package ai.jolli.jollimemory.hooks
 
 import ai.jolli.jollimemory.core.ClaudeHookInput
+import ai.jolli.jollimemory.core.HookEnv
 import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.core.SessionInfo
 import ai.jolli.jollimemory.core.SessionTracker
@@ -13,26 +14,34 @@ import java.time.Instant
  *
  * Invoked by Gemini CLI after each agent turn. Same as StopHook but
  * with source="gemini" and must write {} to stdout.
+ *
+ * JVM-global dependencies (stdin, stdout, env vars) arrive via [HookEnv] and
+ * the session sink via [run]'s `saveSession` parameter, so tests inject fakes
+ * instead of mutating process-wide state. Defaults are the real
+ * implementations — production callers pass a shared env or nothing.
  */
 object GeminiAfterAgentHook {
 
     private val log = JmLogger.create("GeminiAfterAgentHook")
     private val gson = Gson()
 
-    fun run() {
+    fun run(
+        env: HookEnv = HookEnv(),
+        saveSession: (SessionInfo, String) -> Unit = SessionTracker::saveSession,
+    ) {
         // Gemini hooks MUST write JSON to stdout
         try {
-            runInternal()
+            runInternal(env, saveSession)
         } finally {
-            println("{}")
+            env.stdout.println("{}")
         }
     }
 
-    private fun runInternal() {
-        val envProjectDir = System.getenv("GEMINI_PROJECT_DIR") ?: System.getenv("CLAUDE_PROJECT_DIR")
+    private fun runInternal(env: HookEnv, saveSession: (SessionInfo, String) -> Unit) {
+        val envProjectDir = env.getenv("GEMINI_PROJECT_DIR") ?: env.getenv("CLAUDE_PROJECT_DIR")
         if (envProjectDir != null) JmLogger.setLogDir(envProjectDir)
 
-        val input = try { readStdin() } catch (_: Exception) { return }
+        val input = try { env.readStdin() } catch (_: Exception) { return }
         if (input.isBlank()) return
 
         val hookInput = try {
@@ -49,7 +58,7 @@ object GeminiAfterAgentHook {
             source = TranscriptSource.gemini,
         )
 
-        SessionTracker.saveSession(sessionInfo, cwd)
+        saveSession(sessionInfo, cwd)
         log.info("Gemini session saved: %s", hookInput.session_id)
 
         // JOLLI-1954: flush the shared telemetry buffer on every agent turn end
