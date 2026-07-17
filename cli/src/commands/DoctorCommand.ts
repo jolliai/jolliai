@@ -15,6 +15,7 @@ import type { Command } from "commander";
 import { orphanBranchExists } from "../core/GitOps.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { isWorkerLockStale, releaseWorkerLock } from "../core/Locks.js";
+import { getBackend } from "../core/localagent/BackendRegistry.js";
 import { countActiveQueueEntries, getGlobalConfigDir, loadAllSessions, loadConfig } from "../core/SessionTracker.js";
 import { traverseDistPaths } from "../install/DistPathResolver.js";
 import { getStatus, install } from "../install/Installer.js";
@@ -146,6 +147,21 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 			? `credentials found — ${credentialLabel[credentialSource]}`
 			: "no credentials — summaries will not be generated",
 	});
+
+	// For local-agent the "credential" is an executable, not a stored key — so a
+	// green Config check above only means the provider is *selected*. Probe the
+	// binary here (the resolver is cheap and verifies it accepts the flags we
+	// pass) so doctor doesn't report healthy while every commit silently fails
+	// with a setup error because `claude` is missing or off the worker's PATH.
+	if (credentialSource === "local-agent") {
+		try {
+			const backend = getBackend(config.localAgentTool ?? "claude-code");
+			const exe = await backend.discoverExecutable(config.localAgentPath);
+			checks.push({ name: "Local agent CLI", status: "ok", message: `${exe.file} (v${exe.version})` });
+		} catch (err) {
+			checks.push({ name: "Local agent CLI", status: "fail", message: (err as Error).message });
+		}
+	}
 
 	// 7. dist-paths/<source> entries (per-source registry).
 	// No legacy `dist-path` probe: every `install()` migrates the legacy file

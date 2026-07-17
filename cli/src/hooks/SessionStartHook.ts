@@ -25,6 +25,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { readFileFromBranch } from "../core/GitOps.js";
 import { normalizePlansRegistry } from "../core/SessionTracker.js";
 import { getDisplayDate } from "../core/SummaryFormat.js";
@@ -53,6 +54,14 @@ interface BriefingCache {
  * Main entry point — called when this script is executed by Claude Code SessionStart hook.
  */
 export async function main(): Promise<void> {
+	// Skip when this Claude session was spawned by jollimemory's local-agent
+	// backend: generating a briefing here would re-enter jollimemory against a
+	// throwaway temp cwd (and, under local-agent, recurse into another spawn).
+	// See AgentReentry.
+	if (isLocalAgentChild()) {
+		log.info("SessionStart hook skipped — running inside a jollimemory-spawned local agent");
+		return;
+	}
 	try {
 		const input = await readStdin();
 		const { cwd } = JSON.parse(input) as { cwd?: string };

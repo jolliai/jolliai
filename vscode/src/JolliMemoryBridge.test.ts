@@ -2460,6 +2460,25 @@ describe("JolliMemoryBridge", () => {
 			expect(generateSquashMessage).not.toHaveBeenCalled();
 		});
 
+		it("uses the LLM path for the Local Agent provider without any API key", async () => {
+			// Local Agent generates through the agent tool's own login — a key-only
+			// gate would silently drop the LLM squash path. resolveLlmCredentialSource
+			// honors the choice, so generateSquashMessage must still be called.
+			loadGlobalConfig.mockResolvedValue({ aiProvider: "local-agent", model: "claude-3" });
+			// git log for hash1
+			mockExecFileSuccess("fix: local agent\n");
+			getSummary.mockResolvedValueOnce(null);
+			// rev-list --count
+			mockExecFileSuccess("1\n");
+			generateSquashMessage.mockResolvedValue("squashed via local agent");
+
+			const bridge = makeBridge();
+			const result = await bridge.generateSquashMessageWithLLM(["hash1"]);
+
+			expect(result).toBe("squashed via local agent");
+			expect(generateSquashMessage).toHaveBeenCalled();
+		});
+
 		it("uses (no message) fallback when commit message is empty", async () => {
 			// git log for hash1 returns empty message
 			mockExecFileSuccess("\n");

@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LlmCallOptions, LlmCallResult } from "./LlmClient.js";
 
 const mockCallLlm = vi.fn<(options: LlmCallOptions) => Promise<LlmCallResult>>();
-vi.mock("./LlmClient.js", () => ({
+vi.mock("./LlmClient.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("./LlmClient.js")>()),
 	callLlm: (options: LlmCallOptions) => mockCallLlm(options),
 }));
 

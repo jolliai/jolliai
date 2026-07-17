@@ -81,6 +81,21 @@ describe("ClaudeCodeBackend.parseResult", () => {
 		expect(() => backend.parseResult(json)).toThrowError(LocalAgentSetupError);
 	});
 
+	it("classifies a not-signed-in is_error envelope (no HTTP status) as an auth error", () => {
+		// print+json mode can surface a local sign-in failure as an is_error
+		// envelope without an api_error_status, so the 401/403 branch can't catch
+		// it — the phrasing heuristic must, so the user gets sign-in guidance.
+		for (const detail of ["Please run `claude` to log in", "Invalid API key", "authentication_error"]) {
+			const json = JSON.stringify({ type: "result", is_error: true, result: detail });
+			expect(() => backend.parseResult(json)).toThrowError(LocalAgentAuthError);
+		}
+	});
+
+	it("still classifies a generic statusless is_error as a setup error", () => {
+		const json = JSON.stringify({ type: "result", is_error: true, result: "some unrelated failure" });
+		expect(() => backend.parseResult(json)).toThrowError(LocalAgentSetupError);
+	});
+
 	it("handles missing fields with defaults", () => {
 		const json = JSON.stringify({ is_error: false });
 		const out = backend.parseResult(json);
@@ -175,5 +190,10 @@ describe("ClaudeCodeBackend.buildInvocation", () => {
 		} finally {
 			process.env = prev;
 		}
+	});
+
+	it("marks the child as a jollimemory-spawned agent to block hook/enable re-entry", () => {
+		const inv = backend.buildInvocation(exe, req);
+		expect(inv.env.JOLLI_LOCAL_AGENT_CHILD).toBe("1");
 	});
 });

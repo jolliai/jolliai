@@ -84,8 +84,18 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	let { enabled, summaryCount } = await getGuidedFrontDoorStatus(cwd);
 
 	// Any of these counts as "has some credential" and skips the sign-in guide.
+	// `aiProvider: "local-agent"` is self-sufficient for generation — it drives the
+	// local agent tool's own login, holding no jollimemory credential — so it must
+	// short-circuit the sign-in guide too, matching resolveLlmCredentialSource
+	// (which always honors a "local-agent" choice without a presence check).
 	const hasCredential = (): boolean =>
-		Boolean(token || config.jolliApiKey || config.apiKey || process.env.ANTHROPIC_API_KEY);
+		Boolean(
+			token ||
+				config.jolliApiKey ||
+				config.apiKey ||
+				process.env.ANTHROPIC_API_KEY ||
+				config.aiProvider === "local-agent",
+		);
 
 	// ── Auth axis: no credential at all → run the existing sign-in / config guide ──
 	if (!hasCredential()) {

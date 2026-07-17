@@ -7,7 +7,8 @@ import type { LlmCallResult } from "./LlmClient.js";
 const mockCallLlm = vi.fn<(opts: unknown) => Promise<LlmCallResult>>();
 const mockLogWarn = vi.fn();
 
-vi.mock("./LlmClient.js", () => ({
+vi.mock("./LlmClient.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("./LlmClient.js")>()),
 	callLlm: (opts: unknown) => mockCallLlm(opts),
 }));
 

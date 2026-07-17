@@ -212,6 +212,18 @@ describe("GuidedFrontDoor", () => {
 		}
 	});
 
+	it("provider=local-agent with no key/token means no promptSetup, 'local agent set', still listening", async () => {
+		// Local Agent is a self-sufficient generation path (its own login), so the
+		// front door must not nag a local-agent user to sign in or enter a key.
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({ aiProvider: "local-agent" });
+		h.loadUserProfile.mockResolvedValue({ signInPromptDeclined: true }); // suppress the sync nudge
+		await runGuidedFrontDoor();
+		expect(h.promptSetup).not.toHaveBeenCalled();
+		expect(out()).toContain("local agent set (not signed in to Jolli)");
+		expect(out()).toContain("Jolli is listening");
+	});
+
 	it("both keys, not signed in, provider=anthropic → Anthropic label, no nudge", async () => {
 		// The status-line label follows credSource (the key that would actually be
 		// used), so it names Anthropic even though a jolliApiKey is also present;

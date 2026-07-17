@@ -209,6 +209,16 @@ describe("StopHook", () => {
 		process.env = originalEnv;
 	});
 
+	it("should no-op when spawned by the local-agent backend (re-entry guard)", async () => {
+		process.env.JOLLI_LOCAL_AGENT_CHILD = "1";
+		mockStdin(JSON.stringify({ session_id: "s", transcript_path: "/t", cwd: "/my/project" }));
+
+		await handleStopHook();
+
+		// Bails before parsing stdin / recording anything — no self-recursion.
+		expect(saveSession).not.toHaveBeenCalled();
+	});
+
 	it("should save session info from valid stdin using cwd", async () => {
 		const hookData = {
 			session_id: "test-session-123",

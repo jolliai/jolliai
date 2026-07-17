@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("./LlmClient.js", () => ({ callLlm: vi.fn() }));
+vi.mock("./LlmClient.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("./LlmClient.js")>()),
+	callLlm: vi.fn(),
+}));
 vi.mock("./SourceTimeline.js", async (orig) => ({
 	...(await orig<typeof import("./SourceTimeline.js")>()),
 	listPendingSources: vi.fn(),

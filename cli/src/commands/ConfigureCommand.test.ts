@@ -125,12 +125,41 @@ describe("ConfigureCommand — settable keys", () => {
 		expect((await loadConfig()).localFolder).toBe("/tmp/jolli-memory-bank");
 	});
 
-	it("accepts aiProvider with the two allowed values", async () => {
+	it("accepts aiProvider with the three allowed values", async () => {
 		await runConfigure(["--set", "aiProvider=anthropic"]);
 		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ aiProvider: "anthropic" }));
 
 		await runConfigure(["--set", "aiProvider=jolli"]);
 		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ aiProvider: "jolli" }));
+
+		// local-agent must be settable from the CLI — without it, opting into the
+		// Local Agent provider required hand-editing config.json.
+		await runConfigure(["--set", "aiProvider=local-agent"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ aiProvider: "local-agent" }));
+	});
+
+	it("accepts localAgentTool and localAgentPath for the Local Agent provider", async () => {
+		await runConfigure(["--set", "localAgentTool=claude-code"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ localAgentTool: "claude-code" }));
+
+		await runConfigure(["--set", "localAgentPath=/usr/local/bin/claude"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(
+			expect.objectContaining({ localAgentPath: "/usr/local/bin/claude" }),
+		);
+	});
+
+	it("rejects localAgentTool values that aren't in the allowlist", async () => {
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const prevExitCode = process.exitCode;
+		try {
+			await runConfigure(["--set", "localAgentTool=codex"]);
+			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("claude-code"));
+			expect(process.exitCode).toBe(1);
+			expect(mockSaveConfig).not.toHaveBeenCalled();
+		} finally {
+			errorSpy.mockRestore();
+			process.exitCode = prevExitCode;
+		}
 	});
 
 	it("rejects aiProvider values that aren't in the allowlist", async () => {

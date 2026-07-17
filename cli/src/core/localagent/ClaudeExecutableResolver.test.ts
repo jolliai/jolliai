@@ -196,7 +196,7 @@ describe("resolveClaudeExecutable", () => {
 				return "2.1.210\n";
 			});
 
-			const out = resolveClaudeExecutable({ now: () => 1000 });
+			const out = resolveClaudeExecutable({ platform: "linux", now: () => 1000 });
 
 			expect(out).toEqual({ file: "/usr/local/bin/claude", version: "2.1.210" });
 		});
@@ -207,7 +207,7 @@ describe("resolveClaudeExecutable", () => {
 				return "2.1.210\n";
 			});
 
-			resolveClaudeExecutable({ now: () => 1000 });
+			resolveClaudeExecutable({ platform: "linux", now: () => 1000 });
 
 			const probeCalls = mockedExecFileSync.mock.calls.filter((c) => c[0] !== "which");
 			expect(probeCalls).toHaveLength(1);
@@ -221,7 +221,7 @@ describe("resolveClaudeExecutable", () => {
 			});
 			mockedExistsSync.mockImplementation((p: unknown) => p === knownPath);
 
-			const out = resolveClaudeExecutable({ now: () => 1000 });
+			const out = resolveClaudeExecutable({ platform: "linux", now: () => 1000 });
 
 			expect(out.file).toBe(knownPath);
 		});
@@ -232,7 +232,9 @@ describe("resolveClaudeExecutable", () => {
 				throw new Error("unknown option --permission-mode");
 			});
 
-			expect(() => resolveClaudeExecutable({ now: () => 1000 })).toThrowError(LocalAgentSetupError);
+			expect(() => resolveClaudeExecutable({ platform: "linux", now: () => 1000 })).toThrowError(
+				LocalAgentSetupError,
+			);
 		});
 
 		it("classifies an empty probe stdout as incompatible", () => {
@@ -241,7 +243,67 @@ describe("resolveClaudeExecutable", () => {
 				return "";
 			});
 
-			expect(() => resolveClaudeExecutable({ now: () => 1000 })).toThrowError(LocalAgentSetupError);
+			expect(() => resolveClaudeExecutable({ platform: "linux", now: () => 1000 })).toThrowError(
+				LocalAgentSetupError,
+			);
+		});
+	});
+
+	describe("windows discovery (platform injected, Subprocess and fs mocked)", () => {
+		const mockedExecFileSync = vi.mocked(execFileSyncHidden);
+		const mockedExistsSync = vi.mocked(existsSync);
+
+		beforeEach(() => {
+			__resetResolverCacheForTest();
+			mockedExecFileSync.mockReset();
+			mockedExistsSync.mockReset();
+			mockedExistsSync.mockReturnValue(false);
+		});
+
+		afterEach(() => {
+			vi.restoreAllMocks();
+		});
+
+		it("discovers claude.exe via `where` and never probes a .cmd shim", () => {
+			const exe = "C:\\Program Files\\claude\\claude.exe";
+			mockedExecFileSync.mockImplementation((file: unknown) => {
+				// `where` (win32), NOT `which`; CRLF output with a .cmd shim mixed in.
+				if (file === "where") return `${exe}\r\nC:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd\r\n`;
+				return "2.1.210\n";
+			});
+
+			const out = resolveClaudeExecutable({ platform: "win32", now: () => 1000 });
+
+			expect(out).toEqual({ file: exe, version: "2.1.210" });
+			// The .cmd shim is filtered before probing — only the .exe is executed.
+			const probed = mockedExecFileSync.mock.calls.filter((c) => c[0] !== "where").map((c) => c[0]);
+			expect(probed).toEqual([exe]);
+		});
+
+		it("falls back to a known .exe install location when `where` finds nothing", () => {
+			const knownExe = join(homedir(), ".local", "bin", "claude.exe");
+			mockedExecFileSync.mockImplementation((file: unknown) => {
+				if (file === "where") throw new Error("INFO: Could not find files for the given pattern(s).");
+				return "2.1.210\n";
+			});
+			mockedExistsSync.mockImplementation((p: unknown) => p === knownExe);
+
+			const out = resolveClaudeExecutable({ platform: "win32", now: () => 1000 });
+
+			expect(out.file).toBe(knownExe);
+		});
+
+		it("yields no candidate (setup error) when only a .cmd shim is on PATH", () => {
+			mockedExecFileSync.mockImplementation((file: unknown) => {
+				if (file === "where") return "C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd\r\n";
+				return "2.1.210\n";
+			});
+
+			expect(() => resolveClaudeExecutable({ platform: "win32", now: () => 1000 })).toThrowError(
+				LocalAgentSetupError,
+			);
+			// Proves the win32 branch ran (`where`, not `which`) and filtered the .cmd out.
+			expect(mockedExecFileSync.mock.calls.some((c) => c[0] === "where")).toBe(true);
 		});
 	});
 });

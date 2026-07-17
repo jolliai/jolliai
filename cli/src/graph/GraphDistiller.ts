@@ -13,7 +13,7 @@
  */
 
 import { mapWithConcurrency } from "../core/Concurrency.js";
-import { callLlm } from "../core/LlmClient.js";
+import { callLlm, llmCredentials, llmFanoutLimit } from "../core/LlmClient.js";
 import { resolveModelId } from "../core/Summarizer.js";
 import { createLogger } from "../Logger.js";
 import type { LlmConfig } from "../Types.js";
@@ -150,9 +150,7 @@ async function distillCategories(
 		model: resolveModelId(config.model),
 		maxTokens: CATEGORIES_MAX_TOKENS,
 		forceStreaming: true,
-		apiKey: config.apiKey,
-		jolliApiKey: config.jolliApiKey,
-		aiProvider: config.aiProvider,
+		...llmCredentials(config),
 	});
 	const parsed = parseJsonObject<CategoriesResponse>(result.text);
 
@@ -238,9 +236,7 @@ async function distillUnitsForTopic(
 		params: { topicTitle: topic.title, content: topic.content || "(empty)" },
 		model: resolveModelId(config.model),
 		maxTokens: UNITS_MAX_TOKENS,
-		apiKey: config.apiKey,
-		jolliApiKey: config.jolliApiKey,
-		aiProvider: config.aiProvider,
+		...llmCredentials(config),
 	});
 	const parsed = parseJsonObject<UnitsResponse>(result.text);
 	// Strict (incremental): require an actual `units` ARRAY, not merely parseable JSON.
@@ -299,9 +295,7 @@ async function distillEdges(
 		model: resolveModelId(config.model),
 		maxTokens: EDGES_MAX_TOKENS,
 		forceStreaming: true,
-		apiKey: config.apiKey,
-		jolliApiKey: config.jolliApiKey,
-		aiProvider: config.aiProvider,
+		...llmCredentials(config),
 	});
 	const truncated = result.stopReason === "max_tokens";
 	const parsed = parseJsonObject<EdgesResponse>(result.text);
@@ -373,7 +367,7 @@ export async function distillGraph(
 	reportUnits();
 	const perTopicUnits = await mapWithConcurrency(
 		input.topics,
-		UNITS_CONCURRENCY,
+		llmFanoutLimit(UNITS_CONCURRENCY, config),
 		async (topic) => {
 			const result = await distillUnitsForTopic(topic, config);
 			unitsDone++;
@@ -442,9 +436,7 @@ async function distillCategoriesDelta(
 		model: resolveModelId(config.model),
 		maxTokens: CATEGORIES_MAX_TOKENS,
 		forceStreaming: true,
-		apiKey: config.apiKey,
-		jolliApiKey: config.jolliApiKey,
-		aiProvider: config.aiProvider,
+		...llmCredentials(config),
 	});
 	const parsed = parseJsonObject<DeltaCategoriesResponse>(result.text);
 	// Incremental fails closed: require BOTH arrays the prompt contracts for
@@ -526,12 +518,16 @@ export async function distillGraphIncremental(
 		// good graph. Swallowing to `[]` would emit a topic with zero units over a
 		// baseline that had them — data loss, not degradation. (The full path
 		// deliberately tolerates this: it has no prior graph to protect.)
-		const perTopic = await mapWithConcurrency(changedTopics, UNITS_CONCURRENCY, async (topic) => {
-			const r = await distillUnitsForTopic(topic, config, { strict: true });
-			done++;
-			report();
-			return r;
-		});
+		const perTopic = await mapWithConcurrency(
+			changedTopics,
+			llmFanoutLimit(UNITS_CONCURRENCY, config),
+			async (topic) => {
+				const r = await distillUnitsForTopic(topic, config, { strict: true });
+				done++;
+				report();
+				return r;
+			},
+		);
 		newUnits = perTopic.flat();
 	}
 	const units = [...reusedUnits, ...newUnits];

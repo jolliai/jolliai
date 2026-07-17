@@ -243,6 +243,44 @@ export function resolveLlmCredentialSource(
 	return null;
 }
 
+/** The credential-carrying fields callLlm needs to select and drive a provider. */
+type LlmCredentialFields = Pick<
+	LlmCredentials,
+	"apiKey" | "jolliApiKey" | "aiProvider" | "localAgentTool" | "localAgentPath"
+>;
+
+/**
+ * Extracts the credential-carrying subset of an `LlmConfig` for spreading into a
+ * `callLlm({ ... })` options object. Every call site used to hand-copy
+ * apiKey/jolliApiKey/aiProvider, which silently dropped the local-agent fields
+ * (`localAgentTool` / `localAgentPath`) everywhere — a configured binary-path
+ * override never reached the runner. Centralizing the field list here means a
+ * new credential dimension is threaded to all call sites by editing one place.
+ * Keep `model` out — call sites resolve it via `resolveModelId` themselves.
+ */
+export function llmCredentials(config: LlmCredentialFields): LlmCredentialFields {
+	return {
+		apiKey: config.apiKey,
+		jolliApiKey: config.jolliApiKey,
+		aiProvider: config.aiProvider,
+		localAgentTool: config.localAgentTool,
+		localAgentPath: config.localAgentPath,
+	};
+}
+
+/**
+ * Effective parallelism for an LLM fan-out under the active provider. The
+ * API/proxy paths keep the caller's `baseLimit`, but each local-agent call
+ * spawns a full CLI agent turn (a real `claude` process, multi-minute, ~9k
+ * tokens of built-in system prompt each), so fanning out N-wide would launch N
+ * concurrent processes and reliably trip the subscription's rate limit or bury
+ * the machine. Serialize to 1 under local-agent — slower, but the only sane
+ * shape for spawning real agent CLIs.
+ */
+export function llmFanoutLimit(baseLimit: number, config: Pick<LlmCredentials, "aiProvider">): number {
+	return config.aiProvider === "local-agent" ? 1 : baseLimit;
+}
+
 /** Options for making an LLM call */
 export interface LlmCallOptions extends LlmCredentials {
 	/** Template key (e.g. "summarize", "commit-message") */
@@ -429,6 +467,20 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 	try {
 		const stdout = await run(invocation, { timeoutMs: options.timeoutMs });
 		const outcome = backend.parseResult(stdout);
+
+		// Surface the subscription cost the backend parsed. `LlmCallResult` has no
+		// cost field (no provider carries one), so without this the value would be
+		// dead — and local-agent spend is otherwise invisible, since it bills the
+		// tool's own subscription rather than a jollimemory-metered key.
+		log.info(
+			"Local-agent completion: action=%s model=%s cost=$%s in=%d out=%d cached=%d",
+			options.action,
+			model,
+			outcome.costUsd.toFixed(4),
+			outcome.inputTokens,
+			outcome.outputTokens,
+			outcome.cachedTokens,
+		);
 
 		return {
 			text: outcome.text,

@@ -28,6 +28,7 @@
 import { existsSync } from "node:fs";
 import { resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { scanPlansFrom } from "../core/plans/TranscriptPlanDiscovery.js";
 import { scanReferencesFrom } from "../core/references/TranscriptReferenceDiscovery.js";
 import {
@@ -49,6 +50,13 @@ const log = createLogger("StopHook");
  * Reads stdin, parses the hook payload, and saves session info.
  */
 export async function handleStopHook(): Promise<void> {
+	// Skip when this Claude session was itself spawned by jollimemory's
+	// local-agent backend — recording a session for its throwaway temp cwd is
+	// pure self-recursion noise. See AgentReentry.
+	if (isLocalAgentChild()) {
+		log.info("Stop hook skipped — running inside a jollimemory-spawned local agent");
+		return;
+	}
 	const envProjectDir = process.env.CLAUDE_PROJECT_DIR;
 
 	// Set log directory early from env var (available before stdin parsing)

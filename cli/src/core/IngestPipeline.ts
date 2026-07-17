@@ -11,7 +11,7 @@ import type { IngestOperation, LlmConfig } from "../Types.js";
 import { mapWithConcurrency } from "./Concurrency.js";
 import { INGEST_CODES, type IngestCode } from "./IngestErrors.js";
 import { appendIngestRun } from "./IngestRunStore.js";
-import { callLlm } from "./LlmClient.js";
+import { callLlm, llmCredentials, llmFanoutLimit } from "./LlmClient.js";
 import { addProcessed, readProcessedSet, saveProcessedSet } from "./ProcessedSourceStore.js";
 import { createReadStorage } from "./ReadStorageResolver.js";
 import { parseReconciledPage } from "./ReconciledPage.js";
@@ -101,9 +101,7 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 		model: resolveModelId(config.model),
 		maxTokens: ROUTE_MAX_TOKENS,
 		forceStreaming: true,
-		apiKey: config.apiKey,
-		jolliApiKey: config.jolliApiKey,
-		aiProvider: config.aiProvider,
+		...llmCredentials(config),
 	});
 	const plan = parseRoutePlan(routeResult.text ?? "", routeResult.stopReason, batch);
 	if (plan.error) {
@@ -136,7 +134,7 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 	const assignments = [...plan.assignments];
 	const outcomes = await mapWithConcurrency<[string, (typeof assignments)[number][1]], ReconcileOutcome>(
 		assignments,
-		RECONCILE_CONCURRENCY,
+		llmFanoutLimit(RECONCILE_CONCURRENCY, config),
 		async ([slug, assignment]) => {
 			const current = assignment.isNew ? null : await readTopicPage(slug, cwd, readStorage);
 			const title = current?.title ?? assignment.title ?? slug;
@@ -165,9 +163,7 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 				},
 				model: resolveModelId(config.model),
 				maxTokens: RECONCILE_MAX_TOKENS,
-				apiKey: config.apiKey,
-				jolliApiKey: config.jolliApiKey,
-				aiProvider: config.aiProvider,
+				...llmCredentials(config),
 			});
 			if (result.stopReason === "max_tokens") {
 				log.error("Reconcile truncated for topic %s -- keeping old page, holding sources", slug);

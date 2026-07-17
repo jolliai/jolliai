@@ -20,7 +20,14 @@ const log = createLogger("ConfigureCommand");
 const VALID_LOG_LEVELS: ReadonlyArray<LogLevel> = ["debug", "info", "warn", "error"];
 
 /** Valid values for the `aiProvider` config key. */
-const VALID_AI_PROVIDERS: ReadonlyArray<NonNullable<JolliMemoryConfig["aiProvider"]>> = ["anthropic", "jolli"];
+const VALID_AI_PROVIDERS: ReadonlyArray<NonNullable<JolliMemoryConfig["aiProvider"]>> = [
+	"anthropic",
+	"jolli",
+	"local-agent",
+];
+
+/** Valid values for the `localAgentTool` config key (v1 supports only Claude Code). */
+const VALID_LOCAL_AGENT_TOOLS: ReadonlyArray<NonNullable<JolliMemoryConfig["localAgentTool"]>> = ["claude-code"];
 
 /** Valid values for the `globalInstructions` config key. */
 const VALID_GLOBAL_INSTRUCTIONS: ReadonlyArray<NonNullable<JolliMemoryConfig["globalInstructions"]>> = [
@@ -59,6 +66,8 @@ const VALID_CONFIG_KEYS = [
 	"syncTranscripts",
 	"syncPollIntervalSec",
 	"syncOnPush",
+	"localAgentTool",
+	"localAgentPath",
 	"slack.workspaceUrl",
 ] as const satisfies ReadonlyArray<keyof JolliMemoryConfig | "slack.workspaceUrl">;
 
@@ -145,6 +154,12 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		}
 		return raw;
 	}
+	if (key === "localAgentTool") {
+		if (!(VALID_LOCAL_AGENT_TOOLS as ReadonlyArray<string>).includes(raw)) {
+			throw new Error(`${key} must be one of: ${VALID_LOCAL_AGENT_TOOLS.join(", ")} (got: ${raw})`);
+		}
+		return raw;
+	}
 	if (key === "globalInstructions") {
 		if (!(VALID_GLOBAL_INSTRUCTIONS as ReadonlyArray<string>).includes(raw)) {
 			throw new Error(`${key} must be one of: ${VALID_GLOBAL_INSTRUCTIONS.join(", ")} (got: ${raw})`);
@@ -175,7 +190,7 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		// reconstruction can't produce a double slash from a trailing-slash input.
 		return parsed.origin;
 	}
-	// String fields (apiKey, model, jolliApiKey, authToken, localFolder)
+	// String fields (apiKey, model, jolliApiKey, authToken, localFolder, localAgentPath)
 	return raw;
 }
 
@@ -219,7 +234,17 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 	{
 		key: "aiProvider",
 		type: "enum",
-		description: "AI summary provider: anthropic | jolli (auto-set on `jolli auth login`)",
+		description: "AI summary provider: anthropic | jolli | local-agent (auto-set on `jolli auth login`)",
+	},
+	{
+		key: "localAgentTool",
+		type: "enum",
+		description: "Local agent CLI to drive when aiProvider=local-agent: claude-code (v1)",
+	},
+	{
+		key: "localAgentPath",
+		type: "string",
+		description: "Explicit path to the local agent binary, overriding PATH discovery",
 	},
 	{
 		key: "globalInstructions",

@@ -2,7 +2,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LlmConfig } from "../Types.js";
 import type { LlmCallResult } from "./LlmClient.js";
 
-vi.mock("./LlmClient.js", () => ({ callLlm: vi.fn() }));
+vi.mock("./LlmClient.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("./LlmClient.js")>()),
+	callLlm: vi.fn(),
+}));
 vi.mock("./GitOps.js", () => ({ execGit: vi.fn(), getDiffContent: vi.fn() }));
 vi.mock("node:fs/promises", () => ({ readFile: vi.fn() }));
 
@@ -237,6 +240,20 @@ describe("rankContextRelevance", () => {
 		// (which the live overlay would render as a green High chip on all items).
 		expect(res.every((r) => r.tier === "mid")).toBe(true);
 		expect(res.map((r) => r.id)).toEqual(["p1", "n1"]);
+	});
+
+	it("skips the LLM entirely under local-agent (keeps all, no spawn)", async () => {
+		mockCallLlm.mockRejectedValue(new Error("should not be called"));
+		const localAgentConfig = { aiProvider: "local-agent" } as LlmConfig;
+		const items = [item("plan", "p1", "A", "aa"), item("note", "n1", "B", "bb")];
+		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
+			config: localAgentConfig,
+		});
+		// A cold multi-minute CLI agent can't finish inside RANK_TIMEOUT_MS; skip
+		// straight to the conservative keep-all without cold-spawning `claude`.
+		expect(mockCallLlm).not.toHaveBeenCalled();
+		expect(res).toHaveLength(2);
+		expect(res.every((r) => r.relevant && r.tier === "mid" && !r.autoExclude)).toBe(true);
 	});
 });
 
