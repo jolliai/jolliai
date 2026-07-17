@@ -1102,13 +1102,24 @@ fresh across the wait.
    "$HOME/.jolli/jollimemory/run-cli" docs publish --json
    \`\`\`
 
-   Read \`prNumber\` and \`prUrl\` from its JSON output.
+   \`--json\` prints exactly one JSON object on stdout (all human-readable progress
+   goes to stderr) — parse that object; never scrape the human log for a PR number.
 2. Call \`complete_local_run\` (on Claude Code
-   \`mcp__jollimemory__complete_local_run\`) with
-   \`{ "runId": "<runId>", "prNumber": <prNumber>, "prUrl": "<prUrl>" }\`.
-3. Read \`autoMerges\` from its result and tell the user which happened: **"PR
-   auto-merged"** (\`autoMerges: true\`) or **"PR left open for team review"**
-   (\`autoMerges: false\`).
+   \`mcp__jollimemory__complete_local_run\`), branching on what the publish JSON
+   contained:
+   - **PR refs present** (the JSON has a \`prNumber\` — a user-accessible
+     destination): pass them through —
+     \`{ "runId": "<runId>", "prNumber": <prNumber>, "prUrl": "<prUrl>" }\`.
+   - **PR refs withheld** (the JSON is \`"private": true\` with no \`prNumber\` — a
+     private Jolli-managed destination whose backing repo the user cannot access):
+     complete WITHOUT a PR reference — \`{ "runId": "<runId>" }\`. Do not invent,
+     guess, or look up a \`prNumber\`; the run already knows its destination is private.
+   - **Nothing published** (\`"pushed": false\`, e.g. \`"reason": "no-changes"\`): no PR
+     was opened, so there is nothing to complete — tell the user the workflow produced
+     no changes and release the run with \`abandon_local_run\` (Step 7).
+3. Read \`willAutoMerge\` from \`complete_local_run\`'s result and tell the user which
+   happened: **"PR auto-merged"** (\`willAutoMerge: true\`) or **"PR left open for team
+   review"** (\`willAutoMerge: false\`).
 
 ## Step 7 — on cancel: abandon
 
@@ -1150,7 +1161,7 @@ npm i -g @jolli.ai/cli @jolli.ai/space-cli
 export function buildJolliMenuSkillTemplate(): string {
 	return `---
 name: jolli
-description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, pr, local-run) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
+description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, pr, run a workflow local or remote) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
   revision: 1
@@ -1179,9 +1190,18 @@ Assemble ONE combined list of actions from two sources.
   (decisions, topics, files). Route by invoking the \`jolli-search\` skill.
 - **jolli-pr** — Create or update a pull request using a Jolli Memory-generated
   description. Route by invoking the \`jolli-pr\` skill.
-- **jolli-local-run** — Run a Jolli workflow locally (your agent executes the
-  recipe; the writes land in a git-backed Space via a branch + PR). Route by
-  invoking the \`jolli-local-run\` skill.
+- **Run a workflow** — Run a Jolli workflow. When the user picks this, ask them
+  **local vs remote**, defaulting to **local**:
+  - **local (default)** — your agent executes the workflow's recipe on this
+    machine (no Jolli LLM budget); the writes land in a git-backed Space via a
+    branch + PR. Route by invoking the \`jolli-local-run\` skill.
+  - **remote** — the Jolli backend executes the workflow server-side. Route by
+    calling the \`run_remote_workflow\` MCP tool
+    (\`mcp__jollimemory__run_remote_workflow\`).
+
+  A running **remote** run can be canceled with the \`cancel_remote_workflow\` MCP
+  tool (\`mcp__jollimemory__cancel_remote_workflow\`) — offer this if the user
+  wants to stop an in-flight remote run.
 
 Route a local choice by invoking that skill through your host's skill-invocation
 mechanism (for example, the Skill tool in Claude Code).
@@ -1190,14 +1210,21 @@ mechanism (for example, the Skill tool in Claude Code).
 
 Surface every tool whose name starts with \`mcp__jollimemory__\` that is available
 in the current session — for example \`recall\`, \`search\`, \`get_pr_description\`,
-\`queue_status\`, and any manifest-driven platform tools (workflow, space, article,
-and the like). Route a choice by calling the matching \`mcp__jollimemory__*\` tool.
+\`queue_status\`, and any manifest-driven platform tools (space, article, and the
+like). Route a choice by calling the matching \`mcp__jollimemory__*\` tool.
+
+**Exclusions — do NOT surface these as standalone menu items:**
+
+- \`list_workflow_definitions\` — discovery/plumbing, not a human quick-action.
+- \`run_remote_workflow\` and \`cancel_remote_workflow\` — these are already covered
+  by the **Run a workflow** action above (its *remote* path and its cancellation
+  option); don't list them again as raw tools.
 
 Do NOT assume a fixed list — enumerate the Jolli MCP tools that are actually
-registered right now. Do NOT try to fetch or re-derive any backend "menu"
-curation; a skill cannot read the manifest, so simply surface the Jolli MCP tools
-present in the session. If no Jolli MCP tools are registered, present just the
-local skills above.
+registered right now, minus the exclusions above. Do NOT try to fetch or
+re-derive any backend "menu" curation; a skill cannot read the manifest, so
+simply surface the Jolli MCP tools present in the session. If no Jolli MCP tools
+are registered, present just the local skills above.
 
 ## Step 2 — route the request
 
