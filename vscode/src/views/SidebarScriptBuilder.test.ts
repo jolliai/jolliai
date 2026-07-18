@@ -166,11 +166,12 @@ describe("SidebarScriptBuilder", () => {
 	it("defines a per-source brand-icon map covering every provider", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("var SOURCE_ICON_SVG = {");
-		for (const src of ["claude", "codex", "gemini", "cursor", "copilot", "opencode"]) {
+		for (const src of ["claude", "codex", "gemini", "cursor", "copilot", "opencode", "cline"]) {
 			expect(js).toContain(`${src}:`);
 		}
-		// copilot-chat reuses the Copilot mark.
+		// copilot-chat reuses the Copilot mark; cline-cli reuses the Cline mark.
 		expect(js).toContain("SOURCE_ICON_SVG['copilot-chat'] = SOURCE_ICON_SVG.copilot");
+		expect(js).toContain("SOURCE_ICON_SVG['cline-cli'] = SOURCE_ICON_SVG.cline");
 		// Parsed as a trusted constant via DOMParser, not innerHTML.
 		expect(js).toContain("new DOMParser().parseFromString(markup, 'image/svg+xml')");
 		expect(js).not.toContain(".innerHTML = markup");

@@ -12,6 +12,8 @@ describe("transcriptSourceLabel", () => {
 		expect(transcriptSourceLabel("copilot-chat")).toBe("Copilot Chat");
 		expect(transcriptSourceLabel("gemini")).toBe("Gemini");
 		expect(transcriptSourceLabel("opencode")).toBe("OpenCode");
+		expect(transcriptSourceLabel("cline")).toBe("Cline (VS Code)");
+		expect(transcriptSourceLabel("cline-cli")).toBe("Cline CLI");
 	});
 
 	it("falls back to 'Claude' for unknown sources (matches the current webview behavior)", () => {

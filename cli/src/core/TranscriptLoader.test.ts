@@ -17,7 +17,15 @@ vi.mock("./CursorTranscriptReader.js", () => ({
 vi.mock("./CopilotTranscriptReader.js", () => ({
 	readCopilotTranscript: vi.fn(),
 }));
+vi.mock("./ClineTranscriptReader.js", () => ({
+	readClineTranscript: vi.fn(),
+}));
+vi.mock("./ClineCliTranscriptReader.js", () => ({
+	readClineCliTranscript: vi.fn(),
+}));
 
+import { readClineCliTranscript } from "./ClineCliTranscriptReader.js";
+import { readClineTranscript } from "./ClineTranscriptReader.js";
 import { readCopilotTranscript } from "./CopilotTranscriptReader.js";
 import { readCursorTranscript } from "./CursorTranscriptReader.js";
 import { readOpenCodeTranscript } from "./OpenCodeTranscriptReader.js";
@@ -30,6 +38,8 @@ describe("loadTranscript", () => {
 		vi.mocked(readOpenCodeTranscript).mockReset();
 		vi.mocked(readCursorTranscript).mockReset();
 		vi.mocked(readCopilotTranscript).mockReset();
+		vi.mocked(readClineTranscript).mockReset();
+		vi.mocked(readClineCliTranscript).mockReset();
 	});
 	afterEach(() => {
 		rmSync(dir, { recursive: true, force: true });
@@ -186,6 +196,36 @@ describe("loadTranscript", () => {
 		expect(result).toEqual([{ role: "assistant", content: "copilot reply" }]);
 	});
 
+	it("dispatches cline source to readClineTranscript with the synthetic path", async () => {
+		vi.mocked(readClineTranscript).mockResolvedValueOnce({
+			entries: [{ role: "human", content: "cline hi" }],
+			newCursor: {
+				transcriptPath: "/cline/task-1/ui_messages.json",
+				lineNumber: 1,
+				updatedAt: "2026-05-17T00:00:00Z",
+			},
+			totalLinesRead: 1,
+		});
+		const result = await loadTranscript({ source: "cline", transcriptPath: "/cline/task-1/ui_messages.json" });
+		expect(readClineTranscript).toHaveBeenCalledWith("/cline/task-1/ui_messages.json");
+		expect(result).toEqual([{ role: "human", content: "cline hi" }]);
+	});
+
+	it("dispatches cline-cli source to readClineCliTranscript with the synthetic path", async () => {
+		vi.mocked(readClineCliTranscript).mockResolvedValueOnce({
+			entries: [{ role: "assistant", content: "cline-cli reply" }],
+			newCursor: {
+				transcriptPath: "/cline-cli/session-1.json",
+				lineNumber: 1,
+				updatedAt: "2026-05-17T00:00:00Z",
+			},
+			totalLinesRead: 1,
+		});
+		const result = await loadTranscript({ source: "cline-cli", transcriptPath: "/cline-cli/session-1.json" });
+		expect(readClineCliTranscript).toHaveBeenCalledWith("/cline-cli/session-1.json");
+		expect(result).toEqual([{ role: "assistant", content: "cline-cli reply" }]);
+	});
+
 	// Each sqlite-backed reader's catch branch — proves loader errors degrade
 	// to "" instead of bubbling out to the panel.
 	it("returns [] when readOpenCodeTranscript throws", async () => {
@@ -203,6 +243,18 @@ describe("loadTranscript", () => {
 	it("returns [] when readCopilotTranscript throws", async () => {
 		vi.mocked(readCopilotTranscript).mockRejectedValueOnce(new Error("schema drift"));
 		const result = await loadTranscript({ source: "copilot", transcriptPath: "/session-store.db#x" });
+		expect(result).toEqual([]);
+	});
+
+	it("returns [] when readClineTranscript throws", async () => {
+		vi.mocked(readClineTranscript).mockRejectedValueOnce(new Error("parse error"));
+		const result = await loadTranscript({ source: "cline", transcriptPath: "/cline/task-x/ui_messages.json" });
+		expect(result).toEqual([]);
+	});
+
+	it("returns [] when readClineCliTranscript throws", async () => {
+		vi.mocked(readClineCliTranscript).mockRejectedValueOnce(new Error("parse error"));
+		const result = await loadTranscript({ source: "cline-cli", transcriptPath: "/cline-cli/session-x.json" });
 		expect(result).toEqual([]);
 	});
 
@@ -232,6 +284,18 @@ describe("loadTranscript", () => {
 	it("returns [] silently when readCopilotTranscript throws ENOENT (no warn branch)", async () => {
 		vi.mocked(readCopilotTranscript).mockRejectedValueOnce(enoent("/missing.db"));
 		const result = await loadTranscript({ source: "copilot", transcriptPath: "/missing.db#x" });
+		expect(result).toEqual([]);
+	});
+
+	it("returns [] silently when readClineTranscript throws ENOENT (no warn branch)", async () => {
+		vi.mocked(readClineTranscript).mockRejectedValueOnce(enoent("/missing/ui_messages.json"));
+		const result = await loadTranscript({ source: "cline", transcriptPath: "/missing/ui_messages.json" });
+		expect(result).toEqual([]);
+	});
+
+	it("returns [] silently when readClineCliTranscript throws ENOENT (no warn branch)", async () => {
+		vi.mocked(readClineCliTranscript).mockRejectedValueOnce(enoent("/missing/session-x.json"));
+		const result = await loadTranscript({ source: "cline-cli", transcriptPath: "/missing/session-x.json" });
 		expect(result).toEqual([]);
 	});
 

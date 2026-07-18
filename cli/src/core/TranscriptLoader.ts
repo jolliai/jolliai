@@ -85,6 +85,25 @@ export async function loadTranscript(opts: LoadOptions): Promise<TranscriptEntry
 			return [];
 		}
 	}
+	if (opts.source === "cline") {
+		try {
+			const { readClineTranscript } = await import("./ClineTranscriptReader.js");
+			return [...(await readClineTranscript(opts.transcriptPath)).entries];
+		} catch (err) {
+			if (!isEnoent(err)) log.warn("loadTranscript (cline) failed for %s: %s", opts.transcriptPath, errMsg(err));
+			return [];
+		}
+	}
+	if (opts.source === "cline-cli") {
+		try {
+			const { readClineCliTranscript } = await import("./ClineCliTranscriptReader.js");
+			return [...(await readClineCliTranscript(opts.transcriptPath)).entries];
+		} catch (err) {
+			if (!isEnoent(err))
+				log.warn("loadTranscript (cline-cli) failed for %s: %s", opts.transcriptPath, errMsg(err));
+			return [];
+		}
+	}
 	const entries: TranscriptEntry[] = [];
 	let parseSkipped = 0;
 	try {
@@ -130,11 +149,12 @@ export async function loadTranscript(opts: LoadOptions): Promise<TranscriptEntry
 
 /**
  * Per-line JSONL parsers. Sources that own a dedicated single-artifact
- * reader (`gemini` JSON file; `opencode` / `cursor` / `copilot` SQLite DBs)
- * are intentionally absent — those are dispatched at the top of
- * `loadTranscript` before this table is consulted.
+ * reader (`gemini` JSON file; `opencode` / `cursor` / `copilot` SQLite DBs;
+ * `cline` / `cline-cli` plain-JSON files) are intentionally absent — those
+ * are dispatched at the top of `loadTranscript` before this table is
+ * consulted.
  */
-type JsonlSource = Exclude<TranscriptSource, "gemini" | "opencode" | "cursor" | "copilot">;
+type JsonlSource = Exclude<TranscriptSource, "gemini" | "opencode" | "cursor" | "copilot" | "cline" | "cline-cli">;
 const PARSERS: Record<JsonlSource, (line: string) => TranscriptEntry | undefined> = {
 	claude: parseClaude,
 	codex: parseCodex,

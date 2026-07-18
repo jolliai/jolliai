@@ -199,6 +199,43 @@ vi.mock("../core/CopilotDetector.js", () => ({
 	getCopilotDbPath: vi.fn().mockReturnValue("/mock/.copilot/session-store.db"),
 }));
 
+// Cline detectors are wired into loadSessionTranscripts; neutralize them so the
+// hook tests stay hermetic (otherwise they do real fs I/O against the dev machine
+// under fake timers and hang). Mirrors the Copilot mocks above.
+vi.mock("../core/ClineDetector.js", () => ({
+	isClineInstalled: vi.fn().mockResolvedValue(false),
+	getClineStorageDirs: vi.fn().mockReturnValue([]),
+}));
+
+vi.mock("../core/ClineCliDetector.js", () => ({
+	isClineCliInstalled: vi.fn().mockResolvedValue(false),
+	getClineCliSessionsDir: vi.fn().mockReturnValue("/mock/.cline/data/sessions"),
+}));
+
+vi.mock("../core/ClineSessionDiscoverer.js", () => ({
+	discoverClineSessions: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../core/ClineCliSessionDiscoverer.js", () => ({
+	discoverClineCliSessions: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../core/ClineTranscriptReader.js", () => ({
+	readClineTranscript: vi.fn().mockResolvedValue({
+		entries: [],
+		newCursor: { transcriptPath: "", lineNumber: 0, updatedAt: "" },
+		totalLinesRead: 0,
+	}),
+}));
+
+vi.mock("../core/ClineCliTranscriptReader.js", () => ({
+	readClineCliTranscript: vi.fn().mockResolvedValue({
+		entries: [],
+		newCursor: { transcriptPath: "", lineNumber: 0, updatedAt: "" },
+		totalLinesRead: 0,
+	}),
+}));
+
 vi.mock("../core/CopilotSessionDiscoverer.js", () => ({
 	discoverCopilotSessions: vi.fn().mockResolvedValue([]),
 }));

@@ -58,13 +58,19 @@ describe("SettingsHtmlBuilder", () => {
 
 	// ── AI Agents tab ──
 
-	it("AI Agents tab lists all six per-source toggles", () => {
+	it("AI Agents tab lists all seven per-source toggles", () => {
 		expect(html).toContain('id="claudeEnabled"');
 		expect(html).toContain('id="codexEnabled"');
 		expect(html).toContain('id="geminiEnabled"');
 		expect(html).toContain('id="openCodeEnabled"');
 		expect(html).toContain('id="cursorEnabled"');
 		expect(html).toContain('id="copilotEnabled"');
+		expect(html).toContain('id="clineEnabled"');
+	});
+
+	it("Cline toggle description mentions both CLI and VS Code sources", () => {
+		expect(html).toContain("Cline CLI");
+		expect(html).toContain("VS Code");
 	});
 
 	it("Copilot toggle description mentions both CLI and Chat sources", () => {

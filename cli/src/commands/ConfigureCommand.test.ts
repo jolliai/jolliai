@@ -106,6 +106,30 @@ describe("ConfigureCommand — settable keys", () => {
 		expect((await loadConfig()).copilotEnabled).toBe(false);
 	});
 
+	it("accepts clineEnabled as a boolean key", async () => {
+		await runConfigure(["--set", "clineEnabled=true"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ clineEnabled: true }));
+		expect((await loadConfig()).clineEnabled).toBe(true);
+
+		await runConfigure(["--set", "clineEnabled=false"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ clineEnabled: false }));
+		expect((await loadConfig()).clineEnabled).toBe(false);
+	});
+
+	it("rejects a non-boolean value for clineEnabled", async () => {
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const prev = process.exitCode;
+		try {
+			await runConfigure(["--set", "clineEnabled=maybe"]);
+			expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/true\/false/));
+			expect(process.exitCode).toBe(1);
+			expect(mockSaveConfig).not.toHaveBeenCalled();
+		} finally {
+			errorSpy.mockRestore();
+			process.exitCode = prev;
+		}
+	});
+
 	it("accepts syncOnPush as a boolean key", async () => {
 		await runConfigure(["--set", "syncOnPush=false"]);
 		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncOnPush: false }));
@@ -231,6 +255,11 @@ describe("ConfigureCommand — settable keys", () => {
 		expect(help).toContain("localFolder");
 		expect(help).toContain("aiProvider");
 		expect(help).toContain("globalInstructions");
+	});
+
+	it("lists clineEnabled in help/description output", async () => {
+		const help = await runConfigureHelp();
+		expect(help).toContain("clineEnabled");
 	});
 
 	describe("slack.workspaceUrl validation", () => {

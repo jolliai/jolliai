@@ -182,6 +182,9 @@ export function filterSessionsByEnabledIntegrations(
 	if (config.copilotEnabled === false) {
 		filtered = filtered.filter((s) => s.source !== "copilot" && s.source !== "copilot-chat");
 	}
+	if (config.clineEnabled === false) {
+		filtered = filtered.filter((s) => s.source !== "cline" && s.source !== "cline-cli");
+	}
 	return filtered;
 }
 

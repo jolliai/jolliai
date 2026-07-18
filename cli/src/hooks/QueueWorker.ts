@@ -20,6 +20,12 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isClineCliInstalled } from "../core/ClineCliDetector.js";
+import { discoverClineCliSessions } from "../core/ClineCliSessionDiscoverer.js";
+import { readClineCliTranscript } from "../core/ClineCliTranscriptReader.js";
+import { isClineInstalled } from "../core/ClineDetector.js";
+import { discoverClineSessions } from "../core/ClineSessionDiscoverer.js";
+import { readClineTranscript } from "../core/ClineTranscriptReader.js";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
 import { clearAiSelection, conversationKey, readAiSelection, readExclusions } from "../core/CommitSelectionStore.js";
 import {
@@ -3195,6 +3201,23 @@ async function loadSessionTranscripts(
 		/* v8 ignore stop */
 	}
 
+	// Discover Cline VS Code extension sessions (plain-JSON scan across VS Code flavors).
+	if (config.clineEnabled !== false && (await isClineInstalled())) {
+		const clineSessions = await discoverClineSessions(cwd);
+		if (clineSessions.length > 0) {
+			allSessions = [...allSessions, ...clineSessions];
+			log.info("Discovered %d Cline (VS Code) session(s)", clineSessions.length);
+		}
+	}
+	// Discover Cline CLI sessions (plain-JSON scan of ~/.cline/data/sessions).
+	if (config.clineEnabled !== false && (await isClineCliInstalled())) {
+		const clineCliSessions = await discoverClineCliSessions(cwd);
+		if (clineCliSessions.length > 0) {
+			allSessions = [...allSessions, ...clineCliSessions];
+			log.info("Discovered %d Cline CLI session(s)", clineCliSessions.length);
+		}
+	}
+
 	if (allSessions.length === 0) {
 		log.info("No active sessions found — will infer topics from diff if available");
 	}
@@ -3411,7 +3434,7 @@ async function readAllTranscripts(
 			track("ai_source_detected", { source });
 		}
 
-		// Gemini, OpenCode, Cursor, and Copilot use dedicated readers (not JSONL line-based parsing).
+		// Gemini, OpenCode, Cursor, Copilot, and Cline use dedicated readers (not JSONL line-based parsing).
 		// Every reader is wrapped in try/catch + `continue` so one bad session never abandons the
 		// rest of the batch. SQLite-backed readers (opencode/cursor/copilot) fail on transient
 		// lock, corruption, schema drift, or DB disappearing between scan and read. The JSONL
@@ -3454,6 +3477,20 @@ async function readAllTranscripts(
 				result = await readCopilotChatTranscript(session.transcriptPath, cursor ?? undefined, beforeTimestamp);
 			} catch (error: unknown) {
 				log.error("Skipping Copilot Chat session %s: %s", session.sessionId, (error as Error).message);
+				continue;
+			}
+		} else if (source === "cline") {
+			try {
+				result = await readClineTranscript(session.transcriptPath, cursor, beforeTimestamp);
+			} catch (error: unknown) {
+				log.error("Skipping Cline session %s: %s", session.sessionId, (error as Error).message);
+				continue;
+			}
+		} else if (source === "cline-cli") {
+			try {
+				result = await readClineCliTranscript(session.transcriptPath, cursor, beforeTimestamp);
+			} catch (error: unknown) {
+				log.error("Skipping Cline CLI session %s: %s", session.sessionId, (error as Error).message);
 				continue;
 			}
 		} else {

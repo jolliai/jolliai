@@ -6,6 +6,8 @@ vi.mock("./CodexSessionDiscoverer.js", () => ({ discoverCodexSessions: vi.fn() }
 vi.mock("./OpenCodeSessionDiscoverer.js", () => ({ scanOpenCodeSessions: vi.fn() }));
 vi.mock("./CopilotSessionDiscoverer.js", () => ({ scanCopilotSessions: vi.fn() }));
 vi.mock("./CopilotChatSessionDiscoverer.js", () => ({ scanCopilotChatSessions: vi.fn() }));
+vi.mock("./ClineSessionDiscoverer.js", () => ({ scanClineSessions: vi.fn() }));
+vi.mock("./ClineCliSessionDiscoverer.js", () => ({ scanClineCliSessions: vi.fn() }));
 vi.mock("./SessionTracker.js", () => ({ loadAllSessions: vi.fn().mockResolvedValue([]) }));
 vi.mock("./SessionTitleResolver.js", () => ({
 	resolveSessionTitle: vi.fn().mockImplementation(async (s) => s.title ?? `resolved:${s.sessionId}`),
@@ -19,6 +21,8 @@ vi.mock("./TranscriptMessageCounter.js", () => ({
 }));
 
 import { listActiveConversations } from "./ActiveSessionAggregator.js";
+import { scanClineCliSessions } from "./ClineCliSessionDiscoverer.js";
+import { scanClineSessions } from "./ClineSessionDiscoverer.js";
 import { discoverCodexSessions } from "./CodexSessionDiscoverer.js";
 import { conversationKey, setExcluded } from "./CommitSelectionStore.js";
 import { scanCopilotChatSessions } from "./CopilotChatSessionDiscoverer.js";
@@ -48,6 +52,8 @@ beforeEach(() => {
 	vi.mocked(scanOpenCodeSessions).mockReset().mockResolvedValue(scan([]));
 	vi.mocked(scanCopilotSessions).mockReset().mockResolvedValue(scan([]));
 	vi.mocked(scanCopilotChatSessions).mockReset().mockResolvedValue(scan([]));
+	vi.mocked(scanClineSessions).mockReset().mockResolvedValue(scan([]));
+	vi.mocked(scanClineCliSessions).mockReset().mockResolvedValue(scan([]));
 	vi.mocked(discoverCodexSessions).mockReset().mockResolvedValue([]);
 	vi.mocked(loadMergedTranscript)
 		.mockReset()
@@ -135,10 +141,36 @@ describe("listActiveConversations", () => {
 		vi.mocked(scanOpenCodeSessions).mockRejectedValueOnce(new Error("opencode fail"));
 		vi.mocked(scanCopilotSessions).mockRejectedValueOnce(new Error("copilot fail"));
 		vi.mocked(scanCopilotChatSessions).mockRejectedValueOnce(new Error("cc fail"));
+		vi.mocked(scanClineSessions).mockRejectedValueOnce(new Error("cline fail"));
+		vi.mocked(scanClineCliSessions).mockRejectedValueOnce(new Error("cline-cli fail"));
 		vi.mocked(discoverCodexSessions).mockRejectedValueOnce(new Error("codex fail"));
 
 		const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
 		expect(items).toEqual([]);
+	});
+
+	it("includes Cline (VS Code) and Cline CLI sessions from their discoverers", async () => {
+		vi.mocked(scanClineSessions).mockResolvedValueOnce(
+			scan([
+				{ sessionId: "cl1", transcriptPath: "/", updatedAt: iso(-HOUR), source: "cline", title: "Cline task" },
+			]),
+		);
+		vi.mocked(scanClineCliSessions).mockResolvedValueOnce(
+			scan([{ sessionId: "clc1", transcriptPath: "/", updatedAt: iso(-HOUR), source: "cline-cli" }]),
+		);
+
+		const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+		expect(items.map((i) => i.sessionId).sort()).toEqual(["cl1", "clc1"]);
+	});
+
+	it("continues when Cline discoverer throws (source-level isolation)", async () => {
+		vi.mocked(scanClineSessions).mockRejectedValueOnce(new Error("cline scan fail"));
+		vi.mocked(scanOpenCodeSessions).mockResolvedValueOnce(
+			scan([{ sessionId: "ok", transcriptPath: "/", updatedAt: iso(-HOUR), source: "opencode" }]),
+		);
+
+		const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+		expect(items.map((i) => i.sessionId)).toEqual(["ok"]);
 	});
 
 	it("loadClaudeAndGemini swallows SessionTracker errors", async () => {

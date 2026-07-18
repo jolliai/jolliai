@@ -220,3 +220,11 @@ describe("findVscodeWorkspaceHash", () => {
 		expect(await findVscodeWorkspaceHash("Cursor", toNativePath("/Users/test/myproject"))).toBe("cursor1");
 	});
 });
+
+describe("ALL_VSCODE_FLAVORS", () => {
+	it("includes all supported flavors", async () => {
+		const { ALL_VSCODE_FLAVORS } = await import("./VscodeWorkspaceLocator.js");
+		expect(ALL_VSCODE_FLAVORS).toEqual(["Code", "Code - Insiders", "Cursor", "VSCodium", "Windsurf"]);
+		expect(ALL_VSCODE_FLAVORS.length).toBeGreaterThanOrEqual(5);
+	});
+});

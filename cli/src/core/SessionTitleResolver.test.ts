@@ -21,8 +21,8 @@ describe("resolveSessionTitle", () => {
 		vi.mocked(readFirstUserMessageTitle).mockReset();
 	});
 
-	it("uses SessionInfo.title when present (opencode/cursor/copilot)", async () => {
-		for (const source of ["opencode", "cursor", "copilot"] as const) {
+	it("uses SessionInfo.title when present (opencode/cursor/copilot/cline/cline-cli)", async () => {
+		for (const source of ["opencode", "cursor", "copilot", "cline", "cline-cli"] as const) {
 			const result = await resolveSessionTitle({
 				sessionId: "s1",
 				transcriptPath: "/tmp/x",

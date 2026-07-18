@@ -916,6 +916,75 @@ describe("StatusTreeProvider", () => {
 		expect(String(integration?.tooltip)).toContain("Chat: ✓");
 	});
 
+	// ── Cline integration ─────────────────────────────────────────────────
+
+	it("shows Cline Integration row when detected and enabled", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					clineDetected: true,
+					clineEnabled: true,
+					sessionsBySource: { cline: 2, "cline-cli": 3 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const item = items.find((i) => i.label === "Cline Integration");
+		expect(item).toBeDefined();
+		expect(item?.description).toContain("5");
+	});
+
+	it("Cline row tooltip distinguishes CLI / VS Code detection", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					clineDetected: true,
+					clineCliDetected: true,
+					clineVscodeDetected: false,
+					clineEnabled: true,
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const clineItem = items.find((i) => i.label === "Cline Integration");
+		expect(String(clineItem?.tooltip)).toContain("CLI: ✓");
+		expect(String(clineItem?.tooltip)).toContain("VS Code: ✗");
+	});
+
+	it("shows Cline Integration as unavailable when scan errors", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					clineDetected: true,
+					clineEnabled: true,
+					clineScanError: { kind: "parse", message: "bad task json" },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const item = items.find((i) => i.label === "Cline Integration");
+		expect(item?.description).toContain("parse");
+		expect(String(item?.tooltip)).toContain("Cline scan failed");
+	});
+
 	// ── Auth-aware status rows ────────────────────────────────────────────
 
 	it("shows Jolli Account connected when authToken is present", async () => {

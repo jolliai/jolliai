@@ -132,6 +132,8 @@ export function buildNextMemoryScript(): string {
       case 'opencode': return 'OpenCode';
       case 'copilot': return 'Copilot';
       case 'copilot-chat': return 'Copilot Chat';
+      case 'cline': return 'Cline (VS Code)';
+      case 'cline-cli': return 'Cline CLI';
       default: return source;
     }
   }
@@ -173,8 +175,18 @@ export function buildNextMemoryScript(): string {
       '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">' +
       '<g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">' +
       '<path d="M3.5 5 7 8l-3.5 3"/><line x1="8.5" y1="11.5" x2="13" y2="11.5"/></g></svg>',
+    cline:
+      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">' +
+      '<circle cx="8" cy="2.1" r="1.05" fill="currentColor"/>' +
+      '<g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round">' +
+      '<line x1="8" y1="3.15" x2="8" y2="4.7"/>' +
+      '<path d="M5.1 4.7h5.8a2.9 2.9 0 0 1 2.9 2.9v.5l1 1.7-1 1.7v.5a2.9 2.9 0 0 1-2.9 2.9H5.1a2.9 2.9 0 0 1-2.9-2.9v-.5l-1-1.7 1-1.7v-.5A2.9 2.9 0 0 1 5.1 4.7Z"/></g>' +
+      '<g fill="currentColor"><rect x="5.5" y="7.6" width="1.5" height="3.5" rx="0.75"/><rect x="9" y="7.6" width="1.5" height="3.5" rx="0.75"/></g></svg>',
   };
   SOURCE_ICON_SVG['copilot-chat'] = SOURCE_ICON_SVG.copilot;
+  // Cline's VS Code extension + terminal CLI share the same robot-head mark,
+  // as copilot / copilot-chat do above.
+  SOURCE_ICON_SVG['cline-cli'] = SOURCE_ICON_SVG.cline;
 
   function convSourceIcon(source) {
     var markup = SOURCE_ICON_SVG[source];

@@ -57,6 +57,7 @@ const VALID_CONFIG_KEYS = [
 	"openCodeEnabled",
 	"cursorEnabled",
 	"copilotEnabled",
+	"clineEnabled",
 	"mcpPlatformToolsEnabled",
 	"globalInstructions",
 	"logLevel",
@@ -132,6 +133,7 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		key === "openCodeEnabled" ||
 		key === "cursorEnabled" ||
 		key === "copilotEnabled" ||
+		key === "clineEnabled" ||
 		key === "mcpPlatformToolsEnabled" ||
 		key === "syncTranscripts" ||
 		key === "syncOnPush"
@@ -218,6 +220,11 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "copilotEnabled",
 		type: "boolean",
 		description: "Enable Copilot CLI session discovery (true/false; requires Node 22.5+ at runtime)",
+	},
+	{
+		key: "clineEnabled",
+		type: "boolean",
+		description: "Enable Cline (VS Code extension + CLI) session discovery (true/false)",
 	},
 	{
 		key: "mcpPlatformToolsEnabled",

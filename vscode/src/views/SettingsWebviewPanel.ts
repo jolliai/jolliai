@@ -55,6 +55,7 @@ interface SettingsPayload {
 	readonly openCodeEnabled: boolean;
 	readonly cursorEnabled: boolean;
 	readonly copilotEnabled: boolean;
+	readonly clineEnabled: boolean;
 	/** Tri-state config switch (undecided | "enabled" | "disabled") flattened to a checkbox; see handleApplySettings for the enable/disable/preserve-undecided persistence rules. */
 	readonly globalInstructions: boolean;
 	readonly localFolder: string;
@@ -462,6 +463,7 @@ export class SettingsWebviewPanel {
 			openCodeEnabled: config.openCodeEnabled !== false,
 			cursorEnabled: config.cursorEnabled !== false,
 			copilotEnabled: config.copilotEnabled !== false,
+			clineEnabled: config.clineEnabled !== false,
 			globalInstructions: config.globalInstructions === "enabled",
 			localFolder: config.localFolder ?? "",
 			excludePatterns: config.excludePatterns
@@ -610,6 +612,7 @@ export class SettingsWebviewPanel {
 			openCodeEnabled: settings.openCodeEnabled,
 			cursorEnabled: settings.cursorEnabled,
 			copilotEnabled: settings.copilotEnabled,
+			clineEnabled: settings.clineEnabled,
 			...giUpdate,
 			localFolder:
 				settings.localFolder && settings.localFolder.length > 0

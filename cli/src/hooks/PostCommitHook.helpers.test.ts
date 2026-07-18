@@ -98,6 +98,10 @@ vi.mock("node:fs", () => ({
 
 vi.mock("node:os", () => ({
 	homedir: mockHomedir,
+	// Cline detection (wired into loadSessionTranscripts) resolves VS Code flavor
+	// dirs via os.platform(); the mocked homedir points at a temp dir with no
+	// globalStorage, so isClineInstalled() returns false regardless of platform.
+	platform: () => process.platform,
 }));
 
 vi.mock("node:readline", () => ({

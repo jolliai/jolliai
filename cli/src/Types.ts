@@ -4,6 +4,7 @@
  * Central type definitions for all modules in the Jolli Memory tool.
  */
 
+import type { ClineScanError } from "./core/ClineTranscriptShared.js";
 import type { CopilotChatScanError } from "./core/CopilotChatTranscriptReader.js";
 import type { SqliteScanError } from "./core/SqliteHelpers.js";
 
@@ -22,6 +23,8 @@ export const TRANSCRIPT_SOURCES = [
 	"cursor",
 	"copilot",
 	"copilot-chat",
+	"cline",
+	"cline-cli",
 ] as const;
 
 /** Which AI coding agent produced the transcript. Derived from the runtime allowlist. */
@@ -1086,6 +1089,8 @@ export interface JolliMemoryConfig {
 	readonly cursorEnabled?: boolean;
 	/** Enable GitHub Copilot CLI session discovery at post-commit time (default: auto-detect) */
 	readonly copilotEnabled?: boolean;
+	/** Enable Cline (VS Code extension + CLI) session discovery at post-commit time (default: auto-detect) */
+	readonly clineEnabled?: boolean;
 	/** Global minimum log level written to debug.log (default: "info") */
 	readonly logLevel?: LogLevel;
 	/** Per-module log level overrides (e.g. { "GitOps": "debug" }) */
@@ -1368,6 +1373,16 @@ export interface StatusInfo {
 	readonly copilotChatDetected?: boolean;
 	/** Copilot Chat scan failed with a real (non-ENOENT) error: parse / fs / schema. */
 	readonly copilotChatScanError?: CopilotChatScanError;
+	/** Whether any Cline surface (VS Code extension globalStorage or ~/.cline CLI) was detected */
+	readonly clineDetected?: boolean;
+	/** Whether the Cline CLI (~/.cline/data/sessions) was detected */
+	readonly clineCliDetected?: boolean;
+	/** Whether the Cline VS Code extension globalStorage was detected */
+	readonly clineVscodeDetected?: boolean;
+	/** Whether Cline session discovery is enabled in config (undefined = auto-detect) */
+	readonly clineEnabled?: boolean;
+	/** Cline scan failed with a real error (non-ENOENT): parse / fs / schema. */
+	readonly clineScanError?: ClineScanError;
 	/**
 	 * v5 schema migration state — surfaced in `jolli status` and the VSCode
 	 * Hooks tooltip so users can see whether their on-disk data has been

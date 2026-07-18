@@ -239,7 +239,13 @@ object WorkingMemoryHtmlBuilder {
     }
 
     private fun sourceIconSvg(source: String, isDark: Boolean): String {
-        val name = if (source == "copilot-chat") "copilot" else source
+        // copilot-chat and cline-cli reuse their sibling's brand mark (Copilot,
+        // Cline) rather than shipping a duplicate source-*.svg resource.
+        val name = when (source) {
+            "copilot-chat" -> "copilot"
+            "cline-cli" -> "cline"
+            else -> source
+        }
         val base = "/icons/source-$name"
         val svg = (if (isDark) readResource("${base}_dark.svg") else null)
             ?: readResource("$base.svg")
@@ -300,6 +306,8 @@ object WorkingMemoryHtmlBuilder {
         "copilot" -> "Copilot"
         "copilot-chat" -> "Copilot Chat"
         "opencode" -> "OpenCode"
+        "cline" -> "Cline (VS Code)"
+        "cline-cli" -> "Cline CLI"
         else -> source.replaceFirstChar { it.uppercase() }
     }
 

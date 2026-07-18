@@ -38,6 +38,7 @@ export function buildSettingsScript(): string {
   const openCodeEnabledInput = document.getElementById('openCodeEnabled');
   const cursorEnabledInput = document.getElementById('cursorEnabled');
   const copilotEnabledInput = document.getElementById('copilotEnabled');
+  const clineEnabledInput = document.getElementById('clineEnabled');
   const globalInstructionsInput = document.getElementById('globalInstructions');
   const localFolderInput = document.getElementById('localFolder');
   const browseLocalFolderBtn = document.getElementById('browseLocalFolderBtn');
@@ -262,7 +263,7 @@ export function buildSettingsScript(): string {
     }) && valid;
     // At least one integration must be enabled
     var intError = document.getElementById('integrations-error');
-    if (!claudeEnabledInput.checked && !codexEnabledInput.checked && !geminiEnabledInput.checked && !openCodeEnabledInput.checked && !cursorEnabledInput.checked && !copilotEnabledInput.checked) {
+    if (!claudeEnabledInput.checked && !codexEnabledInput.checked && !geminiEnabledInput.checked && !openCodeEnabledInput.checked && !cursorEnabledInput.checked && !copilotEnabledInput.checked && !clineEnabledInput.checked) {
       intError.textContent = 'At least one integration must be enabled';
       valid = false;
     } else {
@@ -337,6 +338,7 @@ export function buildSettingsScript(): string {
       openCodeEnabled: openCodeEnabledInput.checked,
       cursorEnabled: cursorEnabledInput.checked,
       copilotEnabled: copilotEnabledInput.checked,
+      clineEnabled: clineEnabledInput.checked,
       globalInstructions: globalInstructionsInput.checked,
       localFolder: localFolderInput.value,
       excludePatterns: excludePatternsInput.value,
@@ -363,6 +365,7 @@ export function buildSettingsScript(): string {
       openCodeEnabledInput.checked !== initialState.openCodeEnabled ||
       cursorEnabledInput.checked !== initialState.cursorEnabled ||
       copilotEnabledInput.checked !== initialState.copilotEnabled ||
+      clineEnabledInput.checked !== initialState.clineEnabled ||
       globalInstructionsInput.checked !== initialState.globalInstructions ||
       localFolderInput.value !== initialState.localFolder ||
       excludePatternsInput.value !== initialState.excludePatterns ||
@@ -427,7 +430,7 @@ export function buildSettingsScript(): string {
   aiProviderSelect.addEventListener('change', function() {
     checkDirty(); clearSaveFeedback(); syncProviderCard();
   });
-  [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput, cursorEnabledInput, copilotEnabledInput, globalInstructionsInput].forEach(function(input) {
+  [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput, cursorEnabledInput, copilotEnabledInput, clineEnabledInput, globalInstructionsInput].forEach(function(input) {
     input.addEventListener('change', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
   });
   dcoSignoffInput.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
@@ -462,6 +465,7 @@ export function buildSettingsScript(): string {
         openCodeEnabled: openCodeEnabledInput.checked,
         cursorEnabled: cursorEnabledInput.checked,
         copilotEnabled: copilotEnabledInput.checked,
+        clineEnabled: clineEnabledInput.checked,
         globalInstructions: globalInstructionsInput.checked,
         localFolder: localFolderInput.value.trim(),
         excludePatterns: excludePatternsInput.value,
@@ -576,6 +580,7 @@ export function buildSettingsScript(): string {
         openCodeEnabledInput.checked = msg.settings.openCodeEnabled;
         cursorEnabledInput.checked = msg.settings.cursorEnabled;
         copilotEnabledInput.checked = msg.settings.copilotEnabled;
+        clineEnabledInput.checked = msg.settings.clineEnabled;
         globalInstructionsInput.checked = !!msg.settings.globalInstructions;
         localFolderInput.value = msg.settings.localFolder || '';
         excludePatternsInput.value = msg.settings.excludePatterns;

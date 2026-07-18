@@ -241,7 +241,7 @@ function buildFullStatusItems(
 		items.push(accountItem);
 	}
 
-	// Integration status rows (Claude, Codex, Gemini, OpenCode, Cursor)
+	// Integration status rows (Claude, Codex, Gemini, OpenCode, Cursor, Copilot, Cline)
 	const counts = s.sessionsBySource ?? {};
 	pushIntegrationItem(
 		items,
@@ -364,6 +364,35 @@ function buildFullStatusItems(
 		undefined,
 		copilotSessions,
 	);
+
+	// Cline integration: shared `clineEnabled` toggle for the terminal CLI and the
+	// VS Code extension. Like Cursor/OpenCode, a scan error replaces the main row
+	// with a dedicated warn row (single scan channel, unlike Copilot's two).
+	if (s.clineScanError) {
+		items.push(
+			new StatusItem(
+				"Cline Integration",
+				`unavailable — ${s.clineScanError.kind}`,
+				ICON_WARN,
+				`Cline scan failed (${s.clineScanError.kind}): ${s.clineScanError.message}`,
+			),
+		);
+	} else {
+		const clineCliMark = s.clineCliDetected ? "✓" : "✗";
+		const clineVscodeMark = s.clineVscodeDetected ? "✓" : "✗";
+		const clineSessions = (counts.cline ?? 0) + (counts["cline-cli"] ?? 0);
+		pushIntegrationItem(
+			items,
+			s.clineDetected ?? false,
+			s.clineEnabled !== false,
+			undefined,
+			"Cline Integration",
+			`Cline detected (CLI: ${clineCliMark}, VS Code: ${clineVscodeMark}) — session discovery is enabled`,
+			`Cline detected (CLI: ${clineCliMark}, VS Code: ${clineVscodeMark}) but session discovery is disabled in config`,
+			undefined,
+			clineSessions,
+		);
+	}
 
 	if (extensionOutdated) {
 		items.push(
