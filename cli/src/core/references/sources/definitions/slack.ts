@@ -18,8 +18,12 @@ export const slackDefinition: SourceDefinition = {
 		claude: { prefixes: ["mcp__claude_ai_Slack__"], acceptSuffix: "slack_read_thread" },
 		codex: {
 			namespaceSuffix: "slack",
-			functionCallNames: ["_read_thread"],
-			invocationTools: ["slack_read_thread"],
+			// The connector's tool name repeats the app slug (`slack_read_thread`),
+			// unlike asana's `get_task` — so the `function_call` name is
+			// `_slack_read_thread` and the `mcp_tool_call_end` invocation is
+			// `slack.slack_read_thread`. Verified against a real 2026-07-18 rollout.
+			functionCallNames: ["_slack_read_thread"],
+			invocationTools: ["slack.slack_read_thread"],
 		},
 	},
 	wrapperKeys: [],

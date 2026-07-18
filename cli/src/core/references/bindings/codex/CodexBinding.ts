@@ -16,10 +16,27 @@
  *
  * Adding a newly-observed tool/shape = extend one binding file's `normalize`
  * (add a collection key, or a URL backfill) plus the registry's match identity;
- * never touch the parser.
+ * never touch the parser. The one standing exception is parse-scoped context
+ * collection — data that lives in neither the payload nor the args and can only
+ * be harvested by scanning the whole transcript (e.g. Slack's url, pasted as a
+ * permalink elsewhere in the rollout). That is inherently the parser's job; it
+ * gathers such context once and threads it in via {@link CodexNormalizeEnv},
+ * which the binding reads. Extending the env is expected, not a boundary breach.
  */
 
 import type { SourceId } from "../../../../Types.js";
+
+/**
+ * Parse-scoped context a Codex normalizer may read beyond the tool result
+ * payload and its request `arguments`. Today only Slack uses it: its url lives
+ * in neither the payload nor the args — only in the pasted permalink (harvested
+ * into `permalinks`) or the reconstructable `slackWorkspaceUrl` config. Mirrors
+ * the Claude parser's `ContextNormalizeEnv`; every other binding ignores it.
+ */
+export interface CodexNormalizeEnv {
+	readonly permalinks: Map<string, string>;
+	readonly slackWorkspaceUrl?: string;
+}
 
 export interface CodexNormalizer {
 	readonly id: SourceId;
@@ -33,9 +50,10 @@ export interface CodexNormalizer {
 	 * parsed `function_call` `arguments` (undefined when absent); only sources that
 	 * gate on their input read it (monday's `itemIds`). Every other binding ignores
 	 * it. Implementations use {@link normalizeEntities} so both shapes are handled
-	 * uniformly.
+	 * uniformly. `env` carries parse-scoped context (the pasted-permalink map,
+	 * workspace url) — only Slack reads it; every other binding omits the param.
 	 */
-	normalize(business: unknown, toolInput?: unknown): unknown;
+	normalize(business: unknown, toolInput?: unknown, env?: CodexNormalizeEnv): unknown;
 
 	/**
 	 * OPTIONAL recovery — **not** the main path. The normal path is: parse the

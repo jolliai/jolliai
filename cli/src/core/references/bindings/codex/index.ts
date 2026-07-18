@@ -18,6 +18,7 @@ import { jiraCodexBinding } from "./CodexJiraBinding.js";
 import { linearCodexBinding } from "./CodexLinearBinding.js";
 import { mondayCodexBinding } from "./CodexMondayBinding.js";
 import { notionCodexBinding } from "./CodexNotionBinding.js";
+import { slackCodexBinding } from "./CodexSlackBinding.js";
 import { zoomMeetingCodexBinding } from "./CodexZoomMeetingBinding.js";
 
 /** `mcp__codex_apps__` — the shared connector namespace prefix for all sources. */
@@ -32,6 +33,7 @@ const CODEX_NORMALIZERS: readonly CodexNormalizer[] = [
 	confluenceCodexBinding,
 	asanaCodexBinding,
 	mondayCodexBinding,
+	slackCodexBinding,
 ];
 
 const BY_ID: ReadonlyMap<SourceId, CodexNormalizer> = new Map(CODEX_NORMALIZERS.map((n) => [n.id, n]));

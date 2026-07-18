@@ -57,3 +57,48 @@ export function scanUserPermalinks(lines: string[]): Map<string, string> {
 	}
 	return out;
 }
+
+interface CodexUserLine {
+	payload?: { type?: unknown; role?: unknown; content?: unknown; message?: unknown };
+}
+
+/**
+ * Codex counterpart of {@link scanUserPermalinks}. A Codex rollout carries the
+ * user's pasted permalink in one of two `payload`-nested shapes (both observed
+ * in a real 2026-07-18 rollout):
+ *   - a `message` response_item (`role:"user"`) whose content blocks are
+ *     `{type:"input_text", text}` — NOT Claude's `text`; and
+ *   - a `user_message` event whose `message` is a bare string.
+ * Both are scanned; the `<channel>:<parentTs>` key dedupes the same thread that
+ * appears in both line types. Non-user lines (including the tool result blob,
+ * which never contains the permalink) are ignored so no thread is double-sourced.
+ */
+export function scanCodexUserPermalinks(lines: string[]): Map<string, string> {
+	const out = new Map<string, string>();
+	for (const line of lines) {
+		if (!line.includes(".slack.com/archives/")) continue;
+		let parsed: CodexUserLine;
+		try {
+			parsed = JSON.parse(line) as CodexUserLine;
+		} catch {
+			continue;
+		}
+		const p = parsed.payload;
+		if (p === undefined || p === null) continue;
+		const texts: string[] = [];
+		if (p.type === "message" && p.role === "user" && Array.isArray(p.content)) {
+			for (const block of p.content) {
+				if (typeof block !== "object" || block === null) continue;
+				const b = block as { type?: unknown; text?: unknown };
+				if (b.type === "input_text" && typeof b.text === "string") texts.push(b.text);
+			}
+		} else if (p.type === "user_message" && typeof p.message === "string") {
+			texts.push(p.message);
+		}
+		for (const text of texts) {
+			const link = parseSlackPermalink(text);
+			if (link !== null) out.set(`${link.channel}:${link.parentTs}`, link.url);
+		}
+	}
+	return out;
+}
