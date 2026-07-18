@@ -246,6 +246,15 @@ describe("SummaryScriptBuilder", () => {
 		expect(script).toMatch(/'copilot',\s*'copilot-chat'/);
 	});
 
+	it("defines a Cline brand glyph and aliases cline-cli to it", () => {
+		expect(script).toContain("cline:");
+		expect(script).toContain("SOURCE_ICON_SVG['cline-cli'] = SOURCE_ICON_SVG.cline");
+	});
+
+	it("includes both Cline sources in sourceOrder", () => {
+		expect(script).toMatch(/'copilot-chat',\s*'cline',\s*'cline-cli'/);
+	});
+
 	describe("Regenerate summary re-render wiring", () => {
 		// The emitted JS runs in the webview iframe and is not unit-testable
 		// at runtime in vitest. These string-contain assertions pin the

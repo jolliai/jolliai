@@ -32,6 +32,8 @@ const PARSE_LINE: Record<TranscriptSource, (line: string) => string | undefined>
 	cursor: parseCursorUserLine,
 	copilot: parseCopilotUserLine,
 	"copilot-chat": parseCopilotChatUserLine,
+	cline: parseClineUserLine,
+	"cline-cli": parseClineCliUserLine,
 };
 
 /**
@@ -191,6 +193,16 @@ function parseCopilotChatUserLine(line: string): string | undefined {
 		}
 	}
 
+	return undefined;
+}
+
+function parseClineUserLine(_line: string): string | undefined {
+	// Cline extension sessions carry SessionInfo.title from taskHistory.task.
+	return undefined;
+}
+
+function parseClineCliUserLine(_line: string): string | undefined {
+	// Cline CLI sessions carry SessionInfo.title from sidecar metadata.title.
 	return undefined;
 }
 

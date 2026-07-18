@@ -8,6 +8,7 @@
 
 import type { Command } from "commander";
 import { loadAuthToken } from "../auth/AuthConfig.js";
+import type { ClineScanError } from "../core/ClineTranscriptShared.js";
 import { deriveRepoNameFromUrl, getCanonicalRepoUrl } from "../core/GitRemoteUtils.js";
 import {
 	ClientOutdatedError,
@@ -22,6 +23,7 @@ import {
 	saveSpaceBindingCache,
 	tenantOriginForKey,
 } from "../core/SpaceBindingCache.js";
+import type { SqliteScanError } from "../core/SqliteHelpers.js";
 import { getStatus } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { StatusInfo } from "../Types.js";
@@ -222,8 +224,13 @@ interface IntegrationStatusInputs {
 	/** undefined = this integration has no hook concept (Codex, OpenCode). */
 	readonly hookInstalled: boolean | undefined;
 	readonly sessionCount: number | undefined;
-	/** DB existed but scan failed (corrupt/locked/schema/etc). Used by OpenCode and Copilot integrations. */
-	readonly scanError?: StatusInfo["openCodeScanError"];
+	/**
+	 * DB/file scan failed (corrupt/locked/schema/parse/etc). Used by OpenCode,
+	 * Cursor, Copilot, and Cline integrations. Union preserves literal-kind safety
+	 * for both SqliteScanError (corrupt|locked|permission|schema|unknown) and
+	 * ClineScanError (parse|fs|schema|unknown).
+	 */
+	readonly scanError?: SqliteScanError | ClineScanError;
 }
 
 /**
@@ -326,8 +333,39 @@ export function registerStatusCommand(program: Command): void {
 			// the VSCode STATUS panel). Claude's enabled flag lives in config, not
 			// StatusInfo, so read it from the already-loaded `config`.
 			const counts = status.sessionsBySource ?? {};
+			const subIndent = "".padEnd(18);
+			const mark = (detected: boolean | undefined): string => (detected ? "✓" : "✗");
+
+			// Copilot and Cline are dual-variant sources (terminal CLI + editor). Each
+			// prints an indented breakdown sub-line beneath its main row. These are
+			// attached to the row tuple (not emitted after the loop) so they render
+			// directly under their own row rather than the last integration row.
+			const copilotSubLines: string[] = [];
+			const anyCopilotDetected = (status.copilotDetected ?? false) || (status.copilotChatDetected ?? false);
+			if (anyCopilotDetected) {
+				copilotSubLines.push(
+					`  ${subIndent}↳ CLI: ${mark(status.copilotDetected)}, Chat: ${mark(status.copilotChatDetected)}`,
+				);
+				if (status.copilotChatScanError) {
+					copilotSubLines.push(
+						`  ${subIndent}↳ Chat scan failed (${status.copilotChatScanError.kind}): ${status.copilotChatScanError.message}`,
+					);
+				}
+			}
+			const clineSubLines: string[] = [];
+			if (status.clineDetected) {
+				clineSubLines.push(
+					`  ${subIndent}↳ CLI: ${mark(status.clineCliDetected)}, VS Code: ${mark(status.clineVscodeDetected)}`,
+				);
+			}
+
 			const integrationRows: ReadonlyArray<
-				readonly [label: string, detected: boolean | undefined, inputs: IntegrationStatusInputs]
+				readonly [
+					label: string,
+					detected: boolean | undefined,
+					inputs: IntegrationStatusInputs,
+					subLines?: readonly string[],
+				]
 			> = [
 				[
 					"Claude:",
@@ -378,7 +416,7 @@ export function registerStatusCommand(program: Command): void {
 				],
 				[
 					"Copilot:",
-					(status.copilotDetected ?? false) || (status.copilotChatDetected ?? false),
+					anyCopilotDetected,
 					{
 						enabled: status.copilotEnabled !== false,
 						hookInstalled: undefined,
@@ -386,21 +424,25 @@ export function registerStatusCommand(program: Command): void {
 						// CLI scan error renders on the main row; Chat scan error renders as a sub-line below.
 						scanError: status.copilotScanError,
 					},
+					copilotSubLines,
+				],
+				[
+					"Cline:",
+					status.clineDetected ?? false,
+					{
+						enabled: status.clineEnabled !== false,
+						hookInstalled: undefined,
+						sessionCount: (counts.cline ?? 0) + (counts["cline-cli"] ?? 0),
+						scanError: status.clineScanError,
+					},
+					clineSubLines,
 				],
 			];
-			for (const [label, detected, inputs] of integrationRows) {
+			for (const [label, detected, inputs, subLines] of integrationRows) {
 				if (!detected) continue;
 				console.log(`  ${label.padEnd(18)}${describeIntegrationStatus(inputs)}`);
-			}
-			const anyCopilotDetected = (status.copilotDetected ?? false) || (status.copilotChatDetected ?? false);
-			if (anyCopilotDetected) {
-				const cliMark = status.copilotDetected ? "✓" : "✗";
-				const chatMark = status.copilotChatDetected ? "✓" : "✗";
-				console.log(`  ${"".padEnd(18)}↳ CLI: ${cliMark}, Chat: ${chatMark}`);
-				if (status.copilotChatScanError) {
-					console.log(
-						`  ${"".padEnd(18)}↳ Chat scan failed (${status.copilotChatScanError.kind}): ${status.copilotChatScanError.message}`,
-					);
+				for (const line of subLines ?? []) {
+					console.log(line);
 				}
 			}
 

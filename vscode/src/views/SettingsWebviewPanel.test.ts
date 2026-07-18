@@ -1511,6 +1511,73 @@ describe("SettingsWebviewPanel", () => {
 			);
 		});
 
+		it("loads clineEnabled from config (default true)", async () => {
+			const dispatch = await setupWithLoadedConfig({ clineEnabled: false });
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ clineEnabled: false }),
+				}),
+			);
+
+			postMessage.mockClear();
+			SettingsWebviewPanel.dispose();
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				// clineEnabled intentionally absent
+				excludePatterns: [],
+			});
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch2 = captureMessageHandler();
+			dispatch2({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ clineEnabled: true }),
+				}),
+			);
+		});
+
+		it("persists clineEnabled when the user submits", async () => {
+			const dispatch = await setupWithLoadedConfig({ clineEnabled: true });
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					openCodeEnabled: true,
+					copilotEnabled: true,
+					clineEnabled: false,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ clineEnabled: false }),
+				expect.any(String),
+			);
+		});
+
 		it("removes Claude and Gemini hooks when disabled", async () => {
 			const dispatch = await setupWithLoadedConfig();
 

@@ -6,7 +6,7 @@
  * intentionally omitted from this surface):
  *
  *   1. AI Agents     — per-source toggles (Claude / Codex / Gemini /
- *                      OpenCode / Cursor / Copilot)
+ *                      OpenCode / Cursor / Copilot / Cline)
  *   2. AI Summary    — Provider dropdown + Anthropic card (key/model/maxTokens)
  *                      or Jolli card (signed-in / no-key / signed-out)
  *   3. Sync to Jolli — sign-in or signed-in state for cloud push
@@ -55,6 +55,7 @@ export function buildSettingsHtml(nonce: string): string {
       ${buildToggleRow("openCodeEnabled", "OpenCode", "Session discovery via ~/.local/share/opencode/opencode.db")}
       ${buildToggleRow("cursorEnabled", "Cursor", "Session discovery via Cursor's local SQLite store")}
       ${buildToggleRow("copilotEnabled", "Copilot", "Session discovery for GitHub Copilot CLI (~/.copilot/session-store.db) and VS Code Copilot Chat (workspace storage)")}
+      ${buildToggleRow("clineEnabled", "Cline", "Session discovery for the Cline CLI (~/.cline/data/sessions) and the Cline VS Code extension (globalStorage)")}
       <div class="error-message" id="integrations-error"></div>
       <p class="section-hint">Global preferences</p>
       ${buildToggleRow("globalInstructions", "Global Instructions", GLOBAL_INSTRUCTIONS_PROMPT)}

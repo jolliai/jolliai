@@ -92,6 +92,24 @@ describe("SettingsScriptBuilder", () => {
 		);
 	});
 
+	it("references the clineEnabled DOM input", () => {
+		expect(script).toContain("getElementById('clineEnabled')");
+	});
+
+	it("includes clineEnabled in validation guard", () => {
+		expect(script).toMatch(/!clineEnabledInput\.checked/);
+	});
+
+	it("ships clineEnabled in save payload", () => {
+		expect(script).toContain("clineEnabled: clineEnabledInput.checked");
+	});
+
+	it("loads clineEnabled from host message", () => {
+		expect(script).toContain(
+			"clineEnabledInput.checked = msg.settings.clineEnabled",
+		);
+	});
+
 	// ── DCO sign-off toggle ──
 
 	it("references the dcoSignoff DOM input", () => {

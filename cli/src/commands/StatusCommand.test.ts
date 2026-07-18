@@ -204,6 +204,94 @@ describe("StatusCommand — Copilot integration row", () => {
 	});
 });
 
+describe("StatusCommand — Cline integration row", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockLoadConfigFromDir.mockResolvedValue({});
+		mockLoadAuthToken.mockResolvedValue(null);
+		mockFrontDoor.mockResolvedValue({ status: "no_spaces" });
+		mockTenantOrigin.mockReturnValue(null);
+		mockLoadCache.mockResolvedValue(null);
+	});
+
+	afterEach(() => {
+		vi.clearAllMocks();
+	});
+
+	it("does not render Cline row when Cline not detected", async () => {
+		const out = await renderStatus({
+			...baseStatus,
+			// clineDetected unset (undefined) -> default state
+		});
+		expect(out).not.toContain("Cline:");
+	});
+
+	it("renders Cline row with merged extension + CLI session count", async () => {
+		const out = await renderStatus({
+			...baseStatus,
+			clineDetected: true,
+			clineEnabled: true,
+			sessionsBySource: { cline: 2, "cline-cli": 3 },
+		});
+		expect(out).toContain("Cline");
+		expect(out).toMatch(/5\s*sessions/);
+	});
+
+	it("renders Cline row as unavailable on scan error", async () => {
+		const out = await renderStatus({
+			...baseStatus,
+			clineDetected: true,
+			clineScanError: { kind: "parse", message: "bad task json" },
+		});
+		expect(out).toContain("Cline");
+		expect(out).toContain("unavailable");
+		expect(out).toContain("parse");
+	});
+
+	it("renders Cline row as disabled when detected but clineEnabled is false", async () => {
+		const out = await renderStatus({
+			...baseStatus,
+			clineDetected: true,
+			clineEnabled: false,
+		});
+		expect(out).toContain("Cline");
+		expect(out).toContain("detected but disabled");
+	});
+
+	it("Cline row shows CLI/VS Code breakdown when only the CLI is detected", async () => {
+		const out = await renderStatus({
+			...baseStatus,
+			clineDetected: true,
+			clineCliDetected: true,
+			clineVscodeDetected: false,
+			clineEnabled: true,
+		});
+		expect(out).toContain("CLI: ✓");
+		expect(out).toContain("VS Code: ✗");
+	});
+
+	it("renders the Copilot CLI/Chat sub-line under Copilot, not under Cline", async () => {
+		// Regression: the Copilot sub-line was emitted after the whole integration
+		// loop, so it visually attached to the last row (Cline). It must print
+		// directly beneath Copilot — i.e. before the Cline row.
+		const out = await renderStatus({
+			...baseStatus,
+			copilotDetected: true,
+			copilotChatDetected: true,
+			copilotEnabled: true,
+			clineDetected: true,
+			clineCliDetected: true,
+			clineVscodeDetected: true,
+			clineEnabled: true,
+		});
+		const chatIdx = out.indexOf("Chat: ✓");
+		const clineRowIdx = out.indexOf("Cline:");
+		expect(chatIdx).toBeGreaterThan(-1);
+		expect(clineRowIdx).toBeGreaterThan(-1);
+		expect(chatIdx).toBeLessThan(clineRowIdx);
+	});
+});
+
 describe("StatusCommand — Jolli Site display", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();

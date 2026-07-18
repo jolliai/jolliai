@@ -51,6 +51,20 @@ vi.mock("./CopilotChatTranscriptReader.js", () => ({
 		totalLinesRead: 1,
 	}),
 }));
+vi.mock("./ClineTranscriptReader.js", () => ({
+	readClineTranscript: vi.fn().mockResolvedValue({
+		entries: [{ role: "human", content: "cline-payload" }],
+		newCursor: null,
+		totalLinesRead: 1,
+	}),
+}));
+vi.mock("./ClineCliTranscriptReader.js", () => ({
+	readClineCliTranscript: vi.fn().mockResolvedValue({
+		entries: [{ role: "human", content: "cline-cli-payload" }],
+		newCursor: null,
+		totalLinesRead: 1,
+	}),
+}));
 // Mock the codex path's reader so we don't need a real JSONL file for it.
 vi.mock("./TranscriptReader.js", () => ({
 	readTranscript: vi.fn().mockResolvedValue({
@@ -60,6 +74,8 @@ vi.mock("./TranscriptReader.js", () => ({
 	}),
 }));
 
+import { readClineCliTranscript } from "./ClineCliTranscriptReader.js";
+import { readClineTranscript } from "./ClineTranscriptReader.js";
 import { readCopilotChatTranscript } from "./CopilotChatTranscriptReader.js";
 import { readCopilotTranscript } from "./CopilotTranscriptReader.js";
 import { readCursorTranscript } from "./CursorTranscriptReader.js";
@@ -76,6 +92,8 @@ describe("loadUnreadMergedTranscript per-source dispatch", () => {
 		vi.mocked(readCursorTranscript).mockClear();
 		vi.mocked(readCopilotTranscript).mockClear();
 		vi.mocked(readCopilotChatTranscript).mockClear();
+		vi.mocked(readClineTranscript).mockClear();
+		vi.mocked(readClineCliTranscript).mockClear();
 		vi.mocked(readTranscript).mockClear();
 	});
 
@@ -178,6 +196,34 @@ describe("loadUnreadMergedTranscript per-source dispatch", () => {
 		// Cursor was non-null → `cursor ?? undefined` returned the cursor
 		// itself, not undefined.
 		expect(vi.mocked(readCopilotChatTranscript).mock.calls[0][1]).toBeTruthy();
+	});
+
+	it("dispatches to Cline reader for source=cline", async () => {
+		const entries = await loadUnreadMergedTranscript(
+			{
+				sessionId: "s",
+				transcriptPath: "/synthetic/cline.json",
+				updatedAt: "2026-05-15T00:00:00Z",
+				source: "cline",
+			},
+			projectDir,
+		);
+		expect(readClineTranscript).toHaveBeenCalledTimes(1);
+		expect(entries).toEqual([{ role: "human", content: "cline-payload" }]);
+	});
+
+	it("dispatches to Cline CLI reader for source=cline-cli", async () => {
+		const entries = await loadUnreadMergedTranscript(
+			{
+				sessionId: "s",
+				transcriptPath: "/synthetic/cline-cli.json",
+				updatedAt: "2026-05-15T00:00:00Z",
+				source: "cline-cli",
+			},
+			projectDir,
+		);
+		expect(readClineCliTranscript).toHaveBeenCalledTimes(1);
+		expect(entries).toEqual([{ role: "human", content: "cline-cli-payload" }]);
 	});
 
 	it("dispatches to the JSONL reader for source=codex", async () => {

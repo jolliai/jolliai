@@ -21,6 +21,8 @@ export const TRANSCRIPT_SOURCE_LABELS: Readonly<Record<TranscriptSource, string>
 	"copilot-chat": "Copilot Chat",
 	gemini: "Gemini",
 	opencode: "OpenCode",
+	cline: "Cline (VS Code)",
+	"cline-cli": "Cline CLI",
 };
 
 export function transcriptSourceLabel(source: TranscriptSource | undefined): string {

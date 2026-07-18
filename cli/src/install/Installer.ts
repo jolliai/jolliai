@@ -18,6 +18,11 @@ import { stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isClaudeInstalled } from "../core/ClaudeDetector.js";
+import { isClineCliInstalled } from "../core/ClineCliDetector.js";
+import { scanClineCliSessions } from "../core/ClineCliSessionDiscoverer.js";
+import { isClineInstalled } from "../core/ClineDetector.js";
+import { scanClineSessions } from "../core/ClineSessionDiscoverer.js";
+import type { ClineScanError } from "../core/ClineTranscriptShared.js";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
 import { isCopilotChatInstalled } from "../core/CopilotChatDetector.js";
 import { scanCopilotChatSessions } from "../core/CopilotChatSessionDiscoverer.js";
@@ -266,6 +271,7 @@ export async function install(
 		const opencodeDetectedOnce = await isOpenCodeInstalled();
 		const copilotDetectedOnce = await isCopilotInstalled();
 		const copilotChatDetectedOnce = await isCopilotChatInstalled();
+		const clineDetectedOnce = (await isClineInstalled()) || (await isClineCliInstalled());
 
 		// Install .jolli/jollimemory/ state dir (always) and Claude Code hook (if enabled)
 		let claudeResult: HookOpResult = {};
@@ -479,6 +485,12 @@ export async function install(
 				copilotDetected,
 				copilotChatDetected,
 			);
+		}
+
+		// Auto-detect Cline (extension or CLI) and enable session discovery
+		if (clineDetectedOnce && config.clineEnabled === undefined) {
+			await saveConfig({ clineEnabled: true });
+			log.info("Cline detected — enabled Cline session discovery");
 		}
 
 		// Migrate any existing worktree-level API keys to the global config dir.
@@ -786,6 +798,9 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 	const cursorDetected = await isCursorInstalled();
 	const copilotDetected = await isCopilotInstalled();
 	const copilotChatDetected = await isCopilotChatInstalled();
+	const clineVscodeDetected = await isClineInstalled();
+	const clineCliDetected = await isClineCliInstalled();
+	const clineDetected = clineVscodeDetected || clineCliDetected;
 
 	// Check if we can enumerate worktrees; falls back gracefully if not a git repo
 	let enabledWorktrees: number | undefined;
@@ -855,6 +870,16 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
 		}
 		copilotChatScanError = scan.error;
+	}
+
+	// Discover Cline sessions on-demand (extension + CLI), merged under one row.
+	let clineScanError: ClineScanError | undefined;
+	if (config.clineEnabled !== false && clineDetected) {
+		const ext = await scanClineSessions(projectDir);
+		const cli = await scanClineCliSessions(projectDir);
+		const merged = [...ext.sessions, ...cli.sessions];
+		if (merged.length > 0) allEnabledSessions = [...allEnabledSessions, ...merged];
+		clineScanError = ext.error ?? cli.error;
 	}
 
 	// Compute per-source session counts for integration status rows
@@ -955,6 +980,11 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		copilotScanError,
 		copilotChatDetected,
 		copilotChatScanError,
+		clineDetected,
+		clineCliDetected,
+		clineVscodeDetected,
+		clineEnabled: config.clineEnabled,
+		clineScanError,
 		globalConfigDir,
 		worktreeStatePath,
 		enabledWorktrees,
@@ -967,7 +997,7 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 	};
 
 	log.info(
-		"Status: enabled=%s, claude=%s, git=%s, geminiHook=%s, worktreeHooks=%s, sessions=%d, summaries=%d, codex=%s/%s, gemini=%s/%s, enabledWorktrees=%s, opencode=%s/%s, cursor=%s/%s, copilot=%s/%s, copilotChat=%s",
+		"Status: enabled=%s, claude=%s, git=%s, geminiHook=%s, worktreeHooks=%s, sessions=%d, summaries=%d, codex=%s/%s, gemini=%s/%s, enabledWorktrees=%s, opencode=%s/%s, cursor=%s/%s, copilot=%s/%s, copilotChat=%s, cline=%s/%s",
 		status.enabled,
 		status.claudeHookInstalled,
 		status.gitHookInstalled,
@@ -987,6 +1017,8 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		status.copilotDetected,
 		status.copilotEnabled,
 		status.copilotChatDetected,
+		status.clineDetected,
+		status.clineEnabled,
 	);
 
 	return status;

@@ -21,7 +21,16 @@ import { createLogger } from "../Logger.js";
 
 const log = createLogger("VscodeWorkspaceLocator");
 
-export type VscodeFlavor = "Cursor" | "Code";
+export type VscodeFlavor = "Cursor" | "Code" | "Code - Insiders" | "VSCodium" | "Windsurf";
+
+/** All VS Code-family flavors Jolli scans for extension data. Directory name == flavor string. */
+export const ALL_VSCODE_FLAVORS: ReadonlyArray<VscodeFlavor> = [
+	"Code",
+	"Code - Insiders",
+	"Cursor",
+	"VSCodium",
+	"Windsurf",
+];
 
 /**
  * Returns the VS Code-family user-data root for the current platform.

@@ -338,6 +338,38 @@ vi.mock("../core/CursorTranscriptReader.js", () => ({
 	}),
 }));
 
+vi.mock("../core/ClineDetector.js", () => ({
+	isClineInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/ClineSessionDiscoverer.js", () => ({
+	discoverClineSessions: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../core/ClineTranscriptReader.js", () => ({
+	readClineTranscript: vi.fn().mockResolvedValue({
+		entries: [],
+		newCursor: { transcriptPath: "", lineNumber: 0, updatedAt: "" },
+		totalLinesRead: 0,
+	}),
+}));
+
+vi.mock("../core/ClineCliDetector.js", () => ({
+	isClineCliInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/ClineCliSessionDiscoverer.js", () => ({
+	discoverClineCliSessions: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../core/ClineCliTranscriptReader.js", () => ({
+	readClineCliTranscript: vi.fn().mockResolvedValue({
+		entries: [],
+		newCursor: { transcriptPath: "", lineNumber: 0, updatedAt: "" },
+		totalLinesRead: 0,
+	}),
+}));
+
 vi.mock("../core/CopilotDetector.js", () => ({
 	isCopilotInstalled: vi.fn().mockResolvedValue(false),
 }));
@@ -411,6 +443,12 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isClineCliInstalled } from "../core/ClineCliDetector.js";
+import { discoverClineCliSessions } from "../core/ClineCliSessionDiscoverer.js";
+import { readClineCliTranscript } from "../core/ClineCliTranscriptReader.js";
+import { isClineInstalled } from "../core/ClineDetector.js";
+import { discoverClineSessions } from "../core/ClineSessionDiscoverer.js";
+import { readClineTranscript } from "../core/ClineTranscriptReader.js";
 import { isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
 import { clearAiSelection, readAiSelection } from "../core/CommitSelectionStore.js";
 import { assessContextRelevance, buildChangeSignal, computeChangeFingerprint } from "../core/ContextRelevance.js";
@@ -526,6 +564,10 @@ describe("QueueWorker", () => {
 		vi.mocked(isCopilotInstalled).mockResolvedValue(false);
 		vi.mocked(isCopilotChatInstalled).mockResolvedValue(false);
 		vi.mocked(discoverCopilotChatSessions).mockResolvedValue([]);
+		vi.mocked(isClineInstalled).mockResolvedValue(false);
+		vi.mocked(discoverClineSessions).mockResolvedValue([]);
+		vi.mocked(isClineCliInstalled).mockResolvedValue(false);
+		vi.mocked(discoverClineCliSessions).mockResolvedValue([]);
 		vi.mocked(buildMultiSessionContext).mockReturnValue("");
 		vi.mocked(generateSummary).mockResolvedValue({
 			transcriptEntries: 0,
@@ -1439,6 +1481,119 @@ describe("QueueWorker", () => {
 		});
 	});
 
+	describe("Cline integration", () => {
+		it("should include discovered Cline (VS Code) sessions in the pipeline when enabled", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cline.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isClineInstalled).mockResolvedValue(true);
+			vi.mocked(discoverClineSessions).mockResolvedValue([
+				{
+					sessionId: "cline-1",
+					transcriptPath: "/tmp/cline/task-1/ui_messages.json",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "cline",
+				},
+			]);
+			vi.mocked(readClineTranscript).mockResolvedValue({
+				entries: [{ role: "human", content: "Cline context", timestamp: "2026-04-01T12:00:00.000Z" }],
+				newCursor: {
+					transcriptPath: "/tmp/cline/task-1/ui_messages.json",
+					lineNumber: 1,
+					updatedAt: "2026-04-01T12:00:00.000Z",
+				},
+				totalLinesRead: 1,
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(discoverClineSessions).toHaveBeenCalledWith("/test/cwd");
+			expect(readClineTranscript).toHaveBeenCalledWith(
+				"/tmp/cline/task-1/ui_messages.json",
+				null,
+				"2026-04-01T12:00:00.000Z",
+			);
+			expect(saveCursor).toHaveBeenCalledWith(
+				expect.objectContaining({ transcriptPath: "/tmp/cline/task-1/ui_messages.json", lineNumber: 1 }),
+				"/test/cwd",
+			);
+		});
+
+		it("should include discovered Cline CLI sessions in the pipeline when enabled", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cline-cli.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isClineCliInstalled).mockResolvedValue(true);
+			vi.mocked(discoverClineCliSessions).mockResolvedValue([
+				{
+					sessionId: "cline-cli-1",
+					transcriptPath: "/tmp/cline-cli/session-1.json",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "cline-cli",
+				},
+			]);
+			vi.mocked(readClineCliTranscript).mockResolvedValue({
+				entries: [{ role: "human", content: "Cline CLI context", timestamp: "2026-04-01T12:00:00.000Z" }],
+				newCursor: {
+					transcriptPath: "/tmp/cline-cli/session-1.json",
+					lineNumber: 1,
+					updatedAt: "2026-04-01T12:00:00.000Z",
+				},
+				totalLinesRead: 1,
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(discoverClineCliSessions).toHaveBeenCalledWith("/test/cwd");
+			expect(readClineCliTranscript).toHaveBeenCalledWith(
+				"/tmp/cline-cli/session-1.json",
+				null,
+				"2026-04-01T12:00:00.000Z",
+			);
+			expect(saveCursor).toHaveBeenCalledWith(
+				expect.objectContaining({ transcriptPath: "/tmp/cline-cli/session-1.json", lineNumber: 1 }),
+				"/test/cwd",
+			);
+		});
+
+		it("skips discovery for both Cline sources when clineEnabled is explicitly false", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cline-disabled.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({ clineEnabled: false } as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isClineInstalled).mockResolvedValue(true);
+			vi.mocked(isClineCliInstalled).mockResolvedValue(true);
+
+			await runWorker("/test/cwd");
+
+			// clineEnabled=false short-circuits before isClineInstalled/isClineCliInstalled are consulted
+			expect(isClineInstalled).not.toHaveBeenCalled();
+			expect(discoverClineSessions).not.toHaveBeenCalled();
+			expect(isClineCliInstalled).not.toHaveBeenCalled();
+			expect(discoverClineCliSessions).not.toHaveBeenCalled();
+		});
+	});
+
 	describe("OpenCode integration", () => {
 		it("should include discovered OpenCode sessions in the pipeline when enabled", async () => {
 			const op = makeCommitOp();
@@ -1967,6 +2122,81 @@ describe("QueueWorker", () => {
 
 			expect(isCopilotChatInstalled).not.toHaveBeenCalled();
 			expect(discoverCopilotChatSessions).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("Cline integration — read failure", () => {
+		it("skips a Cline session whose transcript read throws and continues with the rest of the pipeline", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cline-throws.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isClineInstalled).mockResolvedValue(true);
+			vi.mocked(discoverClineSessions).mockResolvedValue([
+				{
+					sessionId: "cline-broken",
+					transcriptPath: "/cline/task-broken/ui_messages.json",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "cline",
+				},
+			]);
+			vi.mocked(readClineTranscript).mockRejectedValue(new Error("Cannot read Cline session: cline-broken"));
+
+			await runWorker("/test/cwd");
+
+			expect(readClineTranscript).toHaveBeenCalledWith(
+				"/cline/task-broken/ui_messages.json",
+				null,
+				"2026-04-01T12:00:00.000Z",
+			);
+			// Pipeline still completes — the broken session was skipped, not fatal
+			expect(storeSummary).toHaveBeenCalled();
+			expect(saveCursor).not.toHaveBeenCalledWith(
+				expect.objectContaining({ transcriptPath: "/cline/task-broken/ui_messages.json" }),
+				"/test/cwd",
+			);
+		});
+
+		it("skips a Cline CLI session whose transcript read throws and continues with the rest of the pipeline", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cline-cli-throws.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isClineCliInstalled).mockResolvedValue(true);
+			vi.mocked(discoverClineCliSessions).mockResolvedValue([
+				{
+					sessionId: "cline-cli-broken",
+					transcriptPath: "/cline-cli/session-broken.json",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "cline-cli",
+				},
+			]);
+			vi.mocked(readClineCliTranscript).mockRejectedValue(new Error("Cannot read Cline CLI session: broken"));
+
+			await runWorker("/test/cwd");
+
+			expect(readClineCliTranscript).toHaveBeenCalledWith(
+				"/cline-cli/session-broken.json",
+				null,
+				"2026-04-01T12:00:00.000Z",
+			);
+			expect(storeSummary).toHaveBeenCalled();
+			expect(saveCursor).not.toHaveBeenCalledWith(
+				expect.objectContaining({ transcriptPath: "/cline-cli/session-broken.json" }),
+				"/test/cwd",
+			);
 		});
 	});
 

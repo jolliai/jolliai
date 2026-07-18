@@ -24,6 +24,8 @@
 
 import { createLogger, errMsg } from "../Logger.js";
 import type { SessionInfo, TranscriptEntry, TranscriptReadResult, TranscriptSource } from "../Types.js";
+import { readClineCliTranscript } from "./ClineCliTranscriptReader.js";
+import { readClineTranscript } from "./ClineTranscriptReader.js";
 import { applyOverlay, loadOverlay } from "./ConversationOverlayStore.js";
 import { readCopilotChatTranscript } from "./CopilotChatTranscriptReader.js";
 import { readCopilotTranscript } from "./CopilotTranscriptReader.js";
@@ -130,6 +132,10 @@ async function readUnreadTranscript(
 			return readCopilotTranscript(transcriptPath, cursor);
 		case "copilot-chat":
 			return readCopilotChatTranscript(transcriptPath, cursor ?? undefined);
+		case "cline":
+			return readClineTranscript(transcriptPath, cursor);
+		case "cline-cli":
+			return readClineCliTranscript(transcriptPath, cursor);
 		case "codex":
 			return readTranscript(transcriptPath, cursor, getParserForSource("codex"));
 		default:

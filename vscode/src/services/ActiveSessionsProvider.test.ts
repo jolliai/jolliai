@@ -101,6 +101,8 @@ describe("ActiveSessionsProvider", () => {
 		expect(result.items).toEqual([]);
 		expect([...result.failedSources].sort()).toEqual([
 			"claude",
+			"cline",
+			"cline-cli",
 			"codex",
 			"copilot",
 			"copilot-chat",

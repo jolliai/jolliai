@@ -222,6 +222,8 @@ async function collectFromAllSources(cwd: string): Promise<CollectResult> {
 		loadOpenCode(cwd),
 		loadCopilot(cwd),
 		loadCopilotChat(cwd),
+		loadCline(cwd),
+		loadClineCli(cwd),
 	]);
 	const sessions: SessionInfo[] = [];
 	const failedSources: TranscriptSource[] = [];
@@ -325,5 +327,35 @@ async function loadCopilotChat(cwd: string): Promise<LoaderResult> {
 	} catch (err) {
 		log.warn("scanCopilotChatSessions threw: %s", errMsg(err));
 		return { sessions: [], failed: ["copilot-chat"] };
+	}
+}
+
+async function loadCline(cwd: string): Promise<LoaderResult> {
+	try {
+		const { scanClineSessions } = await import("./ClineSessionDiscoverer.js");
+		const r = await scanClineSessions(cwd);
+		if (r.error) {
+			log.warn("scanClineSessions reported %s: %s", r.error.kind, r.error.message);
+			return { sessions: r.sessions, failed: ["cline"] };
+		}
+		return { sessions: r.sessions, failed: [] };
+	} catch (err) {
+		log.warn("scanClineSessions threw: %s", errMsg(err));
+		return { sessions: [], failed: ["cline"] };
+	}
+}
+
+async function loadClineCli(cwd: string): Promise<LoaderResult> {
+	try {
+		const { scanClineCliSessions } = await import("./ClineCliSessionDiscoverer.js");
+		const r = await scanClineCliSessions(cwd);
+		if (r.error) {
+			log.warn("scanClineCliSessions reported %s: %s", r.error.kind, r.error.message);
+			return { sessions: r.sessions, failed: ["cline-cli"] };
+		}
+		return { sessions: r.sessions, failed: [] };
+	} catch (err) {
+		log.warn("scanClineCliSessions threw: %s", errMsg(err));
+		return { sessions: [], failed: ["cline-cli"] };
 	}
 }

@@ -99,6 +99,28 @@ vi.mock("../core/CopilotChatSessionDiscoverer.js", () => ({
 	discoverCopilotChatSessions: vi.fn().mockResolvedValue([]),
 }));
 
+// Mock ClineDetector for status/install checks
+vi.mock("../core/ClineDetector.js", () => ({
+	isClineInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+// Mock ClineCliDetector for status/install checks
+vi.mock("../core/ClineCliDetector.js", () => ({
+	isClineCliInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+// Mock ClineSessionDiscoverer for status/install checks
+vi.mock("../core/ClineSessionDiscoverer.js", () => ({
+	scanClineSessions: vi.fn().mockResolvedValue({ sessions: [] }),
+	discoverClineSessions: vi.fn().mockResolvedValue([]),
+}));
+
+// Mock ClineCliSessionDiscoverer for status/install checks
+vi.mock("../core/ClineCliSessionDiscoverer.js", () => ({
+	scanClineCliSessions: vi.fn().mockResolvedValue({ sessions: [] }),
+	discoverClineCliSessions: vi.fn().mockResolvedValue([]),
+}));
+
 // Mock SchemaV5Migration so install() doesn't spawn real git fast-import on
 // every test. `install()` both statically imports `readSchemaV5State` (for
 // status) and dynamically imports `migrateSchemaToV5` (for the auto-upgrade
@@ -213,6 +235,14 @@ describe("Installer", () => {
 		const { scanCopilotChatSessions } = await import("../core/CopilotChatSessionDiscoverer.js");
 		vi.mocked(isCopilotChatInstalled).mockResolvedValue(false);
 		vi.mocked(scanCopilotChatSessions).mockResolvedValue({ sessions: [] });
+		const { isClineInstalled } = await import("../core/ClineDetector.js");
+		const { scanClineSessions } = await import("../core/ClineSessionDiscoverer.js");
+		vi.mocked(isClineInstalled).mockResolvedValue(false);
+		vi.mocked(scanClineSessions).mockResolvedValue({ sessions: [] });
+		const { isClineCliInstalled } = await import("../core/ClineCliDetector.js");
+		const { scanClineCliSessions } = await import("../core/ClineCliSessionDiscoverer.js");
+		vi.mocked(isClineCliInstalled).mockResolvedValue(false);
+		vi.mocked(scanClineCliSessions).mockResolvedValue({ sessions: [] });
 	});
 
 	afterEach(async () => {
@@ -429,6 +459,55 @@ describe("Installer", () => {
 
 			const globalConfig = await loadConfigFromDir(getGlobalConfigDir());
 			expect(globalConfig.copilotEnabled).toBeUndefined();
+		});
+
+		it("auto-enables clineEnabled when the Cline VS Code extension is detected", async () => {
+			const { isClineInstalled } = await import("../core/ClineDetector.js");
+			vi.mocked(isClineInstalled).mockResolvedValueOnce(true);
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.clineEnabled).toBe(true);
+		});
+
+		it("auto-enables clineEnabled when only the Cline CLI is detected", async () => {
+			const { isClineInstalled } = await import("../core/ClineDetector.js");
+			const { isClineCliInstalled } = await import("../core/ClineCliDetector.js");
+			vi.mocked(isClineInstalled).mockResolvedValueOnce(false);
+			vi.mocked(isClineCliInstalled).mockResolvedValueOnce(true);
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.clineEnabled).toBe(true);
+		});
+
+		it("does not overwrite clineEnabled when explicitly set", async () => {
+			const { isClineInstalled } = await import("../core/ClineDetector.js");
+			vi.mocked(isClineInstalled).mockResolvedValueOnce(true);
+			await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ clineEnabled: false }), "utf-8");
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.clineEnabled).toBe(false);
+		});
+
+		it("does not auto-enable clineEnabled when neither Cline form is present", async () => {
+			const { isClineInstalled } = await import("../core/ClineDetector.js");
+			const { isClineCliInstalled } = await import("../core/ClineCliDetector.js");
+			vi.mocked(isClineInstalled).mockResolvedValueOnce(false);
+			vi.mocked(isClineCliInstalled).mockResolvedValueOnce(false);
+
+			await install(tempDir);
+
+			const { loadConfigFromDir, getGlobalConfigDir } = await import("../core/SessionTracker.js");
+			const globalConfig = await loadConfigFromDir(getGlobalConfigDir());
+			expect(globalConfig.clineEnabled).toBeUndefined();
 		});
 
 		it("should use process.cwd() when install is called without cwd", async () => {
@@ -2518,6 +2597,78 @@ describe("Installer", () => {
 			expect(status.activeSessions).toBeGreaterThanOrEqual(1);
 			expect(status.sessionsBySource?.copilot).toBe(1);
 			expect(status.copilotScanError).toBeUndefined();
+		});
+
+		it("includes clineDetected/clineEnabled in status when either Cline surface is present", async () => {
+			const { isClineInstalled } = await import("../core/ClineDetector.js");
+			const { saveConfigScoped } = await import("../core/SessionTracker.js");
+			vi.mocked(isClineInstalled).mockResolvedValue(true);
+			await saveConfigScoped({ clineEnabled: true }, emptyGlobalDir);
+			const status = await getStatus(tempDir);
+			expect(status.clineDetected).toBe(true);
+			expect(status.clineEnabled).toBe(true);
+		});
+
+		it("reports Cline CLI and VS Code variants separately in status", async () => {
+			const { isClineInstalled } = await import("../core/ClineDetector.js");
+			const { isClineCliInstalled } = await import("../core/ClineCliDetector.js");
+			const { saveConfigScoped } = await import("../core/SessionTracker.js");
+			vi.mocked(isClineInstalled).mockResolvedValue(false);
+			vi.mocked(isClineCliInstalled).mockResolvedValue(true);
+			await saveConfigScoped({ clineEnabled: true }, emptyGlobalDir);
+			const status = await getStatus(tempDir);
+			expect(status.clineCliDetected).toBe(true);
+			expect(status.clineVscodeDetected).toBe(false);
+			expect(status.clineDetected).toBe(true);
+		});
+
+		it("surfaces clineScanError from the extension or CLI scan", async () => {
+			const { isClineInstalled } = await import("../core/ClineDetector.js");
+			const { scanClineSessions } = await import("../core/ClineSessionDiscoverer.js");
+			const { saveConfigScoped } = await import("../core/SessionTracker.js");
+			vi.mocked(isClineInstalled).mockResolvedValue(true);
+			vi.mocked(scanClineSessions).mockResolvedValue({
+				sessions: [],
+				error: { kind: "parse", message: "unexpected token" },
+			});
+			await saveConfigScoped({ clineEnabled: true }, emptyGlobalDir);
+			const status = await getStatus(tempDir);
+			expect(status.clineScanError).toEqual({ kind: "parse", message: "unexpected token" });
+		});
+
+		it("merges Cline extension and CLI sessions into the active session count", async () => {
+			const { isClineInstalled } = await import("../core/ClineDetector.js");
+			const { scanClineSessions } = await import("../core/ClineSessionDiscoverer.js");
+			const { scanClineCliSessions } = await import("../core/ClineCliSessionDiscoverer.js");
+			const { saveConfigScoped } = await import("../core/SessionTracker.js");
+			vi.mocked(isClineInstalled).mockResolvedValue(true);
+			vi.mocked(scanClineSessions).mockResolvedValue({
+				sessions: [
+					{
+						sessionId: "cline-ext-1",
+						transcriptPath: "/fake/globalStorage/saoudrizwan.claude-dev/tasks/cline-ext-1",
+						updatedAt: new Date().toISOString(),
+						source: "cline",
+					},
+				],
+			});
+			vi.mocked(scanClineCliSessions).mockResolvedValue({
+				sessions: [
+					{
+						sessionId: "cline-cli-1",
+						transcriptPath: "/fake/.cline/data/sessions/cline-cli-1",
+						updatedAt: new Date().toISOString(),
+						source: "cline-cli",
+					},
+				],
+			});
+			await saveConfigScoped({ clineEnabled: true }, emptyGlobalDir);
+
+			const status = await getStatus(tempDir);
+
+			expect(status.sessionsBySource?.cline).toBe(1);
+			expect(status.sessionsBySource?.["cline-cli"]).toBe(1);
+			expect(status.clineScanError).toBeUndefined();
 		});
 
 		it("should count legacy sessions without a source as Claude sessions", async () => {

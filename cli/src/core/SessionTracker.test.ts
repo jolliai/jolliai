@@ -1607,6 +1607,25 @@ describe("SessionTracker", () => {
 			const filtered = filterSessionsByEnabledIntegrations(sessions, {});
 			expect(filtered.map((s) => s.sessionId)).toEqual(["b"]);
 		});
+
+		it("clineEnabled:false drops cline + cline-cli", () => {
+			const sessions: ReadonlyArray<SessionInfo> = [
+				{ sessionId: "a", transcriptPath: "/a", updatedAt: "2026-05-06T00:00:00Z", source: "cline" },
+				{ sessionId: "b", transcriptPath: "/b", updatedAt: "2026-05-06T00:00:00Z", source: "cline-cli" },
+				{ sessionId: "c", transcriptPath: "/c", updatedAt: "2026-05-06T00:00:00Z", source: "claude" },
+			];
+			const filtered = filterSessionsByEnabledIntegrations(sessions, { clineEnabled: false });
+			expect(filtered.map((s) => s.source)).toEqual(["claude"]);
+		});
+
+		it("includes cline + cline-cli sessions when clineEnabled is unset (auto-detect)", () => {
+			const sessions: ReadonlyArray<SessionInfo> = [
+				{ sessionId: "a", transcriptPath: "/a", updatedAt: "2026-05-06T00:00:00Z", source: "cline" },
+				{ sessionId: "b", transcriptPath: "/b", updatedAt: "2026-05-06T00:00:00Z", source: "cline-cli" },
+			];
+			const filtered = filterSessionsByEnabledIntegrations(sessions, {});
+			expect(filtered.map((s) => s.sessionId)).toEqual(["a", "b"]);
+		});
 	});
 
 	// ── git operation queue ────────────────────────────────────────────────
