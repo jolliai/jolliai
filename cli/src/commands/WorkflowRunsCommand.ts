@@ -22,6 +22,9 @@
 import type { Command } from "commander";
 import { JolliMemoryPushClient } from "../core/JolliMemoryPushClient.js";
 import { shapeRunHistoryEntry } from "../core/WorkflowRunReport.js";
+import { createLogger } from "../Logger.js";
+
+const log = createLogger("WorkflowRunsCommand");
 
 /** Registers the `workflow-runs` command on the given Commander program. */
 export function registerWorkflowRunsCommand(program: Command): void {
@@ -36,7 +39,12 @@ export function registerWorkflowRunsCommand(program: Command): void {
 			try {
 				const runs = await client.listWorkflowRuns(id);
 				console.log(JSON.stringify({ type: "runs", runs: runs.map(shapeRunHistoryEntry) }));
-			} catch {
+			} catch (error: unknown) {
+				// The empty-list degrade is deliberate (an unavailable history is a normal
+				// "no history yet" outcome for the agent, never a crash), but log the
+				// swallowed cause at debug so a genuine fault stays diagnosable rather than
+				// silently looking identical to a truly empty history.
+				log.debug("workflow-runs: listWorkflowRuns failed, degrading to empty list — %s", String(error));
 				console.log(JSON.stringify({ type: "runs", runs: [] }));
 			}
 		});

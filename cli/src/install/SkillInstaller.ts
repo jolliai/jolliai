@@ -126,7 +126,8 @@ const SKILLS: ReadonlyArray<SkillRegistration> = [
 
 /**
  * Skill paths recorded in `.git/info/exclude` so they don't pollute
- * `git status` in user repositories. Always 12 entries: 6 skills × 2 targets.
+ * `git status` in user repositories. Derived as {@link SKILLS} × {@link SKILL_TARGETS},
+ * so the count tracks those two lists automatically (one entry per skill per target).
  * Path format follows git's gitignore syntax — leading `/` anchors to the
  * repo root, trailing `/` matches the directory and its contents.
  */
