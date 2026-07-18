@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	buildJolliMenuSkillTemplate,
 	buildLocalRunSkillTemplate,
 	buildRecallSkillTemplate,
 	buildRemoteRunSkillTemplate,
@@ -531,6 +532,18 @@ describe("jolli-remote-run template", () => {
 		expect(t).toContain('"$HOME/.jolli/jollimemory/run-cli" open-url <url>');
 		expect(t).toMatch(/headless/);
 		expect(t).toContain("Only `https` URLs are accepted");
+	});
+
+	it("every open-url recipe/menu notes that an off-allowlist URL is refused-and-printed (Step 8)", () => {
+		// The open-url origin-allowlist gate refuses (never launches) an off-allowlist
+		// URL and prints it with `refused: true`; each template that shells open-url must
+		// tell the agent to surface such a URL for manual opening, not treat it as an error.
+		for (const build of [buildLocalRunSkillTemplate, buildRemoteRunSkillTemplate, buildJolliMenuSkillTemplate]) {
+			const t = build();
+			expect(t).toMatch(/off Jolli's allowlist is refused/);
+			expect(t).toContain('"refused": true');
+			expect(t).toMatch(/open manually/);
+		}
 	});
 
 	it("notes that an in-flight remote run can be cancelled via cancel_remote_workflow", () => {

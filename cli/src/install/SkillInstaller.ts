@@ -998,7 +998,7 @@ name: jolli-local-run
 description: Run a Jolli workflow locally — your own agent executes the workflow's recipe (no Jolli LLM budget) and its file writes land in a git-backed Jolli Space via a branch and pull request that space-cli opens on this machine. Use when the user wants to run a Jolli workflow locally.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 3
+  revision: 4
   vendor: "jolli.ai"
 ---
 
@@ -1181,7 +1181,10 @@ fresh across the wait.
 
    It prints one JSON line \`{ "opened": true|false, "url": "..." }\`. When \`opened\` is
    \`false\` (headless / no browser available) the URL is printed for the user to copy
-   instead — that is normal, not a failure. Only \`https\` URLs are accepted.
+   instead — that is normal, not a failure. Only \`https\` URLs are accepted. A URL
+   whose origin is off Jolli's allowlist is refused (never launched) and printed
+   instead — the result carries \`"refused": true\`; surface that URL for the user to
+   open manually, not as an error.
 
 ## Step 7 — on cancel: abandon
 
@@ -1219,7 +1222,7 @@ name: jolli-remote-run
 description: Run a Jolli workflow remotely — the Jolli backend executes the workflow server-side; this recipe triggers the run, monitors it to completion, reports the outcome (failed / cancelled / succeeded) with its article, PR, and workflow links, and offers to open any in your browser. Use when the user wants to run a Jolli workflow remotely (on the Jolli backend).
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 1
+  revision: 2
   vendor: "jolli.ai"
 ---
 
@@ -1317,7 +1320,10 @@ the user chooses, shell:
 
 It prints one JSON line \`{ "opened": true|false, "url": "..." }\`. When \`opened\` is
 \`false\` (headless / no browser available) the URL is printed for the user to copy
-instead — that is normal, not a failure. Only \`https\` URLs are accepted.
+instead — that is normal, not a failure. Only \`https\` URLs are accepted. A URL whose
+origin is off Jolli's allowlist is refused (never launched) and printed instead — the
+result carries \`"refused": true\`; surface that URL for the user to open manually, not
+as an error.
 
 ## Cancelling an in-flight run
 
@@ -1354,7 +1360,7 @@ name: jolli
 description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, pr, run a workflow local or remote, workflow history) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 2
+  revision: 3
   vendor: "jolli.ai"
 ---
 
@@ -1417,7 +1423,9 @@ Assemble ONE combined list of actions from two sources.
   \`\`\`
 
   (\`{ "opened": true|false, "url": "..." }\`; \`opened: false\` on a headless host
-  just prints the URL — normal, not a failure. Only \`https\` URLs are accepted.)
+  just prints the URL — normal, not a failure. Only \`https\` URLs are accepted. A URL
+  whose origin is off Jolli's allowlist is refused (never launched) and printed — the
+  result carries \`"refused": true\`; surface it for the user to open manually.)
 
 Route a local, remote, or history choice by invoking that skill through your
 host's skill-invocation mechanism (for example, the Skill tool in Claude Code);
