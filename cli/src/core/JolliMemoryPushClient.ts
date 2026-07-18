@@ -28,6 +28,7 @@ import type {
 	WorkflowRunPullRequest,
 	WorkflowRunWrittenArticle,
 } from "./WorkflowRunReport.js";
+import { PlatformToolUnavailableError } from "./WorkflowRunReport.js";
 
 const log = createLogger("JolliMemoryPushClient");
 
@@ -786,7 +787,7 @@ export class JolliMemoryPushClient {
 		const manifest = await this.fetchManifest();
 		const tool = manifest.find((entry) => entry.name === GET_RUN_STATUS_TOOL_NAME);
 		if (!tool) {
-			throw new Error(
+			throw new PlatformToolUnavailableError(
 				`Platform tool "${GET_RUN_STATUS_TOOL_NAME}" is unavailable (platform tools off or backend too old).`,
 			);
 		}
@@ -813,7 +814,7 @@ export class JolliMemoryPushClient {
 		const manifest = await this.fetchManifest();
 		const tool = manifest.find((entry) => entry.name === LIST_WORKFLOW_RUNS_TOOL_NAME);
 		if (!tool) {
-			throw new Error(
+			throw new PlatformToolUnavailableError(
 				`Platform tool "${LIST_WORKFLOW_RUNS_TOOL_NAME}" is unavailable (platform tools off or backend too old).`,
 			);
 		}

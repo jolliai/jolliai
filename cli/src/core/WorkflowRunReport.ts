@@ -18,6 +18,20 @@
  */
 
 /**
+ * Thrown by the run read-methods (`getRunStatus` / `listWorkflowRuns`) when the
+ * backing platform tool is absent from the manifest (platform tools off / backend
+ * too old). Structurally PERMANENT — unlike a transient transport blip, retrying
+ * will not make the tool appear — so the run monitor fails fast on it instead of
+ * burning its transient-retry budget and the ~29s of backoff that costs.
+ */
+export class PlatformToolUnavailableError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "PlatformToolUnavailableError";
+	}
+}
+
+/**
  * The run's lifecycle status on the wire. Terminal values are `completed` /
  * `failed` / `cancelled`; `queued` / `active` are in-progress. NB the success
  * value is `completed`, NOT `succeeded` (`succeeded` is the shaper's presentation
