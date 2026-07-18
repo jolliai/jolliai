@@ -17,6 +17,7 @@ import {
 	PermissionDeniedError,
 	type PlatformToolManifestEntry,
 } from "./JolliMemoryPushClient.js";
+import { PlatformToolUnavailableError } from "./WorkflowRunReport.js";
 
 const KEY = "sk-jol-test"; // parseJolliApiKey may return null for a plain key → baseUrlOverride supplies the URL
 function client(fetchImpl: typeof fetch) {
@@ -1492,9 +1493,11 @@ describe("getRunStatus", () => {
 		expect(run.status).toBe("completed");
 	});
 
-	it("throws when get_run_status is absent from the manifest (platform tools off)", async () => {
+	it("throws a PlatformToolUnavailableError when get_run_status is absent from the manifest (platform tools off)", async () => {
 		const c = client(routed(() => jsonResponse(200, {})));
 		await expect(c.getRunStatus("run-1")).rejects.toThrow(/get_run_status.*unavailable/);
+		// Typed so the monitor can fail fast on it instead of retrying a permanent error.
+		await expect(c.getRunStatus("run-1")).rejects.toBeInstanceOf(PlatformToolUnavailableError);
 	});
 
 	it("throws when the manifest fetch itself fails (404 surface disabled)", async () => {
@@ -1797,9 +1800,10 @@ describe("listWorkflowRuns", () => {
 		await expect(nonArrayRuns.listWorkflowRuns(7)).resolves.toEqual([]);
 	});
 
-	it("throws when list_workflow_runs is absent from the manifest", async () => {
+	it("throws a PlatformToolUnavailableError when list_workflow_runs is absent from the manifest", async () => {
 		const c = client(routed(() => jsonResponse(200, {})));
 		await expect(c.listWorkflowRuns(7)).rejects.toThrow(/list_workflow_runs.*unavailable/);
+		await expect(c.listWorkflowRuns(7)).rejects.toBeInstanceOf(PlatformToolUnavailableError);
 	});
 
 	it("throws (loud) on a non-2xx invocation so the command can degrade", async () => {

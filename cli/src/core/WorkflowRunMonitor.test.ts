@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { monitorRun, realSleep } from "./WorkflowRunMonitor.js";
-import type { WorkflowRunPayload } from "./WorkflowRunReport.js";
+import { PlatformToolUnavailableError, type WorkflowRunPayload } from "./WorkflowRunReport.js";
 
 /** A minimal running (`active`) payload carrying a workflow deep-link. */
 function running(overrides: Partial<WorkflowRunPayload> = {}): WorkflowRunPayload {
@@ -85,6 +85,47 @@ describe("monitorRun", () => {
 		expect(report.status).toBe("running");
 		expect(report.timedOut).toBe(true);
 		expect(report.openableUrls).toEqual([]);
+	});
+
+	it("includes the run deep-link (not just the workflow URL) in a timedOut report when the payload carried one", async () => {
+		const getRunStatus = vi.fn().mockResolvedValue(running({ runUrl: "https://jolli.ai/w/1/r/run_1" }));
+		const sleep = vi.fn().mockResolvedValue(undefined);
+
+		const report = await monitorRun({ getRunStatus, sleep }, "run_1", FAST);
+
+		expect(report.status).toBe("running");
+		expect(report.timedOut).toBe(true);
+		// The run URL points straight at the still-in-progress run for the user to watch.
+		expect(report.openableUrls).toEqual([
+			{ kind: "workflow", url: "https://jolli.ai/w/1" },
+			{ kind: "run", url: "https://jolli.ai/w/1/r/run_1" },
+		]);
+	});
+
+	it("does not sleep after the final attempt (the trailing backoff would poll nothing)", async () => {
+		const getRunStatus = vi.fn().mockResolvedValue(running());
+		const sleep = vi.fn().mockResolvedValue(undefined);
+
+		await monitorRun({ getRunStatus, sleep }, "run_1", FAST);
+
+		// maxAttempts=5 non-terminal polls ⇒ a sleep between each of the first four,
+		// but NOT after the fifth (the loop exits straight into the timedOut report).
+		expect(getRunStatus).toHaveBeenCalledTimes(5);
+		expect(sleep).toHaveBeenCalledTimes(4);
+	});
+
+	it("re-throws a PlatformToolUnavailableError immediately without retrying or sleeping", async () => {
+		const getRunStatus = vi
+			.fn()
+			.mockRejectedValue(new PlatformToolUnavailableError('Platform tool "get_run_status" is unavailable.'));
+		const sleep = vi.fn().mockResolvedValue(undefined);
+
+		await expect(monitorRun({ getRunStatus, sleep }, "run_1", FAST)).rejects.toBeInstanceOf(
+			PlatformToolUnavailableError,
+		);
+		// Permanent error ⇒ fail fast: one call, no transient retries, no backoff.
+		expect(getRunStatus).toHaveBeenCalledTimes(1);
+		expect(sleep).not.toHaveBeenCalled();
 	});
 
 	it("retries a transient throw then succeeds", async () => {
