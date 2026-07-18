@@ -1083,6 +1083,19 @@ export interface JolliMemoryConfig {
 	 * to on. The `JOLLI_MCP_PLATFORM_TOOLS=1` env var overrides it at read time.
 	 */
 	readonly mcpPlatformToolsEnabled?: boolean;
+	/**
+	 * Opt-in extra origins that `jolli open-url` may auto-launch, on top of its
+	 * built-in jolli-origin and known-git-host allowlist tiers. A **local-development
+	 * affordance** for tunnel/dev deployments whose deep-links come from a public base
+	 * host (e.g. an ngrok host) that is neither a jolli origin nor a known git host.
+	 * Each entry is a bare host (`x.ngrok-free.dev`) or a full `https://…` origin,
+	 * normalized to a host and matched with the same suffix-boundary rule as the other
+	 * tiers. Empty/absent by default ⇒ the gate is identical to the two-tier default
+	 * (production/normal users unaffected). The `JOLLI_OPEN_URL_ALLOWED_ORIGINS` env var
+	 * (comma-separated) is **merged with** these — env adds to config, it does not
+	 * replace it. The URL opened is still `https`-only regardless of this list.
+	 */
+	readonly openUrlAllowedOrigins?: ReadonlyArray<string>;
 	/** Enable Codex CLI session discovery at post-commit time (default: auto-detect) */
 	readonly codexEnabled?: boolean;
 	/** Enable Gemini CLI session tracking via AfterAgent hook (default: auto-detect) */

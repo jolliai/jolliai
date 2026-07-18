@@ -7,6 +7,10 @@ import { registerOpenUrlCommand } from "./OpenUrlCommand.js";
 const { openUrlOrPrintMock } = vi.hoisted(() => ({ openUrlOrPrintMock: vi.fn() }));
 vi.mock("../core/OpenUrl.js", () => ({ openUrlOrPrint: openUrlOrPrintMock }));
 
+// The command loads the persisted opt-in dev origins and passes them through.
+const { loadConfigMock } = vi.hoisted(() => ({ loadConfigMock: vi.fn() }));
+vi.mock("../core/SessionTracker.js", () => ({ loadConfig: loadConfigMock }));
+
 const URL_HTTPS = "https://jolli.ai/w/7/runs/abc";
 
 async function run(url: string): Promise<string> {
@@ -21,6 +25,8 @@ async function run(url: string): Promise<string> {
 beforeEach(() => {
 	process.exitCode = 0;
 	openUrlOrPrintMock.mockReset();
+	loadConfigMock.mockReset();
+	loadConfigMock.mockResolvedValue({});
 });
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -32,9 +38,19 @@ describe("open-url command", () => {
 		openUrlOrPrintMock.mockResolvedValue({ opened: true, url: URL_HTTPS });
 
 		const out = await run(URL_HTTPS);
-		expect(openUrlOrPrintMock).toHaveBeenCalledWith(URL_HTTPS);
+		expect(openUrlOrPrintMock).toHaveBeenCalledWith(URL_HTTPS, { configOrigins: undefined });
 		expect(JSON.parse(out)).toEqual({ opened: true, url: URL_HTTPS });
 		expect(process.exitCode).toBe(0);
+	});
+
+	it("passes the persisted openUrlAllowedOrigins config through to openUrlOrPrint", async () => {
+		loadConfigMock.mockResolvedValue({ openUrlAllowedOrigins: ["abc123.ngrok-free.dev"] });
+		openUrlOrPrintMock.mockResolvedValue({ opened: true, url: URL_HTTPS });
+
+		await run(URL_HTTPS);
+		expect(openUrlOrPrintMock).toHaveBeenCalledWith(URL_HTTPS, {
+			configOrigins: ["abc123.ngrok-free.dev"],
+		});
 	});
 
 	it("prints { opened: false, url } and exits 0 when it fell back to printing (headless)", async () => {
@@ -42,6 +58,20 @@ describe("open-url command", () => {
 
 		const out = await run(URL_HTTPS);
 		expect(JSON.parse(out)).toEqual({ opened: false, url: URL_HTTPS });
+		expect(process.exitCode).toBe(0);
+	});
+
+	it("passes through a refused (off-allowlist) result verbatim and exits 0", async () => {
+		const refused = {
+			opened: false,
+			url: "https://evil.example/x",
+			refused: true,
+			reason: "origin-not-allowlisted",
+		};
+		openUrlOrPrintMock.mockResolvedValue(refused);
+
+		const out = await run("https://evil.example/x");
+		expect(JSON.parse(out)).toEqual(refused);
 		expect(process.exitCode).toBe(0);
 	});
 
