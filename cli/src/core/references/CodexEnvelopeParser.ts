@@ -39,8 +39,10 @@
 
 import { createLogger } from "../../Logger.js";
 import { type CliBinding, matchCliCommand } from "./bindings/cli/index.js";
+import type { CodexNormalizeEnv } from "./bindings/codex/CodexBinding.js";
 import { CODEX_APPS_NAMESPACE_PREFIX, getCodexNormalizer } from "./bindings/codex/index.js";
 import { isObject } from "./guards.js";
+import { scanCodexUserPermalinks } from "./SlackPermalink.js";
 import type { SourceDefinition } from "./SourceDefinition.js";
 import { getRegistry } from "./SourceDefinitionRegistry.js";
 import type {
@@ -95,6 +97,15 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 	parse(lines: string[], opts: ExtractOptions): EnvelopeParseResult {
 		const fromLine = opts.fromLineNumber ?? 0;
 		const registry = getRegistry();
+		// Slack's url lives only in the pasted permalink (never the payload/args),
+		// so harvest it once per scan and thread it — plus the workspace-url
+		// fallback — into every normalize call, exactly as the Claude parser does.
+		// Scanning from line 0 (not `fromLine`) so a permalink pasted before the
+		// cursor still resolves a thread fetched after it.
+		const slackEnv: CodexNormalizeEnv = {
+			permalinks: scanCodexUserPermalinks(lines),
+			slackWorkspaceUrl: opts.slackWorkspaceUrl,
+		};
 
 		const calls = new Map<string, FunctionCallRow>();
 		const shellCalls = new Map<string, ShellCallRow>();
@@ -217,13 +228,17 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 			/* v8 ignore start -- every registry codex definition has a matching CodexBinding; guarded for totality. */
 			if (normalizer === undefined) continue;
 			/* v8 ignore stop */
-			emitted.add(callId);
-			// A gating normalizer (monday's itemIds gate) returns null to void — skip
-			// it rather than push a null payload, mirroring the Claude envelope's
-			// context-normalizer null handling. The call is still marked emitted so
-			// the FALLBACK never re-processes it.
-			const payload = normalizer.normalize(business, parseArguments(call.arguments));
+			// A normalizer returns null to void — skip it rather than push a null
+			// payload, mirroring the Claude envelope's context-normalizer null
+			// handling. Crucially, only mark the call `emitted` on SUCCESS: a null
+			// here can mean the payload was malformed/blank (e.g. Slack's url-less
+			// blob), for which a paired `mcp_tool_call_end` event is a valid recovery
+			// source — leaving the call open lets the FALLBACK retry it. A re-gating
+			// normalizer (monday's itemIds gate) simply gates closed again in the
+			// fallback (see the board-browse FALLBACK tests), so this never floods.
+			const payload = normalizer.normalize(business, parseArguments(call.arguments), slackEnv);
 			if (payload === null) continue;
+			emitted.add(callId);
 			results.push({
 				def,
 				toolName: normalizer.canonicalToolName,
@@ -268,11 +283,12 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 			let business = tryParse(ev.text);
 			if (business === null) continue;
 			// Recovery (NOT the main path): reaching the fallback for a call_id that
-			// ALSO has a function_call output means that output failed to parse (a
-			// successful parse would have emitted + marked it in PRIMARY). Some fields
-			// live ONLY on that malformed output (e.g. Jira's tenant webUrl), so let
-			// the binding stitch them onto this valid event payload. Bindings without
-			// this brittle edge leave `recover` unset.
+			// ALSO has a function_call output means that output either failed to parse
+			// or normalized to null (a successful, non-null normalize would have marked
+			// it `emitted` in PRIMARY). Some fields live ONLY on that malformed output
+			// (e.g. Jira's tenant webUrl), so let the binding stitch them onto this
+			// valid event payload. Bindings without this brittle edge leave `recover`
+			// unset.
 			if (normalizer.recover !== undefined && ev.callId !== undefined) {
 				const rawOutput = outputs.get(ev.callId)?.output;
 				if (rawOutput !== undefined) {
@@ -291,7 +307,7 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 			// when NEITHER is present — dropping is safer than flooding a whole board.
 			const toolInput =
 				ev.arguments ?? (ev.callId !== undefined ? parseArguments(calls.get(ev.callId)?.arguments) : undefined);
-			const payload = normalizer.normalize(business, toolInput);
+			const payload = normalizer.normalize(business, toolInput, slackEnv);
 			if (payload === null) continue;
 			results.push({
 				def,

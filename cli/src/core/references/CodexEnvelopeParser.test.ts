@@ -1121,3 +1121,154 @@ describe("CodexEnvelopeParser.parse — monday (itemIds gate from event or funct
 		expect(results.filter((r) => r.def.id === "monday")).toHaveLength(0);
 	});
 });
+
+// ─── Slack thread (codex_apps slack connector) ───────────────────────────────
+// Real 2026-07-18 rollout shape: the pasted permalink lives in a user turn (two
+// line variants), the thread result arrives via mcp_tool_call_end ONLY (no
+// function_call_output), and neither the tool args nor the result carry a url.
+
+const SLACK_PERMALINK = "https://flyer-q4r7867.slack.com/archives/C0BFF9UHBD1/p1783413984700009";
+const SLACK_THREAD_BLOB = {
+	messages:
+		"=== THREAD PARENT MESSAGE ===\n" +
+		"From: Flyer Li <li@example.com> (U0BGFSM16DN)\n" +
+		"Time: 2026-07-07 16:46:24 CST\n" +
+		"Message TS: 1783413984.700009\n" +
+		"Consolidate the existing MCP reference integrations into one engine.\n\n" +
+		"=== THREAD REPLIES (2 total) ===\n\n" +
+		"--- Reply 1 of 2 ---\nMessage TS: 1783415917.422609\nConfig-driven MCP integration\n",
+};
+const SLACK_ARGS = JSON.stringify({ channel_id: "C0BFF9UHBD1", message_ts: "1783413984.700009", limit: 50 });
+
+/** Codex response_item `message` (role:user) with input_text blocks. */
+function codexUserMsg(text: string): string {
+	return jsonl({
+		type: "response_item",
+		timestamp: TS,
+		payload: { type: "message", role: "user", content: [{ type: "input_text", text }] },
+	});
+}
+
+/** Codex event `user_message` with a bare string message. */
+function codexUserMessageEvent(text: string): string {
+	return jsonl({ type: "event_msg", timestamp: TS, payload: { type: "user_message", message: text } });
+}
+
+describe("CodexEnvelopeParser — Slack thread connector", () => {
+	it("captures the thread via the mcp_tool_call_end event, url harvested from the pasted permalink", () => {
+		const lines = [
+			codexUserMsg(`[${SLACK_PERMALINK}](${SLACK_PERMALINK})\n`),
+			fnCall("mcp__codex_apps__slack", "_slack_read_thread", "c_slack", SLACK_ARGS),
+			toolCallEnd("slack.slack_read_thread", "c_slack", SLACK_THREAD_BLOB, {
+				channel_id: "C0BFF9UHBD1",
+				message_ts: "1783413984.700009",
+				limit: 50,
+			}),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("slack");
+		expect(results[0].toolName).toBe("mcp__claude_ai_Slack__slack_read_thread");
+		const p = results[0].payload as { channelId: string; parentTs: string; url?: string };
+		expect(p).toMatchObject({ channelId: "C0BFF9UHBD1", parentTs: "1783413984.700009", url: SLACK_PERMALINK });
+	});
+
+	it("harvests the permalink from the bare-string user_message event shape too", () => {
+		const lines = [
+			codexUserMessageEvent(`${SLACK_PERMALINK}\n`),
+			toolCallEnd("slack.slack_read_thread", "c_slack2", SLACK_THREAD_BLOB, {
+				channel_id: "C0BFF9UHBD1",
+				message_ts: "1783413984.700009",
+			}),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect((results[0].payload as { url?: string }).url).toBe(SLACK_PERMALINK);
+	});
+
+	it("reconstructs the url from slackWorkspaceUrl when no permalink was pasted", () => {
+		const lines = [
+			toolCallEnd("slack.slack_read_thread", "c_slack3", SLACK_THREAD_BLOB, {
+				channel_id: "C0BFF9UHBD1",
+				message_ts: "1783413984.700009",
+			}),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, { slackWorkspaceUrl: "https://flyer-q4r7867.slack.com" });
+		expect((results[0].payload as { url?: string }).url).toBe(SLACK_PERMALINK);
+	});
+
+	it("surfaces a urlless canonical when neither permalink nor workspace url is present (extractRef voids it downstream)", () => {
+		// The parser is a lower layer than extractRef: it still emits the canonical
+		// thread with no url. The slack definition marks url required, so
+		// `SourceEngine.extractRef` is where this urlless payload is voided — mirrors
+		// the Claude parser's equivalent test; nothing is stored end-to-end.
+		const lines = [
+			toolCallEnd("slack.slack_read_thread", "c_slack4", SLACK_THREAD_BLOB, {
+				channel_id: "C0BFF9UHBD1",
+				message_ts: "1783413984.700009",
+			}),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect((results[0].payload as { url?: string }).url).toBeUndefined();
+	});
+
+	it("voids the thread when the event carries no request arguments (no channel/ts to read)", () => {
+		// exec/apps event with neither `invocation.arguments` nor a paired
+		// function_call → readSlackToolInput gets `undefined` → normalize voids.
+		const lines = [toolCallEnd("slack.slack_read_thread", "c_slack_noargs", SLACK_THREAD_BLOB)];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.filter((r) => r.def.id === "slack")).toHaveLength(0);
+	});
+
+	it("voids the thread when request arguments lack channel_id/message_ts", () => {
+		const lines = [toolCallEnd("slack.slack_read_thread", "c_slack_badargs", SLACK_THREAD_BLOB, { limit: 50 })];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.filter((r) => r.def.id === "slack")).toHaveLength(0);
+	});
+
+	it("recovers the thread from the event when the paired function_call_output blob is malformed", () => {
+		// Regression guard: a slack function_call_output that normalizes to null
+		// (no parent `Message TS:` in the blob) must NOT mark the call `emitted` and
+		// suppress the valid mcp_tool_call_end event — that would silently drop the
+		// reference. The FALLBACK recovers it from the good event.
+		const lines = [
+			codexUserMsg(`[${SLACK_PERMALINK}](${SLACK_PERMALINK})\n`),
+			fnCall("mcp__codex_apps__slack", "_slack_read_thread", "c_recover", SLACK_ARGS),
+			fnOutput("c_recover", { messages: "no parent ts here" }, { wrap: "envelope", prefix: true }),
+			toolCallEnd("slack.slack_read_thread", "c_recover", SLACK_THREAD_BLOB, {
+				channel_id: "C0BFF9UHBD1",
+				message_ts: "1783413984.700009",
+			}),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		const slack = results.filter((r) => r.def.id === "slack");
+		expect(slack).toHaveLength(1);
+		expect((slack[0].payload as { url?: string }).url).toBe(SLACK_PERMALINK);
+	});
+});
+
+describe("CodexEnvelopeParser end-to-end — Slack thread via extractReferencesFromTranscript", () => {
+	let dir: string;
+	let file: string;
+	beforeAll(() => {
+		dir = mkdtempSync(join(tmpdir(), "codex-slack-"));
+		file = join(dir, "rollout.jsonl");
+		const lines = [
+			codexUserMsg(`[${SLACK_PERMALINK}](${SLACK_PERMALINK})\n`),
+			fnCall("mcp__codex_apps__slack", "_slack_read_thread", "c_slack", SLACK_ARGS),
+			toolCallEnd("slack.slack_read_thread", "c_slack", SLACK_THREAD_BLOB, {
+				channel_id: "C0BFF9UHBD1",
+				message_ts: "1783413984.700009",
+			}),
+		];
+		writeFileSync(file, `${lines.join("\n")}\n`, "utf-8");
+	});
+	afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+	it("stores a slack reference with the harvested permalink url", async () => {
+		const { references } = await extractReferencesFromTranscript(file, { source: "codex" });
+		const ref = references.find((r) => r.mapKey === "slack:C0BFF9UHBD1-1783413984.700009");
+		expect(ref?.url).toBe(SLACK_PERMALINK);
+		expect(ref?.title?.startsWith("Consolidate")).toBe(true);
+	});
+});
