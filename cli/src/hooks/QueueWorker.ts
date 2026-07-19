@@ -45,6 +45,8 @@ import { readCopilotTranscript } from "../core/CopilotTranscriptReader.js";
 import { isCursorInstalled } from "../core/CursorDetector.js";
 import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
+import { discoverDevinSessions, isDevinInstalled } from "../core/DevinSessionDiscoverer.js";
+import { readDevinTranscript } from "../core/DevinTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
@@ -3217,6 +3219,14 @@ async function loadSessionTranscripts(
 			log.info("Discovered %d Cline CLI session(s)", clineCliSessions.length);
 		}
 	}
+	// Discover Devin CLI sessions (on-demand SQLite scan of the global sessions.db).
+	if (config.devinEnabled !== false && (await isDevinInstalled())) {
+		const devinSessions = await discoverDevinSessions(cwd);
+		if (devinSessions.length > 0) {
+			allSessions = [...allSessions, ...devinSessions];
+			log.info("Discovered %d Devin session(s)", devinSessions.length);
+		}
+	}
 
 	if (allSessions.length === 0) {
 		log.info("No active sessions found — will infer topics from diff if available");
@@ -3491,6 +3501,13 @@ async function readAllTranscripts(
 				result = await readClineCliTranscript(session.transcriptPath, cursor, beforeTimestamp);
 			} catch (error: unknown) {
 				log.error("Skipping Cline CLI session %s: %s", session.sessionId, (error as Error).message);
+				continue;
+			}
+		} else if (source === "devin") {
+			try {
+				result = await readDevinTranscript(session.transcriptPath, cursor, beforeTimestamp);
+			} catch (error: unknown) {
+				log.error("Skipping Devin session %s: %s", session.sessionId, (error as Error).message);
 				continue;
 			}
 		} else {

@@ -34,6 +34,7 @@ const PARSE_LINE: Record<TranscriptSource, (line: string) => string | undefined>
 	"copilot-chat": parseCopilotChatUserLine,
 	cline: parseClineUserLine,
 	"cline-cli": parseClineCliUserLine,
+	devin: parseDevinUserLine,
 };
 
 /**
@@ -156,6 +157,11 @@ function parseCursorUserLine(_line: string): string | undefined {
 
 function parseCopilotUserLine(_line: string): string | undefined {
 	// Same as OpenCode: Copilot CLI sessions carry SessionInfo.title (Task 2.4).
+	return undefined;
+}
+
+function parseDevinUserLine(_line: string): string | undefined {
+	// Same as OpenCode: Devin sessions carry SessionInfo.title from the discoverer.
 	return undefined;
 }
 

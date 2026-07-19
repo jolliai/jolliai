@@ -8,8 +8,8 @@
  * Sources split into two dispatch styles:
  *   - JSONL (claude / codex / copilot-chat) — line-streamed through the
  *     per-source parser in `PARSERS` below.
- *   - Single-artifact readers (gemini JSON file; opencode / cursor / copilot
- *     SQLite databases) — delegated to the dedicated reader module, whose
+ *   - Single-artifact readers (gemini JSON file; opencode / cursor / copilot /
+ *     devin SQLite databases) — delegated to the dedicated reader module, whose
  *     synthetic `<dbPath>#<sessionId>` `transcriptPath` is produced by the
  *     matching session discoverer.
  */
@@ -104,6 +104,18 @@ export async function loadTranscript(opts: LoadOptions): Promise<TranscriptEntry
 			return [];
 		}
 	}
+	if (opts.source === "devin") {
+		try {
+			const { readDevinTranscript } = await import("./DevinTranscriptReader.js");
+			const result = await readDevinTranscript(opts.transcriptPath);
+			return [...result.entries];
+		} catch (err) {
+			if (!isEnoent(err)) {
+				log.warn("loadTranscript (devin) failed for %s: %s", opts.transcriptPath, errMsg(err));
+			}
+			return [];
+		}
+	}
 	const entries: TranscriptEntry[] = [];
 	let parseSkipped = 0;
 	try {
@@ -149,12 +161,15 @@ export async function loadTranscript(opts: LoadOptions): Promise<TranscriptEntry
 
 /**
  * Per-line JSONL parsers. Sources that own a dedicated single-artifact
- * reader (`gemini` JSON file; `opencode` / `cursor` / `copilot` SQLite DBs;
- * `cline` / `cline-cli` plain-JSON files) are intentionally absent — those
- * are dispatched at the top of `loadTranscript` before this table is
- * consulted.
+ * reader (`gemini` JSON file; `opencode` / `cursor` / `copilot` / `devin`
+ * SQLite DBs; `cline` / `cline-cli` plain-JSON files) are intentionally
+ * absent — those are dispatched at the top of `loadTranscript` before this
+ * table is consulted.
  */
-type JsonlSource = Exclude<TranscriptSource, "gemini" | "opencode" | "cursor" | "copilot" | "cline" | "cline-cli">;
+type JsonlSource = Exclude<
+	TranscriptSource,
+	"gemini" | "opencode" | "cursor" | "copilot" | "cline" | "cline-cli" | "devin"
+>;
 const PARSERS: Record<JsonlSource, (line: string) => TranscriptEntry | undefined> = {
 	claude: parseClaude,
 	codex: parseCodex,

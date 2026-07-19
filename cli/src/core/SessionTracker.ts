@@ -185,6 +185,9 @@ export function filterSessionsByEnabledIntegrations(
 	if (config.clineEnabled === false) {
 		filtered = filtered.filter((s) => s.source !== "cline" && s.source !== "cline-cli");
 	}
+	if (config.devinEnabled === false) {
+		filtered = filtered.filter((s) => s.source !== "devin");
+	}
 	return filtered;
 }
 

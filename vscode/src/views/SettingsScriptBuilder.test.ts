@@ -110,6 +110,24 @@ describe("SettingsScriptBuilder", () => {
 		);
 	});
 
+	it("references the devinEnabled DOM input", () => {
+		expect(script).toContain("getElementById('devinEnabled')");
+	});
+
+	it("includes devinEnabled in validation guard", () => {
+		expect(script).toMatch(/!devinEnabledInput\.checked/);
+	});
+
+	it("ships devinEnabled in save payload", () => {
+		expect(script).toContain("devinEnabled: devinEnabledInput.checked");
+	});
+
+	it("loads devinEnabled from host message", () => {
+		expect(script).toContain(
+			"devinEnabledInput.checked = msg.settings.devinEnabled",
+		);
+	});
+
 	// ── DCO sign-off toggle ──
 
 	it("references the dcoSignoff DOM input", () => {

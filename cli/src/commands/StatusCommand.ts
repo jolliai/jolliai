@@ -415,6 +415,16 @@ export function registerStatusCommand(program: Command): void {
 					},
 				],
 				[
+					"Devin:",
+					status.devinDetected,
+					{
+						enabled: status.devinEnabled !== false,
+						hookInstalled: undefined,
+						sessionCount: counts.devin,
+						scanError: status.devinScanError,
+					},
+				],
+				[
 					"Copilot:",
 					anyCopilotDetected,
 					{

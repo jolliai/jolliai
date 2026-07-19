@@ -23,6 +23,7 @@ export const TRANSCRIPT_SOURCE_LABELS: Readonly<Record<TranscriptSource, string>
 	opencode: "OpenCode",
 	cline: "Cline (VS Code)",
 	"cline-cli": "Cline CLI",
+	devin: "Devin",
 };
 
 export function transcriptSourceLabel(source: TranscriptSource | undefined): string {

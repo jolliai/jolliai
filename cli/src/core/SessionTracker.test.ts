@@ -1626,6 +1626,15 @@ describe("SessionTracker", () => {
 			const filtered = filterSessionsByEnabledIntegrations(sessions, {});
 			expect(filtered.map((s) => s.sessionId)).toEqual(["a", "b"]);
 		});
+
+		it("filterSessionsByEnabledIntegrations drops devin when devinEnabled is false", () => {
+			const sessions = [
+				{ sessionId: "a", transcriptPath: "x#a", updatedAt: "2026-07-18T00:00:00Z", source: "devin" as const },
+				{ sessionId: "b", transcriptPath: "y#b", updatedAt: "2026-07-18T00:00:00Z", source: "codex" as const },
+			];
+			const out = filterSessionsByEnabledIntegrations(sessions, { devinEnabled: false });
+			expect(out.map((s) => s.source)).toEqual(["codex"]);
+		});
 	});
 
 	// ── git operation queue ────────────────────────────────────────────────

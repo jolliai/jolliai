@@ -784,6 +784,54 @@ describe("StatusTreeProvider", () => {
 		expect(cursor?.description).toBe("detected & enabled (3 sessions)");
 	});
 
+	// ── Devin scan error / healthy row ────────────────────────────────────
+
+	it("renders an 'unavailable' Devin row when devinScanError is present", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					devinDetected: true,
+					devinEnabled: true,
+					devinScanError: {
+						kind: "locked",
+						message: "database is locked",
+					},
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const devin = items.find((item) => item.label === "Devin Integration");
+		expect(devin?.description).toBe("unavailable — locked");
+		expect(String(devin?.tooltip)).toContain("database is locked");
+	});
+
+	it("falls back to the normal detected/enabled Devin row when no scan error", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					devinDetected: true,
+					devinEnabled: true,
+					sessionsBySource: { devin: 2 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const devin = items.find((item) => item.label === "Devin Integration");
+		expect(devin?.description).toBe("detected & enabled (2 sessions)");
+	});
+
 	// ── Copilot scan error ────────────────────────────────────────────────
 
 	it("shows Copilot Integration row when detected and enabled", async () => {

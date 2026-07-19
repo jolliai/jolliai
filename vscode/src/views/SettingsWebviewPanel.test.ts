@@ -1443,6 +1443,47 @@ describe("SettingsWebviewPanel", () => {
 			);
 		});
 
+		it("loads and saves Devin integration state", async () => {
+			const dispatch = await setupWithLoadedConfig({ devinEnabled: false });
+
+			dispatch({ command: "loadSettings", scope: "project" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ devinEnabled: false }),
+				}),
+			);
+
+			postMessage.mockClear();
+			dispatch({
+				command: "applySettings",
+				scope: "project",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					openCodeEnabled: true,
+					cursorEnabled: true,
+					devinEnabled: false,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ devinEnabled: false }),
+				expect.any(String),
+			);
+		});
+
 		it("loads copilotEnabled from config (default true)", async () => {
 			// When config has copilotEnabled: false, it should be sent as false
 			const dispatch = await setupWithLoadedConfig({ copilotEnabled: false });

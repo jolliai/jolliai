@@ -84,6 +84,7 @@ describe("buildConversationDetailsHtml", () => {
 				"opencode",
 				"copilot",
 				"copilot-chat",
+				"devin",
 			]) {
 				const re = new RegExp(
 					"\\.badge\\.transcript-source-" +

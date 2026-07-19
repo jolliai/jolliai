@@ -130,6 +130,16 @@ describe("ConfigureCommand — settable keys", () => {
 		}
 	});
 
+	it("accepts devinEnabled as a boolean key", async () => {
+		await runConfigure(["--set", "devinEnabled=false"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ devinEnabled: false }));
+		expect((await loadConfig()).devinEnabled).toBe(false);
+
+		await runConfigure(["--set", "devinEnabled=true"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ devinEnabled: true }));
+		expect((await loadConfig()).devinEnabled).toBe(true);
+	});
+
 	it("accepts syncOnPush as a boolean key", async () => {
 		await runConfigure(["--set", "syncOnPush=false"]);
 		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncOnPush: false }));
