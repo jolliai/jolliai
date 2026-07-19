@@ -64,6 +64,7 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain('id="geminiEnabled"');
 		expect(html).toContain('id="openCodeEnabled"');
 		expect(html).toContain('id="cursorEnabled"');
+		expect(html).toContain('id="devinEnabled"');
 		expect(html).toContain('id="copilotEnabled"');
 		expect(html).toContain('id="clineEnabled"');
 	});

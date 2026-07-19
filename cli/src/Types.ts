@@ -25,6 +25,7 @@ export const TRANSCRIPT_SOURCES = [
 	"copilot-chat",
 	"cline",
 	"cline-cli",
+	"devin",
 ] as const;
 
 /** Which AI coding agent produced the transcript. Derived from the runtime allowlist. */
@@ -55,6 +56,17 @@ export interface TranscriptCursor {
 	readonly transcriptPath: string;
 	readonly lineNumber: number;
 	readonly updatedAt: string; // ISO 8601
+	/**
+	 * Opaque, source-defined resume anchor for transcripts whose ordering is
+	 * NOT a stable append-only stream — e.g. Devin's `message_nodes` forest,
+	 * where a regeneration re-points the accepted chain and invalidates a raw
+	 * positional `lineNumber`. When set, the reader resolves the resume point
+	 * by locating this anchor in the freshly-rebuilt sequence and falls back to
+	 * a full re-read if it has been regenerated away, rather than silently
+	 * skipping content. Linear sources leave this undefined and rely on
+	 * `lineNumber`.
+	 */
+	readonly anchorId?: string;
 }
 
 /** A single parsed transcript entry from the JSONL file */
@@ -1091,6 +1103,8 @@ export interface JolliMemoryConfig {
 	readonly copilotEnabled?: boolean;
 	/** Enable Cline (VS Code extension + CLI) session discovery at post-commit time (default: auto-detect) */
 	readonly clineEnabled?: boolean;
+	/** Enable Devin CLI session discovery. Defaults to on when Devin is detected. */
+	readonly devinEnabled?: boolean;
 	/** Global minimum log level written to debug.log (default: "info") */
 	readonly logLevel?: LogLevel;
 	/** Per-module log level overrides (e.g. { "GitOps": "debug" }) */
@@ -1333,6 +1347,12 @@ export interface StatusInfo {
 	readonly copilotDetected?: boolean;
 	/** Whether Copilot CLI session discovery is enabled in config (undefined = auto-detect) */
 	readonly copilotEnabled?: boolean;
+	/** Whether Devin CLI's session DB (~/.local/share/devin/cli/sessions.db) was detected */
+	readonly devinDetected?: boolean;
+	/** Whether Devin CLI session discovery is enabled in config (undefined = auto-detect) */
+	readonly devinEnabled?: boolean;
+	/** Devin DB scan failed with a real (non-ENOENT) error. Same UI semantics as cursorScanError. */
+	readonly devinScanError?: SqliteScanError;
 	/** Directory path for global config (~/.jolli/jollimemory) */
 	readonly globalConfigDir?: string;
 	/** Path to the worktree state directory */

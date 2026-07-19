@@ -186,6 +186,19 @@ vi.mock("../core/CursorTranscriptReader.js", () => ({
 	}),
 }));
 
+vi.mock("../core/DevinSessionDiscoverer.js", () => ({
+	discoverDevinSessions: vi.fn().mockResolvedValue([]),
+	isDevinInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/DevinTranscriptReader.js", () => ({
+	readDevinTranscript: vi.fn().mockResolvedValue({
+		entries: [],
+		newCursor: { transcriptPath: "", lineNumber: 0, updatedAt: "" },
+		totalLinesRead: 0,
+	}),
+}));
+
 vi.mock("../core/GeminiTranscriptReader.js", () => ({
 	readGeminiTranscript: vi.fn().mockResolvedValue({
 		entries: [],

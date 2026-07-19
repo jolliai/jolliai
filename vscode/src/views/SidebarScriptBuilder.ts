@@ -4540,6 +4540,7 @@ export function buildSidebarScript(): string {
       case 'copilot-chat': return 'Copilot Chat';
       case 'cline':        return 'Cline (VS Code)';
       case 'cline-cli':    return 'Cline CLI';
+      case 'devin':        return 'Devin';
       default:             return source;
     }
   }
@@ -4549,9 +4550,10 @@ export function buildSidebarScript(): string {
   // the three surfaces stay visually identical. Brand-colored sources (Claude
   // #D97757, Codex #10A37F, Gemini gradient) keep their hex; the otherwise
   // mid-gray neutrals (Cursor / Copilot / OpenCode, which IntelliJ ships a
-  // _dark variant for) use currentColor so they follow --vscode-icon-foreground
-  // and stay legible on either sidebar theme. copilot-chat reuses the Copilot
-  // mark. Each is a fixed first-party constant, not user content.
+  // _dark variant for, plus Devin, which has no ported brand asset) use
+  // currentColor so they follow --vscode-icon-foreground and stay legible on
+  // either sidebar theme. copilot-chat reuses the Copilot mark. Each is a
+  // fixed first-party constant, not user content.
   var SOURCE_ICON_SVG = {
     claude:
       '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">' +
@@ -4592,6 +4594,12 @@ export function buildSidebarScript(): string {
       '<line x1="8" y1="3.15" x2="8" y2="4.7"/>' +
       '<path d="M5.1 4.7h5.8a2.9 2.9 0 0 1 2.9 2.9v.5l1 1.7-1 1.7v.5a2.9 2.9 0 0 1-2.9 2.9H5.1a2.9 2.9 0 0 1-2.9-2.9v-.5l-1-1.7 1-1.7v-.5A2.9 2.9 0 0 1 5.1 4.7Z"/></g>' +
       '<g fill="currentColor"><rect x="5.5" y="7.6" width="1.5" height="3.5" rx="0.75"/><rect x="9" y="7.6" width="1.5" height="3.5" rx="0.75"/></g></svg>',
+    // Devin's official brand mark — the three-piece cluster from the devin.ai
+    // header ('#logo' symbol, viewBox 0 0 30 34); rendered with currentColor so
+    // its monochrome shape follows --vscode-icon-foreground on either theme.
+    devin:
+      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 30 34">' +
+      '<path fill="currentColor" d="M20.556 15c.715-.41 1.6-.41 2.314 0l1.849 1.067a.9.9 0 0 0 .229.087q.096.022.193.026h.01q.01 0 .02-.003a.8.8 0 0 0 .389-.105l.018-.008 3.694-2.133a.85.85 0 0 0 .427-.739V8.93a.85.85 0 0 0-.427-.74l-3.694-2.132a.86.86 0 0 0-.856 0l-3.695 2.132s-.01.008-.015.01a.8.8 0 0 0-.157.121l-.02.023a1 1 0 0 0-.11.144l-.016.026a.86.86 0 0 0-.11.422v2.132a2.312 2.312 0 0 1-3.472 2l-1.848-1.066a.9.9 0 0 0-.23-.087 1 1 0 0 0-.192-.026h-.028a.8.8 0 0 0-.392.103L14.42 12l-3.694 2.132a.85.85 0 0 0-.427.74v4.263a.85.85 0 0 0 .427.74l3.694 2.132.018.008a1 1 0 0 0 .184.075l.03.008a1 1 0 0 0 .178.023q.01.002.02.003h.01a.8.8 0 0 0 .194-.026q.02-.006.04-.01a1 1 0 0 0 .189-.077l1.848-1.066c.715-.41 1.599-.41 2.313 0a2.32 2.32 0 0 1 1.157 2.001v2.132q.001.105.026.2.003.02.01.041a1 1 0 0 0 .074.18l.016.026q.046.077.111.144l.021.023q.07.068.157.12.008.007.015.01l3.695 2.133a.85.85 0 0 0 .854 0l3.694-2.132a.85.85 0 0 0 .427-.74V20.82a.85.85 0 0 0-.427-.74l-3.694-2.132-.018-.008a1 1 0 0 0-.182-.075q-.014-.002-.028-.005a.7.7 0 0 0-.18-.023h-.028a.8.8 0 0 0-.193.026q-.02.006-.038.01a1 1 0 0 0-.188.077l-1.849 1.066c-.712.411-1.599.411-2.313 0a2.32 2.32 0 0 1-1.157-2.001c0-.822.442-1.59 1.157-2.001l-.003-.01zM.428 13.936l3.694 2.132a.85.85 0 0 0 .855 0l3.694-2.133s.01-.008.015-.01a.8.8 0 0 0 .157-.12l.02-.023q.062-.067.112-.144.008-.01.015-.026a.86.86 0 0 0 .111-.42v-2.133a2.312 2.312 0 0 1 3.471-2l1.849 1.066a.9.9 0 0 0 .229.087q.093.022.193.026h.01q.01-.002.02-.003a.8.8 0 0 0 .392-.106l.018-.008 3.694-2.133a.85.85 0 0 0 .427-.739V2.986a.85.85 0 0 0-.427-.74L15.283.114a.86.86 0 0 0-.856 0l-3.695 2.132s-.01.008-.015.01a.8.8 0 0 0-.157.121l-.02.023a1 1 0 0 0-.112.144q-.008.01-.015.026a.86.86 0 0 0-.11.422v2.132A2.315 2.315 0 0 1 6.83 7.125L4.983 6.06a.9.9 0 0 0-.23-.087 1 1 0 0 0-.193-.026h-.028a.8.8 0 0 0-.39.103l-.019.008L.43 8.189a.85.85 0 0 0-.427.74v4.263a.85.85 0 0 0 .427.74v.005zM18.972 26.008l-3.694-2.133-.018-.008a1 1 0 0 0-.183-.074l-.031-.008a1 1 0 0 0-.18-.023h-.028a.8.8 0 0 0-.193.026q-.02.006-.04.01a1 1 0 0 0-.187.077l-1.849 1.067a2.314 2.314 0 0 1-3.468-2.001v-2.133a.8.8 0 0 0-.036-.242 1 1 0 0 0-.075-.18q-.008-.01-.015-.026a.8.8 0 0 0-.111-.144l-.02-.023a1 1 0 0 0-.157-.12q-.008-.007-.015-.01L4.978 17.93a.86.86 0 0 0-.857 0L.427 20.063a.85.85 0 0 0-.427.739v4.263a.85.85 0 0 0 .427.74l3.694 2.132.018.008a1 1 0 0 0 .18.074l.031.008a1 1 0 0 0 .177.023l.021.002h.01q.098-.001.19-.026.021-.006.042-.01a1 1 0 0 0 .188-.077l1.848-1.066c.715-.41 1.599-.41 2.314 0a2.32 2.32 0 0 1 1.157 2.001v2.133q.001.102.026.2.004.02.01.041a1 1 0 0 0 .075.18q.008.01.015.026.046.077.111.144l.02.023q.07.068.157.12.007.007.016.01l3.694 2.133a.85.85 0 0 0 .855 0l3.694-2.132a.85.85 0 0 0 .427-.74V26.75a.85.85 0 0 0-.427-.74z"/></svg>',
   };
   SOURCE_ICON_SVG['copilot-chat'] = SOURCE_ICON_SVG.copilot;
   // Cline ships two transcript sources (VS Code extension + terminal CLI); both

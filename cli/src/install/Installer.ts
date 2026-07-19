@@ -31,6 +31,7 @@ import { isCopilotInstalled } from "../core/CopilotDetector.js";
 import { scanCopilotSessions } from "../core/CopilotSessionDiscoverer.js";
 import { isCursorInstalled } from "../core/CursorDetector.js";
 import { scanCursorSessions } from "../core/CursorSessionDiscoverer.js";
+import { isDevinInstalled, scanDevinSessions } from "../core/DevinSessionDiscoverer.js";
 import { isGeminiInstalled } from "../core/GeminiSessionDetector.js";
 import { getProjectRootDir, listWorktrees, orphanBranchExists } from "../core/GitOps.js";
 import {
@@ -796,6 +797,7 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 	const geminiDetected = await isGeminiInstalled();
 	const openCodeDetected = await isOpenCodeInstalled();
 	const cursorDetected = await isCursorInstalled();
+	const devinDetected = await isDevinInstalled();
 	const copilotDetected = await isCopilotInstalled();
 	const copilotChatDetected = await isCopilotChatInstalled();
 	const clineVscodeDetected = await isClineInstalled();
@@ -850,6 +852,16 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
 		}
 		cursorScanError = scan.error;
+	}
+
+	// Discover Devin CLI sessions on-demand (not stored in sessions.json).
+	let devinScanError: SqliteScanError | undefined;
+	if (config.devinEnabled !== false && devinDetected) {
+		const scan = await scanDevinSessions(projectDir);
+		if (scan.sessions.length > 0) {
+			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
+		}
+		devinScanError = scan.error;
 	}
 
 	// Discover Copilot CLI sessions on-demand (not stored in sessions.json).
@@ -975,6 +987,9 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		cursorDetected,
 		cursorEnabled: config.cursorEnabled,
 		cursorScanError,
+		devinDetected,
+		devinEnabled: config.devinEnabled,
+		devinScanError,
 		copilotDetected,
 		copilotEnabled: config.copilotEnabled,
 		copilotScanError,

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { isTranscriptSource } from "../Types.js";
 import { transcriptSourceLabel } from "./TranscriptSourceLabel.js";
 
 describe("transcriptSourceLabel", () => {
@@ -22,5 +23,14 @@ describe("transcriptSourceLabel", () => {
 
 	it("falls back to 'Claude' when source is undefined (matches the current webview behavior)", () => {
 		expect(transcriptSourceLabel(undefined)).toBe("Claude");
+	});
+});
+
+describe("devin source registration", () => {
+	it("is a recognized TranscriptSource", () => {
+		expect(isTranscriptSource("devin")).toBe(true);
+	});
+	it("renders the friendly label", () => {
+		expect(transcriptSourceLabel("devin")).toBe("Devin");
 	});
 });

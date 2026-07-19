@@ -58,6 +58,7 @@ const VALID_CONFIG_KEYS = [
 	"cursorEnabled",
 	"copilotEnabled",
 	"clineEnabled",
+	"devinEnabled",
 	"mcpPlatformToolsEnabled",
 	"globalInstructions",
 	"logLevel",
@@ -134,6 +135,7 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		key === "cursorEnabled" ||
 		key === "copilotEnabled" ||
 		key === "clineEnabled" ||
+		key === "devinEnabled" ||
 		key === "mcpPlatformToolsEnabled" ||
 		key === "syncTranscripts" ||
 		key === "syncOnPush"
@@ -225,6 +227,11 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "clineEnabled",
 		type: "boolean",
 		description: "Enable Cline (VS Code extension + CLI) session discovery (true/false)",
+	},
+	{
+		key: "devinEnabled",
+		type: "boolean",
+		description: "Enable Devin CLI session discovery (true/false; requires Node 22.5+ at runtime)",
 	},
 	{
 		key: "mcpPlatformToolsEnabled",

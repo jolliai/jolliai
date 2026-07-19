@@ -107,6 +107,7 @@ describe("ActiveSessionsProvider", () => {
 			"copilot",
 			"copilot-chat",
 			"cursor",
+			"devin",
 			"gemini",
 			"opencode",
 		]);

@@ -39,6 +39,7 @@ Thumbs.db
 .cursor/
 .codex/
 .opencode/
+.devin/
 # Claude MCP server config — written per-worktree with an absolute local path
 # (jolli install → registerMcpInClaude), so it must never be committed.
 .mcp.json

@@ -166,7 +166,7 @@ describe("SidebarScriptBuilder", () => {
 	it("defines a per-source brand-icon map covering every provider", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("var SOURCE_ICON_SVG = {");
-		for (const src of ["claude", "codex", "gemini", "cursor", "copilot", "opencode", "cline"]) {
+		for (const src of ["claude", "codex", "gemini", "cursor", "copilot", "opencode", "cline", "devin"]) {
 			expect(js).toContain(`${src}:`);
 		}
 		// copilot-chat reuses the Copilot mark; cline-cli reuses the Cline mark.

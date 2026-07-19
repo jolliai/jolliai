@@ -1,5 +1,5 @@
 /**
- * Aggregates active AI coding sessions across all 7 supported sources,
+ * Aggregates active AI coding sessions across all 8 supported sources,
  * filters by recency window, resolves display titles, and returns a
  * sorted list ready for UI consumption.
  *
@@ -224,6 +224,7 @@ async function collectFromAllSources(cwd: string): Promise<CollectResult> {
 		loadCopilotChat(cwd),
 		loadCline(cwd),
 		loadClineCli(cwd),
+		loadDevin(cwd),
 	]);
 	const sessions: SessionInfo[] = [];
 	const failedSources: TranscriptSource[] = [];
@@ -357,5 +358,20 @@ async function loadClineCli(cwd: string): Promise<LoaderResult> {
 	} catch (err) {
 		log.warn("scanClineCliSessions threw: %s", errMsg(err));
 		return { sessions: [], failed: ["cline-cli"] };
+	}
+}
+
+async function loadDevin(cwd: string): Promise<LoaderResult> {
+	try {
+		const { scanDevinSessions } = await import("./DevinSessionDiscoverer.js");
+		const r = await scanDevinSessions(cwd);
+		if (r.error) {
+			log.warn("scanDevinSessions reported %s: %s", r.error.kind, r.error.message);
+			return { sessions: r.sessions, failed: ["devin"] };
+		}
+		return { sessions: r.sessions, failed: [] };
+	} catch (err) {
+		log.warn("scanDevinSessions threw: %s", errMsg(err));
+		return { sessions: [], failed: ["devin"] };
 	}
 }

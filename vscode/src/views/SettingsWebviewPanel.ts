@@ -54,6 +54,7 @@ interface SettingsPayload {
 	readonly geminiEnabled: boolean;
 	readonly openCodeEnabled: boolean;
 	readonly cursorEnabled: boolean;
+	readonly devinEnabled: boolean;
 	readonly copilotEnabled: boolean;
 	readonly clineEnabled: boolean;
 	/** Tri-state config switch (undecided | "enabled" | "disabled") flattened to a checkbox; see handleApplySettings for the enable/disable/preserve-undecided persistence rules. */
@@ -462,6 +463,7 @@ export class SettingsWebviewPanel {
 			geminiEnabled: config.geminiEnabled !== false,
 			openCodeEnabled: config.openCodeEnabled !== false,
 			cursorEnabled: config.cursorEnabled !== false,
+			devinEnabled: config.devinEnabled !== false,
 			copilotEnabled: config.copilotEnabled !== false,
 			clineEnabled: config.clineEnabled !== false,
 			globalInstructions: config.globalInstructions === "enabled",
@@ -611,6 +613,7 @@ export class SettingsWebviewPanel {
 			geminiEnabled: settings.geminiEnabled,
 			openCodeEnabled: settings.openCodeEnabled,
 			cursorEnabled: settings.cursorEnabled,
+			devinEnabled: settings.devinEnabled,
 			copilotEnabled: settings.copilotEnabled,
 			clineEnabled: settings.clineEnabled,
 			...giUpdate,

@@ -241,7 +241,7 @@ function buildFullStatusItems(
 		items.push(accountItem);
 	}
 
-	// Integration status rows (Claude, Codex, Gemini, OpenCode, Cursor, Copilot, Cline)
+	// Integration status rows (Claude, Codex, Gemini, OpenCode, Cursor, Copilot, Cline, Devin)
 	const counts = s.sessionsBySource ?? {};
 	pushIntegrationItem(
 		items,
@@ -323,6 +323,30 @@ function buildFullStatusItems(
 			"Cursor detected but session discovery is disabled in config",
 			undefined,
 			counts.cursor,
+		);
+	}
+
+	// Devin: CLI sessions via a global WAL SQLite DB (no agent hook — scan errors surface like OpenCode/Cursor).
+	if (s.devinScanError) {
+		items.push(
+			new StatusItem(
+				"Devin Integration",
+				`unavailable — ${s.devinScanError.kind}`,
+				ICON_WARN,
+				`Devin database scan failed (${s.devinScanError.kind}): ${s.devinScanError.message}`,
+			),
+		);
+	} else {
+		pushIntegrationItem(
+			items,
+			s.devinDetected,
+			s.devinEnabled !== false,
+			undefined,
+			"Devin Integration",
+			"Devin CLI session database found — session discovery is enabled",
+			"Devin detected but session discovery is disabled in config",
+			undefined,
+			counts.devin,
 		);
 	}
 
