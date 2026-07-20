@@ -20,6 +20,9 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isAntigravityInstalled } from "../core/AntigravityDetector.js";
+import { discoverAntigravitySessions } from "../core/AntigravitySessionDiscoverer.js";
+import { readAntigravityTranscript } from "../core/AntigravityTranscriptReader.js";
 import { isClineCliInstalled } from "../core/ClineCliDetector.js";
 import { discoverClineCliSessions } from "../core/ClineCliSessionDiscoverer.js";
 import { readClineCliTranscript } from "../core/ClineCliTranscriptReader.js";
@@ -3227,6 +3230,15 @@ async function loadSessionTranscripts(
 			log.info("Discovered %d Devin session(s)", devinSessions.length);
 		}
 	}
+	// Discover Antigravity conversations (on-demand scan of ~/.gemini/<variant>/conversations/*.db,
+	// scoped by the workspace path recorded in each conversation db).
+	if (config.antigravityEnabled !== false && (await isAntigravityInstalled())) {
+		const antigravitySessions = await discoverAntigravitySessions(cwd);
+		if (antigravitySessions.length > 0) {
+			allSessions = [...allSessions, ...antigravitySessions];
+			log.info("Discovered %d Antigravity session(s)", antigravitySessions.length);
+		}
+	}
 
 	if (allSessions.length === 0) {
 		log.info("No active sessions found — will infer topics from diff if available");
@@ -3508,6 +3520,13 @@ async function readAllTranscripts(
 				result = await readDevinTranscript(session.transcriptPath, cursor, beforeTimestamp);
 			} catch (error: unknown) {
 				log.error("Skipping Devin session %s: %s", session.sessionId, (error as Error).message);
+				continue;
+			}
+		} else if (source === "antigravity") {
+			try {
+				result = await readAntigravityTranscript(session.transcriptPath, cursor ?? undefined, beforeTimestamp);
+			} catch (error: unknown) {
+				log.error("Skipping Antigravity session %s: %s", session.sessionId, (error as Error).message);
 				continue;
 			}
 		} else {

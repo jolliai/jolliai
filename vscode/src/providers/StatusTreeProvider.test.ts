@@ -832,6 +832,54 @@ describe("StatusTreeProvider", () => {
 		expect(devin?.description).toBe("detected & enabled (2 sessions)");
 	});
 
+	// ── Antigravity scan error / healthy row ──────────────────────────────
+
+	it("renders an 'unavailable' Antigravity row when antigravityScanError is present", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					antigravityDetected: true,
+					antigravityEnabled: true,
+					antigravityScanError: {
+						kind: "corrupt",
+						message: "file is not a database",
+					},
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const row = items.find((item) => item.label === "Antigravity Integration");
+		expect(row?.description).toBe("unavailable — corrupt");
+		expect(String(row?.tooltip)).toContain("file is not a database");
+	});
+
+	it("falls back to the normal detected/enabled Antigravity row when no scan error", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					antigravityDetected: true,
+					antigravityEnabled: true,
+					sessionsBySource: { antigravity: 2 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const row = items.find((item) => item.label === "Antigravity Integration");
+		expect(row?.description).toBe("detected & enabled (2 sessions)");
+	});
+
 	// ── Copilot scan error ────────────────────────────────────────────────
 
 	it("shows Copilot Integration row when detected and enabled", async () => {

@@ -58,7 +58,7 @@ describe("SettingsHtmlBuilder", () => {
 
 	// ── AI Agents tab ──
 
-	it("AI Agents tab lists all seven per-source toggles", () => {
+	it("AI Agents tab lists all per-source toggles", () => {
 		expect(html).toContain('id="claudeEnabled"');
 		expect(html).toContain('id="codexEnabled"');
 		expect(html).toContain('id="geminiEnabled"');
@@ -67,6 +67,7 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain('id="devinEnabled"');
 		expect(html).toContain('id="copilotEnabled"');
 		expect(html).toContain('id="clineEnabled"');
+		expect(html).toContain('id="antigravityEnabled"');
 	});
 
 	it("Cline toggle description mentions both CLI and VS Code sources", () => {

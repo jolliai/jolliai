@@ -140,6 +140,16 @@ describe("ConfigureCommand — settable keys", () => {
 		expect((await loadConfig()).devinEnabled).toBe(true);
 	});
 
+	it("accepts antigravityEnabled as a boolean key", async () => {
+		await runConfigure(["--set", "antigravityEnabled=true"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ antigravityEnabled: true }));
+		expect((await loadConfig()).antigravityEnabled).toBe(true);
+
+		await runConfigure(["--set", "antigravityEnabled=false"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ antigravityEnabled: false }));
+		expect((await loadConfig()).antigravityEnabled).toBe(false);
+	});
+
 	it("accepts syncOnPush as a boolean key", async () => {
 		await runConfigure(["--set", "syncOnPush=false"]);
 		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncOnPush: false }));

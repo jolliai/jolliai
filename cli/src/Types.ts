@@ -26,6 +26,7 @@ export const TRANSCRIPT_SOURCES = [
 	"cline",
 	"cline-cli",
 	"devin",
+	"antigravity",
 ] as const;
 
 /** Which AI coding agent produced the transcript. Derived from the runtime allowlist. */
@@ -1105,6 +1106,8 @@ export interface JolliMemoryConfig {
 	readonly clineEnabled?: boolean;
 	/** Enable Devin CLI session discovery. Defaults to on when Devin is detected. */
 	readonly devinEnabled?: boolean;
+	/** Enable Antigravity (Gemini agentic IDE/CLI) session discovery at post-commit time (default: auto-detect) */
+	readonly antigravityEnabled?: boolean;
 	/** Global minimum log level written to debug.log (default: "info") */
 	readonly logLevel?: LogLevel;
 	/** Per-module log level overrides (e.g. { "GitOps": "debug" }) */
@@ -1353,6 +1356,16 @@ export interface StatusInfo {
 	readonly devinEnabled?: boolean;
 	/** Devin DB scan failed with a real (non-ENOENT) error. Same UI semantics as cursorScanError. */
 	readonly devinScanError?: SqliteScanError;
+	/** Whether any Antigravity variant's conversations dir (under ~/.gemini) was detected */
+	readonly antigravityDetected?: boolean;
+	/** Whether Antigravity session discovery is enabled in config (undefined = auto-detect) */
+	readonly antigravityEnabled?: boolean;
+	/**
+	 * Antigravity conversation-db scan failed with a real (non-ENOENT) error —
+	 * corrupt, locked, schema drift, or permission denied. UI surfaces this
+	 * adjacent to the Antigravity row instead of silently rendering "0 sessions".
+	 */
+	readonly antigravityScanError?: SqliteScanError;
 	/** Directory path for global config (~/.jolli/jollimemory) */
 	readonly globalConfigDir?: string;
 	/** Path to the worktree state directory */

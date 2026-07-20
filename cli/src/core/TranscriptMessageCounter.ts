@@ -24,6 +24,7 @@
 
 import { createLogger, errMsg } from "../Logger.js";
 import type { SessionInfo, TranscriptEntry, TranscriptReadResult, TranscriptSource } from "../Types.js";
+import { readAntigravityTranscript } from "./AntigravityTranscriptReader.js";
 import { readClineCliTranscript } from "./ClineCliTranscriptReader.js";
 import { readClineTranscript } from "./ClineTranscriptReader.js";
 import { applyOverlay, loadOverlay } from "./ConversationOverlayStore.js";
@@ -139,6 +140,8 @@ async function readUnreadTranscript(
 			return readClineTranscript(transcriptPath, cursor);
 		case "cline-cli":
 			return readClineCliTranscript(transcriptPath, cursor);
+		case "antigravity":
+			return readAntigravityTranscript(transcriptPath, cursor ?? undefined);
 		case "codex":
 			return readTranscript(transcriptPath, cursor, getParserForSource("codex"));
 		default:

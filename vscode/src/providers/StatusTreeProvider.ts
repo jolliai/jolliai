@@ -418,6 +418,31 @@ function buildFullStatusItems(
 		);
 	}
 
+	// Antigravity: conversations via per-conversation SQLite + plaintext transcript
+	// (no agent hook — scan errors surface like OpenCode/Cursor).
+	if (s.antigravityScanError) {
+		items.push(
+			new StatusItem(
+				"Antigravity Integration",
+				`unavailable — ${s.antigravityScanError.kind}`,
+				ICON_WARN,
+				`Antigravity database scan failed (${s.antigravityScanError.kind}): ${s.antigravityScanError.message}`,
+			),
+		);
+	} else {
+		pushIntegrationItem(
+			items,
+			s.antigravityDetected,
+			s.antigravityEnabled !== false,
+			undefined,
+			"Antigravity Integration",
+			"Antigravity conversations found — session discovery is enabled",
+			"Antigravity detected but session discovery is disabled in config",
+			undefined,
+			counts.antigravity,
+		);
+	}
+
 	if (extensionOutdated) {
 		items.push(
 			new StatusItem(

@@ -40,6 +40,7 @@ export function buildSettingsScript(): string {
   const devinEnabledInput = document.getElementById('devinEnabled');
   const copilotEnabledInput = document.getElementById('copilotEnabled');
   const clineEnabledInput = document.getElementById('clineEnabled');
+  const antigravityEnabledInput = document.getElementById('antigravityEnabled');
   const globalInstructionsInput = document.getElementById('globalInstructions');
   const localFolderInput = document.getElementById('localFolder');
   const browseLocalFolderBtn = document.getElementById('browseLocalFolderBtn');
@@ -264,7 +265,7 @@ export function buildSettingsScript(): string {
     }) && valid;
     // At least one integration must be enabled
     var intError = document.getElementById('integrations-error');
-    if (!claudeEnabledInput.checked && !codexEnabledInput.checked && !geminiEnabledInput.checked && !openCodeEnabledInput.checked && !cursorEnabledInput.checked && !copilotEnabledInput.checked && !clineEnabledInput.checked && !devinEnabledInput.checked) {
+    if (!claudeEnabledInput.checked && !codexEnabledInput.checked && !geminiEnabledInput.checked && !openCodeEnabledInput.checked && !cursorEnabledInput.checked && !copilotEnabledInput.checked && !clineEnabledInput.checked && !devinEnabledInput.checked && !antigravityEnabledInput.checked) {
       intError.textContent = 'At least one integration must be enabled';
       valid = false;
     } else {
@@ -341,6 +342,7 @@ export function buildSettingsScript(): string {
       devinEnabled: devinEnabledInput.checked,
       copilotEnabled: copilotEnabledInput.checked,
       clineEnabled: clineEnabledInput.checked,
+      antigravityEnabled: antigravityEnabledInput.checked,
       globalInstructions: globalInstructionsInput.checked,
       localFolder: localFolderInput.value,
       excludePatterns: excludePatternsInput.value,
@@ -369,6 +371,7 @@ export function buildSettingsScript(): string {
       devinEnabledInput.checked !== initialState.devinEnabled ||
       copilotEnabledInput.checked !== initialState.copilotEnabled ||
       clineEnabledInput.checked !== initialState.clineEnabled ||
+      antigravityEnabledInput.checked !== initialState.antigravityEnabled ||
       globalInstructionsInput.checked !== initialState.globalInstructions ||
       localFolderInput.value !== initialState.localFolder ||
       excludePatternsInput.value !== initialState.excludePatterns ||
@@ -433,7 +436,7 @@ export function buildSettingsScript(): string {
   aiProviderSelect.addEventListener('change', function() {
     checkDirty(); clearSaveFeedback(); syncProviderCard();
   });
-  [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput, cursorEnabledInput, copilotEnabledInput, clineEnabledInput, devinEnabledInput, globalInstructionsInput].forEach(function(input) {
+  [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput, cursorEnabledInput, copilotEnabledInput, clineEnabledInput, devinEnabledInput, antigravityEnabledInput, globalInstructionsInput].forEach(function(input) {
     input.addEventListener('change', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
   });
   dcoSignoffInput.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
@@ -470,6 +473,7 @@ export function buildSettingsScript(): string {
         devinEnabled: devinEnabledInput.checked,
         copilotEnabled: copilotEnabledInput.checked,
         clineEnabled: clineEnabledInput.checked,
+        antigravityEnabled: antigravityEnabledInput.checked,
         globalInstructions: globalInstructionsInput.checked,
         localFolder: localFolderInput.value.trim(),
         excludePatterns: excludePatternsInput.value,
@@ -586,6 +590,7 @@ export function buildSettingsScript(): string {
         devinEnabledInput.checked = msg.settings.devinEnabled;
         copilotEnabledInput.checked = msg.settings.copilotEnabled;
         clineEnabledInput.checked = msg.settings.clineEnabled;
+        antigravityEnabledInput.checked = msg.settings.antigravityEnabled;
         globalInstructionsInput.checked = !!msg.settings.globalInstructions;
         localFolderInput.value = msg.settings.localFolder || '';
         excludePatternsInput.value = msg.settings.excludePatterns;

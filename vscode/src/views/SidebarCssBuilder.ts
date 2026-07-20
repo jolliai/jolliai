@@ -971,6 +971,7 @@ export function buildSidebarCss(): string {
   .tree-node.conversation-row .badge.transcript-source-copilot      { color: #94a3b8; border-color: #94a3b8; background: rgba(148,163,184,0.12); }
   .tree-node.conversation-row .badge.transcript-source-copilot-chat { color: #fbbf24; border-color: #fbbf24; background: rgba(251,191,36,0.12); }
   .tree-node.conversation-row .badge.transcript-source-devin        { color: #d4d4d8; border-color: #d4d4d8; background: rgba(212,212,216,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-antigravity  { color: #f472b6; border-color: #f472b6; background: rgba(244,114,182,0.12); }
 
   /* "Edited" marker — codicon-edit pencil glyph rendered inline after the
      row title. Intentionally a thin icon (no pill / border / fill) so it

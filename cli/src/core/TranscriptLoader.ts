@@ -116,6 +116,18 @@ export async function loadTranscript(opts: LoadOptions): Promise<TranscriptEntry
 			return [];
 		}
 	}
+	if (opts.source === "antigravity") {
+		try {
+			const { readAntigravityTranscript } = await import("./AntigravityTranscriptReader.js");
+			const result = await readAntigravityTranscript(opts.transcriptPath);
+			return [...result.entries];
+		} catch (err) {
+			if (!isEnoent(err)) {
+				log.warn("loadTranscript (antigravity) failed for %s: %s", opts.transcriptPath, errMsg(err));
+			}
+			return [];
+		}
+	}
 	const entries: TranscriptEntry[] = [];
 	let parseSkipped = 0;
 	try {
@@ -162,13 +174,13 @@ export async function loadTranscript(opts: LoadOptions): Promise<TranscriptEntry
 /**
  * Per-line JSONL parsers. Sources that own a dedicated single-artifact
  * reader (`gemini` JSON file; `opencode` / `cursor` / `copilot` / `devin`
- * SQLite DBs; `cline` / `cline-cli` plain-JSON files) are intentionally
- * absent — those are dispatched at the top of `loadTranscript` before this
- * table is consulted.
+ * SQLite DBs; `cline` / `cline-cli` plain-JSON files; `antigravity` whole-file
+ * transcript_full.jsonl) are intentionally absent — those are dispatched at the
+ * top of `loadTranscript` before this table is consulted.
  */
 type JsonlSource = Exclude<
 	TranscriptSource,
-	"gemini" | "opencode" | "cursor" | "copilot" | "cline" | "cline-cli" | "devin"
+	"gemini" | "opencode" | "cursor" | "copilot" | "cline" | "cline-cli" | "devin" | "antigravity"
 >;
 const PARSERS: Record<JsonlSource, (line: string) => TranscriptEntry | undefined> = {
 	claude: parseClaude,
