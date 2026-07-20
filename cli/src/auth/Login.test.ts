@@ -6,6 +6,7 @@ const mockLoadConfig = vi.fn();
 const mockExchangeCliCode = vi.fn();
 const mockGetDeviceLabel = vi.fn();
 const mockShouldRequestFreshApiKey = vi.fn();
+const mockGetJolliUrl = vi.fn();
 
 vi.mock("./AuthConfig.js", async (importActual) => {
 	// `resolveSignInJolliUrl` is a pure helper (no config I/O) that derives the
@@ -15,6 +16,7 @@ vi.mock("./AuthConfig.js", async (importActual) => {
 	return {
 		saveAuthCredentials: (...args: unknown[]) => mockSaveAuthCredentials(...args),
 		shouldRequestFreshApiKey: (...args: unknown[]) => mockShouldRequestFreshApiKey(...args),
+		getJolliUrl: (...args: unknown[]) => mockGetJolliUrl(...args),
 		resolveSignInJolliUrl: actual.resolveSignInJolliUrl,
 	};
 });
@@ -37,7 +39,7 @@ vi.mock("open", () => ({
 	default: (...args: unknown[]) => mockOpen(...args),
 }));
 
-import { browserLogin, createLoginServer } from "./Login.js";
+import { browserLogin, createLoginServer, runBrowserLoginFlow } from "./Login.js";
 
 const TEST_JOLLI_URL = "https://app.jolli.ai";
 // Mimics the format of randomBytes(32).toString("hex") — 64 hex chars.
@@ -944,6 +946,54 @@ describe("Login", () => {
 			mockOpen.mockRejectedValue("string error");
 
 			await expect(browserLogin(TEST_JOLLI_URL)).rejects.toThrow("string error");
+		});
+	});
+
+	describe("runBrowserLoginFlow — tenant URL resolution", () => {
+		it("REJECTS (does not synchronously throw) when getJolliUrl throws and no jolliUrl was passed", async () => {
+			// getJolliUrl() calls assertJolliOriginAllowed and throws on a disallowed
+			// origin (e.g. a poisoned JOLLI_URL). Resolving it inside the Promise
+			// executor means that throw becomes a rejection, so an external caller
+			// that omits jolliUrl and relies on .catch() sees the error rather than a
+			// synchronous throw that escapes it.
+			mockGetJolliUrl.mockImplementation(() => {
+				throw new Error("origin not allowed");
+			});
+			let threwSynchronously = false;
+			let promise: Promise<void>;
+			try {
+				promise = runBrowserLoginFlow({});
+			} catch {
+				threwSynchronously = true;
+				promise = Promise.resolve();
+			}
+			expect(threwSynchronously).toBe(false);
+			await expect(promise).rejects.toThrow("origin not allowed");
+		});
+
+		it("wraps a non-Error thrown by getJolliUrl into an Error rejection", async () => {
+			mockGetJolliUrl.mockImplementation(() => {
+				// Intentionally throw a non-Error to exercise the Error-wrapping branch.
+				throw "boom";
+			});
+			await expect(runBrowserLoginFlow({})).rejects.toThrow("boom");
+		});
+	});
+
+	describe("runBrowserLoginFlow — timeout", () => {
+		it("rejects with a timeout error when loginTimeoutMs elapses before any callback", async () => {
+			// `openBrowser` is a no-op, so nothing ever completes the flow — the only
+			// exit is the loginTimeoutMs watchdog, which closes the callback server and
+			// rejects. Verifies that security-relevant teardown path end to end.
+			await expect(
+				runBrowserLoginFlow({
+					jolliUrl: TEST_JOLLI_URL,
+					openBrowser: async () => {},
+					notify: () => {},
+					emitStartTelemetry: false,
+					loginTimeoutMs: 50,
+				}),
+			).rejects.toThrow(/timed out/i);
 		});
 	});
 });

@@ -8,180 +8,76 @@
  *
  * Bare `compile` (no --cwd) targets all repos under `localFolder`; this matches
  * the VS Code "Build Knowledge Wiki" button, which is repo-wide.
+ *
+ * The single-repo pipeline lives in `core/SingleRepoCompile.ts` and the sweep
+ * in `core/MultiRepoCompile.ts`. This module is the CLI-only shim: parse args,
+ * call the library, format outcomes for the terminal.
  */
 
 import type { Command } from "commander";
-import { drainIngest } from "../core/IngestPipeline.js";
 import { appendCredentialMissingRun } from "../core/IngestRunStore.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { compileAllRepos } from "../core/MultiRepoCompile.js";
-import { emptyProcessedSet, saveProcessedSet } from "../core/ProcessedSourceStore.js";
 import { loadConfig } from "../core/SessionTracker.js";
-import { createStorage } from "../core/StorageFactory.js";
-import { getActiveStorage, setActiveStorage } from "../core/SummaryStore.js";
-import { emptyTopicIndex, readTopicIndex, saveTopicIndex } from "../core/TopicIndexStore.js";
-import { purgeTopicPagesExcept } from "../core/TopicPageStore.js";
-import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
-import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
-import { createLogger, setLogDir } from "../Logger.js";
-import { deriveMemoryBankRoot } from "../sync/SyncBootstrap.js";
-import { DEFAULT_VAULT_WRITE_WAIT_MS, VaultWriteBusyError, withVaultWriteLock } from "../sync/VaultWriteLock.js";
-
-const log = createLogger("CompileCommand");
+import { type CompileSingleRepoFailureReason, compileSingleRepo } from "../core/SingleRepoCompile.js";
+import { setLogDir } from "../Logger.js";
 
 export type CompileOptions = { rebuild?: boolean; cwd?: string };
 
 /** Compile a single repo rooted at `cwd` (dual-write). */
-async function compileSingleRepo(cwd: string, rebuild: boolean): Promise<void> {
+async function runSingleRepo(cwd: string, rebuild: boolean): Promise<void> {
 	setLogDir(cwd);
 	const config = await loadConfig();
 	if (resolveLlmCredentialSource(config) === null) {
-		console.error("\n  Error: No API key configured. Run 'jolli enable' to set up.\n");
-		await appendCredentialMissingRun(cwd, "manual");
+		// handleSingleRepoFailure({ kind: "noApiKey" }) owns BOTH the console error
+		// and the credential-missing telemetry — don't duplicate them here, or the
+		// user sees the error twice and `ingest-runs.json` records two attempts.
 		process.exitCode = 1;
+		await handleSingleRepoFailure({ kind: "noApiKey" }, cwd);
 		return;
 	}
-	const storage = await createStorage(cwd, cwd);
-	// Capture + restore the process-global override so a single-repo compile
-	// doesn't leak it into a long-lived host (mirrors compileAllRepos). Benign in
-	// the one-shot CLI, but executeCompile is an exported entry point.
-	const previousStorage = getActiveStorage();
-	setActiveStorage(storage);
-	try {
-		// Per-write `vault-write.lock` instead of one lock held across the whole drain:
-		// the long reconcile LLM phase runs UNLOCKED and only each persistence call
-		// re-acquires the lock briefly, so a concurrent commit-summary worker can grab
-		// the lock between our writes and generate its summary promptly (commit memory
-		// is high-priority; "build wiki" can proceed slowly). This mirrors the
-		// QueueWorker unlocked-ingest phase. Data safety is preserved by drainIngest's
-		// own guarded-write phase: topic pages re-read + compare before write (no
-		// clobber), the index + processed-set are RMW under the same guard (no
-		// lost-update). The releaseHook wakes any worker that still timed out waiting
-		// on us (defense-in-depth — see VaultWriteLock).
-		const vaultRoot = deriveMemoryBankRoot(config.localFolder);
-		// `launchWorker` is imported lazily so this command's module load (at CLI
-		// startup, via registerCompileCommand) doesn't eagerly pull QueueWorker's
-		// transcript-reader/detector graph in. A busy miss throws VaultWriteBusyError
-		// (caught for the rebuild prerequisite below).
-		const { launchWorker } = await import("../hooks/QueueWorker.js");
-		const writeGuard = async (fn: () => Promise<void>): Promise<void> => {
-			const r = await withVaultWriteLock(vaultRoot, { wait: DEFAULT_VAULT_WRITE_WAIT_MS }, fn, {
-				launch: launchWorker,
-			});
-			if (!r.ran) throw new VaultWriteBusyError();
-		};
 
-		if (rebuild) {
-			// Reset the watermark + index only. An empty index makes route treat every
-			// topic as new, so reconcile gets current=null (clean rebuild).
-			//
-			// This reset is a PREREQUISITE, not a derived view: if it can't take the
-			// lock the index stays populated and the drain below runs as a no-op
-			// incremental — a silent non-rebuild. So a busy lock here exits cleanly with
-			// the same "try again shortly" message the whole-lock predecessor printed,
-			// rather than letting the guard's throw bubble out as an uncaught stack
-			// trace. A real (non-lock) write error still propagates. The QueueWorker
-			// ingest path logs-and-continues instead because its drain is best-effort
-			// background work; a user-invoked compile owes the user a clear exit code.
-			console.log("\n  Rebuilding knowledge base from scratch...");
-			try {
-				await writeGuard(async () => {
-					await saveProcessedSet(emptyProcessedSet(), cwd);
-					await saveTopicIndex(emptyTopicIndex(), cwd);
-				});
-			} catch (e) {
-				if (e instanceof VaultWriteBusyError) {
-					console.error(
-						"\n  Error: another vault writer (a background worker or sync) is busy — try again shortly.\n",
-					);
-					process.exitCode = 1;
-					return;
-				}
-				throw e;
-			}
-		} else {
-			console.log("\n  Ingesting pending sources into the knowledge base...");
-		}
+	if (rebuild) {
+		console.log("\n  Rebuilding knowledge base from scratch...");
+	} else {
+		console.log("\n  Ingesting pending sources into the knowledge base...");
+	}
 
-		const drainResult = await drainIngest(cwd, config, { triggeredBy: "manual", writeGuard });
-		// Converge the canonical layer to the index: drop topic pages no longer
-		// referenced. ONLY on --rebuild (which replays into a possibly smaller topic
-		// set). A routine compile must NOT purge: with the lock released between writes
-		// a concurrent ingest can add a page that is not yet in our index snapshot, and
-		// purging "everything not in the index" would delete it — data loss. Orphans
-		// from topic consolidation are reclaimed on the next --rebuild instead. The
-		// rebuild path is an explicit single-repo reset, so the read+purge under one
-		// writeGuard is sufficient there.
-		// Purge + Markdown re-render are DERIVED-layer regeneration over data the
-		// drain already persisted to the orphan branch / canonical JSON. A busy lock
-		// (or any other failure) here is non-fatal: the memories are safe, only the
-		// regenerated views lag until the next drain. Failing the whole command on a
-		// derived-layer hiccup is what made a successful ingest report as a failure.
-		// Mirrors the QueueWorker unlocked-ingest catch and the search-index
-		// disposable-cache catch below. Orphan pages a skipped purge leaves behind are
-		// reclaimed on the next explicit --rebuild.
-		if (rebuild) {
-			try {
-				await writeGuard(async () => {
-					const index = await readTopicIndex(cwd, storage);
-					await purgeTopicPagesExcept(
-						index.topics.map((t) => t.stableSlug),
-						cwd,
-						storage,
-					);
-				});
-			} catch (purgeErr) {
-				log.warn(
-					"Topic-page purge skipped (non-fatal): %s",
-					purgeErr instanceof Error ? purgeErr.message : String(purgeErr),
-				);
-			}
-		}
-		try {
-			await renderTopicKBWiki(cwd, storage, writeGuard);
-		} catch (renderErr) {
-			log.warn(
-				"Wiki re-render skipped (non-fatal): %s",
-				renderErr instanceof Error ? renderErr.message : String(renderErr),
-			);
-		}
-		// Build the knowledge graph from the freshly-ingested topic KB. Wrapped
-		// non-fatal: a graph build failure or missing LLM key must never fail the
-		// compile. Run UNGUARDED — it is LLM-bearing, so holding vault-write.lock
-		// across it would re-create the commit-blocking stall this fix removes (the
-		// graph is a derived artifact, regenerated on the next compile).
-		try {
-			await buildKnowledgeGraph(cwd, storage, config);
-		} catch (graphErr) {
-			log.warn(
-				"Knowledge graph build failed (non-fatal): %s",
-				graphErr instanceof Error ? graphErr.message : String(graphErr),
-			);
-		}
-		// Keep the local search index warm so the next query (MCP server / `jolli
-		// search`) rarely pays a lazy rebuild. Disposable cache: a failure here must
-		// never fail the compile. SearchIndex (→ @orama/*) is lazy-imported INSIDE
-		// this try so a load failure is contained (mirrors compileAllRepos).
-		try {
-			const { SearchIndex } = await import("../core/SearchIndex.js");
-			await writeGuard(async () => {
-				await SearchIndex.rebuild(cwd, storage);
-			});
-		} catch (idxErr) {
-			log.warn(
-				"Search index update failed (non-fatal): %s",
-				idxErr instanceof Error ? idxErr.message : String(idxErr),
-			);
-		}
+	const result = await compileSingleRepo(cwd, config, { rebuild });
 
-		const { batches, ingested, outcome, topicFailures } = drainResult;
-		let summary = `\n  Done: ${ingested} source(s) folded in ${batches} batch(es). Wiki rebuilt. [${outcome}]`;
-		if (topicFailures.length > 0) {
-			summary += `\n  ${topicFailures.length} topic(s) held: ${topicFailures.map((f) => `${f.slug} (${f.code})`).join(", ")}`;
-		}
-		console.log(`${summary}\n`);
-	} finally {
-		setActiveStorage(previousStorage);
+	if (!result.ok) {
+		process.exitCode = 1;
+		await handleSingleRepoFailure(result.failure, cwd);
+		return;
+	}
+
+	const { batches, ingested, outcome, topicFailures } = result;
+	let summary = `\n  Done: ${ingested} source(s) folded in ${batches} batch(es). Wiki rebuilt. [${outcome}]`;
+	if (topicFailures.length > 0) {
+		summary += `\n  ${topicFailures.length} topic(s) held: ${topicFailures.map((f) => `${f.slug} (${f.code})`).join(", ")}`;
+	}
+	console.log(`${summary}\n`);
+}
+
+async function handleSingleRepoFailure(reason: CompileSingleRepoFailureReason, cwd: string): Promise<void> {
+	switch (reason.kind) {
+		case "noApiKey":
+			console.error("\n  Error: No API key configured. Run 'jolli enable' to set up.\n");
+			// Preserve the pre-refactor telemetry hook: a credential-missing run is
+			// recorded so `ingest-runs.json` reflects the attempt.
+			await appendCredentialMissingRun(cwd, "manual");
+			return;
+		case "vaultBusy":
+			console.error(
+				"\n  Error: another vault writer (a background worker or sync) is busy — try again shortly.\n",
+			);
+			return;
+		case "cancelled":
+			console.error("\n  Cancelled.\n");
+			return;
+		case "internal":
+			console.error(`\n  Error: ${reason.message} (kind=${reason.errorKind})\n`);
+			return;
 	}
 }
 
@@ -210,7 +106,7 @@ async function compileSweep(): Promise<void> {
 
 export async function executeCompile(options: CompileOptions): Promise<void> {
 	if (options.cwd) {
-		await compileSingleRepo(options.cwd, options.rebuild === true);
+		await runSingleRepo(options.cwd, options.rebuild === true);
 		return;
 	}
 	if (options.rebuild) {

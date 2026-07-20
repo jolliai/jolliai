@@ -81,6 +81,7 @@ const STATUS_LABEL: Record<BackfillOutcome["status"], string> = {
 	generated: "✓ generated",
 	"would-generate": "○ would generate",
 	"skipped-has-summary": "· already summarized",
+	"skipped-in-progress": "· live capture in progress",
 	error: "✗ error",
 };
 

@@ -85,6 +85,14 @@ vi.mock("../core/Locks.js", () => ({
 	WORKER_PHASE_FILE: "worker-phase",
 }));
 
+vi.mock("./CommitCaptureLock.js", () => ({
+	COMMIT_CAPTURE_LOCK_WAIT_MS: 1000,
+	withCommitCaptureLock: vi.fn(async (_cwd: string, _hash: string, _mode: unknown, body: () => Promise<unknown>) => ({
+		ran: true,
+		value: await body(),
+	})),
+}));
+
 vi.mock("../sync/VaultWriteLock.js", () => ({
 	acquireVaultWriteLock: vi.fn().mockResolvedValue({
 		release: vi.fn().mockResolvedValue(undefined),
@@ -369,6 +377,7 @@ import { generateSummary } from "../core/Summarizer.js";
 import { getSummary, mergeManyToOne, migrateOneToOne, storeSummary } from "../core/SummaryStore.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
 import type { CommitSummary } from "../Types.js";
+import { withCommitCaptureLock } from "./CommitCaptureLock.js";
 import { runWorker } from "./PostCommitHook.js";
 
 /** Creates a minimal mock SummaryResult (returned by generateSummary) */
@@ -441,6 +450,12 @@ const DEFAULT_COMMIT_OP = {
 function setupFullPipeline(): void {
 	// readFileFromBranch returns null by default (no stored files to log)
 	vi.mocked(readFileFromBranch).mockResolvedValue(null);
+	// getSummary returns null by default (no prior summary for this commit) so the
+	// "summary already exists" skip in processQueueEntry doesn't short-circuit a
+	// plain commit. Reset explicitly — vi.clearAllMocks() does NOT reset
+	// implementations, so a prior test's truthy getSummary would otherwise bleed in
+	// and make the worker skip generation (storeSummary never called).
+	vi.mocked(getSummary).mockResolvedValue(null);
 	// Queue returns one commit entry, then empty on second call (drain loop stops)
 	vi.mocked(dequeueAllGitOperations).mockResolvedValueOnce([DEFAULT_COMMIT_OP]).mockResolvedValue([]);
 	vi.mocked(deleteQueueEntry).mockResolvedValue(undefined);
@@ -2205,6 +2220,35 @@ describe("queue-driven Worker", () => {
 
 			// Entry should still be deleted despite the error
 			expect(deleteQueueEntry).toHaveBeenCalled();
+		});
+
+		it("skips a plain commit whose summary already exists (no re-summarize), then deletes the entry", async () => {
+			setupFullPipeline();
+			// A concurrent backfill already generated + stored this commit's summary.
+			vi.mocked(getSummary).mockResolvedValue(createMockSummary("abc123"));
+
+			await runWorker("/test/project");
+
+			// The pipeline is short-circuited: no new summary is generated/stored.
+			expect(generateSummary).not.toHaveBeenCalled();
+			expect(storeSummary).not.toHaveBeenCalled();
+			// But the queue entry is consumed (deleted) — the work is genuinely done.
+			expect(deleteQueueEntry).toHaveBeenCalledWith(DEFAULT_COMMIT_OP.filePath);
+		});
+
+		it("DEFERS (does not delete) a queue entry when the capture lock is held by another (contention)", async () => {
+			setupFullPipeline();
+			// The commit-capture lock could not be acquired within the wait window —
+			// another live capture holds it. processQueueEntry throws the typed
+			// contention error, which the drain loop treats as "leave for retry".
+			vi.mocked(withCommitCaptureLock).mockResolvedValueOnce({ ran: false });
+
+			await runWorker("/test/project");
+
+			// The entry is NOT deleted — it survives on disk for a later worker to retry
+			// (the old behavior deleted it, permanently losing the summary).
+			expect(deleteQueueEntry).not.toHaveBeenCalledWith(DEFAULT_COMMIT_OP.filePath);
+			expect(storeSummary).not.toHaveBeenCalled();
 		});
 
 		it("warns on unknown queue entry type", async () => {

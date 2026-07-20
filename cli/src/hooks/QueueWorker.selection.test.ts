@@ -19,6 +19,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("./CommitCaptureLock.js", () => ({
+	COMMIT_CAPTURE_LOCK_WAIT_MS: 1000,
+	withCommitCaptureLock: vi.fn(async (_cwd: string, _hash: string, _mode: unknown, body: () => Promise<unknown>) => ({
+		ran: true,
+		value: await body(),
+	})),
+}));
+
 // --- Module stubs (same surface as PostCommitHook.test.ts) ---
 
 vi.mock("node:child_process", () => ({

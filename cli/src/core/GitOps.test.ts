@@ -54,6 +54,7 @@ import {
 	getRepoContributors,
 	getStagedDiffStats,
 	getTreeHash,
+	getWorkingTreeDiff,
 	getWorkingTreeDiffStats,
 	isAncestor,
 	isInsideGitRepo,
@@ -406,7 +407,7 @@ describe("GitOps", () => {
 
 		it("counts untracked selected files' additions on top of the tracked diff", async () => {
 			mockSuccess(" a.ts | 4 ++--\n 1 file changed, 2 insertions(+), 1 deletion(-)\n"); // diff --stat HEAD
-			mockSuccess("new.ts\nlogo.png\n"); // ls-files --others (two untracked)
+			mockSuccess("new.ts\x00logo.png\x00"); // ls-files -z --others (NUL-separated, two untracked)
 			mockSuccess("12\t0\tnew.ts\n"); // numstat new.ts → +12
 			mockSuccess("-\t-\tlogo.png\n"); // numstat binary → additions "-" skipped, still counts as a file
 			const stats = await getWorkingTreeDiffStats(["a.ts", "new.ts", "logo.png"], "/repo");
@@ -414,7 +415,7 @@ describe("GitOps", () => {
 			expect(stats).toEqual({ filesChanged: 3, insertions: 14, deletions: 1 });
 			expect(mockExecFileAsync).toHaveBeenCalledWith(
 				"git",
-				["ls-files", "--others", "--exclude-standard", "--", "a.ts", "new.ts", "logo.png"],
+				["ls-files", "-z", "--others", "--exclude-standard", "--", "a.ts", "new.ts", "logo.png"],
 				expect.objectContaining({ cwd: "/repo" }),
 			);
 			expect(mockExecFileAsync).toHaveBeenCalledWith(
@@ -1638,6 +1639,88 @@ describe("GitOps", () => {
 			await expect(writeFileToBranch("branch", "summaries/abc.json", "{}", "Add")).rejects.toThrow(
 				"Unexpected ls-tree output",
 			);
+		});
+	});
+
+	describe("getWorkingTreeDiff", () => {
+		// Dispatch by args so the parallel Promise.all calls resolve regardless of
+		// microtask ordering (more robust than the queue-based mockSuccess helper).
+		function dispatch(map: Record<string, string>): void {
+			mockExecFileAsync.mockImplementation(async (_cmd: string, args: string[]) => {
+				const key = args.join(" ");
+				const stdout = key in map ? map[key] : "";
+				return { stdout, stderr: "" };
+			});
+		}
+
+		it("combines tracked diff + stats with no untracked files", async () => {
+			dispatch({
+				"diff HEAD": "diff --git a/x b/x\n+line",
+				"ls-files -z --others --exclude-standard": "",
+				"diff --stat HEAD": " 1 file changed, 2 insertions(+), 1 deletion(-)",
+			});
+			const { content, stats } = await getWorkingTreeDiff("/repo");
+			expect(content).toBe("diff --git a/x b/x\n+line");
+			expect(stats).toEqual({ filesChanged: 1, insertions: 2, deletions: 1 });
+		});
+
+		it("appends untracked files as new-file additions and counts them", async () => {
+			dispatch({
+				"diff HEAD": "TRACKED",
+				"ls-files -z --others --exclude-standard": "new.ts",
+				"diff --stat HEAD": " 1 file changed, 2 insertions(+)",
+				"diff --no-index -- /dev/null new.ts": "NEWFILE_PATCH",
+				"diff --no-index --numstat -- /dev/null new.ts": "3\t0\tnew.ts",
+			});
+			const { content, stats } = await getWorkingTreeDiff("/repo");
+			expect(content).toContain("TRACKED");
+			expect(content).toContain("NEWFILE_PATCH");
+			// 1 tracked + 1 untracked file; 2 tracked + 3 untracked insertions.
+			expect(stats).toEqual({ filesChanged: 2, insertions: 5, deletions: 0 });
+		});
+
+		it("captures untracked paths with special/non-ASCII characters (via -z, not dropped)", async () => {
+			// With `-z`, git emits raw NUL-separated paths (no C-style quoting), so a
+			// filename with non-ASCII bytes survives instead of being quoted-then-
+			// dropped. This is the fix: such a file used to vanish from the capture.
+			const weird = 'café "note".ts';
+			dispatch({
+				"diff HEAD": "",
+				"ls-files -z --others --exclude-standard": `${weird}\x00`,
+				"diff --stat HEAD": "",
+				[`diff --no-index -- /dev/null ${weird}`]: "NEWFILE_PATCH",
+				[`diff --no-index --numstat -- /dev/null ${weird}`]: `7\t0\t${weird}`,
+			});
+			const { content, stats } = await getWorkingTreeDiff("/repo");
+			expect(content).toContain("NEWFILE_PATCH");
+			expect(stats).toEqual({ filesChanged: 1, insertions: 7, deletions: 0 });
+		});
+
+		it("ignores a binary/unparseable numstat count for an untracked file", async () => {
+			dispatch({
+				"diff HEAD": "",
+				"ls-files -z --others --exclude-standard": "logo.png",
+				"diff --stat HEAD": "",
+				"diff --no-index -- /dev/null logo.png": "Binary files differ",
+				"diff --no-index --numstat -- /dev/null logo.png": "-\t-\tlogo.png",
+			});
+			const { stats } = await getWorkingTreeDiff("/repo");
+			// "-" numstat → NaN → not counted; the file still bumps filesChanged.
+			expect(stats).toEqual({ filesChanged: 1, insertions: 0, deletions: 0 });
+		});
+
+		it("caps an over-budget diff, prepending the --stat file list", async () => {
+			const huge = "x".repeat(1000);
+			dispatch({
+				"diff HEAD": huge,
+				"ls-files -z --others --exclude-standard": "",
+				"diff --stat HEAD": " 1 file changed, 1000 insertions(+)",
+			});
+			const { content } = await getWorkingTreeDiff("/repo", 300);
+			expect(content.length).toBeLessThanOrEqual(300);
+			expect(content.length).toBeLessThan(huge.length); // body was truncated
+			expect(content).toContain("diff body truncated");
+			expect(content).toContain("1 file changed"); // full --stat list preserved
 		});
 	});
 });

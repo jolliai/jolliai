@@ -47,6 +47,7 @@ vi.mock("../graph/GraphBuilder.js", () => ({ buildKnowledgeGraph: vi.fn(async ()
 
 import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { withVaultWriteLock } from "../sync/VaultWriteLock.js";
+import type { CompileProgressEvent } from "./CompileProgress.js";
 import { drainIngest } from "./IngestPipeline.js";
 import { discoverRepos } from "./MemoryBankRepoDiscovery.js";
 import { compileAllRepos } from "./MultiRepoCompile.js";
@@ -196,5 +197,35 @@ describe("compileAllRepos", () => {
 		const res = await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never);
 		expect(res.failed).toBe(0);
 		expect(res.totalIngested).toBe(2);
+	});
+
+	it("throws AbortError when the signal aborts MID-sweep (during a repo's drain), not only when pre-aborted", async () => {
+		// The between-phase abort check must catch a signal that fires while a repo is
+		// mid-compile, not just one aborted before the sweep started. Abort during the
+		// drain → the pre-graph check throws AbortError, which the outer catch re-raises
+		// as a sweep-cancel (not a per-repo failure).
+		const controller = new AbortController();
+		const graphCallsBefore = vi.mocked(buildKnowledgeGraph).mock.calls.length;
+		vi.mocked(drainIngest).mockImplementationOnce(async () => {
+			controller.abort();
+			return { batches: 1, ingested: 2 } as never;
+		});
+		await expect(
+			compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never, {
+				signal: controller.signal,
+			}),
+		).rejects.toThrow(/cancel/i);
+		// Aborted before the graph phase → no graph build ran for this repo.
+		expect(vi.mocked(buildKnowledgeGraph).mock.calls.length).toBe(graphCallsBefore);
+	});
+
+	it("emits the search-index phase on the sweep so struct-consuming UIs match the single-repo path", async () => {
+		// Parity fix: the single-repo path emits a "search-index" phase event; the sweep
+		// warmed the index silently. Both paths must surface the same phase sequence.
+		const phases: CompileProgressEvent["phase"][] = [];
+		await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never, {
+			onProgressEvent: (e) => phases.push(e.phase),
+		});
+		expect(phases).toContain("search-index");
 	});
 });
