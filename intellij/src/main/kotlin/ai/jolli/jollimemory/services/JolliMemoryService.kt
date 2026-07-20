@@ -242,6 +242,16 @@ class JolliMemoryService(private val project: Project) : Disposable {
         private set
 
     /**
+     * Set to `true` when [initialize] was blocked because no usable Node.js runtime
+     * was found. While set, NOTHING was initialized (no hooks, no KB folder, no
+     * watchers) — the tool window shows a blocking "Node.js required" panel instead
+     * of the full UI. Cleared by a successful [initialize] after Node is detected.
+     */
+    @Volatile
+    var nodeMissing: Boolean = false
+        private set
+
+    /**
      * Resets initialization state so [initialize] can run again.
      * Called when `.git` reappears after being removed (e.g., user ran `git init`
      * after previously deleting the repo).
@@ -262,6 +272,21 @@ val sb = StringBuilder()
             initLog = sb.toString()
             return
         }
+
+        // Hard gate: a usable Node.js runtime is REQUIRED. When absent, initialization
+        // stops here — no hooks, no KB folder, no watchers, no sync. The startup
+        // activity and the tool window surface a blocking "Node.js required" panel
+        // with a Retry that re-runs detection and then this method. Blocking probe,
+        // but cheap after the first detection (in-process + node-info.json cache).
+        if (ai.jolli.jollimemory.bridge.NodeRuntime.detect() == null) {
+            nodeMissing = true
+            lastError = "Node.js not found — Jolli Memory is blocked until it is installed"
+            sb.appendLine("BLOCKED: no usable Node.js runtime found")
+            initLog = sb.toString()
+            log.warn("Initialize blocked: no usable Node.js runtime")
+            return
+        }
+        nodeMissing = false
 
         // Check .git entry
         val gitEntry = java.io.File(basePath, ".git")

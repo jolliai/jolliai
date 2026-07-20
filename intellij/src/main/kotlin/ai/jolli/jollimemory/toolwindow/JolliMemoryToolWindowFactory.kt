@@ -7,6 +7,7 @@ import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliApiClient
 import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
+import ai.jolli.jollimemory.util.escapeHtml
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.DefaultActionGroup
@@ -16,6 +17,8 @@ import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vcs.ProjectLevelVcsManager
+import com.intellij.openapi.fileChooser.FileChooser
+import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.vcs.VcsListener
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
@@ -73,7 +76,158 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             return
         }
 
-        createFullContent(project, toolWindow)
+        createGatedContent(project, toolWindow)
+    }
+
+    /**
+     * Node.js gate in front of the full UI. When a verified Node runtime is already
+     * known (in-process cache, non-blocking check — safe on the EDT) the full content
+     * is built; otherwise the blocking "Node.js required" panel is shown, which probes
+     * in the background and swaps in the full UI only once Node is found.
+     */
+    private fun createGatedContent(project: Project, toolWindow: ToolWindow) {
+        if (ai.jolli.jollimemory.bridge.NodeRuntime.cached() != null) {
+            createFullContent(project, toolWindow)
+        } else {
+            showNodeMissingContent(project, toolWindow)
+        }
+    }
+
+    /**
+     * Blocking panel shown while no verified Node.js runtime is known. Nothing else of
+     * the plugin UI is reachable behind it (and JolliMemoryService.initialize() is
+     * gated on the same check, so no plugin logic runs either).
+     *
+     * On construction it immediately re-probes in the background WITHOUT forcing, so a
+     * detection already running in the startup activity is shared, and a tool window
+     * that opened before that first probe finished self-heals into the full UI. The
+     * Retry button forces a fresh probe and, via
+     * [ai.jolli.jollimemory.services.JolliMemoryStartupActivity.retryNodeDetection],
+     * completes the startup sequence the gate skipped.
+     */
+    private fun showNodeMissingContent(project: Project, toolWindow: ToolWindow) {
+        val statusLabel = JBLabel("Checking for Node.js...")
+        val retryButton = javax.swing.JButton("Retry detection").apply { isEnabled = false }
+        val chooseButton = javax.swing.JButton("Choose manually...").apply { isEnabled = false }
+        val downloadButton = javax.swing.JButton("Download Node.js")
+
+        val messagePanel = JPanel(BorderLayout()).apply {
+            border = JBUI.Borders.empty(12)
+            val box = Box.createVerticalBox()
+            box.add(JBLabel(
+                "<html>" +
+                    "<b>Node.js is required</b><br/><br/>" +
+                    "Jolli Memory needs a Node.js runtime and is blocked until one is found.<br/>" +
+                    "Install Node.js 18 or newer (LTS recommended), then click <b>Retry detection</b> — " +
+                    "or point Jolli Memory at an existing binary with <b>Choose manually</b>." +
+                    "</html>",
+            ).apply { alignmentX = Component.LEFT_ALIGNMENT })
+            box.add(Box.createVerticalStrut(12))
+            box.add(statusLabel.apply { alignmentX = Component.LEFT_ALIGNMENT })
+            box.add(Box.createVerticalStrut(12))
+            box.add(JPanel(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 8, 0)).apply {
+                alignmentX = Component.LEFT_ALIGNMENT
+                isOpaque = false
+                add(retryButton)
+                add(chooseButton)
+                add(downloadButton)
+            })
+            add(box, BorderLayout.NORTH)
+        }
+        val content = ContentFactory.getInstance().createContent(messagePanel, "", false)
+        toolWindow.contentManager.addContent(content)
+
+        downloadButton.addActionListener {
+            com.intellij.ide.BrowserUtil.browse("https://nodejs.org/en/download")
+        }
+
+        fun setBusy(text: String) {
+            statusLabel.text = text
+            retryButton.isEnabled = false
+            chooseButton.isEnabled = false
+        }
+
+        fun setIdle(text: String) {
+            statusLabel.text = text
+            retryButton.isEnabled = true
+            chooseButton.isEnabled = true
+        }
+
+        val unblock = {
+            SwingUtilities.invokeLater {
+                toolWindow.contentManager.removeAllContents(true)
+                createFullContent(project, toolWindow)
+            }
+        }
+
+        val onProbeDone = { found: Boolean ->
+            if (found) {
+                unblock()
+            } else {
+                // If detection ran candidates and rejected every one only because they were too
+                // old, tell the user exactly that — with concrete versions and paths — instead
+                // of a bare "not found" which reads as a bug on a machine that clearly has Node.
+                val rejected = ai.jolli.jollimemory.bridge.NodeRuntime.rejectedFromLastDetection()
+                val msg = if (rejected.isEmpty()) {
+                    "No usable Node.js (18 or newer) was found on this machine."
+                } else {
+                    val items = rejected.joinToString("<br/>") { r ->
+                        "• <b>${escapeHtml(r.version)}</b> at ${escapeHtml(r.path)} — too old"
+                    }
+                    "<html>Node.js is installed but too old (need v18 or newer):<br/>$items</html>"
+                }
+                SwingUtilities.invokeLater { setIdle(msg) }
+            }
+        }
+
+        // Initial background probe (non-forced — shares a probe already running in the
+        // startup activity instead of repeating it).
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            onProbeDone(ai.jolli.jollimemory.bridge.NodeRuntime.detect() != null)
+        }
+
+        retryButton.addActionListener {
+            setBusy("Checking for Node.js...")
+            com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+                onProbeDone(
+                    ai.jolli.jollimemory.services.JolliMemoryStartupActivity.retryNodeDetection(project),
+                )
+            }
+        }
+
+        // Manual fallback for installs the automatic channels can't see (fully custom
+        // locations, exotic shells). The chooser only lets an actual node binary be
+        // picked, and the pick still goes through the same --version + minimum-version
+        // proof as automatic detection — a wrong file can never unblock the plugin.
+        chooseButton.addActionListener {
+            val descriptor = FileChooserDescriptor(true, false, false, false, false, false)
+                .withTitle("Select Node.js Executable")
+                .withDescription("Pick the node binary itself (node / node.exe), not a folder")
+                .withShowHiddenFiles(true) // node usually lives in dot-dirs (~/.nvm, ~/.volta)
+                .withFileFilter { ai.jolli.jollimemory.bridge.NodeRuntime.isNodeExecutableName(it.name) }
+            FileChooser.chooseFile(descriptor, project, null) { picked ->
+                setBusy("Verifying ${picked.name}...")
+                com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+                    val result = ai.jolli.jollimemory.bridge.NodeRuntime.adoptManualSelection(picked.path)
+                    if (result is ai.jolli.jollimemory.bridge.NodeRuntime.ManualSelectionResult.Accepted) {
+                        // Same pooled thread: complete the startup sequence the gate
+                        // skipped, then swap in the full UI.
+                        ai.jolli.jollimemory.services.JolliMemoryStartupActivity.runPostNodeStartup(project)
+                        unblock()
+                    } else {
+                        val message = when (result) {
+                            is ai.jolli.jollimemory.bridge.NodeRuntime.ManualSelectionResult.TooOld ->
+                                "That Node.js is ${result.version} — version 18 or newer is required."
+                            is ai.jolli.jollimemory.bridge.NodeRuntime.ManualSelectionResult.NotNode ->
+                                "The selected file did not answer node --version — pick the actual Node.js binary."
+                            else ->
+                                "The selected file is not an executable."
+                        }
+                        SwingUtilities.invokeLater { setIdle(message) }
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -98,7 +252,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         val content = ContentFactory.getInstance().createContent(messagePanel, "", false)
         toolWindow.contentManager.addContent(content)
 
-        // Listen for VCS changes — when .git appears, rebuild with full UI
+        // Listen for VCS changes — when .git appears, rebuild (behind the Node gate)
         val connection = project.messageBus.connect()
         connection.subscribe(
             ProjectLevelVcsManager.VCS_CONFIGURATION_CHANGED,
@@ -107,7 +261,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
                     connection.disconnect()
                     SwingUtilities.invokeLater {
                         toolWindow.contentManager.removeAllContents(true)
-                        createFullContent(project, toolWindow)
+                        createGatedContent(project, toolWindow)
                     }
                 }
             },
