@@ -24,7 +24,6 @@ import java.util.concurrent.TimeUnit
 object CliIntegrations {
 
     private val log = JmLogger.create("CliIntegrations")
-    private val isWindows = System.getProperty("os.name").lowercase().contains("win")
 
     sealed class Result {
         /** Integrations set up successfully. */
@@ -228,38 +227,13 @@ object CliIntegrations {
         }
 
     /**
-     * The user's login-shell PATH. GUI-launched IDEs inherit a minimal PATH that often
-     * omits node installed via nvm/homebrew, so we ask the login shell (matches
-     * PrService's gh resolution).
+     * Absolute path to a VERIFIED `node` executable, or null if none exists. Delegates
+     * to [NodeRuntime], which probes the process/login/interactive-shell PATHs plus
+     * well-known install dirs, proves candidates with `node --version`, and records the
+     * winner in `~/.jolli/jollimemory/node-info.json`. Blocking on first call — keep
+     * off the EDT (all current callers already run on pooled threads).
      */
-    private val resolvedPath: String by lazy {
-        try {
-            if (isWindows) {
-                System.getenv("PATH") ?: ""
-            } else {
-                val shell = System.getenv("SHELL")?.takeIf { it.isNotBlank() && File(it).canExecute() } ?: "/bin/zsh"
-                val proc = ProcessBuilder(shell, "-l", "-c", "echo \$PATH").redirectErrorStream(true).start()
-                val out = proc.inputStream.bufferedReader().use { it.readText().trim() }
-                proc.waitFor(5, TimeUnit.SECONDS)
-                if (out.isNotBlank()) out else System.getenv("PATH") ?: ""
-            }
-        } catch (_: Exception) {
-            System.getenv("PATH") ?: ""
-        }
-    }
-
-    /** Absolute path to a `node` executable on the login-shell PATH, or null if absent. */
-    fun resolveNode(): String? {
-        val candidates = if (isWindows) listOf("node.exe", "node.cmd", "node") else listOf("node")
-        for (dir in resolvedPath.split(File.pathSeparator)) {
-            if (dir.isBlank()) continue
-            for (name in candidates) {
-                val f = File(dir, name)
-                if (f.canExecute()) return f.absolutePath
-            }
-        }
-        return null
-    }
+    fun resolveNode(): String? = NodeRuntime.detect()?.path
 
     fun isNodeAvailable(): Boolean = resolveNode() != null
 
