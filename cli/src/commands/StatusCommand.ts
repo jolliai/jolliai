@@ -24,6 +24,8 @@ import {
 	tenantOriginForKey,
 } from "../core/SpaceBindingCache.js";
 import type { SqliteScanError } from "../core/SqliteHelpers.js";
+import { createStorage } from "../core/StorageFactory.js";
+import { setActiveStorage } from "../core/SummaryStore.js";
 import { getStatus } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { StatusInfo } from "../Types.js";
@@ -269,6 +271,11 @@ export function registerStatusCommand(program: Command): void {
 		.option("--refresh", "Re-check the Jolli Space binding against the server (bypass the local cache)")
 		.action(async (options: { cwd: string; json?: boolean; refresh?: boolean }) => {
 			setLogDir(options.cwd);
+			// Bind the active storage provider before any summary read (getStatus →
+			// getSummaryCount). Without it resolveStorage falls back to the orphan
+			// branch and logs a WARN — harmless for this read, but noisy, and it
+			// bypasses the folder/dual-write provider a folder-mode user expects.
+			setActiveStorage(await createStorage(options.cwd, options.cwd));
 
 			log.info("Running 'status' command");
 			const status = await getStatus(options.cwd);

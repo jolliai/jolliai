@@ -42,8 +42,13 @@ const CLIENT_VERSION = typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ 
  *   The same origin is used to build the login page URL and to redeem the
  *   exchange code, so the two halves of the flow can never disagree on which
  *   tenant is being signed into.
+ * @param opts.report Progress sink for user-facing lines ("opening browser",
+ *   the fallback URL). Defaults to `console.log`. The Ink TUI passes a callback
+ *   that renders into the panel instead — writing to stdout would corrupt the
+ *   Ink frame, so this must never go straight to `console.*` in that context.
  */
-export function browserLogin(jolliUrl: string): Promise<void> {
+export function browserLogin(jolliUrl: string, opts?: { report?: (msg: string) => void }): Promise<void> {
+	const report = opts?.report ?? ((m: string) => console.log(m));
 	return new Promise((resolve, reject) => {
 		// 256-bit CSRF nonce per RFC 6749 §10.12. Sent on the login URL and
 		// echoed back unchanged on the `?code=` callback; mismatch means the
@@ -53,6 +58,7 @@ export function browserLogin(jolliUrl: string): Promise<void> {
 			port: 0,
 			jolliUrl,
 			expectedState,
+			report,
 			async onListen() {
 				try {
 					const addr = server.address();
@@ -94,8 +100,8 @@ export function browserLogin(jolliUrl: string): Promise<void> {
 
 					track("signin_started", { trigger: "cli" });
 
-					console.log("Opening browser to login...");
-					console.log(`If the browser doesn't open automatically, visit: ${loginUrl}`);
+					report("Opening browser to login...");
+					report(`If the browser doesn't open automatically, visit: ${loginUrl}`);
 
 					// Detach the browser process so it doesn't block Node.js from exiting
 					const child = await open(loginUrl);
@@ -122,6 +128,8 @@ interface LoginServerOptions {
 	 * don't echo state and we'd otherwise lock those users out of sign-in.
 	 */
 	readonly expectedState: string;
+	/** Progress sink for user-facing lines; defaults to `console.warn`/`console.log`. */
+	readonly report?: (msg: string) => void;
 	onListen(): void;
 	onSuccess(): void;
 	onError(error: Error): void;
@@ -148,6 +156,7 @@ interface LoginServerOptions {
  */
 export function createLoginServer(options: LoginServerOptions): Server {
 	const { port, jolliUrl, expectedState, onListen, onSuccess, onError } = options;
+	const report = options.report ?? ((m: string) => console.warn(m));
 
 	const server = createServer(async (req, res) => {
 		const url = new URL((req as { url: string }).url, `http://127.0.0.1:${port}`);
@@ -207,9 +216,7 @@ export function createLoginServer(options: LoginServerOptions): Server {
 			} else if (legacyToken) {
 				// Legacy fallback. Logged at warn level so we can track residual
 				// usage and decide when it's safe to drop this branch.
-				console.warn(
-					"Using legacy token-in-URL callback — server has not been upgraded to the code-exchange flow",
-				);
+				report("Using legacy token-in-URL callback — server has not been upgraded to the code-exchange flow");
 				const legacyApiKey = url.searchParams.get("jolli_api_key");
 				credentials = {
 					token: legacyToken,

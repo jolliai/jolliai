@@ -3,11 +3,11 @@
  * commits does the cold-start back-fill offer".
  *
  * Shared by every surface that computes cold-start signals or renders the offer:
- * the CLI guided front door (`BackfillFrontDoorStep`), the VS Code sidebar card,
- * and the Settings panel all import these so the window + cap can never drift
- * between them. Lives in `cli/src/backfill/` (not the VS Code layer) because the
- * CLI front door is now a first-class consumer; the VS Code `BackfillListRenderer`
- * re-exports them for its existing importers.
+ * the CLI `backfill` command, the VS Code sidebar card, and the Settings panel
+ * all import these so the window + cap can never drift between them. Lives in
+ * `cli/src/backfill/` (not the VS Code layer) because the CLI is a first-class
+ * consumer; the VS Code `BackfillListRenderer` re-exports them for its existing
+ * importers.
  */
 
 /**

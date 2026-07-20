@@ -13,7 +13,7 @@ vi.mock("../core/ContextCompiler.js", () => ({
 	DEFAULT_TOKEN_BUDGET: 80000,
 }));
 vi.mock("../core/TopicPageStore.js", () => ({ readTopicPage: vi.fn() }));
-vi.mock("../core/SummaryStore.js", () => ({ getActiveStorage: vi.fn() }));
+vi.mock("../core/SummaryStore.js", () => ({ getActiveStorage: vi.fn(), getIndex: vi.fn() }));
 vi.mock("../core/PrDescription.js", () => ({ buildPrDescription: vi.fn() }));
 vi.mock("../util/Subprocess.js", () => ({ execFileSyncHidden: vi.fn() }));
 vi.mock("../core/JolliMemoryPushOrchestrator.js", () => ({
@@ -40,10 +40,12 @@ import { pushBranchToJolli, resolveSpaceId } from "../core/JolliMemoryPushOrches
 import { buildPrDescription } from "../core/PrDescription.js";
 import { SearchIndex } from "../core/SearchIndex.js";
 import { clearSpaceBindingCache } from "../core/SpaceBindingCache.js";
-import { getActiveStorage } from "../core/SummaryStore.js";
+import { getActiveStorage, getIndex } from "../core/SummaryStore.js";
 import { readTopicPage } from "../core/TopicPageStore.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import {
+	collapseTimelineRefs,
+	getTopicDetail,
 	runBindSpace,
 	runDecisionTimeline,
 	runGetPrDescription,
@@ -197,6 +199,95 @@ describe("runDecisionTimeline", () => {
 		} as never);
 		const out = await runDecisionTimeline("/repo", { slug: "auth" });
 		expect(out.timeline[0].branch).toBe("");
+	});
+
+	it("folds an amend-superseded summary ref into its live head via the index", async () => {
+		// The page holds both the pre-amend hash ("old") and the re-ingested head
+		// ("new"); the index marks "old" as superseded (parentCommitHash → "new").
+		vi.mocked(readTopicPage).mockResolvedValue({
+			title: "Auth",
+			sourceRefs: [
+				{ type: "summary", id: "old", timestamp: "2026-01-01T00:00:00Z", branch: "x" },
+				{ type: "summary", id: "new", timestamp: "2026-01-01T00:00:00Z", branch: "x" },
+			],
+		} as never);
+		vi.mocked(getIndex).mockResolvedValue({
+			entries: [
+				{ commitHash: "old", parentCommitHash: "new", commitDate: "2026-01-01T00:00:00Z", branch: "x" },
+				{ commitHash: "new", parentCommitHash: null, commitDate: "2026-01-01T00:00:00Z", branch: "y" },
+			],
+		} as never);
+		const out = await runDecisionTimeline("/repo", { slug: "auth" });
+		expect(out.timeline).toEqual([
+			{ timestamp: "2026-01-01T00:00:00Z", branch: "y", sourceType: "summary", sourceId: "new" },
+		]);
+	});
+
+	it("dedupes per-commit plan snapshots to the base slug's earliest timestamp", async () => {
+		vi.mocked(readTopicPage).mockResolvedValue({
+			title: "Auth",
+			sourceRefs: [
+				{ type: "plan", id: "home-tab-deadbeef", timestamp: "2026-01-03T00:00:00Z", branch: "x" },
+				{ type: "plan", id: "home-tab-cafe1234", timestamp: "2026-01-02T00:00:00Z", branch: "x" },
+				{ type: "note", id: "n1", timestamp: "2026-01-04T00:00:00Z", branch: "x" },
+			],
+		} as never);
+		const out = await runDecisionTimeline("/repo", { slug: "auth" });
+		expect(out.timeline.map((t) => t.sourceId)).toEqual(["home-tab-cafe1234", "n1"]);
+	});
+});
+
+describe("getTopicDetail", () => {
+	it("returns the page's readable content, related branches, and ordered timeline", async () => {
+		vi.mocked(readTopicPage).mockResolvedValue({
+			title: "Renamed file diff",
+			content: "## Problem\nDiff failed.\n## Fix\nRead the working tree.",
+			relatedBranches: ["bug-rename"],
+			lastUpdatedAt: "2026-07-13T00:00:00Z",
+			sourceRefs: [
+				{ type: "summary", id: "b", timestamp: "2026-02-01T00:00:00Z", branch: "x" },
+				{ type: "summary", id: "a", timestamp: "2026-01-01T00:00:00Z", branch: "x" },
+			],
+		} as never);
+		const out = await getTopicDetail("/repo", "renamed");
+		expect(out.title).toBe("Renamed file diff");
+		expect(out.content).toContain("Read the working tree.");
+		expect(out.relatedBranches).toEqual(["bug-rename"]);
+		expect(out.timeline.map((t) => t.sourceId)).toEqual(["a", "b"]); // chronological
+	});
+
+	it("throws when the topic does not exist", async () => {
+		vi.mocked(readTopicPage).mockResolvedValue(null);
+		await expect(getTopicDetail("/repo", "missing")).rejects.toThrow(/not found/i);
+	});
+
+	it("rejects an empty slug", async () => {
+		await expect(getTopicDetail("/repo", "  ")).rejects.toThrow(/slug` is required/i);
+	});
+});
+
+describe("collapseTimelineRefs", () => {
+	it("survives a parentCommitHash cycle and keeps distinct heads distinct", () => {
+		const refs = [
+			{ type: "summary" as const, id: "a", timestamp: "2026-01-01T00:00:00Z" },
+			{ type: "summary" as const, id: "c", timestamp: "2026-01-02T00:00:00Z" },
+		];
+		const entries = [
+			{ commitHash: "a", parentCommitHash: "b" },
+			{ commitHash: "b", parentCommitHash: "a" }, // corrupt cycle — must not hang
+		] as never[];
+		const out = collapseTimelineRefs(refs, entries as never);
+		expect(out.map((r) => r.id).sort()).toEqual(["b", "c"]);
+	});
+
+	it("prefers a parseable plan timestamp over an unparseable one", () => {
+		const refs = [
+			{ type: "plan" as const, id: "p-12345678", timestamp: "not-a-date" },
+			{ type: "plan" as const, id: "p-abcdef01", timestamp: "2026-01-02T00:00:00Z" },
+		];
+		const out = collapseTimelineRefs(refs, []);
+		expect(out).toHaveLength(1);
+		expect(out[0].timestamp).toBe("2026-01-02T00:00:00Z");
 	});
 });
 

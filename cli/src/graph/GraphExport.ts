@@ -14,6 +14,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createStorage } from "../core/StorageFactory.js";
@@ -114,8 +115,10 @@ export function buildStandaloneHtml(assetsDir: string, graphJson: string): strin
 export interface ExportGraphOptions {
 	/** Repo directory whose graph to export. */
 	readonly cwd: string;
-	/** Output target: a directory (gets `<repo>-graph.html`) or an explicit `*.html` path. */
-	readonly out: string;
+	/** Output target: a directory (gets `<repo>-graph.html`) or an explicit `*.html`
+	 *  path. When omitted, defaults to the user's Documents folder (`~/Documents`)
+	 *  — NOT the repo cwd, which would dirty the git working tree. */
+	readonly out?: string;
 }
 
 /**
@@ -132,9 +135,9 @@ export async function exportGraphHtml(opts: ExportGraphOptions): Promise<string>
 	}
 	const html = buildStandaloneHtml(resolveAssetsDir(), readFileSync(graphPath, "utf8"));
 
-	const outFile = opts.out.toLowerCase().endsWith(".html")
-		? opts.out
-		: join(opts.out, `${basename(kbRoot)}-graph.html`);
+	// No explicit target → the user's Documents folder (keeps the repo clean).
+	const outDir = opts.out && opts.out.trim() !== "" ? opts.out : join(homedir(), "Documents");
+	const outFile = outDir.toLowerCase().endsWith(".html") ? outDir : join(outDir, `${basename(kbRoot)}-graph.html`);
 	mkdirSync(dirname(outFile), { recursive: true });
 	writeFileSync(outFile, html, "utf8");
 	return outFile;

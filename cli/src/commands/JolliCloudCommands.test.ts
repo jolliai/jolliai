@@ -236,9 +236,10 @@ describe("jolli push / spaces / bind commands", () => {
 		it("default output lists spaces with a default marker", async () => {
 			const { stdout } = await runCommand(["spaces", "--cwd", "/tmp/x"]);
 			expect(stdout).toContain("Acme");
-			expect(stdout).toContain("acme");
 			expect(stdout).toContain("Widgets");
 			expect(stdout).toContain("(default)");
+			// Slug is no longer shown in the human-readable listing — name only.
+			expect(stdout).not.toContain("(acme)");
 		});
 
 		it("empty space list prints a friendly message", async () => {

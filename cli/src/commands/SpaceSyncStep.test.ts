@@ -527,7 +527,7 @@ describe("runSpaceSyncStep", () => {
 		});
 		h.promptText.mockResolvedValue("1");
 
-		await expect(runSpaceSyncStep("/repo", { client })).resolves.toBeUndefined();
+		await expect(runSpaceSyncStep("/repo", { client })).resolves.toEqual({ kind: "error", message: "boom" });
 
 		expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("✓ syncing"));
 	});
@@ -537,7 +537,10 @@ describe("runSpaceSyncStep", () => {
 			frontDoor: vi.fn().mockRejectedValue("string failure"),
 		});
 
-		await expect(runSpaceSyncStep("/repo", { client })).resolves.toBeUndefined();
+		await expect(runSpaceSyncStep("/repo", { client })).resolves.toEqual({
+			kind: "error",
+			message: "string failure",
+		});
 
 		expect(logSpy).not.toHaveBeenCalled();
 	});
@@ -547,7 +550,7 @@ describe("runSpaceSyncStep", () => {
 		// apiKeyProvider over the already-loaded config. The stubbed parseBaseUrl
 		// returns undefined, so auth resolution throws before any network I/O —
 		// exercising the default-client path end-to-end without a fetch.
-		await expect(runSpaceSyncStep("/repo")).resolves.toBeUndefined();
+		await expect(runSpaceSyncStep("/repo")).resolves.toMatchObject({ kind: "error" });
 
 		expect(logSpy).not.toHaveBeenCalled();
 	});
@@ -681,5 +684,41 @@ describe("runSpaceSyncStep", () => {
 			spaceName: spaceB.name,
 			canPush: true,
 		});
+	});
+
+	it("routes output through `report` (not stdout) when provided", async () => {
+		const { client } = makeClient({
+			frontDoor: vi
+				.fn()
+				.mockResolvedValue({ status: "bound", binding: { jmSpaceId: 7, spaceName: "Acme Core" } }),
+		});
+		const report = vi.fn();
+
+		await runSpaceSyncStep("/repo", { client, report });
+
+		expect(report).toHaveBeenCalledWith('  ✓ syncing · Space "Acme Core"');
+		expect(logSpy).not.toHaveBeenCalled();
+	});
+
+	it("nonInteractive: never prompts on multiple Spaces, reports a bind-later hint", async () => {
+		const { client, createBinding } = makeClient({
+			frontDoor: vi
+				.fn()
+				.mockResolvedValue({ status: "unbound", spaces: [spaceA, spaceB], defaultSpaceId: spaceA.id }),
+		});
+		const report = vi.fn();
+
+		await runSpaceSyncStep("/repo", { client, nonInteractive: true, report });
+
+		expect(h.promptText).not.toHaveBeenCalled();
+		expect(createBinding).not.toHaveBeenCalled();
+		// Lists each Space with a concrete, copy-pasteable `--space <id>` command
+		// (a bare `jolli bind` requires --space, so a name-only hint is a dead end).
+		const reported = report.mock.calls.map((c) => c[0] as string).join("\n");
+		expect(reported).toContain("jolli bind --space 1");
+		expect(reported).toContain("Acme Core");
+		expect(reported).toContain("jolli bind --space 2");
+		expect(reported).toContain("Sandbox");
+		expect(reported).toContain("(default)"); // marks the default Space
 	});
 });

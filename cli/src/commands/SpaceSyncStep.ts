@@ -1,12 +1,13 @@
 /**
- * Cloud sync / Space-binding step delegated by the guided front door.
+ * Cloud sync / Space-binding step, invoked from the Jolli TUI's cloud-sync
+ * action (and reusable by any caller that owns the auth + enable axes).
  *
- * The guided front door (`runGuidedFrontDoor`) owns the auth + enable axes and
- * calls this once whenever the repo is in the enabled state (interactive TTY
- * guaranteed by the front door). Everything about getting memories into a
- * Jolli Space — binding-state discovery, single/multi Space binding, and every
- * sync-related user prompt — lives here, not in the front door. Kept in its
- * own module so the front door's tests can mock it.
+ * The caller invokes this once whenever the repo is in the enabled state.
+ * Everything about getting memories into a Jolli Space — binding-state
+ * discovery, single/multi Space binding, and every sync-related user prompt —
+ * lives here, not in the caller. In `nonInteractive` mode (the TUI, whose Ink
+ * owns raw stdin) it never prompts and routes messages through `report`. Kept
+ * in its own module so callers' tests can mock it.
  *
  * Cache-first on the common path: a fresh healthy entry in the local
  * SpaceBindingCache (`space-binding.json`) prints the sync line with zero
@@ -23,6 +24,12 @@
  * authority on binding state — the cache is a display/probe accelerator with
  * a TTL, and every rejected push clears it (see SpaceBindingCache), so a
  * re-bind or unbind done elsewhere is still picked up.
+ *
+ * Output + interactivity are pluggable so the Ink TUI can drive this step:
+ * `report` is the progress sink (defaults to `console.log`; the TUI routes it
+ * into its panel), and `nonInteractive` suppresses the readline prompts that
+ * would fight Ink's raw stdin — the several-Spaces pick and the rebind escape
+ * hatch are both deferred to an explicit `jolli bind` in that mode.
  *
  * Failure posture: best-effort. The front door must never be blocked by cloud
  * state, so every error (not signed in, outdated client, network) is logged at
@@ -54,15 +61,52 @@ const log = createLogger("SpaceSyncStep");
 /** Test seam — defaults to a real `JolliMemoryPushClient` (mirrors `PushBranchOpts.client`). */
 export interface SpaceSyncStepOpts {
 	readonly client?: JolliMemoryPushClient;
+	/**
+	 * When true, the interactive branches do NOT prompt (readline would fight
+	 * Ink's raw mode) — the several-Spaces pick reports a "bind later" hint and
+	 * the rebind escape hatch is skipped. Set by the TUI's `runCloudSync`; the
+	 * single-Space / already-bound / no-Spaces paths never prompt and are
+	 * unaffected.
+	 */
+	readonly nonInteractive?: boolean;
+	/** Progress sink; defaults to `console.log`. The TUI routes it into the panel. */
+	readonly report?: (msg: string) => void;
 }
 
+/**
+ * The actual outcome of a sync attempt — the return value exists so a caller
+ * (the TUI's cloud-sync action) can render a TRUTHFUL result line instead of
+ * assuming success. `report` still carries the human-readable detail; this is
+ * the machine-readable verdict.
+ * - `bound`        — a binding is in place (freshly created, or already present /
+ *                    re-checked when `rechecked` is true).
+ * - `no-credential`— no `jolliApiKey`, nothing to sync to.
+ * - `no-spaces`    — no Spaces are available to bind to.
+ * - `multi-space`  — several bindable Spaces; the pick was deferred (nothing bound).
+ * - `conflict`     — the repo is already bound to a different Space; pick not applied.
+ * - `error`        — the attempt failed (offline, revoked key, server hiccup, …).
+ */
+export type SpaceSyncOutcome =
+	| {
+			readonly kind: "bound";
+			readonly spaceName: string | null;
+			readonly canPush: boolean | null;
+			readonly rechecked: boolean;
+	  }
+	| { readonly kind: "no-credential" }
+	| { readonly kind: "no-spaces" }
+	| { readonly kind: "multi-space"; readonly count: number }
+	| { readonly kind: "conflict" }
+	| { readonly kind: "error"; readonly message: string };
+
 /** Runs the Space-binding axis of the guided front door. See the module docstring for the contract. */
-export async function runSpaceSyncStep(cwd: string, opts: SpaceSyncStepOpts = {}): Promise<void> {
+export async function runSpaceSyncStep(cwd: string, opts: SpaceSyncStepOpts = {}): Promise<SpaceSyncOutcome> {
+	const report = opts.report ?? ((m: string) => console.log(m));
 	const config = await loadConfig();
 	// No Jolli credential → nothing to sync to. The front door's status line
 	// already tells the user how to sign in; stay quiet here.
 	if (!config.jolliApiKey) {
-		return;
+		return { kind: "no-credential" };
 	}
 	try {
 		const repoUrl = await getCanonicalRepoUrl(cwd);
@@ -75,8 +119,8 @@ export async function runSpaceSyncStep(cwd: string, opts: SpaceSyncStepOpts = {}
 		if (origin) {
 			const cached = await loadSpaceBindingCache(cwd, { repoUrl, origin });
 			if (cached) {
-				printSyncLine(cached.spaceName, cached.canPush);
-				return;
+				printSyncLine(cached.spaceName, cached.canPush, report);
+				return { kind: "bound", spaceName: cached.spaceName, canPush: cached.canPush, rechecked: true };
 			}
 		}
 
@@ -96,8 +140,10 @@ export async function runSpaceSyncStep(cwd: string, opts: SpaceSyncStepOpts = {}
 			// Rebind escape hatch: the server attaches a non-empty bindable pool
 			// exactly when the binding is unusable for this caller (canPush
 			// false). Without it there is nothing to offer — the warning line
-			// points at restored access instead (rebindFollows false).
-			const rebindFollows = result.binding.canPush === false && result.spaces.length > 0;
+			// points at restored access instead (rebindFollows false). It is an
+			// interactive prompt, so it is skipped entirely in the TUI's
+			// non-interactive mode (the warning line still shows the hint).
+			const rebindFollows = !opts.nonInteractive && result.binding.canPush === false && result.spaces.length > 0;
 			const healthy = result.binding.canPush !== false && result.binding.spaceName !== null;
 			if (healthy && origin) {
 				await saveSpaceBindingCache(cwd, {
@@ -111,11 +157,22 @@ export async function runSpaceSyncStep(cwd: string, opts: SpaceSyncStepOpts = {}
 				// Degraded bindings must never be served from cache.
 				await clearSpaceBindingCache(cwd);
 			}
-			printSyncLine(result.binding.spaceName, result.binding.canPush, rebindFollows);
+			printSyncLine(result.binding.spaceName, result.binding.canPush, report, rebindFollows);
 			if (rebindFollows) {
-				await offerRebind(client, { cwd, repoUrl, repoName, origin }, result.spaces, result.defaultSpaceId);
+				await offerRebind(
+					client,
+					{ cwd, repoUrl, repoName, origin },
+					result.spaces,
+					result.defaultSpaceId,
+					report,
+				);
 			}
-			return;
+			return {
+				kind: "bound",
+				spaceName: result.binding.spaceName,
+				canPush: result.binding.canPush,
+				rechecked: true,
+			};
 		}
 		// An `unbound` whose list came back empty is contract drift (the server
 		// answers `no_spaces` when nothing is bindable) — prompting would offer
@@ -126,16 +183,27 @@ export async function runSpaceSyncStep(cwd: string, opts: SpaceSyncStepOpts = {}
 		if (result.status === "no_spaces" || result.spaces.length === 0) {
 			await clearSpaceBindingCache(cwd);
 			const site = siteFromApiKey(config.jolliApiKey);
-			console.log(
-				`  No Jolli Spaces available to you — create one${site ? ` at ${site}` : " in the Jolli web app"}`,
-			);
-			return;
+			report(`  No Jolli Spaces available to you — create one${site ? ` at ${site}` : " in the Jolli web app"}`);
+			return { kind: "no-spaces" };
 		}
 
 		// Several bindable Spaces — ask which one, then bind via the same
 		// endpoint the VS Code chooser uses. A single-entry list is contract
 		// drift too (the server auto-binds that case) — take it without a
 		// pointless one-option prompt.
+		// In non-interactive (TUI) mode, prompting would fight Ink's raw stdin —
+		// defer the pick to an explicit `jolli bind`. List the actual Spaces + ids
+		// so the user has a concrete `--space <id>` to run (a bare `jolli bind`
+		// requires --space, so a name-only hint would be a dead end).
+		if (result.spaces.length > 1 && opts.nonInteractive) {
+			report("  Multiple Jolli Spaces — bind this repo with one of:");
+			for (const s of result.spaces) {
+				report(
+					`    jolli bind --space ${s.id}   # ${s.name}${s.id === result.defaultSpaceId ? " (default)" : ""}`,
+				);
+			}
+			return { kind: "multi-space", count: result.spaces.length };
+		}
 		const chosen =
 			result.spaces.length === 1
 				? result.spaces[0]
@@ -151,10 +219,10 @@ export async function runSpaceSyncStep(cwd: string, opts: SpaceSyncStepOpts = {}
 			// (mirrors pushBranchToJolli). An undefined existingSpaceId cannot be
 			// confirmed, so it is a mismatch too.
 			if (err.existingSpaceId !== chosen.id) {
-				console.log(
+				report(
 					"  ⚠ this repo is already bound to a different Jolli Space — your pick was not applied. Re-run `jolli` to see the active binding.",
 				);
-				return;
+				return { kind: "conflict" };
 			}
 		}
 		// canPush is true by construction here: the server's bindable pool is
@@ -168,11 +236,16 @@ export async function runSpaceSyncStep(cwd: string, opts: SpaceSyncStepOpts = {}
 				canPush: true,
 			});
 		}
-		printSyncLine(chosen.name, true);
+		printSyncLine(chosen.name, true, report);
+		return { kind: "bound", spaceName: chosen.name, canPush: true, rechecked: false };
 	} catch (error) {
 		// Best-effort: never block or noise up the front door over cloud state
-		// (offline, revoked key, outdated client, server hiccup).
-		log.debug(`space sync step skipped: ${error instanceof Error ? error.message : String(error)}`);
+		// (offline, revoked key, outdated client, server hiccup). The failure is
+		// returned (not swallowed) so an explicit caller — the TUI's cloud-sync
+		// action — can show it instead of a false "bound" line.
+		const message = error instanceof Error ? error.message : String(error);
+		log.debug(`space sync step skipped: ${message}`);
+		return { kind: "error", message };
 	}
 }
 
@@ -197,17 +270,22 @@ export async function runSpaceSyncStep(cwd: string, opts: SpaceSyncStepOpts = {}
  * is not told to chase access one line before being offered a way out
  * (mirrors StatusCommand's canRebind-switched hint).
  */
-function printSyncLine(spaceName: string | null, canPush: boolean | null, rebindFollows = false): void {
+function printSyncLine(
+	spaceName: string | null,
+	canPush: boolean | null,
+	report: (msg: string) => void,
+	rebindFollows = false,
+): void {
 	const hint = rebindFollows ? "" : " (ask for access)";
 	if (!spaceName) {
-		console.log(`  ⚠ bound · no access to the Space — memories won't sync${hint}`);
+		report(`  ⚠ bound · no access to the Space — memories won't sync${hint}`);
 		return;
 	}
 	if (canPush === false) {
-		console.log(`  ⚠ bound · Space "${spaceName}" — read-only access, memories won't sync${hint}`);
+		report(`  ⚠ bound · Space "${spaceName}" — read-only access, memories won't sync${hint}`);
 		return;
 	}
-	console.log(`  ✓ syncing · Space "${spaceName}"`);
+	report(`  ✓ syncing · Space "${spaceName}"`);
 }
 
 /**
@@ -227,6 +305,7 @@ async function offerRebind(
 	repo: { cwd: string; repoUrl: string; repoName: string; origin: string | null },
 	spaces: ReadonlyArray<JolliMemorySpace>,
 	defaultSpaceId: number | null,
+	report: (msg: string) => void,
 ): Promise<void> {
 	const single = spaces.length === 1 ? spaces[0] : null;
 	const question = single
@@ -249,7 +328,7 @@ async function offerRebind(
 		// failure (same 409 tolerance as the main bind flow above).
 		if (!(error instanceof BindingAlreadyExistsError) || error.existingSpaceId !== chosen.id) {
 			log.debug(`rebind failed: ${error instanceof Error ? error.message : String(error)}`);
-			console.log("  ⚠ rebind failed — re-run `jolli` to retry");
+			report("  ⚠ rebind failed — re-run `jolli` to retry");
 			return;
 		}
 	}
@@ -264,7 +343,7 @@ async function offerRebind(
 			canPush: true,
 		});
 	}
-	printSyncLine(chosen.name, true);
+	printSyncLine(chosen.name, true, report);
 }
 
 /**

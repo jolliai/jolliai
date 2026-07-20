@@ -263,3 +263,41 @@ export async function removeRepoMcpHosts(wt: string): Promise<void> {
 	const regs = buildRegistrars(ALL_DETECTED).filter((r) => r.scope === "repo");
 	await forEachIsolated(regs, wt, "removal", (r) => r.remove(wt));
 }
+
+/** A host key in {@link DetectedHosts}. */
+export type McpHostName = keyof DetectedHosts;
+
+/** A `DetectedHosts` with exactly `host` flagged true. */
+function onlyHost(host: McpHostName): DetectedHosts {
+	return {
+		claude: host === "claude",
+		codex: host === "codex",
+		cursor: host === "cursor",
+		gemini: host === "gemini",
+		opencode: host === "opencode",
+		copilot: host === "copilot",
+		copilotChat: host === "copilotChat",
+	};
+}
+
+/**
+ * Remove the JolliMemory MCP entry for a SINGLE **repo-scoped** host (Claude or
+ * Cursor) in this worktree — the granular counterpart to {@link removeRepoMcpHosts},
+ * for the control-center TUI's per-source disable. A no-op for global hosts:
+ * their entry is machine-wide and shared across repos, so a per-repo TUI must
+ * never remove it (see {@link removeRepoMcpHosts} rationale).
+ */
+export async function removeRepoMcpHostsFor(wt: string, host: McpHostName): Promise<void> {
+	const regs = buildRegistrars(onlyHost(host)).filter((r) => r.scope === "repo");
+	await forEachIsolated(regs, wt, "removal", (r) => r.remove(wt));
+}
+
+/**
+ * Register the MCP server for a SINGLE **repo-scoped** host (Claude or Cursor)
+ * in this worktree — granular counterpart to {@link registerRepoMcpHosts}. A
+ * no-op for global hosts (their registration stays install/detection-driven).
+ */
+export async function registerRepoMcpHostsFor(wt: string, host: McpHostName): Promise<void> {
+	const regs = buildRegistrars(onlyHost(host)).filter((r) => r.scope === "repo");
+	await forEachIsolated(regs, wt, "registration", (r) => r.register(wt));
+}

@@ -47,6 +47,7 @@
  * `intellij/src/main/kotlin/ai/jolli/jollimemory/bridge/SkillInstaller.kt`.
  */
 
+import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createLogger } from "../Logger.js";
@@ -181,6 +182,67 @@ export async function updateSkillsIfNeeded(
  */
 export async function updateSkillIfNeeded(projectDir: string, config: { claudeEnabled?: boolean } = {}): Promise<void> {
 	return updateSkillsIfNeeded(projectDir, config);
+}
+
+/** Names of the skills Jolli manages (stable order). */
+export const SKILL_NAMES: ReadonlyArray<string> = SKILLS.map((s) => s.name);
+
+type SkillTargetHost = SkillTarget["host"];
+
+function targetDirFor(projectDir: string, target: SkillTargetHost): string | null {
+	const t = SKILL_TARGETS.find((x) => x.host === target);
+	return t ? join(projectDir, ...t.relativeDir) : null;
+}
+
+/**
+ * Installs/updates one skill into one target directory family (`claude-code` or
+ * `agents-std`). Granular counterpart to {@link updateSkillsIfNeeded}, for the
+ * control-center TUI's per-source apply. No-op for an unknown skill/target.
+ */
+export async function installSkill(projectDir: string, skillName: string, target: SkillTargetHost): Promise<void> {
+	const skill = SKILLS.find((s) => s.name === skillName);
+	const dir = targetDirFor(projectDir, target);
+	if (!skill || !dir) return;
+	await upsertSkill(dir, skill.name, skill.build());
+}
+
+/** Removes one skill's directory from one target. No-op if absent. */
+export async function removeSkill(projectDir: string, skillName: string, target: SkillTargetHost): Promise<void> {
+	const dir = targetDirFor(projectDir, target);
+	if (!dir) return;
+	try {
+		await rm(join(dir, skillName), { recursive: true, force: true });
+		/* v8 ignore start -- defensive: rm with force:true rarely throws */
+	} catch {
+		// Ignore — already absent.
+	}
+	/* v8 ignore stop */
+}
+
+/** Which targets each managed skill is currently written to (SKILL.md present). */
+export interface InstalledSkill {
+	readonly name: string;
+	readonly targets: SkillTargetHost[];
+}
+
+/** Read-only: reports, per managed skill, which target dirs hold its SKILL.md. */
+export function readInstalledSkills(projectDir: string): InstalledSkill[] {
+	return SKILL_NAMES.map((name) => ({
+		name,
+		targets: SKILL_TARGETS.filter((t) => existsSync(join(projectDir, ...t.relativeDir, name, "SKILL.md"))).map(
+			(t) => t.host,
+		),
+	}));
+}
+
+/** Installs all managed skills into one target (used when enabling a source). */
+export async function installSkillsForTarget(projectDir: string, target: SkillTargetHost): Promise<void> {
+	for (const name of SKILL_NAMES) await installSkill(projectDir, name, target);
+}
+
+/** Removes all managed skills from one target (used when disabling a source). */
+export async function removeSkillsForTarget(projectDir: string, target: SkillTargetHost): Promise<void> {
+	for (const name of SKILL_NAMES) await removeSkill(projectDir, name, target);
 }
 
 /**

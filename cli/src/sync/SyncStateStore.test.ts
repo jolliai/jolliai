@@ -19,7 +19,14 @@ vi.mock("node:os", async () => {
 	return { ...actual, homedir: () => mockHomeDir.value };
 });
 
-import { clearConflict, getGlobalSyncDir, loadSyncState, recordConflict, saveSyncState } from "./SyncStateStore.js";
+import {
+	clearConflict,
+	getGlobalSyncDir,
+	getLastSyncAt,
+	loadSyncState,
+	recordConflict,
+	saveSyncState,
+} from "./SyncStateStore.js";
 import type { SyncStateFile } from "./SyncTypes.js";
 
 let tempDir: string;
@@ -47,6 +54,31 @@ describe("SyncStateStore", () => {
 	describe("getGlobalSyncDir", () => {
 		it("returns ~/.jolli/jollimemory/", () => {
 			expect(getGlobalSyncDir()).toBe(join(tempDir, ".jolli", "jollimemory"));
+		});
+	});
+
+	describe("getLastSyncAt", () => {
+		it("returns null when nothing has synced", async () => {
+			expect(await getLastSyncAt()).toBeNull();
+		});
+
+		it("returns the most recent push/fetch across all users", async () => {
+			await saveSyncState(sample({ userSlug: "alice-abc1234", lastPushAt: "2026-07-15T10:00:00Z" }));
+			await saveSyncState(sample({ userSlug: "bob-def5678", lastFetchAt: "2026-07-15T11:30:00Z" }));
+			expect(await getLastSyncAt()).toBe("2026-07-15T11:30:00Z");
+		});
+
+		it("scopes to a single account's activity when given a userSlug (no cross-account leak)", async () => {
+			await saveSyncState(sample({ userSlug: "alice-abc1234", lastPushAt: "2026-07-15T10:00:00Z" }));
+			await saveSyncState(sample({ userSlug: "bob-def5678", lastFetchAt: "2026-07-15T11:30:00Z" }));
+			// Bob's newer timestamp must NOT bleed into Alice's scoped view.
+			expect(await getLastSyncAt("alice-abc1234")).toBe("2026-07-15T10:00:00Z");
+			expect(await getLastSyncAt("bob-def5678")).toBe("2026-07-15T11:30:00Z");
+		});
+
+		it("returns null for an unknown userSlug", async () => {
+			await saveSyncState(sample({ userSlug: "bob-def5678", lastFetchAt: "2026-07-15T11:30:00Z" }));
+			expect(await getLastSyncAt("nobody-00000000")).toBeNull();
 		});
 	});
 
