@@ -76,6 +76,17 @@ describe("buildSyncEngine returns null when prerequisites are missing", () => {
 });
 
 describe("defaultResolveContext / deriveMemoryBankRoot", () => {
+	it("resolves the vault without inventing a source-repo identity", async () => {
+		const { defaultResolveContext } = await import("./SyncBootstrap.js");
+		const localFolder = join(tempDir, "vault-only-root");
+		const ctx = await defaultResolveContext({ reason: "manual", transcripts: false }, localFolder);
+
+		expect(ctx).toEqual({
+			memoryBankRoot: localFolder,
+			author: { name: "Jolli Memory", email: "memory@jolli.ai" },
+		});
+	});
+
 	it("computes a deterministic vault context from cwd + localFolder", async () => {
 		const { defaultResolveContext, deriveMemoryBankRoot } = await import("./SyncBootstrap.js");
 		const localFolder = join(tempDir, "vault-root");
@@ -124,6 +135,7 @@ describe("defaultResolveContext / deriveMemoryBankRoot", () => {
 		const { existsSync } = await import("node:fs");
 		const localFolder = join(tempDir, "fresh-vault-root");
 		const ctx = await defaultResolveContext({ cwd: tempDir, reason: "manual", transcripts: false }, localFolder);
+		if (ctx.repoFolderName === undefined) throw new Error("expected source-repo context");
 		const perRepoFolder = join(localFolder, ctx.repoFolderName);
 		expect(existsSync(perRepoFolder)).toBe(false);
 		expect(existsSync(join(perRepoFolder, ".jolli", "config.json"))).toBe(false);
@@ -224,11 +236,11 @@ describe("buildSyncEngine returns a configured engine when prerequisites are met
 });
 
 describe("onRoundComplete wiring (cross-repo pending-worker wakeup)", () => {
-	async function getWiredOnRoundComplete(localFolder: string): Promise<(cwd: string) => void> {
+	async function getWiredOnRoundComplete(localFolder: string): Promise<(cwd?: string) => void> {
 		await writeConfig({ jolliApiKey: "sk-jol-test", localFolder });
 		const engine = await buildSyncEngine({ cwd: tempDir, ui: STUB_UI });
 		expect(engine).not.toBeNull();
-		const cb = (engine as unknown as { opts: { onRoundComplete: (cwd: string) => void } }).opts.onRoundComplete;
+		const cb = (engine as unknown as { opts: { onRoundComplete: (cwd?: string) => void } }).opts.onRoundComplete;
 		expect(cb).toBeTypeOf("function");
 		return cb;
 	}
@@ -268,6 +280,19 @@ describe("onRoundComplete wiring (cross-repo pending-worker wakeup)", () => {
 		// /repo/a from the registry was filtered out by the `!== cwd` guard.
 		const calls = launchWorkerMock.mock.calls.map((c) => c[0]).sort();
 		expect(calls).toEqual(["/repo/a", "/repo/b"]);
+	});
+
+	it("drains all pending workers after a vault-only round", async () => {
+		const localFolder = join(tempDir, "vault");
+		const { recordPendingWorker } = await import("./PendingWorkers.js");
+		const { deriveMemoryBankRoot } = await import("./SyncBootstrap.js");
+		await recordPendingWorker(deriveMemoryBankRoot(localFolder), "/repo/a");
+
+		const cb = await getWiredOnRoundComplete(localFolder);
+		cb();
+		await new Promise((r) => setTimeout(r, 100));
+
+		expect(launchWorkerMock).toHaveBeenCalledExactlyOnceWith("/repo/a");
 	});
 
 	it("swallows pending-worker drain errors (non-fatal)", async () => {

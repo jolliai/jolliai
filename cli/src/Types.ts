@@ -295,6 +295,10 @@ export interface StoredSession {
 	 * carries.
 	 */
 	readonly toolUse?: ReadonlyArray<ToolCallCount>;
+	/** Branch the session was recorded on, when the producer captured it — set by
+	 *  the desktop `ActiveTranscriptScanner`; absent for orphan-branch reads. Read
+	 *  by `TranscriptStats.firstBranch` as a branch-resolution fallback. */
+	readonly gitBranch?: string;
 }
 
 /** Structured transcript data for a commit, stored as `transcripts/{commitHash}.json` in the orphan branch */

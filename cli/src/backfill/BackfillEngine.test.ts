@@ -46,12 +46,20 @@ vi.mock("../core/IngestTrigger.js", () => ({
 vi.mock("../hooks/QueueWorker.js", () => ({
 	launchWorker: vi.fn(),
 }));
+vi.mock("../hooks/CommitCaptureLock.js", () => ({
+	COMMIT_CAPTURE_LOCK_WAIT_MS: 1000,
+	withCommitCaptureLock: vi.fn(async (_cwd: string, _hash: string, _mode: unknown, body: () => Promise<unknown>) => ({
+		ran: true,
+		value: await body(),
+	})),
+}));
 
 import { getCurrentBranch } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { generateSummary } from "../core/Summarizer.js";
 import { getIndexEntryMap, storeSummary } from "../core/SummaryStore.js";
+import { withCommitCaptureLock } from "../hooks/CommitCaptureLock.js";
 import { launchWorker } from "../hooks/QueueWorker.js";
 import { countMissingSummaries, runBackfill } from "./BackfillEngine.js";
 import { attributeCommits } from "./CommitAttributor.js";
@@ -243,6 +251,29 @@ describe("runBackfill", () => {
 		expect(report.outcomes[0].status).toBe("skipped-has-summary");
 		// All candidates already summarized → no attribution / ingest at all.
 		expect(vi.mocked(attributeCommits)).not.toHaveBeenCalled();
+	});
+
+	it("skips a hash when a live capture already owns its generation lock", async () => {
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map(), skipped: ["c1"] });
+		vi.mocked(withCommitCaptureLock).mockResolvedValueOnce({ ran: false });
+
+		const report = await runBackfill({ cwd: CWD, hashes: ["c1"] });
+
+		expect(report.outcomes[0].status).toBe("skipped-in-progress");
+		expect(report.skipped).toBe(1);
+		expect(vi.mocked(generateSummary)).not.toHaveBeenCalled();
+	});
+
+	it("rechecks for a summary after claiming the hash and skips redundant generation", async () => {
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map(), skipped: ["c1"] });
+		vi.mocked(getIndexEntryMap)
+			.mockResolvedValueOnce(new Map())
+			.mockResolvedValueOnce(new Map([["c1", {} as never]]));
+
+		const report = await runBackfill({ cwd: CWD, hashes: ["c1"] });
+
+		expect(report.outcomes[0].status).toBe("skipped-has-summary");
+		expect(vi.mocked(generateSummary)).not.toHaveBeenCalled();
 	});
 
 	it("generates a diff-only summary when no conversation is attributed (mirrors live no-session path)", async () => {

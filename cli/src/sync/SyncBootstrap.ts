@@ -1,6 +1,7 @@
 /**
  * DI helper that assembles a fully-wired `SyncEngine` from the user's
- * config + cwd, or returns `null` when sync is dormant (no auth token).
+ * config plus optional source-repo context, or returns `null` when sync is
+ * dormant (no auth token).
  *
  * Plan §0.7: the only prerequisite for the engine to exist is a valid
  * `jolliApiKey`. The `autoSyncEnabled` flag controls whether the orchestrator
@@ -33,7 +34,8 @@ import type { SyncRoundOptions, SyncState } from "./SyncTypes.js";
 const log = createLogger("Sync:Bootstrap");
 
 export interface BootstrapOpts {
-	readonly cwd: string;
+	/** Source-repository checkout. Omit when only the Memory Bank vault is being synced. */
+	readonly cwd?: string;
 	readonly ui: ConflictUi;
 	readonly onStateChange?: (state: SyncState) => void;
 	/**
@@ -127,7 +129,7 @@ export async function buildSyncEngine(opts: BootstrapOpts): Promise<SyncEngine |
 		// source repos sharing this vault would sit until their next
 		// post-commit hook.
 		onRoundComplete: (cwd) => {
-			launchWorker(cwd);
+			if (cwd !== undefined) launchWorker(cwd);
 			void (async () => {
 				try {
 					const fresh = await loadConfig();
@@ -199,8 +201,11 @@ export async function defaultResolveContext(
 	round: SyncRoundOptions,
 	localFolder: string | undefined,
 ): Promise<RoundContext> {
-	const identity = computeRepoIdentity(round.cwd);
 	const memoryBankRoot = deriveMemoryBankRoot(localFolder);
+	const author = { name: "Jolli Memory", email: "memory@jolli.ai" };
+	if (round.cwd === undefined) return { memoryBankRoot, author };
+
+	const identity = computeRepoIdentity(round.cwd);
 	// `repoFolderName` MUST match the directory FolderStorage actually writes
 	// to on disk — otherwise `repos.json` claims a folder that holds no
 	// content while the real content sits in a sibling. Pre-fix this could
@@ -223,7 +228,7 @@ export async function defaultResolveContext(
 		memoryBankRoot,
 		repoFolderName,
 		repoIdentity: identity.repoIdentity,
-		author: { name: "Jolli Memory", email: "memory@jolli.ai" },
+		author,
 	};
 }
 

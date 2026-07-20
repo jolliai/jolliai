@@ -422,6 +422,17 @@ describe("storeSummary catalog integration", () => {
 		expect(catalog.entries).toHaveLength(1);
 		expect(catalog.entries[0].recap).toBe("updated recap");
 	});
+
+	it("promotes a live capture over an existing back-filled summary without force", async () => {
+		await storeSummary(makeSummary("hash1", { branch: "backfilled", backfilled: true }));
+		await storeSummary(makeSummary("hash1", { branch: "main", recap: "live recap" }));
+
+		const stored = JSON.parse(storage.files.get("summaries/hash1.json") ?? "{}");
+		expect(stored.branch).toBe("main");
+		expect(stored.backfilled).toBeUndefined();
+		expect(stored.recap).toBe("live recap");
+		expect(storage.writeCalls).toBe(2);
+	});
 });
 
 // ─── removeFromIndex catalog cleanup ─────────────────────────────────────────

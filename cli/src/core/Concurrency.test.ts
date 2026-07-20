@@ -61,6 +61,33 @@ describe("mapWithConcurrency", () => {
 		).rejects.toThrow("nope");
 	});
 
+	it("stops pulling new items after the first un-mapped error", async () => {
+		const attempted: number[] = [];
+		const gate = defer();
+		// Two workers start on items 0 and 1. Worker A throws immediately; worker B
+		// parks on item 1. Once released, B must NOT pick up 2 or 3 — the batch is
+		// already rejecting, so those tasks would be wasted work.
+		const run = mapWithConcurrency([0, 1, 2, 3], 2, async (i) => {
+			attempted.push(i);
+			if (i === 0) throw new Error("boom");
+			await gate.promise;
+			return i;
+		});
+		const settled = run.then(
+			() => {
+				throw new Error("should have rejected");
+			},
+			(e: unknown) => e,
+		);
+		// Let worker A throw (sets the abort flag) before releasing worker B.
+		await Promise.resolve();
+		await Promise.resolve();
+		gate.resolve();
+		const err = await settled;
+		expect((err as Error).message).toBe("boom");
+		expect([...attempted].sort()).toEqual([0, 1]);
+	});
+
 	it("returns empty array for empty input", async () => {
 		expect(await mapWithConcurrency([], 4, async (i) => i)).toEqual([]);
 	});

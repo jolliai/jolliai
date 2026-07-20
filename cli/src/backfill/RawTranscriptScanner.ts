@@ -160,10 +160,19 @@ function parseLine(line: string, lineNo: number, fileSessionId: string, transcri
  *
  * @param acceptCwd  predicate scoping entries to the target repo's worktree(s)
  * @param projectsRoot  override for `~/.claude/projects` (tests inject a temp dir)
+ * @param acceptDir  optional pre-filter on the project DIRECTORY name (the
+ *   encoded cwd Claude Code names each `~/.claude/projects/<dir>` after). When
+ *   given, directories it rejects are skipped WITHOUT being read — a pure
+ *   performance narrowing for a host that already knows which repo it wants
+ *   (e.g. the desktop Conversations panel scoped to one worktree). It never
+ *   changes results versus scanning every dir: `acceptCwd` still gates every
+ *   entry, so an over-inclusive `acceptDir` is harmless and an omitted one keeps
+ *   the original whole-tree behaviour. Existing callers pass nothing.
  */
 export async function scanClaudeTranscripts(
 	acceptCwd: CwdPredicate,
 	projectsRoot: string = join(homedir(), ".claude", "projects"),
+	acceptDir?: (dirName: string) => boolean,
 ): Promise<Map<string, RawEntry[]>> {
 	const bySession = new Map<string, RawEntry[]>();
 
@@ -176,6 +185,7 @@ export async function scanClaudeTranscripts(
 	}
 
 	for (const dir of dirents) {
+		if (acceptDir && !acceptDir(dir)) continue;
 		const projectDir = join(projectsRoot, dir);
 		let files: string[];
 		try {

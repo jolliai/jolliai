@@ -16,7 +16,7 @@ import type { SourceRef } from "./TopicKBTypes.js";
 
 const log = createLogger("FolderPlanNoteSource");
 
-interface PlanNoteMeta {
+export interface PlanNoteMeta {
 	readonly type: "plan" | "note";
 	readonly id: string;
 	readonly title: string;
@@ -95,6 +95,15 @@ function readMeta(kbRoot: string): PlanNoteMeta[] {
 /** Enumerate plan + note sources (not summaries/wiki) for the timeline fold. */
 export async function listFolderPlanNoteRefs(kbRoot: string): Promise<SourceRef[]> {
 	return readMeta(kbRoot).map((m) => ({ type: m.type, id: m.id, timestamp: m.timestamp, branch: m.branch }));
+}
+
+/**
+ * Like {@link listFolderPlanNoteRefs} but carries each source's title + branch —
+ * for a host that lists plan/note context items for display (the desktop
+ * cockpit's Context sub-section), not just the timeline fold's refs.
+ */
+export async function listFolderPlanNotes(kbRoot: string): Promise<PlanNoteMeta[]> {
+	return readMeta(kbRoot);
 }
 
 /** Full body for reconcile. null when the hidden source is missing (drops from the fold). */

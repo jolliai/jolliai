@@ -323,8 +323,15 @@ export interface SyncRoundResult {
 export type SyncPhase = "downloading" | "merging" | "resolving" | "uploading" | "waiting";
 
 /** Caller-supplied options for `SyncEngine.runRound()`. */
-export interface SyncRoundOptions {
-	readonly cwd: string;
-	readonly reason: "post-commit" | "poll" | "manual" | "first-bind";
-	readonly transcripts: boolean;
-}
+export type SyncRoundOptions =
+	| {
+			readonly cwd: string;
+			readonly reason: "post-commit" | "poll" | "manual" | "first-bind";
+			readonly transcripts: boolean;
+	  }
+	| {
+			/** A missing cwd is valid only for an explicit vault-only manual sync. */
+			readonly cwd?: undefined;
+			readonly reason: "manual";
+			readonly transcripts: boolean;
+	  };

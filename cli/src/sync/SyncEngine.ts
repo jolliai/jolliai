@@ -129,31 +129,30 @@ export type LegacyMigrationFactory = (opts: { memoryBankRoot: string; transcript
 
 export type ResolverFactory = (client: GitClient) => ConflictResolver;
 
-export interface RoundContext {
+interface RoundContextBase {
 	/**
 	 * Git working tree root — also the FolderStorage root (plan §0.13).
 	 * Defaults to `<localFolder>` (≈ `~/Documents/jolli/`).
 	 */
 	readonly memoryBankRoot: string;
-	/**
-	 * Subdirectory of `memoryBankRoot` holding this source repo's Memory Bank
-	 * content. Effective `folderRoot` = `join(memoryBankRoot, repoFolderName)`.
-	 * Equal to the repo's slug; may be overridden at round time by
-	 * `<memoryBankRoot>/.jolli/repos.json` when another `repoIdentity` already
-	 * claims this slug — the engine then assigns `<slug>-<hash6>` to the
-	 * loser. See `RepoMapping.resolveOrAssignFolder`.
-	 */
-	readonly repoFolderName: string;
-	/**
-	 * Canonical identity used to key the `repos.json` mapping. Stable per
-	 * source repo (typically the normalized git remote URL); two devices
-	 * pointing at the same source repo MUST produce the same value so the
-	 * vault mapping resolves consistently.
-	 */
-	readonly repoIdentity: string;
 	/** `git commit --author` flag. */
 	readonly author: { readonly name: string; readonly email: string };
 }
+
+export type RoundContext = RoundContextBase &
+	(
+		| {
+				/** Subdirectory of `memoryBankRoot` holding this source repo's Memory Bank content. */
+				readonly repoFolderName: string;
+				/** Stable source-repo identity, normally derived from its normalized Git remote URL. */
+				readonly repoIdentity: string;
+		  }
+		| {
+				/** Vault-only rounds have no source-repository mapping to add. */
+				readonly repoFolderName?: undefined;
+				readonly repoIdentity?: undefined;
+		  }
+	);
 
 export interface SyncEngineOpts {
 	readonly backend: BackendClient;
@@ -198,11 +197,11 @@ export interface SyncEngineOpts {
 	 * callback are caught + logged (same convention as `onStateChange` /
 	 * `onLockedWait`).
 	 *
-	 * `cwd` is the source-repo cwd from the `SyncRoundOptions`, which is
-	 * what `launchWorker` expects (the queue lives under
-	 * `<cwd>/.jolli/jollimemory/git-op-queue/`).
+	 * `cwd` is the optional source-repo cwd from `SyncRoundOptions`. Vault-only
+	 * rounds omit it but still fire the callback so cross-repo pending workers
+	 * can be drained after the vault lock is released.
 	 */
-	readonly onRoundComplete?: (cwd: string) => void;
+	readonly onRoundComplete?: (cwd?: string) => void;
 	readonly lockTimeoutMs?: number;
 	readonly refreshIntervalMs?: number;
 	readonly maxPushRetries?: number;
@@ -527,7 +526,7 @@ export class SyncEngine {
 	}
 
 	private async runRoundTraced(round: SyncRoundOptions): Promise<SyncRoundResult> {
-		log.info("runRound start reason=%s cwd=%s", round.reason, round.cwd);
+		log.info("runRound start reason=%s cwd=%s", round.reason, round.cwd ?? "<vault-only>");
 		const roundStart = Date.now();
 		this.canary = { symlinked: [], unowned: [] };
 		const lockAcquired = await acquireSyncLock({
@@ -1125,27 +1124,36 @@ export class SyncEngine {
 				log.warn("onRepoMappingConflict callback threw (swallowed): %s", (e as Error).message);
 			}
 		}
-		const resolved = resolveOrAssignFolder(mapping, {
-			repoIdentity: ctx.repoIdentity,
-			authoritativeFolder: ctx.repoFolderName,
-		});
-		const effectiveCtx: RoundContext = { ...ctx, repoFolderName: resolved.folder };
-		// Persist when the canonicalize pass collapsed legacy rows, the
-		// reconcile added on-disk folders, OR `resolveOrAssignFolder` changed
-		// this round's repo. `resolved` already carries the
-		// canonicalized+reconciled mapping (it was fed `mapping`), so its
-		// `updatedMapping` supersedes the earlier results when non-null.
-		if (canon.changed || reconcile.changed || resolved.updatedMapping !== null) {
-			await saveRepoMapping(effectiveCtx.memoryBankRoot, resolved.updatedMapping ?? mapping);
-			// One log line covers "new mapping", "rewrote diverged mapping",
-			// "collapsed legacy duplicate rows", and "reconciled missing
-			// on-disk folders" — the engine doesn't care which one happened,
-			// only that `repos.json` is now consistent with disk.
+		if ((ctx.repoIdentity === undefined) !== (ctx.repoFolderName === undefined)) {
+			throw new Error("round context must provide both repoIdentity and repoFolderName, or neither");
+		}
+		if (ctx.repoIdentity !== undefined && ctx.repoFolderName !== undefined) {
+			const resolved = resolveOrAssignFolder(mapping, {
+				repoIdentity: ctx.repoIdentity,
+				authoritativeFolder: ctx.repoFolderName,
+			});
+			// Persist when the canonicalize pass collapsed legacy rows, the
+			// reconcile added on-disk folders, OR `resolveOrAssignFolder` changed
+			// this round's repo. `resolved` already carries the
+			// canonicalized+reconciled mapping (it was fed `mapping`), so its
+			// `updatedMapping` supersedes the earlier results when non-null.
+			if (canon.changed || reconcile.changed || resolved.updatedMapping !== null) {
+				await saveRepoMapping(ctx.memoryBankRoot, resolved.updatedMapping ?? mapping);
+				log.info(
+					"repos.json: persisted folder=%s for repoIdentity=%s (authoritative=%s, canonicalized=%s, reconciled=%s)",
+					resolved.folder,
+					ctx.repoIdentity,
+					ctx.repoFolderName,
+					canon.changed,
+					reconcile.changed,
+				);
+			}
+		} else if (canon.changed || reconcile.changed) {
+			// A vault-only round has no live source repo to add, but it can still
+			// repair mappings from identities persisted in each repo folder.
+			await saveRepoMapping(ctx.memoryBankRoot, mapping);
 			log.info(
-				"repos.json: persisted folder=%s for repoIdentity=%s (authoritative=%s, canonicalized=%s, reconciled=%s)",
-				resolved.folder,
-				ctx.repoIdentity,
-				ctx.repoFolderName,
+				"repos.json: persisted vault-only reconciliation (canonicalized=%s, reconciled=%s)",
 				canon.changed,
 				reconcile.changed,
 			);
@@ -1160,7 +1168,7 @@ export class SyncEngine {
 			/* v8 ignore next -- exercised only in real-bundle paths */ defaultBootstrapFactory
 		)({
 			vaultClient: state.client,
-			memoryBankRoot: effectiveCtx.memoryBankRoot,
+			memoryBankRoot: ctx.memoryBankRoot,
 			transcripts: round.transcripts,
 		});
 		await bootstrap.ensureBootstrap();

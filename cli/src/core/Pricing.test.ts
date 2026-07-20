@@ -46,6 +46,13 @@ describe("estimateModelCostUsd", () => {
 	it("returns null for a model absent from the table", () => {
 		expect(estimateModelCostUsd(usage("some-unknown-model"))).toBeNull();
 	});
+
+	it("prices the date-suffixed Haiku id (transcripts record it verbatim) same as the un-suffixed row", () => {
+		const suffixed = estimateModelCostUsd(usage("claude-haiku-4-5-20251001", { input: 500_000, output: 200_000 }));
+		const plain = estimateModelCostUsd(usage("claude-haiku-4-5", { input: 500_000, output: 200_000 }));
+		expect(suffixed).not.toBeNull();
+		expect(suffixed).toBe(plain);
+	});
 });
 
 describe("estimateCostUsd", () => {
