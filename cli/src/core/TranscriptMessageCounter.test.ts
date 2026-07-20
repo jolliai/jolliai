@@ -106,6 +106,31 @@ describe("countTranscriptMessages", () => {
 		expect(n).toBe(2);
 	});
 
+	it("counts antigravity transcript messages (skips CHECKPOINT)", async () => {
+		const file = join(dir, "transcript_full.jsonl");
+		writeFileSync(
+			file,
+			`${[
+				{
+					type: "USER_INPUT",
+					created_at: "2026-07-19T09:46:50Z",
+					content: "<USER_REQUEST>\nhi\n</USER_REQUEST>",
+				},
+				{ type: "CHECKPOINT", created_at: "2026-07-19T09:46:50Z", content: "{{ CHECKPOINT 0 }}" },
+				{ type: "PLANNER_RESPONSE", created_at: "2026-07-19T09:46:51Z", content: "hello" },
+			]
+				.map((l) => JSON.stringify(l))
+				.join("\n")}\n`,
+		);
+		const n = await countTranscriptMessages({
+			sessionId: "agy1",
+			transcriptPath: file,
+			updatedAt: "2026-07-19T09:46:50Z",
+			source: "antigravity",
+		});
+		expect(n).toBe(2);
+	});
+
 	it("skips malformed lines without throwing", async () => {
 		const file = join(dir, "bad.jsonl");
 		writeFileSync(file, 'not json\n{"type":"user","message":{"role":"user","content":"x"}}\n');

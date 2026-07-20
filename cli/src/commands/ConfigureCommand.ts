@@ -59,6 +59,7 @@ const VALID_CONFIG_KEYS = [
 	"copilotEnabled",
 	"clineEnabled",
 	"devinEnabled",
+	"antigravityEnabled",
 	"mcpPlatformToolsEnabled",
 	"globalInstructions",
 	"logLevel",
@@ -136,6 +137,7 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		key === "copilotEnabled" ||
 		key === "clineEnabled" ||
 		key === "devinEnabled" ||
+		key === "antigravityEnabled" ||
 		key === "mcpPlatformToolsEnabled" ||
 		key === "syncTranscripts" ||
 		key === "syncOnPush"
@@ -232,6 +234,11 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "devinEnabled",
 		type: "boolean",
 		description: "Enable Devin CLI session discovery (true/false; requires Node 22.5+ at runtime)",
+	},
+	{
+		key: "antigravityEnabled",
+		type: "boolean",
+		description: "Enable Antigravity session discovery (true/false; requires Node 22.5+ at runtime)",
 	},
 	{
 		key: "mcpPlatformToolsEnabled",

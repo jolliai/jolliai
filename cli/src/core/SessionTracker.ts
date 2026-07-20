@@ -188,6 +188,9 @@ export function filterSessionsByEnabledIntegrations(
 	if (config.devinEnabled === false) {
 		filtered = filtered.filter((s) => s.source !== "devin");
 	}
+	if (config.antigravityEnabled === false) {
+		filtered = filtered.filter((s) => s.source !== "antigravity");
+	}
 	return filtered;
 }
 

@@ -35,6 +35,7 @@ const PARSE_LINE: Record<TranscriptSource, (line: string) => string | undefined>
 	cline: parseClineUserLine,
 	"cline-cli": parseClineCliUserLine,
 	devin: parseDevinUserLine,
+	antigravity: parseAntigravityUserLine,
 };
 
 /**
@@ -157,6 +158,11 @@ function parseCursorUserLine(_line: string): string | undefined {
 
 function parseCopilotUserLine(_line: string): string | undefined {
 	// Same as OpenCode: Copilot CLI sessions carry SessionInfo.title (Task 2.4).
+	return undefined;
+}
+function parseAntigravityUserLine(_line: string): string | undefined {
+	// Antigravity sessions carry SessionInfo.title (populated by the discoverer
+	// from the first USER_INPUT row), so no per-line parsing is needed here.
 	return undefined;
 }
 

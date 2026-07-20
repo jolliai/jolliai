@@ -1582,6 +1582,33 @@ describe("SessionTracker", () => {
 			expect(result.map((s) => s.sessionId)).toEqual(["a"]);
 		});
 
+		it("filters out antigravity sessions when antigravityEnabled is false", () => {
+			const sessions = [
+				{ sessionId: "a", transcriptPath: "/a", updatedAt: "2026-05-05T00:00:00Z", source: "claude" as const },
+				{
+					sessionId: "b",
+					transcriptPath: "/b",
+					updatedAt: "2026-05-05T00:00:00Z",
+					source: "antigravity" as const,
+				},
+			];
+			const result = filterSessionsByEnabledIntegrations(sessions, { antigravityEnabled: false });
+			expect(result.map((s) => s.sessionId)).toEqual(["a"]);
+		});
+
+		it("keeps antigravity sessions when antigravityEnabled is unset or true", () => {
+			const sessions = [
+				{
+					sessionId: "b",
+					transcriptPath: "/b",
+					updatedAt: "2026-05-05T00:00:00Z",
+					source: "antigravity" as const,
+				},
+			];
+			expect(filterSessionsByEnabledIntegrations(sessions, {})).toEqual(sessions);
+			expect(filterSessionsByEnabledIntegrations(sessions, { antigravityEnabled: true })).toEqual(sessions);
+		});
+
 		it("keeps copilot sessions when copilotEnabled is unset or true", () => {
 			const sessions = [
 				{ sessionId: "b", transcriptPath: "/b", updatedAt: "2026-05-05T00:00:00Z", source: "copilot" as const },

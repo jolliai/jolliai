@@ -15,6 +15,7 @@ describe("transcriptSourceLabel", () => {
 		expect(transcriptSourceLabel("opencode")).toBe("OpenCode");
 		expect(transcriptSourceLabel("cline")).toBe("Cline (VS Code)");
 		expect(transcriptSourceLabel("cline-cli")).toBe("Cline CLI");
+		expect(transcriptSourceLabel("antigravity")).toBe("Antigravity");
 	});
 
 	it("falls back to 'Claude' for unknown sources (matches the current webview behavior)", () => {

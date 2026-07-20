@@ -226,6 +226,33 @@ describe("loadTranscript", () => {
 		expect(result).toEqual([{ role: "assistant", content: "cline-cli reply" }]);
 	});
 
+	it("dispatches antigravity source to readAntigravityTranscript (reads the real jsonl)", async () => {
+		const file = join(dir, "transcript_full.jsonl");
+		writeFileSync(
+			file,
+			`${[
+				{
+					type: "USER_INPUT",
+					created_at: "2026-07-19T09:46:50Z",
+					content: "<USER_REQUEST>\nhi\n</USER_REQUEST>",
+				},
+				{ type: "PLANNER_RESPONSE", created_at: "2026-07-19T09:46:51Z", content: "hello" },
+			]
+				.map((l) => JSON.stringify(l))
+				.join("\n")}\n`,
+		);
+		const result = await loadTranscript({ source: "antigravity", transcriptPath: file });
+		expect(result).toEqual([
+			{ role: "human", content: "hi", timestamp: "2026-07-19T09:46:50Z" },
+			{ role: "assistant", content: "hello", timestamp: "2026-07-19T09:46:51Z" },
+		]);
+	});
+
+	it("returns [] for a missing antigravity transcript", async () => {
+		const result = await loadTranscript({ source: "antigravity", transcriptPath: join(dir, "nope.jsonl") });
+		expect(result).toEqual([]);
+	});
+
 	// Each sqlite-backed reader's catch branch — proves loader errors degrade
 	// to "" instead of bubbling out to the panel.
 	it("returns [] when readOpenCodeTranscript throws", async () => {

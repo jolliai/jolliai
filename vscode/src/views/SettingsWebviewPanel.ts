@@ -57,6 +57,7 @@ interface SettingsPayload {
 	readonly devinEnabled: boolean;
 	readonly copilotEnabled: boolean;
 	readonly clineEnabled: boolean;
+	readonly antigravityEnabled: boolean;
 	/** Tri-state config switch (undecided | "enabled" | "disabled") flattened to a checkbox; see handleApplySettings for the enable/disable/preserve-undecided persistence rules. */
 	readonly globalInstructions: boolean;
 	readonly localFolder: string;
@@ -466,6 +467,7 @@ export class SettingsWebviewPanel {
 			devinEnabled: config.devinEnabled !== false,
 			copilotEnabled: config.copilotEnabled !== false,
 			clineEnabled: config.clineEnabled !== false,
+			antigravityEnabled: config.antigravityEnabled !== false,
 			globalInstructions: config.globalInstructions === "enabled",
 			localFolder: config.localFolder ?? "",
 			excludePatterns: config.excludePatterns
@@ -616,6 +618,7 @@ export class SettingsWebviewPanel {
 			devinEnabled: settings.devinEnabled,
 			copilotEnabled: settings.copilotEnabled,
 			clineEnabled: settings.clineEnabled,
+			antigravityEnabled: settings.antigravityEnabled,
 			...giUpdate,
 			localFolder:
 				settings.localFolder && settings.localFolder.length > 0

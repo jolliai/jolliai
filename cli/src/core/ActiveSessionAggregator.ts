@@ -225,6 +225,7 @@ async function collectFromAllSources(cwd: string): Promise<CollectResult> {
 		loadCline(cwd),
 		loadClineCli(cwd),
 		loadDevin(cwd),
+		loadAntigravity(cwd),
 	]);
 	const sessions: SessionInfo[] = [];
 	const failedSources: TranscriptSource[] = [];
@@ -373,5 +374,20 @@ async function loadDevin(cwd: string): Promise<LoaderResult> {
 	} catch (err) {
 		log.warn("scanDevinSessions threw: %s", errMsg(err));
 		return { sessions: [], failed: ["devin"] };
+	}
+}
+
+async function loadAntigravity(cwd: string): Promise<LoaderResult> {
+	try {
+		const { scanAntigravitySessions } = await import("./AntigravitySessionDiscoverer.js");
+		const r = await scanAntigravitySessions(cwd);
+		if (r.error) {
+			log.warn("scanAntigravitySessions reported %s: %s", r.error.kind, r.error.message);
+			return { sessions: r.sessions, failed: ["antigravity"] };
+		}
+		return { sessions: r.sessions, failed: [] };
+	} catch (err) {
+		log.warn("scanAntigravitySessions threw: %s", errMsg(err));
+		return { sessions: [], failed: ["antigravity"] };
 	}
 }

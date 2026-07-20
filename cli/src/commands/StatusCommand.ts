@@ -447,6 +447,16 @@ export function registerStatusCommand(program: Command): void {
 					},
 					clineSubLines,
 				],
+				[
+					"Antigravity:",
+					status.antigravityDetected,
+					{
+						enabled: status.antigravityEnabled !== false,
+						hookInstalled: undefined,
+						sessionCount: counts.antigravity,
+						scanError: status.antigravityScanError,
+					},
+				],
 			];
 			for (const [label, detected, inputs, subLines] of integrationRows) {
 				if (!detected) continue;

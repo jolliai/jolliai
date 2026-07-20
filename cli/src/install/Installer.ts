@@ -17,6 +17,8 @@
 import { stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isAntigravityInstalled } from "../core/AntigravityDetector.js";
+import { scanAntigravitySessions } from "../core/AntigravitySessionDiscoverer.js";
 import { isClaudeInstalled } from "../core/ClaudeDetector.js";
 import { isClineCliInstalled } from "../core/ClineCliDetector.js";
 import { scanClineCliSessions } from "../core/ClineCliSessionDiscoverer.js";
@@ -803,6 +805,7 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 	const clineVscodeDetected = await isClineInstalled();
 	const clineCliDetected = await isClineCliInstalled();
 	const clineDetected = clineVscodeDetected || clineCliDetected;
+	const antigravityDetected = await isAntigravityInstalled();
 
 	// Check if we can enumerate worktrees; falls back gracefully if not a git repo
 	let enabledWorktrees: number | undefined;
@@ -892,6 +895,16 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		const merged = [...ext.sessions, ...cli.sessions];
 		if (merged.length > 0) allEnabledSessions = [...allEnabledSessions, ...merged];
 		clineScanError = ext.error ?? cli.error;
+	}
+
+	// Discover Antigravity conversations on-demand (not stored in sessions.json).
+	let antigravityScanError: SqliteScanError | undefined;
+	if (config.antigravityEnabled !== false && antigravityDetected) {
+		const scan = await scanAntigravitySessions(projectDir);
+		if (scan.sessions.length > 0) {
+			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
+		}
+		antigravityScanError = scan.error;
 	}
 
 	// Compute per-source session counts for integration status rows
@@ -1000,6 +1013,9 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		clineVscodeDetected,
 		clineEnabled: config.clineEnabled,
 		clineScanError,
+		antigravityDetected,
+		antigravityEnabled: config.antigravityEnabled,
+		antigravityScanError,
 		globalConfigDir,
 		worktreeStatePath,
 		enabledWorktrees,

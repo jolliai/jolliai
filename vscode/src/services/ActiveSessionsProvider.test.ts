@@ -88,7 +88,7 @@ describe("ActiveSessionsProvider", () => {
 	it("listWithDiagnostics on aggregator-throw flags every known source as failed", async () => {
 		// When the aggregator itself throws (not just one source loader),
 		// every source is effectively unavailable. Returning failedSources:
-		// [] would tell the webview "0 of 7 failed" — indistinguishable from
+		// [] would tell the webview "0 of 8 failed" — indistinguishable from
 		// a healthy-but-empty list, so the partial-data banner never shows
 		// and users can't tell the feature is broken. Returning the full
 		// TRANSCRIPT_SOURCES set is honest: webview renders the banner and
@@ -100,6 +100,7 @@ describe("ActiveSessionsProvider", () => {
 		const result = await p.listWithDiagnostics();
 		expect(result.items).toEqual([]);
 		expect([...result.failedSources].sort()).toEqual([
+			"antigravity",
 			"claude",
 			"cline",
 			"cline-cli",
