@@ -58,6 +58,10 @@ vscode/assets/codicons/
 # Generated knowledge-graph viz assets (copied from cli/src/graph/assets at build time)
 vscode/assets/graph/
 
+# Exported knowledge-graph HTML (jolli graph — defaults to ~/Documents; this
+# guards against a stray export landing in a repo via `--export <dir>`)
+*-graph.html
+
 # Local pre-PR review state (per-developer scratch)
 .claude/review-findings/
 

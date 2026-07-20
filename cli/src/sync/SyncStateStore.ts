@@ -48,6 +48,34 @@ async function readAllEntries(): Promise<Record<string, SyncStateFile>> {
 }
 
 /**
+ * Most recent sync activity — the max of `lastPushAt` / `lastFetchAt`. Returns
+ * `null` when nothing has synced (no Space bound, or fresh install).
+ *
+ * Pass `userSlug` to scope to a single account (the correct answer for a
+ * per-account view). With no argument it falls back to the max across ALL users
+ * on the machine — a best-effort convenience for callers that can't cheaply
+ * resolve the current userSlug (e.g. the Home header, which would otherwise need
+ * a network whoami). NOTE: on a machine with multiple accounts the unscoped form
+ * can report another account's timestamp — pass `userSlug` when accuracy matters.
+ */
+export async function getLastSyncAt(userSlug?: string): Promise<string | null> {
+	const all = await readAllEntries();
+	const entries = userSlug ? [all[userSlug]] : Object.values(all);
+	let latest = 0;
+	let latestIso: string | null = null;
+	for (const entry of entries) {
+		for (const iso of [entry?.lastPushAt, entry?.lastFetchAt]) {
+			const t = iso ? Date.parse(iso) : Number.NaN;
+			if (Number.isFinite(t) && t > latest) {
+				latest = t;
+				latestIso = iso ?? null;
+			}
+		}
+	}
+	return latestIso;
+}
+
+/**
  * Returns the saved state for `userSlug`, or `null` when the file is missing,
  * unreadable, or the stored `version` doesn't match `STATE_VERSION` (future
  * upgrade hook — for now there's only v1).

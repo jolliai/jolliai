@@ -6,6 +6,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const { createStorage } = vi.hoisted(() => ({ createStorage: vi.fn() }));
 vi.mock("../core/StorageFactory.js", () => ({ createStorage }));
 
+// GraphExport defaults its output to `join(homedir(), "Documents")`; mock homedir
+// so the test writes to a temp home, not the real one. Keep every other os export
+// (the test uses `tmpdir`).
+const { mockHomedir } = vi.hoisted(() => ({ mockHomedir: vi.fn(() => "/tmp") }));
+vi.mock("node:os", async (orig) => {
+	const actual = await orig<typeof import("node:os")>();
+	return { ...actual, homedir: mockHomedir };
+});
+
 import { assembleGraphHtml, escapeForInlineScript, exportGraphHtml, resolveAssetsDir } from "./GraphExport.js";
 
 const TEMPLATE = `<!doctype html><html><head>
@@ -139,6 +148,18 @@ describe("exportGraphHtml", () => {
 		const html = readFileSync(file, "utf8");
 		expect(html).toContain("window.__EMBEDDED_GRAPH__");
 		expect(html).not.toContain("styles/main.css"); // stylesheet inlined (real assets)
+	});
+
+	it("defaults to the user's ~/Documents folder when out is omitted", async () => {
+		const { kbRoot } = seedGraph();
+		createStorage.mockResolvedValue({ kbRoot });
+		const home = tmp("kg-home-");
+		mockHomedir.mockReturnValue(home);
+
+		const file = await exportGraphHtml({ cwd: kbRoot }); // no `out`
+
+		expect(file).toBe(join(home, "Documents", `${basename(kbRoot)}-graph.html`));
+		expect(readFileSync(file, "utf8")).toContain("__EMBEDDED_GRAPH__");
 	});
 
 	it("honors an explicit *.html output path", async () => {

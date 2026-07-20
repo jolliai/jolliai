@@ -991,6 +991,7 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		summaryCount,
 		orphanBranch: ORPHAN_BRANCH,
 		claudeDetected,
+		claudeEnabled: config.claudeEnabled,
 		codexDetected,
 		codexEnabled: config.codexEnabled,
 		geminiDetected,

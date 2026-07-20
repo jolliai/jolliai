@@ -62,6 +62,12 @@ const copyGraphAssets = {
 
 export default defineConfig({
 	plugins: [copyGraphAssets],
+	// JSX for the Ink TUI (TSX, dynamically imported on the interactive path only)
+	// is configured via tsconfig `jsx: react-jsx` / `jsxImportSource: react`, which
+	// esbuild (the build transformer) reads directly. We deliberately do NOT set a
+	// vite `esbuild` option here: vitest 4 transforms with oxc and would warn that
+	// the esbuild option is ignored. `react`/`react/jsx-runtime`/`ink` stay external
+	// (see rollupOptions.external), exactly like `log-update`.
 	define: {
 		__PKG_VERSION__: JSON.stringify(pkg.version),
 		__CLI_PKG_VERSION__: JSON.stringify(pkg.version),
@@ -87,7 +93,17 @@ export default defineConfig({
 			formats: ["es"],
 		},
 		rollupOptions: {
-			external: ["@anthropic-ai/sdk", "commander", "open", "semver", /^node:.*/],
+			external: [
+				"@anthropic-ai/sdk",
+				"commander",
+				"log-update",
+				"ink",
+				"react",
+				"react/jsx-runtime",
+				"open",
+				"semver",
+				/^node:.*/,
+			],
 			output: {
 				chunkFileNames: "[name].js",
 			},

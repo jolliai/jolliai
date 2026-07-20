@@ -1337,6 +1337,8 @@ export interface StatusInfo {
 	readonly orphanBranch: string;
 	/** Whether Claude Code directory (~/.claude/) was detected */
 	readonly claudeDetected?: boolean;
+	/** Whether Claude session discovery is enabled in config (undefined = on by default) */
+	readonly claudeEnabled?: boolean;
 	/** Whether Codex CLI directory (~/.codex/) was detected */
 	readonly codexDetected?: boolean;
 	/** Whether Codex session discovery is enabled in config (undefined = auto-detect) */

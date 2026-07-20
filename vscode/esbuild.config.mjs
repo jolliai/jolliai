@@ -43,6 +43,12 @@ const base = {
 	sourcemap: false,
 	minify: true,
 	logLevel: "info",
+	// The bundled CLI includes the Ink TUI source (TSX). It's only reached by the
+	// Jolli TUI (bare `jolli`), which the extension host never spawns, but esbuild
+	// still parses the files — so transpile JSX with the automatic runtime.
+	// `ink`/`react` are kept external (below), so this only affects our own TSX.
+	jsx: "automatic",
+	jsxImportSource: "react",
 };
 
 // ── Bundle 1: VSCode Extension ─────────────────────────────────────────────
@@ -98,6 +104,12 @@ const cliOptions = {
 	// CLI entry points live under ../cli/src/, so esbuild's Node module
 	// resolution starts there and never reaches jollimemory-vscode/node_modules/.
 	// nodePaths adds our own node_modules as a fallback search path.
+	// `log-update` / `ink` / `react` are only reached through the Jolli TUI (bare
+	// `jolli`), which the extension host never spawns — keep them external
+	// rather than bundling the TUI's terminal/React deps. The require() left
+	// behind sits on a dead path here (ink@7 needs Node ≥22; never executed on the
+	// Node 18 extension host).
+	external: ["log-update", "ink", "react", "react/jsx-runtime"],
 	nodePaths: [resolve("node_modules")],
 	// esbuild define only accepts identifiers or JSON literals, not expressions.
 	// Inject a shim variable via banner, then map import.meta.url to it.

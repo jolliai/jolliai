@@ -31,8 +31,10 @@ const { mockQuestion } = vi.hoisted(() => ({
 	mockQuestion: vi.fn((_q: string, cb: (a: string) => void) => cb("")),
 }));
 
-const { mockRunGuidedFrontDoor } = vi.hoisted(() => ({
-	mockRunGuidedFrontDoor: vi.fn().mockResolvedValue(undefined),
+const { mockRunInkTui, mockLoadHomeModel, mockRenderHomeSnapshot } = vi.hoisted(() => ({
+	mockRunInkTui: vi.fn().mockResolvedValue(undefined),
+	mockLoadHomeModel: vi.fn().mockResolvedValue({ type: "home", repo: "r", branch: "b" }),
+	mockRenderHomeSnapshot: vi.fn().mockReturnValue("SNAPSHOT"),
 }));
 
 vi.mock("node:child_process", () => ({
@@ -48,8 +50,10 @@ vi.mock("node:readline", () => ({
 	createInterface: mockCreateInterface,
 }));
 
-vi.mock("./commands/GuidedFrontDoor.js", () => ({
-	runGuidedFrontDoor: mockRunGuidedFrontDoor,
+vi.mock("./tui/ink/runInkTui.js", () => ({ runInkTui: mockRunInkTui }));
+vi.mock("./tui/ink/HomeSnapshot.js", () => ({
+	loadHomeModel: mockLoadHomeModel,
+	renderHomeSnapshot: mockRenderHomeSnapshot,
 }));
 
 vi.mock("./core/SessionTracker.js", () => ({
@@ -303,6 +307,13 @@ vi.mock("./core/SearchIndex.js", () => ({
 	SearchIndex: { rebuild: vi.fn(async () => {}) },
 }));
 
+// `graph` declares `--cwd` with NO default, so it exercises the preAction hook's
+// `source === undefined` forwarding branch. Mock the export so the test asserts
+// cwd propagation without touching the filesystem.
+vi.mock("./graph/GraphExport.js", () => ({
+	exportGraphHtml: vi.fn(async () => "/out/knowledge-graph.html"),
+}));
+
 vi.mock("./core/ProcessedSourceStore.js", () => ({
 	saveProcessedSet: vi.fn(async () => {}),
 	emptyProcessedSet: vi.fn(() => ({ schemaVersion: 1, processed: {} })),
@@ -371,6 +382,7 @@ import { exportSummaries } from "./core/SummaryExporter.js";
 import { hasMigrationMeta, migrateV1toV3 } from "./core/SummaryMigration.js";
 import { getIndex, getSummary, indexNeedsMigration, listSummaries, migrateIndexToV3 } from "./core/SummaryStore.js";
 import { CLI_PACKAGE_NAME, REFRESH_COMMAND, refreshUpdateCache } from "./core/UpdateCheck.js";
+import { exportGraphHtml } from "./graph/GraphExport.js";
 import { getStatus, install, uninstall } from "./install/Installer.js";
 import { loadPlugins } from "./PluginLoader.js";
 
@@ -405,47 +417,93 @@ describe("CLI", () => {
 			Object.defineProperty(process.stdout, "isTTY", { value: priorOut, configurable: true });
 		});
 
-		it("runs the front door with no args when stdin+stdout are TTY", async () => {
+		it("opens the Ink TUI with no args when stdin+stdout are TTY", async () => {
 			setTty(true, true);
 			await main([]);
-			expect(mockRunGuidedFrontDoor).toHaveBeenCalledTimes(1);
+			expect(mockRunInkTui).toHaveBeenCalledTimes(1);
+			// (cwd, initialTab, catalog)
+			expect(mockRunInkTui.mock.calls[0][1]).toBe("home");
+			expect(Array.isArray(mockRunInkTui.mock.calls[0][2])).toBe(true);
 		});
 
-		it("does NOT run the front door when stdin is not a TTY", async () => {
+		it("opens directly on the requested tab via --view", async () => {
+			setTty(true, true);
+			await main(["--view", "settings"]);
+			expect(mockRunInkTui).toHaveBeenCalledTimes(1);
+			expect(mockRunInkTui.mock.calls[0][1]).toBe("settings");
+		});
+
+		it("routes --view timeline / recall / memory-bank to the Memory Bank tab", async () => {
+			setTty(true, true);
+			for (const v of ["timeline", "recall", "memory-bank"]) {
+				mockRunInkTui.mockClear();
+				await main(["--view", v]);
+				expect(mockRunInkTui.mock.calls[0][1]).toBe("memory-bank");
+			}
+		});
+
+		it("routes --view browse to the Memories tab (current-branch view)", async () => {
+			setTty(true, true);
+			await main(["--view", "browse"]);
+			expect(mockRunInkTui.mock.calls[0][1]).toBe("memories");
+		});
+
+		it("routes legacy --view graph to the Memories tab (graph is a command now, browse)", async () => {
+			setTty(true, true);
+			await main(["--view", "graph"]);
+			expect(mockRunInkTui.mock.calls[0][1]).toBe("memories");
+			expect(mockRunInkTui.mock.calls[0][3]).toBeUndefined();
+		});
+
+		it("prints a one-line error and sets exit code 1 when the snapshot read fails", async () => {
+			setTty(true, true);
+			const priorExit = process.exitCode;
+			mockLoadHomeModel.mockRejectedValueOnce(new Error("index unreadable"));
+			try {
+				// console.error is spied module-wide (cleared each test) — assert on it directly.
+				await main(["--once"]);
+				expect(vi.mocked(console.error)).toHaveBeenCalledWith(expect.stringContaining("index unreadable"));
+				expect(process.exitCode).toBe(1);
+			} finally {
+				process.exitCode = priorExit;
+			}
+		});
+
+		it("prints a plain-text snapshot for --once (no TUI)", async () => {
+			setTty(true, true);
+			await main(["--once"]);
+			expect(mockRunInkTui).not.toHaveBeenCalled();
+			expect(mockRenderHomeSnapshot).toHaveBeenCalledTimes(1);
+			// console.log is spied module-wide (cleared each test) — assert on it directly.
+			expect(vi.mocked(console.log)).toHaveBeenCalledWith("SNAPSHOT");
+		});
+
+		it("prints JSON for --once --format json", async () => {
+			setTty(true, true);
+			await main(["--once", "--format", "json"]);
+			expect(mockRunInkTui).not.toHaveBeenCalled();
+			const printed = vi
+				.mocked(console.log)
+				.mock.calls.map((c) => String(c[0]))
+				.find((s) => s.startsWith("{"));
+			expect(printed).toBeDefined();
+			expect(JSON.parse(printed as string).type).toBe("home");
+		});
+
+		it("does NOT open the TUI when stdin is not a TTY (prints help instead)", async () => {
 			setTty(false, true);
-			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
-				throw new Error("process.exit");
-			}) as never);
-			try {
-				await main([]);
-			} catch {
-				// bare + non-TTY falls through to parseAsync → grouped help → exit(1)
-			} finally {
-				// It must NOT enter the front door, and it MUST fall through to
-				// parseAsync's help-and-exit path (positive proof of the fallback).
-				expect(mockRunGuidedFrontDoor).not.toHaveBeenCalled();
-				expect(exitSpy).toHaveBeenCalled();
-				exitSpy.mockRestore();
-			}
+			await main([]);
+			expect(mockRunInkTui).not.toHaveBeenCalled();
+			expect(mockRenderHomeSnapshot).not.toHaveBeenCalled(); // no snapshot without --once
 		});
 
-		it("does NOT run the front door when stdout is piped (not a TTY)", async () => {
+		it("does NOT open the TUI when stdout is piped (not a TTY)", async () => {
 			setTty(true, false);
-			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
-				throw new Error("process.exit");
-			}) as never);
-			try {
-				await main([]);
-			} catch {
-				// piped stdout falls through to parseAsync → grouped help
-			} finally {
-				expect(mockRunGuidedFrontDoor).not.toHaveBeenCalled();
-				expect(exitSpy).toHaveBeenCalled();
-				exitSpy.mockRestore();
-			}
+			await main([]);
+			expect(mockRunInkTui).not.toHaveBeenCalled();
 		});
 
-		it("does NOT run the front door when a subcommand is given, even on a full TTY", async () => {
+		it("does NOT open the TUI when a subcommand is given, even on a full TTY", async () => {
 			setTty(true, true);
 			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
 				throw new Error("process.exit");
@@ -453,11 +511,50 @@ describe("CLI", () => {
 			try {
 				await main(["--version"]);
 			} catch {
-				// --version prints and exits via commander; never enters the front door
+				// --version prints and exits via commander; never enters the action
 			} finally {
-				expect(mockRunGuidedFrontDoor).not.toHaveBeenCalled();
+				expect(mockRunInkTui).not.toHaveBeenCalled();
 				exitSpy.mockRestore();
 			}
+		});
+
+		it("no longer registers watch / tui commands", async () => {
+			setTty(false, true);
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main(["watch"]);
+			} catch {
+				// unknown command → commander errors and exits
+			} finally {
+				expect(mockRunInkTui).not.toHaveBeenCalled();
+				exitSpy.mockRestore();
+			}
+		});
+	});
+
+	describe("toInitialTab", () => {
+		it("passes through real tabs and maps legacy views", async () => {
+			const { toInitialTab } = await import("./Api.js");
+			expect(toInitialTab("settings")).toBe("settings");
+			expect(toInitialTab("memories")).toBe("memories");
+			expect(toInitialTab("browse")).toBe("memories");
+			// The Commands tab became Home's `/` palette.
+			expect(toInitialTab("commands")).toBe("home");
+			// Graph/backfill are commands now → the current-branch Memories tab.
+			expect(toInitialTab("graph")).toBe("memories");
+			expect(toInitialTab("backfill")).toBe("memories");
+			// Manage merged into Settings.
+			expect(toInitialTab("manage")).toBe("settings");
+			expect(toInitialTab("dashboard")).toBe("home");
+			// Queue status now lives on Home's Status sub-items → Home.
+			expect(toInitialTab("queue")).toBe("home");
+			// recall/timeline/memory-bank → the repo-wide Memory Bank tab.
+			expect(toInitialTab("recall")).toBe("memory-bank");
+			expect(toInitialTab("timeline")).toBe("memory-bank");
+			expect(toInitialTab("memory-bank")).toBe("memory-bank");
+			expect(toInitialTab(undefined)).toBe("home");
 		});
 	});
 
@@ -889,6 +986,29 @@ describe("CLI", () => {
 		it("should call getStatus", async () => {
 			await main(["status"]);
 			expect(getStatus).toHaveBeenCalled();
+		});
+
+		it("forwards a root --cwd to the subcommand (jolli --cwd <dir> status)", async () => {
+			await main(["--cwd", "/forward/test", "status"]);
+			expect(getStatus).toHaveBeenLastCalledWith("/forward/test");
+		});
+
+		it("lets an explicit subcommand --cwd win over the root --cwd", async () => {
+			await main(["--cwd", "/root/dir", "status", "--cwd", "/explicit/dir"]);
+			expect(getStatus).toHaveBeenLastCalledWith("/explicit/dir");
+		});
+
+		it("forwards a root --cwd to a subcommand whose --cwd has no default (jolli --cwd <dir> graph)", async () => {
+			// `graph`'s --cwd declares no default, so its source is `undefined` (not
+			// "default") when unset — the branch that silently dropped the root cwd
+			// before, running against process.cwd() (wrong repo, looked successful).
+			await main(["--cwd", "/forward/graph", "graph", "--export", "/out"]);
+			expect(exportGraphHtml).toHaveBeenLastCalledWith(expect.objectContaining({ cwd: "/forward/graph" }));
+		});
+
+		it("lets an explicit graph --cwd win over the root --cwd", async () => {
+			await main(["--cwd", "/root/dir", "graph", "--export", "/out", "--cwd", "/explicit/graph"]);
+			expect(exportGraphHtml).toHaveBeenLastCalledWith(expect.objectContaining({ cwd: "/explicit/graph" }));
 		});
 
 		it("should display active session info", async () => {

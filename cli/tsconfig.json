@@ -18,7 +18,9 @@
 		"skipLibCheck": true,
 		"forceConsistentCasingInFileNames": true,
 		"resolveJsonModule": true,
-		"verbatimModuleSyntax": false
+		"verbatimModuleSyntax": false,
+		"jsx": "react-jsx",
+		"jsxImportSource": "react"
 	},
 	"include": ["src/**/*"],
 	"exclude": ["node_modules", "dist"]
