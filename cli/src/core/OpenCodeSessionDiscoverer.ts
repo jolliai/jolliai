@@ -8,7 +8,9 @@
  * Algorithm:
  *   1. Check if the global DB file exists at ~/.local/share/opencode/opencode.db
  *   2. Open the DB read-only using node:sqlite (built-in SQLite with WAL support)
- *   3. Query the session table for recent top-level sessions matching projectDir
+ *   3. Query the session table for recent sessions (time cutoff in SQL), then keep
+ *      those whose `directory` is inside projectDir via `sessionDirBelongsToRepo`
+ *      (prefix/containment + nested-repo exclusion, shared with Devin/Copilot)
  *   4. Return matching sessions as SessionInfo[] with source="opencode"
  *
  * Cursor design: All sessions share one DB file. To give each session its own
@@ -16,10 +18,11 @@
  */
 
 import { stat } from "node:fs/promises";
-import { homedir, platform } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
+import { sessionDirBelongsToRepo } from "./SessionDirMatch.js";
 import {
 	classifyScanError as classifySqliteScanError,
 	hasNodeSqliteSupport as hasNodeSqliteSupportFromHelpers,
@@ -152,33 +155,33 @@ export async function scanOpenCodeSessions(projectDir: string): Promise<OpenCode
 			// Auto-compact creates child sessions (parent_id != NULL) that carry on the conversation,
 			// so filtering to parent_id IS NULL would miss active sessions after compaction.
 			//
-			// Windows and macOS have case-insensitive filesystems: OpenCode may store
-			// directory as "E:\\proj" while Jolli's projectDir arrives lowercased
-			// (e.g. VS Code URIs lowercase the drive letter). Compare case-insensitively
-			// on those platforms. Linux filesystems are case-sensitive, so exact match
-			// is correct there.
-			const os = platform();
-			const caseInsensitive = os === "win32" || os === "darwin";
-			const directoryMatch = caseInsensitive
-				? "LOWER(directory) = LOWER(:projectDir)"
-				: "directory = :projectDir";
-
+			// The directory match runs in JS via `sessionDirBelongsToRepo` (shared with
+			// Devin/Copilot): prefix/containment with separator + case folding (handling
+			// the "E:\\proj" vs "e:\\proj" Windows drive-letter drift and case-sensitive
+			// Linux) plus the nested-repo exclusion. It replaced the SQL `directory =
+			// :projectDir` (and the win32/darwin LOWER() variant), which silently dropped
+			// every session run from a subdirectory of the repo (JOLLI-2015). Rows are
+			// still narrowed by the time cutoff in SQL; the directory filter is JS-side.
 			const rows = db
 				.prepare(
-					`SELECT id, title, time_created, time_updated
+					// No ORDER BY: every row passing the SQL cutoff and the JS directory filter is
+					// kept regardless of order, so sorting the result set would buy nothing.
+					`SELECT id, title, time_created, time_updated, directory
 					 FROM session
-					 WHERE ${directoryMatch}
-					   AND time_updated > :cutoff
-					 ORDER BY time_updated DESC`,
+					 WHERE time_updated > :cutoff`,
 				)
-				.all({ projectDir, cutoff: cutoffMs }) as ReadonlyArray<{
+				.all({ cutoff: cutoffMs }) as ReadonlyArray<{
 				id: string;
 				title: string;
 				time_created: number;
 				time_updated: number;
+				directory: string;
 			}>;
 
 			return rows.flatMap((row): SessionInfo[] => {
+				if (!sessionDirBelongsToRepo(row.directory, projectDir)) {
+					return [];
+				}
 				// Guard against schema drift: SQL's `time_updated > :cutoff` already
 				// filters NULL, but a non-numeric value would make new Date().toISOString()
 				// throw RangeError and bubble up as a spurious "unknown" scan error.

@@ -10,14 +10,21 @@ vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
 // Mock homedir so tests don't depend on real home directory
-const { mockHomedir, mockPlatform } = vi.hoisted(() => ({
+const { mockHomedir } = vi.hoisted(() => ({
 	mockHomedir: vi.fn().mockReturnValue(""),
-	mockPlatform: vi.fn().mockReturnValue("darwin"),
 }));
 vi.mock("node:os", async (importOriginal) => {
 	const original = await importOriginal<typeof import("node:os")>();
-	return { ...original, homedir: mockHomedir, platform: mockPlatform };
+	return { ...original, homedir: mockHomedir };
 });
+
+// The directory match runs through `normalizePathForCompare`, which reads
+// `process.platform` directly. Override it per-test so the case-sensitivity
+// branch is deterministic regardless of host OS, and restore in afterEach.
+const savedPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+function setPlatform(os: NodeJS.Platform): void {
+	Object.defineProperty(process, "platform", { value: os, configurable: true });
+}
 
 import {
 	discoverOpenCodeSessions,
@@ -134,6 +141,8 @@ describe("OpenCodeSessionDiscoverer", () => {
 		// Restore XDG_DATA_HOME to avoid leaking between tests
 		if (savedXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
 		else process.env.XDG_DATA_HOME = savedXdgDataHome;
+		/* v8 ignore next -- the platform descriptor is always present on supported runtimes */
+		if (savedPlatform) Object.defineProperty(process, "platform", savedPlatform);
 		await rm(tempDir, { recursive: true, force: true });
 		await rm(fakeHome, { recursive: true, force: true });
 	});
@@ -202,11 +211,13 @@ describe("OpenCodeSessionDiscoverer", () => {
 
 			const sessions = await discoverOpenCodeSessions(projectDir);
 
+			// The query has no ORDER BY — all matching rows are kept regardless of order —
+			// so assert on set membership rather than a specific ordering.
 			expect(sessions).toHaveLength(2);
-			expect(sessions[0].sessionId).toBe("s2");
-			expect(sessions[1].sessionId).toBe("s1");
-			expect(sessions[0].source).toBe("opencode");
-			expect(sessions[0].transcriptPath).toContain("#s2");
+			const byId = new Map(sessions.map((s) => [s.sessionId, s]));
+			expect([...byId.keys()].sort()).toEqual(["s1", "s2"]);
+			expect(byId.get("s2")?.source).toBe("opencode");
+			expect(byId.get("s2")?.transcriptPath).toContain("#s2");
 		});
 
 		it("filters out sessions from other projects", async () => {
@@ -226,6 +237,45 @@ describe("OpenCodeSessionDiscoverer", () => {
 
 			expect(sessions).toHaveLength(1);
 			expect(sessions[0].sessionId).toBe("mine");
+		});
+
+		// JOLLI-2015: a session run from a subdirectory of the project (common in a
+		// monorepo, `cd packages/foo && opencode`) IS attributed to the repo via
+		// prefix/containment matching — semantics shared with Devin.
+		it("discovers a session run in a subdirectory of the project (prefix match)", async () => {
+			const now = Date.now();
+			const dbDir = join(fakeHome, ".local", "share", "opencode");
+			await createOpenCodeDb(dbDir, [
+				{
+					id: "in-subdir",
+					directory: join(projectDir, "packages", "foo"),
+					time_created: now - 1000,
+					time_updated: now - 100,
+				},
+			]);
+
+			const sessions = await discoverOpenCodeSessions(projectDir);
+			expect(sessions.map((s) => s.sessionId)).toEqual(["in-subdir"]);
+		});
+
+		// A session living in a NESTED git repo / submodule inside the worktree
+		// belongs to the inner repo's own post-commit, not this one — an intervening
+		// `.git` excludes it. Uses a real temp dir so `.git` can exist on disk.
+		it("does NOT discover a session inside a nested git repo under the project", async () => {
+			const now = Date.now();
+			const dbDir = join(fakeHome, ".local", "share", "opencode");
+			const realRepo = await mkdtemp(join(tmpdir(), "opencode-nested-"));
+			try {
+				const nested = join(realRepo, "vendor", "lib");
+				await mkdir(join(nested, ".git"), { recursive: true });
+				await createOpenCodeDb(dbDir, [
+					{ id: "nested", directory: nested, time_created: now - 1000, time_updated: now - 100 },
+				]);
+
+				expect(await discoverOpenCodeSessions(realRepo)).toHaveLength(0);
+			} finally {
+				await rm(realRepo, { recursive: true, force: true });
+			}
 		});
 
 		it("filters out stale sessions older than 48 hours", async () => {
@@ -340,9 +390,11 @@ describe("OpenCodeSessionDiscoverer", () => {
 				//   worker pipeline spawned with cwd "E:\\jollimemory-3" → stored by OpenCode
 				//   extension status reported projectDir "e:\\jollimemory-3" → exact-match missed
 				// Both describe the same directory on a case-insensitive filesystem, so the
-				// SQL must match regardless of drive-letter casing on Windows / macOS.
+				// match must hold regardless of drive-letter casing on Windows / macOS.
+				// `sessionDirBelongsToRepo` folds case via `normalizePathForCompare`, which
+				// reads `process.platform` — so drive the platform there, not the node:os mock.
 				// Linux's case-sensitive behaviour is asserted by the next test.
-				mockPlatform.mockReturnValue(osName);
+				setPlatform(osName);
 				const now = Date.now();
 				const dbDir = join(fakeHome, ".local", "share", "opencode");
 				const storedDir = "E:\\jollimemory-3";
@@ -359,9 +411,9 @@ describe("OpenCodeSessionDiscoverer", () => {
 
 		it("matches directory exactly (case-sensitive) on linux", async () => {
 			// Linux filesystems are case-sensitive, so a casing mismatch must NOT
-			// resolve to the same session. This exercises the `directory = :projectDir`
-			// branch of the case-insensitive ternary that darwin/win32 hosts skip.
-			mockPlatform.mockReturnValue("linux");
+			// resolve to the same session. This exercises the case-sensitive branch of
+			// `normalizePathForCompare` (no lowercasing) that darwin/win32 hosts skip.
+			setPlatform("linux");
 			const now = Date.now();
 			const dbDir = join(fakeHome, ".local", "share", "opencode");
 			const storedDir = "/home/flyer/Project";

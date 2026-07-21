@@ -31,6 +31,14 @@ vi.mock("node:os", async (importOriginal) => {
 	return { ...original, homedir: () => mockHomeDir(), platform: () => mockPlatform() };
 });
 
+// The cwd match now runs through `normalizePathForCompare`, which reads
+// `process.platform` directly (not os.platform()). Override it per-test so the
+// case-sensitivity branch is deterministic regardless of host OS; restore in afterEach.
+const savedPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+function setPlatform(os: NodeJS.Platform): void {
+	Object.defineProperty(process, "platform", { value: os, configurable: true });
+}
+
 import { discoverCodexSessions, isCodexInstalled } from "./CodexSessionDiscoverer.js";
 
 let tempDir: string;
@@ -43,6 +51,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	/* v8 ignore next -- the platform descriptor is always present on supported runtimes */
+	if (savedPlatform) Object.defineProperty(process, "platform", savedPlatform);
 	await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -98,6 +108,45 @@ describe("discoverCodexSessions", () => {
 
 		const sessions = await discoverCodexSessions("/my/project");
 		expect(sessions).toHaveLength(0);
+	});
+
+	// JOLLI-2015: a session run from a subdirectory of the project (common in a
+	// monorepo, `cd packages/foo && codex`) IS attributed to the repo via
+	// prefix/containment matching — semantics shared with Devin/OpenCode/Copilot.
+	it("discovers a session run in a subdirectory of the project (prefix match)", async () => {
+		const now = new Date();
+		const year = String(now.getFullYear());
+		const month = String(now.getMonth() + 1).padStart(2, "0");
+		const day = String(now.getDate()).padStart(2, "0");
+		const dayDir = join(tempDir, ".codex", "sessions", year, month, day);
+
+		await createCodexSession(dayDir, "rollout-sub.jsonl", "/my/project/packages/foo", "sess-sub");
+
+		const sessions = await discoverCodexSessions("/my/project");
+		expect(sessions.map((s) => s.sessionId)).toEqual(["sess-sub"]);
+	});
+
+	// A session living in a NESTED git repo / submodule inside the worktree belongs
+	// to the inner repo's own post-commit, not this one — an intervening `.git`
+	// excludes it. Uses a real temp dir so `.git` can exist on disk.
+	it("does NOT discover a session inside a nested git repo under the project", async () => {
+		const now = new Date();
+		const year = String(now.getFullYear());
+		const month = String(now.getMonth() + 1).padStart(2, "0");
+		const day = String(now.getDate()).padStart(2, "0");
+		const dayDir = join(tempDir, ".codex", "sessions", year, month, day);
+
+		const realRepo = await mkdtemp(join(realTmpdir(), "codex-nested-"));
+		try {
+			const nested = join(realRepo, "vendor", "lib");
+			await mkdir(join(nested, ".git"), { recursive: true });
+			await createCodexSession(dayDir, "rollout-nested.jsonl", nested, "sess-nested");
+
+			const sessions = await discoverCodexSessions(realRepo);
+			expect(sessions).toHaveLength(0);
+		} finally {
+			await rm(realRepo, { recursive: true, force: true });
+		}
 	});
 
 	it("returns empty array when sessions directory does not exist", async () => {
@@ -346,7 +395,7 @@ describe("discoverCodexSessions", () => {
 
 describe("Windows path case-insensitive matching", () => {
 	it("matches cwd with different drive letter case on Windows", async () => {
-		mockPlatform.mockReturnValue("win32");
+		setPlatform("win32");
 
 		const now = new Date();
 		const year = String(now.getFullYear());
@@ -365,7 +414,7 @@ describe("Windows path case-insensitive matching", () => {
 	});
 
 	it("does not match different paths case-insensitively on non-Windows", async () => {
-		mockPlatform.mockReturnValue("linux");
+		setPlatform("linux");
 
 		const now = new Date();
 		const year = String(now.getFullYear());

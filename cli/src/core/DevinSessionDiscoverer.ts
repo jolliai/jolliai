@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
-import { normalizePathForCompare } from "./PathUtils.js";
+import { sessionDirBelongsToRepo } from "./SessionDirMatch.js";
 import { classifyScanError, hasNodeSqliteSupport, type SqliteScanError, withSqliteDb } from "./SqliteHelpers.js";
 
 const log = createLogger("DevinDiscoverer");
@@ -50,30 +50,28 @@ function parseWorkspaceDirs(raw: string | null): string[] {
 }
 
 /**
- * A Devin session belongs to `wantDir` when its primary `working_directory` OR
- * any of its additional `workspace_dirs` normalizes to the same path. Sessions
+ * A Devin session belongs to `repoRoot` when its primary `working_directory` OR
+ * any of its additional `workspace_dirs` is inside the repo worktree. Sessions
  * started from an attached workspace/worktree surface only through
  * `workspace_dirs`, so matching on `working_directory` alone silently drops them.
- * `wantDir` must already be `normalizePathForCompare`-normalized.
  *
- * Matching is exact path *equality*, not a prefix/containment test. This mirrors
- * the other hookless directory-scoped source (OpenCode's `directory = :projectDir`)
- * and has a deliberate consequence: a session started from a *subdirectory* of the
- * repo — common in a monorepo, e.g. `cd packages/foo && devin …` — is NOT
- * attributed to the repo, because `wantDir` is the git repo root and the child
- * path is not equal to it. Hook-backed sources (Claude/Gemini) don't have this gap:
- * their hook resolves the git root at record time, so a subdirectory session still
- * lands under the repo. For hookless sources the only capture path is running Devin
- * at the repo root (or attaching the root via `workspace_dirs`). This is a known,
- * intentional limitation — see the "subdirectory of the project" contract test in
- * DevinSessionDiscoverer.test.ts. Widening it to prefix/containment matching is a
- * cross-source semantics decision, not a Devin-local tweak.
+ * Matching is prefix/containment via {@link sessionDirBelongsToRepo}, shared with
+ * the other hookless directory-scoped sources (OpenCode, Copilot): a session
+ * started from a *subdirectory* of the repo — common in a monorepo, e.g.
+ * `cd packages/foo && devin …` — IS attributed to the repo (JOLLI-2015).
+ * Sessions living in a nested git repo / submodule inside the worktree are
+ * excluded so they aren't double-captured by both repos — the helper's docstring
+ * has the full rationale.
  */
-function sessionMatchesDir(workingDirectory: string | null, workspaceDirsRaw: string | null, wantDir: string): boolean {
-	if (typeof workingDirectory === "string" && normalizePathForCompare(workingDirectory) === wantDir) {
+function sessionMatchesDir(
+	workingDirectory: string | null,
+	workspaceDirsRaw: string | null,
+	repoRoot: string,
+): boolean {
+	if (typeof workingDirectory === "string" && sessionDirBelongsToRepo(workingDirectory, repoRoot)) {
 		return true;
 	}
-	return parseWorkspaceDirs(workspaceDirsRaw).some((dir) => normalizePathForCompare(dir) === wantDir);
+	return parseWorkspaceDirs(workspaceDirsRaw).some((dir) => sessionDirBelongsToRepo(dir, repoRoot));
 }
 
 function getDevinCliDir(home?: string): string {
@@ -173,19 +171,19 @@ export async function scanDevinSessionsAt(dbPath: string, projectDir: string): P
 			// last_activity_at is epoch SECONDS → compare against cutoff in seconds.
 			const cutoffSec = Math.floor(cutoffMs / 1000);
 
-			// The directory match is done in JS rather than SQL so it can go
-			// through `normalizePathForCompare` — folding `\`↔`/`, trailing
-			// slashes, and (only on win32/darwin) case, matching the rest of the
-			// codebase. A raw `working_directory = :projectDir` silently missed
-			// sessions when Devin persisted a trailing slash or a `\`-separated path.
-			const wantDir = normalizePathForCompare(projectDir);
+			// The directory match runs in JS (not SQL) via `sessionDirBelongsToRepo`,
+			// which does prefix/containment matching with separator/case folding plus
+			// the nested-repo exclusion. The old exact `working_directory = :projectDir`
+			// both missed subdirectory sessions and mishandled trailing-slash / backslash
+			// paths.
 			const rows = db
 				.prepare(
+					// No ORDER BY: every row passing the SQL filters and the JS directory match is
+					// kept regardless of order, so sorting the result set would buy nothing.
 					`SELECT id, title, last_activity_at, working_directory, workspace_dirs
 					 FROM sessions
 					 WHERE hidden = 0
-					   AND last_activity_at > :cutoff
-					 ORDER BY last_activity_at DESC`,
+					   AND last_activity_at > :cutoff`,
 				)
 				.all({ cutoff: cutoffSec }) as ReadonlyArray<{
 				id: string;
@@ -196,7 +194,7 @@ export async function scanDevinSessionsAt(dbPath: string, projectDir: string): P
 			}>;
 
 			return rows.flatMap((row): SessionInfo[] => {
-				if (!sessionMatchesDir(row.working_directory, row.workspace_dirs, wantDir)) {
+				if (!sessionMatchesDir(row.working_directory, row.workspace_dirs, projectDir)) {
 					return [];
 				}
 				if (!Number.isFinite(row.last_activity_at)) {
