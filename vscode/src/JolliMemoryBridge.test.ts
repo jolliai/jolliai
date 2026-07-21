@@ -199,6 +199,10 @@ const { lstat, mkdir, rm, unlink, writeFile } = vi.hoisted(() => ({
 	writeFile: vi.fn(),
 }));
 
+const { readManualDisableFlag } = vi.hoisted(() => ({
+	readManualDisableFlag: vi.fn().mockResolvedValue(false),
+}));
+
 /**
  * Mock for node:child_process execFile.
  * promisify wraps this into a function returning Promise<{stdout, stderr}>.
@@ -364,6 +368,10 @@ vi.mock("./util/Logger.js", () => ({
 	log: { info, warn, error, debug },
 }));
 
+vi.mock("./services/ManualDisableFlag.js", () => ({
+	readManualDisableFlag,
+}));
+
 vi.mock("node:child_process", () => ({
 	execFile: execFileMock,
 }));
@@ -492,6 +500,10 @@ describe("JolliMemoryBridge", () => {
 		});
 		mkdir.mockResolvedValue(undefined);
 		writeFile.mockResolvedValue(undefined);
+		// vi.resetAllMocks() above wipes the hoisted default; re-establish it so
+		// refreshHookPathsIfStale's manual-disable gate reads a real `false` (not a
+		// bare undefined that only works because it's falsy).
+		readManualDisableFlag.mockResolvedValue(false);
 		scanTreeHashAliases.mockResolvedValue(false);
 		// Default: folder has an index — every test that doesn't care
 		// about the C2 fallback gets a non-null result and createReadStorage
@@ -591,6 +603,23 @@ describe("JolliMemoryBridge", () => {
 	// ── refreshHookPathsIfStale ──────────────────────────────────────────
 
 	describe("refreshHookPathsIfStale()", () => {
+		it("skips re-enable entirely when the repo is manually disabled (upgrade must not clobber the opt-out)", async () => {
+			readManualDisableFlag.mockResolvedValue(true);
+			// A stale/missing own dist-path would normally force a re-enable; the
+			// manual-disable gate must short-circuit before that.
+			existsSync.mockImplementation(
+				(p: string) => !String(p).includes("settings.local.json"),
+			);
+			mockDeriveSourceTag.mockReturnValue("vscode");
+			mockTraverseDistPaths.mockReturnValue([]);
+			const bridge = makeBridge();
+
+			const result = await bridge.refreshHookPathsIfStale("/ext/v2.0.0");
+
+			expect(installerInstall).not.toHaveBeenCalled();
+			expect(result).toBeUndefined();
+		});
+
 		it("re-enables when own dist-paths/<self> entry is missing", async () => {
 			existsSync.mockImplementation(
 				(p: string) => !String(p).includes("settings.local.json"),

@@ -16,6 +16,7 @@ import { orphanBranchExists } from "../core/GitOps.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { isWorkerLockStale, releaseWorkerLock } from "../core/Locks.js";
 import { getBackend } from "../core/localagent/BackendRegistry.js";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { countActiveQueueEntries, getGlobalConfigDir, loadAllSessions, loadConfig } from "../core/SessionTracker.js";
 import { traverseDistPaths } from "../install/DistPathResolver.js";
 import { getStatus, install } from "../install/Installer.js";
@@ -46,8 +47,18 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 
 	// 1. Installer status (hooks)
 	const status = await getStatus(cwd);
+	// A manual disable is the user's highest-priority intent: missing hooks are
+	// then expected, not a fault. Report it as OK and offer no reinstall fixer, so
+	// `doctor --fix` never silently re-enables a repo the user turned off.
+	const manuallyDisabled = await readManualDisableFlag(cwd);
 
-	if (!status.gitHookInstalled) {
+	if (manuallyDisabled) {
+		checks.push({
+			name: "Git hooks",
+			status: "ok",
+			message: "manually disabled — run `jolli enable` to re-enable",
+		});
+	} else if (!status.gitHookInstalled) {
 		checks.push({
 			name: "Git hooks",
 			status: "fail",

@@ -20,6 +20,7 @@ import { getJolliUrl, loadAuthToken } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
 import { validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
+import { writeManualDisableFlag } from "../core/RepoProfile.js";
 import { getGlobalConfigDir, loadConfig, saveConfigScoped } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { getSummaryCount, setActiveStorage } from "../core/SummaryStore.js";
@@ -120,6 +121,10 @@ export async function runGuidedFrontDoor(): Promise<void> {
 			return;
 		}
 		track("surface_enabled", { trigger: "cli" });
+		// Enabling here is an explicit user choice — clear any repo-wide
+		// manual-disable opt-out so a later upgrade / VS Code activation keeps it on
+		// (the front door is never integrations-only). Mirrors `jolli enable`.
+		await writeManualDisableFlag(cwd, false);
 		for (const warning of result.warnings) console.warn(`  Warning: ${warning}`);
 		// Git hooks record commits immediately, but the AI-agent session hooks
 		// (Claude, Gemini) only attach on a fresh session — say so once here.

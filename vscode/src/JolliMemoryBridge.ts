@@ -120,6 +120,7 @@ import {
 } from "./util/ForcePushSafety.js";
 import { log } from "./util/Logger.js";
 import { loadGlobalConfig } from "./util/WorkspaceUtils.js";
+import { readManualDisableFlag } from "./services/ManualDisableFlag.js";
 
 // ─── Git helpers ────────────────────────────────────────────────────────────
 
@@ -439,6 +440,17 @@ export class JolliMemoryBridge {
 		| undefined
 	> {
 		log.debug("bridge", "Checking hook paths for staleness", { extensionPath });
+
+		// Highest-priority gate: a repo the user manually disabled must never be
+		// silently re-enabled by a version upgrade. Both branches below call
+		// enable() (reinstalling the shared git hook), so returning here is what
+		// stops an upgrade from clobbering the opt-out. A disabled repo has no
+		// hooks to refresh; `undefined` means "no version mismatch" so the caller
+		// no-ops (no re-enable, no outdated-version toast).
+		if (await readManualDisableFlag(this.cwd)) {
+			log.info("bridge", "Manual disable in effect — skipping stale-hook refresh / re-enable");
+			return;
+		}
 
 		// Check for legacy hooks that predate the dist-path format entirely
 		if (this.hasUnmigratedLocalHooks()) {

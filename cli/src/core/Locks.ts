@@ -120,6 +120,7 @@ export const SYNC_LOCK_FILE = "sync.lock";
 export const PLANS_LOCK_FILE = "plans.lock";
 export const COMMIT_SELECTION_LOCK_FILE = "commit-selection.lock";
 export const PUSH_PENDING_LOCK_FILE = "push-pending.lock";
+export const PROFILE_LOCK_FILE = "profile.lock";
 
 /** Default wait budget for `acquireOrphanWriteLock` (background callers). */
 export const DEFAULT_ORPHAN_WRITE_TIMEOUT_MS = 1000;
@@ -146,6 +147,15 @@ export const DEFAULT_PUSH_PENDING_LOCK_TIMEOUT_MS = 5000;
 
 /** Default poll interval while waiting for `push-pending.lock`. */
 export const DEFAULT_PUSH_PENDING_LOCK_POLL_MS = 25;
+
+/**
+ * Default wait budget for `withProfileLock`. Same rationale as `withPlansLock`:
+ * the guarded section is a sub-millisecond read-modify-write of `profile.json`.
+ */
+export const DEFAULT_PROFILE_LOCK_TIMEOUT_MS = 5000;
+
+/** Default poll interval while waiting for `profile.lock`. */
+export const DEFAULT_PROFILE_LOCK_POLL_MS = 25;
 
 /** Optional knobs for `acquireOrphanWriteLock`. */
 export interface OrphanWriteLockOpts {
@@ -486,5 +496,49 @@ export async function withPushPendingLock<T>(
 		return await fn();
 	} finally {
 		if (acquired) await releaseIfOwned(lockPath, PUSH_PENDING_LOCK_FILE);
+	}
+}
+
+/**
+ * Runs `fn` while holding `profile.lock`, serialising the read-modify-write of
+ * `profile.json` (`backfillDismissed`, `manuallyDisabled`) across processes AND
+ * worktrees.
+ *
+ * **Why the SHARED lock dir (not per-worktree like `withPlansLock`).**
+ * `profile.json` is anchored to the MAIN worktree root and shared by every
+ * worktree of the repo (see `RepoProfile`), so its writers include a CLI process
+ * in one worktree and the VS Code extension host in another. A per-worktree lock
+ * would serialise nothing between them; this lock lives in the shared
+ * `<git-common-dir>/jollimemory/` dir (same place as `orphan-write.lock`) so all
+ * worktrees and both surfaces contend on one file. Losing that race could drop a
+ * `manuallyDisabled` write and silently re-enable a repo the user turned off.
+ *
+ * **Best-effort fallback.** If the lock can't be acquired within `timeoutMs`
+ * (a crashed holder is auto-reclaimed once stale), `fn` still runs — the atomic
+ * tmp+rename write in `RepoProfile.writeProfile` keeps the file from ever being
+ * corrupted, and the residual lost-update window is far smaller than the
+ * unlocked read-modify-write it replaces. MUST NOT be nested.
+ */
+export async function withProfileLock<T>(
+	cwd: string | undefined,
+	fn: () => Promise<T>,
+	opts: OrphanWriteLockOpts = {},
+): Promise<T> {
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_PROFILE_LOCK_TIMEOUT_MS;
+	const pollMs = opts.pollMs ?? DEFAULT_PROFILE_LOCK_POLL_MS;
+	const dir = await ensureSharedLockDir(cwd);
+	const lockPath = join(dir, PROFILE_LOCK_FILE);
+	const acquired = await acquireWithPoll(lockPath, { timeoutMs, pollMs });
+	if (!acquired) {
+		log.warn(
+			"withProfileLock: could not acquire %s within %d ms — proceeding best-effort",
+			PROFILE_LOCK_FILE,
+			timeoutMs,
+		);
+	}
+	try {
+		return await fn();
+	} finally {
+		if (acquired) await releaseIfOwned(lockPath, PROFILE_LOCK_FILE);
 	}
 }

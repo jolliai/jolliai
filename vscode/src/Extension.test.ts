@@ -2155,6 +2155,21 @@ describe("Extension", () => {
 					true,
 				);
 			});
+
+			it("aborts (never calls bridge.disable) and shows an error when the opt-out can't be persisted", async () => {
+				// A disable we can't make durable would leave a hooks-gone-but-flag-unset
+				// half-state that a later upgrade re-enables — so change nothing.
+				writeManualDisableFlag.mockRejectedValueOnce(new Error("EACCES"));
+				mockBridge.disable.mockClear();
+				showErrorMessage.mockClear();
+				const handler = getRegisteredCommand("jollimemory.disableJolliMemory");
+				await handler();
+
+				expect(mockBridge.disable).not.toHaveBeenCalled();
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("could not save the disable setting"),
+				);
+			});
 		});
 
 		describe("refreshStatus", () => {
@@ -6733,11 +6748,34 @@ describe("Extension", () => {
 			expect(mockBridge.autoInstallForWorktree).not.toHaveBeenCalled();
 		});
 
+		it("skips worktree auto-install when the repo is manually disabled", async () => {
+			// Even with the trigger conditions met (shared git hook present, this
+			// worktree's hooks missing), a manual-disable opt-out must block the
+			// silent re-install — covers the failed-uninstall window where the
+			// shared hook survives but the user's intent is "off".
+			mockBridge.getStatus.mockResolvedValue({
+				enabled: true,
+				gitHookInstalled: true,
+				worktreeHooksInstalled: false,
+				enabledWorktrees: 2,
+			});
+			mockBridge.autoInstallForWorktree.mockClear();
+			readManualDisableFlag.mockResolvedValueOnce(true);
+
+			const ctx = makeContext();
+			activate(ctx);
+
+			await vi.waitFor(() => {
+				expect(mockStatusStore.refresh).toHaveBeenCalled();
+			});
+			expect(mockBridge.autoInstallForWorktree).not.toHaveBeenCalled();
+		});
+
 		// Auto-enable on activate: a fresh workspace with no opt-out should
-		// install hooks transparently. The opt-out is a marker file
-		// (`<projectDir>/.jolli/jollimemory/disabled-by-user`) that survives
-		// across IDE restarts AND project moves, since it's project-scoped
-		// rather than bound to VS Code's per-machine workspaceState.
+		// install hooks transparently. The opt-out is the repo-wide
+		// `manuallyDisabled` flag in profile.json (RepoProfile, anchored to the
+		// main worktree root), so it holds across IDE restarts, project moves,
+		// and every worktree of the repo — not VS Code's per-machine workspaceState.
 		describe("auto-enable on activate", () => {
 			it("calls bridge.enable when status.enabled=false and no opt-out recorded", async () => {
 				mockBridge.getStatus.mockResolvedValue({

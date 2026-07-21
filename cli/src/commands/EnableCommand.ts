@@ -11,6 +11,7 @@ import { getJolliUrl } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { validateJolliApiKey } from "../core/JolliApiUtils.js";
+import { writeManualDisableFlag } from "../core/RepoProfile.js";
 import { getGlobalConfigDir, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
 import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
@@ -185,6 +186,14 @@ export function registerEnableCommand(program: Command): void {
 
 			if (result.success) {
 				track("surface_enabled", { trigger: "cli" });
+				// Explicit enable clears any repo-wide manual-disable opt-out so a
+				// later upgrade / window reload keeps the feature on. Skipped for
+				// integrations-only (IntelliJ's MCP-only setup), which is not a full
+				// enable. Written unconditionally otherwise — profile.json is
+				// machine-local and gitignored.
+				if (!options.integrationsOnly) {
+					await writeManualDisableFlag(options.cwd, false);
+				}
 				if (options.integrationsOnly) {
 					console.log("\n  Jolli Memory integrations enabled (MCP + skills; no hooks installed).\n");
 				} else {
@@ -271,6 +280,27 @@ export function registerDisableCommand(program: Command): void {
 			setLogDir(options.cwd);
 
 			log.info("Running 'disable' command");
+			// Record the repo-wide opt-out BEFORE the async uninstall so the user's
+			// intent survives even if uninstall throws. Skipped for integrations-only
+			// (IntelliJ's MCP-only teardown), which is not a full disable.
+			//
+			// If we CANNOT persist the opt-out, do NOT remove hooks: a disable we
+			// can't make durable would leave a deceptive half-state (hooks gone, but
+			// a later upgrade / VS Code activation silently re-enables). Fail loudly
+			// and change nothing so the state stays coherent (still enabled).
+			if (!options.integrationsOnly) {
+				try {
+					await writeManualDisableFlag(options.cwd, true);
+				} catch (err) {
+					console.error(
+						`\n  Error: could not persist the disable opt-out (${(err as Error).message}).\n` +
+							"  Hooks were left intact to avoid a state that silently re-enables.\n" +
+							"  Fix write access to .jolli/jollimemory/ and re-run 'jolli disable'.\n",
+					);
+					process.exitCode = 1;
+					return;
+				}
+			}
 			const result = await uninstall(options.cwd, { integrationsOnly: options.integrationsOnly });
 
 			if (result.success) {
