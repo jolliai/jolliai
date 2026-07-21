@@ -70,6 +70,15 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain('id="antigravityEnabled"');
 	});
 
+	it("does not render a separate Cursor CLI toggle (shares the Cursor toggle)", () => {
+		expect(html).not.toContain('id="cursorCliEnabled"');
+	});
+
+	it("Cursor toggle description mentions both the Composer IDE and the cursor-agent CLI", () => {
+		expect(html).toContain("Composer IDE");
+		expect(html).toContain("cursor-agent CLI");
+	});
+
 	it("Cline toggle description mentions both CLI and VS Code sources", () => {
 		expect(html).toContain("Cline CLI");
 		expect(html).toContain("VS Code");

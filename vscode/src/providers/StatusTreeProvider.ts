@@ -241,7 +241,7 @@ function buildFullStatusItems(
 		items.push(accountItem);
 	}
 
-	// Integration status rows (Claude, Codex, Gemini, OpenCode, Cursor, Copilot, Cline, Devin)
+	// Integration status rows (Claude, Codex, Gemini, OpenCode, Cursor, Copilot, Cline, Devin, Cursor CLI)
 	const counts = s.sessionsBySource ?? {};
 	pushIntegrationItem(
 		items,
@@ -302,7 +302,9 @@ function buildFullStatusItems(
 			counts.opencode,
 		);
 	}
-	// Cursor: Composer sessions via global SQLite (no agent hook — scan errors surface like OpenCode).
+	// Cursor integration: shared `cursorEnabled` toggle for the Composer IDE and the
+	// cursor-agent CLI. Each form has its own scan-error channel; each surfaces as a
+	// separate warn row (mirrors Copilot's CLI/Chat treatment).
 	if (s.cursorScanError) {
 		items.push(
 			new StatusItem(
@@ -312,19 +314,32 @@ function buildFullStatusItems(
 				`Cursor database scan failed (${s.cursorScanError.kind}): ${s.cursorScanError.message}`,
 			),
 		);
-	} else {
-		pushIntegrationItem(
-			items,
-			s.cursorDetected,
-			s.cursorEnabled !== false,
-			undefined,
-			"Cursor Integration",
-			"Cursor Composer store found — session discovery is enabled",
-			"Cursor detected but session discovery is disabled in config",
-			undefined,
-			counts.cursor,
+	}
+	if (s.cursorCliScanError) {
+		items.push(
+			new StatusItem(
+				"Cursor CLI",
+				`unavailable — ${s.cursorCliScanError.kind}`,
+				ICON_WARN,
+				`Cursor CLI scan failed (${s.cursorCliScanError.kind}): ${s.cursorCliScanError.message}`,
+			),
 		);
 	}
+	const cursorIdeMark = s.cursorDetected ? "✓" : "✗";
+	const cursorCliMark = s.cursorCliDetected ? "✓" : "✗";
+	const anyCursorDetected = (s.cursorDetected ?? false) || (s.cursorCliDetected ?? false);
+	const cursorSessions = (counts.cursor ?? 0) + (counts["cursor-cli"] ?? 0);
+	pushIntegrationItem(
+		items,
+		anyCursorDetected,
+		s.cursorEnabled !== false,
+		undefined,
+		"Cursor Integration",
+		`Cursor detected (IDE: ${cursorIdeMark}, CLI: ${cursorCliMark}) — session discovery is enabled`,
+		`Cursor detected (IDE: ${cursorIdeMark}, CLI: ${cursorCliMark}) but session discovery is disabled in config`,
+		undefined,
+		cursorSessions,
+	);
 
 	// Devin: CLI sessions via a global WAL SQLite DB (no agent hook — scan errors surface like OpenCode/Cursor).
 	if (s.devinScanError) {

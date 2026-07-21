@@ -338,12 +338,17 @@ export function buildIntegrationRows(
 			],
 			[
 				"Cursor",
-				status.cursorDetected,
+				(status.cursorDetected ?? false) || (status.cursorCliDetected ?? false),
 				{
 					enabled: status.cursorEnabled !== false,
 					hookInstalled: undefined,
-					sessionCount: counts.cursor,
-					scanError: status.cursorScanError,
+					sessionCount: (counts.cursor ?? 0) + (counts["cursor-cli"] ?? 0),
+					// A merged integration is only "unavailable" when BOTH data channels
+					// failed. A broken IDE DB beside a healthy CLI (or vice-versa) must not
+					// mask the working source's session count via describeIntegrationStatus'
+					// early return — each failure renders as a sub-line below instead.
+					// Mirrors the VS Code STATUS tree (merged row + per-source warnings).
+					scanError: status.cursorScanError && status.cursorCliScanError ? status.cursorScanError : undefined,
 				},
 			],
 			[
@@ -489,6 +494,22 @@ export function registerStatusCommand(program: Command): void {
 					console.log(
 						`  ${subIndent}↳ CLI: ${mark(status.clineCliDetected)}, VS Code: ${mark(status.clineVscodeDetected)}`,
 					);
+				} else if (name === "Cursor") {
+					console.log(
+						`  ${subIndent}↳ IDE: ${mark(status.cursorDetected)}, CLI: ${mark(status.cursorCliDetected)}`,
+					);
+					// Both variants' scan errors render as non-masking sub-lines. The main
+					// row only reads "unavailable" when BOTH failed (see the row's scanError).
+					if (status.cursorScanError) {
+						console.log(
+							`  ${subIndent}↳ IDE scan failed (${status.cursorScanError.kind}): ${status.cursorScanError.message}`,
+						);
+					}
+					if (status.cursorCliScanError) {
+						console.log(
+							`  ${subIndent}↳ CLI scan failed (${status.cursorCliScanError.kind}): ${status.cursorCliScanError.message}`,
+						);
+					}
 				}
 			}
 

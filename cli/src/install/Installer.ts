@@ -31,6 +31,11 @@ import { scanCopilotChatSessions } from "../core/CopilotChatSessionDiscoverer.js
 import type { CopilotChatScanError } from "../core/CopilotChatTranscriptReader.js";
 import { isCopilotInstalled } from "../core/CopilotDetector.js";
 import { scanCopilotSessions } from "../core/CopilotSessionDiscoverer.js";
+import {
+	type CursorCliScanError,
+	isCursorCliInstalled,
+	scanCursorCliSessions,
+} from "../core/CursorCliSessionDiscoverer.js";
 import { isCursorInstalled } from "../core/CursorDetector.js";
 import { scanCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { isDevinInstalled, scanDevinSessions } from "../core/DevinSessionDiscoverer.js";
@@ -599,13 +604,15 @@ export async function install(
 			}
 		}
 
-		// Auto-detect Cursor and enable Composer session discovery
+		// Auto-detect Cursor in either form (Composer IDE or cursor-agent CLI) and
+		// enable the shared cursorEnabled flag. Both sources share one toggle —
+		// mirrors the copilotEnabled treatment for Copilot CLI + Chat below.
+		const cursorCliDetectedOnce = await isCursorCliInstalled();
 		const cursorDetected = config.cursorEnabled !== false && cursorDetectedOnce;
-		if (cursorDetected) {
-			if (config.cursorEnabled === undefined) {
-				await saveConfig({ cursorEnabled: true });
-				log.info("Cursor detected — enabled Cursor Composer session discovery");
-			}
+		const cursorCliDetected = config.cursorEnabled !== false && cursorCliDetectedOnce;
+		if ((cursorDetected || cursorCliDetected) && config.cursorEnabled === undefined) {
+			await saveConfig({ cursorEnabled: true });
+			log.info("Cursor detected (IDE=%s, CLI=%s) — enabled session discovery", cursorDetected, cursorCliDetected);
 		}
 
 		// Auto-detect GitHub Copilot in either form (terminal CLI or vscode Chat) and
@@ -952,6 +959,7 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 	const openCodeDetected = await isOpenCodeInstalled();
 	const cursorDetected = await isCursorInstalled();
 	const devinDetected = await isDevinInstalled();
+	const cursorCliDetected = await isCursorCliInstalled();
 	const copilotDetected = await isCopilotInstalled();
 	const copilotChatDetected = await isCopilotChatInstalled();
 	const clineVscodeDetected = await isClineInstalled();
@@ -1017,6 +1025,17 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
 		}
 		devinScanError = scan.error;
+	}
+
+	// Discover Cursor CLI (cursor-agent) sessions on-demand (not stored in sessions.json).
+	// Shares cursorEnabled with the Composer IDE source (one "Cursor" toggle).
+	let cursorCliScanError: CursorCliScanError | undefined;
+	if (config.cursorEnabled !== false && cursorCliDetected) {
+		const scan = await scanCursorCliSessions(projectDir);
+		if (scan.sessions.length > 0) {
+			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
+		}
+		cursorCliScanError = scan.error;
 	}
 
 	// Discover Copilot CLI sessions on-demand (not stored in sessions.json).
@@ -1155,6 +1174,8 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		devinDetected,
 		devinEnabled: config.devinEnabled,
 		devinScanError,
+		cursorCliDetected,
+		cursorCliScanError,
 		copilotDetected,
 		copilotEnabled: config.copilotEnabled,
 		copilotScanError,

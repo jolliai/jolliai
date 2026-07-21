@@ -17,6 +17,7 @@ export const TRANSCRIPT_SOURCE_LABELS: Readonly<Record<TranscriptSource, string>
 	claude: "Claude",
 	codex: "Codex",
 	cursor: "Cursor",
+	"cursor-cli": "Cursor CLI",
 	copilot: "Copilot",
 	"copilot-chat": "Copilot Chat",
 	gemini: "Gemini",

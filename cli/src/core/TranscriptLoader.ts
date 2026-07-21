@@ -116,6 +116,18 @@ export async function loadTranscript(opts: LoadOptions): Promise<TranscriptEntry
 			return [];
 		}
 	}
+	if (opts.source === "cursor-cli") {
+		try {
+			const { readCursorCliTranscript } = await import("./CursorCliTranscriptReader.js");
+			const result = await readCursorCliTranscript(opts.transcriptPath);
+			return [...result.entries];
+		} catch (err) {
+			if (!isEnoent(err)) {
+				log.warn("loadTranscript (cursor-cli) failed for %s: %s", opts.transcriptPath, errMsg(err));
+			}
+			return [];
+		}
+	}
 	if (opts.source === "antigravity") {
 		try {
 			const { readAntigravityTranscript } = await import("./AntigravityTranscriptReader.js");
@@ -180,7 +192,7 @@ export async function loadTranscript(opts: LoadOptions): Promise<TranscriptEntry
  */
 type JsonlSource = Exclude<
 	TranscriptSource,
-	"gemini" | "opencode" | "cursor" | "copilot" | "cline" | "cline-cli" | "devin" | "antigravity"
+	"gemini" | "opencode" | "cursor" | "cursor-cli" | "copilot" | "cline" | "cline-cli" | "devin" | "antigravity"
 >;
 const PARSERS: Record<JsonlSource, (line: string) => TranscriptEntry | undefined> = {
 	claude: parseClaude,

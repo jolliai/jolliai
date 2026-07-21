@@ -177,7 +177,7 @@ export function filterSessionsByEnabledIntegrations(
 		filtered = filtered.filter((s) => s.source !== "opencode");
 	}
 	if (config.cursorEnabled === false) {
-		filtered = filtered.filter((s) => s.source !== "cursor");
+		filtered = filtered.filter((s) => s.source !== "cursor" && s.source !== "cursor-cli");
 	}
 	if (config.copilotEnabled === false) {
 		filtered = filtered.filter((s) => s.source !== "copilot" && s.source !== "copilot-chat");

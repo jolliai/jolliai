@@ -199,6 +199,23 @@ vi.mock("../core/DevinTranscriptReader.js", () => ({
 	}),
 }));
 
+// Cursor CLI (cursor-agent) discovery is wired into loadSessionTranscripts; neutralize
+// it so the hook tests stay hermetic. Otherwise, on a dev machine that has cursor-agent
+// installed (~/.cursor/chats present), isCursorCliInstalled() returns true and the real
+// scan does fs I/O under fake timers and hangs. Mirrors the Devin/Cline mocks above.
+vi.mock("../core/CursorCliSessionDiscoverer.js", () => ({
+	discoverCursorCliSessions: vi.fn().mockResolvedValue([]),
+	isCursorCliInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/CursorCliTranscriptReader.js", () => ({
+	readCursorCliTranscript: vi.fn().mockResolvedValue({
+		entries: [],
+		newCursor: { transcriptPath: "", lineNumber: 0, updatedAt: "" },
+		totalLinesRead: 0,
+	}),
+}));
+
 vi.mock("../core/GeminiTranscriptReader.js", () => ({
 	readGeminiTranscript: vi.fn().mockResolvedValue({
 		entries: [],

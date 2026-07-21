@@ -418,6 +418,19 @@ vi.mock("../core/DevinTranscriptReader.js", () => ({
 	}),
 }));
 
+vi.mock("../core/CursorCliSessionDiscoverer.js", () => ({
+	discoverCursorCliSessions: vi.fn().mockResolvedValue([]),
+	isCursorCliInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/CursorCliTranscriptReader.js", () => ({
+	readCursorCliTranscript: vi.fn().mockResolvedValue({
+		entries: [],
+		newCursor: { transcriptPath: "", lineNumber: 0, updatedAt: "" },
+		totalLinesRead: 0,
+	}),
+}));
+
 vi.mock("../core/GeminiTranscriptReader.js", () => ({
 	readGeminiTranscript: vi.fn().mockResolvedValue({
 		entries: [],
@@ -481,6 +494,8 @@ import { discoverCopilotChatSessions } from "../core/CopilotChatSessionDiscovere
 import { isCopilotInstalled } from "../core/CopilotDetector.js";
 import { discoverCopilotSessions } from "../core/CopilotSessionDiscoverer.js";
 import { readCopilotTranscript } from "../core/CopilotTranscriptReader.js";
+import { discoverCursorCliSessions, isCursorCliInstalled } from "../core/CursorCliSessionDiscoverer.js";
+import { readCursorCliTranscript } from "../core/CursorCliTranscriptReader.js";
 import { isCursorInstalled } from "../core/CursorDetector.js";
 import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
@@ -597,6 +612,8 @@ describe("QueueWorker", () => {
 		vi.mocked(discoverClineCliSessions).mockResolvedValue([]);
 		vi.mocked(isDevinInstalled).mockResolvedValue(false);
 		vi.mocked(discoverDevinSessions).mockResolvedValue([]);
+		vi.mocked(isCursorCliInstalled).mockResolvedValue(false);
+		vi.mocked(discoverCursorCliSessions).mockResolvedValue([]);
 		vi.mocked(buildMultiSessionContext).mockReturnValue("");
 		vi.mocked(generateSummary).mockResolvedValue({
 			transcriptEntries: 0,
@@ -1757,6 +1774,72 @@ describe("QueueWorker", () => {
 
 			expect(isDevinInstalled).not.toHaveBeenCalled();
 			expect(discoverDevinSessions).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("Cursor CLI integration", () => {
+		it("should include discovered Cursor CLI sessions in the pipeline when enabled", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cursor-cli.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isCursorCliInstalled).mockResolvedValue(true);
+			vi.mocked(discoverCursorCliSessions).mockResolvedValue([
+				{
+					sessionId: "ccli-1",
+					transcriptPath: "/tmp/cursor-cli/chats/ccli-1/meta.json",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "cursor-cli",
+				},
+			]);
+			vi.mocked(readCursorCliTranscript).mockResolvedValue({
+				entries: [{ role: "human", content: "Cursor CLI context", timestamp: "2026-04-01T12:00:00.000Z" }],
+				newCursor: {
+					transcriptPath: "/tmp/cursor-cli/chats/ccli-1/meta.json",
+					lineNumber: 1,
+					updatedAt: "2026-04-01T12:00:00.000Z",
+				},
+				totalLinesRead: 1,
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(discoverCursorCliSessions).toHaveBeenCalledWith("/test/cwd");
+			expect(readCursorCliTranscript).toHaveBeenCalledWith(
+				"/tmp/cursor-cli/chats/ccli-1/meta.json",
+				null,
+				"2026-04-01T12:00:00.000Z",
+			);
+			expect(saveCursor).toHaveBeenCalledWith(
+				expect.objectContaining({ transcriptPath: "/tmp/cursor-cli/chats/ccli-1/meta.json", lineNumber: 1 }),
+				"/test/cwd",
+			);
+		});
+
+		it("does not call isCursorCliInstalled or discoverCursorCliSessions when cursorEnabled is false", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cursor-cli-disabled.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({
+				cursorEnabled: false,
+			} as Awaited<ReturnType<typeof loadConfig>>);
+
+			await runWorker("/test/cwd");
+
+			expect(isCursorCliInstalled).not.toHaveBeenCalled();
+			expect(discoverCursorCliSessions).not.toHaveBeenCalled();
 		});
 	});
 
