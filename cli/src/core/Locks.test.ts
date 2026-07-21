@@ -37,6 +37,7 @@ import {
 	LOCK_TIMEOUT_MS,
 	ORPHAN_WRITE_LOCK_FILE,
 	PLANS_LOCK_FILE,
+	PROFILE_LOCK_FILE,
 	PUSH_PENDING_LOCK_FILE,
 	refreshIngestLockMtime,
 	refreshWorkerLockMtime,
@@ -45,6 +46,7 @@ import {
 	releaseWorkerLock,
 	WORKER_LOCK_FILE,
 	withPlansLock,
+	withProfileLock,
 	withPushPendingLock,
 } from "./Locks.js";
 
@@ -75,6 +77,14 @@ function pushPendingLockPath(tempDir: string): string {
 	return join(tempDir, ".jolli", "jollimemory", PUSH_PENDING_LOCK_FILE);
 }
 
+/**
+ * profile.lock dir = `<git-common-dir>/jollimemory/` (SHARED across worktrees),
+ * like orphan-write.lock — profile.json is repo-wide, not per-worktree.
+ */
+function profileLockPath(tempDir: string): string {
+	return join(tempDir, ".git", "jollimemory", PROFILE_LOCK_FILE);
+}
+
 describe("Locks", () => {
 	let tempDir: string;
 
@@ -101,6 +111,7 @@ describe("Locks", () => {
 		await rm(join(tempDir, ".jolli", "jollimemory", INGEST_LOCK_FILE), { force: true });
 		await rm(join(tempDir, ".git", "jollimemory", ORPHAN_WRITE_LOCK_FILE), { force: true });
 		await rm(plansLockPath(tempDir), { force: true });
+		await rm(profileLockPath(tempDir), { force: true });
 	});
 
 	afterEach(async () => {
@@ -591,6 +602,73 @@ describe("Locks", () => {
 			expect(result).toBe("best-effort");
 			// The foreign-owned lock is untouched.
 			await expect(stat(plansLockPath(tempDir))).resolves.toBeDefined();
+		});
+	});
+
+	describe("withProfileLock — shared (repo-wide) profile.json RMW serialisation", () => {
+		it("acquires in the SHARED git-common-dir, runs the body, returns its value, then releases", async () => {
+			let lockHeldDuringBody = false;
+			const result = await withProfileLock(tempDir, async () => {
+				lockHeldDuringBody = await stat(profileLockPath(tempDir)).then(
+					() => true,
+					() => false,
+				);
+				return 7;
+			});
+			expect(result).toBe(7);
+			expect(lockHeldDuringBody).toBe(true);
+			await expect(stat(profileLockPath(tempDir))).rejects.toThrow();
+		});
+
+		it("releases the lock even when the body throws", async () => {
+			await expect(
+				withProfileLock(tempDir, async () => {
+					throw new Error("boom");
+				}),
+			).rejects.toThrow("boom");
+			await expect(stat(profileLockPath(tempDir))).rejects.toThrow();
+		});
+
+		it("serialises two overlapping holders: the second waits for the first to release", async () => {
+			const order: string[] = [];
+			let releaseFirst: () => void = () => {};
+			const firstBodyEntered = new Promise<void>((resolve) => {
+				void withProfileLock(tempDir, async () => {
+					order.push("first-enter");
+					resolve();
+					await new Promise<void>((r) => {
+						releaseFirst = r;
+					});
+					order.push("first-exit");
+				});
+			});
+			await firstBodyEntered;
+			const second = withProfileLock(tempDir, async () => {
+				order.push("second-enter");
+			});
+			await new Promise((r) => setTimeout(r, 60));
+			expect(order).toEqual(["first-enter"]);
+			releaseFirst();
+			await second;
+			expect(order).toEqual(["first-enter", "first-exit", "second-enter"]);
+		});
+
+		it("falls back to best-effort (still runs the body) when the lock can't be acquired in time", async () => {
+			await mkdir(join(tempDir, ".git", "jollimemory"), { recursive: true });
+			await writeFile(profileLockPath(tempDir), String(process.pid), "utf-8");
+
+			let ran = false;
+			const result = await withProfileLock(
+				tempDir,
+				async () => {
+					ran = true;
+					return "best-effort";
+				},
+				{ timeoutMs: 80, pollMs: 20 },
+			);
+			expect(ran).toBe(true);
+			expect(result).toBe("best-effort");
+			await expect(stat(profileLockPath(tempDir))).resolves.toBeDefined();
 		});
 	});
 

@@ -22,6 +22,7 @@ const h = vi.hoisted(() => ({
 	getGlobalConfigDir: vi.fn(),
 	loadUserProfile: vi.fn(),
 	saveUserProfile: vi.fn(),
+	writeManualDisableFlag: vi.fn(),
 }));
 
 vi.mock("../auth/AuthConfig.js", () => ({ loadAuthToken: h.loadAuthToken, getJolliUrl: h.getJolliUrl }));
@@ -32,6 +33,7 @@ vi.mock("../core/SessionTracker.js", () => ({
 	saveConfigScoped: h.saveConfigScoped,
 	getGlobalConfigDir: h.getGlobalConfigDir,
 }));
+vi.mock("../core/RepoProfile.js", () => ({ writeManualDisableFlag: h.writeManualDisableFlag }));
 vi.mock("../core/StorageFactory.js", () => ({ createStorage: h.createStorage }));
 vi.mock("../core/SummaryStore.js", () => ({
 	getSummaryCount: h.getSummaryCount,
@@ -247,11 +249,22 @@ describe("GuidedFrontDoor", () => {
 
 		expect(h.install).toHaveBeenCalledWith("/repo", { source: "cli" });
 		expect(h.track).toHaveBeenCalledWith("surface_enabled", { trigger: "cli" });
+		// Enabling via the front door must clear the repo-wide manual-disable opt-out,
+		// otherwise doctor/VS Code would still treat the repo as disabled.
+		expect(h.writeManualDisableFlag).toHaveBeenCalledWith("/repo", false);
 		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo", "cli-front-door");
 		expect(h.runSpaceSyncStep).toHaveBeenCalledWith("/repo");
 		expect(out()).toContain("5 memories");
 		expect(out()).toContain("signed in");
 		expect(out()).toContain("Restart your AI agent session");
+	});
+
+	it("front-door enable that FAILS does not clear the manual-disable opt-out", async () => {
+		h.isGitHookInstalled.mockResolvedValue(false);
+		h.promptText.mockResolvedValue("y");
+		h.install.mockResolvedValue({ success: false, message: "boom", warnings: [] });
+		await runGuidedFrontDoor();
+		expect(h.writeManualDisableFlag).not.toHaveBeenCalled();
 	});
 
 	it("just enabled a fresh repo (no memories yet) → 0 memories", async () => {

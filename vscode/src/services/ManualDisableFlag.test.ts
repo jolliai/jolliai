@@ -1,66 +1,48 @@
-import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import {
-	readManualDisableFlag,
-	writeManualDisableFlag,
-} from "./ManualDisableFlag.js";
+import { readManualDisableFlag, writeManualDisableFlag } from "./ManualDisableFlag.js";
 
-describe("ManualDisableFlag", () => {
+// The flag is CLI-owned (RepoProfile / profile.json) and repo-wide; this module
+// is a thin re-export. `git init` makes each temp dir a real repo so we exercise
+// RepoProfile's git-common-dir anchoring (the actual VS Code path) and don't
+// accidentally resolve to an enclosing repo if TMPDIR happens to sit inside one.
+describe("ManualDisableFlag (repo-wide, profile.json backed)", () => {
 	let cwd: string;
 
 	beforeEach(async () => {
 		cwd = await mkdtemp(join(tmpdir(), "jolli-disable-flag-"));
+		execFileSync("git", ["init", "-q"], { cwd });
 	});
 
 	afterEach(async () => {
 		await rm(cwd, { recursive: true, force: true });
 	});
 
-	it("read returns false when the marker file does not exist", async () => {
+	it("read returns false when nothing is set", async () => {
 		expect(await readManualDisableFlag(cwd)).toBe(false);
 	});
 
-	it("write(true) creates the marker (and parent dirs) under .jolli/jollimemory/disabled-by-user", async () => {
-		await writeManualDisableFlag(cwd, true);
-
-		const expected = join(cwd, ".jolli", "jollimemory", "disabled-by-user");
-		await expect(stat(expected)).resolves.toBeDefined();
-		expect(await readManualDisableFlag(cwd)).toBe(true);
-	});
-
-	it("write(true) records an ISO timestamp body for human debugging", async () => {
-		await writeManualDisableFlag(cwd, true);
-		const body = await readFile(
-			join(cwd, ".jolli", "jollimemory", "disabled-by-user"),
-			"utf-8",
-		);
-		expect(body.trim()).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
-	});
-
-	it("write(false) removes the marker if it exists", async () => {
+	it("write(true) persists to profile.json and read returns true", async () => {
 		await writeManualDisableFlag(cwd, true);
 		expect(await readManualDisableFlag(cwd)).toBe(true);
+		const body = await readFile(join(cwd, ".jolli", "jollimemory", "profile.json"), "utf-8");
+		expect(JSON.parse(body)).toMatchObject({ manuallyDisabled: true });
+	});
 
+	it("write(false) clears the opt-out", async () => {
+		await writeManualDisableFlag(cwd, true);
+		expect(await readManualDisableFlag(cwd)).toBe(true);
 		await writeManualDisableFlag(cwd, false);
 		expect(await readManualDisableFlag(cwd)).toBe(false);
 	});
 
-	it("write(false) is a no-op when the marker is already absent", async () => {
-		await expect(writeManualDisableFlag(cwd, false)).resolves.toBeUndefined();
-		expect(await readManualDisableFlag(cwd)).toBe(false);
-	});
-
-	it("write(false) rethrows non-ENOENT unlink errors instead of silently swallowing them", async () => {
-		// Pin the contract: ENOENT (already-gone) is the only error that
-		// write(false) is allowed to absorb — any other IO failure must
-		// propagate so the caller knows the opt-out didn't actually clear.
-		// Putting a directory at the marker path makes unlink throw
-		// EISDIR (Linux) / EPERM (macOS), both of which are non-ENOENT.
-		const markerPath = join(cwd, ".jolli", "jollimemory", "disabled-by-user");
-		await mkdir(markerPath, { recursive: true });
-		await expect(writeManualDisableFlag(cwd, false)).rejects.toThrow();
+	it("migrates a legacy per-worktree disabled-by-user marker on read", async () => {
+		await mkdir(join(cwd, ".jolli", "jollimemory"), { recursive: true });
+		await writeFile(join(cwd, ".jolli", "jollimemory", "disabled-by-user"), new Date(0).toISOString());
+		expect(await readManualDisableFlag(cwd)).toBe(true);
 	});
 });

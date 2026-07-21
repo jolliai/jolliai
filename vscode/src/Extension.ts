@@ -2287,9 +2287,21 @@ export function activate(context: vscode.ExtensionContext): void {
 			"jollimemory.disableJolliMemory",
 			async () => {
 				log.info("cmd", "disableJolliMemory invoked");
-				// Record the opt-out *before* the async uninstall so the user's
-				// intent is durable even if Installer.uninstall() throws or fails.
-				await writeManualDisableFlag(workspaceRoot, true);
+				// Record the opt-out *before* the async uninstall so the user's intent
+				// is durable even if Installer.uninstall() throws or fails. If we can't
+				// persist it, don't disable: a hooks-removed-but-flag-unset half-state
+				// would be silently re-enabled by a later upgrade / activation.
+				try {
+					await writeManualDisableFlag(workspaceRoot, true);
+				} catch (err) {
+					log.error("cmd", "disable aborted — could not persist opt-out", {
+						message: (err as Error).message,
+					});
+					vscode.window.showErrorMessage(
+						`Jolli Memory: could not save the disable setting (${(err as Error).message}). Nothing was changed.`,
+					);
+					return;
+				}
 				const result = await bridge.disable();
 				if (!result.success) {
 					log.error("cmd", "disable failed", { message: result.message });
@@ -3997,11 +4009,20 @@ export function activate(context: vscode.ExtensionContext): void {
 				statusBar,
 			);
 
+			// The user's manual-disable opt-out is the highest-priority signal and is
+			// repo-wide (RepoProfile.manuallyDisabled in profile.json at the main
+			// worktree root, shared across every worktree). Read it once and let it
+			// gate BOTH re-install paths below, so neither a version upgrade nor a
+			// sibling-worktree reload can silently re-enable a repo the user turned off.
+			const status = await bridge.getStatus();
+			const manuallyDisabled = await readManualDisableFlag(workspaceRoot);
+
 			// Auto-install hooks for new worktrees when the project is already enabled.
 			// If other worktrees have hooks installed but this one doesn't, silently
-			// re-run enable so no manual step is required.
-			const status = await bridge.getStatus();
+			// re-run enable so no manual step is required — but never against an
+			// opt-out (e.g. a failed uninstall that left the shared git hook behind).
 			if (
+				!manuallyDisabled &&
 				status.gitHookInstalled &&
 				status.worktreeHooksInstalled === false &&
 				status.enabledWorktrees !== undefined &&
@@ -4023,12 +4044,11 @@ export function activate(context: vscode.ExtensionContext): void {
 				);
 			}
 
-			// Auto-enable on first run unless the user has explicitly opted out.
-			// The opt-out is a marker file at
-			// `<projectDir>/.jolli/jollimemory/disabled-by-user` (sibling of
-			// sessions.json / cursors.json), so a fresh project / fresh worktree
-			// has no marker → falsy → install.
-			const manuallyDisabled = await readManualDisableFlag(workspaceRoot);
+			// Auto-enable on first run unless the user has explicitly opted out. The
+			// opt-out is repo-wide (RepoProfile.manuallyDisabled in profile.json at
+			// the main worktree root), so a fresh project OR a sibling worktree of a
+			// disabled repo is handled correctly: a sibling worktree now reads the
+			// same flag and stays off instead of re-enabling on reload.
 			if (!status.enabled && !manuallyDisabled) {
 				log.info(
 					"activate",

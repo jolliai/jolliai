@@ -169,6 +169,15 @@ vi.mock("./install/Installer.js", () => ({
 	}),
 }));
 
+vi.mock("./core/RepoProfile.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./core/RepoProfile.js")>();
+	return {
+		...actual,
+		readManualDisableFlag: vi.fn().mockResolvedValue(false),
+		writeManualDisableFlag: vi.fn().mockResolvedValue(undefined),
+	};
+});
+
 vi.mock("./core/SummaryStore.js", () => ({
 	listSummaries: vi.fn().mockResolvedValue([]),
 	getSummary: vi.fn().mockResolvedValue(null),
@@ -356,6 +365,7 @@ vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
 import { main } from "./Api.js";
 import { compileTaskContext, listBranchCatalog, renderContextMarkdown } from "./core/ContextCompiler.js";
+import { readManualDisableFlag, writeManualDisableFlag } from "./core/RepoProfile.js";
 import { loadConfigFromDir } from "./core/SessionTracker.js";
 import { exportSummaries } from "./core/SummaryExporter.js";
 import { hasMigrationMeta, migrateV1toV3 } from "./core/SummaryMigration.js";
@@ -814,6 +824,22 @@ describe("CLI", () => {
 				delete process.env.JOLLI_LOCAL_AGENT_CHILD;
 			}
 		});
+
+		it("clears the repo-wide manual-disable opt-out on a successful enable", async () => {
+			await main(["enable", "--cwd", "/tmp/test-project"]);
+			expect(writeManualDisableFlag).toHaveBeenCalledWith("/tmp/test-project", false);
+		});
+
+		it("does NOT clear the opt-out when the install fails", async () => {
+			vi.mocked(install).mockResolvedValueOnce({ success: false, message: "Failed", warnings: [] });
+			await main(["enable"]);
+			expect(writeManualDisableFlag).not.toHaveBeenCalled();
+		});
+
+		it("does NOT touch the opt-out for --integrations-only enable", async () => {
+			await main(["enable", "--integrations-only"]);
+			expect(writeManualDisableFlag).not.toHaveBeenCalled();
+		});
 	});
 
 	describe("disable command", () => {
@@ -830,6 +856,31 @@ describe("CLI", () => {
 		it("should set exit code on failure", async () => {
 			vi.mocked(uninstall).mockResolvedValueOnce({ success: false, message: "Failed", warnings: [] });
 			await main(["disable"]);
+			expect(process.exitCode).toBe(1);
+		});
+
+		it("records the repo-wide manual-disable opt-out before uninstalling", async () => {
+			await main(["disable", "--cwd", "/tmp/test-project"]);
+			expect(writeManualDisableFlag).toHaveBeenCalledWith("/tmp/test-project", true);
+		});
+
+		it("records the opt-out even when uninstall then fails (intent is durable)", async () => {
+			vi.mocked(uninstall).mockResolvedValueOnce({ success: false, message: "Failed", warnings: [] });
+			await main(["disable"]);
+			expect(writeManualDisableFlag).toHaveBeenCalledWith(expect.any(String), true);
+		});
+
+		it("does NOT record the opt-out for --integrations-only disable", async () => {
+			await main(["disable", "--integrations-only"]);
+			expect(writeManualDisableFlag).not.toHaveBeenCalled();
+		});
+
+		it("aborts (does not uninstall) and exits non-zero when the opt-out cannot be persisted", async () => {
+			// If the durable opt-out can't be written, removing hooks would leave a
+			// state that silently re-enables — so disable must change nothing.
+			vi.mocked(writeManualDisableFlag).mockRejectedValueOnce(new Error("EACCES"));
+			await main(["disable"]);
+			expect(uninstall).not.toHaveBeenCalled();
 			expect(process.exitCode).toBe(1);
 		});
 	});
@@ -4159,6 +4210,18 @@ describe("CLI", () => {
 			const output = (await runDoctor(["doctor"], { gitHookInstalled: false })).join("\n");
 			expect(output).toContain("✗ Git hooks");
 			expect(output).toContain("not installed");
+		});
+
+		it("reports missing Git hooks as OK (manually disabled) — no reinstall fixer", async () => {
+			// A manual disable is the user's highest-priority intent: missing hooks are
+			// expected, so doctor reports OK and offers no reinstall, keeping `--fix`
+			// from silently re-enabling an opted-out repo.
+			vi.mocked(readManualDisableFlag).mockResolvedValueOnce(true);
+			const output = (await runDoctor(["doctor", "--fix"], { gitHookInstalled: false })).join("\n");
+			expect(output).toContain("✓ Git hooks");
+			expect(output).toContain("manually disabled");
+			expect(output).not.toContain("reinstalled");
+			expect(install).not.toHaveBeenCalled();
 		});
 
 		it("should flag stuck lock file as fail", async () => {

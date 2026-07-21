@@ -18,15 +18,23 @@
  * not re-prompted.
  */
 
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { getJolliMemoryDir } from "../Logger.js";
-import { execGit } from "./GitOps.js";
+import { execGit, listWorktrees } from "./GitOps.js";
+import { withProfileLock } from "./Locks.js";
 
 const PROFILE_FILE = "profile.json";
 /** Legacy marker (pre-RepoProfile): `<git-common-dir>/jollimemory/backfill-card-dismissed`. */
 const LEGACY_DISMISS_DIR = "jollimemory";
 const LEGACY_DISMISS_FILE = "backfill-card-dismissed";
+/**
+ * Legacy manual-disable marker (pre-repo-scope): a per-worktree file at
+ * `<worktreeRoot>/.jolli/jollimemory/disabled-by-user`, written by the VS Code
+ * extension before the flag became a repo-wide `profile.json` field. Reads
+ * migrate it (see {@link readManualDisableFlag}).
+ */
+const LEGACY_DISABLE_FILE = "disabled-by-user";
 
 export interface RepoProfile {
 	/**
@@ -36,6 +44,14 @@ export interface RepoProfile {
 	 * any generation). Only an explicit re-set to false would undo it.
 	 */
 	backfillDismissed?: boolean;
+	/**
+	 * The user explicitly disabled Jolli Memory for this repo (`jolli disable` or
+	 * the VS Code "Disable" command). Repo-wide — it matches the shared git hook
+	 * that `status.enabled` reflects, so one disable holds across every worktree.
+	 * Highest priority: never auto-cleared by upgrades, window reloads, or hook
+	 * repair; only an explicit re-enable sets it back to false.
+	 */
+	manuallyDisabled?: boolean;
 }
 
 /** Resolved paths for a repo's profile, plus the legacy marker to migrate from. */
@@ -66,10 +82,11 @@ async function resolvePaths(cwd: string): Promise<ProfilePaths> {
 	// and dirname drops the `<name>` segment, so the profile lands at
 	// `<super>/.git/modules/.jolli/...`, shared by every submodule of that super-repo.
 	// Reads/writes stay self-consistent, but sibling submodules then share one profile,
-	// so a dismiss in one submodule suppresses the offer in the others. Known,
-	// low-severity limitation (no data loss); git submodules are rare enough that a
-	// per-submodule special-case isn't worth it. Note the legacy marker below is anchored
-	// at the full commonDir (with `<name>`), so it was per-submodule.
+	// so a dismiss in one submodule suppresses the offer in the others — and likewise a
+	// `manuallyDisabled` set in one submodule turns Jolli off for every sibling submodule
+	// of that super-repo. Known, low-severity limitation (no data loss); git submodules
+	// are rare enough that a per-submodule special-case isn't worth it. Note the legacy
+	// markers are anchored per-worktree/per-submodule-checkout, so they were per-submodule.
 	const mainRoot = dirname(commonDir);
 	return {
 		profilePath: join(getJolliMemoryDir(mainRoot), PROFILE_FILE),
@@ -82,7 +99,9 @@ async function readRaw(profilePath: string): Promise<RepoProfile> {
 	try {
 		const text = await readFile(profilePath, "utf-8");
 		const parsed = JSON.parse(text);
-		return parsed && typeof parsed === "object" ? (parsed as RepoProfile) : {};
+		// Arrays are `typeof "object"` too — reject them so a stray `[...]` profile
+		// isn't spread into `{0:..., 1:...}` by a later migration.
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as RepoProfile) : {};
 	} catch {
 		return {};
 	}
@@ -99,7 +118,18 @@ async function fileExists(path: string): Promise<boolean> {
 
 async function writeProfile(profilePath: string, profile: RepoProfile): Promise<void> {
 	await mkdir(dirname(profilePath), { recursive: true });
-	await writeFile(profilePath, `${JSON.stringify(profile, null, "\t")}\n`);
+	// Atomic write: a torn/partial file reads back as `{}` (corrupt JSON), which
+	// would silently drop a durable opt-out. Write a PID-scoped temp then rename
+	// (atomic on the same volume; replaces the target on Windows). The PID suffix
+	// avoids a temp-file collision if two writers ever race without the lock.
+	const tmpPath = `${profilePath}.${process.pid}.tmp`;
+	await writeFile(tmpPath, `${JSON.stringify(profile, null, "\t")}\n`);
+	try {
+		await rename(tmpPath, profilePath);
+	} catch (err) {
+		await unlink(tmpPath).catch(() => {});
+		throw err;
+	}
 }
 
 /**
@@ -113,17 +143,88 @@ export async function readRepoProfile(cwd: string): Promise<RepoProfile> {
 	const { profilePath, legacyMarkerPath } = await resolvePaths(cwd);
 	const profile = await readRaw(profilePath);
 	if (profile.backfillDismissed === undefined && legacyMarkerPath && (await fileExists(legacyMarkerPath))) {
-		const migrated: RepoProfile = { ...profile, backfillDismissed: true };
-		// Best-effort persist so the legacy marker only needs to be read once.
-		await writeProfile(profilePath, migrated).catch(() => {});
-		return migrated;
+		// Persist under the profile lock, re-reading inside so a concurrent write of
+		// the OTHER field (manuallyDisabled) isn't clobbered. Best-effort: a persist
+		// failure still returns the migrated value, and the next read re-migrates.
+		await withProfileLock(cwd, async () => {
+			const current = await readRaw(profilePath);
+			if (current.backfillDismissed === undefined) {
+				await writeProfile(profilePath, { ...current, backfillDismissed: true });
+			}
+		}).catch(() => {});
+		return { ...profile, backfillDismissed: true };
 	}
 	return profile;
 }
 
-/** Merges `patch` into the repo's profile and persists it. */
+/**
+ * Merges `patch` into the repo's profile and persists it. The read-modify-write
+ * runs under the shared `profile.lock` (see {@link withProfileLock}) so a
+ * concurrent writer in another process/worktree can't lose-update a sibling
+ * field — e.g. a VS Code `backfillDismissed` write must not drop a CLI
+ * `manuallyDisabled` write, which would silently re-enable a disabled repo.
+ */
 export async function updateRepoProfile(cwd: string, patch: Partial<RepoProfile>): Promise<void> {
 	const { profilePath } = await resolvePaths(cwd);
-	const current = await readRaw(profilePath);
-	await writeProfile(profilePath, { ...current, ...patch });
+	await withProfileLock(cwd, async () => {
+		const current = await readRaw(profilePath);
+		await writeProfile(profilePath, { ...current, ...patch });
+	});
+}
+
+/**
+ * True iff any worktree of this repo still carries the legacy per-worktree
+ * `disabled-by-user` marker. Enumerating all worktrees (not just `cwd`) is what
+ * makes the migration robust: a repo disabled in one worktree stays disabled no
+ * matter which worktree first reads the flag after the upgrade. Falls back to
+ * checking just `cwd` when worktree enumeration fails (e.g. not a git repo).
+ */
+async function anyWorktreeHasLegacyDisableMarker(cwd: string): Promise<boolean> {
+	let worktrees: ReadonlyArray<string>;
+	try {
+		worktrees = await listWorktrees(cwd);
+	} catch {
+		worktrees = [cwd];
+	}
+	for (const wt of worktrees) {
+		if (await fileExists(join(getJolliMemoryDir(wt), LEGACY_DISABLE_FILE))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Reads the repo-wide manual-disable flag — the user's highest-priority opt-out.
+ *
+ * If `profile.json` has no `manuallyDisabled` field yet but any worktree still
+ * carries the legacy `disabled-by-user` marker, the repo is treated as disabled
+ * and the decision is persisted into the profile (best-effort — a persist
+ * failure still returns the migrated value, and the next read re-migrates).
+ * Once the field is set (by migration or an explicit enable/disable), the legacy
+ * marker is ignored.
+ */
+export async function readManualDisableFlag(cwd: string): Promise<boolean> {
+	const { profilePath } = await resolvePaths(cwd);
+	const profile = await readRaw(profilePath);
+	if (profile.manuallyDisabled !== undefined) {
+		return profile.manuallyDisabled === true;
+	}
+	const legacy = await anyWorktreeHasLegacyDisableMarker(cwd);
+	if (legacy) {
+		// Persist under the profile lock, re-reading inside so a concurrent write of
+		// the OTHER field (backfillDismissed) isn't clobbered. Best-effort.
+		await withProfileLock(cwd, async () => {
+			const current = await readRaw(profilePath);
+			if (current.manuallyDisabled === undefined) {
+				await writeProfile(profilePath, { ...current, manuallyDisabled: true });
+			}
+		}).catch(() => {});
+	}
+	return legacy;
+}
+
+/** Sets (`true`) or clears (`false`) the repo-wide manual-disable flag. */
+export async function writeManualDisableFlag(cwd: string, disabled: boolean): Promise<void> {
+	await updateRepoProfile(cwd, { manuallyDisabled: disabled });
 }
