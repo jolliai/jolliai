@@ -4,6 +4,10 @@
 		"module": "ESNext",
 		"moduleResolution": "bundler",
 		"lib": ["ES2022"],
+		// The bundled CLI includes the Ink TUI (TSX). tsc here type-checks those
+		// cross-package files, so it needs the same JSX config as cli/tsconfig.json.
+		"jsx": "react-jsx",
+		"jsxImportSource": "react",
 		"outDir": "dist",
 		// tsc is type-check only here (esbuild produces dist/). Cross-package imports of
 		// ../../../cli/src/** pull files outside this package into the program, so their

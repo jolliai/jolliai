@@ -55,7 +55,7 @@
 	},
 	"overrides": [
 		{
-			"includes": ["src/util/Subprocess.ts", "**/*.test.ts"],
+			"includes": ["src/util/Subprocess.ts", "**/*.test.ts", "**/*.test.tsx"],
 			"linter": {
 				"rules": {
 					"style": {

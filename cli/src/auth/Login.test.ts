@@ -810,6 +810,21 @@ describe("Login", () => {
 			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "browser-token", jolliUrl: TEST_JOLLI_URL });
 		});
 
+		it("routes progress through `report` when provided, not console.log", async () => {
+			mockLoadConfig.mockResolvedValue({});
+			mockExchangeCliCode.mockResolvedValue({ token: "browser-token-r" });
+			mockOpen.mockImplementation(simulateBrowserCallback("browser-code-r"));
+			const report = vi.fn();
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+			await browserLogin(TEST_JOLLI_URL, { report });
+
+			expect(report).toHaveBeenCalledWith("Opening browser to login...");
+			expect(report.mock.calls.some(([m]) => String(m).includes("visit:"))).toBe(true);
+			expect(logSpy).not.toHaveBeenCalled();
+			logSpy.mockRestore();
+		});
+
 		it("includes a 256-bit hex state nonce on the login URL (RFC 6749 §10.12)", async () => {
 			mockLoadConfig.mockResolvedValue({});
 			mockExchangeCliCode.mockResolvedValue({ token: "browser-token-3" });

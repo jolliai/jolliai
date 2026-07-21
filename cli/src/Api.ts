@@ -7,18 +7,17 @@
  * is a thin shim that imports from here.
  */
 
-import { Command, Help } from "commander";
+import { Command, Help, Option } from "commander";
 import { registerAuthCommands } from "./commands/AuthCommand.js";
 import { registerBackfillCommand } from "./commands/BackfillCommand.js";
 import { registerCleanCommand } from "./commands/CleanCommand.js";
-import { checkVersionMismatch, VERSION } from "./commands/CliUtils.js";
+import { checkVersionMismatch, resolveProjectDir, VERSION } from "./commands/CliUtils.js";
 import { registerCompileCommand } from "./commands/CompileCommand.js";
 import { registerConfigureCommand } from "./commands/ConfigureCommand.js";
 import { registerDoctorCommand } from "./commands/DoctorCommand.js";
 import { registerDisableCommand, registerEnableCommand } from "./commands/EnableCommand.js";
 import { registerExportCommand, registerExportPromptCommand } from "./commands/ExportCommand.js";
 import { registerGraphCommand } from "./commands/GraphCommand.js";
-import { runGuidedFrontDoor } from "./commands/GuidedFrontDoor.js";
 import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { getHelpGroup } from "./commands/HelpGroups.js";
 import { registerBindCommand, registerPushCommand, registerSpacesCommand } from "./commands/JolliCloudCommands.js";
@@ -43,10 +42,16 @@ import { registerWorkflowRunsCommand } from "./commands/WorkflowRunsCommand.js";
 // pure re-exports from the entry bundle when nothing inside the entry
 // consumes them).
 import { parseBaseUrl as _parseBaseUrl, parseJolliApiKey as _parseJolliApiKey } from "./core/JolliApiUtils.js";
+import { createStorage } from "./core/StorageFactory.js";
+import { setActiveStorage } from "./core/SummaryStore.js";
 import { installCommandTelemetryHooks } from "./core/TelemetryCommandHook.js";
 import { CLI_PACKAGE_NAME, REFRESH_COMMAND, refreshUpdateCache } from "./core/UpdateCheck.js";
-import type { Logger } from "./Logger.js";
+import { type Logger, setLogDir } from "./Logger.js";
 import { loadPlugins, registerMissingStubs } from "./PluginLoader.js";
+import { buildCommandCatalog } from "./tui/ink/CommandCatalog.js";
+import { loadHomeModel, renderHomeSnapshot } from "./tui/ink/HomeSnapshot.js";
+import type { Tab } from "./tui/ink/TuiApp.js";
+import { buildTuiDeps } from "./tui/ink/TuiDeps.js";
 
 /**
  * Runtime context handed to a plugin's `register()` function.
@@ -206,12 +211,77 @@ agent. Provided by the @jolli.ai/space-cli plugin.`;
  * Main CLI entry point.
  * Exported for testability — can be called with custom args.
  */
+/**
+ * Maps the `--view` value (incl. legacy `dashboard`/`queue`/`backfill`/
+ * `memory-bank` aliases) to a TUI tab. Exported for unit testing. Migrated from
+ * the removed WatchCommand — `jolli` is now the sole TUI entry point.
+ */
+export function toInitialTab(view: string | undefined): Tab {
+	switch (view) {
+		case "memories":
+		case "browse":
+			// The current-branch committed-memories tab (browse).
+			return "memories";
+		case "settings":
+			return "settings";
+		case "manage":
+			// The old Manage tab merged with Settings; Settings is the survivor.
+			return "settings";
+		case "recall":
+		case "timeline":
+		case "memory-bank":
+			// The repo-wide Memory Bank tab (recall + timeline sub-views).
+			return "memory-bank";
+		case "graph":
+		case "backfill":
+			// graph/backfill are now `/` commands, not views; the legacy `--view`
+			// values land on the current-branch Memories tab.
+			return "memories";
+		default:
+			// "home", legacy "dashboard"/"commands" (the Commands tab became the
+			// `/` palette), and legacy "queue" (queue status now lives on Home's
+			// Status sub-items) land on Home.
+			return "home";
+	}
+}
+
 export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	const program = new Command();
+	// Positional options: the root's own options (--once/--view/--cwd/--format)
+	// are valid only BEFORE a subcommand, so subcommands keep their own
+	// same-named options (e.g. `jolli compile --cwd …`) instead of the root
+	// swallowing them.
+	program.enablePositionalOptions();
 	program
 		.name("jolli")
 		.description("Auto-document AI development sessions and generate documentation sites")
-		.version(VERSION);
+		.version(VERSION)
+		// Bare `jolli` is the control-center TUI + guided front door (default
+		// action below). These top-level options tune that entry point; they
+		// replace the removed `jolli watch` command.
+		// No eager default — resolveProjectDir() runs a synchronous `git rev-parse`,
+		// so it is deferred to the default action below (this option is only read
+		// there) instead of firing on every `jolli <subcommand>` / `--version`.
+		.option("--cwd <dir>", "Project directory (default: git repo root)")
+		.addOption(
+			new Option("--view <view>", "Initial tab").choices([
+				"home",
+				"memories",
+				"browse",
+				"recall",
+				"timeline",
+				"manage",
+				"settings",
+				"graph",
+				"commands",
+				"dashboard",
+				"queue",
+				"backfill",
+				"memory-bank",
+			]),
+		)
+		.option("--once", "Print a single status snapshot and exit (no resident TUI)")
+		.addOption(new Option("--format <fmt>", "Output format for --once").choices(["json"]));
 
 	const formatGroupedHelp = (cmd: Command, helper: Help): string => {
 		// Grouping by Memory/Site only makes sense at the root program. For
@@ -404,15 +474,63 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	// check doesn't trigger a second discovery walk on the startup hot path.
 	await checkVersionMismatch({ pluginDiagnostics });
 
-	// Bare `jolli` (no subcommand) on an interactive terminal becomes the guided
-	// front door instead of a help wall. Requires BOTH stdin and stdout to be a
-	// TTY: piped (`jolli | cat`) or CI runs fall through to `parseAsync`, which
-	// prints the grouped help and never blocks or prompts.
-	const userArgs = args ?? process.argv.slice(2);
-	if (userArgs.length === 0 && process.stdin.isTTY === true && process.stdout.isTTY === true) {
-		await runGuidedFrontDoor();
-		return;
-	}
+	// Default action (no subcommand) — the sole TUI entry point. `jolli` opens
+	// the Ink control center (guided front door when setup is incomplete);
+	// `--once`/`--format json` print a scriptable snapshot; a non-interactive
+	// bare `jolli` (piped / CI) prints help. Ink/react are pulled in only on the
+	// interactive branch via dynamic import, keeping them off every other path.
+	program.action(async (opts: { cwd?: string; view?: string; once?: boolean; format?: string }) => {
+		const cwd = opts.cwd ?? resolveProjectDir();
+		// Ink needs a TTY on BOTH stdin and stdout; a snapshot request also forces
+		// the non-interactive path. (isInteractive() checks stdin only, so we test
+		// stdout explicitly — mirrors the old bare-`jolli` guard.)
+		const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
+		const nonInteractive = opts.once === true || opts.format === "json" || !interactive;
+		if (nonInteractive) {
+			if (opts.once !== true && opts.format !== "json") {
+				program.outputHelp();
+				return;
+			}
+			// A snapshot must fail cleanly (one-line error, non-zero exit) rather
+			// than dumping a Node stack trace — this path is meant to be scripted.
+			try {
+				setLogDir(cwd);
+				setActiveStorage(await createStorage(cwd, cwd));
+				const model = await loadHomeModel(buildTuiDeps(cwd));
+				console.log(
+					opts.format === "json" ? JSON.stringify({ type: "home", ...model }) : renderHomeSnapshot(model),
+				);
+			} catch (err) {
+				console.error(`jolli: could not read status — ${(err as Error).message}`);
+				process.exitCode = 1;
+			}
+			return;
+		}
+		const { runInkTui } = await import("./tui/ink/runInkTui.js");
+		await runInkTui(cwd, toInitialTab(opts.view), buildCommandCatalog(program));
+	});
+
+	// The root `--cwd` exists for the bare-`jolli` TUI, but positional options mean
+	// `jolli --cwd <dir> status` parses it at the root and the subcommand would
+	// otherwise ignore it — silently running against the current directory (a
+	// dangerous "wrong repo looks successful" footgun). Forward it to any subcommand
+	// that has its own `--cwd` the user did NOT set explicitly. Commander reports the
+	// source as "default" for subcommands whose `--cwd` carries a default value
+	// (`status`, `backfill`, …) and `undefined` for those declaring `--cwd` with no
+	// default (`graph`, `compile`) — both mean "unset", so both must inherit the root
+	// value. An explicit `status --cwd <dir>` (source "cli"/"env") wins, and the bare
+	// TUI (actionCommand === program) reads the root value itself.
+	program.hook("preAction", (_thisCommand, actionCommand) => {
+		const rootCwd = program.opts().cwd as string | undefined;
+		if (rootCwd === undefined || actionCommand === program) {
+			return;
+		}
+		const hasCwdOption = actionCommand.options.some((o) => o.attributeName() === "cwd");
+		const source = actionCommand.getOptionValueSource("cwd");
+		if (hasCwdOption && (source === "default" || source === undefined)) {
+			actionCommand.setOptionValue("cwd", rootCwd);
+		}
+	});
 
 	/* v8 ignore start - process.argv branch only used when running as script, not in tests */
 	await program.parseAsync(args !== undefined ? ["node", "jolli", ...args] : process.argv);

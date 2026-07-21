@@ -52,9 +52,9 @@ function emitError(message: string, format: string | undefined): void {
 	process.exitCode = 1;
 }
 
-/** Renders a `<id>  <name> (<slug>)` line per space, marking the tenant's configured default. */
+/** Renders a `<id>  <name>` line per space, marking the tenant's configured default. */
 function renderSpaceLines(spaces: ReadonlyArray<JolliMemorySpace>, defaultSpaceId: number | null): string[] {
-	return spaces.map((s) => `    ${s.id}  ${s.name} (${s.slug})${s.id === defaultSpaceId ? " (default)" : ""}`);
+	return spaces.map((s) => `    ${s.id}  ${s.name}${s.id === defaultSpaceId ? " (default)" : ""}`);
 }
 
 /** Registers the `push` command on the given Commander program. */

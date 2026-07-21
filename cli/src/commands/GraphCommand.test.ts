@@ -41,6 +41,13 @@ describe("executeGraph", () => {
 		expect(process.exitCode).toBe(0);
 	});
 
+	it("bare --export (true) exports with out omitted → GraphExport picks the personal dir", async () => {
+		exportGraphHtml.mockResolvedValue("/home/u/.jolli/jollimemory/graph/repo-graph.html");
+		await executeGraph({ export: true });
+		expect(exportGraphHtml).toHaveBeenCalledWith({ cwd: process.cwd(), out: undefined });
+		expect(process.exitCode).toBe(0);
+	});
+
 	it("passes an explicit --cwd through", async () => {
 		exportGraphHtml.mockResolvedValue("/out/x-graph.html");
 		await executeGraph({ export: "/out", cwd: "/repo" });
