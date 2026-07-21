@@ -188,6 +188,45 @@ export async function loadSpaceBindingCache(
 	return parsed;
 }
 
+/**
+ * Display-only read of the cached Space binding for a status snapshot — returns
+ * the bound Space's `spaceName` WITHOUT the tenant-origin / repoUrl match that
+ * {@link loadSpaceBindingCache} performs before a push.
+ *
+ * Origin matching requires decoding the API key ({@link tenantOriginForKey}),
+ * which the `status` path deliberately avoids so it stays clear of CodeQL's
+ * clear-text-logging taint. The space name is a plain user-visible label (not
+ * secret, not key-derived), and a stale name after a tenant swap is a harmless
+ * display blemish that the next rejected push clears — so skipping the origin
+ * check here is safe. Shape validation and the same TTL still apply; a malformed
+ * file is left in place (the authoritative {@link loadSpaceBindingCache} prunes
+ * it). Returns null when absent, unparseable, or expired.
+ */
+export async function loadSpaceBindingDisplay(cwd: string): Promise<{ spaceName: string; canPush: boolean } | null> {
+	const path = await cachePath(cwd);
+	let raw: string;
+	try {
+		raw = await readFile(path, "utf-8");
+	} catch (err) {
+		/* v8 ignore next 2 -- defensive: only non-ENOENT read errors log; both return null */
+		if (!isEnoent(err))
+			log.debug(`binding display read failed: ${err instanceof Error ? err.message : String(err)}`);
+		return null;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return null;
+	}
+	if (!isValidEntry(parsed)) return null;
+	const age = Date.now() - new Date(parsed.checkedAt).getTime();
+	if (!Number.isFinite(age) || age < 0 || age > SPACE_BINDING_TTL_MS) return null;
+	// Only a healthy binding is ever written (canPush is `true | null`); a `null`
+	// (older server, unknown) is treated as pushable, matching loadSpaceBindingCache.
+	return { spaceName: parsed.spaceName, canPush: parsed.canPush ?? true };
+}
+
 /** What a save records — timestamps are stamped inside {@link saveSpaceBindingCache}. */
 export interface SpaceBindingSaveArgs {
 	readonly repoUrl: string;

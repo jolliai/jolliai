@@ -46,14 +46,17 @@ export async function saveAuthToken(token: string): Promise<void> {
  *
  * Also writes `aiProvider: "jolli"` because clicking "Sign in to Jolli" is the
  * user's explicit declaration of intent to use Jolli for AI summaries — UNLESS
- * the user has already explicitly chosen `aiProvider: "anthropic"` in
- * Settings. In that case we leave the choice alone: a deliberate Anthropic
- * pick should outlast a sign-in (e.g. user signs in just to push, not to
- * switch providers). When `aiProvider` is unset or already "jolli", we write
- * "jolli" to align the dispatcher's `resolveLlmCredentialSource` with the
- * user's onboarding choice — without it, a returning user who already had an
- * Anthropic API key in config would see Settings UI promise "using Jolli" but
- * the dispatcher would still pick Anthropic via the legacy precedence path.
+ * the user has already explicitly chosen `aiProvider: "anthropic"` OR
+ * `aiProvider: "local-agent"` in Settings. In that case we leave the choice
+ * alone: a deliberate provider pick should outlast a sign-in (e.g. user signs in
+ * just to push memories to a Space, not to switch summary engines). This matters
+ * for the Claude Code plugin, which defaults to `local-agent` — logging in to
+ * bind/share a Space must NOT silently redirect summary generation to the Jolli
+ * proxy. When `aiProvider` is unset or already "jolli", we write "jolli" to align
+ * the dispatcher's `resolveLlmCredentialSource` with the user's onboarding
+ * choice — without it, a returning user who already had an Anthropic API key in
+ * config would see Settings UI promise "using Jolli" but the dispatcher would
+ * still pick Anthropic via the legacy precedence path.
  *
  * `clearAuthCredentials` rolls back this auto-write on logout (only when the
  * stored value is still "jolli") so the config doesn't keep a "jolli"
@@ -84,7 +87,7 @@ export async function saveAuthCredentials(credentials: {
 		authToken: credentials.token,
 		jolliUrl: normalizedJolliUrl,
 	};
-	if (config.aiProvider !== "anthropic") {
+	if (config.aiProvider !== "anthropic" && config.aiProvider !== "local-agent") {
 		update.aiProvider = "jolli";
 	}
 	if (credentials.jolliApiKey) {
@@ -257,9 +260,10 @@ export async function loadAuthToken(): Promise<string | undefined> {
 /**
  * Clears the auth token, Jolli API key, and (only if it equals "jolli") the
  * `aiProvider` preference. Symmetric with `saveAuthCredentials`: that path
- * writes "jolli" only when the current value isn't already "anthropic", so the
- * "explicit anthropic survives a Jolli sign-in / logout round-trip" property
- * holds end-to-end. Leaving "jolli" behind on logout would pin
+ * writes "jolli" only when the current value isn't already "anthropic" or
+ * "local-agent", so the "explicit provider pick survives a Jolli sign-in /
+ * logout round-trip" property holds end-to-end for both. Leaving "jolli" behind
+ * on logout would pin
  * `resolveLlmCredentialSource` to the proxy after the credentials are gone —
  * subsequent commits would then fail silently in VS Code (where the CLI
  * warning copy never reaches the user).

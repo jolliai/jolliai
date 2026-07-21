@@ -3,26 +3,34 @@
  *
  * Asserts the v5 spec-compliant cross-platform shape:
  *
- * - One byte-identical SKILL.md written to both `.claude/skills/<name>/` and
- *   `.agents/skills/<name>/` per skill.
+ * - A full `jolli enable` writes one SKILL.md per skill into the cross-platform
+ *   `.agents/skills/<name>/` target ONLY. Claude Code (`.claude/skills/`) is owned
+ *   by the plugin now, so it is never a full-enable write target.
  * - Frontmatter contains only the spec-allowed fields (`name`, `description`,
  *   `metadata`) — no Claude-private fields like `argument-hint` or `user-invocable`.
  * - The invocation block uses a here-doc with an LLM-generated high-entropy
  *   delimiter (`JOLLI_ARG_<DELIM>_END`) and `--arg-stdin`, NOT a fixed string,
  *   NOT `$ARGUMENTS` argv interpolation, NOT a double-quoted argv string.
- * - The Claude-target gate (`config.claudeEnabled === false`) skips
- *   `.claude/skills/` but still writes `.agents/skills/`.
+ * - The plugin bootstrap owns `.claude/skills/`: {@link installPluginJolliMenu}
+ *   writes the bare `/jolli` umbrella there, {@link removeClaudeLegacySkills}
+ *   deletes pre-plugin unnamespaced `jolli-*` copies.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	buildJolliMenuSkillTemplate,
 	buildLocalRunSkillTemplate,
+	buildPluginJolliMenuSkillTemplate,
 	buildRecallSkillTemplate,
 	buildRemoteRunSkillTemplate,
 	buildSearchSkillTemplate,
+	installPluginJolliMenu,
+	JOLLI_MENU_GIT_EXCLUDE_PATHS,
+	PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS,
+	removeClaudeLegacySkills,
+	removePluginJolliMenu,
 	SKILL_GIT_EXCLUDE_PATHS,
 	updateSkillIfNeeded,
 	updateSkillsIfNeeded,
@@ -45,32 +53,32 @@ afterEach(() => {
 
 // ─── Convenience readers ────────────────────────────────────────────────────
 
-function readRecall(target: "claude" | "agents" = "claude"): string {
+function readRecall(target: "claude" | "agents" = "agents"): string {
 	const dir = target === "claude" ? ".claude/skills/jolli-recall" : ".agents/skills/jolli-recall";
 	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
 }
 
-function readSearch(target: "claude" | "agents" = "claude"): string {
+function readSearch(target: "claude" | "agents" = "agents"): string {
 	const dir = target === "claude" ? ".claude/skills/jolli-search" : ".agents/skills/jolli-search";
 	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
 }
 
-function readPr(target: "claude" | "agents" = "claude"): string {
+function readPr(target: "claude" | "agents" = "agents"): string {
 	const dir = target === "claude" ? ".claude/skills/jolli-pr" : ".agents/skills/jolli-pr";
 	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
 }
 
-function readJolli(target: "claude" | "agents" = "claude"): string {
+function readJolli(target: "claude" | "agents" = "agents"): string {
 	const dir = target === "claude" ? ".claude/skills/jolli" : ".agents/skills/jolli";
 	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
 }
 
-function readLocalRun(target: "claude" | "agents" = "claude"): string {
+function readLocalRun(target: "claude" | "agents" = "agents"): string {
 	const dir = target === "claude" ? ".claude/skills/jolli-local-run" : ".agents/skills/jolli-local-run";
 	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
 }
 
-function readRemoteRun(target: "claude" | "agents" = "claude"): string {
+function readRemoteRun(target: "claude" | "agents" = "agents"): string {
 	const dir = target === "claude" ? ".claude/skills/jolli-remote-run" : ".agents/skills/jolli-remote-run";
 	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
 }
@@ -78,64 +86,40 @@ function readRemoteRun(target: "claude" | "agents" = "claude"): string {
 // ─── Dual-target write ──────────────────────────────────────────────────────
 
 describe("updateSkillsIfNeeded — target dimension", () => {
-	it("writes all six skills into both .claude/skills/ and .agents/skills/", async () => {
+	it("writes all six skills into .agents/skills/ and NEVER into .claude/skills/", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(true);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(true);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(true);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-local-run/SKILL.md"))).toBe(true);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-remote-run/SKILL.md"))).toBe(true);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli/SKILL.md"))).toBe(true);
+		// Cross-platform target: all six present.
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-local-run/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-remote-run/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli/SKILL.md"))).toBe(true);
+		// Claude Code target: owned by the plugin now — a full enable writes nothing here.
+		expect(existsSync(join(tempDir, ".claude/skills"))).toBe(false);
 	});
 
-	it("writes byte-identical SKILL.md to .claude/skills/ and .agents/skills/", async () => {
-		await updateSkillsIfNeeded(tempDir);
-		expect(readRecall("claude")).toBe(readRecall("agents"));
-		expect(readSearch("claude")).toBe(readSearch("agents"));
-		expect(readPr("claude")).toBe(readPr("agents"));
-		expect(readLocalRun("claude")).toBe(readLocalRun("agents"));
-		expect(readRemoteRun("claude")).toBe(readRemoteRun("agents"));
-		expect(readJolli("claude")).toBe(readJolli("agents"));
-	});
-
-	it("with claudeEnabled=false, skips .claude/skills/ but still writes .agents/skills/", async () => {
+	it("with claudeEnabled=false, still writes .agents/skills/ (Claude is no longer a target to gate)", async () => {
 		await updateSkillsIfNeeded(tempDir, { claudeEnabled: false });
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(false);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(false);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(false);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-local-run/SKILL.md"))).toBe(false);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-remote-run/SKILL.md"))).toBe(false);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-local-run/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-remote-run/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli/SKILL.md"))).toBe(true);
+		// claudeEnabled=false never produced a .claude/skills/ write and still doesn't.
+		expect(existsSync(join(tempDir, ".claude/skills"))).toBe(false);
 	});
 
-	it("with claudeEnabled=undefined (default), writes both targets for all skills", async () => {
+	it("with claudeEnabled=undefined (default), writes the .agents target for all skills", async () => {
 		await updateSkillsIfNeeded(tempDir, {});
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".claude/skills"))).toBe(false);
 	});
 
-	it("exports the 12 git-exclude paths for the six skills × two targets", () => {
+	it("exports the 6 git-exclude paths for the six skills (agents target only)", () => {
 		expect(SKILL_GIT_EXCLUDE_PATHS).toEqual([
-			"/.claude/skills/jolli-recall/",
-			"/.claude/skills/jolli-search/",
-			"/.claude/skills/jolli-pr/",
-			"/.claude/skills/jolli-local-run/",
-			"/.claude/skills/jolli-remote-run/",
-			"/.claude/skills/jolli/",
 			"/.agents/skills/jolli-recall/",
 			"/.agents/skills/jolli-search/",
 			"/.agents/skills/jolli-pr/",
@@ -143,6 +127,8 @@ describe("updateSkillsIfNeeded — target dimension", () => {
 			"/.agents/skills/jolli-remote-run/",
 			"/.agents/skills/jolli/",
 		]);
+		// No .claude/skills/ line — a full enable no longer writes there.
+		expect(SKILL_GIT_EXCLUDE_PATHS.some((p) => p.startsWith("/.claude/"))).toBe(false);
 	});
 
 	it("renders a parseable metadata.revision for every installed skill", async () => {
@@ -153,7 +139,6 @@ describe("updateSkillsIfNeeded — target dimension", () => {
 		await updateSkillsIfNeeded(tempDir);
 		const revisionLine = /\n {2}revision: \d+\n/;
 		for (const read of [readRecall, readSearch, readPr, readLocalRun, readRemoteRun, readJolli]) {
-			expect(read("claude")).toMatch(revisionLine);
 			expect(read("agents")).toMatch(revisionLine);
 		}
 	});
@@ -1109,25 +1094,24 @@ describe("legacy directories", () => {
 	it("upserts search even when recall already exists at the current version", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const fs = await import("node:fs");
-		fs.rmSync(join(tempDir, ".claude/skills/jolli-search"), { recursive: true, force: true });
+		fs.rmSync(join(tempDir, ".agents/skills/jolli-search"), { recursive: true, force: true });
 		await updateSkillsIfNeeded(tempDir);
-		expect(fs.existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(true);
+		expect(fs.existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
 	});
 
-	it("backward-compat alias updateSkillIfNeeded installs all skills into both targets", async () => {
+	it("backward-compat alias updateSkillIfNeeded installs all skills into the .agents target", async () => {
 		await updateSkillIfNeeded(tempDir);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(true);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(true);
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-pr/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-pr/SKILL.md"))).toBe(true);
+		// Never writes the Claude Code target (plugin owns it).
+		expect(existsSync(join(tempDir, ".claude/skills"))).toBe(false);
 	});
 
-	it("backward-compat alias respects claudeEnabled=false", async () => {
+	it("backward-compat alias writes the .agents target regardless of claudeEnabled", async () => {
 		await updateSkillIfNeeded(tempDir, { claudeEnabled: false });
-		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(false);
 		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".claude/skills"))).toBe(false);
 	});
 });
 
@@ -1148,8 +1132,8 @@ describe("revision-based idempotency", () => {
 		// the one-time migration onto revision-based tracking.
 		const fs = await import("node:fs");
 		const planted = `---\nname: jolli-recall\njolli-skill-version: ${CURRENT_VERSION}\n---\nlegacy body`;
-		fs.mkdirSync(join(tempDir, ".claude/skills/jolli-recall"), { recursive: true });
-		fs.writeFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), planted, "utf-8");
+		fs.mkdirSync(join(tempDir, ".agents/skills/jolli-recall"), { recursive: true });
+		fs.writeFileSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"), planted, "utf-8");
 		await updateSkillsIfNeeded(tempDir);
 		expect(readRecall()).not.toBe(planted);
 		expect(readRecall()).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}revision: \d+/);
@@ -1158,8 +1142,8 @@ describe("revision-based idempotency", () => {
 	it("overwrites a file whose revision is lower than ours", async () => {
 		const fs = await import("node:fs");
 		const planted = `---\nname: jolli-recall\nmetadata:\n  version: "0.0.0"\n  revision: 0\n  vendor: "jolli.ai"\n---\nold body`;
-		fs.mkdirSync(join(tempDir, ".claude/skills/jolli-recall"), { recursive: true });
-		fs.writeFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), planted, "utf-8");
+		fs.mkdirSync(join(tempDir, ".agents/skills/jolli-recall"), { recursive: true });
+		fs.writeFileSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"), planted, "utf-8");
 		await updateSkillsIfNeeded(tempDir);
 		expect(readRecall()).not.toBe(planted);
 		expect(readRecall()).toMatch(/Every commit deserves a Memory/);
@@ -1168,10 +1152,266 @@ describe("revision-based idempotency", () => {
 	it("does NOT downgrade a file whose revision is higher than ours (newer tool wins)", async () => {
 		const fs = await import("node:fs");
 		const planted = `---\nname: jolli-recall\nmetadata:\n  version: "9.9.9"\n  revision: 999\n  vendor: "jolli.ai"\n---\ncontent from a newer tool`;
-		fs.mkdirSync(join(tempDir, ".claude/skills/jolli-recall"), { recursive: true });
-		fs.writeFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), planted, "utf-8");
+		fs.mkdirSync(join(tempDir, ".agents/skills/jolli-recall"), { recursive: true });
+		fs.writeFileSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"), planted, "utf-8");
 		await updateSkillsIfNeeded(tempDir);
 		// Left untouched — never downgrade a newer revision.
 		expect(readRecall()).toBe(planted);
+	});
+
+	it("does NOT overwrite a user-authored SKILL.md that carries no Jolli ownership marker", async () => {
+		// A user who happens to name a skill `jolli` (or any Jolli name) in the
+		// `.agents/skills/` target has neither the modern `vendor: "jolli.ai"` metadata
+		// nor the legacy `jolli-skill-version:` marker, and no revision line — so without
+		// the ownership guard the downgrade path (PREHISTORIC < ours) would clobber it. It
+		// must be left byte-for-byte intact. (This full-enable path runs on every VS Code /
+		// IntelliJ session start, so this is the data-loss it prevents.)
+		const fs = await import("node:fs");
+		const planted = `---\nname: jolli\ndescription: my own jolli command\n---\nuser body, not Jolli's`;
+		fs.mkdirSync(join(tempDir, ".agents/skills/jolli"), { recursive: true });
+		fs.writeFileSync(join(tempDir, ".agents/skills/jolli/SKILL.md"), planted, "utf-8");
+		await updateSkillsIfNeeded(tempDir);
+		expect(readJolli("agents")).toBe(planted);
+	});
+});
+
+// ─── Plugin bare /jolli umbrella ────────────────────────────────────────────
+
+describe("buildPluginJolliMenuSkillTemplate", () => {
+	it("is spec-compliant and routes to the plugin's namespaced /jolli:* skills", () => {
+		const tpl = buildPluginJolliMenuSkillTemplate();
+		expect(tpl).toMatch(/^---\nname: jolli\n/);
+		expect(tpl).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}revision: \d+\n {2}vendor: "jolli\.ai"/);
+		// Routes to the namespaced plugin skills, not the unnamespaced siblings.
+		for (const s of ["jolli:init", "jolli:recall", "jolli:search", "jolli:push"]) {
+			expect(tpl).toContain(s);
+		}
+		// The plugin no longer ships a /jolli:pr skill — the menu must not route to it.
+		expect(tpl).not.toContain("jolli:pr");
+		// No Claude-private frontmatter fields.
+		expect(tpl).not.toMatch(/^argument-hint:/m);
+		expect(tpl).not.toMatch(/^user-invocable:/m);
+	});
+
+	it("leads the menu with /jolli:init on a fresh (0-memory) repo instead of empty recall/search", () => {
+		const tpl = buildPluginJolliMenuSkillTemplate();
+		// The 0-memory ordering rule must name storedMemories, put /jolli:init first,
+		// and justify demoting recall/search (they would only return empty).
+		expect(tpl).toMatch(/when\s+`storedMemories`\s+is 0, lead with `\/jolli:init` as the FIRST/);
+		expect(tpl).toMatch(/demote recall \/ search/);
+	});
+
+	it("renders the CLI-style snapshot: syncing · Space line (gated on `space`) + a listening closer", () => {
+		const tpl = buildPluginJolliMenuSkillTemplate();
+		// Reads the new `space` status field and renders the sync line from it.
+		expect(tpl).toContain("`space`");
+		expect(tpl).toContain('✓ syncing · Space "<space.name>"');
+		// The sync line is gated on a non-null space (unbound → drop the line, no "not bound").
+		expect(tpl).toMatch(/only when `space` is\s+non-null/);
+		// The closer mirrors the CLI front door, both phrasings present.
+		expect(tpl).toContain("Jolli is listening — last memory saved.");
+		expect(tpl).toMatch(/your next commit is your\s+first memory/);
+	});
+
+	it("derives 'can generate' provider-aware so a local-agent repo is not pushed into setup", () => {
+		const tpl = buildPluginJolliMenuSkillTemplate();
+		// Must honor the local-agent default (generation with no key / no sign-in),
+		// not the old blind signedIn||jolliKey||anthropicKey OR that shoved a fresh
+		// plugin repo into /jolli:init even though it can already generate.
+		expect(tpl).toContain("can generate memories");
+		expect(tpl).toContain("`local-agent` → **yes**");
+		// A pinned provider is satisfied only by its own credential.
+		expect(tpl).toMatch(/`jolli` → yes only if\s+`account\.jolliApiKeyConfigured`/);
+		expect(tpl).toMatch(/`anthropic` → yes only if `account\.anthropicKeyConfigured`/);
+		// A bare OAuth token is a sync credential, not a generation one.
+		expect(tpl).toMatch(/`account\.signedIn` alone does NOT count/);
+		// The setup branch keys off generation capability, not "no credential".
+		expect(tpl).toContain("OR memories can't be generated");
+	});
+});
+
+describe("installPluginJolliMenu", () => {
+	it("writes the bare /jolli umbrella to the Claude target only", async () => {
+		await installPluginJolliMenu(tempDir);
+		const umbrella = join(tempDir, ".claude", "skills", "jolli", "SKILL.md");
+		expect(existsSync(umbrella)).toBe(true);
+		expect(readFileSync(umbrella, "utf-8")).toContain("jolli:recall");
+		// NOT written to the cross-platform target (those hosts lack `jolli:*`).
+		expect(existsSync(join(tempDir, ".agents", "skills", "jolli", "SKILL.md"))).toBe(false);
+		// And it writes ONLY the umbrella — not the unnamespaced sibling skills.
+		expect(existsSync(join(tempDir, ".claude", "skills", "jolli-recall", "SKILL.md"))).toBe(false);
+	});
+
+	it("leaves a user's own `jolli` skill (no vendor marker) untouched", async () => {
+		// A user who happens to name a skill `jolli` must not have it clobbered by
+		// the plugin's every-SessionStart bootstrap. Mirrors the symmetric guard in
+		// removePluginJolliMenu.
+		const dir = join(tempDir, ".claude", "skills", "jolli");
+		mkdirSync(dir, { recursive: true });
+		const userContent = "---\nname: jolli\n---\n\n# my own jolli skill (nothing to do with Jolli Memory)\n";
+		writeFileSync(join(dir, "SKILL.md"), userContent, "utf-8");
+
+		await installPluginJolliMenu(tempDir);
+
+		// The write is skipped — the user's file is preserved verbatim.
+		expect(readFileSync(join(dir, "SKILL.md"), "utf-8")).toBe(userContent);
+	});
+
+	it("refreshes an existing umbrella that carries our vendor marker", async () => {
+		// A stale Jolli-authored umbrella (vendor marker present, older/placeholder
+		// body) is ours to rewrite — the guard lets it through to upsertSkill.
+		const dir = join(tempDir, ".claude", "skills", "jolli");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "SKILL.md"), '---\nmetadata:\n  vendor: "jolli.ai"\n---\n\nstale\n', "utf-8");
+
+		await installPluginJolliMenu(tempDir);
+
+		// Overwritten with the current template (routes to jolli:recall).
+		expect(readFileSync(join(dir, "SKILL.md"), "utf-8")).toContain("jolli:recall");
+	});
+
+	it("RECLAIMS a legacy standalone umbrella (higher-revision plugin variant wins the slot)", async () => {
+		// Pre-upgrade a full `jolli enable` wrote the standalone menu (routes to the
+		// unnamespaced jolli-* siblings) into .claude/skills/jolli/. After the plugin
+		// deletes those siblings (removeClaudeLegacySkills), that standalone umbrella
+		// would point at nothing — so the plugin variant's revision must outrank it and
+		// overwrite it in place. Both carry the same vendor marker, so the ownership
+		// guard can't distinguish them; only the revision bump does.
+		const dir = join(tempDir, ".claude", "skills", "jolli");
+		mkdirSync(dir, { recursive: true });
+		const standalone = buildJolliMenuSkillTemplate();
+		writeFileSync(join(dir, "SKILL.md"), standalone, "utf-8");
+		// Sanity: the standalone menu routes to the unnamespaced sibling, not /jolli:*.
+		expect(standalone).toContain("jolli-recall");
+		expect(standalone).not.toContain("jolli:recall");
+
+		await installPluginJolliMenu(tempDir);
+
+		// Reclaimed: now the plugin variant (routes to the namespaced /jolli:* skills).
+		expect(readFileSync(join(dir, "SKILL.md"), "utf-8")).toContain("jolli:recall");
+	});
+
+	it("exports a single Claude-target git-exclude path for the umbrella", () => {
+		expect(PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS).toEqual(["/.claude/skills/jolli/"]);
+	});
+});
+
+describe("buildPluginJolliMenuSkillTemplate self-guard", () => {
+	it("instructs the model to verify a routing target exists before routing", () => {
+		const tpl = buildPluginJolliMenuSkillTemplate();
+		// A Step 0 gate must exist and mention self-removal for the leftover case.
+		expect(tpl).toContain("Step 0");
+		expect(tpl).toContain("rm -rf .claude/skills/jolli");
+		// The old "always present" claim (which routed to now-missing skills) is gone.
+		expect(tpl).not.toContain("Jolli plugin skills (always present)");
+	});
+
+	it("distinguishes a still-working CLI from a full uninstall (no false 'uninstalled')", () => {
+		const tpl = buildPluginJolliMenuSkillTemplate();
+		// Must probe the bundled CLI so a working CLI is never mis-reported as gone
+		// just because the plugin's menu isn't loaded in this session.
+		expect(tpl).toContain("$HOME/.jolli/jollimemory/run-cli");
+		// Both branches are spelled out explicitly.
+		expect(tpl).toContain("CLI present");
+		expect(tpl).toContain("CLI absent");
+	});
+});
+
+describe("removePluginJolliMenu", () => {
+	it("removes the umbrella from every target when it carries our vendor marker", async () => {
+		// A full `jolli enable` writes the umbrella to BOTH targets.
+		for (const dir of [".claude/skills/jolli", ".agents/skills/jolli"]) {
+			mkdirSync(join(tempDir, dir), { recursive: true });
+			writeFileSync(join(tempDir, dir, "SKILL.md"), 'metadata:\n  vendor: "jolli.ai"\n', "utf-8");
+		}
+
+		await removePluginJolliMenu(tempDir);
+
+		expect(existsSync(join(tempDir, ".claude", "skills", "jolli"))).toBe(false);
+		expect(existsSync(join(tempDir, ".agents", "skills", "jolli"))).toBe(false);
+	});
+
+	it("leaves a user's own `jolli` skill (no vendor marker) untouched", async () => {
+		const dir = join(tempDir, ".claude", "skills", "jolli");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "SKILL.md"), "# my own jolli skill\n", "utf-8");
+
+		await removePluginJolliMenu(tempDir);
+
+		expect(existsSync(join(dir, "SKILL.md"))).toBe(true);
+	});
+
+	it("is a no-op when no umbrella is present", async () => {
+		await expect(removePluginJolliMenu(tempDir)).resolves.toBeUndefined();
+	});
+
+	it("exports the umbrella exclude paths for the .agents target and the Claude Code slot", () => {
+		expect(JOLLI_MENU_GIT_EXCLUDE_PATHS).toEqual(["/.agents/skills/jolli/", "/.claude/skills/jolli/"]);
+	});
+});
+
+// ─── Plugin cleanup of legacy unnamespaced .claude/skills/jolli-* ────────────
+
+describe("removeClaudeLegacySkills", () => {
+	/** Plants a Jolli-owned SKILL.md (vendor marker) at .claude/skills/<name>/. */
+	function plantClaudeSkill(name: string, extra = ""): void {
+		const dir = join(tempDir, ".claude", "skills", name);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(
+			join(dir, "SKILL.md"),
+			`---\nname: ${name}\nmetadata:\n  vendor: "jolli.ai"\n---\n${extra}`,
+			"utf-8",
+		);
+	}
+
+	it("deletes the Jolli-owned unnamespaced jolli-* skills from .claude/skills/", async () => {
+		for (const name of ["jolli-recall", "jolli-search", "jolli-pr", "jolli-local-run", "jolli-remote-run"]) {
+			plantClaudeSkill(name);
+		}
+		await removeClaudeLegacySkills(tempDir);
+		for (const name of ["jolli-recall", "jolli-search", "jolli-pr", "jolli-local-run", "jolli-remote-run"]) {
+			expect(existsSync(join(tempDir, ".claude", "skills", name))).toBe(false);
+		}
+	});
+
+	it("deletes an ancient legacy dir recognized by its jolli-skill-version marker", async () => {
+		const dir = join(tempDir, ".claude", "skills", "jollimemory-recall");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(
+			join(dir, "SKILL.md"),
+			"---\nname: jollimemory-recall\njolli-skill-version: 0.1.0\n---\nold",
+			"utf-8",
+		);
+		await removeClaudeLegacySkills(tempDir);
+		expect(existsSync(dir)).toBe(false);
+	});
+
+	it("NEVER deletes the bare /jolli umbrella (the plugin overwrites it in place)", async () => {
+		plantClaudeSkill("jolli-recall");
+		plantClaudeSkill("jolli"); // the umbrella slot
+		await removeClaudeLegacySkills(tempDir);
+		expect(existsSync(join(tempDir, ".claude", "skills", "jolli-recall"))).toBe(false);
+		expect(existsSync(join(tempDir, ".claude", "skills", "jolli", "SKILL.md"))).toBe(true);
+	});
+
+	it("leaves a user-authored jolli-recall (no ownership marker) untouched", async () => {
+		const dir = join(tempDir, ".claude", "skills", "jolli-recall");
+		mkdirSync(dir, { recursive: true });
+		const userContent = "---\nname: jolli-recall\ndescription: my own thing\n---\nuser body";
+		writeFileSync(join(dir, "SKILL.md"), userContent, "utf-8");
+		await removeClaudeLegacySkills(tempDir);
+		expect(existsSync(join(dir, "SKILL.md"))).toBe(true);
+		expect(readFileSync(join(dir, "SKILL.md"), "utf-8")).toBe(userContent);
+	});
+
+	it("never touches the cross-platform .agents/skills/ target", async () => {
+		await updateSkillsIfNeeded(tempDir); // writes .agents/skills/jolli-*
+		await removeClaudeLegacySkills(tempDir);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
+	});
+
+	it("is a no-op when nothing is present", async () => {
+		await expect(removeClaudeLegacySkills(tempDir)).resolves.toBeUndefined();
 	});
 });

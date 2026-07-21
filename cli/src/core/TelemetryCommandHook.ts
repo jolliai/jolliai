@@ -56,14 +56,27 @@ let pending: { readonly command: string; readonly start: number } | null = null;
 let invokedRootCommand: string | null = null;
 
 /**
+ * Set by commands that run as a synchronous bootstrap (e.g. `enable
+ * --git-hooks-only` on every Claude Code SessionStart) where the ≤2s
+ * exit-flush adds latency to the critical path with no user-visible benefit.
+ */
+let forcedSkipExitFlush = false;
+
+/** Opt the current process out of the exit-flush (e.g. SessionStart bootstrap). */
+export function markSkipExitFlush(): void {
+	forcedSkipExitFlush = true;
+}
+
+/**
  * True when the resolved command belongs to the `telemetry` group, so the CLI's
  * exit-flush should be skipped: `telemetry off` clears the buffer and
  * `telemetry inspect` must not transmit. Derived from the commander-parsed
  * command (via `preAction`), not `process.argv[2]` — the positional check broke
- * silently the moment a global option preceded the subcommand.
+ * silently the moment a global option preceded the subcommand. Also true when
+ * a command explicitly opted out via {@link markSkipExitFlush}.
  */
 export function shouldSkipExitFlush(): boolean {
-	return invokedRootCommand === "telemetry";
+	return forcedSkipExitFlush || invokedRootCommand === "telemetry";
 }
 
 /** Register the `command_invoked` auto-emit hooks on the root program. */

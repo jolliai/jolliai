@@ -63,3 +63,9 @@ vscode/assets/graph/
 
 # Personal notes
 notes.md
+
+# claude-plugin ships these as part of the plugin package, but they are caught by
+# broad ignores above (.mcp.json at repo root; SKILL.md in the user's global
+# gitignore). Re-include them so the plugin is committed complete.
+!/claude-plugin/plugins/**/.mcp.json
+!/claude-plugin/plugins/**/SKILL.md

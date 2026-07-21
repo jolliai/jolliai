@@ -1,0 +1,10 @@
+{
+	"name": "jolli",
+	"displayName": "Jolli Memory",
+	"version": "1.0.0",
+	"description": "Automatically captures and generates project memory from your development work — team-shareable and synced across devices, so you can recall and search past decisions and context across sessions and agents. Backed by the jolli CLI bundled as an MCP server.",
+	"author": { "name": "jolli.ai", "url": "https://jolli.ai" },
+	"homepage": "https://jolli.ai",
+	"license": "Apache-2.0",
+	"keywords": ["memory", "recall", "pr", "git", "context"]
+}

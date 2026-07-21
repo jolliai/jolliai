@@ -21,23 +21,23 @@ class SkillInstallerTest {
     inner class UpdateSkillIfNeeded {
 
         @Test
-        fun `creates all three SKILL_md files in both target dirs`(@TempDir tempDir: File) {
+        fun `creates all three SKILL_md files in the agents target and never in claude`(@TempDir tempDir: File) {
             SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
 
-            for (root in listOf(".claude/skills", ".agents/skills")) {
-                for (name in SkillInstaller.SKILL_NAMES) {
-                    val skillFile = File(tempDir, "$root/$name/SKILL.md")
-                    skillFile.exists() shouldBe true
-                    skillFile.readText() shouldContain "name: $name"
-                }
+            for (name in SkillInstaller.SKILL_NAMES) {
+                val skillFile = File(tempDir, ".agents/skills/$name/SKILL.md")
+                skillFile.exists() shouldBe true
+                skillFile.readText() shouldContain "name: $name"
             }
+            // Claude Code target is owned by the plugin now — never written here.
+            File(tempDir, ".claude/skills").exists() shouldBe false
         }
 
         @Test
         fun `recall template carries spec-compliant frontmatter`(@TempDir tempDir: File) {
             SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
 
-            val content = File(tempDir, ".claude/skills/jolli-recall/SKILL.md").readText()
+            val content = File(tempDir, ".agents/skills/jolli-recall/SKILL.md").readText()
             content shouldContain "name: jolli-recall"
             content shouldContain "description:"
             content shouldContain "metadata:"
@@ -48,11 +48,12 @@ class SkillInstallerTest {
         }
 
         @Test
-        fun `claudeEnabled false skips claude target but still writes agents target`(@TempDir tempDir: File) {
+        fun `writes the agents target regardless of claudeEnabled`(@TempDir tempDir: File) {
             SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded(claudeEnabled = false)
 
-            File(tempDir, ".claude/skills/jolli-recall/SKILL.md").exists() shouldBe false
             File(tempDir, ".agents/skills/jolli-recall/SKILL.md").exists() shouldBe true
+            // claudeEnabled no longer gates a shipped target — nothing lands in .claude/skills.
+            File(tempDir, ".claude/skills").exists() shouldBe false
         }
 
         @Test
@@ -60,7 +61,7 @@ class SkillInstallerTest {
             val installer = SkillInstaller(tempDir.absolutePath)
 
             installer.updateSkillIfNeeded()
-            val skillFile = File(tempDir, ".claude/skills/jolli-recall/SKILL.md")
+            val skillFile = File(tempDir, ".agents/skills/jolli-recall/SKILL.md")
             val firstContent = skillFile.readText()
             val lastModified = skillFile.lastModified()
 
@@ -74,7 +75,7 @@ class SkillInstallerTest {
 
         @Test
         fun `upgrades a legacy revisionless file (prehistoric revision)`(@TempDir tempDir: File) {
-            val skillDir = File(tempDir, ".claude/skills/jolli-recall")
+            val skillDir = File(tempDir, ".agents/skills/jolli-recall")
             skillDir.mkdirs()
             val skillFile = File(skillDir, "SKILL.md")
             // Legacy format: no metadata.revision → treated as PREHISTORIC_REVISION → upgraded.
@@ -96,7 +97,7 @@ Old content
 
         @Test
         fun `does not downgrade a SKILL_md written by a newer revision`(@TempDir tempDir: File) {
-            val skillDir = File(tempDir, ".claude/skills/jolli-recall")
+            val skillDir = File(tempDir, ".agents/skills/jolli-recall")
             skillDir.mkdirs()
             val skillFile = File(skillDir, "SKILL.md")
             val newerContent = """---
@@ -117,6 +118,29 @@ Content from a newer tool.
         }
 
         @Test
+        fun `never overwrites a user-authored SKILL_md that lacks a Jolli ownership marker`(@TempDir tempDir: File) {
+            val skillDir = File(tempDir, ".agents/skills/jolli-recall")
+            skillDir.mkdirs()
+            val skillFile = File(skillDir, "SKILL.md")
+            // A completely user-authored file: no `vendor: "jolli.ai"`, no
+            // `jolli-skill-version:`, no revision — must NEVER be clobbered.
+            val userContent = """---
+name: jolli-recall
+description: My custom recall workflow
+---
+# My Custom Recall
+
+Do it my way.
+"""
+            skillFile.writeText(userContent)
+
+            SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
+
+            // User file untouched — the ownership guard prevents overwrite.
+            skillFile.readText() shouldBe userContent
+        }
+
+        @Test
         fun `deletes legacy skill directories`(@TempDir tempDir: File) {
             val legacy1 = File(tempDir, ".claude/skills/jollimemory-recall")
             val legacy2 = File(tempDir, ".claude/skills/jolli-memory-recall")
@@ -127,15 +151,17 @@ Content from a newer tool.
 
             SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
 
+            // Ancient .claude/skills legacy dirs are still cleaned up on write.
             legacy1.exists() shouldBe false
             legacy2.exists() shouldBe false
-            File(tempDir, ".claude/skills/jolli-recall/SKILL.md").exists() shouldBe true
+            // The shipped skill lands in the .agents target (not .claude).
+            File(tempDir, ".agents/skills/jolli-recall/SKILL.md").exists() shouldBe true
         }
 
         @Test
         fun `handles missing skills directory gracefully`(@TempDir tempDir: File) {
             SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
-            File(tempDir, ".claude/skills/jolli-pr/SKILL.md").exists() shouldBe true
+            File(tempDir, ".agents/skills/jolli-pr/SKILL.md").exists() shouldBe true
         }
     }
 

@@ -27,7 +27,13 @@ interface RunOpts {
 /**
  * Spawns the invocation, feeds `stdin`, and resolves stdout on exit 0.
  * Timeout → SIGTERM then (after grace) SIGKILL → LocalAgentTransientError.
- * Nonzero exit → LocalAgentSetupError carrying the stderr tail.
+ * Nonzero exit WITH stdout → still resolves stdout, because `claude -p
+ * --output-format json` reports auth/API failures as an `is_error` envelope on
+ * STDOUT while exiting 1; the backend's `parseResult` is the authority on that
+ * envelope (it classifies e.g. an expired-login failure into a LocalAgentAuthError
+ * with sign-in guidance). Only a nonzero exit with NO stdout — an opaque failure
+ * with nothing to interpret — rejects with LocalAgentSetupError carrying the
+ * stderr tail.
  */
 export function runInvocation(inv: Invocation, opts: RunOpts = {}): Promise<string> {
 	const spawnImpl = opts.spawnImpl ?? spawnHidden;
@@ -83,10 +89,25 @@ export function runInvocation(inv: Invocation, opts: RunOpts = {}): Promise<stri
 			// (often most relevant) character of the error message survives in the
 			// tail instead of being silently dropped.
 			stderr = (stderr + stderrDecoder.end()).slice(-STDERR_TAIL_MAX_CHARS);
-			if (code === 0) {
-				resolve(Buffer.concat(stdoutChunks).toString("utf8"));
+			const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+			// A clean exit always resolves. A NONZERO exit still resolves when the
+			// agent produced stdout: the failure detail lives in that stdout envelope
+			// (see the function docstring), and only the backend's parseResult can
+			// interpret it — discarding it here would strip an expired-login failure
+			// down to an opaque "exited with code 1" and bypass the auth
+			// classification entirely. Only a nonzero exit with NO stdout is a true
+			// opaque failure, and rejects with the code + stderr tail as before.
+			if (code === 0 || stdout.length > 0) {
+				if (code !== 0) {
+					log.warn(
+						"Local agent exited %s but produced stdout; deferring to the parser. stderr tail: %s",
+						code,
+						stderr,
+					);
+				}
+				resolve(stdout);
 			} else {
-				log.warn("Local agent exited %s; stderr tail: %s", code, stderr);
+				log.warn("Local agent exited %s with no stdout; stderr tail: %s", code, stderr);
 				reject(new LocalAgentSetupError(`Local agent exited with code ${code}. ${stderr.trim()}`));
 			}
 		});

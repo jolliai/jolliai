@@ -236,6 +236,23 @@ describe("AuthConfig", () => {
 			});
 		});
 
+		it("preserves an explicit aiProvider='local-agent' choice across a Jolli sign-in", async () => {
+			// The Claude Code plugin defaults to local-agent (memories run through the
+			// user's local `claude` subscription). Signing in to Jolli — done to bind
+			// and share a Space, NOT to change the summary engine — must leave that
+			// choice alone; otherwise summary generation would silently redirect to
+			// the Jolli proxy. Symmetric with the anthropic case above.
+			mockLoadConfig.mockResolvedValue({ aiProvider: "local-agent" });
+			mockSaveConfig.mockResolvedValue(undefined);
+			await saveAuthCredentials({ token: "tk-abc", jolliApiKey: VALID_KEY, jolliUrl: TEST_JOLLI_URL });
+			expect(mockSaveConfig).toHaveBeenCalledTimes(1);
+			expect(mockSaveConfig).toHaveBeenCalledWith({
+				authToken: "tk-abc",
+				jolliUrl: TEST_JOLLI_URL,
+				jolliApiKey: VALID_KEY,
+			});
+		});
+
 		it("re-asserts aiProvider='jolli' when current is already 'jolli' (idempotent)", async () => {
 			// Repeated sign-ins (e.g. after token expiry) keep the choice stable.
 			mockLoadConfig.mockResolvedValue({ aiProvider: "jolli" });

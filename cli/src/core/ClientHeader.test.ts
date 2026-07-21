@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { JOLLI_CLIENT_HEADER } from "./ClientHeader.js";
+import { isClaudePluginBuild, JOLLI_CLIENT_HEADER, resolveClientKind } from "./ClientHeader.js";
 
 describe("JOLLI_CLIENT_HEADER", () => {
 	it("resolves to <kind>/<version> from bundler-injected globals", () => {
@@ -18,5 +18,17 @@ describe("JOLLI_CLIENT_HEADER", () => {
 		// (it bumps every release) — pin the shape and the kind prefix.
 		expect(JOLLI_CLIENT_HEADER).toMatch(/^cli\/.+/);
 		expect(JOLLI_CLIENT_HEADER).not.toBe("cli/dev");
+	});
+});
+
+describe("resolveClientKind", () => {
+	it("returns the bundler-defined kind (cli in the CLI build / vitest)", () => {
+		expect(resolveClientKind()).toBe("cli");
+	});
+});
+
+describe("isClaudePluginBuild", () => {
+	it("returns false in the CLI build / vitest", () => {
+		expect(isClaudePluginBuild()).toBe(false);
 	});
 });

@@ -11,13 +11,15 @@ import { getJolliUrl } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { validateJolliApiKey } from "../core/JolliApiUtils.js";
-import { writeManualDisableFlag } from "../core/RepoProfile.js";
+import { readManualDisableFlag, writeManualDisableFlag } from "../core/RepoProfile.js";
 import { getGlobalConfigDir, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
+import { markSkipExitFlush } from "../core/TelemetryCommandHook.js";
 import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
+import { isValidSourceTag } from "../install/DistPathResolver.js";
 import { install, uninstall } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
-import type { JolliMemoryConfig } from "../Types.js";
+import type { InstallResult, JolliMemoryConfig } from "../Types.js";
 import { isInteractive, promptText, resolveProjectDir } from "./CliUtils.js";
 
 const log = createLogger("EnableCommand");
@@ -162,108 +164,202 @@ export function registerEnableCommand(program: Command): void {
 			"Set up MCP + skills + dispatch scripts only; install no git/agent hooks (for hosts that manage their own hooks, e.g. the IntelliJ plugin)",
 		)
 		.option(
+			"--git-hooks-only",
+			"Install ONLY the git hooks (+ dispatch scripts) that drive summary generation; set up no MCP/skills/agent hooks (for the Claude Code plugin, which ships those itself). Silent on success.",
+		)
+		.option(
 			"--source-tag <tag>",
 			"Override the dist-paths source tag (e.g. 'intellij') so this install coexists with other surfaces",
 		)
-		.action(async (options: { cwd: string; yes?: boolean; integrationsOnly?: boolean; sourceTag?: string }) => {
-			setLogDir(options.cwd);
+		.option(
+			"--reload-skills",
+			"After a --git-hooks-only bootstrap, emit a SessionStart reloadSkills signal on stdout so a freshly-written bare /jolli project skill is picked up THIS session (for the Claude Code plugin's SessionStart hook; ignored otherwise)",
+		)
+		.action(
+			async (options: {
+				cwd: string;
+				yes?: boolean;
+				integrationsOnly?: boolean;
+				gitHooksOnly?: boolean;
+				sourceTag?: string;
+				reloadSkills?: boolean;
+			}) => {
+				setLogDir(options.cwd);
 
-			// A jollimemory-spawned local agent (see AgentReentry) triggers the
-			// `jolli` Claude plugin's SessionStart hook, which runs this command
-			// against the agent's throwaway temp cwd. Installing hooks / claiming a
-			// Memory Bank repo there is pure self-recursion — bail before any work.
-			if (isLocalAgentChild()) {
-				log.info("'enable' skipped — running inside a jollimemory-spawned local agent");
-				return;
-			}
-
-			log.info("Running 'enable' command");
-			const result = await install(options.cwd, {
-				source: "cli",
-				integrationsOnly: options.integrationsOnly,
-				sourceTag: options.sourceTag,
-			});
-
-			if (result.success) {
-				track("surface_enabled", { trigger: "cli" });
-				// Explicit enable clears any repo-wide manual-disable opt-out so a
-				// later upgrade / window reload keeps the feature on. Skipped for
-				// integrations-only (IntelliJ's MCP-only setup), which is not a full
-				// enable. Written unconditionally otherwise — profile.json is
-				// machine-local and gitignored.
-				if (!options.integrationsOnly) {
-					await writeManualDisableFlag(options.cwd, false);
+				// A jollimemory-spawned local agent (see AgentReentry) triggers the
+				// `jolli` Claude plugin's SessionStart hook, which runs this command
+				// against the agent's throwaway temp cwd. Installing hooks / claiming a
+				// Memory Bank repo there is pure self-recursion — bail before any work.
+				if (isLocalAgentChild()) {
+					log.info("'enable' skipped — running inside a jollimemory-spawned local agent");
+					return;
 				}
-				if (options.integrationsOnly) {
-					console.log("\n  Jolli Memory integrations enabled (MCP + skills; no hooks installed).\n");
-				} else {
-					console.log("\n  Jolli Memory enabled successfully!\n");
-					console.log("  Hooks installed:");
-					console.log(`    - Git post-commit hook (${result.gitHookPath ?? ".git/hooks/post-commit"})`);
-					console.log(
-						`    - Git post-rewrite hook (${result.postRewriteHookPath ?? ".git/hooks/post-rewrite"})`,
-					);
-					console.log(
-						`    - Git prepare-commit-msg hook (${result.prepareMsgHookPath ?? ".git/hooks/prepare-commit-msg"})`,
-					);
-					console.log(`    - Git post-merge hook (${result.postMergeHookPath ?? ".git/hooks/post-merge"})`);
-					console.log(`    - Git pre-push hook (${result.prePushHookPath ?? ".git/hooks/pre-push"})`);
-					console.log(
-						`    - Claude Code hooks (${result.claudeSettingsPath ?? ".claude/settings.local.json"})`,
-					);
-					if (result.geminiSettingsPath) {
-						console.log(`    - Gemini CLI hook (${result.geminiSettingsPath})`);
+
+				if (options.integrationsOnly && options.gitHooksOnly) {
+					console.error("\n  Error: --integrations-only and --git-hooks-only are mutually exclusive.\n");
+					process.exitCode = 1;
+					return;
+				}
+
+				// The git-hooks-only path runs as the Claude Code plugin's SessionStart
+				// bootstrap on every session — skip the ≤2s telemetry exit-flush so it
+				// doesn't add latency to the synchronous startup path.
+				if (options.gitHooksOnly) {
+					markSkipExitFlush();
+
+					// A repo the user explicitly turned off (`jolli disable`) records a
+					// repo-wide manual-disable opt-out. Unlike a full `enable`, this
+					// bootstrap re-runs on EVERY SessionStart, so without this gate it
+					// would silently reinstall the git hooks and defeat the opt-out. Honor
+					// it here — mirroring the VS Code activation gate — so the manual
+					// disable stays the highest-priority signal. A full `enable` still
+					// clears the flag (reportEnableResult), so an explicit re-enable wins.
+					// Stay silent on exit 0: the plugin injects this path's stdout into the
+					// agent context, so skipping must be as quiet as a successful install.
+					if (await readManualDisableFlag(options.cwd)) {
+						log.info("'enable --git-hooks-only' skipped — repo manually disabled");
+						return;
 					}
 				}
 
-				for (const warning of result.warnings) {
-					console.warn(`  Warning: ${warning}`);
+				if (options.sourceTag !== undefined && !isValidSourceTag(options.sourceTag)) {
+					// The tag becomes a dist-paths filename and a JOLLI_DIST_PREFER_SOURCE=
+					// shell env value in generated git hooks — reject anything that isn't a
+					// safe path segment / shell token before it reaches either.
+					console.error(
+						"\n  Error: --source-tag must be lowercase alphanumerics and hyphens only (e.g. 'intellij').\n",
+					);
+					process.exitCode = 1;
+					return;
 				}
 
-				if (!options.integrationsOnly) {
-					console.log("\n  IMPORTANT: Restart your AI agent session for the hooks to take effect.");
-				}
-				console.log("  Run 'jolli doctor' to verify installation.");
+				log.info("Running 'enable' command");
+				const result = await install(options.cwd, {
+					source: "cli",
+					integrationsOnly: options.integrationsOnly,
+					gitHooksOnly: options.gitHooksOnly,
+					sourceTag: options.sourceTag,
+				});
 
-				// Onboarding disclosure: telemetry is opt-out, so state it plainly here
-				// (the once-only first-run banner also covers non-enable first commands).
-				console.log("\n  Telemetry: anonymous, content-free usage data is on by default to improve");
-				console.log("  Jolli Memory (never your code, paths, or memory content). Turn it off with");
-				console.log("  'jolli telemetry off' (or DO_NOT_TRACK=1) · https://www.jolli.ai/telemetry");
-
-				// Step 2: Interactive API key configuration
-				if (isInteractive() && !options.yes) {
-					await promptSetup();
-				} else {
-					// Non-interactive: print manual config guide
-					const configDir = getGlobalConfigDir();
-					console.log("\n  Configure a provider to enable summarization:");
-					console.log(`    Edit: ${join(configDir, "config.json")}`);
-					console.log('    - Set "apiKey" (Anthropic) and/or "jolliApiKey" (Jolli Space), or');
-					console.log('    - Set "aiProvider": "local-agent" to drive a local Claude Code CLI (no key)\n');
+				// git-hooks-only runs as the Claude Code plugin's SessionStart bootstrap
+				// on every session. Its stdout would be injected into the agent context,
+				// so stay silent on success (details go to debug.log) and never run the
+				// interactive setup / telemetry banner; only surface failures on stderr.
+				if (options.gitHooksOnly) {
+					if (result.success) {
+						log.info("git-hooks-only bootstrap complete");
+						// The Claude Code plugin's SessionStart hook runs this to write the
+						// bare `/jolli` project skill (installPluginJolliMenu). Claude Code
+						// enumerates skills BEFORE SessionStart hooks finish, so without a
+						// signal the freshly written `/jolli` would only appear next session.
+						// Emit the reloadSkills hookSpecificOutput as PURE JSON: on exit 0
+						// Claude Code parses it as structured output (NOT injected into the
+						// agent context, unlike plain-text stdout) and re-scans the skill /
+						// command dirs AFTER all SessionStart hooks complete — so `/jolli` is
+						// invocable this same session. Gated on the flag so a manual
+						// `enable --git-hooks-only` (e.g. from /jolli:init) stays silent.
+						if (options.reloadSkills) {
+							process.stdout.write(
+								JSON.stringify({
+									hookSpecificOutput: { hookEventName: "SessionStart", reloadSkills: true },
+								}),
+							);
+						}
+					} else {
+						console.error(`Jolli git-hooks bootstrap failed: ${result.message}`);
+						process.exitCode = 1;
+					}
+					return;
 				}
 
-				// Pre-push sync catch-up (JOLLI-1900): retry any commits left in
-				// push-pending.json from a previous session. Runs after promptSetup so a
-				// user who just signed in gets their backlog pushed. Skipped in
-				// integrations-only mode (IntelliJ manages its own hook/worker). Fully
-				// guarded — never throws, no-ops when nothing is pending or not signed in.
-				if (!options.integrationsOnly) {
-					triggerPendingPushRetry(options.cwd, "cli-enable");
-				}
+				await reportEnableResult(result, options);
+			},
+		);
+}
 
-				// Historical back-fill is no longer kicked off automatically at enable
-				// time — it is user-driven now (VS Code cold-start card, or the manual
-				// `jolli backfill` command) so nothing spends LLM budget without an
-				// explicit opt-in.
-			} else {
-				console.error(`\n  Error: ${result.message}\n`);
-				process.exitCode = 1;
-				for (const warning of result.warnings) {
-					console.warn(`  Warning: ${warning}`);
-				}
+/**
+ * Prints the human-facing outcome of a full `jolli enable` (non git-hooks-only)
+ * and, when interactive, runs the API-key setup flow. Extracted from the action
+ * so the git-hooks-only bootstrap path can stay silent.
+ */
+async function reportEnableResult(
+	result: InstallResult,
+	options: { cwd: string; yes?: boolean; integrationsOnly?: boolean },
+): Promise<void> {
+	if (result.success) {
+		track("surface_enabled", { trigger: "cli" });
+		// Explicit enable clears any repo-wide manual-disable opt-out so a later
+		// upgrade / window reload keeps the feature on. Skipped for integrations-only
+		// (IntelliJ's MCP-only setup), which is not a full enable. Written
+		// unconditionally otherwise — profile.json is machine-local and gitignored.
+		if (!options.integrationsOnly) {
+			await writeManualDisableFlag(options.cwd, false);
+		}
+		if (options.integrationsOnly) {
+			console.log("\n  Jolli Memory integrations enabled (MCP + skills; no hooks installed).\n");
+		} else {
+			console.log("\n  Jolli Memory enabled successfully!\n");
+			console.log("  Hooks installed:");
+			console.log(`    - Git post-commit hook (${result.gitHookPath ?? ".git/hooks/post-commit"})`);
+			console.log(`    - Git post-rewrite hook (${result.postRewriteHookPath ?? ".git/hooks/post-rewrite"})`);
+			console.log(
+				`    - Git prepare-commit-msg hook (${result.prepareMsgHookPath ?? ".git/hooks/prepare-commit-msg"})`,
+			);
+			console.log(`    - Git post-merge hook (${result.postMergeHookPath ?? ".git/hooks/post-merge"})`);
+			console.log(`    - Git pre-push hook (${result.prePushHookPath ?? ".git/hooks/pre-push"})`);
+			console.log(`    - Claude Code hooks (${result.claudeSettingsPath ?? ".claude/settings.local.json"})`);
+			if (result.geminiSettingsPath) {
+				console.log(`    - Gemini CLI hook (${result.geminiSettingsPath})`);
 			}
-		});
+		}
+
+		for (const warning of result.warnings) {
+			console.warn(`  Warning: ${warning}`);
+		}
+
+		if (!options.integrationsOnly) {
+			console.log("\n  IMPORTANT: Restart your AI agent session for the hooks to take effect.");
+		}
+		console.log("  Run 'jolli doctor' to verify installation.");
+
+		// Onboarding disclosure: telemetry is opt-out, so state it plainly here
+		// (the once-only first-run banner also covers non-enable first commands).
+		console.log("\n  Telemetry: anonymous, content-free usage data is on by default to improve");
+		console.log("  Jolli Memory (never your code, paths, or memory content). Turn it off with");
+		console.log("  'jolli telemetry off' (or DO_NOT_TRACK=1) · https://www.jolli.ai/telemetry");
+
+		// Step 2: Interactive API key configuration
+		if (isInteractive() && !options.yes) {
+			await promptSetup();
+		} else {
+			// Non-interactive: print manual config guide
+			const configDir = getGlobalConfigDir();
+			console.log("\n  Configure a provider to enable summarization:");
+			console.log(`    Edit: ${join(configDir, "config.json")}`);
+			console.log('    - Set "apiKey" (Anthropic) and/or "jolliApiKey" (Jolli Space), or');
+			console.log('    - Set "aiProvider": "local-agent" to drive a local Claude Code CLI (no key)\n');
+		}
+
+		// Pre-push sync catch-up (JOLLI-1900): retry any commits left in
+		// push-pending.json from a previous session. Runs after promptSetup so a
+		// user who just signed in gets their backlog pushed. Skipped in
+		// integrations-only mode (IntelliJ manages its own hook/worker). Fully
+		// guarded — never throws, no-ops when nothing is pending or not signed in.
+		if (!options.integrationsOnly) {
+			triggerPendingPushRetry(options.cwd, "cli-enable");
+		}
+
+		// Historical back-fill is no longer kicked off automatically at enable
+		// time — it is user-driven now (VS Code cold-start card, or the manual
+		// `jolli backfill` command) so nothing spends LLM budget without an
+		// explicit opt-in.
+	} else {
+		console.error(`\n  Error: ${result.message}\n`);
+		process.exitCode = 1;
+		for (const warning of result.warnings) {
+			console.warn(`  Warning: ${warning}`);
+		}
+	}
 }
 
 /** Registers the `disable` command on the given Commander program. */
