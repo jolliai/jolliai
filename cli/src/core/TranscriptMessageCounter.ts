@@ -30,6 +30,7 @@ import { readClineTranscript } from "./ClineTranscriptReader.js";
 import { applyOverlay, loadOverlay } from "./ConversationOverlayStore.js";
 import { readCopilotChatTranscript } from "./CopilotChatTranscriptReader.js";
 import { readCopilotTranscript } from "./CopilotTranscriptReader.js";
+import { readCursorCliTranscript } from "./CursorCliTranscriptReader.js";
 import { readCursorTranscript } from "./CursorTranscriptReader.js";
 import { readDevinTranscript } from "./DevinTranscriptReader.js";
 import { readGeminiTranscript } from "./GeminiTranscriptReader.js";
@@ -134,6 +135,8 @@ async function readUnreadTranscript(
 			return readCopilotTranscript(transcriptPath, cursor);
 		case "devin":
 			return readDevinTranscript(transcriptPath, cursor);
+		case "cursor-cli":
+			return readCursorCliTranscript(transcriptPath, cursor);
 		case "copilot-chat":
 			return readCopilotChatTranscript(transcriptPath, cursor ?? undefined);
 		case "cline":

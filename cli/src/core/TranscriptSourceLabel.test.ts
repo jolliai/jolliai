@@ -7,6 +7,7 @@ describe("transcriptSourceLabel", () => {
 		expect(transcriptSourceLabel("claude")).toBe("Claude");
 		expect(transcriptSourceLabel("codex")).toBe("Codex");
 		expect(transcriptSourceLabel("cursor")).toBe("Cursor");
+		expect(transcriptSourceLabel("cursor-cli")).toBe("Cursor CLI");
 		// Note: 'Copilot' not 'Copilot CLI' — matches the pre-existing
 		// TranscriptEntryRenderer.ts getSourceLabel behavior.
 		expect(transcriptSourceLabel("copilot")).toBe("Copilot");

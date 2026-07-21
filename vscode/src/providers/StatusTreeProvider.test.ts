@@ -832,6 +832,82 @@ describe("StatusTreeProvider", () => {
 		expect(devin?.description).toBe("detected & enabled (2 sessions)");
 	});
 
+	// ── Cursor CLI shares the Cursor toggle (merged, Copilot-style) ─────────
+
+	it("renders a separate 'Cursor CLI' warn row when cursorCliScanError is present", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					cursorCliDetected: true,
+					cursorEnabled: true,
+					cursorCliScanError: {
+						kind: "fs",
+						message: "permission denied",
+					},
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cursorCli = items.find((item) => item.label === "Cursor CLI");
+		expect(cursorCli?.description).toBe("unavailable — fs");
+		expect(String(cursorCli?.tooltip)).toContain("permission denied");
+		// No standalone "Cursor CLI Integration" row anymore.
+		expect(items.find((item) => item.label === "Cursor CLI Integration")).toBeUndefined();
+	});
+
+	it("merges cursor + cursor-cli sessions into a single Cursor row under the shared toggle", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					cursorDetected: true,
+					cursorCliDetected: true,
+					cursorEnabled: true,
+					sessionsBySource: { cursor: 3, "cursor-cli": 4 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cursor = items.find((item) => item.label === "Cursor Integration");
+		expect(cursor?.description).toBe("detected & enabled (7 sessions)");
+		expect(String(cursor?.tooltip)).toContain("IDE: ✓, CLI: ✓");
+		expect(items.find((item) => item.label === "Cursor CLI Integration")).toBeUndefined();
+	});
+
+	it("keeps the Cursor row detected when only the cursor-agent CLI is present", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					cursorDetected: false,
+					cursorCliDetected: true,
+					cursorEnabled: true,
+					sessionsBySource: { "cursor-cli": 4 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cursor = items.find((item) => item.label === "Cursor Integration");
+		expect(cursor?.description).toBe("detected & enabled (4 sessions)");
+		expect(String(cursor?.tooltip)).toContain("IDE: ✗, CLI: ✓");
+	});
+
 	// ── Antigravity scan error / healthy row ──────────────────────────────
 
 	it("renders an 'unavailable' Antigravity row when antigravityScanError is present", async () => {

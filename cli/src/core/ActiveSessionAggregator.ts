@@ -225,6 +225,7 @@ async function collectFromAllSources(cwd: string): Promise<CollectResult> {
 		loadCline(cwd),
 		loadClineCli(cwd),
 		loadDevin(cwd),
+		loadCursorCli(cwd),
 		loadAntigravity(cwd),
 	]);
 	const sessions: SessionInfo[] = [];
@@ -374,6 +375,21 @@ async function loadDevin(cwd: string): Promise<LoaderResult> {
 	} catch (err) {
 		log.warn("scanDevinSessions threw: %s", errMsg(err));
 		return { sessions: [], failed: ["devin"] };
+	}
+}
+
+async function loadCursorCli(cwd: string): Promise<LoaderResult> {
+	try {
+		const { scanCursorCliSessions } = await import("./CursorCliSessionDiscoverer.js");
+		const r = await scanCursorCliSessions(cwd);
+		if (r.error) {
+			log.warn("scanCursorCliSessions reported %s: %s", r.error.kind, r.error.message);
+			return { sessions: r.sessions, failed: ["cursor-cli"] };
+		}
+		return { sessions: r.sessions, failed: [] };
+	} catch (err) {
+		log.warn("scanCursorCliSessions threw: %s", errMsg(err));
+		return { sessions: [], failed: ["cursor-cli"] };
 	}
 }
 

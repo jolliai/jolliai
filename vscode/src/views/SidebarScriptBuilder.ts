@@ -4541,6 +4541,7 @@ export function buildSidebarScript(): string {
       case 'cline':        return 'Cline (VS Code)';
       case 'cline-cli':    return 'Cline CLI';
       case 'devin':        return 'Devin';
+      case 'cursor-cli':   return 'Cursor CLI';
       case 'antigravity':  return 'Antigravity';
       default:             return source;
     }
@@ -4622,6 +4623,8 @@ export function buildSidebarScript(): string {
   // Cline ships two transcript sources (VS Code extension + terminal CLI); both
   // wear the same robot-head mark, mirroring the copilot / copilot-chat pairing.
   SOURCE_ICON_SVG['cline-cli'] = SOURCE_ICON_SVG.cline;
+  // Cursor CLI (cursor-agent) reuses Cursor's brand mark, same pairing pattern.
+  SOURCE_ICON_SVG['cursor-cli'] = SOURCE_ICON_SVG.cursor;
 
   // Build the leading source glyph for a conversation row. Parses the trusted
   // constant via DOMParser (NOT innerHTML-for-content; CSP also forbids <img>

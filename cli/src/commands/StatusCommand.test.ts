@@ -292,6 +292,86 @@ describe("StatusCommand — Cline integration row", () => {
 	});
 });
 
+describe("StatusCommand — Cursor integration row (merged IDE + CLI)", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockLoadConfigFromDir.mockResolvedValue({});
+		mockLoadAuthToken.mockResolvedValue(null);
+		mockFrontDoor.mockResolvedValue({ status: "no_spaces" });
+		mockTenantOrigin.mockReturnValue(null);
+		mockLoadCache.mockResolvedValue(null);
+	});
+
+	afterEach(() => {
+		vi.clearAllMocks();
+	});
+
+	it("does not render Cursor row when neither IDE nor CLI is detected", async () => {
+		const out = await renderStatus({ ...baseStatus });
+		expect(out).not.toContain("Cursor");
+	});
+
+	it("renders a merged IDE + CLI session count", async () => {
+		const out = await renderStatus({
+			...baseStatus,
+			cursorDetected: true,
+			cursorCliDetected: true,
+			cursorEnabled: true,
+			sessionsBySource: { cursor: 2, "cursor-cli": 3 },
+		});
+		expect(out).toContain("Cursor");
+		expect(out).toMatch(/5\s*sessions/);
+	});
+
+	it("does NOT mask a healthy CLI when the IDE DB scan fails", async () => {
+		// Regression (P2): a broken IDE DB used to feed the merged row's scanError,
+		// whose early return marked the WHOLE Cursor integration "unavailable" and
+		// hid the healthy CLI's session count. IDE-only failure must now render as a
+		// non-masking sub-line while the main row keeps the CLI count.
+		const out = await renderStatus({
+			...baseStatus,
+			cursorDetected: true,
+			cursorCliDetected: true,
+			cursorEnabled: true,
+			cursorScanError: { kind: "locked", message: "database is locked" },
+			sessionsBySource: { "cursor-cli": 4 },
+		});
+		expect(out).not.toContain("unavailable");
+		expect(out).toMatch(/4\s*sessions/);
+		expect(out).toContain("IDE scan failed (locked)");
+		expect(out).toContain("database is locked");
+	});
+
+	it("renders a non-masking sub-line when only the CLI scan fails", async () => {
+		const out = await renderStatus({
+			...baseStatus,
+			cursorDetected: true,
+			cursorCliDetected: true,
+			cursorEnabled: true,
+			cursorCliScanError: { kind: "fs", message: "EACCES on projects/" },
+			sessionsBySource: { cursor: 2 },
+		});
+		expect(out).not.toContain("unavailable");
+		expect(out).toMatch(/2\s*sessions/);
+		expect(out).toContain("CLI scan failed (fs)");
+		expect(out).toContain("EACCES on projects/");
+	});
+
+	it("reads unavailable only when BOTH IDE and CLI scans fail", async () => {
+		const out = await renderStatus({
+			...baseStatus,
+			cursorDetected: true,
+			cursorCliDetected: true,
+			cursorEnabled: true,
+			cursorScanError: { kind: "locked", message: "database is locked" },
+			cursorCliScanError: { kind: "parse", message: "bad meta.json" },
+		});
+		expect(out).toContain("unavailable");
+		expect(out).toContain("IDE scan failed (locked)");
+		expect(out).toContain("CLI scan failed (parse)");
+	});
+});
+
 describe("StatusCommand — Jolli Site display", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();

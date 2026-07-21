@@ -233,7 +233,7 @@ describe("SummaryScriptBuilder", () => {
 
 	it("appends 'cursor' and 'copilot' to sourceOrder", () => {
 		expect(script).toContain(
-			"'claude', 'codex', 'gemini', 'opencode', 'cursor', 'copilot'",
+			"'claude', 'codex', 'gemini', 'opencode', 'cursor', 'cursor-cli', 'copilot'",
 		);
 	});
 
@@ -259,6 +259,11 @@ describe("SummaryScriptBuilder", () => {
 		expect(script).toMatch(/'cline-cli',\s*'devin'/);
 		expect(script).toContain("devin:");
 		expect(script).toContain('viewBox="0 0 30 34"');
+	});
+
+	it("places cursor-cli after cursor in source ordering and aliases its brand glyph", () => {
+		expect(script).toMatch(/'cursor',\s*'cursor-cli'/);
+		expect(script).toContain("SOURCE_ICON_SVG['cursor-cli'] = SOURCE_ICON_SVG.cursor");
 	});
 
 	describe("Regenerate summary re-render wiring", () => {

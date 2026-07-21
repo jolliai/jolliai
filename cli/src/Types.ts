@@ -21,6 +21,7 @@ export const TRANSCRIPT_SOURCES = [
 	"gemini",
 	"opencode",
 	"cursor",
+	"cursor-cli",
 	"copilot",
 	"copilot-chat",
 	"cline",
@@ -1119,7 +1120,12 @@ export interface JolliMemoryConfig {
 	readonly globalInstructions?: "enabled" | "disabled";
 	/** Enable OpenCode session discovery at post-commit time (default: auto-detect) */
 	readonly openCodeEnabled?: boolean;
-	/** Enable Cursor Composer session discovery at post-commit time (default: auto-detect) */
+	/**
+	 * Enable Cursor session discovery at post-commit time (default: auto-detect).
+	 * Shared by both Cursor forms — the Composer IDE and the cursor-agent CLI —
+	 * so there is one user-facing "Cursor" toggle (mirrors the shared
+	 * copilotEnabled flag for Copilot CLI + Chat).
+	 */
 	readonly cursorEnabled?: boolean;
 	/** Enable GitHub Copilot CLI session discovery at post-commit time (default: auto-detect) */
 	readonly copilotEnabled?: boolean;
@@ -1388,6 +1394,10 @@ export interface StatusInfo {
 	readonly devinEnabled?: boolean;
 	/** Devin DB scan failed with a real (non-ENOENT) error. Same UI semantics as cursorScanError. */
 	readonly devinScanError?: SqliteScanError;
+	/** Whether Cursor CLI's session store (~/.cursor/chats or cursor-agent equivalent) was detected */
+	readonly cursorCliDetected?: boolean;
+	/** Cursor CLI scan failed with a real (non-ENOENT) error. Same UI semantics as cursorScanError. */
+	readonly cursorCliScanError?: { readonly kind: "fs" | "parse"; readonly message: string };
 	/** Whether any Antigravity variant's conversations dir (under ~/.gemini) was detected */
 	readonly antigravityDetected?: boolean;
 	/** Whether Antigravity session discovery is enabled in config (undefined = auto-detect) */

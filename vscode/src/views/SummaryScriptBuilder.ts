@@ -2179,6 +2179,8 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
   // Cline's VS Code extension + terminal CLI share one robot-head mark, as
   // copilot / copilot-chat do above.
   SOURCE_ICON_SVG['cline-cli'] = SOURCE_ICON_SVG.cline;
+  // Cursor CLI (cursor-agent) reuses Cursor's brand mark, same pairing pattern.
+  SOURCE_ICON_SVG['cursor-cli'] = SOURCE_ICON_SVG.cursor;
 
   // Render inline conversation rows from the host's conversationsData payload.
   // Interpolated host-supplied strings (title/source/ids) go through esc(),
@@ -2379,7 +2381,7 @@ ${buildSourceLabelScript()}
       if (conversationsStats) {
         var sessionCounts = msg.sessionCounts || {};
         var parts = [];
-        var sourceOrder = ['claude', 'codex', 'gemini', 'opencode', 'cursor', 'copilot', 'copilot-chat', 'cline', 'cline-cli', 'devin', 'antigravity'];
+        var sourceOrder = ['claude', 'codex', 'gemini', 'opencode', 'cursor', 'cursor-cli', 'copilot', 'copilot-chat', 'cline', 'cline-cli', 'devin', 'antigravity'];
         for (var i = 0; i < sourceOrder.length; i++) {
           var source = sourceOrder[i];
           var count = sessionCounts[source] || 0;

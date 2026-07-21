@@ -46,6 +46,8 @@ import { readCopilotChatTranscript } from "../core/CopilotChatTranscriptReader.j
 import { isCopilotInstalled } from "../core/CopilotDetector.js";
 import { discoverCopilotSessions } from "../core/CopilotSessionDiscoverer.js";
 import { readCopilotTranscript } from "../core/CopilotTranscriptReader.js";
+import { discoverCursorCliSessions, isCursorCliInstalled } from "../core/CursorCliSessionDiscoverer.js";
+import { readCursorCliTranscript } from "../core/CursorCliTranscriptReader.js";
 import { isCursorInstalled } from "../core/CursorDetector.js";
 import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
@@ -3312,6 +3314,15 @@ async function loadSessionTranscripts(
 			log.info("Discovered %d Devin session(s)", devinSessions.length);
 		}
 	}
+	// Discover Cursor CLI (cursor-agent) sessions (on-demand scan of ~/.cursor/chats/*/*/meta.json).
+	// Shares cursorEnabled with the Composer IDE source (one user-facing toggle for "Cursor").
+	if (config.cursorEnabled !== false && (await isCursorCliInstalled())) {
+		const cursorCliSessions = await discoverCursorCliSessions(cwd);
+		if (cursorCliSessions.length > 0) {
+			allSessions = [...allSessions, ...cursorCliSessions];
+			log.info("Discovered %d Cursor CLI session(s)", cursorCliSessions.length);
+		}
+	}
 	// Discover Antigravity conversations (on-demand scan of ~/.gemini/<variant>/conversations/*.db,
 	// scoped by the workspace path recorded in each conversation db).
 	if (config.antigravityEnabled !== false && (await isAntigravityInstalled())) {
@@ -3602,6 +3613,13 @@ async function readAllTranscripts(
 				result = await readDevinTranscript(session.transcriptPath, cursor, beforeTimestamp);
 			} catch (error: unknown) {
 				log.error("Skipping Devin session %s: %s", session.sessionId, (error as Error).message);
+				continue;
+			}
+		} else if (source === "cursor-cli") {
+			try {
+				result = await readCursorCliTranscript(session.transcriptPath, cursor, beforeTimestamp);
+			} catch (error: unknown) {
+				log.error("Skipping Cursor CLI session %s: %s", session.sessionId, (error as Error).message);
 				continue;
 			}
 		} else if (source === "antigravity") {

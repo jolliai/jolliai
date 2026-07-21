@@ -35,6 +35,7 @@ const PARSE_LINE: Record<TranscriptSource, (line: string) => string | undefined>
 	cline: parseClineUserLine,
 	"cline-cli": parseClineCliUserLine,
 	devin: parseDevinUserLine,
+	"cursor-cli": parseCursorCliUserLine,
 	antigravity: parseAntigravityUserLine,
 };
 
@@ -168,6 +169,11 @@ function parseAntigravityUserLine(_line: string): string | undefined {
 
 function parseDevinUserLine(_line: string): string | undefined {
 	// Same as OpenCode: Devin sessions carry SessionInfo.title from the discoverer.
+	return undefined;
+}
+
+function parseCursorCliUserLine(_line: string): string | undefined {
+	// Cursor CLI sessions carry SessionInfo.title from the discoverer (meta.json.title).
 	return undefined;
 }
 

@@ -169,9 +169,11 @@ describe("SidebarScriptBuilder", () => {
 		for (const src of ["claude", "codex", "gemini", "cursor", "copilot", "opencode", "cline", "devin"]) {
 			expect(js).toContain(`${src}:`);
 		}
-		// copilot-chat reuses the Copilot mark; cline-cli reuses the Cline mark.
+		// copilot-chat reuses the Copilot mark; cline-cli reuses the Cline mark;
+		// cursor-cli reuses the Cursor mark.
 		expect(js).toContain("SOURCE_ICON_SVG['copilot-chat'] = SOURCE_ICON_SVG.copilot");
 		expect(js).toContain("SOURCE_ICON_SVG['cline-cli'] = SOURCE_ICON_SVG.cline");
+		expect(js).toContain("SOURCE_ICON_SVG['cursor-cli'] = SOURCE_ICON_SVG.cursor");
 		// Parsed as a trusted constant via DOMParser, not innerHTML.
 		expect(js).toContain("new DOMParser().parseFromString(markup, 'image/svg+xml')");
 		expect(js).not.toContain(".innerHTML = markup");

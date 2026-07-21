@@ -218,7 +218,8 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 	{
 		key: "cursorEnabled",
 		type: "boolean",
-		description: "Enable Cursor Composer session discovery (true/false; requires Node 22.5+ at runtime)",
+		description:
+			"Enable Cursor session discovery — Composer IDE + cursor-agent CLI (true/false; requires Node 22.5+ at runtime)",
 	},
 	{
 		key: "copilotEnabled",

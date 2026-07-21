@@ -128,6 +128,10 @@ describe("SettingsScriptBuilder", () => {
 		);
 	});
 
+	it("does not reference a separate cursorCliEnabled input (shares the Cursor toggle)", () => {
+		expect(script).not.toContain("cursorCliEnabled");
+	});
+
 	// ── DCO sign-off toggle ──
 
 	it("references the dcoSignoff DOM input", () => {

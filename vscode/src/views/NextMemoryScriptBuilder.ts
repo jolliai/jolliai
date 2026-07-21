@@ -135,6 +135,7 @@ export function buildNextMemoryScript(): string {
       case 'cline': return 'Cline (VS Code)';
       case 'cline-cli': return 'Cline CLI';
       case 'devin': return 'Devin';
+      case 'cursor-cli': return 'Cursor CLI';
       case 'antigravity': return 'Antigravity';
       default: return source;
     }
@@ -210,6 +211,8 @@ export function buildNextMemoryScript(): string {
   // Cline's VS Code extension + terminal CLI share the same robot-head mark,
   // as copilot / copilot-chat do above.
   SOURCE_ICON_SVG['cline-cli'] = SOURCE_ICON_SVG.cline;
+  // Cursor CLI (cursor-agent) reuses Cursor's brand mark, same pattern as above.
+  SOURCE_ICON_SVG['cursor-cli'] = SOURCE_ICON_SVG.cursor;
 
   function convSourceIcon(source) {
     var markup = SOURCE_ICON_SVG[source];

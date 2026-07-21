@@ -1662,6 +1662,21 @@ describe("SessionTracker", () => {
 			const out = filterSessionsByEnabledIntegrations(sessions, { devinEnabled: false });
 			expect(out.map((s) => s.source)).toEqual(["codex"]);
 		});
+
+		it("filterSessionsByEnabledIntegrations drops both cursor and cursor-cli when cursorEnabled is false", () => {
+			const sessions = [
+				{
+					sessionId: "a",
+					transcriptPath: "x#a",
+					updatedAt: "2026-07-18T00:00:00Z",
+					source: "cursor-cli" as const,
+				},
+				{ sessionId: "c", transcriptPath: "z#c", updatedAt: "2026-07-18T00:00:00Z", source: "cursor" as const },
+				{ sessionId: "b", transcriptPath: "y#b", updatedAt: "2026-07-18T00:00:00Z", source: "codex" as const },
+			];
+			const out = filterSessionsByEnabledIntegrations(sessions, { cursorEnabled: false });
+			expect(out.map((s) => s.source)).toEqual(["codex"]);
+		});
 	});
 
 	// ── git operation queue ────────────────────────────────────────────────

@@ -85,6 +85,7 @@ export function buildConversationDetailsHtml(opts: BuildHtmlOptions): string {
 		".badge.transcript-source-copilot      { color: #94a3b8; border-color: #94a3b8; background: rgba(148,163,184,0.12); }",
 		".badge.transcript-source-copilot-chat { color: #fbbf24; border-color: #fbbf24; background: rgba(251,191,36,0.12); }",
 		".badge.transcript-source-devin        { color: #d4d4d8; border-color: #d4d4d8; background: rgba(212,212,216,0.12); }",
+		".badge.transcript-source-cursor-cli   { color: #2dd4bf; border-color: #2dd4bf; background: rgba(45,212,191,0.12); }",
 		".badge.transcript-source-antigravity  { color: #f472b6; border-color: #f472b6; background: rgba(244,114,182,0.12); }",
 		".edited-notice { display: flex; align-items: center; gap: 8px; margin: 0 0 16px 0; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--vscode-gitDecoration-modifiedResourceForeground, var(--vscode-focusBorder)); background: color-mix(in srgb, var(--vscode-gitDecoration-modifiedResourceForeground, var(--vscode-focusBorder)) 12%, transparent); color: var(--vscode-foreground); }",
 		".edited-notice.hidden { display: none; }",
@@ -169,6 +170,8 @@ function providerLabel(source: string): string {
 			return "Copilot Chat";
 		case "devin":
 			return "Devin";
+		case "cursor-cli":
+			return "Cursor CLI";
 		case "antigravity":
 			return "Antigravity";
 		default:

@@ -1166,7 +1166,7 @@ describe("CLI", () => {
 				expect(calls.some((s) => s.includes("OpenCode:") && s.includes("unavailable — corrupt"))).toBe(true);
 			});
 
-			it("renders 'unavailable — <kind>' for Cursor when cursorScanError is present", async () => {
+			it("does NOT mark Cursor unavailable when only the IDE scan fails (healthy CLI must not be masked)", async () => {
 				vi.mocked(getStatus).mockResolvedValueOnce({
 					enabled: true,
 					claudeHookInstalled: false,
@@ -1177,8 +1177,34 @@ describe("CLI", () => {
 					summaryCount: 0,
 					orphanBranch: "jollimemory/summaries/v3",
 					cursorDetected: true,
+					cursorCliDetected: true,
 					cursorEnabled: true,
 					cursorScanError: { kind: "locked", message: "database is locked" },
+					sessionsBySource: { "cursor-cli": 3 },
+				});
+
+				await main(["status"]);
+				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+				// Merged Cursor row stays available (CLI still works); IDE failure is a sub-line.
+				expect(calls.some((s) => s.includes("Cursor:") && s.includes("unavailable"))).toBe(false);
+				expect(calls.some((s) => s.includes("IDE scan failed (locked)"))).toBe(true);
+			});
+
+			it("renders 'unavailable — <kind>' for Cursor only when BOTH IDE and CLI scans fail", async () => {
+				vi.mocked(getStatus).mockResolvedValueOnce({
+					enabled: true,
+					claudeHookInstalled: false,
+					gitHookInstalled: true,
+					geminiHookInstalled: false,
+					activeSessions: 0,
+					mostRecentSession: null,
+					summaryCount: 0,
+					orphanBranch: "jollimemory/summaries/v3",
+					cursorDetected: true,
+					cursorCliDetected: true,
+					cursorEnabled: true,
+					cursorScanError: { kind: "locked", message: "database is locked" },
+					cursorCliScanError: { kind: "parse", message: "bad meta.json" },
 					sessionsBySource: {},
 				});
 

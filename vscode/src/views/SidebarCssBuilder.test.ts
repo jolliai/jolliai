@@ -491,6 +491,7 @@ describe("onboarding panel styles", () => {
 				"copilot",
 				"copilot-chat",
 				"devin",
+				"cursor-cli",
 			];
 			for (const source of sources) {
 				const re = new RegExp(
@@ -517,6 +518,7 @@ describe("onboarding panel styles", () => {
 				"copilot",
 				"copilot-chat",
 				"devin",
+				"cursor-cli",
 			];
 			for (const source of sources) {
 				const re = new RegExp(
