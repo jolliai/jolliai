@@ -350,8 +350,16 @@ export type CommitSource = "cli" | "plugin";
  *     topics for amend step-2 / squash fallback) so downstream pipelines
  *     never face missing source summaries, but the user is prompted to
  *     regenerate via the webview banner.
+ *   - "local-agent-auth": a more specific "llm-failed" — the local-agent
+ *     provider's `claude` login expired / is not signed in (a
+ *     LocalAgentAuthError). Behaves exactly like "llm-failed" for storage and
+ *     the regenerate affordance, but lets surfaces (the SessionStart reminder,
+ *     the post-commit output) show sign-in guidance instead of a generic
+ *     failure. Written only on the fresh-commit path; amend/squash keep
+ *     "llm-failed" (their LLM error is reduced to a status inside the
+ *     Summarizer before it can be classified).
  */
-export type SummaryErrorKind = "llm-failed";
+export type SummaryErrorKind = "llm-failed" | "local-agent-auth";
 
 /**
  * Schema version stamped on newly written CommitSummary roots.
@@ -1160,6 +1168,17 @@ export interface JolliMemoryConfig {
 	readonly localAgentTool?: "claude-code";
 	/** Optional explicit path to the local agent binary, overriding PATH discovery. */
 	readonly localAgentPath?: string;
+	/**
+	 * Whether the post-commit hook prints live memory-capture progress to stdout
+	 * (so a `git commit` driven from a terminal or AI-agent session shows the
+	 * capture lifecycle inline, and blocks until it drains).
+	 *  - "auto" (default): show only in an interactive place — a TTY, or an
+	 *    AI-agent session (Claude Code etc.). GUI git clients stay silent + fast.
+	 *  - "on":  always show (and block) — any commit surface.
+	 *  - "off": never show; keep the fast, silent, non-blocking behavior.
+	 * The `JOLLI_COMMIT_FEEDBACK` env var overrides this per-invocation.
+	 */
+	readonly commitFeedback?: "auto" | "on" | "off";
 	/**
 	 * When true, plugin-initiated `git commit` / `--amend` / squash invocations
 	 * pass `-s` to add a DCO `Signed-off-by:` trailer. Off by default. Read at

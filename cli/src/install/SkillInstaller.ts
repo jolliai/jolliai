@@ -1,12 +1,19 @@
 /**
  * Skill Installer
  *
- * Writes one byte-identical SKILL.md per skill to **both** target directories:
+ * Writes one byte-identical SKILL.md per skill into the cross-platform target:
  *
- *   - `<projectDir>/.claude/skills/<name>/SKILL.md`  — for Claude Code
- *   - `<projectDir>/.agents/skills/<name>/SKILL.md`  — for the cross-platform
+ *   - `<projectDir>/.agents/skills/<name>/SKILL.md`  — the cross-platform
  *     Agent Skills standard, picked up by Codex CLI, Cursor 2.4+, Windsurf,
  *     OpenCode, Gemini CLI, GitHub Copilot.
+ *
+ * **Claude Code (`.claude/skills/`) is deliberately NOT a write target.** The
+ * Claude Code plugin owns Claude Code skills as namespaced `/jolli:*`, so a full
+ * `jolli enable` writing unnamespaced `.claude/skills/jolli-*` here would only
+ * duplicate them in the `/` menu. The only thing that touches `.claude/skills/`
+ * now is the plugin bootstrap ({@link installPluginJolliMenu} writes the bare
+ * `/jolli` umbrella; {@link removeClaudeLegacySkills} deletes pre-plugin
+ * unnamespaced copies) — see {@link CLAUDE_SKILLS_DIR}.
  *
  * Frontmatter is spec-compliant only (`name`, `description`, `metadata`) —
  * no Claude-private fields (`argument-hint`, `user-invocable`) — so the same
@@ -80,29 +87,26 @@ interface SkillRegistration {
  * - `host` is a stable identifier used in logs / tests.
  * - `relativeDir` is the path under `<projectDir>` where SKILL.md files live.
  * - `enabled` decides whether to write into this target for the given config.
- *   `.claude/skills/` is gated on `config.claudeEnabled !== false`. The
- *   `.agents/skills/` cross-platform target is unconditional today — splitting
+ *   The one shipped target (`.agents/skills/`) is unconditional today — splitting
  *   it across a per-host detector list (`isCodexInstalled || isGeminiInstalled
  *   || …`) would miss Cursor / OpenCode / Copilot-only users, and the cost is
- *   ~10 KB of two SKILL.md files that `.git/info/exclude` keeps out of `git
- *   status`.
+ *   ~10 KB of SKILL.md files that `.git/info/exclude` keeps out of `git status`.
+ *   The `enabled`/config plumbing is retained as an extension point for a future
+ *   re-gated target.
  */
 export interface SkillTarget {
-	readonly host: "claude-code" | "agents-std";
+	readonly host: "agents-std";
 	readonly relativeDir: ReadonlyArray<string>;
 	readonly enabled: (config: { claudeEnabled?: boolean }) => boolean;
 }
 
 /**
- * Where `jolli enable` writes SKILL.md files. Order is preserved so logs and
- * tests can rely on a stable iteration order.
+ * Where `jolli enable` writes SKILL.md files. Only the cross-platform
+ * `.agents/skills/` target ships — Claude Code (`.claude/skills/`) is owned by the
+ * plugin now (see the module header and {@link CLAUDE_SKILLS_DIR}), so it is
+ * intentionally absent here.
  */
 export const SKILL_TARGETS: ReadonlyArray<SkillTarget> = [
-	{
-		host: "claude-code",
-		relativeDir: [".claude", "skills"],
-		enabled: (config) => config.claudeEnabled !== false,
-	},
 	{
 		host: "agents-std",
 		relativeDir: [".agents", "skills"],
@@ -110,6 +114,15 @@ export const SKILL_TARGETS: ReadonlyArray<SkillTarget> = [
 		enabled: () => true,
 	},
 ];
+
+/**
+ * The Claude Code project-skills dir. No longer a full-`jolli enable` write target
+ * (the Claude Code plugin owns `/jolli:*`), but still the slot the plugin bootstrap
+ * writes the bare `/jolli` umbrella into ({@link installPluginJolliMenu}), removes
+ * it from on uninstall ({@link removePluginJolliMenu}), and cleans legacy
+ * unnamespaced CLI-written skills out of ({@link removeClaudeLegacySkills}).
+ */
+export const CLAUDE_SKILLS_DIR: ReadonlyArray<string> = [".claude", "skills"];
 
 /**
  * Registry of skills installed by `jolli enable`. Adding a new skill is
@@ -128,18 +141,46 @@ const SKILLS: ReadonlyArray<SkillRegistration> = [
  * Skill paths recorded in `.git/info/exclude` so they don't pollute
  * `git status` in user repositories. Derived as {@link SKILLS} × {@link SKILL_TARGETS},
  * so the count tracks those two lists automatically (one entry per skill per target).
- * Path format follows git's gitignore syntax — leading `/` anchors to the
- * repo root, trailing `/` matches the directory and its contents.
+ * With `.claude/skills/` gone from {@link SKILL_TARGETS}, this now covers only the
+ * `.agents/skills/` entries a full `jolli enable` actually writes — a fresh enable
+ * REPLACES the managed block with this set, so any stale `.claude/skills/*` lines a
+ * pre-upgrade enable wrote are dropped automatically. Path format follows git's
+ * gitignore syntax — leading `/` anchors to the repo root, trailing `/` matches the
+ * directory and its contents.
  */
 export const SKILL_GIT_EXCLUDE_PATHS: ReadonlyArray<string> = SKILL_TARGETS.flatMap((target) =>
 	SKILLS.map((skill) => `/${target.relativeDir.join("/")}/${skill.name}/`),
 );
 
 /**
+ * Git-exclude path for the bare `/jolli` umbrella that the Claude Code plugin's
+ * `enable --git-hooks-only` bootstrap writes (Claude Code target only — see
+ * {@link installPluginJolliMenu}). Registered by the caller so the generated
+ * skill never shows up in the user's `git status`.
+ */
+export const PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS: ReadonlyArray<string> = ["/.claude/skills/jolli/"];
+
+/**
+ * Exclude paths for the bare `/jolli` umbrella that uninstall must drop. The
+ * umbrella can land in `.agents/skills/jolli/` (written by a full `jolli enable`
+ * for every {@link SKILL_TARGETS} entry) AND in `.claude/skills/jolli/` (written by
+ * the plugin bootstrap, {@link PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS}). Since
+ * `.claude/skills/` is no longer a {@link SKILL_TARGETS} entry, the Claude-Code line
+ * is unioned in explicitly rather than derived. The `jolli-*` sibling entries in the
+ * same managed block are intentionally left behind — see {@link removePluginJolliMenu}
+ * and the uninstall skill policy.
+ */
+export const JOLLI_MENU_GIT_EXCLUDE_PATHS: ReadonlyArray<string> = [
+	...SKILL_TARGETS.map((target) => `/${target.relativeDir.join("/")}/jolli/`),
+	...PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS,
+];
+
+/**
  * Installs or updates Jolli skill files. The same byte-identical SKILL.md is
- * written into each enabled target directory under {@link SKILL_TARGETS}; the
- * Claude Code target is gated on `config.claudeEnabled !== false`, the
- * cross-platform `.agents/skills/` target is unconditional.
+ * written into each enabled target directory under {@link SKILL_TARGETS} — today
+ * only the cross-platform `.agents/skills/` target (Claude Code's `.claude/skills/`
+ * is owned by the plugin now, see the module header). The `config` argument is
+ * retained for the {@link SkillTarget} `enabled` gate extension point.
  *
  * Cleans up legacy directory names from prior versions. Each skill is checked
  * and upserted independently, so installing a new skill (or updating one of
@@ -163,6 +204,9 @@ export async function updateSkillsIfNeeded(
 	}
 
 	for (const target of SKILL_TARGETS) {
+		// The one shipped target (`.agents/skills/`) is unconditional, so this guard
+		// never short-circuits today; it is retained as the re-gating extension point.
+		/* v8 ignore next -- single always-on target; the disabled branch is unreachable now */
 		if (!target.enabled(config)) continue;
 		const targetDir = join(projectDir, ...target.relativeDir);
 		for (const skill of SKILLS) {
@@ -181,6 +225,138 @@ export async function updateSkillsIfNeeded(
  */
 export async function updateSkillIfNeeded(projectDir: string, config: { claudeEnabled?: boolean } = {}): Promise<void> {
 	return updateSkillsIfNeeded(projectDir, config);
+}
+
+/**
+ * Writes ONLY the bare `/jolli` umbrella menu into the Claude Code target
+ * (`<projectDir>/.claude/skills/jolli/SKILL.md`). Called by the Claude Code
+ * plugin bootstrap (`enable --git-hooks-only`) so a plugin-only user still gets a
+ * bare `/jolli` front door: a plugin skill can only ever be invoked as
+ * `/jolli:<name>` (Claude Code namespaces plugin skills), so the BARE form has to
+ * come from this non-plugin project skill.
+ *
+ * Written ONLY to the Claude Code target — the umbrella routes to the plugin's
+ * own `jolli:*` skills, which the cross-platform `.agents/skills/` hosts (Codex,
+ * Cursor, Gemini, Copilot, OpenCode) don't have. Unlike a full `jolli enable`
+ * this writes just the umbrella, NOT the unnamespaced `jolli-recall|search|pr`
+ * siblings, so the Claude `/` menu shows a single clean `/jolli` alongside the
+ * plugin's `/jolli:*`. Fail-soft (delegates to the version-aware upsertSkill).
+ */
+export async function installPluginJolliMenu(projectDir: string): Promise<void> {
+	const skillsDir = join(projectDir, ...CLAUDE_SKILLS_DIR);
+	const skillPath = join(skillsDir, "jolli", "SKILL.md");
+
+	// Guard: if a SKILL.md already exists at this path but does NOT carry our
+	// vendor marker, it belongs to the user — never overwrite it. Mirrors the
+	// symmetric check in removePluginJolliMenu.
+	try {
+		const existing = await readFile(skillPath, "utf-8");
+		if (!existing.includes('vendor: "jolli.ai"')) {
+			log.info("Skipping umbrella write — existing %s lacks vendor marker (user-owned)", skillPath);
+			return;
+		}
+	} catch {
+		// File doesn't exist — safe to create.
+	}
+
+	await upsertSkill(skillsDir, "jolli", buildPluginJolliMenuSkillTemplate());
+}
+
+/**
+ * Removes the bare `/jolli` umbrella menu from `.claude/skills/jolli/` and every
+ * {@link SKILL_TARGETS} dir on uninstall.
+ *
+ * The umbrella is written OUTSIDE the Claude Code plugin (into the user repo's
+ * `.claude/skills/jolli/`, and — after a full `jolli enable` — `.agents/skills/
+ * jolli/`), because a plugin skill can only ever be invoked as `/jolli:<name>`
+ * (see {@link installPluginJolliMenu}). That placement means Claude Code's
+ * plugin-manager uninstall never reaches it: without this cleanup the umbrella
+ * lingers as a broken menu that routes to `/jolli:*` skills that no longer
+ * exist. So a code-driven `jolli uninstall` removes it here.
+ *
+ * TARGETED exception to the conservative "leave `jolli-*` skills alone" policy:
+ * the bare `jolli` dir is unambiguously Jolli's, so it is safe to delete — but
+ * only after confirming the on-disk SKILL.md carries our `vendor: "jolli.ai"`
+ * marker, so a user's own hand-authored `.claude/skills/jolli/` is never
+ * touched. Fail-soft: any per-target read/remove error is logged, never thrown.
+ */
+export async function removePluginJolliMenu(projectDir: string): Promise<void> {
+	// The umbrella can live in `.claude/skills/jolli/` (plugin bootstrap) and in
+	// `.agents/skills/jolli/` (a full `jolli enable`). `.claude/skills/` is no longer
+	// a SKILL_TARGETS entry, so union it in explicitly.
+	const umbrellaDirs = [...SKILL_TARGETS.map((target) => target.relativeDir), CLAUDE_SKILLS_DIR];
+	for (const relativeDir of umbrellaDirs) {
+		const skillDir = join(projectDir, ...relativeDir, "jolli");
+		const skillPath = join(skillDir, "SKILL.md");
+		let content: string;
+		try {
+			content = await readFile(skillPath, "utf-8");
+		} catch {
+			continue; // No umbrella in this target — nothing to remove.
+		}
+		// Only remove a menu we generated. A coincidental user skill named `jolli`
+		// lacks our vendor marker and is left untouched.
+		if (!content.includes('vendor: "jolli.ai"')) continue;
+		try {
+			await rm(skillDir, { recursive: true, force: true });
+			log.info("Removed Jolli umbrella menu at %s", skillDir);
+			/* v8 ignore start -- defensive: rm with force:true rarely throws */
+		} catch (error: unknown) {
+			log.warn("Failed to remove umbrella at %s: %s", skillDir, (error as Error).message);
+		}
+		/* v8 ignore stop */
+	}
+}
+
+/**
+ * The unnamespaced Claude Code skill dirs a pre-plugin `jolli enable` used to write
+ * into `.claude/skills/`. Tracks {@link SKILLS} automatically (minus the bare
+ * `jolli` umbrella, which {@link installPluginJolliMenu} overwrites in place rather
+ * than deleting), plus the ancient {@link LEGACY_SKILL_DIRS}.
+ */
+const CLAUDE_LEGACY_SKILL_DIRS: ReadonlyArray<string> = [
+	...SKILLS.filter((skill) => skill.name !== "jolli").map((skill) => skill.name),
+	...LEGACY_SKILL_DIRS,
+];
+
+/**
+ * Deletes the legacy unnamespaced Jolli skills from the Claude Code target
+ * (`.claude/skills/jolli-*`). Called by the Claude Code plugin's `enable
+ * --git-hooks-only` bootstrap: the plugin ships these as namespaced `/jolli:*`
+ * skills, so the CLI-written unnamespaced copies are redundant duplicates in the
+ * `/` menu. Only removes a dir whose SKILL.md carries a Jolli ownership marker
+ * (modern `vendor` or legacy `jolli-skill-version`) — a user's own hand-authored
+ * skill of the same name is never touched (mirrors {@link removePluginJolliMenu}).
+ *
+ * The bare `/jolli` umbrella is NOT removed here — {@link installPluginJolliMenu}
+ * overwrites it in place with the plugin variant (whose revision outranks the
+ * standalone menu's), so a pre-upgrade umbrella can never linger pointing at one of
+ * the `jolli-*` skills this just deleted. Fail-soft per dir.
+ */
+export async function removeClaudeLegacySkills(projectDir: string): Promise<void> {
+	for (const name of CLAUDE_LEGACY_SKILL_DIRS) {
+		const skillDir = join(projectDir, ...CLAUDE_SKILLS_DIR, name);
+		const skillPath = join(skillDir, "SKILL.md");
+		let content: string;
+		try {
+			content = await readFile(skillPath, "utf-8");
+		} catch {
+			continue; // Not present in this repo — nothing to remove.
+		}
+		// Never delete a user's own same-named skill — it lacks the ownership marker.
+		if (!isJolliOwnedSkill(content)) {
+			log.info("Keeping %s — no Jolli ownership marker (user-owned)", skillDir);
+			continue;
+		}
+		try {
+			await rm(skillDir, { recursive: true, force: true });
+			log.info("Removed legacy Jolli skill at %s", skillDir);
+			/* v8 ignore start -- defensive: rm with force:true rarely throws */
+		} catch (error: unknown) {
+			log.warn("Failed to remove legacy skill at %s: %s", skillDir, (error as Error).message);
+		}
+		/* v8 ignore stop */
+	}
 }
 
 /**
@@ -207,6 +383,17 @@ function parseRevision(content: string): number {
 }
 
 /**
+ * True when an on-disk SKILL.md was written by Jolli (any version) rather than
+ * hand-authored by the user. Recognizes both the modern `vendor: "jolli.ai"`
+ * metadata and the legacy pre-revision `jolli-skill-version:` frontmatter, so a
+ * one-time legacy→revision migration is still allowed while a user's own skill
+ * (which carries neither marker) is never overwritten.
+ */
+function isJolliOwnedSkill(content: string): boolean {
+	return content.includes('vendor: "jolli.ai"') || content.includes("jolli-skill-version:");
+}
+
+/**
  * Writes one skill's SKILL.md when this tool's revision is newer than what's on
  * disk. Idempotent; never downgrades a file a newer tool wrote. See the module
  * header for the precedence rule.
@@ -221,6 +408,20 @@ async function upsertSkill(skillsDir: string, name: string, content: string): Pr
 
 	try {
 		const existing = await readFile(skillPath, "utf-8");
+		// Never overwrite a SKILL.md that carries no Jolli ownership marker — it is
+		// the user's own hand-authored skill, not ours (the realistic collision is a
+		// user's bare `.claude/skills/jolli/`). A file Jolli wrote is recognizable
+		// either by the modern `vendor: "jolli.ai"` metadata or by the legacy
+		// pre-revision `jolli-skill-version:` frontmatter; a user's file has neither
+		// and — lacking a revision line — would otherwise be clobbered by the
+		// downgrade guard below (PREHISTORIC < ours). Mirrors the symmetric guard in
+		// installPluginJolliMenu / removePluginJolliMenu (which need only the modern
+		// marker; here the legacy marker is also honored so a one-time legacy→revision
+		// migration of `jolli-recall` etc. still reaches existing installs).
+		if (!isJolliOwnedSkill(existing)) {
+			log.info("Skipping %s SKILL.md — no Jolli ownership marker (user-owned)", name);
+			return;
+		}
 		if (parseRevision(existing) >= myRevision) {
 			// Equal → same content by contract; greater → a newer tool wrote it.
 			// Either way, leave it untouched (never downgrade).
@@ -1354,6 +1555,13 @@ to report the cancelled outcome (who/when + workflow URL).
  * Claude Code's AskUserQuestion), otherwise a plain-text list, then invoke the
  * chosen action. Host-agnostic by design — the AskUserQuestion mention is only an
  * example and the text-list fallback keeps `/jolli` usable on every host.
+ *
+ * Written by a full `jolli enable` to `.agents/skills/jolli/SKILL.md` only — the
+ * Claude Code slot (`.claude/skills/jolli/`) is written by the plugin variant
+ * {@link buildPluginJolliMenuSkillTemplate} instead. The two no longer share a
+ * directory, but a pre-upgrade install may still have THIS template sitting in the
+ * legacy `.claude/skills/jolli/` slot, which the plugin variant reclaims by revision
+ * (see that docstring); keep the two `metadata.revision` literals in view together.
  */
 export function buildJolliMenuSkillTemplate(): string {
 	return `---
@@ -1467,5 +1675,237 @@ This skill takes one optional free-text argument.
 
 Host-agnostic by design: the AskUserQuestion mention is only an example; the
 text-list fallback keeps \`/jolli\` usable on every host that loads skills.
+`;
+}
+
+/**
+ * The Claude-Code-plugin variant of the bare `/jolli` front door. Like
+ * {@link buildJolliMenuSkillTemplate} it routes to the plugin's OWN namespaced
+ * skills (`jolli:init` / `jolli:recall` / `jolli:search` / `jolli:push`) rather
+ * than the unnamespaced `jolli-*` siblings, because in a plugin install those
+ * namespaced skills are the ones that exist.
+ *
+ * Unlike the passive standalone menu, this variant is a **state-aware guided
+ * front door** modelled on the CLI's `runGuidedFrontDoor` capability ladder
+ * (`cli/src/commands/GuidedFrontDoor.ts`): it reads `mcp__jollimemory__status`
+ * (falling back to `jolli status`), and if the repo isn't fully set up
+ * (no generation credential, or git hooks not installed) it steers the user
+ * into `/jolli:init` — which owns sign-in → enable → bind-Space — rather than
+ * dumping a menu. Once set up it prints a short `✓` snapshot and only THEN
+ * presents the action menu, biased by state. It still never re-implements an
+ * action; it only reads status and invokes an existing skill or MCP tool. Space
+ * binding is deliberately not gated on here — `status` doesn't report it (it
+ * only surfaces via `/jolli:push`'s `binding_required`), so binding stays
+ * `/jolli:init`'s / `/jolli:push`'s job.
+ *
+ * Written by {@link installPluginJolliMenu} to `<repo>/.claude/skills/jolli/`,
+ * which is the only way to surface a BARE `/jolli` from a plugin (plugin skills
+ * are always `/<plugin>:<skill>`). Frontmatter is spec-compliant (name /
+ * description / metadata only) so it passes `skills-ref validate`.
+ *
+ * ⚠ Revision-ordering contract with {@link buildJolliMenuSkillTemplate}: a full
+ * `jolli enable` no longer writes the standalone menu to `.claude/skills/jolli/`
+ * (it targets `.agents/skills/` only), so in a fresh install the two no longer
+ * collide. BUT a pre-upgrade install may still have the standalone menu (revision
+ * 3) sitting in `.claude/skills/jolli/`, and both carry `vendor: "jolli.ai"` so the
+ * ownership guard cannot tell them apart — `upsertSkill` arbitrates purely by
+ * `metadata.revision`. This variant is therefore revision **5** (above the
+ * standalone's 3) so {@link installPluginJolliMenu} RECLAIMS that legacy slot,
+ * replacing a stale standalone menu that would otherwise route to the unnamespaced
+ * `jolli-*` skills {@link removeClaudeLegacySkills} just deleted. Keep this note and
+ * both revision literals in view when editing either template — dropping this below
+ * 3 would strand the broken pre-upgrade menu.
+ */
+export function buildPluginJolliMenuSkillTemplate(): string {
+	return `---
+name: jolli
+description: The Jolli front door — checks how Jolli is set up in this repo, guides first-time setup through /jolli:init when something's missing, and otherwise shows a status snapshot and routes you to the right Jolli skill or MCP tool. Use when the user types /jolli or asks for Jolli / the Jolli menu.
+metadata:
+  version: "${SKILL_VERSION}"
+  revision: 5
+  vendor: "jolli.ai"
+---
+
+# Jolli
+
+The single front door for Jolli. Rather than dumping a static list, it reads how
+Jolli is set up in THIS repo and guides the next step: if setup is incomplete it
+walks the user into \`/jolli:init\`; once everything is wired it shows a short
+status snapshot and routes the user's choice to the right skill or Jolli MCP
+tool. It is a friendly front door — it **never** re-implements any action, it
+only reads status and invokes an existing skill or an existing MCP tool. The
+standalone \`/jolli:init\`, \`/jolli:recall\`, \`/jolli:search\`, \`/jolli:push\`
+commands all keep working unchanged; this is layered on top of them, not a
+replacement.
+
+## Step 0 — confirm this menu can route
+
+This menu is a project skill written OUTSIDE the Jolli plugin (a plugin skill
+could only ever be \`/jolli:<name>\`, never a bare \`/jolli\`), so it can linger
+in \`.claude/skills/jolli/\` after the plugin has been uninstalled. It can only
+route to targets that exist in THIS session, so before doing anything else
+confirm at least one routing target is available. The menu can route if
+**either** of these holds:
+
+- one or more MCP tools whose name contains \`jollimemory\` are registered, **or**
+- the plugin's own namespaced skills (\`jolli:init\` / \`jolli:recall\` /
+  \`jolli:search\` / \`jolli:push\`) are invocable this session.
+
+If **either** holds, proceed to Step 1.
+
+If **neither** holds, do **not** build the menu and do **not** invoke any
+\`/jolli:*\` skill — it is not registered and the call will fail. But this alone
+does NOT mean Jolli is gone: the Jolli CLI installs a memory pipeline that runs
+independently of this plugin (git hooks that generate memories on every commit).
+So distinguish the two cases — check whether the bundled CLI dispatch exists by
+running \`test -f "$HOME/.jolli/jollimemory/run-cli" && echo present\`:
+
+- **CLI present** → Jolli still works; only the plugin's interactive menu is not
+  loaded in this session. Tell the user plainly: the Jolli plugin menu isn't
+  loaded here, but the Jolli CLI is still installed — commits still generate
+  memories, and they can run \`jolli recall\` / \`jolli search\` directly. This
+  \`/jolli\` file is a leftover from a previous plugin install; they can remove
+  it with \`rm -rf .claude/skills/jolli\`, and reinstall the Jolli plugin to
+  bring the menu back.
+- **CLI absent** → Jolli is no longer installed at all. Tell the user this
+  \`/jolli\` menu is a stale leftover; they can remove it with
+  \`rm -rf .claude/skills/jolli\`, and (re)install Jolli to bring it back.
+
+Either way, then stop — do not continue to Step 1.
+
+## Step 1 — read how Jolli is set up
+
+Before deciding what to show, read the current state so you can guide instead of
+guessing. This is the state-aware front door — not a static list.
+
+**Preferred (MCP):** call the \`status\` tool (on Claude Code
+\`mcp__jollimemory__status\`) with no arguments. From its result read:
+
+- \`enabled\` — are Jolli's git hooks installed in this repo (is memory
+  generation on)?
+- \`account.signedIn\` — is the user signed in to Jolli?
+- \`account.jolliApiKeyConfigured\` / \`account.anthropicKeyConfigured\` — is a
+  generation credential present?
+- \`account.site\` — the Jolli site host, for the snapshot line.
+- \`storedMemories\` — how many memories this repo already has.
+- \`space\` — the bound Jolli Space (\`{ name }\`) this repo's memories sync to, or
+  \`null\` when the repo isn't bound yet. Drives the \`syncing · Space\` snapshot line.
+
+**Fallback (CLI):** if the \`status\` MCP tool is unavailable (an older Jolli),
+run the bundled CLI through its stable dispatch script and read the same facts
+from its printed output:
+
+\`\`\`bash
+JOLLI_DIST_PREFER_SOURCE=claude-plugin "$HOME/.jolli/jollimemory/run-cli" status
+\`\`\`
+
+If neither the tool nor the CLI can be reached at all, skip the state-based
+guidance and go straight to Step 3's menu (present it without a snapshot).
+
+Note: \`status.space\` is display-only — it names the bound Space for the snapshot
+but does NOT confirm push health. Full binding management (picking / re-binding a
+Space) stays \`/jolli:init\`'s and \`/jolli:push\`'s job; do not try to (re)bind here.
+
+## Step 2 — guide by state (the front door)
+
+Derive two capabilities from Step 1, mirroring the CLI's guided front door:
+
+- **can generate memories** — provider-AWARE, NOT a blind OR of every field.
+  Read \`account.aiProvider\` and decide:
+  - \`local-agent\` → **yes** (memories generate through the user's local Claude
+    subscription — no API key and no Jolli sign-in required). This is the plugin's
+    default, so a freshly-installed plugin repo can already generate.
+  - \`jolli\` → yes only if \`account.jolliApiKeyConfigured\`.
+  - \`anthropic\` → yes only if \`account.anthropicKeyConfigured\`.
+  - \`null\` / unset → yes if \`account.jolliApiKeyConfigured\` OR
+    \`account.anthropicKeyConfigured\`.
+
+  (\`account.signedIn\` alone does NOT count — an OAuth token is a sync credential,
+  not a generation one.)
+- **enabled** = the \`enabled\` flag.
+
+Then take exactly one branch:
+
+- **Not fully set up** — \`enabled\` is false, OR memories can't be generated:
+  memory generation isn't wired yet, so lead with SETUP, not the action menu.
+  State in one line what's missing (for example "not signed in, and memory
+  generation is off for this repo"), then invoke the \`jolli:init\` skill through
+  the Skill tool — it walks sign-in → enable → bind a Space in one guided pass.
+  Do NOT hand-roll those steps here; \`/jolli:init\` owns them. (Exception: if the
+  user gave an argument in Step 3 that clearly names a different action, honor
+  that instead — see Step 3.)
+
+- **Fully set up** — enabled AND a credential present: print a short snapshot,
+  then continue to Step 3 to present the action menu.
+
+  \`\`\`
+  ✓ signed in · <account.site>        (or "✓ Jolli key set" / "✓ Anthropic key set" when not signed in)
+  ✓ enabled · <storedMemories> memories
+  ✓ syncing · Space "<space.name>"    (ONLY when \`space\` is non-null; omit the whole line otherwise)
+
+  Jolli is listening — last memory saved.
+  \`\`\`
+
+  Render the \`✓ syncing · Space "<space.name>"\` line **only when \`space\` is
+  non-null** — it means a \`git push\` auto-publishes this branch's memories to that
+  Space (the pre-push hook does it). When \`space\` is null, drop that line entirely;
+  do not print a "not bound" line here (binding is \`/jolli:init\`'s job).
+
+  The closing \`Jolli is listening — …\` line mirrors the CLI front door: use
+  **"last memory saved."** when \`storedMemories\` > 0, or **"your next commit is your
+  first memory"** when \`storedMemories\` is 0.
+
+  If \`storedMemories\` is 0, still show the menu, but Step 3 leads it with
+  \`/jolli:init\` (on a fresh repo recall / search would only return empty, so
+  they must not be the default action).
+
+## Step 3 — route the request / present the menu
+
+This skill takes one optional free-text argument.
+
+- **Argument provided** → match it to exactly one action below and invoke that
+  action directly (invoke the skill, or call the Jolli MCP tool), regardless of
+  the Step 2 state — a specific request wins over the setup nudge. The invoked
+  skill handles its own preconditions (for example \`/jolli:push\` will offer to
+  bind a Space if the repo isn't bound). Only ask the user to choose if the
+  request is ambiguous or matches no action.
+- **Argument absent** → after the Step 2 guidance, present the action menu and
+  let the user pick, using an interactive single-select tool if your host
+  provides one (for example AskUserQuestion in Claude Code); otherwise list the
+  options as plain text and ask. Bias the ordering to the state: when
+  \`storedMemories\` is 0, lead with \`/jolli:init\` as the FIRST (default)
+  option — finish setup / bind a Space, or just make the first commit — and
+  demote recall / search below it, since on a fresh repo both would only
+  return empty. When memories exist, lead instead with recall / search. Either
+  way keep \`/jolli:init\` available for re-running setup or re-binding a Space.
+  After the user selects, invoke the corresponding skill or MCP tool.
+
+### Jolli plugin skills
+
+List a plugin skill only if it was confirmed available in Step 0.
+
+- **/jolli:init** — Set up Jolli for this repo: sign in if needed, enable memory
+  generation, and bind the repo to a Jolli Space. Route by invoking the
+  \`jolli:init\` skill.
+- **/jolli:recall** — Recall prior development context for the current branch.
+  Route by invoking the \`jolli:recall\` skill.
+- **/jolli:search** — Search structured commit memories across branches
+  (decisions, topics, files). Route by invoking the \`jolli:search\` skill.
+- **/jolli:push** — Publish this branch's memories to a Jolli Space. Route by
+  invoking the \`jolli:push\` skill.
+
+Route a local choice by invoking that skill through the Skill tool.
+
+### Jolli MCP tools (whatever is registered this session)
+
+Surface every tool whose name contains \`jollimemory\` that is available in the
+current session — for example \`recall\`, \`search\`, \`get_pr_description\`,
+\`queue_status\`, \`status\`, and the Jolli Space tools (\`list_spaces\`,
+\`bind_space\`, \`push_memory\`). Route a choice by calling the matching Jolli
+MCP tool.
+
+Do NOT assume a fixed list — enumerate the Jolli MCP tools that are actually
+registered right now. If no Jolli MCP tools are registered, present just the
+plugin skills above.
 `;
 }

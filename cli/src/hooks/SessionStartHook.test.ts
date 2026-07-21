@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommitSummary, PlansRegistry, SummaryIndex } from "../Types.js";
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
@@ -12,7 +12,21 @@ vi.mock("node:fs", () => ({
 	readFileSync: vi.fn().mockReturnValue("{}"),
 	writeFileSync: vi.fn(),
 	mkdirSync: vi.fn(),
+	rmSync: vi.fn(),
 }));
+
+// Partial mock — keep the real `normalizePlansRegistry` (used by the briefing
+// path) but control `loadConfig` so the login-reminder credential check is
+// deterministic and never reads the dev machine's real config. `saveConfig` is
+// stubbed so the plugin default-provider seed never touches real disk.
+vi.mock("../core/SessionTracker.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/SessionTracker.js")>();
+	return {
+		...actual,
+		loadConfig: vi.fn().mockResolvedValue({}),
+		saveConfig: vi.fn().mockResolvedValue(undefined),
+	};
+});
 
 vi.mock("../core/SummaryStore.js", () => ({
 	getIndex: vi.fn(),
@@ -42,8 +56,9 @@ vi.mock("../Logger.js", () => ({
 }));
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readFileFromBranch } from "../core/GitOps.js";
+import { loadConfig, saveConfig } from "../core/SessionTracker.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
 
@@ -53,6 +68,9 @@ const mockReadFileFromBranch = vi.mocked(readFileFromBranch);
 const mockCollectAllTopics = vi.mocked(collectAllTopics);
 const mockExistsSync = vi.mocked(existsSync);
 const mockReadFileSync = vi.mocked(readFileSync);
+const mockRmSync = vi.mocked(rmSync);
+const mockLoadConfig = vi.mocked(loadConfig);
+const mockSaveConfig = vi.mocked(saveConfig);
 
 function makeIndex(entries: SummaryIndex["entries"]): SummaryIndex {
 	return { version: 3, entries };
@@ -74,7 +92,14 @@ function makeSummary(overrides: Partial<CommitSummary> = {}): CommitSummary {
 }
 
 // Import after mocks
-const { main } = await import("./SessionStartHook.js");
+const {
+	main,
+	computeLoginReminder,
+	formatRecallSuggestion,
+	getLoginReminder,
+	ensurePluginDefaultProvider,
+	getAuthFailureReminder,
+} = await import("./SessionStartHook.js");
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
@@ -244,7 +269,7 @@ describe("SessionStartHook", () => {
 		writeSpy.mockRestore();
 	});
 
-	it("should suggest /jolli-recall when > 3 days since last commit", async () => {
+	it("should suggest recall when > 3 days since last commit", async () => {
 		const oldDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 		const olderDate = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
 		mockGetIndex.mockResolvedValue(
@@ -273,7 +298,9 @@ describe("SessionStartHook", () => {
 
 		expect(writeSpy).toHaveBeenCalledTimes(1);
 		const output = writeSpy.mock.calls[0][0] as string;
-		expect(output).toContain("/jolli-recall");
+		// CLI build → the recall CTA is the `jolli recall` command, NOT a jolli-recall skill.
+		expect(output).toContain("jolli recall");
+		expect(output).not.toContain("jolli-recall");
 		expect(output).toContain("days since last commit");
 		writeSpy.mockRestore();
 	});
@@ -307,9 +334,10 @@ describe("SessionStartHook", () => {
 
 		expect(writeSpy).toHaveBeenCalledTimes(1);
 		const output = writeSpy.mock.calls[0][0] as string;
-		// v5: cross-platform phrasing covers Codex / Cursor / etc. as well.
-		expect(output).toContain("Tip: run the jolli-recall skill");
-		expect(output).toContain("/jolli-recall in Claude Code");
+		// Non-plugin (CLI build): the tip names the `jolli recall` command, never a
+		// jolli-recall skill (the plugin surface uses `/jolli:recall` instead).
+		expect(output).toContain("Tip: run `jolli recall` for full context");
+		expect(output).not.toContain("jolli-recall");
 		expect(output).not.toContain("Warning:");
 		writeSpy.mockRestore();
 	});
@@ -1133,7 +1161,7 @@ describe("SessionStartHook", () => {
 
 	// ─── Time gap behavior ──────────────────────────────────────────────────
 
-	it("should suggest /jolli-recall when > 3 days since last commit", async () => {
+	it("should suggest recall when > 3 days since last commit", async () => {
 		const oldDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 		const olderDate = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
 		mockGetIndex.mockResolvedValue(
@@ -1162,7 +1190,9 @@ describe("SessionStartHook", () => {
 
 		expect(writeSpy).toHaveBeenCalledTimes(1);
 		const output = writeSpy.mock.calls[0][0] as string;
-		expect(output).toContain("/jolli-recall");
+		// CLI build → the recall CTA is the `jolli recall` command, NOT a jolli-recall skill.
+		expect(output).toContain("jolli recall");
+		expect(output).not.toContain("jolli-recall");
 		expect(output).toContain("days since last commit");
 		writeSpy.mockRestore();
 	});
@@ -1196,8 +1226,10 @@ describe("SessionStartHook", () => {
 
 		expect(writeSpy).toHaveBeenCalledTimes(1);
 		const output = writeSpy.mock.calls[0][0] as string;
-		expect(output).toContain("Tip: run the jolli-recall skill");
-		expect(output).toContain("/jolli-recall in Claude Code");
+		// Non-plugin (CLI build): the tip names the `jolli recall` command, never a
+		// jolli-recall skill (the plugin surface uses `/jolli:recall` instead).
+		expect(output).toContain("Tip: run `jolli recall` for full context");
+		expect(output).not.toContain("jolli-recall");
 		expect(output).not.toContain("Warning:");
 		writeSpy.mockRestore();
 	});
@@ -1864,5 +1896,279 @@ describe("SessionStartHook", () => {
 		expect(output).toContain("1 commits (unknown ~ unknown)");
 		expect(output).toContain("(unknown)");
 		writeSpy.mockRestore();
+	});
+});
+
+// ─── Plugin default provider ─────────────────────────────────────────────────
+
+describe("ensurePluginDefaultProvider", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockSaveConfig.mockResolvedValue(undefined);
+	});
+
+	it("seeds aiProvider=local-agent + localAgentTool on the plugin surface when unset", async () => {
+		const wrote = await ensurePluginDefaultProvider("claude-plugin", {});
+		expect(wrote).toBe(true);
+		expect(mockSaveConfig).toHaveBeenCalledWith({ aiProvider: "local-agent", localAgentTool: "claude-code" });
+	});
+
+	it("does nothing off the plugin build (cli / vscode keep their own default-derivation)", async () => {
+		expect(await ensurePluginDefaultProvider("cli", {})).toBe(false);
+		expect(await ensurePluginDefaultProvider("vscode-plugin", {})).toBe(false);
+		expect(mockSaveConfig).not.toHaveBeenCalled();
+	});
+
+	it("never overwrites an explicit provider choice", async () => {
+		for (const aiProvider of ["anthropic", "jolli", "local-agent"] as const) {
+			expect(await ensurePluginDefaultProvider("claude-plugin", { aiProvider })).toBe(false);
+		}
+		expect(mockSaveConfig).not.toHaveBeenCalled();
+	});
+
+	it("swallows a config-write failure so session startup is never blocked", async () => {
+		mockSaveConfig.mockRejectedValueOnce(new Error("disk full"));
+		expect(await ensurePluginDefaultProvider("claude-plugin", {})).toBe(false);
+	});
+});
+
+// ─── Login reminder ──────────────────────────────────────────────────────────
+
+describe("computeLoginReminder", () => {
+	it("returns the reminder for the claude-plugin surface with no credential and no dismiss", () => {
+		const text = computeLoginReminder("claude-plugin", false, false);
+		expect(text).toContain("/jolli:login");
+		expect(text).toContain("Not signed in");
+	});
+
+	it("returns null for non-plugin surfaces (cli / vscode) even without a credential", () => {
+		expect(computeLoginReminder("cli", false, false)).toBeNull();
+		expect(computeLoginReminder("vscode-plugin", false, false)).toBeNull();
+	});
+
+	it("returns null when a credential is configured", () => {
+		expect(computeLoginReminder("claude-plugin", true, false)).toBeNull();
+	});
+
+	it("returns null when the reminder has been dismissed", () => {
+		expect(computeLoginReminder("claude-plugin", false, true)).toBeNull();
+	});
+});
+
+describe("formatRecallSuggestion", () => {
+	it("returns null when the last commit is same-day (0 days)", () => {
+		expect(formatRecallSuggestion(0, "cli")).toBeNull();
+		expect(formatRecallSuggestion(0, "claude-plugin")).toBeNull();
+	});
+
+	it("uses the /jolli:recall namespaced skill on the Claude Code plugin surface", () => {
+		expect(formatRecallSuggestion(2, "claude-plugin")).toBe("Tip: run /jolli:recall for full context");
+		expect(formatRecallSuggestion(9, "claude-plugin")).toBe(
+			"Warning: 9 days since last commit. Run /jolli:recall for full context.",
+		);
+	});
+
+	it("uses the `jolli recall` CLI on non-plugin surfaces and never names a jolli-recall skill", () => {
+		for (const kind of ["cli", "vscode-plugin", "intellij-plugin"]) {
+			const tip = formatRecallSuggestion(2, kind);
+			const warning = formatRecallSuggestion(9, kind);
+			expect(tip).toBe("Tip: run `jolli recall` for full context");
+			expect(warning).toBe("Warning: 9 days since last commit. Run `jolli recall` for full context.");
+			expect(tip).not.toContain("jolli-recall");
+			expect(warning).not.toContain("jolli-recall");
+		}
+	});
+
+	it("switches from Tip to Warning past the 3-day threshold", () => {
+		expect(formatRecallSuggestion(3, "cli")?.startsWith("Tip:")).toBe(true);
+		expect(formatRecallSuggestion(4, "cli")?.startsWith("Warning:")).toBe(true);
+	});
+});
+
+describe("getLoginReminder", () => {
+	const savedAnthropicKey = process.env.ANTHROPIC_API_KEY;
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		delete process.env.ANTHROPIC_API_KEY;
+		mockLoadConfig.mockResolvedValue({});
+		mockExistsSync.mockReturnValue(false);
+	});
+
+	afterEach(() => {
+		if (savedAnthropicKey === undefined) {
+			delete process.env.ANTHROPIC_API_KEY;
+		} else {
+			process.env.ANTHROPIC_API_KEY = savedAnthropicKey;
+		}
+	});
+
+	// The CLI test build fixes __JOLLI_CLIENT_KIND__ to "cli", so the returned
+	// value is always null here — these tests exercise the credential/marker
+	// wiring and side effects (the reminder text itself is covered above).
+	it("removes a stale dismiss marker once a credential is present", async () => {
+		mockLoadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
+		mockExistsSync.mockReturnValue(true);
+
+		const result = await getLoginReminder("/test");
+
+		expect(mockRmSync).toHaveBeenCalledWith(expect.stringContaining("login-reminder-dismissed"));
+		expect(result).toBeNull();
+	});
+
+	it("treats the local-agent provider as credentialed (no key needed)", async () => {
+		// local-agent drives the tool's own subscription login, so it has NO
+		// apiKey/jolliApiKey/ANTHROPIC_API_KEY yet still generates memories. It must
+		// count as credentialed — proven here by the stale marker being cleaned up
+		// (the `hasCredential === true` side effect), not left in place.
+		mockLoadConfig.mockResolvedValue({ aiProvider: "local-agent" });
+		mockExistsSync.mockReturnValue(true);
+
+		const result = await getLoginReminder("/test");
+
+		expect(mockRmSync).toHaveBeenCalledWith(expect.stringContaining("login-reminder-dismissed"));
+		expect(result).toBeNull();
+	});
+
+	it("tolerates a marker-cleanup failure", async () => {
+		mockLoadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
+		mockExistsSync.mockReturnValue(true);
+		mockRmSync.mockImplementation(() => {
+			throw new Error("EACCES");
+		});
+
+		await expect(getLoginReminder("/test")).resolves.toBeNull();
+		expect(mockRmSync).toHaveBeenCalled();
+	});
+
+	it("does not remove the marker when no credential is present", async () => {
+		mockLoadConfig.mockResolvedValue({});
+		mockExistsSync.mockReturnValue(true);
+
+		const result = await getLoginReminder("/test");
+
+		expect(mockRmSync).not.toHaveBeenCalled();
+		expect(result).toBeNull();
+	});
+});
+
+describe("getAuthFailureReminder", () => {
+	const AUTH = "local-agent-auth" as const;
+
+	function indexWith(...marks: Array<{ hash: string; date: string }>): SummaryIndex {
+		return makeIndex(
+			marks.map(({ hash, date }) => ({
+				commitHash: hash,
+				parentCommitHash: null,
+				commitMessage: `commit ${hash}`,
+				commitDate: date,
+				branch: "feature/test-branch",
+				generatedAt: date,
+			})),
+		);
+	}
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockExecFileSync.mockReturnValue("feature/test-branch\n" as never);
+	});
+
+	it("returns the reminder when the newest commit carries the auth marker", async () => {
+		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
+		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: AUTH })));
+
+		const result = await getAuthFailureReminder("/test", "claude-plugin");
+
+		expect(result).toContain("the Claude login used for local generation has expired");
+		expect(result).toContain("claude auth login");
+		expect(result).toContain("jolli configure --set aiProvider");
+		// It read the newest commit's summary file.
+		expect(mockReadFileFromBranch).toHaveBeenCalledWith(
+			"jollimemory/summaries/v3",
+			"summaries/newest.json",
+			"/test",
+		);
+	});
+
+	it("returns null once the newest commit is healthy again (auto-clear)", async () => {
+		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
+		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: undefined })));
+
+		expect(await getAuthFailureReminder("/test", "claude-plugin")).toBeNull();
+	});
+
+	it("does not fire for a generic llm-failed marker (auth-specific only)", async () => {
+		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
+		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: "llm-failed" })));
+
+		expect(await getAuthFailureReminder("/test", "claude-plugin")).toBeNull();
+	});
+
+	it("checks only the NEWEST commit — an old auth failure under a newer healthy commit is silent", async () => {
+		mockGetIndex.mockResolvedValue(
+			indexWith(
+				{ hash: "older-failed", date: "2026-03-29T09:00:00.000Z" },
+				{ hash: "newest-ok", date: "2026-03-29T12:00:00.000Z" },
+			),
+		);
+		// The hook must read the newest ("newest-ok"), which is healthy → no reminder.
+		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: undefined })));
+
+		expect(await getAuthFailureReminder("/test", "claude-plugin")).toBeNull();
+		expect(mockReadFileFromBranch).toHaveBeenCalledWith(
+			"jollimemory/summaries/v3",
+			"summaries/newest-ok.json",
+			"/test",
+		);
+	});
+
+	it("is gated to the Claude Code plugin — other client kinds never see it", async () => {
+		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
+		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: AUTH })));
+
+		expect(await getAuthFailureReminder("/test", "cli")).toBeNull();
+		// Gated out before any git/index work.
+		expect(mockGetIndex).not.toHaveBeenCalled();
+	});
+
+	it("fires on main too — an auth failure is branch-independent (NOT skipped like the briefing)", async () => {
+		mockExecFileSync.mockReturnValue("main\n" as never);
+		mockGetIndex.mockResolvedValue(
+			makeIndex([
+				{
+					commitHash: "onmain",
+					parentCommitHash: null,
+					commitMessage: "commit on main",
+					commitDate: "2026-03-29T12:00:00.000Z",
+					branch: "main",
+					generatedAt: "2026-03-29T12:00:00.000Z",
+				},
+			]),
+		);
+		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ branch: "main", summaryError: AUTH })));
+
+		expect(await getAuthFailureReminder("/test", "claude-plugin")).toContain("claude auth login");
+	});
+
+	it("returns null on a detached HEAD (no branch)", async () => {
+		mockExecFileSync.mockReturnValue("\n" as never);
+		expect(await getAuthFailureReminder("/test", "claude-plugin")).toBeNull();
+		expect(mockGetIndex).not.toHaveBeenCalled();
+	});
+
+	it("returns null when there is no index", async () => {
+		mockGetIndex.mockResolvedValue(null);
+		expect(await getAuthFailureReminder("/test", "claude-plugin")).toBeNull();
+	});
+
+	it("returns null when the branch has no root entries", async () => {
+		mockGetIndex.mockResolvedValue(makeIndex([]));
+		expect(await getAuthFailureReminder("/test", "claude-plugin")).toBeNull();
+	});
+
+	it("returns null (not throw) when the summary file is missing", async () => {
+		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
+		mockReadFileFromBranch.mockResolvedValue(null);
+		expect(await getAuthFailureReminder("/test", "claude-plugin")).toBeNull();
 	});
 });

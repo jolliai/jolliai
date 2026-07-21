@@ -35,7 +35,7 @@ import { isCursorInstalled } from "../core/CursorDetector.js";
 import { scanCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { isDevinInstalled, scanDevinSessions } from "../core/DevinSessionDiscoverer.js";
 import { isGeminiInstalled } from "../core/GeminiSessionDetector.js";
-import { getProjectRootDir, listWorktrees, orphanBranchExists } from "../core/GitOps.js";
+import { getProjectRootDir, isInsideGitRepo, listWorktrees, orphanBranchExists } from "../core/GitOps.js";
 import {
 	isOpenCodeInstalled,
 	type OpenCodeScanError,
@@ -67,13 +67,14 @@ import { installHookScripts } from "./DispatchScripts.js";
 import {
 	deriveSourceTag,
 	installDistPath,
+	isValidSourceTag,
 	migrateLegacyDistPath,
 	pickBestDistPath,
 	pruneStaleDistPaths,
 	traverseDistPaths,
 } from "./DistPathResolver.js";
 import { installGeminiHook, isGeminiHookInstalled, removeGeminiHook } from "./GeminiHookInstaller.js";
-import { updateGitExclude } from "./GitExclude.js";
+import { addGitExcludePaths, removeGitExcludePaths, updateGitExclude } from "./GitExclude.js";
 import {
 	installGitHook,
 	installPostMergeHook,
@@ -105,7 +106,15 @@ import {
 	registerRepoMcpHosts,
 	removeRepoMcpHosts,
 } from "./mcp/HostRegistrars.js";
-import { SKILL_GIT_EXCLUDE_PATHS, updateSkillIfNeeded } from "./SkillInstaller.js";
+import {
+	installPluginJolliMenu,
+	JOLLI_MENU_GIT_EXCLUDE_PATHS,
+	PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS,
+	removeClaudeLegacySkills,
+	removePluginJolliMenu,
+	SKILL_GIT_EXCLUDE_PATHS,
+	updateSkillIfNeeded,
+} from "./SkillInstaller.js";
 
 // ─── Re-exports for backward compatibility ──────────────────────────────────
 // External consumers import from "./Installer.js" — these re-exports keep
@@ -191,6 +200,7 @@ export async function install(
 	options?: {
 		source?: "vscode-extension" | "cli";
 		integrationsOnly?: boolean;
+		gitHooksOnly?: boolean;
 		sourceTag?: string;
 	},
 ): Promise<InstallResult> {
@@ -205,7 +215,52 @@ export async function install(
 	// IntelliJ's Java hooks and make memory generation depend on Node.
 	const integrationsOnly = options?.integrationsOnly === true;
 
-	log.info(integrationsOnly ? "Installing Jolli Memory integrations (no hooks)" : "Installing Jolli Memory hooks");
+	// git-hooks-only: the mirror of integrations-only. Installs the git shell
+	// hooks (plus the dispatch scripts + dist-path entry they resolve through) and
+	// skips every integration — MCP registration, most skills, and the
+	// Claude/Gemini/SessionStart agent hooks. It writes ONLY the bare `/jolli`
+	// umbrella menu skill (a plugin skill can only be invoked as `/jolli:<name>`,
+	// so the bare front door must come from a project skill) and actively REMOVES
+	// any global-instructions block a prior version wrote to ~/.claude/CLAUDE.md
+	// (see below) — the plugin drives host guidance through its own skill
+	// descriptions, not the global file. Used by the Claude Code plugin, which
+	// ships its own MCP server, skills, and agent hooks via the plugin manifest and
+	// needs the CLI only to wire the git hooks that drive summary generation (the
+	// Claude Code plugin model does not cover git hooks).
+	const gitHooksOnly = options?.gitHooksOnly === true;
+
+	if (integrationsOnly && gitHooksOnly) {
+		return {
+			success: false,
+			message: "install: integrationsOnly and gitHooksOnly are mutually exclusive",
+			warnings,
+		};
+	}
+
+	// Hook install — and the worktree enumeration every mode runs below — only
+	// makes sense inside a git repository. Without this guard `listWorktrees` fails
+	// deep with a confusing "Failed to list worktrees" error, and callers whose
+	// cwd isn't a repo (e.g. an editor extension host whose process.cwd() is "/")
+	// retry in a failed-enable loop. Bail early and cheaply with a clear reason;
+	// no successful path changes, since reaching listWorktrees already required a
+	// repo. Guards on repo-presence (not work-tree) so a bare repo hosting linked
+	// worktrees — a valid `git worktree` setup — still installs as before.
+	if (!(await isInsideGitRepo(projectDir))) {
+		log.info("Skipping Jolli Memory install — %s is not inside a git work tree", projectDir);
+		return {
+			success: false,
+			message: `Not a git repository — skipping Jolli Memory install (${projectDir})`,
+			warnings,
+		};
+	}
+
+	log.info(
+		gitHooksOnly
+			? "Installing Jolli Memory git hooks only (no integrations)"
+			: integrationsOnly
+				? "Installing Jolli Memory integrations (no hooks)"
+				: "Installing Jolli Memory hooks",
+	);
 
 	try {
 		// Load config to check integration enabled flags (always global)
@@ -242,6 +297,26 @@ export async function install(
 		const sourceTag =
 			options?.sourceTag ?? (callerSource === "vscode-extension" ? deriveSourceTag(callerDistDir) : "cli");
 
+		// Validate the source tag ONCE, up front, before anything is written. Two
+		// downstream consumers reject an invalid tag with *different* failure
+		// contracts: installDistPath returns false, while the git-hook builders
+		// (buildHookCommand / installPrePushHook / installPrepareMsgHook) THROW —
+		// because the tag is interpolated into an auto-executing shell hook, so a hard
+		// refusal there is the safe choice. Letting a bad tag flow through would throw
+		// partway down the git-hook sequence, leaving some hooks written and others not
+		// (a half-registered install). Failing here makes the whole install
+		// all-or-nothing under one uniform result, and leaves those downstream guards
+		// as unreachable-in-normal-flow defense-in-depth. Normal callers never trip
+		// this: "cli", the IntelliJ/plugin explicit tags, and deriveSourceTag's output
+		// are all valid — only a malformed injected tag is rejected.
+		if (!isValidSourceTag(sourceTag)) {
+			return {
+				success: false,
+				message: `Refusing to install with an unsafe source tag: ${JSON.stringify(sourceTag)}`,
+				warnings,
+			};
+		}
+
 		const distPathOk = await installDistPath(sourceTag);
 		if (!distPathOk) {
 			return {
@@ -268,13 +343,16 @@ export async function install(
 		// Run host detectors once before the per-worktree loop so each detector
 		// is called exactly once. Results are reused both inside the loop (for MCP
 		// registration) and after it (for auto-enable config writes / hook installs).
-		const codexDetectedOnce = await isCodexInstalled();
-		const geminiDetectedOnce = await isGeminiInstalled();
-		const cursorDetectedOnce = await isCursorInstalled();
-		const opencodeDetectedOnce = await isOpenCodeInstalled();
-		const copilotDetectedOnce = await isCopilotInstalled();
-		const copilotChatDetectedOnce = await isCopilotChatInstalled();
-		const clineDetectedOnce = (await isClineInstalled()) || (await isClineCliInstalled());
+		// In git-hooks-only mode every host integration is skipped, so these results
+		// go unused — short-circuit the filesystem probes to keep the SessionStart
+		// bootstrap fast (it runs on every new Claude Code session).
+		const codexDetectedOnce = gitHooksOnly ? false : await isCodexInstalled();
+		const geminiDetectedOnce = gitHooksOnly ? false : await isGeminiInstalled();
+		const cursorDetectedOnce = gitHooksOnly ? false : await isCursorInstalled();
+		const opencodeDetectedOnce = gitHooksOnly ? false : await isOpenCodeInstalled();
+		const copilotDetectedOnce = gitHooksOnly ? false : await isCopilotInstalled();
+		const copilotChatDetectedOnce = gitHooksOnly ? false : await isCopilotChatInstalled();
+		const clineDetectedOnce = gitHooksOnly ? false : (await isClineInstalled()) || (await isClineCliInstalled());
 
 		// Install .jolli/jollimemory/ state dir (always) and Claude Code hook (if enabled)
 		let claudeResult: HookOpResult = {};
@@ -295,6 +373,31 @@ export async function install(
 					log.warn("Failed to bootstrap sessions.json in %s: %s", wt, (err as Error).message);
 				}
 				/* v8 ignore stop */
+			}
+			// git-hooks-only: the state dir + sessions.json bootstrap above is all
+			// this worktree needs. Skip MCP registration and the Claude/SessionStart
+			// agent hooks — the Claude Code plugin owns those.
+			if (gitHooksOnly) {
+				// A plugin skill can only be invoked as `/jolli:<name>`; a BARE `/jolli`
+				// front door has to come from a non-plugin project skill. Write just the
+				// umbrella menu (routing to the plugin's own `/jolli:*` skills) into
+				// .claude/skills/jolli/ and keep it out of `git status`.
+				await installPluginJolliMenu(wt);
+				// The plugin ships recall/search/pr/run as namespaced `/jolli:*` skills,
+				// so the unnamespaced `.claude/skills/jolli-*` a pre-plugin `jolli enable`
+				// wrote are now duplicates in the `/` menu. Delete the Jolli-owned ones
+				// (a user's own same-named skill is left untouched). Ordered after the
+				// umbrella write so the plugin-variant umbrella (which outranks the
+				// standalone menu by revision) reclaims `.claude/skills/jolli/` and can't
+				// be left pointing at a skill this just removed.
+				await removeClaudeLegacySkills(wt);
+				// UNION (not replace): git-hooks-only re-runs on every plugin
+				// SessionStart and only knows its own umbrella entry. Replacing the
+				// block would shrink a set a prior full `jolli enable` populated,
+				// un-hiding those paths in `git status` and churning the file each
+				// session. `addGitExcludePaths` merges, leaving other entries intact.
+				await addGitExcludePaths(wt, [...PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS]);
+				continue;
 			}
 			// SKILL.md is written for every enabled target — the cross-platform
 			// `.agents/skills/` target is unconditional, and `.claude/skills/`
@@ -386,10 +489,29 @@ export async function install(
 		// block idempotently, `disabled` heals any stale block. Delegated to
 		// syncGlobalInstructions so every surface shares identical host-gating and
 		// the write/remove decision logic.
-		await syncGlobalInstructions({
-			codexDetected: codexDetectedOnce,
-			geminiDetected: geminiDetectedOnce,
-		});
+		// The Claude Code plugin (git-hooks-only) deliberately does NOT write the
+		// memory-routing block into ~/.claude/CLAUDE.md — the plugin must never
+		// silently edit the user's global instruction file. It relies on its skills'
+		// own `description` fields (and the bare `/jolli` umbrella) to drive
+		// invocation instead. On every SessionStart it actively REMOVES any block a
+		// prior plugin version wrote (marker-bracketed, so all other content is
+		// preserved); idempotent once gone.
+		//
+		// Coexistence caveat (accepted, last-writer-wins): the marker pair is shared,
+		// so `removeGlobalInstructions` can't tell a plugin-written block from one a
+		// full CLI / VS Code install wrote via `syncGlobalInstructions`. On a machine
+		// running BOTH, the plugin's every-SessionStart removal will strip the block
+		// the CLI wrote, and the CLI re-adds it on its next enable — a benign tug-of-war.
+		// This is not specially handled: the plugin targets plugin-only users, and
+		// CLI+plugin on one machine is a redundant setup, not a supported combination.
+		if (!gitHooksOnly) {
+			await syncGlobalInstructions({
+				codexDetected: codexDetectedOnce,
+				geminiDetected: geminiDetectedOnce,
+			});
+		} else {
+			await removeGlobalInstructions();
+		}
 
 		// Git hooks are shared across all worktrees — install once. Skipped in
 		// integrations-only mode (the caller owns its own git hooks); the *HookPath
@@ -400,31 +522,41 @@ export async function install(
 		let postMergeResult: HookOpResult = {};
 		let prePushResult: HookOpResult = {};
 		if (!integrationsOnly) {
-			gitResult = await installGitHook(projectDir);
+			// git-hooks-only means a standalone surface (the Claude Code plugin) owns
+			// these git hooks — SOFT-prefer the source this install just registered in
+			// dist-paths/ (sourceTag) so its dist wins a version tie, while still letting
+			// a strictly-higher-version surface win (JOLLI_DIST_PREFER_SOURCE, not a hard
+			// pin). At git-hook trigger time the invoking client is unknown, so this
+			// degrades to "last enable wins" — acceptable because the plugin re-runs
+			// enable on every SessionStart. Shared installs (CLI / VS Code) leave this
+			// undefined and keep the plain cross-source resolver behavior.
+			const preferSource = gitHooksOnly ? sourceTag : undefined;
+
+			gitResult = await installGitHook(projectDir, preferSource);
 			if (gitResult.warning) {
 				warnings.push(gitResult.warning);
 			}
 
 			// Install Git post-rewrite hook (handles amend/rebase summary migration)
-			postRewriteResult = await installPostRewriteHook(projectDir);
+			postRewriteResult = await installPostRewriteHook(projectDir, preferSource);
 			if (postRewriteResult.warning) {
 				warnings.push(postRewriteResult.warning);
 			}
 
 			// Install Git prepare-commit-msg hook (handles git merge --squash)
-			prepareMsgResult = await installPrepareMsgHook(projectDir);
+			prepareMsgResult = await installPrepareMsgHook(projectDir, preferSource);
 			if (prepareMsgResult.warning) {
 				warnings.push(prepareMsgResult.warning);
 			}
 
 			// Install Git post-merge hook (auto-compiles merged branch summaries after pull/merge)
-			postMergeResult = await installPostMergeHook(projectDir);
+			postMergeResult = await installPostMergeHook(projectDir, preferSource);
 			if (postMergeResult.warning) {
 				warnings.push(postMergeResult.warning);
 			}
 
 			// Install Git pre-push hook (auto-syncs pushed commits' memory to Jolli Space)
-			prePushResult = await installPrePushHook(projectDir);
+			prePushResult = await installPrePushHook(projectDir, preferSource);
 			if (prePushResult.warning) {
 				warnings.push(prePushResult.warning);
 			}
@@ -498,8 +630,12 @@ export async function install(
 
 		// Migrate any existing worktree-level API keys to the global config dir.
 		// The worktrees list always includes the main repo root as its first entry.
-		for (const wt of worktrees) {
-			await migrateWorktreeConfig(wt);
+		// Skipped in git-hooks-only mode — the plugin bootstrap runs on every session
+		// start and this key migration is a one-time integration concern, not a hook.
+		if (!gitHooksOnly) {
+			for (const wt of worktrees) {
+				await migrateWorktreeConfig(wt);
+			}
 		}
 
 		// v3 → v4 → v5 unified schema migration. Idempotent: `migrateSchemaToV5`
@@ -518,6 +654,8 @@ export async function install(
 		// surfaced this bug — see git history of this block).
 		if (options?.source === "vscode-extension") {
 			log.info("Skipping v5 migration on vscode-extension source — Extension.ts owns it with UI");
+		} else if (gitHooksOnly) {
+			log.info("Skipping v5 migration in git-hooks-only mode — runs on every session start");
 		} else {
 			try {
 				const { migrateSchemaToV5 } = await import("../core/SchemaV5Migration.js");
@@ -721,6 +859,14 @@ export async function uninstall(cwd?: string, options?: { integrationsOnly?: boo
 			} catch (mcpErr) {
 				log.warn("MCP removal failed in %s (non-fatal): %s", wt, (mcpErr as Error).message);
 			}
+			// Remove the bare `/jolli` umbrella menu. It's written outside the Claude
+			// Code plugin (into this repo's `.claude/skills/jolli/`), so a plugin-manager
+			// uninstall can't reach it — a code-driven uninstall must, or it lingers as a
+			// broken menu routing to `/jolli:*` skills that no longer exist. Guarded by
+			// our vendor marker so a user's own `jolli` skill is never deleted (see
+			// removePluginJolliMenu). This is the ONE skill uninstall actively removes;
+			// the `jolli-*` siblings stay per the conservative policy noted below.
+			await removePluginJolliMenu(wt);
 		}
 
 		// Git hooks are shared — remove once from the common hooks directory
@@ -736,16 +882,22 @@ export async function uninstall(cwd?: string, options?: { integrationsOnly?: boo
 		await removePostMergeHook(projectDir);
 		await removePrePushHook(projectDir);
 
-		// Conservative skill-cleanup policy: leave the generated SKILL.md files
-		// AND the `.git/info/exclude` block alone. Users sometimes ship their
-		// own skills alongside Jolli's under `.claude/skills/` or
-		// `.agents/skills/`, and a blind `rm -rf` of those directories on
-		// uninstall would delete unrelated user content. The exclude block is
-		// also harmless if left behind — git silently ignores entries that no
-		// longer match anything. Leaving the files behind also means re-enabling
-		// Jolli later is a no-op.
+		// Drop the bare `/jolli` umbrella's exclude line(s) from the shared managed
+		// block (git hooks live in the common dir, so this runs once). The `jolli-*`
+		// sibling entries are deliberately kept — their SKILL.md files are left in
+		// place by the conservative policy below, so their exclude lines stay too.
+		await removeGitExcludePaths(projectDir, JOLLI_MENU_GIT_EXCLUDE_PATHS);
+
+		// Conservative skill-cleanup policy: leave the generated `jolli-*` SKILL.md
+		// files (and their `.git/info/exclude` lines) alone. Users sometimes ship
+		// their own skills alongside Jolli's under `.claude/skills/` or
+		// `.agents/skills/`, and a blind `rm -rf` of those directories on uninstall
+		// would delete unrelated user content. Leaving them behind also means
+		// re-enabling Jolli later is a no-op. The bare `jolli` umbrella is the sole
+		// exception (removed above): it's unambiguously ours and, living outside the
+		// plugin, would otherwise orphan into a broken menu.
 		warnings.push(
-			"Skill files were left in place. To remove them manually: `rm -rf .agents/skills/jolli-* .claude/skills/jolli-*` and delete the `# >>> jolli skill exclude >>>` block from `.git/info/exclude` if you no longer want it.",
+			"The `jolli-*` skill files were left in place. To remove them manually: `rm -rf .agents/skills/jolli-* .claude/skills/jolli-*` and delete the `# >>> jolli skill exclude >>>` block from `.git/info/exclude` if you no longer want it.",
 		);
 
 		log.info("Uninstallation complete");

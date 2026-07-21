@@ -16,6 +16,7 @@
 
 import { execGit, getCommitInfo, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
+import { hasLlmCredentials } from "../core/LlmCredentials.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
@@ -145,17 +146,8 @@ async function worktreeRoots(cwd: string): Promise<string[]> {
 	return [...roots];
 }
 
-function hasLlmCredentials(config: {
-	apiKey?: string;
-	jolliApiKey?: string;
-	aiProvider?: "anthropic" | "jolli" | "local-agent";
-}): boolean {
-	// local-agent drives the tool's own subscription login, not a
-	// jollimemory-held credential — presence of apiKey/jolliApiKey/ANTHROPIC_API_KEY
-	// is not the blocker for it (mirrors resolveLlmCredentialSource in LlmClient.ts).
-	if (config.aiProvider === "local-agent") return true;
-	return Boolean(config.apiKey || config.jolliApiKey || process.env.ANTHROPIC_API_KEY);
-}
+// hasLlmCredentials is imported from ../core/LlmCredentials.js (single source of
+// truth shared with SessionStartHook, the summarizer, and compile).
 
 /** Converts an attributed commit's sessions into the orphan-branch transcript artifact. */
 function toStoredTranscript(attr: AttributedCommit): StoredTranscript {

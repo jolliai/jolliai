@@ -8,14 +8,18 @@ import java.io.File
  * Manages the installation, update, and cleanup of Jolli skill files.
  *
  * Kotlin counterpart of the TypeScript SkillInstaller in
- * `cli/src/install/SkillInstaller.ts`. Writes one byte-identical `SKILL.md`
- * per skill into **both** target directories:
+ * `cli/src/install/SkillInstaller.ts`. Writes one `SKILL.md` per skill into the
+ * cross-platform target only:
  *
- *   - `<projectDir>/.claude/skills/<name>/SKILL.md`  — Claude Code (gated on
- *     `claudeEnabled != false`).
  *   - `<projectDir>/.agents/skills/<name>/SKILL.md`  — the cross-platform Agent
  *     Skills standard (Codex / Cursor / Windsurf / OpenCode / Gemini / Copilot);
  *     always written.
+ *
+ * **Claude Code (`.claude/skills/`) is deliberately NOT a write target.** The
+ * Claude Code plugin owns Claude Code skills as namespaced `/jolli:*`, so writing
+ * unnamespaced `.claude/skills/jolli-*` here would only duplicate them in the `/`
+ * menu (mirrors the CLI — see the module header of `SkillInstaller.ts`). Legacy
+ * `.claude/skills/` directory names are still cleaned up on write.
  *
  * Three skills ship today: `jolli-recall`, `jolli-search`, `jolli-pr`. Each is
  * upserted **independently** by its content revision, so a newer skill is never
@@ -59,11 +63,12 @@ class SkillInstaller(private val projectDir: String) {
 
         /**
          * Target directory families for skill writes, mirroring the CLI's
-         * `SKILL_TARGETS`. `.claude/skills` is gated on `claudeEnabled != false`;
-         * `.agents/skills` (the cross-platform Agent Skills standard) is unconditional.
+         * `SKILL_TARGETS`. Only the cross-platform `.agents/skills` target ships —
+         * Claude Code (`.claude/skills`) is owned by the plugin now, so it is
+         * intentionally absent. `gatedOnClaude` is retained as the re-gating
+         * extension point (the one shipped target is unconditional).
          */
         private val SKILL_TARGETS = listOf(
-            SkillTarget(".claude/skills", gatedOnClaude = true),
             SkillTarget(".agents/skills", gatedOnClaude = false),
         )
 
@@ -86,13 +91,14 @@ class SkillInstaller(private val projectDir: String) {
     private data class SkillTarget(val relativeDir: String, val gatedOnClaude: Boolean)
 
     /**
-     * Writes or updates every Jolli SKILL.md into each enabled target directory,
-     * and removes legacy skill directories from previous versions.
+     * Writes or updates every Jolli SKILL.md into each enabled target directory
+     * (today only the cross-platform `.agents/skills`), and removes legacy skill
+     * directories from previous versions.
      *
-     * `claudeEnabled` gates the `.claude/skills` target (defaults to true — the
-     * same "enabled unless explicitly false" semantics as the CLI). Callers that
-     * have the config in hand should pass `config.claudeEnabled != false`; the
-     * default is resolved from the global config when omitted.
+     * `claudeEnabled` is retained for the `gatedOnClaude` extension point and the
+     * same "enabled unless explicitly false" semantics as the CLI; it no longer
+     * gates a shipped target (Claude Code is owned by the plugin). The default is
+     * resolved from the global config when omitted.
      */
     fun updateSkillIfNeeded(claudeEnabled: Boolean = resolveClaudeEnabled()) {
         val version = resolvePluginVersion()
@@ -123,6 +129,11 @@ class SkillInstaller(private val projectDir: String) {
      * Writes one skill's SKILL.md when this tool's revision is newer than what's on
      * disk. Idempotent; never downgrades a file a newer tool wrote. See the class
      * docstring for the precedence rule.
+     *
+     * A file that carries NO Jolli ownership marker (`vendor: "jolli.ai"` or the
+     * legacy `jolli-skill-version:` frontmatter) is treated as user-authored and
+     * is NEVER overwritten — mirrors the TS-side `isJolliOwnedSkill` guard in
+     * `cli/src/install/SkillInstaller.ts`.
      */
     private fun upsertSkill(skillsDir: File, name: String, content: String, version: String) {
         val skillDir = File(skillsDir, name)
@@ -135,6 +146,11 @@ class SkillInstaller(private val projectDir: String) {
         if (skillPath.exists()) {
             try {
                 val existing = skillPath.readText(Charsets.UTF_8)
+                // Never overwrite a user-authored skill — it lacks the ownership marker.
+                if (!isJolliOwnedSkill(existing)) {
+                    log.info("Skipping %s SKILL.md — no Jolli ownership marker (user-owned)", name)
+                    return
+                }
                 val diskRevision = parseRevision(existing) ?: PREHISTORIC_REVISION
                 if (diskRevision >= myRevision) {
                     // Equal → same content by contract; greater → a newer tool wrote it.
@@ -154,6 +170,15 @@ class SkillInstaller(private val projectDir: String) {
             log.info("Failed to write %s SKILL.md: %s", name, e.message)
         }
     }
+
+    /**
+     * True when the file content carries a Jolli ownership marker — either the
+     * modern `vendor: "jolli.ai"` metadata or the legacy `jolli-skill-version:`
+     * frontmatter. A file with neither was hand-authored by the user and must
+     * never be overwritten. Mirrors `isJolliOwnedSkill` in the TS SkillInstaller.
+     */
+    private fun isJolliOwnedSkill(content: String): Boolean =
+        content.contains("vendor: \"jolli.ai\"") || content.contains("jolli-skill-version:")
 
     /** Parses the shared `metadata.revision` integer, or null when absent/unparseable. */
     private fun parseRevision(content: String): Long? =

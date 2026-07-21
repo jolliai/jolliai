@@ -149,7 +149,9 @@ function renderShortSummary(ctx: {
 	lines.push(`  Files changed: ${ctx.totalFilesChanged}`);
 	lines.push("");
 	lines.push("  Run with --full or --output <path> for full context.");
-	lines.push("  Run the jolli-recall skill (e.g. /jolli-recall in Claude Code) for AI-assisted recall.");
+	// Surface-neutral: never name an unnamespaced `jolli-recall` (it doesn't exist
+	// under the Claude Code plugin, which exposes recall as `/jolli:recall`).
+	lines.push("  For AI-assisted recall, use your agent's Jolli recall skill or the recall MCP tool.");
 	lines.push("");
 
 	return lines.join("\n");

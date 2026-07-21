@@ -7,6 +7,7 @@ import { JOLLI_DIR, JOLLIMEMORY_DIR } from "../Logger.js";
 import {
 	clearSpaceBindingCache,
 	loadSpaceBindingCache,
+	loadSpaceBindingDisplay,
 	SPACE_BINDING_CACHE_FILE,
 	SPACE_BINDING_TTL_MS,
 	type SpaceBindingCacheEntry,
@@ -308,5 +309,49 @@ describe("tenantOriginForKey", () => {
 
 	it("returns null when the embedded URL is unparseable", async () => {
 		expect(tenantOriginForKey(keyFor("not a url"))).toBeNull();
+	});
+});
+
+describe("loadSpaceBindingDisplay", () => {
+	it("returns the space name for a fresh healthy entry", async () => {
+		await writeFile(filePath(), JSON.stringify(validEntry({ spaceName: "Shared Memory" })), "utf-8");
+		expect(await loadSpaceBindingDisplay(cwd)).toEqual({ spaceName: "Shared Memory", canPush: true });
+	});
+
+	it("ignores an origin / repoUrl mismatch (display-only, no tenant match)", async () => {
+		// The differentiator from loadSpaceBindingCache: a snapshot read must not
+		// decode the API key to match tenants, so a mismatched origin still displays.
+		await writeFile(
+			filePath(),
+			JSON.stringify(validEntry({ origin: "https://other.jolli.ai", repoUrl: "https://github.com/x/y" })),
+			"utf-8",
+		);
+		expect(await loadSpaceBindingCache(cwd, KEY)).toBeNull();
+		expect(await loadSpaceBindingDisplay(cwd)).toEqual({ spaceName: "Acme Core", canPush: true });
+	});
+
+	it("maps a null canPush (older server) to canPush:true", async () => {
+		await writeFile(filePath(), JSON.stringify(validEntry({ canPush: null })), "utf-8");
+		expect(await loadSpaceBindingDisplay(cwd)).toEqual({ spaceName: "Acme Core", canPush: true });
+	});
+
+	it("returns null when no cache file exists", async () => {
+		expect(await loadSpaceBindingDisplay(cwd)).toBeNull();
+	});
+
+	it("returns null for an expired entry (past the TTL)", async () => {
+		const stale = new Date(Date.now() - SPACE_BINDING_TTL_MS - 1000).toISOString();
+		await writeFile(filePath(), JSON.stringify(validEntry({ checkedAt: stale })), "utf-8");
+		expect(await loadSpaceBindingDisplay(cwd)).toBeNull();
+	});
+
+	it("returns null for malformed JSON", async () => {
+		await writeFile(filePath(), "{ not json", "utf-8");
+		expect(await loadSpaceBindingDisplay(cwd)).toBeNull();
+	});
+
+	it("returns null for a shape-invalid entry", async () => {
+		await writeFile(filePath(), JSON.stringify({ version: 1, spaceName: "" }), "utf-8");
+		expect(await loadSpaceBindingDisplay(cwd)).toBeNull();
 	});
 });

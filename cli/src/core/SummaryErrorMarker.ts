@@ -8,6 +8,34 @@ import type { CommitSummary, SummaryErrorKind } from "../Types.js";
 export const LLM_FAILED: SummaryErrorKind = "llm-failed";
 
 /**
+ * Marker for the auth-expired subcase of an LLM failure — the local-agent
+ * `claude` login expired or is not signed in. Same grep-ability rationale as
+ * {@link LLM_FAILED}.
+ */
+export const LOCAL_AGENT_AUTH: SummaryErrorKind = "local-agent-auth";
+
+/**
+ * Maps a thrown LLM error to a summary-error marker kind: a LocalAgentAuthError
+ * (the local `claude` login expired / not signed in) becomes
+ * {@link LOCAL_AGENT_AUTH} so surfaces can show sign-in guidance; every other
+ * failure is the generic {@link LLM_FAILED}.
+ *
+ * Matched by `name`, not `instanceof`: esbuild inlines `cli/src/**` into the VS
+ * Code bundle, which can yield two copies of the error class where `instanceof`
+ * silently returns false. The `name` string is stable across those copies.
+ */
+export function classifyLlmFailure(err: unknown): SummaryErrorKind {
+	return (err as { name?: unknown } | null | undefined)?.name === "LocalAgentAuthError"
+		? LOCAL_AGENT_AUTH
+		: LLM_FAILED;
+}
+
+/** Whether a summary's error marker is the auth-expired subcase. */
+export function isLocalAgentAuthError(summary: Pick<CommitSummary, "summaryError">): boolean {
+	return summary.summaryError === LOCAL_AGENT_AUTH;
+}
+
+/**
  * Whether the given summary should surface the "regenerate me" affordance.
  * Reads two fields:
  *   - `summaryError` (new field, set explicitly by all failure paths)

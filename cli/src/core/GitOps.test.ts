@@ -56,6 +56,7 @@ import {
 	getTreeHash,
 	getWorkingTreeDiffStats,
 	isAncestor,
+	isInsideGitRepo,
 	listFilesInBranch,
 	listWorktrees,
 	orphanBranchExists,
@@ -1503,6 +1504,23 @@ describe("GitOps", () => {
 			mockSuccess("../../.git\n");
 			const rootDir = await getProjectRootDir("/repo/worktrees/wt-1");
 			expect(rootDir).toBe(resolve("/repo/worktrees/wt-1", "../.."));
+		});
+	});
+
+	describe("isInsideGitRepo", () => {
+		it("returns true inside a normal work tree", async () => {
+			mockSuccess(".git");
+			expect(await isInsideGitRepo("/main/repo")).toBe(true);
+		});
+
+		it("returns true for a bare repo hosting linked worktrees (git-dir resolves)", async () => {
+			mockSuccess("/some/bare.git");
+			expect(await isInsideGitRepo("/some/bare")).toBe(true);
+		});
+
+		it("returns false (never throws) outside a repo", async () => {
+			mockFailure(128, "fatal: not a git repository (or any of the parent directories): .git");
+			expect(await isInsideGitRepo("/not/a/repo")).toBe(false);
 		});
 	});
 

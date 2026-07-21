@@ -25,3 +25,23 @@ export const JOLLI_CLIENT_HEADER =
 		: /* v8 ignore start -- fallback for an unbundled execution (no `define:` plugin); the vitest config defines both globals so this branch is unreachable from unit tests */
 			"cli/dev";
 /* v8 ignore stop */
+
+/**
+ * Build-time client kind (`__JOLLI_CLIENT_KIND__`), resolved safely.
+ *
+ * The global is a bundler `define:` (vite for the CLI build, esbuild for the
+ * VS Code / plugin builds). Under an unbundled execution — `tsx src/Cli.ts`,
+ * i.e. `npm run cli` in development — no `define:` ran, so a *bare* reference
+ * to `__JOLLI_CLIENT_KIND__` throws `ReferenceError`. `typeof` never throws,
+ * so every runtime read must go through this guard rather than touching the
+ * global directly. Mirrors `JOLLI_CLIENT_HEADER` above.
+ */
+export function resolveClientKind(): typeof __JOLLI_CLIENT_KIND__ {
+	/* v8 ignore next -- the vitest config defines the global, so the `: "cli"` fallback is unreachable from unit tests */
+	return typeof __JOLLI_CLIENT_KIND__ !== "undefined" ? __JOLLI_CLIENT_KIND__ : "cli";
+}
+
+/** True when this bundle is the Claude Code plugin's CLI. Never throws unbundled. */
+export function isClaudePluginBuild(): boolean {
+	return resolveClientKind() === "claude-plugin";
+}

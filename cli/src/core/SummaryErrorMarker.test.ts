@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { CommitSummary } from "../Types.js";
-import { isSummaryError, LLM_FAILED, withSummaryError } from "./SummaryErrorMarker.js";
+import { LocalAgentAuthError, LocalAgentSetupError } from "./localagent/Types.js";
+import {
+	classifyLlmFailure,
+	isLocalAgentAuthError,
+	isSummaryError,
+	LLM_FAILED,
+	LOCAL_AGENT_AUTH,
+	withSummaryError,
+} from "./SummaryErrorMarker.js";
 
 const baseSummary: CommitSummary = {
 	version: 4,
@@ -94,5 +102,31 @@ describe("SummaryErrorMarker", () => {
 		const input = { ...baseSummary };
 		withSummaryError(input);
 		expect(input.summaryError).toBeUndefined();
+	});
+
+	it("classifyLlmFailure maps a LocalAgentAuthError to the auth-specific kind", () => {
+		expect(classifyLlmFailure(new LocalAgentAuthError("expired"))).toBe(LOCAL_AGENT_AUTH);
+	});
+
+	it("classifyLlmFailure maps any other error to the generic kind", () => {
+		expect(classifyLlmFailure(new LocalAgentSetupError("boom"))).toBe(LLM_FAILED);
+		expect(classifyLlmFailure(new Error("network"))).toBe(LLM_FAILED);
+	});
+
+	it("classifyLlmFailure matches by name so it survives esbuild class duplication", () => {
+		// A structurally-equal object with the right `name` (mimicking a
+		// cross-bundle copy where instanceof would fail) is still classified.
+		expect(classifyLlmFailure({ name: "LocalAgentAuthError", message: "x" })).toBe(LOCAL_AGENT_AUTH);
+	});
+
+	it("classifyLlmFailure tolerates null / undefined", () => {
+		expect(classifyLlmFailure(null)).toBe(LLM_FAILED);
+		expect(classifyLlmFailure(undefined)).toBe(LLM_FAILED);
+	});
+
+	it("isLocalAgentAuthError is true only for the auth marker", () => {
+		expect(isLocalAgentAuthError({ summaryError: LOCAL_AGENT_AUTH })).toBe(true);
+		expect(isLocalAgentAuthError({ summaryError: LLM_FAILED })).toBe(false);
+		expect(isLocalAgentAuthError({ summaryError: undefined })).toBe(false);
 	});
 });

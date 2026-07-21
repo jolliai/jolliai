@@ -77,6 +77,23 @@ export function deriveSourceTag(extensionPath: string): string {
 	return createHash("sha256").update(extensionPath).digest("hex").slice(0, 8);
 }
 
+/**
+ * A source tag names a `dist-paths/<tag>` file AND is interpolated into the
+ * `JOLLI_DIST_PREFER_SOURCE=<tag>` env prefix of generated, auto-executing git hooks.
+ * Every value `deriveSourceTag` produces already satisfies this shape, but the
+ * user-facing `enable --source-tag <tag>` flag is unconstrained — a tag with a
+ * space / shell metacharacter would inject into the hook, and a `/` or `..`
+ * would traverse out of `dist-paths/`. Constrain it to lowercase
+ * alphanumerics + hyphen (must start alphanumeric) so it is safe as both a
+ * shell token and a path segment.
+ */
+const SOURCE_TAG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+
+/** True when `tag` is safe to use as a dist-paths filename and a shell env value. */
+export function isValidSourceTag(tag: string): boolean {
+	return SOURCE_TAG_PATTERN.test(tag);
+}
+
 // ─── File I/O ────────────────────────────────────────────────────────────────
 
 /**

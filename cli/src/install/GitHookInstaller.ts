@@ -12,6 +12,7 @@ import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { resolveGitHooksDir } from "../core/GitOps.js";
 import { createLogger } from "../Logger.js";
+import { isValidSourceTag } from "./DistPathResolver.js";
 import type { HookOpResult } from "./HookSettingsHelper.js";
 import { buildHookCommand } from "./HookSettingsHelper.js";
 
@@ -41,12 +42,13 @@ const PRE_PUSH_MARKER_END = "# <<< JolliMemory pre-push hook <<<";
  * Installs the git post-commit hook.
  * If a hook already exists, appends Jolli Memory's section.
  */
-export async function installGitHook(projectDir: string): Promise<HookOpResult> {
+export async function installGitHook(projectDir: string, distSource?: string): Promise<HookOpResult> {
 	const hooksDir = await resolveGitHooksDir(projectDir);
 	const hookPath = join(hooksDir, "post-commit");
 
-	// Build hook command using dist-path indirection (resolved at runtime via shell)
-	const hookCommandLine = buildHookCommand("post-commit");
+	// Build hook command using dist-path indirection (resolved at runtime via shell).
+	// distSource soft-prefers resolution toward one source (version tie only; Claude Code plugin: "claude-plugin").
+	const hookCommandLine = buildHookCommand("post-commit", "", distSource);
 	const hookSection = [HOOK_MARKER_START, hookCommandLine, HOOK_MARKER_END].join("\n");
 
 	let warning: string | undefined;
@@ -103,30 +105,50 @@ export async function installGitHook(projectDir: string): Promise<HookOpResult> 
  * Installs the git post-rewrite hook (handles amend/rebase summary migration).
  * If a hook already exists, appends Jolli Memory's section.
  */
-export async function installPostRewriteHook(projectDir: string): Promise<HookOpResult> {
+export async function installPostRewriteHook(projectDir: string, distSource?: string): Promise<HookOpResult> {
 	// post-rewrite receives the command ("amend" or "rebase") as $1
-	const hookCommandLine = buildHookCommand("post-rewrite", '"$1"');
+	const hookCommandLine = buildHookCommand("post-rewrite", '"$1"', distSource);
 	const hookSection = [POST_REWRITE_MARKER_START, hookCommandLine, POST_REWRITE_MARKER_END].join("\n");
 
-	return installGenericGitHook(projectDir, "post-rewrite", hookSection, hookCommandLine, POST_REWRITE_MARKER_START);
+	return installGenericGitHook(projectDir, "post-rewrite", hookSection, POST_REWRITE_MARKER_START);
 }
 
 /**
  * Installs the git prepare-commit-msg hook (handles git merge --squash).
  * If a hook already exists, appends Jolli Memory's section.
+ *
+ * Guarded the same three ways as pre-push: `[ -x ]` skips a missing/incomplete
+ * run-hook, `|| true` swallows a non-zero exit from Jolli itself, and — because
+ * this section is APPENDED to any existing hook — the preceding command's exit
+ * status is captured and restored via a subshell. git aborts the commit on a
+ * non-zero prepare-commit-msg exit, so a preceding section's failure must still
+ * abort; without the restore, our best-effort `if … || true; fi` (which always
+ * exits 0) would silently turn that failure into success.
  */
-export async function installPrepareMsgHook(projectDir: string): Promise<HookOpResult> {
-	// prepare-commit-msg receives the commit message file as $1 and source type as $2
-	const hookCommandLine = buildHookCommand("prepare-commit-msg", '"$1" "$2"');
+export async function installPrepareMsgHook(projectDir: string, distSource?: string): Promise<HookOpResult> {
+	// prepare-commit-msg receives the commit message file as $1 and source type as $2.
+	const runHook = '"$HOME/.jolli/jollimemory/run-hook"';
+	// Defense-in-depth, unreachable in the normal flow: install() validates the tag
+	// once up front and aborts all-or-nothing. Kept here (and matching buildHookCommand)
+	// because this line interpolates the tag into an auto-executing hook — a direct
+	// caller that bypasses the up-front check must still hard-fail, not emit unsafe shell.
+	if (distSource !== undefined && !isValidSourceTag(distSource)) {
+		throw new Error(
+			`Refusing to build prepare-commit-msg hook with unsafe source tag: ${JSON.stringify(distSource)}`,
+		);
+	}
+	const prefer = distSource ? `JOLLI_DIST_PREFER_SOURCE='${distSource}' ` : "";
+	// Mirror the pre-push guard exactly: preserve the preceding command's status so an
+	// existing validation failure still aborts the commit, while the [ -x ] + || true
+	// pair keeps a missing run-hook or a Jolli-side error from blocking it.
+	const hookCommandLine = [
+		"__jolli_prepare_msg_previous_status=$?",
+		`if [ -x ${runHook} ]; then ${prefer}${runHook} prepare-commit-msg "$1" "$2" || true; fi`,
+		'(exit "$__jolli_prepare_msg_previous_status")',
+	].join("\n");
 	const hookSection = [PREPARE_MSG_MARKER_START, hookCommandLine, PREPARE_MSG_MARKER_END].join("\n");
 
-	return installGenericGitHook(
-		projectDir,
-		"prepare-commit-msg",
-		hookSection,
-		hookCommandLine,
-		PREPARE_MSG_MARKER_START,
-	);
+	return installGenericGitHook(projectDir, "prepare-commit-msg", hookSection, PREPARE_MSG_MARKER_START);
 }
 
 /**
@@ -134,11 +156,11 @@ export async function installPrepareMsgHook(projectDir: string): Promise<HookOpR
  * after `git pull`/`git merge` completes).
  * If a hook already exists, appends Jolli Memory's section.
  */
-export async function installPostMergeHook(projectDir: string): Promise<HookOpResult> {
-	const hookCommandLine = buildHookCommand("post-merge");
+export async function installPostMergeHook(projectDir: string, distSource?: string): Promise<HookOpResult> {
+	const hookCommandLine = buildHookCommand("post-merge", "", distSource);
 	const hookSection = [POST_MERGE_MARKER_START, hookCommandLine, POST_MERGE_MARKER_END].join("\n");
 
-	return installGenericGitHook(projectDir, "post-merge", hookSection, hookCommandLine, POST_MERGE_MARKER_START);
+	return installGenericGitHook(projectDir, "post-merge", hookSection, POST_MERGE_MARKER_START);
 }
 
 /**
@@ -149,7 +171,7 @@ export async function installPostMergeHook(projectDir: string): Promise<HookOpRe
  * `"$@"` forwards the args and `exec` inherits stdin, so PrePushHook.js sees
  * both.
  */
-export async function installPrePushHook(projectDir: string): Promise<HookOpResult> {
+export async function installPrePushHook(projectDir: string, distSource?: string): Promise<HookOpResult> {
 	// pre-push is the only hook where non-zero exit aborts the git operation.
 	// Guard with [ -x ] + || true so a missing run-hook or absent Node can
 	// NEVER block the user's push (aligned with IntelliJ's prePushScript).
@@ -157,14 +179,27 @@ export async function installPrePushHook(projectDir: string): Promise<HookOpResu
 	// so letting our best-effort command become the script's final status would
 	// turn a preceding failure into success and incorrectly allow the push.
 	const runHook = '"$HOME/.jolli/jollimemory/run-hook"';
+	// distSource SOFT-prefers one source (Claude Code plugin: "claude-plugin") via
+	// JOLLI_DIST_PREFER_SOURCE — resolve-dist-path picks it only when present,
+	// complete, and at the top version, else falls through to cross-source. Mirrors
+	// buildHookCommand; the other four git hooks bake the same var through it, but
+	// pre-push builds its line inline (the [ -x ] + || true guard), so re-assert the
+	// tag shape here too — this value is interpolated into an auto-executing hook.
+	// Like prepare-commit-msg, this is unreachable defense-in-depth: install() already
+	// validated the tag up front. It THROWS (not returns) for the same reason — a bad
+	// tag reaching a shell-interpolation boundary must hard-fail.
+	if (distSource !== undefined && !isValidSourceTag(distSource)) {
+		throw new Error(`Refusing to build pre-push hook with unsafe source tag: ${JSON.stringify(distSource)}`);
+	}
+	const prefer = distSource ? `JOLLI_DIST_PREFER_SOURCE='${distSource}' ` : "";
 	const hookCommandLine = [
 		"__jolli_pre_push_previous_status=$?",
-		`if [ -x ${runHook} ]; then ${runHook} pre-push "$@" || true; fi`,
+		`if [ -x ${runHook} ]; then ${prefer}${runHook} pre-push "$@" || true; fi`,
 		'(exit "$__jolli_pre_push_previous_status")',
 	].join("\n");
 	const hookSection = [PRE_PUSH_MARKER_START, hookCommandLine, PRE_PUSH_MARKER_END].join("\n");
 
-	return installGenericGitHook(projectDir, "pre-push", hookSection, hookCommandLine, PRE_PUSH_MARKER_START);
+	return installGenericGitHook(projectDir, "pre-push", hookSection, PRE_PUSH_MARKER_START);
 }
 
 /**
@@ -175,7 +210,6 @@ async function installGenericGitHook(
 	projectDir: string,
 	hookName: string,
 	hookSection: string,
-	scriptPath: string,
 	markerStart: string,
 ): Promise<HookOpResult> {
 	const markerEnd = hookSection.slice(hookSection.lastIndexOf("\n") + 1);
@@ -189,8 +223,12 @@ async function installGenericGitHook(
 		existingContent = await readFile(hookPath, "utf-8");
 
 		if (existingContent.includes(markerStart)) {
-			// Check if the section already has the correct script path
-			if (existingContent.includes(scriptPath)) {
+			// Check if the section is already byte-identical to what we'd write.
+			// (A naive `includes(scriptPath)` substring check would false-positive
+			// when the existing line carries a JOLLI_DIST_PREFER_SOURCE prefix that
+			// the current caller omits — the unprefixed scriptPath is a substring
+			// of the prefixed line.)
+			if (existingContent.includes(hookSection)) {
 				return { path: hookPath };
 			}
 

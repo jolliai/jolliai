@@ -23,17 +23,21 @@
  *   - .jolli/jollimemory/plans.json → associated plan names
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
+import { resolveClientKind } from "../core/ClientHeader.js";
 import { readFileFromBranch } from "../core/GitOps.js";
-import { normalizePlansRegistry } from "../core/SessionTracker.js";
+import { hasLlmCredentials } from "../core/LlmCredentials.js";
+import { loadConfig, normalizePlansRegistry, saveConfig } from "../core/SessionTracker.js";
+import { isLocalAgentAuthError } from "../core/SummaryErrorMarker.js";
 import { getDisplayDate } from "../core/SummaryFormat.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
 import { createLogger, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
-import type { CommitSummary, DiffStats, PlansRegistry, SummaryIndexEntry } from "../Types.js";
+import type { CommitSummary, DiffStats, JolliMemoryConfig, PlansRegistry, SummaryIndexEntry } from "../Types.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
+import { AUTH_FAILURE_REMINDER_TEXT } from "./AuthRemediation.js";
 import { readStdin } from "./HookUtils.js";
 
 const log = createLogger("SessionStartHook");
@@ -48,6 +52,180 @@ interface BriefingCache {
 	readonly lastCommitHash: string;
 	readonly briefingText: string;
 	readonly generatedAt: string;
+}
+
+// ─── Login reminder (Claude Code plugin only) ────────────────────────────────
+
+/**
+ * Per-repo marker that silences the not-signed-in reminder. Lives beside the
+ * other per-project state (`.jolli/jollimemory/`) so it is worktree-scoped.
+ * Created on the user's request ("stop reminding me"); auto-removed once a
+ * credential appears (see {@link getLoginReminder}).
+ */
+const LOGIN_REMINDER_DISMISS_MARKER = "login-reminder-dismissed";
+
+/**
+ * Shown at session start when the Claude Code plugin has no way to generate
+ * memories yet. Plain text — Claude Code displays it to the user AND injects it
+ * into Claude's context, so it doubles as an instruction the agent can act on.
+ */
+const LOGIN_REMINDER_TEXT = [
+	"[Jolli Memory] Not signed in — no memories are being generated for your commits.",
+	"→ Run /jolli:login to sign in to Jolli (AI summaries, no Anthropic API key needed).",
+	`(To stop this reminder without signing in, create an empty file at` +
+		` .jolli/jollimemory/${LOGIN_REMINDER_DISMISS_MARKER} in this repo.)`,
+].join("\n");
+
+/**
+ * Pure decision for whether to surface the not-signed-in reminder. Kept
+ * side-effect-free so every branch is unit-testable regardless of the build's
+ * `__JOLLI_CLIENT_KIND__` value (which is fixed to `"cli"` in the CLI build).
+ *
+ * Only the Claude Code plugin shows this: the CLI and VS Code surfaces have
+ * their own sign-in UX, and gating here keeps the reminder out of their
+ * session-start output.
+ */
+export function computeLoginReminder(clientKind: string, hasCredential: boolean, dismissed: boolean): string | null {
+	if (clientKind !== "claude-plugin") return null;
+	if (hasCredential) return null;
+	if (dismissed) return null;
+	return LOGIN_REMINDER_TEXT;
+}
+
+/**
+ * The Claude Code plugin defaults `aiProvider` to `"local-agent"`. A plugin user
+ * is by definition running inside Claude Code, so a signed-in `claude` CLI is
+ * already on hand — driving it through the local-agent backend generates memories
+ * with zero extra setup: no Anthropic API key, no Jolli sign-in. We seed that
+ * choice on the plugin's session start, but ONLY when the user has expressed no
+ * explicit provider preference; an explicit "anthropic" / "jolli" / "local-agent"
+ * pick is never overwritten. `localAgentTool` is seeded alongside so the runner
+ * has its target tool.
+ *
+ * Called BEFORE {@link getLoginReminder} in `main()` so a brand-new plugin user is
+ * immediately "credentialed" (`hasLlmCredentials` counts local-agent) and never
+ * sees the spurious "Not signed in — no memories" reminder on their first session.
+ *
+ * Gated to the plugin build (`clientKind === "claude-plugin"`): the CLI and VS Code
+ * surfaces keep their own default-derivation and are intentionally left untouched.
+ * Returns whether it wrote the default. Swallows write failures — a config-write
+ * hiccup must never block session startup or suppress the briefing; the fallback
+ * (no write) just leaves the reminder armed, which is the safe direction.
+ */
+export async function ensurePluginDefaultProvider(
+	clientKind: string,
+	config: Pick<JolliMemoryConfig, "aiProvider">,
+): Promise<boolean> {
+	if (clientKind !== "claude-plugin") return false;
+	if (config.aiProvider !== undefined) return false;
+	try {
+		await saveConfig({ aiProvider: "local-agent", localAgentTool: "claude-code" });
+		log.info("Seeded default aiProvider=local-agent for the Claude Code plugin");
+		return true;
+	} catch (error) {
+		log.info("Failed to seed default local-agent provider: %s", (error as Error).message);
+		return false;
+	}
+}
+
+/**
+ * Wiring for {@link computeLoginReminder}: resolves the build's client kind,
+ * whether any LLM credential is configured (Anthropic key, Jolli Space key, or the
+ * `local-agent` provider — which needs no jollimemory-held key), and whether the
+ * dismiss marker is present — then returns the reminder text or null. Also cleans
+ * up a stale dismiss marker once a credential exists, so a later sign-out re-arms
+ * the reminder cleanly.
+ */
+export async function getLoginReminder(projectDir: string): Promise<string | null> {
+	const clientKind = resolveClientKind();
+	const config = await loadConfig();
+	// Authoritative predicate (shared with the summarizer / compile / back-fill):
+	// counts `local-agent` as credentialed. A hand-rolled key-only check here would
+	// falsely tell local-agent users "Not signed in" though they generate memories
+	// fine. Imported from the LlmCredentials leaf so this LLM-free hook stays light.
+	const hasCredential = hasLlmCredentials(config);
+	const markerPath = join(projectDir, ".jolli", "jollimemory", LOGIN_REMINDER_DISMISS_MARKER);
+	const dismissed = existsSync(markerPath);
+
+	// Once a credential is present, a leftover dismiss marker is moot — remove it
+	// so signing out later starts from a clean slate.
+	if (hasCredential && dismissed) {
+		try {
+			rmSync(markerPath);
+		} catch {
+			// Non-fatal — a stale marker only suppresses a reminder that a present
+			// credential already suppresses.
+		}
+	}
+
+	return computeLoginReminder(clientKind, hasCredential, dismissed);
+}
+
+// ─── Local-agent auth-failure reminder (Claude Code plugin only) ──────────────
+
+/**
+ * Reminder text is shared with the post-commit inline surface (see
+ * {@link file://./AuthRemediation.ts}) so the two never drift. No manual
+ * dismiss marker (unlike the not-signed-in reminder): a broken-login state is
+ * transient, not a steady-state choice, so silencing it would just keep
+ * generation failing silently — the exact UX this exists to kill. It clears
+ * automatically once a later commit generates successfully (the marker on the
+ * newest commit is then absent).
+ */
+
+/**
+ * Reads the newest summarized commit on the current branch and reports whether
+ * it carries the local-agent auth-failure marker. One git read (mirrors
+ * {@link loadLastSummary}); reads current truth, so the reminder self-clears
+ * after a successful regeneration without any persisted dismiss state.
+ */
+async function isLatestCommitAuthFailure(commitHash: string, cwd: string): Promise<boolean> {
+	try {
+		const raw = await readFileFromBranch(ORPHAN_BRANCH, `summaries/${commitHash}.json`, cwd);
+		if (!raw) return false;
+		return isLocalAgentAuthError(JSON.parse(raw) as CommitSummary);
+	} catch (error: unknown) {
+		/* v8 ignore next 3 - defensive: summary load failure degrades to "no reminder" */
+		log.info("Failed to check auth-failure state for %s: %s", commitHash.substring(0, 8), (error as Error).message);
+		return false;
+	}
+}
+
+/**
+ * Returns the auth-failure reminder when the newest summarized commit on the
+ * current branch failed on an expired local `claude` login, else null.
+ *
+ * Plugin-only (like {@link getLoginReminder}): other surfaces have their own
+ * failure UI. Checks only the NEWEST commit — a later healthy commit means the
+ * login is working again, so nothing to remind about.
+ *
+ * Unlike the branch briefing, this deliberately does NOT skip main/master/etc.
+ * (`SKIP_BRANCHES`): a broken local login fails generation on EVERY branch, so a
+ * user who only ever commits on `main` must still be warned. The only branch
+ * guard is a detached HEAD (no branch to scan).
+ *
+ * `clientKind` is injected (defaulting to the build's resolved kind) for the
+ * same reason {@link computeLoginReminder} takes it: the CLI test build pins
+ * `__JOLLI_CLIENT_KIND__` to "cli", so a hard-coded `resolveClientKind()` here
+ * would make the plugin path untestable.
+ */
+export async function getAuthFailureReminder(
+	projectDir: string,
+	clientKind: string = resolveClientKind(),
+): Promise<string | null> {
+	if (clientKind !== "claude-plugin") return null;
+	const branch = getCurrentBranch(projectDir);
+	if (!branch) return null;
+	const index = await getIndex(projectDir);
+	if (!index) return null;
+	const rootEntries = index.entries.filter(
+		(e) => e.branch === branch && (e.parentCommitHash === null || e.parentCommitHash === undefined),
+	);
+	if (rootEntries.length === 0) return null;
+	const newest = [...rootEntries].sort(
+		(a, b) => new Date(getDisplayDate(b)).getTime() - new Date(getDisplayDate(a)).getTime(),
+	)[0];
+	return (await isLatestCommitAuthFailure(newest.commitHash, projectDir)) ? AUTH_FAILURE_REMINDER_TEXT : null;
 }
 
 /**
@@ -70,16 +248,33 @@ export async function main(): Promise<void> {
 
 		log.info("SessionStartHook invoked (cwd=%s)", projectDir);
 
-		const result = await Promise.race([generateBriefing(projectDir), timeout(HARD_TIMEOUT_MS)]);
+		// Seed the Claude Code plugin's default AI provider (local-agent) on first
+		// use — before the login-reminder check below re-reads config — so a fresh
+		// plugin user generates memories via their local `claude` with no sign-in and
+		// never sees the spurious "Not signed in" nag. No-op off the plugin build or
+		// once any explicit provider choice exists.
+		await ensurePluginDefaultProvider(resolveClientKind(), await loadConfig());
 
-		if (result) {
-			log.info("Briefing generated (%d chars)", result.length);
-			// Output plain text — Claude Code displays it to the user AND
-			// injects it into Claude's context. JSON hookSpecificOutput is
-			// invisible to users, so we use plain text for visibility.
-			process.stdout.write(result);
+		// All three reads run in parallel, each individually bounded by the hard
+		// timeout so the ENTIRE hook (not just the briefing) respects the <500 ms
+		// ceiling. A slow git read in getAuthFailureReminder can no longer push the
+		// session start past the documented performance contract.
+		const [briefing, authReminder, reminder] = await Promise.all([
+			Promise.race([generateBriefing(projectDir), timeout(HARD_TIMEOUT_MS)]),
+			Promise.race([getAuthFailureReminder(projectDir), timeout(HARD_TIMEOUT_MS)]),
+			Promise.race([getLoginReminder(projectDir), timeout(HARD_TIMEOUT_MS)]),
+		]);
+
+		// Output plain text — Claude Code displays it to the user AND injects it
+		// into Claude's context. JSON hookSpecificOutput is invisible to users, so
+		// we use plain text for visibility. Actionable reminders lead; the branch
+		// briefing follows.
+		const sections = [authReminder, reminder, briefing].filter((s): s is string => Boolean(s));
+		if (sections.length > 0) {
+			log.info("SessionStart output (%d sections)", sections.length);
+			process.stdout.write(sections.join("\n\n"));
 		} else {
-			log.info("No briefing generated (skipped or timed out)");
+			log.info("No briefing or reminder generated (skipped or timed out)");
 		}
 	} catch (error: unknown) {
 		/* v8 ignore next 2 - defensive: main() catches unexpected errors to never block session startup */
@@ -301,19 +496,33 @@ function buildBriefingText(
 		lines.push(`Plans: ${planNames.join("; ")}`);
 	}
 
-	// Line 6: Recall suggestion based on time gap. Phrasing covers every
-	// agent host — Claude Code uses `/jolli-recall`, other platforms (Codex,
-	// Cursor, OpenCode, Windsurf, Gemini) invoke the same skill via natural
-	// language, mentions, or their own slash syntax.
-	if (daysSinceLastCommit > 3) {
-		lines.push(
-			`Warning: ${daysSinceLastCommit} days since last commit. Suggest running the jolli-recall skill (e.g. /jolli-recall in Claude Code) for full context.`,
-		);
-	} else if (daysSinceLastCommit > 0) {
-		lines.push("Tip: run the jolli-recall skill (e.g. /jolli-recall in Claude Code) for full context");
-	}
+	// Line 6: Recall suggestion based on time gap.
+	const recallSuggestion = formatRecallSuggestion(daysSinceLastCommit, resolveClientKind());
+	if (recallSuggestion) lines.push(recallSuggestion);
 
 	return lines.join("\n");
+}
+
+/**
+ * Builds the session-start recall call-to-action, or null when the last commit is
+ * same-day (nothing to suggest).
+ *
+ * The recall entry point differs by surface, so this deliberately NEVER names an
+ * unnamespaced `jolli-recall` skill: the Claude Code plugin exposes recall as the
+ * namespaced `/jolli:recall` skill, while every other surface reaches the same
+ * capability through the `jolli recall` CLI (the `recall` MCP tool wraps the same
+ * engine). Recall defaults to the current branch, so no argument is needed.
+ *
+ * Pure and `clientKind`-parameterized (mirrors {@link computeLoginReminder}) so both
+ * the plugin and non-plugin branches are unit-testable regardless of the build's
+ * fixed `__JOLLI_CLIENT_KIND__` (always `"cli"` in the CLI test build).
+ */
+export function formatRecallSuggestion(daysSinceLastCommit: number, clientKind: string): string | null {
+	if (daysSinceLastCommit <= 0) return null;
+	const recallHint = clientKind === "claude-plugin" ? "/jolli:recall" : "`jolli recall`";
+	return daysSinceLastCommit > 3
+		? `Warning: ${daysSinceLastCommit} days since last commit. Run ${recallHint} for full context.`
+		: `Tip: run ${recallHint} for full context`;
 }
 
 /**

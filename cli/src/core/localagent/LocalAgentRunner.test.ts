@@ -78,6 +78,24 @@ describe("runInvocation", () => {
 		).rejects.toBeInstanceOf(LocalAgentSetupError);
 	});
 
+	it("resolves the stdout envelope on a NONZERO exit when stdout is non-empty", async () => {
+		// `claude -p --output-format json` reports auth/API failures as an is_error
+		// envelope on STDOUT while exiting 1. The runner must hand that stdout to
+		// the caller (so the backend's parseResult can classify it, e.g. into an
+		// auth error) rather than discarding it and rejecting with the empty stderr.
+		const envelope = '{"is_error":true,"result":"OAuth session expired and could not be refreshed"}';
+		const out = await runInvocation(inv, {
+			spawnImpl: fakeSpawn({ stdout: envelope, stderr: "", code: 1 }),
+		});
+		expect(out).toBe(envelope);
+	});
+
+	it("still rejects on a nonzero exit when stdout is empty (opaque failure)", async () => {
+		await expect(
+			runInvocation(inv, { spawnImpl: fakeSpawn({ stderr: "opaque boom", code: 1 }) }),
+		).rejects.toBeInstanceOf(LocalAgentSetupError);
+	});
+
 	it("throws a transient error on timeout and kills the child", async () => {
 		await expect(runInvocation(inv, { timeoutMs: 20, spawnImpl: fakeSpawn({ hang: true }) })).rejects.toThrowError(
 			LocalAgentTransientError,

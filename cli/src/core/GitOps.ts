@@ -847,6 +847,20 @@ export async function getProjectRootDir(cwd: string): Promise<string> {
 }
 
 /**
+ * Whether `cwd` is inside any git repository (`git rev-parse --git-dir` exits 0).
+ * Cheap guard for operations that only make sense in a repo (hook install,
+ * worktree enumeration): lets callers bail with a clear reason instead of
+ * failing deep inside a git subcommand. Never throws — a non-repo `cwd` (or a
+ * missing `git`) resolves to `false`. Intentionally returns `true` for any git
+ * context — including a bare repo that hosts linked worktrees — so it only
+ * blocks genuinely-non-git directories and never a valid `git worktree` setup.
+ */
+export async function isInsideGitRepo(cwd: string): Promise<boolean> {
+	const result = await execGit(["rev-parse", "--git-dir"], cwd);
+	return result.exitCode === 0;
+}
+
+/**
  * Returns the absolute paths of all git worktrees for the repository.
  * Parses the output of `git worktree list --porcelain` and extracts lines
  * starting with "worktree " to collect each worktree path.

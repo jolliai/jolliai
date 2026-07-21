@@ -8,6 +8,7 @@
 
 import type { Command } from "commander";
 import { loadAuthToken } from "../auth/AuthConfig.js";
+import { isClaudePluginBuild } from "../core/ClientHeader.js";
 import type { ClineScanError } from "../core/ClineTranscriptShared.js";
 import { deriveRepoNameFromUrl, getCanonicalRepoUrl } from "../core/GitRemoteUtils.js";
 import {
@@ -219,7 +220,7 @@ export function describeSpaceBinding(state: SpaceBindingStatus): string {
 }
 
 /** Inputs to describeIntegrationStatus — one row in the CLI integration block. */
-interface IntegrationStatusInputs {
+export interface IntegrationStatusInputs {
 	readonly enabled: boolean;
 	/** undefined = this integration has no hook concept (Codex, OpenCode). */
 	readonly hookInstalled: boolean | undefined;
@@ -241,7 +242,7 @@ interface IntegrationStatusInputs {
  * scan-error channel. Wording is kept aligned with VSCode so users see the
  * same language in both surfaces.
  */
-function describeIntegrationStatus(x: IntegrationStatusInputs): string {
+export function describeIntegrationStatus(x: IntegrationStatusInputs): string {
 	if (x.scanError) {
 		return `unavailable — ${x.scanError.kind}`;
 	}
@@ -257,6 +258,136 @@ function describeIntegrationStatus(x: IntegrationStatusInputs): string {
 		return `hook installed${suffix}`;
 	}
 	return `detected & enabled${suffix}`;
+}
+
+/**
+ * Whether Claude's agent hook is effectively active. The Claude Code plugin wires
+ * its Stop/SessionStart hooks through its own manifest (hooks.json), NOT
+ * `.claude/settings*.json`, so the settings-file probe `claudeHookInstalled` reads
+ * false for a plugin-only install even though the hooks are live. When the caller
+ * IS the plugin, treat the manifest hooks as active. Shared by both `jolli status`
+ * and the MCP `status` tool so the two surfaces never disagree about the plugin.
+ */
+export function resolveClaudeHookActive(status: StatusInfo, isClaudePlugin: boolean): boolean {
+	return status.claudeHookInstalled || isClaudePlugin;
+}
+
+/** The one-line hook summary (`"5 Git + 2 Claude + 1 Gemini CLI"` / `"none installed"`). */
+export function buildHookSummary(status: StatusInfo, claudeHookActive: boolean): string {
+	const hookParts: string[] = [];
+	if (status.gitHookInstalled) hookParts.push(`${status.prePushHookInstalled ? 5 : 4} Git`);
+	if (claudeHookActive) hookParts.push("2 Claude");
+	if (status.geminiHookInstalled) hookParts.push("1 Gemini CLI");
+	return hookParts.length > 0 ? hookParts.join(" + ") : "none installed";
+}
+
+/** The `<source>@<version>` hook-runtime string, or undefined when no hook source is registered. */
+export function buildHookRuntime(status: StatusInfo): string | undefined {
+	return status.hookSource
+		? `${status.hookSource}${status.hookVersion && status.hookVersion !== "unknown" ? `@${status.hookVersion}` : ""}`
+		: undefined;
+}
+
+/** One detected integration, ready to render via {@link describeIntegrationStatus}. */
+export interface IntegrationRow {
+	readonly name: string;
+	readonly inputs: IntegrationStatusInputs;
+}
+
+/**
+ * The canonical per-integration row table, filtered to detected integrations.
+ * Shared by `jolli status` (which adds a `:` label + column padding) and the MCP
+ * `status` tool (which uses `name` verbatim) so the enabled/hook/session rules
+ * live in exactly one place and can't drift between surfaces.
+ */
+export function buildIntegrationRows(
+	status: StatusInfo,
+	opts: { readonly claudeEnabled: boolean; readonly claudeHookActive: boolean },
+): IntegrationRow[] {
+	const counts = status.sessionsBySource ?? {};
+	const rows: ReadonlyArray<readonly [name: string, detected: boolean | undefined, inputs: IntegrationStatusInputs]> =
+		[
+			[
+				"Claude",
+				status.claudeDetected,
+				{ enabled: opts.claudeEnabled, hookInstalled: opts.claudeHookActive, sessionCount: counts.claude },
+			],
+			[
+				"Codex",
+				status.codexDetected,
+				{ enabled: status.codexEnabled !== false, hookInstalled: undefined, sessionCount: counts.codex },
+			],
+			[
+				"Gemini",
+				status.geminiDetected,
+				{
+					enabled: status.geminiEnabled !== false,
+					hookInstalled: status.geminiHookInstalled,
+					sessionCount: counts.gemini,
+				},
+			],
+			[
+				"OpenCode",
+				status.openCodeDetected,
+				{
+					enabled: status.openCodeEnabled !== false,
+					hookInstalled: undefined,
+					sessionCount: counts.opencode,
+					scanError: status.openCodeScanError,
+				},
+			],
+			[
+				"Cursor",
+				status.cursorDetected,
+				{
+					enabled: status.cursorEnabled !== false,
+					hookInstalled: undefined,
+					sessionCount: counts.cursor,
+					scanError: status.cursorScanError,
+				},
+			],
+			[
+				"Devin",
+				status.devinDetected,
+				{
+					enabled: status.devinEnabled !== false,
+					hookInstalled: undefined,
+					sessionCount: counts.devin,
+					scanError: status.devinScanError,
+				},
+			],
+			[
+				"Copilot",
+				(status.copilotDetected ?? false) || (status.copilotChatDetected ?? false),
+				{
+					enabled: status.copilotEnabled !== false,
+					hookInstalled: undefined,
+					sessionCount: (counts.copilot ?? 0) + (counts["copilot-chat"] ?? 0),
+					scanError: status.copilotScanError,
+				},
+			],
+			[
+				"Cline",
+				status.clineDetected ?? false,
+				{
+					enabled: status.clineEnabled !== false,
+					hookInstalled: undefined,
+					sessionCount: (counts.cline ?? 0) + (counts["cline-cli"] ?? 0),
+					scanError: status.clineScanError,
+				},
+			],
+			[
+				"Antigravity",
+				status.antigravityDetected,
+				{
+					enabled: status.antigravityEnabled !== false,
+					hookInstalled: undefined,
+					sessionCount: counts.antigravity,
+					scanError: status.antigravityScanError,
+				},
+			],
+		];
+	return rows.filter(([, detected]) => detected).map(([name, , inputs]) => ({ name, inputs }));
 }
 
 /** Registers the `status` command on the given Commander program. */
@@ -278,16 +409,12 @@ export function registerStatusCommand(program: Command): void {
 				return;
 			}
 
-			// Build hooks description matching VSCode STATUS panel format
-			const hookParts: string[] = [];
-			if (status.gitHookInstalled) hookParts.push(`${status.prePushHookInstalled ? 5 : 4} Git`);
-			if (status.claudeHookInstalled) hookParts.push("2 Claude");
-			if (status.geminiHookInstalled) hookParts.push("1 Gemini CLI");
-			const hooksDesc = hookParts.length > 0 ? hookParts.join(" + ") : "none installed";
-
-			const hookRuntime = status.hookSource
-				? `${status.hookSource}${status.hookVersion && status.hookVersion !== "unknown" ? `@${status.hookVersion}` : ""}`
-				: undefined;
+			// Hook summary + runtime, shared verbatim with the MCP `status` tool.
+			// Fold plugin-hook awareness the same way the MCP tool does, so a
+			// plugin-only install reports Claude consistently on both surfaces.
+			const claudeHookActive = resolveClaudeHookActive(status, isClaudePluginBuild());
+			const hooksDesc = buildHookSummary(status, claudeHookActive);
+			const hookRuntime = buildHookRuntime(status);
 
 			// Load config for Jolli Site display (same layered logic as enable).
 			// `jolliUrl` is the persisted public site origin, written on every
@@ -332,137 +459,36 @@ export function registerStatusCommand(program: Command): void {
 			// undetected ones stay hidden to keep the output terse (same rule as
 			// the VSCode STATUS panel). Claude's enabled flag lives in config, not
 			// StatusInfo, so read it from the already-loaded `config`.
-			const counts = status.sessionsBySource ?? {};
+			// Per-integration breakdown, built from the shared table so `jolli status`
+			// and the MCP `status` tool apply identical enabled/hook/session rules.
+			// Only detected integrations are returned; the CLI adds a `:` label + column
+			// padding. Claude's enabled flag lives in config, not StatusInfo.
+			//
+			// Copilot and Cline are dual-variant sources (terminal CLI + editor); each
+			// prints an indented breakdown sub-line directly beneath its own row (keyed
+			// on `name` inside the loop) rather than after the loop, so the sub-line
+			// can't attach to the last integration row.
 			const subIndent = "".padEnd(18);
 			const mark = (detected: boolean | undefined): string => (detected ? "✓" : "✗");
-
-			// Copilot and Cline are dual-variant sources (terminal CLI + editor). Each
-			// prints an indented breakdown sub-line beneath its main row. These are
-			// attached to the row tuple (not emitted after the loop) so they render
-			// directly under their own row rather than the last integration row.
-			const copilotSubLines: string[] = [];
-			const anyCopilotDetected = (status.copilotDetected ?? false) || (status.copilotChatDetected ?? false);
-			if (anyCopilotDetected) {
-				copilotSubLines.push(
-					`  ${subIndent}↳ CLI: ${mark(status.copilotDetected)}, Chat: ${mark(status.copilotChatDetected)}`,
-				);
-				if (status.copilotChatScanError) {
-					copilotSubLines.push(
-						`  ${subIndent}↳ Chat scan failed (${status.copilotChatScanError.kind}): ${status.copilotChatScanError.message}`,
+			const integrationRows = buildIntegrationRows(status, {
+				claudeEnabled: config?.claudeEnabled !== false,
+				claudeHookActive,
+			});
+			for (const { name, inputs } of integrationRows) {
+				console.log(`  ${`${name}:`.padEnd(18)}${describeIntegrationStatus(inputs)}`);
+				if (name === "Copilot") {
+					console.log(
+						`  ${subIndent}↳ CLI: ${mark(status.copilotDetected)}, Chat: ${mark(status.copilotChatDetected)}`,
 					);
-				}
-			}
-			const clineSubLines: string[] = [];
-			if (status.clineDetected) {
-				clineSubLines.push(
-					`  ${subIndent}↳ CLI: ${mark(status.clineCliDetected)}, VS Code: ${mark(status.clineVscodeDetected)}`,
-				);
-			}
-
-			const integrationRows: ReadonlyArray<
-				readonly [
-					label: string,
-					detected: boolean | undefined,
-					inputs: IntegrationStatusInputs,
-					subLines?: readonly string[],
-				]
-			> = [
-				[
-					"Claude:",
-					status.claudeDetected,
-					{
-						enabled: config?.claudeEnabled !== false,
-						hookInstalled: status.claudeHookInstalled,
-						sessionCount: counts.claude,
-					},
-				],
-				[
-					"Codex:",
-					status.codexDetected,
-					{
-						enabled: status.codexEnabled !== false,
-						hookInstalled: undefined,
-						sessionCount: counts.codex,
-					},
-				],
-				[
-					"Gemini:",
-					status.geminiDetected,
-					{
-						enabled: status.geminiEnabled !== false,
-						hookInstalled: status.geminiHookInstalled,
-						sessionCount: counts.gemini,
-					},
-				],
-				[
-					"OpenCode:",
-					status.openCodeDetected,
-					{
-						enabled: status.openCodeEnabled !== false,
-						hookInstalled: undefined,
-						sessionCount: counts.opencode,
-						scanError: status.openCodeScanError,
-					},
-				],
-				[
-					"Cursor:",
-					status.cursorDetected,
-					{
-						enabled: status.cursorEnabled !== false,
-						hookInstalled: undefined,
-						sessionCount: counts.cursor,
-						scanError: status.cursorScanError,
-					},
-				],
-				[
-					"Devin:",
-					status.devinDetected,
-					{
-						enabled: status.devinEnabled !== false,
-						hookInstalled: undefined,
-						sessionCount: counts.devin,
-						scanError: status.devinScanError,
-					},
-				],
-				[
-					"Copilot:",
-					anyCopilotDetected,
-					{
-						enabled: status.copilotEnabled !== false,
-						hookInstalled: undefined,
-						sessionCount: (counts.copilot ?? 0) + (counts["copilot-chat"] ?? 0),
-						// CLI scan error renders on the main row; Chat scan error renders as a sub-line below.
-						scanError: status.copilotScanError,
-					},
-					copilotSubLines,
-				],
-				[
-					"Cline:",
-					status.clineDetected ?? false,
-					{
-						enabled: status.clineEnabled !== false,
-						hookInstalled: undefined,
-						sessionCount: (counts.cline ?? 0) + (counts["cline-cli"] ?? 0),
-						scanError: status.clineScanError,
-					},
-					clineSubLines,
-				],
-				[
-					"Antigravity:",
-					status.antigravityDetected,
-					{
-						enabled: status.antigravityEnabled !== false,
-						hookInstalled: undefined,
-						sessionCount: counts.antigravity,
-						scanError: status.antigravityScanError,
-					},
-				],
-			];
-			for (const [label, detected, inputs, subLines] of integrationRows) {
-				if (!detected) continue;
-				console.log(`  ${label.padEnd(18)}${describeIntegrationStatus(inputs)}`);
-				for (const line of subLines ?? []) {
-					console.log(line);
+					if (status.copilotChatScanError) {
+						console.log(
+							`  ${subIndent}↳ Chat scan failed (${status.copilotChatScanError.kind}): ${status.copilotChatScanError.message}`,
+						);
+					}
+				} else if (name === "Cline") {
+					console.log(
+						`  ${subIndent}↳ CLI: ${mark(status.clineCliDetected)}, VS Code: ${mark(status.clineVscodeDetected)}`,
+					);
 				}
 			}
 

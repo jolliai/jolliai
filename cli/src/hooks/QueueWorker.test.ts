@@ -14,6 +14,17 @@ vi.mock("../core/GitOps.js", () => ({
 	getProjectRootDir: vi.fn().mockImplementation((cwd: string) => Promise.resolve(cwd)),
 }));
 
+// CaptureProgress is the interactive-feedback stream (its own real behavior is
+// covered by CaptureProgress.test.ts). Here it is a spy so tests can assert the
+// lifecycle events the worker emits, without touching the filesystem.
+vi.mock("./CaptureProgress.js", () => ({
+	CAPTURE_PROGRESS_MAX_AGE_MS: 60 * 60 * 1000,
+	acquireCaptureLock: vi.fn(),
+	emitCaptureProgress: vi.fn(),
+	pruneStaleCaptureProgress: vi.fn(),
+	releaseCaptureLock: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../core/SessionTracker.js")>();
 	return {
@@ -481,6 +492,7 @@ import { appendCredentialMissingRun } from "../core/IngestRunStore.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
 import { LlmCredentialError } from "../core/LlmClient.js";
 import { acquireIngestLock, acquireWorkerLock, releaseIngestLock, releaseWorkerLock } from "../core/Locks.js";
+import { LocalAgentAuthError } from "../core/localagent/Types.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import {
@@ -1409,6 +1421,31 @@ describe("QueueWorker", () => {
 			const stored = vi.mocked(storeSummary).mock.calls[0][0];
 			expect(stored.summaryError).toBe("llm-failed");
 		});
+
+		it("writes the auth-specific marker when both attempts throw LocalAgentAuthError", async () => {
+			// The local `claude` login expired — both attempts throw
+			// LocalAgentAuthError. The placeholder still lands, but the marker is
+			// the auth-specific kind so the SessionStart reminder + post-commit
+			// output can show sign-in guidance instead of a generic failure.
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/auth.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			vi.mocked(generateSummary)
+				.mockRejectedValueOnce(new LocalAgentAuthError("OAuth session expired"))
+				.mockRejectedValueOnce(new LocalAgentAuthError("OAuth session expired"));
+
+			await runWorker("/test/cwd");
+
+			expect(generateSummary).toHaveBeenCalledTimes(2);
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			const stored = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(stored.topics).toEqual([]);
+			expect(stored.llm?.stopReason).toBe("error");
+			expect(stored.summaryError).toBe("local-agent-auth");
+		});
 	});
 
 	describe("Cursor integration", () => {
@@ -2286,6 +2323,22 @@ describe("QueueWorker", () => {
 	describe("squash helpers", () => {
 		it("should skip squash queue entries without source hashes", async () => {
 			await expect(__test__.handleSquashFromQueue(makeCommitOp(), "/test/cwd")).resolves.toBeUndefined();
+		});
+
+		it("emits a terminal `failed` for an unknown queue entry type so the watcher never hangs", async () => {
+			const { emitCaptureProgress } = await import("./CaptureProgress.js");
+			vi.mocked(emitCaptureProgress).mockClear();
+			// A corrupt / future queue entry whose type matches no switch case. It
+			// stores nothing, so the interactive watcher must be told `failed`
+			// rather than left on "analysis continues in the background…". storage
+			// is never read (the branch-less op returns before the tail step).
+			const op = makeCommitOp({ type: "bogus" as CommitGitOperation["type"] });
+			await expect(__test__.processQueueEntry(op, "/test/cwd", {} as never, false)).resolves.toBeUndefined();
+			expect(vi.mocked(emitCaptureProgress)).toHaveBeenCalledWith("/test/cwd", op.commitHash, "failed");
+			// The `finally` still closes the stream with a terminal `end`.
+			expect(vi.mocked(emitCaptureProgress)).toHaveBeenCalledWith("/test/cwd", op.commitHash, "end", {
+				terminal: true,
+			});
 		});
 
 		it("should default squash commitSource to cli", async () => {

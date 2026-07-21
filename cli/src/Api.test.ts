@@ -132,6 +132,7 @@ vi.mock("./install/DistPathResolver.js", () => ({
 	traverseDistPaths: vi.fn().mockReturnValue([]),
 	migrateLegacyDistPath: vi.fn().mockResolvedValue(false),
 	deriveSourceTag: vi.fn().mockReturnValue("cli"),
+	isValidSourceTag: (tag: string) => /^[a-z0-9][a-z0-9-]*$/.test(tag),
 }));
 
 vi.mock("open", () => ({
@@ -839,6 +840,67 @@ describe("CLI", () => {
 		it("does NOT touch the opt-out for --integrations-only enable", async () => {
 			await main(["enable", "--integrations-only"]);
 			expect(writeManualDisableFlag).not.toHaveBeenCalled();
+		});
+
+		it("rejects an unsafe --source-tag before calling install", async () => {
+			await main(["enable", "--cwd", "/tmp/test-project", "--source-tag", "bad tag; rm -rf /"]);
+			expect(process.exitCode).toBe(1);
+			expect(install).not.toHaveBeenCalled();
+			expect(console.error).toHaveBeenCalledWith(expect.stringContaining("--source-tag"));
+		});
+
+		it("rejects --integrations-only + --git-hooks-only as mutually exclusive", async () => {
+			await main(["enable", "--integrations-only", "--git-hooks-only", "--cwd", "/tmp/test-project"]);
+			expect(process.exitCode).toBe(1);
+			expect(install).not.toHaveBeenCalled();
+			expect(console.error).toHaveBeenCalledWith(expect.stringContaining("mutually exclusive"));
+		});
+
+		it("forwards a valid --source-tag to install", async () => {
+			await main(["enable", "--cwd", "/tmp/test-project", "--source-tag", "intellij"]);
+			expect(vi.mocked(install)).toHaveBeenCalledWith(
+				"/tmp/test-project",
+				expect.objectContaining({ sourceTag: "intellij" }),
+			);
+		});
+
+		it("emits a reloadSkills SessionStart signal on --git-hooks-only success with --reload-skills", async () => {
+			await main(["enable", "--git-hooks-only", "--reload-skills", "--cwd", "/tmp/test-project"]);
+			const stdoutWrites = vi.mocked(process.stdout.write).mock.calls.map((c) => String(c[0]));
+			const signal = stdoutWrites.find((w) => w.includes("reloadSkills"));
+			expect(signal).toBeDefined();
+			// Pure JSON on exit 0 — Claude Code parses it as structured hook output
+			// (not injected into context) and re-scans skills after SessionStart hooks.
+			expect(JSON.parse(signal as string)).toEqual({
+				hookSpecificOutput: { hookEventName: "SessionStart", reloadSkills: true },
+			});
+			// The git-hooks-only stdout stream must be exactly one JSON write — a
+			// stray console.log on this path would corrupt Claude Code's JSON parse.
+			expect(stdoutWrites).toHaveLength(1);
+		});
+
+		it("stays silent (no reloadSkills signal) on --git-hooks-only without --reload-skills", async () => {
+			await main(["enable", "--git-hooks-only", "--cwd", "/tmp/test-project"]);
+			const wroteSignal = vi
+				.mocked(process.stdout.write)
+				.mock.calls.map((c) => String(c[0]))
+				.some((w) => w.includes("reloadSkills"));
+			expect(wroteSignal).toBe(false);
+		});
+
+		it("skips the --git-hooks-only bootstrap when the repo is manually disabled", async () => {
+			// The Claude Code plugin re-runs this bootstrap on every SessionStart;
+			// a prior `jolli disable` (repo-wide opt-out) must not be silently
+			// reinstalled. Bail before install(), silently, exit 0.
+			vi.mocked(readManualDisableFlag).mockResolvedValueOnce(true);
+			await main(["enable", "--git-hooks-only", "--reload-skills", "--cwd", "/tmp/test-project"]);
+			expect(install).not.toHaveBeenCalled();
+			expect(process.exitCode).not.toBe(1);
+			const wroteSignal = vi
+				.mocked(process.stdout.write)
+				.mock.calls.map((c) => String(c[0]))
+				.some((w) => w.includes("reloadSkills"));
+			expect(wroteSignal).toBe(false);
 		});
 	});
 
