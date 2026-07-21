@@ -23,7 +23,7 @@ import type { SessionInfo } from "../Types.js";
 import { getAntigravityVariants } from "./AntigravityDetector.js";
 import { unwrapUserRequest } from "./AntigravityTranscriptReader.js";
 import { listWorktrees } from "./GitOps.js";
-import { normalizePathForCompare } from "./PathUtils.js";
+import { sessionDirBelongsToRepo } from "./SessionDirMatch.js";
 import { classifyScanError, hasNodeSqliteSupport, type SqliteScanError, withSqliteDb } from "./SqliteHelpers.js";
 
 const log = createLogger("AntigravityDiscoverer");
@@ -123,19 +123,22 @@ async function readTitle(transcriptPath: string): Promise<string | undefined> {
 }
 
 /**
- * Resolves the normalized set of worktree roots for the repo containing
- * `projectDir`. Antigravity records the checkout the IDE was opened in, which is
- * frequently a *different* worktree than the one committing (e.g. the IDE sits
- * on the main checkout while commits happen from a linked feature worktree), so
- * a plain `workspacePath === projectDir` match drops the conversation. Matching
- * against every worktree root attributes the conversation to the same repo
- * regardless of which worktree runs the hook. Falls back to exact-match on
- * `projectDir` when git is unavailable or the dir is not inside a repo.
+ * Resolves the set of worktree roots (raw, unnormalized paths) for the repo
+ * containing `projectDir`. Antigravity records the checkout the IDE was opened
+ * in, which is frequently a *different* worktree than the one committing (e.g.
+ * the IDE sits on the main checkout while commits happen from a linked feature
+ * worktree), so matching against every worktree root attributes the conversation
+ * to the same repo regardless of which worktree runs the hook. Falls back to
+ * just `projectDir` when git is unavailable or the dir is not inside a repo.
+ *
+ * Paths are kept raw (not `normalizePathForCompare`d) because the caller feeds
+ * them to `sessionDirBelongsToRepo`, whose nested-repo `.git` walk needs the
+ * real on-disk path; that helper does the separator/case folding itself.
  */
 async function resolveWorktreeRoots(projectDir: string): Promise<ReadonlySet<string>> {
-	const roots = new Set<string>([normalizePathForCompare(projectDir)]);
+	const roots = new Set<string>([projectDir]);
 	try {
-		for (const wt of await listWorktrees(projectDir)) roots.add(normalizePathForCompare(wt));
+		for (const wt of await listWorktrees(projectDir)) roots.add(wt);
 	} catch (err) {
 		log.debug("listWorktrees failed for %s (falling back to exact match): %s", projectDir, errMsg(err));
 	}
@@ -207,7 +210,12 @@ export async function scanAntigravitySessions(projectDir: string, home?: string)
 				continue;
 			}
 
-			if (!workspacePath || !worktreeRoots.has(normalizePathForCompare(workspacePath))) continue;
+			// Prefix/containment match (shared `sessionDirBelongsToRepo`, like the
+			// other hookless sources): a workspace recorded in a *subdirectory* of a
+			// worktree still belongs to the repo (JOLLI-2015), while a nested git
+			// repo / submodule inside it is excluded via the helper's `.git` walk.
+			if (!workspacePath || ![...worktreeRoots].some((root) => sessionDirBelongsToRepo(workspacePath, root)))
+				continue;
 
 			const transcriptPath = join(variant.brainDir, convId, ...TRANSCRIPT_RELPATH);
 			if (!existsSync(transcriptPath)) {

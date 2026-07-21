@@ -13,7 +13,8 @@
  * Algorithm:
  *   1. Scan ~/.codex/sessions/YYYY/MM/DD/ for recent JSONL files
  *   2. Read only line 1 of each file (session_meta) to extract cwd
- *   3. Match cwd against the current project directory
+ *   3. Match cwd against the project dir via sessionDirBelongsToRepo (prefix/
+ *      containment + nested-repo exclusion, shared with Devin/OpenCode/Copilot)
  *   4. Also scan ~/.codex/archived_sessions/ for recently archived sessions
  *   5. Return matching sessions as SessionInfo[] with source="codex"
  *
@@ -23,11 +24,12 @@
 
 import { createReadStream } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
-import { homedir, platform } from "node:os";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { createLogger } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
+import { sessionDirBelongsToRepo } from "./SessionDirMatch.js";
 
 const log = createLogger("CodexDiscoverer");
 
@@ -207,14 +209,13 @@ async function tryParseSessionMeta(filePath: string, resolvedProject: string): P
 			return null;
 		}
 
-		// Match cwd against the project directory
-		// On Windows, drive letter case may differ (e.g. Codex stores "e:\foo" vs "E:\foo")
-		const resolvedCwd = resolve(cwd);
-		const cwdMatch =
-			platform() === "win32"
-				? resolvedCwd.toLowerCase() === resolvedProject.toLowerCase()
-				: resolvedCwd === resolvedProject;
-		if (!cwdMatch) {
+		// Match cwd against the project directory via `sessionDirBelongsToRepo`
+		// (shared with Devin/OpenCode/Copilot): prefix/containment with separator +
+		// case folding (handling the Windows "e:\foo" vs "E:\foo" drive-letter drift)
+		// plus the nested-repo exclusion. It replaced the exact `resolvedCwd ===
+		// resolvedProject` match, which silently dropped every session run from a
+		// subdirectory of the repo (JOLLI-2015).
+		if (!sessionDirBelongsToRepo(resolve(cwd), resolvedProject)) {
 			return null;
 		}
 

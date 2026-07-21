@@ -35,7 +35,9 @@ const SCHEMA_STATEMENTS = [
 
 interface SeedSession {
 	id: string;
-	cwd: string;
+	// `null` seeds a SQL NULL cwd — Copilot CLI stores this for sessions started
+	// outside any project (see the null-cwd regression test below).
+	cwd: string | null;
 	updated_at: string;
 	// Optional override for the sessions.summary column. `undefined` (default)
 	// inserts SQL NULL — matches the historical fixture shape so existing tests
@@ -95,14 +97,43 @@ describe("scanCopilotSessions", () => {
 		expect(sessions[0].transcriptPath).toMatch(/session-store\.db#a$/);
 	});
 
-	it("returns multiple matching sessions ordered by updated_at DESC", async () => {
+	// JOLLI-2015: a session run from a subdirectory of the project (common in a
+	// monorepo, `cd packages/foo && copilot`) IS attributed to the repo via
+	// prefix/containment matching — semantics shared with Devin/OpenCode.
+	it("returns a session run in a subdirectory of the project (prefix match)", async () => {
+		await withFixture([
+			{ id: "sub", cwd: platformPath("/Users/x/project/packages/foo"), updated_at: isoFromNow() },
+		]);
+		const { scanCopilotSessions } = await import("./CopilotSessionDiscoverer.js");
+		const { sessions } = await scanCopilotSessions(platformPath("/Users/x/project"));
+		expect(sessions.map((s) => s.sessionId)).toEqual(["sub"]);
+	});
+
+	// A session living in a NESTED git repo / submodule inside the worktree belongs
+	// to the inner repo's own post-commit, not this one — an intervening `.git`
+	// excludes it. Uses a real temp dir so `.git` can exist on disk.
+	it("does NOT return a session inside a nested git repo under the project", async () => {
+		const { mkdir } = await import("node:fs/promises");
+		const realRepo = await mkdtemp(join(tmpdir(), "copilot-nested-"));
+		cleanups.push(() => rm(realRepo, { recursive: true, force: true }));
+		const nested = join(realRepo, "vendor", "lib");
+		await mkdir(join(nested, ".git"), { recursive: true });
+		await withFixture([{ id: "nested", cwd: resolve(nested), updated_at: isoFromNow() }]);
+		const { scanCopilotSessions } = await import("./CopilotSessionDiscoverer.js");
+		const { sessions } = await scanCopilotSessions(resolve(realRepo));
+		expect(sessions).toEqual([]);
+	});
+
+	it("returns every matching session (order is not part of the contract)", async () => {
+		// The query has no ORDER BY — all rows passing the directory + staleness filters
+		// are kept regardless of order — so assert on set membership, not order.
 		await withFixture([
 			{ id: "older", cwd: platformPath("/p"), updated_at: isoFromNow(2_000) },
 			{ id: "newer", cwd: platformPath("/p"), updated_at: isoFromNow(1_000) },
 		]);
 		const { scanCopilotSessions } = await import("./CopilotSessionDiscoverer.js");
 		const { sessions } = await scanCopilotSessions(platformPath("/p"));
-		expect(sessions.map((s) => s.sessionId)).toEqual(["newer", "older"]);
+		expect(sessions.map((s) => s.sessionId).sort()).toEqual(["newer", "older"]);
 	});
 
 	it("normalizes trailing slashes on the projectDir", async () => {
@@ -168,6 +199,23 @@ describe("scanCopilotSessions", () => {
 		const { sessions, error } = await scanCopilotSessions(platformPath("/Users/x/project"));
 		expect(sessions).toEqual([]);
 		expect(error?.kind).toBe("corrupt");
+	});
+
+	// Regression: Copilot CLI stores cwd = NULL for a session started outside any
+	// project. The scan maps `sessionDirBelongsToRepo` over every row in one
+	// flatMap, so a null-cwd row must be skipped rather than throwing — otherwise
+	// that single poison row aborts the whole scan and drops every session (the
+	// "Copilot capture stopped working" bug: one null row → source flagged
+	// unavailable, zero sessions summarized).
+	it("skips a null-cwd row without poisoning the rest of the scan", async () => {
+		await withFixture([
+			{ id: "null-cwd", cwd: null, updated_at: isoFromNow(1_000) },
+			{ id: "good", cwd: platformPath("/p"), updated_at: isoFromNow(2_000) },
+		]);
+		const { scanCopilotSessions } = await import("./CopilotSessionDiscoverer.js");
+		const { sessions, error } = await scanCopilotSessions(platformPath("/p"));
+		expect(error).toBeUndefined();
+		expect(sessions.map((s) => s.sessionId)).toEqual(["good"]);
 	});
 
 	it("skips a row whose updated_at is non-finite", async () => {

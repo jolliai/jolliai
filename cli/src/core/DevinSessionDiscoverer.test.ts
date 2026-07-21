@@ -324,15 +324,13 @@ describe("DevinSessionDiscoverer", () => {
 			expect(await discoverDevinSessions(projectDir)).toEqual([]);
 		});
 
-		// Contract, not a limitation to "fix" silently: matching is intentionally
-		// an exact repo-root equality (see sessionMatchesDir docstring), so a
-		// session started from a *subdirectory* of the project — common in a
-		// monorepo (`cd packages/foo && devin …`) — is NOT attributed to the repo.
-		// Capture requires running Devin at the repo root (or attaching the root as
-		// a workspace_dir). If this ever needs to change, it is a deliberate
-		// semantics decision across all hookless directory-scoped sources, not a
-		// spot edit here — flipping this test guards against an accidental change.
-		it("does NOT match a session started in a subdirectory of the project (exact-match contract)", async () => {
+		// JOLLI-2015: a session started from a *subdirectory* of the project —
+		// common in a monorepo (`cd packages/foo && devin …`) — IS attributed to
+		// the repo. Matching is prefix/containment (see sessionMatchesDir docstring
+		// → sessionDirBelongsToRepo), so the child path resolves to the repo root.
+		// This replaced the previous exact-equality contract that silently dropped
+		// every subdirectory session.
+		it("matches a session started in a subdirectory of the project (prefix match)", async () => {
 			const dbDir = join(fakeDataHome, "devin", "cli");
 			const nowSec = Math.floor(Date.now() / 1000);
 			await createDevinDb(dbDir, [
@@ -343,7 +341,28 @@ describe("DevinSessionDiscoverer", () => {
 				},
 			]);
 
-			expect(await discoverDevinSessions(projectDir)).toEqual([]);
+			const sessions = await discoverDevinSessions(projectDir);
+			expect(sessions.map((s) => s.sessionId)).toEqual(["in-subdir"]);
+		});
+
+		// The prefix match must not swallow a session that lives in a NESTED git
+		// repo / submodule inside the worktree — that session belongs to the inner
+		// repo's own post-commit. An intervening `.git` between the session dir and
+		// the repo root excludes it (see sessionDirBelongsToRepo). Uses a real temp
+		// dir so `.git` can exist on disk.
+		it("does NOT match a session inside a nested git repo under the project", async () => {
+			const dbDir = join(fakeDataHome, "devin", "cli");
+			const nowSec = Math.floor(Date.now() / 1000);
+			const realRepo = await mkdtemp(join(tmpdir(), "devin-nested-"));
+			try {
+				const nested = join(realRepo, "vendor", "lib");
+				await mkdir(join(nested, ".git"), { recursive: true });
+				await createDevinDb(dbDir, [{ id: "nested", workingDirectory: nested, lastActivityAt: nowSec - 100 }]);
+
+				expect(await discoverDevinSessions(realRepo)).toEqual([]);
+			} finally {
+				await rm(realRepo, { recursive: true, force: true });
+			}
 		});
 
 		it.each([

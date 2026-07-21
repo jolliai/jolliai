@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, realpathSync, utimesSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -124,6 +124,37 @@ sqliteOnly("AntigravitySessionDiscoverer", () => {
 		// ...discovered while running from the sibling WORKTREE.
 		const sessions = await discoverAntigravitySessions(wt, home);
 		expect(sessions.map((s) => s.sessionId)).toEqual(["cross-wt"]);
+	});
+
+	// JOLLI-2015: a conversation recorded in a subdirectory of the project (the IDE
+	// opened on a subpackage, or a CLI variant run from `cd packages/foo`) IS
+	// attributed to the repo via prefix/containment matching — shared with the other
+	// hookless sources.
+	it("discovers a conversation recorded in a subdirectory of the project (prefix match)", async () => {
+		const home = freshDir("agy-home-");
+		const ws = freshDir("repo-");
+		createAntigravityConvo(home, {
+			convId: "in-subdir",
+			workspacePath: join(ws, "packages", "foo"),
+			transcriptLines: REAL_TRANSCRIPT_FULL,
+		});
+		const sessions = await discoverAntigravitySessions(ws, home);
+		expect(sessions.map((s) => s.sessionId)).toEqual(["in-subdir"]);
+	});
+
+	// A conversation living in a NESTED git repo / submodule inside the worktree
+	// belongs to the inner repo, not this one — an intervening `.git` excludes it.
+	it("skips a conversation inside a nested git repo under the project", async () => {
+		const home = freshDir("agy-home-");
+		const ws = realpathSync(freshDir("repo-"));
+		const nested = join(ws, "vendor", "lib");
+		mkdirSync(join(nested, ".git"), { recursive: true });
+		createAntigravityConvo(home, {
+			convId: "nested",
+			workspacePath: nested,
+			transcriptLines: REAL_TRANSCRIPT_FULL,
+		});
+		expect(await discoverAntigravitySessions(ws, home)).toHaveLength(0);
 	});
 
 	it("de-duplicates a conversation present under multiple variants, keeping the newest", async () => {

@@ -2,7 +2,9 @@
  * GitHub Copilot CLI session discoverer.
  *
  * Copilot stores every session in ~/.copilot/session-store.db. Each session row
- * carries its own `cwd`, so workspace attribution is exact. Sessions older than
+ * carries its own `cwd`; attribution is prefix/containment via
+ * `sessionDirBelongsToRepo` (shared with Devin/OpenCode), so a session run from a
+ * subdirectory of the repo is still captured (JOLLI-2015). Sessions older than
  * 48 hours are excluded — matches the OpenCode / Cursor / Codex convention so a
  * user enabling Copilot for the first time doesn't pull months of history into
  * the next commit summary. Synthetic transcript path: "<dbPath>#<sessionId>".
@@ -13,6 +15,7 @@ import { resolve } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
 import { getCopilotDbPath } from "./CopilotDetector.js";
+import { sessionDirBelongsToRepo } from "./SessionDirMatch.js";
 import { classifyScanError, type SqliteScanError, withSqliteDb } from "./SqliteHelpers.js";
 
 const log = createLogger("CopilotDiscoverer");
@@ -54,17 +57,26 @@ export async function scanCopilotSessions(projectDir: string): Promise<CopilotSc
 
 	try {
 		const sessions = await withSqliteDb(dbPath, (db) => {
-			const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
-			const cwdMatch = caseInsensitive ? "LOWER(cwd) = LOWER(:cwd)" : "cwd = :cwd";
+			// The directory match runs in JS via `sessionDirBelongsToRepo` (shared with
+			// Devin/OpenCode): prefix/containment with separator + case folding plus the
+			// nested-repo exclusion. It replaced the SQL `cwd = :cwd` (and its win32/darwin
+			// LOWER() variant), which silently dropped every session run from a
+			// subdirectory of the repo (JOLLI-2015). updated_at is TEXT with no clean SQL
+			// cutoff, so the staleness filter is already JS-side below — the directory
+			// filter joins it there.
 			const rows = db
 				.prepare(
+					// No ORDER BY: every row passing the directory + staleness filters below is
+					// kept regardless of order, so sorting would only add a full-table sort on
+					// top of an already-unavoidable full scan (updated_at is TEXT — see above).
 					`SELECT id, cwd, repository, branch, host_type, summary, created_at, updated_at
-					 FROM sessions
-					 WHERE ${cwdMatch}
-					 ORDER BY updated_at DESC`,
+					 FROM sessions`,
 				)
-				.all({ cwd: normalized }) as ReadonlyArray<{ id: string; updated_at: string; summary: unknown }>;
+				.all() as ReadonlyArray<{ id: string; cwd: string; updated_at: string; summary: unknown }>;
 			return rows.flatMap((row): SessionInfo[] => {
+				if (!sessionDirBelongsToRepo(row.cwd, normalized)) {
+					return [];
+				}
 				const ms = Date.parse(row.updated_at);
 				if (!Number.isFinite(ms)) {
 					log.warn("Skipping Copilot session %s: non-finite updated_at", row.id);
