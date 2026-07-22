@@ -1465,6 +1465,216 @@ describe("QueueWorker", () => {
 		});
 	});
 
+	describe("assembleReferenceBlocks — track-only source filtering", () => {
+		it("omits track-only (context7) references from the LLM block while keeping notion", async () => {
+			const { readReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+			vi.mocked(readReferenceMarkdown).mockImplementation(async (path: string) => {
+				if (path.includes("notion")) {
+					return {
+						mapKey: "notion:abcdef0123456789abcdef0123456789",
+						source: "notion",
+						nativeId: "abcdef0123456789abcdef0123456789",
+						title: "Notion page",
+						url: "https://www.notion.so/Notion-page-abcdef0123456789abcdef0123456789",
+						toolName: "notion-fetch",
+						referencedAt: "2026-05-14T06:06:01.123Z",
+					};
+				}
+				if (path.includes("context7")) {
+					return {
+						mapKey: "context7:/vercel/next.js",
+						source: "context7",
+						nativeId: "/vercel/next.js",
+						title: "vercel/next.js",
+						url: "https://context7.com/vercel/next.js",
+						toolName: "mcp__context7__query-docs",
+						referencedAt: "2026-05-14T06:06:02.123Z",
+					};
+				}
+				return null;
+			});
+
+			const block = await __test__.assembleReferenceBlocks([
+				{
+					source: "notion",
+					nativeId: "abcdef0123456789abcdef0123456789",
+					title: "Notion page",
+					url: "https://www.notion.so/Notion-page-abcdef0123456789abcdef0123456789",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/notion/abcdef.md",
+					addedAt: "x",
+					updatedAt: "x",
+					sourceToolName: "notion-fetch",
+				},
+				{
+					source: "context7",
+					nativeId: "/vercel/next.js",
+					title: "vercel/next.js",
+					url: "https://context7.com/vercel/next.js",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/context7/vercel-next-js.md",
+					addedAt: "x",
+					updatedAt: "x",
+					sourceToolName: "mcp__context7__query-docs",
+				},
+			]);
+
+			expect(block).toContain("notion-pages");
+			expect(block).not.toContain("context7-libraries");
+		});
+	});
+
+	describe("trackOnly references and relevance", () => {
+		// Shared arrange: two active references — a track-only context7 library and a
+		// normal Linear issue — plus the archival rescan seeing both. `excludedContext`
+		// is what the pipeline treats as excluded; each test supplies its own verdict.
+		async function arrangeTwoRefs(excludedContext: ExcludedContextItem[]): Promise<void> {
+			const op = makeCommitOp({ commitHash: "abc12345def67890" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/li.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+
+			const { readReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+			vi.mocked(readReferenceMarkdown).mockImplementation(async (path: string) => {
+				if (path.includes("context7")) {
+					return {
+						mapKey: "context7:/vercel/next.js",
+						source: "context7",
+						nativeId: "/vercel/next.js",
+						title: "vercel/next.js",
+						url: "https://context7.com/vercel/next.js",
+						toolName: "mcp__context7__query-docs",
+						referencedAt: "2026-05-14T06:06:01.123Z",
+					};
+				}
+				if (path.includes("linear")) {
+					return {
+						mapKey: "linear:PROJ-1",
+						source: "linear",
+						nativeId: "PROJ-1",
+						title: "Linear issue",
+						url: "https://linear.app/x/PROJ-1",
+						toolName: "mcp__linear__get_issue",
+						referencedAt: "2026-05-14T06:06:02.123Z",
+					};
+				}
+				return null;
+			});
+
+			vi.mocked(getReferenceEntriesForBranch).mockResolvedValue([
+				{
+					source: "context7",
+					nativeId: "/vercel/next.js",
+					title: "vercel/next.js",
+					url: "https://context7.com/vercel/next.js",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/context7/vercel-next-js.md",
+					addedAt: "x",
+					updatedAt: "x",
+					sourceToolName: "mcp__context7__query-docs",
+				},
+				{
+					source: "linear",
+					nativeId: "PROJ-1",
+					title: "Linear issue",
+					url: "https://linear.app/x/PROJ-1",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1.md",
+					addedAt: "x",
+					updatedAt: "x",
+					sourceToolName: "mcp__linear__get_issue",
+				},
+			]);
+
+			vi.mocked(assessContextRelevance).mockResolvedValueOnce({
+				plans: [],
+				notes: [],
+				references: [],
+				excludedContext,
+				results: [],
+			});
+
+			// Archival is a separate registry rescan — both refs are still active.
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{
+					mapKey: "context7:/vercel/next.js",
+					source: "context7",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/context7/vercel-next-js.md",
+				},
+				{
+					mapKey: "linear:PROJ-1",
+					source: "linear",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1.md",
+				},
+			]);
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				references: {
+					"context7:/vercel/next.js": {
+						source: "context7",
+						nativeId: "/vercel/next.js",
+						title: "vercel/next.js",
+						url: "https://context7.com/vercel/next.js",
+						sourcePath: "/test/cwd/.jolli/jollimemory/references/context7/vercel-next-js.md",
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						sourceToolName: "mcp__context7__query-docs",
+					},
+					"linear:PROJ-1": {
+						source: "linear",
+						nativeId: "PROJ-1",
+						title: "Linear issue",
+						url: "https://linear.app/x/PROJ-1",
+						sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1.md",
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				},
+			});
+		}
+
+		it("keeps a track-only (context7) reference out of the relevance input and always archived", async () => {
+			// Realistic verdict: the LLM can only exclude what it was given (linear).
+			await arrangeTwoRefs([
+				{ kind: "reference", key: "linear:PROJ-1", title: "Linear issue", reason: "unrelated", tier: "low" },
+			]);
+
+			await runWorker("/test/cwd");
+
+			// Input-split: context7 never reaches the relevance LLM (only linear does),
+			// so a relevance verdict can never auto-exclude it.
+			expect(assessContextRelevance).toHaveBeenCalledTimes(1);
+			const rawArg = vi.mocked(assessContextRelevance).mock.calls[0][0];
+			expect(rawArg.references).toEqual([expect.objectContaining({ source: "linear", nativeId: "PROJ-1" })]);
+
+			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
+			const archivedSources = savedSummary.references?.map((r) => r.source) ?? [];
+			expect(archivedSources).toContain("context7"); // always archived
+			expect(archivedSources).not.toContain("linear"); // the LLM's linear exclusion is honored
+		});
+
+		it("still honors an EXPLICIT exclusion of a track-only reference (dropped from archival)", async () => {
+			// An explicit/persisted decision that lands context7 in excludedContext must
+			// be honored — a deliberately-excluded reference is not archived, even track-only.
+			await arrangeTwoRefs([
+				{
+					kind: "reference",
+					key: "context7:/vercel/next.js",
+					title: "vercel/next.js",
+					reason: "user excluded",
+					tier: "low",
+				},
+			]);
+
+			await runWorker("/test/cwd");
+
+			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
+			const archivedSources = savedSummary.references?.map((r) => r.source) ?? [];
+			expect(archivedSources).not.toContain("context7"); // explicit exclusion honored
+			expect(archivedSources).toContain("linear"); // linear had no exclusion → archived
+		});
+	});
+
 	describe("Cursor integration", () => {
 		it("should include discovered Cursor sessions in the pipeline when enabled", async () => {
 			const op = makeCommitOp();

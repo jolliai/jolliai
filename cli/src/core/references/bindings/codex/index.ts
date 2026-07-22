@@ -13,6 +13,7 @@ import type { SourceId } from "../../../../Types.js";
 import { asanaCodexBinding } from "./CodexAsanaBinding.js";
 import type { CodexNormalizer } from "./CodexBinding.js";
 import { confluenceCodexBinding } from "./CodexConfluenceBinding.js";
+import { context7CodexBinding } from "./CodexContext7Binding.js";
 import { githubCodexBinding } from "./CodexGitHubBinding.js";
 import { jiraCodexBinding } from "./CodexJiraBinding.js";
 import { linearCodexBinding } from "./CodexLinearBinding.js";
@@ -34,6 +35,7 @@ const CODEX_NORMALIZERS: readonly CodexNormalizer[] = [
 	asanaCodexBinding,
 	mondayCodexBinding,
 	slackCodexBinding,
+	context7CodexBinding,
 ];
 
 const BY_ID: ReadonlyMap<SourceId, CodexNormalizer> = new Map(CODEX_NORMALIZERS.map((n) => [n.id, n]));

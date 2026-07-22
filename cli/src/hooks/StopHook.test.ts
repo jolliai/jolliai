@@ -12,6 +12,9 @@ vi.mock("../core/SessionTracker.js", () => ({
 	loadPlansRegistry: vi.fn().mockResolvedValue({ version: 1, plans: {} }),
 	savePlansRegistry: vi.fn().mockResolvedValue(undefined),
 	upsertReferenceEntry: vi.fn().mockResolvedValue(undefined),
+	// The discovery-ownership gate resolves the global run-hook launcher path via
+	// getGlobalConfigDir to check that the CLI hook it would defer to can run.
+	getGlobalConfigDir: vi.fn().mockReturnValue("/home/user/.jolli/jollimemory"),
 }));
 
 // Mock ReferenceExtractor — pure-function module called from StopHook.
@@ -30,6 +33,13 @@ vi.mock("../core/TelemetryStartup.js", () => ({
 // plans.json RMW body inline; the lock contract is covered in Locks.test.ts.
 vi.mock("../core/Locks.js", () => ({
 	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
+}));
+
+// Mock ClaudeHookInstaller — the discovery-ownership gate calls
+// isClaudeHookInstalled to decide whether to defer transcript discovery to the
+// CLI/settings Stop hook when this process is the claude-plugin's Stop hook.
+vi.mock("../install/ClaudeHookInstaller.js", () => ({
+	isClaudeHookInstalled: vi.fn().mockResolvedValue(false),
 }));
 
 // Mock node:fs so we can control existsSync / readFileSync / createReadStream
@@ -76,12 +86,14 @@ import {
 	loadConfig,
 	loadDiscoveryCursor,
 	loadPlansRegistry,
+	migrateDiscoveryCursors,
 	saveDiscoveryCursor,
 	savePlansRegistry,
 	saveSession,
 	upsertReferenceEntry,
 } from "../core/SessionTracker.js";
 import { flushTelemetryNow } from "../core/TelemetryStartup.js";
+import { isClaudeHookInstalled } from "../install/ClaudeHookInstaller.js";
 import type { PlanEntry } from "../Types.js";
 import { withPlatform } from "../testUtils/withPlatform.js";
 import { handleStopHook } from "./StopHook.js";
@@ -204,6 +216,10 @@ describe("StopHook", () => {
 		vi.clearAllMocks();
 		process.env = { ...originalEnv };
 		process.env.CLAUDE_PROJECT_DIR = undefined;
+		// Default: not a plugin invocation, so the single-owner gate never probes the
+		// run-hook launcher — keeps plan tests that queue existsSync via
+		// mockReturnValueOnce deterministic. Gate tests set this explicitly.
+		process.env.CLAUDE_PLUGIN_ROOT = undefined;
 		// Default: transcript file does not exist → plan discovery exits early
 		vi.mocked(existsSync).mockReturnValue(false);
 		// Default: loadPlansRegistry returns empty registry
@@ -214,6 +230,88 @@ describe("StopHook", () => {
 
 	afterEach(() => {
 		process.env = originalEnv;
+	});
+
+	describe("plugin/CLI discovery ownership (single-owner gate)", () => {
+		// Both surfaces (the CLI/settings Stop hook and the claude-plugin Stop
+		// hook) fire on the same Stop event and share ONE merged
+		// discovery-cursors.json. The plugin hook is pinned to its bundled dist,
+		// while the CLI hook resolves the newest dist across every source
+		// (run-hook → resolve-dist-path). If the (potentially older) plugin hook
+		// runs discovery and advances the cursor past a tool_use it does not
+		// recognize — e.g. a source added after the plugin build, like context7 —
+		// the newer CLI hook, starting from that advanced cursor, never sees it
+		// and the reference is lost for good. So the plugin hook defers discovery
+		// to the CLI hook whenever one is installed. `migrateDiscoveryCursors` is
+		// the first call inside the discovery pass, so its (non-)invocation is the
+		// authoritative "discovery ran" signal.
+		it("defers discovery when invoked as the plugin hook AND the CLI Stop hook is installed", async () => {
+			vi.mocked(existsSync).mockReturnValue(true);
+			vi.mocked(isClaudeHookInstalled).mockResolvedValue(true);
+			process.env.CLAUDE_PLUGIN_ROOT = "/plugins/jolli";
+
+			mockStdin(hookJson());
+			await handleStopHook();
+
+			expect(migrateDiscoveryCursors).not.toHaveBeenCalled();
+			expect(extractReferencesFromTranscript).not.toHaveBeenCalled();
+			// session save + telemetry flush are surface-independent and still run
+			expect(saveSession).toHaveBeenCalled();
+			expect(flushTelemetryNow).toHaveBeenCalled();
+		});
+
+		it("runs discovery as the plugin hook when NO CLI Stop hook is installed (plugin-only install)", async () => {
+			vi.mocked(existsSync).mockReturnValue(true);
+			vi.mocked(isClaudeHookInstalled).mockResolvedValue(false);
+			process.env.CLAUDE_PLUGIN_ROOT = "/plugins/jolli";
+
+			mockStdin(hookJson());
+			await handleStopHook();
+
+			expect(migrateDiscoveryCursors).toHaveBeenCalled();
+		});
+
+		it("runs discovery for the CLI hook (CLAUDE_PLUGIN_ROOT unset) even when a CLI Stop hook is installed", async () => {
+			vi.mocked(existsSync).mockReturnValue(true);
+			vi.mocked(isClaudeHookInstalled).mockResolvedValue(true);
+			process.env.CLAUDE_PLUGIN_ROOT = undefined;
+
+			mockStdin(hookJson());
+			await handleStopHook();
+
+			expect(migrateDiscoveryCursors).toHaveBeenCalled();
+		});
+
+		it("runs discovery (does NOT defer) when the settings hook is stale but the run-hook launcher is missing", async () => {
+			// A stale `.claude/settings*.json` Stop hook entry can outlive the global
+			// `~/.jolli/jollimemory/run-hook` launcher it invokes (CLI uninstalled,
+			// folder wiped). Deferring to a launcher that no longer runs would leave
+			// NOBODY doing discovery — the exact stranding the gate exists to prevent.
+			// So when the launcher is absent, the plugin hook stays the fallback owner.
+			vi.mocked(isClaudeHookInstalled).mockResolvedValue(true);
+			process.env.CLAUDE_PLUGIN_ROOT = "/plugins/jolli";
+			// Transcript exists (discovery can proceed) but the run-hook launcher does not.
+			vi.mocked(existsSync).mockImplementation((p) => !String(p).includes("run-hook"));
+
+			mockStdin(hookJson());
+			await handleStopHook();
+
+			expect(migrateDiscoveryCursors).toHaveBeenCalled();
+		});
+
+		it("treats an empty CLAUDE_PLUGIN_ROOT as NOT a plugin invocation (runs discovery)", async () => {
+			// A truthy check, not `!== undefined`: an empty value is not a real
+			// plugin root, so the hook must still own discovery rather than defer
+			// to a CLI hook that may not exist.
+			vi.mocked(existsSync).mockReturnValue(true);
+			vi.mocked(isClaudeHookInstalled).mockResolvedValue(true);
+			process.env.CLAUDE_PLUGIN_ROOT = "";
+
+			mockStdin(hookJson());
+			await handleStopHook();
+
+			expect(migrateDiscoveryCursors).toHaveBeenCalled();
+		});
 	});
 
 	it("should no-op when spawned by the local-agent backend (re-entry guard)", async () => {

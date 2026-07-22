@@ -1305,3 +1305,86 @@ describe("extractReferencesFromTranscript — Claude Bash gh issue view CLI fall
 		expect(references[0].mapKey).toBe("github:jolliai/jolli#959");
 	});
 });
+
+// ─── Regression: incremental cursor must not split an argumentsDerived pair ───
+//
+// REPRO for the observed data loss: a Claude StopHook context7 (`query-docs`)
+// lookup was never persisted, while the exact same lookup extracts cleanly from
+// the full transcript. Root cause: incremental discovery advances a forward-only
+// cursor, and `context7` is `argumentsDerived` — its reference is built from the
+// tool_use `input`, emitted only when the paired tool_result is seen IN THE SAME
+// scan. If the cursor boundary lands between the tool_use and its tool_result
+// (double StopHook fire racing the cursor, or the result simply not flushed to
+// disk yet when the first scan runs), pass 1 sees a tool_use with no result (no
+// emit) and advances the cursor past it; pass 2 sees a result with no pending
+// tool_use (no emit). The reference is lost forever because the cursor never
+// rewinds.
+//
+// This pins the fix-agnostic invariant: across the full lifetime of incremental
+// discovery, an argumentsDerived reference is captured even when a scan boundary
+// splits its tool_use/tool_result pair. Any chosen fix (carry pending across
+// scans, hold the cursor before an unpaired tool_use, or dedupe the double fire)
+// must make this pass. It currently FAILS (union is empty).
+describe("extractReferencesFromTranscript incremental argumentsDerived pairing", () => {
+	const c7ToolUse = toolUseLine({
+		toolUseId: "c7_1",
+		toolName: "mcp__context7__query-docs",
+		timestamp: "2026-07-22T14:59:52.000Z",
+		inputJson: JSON.stringify({ libraryId: "/thedotmack/claude-mem", query: "what is claude-mem" }),
+	});
+	// context7 returns markdown prose, not JSON — the argumentsDerived path.
+	const c7Result = toolResultLine({
+		toolUseId: "c7_1",
+		timestamp: "2026-07-22T14:59:53.000Z",
+		payload: "### Claude-Mem\n\nClaude-Mem is a persistent memory compression system for Claude Code…",
+	});
+
+	it("control: a single full scan captures the context7 reference", async () => {
+		mockReadFile.mockResolvedValue(makeJsonl(c7ToolUse, c7Result));
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
+		expect(references.map((r) => r.mapKey)).toContain("context7:/thedotmack/claude-mem");
+	});
+
+	it("does not lose the reference when the cursor boundary splits the tool_use/tool_result pair", async () => {
+		// Pass 1: the tool_result has not been flushed yet — only the tool_use is
+		// on disk. No reference is emitted, and the cursor advances past it.
+		mockReadFile.mockResolvedValueOnce(makeJsonl(c7ToolUse));
+		const pass1 = await extractReferencesFromTranscript("/fake.jsonl");
+
+		// Pass 2: the result is now flushed. Discovery resumes from the persisted
+		// cursor, so it starts AFTER the tool_use line.
+		mockReadFile.mockResolvedValueOnce(makeJsonl(c7ToolUse, c7Result));
+		const pass2 = await extractReferencesFromTranscript("/fake.jsonl", {
+			fromLineNumber: pass1.lastLineNumberScanned,
+		});
+
+		const captured = [...pass1.references, ...pass2.references].map((r) => r.mapKey);
+		expect(captured).toContain("context7:/thedotmack/claude-mem");
+	});
+
+	it("does NOT rewind past a genuinely resultless tool_use that a later result followed", async () => {
+		// c7_1 never gets a result (aborted/errored call). A completed linear
+		// lookup follows it. The unpaired tool_use sits BEFORE the last paired
+		// result, so the tail is not "incomplete" — rewinding here would pin the
+		// cursor on a call that will never pair. The cursor must advance to EOF.
+		const jsonl = makeJsonl(
+			c7ToolUse, // line index 0 — stays unpaired
+			toolUseLine({
+				toolUseId: "toolu_lin",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-07-22T15:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_lin",
+				timestamp: "2026-07-22T15:00:01.000Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { references, lastLineNumberScanned } = await extractReferencesFromTranscript("/fake.jsonl");
+
+		expect(lastLineNumberScanned).toBe(3); // advanced to EOF, not rewound to line 0
+		expect(references.map((r) => r.mapKey)).toEqual(["linear:PROJ-1528"]);
+	});
+});

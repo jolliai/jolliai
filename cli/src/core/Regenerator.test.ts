@@ -1598,5 +1598,74 @@ describe("regenerateSummary", () => {
 			// Only one block, leading with `<linear-issues>`.
 			expect(params.referenceBlocks?.startsWith("<linear-issues>")).toBe(true);
 		});
+
+		it("excludes the track-only context7 block while keeping the linear block", async () => {
+			// context7 refs are still read + grouped into bySource (readReferenceFromBranch
+			// is still called for it below), but the block-emit loop skips it — only the
+			// LLM-facing referenceBlocks output is filtered.
+			const mixed: CommitSummary = {
+				...baseSummary,
+				references: [
+					{
+						archivedKey: "linear:PROJ-1-abc12345",
+						source: "linear",
+						nativeId: "PROJ-1",
+						title: "L1",
+						url: "https://linear.app/x",
+						referencedAt: "2026-05-22T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+					{
+						archivedKey: "context7:/vercel/next.js-deadbeef",
+						source: "context7",
+						nativeId: "/vercel/next.js",
+						title: "vercel/next.js",
+						url: "https://context7.com/vercel/next.js",
+						referencedAt: "2026-05-22T00:00:00Z",
+						sourceToolName: "mcp__context7__query-docs",
+					},
+				],
+			} as CommitSummary;
+			vi.mocked(SummaryStore.readReferenceFromBranch)
+				.mockResolvedValueOnce(
+					[
+						"---",
+						'source: "linear"',
+						'nativeId: "PROJ-1"',
+						'title: "L1"',
+						'url: "https://linear.app/x"',
+						'referencedAt: "2026-05-22T00:00:00Z"',
+						'sourceToolName: "mcp__linear__get_issue"',
+						"---",
+						"L1 body",
+					].join("\n"),
+				)
+				.mockResolvedValueOnce(
+					[
+						"---",
+						'source: "context7"',
+						'nativeId: "/vercel/next.js"',
+						'title: "vercel/next.js"',
+						'url: "https://context7.com/vercel/next.js"',
+						'referencedAt: "2026-05-22T00:00:00Z"',
+						'sourceToolName: "mcp__context7__query-docs"',
+						"---",
+						"context7 body",
+					].join("\n"),
+				);
+
+			await regenerateSummary(mixed, "/repo", config);
+
+			// Still read (archival/grouping is untouched by the LLM-block filter).
+			expect(SummaryStore.readReferenceFromBranch).toHaveBeenCalledWith(
+				"context7",
+				"context7:/vercel/next.js-deadbeef",
+				"/repo",
+				undefined,
+			);
+			const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+			expect(params.referenceBlocks).toContain("<linear-issues>");
+			expect(params.referenceBlocks).not.toContain("context7-libraries");
+		});
 	});
 });

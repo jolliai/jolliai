@@ -1272,3 +1272,85 @@ describe("CodexEnvelopeParser end-to-end — Slack thread via extractReferencesF
 		expect(ref?.title?.startsWith("Consolidate")).toBe(true);
 	});
 });
+
+// ─── context7 (local MCP, argumentsDerived fallback) ─────────────────────────
+// Real 2026-07 rollout shape: context7 runs as a LOCAL MCP server (not a
+// codex_apps connector), so it never carries the `mcp__codex_apps__` namespace
+// and is matched ONLY via the FALLBACK path on `mcp_tool_call_end`, using
+// `invocation.tool`/`invocation.arguments`. `result.Ok.content[0].text` is
+// markdown prose, not JSON — this is the argumentsDerived case the FALLBACK
+// loop must special-case rather than drop.
+
+describe("context7 local MCP (fallback path, prose result)", () => {
+	it("extracts one reference from a query-docs mcp_tool_call_end event", () => {
+		const lines = [
+			JSON.stringify({
+				timestamp: "2026-07-22T08:18:30.000Z",
+				type: "event_msg",
+				payload: {
+					type: "mcp_tool_call_end",
+					call_id: "callc7",
+					invocation: {
+						server: "context7",
+						tool: "query-docs",
+						arguments: { libraryId: "/vercel/next.js", query: "middleware in the app router" },
+					},
+					result: {
+						Ok: {
+							content: [
+								{ type: "text", text: "### Middleware\n\nSource: https://github.com/vercel/next.js/…" },
+							],
+						},
+					},
+				},
+			}),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("context7");
+		expect(results[0].payload).toEqual({ libraryId: "/vercel/next.js", query: "middleware in the app router" });
+	});
+
+	it("ignores resolve-library-id events", () => {
+		const lines = [
+			JSON.stringify({
+				timestamp: "2026-07-22T08:18:29.000Z",
+				type: "event_msg",
+				payload: {
+					type: "mcp_tool_call_end",
+					call_id: "callr",
+					invocation: {
+						server: "context7",
+						tool: "resolve-library-id",
+						arguments: { libraryName: "Next.js" },
+					},
+					result: { Ok: { content: [{ type: "text", text: "Available Libraries:\n- /vercel/next.js" }] } },
+				},
+			}),
+		];
+		expect(codexEnvelopeParser.parse(lines, {}).results).toHaveLength(0);
+	});
+});
+
+// ─── context7 (codex_apps connector, PRIMARY path, argumentsDerived) ─────────
+// A `codex_apps` connector build of context7 (as opposed to the local-MCP build
+// exercised above) would carry the `mcp__codex_apps__` namespace and match via
+// PRIMARY (function_call + function_call_output), not FALLBACK. This shape is
+// catalog-derived (inferred from the codex_apps connector convention shared by
+// asana/monday/etc. above), NOT captured from a real rollout — no live context7
+// connector transcript was available. Its prose result (non-JSON output) is the
+// case the PRIMARY loop must special-case via `argumentsDerived` rather than drop
+// (mirroring the FALLBACK loop's existing null-business guard).
+describe("context7 codex_apps connector (PRIMARY path, prose result)", () => {
+	it("extracts one reference from a _query_docs function_call/output pair", () => {
+		const args = JSON.stringify({ libraryId: "/vercel/next.js", query: "middleware in the app router" });
+		const lines = [
+			fnCall("mcp__codex_apps__context7", "_query_docs", "c_context7", args),
+			fnOutputRaw("c_context7", "### Middleware\n\nSource: https://github.com/vercel/next.js/…"),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("context7");
+		expect(results[0].payload).toEqual({ libraryId: "/vercel/next.js", query: "middleware in the app router" });
+	});
+});

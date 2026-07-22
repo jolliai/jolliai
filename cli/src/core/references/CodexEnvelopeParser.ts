@@ -222,8 +222,15 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 			if (call === undefined) continue;
 			const def = resolveCodexDef(registry, call.namespace, call.name);
 			if (def === undefined) continue;
-			const business = parseFunctionCallOutput(out.output);
-			if (business === null) continue;
+			let business = parseFunctionCallOutput(out.output);
+			if (business === null) {
+				// An arguments-derived source (context7) returns prose, not JSON. Its
+				// reference is built from invocation.arguments below, so an unparseable
+				// output is expected — give the normalizer an empty business object
+				// instead of dropping the call. Every JSON-result source is unaffected.
+				if (def.argumentsDerived !== true) continue;
+				business = {};
+			}
 			const normalizer = getCodexNormalizer(def.id);
 			/* v8 ignore start -- every registry codex definition has a matching CodexBinding; guarded for totality. */
 			if (normalizer === undefined) continue;
@@ -281,7 +288,14 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 			if (normalizer === undefined) continue;
 			/* v8 ignore stop */
 			let business = tryParse(ev.text);
-			if (business === null) continue;
+			if (business === null) {
+				// An arguments-derived source (context7) returns prose, not JSON. Its
+				// reference is built from invocation.arguments below, so an unparseable
+				// event text is expected — give the normalizer an empty business object
+				// instead of dropping the event. Every JSON-result source is unaffected.
+				if (def.argumentsDerived !== true) continue;
+				business = {};
+			}
 			// Recovery (NOT the main path): reaching the fallback for a call_id that
 			// ALSO has a function_call output means that output either failed to parse
 			// or normalized to null (a successful, non-null normalize would have marked

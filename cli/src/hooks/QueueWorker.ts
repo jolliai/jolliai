@@ -1530,6 +1530,7 @@ async function assembleReferenceBlocks(activeReferenceEntries: ReadonlyArray<Ref
 	}
 	const parts: string[] = [];
 	for (const def of getRegistry().all()) {
+		if (def.trackOnly === true) continue; // track-only sources never reach the memory-decision LLM
 		const refs = refsBySource.get(def.id) ?? [];
 		const block = renderBlock(def, refs);
 		if (block.length > 0) parts.push(block);
@@ -1590,7 +1591,15 @@ async function consumeWorkspaceContext(args: {
 		note: new Set<string>(),
 		reference: new Set<string>(),
 	};
-	for (const e of excludedContext) aiExcludedKeys[e.kind].add(e.key);
+	for (const e of excludedContext) {
+		// An explicit exclusion — whether a relevance verdict or a reused/persisted
+		// aiSelection decision — is always honored, including for track-only sources
+		// (context7): a reference the user deliberately excluded must not be archived
+		// with the commit memory. Track-only refs are kept OUT of the relevance LLM's
+		// input upstream, so a relevance verdict can never auto-exclude them here; any
+		// track-only key that does appear in `excludedContext` is a deliberate choice.
+		aiExcludedKeys[e.kind].add(e.key);
+	}
 
 	const planSlugs = await detectPlanSlugsFromRegistry(cwd, branch);
 	for (const excludedSlug of exclusions.plans) planSlugs.delete(excludedSlug);
@@ -1764,6 +1773,16 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	const userKeptReferences = rawActiveReferenceEntries.filter(
 		(e) => !exclusions.references.has(`${e.source}:${e.nativeId}`),
 	);
+	// Track-only sources (e.g. context7) must be unconditionally tracked — never
+	// fed to the relevance LLM, so a verdict can never land them in excludedContext
+	// and get them dropped from archival. Split them out of the relevance input;
+	// they're spliced back into activeReferenceEntries below (both on success and
+	// on the fail-open catch, since `activeReferenceEntries` defaults to the full
+	// `userKeptReferences`, which already includes them).
+	const trackOnlyReferences = userKeptReferences.filter((e) => getRegistry().byId(e.source)?.trackOnly === true);
+	const relevanceCandidateReferences = userKeptReferences.filter(
+		(e) => getRegistry().byId(e.source)?.trackOnly !== true,
+	);
 
 	// AI relevance: rank the user-kept context against this change and soft-exclude
 	// clearly-unrelated items. Wrapped so ANY failure (git / content-read / LLM /
@@ -1779,7 +1798,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	let contextRelevance: ReadonlyArray<ContextRelevanceRef> = [];
 	try {
 		const changeSignal = await buildChangeSignal(commitInfo.message, `${op.commitHash}~1`, op.commitHash, cwd);
-		const raw = { plans: userKeptPlans, notes: userKeptNotes, references: userKeptReferences };
+		const raw = { plans: userKeptPlans, notes: userKeptNotes, references: relevanceCandidateReferences };
 		// Reuse the pre-commit panel's full-text ranking when its change fingerprint
 		// matches (so the excluded set the user saw is exactly what lands, and we skip
 		// a redundant LLM call). Otherwise — panel not opened, or the change moved
@@ -1792,7 +1811,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 				: await assessContextRelevance(raw, changeSignal, config);
 		activePlanEntries = [...relevance.plans];
 		activeNoteEntries = [...relevance.notes];
-		activeReferenceEntries = [...relevance.references];
+		activeReferenceEntries = [...relevance.references, ...trackOnlyReferences];
 		excludedContext = relevance.excludedContext;
 		// Kept items' tier+reason for the summary artifact (a user-dismissed
 		// exclusion lands here with its ORIGINAL verdict attached). Empty when the
@@ -2879,6 +2898,13 @@ async function handleAmendPipeline(
 	const userKeptAmendRefs = rawAmendReferenceEntries.filter(
 		(e) => !amendExclusions.references.has(`${e.source}:${e.nativeId}`),
 	);
+	// Track-only sources (e.g. context7) must be unconditionally tracked — never fed
+	// to the relevance LLM, so a verdict can never land them in amendExcludedContext
+	// and get them dropped from archival. Mirrors executePipeline's split above.
+	const trackOnlyAmendRefs = userKeptAmendRefs.filter((e) => getRegistry().byId(e.source)?.trackOnly === true);
+	const relevanceCandidateAmendRefs = userKeptAmendRefs.filter(
+		(e) => getRegistry().byId(e.source)?.trackOnly !== true,
+	);
 	// AI relevance filtering, mirroring executePipeline's Stage 2 (wrapped so any
 	// git / content-read / LLM / parse failure falls back to the full user-kept set).
 	// assessContextRelevance is fail-open and unit-tested; this call site is amend-only,
@@ -2902,13 +2928,13 @@ async function handleAmendPipeline(
 			cwd,
 		);
 		const amendRelevance = await assessContextRelevance(
-			{ plans: userKeptAmendPlans, notes: userKeptAmendNotes, references: userKeptAmendRefs },
+			{ plans: userKeptAmendPlans, notes: userKeptAmendNotes, references: relevanceCandidateAmendRefs },
 			amendChangeSignal,
 			amendConfig,
 		);
 		amendPlanEntries = [...amendRelevance.plans];
 		amendNoteEntries = [...amendRelevance.notes];
-		amendReferenceEntries = [...amendRelevance.references];
+		amendReferenceEntries = [...amendRelevance.references, ...trackOnlyAmendRefs];
 		amendExcludedContext = amendRelevance.excludedContext;
 		// Kept items' tier+reason for the amend summary artifact (amend always
 		// re-ranks fresh, so results are always populated on success).
@@ -3746,6 +3772,7 @@ export const __test__ = {
 	buildHoistedAmendRoot,
 	consumeWorkspaceContext,
 	associatePlansWithCommit,
+	assembleReferenceBlocks,
 	finalizeReferenceArchive,
 	executePipeline,
 	handleAmendPipeline,
