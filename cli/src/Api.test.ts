@@ -842,6 +842,17 @@ describe("CLI", () => {
 			expect(writeManualDisableFlag).not.toHaveBeenCalled();
 		});
 
+		it("warns but does not fail when clearing the manual-disable opt-out throws after a successful install", async () => {
+			vi.mocked(writeManualDisableFlag).mockRejectedValueOnce(new Error("disk full"));
+			await main(["enable", "--cwd", "/tmp/test-project"]);
+			// Enable still succeeds (no exit code) — hooks are installed, only the opt-out clear failed.
+			expect(process.exitCode).toBeUndefined();
+			expect(console.warn).toHaveBeenCalledWith(
+				expect.stringContaining("could not clear the manual-disable flag"),
+			);
+			expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("Run `jolli enable` again"));
+		});
+
 		it("rejects an unsafe --source-tag before calling install", async () => {
 			await main(["enable", "--cwd", "/tmp/test-project", "--source-tag", "bad tag; rm -rf /"]);
 			expect(process.exitCode).toBe(1);

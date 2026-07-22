@@ -124,7 +124,16 @@ export async function runGuidedFrontDoor(): Promise<void> {
 		// Enabling here is an explicit user choice — clear any repo-wide
 		// manual-disable opt-out so a later upgrade / VS Code activation keeps it on
 		// (the front door is never integrations-only). Mirrors `jolli enable`.
-		await writeManualDisableFlag(cwd, false);
+		// SessionStart does NOT retry a failed clear — it returns immediately when
+		// the flag is still true. Only an explicit enable clears it.
+		try {
+			await writeManualDisableFlag(cwd, false);
+		} catch (err) {
+			console.warn(
+				`\n  Warning: could not clear the manual-disable flag (${(err as Error).message}).\n` +
+					"  Enable succeeded. Run `jolli enable` again to clear the opt-out.\n",
+			);
+		}
 		for (const warning of result.warnings) console.warn(`  Warning: ${warning}`);
 		// Git hooks record commits immediately, but the AI-agent session hooks
 		// (Claude, Gemini) only attach on a fresh session — say so once here.

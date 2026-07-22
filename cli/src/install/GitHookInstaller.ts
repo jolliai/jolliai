@@ -59,8 +59,13 @@ export async function installGitHook(projectDir: string, distSource?: string): P
 		existingContent = await readFile(hookPath, "utf-8");
 
 		if (existingContent.includes(HOOK_MARKER_START)) {
-			// Check if the hook section already has the correct command
-			if (existingContent.includes(hookCommandLine)) {
+			// Check if the section is already byte-identical to what we'd write.
+			// (A naive `includes(hookCommandLine)` substring check would false-positive
+			// when the existing line carries a JOLLI_DIST_PREFER_SOURCE prefix that
+			// the current caller omits — the unprefixed command is a substring of the
+			// prefixed line. Match the full section — markers + command — so a prefixed
+			// section is seen as different and correctly replaced.)
+			if (existingContent.includes(hookSection)) {
 				return { path: hookPath };
 			}
 
