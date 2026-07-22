@@ -14,6 +14,7 @@ import {
 	type Prompt,
 } from "@modelcontextprotocol/sdk/types.js";
 import { VERSION } from "../commands/CliUtils.js";
+import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { JolliMemoryPushClient, type PlatformToolManifestEntry } from "../core/JolliMemoryPushClient.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
@@ -219,6 +220,20 @@ export interface StartMcpServerDeps {
 
 /** Start the stdio MCP server. Resolves when the transport closes. */
 export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {}): Promise<void> {
+	// Re-entrancy guard (JOLLI-2033): the local-agent backend spawns `claude` in a
+	// throwaway temp cwd marked JOLLI_LOCAL_AGENT_CHILD=1. When the jolli plugin is
+	// globally installed, that nested `claude` spawns `jolli mcp` here — inheriting
+	// the marker. Without this no-op, the storage init below roots a FolderStorage
+	// at <localFolder>/<tempDirName>/, claiming a spurious Memory Bank "repo" per
+	// summary call (the temp dir basename becomes the repoName). The child runs
+	// `--tools ""` (all tools denied) so it never invokes an MCP tool; no-op the
+	// whole server. Mirrors the SessionStartHook/StopHook/EnableCommand guards and
+	// honors the "MCP storage init no-ops" contract stated in AgentReentry.
+	if (isLocalAgentChild()) {
+		log.info("Local-agent child detected; skipping MCP server startup to avoid a spurious Memory Bank repo");
+		return;
+	}
+
 	// Establish the configured storage backend up front. The tool handlers read
 	// through the store APIs without threading `storage`, so without this they'd
 	// fall through resolveStorage to the orphan branch — wrong for folder-mode
