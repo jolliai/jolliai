@@ -25,6 +25,7 @@ import type { Command } from "commander";
 import type { HelpGroup } from "./commands/HelpGroups.js";
 import { registerSiteCommandStubs } from "./commands/SiteCommandStubs.js";
 import { registerSpaceCommandStubs } from "./commands/SpaceCommandStubs.js";
+import { registerWorkflowCommandStubs } from "./commands/WorkflowCommandStubs.js";
 
 export interface KnownPlugin {
 	id: string;
@@ -62,5 +63,17 @@ export const KNOWN_PLUGINS: ReadonlyArray<KnownPlugin> = [
 		installHint: "npm install -g @jolli.ai/site-cli",
 		helpGroup: "site",
 		registerStub: registerSiteCommandStubs,
+	},
+	{
+		// @jolli.ai/workflow-cli — Jolli Workflows (run local/remote, run history).
+		// When missing, the stub keeps the `workflow` command visible in `--help`
+		// and, per-subcommand, either emits the machine-readable
+		// `workflow_cli_required` JSON (`workflow local-run`, parsed by the recipe)
+		// or a one-line install hint (`workflow runs` / `workflow run-status`).
+		id: "5ea2fc8c-a0cb-416f-9276-219f1d51c51f",
+		packageName: "@jolli.ai/workflow-cli",
+		installHint: "npm install -g @jolli.ai/workflow-cli",
+		helpGroup: "workflow",
+		registerStub: registerWorkflowCommandStubs,
 	},
 ];

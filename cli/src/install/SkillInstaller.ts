@@ -1210,7 +1210,7 @@ name: jolli-local-run
 description: Run a Jolli workflow locally — your own agent executes the workflow's recipe (no Jolli LLM budget) and its file writes land in a git-backed Jolli Space via a branch and pull request that space-cli opens on this machine. Use when the user wants to run a Jolli workflow locally.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 4
+  revision: 5
   vendor: "jolli.ai"
 ---
 
@@ -1237,7 +1237,7 @@ ${SHELL_PREREQUISITE_BLOCK}
 Run the eligibility helper and read its JSON:
 
 \`\`\`bash
-"$HOME/.jolli/jollimemory/run-cli" local-run-workflows
+"$HOME/.jolli/jollimemory/run-cli" workflow local-run
 \`\`\`
 
 - \`{ "type": "workflows", "workflows": [ { "id": 7, "name": "Impact Analysis", "autoMerges": true|false }, ... ] }\`
@@ -1247,6 +1247,13 @@ Run the eligibility helper and read its JSON:
   **open the PR for team review** (\`autoMerges: false\`). If the array is empty,
   tell the user there are no locally-runnable workflows (a workflow's destination
   must be a git-backed, already-cloned Space) and stop.
+- \`{ "type": "workflow_cli_required", "installHint": "..." }\` — the workflow-cli
+  plugin is missing. Tell the user to install it (run the \`installHint\`) and stop:
+
+  \`\`\`bash
+  npm i -g @jolli.ai/cli @jolli.ai/workflow-cli
+  \`\`\`
+
 - \`{ "type": "space_cli_required", ... }\` — the space-cli plugin is missing. Tell
   the user to install it and stop:
 
@@ -1332,7 +1339,7 @@ fresh across the wait.
    deterministically** — do not eyeball it yourself:
 
    \`\`\`bash
-   "$HOME/.jolli/jollimemory/run-cli" verify-publish-branch <writeTarget.workBranch> <headBranch>
+   "$HOME/.jolli/jollimemory/run-cli" space verify-publish-branch <writeTarget.workBranch> <headBranch>
    \`\`\`
 
    It prints \`{ "match": true|false, "expected": "...", "actual": "..." }\` and exits
@@ -1372,7 +1379,7 @@ fresh across the wait.
      \`active: false\` or has \`url: null\`, publishing has **not** completed yet (the
      auto-merge and reindex may still be in progress) — tell the user that article is
      **not yet available**, never invent a URL, and note they can re-check shortly via the
-     run URL or by re-running \`workflow-run-status <runId>\`. Then present the workflow URL
+     run URL or by re-running \`workflow run-status <runId>\`. Then present the workflow URL
      (\`workflowUrl\`) and the run URL (\`runUrl\`).
    - **PR left open for team review** (\`willAutoMerge: false\` — auto-apply off): the
      open **PR is the artifact**. Tell the user "PR left open for team review" and
@@ -1420,7 +1427,7 @@ npm i -g @jolli.ai/cli @jolli.ai/space-cli
  * Remote-workflow-run recipe skill — walks the calling agent through running a
  * Jolli workflow on the Jolli backend: identify the workflow, trigger the run via
  * the `run_remote_workflow` platform tool, then shell the deterministic
- * `workflow-run-status` monitor (host code polls to a terminal state) and report
+ * `workflow run-status` monitor (host code polls to a terminal state) and report
  * the outcome — failed (troubleshooting + workflow URL), cancelled (who/when +
  * workflow URL), or succeeded (still-active article URLs + workflow URL) — and
  * offer to open any reported URL. Prefers the Jolli MCP platform tools for the run
@@ -1434,7 +1441,7 @@ name: jolli-remote-run
 description: Run a Jolli workflow remotely — the Jolli backend executes the workflow server-side; this recipe triggers the run, monitors it to completion, reports the outcome (failed / cancelled / succeeded) with its article, PR, and workflow links, and offers to open any in your browser. Use when the user wants to run a Jolli workflow remotely (on the Jolli backend).
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 2
+  revision: 3
   vendor: "jolli.ai"
 ---
 
@@ -1482,7 +1489,7 @@ that handle drives the monitor in Step 3.
 Shell the deterministic monitor with the captured \`runId\`:
 
 \`\`\`bash
-"$HOME/.jolli/jollimemory/run-cli" workflow-run-status <runId>
+"$HOME/.jolli/jollimemory/run-cli" workflow run-status <runId>
 \`\`\`
 
 It polls the run to a terminal state (with backoff, so you do not drive the poll
@@ -1519,7 +1526,7 @@ Report based on \`status\`:
   stopped polling before the run reached a terminal state — the run is **still
   running server-side**, not failed. Tell the user it is still in progress, present
   the \`workflow\` URL so they can watch it, and note they can re-check later by
-  re-running \`workflow-run-status <runId>\`.
+  re-running \`workflow run-status <runId>\`.
 
 ## Step 5 — offer to open any reported URL
 
@@ -1542,7 +1549,7 @@ as an error.
 While a remote run is still in progress, the user can stop it: call
 \`cancel_remote_workflow\` (on Claude Code
 \`mcp__jollimemory__cancel_remote_workflow\`) with the workflow's numeric id —
-\`{ "id": <workflow id> }\`. After cancelling, re-run \`workflow-run-status <runId>\`
+\`{ "id": <workflow id> }\`. After cancelling, re-run \`workflow run-status <runId>\`
 to report the cancelled outcome (who/when + workflow URL).
 `;
 }
@@ -1579,7 +1586,7 @@ name: jolli
 description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, pr, run a workflow local or remote, workflow history) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 3
+  revision: 4
   vendor: "jolli.ai"
 ---
 
@@ -1629,7 +1636,7 @@ Assemble ONE combined list of actions from two sources.
   id), then shell:
 
   \`\`\`bash
-  "$HOME/.jolli/jollimemory/run-cli" workflow-runs <workflowId>
+  "$HOME/.jolli/jollimemory/run-cli" workflow runs <workflowId>
   \`\`\`
 
   It prints \`{ "type": "runs", "runs": [ ... ] }\` — one entry per run with its
@@ -1720,11 +1727,12 @@ text-list fallback keeps \`/jolli\` usable on every host that loads skills.
  * 3) sitting in `.claude/skills/jolli/`, and both carry `vendor: "jolli.ai"` so the
  * ownership guard cannot tell them apart — `upsertSkill` arbitrates purely by
  * `metadata.revision`. This variant is therefore revision **5** (above the
- * standalone's 3) so {@link installPluginJolliMenu} RECLAIMS that legacy slot,
- * replacing a stale standalone menu that would otherwise route to the unnamespaced
+ * standalone's current revision 4, and above the ≤3 any legacy `.claude/` copy
+ * carries) so {@link installPluginJolliMenu} RECLAIMS that legacy slot, replacing
+ * a stale standalone menu that would otherwise route to the unnamespaced
  * `jolli-*` skills {@link removeClaudeLegacySkills} just deleted. Keep this note and
  * both revision literals in view when editing either template — dropping this below
- * 3 would strand the broken pre-upgrade menu.
+ * 4 would strand the broken pre-upgrade menu.
  */
 export function buildPluginJolliMenuSkillTemplate(): string {
 	return `---

@@ -729,6 +729,79 @@ describe("CLI", () => {
 			exitSpy.mockRestore();
 		});
 
+		it("groups the workflow-cli stub under 'Jolli Workflows' (after Space, not Other)", async () => {
+			// With workflow-cli not loaded, `registerMissingStubs` registers the
+			// `workflow` stub, which must render under the dedicated "Jolli
+			// Workflows" section rather than falling through to "Other commands:".
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main(["--help"]);
+			} catch {
+				// Commander calls process.exit after --help
+			}
+			const writes = vi.mocked(process.stdout.write).mock.calls.map((c) => String(c[0]));
+			const helpOutput = writes.join("");
+
+			const spaceHeader = helpOutput.indexOf("Jolli Space — Sync docs");
+			const workflowHeader = helpOutput.indexOf("Jolli Workflows — Run workflows");
+			const otherHeader = helpOutput.indexOf("Other commands:");
+			const workflowIdx = helpOutput.indexOf("workflow ");
+
+			expect(workflowHeader).toBeGreaterThan(spaceHeader);
+			// The `workflow` command appears inside the Workflows section.
+			expect(workflowIdx).toBeGreaterThan(workflowHeader);
+			if (otherHeader >= 0) expect(workflowHeader).toBeLessThan(otherHeader);
+			exitSpy.mockRestore();
+		});
+
+		it("workflow-cli stub emits the workflow_cli_required JSON on stdout for `workflow local-run`", async () => {
+			// The local-run recipe parses this command's stdout as JSON, so the
+			// missing-plugin case is a machine-readable "needs input" state on
+			// stdout — NOT the prose install hint / non-zero exit the other
+			// subcommands use.
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main(["workflow", "local-run"]);
+			} catch {
+				// The stub returns normally for local-run; guard defensively.
+			}
+			const stdout = vi
+				.mocked(console.log)
+				.mock.calls.map((c) => String(c[0]))
+				.join("\n");
+			expect(JSON.parse(stdout)).toEqual({
+				type: "workflow_cli_required",
+				installHint: "npm i -g @jolli.ai/cli @jolli.ai/workflow-cli",
+			});
+			expect(exitSpy).not.toHaveBeenCalled();
+			exitSpy.mockRestore();
+		});
+
+		it("workflow-cli stub prints an install hint and exits non-zero for `workflow runs`", async () => {
+			// A non-local-run subcommand must surface the install hint and fail
+			// loudly (exit 1) rather than silently no-op.
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main(["workflow", "runs", "7"]);
+			} catch {
+				// stub action calls process.exit(1)
+			}
+			const stderr = vi
+				.mocked(console.error)
+				.mock.calls.map((c) => String(c[0]))
+				.join("\n");
+			expect(stderr).toContain("`jolli workflow runs` requires the @jolli.ai/workflow-cli plugin.");
+			expect(stderr).toContain("npm i -g @jolli.ai/cli @jolli.ai/workflow-cli");
+			expect(exitSpy).toHaveBeenCalledWith(1);
+			exitSpy.mockRestore();
+		});
+
 		it("does not group an untagged plugin command under Jolli Space just because its name matches", async () => {
 			// P2 regression: grouping is by provenance tag, not by name. An
 			// unrelated plugin that registers a generic `init` (a name the Space
