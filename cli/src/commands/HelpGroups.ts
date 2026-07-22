@@ -21,7 +21,7 @@
 import type { Command } from "commander";
 
 /** Identifies the `jolli --help` section a plugin's commands belong to. */
-export type HelpGroup = "site" | "space";
+export type HelpGroup = "site" | "space" | "workflow";
 
 /** Property key under which the group tag is stashed on a Command instance. */
 const HELP_GROUP_KEY = "__jolliHelpGroup";

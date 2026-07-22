@@ -259,11 +259,11 @@ describe("jolli menu template frontmatter", () => {
 		expect(jolli).toMatch(/not by calling the raw tool/);
 	});
 
-	it("adds a Workflow history action that shells workflow-runs and offers open-url", async () => {
+	it("adds a Workflow history action that shells workflow runs and offers open-url", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const jolli = readJolli();
 		expect(jolli).toMatch(/Workflow history/);
-		expect(jolli).toContain('"$HOME/.jolli/jollimemory/run-cli" workflow-runs <workflowId>');
+		expect(jolli).toContain('"$HOME/.jolli/jollimemory/run-cli" workflow runs <workflowId>');
 		expect(jolli).toContain('"type": "runs"');
 		// An empty history is a normal outcome, not an error.
 		expect(jolli).toMatch(/no history yet/);
@@ -321,9 +321,15 @@ describe("jolli-local-run template", () => {
 
 	it("uses the eligibility helper and offers only runnable workflows, announcing auto-merge vs team review", () => {
 		const t = buildLocalRunSkillTemplate();
-		expect(t).toContain("local-run-workflows");
+		expect(t).toContain('"$HOME/.jolli/jollimemory/run-cli" workflow local-run');
 		expect(t).toMatch(/auto-merge/i);
 		expect(t).toMatch(/team review/i);
+	});
+
+	it("handles the workflow_cli_required result (plugin absent) with an install hint", () => {
+		const t = buildLocalRunSkillTemplate();
+		expect(t).toContain("workflow_cli_required");
+		expect(t).toContain("npm i -g @jolli.ai/cli @jolli.ai/workflow-cli");
 	});
 
 	it("pins docs pull to --branch and explicitly forbids the destructive --agent", () => {
@@ -358,7 +364,7 @@ describe("jolli-local-run template", () => {
 		const t = buildLocalRunSkillTemplate();
 		// Deterministic branch check via the CLI, not an LLM string comparison.
 		expect(t).toContain(
-			'"$HOME/.jolli/jollimemory/run-cli" verify-publish-branch <writeTarget.workBranch> <headBranch>',
+			'"$HOME/.jolli/jollimemory/run-cli" space verify-publish-branch <writeTarget.workBranch> <headBranch>',
 		);
 		expect(t).toContain("headBranch");
 		// On mismatch the recipe must fail loudly and NOT complete the run as success.
@@ -479,9 +485,9 @@ describe("jolli-remote-run template", () => {
 		expect(t).toContain("mcp__jollimemory__list_workflows");
 	});
 
-	it("shells the deterministic workflow-run-status monitor with the runId", () => {
+	it("shells the deterministic workflow run-status monitor with the runId", () => {
 		const t = buildRemoteRunSkillTemplate();
-		expect(t).toContain('"$HOME/.jolli/jollimemory/run-cli" workflow-run-status <runId>');
+		expect(t).toContain('"$HOME/.jolli/jollimemory/run-cli" workflow run-status <runId>');
 		// Documents the report shape the recipe parses.
 		expect(t).toContain("openableUrls");
 		expect(t).toMatch(/"succeeded"/);

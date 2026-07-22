@@ -25,7 +25,6 @@ import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { getHelpGroup } from "./commands/HelpGroups.js";
 import { registerIdeBridgeCommand } from "./commands/IdeBridgeRegistration.js";
 import { registerBindCommand, registerPushCommand, registerSpacesCommand } from "./commands/JolliCloudCommands.js";
-import { registerLocalRunOfferCommand } from "./commands/LocalRunOfferCommand.js";
 import { registerMcpCommand } from "./commands/McpCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
 import { registerMigrateMemoryBankCommand } from "./commands/MigrateMemoryBankCommand.js";
@@ -38,10 +37,7 @@ import { registerStatusCommand } from "./commands/StatusCommand.js";
 import { registerSyncCommand } from "./commands/SyncCommand.js";
 import { registerTelemetryCommand } from "./commands/TelemetryCommand.js";
 import { registerUninstallCommand } from "./commands/UninstallCommand.js";
-import { registerVerifyPublishBranchCommand } from "./commands/VerifyPublishBranchCommand.js";
 import { registerViewCommand } from "./commands/ViewCommand.js";
-import { registerWorkflowRunStatusCommand } from "./commands/WorkflowRunStatusCommand.js";
-import { registerWorkflowRunsCommand } from "./commands/WorkflowRunsCommand.js";
 // _parseJolliApiKey / _parseBaseUrl: re-exposed at the bottom of this file.
 // See the `parseJolliApiKey` export for the rationale (Vite tree-shaker drops
 // pure re-exports from the entry bundle when nothing inside the entry
@@ -175,11 +171,7 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"backfill",
 	"pr-description",
 	"queue-status",
-	"local-run-workflows",
 	"open-url",
-	"verify-publish-branch",
-	"workflow-run-status",
-	"workflow-runs",
 	"compile",
 	"graph",
 	"export",
@@ -205,6 +197,10 @@ or run a hot-reload dev server while you write.`;
 const SPACE_DESCRIPTION = `Sync your Markdown docs with a Jolli Space, map source repositories, and
 run documentation impact analysis on your changes — plus an interactive AI
 agent. Provided by the @jolli.ai/space-cli plugin.`;
+
+const WORKFLOW_DESCRIPTION = `Run Jolli workflows on your content — locally (your own agent executes the
+recipe, no Jolli LLM budget) or remotely (the Jolli backend runs it) — and
+review a workflow's run history. Provided by the @jolli.ai/workflow-cli plugin.`;
 
 /**
  * Main CLI entry point.
@@ -250,6 +246,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 		const memoryCmds = visibleCmds.filter((c) => MEMORY_COMMAND_NAMES.has(c.name()));
 		const siteCmds = visibleCmds.filter((c) => getHelpGroup(c) === "site");
 		const spaceCmds = visibleCmds.filter((c) => getHelpGroup(c) === "space");
+		const workflowCmds = visibleCmds.filter((c) => getHelpGroup(c) === "workflow");
 		// Anything that isn't a Memory builtin and carries no plugin group tag —
 		// e.g. a third-party plugin's command — falls through to "Other commands:".
 		const otherCmds = visibleCmds.filter(
@@ -321,6 +318,18 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 			lines.push("");
 		}
 
+		/* v8 ignore start -- root program always registers the Jolli Workflows command (real plugin or stub) */
+		if (workflowCmds.length > 0) {
+			/* v8 ignore stop */
+			lines.push("Jolli Workflows — Run workflows locally or remotely and view run history");
+			lines.push(renderSectionDescription(WORKFLOW_DESCRIPTION), "");
+			lines.push("Commands:");
+			for (const c of workflowCmds) {
+				lines.push(formatRow(helper.subcommandTerm(c), helper.subcommandDescription(c)));
+			}
+			lines.push("");
+		}
+
 		if (otherCmds.length > 0) {
 			lines.push("Other commands:");
 			for (const c of otherCmds) {
@@ -365,11 +374,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerSpacesCommand(program);
 	registerBindCommand(program);
 	registerQueueStatusCommand(program);
-	registerLocalRunOfferCommand(program);
 	registerOpenUrlCommand(program);
-	registerVerifyPublishBranchCommand(program);
-	registerWorkflowRunStatusCommand(program);
-	registerWorkflowRunsCommand(program);
 	registerCompileCommand(program);
 	registerGraphCommand(program);
 	registerMigrateCommand(program);
