@@ -13,7 +13,17 @@ import type { RemovableItem, UninstallInventory } from "../install/UninstallScan
 
 // ─── Hoisted mocks ────────────────────────────────────────────────────────────
 
-const { mockScan, mockPrune, mockUninstall, mockRm, mockIsInteractive, mockPromptText, mockTrack } = vi.hoisted(() => ({
+const {
+	mockScan,
+	mockPrune,
+	mockUninstall,
+	mockRm,
+	mockIsInteractive,
+	mockPromptText,
+	mockTrack,
+	mockCreateStorage,
+	mockSetActiveStorage,
+} = vi.hoisted(() => ({
 	mockScan: vi.fn(),
 	mockPrune: vi.fn(),
 	mockUninstall: vi.fn(),
@@ -21,9 +31,15 @@ const { mockScan, mockPrune, mockUninstall, mockRm, mockIsInteractive, mockPromp
 	mockIsInteractive: vi.fn(),
 	mockPromptText: vi.fn(),
 	mockTrack: vi.fn(),
+	mockCreateStorage: vi.fn(),
+	mockSetActiveStorage: vi.fn(),
 }));
 
 vi.mock("node:fs/promises", () => ({ rm: mockRm }));
+
+vi.mock("../core/StorageFactory.js", () => ({ createStorage: mockCreateStorage }));
+
+vi.mock("../core/SummaryStore.js", () => ({ setActiveStorage: mockSetActiveStorage }));
 
 vi.mock("../install/UninstallScan.js", () => ({
 	scanUninstallInventory: mockScan,
@@ -81,6 +97,7 @@ beforeEach(() => {
 	mockPrune.mockResolvedValue(undefined);
 	mockUninstall.mockResolvedValue({ success: true, message: "ok", warnings: [] });
 	mockIsInteractive.mockReturnValue(true);
+	mockCreateStorage.mockResolvedValue({ tag: "fake-storage" });
 });
 
 afterEach(() => {
@@ -117,6 +134,30 @@ describe("parseSelection", () => {
 
 	it("returns null when no valid index is present", () => {
 		expect(parseSelection("0 9 foo", 3)).toBeNull();
+	});
+});
+
+// ─── storage backend ──────────────────────────────────────────────────────────
+
+describe("uninstall — storage backend", () => {
+	it("establishes the configured backend before scanning", async () => {
+		mockScan.mockResolvedValue(inventory([]));
+		await run(["--yes"]);
+		// Backend must be set before the scan reads the summary count, else the read
+		// falls through to the orphan-branch fallback and logs a spurious warning.
+		expect(mockCreateStorage).toHaveBeenCalledWith("/repo", "/repo");
+		expect(mockSetActiveStorage).toHaveBeenCalledWith({ tag: "fake-storage" });
+		const setOrder = mockSetActiveStorage.mock.invocationCallOrder[0];
+		const scanOrder = mockScan.mock.invocationCallOrder[0];
+		expect(setOrder).toBeLessThan(scanOrder);
+	});
+
+	it("proceeds when the backend cannot be established (non-fatal)", async () => {
+		mockCreateStorage.mockRejectedValue(new Error("no repo"));
+		mockScan.mockResolvedValue(inventory([]));
+		const { out } = await run(["--yes"]);
+		expect(mockSetActiveStorage).not.toHaveBeenCalled();
+		expect(out).toContain("No Jolli installation or configuration found");
 	});
 });
 
