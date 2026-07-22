@@ -2,7 +2,7 @@ package ai.jolli.jollimemory.actions
 
 import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.core.SessionTracker
-import ai.jolli.jollimemory.core.Summarizer
+import ai.jolli.jollimemory.bridge.CliIntegrations
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
@@ -47,7 +47,10 @@ class SquashAction : AnAction() {
         val project = e.project ?: return
         val service = project.getService(JolliMemoryService::class.java)
         val git = service.getGitOps() ?: return
-        val cwd = service.mainRepoRoot ?: project.basePath ?: return
+        // cwd is the worktree root: post-commit hooks fire from the worktree
+        // and read squash-pending.json from `<worktree>/.jolli/jollimemory/`,
+        // so writes here must target the same tree.
+        val cwd = project.basePath ?: return
 
         if (SessionTracker.isWorkerBusy(cwd)) {
             Messages.showWarningDialog(project,
@@ -55,8 +58,6 @@ class SquashAction : AnAction() {
                 "Jolli Memory")
             return
         }
-
-        val config = SessionTracker.loadConfig(cwd)
 
         // Get selected commits from CommitsPanel if available, otherwise use all branch commits
         val commitsPanel = service.panelRegistry?.commitsPanel
@@ -84,38 +85,25 @@ class SquashAction : AnAction() {
         ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Jolli Memory: Squashing...", false) {
             override fun run(indicator: ProgressIndicator) {
                 try {
-                    // Get summaries for each commit to generate a good squash message
-                    indicator.text = "Reading commit summaries..."
-                    var ticketId: String? = null
-                    val commitData = commits.map { c ->
-                        val summary = service.getSummary(c.hash)
-                        val topics = summary?.topics ?: emptyList()
-                        // Take the first non-empty ticketId (matching VS Code behavior)
-                        if (ticketId == null && !summary?.ticketId.isNullOrBlank()) {
-                            ticketId = summary?.ticketId
-                        }
-                        c.message to topics
-                    }
-
-                    // Determine full vs partial squash (matching VS Code behavior)
-                    val allBranchCommits = service.getBranchCommits()
-                    val isFullSquash = commits.size >= allBranchCommits.size
-
-                    // Generate squash message via AI (matching VS Code: abort on failure)
+                    // Generate squash message via AI (matching VS Code: abort on failure).
+                    // The CLI's `generate squash-message` bridge re-reads each hash's
+                    // commit subject and summary itself (GenerateCommand runSquashMessage),
+                    // and derives ticketId + isFullSquash from the same range. Reading them
+                    // here too would just duplicate N orphan-branch reads per squash.
+                    // Credential gating happens CLI-side (`resolveLlmCredentialSource` covers
+                    // Anthropic / Jolli-proxy / local-agent uniformly); a missing-provider
+                    // failure comes back as a classified error envelope that
+                    // `friendlyLlmMessage` turns into user guidance.
                     indicator.text = "Generating squash message..."
                     val message: String
-                    if (config.apiKey.isNullOrBlank()) {
-                        log.warn("No API key configured — cannot generate AI squash message")
-                        ApplicationManager.getApplication().invokeLater {
-                            Messages.showErrorDialog(project,
-                                "No API key configured. Please set your Anthropic API key in the Jolli Memory settings.",
-                                "Jolli Memory")
-                        }
-                        return
-                    }
                     try {
                         log.info("Generating squash message via AI…")
-                        message = Summarizer.generateSquashMessage(commitData, ticketId, isFullSquash, config.apiKey, config.model, config.jolliApiKey, config.aiProvider)
+                        val request = com.google.gson.Gson().toJson(
+                            mapOf("hashes" to commits.reversed().map { it.hash }),
+                        )
+                        val response = CliIntegrations.generate(cwd, "squash-message", request, indicator)
+                        message = response.get("message")?.asString
+                            ?: throw RuntimeException("Empty response from the CLI")
                         log.info("Squash message generated: %s", message)
                     } catch (ex: Exception) {
                         log.error("Failed to generate squash message: %s", ex.message)
@@ -261,7 +249,11 @@ class SquashAction : AnAction() {
     override fun update(e: AnActionEvent) {
         val service = e.project?.getService(JolliMemoryService::class.java)
         val status = service?.getStatus()
-        val cwd = service?.mainRepoRoot ?: e.project?.basePath
+        // Worker locks are per-worktree, and [actionPerformed] runs against
+        // `project.basePath` (the current worktree). The button-enabled state
+        // must reflect the SAME tree, otherwise a busy worker in the main
+        // checkout would grey out this worktree's button (and vice versa).
+        val cwd = e.project?.basePath
         val workerBusy = cwd != null && SessionTracker.isWorkerBusy(cwd)
         val isForeign = service?.panelRegistry?.commitsPanel?.isForeignMode == true
         e.presentation.isEnabled = status != null && status.enabled && !workerBusy && !isForeign

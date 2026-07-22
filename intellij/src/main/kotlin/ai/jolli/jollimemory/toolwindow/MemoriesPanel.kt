@@ -129,8 +129,12 @@ class MemoriesPanel(
 
     private fun refreshFromIndex() {
         val status = service.getStatus()
-        if (status == null || !status.enabled) {
+        if (status == null) {
             SwingUtilities.invokeLater { showInitializing() }
+            return
+        }
+        if (!status.enabled) {
+            SwingUtilities.invokeLater { showDisabled() }
             return
         }
 
@@ -153,6 +157,17 @@ class MemoriesPanel(
     private fun showInitializing() {
         removeAll()
         emptyLabel.text = "<html><center>Initializing Jolli Memory...</center></html>"
+        add(emptyLabel, BorderLayout.CENTER)
+        revalidate(); repaint()
+    }
+
+    // Shown when the service is initialized but hooks are not installed (or were
+    // uninstalled). Distinct from showInitializing so users are not misled into
+    // thinking a background task is still running — nothing is, until they enable.
+    private fun showDisabled() {
+        removeAll()
+        emptyLabel.text = "<html><center>Jolli Memory is not enabled for this repository.<br/>" +
+            "Open the Status panel to install hooks and enable it.</center></html>"
         add(emptyLabel, BorderLayout.CENTER)
         revalidate(); repaint()
     }

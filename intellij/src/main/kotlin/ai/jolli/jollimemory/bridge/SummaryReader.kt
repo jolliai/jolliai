@@ -23,9 +23,13 @@ class SummaryReader(private val projectDir: String, private val git: GitCommands
 
     /** Read the full installation and data status. */
     fun getStatus(installer: HookInstaller): StatusInfo {
-        val hooksInstalled = installer.areAllHooksInstalled()
         val sessions = SessionTracker.loadAllSessions(projectDir)
         val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
+        // Mirror the CLI's isFullyInstalled readiness check: a user with
+        // `claudeEnabled: false` intentionally has no Claude Stop hook, so
+        // requiring it would report a complete install as broken and re-trigger
+        // the startup auto-install every launch.
+        val hooksInstalled = installer.areAllHooksInstalled(claudeRequired = config.claudeEnabled != false)
         val branchExists = git.branchExists(ORPHAN_BRANCH)
         val summaryCount = if (branchExists) countSummaries() else 0
 
@@ -53,8 +57,12 @@ class SummaryReader(private val projectDir: String, private val git: GitCommands
         return StatusInfo(
             enabled = hooksInstalled,
             claudeHookInstalled = installer.isClaudeHookInstalled(),
-            gitHookInstalled = installer.isGitHookInstalled("post-commit",
-                "# >>> JolliMemory post-commit hook >>>"),
+            // Reflect all five CLI-installed git hooks (post-commit, post-rewrite,
+            // prepare-commit-msg, post-merge, pre-push). Checking only post-commit
+            // reported the whole set as absent whenever any single hook was missing
+            // from that one file, so the sidebar showed "Hooks: none installed"
+            // while pre-push (and friends) were actually installed.
+            gitHookInstalled = installer.areAllGitHooksInstalled(),
             geminiHookInstalled = installer.isGeminiHookInstalled(),
             activeSessions = sessions.size,
             mostRecentSession = SessionTracker.loadMostRecentSession(projectDir),

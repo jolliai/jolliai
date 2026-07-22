@@ -224,7 +224,7 @@ class CommitsPanel(
                 return@executeOnPooledThread
             }
             if (!status.enabled) {
-                SwingUtilities.invokeLater { showInitializing() }
+                SwingUtilities.invokeLater { showDisabled() }
                 return@executeOnPooledThread
             }
             try {
@@ -297,7 +297,7 @@ class CommitsPanel(
             return
         }
         if (!status.enabled) {
-            SwingUtilities.invokeLater { if (refreshVersion == myVersion) showInitializing() }
+            SwingUtilities.invokeLater { if (refreshVersion == myVersion) showDisabled() }
             return
         }
 
@@ -364,6 +364,17 @@ class CommitsPanel(
     private fun showInitializing() {
         removeAll()
         emptyLabel.text = "<html><center>Initializing Jolli Memory...</center></html>"
+        add(emptyLabel, BorderLayout.CENTER)
+        revalidate(); repaint()
+    }
+
+    // Shown when the service is initialized but hooks are not installed (or were
+    // uninstalled). Distinct from showInitializing so users are not misled into
+    // thinking a background task is still running — nothing is, until they enable.
+    private fun showDisabled() {
+        removeAll()
+        emptyLabel.text = "<html><center>Jolli Memory is not enabled for this repository.<br/>" +
+            "Open the Status panel to install hooks and enable it.</center></html>"
         add(emptyLabel, BorderLayout.CENTER)
         revalidate(); repaint()
     }

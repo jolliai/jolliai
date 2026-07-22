@@ -117,14 +117,17 @@ class StatusPanel(
 
         listModel.clear()
 
-        // 1. Hooks — detailed breakdown matching VS Code (Git + Claude + Gemini)
+        // 1. Hooks — detailed breakdown matching VS Code (Git + Claude + Gemini).
+        // All hooks are CLI-installed now (full `enable`): five git hooks incl.
+        // post-merge and pre-push, running the Node run-hook dispatcher.
         val hookParts = mutableListOf<String>()
-        if (status.gitHookInstalled) hookParts.add("3 Git")
+        if (status.gitHookInstalled) hookParts.add("5 Git")
         if (status.claudeHookInstalled) hookParts.add("2 Claude")
         if (status.geminiHookInstalled) hookParts.add("1 Gemini CLI")
         val hooksDescription = if (hookParts.isNotEmpty()) hookParts.joinToString(" + ") else "none installed"
         val hooksTooltip = listOf(
-            "Git hooks: ${if (status.gitHookInstalled) "3 installed" else "not installed"} (post-commit, post-rewrite, prepare-commit-msg)",
+            "Git hooks: ${if (status.gitHookInstalled) "5 installed" else "not installed"} " +
+                "(post-commit, post-rewrite, prepare-commit-msg, post-merge, pre-push)",
             "Claude Code hooks: ${if (status.claudeHookInstalled) "2 installed" else "not installed"} (Stop, SessionStart)",
             "Gemini CLI hook: ${if (status.geminiHookInstalled) "installed" else "not installed"} (AfterAgent)",
         ).joinToString("\n")

@@ -66,6 +66,26 @@ describe("runInvocation", () => {
 		await expect(promise).resolves.toBe('{"r":"好"}');
 	});
 
+	it("resolves stdout on nonzero exit when it carries an is_error envelope (Claude versions that exit 1 on auth failures)", async () => {
+		const envelope = '{"type":"result","is_error":true,"result":"Not logged in · Please run /login"}';
+		const out = await runInvocation(inv, { spawnImpl: fakeSpawn({ stdout: envelope, code: 1 }) });
+		expect(out).toBe(envelope);
+	});
+
+	it("resolves stdout on nonzero exit even when stdout is not JSON (defers to parseResult)", async () => {
+		const out = await runInvocation(inv, {
+			spawnImpl: fakeSpawn({ stdout: "plain text failure", stderr: "boom", code: 1 }),
+		});
+		expect(out).toBe("plain text failure");
+	});
+
+	it("resolves stdout on nonzero exit even when is_error is not true (defers to parseResult)", async () => {
+		const out = await runInvocation(inv, {
+			spawnImpl: fakeSpawn({ stdout: '{"is_error":false,"result":"x"}', code: 1 }),
+		});
+		expect(out).toBe('{"is_error":false,"result":"x"}');
+	});
+
 	it("throws a setup error with a stderr tail on nonzero exit", async () => {
 		await expect(
 			runInvocation(inv, { spawnImpl: fakeSpawn({ stderr: "boom details", code: 1 }) }),

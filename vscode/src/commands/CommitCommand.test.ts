@@ -308,6 +308,22 @@ describe("CommitCommand", () => {
 		);
 	});
 
+	it("maps a local-agent auth failure to sign-in guidance", async () => {
+		const deps = makeDeps();
+		const authErr = new Error(
+			"Claude Code returned an error (status 0): Not logged in · Please run /login",
+		);
+		authErr.name = "LocalAgentAuthError";
+		deps.bridge.generateCommitMessage.mockRejectedValue(authErr);
+		const command = makeCommand(deps);
+
+		await command.execute();
+
+		expect(showErrorMessage).toHaveBeenCalledWith(
+			expect.stringContaining("not signed in"),
+		);
+	});
+
 	it("shows the quick pick, accepts the first action, and trims the message", async () => {
 		const deps = makeDeps();
 		const command = makeCommand(deps);

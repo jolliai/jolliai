@@ -1,25 +1,52 @@
 package ai.jolli.jollimemory.bridge
 
 import com.google.gson.GsonBuilder
-import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import ai.jolli.jollimemory.core.JmLogger
 import java.io.File
 
 /**
- * Installs and removes JolliMemory hooks — pure Kotlin, no Node.js.
+ * Installs and removes JolliMemory hooks by delegating to the plugin-bundled CLI.
  *
- * Hooks installed:
- *   1. Claude Code Stop hook in .claude/settings.local.json
- *   2. Git post-commit hook in .git/hooks/post-commit
- *   3. Git post-rewrite hook in .git/hooks/post-rewrite
- *   4. Git prepare-commit-msg hook in .git/hooks/prepare-commit-msg
- *   5. Git pre-push hook in .git/hooks/pre-push (JOLLI-1900)
+ * `install()` runs the CLI's FULL `enable` ([CliIntegrations.enableFull]): the five
+ * git hooks (post-commit, post-rewrite, prepare-commit-msg, post-merge, pre-push —
+ * all Node `run-hook` dispatcher scripts), the Claude Stop/SessionStart hooks, the
+ * Gemini AfterAgent hook, skills, global instructions, MCP registration, and the
+ * dispatch scripts. `uninstall()` runs the full `disable`. The plugin no longer
+ * writes any hook body itself — the former Kotlin fat-JAR pipeline
+ * (`java -jar jollimemory-hooks.jar ...`) is gone, so commits are summarized by the
+ * same CLI QueueWorker as the CLI and VS Code surfaces.
  *
- * The git-hook INSTALLATION is pure file I/O — no Node.js needed on the plugin
- * side. Hooks 2–4 run via the Kotlin fat JAR; the pre-push hook (5) is the one
- * exception — it reuses the shared Node `run-hook` dispatcher (see
- * [prePushScript]) because the Space-sync engine has no Kotlin port.
+ * What stays Kotlin-side:
+ *   - detection: the CLI's GitHookInstaller uses the exact same section markers, so
+ *     hooks installed by ANY surface (including a legacy fat-JAR body, which a full
+ *     enable replaces in place) are recognized;
+ *   - legacy-entry cleanup: agent-hook entries the old fat-JAR install wrote into
+ *     Claude/Gemini settings are NOT matched by the CLI's identifier lists
+ *     ("run-hook"/"StopHook"/"GeminiAfterAgentHook" — the legacy command contains
+ *     none of them verbatim as a command marker), so they are removed here before
+ *     enable to prevent DOUBLE hooks after an upgrade;
+ *   - legacy git-hook body pre-flight: [detectLegacyGitHookBodies] scans the five
+ *     tracked git hook files for `jollimemory-hooks.jar` references and logs which
+ *     ones are about to be replaced. Does NOT modify the files — the CLI enable's
+ *     marker-scoped in-place replace does that cleanly (identical section markers +
+ *     [resolveGitHooksDir] resolving worktrees to the main repo's `hooks/`), so the
+ *     retired `java -jar` command line disappears with the section body itself. The
+ *     scan is observability: an upgrade path that would otherwise be silent becomes
+ *     visible in the install log;
+ *   - the `.gitignore` guard for `.jolli/` (cheap and idempotent).
+ *
+ * Worktree-aware legacy uninstall: on `.git`-file worktrees the CLI's
+ * `resolveGitHooksDir` follows `gitdir:` back to the main repo's shared `hooks/`,
+ * so the marker-scoped replace runs against the same set of files regardless of
+ * which worktree opens the project. No separate per-worktree teardown pass is
+ * needed — main-repo replace fans out to every worktree because they all share
+ * that hooks directory.
+ *
+ * The old `~/.jolli/bin/jollimemory-hooks.jar` file is deliberately NOT deleted:
+ * other repositories may still carry legacy hook bodies pointing at it until they
+ * are re-enabled (their post-merge-less hook set fails [areAllHooksInstalled], which
+ * triggers auto-install on their next open).
  */
 class HookInstaller(private val projectDir: String, private val mainRepoRoot: String = projectDir) {
 
@@ -55,14 +82,24 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
     /**
      * Ensures `.jolli/` is listed in the project's `.gitignore`.
      * Prevents accidental commits of API keys stored in `.jolli/jollimemory/config.json`.
+     *
+     * Also respects two explicit user opt-outs so we don't fight the project's
+     * own choice: a negation line (`!.jolli/`) and a commented-out entry
+     * (`# .jolli/`). In either case we leave the file untouched — the CLI's
+     * enable path will still refuse to write anything sensitive if the user
+     * really did want `.jolli/` tracked.
      */
     private fun ensureGitignoreEntry(projectRoot: String) {
         val gitignore = File(projectRoot, ".gitignore")
         val entry = ".jolli/"
         if (gitignore.exists()) {
             val content = gitignore.readText(Charsets.UTF_8)
-            // Check if already covered (exact line match)
-            if (content.lines().any { it.trim() == entry || it.trim() == ".jolli" }) return
+            val alreadyCovered = content.lines().any { raw ->
+                val trimmed = raw.trim()
+                val effective = trimmed.removePrefix("#").trim().removePrefix("!").trim()
+                effective == entry || effective == ".jolli"
+            }
+            if (alreadyCovered) return
             // Append entry
             val separator = if (content.endsWith("\n")) "" else "\n"
             gitignore.appendText("${separator}${entry}\n", Charsets.UTF_8)
@@ -74,23 +111,48 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
 
     companion object {
         private const val POST_COMMIT_START = "# >>> JolliMemory post-commit hook >>>"
-        private const val POST_COMMIT_END = "# <<< JolliMemory post-commit hook <<<"
         private const val POST_REWRITE_START = "# >>> JolliMemory post-rewrite hook >>>"
-        private const val POST_REWRITE_END = "# <<< JolliMemory post-rewrite hook <<<"
         private const val PREPARE_MSG_START = "# >>> JolliMemory prepare-commit-msg hook >>>"
-        private const val PREPARE_MSG_END = "# <<< JolliMemory prepare-commit-msg hook <<<"
+        private const val POST_MERGE_START = "# >>> JolliMemory post-merge hook >>>"
         private const val PRE_PUSH_START = "# >>> JolliMemory pre-push hook >>>"
-        private const val PRE_PUSH_END = "# <<< JolliMemory pre-push hook <<<"
+
+        /** Marker of the retired fat-JAR hook variant inside agent settings entries. */
+        private const val LEGACY_JAR_MARKER = "jollimemory-hooks"
+
+        /**
+         * Substrings identifying a JolliMemory entry inside Claude's hooks.Stop array.
+         * Mirrors the CLI's STOP_HOOK_IDENTIFIERS ("run-hook" for the current dispatcher
+         * entry — its command is `"$HOME/.jolli/jollimemory/run-hook" stop`, which contains
+         * none of the older markers — and "StopHook" for the legacy direct-node form);
+         * LEGACY_JAR_MARKER adds the retired fat-JAR form so pre-CLI installs are still
+         * recognized before their upgrade.
+         */
+        private val CLAUDE_HOOK_IDENTIFIERS = listOf("run-hook", "StopHook", LEGACY_JAR_MARKER)
     }
 
-    /** Check if Claude Code Stop hook is installed (checks main repo's .claude/). */
+    /**
+     * Check if the Claude Code Stop hook is installed.
+     *
+     * Reads `projectDir/.claude/settings.local.json` — NOT `mainRepoRoot`. The CLI's
+     * enable path runs with `.directory(projectDir)` and no `--cwd`, so its own
+     * `resolveProjectDir()` (git rev-parse --show-toplevel) returns the CURRENT
+     * worktree and it writes the Stop hook there. Detecting from `mainRepoRoot`
+     * would keep this false forever on a linked worktree — the startup gate
+     * (`cachedStatus?.enabled != true`) would then rerun a full enable on every
+     * open. On the main checkout `projectDir == mainRepoRoot` so nothing changes.
+     */
     fun isClaudeHookInstalled(): Boolean {
-        val settingsPath = File(mainRepoRoot, ".claude/settings.local.json")
+        val settingsPath = File(projectDir, ".claude/settings.local.json")
         if (!settingsPath.exists()) return false
         return try {
-            val content = settingsPath.readText(Charsets.UTF_8)
-            // Match any JolliMemory hook variant: Node.js (StopHook.js) or Kotlin (jollimemory-hooks.jar stop)
-            content.contains("JolliMemory") || content.contains("StopHook") || content.contains("jollimemory-hooks")
+            val settings = JsonParser.parseString(settingsPath.readText(Charsets.UTF_8)).asJsonObject
+            val stopArray = settings.getAsJsonObject("hooks")?.getAsJsonArray("Stop") ?: return false
+            // Match per Stop entry (not against the whole file) so unrelated settings
+            // content can't produce a false positive, mirroring the CLI's matcher helpers.
+            stopArray.any { entry ->
+                val text = entry.toString()
+                CLAUDE_HOOK_IDENTIFIERS.any { text.contains(it) }
+            }
         } catch (_: Exception) {
             false
         }
@@ -99,7 +161,7 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
     /** Returns debug info about paths being checked. */
     fun getDebugInfo(): String {
         val gitDir = resolveGitDir()
-        val claudePath = File(mainRepoRoot, ".claude/settings.local.json")
+        val claudePath = File(projectDir, ".claude/settings.local.json")
         val postCommit = File(gitDir, "hooks/post-commit")
         return "projectDir=$projectDir, mainRepoRoot=$mainRepoRoot, " +
             "gitDir=$gitDir, " +
@@ -136,21 +198,35 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
         return File("$home/.claude").isDirectory
     }
 
-    /** Check all required hooks. */
-    fun areAllHooksInstalled(): Boolean {
-        return isClaudeHookInstalled() &&
-            isGitHookInstalled("post-commit", POST_COMMIT_START) &&
+    /**
+     * Check all required hooks. post-merge is part of the set: legacy fat-JAR installs
+     * never wrote it, so they fail this check and the startup auto-install upgrades
+     * them to the CLI-managed Node hooks (same markers — replaced in place).
+     *
+     * @param claudeRequired pass false when the user explicitly disabled Claude
+     *   (config.claudeEnabled == false): the CLI's enable skips the Claude hook then,
+     *   so requiring it here would flag a complete install as broken and re-trigger
+     *   the startup auto-install on every project open. Mirrors the CLI's own
+     *   isFullyInstalled readiness check (`claudeReady = claudeEnabled === false || …`).
+     */
+    fun areAllHooksInstalled(claudeRequired: Boolean = true): Boolean {
+        return (!claudeRequired || isClaudeHookInstalled()) && areAllGitHooksInstalled()
+    }
+
+    /** Check all five CLI-installed git hook sections. */
+    fun areAllGitHooksInstalled(): Boolean {
+        return isGitHookInstalled("post-commit", POST_COMMIT_START) &&
             isGitHookInstalled("post-rewrite", POST_REWRITE_START) &&
             isGitHookInstalled("prepare-commit-msg", PREPARE_MSG_START) &&
+            isGitHookInstalled("post-merge", POST_MERGE_START) &&
             isGitHookInstalled("pre-push", PRE_PUSH_START)
     }
 
     /**
-     * Install all hooks.
+     * Install all hooks by running the bundled CLI's full `enable`.
      * Returns a result message.
      */
     fun install(): InstallResult {
-        val warnings = mutableListOf<String>()
         val installLog = StringBuilder()
         try {
             // Ensure .jolli/jollimemory directory
@@ -161,85 +237,42 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             ensureGitignoreEntry(projectDir)
             installLog.appendLine("Checked .gitignore for .jolli/ entry")
 
-            // Find/extract hooks JAR
-            val jar = findHooksJar()
-            // Debug: log where the classloader finds the plugin
-            val classLocation = try {
-                HookInstaller::class.java.protectionDomain?.codeSource?.location?.toURI()?.toString() ?: "null"
-            } catch (e: Exception) { "error: ${e.message}" }
-            installLog.appendLine("classLocation=$classLocation")
-            installLog.appendLine("hooks JAR: $jar")
+            // Drop agent-hook entries written by the retired fat-JAR install BEFORE
+            // enable — the CLI's identifier lists don't match them, so without this an
+            // upgraded install would end up with double Stop/AfterAgent hooks.
+            val removedLegacy = removeLegacyAgentHookEntries()
+            installLog.appendLine("Legacy fat-JAR agent entries removed: $removedLegacy")
 
-            // Install Claude Code hook
-            installClaudeHook()
-            // DEBUG: verify file was written correctly
-            val verifyFile = File(mainRepoRoot, ".claude/settings.local.json")
-            val verifyContent = if (verifyFile.exists()) verifyFile.readText(Charsets.UTF_8) else "FILE NOT FOUND"
-            val hasHook = verifyContent.contains("jollimemory-hooks")
-            installLog.appendLine("Claude hook installed (verified: hasHook=$hasHook, size=${verifyContent.length})")
-            if (!hasHook) {
-                installLog.appendLine("WARNING: Claude hook NOT found in file after write!")
-                installLog.appendLine("File content: ${verifyContent.take(200)}")
+            // Log any legacy fat-JAR git-hook bodies about to be swept out. The CLI's
+            // enable replaces the marker section in place (same markers as the retired
+            // Kotlin install wrote), so we only need visibility, not a separate teardown.
+            val legacyGitHooks = detectLegacyGitHookBodies()
+            if (legacyGitHooks.isNotEmpty()) {
+                log.info("Legacy fat-JAR git hook bodies detected (replaced in place by CLI enable): %s", legacyGitHooks)
+                installLog.appendLine("Legacy fat-JAR git hooks detected: $legacyGitHooks")
             }
 
-            // Install Gemini CLI hook (if Gemini is detected)
-            installGeminiHook()
-            installLog.appendLine("Gemini hook installed")
-
-            // Install git hooks
-            installGitHook("post-commit", POST_COMMIT_START, POST_COMMIT_END, postCommitScript())
-            installGitHook("post-rewrite", POST_REWRITE_START, POST_REWRITE_END, postRewriteScript())
-            installGitHook("prepare-commit-msg", PREPARE_MSG_START, PREPARE_MSG_END, prepareMsgScript())
-            installGitHook("pre-push", PRE_PUSH_START, PRE_PUSH_END, prePushScript())
-            installLog.appendLine("Git hooks installed")
-
-            // Install Jolli skill files (jolli-recall / jolli-search / jolli-pr) into both
-            // .claude/skills and the cross-platform .agents/skills.
-            SkillInstaller(mainRepoRoot).updateSkillIfNeeded()
-            installLog.appendLine("Skills installed")
-
-            // Re-apply the machine-global skill-preference block per the user's saved consent.
-            // confirm=null → never prompts here (the Settings checkbox is the consent surface);
-            // this only writes when the user already opted in, removes when they opted out, and
-            // is a no-op while undecided. Fail-soft — never breaks enable.
-            try {
-                GlobalInstructionsInstaller.sync()
-                installLog.appendLine("Global instructions synced")
-            } catch (e: Exception) {
-                installLog.appendLine("Global instructions sync failed (non-fatal): ${e.message}")
-            }
-
-            // Light up MCP + the full skill set (recall/search/pr) by shelling the bundled
-            // CLI's integrations-only enable. Node-only: when Node is absent this is a clean
-            // skip — Java hooks above already made memory generation work. Never fatal.
-            // ALL non-Ok results surface a warning (not just NodeMissing) so a failed/absent
-            // bundle no longer fails silently.
-            val integ = CliIntegrations.enableIntegrations(projectDir)
-            val integrationsIssue = CliIntegrations.warningFor(integ)
-            if (integrationsIssue != null) warnings.add(integrationsIssue)
-            installLog.appendLine(
-                when (integ) {
-                    is CliIntegrations.Result.Ok -> "Integrations (MCP + skills) enabled"
-                    is CliIntegrations.Result.NodeMissing -> "Integrations skipped: Node.js not found"
-                    is CliIntegrations.Result.BundleMissing -> "Integrations skipped: bundled Cli.js not found"
-                    is CliIntegrations.Result.Failed -> "Integrations failed (non-fatal): ${integ.message}"
-                },
-            )
-
-            // Final verification: re-read Claude hook file
-            val finalVerify = File(mainRepoRoot, ".claude/settings.local.json")
-            val finalContent = if (finalVerify.exists()) finalVerify.readText(Charsets.UTF_8) else "FILE NOT FOUND"
-            installLog.appendLine("Final verify: hasHook=${finalContent.contains("jollimemory-hooks")}, size=${finalContent.length}")
-            installLog.appendLine("areAllHooksInstalled=${areAllHooksInstalled()}")
-
-            // Write install log
+            // The CLI owns ALL hook installation: git hooks + Claude + Gemini + skills
+            // + global instructions + MCP + dispatch scripts, in one transaction-ish run.
+            val result = CliIntegrations.enableFull(projectDir)
+            installLog.appendLine("CLI full enable result: $result")
+            installLog.appendLine("claudeHook=${isClaudeHookInstalled()} gitHooks5=${areAllGitHooksInstalled()}")
             writeInstallLog(installLog.toString())
 
-            return InstallResult(true, "JolliMemory hooks installed successfully", warnings, integrationsIssue = integrationsIssue)
+            return when (result) {
+                is CliIntegrations.Result.Ok ->
+                    InstallResult(true, "JolliMemory hooks installed successfully", emptyList())
+                else ->
+                    InstallResult(
+                        false,
+                        CliIntegrations.warningFor(result) ?: "enable failed",
+                        emptyList(),
+                    )
+            }
         } catch (e: Exception) {
             installLog.appendLine("ERROR: ${e.message}\n${e.stackTraceToString()}")
             writeInstallLog(installLog.toString())
-            return InstallResult(false, "Installation failed: ${e.message}", warnings)
+            return InstallResult(false, "Installation failed: ${e.message}", emptyList())
         }
     }
 
@@ -273,440 +306,105 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
     }
 
     /**
-     * Remove all hooks.
+     * Remove all hooks by running the bundled CLI's full `disable` (git hook sections —
+     * same markers regardless of which surface wrote them, including legacy fat-JAR
+     * bodies — plus Claude/Gemini agent hooks and the repo-scoped MCP registration).
      */
     fun uninstall(): InstallResult {
-        try {
-            removeClaudeHook()
-            removeGeminiHook()
-            removeGitHookSection("post-commit", POST_COMMIT_START, POST_COMMIT_END)
-            removeGitHookSection("post-rewrite", POST_REWRITE_START, POST_REWRITE_END)
-            removeGitHookSection("prepare-commit-msg", PREPARE_MSG_START, PREPARE_MSG_END)
-            removeGitHookSection("pre-push", PRE_PUSH_START, PRE_PUSH_END)
-            // Mirror of enable: tear down the MCP registration via the bundled CLI
-            // (best-effort, node-only). Leaves hooks/skills/dist-paths per the CLI's
-            // conservative uninstall policy. Never fails the disable over this.
-            CliIntegrations.disableIntegrations(projectDir)
-            return InstallResult(true, "JolliMemory hooks removed", emptyList())
+        return try {
+            // Legacy fat-JAR agent entries are invisible to the CLI's identifier lists —
+            // sweep them here so a disable leaves nothing behind.
+            removeLegacyAgentHookEntries()
+            when (val result = CliIntegrations.disableFull(projectDir)) {
+                is CliIntegrations.Result.Ok -> InstallResult(true, "JolliMemory hooks removed", emptyList())
+                else -> InstallResult(
+                    false,
+                    CliIntegrations.warningFor(result) ?: "disable failed",
+                    emptyList(),
+                )
+            }
         } catch (e: Exception) {
-            return InstallResult(false, "Uninstallation failed: ${e.message}", emptyList())
+            InstallResult(false, "Uninstallation failed: ${e.message}", emptyList())
         }
     }
 
-    // ── Claude Code Hook ────────────────────────────────────────────────────
-
-    private fun installClaudeHook() {
-        val settingsDir = File(mainRepoRoot, ".claude")
-        settingsDir.mkdirs()
-        val settingsFile = File(settingsDir, "settings.local.json")
-
-        val hooksJar = findHooksJar()
-        val javaPath = resolveJavaPath()
-
-        val settings: JsonObject = if (settingsFile.exists()) {
-            try {
-                JsonParser.parseString(settingsFile.readText(Charsets.UTF_8)).asJsonObject
-            } catch (_: Exception) {
-                JsonObject()
-            }
-        } else {
-            JsonObject()
-        }
-
-        // Build hooks.Stop entry
-        val hooks = settings.getAsJsonObject("hooks") ?: JsonObject().also { settings.add("hooks", it) }
-
-        // Check if already installed with correct path
-        val stopArray = hooks.getAsJsonArray("Stop") ?: com.google.gson.JsonArray().also { hooks.add("Stop", it) }
-        if (hooksJar != null) {
-            val hookCommand = """"$javaPath" -jar "$hooksJar" stop"""
-
-            // Remove ALL existing JolliMemory entries (Node.js or Kotlin variants)
-            val iterator = stopArray.iterator()
-            while (iterator.hasNext()) {
-                val entry = iterator.next()
-                if (entry.isJsonObject) {
-                    val text = entry.toString()
-                    if (text.contains("JolliMemory") || text.contains("StopHook") || text.contains("jollimemory-hooks")) {
-                        iterator.remove()
-                    }
-                }
-            }
-
-            // Add new entry
-            val hookEntry = JsonObject()
-            val hooksArray = com.google.gson.JsonArray()
-            val hookDef = JsonObject().apply {
-                addProperty("type", "command")
-                addProperty("command", hookCommand)
-                addProperty("async", true)
-            }
-            hooksArray.add(hookDef)
-            hookEntry.add("hooks", hooksArray)
-            stopArray.add(hookEntry)
-        }
-
-        settingsFile.writeText(gson.toJson(settings))
-    }
-
-    private fun removeClaudeHook() {
-        val settingsFile = File(mainRepoRoot, ".claude/settings.local.json")
-        if (!settingsFile.exists()) return
-
-        try {
-            val settings = JsonParser.parseString(settingsFile.readText(Charsets.UTF_8)).asJsonObject
-            val hooks = settings.getAsJsonObject("hooks") ?: return
-            val stopArray = hooks.getAsJsonArray("Stop") ?: return
-
-            val iterator = stopArray.iterator()
-            while (iterator.hasNext()) {
-                val entry = iterator.next()
-                val text = entry.toString()
-                if (text.contains("StopHook") || text.contains("JolliMemory") || text.contains("jollimemory-hooks")) {
-                    iterator.remove()
-                }
-            }
-
-            if (stopArray.isEmpty) hooks.remove("Stop")
-            settingsFile.writeText(gson.toJson(settings))
-        } catch (_: Exception) { }
-    }
-
-    // ── Gemini CLI Hook ────────────────────────────────────────────────────
+    // ── Legacy fat-JAR entry cleanup ────────────────────────────────────────
 
     /**
-     * Installs the JolliMemory AfterAgent hook into `.gemini/settings.json`.
+     * Scans the five tracked git-hook files (`post-commit`, `post-rewrite`,
+     * `prepare-commit-msg`, `post-merge`, `pre-push`) for `jollimemory-hooks.jar`
+     * references written by the retired Kotlin fat-JAR install. Returns the hook
+     * names whose bodies still contain such a reference — the CLI's enable will
+     * replace those marker sections in place immediately after.
      *
-     * Matches the VS Code extension's Gemini hook format:
-     * ```json
-     * { "hooks": { "AfterAgent": [{ "hooks": [{ "type": "command", "command": "..." }] }] } }
-     * ```
-     *
-     * Uses the JAR-based command (`java -jar jollimemory-hooks.jar gemini-after-agent`)
-     * instead of Node.js, consistent with all other IntelliJ plugin hooks.
+     * Read-only by design: the CLI enable's marker-scoped in-place replace already
+     * takes care of removal, and doing another edit here would fight with it.
+     * Worktree-aware via [resolveGitDir], which follows `gitdir:` back to the main
+     * repo's shared `hooks/` — so the same set of files is scanned regardless of
+     * which worktree the plugin opens the project in.
      */
-    private fun installGeminiHook() {
-        val settingsDir = File(projectDir, ".gemini")
-        settingsDir.mkdirs()
-        val settingsFile = File(settingsDir, "settings.json")
-
-        val hooksJar = findHooksJar()
-        val javaPath = resolveJavaPath()
-
-        val settings: JsonObject = if (settingsFile.exists()) {
+    internal fun detectLegacyGitHookBodies(): List<String> {
+        val hooksDir = File(resolveGitDir(), "hooks")
+        if (!hooksDir.isDirectory) return emptyList()
+        val hookNames = listOf("post-commit", "post-rewrite", "prepare-commit-msg", "post-merge", "pre-push")
+        return hookNames.filter { name ->
+            val file = File(hooksDir, name)
+            if (!file.isFile) return@filter false
             try {
-                JsonParser.parseString(settingsFile.readText(Charsets.UTF_8)).asJsonObject
+                file.readText(Charsets.UTF_8).contains(LEGACY_JAR_MARKER)
             } catch (_: Exception) {
-                JsonObject()
+                false
             }
-        } else {
-            JsonObject()
         }
-
-        val hooks = settings.getAsJsonObject("hooks") ?: JsonObject().also { settings.add("hooks", it) }
-        val afterAgentArray = hooks.getAsJsonArray("AfterAgent")
-            ?: com.google.gson.JsonArray().also { hooks.add("AfterAgent", it) }
-
-        if (hooksJar != null) {
-            val hookCommand = """"$javaPath" -jar "$hooksJar" gemini-after-agent"""
-
-            // Remove existing JolliMemory entries (Node.js or Kotlin variants)
-            val iterator = afterAgentArray.iterator()
-            while (iterator.hasNext()) {
-                val entry = iterator.next()
-                if (entry.isJsonObject) {
-                    val text = entry.toString()
-                    if (text.contains("JolliMemory") || text.contains("jollimemory") ||
-                        text.contains("GeminiAfterAgentHook") || text.contains("jollimemory-hooks")
-                    ) {
-                        iterator.remove()
-                    }
-                }
-            }
-
-            // Add new matcher group entry (matches VS Code format)
-            val hookEntry = JsonObject()
-            val hooksArray = com.google.gson.JsonArray()
-            val hookDef = JsonObject().apply {
-                addProperty("type", "command")
-                addProperty("command", hookCommand)
-                addProperty("name", "jollimemory-session-tracker")
-            }
-            hooksArray.add(hookDef)
-            hookEntry.add("hooks", hooksArray)
-            afterAgentArray.add(hookEntry)
-        }
-
-        settingsFile.writeText(gson.toJson(settings))
     }
 
-    private fun removeGeminiHook() {
-        val settingsFile = File(projectDir, ".gemini/settings.json")
-        if (!settingsFile.exists()) return
+    /**
+     * Removes agent-hook entries written by the retired Kotlin fat-JAR install
+     * (`java -jar .../jollimemory-hooks.jar stop|gemini-after-agent`) from the Claude
+     * and Gemini settings files. Matches ONLY the `jollimemory-hooks` marker — the
+     * CLI-written entries (`.jolli/jollimemory/run-hook ...`) never contain it, so
+     * this can never remove a current hook. Returns true when anything was removed.
+     */
+    internal fun removeLegacyAgentHookEntries(): Boolean {
+        var removed = false
+        // Claude settings live at projectDir/.claude/... to match where the CLI's
+        // enable writes them (its `resolveProjectDir()` is `git rev-parse
+        // --show-toplevel`, which returns the current worktree). A linked worktree
+        // could carry a legacy fat-JAR entry here from a pre-CLI install, and
+        // scanning `mainRepoRoot` would miss it.
+        removed = removeLegacyEntriesFrom(File(projectDir, ".claude/settings.local.json"), "Stop") || removed
+        removed = removeLegacyEntriesFrom(File(projectDir, ".gemini/settings.json"), "AfterAgent") || removed
+        return removed
+    }
 
-        try {
+    /** Strips legacy fat-JAR entries from one settings file's hooks.<event> array. */
+    private fun removeLegacyEntriesFrom(settingsFile: File, eventKey: String): Boolean {
+        if (!settingsFile.exists()) return false
+        return try {
             val settings = JsonParser.parseString(settingsFile.readText(Charsets.UTF_8)).asJsonObject
-            val hooks = settings.getAsJsonObject("hooks") ?: return
-            val afterAgentArray = hooks.getAsJsonArray("AfterAgent") ?: return
+            val hooks = settings.getAsJsonObject("hooks") ?: return false
+            val eventArray = hooks.getAsJsonArray(eventKey) ?: return false
 
-            val iterator = afterAgentArray.iterator()
+            var removed = false
+            val iterator = eventArray.iterator()
             while (iterator.hasNext()) {
                 val entry = iterator.next()
-                val text = entry.toString()
-                if (text.contains("JolliMemory") || text.contains("jollimemory") ||
-                    text.contains("GeminiAfterAgentHook") || text.contains("jollimemory-hooks")
-                ) {
+                if (entry.isJsonObject && entry.toString().contains(LEGACY_JAR_MARKER)) {
                     iterator.remove()
+                    removed = true
                 }
             }
+            if (!removed) return false
 
-            if (afterAgentArray.isEmpty) hooks.remove("AfterAgent")
+            if (eventArray.isEmpty) hooks.remove(eventKey)
             if (hooks.entrySet().isEmpty()) settings.remove("hooks")
             settingsFile.writeText(gson.toJson(settings))
-        } catch (_: Exception) { }
-    }
-
-    /**
-     * Finds or extracts the jollimemory-hooks.jar file.
-     *
-     * The JAR is bundled inside the IntelliJ plugin. On first use, it's extracted
-     * to ~/.jolli/bin/jollimemory-hooks.jar so hook scripts can reference a stable path.
-     */
-    private fun findHooksJar(): String? {
-        val home = System.getProperty("user.home")
-        val binDir = File("$home/.jolli/bin")
-        val installed = File(binDir, "jollimemory-hooks.jar")
-
-        // 1. Find in plugin's bin/ directory and always copy to ~/.jolli/bin/ (keeps it up to date)
-        val pluginJar = findPluginLibJar()
-        if (pluginJar != null) {
-            try {
-                binDir.mkdirs()
-                pluginJar.copyTo(installed, overwrite = true)
-                // Copy sqlite-jdbc.jar — the hooks JAR's MANIFEST Class-Path references it.
-                // In the plugin directory layout it lives in lib/ (sibling of bin/).
-                val libDir = pluginJar.parentFile?.parentFile?.let { File(it, "lib") }
-                val sqliteJar = libDir?.listFiles()?.firstOrNull {
-                    it.name.startsWith("sqlite-jdbc") && it.name.endsWith(".jar")
-                }
-                if (sqliteJar != null) {
-                    sqliteJar.copyTo(File(binDir, "sqlite-jdbc.jar"), overwrite = true)
-                    log.info("Copied sqlite-jdbc.jar to: %s", binDir.absolutePath)
-                }
-                log.info("Copied hooks JAR from plugin lib to: %s", installed.absolutePath)
-                return installed.absolutePath
-            } catch (e: Exception) {
-                log.info("Failed to copy hooks JAR: %s", e.message)
-                return pluginJar.absolutePath
-            }
+            log.info("Removed legacy fat-JAR entries from %s (%s)", settingsFile.name, eventKey)
+            true
+        } catch (e: Exception) {
+            log.warn("Legacy entry cleanup failed for %s: %s", settingsFile.absolutePath, e.message)
+            false
         }
-
-        // 2. Already at ~/.jolli/bin/ from a previous install
-        if (installed.exists()) return installed.absolutePath
-
-        // 3. Fallback: dev build output
-        val devPaths = listOf(
-            File(projectDir, "tools/jollimemory-intellij/build/libs"),
-            File(mainRepoRoot, "tools/jollimemory-intellij/build/libs"),
-        )
-        for (devBuild in devPaths) {
-            if (devBuild.isDirectory) {
-                val jar = devBuild.listFiles()?.firstOrNull {
-                    it.name.startsWith("jollimemory-hooks") && it.name.endsWith(".jar")
-                }
-                if (jar != null) return jar.absolutePath
-            }
-        }
-
-        log.info("jollimemory-hooks.jar not found")
-        return null
-    }
-
-    /** Finds jollimemory-hooks.jar using IntelliJ's Plugin API to locate the plugin directory. */
-    private fun findPluginLibJar(): File? {
-        val searchLog = StringBuilder()
-        return try {
-            // Derive the plugin install path from this class's code-source location
-            // instead of the IntelliJ `PluginManager` API (which is `@ApiStatus.Internal`
-            // and tripped the Marketplace Plugin Verifier). In an installed plugin this
-            // class is loaded from `<pluginPath>/lib/<jar>.jar`, so the plugin root is two
-            // levels up. Pure JVM API — also resolves to null cleanly when running from
-            // the hooks JAR outside the IDE, which the null-guards below handle.
-            // Robust plugin-dir resolution: codeSource first, then a bundled-resource URL
-            // fallback (codeSource.location is null under IntelliJ 2026.1's module loader).
-            val pluginPath = CliIntegrations.resolvePluginDir()?.toPath()
-            searchLog.appendLine("pluginPath=$pluginPath (via resolvePluginDir)")
-
-            if (pluginPath != null) {
-                // Check bin/ first (hooks JAR lives outside lib/ to avoid Plugin Verifier scanning)
-                val binDir = pluginPath.resolve("bin").toFile()
-                searchLog.appendLine("binDir=${binDir.absolutePath} exists=${binDir.exists()}")
-
-                if (binDir.isDirectory) {
-                    val candidate = File(binDir, "jollimemory-hooks.jar")
-                    if (candidate.exists()) {
-                        searchLog.appendLine("FOUND in bin/: ${candidate.absolutePath}")
-                        writeSearchLog(searchLog.toString())
-                        return candidate
-                    }
-                }
-
-                // Fallback: check lib/ for backwards compatibility
-                val libDir = pluginPath.resolve("lib").toFile()
-                searchLog.appendLine("libDir=${libDir.absolutePath} exists=${libDir.exists()}")
-
-                if (libDir.isDirectory) {
-                    val files = libDir.listFiles()?.map { it.name } ?: emptyList()
-                    searchLog.appendLine("libDir contents: $files")
-
-                    val candidate = File(libDir, "jollimemory-hooks.jar")
-                    if (candidate.exists()) {
-                        searchLog.appendLine("FOUND in lib/: ${candidate.absolutePath}")
-                        writeSearchLog(searchLog.toString())
-                        return candidate
-                    }
-                }
-
-                // Walk entire plugin directory
-                val pluginDir = pluginPath.toFile()
-                searchLog.appendLine("Walking plugin dir: ${pluginDir.absolutePath}")
-                val found = pluginDir.walkTopDown().maxDepth(5)
-                    .firstOrNull { it.name == "jollimemory-hooks.jar" }
-                if (found != null) {
-                    searchLog.appendLine("FOUND via walk: ${found.absolutePath}")
-                    writeSearchLog(searchLog.toString())
-                    return found
-                }
-            }
-
-            searchLog.appendLine("NOT FOUND")
-            writeSearchLog(searchLog.toString())
-            null
-        } catch (e: Throwable) {
-            // Catches both Exception AND NoClassDefFoundError (when running outside IntelliJ)
-            searchLog.appendLine("EXCEPTION: ${e.javaClass.simpleName}: ${e.message}")
-            writeSearchLog(searchLog.toString())
-            null
-        }
-    }
-
-    private fun writeSearchLog(content: String) {
-        try {
-            File(System.getProperty("user.home") + "/.jolli/logs", "jollimemory-jar-search.log").also { it.parentFile.mkdirs() }
-                .writeText("=== JAR Search Log ===\n${java.time.Instant.now()}\n\n$content")
-        } catch (_: Exception) { }
-    }
-
-    /** Resolves the java binary path (IntelliJ bundled JDK or system). */
-    private fun resolveJavaPath(): String {
-        // IntelliJ's bundled JDK
-        val javaHome = System.getProperty("java.home")
-        if (javaHome != null) {
-            val javaBin = File("$javaHome/bin/java")
-            if (javaBin.exists()) return javaBin.absolutePath
-        }
-        return "java"
-    }
-
-    // ── Git Hooks ───────────────────────────────────────────────────────────
-
-    private fun installGitHook(hookName: String, startMarker: String, endMarker: String, script: String) {
-        val hooksDir = File(resolveGitDir(), "hooks")
-        hooksDir.mkdirs()
-        val hookFile = File(hooksDir, hookName)
-
-        var content = if (hookFile.exists()) hookFile.readText(Charsets.UTF_8) else "#!/bin/sh\n"
-
-        // Ensure shebang
-        if (!content.startsWith("#!")) {
-            content = "#!/bin/sh\n$content"
-        }
-
-        // Remove existing section if present
-        content = removeBetweenMarkers(content, startMarker, endMarker)
-
-        // Append new section
-        content = content.trimEnd() + "\n\n$startMarker\n$script\n$endMarker\n"
-
-        hookFile.writeText(content)
-        hookFile.setExecutable(true)
-    }
-
-    private fun removeGitHookSection(hookName: String, startMarker: String, endMarker: String) {
-        val hookFile = File(resolveGitDir(), "hooks/$hookName")
-        if (!hookFile.exists()) return
-
-        val content = hookFile.readText(Charsets.UTF_8)
-        val cleaned = removeBetweenMarkers(content, startMarker, endMarker).trim()
-
-        // If only shebang remains, delete the file
-        if (cleaned == "#!/bin/sh" || cleaned.isBlank()) {
-            hookFile.delete()
-        } else {
-            hookFile.writeText(cleaned + "\n")
-        }
-    }
-
-    private fun removeBetweenMarkers(content: String, startMarker: String, endMarker: String): String {
-        val startIdx = content.indexOf(startMarker)
-        val endIdx = content.indexOf(endMarker)
-        if (startIdx < 0 || endIdx < 0 || endIdx <= startIdx) return content
-        return content.substring(0, startIdx) + content.substring(endIdx + endMarker.length)
-    }
-
-    // ── Hook script templates ───────────────────────────────────────────────
-    // Shell scripts that delegate to the Kotlin fat JAR.
-    // No Node.js needed — only JDK (bundled with IntelliJ).
-
-    private fun postCommitScript(): String {
-        val jar = findHooksJar() ?: return "echo 'jollimemory-hooks.jar not found' >&2"
-        val java = resolveJavaPath()
-        return """"$java" -jar "$jar" post-commit "$@" &"""
-    }
-
-    private fun postRewriteScript(): String {
-        val jar = findHooksJar() ?: return "echo 'jollimemory-hooks.jar not found' >&2"
-        val java = resolveJavaPath()
-        return """"$java" -jar "$jar" post-rewrite "$@""""
-    }
-
-    private fun prepareMsgScript(): String {
-        val jar = findHooksJar() ?: return "echo 'jollimemory-hooks.jar not found' >&2"
-        val java = resolveJavaPath()
-        return """"$java" -jar "$jar" prepare-commit-msg "$@""""
-    }
-
-    /**
-     * pre-push (JOLLI-1900): sync the pushed commits' memory to Jolli Space.
-     *
-     * Unlike every other IntelliJ hook, this does NOT go through the Kotlin fat
-     * JAR — the pre-push sync engine (the `push-pending.json` queue + the Jolli
-     * Space doc upload) lives only in the Node CLI, with no Kotlin port. Instead
-     * it reuses the SAME shared `run-hook` dispatcher the CLI and VS Code install
-     * (written by [CliIntegrations.enableIntegrations] → the bundled `jolli enable
-     * --integrations-only`), so IntelliJ gets byte-identical per-push behaviour via
-     * the same `PrePushHook.js` (JOLLI-1900 requirement 3 — reuse the existing
-     * push path, don't re-implement it). The hook itself syncs inline with a
-     * budget-bound batch request and spawns no worker; the bundled
-     * `PrePushWorker.js` remains only as the standalone compensation drain
-     * [CliIntegrations.retryPendingPushes] spawns.
-     *
-     * The absolute `run-hook` path is baked at install time (same convention as the
-     * `java -jar <jar>` paths in the other scripts). Guarded two ways so a missing
-     * dispatcher or absent Node can NEVER abort the push: the `[ -x … ]` test skips
-     * when `run-hook` isn't there (integrations not enabled / Node absent), and
-     * `|| true` swallows any non-zero exit from Jolli itself. Because this section is
-     * appended to an existing hook, it also captures the preceding command's status and
-     * restores it with a subshell exit: an existing validation failure must still abort
-     * the push, while the parent shell remains available to later appended sections.
-     */
-    private fun prePushScript(): String {
-        val runHook = File(System.getProperty("user.home"), ".jolli/jollimemory/run-hook").absolutePath
-        return """
-            __jolli_pre_push_previous_status=${'$'}?
-            if [ -x "$runHook" ]; then "$runHook" pre-push "$@" || true; fi
-            (exit "${'$'}__jolli_pre_push_previous_status")
-        """.trimIndent()
     }
 }
 
@@ -716,8 +414,9 @@ data class InstallResult(
     val warnings: List<String>,
     /**
      * Human-readable reason MCP + skills were not set up (Node missing, bundle missing, or
-     * the bundled CLI failed), or `null` when they succeeded. Memory generation works either
-     * way. Drives the balloon notification; the StatusPanel row reflects the live state.
+     * the bundled CLI failed), or `null` when they succeeded. With the CLI owning the whole
+     * enable, a failure now fails the install as a whole — this stays for API compatibility
+     * and for the startup catch-up path's notifications.
      */
     val integrationsIssue: String? = null,
 )

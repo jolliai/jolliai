@@ -1,8 +1,7 @@
 package ai.jolli.jollimemory.actions
 
-import ai.jolli.jollimemory.core.CommitMessageParams
+import ai.jolli.jollimemory.bridge.CliIntegrations
 import ai.jolli.jollimemory.core.SessionTracker
-import ai.jolli.jollimemory.core.Summarizer
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
@@ -58,7 +57,12 @@ class CommitAIAction : AnAction() {
      */
     fun performCommit(project: com.intellij.openapi.project.Project) {
         val service = project.getService(JolliMemoryService::class.java)
-        val cwd = service.mainRepoRoot ?: project.basePath ?: return
+        // cwd is the worktree root (project.basePath): the CLI must read this
+        // worktree's staged index and write squash/plugin-source markers here.
+        // `mainRepoRoot` points at the shared main repo and is only right for
+        // reads of shared state (e.g. RepoProfile); mixing the two shifted the
+        // staged diff and post-commit markers to the wrong tree.
+        val cwd = project.basePath ?: return
 
         // Step 1: Guard — block while post-commit worker holds the lock
         if (SessionTracker.isWorkerBusy(cwd)) {
@@ -68,13 +72,12 @@ class CommitAIAction : AnAction() {
             return
         }
 
-        val config = SessionTracker.loadConfig(cwd)
-        if (config.apiKey.isNullOrBlank() && config.jolliApiKey.isNullOrBlank() && System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()) {
-            Messages.showErrorDialog(project,
-                "No LLM credentials available.\nSign in to Jolli or configure an Anthropic API key in Settings > Tools > Jolli Memory.",
-                "Jolli Memory")
-            return
-        }
+        // Credential gating is delegated to the CLI: `resolveLlmCredentialSource`
+        // accepts `aiProvider: "local-agent"` with no API key, plus the Anthropic /
+        // Jolli-proxy sources. A CLI-side failure surfaces as a classified error
+        // envelope which `friendlyLlmMessage` turns into user guidance — an
+        // env-var pre-check in the plugin would also miss local-agent, so we
+        // don't run one here.
 
         // Step 2: Get selected files from ChangesPanel
         val changesPanel = service.panelRegistry?.changesPanel
@@ -120,22 +123,14 @@ class CommitAIAction : AnAction() {
                         git.unstageFiles(unselectedTrackedPaths)
                     }
 
-                    // Get staged diff and branch
-                    indicator.text = "Reading staged diff..."
-                    val diff = git.exec("diff", "--cached") ?: ""
-                    val branch = git.getCurrentBranch() ?: "unknown"
-
-                    // Step 5: Generate AI message
+                    // Step 5: Generate AI message via the bundled CLI. The `generate
+                    // commit-message` bridge reads the staged diff, branch, and file
+                    // list from git itself — the same contract as the VS Code bridge —
+                    // so nothing is passed here beyond the project directory.
                     indicator.text = "Generating AI commit message..."
-                    val message = Summarizer.generateCommitMessage(CommitMessageParams(
-                        stagedDiff = diff,
-                        branch = branch,
-                        stagedFiles = selectedPaths,
-                        apiKey = config.apiKey,
-                        model = config.model,
-                        jolliApiKey = config.jolliApiKey,
-                        aiProvider = config.aiProvider,
-                    ))
+                    val response = CliIntegrations.generate(cwd, "commit-message", null, indicator)
+                    val message = response.get("message")?.asString
+                        ?: throw RuntimeException("Empty response from the CLI")
 
                     // Step 6: Show dialog on EDT
                     ApplicationManager.getApplication().invokeLater {
@@ -292,7 +287,11 @@ class CommitAIAction : AnAction() {
     override fun update(e: AnActionEvent) {
         val service = e.project?.getService(JolliMemoryService::class.java)
         val status = service?.getStatus()
-        val cwd = service?.mainRepoRoot ?: e.project?.basePath
+        // Worker locks are per-worktree, and [actionPerformed] runs against
+        // `project.basePath` (the current worktree). The button-enabled state
+        // must reflect the SAME tree, otherwise a busy worker in the main
+        // checkout would grey out this worktree's button (and vice versa).
+        val cwd = e.project?.basePath
         val workerBusy = cwd != null && SessionTracker.isWorkerBusy(cwd)
         val hasSelectedFiles = service?.panelRegistry?.changesPanel?.getSelectedFiles()?.isNotEmpty() ?: false
         e.presentation.isEnabled = status != null && status.enabled && !workerBusy && hasSelectedFiles

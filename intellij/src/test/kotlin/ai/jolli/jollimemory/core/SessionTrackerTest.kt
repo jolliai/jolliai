@@ -195,21 +195,10 @@ class SessionTrackerTest {
     @Nested
     inner class PluginSource {
         @Test
-        fun `save and load plugin source`() {
+        fun `savePluginSource writes the marker file`() {
             SessionTracker.savePluginSource(cwd)
-            SessionTracker.loadPluginSource(cwd) shouldBe true
-        }
-
-        @Test
-        fun `loadPluginSource returns false when not saved`() {
-            SessionTracker.loadPluginSource(cwd) shouldBe false
-        }
-
-        @Test
-        fun `deletePluginSource removes file`() {
-            SessionTracker.savePluginSource(cwd)
-            SessionTracker.deletePluginSource(cwd)
-            SessionTracker.loadPluginSource(cwd) shouldBe false
+            val dir = ai.jolli.jollimemory.core.JmLogger.getJolliMemoryDir(cwd)
+            java.io.File(dir, "plugin-source").exists() shouldBe true
         }
     }
 

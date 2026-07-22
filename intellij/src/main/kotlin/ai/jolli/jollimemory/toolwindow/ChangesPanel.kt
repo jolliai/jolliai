@@ -9,9 +9,15 @@ import com.intellij.diff.requests.SimpleDiffRequest
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationActivationListener
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ReadAction
+import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.util.io.FileUtil
+import com.intellij.openapi.vcs.changes.Change
+import com.intellij.openapi.vcs.changes.ChangeListListener
+import com.intellij.openapi.vcs.changes.ChangeListManager
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFileManager
 import com.intellij.openapi.vfs.newvfs.BulkFileListener
@@ -34,6 +40,8 @@ import java.awt.event.MouseAdapter
 import java.awt.font.TextAttribute
 import java.awt.event.MouseEvent
 import java.io.File
+import java.nio.file.Path
+import java.nio.file.Paths
 import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.DataContext
@@ -53,8 +61,10 @@ import javax.swing.Timer
  * Changes panel — shows git working tree changes with checkboxes.
  * Matches VS Code Source Control panel layout:
  *   - [checkbox] [icon] filename parentDir/  M  [discard on hover]
- *   - git status --porcelain=v1
- *   - Auto-refreshes on file system changes (VFS listener)
+ *   - Reads working-tree changes from IntelliJ's ChangeListManager (same source as the
+ *     IDE Commit tool window; reflects unsaved in-editor edits), falling back to
+ *     `git status --porcelain=v1` when the VCS layer isn't ready
+ *   - Auto-refreshes on ChangeListManager updates and file-system changes (VFS listener)
  *   - Checkboxes for selecting files to commit
  *   - Color-coded status letters matching VS Code (M=yellow, A=green, U=green, D=red, R=blue)
  *   - Untracked files (?? in porcelain) display as "U" to match VS Code convention
@@ -80,13 +90,13 @@ class ChangesPanel(
     private var debounceTimer: Timer? = null
     private var gitChangeDebounceTimer: Timer? = null
     /**
-     * Repeating poll that catches file changes made OUTSIDE the IDE (e.g. Claude
-     * Code editing files from a terminal). IntelliJ's VFS_CHANGES topic only fires
-     * after the IDE refreshes its VFS — which for external writes happens on
-     * window focus-gain, not immediately — so the VFS listener alone misses them.
-     * `refreshFromGit()` reads `git status` off disk directly (independent of the
-     * VFS), so a periodic tick reliably surfaces external changes. Runs only while
-     * the panel is showing; dedupes so an unchanged tree is a cheap no-op.
+     * Repeating safety-net poll for file changes made OUTSIDE the IDE (e.g. Claude
+     * Code editing files from a terminal). In-editor edits refresh instantly via the
+     * ChangeListListener subscription; external writes surface once IntelliJ refreshes
+     * its VFS (native watcher, or window focus-gain), which also updates the
+     * ChangeListManager that refreshFromGit reads from. This tick is the backstop for
+     * the rare case neither has fired yet. Runs only while the panel is showing;
+     * dedupes so an unchanged tree is a cheap no-op.
      */
     private var pollTimer: Timer? = null
     /**
@@ -146,6 +156,19 @@ class ChangesPanel(
             com.intellij.openapi.vcs.VcsListener { scheduleGitChangeRefresh() },
         )
 
+        // ChangeListManager is the IDE's own working-tree change tracker — the same
+        // source the built-in Commit tool window reads. Its "update done" signal fires
+        // once in-editor edits are reflected in the change list, INCLUDING files that
+        // are modified but not yet saved to disk. Subscribing here is what makes the
+        // panel update as the user types, instead of only after the file is flushed to
+        // disk and picked up by a disk-level `git status`.
+        projectBusConnection.subscribe(
+            ChangeListListener.TOPIC,
+            object : ChangeListListener {
+                override fun changeListUpdateDone() = scheduleDebouncedRefresh()
+            },
+        )
+
         // Focus-gain: when the IDE window is re-activated (e.g. the user alt-tabs
         // back after Claude Code edited files in a terminal), refresh immediately
         // so the panel is current the moment they look at it.
@@ -159,7 +182,7 @@ class ChangesPanel(
         // Live poll for external changes while the panel is on screen (see pollTimer).
         // The Swing Timer fires on the EDT, so the isShowing check is thread-safe;
         // refresh() is deduped, making an unchanged tree a cheap no-op.
-        pollTimer = Timer(2000) { if (isShowing) refresh() }.apply {
+        pollTimer = Timer(2000) { if (isShowing) { flushUnsavedGitignore(); refresh() } }.apply {
             isRepeats = true
             start()
         }
@@ -170,7 +193,7 @@ class ChangesPanel(
 
     private fun scheduleDebouncedRefresh() {
         debounceTimer?.stop()
-        debounceTimer = Timer(300) { refresh() }.apply {
+        debounceTimer = Timer(300) { flushUnsavedGitignore(); refresh() }.apply {
             isRepeats = false
             start()
         }
@@ -183,9 +206,39 @@ class ChangesPanel(
      */
     private fun scheduleGitChangeRefresh() {
         gitChangeDebounceTimer?.stop()
-        gitChangeDebounceTimer = Timer(500) { refresh() }.apply {
+        gitChangeDebounceTimer = Timer(500) { flushUnsavedGitignore(); refresh() }.apply {
             isRepeats = false
             start()
+        }
+    }
+
+    /**
+     * Flushes unsaved git ignore-rule edits to disk — ONLY `.gitignore` documents and
+     * the repo-local `.git/info/exclude` (never any other unsaved file).
+     *
+     * Ignore semantics are disk-based: both git and IntelliJ's VCS ignore engine read
+     * the saved file. So an edited-but-unsaved .gitignore shows its own M row instantly
+     * (ChangeListManager sees in-editor edits), while the files it un-ignores stay
+     * hidden until the document lands on disk — with IntelliJ's lazy autosave that can
+     * be many seconds. Saving the ignore-rule document early closes that gap and
+     * matches the VS Code (autosave) experience. Must run on the EDT — all callers
+     * are Swing timer callbacks.
+     */
+    private fun flushUnsavedGitignore() {
+        try {
+            val fdm = FileDocumentManager.getInstance()
+            val unsaved = fdm.unsavedDocuments.filter { doc ->
+                val f = fdm.getFile(doc) ?: return@filter false
+                // .git/info/exclude — the parent+path guard also matches the per-worktree
+                // variant at .git/worktrees/<n>/info/exclude, so linked worktrees behave
+                // identically to the main working tree.
+                f.name == ".gitignore" ||
+                    (f.name == "exclude" && f.parent?.name == "info" && f.path.contains("/.git/"))
+            }
+            unsaved.forEach { fdm.saveDocument(it) }
+        } catch (_: Exception) {
+            // best-effort flush; a failure just means the disk-based ignore check
+            // will lag until IntelliJ's own autosave catches up.
         }
     }
 
@@ -203,12 +256,18 @@ class ChangesPanel(
             return
         }
         if (!status.enabled) {
-            SwingUtilities.invokeLater { if (refreshVersion == myVersion) showInitializing() }
+            SwingUtilities.invokeLater { if (refreshVersion == myVersion) showDisabled() }
             return
         }
 
+        // Prefer IntelliJ's ChangeListManager: it reflects in-editor edits that are not
+        // yet saved to disk (the IDE's own Commit panel reads the same source), so the
+        // list updates as the user types. Fall back to the on-disk `git status` path
+        // only when the VCS layer can't produce a list (readChangesFromClm returns null).
+        val repoRoot = service.mainRepoRoot ?: project.basePath
+        val clmChanges = repoRoot?.let { readChangesFromClm(it) }
         val newChanges = try {
-            service.getChangedFiles()
+            clmChanges ?: service.getChangedFiles()
         } catch (_: Exception) {
             emptyList()
         }
@@ -231,6 +290,67 @@ class ChangesPanel(
     }
 
     /**
+     * Reads working-tree changes from IntelliJ's [ChangeListManager] — the same data
+     * source the IDE's built-in Commit tool window uses. Unlike the disk-level `git
+     * status` in [JolliMemoryService.getChangedFiles], this reflects in-editor edits
+     * not yet saved to disk, so the panel updates as the user types. Returns null on
+     * failure (VCS layer not ready / read error) so the caller can fall back to git.
+     *
+     * Status codes are the single-letter git codes [JolliMemoryService.getChangedFiles]
+     * emits (untracked = "?"), so downstream consumers — commit staging in
+     * CommitAIAction, discard, status badges — behave identically to the git path.
+     * Sorted by path so the dedupe signature in [refreshFromGit] is stable across
+     * ChangeListManager's unordered collection.
+     */
+    private fun readChangesFromClm(repoRoot: String): List<FileChange>? {
+        return try {
+            ReadAction.compute<List<FileChange>?, RuntimeException> {
+                val clm = ChangeListManager.getInstance(project)
+                val root = Paths.get(repoRoot)
+                val out = mutableListOf<FileChange>()
+                for (change in clm.allChanges) {
+                    val fp = change.afterRevision?.file ?: change.beforeRevision?.file ?: continue
+                    val rel = relativizeToRoot(root, fp.path) ?: continue
+                    out.add(FileChange(relativePath = rel, statusCode = clmStatusCode(change)))
+                }
+                for (fp in clm.unversionedFilesPaths) {
+                    val rel = relativizeToRoot(root, fp.path) ?: continue
+                    out.add(FileChange(relativePath = rel, statusCode = "?"))
+                }
+                // Distinguish "CLM says clean" from "CLM has not populated yet". At
+                // startup — and briefly after a VCS refresh — the manager returns
+                // empty collections before its first update finishes, so returning
+                // `emptyList()` here would let the caller's `clmChanges ?: gitFallback`
+                // skip the git path and flash "no changes" over a dirty tree. When
+                // the CLM view is empty, we defer to git — a clean tree makes that
+                // an extra 5 ms `git status` per 2 s poll (cheap and self-correcting),
+                // while a dirty tree correctly shows its files instead of nothing.
+                if (out.isEmpty()) null else out.sortedBy { it.relativePath }
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Maps a ChangeListManager change type to the single-letter git code getChangedFiles emits. */
+    private fun clmStatusCode(change: Change): String = when (change.type) {
+        Change.Type.NEW -> "A"
+        Change.Type.DELETED -> "D"
+        Change.Type.MODIFICATION -> "M"
+        Change.Type.MOVED -> "R"
+    }
+
+    /** Repo-root-relative, forward-slash path; null when [absPath] falls outside [root]. */
+    private fun relativizeToRoot(root: Path, absPath: String): String? {
+        return try {
+            val rel = root.relativize(Paths.get(absPath))
+            if (rel.startsWith("..")) null else FileUtil.toSystemIndependentName(rel.toString())
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
      * Order-sensitive signature of the changed-file set (status code + path per
      * file). Two refreshes with the same signature render identically, so the
      * dedupe in [refreshFromGit] can skip the second one.
@@ -244,6 +364,18 @@ class ChangesPanel(
         lastRenderedSignature = null
         removeAll()
         emptyLabel.text = "<html><center>Initializing Jolli Memory...</center></html>"
+        add(emptyLabel, BorderLayout.CENTER)
+        revalidate(); repaint()
+    }
+
+    // Shown when the service is initialized but hooks are not installed (or were
+    // uninstalled). Distinct from showInitializing so users are not misled into
+    // thinking a background task is still running — nothing is, until they enable.
+    private fun showDisabled() {
+        lastRenderedSignature = null
+        removeAll()
+        emptyLabel.text = "<html><center>Jolli Memory is not enabled for this repository.<br/>" +
+            "Open the Status panel to install hooks and enable it.</center></html>"
         add(emptyLabel, BorderLayout.CENTER)
         revalidate(); repaint()
     }
