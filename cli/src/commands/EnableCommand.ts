@@ -292,8 +292,20 @@ async function reportEnableResult(
 		// upgrade / window reload keeps the feature on. Skipped for integrations-only
 		// (IntelliJ's MCP-only setup), which is not a full enable. Written
 		// unconditionally otherwise — profile.json is machine-local and gitignored.
+		// Unlike the disable path (where a failed write must block hook removal to
+		// avoid a deceptive half-state), a failed clear here is non-fatal: hooks are
+		// already installed, and a subsequent full `jolli enable` will retry.
+		// SessionStart does NOT retry — it returns immediately when the flag is
+		// still true (the manualDisable gate), so only an explicit enable clears it.
 		if (!options.integrationsOnly) {
-			await writeManualDisableFlag(options.cwd, false);
+			try {
+				await writeManualDisableFlag(options.cwd, false);
+			} catch (err) {
+				console.warn(
+					`\n  Warning: could not clear the manual-disable flag (${(err as Error).message}).\n` +
+						"  Enable succeeded. Run `jolli enable` again to clear the opt-out.\n",
+				);
+			}
 		}
 		if (options.integrationsOnly) {
 			console.log("\n  Jolli Memory integrations enabled (MCP + skills; no hooks installed).\n");

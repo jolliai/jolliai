@@ -267,6 +267,17 @@ describe("GuidedFrontDoor", () => {
 		expect(h.writeManualDisableFlag).not.toHaveBeenCalled();
 	});
 
+	it("warns but does not fail when writeManualDisableFlag rejects after a successful install", async () => {
+		h.isGitHookInstalled.mockResolvedValue(false);
+		h.promptText.mockResolvedValue("y");
+		h.getSummaryCount.mockResolvedValue(5);
+		h.writeManualDisableFlag.mockRejectedValueOnce(new Error("disk full"));
+		await runGuidedFrontDoor();
+		// Enable still succeeded — hooks installed, just the opt-out clear failed.
+		expect(warns.some((w) => w.includes("could not clear the manual-disable flag"))).toBe(true);
+		expect(warns.some((w) => w.includes("Run `jolli enable` again"))).toBe(true);
+	});
+
 	it("just enabled a fresh repo (no memories yet) → 0 memories", async () => {
 		h.isGitHookInstalled.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("y");

@@ -2226,7 +2226,17 @@ export function activate(context: vscode.ExtensionContext): void {
 					// Clear the opt-out so subsequent IDE restarts auto-enable as
 					// usual. Done only on success — a failed install means the
 					// previous (manuallyDisabled) state is still the user's intent.
-					await writeManualDisableFlag(workspaceRoot, false);
+					// A failed clear is non-fatal: hooks are already installed.
+					try {
+						await writeManualDisableFlag(workspaceRoot, false);
+					} catch (err) {
+						log.warn(
+							"cmd",
+							`Could not clear the manual-disable flag: ${
+								err instanceof Error ? err.message : String(err)
+							}. Run "Jolli Memory: Enable" again to clear the opt-out.`,
+						);
+					}
 					// JOLLI-1904 (funnel): surface enabled. Mirrors IntelliJ
 					// surface_enabled { trigger }; surface=vscode auto-injected.
 					track("surface_enabled", { trigger: "command" });

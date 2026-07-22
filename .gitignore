@@ -40,6 +40,12 @@ Thumbs.db
 .codex/
 .opencode/
 .devin/
+.qoder/
+.workbuddy/
+.reasonix/
+.playwright-cli/
+.playwright-mcp/
+.codegraph/
 # Claude MCP server config — written per-worktree with an absolute local path
 # (jolli install → registerMcpInClaude), so it must never be committed.
 .mcp.json
