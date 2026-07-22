@@ -33,6 +33,7 @@ import { scanUserPermalinks } from "./SlackPermalink.js";
 import type { SourceDefinition } from "./SourceDefinition.js";
 import { getRegistry } from "./SourceDefinitionRegistry.js";
 import { normalizeConfluence } from "./sources/ConfluenceNormalize.js";
+import { normalizeContext7 } from "./sources/Context7Normalize.js";
 import { normalizeMonday, readItemIds } from "./sources/MondayNormalize.js";
 import { normalizeSlackThread } from "./sources/SlackNormalize.js";
 import { normalizeZoomDoc } from "./sources/ZoomDocNormalize.js";
@@ -80,6 +81,13 @@ interface PendingEntry {
 	 * looks at this field.
 	 */
 	readonly toolInput?: unknown;
+	/**
+	 * 0-based transcript line index of the originating tool_use. Retained so a
+	 * scan that ends with this entry still unpaired can rewind its cursor to this
+	 * line, letting the next scan re-pair it once the tool_result has landed. See
+	 * the tail-rewind logic in {@link ClaudeEnvelopeParser.parse}.
+	 */
+	readonly toolUseLineIndex: number;
 }
 
 class ClaudeEnvelopeParser implements TranscriptEnvelopeParser {
@@ -88,6 +96,11 @@ class ClaudeEnvelopeParser implements TranscriptEnvelopeParser {
 		const pending = new Map<string, PendingEntry>();
 		const results: NormalizedToolResult[] = [];
 		let lastConsumed = fromLine;
+		// 0-based index of the last line that paired a tool_result to a pending
+		// tool_use. Used by the tail-rewind below to tell a flush-race incomplete
+		// tail (only unpaired tool_uses after the last result → rewind) apart from a
+		// genuinely resultless call left behind mid-stream (do not pin the cursor).
+		let lastResultLineIndex = fromLine - 1;
 		// Slack's normalize needs a url no MCP payload carries; the pasted
 		// permalink (if any) is the only place it lives. Scanned once up front so
 		// every user text line is visited exactly once regardless of how many
@@ -124,12 +137,39 @@ class ClaudeEnvelopeParser implements TranscriptEnvelopeParser {
 			if (role === undefined || blocks === undefined) continue;
 
 			if (role === "assistant") {
-				collectToolUses(blocks, timestamp, opts.beforeTimestamp, pending);
+				collectToolUses(blocks, i, timestamp, opts.beforeTimestamp, pending);
 				/* v8 ignore start -- readRole returns only "assistant" | "user" | undefined; undefined is filtered above, so the else-if's false branch is unreachable. */
 			} else if (role === "user") {
 				/* v8 ignore stop */
+				const resultsBefore = results.length;
 				collectToolResults(blocks, i + 1, timestamp, opts.beforeTimestamp, pending, results, permalinks, opts);
+				if (results.length > resultsBefore) lastResultLineIndex = i;
 			}
+		}
+
+		// Tail rewind: a matched tool_use left unpaired in the trailing suffix (after
+		// the last paired result) is an INCOMPLETE tail — the tool_result has not
+		// been flushed to disk yet, or a concurrent StopHook fire advanced the cursor
+		// mid-pair. Rewind the cursor to the earliest such tail tool_use so the next
+		// scan re-reads from there and can pair it. Without this, an `argumentsDerived`
+		// reference (context7 — built from the tool_use input, emitted only when its
+		// result is seen in the SAME scan) is lost for good, since the cursor never
+		// moves backward. Re-scanning the tail is idempotent.
+		//
+		// The rewind target MUST be scoped to the trailing suffix (`> lastResultLineIndex`
+		// PER ENTRY), not the earliest pending entry overall: a genuinely resultless
+		// call left behind EARLIER (aborted/errored, then later calls paired fine)
+		// sits before lastResultLineIndex, and must neither become the rewind target
+		// nor — the bug this replaced — suppress the rewind of a newer incomplete tail
+		// by dragging the global minimum below the threshold.
+		if (pending.size > 0) {
+			let earliestTailPending = Number.POSITIVE_INFINITY;
+			for (const entry of pending.values()) {
+				if (entry.toolUseLineIndex > lastResultLineIndex && entry.toolUseLineIndex < earliestTailPending) {
+					earliestTailPending = entry.toolUseLineIndex;
+				}
+			}
+			if (earliestTailPending !== Number.POSITIVE_INFINITY) lastConsumed = earliestTailPending;
 		}
 
 		return { results, lastLineNumberScanned: lastConsumed };
@@ -171,6 +211,7 @@ function readCommand(input: unknown): string | undefined {
 
 function collectToolUses(
 	blocks: readonly unknown[],
+	lineIndex: number,
 	timestamp: string | undefined,
 	beforeTimestamp: string | undefined,
 	pending: Map<string, PendingEntry>,
@@ -195,6 +236,7 @@ function collectToolUses(
 				def: mcpDef,
 				normalize: identity,
 				requireSuccess: false,
+				toolUseLineIndex: lineIndex,
 				// Only sources with a registered context-normalizer read the
 				// tool_use input (Slack's channel_id/message_ts, zoom-doc's
 				// fileId); every other source's `normalize` is `identity` and
@@ -222,6 +264,7 @@ function collectToolUses(
 				normalize: cli.normalize,
 				command,
 				requireSuccess: true,
+				toolUseLineIndex: lineIndex,
 			});
 		}
 	}
@@ -297,6 +340,7 @@ const CONTEXT_NORMALIZERS: Record<
 	},
 	confluence: (payload) => normalizeConfluence(payload),
 	monday: (payload, toolInput) => normalizeMonday(payload, { itemIds: readItemIds(toolInput) }),
+	context7: (_payload, toolInput) => normalizeContext7(toolInput),
 };
 
 /**
@@ -352,23 +396,31 @@ function collectToolResults(
 			// whose bundled transcript routinely blows the cap).
 			const recovered = recoverOffloadedPayload(payloadText);
 			if (recovered === undefined) {
-				log.warn(
-					"Dropping tool_result for %s (%s): payload JSON.parse failed: %s | preview=%s",
+				// An arguments-derived source (context7) returns prose, not JSON — its
+				// reference is built from the retained toolInput, so an unparseable result
+				// is expected. Give the normalizer an empty payload instead of dropping.
+				if (pendingEntry.def.argumentsDerived === true) {
+					parsedPayload = {};
+				} else {
+					log.warn(
+						"Dropping tool_result for %s (%s): payload JSON.parse failed: %s | preview=%s",
+						b.tool_use_id,
+						pendingEntry.toolName,
+						(err as Error).message,
+						payloadText.slice(0, 200),
+					);
+					pending.delete(b.tool_use_id);
+					continue;
+				}
+			} else {
+				log.info(
+					"Recovered offloaded tool_result for %s (%s) from %s",
 					b.tool_use_id,
 					pendingEntry.toolName,
-					(err as Error).message,
-					payloadText.slice(0, 200),
+					recovered.path,
 				);
-				pending.delete(b.tool_use_id);
-				continue;
+				parsedPayload = recovered.payload;
 			}
-			log.info(
-				"Recovered offloaded tool_result for %s (%s) from %s",
-				b.tool_use_id,
-				pendingEntry.toolName,
-				recovered.path,
-			);
-			parsedPayload = recovered.payload;
 		}
 
 		// A source whose canonical shape the identity path cannot produce runs

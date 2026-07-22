@@ -277,6 +277,7 @@ async function rebuildReferenceBlocks(
 
 	const blocks: string[] = [];
 	for (const def of getRegistry().all()) {
+		if (def.trackOnly === true) continue; // track-only sources never reach the regeneration LLM
 		const sourceRefs = bySource.get(def.id);
 		if (!sourceRefs || sourceRefs.length === 0) continue;
 		const block = renderBlock(def, sourceRefs);

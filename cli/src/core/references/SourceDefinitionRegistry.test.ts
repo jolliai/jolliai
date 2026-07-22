@@ -43,7 +43,7 @@ describe("SourceDefinitionRegistry", () => {
 		expect(r.match("codex", "linear.get_issue")?.id).toBe("linear"); // invocation-tool path (no namespace)
 	});
 
-	it("all() is stable order linear,confluence,jira,github,notion,slack,zoom-meeting,zoom-doc,asana,monday", () => {
+	it("all() is stable order linear,confluence,jira,github,notion,slack,zoom-meeting,zoom-doc,asana,monday,context7", () => {
 		expect(
 			getRegistry()
 				.all()
@@ -59,6 +59,7 @@ describe("SourceDefinitionRegistry", () => {
 			"zoom-doc",
 			"asana",
 			"monday",
+			"context7",
 		]);
 	});
 

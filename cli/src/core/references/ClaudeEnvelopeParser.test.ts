@@ -323,3 +323,87 @@ describe("ClaudeEnvelopeParser monday", () => {
 		expect(results.filter((r) => r.def.id === "monday")).toHaveLength(0);
 	});
 });
+
+describe("ClaudeEnvelopeParser context7 (arguments-derived, prose result)", () => {
+	function context7Lines(toolName: string, id: string, input: Record<string, unknown>, resultText: string): string[] {
+		return [
+			JSON.stringify({
+				message: {
+					role: "assistant",
+					content: [{ type: "tool_use", id, name: toolName, input }],
+				},
+			}),
+			JSON.stringify({
+				message: {
+					role: "user",
+					content: [{ type: "tool_result", tool_use_id: id, content: resultText }],
+				},
+			}),
+		];
+	}
+
+	it("extracts one reference from a query-docs call whose result is markdown", () => {
+		const lines = context7Lines(
+			"mcp__context7__query-docs",
+			"c7a",
+			{ libraryId: "/vercel/next.js", query: "how does middleware work in the app router" },
+			"### Real-world middleware example\n\nSource: https://github.com/vercel/next.js/blob/canary/examples/i18n-routing/middleware.ts\n\nA complete middleware.ts example…",
+		);
+		const { results } = claudeEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("context7");
+		expect(results[0].payload).toEqual({
+			libraryId: "/vercel/next.js",
+			query: "how does middleware work in the app router",
+		});
+	});
+
+	it("ignores resolve-library-id calls", () => {
+		const lines = context7Lines(
+			"mcp__context7__resolve-library-id",
+			"c7r",
+			{ libraryName: "Next.js", query: "middleware" },
+			"Available Libraries:\n- /vercel/next.js",
+		);
+		expect(claudeEnvelopeParser.parse(lines, {}).results).toHaveLength(0);
+	});
+});
+
+describe("ClaudeEnvelopeParser tail-rewind with an earlier abandoned call", () => {
+	// Regression: a resultless call left behind EARLIER in the transcript (aborted
+	// / errored) must not drag the tail-rewind target back below lastResultLineIndex
+	// and thereby suppress the rewind of a genuinely-incomplete TAIL call. Before
+	// the fix the rewind used the earliest pending tool_use ANYWHERE; the abandoned
+	// call's low line index failed the `> lastResultLineIndex` guard, so the cursor
+	// stayed at EOF and the tail context7 reference was stranded forever once its
+	// result finally landed on a later scan.
+	function assistantToolUse(id: string, input: Record<string, unknown>): string {
+		return JSON.stringify({
+			message: {
+				role: "assistant",
+				content: [{ type: "tool_use", id, name: "mcp__context7__query-docs", input }],
+			},
+		});
+	}
+	function userToolResult(id: string, text: string): string {
+		return JSON.stringify({
+			message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: text }] },
+		});
+	}
+
+	it("rewinds to the trailing incomplete call, not the earlier abandoned one", () => {
+		const transcript = [
+			assistantToolUse("old-abandoned", { libraryId: "/a/aborted", query: "never answered" }), // line 0, no result
+			assistantToolUse("mid-paired", { libraryId: "/b/paired", query: "answered inline" }), // line 1
+			userToolResult("mid-paired", "### docs\nSource: https://example.test/b"), // line 2 → lastResultLineIndex = 2
+			assistantToolUse("tail-incomplete", { libraryId: "/c/tail", query: "result not flushed yet" }), // line 3
+		];
+		const { results, lastLineNumberScanned } = claudeEnvelopeParser.parse(transcript, {});
+		// Only the mid pair produced a reference this scan.
+		expect(results).toHaveLength(1);
+		expect(results[0].payload).toEqual({ libraryId: "/b/paired", query: "answered inline" });
+		// Cursor must rewind to the tail tool_use (line index 3) so the next scan
+		// re-pairs it — NOT sit at EOF (4), which strands it forever.
+		expect(lastLineNumberScanned).toBe(3);
+	});
+});

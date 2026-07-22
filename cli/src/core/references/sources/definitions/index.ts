@@ -15,6 +15,7 @@
 
 import { asanaDefinition } from "./asana.js";
 import { confluenceDefinition } from "./confluence.js";
+import { context7Definition } from "./context7.js";
 import { githubDefinition } from "./github.js";
 import { jiraDefinition } from "./jira.js";
 import { linearDefinition } from "./linear.js";
@@ -35,4 +36,5 @@ export const BUILTIN_DEFINITIONS = [
 	zoomDocDefinition,
 	asanaDefinition,
 	mondayDefinition,
+	context7Definition,
 ] as const;

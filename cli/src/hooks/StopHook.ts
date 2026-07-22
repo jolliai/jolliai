@@ -26,12 +26,13 @@
  */
 
 import { existsSync } from "node:fs";
-import { resolve as pathResolve } from "node:path";
+import { join, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { scanPlansFrom } from "../core/plans/TranscriptPlanDiscovery.js";
 import { scanReferencesFrom } from "../core/references/TranscriptReferenceDiscovery.js";
 import {
+	getGlobalConfigDir,
 	loadConfig,
 	loadDiscoveryCursor,
 	migrateDiscoveryCursors,
@@ -39,6 +40,7 @@ import {
 	saveSession,
 } from "../core/SessionTracker.js";
 import { flushTelemetryNow } from "../core/TelemetryStartup.js";
+import { isClaudeHookInstalled } from "../install/ClaudeHookInstaller.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { ClaudeHookInput, SessionInfo } from "../Types.js";
 import { readStdin } from "./HookUtils.js";
@@ -135,7 +137,63 @@ export async function handleStopHook(): Promise<void> {
 	// one discovery-cursors.json line per transcript. Each inner scan swallows
 	// its own errors so one failing discovery never blocks the other or the
 	// cursor advance.
-	await discoverFromTranscript(sessionInfo, projectDir);
+	//
+	// Single-owner gate. When both the CLI/settings Stop hook and the
+	// claude-plugin Stop hook are enabled on a repo, Claude Code fires BOTH on
+	// every Stop event and they share ONE merged discovery-cursors.json. The
+	// plugin hook is pinned to its bundled `${CLAUDE_PLUGIN_ROOT}/dist`, while the
+	// CLI hook resolves the newest dist across every source (run-hook →
+	// resolve-dist-path). If the (possibly older) plugin hook wins the race and
+	// advances the cursor past a tool_use it doesn't recognize — a source added
+	// after the plugin build, e.g. context7 — the newer CLI hook starts from that
+	// advanced cursor, never re-reads those lines (the cursor only moves forward),
+	// and the reference is lost for good. So the plugin-invoked hook defers
+	// discovery to the CLI hook whenever one is installed; a plugin-only install
+	// (no CLI Stop hook) still runs discovery itself. Session save + telemetry
+	// flush are surface-independent and always run.
+	//
+	// Discriminator — CLAUDE_PLUGIN_ROOT: Claude Code sets it in the environment
+	// of a plugin-provided hook's process, and ONLY there (it is not
+	// session-global — verified: absent from the parent Claude Code process env).
+	// That scoping is what makes the gate safe from a zero-runner deadlock: the
+	// CLI/settings hook never sees the var, so it never defers, so at least one
+	// hook always runs discovery. A truthy check (not `!== undefined`) so an empty
+	// value is never mistaken for a plugin invocation, matching how `envProjectDir`
+	// is tested above.
+	//
+	// `isClaudeHookInstalled` reads the repo's `.claude/settings*.json`. The plugin
+	// registers its own Stop hook in the plugin package's `hooks/hooks.json`, never
+	// in repo settings, so it can't false-positive here as "the CLI hook". (It
+	// matches both the `run-hook` and legacy `StopHook` command markers — both are
+	// CLI-install forms.) And this gate degrades gracefully: even if the
+	// discriminator ever failed and both hooks ran, the rebuilt plugin dist now
+	// understands every source, so a double scan would still extract correctly
+	// rather than strand a reference — the gate removes the wasted work and the
+	// cross-version race, it is not the sole line of defense.
+	//
+	// Runner liveness: the settings entry alone is NOT proof that the CLI hook can
+	// actually run. A stale `.claude/settings*.json` hook can outlive the global
+	// `~/.jolli/jollimemory/run-hook` launcher it invokes (CLI uninstalled, folder
+	// wiped) — every CLI-install Stop hook, current or legacy, shells out through
+	// that one launcher. Deferring to a launcher that no longer exists would leave
+	// NOBODY running discovery, silently stopping plan/reference updates. So we only
+	// defer when the launcher is present on disk; if it is gone, the plugin stays the
+	// fallback owner and runs discovery itself. (Running when we could have deferred
+	// is safe — at worst a redundant idempotent scan; deferring to a dead runner is
+	// not.)
+	const isPluginInvocation = Boolean(process.env.CLAUDE_PLUGIN_ROOT);
+	// Short-circuit order matters: cheap env check → sync launcher probe → async
+	// settings read. Only a plugin invocation ever probes the launcher, so a
+	// normal CLI-hook run pays nothing extra.
+	const deferToCliHook =
+		isPluginInvocation &&
+		existsSync(join(getGlobalConfigDir(), "run-hook")) &&
+		(await isClaudeHookInstalled(projectDir));
+	if (deferToCliHook) {
+		log.info("Plugin Stop hook: a CLI Stop hook owns transcript discovery — deferring to it");
+	} else {
+		await discoverFromTranscript(sessionInfo, projectDir);
+	}
 
 	// JOLLI-1954: the Stop hook fires on every agent turn end — far more often
 	// than commits — so piggyback it to drain the shared telemetry buffer. Covers

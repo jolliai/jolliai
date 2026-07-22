@@ -74,6 +74,20 @@ export interface SourceDefinition {
 	readonly id: string;
 	readonly label: string;
 	readonly icon: string;
+	/**
+	 * Track-only: the reference is captured, archived into CommitSummary.references,
+	 * and shown in every reference listing (detail page, PR, push, timeline), but is
+	 * EXCLUDED from the {{references}} block fed to the memory-decision LLM. Absent
+	 * (falsy) for every existing source.
+	 */
+	readonly trackOnly?: boolean;
+	/**
+	 * Arguments-derived: the reference is built from the tool-call arguments, not the
+	 * result, so a non-JSON (prose) result is expected. Both transcript parsers pass an
+	 * empty payload to this source's normalizer on JSON-parse failure instead of
+	 * dropping the call. Absent (falsy) for every existing (JSON-result) source.
+	 */
+	readonly argumentsDerived?: boolean;
 	readonly match: SourceMatch;
 	readonly wrapperKeys: ReadonlyArray<string>;
 	readonly reference: {
