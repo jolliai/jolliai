@@ -54,6 +54,72 @@ class CliIntegrationsTest {
         CliIntegrations.retryPendingPushes(tempDir.absolutePath, waitForCompletion = true)
     }
 
+    // ── parseGenerateResponse — the `jolli generate` stdout contract ───────
+
+    @Test
+    fun `parseGenerateResponse returns the success object`() {
+        val obj = CliIntegrations.parseGenerateResponse(
+            """{"type":"commit-message","message":"Add feature"}""",
+            "commit-message",
+            0,
+        )
+        obj.get("message").asString shouldBe "Add feature"
+    }
+
+    @Test
+    fun `parseGenerateResponse takes the last non-blank line (stray runtime noise ignored)`() {
+        val stdout = "(node) some experimental warning\n\n" +
+            """{"type":"recap","recap":"A recap."}""" + "\n"
+        val obj = CliIntegrations.parseGenerateResponse(stdout, "recap", 0)
+        obj.get("recap").asString shouldBe "A recap."
+    }
+
+    @Test
+    fun `parseGenerateResponse surfaces the CLI error message`() {
+        val ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+            CliIntegrations.parseGenerateResponse(
+                """{"type":"error","message":"No LLM provider available."}""",
+                "commit-message",
+                1,
+            )
+        }
+        ex.message shouldBe "No LLM provider available."
+    }
+
+    @Test
+    fun `parseGenerateResponse maps LocalAgentAuthError to sign-in guidance`() {
+        val stdout = """{"type":"error","message":"Claude Code returned an error (status 0): """ +
+            """Not logged in · Please run /login","errorName":"LocalAgentAuthError"}"""
+        val ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+            CliIntegrations.parseGenerateResponse(stdout, "commit-message", 1)
+        }
+        ex.message shouldContain "not signed in"
+    }
+
+    @Test
+    fun `parseGenerateResponse fails loud on empty output`() {
+        val ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+            CliIntegrations.parseGenerateResponse("\n  \n", "translate", 1)
+        }
+        ex.message shouldContain "no output"
+    }
+
+    @Test
+    fun `parseGenerateResponse fails loud on unreadable output`() {
+        val ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+            CliIntegrations.parseGenerateResponse("Segmentation fault", "translate", 139)
+        }
+        ex.message shouldContain "unreadable"
+    }
+
+    @Test
+    fun `parseGenerateResponse rejects a non-zero exit even with success-shaped output`() {
+        val ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+            CliIntegrations.parseGenerateResponse("""{"type":"translate","text":"x"}""", "translate", 1)
+        }
+        ex.message shouldContain "exit 1"
+    }
+
     // ── warningFor — every non-Ok result yields a user-facing message ──────
 
     @Test

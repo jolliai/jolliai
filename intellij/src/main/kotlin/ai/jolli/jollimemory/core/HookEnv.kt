@@ -13,7 +13,6 @@ import java.io.PrintStream
  * like the previously hard-wired code.
  *
  * Composition roots (the only places a REAL instance is born):
- *   - [ai.jolli.jollimemory.hooks.HookRunner.main] for the standalone hooks JAR
  *   - IDE-side services construct one where needed (plugin process)
  *
  * Tests never mutate JVM globals: they build a fake instance via

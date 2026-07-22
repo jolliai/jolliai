@@ -68,6 +68,28 @@ class HookInstallerTest {
             File(tempDir, ".claude/settings.local.json").writeText("""{"hooks":{}}""")
             HookInstaller(tempDir.absolutePath).isClaudeHookInstalled() shouldBe false
         }
+
+        @Test
+        fun `returns true for the CLI-written run-hook entry`(@TempDir tempDir: File) {
+            // The CLI's full enable writes this dispatcher form — it contains neither
+            // "JolliMemory" nor "StopHook", so detection must match "run-hook" itself.
+            File(tempDir, ".claude").mkdirs()
+            File(tempDir, ".claude/settings.local.json").writeText(
+                """{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"\"${'$'}HOME/.jolli/jollimemory/run-hook\" stop","async":true}]}]}}""",
+            )
+            HookInstaller(tempDir.absolutePath).isClaudeHookInstalled() shouldBe true
+        }
+
+        @Test
+        fun `ignores identifiers outside the Stop hook entries`(@TempDir tempDir: File) {
+            // Matching is per hooks.Stop entry, not whole-file: unrelated settings
+            // content containing an identifier must not read as installed.
+            File(tempDir, ".claude").mkdirs()
+            File(tempDir, ".claude/settings.local.json").writeText(
+                """{"permissions":{"allow":["Bash(~/bin/my-run-hook.sh)"]},"hooks":{}}""",
+            )
+            HookInstaller(tempDir.absolutePath).isClaudeHookInstalled() shouldBe false
+        }
     }
 
     // ── isGeminiHookInstalled ─────────────────────────────────────────
@@ -138,7 +160,12 @@ class HookInstallerTest {
         }
     }
 
-    // ── areAllHooksInstalled ────────────────────────────────────────────
+    // ── areAllHooksInstalled / areAllGitHooksInstalled ──────────────────
+
+    private fun writeGitHookSection(projectDir: File, name: String) {
+        File(projectDir, ".git/hooks/$name").writeText(
+            "#!/bin/sh\n# >>> JolliMemory $name hook >>>\nscript\n# <<< JolliMemory $name hook <<<\n")
+    }
 
     @Test
     fun `areAllHooksInstalled returns false when no hooks`() {
@@ -146,13 +173,27 @@ class HookInstallerTest {
     }
 
     @Test
-    fun `pre-push script preserves the preceding hook status`() {
-        val method = HookInstaller::class.java.getDeclaredMethod("prePushScript")
-        method.isAccessible = true
-        val script = method.invoke(HookInstaller("/fake")) as String
+    fun `areAllGitHooksInstalled requires all five sections`(@TempDir tempDir: File) {
+        File(tempDir, ".git/hooks").mkdirs()
+        // Legacy fat-JAR set: three hooks, no post-merge/pre-push — not complete.
+        listOf("post-commit", "post-rewrite", "prepare-commit-msg").forEach { writeGitHookSection(tempDir, it) }
+        val installer = HookInstaller(tempDir.absolutePath)
+        installer.areAllGitHooksInstalled() shouldBe false
 
-        script shouldContain "__jolli_pre_push_previous_status=${'$'}?"
-        script shouldContain """(exit "${'$'}__jolli_pre_push_previous_status")"""
+        listOf("post-merge", "pre-push").forEach { writeGitHookSection(tempDir, it) }
+        installer.areAllGitHooksInstalled() shouldBe true
+    }
+
+    @Test
+    fun `areAllHooksInstalled exempts claude when claudeRequired is false`(@TempDir tempDir: File) {
+        File(tempDir, ".git/hooks").mkdirs()
+        listOf("post-commit", "post-rewrite", "prepare-commit-msg", "post-merge", "pre-push")
+            .forEach { writeGitHookSection(tempDir, it) }
+        // No .claude/settings.local.json: with claudeEnabled == false the CLI never
+        // writes one, and the install must still count as complete.
+        val installer = HookInstaller(tempDir.absolutePath)
+        installer.areAllHooksInstalled() shouldBe false
+        installer.areAllHooksInstalled(claudeRequired = false) shouldBe true
     }
 
     // ── getDebugInfo ────────────────────────────────────────────────────
@@ -166,108 +207,96 @@ class HookInstallerTest {
         info shouldContain "claudeSettings="
     }
 
-    // ── uninstall ───────────────────────────────────────────────────────
+    // ── legacy fat-JAR entry cleanup ────────────────────────────────────
+    // Git hook section removal is the CLI's job now (uninstall runs the bundled
+    // `disable`); the Kotlin side only sweeps the retired fat-JAR agent entries
+    // the CLI's identifier lists don't recognize.
 
     @Nested
-    inner class Uninstall {
+    inner class LegacyCleanup {
         @Test
-        fun `removes claude hook from settings`(@TempDir tempDir: File) {
-            File(tempDir, ".git/hooks").mkdirs()
+        fun `removes the legacy claude stop entry`(@TempDir tempDir: File) {
             File(tempDir, ".claude").mkdirs()
             File(tempDir, ".claude/settings.local.json").writeText("""{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"java -jar jollimemory-hooks.jar stop"}]}]}}""")
 
-            val result = HookInstaller(tempDir.absolutePath).uninstall()
-            result.success shouldBe true
+            HookInstaller(tempDir.absolutePath).removeLegacyAgentHookEntries() shouldBe true
 
             val content = File(tempDir, ".claude/settings.local.json").readText()
             content shouldNotContain "jollimemory-hooks"
         }
 
         @Test
-        fun `removes gemini hook from settings`(@TempDir tempDir: File) {
-            File(tempDir, ".git/hooks").mkdirs()
+        fun `removes the legacy gemini after-agent entry`(@TempDir tempDir: File) {
             File(tempDir, ".gemini").mkdirs()
             File(tempDir, ".gemini/settings.json").writeText(
                 """{"hooks":{"AfterAgent":[{"hooks":[{"type":"command","command":"java -jar jollimemory-hooks.jar gemini-after-agent","name":"jollimemory-session-tracker"}]}]}}""",
             )
 
-            val result = HookInstaller(tempDir.absolutePath).uninstall()
-            result.success shouldBe true
+            HookInstaller(tempDir.absolutePath).removeLegacyAgentHookEntries() shouldBe true
 
             val content = File(tempDir, ".gemini/settings.json").readText()
-            content shouldNotContain "jollimemory"
+            content shouldNotContain "jollimemory-hooks"
             content shouldNotContain "AfterAgent"
         }
 
         @Test
-        fun `removes git hook sections`(@TempDir tempDir: File) {
-            File(tempDir, ".git/hooks").mkdirs()
-            // Create post-commit with JolliMemory section
-            File(tempDir, ".git/hooks/post-commit").writeText(
-                "#!/bin/sh\n\n# >>> JolliMemory post-commit hook >>>\nsome script\n# <<< JolliMemory post-commit hook <<<\n")
+        fun `keeps CLI-written run-hook entries untouched`(@TempDir tempDir: File) {
+            File(tempDir, ".claude").mkdirs()
+            val cliEntry = """{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"\"${'$'}HOME/.jolli/jollimemory/run-hook\" stop","async":true}]}]}}"""
+            File(tempDir, ".claude/settings.local.json").writeText(cliEntry)
 
-            HookInstaller(tempDir.absolutePath).uninstall()
+            HookInstaller(tempDir.absolutePath).removeLegacyAgentHookEntries() shouldBe false
 
-            // Should either delete or clean the file
-            val hookFile = File(tempDir, ".git/hooks/post-commit")
-            if (hookFile.exists()) {
-                hookFile.readText() shouldNotContain "JolliMemory"
-            }
+            val content = File(tempDir, ".claude/settings.local.json").readText()
+            content shouldContain "run-hook"
         }
 
         @Test
-        fun `removes the pre-push hook section`(@TempDir tempDir: File) {
-            File(tempDir, ".git/hooks").mkdirs()
-            File(tempDir, ".git/hooks/pre-push").writeText(
-                "#!/bin/sh\n\n# >>> JolliMemory pre-push hook >>>\nsome script\n# <<< JolliMemory pre-push hook <<<\n")
-
-            HookInstaller(tempDir.absolutePath).uninstall()
-
-            val hookFile = File(tempDir, ".git/hooks/pre-push")
-            if (hookFile.exists()) {
-                hookFile.readText() shouldNotContain "JolliMemory"
-            }
+        fun `returns false when there are no settings files`() {
+            HookInstaller("/nonexistent").removeLegacyAgentHookEntries() shouldBe false
         }
 
         @Test
-        fun `succeeds when no hooks exist`() {
-            val result = HookInstaller("/nonexistent").uninstall()
-            result.message.isNotEmpty() shouldBe true
+        fun `detectLegacyGitHookBodies flags hooks that still call the fat-JAR`(@TempDir tempDir: File) {
+            val hooksDir = File(tempDir, ".git/hooks").apply { mkdirs() }
+            File(hooksDir, "post-commit").writeText(
+                "#!/bin/sh\n# >>> JolliMemory post-commit hook >>>\n\"java\" -jar \"/opt/jollimemory-hooks.jar\" post-commit\n# <<< JolliMemory post-commit hook <<<\n",
+            )
+            File(hooksDir, "post-rewrite").writeText(
+                "#!/bin/sh\n# >>> JolliMemory post-rewrite hook >>>\nnode /abs/run-hook post-rewrite \"\$1\"\n# <<< JolliMemory post-rewrite hook <<<\n",
+            )
+
+            HookInstaller(tempDir.absolutePath).detectLegacyGitHookBodies() shouldBe listOf("post-commit")
+        }
+
+        @Test
+        fun `detectLegacyGitHookBodies returns empty when no hooks dir exists`() {
+            HookInstaller("/nonexistent/path").detectLegacyGitHookBodies() shouldBe emptyList()
+        }
+
+        @Test
+        fun `detectLegacyGitHookBodies resolves the worktree gitdir to the main repo hooks`(@TempDir tempDir: File) {
+            val mainGitDir = File(tempDir, "main/.git").apply { mkdirs() }
+            val hooksDir = File(mainGitDir, "hooks").apply { mkdirs() }
+            File(mainGitDir, "worktrees/wt1").mkdirs()
+            File(hooksDir, "post-commit").writeText(
+                "#!/bin/sh\n# >>> JolliMemory post-commit hook >>>\n\"java\" -jar \"/opt/jollimemory-hooks.jar\" post-commit\n# <<< JolliMemory post-commit hook <<<\n",
+            )
+            val worktree = File(tempDir, "worktree").apply { mkdirs() }
+            File(worktree, ".git").writeText("gitdir: ${mainGitDir.absolutePath}/worktrees/wt1")
+
+            HookInstaller(worktree.absolutePath).detectLegacyGitHookBodies() shouldBe listOf("post-commit")
         }
     }
 
-    // ── removeBetweenMarkers (private, via reflection) ──────────────────
+    // ── uninstall ───────────────────────────────────────────────────────
 
-    @Nested
-    inner class RemoveBetweenMarkers {
-        private fun removeBetweenMarkers(content: String, start: String, end: String): String {
-            val method = HookInstaller::class.java.getDeclaredMethod("removeBetweenMarkers", String::class.java, String::class.java, String::class.java)
-            method.isAccessible = true
-            return method.invoke(HookInstaller("/fake"), content, start, end) as String
-        }
-
-        @Test
-        fun `removes content between markers`() {
-            val result = removeBetweenMarkers("before\n# START\nmiddle\n# END\nafter", "# START", "# END")
-            result shouldContain "before"
-            result shouldContain "after"
-            result shouldNotContain "middle"
-        }
-
-        @Test
-        fun `returns unchanged when no markers`() {
-            removeBetweenMarkers("no markers here", "# START", "# END") shouldBe "no markers here"
-        }
-
-        @Test
-        fun `returns unchanged when only start marker`() {
-            removeBetweenMarkers("before\n# START\nafter", "# START", "# END") shouldContain "before"
-        }
-
-        @Test
-        fun `returns unchanged when end before start`() {
-            removeBetweenMarkers("# END\nbefore\n# START\nafter", "# START", "# END") shouldContain "before"
-        }
+    @Test
+    fun `uninstall reports a message when the CLI bundle is unavailable`() {
+        // No bundled Cli.js on the test classpath: the CLI disable can't run, so
+        // uninstall reports the failure instead of pretending it succeeded.
+        val result = HookInstaller("/nonexistent").uninstall()
+        result.message.isNotEmpty() shouldBe true
     }
 
     // ── resolveGitDir with worktree ─────────────────────────────────────
@@ -284,12 +313,14 @@ class HookInstallerTest {
     }
 
     @Test
-    fun `install returns failure message when jar not found`(@TempDir tempDir: File) {
+    fun `install fails with a message when the CLI bundle is unavailable`(@TempDir tempDir: File) {
         File(tempDir, ".git").mkdirs()
         File(tempDir, ".jolli/jollimemory").mkdirs()
+        // Hook installation is fully CLI-owned: with no bundled Cli.js on the test
+        // classpath the full enable can't run, so install() must fail loudly (no
+        // Kotlin-side partial hook writes exist anymore).
         val result = HookInstaller(tempDir.absolutePath).install()
-        // install() should succeed partially even if jar isn't found
-        // (the Claude hook and git hooks are still written)
+        result.success shouldBe false
         result.message.isNotEmpty() shouldBe true
     }
 }

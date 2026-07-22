@@ -467,16 +467,6 @@ object SessionTracker {
         File(dir, PLUGIN_SOURCE_FILE).writeText(java.time.Instant.now().toString())
     }
 
-    fun loadPluginSource(cwd: String? = null): Boolean {
-        val dir = JmLogger.getJolliMemoryDir(cwd)
-        return File(dir, PLUGIN_SOURCE_FILE).exists()
-    }
-
-    fun deletePluginSource(cwd: String? = null) {
-        val dir = JmLogger.getJolliMemoryDir(cwd)
-        File(dir, PLUGIN_SOURCE_FILE).delete()
-    }
-
     // ── Plans Registry ──────────────────────────────────────────────────────
 
     fun loadPlansRegistry(cwd: String? = null): PlansRegistry {

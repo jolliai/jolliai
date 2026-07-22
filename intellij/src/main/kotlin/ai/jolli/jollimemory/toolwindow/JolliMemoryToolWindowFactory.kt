@@ -895,9 +895,10 @@ private class StatusIndicatorLabel(
             sb.append("<p><span style='color:#D29922'>\u25CF</span> <b>$providerName API key missing</b> — open Settings to add one</p>")
         }
 
-        // Hooks
+        // Hooks — CLI-installed via full `enable`: five git hooks incl.
+        // post-merge and pre-push, running the Node run-hook dispatcher.
         val hookParts = mutableListOf<String>()
-        if (status.gitHookInstalled) hookParts.add("3 Git")
+        if (status.gitHookInstalled) hookParts.add("5 Git")
         if (status.claudeHookInstalled) hookParts.add("2 Claude")
         if (status.geminiHookInstalled) hookParts.add("1 Gemini CLI")
         val hooksDesc = if (hookParts.isNotEmpty()) hookParts.joinToString(" + ") else "none installed"

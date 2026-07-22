@@ -35,6 +35,11 @@
         <projectService
             serviceImplementation="ai.jolli.jollimemory.services.JolliMemoryService"/>
 
+        <!-- Slice-1 daemon channel: spawns `jolli daemon` and dispatches refresh
+             notifications to JolliMemoryService.refreshStatus. -->
+        <projectService
+            serviceImplementation="ai.jolli.jollimemory.bridge.DaemonNotificationClient"/>
+
         <!-- Tool window: sidebar with collapsible STATUS, MEMORIES, PLANS & NOTES, CHANGES panels -->
         <toolWindow
             id="JOLLI"

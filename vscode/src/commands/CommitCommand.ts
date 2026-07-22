@@ -60,6 +60,24 @@ interface AmendAvailability {
 	readonly reason: string;
 }
 
+/**
+ * User-facing text for a commit-message generation failure. A local-agent auth
+ * failure (`LocalAgentAuthError` from the bundled CLI's Claude Code backend)
+ * gets sign-in guidance: its raw message ("Not logged in · Please run /login")
+ * assumes an open claude session the user doesn't have. Matched by `err.name`
+ * (a string literal set in the error's constructor) rather than instanceof so
+ * the check survives bundling.
+ */
+function describeGenerateError(err: unknown): string {
+	if (err instanceof Error && err.name === "LocalAgentAuthError") {
+		return (
+			"Claude Code is installed but not signed in. Open a terminal, run `claude`, " +
+			"and sign in with /login — or switch the AI provider in Jolli Memory settings."
+		);
+	}
+	return err instanceof Error ? err.message : String(err);
+}
+
 // ─── CommitCommand ────────────────────────────────────────────────────────────
 
 export class CommitCommand {
@@ -160,7 +178,7 @@ export class CommitCommand {
 			);
 			log.info("commit", "Commit message generated", { generatedMessage });
 		} catch (err: unknown) {
-			const message = err instanceof Error ? err.message : String(err);
+			const message = describeGenerateError(err);
 			log.error("commit", `Failed to generate commit message: ${message}`, err);
 			vscode.window.showErrorMessage(
 				`Jolli Memory: Failed to generate commit message: ${message}`,

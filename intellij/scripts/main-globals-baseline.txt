@@ -1,4 +1,3 @@
-src/main/kotlin/ai/jolli/jollimemory/actions/CommitAIAction.kt
 src/main/kotlin/ai/jolli/jollimemory/auth/JolliConfigStore.kt
 src/main/kotlin/ai/jolli/jollimemory/auth/JolliUrlConfig.kt
 src/main/kotlin/ai/jolli/jollimemory/bridge/CliIntegrations.kt
@@ -14,9 +13,6 @@ src/main/kotlin/ai/jolli/jollimemory/core/WindowsHidden.kt
 src/main/kotlin/ai/jolli/jollimemory/core/plans/TranscriptPlanDiscovery.kt
 src/main/kotlin/ai/jolli/jollimemory/core/telemetry/Telemetry.kt
 src/main/kotlin/ai/jolli/jollimemory/core/telemetry/TelemetryConsent.kt
-src/main/kotlin/ai/jolli/jollimemory/hooks/HookRunner.kt
-src/main/kotlin/ai/jolli/jollimemory/hooks/HookUtils.kt
-src/main/kotlin/ai/jolli/jollimemory/hooks/PostCommitHook.kt
 src/main/kotlin/ai/jolli/jollimemory/services/JolliMemoryService.kt
 src/main/kotlin/ai/jolli/jollimemory/services/PlanService.kt
 src/main/kotlin/ai/jolli/jollimemory/services/PrService.kt

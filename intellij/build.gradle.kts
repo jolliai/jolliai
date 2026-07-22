@@ -1,4 +1,5 @@
 import org.jetbrains.intellij.platform.gradle.IntelliJPlatformType
+import org.jetbrains.intellij.platform.gradle.tasks.PrepareSandboxTask
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 import java.util.zip.ZipEntry
@@ -11,7 +12,6 @@ plugins {
     id("java")
     id("org.jetbrains.kotlin.jvm") version "2.1.20"
     id("org.jetbrains.intellij.platform") version "2.5.0"
-    id("com.gradleup.shadow") version "9.0.0-beta12"
     id("org.jetbrains.kotlinx.kover") version "0.9.1"
     id("org.jetbrains.changelog") version "2.2.1"
 }
@@ -29,9 +29,6 @@ repositories {
     }
 }
 
-// Standalone configuration for the hooks fat JAR (includes kotlin-stdlib)
-val hooksRuntime: Configuration by configurations.creating
-
 dependencies {
     intellijPlatform {
         // 2025.1 is the minimum: the non-deprecated FileSaverDescriptor(title, description) +
@@ -48,13 +45,9 @@ dependencies {
         jetbrainsRuntime()
     }
     // Gson and kotlin-stdlib are compileOnly — IntelliJ bundles both at runtime.
-    // The standalone hooks JAR bundles its own copies via the hooksRuntime configuration.
     compileOnly("com.google.code.gson:gson:2.12.1")
     compileOnly("org.jetbrains.kotlin:kotlin-stdlib")
     implementation("org.xerial:sqlite-jdbc:3.49.1.0")
-    hooksRuntime("com.google.code.gson:gson:2.12.1")
-    hooksRuntime("org.jetbrains.kotlin:kotlin-stdlib:2.1.20")
-    hooksRuntime("org.xerial:sqlite-jdbc:3.49.1.0")
     // 5.12+ is required for junit.jupiter.extensions.autodetection.exclude — the
     // filter that keeps the IDE testFramework.jar's global JUnit extensions out
     // of this suite (see the test task's doFirst below).
@@ -207,181 +200,58 @@ intellijPlatform {
     }
 }
 
-// Resolve the sqlite-jdbc JAR filename from the dependency so the Class-Path
-// manifest stays correct when the version is bumped.
-val sqliteJdbcFileName: String by lazy {
-    hooksRuntime.resolvedConfiguration.resolvedArtifacts
-        .map { it.file.name }
-        .first { it.startsWith("sqlite-jdbc") }
-}
-
-// Fat JAR for hooks (standalone executable without IntelliJ dependencies)
-tasks.register<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("hookJar") {
-    archiveBaseName.set("jollimemory-hooks")
-    archiveClassifier.set("")
-    manifest {
-        attributes["Main-Class"] = "ai.jolli.jollimemory.hooks.HookRunner"
-        // JVM resolves Class-Path entries relative to the JAR's own directory.
-        // Two entries: (1) when installed to ~/.jolli/bin/ alongside sqlite-jdbc.jar,
-        // (2) when running from plugin's bin/ directory, resolve from sibling lib/.
-        attributes["Class-Path"] = "sqlite-jdbc.jar ../lib/$sqliteJdbcFileName"
-    }
-    from(sourceSets.main.get().output)
-    // runtimeClasspath no longer includes Gson/kotlin-stdlib (both compileOnly);
-    // hooksRuntime bundles them explicitly for standalone execution.
-    configurations = listOf(hooksRuntime)
-    // Exclude IntelliJ platform classes — hooks don't need them
-    exclude("com/intellij/**")
-    exclude("org/jetbrains/**")
-    // Exclude TypeVariableImpl and TypesJVMKt — TypeVariableImpl doesn't implement
-    // TypeVariable.getAnnotatedBounds(), causing binary incompatibility with newer
-    // JDKs bundled in IntelliJ 2026.1+. TypesJVMKt.computeJavaType() references
-    // TypeVariableImpl, so it must also be excluded to avoid NoSuchClassError.
-    // Must NOT exclude the entire kotlin/reflect package — KFunction etc.
-    // are needed by kotlin-stdlib's Regex.findAll() at runtime.
-    exclude("kotlin/reflect/TypeVariableImpl.class")
-    exclude("kotlin/reflect/TypesJVMKt.class")
-    exclude("kotlin/reflect/TypesJVMKt\$*.class")
-    // Exclude the plugin descriptor so IntelliJ doesn't see two plugin.xml files
-    exclude("META-INF/plugin.xml")
-    // Exclude sqlite-jdbc entirely — it ships as a separate JAR in bin/ and is loaded
-    // via Class-Path manifest at runtime. This avoids duplicating the 3.8 MB library.
-    exclude("org/sqlite/**")
-    exclude("META-INF/maven/org.xerial/**")
-    exclude("META-INF/native-image/org.xerial/**")
-    exclude("META-INF/versions/9/org/sqlite/**")
-    mergeServiceFiles()
-}
-
-// Add hooks JAR to the sandbox BEFORE buildPlugin zips it
-tasks.named("prepareSandbox") {
-    dependsOn("hookJar")
-}
-
-// After prepareSandbox completes, copy hooks JAR and a stripped sqlite-jdbc.jar into bin/.
-// Using bin/ instead of lib/ keeps them off the plugin classloader path, so Plugin
-// Verifier doesn't flag the bundled dependencies.
-tasks.register("copyHookJarToSandbox") {
-    dependsOn("prepareSandbox", "hookJar")
-    doLast {
-        val hookJar = tasks.named("hookJar").get().outputs.files.singleFile
-        val pluginBin = layout.buildDirectory.dir("idea-sandbox/plugins/jollimemory-intellij/bin").get().asFile
-        pluginBin.mkdirs()
-        hookJar.copyTo(File(pluginBin, "jollimemory-hooks.jar"), overwrite = true)
-        logger.lifecycle("Copied hooks JAR to: ${pluginBin}/jollimemory-hooks.jar")
-
-        // Produce a platform-stripped sqlite-jdbc.jar for the hooks JAR's Class-Path.
-        // The plugin's lib/ has the full upstream JAR; we strip it down to desktop platforms only.
-        val keepNativePrefixes = listOf(
-            "org/sqlite/native/Mac/",
-            "org/sqlite/native/Linux/aarch64/",
-            "org/sqlite/native/Linux/x86_64/",
-            "org/sqlite/native/Windows/aarch64/",
-            "org/sqlite/native/Windows/x86_64/",
-        )
-        val sqliteSrc = hooksRuntime.resolvedConfiguration.resolvedArtifacts
-            .map { it.file }
-            .first { it.name.startsWith("sqlite-jdbc") }
-        val sqliteDst = File(pluginBin, "sqlite-jdbc.jar")
-        val zipIn = ZipFile(sqliteSrc)
-        val zipOut = ZipOutputStream(FileOutputStream(sqliteDst))
-        try {
-            val entries = zipIn.entries()
-            while (entries.hasMoreElements()) {
-                val entry = entries.nextElement()
-                val name = entry.name
-                if (name.startsWith("org/sqlite/native/") &&
-                    keepNativePrefixes.none { prefix -> name.startsWith(prefix) }
-                ) continue
-                zipOut.putNextEntry(ZipEntry(name))
-                if (!entry.isDirectory) {
-                    val buf = ByteArray(8192)
-                    val stream = zipIn.getInputStream(entry)
-                    var len = stream.read(buf)
-                    while (len >= 0) {
-                        zipOut.write(buf, 0, len)
-                        len = stream.read(buf)
-                    }
-                    stream.close()
-                }
-                zipOut.closeEntry()
-            }
-        } finally {
-            zipOut.close()
-            zipIn.close()
-        }
-        logger.lifecycle("Stripped sqlite-jdbc.jar to: ${pluginBin}/sqlite-jdbc.jar (${sqliteSrc.length() / 1024}K -> ${sqliteDst.length() / 1024}K)")
-    }
-}
-
-// Bundle the self-contained CLI bundle (esbuild output — all deps inlined, no
-// node_modules) so the plugin can run `node Cli.js enable --integrations-only`
-// to light up MCP + skills without depending on a global CLI install. Source is
-// vscode/dist/Cli.js (produced by `npm run build`); copied into the plugin's
-// cli-dist/ (like the hooks JAR's bin/), off the classloader path.
-// Bundle the FULL self-contained CLI dist (all esbuild bundles: Cli.js + the hook
-// entry scripts PostCommitHook.js / PrepareMsgHook.js / …). Cli.js alone is enough
-// for MCP + skills, but the shared `run-hook` dispatcher execs the per-hook .js
-// files by name — so a single-file bundle would break node git hooks whenever the
-// IntelliJ dist wins dist-paths arbitration (mixed installs). Excludes Extension.js
-// (the VS Code extension-host bundle, not needed here).
+// Bundle the FULL self-contained CLI dist (esbuild output — every dep inlined, no
+// node_modules): Cli.js plus the per-hook entry scripts (PostCommitHook.js /
+// PrepareMsgHook.js / …). The plugin runs `node Cli.js enable` to install ALL hooks
+// + MCP + skills without depending on a global CLI install. Cli.js alone covers MCP
+// + skills, but the shared `run-hook` dispatcher execs the per-hook .js files by
+// name, so a single-file bundle would break node git hooks whenever the IntelliJ
+// dist wins dist-paths arbitration (mixed installs). Source is vscode/dist/*.js
+// (produced by `npm run build`); Extension.js (the VS Code extension-host bundle) is
+// excluded. Placed under the plugin's cli-dist/, off the classloader path, so the
+// Plugin Verifier skips it.
+//
+// Wired into prepareSandbox (a Sync task) rather than a bespoke copy task so runIde
+// and buildPlugin share ONE path: the bundle lands in the version-scoped sandbox the
+// IDE actually loads (…/idea-sandbox/<IDE>/plugins/<plugin>/), and buildPlugin zips it
+// straight from there — no separate inject step. The prior bespoke task wrote to an
+// unversioned …/idea-sandbox/plugins/<plugin>/ path that runIde never loads from, so
+// dev sandboxes launched with an empty cli-dist and enable aborted with BundleMissing.
+// Scoped to the main prepareSandbox only (not prepareTestSandbox), so the unit-test
+// run keeps its current independence from the vscode/dist build.
 val vscodeDistDir = rootProject.layout.projectDirectory.dir("../vscode/dist")
-tasks.register("copyCliDistToSandbox") {
-    dependsOn("prepareSandbox")
-    doLast {
-        val srcDir = vscodeDistDir.asFile
-        val cliJs = File(srcDir, "Cli.js")
+tasks.named<PrepareSandboxTask>("prepareSandbox") {
+    // Fail fast with an actionable message instead of silently syncing an empty
+    // cli-dist (which only surfaces much later as a runtime BundleMissing).
+    doFirst {
+        val cliJs = vscodeDistDir.file("Cli.js").asFile
         if (!cliJs.exists()) {
             throw GradleException(
                 "Bundled CLI not found at ${cliJs.path}. Run `npm run build` at the repo root " +
                     "first (it builds vscode/dist/*.js), then re-run the Gradle build.",
             )
         }
-        val cliDist = layout.buildDirectory.dir("idea-sandbox/plugins/jollimemory-intellij/cli-dist").get().asFile
-        cliDist.mkdirs()
-        val copied = srcDir.listFiles { f -> f.isFile && f.name.endsWith(".js") && f.name != "Extension.js" }
-            ?.onEach { it.copyTo(File(cliDist, it.name), overwrite = true) }
-            ?.size ?: 0
-        logger.lifecycle("Copied bundled CLI dist ($copied .js files) to: $cliDist")
+    }
+    from(vscodeDistDir) {
+        into("${rootProject.name}/cli-dist")
+        include("*.js")
+        exclude("Extension.js")
     }
 }
 
-// buildSearchableOptions reads from sandbox — make sure hooks JAR + CLI bundle are there
-tasks.named("buildSearchableOptions") {
-    dependsOn("copyHookJarToSandbox", "copyCliDistToSandbox")
-}
-
-// After buildPlugin creates the zip, inject bin/ JARs and strip unused sqlite-jdbc natives from lib/.
+// After buildPlugin creates the zip, strip unused sqlite-jdbc natives from lib/. The
+// CLI bundle (cli-dist/) is already inside the archive: prepareSandbox placed it in
+// the sandbox and buildPlugin zips the sandbox verbatim, so no separate inject step.
 tasks.named("buildPlugin") {
-    dependsOn("copyHookJarToSandbox", "copyCliDistToSandbox")
     val buildPluginArchive = layout.buildDirectory.file("distributions/jollimemory-intellij-${project.version}.zip")
     doLast {
         // Target THIS build's archive by exact name. Using listFiles().firstOrNull { .zip }
         // grabbed a stale prior-version (or already-signed) zip when build/distributions/
-        // still held old artifacts, leaving the real output un-injected and unstripped.
+        // still held old artifacts, leaving the real output unstripped.
         val zipFile = buildPluginArchive.get().asFile.takeIf { it.exists() } ?: return@doLast
-        val pluginBin = layout.buildDirectory.dir("idea-sandbox/plugins/jollimemory-intellij/bin").get().asFile
-        val pluginCliDist = layout.buildDirectory.dir("idea-sandbox/plugins/jollimemory-intellij/cli-dist").get().asFile
 
-        // 1. Add hooks JAR to bin/ (outside lib/ so Plugin Verifier skips it).
-        //    sqlite-jdbc.jar is NOT duplicated here — the hooks JAR's Class-Path manifest
-        //    references ../lib/sqlite-jdbc-*.jar when running from the plugin directory.
-        //    A separate copy is only made to ~/.jolli/bin/ by HookInstaller at install time.
-        //    The bundled CLI goes to cli-dist/ (also off the classloader path).
-        ant.withGroovyBuilder {
-            "zip"("destfile" to zipFile.absolutePath, "update" to true) {
-                "zipfileset"("dir" to pluginBin.absolutePath, "prefix" to "jollimemory-intellij/bin") {
-                    "include"("name" to "jollimemory-hooks.jar")
-                }
-                "zipfileset"("dir" to pluginCliDist.absolutePath, "prefix" to "jollimemory-intellij/cli-dist") {
-                    "include"("name" to "*.js")
-                }
-            }
-        }
-        logger.lifecycle("Injected hooks JAR + CLI bundle into: ${zipFile.name}")
-
-        // 2. Strip sqlite-jdbc native libraries in lib/ for platforms IntelliJ never runs on.
-        //    The lib/ copy is used by the IDE plugin classloader; bin/sqlite-jdbc.jar is for hooks.
+        // Strip sqlite-jdbc native libraries in lib/ for platforms IntelliJ never runs on.
+        // The lib/ copy is used by the IDE plugin classloader (OpenCode/Cursor SQLite reads).
         val keepNativePrefixes = listOf(
             "org/sqlite/native/Mac/",
             "org/sqlite/native/Linux/aarch64/",

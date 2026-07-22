@@ -108,8 +108,8 @@ class JolliMemoryStartupActivity : ProjectActivity {
 
         /**
          * The startup sequence that runs once the Node gate has passed: service
-         * initialization, sync activation, cold-start back-fill signals, and
-         * telemetry bootstrap/flush scheduling.
+         * initialization, daemon notification channel start, sync activation,
+         * cold-start back-fill signals, and telemetry bootstrap/flush scheduling.
          */
         internal fun runPostNodeStartup(project: Project) {
             val basePath = project.basePath ?: return
@@ -117,6 +117,15 @@ class JolliMemoryStartupActivity : ProjectActivity {
             log.info("JolliMemory: initializing for project at $basePath")
             val service = project.getService(JolliMemoryService::class.java)
             service.initialize()
+
+            // Slice-1 daemon channel: replaces the in-process refresh signal the retired
+            // Kotlin PostCommitHook used to fire. The client spawns `jolli daemon` and
+            // dispatches `refresh` notifications to JolliMemoryService.refreshStatus.
+            try {
+                project.getService(ai.jolli.jollimemory.bridge.DaemonNotificationClient::class.java).start()
+            } catch (e: Exception) {
+                log.warn("Daemon notification client start failed (ignored): ${e.message}")
+            }
 
             log.info("JolliMemory: activating sync for project at $basePath")
             ai.jolli.jollimemory.sync.SyncActivation.activateSync(project, service)
