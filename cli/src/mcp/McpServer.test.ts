@@ -357,6 +357,26 @@ describe("startMcpServer", () => {
 		await startMcpServer("/repo");
 		expect(serverInfo).toMatchObject({ name: "jollimemory", version: VERSION });
 	});
+
+	it("no-ops entirely when running as a local-agent child (JOLLI-2033)", async () => {
+		// The local-agent backend spawns `claude` in a throwaway temp cwd marked
+		// JOLLI_LOCAL_AGENT_CHILD=1; a globally-installed jolli plugin then spawns
+		// `jolli mcp` there. Without this guard, createStorage roots a FolderStorage
+		// at <localFolder>/<tempDirName>/, claiming a spurious Memory Bank "repo" per
+		// summary call. The child denies all tools, so no MCP tool is ever invoked —
+		// the whole server must no-op, mirroring the SessionStart/Stop/enable guards.
+		vi.mocked(createStorage).mockClear();
+		vi.mocked(setActiveStorage).mockClear();
+		process.env.JOLLI_LOCAL_AGENT_CHILD = "1";
+		try {
+			await startMcpServer("/tmp/jolli-localagent-abc123");
+		} finally {
+			delete process.env.JOLLI_LOCAL_AGENT_CHILD;
+		}
+		expect(createStorage).not.toHaveBeenCalled();
+		expect(setActiveStorage).not.toHaveBeenCalled();
+		expect(connectMock).not.toHaveBeenCalled();
+	});
 });
 
 describe("startMcpServer — platform tools", () => {
