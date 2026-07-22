@@ -17,6 +17,8 @@
 
 import { rm } from "node:fs/promises";
 import type { Command } from "commander";
+import { createStorage } from "../core/StorageFactory.js";
+import { setActiveStorage } from "../core/SummaryStore.js";
 import { track } from "../core/Telemetry.js";
 import { uninstall } from "../install/Installer.js";
 import {
@@ -242,6 +244,19 @@ export function registerUninstallCommand(program: Command): void {
 		.action(async (options: { cwd: string; dryRun?: boolean; yes?: boolean; scope?: string }) => {
 			setLogDir(options.cwd);
 			log.info("Running 'uninstall' command");
+
+			// Establish the configured storage backend before the scan — same as the
+			// read commands (SearchCommand/RecallCommand). The scan reaches getStatus →
+			// getSummaryCount, a read that otherwise falls through resolveStorage to the
+			// orphan-branch fallback and logs a spurious "folder-mode users will miss
+			// this write" warning (misleading: the scan only reads, never writes).
+			// Guarded because uninstall may run in a half-configured or non-repo state;
+			// on failure the read still succeeds via the fallback.
+			try {
+				setActiveStorage(await createStorage(options.cwd, options.cwd));
+			} catch (err) {
+				log.info("Could not establish storage backend before scan (non-fatal): %s", (err as Error).message);
+			}
 
 			const scope = options.scope;
 			if (scope !== "all" && scope !== "global" && scope !== "project") {
