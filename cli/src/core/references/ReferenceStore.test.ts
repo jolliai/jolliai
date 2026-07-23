@@ -56,6 +56,20 @@ function githubRef(overrides: Partial<Reference> = {}): Reference {
 	};
 }
 
+function context7Ref(overrides: Partial<Reference> = {}): Reference {
+	return {
+		mapKey: "context7:/websites/api_jquery",
+		source: "context7",
+		nativeId: "/websites/api_jquery",
+		title: "websites/api_jquery",
+		url: "https://context7.com/websites/api_jquery",
+		description: "how to use jQuery.ajax() function: options, success/error callbacks",
+		referencedAt: "2026-07-23T03:31:06.464Z",
+		toolName: "mcp__context7__query-docs",
+		...overrides,
+	};
+}
+
 describe("ReferenceStore", () => {
 	let tempDir: string;
 
@@ -582,6 +596,49 @@ describe("ReferenceStore", () => {
 			const back = await readReferenceMarkdown(sourcePath);
 			expect(back).not.toBeNull();
 			expect(hashReferenceContent(back as Reference)).toBe(contentHash);
+		});
+	});
+
+	describe("track-only / arguments-derived auto-note", () => {
+		it("appends a human note explaining why a track-only reference stores so little", async () => {
+			const { sourcePath } = await writeReferenceMarkdown(context7Ref(), tempDir);
+			const content = await readFile(sourcePath, "utf-8");
+			// argumentsDerived → "full response not saved"; trackOnly → "not used ... summaries".
+			expect(content).toContain("bookmark, not a full copy");
+			expect(content).toContain("intentionally not saved");
+			expect(content).toContain("Track-only");
+			expect(content).toContain("not** used as a source when generating memory summaries");
+			// The user-facing body (the query) still renders above the note.
+			expect(content).toContain("how to use jQuery.ajax()");
+		});
+
+		it("does not append a note to ordinary (non-track-only) references", async () => {
+			const { sourcePath } = await writeReferenceMarkdown(linearRef({ description: "Issue body" }), tempDir);
+			const content = await readFile(sourcePath, "utf-8");
+			expect(content).not.toContain("bookmark, not a full copy");
+			expect(content).not.toContain("Track-only");
+		});
+
+		it("strips the note on read so it never folds into the stored description", async () => {
+			const { sourcePath } = await writeReferenceMarkdown(context7Ref(), tempDir);
+			const back = await readReferenceMarkdown(sourcePath);
+			expect(back).not.toBeNull();
+			expect((back as Reference).description).toBe(context7Ref().description);
+			expect((back as Reference).description).not.toContain("bookmark");
+		});
+
+		it("keeps the guard hash stable across a render→parse→render round-trip (no re-upsert loop)", async () => {
+			const { sourcePath, contentHash } = await writeReferenceMarkdown(context7Ref(), tempDir);
+			const back = await readReferenceMarkdown(sourcePath);
+			expect(back).not.toBeNull();
+			// Archive-side hash of the parsed-back ref must equal the upsert-side hash,
+			// or the reference re-surfaces as uncommitted on every re-extraction.
+			expect(hashReferenceContent(back as Reference)).toBe(contentHash);
+
+			// A second round-trip must not accumulate the note into the body.
+			const { sourcePath: sp2 } = await writeReferenceMarkdown(back as Reference, tempDir);
+			const back2 = await readReferenceMarkdown(sp2);
+			expect((back2 as Reference).description).toBe(context7Ref().description);
 		});
 	});
 });

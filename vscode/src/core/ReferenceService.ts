@@ -246,11 +246,12 @@ function readFrontmatter(sourcePath: string): ParsedFrontmatter {
 	if (closingIdx === -1) return {};
 
 	const fmLines = lines.slice(1, closingIdx);
-	const body = lines
-		.slice(closingIdx + 1)
-		.join("\n")
-		.replace(/^\n+/, "")
-		.replace(/\n+$/, "");
+	const rawBody = lines.slice(closingIdx + 1).join("\n");
+	// LOCKSTEP with ReferenceStore.stripReferenceNote (cli): drop the auto-generated
+	// track-only note (everything from the "<!-- jolli:auto-note -->" sentinel onward)
+	// so it never leaks into the 200-char description snippet shown in the sidebar / hover.
+	const noteIdx = rawBody.indexOf("<!-- jolli:auto-note -->");
+	const body = (noteIdx === -1 ? rawBody : rawBody.slice(0, noteIdx)).replace(/^\n+/, "").replace(/\n+$/, "");
 
 	const out: {
 		-readonly [K in keyof ParsedFrontmatter]: ParsedFrontmatter[K];
