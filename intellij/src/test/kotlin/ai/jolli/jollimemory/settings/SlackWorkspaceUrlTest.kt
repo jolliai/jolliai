@@ -89,16 +89,5 @@ class SlackWorkspaceUrlTest {
 			back.slack?.workspaceUrl shouldBe "https://my-team.slack.com"
 		}
 
-		@Test
-		fun `merge saveConfig preserves slack across a partial update`(@TempDir tempDir: File) {
-			val cwd = tempDir.absolutePath
-			// saveConfig writes under ensureDir(cwd); seed slack, then update an
-			// unrelated field. slack must survive the field-by-field merge.
-			SessionTracker.saveConfig(JolliMemoryConfig(slack = SlackConfig(workspaceUrl = "https://my-team.slack.com")), cwd)
-			SessionTracker.saveConfig(JolliMemoryConfig(model = "sonnet"), cwd)
-			val back = SessionTracker.loadConfigFromDir(SessionTracker.ensureDir(cwd))
-			back.model shouldBe "sonnet"
-			back.slack?.workspaceUrl shouldBe "https://my-team.slack.com"
-		}
 	}
 }

@@ -2,7 +2,7 @@ package ai.jolli.jollimemory.core
 
 /**
  * KnowledgeCompiler — parse/format helpers for the topic-KB compile format.
- * Pure string/regex logic, reused by ReconciledPage and SourceContent.
+ * Pure string/regex logic, reused by ReconciledPage.
  *
  * Kotlin port of `cli/src/core/KnowledgeCompiler.ts`. Regexes are ported
  * verbatim; the slug rules and field-marker boundaries must stay identical.

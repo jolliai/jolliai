@@ -108,10 +108,12 @@ object TranscriptReferenceDiscovery {
 		val mapKey = ref.mapKey
 		val now = java.time.Instant.now().toString()
 
-		// Load → merge → save under lock. Only release the lock if we actually hold
-		// it — releaseLock is an unconditional file delete, so releasing a lock we
-		// never acquired would wipe the holder's lock (the PostCommitHook worker or a
-		// parallel StopHook) and let a second writer interleave plans.json writes.
+		// Load → merge → save under `plans.lock` (bridged to the CLI daemon so
+		// this serializes with the CLI's own StopHook / QueueWorker / Codex-tick
+		// writers, which all wrap their RMW in withPlansLock). Only release
+		// when we actually hold it: the daemon release is PID-checked, but
+		// gating on `locked` keeps the intent obvious and skips a needless
+		// bridge round-trip on the failure path.
 		val locked = SessionTracker.acquireLock(cwd)
 		if (!locked) {
 			log.warn("upsertReferenceEntry: could not acquire lock for %s — writing without lock", mapKey)

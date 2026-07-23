@@ -79,8 +79,19 @@ class ChangesPanel(
     override fun currentRowCount(): Int = changes.size
 
     private val emptyLabel = JBLabel("No changes detected.", javax.swing.SwingConstants.CENTER)
-    /** Per-file selection (parallel to [changes]); deselected files are struck through. */
-    private val selectedStates = mutableListOf<Boolean>()
+    /**
+     * Per-file selection (parallel to [changes]); deselected files are struck through.
+     *
+     * `CopyOnWriteArrayList` because [getSelectedFiles] is invoked from
+     * [ai.jolli.jollimemory.actions.CommitAIAction.update] on the background
+     * ActionUpdateThread (BGT), while all mutations here fire from EDT event
+     * handlers (mouse toggle, refreshFromGit). An `ArrayList` would let the
+     * concurrent `clear() + add()` cycle slice through a BGT read and throw
+     * CME; COW gives the reader an implicit snapshot with no explicit locking.
+     * Writes are O(n) but n is capped at the working-tree change count, so the
+     * copy cost is negligible against the safety win.
+     */
+    private val selectedStates: MutableList<Boolean> = java.util.concurrent.CopyOnWriteArrayList()
     private val fileListPanel = JPanel().apply {
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
     }

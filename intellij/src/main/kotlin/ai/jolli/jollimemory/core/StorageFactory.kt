@@ -1,56 +1,57 @@
 package ai.jolli.jollimemory.core
 
-import ai.jolli.jollimemory.bridge.GitCommands
-import java.nio.file.Path
+import ai.jolli.jollimemory.bridge.CliIntegrations
+import ai.jolli.jollimemory.bridge.GitOps
+import com.google.gson.Gson
+import com.google.gson.JsonObject
 
 /**
- * StorageFactory — creates the appropriate StorageProvider based on config.
+ * Creates the thin JVM adapter for the CLI-owned storage provider stack.
  *
- * Storage modes:
- * - "orphan" (default): OrphanBranchStorage only — current behavior
- * - "dual-write": writes to both orphan branch and folder, reads from orphan
- * - "folder": FolderStorage only — final target state
- *
- * Part of JOLLI-1309 / Phase 2, Step 2.1.
+ * The [git] parameter is retained for source compatibility with existing IDE
+ * composition code; the CLI-backed provider resolves storage entirely from
+ * [projectPath], so the [GitOps] value itself is never dereferenced here.
  */
 object StorageFactory {
 
-    private val log = JmLogger.create("StorageFactory")
+	fun create(
+		@Suppress("UNUSED_PARAMETER") git: GitOps,
+		projectPath: String,
+	): StorageProvider = CliStorageProvider(projectPath)
+}
 
-    /**
-     * Creates a StorageProvider based on the configured storage mode.
-     *
-     * @param git Git command surface for OrphanBranchStorage (production: GitOps)
-     * @param projectPath The resolved repo root path (for resolving KB folder)
-     * @param config The user's JolliMemoryConfig (contains storageMode, knowledgeBasePath)
-     */
-    fun create(git: GitCommands, projectPath: String, config: JolliMemoryConfig = SessionTracker.loadConfig()): StorageProvider {
-        val mode = config.storageMode ?: "dual-write"
-        log.info("StorageFactory.create: storageMode=%s, projectPath=%s", mode, projectPath)
+private class CliStorageProvider(private val projectPath: String) : StorageProvider {
 
-        return when (mode) {
-            "dual-write" -> {
-                val orphan = OrphanBranchStorage(git)
-                val folder = createFolderStorage(projectPath, config)
-                log.info("Storage mode: dual-write (primary=orphan, shadow=folder)")
-                DualWriteStorage(orphan, folder)
-            }
-            "folder" -> {
-                log.info("Storage mode: folder")
-                createFolderStorage(projectPath, config)
-            }
-            else -> {
-                log.info("Storage mode: orphan (default)")
-                OrphanBranchStorage(git)
-            }
-        }
-    }
+	private val gson = Gson()
 
-    private fun createFolderStorage(projectPath: String, config: JolliMemoryConfig): FolderStorage {
-        val repoName = KBPathResolver.extractRepoName(projectPath)
-        val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
-        val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
-        val metadataManager = MetadataManager(kbRoot.resolve(".jolli"))
-        return FolderStorage(kbRoot, metadataManager)
-    }
+	override fun readFile(path: String): String? =
+		run("read", "path" to path).asJsonObject.get("content")?.takeUnless { it.isJsonNull }?.asString
+
+	override fun writeFiles(files: List<FileWrite>, message: String) {
+		val request = JsonObject().apply {
+			addProperty("operation", "write")
+			add("files", gson.toJsonTree(files))
+			addProperty("message", message)
+		}
+		CliIntegrations.runIdeBridge(projectPath, "storage", gson.toJson(request))
+	}
+
+	override fun listFiles(prefix: String): List<String> {
+		val paths = run("list", "prefix" to prefix).asJsonObject.getAsJsonArray("paths") ?: return emptyList()
+		return paths.map { it.asString }
+	}
+
+	override fun exists(): Boolean = run("exists").asJsonObject.get("exists")?.asBoolean == true
+
+	override fun ensure() {
+		run("ensure")
+	}
+
+	private fun run(operation: String, vararg fields: Pair<String, String>): com.google.gson.JsonElement {
+		val request = JsonObject().apply {
+			addProperty("operation", operation)
+			for ((key, value) in fields) addProperty(key, value)
+		}
+		return CliIntegrations.runIdeBridge(projectPath, "storage", gson.toJson(request))
+	}
 }

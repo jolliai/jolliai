@@ -8,17 +8,16 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.project.Project
 
 /**
- * IntelliJ-specific glue that constructs a [SyncEngine] on sign-in
- * and tears it down on sign-out.
- *
- * Port of `vscode/src/sync/VsCodeSyncBootstrap.ts:activateSync()`.
+ * IntelliJ-specific glue that hooks the sync orchestrator into auth state.
+ * Every heavy piece of the sync round lives in the CLI now — this object only
+ * decides *when* to start/stop the orchestrator based on sign-in and config.
  */
 object SyncActivation {
 
 	private val log = JmLogger.create("SyncActivation")
 
 	/**
-	 * Registers an auth listener that calls [reconcileSync] on sign-in/sign-out,
+	 * Registers an auth listener that calls [reconcileSync] on sign-in / sign-out,
 	 * and runs an initial reconcile for the "already signed in at startup" case.
 	 *
 	 * Returns a [Disposable] that removes the auth listener.
@@ -29,18 +28,17 @@ object SyncActivation {
 			log.info("activateSync: auth state changed, reconciling")
 			reconcileSync(project, service)
 		}
-		// Initial reconcile for "already signed in" case.
 		log.info("activateSync: running initial reconcile")
 		reconcileSync(project, service)
 		return disposable
 	}
 
 	/**
-	 * Checks config and either starts or stops sync accordingly.
+	 * Reconciles sync lifecycle with the current auth + config state.
 	 *
-	 * - No API key → stop sync (sign-out path)
-	 * - Engine built → start sync (engine is always built so manual sync works)
-	 * - `autoSyncEnabled == false` → stop polling (but engine remains for manual sync)
+	 * - No `jolliApiKey` → stop the orchestrator (sign-out path).
+	 * - Signed in → start the orchestrator; when `autoSyncEnabled` is false the
+	 *   orchestrator is built but polling is stopped so manual sync still works.
 	 */
 	internal fun reconcileSync(project: Project, service: JolliMemoryService) {
 		val cwd = service.mainRepoRoot ?: project.basePath ?: return
@@ -52,22 +50,10 @@ object SyncActivation {
 			return
 		}
 
-		val engine = buildSyncEngine(cwd)
-		if (engine == null) {
-			log.info("reconcileSync: engine could not be built — stopping sync")
-			service.stopSync()
-			return
-		}
-
 		val autoSyncEnabled = config.autoSyncEnabled ?: true
 		val pollIntervalSec = config.syncPollIntervalSec
-		log.info("reconcileSync: engine built, autoSync=$autoSyncEnabled pollInterval=$pollIntervalSec")
+		log.info("reconcileSync: starting sync autoSync=$autoSyncEnabled pollInterval=$pollIntervalSec")
 
-		service.startSync(engine, cwd, pollIntervalSec)
-
-		if (!autoSyncEnabled) {
-			log.info("reconcileSync: autoSyncEnabled=false — stopping polling (manual sync still available)")
-			service.stopSync()
-		}
+		service.startSync(cwd, pollIntervalSec, autoSyncEnabled)
 	}
 }

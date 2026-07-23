@@ -325,10 +325,10 @@ class PlansPanel(
             val cwd = service.mainRepoRoot ?: project.basePath ?: ""
             val gitOps = service.getGitOps()
             val currentBranch = gitOps?.getCurrentBranch()
-            // Plans enter the registry via transcript discovery (StopHook →
-            // TranscriptPlanDiscovery), mirroring VS Code — so a plan appears in
-            // CONTEXT only when the user actually created/edited it in a session, and
-            // is consumed on commit. We no longer directory-scan ~/.claude/plans/.
+            // Plans enter the registry via the CLI's transcript discovery
+            // pipeline, mirroring VS Code — so a plan appears in CONTEXT only when
+            // the user actually created/edited it in a session, and is consumed on
+            // commit. We no longer directory-scan ~/.claude/plans/.
             val registry = SessionTracker.loadPlansRegistry(cwd)
 
             val ex = CommitSelectionStore.readExclusions(cwd)
@@ -425,9 +425,12 @@ class PlansPanel(
         revalidate(); repaint()
     }
 
-    // Shown when the service is initialized but hooks are not installed (or were
-    // uninstalled). Distinct from showInitializing so users are not misled into
-    // thinking a background task is still running — nothing is, until they enable.
+    /**
+     * Shown when the service is initialized but hooks are not installed (or
+     * were uninstalled / paused). Distinct from [showInitializing] so users
+     * are not misled into thinking a background task is still running —
+     * nothing will run until they enable it from the Status panel.
+     */
     private fun showDisabled() {
         removeAll()
         emptyLabel.text = "<html><center>Jolli Memory is not enabled for this repository.<br/>" +

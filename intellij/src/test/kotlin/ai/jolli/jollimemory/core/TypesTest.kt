@@ -10,7 +10,24 @@ class TypesTest {
     inner class Enums {
         @Test
         fun `TranscriptSource has correct values`() {
-            TranscriptSource.entries.map { it.name } shouldBe listOf("claude", "codex", "gemini", "opencode", "cursor", "copilot", "copilot-chat")
+            // Must stay in lockstep with cli/src/Types.ts TRANSCRIPT_SOURCES. Order
+            // and count both matter: Gson reflection deserialises unknown enum names
+            // to Kotlin `null` via Unsafe, so any CLI source missing from this enum
+            // NPEs the sidebar on first render for users of that agent.
+            TranscriptSource.entries.map { it.name } shouldBe listOf(
+                "claude",
+                "codex",
+                "gemini",
+                "opencode",
+                "cursor",
+                "cursor-cli",
+                "copilot",
+                "copilot-chat",
+                "cline",
+                "cline-cli",
+                "devin",
+                "antigravity",
+            )
         }
 
         @Test

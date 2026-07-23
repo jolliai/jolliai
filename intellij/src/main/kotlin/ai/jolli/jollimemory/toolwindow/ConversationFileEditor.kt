@@ -133,23 +133,12 @@ class ConversationFileEditor(
 	private fun loadTranscript() {
 		ApplicationManager.getApplication().executeOnPooledThread {
 			val source = item.source
-			val session = SessionInfo(
-				sessionId = item.sessionId,
-				transcriptPath = item.transcriptPath,
-				updatedAt = item.updatedAt,
-				source = source,
-			)
 			val raw = TranscriptMessageCounter.loadUnreadTranscript(source, item.transcriptPath, cwd)
-			val overlay = ConversationOverlayStore.loadOverlay(
-				OverlayKey(cwd, source, item.sessionId),
-			)
-			val displayed = ConversationOverlayStore.applyOverlay(raw, overlay)
-			// For identity derivation: raw entries with deletes applied but edits NOT applied
-			val rawWithDeletesOnly = ConversationOverlayStore.applyDeletes(raw, overlay)
+			val view = ConversationOverlayStore.loadView(OverlayKey(cwd, source, item.sessionId), raw)
 
 			SwingUtilities.invokeLater {
-				rawEntries = rawWithDeletesOnly
-				displayEntries = displayed
+				rawEntries = view.rawWithDeletesOnly
+				displayEntries = view.displayed
 				editedContent.clear()
 				deletedIndices.clear()
 				renderEntries()
@@ -395,22 +384,17 @@ class ConversationFileEditor(
 
 		ApplicationManager.getApplication().executeOnPooledThread {
 			try {
-				val existing = ConversationOverlayStore.loadOverlay(key)
-				val (mergedDeletes, mergedEdits) = ConversationOverlayStore.mergeOverlay(
-					existing, newDeletes, newEdits,
-				)
-				ConversationOverlayStore.saveOverlay(key, mergedDeletes, mergedEdits)
+				ConversationOverlayStore.mergeAndSave(key, newDeletes, newEdits)
 
 				// Check if all entries are now deleted (auto-hide)
 				val raw = TranscriptMessageCounter.loadUnreadTranscript(source, item.transcriptPath, cwd)
-				val updatedOverlay = ConversationOverlayStore.loadOverlay(key)
-				val remaining = ConversationOverlayStore.applyOverlay(raw, updatedOverlay)
+				val remaining = ConversationOverlayStore.loadView(key, raw).displayed
 
 				SwingUtilities.invokeLater {
 					if (remaining.isEmpty()) {
 						// Auto-hide: dismiss the conversation and close the tab
 						ApplicationManager.getApplication().executeOnPooledThread {
-							HiddenConversationsStore.hideConversation(cwd, source, item.sessionId)
+							ConversationOverlayStore.hideConversation(cwd, source, item.sessionId)
 							SwingUtilities.invokeLater {
 								FileEditorManager.getInstance(project).closeFile(file)
 								onSaved?.invoke()

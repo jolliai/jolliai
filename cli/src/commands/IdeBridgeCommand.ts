@@ -13,19 +13,16 @@ import { DaemonWatcher } from "../daemon/DaemonWatcher.js";
 import { setLogDir } from "../Logger.js";
 import type { ConflictUi, Tier3Pick } from "../sync/ConflictResolver.js";
 import type { FileWrite, JolliMemoryConfig, TranscriptSource } from "../Types.js";
+import { TRANSCRIPT_SOURCES as ALL_TRANSCRIPT_SOURCES } from "../Types.js";
 import { readStdin } from "./CliUtils.js";
 
 type JsonObject = Record<string, unknown>;
 
-const TRANSCRIPT_SOURCES = new Set<TranscriptSource>([
-	"claude",
-	"codex",
-	"gemini",
-	"opencode",
-	"cursor",
-	"copilot",
-	"copilot-chat",
-]);
+// Derived from the SINGLE source of truth in Types.ts so a new transcript
+// source (Cline / Devin / Antigravity) becomes acceptable here automatically —
+// the pre-fix inline list drifted 7-vs-12 and made transcript/overlay actions
+// reject valid sources the aggregator was already emitting.
+const TRANSCRIPT_SOURCES: ReadonlySet<TranscriptSource> = new Set(ALL_TRANSCRIPT_SOURCES);
 
 function parseRequest(raw: string): JsonObject {
 	if (raw.trim().length === 0) return {};
@@ -233,6 +230,49 @@ async function runSessionStateAction(cwd: string, request: JsonObject): Promise<
 		case "worker-busy": {
 			const { getWorkerBusyState } = await import("../core/Locks.js");
 			return getWorkerBusyState(cwd);
+		}
+		case "acquire-lock": {
+			// Hold `plans.lock` on behalf of a two-phase IDE caller (Kotlin
+			// TranscriptReferenceDiscovery does load → mutate → save across three
+			// bridge calls and needs a shared mutex against the CLI's own
+			// StopHook / QueueWorker / Codex-tick writers, which all wrap their
+			// RMW in `withPlansLock`). The daemon process (this bridge) becomes
+			// the PID recorded in the lock file, so releaseIfOwned in the
+			// paired release-lock call correctly matches ownership.
+			//
+			// Concurrent acquire-lock calls to the SAME daemon+cwd serialize:
+			// `isPidAlive` short-circuits when the recorded PID is the daemon's
+			// own, so the second caller polls until the first releases (or the
+			// caller-supplied timeout fires). That is the intended behaviour —
+			// the same rule as `withPlansLock`'s "MUST NOT be nested".
+			const { join } = await import("node:path");
+			const { mkdir } = await import("node:fs/promises");
+			const { getJolliMemoryDir } = await import("../Logger.js");
+			const { acquireWithPoll } = await import("../core/LockPrimitives.js");
+			const { PLANS_LOCK_FILE, DEFAULT_PLANS_LOCK_TIMEOUT_MS, DEFAULT_PLANS_LOCK_POLL_MS } = await import(
+				"../core/Locks.js"
+			);
+			const dir = getJolliMemoryDir(cwd);
+			await mkdir(dir, { recursive: true });
+			const lockPath = join(dir, PLANS_LOCK_FILE);
+			const timeoutMs = optionalNumberField(request, "timeoutMs", DEFAULT_PLANS_LOCK_TIMEOUT_MS);
+			const pollMs = optionalNumberField(request, "pollMs", DEFAULT_PLANS_LOCK_POLL_MS);
+			const acquired = await acquireWithPoll(lockPath, { timeoutMs, pollMs });
+			return { acquired };
+		}
+		case "release-lock": {
+			// PID-checked release — the paired acquire-lock recorded this
+			// daemon's PID, so releaseIfOwned matches and removes the file.
+			// A stray release from a caller that never acquired (or whose
+			// acquire returned false) becomes a safe no-op because a
+			// different-PID owner short-circuits the delete.
+			const { join } = await import("node:path");
+			const { getJolliMemoryDir } = await import("../Logger.js");
+			const { releaseIfOwned } = await import("../core/LockPrimitives.js");
+			const { PLANS_LOCK_FILE } = await import("../core/Locks.js");
+			const lockPath = join(getJolliMemoryDir(cwd), PLANS_LOCK_FILE);
+			await releaseIfOwned(lockPath, PLANS_LOCK_FILE);
+			return { ok: true };
 		}
 		case "save-plugin-source":
 			await tracker.savePluginSource(cwd);
