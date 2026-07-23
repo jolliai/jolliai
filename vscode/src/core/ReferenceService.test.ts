@@ -365,6 +365,34 @@ describe("detectReferences", () => {
 		expect(result[0].description).toBe("body");
 	});
 
+	it("strips the auto-generated track-only note from the description snippet", async () => {
+		mockLoadPlansRegistry.mockResolvedValue({
+			version: 1,
+			plans: {},
+			references: { "linear:PROJ-1528": makeEntry() },
+		});
+		mockReadFileSync.mockReturnValue(
+			[
+				"---",
+				'source: "context7"',
+				"---",
+				"how to use jQuery.ajax()",
+				"",
+				"<!-- jolli:auto-note -->",
+				"",
+				"---",
+				"",
+				"> ℹ️ **This is a bookmark, not a full copy.** Context7's full response is intentionally not saved.",
+				"",
+			].join("\n"),
+		);
+		const result = await detectReferences("/repo");
+		// Only the query survives — the sentinel and note text must not leak into the snippet.
+		expect(result[0].description).toBe("how to use jQuery.ajax()");
+		expect(result[0].description).not.toContain("jolli:auto-note");
+		expect(result[0].description).not.toContain("bookmark");
+	});
+
 	it("skips a bad-shape fields list item (valid JSON, missing key/label/value)", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,

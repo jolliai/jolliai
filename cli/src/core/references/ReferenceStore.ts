@@ -34,6 +34,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createLogger, getJolliMemoryDir } from "../../Logger.js";
 import type { Reference, ReferenceField, SourceId } from "../../Types.js";
+import type { SourceDefinition } from "./SourceDefinition.js";
 import { getRegistry } from "./SourceDefinitionRegistry.js";
 
 const log = createLogger("ReferenceStore");
@@ -187,6 +188,62 @@ function stripBodyEdges(body: string): string {
 	return body.replace(/^\n+/, "").replace(/\n+$/, "");
 }
 
+/**
+ * Drop the auto-generated note (everything from {@link REFERENCE_NOTE_SENTINEL} onward)
+ * so it never round-trips into the stored `description`. Keyed on the sentinel's presence
+ * in the text — not on the source definition — so a reference whose source was later
+ * removed from the registry still parses back to the same body.
+ *
+ * LOCKSTEP: the VS Code-side reader (`vscode/src/core/ReferenceService.ts` `readFrontmatter`)
+ * strips the same sentinel before building its 200-char description snippet — keep both in sync.
+ */
+function stripReferenceNote(body: string): string {
+	const idx = body.indexOf(REFERENCE_NOTE_SENTINEL);
+	return idx === -1 ? body : body.slice(0, idx);
+}
+
+/**
+ * Sentinel opening the auto-generated human note for track-only / arguments-derived
+ * references. It's an HTML comment (invisible in rendered markdown) that acts as the
+ * cut point for the render↔parse round-trip: {@link renderMarkdown} appends everything
+ * from this line onward, {@link parseMarkdown} strips it back off before assigning
+ * `description`. Without the strip the note would fold into the stored body, get
+ * re-appended on the next render, and drift the {@link hashReferenceContent} guard —
+ * re-upserting + re-archiving the reference on every commit forever.
+ */
+const REFERENCE_NOTE_SENTINEL = "<!-- jolli:auto-note -->";
+
+/**
+ * Deterministic footer explaining why a track-only / arguments-derived reference stores
+ * so little content — a recurring point of user confusion ("why is the Context7 content
+ * so short — is it broken?"). `argumentsDerived` sources build the reference from the
+ * call arguments and discard the (prose) tool result, so the body is only the query;
+ * `trackOnly` sources are kept as context but never fed to the summary LLM. Returns "" for
+ * ordinary sources so their markdown is untouched.
+ *
+ * The note is emitted from the source definition alone (not from stored body text), so it
+ * is byte-identical across renders of the same source — the property the round-trip relies
+ * on. See {@link REFERENCE_NOTE_SENTINEL}.
+ */
+function referenceNote(def: SourceDefinition | undefined): string {
+	if (def === undefined || (def.argumentsDerived !== true && def.trackOnly !== true)) return "";
+	// One blockquote paragraph per relevant flag, joined with a `>` continuation line so
+	// they read as a single quote block. Built via an array (not conditional separators)
+	// so there is no separator branch to leave uncovered.
+	const paragraphs: string[] = [];
+	if (def.argumentsDerived === true) {
+		paragraphs.push(
+			`> ℹ️ **This is a bookmark, not a full copy.** Only the query and the ${def.label} link are recorded here — ${def.label}'s full response is intentionally not saved. This is expected behaviour, not a bug.`,
+		);
+	}
+	if (def.trackOnly === true) {
+		paragraphs.push(
+			"> _Track-only_ — this reference is kept as background context but is **not** used as a source when generating memory summaries.",
+		);
+	}
+	return [REFERENCE_NOTE_SENTINEL, "", "---", "", paragraphs.join("\n>\n")].join("\n");
+}
+
 function renderMarkdown(ref: Reference): string {
 	const lines: string[] = ["---"];
 	lines.push(`source: ${JSON.stringify(ref.source)}`);
@@ -210,6 +267,10 @@ function renderMarkdown(ref: Reference): string {
 	if (ref.description !== undefined) {
 		const body = stripBodyEdges(ref.description);
 		if (body.length > 0) lines.push(body);
+	}
+	const note = referenceNote(getRegistry().byId(ref.source));
+	if (note.length > 0) {
+		lines.push("", note);
 	}
 	return `${lines.join("\n")}\n`;
 }
@@ -239,7 +300,10 @@ function parseMarkdown(content: string): Reference | null {
 	if (closingIdx === -1) return null;
 
 	const frontmatter = lines.slice(1, closingIdx);
-	const body = stripBodyEdges(lines.slice(closingIdx + 1).join("\n"));
+	// Cut the auto-generated note (if any) before it can fold into `description`.
+	// renderMarkdown re-derives the note from the source definition on every render,
+	// so stripping it here keeps render→parse→render idempotent. See REFERENCE_NOTE_SENTINEL.
+	const body = stripBodyEdges(stripReferenceNote(lines.slice(closingIdx + 1).join("\n")));
 
 	const scalars: Record<string, string> = {};
 	const refFields: ReferenceField[] = [];
