@@ -1441,7 +1441,7 @@ name: jolli-remote-run
 description: Run a Jolli workflow remotely — the Jolli backend executes the workflow server-side; this recipe triggers the run, monitors it to completion, reports the outcome (failed / cancelled / succeeded) with its article, PR, and workflow links, and offers to open any in your browser. Use when the user wants to run a Jolli workflow remotely (on the Jolli backend).
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 3
+  revision: 4
   vendor: "jolli.ai"
 ---
 
@@ -1476,15 +1476,44 @@ Determine which workflow the user wants to run and keep its numeric \`id\`.
   text). Keep the chosen workflow's \`id\`.
 - Otherwise, ask the user which workflow to run and get its numeric \`id\`.
 
-## Step 2 — trigger the remote run
+## Step 2 — confirm the run monitor is installed (before triggering)
+
+The run trigger (\`run_remote_workflow\`) is a Jolli **backend** tool: it creates a
+real, budget-spending run **even when the deterministic monitor is not installed**.
+The monitor (\`workflow run-status\`, Step 4) is provided by the
+\`@jolli.ai/workflow-cli\` plugin. So confirm that plugin is present **before**
+triggering — otherwise a missing monitor would leave the run you are about to
+create orphaned (still running server-side, with no way for this recipe to report
+its outcome).
+
+Run the plugin's eligibility helper purely as a presence probe and read its JSON:
+
+\`\`\`bash
+"$HOME/.jolli/jollimemory/run-cli" workflow local-run
+\`\`\`
+
+- \`{ "type": "workflow_cli_required", "installHint": "..." }\` — the workflow-cli
+  plugin is **not installed**. Do **not** trigger the run. Tell the user to install
+  it (run the \`installHint\`) and stop:
+
+  \`\`\`bash
+  npm i -g @jolli.ai/cli @jolli.ai/workflow-cli
+  \`\`\`
+
+- **any other result** (\`workflows\`, \`space_cli_required\`, or \`error\`) — the plugin
+  **is** installed (only its stub ever emits \`workflow_cli_required\`), so the monitor
+  is available. Ignore the rest of this probe's output — it reports *local*-run
+  eligibility, which does not gate a remote run — and proceed to Step 3.
+
+## Step 3 — trigger the remote run
 
 Call the \`run_remote_workflow\` tool (on Claude Code
 \`mcp__jollimemory__run_remote_workflow\`) with the chosen workflow's id, passed as
 an **unquoted number**: \`{ "id": <workflow id> }\` (add \`templateVariables\` only if
 the workflow needs them). Capture \`runId\` from its result (\`{ "runId": "..." }\`) —
-that handle drives the monitor in Step 3.
+that handle drives the monitor in Step 4.
 
-## Step 3 — monitor the run to completion
+## Step 4 — monitor the run to completion
 
 Shell the deterministic monitor with the captured \`runId\`:
 
@@ -1517,7 +1546,7 @@ is not installed. Tell the user to install it and stop:
 npm i -g @jolli.ai/cli @jolli.ai/workflow-cli
 \`\`\`
 
-## Step 4 — report the outcome
+## Step 5 — report the outcome
 
 Report based on \`status\`:
 
@@ -1536,7 +1565,7 @@ Report based on \`status\`:
   the \`workflow\` URL so they can watch it, and note they can re-check later by
   re-running \`workflow run-status <runId>\`.
 
-## Step 5 — offer to open any reported URL
+## Step 6 — offer to open any reported URL
 
 Offer to open any URL from the report in the user's default browser. For each URL
 the user chooses, shell:

@@ -494,6 +494,24 @@ describe("jolli-remote-run template", () => {
 		expect(t).toContain("mcp__jollimemory__list_workflows");
 	});
 
+	it("preflights the workflow-cli monitor via the local-run probe BEFORE triggering the run", () => {
+		// The run trigger is a backend tool that spends budget even when the plugin
+		// monitor is absent, so the recipe must confirm the plugin is installed
+		// before calling run_remote_workflow — otherwise a missing monitor orphans a
+		// live run. The presence probe reuses `workflow local-run`, whose stub emits
+		// `workflow_cli_required` (the only signal that gates the run).
+		const t = buildRemoteRunSkillTemplate();
+		expect(t).toContain('"$HOME/.jolli/jollimemory/run-cli" workflow local-run');
+		expect(t).toContain("workflow_cli_required");
+		expect(t).toMatch(/Do \*\*not\*\* trigger the run/);
+		// The probe must precede the trigger both in step order and in the text.
+		const probeAt = t.indexOf('run-cli" workflow local-run');
+		const triggerAt = t.indexOf("Call the `run_remote_workflow` tool");
+		expect(probeAt).toBeGreaterThan(-1);
+		expect(triggerAt).toBeGreaterThan(-1);
+		expect(probeAt).toBeLessThan(triggerAt);
+	});
+
 	it("shells the deterministic workflow run-status monitor with the runId", () => {
 		const t = buildRemoteRunSkillTemplate();
 		expect(t).toContain('"$HOME/.jolli/jollimemory/run-cli" workflow run-status <runId>');
