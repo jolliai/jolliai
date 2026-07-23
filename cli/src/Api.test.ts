@@ -151,6 +151,13 @@ vi.mock("./core/localagent/ClaudeExecutableResolver.js", async (importOriginal) 
 vi.mock("./commands/OptionalLogin.js", () => ({
 	offerOptionalJolliLogin: vi.fn().mockResolvedValue(undefined),
 }));
+vi.mock("./commands/GenerationFix.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./commands/GenerationFix.js")>();
+	// Keep the real `canGenerateNow` predicate the enable flow depends on; spy only
+	// the interactive repair ladder so tests can assert whether it ran. The
+	// ladder's own behavior is covered end-to-end in GuidedFrontDoor.test.ts.
+	return { ...actual, promptGenerationFix: vi.fn().mockResolvedValue(false) };
+});
 
 vi.mock("./hooks/PushCompensation.js", () => ({
 	triggerPendingPushRetry: vi.fn().mockResolvedValue(undefined),
@@ -3714,6 +3721,76 @@ describe("CLI", () => {
 				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
 				vi.mocked(isClaudeCodeUsable).mockReturnValue(false);
 				vi.mocked(loadConfig).mockResolvedValue({});
+			}
+		});
+
+		it("enable repair: local-agent configured but claude broken → repair ladder only, no provider menu", async () => {
+			const { promptGenerationFix } = await import("./commands/GenerationFix.js");
+			const { loadConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(promptGenerationFix).mockClear();
+			vi.mocked(console.log).mockClear();
+			// isClaudeCodeUsable stays false (module default) → local-agent can't generate,
+			// so this configured-but-broken state must go STRAIGHT to the repair ladder.
+			vi.mocked(loadConfig).mockResolvedValue({ aiProvider: "local-agent" });
+			mockUserInput();
+			mockExistsSync.mockReturnValue(false);
+			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+
+			try {
+				await main(["enable"]);
+				expect(promptGenerationFix).toHaveBeenCalled();
+				// Double-menu avoided: promptSetup is skipped, so its provider menu never
+				// prints — the user sees the repair ladder alone, not two menus.
+				const logs = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+				expect(logs.some((l) => l.includes("How would you like to generate summaries"))).toBe(false);
+			} finally {
+				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
+				vi.mocked(loadConfig).mockResolvedValue({});
+			}
+		});
+
+		it("enable repair: provider set, no key but signed in → runs the repair ladder", async () => {
+			const { promptGenerationFix } = await import("./commands/GenerationFix.js");
+			const { loadConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(promptGenerationFix).mockClear();
+			// aiProvider=anthropic with no key → can't generate; a stored authToken is a
+			// credential, so the ladder must run rather than finish silently broken.
+			// Clear ANTHROPIC_API_KEY so a var in the runner's env can't make
+			// canGenerateNow report "anthropic-env" and skip the ladder.
+			const origKey = process.env.ANTHROPIC_API_KEY;
+			delete process.env.ANTHROPIC_API_KEY;
+			vi.mocked(loadConfig).mockResolvedValue({ aiProvider: "anthropic", authToken: "tok" });
+			mockUserInput();
+			mockExistsSync.mockReturnValue(false);
+			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+
+			try {
+				await main(["enable"]);
+				expect(promptGenerationFix).toHaveBeenCalled();
+			} finally {
+				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
+				vi.mocked(loadConfig).mockResolvedValue({});
+				if (origKey !== undefined) process.env.ANTHROPIC_API_KEY = origKey;
+			}
+		});
+
+		it("enable repair: nothing configured (skipped setup) → ladder NOT run, no nudge", async () => {
+			const { promptGenerationFix } = await import("./commands/GenerationFix.js");
+			const { offerOptionalJolliLogin } = await import("./commands/OptionalLogin.js");
+			vi.mocked(promptGenerationFix).mockClear();
+			vi.mocked(offerOptionalJolliLogin).mockClear();
+			// loadConfig stays {} (default) → no credential and no engine: nothing to
+			// repair, and nothing to sync, so neither prompt fires.
+			mockUserInput("3");
+			mockExistsSync.mockReturnValue(false);
+			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+
+			try {
+				await main(["enable"]);
+				expect(promptGenerationFix).not.toHaveBeenCalled();
+				expect(offerOptionalJolliLogin).not.toHaveBeenCalled();
+			} finally {
+				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
 			}
 		});
 

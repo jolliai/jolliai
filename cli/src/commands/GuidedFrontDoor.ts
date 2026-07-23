@@ -20,12 +20,9 @@
  */
 
 import { basename } from "node:path";
-import { getJolliUrl, loadAuthToken } from "../auth/AuthConfig.js";
-import { browserLogin } from "../auth/Login.js";
-import { validateJolliApiKey } from "../core/JolliApiUtils.js";
+import { loadAuthToken } from "../auth/AuthConfig.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
-import { isClaudeCodeUsable } from "../core/localagent/ClaudeExecutableResolver.js";
-import { getGlobalConfigDir, loadConfig, saveConfigScoped } from "../core/SessionTracker.js";
+import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { getSummaryCount, setActiveStorage } from "../core/SummaryStore.js";
 import { track } from "../core/Telemetry.js";
@@ -33,10 +30,10 @@ import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
 import { isGitHookInstalled } from "../install/GitHookInstaller.js";
 import { install } from "../install/Installer.js";
 import { setLogDir } from "../Logger.js";
-import type { JolliMemoryConfig } from "../Types.js";
 import { runBackfillFrontDoorStep } from "./BackfillFrontDoorStep.js";
 import { isAffirmative, isInsideGitWorkTree, promptText, resolveProjectDir } from "./CliUtils.js";
 import { promptSetup } from "./EnableCommand.js";
+import { canGenerateNow, promptGenerationFix } from "./GenerationFix.js";
 import { offerOptionalJolliLogin } from "./OptionalLogin.js";
 import { runSpaceSyncStep } from "./SpaceSyncStep.js";
 
@@ -70,21 +67,6 @@ function siteHost(jolliUrl: string | undefined): string | undefined {
 	} catch {
 		return undefined;
 	}
-}
-
-/**
- * Whether summaries can be generated with the current config. Mirrors
- * `resolveLlmCredentialSource`, EXCEPT for the local agent: that resolver returns
- * "local-agent" unconditionally (it never probes the binary), so here we
- * additionally verify `claude` is actually runnable — this is what surfaces a
- * broken local agent (R3) on the interactive path instead of at commit time.
- */
-function canGenerateNow(config: JolliMemoryConfig): boolean {
-	// Probe the SAME binary the commit-time runtime would use — honor an explicit
-	// localAgentPath, else default PATH discovery — so this never disagrees with
-	// what actually generates summaries.
-	if (config.aiProvider === "local-agent") return isClaudeCodeUsable({ overridePath: config.localAgentPath });
-	return resolveLlmCredentialSource(config) !== null;
 }
 
 /**
@@ -234,7 +216,9 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	await runSpaceSyncStep(cwd);
 	triggerPendingPushRetry(cwd, "cli-front-door");
 
-	// ── Closing: only promise "listening" when generation works. ──
+	// ── Closing: only promise "listening" when generation actually works. The
+	// back-fill offer and the listening line stay gated on canGenerate so we never
+	// claim to be capturing memories with no engine to build them. ──
 	if (canGenerate) {
 		// Cold-start back-fill offer (unchanged). Best-effort — never throws.
 		await runBackfillFrontDoorStep(cwd);
@@ -243,154 +227,25 @@ export async function runGuidedFrontDoor(): Promise<void> {
 			summaryCount === 0
 				? "Jolli is listening — your next commit is your first memory"
 				: "Jolli is listening — last memory saved.";
-		console.log(`\n  ${listening}\n`);
-
-		// Next steps only on a fresh setup (onboarding ran this run) — a returning
-		// user doesn't need the orientation again, and the not-a-repo / not-enabled
-		// dead ends never reach here.
-		if (ranOnboarding) printNextSteps();
+		console.log(`\n  ${listening}`);
 	}
+
+	// Next steps orientation — printed on EVERY path that reaches here, for new
+	// and returning users alike and whether or not generation is configured
+	// (unlike the listening line above, it makes no promise that could be false).
+	// The ONLY states that never show Next steps are the three early-return dead
+	// ends earlier in this function, none of which reach this line:
+	//   1. not a git repository        → returned early with exitCode 1
+	//   2. enable declined at the [Y/n] prompt → returned early (a valid choice)
+	//   3. install failure             → returned early with exitCode 1
+	printNextSteps();
 }
 
-/** Prints the one-time orientation shown after a successful first-run setup. */
+/** Prints the closing orientation shown on every non-dead-end front-door run. */
 function printNextSteps(): void {
-	console.log("  Next steps");
+	console.log("\n  Next steps");
 	console.log("    1. Keep working in your agent — every commit becomes a memory, automatically.");
 	console.log("    2. Reach back: jolli recall · jolli search · jolli compile · jolli graph · jolli mcp");
 	console.log("    3. In your editor: add the VS Code extension or IntelliJ plugin.");
 	console.log("    4. See all commands: jolli help\n");
-}
-
-/**
- * Reached only when generation is broken while a credential exists. Routes to the
- * local-agent repair (R3) when the provider is the local agent, else the
- * anthropic/jolli key-mismatch repair (R1/R2). Returns whether generation can now
- * proceed. The provider is only ever changed by an explicit choice here.
- */
-async function promptGenerationFix(config: JolliMemoryConfig): Promise<boolean> {
-	const configDir = getGlobalConfigDir();
-
-	// R3: the local agent is configured but `claude` isn't runnable.
-	if (config.aiProvider === "local-agent") {
-		return promptLocalAgentFix(configDir, config.localAgentPath);
-	}
-
-	const provider = config.aiProvider === "jolli" ? "jolli" : "anthropic";
-	const providerName = provider === "jolli" ? "Jolli" : "Anthropic";
-	const hasJolliKey = Boolean(config.jolliApiKey);
-	const hasAnthropicKey = Boolean(config.apiKey || process.env.ANTHROPIC_API_KEY);
-	// The *other* provider already has a key → switching to it fixes generation
-	// with no typing. Symmetric: covers both provider directions.
-	const otherHasKey = provider === "anthropic" ? hasJolliKey : hasAnthropicKey;
-	const otherProvider = provider === "anthropic" ? "jolli" : "anthropic";
-	const otherName = otherProvider === "jolli" ? "Jolli" : "Anthropic";
-	const enterKeyLabel = provider === "anthropic" ? "an Anthropic key" : "a Jolli key";
-	const enterMissingKey = (): Promise<boolean> =>
-		provider === "anthropic" ? promptAndSaveAnthropicKey(configDir) : promptAndSaveJolliKey(configDir);
-
-	console.log(
-		`\n  AI provider is set to ${providerName} but no ${providerName} key is available — memories won't be generated.\n`,
-	);
-
-	if (otherHasKey) {
-		const switchHint = otherProvider === "jolli" ? "use your sign-in" : "use existing key";
-		console.log(`    1. Switch to ${otherName} (${switchHint})`);
-		console.log(`    2. Enter ${enterKeyLabel}`);
-		console.log("    3. Skip for now");
-		const choice = (await promptText("\n  Choice [1]: ")) || "1";
-		if (choice === "3") {
-			console.log("\n  Skipped. Set a key in settings or run `jolli configure` later.\n");
-			return false;
-		}
-		if (choice === "1") {
-			await saveConfigScoped({ aiProvider: otherProvider }, configDir);
-			console.log(`\n  ✓ switched to ${otherName}`);
-			return true;
-		}
-		return enterMissingKey();
-	}
-
-	console.log(`    1. Enter ${enterKeyLabel}`);
-	console.log("    2. Skip for now");
-	const choice = (await promptText("\n  Choice [1]: ")) || "1";
-	if (choice === "2") {
-		console.log("\n  Skipped. Set a key in settings or run `jolli configure` later.\n");
-		return false;
-	}
-	return enterMissingKey();
-}
-
-/**
- * R3 repair: the provider is Local Agent but no usable `claude` was found.
- * Offers a retry (re-probe once), or a switch to Jolli / Anthropic, or skip.
- * Every branch terminates — no infinite retry loop. Returns whether generation
- * can now proceed.
- */
-async function promptLocalAgentFix(configDir: string, localAgentPath: string | undefined): Promise<boolean> {
-	console.log(
-		"\n  AI provider is set to Local Agent but no usable `claude` was found — memories won't be generated.\n",
-	);
-	console.log("    1. Retry (after install / upgrade, or `claude login`)");
-	console.log("    2. Switch to Jolli (sign in)");
-	console.log("    3. Enter an Anthropic key");
-	console.log("    4. Skip for now");
-	const choice = (await promptText("\n  Choice [1]: ")) || "1";
-
-	if (choice === "4") {
-		console.log("\n  Skipped. Fix Claude Code or run `jolli configure` later.\n");
-		return false;
-	}
-	if (choice === "2") {
-		try {
-			await browserLogin(getJolliUrl());
-		} catch (err) {
-			console.error(`\n  Login failed: ${err instanceof Error ? err.message : String(err)}\n`);
-			return false;
-		}
-		// Sign-in preserves an explicit local-agent choice (AuthConfig guard), so
-		// switching the engine to Jolli must be set explicitly here.
-		await saveConfigScoped({ aiProvider: "jolli" }, configDir);
-		console.log("\n  ✓ switched to Jolli");
-		return true;
-	}
-	if (choice === "3") {
-		return promptAndSaveAnthropicKey(configDir);
-	}
-	// choice 1 — retry the probe exactly once, then stop.
-	if (isClaudeCodeUsable({ overridePath: localAgentPath })) {
-		console.log("\n  ✓ Claude Code is working now.");
-		return true;
-	}
-	console.log("\n  Still no usable `claude`. Fix it and run `jolli` again, or `jolli configure`.\n");
-	return false;
-}
-
-/** Prompts for an Anthropic API key, saves it, and pins the provider to Anthropic. Returns whether a key was saved. */
-async function promptAndSaveAnthropicKey(configDir: string): Promise<boolean> {
-	const key = await promptText("\n  Anthropic API Key (press Enter to skip): ");
-	if (!key) {
-		console.log("  Skipped. Set a key in settings or run `jolli configure` later.\n");
-		return false;
-	}
-	await saveConfigScoped({ apiKey: key, aiProvider: "anthropic" }, configDir);
-	console.log("\n  ✓ Anthropic key saved");
-	return true;
-}
-
-/** Prompts for a Jolli API key, validates + saves it, and pins the provider to Jolli. Returns whether a key was saved. */
-async function promptAndSaveJolliKey(configDir: string): Promise<boolean> {
-	const key = await promptText("\n  Jolli API Key (press Enter to skip): ");
-	if (!key) {
-		console.log("  Skipped. Set a key in settings or run `jolli configure` later.\n");
-		return false;
-	}
-	try {
-		validateJolliApiKey(key);
-	} catch (err) {
-		console.error(`\n  Error: ${(err as Error).message}\n`);
-		return false;
-	}
-	await saveConfigScoped({ jolliApiKey: key, aiProvider: "jolli" }, configDir);
-	console.log("\n  ✓ Jolli key saved");
-	return true;
 }
