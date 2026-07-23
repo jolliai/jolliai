@@ -12,7 +12,7 @@
 
     <description><![CDATA[
         AI-powered commit summaries and smart git operations.<br/>
-        Automatically captures your AI coding conversations (Claude Code, Gemini CLI, Codex)
+        Automatically captures your AI coding conversations (Claude Code, Gemini, Codex)
         and generates structured summaries for each commit — so you always remember <em>why</em>.
         <br/><br/>
         <a href="https://github.com/jolliai/jolliai">Source Code</a> |

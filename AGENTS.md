@@ -120,7 +120,7 @@ Hook installation uses dist-path indirection: hooks call `node "$($HOME/.jolli/j
 |------|-------|-------------|--------|
 | Claude Code | repo | `.mcp.json` in the project root | `registerMcpInClaude` (custom merge — preserves other servers) |
 | Cursor | repo | `.cursor/mcp.json` in the project root | `JsonMcpWriter` |
-| Gemini CLI | global | `~/.gemini/settings.json` | `JsonMcpWriter` |
+| Gemini | global | `~/.gemini/settings.json` | `JsonMcpWriter` |
 | Codex | global | `~/.codex/config.toml` | `CodexTomlWriter` (hand-written TOML — no external TOML lib) |
 | OpenCode | global | `~/.config/opencode/opencode.json` | `JsonMcpWriter` (key `mcp`; entry needs `type:"local"` + combined command array) |
 | GitHub Copilot CLI | global | `~/.copilot/mcp-config.json` | `JsonMcpWriter` |

@@ -100,8 +100,8 @@ class SettingsDialog(
 
     // ── Tab 4: General ─────────────────────────────────────────────────────
     private val claudeEnabledCheckbox = JBCheckBox("Claude Code — Session tracking via Stop hook", true)
-    private val codexEnabledCheckbox = JBCheckBox("Codex CLI — Session discovery via filesystem scan", true)
-    private val geminiEnabledCheckbox = JBCheckBox("Gemini CLI — Session tracking via AfterAgent hook", true)
+    private val codexEnabledCheckbox = JBCheckBox("Codex — Session discovery via filesystem scan", true)
+    private val geminiEnabledCheckbox = JBCheckBox("Gemini — Session tracking via AfterAgent hook", true)
     private val openCodeEnabledCheckbox = JBCheckBox("OpenCode — Session discovery via SQLite database scan", true)
     private val cursorEnabledCheckbox = JBCheckBox("Cursor IDE — Composer session discovery via SQLite database scan", true)
     private val copilotEnabledCheckbox = JBCheckBox("GitHub Copilot — CLI session-store scan + VS Code Chat workspace storage", true)

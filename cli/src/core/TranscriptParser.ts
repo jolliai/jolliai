@@ -2,12 +2,12 @@
  * Transcript Parser — Strategy Pattern for Multi-Agent JSONL Parsing
  *
  * Defines a common interface for parsing transcript lines from different
- * AI coding agents (Claude Code, OpenAI Codex CLI). Each agent produces
+ * AI coding agents (Claude Code, OpenAI Codex). Each agent produces
  * JSONL files with different event schemas; this module normalizes them
  * into a unified TranscriptEntry format for downstream processing.
  *
  * Claude Code format: { message: { role, content }, timestamp?, isCompactSummary? }
- * Codex CLI format:   { timestamp, type, payload: { type, message, ... } }
+ * Codex format:   { timestamp, type, payload: { type, message, ... } }
  */
 
 import { createLogger } from "../Logger.js";
@@ -101,7 +101,7 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 }
 
 /**
- * OpenAI Codex CLI transcript parser.
+ * OpenAI Codex transcript parser.
  *
  * Extracts user and assistant messages from the Codex JSONL event stream.
  * Only parses `event_msg` events with `user_message` and `agent_message`

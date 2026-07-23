@@ -4,7 +4,7 @@
 
 **Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort.
 
-When you work with AI agents like Claude Code, Codex, or Gemini CLI, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+When you work with AI agents like Claude Code, Codex, or Gemini, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
 ---
 
@@ -35,8 +35,8 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | Agent | How sessions are tracked |
 | -- | -- |
 | **Claude Code** | A lightweight `StopHook` fires after each AI response |
-| **Gemini CLI** | An `AfterAgent` hook fires after each agent completion |
-| **Codex CLI** | No hook needed — sessions are discovered automatically by scanning the filesystem |
+| **Gemini** | An `AfterAgent` hook fires after each agent completion |
+| **Codex** | No hook needed — sessions are discovered automatically by scanning the filesystem |
 
 ### Git Hooks — generating summaries on commit
 

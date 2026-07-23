@@ -4,7 +4,7 @@
 
 **Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort.
 
-When you work with AI agents like Claude Code, Codex, Gemini CLI, OpenCode, Cursor IDE, GitHub Copilot CLI, or VS Code Copilot Chat, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+When you work with AI agents like Claude Code, Codex, Gemini, OpenCode, Cursor IDE, GitHub Copilot CLI, or VS Code Copilot Chat, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
 ---
 
@@ -63,8 +63,8 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | Agent | How sessions are tracked |
 | -- | -- |
 | **Claude Code** | A lightweight `StopHook` fires after each AI response; a `SessionStartHook` injects a mini-briefing at session start |
-| **Gemini CLI** | An `AfterAgent` hook fires after each agent completion |
-| **Codex CLI** | No hook needed — sessions are discovered automatically by scanning the filesystem |
+| **Gemini** | An `AfterAgent` hook fires after each agent completion |
+| **Codex** | No hook needed — sessions are discovered automatically by scanning the filesystem |
 | **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database (requires a host VS Code with Node 22.5+) |
 | **Cursor IDE** (Composer) | No hook needed — sessions are discovered automatically by reading Cursor's SQLite stores at `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (macOS; equivalent paths on Linux/Windows) and the corresponding per-workspace `workspaceStorage/` databases |
 | **GitHub Copilot CLI** | No hook needed — sessions are discovered automatically by scanning the Copilot CLI session log |
@@ -227,7 +227,7 @@ Click the gear icon (`$(gear)`) in the view's title bar (or any **Open Settings*
 | Tab | What it controls |
 | -- | -- |
 | **AI Agents** | Per-source toggles for Claude / Codex / Gemini / OpenCode / Cursor / Copilot session tracking. Copilot CLI and VS Code Copilot Chat share a single switch. A **Global Instructions** toggle controls whether Jolli adds its "prefer these skills" note to your machine-global AI instruction files (`~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`, `~/.codex/AGENTS.md`) — off until you turn it on (or accept the one-time notice shown when you enable), and turning it off removes the note. |
-| **AI Summary** | **Provider** dropdown (**Anthropic** / **Jolli** / **Local Agent (subscription)**). The Anthropic card holds `apiKey`, `model`, and `maxTokens`. The Jolli card shows your sign-in state — *Signed-in & ready*, *Signed-in but missing key*, or *Signed-out* — and exposes `jolliApiKey` under an **Advanced** disclosure for power users. The Local Agent card selects the agent tool (`localAgentTool`, currently Claude Code) and drives that CLI's own subscription login — no API key needed. |
+| **AI Summary** | **Provider** dropdown (**Anthropic** / **Jolli** / **Local Agent**). The Anthropic card holds `apiKey`, `model`, and `maxTokens`. The Jolli card shows your sign-in state — *Signed-in & ready*, *Signed-in but missing key*, or *Signed-out* — and exposes `jolliApiKey` under an **Advanced** disclosure for power users. The Local Agent card selects the agent tool (`localAgentTool`, currently Claude Code) and drives that CLI's own subscription login — no API key needed. |
 | **Sync to Jolli** | Sign-in / sign-out for pushing memories to your Jolli Space. |
 | **Memory Bank** | The on-disk Markdown copy of your memories: pick a folder via **Browse…**, then optionally click **Migrate to Memory Bank** to re-migrate the current repo into a fresh `-N`-suffixed folder (the previous folder is left untouched). |
 | **Others** | `excludePatterns` for the Changes section in the Branch tab, plus the **DCO sign-off** toggle — when on, **AI Commit** appends `Signed-off-by: <user.name> <user.email>` to its generated commit messages so they pass a DCO-gated CI without manual editing. Off by default. |
@@ -304,8 +304,8 @@ Most settings live behind the gear icon in the view's title bar. `authToken` is 
 | `authToken` | string | — | OAuth token set automatically by **Sign In to Jolli** — not edited manually |
 | `logLevel` | enum | `info` | Verbosity of `debug.log`: `debug`, `info`, `warn`, `error` (set via `jolli configure` CLI) |
 | `claudeEnabled` | boolean | auto-detect | Enable Claude Code session tracking |
-| `codexEnabled` | boolean | auto-detect | Enable Codex CLI session discovery |
-| `geminiEnabled` | boolean | auto-detect | Enable Gemini CLI session tracking |
+| `codexEnabled` | boolean | auto-detect | Enable Codex session discovery |
+| `geminiEnabled` | boolean | auto-detect | Enable Gemini session tracking |
 | `openCodeEnabled` | boolean | auto-detect | Enable OpenCode session discovery (requires a host VS Code with Node 22.5+) |
 | `cursorEnabled` | boolean | auto-detect | Enable Cursor IDE (Composer) session discovery |
 | `copilotEnabled` | boolean | auto-detect | Enable GitHub Copilot CLI **and** VS Code Copilot Chat session discovery (single shared switch) |

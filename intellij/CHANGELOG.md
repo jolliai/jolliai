@@ -145,8 +145,8 @@
 ### AI Agent Support
 
 - **Claude Code** — StopHook after each response, SessionStartHook briefing at startup
-- **Gemini CLI** — AfterAgent hook after each agent completion
-- **Codex CLI** — automatic filesystem discovery, no hook needed
+- **Gemini** — AfterAgent hook after each agent completion
+- **Codex** — automatic filesystem discovery, no hook needed
 - **OpenCode** — session discovery via SQLite database scan
 - **Cursor IDE** — Composer session discovery via SQLite database scan
 - **GitHub Copilot CLI & Copilot Chat** — session discovery via filesystem scan

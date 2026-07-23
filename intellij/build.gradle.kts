@@ -80,7 +80,7 @@ intellijPlatform {
                 development documentation attached to every commit, without any extra effort.
             </p>
             <p>
-                When you work with AI agents like <b>Claude Code</b>, <b>Codex</b>, or <b>Gemini CLI</b>,
+                When you work with AI agents like <b>Claude Code</b>, <b>Codex</b>, or <b>Gemini</b>,
                 the reasoning behind every decision lives in the conversation &mdash;
                 <em>why this approach was chosen, what alternatives were considered, what problems came up along the way</em>.
                 The moment you commit, that context is gone. Jolli Memory captures it automatically.
@@ -123,8 +123,8 @@ intellijPlatform {
             <h3>Multi-Agent Support</h3>
             <table>
                 <tr><td><b>Claude Code</b></td><td>StopHook after each response + SessionStartHook briefing at startup</td></tr>
-                <tr><td><b>Gemini CLI</b></td><td>AfterAgent hook after each agent completion</td></tr>
-                <tr><td><b>Codex CLI</b></td><td>Automatic filesystem discovery &mdash; no hook needed</td></tr>
+                <tr><td><b>Gemini</b></td><td>AfterAgent hook after each agent completion</td></tr>
+                <tr><td><b>Codex</b></td><td>Automatic filesystem discovery &mdash; no hook needed</td></tr>
             </table>
 
             <h3>Tool Window</h3>

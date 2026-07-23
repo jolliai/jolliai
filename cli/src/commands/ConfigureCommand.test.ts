@@ -192,11 +192,22 @@ describe("ConfigureCommand — settable keys", () => {
 		);
 	});
 
+	it("accepts all four localAgentTool ids (claude-code, codex, cursor-agent, opencode)", async () => {
+		// Widened from a claude-code-only allowlist now that Codex, Cursor, and
+		// OpenCode backends are registered too — the CLI must let users pick any
+		// of them via `configure --set`, not just hand-edit config.json.
+		for (const tool of ["claude-code", "codex", "cursor-agent", "opencode"]) {
+			mockSaveConfig.mockClear();
+			await runConfigure(["--set", `localAgentTool=${tool}`]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ localAgentTool: tool }));
+		}
+	});
+
 	it("rejects localAgentTool values that aren't in the allowlist", async () => {
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		const prevExitCode = process.exitCode;
 		try {
-			await runConfigure(["--set", "localAgentTool=codex"]);
+			await runConfigure(["--set", "localAgentTool=windsurf"]);
 			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("claude-code"));
 			expect(process.exitCode).toBe(1);
 			expect(mockSaveConfig).not.toHaveBeenCalled();
@@ -204,6 +215,20 @@ describe("ConfigureCommand — settable keys", () => {
 			errorSpy.mockRestore();
 			process.exitCode = prevExitCode;
 		}
+	});
+
+	it("accepts localAgentModel as a free-form string key, including an empty string", async () => {
+		await runConfigure(["--set", "localAgentModel=gpt-5-codex"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ localAgentModel: "gpt-5-codex" }));
+
+		mockSaveConfig.mockClear();
+		await runConfigure(["--set", "localAgentModel="]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ localAgentModel: "" }));
+	});
+
+	it("lists localAgentModel in --list-keys output", async () => {
+		const help = await runConfigureHelp();
+		expect(help).toContain("localAgentModel");
 	});
 
 	it("rejects aiProvider values that aren't in the allowlist", async () => {

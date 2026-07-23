@@ -9,7 +9,7 @@
 
 **Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, with no extra effort.
 
-When you work with AI agents (Claude Code, Codex, Gemini CLI, OpenCode, Cursor, GitHub Copilot CLI, or VS Code Copilot Chat), the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were weighed, what went wrong along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+When you work with AI agents (Claude Code, Codex, Gemini, OpenCode, Cursor, GitHub Copilot CLI, or VS Code Copilot Chat), the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were weighed, what went wrong along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
 ![Asking an AI agent "why do we retry with exponential backoff instead of a fixed delay?" and it answers from Jolli Memory, citing the commit where the decision was made](docs/media/ask-your-agent.gif)
 
@@ -50,7 +50,7 @@ Prefer an in-editor panel? The same memories show up in the [VS Code extension](
 ## What you get
 
 - **Never lose the _why_.** Every commit gets a structured memory: the trigger behind the change, the decisions and trade-offs, and what was actually built.
-- **Works with 7 AI agents.** Claude Code, Codex, Gemini CLI, OpenCode, Cursor (Composer), GitHub Copilot CLI, and VS Code Copilot Chat. Sessions are detected automatically, no per-tool setup.
+- **Works with 7 AI agents.** Claude Code, Codex, Gemini, OpenCode, Cursor (Composer), GitHub Copilot CLI, and VS Code Copilot Chat. Sessions are detected automatically, no per-tool setup.
 - **Ask your agent about past work.** `jolli mcp` exposes your history over the Model Context Protocol (9 tools: search, recall a branch, trace a decision's timeline, list branches, draft a PR description, and more), so your agent can answer "how did we handle X?" and draft PRs without leaving the chat. Registered automatically when you enable.
 - **Catch up on history.** `jolli backfill` writes memories for commits you made before installing Jolli.
 - **Knowledge wiki and graph.** `jolli compile` folds work scattered across many commits into per-topic pages; `jolli graph` renders them as an interactive, shareable map of decisions and how they connect. Both build in the background.

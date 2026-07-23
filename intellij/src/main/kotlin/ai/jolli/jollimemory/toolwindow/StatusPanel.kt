@@ -117,13 +117,13 @@ class StatusPanel(
         val hookParts = mutableListOf<String>()
         if (status.gitHookInstalled) hookParts.add("5 Git")
         if (status.claudeHookInstalled) hookParts.add("2 Claude")
-        if (status.geminiHookInstalled) hookParts.add("1 Gemini CLI")
+        if (status.geminiHookInstalled) hookParts.add("1 Gemini")
         val hooksDescription = if (hookParts.isNotEmpty()) hookParts.joinToString(" + ") else "none installed"
         val hooksTooltip = listOf(
             "Git hooks: ${if (status.gitHookInstalled) "5 installed" else "not installed"} " +
                 "(post-commit, post-rewrite, prepare-commit-msg, post-merge, pre-push)",
             "Claude Code hooks: ${if (status.claudeHookInstalled) "2 installed" else "not installed"} (Stop, SessionStart)",
-            "Gemini CLI hook: ${if (status.geminiHookInstalled) "installed" else "not installed"} (AfterAgent)",
+            "Gemini hook: ${if (status.geminiHookInstalled) "installed" else "not installed"} (AfterAgent)",
         ).joinToString("\n")
         listModel.addElement(StatusRow(
             icon = if (status.gitHookInstalled) Icon.OK else Icon.ERROR,
@@ -188,8 +188,8 @@ class StatusPanel(
                 enabled = enabled,
                 hookInstalled = null,
                 label = "Codex Integration",
-                enabledTooltip = "Codex CLI sessions directory found — session discovery is enabled",
-                disabledTooltip = "Codex CLI detected but session discovery is disabled in config",
+                enabledTooltip = "Codex sessions directory found — session discovery is enabled",
+                disabledTooltip = "Codex detected but session discovery is disabled in config",
                 hookMissingTooltip = null,
             )
         }
@@ -202,9 +202,9 @@ class StatusPanel(
                 enabled = enabled,
                 hookInstalled = status.geminiHookInstalled,
                 label = "Gemini Integration",
-                enabledTooltip = "Gemini CLI AfterAgent hook installed — session tracking is enabled",
-                disabledTooltip = "Gemini CLI detected but session tracking is disabled in config",
-                hookMissingTooltip = "Gemini CLI detected but AfterAgent hook is not installed",
+                enabledTooltip = "Gemini AfterAgent hook installed — session tracking is enabled",
+                disabledTooltip = "Gemini detected but session tracking is disabled in config",
+                hookMissingTooltip = "Gemini detected but AfterAgent hook is not installed",
             )
         }
 

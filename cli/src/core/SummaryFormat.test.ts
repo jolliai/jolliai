@@ -586,4 +586,33 @@ describe("formatProviderLabel", () => {
 		};
 		expect(formatProviderLabel(s as never)).toBe("mixed: Anthropic, Jolli proxy");
 	});
+	it("renders the specific local-agent tool in the footer", () => {
+		const summary = {
+			llm: {
+				model: "m",
+				inputTokens: 1,
+				outputTokens: 1,
+				apiLatencyMs: 1,
+				stopReason: null,
+				source: "local-agent",
+				localAgentTool: "cursor-agent",
+			},
+			children: [],
+		} as unknown as CommitSummary;
+		expect(formatProviderLabel(summary)).toBe("Local agent - Cursor");
+	});
+	it("falls back to bare 'Local agent' when the tool is absent (old summary)", () => {
+		const summary = {
+			llm: {
+				model: "m",
+				inputTokens: 1,
+				outputTokens: 1,
+				apiLatencyMs: 1,
+				stopReason: null,
+				source: "local-agent",
+			},
+			children: [],
+		} as unknown as CommitSummary;
+		expect(formatProviderLabel(summary)).toBe("Local agent");
+	});
 });

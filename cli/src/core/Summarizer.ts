@@ -201,6 +201,7 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 		apiLatencyMs: llmResult.apiLatencyMs,
 		stopReason: llmResult.stopReason ?? null,
 		source: llmResult.source,
+		localAgentTool: llmResult.localAgentTool,
 	};
 	if (!isFormatCompliant(responseText)) {
 		log.error("=== LLM raw response (format-incompliant) START ===");
@@ -245,6 +246,7 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 					// is identical — pull from the retry result rather than the
 					// initial llmMeta to keep the construction local & explicit.
 					source: retryResult.source,
+					localAgentTool: retryResult.localAgentTool,
 				};
 			} else {
 				log.warn("Strict-retry response was also format-incompliant -- accepting first-response result");
@@ -1404,6 +1406,7 @@ export async function generateSquashConsolidation(
 			apiLatencyMs: llmResult.apiLatencyMs,
 			stopReason: llmResult.stopReason ?? null,
 			source: llmResult.source,
+			localAgentTool: llmResult.localAgentTool,
 		};
 		return { responseText, parsed, llm };
 	};
@@ -1472,6 +1475,7 @@ export async function generateSquashConsolidation(
 					// Same credentials across both calls; strict.llm.source is
 					// equal to first.llm.source by construction (callOnce → callLlm).
 					source: strict.llm.source,
+					localAgentTool: strict.llm.localAgentTool,
 				};
 				return { status: "ok", ...buildResult(strict.parsed, mergedLlm) };
 			}

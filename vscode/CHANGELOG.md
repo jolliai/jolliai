@@ -4,7 +4,7 @@
 
 ## 0.99.8
 
-- **Generate memories with a local AI CLI** — a new **Local Agent (subscription)** provider in **Settings** lets a locally-installed agent (Claude Code) write your memories using its own login — no Anthropic or Jolli key needed. Pick the agent tool right there, see it reflected in the status panel, and each memory shows **Local agent** as its provider in the details footer.
+- **Generate memories with a local AI CLI** — a new **Local Agent** provider in **Settings** lets a locally-installed agent (Claude Code) write your memories using its own login — no Anthropic or Jolli key needed. Pick the agent tool right there, see it reflected in the status panel, and each memory shows **Local agent** as its provider in the details footer.
 - **Three more reference sources** — issues, pages, tasks, and items from **Confluence, Asana, and monday.com** mentioned in your AI conversations now appear on your memories, next to Linear, Jira, GitHub, Notion, Slack, and Zoom.
 - **See why something was left out** — when the relevance check drops a plan, note, or file from a memory, the reason now lives in that item's hover card instead of a native tooltip, so it's easy to read and act on.
 - **Sharper memory relevance** — the check that decides what belongs in each memory moved from a simple keep/drop list to tier-based ranking, so what's shown is chosen more precisely.
@@ -151,7 +151,7 @@
 
 ## 0.94.3
 
-- **Gemini CLI integration** — session tracking via `AfterAgent` hook, transcript parsing, cross-platform support
+- **Gemini integration** — session tracking via `AfterAgent` hook, transcript parsing, cross-platform support
 - **PR body streamlining** — simplified PR description with auto-truncation for GitHub's body size limit
 - **Push/Delete security** — API key ownership enforcement on server-side routes
 
@@ -182,7 +182,7 @@
 ## 0.91
 
 - **Push plans to Jolli** — plans uploaded as separate articles in a "Plans" subfolder; URLs shown under Jolli Memory row
-- **Codex CLI integration** — session discovery from `~/.codex/sessions/`, Codex-specific transcript parsing, `codexEnabled` config
+- **Codex integration** — session discovery from `~/.codex/sessions/`, Codex-specific transcript parsing, `codexEnabled` config
 
 ## 0.90
 

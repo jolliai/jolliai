@@ -4,13 +4,13 @@ The `@jolli.ai/cli` package has two main uses:
 
 ## 1. Jolli Memory — automatic AI session summaries
 
-Turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort. When you work with AI agents like Claude Code, Codex, Gemini CLI, OpenCode, Cursor IDE, GitHub Copilot CLI, or VS Code Copilot Chat, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+Turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort. When you work with AI agents like Claude Code, Codex, Gemini, OpenCode, Cursor IDE, GitHub Copilot CLI, or VS Code Copilot Chat, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
 **What it does:**
 
 - **Automatic capture** — after each commit, reads your AI transcripts + diff, calls the LLM, and stores a structured summary alongside the commit. The commit returns instantly; the summary is generated in a detached background process (~10–20 s).
 - **Catch up on existing history** — `jolli backfill` creates memories for commits you made before enabling Jolli.
-- **Seven supported agents** — Claude Code, Codex, Gemini CLI, OpenCode, Cursor IDE (Composer), GitHub Copilot CLI, and VS Code Copilot Chat.
+- **Seven supported agents** — Claude Code, Codex, Gemini, OpenCode, Cursor IDE (Composer), GitHub Copilot CLI, and VS Code Copilot Chat.
 - **Dual storage** — every memory is written to a dedicated git orphan branch (`jollimemory/summaries/v3`, the source of truth) **and** to a human-browsable Memory Bank folder on disk (canonical JSON + Markdown).
 - **Worktree-aware** — hooks and summaries work across `git worktree` checkouts.
 - **Squash / amend / rebase safe** — a unified operation queue migrates or consolidates summaries when commits are rewritten, so memories are never lost.
@@ -81,8 +81,8 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | Agent | How sessions are tracked |
 | -- | -- |
 | **Claude Code** | A lightweight `StopHook` fires after each AI response; a `SessionStartHook` injects a mini-briefing at session start |
-| **Gemini CLI** | An `AfterAgent` hook fires after each agent completion |
-| **Codex CLI** | No hook needed — sessions are discovered automatically by scanning the filesystem. Linear/Jira/GitHub/Notion/Slack/Zoom/Confluence/Asana/monday.com references in Codex MCP calls are extracted on the VS Code sidebar's 60s polling tick (not at commit time) |
+| **Gemini** | An `AfterAgent` hook fires after each agent completion |
+| **Codex** | No hook needed — sessions are discovered automatically by scanning the filesystem. Linear/Jira/GitHub/Notion/Slack/Zoom/Confluence/Asana/monday.com references in Codex MCP calls are extracted on the VS Code sidebar's 60s polling tick (not at commit time) |
 | **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database at `~/.local/share/opencode/opencode.db` (requires Node 22.5+) |
 | **Cursor IDE** (Composer) | No hook needed — sessions are discovered automatically by reading Cursor's local SQLite stores (`globalStorage/state.vscdb` plus per-workspace `workspaceStorage/` databases under your platform's Cursor user-data directory) |
 | **GitHub Copilot CLI** | No hook needed — sessions are discovered automatically by scanning Copilot CLI's session log |
@@ -466,8 +466,8 @@ Settings are stored globally in `~/.jolli/jollimemory/config.json`. The recommen
 | `authToken` | string | — | OAuth auth token (set automatically by `jolli auth login`) |
 | `logLevel` | enum | `info` | Log level for `debug.log`: `debug`, `info`, `warn`, `error` |
 | `claudeEnabled` | boolean | auto-detect | Enable Claude Code session tracking |
-| `codexEnabled` | boolean | auto-detect | Enable Codex CLI session discovery |
-| `geminiEnabled` | boolean | auto-detect | Enable Gemini CLI session tracking |
+| `codexEnabled` | boolean | auto-detect | Enable Codex session discovery |
+| `geminiEnabled` | boolean | auto-detect | Enable Gemini session tracking |
 | `openCodeEnabled` | boolean | auto-detect | Enable OpenCode session discovery (requires Node 22.5+) |
 | `cursorEnabled` | boolean | auto-detect | Enable Cursor IDE (Composer) session discovery |
 | `copilotEnabled` | boolean | auto-detect | Enable GitHub Copilot CLI **and** VS Code Copilot Chat session discovery (single shared switch) |

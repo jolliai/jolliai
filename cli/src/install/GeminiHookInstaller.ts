@@ -1,5 +1,5 @@
 /**
- * GeminiHookInstaller — Install/remove/detect Gemini CLI AfterAgent hooks
+ * GeminiHookInstaller — Install/remove/detect Gemini AfterAgent hooks
  * in `.gemini/settings.json`.
  *
  * Extracted from Installer.ts for single-responsibility.
@@ -20,7 +20,7 @@ import {
 const log = createLogger("GeminiHookInstaller");
 
 /**
- * Installs the Gemini CLI AfterAgent hook in .gemini/settings.json at the project root.
+ * Installs the Gemini AfterAgent hook in .gemini/settings.json at the project root.
  * Uses the same matcher group format as Claude Code hooks.
  */
 export async function installGeminiHook(projectDir: string): Promise<HookOpResult> {

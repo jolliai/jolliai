@@ -95,8 +95,8 @@ const cursorRegistrar: McpHostRegistrar = {
 };
 
 /**
- * Gemini CLI: global `~/.gemini/settings.json` (GEMINI_DIR = ".gemini").
- * Format verified from Gemini CLI 0.38.2 source (SETTINGS_SCHEMA_DEFINITIONS.MCPServerConfig):
+ * Gemini: global `~/.gemini/settings.json` (GEMINI_DIR = ".gemini").
+ * Format verified from Gemini 0.38.2 source (SETTINGS_SCHEMA_DEFINITIONS.MCPServerConfig):
  * top-level key `mcpServers`, entry shape `{ command?, args?, env?, cwd?, url? }`.
  * Global config — never committed, so gitExcludePaths returns [].
  */
@@ -109,7 +109,7 @@ const geminiRegistrar: McpHostRegistrar = {
 };
 
 /**
- * Codex CLI: global `~/.codex/config.toml`.
+ * Codex: global `~/.codex/config.toml`.
  * Format verified from official Codex docs (https://developers.openai.com/codex/mcp)
  * and confirmed against a real ~/.codex/config.toml on developer machine:
  *   [mcp_servers.jollimemory]

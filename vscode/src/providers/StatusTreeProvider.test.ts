@@ -201,7 +201,6 @@ describe("StatusTreeProvider", () => {
 			"Hooks",
 			"Sessions",
 			"AI Summary Provider",
-			"Anthropic API Key",
 			"Jolli Site",
 			"Claude Integration",
 			"Codex Integration",
@@ -219,14 +218,10 @@ describe("StatusTreeProvider", () => {
 			command: "jollimemory.openSettings",
 			title: "Open Settings",
 		});
-		// Anthropic API Key warning still present because aiProvider is
-		// undefined (legacy config) — the suppression only kicks in when the
-		// user has explicitly chosen Jolli.
-		const apiKeyRow = items.find((it) => it.label === "Anthropic API Key");
-		expect(apiKeyRow?.command).toEqual({
-			command: "jollimemory.openSettings",
-			title: "Open Settings",
-		});
+		// Anthropic API Key warning absent: this config resolves to Jolli (a
+		// legacy jolliApiKey with no explicit aiProvider), and the warning now
+		// shows only when aiProvider is explicitly "anthropic".
+		expect(items.map((it) => it.label)).not.toContain("Anthropic API Key");
 		expect(items.find((it) => it.label === "Jolli Site")?.description).toBe(
 			"acme.jolli.app",
 		);
@@ -259,6 +254,31 @@ describe("StatusTreeProvider", () => {
 		expect(
 			items.find((it) => it.label === "AI Summary Provider")?.description,
 		).toBe("Jolli");
+	});
+
+	it("suppresses the Anthropic API Key warning when aiProvider is explicitly 'local-agent'", async () => {
+		// A local agent generates through its own CLI login, so it never needs
+		// an Anthropic key. Without this suppression the tree contradicts
+		// itself: the AI Summary Provider row reports "Local agent ✓" (the
+		// dispatcher would happily drive the local CLI), while the warning row
+		// would still nag that the Anthropic key is missing.
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: undefined,
+			jolliApiKey: undefined,
+			aiProvider: "local-agent",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const labels = items.map((it) => it.label);
+		expect(labels).not.toContain("Anthropic API Key");
+		// Provider row still present, showing the explicit choice.
+		expect(
+			items.find((it) => it.label === "AI Summary Provider")?.description,
+		).toBe("Local agent - Claude Code");
 	});
 
 	it("suppresses the Anthropic API Key warning when ANTHROPIC_API_KEY env is set", async () => {
@@ -305,7 +325,7 @@ describe("StatusTreeProvider", () => {
 		expect((providerRow?.iconPath as { id: string }).id).toBe("warning");
 	});
 
-	it("provider row shows 'Local agent' (not 'not configured') when aiProvider='local-agent'", async () => {
+	it("provider row shows 'Local agent - Claude Code' (not 'not configured') when aiProvider='local-agent'", async () => {
 		// Regression: the provider-row switch had no `case "local-agent"`, so a
 		// resolved local-agent source fell into the default → "not configured",
 		// even though the dispatcher would happily drive the local CLI agent.
@@ -321,7 +341,24 @@ describe("StatusTreeProvider", () => {
 		const providerRow = provider
 			.getChildren()
 			.find((it) => it.label === "AI Summary Provider");
-		expect(providerRow?.description).toBe("Local agent");
+		expect(providerRow?.description).toBe("Local agent - Claude Code");
+		expect((providerRow?.iconPath as { id: string }).id).not.toBe("warning");
+	});
+
+	it("provider row shows the chosen tool's label, e.g. 'Local agent - Codex', when localAgentTool='codex'", async () => {
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			aiProvider: "local-agent",
+			localAgentTool: "codex",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const providerRow = provider
+			.getChildren()
+			.find((it) => it.label === "AI Summary Provider");
+		expect(providerRow?.description).toBe("Local agent - Codex");
 		expect((providerRow?.iconPath as { id: string }).id).not.toBe("warning");
 	});
 
@@ -549,7 +586,7 @@ describe("StatusTreeProvider", () => {
 		expect(provider.getChildren()).toEqual([]);
 	});
 
-	it("includes Gemini CLI in hooks description when geminiHookInstalled is true", async () => {
+	it("includes Gemini in hooks description when geminiHookInstalled is true", async () => {
 		const bridge = {
 			cwd: "/repo",
 			getStatus: vi.fn(async () =>
@@ -567,7 +604,7 @@ describe("StatusTreeProvider", () => {
 
 		const items = provider.getChildren();
 		const hooksItem = items.find((item) => item.label === "Hooks");
-		expect(hooksItem?.description).toBe("4 Git + 2 Claude + 1 Gemini CLI");
+		expect(hooksItem?.description).toBe("4 Git + 2 Claude + 1 Gemini");
 	});
 
 	it("shows 'none installed' when no hooks are installed", async () => {
@@ -1428,7 +1465,12 @@ describe("StatusTreeProvider", () => {
 				cwd: "/repo",
 				getStatus: vi.fn(async () => makeStatus()),
 			};
-			loadConfigFromDir.mockResolvedValue({ apiKey: undefined });
+			// The warning row appears only when the chosen provider is Anthropic
+			// and no key is resolvable.
+			loadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				aiProvider: "anthropic",
+			});
 
 			const provider = makeStatusProvider(bridge as never);
 			await provider.refresh();

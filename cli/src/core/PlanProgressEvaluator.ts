@@ -139,6 +139,7 @@ export async function evaluatePlanProgress(
 		apiLatencyMs: llmResult.apiLatencyMs,
 		stopReason: llmResult.stopReason ?? null,
 		source: llmResult.source,
+		localAgentTool: llmResult.localAgentTool,
 	};
 
 	return { summary: parsed.summary, steps, llm };

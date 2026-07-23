@@ -17,6 +17,8 @@ import {
 	NotAuthenticatedError,
 	SPACE_PROBE_TIMEOUT_MS,
 } from "../core/JolliMemoryPushClient.js";
+import { resolveLlmCredentialSource } from "../core/LlmClient.js";
+import { localAgentToolLabel } from "../core/localagent/ToolMeta.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import {
 	clearSpaceBindingCache,
@@ -27,7 +29,7 @@ import {
 import type { SqliteScanError } from "../core/SqliteHelpers.js";
 import { getStatus } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
-import type { StatusInfo } from "../Types.js";
+import type { JolliMemoryConfig, StatusInfo } from "../Types.js";
 import { resolveProjectDir, VERSION } from "./CliUtils.js";
 
 const log = createLogger("StatusCommand");
@@ -55,6 +57,30 @@ const log = createLogger("StatusCommand");
  */
 export function describeSchemaV5Status(state: StatusInfo["schemaV5"]): string {
 	return state === "completed" ? "Up to date (v5)" : "Not migrated — run jolli migrate";
+}
+
+/**
+ * `AI Provider:` status row. Mirrors the VS Code Status panel's "AI Summary
+ * Provider" row: resolve the credential the next commit will actually use via
+ * the same `resolveLlmCredentialSource` the LLM dispatcher uses, so the CLI and
+ * the extension can never disagree about the active provider. Labels match the
+ * VS Code panel verbatim (`"Jolli"`, not the footer's `"Jolli proxy"`). A `null`
+ * source — provider chosen but its required credential missing, or nothing
+ * configured — renders as `"Not configured"`.
+ */
+export function describeAiProvider(config: JolliMemoryConfig): string {
+	switch (resolveLlmCredentialSource(config)) {
+		case "anthropic-config":
+			return "Anthropic";
+		case "anthropic-env":
+			return "Anthropic (env)";
+		case "jolli-proxy":
+			return "Jolli";
+		case "local-agent":
+			return `Local agent - ${localAgentToolLabel(config.localAgentTool ?? "claude-code")}`;
+		default:
+			return "Not configured";
+	}
 }
 
 /**
@@ -315,12 +341,12 @@ export function resolveClaudeHookActive(status: StatusInfo, _isClaudePlugin: boo
 	return status.claudeHookInstalled;
 }
 
-/** The one-line hook summary (`"5 Git + 2 Claude + 1 Gemini CLI"` / `"none installed"`). */
+/** The one-line hook summary (`"5 Git + 2 Claude + 1 Gemini"` / `"none installed"`). */
 export function buildHookSummary(status: StatusInfo, claudeHookActive: boolean): string {
 	const hookParts: string[] = [];
 	if (status.gitHookInstalled) hookParts.push(`${status.prePushHookInstalled ? 5 : 4} Git`);
 	if (claudeHookActive) hookParts.push("2 Claude");
-	if (status.geminiHookInstalled) hookParts.push("1 Gemini CLI");
+	if (status.geminiHookInstalled) hookParts.push("1 Gemini");
 	return hookParts.length > 0 ? hookParts.join(" + ") : "none installed";
 }
 
@@ -508,10 +534,16 @@ export function registerStatusCommand(program: Command): void {
 			console.log(`  Jolli Account:    ${authToken ? "Signed in" : "Not signed in"}`);
 			console.log(`  Jolli API Key:    ${config?.jolliApiKey ? "Configured" : "Not configured"}`);
 			console.log(`  Jolli Space:      ${describeSpaceBinding(spaceBinding)}`);
-			/* v8 ignore next 2 -- ternary: env var presence depends on external environment */
-			console.log(
-				`  Anthropic Key:    ${config?.apiKey || process.env.ANTHROPIC_API_KEY ? "Configured" : "Not configured"}`,
-			);
+			console.log(`  AI Provider:      ${describeAiProvider(config)}`);
+			// Anthropic Key row only when the user picked Anthropic — mirrors the
+			// VS Code Status panel, where the key warning shows solely for the
+			// Anthropic provider. Jolli / Local Agent / an unset provider don't
+			// use an Anthropic key, so the row would only add noise.
+			if (config.aiProvider === "anthropic") {
+				/* v8 ignore next -- ternary: env var presence depends on external environment */
+				const anthropicKey = config.apiKey || process.env.ANTHROPIC_API_KEY ? "Configured" : "Not configured";
+				console.log(`  Anthropic Key:    ${anthropicKey}`);
+			}
 			console.log(`  Sessions:         ${status.activeSessions}`);
 
 			// Per-integration breakdown. Only print rows for detected integrations;
