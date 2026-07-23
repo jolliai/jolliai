@@ -273,6 +273,15 @@ describe("jolli menu template frontmatter", () => {
 		expect(jolli).toContain("### Shell prerequisite");
 	});
 
+	it("the Workflow history action handles the plugin-absent case with an install hint", async () => {
+		// `workflow runs` hits the stub (prose + exit 1) when workflow-cli is
+		// absent — the menu must steer the user to install it, not fall through.
+		await updateSkillsIfNeeded(tempDir);
+		const jolli = readJolli();
+		expect(jolli).toContain("@jolli.ai/workflow-cli");
+		expect(jolli).toContain("npm i -g @jolli.ai/cli @jolli.ai/workflow-cli");
+	});
+
 	it("mentions canceling an in-flight remote run via cancel_remote_workflow", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const jolli = readJolli();
@@ -493,6 +502,14 @@ describe("jolli-remote-run template", () => {
 		expect(t).toMatch(/"succeeded"/);
 		expect(t).toMatch(/"failed"/);
 		expect(t).toMatch(/"cancelled"/);
+	});
+
+	it("handles the plugin-absent case for workflow run-status with an install hint", () => {
+		// The run-status stub prints prose + exit 1 (not a JSON report) when
+		// workflow-cli is absent — the recipe must steer the user to install it.
+		const t = buildRemoteRunSkillTemplate();
+		expect(t).toContain("@jolli.ai/workflow-cli");
+		expect(t).toContain("npm i -g @jolli.ai/cli @jolli.ai/workflow-cli");
 	});
 
 	it("reports failed, cancelled, succeeded, and still-running outcomes", () => {

@@ -1509,6 +1509,14 @@ could not be reached — platform tools off, or a transport failure), tell the u
 the run status could not be retrieved and stop. That is a degraded outcome, not a
 crash — the run may still be progressing server-side.
 
+If instead the command exits non-zero and prints a prose install hint naming
+\`@jolli.ai/workflow-cli\` (rather than a JSON report line), the workflow-cli plugin
+is not installed. Tell the user to install it and stop:
+
+\`\`\`bash
+npm i -g @jolli.ai/cli @jolli.ai/workflow-cli
+\`\`\`
+
 ## Step 4 — report the outcome
 
 Report based on \`status\`:
@@ -1642,7 +1650,10 @@ Assemble ONE combined list of actions from two sources.
   It prints \`{ "type": "runs", "runs": [ ... ] }\` — one entry per run with its
   \`status\`, \`timestamp\`, and any \`workflowUrl\` / \`runUrl\` / \`prUrl\` /
   \`articleUrls\`. An empty \`runs\` list is the normal "no history yet" outcome, not
-  an error. Offer to open any listed URL via the \`open-url\` helper:
+  an error. If instead the command exits non-zero and prints an install hint naming
+  \`@jolli.ai/workflow-cli\` (rather than the JSON above), the workflow-cli plugin is
+  not installed — tell the user to install it (\`npm i -g @jolli.ai/cli @jolli.ai/workflow-cli\`)
+  and stop. Offer to open any listed URL via the \`open-url\` helper:
 
   \`\`\`bash
   "$HOME/.jolli/jollimemory/run-cli" open-url <url>

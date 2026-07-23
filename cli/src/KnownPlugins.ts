@@ -72,6 +72,12 @@ export const KNOWN_PLUGINS: ReadonlyArray<KnownPlugin> = [
 		// or a one-line install hint (`workflow runs` / `workflow run-status`).
 		id: "5ea2fc8c-a0cb-416f-9276-219f1d51c51f",
 		packageName: "@jolli.ai/workflow-cli",
+		// Single-package hint (this is the surface `doctor` / the update-check print
+		// to upgrade an already-known plugin). Intentionally NOT the two-package
+		// `npm i -g @jolli.ai/cli @jolli.ai/workflow-cli` the stub + local-run recipe
+		// use — those name both packages because a user on that path may have neither
+		// at the right versions. Matches the single-package hint on the site/space
+		// entries; don't "reconcile" the two forms.
 		installHint: "npm install -g @jolli.ai/workflow-cli",
 		helpGroup: "workflow",
 		registerStub: registerWorkflowCommandStubs,
