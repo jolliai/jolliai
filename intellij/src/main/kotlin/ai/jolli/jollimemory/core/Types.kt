@@ -482,11 +482,19 @@ data class JolliMemoryConfig(
      * Tri-state consent for the machine-global skill-preference block written into
      * ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md, ~/.codex/AGENTS.md: "enabled" /
      * "disabled" / null (undecided). Cross-surface: persisted in the shared
-     * config.json so CLI / VS Code / IntelliJ agree. See GlobalInstructionsInstaller.
+     * config.json so CLI / VS Code / IntelliJ agree. See cli/src/install/GlobalInstructionsInstaller.ts.
      */
     val globalInstructions: String? = null,
     /** AI summarization provider: "jolli" (proxy) or "anthropic" (direct). null defers to legacy "Anthropic wins" routing. */
     val aiProvider: String? = null,
+    /** Local agent tool identifier for shared-provider config (currently only "claude-code"). */
+    val localAgentTool: String? = null,
+    /** Optional user-picked path to the local agent binary; null uses the default lookup. */
+    val localAgentPath: String? = null,
+    /** DCO sign-off toggle mirrored into the shared config.json (cross-surface with CLI / VS Code). */
+    val dcoSignoff: Boolean? = null,
+    /** Telemetry opt-out flag stored in the shared config.json: "on" / "off" / null (default on). */
+    val telemetry: String? = null,
     val logLevel: String? = null,
     val logLevelOverrides: Map<String, String>? = null,
     val knowledgeBasePath: String? = null,
@@ -628,3 +636,19 @@ data class ActiveConversationsResult(
     val items: List<ActiveConversationItem>,
     val failedSources: List<TranscriptSource>,
 )
+
+/**
+ * Severity classification for SQLite scan failures, surfaced by the CLI so the
+ * Status panel can distinguish a real failure from "zero sessions today". These
+ * are pure DTOs — the JDBC scan itself now happens in the CLI.
+ */
+enum class SqliteScanErrorKind { corrupt, locked, permission, schema, unknown }
+
+/** Scan-failure DTO for OpenCode / Cursor / Copilot CLI SQLite sources. */
+data class SqliteScanError(val kind: SqliteScanErrorKind, val message: String)
+
+/**
+ * Scan-failure DTO for the Copilot Chat filesystem source. `kind` is a free-form
+ * "parse" / "fs" / "schema" / "unknown" tag chosen by the CLI (see CLI spec).
+ */
+data class CopilotChatScanError(val kind: String, val message: String)

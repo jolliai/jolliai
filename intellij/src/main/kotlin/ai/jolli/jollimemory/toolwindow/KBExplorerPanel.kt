@@ -4,16 +4,11 @@ import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.KBDataCache
 import ai.jolli.jollimemory.core.KBPathResolver
 import ai.jolli.jollimemory.core.KBRepoDiscoverer
-import ai.jolli.jollimemory.core.IngestPipeline
 import ai.jolli.jollimemory.core.MetadataManager
-import ai.jolli.jollimemory.core.MultiRepoCompile
-import ai.jolli.jollimemory.core.MigrationEngine
 import ai.jolli.jollimemory.core.MigrationState
-import ai.jolli.jollimemory.core.FolderStorage
-import ai.jolli.jollimemory.core.OrphanBranchStorage
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.JolliMemoryIcons
-import ai.jolli.jollimemory.bridge.GitOps
+import ai.jolli.jollimemory.bridge.CliIntegrations
 import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
 import ai.jolli.jollimemory.sync.SyncActivation
@@ -954,13 +949,12 @@ class KBExplorerPanel(
         try {
             val root = kbRoot ?: return
             val mm = MetadataManager(root.resolve(".jolli"))
+            // Force a full re-migration: clearing the completed marker makes the CLI
+            // pick the full `runMigration()` path instead of the stale-child reconcile.
             mm.saveMigrationState(MigrationState(status = "pending"))
 
             val projectPath = service.mainRepoRoot ?: project.basePath ?: return
-            val orphan = OrphanBranchStorage(GitOps(projectPath))
-            val folder = FolderStorage(root, mm)
-            val engine = MigrationEngine(orphan, folder, mm)
-            val result = engine.runMigration()
+            val result = CliIntegrations.migrateMemoryBank(projectPath)
 
             LOG.info("Reset migration: ${result.status} (${result.migratedEntries}/${result.totalEntries})")
             refresh()
@@ -1016,50 +1010,52 @@ class KBExplorerPanel(
     private fun buildKnowledgeWiki() {
         JM.info("buildKnowledgeWiki: button clicked")
         val config = SessionTracker.loadConfig()
-        // Either a Jolli sign-in (proxy mode) or an Anthropic key (direct mode, local
-        // prompt templates) can drive the wiki build.
-        val hasCredentials = !config.apiKey.isNullOrBlank() ||
-            !config.jolliApiKey.isNullOrBlank() ||
-            !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()
-        if (!hasCredentials) {
+        // Either a Jolli sign-in (proxy mode) or an Anthropic key (direct mode with
+        // local prompt templates) can drive the wiki build. Failing fast here — before
+        // spinning up the background task — gives the user a clear "sign in / set a
+        // key" nudge instead of an opaque CLI-level error toast.
+        if (!service.hasSummaryCredentials(config)) {
             notifyWiki(
-                "Building the knowledge wiki needs an API key. Open Settings → Memory Bank to sign in or configure a key, then try again.",
+                "Building the knowledge wiki needs an API key. Open Settings → AI Summary to sign in or configure a key, then try again.",
                 NotificationType.INFORMATION,
             )
             return
         }
-        // Concurrency is guarded per-vault-root by the `VaultWriteLock` inside
-        // MultiRepoCompile (returns result.skipped, handled below). A process-wide
-        // in-memory flag was wrong here: it serialised unrelated projects pointing at
-        // different Memory Bank roots. The fail-fast lock is the single source of truth.
         val parent = config.knowledgeBasePath?.let { Path.of(it) } ?: KBPathResolver.KB_PARENT
-        val llmConfig = IngestPipeline.LlmConfig(
-            apiKey = config.apiKey,
-            jolliApiKey = config.jolliApiKey,
-            model = config.model,
-            aiProvider = config.aiProvider,
-        )
 
         ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Jolli Memory: Building knowledge wiki…", false) {
             override fun run(indicator: ProgressIndicator) {
                 try {
-                    val result = MultiRepoCompile.compileAllRepos(
-                        parent, llmConfig,
-                        excludeFolders = config.compileExcludeFolders ?: emptyList(),
-                        onProgress = { folder -> indicator.text = "Compiling $folder…" },
+                    indicator.text = "Compiling Memory Bank…"
+                    val request = com.google.gson.JsonObject().apply {
+                        addProperty("localFolder", parent.toString())
+                        add("config", gson.toJsonTree(config))
+                    }
+                    val result = CliIntegrations.runIdeBridge(
+                        projectDir = service.mainRepoRoot ?: project.basePath ?: ".",
+                        action = "compile",
+                        requestJson = gson.toJson(request),
                     )
-                    if (result.skipped) {
+                    val obj = result.asJsonObject
+                    // The CLI-side vault write lock returns `skipped=true` when another
+                    // compile is already running against this Memory Bank root. Surface
+                    // that as an informational toast rather than a "0 source(s)" result
+                    // that reads like a silent no-op.
+                    if (obj.get("skipped")?.asBoolean == true) {
                         notifyWiki(
                             "Another knowledge wiki build is already running for this Memory Bank folder — skipped.",
                             NotificationType.INFORMATION,
                         )
-                    } else {
-                        val failedNote = if (result.failed > 0) " (${result.failed} failed)" else ""
-                        notifyWiki(
-                            "Knowledge wiki updated: ${result.totalIngested} source(s) across ${result.repos.size} repo(s)$failedNote.",
-                            NotificationType.INFORMATION,
-                        )
+                        return
                     }
+                    val totalIngested = obj.get("totalIngested")?.asInt ?: 0
+                    val failed = obj.get("failed")?.asInt ?: 0
+                    val repoCount = obj.getAsJsonArray("repos")?.size() ?: 0
+                    val failedNote = if (failed > 0) " ($failed failed)" else ""
+                    notifyWiki(
+                        "Knowledge wiki updated: $totalIngested source(s) across $repoCount repo(s)$failedNote.",
+                        NotificationType.INFORMATION,
+                    )
                     // External nio writes — refresh the VFS subtree so the KB tree picks up _wiki/.
                     ApplicationManager.getApplication().invokeLater {
                         LocalFileSystem.getInstance().refreshAndFindFileByNioFile(parent)?.refresh(true, true)

@@ -6,7 +6,7 @@ import ai.jolli.jollimemory.core.CommitSelectionStore
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.StoredSession
 import ai.jolli.jollimemory.core.ConversationUsage
-import ai.jolli.jollimemory.core.TranscriptReader
+import ai.jolli.jollimemory.core.TranscriptMessageCounter
 import ai.jolli.jollimemory.core.TranscriptSource
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliMemoryService
@@ -137,9 +137,12 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
      * the JCEF panel's own component context would otherwise risk a null project.
      */
     private fun runCommit() {
+        ai.jolli.jollimemory.core.JmLogger.create("WorkingMemoryPanel")
+            .info("runCommit: webview Commit Memory clicked")
         // Call the commit logic directly with our explicit project — the JCEF panel's
         // own data context doesn't reliably carry the project, and the action-invocation
         // API (ActionUtil.invokeAction) is deprecated inconsistently across IDE versions.
+        // Re-entrancy is handled inside performCommit (shared commitInProgress guard).
         ai.jolli.jollimemory.actions.CommitAIAction().performCommit(project)
     }
 
@@ -168,7 +171,10 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
         // "leave out / add back" editing. `excluded` drives the ✕/+ toggle state.
         val rawConversations = try {
             ActiveSessionAggregator.listActiveConversations(cwd)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            // No warning banner in this panel — at least record the transport
+            // failure so a silent empty list can be traced when users report it.
+            LOG.warn("listActiveConversations failed, panel will show empty: ${e.message}")
             emptyList()
         }
         val conversations = rawConversations.map {
@@ -222,7 +228,7 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
         val sessions = included.map { c ->
             val entries = if (c.source in usageSources) {
                 try {
-                    TranscriptReader.readTranscript(c.transcriptPath).entries
+                    TranscriptMessageCounter.loadTranscript(c.source, c.transcriptPath, cwd)
                 } catch (_: Exception) {
                     emptyList()
                 }

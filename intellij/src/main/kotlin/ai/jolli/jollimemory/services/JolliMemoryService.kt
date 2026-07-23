@@ -7,15 +7,15 @@ import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.bridge.HookInstaller
 import ai.jolli.jollimemory.bridge.SummaryReader
 import ai.jolli.jollimemory.core.CommitSummary
+import ai.jolli.jollimemory.core.HookEnv
 import ai.jolli.jollimemory.core.JmLogger
+import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.KBPathResolver
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.StatusInfo
 import ai.jolli.jollimemory.core.StorageFactory
-import ai.jolli.jollimemory.sync.SyncEngine
-import ai.jolli.jollimemory.sync.SyncOrchestrator
+import ai.jolli.jollimemory.sync.CliSyncOrchestrator
 import ai.jolli.jollimemory.sync.STATUS_AUTO_CLEAR_DELAY_MS
-import ai.jolli.jollimemory.sync.SyncOrchestratorOpts
 import ai.jolli.jollimemory.sync.SyncState
 import ai.jolli.jollimemory.sync.SyncStatusBarWidget
 import ai.jolli.jollimemory.sync.SyncStatusDetail
@@ -26,16 +26,17 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VirtualFileManager
+import com.intellij.openapi.vfs.newvfs.BulkFileListener
+import com.intellij.openapi.vfs.newvfs.events.VFileEvent
 import com.intellij.openapi.wm.WindowManager
 import com.intellij.util.concurrency.AppExecutorUtil
 import git4idea.repo.GitRepository
 import git4idea.repo.GitRepositoryChangeListener
 import java.io.File
-import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.StandardWatchEventKinds
-import java.nio.file.WatchService
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -44,7 +45,9 @@ import javax.swing.Timer
 /**
  * Project-level service managing JolliMemory state.
  *
- * Uses native Kotlin bridge — no Node.js needed.
+ * Read paths (storage, session data, per-source discovery, sync) route
+ * through the bundled CLI's `jolli ide-bridge` command, so a working Node.js
+ * runtime is required — see [ai.jolli.jollimemory.bridge.NodeRuntime].
  */
 @Service(Service.Level.PROJECT)
 class JolliMemoryService(private val project: Project) : Disposable {
@@ -55,6 +58,14 @@ class JolliMemoryService(private val project: Project) : Disposable {
     private var reader: SummaryReader? = null
     @Volatile
     private var cachedStatus: StatusInfo? = null
+    /** Cached worker-busy flag. Read synchronously by AnAction.update() so the EDT
+     *  never blocks on a node-bridge call. Refreshed by refreshStatus() and by the
+     *  NIO watcher on worker.lock create/delete events. Mirrors VS Code's
+     *  StatusStore.workerBusy: source of truth is the on-disk worker.lock, this is
+     *  the pushed-in-memory view actions read. Click-time paths still re-check the
+     *  authoritative SessionTracker.isWorkerBusy() to close the update-latency window. */
+    @Volatile
+    private var workerBusyCached: Boolean = false
     /** Timestamp until which refreshStatus() should not downgrade enabled→disabled.
      *  Set after install() to prevent GIT_REPO_CHANGE from flapping the status. */
     @Volatile
@@ -65,12 +76,28 @@ class JolliMemoryService(private val project: Project) : Disposable {
     var lastError: String? = null
         private set
     private val listeners = CopyOnWriteArrayList<() -> Unit>()
+    /**
+     * @Volatile because the debounce timer is scheduled from the VFS listener
+     * thread and stopped from the disposer/EDT — the reference must publish safely.
+     */
+    @Volatile
     private var orphanRefDebounceTimer: Timer? = null
-    private var nioWatchService: WatchService? = null
-    private var nioWatchThread: Thread? = null
+    /**
+     * Watch-root tokens returned by [LocalFileSystem.addRootsToWatch]. Kept so
+     * we can hand them back on [dispose] via `removeWatchedRoots`.
+     */
+    @Volatile
+    private var vfsWatchRequests: Set<LocalFileSystem.WatchRequest> = emptySet()
+    /**
+     * Set true at the very start of [dispose] so any late-arriving VFS_CHANGES
+     * batch (already in-flight when disposal begins) does not schedule a new
+     * debounce timer against a released service.
+     */
+    @Volatile
+    private var disposed = false
 
     // ── Sync orchestrator ────────────────────────────────────────────────
-    private var orchestrator: SyncOrchestrator? = null
+    private var orchestrator: CliSyncOrchestrator? = null
     private val lastSyncSuccessAtMs = AtomicLong(0)
     @Volatile
     private var syncState: SyncState? = null
@@ -142,7 +169,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
     var recentMissingCount: Int = 0
         private set
 
-    /** Whether the user dismissed the card for this repo (repo-wide marker). */
+    /** Whether the user permanently dismissed the card for this repo. */
     @Volatile
     var backfillDismissed: Boolean = false
         private set
@@ -187,7 +214,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
     /** True when the tool-window card should be shown. */
     fun shouldShowBackfillCard(): Boolean = coldStartVariant != null && !backfillDismissed
 
-    /** Records that the user dismissed the card (writes the repo-wide marker). Idempotent. */
+    /** Records the user's sticky repo-wide dismissal. Idempotent. */
     fun dismissBackfillCard() {
         val cwd = backfillCwd() ?: return
         backfillDismissed = true
@@ -196,18 +223,13 @@ class JolliMemoryService(private val project: Project) : Disposable {
     }
 
     /**
-     * Post-back-fill bookkeeping shared by both entry points (card + Settings), mirroring
-     * VS Code's `runBackfillJob`: once any summary is generated the repo is no longer in
-     * cold start and the dismiss marker is cleared so a future fresh-empty transition
-     * re-surfaces the card.
+     * Post-back-fill bookkeeping shared by both entry points (card + Settings). Completing
+     * generation clears the cold-start snapshot but preserves an explicit dismissal.
      */
     fun onBackfillCompleted(generatedAny: Boolean) {
         if (generatedAny) {
-            val cwd = backfillCwd()
             coldStartVariant = null
             recentMissingCount = 0
-            backfillDismissed = false
-            if (cwd != null) ai.jolli.jollimemory.backfill.BackfillDismissFlag.setDismissed(cwd, false)
         }
         notifyBackfillListeners()
     }
@@ -263,7 +285,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
 
     fun initialize() {
         if (isInitialized) return
-val sb = StringBuilder()
+        val sb = StringBuilder()
         val basePath = project.basePath
         sb.appendLine("basePath=$basePath")
 
@@ -323,13 +345,9 @@ val sb = StringBuilder()
             lastError = "Status check failed: ${e.message}"
         }
 
-        // Ensure Claude Code skill file is up to date
-        try {
-            ai.jolli.jollimemory.bridge.SkillInstaller(resolvedRoot).updateSkillIfNeeded()
-            sb.appendLine("Skill file checked/updated")
-        } catch (e: Exception) {
-            sb.appendLine("Skill update failed: ${e.message}")
-        }
+        // Skills are owned by the bundled CLI: written by the full `enable` on first
+        // install (auto-install below) and refreshed by the version-gated
+        // `enable --integrations-only` catch-up — no Kotlin-side skill writer remains.
 
         // Auto-initialize KB folder with repo identity + auto-migrate
         try {
@@ -340,29 +358,20 @@ val sb = StringBuilder()
             KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
             sb.appendLine("KB folder initialized: $kbRoot")
 
-            // Auto-migrate: if orphan branch has data but migration not completed yet
-            val orphan = ai.jolli.jollimemory.core.OrphanBranchStorage(gitOps)
-            if (orphan.exists()) {
-                val mm = ai.jolli.jollimemory.core.MetadataManager(kbRoot.resolve(".jolli"))
-                val migrationState = mm.readMigrationState()
-                if (migrationState == null || migrationState.status != "completed") {
-                    val folder = ai.jolli.jollimemory.core.FolderStorage(kbRoot, mm)
-                    val engine = ai.jolli.jollimemory.core.MigrationEngine(orphan, folder, mm)
-                    val result = engine.runMigration()
-                    sb.appendLine("Auto-migration: ${result.status} (${result.migratedEntries}/${result.totalEntries})")
-                } else {
-                    sb.appendLine("Migration already completed")
-                }
-            }
+            // Auto-migrate orphan-branch data into the Memory Bank folder via the
+            // bundled CLI (CliIntegrations.migrateMemoryBank → `jolli migrate-memory-bank`).
+            // The CLI decides whether an orphan branch exists and whether migration
+            // already completed (full migration vs idempotent stale-child reconcile),
+            // matching the VS Code activate path. The Kotlin MigrationEngine is gone.
+            val migration = CliIntegrations.migrateMemoryBank(resolvedRoot)
+            sb.appendLine("Auto-migration: ${migration.status} (${migration.migratedEntries}/${migration.totalEntries})")
         } catch (e: Exception) {
             sb.appendLine("KB folder init/migration failed: ${e.message}")
         }
 
         // Auto-install hooks if configured and not paused (eliminates the separate "Enable" step)
         val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
-        val hasCredentials = !config.apiKey.isNullOrBlank() ||
-            !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() ||
-            !config.jolliApiKey.isNullOrBlank()
+        val hasCredentials = hasSummaryCredentials(config)
         val isPaused = config.paused == true
         if (hasCredentials && !isPaused && cachedStatus?.enabled != true) {
             sb.appendLine("Auto-installing hooks (configured + not paused + not yet enabled)")
@@ -409,18 +418,28 @@ val sb = StringBuilder()
             GitRepositoryChangeListener { refreshStatus() },
         )
 
-        // ── Orphan branch ref + lock file watcher (NIO WatchService) ──────
+        // ── Orphan branch ref + lock file watcher (IntelliJ VFS) ──────────
         // The post-commit hook worker runs in the background and writes summaries
         // to the orphan branch via `git update-ref`. IntelliJ's GIT_REPO_CHANGE
-        // does NOT fire for orphan branch ref updates (only working-tree changes).
-        // IntelliJ's VFS BulkFileListener also misses .git/ internal changes because
-        // those directories are excluded from VFS scanning.
+        // does NOT fire for orphan branch ref updates (only working-tree changes),
+        // so we must arrange our own notification path.
         //
-        // We use Java NIO WatchService for OS-level file monitoring (like VS Code's
-        // FileSystemWatcher), watching:
+        // We route through IntelliJ's own VFS: LocalFileSystem.addRootsToWatch
+        // hands the paths to fsnotifier (JetBrains's native FS helper), which
+        // bridges platform-native events (FSEvents on macOS, inotify on Linux,
+        // ReadDirectoryChangesW on Windows). This matches VS Code's underlying
+        // FileSystemWatcher quality and replaces the previous Java NIO
+        // WatchService, which on macOS silently degrades to a 10s polling
+        // watcher that regularly misses git's brief atomic-rename events.
+        //
+        // .git/ subdirs are not part of the project index by default, so we
+        // also call refreshAndFindFileByPath to seed the VFS with the paths
+        // before subscribing to VFS_CHANGES.
+        //
+        // Watched:
         //   .git/refs/heads/jollimemory/summaries/ (orphan ref parent dir)
         //   .jolli/jollimemory/ (lock file dir — worker completion fallback)
-        startNioFileWatchers(resolvedRoot)
+        startVfsFileWatchers(resolvedRoot)
 
         // Write debug log to a temp file for easy access
         try {
@@ -431,90 +450,112 @@ val sb = StringBuilder()
     }
 
     /**
-     * Starts OS-level file watchers using Java NIO WatchService.
+     * Starts file watchers on top of IntelliJ's VFS.
      *
-     * Watches the parent directories of the orphan branch ref file and the lock file.
-     * Unlike IntelliJ's VFS BulkFileListener (which excludes .git/ internals),
-     * NIO WatchService monitors at the OS level (FSEvents on macOS, inotify on Linux),
-     * matching VS Code's FileSystemWatcher behavior.
+     * IntelliJ's VFS uses fsnotifier (a JetBrains-shipped native helper) to
+     * receive OS-level FS events — FSEvents on macOS, inotify on Linux,
+     * ReadDirectoryChangesW on Windows. Event quality matches VS Code's
+     * FileSystemWatcher / Node fsevents.
+     *
+     * Steps for each watched directory:
+     *   1. `refreshAndFindFileByPath` — seed the VFS with the dir so events
+     *      inside `.git/` (normally outside project scope) actually fire.
+     *   2. `addRootsToWatch(paths, watchRecursively=false)` — tell fsnotifier
+     *      to bridge platform events for this dir into the VFS.
+     *
+     * We then subscribe to `VirtualFileManager.VFS_CHANGES` and filter events
+     * by full path — matching only the four files we actually care about so
+     * unrelated writes (debug.log, sessions.json, cursors.json) don't spam
+     * refreshes.
+     *
+     * Filenames watched (see the path comparisons in the listener body):
+     *   .git/refs/heads/jollimemory/summaries/v3  (or whatever ORPHAN_BRANCH ends with)
+     *   .jolli/jollimemory/lock         (post-commit worker lifecycle)
+     *   .jolli/jollimemory/worker.lock  (drives workerBusyCached — AI-Commit/Squash gate)
+     *   .jolli/jollimemory/plans.json   (StopHook plan/reference discovery mid-session)
      */
-    private fun startNioFileWatchers(repoRoot: String) {
+    private fun startVfsFileWatchers(repoRoot: String) {
         val orphanBranch = JmLogger.ORPHAN_BRANCH
-        // Watch the parent dir of the orphan ref: .git/refs/heads/jollimemory/summaries/
         val orphanRefDir = Path.of(repoRoot, ".git", "refs", "heads", orphanBranch).parent
-        // Watch .jolli/jollimemory/ for lock file changes
+        val orphanRefFile = orphanRefDir.resolve(Path.of(orphanBranch).fileName.toString())
         val lockDir = Path.of(repoRoot, ".jolli", "jollimemory")
-
-        // The ref file name we're looking for (e.g., "v3")
-        val orphanRefFileName = Path.of(orphanBranch).fileName.toString()
-        val lockFileName = "lock"
+        val orphanRefFileName = orphanRefFile.fileName.toString()
 
         try {
-            val watchService = FileSystems.getDefault().newWatchService()
-            nioWatchService = watchService
+            val fs = LocalFileSystem.getInstance()
+            val rootsToWatch = mutableSetOf<String>()
 
-            // Ensure directories exist before watching
-            if (Files.isDirectory(orphanRefDir)) {
-                orphanRefDir.register(watchService,
-                    StandardWatchEventKinds.ENTRY_CREATE,
-                    StandardWatchEventKinds.ENTRY_MODIFY)
-                log.info("NIO watcher registered on: $orphanRefDir")
+            // Resolve each dir to the SAME canonical form the VFS reports back in
+            // event.path. macOS in particular routes /tmp, /var and many other
+            // real paths through symlinks (e.g. /var → /private/var), so a bare
+            // Path.toAbsolutePath() would never match the canonical event.path
+            // — every VFS_CHANGES event would silently miss.
+            val orphanDirVfsPath: String? = if (Files.isDirectory(orphanRefDir)) {
+                val vf = fs.refreshAndFindFileByPath(orphanRefDir.toAbsolutePath().toString())
+                if (vf == null) log.warn("VFS refused to register orphan ref dir: $orphanRefDir")
+                rootsToWatch.add(orphanRefDir.toAbsolutePath().toString())
+                log.info("VFS watcher registered on: $orphanRefDir")
+                vf?.path ?: canonicalize(orphanRefDir)
             } else {
-                log.info("Orphan ref dir does not exist yet, skipping NIO watch: $orphanRefDir")
+                log.info("Orphan ref dir does not exist yet, skipping VFS watch: $orphanRefDir")
+                null
             }
 
-            if (Files.isDirectory(lockDir)) {
-                lockDir.register(watchService,
-                    StandardWatchEventKinds.ENTRY_CREATE,
-                    StandardWatchEventKinds.ENTRY_DELETE,
-                    // ENTRY_MODIFY so a live plans.json write (StopHook reference/plan
-                    // discovery) refreshes the panel. The lock-file create/delete signal
-                    // is too brief for the macOS polling WatchService to catch reliably,
-                    // and plans.json persists — so watching the data file itself is the
-                    // reliable trigger for CONTEXT updates during a session.
-                    StandardWatchEventKinds.ENTRY_MODIFY)
-                log.info("NIO watcher registered on: $lockDir")
+            val lockDirVfsPath: String? = if (Files.isDirectory(lockDir)) {
+                val vf = fs.refreshAndFindFileByPath(lockDir.toAbsolutePath().toString())
+                if (vf == null) log.warn("VFS refused to register lock dir: $lockDir")
+                rootsToWatch.add(lockDir.toAbsolutePath().toString())
+                log.info("VFS watcher registered on: $lockDir")
+                vf?.path ?: canonicalize(lockDir)
             } else {
-                log.info("Lock dir does not exist yet, skipping NIO watch: $lockDir")
+                log.info("Lock dir does not exist yet, skipping VFS watch: $lockDir")
+                null
             }
 
-            // Background thread to poll watch events
-            val thread = Thread({
-                try {
-                    while (!Thread.currentThread().isInterrupted) {
-                        val key = watchService.take() // Blocks until event
-                        var shouldRefresh = false
-                        for (event in key.pollEvents()) {
-                            val fileName = (event.context() as? Path)?.toString() ?: continue
-                            // Refresh on: orphan-ref updates (summary written), lock file
-                            // create/delete (worker start/finish), and plans.json writes
-                            // (StopHook reference/plan discovery during a live session —
-                            // this is what surfaces a newly created plan in CONTEXT without
-                            // waiting for the next commit). Other files in the dir
-                            // (debug.log, sessions.json, cursors.json) are ignored here so
-                            // their churn doesn't spam refreshes.
-                            if (fileName == orphanRefFileName || fileName == lockFileName || fileName == "plans.json") {
-                                shouldRefresh = true
-                            }
-                        }
-                        key.reset()
-                        if (shouldRefresh) {
+            if (rootsToWatch.isNotEmpty()) {
+                vfsWatchRequests = fs.addRootsToWatch(rootsToWatch, false)
+            }
+
+            val orphanRefPath = orphanDirVfsPath?.let { "$it/$orphanRefFileName" }
+            val workerLockPath = lockDirVfsPath?.let { "$it/worker.lock" }
+            val lockPath = lockDirVfsPath?.let { "$it/lock" }
+            val plansJsonPath = lockDirVfsPath?.let { "$it/plans.json" }
+
+            // Tie the message-bus subscription to the service's Disposable lifecycle
+            // so IntelliJ tears it down automatically when the project closes.
+            val busConnection = ApplicationManager.getApplication().messageBus.connect(this)
+            busConnection.subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
+                override fun after(events: List<VFileEvent>) {
+                    if (disposed) return
+                    for (event in events) {
+                        val path = event.path
+                        if (path == orphanRefPath ||
+                            path == workerLockPath ||
+                            path == lockPath ||
+                            path == plansJsonPath
+                        ) {
                             scheduleDebouncedOrphanRefresh()
+                            return
                         }
                     }
-                } catch (_: InterruptedException) {
-                    // Normal shutdown
-                } catch (_: java.nio.file.ClosedWatchServiceException) {
-                    // Normal shutdown
-                } catch (ex: Exception) {
-                    log.warn("NIO watch thread error: ${ex.message}")
                 }
-            }, "JolliMemory-NIO-Watcher")
-            thread.isDaemon = true
-            thread.start()
-            nioWatchThread = thread
+            })
         } catch (ex: Exception) {
-            log.warn("Failed to start NIO file watchers: ${ex.message}")
+            log.warn("Failed to start VFS file watchers: ${ex.message}")
+        }
+    }
+
+    /**
+     * Canonicalize a path (resolve symlinks) with forward-slash normalization,
+     * so its string form matches what IntelliJ VFS reports in event.path.
+     * Falls back to the plain absolute path if canonicalization fails.
+     */
+    private fun canonicalize(path: Path): String {
+        val absolute = path.toAbsolutePath().toString()
+        return try {
+            path.toFile().canonicalPath.replace('\\', '/')
+        } catch (_: Exception) {
+            absolute.replace('\\', '/')
         }
     }
 
@@ -524,8 +565,10 @@ val sb = StringBuilder()
      * which may trigger multiple events. A 500ms debounce collapses them into one refresh.
      */
     private fun scheduleDebouncedOrphanRefresh() {
+        if (disposed) return
         orphanRefDebounceTimer?.stop()
         orphanRefDebounceTimer = Timer(500) {
+            if (disposed) return@Timer
             ApplicationManager.getApplication().executeOnPooledThread { refreshStatus() }
         }.apply {
             isRepeats = false
@@ -534,6 +577,34 @@ val sb = StringBuilder()
     }
 
     fun getStatus(): StatusInfo? = cachedStatus
+
+    /**
+     * True when any credential capable of driving summary/wiki generation is set —
+     * config.apiKey, config.jolliApiKey, or the ANTHROPIC_API_KEY env var.
+     *
+     * The env-var read goes through [HookEnv] so tests can override it without
+     * mutating JVM globals (per scripts/check-global-state.sh's test-side gate).
+     * The default `HookEnv()` argument returns the real `System.getenv`, so
+     * production behaviour is unchanged — but the read is no longer a raw
+     * `System.getenv` sitting in a file-level-ratcheted baseline.
+     */
+    fun hasSummaryCredentials(config: JolliMemoryConfig, env: HookEnv = HookEnv()): Boolean =
+        !config.apiKey.isNullOrBlank() ||
+            !config.jolliApiKey.isNullOrBlank() ||
+            !env.getenv("ANTHROPIC_API_KEY").isNullOrBlank()
+
+    /** EDT-safe cheap read of the worker-busy flag. Never blocks. See workerBusyCached. */
+    fun isWorkerBusy(): Boolean = workerBusyCached
+
+    private fun computeWorkerBusy(): Boolean {
+        val cwd = mainRepoRoot ?: return false
+        return try {
+            SessionTracker.isWorkerBusy(cwd)
+        } catch (e: Exception) {
+            log.warn("computeWorkerBusy failed: ${e.message}")
+            false
+        }
+    }
 
     @Synchronized
     fun refreshStatus(): StatusInfo? {
@@ -569,6 +640,7 @@ val sb = StringBuilder()
                 return cachedStatus
             }
             cachedStatus = newStatus
+            workerBusyCached = computeWorkerBusy()
             notifyListeners()
             cachedStatus
         } catch (e: Exception) {
@@ -1039,27 +1111,33 @@ val sb = StringBuilder()
      * Start the sync orchestrator with the given engine and poll interval.
      * Wires the orchestrator's state changes to the status bar widget.
      */
-    fun startSync(engine: SyncEngine, cwd: String, pollIntervalSec: Int? = null) {
+    fun startSync(cwd: String, pollIntervalSec: Int? = null, autoSyncEnabled: Boolean = true) {
         stopSync()
+        // Each orchestrator owns a dedicated bounded ScheduledExecutorService.
+        // Auth reconciles call startSync() on every sign-in / sign-out flip,
+        // so the previous instance must be disposed explicitly or its
+        // executor thread lingers for the lifetime of the IDE.
+        orchestrator?.dispose()
+        orchestrator = null
         val widget = findSyncWidget()
-        val orch = SyncOrchestrator(SyncOrchestratorOpts(
-            engine = engine,
+        val orch = CliSyncOrchestrator(
+            project = project,
             cwd = cwd,
             pollIntervalSec = pollIntervalSec,
-            lastSuccessAtMs = lastSyncSuccessAtMs,
             onStateChange = { state, detail ->
                 val gen = syncStateGen.incrementAndGet()
                 syncState = state
                 syncDetail = detail
+                if (state == SyncState.SYNCED) lastSyncSuccessAtMs.set(System.currentTimeMillis())
                 ApplicationManager.getApplication().invokeLater {
                     widget?.setSyncState(state, detail)
                     syncListeners.forEach { it(state, detail) }
                 }
                 scheduleStatusAutoClear(state, gen)
             },
-        ))
+        )
         orchestrator = orch
-        orch.start()
+        if (autoSyncEnabled) orch.start()
     }
 
     /** Stop the sync polling loop (orchestrator remains usable for manual sync). */
@@ -1136,11 +1214,22 @@ val sb = StringBuilder()
     }
 
     override fun dispose() {
+        // Set first so any VFS_CHANGES batch already in-flight sees `disposed`
+        // and refuses to schedule a fresh debounce timer against a released
+        // service.
+        disposed = true
         orchestrator?.dispose()
         orchestrator = null
         orphanRefDebounceTimer?.stop()
-        nioWatchThread?.interrupt()
-        try { nioWatchService?.close() } catch (_: Exception) { }
+        orphanRefDebounceTimer = null
+        if (vfsWatchRequests.isNotEmpty()) {
+            try {
+                LocalFileSystem.getInstance().removeWatchedRoots(vfsWatchRequests)
+            } catch (_: Exception) { }
+            vfsWatchRequests = emptySet()
+        }
+        // The VFS_CHANGES subscription was connected with `this` as the parent
+        // Disposable, so IntelliJ tears it down automatically here.
         listeners.clear()
         syncListeners.clear()
     }

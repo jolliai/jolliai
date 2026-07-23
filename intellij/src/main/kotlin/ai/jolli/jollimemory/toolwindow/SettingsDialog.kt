@@ -1,12 +1,10 @@
 package ai.jolli.jollimemory.toolwindow
 
-import ai.jolli.jollimemory.core.FolderStorage
 import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.KBPathResolver
-import ai.jolli.jollimemory.core.MetadataManager
-import ai.jolli.jollimemory.core.MigrationEngine
-import ai.jolli.jollimemory.core.OrphanBranchStorage
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.core.StorageFactory
+import ai.jolli.jollimemory.bridge.CliIntegrations
 import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
@@ -45,8 +43,8 @@ import javax.swing.SwingUtilities
 /**
  * Settings dialog with four tabs:
  *
- *   1. AI Summary — provider selection (Anthropic direct vs Jolli proxy),
- *      with contextual Anthropic settings or Jolli sign-in prompt
+ *   1. AI Summary — provider selection (Anthropic direct, Jolli proxy, or Local Agent),
+ *      with contextual Anthropic settings, Jolli sign-in prompt, or agent-tool picker
  *   2. Sync to Jolli — cloud push settings, login-dependent
  *   3. Memory Bank — local storage folder, sort order, migration
  *   4. General — enabled platforms, exclude patterns, pause toggle
@@ -57,10 +55,14 @@ class SettingsDialog(
 ) : DialogWrapper(project) {
 
     // ── Tab 1: AI Summary ──────────────────────────────────────────────────
-    private val providerCombo = ComboBox(DefaultComboBoxModel(arrayOf("Anthropic", "Jolli"))).apply {
+    private val providerCombo = ComboBox(DefaultComboBoxModel(arrayOf("Anthropic", "Jolli", PROVIDER_LOCAL_AGENT))).apply {
         maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
     }
     private val anthropicKeyField = JBPasswordField()
+    /** Agent tool picker for the Local Agent provider — v1 supports only Claude Code (parity with VS Code). */
+    private val localAgentToolCombo = ComboBox(DefaultComboBoxModel(arrayOf("Claude Code"))).apply {
+        maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+    }
     private val modelCombo = ComboBox(DefaultComboBoxModel(arrayOf(
         "haiku — fastest, cheapest",
         "sonnet — balanced (default)",
@@ -112,6 +114,8 @@ class SettingsDialog(
     private val pauseCheckbox = JBCheckBox("Pause Jolli Memory (temporarily disable hooks without losing configuration)")
     private val telemetryCheckbox =
         JBCheckBox("Send anonymous usage telemetry (content-free — never code, paths, or memory content)", true)
+    private val dcoSignoffCheckbox =
+        JBCheckBox("Add Signed-off-by (DCO) trailer to commits made by Jolli Memory (commit / amend / squash)", false)
 
     // ── State ──────────────────────────────────────────────────────────────
     private var savedAnthropicKey: String = ""
@@ -207,7 +211,7 @@ class SettingsDialog(
 
         panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
             .addLabeledComponent(JBLabel("Provider:"), providerCombo, 1, false)
-            .addTooltip("Choose how AI summaries are generated for each commit")
+            .addTooltip("Choose how AI summaries are generated for each commit.")
             .panel))
 
         // Anthropic card: warning + key + model + max tokens
@@ -327,10 +331,23 @@ class SettingsDialog(
             override fun changedUpdate(e: javax.swing.event.DocumentEvent) = update()
         })
 
+        // Local Agent card: agent-tool picker (v1: Claude Code only). Uses the tool's own
+        // subscription sign-in, so no API key is collected here — mirrors the VS Code card.
+        val localAgentContent = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            add(Box.createVerticalStrut(8))
+            add(createStretchedFormPanel(FormBuilder.createFormBuilder()
+                .addLabeledComponent(JBLabel("Agent tool:"), localAgentToolCombo, 1, false)
+                .addTooltip("Uses your local Claude Code login (subscription). Sign in with the claude CLI if prompted.")
+                .panel))
+        }
+
         anthropicCardPanel.add(anthropicContent, CARD_ANTHROPIC)
         anthropicCardPanel.add(jolliSignedInContent, CARD_JOLLI_OK)
         anthropicCardPanel.add(jolliNoKeyContent, CARD_JOLLI_NOKEY)
         anthropicCardPanel.add(jolliSignedOutContent, CARD_JOLLI_SIGNIN)
+        anthropicCardPanel.add(localAgentContent, CARD_LOCAL_AGENT)
         anthropicCardPanel.alignmentX = JComponent.LEFT_ALIGNMENT
         panel.add(anthropicCardPanel)
 
@@ -537,6 +554,16 @@ class SettingsDialog(
             .panel))
 
         panel.add(Box.createVerticalStrut(12))
+        panel.add(JBLabel("<html><b>Commits</b></html>").apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            border = JBUI.Borders.emptyBottom(2)
+        })
+        panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
+            .addComponent(dcoSignoffCheckbox, 4)
+            .addTooltip("Adds a Signed-off-by trailer (git commit -s) to commits Jolli makes. Required by many open-source projects' CI. Shared with the VS Code extension via config.json.")
+            .panel))
+
+        panel.add(Box.createVerticalStrut(12))
         panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
             .addComponent(pauseCheckbox, 4)
             .addTooltip("Uninstalls hooks while preserving all settings. Unpause to re-enable.")
@@ -597,6 +624,10 @@ class SettingsDialog(
             val hasKey = getEffectiveAnthropicKey().isNotBlank() ||
                 !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()
             anthropicWarningRef?.isVisible = !hasKey
+            advancedLinkRef?.isVisible = false
+            advancedPanelRef?.isVisible = false
+        } else if (provider == PROVIDER_LOCAL_AGENT) {
+            anthropicCardLayout.show(anthropicCardPanel, CARD_LOCAL_AGENT)
             advancedLinkRef?.isVisible = false
             advancedPanelRef?.isVisible = false
         } else if (hasJolliApiKey()) {
@@ -692,7 +723,11 @@ class SettingsDialog(
     }
 
     override fun doOKAction() {
-        val provider = if ((providerCombo.selectedItem as String) == "Anthropic") "anthropic" else "jolli"
+        val provider = when (providerCombo.selectedItem as String) {
+            "Anthropic" -> "anthropic"
+            PROVIDER_LOCAL_AGENT -> "local-agent"
+            else -> "jolli"
+        }
         // Always preserve the Anthropic key even when Jolli is selected,
         // so switching back to Anthropic doesn't lose the saved key.
         val resolvedApiKey = getEffectiveAnthropicKey()
@@ -736,7 +771,10 @@ class SettingsDialog(
         // Re-load after potential sign-out so authToken change is reflected
         val existing = SessionTracker.loadConfigFromDir(configDir)
         val config = existing.copy(
-            apiKey = resolvedApiKey.ifBlank { null },
+            // apiKey / aiProvider / localAgentTool / localAgentPath live ONLY in the shared
+            // config.json (one copy) — force-null here so they never leak into config-intellij.json;
+            // the real save happens via saveSharedProviderConfig below.
+            apiKey = null,
             jolliApiKey = if (jolliKeyCleared) null else jolliApiKeyText.ifBlank { null },
             model = (modelCombo.selectedItem as String).substringBefore(" ").let { if (it == "sonnet") null else it },
             maxTokens = maxTokens,
@@ -747,7 +785,13 @@ class SettingsDialog(
             cursorEnabled = cursorEnabledCheckbox.isSelected,
             copilotEnabled = copilotEnabledCheckbox.isSelected,
             excludePatterns = if (excludePatterns.isNotEmpty()) excludePatterns else null,
-            aiProvider = provider,
+            aiProvider = null,
+            localAgentTool = null,
+            localAgentPath = null,
+            // dcoSignoff is NOT written to config-intellij.json — it lives in the shared
+            // config.json (cross-surface). Force-null here so a stale overlay value never
+            // leaks into the per-IDE file; the real save happens via saveDcoSignoff below.
+            dcoSignoff = null,
             knowledgeBasePath = kbPath,
             knowledgeBaseSort = kbSort,
             paused = if (pauseCheckbox.isSelected) true else null,
@@ -756,11 +800,30 @@ class SettingsDialog(
             syncPollIntervalSec = pollIntervalField.text.trim().toIntOrNull(),
         )
         SessionTracker.saveConfigToDir(config, configDir)
+        // Provider routing lives ONLY in the shared config.json (cross-surface, one copy) so the
+        // CLI's summary QueueWorker honors the choice made here. The Anthropic key is still
+        // preserved across provider switches, but now stored shared so the CLI can read it too.
+        // localAgentTool is always "claude-code" (the only supported tool) and localAgentPath is
+        // never touched — both mirror how the VS Code settings panel persists this group.
+        SessionTracker.saveSharedProviderConfig(
+            aiProvider = provider,
+            apiKey = resolvedApiKey.ifBlank { null },
+            localAgentTool = "claude-code",
+        )
+        // DCO sign-off lives in the shared config.json (cross-surface with CLI / VS Code),
+        // so it is persisted via a JSON-level partial update instead of the
+        // config-intellij.json data-class overwrite above.
+        SessionTracker.saveDcoSignoff(dcoSignoffCheckbox.isSelected)
         // Telemetry opt-out lives in the shared config.json (machine-global, cross-surface).
         // Apply the choice to the LIVE Telemetry context too, so it takes effect this session
         // (parity with the first-run balloon's "Turn off" and the VS Code toggle) rather than
         // only after the next IDE restart.
-        ai.jolli.jollimemory.core.telemetry.TelemetrySharedConfig.setTelemetry(telemetryCheckbox.isSelected)
+        SessionTracker.saveConfigToDir(
+            SessionTracker.loadConfigFromDir(configDir).copy(
+                telemetry = if (telemetryCheckbox.isSelected) "on" else "off",
+            ),
+            configDir,
+        )
         if (telemetryCheckbox.isSelected) {
             project.basePath?.let { ai.jolli.jollimemory.core.telemetry.TelemetryActivation.bootstrap(it) }
         } else {
@@ -822,28 +885,29 @@ class SettingsDialog(
                         val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, kbCustomPath)
                         KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
 
-                        val gitOps = GitOps(projectPath)
-                        val orphan = OrphanBranchStorage(gitOps)
-                        if (orphan.exists()) {
-                            indicator.text = "Migrating memories to Memory Bank…"
-                            val mm = MetadataManager(kbRoot.resolve(".jolli"))
-                            val folder = FolderStorage(kbRoot, mm)
-                            folder.ensure()
-                            MigrationEngine(orphan, folder, mm).runMigration()
-                        }
+                        // Migrate orphan-branch data into the Memory Bank folder via the
+                        // bundled CLI; it no-ops when there is no orphan branch and runs
+                        // the idempotent reconcile once migration has completed.
+                        indicator.text = "Migrating memories to Memory Bank…"
+                        CliIntegrations.migrateMemoryBank(projectPath)
                     }
 
                     // 2b. Apply the global-instructions consent: persist a fresh decision to
-                    // the shared config, then write or remove the skill-preference block. sync()
-                    // reads the just-persisted value; confirm=null so it never prompts here.
+                    // the shared config, then let the bundled CLI write or remove the
+                    // skill-preference block. `enable --integrations-only` runs the same
+                    // syncGlobalInstructions as VS Code — it reads the just-persisted value
+                    // and never prompts (undecided is a no-op, "disabled" heals stale blocks).
+                    // Unconditional so unrelated saves (e.g. a claudeEnabled flip) also heal.
                     if (newGlobalInstructions != null && newGlobalInstructions != prevGlobalInstructions) {
                         indicator.text = "Updating AI assistant instructions…"
                         SessionTracker.saveGlobalInstructions(newGlobalInstructions)
                     }
-                    try {
-                        ai.jolli.jollimemory.bridge.GlobalInstructionsInstaller.sync()
-                    } catch (e: Exception) {
-                        // Fail-soft — a read-only global file must never break settings save.
+                    if (projectPath != null) {
+                        try {
+                            ai.jolli.jollimemory.bridge.CliIntegrations.enableIntegrations(projectPath)
+                        } catch (e: Exception) {
+                            // Fail-soft — instruction sync must never break settings save.
+                        }
                     }
 
                     // 3. Refresh status once, after everything settled.
@@ -873,6 +937,7 @@ class SettingsDialog(
         val provider = when (config.aiProvider?.lowercase()) {
             "jolli" -> "Jolli"
             "anthropic" -> "Anthropic"
+            "local-agent" -> PROVIDER_LOCAL_AGENT
             else -> if (JolliAuthService.isSignedIn()) "Jolli" else "Anthropic"
         }
         providerCombo.selectedItem = provider
@@ -909,10 +974,10 @@ class SettingsDialog(
         openCodeEnabledCheckbox.isSelected = config.openCodeEnabled != false
         cursorEnabledCheckbox.isSelected = config.cursorEnabled != false
         copilotEnabledCheckbox.isSelected = config.copilotEnabled != false
+        dcoSignoffCheckbox.isSelected = config.dcoSignoff == true
         pauseCheckbox.isSelected = config.paused == true
         // Telemetry: on unless the shared opt-out flag says "off" (default on).
-        telemetryCheckbox.isSelected =
-            ai.jolli.jollimemory.core.telemetry.TelemetrySharedConfig.telemetryFlag() != "off"
+        telemetryCheckbox.isSelected = config.telemetry != "off"
 
         // Memory Bank
         val projectPath = service.mainRepoRoot ?: project.basePath ?: ""
@@ -945,71 +1010,97 @@ class SettingsDialog(
     private fun createMigrateButton(): JComponent {
         return JButton("Migrate to Memory Bank").apply {
             toolTipText = "Migrate existing memories from git storage to the Memory Bank folder"
+            val button = this
             addActionListener {
-                isEnabled = false
-                text = "Migrating..."
-                try {
-                    val projectPath = service.mainRepoRoot ?: project.basePath ?: ""
-                    if (projectPath.isBlank()) {
-                        Messages.showWarningDialog(project, "No project path available.", "Migration")
-                        return@addActionListener
-                    }
-
-                    val gitOps = GitOps(projectPath)
-                    val orphan = OrphanBranchStorage(gitOps)
-                    if (!orphan.exists()) {
-                        Messages.showInfoMessage(project, "No git storage found — nothing to migrate.", "Migration")
-                        return@addActionListener
-                    }
-
-                    val config = SessionTracker.loadConfig()
-                    val repoName = KBPathResolver.extractRepoName(projectPath)
-                    val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
-
-                    // Enumerate every folder that currently holds this repo, then
-                    // archive the whole pile FIRST — the canonical base `<repo>` slot
-                    // included — so migration lands back on the base name instead of
-                    // climbing to an ever-higher `<repo>-N`. Safe to archive up front:
-                    // the migration SOURCE is the orphan branch (system of record), not
-                    // these folders, so a crash mid-migrate self-heals on the next
-                    // activation, which re-migrates into the now-free base slot.
-                    // archiveKBFolder MOVES each folder into the hidden .jolli/archive/
-                    // (not an in-place identity rewrite, which left them visible and
-                    // still git-tracked). Mirrors the VS Code rebuildKnowledgeBase flow.
-                    val staleFolders = KBPathResolver.findRepoFolders(repoName, remoteUrl, config.knowledgeBasePath)
-                    for (stale in staleFolders) {
-                        KBPathResolver.archiveKBFolder(stale, config.knowledgeBasePath)
-                    }
-
-                    // With the pile archived, the base slot is free; resolve to it
-                    // (falling back to a fresh -N only if some folder survived archiving).
-                    val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
-                    KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
-                    val mm = MetadataManager(kbRoot.resolve(".jolli"))
-                    val folder = FolderStorage(kbRoot, mm)
-                    folder.ensure()
-
-                    val engine = MigrationEngine(orphan, folder, mm)
-                    val result = engine.runMigration()
-
-                    if (result.status == "completed") {
-                        Messages.showInfoMessage(project,
-                            "Migration completed: ${result.migratedEntries} memories migrated to\n$kbRoot",
-                            "Migration")
-                    } else {
-                        Messages.showErrorDialog(project,
-                            "Migration finished with status: ${result.status}\n" +
-                                "${result.migratedEntries}/${result.totalEntries} entries processed.",
-                            "Migration")
-                    }
-                } catch (e: Exception) {
-                    Messages.showErrorDialog(project,
-                        "Migration failed: ${e.message}",
-                        "Migration")
-                } finally {
-                    isEnabled = true
-                    text = "Migrate to Memory Bank"
+                val projectPath = service.mainRepoRoot ?: project.basePath ?: ""
+                if (projectPath.isBlank()) {
+                    Messages.showWarningDialog(project, "No project path available.", "Migration")
+                    return@addActionListener
                 }
+                // Every step below shells out to the CLI at least once. Running them on
+                // the EDT — as the previous inline `try { … }` did — can stall the IDE
+                // for several seconds whenever the daemon is unavailable and each call
+                // falls back to a cold-start Node spawn. Move the whole flow onto a
+                // background task, mirroring [doOKAction]'s migration branch; the
+                // button's enabled state and label are reset from the EDT once the task
+                // finishes (or fails), so a mid-flight click can't fire another round.
+                button.isEnabled = false
+                button.text = "Migrating..."
+                ProgressManager.getInstance().run(
+                    object : Task.Backgroundable(project, "Migrating memories to Memory Bank…", false) {
+                        override fun run(indicator: ProgressIndicator) {
+                            indicator.isIndeterminate = true
+                            try {
+                                indicator.text = "Checking git storage…"
+                                val gitOps = GitOps(projectPath)
+                                val storage = StorageFactory.create(gitOps, projectPath)
+                                if (!storage.exists()) {
+                                    SwingUtilities.invokeLater {
+                                        Messages.showInfoMessage(project, "No git storage found — nothing to migrate.", "Migration")
+                                    }
+                                    return
+                                }
+
+                                indicator.text = "Reading configuration…"
+                                val config = SessionTracker.loadConfig()
+                                val repoName = KBPathResolver.extractRepoName(projectPath)
+                                val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
+
+                                // Enumerate every folder that currently holds this repo, then
+                                // archive the whole pile FIRST — the canonical base `<repo>` slot
+                                // included — so migration lands back on the base name instead of
+                                // climbing to an ever-higher `<repo>-N`. Safe to archive up front:
+                                // the migration SOURCE is the orphan branch (system of record), not
+                                // these folders, so a crash mid-migrate self-heals on the next
+                                // activation, which re-migrates into the now-free base slot.
+                                // archiveKBFolder MOVES each folder into the hidden .jolli/archive/
+                                // (not an in-place identity rewrite, which left them visible and
+                                // still git-tracked). Mirrors the VS Code rebuildKnowledgeBase flow.
+                                val staleFolders = KBPathResolver.findRepoFolders(repoName, remoteUrl, config.knowledgeBasePath)
+                                for (stale in staleFolders) {
+                                    indicator.text = "Archiving $stale…"
+                                    KBPathResolver.archiveKBFolder(stale, config.knowledgeBasePath)
+                                }
+
+                                // With the pile archived, the base slot is free; resolve to it
+                                // (falling back to a fresh -N only if some folder survived archiving).
+                                indicator.text = "Initializing Memory Bank…"
+                                val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
+                                KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
+
+                                // Run the migration through the bundled CLI. The CLI resolves the
+                                // same freshly-archived base folder from the shared config and
+                                // copies the orphan-branch data onto disk.
+                                indicator.text = "Migrating memories…"
+                                val result = CliIntegrations.migrateMemoryBank(projectPath)
+
+                                SwingUtilities.invokeLater {
+                                    if (result.status == "completed") {
+                                        Messages.showInfoMessage(project,
+                                            "Migration completed: ${result.migratedEntries} memories migrated to\n$kbRoot",
+                                            "Migration")
+                                    } else {
+                                        Messages.showErrorDialog(project,
+                                            "Migration finished with status: ${result.status}\n" +
+                                                "${result.migratedEntries}/${result.totalEntries} entries processed.",
+                                            "Migration")
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                SwingUtilities.invokeLater {
+                                    Messages.showErrorDialog(project,
+                                        "Migration failed: ${e.message}",
+                                        "Migration")
+                                }
+                            } finally {
+                                SwingUtilities.invokeLater {
+                                    button.isEnabled = true
+                                    button.text = "Migrate to Memory Bank"
+                                }
+                            }
+                        }
+                    },
+                )
             }
         }
     }
@@ -1022,6 +1113,10 @@ class SettingsDialog(
         private const val CARD_JOLLI_OK = "card.jolli.ok"
         private const val CARD_JOLLI_NOKEY = "card.jolli.nokey"
         private const val CARD_JOLLI_SIGNIN = "card.jolli.signin"
+        private const val CARD_LOCAL_AGENT = "card.localagent"
+
+        /** Display label for the local-agent provider — must match the VS Code settings dropdown text. */
+        private const val PROVIDER_LOCAL_AGENT = "Local Agent (subscription)"
         private const val CARD_SYNC_SIGNEDOUT = "card.sync.out"
         private const val CARD_SYNC_NOKEY = "card.sync.nokey"
         private const val CARD_SYNC_SIGNEDIN = "card.sync.in"

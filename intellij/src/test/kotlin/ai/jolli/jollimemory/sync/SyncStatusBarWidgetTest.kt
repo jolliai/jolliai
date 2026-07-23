@@ -22,7 +22,7 @@ import org.junit.jupiter.api.parallel.Isolated
 // MockK stays here because IntelliJ's Project is a huge platform interface a
 // hand-written fake cannot reasonably cover. MockK's recorder is process-global
 // and its instrumentation window raced with concurrent tests even under a
-// shared "mockk" ResourceLock (stubs silently vanished — see GitCommands.kt),
+// shared "mockk" ResourceLock (stubs silently vanished),
 // so mockk users now run @Isolated: the rest of the test plan is suspended
 // while this class executes. Temporary guard — remove when migrated off MockK.
 @Isolated

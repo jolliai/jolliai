@@ -621,6 +621,38 @@ object CliIntegrations {
     }
 
     /**
+     * Returns a directory that [findDaemonForCwd] can match against an open
+     * project so global-scope bridge calls (auth token load, global config
+     * read, KB path resolve, KB repo discovery, summary-tree read) reach the
+     * daemon's ~5-20 ms fast path instead of falling through to the ~500 ms
+     * one-shot Node spawn.
+     *
+     * These callers have no natural project context (they run from global
+     * singletons or from actions whose event has no project) yet the request
+     * itself does not depend on which project answers — it reads global
+     * config or an explicit `dir` inside the request payload. Any open
+     * project's daemon will serve them identically.
+     *
+     * Preference order: first non-disposed open project's canonical
+     * basePath; else `System.getProperty("user.dir")`, preserving the
+     * pre-daemon behavior when no project is open yet.
+     */
+    fun resolveDefaultCwd(): String {
+        val projects = try {
+            com.intellij.openapi.project.ProjectManager.getInstance().openProjects
+        } catch (_: Throwable) {
+            emptyArray()
+        }
+        for (project in projects) {
+            if (project.isDisposed) continue
+            val base = project.basePath ?: continue
+            val canon = runCatching { File(base).canonicalPath }.getOrNull() ?: continue
+            return canon
+        }
+        return System.getProperty("user.dir")
+    }
+
+    /**
      * Reads the JolliMemoryService's mainRepoRoot without forcing service
      * creation. If the service has not been instantiated yet (very early
      * startup) we return null and let the caller consider only basePath.
@@ -670,10 +702,10 @@ object CliIntegrations {
     /**
      * Runs the orphan-branch → Memory Bank folder migration via the bundled CLI's
      * hidden `migrate-memory-bank` command (see
-     * cli/src/commands/MigrateMemoryBankCommand.ts). This replaces the plugin's own
-     * Kotlin `MigrationEngine`: the CLI resolves the Memory Bank root from the shared
-     * config, runs the full migration when it has not completed yet, and otherwise
-     * runs the idempotent stale-child reconcile — matching the VS Code activate path.
+     * cli/src/commands/MigrateMemoryBankCommand.ts). The CLI is the sole migration
+     * implementation: it resolves the Memory Bank root from the shared config,
+     * runs the full migration when it has not completed yet, and otherwise runs
+     * the idempotent stale-child reconcile — matching the VS Code activate path.
      *
      * The command needs no stdin and prints a single JSON line on stdout —
      * `{"type":"migrate-memory-bank","status":…,"migratedEntries":…,"totalEntries":…}`

@@ -1,4 +1,3 @@
-src/test/kotlin/ai/jolli/jollimemory/core/plans/TranscriptPlanDiscoveryTest.kt
 src/test/kotlin/ai/jolli/jollimemory/core/references/TranscriptReferenceDiscoveryTest.kt
 src/test/kotlin/ai/jolli/jollimemory/services/BranchShareControllerTest.kt
 src/test/kotlin/ai/jolli/jollimemory/services/BranchShareModalTest.kt

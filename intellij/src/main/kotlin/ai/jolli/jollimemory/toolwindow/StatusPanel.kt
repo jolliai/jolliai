@@ -1,12 +1,6 @@
 package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.JolliMemoryIcons
-import ai.jolli.jollimemory.core.CodexSessionDiscoverer
-import ai.jolli.jollimemory.core.CopilotChatSupport
-import ai.jolli.jollimemory.core.CopilotSupport
-import ai.jolli.jollimemory.core.GeminiSupport
-import ai.jolli.jollimemory.core.CursorSupport
-import ai.jolli.jollimemory.core.OpenCodeSupport
 import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.StorageFactory
@@ -187,7 +181,7 @@ class StatusPanel(
         }
 
         // 7. Codex Integration (no hooks needed — just detection)
-        val codexDetected = status.codexDetected ?: CodexSessionDiscoverer.isCodexInstalled()
+        val codexDetected = status.codexDetected ?: false
         if (codexDetected) {
             val enabled = config.codexEnabled != false
             addIntegrationRow(
@@ -201,7 +195,7 @@ class StatusPanel(
         }
 
         // 8. Gemini Integration
-        val geminiDetected = status.geminiDetected ?: GeminiSupport.isGeminiInstalled()
+        val geminiDetected = status.geminiDetected ?: false
         if (geminiDetected) {
             val enabled = config.geminiEnabled != false
             addIntegrationRow(
@@ -215,7 +209,7 @@ class StatusPanel(
         }
 
         // 9. OpenCode Integration (no hooks needed — just detection)
-        val openCodeDetected = status.openCodeDetected ?: OpenCodeSupport.isOpenCodeInstalled()
+        val openCodeDetected = status.openCodeDetected ?: false
         if (openCodeDetected) {
             val openCodeEnabled = config.openCodeEnabled != false
             val openCodeScanError = status.openCodeScanError
@@ -239,7 +233,7 @@ class StatusPanel(
         }
 
         // 10. Cursor Integration (no hooks needed — just detection)
-        val cursorDetected = status.cursorDetected ?: CursorSupport.isCursorInstalled()
+        val cursorDetected = status.cursorDetected ?: false
         if (cursorDetected) {
             val cursorEnabled = config.cursorEnabled != false
             val cursorScanError = status.cursorScanError
@@ -263,8 +257,8 @@ class StatusPanel(
         }
 
         // 11. Copilot Integration (no hooks needed — covers both CLI and VS Code Chat under one toggle)
-        val copilotCliDetected = status.copilotDetected ?: CopilotSupport.isCopilotInstalled()
-        val copilotChatDetected = status.copilotChatDetected ?: CopilotChatSupport.isCopilotChatInstalled()
+        val copilotCliDetected = status.copilotDetected ?: false
+        val copilotChatDetected = status.copilotChatDetected ?: false
         val copilotScanError = status.copilotScanError
         val copilotChatScanError = status.copilotChatScanError
         if (copilotScanError != null) {

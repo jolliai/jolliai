@@ -295,7 +295,14 @@ class PinnedPanel(
 				ActiveSessionAggregator.listActiveConversationsWithDiagnostics(cwd).items.firstOrNull {
 					CommitSelectionStore.conversationKey(it.source, it.sessionId) == key
 				}
-			} catch (_: Exception) { null }
+			} catch (e: Exception) {
+				// The click silently no-ops if the bridge is down. At least log so a
+				// user report can be traced back to a transport failure rather than
+				// a missing pinned session.
+				ai.jolli.jollimemory.core.JmLogger.create("PinnedPanel")
+					.warn("openConversation: listActiveConversations failed for key=%s: %s", key, e.message)
+				null
+			}
 			SwingUtilities.invokeLater {
 				if (item != null) {
 					FileEditorManager.getInstance(project).openFile(ConversationVirtualFile(item, cwd), true)

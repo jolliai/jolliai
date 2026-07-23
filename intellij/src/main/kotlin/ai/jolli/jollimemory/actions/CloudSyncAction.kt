@@ -6,6 +6,7 @@ import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
 import ai.jolli.jollimemory.sync.SyncActivation
 import com.intellij.ide.ActivityTracker
+import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.application.ApplicationManager
@@ -44,6 +45,13 @@ class CloudSyncAction : AnAction() {
 			ActivityTracker.getInstance().inc()
 		}
 	}
+
+	// update() lands in JolliAuthService.isSignedIn() which round-trips through
+	// the CLI. The daemon fast path is ~5-20 ms, but a fresh IDE with no
+	// daemon yet falls back to a ~500 ms one-shot Node spawn. Declaring the
+	// update off the EDT keeps that worst case from blocking the UI past the
+	// platform's 300 ms slow-EDT threshold.
+	override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
 
 	override fun update(e: AnActionEvent) {
 		val signedIn = JolliAuthService.isSignedIn()
