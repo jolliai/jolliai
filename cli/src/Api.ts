@@ -28,6 +28,7 @@ import { registerBindCommand, registerPushCommand, registerSpacesCommand } from 
 import { registerMcpCommand } from "./commands/McpCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
 import { registerMigrateMemoryBankCommand } from "./commands/MigrateMemoryBankCommand.js";
+import { registerMovedCommandNotices } from "./commands/MovedCommandNotices.js";
 import { registerOpenUrlCommand } from "./commands/OpenUrlCommand.js";
 import { registerPrDescriptionCommand } from "./commands/PrDescriptionCommand.js";
 import { registerQueueStatusCommand } from "./commands/QueueStatusCommand.js";
@@ -45,6 +46,7 @@ import { registerViewCommand } from "./commands/ViewCommand.js";
 import { parseBaseUrl as _parseBaseUrl, parseJolliApiKey as _parseJolliApiKey } from "./core/JolliApiUtils.js";
 import { installCommandTelemetryHooks } from "./core/TelemetryCommandHook.js";
 import { CLI_PACKAGE_NAME, REFRESH_COMMAND, refreshUpdateCache } from "./core/UpdateCheck.js";
+import { autoRefreshSkillsIfStale } from "./install/SkillAutoRefresh.js";
 import type { Logger } from "./Logger.js";
 import { loadPlugins, registerMissingStubs } from "./PluginLoader.js";
 
@@ -144,6 +146,14 @@ export const parseBaseUrl = _parseBaseUrl;
 
 /** Internal commands hidden from `--help` (still callable by name). */
 const HIDDEN_COMMANDS = new Set(["migrate", "export-prompt"]);
+
+/**
+ * Commands that own skill lifecycle themselves — the startup skill auto-refresh
+ * ({@link autoRefreshSkillsIfStale}) is skipped for these so it never re-adds
+ * skills an `uninstall` is about to remove, or double-writes what `enable`
+ * already reconciles this same invocation.
+ */
+const SKILL_LIFECYCLE_COMMANDS = new Set(["enable", "disable", "uninstall"]);
 
 /**
  * Read Commander's per-command hidden flag without locking into a specific
@@ -403,6 +413,14 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	const { loaded: loadedPluginIds, diagnostics: pluginDiagnostics } = await loadPlugins(program, VERSION);
 	registerMissingStubs(program, loadedPluginIds);
 
+	// Hidden notices for the flat workflow-run command names removed when that
+	// surface moved to @jolli.ai/workflow-cli. A stale on-disk recipe (from a
+	// pre-migration enable, on a host upgraded without a re-enable) that still
+	// shells an old name gets a clear "command moved / skills refreshed / re-run"
+	// message instead of Commander's bare unknown-command error. Registered after
+	// stubs so a real command that owns a name always wins.
+	registerMovedCommandNotices(program);
+
 	// Hidden subcommand spawned by checkVersionMismatch's detached refresh:
 	// queries npm for the latest version of the CLI + the given plugins and
 	// rewrites update-check.json. Never user-invoked directly.
@@ -422,6 +440,15 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	// TTY: piped (`jolli | cat`) or CI runs fall through to `parseAsync`, which
 	// prints the grouped help and never blocks or prompts.
 	const userArgs = args ?? process.argv.slice(2);
+
+	// Self-heal stale on-disk skill recipes for CLI-only users who upgraded the
+	// global package without re-running `jolli enable` (the only other place skills
+	// refresh). Version-guarded + fail-soft. Skip the commands that own skill
+	// lifecycle themselves, so a refresh never fights an in-progress uninstall.
+	const invokedCommand = userArgs.find((a) => !a.startsWith("-"));
+	if (invokedCommand === undefined || !SKILL_LIFECYCLE_COMMANDS.has(invokedCommand)) {
+		await autoRefreshSkillsIfStale(process.cwd());
+	}
 	if (userArgs.length === 0 && process.stdin.isTTY === true && process.stdout.isTTY === true) {
 		await runGuidedFrontDoor();
 		return;

@@ -186,6 +186,14 @@ vi.mock("./install/Installer.js", () => ({
 	}),
 }));
 
+// Startup skill auto-refresh is a real filesystem side-effect (it walks up from
+// cwd and rewrites skills in whatever enabled repo it finds — which, under the
+// test runner, is this very repo). Neutralize it here, as with the other startup
+// side-effects above; its own behavior is covered in SkillAutoRefresh.test.ts.
+vi.mock("./install/SkillAutoRefresh.js", () => ({
+	autoRefreshSkillsIfStale: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("./core/RepoProfile.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./core/RepoProfile.js")>();
 	return {
