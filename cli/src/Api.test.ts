@@ -142,6 +142,15 @@ vi.mock("open", () => ({
 vi.mock("./auth/Login.js", () => ({
 	browserLogin: vi.fn().mockResolvedValue(undefined),
 }));
+vi.mock("./core/localagent/ClaudeExecutableResolver.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./core/localagent/ClaudeExecutableResolver.js")>();
+	// Default: no local agent detected, so `promptSetup` shows the provider menu
+	// deterministically (never shells out to a real `claude` during tests).
+	return { ...actual, isClaudeCodeUsable: vi.fn(() => false) };
+});
+vi.mock("./commands/OptionalLogin.js", () => ({
+	offerOptionalJolliLogin: vi.fn().mockResolvedValue(undefined),
+}));
 
 vi.mock("./hooks/PushCompensation.js", () => ({
 	triggerPendingPushRetry: vi.fn().mockResolvedValue(undefined),
@@ -3452,29 +3461,25 @@ describe("CLI", () => {
 		});
 
 		it("should run promptSetup after install when interactive", async () => {
-			// Choose "4" (skip), then skip Anthropic key
-			mockUserInput("4", "");
+			// No local agent detected (mocked false) → the provider menu appears. Skip (3).
+			mockUserInput("3");
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 
 			try {
 				await main(["enable"]);
 
-				// promptSetup was reached — it printed the setup menu
 				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
-				expect(calls.some((s) => s.includes("How would you like to use Jolli Memory"))).toBe(true);
+				expect(calls.some((s) => s.includes("How would you like to generate summaries"))).toBe(true);
 			} finally {
 				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
 			}
 		});
 
-		it("should save API keys and print confirmation when keys are entered interactively", async () => {
+		it("should save an Anthropic key entered interactively (menu choice 2)", async () => {
 			const { saveConfigScoped } = await import("./core/SessionTracker.js");
-			// Construct an on-allowlist key so the new validateJolliApiKey gate passes.
-			const goodMeta = { t: "tenant1", u: "https://tenant1.jolli.ai" };
-			const goodJolliKey = `sk-jol-${Buffer.from(JSON.stringify(goodMeta)).toString("base64url")}.secret`;
-			// Choose "2" (manual Jolli API key), enter key, then enter Anthropic key
-			mockUserInput("2", goodJolliKey, "sk-ant-test-key");
+			// Choice "2" = enter an Anthropic key.
+			mockUserInput("2", "sk-ant-test-key");
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 
@@ -3482,10 +3487,12 @@ describe("CLI", () => {
 				await main(["enable"]);
 
 				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
-				expect(calls.some((s) => s.includes("Jolli API Key:     saved"))).toBe(true);
 				expect(calls.some((s) => s.includes("Anthropic API Key: saved"))).toBe(true);
 				expect(calls.some((s) => s.includes("Configuration saved"))).toBe(true);
-				expect(saveConfigScoped).toHaveBeenCalled();
+				expect(saveConfigScoped).toHaveBeenCalledWith(
+					expect.objectContaining({ apiKey: "sk-ant-test-key", aiProvider: "anthropic" }),
+					expect.any(String),
+				);
 			} finally {
 				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
 			}
@@ -3513,9 +3520,8 @@ describe("CLI", () => {
 			}
 		});
 
-		it("should display no-API-keys warning when setup is skipped", async () => {
-			// Choose "4" (skip), then skip Anthropic key
-			mockUserInput("4", "");
+		it("should print skip guidance when setup is skipped (menu choice 3)", async () => {
+			mockUserInput("3");
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 			const origKey = process.env.ANTHROPIC_API_KEY;
@@ -3532,12 +3538,12 @@ describe("CLI", () => {
 			}
 		});
 
-		it("should select the Local Agent provider on choice 3 (no key, no Anthropic prompt)", async () => {
+		it("should auto-select Local Agent when a working claude is detected (no menu)", async () => {
 			const { saveConfigScoped } = await import("./core/SessionTracker.js");
-			// Choose "3" (Local Agent). No further input — a fallthrough to the
-			// Anthropic prompt would hang on a missing second answer, so reaching the
-			// end proves the self-sufficient early return.
-			mockUserInput("3");
+			const { isClaudeCodeUsable } = await import("./core/localagent/ClaudeExecutableResolver.js");
+			vi.mocked(isClaudeCodeUsable).mockReturnValue(true);
+			// No menu input — detection auto-selects local agent and returns.
+			mockUserInput();
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 
@@ -3549,11 +3555,12 @@ describe("CLI", () => {
 					expect.any(String),
 				);
 				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
-				expect(calls.some((s) => s.includes("Local Agent (Claude Code subscription)"))).toBe(true);
-				// Self-sufficient: the Anthropic-key prompt must NOT run.
-				expect(calls.some((s) => s.includes("Anthropic API Key"))).toBe(false);
+				expect(calls.some((s) => s.includes("Detected Claude Code"))).toBe(true);
+				// Auto-detected → the provider menu must NOT appear.
+				expect(calls.some((s) => s.includes("How would you like to generate summaries"))).toBe(false);
 			} finally {
 				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
+				vi.mocked(isClaudeCodeUsable).mockReturnValue(false);
 			}
 		});
 
@@ -3631,109 +3638,148 @@ describe("CLI", () => {
 			}
 		});
 
-		it("should show empty line when keys are saved after manual entry", async () => {
-			const { loadConfigFromDir } = await import("./core/SessionTracker.js");
-			// Construct an on-allowlist key so the new validateJolliApiKey gate passes.
-			const goodMeta = { t: "tenant1", u: "https://tenant1.jolli.ai" };
-			const goodJolliKey = `sk-jol-${Buffer.from(JSON.stringify(goodMeta)).toString("base64url")}.secret`;
-			// Choose "2" (manual), enter Jolli key, enter Anthropic key
-			mockUserInput("2", goodJolliKey, "sk-ant-test");
-			mockExistsSync.mockReturnValue(false);
-			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-			// Mock the 3 calls to loadConfigFromDir:
-			// 1. initial check in promptSetup (empty, show menu)
-			// 2. after manual key entry, check for Anthropic key (has Jolli key now)
-			// 3. final state check in promptAnthropicKey (has both keys)
-			vi.mocked(loadConfigFromDir)
-				.mockResolvedValueOnce({})
-				.mockResolvedValueOnce({ jolliApiKey: goodJolliKey })
-				.mockResolvedValueOnce({ jolliApiKey: goodJolliKey, apiKey: "sk-ant-test" });
-
-			try {
-				await main(["enable"]);
-
-				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
-				expect(calls.some((s) => s.includes("Jolli API Key:     saved"))).toBe(true);
-				expect(calls.some((s) => s.includes("Anthropic API Key: saved"))).toBe(true);
-			} finally {
-				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
-			}
-		});
-
-		it("should error and set exit code when manual Jolli key fails validation", async () => {
+		it("menu choice 2 then empty Anthropic key → nothing saved for that provider", async () => {
 			const { saveConfigScoped } = await import("./core/SessionTracker.js");
 			vi.mocked(saveConfigScoped).mockClear();
-			// Choose "2" (manual), enter a key that parseJolliApiKey will reject (no sk-jol- prefix),
-			// then skip the Anthropic key prompt that follows.
-			mockUserInput("2", "bad-key", "");
+			mockUserInput("2", ""); // choose Anthropic, then press Enter (skip the key)
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-			const origKey = process.env.ANTHROPIC_API_KEY;
-			delete process.env.ANTHROPIC_API_KEY;
 
 			try {
 				await main(["enable"]);
-
-				const errorCalls = errorSpy.mock.calls.map((c) => String(c[0]));
-				expect(errorCalls.some((s) => s.includes("Error:"))).toBe(true);
-				expect(process.exitCode).toBe(1);
-				// validateJolliApiKey threw before saveConfigScoped could persist the key.
-				expect(saveConfigScoped).not.toHaveBeenCalled();
+				expect(saveConfigScoped).not.toHaveBeenCalledWith(
+					expect.objectContaining({ aiProvider: "anthropic" }),
+					expect.any(String),
+				);
 			} finally {
 				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
-				errorSpy.mockRestore();
-				if (origKey !== undefined) process.env.ANTHROPIC_API_KEY = origKey;
 			}
 		});
 
-		it("should show no-API-keys warning when manual key is skipped and no Anthropic key", async () => {
-			// Choose "2" (manual), skip Jolli API key, skip Anthropic key
-			mockUserInput("2", "", "");
+		it("enable nudge: Anthropic configured but not signed in → offers sign-in", async () => {
+			const { offerOptionalJolliLogin } = await import("./commands/OptionalLogin.js");
+			const { loadConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(offerOptionalJolliLogin).mockClear();
+			// After promptSetup the config shows an Anthropic key and no Jolli credential.
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-ant-x", aiProvider: "anthropic" });
+			mockUserInput("2", "sk-ant-x");
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-			const origKey = process.env.ANTHROPIC_API_KEY;
-			delete process.env.ANTHROPIC_API_KEY;
 
 			try {
 				await main(["enable"]);
-
-				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
-				expect(calls.some((s) => s.includes("No API keys configured"))).toBe(true);
+				expect(offerOptionalJolliLogin).toHaveBeenCalled();
 			} finally {
 				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
-				if (origKey !== undefined) process.env.ANTHROPIC_API_KEY = origKey;
+				// Restore the factory default so the persistent override doesn't bleed
+				// into later tests (beforeEach uses clearAllMocks, not resetAllMocks).
+				vi.mocked(loadConfig).mockResolvedValue({});
 			}
 		});
 
-		it("should show no-API-keys warning after browser login when only authToken is saved", async () => {
-			// Simulates the partial-setup case: OAuth succeeds and an authToken is
-			// saved, but backend key-generation fails so no jolliApiKey is set. The
-			// warning must still appear since authToken alone can't drive summaries.
-			const { loadConfigFromDir } = await import("./core/SessionTracker.js");
-			// Choose "1" (browser login), then skip Anthropic key
-			mockUserInput("1", "");
+		it("enable nudge: already can sync (Jolli key) → no sign-in offer", async () => {
+			const { offerOptionalJolliLogin } = await import("./commands/OptionalLogin.js");
+			const { loadConfig, loadConfigFromDir } = await import("./core/SessionTracker.js");
+			vi.mocked(offerOptionalJolliLogin).mockClear();
+			vi.mocked(loadConfigFromDir).mockResolvedValueOnce({ jolliApiKey: "sk-jol-x", apiKey: "sk-ant-x" });
+			vi.mocked(loadConfig).mockResolvedValue({ jolliApiKey: "sk-jol-x" });
+			mockUserInput();
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-			const origKey = process.env.ANTHROPIC_API_KEY;
-			delete process.env.ANTHROPIC_API_KEY;
-			// loadConfigFromDir calls: (1) initial in promptSetup — empty (show menu);
-			// (2) after browserLogin — authToken only; (3) after Jolli setup in
-			// promptSetup; (4) final state check in promptAnthropicKey.
-			vi.mocked(loadConfigFromDir)
-				.mockResolvedValueOnce({})
-				.mockResolvedValueOnce({ authToken: "tok" })
-				.mockResolvedValueOnce({ authToken: "tok" })
-				.mockResolvedValueOnce({ authToken: "tok" });
 
 			try {
 				await main(["enable"]);
+				expect(offerOptionalJolliLogin).not.toHaveBeenCalled();
+			} finally {
+				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
+				vi.mocked(loadConfig).mockResolvedValue({});
+			}
+		});
 
-				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
-				expect(calls.some((s) => s.includes("No API keys configured"))).toBe(true);
+		it("enable nudge: local-agent generation, not signed in → offers sign-in", async () => {
+			const { offerOptionalJolliLogin } = await import("./commands/OptionalLogin.js");
+			const { loadConfig } = await import("./core/SessionTracker.js");
+			const { isClaudeCodeUsable } = await import("./core/localagent/ClaudeExecutableResolver.js");
+			vi.mocked(offerOptionalJolliLogin).mockClear();
+			vi.mocked(isClaudeCodeUsable).mockReturnValue(true);
+			vi.mocked(loadConfig).mockResolvedValue({ aiProvider: "local-agent" });
+			mockUserInput();
+			mockExistsSync.mockReturnValue(false);
+			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+
+			try {
+				await main(["enable"]);
+				expect(offerOptionalJolliLogin).toHaveBeenCalled();
+			} finally {
+				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
+				vi.mocked(isClaudeCodeUsable).mockReturnValue(false);
+				vi.mocked(loadConfig).mockResolvedValue({});
+			}
+		});
+
+		it("jolliApiKey configured, no Anthropic → prompts and saves an Anthropic key", async () => {
+			const { saveConfigScoped, loadConfigFromDir } = await import("./core/SessionTracker.js");
+			vi.mocked(saveConfigScoped).mockClear();
+			vi.mocked(loadConfigFromDir).mockReset();
+			vi.mocked(loadConfigFromDir).mockResolvedValue({ jolliApiKey: "sk-jol-x" });
+			const origKey = process.env.ANTHROPIC_API_KEY;
+			delete process.env.ANTHROPIC_API_KEY;
+			mockUserInput("sk-ant-new");
+			mockExistsSync.mockReturnValue(false);
+			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+
+			try {
+				await main(["enable"]);
+				expect(saveConfigScoped).toHaveBeenCalledWith(
+					expect.objectContaining({ apiKey: "sk-ant-new" }),
+					expect.any(String),
+				);
 			} finally {
 				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
 				if (origKey !== undefined) process.env.ANTHROPIC_API_KEY = origKey;
+				vi.mocked(loadConfigFromDir).mockReset();
+				vi.mocked(loadConfigFromDir).mockResolvedValue({});
+			}
+		});
+
+		it("jolliApiKey configured, empty Anthropic input → no Anthropic key saved", async () => {
+			const { saveConfigScoped, loadConfigFromDir } = await import("./core/SessionTracker.js");
+			vi.mocked(saveConfigScoped).mockClear();
+			vi.mocked(loadConfigFromDir).mockReset();
+			vi.mocked(loadConfigFromDir).mockResolvedValue({ jolliApiKey: "sk-jol-x" });
+			const origKey = process.env.ANTHROPIC_API_KEY;
+			delete process.env.ANTHROPIC_API_KEY;
+			mockUserInput(""); // press Enter → skip
+			mockExistsSync.mockReturnValue(false);
+			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+
+			try {
+				await main(["enable"]);
+				expect(saveConfigScoped).not.toHaveBeenCalledWith(
+					expect.objectContaining({ apiKey: expect.any(String) }),
+					expect.any(String),
+				);
+			} finally {
+				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
+				if (origKey !== undefined) process.env.ANTHROPIC_API_KEY = origKey;
+				vi.mocked(loadConfigFromDir).mockReset();
+				vi.mocked(loadConfigFromDir).mockResolvedValue({});
+			}
+		});
+
+		it("browser login (menu choice 1) completes the interactive enable", async () => {
+			const { browserLogin } = await import("./auth/Login.js");
+			// No local agent → menu → choice "1" = browser login. Terminal choice
+			// (no Anthropic fall-through), so a single answer is enough.
+			mockUserInput("1");
+			mockExistsSync.mockReturnValue(false);
+			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+
+			try {
+				await main(["enable"]);
+				expect(browserLogin).toHaveBeenCalled();
+			} finally {
+				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
 			}
 		});
 	});
@@ -5901,12 +5947,22 @@ describe("CLI", () => {
 		});
 
 		it("should skip prompts for already-configured API keys", async () => {
-			vi.mocked(loadConfigFromDir).mockResolvedValueOnce({ jolliApiKey: "existing", apiKey: "existing" });
+			const { loadConfigFromDir } = await import("./core/SessionTracker.js");
+			// Hermetic: drain any leftover mockResolvedValueOnce from prior tests
+			// (the shared beforeEach uses clearAllMocks, which doesn't clear the
+			// once-queue) and return a fully-configured config for every read.
+			vi.mocked(loadConfigFromDir).mockReset();
+			vi.mocked(loadConfigFromDir).mockResolvedValue({ jolliApiKey: "existing", apiKey: "existing" });
 
-			await main(["enable", "--cwd", "/tmp/test-project"]);
+			try {
+				await main(["enable", "--cwd", "/tmp/test-project"]);
 
-			expect(console.log).toHaveBeenCalledWith(expect.stringContaining("configured"));
-			expect(mockQuestion).not.toHaveBeenCalled();
+				expect(console.log).toHaveBeenCalledWith(expect.stringContaining("configured"));
+				expect(mockQuestion).not.toHaveBeenCalled();
+			} finally {
+				vi.mocked(loadConfigFromDir).mockReset();
+				vi.mocked(loadConfigFromDir).mockResolvedValue({});
+			}
 		});
 	});
 

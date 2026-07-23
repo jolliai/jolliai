@@ -7,11 +7,12 @@
 
 import { join } from "node:path";
 import { type Command, Option } from "commander";
-import { getJolliUrl } from "../auth/AuthConfig.js";
+import { getJolliUrl, loadAuthToken } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
-import { validateJolliApiKey } from "../core/JolliApiUtils.js";
-import { getGlobalConfigDir, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
+import { resolveLlmCredentialSource } from "../core/LlmClient.js";
+import { isClaudeCodeUsable } from "../core/localagent/ClaudeExecutableResolver.js";
+import { getGlobalConfigDir, loadConfig, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
 import { markSkipExitFlush } from "../core/TelemetryCommandHook.js";
 import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
@@ -20,52 +21,70 @@ import { install, uninstall } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { InstallResult, JolliMemoryConfig } from "../Types.js";
 import { isInteractive, promptText, resolveProjectDir } from "./CliUtils.js";
+import { offerOptionalJolliLogin } from "./OptionalLogin.js";
 
 const log = createLogger("EnableCommand");
 
 /**
- * Interactive setup flow after hooks are installed.
- * Offers browser login (recommended), manual API key entry, or skip.
- * Always uses the global config directory.
+ * Interactive provider-setup flow after hooks are installed. When a fresh config
+ * meets a working local Claude Code CLI it auto-selects the local agent and
+ * returns; otherwise it offers browser sign-in (recommended), an Anthropic key,
+ * or skip. Always uses the global config directory. Shared by `jolli enable` and
+ * the bare-`jolli` guided front door.
  */
 export async function promptSetup(): Promise<void> {
 	const configDir = getGlobalConfigDir();
 	const config = await loadConfigFromDir(configDir);
 
-	// If jolliApiKey is already configured, skip the setup menu
+	// Already signed in / holding a Jolli key → skip the provider menu.
 	if (config.jolliApiKey) {
 		console.log("\n  Jolli API Key:     configured ✓");
 		await promptAnthropicKey(configDir, config);
 		return;
 	}
 
-	console.log("\n  How would you like to use Jolli Memory?\n");
-	console.log("    1. Sign up / Sign in to Jolli (recommended)");
-	console.log("    2. Enter Jolli API Key manually");
-	console.log("    3. Use a local agent CLI — Claude Code subscription, no API key");
-	console.log("    4. Skip for now (configure later)");
+	// Zero-friction default: when nothing is configured yet AND a working local
+	// Claude Code CLI is present, generate summaries through the user's own
+	// subscription (no API key, no sign-in) and skip the menu entirely. Probe
+	// ONLY on a truly fresh config so an existing Anthropic key or a deliberate
+	// provider choice is never second-guessed (and so an already-configured
+	// re-run never pays for the subprocess probe).
+	const fresh = !config.apiKey && !process.env.ANTHROPIC_API_KEY && config.aiProvider === undefined;
+	let noLocalAgent = false;
+	if (fresh) {
+		if (isClaudeCodeUsable({ overridePath: config.localAgentPath })) {
+			await handleLocalAgent(configDir);
+			return;
+		}
+		noLocalAgent = true;
+	}
+
+	// No local agent: the only ways to generate are the Jolli proxy (sign in) or
+	// a direct Anthropic key. "Skip" defers setup — hooks still install, nothing
+	// generates until configured. (Manual Jolli-key entry was retired; set one
+	// with `jolli configure` if needed.)
+	console.log(
+		noLocalAgent
+			? "\n  No local agent CLI found. How would you like to generate summaries?\n"
+			: "\n  How would you like to generate summaries?\n",
+	);
+	console.log("    1. Sign up / Sign in to Jolli (browser login)   [recommended]");
+	console.log("    2. Enter Anthropic API key (sk-ant-...)");
+	console.log("    3. Skip for now (configure later)");
 
 	const answer = await promptText("\n  Choice [1]: ");
 	const choice = answer.trim() || "1";
 
-	if (choice === "1") {
-		await handleBrowserLogin();
-	} else if (choice === "2") {
-		await handleManualApiKey(configDir);
+	// Each choice is terminal — no fall-through to the Anthropic-key prompt (that
+	// stays only on the "already have a Jolli key" path above).
+	if (choice === "2") {
+		await handleAnthropicKey(configDir);
 	} else if (choice === "3") {
-		await handleLocalAgent(configDir);
-		// Local Agent is self-sufficient (drives the tool's own login, holds no
-		// jollimemory key), so skip the Anthropic-key fallback below.
-		return;
-	} else {
-		console.log(`\n  Skipped. You can configure later with 'jolli auth login' or edit:`);
+		console.log("\n  Skipped. Configure later with 'jolli auth login' or 'jolli configure'.");
 		console.log(`    ${join(configDir, "config.json")}\n`);
-		return;
+	} else {
+		await handleBrowserLogin();
 	}
-
-	// After Jolli setup, offer Anthropic key if not configured
-	const updatedConfig = await loadConfigFromDir(configDir);
-	await promptAnthropicKey(configDir, updatedConfig);
 }
 
 /** Opens the browser for OAuth login/signup and saves credentials on callback. */
@@ -84,68 +103,49 @@ async function handleBrowserLogin(): Promise<void> {
 	}
 }
 
-/** Prompts for a Jolli API key and saves it to config. */
-async function handleManualApiKey(configDir: string): Promise<void> {
-	console.log("\n  API Key Configuration");
-	console.log("  ──────────────────────────────────────");
-
-	const key = await promptText("  Jolli API Key (press Enter to skip): ");
+/** Prompts for an Anthropic API key and pins the provider to Anthropic. */
+async function handleAnthropicKey(configDir: string): Promise<void> {
+	const key = await promptText("\n  Anthropic API Key (press Enter to skip): ");
 	if (key) {
-		try {
-			validateJolliApiKey(key);
-		} catch (err) {
-			console.error(`\n  Error: ${(err as Error).message}\n`);
-			process.exitCode = 1;
-			return;
-		}
-		await saveConfigScoped({ jolliApiKey: key } as Partial<JolliMemoryConfig>, configDir);
-		console.log("  Jolli API Key:     saved ✓");
+		await saveConfigScoped({ apiKey: key, aiProvider: "anthropic" } as Partial<JolliMemoryConfig>, configDir);
+		console.log("  Anthropic API Key: saved ✓");
 		console.log(`\n  Configuration saved to ${join(configDir, "config.json")}`);
 	}
 }
 
 /**
- * Selects the Local Agent provider: summaries are generated by driving a
- * locally-installed agent CLI (v1: Claude Code) through its own subscription
- * login, so no jollimemory-held API key is stored. Self-sufficient — the caller
- * does not fall through to the Anthropic-key prompt. Binary liveness is verified
- * by `jolli doctor`, which probes that `claude` is installed and accepts the
- * flags we pass.
+ * Auto-selects the Local Agent provider after a working Claude Code CLI is
+ * detected: summaries are generated by driving the local `claude` (v1) through
+ * the user's own subscription, so no jollimemory-held API key is stored. Reached
+ * only when {@link isClaudeCodeUsable} already returned true on a fresh config,
+ * so the message states the detection plainly and points at how to change it.
  */
 async function handleLocalAgent(configDir: string): Promise<void> {
 	await saveConfigScoped(
 		{ aiProvider: "local-agent", localAgentTool: "claude-code" } as Partial<JolliMemoryConfig>,
 		configDir,
 	);
-	console.log("\n  AI provider:       Local Agent (Claude Code subscription) ✓");
-	console.log("  No API key needed — summaries run through your local `claude` login.");
-	console.log("  Run 'jolli doctor' to verify the claude CLI is installed and signed in.");
+	console.log("\n  ✓ Detected Claude Code — using your subscription to generate summaries (claude -p), no API key.");
+	console.log("  Summaries run through your local `claude` login.");
+	console.log("  Change this anytime: 'jolli auth login', or 'jolli configure --set aiProvider=jolli'.");
 	console.log(`\n  Configuration saved to ${join(configDir, "config.json")}\n`);
 }
 
-/** Prompts for an Anthropic API key if not already configured. */
+/**
+ * Offers an Anthropic API key on the "already have a Jolli key" path (its only
+ * caller — a jolliApiKey is always present here, so summaries can already be
+ * generated; this just lets the user add a direct key on top).
+ */
 async function promptAnthropicKey(configDir: string, config: JolliMemoryConfig): Promise<void> {
 	if (config.apiKey || process.env.ANTHROPIC_API_KEY) {
 		console.log("  Anthropic API Key: configured ✓\n");
 		return;
 	}
-
 	const key = await promptText("  Anthropic API Key (press Enter to skip): ");
 	if (key) {
 		await saveConfigScoped({ apiKey: key } as Partial<JolliMemoryConfig>, configDir);
 		console.log("  Anthropic API Key: saved ✓");
 		console.log(`\n  Configuration saved to ${join(configDir, "config.json")}`);
-	}
-
-	// Check final state
-	const updatedConfig = await loadConfigFromDir(configDir);
-	const hasJolliKey = Boolean(updatedConfig.jolliApiKey);
-	const hasAnthropicKey = updatedConfig.apiKey || process.env.ANTHROPIC_API_KEY;
-
-	if (!hasJolliKey && !hasAnthropicKey) {
-		console.log("\n  Warning: No API keys configured. Jolli Memory summaries will not be generated.");
-		console.log("  Run 'jolli auth login' or 'jolli enable' again to configure, or edit config manually:");
-		console.log(`    ${join(configDir, "config.json")}\n`);
 	} else {
 		console.log("");
 	}
@@ -277,9 +277,22 @@ async function reportEnableResult(
 		console.log("  Jolli Memory (never your code, paths, or memory content). Turn it off with");
 		console.log("  'jolli telemetry off' (or DO_NOT_TRACK=1) · https://www.jolli.ai/telemetry");
 
-		// Step 2: Interactive API key configuration
+		// Step 2: Interactive provider configuration
 		if (isInteractive() && !options.yes) {
 			await promptSetup();
+			// Sign-in nudge (parity with the guided front door's Rung 2): a user
+			// who just configured local-agent / Anthropic generation but isn't
+			// signed in gets offered cloud sync once. Kept INSIDE the interactive
+			// guard so `-y` / non-interactive runs never open a browser login.
+			const cfg = await loadConfig();
+			const canGenerate =
+				cfg.aiProvider === "local-agent"
+					? isClaudeCodeUsable({ overridePath: cfg.localAgentPath })
+					: resolveLlmCredentialSource(cfg) !== null;
+			const canSync = Boolean((await loadAuthToken()) || cfg.jolliApiKey);
+			if (canGenerate && !canSync) {
+				await offerOptionalJolliLogin();
+			}
 		} else {
 			// Non-interactive: print manual config guide
 			const configDir = getGlobalConfigDir();

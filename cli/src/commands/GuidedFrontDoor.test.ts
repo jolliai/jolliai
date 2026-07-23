@@ -22,6 +22,8 @@ const h = vi.hoisted(() => ({
 	getGlobalConfigDir: vi.fn(),
 	loadUserProfile: vi.fn(),
 	saveUserProfile: vi.fn(),
+	isInsideGitWorkTree: vi.fn(),
+	isClaudeCodeUsable: vi.fn(),
 }));
 
 vi.mock("../auth/AuthConfig.js", () => ({ loadAuthToken: h.loadAuthToken, getJolliUrl: h.getJolliUrl }));
@@ -50,7 +52,16 @@ vi.mock("./SpaceSyncStep.js", () => ({ runSpaceSyncStep: h.runSpaceSyncStep }));
 vi.mock("./BackfillFrontDoorStep.js", () => ({ runBackfillFrontDoorStep: h.runBackfillFrontDoorStep }));
 vi.mock("./CliUtils.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./CliUtils.js")>();
-	return { ...actual, promptText: h.promptText, resolveProjectDir: h.resolveProjectDir };
+	return {
+		...actual,
+		promptText: h.promptText,
+		resolveProjectDir: h.resolveProjectDir,
+		isInsideGitWorkTree: h.isInsideGitWorkTree,
+	};
+});
+vi.mock("../core/localagent/ClaudeExecutableResolver.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/localagent/ClaudeExecutableResolver.js")>();
+	return { ...actual, isClaudeCodeUsable: h.isClaudeCodeUsable };
 });
 
 import { getGuidedFrontDoorStatus, runGuidedFrontDoor } from "./GuidedFrontDoor.js";
@@ -102,6 +113,8 @@ describe("GuidedFrontDoor", () => {
 		h.promptSetup.mockResolvedValue(undefined);
 		h.loadUserProfile.mockResolvedValue({});
 		h.saveUserProfile.mockResolvedValue(undefined);
+		h.isInsideGitWorkTree.mockReturnValue(true);
+		h.isClaudeCodeUsable.mockReturnValue(true);
 	});
 
 	afterEach(() => {
@@ -195,7 +208,7 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).not.toContain("signed in ·");
 		expect(out()).toContain("Jolli is listening");
 		expect(h.browserLogin).not.toHaveBeenCalled();
-		expect(h.promptText).not.toHaveBeenCalledWith(expect.stringContaining("Sign in now to sync"));
+		expect(h.promptText).not.toHaveBeenCalledWith(expect.stringContaining("Sign in to Jolli to sync"));
 	});
 
 	it("ANTHROPIC_API_KEY env counts as a credential (status line names Anthropic)", async () => {
@@ -232,7 +245,7 @@ describe("GuidedFrontDoor", () => {
 		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x", jolliApiKey: "sk-jol-x", aiProvider: "anthropic" });
 		await runGuidedFrontDoor();
 		expect(out()).toContain("Anthropic API key set (not signed in to Jolli)");
-		expect(h.promptText).not.toHaveBeenCalledWith(expect.stringContaining("Sign in now to sync"));
+		expect(h.promptText).not.toHaveBeenCalledWith(expect.stringContaining("Sign in to Jolli to sync"));
 		expect(h.browserLogin).not.toHaveBeenCalled();
 		expect(out()).toContain("Jolli is listening");
 	});
@@ -252,6 +265,10 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).toContain("5 memories");
 		expect(out()).toContain("signed in");
 		expect(out()).toContain("Restart your AI agent session");
+		// Concise install confirmation (repo basename of the mocked "/repo").
+		expect(out()).toContain("Git hooks added");
+		expect(out()).toContain("Agent hooks + MCP server added");
+		expect(out()).toContain("Jolli Memory enabled in repo");
 	});
 
 	it("front-door enable that FAILS does not clear the manual-disable opt-out", async () => {
@@ -350,7 +367,9 @@ describe("GuidedFrontDoor", () => {
 		await runGuidedFrontDoor();
 
 		expect(out()).toContain("Anthropic API key set (not signed in to Jolli)");
-		expect(h.promptText).toHaveBeenCalledWith(expect.stringContaining("Sign in now to sync memories to a Space"));
+		expect(h.promptText).toHaveBeenCalledWith(
+			expect.stringContaining("Sign in to Jolli to sync memories to a Space"),
+		);
 		expect(h.browserLogin).toHaveBeenCalledWith("https://acme.jolli.ai");
 		expect(out()).toContain("memories will sync to your Space");
 		expect(h.saveUserProfile).not.toHaveBeenCalled();
@@ -411,7 +430,7 @@ describe("GuidedFrontDoor", () => {
 		h.loadUserProfile.mockResolvedValue({ signInPromptDeclined: true });
 		await runGuidedFrontDoor();
 
-		expect(h.promptText).not.toHaveBeenCalledWith(expect.stringContaining("Sign in now to sync"));
+		expect(h.promptText).not.toHaveBeenCalledWith(expect.stringContaining("Sign in to Jolli to sync"));
 		expect(h.browserLogin).not.toHaveBeenCalled();
 		expect(h.saveUserProfile).not.toHaveBeenCalled();
 		expect(out()).toContain("Jolli is listening");
@@ -433,11 +452,16 @@ describe("GuidedFrontDoor", () => {
 
 	it("provider=anthropic + jolliApiKey, choose 'switch to Jolli' → saves aiProvider, listening reflects count", async () => {
 		h.loadAuthToken.mockResolvedValue("oauth-token");
-		h.loadConfig.mockResolvedValue({
-			jolliApiKey: "sk-jol-x",
-			aiProvider: "anthropic",
-			jolliUrl: "https://acme.jolli.ai",
-		});
+		// First read is the pre-switch config (anthropic, no anthropic key → can't
+		// generate → repair). The reload after the switch reflects the persisted
+		// aiProvider=jolli, so the recomputed canGenerate becomes true (jolli-proxy).
+		h.loadConfig
+			.mockResolvedValueOnce({
+				jolliApiKey: "sk-jol-x",
+				aiProvider: "anthropic",
+				jolliUrl: "https://acme.jolli.ai",
+			})
+			.mockResolvedValue({ jolliApiKey: "sk-jol-x", aiProvider: "jolli", jolliUrl: "https://acme.jolli.ai" });
 		h.getSummaryCount.mockResolvedValue(163);
 		h.promptText.mockResolvedValue("1");
 		await runGuidedFrontDoor();
@@ -556,6 +580,151 @@ describe("GuidedFrontDoor", () => {
 		await runGuidedFrontDoor();
 		expect(h.validateJolliApiKey).not.toHaveBeenCalled();
 		expect(h.saveConfigScoped).not.toHaveBeenCalled();
+	});
+
+	// ── Repo gate (not a git working tree) ──
+
+	it("not a git repo → dead end, exitCode 1, no storage / onboarding", async () => {
+		h.isInsideGitWorkTree.mockReturnValue(false);
+		await runGuidedFrontDoor();
+		expect(out()).toContain("not a git repository");
+		expect(out()).toContain("Change into a repo");
+		expect(process.exitCode).toBe(1);
+		expect(h.createStorage).not.toHaveBeenCalled();
+		expect(h.setActiveStorage).not.toHaveBeenCalled();
+		expect(h.promptSetup).not.toHaveBeenCalled();
+		// The dead-end keeps its own header but must NOT print the positive
+		// repo-confirmation line reserved for the happy path.
+		expect(out()).toContain("Jolli guided setup");
+		expect(out()).not.toContain("✓ Git repository");
+	});
+
+	it("inside a git repo → prints the guided-setup header + repo confirmation", async () => {
+		await runGuidedFrontDoor();
+		expect(out()).toContain("Jolli guided setup");
+		expect(out()).toContain("✓ Git repository /repo");
+	});
+
+	// ── M1: signed in + local agent → engine suffix on the status line ──
+
+	it("signed in with local-agent provider → status line names the engine", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({ jolliUrl: "https://acme.jolli.ai", aiProvider: "local-agent" });
+		h.getSummaryCount.mockResolvedValue(9);
+		await runGuidedFrontDoor();
+		expect(out()).toContain("signed in · acme.jolli.ai · summaries via Claude Code");
+		expect(out()).toContain("Jolli is listening");
+	});
+
+	// ── R3: local-agent configured but `claude` not usable ──
+
+	it("R3: local agent broken + skip → repair menu, no false listening", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({ aiProvider: "local-agent" });
+		h.isClaudeCodeUsable.mockReturnValue(false);
+		h.promptText.mockResolvedValue("4"); // skip
+		await runGuidedFrontDoor();
+		expect(out()).toContain("no usable `claude` was found");
+		expect(out()).toContain("Skipped");
+		expect(out()).not.toContain("Jolli is listening");
+		expect(h.runBackfillFrontDoorStep).not.toHaveBeenCalled();
+	});
+
+	it("R3: retry succeeds (claude now usable) → generation restored, listening", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({ jolliUrl: "https://acme.jolli.ai", aiProvider: "local-agent" });
+		h.getSummaryCount.mockResolvedValue(1);
+		h.isClaudeCodeUsable.mockReturnValueOnce(false).mockReturnValue(true);
+		h.promptText.mockResolvedValue("1"); // retry
+		await runGuidedFrontDoor();
+		expect(out()).toContain("Claude Code is working now");
+		expect(out()).toContain("Jolli is listening");
+	});
+
+	it("R3: retry still broken → stops, no listening", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({ aiProvider: "local-agent" });
+		h.isClaudeCodeUsable.mockReturnValue(false);
+		h.promptText.mockResolvedValue("1"); // retry, still broken
+		await runGuidedFrontDoor();
+		expect(out()).toContain("Still no usable `claude`");
+		expect(out()).not.toContain("Jolli is listening");
+	});
+
+	it("R3: switch to Jolli → browser login + provider set to jolli", async () => {
+		h.loadAuthToken.mockResolvedValueOnce(undefined).mockResolvedValue("new-token");
+		h.loadConfig
+			.mockResolvedValueOnce({ aiProvider: "local-agent" })
+			.mockResolvedValue({ aiProvider: "jolli", jolliApiKey: "sk-jol-new", jolliUrl: "https://acme.jolli.ai" });
+		h.isClaudeCodeUsable.mockReturnValue(false);
+		h.promptText.mockResolvedValue("2"); // switch to Jolli
+		await runGuidedFrontDoor();
+		expect(h.browserLogin).toHaveBeenCalledWith("https://acme.jolli.ai");
+		expect(h.saveConfigScoped).toHaveBeenCalledWith({ aiProvider: "jolli" }, "/global/config");
+		expect(out()).toContain("switched to Jolli");
+	});
+
+	it("R3: switch to Jolli but login fails → no provider change, no listening", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({ aiProvider: "local-agent" });
+		h.isClaudeCodeUsable.mockReturnValue(false);
+		h.promptText.mockResolvedValue("2");
+		h.browserLogin.mockRejectedValue(new Error("network down"));
+		await runGuidedFrontDoor();
+		expect(errors.join("\n")).toContain("network down");
+		expect(h.saveConfigScoped).not.toHaveBeenCalled();
+		expect(out()).not.toContain("Jolli is listening");
+	});
+
+	it("R3: enter an Anthropic key → saved with provider anthropic", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({ jolliUrl: "https://acme.jolli.ai", aiProvider: "local-agent" });
+		h.isClaudeCodeUsable.mockReturnValue(false);
+		h.promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("sk-ant-new");
+		await runGuidedFrontDoor();
+		expect(h.saveConfigScoped).toHaveBeenCalledWith(
+			{ apiKey: "sk-ant-new", aiProvider: "anthropic" },
+			"/global/config",
+		);
+		expect(out()).toContain("Anthropic key saved");
+	});
+
+	it("R3: Enter at the repair menu defaults to Retry", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({ aiProvider: "local-agent" });
+		h.isClaudeCodeUsable.mockReturnValue(false); // broken; retry re-probes, still broken
+		h.promptText.mockResolvedValue(""); // Enter → default [1] = Retry
+		await runGuidedFrontDoor();
+		expect(out()).toContain("Still no usable `claude`");
+		expect(out()).not.toContain("Jolli is listening");
+	});
+
+	it("R3: switch to Jolli, login rejects with a non-Error value → still reported", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({ aiProvider: "local-agent" });
+		h.isClaudeCodeUsable.mockReturnValue(false);
+		h.promptText.mockResolvedValue("2"); // switch to Jolli
+		h.browserLogin.mockRejectedValue("odd failure"); // non-Error rejection
+		await runGuidedFrontDoor();
+		expect(errors.join("\n")).toContain("odd failure");
+		expect(out()).not.toContain("Jolli is listening");
+	});
+
+	// ── Next steps: only on a fresh first-run setup ──
+
+	it("fresh onboarding that becomes usable → prints Next steps", async () => {
+		h.loadAuthToken.mockResolvedValueOnce(undefined).mockResolvedValue("new-token");
+		h.loadConfig.mockResolvedValueOnce({}).mockResolvedValue({ jolliApiKey: "sk-jol-new" });
+		await runGuidedFrontDoor();
+		expect(h.promptSetup).toHaveBeenCalledTimes(1);
+		expect(out()).toContain("Next steps");
+		expect(out()).toContain("jolli recall");
+	});
+
+	it("returning user (already had a credential) → no Next steps", async () => {
+		h.getSummaryCount.mockResolvedValue(3);
+		await runGuidedFrontDoor();
+		expect(out()).not.toContain("Next steps");
 	});
 
 	describe("getGuidedFrontDoorStatus", () => {

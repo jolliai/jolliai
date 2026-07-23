@@ -143,14 +143,20 @@ export async function readRepoProfile(cwd: string): Promise<RepoProfile> {
 	const { profilePath, legacyMarkerPath } = await resolvePaths(cwd);
 	const profile = await readRaw(profilePath);
 	if (profile.backfillDismissed === undefined && legacyMarkerPath && (await fileExists(legacyMarkerPath))) {
+		const marker = legacyMarkerPath;
 		// Persist under the profile lock, re-reading inside so a concurrent write of
-		// the OTHER field (manuallyDisabled) isn't clobbered. Best-effort: a persist
-		// failure still returns the migrated value, and the next read re-migrates.
+		// the OTHER field (manuallyDisabled) isn't clobbered, then retire the legacy
+		// marker so a later profile.json reset can't resurrect a stale dismiss.
+		// Best-effort throughout: if the persist throws we never reach the unlink, so
+		// the marker survives and the next read re-migrates.
 		await withStrictProfileLock(cwd, async () => {
 			const current = await readRaw(profilePath);
 			if (current.backfillDismissed === undefined) {
 				await writeProfile(profilePath, { ...current, backfillDismissed: true });
 			}
+			// profile.json now durably carries the field, so the marker is obsolete —
+			// a failed unlink just leaves it inert (the field suppresses re-migration).
+			await unlink(marker).catch(() => {});
 		}).catch(() => {});
 		return { ...profile, backfillDismissed: true };
 	}

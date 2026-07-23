@@ -2,40 +2,43 @@
  * The guided front door — what bare `jolli` (no args, interactive TTY) runs.
  *
  * It reads two orthogonal capabilities and guides the next step:
- *   - can generate — is there a usable LLM key (`resolveLlmCredentialSource`)?
+ *   - can generate — is there a usable engine (`canGenerateNow`)? For the local
+ *     agent this actually probes that `claude` is runnable, so a broken CLI is
+ *     caught here rather than silently at commit time.
  *   - can sync     — is there any Jolli credential (OAuth token or jolliApiKey)
  *                    to push memories to a Space?
- * `signedIn` (an OAuth token) is display-only — it decides the status-line
- * wording, never the control flow.
  *
- * Flow: opening status line → capability ladder (fix generation if broken, then
- * offer sign-in if memories can't sync) → cloud side-effects with the settled
- * credentials → a closing "Jolli is listening" when generation works. It
- * replaces running `auth login`, `auth status`, `enable`, and `status` by hand
- * without removing those commands. Everything about the cloud side (pushing to a
- * Space, binding, sync prompts) is delegated to `runSpaceSyncStep`.
+ * Flow (order is fixed and identical across states — a run only shows the steps
+ * its state still needs):
+ *   git repo? → onboarding (fresh only) → repair broken provider → Sign in? →
+ *   Enable? → status line → cloud side-effects → backfill → listening / Next steps
+ *
+ * `Sign in?` deliberately precedes `Enable?`. The opening status line moved to
+ * AFTER `Enable?` so `✓ enabled` is always truthful. Non-git directories are a
+ * dead end (Jolli attaches memory to commits). The exit code is coarse: non-zero
+ * only on a hard blocker (not a repo, install failure); a valid decline is 0.
  */
 
+import { basename } from "node:path";
 import { getJolliUrl, loadAuthToken } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
 import { validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
+import { isClaudeCodeUsable } from "../core/localagent/ClaudeExecutableResolver.js";
 import { getGlobalConfigDir, loadConfig, saveConfigScoped } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { getSummaryCount, setActiveStorage } from "../core/SummaryStore.js";
 import { track } from "../core/Telemetry.js";
-import { loadUserProfile, saveUserProfile } from "../core/UserProfile.js";
 import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
 import { isGitHookInstalled } from "../install/GitHookInstaller.js";
 import { install } from "../install/Installer.js";
-import { createLogger, setLogDir } from "../Logger.js";
+import { setLogDir } from "../Logger.js";
 import type { JolliMemoryConfig } from "../Types.js";
 import { runBackfillFrontDoorStep } from "./BackfillFrontDoorStep.js";
-import { isAffirmative, promptText, resolveProjectDir } from "./CliUtils.js";
+import { isAffirmative, isInsideGitWorkTree, promptText, resolveProjectDir } from "./CliUtils.js";
 import { promptSetup } from "./EnableCommand.js";
+import { offerOptionalJolliLogin } from "./OptionalLogin.js";
 import { runSpaceSyncStep } from "./SpaceSyncStep.js";
-
-const log = createLogger("GuidedFrontDoor");
 
 /** Lightweight front-door status. Deliberately avoids the heavy `getStatus()`. */
 export interface GuidedFrontDoorStatus {
@@ -70,11 +73,47 @@ function siteHost(jolliUrl: string | undefined): string | undefined {
 }
 
 /**
+ * Whether summaries can be generated with the current config. Mirrors
+ * `resolveLlmCredentialSource`, EXCEPT for the local agent: that resolver returns
+ * "local-agent" unconditionally (it never probes the binary), so here we
+ * additionally verify `claude` is actually runnable — this is what surfaces a
+ * broken local agent (R3) on the interactive path instead of at commit time.
+ */
+function canGenerateNow(config: JolliMemoryConfig): boolean {
+	// Probe the SAME binary the commit-time runtime would use — honor an explicit
+	// localAgentPath, else default PATH discovery — so this never disagrees with
+	// what actually generates summaries.
+	if (config.aiProvider === "local-agent") return isClaudeCodeUsable({ overridePath: config.localAgentPath });
+	return resolveLlmCredentialSource(config) !== null;
+}
+
+/**
  * Runs the guided front door. Assumes the caller (Api.ts) has already confirmed
  * an interactive TTY on both stdin and stdout — this never guards for that.
  */
 export async function runGuidedFrontDoor(): Promise<void> {
 	const cwd = resolveProjectDir();
+
+	// ── Repo gate: Jolli attaches memory to commits, so it must run inside a git
+	// working tree. Checked BEFORE storage init so a non-repo doesn't resolve a
+	// bogus Memory Bank path off the cwd. Dead end by design (no git-init offer). ──
+	if (!isInsideGitWorkTree(cwd)) {
+		console.log("\n  Jolli guided setup");
+		console.log(`  Checking directory ${cwd} ..... not a git repository`);
+		console.log("  Jolli attaches memory to your commits, so it must run inside a git repository.");
+		console.log("  Change into a repo and run `jolli` again:");
+		console.log("    % cd ~/code/your-repo");
+		console.log("    % jolli\n");
+		process.exitCode = 1;
+		return;
+	}
+
+	// Repo confirmed: emit the same "Jolli guided setup" header the dead-end
+	// branch prints, plus a positive confirmation line, so the framing is
+	// identical whether the directory is a repo or not.
+	console.log("\n  Jolli guided setup");
+	console.log(`  ✓ Git repository ${cwd}`);
+
 	// Initialise storage the way every other memory-reading command does, so
 	// folder-mode users read from their Memory Bank rather than the orphan-branch
 	// fallback (which also logs a resolveStorage warning).
@@ -86,8 +125,7 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	// Any of these counts as "has some credential" and skips the sign-in guide.
 	// `aiProvider: "local-agent"` is self-sufficient for generation — it drives the
 	// local agent tool's own login, holding no jollimemory credential — so it must
-	// short-circuit the sign-in guide too, matching resolveLlmCredentialSource
-	// (which always honors a "local-agent" choice without a presence check).
+	// short-circuit the onboarding guide too.
 	const hasCredential = (): boolean =>
 		Boolean(
 			token ||
@@ -97,19 +135,58 @@ export async function runGuidedFrontDoor(): Promise<void> {
 				config.aiProvider === "local-agent",
 		);
 
-	// ── Auth axis: no credential at all → run the existing sign-in / config guide ──
-	if (!hasCredential()) {
+	// Snapshot NOW whether onboarding runs this run — it gates Next steps at the
+	// very end, and `hasCredential()` flips to true after a sign-in mid-run, so it
+	// cannot be recomputed there.
+	const ranOnboarding = !hasCredential();
+
+	// ── Auth axis: no credential at all → run the onboarding guide (Claude
+	// auto-detect / provider menu). Shared with `jolli enable` via promptSetup. ──
+	if (ranOnboarding) {
 		await promptSetup();
 		token = await loadAuthToken();
 		config = await loadConfig();
 	}
 
-	// ── Enable axis: not enabled → offer to enable ──
+	// ── Two orthogonal capabilities, recomputed after each interactive step. ──
+	let canGenerate = canGenerateNow(config);
+	let canSync = Boolean(token || config.jolliApiKey);
+
+	// ── Rung 1 (blocking): a credential exists but the chosen provider can't use
+	// it → repair the provider mismatch. Covers R1/R2 (anthropic/jolli) and R3 (a
+	// configured local agent whose `claude` isn't runnable). `hasCredential()`
+	// excludes the fresh user who just skipped setup (nothing to repair). ──
+	if (!canGenerate && hasCredential()) {
+		await promptGenerationFix(config);
+		token = await loadAuthToken();
+		config = await loadConfig();
+		// Recompute from the freshly-saved config, not the fix's optimistic return:
+		// a switch to Jolli only actually restores generation if a jolliApiKey now
+		// exists, so trust canGenerateNow.
+		canGenerate = canGenerateNow(config);
+		canSync = Boolean(token || config.jolliApiKey);
+	}
+
+	// ── Sign in BEFORE enable: generation works but memories can't sync → offer
+	// sign-in once (default Yes; a prior global decline suppresses it). ──
+	if (canGenerate && !canSync) {
+		await offerOptionalJolliLogin();
+		token = await loadAuthToken();
+		config = await loadConfig();
+		// Signing in can flip an unset provider to "jolli"; if no jolliApiKey was
+		// minted, generation is no longer possible — recompute so the closing
+		// "listening" promise stays honest.
+		canGenerate = canGenerateNow(config);
+		canSync = Boolean(token || config.jolliApiKey);
+	}
+
+	// ── Enable axis: offer to enable AFTER identity/provider are settled. ──
 	if (!enabled) {
-		const answer = await promptText("\n  Enable Jolli in this repo? [Y/n] ");
+		const repoName = basename(cwd);
+		const answer = await promptText(`\n  Enable Jolli Memory in ${repoName}? [Y/n] `);
 		if (!isAffirmative(answer)) {
 			console.log("\n  Not enabled. Run `jolli` or `jolli enable` anytime.\n");
-			return;
+			return; // exitCode stays 0 — a valid choice, not an error.
 		}
 		setLogDir(cwd);
 		const result = await install(cwd, { source: "cli", clearManualDisableOnSuccess: true });
@@ -121,70 +198,45 @@ export async function runGuidedFrontDoor(): Promise<void> {
 		}
 		track("surface_enabled", { trigger: "cli" });
 		for (const warning of result.warnings) console.warn(`  Warning: ${warning}`);
+		// Concise install confirmation (the full per-path list stays in `jolli enable`).
+		console.log("\n  ✓ Git hooks added (post-commit, post-rewrite, prepare-commit-msg)");
+		console.log("  ✓ Agent hooks + MCP server added");
+		console.log(`  ✓ Jolli Memory enabled in ${repoName}.`);
 		// Git hooks record commits immediately, but the AI-agent session hooks
 		// (Claude, Gemini) only attach on a fresh session — say so once here.
-		console.log("\n  Restart your AI agent session so it records that session too.");
+		console.log("  Restart your AI agent session so it records that session too.");
 		enabled = true;
-		// enabled is now known true, so only the count can have changed — read it
-		// directly instead of re-running the whole lightweight status.
 		summaryCount = await getSummaryCount(cwd);
 	}
 
-	// ── Two orthogonal capabilities. `signedIn` (a token) is display-only. ──
-	const credSource = resolveLlmCredentialSource(config);
-	let canGenerate = credSource !== null;
-	let canSync = Boolean(token || config.jolliApiKey);
-
-	// ── Status line (opening snapshot; the token picks the wording only) ──
+	// ── Status line (AFTER enable, so `✓ enabled` is always truthful). ──
 	if (token) {
 		const site = siteHost(config.jolliUrl);
-		console.log(site ? `\n  ✓ signed in · ${site}` : "\n  ✓ signed in");
-	} else if (credSource === "local-agent") {
+		const engine = canGenerate && config.aiProvider === "local-agent" ? " · summaries via Claude Code" : "";
+		console.log(site ? `\n  ✓ signed in · ${site}${engine}` : `\n  ✓ signed in${engine}`);
+	} else if (canGenerate && config.aiProvider === "local-agent") {
 		console.log("\n  ✓ local agent set (not signed in to Jolli)");
-	} else if (credSource) {
-		const keyLabel = credSource === "jolli-proxy" ? "Jolli API key" : "Anthropic API key";
+	} else if (canGenerate) {
+		// Label the key that would ACTUALLY be used (credSource), not just whichever
+		// is present — a jolliApiKey alongside aiProvider="anthropic" still generates
+		// via Anthropic.
+		const keyLabel = resolveLlmCredentialSource(config) === "jolli-proxy" ? "Jolli API key" : "Anthropic API key";
 		console.log(`\n  ✓ ${keyLabel} set (not signed in to Jolli)`);
 	} else {
 		console.log("\n  ✗ not signed in — run `jolli auth login` to start generating memories");
 	}
 	console.log(`  ✓ enabled · ${summaryCount} ${summaryCount === 1 ? "memory" : "memories"}`);
 
-	// ── Rung 1 (blocking): a credential exists but the chosen provider can't use
-	// it → repair the provider/key mismatch. `hasCredential()` excludes the fresh
-	// user who just skipped setup (nothing to repair — don't re-ask). ──
-	if (!canGenerate && hasCredential()) {
-		canGenerate = await promptGenerationFix(config);
-		// A key entered / provider switched above may now allow sync too.
-		config = await loadConfig();
-		canSync = Boolean(token || config.jolliApiKey);
-	}
-
-	// ── Rung 2 (non-blocking): generation works, but memories can't leave the
-	// machine → offer sign-in once, defaulting to Yes. A prior decline (persisted
-	// in profile.json) suppresses it. Read the profile lazily — only here. ──
-	if (canGenerate && !canSync) {
-		const profile = await loadUserProfile();
-		if (!profile.signInPromptDeclined) {
-			await promptOptionalLogin();
-			token = await loadAuthToken();
-			config = await loadConfig();
-			canSync = Boolean(token || config.jolliApiKey);
-		}
-	}
-	// ── Cloud side-effects: only after credentials are settled, so a sign-in or
-	// key established above is picked up this run. We are always enabled by here
-	// (the enable axis above either enabled the repo or returned early). Bind the
-	// Space first (runSpaceSyncStep), then push the backlog to it —
-	// triggerPendingPushRetry is idempotent and no-ops when not signed in. ──
+	// ── Cloud side-effects: only after credentials are settled. Bind the Space
+	// first, then push the backlog — triggerPendingPushRetry no-ops when not
+	// signed in. We are always enabled by here (the enable axis returned early on
+	// decline). ──
 	await runSpaceSyncStep(cwd);
 	triggerPendingPushRetry(cwd, "cli-front-door");
 
-	// ── Closing confirmation: only promise "listening" when generation works. ──
+	// ── Closing: only promise "listening" when generation works. ──
 	if (canGenerate) {
-		// Cold-start back-fill offer. Runs after the capability ladder + cloud
-		// side-effects (so it benefits from any key/sign-in just established) and
-		// re-reads the count so the "listening" line reflects memories just built.
-		// Best-effort — the step never throws into the front door. See BackfillFrontDoorStep.
+		// Cold-start back-fill offer (unchanged). Best-effort — never throws.
 		await runBackfillFrontDoorStep(cwd);
 		summaryCount = await getSummaryCount(cwd);
 		const listening =
@@ -192,18 +244,37 @@ export async function runGuidedFrontDoor(): Promise<void> {
 				? "Jolli is listening — your next commit is your first memory"
 				: "Jolli is listening — last memory saved.";
 		console.log(`\n  ${listening}\n`);
+
+		// Next steps only on a fresh setup (onboarding ran this run) — a returning
+		// user doesn't need the orientation again, and the not-a-repo / not-enabled
+		// dead ends never reach here.
+		if (ranOnboarding) printNextSteps();
 	}
 }
 
+/** Prints the one-time orientation shown after a successful first-run setup. */
+function printNextSteps(): void {
+	console.log("  Next steps");
+	console.log("    1. Keep working in your agent — every commit becomes a memory, automatically.");
+	console.log("    2. Reach back: jolli recall · jolli search · jolli compile · jolli graph · jolli mcp");
+	console.log("    3. In your editor: add the VS Code extension or IntelliJ plugin.");
+	console.log("    4. See all commands: jolli help\n");
+}
+
 /**
- * Reached only when generation is broken while a credential exists: the chosen
- * `aiProvider` has no usable key. Offer the zero-typing fix first — switch to
- * whichever provider a key already exists for — then entering the missing key,
- * then skip. The provider is only ever changed by an explicit choice here.
- * Returns whether generation can now proceed (a key was set / provider switched).
+ * Reached only when generation is broken while a credential exists. Routes to the
+ * local-agent repair (R3) when the provider is the local agent, else the
+ * anthropic/jolli key-mismatch repair (R1/R2). Returns whether generation can now
+ * proceed. The provider is only ever changed by an explicit choice here.
  */
 async function promptGenerationFix(config: JolliMemoryConfig): Promise<boolean> {
 	const configDir = getGlobalConfigDir();
+
+	// R3: the local agent is configured but `claude` isn't runnable.
+	if (config.aiProvider === "local-agent") {
+		return promptLocalAgentFix(configDir, config.localAgentPath);
+	}
+
 	const provider = config.aiProvider === "jolli" ? "jolli" : "anthropic";
 	const providerName = provider === "jolli" ? "Jolli" : "Anthropic";
 	const hasJolliKey = Boolean(config.jolliApiKey);
@@ -249,6 +320,51 @@ async function promptGenerationFix(config: JolliMemoryConfig): Promise<boolean> 
 	return enterMissingKey();
 }
 
+/**
+ * R3 repair: the provider is Local Agent but no usable `claude` was found.
+ * Offers a retry (re-probe once), or a switch to Jolli / Anthropic, or skip.
+ * Every branch terminates — no infinite retry loop. Returns whether generation
+ * can now proceed.
+ */
+async function promptLocalAgentFix(configDir: string, localAgentPath: string | undefined): Promise<boolean> {
+	console.log(
+		"\n  AI provider is set to Local Agent but no usable `claude` was found — memories won't be generated.\n",
+	);
+	console.log("    1. Retry (after install / upgrade, or `claude login`)");
+	console.log("    2. Switch to Jolli (sign in)");
+	console.log("    3. Enter an Anthropic key");
+	console.log("    4. Skip for now");
+	const choice = (await promptText("\n  Choice [1]: ")) || "1";
+
+	if (choice === "4") {
+		console.log("\n  Skipped. Fix Claude Code or run `jolli configure` later.\n");
+		return false;
+	}
+	if (choice === "2") {
+		try {
+			await browserLogin(getJolliUrl());
+		} catch (err) {
+			console.error(`\n  Login failed: ${err instanceof Error ? err.message : String(err)}\n`);
+			return false;
+		}
+		// Sign-in preserves an explicit local-agent choice (AuthConfig guard), so
+		// switching the engine to Jolli must be set explicitly here.
+		await saveConfigScoped({ aiProvider: "jolli" }, configDir);
+		console.log("\n  ✓ switched to Jolli");
+		return true;
+	}
+	if (choice === "3") {
+		return promptAndSaveAnthropicKey(configDir);
+	}
+	// choice 1 — retry the probe exactly once, then stop.
+	if (isClaudeCodeUsable({ overridePath: localAgentPath })) {
+		console.log("\n  ✓ Claude Code is working now.");
+		return true;
+	}
+	console.log("\n  Still no usable `claude`. Fix it and run `jolli` again, or `jolli configure`.\n");
+	return false;
+}
+
 /** Prompts for an Anthropic API key, saves it, and pins the provider to Anthropic. Returns whether a key was saved. */
 async function promptAndSaveAnthropicKey(configDir: string): Promise<boolean> {
 	const key = await promptText("\n  Anthropic API Key (press Enter to skip): ");
@@ -277,33 +393,4 @@ async function promptAndSaveJolliKey(configDir: string): Promise<boolean> {
 	await saveConfigScoped({ jolliApiKey: key, aiProvider: "jolli" }, configDir);
 	console.log("\n  ✓ Jolli key saved");
 	return true;
-}
-
-/**
- * Generation works locally, but there's no Jolli credential to sync memories to
- * a Space. Offer to sign in — default Yes, asked once. On an explicit "no" we
- * persist the decline (profile.json) so this never reappears; a login failure is
- * NOT a decline, so it stays unrecorded and the next run can offer again.
- */
-async function promptOptionalLogin(): Promise<void> {
-	const answer = await promptText("\n  Not signed in to Jolli. Sign in now to sync memories to a Space? [Y/n] ");
-	if (!isAffirmative(answer)) {
-		// Persisting the decline is best-effort: a cosmetic "don't ask again" flag
-		// must never abort the front door if the profile dir isn't writable — we
-		// just offer again next run.
-		try {
-			await saveUserProfile({ signInPromptDeclined: true });
-		} catch {
-			log.debug("Could not persist the sign-in decline; will offer again next run");
-		}
-		console.log("  You can sign in anytime with `jolli auth login`.\n");
-		return;
-	}
-	try {
-		await browserLogin(getJolliUrl());
-		console.log("\n  ✓ signed in — memories will sync to your Space.\n");
-	} catch (err) {
-		console.error(`\n  Login failed: ${err instanceof Error ? err.message : String(err)}`);
-		console.log("  You can try again with `jolli auth login`.\n");
-	}
 }

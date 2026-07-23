@@ -163,6 +163,34 @@ export function resolveProjectDir(): string {
 	return _cachedProjectDir;
 }
 
+/**
+ * True when `cwd` is inside a git working tree.
+ *
+ * Uses `git rev-parse --is-inside-work-tree`, the canonical check, and tests the
+ * STDOUT (`"true"`) — NOT just the exit code. Inside a bare repo or the `.git`
+ * directory itself the command prints `"false"` yet still exits 0, so an
+ * exit-code-only check would misclassify those as a working tree. Any spawn
+ * failure (git missing, or a non-git dir → non-zero exit) resolves to false.
+ *
+ * The guided front door calls this before touching storage: Jolli attaches
+ * memory to commits, so a non-work-tree run is a dead end rather than something
+ * to configure.
+ */
+export function isInsideGitWorkTree(cwd: string): boolean {
+	try {
+		const out = execFileSyncHidden("git", ["rev-parse", "--is-inside-work-tree"], {
+			cwd,
+			encoding: "utf-8",
+			// Swallow git's own "fatal: not a git repository" so it never leaks to
+			// the user's terminal before jolli's own dead-end message.
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		return out.trim() === "true";
+	} catch {
+		return false;
+	}
+}
+
 /** Formats an ISO date string as "Mon DD" (e.g. "Apr 15"). Falls back to substring on invalid dates. */
 export function formatShortDate(iso: string): string {
 	const d = new Date(iso);

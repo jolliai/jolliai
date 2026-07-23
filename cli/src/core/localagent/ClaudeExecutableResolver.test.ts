@@ -3,7 +3,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSyncHidden } from "../../util/Subprocess.js";
-import { __resetResolverCacheForTest, resolveClaudeExecutable } from "./ClaudeExecutableResolver.js";
+import {
+	__resetResolverCacheForTest,
+	isClaudeCodeUsable,
+	resolveClaudeExecutable,
+} from "./ClaudeExecutableResolver.js";
 import { LocalAgentSetupError } from "./Types.js";
 
 vi.mock("../../util/Subprocess.js", () => ({ execFileSyncHidden: vi.fn() }));
@@ -305,5 +309,23 @@ describe("resolveClaudeExecutable", () => {
 			// Proves the win32 branch ran (`where`, not `which`) and filtered the .cmd out.
 			expect(mockedExecFileSync.mock.calls.some((c) => c[0] === "where")).toBe(true);
 		});
+	});
+});
+
+describe("isClaudeCodeUsable", () => {
+	it("true when a candidate resolves", () => {
+		__resetResolverCacheForTest();
+		expect(
+			isClaudeCodeUsable({
+				candidates: () => ["/a/claude"],
+				probe: () => ({ ok: true, version: "1.0.0" }),
+				now: () => 1000,
+			}),
+		).toBe(true);
+	});
+
+	it("false when nothing resolves (resolveClaudeExecutable throws)", () => {
+		__resetResolverCacheForTest();
+		expect(isClaudeCodeUsable({ candidates: () => [], probe: () => ({ ok: false }), now: () => 1000 })).toBe(false);
 	});
 });

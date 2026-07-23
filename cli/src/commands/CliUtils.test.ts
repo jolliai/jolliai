@@ -502,4 +502,26 @@ describe("CliUtils", () => {
 			).toBe(false);
 		});
 	});
+
+	describe("isInsideGitWorkTree", () => {
+		it("true when `git rev-parse --is-inside-work-tree` prints 'true'", async () => {
+			mockExecFileSync.mockReturnValue("true\n");
+			const { isInsideGitWorkTree } = await import("./CliUtils.js");
+			expect(isInsideGitWorkTree("/repo")).toBe(true);
+		});
+
+		it("false when it prints 'false' (bare repo / inside .git, exit 0) — stdout, not exit code", async () => {
+			mockExecFileSync.mockReturnValue("false\n");
+			const { isInsideGitWorkTree } = await import("./CliUtils.js");
+			expect(isInsideGitWorkTree("/some/dir")).toBe(false);
+		});
+
+		it("false when git exits non-zero (not a git dir → throws)", async () => {
+			mockExecFileSync.mockImplementation(() => {
+				throw new Error("fatal: not a git repository");
+			});
+			const { isInsideGitWorkTree } = await import("./CliUtils.js");
+			expect(isInsideGitWorkTree("/tmp/x")).toBe(false);
+		});
+	});
 });
