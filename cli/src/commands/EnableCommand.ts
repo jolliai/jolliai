@@ -10,7 +10,6 @@ import { type Command, Option } from "commander";
 import { getJolliUrl, loadAuthToken } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
-import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { isClaudeCodeUsable } from "../core/localagent/ClaudeExecutableResolver.js";
 import { getGlobalConfigDir, loadConfig, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
@@ -21,6 +20,7 @@ import { install, uninstall } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { InstallResult, JolliMemoryConfig } from "../Types.js";
 import { isInteractive, promptText, resolveProjectDir } from "./CliUtils.js";
+import { canGenerateNow, promptGenerationFix } from "./GenerationFix.js";
 import { offerOptionalJolliLogin } from "./OptionalLogin.js";
 
 const log = createLogger("EnableCommand");
@@ -279,17 +279,45 @@ async function reportEnableResult(
 
 		// Step 2: Interactive provider configuration
 		if (isInteractive() && !options.yes) {
-			await promptSetup();
+			let cfg = await loadConfig();
+			let token = await loadAuthToken();
+			const hasCredential = (): boolean =>
+				Boolean(
+					token ||
+						cfg.jolliApiKey ||
+						cfg.apiKey ||
+						process.env.ANTHROPIC_API_KEY ||
+						cfg.aiProvider === "local-agent",
+				);
+			let canGenerate = canGenerateNow(cfg);
+			// Onboarding menu — EXCEPT when a provider is already configured but simply
+			// broken (has a credential yet can't generate). That case skips straight to
+			// the repair ladder below, so the user sees ONE menu (the fix), not two: the
+			// provider menu AND then the repair menu. Fresh users still onboard;
+			// configured-but-working users still get promptSetup (e.g. to add a second
+			// key). Mirrors the guided front door, which likewise repairs before asking.
+			if (!(hasCredential() && !canGenerate)) {
+				await promptSetup();
+				cfg = await loadConfig();
+				token = await loadAuthToken();
+				canGenerate = canGenerateNow(cfg);
+			}
+			// Repair ladder (parity with the guided front door's Rung 1): a provider
+			// that is configured but can't actually generate — a broken local `claude`,
+			// or an anthropic/jolli key mismatch — gets a one-step fix BEFORE the sync
+			// nudge, so `jolli enable` can't finish with generation silently broken.
+			// Skipped for the fresh user who just chose "Skip" (no credential to repair).
+			if (!canGenerate && hasCredential()) {
+				await promptGenerationFix(cfg);
+				cfg = await loadConfig();
+				token = await loadAuthToken();
+				canGenerate = canGenerateNow(cfg);
+			}
 			// Sign-in nudge (parity with the guided front door's Rung 2): a user
 			// who just configured local-agent / Anthropic generation but isn't
 			// signed in gets offered cloud sync once. Kept INSIDE the interactive
 			// guard so `-y` / non-interactive runs never open a browser login.
-			const cfg = await loadConfig();
-			const canGenerate =
-				cfg.aiProvider === "local-agent"
-					? isClaudeCodeUsable({ overridePath: cfg.localAgentPath })
-					: resolveLlmCredentialSource(cfg) !== null;
-			const canSync = Boolean((await loadAuthToken()) || cfg.jolliApiKey);
+			const canSync = Boolean(token || cfg.jolliApiKey);
 			if (canGenerate && !canSync) {
 				await offerOptionalJolliLogin();
 			}

@@ -376,15 +376,28 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).toContain("last memory saved");
 	});
 
-	it("local Anthropic key, answer 'n' → records the decline, no login, still listening", async () => {
+	it("local Anthropic key, answer 'n' (not now) → NO decline recorded, no login, offer returns next run", async () => {
 		h.loadAuthToken.mockResolvedValue(undefined);
 		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x" });
 		h.promptText.mockResolvedValue("n");
 		await runGuidedFrontDoor();
 
 		expect(h.browserLogin).not.toHaveBeenCalled();
-		expect(h.saveUserProfile).toHaveBeenCalledWith({ signInPromptDeclined: true });
+		// "not now" is transient — nothing is persisted, so it reappears next run.
+		expect(h.saveUserProfile).not.toHaveBeenCalled();
 		expect(out()).toContain("You can sign in anytime");
+		expect(out()).toContain("Jolli is listening");
+	});
+
+	it("local Anthropic key, answer 'd' (don't ask again) → records the decline, no login", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x" });
+		h.promptText.mockResolvedValue("d");
+		await runGuidedFrontDoor();
+
+		expect(h.browserLogin).not.toHaveBeenCalled();
+		expect(h.saveUserProfile).toHaveBeenCalledWith({ signInPromptDeclined: true });
+		expect(out()).toContain("won't ask again");
 		expect(out()).toContain("Jolli is listening");
 	});
 
@@ -401,15 +414,15 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).toContain("Jolli is listening");
 	});
 
-	it("local Anthropic key, decline but persisting the flag fails → swallowed, front door still finishes", async () => {
+	it("local Anthropic key, 'd' but persisting the flag fails → swallowed, front door still finishes", async () => {
 		h.loadAuthToken.mockResolvedValue(undefined);
 		h.loadConfig.mockResolvedValue({ apiKey: "sk-ant-x" });
-		h.promptText.mockResolvedValue("n");
+		h.promptText.mockResolvedValue("d");
 		h.saveUserProfile.mockRejectedValue(new Error("EACCES: read-only home"));
 		await runGuidedFrontDoor();
 
 		expect(h.saveUserProfile).toHaveBeenCalledWith({ signInPromptDeclined: true });
-		expect(out()).toContain("You can sign in anytime");
+		expect(out()).toContain("won't ask again");
 		expect(out()).toContain("Jolli is listening");
 	});
 
@@ -534,7 +547,7 @@ describe("GuidedFrontDoor", () => {
 			.mockResolvedValueOnce({ apiKey: "sk-ant-x", aiProvider: "jolli" })
 			.mockResolvedValueOnce({ apiKey: "sk-ant-x", aiProvider: "anthropic" });
 		h.getSummaryCount.mockResolvedValue(3);
-		h.promptText.mockResolvedValueOnce("1").mockResolvedValueOnce("n"); // switch, then decline login
+		h.promptText.mockResolvedValueOnce("1").mockResolvedValueOnce("d"); // switch, then "don't ask again"
 		await runGuidedFrontDoor();
 		expect(out()).toContain("no Jolli key is available");
 		expect(h.saveConfigScoped).toHaveBeenCalledWith({ aiProvider: "anthropic" }, "/global/config");
@@ -710,7 +723,9 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).not.toContain("Jolli is listening");
 	});
 
-	// ── Next steps: only on a fresh first-run setup ──
+	// ── Next steps: shown on every path that reaches the end (new or returning
+	// user, generation configured or not); only the three early-return dead ends
+	// (not-a-repo / enable-declined / install-failure) omit it. ──
 
 	it("fresh onboarding that becomes usable → prints Next steps", async () => {
 		h.loadAuthToken.mockResolvedValueOnce(undefined).mockResolvedValue("new-token");
@@ -721,9 +736,32 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).toContain("jolli recall");
 	});
 
-	it("returning user (already had a credential) → no Next steps", async () => {
+	it("returning user (already had a credential) → still prints Next steps", async () => {
 		h.getSummaryCount.mockResolvedValue(3);
 		await runGuidedFrontDoor();
+		expect(h.promptSetup).not.toHaveBeenCalled();
+		expect(out()).toContain("Next steps");
+	});
+
+	it("generation not configured (skipped setup) → still prints Next steps but no listening", async () => {
+		h.loadAuthToken.mockResolvedValue(undefined);
+		h.loadConfig.mockResolvedValue({});
+		await runGuidedFrontDoor();
+		expect(out()).toContain("Next steps");
+		expect(out()).not.toContain("Jolli is listening");
+	});
+
+	it("not a git repo → dead end omits Next steps", async () => {
+		h.isInsideGitWorkTree.mockReturnValue(false);
+		await runGuidedFrontDoor();
+		expect(out()).not.toContain("Next steps");
+	});
+
+	it("enable declined → dead end omits Next steps", async () => {
+		h.isGitHookInstalled.mockResolvedValue(false);
+		h.promptText.mockResolvedValue("n");
+		await runGuidedFrontDoor();
+		expect(out()).toContain("Not enabled");
 		expect(out()).not.toContain("Next steps");
 	});
 
