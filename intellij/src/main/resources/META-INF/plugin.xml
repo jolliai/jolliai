@@ -35,10 +35,20 @@
         <projectService
             serviceImplementation="ai.jolli.jollimemory.services.JolliMemoryService"/>
 
-        <!-- Slice-1 daemon channel: spawns `jolli daemon` and dispatches refresh
-             notifications to JolliMemoryService.refreshStatus. -->
+        <!-- Refresh-listener registry. In scheme A' this no longer spawns its own
+             daemon subprocess; CliDaemonClient owns the single ide-bridge-serve
+             process and injects `refresh` events into this service, so every
+             previously wired addRefreshListener callback keeps working unchanged. -->
         <projectService
             serviceImplementation="ai.jolli.jollimemory.bridge.DaemonNotificationClient"/>
+
+        <!-- Long-lived NDJSON connection to `jolli ide-bridge-serve`. Amortises Node
+             cold-start across every ide-bridge call so panel refreshes and action
+             clicks return in ~5-20 ms instead of ~500 ms - 2 s. The same stdio
+             stream also delivers server-pushed `refresh` notifications, which this
+             client injects into DaemonNotificationClient. -->
+        <projectService
+            serviceImplementation="ai.jolli.jollimemory.bridge.CliDaemonClient"/>
 
         <!-- Tool window: sidebar with collapsible STATUS, MEMORIES, PLANS & NOTES, CHANGES panels -->
         <toolWindow

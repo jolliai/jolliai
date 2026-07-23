@@ -23,10 +23,12 @@ import { registerGraphCommand } from "./commands/GraphCommand.js";
 import { runGuidedFrontDoor } from "./commands/GuidedFrontDoor.js";
 import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { getHelpGroup } from "./commands/HelpGroups.js";
+import { registerIdeBridgeCommand } from "./commands/IdeBridgeRegistration.js";
 import { registerBindCommand, registerPushCommand, registerSpacesCommand } from "./commands/JolliCloudCommands.js";
 import { registerLocalRunOfferCommand } from "./commands/LocalRunOfferCommand.js";
 import { registerMcpCommand } from "./commands/McpCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
+import { registerMigrateMemoryBankCommand } from "./commands/MigrateMemoryBankCommand.js";
 import { registerOpenUrlCommand } from "./commands/OpenUrlCommand.js";
 import { registerPrDescriptionCommand } from "./commands/PrDescriptionCommand.js";
 import { registerQueueStatusCommand } from "./commands/QueueStatusCommand.js";
@@ -371,6 +373,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerCompileCommand(program);
 	registerGraphCommand(program);
 	registerMigrateCommand(program);
+	registerMigrateMemoryBankCommand(program);
 	registerHealFolderCommand(program);
 	registerExportPromptCommand(program);
 	registerExportCommand(program);
@@ -380,6 +383,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerTelemetryCommand(program);
 	registerGenerateCommand(program);
 	registerDaemonCommand(program);
+	registerIdeBridgeCommand(program);
 
 	// Auto-emit `command_invoked` for every command (built-in, plugin, future).
 	// No-op until telemetry is bootstrapped (Cli.ts), so harmless in tests.

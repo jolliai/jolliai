@@ -24,6 +24,8 @@ export interface PinEntry {
 	readonly id: string;
 	readonly title: string;
 	readonly pinnedAt: number;
+	/** Optional compact badge supplied by UI hosts (IntelliJ uses source-specific badges). */
+	readonly badge?: string;
 	/** Only populated for kind === 'conversation'. Identifies the transcript provider. */
 	readonly source?: string;
 	/** Only populated for kind === 'conversation'. Absolute path to the transcript file. */
@@ -65,7 +67,10 @@ function asPinEntryArray(v: unknown): PinEntry[] {
 			PIN_KINDS.has(p.kind) &&
 			typeof p.id === "string" &&
 			typeof p.title === "string" &&
-			typeof p.pinnedAt === "number"
+			typeof p.pinnedAt === "number" &&
+			(p.badge === undefined || typeof p.badge === "string") &&
+			(p.source === undefined || typeof p.source === "string") &&
+			(p.transcriptPath === undefined || typeof p.transcriptPath === "string")
 		);
 	});
 }

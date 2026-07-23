@@ -142,11 +142,29 @@ class DaemonNotificationClient(private val project: Project) : Disposable {
         return Disposable { listeners.remove(listener) }
     }
 
-    /** Idempotent start — spawns the daemon subprocess if not already running. */
+    /**
+     * Idempotent start.
+     *
+     * In slice 2 (scheme A') a single `jolli ide-bridge-serve` process carries
+     * both request/response traffic and `refresh` notifications, and that
+     * process is owned by [CliDaemonClient]. This class no longer spawns its
+     * own daemon; it stays alive purely as the plugin-wide refresh-listener
+     * registry. [CliDaemonClient] calls [injectRefresh] whenever its stdout
+     * carries a refresh line, and every previously registered
+     * [addRefreshListener] callback keeps working unchanged.
+     */
     fun start() {
         if (stopped.get()) return
-        if (!started.compareAndSet(false, true)) return
-        spawnDaemon()
+        started.compareAndSet(false, true)
+    }
+
+    /**
+     * Fires the given event to every registered listener. Invoked by
+     * [CliDaemonClient] when its long-lived ide-bridge-serve stdout emits a
+     * `refresh` notification.
+     */
+    fun injectRefresh(event: RefreshEvent) {
+        onRefresh(event)
     }
 
     private fun spawnDaemon() {

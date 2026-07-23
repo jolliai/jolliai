@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { createLogger } from "../Logger.js";
+import type { SummaryIndex } from "../Types.js";
 import { tryMarkHiddenOnWindows } from "../util/WindowsHidden.js";
 import type { BranchesJson, BranchMapping, KBConfig, Manifest, ManifestEntry, MigrationState } from "./KBTypes.js";
 import { toForwardSlash } from "./PathUtils.js";
@@ -272,6 +273,11 @@ export class MetadataManager {
 				(e.parentCommitHash === null || typeof e.parentCommitHash === "string") &&
 				e.parentCommitHash === null,
 		);
+	}
+
+	/** Full index DTO for IDE display adapters. */
+	readIndex(): SummaryIndex | null {
+		return this.readJson<SummaryIndex>(this.indexPath);
 	}
 
 	// ── Config ─────────────────────────────────────────────────────────────

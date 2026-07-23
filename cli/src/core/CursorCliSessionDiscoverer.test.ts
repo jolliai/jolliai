@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CURSOR_CLI_META_JSON, CURSOR_CLI_TRANSCRIPT_JSONL } from "../testUtils/cursorCliFixture.js";
 import {
 	discoverCursorCliSessions,
@@ -55,22 +55,34 @@ describe("scanCursorCliSessions", () => {
 	});
 
 	it("parses a real pinned cursor-agent meta.json + JSONL fixture end to end", async () => {
-		const uuid = "6f2a9c3e-6b3c-4e7a-9b8a-1a2b3c4d5e6f";
-		const fixtureProject = "/Users/example/proj"; // must match CURSOR_CLI_META_JSON.cwd verbatim
-		const dir = join(chatsDir, "real-hash", uuid);
-		await mkdir(dir, { recursive: true });
-		await writeFile(join(dir, "meta.json"), CURSOR_CLI_META_JSON, "utf8");
-		await writeTranscript(projectsDir, "example-proj", uuid, CURSOR_CLI_TRANSCRIPT_JSONL);
+		// The fixture's updatedAtMs is a real historical timestamp; discoverer
+		// enforces a 48h staleness gate against Date.now(), so real-time clock
+		// drift would eventually flip this test from green to red without any
+		// code change. Pin "now" to just after the fixture time to keep the
+		// gate deterministic. Scoped to this single it() so the other cases
+		// that use the top-level `now = Date.now()` are unaffected.
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date(1784631456880 + 1000));
+		try {
+			const uuid = "6f2a9c3e-6b3c-4e7a-9b8a-1a2b3c4d5e6f";
+			const fixtureProject = "/Users/example/proj"; // must match CURSOR_CLI_META_JSON.cwd verbatim
+			const dir = join(chatsDir, "real-hash", uuid);
+			await mkdir(dir, { recursive: true });
+			await writeFile(join(dir, "meta.json"), CURSOR_CLI_META_JSON, "utf8");
+			await writeTranscript(projectsDir, "example-proj", uuid, CURSOR_CLI_TRANSCRIPT_JSONL);
 
-		const r = await scanCursorCliSessions(fixtureProject, chatsDir, projectsDir);
+			const r = await scanCursorCliSessions(fixtureProject, chatsDir, projectsDir);
 
-		expect(r.sessions).toHaveLength(1);
-		expect(r.sessions[0]).toMatchObject({
-			sessionId: uuid,
-			title: "Hello There",
-			updatedAt: new Date(1784631456880).toISOString(),
-			source: "cursor-cli",
-		});
+			expect(r.sessions).toHaveLength(1);
+			expect(r.sessions[0]).toMatchObject({
+				sessionId: uuid,
+				title: "Hello There",
+				updatedAt: new Date(1784631456880).toISOString(),
+				source: "cursor-cli",
+			});
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("does NOT attribute a session run from a repo subdirectory (exact-equality contract, like Devin)", async () => {

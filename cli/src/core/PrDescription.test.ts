@@ -13,6 +13,8 @@ import {
 	MARKER_END,
 	MARKER_START,
 	pickPrTitle,
+	replaceMarkerRegion,
+	replaceSummaryInBody,
 	wrapWithMarkers,
 } from "./PrDescription.js";
 import { getSummary } from "./SummaryStore.js";
@@ -60,6 +62,45 @@ describe("buildPrBodyMarkdown", () => {
 describe("wrapWithMarkers", () => {
 	it("wraps with start/end markers", () => {
 		expect(wrapWithMarkers("X")).toBe("<!-- jollimemory-summary-start -->\nX\n<!-- jollimemory-summary-end -->");
+	});
+});
+
+describe("replaceSummaryInBody", () => {
+	it("replaces the managed region while preserving surrounding text", () => {
+		expect(
+			replaceSummaryInBody(
+				"Before\n\n<!-- jollimemory-summary-start -->\nOld\n<!-- jollimemory-summary-end -->\n\nAfter",
+				"New",
+			),
+		).toBe("Before\n\n<!-- jollimemory-summary-start -->\nNew\n<!-- jollimemory-summary-end -->\n\nAfter");
+	});
+
+	it("appends a managed region when none exists", () => {
+		expect(replaceSummaryInBody("Manual", "Generated")).toBe(
+			"Manual\n\n<!-- jollimemory-summary-start -->\nGenerated\n<!-- jollimemory-summary-end -->",
+		);
+	});
+});
+
+describe("replaceMarkerRegion", () => {
+	it("accepts a block that is already wrapped", () => {
+		expect(replaceMarkerRegion("Manual", wrapWithMarkers("Generated"))).toBe(
+			"Manual\n\n<!-- jollimemory-summary-start -->\nGenerated\n<!-- jollimemory-summary-end -->",
+		);
+	});
+
+	// Regression: String.prototype.replace's SECOND arg is a substitution pattern
+	// when it's a string ($&/$$/$`/$'/$n are all parsed). LLM summaries commonly
+	// contain `$` (money like `$$100`, sed snippets like `s/x/$&/g`, backtick
+	// hints). Passing the block as a string would silently corrupt the PR body;
+	// the fix uses a function replacer so every `$` sequence stays literal.
+	it("treats $ sequences in the wrapped block as literals (not substitution patterns)", () => {
+		const current = `Before\n\n${MARKER_START}\nOLD\n${MARKER_END}\n\nAfter`;
+		const payload = "Costs $$100. Use sed s/x/$&/g. Also $` and $' and $1.";
+		const wrapped = wrapWithMarkers(payload);
+		expect(replaceMarkerRegion(current, wrapped)).toBe(
+			`Before\n\n${MARKER_START}\n${payload}\n${MARKER_END}\n\nAfter`,
+		);
 	});
 });
 
