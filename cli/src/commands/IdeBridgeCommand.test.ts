@@ -84,7 +84,29 @@ vi.mock("../core/SessionTracker.js", () => ({
 
 vi.mock("../core/Locks.js", () => ({
 	getWorkerBusyState: vi.fn().mockResolvedValue({ held: false, blocking: false }),
+	// Constants consumed by the acquire-lock / release-lock bridge cases. Kept
+	// as plain literals here so the tests are decoupled from any future
+	// re-tuning of the real defaults in Locks.ts.
+	PLANS_LOCK_FILE: "plans.lock",
+	DEFAULT_PLANS_LOCK_TIMEOUT_MS: 5000,
+	DEFAULT_PLANS_LOCK_POLL_MS: 25,
 }));
+
+vi.mock("../core/LockPrimitives.js", () => ({
+	acquireWithPoll: vi.fn(),
+	releaseIfOwned: vi.fn(),
+}));
+
+vi.mock("node:fs/promises", async (importActual) => {
+	// Only mkdir needs stubbing (the acquire-lock case ensures the lock dir
+	// exists). Every other fs function keeps its real behavior so unrelated
+	// paths in the bridge aren't disturbed.
+	const actual = await importActual<typeof import("node:fs/promises")>();
+	return {
+		...actual,
+		mkdir: vi.fn().mockResolvedValue(undefined),
+	};
+});
 
 vi.mock("../auth/AuthConfig.js", () => ({
 	getJolliUrl: vi.fn().mockReturnValue("https://jolli.ai"),
@@ -1007,6 +1029,53 @@ describe("runIdeBridgeAction — session-state", () => {
 		await expect(runIdeBridgeAction("session-state", "/r", { operation: "wat" })).rejects.toThrow(
 			/Unknown session-state operation/,
 		);
+	});
+
+	it("acquires plans.lock via the LockPrimitives.acquireWithPoll primitive", async () => {
+		const { acquireWithPoll } = await import("../core/LockPrimitives.js");
+		vi.mocked(acquireWithPoll).mockResolvedValue(true);
+		const result = await runIdeBridgeAction("session-state", "/r", { operation: "acquire-lock" });
+		expect(result).toEqual({ acquired: true });
+		// The daemon must acquire against the per-worktree plans.lock path — a
+		// wrong path (e.g. hitting the shared orphan-write dir) would silently
+		// bypass every other plans.json writer.
+		expect(vi.mocked(acquireWithPoll)).toHaveBeenCalledWith("/r/.jolli/jollimemory/plans.lock", {
+			timeoutMs: 5000,
+			pollMs: 25,
+		});
+	});
+
+	it("reports acquired=false when the lock cannot be taken within the poll budget", async () => {
+		const { acquireWithPoll } = await import("../core/LockPrimitives.js");
+		vi.mocked(acquireWithPoll).mockResolvedValue(false);
+		const result = await runIdeBridgeAction("session-state", "/r", { operation: "acquire-lock" });
+		// A false return tells the IDE caller to skip or fall back to
+		// best-effort — it must NOT be treated as a swallowed success.
+		expect(result).toEqual({ acquired: false });
+	});
+
+	it("honours caller-supplied timeoutMs / pollMs on acquire-lock", async () => {
+		const { acquireWithPoll } = await import("../core/LockPrimitives.js");
+		vi.mocked(acquireWithPoll).mockResolvedValue(true);
+		await runIdeBridgeAction("session-state", "/r", {
+			operation: "acquire-lock",
+			timeoutMs: 200,
+			pollMs: 10,
+		});
+		expect(vi.mocked(acquireWithPoll)).toHaveBeenLastCalledWith("/r/.jolli/jollimemory/plans.lock", {
+			timeoutMs: 200,
+			pollMs: 10,
+		});
+	});
+
+	it("releases plans.lock via LockPrimitives.releaseIfOwned (PID-checked)", async () => {
+		// releaseIfOwned is deliberately a no-op when the on-disk PID does not
+		// match the daemon's — the bridge just forwards the request; the
+		// primitive is what enforces the safety check.
+		const { releaseIfOwned } = await import("../core/LockPrimitives.js");
+		const result = await runIdeBridgeAction("session-state", "/r", { operation: "release-lock" });
+		expect(result).toEqual({ ok: true });
+		expect(vi.mocked(releaseIfOwned)).toHaveBeenCalledWith("/r/.jolli/jollimemory/plans.lock", "plans.lock");
 	});
 });
 

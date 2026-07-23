@@ -1,492 +1,145 @@
 package ai.jolli.jollimemory.core
 
-import ai.jolli.jollimemory.bridge.GitCommands
-import ai.jolli.jollimemory.core.references.ReferenceStore
+import ai.jolli.jollimemory.bridge.CliIntegrations
+import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.core.references.SourceId
 import com.google.gson.Gson
-import com.google.gson.GsonBuilder
-import java.time.Instant
+import com.google.gson.JsonElement
+import com.google.gson.JsonObject
+import com.google.gson.reflect.TypeToken
 
 /**
- * SummaryStore — Kotlin port of SummaryStore.ts
+ * Thin JVM DTO adapter for the CLI-owned summary/storage implementation.
  *
- * Stores and retrieves commit summaries via a StorageProvider.
- * The default provider is OrphanBranchStorage (git plumbing on an orphan branch).
- *
- * GitOps is still needed for non-storage git operations (e.g. cat-file
- * for tree hash extraction).
+ * The constructor keeps its historical [GitOps]/[StorageProvider] parameters so
+ * existing IDE composition code does not need a second storage abstraction. No
+ * index, alias, path, tree, or write policy is implemented on the JVM.
  */
-class SummaryStore(private val cwd: String, private val git: GitCommands, private val storage: StorageProvider) {
+class SummaryStore(
+	private val cwd: String,
+	@Suppress("UNUSED_PARAMETER") git: GitOps,
+	@Suppress("UNUSED_PARAMETER") storage: StorageProvider,
+) {
+	constructor(cwd: String, git: GitOps) : this(cwd, git, StorageFactory.create(git, cwd))
 
-    /** Backward-compatible constructor: creates OrphanBranchStorage from GitCommands. */
-    constructor(cwd: String, git: GitCommands) : this(cwd, git, OrphanBranchStorage(git))
+	private val gson = Gson()
 
-    private val log = JmLogger.create("SummaryStore")
-    private val gson: Gson = GsonBuilder().setPrettyPrinting().create()
+	companion object {
+		const val ORPHAN_BRANCH = JmLogger.ORPHAN_BRANCH
+	}
 
-    companion object {
-        const val ORPHAN_BRANCH = JmLogger.ORPHAN_BRANCH
-        private const val INDEX_FILE = "index.json"
-    }
+	fun loadIndex(): SummaryIndex? = decode(run("index"), SummaryIndex::class.java)
 
-    // ── Read API ────────────────────────────────────────────────────────────
+	fun getSummary(commitHash: String): CommitSummary? =
+		decode(run("get") { addProperty("commitHash", commitHash) }, CommitSummary::class.java)
 
-    fun loadIndex(): SummaryIndex? {
-        val json = storage.readFile(INDEX_FILE) ?: return null
-        return try {
-            gson.fromJson(json, SummaryIndex::class.java)
-        } catch (e: Exception) {
-            log.warn("Failed to parse index: %s", e.message)
-            null
-        }
-    }
+	fun listSummaries(count: Int = 10): List<CommitSummary> {
+		val result = run("list") { addProperty("count", count) }
+		if (result.isJsonNull) return emptyList()
+		return gson.fromJson(result, object : TypeToken<List<CommitSummary>>() {}.type)
+	}
 
-    fun getSummary(commitHash: String): CommitSummary? {
-        val resolved = resolveAlias(commitHash)
-        val json = storage.readFile("summaries/$resolved.json") ?: return null
-        return try {
-            gson.fromJson(json, CommitSummary::class.java)
-        } catch (e: Exception) {
-            log.warn("Failed to parse summary for %s: %s", commitHash.take(8), e.message)
-            null
-        }
-    }
+	fun getSummaryCount(): Int = run("count").asJsonObject.get("count")?.asInt ?: 0
 
-    fun listSummaries(count: Int = 10): List<CommitSummary> {
-        val index = loadIndex() ?: return emptyList()
-        return index.entries
-            .filter { it.parentCommitHash == null }
-            .sortedByDescending { it.commitDate }
-            .take(count)
-            .mapNotNull { getSummary(it.commitHash) }
-    }
+	fun findRootHash(commitHash: String): String? =
+		stringResult(run("find-root") { addProperty("commitHash", commitHash) }, "hash")
 
-    fun getSummaryCount(): Int = storage.listFiles("summaries/").size
+	fun filterCommitsWithSummary(hashes: List<String>): Set<String> {
+		val result = run("filter-hashes") { add("hashes", gson.toJsonTree(hashes)) }
+		return result.asJsonObject.getAsJsonArray("hashes")?.mapTo(linkedSetOf()) { it.asString } ?: emptySet()
+	}
 
-    fun findRootHash(commitHash: String): String? {
-        val index = loadIndex() ?: return null
-        val entryMap = index.entries.associateBy { it.commitHash }
-        val resolved = index.commitAliases?.get(commitHash) ?: commitHash
-        var current = entryMap[resolved] ?: return null
-        while (current.parentCommitHash != null) {
-            current = entryMap[current.parentCommitHash] ?: return current.commitHash
-        }
-        return current.commitHash
-    }
+	fun scanTreeHashAliases(unmatchedHashes: List<String>): Boolean =
+		run("scan-aliases") { add("hashes", gson.toJsonTree(unmatchedHashes)) }
+			.asJsonObject.get("changed")?.asBoolean == true
 
-    fun filterCommitsWithSummary(hashes: List<String>): Set<String> {
-        val index = loadIndex() ?: return emptySet()
-        val indexed = index.entries.map { it.commitHash }.toSet()
-        val aliases = index.commitAliases ?: emptyMap()
+	fun resolveAlias(hash: String): String =
+		stringResult(run("resolve-alias") { addProperty("commitHash", hash) }, "hash") ?: hash
 
-        val matched = mutableSetOf<String>()
-        for (hash in hashes) {
-            if (hash in indexed || hash in aliases) {
-                matched.add(hash)
-            }
-        }
-        return matched
-    }
+	fun storeSummary(
+		summary: CommitSummary,
+		force: Boolean = false,
+		transcript: StoredTranscript? = null,
+		planProgress: List<PlanProgressArtifact>? = null,
+		referenceFiles: List<FileWrite>? = null,
+	) {
+		run("store-summary") {
+			add("summary", gson.toJsonTree(summary))
+			addProperty("force", force)
+			transcript?.let { add("transcript", gson.toJsonTree(it)) }
+			planProgress?.let { add("planProgress", gson.toJsonTree(it)) }
+			referenceFiles?.let { add("referenceFiles", gson.toJsonTree(it)) }
+		}
+	}
 
-    /**
-     * Scans unmatched commit hashes for tree-hash aliases.
-     * When a commit's tree hash matches an indexed summary's tree hash,
-     * records the alias so future lookups find the summary.
-     * This enables cross-branch matching (e.g. GitHub squash merge vs feature branch).
-     */
-    fun scanTreeHashAliases(unmatchedHashes: List<String>): Boolean {
-        if (unmatchedHashes.isEmpty()) return false
+	fun readPlanProgress(slug: String): PlanProgressArtifact? =
+		decode(run("read-plan-progress") { addProperty("slug", slug) }, PlanProgressArtifact::class.java)
 
-        val index = loadIndex() ?: return false
-        val treeHashToCommit = mutableMapOf<String, String>()
-        for (entry in index.entries) {
-            val th = entry.treeHash
-            if (th != null) treeHashToCommit[th] = entry.commitHash
-        }
-        if (treeHashToCommit.isEmpty()) return false
+	fun storePlanFiles(files: List<FileWrite>, commitMessage: String) = storeFiles(files, commitMessage)
 
-        val existingAliases = (index.commitAliases ?: emptyMap()).toMutableMap()
-        var anyFound = false
+	fun storeNoteFiles(files: List<FileWrite>, commitMessage: String) = storeFiles(files, commitMessage)
 
-        for (hash in unmatchedHashes) {
-            if (hash in existingAliases) continue
-            // Get the tree hash for this commit (reads from the actual git repo, not storage)
-            val catFile = git.exec("cat-file", "-p", hash) ?: continue
-            val match = Regex("^tree ([a-f0-9]+)").find(catFile) ?: continue
-            val treeHash = match.groupValues[1]
+	fun readPlanFromBranch(slug: String): String? =
+		stringResult(run("read-plan") { addProperty("slug", slug) }, "content")
 
-            val aliasTarget = treeHashToCommit[treeHash]
-            if (aliasTarget != null && aliasTarget != hash) {
-                existingAliases[hash] = aliasTarget
-                anyFound = true
-                log.info("Tree hash alias: %s → %s", hash.take(8), aliasTarget.take(8))
-            }
-        }
+	fun writePlanToBranch(slug: String, content: String, message: String) {
+		run("write-plan") {
+			addProperty("slug", slug)
+			addProperty("content", content)
+			addProperty("message", message)
+		}
+	}
 
-        if (anyFound) {
-            val updated = index.copy(commitAliases = existingAliases)
-            val files = listOf(FileWrite("index.json", gson.toJson(updated)))
-            storage.writeFiles(files, "Update commit aliases")
-        }
+	fun readReferenceFromBranch(source: SourceId, archivedKey: String): String? =
+		stringResult(run("read-reference") {
+			addProperty("source", source.name)
+			addProperty("archivedKey", archivedKey)
+		}, "content")
 
-        return anyFound
-    }
+	fun writeReferenceFromBranch(source: SourceId, archivedKey: String, content: String, message: String) {
+		run("write-reference") {
+			addProperty("source", source.name)
+			addProperty("archivedKey", archivedKey)
+			addProperty("content", content)
+			addProperty("message", message)
+		}
+	}
 
-    /** Resolves a commit hash through aliases. Returns the alias target or the original hash. */
-    fun resolveAlias(hash: String): String {
-        val index = loadIndex() ?: return hash
-        return index.commitAliases?.get(hash) ?: hash
-    }
+	fun storeReferences(files: List<FileWrite>, commitMessage: String) = storeFiles(files, commitMessage)
 
-    // ── Write API ───────────────────────────────────────────────────────────
+	fun getTranscriptHashes(): Set<String> =
+		run("transcript-hashes").asJsonObject.getAsJsonArray("hashes")
+			?.mapTo(linkedSetOf()) { it.asString } ?: emptySet()
 
-    fun storeSummary(summary: CommitSummary, force: Boolean = false, transcript: StoredTranscript? = null, planProgress: List<PlanProgressArtifact>? = null, referenceFiles: List<FileWrite>? = null) {
-        val existingIndex = loadIndex()
-        val entryMap = (existingIndex?.entries ?: emptyList()).associateBy { it.commitHash }.toMutableMap()
+	fun readTranscript(commitHash: String): StoredTranscript? =
+		decode(run("read-transcript") { addProperty("commitHash", commitHash) }, StoredTranscript::class.java)
 
-        if (!force && summary.commitHash in entryMap) {
-            log.info("Summary for %s already exists — skipping", summary.commitHash.take(8))
-            return
-        }
+	fun writeTranscriptBatch(writes: Map<String, StoredTranscript>, deletes: Set<String>) {
+		run("write-transcript-batch") {
+			add("writes", gson.toJsonTree(writes))
+			add("deletes", gson.toJsonTree(deletes))
+		}
+	}
 
-        val newEntries = flattenSummaryTree(summary, null)
-        for (entry in newEntries) entryMap[entry.commitHash] = entry
+	private fun storeFiles(files: List<FileWrite>, message: String) {
+		if (files.isEmpty()) return
+		run("store-files") {
+			add("files", gson.toJsonTree(files))
+			addProperty("message", message)
+		}
+	}
 
-        val newIndex = SummaryIndex(
-            version = 3,
-            entries = entryMap.values.toList(),
-            commitAliases = existingIndex?.commitAliases,
-        )
+	private fun run(operation: String, configure: JsonObject.() -> Unit = {}): JsonElement {
+		val request = JsonObject().apply {
+			addProperty("operation", operation)
+			configure()
+		}
+		return CliIntegrations.runIdeBridge(cwd, "summary-store", gson.toJson(request))
+	}
 
-        val indexJson = gson.toJson(newIndex)
+	private fun <T> decode(element: JsonElement, type: Class<T>): T? =
+		if (element.isJsonNull) null else gson.fromJson(element, type)
 
-        val files = mutableListOf(
-            FileWrite("summaries/${summary.commitHash}.json", gson.toJson(summary)),
-            FileWrite(INDEX_FILE, indexJson),
-        )
-        if (transcript != null && transcript.sessions.isNotEmpty()) {
-            files.add(FileWrite("transcripts/${summary.commitHash}.json", gson.toJson(transcript)))
-        }
-        if (!planProgress.isNullOrEmpty()) {
-            for (artifact in planProgress) {
-                files.add(FileWrite("plan-progress/${artifact.planSlug}.json", gson.toJson(artifact)))
-            }
-        }
-        if (!referenceFiles.isNullOrEmpty()) {
-            files.addAll(referenceFiles)
-        }
-
-        storage.writeFiles(files, "Add summary for ${summary.commitHash.take(8)}: ${summary.commitMessage.take(50)}")
-    }
-
-    fun migrateOneToOne(oldSummary: CommitSummary, newCommitInfo: CommitInfo) {
-        val newSummary = CommitSummary(
-            version = SummaryTree.CURRENT_SCHEMA_VERSION, commitHash = newCommitInfo.hash,
-            commitMessage = newCommitInfo.message, commitAuthor = newCommitInfo.author,
-            commitDate = newCommitInfo.date, branch = oldSummary.branch,
-            generatedAt = Instant.now().toString(), commitType = CommitType.rebase,
-            jolliDocId = oldSummary.jolliDocId, jolliDocUrl = oldSummary.jolliDocUrl,
-            orphanedDocIds = oldSummary.orphanedDocIds,
-            unresolvedOrphanHashes = oldSummary.unresolvedOrphanHashes,
-            plans = oldSummary.plans, e2eTestGuide = oldSummary.e2eTestGuide, recap = oldSummary.recap,
-            children = listOf(stripMergedMetadata(oldSummary)),
-        )
-        storeSummary(newSummary, force = true)
-    }
-
-    fun mergeManyToOne(
-        oldSummaries: List<CommitSummary>,
-        newCommitInfo: CommitInfo,
-        apiKey: String? = null,
-        model: String? = null,
-        jolliApiKey: String? = null,
-        aiProvider: String? = null,
-    ) {
-        val children = oldSummaries.sortedByDescending { it.commitDate }
-            .map(::stripMergedMetadata)
-        val allPlans = oldSummaries.flatMap { it.plans ?: emptyList() }
-            .groupBy { it.slug }.mapNotNull { (_, p) -> p.maxByOrNull { it.updatedAt } }
-        val allE2e = oldSummaries.flatMap { it.e2eTestGuide ?: emptyList() }
-        val jolliCandidates = collectJolliCandidates(oldSummaries)
-        val jolliWinner = jolliCandidates.maxWithOrNull(
-            compareBy<JolliCandidate> { it.generatedAt }.thenBy { it.commitDate },
-        )
-        val orphanedDocIds = (
-            jolliCandidates.filter { it !== jolliWinner }.map { it.docId } +
-                collectOrphanedDocIds(oldSummaries)
-            ).distinct().filter { it != jolliWinner?.docId }
-        val unresolvedOrphanHashes = (
-            oldSummaries.filter { it.jolliDocId == null }.map { it.commitHash } +
-                collectUnresolvedOrphanHashes(oldSummaries)
-            ).distinct()
-
-        // Build consolidation sources from old summaries
-        val sources = oldSummaries.map { s ->
-            Summarizer.SquashConsolidationSource(
-                commitHash = s.commitHash,
-                commitDate = s.commitDate,
-                commitMessage = s.commitMessage,
-                ticketId = s.ticketId,
-                recap = s.recap,
-                topics = s.topics ?: emptyList(),
-            )
-        }
-
-        // Try LLM consolidation, fall back to mechanical merge
-        var mergedTopics: List<TopicSummary>? = null
-        var mergedRecap: String? = null
-        var mergedTicketId: String? = null
-        var llmMetadata: LlmCallMetadata? = null
-        var summaryError: String? = null
-
-        val hasCredentials = !apiKey.isNullOrBlank() || !jolliApiKey.isNullOrBlank()
-        if (hasCredentials) {
-            val outcome = Summarizer.generateSquashConsolidation(
-                sources = sources,
-                squashCommitMessage = newCommitInfo.message,
-                apiKey = apiKey,
-                model = model,
-                jolliApiKey = jolliApiKey,
-                aiProvider = aiProvider,
-            )
-            when (outcome) {
-                is Summarizer.SquashConsolidationOutcome.Ok -> {
-                    mergedTopics = outcome.result.topics
-                    mergedRecap = outcome.result.recap
-                    mergedTicketId = outcome.result.ticketId
-                    llmMetadata = outcome.result.llm
-                }
-                is Summarizer.SquashConsolidationOutcome.NoContent -> {
-                    val (topics, recap, ticket) = Summarizer.mechanicalConsolidate(sources)
-                    mergedTopics = topics
-                    mergedRecap = recap
-                    mergedTicketId = ticket
-                }
-                is Summarizer.SquashConsolidationOutcome.LlmError -> {
-                    val (topics, recap, ticket) = Summarizer.mechanicalConsolidate(sources)
-                    mergedTopics = topics
-                    mergedRecap = recap
-                    mergedTicketId = ticket
-                    summaryError = "llm-failed"
-                }
-            }
-        } else {
-            val (topics, recap, ticket) = Summarizer.mechanicalConsolidate(sources)
-            mergedTopics = topics
-            mergedRecap = recap
-            mergedTicketId = ticket
-        }
-
-        // Merge the squashed commits' stored transcripts into one keyed under the
-        // new commit. Each pre-squash commit stored only the *new* entries for a
-        // session, so we group by session and concatenate those slices in
-        // chronological (oldest-first) order to reconstruct the full conversation.
-        // Without this the transcripts stay orphaned under the old hashes and the
-        // panel (which reads transcripts/<commitHash>.json) shows no conversations.
-        val mergedSessions = LinkedHashMap<String, StoredSession>()
-        for (s in oldSummaries.sortedBy { it.commitDate }) {
-            val tjson = storage.readFile("transcripts/${s.commitHash}.json") ?: continue
-            val t = try { gson.fromJson(tjson, StoredTranscript::class.java) } catch (_: Exception) { null } ?: continue
-            for (session in t.sessions) {
-                val key = session.sessionId.ifBlank { "${session.source}|${session.transcriptPath}" }
-                val existing = mergedSessions[key]
-                mergedSessions[key] =
-                    if (existing == null) session else existing.copy(
-                        entries = existing.entries + session.entries,
-                        transcriptPath = existing.transcriptPath ?: session.transcriptPath,
-                    )
-            }
-        }
-        val mergedTranscript = mergedSessions.values.toList()
-            .takeIf { it.isNotEmpty() }?.let { StoredTranscript(it) }
-        val totalEntries = mergedSessions.values.sumOf { it.entries.size }
-        val totalTurns = mergedSessions.values.sumOf { s -> s.entries.count { it.role == "human" } }
-        // Canonical (TS-identical) conversation usage: token breakdown + per-model cost.
-        val usage = mergedTranscript?.let { ConversationUsage.aggregate(it.sessions) }
-
-        val newSummary = CommitSummary(
-            version = SummaryTree.CURRENT_SCHEMA_VERSION, commitHash = newCommitInfo.hash,
-            commitMessage = newCommitInfo.message, commitAuthor = newCommitInfo.author,
-            commitDate = newCommitInfo.date, branch = oldSummaries.firstOrNull()?.branch ?: "unknown",
-            generatedAt = Instant.now().toString(), commitType = CommitType.squash,
-            plans = allPlans.takeIf { it.isNotEmpty() }, e2eTestGuide = allE2e.takeIf { it.isNotEmpty() },
-            jolliDocId = jolliWinner?.docId,
-            jolliDocUrl = jolliWinner?.docUrl,
-            orphanedDocIds = orphanedDocIds.takeIf { it.isNotEmpty() },
-            unresolvedOrphanHashes = unresolvedOrphanHashes.takeIf { it.isNotEmpty() },
-            topics = mergedTopics?.takeIf { it.isNotEmpty() },
-            recap = mergedRecap,
-            ticketId = mergedTicketId,
-            llm = llmMetadata,
-            conversationTurns = totalTurns.takeIf { it > 0 },
-            transcriptEntries = totalEntries.takeIf { it > 0 },
-            conversationTokens = usage?.conversationTokens,
-            conversationTokenBreakdown = usage?.breakdown,
-            conversationModels = usage?.models?.takeIf { it.isNotEmpty() },
-            estimatedCostUsd = usage?.estimatedCostUsd,
-            pricesAsOf = usage?.estimatedCostUsd?.let { ModelPricing.PRICES_AS_OF },
-            summaryError = summaryError,
-            children = children,
-        )
-        storeSummary(newSummary, force = true, transcript = mergedTranscript)
-    }
-
-    // ── Plan progress storage ─────────────────────────────────────────────
-
-    /** Reads a plan progress artifact from storage. */
-    fun readPlanProgress(slug: String): PlanProgressArtifact? {
-        val json = storage.readFile("plan-progress/$slug.json") ?: return null
-        return try {
-            gson.fromJson(json, PlanProgressArtifact::class.java)
-        } catch (e: Exception) {
-            log.warn("Failed to parse plan progress for %s: %s", slug, e.message)
-            null
-        }
-    }
-
-    // ── Plan storage ─────────────────────────────────────────────────────
-
-    /** Writes plan files to storage in a single atomic commit. */
-    fun storePlanFiles(files: List<FileWrite>, commitMessage: String) {
-        if (files.isEmpty()) return
-        storage.writeFiles(files, commitMessage)
-        log.info("Stored %d plan file(s): %s", files.size, commitMessage)
-    }
-
-    /** Batch write note files (`notes/<id>.md`) to storage — dual-writes like plans. */
-    fun storeNoteFiles(files: List<FileWrite>, commitMessage: String) {
-        if (files.isEmpty()) return
-        storage.writeFiles(files, commitMessage)
-        log.info("Stored %d note file(s): %s", files.size, commitMessage)
-    }
-
-    /** Reads a plan file from storage. */
-    fun readPlanFromBranch(slug: String): String? {
-        return storage.readFile("plans/$slug.md")
-    }
-
-    /** Writes a plan file to storage. */
-    fun writePlanToBranch(slug: String, content: String, message: String) {
-        val files = listOf(FileWrite("plans/$slug.md", content))
-        storage.writeFiles(files, message)
-    }
-
-    // ── Reference storage (orphan branch) ────────────────────────────────
-
-    /**
-     * Build the orphan-branch path for a reference markdown file.
-     * Port of CLI's `orphanPathFor(source, archivedKey)`.
-     */
-    private fun orphanPathFor(source: SourceId, archivedKey: String): String {
-        val prefix = "${source.name}:"
-        val bareKey = if (archivedKey.startsWith(prefix)) archivedKey.removePrefix(prefix) else archivedKey
-        val sanitized = ReferenceStore.sanitizeNativeIdForPath(source, bareKey)
-        return "references/${source.name}/$sanitized.md"
-    }
-
-    /** Reads a reference's archived markdown from the orphan branch. */
-    fun readReferenceFromBranch(source: SourceId, archivedKey: String): String? {
-        return try {
-            storage.readFile(orphanPathFor(source, archivedKey))
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    /** Writes a single reference markdown file to the orphan branch. */
-    fun writeReferenceFromBranch(source: SourceId, archivedKey: String, content: String, message: String) {
-        val files = listOf(FileWrite(orphanPathFor(source, archivedKey), content))
-        storage.writeFiles(files, message)
-    }
-
-    /** Batch write reference files to the orphan branch. */
-    fun storeReferences(files: List<FileWrite>, commitMessage: String) {
-        if (files.isEmpty()) return
-        storage.writeFiles(files, commitMessage)
-        log.info("Stored %d reference file(s)", files.size)
-    }
-
-    // ── Transcript storage ──────────────────────────────────────────────
-
-    /** Lists commit hashes that have transcript files in storage. */
-    fun getTranscriptHashes(): Set<String> {
-        return storage.listFiles("transcripts/")
-            .map { it.removePrefix("transcripts/").removeSuffix(".json") }
-            .toSet()
-    }
-
-    /** Reads a stored transcript for a commit hash. */
-    fun readTranscript(commitHash: String): StoredTranscript? {
-        val json = storage.readFile("transcripts/$commitHash.json") ?: return null
-        return try {
-            gson.fromJson(json, StoredTranscript::class.java)
-        } catch (e: Exception) {
-            log.warn("Failed to parse transcript for %s: %s", commitHash.take(8), e.message)
-            null
-        }
-    }
-
-    /** Batch writes and deletes transcript files. */
-    fun writeTranscriptBatch(writes: Map<String, StoredTranscript>, deletes: Set<String>) {
-        val files = mutableListOf<FileWrite>()
-        for ((hash, transcript) in writes) {
-            files.add(FileWrite("transcripts/$hash.json", gson.toJson(transcript)))
-        }
-        for (hash in deletes) {
-            files.add(FileWrite("transcripts/$hash.json", "", delete = true))
-        }
-        if (files.isNotEmpty()) {
-            storage.writeFiles(files, "Update transcripts")
-        }
-    }
-
-    // ── Internal helpers ────────────────────────────────────────────────────
-
-    private data class JolliCandidate(
-        val docId: Int,
-        val docUrl: String,
-        val commitDate: String,
-        val generatedAt: String,
-    )
-
-    private fun collectJolliCandidates(nodes: List<CommitSummary>): List<JolliCandidate> = nodes.flatMap { node ->
-        val own = if (node.jolliDocId != null && node.jolliDocUrl != null) {
-            listOf(JolliCandidate(node.jolliDocId, node.jolliDocUrl, node.commitDate, node.generatedAt))
-        } else {
-            emptyList()
-        }
-        own + collectJolliCandidates(node.children ?: emptyList())
-    }
-
-    private fun collectOrphanedDocIds(nodes: List<CommitSummary>): List<Int> = nodes.flatMap { node ->
-        (node.orphanedDocIds ?: emptyList()) + collectOrphanedDocIds(node.children ?: emptyList())
-    }
-
-    private fun collectUnresolvedOrphanHashes(nodes: List<CommitSummary>): List<String> = nodes.flatMap { node ->
-        (node.unresolvedOrphanHashes ?: emptyList()) + collectUnresolvedOrphanHashes(node.children ?: emptyList())
-    }
-
-    private fun stripMergedMetadata(node: CommitSummary): CommitSummary = node.copy(
-        jolliDocId = null,
-        jolliDocUrl = null,
-        orphanedDocIds = null,
-        unresolvedOrphanHashes = null,
-        plans = null,
-        e2eTestGuide = null,
-        recap = null,
-        children = node.children?.map(::stripMergedMetadata),
-    )
-
-    private fun flattenSummaryTree(node: CommitSummary, parentHash: String?): List<SummaryIndexEntry> {
-        val treeHash = git.exec("cat-file", "-p", node.commitHash)?.let { output ->
-            Regex("^tree (\\w+)").find(output)?.groupValues?.get(1)
-        }
-        val entry = SummaryIndexEntry(
-            commitHash = node.commitHash, parentCommitHash = parentHash,
-            treeHash = treeHash, commitType = node.commitType,
-            commitMessage = node.commitMessage, commitDate = node.commitDate,
-            branch = node.branch, generatedAt = node.generatedAt,
-        )
-        return listOf(entry) + (node.children ?: emptyList()).flatMap { flattenSummaryTree(it, node.commitHash) }
-    }
+	private fun stringResult(element: JsonElement, field: String): String? =
+		element.asJsonObject.get(field)?.takeUnless { it.isJsonNull }?.asString
 }

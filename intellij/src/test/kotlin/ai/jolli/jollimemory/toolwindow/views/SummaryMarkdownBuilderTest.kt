@@ -123,6 +123,7 @@ class SummaryMarkdownBuilderTest {
         @Test
         fun `includes Task usage with cost and segment split when a breakdown is present`() {
             val summary = makeSummary().copy(
+                conversationTokens = 3_000_000,
                 conversationTokenBreakdown = ConversationTokenBreakdown(1_000_000, 1_000_000, 1_000_000),
             )
             val md = SummaryMarkdownBuilder.buildMarkdown(summary)

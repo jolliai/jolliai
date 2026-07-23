@@ -54,14 +54,45 @@ object JolliAuthService {
 
     private val authListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
 
+    /**
+     * Cached result of the last is-signed-in probe. isSignedIn() is polled on
+     * every action-update tick and toolbar refresh — even with the daemon
+     * fast path, avoiding a bridge round-trip per poll keeps the UI reactive.
+     * Invalidated inside [notifyAuthListeners] so login success and signOut
+     * both force the next call to re-query.
+     *
+     * A short TTL ([SIGNED_IN_CACHE_TTL_MS]) ensures external token changes —
+     * `jolli login` / `jolli sign-out` from a terminal while the IDE is open —
+     * become visible within a few seconds instead of never (pre-TTL the cache
+     * only invalidated on in-app login/signOut).
+     */
+    @Volatile
+    private var signedInCache: Boolean? = null
+
+    @Volatile
+    private var signedInCacheExpiresAt: Long = 0L
+
+    private const val SIGNED_IN_CACHE_TTL_MS: Long = 5_000
+
     fun addAuthListener(listener: () -> Unit): Disposable {
         authListeners.add(listener)
         return Disposable { authListeners.remove(listener) }
     }
 
-    private fun notifyAuthListeners() { authListeners.forEach { it() } }
+    private fun notifyAuthListeners() {
+        signedInCache = null
+        signedInCacheExpiresAt = 0L
+        authListeners.forEach { it() }
+    }
 
-    fun isSignedIn(): Boolean = JolliConfigStore.loadAuthToken() != null
+    fun isSignedIn(): Boolean {
+        val cached = signedInCache
+        if (cached != null && System.currentTimeMillis() < signedInCacheExpiresAt) return cached
+        val v = JolliConfigStore.loadAuthToken() != null
+        signedInCache = v
+        signedInCacheExpiresAt = System.currentTimeMillis() + SIGNED_IN_CACHE_TTL_MS
+        return v
+    }
 
     /**
      * Start the OAuth login flow.

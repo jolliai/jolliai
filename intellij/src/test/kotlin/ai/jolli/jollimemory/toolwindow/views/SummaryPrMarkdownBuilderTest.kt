@@ -295,43 +295,6 @@ class SummaryPrMarkdownBuilderTest {
     }
 
     @Nested
-    inner class Truncation {
-        @Test
-        fun `truncates topics at 65K with omission warning`() {
-            // Create topics with large enough content to exceed the limit
-            val bigText = "x".repeat(5000)
-            val topics = (1..20).map {
-                TopicSummary("Topic $it", bigText, bigText, bigText)
-            }
-            val md = SummaryPrMarkdownBuilder.buildPrMarkdown(makeSummary(topics = topics))
-            md shouldContain "omitted due to GitHub PR body size limit"
-        }
-
-        @Test
-        fun `singular omission message for one topic`() {
-            val bigText = "x".repeat(60000)
-            val topics = listOf(
-                TopicSummary("Included", "short", "short", "short"),
-                TopicSummary("Omitted", bigText, bigText, bigText),
-            )
-            val md = SummaryPrMarkdownBuilder.buildPrMarkdown(makeSummary(topics = topics))
-            md shouldContain "1 more topic omitted"
-        }
-
-        @Test
-        fun `plural omission message for multiple topics`() {
-            val bigText = "x".repeat(30000)
-            val topics = listOf(
-                TopicSummary("Included", "short", "short", "short"),
-                TopicSummary("Omitted1", bigText, bigText, bigText),
-                TopicSummary("Omitted2", bigText, bigText, bigText),
-            )
-            val md = SummaryPrMarkdownBuilder.buildPrMarkdown(makeSummary(topics = topics))
-            md shouldContain "more topics omitted"
-        }
-    }
-
-    @Nested
     inner class WrapInGithubDetails {
         @Test
         fun `produces correct structure`() {

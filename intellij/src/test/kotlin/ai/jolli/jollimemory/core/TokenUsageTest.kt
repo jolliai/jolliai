@@ -5,8 +5,7 @@ import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 
 /**
- * Tests for [ConversationUsage.aggregate] (the canonical, TS-identical token/cost
- * aggregation) and the model capture in [TranscriptReader.parseTranscriptLine].
+ * Tests for [ConversationUsage.aggregate] (the canonical token/cost aggregation).
  * cache_read is excluded from every total, matching the CLI/VS Code side.
  */
 class TokenUsageTest {
@@ -105,53 +104,6 @@ class TokenUsageTest {
                 listOf(session("s1", listOf(entry(MessageUsage(inputTokens = 500))))),
             )!!
             noModel.estimatedCostUsd shouldBe null
-        }
-    }
-
-    @Nested
-    inner class ParseUsage {
-        @Test
-        fun `parses Claude message dot usage into the entry`() {
-            val line = """
-                {"timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant",
-                "content":"hello","usage":{"input_tokens":11176,"output_tokens":237,
-                "cache_read_input_tokens":19604,"cache_creation_input_tokens":13064}}}
-            """.trimIndent().replace("\n", "")
-            val e = TranscriptReader.parseTranscriptLine(line, 0)!!
-            e.role shouldBe "assistant"
-            e.usage shouldBe MessageUsage(
-                inputTokens = 11176,
-                outputTokens = 237,
-                cacheReadTokens = 19604,
-                cacheWriteTokens = 13064,
-            )
-        }
-
-        @Test
-        fun `captures message dot model onto the usage for pricing`() {
-            val line = """
-                {"message":{"role":"assistant","model":"claude-opus-4-8",
-                "content":"hi","usage":{"input_tokens":10,"output_tokens":2}}}
-            """.trimIndent().replace("\n", "")
-            TranscriptReader.parseTranscriptLine(line, 0)!!.usage!!.model shouldBe "claude-opus-4-8"
-        }
-
-        @Test
-        fun `model defaults to empty when absent`() {
-            val line = """{"message":{"role":"assistant","content":"hi","usage":{"input_tokens":10}}}"""
-            TranscriptReader.parseTranscriptLine(line, 0)!!.usage!!.model shouldBe ""
-        }
-
-        @Test
-        fun `assistant without usage has null usage`() {
-            val line = """{"message":{"role":"assistant","content":"hi"}}"""
-            TranscriptReader.parseTranscriptLine(line, 0)!!.usage shouldBe null
-        }
-
-        @Test
-        fun `user message has null usage`() {
-            val line = """{"message":{"role":"user","content":"do the thing"}}"""
-            TranscriptReader.parseTranscriptLine(line, 0)!!.usage shouldBe null
         }
     }
 }

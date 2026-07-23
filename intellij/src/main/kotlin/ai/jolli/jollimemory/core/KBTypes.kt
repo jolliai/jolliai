@@ -3,7 +3,7 @@ package ai.jolli.jollimemory.core
 /**
  * Data classes for the local Knowledge Base (.jolli/ metadata layer).
  *
- * Part of JOLLI-1309 / Step 1.2–1.3: FolderStorage + MetadataManager.
+ * Part of JOLLI-1309 / Step 1.2–1.3.
  */
 
 // ── Manifest ───────────────────────────────────────────────────────────────
@@ -20,9 +20,9 @@ data class ManifestEntry(
     val path: String,
     val fileId: String,
     // "commit" | "plan" | "note" | "wiki". "wiki" tags the generated
-    // <kbRoot>/_wiki/topic--<slug>.md and _index.md pages so MemoryBankScanner
-    // (which filters by manifest-path membership) excludes them from
-    // "user-written" classification.
+    // <kbRoot>/_wiki/topic--<slug>.md and _index.md pages so the CLI Memory
+    // Bank scanner (which filters by manifest-path membership) excludes them
+    // from "user-written" classification.
     val type: String,
     val fingerprint: String,
     val source: ManifestSource,

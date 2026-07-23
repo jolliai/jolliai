@@ -1,278 +1,104 @@
 package ai.jolli.jollimemory.core
 
-import java.time.Instant
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
-import java.util.Locale
+import ai.jolli.jollimemory.bridge.CliIntegrations
+import com.google.gson.Gson
+import com.google.gson.JsonObject
 
-/**
- * SummaryTree — Kotlin port of SummaryTree.ts
- *
- * Pure utility functions for traversing the CommitSummary tree structure.
- */
+/** Thin DTO adapter for the CLI-owned summary-tree traversal and edit rules. */
 object SummaryTree {
+	private val gson = Gson()
+	private const val ACTION = "summary-tree"
 
-    /** Summary schema version that marks root topics as authoritative (unified hoist). */
-    const val UNIFIED_HOIST_VERSION = 4
+	data class TopicWithDate(
+		val topic: TopicSummary,
+		val commitDate: String? = null,
+		val treeIndex: Int? = null,
+	)
 
-    /** Current schema version written by this plugin. */
-    const val CURRENT_SCHEMA_VERSION = 5
+	data class UpdateResult(val result: CommitSummary, val consumed: Int)
 
-    /** A topic annotated with the commitDate of the node it came from */
-    data class TopicWithDate(
-        val topic: TopicSummary,
-        val commitDate: String? = null,
-        val treeIndex: Int? = null,
-    )
+	private data class Analysis(
+		val unified: Boolean,
+		val allTopics: List<TopicWithDate>,
+		val displayTopics: List<TopicWithDate>,
+		val stats: DiffStats,
+		val turns: Int,
+		val tokens: Long,
+		val breakdown: ConversationTokenBreakdown,
+		val estimatedCost: Double,
+		val topicCount: Int,
+		val sourceNodes: List<CommitSummary>,
+		val leaf: Boolean,
+		val durationDays: Int,
+		val durationLabel: String,
+	)
 
-    /** Returns true when the summary uses the unified hoist format (v4+),
-     *  meaning root topics are authoritative and children are archival only. */
-    fun isUnifiedHoistFormat(summary: CommitSummary): Boolean {
-        return (summary.version ?: 3) >= UNIFIED_HOIST_VERSION
-    }
+	/**
+	 * Small access-ordered LRU so a Commits panel that fans out N `analyze()`
+	 * calls (topic counts, token meter, cost, duration label…) over the same
+	 * scrolling window collapses to one CLI round per unique summary instead
+	 * of one per call. Sized at 32: enough to cover a full sidebar page plus
+	 * a couple of open detail views, small enough that the retained summary
+	 * JSON strings never dominate the plugin's heap footprint. The map is
+	 * mutated under `synchronized(cache)`; the CLI round itself runs outside
+	 * the lock so a slow bridge call can't block unrelated analyses.
+	 */
+	private const val CACHE_SIZE = 32
+	private val cache: LinkedHashMap<String, Analysis> =
+		object : LinkedHashMap<String, Analysis>(16, 0.75f, true) {
+			override fun removeEldestEntry(eldest: Map.Entry<String, Analysis>): Boolean = size > CACHE_SIZE
+		}
 
-    /**
-     * Collects topics for display. For v4+ summaries, returns only root topics
-     * (authoritative after LLM consolidation). For v3, recurses into children.
-     */
-    fun collectDisplayTopics(node: CommitSummary): List<TopicWithDate> {
-        if (isUnifiedHoistFormat(node)) {
-            return (node.topics ?: emptyList()).map { TopicWithDate(it, node.commitDate) }
-        }
-        return collectAllTopics(node)
-    }
+	fun isUnifiedHoistFormat(summary: CommitSummary): Boolean = analyze(summary).unified
+	fun collectDisplayTopics(node: CommitSummary): List<TopicWithDate> = analyze(node).displayTopics
+	fun collectAllTopics(node: CommitSummary): List<TopicWithDate> = analyze(node).allTopics
+	fun aggregateStats(node: CommitSummary): DiffStats = analyze(node).stats
+	fun aggregateTurns(node: CommitSummary): Int = analyze(node).turns
+	fun aggregateConversationTokens(node: CommitSummary): Long = analyze(node).tokens
+	fun aggregateConversationTokenBreakdown(node: CommitSummary): ConversationTokenBreakdown = analyze(node).breakdown
+	fun aggregateEstimatedCost(node: CommitSummary): Double = analyze(node).estimatedCost
+	fun countTopics(node: CommitSummary): Int = analyze(node).topicCount
+	fun collectSourceNodes(node: CommitSummary): List<CommitSummary> = analyze(node).sourceNodes
+	fun isLeafNode(node: CommitSummary): Boolean = analyze(node).leaf
+	fun computeDurationDays(node: CommitSummary): Int = analyze(node).durationDays
+	fun formatDurationLabel(node: CommitSummary): String = analyze(node).durationLabel
 
-    /** Recursively collects all topics in chronological order (oldest first). */
-    fun collectAllTopics(node: CommitSummary): List<TopicWithDate> {
-        val childTopics = (node.children ?: emptyList()).reversed().flatMap { collectAllTopics(it) }
-        val own = (node.topics ?: emptyList()).map { TopicWithDate(it, node.commitDate) }
-        return childTopics + own
-    }
+	fun updateTopicInTree(node: CommitSummary, globalIndex: Int, updates: TopicUpdates): UpdateResult? =
+		mutation("update-topic", node, globalIndex) { add("updates", gson.toJsonTree(updates)) }
 
-    /** Recursively aggregates diff statistics across the entire tree. */
-    fun aggregateStats(node: CommitSummary): DiffStats {
-        var filesChanged = node.stats?.filesChanged ?: 0
-        var insertions = node.stats?.insertions ?: 0
-        var deletions = node.stats?.deletions ?: 0
-        for (child in node.children ?: emptyList()) {
-            val cs = aggregateStats(child)
-            filesChanged += cs.filesChanged
-            insertions += cs.insertions
-            deletions += cs.deletions
-        }
-        return DiffStats(filesChanged, insertions, deletions)
-    }
+	fun deleteTopicInTree(node: CommitSummary, globalIndex: Int): UpdateResult? =
+		mutation("delete-topic", node, globalIndex)
 
-    /** Recursively sums conversationTurns across the entire tree. */
-    fun aggregateTurns(node: CommitSummary): Int {
-        val own = node.conversationTurns ?: 0
-        val childTurns = (node.children ?: emptyList()).sumOf { aggregateTurns(it) }
-        return own + childTurns
-    }
+	private fun analyze(node: CommitSummary): Analysis {
+		val summaryJson = gson.toJson(node)
+		synchronized(cache) { cache[summaryJson] }?.let { return it }
+		val result = requestAnalysis(node)
+		synchronized(cache) { cache[summaryJson] = result }
+		return result
+	}
 
-    /**
-     * A node's OWN token breakdown, applying the same fallback the Commits-list brief uses
-     * ([JolliMemoryService.getBranchCommits]): prefer the canonical [CommitSummary.conversationTokenBreakdown],
-     * else map the legacy `tokenUsage` (cached = cache_creation; cache_read dropped to match TS).
-     * Returns zeros when neither is present. Keeping this in one place stops the detail view and
-     * the list from disagreeing on the same underlying counts.
-     */
-    private fun ownBreakdown(node: CommitSummary): ConversationTokenBreakdown {
-        node.conversationTokenBreakdown?.let { return ConversationTokenBreakdown(it.input, it.output, it.cached) }
-        node.tokenUsage?.let {
-            return ConversationTokenBreakdown(it.inputTokens, it.outputTokens, it.cacheWriteTokens)
-        }
-        return ConversationTokenBreakdown(0, 0, 0)
-    }
+	private fun requestAnalysis(node: CommitSummary): Analysis {
+		val request = baseRequest("analyze", node)
+		val result = CliIntegrations.runIdeBridge(CliIntegrations.resolveDefaultCwd(), ACTION, gson.toJson(request))
+		return gson.fromJson(result, Analysis::class.java)
+	}
 
-    /**
-     * Recursively sums conversationTokens across the entire tree. A consolidated
-     * (squash/amend/rebase) memory carries its tokens on the folded children, so
-     * the detail view must aggregate the whole tree, not read the root's scalar.
-     * Falls back to the node's breakdown total when the scalar is absent, so a
-     * summary that recorded only a breakdown still reports a nonzero total.
-     */
-    fun aggregateConversationTokens(node: CommitSummary): Long {
-        val bd = ownBreakdown(node)
-        val own = node.conversationTokens?.toLong() ?: (bd.input + bd.output + bd.cached)
-        return own + (node.children ?: emptyList()).sumOf { aggregateConversationTokens(it) }
-    }
+	private fun mutation(
+		operation: String,
+		node: CommitSummary,
+		globalIndex: Int,
+		configure: JsonObject.() -> Unit = {},
+	): UpdateResult? {
+		val request = baseRequest(operation, node).apply {
+			addProperty("globalIndex", globalIndex)
+			configure()
+		}
+		val result = CliIntegrations.runIdeBridge(CliIntegrations.resolveDefaultCwd(), ACTION, gson.toJson(request))
+		return if (result.isJsonNull) null else gson.fromJson(result, UpdateResult::class.java)
+	}
 
-    /** Recursively sums the per-segment conversation-token breakdown across the tree. */
-    fun aggregateConversationTokenBreakdown(node: CommitSummary): ConversationTokenBreakdown {
-        val own = ownBreakdown(node)
-        var input = own.input
-        var output = own.output
-        var cached = own.cached
-        for (child in node.children ?: emptyList()) {
-            val c = aggregateConversationTokenBreakdown(child)
-            input += c.input
-            output += c.output
-            cached += c.cached
-        }
-        return ConversationTokenBreakdown(input, output, cached)
-    }
-
-    /**
-     * Recursively sums the stored per-model [CommitSummary.estimatedCostUsd] across the tree —
-     * the accurate, write-time figure. Kept pure (no re-pricing, no fallback), mirroring the TS
-     * `aggregateEstimatedCost`. When this returns 0 (legacy/token-only memories with no stored
-     * cost), the display layer falls back to a Sonnet-rate estimate of the aggregated breakdown
-     * via [ModelPricing.estimateSonnetCostUsd] — the SAME "prefer stored, else Sonnet" logic the
-     * VS Code sidebar uses — so both tools show the same cost.
-     */
-    fun aggregateEstimatedCost(node: CommitSummary): Double {
-        val own = node.estimatedCostUsd ?: 0.0
-        return own + (node.children ?: emptyList()).sumOf { aggregateEstimatedCost(it) }
-    }
-
-    /** Recursively counts total topics across the entire tree. */
-    fun countTopics(node: CommitSummary): Int {
-        val own = node.topics?.size ?: 0
-        val childCount = (node.children ?: emptyList()).sumOf { countTopics(it) }
-        return own + childCount
-    }
-
-    /** Collects all nodes that have their own topics, newest first. */
-    fun collectSourceNodes(node: CommitSummary): List<CommitSummary> {
-        val childNodes = (node.children ?: emptyList()).flatMap { collectSourceNodes(it) }
-        val hasOwnData = (node.topics?.size ?: 0) > 0
-        return if (hasOwnData) listOf(node) + childNodes else childNodes
-    }
-
-    /** Result from updateTopicInTree / deleteTopicInTree */
-    data class UpdateResult(val result: CommitSummary, val consumed: Int)
-
-    /**
-     * Updates a topic at a global index within the tree, returning a new tree.
-     * The global index follows the same chronological order as collectAllTopics.
-     * Returns null if the index is out of range.
-     */
-    fun updateTopicInTree(
-        node: CommitSummary,
-        globalIndex: Int,
-        updates: TopicUpdates,
-    ): UpdateResult? {
-        var offset = 0
-
-        // Process children oldest-first (same order as collectAllTopics)
-        val reversedChildren = (node.children ?: emptyList()).reversed()
-        val newReversedChildren = mutableListOf<CommitSummary>()
-        var childModified = false
-
-        for (child in reversedChildren) {
-            if (childModified) {
-                newReversedChildren.add(child)
-                continue
-            }
-            val childResult = updateTopicInTree(child, globalIndex - offset, updates) ?: return null
-            offset += childResult.consumed
-            if (childResult.result !== child) {
-                childModified = true
-                newReversedChildren.add(childResult.result)
-            } else {
-                newReversedChildren.add(child)
-            }
-        }
-
-        // Check own topics
-        val ownTopics = node.topics ?: emptyList()
-        val localIndex = globalIndex - offset
-        if (!childModified && localIndex >= 0 && localIndex < ownTopics.size) {
-            val newTopics = ownTopics.mapIndexed { i, t ->
-                if (i == localIndex) t.copy(
-                    title = updates.title ?: t.title,
-                    trigger = updates.trigger ?: t.trigger,
-                    response = updates.response ?: t.response,
-                    decisions = updates.decisions ?: t.decisions,
-                    todo = updates.todo ?: t.todo,
-                    filesAffected = updates.filesAffected ?: t.filesAffected,
-                ) else t
-            }
-            return UpdateResult(
-                result = node.copy(topics = newTopics, children = newReversedChildren.reversed()),
-                consumed = offset + ownTopics.size,
-            )
-        }
-
-        val newChildren = if (childModified) newReversedChildren.reversed() else node.children
-        return UpdateResult(
-            result = if (childModified) node.copy(children = newChildren) else node,
-            consumed = offset + ownTopics.size,
-        )
-    }
-
-    /**
-     * Deletes a topic at a global index within the tree, returning a new tree.
-     * The global index follows the same chronological order as collectAllTopics.
-     * Returns null if the index is out of range.
-     */
-    fun deleteTopicInTree(
-        node: CommitSummary,
-        globalIndex: Int,
-    ): UpdateResult? {
-        var offset = 0
-
-        val reversedChildren = (node.children ?: emptyList()).reversed()
-        val newReversedChildren = mutableListOf<CommitSummary>()
-        var childModified = false
-
-        for (child in reversedChildren) {
-            if (childModified) {
-                newReversedChildren.add(child)
-                continue
-            }
-            val childResult = deleteTopicInTree(child, globalIndex - offset) ?: return null
-            offset += childResult.consumed
-            if (childResult.result !== child) {
-                childModified = true
-                newReversedChildren.add(childResult.result)
-            } else {
-                newReversedChildren.add(child)
-            }
-        }
-
-        val ownTopics = node.topics ?: emptyList()
-        val localIndex = globalIndex - offset
-        if (!childModified && localIndex >= 0 && localIndex < ownTopics.size) {
-            val newTopics = ownTopics.filterIndexed { i, _ -> i != localIndex }
-            return UpdateResult(
-                result = node.copy(topics = newTopics, children = newReversedChildren.reversed()),
-                consumed = offset + ownTopics.size,
-            )
-        }
-
-        val newChildren = if (childModified) newReversedChildren.reversed() else node.children
-        return UpdateResult(
-            result = if (childModified) node.copy(children = newChildren) else node,
-            consumed = offset + ownTopics.size,
-        )
-    }
-
-    /** Returns true if this node has no children (leaf node). */
-    fun isLeafNode(node: CommitSummary): Boolean {
-        return node.children.isNullOrEmpty()
-    }
-
-    /** Computes the work duration in days across the entire tree. */
-    fun computeDurationDays(node: CommitSummary): Int {
-        val sources = collectSourceNodes(node)
-        if (sources.size <= 1) return 1
-        val dates = sources.map { it.commitDate.take(10) }.toSet()
-        return dates.size
-    }
-
-    /** Formats a human-readable duration label. */
-    fun formatDurationLabel(node: CommitSummary): String {
-        val days = computeDurationDays(node)
-        val dayStr = if (days == 1) "1 day" else "$days days"
-        val sources = collectSourceNodes(node)
-        if (sources.size <= 1) return dayStr
-
-        val timestamps = sources.map { Instant.parse(it.commitDate).toEpochMilli() }
-        val earliest = Instant.ofEpochMilli(timestamps.min())
-        val latest = Instant.ofEpochMilli(timestamps.max())
-        val fmt = DateTimeFormatter.ofPattern("MMM d, yyyy", Locale.US).withZone(ZoneId.systemDefault())
-        return "$dayStr (${fmt.format(earliest)} — ${fmt.format(latest)})"
-    }
+	private fun baseRequest(operation: String, node: CommitSummary): JsonObject = JsonObject().apply {
+		addProperty("operation", operation)
+		add("summary", gson.toJsonTree(node))
+	}
 }

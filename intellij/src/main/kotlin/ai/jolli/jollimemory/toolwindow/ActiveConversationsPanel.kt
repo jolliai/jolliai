@@ -109,10 +109,14 @@ class ActiveConversationsPanel(
 
 	private fun loadData() {
 		val cwd = service.mainRepoRoot ?: project.basePath ?: return
+		// A bridge / transport failure means we don't know which sources are OK,
+		// so mark ALL of them as failed. Without this, an empty `failedSources`
+		// hides the warning banner and the user sees a "no active conversations"
+		// row that is really "sidebar can't reach the CLI daemon".
 		val result: ActiveConversationsResult = try {
 			ActiveSessionAggregator.listActiveConversationsWithDiagnostics(cwd)
 		} catch (e: Exception) {
-			ActiveConversationsResult(emptyList(), emptyList())
+			ActiveConversationsResult(emptyList(), TranscriptSource.entries.toList())
 		}
 		val exclusions = CommitSelectionStore.readExclusions(cwd)
 		val itemsWithSelection = result.items.map { item ->

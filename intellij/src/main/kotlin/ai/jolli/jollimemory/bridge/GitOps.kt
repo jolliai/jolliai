@@ -10,11 +10,11 @@ import java.util.concurrent.TimeUnit
  * Git is universally available on developer machines — no Node.js needed.
  * Uses IntelliJ's bundled git if available, falls back to system git.
  *
- * The real (and only production) implementation of [GitCommands]; consumers
- * that only need that surface depend on the interface so tests can inject a
- * hand-written fake instead of bytecode-mocking this final class.
+ * IDE-only surface: reads for the tool-window/panels and short user-triggered
+ * git actions. Domain-level orphan-branch I/O has moved to the CLI via
+ * `jolli ide-bridge git-exec`; keep this class limited to display-time reads.
  */
-class GitOps(private val projectDir: String) : GitCommands {
+class GitOps(private val projectDir: String) {
 
     private val log = JmLogger.create("GitOps")
 
@@ -126,24 +126,24 @@ class GitOps(private val projectDir: String) : GitCommands {
      * Runs a git command and returns stdout, or null on failure.
      * Delegates to [execWithResult] — use that directly when stderr is needed.
      */
-    override fun exec(vararg args: String, timeoutSeconds: Long, trim: Boolean): String? {
+    fun exec(vararg args: String, timeoutSeconds: Long = 15, trim: Boolean = true): String? {
         val result = execWithResult(*args, timeoutSeconds = timeoutSeconds, trim = trim)
         return if (result.exitCode == 0) result.stdout else null
     }
 
     /** Check if a branch exists. */
-    override fun branchExists(branchName: String): Boolean {
+    fun branchExists(branchName: String): Boolean {
         return exec("rev-parse", "--verify", "refs/heads/$branchName") != null
     }
 
     /** List files in an orphan branch under a prefix. */
-    override fun listBranchFiles(branch: String, prefix: String): List<String> {
+    fun listBranchFiles(branch: String, prefix: String): List<String> {
         val output = exec("ls-tree", "-r", "--name-only", branch, prefix) ?: return emptyList()
         return output.lines().filter { it.isNotBlank() }
     }
 
     /** Read a file from an orphan branch. */
-    override fun readBranchFile(branch: String, path: String): String? {
+    fun readBranchFile(branch: String, path: String): String? {
         return exec("show", "$branch:$path")
     }
 
@@ -170,7 +170,7 @@ class GitOps(private val projectDir: String) : GitCommands {
     }
 
     /** Execute a git command with stdin input and return stdout. */
-    override fun execWithStdin(vararg args: String, input: String, timeoutSeconds: Long): String? {
+    fun execWithStdin(vararg args: String, input: String, timeoutSeconds: Long = 15): String? {
         return try {
             val cmdArgs = mutableListOf("git")
             cmdArgs.addAll(args)

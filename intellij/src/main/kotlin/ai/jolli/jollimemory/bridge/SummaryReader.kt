@@ -1,91 +1,39 @@
 package ai.jolli.jollimemory.bridge
 
-import ai.jolli.jollimemory.core.CodexSessionDiscoverer
 import ai.jolli.jollimemory.core.CommitSummary
-import ai.jolli.jollimemory.core.CopilotChatSupport
-import ai.jolli.jollimemory.core.CopilotSupport
-import ai.jolli.jollimemory.core.CursorSupport
-import ai.jolli.jollimemory.core.GeminiSupport
 import ai.jolli.jollimemory.core.JmLogger
-import ai.jolli.jollimemory.core.OpenCodeSupport
-import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.StatusInfo
 import com.google.gson.Gson
 import com.google.gson.JsonParser
 
 /**
  * Reads JolliMemory data from the filesystem and git — pure Kotlin, no Node.js.
+ *
+ * `worktreeDir` MUST be the CURRENT worktree root (project.basePath), not the
+ * shared main-repo root. The CLI's `getStatus` treats its cwd as the target
+ * checkout — it reads `.claude/settings.local.json`, `.gemini/settings.json`,
+ * `.jolli/jollimemory/sessions.json`, and every source-detector from that
+ * directory. Passing the main worktree root here would make every linked
+ * worktree report the main checkout's hook state instead of its own, keep the
+ * Claude Stop hook forever "installed" from the linked worktree's point of
+ * view, and skip the startup self-heal that should repair it. Orphan-branch
+ * reads (listSummaries / getSummary) go through `git` (GitOps), which resolves
+ * the shared common-dir automatically, so they aren't affected by this choice.
  */
-class SummaryReader(private val projectDir: String, private val git: GitCommands) {
+class SummaryReader(private val worktreeDir: String, private val git: GitOps) {
 
     private val log = JmLogger.create("SummaryReader")
     private val gson = Gson()
 
     /** Read the full installation and data status. */
-    fun getStatus(installer: HookInstaller): StatusInfo {
-        val sessions = SessionTracker.loadAllSessions(projectDir)
-        val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
-        // Mirror the CLI's isFullyInstalled readiness check: a user with
-        // `claudeEnabled: false` intentionally has no Claude Stop hook, so
-        // requiring it would report a complete install as broken and re-trigger
-        // the startup auto-install every launch.
-        val hooksInstalled = installer.areAllHooksInstalled(claudeRequired = config.claudeEnabled != false)
-        val branchExists = git.branchExists(ORPHAN_BRANCH)
-        val summaryCount = if (branchExists) countSummaries() else 0
-
-        // Lightweight DB health checks — no full scan, just open + trivial query
-        val openCodeInstalled = OpenCodeSupport.isOpenCodeInstalled()
-        val openCodeError = if (openCodeInstalled && config.openCodeEnabled != false)
-            OpenCodeSupport.checkDbHealth() else null
-
-        val cursorInstalled = CursorSupport.isCursorInstalled()
-        val cursorError = if (cursorInstalled && config.cursorEnabled != false)
-            CursorSupport.checkDbHealth() else null
-
-        val copilotInstalled = CopilotSupport.isCopilotInstalled()
-        val copilotError = if (copilotInstalled && config.copilotEnabled != false)
-            CopilotSupport.checkDbHealth() else null
-
-        val copilotChatInstalled = CopilotChatSupport.isCopilotChatInstalled()
-
-        // Node-powered integrations (MCP + full skill set). getStatus() runs off the EDT
-        // (refreshStatus is invoked on a pooled thread / the startup coroutine), so the
-        // login-shell PATH probe inside isNodeAvailable() never blocks the UI.
-        val nodeAvailable = CliIntegrations.isNodeAvailable()
-        val integrationsActive = CliIntegrations.integrationsUpToDate()
-
-        return StatusInfo(
-            enabled = hooksInstalled,
-            claudeHookInstalled = installer.isClaudeHookInstalled(),
-            // Reflect all five CLI-installed git hooks (post-commit, post-rewrite,
-            // prepare-commit-msg, post-merge, pre-push). Checking only post-commit
-            // reported the whole set as absent whenever any single hook was missing
-            // from that one file, so the sidebar showed "Hooks: none installed"
-            // while pre-push (and friends) were actually installed.
-            gitHookInstalled = installer.areAllGitHooksInstalled(),
-            geminiHookInstalled = installer.isGeminiHookInstalled(),
-            activeSessions = sessions.size,
-            mostRecentSession = SessionTracker.loadMostRecentSession(projectDir),
-            summaryCount = summaryCount,
-            orphanBranch = ORPHAN_BRANCH,
-            claudeDetected = installer.isClaudeDetected(),
-            codexDetected = CodexSessionDiscoverer.isCodexInstalled(),
-            codexEnabled = config.codexEnabled,
-            geminiDetected = GeminiSupport.isGeminiInstalled(),
-            geminiEnabled = config.geminiEnabled,
-            openCodeDetected = openCodeInstalled,
-            openCodeEnabled = config.openCodeEnabled,
-            openCodeScanError = openCodeError,
-            cursorDetected = cursorInstalled,
-            cursorEnabled = config.cursorEnabled,
-            cursorScanError = cursorError,
-            copilotDetected = copilotInstalled,
-            copilotEnabled = config.copilotEnabled,
-            copilotScanError = copilotError,
-            copilotChatDetected = copilotChatInstalled,
-            copilotChatScanError = null,
-            nodeAvailable = nodeAvailable,
-            integrationsActive = integrationsActive,
+    fun getStatus(@Suppress("UNUSED_PARAMETER") installer: HookInstaller): StatusInfo {
+        val cliStatus = gson.fromJson(
+            CliIntegrations.runIdeBridge(worktreeDir, "status"),
+            StatusInfo::class.java,
+        )
+        return cliStatus.copy(
+            nodeAvailable = CliIntegrations.isNodeAvailable(),
+            integrationsActive = CliIntegrations.integrationsUpToDate(),
         )
     }
 

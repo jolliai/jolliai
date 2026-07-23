@@ -119,8 +119,16 @@ object SessionTitleResolver {
 		TranscriptSource.gemini -> ::parseGeminiUserLine
 		TranscriptSource.opencode -> { _ -> null } // OpenCode carries native title
 		TranscriptSource.cursor -> { _ -> null } // Cursor carries native title
+		TranscriptSource.`cursor-cli` -> { _ -> null } // Cursor CLI carries native title
 		TranscriptSource.copilot -> { _ -> null }
 		TranscriptSource.`copilot-chat` -> { _ -> null }
+		// Cline / Devin / Antigravity: no local line parser — the CLI-side
+		// aggregator provides a title, so returning null here just declines the
+		// fallback path (matches every other non-Claude/Codex/Gemini source).
+		TranscriptSource.cline -> { _ -> null }
+		TranscriptSource.`cline-cli` -> { _ -> null }
+		TranscriptSource.devin -> { _ -> null }
+		TranscriptSource.antigravity -> { _ -> null }
 	}
 
 	private fun parseClaudeUserLine(line: String): String? {
