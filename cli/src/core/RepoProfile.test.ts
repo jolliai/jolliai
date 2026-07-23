@@ -56,7 +56,7 @@ describe("RepoProfile", () => {
 		expect(await readRepoProfile(cwd)).toEqual({});
 	});
 
-	it("migrates the legacy backfill-card-dismissed marker on read and persists it (read-once)", async () => {
+	it("migrates the legacy backfill-card-dismissed marker on read, persists it, and retires the marker", async () => {
 		// Legacy location: <git-common-dir>/jollimemory/backfill-card-dismissed.
 		const legacyMarker = join(cwd, ".git", "jollimemory", "backfill-card-dismissed");
 		mkdirSync(join(cwd, ".git", "jollimemory"), { recursive: true });
@@ -64,10 +64,11 @@ describe("RepoProfile", () => {
 
 		expect(await readRepoProfile(cwd)).toEqual({ backfillDismissed: true });
 		expect(existsSync(profilePath(cwd))).toBe(true);
+		// A successful migration retires the marker so a later profile.json reset
+		// (deleting the field) can't resurrect a stale dismiss.
+		expect(existsSync(legacyMarker)).toBe(false);
 
-		// Prove the value was PERSISTED, not merely re-derived: remove the legacy
-		// marker and read again — the dismiss must survive from profile.json alone.
-		rmSync(legacyMarker);
+		// The dismiss survives from profile.json alone (marker already gone).
 		expect(await readRepoProfile(cwd)).toEqual({ backfillDismissed: true });
 	});
 
@@ -86,6 +87,25 @@ describe("RepoProfile", () => {
 		expect(await readRepoProfile(cwd)).toEqual({ backfillDismissed: true });
 		// Persist failed → profile.json is still the directory (never became a file).
 		expect(statSync(profilePath(cwd)).isDirectory()).toBe(true);
+		// ...and the marker is preserved (unlink never runs when the persist throws),
+		// so the next read re-migrates.
+		expect(existsSync(join(legacyDir, "backfill-card-dismissed"))).toBe(true);
+	});
+
+	it("migrates and persists even when retiring the marker fails", async () => {
+		// Make the unlink fail deterministically: the marker is a non-empty DIRECTORY,
+		// so fileExists() still sees it but unlink() throws (EISDIR/EPERM). The persist
+		// succeeds, so the dismiss must still land in profile.json without crashing.
+		const legacyMarker = join(cwd, ".git", "jollimemory", "backfill-card-dismissed");
+		mkdirSync(legacyMarker, { recursive: true });
+		writeFileSync(join(legacyMarker, "child"), "keeps the dir non-empty");
+
+		expect(await readRepoProfile(cwd)).toEqual({ backfillDismissed: true });
+		expect(existsSync(profilePath(cwd))).toBe(true);
+		// The marker dir lingers (unlink failed) but is now inert: profile.json carries
+		// the field, so the next read never consults the marker again.
+		expect(existsSync(legacyMarker)).toBe(true);
+		expect(await readRepoProfile(cwd)).toEqual({ backfillDismissed: true });
 	});
 
 	it("does NOT let the legacy marker override an explicit profile value", async () => {

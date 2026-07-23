@@ -153,3 +153,25 @@ export function resolveClaudeExecutable(opts: ResolveOpts = {}): ResolvedExecuta
 	cached = { at: now(), key: cacheKey, result: best };
 	return best;
 }
+
+/**
+ * Non-throwing liveness check for the local Claude Code CLI: true when a
+ * compatible `claude` is resolvable (present on PATH / known locations AND it
+ * accepts the flags we pass), false otherwise. Thin wrapper over
+ * {@link resolveClaudeExecutable} so interactive callers (the guided front door,
+ * `promptSetup`) can branch on availability without a try/catch.
+ *
+ * Exported as its own function on purpose: it is the seam tests mock so they
+ * never shell out to a real `claude`. Cost is one `resolveClaudeExecutable`
+ * call — a successful resolution is cached for {@link RESOLUTION_CACHE_TTL_MS},
+ * but a failure is never cached, so a just-installed / just-fixed binary is
+ * picked up on the next call.
+ */
+export function isClaudeCodeUsable(opts: ResolveOpts = {}): boolean {
+	try {
+		resolveClaudeExecutable(opts);
+		return true;
+	} catch {
+		return false;
+	}
+}
