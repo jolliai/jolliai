@@ -6,12 +6,11 @@
  */
 
 import { join } from "node:path";
-import type { Command } from "commander";
+import { type Command, Option } from "commander";
 import { getJolliUrl } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { validateJolliApiKey } from "../core/JolliApiUtils.js";
-import { readManualDisableFlag, writeManualDisableFlag } from "../core/RepoProfile.js";
 import { getGlobalConfigDir, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
 import { markSkipExitFlush } from "../core/TelemetryCommandHook.js";
@@ -161,28 +160,22 @@ export function registerEnableCommand(program: Command): void {
 		.option("-y, --yes", "Skip interactive prompts")
 		.option(
 			"--integrations-only",
-			"Set up MCP + skills + dispatch scripts only; install no git/agent hooks (for hosts that manage their own hooks, e.g. the IntelliJ plugin)",
+			"Repair MCP, skills, and dispatch scripts without changing repo hooks (advanced)",
 		)
 		.option(
-			"--git-hooks-only",
-			"Install ONLY the git hooks (+ dispatch scripts) that drive summary generation; set up no MCP/skills/agent hooks (for the Claude Code plugin, which ships those itself). Silent on success.",
+			"--repo-hooks-only",
+			"Install only the shared runtime, source-neutral Git hooks, Claude agent hooks, and project /jolli menu",
 		)
-		.option(
-			"--source-tag <tag>",
-			"Override the dist-paths source tag (e.g. 'intellij') so this install coexists with other surfaces",
-		)
-		.option(
-			"--reload-skills",
-			"After a --git-hooks-only bootstrap, emit a SessionStart reloadSkills signal on stdout so a freshly-written bare /jolli project skill is picked up THIS session (for the Claude Code plugin's SessionStart hook; ignored otherwise)",
-		)
+		.option("--source-tag <tag>", "Override the dist-paths source tag (e.g. 'intellij')")
+		.addOption(new Option("--automatic").hideHelp())
 		.action(
 			async (options: {
 				cwd: string;
 				yes?: boolean;
 				integrationsOnly?: boolean;
-				gitHooksOnly?: boolean;
+				repoHooksOnly?: boolean;
 				sourceTag?: string;
-				reloadSkills?: boolean;
+				automatic?: boolean;
 			}) => {
 				setLogDir(options.cwd);
 
@@ -195,37 +188,19 @@ export function registerEnableCommand(program: Command): void {
 					return;
 				}
 
-				if (options.integrationsOnly && options.gitHooksOnly) {
-					console.error("\n  Error: --integrations-only and --git-hooks-only are mutually exclusive.\n");
+				if (options.integrationsOnly && options.repoHooksOnly) {
+					console.error("\n  Error: --integrations-only and --repo-hooks-only are mutually exclusive.\n");
 					process.exitCode = 1;
 					return;
 				}
 
-				// The git-hooks-only path runs as the Claude Code plugin's SessionStart
-				// bootstrap on every session — skip the ≤2s telemetry exit-flush so it
-				// doesn't add latency to the synchronous startup path.
-				if (options.gitHooksOnly) {
+				if (options.repoHooksOnly) {
 					markSkipExitFlush();
-
-					// A repo the user explicitly turned off (`jolli disable`) records a
-					// repo-wide manual-disable opt-out. Unlike a full `enable`, this
-					// bootstrap re-runs on EVERY SessionStart, so without this gate it
-					// would silently reinstall the git hooks and defeat the opt-out. Honor
-					// it here — mirroring the VS Code activation gate — so the manual
-					// disable stays the highest-priority signal. A full `enable` still
-					// clears the flag (reportEnableResult), so an explicit re-enable wins.
-					// Stay silent on exit 0: the plugin injects this path's stdout into the
-					// agent context, so skipping must be as quiet as a successful install.
-					if (await readManualDisableFlag(options.cwd)) {
-						log.info("'enable --git-hooks-only' skipped — repo manually disabled");
-						return;
-					}
 				}
 
 				if (options.sourceTag !== undefined && !isValidSourceTag(options.sourceTag)) {
-					// The tag becomes a dist-paths filename and a JOLLI_DIST_PREFER_SOURCE=
-					// shell env value in generated git hooks — reject anything that isn't a
-					// safe path segment / shell token before it reaches either.
+					// The tag becomes a dist-paths filename and may be passed to the
+					// resolver as an env value — reject unsafe path/shell tokens.
 					console.error(
 						"\n  Error: --source-tag must be lowercase alphanumerics and hyphens only (e.g. 'intellij').\n",
 					);
@@ -237,36 +212,18 @@ export function registerEnableCommand(program: Command): void {
 				const result = await install(options.cwd, {
 					source: "cli",
 					integrationsOnly: options.integrationsOnly,
-					gitHooksOnly: options.gitHooksOnly,
+					repoHooksOnly: options.repoHooksOnly,
 					sourceTag: options.sourceTag,
+					respectManualDisable: options.automatic,
+					clearManualDisableOnSuccess: !options.integrationsOnly && !options.automatic,
+					automatic: options.automatic,
 				});
 
-				// git-hooks-only runs as the Claude Code plugin's SessionStart bootstrap
-				// on every session. Its stdout would be injected into the agent context,
-				// so stay silent on success (details go to debug.log) and never run the
-				// interactive setup / telemetry banner; only surface failures on stderr.
-				if (options.gitHooksOnly) {
+				if (options.repoHooksOnly) {
 					if (result.success) {
-						log.info("git-hooks-only bootstrap complete");
-						// The Claude Code plugin's SessionStart hook runs this to write the
-						// bare `/jolli` project skill (installPluginJolliMenu). Claude Code
-						// enumerates skills BEFORE SessionStart hooks finish, so without a
-						// signal the freshly written `/jolli` would only appear next session.
-						// Emit the reloadSkills hookSpecificOutput as PURE JSON: on exit 0
-						// Claude Code parses it as structured output (NOT injected into the
-						// agent context, unlike plain-text stdout) and re-scans the skill /
-						// command dirs AFTER all SessionStart hooks complete — so `/jolli` is
-						// invocable this same session. Gated on the flag so a manual
-						// `enable --git-hooks-only` (e.g. from /jolli:init) stays silent.
-						if (options.reloadSkills) {
-							process.stdout.write(
-								JSON.stringify({
-									hookSpecificOutput: { hookEventName: "SessionStart", reloadSkills: true },
-								}),
-							);
-						}
+						log.info("repo-hooks-only reconciliation complete");
 					} else {
-						console.error(`Jolli git-hooks bootstrap failed: ${result.message}`);
+						console.error(`Jolli repo-hooks reconciliation failed: ${result.message}`);
 						process.exitCode = 1;
 					}
 					return;
@@ -278,9 +235,8 @@ export function registerEnableCommand(program: Command): void {
 }
 
 /**
- * Prints the human-facing outcome of a full `jolli enable` (non git-hooks-only)
- * and, when interactive, runs the API-key setup flow. Extracted from the action
- * so the git-hooks-only bootstrap path can stay silent.
+ * Prints the human-facing outcome of a full `jolli enable` and, when
+ * interactive, runs the API-key setup flow. Repo-hooks-only stays silent.
  */
 async function reportEnableResult(
 	result: InstallResult,
@@ -288,25 +244,6 @@ async function reportEnableResult(
 ): Promise<void> {
 	if (result.success) {
 		track("surface_enabled", { trigger: "cli" });
-		// Explicit enable clears any repo-wide manual-disable opt-out so a later
-		// upgrade / window reload keeps the feature on. Skipped for integrations-only
-		// (IntelliJ's MCP-only setup), which is not a full enable. Written
-		// unconditionally otherwise — profile.json is machine-local and gitignored.
-		// Unlike the disable path (where a failed write must block hook removal to
-		// avoid a deceptive half-state), a failed clear here is non-fatal: hooks are
-		// already installed, and a subsequent full `jolli enable` will retry.
-		// SessionStart does NOT retry — it returns immediately when the flag is
-		// still true (the manualDisable gate), so only an explicit enable clears it.
-		if (!options.integrationsOnly) {
-			try {
-				await writeManualDisableFlag(options.cwd, false);
-			} catch (err) {
-				console.warn(
-					`\n  Warning: could not clear the manual-disable flag (${(err as Error).message}).\n` +
-						"  Enable succeeded. Run `jolli enable` again to clear the opt-out.\n",
-				);
-			}
-		}
 		if (options.integrationsOnly) {
 			console.log("\n  Jolli Memory integrations enabled (MCP + skills; no hooks installed).\n");
 		} else {
@@ -355,8 +292,8 @@ async function reportEnableResult(
 		// Pre-push sync catch-up (JOLLI-1900): retry any commits left in
 		// push-pending.json from a previous session. Runs after promptSetup so a
 		// user who just signed in gets their backlog pushed. Skipped in
-		// integrations-only mode (IntelliJ manages its own hook/worker). Fully
-		// guarded — never throws, no-ops when nothing is pending or not signed in.
+		// integrations-only is a focused repair mode and does not own Git-hook
+		// capture. Fully guarded — never throws, no-ops when nothing is pending.
 		if (!options.integrationsOnly) {
 			triggerPendingPushRetry(options.cwd, "cli-enable");
 		}
@@ -396,20 +333,11 @@ export function registerDisableCommand(program: Command): void {
 			// can't make durable would leave a deceptive half-state (hooks gone, but
 			// a later upgrade / VS Code activation silently re-enables). Fail loudly
 			// and change nothing so the state stays coherent (still enabled).
-			if (!options.integrationsOnly) {
-				try {
-					await writeManualDisableFlag(options.cwd, true);
-				} catch (err) {
-					console.error(
-						`\n  Error: could not persist the disable opt-out (${(err as Error).message}).\n` +
-							"  Hooks were left intact to avoid a state that silently re-enables.\n" +
-							"  Fix write access to .jolli/jollimemory/ and re-run 'jolli disable'.\n",
-					);
-					process.exitCode = 1;
-					return;
-				}
-			}
-			const result = await uninstall(options.cwd, { integrationsOnly: options.integrationsOnly });
+			const result = await uninstall(options.cwd, {
+				integrationsOnly: options.integrationsOnly,
+				preserveMenu: !options.integrationsOnly,
+				persistManualDisable: !options.integrationsOnly,
+			});
 
 			if (result.success) {
 				track("surface_disabled", { reason: "manual" });

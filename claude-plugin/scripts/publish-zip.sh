@@ -37,7 +37,7 @@ node "$PLUGIN_DIR/scripts/build.mjs"
 # git-hook/worker scripts block the installing user's commits (see build.mjs
 # header). Kept in lockstep with build.mjs entryPoints AND _publish-lib.sh's
 # PUBLISH_REQUIRED_DIST.
-REQUIRED_DIST="Cli.js StopHook.js SessionStartHook.js PostCommitHook.js PostMergeHook.js PostRewriteHook.js PrepareMsgHook.js PrePushHook.js QueueWorker.js PrePushWorker.js"
+REQUIRED_DIST="Cli.js PluginBootstrapHook.js StopHook.js SessionStartHook.js PostCommitHook.js PostMergeHook.js PostRewriteHook.js PrepareMsgHook.js PrePushHook.js QueueWorker.js PrePushWorker.js"
 missing=""
 for f in $REQUIRED_DIST; do
 	[ -s "$PLUGIN_DIR/dist/$f" ] || missing="$missing $f"

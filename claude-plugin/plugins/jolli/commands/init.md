@@ -63,7 +63,7 @@ subscription) when the user has made no explicit choice, so generation works wit
 no API key. Silent on success:
 
 ```bash
-JOLLI_DIST_PREFER_SOURCE=claude-plugin "$HOME/.jolli/jollimemory/run-cli" enable --git-hooks-only --source-tag claude-plugin
+JOLLI_DIST_PREFER_SOURCE=claude-plugin "$HOME/.jolli/jollimemory/run-cli" enable --repo-hooks-only --source-tag claude-plugin
 ```
 
 ## Step 4: Bind the repo to a Jolli Space

@@ -6,7 +6,7 @@
  * Mirrors vscode/esbuild.config.mjs (CJS, node target, import.meta.url shim).
  * The dist must carry not just the entry points the plugin launches directly
  * (Cli.js, StopHook.js, SessionStartHook.js) but ALSO the git-hook scripts and
- * their workers — because `enable --git-hooks-only` installs git hooks that
+ * their workers — because PluginBootstrapHook installs repo hooks that
  * resolve, at commit time, back through `dist-paths/` to THIS dist. A dist
  * missing e.g. PrepareMsgHook.js does not merely no-op: the prepare-commit-msg
  * hook would `node <dist>/PrepareMsgHook.js` a nonexistent file and BLOCK the
@@ -47,6 +47,18 @@ const jmSrc = resolve(cliDir, "src");
 
 const pluginPkg = JSON.parse(readFileSync(resolve(pluginDir, ".claude-plugin", "plugin.json"), "utf-8"));
 const cliPkg = JSON.parse(readFileSync(resolve(cliDir, "package.json"), "utf-8"));
+const hooksManifest = JSON.parse(readFileSync(resolve(pluginDir, "hooks", "hooks.json"), "utf-8"));
+const manifestHooks = hooksManifest.hooks ?? {};
+const sessionStartCommands = (manifestHooks.SessionStart ?? []).flatMap((group) =>
+	(group.hooks ?? []).map((hook) => hook.command),
+);
+if (
+	Object.keys(manifestHooks).length !== 1 ||
+	sessionStartCommands.length !== 1 ||
+	!sessionStartCommands[0]?.includes("PluginBootstrapHook.js")
+) {
+	throw new Error("hooks.json must register exactly one SessionStart PluginBootstrapHook and no business hooks");
+}
 
 const options = {
 	bundle: true,
@@ -60,9 +72,10 @@ const options = {
 	logLevel: "info",
 	entryPoints: [
 		{ in: resolve(jmSrc, "Cli.ts"), out: "Cli" },
+		{ in: resolve(jmSrc, "hooks", "PluginBootstrapHook.ts"), out: "PluginBootstrapHook" },
 		{ in: resolve(jmSrc, "hooks", "StopHook.ts"), out: "StopHook" },
 		{ in: resolve(jmSrc, "hooks", "SessionStartHook.ts"), out: "SessionStartHook" },
-		// Git shell hooks — installed by `enable --git-hooks-only`, resolved back
+		// Git shell hooks — installed by the bootstrap reconciler, resolved back
 		// to this dist at commit time via dist-paths/. Omitting any of these turns
 		// the corresponding git hook into a "node <missing file>" that BLOCKS the
 		// git operation (see header).
@@ -91,6 +104,36 @@ const options = {
 	},
 };
 
+// Guard the dist against a silently-dropped entry point. esbuild only fails on a
+// missing *source* file, not on a removed `entryPoints` line — and the REQUIRED_DIST
+// completeness loops live in the publish scripts, which are NOT in `npm run all`/CI.
+// So assert the canonical entry set here, where `build:claude-plugin` (and thus CI)
+// catches drift. Kept in lockstep with cli/src/install/DistPathWriter.ts
+// REQUIRED_RUNTIME_FILES (those 10 + PluginBootstrapHook, which the manifest launches
+// directly and so never resolves through dist-paths/).
+const EXPECTED_ENTRY_OUTS = [
+	"Cli",
+	"PluginBootstrapHook",
+	"StopHook",
+	"SessionStartHook",
+	"PostCommitHook",
+	"PostMergeHook",
+	"PostRewriteHook",
+	"PrepareMsgHook",
+	"PrePushHook",
+	"QueueWorker",
+	"PrePushWorker",
+];
+const actualOuts = options.entryPoints.map((e) => e.out).sort();
+const expectedOuts = [...EXPECTED_ENTRY_OUTS].sort();
+if (actualOuts.length !== expectedOuts.length || actualOuts.some((out, i) => out !== expectedOuts[i])) {
+	throw new Error(
+		`build.mjs entryPoints drifted from the canonical ${EXPECTED_ENTRY_OUTS.length}-entry plugin dist set.\n` +
+			`  expected: ${expectedOuts.join(", ")}\n` +
+			`  actual:   ${actualOuts.join(", ")}`,
+	);
+}
+
 if (isWatch) {
 	const ctx = await esbuild.context(options);
 	await ctx.watch();
@@ -103,6 +146,6 @@ if (isWatch) {
 	if (result.errors.length > 0) process.exit(1);
 	console.log(
 		`Built plugin dist/ v${pluginPkg.version} — ${options.entryPoints.length} entries ` +
-			"(Cli.js, Stop/SessionStart hooks, the 5 git hooks, and the QueueWorker/PrePushWorker workers)",
+			"(Cli.js, PluginBootstrapHook.js, Stop/SessionStart hooks, the 5 git hooks, and both workers)",
 	);
 }

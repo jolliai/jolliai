@@ -41,11 +41,13 @@ import { scanCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { isDevinInstalled, scanDevinSessions } from "../core/DevinSessionDiscoverer.js";
 import { isGeminiInstalled } from "../core/GeminiSessionDetector.js";
 import { getProjectRootDir, isInsideGitRepo, listWorktrees, orphanBranchExists } from "../core/GitOps.js";
+import { acquireRepoHooksLock, type StrictLockHandle, withRuntimeRegistryLock } from "../core/Locks.js";
 import {
 	isOpenCodeInstalled,
 	type OpenCodeScanError,
 	scanOpenCodeSessions,
 } from "../core/OpenCodeSessionDiscoverer.js";
+import { readManualDisableFlag, writeManualDisableFlag } from "../core/RepoProfile.js";
 import { readSchemaV5State } from "../core/SchemaV5Migration.js";
 import {
 	ensureJolliMemoryDir,
@@ -62,12 +64,7 @@ import type { StorageProvider } from "../core/StorageProvider.js";
 import { getSummaryCount } from "../core/SummaryStore.js";
 import { createLogger, getJolliMemoryDir, ORPHAN_BRANCH } from "../Logger.js";
 import type { InstallResult, JolliMemoryConfig, SessionInfo, StatusInfo, TranscriptSource } from "../Types.js";
-import {
-	installClaudeHook,
-	installSessionStartHook,
-	isClaudeHookInstalled,
-	removeClaudeHook,
-} from "./ClaudeHookInstaller.js";
+import { isClaudeHookInstalled, reconcileClaudeAgentHooks, removeClaudeHook } from "./ClaudeHookInstaller.js";
 import { installHookScripts } from "./DispatchScripts.js";
 import {
 	deriveSourceTag,
@@ -144,15 +141,8 @@ function pathsEqual(a: string, b: string): boolean {
 	return a.toLowerCase() === b.toLowerCase();
 }
 
-function hasRequiredWorktreeHooks(
-	claudeHookInstalled: boolean,
-	geminiHookInstalled: boolean,
-	config: JolliMemoryConfig,
-	geminiDetected: boolean,
-): boolean {
-	const claudeReady = config.claudeEnabled === false || claudeHookInstalled;
-	const geminiReady = config.geminiEnabled === false || !geminiDetected || geminiHookInstalled;
-	return claudeReady && geminiReady;
+function hasRequiredWorktreeHooks(claudeHookInstalled: boolean, config: JolliMemoryConfig): boolean {
+	return config.claudeEnabled === false || claudeHookInstalled;
 }
 
 /**
@@ -205,8 +195,12 @@ export async function install(
 	options?: {
 		source?: "vscode-extension" | "cli";
 		integrationsOnly?: boolean;
-		gitHooksOnly?: boolean;
+		repoHooksOnly?: boolean;
 		sourceTag?: string;
+		respectManualDisable?: boolean;
+		clearManualDisableOnSuccess?: boolean;
+		/** Automatic surface repair: short lock waits and current-worktree-only reconciliation. */
+		automatic?: boolean;
 	},
 ): Promise<InstallResult> {
 	/* v8 ignore next - process.cwd() fallback only used when called without cwd arg */
@@ -215,29 +209,19 @@ export async function install(
 
 	// integrations-only: set up the node-side integrations (dispatch scripts,
 	// dist-paths, MCP registration, skills) but install NO hooks (git or agent).
-	// Used by the IntelliJ plugin, which manages its own Java hooks and only needs
-	// this to light up MCP + skills — installing node hooks here would clobber
-	// IntelliJ's Java hooks and make memory generation depend on Node.
+	// Kept as a focused integrations repair mode. All current surfaces, including
+	// IntelliJ, delegate Agent/Git hook ownership to the canonical full lifecycle.
 	const integrationsOnly = options?.integrationsOnly === true;
 
-	// git-hooks-only: the mirror of integrations-only. Installs the git shell
-	// hooks (plus the dispatch scripts + dist-path entry they resolve through) and
-	// skips every integration — MCP registration, most skills, and the
-	// Claude/Gemini/SessionStart agent hooks. It writes ONLY the bare `/jolli`
-	// umbrella menu skill (a plugin skill can only be invoked as `/jolli:<name>`,
-	// so the bare front door must come from a project skill) and actively REMOVES
-	// any global-instructions block a prior version wrote to ~/.claude/CLAUDE.md
-	// (see below) — the plugin drives host guidance through its own skill
-	// descriptions, not the global file. Used by the Claude Code plugin, which
-	// ships its own MCP server, skills, and agent hooks via the plugin manifest and
-	// needs the CLI only to wire the git hooks that drive summary generation (the
-	// Claude Code plugin model does not cover git hooks).
-	const gitHooksOnly = options?.gitHooksOnly === true;
+	// repo-hooks-only installs the repo-owned lifecycle: source-neutral Git hooks,
+	// canonical Claude Stop/SessionStart hooks, project-local menu and state. It
+	// skips host detection, MCP registration, and unrelated skills.
+	const repoHooksOnly = options?.repoHooksOnly === true;
 
-	if (integrationsOnly && gitHooksOnly) {
+	if (integrationsOnly && repoHooksOnly) {
 		return {
 			success: false,
-			message: "install: integrationsOnly and gitHooksOnly are mutually exclusive",
+			message: "install: integrationsOnly and repoHooksOnly are mutually exclusive",
 			warnings,
 		};
 	}
@@ -260,39 +244,21 @@ export async function install(
 	}
 
 	log.info(
-		gitHooksOnly
-			? "Installing Jolli Memory git hooks only (no integrations)"
+		repoHooksOnly
+			? "Installing Jolli Memory repo hooks only (no integrations)"
 			: integrationsOnly
 				? "Installing Jolli Memory integrations (no hooks)"
 				: "Installing Jolli Memory hooks",
 	);
 
+	let repoLock: StrictLockHandle | null = null;
 	try {
 		// Load config to check integration enabled flags (always global)
 		const config = await loadConfig();
 
 		// List all worktrees so we can install per-worktree hooks in each one
-		const worktrees = await listWorktrees(projectDir);
-
-		// Write run-hook + resolve-dist-path shim (once, outside worktree loop)
-		const resolveScriptsOk = await installHookScripts();
-		if (!resolveScriptsOk) {
-			return {
-				success: false,
-				message: "Failed to write resolve-dist-path scripts — cannot install hooks that depend on them",
-				warnings,
-			};
-		}
-
-		// One-time migration of legacy single-file dist-path → dist-paths/<derived-tag>.
-		// Idempotent and safe to retry. Logs but does not fail install on errors.
-		try {
-			await migrateLegacyDistPath();
-			/* v8 ignore start -- defensive: migrateLegacyDistPath handles its own errors internally */
-		} catch (error: unknown) {
-			log.warn("Legacy dist-path migration failed (non-fatal): %s", (error as Error).message);
-		}
-		/* v8 ignore stop */
+		const worktrees = options?.automatic ? [projectDir] : await listWorktrees(projectDir);
+		const lifecycleLockOpts = options?.automatic ? { timeoutMs: 200, pollMs: 25 } : undefined;
 
 		// Determine this caller's source tag and write its per-source dist-paths/ entry.
 		// An explicit sourceTag (e.g. "intellij" passed by the IntelliJ plugin) wins;
@@ -302,18 +268,17 @@ export async function install(
 		const sourceTag =
 			options?.sourceTag ?? (callerSource === "vscode-extension" ? deriveSourceTag(callerDistDir) : "cli");
 
-		// Validate the source tag ONCE, up front, before anything is written. Two
-		// downstream consumers reject an invalid tag with *different* failure
-		// contracts: installDistPath returns false, while the git-hook builders
-		// (buildHookCommand / installPrePushHook / installPrepareMsgHook) THROW —
-		// because the tag is interpolated into an auto-executing shell hook, so a hard
-		// refusal there is the safe choice. Letting a bad tag flow through would throw
-		// partway down the git-hook sequence, leaving some hooks written and others not
-		// (a half-registered install). Failing here makes the whole install
-		// all-or-nothing under one uniform result, and leaves those downstream guards
-		// as unreachable-in-normal-flow defense-in-depth. Normal callers never trip
-		// this: "cli", the IntelliJ/plugin explicit tags, and deriveSourceTag's output
-		// are all valid — only a malformed injected tag is rejected.
+		// Validate the source tag ONCE, up front, before anything is written. The
+		// tag's only downstream consumer is installDistPath, which uses it as a
+		// FILENAME (`dist-paths/<sourceTag>`), so a malformed tag is a path-segment
+		// hazard — NOT a shell-interpolation one: no source tag ever reaches a shell
+		// hook (the repo Git and Agent hooks are source-neutral and byte-identical
+		// across surfaces, dispatching through run-hook). installDistPath re-validates
+		// and returns false on a bad tag as defense-in-depth, but failing here keeps
+		// the whole install all-or-nothing under one uniform result rather than doing
+		// partial work before that late guard fires. Normal callers never trip this:
+		// "cli", the IntelliJ/plugin explicit tags, and deriveSourceTag's output are
+		// all valid — only a malformed injected tag is rejected.
 		if (!isValidSourceTag(sourceTag)) {
 			return {
 				success: false,
@@ -322,42 +287,66 @@ export async function install(
 			};
 		}
 
-		const distPathOk = await installDistPath(sourceTag);
-		if (!distPathOk) {
+		const reconcileRuntime = async () => {
+			if (!(await installHookScripts())) return false;
+			try {
+				await migrateLegacyDistPath();
+				/* v8 ignore start -- defensive: migrateLegacyDistPath handles its own errors internally */
+			} catch (error: unknown) {
+				log.warn("Legacy dist-path migration failed (non-fatal): %s", (error as Error).message);
+			}
+			/* v8 ignore stop */
+			if (!(await installDistPath(sourceTag))) return false;
+			try {
+				const pruned = await pruneStaleDistPaths();
+				if (pruned.length > 0) log.info("Pruned stale dist-paths entries: %s", pruned.join(", "));
+				/* v8 ignore start -- defensive: pruneStaleDistPaths swallows its own per-entry errors */
+			} catch (error: unknown) {
+				log.warn("Pruning stale dist-paths failed (non-fatal): %s", (error as Error).message);
+			}
+			/* v8 ignore stop */
+			return true;
+		};
+		const runtimeResult = lifecycleLockOpts
+			? await withRuntimeRegistryLock(reconcileRuntime, lifecycleLockOpts)
+			: await withRuntimeRegistryLock(reconcileRuntime);
+		if (!runtimeResult.acquired || runtimeResult.value !== true) {
 			return {
 				success: false,
-				message: "Failed to write per-source dist-paths/ entry — cannot install hooks that depend on it",
+				message: "Failed to reconcile the shared runtime registry — cannot install hooks that depend on it",
 				warnings,
 			};
 		}
 
-		// Sweep dist-paths entries whose dist dir was removed (e.g. an uninstalled IDE
-		// extension). Keeps dist-path selection — and the absolute Cli.js path it bakes
-		// into .mcp.json on Windows — pointed at live dists, so a ghost entry can't leave
-		// a dead MCP registration behind. Runs after writing our own (live) entry, so it
-		// never prunes the caller. Non-fatal: a leftover ghost is filtered at selection time.
-		try {
-			const pruned = await pruneStaleDistPaths();
-			if (pruned.length > 0) log.info("Pruned stale dist-paths entries: %s", pruned.join(", "));
-			/* v8 ignore start -- defensive: pruneStaleDistPaths swallows its own per-entry errors */
-		} catch (error: unknown) {
-			log.warn("Pruning stale dist-paths failed (non-fatal): %s", (error as Error).message);
+		if (!integrationsOnly) {
+			repoLock = lifecycleLockOpts
+				? await acquireRepoHooksLock(projectDir, lifecycleLockOpts)
+				: await acquireRepoHooksLock(projectDir);
+			if (!repoLock) {
+				return {
+					success: false,
+					message: "Another Jolli enable/disable operation is still running; retry shortly",
+					warnings,
+				};
+			}
+			if (options?.respectManualDisable && (await readManualDisableFlag(projectDir))) {
+				return { success: true, message: "Repository remains manually disabled", warnings };
+			}
 		}
-		/* v8 ignore stop */
 
 		// Run host detectors once before the per-worktree loop so each detector
 		// is called exactly once. Results are reused both inside the loop (for MCP
 		// registration) and after it (for auto-enable config writes / hook installs).
-		// In git-hooks-only mode every host integration is skipped, so these results
+		// In repo-hooks-only mode every host integration is skipped, so these results
 		// go unused — short-circuit the filesystem probes to keep the SessionStart
 		// bootstrap fast (it runs on every new Claude Code session).
-		const codexDetectedOnce = gitHooksOnly ? false : await isCodexInstalled();
-		const geminiDetectedOnce = gitHooksOnly ? false : await isGeminiInstalled();
-		const cursorDetectedOnce = gitHooksOnly ? false : await isCursorInstalled();
-		const opencodeDetectedOnce = gitHooksOnly ? false : await isOpenCodeInstalled();
-		const copilotDetectedOnce = gitHooksOnly ? false : await isCopilotInstalled();
-		const copilotChatDetectedOnce = gitHooksOnly ? false : await isCopilotChatInstalled();
-		const clineDetectedOnce = gitHooksOnly ? false : (await isClineInstalled()) || (await isClineCliInstalled());
+		const codexDetectedOnce = repoHooksOnly ? false : await isCodexInstalled();
+		const geminiDetectedOnce = repoHooksOnly ? false : await isGeminiInstalled();
+		const cursorDetectedOnce = repoHooksOnly ? false : await isCursorInstalled();
+		const opencodeDetectedOnce = repoHooksOnly ? false : await isOpenCodeInstalled();
+		const copilotDetectedOnce = repoHooksOnly ? false : await isCopilotInstalled();
+		const copilotChatDetectedOnce = repoHooksOnly ? false : await isCopilotChatInstalled();
+		const clineDetectedOnce = repoHooksOnly ? false : (await isClineInstalled()) || (await isClineCliInstalled());
 
 		// Install .jolli/jollimemory/ state dir (always) and Claude Code hook (if enabled)
 		let claudeResult: HookOpResult = {};
@@ -379,10 +368,7 @@ export async function install(
 				}
 				/* v8 ignore stop */
 			}
-			// git-hooks-only: the state dir + sessions.json bootstrap above is all
-			// this worktree needs. Skip MCP registration and the Claude/SessionStart
-			// agent hooks — the Claude Code plugin owns those.
-			if (gitHooksOnly) {
+			if (repoHooksOnly) {
 				// A plugin skill can only be invoked as `/jolli:<name>`; a BARE `/jolli`
 				// front door has to come from a non-plugin project skill. Write just the
 				// umbrella menu (routing to the plugin's own `/jolli:*` skills) into
@@ -396,12 +382,16 @@ export async function install(
 				// standalone menu by revision) reclaims `.claude/skills/jolli/` and can't
 				// be left pointing at a skill this just removed.
 				await removeClaudeLegacySkills(wt);
-				// UNION (not replace): git-hooks-only re-runs on every plugin
+				// UNION (not replace): PluginBootstrapHook re-runs on every plugin
 				// SessionStart and only knows its own umbrella entry. Replacing the
 				// block would shrink a set a prior full `jolli enable` populated,
 				// un-hiding those paths in `git status` and churning the file each
 				// session. `addGitExcludePaths` merges, leaving other entries intact.
 				await addGitExcludePaths(wt, [...PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS]);
+				if (config.claudeEnabled !== false) {
+					const result = await reconcileClaudeAgentHooks(wt);
+					if (wt === projectDir || claudeResult.path === undefined) claudeResult = result;
+				}
 				continue;
 			}
 			// SKILL.md is written for every enabled target — the cross-platform
@@ -437,6 +427,7 @@ export async function install(
 			// hosts contribute [] here — their configs live outside the repo.
 			await updateGitExclude(wt, [
 				...SKILL_GIT_EXCLUDE_PATHS,
+				...PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS,
 				...buildRegistrars(detected).flatMap((r) => r.gitExcludePaths()),
 			]);
 			// Register the MCP server in the detected REPO-scoped hosts (Claude,
@@ -450,7 +441,7 @@ export async function install(
 			// Claude/SessionStart hooks (the caller manages its own hooks).
 			if (integrationsOnly) continue;
 			if (config.claudeEnabled === false) continue;
-			const result = await installClaudeHook(wt);
+			const result = await reconcileClaudeAgentHooks(wt);
 			/* v8 ignore start -- defensive: installClaudeHook currently never returns warnings */
 			if (result.warning) {
 				warnings.push(result.warning);
@@ -461,7 +452,6 @@ export async function install(
 				claudeResult = result;
 			}
 			// Install SessionStart hook for auto-briefing
-			await installSessionStartHook(wt);
 		}
 
 		// Register the MCP server in the detected GLOBAL hosts (Codex, Gemini,
@@ -494,28 +484,14 @@ export async function install(
 		// block idempotently, `disabled` heals any stale block. Delegated to
 		// syncGlobalInstructions so every surface shares identical host-gating and
 		// the write/remove decision logic.
-		// The Claude Code plugin (git-hooks-only) deliberately does NOT write the
-		// memory-routing block into ~/.claude/CLAUDE.md — the plugin must never
-		// silently edit the user's global instruction file. It relies on its skills'
-		// own `description` fields (and the bare `/jolli` umbrella) to drive
-		// invocation instead. On every SessionStart it actively REMOVES any block a
-		// prior plugin version wrote (marker-bracketed, so all other content is
-		// preserved); idempotent once gone.
-		//
-		// Coexistence caveat (accepted, last-writer-wins): the marker pair is shared,
-		// so `removeGlobalInstructions` can't tell a plugin-written block from one a
-		// full CLI / VS Code install wrote via `syncGlobalInstructions`. On a machine
-		// running BOTH, the plugin's every-SessionStart removal will strip the block
-		// the CLI wrote, and the CLI re-adds it on its next enable — a benign tug-of-war.
-		// This is not specially handled: the plugin targets plugin-only users, and
-		// CLI+plugin on one machine is a redundant setup, not a supported combination.
-		if (!gitHooksOnly) {
+		// Automatic repo-hook reconciliation deliberately leaves machine-global
+		// instructions untouched. Full explicit enable remains their sole owner,
+		// so coexisting surfaces never create a SessionStart write tug-of-war.
+		if (!repoHooksOnly) {
 			await syncGlobalInstructions({
 				codexDetected: codexDetectedOnce,
 				geminiDetected: geminiDetectedOnce,
 			});
-		} else {
-			await removeGlobalInstructions();
 		}
 
 		// Git hooks are shared across all worktrees — install once. Skipped in
@@ -527,41 +503,33 @@ export async function install(
 		let postMergeResult: HookOpResult = {};
 		let prePushResult: HookOpResult = {};
 		if (!integrationsOnly) {
-			// git-hooks-only means a standalone surface (the Claude Code plugin) owns
-			// these git hooks — SOFT-prefer the source this install just registered in
-			// dist-paths/ (sourceTag) so its dist wins a version tie, while still letting
-			// a strictly-higher-version surface win (JOLLI_DIST_PREFER_SOURCE, not a hard
-			// pin). At git-hook trigger time the invoking client is unknown, so this
-			// degrades to "last enable wins" — acceptable because the plugin re-runs
-			// enable on every SessionStart. Shared installs (CLI / VS Code) leave this
-			// undefined and keep the plain cross-source resolver behavior.
-			const preferSource = gitHooksOnly ? sourceTag : undefined;
-
-			gitResult = await installGitHook(projectDir, preferSource);
+			// Repo hooks are byte-identical and source-neutral across every surface.
+			// Runtime selection happens only inside the shared dispatcher.
+			gitResult = await installGitHook(projectDir);
 			if (gitResult.warning) {
 				warnings.push(gitResult.warning);
 			}
 
 			// Install Git post-rewrite hook (handles amend/rebase summary migration)
-			postRewriteResult = await installPostRewriteHook(projectDir, preferSource);
+			postRewriteResult = await installPostRewriteHook(projectDir);
 			if (postRewriteResult.warning) {
 				warnings.push(postRewriteResult.warning);
 			}
 
 			// Install Git prepare-commit-msg hook (handles git merge --squash)
-			prepareMsgResult = await installPrepareMsgHook(projectDir, preferSource);
+			prepareMsgResult = await installPrepareMsgHook(projectDir);
 			if (prepareMsgResult.warning) {
 				warnings.push(prepareMsgResult.warning);
 			}
 
 			// Install Git post-merge hook (auto-compiles merged branch summaries after pull/merge)
-			postMergeResult = await installPostMergeHook(projectDir, preferSource);
+			postMergeResult = await installPostMergeHook(projectDir);
 			if (postMergeResult.warning) {
 				warnings.push(postMergeResult.warning);
 			}
 
 			// Install Git pre-push hook (auto-syncs pushed commits' memory to Jolli Space)
-			prePushResult = await installPrePushHook(projectDir, preferSource);
+			prePushResult = await installPrePushHook(projectDir);
 			if (prePushResult.warning) {
 				warnings.push(prePushResult.warning);
 			}
@@ -607,7 +575,7 @@ export async function install(
 		// Auto-detect Cursor in either form (Composer IDE or cursor-agent CLI) and
 		// enable the shared cursorEnabled flag. Both sources share one toggle —
 		// mirrors the copilotEnabled treatment for Copilot CLI + Chat below.
-		const cursorCliDetectedOnce = await isCursorCliInstalled();
+		const cursorCliDetectedOnce = repoHooksOnly ? false : await isCursorCliInstalled();
 		const cursorDetected = config.cursorEnabled !== false && cursorDetectedOnce;
 		const cursorCliDetected = config.cursorEnabled !== false && cursorCliDetectedOnce;
 		if ((cursorDetected || cursorCliDetected) && config.cursorEnabled === undefined) {
@@ -637,9 +605,9 @@ export async function install(
 
 		// Migrate any existing worktree-level API keys to the global config dir.
 		// The worktrees list always includes the main repo root as its first entry.
-		// Skipped in git-hooks-only mode — the plugin bootstrap runs on every session
+		// Skipped in repo-hooks-only mode — the plugin bootstrap runs on every session
 		// start and this key migration is a one-time integration concern, not a hook.
-		if (!gitHooksOnly) {
+		if (!repoHooksOnly) {
 			for (const wt of worktrees) {
 				await migrateWorktreeConfig(wt);
 			}
@@ -661,8 +629,8 @@ export async function install(
 		// surfaced this bug — see git history of this block).
 		if (options?.source === "vscode-extension") {
 			log.info("Skipping v5 migration on vscode-extension source — Extension.ts owns it with UI");
-		} else if (gitHooksOnly) {
-			log.info("Skipping v5 migration in git-hooks-only mode — runs on every session start");
+		} else if (repoHooksOnly) {
+			log.info("Skipping v5 migration in repo-hooks-only mode — runs on every session start");
 		} else {
 			try {
 				const { migrateSchemaToV5 } = await import("../core/SchemaV5Migration.js");
@@ -676,6 +644,23 @@ export async function install(
 				);
 			} catch (err: unknown) {
 				log.warn("Schema v5 migration failed (non-fatal): %s", (err as Error).message);
+			}
+		}
+
+		if (options?.clearManualDisableOnSuccess && !integrationsOnly) {
+			// Best-effort: every hook is already installed by this point, so a failure
+			// to clear the opt-out (e.g. a profile-lock timeout — writeManualDisableFlag
+			// throws) must NOT turn a successful enable into a reported failure. Warn and
+			// continue; a later enable re-clears it. Contrast uninstall's
+			// persistManualDisable, where a write failure MUST abort (fail-atomic).
+			try {
+				await writeManualDisableFlag(projectDir, false);
+			} catch (err: unknown) {
+				const detail = (err as Error).message;
+				warnings.push(
+					`Enabled, but could not clear the manual-disable opt-out (${detail}). Run enable again to clear it.`,
+				);
+				log.warn("Could not clear manual-disable opt-out after enable (non-fatal): %s", detail);
 			}
 		}
 
@@ -697,6 +682,8 @@ export async function install(
 		const message = `Installation failed: ${(error as Error).message}`;
 		log.error(message);
 		return { success: false, message, warnings };
+	} finally {
+		if (repoLock) await repoLock.release();
 	}
 	/* v8 ignore stop */
 }
@@ -808,7 +795,15 @@ async function migrateWorktreeConfig(worktreeDir: string): Promise<void> {
  *
  * @param cwd - Optional working directory (defaults to process.cwd())
  */
-export async function uninstall(cwd?: string, options?: { integrationsOnly?: boolean }): Promise<InstallResult> {
+export async function uninstall(
+	cwd?: string,
+	options?: {
+		integrationsOnly?: boolean;
+		preserveMenu?: boolean;
+		repoLockHeld?: boolean;
+		persistManualDisable?: boolean;
+	},
+): Promise<InstallResult> {
 	/* v8 ignore next - process.cwd() fallback only used when called without cwd arg */
 	const projectDir = cwd ?? process.cwd();
 	const warnings: string[] = [];
@@ -821,7 +816,21 @@ export async function uninstall(cwd?: string, options?: { integrationsOnly?: boo
 
 	log.info(integrationsOnly ? "Removing Jolli Memory integrations (MCP)" : "Removing Jolli Memory hooks");
 
+	let uninstallLock: StrictLockHandle | null = null;
 	try {
+		if (!integrationsOnly && !options?.repoLockHeld) {
+			uninstallLock = await acquireRepoHooksLock(projectDir);
+			if (!uninstallLock) {
+				return {
+					success: false,
+					message: "Another Jolli enable/disable operation is still running; retry shortly",
+					warnings,
+				};
+			}
+		}
+		if (!integrationsOnly && options?.persistManualDisable) {
+			await writeManualDisableFlag(projectDir, true);
+		}
 		// Attempt to list all worktrees; fall back to just this directory if it fails
 		let worktrees: ReadonlyArray<string>;
 		try {
@@ -873,7 +882,7 @@ export async function uninstall(cwd?: string, options?: { integrationsOnly?: boo
 			// our vendor marker so a user's own `jolli` skill is never deleted (see
 			// removePluginJolliMenu). This is the ONE skill uninstall actively removes;
 			// the `jolli-*` siblings stay per the conservative policy noted below.
-			await removePluginJolliMenu(wt);
+			if (!options?.preserveMenu) await removePluginJolliMenu(wt);
 		}
 
 		// Git hooks are shared — remove once from the common hooks directory
@@ -893,7 +902,7 @@ export async function uninstall(cwd?: string, options?: { integrationsOnly?: boo
 		// block (git hooks live in the common dir, so this runs once). The `jolli-*`
 		// sibling entries are deliberately kept — their SKILL.md files are left in
 		// place by the conservative policy below, so their exclude lines stay too.
-		await removeGitExcludePaths(projectDir, JOLLI_MENU_GIT_EXCLUDE_PATHS);
+		if (!options?.preserveMenu) await removeGitExcludePaths(projectDir, JOLLI_MENU_GIT_EXCLUDE_PATHS);
 
 		// Conservative skill-cleanup policy: leave the generated `jolli-*` SKILL.md
 		// files (and their `.git/info/exclude` lines) alone. Users sometimes ship
@@ -913,13 +922,17 @@ export async function uninstall(cwd?: string, options?: { integrationsOnly?: boo
 			message: "Jolli Memory hooks removed successfully",
 			warnings,
 		};
-		/* v8 ignore start -- defensive wrapper: helper paths already catch expected filesystem failures */
+		// The catch is a real path, not just a defensive wrapper: the manual-disable
+		// behavioral tests drive it via a forced persist write failure (fail-atomic)
+		// and a forced teardown-step throw (opt-out survives). The finally's null-lock
+		// branch is covered by the integrations-only uninstall (no repo lock acquired).
 	} catch (error: unknown) {
 		const message = `Uninstallation failed: ${(error as Error).message}`;
 		log.error(message);
 		return { success: false, message, warnings };
+	} finally {
+		if (uninstallLock) await uninstallLock.release();
 	}
-	/* v8 ignore stop */
 }
 
 // ─── Status ─────────────────────────────────────────────────────────────────
@@ -1099,13 +1112,7 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 			const hookChecks = await Promise.all(
 				worktrees.map(async (wt) => {
 					const worktreeClaudeHookInstalled = await isClaudeHookInstalled(wt);
-					const worktreeGeminiHookInstalled = geminiDetected ? await isGeminiHookInstalled(wt) : false;
-					return hasRequiredWorktreeHooks(
-						worktreeClaudeHookInstalled,
-						worktreeGeminiHookInstalled,
-						config,
-						geminiDetected,
-					);
+					return hasRequiredWorktreeHooks(worktreeClaudeHookInstalled, config);
 				}),
 			);
 			enabledWorktrees = hookChecks.filter(Boolean).length;
@@ -1114,12 +1121,7 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		}
 	}
 
-	const worktreeHooksInstalled = hasRequiredWorktreeHooks(
-		claudeHookInstalled,
-		geminiHookInstalled,
-		config,
-		geminiDetected,
-	);
+	const worktreeHooksInstalled = hasRequiredWorktreeHooks(claudeHookInstalled, config);
 
 	// Enumerate all registered sources from dist-paths/<source>.
 	// "Active runtime" = highest-version available entry — mirrors the run-hook

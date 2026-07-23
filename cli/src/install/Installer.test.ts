@@ -21,6 +21,14 @@ vi.mock("../core/GitOps.js", () => ({
 	getGitCommonDir: vi.fn().mockImplementation(async (cwd: string) => join(cwd, ".git")),
 	getProjectRootDir: vi.fn().mockImplementation(async (cwd: string) => cwd),
 	resolveGitHooksDir: vi.fn().mockImplementation(async (cwd: string) => join(cwd, ".git", "hooks")),
+	// Used by RepoProfile.resolvePaths to anchor profile.json at the main worktree
+	// root; point it at the temp dir's `.git` so the real read/write persistence
+	// lands under tempDir (exercised by the manual-disable behavioral tests).
+	execGit: vi.fn().mockImplementation(async (_args: ReadonlyArray<string>, cwd = "") => ({
+		stdout: join(cwd, ".git"),
+		stderr: "",
+		exitCode: 0,
+	})),
 }));
 
 // Mock SummaryStore for status check
@@ -195,6 +203,44 @@ vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
+// Force writeManualDisableFlag to fail on demand, to prove the fail-safe behavior:
+// a failed opt-out CLEAR on enable is non-fatal, while a failed opt-out PERSIST on
+// disable aborts the uninstall (fail-atomic). readManualDisableFlag stays real, and
+// the write falls through to the real implementation whenever forceWriteError is null.
+const { repoProfileControl } = vi.hoisted(() => ({
+	repoProfileControl: { forceWriteError: null as Error | null },
+}));
+vi.mock("../core/RepoProfile.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/RepoProfile.js")>();
+	return {
+		...actual,
+		writeManualDisableFlag: vi.fn(async (cwd: string, disabled: boolean) => {
+			if (repoProfileControl.forceWriteError) throw repoProfileControl.forceWriteError;
+			return actual.writeManualDisableFlag(cwd, disabled);
+		}),
+	};
+});
+
+// Force the FIRST teardown step (removeClaudeHook) to throw on demand. Used to
+// prove that when the opt-out has already been persisted and a later teardown
+// step fails, the manuallyDisabled flag stays SET (intent persists) — disable
+// still reports failure and the flag is never rolled back. Passthrough to the
+// real impl whenever forceRemoveError is null, so every other test is untouched.
+const { claudeHookControl } = vi.hoisted(() => ({
+	claudeHookControl: { forceRemoveError: null as Error | null },
+}));
+vi.mock("./ClaudeHookInstaller.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./ClaudeHookInstaller.js")>();
+	return {
+		...actual,
+		removeClaudeHook: vi.fn(async (projectDir: string) => {
+			if (claudeHookControl.forceRemoveError) throw claudeHookControl.forceRemoveError;
+			return actual.removeClaudeHook(projectDir);
+		}),
+	};
+});
+
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { installSessionStartHook } from "./ClaudeHookInstaller.js";
 import { renderInstructionsBlock } from "./GlobalInstructionsInstaller.js";
 import { getStatus, install, isGeminiHookInstalled, uninstall } from "./Installer.js";
@@ -302,7 +348,7 @@ describe("Installer", () => {
 			expect(await exists(join(distPaths, "cli"))).toBe(false);
 		});
 
-		it("git-hooks-only installs git hooks but no MCP/skills/agent hooks", async () => {
+		it("repo-hooks-only installs source-neutral Git and Claude hooks without MCP/full skills", async () => {
 			const exists = (p: string) =>
 				stat(p)
 					.then(() => true)
@@ -310,7 +356,7 @@ describe("Installer", () => {
 
 			// Seed leftovers a prior full `jolli enable` would have written: a
 			// Jolli-owned unnamespaced Claude skill (vendor marker), the cross-platform
-			// copy, and a user's own skill. git-hooks-only now DELETES the Jolli-owned
+			// copy, and a user's own skill. repo-hooks-only DELETES the Jolli-owned
 			// unnamespaced Claude copy (the plugin ships it as /jolli:recall), while the
 			// `.agents/` copy and the user's own skill are left intact.
 			await mkdir(join(tempDir, ".claude", "skills", "jolli-recall"), { recursive: true });
@@ -324,7 +370,7 @@ describe("Installer", () => {
 			await mkdir(join(tempDir, ".agents", "skills", "jolli-recall"), { recursive: true });
 			await writeFile(join(tempDir, ".agents", "skills", "jolli-recall", "SKILL.md"), "keep", "utf-8");
 
-			const result = await install(tempDir, { gitHooksOnly: true, sourceTag: "claude-plugin" });
+			const result = await install(tempDir, { repoHooksOnly: true, sourceTag: "claude-plugin" });
 			expect(result.success).toBe(true);
 
 			// Git hooks ARE installed — the whole point of the mode (mirror of integrations-only).
@@ -335,24 +381,20 @@ describe("Installer", () => {
 			expect(await exists(join(tempDir, ".git", "hooks", "pre-push"))).toBe(true);
 			expect(result.gitHookPath).toBeDefined();
 
-			// Soft prefer: every git hook the plugin installs carries
-			// JOLLI_DIST_PREFER_SOURCE=<sourceTag>, so its dist wins a version tie at
-			// resolve time but a strictly-higher-version vscode/cursor dist can still
-			// win (the former hard JOLLI_DIST_SOURCE pin is gone — all sources compete).
+			// Every repo hook is source-neutral; the dispatcher chooses the newest
+			// complete runtime independently of whichever surface reconciled it.
 			for (const hook of ["post-commit", "post-rewrite", "prepare-commit-msg", "post-merge", "pre-push"]) {
 				const body = await readFile(join(tempDir, ".git", "hooks", hook), "utf-8");
-				expect(body, `${hook} should soft-prefer its source`).toContain(
-					"JOLLI_DIST_PREFER_SOURCE='claude-plugin'",
-				);
+				expect(body, `${hook} must be source-neutral`).not.toContain("JOLLI_DIST_PREFER_SOURCE");
 				expect(body, `${hook} must not carry the old hard pin`).not.toContain("JOLLI_DIST_SOURCE=");
 			}
 
-			// No integrations: MCP registration and Claude agent hooks are skipped, and
-			// git-hooks-only writes NONE of the unnamespaced skill set — only the bare
+			// No integrations: MCP registration is skipped. Canonical Claude agent
+			// hooks are installed, while repo-hooks-only writes NONE of the unnamespaced skill set — only the bare
 			// `/jolli` umbrella (asserted below). `jolli-search` is never seeded, and its
 			// continued absence proves the full skill set is not installed here.
 			expect(await exists(join(tempDir, ".mcp.json"))).toBe(false);
-			expect(await exists(join(tempDir, ".claude", "settings.local.json"))).toBe(false);
+			expect(await exists(join(tempDir, ".claude", "settings.local.json"))).toBe(true);
 			expect(await exists(join(tempDir, ".agents", "skills", "jolli-search", "SKILL.md"))).toBe(false);
 			expect(await exists(join(tempDir, ".claude", "skills", "jolli-search", "SKILL.md"))).toBe(false);
 
@@ -387,7 +429,7 @@ describe("Installer", () => {
 			expect(await exists(join(tempDir, ".agents", "skills", "jolli", "SKILL.md"))).toBe(false);
 		});
 
-		it("git-hooks-only removes a CLAUDE.md block a prior plugin version wrote, keeping other content", async () => {
+		it("repo-hooks-only leaves global CLAUDE.md untouched", async () => {
 			const exists = (p: string) =>
 				stat(p)
 					.then(() => true)
@@ -399,18 +441,18 @@ describe("Installer", () => {
 			const userContent = "# My own global instructions\n\nKeep me.\n";
 			await writeFile(claudeMd, `${userContent}\n${renderInstructionsBlock()}`, "utf-8");
 
-			const result = await install(tempDir, { gitHooksOnly: true, sourceTag: "claude-plugin" });
+			const result = await install(tempDir, { repoHooksOnly: true, sourceTag: "claude-plugin" });
 			expect(result.success).toBe(true);
 
-			// The marker-bracketed Jolli block is stripped; the user's content survives.
+			// Repo reconciliation never owns machine-global instructions.
 			expect(await exists(claudeMd)).toBe(true);
 			const after = await readFile(claudeMd, "utf-8");
 			expect(after).toContain("Keep me.");
-			expect(after).not.toContain("jolli-recall");
+			expect(after).toContain("jolli-recall");
 		});
 
-		it("rejects integrations-only and git-hooks-only together", async () => {
-			const result = await install(tempDir, { integrationsOnly: true, gitHooksOnly: true });
+		it("rejects integrations-only and repo-hooks-only together", async () => {
+			const result = await install(tempDir, { integrationsOnly: true, repoHooksOnly: true });
 			expect(result.success).toBe(false);
 			expect(result.message).toContain("mutually exclusive");
 		});
@@ -425,7 +467,7 @@ describe("Installer", () => {
 			// allowed through, installDistPath would soft-fail (return false) while the
 			// git-hook builders would THROW partway down the sequence, leaving some hooks
 			// on disk and others not — the half-registered state the up-front guard prevents.
-			const result = await install(tempDir, { gitHooksOnly: true, sourceTag: "bad;tag" });
+			const result = await install(tempDir, { repoHooksOnly: true, sourceTag: "bad;tag" });
 			expect(result.success).toBe(false);
 			expect(result.message).toContain("unsafe source tag");
 
@@ -694,7 +736,7 @@ describe("Installer", () => {
 			expect(content).toContain("JolliMemory");
 			expect(content).toContain("run-hook");
 			expect(content).toContain("post-commit");
-			// A shared (non-git-hooks-only) install keeps the cross-source resolver —
+			// A shared full install keeps the cross-source resolver —
 			// no source pin, so it can pick up a newer dist from any surface.
 			expect(content).not.toContain("JOLLI_DIST_SOURCE");
 		});
@@ -844,6 +886,38 @@ describe("Installer", () => {
 			expect(settings.hooks.Stop[0].hooks[0].command).not.toContain("/old/path/");
 			expect(settings.hooks.Stop[0].hooks[0].command).toContain("run-hook");
 			expect(settings.hooks.Stop[0].hooks[0].command).toContain("stop");
+		});
+
+		it("replaces the legacy IntelliJ Kotlin Stop owner with one canonical Stop and SessionStart", async () => {
+			const settingsDir = join(tempDir, ".claude");
+			await mkdir(settingsDir, { recursive: true });
+			await writeFile(
+				join(settingsDir, "settings.local.json"),
+				JSON.stringify({
+					hooks: {
+						Stop: [
+							{
+								hooks: [
+									{
+										type: "command",
+										command: '"/jdk/bin/java" -jar "/home/.jolli/bin/jollimemory-hooks.jar" stop',
+										async: true,
+									},
+								],
+							},
+						],
+					},
+				}),
+				"utf-8",
+			);
+
+			expect((await install(tempDir)).success).toBe(true);
+
+			const settings = JSON.parse(await readFile(join(settingsDir, "settings.local.json"), "utf-8"));
+			expect(settings.hooks.Stop).toHaveLength(1);
+			expect(settings.hooks.SessionStart).toHaveLength(1);
+			expect(JSON.stringify(settings)).not.toContain("jollimemory-hooks.jar");
+			expect(settings.hooks.Stop[0].hooks[0].command).toContain("run-hook");
 		});
 
 		it("should migrate legacy hook from settings.json to settings.local.json", async () => {
@@ -1694,7 +1768,7 @@ describe("Installer", () => {
 			);
 
 			const status = await getStatus(tempDir);
-			expect(status.claudeHookInstalled).toBe(true);
+			expect(status.claudeHookInstalled).toBe(false);
 		});
 
 		it("should report not installed when settings.local.json exists without hooks", async () => {
@@ -2118,6 +2192,42 @@ describe("Installer", () => {
 	});
 
 	describe("Gemini hook uninstall", () => {
+		it("replaces and removes the legacy IntelliJ Kotlin AfterAgent owner", async () => {
+			const { isGeminiInstalled } = await import("../core/GeminiSessionDetector.js");
+			vi.mocked(isGeminiInstalled).mockResolvedValue(true);
+			const settingsDir = join(tempDir, ".gemini");
+			await mkdir(settingsDir, { recursive: true });
+			const settingsPath = join(settingsDir, "settings.json");
+			await writeFile(
+				settingsPath,
+				JSON.stringify({
+					hooks: {
+						AfterAgent: [
+							{
+								hooks: [
+									{
+										type: "command",
+										command:
+											'"/jdk/bin/java" -jar "/home/.jolli/bin/jollimemory-hooks.jar" gemini-after-agent',
+									},
+								],
+							},
+						],
+					},
+				}),
+				"utf-8",
+			);
+
+			expect((await install(tempDir)).success).toBe(true);
+			const installed = JSON.parse(await readFile(settingsPath, "utf-8"));
+			expect(installed.hooks.AfterAgent).toHaveLength(1);
+			expect(JSON.stringify(installed)).not.toContain("jollimemory-hooks.jar");
+			expect(installed.hooks.AfterAgent[0].hooks[0].command).toContain("run-hook");
+
+			expect((await uninstall(tempDir)).success).toBe(true);
+			expect(JSON.parse(await readFile(settingsPath, "utf-8")).hooks).toBeUndefined();
+		});
+
 		it("should remove Gemini hook from .gemini/settings.json", async () => {
 			const { isGeminiInstalled } = await import("../core/GeminiSessionDetector.js");
 			vi.mocked(isGeminiInstalled).mockResolvedValue(true);
@@ -3142,7 +3252,7 @@ describe("Installer", () => {
 
 			const result = await install(tempDir);
 			expect(result.success).toBe(false);
-			expect(result.message).toContain("dist-paths");
+			expect(result.message).toContain("runtime registry");
 		});
 	});
 
@@ -3162,7 +3272,7 @@ describe("Installer", () => {
 					const result = await install(tempDir);
 					// installResolveScript failure causes install to fail fast
 					expect(result.success).toBe(false);
-					expect(result.message).toContain("resolve-dist-path");
+					expect(result.message).toContain("runtime registry");
 				} finally {
 					// Restore permissions for cleanup
 					await chmod(globalDir, 0o755);
@@ -3193,44 +3303,79 @@ describe("Installer", () => {
 		});
 	});
 
-	describe("installSessionStartHook — writeFile catch block", () => {
-		it("should handle write failure gracefully when settings file is unwritable", async () => {
-			// First install normally to create all hooks
+	describe("reconcileClaudeAgentHooks — atomic write survives a read-only settings file", () => {
+		it("enable still succeeds when .claude/settings.local.json is read-only (atomic tmp+rename)", async () => {
+			// install() writes the canonical Claude hooks via reconcileClaudeAgentHooks,
+			// which uses atomicWriteFile (temp file + rename). rename replaces the target
+			// based on the PARENT DIRECTORY's permissions, not the target file's — so a
+			// read-only settings FILE does not block the rewrite. This guards that
+			// resilience (a plain writeFile to the same path would EACCES). It does NOT
+			// exercise a "writeFile catch" — reconcileClaudeAgentHooks has none on its
+			// write path; the resilience comes from the atomic rename.
 			await install(tempDir);
-
-			const settingsDir = join(tempDir, ".claude");
-			const settingsPath = join(settingsDir, "settings.local.json");
-
-			// Remove the SessionStart hook so installSessionStartHook needs to re-write
+			const settingsPath = join(tempDir, ".claude", "settings.local.json");
+			// Drop SessionStart so the reconcile has a real change to write, then lock the file.
 			const settings = JSON.parse(await readFile(settingsPath, "utf-8"));
 			delete settings.hooks.SessionStart;
 			await writeFile(settingsPath, JSON.stringify(settings), "utf-8");
-
-			// Make the settings FILE read-only (not the directory).
-			// installClaudeHook reads + rewrites this file (it will fail too, but
-			// installClaudeHook doesn't catch writeFile errors — it just returns the path).
-			// Actually, installClaudeHook will also fail. Instead, make the file immutable
-			// after installClaudeHook runs by keeping the hook already present.
-			// Better approach: keep the Stop hook intact so installClaudeHook sees
-			// hasJolliMemoryHookWithCommand=true and returns early, then make only
-			// the writeFile in installSessionStartHook fail.
-
-			// Re-read to get final state after install, then re-install with read-only file
-			const currentSettings = JSON.parse(await readFile(settingsPath, "utf-8"));
-			// Remove SessionStart to force re-installation attempt
-			delete currentSettings.hooks.SessionStart;
-			await writeFile(settingsPath, JSON.stringify(currentSettings), "utf-8");
-			// Make the file itself read-only
 			await chmod(settingsPath, 0o444);
 
 			try {
 				const result = await install(tempDir);
-				// installSessionStartHook catches writeFile errors with log.warn,
-				// so the overall install should still succeed
 				expect(result.success).toBe(true);
 			} finally {
 				await chmod(settingsPath, 0o755);
 			}
+		});
+	});
+
+	describe("manual-disable persistence is fail-safe (behavioral)", () => {
+		afterEach(() => {
+			repoProfileControl.forceWriteError = null;
+			claudeHookControl.forceRemoveError = null;
+		});
+
+		it("enable: a failed clearManualDisableOnSuccess write is non-fatal — hooks stay installed and enable succeeds", async () => {
+			// The opt-out clear runs AFTER every hook is written. If it throws (e.g. a
+			// profile-lock timeout), the enable must still report success — otherwise a
+			// fully-installed repo is reported as failed. Regression guard for the
+			// try/catch around the clearManualDisableOnSuccess write.
+			repoProfileControl.forceWriteError = new Error("Timed out acquiring the repo profile lock");
+			const result = await install(tempDir, { clearManualDisableOnSuccess: true });
+			expect(result.success).toBe(true);
+			expect((await getStatus(tempDir)).gitHookInstalled).toBe(true);
+		});
+
+		it("disable: a failed persistManualDisable write aborts the uninstall — hooks are NOT removed and disable fails", async () => {
+			// The opt-out is persisted BEFORE any hook is torn down. If that write fails
+			// we must change nothing (fail-atomic) — a hooks-removed-but-flag-unset state
+			// would be silently re-enabled by a later upgrade/session. Regression guard
+			// for the persist-before-teardown ordering.
+			await install(tempDir);
+			expect((await getStatus(tempDir)).gitHookInstalled).toBe(true);
+			repoProfileControl.forceWriteError = new Error("Timed out acquiring the repo profile lock");
+			const result = await uninstall(tempDir, { persistManualDisable: true });
+			expect(result.success).toBe(false);
+			expect((await getStatus(tempDir)).gitHookInstalled).toBe(true);
+		});
+
+		it("disable: the opt-out survives a teardown failure — flag stays set, disable reports failure, no rollback", async () => {
+			// The opt-out is persisted BEFORE any hook is torn down. This guards the
+			// OTHER half of that ordering: once persisted, a subsequent teardown throw
+			// must NOT roll the flag back. Otherwise a partially-removed repo whose flag
+			// got reverted would be silently re-enabled by a later upgrade/session — the
+			// exact "hooks gone, flag unset" hazard the persist-first ordering exists to
+			// prevent. If someone reordered persist to AFTER teardown, the throw below
+			// would skip it and this assertion on manuallyDisabled would fail.
+			await install(tempDir);
+			expect(await readManualDisableFlag(tempDir)).toBe(false);
+
+			claudeHookControl.forceRemoveError = new Error("EACCES removing the Claude hook");
+			const result = await uninstall(tempDir, { persistManualDisable: true });
+
+			expect(result.success).toBe(false);
+			// The durable opt-out was written first and is NOT rolled back on teardown failure.
+			expect(await readManualDisableFlag(tempDir)).toBe(true);
 		});
 	});
 
@@ -3246,7 +3391,7 @@ describe("Installer", () => {
 
 			const result = await install(tempDir);
 			expect(result.success).toBe(false);
-			expect(result.message).toContain("resolve-dist-path");
+			expect(result.message).toContain("Installation failed");
 
 			// Restore for other tests
 			mockHomedir.mockReturnValue(fakeHomeDir);

@@ -40,6 +40,7 @@ import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getHeadHash } from "../core/GitOps.js";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { saveSquashPending } from "../core/SessionTracker.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import { detectResetSquash, resolveGitDir } from "./GitOperationDetector.js";
@@ -57,6 +58,10 @@ const log = createLogger("PrepareMsgHook");
 export async function handlePrepareMsgHook(source: string | undefined, cwd: string, _oldHash?: string): Promise<void> {
 	setLogDir(cwd);
 	log.info("=== Prepare-commit-msg hook started (source: %s) ===", source ?? "");
+	if (await readManualDisableFlag(cwd)) {
+		log.info("Repository is manually disabled — skipping squash detection");
+		return;
+	}
 
 	// Note: Amend detection has been removed from prepare-commit-msg.
 	// It is now handled by post-commit (reflog detection) and post-rewrite (stdin mapping).

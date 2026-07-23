@@ -13,6 +13,7 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { getCurrentTraceId, runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
 import { createLogger } from "../Logger.js";
 import type { CommitSource, GitOperation } from "../Types.js";
@@ -152,6 +153,15 @@ export function postCommitEntry(cwd: string): { commitHash: string } | null {
 
 /* v8 ignore stop */
 
+/** Async lifecycle gate around the synchronous Git-hook entry. */
+export async function runPostCommitHook(cwd: string): Promise<{ commitHash: string } | null> {
+	if (await readManualDisableFlag(cwd)) {
+		log.info("Repository is manually disabled — skipping post-commit enqueue");
+		return null;
+	}
+	return postCommitEntry(cwd);
+}
+
 // Re-export QueueWorker's __test__ helpers alongside our own so that existing
 // tests importing __test__ from PostCommitHook.js continue to work.
 import { __test__ as workerTestHelpers } from "./QueueWorker.js";
@@ -197,7 +207,7 @@ if (isMainScript()) {
 	// preserving the original fast, silent behavior. The detached worker runs
 	// regardless of whether we watch.
 	void runWithTrace(traceIdFromEnv(), async () => {
-		const result = postCommitEntry(process.cwd());
+		const result = await runPostCommitHook(process.cwd());
 		if (result) {
 			try {
 				await runCommitFeedback(process.cwd(), result.commitHash);

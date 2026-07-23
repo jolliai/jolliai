@@ -66,7 +66,7 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 			fixer: async () => {
 				// Fixer contract: throw on failure so the doctor loop records the
 				// failure (exit code, ✗ icon). A success path must return a string.
-				const result = await install(cwd, { source: "cli" });
+				const result = await install(cwd, { source: "cli", respectManualDisable: true });
 				if (!result.success) throw new Error(result.message);
 				return "reinstalled";
 			},

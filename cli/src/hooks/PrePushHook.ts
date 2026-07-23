@@ -33,6 +33,7 @@ import {
 	processPrePushInline,
 } from "../core/PushExecutor.js";
 import { mergeEntries, type PushTarget } from "../core/PushPendingStore.js";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { getIndexEntryMap, getSummary } from "../core/SummaryStore.js";
@@ -257,6 +258,10 @@ async function printSignedOutMemoryNotice(
 export async function prePushEntry(cwd: string, stdin: string, remote?: string, startedAtMs?: number): Promise<void> {
 	const deadlineAt = (startedAtMs ?? Date.now()) + PRE_PUSH_SYNC_BUDGET_MS;
 	log.info("pre-push hook: remote=%s budget=%dms", remote ?? "(none)", PRE_PUSH_SYNC_BUDGET_MS);
+	if (await readManualDisableFlag(cwd)) {
+		log.info("Repository is manually disabled — skipping pre-push tracking");
+		return;
+	}
 	const config = await loadConfig();
 
 	// Explicit opt-out: do nothing at all (no file write, no sync).

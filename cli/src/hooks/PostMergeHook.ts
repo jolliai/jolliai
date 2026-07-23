@@ -18,6 +18,7 @@
 import { execGit } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
 import { createLogger, setLogDir } from "../Logger.js";
@@ -76,6 +77,10 @@ async function detectMergeAtHead(cwd: string): Promise<string> {
 export async function handlePostMerge(cwd: string): Promise<void> {
 	setLogDir(cwd);
 	log.info("Post-merge hook triggered");
+	if (await readManualDisableFlag(cwd)) {
+		log.info("Repository is manually disabled — skipping post-merge enqueue");
+		return;
+	}
 
 	// Detect merge commits in the pulled range via the HEAD reflog.
 	const result = await execGit(["log", "--merges", "--pretty=format:%s", "HEAD@{1}..HEAD"], cwd);

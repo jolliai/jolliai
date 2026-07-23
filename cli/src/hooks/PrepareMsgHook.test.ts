@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const mockReadManualDisableFlag = vi.hoisted(() => vi.fn().mockResolvedValue(false));
+
 // Mock fs/promises so we can control readFile results without touching disk
 vi.mock("node:fs/promises", () => ({
 	readFile: vi.fn(),
@@ -8,6 +10,10 @@ vi.mock("node:fs/promises", () => ({
 vi.mock("../core/SessionTracker.js", () => ({
 	saveSquashPending: vi.fn(),
 	loadSquashPending: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock("../core/RepoProfile.js", () => ({
+	readManualDisableFlag: mockReadManualDisableFlag,
 }));
 
 vi.mock("../core/GitOps.js", () => ({
@@ -97,6 +103,14 @@ describe("parseSquashMsg", () => {
 describe("handlePrepareMsgHook", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		mockReadManualDisableFlag.mockResolvedValue(false);
+	});
+
+	it("does not write squash state while the repo is manually disabled", async () => {
+		mockReadManualDisableFlag.mockResolvedValue(true);
+		await handlePrepareMsgHook("squash", "/test/project");
+		expect(readFile).not.toHaveBeenCalled();
+		expect(saveSquashPending).not.toHaveBeenCalled();
 	});
 
 	it("should skip when source is not 'squash'", async () => {
@@ -185,6 +199,7 @@ describe("handlePrepareMsgHook — reset-squash detection", () => {
 
 	beforeEach(() => {
 		vi.clearAllMocks();
+		mockReadManualDisableFlag.mockResolvedValue(false);
 	});
 
 	/**

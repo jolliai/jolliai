@@ -22,7 +22,7 @@ import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promis
 import { dirname, isAbsolute, join } from "node:path";
 import { getJolliMemoryDir } from "../Logger.js";
 import { execGit, listWorktrees } from "./GitOps.js";
-import { withProfileLock } from "./Locks.js";
+import { withStrictProfileLock } from "./Locks.js";
 
 const PROFILE_FILE = "profile.json";
 /** Legacy marker (pre-RepoProfile): `<git-common-dir>/jollimemory/backfill-card-dismissed`. */
@@ -146,7 +146,7 @@ export async function readRepoProfile(cwd: string): Promise<RepoProfile> {
 		// Persist under the profile lock, re-reading inside so a concurrent write of
 		// the OTHER field (manuallyDisabled) isn't clobbered. Best-effort: a persist
 		// failure still returns the migrated value, and the next read re-migrates.
-		await withProfileLock(cwd, async () => {
+		await withStrictProfileLock(cwd, async () => {
 			const current = await readRaw(profilePath);
 			if (current.backfillDismissed === undefined) {
 				await writeProfile(profilePath, { ...current, backfillDismissed: true });
@@ -159,17 +159,20 @@ export async function readRepoProfile(cwd: string): Promise<RepoProfile> {
 
 /**
  * Merges `patch` into the repo's profile and persists it. The read-modify-write
- * runs under the shared `profile.lock` (see {@link withProfileLock}) so a
+ * runs under the shared `profile.lock` (see {@link withStrictProfileLock}) so a
  * concurrent writer in another process/worktree can't lose-update a sibling
  * field — e.g. a VS Code `backfillDismissed` write must not drop a CLI
  * `manuallyDisabled` write, which would silently re-enable a disabled repo.
  */
 export async function updateRepoProfile(cwd: string, patch: Partial<RepoProfile>): Promise<void> {
 	const { profilePath } = await resolvePaths(cwd);
-	await withProfileLock(cwd, async () => {
+	const result = await withStrictProfileLock(cwd, async () => {
 		const current = await readRaw(profilePath);
 		await writeProfile(profilePath, { ...current, ...patch });
 	});
+	if (!result.acquired) {
+		throw new Error("Timed out acquiring the repo profile lock");
+	}
 }
 
 /**
@@ -199,10 +202,10 @@ async function anyWorktreeHasLegacyDisableMarker(cwd: string): Promise<boolean> 
  *
  * If `profile.json` has no `manuallyDisabled` field yet but any worktree still
  * carries the legacy `disabled-by-user` marker, the repo is treated as disabled
- * and the decision is persisted into the profile (best-effort — a persist
- * failure still returns the migrated value, and the next read re-migrates).
- * Once the field is set (by migration or an explicit enable/disable), the legacy
- * marker is ignored.
+ * and the decision is persisted into the profile. A confirmed absence is also
+ * persisted as `false`, so hot-path hook checks do not enumerate all worktrees
+ * forever on a fresh install. The locked write re-reads the profile, so it
+ * cannot overwrite a concurrent explicit enable/disable.
  */
 export async function readManualDisableFlag(cwd: string): Promise<boolean> {
 	const { profilePath } = await resolvePaths(cwd);
@@ -211,17 +214,15 @@ export async function readManualDisableFlag(cwd: string): Promise<boolean> {
 		return profile.manuallyDisabled === true;
 	}
 	const legacy = await anyWorktreeHasLegacyDisableMarker(cwd);
-	if (legacy) {
-		// Persist under the profile lock, re-reading inside so a concurrent write of
-		// the OTHER field (backfillDismissed) isn't clobbered. Best-effort.
-		await withProfileLock(cwd, async () => {
-			const current = await readRaw(profilePath);
-			if (current.manuallyDisabled === undefined) {
-				await writeProfile(profilePath, { ...current, manuallyDisabled: true });
-			}
-		}).catch(() => {});
-	}
-	return legacy;
+	const migration = await withStrictProfileLock(cwd, async () => {
+		const current = await readRaw(profilePath);
+		if (current.manuallyDisabled === undefined) {
+			await writeProfile(profilePath, { ...current, manuallyDisabled: legacy });
+			return legacy;
+		}
+		return current.manuallyDisabled === true;
+	}).catch(() => null);
+	return migration?.acquired ? (migration.value ?? legacy) : legacy;
 }
 
 /** Sets (`true`) or clears (`false`) the repo-wide manual-disable flag. */

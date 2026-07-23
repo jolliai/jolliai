@@ -54,8 +54,9 @@
  * `intellij/src/main/kotlin/ai/jolli/jollimemory/bridge/SkillInstaller.kt`.
  */
 
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { atomicWriteFile } from "../core/AtomicWrite.js";
 import { createLogger } from "../Logger.js";
 
 const log = createLogger("SkillInstaller");
@@ -154,7 +155,7 @@ export const SKILL_GIT_EXCLUDE_PATHS: ReadonlyArray<string> = SKILL_TARGETS.flat
 
 /**
  * Git-exclude path for the bare `/jolli` umbrella that the Claude Code plugin's
- * `enable --git-hooks-only` bootstrap writes (Claude Code target only — see
+ * PluginBootstrapHook writes (Claude Code target only — see
  * {@link installPluginJolliMenu}). Registered by the caller so the generated
  * skill never shows up in the user's `git status`.
  */
@@ -230,7 +231,7 @@ export async function updateSkillIfNeeded(projectDir: string, config: { claudeEn
 /**
  * Writes ONLY the bare `/jolli` umbrella menu into the Claude Code target
  * (`<projectDir>/.claude/skills/jolli/SKILL.md`). Called by the Claude Code
- * plugin bootstrap (`enable --git-hooks-only`) so a plugin-only user still gets a
+ * plugin bootstrap so a plugin-only user still gets a
  * bare `/jolli` front door: a plugin skill can only ever be invoked as
  * `/jolli:<name>` (Claude Code namespaces plugin skills), so the BARE form has to
  * come from this non-plugin project skill.
@@ -260,6 +261,15 @@ export async function installPluginJolliMenu(projectDir: string): Promise<void> 
 	}
 
 	await upsertSkill(skillsDir, "jolli", buildPluginJolliMenuSkillTemplate());
+}
+
+export async function isPluginJolliMenuCanonical(projectDir: string): Promise<boolean> {
+	try {
+		const skillPath = join(projectDir, ...CLAUDE_SKILLS_DIR, "jolli", "SKILL.md");
+		return (await readFile(skillPath, "utf-8")) === buildPluginJolliMenuSkillTemplate();
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -322,7 +332,7 @@ const CLAUDE_LEGACY_SKILL_DIRS: ReadonlyArray<string> = [
 /**
  * Deletes the legacy unnamespaced Jolli skills from the Claude Code target
  * (`.claude/skills/jolli-*`). Called by the Claude Code plugin's `enable
- * --git-hooks-only` bootstrap: the plugin ships these as namespaced `/jolli:*`
+ * bootstrap: the plugin ships these as namespaced `/jolli:*`
  * skills, so the CLI-written unnamespaced copies are redundant duplicates in the
  * `/` menu. Only removes a dir whose SKILL.md carries a Jolli ownership marker
  * (modern `vendor` or legacy `jolli-skill-version`) — a user's own hand-authored
@@ -433,7 +443,7 @@ async function upsertSkill(skillsDir: string, name: string, content: string): Pr
 
 	try {
 		await mkdir(skillDir, { recursive: true });
-		await writeFile(skillPath, content, "utf-8");
+		await atomicWriteFile(skillPath, content);
 		log.info("Wrote SKILL.md (revision %d) to %s", myRevision, skillPath);
 		/* v8 ignore start - defensive: mkdir/writeFile failure on read-only filesystem */
 	} catch (error: unknown) {

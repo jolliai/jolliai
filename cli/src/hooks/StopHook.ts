@@ -30,6 +30,7 @@ import { join, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { scanPlansFrom } from "../core/plans/TranscriptPlanDiscovery.js";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { scanReferencesFrom } from "../core/references/TranscriptReferenceDiscovery.js";
 import {
 	getGlobalConfigDir,
@@ -94,6 +95,10 @@ export async function handleStopHook(): Promise<void> {
 	}
 
 	log.info("Stop hook triggered (session=%s)", hookData.session_id ?? "unknown");
+	if (await readManualDisableFlag(projectDir)) {
+		log.info("Stop hook skipped — repository manually disabled");
+		return;
+	}
 	log.info(
 		"Hook input — session_id=%s, transcript_path=%s",
 		hookData.session_id ?? "(none)",

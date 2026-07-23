@@ -18,6 +18,7 @@
 import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { processPushPending } from "../core/PushExecutor.js";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
 import { createLogger } from "../Logger.js";
 
@@ -25,6 +26,10 @@ const log = createLogger("PrePushWorker");
 
 /** Drains push-pending.json to Jolli Space. Entry point for the standalone run. */
 export async function runPushWorker(cwd: string, trigger = "activation"): Promise<void> {
+	if (await readManualDisableFlag(cwd)) {
+		log.info("PrePushWorker(%s): skipped — repository manually disabled", trigger);
+		return;
+	}
 	log.info("PrePushWorker(%s): spawned compensation drain starting", trigger);
 	const result = await processPushPending(cwd, { source: "activation" });
 	log.info(

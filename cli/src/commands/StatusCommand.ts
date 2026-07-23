@@ -304,15 +304,15 @@ export function collectIntegrationScanErrors(status: StatusInfo, name: string): 
 }
 
 /**
- * Whether Claude's agent hook is effectively active. The Claude Code plugin wires
- * its Stop/SessionStart hooks through its own manifest (hooks.json), NOT
- * `.claude/settings*.json`, so the settings-file probe `claudeHookInstalled` reads
- * false for a plugin-only install even though the hooks are live. When the caller
- * IS the plugin, treat the manifest hooks as active. Shared by both `jolli status`
- * and the MCP `status` tool so the two surfaces never disagree about the plugin.
+ * Whether Claude's agent hook is effectively active. In the unified model every
+ * surface — including the Claude Code plugin (via PluginBootstrapHook) — installs
+ * the canonical Stop/SessionStart hooks into `.claude/settings.local.json`, so the
+ * settings-file probe `claudeHookInstalled` is authoritative for plugin installs
+ * too. The `isClaudePlugin` argument is retained for call-site stability but no
+ * longer needed. Shared by `jolli status` and the MCP `status` tool.
  */
-export function resolveClaudeHookActive(status: StatusInfo, isClaudePlugin: boolean): boolean {
-	return status.claudeHookInstalled || isClaudePlugin;
+export function resolveClaudeHookActive(status: StatusInfo, _isClaudePlugin: boolean): boolean {
+	return status.claudeHookInstalled;
 }
 
 /** The one-line hook summary (`"5 Git + 2 Claude + 1 Gemini CLI"` / `"none installed"`). */
@@ -469,8 +469,8 @@ export function registerStatusCommand(program: Command): void {
 			}
 
 			// Hook summary + runtime, shared verbatim with the MCP `status` tool.
-			// Fold plugin-hook awareness the same way the MCP tool does, so a
-			// plugin-only install reports Claude consistently on both surfaces.
+			// The plugin manifest contains only the bootstrap; Claude is active
+			// only when both canonical repo-installed hooks are healthy.
 			const claudeHookActive = resolveClaudeHookActive(status, isClaudePluginBuild());
 			const hooksDesc = buildHookSummary(status, claudeHookActive);
 			const hookRuntime = buildHookRuntime(status);

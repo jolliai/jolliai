@@ -179,7 +179,7 @@ interface DiscoveryResult {
 async function discoverKnownPlugins(opts?: LoadPluginsOptions): Promise<DiscoveryResult> {
 	const known = opts?.knownPluginsOverride ?? KNOWN_PLUGINS;
 	// The Claude Code plugin bundles this CLI purely to run `mcp` and
-	// `enable --git-hooks-only` — it is a fixed command surface, not a plugin host.
+	// `enable --repo-hooks-only` — it is a fixed command surface, not a plugin host.
 	// Left un-gated, every invocation of the plugin's bundled Cli.js would scan the
 	// user's global npm root (`npm root -g`) and try to load whatever host-CLI
 	// plugins (site-cli / space-cli) happen to be installed there — emitting a

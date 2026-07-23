@@ -312,16 +312,17 @@ release cadence.**
   VS Code: rebuild the CLI before packaging because the bundle inlines it.)
 
 - **The plugin soft-prefers its own dist, but competes on version.** The plugin's
-  git hooks and CLI commands (`init`/`login`/`logout`/`recall`/`search`/`status`)
-  set `JOLLI_DIST_PREFER_SOURCE=claude-plugin`, so `resolve-dist-path` picks the
+  CLI commands (`init`/`login`/`logout`/`recall`/`search`/`status`) set
+  `JOLLI_DIST_PREFER_SOURCE=claude-plugin`, so `resolve-dist-path` picks the
   `dist-paths/claude-plugin` entry when it is present, complete, and already at the
   top version — winning a version **tie** ahead of the global cli/vscode/cursor
   order. But a strictly-higher-version vscode/cli dist still wins, and a missing /
   incomplete / older plugin dist falls through to normal cross-source selection
   (never a hard fail — the former `JOLLI_DIST_SOURCE` hard pin is gone; all sources
-  compete now). The plugin's MCP server and agent hooks still launch their own
-  bundle directly via `${CLAUDE_PLUGIN_ROOT}/dist/*` — they are per-host, not
-  shared cross-source resources. The `dist-paths/<source>` core version
+  compete now). The plugin MCP server launches its own bundle directly; the
+  manifest registers only `PluginBootstrapHook`, which installs canonical
+  source-neutral Stop/SessionStart hooks through the shared `run-hook`
+  dispatcher. The `dist-paths/<source>` core version
   (`__CLI_PKG_VERSION__`, injected by `build.mjs` from `cli/package.json`) drives
   cross-source selection for every surface; the plugin's marketing version is
   irrelevant — no lockstep check between `plugin.json` and `cli/package.json` is
@@ -335,10 +336,11 @@ what propagates CLI changes — a build step, not a version lock.*
 
 ## Open items before shipping
 
-- ~~CLI needs a narrow `enable --git-hooks-only` entry for the SessionStart
-  bootstrap.~~ **Done** — `jolli enable --git-hooks-only` installs only the git
-  hooks (+ dispatch scripts + dist-path entry), skipping MCP/skills/agent hooks,
-  and is silent on success. **One addition:** it writes the bare `/jolli` umbrella
+- ~~CLI needs a narrow repo-hook reconciler for PluginBootstrapHook.~~ **Done** —
+  `jolli enable --repo-hooks-only` installs the shared runtime, source-neutral
+  Git hooks, canonical Claude Stop/SessionStart hooks, and project state while
+  skipping MCP/full skills. PluginBootstrapHook calls the same installer directly
+  and writes the bare `/jolli` umbrella
   menu into `.claude/skills/jolli/` and git-excludes it — a plugin skill can only
   ever be invoked as `/jolli:<name>`, so the bare `/jolli` front door has to come
   from a non-plugin project skill (the umbrella routes to the plugin's own
