@@ -44,6 +44,28 @@ Jump to: [Jolli Sites](#jolli-site--documentation-from-your-content-folder) · [
 
 ---
 
+## Use Jolli with your AI agent
+
+Coding agents read your development history over MCP. Setup is two commands:
+
+```bash
+npm install -g @jolli.ai/cli
+jolli enable            # run from your project root
+```
+
+`jolli enable` auto-registers a local MCP server named `jollimemory` into every AI host it detects on your machine (Claude Code, Cursor, Codex, Gemini CLI, OpenCode, GitHub Copilot CLI, VS Code Copilot Chat). MCP registration is automatic: nothing to opt into, and no separate MCP install. Restart your agent afterward so it picks up the new server.
+
+**CLI-hosted, not remote.** Jolli's MCP server is a local stdio process (`jolli mcp`) that each host spawns on your own machine. There is no remote URL and no `.well-known/mcp.json` to point a cloud MCP client at, and your memories never leave your machine to be queried.
+
+**Tools your agent gets** (invoked in plain language, never called by name): `recall` and `search` (load or search your history), `get_decision_timeline`, `list_branches`, `get_pr_description`, `queue_status`, `status`, plus `bind_space`, `list_spaces`, and `push_memory` for Jolli Space.
+
+`@jolli.ai/space-cli` is optional and only needed for git-backed local workflow runs; it is not required for MCP.
+
+**Full onboarding docs:**
+
+- [Getting Started with Jolli Memory](https://docs.jolli.ai/jolli-memory/getting-started-with-jolli-memory) - install, enable, and your first memory.
+- [Connect Memory to Your AI Assistant (MCP)](https://docs.jolli.ai/jolli-memory/use-your-memory-from-any-ai-assistant-mcp) - the full per-host MCP setup.
+
 ## Jolli Memory
 
 ## How It Works
@@ -119,7 +141,7 @@ Installs all hooks required for automatic summarization:
 - **Git post-rewrite hook** — migrates summaries on amend/rebase
 - **Git prepare-commit-msg hook** — detects squash operations
 - **Gemini AfterAgent hook** (if Gemini CLI detected) — tracks Gemini sessions
-- **MCP server registration** — adds the JolliMemory MCP server to your project's `.mcp.json` so Claude Code can query your memories (see [`jolli mcp`](#jolli-mcp))
+- **MCP server registration** — registers the `jollimemory` MCP server into every AI host Jolli detects (Claude Code and Cursor per-repo; Gemini CLI, Codex, OpenCode, and Copilot machine-wide) so your agent can query your memories (see [`jolli mcp`](#jolli-mcp))
 - **Skill preference** *(opt-in)* — can teach your AI agent to reach for Jolli by default when creating a PR, searching past work, or recalling a branch, by writing to your machine-global instruction files (`~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`, `~/.codex/AGENTS.md`). `jolli enable` no longer prompts — it only applies a decision you've already made. Turn it on with `jolli configure --set globalInstructions=enabled` (or the editor toggle); it stays off until you do.
 
 ```bash
@@ -270,7 +292,7 @@ jolli mcp
 jolli mcp --reindex
 ```
 
-On top of these nine built-in tools, the server also surfaces **platform tools** defined by the Jolli backend (on by default), so a connected agent can act on your Jolli Space directly. Turn them off with `jolli configure --set mcpPlatformToolsEnabled=false`.
+On top of these ten built-in tools, the server also surfaces **platform tools** defined by the Jolli backend (on by default), so a connected agent can act on your Jolli Space directly. Turn them off with `jolli configure --set mcpPlatformToolsEnabled=false`.
 
 `jolli enable` registers this server automatically in your project's `.mcp.json`, so Claude Code picks it up on its next start — no manual setup. The search index is a disposable local cache (never written to the orphan branch); `--reindex` forces a fresh rebuild if you ever want to clear it.
 
@@ -679,6 +701,7 @@ What it does: detects sidebar config, reorganizes directory structure, downgrade
 
 ## Support
 
+- **Documentation:** [Getting Started with Jolli Memory](https://docs.jolli.ai/jolli-memory/getting-started-with-jolli-memory) and [Connect Memory to Your AI Assistant (MCP)](https://docs.jolli.ai/jolli-memory/use-your-memory-from-any-ai-assistant-mcp), plus the full guides and reference on [docs.jolli.ai](https://docs.jolli.ai/jolli-memory/getting-started-with-jolli-memory).
 - **Issues & feature requests** — [GitHub Issues](https://github.com/jolliai/jolliai/issues)
 - **Jolli Space onboarding / enterprise** — support@jolli.ai
 - **VS Code extension reference** — see the [VS Code README](https://github.com/jolliai/jolliai/tree/main/vscode)
