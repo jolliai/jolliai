@@ -44,6 +44,11 @@
 	},
 	"keywords": [
 		"ai",
+		"ai-agent",
+		"coding-agent",
+		"mcp",
+		"model-context-protocol",
+		"memory",
 		"documentation",
 		"git-hooks",
 		"claude-code",
