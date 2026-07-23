@@ -40,7 +40,7 @@ describe("StatusDataService.derive", () => {
 			geminiHookInstalled: true,
 		});
 		const derived = StatusDataService.derive(status, null);
-		expect(derived.hooksDescription).toBe("4 Git + 2 Claude + 1 Gemini CLI");
+		expect(derived.hooksDescription).toBe("4 Git + 2 Claude + 1 Gemini");
 		expect(derived.allHooksInstalled).toBe(true);
 	});
 

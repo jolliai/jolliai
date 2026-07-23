@@ -115,6 +115,18 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain('value="claude-code"');
 	});
 
+	it("agent-tool dropdown lists all four local agent tools with their display labels", () => {
+		expect(html).toContain('<option value="claude-code">Claude Code</option>');
+		expect(html).toContain('<option value="codex">Codex</option>');
+		expect(html).toContain('<option value="cursor-agent">Cursor</option>');
+		expect(html).toContain('<option value="opencode">OpenCode</option>');
+	});
+
+	it("agent-tool hint is tool-agnostic, not Claude-specific", () => {
+		expect(html).not.toContain("Uses your local Claude Code login");
+		expect(html).toContain("Uses your local agent's own login");
+	});
+
 	it("Anthropic card carries API key, model, and max tokens fields", () => {
 		expect(html).toContain('id="apiKey"');
 		expect(html).toContain('id="model"');

@@ -16,6 +16,8 @@ import { orphanBranchExists } from "../core/GitOps.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { isWorkerLockStale, releaseWorkerLock } from "../core/Locks.js";
 import { getBackend } from "../core/localagent/BackendRegistry.js";
+import { describeCandidate } from "../core/localagent/ExecutableResolver.js";
+import { localAgentToolLabel, localAgentToolLoginHint } from "../core/localagent/ToolMeta.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { countActiveQueueEntries, getGlobalConfigDir, loadAllSessions, loadConfig } from "../core/SessionTracker.js";
 import { traverseDistPaths } from "../install/DistPathResolver.js";
@@ -145,11 +147,12 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 	// actually accept (including the documented ANTHROPIC_API_KEY env var fallback).
 	const config = await loadConfig();
 	const credentialSource = resolveLlmCredentialSource(config);
+	const localAgentTool = config.localAgentTool ?? "claude-code";
 	const credentialLabel: Record<NonNullable<typeof credentialSource>, string> = {
 		"anthropic-config": "Anthropic API key (config)",
 		"anthropic-env": "Anthropic API key (ANTHROPIC_API_KEY env)",
 		"jolli-proxy": "Jolli proxy key",
-		"local-agent": "local agent (Claude Code subscription)",
+		"local-agent": `local agent (${localAgentToolLabel(localAgentTool)})`,
 	};
 	checks.push({
 		name: "Config",
@@ -166,11 +169,25 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 	// with a setup error because `claude` is missing or off the worker's PATH.
 	if (credentialSource === "local-agent") {
 		try {
-			const backend = getBackend(config.localAgentTool ?? "claude-code");
+			const backend = getBackend(localAgentTool);
 			const exe = await backend.discoverExecutable(config.localAgentPath);
-			checks.push({ name: "Local agent CLI", status: "ok", message: `${exe.file} (v${exe.version})` });
+			// describeCandidate, not exe.file: a shim-resolved tool spawns through an
+			// interpreter, so the bare file is `…\node.exe` — which reads as doctor
+			// having picked the wrong binary entirely.
+			checks.push({
+				name: "Local agent CLI",
+				status: "ok",
+				message: `${describeCandidate(exe)} (v${exe.version})`,
+			});
 		} catch (err) {
-			checks.push({ name: "Local agent CLI", status: "fail", message: (err as Error).message });
+			// Append the tool-specific login hint so a not-signed-in user gets
+			// actionable guidance instead of just the raw discovery error.
+			const loginHint = localAgentToolLoginHint(localAgentTool);
+			checks.push({
+				name: "Local agent CLI",
+				status: "fail",
+				message: `${(err as Error).message} — ${loginHint}`,
+			});
 		}
 	}
 

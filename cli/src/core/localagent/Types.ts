@@ -2,6 +2,14 @@
 export interface ResolvedExecutable {
 	readonly file: string;
 	readonly version: string;
+	/**
+	 * Launcher arguments that MUST precede the tool's own arguments. Empty for a
+	 * self-contained binary; populated when the tool is really a script that needs
+	 * an interpreter — e.g. Windows `cursor-agent` resolves to the bundled
+	 * `node.exe` with `launchArgs: ["--use-system-ca", "…\\index.js"]`. Backends
+	 * spread this ahead of their own flags in `buildInvocation`.
+	 */
+	readonly launchArgs?: readonly string[];
 }
 
 /**

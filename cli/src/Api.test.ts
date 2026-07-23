@@ -1091,10 +1091,7 @@ describe("CLI", () => {
 			expect(
 				calls.some(
 					(s) =>
-						s.includes("Hooks:") &&
-						s.includes("4 Git") &&
-						s.includes("2 Claude") &&
-						s.includes("1 Gemini CLI"),
+						s.includes("Hooks:") && s.includes("4 Git") && s.includes("2 Claude") && s.includes("1 Gemini"),
 				),
 			).toBe(true);
 		});
@@ -3549,8 +3546,8 @@ describe("CLI", () => {
 		});
 
 		it("should run promptSetup after install when interactive", async () => {
-			// No local agent detected (mocked false) → the provider menu appears. Skip (3).
-			mockUserInput("3");
+			// No local agent detected (mocked false) → the provider menu appears. Skip (4).
+			mockUserInput("4");
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 
@@ -3608,8 +3605,8 @@ describe("CLI", () => {
 			}
 		});
 
-		it("should print skip guidance when setup is skipped (menu choice 3)", async () => {
-			mockUserInput("3");
+		it("should print skip guidance when setup is skipped (menu choice 4)", async () => {
+			mockUserInput("4");
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 			const origKey = process.env.ANTHROPIC_API_KEY;
@@ -3649,6 +3646,33 @@ describe("CLI", () => {
 			} finally {
 				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
 				vi.mocked(isClaudeCodeUsable).mockReturnValue(false);
+			}
+		});
+
+		it("should select a Local Agent tool via the picker on menu choice 3 (no key, no Anthropic prompt)", async () => {
+			const { saveConfigScoped } = await import("./core/SessionTracker.js");
+			// Claude not auto-detected → the provider menu appears. Choose "3" (local
+			// agent CLI). The follow-up tool sub-menu gets no explicit answer, so it
+			// defaults to the first tool (claude-code). A fallthrough to the Anthropic
+			// prompt would hang on a missing answer, so reaching the end proves the
+			// self-sufficient early return.
+			mockUserInput("3");
+			mockExistsSync.mockReturnValue(false);
+			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+
+			try {
+				await main(["enable"]);
+
+				expect(saveConfigScoped).toHaveBeenCalledWith(
+					expect.objectContaining({ aiProvider: "local-agent", localAgentTool: "claude-code" }),
+					expect.any(String),
+				);
+				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+				expect(calls.some((s) => s.includes("Local Agent (Claude Code)"))).toBe(true);
+				// Self-sufficient: the Anthropic-key prompt must NOT run.
+				expect(calls.some((s) => s.includes("Anthropic API Key"))).toBe(false);
+			} finally {
+				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
 			}
 		});
 
@@ -3862,7 +3886,7 @@ describe("CLI", () => {
 			vi.mocked(offerOptionalJolliLogin).mockClear();
 			// loadConfig stays {} (default) → no credential and no engine: nothing to
 			// repair, and nothing to sync, so neither prompt fires.
-			mockUserInput("3");
+			mockUserInput("4");
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 
@@ -3958,7 +3982,7 @@ describe("CLI", () => {
 			await main(["enable", "-y"]);
 
 			const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
-			expect(calls.some((s) => s.includes("Gemini CLI hook") && s.includes(".gemini/settings.json"))).toBe(true);
+			expect(calls.some((s) => s.includes("Gemini hook") && s.includes(".gemini/settings.json"))).toBe(true);
 		});
 
 		it("should print warnings on enable failure", async () => {
@@ -4557,7 +4581,7 @@ describe("CLI", () => {
 			});
 			const output = (await runDoctor(["doctor"], { config: { aiProvider: "local-agent" } })).join("\n");
 			expect(output).toContain("✓ Config");
-			expect(output).toContain("local agent (Claude Code subscription)");
+			expect(output).toContain("local agent (Claude Code)");
 			expect(output).toContain("✓ Local agent CLI");
 			expect(output).toContain("/usr/local/bin/claude (v2.1.210)");
 		});
@@ -5675,7 +5699,8 @@ describe("CLI", () => {
 
 		it("should show 'Not configured' for Anthropic Key when neither config.apiKey nor env var is set", async () => {
 			const { loadConfigFromDir } = await import("./core/SessionTracker.js");
-			vi.mocked(loadConfigFromDir).mockResolvedValueOnce({});
+			// The Anthropic Key row is only emitted for the Anthropic provider.
+			vi.mocked(loadConfigFromDir).mockResolvedValueOnce({ aiProvider: "anthropic" });
 			const origKey = process.env.ANTHROPIC_API_KEY;
 			delete process.env.ANTHROPIC_API_KEY;
 
@@ -5691,7 +5716,7 @@ describe("CLI", () => {
 
 		it("should show 'Configured' for Anthropic Key when config.apiKey is set", async () => {
 			const { loadConfigFromDir } = await import("./core/SessionTracker.js");
-			vi.mocked(loadConfigFromDir).mockResolvedValueOnce({ apiKey: "sk-ant-test123" });
+			vi.mocked(loadConfigFromDir).mockResolvedValueOnce({ apiKey: "sk-ant-test123", aiProvider: "anthropic" });
 
 			await main(["status"]);
 
@@ -5701,7 +5726,8 @@ describe("CLI", () => {
 
 		it("should show 'Configured' for Anthropic Key from ANTHROPIC_API_KEY env var", async () => {
 			const { loadConfigFromDir } = await import("./core/SessionTracker.js");
-			vi.mocked(loadConfigFromDir).mockResolvedValueOnce({});
+			// The Anthropic Key row is only emitted for the Anthropic provider.
+			vi.mocked(loadConfigFromDir).mockResolvedValueOnce({ aiProvider: "anthropic" });
 			const origKey = process.env.ANTHROPIC_API_KEY;
 			process.env.ANTHROPIC_API_KEY = "sk-ant-from-env";
 
@@ -6143,7 +6169,7 @@ describe("CLI", () => {
 
 			await main(["enable", "--cwd", "/tmp/test-project"]);
 
-			expect(console.log).toHaveBeenCalledWith(expect.stringContaining("Gemini CLI hook"));
+			expect(console.log).toHaveBeenCalledWith(expect.stringContaining("Gemini hook"));
 		});
 
 		it("should print warnings on enable failure", async () => {

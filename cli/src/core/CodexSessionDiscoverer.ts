@@ -1,7 +1,7 @@
 /**
  * Codex Session Discoverer
  *
- * On-demand scanner for OpenAI Codex CLI sessions. Since Codex has no
+ * On-demand scanner for OpenAI Codex sessions. Since Codex has no
  * lifecycle hook we can use (the Stop hook needs per-user manual trust and is
  * broken under git worktrees), sessions are discovered by scanning the
  * filesystem. This runs both at post-commit time (for summaries) and on the
@@ -40,7 +40,7 @@ const SESSION_STALE_MS = 48 * 60 * 60 * 1000;
 const CODEX_DIR_NAME = ".codex";
 
 /**
- * Discovers Codex CLI sessions relevant to the given project directory.
+ * Discovers Codex sessions relevant to the given project directory.
  * Scans ~/.codex/sessions/ for JSONL files whose session_meta.cwd matches
  * the project directory. Only returns sessions updated within the staleness
  * window (48 hours).
@@ -68,8 +68,8 @@ export async function discoverCodexSessions(projectDir: string): Promise<Readonl
 }
 
 /**
- * Checks whether the Codex CLI data directory exists.
- * Used by the Installer to detect Codex CLI presence.
+ * Checks whether the Codex data directory exists.
+ * Used by the Installer to detect Codex presence.
  */
 export async function isCodexInstalled(): Promise<boolean> {
 	const sessionsDir = join(homedir(), CODEX_DIR_NAME);

@@ -123,6 +123,67 @@ async function renderStatus(status: StatusInfo, extraArgs: readonly string[] = [
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
+describe("StatusCommand — AI Provider row", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockLoadAuthToken.mockResolvedValue(null);
+		mockFrontDoor.mockResolvedValue({ status: "no_spaces" });
+		mockTenantOrigin.mockReturnValue(null);
+		mockLoadCache.mockResolvedValue(null);
+		delete process.env.ANTHROPIC_API_KEY;
+	});
+
+	afterEach(() => {
+		vi.clearAllMocks();
+		delete process.env.ANTHROPIC_API_KEY;
+	});
+
+	it("shows 'Anthropic' and the Anthropic Key row when provider is anthropic with a key", async () => {
+		mockLoadConfigFromDir.mockResolvedValue({ aiProvider: "anthropic", apiKey: "sk-ant-xxx" });
+		const out = await renderStatus(baseStatus);
+		expect(out).toContain("AI Provider:      Anthropic");
+		expect(out).toContain("Anthropic Key:    Configured");
+	});
+
+	it("shows the Anthropic Key row as 'Not configured' when provider is anthropic without a key", async () => {
+		mockLoadConfigFromDir.mockResolvedValue({ aiProvider: "anthropic", apiKey: undefined });
+		const out = await renderStatus(baseStatus);
+		expect(out).toContain("AI Provider:      Not configured");
+		expect(out).toContain("Anthropic Key:    Not configured");
+	});
+
+	it("shows 'Anthropic (env)' when provider is anthropic and only ANTHROPIC_API_KEY is set", async () => {
+		process.env.ANTHROPIC_API_KEY = "sk-ant-env";
+		mockLoadConfigFromDir.mockResolvedValue({ aiProvider: "anthropic", apiKey: undefined });
+		const out = await renderStatus(baseStatus);
+		expect(out).toContain("AI Provider:      Anthropic (env)");
+		expect(out).toContain("Anthropic Key:    Configured");
+	});
+
+	it("shows 'Jolli' and omits the Anthropic Key row when provider is jolli", async () => {
+		mockLoadConfigFromDir.mockResolvedValue({ aiProvider: "jolli", jolliApiKey: "jk" });
+		const out = await renderStatus(baseStatus);
+		expect(out).toContain("AI Provider:      Jolli");
+		expect(out).not.toContain("Anthropic Key:");
+	});
+
+	it("shows the chosen tool label and omits the Anthropic Key row when provider is local-agent", async () => {
+		mockLoadConfigFromDir.mockResolvedValue({ aiProvider: "local-agent", localAgentTool: "codex" });
+		const out = await renderStatus(baseStatus);
+		expect(out).toContain("AI Provider:      Local agent - Codex");
+		expect(out).not.toContain("Anthropic Key:");
+	});
+
+	it("omits the Anthropic Key row for a legacy config (no aiProvider) even when a key resolves", async () => {
+		// Legacy precedence resolves an apiKey to "Anthropic", but the row is
+		// gated on the EXPLICIT anthropic choice, so no Anthropic Key line prints.
+		mockLoadConfigFromDir.mockResolvedValue({ apiKey: "sk-ant-legacy" });
+		const out = await renderStatus(baseStatus);
+		expect(out).toContain("AI Provider:      Anthropic");
+		expect(out).not.toContain("Anthropic Key:");
+	});
+});
+
 describe("StatusCommand — Copilot integration row", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();

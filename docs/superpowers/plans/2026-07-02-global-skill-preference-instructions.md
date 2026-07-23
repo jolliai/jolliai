@@ -142,7 +142,7 @@ Create `cli/src/install/GlobalInstructionsInstaller.ts`:
  * into each detected AI host's GLOBAL instruction file:
  *
  *   - Claude Code → ~/.claude/CLAUDE.md
- *   - Gemini CLI  → ~/.gemini/GEMINI.md
+ *   - Gemini  → ~/.gemini/GEMINI.md
  *   - Codex       → ~/.codex/AGENTS.md
  *
  * The rule tells the host LLM to reach for the jolli-pr / jolli-search /

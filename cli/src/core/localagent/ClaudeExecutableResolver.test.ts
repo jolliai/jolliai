@@ -17,8 +17,8 @@ describe("resolveClaudeExecutable", () => {
 	it("picks the newest capable candidate", () => {
 		__resetResolverCacheForTest();
 		const out = resolveClaudeExecutable({
-			candidates: () => ["/a/claude", "/b/claude"],
-			probe: (f) => (f === "/a/claude" ? { ok: true, version: "2.0.0" } : { ok: true, version: "2.1.210" }),
+			candidates: () => [{ file: "/a/claude" }, { file: "/b/claude" }],
+			probe: (c) => (c.file === "/a/claude" ? { ok: true, version: "2.0.0" } : { ok: true, version: "2.1.210" }),
 			now: () => 1000,
 		});
 		expect(out).toEqual({ file: "/b/claude", version: "2.1.210" });
@@ -27,7 +27,7 @@ describe("resolveClaudeExecutable", () => {
 	it("keeps the first candidate found when versions compare equal", () => {
 		__resetResolverCacheForTest();
 		const out = resolveClaudeExecutable({
-			candidates: () => ["/a/claude", "/b/claude"],
+			candidates: () => [{ file: "/a/claude" }, { file: "/b/claude" }],
 			probe: () => ({ ok: true, version: "2.1.210" }),
 			now: () => 1000,
 		});
@@ -37,8 +37,8 @@ describe("resolveClaudeExecutable", () => {
 	it("compares versions with differing segment counts (e.g. '2' vs '2.0.1')", () => {
 		__resetResolverCacheForTest();
 		const out = resolveClaudeExecutable({
-			candidates: () => ["/a/claude", "/b/claude"],
-			probe: (f) => (f === "/a/claude" ? { ok: true, version: "2" } : { ok: true, version: "2.0.1" }),
+			candidates: () => [{ file: "/a/claude" }, { file: "/b/claude" }],
+			probe: (c) => (c.file === "/a/claude" ? { ok: true, version: "2" } : { ok: true, version: "2.0.1" }),
 			now: () => 1000,
 		});
 		expect(out.file).toBe("/b/claude");
@@ -47,8 +47,8 @@ describe("resolveClaudeExecutable", () => {
 	it("compares versions with differing segment counts, longer-first order", () => {
 		__resetResolverCacheForTest();
 		const out = resolveClaudeExecutable({
-			candidates: () => ["/a/claude", "/b/claude"],
-			probe: (f) => (f === "/a/claude" ? { ok: true, version: "2.0.1" } : { ok: true, version: "2" }),
+			candidates: () => [{ file: "/a/claude" }, { file: "/b/claude" }],
+			probe: (c) => (c.file === "/a/claude" ? { ok: true, version: "2.0.1" } : { ok: true, version: "2" }),
 			now: () => 1000,
 		});
 		expect(out.file).toBe("/a/claude");
@@ -57,8 +57,8 @@ describe("resolveClaudeExecutable", () => {
 	it("treats an ok probe with a missing/garbage version as version '0'", () => {
 		__resetResolverCacheForTest();
 		const out = resolveClaudeExecutable({
-			candidates: () => ["/a/claude", "/b/claude"],
-			probe: (f) => (f === "/a/claude" ? { ok: true } : { ok: true, version: "not-a-version" }),
+			candidates: () => [{ file: "/a/claude" }, { file: "/b/claude" }],
+			probe: (c) => (c.file === "/a/claude" ? { ok: true } : { ok: true, version: "not-a-version" }),
 			now: () => 1000,
 		});
 		// Neither candidate reports a real version, so the first capable one wins.
@@ -69,8 +69,8 @@ describe("resolveClaudeExecutable", () => {
 	it("does not let a later ok-but-versionless candidate replace an earlier versioned one", () => {
 		__resetResolverCacheForTest();
 		const out = resolveClaudeExecutable({
-			candidates: () => ["/a/claude", "/b/claude"],
-			probe: (f) => (f === "/a/claude" ? { ok: true, version: "1.0.0" } : { ok: true }),
+			candidates: () => [{ file: "/a/claude" }, { file: "/b/claude" }],
+			probe: (c) => (c.file === "/a/claude" ? { ok: true, version: "1.0.0" } : { ok: true }),
 			now: () => 1000,
 		});
 		expect(out).toEqual({ file: "/a/claude", version: "1.0.0" });
@@ -79,7 +79,7 @@ describe("resolveClaudeExecutable", () => {
 	it("falls back to the real clock when `now` is not injected", () => {
 		__resetResolverCacheForTest();
 		const out = resolveClaudeExecutable({
-			candidates: () => ["/a/claude"],
+			candidates: () => [{ file: "/a/claude" }],
 			probe: () => ({ ok: true, version: "2.1.210" }),
 		});
 		expect(out.file).toBe("/a/claude");
@@ -88,8 +88,8 @@ describe("resolveClaudeExecutable", () => {
 	it("skips incompatible (probe not ok) candidates", () => {
 		__resetResolverCacheForTest();
 		const out = resolveClaudeExecutable({
-			candidates: () => ["/old/claude", "/new/claude"],
-			probe: (f) => (f === "/old/claude" ? { ok: false } : { ok: true, version: "2.1.210" }),
+			candidates: () => [{ file: "/old/claude" }, { file: "/new/claude" }],
+			probe: (c) => (c.file === "/old/claude" ? { ok: false } : { ok: true, version: "2.1.210" }),
 			now: () => 1000,
 		});
 		expect(out.file).toBe("/new/claude");
@@ -98,7 +98,11 @@ describe("resolveClaudeExecutable", () => {
 	it("throws a setup error when nothing is capable", () => {
 		__resetResolverCacheForTest();
 		expect(() =>
-			resolveClaudeExecutable({ candidates: () => ["/x/claude"], probe: () => ({ ok: false }), now: () => 1000 }),
+			resolveClaudeExecutable({
+				candidates: () => [{ file: "/x/claude" }],
+				probe: () => ({ ok: false }),
+				now: () => 1000,
+			}),
 		).toThrowError(LocalAgentSetupError);
 	});
 
@@ -107,7 +111,7 @@ describe("resolveClaudeExecutable", () => {
 		const out = resolveClaudeExecutable({
 			overridePath: "/custom/claude",
 			candidates: () => [],
-			probe: (f) => ({ ok: f === "/custom/claude", version: "2.1.210" }),
+			probe: (c) => ({ ok: c.file === "/custom/claude", version: "2.1.210" }),
 			now: () => 1000,
 		});
 		expect(out.file).toBe("/custom/claude");
@@ -132,8 +136,8 @@ describe("resolveClaudeExecutable", () => {
 			calls++;
 			return { ok: true, version: "2.1.210" };
 		};
-		resolveClaudeExecutable({ candidates: () => ["/a/claude"], probe, now: () => 0 });
-		resolveClaudeExecutable({ candidates: () => ["/a/claude"], probe, now: () => 60_000 });
+		resolveClaudeExecutable({ candidates: () => [{ file: "/a/claude" }], probe, now: () => 0 });
+		resolveClaudeExecutable({ candidates: () => [{ file: "/a/claude" }], probe, now: () => 60_000 });
 		expect(calls).toBe(1); // second call served from cache
 	});
 
@@ -144,7 +148,7 @@ describe("resolveClaudeExecutable", () => {
 			calls++;
 			return { ok: true, version: "2.1.210" };
 		};
-		const first = resolveClaudeExecutable({ candidates: () => ["/a/claude"], probe, now: () => 0 });
+		const first = resolveClaudeExecutable({ candidates: () => [{ file: "/a/claude" }], probe, now: () => 0 });
 		expect(first.file).toBe("/a/claude");
 		// Different cache key (override path) within the TTL must re-probe rather
 		// than leak the default-discovery binary — the cross-repo/config bug.
@@ -160,8 +164,8 @@ describe("resolveClaudeExecutable", () => {
 			calls++;
 			return { ok: true, version: "2.1.210" };
 		};
-		resolveClaudeExecutable({ candidates: () => ["/a/claude"], probe, now: () => 0 });
-		resolveClaudeExecutable({ candidates: () => ["/a/claude"], probe, now: () => 15 * 60_000 + 1 });
+		resolveClaudeExecutable({ candidates: () => [{ file: "/a/claude" }], probe, now: () => 0 });
+		resolveClaudeExecutable({ candidates: () => [{ file: "/a/claude" }], probe, now: () => 15 * 60_000 + 1 });
 		expect(calls).toBe(2);
 	});
 
@@ -172,8 +176,12 @@ describe("resolveClaudeExecutable", () => {
 			calls++;
 			return { ok: false };
 		};
-		expect(() => resolveClaudeExecutable({ candidates: () => ["/a/claude"], probe, now: () => 0 })).toThrow();
-		expect(() => resolveClaudeExecutable({ candidates: () => ["/a/claude"], probe, now: () => 1 })).toThrow();
+		expect(() =>
+			resolveClaudeExecutable({ candidates: () => [{ file: "/a/claude" }], probe, now: () => 0 }),
+		).toThrow();
+		expect(() =>
+			resolveClaudeExecutable({ candidates: () => [{ file: "/a/claude" }], probe, now: () => 1 }),
+		).toThrow();
 		expect(calls).toBe(2);
 	});
 
@@ -317,7 +325,7 @@ describe("isClaudeCodeUsable", () => {
 		__resetResolverCacheForTest();
 		expect(
 			isClaudeCodeUsable({
-				candidates: () => ["/a/claude"],
+				candidates: () => [{ file: "/a/claude" }],
 				probe: () => ({ ok: true, version: "1.0.0" }),
 				now: () => 1000,
 			}),

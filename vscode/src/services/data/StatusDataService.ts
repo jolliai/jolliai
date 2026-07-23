@@ -33,7 +33,7 @@ export class StatusDataService {
 			parts.push("2 Claude");
 		}
 		if (status?.geminiHookInstalled) {
-			parts.push("1 Gemini CLI");
+			parts.push("1 Gemini");
 		}
 		return {
 			hasApiKey: !!config?.apiKey,

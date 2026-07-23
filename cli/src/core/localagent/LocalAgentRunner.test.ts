@@ -177,6 +177,32 @@ describe("runInvocation", () => {
 		await expect(promise).resolves.toBe('{"ok":true}');
 	});
 
+	it("strips NUL bytes from argv before spawning (argv cannot contain NUL: Node throws ERR_INVALID_ARG_VALUE)", async () => {
+		// The arg-based backends (codex/cursor/opencode) pass the summary prompt as
+		// a positional arg, and content being summarized (binary diffs, transcripts)
+		// can carry stray NUL bytes. Node's spawn rejects any argv element with a NUL
+		// ("args[N] must be a string without null bytes") before the child starts, so
+		// the runner must strip them at the spawn boundary. Claude's stdin path is
+		// unaffected (a byte stream has no such restriction).
+		let receivedArgs: readonly string[] | undefined;
+		const spawnImpl = ((_file: string, args: string[]) => {
+			receivedArgs = args;
+			const child = makeFakeChild();
+			setImmediate(() => {
+				child.stdout.write("ok");
+				child.stdout.end();
+				child.stderr.end();
+				child.emit("close", 0);
+			});
+			// biome-ignore lint/suspicious/noExplicitAny: test double for spawn's return
+			return child as any;
+		}) as never;
+		const nulInv = { ...inv, args: ["run", "sys\n\nsummary\x00with\x00nul"] };
+		const out = await runInvocation(nulInv, { spawnImpl });
+		expect(out).toBe("ok");
+		expect(receivedArgs).toEqual(["run", "sys\n\nsummarywithnul"]);
+	});
+
 	it("settles only once: a late close/error after timeout is ignored", async () => {
 		vi.useFakeTimers();
 		try {

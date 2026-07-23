@@ -402,6 +402,7 @@ describe("buildStatusSummary", () => {
 		jolliApiKeyConfigured: true,
 		anthropicKeyConfigured: true,
 		aiProvider: "jolli" as const,
+		localAgentTool: null,
 		site: "https://acme.jolli.ai",
 		diskBacked: true,
 		claudeEnabled: true,
@@ -426,7 +427,7 @@ describe("buildStatusSummary", () => {
 		);
 		expect(r.version).toBe("9.9.9");
 		expect(r.hooks).toEqual({
-			summary: "5 Git + 2 Claude + 1 Gemini CLI",
+			summary: "5 Git + 2 Claude + 1 Gemini",
 			git: true,
 			prePush: true,
 			claude: true,
@@ -434,10 +435,10 @@ describe("buildStatusSummary", () => {
 			runtime: "cli@1.0.0",
 		});
 		expect(r.dataMigration).toBe("Up to date (v5)");
+		// Signed in → jolliApiKeyConfigured omitted; provider "jolli" → no
+		// anthropicKeyConfigured and no localAgentTool.
 		expect(r.account).toEqual({
 			signedIn: true,
-			jolliApiKeyConfigured: true,
-			anthropicKeyConfigured: true,
 			aiProvider: "jolli",
 			site: "acme.jolli.ai",
 			siteLabel: "Jolli Site",
@@ -451,6 +452,49 @@ describe("buildStatusSummary", () => {
 		expect(r.orphanBranch).toBe("jollimemory/summaries/v3");
 		// No `space` in ctx → null (repo not bound / binding unknown).
 		expect(r.space).toBeNull();
+	});
+
+	it("surfaces anthropicKeyConfigured only for the anthropic provider (signed out)", () => {
+		const r = buildStatusSummary(makeStatus(), {
+			version: "1",
+			isClaudePlugin: false,
+			account: { ...account, signedIn: false, aiProvider: "anthropic" },
+		});
+		expect(r.account).toEqual({
+			signedIn: false,
+			jolliApiKeyConfigured: true, // signed out → surfaced
+			anthropicKeyConfigured: true, // provider anthropic → surfaced
+			aiProvider: "anthropic",
+			site: "acme.jolli.ai",
+			siteLabel: "Jolli Site",
+		});
+	});
+
+	it("surfaces the local agent tool label for the local-agent provider", () => {
+		const r = buildStatusSummary(makeStatus(), {
+			version: "1",
+			isClaudePlugin: false,
+			account: { ...account, signedIn: false, aiProvider: "local-agent", localAgentTool: "codex" },
+		});
+		expect(r.account).toEqual({
+			signedIn: false,
+			jolliApiKeyConfigured: true,
+			aiProvider: "local-agent",
+			localAgentTool: "Codex", // friendly label, not the raw id
+			site: "acme.jolli.ai",
+			siteLabel: "Jolli Site",
+		});
+	});
+
+	it("defaults the local agent tool label to Claude Code when unset", () => {
+		const r = buildStatusSummary(makeStatus(), {
+			version: "1",
+			isClaudePlugin: false,
+			account: { ...account, aiProvider: "local-agent", localAgentTool: null },
+		});
+		expect(r.account.localAgentTool).toBe("Claude Code");
+		// Signed in → the Jolli key stays omitted even for local-agent.
+		expect(r.account.jolliApiKeyConfigured).toBeUndefined();
 	});
 
 	it("carries a bound Space name through when ctx.space is provided", () => {
@@ -653,10 +697,10 @@ describe("runStatus", () => {
 		expect(loadConfigFromDir).toHaveBeenCalledWith("/glob");
 		expect(r.version).toBe(VERSION);
 		expect(r.storedMemories).toBe(7);
+		// Signed in → jolliApiKeyConfigured omitted; provider unset (null) → no
+		// anthropicKeyConfigured and no localAgentTool.
 		expect(r.account).toEqual({
 			signedIn: true,
-			jolliApiKeyConfigured: true,
-			anthropicKeyConfigured: true,
 			aiProvider: null, // config had no explicit choice
 			site: "acme.jolli.ai",
 			siteLabel: "Jolli Site",
@@ -678,18 +722,20 @@ describe("runStatus", () => {
 		expect(r.space).toEqual({ name: "Shared Memory" });
 	});
 
-	it("falls back to ANTHROPIC_API_KEY and reports an empty config as unconfigured", async () => {
+	it("falls back to ANTHROPIC_API_KEY for the anthropic provider and reports a keyless config as unconfigured", async () => {
 		const prev = process.env.ANTHROPIC_API_KEY;
 		process.env.ANTHROPIC_API_KEY = "env-key";
 		try {
 			vi.mocked(getStatus).mockResolvedValue(makeStatus());
 			vi.mocked(getGlobalConfigDir).mockReturnValue("/glob");
-			vi.mocked(loadConfigFromDir).mockResolvedValue({});
+			// Provider "anthropic" is what surfaces anthropicKeyConfigured at all.
+			vi.mocked(loadConfigFromDir).mockResolvedValue({ aiProvider: "anthropic" });
 			vi.mocked(loadAuthToken).mockResolvedValue(undefined);
 
 			const r = await runStatus("/repo");
 
 			expect(r.account.signedIn).toBe(false);
+			// Signed out → jolliApiKeyConfigured surfaced (and false here).
 			expect(r.account.jolliApiKeyConfigured).toBe(false);
 			expect(r.account.anthropicKeyConfigured).toBe(true); // from the env var
 			expect(r.account.site).toBeNull();
@@ -712,7 +758,9 @@ describe("runStatus", () => {
 
 			const r = await runStatus("/repo");
 
-			expect(r.account.anthropicKeyConfigured).toBe(false);
+			// Provider unset (not "anthropic") → anthropicKeyConfigured omitted entirely.
+			expect(r.account.anthropicKeyConfigured).toBeUndefined();
+			// Signed out → the stored Jolli key is surfaced as the generation credential.
 			expect(r.account.jolliApiKeyConfigured).toBe(true);
 			expect(r.integrations).toEqual([{ name: "Claude", detected: true, status: "detected but disabled" }]);
 		} finally {
@@ -741,8 +789,12 @@ describe("runStatus", () => {
 
 			expect(r.account.aiProvider).toBe("local-agent");
 			expect(r.account.signedIn).toBe(false);
+			// Signed out → the (absent) Jolli key is still surfaced as false.
 			expect(r.account.jolliApiKeyConfigured).toBe(false);
-			expect(r.account.anthropicKeyConfigured).toBe(false);
+			// Not the anthropic provider → the Anthropic key status is omitted.
+			expect(r.account.anthropicKeyConfigured).toBeUndefined();
+			// local-agent → the driving CLI's friendly label is surfaced.
+			expect(r.account.localAgentTool).toBe("Claude Code");
 		} finally {
 			if (prev === undefined) delete process.env.ANTHROPIC_API_KEY;
 			else process.env.ANTHROPIC_API_KEY = prev;

@@ -12,12 +12,16 @@ import { tmpdir } from "node:os";
 import { basename } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { createLogger } from "../Logger.js";
-import type { LlmCredentialSource } from "../Types.js";
+import type { LlmCredentialSource, LocalAgentToolId } from "../Types.js";
 import { JOLLI_CLIENT_HEADER } from "./ClientHeader.js";
 import { parseBaseUrl, parseJolliApiKey } from "./JolliApiUtils.js";
 import { getBackend, registerBackend } from "./localagent/BackendRegistry.js";
 import { ClaudeCodeBackend, LOCAL_AGENT_TMP_PREFIX } from "./localagent/ClaudeCodeBackend.js";
+import { CodexBackend } from "./localagent/CodexBackend.js";
+import { CursorAgentBackend } from "./localagent/CursorAgentBackend.js";
+import { describeCandidate } from "./localagent/ExecutableResolver.js";
 import { runInvocation as defaultRunInvocation } from "./localagent/LocalAgentRunner.js";
+import { OpenCodeBackend } from "./localagent/OpenCodeBackend.js";
 import { fillTemplate, findUnfilledPlaceholders, TEMPLATES } from "./PromptTemplates.js";
 import { resolveModelId } from "./Summarizer.js";
 import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "./TraceContext.js";
@@ -25,6 +29,9 @@ import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "./TraceCo
 // Register the v1 backend once at module load. The registry is the extension
 // point for future tools (Codex, Cursor) — add a `registerBackend(...)` here.
 registerBackend(new ClaudeCodeBackend());
+registerBackend(new CursorAgentBackend());
+registerBackend(new CodexBackend());
+registerBackend(new OpenCodeBackend());
 
 // Re-export so existing imports of LlmCredentialSource from this module keep
 // working — the source-of-truth definition lives in Types.ts because
@@ -194,8 +201,8 @@ interface LlmCredentials {
 	 * credential-presence precedence below.
 	 */
 	readonly aiProvider?: "anthropic" | "jolli" | "local-agent";
-	/** Which local agent tool to drive when aiProvider === "local-agent" (v1: "claude-code"). */
-	readonly localAgentTool?: "claude-code";
+	/** Which local agent tool to drive when aiProvider === "local-agent". */
+	readonly localAgentTool?: LocalAgentToolId;
 	/** Optional explicit path to the local agent binary, overriding PATH discovery. */
 	readonly localAgentPath?: string;
 }
@@ -343,6 +350,13 @@ export interface LlmCallResult {
 	 * Persisted into `LlmCallMetadata.source` for traceability of past summaries.
 	 */
 	readonly source: LlmCredentialSource;
+	/**
+	 * For source === "local-agent": which tool produced this result. Threaded
+	 * through into `LlmCallMetadata.localAgentTool` by callers that build the
+	 * persisted metadata (`Summarizer.ts`, `PlanProgressEvaluator.ts`) so the
+	 * footer can attribute the specific tool. Absent for every other source.
+	 */
+	readonly localAgentTool?: LocalAgentToolId;
 }
 
 /**
@@ -454,11 +468,15 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 	// max_tokens budget (and the resulting `stopReason === "max_tokens"`
 	// truncation signal) simply does not apply under the local-agent provider.
 
-	const backend = getBackend(options.localAgentTool ?? "claude-code");
+	const tool = options.localAgentTool ?? "claude-code";
+	const backend = getBackend(tool);
 	const exe = await backend.discoverExecutable(options.localAgentPath);
+	// claude-code keeps the resolved alias (its model selection is action-driven);
+	// every other tool uses its own default model (empty ⇒ no model flag passed).
+	const effectiveModel = tool === "claude-code" ? model : "";
 	const invocation = backend.buildInvocation(exe, {
 		prompt,
-		model,
+		model: effectiveModel,
 		systemPrompt: "You output only what the prompt asks for, with no preamble or commentary.",
 	});
 
@@ -473,9 +491,9 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 		// dead — and local-agent spend is otherwise invisible, since it bills the
 		// tool's own subscription rather than a jollimemory-metered key.
 		log.info(
-			"Local-agent completion: action=%s model=%s cost=$%s in=%d out=%d cached=%d",
+			"Local-agent completion: action=%s tool=%s cost=$%s in=%d out=%d cached=%d",
 			options.action,
-			model,
+			tool,
 			outcome.costUsd.toFixed(4),
 			outcome.inputTokens,
 			outcome.outputTokens,
@@ -491,7 +509,30 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 			apiLatencyMs: Date.now() - startTime,
 			stopReason: outcome.stopReason,
 			source,
+			localAgentTool: tool,
 		};
+	} catch (err) {
+		// Symmetric with callDirect/callProxy, which both log rich failure detail:
+		// local-agent was the ONLY provider that logged nothing when a CLI was found
+		// but the invocation still failed. This covers a run() rejection (timeout /
+		// spawn failure / nonzero exit with no stdout) AND a parseResult throw
+		// (expired login, unparseable output). errorName carries the LocalAgent*Error
+		// class so debug.log shows the classification (setup vs auth vs transient)
+		// without decoding the message. Discovery failures throw earlier (before this
+		// try) and are logged by resolveExecutable instead.
+		const elapsedMs = Date.now() - startTime;
+		const errorName = err instanceof Error ? err.name : "(non-error)";
+		const message = err instanceof Error ? err.message : String(err);
+		log.error(
+			"Local-agent call failed: action=%s tool=%s exe=%s elapsedMs=%d errorName=%s error=%s",
+			options.action,
+			tool,
+			describeCandidate(exe),
+			elapsedMs,
+			errorName,
+			message,
+		);
+		throw err;
 	} finally {
 		// Only remove a cwd WE created (buildInvocation's mkdtemp under tmpdir with
 		// our prefix); callLocalAgent is backend-generic and tests inject stubs

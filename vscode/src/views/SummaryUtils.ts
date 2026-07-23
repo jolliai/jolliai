@@ -42,6 +42,7 @@ export {
 } from "../../../cli/src/core/TokenCost.js";
 
 import { escHtml } from "../../../cli/src/core/MarkdownEscape.js";
+import { localAgentToolLabel } from "../../../cli/src/core/localagent/ToolMeta.js";
 import { resolveLlmCredentialSource } from "../../../cli/src/core/LlmClient.js";
 import { formatDate as coreFormatDate } from "../../../cli/src/core/SummaryFormat.js";
 import type {
@@ -77,13 +78,20 @@ const PROVIDER_LABELS: Record<LlmCredentialSource, string> = {
  * back from the resolver becomes `undefined` here so callers can omit
  * "via …" instead of promising a provider that will throw at call time.
  * Label strings come from a local PROVIDER_LABELS copy — keep it in lockstep
- * with the canonical map in `SummaryFormat.ts`.
+ * with the canonical map in `SummaryFormat.ts`. For `"local-agent"` the
+ * specific tool is surfaced (`"Local agent - Cursor"`), matching the historical
+ * footer (`formatProviderLabel`), the `jolli status` row, and the Status tree
+ * so a Regenerate preview never disagrees with them about which tool will run.
  */
 export function formatActiveProviderLabel(
 	config: LlmConfig,
 ): string | undefined {
 	const source = resolveLlmCredentialSource(config);
-	return source === null ? undefined : PROVIDER_LABELS[source];
+	if (source === null) return undefined;
+	if (source === "local-agent") {
+		return `Local agent - ${localAgentToolLabel(config.localAgentTool ?? "claude-code")}`;
+	}
+	return PROVIDER_LABELS[source];
 }
 
 // ─── Push contract: relativePath construction ───────────────────────────────

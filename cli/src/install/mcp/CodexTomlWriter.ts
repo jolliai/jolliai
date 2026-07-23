@@ -4,7 +4,7 @@
  * ## Verified config format (observed from real ~/.codex/config.toml on developer machine,
  *    confirmed against official Codex docs at https://developers.openai.com/codex/mcp)
  *
- * Codex CLI global config: ~/.codex/config.toml
+ * Codex global config: ~/.codex/config.toml
  * MCP servers use table key `mcp_servers` (underscore, NOT `mcpServers` or `mcp-servers`):
  *
  *   [mcp_servers.jollimemory]

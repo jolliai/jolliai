@@ -10,7 +10,7 @@ writes a Jolli "prefer these skills by default" managed block into **machine-glo
 instruction files that users often hand-maintain:
 
 - Claude Code → `~/.claude/CLAUDE.md`
-- Gemini CLI → `~/.gemini/GEMINI.md`
+- Gemini → `~/.gemini/GEMINI.md`
 - Codex → `~/.codex/AGENTS.md`
 
 Today it runs **unconditionally** inside `install()` ([Installer.ts:331](../../../cli/src/install/Installer.ts#L331)),

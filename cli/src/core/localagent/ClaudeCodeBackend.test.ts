@@ -197,3 +197,13 @@ describe("ClaudeCodeBackend.buildInvocation", () => {
 		expect(inv.env.JOLLI_LOCAL_AGENT_CHILD).toBe("1");
 	});
 });
+
+describe("ClaudeCodeBackend.buildInvocation with launcher args", () => {
+	it("prepends launchArgs ahead of the CLI's own flags", () => {
+		const inv = new ClaudeCodeBackend().buildInvocation(
+			{ file: "node.exe", version: "2.1.210", launchArgs: ["cli.js"] },
+			{ prompt: "p", model: "m", systemPrompt: "s" },
+		);
+		expect(inv.args.slice(0, 2)).toEqual(["cli.js", "-p"]);
+	});
+});

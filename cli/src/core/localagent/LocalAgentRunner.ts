@@ -38,8 +38,17 @@ interface RunOpts {
 export function runInvocation(inv: Invocation, opts: RunOpts = {}): Promise<string> {
 	const spawnImpl = opts.spawnImpl ?? spawnHidden;
 	const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+	// argv cannot contain NUL bytes: Node's spawn throws ERR_INVALID_ARG_VALUE
+	// ("args[N] must be a string without null bytes") before the child even starts.
+	// The arg-based backends (codex/cursor/opencode) pass the summary prompt as a
+	// positional arg, and content being summarized (binary diffs, transcripts) can
+	// carry stray NUL bytes, so strip them here at the spawn boundary — the one
+	// layer that owns this constraint and covers every arg-based backend at once.
+	// (ClaudeCodeBackend sends the prompt via stdin below, a byte stream with no
+	// such restriction, so `inv.stdin` is deliberately left untouched.)
+	const args = inv.args.map((a) => a.replace(/\0/g, ""));
 	return new Promise<string>((resolve, reject) => {
-		const child = spawnImpl(inv.file, [...inv.args], {
+		const child = spawnImpl(inv.file, args, {
 			cwd: inv.cwd,
 			env: inv.env,
 			stdio: ["pipe", "pipe", "pipe"],

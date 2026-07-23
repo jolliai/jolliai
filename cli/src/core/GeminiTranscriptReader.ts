@@ -1,7 +1,7 @@
 /**
  * Gemini Transcript Reader
  *
- * Parses Gemini CLI session files (single JSON, not JSONL).
+ * Parses Gemini session files (single JSON, not JSONL).
  * Sessions are stored at: ~/.gemini/tmp/<project_hash>/chats/session-*.json
  *
  * Each file is a JSON object (ConversationRecord) with a `messages[]` array.
@@ -46,7 +46,7 @@ interface GeminiConversationRecord {
 }
 
 /**
- * Reads a Gemini CLI session JSON file and returns parsed transcript entries.
+ * Reads a Gemini session JSON file and returns parsed transcript entries.
  * Supports cursor-based resumption by tracking the number of messages already processed.
  *
  * @param transcriptPath - Absolute path to the session JSON file

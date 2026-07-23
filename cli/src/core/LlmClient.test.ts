@@ -1580,6 +1580,62 @@ describe("callLlm — local-agent", () => {
 		expect(seenOverride).toBe("/custom/path/to/claude");
 	});
 
+	it("rethrows the original error (unwrapped) when a found CLI's parseResult fails", async () => {
+		const boom = new Error("Codex produced no JSONL events");
+		const stub: LocalAgentBackend = {
+			id: "claude-code",
+			discoverExecutable: async () => ({ file: "/x/claude", version: "2.1.210" }),
+			buildInvocation: () => ({ file: "/x/claude", args: [], stdin: "P", env: {}, cwd: "/tmp" }),
+			parseResult: () => {
+				throw boom;
+			},
+		};
+		registerBackend(stub);
+
+		// The exact error propagates — the failure-logging catch logs and rethrows,
+		// it must not swallow or wrap (the caller's auth/transient classification
+		// relies on the original error identity).
+		await expect(
+			callLlm({
+				action: "recap",
+				params: { branch: "main", summaries: "x" },
+				aiProvider: "local-agent",
+				localAgentTool: "claude-code",
+				__localAgentRun: async () => "ignored-by-stub",
+			}),
+		).rejects.toBe(boom);
+	});
+
+	it("handles a non-Error rejection from the runner without masking it", async () => {
+		const stub: LocalAgentBackend = {
+			id: "claude-code",
+			discoverExecutable: async () => ({ file: "/x/claude", version: "2.1.210" }),
+			buildInvocation: () => ({ file: "/x/claude", args: [], stdin: "P", env: {}, cwd: "/tmp" }),
+			parseResult: () => ({
+				text: "",
+				inputTokens: 0,
+				outputTokens: 0,
+				cachedTokens: 0,
+				costUsd: 0,
+				stopReason: null,
+			}),
+		};
+		registerBackend(stub);
+
+		await expect(
+			callLlm({
+				action: "recap",
+				params: { branch: "main", summaries: "x" },
+				aiProvider: "local-agent",
+				localAgentTool: "claude-code",
+				// A rejection that is NOT an Error exercises the catch's defensive branch.
+				__localAgentRun: async () => {
+					throw "raw-string-failure";
+				},
+			}),
+		).rejects.toBe("raw-string-failure");
+	});
+
 	describe("temp cwd cleanup", () => {
 		it("removes the real mkdtemp'd cwd after a successful run", async () => {
 			const realCwd = mkdtempSync(join(tmpdir(), "jolli-localagent-"));

@@ -888,6 +888,18 @@ describe("SummaryUtils", () => {
 			delete process.env.ANTHROPIC_API_KEY;
 			expect(formatActiveProviderLabel({} as never)).toBeUndefined();
 		});
+
+		it("surfaces the specific tool for aiProvider local-agent", () => {
+			expect(
+				formatActiveProviderLabel({ aiProvider: "local-agent", localAgentTool: "cursor-agent" } as never),
+			).toBe("Local agent - Cursor");
+		});
+
+		it("defaults local-agent to Claude Code when localAgentTool is unset", () => {
+			expect(formatActiveProviderLabel({ aiProvider: "local-agent" } as never)).toBe(
+				"Local agent - Claude Code",
+			);
+		});
 	});
 
 	// ─── formatTokensCompact / formatSonnetCostEstimate ─────────────────────────

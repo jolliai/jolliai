@@ -82,6 +82,7 @@ export class ClaudeCodeBackend implements LocalAgentBackend {
 			// touch the filesystem or shell. (`--permission-mode dontAsk` is the
 			// belt to this suspenders: even a would-be tool call never prompts.)
 			args: [
+				...(exe.launchArgs ?? []), // interpreter args when `exe.file` is a launcher, not the CLI itself
 				"-p",
 				"--output-format",
 				"json",
