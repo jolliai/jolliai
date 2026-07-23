@@ -1135,14 +1135,20 @@ describe("StatusTreeProvider", () => {
 		expect(String(clineItem?.tooltip)).toContain("VS Code: ✗");
 	});
 
-	it("shows Cline Integration as unavailable when scan errors", async () => {
+	it("surfaces a VS Code scan error as a warn row without masking the healthy CLI", async () => {
+		// Regression (JOLLI-2034): a single collapsed clineScanError REPLACED the
+		// main Cline row, hiding the healthy CLI. The VS Code failure now surfaces
+		// as its own warn row while the merged "detected & enabled" row still shows.
 		const bridge = {
 			cwd: "/repo",
 			getStatus: vi.fn(async () =>
 				makeStatus({
 					clineDetected: true,
+					clineCliDetected: true,
+					clineVscodeDetected: true,
 					clineEnabled: true,
-					clineScanError: { kind: "parse", message: "bad task json" },
+					clineVscodeScanError: { kind: "parse", message: "bad task json" },
+					sessionsBySource: { "cline-cli": 3 },
 				}),
 			),
 		};
@@ -1152,9 +1158,46 @@ describe("StatusTreeProvider", () => {
 		await provider.refresh();
 
 		const items = provider.getChildren();
-		const item = items.find((i) => i.label === "Cline Integration");
-		expect(item?.description).toContain("parse");
-		expect(String(item?.tooltip)).toContain("Cline scan failed");
+		const warnRow = items.find(
+			(i) => i.label === "Cline Integration" && String(i.description).includes("unavailable"),
+		);
+		expect(warnRow?.description).toBe("unavailable — parse");
+		expect(String(warnRow?.tooltip)).toContain("Cline VS Code scan failed");
+		// The merged row still renders the healthy CLI's session count.
+		const healthyRow = items.find(
+			(i) => i.label === "Cline Integration" && String(i.tooltip).includes("CLI: ✓"),
+		);
+		expect(healthyRow?.description).toBe("detected & enabled (3 sessions)");
+	});
+
+	it("renders a separate 'Cline CLI' warn row when clineCliScanError is present", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					clineDetected: true,
+					clineCliDetected: true,
+					clineVscodeDetected: true,
+					clineEnabled: true,
+					clineCliScanError: { kind: "fs", message: "permission denied" },
+					sessionsBySource: { cline: 2 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cliWarn = items.find((i) => i.label === "Cline CLI");
+		expect(cliWarn?.description).toBe("unavailable — fs");
+		expect(String(cliWarn?.tooltip)).toContain("permission denied");
+		// Main row unaffected.
+		const healthyRow = items.find(
+			(i) => i.label === "Cline Integration" && String(i.description).includes("detected & enabled"),
+		);
+		expect(healthyRow?.description).toBe("detected & enabled (2 sessions)");
 	});
 
 	// ── Auth-aware status rows ────────────────────────────────────────────

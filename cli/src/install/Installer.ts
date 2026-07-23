@@ -1059,13 +1059,18 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 	}
 
 	// Discover Cline sessions on-demand (extension + CLI), merged under one row.
-	let clineScanError: ClineScanError | undefined;
+	// Each channel keeps its OWN scan-error field — collapsing them (the old
+	// `ext.error ?? cli.error`) dropped a concurrent CLI failure and let one
+	// broken channel mask a healthy sibling on the merged row (JOLLI-2034).
+	let clineVscodeScanError: ClineScanError | undefined;
+	let clineCliScanError: ClineScanError | undefined;
 	if (config.clineEnabled !== false && clineDetected) {
 		const ext = await scanClineSessions(projectDir);
 		const cli = await scanClineCliSessions(projectDir);
 		const merged = [...ext.sessions, ...cli.sessions];
 		if (merged.length > 0) allEnabledSessions = [...allEnabledSessions, ...merged];
-		clineScanError = ext.error ?? cli.error;
+		clineVscodeScanError = ext.error;
+		clineCliScanError = cli.error;
 	}
 
 	// Discover Antigravity conversations on-demand (not stored in sessions.json).
@@ -1185,7 +1190,8 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		clineCliDetected,
 		clineVscodeDetected,
 		clineEnabled: config.clineEnabled,
-		clineScanError,
+		clineVscodeScanError,
+		clineCliScanError,
 		antigravityDetected,
 		antigravityEnabled: config.antigravityEnabled,
 		antigravityScanError,

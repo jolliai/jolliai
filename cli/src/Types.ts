@@ -1457,8 +1457,15 @@ export interface StatusInfo {
 	readonly clineVscodeDetected?: boolean;
 	/** Whether Cline session discovery is enabled in config (undefined = auto-detect) */
 	readonly clineEnabled?: boolean;
-	/** Cline scan failed with a real error (non-ENOENT): parse / fs / schema. */
-	readonly clineScanError?: ClineScanError;
+	/**
+	 * Cline VS Code extension scan failed with a real error (non-ENOENT): parse /
+	 * fs / schema. Split from the CLI channel (was a single collapsed
+	 * `clineScanError`) so one broken channel never masks a healthy sibling on the
+	 * merged Cline row — see `buildIntegrationRows` in StatusCommand.ts.
+	 */
+	readonly clineVscodeScanError?: ClineScanError;
+	/** Cline CLI (~/.cline/data/sessions) scan failed with a real error. Same UI semantics as clineVscodeScanError. */
+	readonly clineCliScanError?: ClineScanError;
 	/**
 	 * v5 schema migration state — surfaced in `jolli status` and the VSCode
 	 * Hooks tooltip so users can see whether their on-disk data has been

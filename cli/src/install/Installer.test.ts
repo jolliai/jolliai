@@ -2812,18 +2812,28 @@ describe("Installer", () => {
 			expect(status.clineDetected).toBe(true);
 		});
 
-		it("surfaces clineScanError from the extension or CLI scan", async () => {
+		it("surfaces the VS Code and CLI scan errors on separate fields (no collapse)", async () => {
+			// Regression (JOLLI-2034): the two channels previously collapsed into a
+			// single `clineScanError` via `ext.error ?? cli.error`, so a VS Code
+			// failure DROPPED a concurrent CLI failure. Each channel now populates
+			// its own field so neither masks nor loses the other.
 			const { isClineInstalled } = await import("../core/ClineDetector.js");
 			const { scanClineSessions } = await import("../core/ClineSessionDiscoverer.js");
+			const { scanClineCliSessions } = await import("../core/ClineCliSessionDiscoverer.js");
 			const { saveConfigScoped } = await import("../core/SessionTracker.js");
 			vi.mocked(isClineInstalled).mockResolvedValue(true);
 			vi.mocked(scanClineSessions).mockResolvedValue({
 				sessions: [],
 				error: { kind: "parse", message: "unexpected token" },
 			});
+			vi.mocked(scanClineCliSessions).mockResolvedValue({
+				sessions: [],
+				error: { kind: "fs", message: "EACCES on sessions/" },
+			});
 			await saveConfigScoped({ clineEnabled: true }, emptyGlobalDir);
 			const status = await getStatus(tempDir);
-			expect(status.clineScanError).toEqual({ kind: "parse", message: "unexpected token" });
+			expect(status.clineVscodeScanError).toEqual({ kind: "parse", message: "unexpected token" });
+			expect(status.clineCliScanError).toEqual({ kind: "fs", message: "EACCES on sessions/" });
 		});
 
 		it("merges Cline extension and CLI sessions into the active session count", async () => {
@@ -2858,7 +2868,8 @@ describe("Installer", () => {
 
 			expect(status.sessionsBySource?.cline).toBe(1);
 			expect(status.sessionsBySource?.["cline-cli"]).toBe(1);
-			expect(status.clineScanError).toBeUndefined();
+			expect(status.clineVscodeScanError).toBeUndefined();
+			expect(status.clineCliScanError).toBeUndefined();
 		});
 
 		it("should count legacy sessions without a source as Claude sessions", async () => {

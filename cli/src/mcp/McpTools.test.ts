@@ -541,6 +541,82 @@ describe("buildStatusSummary", () => {
 			{ name: "Copilot", detected: true, status: "detected & enabled (5 sessions)" },
 		]);
 	});
+
+	it("surfaces a merged integration's single broken channel via scanErrors while keeping the healthy status", () => {
+		// Copilot CLI DB is locked but Chat is healthy: the merged row must NOT read
+		// "unavailable" (its session count would vanish), so the partial failure has
+		// to travel in the structured scanErrors channel instead. Mirrors the CLI's
+		// non-masking `↳ CLI scan failed` sub-line and the VS Code per-channel warning.
+		const r = buildStatusSummary(
+			makeStatus({
+				copilotDetected: true,
+				copilotChatDetected: true,
+				copilotScanError: { kind: "locked", message: "db is locked" },
+				sessionsBySource: { "copilot-chat": 3 },
+			}),
+			{ version: "1", account, isClaudePlugin: false },
+		);
+		expect(r.integrations).toEqual([
+			{
+				name: "Copilot",
+				detected: true,
+				status: "detected & enabled (3 sessions)",
+				scanErrors: [{ channel: "CLI", kind: "locked", message: "db is locked" }],
+			},
+		]);
+	});
+
+	it("collects both channels in scanErrors for Cline and Cursor merged rows", () => {
+		// Cline: only the VS Code channel failed → row stays healthy, one scanError.
+		const cline = buildStatusSummary(
+			makeStatus({
+				clineDetected: true,
+				clineCliDetected: true,
+				clineVscodeScanError: { kind: "parse", message: "bad json" },
+				sessionsBySource: { "cline-cli": 2 },
+			}),
+			{ version: "1", account, isClaudePlugin: false },
+		);
+		expect(cline.integrations).toEqual([
+			{
+				name: "Cline",
+				detected: true,
+				status: "detected & enabled (2 sessions)",
+				scanErrors: [{ channel: "VS Code", kind: "parse", message: "bad json" }],
+			},
+		]);
+
+		// Cursor: BOTH channels failed → status reads "unavailable" AND scanErrors
+		// carries both, so a caller can still see each channel's kind/message.
+		const cursor = buildStatusSummary(
+			makeStatus({
+				cursorDetected: true,
+				cursorCliDetected: true,
+				cursorScanError: { kind: "corrupt", message: "ide db corrupt" },
+				cursorCliScanError: { kind: "fs", message: "cli read failed" },
+			}),
+			{ version: "1", account, isClaudePlugin: false },
+		);
+		expect(cursor.integrations).toEqual([
+			{
+				name: "Cursor",
+				detected: true,
+				status: "unavailable — corrupt",
+				scanErrors: [
+					{ channel: "IDE", kind: "corrupt", message: "ide db corrupt" },
+					{ channel: "CLI", kind: "fs", message: "cli read failed" },
+				],
+			},
+		]);
+	});
+
+	it("omits scanErrors entirely when a merged integration has no channel failures", () => {
+		const r = buildStatusSummary(
+			makeStatus({ copilotChatDetected: true, sessionsBySource: { "copilot-chat": 1 } }),
+			{ version: "1", account, isClaudePlugin: false },
+		);
+		expect(r.integrations).toEqual([{ name: "Copilot", detected: true, status: "detected & enabled (1 session)" }]);
+	});
 });
 
 describe("runStatus", () => {

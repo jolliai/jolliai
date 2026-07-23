@@ -260,6 +260,49 @@ export function describeIntegrationStatus(x: IntegrationStatusInputs): string {
 	return `detected & enabled${suffix}`;
 }
 
+/** One channel-labelled scan failure inside a merged (dual-variant) integration. */
+export interface IntegrationScanError {
+	/** Human channel label, matching the CLI sub-line wording ("CLI", "Chat", "IDE", "VS Code"). */
+	readonly channel: string;
+	readonly kind: string;
+	readonly message: string;
+}
+
+/**
+ * Per-channel scan failures for the dual-variant integrations (Copilot, Cline,
+ * Cursor). Their merged {@link describeIntegrationStatus} row only reads
+ * "unavailable" when BOTH channels fail (see `buildIntegrationRows`' gated
+ * `scanError`), so a single broken channel beside a healthy sibling is invisible
+ * in the flat descriptor. The CLI renders these as `↳ … scan failed` sub-lines
+ * and the VS Code STATUS tree as per-channel warning nodes; this collects the
+ * same set so the flat MCP {@link StatusIntegration} can carry them too.
+ *
+ * Returns `[]` for single-channel sources (OpenCode, Devin, Antigravity, …):
+ * their scan failure is never masked — it already surfaces as `unavailable —
+ * <kind>` in the `status` descriptor.
+ */
+export function collectIntegrationScanErrors(status: StatusInfo, name: string): IntegrationScanError[] {
+	const errs: IntegrationScanError[] = [];
+	const push = (channel: string, e: { readonly kind: string; readonly message: string } | undefined): void => {
+		if (e) errs.push({ channel, kind: e.kind, message: e.message });
+	};
+	switch (name) {
+		case "Copilot":
+			push("CLI", status.copilotScanError);
+			push("Chat", status.copilotChatScanError);
+			break;
+		case "Cline":
+			push("VS Code", status.clineVscodeScanError);
+			push("CLI", status.clineCliScanError);
+			break;
+		case "Cursor":
+			push("IDE", status.cursorScanError);
+			push("CLI", status.cursorCliScanError);
+			break;
+	}
+	return errs;
+}
+
 /**
  * Whether Claude's agent hook is effectively active. The Claude Code plugin wires
  * its Stop/SessionStart hooks through its own manifest (hooks.json), NOT
@@ -368,7 +411,13 @@ export function buildIntegrationRows(
 					enabled: status.copilotEnabled !== false,
 					hookInstalled: undefined,
 					sessionCount: (counts.copilot ?? 0) + (counts["copilot-chat"] ?? 0),
-					scanError: status.copilotScanError,
+					// Merged CLI + Chat row: "unavailable" only when BOTH channels
+					// failed. A broken CLI DB beside a healthy Chat (or vice-versa) must
+					// not mask the working source via describeIntegrationStatus' early
+					// return — each failure renders as a sub-line below instead. Mirrors
+					// the Cursor entry above and the VS Code STATUS tree.
+					scanError:
+						status.copilotScanError && status.copilotChatScanError ? status.copilotScanError : undefined,
 				},
 			],
 			[
@@ -378,7 +427,12 @@ export function buildIntegrationRows(
 					enabled: status.clineEnabled !== false,
 					hookInstalled: undefined,
 					sessionCount: (counts.cline ?? 0) + (counts["cline-cli"] ?? 0),
-					scanError: status.clineScanError,
+					// Merged VS Code + CLI row: only "unavailable" when BOTH channels
+					// failed (same rule as Cursor/Copilot above).
+					scanError:
+						status.clineVscodeScanError && status.clineCliScanError
+							? status.clineVscodeScanError
+							: undefined,
 				},
 			],
 			[
@@ -485,6 +539,14 @@ export function registerStatusCommand(program: Command): void {
 					console.log(
 						`  ${subIndent}↳ CLI: ${mark(status.copilotDetected)}, Chat: ${mark(status.copilotChatDetected)}`,
 					);
+					// Both channels' scan errors render as non-masking sub-lines. The
+					// main row only reads "unavailable" when BOTH failed (see the row's
+					// scanError). Symmetric with Cursor's dual sub-lines.
+					if (status.copilotScanError) {
+						console.log(
+							`  ${subIndent}↳ CLI scan failed (${status.copilotScanError.kind}): ${status.copilotScanError.message}`,
+						);
+					}
 					if (status.copilotChatScanError) {
 						console.log(
 							`  ${subIndent}↳ Chat scan failed (${status.copilotChatScanError.kind}): ${status.copilotChatScanError.message}`,
@@ -494,6 +556,16 @@ export function registerStatusCommand(program: Command): void {
 					console.log(
 						`  ${subIndent}↳ CLI: ${mark(status.clineCliDetected)}, VS Code: ${mark(status.clineVscodeDetected)}`,
 					);
+					if (status.clineVscodeScanError) {
+						console.log(
+							`  ${subIndent}↳ VS Code scan failed (${status.clineVscodeScanError.kind}): ${status.clineVscodeScanError.message}`,
+						);
+					}
+					if (status.clineCliScanError) {
+						console.log(
+							`  ${subIndent}↳ CLI scan failed (${status.clineCliScanError.kind}): ${status.clineCliScanError.message}`,
+						);
+					}
 				} else if (name === "Cursor") {
 					console.log(
 						`  ${subIndent}↳ IDE: ${mark(status.cursorDetected)}, CLI: ${mark(status.cursorCliDetected)}`,

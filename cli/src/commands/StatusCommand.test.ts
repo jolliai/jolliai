@@ -1,7 +1,9 @@
 /**
  * Tests for StatusCommand — `jolli status` integration rows.
  *
- * Covers the per-integration breakdown output, focused on the Copilot row.
+ * Covers the per-integration breakdown output, focused on the merged
+ * (two-channel) rows — Copilot (CLI + Chat), Cline (CLI + VS Code), Cursor
+ * (IDE + CLI) — where one channel failing must not mask a healthy sibling.
  */
 
 import { Command } from "commander";
@@ -154,15 +156,38 @@ describe("StatusCommand — Copilot integration row", () => {
 		expect(out).toContain("3");
 	});
 
-	it("renders Copilot row as unavailable on scan error", async () => {
+	it("does NOT mask a healthy Chat when the CLI DB scan fails", async () => {
+		// Regression (JOLLI-2034): a broken CLI DB used to feed the merged row's
+		// scanError, whose early return marked the WHOLE Copilot integration
+		// "unavailable" and hid the healthy Chat's session count. CLI-only failure
+		// must now render as a non-masking sub-line while the main row keeps the count.
 		const out = await renderStatus({
 			...baseStatus,
 			copilotDetected: true,
+			copilotChatDetected: true,
+			copilotEnabled: true,
 			copilotScanError: { kind: "locked", message: "database is locked" },
+			sessionsBySource: { "copilot-chat": 4 },
 		});
-		expect(out).toContain("Copilot");
-		expect(out).toContain("unavailable");
-		expect(out).toContain("locked");
+		expect(out).not.toContain("unavailable");
+		expect(out).toMatch(/4\s*sessions/);
+		expect(out).toContain("CLI scan failed (locked)");
+		expect(out).toContain("database is locked");
+	});
+
+	it("reads unavailable only when BOTH CLI and Chat scans fail", async () => {
+		const out = await renderStatus({
+			...baseStatus,
+			copilotDetected: true,
+			copilotChatDetected: true,
+			copilotEnabled: true,
+			copilotScanError: { kind: "locked", message: "database is locked" },
+			copilotChatScanError: { kind: "parse", message: "bad jsonl event at line 7" },
+		});
+		expect(out).toContain("Copilot:");
+		expect(out).toContain("unavailable — locked");
+		expect(out).toContain("CLI scan failed (locked)");
+		expect(out).toContain("Chat scan failed (parse)");
 	});
 
 	it("renders Copilot row as disabled when detected but copilotEnabled is false", async () => {
@@ -188,17 +213,20 @@ describe("StatusCommand — Copilot integration row", () => {
 		expect(out).toMatch(/2\s*sessions/);
 	});
 
-	it("emits a Chat scan-failed sub-line when copilotChatScanError is set", async () => {
-		// CLI scan error renders on the main row; Chat error is structurally
-		// different — it surfaces as an indented "↳ Chat scan failed" sub-line
-		// underneath the CLI/Chat breakdown so users can tell which form failed.
+	it("does NOT mask a healthy CLI when only the Chat scan fails", async () => {
+		// Symmetric to the CLI-failure case: a Chat-only error surfaces as an
+		// indented "↳ Chat scan failed" sub-line while the main row keeps the
+		// healthy CLI's session count (not "unavailable").
 		const out = await renderStatus({
 			...baseStatus,
 			copilotDetected: true,
 			copilotChatDetected: true,
 			copilotEnabled: true,
 			copilotChatScanError: { kind: "parse", message: "bad jsonl event at line 7" },
+			sessionsBySource: { copilot: 2 },
 		});
+		expect(out).not.toContain("unavailable");
+		expect(out).toMatch(/2\s*sessions/);
 		expect(out).toContain("Chat scan failed (parse)");
 		expect(out).toContain("bad jsonl event at line 7");
 	});
@@ -237,15 +265,56 @@ describe("StatusCommand — Cline integration row", () => {
 		expect(out).toMatch(/5\s*sessions/);
 	});
 
-	it("renders Cline row as unavailable on scan error", async () => {
+	it("does NOT mask a healthy CLI when the VS Code scan fails", async () => {
+		// Regression (JOLLI-2034): Cline collapsed both channels into one scanError
+		// field, so a broken VS Code extension scan marked the WHOLE row
+		// "unavailable" and hid the healthy CLI's session count. VS-Code-only
+		// failure must now render as a non-masking sub-line.
 		const out = await renderStatus({
 			...baseStatus,
 			clineDetected: true,
-			clineScanError: { kind: "parse", message: "bad task json" },
+			clineCliDetected: true,
+			clineVscodeDetected: true,
+			clineEnabled: true,
+			clineVscodeScanError: { kind: "parse", message: "bad task json" },
+			sessionsBySource: { "cline-cli": 3 },
 		});
-		expect(out).toContain("Cline");
-		expect(out).toContain("unavailable");
-		expect(out).toContain("parse");
+		expect(out).not.toContain("unavailable");
+		expect(out).toMatch(/3\s*sessions/);
+		expect(out).toContain("VS Code scan failed (parse)");
+		expect(out).toContain("bad task json");
+	});
+
+	it("renders a non-masking sub-line when only the CLI scan fails", async () => {
+		const out = await renderStatus({
+			...baseStatus,
+			clineDetected: true,
+			clineCliDetected: true,
+			clineVscodeDetected: true,
+			clineEnabled: true,
+			clineCliScanError: { kind: "fs", message: "EACCES on sessions/" },
+			sessionsBySource: { cline: 2 },
+		});
+		expect(out).not.toContain("unavailable");
+		expect(out).toMatch(/2\s*sessions/);
+		expect(out).toContain("CLI scan failed (fs)");
+		expect(out).toContain("EACCES on sessions/");
+	});
+
+	it("reads unavailable only when BOTH VS Code and CLI scans fail", async () => {
+		const out = await renderStatus({
+			...baseStatus,
+			clineDetected: true,
+			clineCliDetected: true,
+			clineVscodeDetected: true,
+			clineEnabled: true,
+			clineVscodeScanError: { kind: "parse", message: "bad task json" },
+			clineCliScanError: { kind: "fs", message: "EACCES on sessions/" },
+		});
+		expect(out).toContain("Cline:");
+		expect(out).toContain("unavailable — parse");
+		expect(out).toContain("VS Code scan failed (parse)");
+		expect(out).toContain("CLI scan failed (fs)");
 	});
 
 	it("renders Cline row as disabled when detected but clineEnabled is false", async () => {
