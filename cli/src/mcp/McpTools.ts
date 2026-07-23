@@ -11,8 +11,10 @@ import {
 	buildHookRuntime,
 	buildHookSummary,
 	buildIntegrationRows,
+	collectIntegrationScanErrors,
 	describeIntegrationStatus,
 	describeSchemaV5Status,
+	type IntegrationScanError,
 	resolveClaudeHookActive,
 } from "../commands/StatusCommand.js";
 import { isClaudePluginBuild } from "../core/ClientHeader.js";
@@ -171,6 +173,17 @@ export interface StatusIntegration {
 	 * lives ONLY inside this string.
 	 */
 	readonly status: string;
+	/**
+	 * Per-channel scan failures for the dual-variant integrations (Copilot, Cline,
+	 * Cursor). Present ONLY when at least one channel failed. The merged `status`
+	 * descriptor stays healthy when just one channel is broken (so its session
+	 * count is not masked), so a single-channel failure would otherwise be
+	 * invisible to an MCP caller — it travels here instead. Mirrors the `jolli
+	 * status` `↳ … scan failed` sub-lines and the VS Code STATUS tree's per-channel
+	 * warning nodes. Single-channel sources never populate this: their failure
+	 * already reads as `unavailable — <kind>` in `status`.
+	 */
+	readonly scanErrors?: readonly IntegrationScanError[];
 }
 
 /** Curated installation & configuration health report — the `status` MCP tool result. */
@@ -263,11 +276,18 @@ export function buildStatusSummary(
 	const integrations: StatusIntegration[] = buildIntegrationRows(status, {
 		claudeEnabled: ctx.account.claudeEnabled,
 		claudeHookActive,
-	}).map(({ name, inputs }) => ({
-		name,
-		detected: true,
-		status: describeIntegrationStatus(inputs),
-	}));
+	}).map(({ name, inputs }) => {
+		// A merged row's `scanError` is gated on BOTH channels failing (so a
+		// healthy channel's session count survives), which means a single broken
+		// channel is invisible in `status`. Recover it into the structured field.
+		const scanErrors = collectIntegrationScanErrors(status, name);
+		return {
+			name,
+			detected: true,
+			status: describeIntegrationStatus(inputs),
+			...(scanErrors.length > 0 ? { scanErrors } : {}),
+		};
+	});
 
 	const site = ctx.account.site ? ctx.account.site.replace(/^https?:\/\//, "") : null;
 	const siteLabel = site ? (ctx.account.diskBacked ? "Jolli Site" : "Last signed-in site") : null;

@@ -405,33 +405,43 @@ function buildFullStatusItems(
 	);
 
 	// Cline integration: shared `clineEnabled` toggle for the terminal CLI and the
-	// VS Code extension. Like Cursor/OpenCode, a scan error replaces the main row
-	// with a dedicated warn row (single scan channel, unlike Copilot's two).
-	if (s.clineScanError) {
+	// VS Code extension. Each form has its own scan-error channel; each surfaces
+	// as a separate warn row while the merged row is ALWAYS shown, so a broken
+	// channel never masks a healthy sibling (mirrors Cursor/Copilot; JOLLI-2034).
+	if (s.clineVscodeScanError) {
 		items.push(
 			new StatusItem(
 				"Cline Integration",
-				`unavailable — ${s.clineScanError.kind}`,
+				`unavailable — ${s.clineVscodeScanError.kind}`,
 				ICON_WARN,
-				`Cline scan failed (${s.clineScanError.kind}): ${s.clineScanError.message}`,
+				`Cline VS Code scan failed (${s.clineVscodeScanError.kind}): ${s.clineVscodeScanError.message}`,
 			),
 		);
-	} else {
-		const clineCliMark = s.clineCliDetected ? "✓" : "✗";
-		const clineVscodeMark = s.clineVscodeDetected ? "✓" : "✗";
-		const clineSessions = (counts.cline ?? 0) + (counts["cline-cli"] ?? 0);
-		pushIntegrationItem(
-			items,
-			s.clineDetected ?? false,
-			s.clineEnabled !== false,
-			undefined,
-			"Cline Integration",
-			`Cline detected (CLI: ${clineCliMark}, VS Code: ${clineVscodeMark}) — session discovery is enabled`,
-			`Cline detected (CLI: ${clineCliMark}, VS Code: ${clineVscodeMark}) but session discovery is disabled in config`,
-			undefined,
-			clineSessions,
+	}
+	if (s.clineCliScanError) {
+		items.push(
+			new StatusItem(
+				"Cline CLI",
+				`unavailable — ${s.clineCliScanError.kind}`,
+				ICON_WARN,
+				`Cline CLI scan failed (${s.clineCliScanError.kind}): ${s.clineCliScanError.message}`,
+			),
 		);
 	}
+	const clineCliMark = s.clineCliDetected ? "✓" : "✗";
+	const clineVscodeMark = s.clineVscodeDetected ? "✓" : "✗";
+	const clineSessions = (counts.cline ?? 0) + (counts["cline-cli"] ?? 0);
+	pushIntegrationItem(
+		items,
+		s.clineDetected ?? false,
+		s.clineEnabled !== false,
+		undefined,
+		"Cline Integration",
+		`Cline detected (CLI: ${clineCliMark}, VS Code: ${clineVscodeMark}) — session discovery is enabled`,
+		`Cline detected (CLI: ${clineCliMark}, VS Code: ${clineVscodeMark}) but session discovery is disabled in config`,
+		undefined,
+		clineSessions,
+	);
 
 	// Antigravity: conversations via per-conversation SQLite + plaintext transcript
 	// (no agent hook — scan errors surface like OpenCode/Cursor).
