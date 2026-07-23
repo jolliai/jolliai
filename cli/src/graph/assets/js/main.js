@@ -131,8 +131,16 @@
     try {
       await window.WikiDataLoader.load();
     } catch (err) {
-      document.getElementById("board").innerHTML =
-        `<div style="padding:40px;color:#c66">Failed to load the knowledge graph data — ${err.message}.</div>`;
+      // Render the error as a text node, not innerHTML: err.message can carry
+      // host-supplied / exception text (see host-bridge.js requestGraph, which
+      // rejects with String(data.error) from a postMessage), so interpolating it
+      // into HTML would be a DOM-XSS sink. textContent escapes it inertly.
+      const board = document.getElementById("board");
+      board.textContent = "";
+      const div = document.createElement("div");
+      div.style.cssText = "padding:40px;color:#c66";
+      div.textContent = `Failed to load the knowledge graph data — ${err.message}.`;
+      board.appendChild(div);
       return;
     }
     // Track last nav to know when a full re-render is needed vs panel-only.
