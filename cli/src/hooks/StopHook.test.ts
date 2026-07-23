@@ -22,6 +22,10 @@ vi.mock("../core/references/ReferenceExtractor.js", () => ({
 	extractReferencesFromTranscript: vi.fn().mockResolvedValue({ references: [], lastLineNumberScanned: 0 }),
 }));
 
+vi.mock("../core/RepoProfile.js", () => ({
+	readManualDisableFlag: vi.fn().mockResolvedValue(false),
+}));
+
 // Mock the telemetry flush so the terminal JOLLI-1954 flush is a no-op and its
 // arguments (short timeout) can be asserted.
 vi.mock("../core/TelemetryStartup.js", () => ({
@@ -81,6 +85,7 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { extractReferencesFromTranscript } from "../core/references/ReferenceExtractor.js";
 import {
 	loadConfig,
@@ -226,6 +231,7 @@ describe("StopHook", () => {
 		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
 		// Default: loadDiscoveryCursor returns null (no prior scan)
 		vi.mocked(loadDiscoveryCursor).mockResolvedValue(null);
+		vi.mocked(readManualDisableFlag).mockResolvedValue(false);
 	});
 
 	afterEach(() => {
@@ -322,6 +328,17 @@ describe("StopHook", () => {
 
 		// Bails before parsing stdin / recording anything — no self-recursion.
 		expect(saveSession).not.toHaveBeenCalled();
+	});
+
+	it("does not record or advance discovery while the repo is manually disabled", async () => {
+		vi.mocked(readManualDisableFlag).mockResolvedValue(true);
+		mockStdin(hookJson());
+
+		await handleStopHook();
+
+		expect(saveSession).not.toHaveBeenCalled();
+		expect(extractReferencesFromTranscript).not.toHaveBeenCalled();
+		expect(saveDiscoveryCursor).not.toHaveBeenCalled();
 	});
 
 	it("should save session info from valid stdin using cwd", async () => {

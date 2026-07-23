@@ -1,8 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { extractMergedBranches, handlePostMerge } from "./PostMergeHook.js";
 
+const mockReadManualDisableFlag = vi.hoisted(() => vi.fn().mockResolvedValue(false));
+
 vi.mock("../core/GitOps.js", () => ({
 	execGit: vi.fn(),
+}));
+
+vi.mock("../core/RepoProfile.js", () => ({
+	readManualDisableFlag: mockReadManualDisableFlag,
 }));
 
 vi.mock("../core/SessionTracker.js", () => ({
@@ -62,7 +68,15 @@ describe("extractMergedBranches", () => {
 describe("handlePostMerge", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		mockReadManualDisableFlag.mockResolvedValue(false);
 		mockEnqueueIngest.mockResolvedValue(true);
+	});
+
+	it("does not enqueue ingest while the repo is manually disabled", async () => {
+		mockReadManualDisableFlag.mockResolvedValue(true);
+		await handlePostMerge("/repo");
+		expect(mockExecGit).not.toHaveBeenCalled();
+		expect(mockEnqueueIngest).not.toHaveBeenCalled();
 	});
 
 	it("should skip when no merge commits detected", async () => {

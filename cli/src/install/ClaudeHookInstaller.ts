@@ -8,21 +8,19 @@
  * Extracted from Installer.ts for single-responsibility.
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createLogger } from "../Logger.js";
+import { atomicWriteFile } from "../core/AtomicWrite.js";
 import type { HookOpResult } from "./HookSettingsHelper.js";
 import {
 	buildHookCommand,
 	hasHookWithIdentifier,
 	hasJolliMemoryHook,
-	hasJolliMemoryHookWithCommand,
 	removeHooksWithIdentifier,
 	removeJolliMemoryHook,
 	SESSION_START_HOOK_IDENTIFIERS,
+	STOP_HOOK_IDENTIFIERS,
 } from "./HookSettingsHelper.js";
-
-const log = createLogger("ClaudeHookInstaller");
 
 /**
  * Installs the Claude Code Stop hook in .claude/settings.local.json.
@@ -31,112 +29,72 @@ const log = createLogger("ClaudeHookInstaller");
  * (from previous versions that wrote to the shared file).
  */
 export async function installClaudeHook(projectDir: string): Promise<HookOpResult> {
+	return reconcileClaudeAgentHooks(projectDir);
+}
+
+/**
+ * Reconciles both canonical Claude Code agent hooks in one read-modify-write.
+ *
+ * Keeping Stop and SessionStart in a single transaction prevents concurrent
+ * surfaces from installing one hook while accidentally overwriting the other.
+ */
+export async function reconcileClaudeAgentHooks(projectDir: string): Promise<HookOpResult> {
 	const settingsDir = join(projectDir, ".claude");
 	const localSettingsPath = join(settingsDir, "settings.local.json");
-
-	// Build hook command using dist-path indirection (resolved at runtime via shell)
-	const hookCommand = buildHookCommand("stop");
+	const stopCommand = buildHookCommand("stop");
+	const sessionStartCommand = buildHookCommand("session-start");
 
 	// Clean up legacy hooks from settings.json (previous versions wrote there)
 	await cleanLegacyClaudeHook(projectDir);
 
-	// Read existing local settings or create new
+	// Read existing local settings or create new. Only ENOENT is treated as an
+	// empty file: malformed JSON or a permission error must never be overwritten.
 	let settings: Record<string, unknown> = {};
+	let existingContent: string | undefined;
 	try {
-		const content = await readFile(localSettingsPath, "utf-8");
-		settings = JSON.parse(content) as Record<string, unknown>;
-	} catch {
-		// No existing settings — create new
+		existingContent = await readFile(localSettingsPath, "utf-8");
+		settings = JSON.parse(existingContent) as Record<string, unknown>;
+	} catch (error: unknown) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 
-	// Get or create hooks section
 	const hooks = (settings.hooks ?? {}) as Record<string, unknown>;
 	const stopMatcherGroups = (hooks.Stop ?? []) as Array<Record<string, unknown>>;
-
-	// Check if our hook already exists with the correct command path
-	if (hasJolliMemoryHookWithCommand(stopMatcherGroups, hookCommand)) {
-		return { path: localSettingsPath };
-	}
-
-	// Remove any existing Jolli Memory hooks (may have outdated paths)
-	const cleaned = removeJolliMemoryHook(stopMatcherGroups);
-
-	// Add our hook using the new matcher group format:
-	// { hooks: [{ type, command, async }] }
-	cleaned.push({
+	const sessionStartGroups = (hooks.SessionStart ?? []) as Array<Record<string, unknown>>;
+	const cleanedStop = removeJolliMemoryHook(stopMatcherGroups);
+	cleanedStop.push({
 		hooks: [
 			{
 				type: "command",
-				command: hookCommand,
+				command: stopCommand,
 				async: true,
 			},
 		],
 	});
 
-	hooks.Stop = cleaned;
-	settings.hooks = hooks;
-
-	// Write local settings
-	await mkdir(settingsDir, { recursive: true });
-	await writeFile(localSettingsPath, JSON.stringify(settings, null, "\t"), "utf-8");
-	return { path: localSettingsPath };
-}
-
-/**
- * Installs the SessionStart hook in .claude/settings.local.json.
- * Outputs a mini-briefing when a new Claude Code session starts.
- */
-export async function installSessionStartHook(projectDir: string): Promise<void> {
-	const settingsDir = join(projectDir, ".claude");
-	const localSettingsPath = join(settingsDir, "settings.local.json");
-
-	// Build hook command using dist-path indirection (resolved at runtime via shell)
-	const hookCommand = buildHookCommand("session-start");
-
-	// Read existing local settings (installClaudeHook runs before this, so the file
-	// should exist with the Stop hook already installed). If the file doesn't exist
-	// yet, start with empty settings. If it exists but can't be read/parsed, propagate
-	// the error to avoid silently overwriting the Stop hook with an empty object.
-	let settings: Record<string, unknown> = {};
-	try {
-		const content = await readFile(localSettingsPath, "utf-8");
-		settings = JSON.parse(content) as Record<string, unknown>;
-	} catch (error: unknown) {
-		// ENOENT = file doesn't exist yet — safe to start fresh
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-			throw error;
-		}
-	}
-
-	const hooks = (settings.hooks ?? {}) as Record<string, unknown>;
-	const sessionStartGroups = (hooks.SessionStart ?? []) as Array<Record<string, unknown>>;
-
-	// Check if our hook already exists with the correct command path
-	if (hasJolliMemoryHookWithCommand(sessionStartGroups, hookCommand)) {
-		return;
-	}
-
-	// Remove any existing Jolli Memory SessionStart hooks (outdated paths)
-	const cleaned = removeHooksWithIdentifier(sessionStartGroups, SESSION_START_HOOK_IDENTIFIERS);
-
-	cleaned.push({
+	const cleanedSessionStart = removeHooksWithIdentifier(sessionStartGroups, SESSION_START_HOOK_IDENTIFIERS);
+	cleanedSessionStart.push({
 		hooks: [
 			{
 				type: "command",
-				command: hookCommand,
+				command: sessionStartCommand,
 			},
 		],
 	});
 
-	hooks.SessionStart = cleaned;
+	hooks.Stop = cleanedStop;
+	hooks.SessionStart = cleanedSessionStart;
 	settings.hooks = hooks;
+	const nextContent = JSON.stringify(settings, null, "\t");
+	if (existingContent === nextContent) return { path: localSettingsPath };
+	await mkdir(settingsDir, { recursive: true });
+	await atomicWriteFile(localSettingsPath, nextContent);
+	return { path: localSettingsPath };
+}
 
-	try {
-		await mkdir(settingsDir, { recursive: true });
-		await writeFile(localSettingsPath, JSON.stringify(settings, null, "\t"), "utf-8");
-	} catch (error: unknown) {
-		log.warn("Failed to install SessionStart hook: %s", (error as Error).message);
-	}
+/** Backward-compatible wrapper; the reconciler always installs both hooks. */
+export async function installSessionStartHook(projectDir: string): Promise<void> {
+	await reconcileClaudeAgentHooks(projectDir);
 }
 
 /**
@@ -174,7 +132,7 @@ async function cleanLegacyClaudeHook(projectDir: string): Promise<void> {
 		settings.hooks = hooks;
 	}
 
-	await writeFile(settingsPath, JSON.stringify(settings, null, "\t"), "utf-8");
+	await atomicWriteFile(settingsPath, JSON.stringify(settings, null, "\t"));
 }
 
 /**
@@ -242,7 +200,7 @@ export async function removeClaudeHook(projectDir: string): Promise<HookOpResult
 		settings.hooks = hooks;
 	}
 
-	await writeFile(localSettingsPath, JSON.stringify(settings, null, "\t"), "utf-8");
+	await atomicWriteFile(localSettingsPath, JSON.stringify(settings, null, "\t"));
 	return {};
 }
 
@@ -251,27 +209,59 @@ export async function removeClaudeHook(projectDir: string): Promise<HookOpResult
  * Checks settings.local.json (current) and falls back to settings.json (legacy).
  */
 export async function isClaudeHookInstalled(projectDir: string): Promise<boolean> {
-	// Check settings.local.json first (current location)
-	if (await hasClaudeHookInFile(join(projectDir, ".claude", "settings.local.json"))) {
-		return true;
-	}
-	// Fall back to settings.json (legacy location)
-	return hasClaudeHookInFile(join(projectDir, ".claude", "settings.json"));
+	const health = await getClaudeAgentHookHealth(projectDir);
+	return health.stop && health.sessionStart;
 }
 
 /**
- * Checks if a specific settings file contains a Jolli Memory hook.
+ * Reports each canonical business hook independently so callers can repair a
+ * partial installation instead of treating a lone Stop hook as healthy.
  */
-async function hasClaudeHookInFile(settingsPath: string): Promise<boolean> {
+export async function getClaudeAgentHookHealth(
+	projectDir: string,
+): Promise<{ readonly stop: boolean; readonly sessionStart: boolean }> {
 	try {
-		const content = await readFile(settingsPath, "utf-8");
+		const content = await readFile(join(projectDir, ".claude", "settings.local.json"), "utf-8");
 		const settings = JSON.parse(content) as Record<string, unknown>;
 		const hooks = settings.hooks as Record<string, unknown> | undefined;
-		if (!hooks) return false;
+		if (!hooks) return { stop: false, sessionStart: false };
 
 		const stopMatcherGroups = (hooks.Stop ?? []) as Array<Record<string, unknown>>;
-		return hasJolliMemoryHook(stopMatcherGroups);
+		const sessionStartGroups = (hooks.SessionStart ?? []) as Array<Record<string, unknown>>;
+		return {
+			stop: hasExactlyOneCanonicalHook(stopMatcherGroups, STOP_HOOK_IDENTIFIERS, buildHookCommand("stop"), true),
+			sessionStart: hasExactlyOneCanonicalHook(
+				sessionStartGroups,
+				SESSION_START_HOOK_IDENTIFIERS,
+				buildHookCommand("session-start"),
+				false,
+			),
+		};
 	} catch {
-		return false;
+		return { stop: false, sessionStart: false };
 	}
+}
+
+function hasExactlyOneCanonicalHook(
+	groups: ReadonlyArray<Record<string, unknown>>,
+	identifiers: ReadonlyArray<string>,
+	expectedCommand: string,
+	expectedAsync: boolean,
+): boolean {
+	const owned = groups.filter((group) => {
+		const innerHooks = group.hooks as Array<Record<string, unknown>> | undefined;
+		return innerHooks?.some((hook) => {
+			const command = hook.command;
+			return typeof command === "string" && identifiers.some((identifier) => command.includes(identifier));
+		});
+	});
+	if (owned.length !== 1) return false;
+	const hooks = owned[0].hooks as Array<Record<string, unknown>> | undefined;
+	if (!hooks || hooks.length !== 1) return false;
+	const hook = hooks[0];
+	return (
+		hook.type === "command" &&
+		hook.command === expectedCommand &&
+		(expectedAsync ? hook.async === true : hook.async === undefined)
+	);
 }

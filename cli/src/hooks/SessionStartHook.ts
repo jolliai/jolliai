@@ -29,6 +29,7 @@ import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { resolveClientKind } from "../core/ClientHeader.js";
 import { readFileFromBranch } from "../core/GitOps.js";
 import { hasLlmCredentials } from "../core/LlmCredentials.js";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig, normalizePlansRegistry, saveConfig } from "../core/SessionTracker.js";
 import { isLocalAgentAuthError } from "../core/SummaryErrorMarker.js";
 import { getDisplayDate } from "../core/SummaryFormat.js";
@@ -136,8 +137,10 @@ export async function ensurePluginDefaultProvider(
  * up a stale dismiss marker once a credential exists, so a later sign-out re-arms
  * the reminder cleanly.
  */
-export async function getLoginReminder(projectDir: string): Promise<string | null> {
-	const clientKind = resolveClientKind();
+export async function getLoginReminder(
+	projectDir: string,
+	clientKind: string = resolveClientKind(),
+): Promise<string | null> {
 	const config = await loadConfig();
 	// Authoritative predicate (shared with the summarizer / compile / back-fill):
 	// counts `local-agent` as credentialed. A hand-rolled key-only check here would
@@ -247,32 +250,17 @@ export async function main(): Promise<void> {
 		setLogDir(projectDir);
 
 		log.info("SessionStartHook invoked (cwd=%s)", projectDir);
+		if (await readManualDisableFlag(projectDir)) {
+			log.info("SessionStart hook skipped — repository manually disabled");
+			return;
+		}
 
-		// Seed the Claude Code plugin's default AI provider (local-agent) on first
-		// use — before the login-reminder check below re-reads config — so a fresh
-		// plugin user generates memories via their local `claude` with no sign-in and
-		// never sees the spurious "Not signed in" nag. No-op off the plugin build or
-		// once any explicit provider choice exists.
-		await ensurePluginDefaultProvider(resolveClientKind(), await loadConfig());
-
-		// All three reads run in parallel, each individually bounded by the hard
-		// timeout so the ENTIRE hook (not just the briefing) respects the <500 ms
-		// ceiling. A slow git read in getAuthFailureReminder can no longer push the
-		// session start past the documented performance contract.
-		const [briefing, authReminder, reminder] = await Promise.all([
-			Promise.race([generateBriefing(projectDir), timeout(HARD_TIMEOUT_MS)]),
-			Promise.race([getAuthFailureReminder(projectDir), timeout(HARD_TIMEOUT_MS)]),
-			Promise.race([getLoginReminder(projectDir), timeout(HARD_TIMEOUT_MS)]),
-		]);
-
-		// Output plain text — Claude Code displays it to the user AND injects it
-		// into Claude's context. JSON hookSpecificOutput is invisible to users, so
-		// we use plain text for visibility. Actionable reminders lead; the branch
-		// briefing follows.
-		const sections = [authReminder, reminder, briefing].filter((s): s is string => Boolean(s));
-		if (sections.length > 0) {
-			log.info("SessionStart output (%d sections)", sections.length);
-			process.stdout.write(sections.join("\n\n"));
+		const context = await buildSessionStartContext(projectDir, "shared", {
+			includeBriefing: true,
+			includePluginReminders: false,
+		});
+		if (context) {
+			process.stdout.write(context);
 		} else {
 			log.info("No briefing or reminder generated (skipped or timed out)");
 		}
@@ -280,6 +268,35 @@ export async function main(): Promise<void> {
 		/* v8 ignore next 2 - defensive: main() catches unexpected errors to never block session startup */
 		log.info("SessionStartHook failed: %s", (error as Error).message);
 	}
+}
+
+/**
+ * Builds the SessionStart context without writing stdout. The canonical
+ * settings-installed hook passes `shared`, while PluginBootstrap passes
+ * `claude-plugin` to cover the very first session before that hook is loaded.
+ */
+export async function buildSessionStartContext(
+	projectDir: string,
+	clientKind: string,
+	options: { readonly includeBriefing?: boolean; readonly includePluginReminders?: boolean } = {},
+): Promise<string | null> {
+	const includeBriefing = options.includeBriefing !== false;
+	const includePluginReminders = options.includePluginReminders !== false;
+	const [briefing, authReminder, reminder] = await Promise.all([
+		includeBriefing
+			? Promise.race([generateBriefing(projectDir), timeout(HARD_TIMEOUT_MS)])
+			: Promise.resolve(null),
+		includePluginReminders
+			? Promise.race([getAuthFailureReminder(projectDir, clientKind), timeout(HARD_TIMEOUT_MS)])
+			: Promise.resolve(null),
+		includePluginReminders
+			? Promise.race([getLoginReminder(projectDir, clientKind), timeout(HARD_TIMEOUT_MS)])
+			: Promise.resolve(null),
+	]);
+	const sections = [authReminder, reminder, briefing].filter((section): section is string => Boolean(section));
+	if (sections.length === 0) return null;
+	log.info("SessionStart output (%d sections)", sections.length);
+	return sections.join("\n\n");
 }
 
 /**

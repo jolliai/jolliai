@@ -24,7 +24,7 @@ PLUGIN_DIR="$SRC/plugins/jolli"
 # installing user's commit (see plugins/jolli/scripts/build.mjs header). Kept in
 # lockstep with that build's entryPoints AND with publish-zip.sh's REQUIRED_DIST.
 PUBLISH_REQUIRED_DIST=(
-	Cli.js StopHook.js SessionStartHook.js
+	Cli.js PluginBootstrapHook.js StopHook.js SessionStartHook.js
 	PostCommitHook.js PostMergeHook.js PostRewriteHook.js PrepareMsgHook.js PrePushHook.js
 	QueueWorker.js PrePushWorker.js
 )

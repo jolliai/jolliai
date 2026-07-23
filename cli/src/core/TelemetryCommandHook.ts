@@ -57,7 +57,7 @@ let invokedRootCommand: string | null = null;
 
 /**
  * Set by commands that run as a synchronous bootstrap (e.g. `enable
- * --git-hooks-only` on every Claude Code SessionStart) where the ≤2s
+ * PluginBootstrapHook on every Claude Code SessionStart) where the ≤2s
  * exit-flush adds latency to the critical path with no user-visible benefit.
  */
 let forcedSkipExitFlush = false;

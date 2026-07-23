@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 
 // ─── Mocks ──────────────────────────────────────────────────────────────────
 
@@ -12,6 +13,10 @@ vi.mock("../core/GitOps.js", () => ({
 	getLastReflogAction: vi.fn(),
 	readFileFromBranch: vi.fn(),
 	getProjectRootDir: vi.fn().mockImplementation((cwd: string) => Promise.resolve(cwd)),
+}));
+
+vi.mock("../core/RepoProfile.js", () => ({
+	readManualDisableFlag: vi.fn().mockResolvedValue(false),
 }));
 
 // CaptureProgress is the interactive-feedback stream (its own real behavior is
@@ -543,6 +548,14 @@ import type {
 	ReferenceCommitRef,
 } from "../Types.js";
 import { __test__, buildWorkerStartupBanner, launchWorker, runWorker } from "./QueueWorker.js";
+
+describe("runWorker — manual disable guard", () => {
+	it("returns before acquiring worker/storage locks", async () => {
+		vi.mocked(readManualDisableFlag).mockResolvedValueOnce(true);
+		await runWorker("/disabled");
+		expect(acquireWorkerLock).not.toHaveBeenCalled();
+	});
+});
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 

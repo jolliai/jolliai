@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Re-export node:fs/promises through a mock so individual tests can `vi.spyOn`
@@ -28,6 +28,7 @@ import {
 	__resetSharedLockDirCache,
 	acquireIngestLock,
 	acquireOrphanWriteLock,
+	acquireRepoHooksLock,
 	acquireWorkerLock,
 	DEFAULT_ORPHAN_WRITE_POLL_MS,
 	getWorkerBusyState,
@@ -39,6 +40,8 @@ import {
 	PLANS_LOCK_FILE,
 	PROFILE_LOCK_FILE,
 	PUSH_PENDING_LOCK_FILE,
+	REPO_HOOKS_LOCK_FILE,
+	RUNTIME_REGISTRY_LOCK_FILE,
 	refreshIngestLockMtime,
 	refreshWorkerLockMtime,
 	releaseIngestLock,
@@ -48,6 +51,9 @@ import {
 	withPlansLock,
 	withProfileLock,
 	withPushPendingLock,
+	withRepoHooksLock,
+	withRuntimeRegistryLock,
+	withStrictProfileLock,
 } from "./Locks.js";
 
 /**
@@ -85,6 +91,10 @@ function profileLockPath(tempDir: string): string {
 	return join(tempDir, ".git", "jollimemory", PROFILE_LOCK_FILE);
 }
 
+function repoHooksLockPath(tempDir: string): string {
+	return join(tempDir, ".git", "jollimemory", REPO_HOOKS_LOCK_FILE);
+}
+
 describe("Locks", () => {
 	let tempDir: string;
 
@@ -112,6 +122,7 @@ describe("Locks", () => {
 		await rm(join(tempDir, ".git", "jollimemory", ORPHAN_WRITE_LOCK_FILE), { force: true });
 		await rm(plansLockPath(tempDir), { force: true });
 		await rm(profileLockPath(tempDir), { force: true });
+		await rm(repoHooksLockPath(tempDir), { force: true });
 	});
 
 	afterEach(async () => {
@@ -718,6 +729,59 @@ describe("Locks", () => {
 			releaseFirst();
 			await second;
 			expect(order).toEqual(["first-enter", "first-exit", "second-enter"]);
+		});
+	});
+
+	describe("strict enablement locks", () => {
+		it("acquireRepoHooksLock returns a release handle in the shared repo directory", async () => {
+			const handle = await acquireRepoHooksLock(tempDir);
+			expect(handle).not.toBeNull();
+			await expect(stat(repoHooksLockPath(tempDir))).resolves.toBeDefined();
+			await handle?.release();
+			await expect(stat(repoHooksLockPath(tempDir))).rejects.toThrow();
+		});
+
+		it("withRepoHooksLock returns values and releases on throw", async () => {
+			const result = await withRepoHooksLock(tempDir, async () => 42);
+			expect(result).toEqual({ acquired: true, value: 42 });
+			await expect(
+				withRepoHooksLock(tempDir, async () => {
+					throw new Error("boom");
+				}),
+			).rejects.toThrow("boom");
+			await expect(stat(repoHooksLockPath(tempDir))).rejects.toThrow();
+		});
+
+		it("strict repo lock timeout does not run the callback", async () => {
+			await mkdir(join(tempDir, ".git", "jollimemory"), { recursive: true });
+			await writeFile(repoHooksLockPath(tempDir), String(process.pid));
+			const body = vi.fn();
+			const result = await withRepoHooksLock(tempDir, body, { timeoutMs: 30, pollMs: 10 });
+			expect(result).toEqual({ acquired: false });
+			expect(body).not.toHaveBeenCalled();
+		});
+
+		it("runtime registry lock is strict and releases after success", async () => {
+			const globalDir = join(tempDir, "global-runtime");
+			const result = await withRuntimeRegistryLock(async () => "ok", { globalDir });
+			expect(result).toEqual({ acquired: true, value: "ok" });
+			await expect(stat(join(globalDir, RUNTIME_REGISTRY_LOCK_FILE))).rejects.toThrow();
+
+			await writeFile(join(globalDir, RUNTIME_REGISTRY_LOCK_FILE), String(process.pid));
+			const body = vi.fn();
+			expect(await withRuntimeRegistryLock(body, { globalDir, timeoutMs: 30, pollMs: 10 })).toEqual({
+				acquired: false,
+			});
+			expect(body).not.toHaveBeenCalled();
+		});
+
+		it("strict profile lock timeout does not run the callback", async () => {
+			await mkdir(dirname(profileLockPath(tempDir)), { recursive: true });
+			await writeFile(profileLockPath(tempDir), String(process.pid));
+			const body = vi.fn();
+			const result = await withStrictProfileLock(tempDir, body, { timeoutMs: 30, pollMs: 10 });
+			expect(result).toEqual({ acquired: false });
+			expect(body).not.toHaveBeenCalled();
 		});
 	});
 

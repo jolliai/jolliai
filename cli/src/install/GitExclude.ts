@@ -18,8 +18,9 @@
  * themselves still get written; the user just may see them in `git status`.
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { dirname, join, posix as posixPath, win32 as win32Path } from "node:path";
+import { atomicWriteFile } from "../core/AtomicWrite.js";
 import { createLogger } from "../Logger.js";
 import { execFileAsyncHidden } from "../util/Subprocess.js";
 
@@ -135,7 +136,7 @@ export async function updateGitExclude(projectDir: string, paths: ReadonlyArray<
 
 	try {
 		await mkdir(dirname(excludePath), { recursive: true });
-		await writeFile(excludePath, updated, "utf-8");
+		await atomicWriteFile(excludePath, updated);
 		log.info("Updated %s with %d Jolli skill exclude paths", excludePath, paths.length);
 		return true;
 		/* v8 ignore start -- defensive: write failure on read-only fs / EPERM */
@@ -156,7 +157,7 @@ export async function updateGitExclude(projectDir: string, paths: ReadonlyArray<
  * sets:
  *   - A full `jolli enable` owns the complete skill/MCP set and uses REPLACE so
  *     dropping a skill from {@link SKILL_GIT_EXCLUDE_PATHS} removes its line.
- *   - The Claude Code plugin's `enable --git-hooks-only` re-runs on every
+ *   - The Claude Code plugin bootstrap re-runs on every
  *     SessionStart and only knows its own one umbrella entry. If it used REPLACE
  *     it would shrink a block a prior full `jolli enable` populated, un-hiding
  *     those paths in `git status` and churning the file every session. UNION
@@ -192,7 +193,7 @@ export async function addGitExcludePaths(projectDir: string, paths: ReadonlyArra
 
 	try {
 		await mkdir(dirname(excludePath), { recursive: true });
-		await writeFile(excludePath, updated, "utf-8");
+		await atomicWriteFile(excludePath, updated);
 		log.info("Merged %d Jolli skill exclude path(s) into %s", paths.length, excludePath);
 		return true;
 		/* v8 ignore start -- defensive: write failure on read-only fs / EPERM */
@@ -247,7 +248,7 @@ export async function removeGitExcludePaths(
 	}
 
 	try {
-		await writeFile(excludePath, updated, "utf-8");
+		await atomicWriteFile(excludePath, updated);
 		log.info("Removed %d Jolli exclude path(s) from %s", pathsToRemove.length, excludePath);
 		return true;
 		/* v8 ignore start -- defensive: write failure on read-only fs / EPERM */

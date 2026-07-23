@@ -22,7 +22,6 @@ const h = vi.hoisted(() => ({
 	getGlobalConfigDir: vi.fn(),
 	loadUserProfile: vi.fn(),
 	saveUserProfile: vi.fn(),
-	writeManualDisableFlag: vi.fn(),
 }));
 
 vi.mock("../auth/AuthConfig.js", () => ({ loadAuthToken: h.loadAuthToken, getJolliUrl: h.getJolliUrl }));
@@ -33,7 +32,6 @@ vi.mock("../core/SessionTracker.js", () => ({
 	saveConfigScoped: h.saveConfigScoped,
 	getGlobalConfigDir: h.getGlobalConfigDir,
 }));
-vi.mock("../core/RepoProfile.js", () => ({ writeManualDisableFlag: h.writeManualDisableFlag }));
 vi.mock("../core/StorageFactory.js", () => ({ createStorage: h.createStorage }));
 vi.mock("../core/SummaryStore.js", () => ({
 	getSummaryCount: h.getSummaryCount,
@@ -247,11 +245,8 @@ describe("GuidedFrontDoor", () => {
 		h.getSummaryCount.mockResolvedValue(5);
 		await runGuidedFrontDoor();
 
-		expect(h.install).toHaveBeenCalledWith("/repo", { source: "cli" });
+		expect(h.install).toHaveBeenCalledWith("/repo", { source: "cli", clearManualDisableOnSuccess: true });
 		expect(h.track).toHaveBeenCalledWith("surface_enabled", { trigger: "cli" });
-		// Enabling via the front door must clear the repo-wide manual-disable opt-out,
-		// otherwise doctor/VS Code would still treat the repo as disabled.
-		expect(h.writeManualDisableFlag).toHaveBeenCalledWith("/repo", false);
 		expect(h.triggerPendingPushRetry).toHaveBeenCalledWith("/repo", "cli-front-door");
 		expect(h.runSpaceSyncStep).toHaveBeenCalledWith("/repo");
 		expect(out()).toContain("5 memories");
@@ -264,18 +259,7 @@ describe("GuidedFrontDoor", () => {
 		h.promptText.mockResolvedValue("y");
 		h.install.mockResolvedValue({ success: false, message: "boom", warnings: [] });
 		await runGuidedFrontDoor();
-		expect(h.writeManualDisableFlag).not.toHaveBeenCalled();
-	});
-
-	it("warns but does not fail when writeManualDisableFlag rejects after a successful install", async () => {
-		h.isGitHookInstalled.mockResolvedValue(false);
-		h.promptText.mockResolvedValue("y");
-		h.getSummaryCount.mockResolvedValue(5);
-		h.writeManualDisableFlag.mockRejectedValueOnce(new Error("disk full"));
-		await runGuidedFrontDoor();
-		// Enable still succeeded — hooks installed, just the opt-out clear failed.
-		expect(warns.some((w) => w.includes("could not clear the manual-disable flag"))).toBe(true);
-		expect(warns.some((w) => w.includes("Run `jolli enable` again"))).toBe(true);
+		expect(h.install).toHaveBeenCalledWith("/repo", { source: "cli", clearManualDisableOnSuccess: true });
 	});
 
 	it("just enabled a fresh repo (no memories yet) → 0 memories", async () => {
@@ -291,7 +275,7 @@ describe("GuidedFrontDoor", () => {
 		h.isGitHookInstalled.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("");
 		await runGuidedFrontDoor();
-		expect(h.install).toHaveBeenCalledWith("/repo", { source: "cli" });
+		expect(h.install).toHaveBeenCalledWith("/repo", { source: "cli", clearManualDisableOnSuccess: true });
 	});
 
 	it("not enabled + [Y/n]=n → no install, early return", async () => {

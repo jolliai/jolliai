@@ -244,7 +244,7 @@ describe("addGitExcludePaths", () => {
 		const full = ["/.agents/skills/jolli-recall/", "/.agents/skills/jolli-search/", "/.claude/skills/jolli/"];
 		await updateGitExclude(tempDir, full);
 
-		// The plugin's git-hooks-only path adds only its umbrella entry.
+		// The plugin's repo-hooks-only path adds only its umbrella entry.
 		await addGitExcludePaths(tempDir, ["/.claude/skills/jolli/"]);
 
 		const excludePath = (await resolveGitExcludePath(tempDir)) as string;

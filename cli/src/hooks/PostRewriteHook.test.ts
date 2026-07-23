@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Use vi.hoisted so mockCreateInterface is available when vi.mock factory runs (hoisting issue)
-const { mockCreateInterface, mockExistsSync, mockUnlinkSync } = vi.hoisted(() => ({
+const { mockCreateInterface, mockExistsSync, mockReadManualDisableFlag, mockUnlinkSync } = vi.hoisted(() => ({
 	mockCreateInterface: vi.fn(),
 	mockExistsSync: vi.fn(),
+	mockReadManualDisableFlag: vi.fn().mockResolvedValue(false),
 	mockUnlinkSync: vi.fn(),
 }));
 
@@ -26,6 +27,10 @@ vi.mock("../core/GitOps.js", () => ({
 
 vi.mock("../core/SessionTracker.js", () => ({
 	enqueueGitOperation: vi.fn(),
+}));
+
+vi.mock("../core/RepoProfile.js", () => ({
+	readManualDisableFlag: mockReadManualDisableFlag,
 }));
 
 vi.mock("../core/Locks.js", () => ({
@@ -77,6 +82,15 @@ describe("PostRewriteHook", () => {
 		vi.mocked(getCurrentBranch).mockResolvedValue("");
 		// Default: no plugin-source file
 		mockExistsSync.mockReturnValue(false);
+		mockReadManualDisableFlag.mockResolvedValue(false);
+	});
+
+	it("does not enqueue while the repo is manually disabled", async () => {
+		mockReadManualDisableFlag.mockResolvedValue(true);
+		setStdinLines(["aaaa1111 bbbb2222"]);
+		await handlePostRewriteHook("amend", "/test/project");
+		expect(enqueueGitOperation).not.toHaveBeenCalled();
+		expect(launchWorker).not.toHaveBeenCalled();
 	});
 
 	// ── amend ──────────────────────────────────────────────────────────────

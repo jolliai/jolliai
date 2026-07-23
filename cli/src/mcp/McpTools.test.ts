@@ -499,9 +499,7 @@ describe("buildStatusSummary", () => {
 		expect(r.integrations).toEqual([]);
 	});
 
-	it("treats the Claude hook as active in plugin mode even when settings.json has no hook", () => {
-		// Claude Code plugin: hooks come from the manifest, so claudeHookInstalled
-		// (a settings-file probe) is false — but isClaudePlugin flips it to active.
+	it("does not treat the bootstrap-only plugin manifest as an active business hook", () => {
 		const r = buildStatusSummary(
 			makeStatus({
 				gitHookInstalled: true,
@@ -512,9 +510,9 @@ describe("buildStatusSummary", () => {
 			}),
 			{ version: "1", account, isClaudePlugin: true },
 		);
-		expect(r.hooks.summary).toBe("5 Git + 2 Claude");
-		expect(r.hooks.claude).toBe(true);
-		expect(r.integrations).toEqual([{ name: "Claude", detected: true, status: "hook installed (4 sessions)" }]);
+		expect(r.hooks.summary).toBe("5 Git");
+		expect(r.hooks.claude).toBe(false);
+		expect(r.integrations).toEqual([{ name: "Claude", detected: true, status: "hook not installed" }]);
 	});
 
 	it("describes each detected integration and combines Copilot CLI + Chat session counts", () => {

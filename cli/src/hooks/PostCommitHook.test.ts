@@ -29,6 +29,10 @@ vi.mock("../core/GitOps.js", () => ({
 	getProjectRootDir: vi.fn().mockImplementation((cwd: string) => Promise.resolve(cwd)),
 }));
 
+vi.mock("../core/RepoProfile.js", () => ({
+	readManualDisableFlag: vi.fn().mockResolvedValue(false),
+}));
+
 vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../core/SessionTracker.js")>();
 	return {
@@ -368,6 +372,7 @@ import { enqueueIngestOperation } from "../core/IngestTrigger.js";
 import { acquireWorkerLock, releaseWorkerLock } from "../core/Locks.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import {
 	associateNoteWithCommit,
 	associatePlanWithCommit,
@@ -386,7 +391,7 @@ import { generateSummary } from "../core/Summarizer.js";
 import { getSummary, mergeManyToOne, migrateOneToOne, storeSummary } from "../core/SummaryStore.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
 import type { CommitSummary } from "../Types.js";
-import { runWorker } from "./PostCommitHook.js";
+import { runPostCommitHook, runWorker } from "./PostCommitHook.js";
 
 /** Creates a minimal mock SummaryResult (returned by generateSummary) */
 function createMockResult(): SummaryResult {
@@ -509,10 +514,17 @@ describe("PostCommitHook", () => {
 		// Default: empty queue (individual tests or setupFullPipeline set their own entries)
 		vi.mocked(dequeueAllGitOperations).mockResolvedValue([]);
 		vi.mocked(deleteQueueEntry).mockResolvedValue(undefined);
+		vi.mocked(readManualDisableFlag).mockResolvedValue(false);
 	});
 
 	// Note: rebase skip is now handled in postCommitEntry(), not runWorker().
 	// See PostRewriteHook.test.ts for rebase enqueue tests.
+
+	it("does not enqueue a commit while the repo is manually disabled", async () => {
+		vi.mocked(readManualDisableFlag).mockResolvedValue(true);
+		await expect(runPostCommitHook("/test/project")).resolves.toBeNull();
+		expect(spawn).not.toHaveBeenCalled();
+	});
 
 	it("debounce-enqueues a post-commit ingest after processing a commit", async () => {
 		setupFullPipeline();

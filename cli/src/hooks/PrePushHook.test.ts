@@ -7,7 +7,10 @@ import { getIndexEntryMap, getSummary } from "../core/SummaryStore.js";
 import { execFileAsyncHidden } from "../util/Subprocess.js";
 import { PRE_PUSH_SYNC_BUDGET_MS, parsePushRefs, prePushEntry } from "./PrePushHook.js";
 
+const mockReadManualDisableFlag = vi.hoisted(() => vi.fn().mockResolvedValue(false));
+
 vi.mock("../core/SessionTracker.js", () => ({ loadConfig: vi.fn() }));
+vi.mock("../core/RepoProfile.js", () => ({ readManualDisableFlag: mockReadManualDisableFlag }));
 vi.mock("../core/PushPendingStore.js", () => ({ mergeEntries: vi.fn() }));
 vi.mock("../core/PushExecutor.js", () => ({ processPrePushInline: vi.fn() }));
 vi.mock("../core/StorageFactory.js", () => ({ createStorage: vi.fn() }));
@@ -40,6 +43,7 @@ beforeEach(() => {
 	vi.mocked(getIndexEntryMap).mockResolvedValue(new Map());
 	vi.mocked(getSummary).mockResolvedValue(null);
 	vi.mocked(execFileAsyncHidden).mockResolvedValue({ stdout: "c1\nc2\n", stderr: "" });
+	mockReadManualDisableFlag.mockResolvedValue(false);
 });
 
 afterEach(() => {
@@ -56,6 +60,13 @@ describe("parsePushRefs", () => {
 });
 
 describe("prePushEntry", () => {
+	it("does not record pending pushes while the repo is manually disabled", async () => {
+		mockReadManualDisableFlag.mockResolvedValue(true);
+		await prePushEntry(CWD, `refs/heads/x ${LOCAL} refs/heads/x ${REMOTE}\n`, REMOTE_NAME);
+		expect(loadConfig).not.toHaveBeenCalled();
+		expect(mergeEntries).not.toHaveBeenCalled();
+	});
+
 	it("no-ops entirely when syncOnPush is false (no file write, no inline sync)", async () => {
 		vi.mocked(loadConfig).mockResolvedValue({ jolliApiKey: "sk-jol-x", syncOnPush: false });
 		await prePushEntry(CWD, `refs/heads/x ${LOCAL} refs/heads/x ${REMOTE}\n`, REMOTE_NAME);

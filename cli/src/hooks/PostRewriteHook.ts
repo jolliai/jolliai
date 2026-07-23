@@ -27,6 +27,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { getCurrentBranch } from "../core/GitOps.js";
 import { isWorkerLockHeld } from "../core/Locks.js";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { enqueueGitOperation } from "../core/SessionTracker.js";
 import { getCurrentTraceId, runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
 import { createLogger, getJolliMemoryDir, setLogDir } from "../Logger.js";
@@ -50,6 +51,10 @@ interface HashMapping {
 export async function handlePostRewriteHook(command: string, cwd: string): Promise<void> {
 	setLogDir(cwd);
 	log.info("=== Post-rewrite hook started (command: %s) ===", command);
+	if (await readManualDisableFlag(cwd)) {
+		log.info("Repository is manually disabled — skipping post-rewrite enqueue");
+		return;
+	}
 
 	const mappings = await readStdinMappings();
 	if (mappings.length === 0) {

@@ -128,6 +128,7 @@ describe("RepoProfile", () => {
 
 		it("defaults to false when nothing is set", async () => {
 			expect(await readManualDisableFlag(cwd)).toBe(false);
+			expect(await readRepoProfile(cwd)).toEqual({ manuallyDisabled: false });
 		});
 
 		it("round-trips true/false through profile.json", async () => {
@@ -197,7 +198,6 @@ describe("RepoProfile", () => {
 		it("falls back to checking only cwd when not a git repo (listWorktrees fails)", async () => {
 			const nonGit = mkdtempSync(join(tmpdir(), "jolli-repoprofile-nogit-"));
 			try {
-				expect(await readManualDisableFlag(nonGit)).toBe(false);
 				mkdirSync(join(nonGit, ".jolli", "jollimemory"), { recursive: true });
 				writeFileSync(legacyMarker(nonGit), new Date(0).toISOString());
 				expect(await readManualDisableFlag(nonGit)).toBe(true);

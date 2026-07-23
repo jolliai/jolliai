@@ -6,8 +6,6 @@
  * integration while sharing the common matcher/identifier infrastructure.
  */
 
-import { isValidSourceTag } from "./DistPathResolver.js";
-
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 /** Result of a single hook install/remove operation. */
@@ -29,30 +27,12 @@ const RUN_HOOK_SHELL = '"$HOME/.jolli/jollimemory/run-hook"';
 /**
  * Build a hook command that calls run-hook.
  *
- * `preferSource` (e.g. "claude-plugin") prepends `JOLLI_DIST_PREFER_SOURCE=<source>`
- * so the hook SOFT-prefers that source: resolve-dist-path picks it only when it is
- * present, complete, and already at the top version, otherwise it falls through to
- * normal cross-source selection. Used by the Claude Code plugin's git-hooks-only
- * install so its dist wins version ties without shadowing a strictly-higher source.
- * Omitted for shared installs (CLI / VS Code), which keep the plain cross-source
- * resolver. (This replaced the former hard `JOLLI_DIST_SOURCE` pin.)
+ * Hook commands are source-neutral. Runtime selection happens only inside the
+ * shared resolver, so every surface writes byte-identical repo hooks.
  */
-export function buildHookCommand(hookType: string, args = "", preferSource?: string): string {
+export function buildHookCommand(hookType: string, args = ""): string {
 	const suffix = args ? ` ${args}` : "";
-	// Re-assert the tag shape at THIS write boundary, not only at the `--source-tag`
-	// CLI flag: this is the line that interpolates the tag into a generated,
-	// auto-executing shell hook, so it must never trust the caller. isValidSourceTag
-	// forbids quotes / whitespace / shell metacharacters, so the single-quoted value
-	// below cannot be broken out of or injected into. `install()` validates the same
-	// tag once up front and fails all-or-nothing, so in the normal flow this throw is
-	// unreachable defense-in-depth; it deliberately THROWS (rather than returning, like
-	// installDistPath) because emitting an unsafe hook line is worse than aborting — a
-	// direct caller that skips the up-front check still gets a hard, loud failure.
-	if (preferSource !== undefined && !isValidSourceTag(preferSource)) {
-		throw new Error(`Refusing to build hook command with unsafe source tag: ${JSON.stringify(preferSource)}`);
-	}
-	const prefer = preferSource ? `JOLLI_DIST_PREFER_SOURCE='${preferSource}' ` : "";
-	return `${prefer}${RUN_HOOK_SHELL} ${hookType}${suffix}`;
+	return `${RUN_HOOK_SHELL} ${hookType}${suffix}`;
 }
 
 // ─── Hook identifier constants ──────────────────────────────────────────────
@@ -65,9 +45,9 @@ export function buildHookCommand(hookType: string, args = "", preferSource?: str
  * are recognized so a current install can detect and replace legacy hook
  * sections during upgrade.
  */
-export const STOP_HOOK_IDENTIFIERS = ["run-hook", "StopHook"] as const;
+export const STOP_HOOK_IDENTIFIERS = ["run-hook", "StopHook", "jollimemory-hooks.jar"] as const;
 export const SESSION_START_HOOK_IDENTIFIERS = ["run-hook", "SessionStartHook"] as const;
-export const GEMINI_HOOK_IDENTIFIERS = ["run-hook", "GeminiAfterAgentHook"] as const;
+export const GEMINI_HOOK_IDENTIFIERS = ["run-hook", "GeminiAfterAgentHook", "jollimemory-hooks.jar"] as const;
 
 // ─── Matcher helpers ────────────────────────────────────────────────────────
 

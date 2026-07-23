@@ -810,7 +810,10 @@ describe("CLI", () => {
 
 		it("should pass cwd to install", async () => {
 			await main(["enable", "--cwd", "/tmp/test-project"]);
-			expect(vi.mocked(install)).toHaveBeenCalledWith("/tmp/test-project", { source: "cli" });
+			expect(vi.mocked(install)).toHaveBeenCalledWith(
+				"/tmp/test-project",
+				expect.objectContaining({ source: "cli", clearManualDisableOnSuccess: true }),
+			);
 		});
 
 		it("should no-op when spawned by the local-agent backend (re-entry guard)", async () => {
@@ -826,12 +829,32 @@ describe("CLI", () => {
 			}
 		});
 
-		it("clears the repo-wide manual-disable opt-out on a successful enable", async () => {
+		it("asks the locked installer to clear the repo-wide opt-out", async () => {
 			await main(["enable", "--cwd", "/tmp/test-project"]);
-			expect(writeManualDisableFlag).toHaveBeenCalledWith("/tmp/test-project", false);
+			expect(install).toHaveBeenCalledWith(
+				"/tmp/test-project",
+				expect.objectContaining({
+					automatic: undefined,
+					respectManualDisable: undefined,
+					clearManualDisableOnSuccess: true,
+				}),
+			);
 		});
 
-		it("does NOT clear the opt-out when the install fails", async () => {
+		it("automatic surface enable respects manual disable and uses short current-worktree reconciliation", async () => {
+			await main(["enable", "--automatic", "--yes", "--source-tag", "intellij", "--cwd", "/tmp/test-project"]);
+			expect(install).toHaveBeenCalledWith(
+				"/tmp/test-project",
+				expect.objectContaining({
+					automatic: true,
+					respectManualDisable: true,
+					clearManualDisableOnSuccess: false,
+					sourceTag: "intellij",
+				}),
+			);
+		});
+
+		it("delegates failed enable without a lock-external profile write", async () => {
 			vi.mocked(install).mockResolvedValueOnce({ success: false, message: "Failed", warnings: [] });
 			await main(["enable"]);
 			expect(writeManualDisableFlag).not.toHaveBeenCalled();
@@ -839,18 +862,10 @@ describe("CLI", () => {
 
 		it("does NOT touch the opt-out for --integrations-only enable", async () => {
 			await main(["enable", "--integrations-only"]);
-			expect(writeManualDisableFlag).not.toHaveBeenCalled();
-		});
-
-		it("warns but does not fail when clearing the manual-disable opt-out throws after a successful install", async () => {
-			vi.mocked(writeManualDisableFlag).mockRejectedValueOnce(new Error("disk full"));
-			await main(["enable", "--cwd", "/tmp/test-project"]);
-			// Enable still succeeds (no exit code) — hooks are installed, only the opt-out clear failed.
-			expect(process.exitCode).toBeUndefined();
-			expect(console.warn).toHaveBeenCalledWith(
-				expect.stringContaining("could not clear the manual-disable flag"),
+			expect(install).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.objectContaining({ clearManualDisableOnSuccess: false }),
 			);
-			expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("Run `jolli enable` again"));
 		});
 
 		it("rejects an unsafe --source-tag before calling install", async () => {
@@ -860,8 +875,8 @@ describe("CLI", () => {
 			expect(console.error).toHaveBeenCalledWith(expect.stringContaining("--source-tag"));
 		});
 
-		it("rejects --integrations-only + --git-hooks-only as mutually exclusive", async () => {
-			await main(["enable", "--integrations-only", "--git-hooks-only", "--cwd", "/tmp/test-project"]);
+		it("rejects --integrations-only + --repo-hooks-only as mutually exclusive", async () => {
+			await main(["enable", "--integrations-only", "--repo-hooks-only", "--cwd", "/tmp/test-project"]);
 			expect(process.exitCode).toBe(1);
 			expect(install).not.toHaveBeenCalled();
 			expect(console.error).toHaveBeenCalledWith(expect.stringContaining("mutually exclusive"));
@@ -875,43 +890,16 @@ describe("CLI", () => {
 			);
 		});
 
-		it("emits a reloadSkills SessionStart signal on --git-hooks-only success with --reload-skills", async () => {
-			await main(["enable", "--git-hooks-only", "--reload-skills", "--cwd", "/tmp/test-project"]);
-			const stdoutWrites = vi.mocked(process.stdout.write).mock.calls.map((c) => String(c[0]));
-			const signal = stdoutWrites.find((w) => w.includes("reloadSkills"));
-			expect(signal).toBeDefined();
-			// Pure JSON on exit 0 — Claude Code parses it as structured hook output
-			// (not injected into context) and re-scans skills after SessionStart hooks.
-			expect(JSON.parse(signal as string)).toEqual({
-				hookSpecificOutput: { hookEventName: "SessionStart", reloadSkills: true },
-			});
-			// The git-hooks-only stdout stream must be exactly one JSON write — a
-			// stray console.log on this path would corrupt Claude Code's JSON parse.
-			expect(stdoutWrites).toHaveLength(1);
+		it("forwards --repo-hooks-only and stays silent on success", async () => {
+			await main(["enable", "--repo-hooks-only", "--cwd", "/tmp/test-project"]);
+			expect(install).toHaveBeenCalledWith("/tmp/test-project", expect.objectContaining({ repoHooksOnly: true }));
 		});
 
-		it("stays silent (no reloadSkills signal) on --git-hooks-only without --reload-skills", async () => {
-			await main(["enable", "--git-hooks-only", "--cwd", "/tmp/test-project"]);
-			const wroteSignal = vi
-				.mocked(process.stdout.write)
-				.mock.calls.map((c) => String(c[0]))
-				.some((w) => w.includes("reloadSkills"));
-			expect(wroteSignal).toBe(false);
-		});
-
-		it("skips the --git-hooks-only bootstrap when the repo is manually disabled", async () => {
-			// The Claude Code plugin re-runs this bootstrap on every SessionStart;
-			// a prior `jolli disable` (repo-wide opt-out) must not be silently
-			// reinstalled. Bail before install(), silently, exit 0.
-			vi.mocked(readManualDisableFlag).mockResolvedValueOnce(true);
-			await main(["enable", "--git-hooks-only", "--reload-skills", "--cwd", "/tmp/test-project"]);
-			expect(install).not.toHaveBeenCalled();
-			expect(process.exitCode).not.toBe(1);
-			const wroteSignal = vi
-				.mocked(process.stdout.write)
-				.mock.calls.map((c) => String(c[0]))
-				.some((w) => w.includes("reloadSkills"));
-			expect(wroteSignal).toBe(false);
+		it("sets exit code and reports when --repo-hooks-only reconciliation fails", async () => {
+			vi.mocked(install).mockResolvedValueOnce({ success: false, message: "hook write blocked", warnings: [] });
+			await main(["enable", "--repo-hooks-only", "--cwd", "/tmp/test-project"]);
+			expect(process.exitCode).toBe(1);
+			expect(console.error).toHaveBeenCalledWith(expect.stringContaining("repo-hooks reconciliation failed"));
 		});
 	});
 
@@ -932,29 +920,17 @@ describe("CLI", () => {
 			expect(process.exitCode).toBe(1);
 		});
 
-		it("records the repo-wide manual-disable opt-out before uninstalling", async () => {
+		it("asks the locked uninstaller to persist the opt-out and preserve the menu", async () => {
 			await main(["disable", "--cwd", "/tmp/test-project"]);
-			expect(writeManualDisableFlag).toHaveBeenCalledWith("/tmp/test-project", true);
-		});
-
-		it("records the opt-out even when uninstall then fails (intent is durable)", async () => {
-			vi.mocked(uninstall).mockResolvedValueOnce({ success: false, message: "Failed", warnings: [] });
-			await main(["disable"]);
-			expect(writeManualDisableFlag).toHaveBeenCalledWith(expect.any(String), true);
+			expect(uninstall).toHaveBeenCalledWith(
+				"/tmp/test-project",
+				expect.objectContaining({ persistManualDisable: true, preserveMenu: true }),
+			);
 		});
 
 		it("does NOT record the opt-out for --integrations-only disable", async () => {
 			await main(["disable", "--integrations-only"]);
 			expect(writeManualDisableFlag).not.toHaveBeenCalled();
-		});
-
-		it("aborts (does not uninstall) and exits non-zero when the opt-out cannot be persisted", async () => {
-			// If the durable opt-out can't be written, removing hooks would leave a
-			// state that silently re-enables — so disable must change nothing.
-			vi.mocked(writeManualDisableFlag).mockRejectedValueOnce(new Error("EACCES"));
-			await main(["disable"]);
-			expect(uninstall).not.toHaveBeenCalled();
-			expect(process.exitCode).toBe(1);
 		});
 	});
 
@@ -3469,7 +3445,10 @@ describe("CLI", () => {
 
 			await main(["enable", "-y"]);
 
-			expect(install).toHaveBeenCalledWith(expect.any(String), { source: "cli" });
+			expect(install).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.objectContaining({ source: "cli", clearManualDisableOnSuccess: true }),
+			);
 		});
 
 		it("should run promptSetup after install when interactive", async () => {

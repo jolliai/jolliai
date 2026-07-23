@@ -6,6 +6,7 @@ const mockExistsSync = vi.fn();
 const mockInstallDistPath = vi.fn().mockResolvedValue(true);
 const mockInstallResolveScripts = vi.fn().mockResolvedValue(true);
 const mockMigrateLegacy = vi.fn().mockResolvedValue(false);
+const mockWithRuntimeRegistryLock = vi.fn(async (body: () => Promise<unknown>) => body());
 
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
@@ -19,6 +20,10 @@ vi.mock("./install/Installer.js", () => ({
 
 vi.mock("./install/DistPathResolver.js", () => ({
 	migrateLegacyDistPath: mockMigrateLegacy,
+}));
+
+vi.mock("./core/Locks.js", () => ({
+	withRuntimeRegistryLock: mockWithRuntimeRegistryLock,
 }));
 
 describe("PostInstall", () => {
@@ -46,6 +51,9 @@ describe("PostInstall", () => {
 		mockExistsSync.mockImplementation((p: string) => p.endsWith("dist-paths"));
 		await runPostInstall();
 		expect(mockInstallResolveScripts).toHaveBeenCalledTimes(1);
+		expect(mockWithRuntimeRegistryLock).toHaveBeenCalledWith(expect.any(Function), {
+			globalDir: expect.stringContaining(".jolli/jollimemory"),
+		});
 		expect(mockInstallDistPath).toHaveBeenCalledTimes(1);
 		expect(mockInstallDistPath).toHaveBeenCalledWith("cli", expect.any(String));
 	});

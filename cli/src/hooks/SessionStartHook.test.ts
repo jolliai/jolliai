@@ -36,6 +36,10 @@ vi.mock("../core/GitOps.js", () => ({
 	readFileFromBranch: vi.fn(),
 }));
 
+vi.mock("../core/RepoProfile.js", () => ({
+	readManualDisableFlag: vi.fn().mockResolvedValue(false),
+}));
+
 vi.mock("../core/SummaryTree.js", () => ({
 	collectAllTopics: vi.fn().mockReturnValue([]),
 }));
@@ -58,6 +62,7 @@ vi.mock("../Logger.js", () => ({
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readFileFromBranch } from "../core/GitOps.js";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig, saveConfig } from "../core/SessionTracker.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
@@ -94,6 +99,7 @@ function makeSummary(overrides: Partial<CommitSummary> = {}): CommitSummary {
 // Import after mocks
 const {
 	main,
+	buildSessionStartContext,
 	computeLoginReminder,
 	formatRecallSuggestion,
 	getLoginReminder,
@@ -109,6 +115,7 @@ describe("SessionStartHook", () => {
 		mockExecFileSync.mockReturnValue("feature/test-branch\n" as never);
 		mockReadFileFromBranch.mockResolvedValue(null);
 		mockExistsSync.mockReturnValue(false);
+		vi.mocked(readManualDisableFlag).mockResolvedValue(false);
 	});
 
 	// ─── Skip conditions ────────────────────────────────────────────────────
@@ -125,6 +132,18 @@ describe("SessionStartHook", () => {
 			writeSpy.mockRestore();
 			delete process.env.JOLLI_LOCAL_AGENT_CHILD;
 		}
+	});
+
+	it("should emit no context while the repo is manually disabled", async () => {
+		vi.mocked(readManualDisableFlag).mockResolvedValue(true);
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+		await main();
+
+		expect(mockExecFileSync).not.toHaveBeenCalled();
+		expect(mockGetIndex).not.toHaveBeenCalled();
+		expect(writeSpy).not.toHaveBeenCalled();
+		writeSpy.mockRestore();
 	});
 
 	it("should skip main/master/develop branches", async () => {
@@ -2170,5 +2189,95 @@ describe("getAuthFailureReminder", () => {
 		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
 		mockReadFileFromBranch.mockResolvedValue(null);
 		expect(await getAuthFailureReminder("/test", "claude-plugin")).toBeNull();
+	});
+});
+
+// The PluginBootstrap path (the ONLY caller that passes includePluginReminders:
+// true) mocks buildSessionStartContext wholesale, so these are the sole tests that
+// exercise the reminder-assembly branch end-to-end. Without them, deleting the
+// getAuthFailureReminder / getLoginReminder wiring inside buildSessionStartContext
+// would leave every test green.
+describe("buildSessionStartContext — plugin reminder assembly", () => {
+	const savedAnthropicKey = process.env.ANTHROPIC_API_KEY;
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		// The not-signed-in reminder is gated on hasLlmCredentials, which counts the
+		// ANTHROPIC_API_KEY env var — clear it so a dev machine's key can't suppress it.
+		delete process.env.ANTHROPIC_API_KEY;
+		mockExecFileSync.mockReturnValue("feature/test-branch\n" as never);
+		mockReadFileFromBranch.mockResolvedValue(null);
+		mockExistsSync.mockReturnValue(false);
+		mockLoadConfig.mockResolvedValue({});
+		vi.mocked(readManualDisableFlag).mockResolvedValue(false);
+	});
+
+	afterEach(() => {
+		if (savedAnthropicKey === undefined) {
+			delete process.env.ANTHROPIC_API_KEY;
+		} else {
+			process.env.ANTHROPIC_API_KEY = savedAnthropicKey;
+		}
+	});
+
+	it("assembles BOTH the auth-failure and not-signed-in reminders (includePluginReminders: true)", async () => {
+		// Newest commit failed on an expired local login → auth reminder fires.
+		mockGetIndex.mockResolvedValue(
+			makeIndex([
+				{
+					commitHash: "newest",
+					parentCommitHash: null,
+					commitMessage: "commit newest",
+					commitDate: "2026-03-29T12:00:00.000Z",
+					branch: "feature/test-branch",
+					generatedAt: "2026-03-29T12:00:00.000Z",
+				},
+			]),
+		);
+		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: "local-agent-auth" })));
+		// No credential + no dismiss marker → not-signed-in reminder fires too.
+		mockLoadConfig.mockResolvedValue({});
+		mockExistsSync.mockReturnValue(false);
+
+		const result = await buildSessionStartContext("/test", "claude-plugin", {
+			includeBriefing: false,
+			includePluginReminders: true,
+		});
+
+		expect(result).not.toBeNull();
+		// Auth-failure section (from getAuthFailureReminder).
+		expect(result).toContain("the Claude login used for local generation has expired");
+		// Not-signed-in section (from getLoginReminder → computeLoginReminder).
+		expect(result).toContain("/jolli:login");
+		// Ordered auth-failure first, then not-signed-in, joined by a blank line.
+		expect((result as string).indexOf("has expired")).toBeLessThan((result as string).indexOf("/jolli:login"));
+		expect(result).toContain("\n\n");
+	});
+
+	it("skips both reminders when includePluginReminders is false, even with reminder triggers present", async () => {
+		// Same triggering state as above — but the false gate must consult neither
+		// getAuthFailureReminder nor getLoginReminder, so the result is null.
+		mockGetIndex.mockResolvedValue(
+			makeIndex([
+				{
+					commitHash: "newest",
+					parentCommitHash: null,
+					commitMessage: "commit newest",
+					commitDate: "2026-03-29T12:00:00.000Z",
+					branch: "feature/test-branch",
+					generatedAt: "2026-03-29T12:00:00.000Z",
+				},
+			]),
+		);
+		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: "local-agent-auth" })));
+
+		const result = await buildSessionStartContext("/test", "claude-plugin", {
+			includeBriefing: false,
+			includePluginReminders: false,
+		});
+
+		expect(result).toBeNull();
+		// The reminder path never read the config/marker.
+		expect(mockLoadConfig).not.toHaveBeenCalled();
 	});
 });

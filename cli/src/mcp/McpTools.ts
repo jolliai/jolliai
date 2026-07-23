@@ -267,8 +267,8 @@ export function buildStatusSummary(
 	},
 ): StatusResult {
 	// Hook summary / runtime / integration rows are built from the shared helpers
-	// in StatusCommand so this tool and `jolli status` never drift. claudeHookActive
-	// folds the plugin-manifest hook the same way on both surfaces.
+	// in StatusCommand so this tool and `jolli status` never drift. The plugin
+	// manifest bootstrap does not count as a business Agent hook.
 	const claudeHookActive = resolveClaudeHookActive(status, ctx.isClaudePlugin);
 	const summary = buildHookSummary(status, claudeHookActive);
 	const runtime = buildHookRuntime(status) ?? null;

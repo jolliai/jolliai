@@ -60,6 +60,7 @@
  */
 
 import { mkdir, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { createLogger, getJolliMemoryDir } from "../Logger.js";
 import * as Subprocess from "../util/Subprocess.js";
@@ -121,6 +122,8 @@ export const PLANS_LOCK_FILE = "plans.lock";
 export const COMMIT_SELECTION_LOCK_FILE = "commit-selection.lock";
 export const PUSH_PENDING_LOCK_FILE = "push-pending.lock";
 export const PROFILE_LOCK_FILE = "profile.lock";
+export const REPO_HOOKS_LOCK_FILE = "repo-hooks.lock";
+export const RUNTIME_REGISTRY_LOCK_FILE = "runtime-registry.lock";
 
 /** Default wait budget for `acquireOrphanWriteLock` (background callers). */
 export const DEFAULT_ORPHAN_WRITE_TIMEOUT_MS = 1000;
@@ -156,6 +159,8 @@ export const DEFAULT_PROFILE_LOCK_TIMEOUT_MS = 5000;
 
 /** Default poll interval while waiting for `profile.lock`. */
 export const DEFAULT_PROFILE_LOCK_POLL_MS = 25;
+export const DEFAULT_REPO_HOOKS_LOCK_TIMEOUT_MS = 5000;
+export const DEFAULT_RUNTIME_REGISTRY_LOCK_TIMEOUT_MS = 5000;
 
 /** Optional knobs for `acquireOrphanWriteLock`. */
 export interface OrphanWriteLockOpts {
@@ -540,5 +545,96 @@ export async function withProfileLock<T>(
 		return await fn();
 	} finally {
 		if (acquired) await releaseIfOwned(lockPath, PROFILE_LOCK_FILE);
+	}
+}
+
+export interface StrictLockResult<T> {
+	readonly acquired: boolean;
+	readonly value?: T;
+}
+
+export interface RuntimeRegistryLockOpts extends OrphanWriteLockOpts {
+	readonly globalDir?: string;
+}
+
+export interface StrictLockHandle {
+	readonly release: () => Promise<void>;
+}
+
+export async function acquireRepoHooksLock(
+	cwd: string,
+	opts: OrphanWriteLockOpts = {},
+): Promise<StrictLockHandle | null> {
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_REPO_HOOKS_LOCK_TIMEOUT_MS;
+	const pollMs = opts.pollMs ?? DEFAULT_PROFILE_LOCK_POLL_MS;
+	const dir = await ensureSharedLockDir(cwd);
+	const lockPath = join(dir, REPO_HOOKS_LOCK_FILE);
+	const acquired = await acquireWithPoll(lockPath, { timeoutMs, pollMs });
+	if (!acquired) return null;
+	return { release: () => releaseIfOwned(lockPath, REPO_HOOKS_LOCK_FILE) };
+}
+
+/**
+ * Serialises repo enable/disable/reconcile across every worktree. Unlike the
+ * older state-store locks, this is deliberately strict: timeout means the
+ * callback is not run, because an unlocked automatic enable could race a
+ * durable manual disable and silently reverse the user's choice.
+ */
+export async function withRepoHooksLock<T>(
+	cwd: string,
+	fn: () => Promise<T>,
+	opts: OrphanWriteLockOpts = {},
+): Promise<StrictLockResult<T>> {
+	const handle = await acquireRepoHooksLock(cwd, opts);
+	if (!handle) return { acquired: false };
+	try {
+		return { acquired: true, value: await fn() };
+	} finally {
+		await handle.release();
+	}
+}
+
+/**
+ * Strict variant for durable lifecycle decisions stored in profile.json.
+ * Unlike withProfileLock, a timeout never runs the callback unlocked.
+ */
+export async function withStrictProfileLock<T>(
+	cwd: string,
+	fn: () => Promise<T>,
+	opts: OrphanWriteLockOpts = {},
+): Promise<StrictLockResult<T>> {
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_PROFILE_LOCK_TIMEOUT_MS;
+	const pollMs = opts.pollMs ?? DEFAULT_PROFILE_LOCK_POLL_MS;
+	const dir = await ensureSharedLockDir(cwd);
+	const lockPath = join(dir, PROFILE_LOCK_FILE);
+	const acquired = await acquireWithPoll(lockPath, { timeoutMs, pollMs });
+	if (!acquired) return { acquired: false };
+	try {
+		return { acquired: true, value: await fn() };
+	} finally {
+		await releaseIfOwned(lockPath, PROFILE_LOCK_FILE);
+	}
+}
+
+/**
+ * Serialises the machine-global dispatcher and dist-path registry across repos
+ * and surfaces. It is intentionally separate from repo-hooks.lock; callers
+ * must not hold both at once.
+ */
+export async function withRuntimeRegistryLock<T>(
+	fn: () => Promise<T>,
+	opts: RuntimeRegistryLockOpts = {},
+): Promise<StrictLockResult<T>> {
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_RUNTIME_REGISTRY_LOCK_TIMEOUT_MS;
+	const pollMs = opts.pollMs ?? DEFAULT_PROFILE_LOCK_POLL_MS;
+	const dir = opts.globalDir ?? join(homedir(), ".jolli", "jollimemory");
+	await mkdir(dir, { recursive: true });
+	const lockPath = join(dir, RUNTIME_REGISTRY_LOCK_FILE);
+	const acquired = await acquireWithPoll(lockPath, { timeoutMs, pollMs });
+	if (!acquired) return { acquired: false };
+	try {
+		return { acquired: true, value: await fn() };
+	} finally {
+		await releaseIfOwned(lockPath, RUNTIME_REGISTRY_LOCK_FILE);
 	}
 }

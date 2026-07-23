@@ -74,6 +74,7 @@ import { evaluatePlanProgress } from "../core/PlanProgressEvaluator.js";
 import { formatPlansBlock } from "../core/PlanPromptFormatter.js";
 import { estimateCostUsd, PRICES_AS_OF } from "../core/Pricing.js";
 import { triggerPushForNewSummaries } from "../core/PushExecutor.js";
+import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { deleteReferenceMarkdown, readReferenceMarkdown } from "../core/references/ReferenceStore.js";
 import { getRegistry } from "../core/references/SourceDefinitionRegistry.js";
 import { renderBlock } from "../core/references/SourceEngine.js";
@@ -360,6 +361,10 @@ export function buildWorkerStartupBanner(info: {
  */
 export async function runWorker(cwd: string, force = false): Promise<void> {
 	setLogDir(cwd);
+	if (await readManualDisableFlag(cwd)) {
+		log.info("Queue worker skipped — repository manually disabled");
+		return;
+	}
 	const drainStart = Date.now();
 
 	/* v8 ignore start -- compile-time global fallbacks: vite (tests) and esbuild (builds) always define these, so the `: "…"` arms are unreachable from unit tests; mirrors ClientHeader.ts */

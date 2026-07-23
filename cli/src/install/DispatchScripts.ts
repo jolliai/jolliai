@@ -10,9 +10,10 @@
  * Extracted from Installer.ts for single-responsibility.
  */
 
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { atomicWriteFile } from "../core/AtomicWrite.js";
 import { createLogger } from "../Logger.js";
 import { SOURCE_PREFERENCE_ORDER } from "./DistPathResolver.js";
 
@@ -53,8 +54,8 @@ const RESOLVE_DIST_PATH_CONTENT = `#!/bin/bash
 # the bundled @jolli.ai/cli core is identical at equal versions — the tie-break
 # only makes the winner deterministic and favours the canonical CLI build.
 #
-# When JOLLI_DIST_PREFER_SOURCE is set (the Claude Code plugin's git hooks and CLI
-# commands set it to "claude-plugin"), that source is SOFT-preferred: it wins a
+# When JOLLI_DIST_PREFER_SOURCE is set (for example by Claude Plugin CLI
+# commands), that source is SOFT-preferred: it wins a
 # version TIE — selected only if present, complete, and already at the top version
 # BEST_VER — but never beats a strictly-higher version from another source, and a
 # missing / incomplete / older prefer silently falls through to normal cross-source
@@ -117,8 +118,8 @@ if [ -d "$DIR/dist-paths" ]; then
   done
 fi
 
-# Soft prefer — when JOLLI_DIST_PREFER_SOURCE names a source (the Claude Code plugin
-# sets it to "claude-plugin" on its git hooks and CLI recipes), that source WINS a
+# Soft prefer — when JOLLI_DIST_PREFER_SOURCE names a source (the Claude Code
+# plugin sets it to "claude-plugin" for its CLI recipes), that source WINS a
 # version tie ahead of the global preference order below: it is chosen only if it is
 # present, complete, AND already at the top version BEST_VER. A strictly-higher
 # version elsewhere has already won BEST_VER in Pass 1, so prefer never overrides it;
@@ -263,7 +264,7 @@ async function writeIfChanged(filePath: string, content: string): Promise<void> 
 		await chmod(filePath, 0o755);
 		return;
 	}
-	await writeFile(filePath, content, "utf-8");
+	await atomicWriteFile(filePath, content);
 	await chmod(filePath, 0o755);
 }
 

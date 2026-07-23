@@ -5,14 +5,14 @@
  * Extracted from Installer.ts for single-responsibility.
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { atomicWriteFile } from "../core/AtomicWrite.js";
 import { createLogger } from "../Logger.js";
 import type { HookOpResult } from "./HookSettingsHelper.js";
 import {
 	buildHookCommand,
 	GEMINI_HOOK_IDENTIFIERS,
-	hasHookWithCommand,
 	hasHookWithIdentifier,
 	removeHooksWithIdentifier,
 } from "./HookSettingsHelper.js";
@@ -32,23 +32,20 @@ export async function installGeminiHook(projectDir: string): Promise<HookOpResul
 
 	// Read existing settings or create new
 	let settings: Record<string, unknown> = {};
+	let existingContent: string | undefined;
 	try {
-		const content = await readFile(settingsPath, "utf-8");
-		settings = JSON.parse(content) as Record<string, unknown>;
-	} catch {
-		// No existing settings — create new
+		existingContent = await readFile(settingsPath, "utf-8");
+		settings = JSON.parse(existingContent) as Record<string, unknown>;
+	} catch (error: unknown) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 
 	// Get or create hooks section
 	const hooks = (settings.hooks ?? {}) as Record<string, unknown>;
 	const afterAgentGroups = (hooks.AfterAgent ?? []) as Array<Record<string, unknown>>;
 
-	// Check if our hook already exists with the correct command path
-	if (hasHookWithCommand(afterAgentGroups, hookCommand)) {
-		return { path: settingsPath };
-	}
-
-	// Remove any existing Jolli Memory hooks (may have outdated paths)
+	// Remove every existing owner (including old Kotlin and duplicate canonical
+	// entries), then append exactly one source-neutral hook.
 	const cleaned = removeHooksWithIdentifier(afterAgentGroups, GEMINI_HOOK_IDENTIFIERS);
 
 	// Add our hook
@@ -66,8 +63,10 @@ export async function installGeminiHook(projectDir: string): Promise<HookOpResul
 	settings.hooks = hooks;
 
 	// Write settings
+	const nextContent = JSON.stringify(settings, null, "\t");
+	if (existingContent === nextContent) return { path: settingsPath };
 	await mkdir(settingsDir, { recursive: true });
-	await writeFile(settingsPath, JSON.stringify(settings, null, "\t"), "utf-8");
+	await atomicWriteFile(settingsPath, nextContent);
 	log.info("Gemini AfterAgent hook installed");
 	return { path: settingsPath };
 }
@@ -83,7 +82,21 @@ export async function isGeminiHookInstalled(projectDir: string): Promise<boolean
 		const hooks = settings.hooks as Record<string, unknown> | undefined;
 		if (!hooks) return false;
 		const afterAgentGroups = (hooks.AfterAgent ?? []) as Array<Record<string, unknown>>;
-		return hasHookWithIdentifier(afterAgentGroups, GEMINI_HOOK_IDENTIFIERS);
+		const owned = afterAgentGroups.filter((group) =>
+			(group.hooks as Array<Record<string, unknown>> | undefined)?.some(
+				(hook) =>
+					typeof hook.command === "string" &&
+					GEMINI_HOOK_IDENTIFIERS.some((identifier) => (hook.command as string).includes(identifier)),
+			),
+		);
+		if (owned.length !== 1) return false;
+		const hookDefs = owned[0].hooks as Array<Record<string, unknown>> | undefined;
+		return (
+			hookDefs?.length === 1 &&
+			hookDefs[0].type === "command" &&
+			hookDefs[0].command === buildHookCommand("gemini-after-agent") &&
+			hookDefs[0].name === "jolli-session-tracker"
+		);
 	} catch {
 		return false;
 	}
@@ -123,6 +136,6 @@ export async function removeGeminiHook(projectDir: string): Promise<void> {
 		settings.hooks = hooks;
 	}
 
-	await writeFile(settingsPath, JSON.stringify(settings, null, "\t"), "utf-8");
+	await atomicWriteFile(settingsPath, JSON.stringify(settings, null, "\t"));
 	log.info("Gemini AfterAgent hook removed");
 }

@@ -8,8 +8,9 @@
 		"vscode"
 	],
 	"scripts": {
-		"build": "npm run build -w @jolli.ai/cli && npm run build -w vscode",
+		"build": "npm run build -w @jolli.ai/cli && npm run build:claude-plugin && npm run build -w vscode",
 		"build:cli": "npm run build -w @jolli.ai/cli",
+		"build:claude-plugin": "node claude-plugin/plugins/jolli/scripts/build.mjs",
 		"build:vscode": "npm run build -w vscode",
 		"typecheck": "npm run typecheck -w @jolli.ai/cli && npm run typecheck -w vscode",
 		"typecheck:cli": "npm run typecheck -w @jolli.ai/cli",
