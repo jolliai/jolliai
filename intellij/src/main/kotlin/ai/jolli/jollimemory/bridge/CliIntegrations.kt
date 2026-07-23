@@ -15,6 +15,8 @@ object CliIntegrations {
 
     private val log = JmLogger.create("CliIntegrations")
 
+    private const val IDE_BRIDGE_TIMEOUT_SECONDS = 300L
+
     sealed class Result {
         /** Integrations set up successfully. */
         object Ok : Result()
@@ -156,10 +158,11 @@ object CliIntegrations {
      * Records a successful enable by stamping the current plugin version.
      *
      * The write is atomic (temp sibling + [java.nio.file.Files.move] with
-     * ATOMIC_MOVE) so a concurrent reader can never observe a half-truncated
-     * stamp. Without this, a reader that landed inside `writeText`'s truncate
-     * window would compare against `""` and mistakenly conclude the dist is
-     * stale.
+     * ATOMIC_MOVE) so a concurrent reader — [CliDaemonClient.currentDistVersion]
+     * runs on every daemon call() — can never observe a half-truncated stamp.
+     * Without this, a reader that landed inside `writeText`'s truncate window
+     * would compare the daemon's cached distVersion against `""`, decide the
+     * daemon was stale, tear it down, and pull every in-flight future with it.
      */
     internal fun markIntegrationsEnabled(distDir: File) {
         try {
@@ -457,6 +460,184 @@ object CliIntegrations {
     }
 
     /**
+     * Runs one hidden `jolli ide-bridge <action>` JSON request. Domain behavior
+     * stays in `cli/src`; Kotlin callers only serialize DTOs and consume the
+     * returned `result` element.
+     */
+    fun runIdeBridge(
+        projectDir: String,
+        action: String,
+        requestJson: String? = null,
+        timeoutSeconds: Long = IDE_BRIDGE_TIMEOUT_SECONDS,
+    ): com.google.gson.JsonElement {
+        // Prefer the long-lived daemon when the caller's project has one bound.
+        // A daemon call is ~5-20ms vs a one-shot spawn's ~500ms-2s cold start,
+        // so this shift is what pulls hot-path bridge reads (config-load,
+        // status, session-state, etc.) below IntelliJ's 300ms slow-EDT floor.
+        // A real business-logic error propagates as [CliBridgeException] —
+        // same shape as before so callers up the stack don't care which path
+        // ran. Any local failure (daemon crashed, protocol mismatch, socket
+        // broke) is logged and falls through to the legacy one-shot spawn so
+        // the request still completes.
+        findDaemonForCwd(projectDir)?.let { client ->
+            try {
+                return client.call(action, projectDir, requestJson, timeoutSeconds)
+            } catch (e: CliBridgeException) {
+                throw e
+            } catch (e: CliDaemonClient.CliDaemonTimeoutException) {
+                // Timeout means the daemon is STILL running the action. A
+                // one-shot fallback would spawn a second Node process that
+                // starts the same action fresh, so a side-effectful op
+                // (sync push, store-summary, force-push) would run twice.
+                // Surface the timeout instead — the daemon's own guarantee
+                // is the same as the legacy one-shot path once the wait
+                // budget is exhausted.
+                throw e
+            } catch (e: Exception) {
+                log.warn("CLI daemon call failed, falling back to one-shot spawn: %s", e.message)
+            }
+        }
+        val node = resolveNode()
+            ?: throw RuntimeException("Node.js not found — it is required for Jolli Memory. Install Node.js and reopen the project.")
+        val cliJs = resolveCliJs()
+            ?: throw RuntimeException("The bundled CLI was not found in the plugin. Try reinstalling Jolli Memory.")
+        val outFile = File.createTempFile("jolli-ide-bridge-", ".json")
+        try {
+            val proc = ProcessBuilder(node, cliJs.absolutePath, "ide-bridge", action, "--cwd", projectDir)
+                .directory(File(projectDir))
+                .redirectOutput(outFile)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start()
+            proc.outputStream.use { stdin ->
+                if (requestJson != null) stdin.write(requestJson.toByteArray(Charsets.UTF_8))
+            }
+            if (!proc.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+                proc.destroyForcibly()
+                throw RuntimeException("CLI bridge action '$action' timed out after ${timeoutSeconds}s")
+            }
+            val line = outFile.readText(Charsets.UTF_8).lineSequence().lastOrNull { it.isNotBlank() }
+                ?: throw RuntimeException("CLI bridge action '$action' produced no output (exit ${proc.exitValue()})")
+            val obj = try {
+                JsonParser.parseString(line).asJsonObject
+            } catch (_: Exception) {
+                throw RuntimeException("CLI bridge action '$action' returned unreadable output: ${line.take(200)}")
+            }
+            // JSON-RPC 2.0 wire: success has `result`, failure has `error: {code, message, data}`.
+            val errorObj = obj.get("error")?.takeIf { it.isJsonObject }?.asJsonObject
+            if (errorObj != null) {
+                val data = errorObj.get("data")?.takeIf { it.isJsonObject }?.asJsonObject
+                    ?: com.google.gson.JsonObject()
+                throw CliBridgeException(
+                    data.get("errorName")?.takeUnless { it.isJsonNull }?.asString,
+                    errorObj.get("message")?.asString ?: "unknown CLI bridge error",
+                    data,
+                )
+            }
+            if (proc.exitValue() != 0) {
+                throw RuntimeException("CLI bridge action '$action' failed (exit ${proc.exitValue()})")
+            }
+            return obj.get("result") ?: com.google.gson.JsonNull.INSTANCE
+        } finally {
+            outFile.delete()
+        }
+    }
+
+    /**
+     * Locates a working `Cli.js` by the same 4-step chain the one-shot bridge
+     * has always used: installed plugin dist → workspace dev checkout → the
+     * previously-extracted intellij dist → freshly re-extract from the plugin
+     * jar. Consolidated here so [runIdeBridge] and [CliDaemonClient] use one
+     * lookup and can never drift.
+     */
+    internal fun resolveCliJs(): File? =
+        resolveBundledCliJs()
+            ?: resolveDevelopmentCliJs()
+            ?: File(distIntellijDir(), "Cli.js").takeIf { it.exists() }
+            ?: extractCliDist()?.let { File(it, "Cli.js") }
+
+    /**
+     * Unit tests and local Gradle runs execute classes outside an installed plugin,
+     * so there is no `<plugin>/cli-dist`. Reuse the freshly built workspace CLI in
+     * that environment. Installed plugins always resolve [resolveBundledCliJs]
+     * first and never enter this development-only lookup.
+     */
+    private fun resolveDevelopmentCliJs(): File? {
+        val workingDir = File(System.getProperty("user.dir"))
+        return sequenceOf(
+            File(workingDir, "cli/dist/Cli.js"),
+            File(workingDir, "../cli/dist/Cli.js"),
+        ).firstOrNull { it.isFile }
+    }
+
+    /**
+     * Locates the [CliDaemonClient] whose project owns [projectDir], or null
+     * when no matching open Project has a daemon service attached.
+     *
+     * A project has TWO valid "cwds": `project.basePath` (where IntelliJ was
+     * pointed) and the main git worktree root the plugin resolved during
+     * startup (`JolliMemoryService.mainRepoRoot`). These two can be
+     * completely disjoint filesystem paths when the IDE opened a *linked*
+     * worktree — the mainRepoRoot is `.../repo` while basePath is
+     * `.../repo-feature`, and neither is a prefix of the other. Every
+     * hot-path caller in the audit passes `service.mainRepoRoot ?: basePath`,
+     * so we must be able to match either form; otherwise the daemon quietly
+     * falls through to one-shot spawns for the majority of clicks.
+     *
+     * Matching per candidate: direct canonical equality, then either-way
+     * prefix containment (covers a caller cwd that is a subdirectory of the
+     * project root, and the rarer reverse). We use `getServiceIfCreated` to
+     * read `mainRepoRoot` — creating JolliMemoryService here would trigger
+     * its heavy `initialize()` from an ide-bridge call, which is not the
+     * responsibility of this cheap lookup.
+     *
+     * A no-match returns null so [runIdeBridge] falls through to the
+     * one-shot spawn path without incident.
+     */
+    private fun findDaemonForCwd(projectDir: String): CliDaemonClient? {
+        if (projectDir.isBlank()) return null
+        val cwdCanon = runCatching { File(projectDir).canonicalPath }.getOrNull() ?: return null
+        val projects = try {
+            com.intellij.openapi.project.ProjectManager.getInstance().openProjects
+        } catch (_: Throwable) {
+            // ProjectManager not ready (very early startup) — one-shot spawn works.
+            return null
+        }
+        for (project in projects) {
+            if (project.isDisposed) continue
+            val candidates = buildList {
+                project.basePath?.let { add(it) }
+                mainRepoRootOf(project)?.let { add(it) }
+            }
+            for (raw in candidates) {
+                val candidate = runCatching { File(raw).canonicalPath }.getOrNull() ?: continue
+                val matches = candidate == cwdCanon ||
+                    cwdCanon.startsWith(candidate + File.separator) ||
+                    candidate.startsWith(cwdCanon + File.separator)
+                if (!matches) continue
+                return runCatching { project.getService(CliDaemonClient::class.java) }.getOrNull()
+            }
+        }
+        return null
+    }
+
+    /**
+     * Reads the JolliMemoryService's mainRepoRoot without forcing service
+     * creation. If the service has not been instantiated yet (very early
+     * startup) we return null and let the caller consider only basePath.
+     */
+    private fun mainRepoRootOf(project: com.intellij.openapi.project.Project): String? {
+        return try {
+            val cls = ai.jolli.jollimemory.services.JolliMemoryService::class.java
+            // `getServiceIfCreated` returns null when the service isn't already
+            // bound — safer than `getService`, which would trigger its heavy
+            // initialize() from an ide-bridge call.
+            project.getServiceIfCreated(cls)?.mainRepoRoot
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
      * User-facing text for a classified CLI generation failure. The CLI tags its
      * error JSON with `errorName` (see cli/src/commands/GenerateCommand.ts); the
      * local-agent auth failure gets sign-in guidance because its raw message
@@ -469,6 +650,96 @@ object CliIntegrations {
             "Claude Code is installed but not signed in. Open a terminal, run `claude`, " +
                 "and sign in with /login — or switch the AI provider in Jolli Memory settings."
         else -> message
+    }
+
+    /** Result of one `jolli migrate-memory-bank` run — the subset the UI status lines need. */
+    data class MigrationBridgeResult(
+        val status: String,
+        val migratedEntries: Int,
+        val totalEntries: Int,
+    )
+
+    /**
+     * Wall-clock budget for one Memory Bank migration. Generous because a first
+     * migration on a large repo copies every summary / transcript / plan / note
+     * from the orphan branch onto disk; the steady-state stale-child reconcile
+     * finishes in well under a second.
+     */
+    private const val MIGRATE_TIMEOUT_SECONDS = 300L
+
+    /**
+     * Runs the orphan-branch → Memory Bank folder migration via the bundled CLI's
+     * hidden `migrate-memory-bank` command (see
+     * cli/src/commands/MigrateMemoryBankCommand.ts). This replaces the plugin's own
+     * Kotlin `MigrationEngine`: the CLI resolves the Memory Bank root from the shared
+     * config, runs the full migration when it has not completed yet, and otherwise
+     * runs the idempotent stale-child reconcile — matching the VS Code activate path.
+     *
+     * The command needs no stdin and prints a single JSON line on stdout —
+     * `{"type":"migrate-memory-bank","status":…,"migratedEntries":…,"totalEntries":…}`
+     * on success, `{"type":"error", …}` on failure. stdout is redirected to a temp
+     * file so a chatty migration log can never fill the pipe and deadlock [waitFor].
+     *
+     * Throws [RuntimeException] with a user-facing message on ANY failure (Node
+     * missing, bundle missing, timeout, CLI error) — callers surface `ex.message`.
+     */
+    fun migrateMemoryBank(projectDir: String): MigrationBridgeResult {
+        val node = resolveNode()
+            ?: throw RuntimeException(
+                "Node.js not found — it is required for Memory Bank migration. Install Node.js and reopen the project.",
+            )
+        val distDir = distIntellijDir().takeIf { File(it, "Cli.js").exists() }
+            ?: extractCliDist()
+            ?: throw RuntimeException("The bundled CLI was not found in the plugin. Try reinstalling the Jolli Memory plugin.")
+        val cliJs = File(distDir, "Cli.js")
+
+        val outFile = File.createTempFile("jolli-migrate-", ".json")
+        try {
+            val proc = ProcessBuilder(node, cliJs.absolutePath, "migrate-memory-bank", "--cwd", projectDir)
+                .directory(File(projectDir))
+                .redirectOutput(outFile)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start()
+            if (!proc.waitFor(MIGRATE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                proc.destroyForcibly()
+                throw RuntimeException("Memory Bank migration timed out after ${MIGRATE_TIMEOUT_SECONDS}s")
+            }
+            return parseMigrateResponse(outFile.readText(Charsets.UTF_8), proc.exitValue())
+        } finally {
+            outFile.delete()
+        }
+    }
+
+    /**
+     * Parses the `migrate-memory-bank` stdout contract. Split out for direct
+     * testing — the response is the LAST non-blank line so stray Node runtime
+     * output (e.g. experimental-feature warnings) cannot break it.
+     */
+    internal fun parseMigrateResponse(stdout: String, exitValue: Int): MigrationBridgeResult {
+        val line = stdout.lineSequence().lastOrNull { it.isNotBlank() }
+            ?: throw RuntimeException("Memory Bank migration produced no output (exit $exitValue)")
+        val obj = try {
+            JsonParser.parseString(line).asJsonObject
+        } catch (_: Exception) {
+            throw RuntimeException("Memory Bank migration returned unreadable output (exit $exitValue): ${line.take(200)}")
+        }
+        if (obj.get("type")?.asString == "error") {
+            // Preserve the CLI's classified errorName so downstream dialogs can
+            // route on the same key runIdeBridge already surfaces (e.g. auth
+            // failures) instead of degrading to a generic RuntimeException.
+            throw CliBridgeException(
+                obj.get("errorName")?.takeUnless { it.isJsonNull }?.asString,
+                obj.get("message")?.asString ?: "unknown error",
+            )
+        }
+        if (exitValue != 0) {
+            throw RuntimeException("Memory Bank migration failed (exit $exitValue)")
+        }
+        val status = obj.get("status")?.asString ?: "unknown"
+        val migrated = obj.get("migratedEntries")?.asInt ?: 0
+        val total = obj.get("totalEntries")?.asInt ?: 0
+        log.info("migrate-memory-bank succeeded: %s (%d/%d)", status, migrated, total)
+        return MigrationBridgeResult(status, migrated, total)
     }
 
     /**
@@ -553,5 +824,11 @@ object CliIntegrations {
             log.warn("Failed to run bundled CLI %s (non-fatal): %s", label, e.message)
             Result.Failed(e.message ?: "unknown")
         }
-	}
+    }
+
+    class CliBridgeException(
+        val errorName: String?,
+        message: String,
+        val details: com.google.gson.JsonObject = com.google.gson.JsonObject(),
+    ) : RuntimeException(message)
 }

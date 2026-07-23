@@ -17,10 +17,33 @@ import { getSummary } from "./SummaryStore.js";
 
 export const MARKER_START = "<!-- jollimemory-summary-start -->";
 export const MARKER_END = "<!-- jollimemory-summary-end -->";
+const MARKER_PATTERN = new RegExp(
+	`${MARKER_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\s\\S]*?${MARKER_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+);
 
 /** Wraps markdown content with start/end markers (idempotent PR updates). */
 export function wrapWithMarkers(markdown: string): string {
 	return `${MARKER_START}\n${markdown}\n${MARKER_END}`;
+}
+
+/**
+ * Replaces the managed marker region with an already-wrapped block.
+ *
+ * Uses a function replacer, not a string, so `$` sequences inside the wrapped
+ * summary markdown (`$&`, `$$`, `` $` ``, `$'`, `$n`) are treated as literals
+ * rather than `String.prototype.replace` substitution patterns — otherwise a
+ * summary containing e.g. `$$100`, a sed snippet `s/x/$&/g`, or a backtick
+ * pattern would silently corrupt the PR body (fold in the old marker region,
+ * swallow a `$`, etc.). Mirrors the Kotlin lambda form in PrService.kt.
+ */
+export function replaceMarkerRegion(currentBody: string, wrappedBlock: string): string {
+	if (MARKER_PATTERN.test(currentBody)) return currentBody.replace(MARKER_PATTERN, () => wrappedBlock);
+	return currentBody ? `${currentBody}\n\n${wrappedBlock}` : wrappedBlock;
+}
+
+/** Replaces the managed marker region, or appends one while preserving user-authored text. */
+export function replaceSummaryInBody(currentBody: string, newMarkdown: string): string {
+	return replaceMarkerRegion(currentBody, wrapWithMarkers(newMarkdown));
 }
 
 /**

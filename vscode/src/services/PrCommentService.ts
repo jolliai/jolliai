@@ -39,10 +39,17 @@ const MARKER_PATTERN = new RegExp(
  * existing marker region in place, or appends when the body has no markers
  * yet. Everything outside the marker region (manual description, checklist,
  * reviewer notes, …) is preserved verbatim.
+ *
+ * Uses a function replacer, not a string, so `$` sequences inside the wrapped
+ * summary markdown (`$&`, `$$`, `` $` ``, `$'`, `$n`) are treated as literals
+ * rather than `String.prototype.replace` substitution patterns — otherwise a
+ * summary containing e.g. `$$100`, a sed snippet `s/x/$&/g`, or a backtick
+ * pattern would silently corrupt the PR body (fold in the old marker region,
+ * swallow a `$`, etc.). Kept lockstep with the CLI + Kotlin implementations.
  */
 function replaceMarkerRegion(currentBody: string, wrappedBlock: string): string {
 	if (MARKER_PATTERN.test(currentBody)) {
-		return currentBody.replace(MARKER_PATTERN, wrappedBlock);
+		return currentBody.replace(MARKER_PATTERN, () => wrappedBlock);
 	}
 	return currentBody ? `${currentBody}\n\n${wrappedBlock}` : wrappedBlock;
 }
