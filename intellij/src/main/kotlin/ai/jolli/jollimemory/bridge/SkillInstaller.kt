@@ -21,9 +21,11 @@ import java.io.File
  * menu (mirrors the CLI — see the module header of `SkillInstaller.ts`). Legacy
  * `.claude/skills/` directory names are still cleaned up on write.
  *
- * Three skills ship today: `jolli-recall`, `jolli-search`, `jolli-pr`. Each is
- * upserted **independently** by its content revision, so a newer skill is never
- * blocked from installing just because another skill is already current.
+ * Two skills ship today: `jolli-recall`, `jolli-search`. Each is upserted
+ * **independently** by its content revision, so a newer skill is never blocked
+ * from installing just because another skill is already current. Skills Jolli
+ * has retired (see [REMOVED_SKILL_NAMES]) are swept out of the write target on
+ * every enable so an upgrade never strands a dead skill.
  *
  * ## Cross-tool idempotency — `metadata.revision`
  *
@@ -56,7 +58,16 @@ class SkillInstaller(private val projectDir: String) {
 
     companion object {
         /** Skill directory names installed today, in install order. */
-        val SKILL_NAMES = listOf("jolli-recall", "jolli-search", "jolli-pr")
+        val SKILL_NAMES = listOf("jolli-recall", "jolli-search")
+
+        /**
+         * Skill directory names Jolli USED to ship but no longer does. Removed from
+         * the write target on every enable (marker-guarded) so an upgrade doesn't
+         * strand a dead skill. `jolli-pr` was retired once PR authoring moved off a
+         * dedicated skill; the `get_pr_description` MCP tool / `pr-description` CLI
+         * command that backed it remain. Mirrors the CLI's REMOVED_SKILL_NAMES.
+         */
+        val REMOVED_SKILL_NAMES = listOf("jolli-pr")
 
         /** Legacy skill directory names from previous versions (cleaned up under .claude/skills). */
         val LEGACY_SKILL_DIRS = listOf("jollimemory-recall", "jolli-memory-recall")
@@ -118,10 +129,42 @@ class SkillInstaller(private val projectDir: String) {
 
         for (target in SKILL_TARGETS) {
             if (target.gatedOnClaude && !claudeEnabled) continue
+            val targetDir = File(projectDir, target.relativeDir)
+            // Sweep away retired skills before writing the current set, so an upgrade
+            // doesn't strand a dead skill (e.g. a pre-removal jolli-pr) in the repo.
+            for (name in REMOVED_SKILL_NAMES) {
+                removeRetiredSkill(File(targetDir, name))
+            }
             for (name in SKILL_NAMES) {
                 val template = loadTemplate(name, version) ?: continue
-                upsertSkill(File(projectDir, target.relativeDir), name, template, version)
+                upsertSkill(targetDir, name, template, version)
             }
+        }
+    }
+
+    /**
+     * Deletes a single retired-skill directory, but only when its SKILL.md carries a
+     * Jolli ownership marker — so a user's own hand-authored skill of the same name
+     * is never removed. A missing directory is a no-op. Fail-soft: any read/remove
+     * error is swallowed. Mirrors the CLI's `removeRetiredSkill`.
+     */
+    private fun removeRetiredSkill(skillDir: File) {
+        val skillPath = File(skillDir, "SKILL.md")
+        if (!skillPath.exists()) return
+        val content = try {
+            skillPath.readText(Charsets.UTF_8)
+        } catch (_: Exception) {
+            return
+        }
+        if (!isJolliOwnedSkill(content)) {
+            log.info("Keeping %s — no Jolli ownership marker (user-owned)", skillDir.absolutePath)
+            return
+        }
+        try {
+            skillDir.deleteRecursively()
+            log.info("Removed retired Jolli skill at %s", skillDir.absolutePath)
+        } catch (e: Exception) {
+            log.info("Failed to remove retired skill at %s: %s", skillDir.absolutePath, e.message)
         }
     }
 

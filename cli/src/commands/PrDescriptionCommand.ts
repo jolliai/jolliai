@@ -2,11 +2,10 @@
  * PrDescriptionCommand — Output a Jolli Memory PR title + body for the current
  * branch.
  *
- * This is the CLI fallback for the `jolli-pr` skill on hosts where the
- * `get_pr_description` MCP tool is unavailable. It wraps the same
+ * This is the CLI counterpart of the `get_pr_description` MCP tool, for agents
+ * and scripts that shell the CLI rather than call MCP. It wraps the same
  * `buildPrDescription` core that the MCP tool calls, so both surfaces emit the
- * identical `PrDescriptionResult` shape — the skill renders either one the same
- * way.
+ * identical `PrDescriptionResult` shape and can be consumed the same way.
  *
  * Output modes:
  *   - `--format json` — the full `PrDescriptionResult` (for skill/agent consumption)
@@ -57,7 +56,7 @@ function renderHumanSummary(result: {
 	);
 	lines.push("");
 	lines.push("  Run with --format json for the full PR body.");
-	lines.push("  Run the jolli-pr skill (e.g. /jolli-pr in Claude Code) to open the PR.");
+	lines.push("  Then open the PR with the GitHub CLI, e.g. gh pr create --body-file <file>.");
 	lines.push("");
 	return lines.join("\n");
 }

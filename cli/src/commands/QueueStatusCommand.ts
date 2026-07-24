@@ -2,7 +2,7 @@
  * QueueStatusCommand — report whether memory-summary generation is still
  * in progress for the current worktree, and optionally wait for it to drain.
  *
- * This is the CLI surface the `jolli-pr` skill polls before building a PR so
+ * This is the CLI surface a PR-description flow polls before building a PR so
  * freshly-committed summaries are included. Wiki/graph ingest is excluded from
  * the "still generating" verdict (see QueueStatus).
  *

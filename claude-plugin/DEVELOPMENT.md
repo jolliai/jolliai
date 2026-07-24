@@ -20,7 +20,6 @@ claude-plugin/
     ├── hooks/hooks.json                # Stop + SessionStart (+ git-hook bootstrap)
     ├── skills/                         # /jolli:recall  /jolli:search  /jolli:push
     ├── commands/                       # /jolli:init  /jolli:status  /jolli:timeline  /jolli:login  /jolli:logout
-    ├── agents/                         # jolli:pr-writer subagent
     ├── scripts/build.mjs               # esbuild → dist/ (Cli, Stop/SessionStart hooks, 5 git hooks, 2 workers)
     └── dist/                           # built bundles (gitignored)
 ```
@@ -244,11 +243,11 @@ There is no publishing `package.json` here yet; when you add one, a
   corresponding git hook into `node <missing file>` and BLOCKS the commit.
 - `.claude-plugin/plugin.json` — the manifest.
 - `.mcp.json` — the MCP server registration; without it the 10 MCP tools never load.
-- `hooks/`, `skills/`, `commands/`, `agents/` — the Stop/SessionStart hooks, the
-  `/jolli:*` skills and commands, and the `jolli:pr-writer` subagent.
+- `hooks/`, `skills/`, `commands/` — the Stop/SessionStart hooks and the
+  `/jolli:*` skills and commands.
 
 > ⚠️ **`files: ["dist"]` alone ships a broken plugin** — `dist/` is only the bundled
-> CLI; the manifest, `.mcp.json`, hooks, skills, commands, and agent all live outside
+> CLI; the manifest, `.mcp.json`, hooks, skills, and commands all live outside
 > it. Two of these are also `.gitignore`-sensitive: `.mcp.json` is caught by the repo
 > root's broad `.mcp.json` rule and `skills/**/SKILL.md` by a global `SKILL.md` rule,
 > so both are re-included via `!`-exceptions in the repo root `.gitignore`. Keep those
@@ -364,7 +363,7 @@ what propagates CLI changes — a build step, not a version lock.*
   `cli/src/core/JolliApiUtils.ts` alongside CLI / VS Code / IntelliJ.
 - **npm `files` whitelist must ship the whole plugin, not just `dist/`.** When the
   publishing `package.json` is added, include `dist/`, `.claude-plugin/plugin.json`,
-  `.mcp.json`, `hooks/`, `skills/`, `commands/`, `agents/`. `.mcp.json` and
+  `.mcp.json`, `hooks/`, `skills/`, `commands/`. `.mcp.json` and
   `skills/**/SKILL.md` are `.gitignore`-re-included at the repo root (see the
   Distribution section) — the published package needs that same full set, or it
   ships without its MCP server and skills. Verify with `npm pack --dry-run` before

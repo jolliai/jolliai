@@ -374,7 +374,7 @@ export async function install(
 				// umbrella menu (routing to the plugin's own `/jolli:*` skills) into
 				// .claude/skills/jolli/ and keep it out of `git status`.
 				await installPluginJolliMenu(wt);
-				// The plugin ships recall/search/pr/run as namespaced `/jolli:*` skills,
+				// The plugin ships recall/search/run as namespaced `/jolli:*` skills,
 				// so the unnamespaced `.claude/skills/jolli-*` a pre-plugin `jolli enable`
 				// wrote are now duplicates in the `/` menu. Delete the Jolli-owned ones
 				// (a user's own same-named skill is left untouched). Ordered after the

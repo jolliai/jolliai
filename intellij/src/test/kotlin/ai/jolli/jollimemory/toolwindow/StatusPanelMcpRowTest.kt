@@ -24,8 +24,8 @@ class StatusPanelMcpRowTest {
         val row = StatusPanel.mcpStatusRow(nodeAvailable = false, integrationsActive = false)
         row.icon shouldBe StatusPanel.Icon.WARN
         row.description shouldBe "Node.js not found"
+        row.tooltip!! shouldContain "/jolli-recall"
         row.tooltip!! shouldContain "/jolli-search"
-        row.tooltip!! shouldContain "/jolli-pr"
         row.tooltip!! shouldContain "MCP"
     }
 

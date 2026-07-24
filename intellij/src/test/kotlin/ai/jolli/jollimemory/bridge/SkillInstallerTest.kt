@@ -161,15 +161,45 @@ Do it my way.
         @Test
         fun `handles missing skills directory gracefully`(@TempDir tempDir: File) {
             SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
-            File(tempDir, ".agents/skills/jolli-pr/SKILL.md").exists() shouldBe true
+            File(tempDir, ".agents/skills/jolli-search/SKILL.md").exists() shouldBe true
+        }
+
+        @Test
+        fun `sweeps a Jolli-owned retired jolli-pr out of the agents target`(@TempDir tempDir: File) {
+            val dir = File(tempDir, ".agents/skills/jolli-pr")
+            dir.mkdirs()
+            File(dir, "SKILL.md").writeText("---\nname: jolli-pr\nmetadata:\n  vendor: \"jolli.ai\"\n---\nretired\n")
+
+            SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
+
+            // Retired skill removed; a current skill is still written.
+            dir.exists() shouldBe false
+            File(tempDir, ".agents/skills/jolli-recall/SKILL.md").exists() shouldBe true
+        }
+
+        @Test
+        fun `keeps a user-owned jolli-pr with no ownership marker`(@TempDir tempDir: File) {
+            val dir = File(tempDir, ".agents/skills/jolli-pr")
+            dir.mkdirs()
+            val userContent = "---\nname: jolli-pr\n---\n\n# my own PR helper\n"
+            File(dir, "SKILL.md").writeText(userContent)
+
+            SkillInstaller(tempDir.absolutePath).updateSkillIfNeeded()
+
+            File(dir, "SKILL.md").readText() shouldBe userContent
         }
     }
 
     // ── Constants ────────────────────────────────────────────────────────
 
     @Test
-    fun `SKILL_NAMES lists the three shipped skills`() {
-        SkillInstaller.SKILL_NAMES shouldBe listOf("jolli-recall", "jolli-search", "jolli-pr")
+    fun `SKILL_NAMES lists the two shipped skills`() {
+        SkillInstaller.SKILL_NAMES shouldBe listOf("jolli-recall", "jolli-search")
+    }
+
+    @Test
+    fun `REMOVED_SKILL_NAMES lists the retired jolli-pr skill`() {
+        SkillInstaller.REMOVED_SKILL_NAMES shouldBe listOf("jolli-pr")
     }
 
     @Test

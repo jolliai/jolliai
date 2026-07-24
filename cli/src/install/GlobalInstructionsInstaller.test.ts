@@ -26,13 +26,25 @@ const START = "<!-- >>> jolli memory instructions >>> -->";
 const END = "<!-- <<< jolli memory instructions <<< -->";
 
 describe("renderInstructionsBlock", () => {
-	it("wraps all three skill names in a marker block ending with a newline", () => {
+	it("describes the recall/search capabilities by intent, not by a fixed skill name", () => {
 		const block = renderInstructionsBlock();
 		expect(block.startsWith(START)).toBe(true);
 		expect(block.endsWith(`${END}\n`)).toBe(true);
-		expect(block).toContain("jolli-pr");
-		expect(block).toContain("jolli-search");
-		expect(block).toContain("jolli-recall");
+		// Names the two capabilities and tells the LLM to route by intent.
+		expect(block).toContain("**Recall**");
+		expect(block).toContain("**Search**");
+		expect(block).toContain("route by");
+		// It must NOT hard-code any host's literal skill ID: the block is shared by
+		// plugin (`jolli:recall`) and CLI (`jolli-recall`) installs whose IDs differ,
+		// so a fixed name would dangle for one of them. Point at the MCP tool family
+		// generically instead.
+		expect(block).not.toContain("jolli-search");
+		expect(block).not.toContain("jolli-recall");
+		expect(block).not.toContain("jolli:recall");
+		expect(block).not.toContain("jolli:search");
+		// The retired jolli-pr skill is no longer referenced.
+		expect(block).not.toContain("jolli-pr");
+		expect(block).toContain("mcp__jollimemory__");
 	});
 
 	it("includes the memory-routing heuristic (consult memory first for why/history questions)", () => {
@@ -40,7 +52,7 @@ describe("renderInstructionsBlock", () => {
 		expect(block).toContain("memory-shaped");
 		// Biases toward using memory (high recall) ...
 		expect(block).toContain("lean toward consulting memory");
-		expect(block).toContain("run a quick `jolli-search` first");
+		expect(block).toContain("run a quick search");
 		// ... while excluding pure code/mechanical questions (precision).
 		expect(block).toContain("answer those from the code directly");
 		// A whole-feature "how does it work / how is it designed" question is
@@ -74,7 +86,7 @@ describe("applyInstructionsBlock", () => {
 		const result = applyInstructionsBlock(existing, block);
 		expect(result).toContain("# Top");
 		expect(result).toContain("# Bottom");
-		expect(result).toContain("jolli-recall");
+		expect(result).toContain("memory-shaped");
 		expect(result).not.toContain("## Stale");
 	});
 
@@ -104,7 +116,7 @@ describe("applyInstructionsBlock", () => {
 		const existing = "# Top\n\n## Jolli Memory\nold intro\n\n# Bottom\n";
 		const result = applyInstructionsBlock(existing, block);
 		expect(result).toBe(`# Top\n\n${block}# Bottom\n`);
-		expect(result).toContain("jolli-recall");
+		expect(result).toContain("memory-shaped");
 		expect(result).not.toContain("old intro");
 		expect(result.split(START).length - 1).toBe(1);
 	});
@@ -143,14 +155,14 @@ describe("installGlobalInstructions", () => {
 		const codex = await readFile(join(home, ".codex", "AGENTS.md"), "utf-8");
 		for (const content of [claude, gemini, codex]) {
 			expect(content).toContain(START);
-			expect(content).toContain("jolli-pr");
+			expect(content).toContain("memory-shaped");
 		}
 	});
 
 	it("does not create a file for a disabled host", async () => {
 		await installGlobalInstructions({ claude: true, gemini: false, codex: false });
 
-		expect(await readFile(join(home, ".claude", "CLAUDE.md"), "utf-8")).toContain("jolli-pr");
+		expect(await readFile(join(home, ".claude", "CLAUDE.md"), "utf-8")).toContain("memory-shaped");
 		await expect(readFile(join(home, ".gemini", "GEMINI.md"), "utf-8")).rejects.toThrow();
 		await expect(readFile(join(home, ".codex", "AGENTS.md"), "utf-8")).rejects.toThrow();
 	});
@@ -164,7 +176,7 @@ describe("installGlobalInstructions", () => {
 		const content = await readFile(join(home, ".claude", "CLAUDE.md"), "utf-8");
 		expect(content).toContain("# My global rules");
 		expect(content).toContain("Be concise.");
-		expect(content).toContain("jolli-recall");
+		expect(content).toContain("memory-shaped");
 	});
 
 	it("is idempotent — a second run does not change the file", async () => {
@@ -212,7 +224,7 @@ describe("removeInstructionsBlock", () => {
 		const removed = removeInstructionsBlock(existing);
 		expect(removed).not.toContain(START);
 		expect(removed).not.toContain(END);
-		expect(removed).not.toContain("jolli-pr");
+		expect(removed).not.toContain("memory-shaped");
 		// Surrounding user content survives; no dangling blank line at EOF.
 		expect(removed).toContain("# My global rules");
 		expect(removed).toContain("Be concise.");
@@ -247,8 +259,8 @@ describe("removeGlobalInstructions", () => {
 
 		const claude = await readFile(join(home, ".claude", "CLAUDE.md"), "utf-8");
 		const gemini = await readFile(join(home, ".gemini", "GEMINI.md"), "utf-8");
-		expect(claude).not.toContain("jolli-pr");
-		expect(gemini).not.toContain("jolli-pr");
+		expect(claude).not.toContain("memory-shaped");
+		expect(gemini).not.toContain("memory-shaped");
 	});
 
 	it("is a fail-soft no-op when a host file does not exist", async () => {

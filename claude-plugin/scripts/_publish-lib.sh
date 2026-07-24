@@ -33,11 +33,10 @@ PUBLISH_REQUIRED_DIST=(
 # the exact-count staging assertion so a partial skill loss is caught.
 PUBLISH_EXPECTED_SKILLS=(push recall search)
 
-# Commands and agents the plugin ships (same exact-count pattern as skills —
-# a repo-local .gitignore silently dropping one file leaves the count >0 but
-# wrong; the exact count catches it).
+# Commands the plugin ships (same exact-count pattern as skills — a repo-local
+# .gitignore silently dropping one file leaves the count >0 but wrong; the exact
+# count catches it). The plugin ships no subagents.
 PUBLISH_EXPECTED_COMMANDS=(init login logout status timeline)
-PUBLISH_EXPECTED_AGENTS=(pr-writer)
 
 # Critical singleton config files that MUST be staged. A repo-local .gitignore
 # rule (e.g. `*.json`) could silently drop any of these while the dist check
@@ -72,9 +71,9 @@ publish_assert_dist_built() {
 # reflects the post-`add` index (and, unlike `diff --cached`, still passes on a
 # re-publish where dist didn't change but is already tracked).
 #
-# Also asserts that skills, commands, agents, and critical config files are
-# staged: a repo-local .gitignore rule (e.g. `SKILL.md` or `*.json`) could
-# silently drop them while the dist-only check passes.
+# Also asserts that skills, commands, and critical config files are staged: a
+# repo-local .gitignore rule (e.g. `SKILL.md` or `*.json`) could silently drop
+# them while the dist-only check passes.
 publish_assert_dist_staged() {
 	local dest="$1" missing=() f
 	for f in "${PUBLISH_REQUIRED_DIST[@]}"; do
@@ -88,20 +87,17 @@ publish_assert_dist_staged() {
 	local skill_count
 	skill_count="$(git -C "$dest" ls-files -- 'plugins/jolli/skills/*/SKILL.md' | wc -l | tr -d ' ')"
 	[ "$skill_count" -eq "${#PUBLISH_EXPECTED_SKILLS[@]}" ] || missing+=("skills/*/SKILL.md (expected ${#PUBLISH_EXPECTED_SKILLS[@]}, found $skill_count)")
-	# Assert commands and agents directories have the exact expected staged count
+	# Assert the commands directory has the exact expected staged count
 	# (same exact-count pattern as skills — a partial gitignore drop is caught).
 	local cmd_count
 	cmd_count="$(git -C "$dest" ls-files -- 'plugins/jolli/commands/*' | wc -l | tr -d ' ')"
 	[ "$cmd_count" -eq "${#PUBLISH_EXPECTED_COMMANDS[@]}" ] || missing+=("commands/* (expected ${#PUBLISH_EXPECTED_COMMANDS[@]}, found $cmd_count)")
-	local agent_count
-	agent_count="$(git -C "$dest" ls-files -- 'plugins/jolli/agents/*' | wc -l | tr -d ' ')"
-	[ "$agent_count" -eq "${#PUBLISH_EXPECTED_AGENTS[@]}" ] || missing+=("agents/* (expected ${#PUBLISH_EXPECTED_AGENTS[@]}, found $agent_count)")
 	if [ "${#missing[@]}" -gt 0 ]; then
 		echo "error: required file(s) not staged for commit: ${missing[*]}" >&2
 		echo "       The marketplace repo's .gitignore is likely ignoring them." >&2
-		echo "       Remove that rule (the plugin MUST ship dist/ + skills/ + commands/ + agents/ + configs) and re-run." >&2
-		echo "       If you added or removed a command, agent, or skill, update" >&2
-		echo "       PUBLISH_EXPECTED_{COMMANDS,AGENTS,SKILLS} in _publish-lib.sh." >&2
+		echo "       Remove that rule (the plugin MUST ship dist/ + skills/ + commands/ + configs) and re-run." >&2
+		echo "       If you added or removed a command or skill, update" >&2
+		echo "       PUBLISH_EXPECTED_{COMMANDS,SKILLS} in _publish-lib.sh." >&2
 		return 1
 	fi
 }
