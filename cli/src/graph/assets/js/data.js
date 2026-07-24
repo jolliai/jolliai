@@ -5,6 +5,16 @@
 (function () {
   "use strict";
 
+  // The schema version this viewer is built for. MUST stay in lockstep with
+  // GRAPH_SCHEMA_VERSION in cli/src/graph/GraphSchema.ts — same "thin mirror,
+  // keep in sync" contract as the symmetric-edge dedup below. A loaded graph.json
+  // whose schemaVersion is a NUMBER strictly below this was written by an older
+  // build; the viewer still renders it (every new-field read is guarded), but
+  // main.js surfaces a "regenerate for the full experience" notice. A missing or
+  // non-numeric schemaVersion is NOT treated as stale (no false positive on data
+  // that predates the field or is hand-authored).
+  const SUPPORTED_SCHEMA_VERSION = 4;
+
   // Muted jewel-tone palette for categories — deliberately avoids pure red/blue
   // (those hues belong to the supersedes/extends edge colors).
   const CATEGORY_PALETTE = [
@@ -165,8 +175,15 @@
       }
     }
 
+    // True when the loaded graph.json is a known-older schema than this viewer.
+    // Consumed by main.js to reveal the stale-schema banner. Read-only signal —
+    // nothing here mutates `graph`.
+    const schemaStale =
+      typeof graph.schemaVersion === "number" && graph.schemaVersion < SUPPORTED_SCHEMA_VERSION;
+
     window.WikiData = {
       graph,
+      schemaStale,
       categories: graph.categories,
       topics: graph.topics,
       units: graph.units,

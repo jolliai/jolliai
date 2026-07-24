@@ -127,6 +127,19 @@
     });
   }
 
+  // Reveal the stale-schema notice when the loaded graph.json predates this
+  // viewer's schema version (WikiData.schemaStale, computed in data.js). Purely
+  // advisory: the graph still renders — this only nudges the user to regenerate.
+  // Dismiss is session-only (no persistence). No-op if the banner markup is
+  // absent (e.g. a host page that strips it).
+  function wireStaleBanner() {
+    const banner = document.getElementById("stale-banner");
+    if (!banner) return;
+    if (window.WikiData && window.WikiData.schemaStale) banner.hidden = false;
+    const close = document.getElementById("stale-banner-close");
+    if (close) close.addEventListener("click", () => { banner.hidden = true; });
+  }
+
   async function boot() {
     try {
       await window.WikiDataLoader.load();
@@ -143,6 +156,7 @@
       board.appendChild(div);
       return;
     }
+    wireStaleBanner();
     // Track last nav to know when a full re-render is needed vs panel-only.
     // Seed from the state the initial render already drew, so the first
     // selection isn't misread as a navigation (which would wipe its styling).

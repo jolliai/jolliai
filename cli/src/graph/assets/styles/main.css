@@ -91,6 +91,32 @@ body {
 
 .app { display: flex; flex-direction: column; height: 100vh; }
 
+/* ── Stale-schema banner ────────────────────────────────── */
+/* Full-width notice above the topbar; main.js toggles [hidden] based on the
+   loaded graph's schemaVersion. A translucent amber tint conveys "advisory"
+   while ADAPTING to the theme: it layers over the host-provided --bg, so it
+   reads as light-amber on a light theme and dark-amber on a dark one. Text uses
+   --ink (reliably host-injected in both VS Code and the web embed). It is
+   deliberately NOT keyed off --accent-soft (= --vscode-focusBorder): a web host
+   resolved that token to a dark colour, which rendered a dark bar clashing with
+   the light graph. [hidden] must win over the flex default. */
+.stale-banner {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 20px;
+  background: rgba(224, 172, 43, 0.16);
+  border-bottom: 1px solid rgba(224, 172, 43, 0.55);
+  color: var(--ink); font-size: 12.5px;
+  flex-shrink: 0;
+}
+.stale-banner[hidden] { display: none; }
+.stale-banner-text { flex: 1; }
+.stale-banner-close {
+  border: none; background: transparent; color: var(--muted);
+  font-size: 18px; line-height: 1; cursor: pointer; padding: 0 4px;
+  transition: color .15s;
+}
+.stale-banner-close:hover { color: var(--ink); }
+
 /* ── Topbar ─────────────────────────────────────────────── */
 .topbar {
   display: flex; align-items: center; gap: 18px;
