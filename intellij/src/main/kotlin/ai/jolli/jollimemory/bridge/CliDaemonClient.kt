@@ -86,6 +86,9 @@ class CliDaemonClient(private val project: Project) : Disposable {
 	 */
 	fun call(action: String, cwd: String, requestJson: String?, timeoutSeconds: Long): JsonElement {
 		if (disposed.get()) throw IllegalStateException("CliDaemonClient is disposed")
+		// Wall-clock for the whole round trip; only logged when it trips the
+		// slow-call budget below.
+		val startNanos = System.nanoTime()
 		// Resolve the daemon FIRST so we can register the future in that
 		// daemon's own inFlight map — this is what scopes onProcessDeath.
 		val daemon = ensureDaemonStarted()
@@ -122,6 +125,10 @@ class CliDaemonClient(private val project: Project) : Disposable {
 			} catch (e: ExecutionException) {
 				throw e.cause ?: e
 			}
+			val tookMs = (System.nanoTime() - startNanos) / 1_000_000
+			if (tookMs > 300) {
+				log.warn("slow daemon call: action=%s took=%dms (thread=%s)", action, tookMs, Thread.currentThread().name)
+			}
 			return unwrapResponseEnvelope(envelope)
 		} finally {
 			daemon.inFlight.remove(id)
@@ -134,6 +141,9 @@ class CliDaemonClient(private val project: Project) : Disposable {
 	private fun ensureDaemonStarted(): DaemonProcess {
 		val cur = processRef.get()
 		if (cur != null && cur.process.isAlive && cur.distVersion == currentDistVersion()) return cur
+		// The lazy spawn (Node cold start + handshake wait) blocks whichever thread makes
+		// the first call. Time it so the info log below reports how long the caller waited.
+		val startNanos = System.nanoTime()
 		synchronized(startLock) {
 			// Re-check disposed under the lock so we cannot race with dispose():
 			// a caller that passed the top-level `disposed.get()` gate can still
@@ -154,6 +164,13 @@ class CliDaemonClient(private val project: Project) : Disposable {
 				throw IllegalStateException("CliDaemonClient disposed during startup")
 			}
 			processRef.set(started)
+			// The lazy start is a normal path — log at info so it doesn't flood the warn
+			// channel alongside genuine failures. The slow-call warn above still fires
+			// separately when a specific call trips the 300ms budget.
+			log.info(
+				"CLI daemon lazy-started in %dms on thread=%s (blocks the caller — EDT freeze when called from UI)",
+				(System.nanoTime() - startNanos) / 1_000_000, Thread.currentThread().name,
+			)
 			return started
 		}
 	}

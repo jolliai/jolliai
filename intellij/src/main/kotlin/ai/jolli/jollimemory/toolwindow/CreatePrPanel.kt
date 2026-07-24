@@ -13,6 +13,8 @@ import ai.jolli.jollimemory.services.JolliShareService
 import ai.jolli.jollimemory.services.PrService
 import ai.jolli.jollimemory.toolwindow.views.CreatePrData
 import ai.jolli.jollimemory.toolwindow.views.CreatePrHtmlBuilder
+import ai.jolli.jollimemory.toolwindow.views.ThemeUtils
+import ai.jolli.jollimemory.toolwindow.views.ThemeUtils.toCssHex
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
@@ -140,6 +142,12 @@ class CreatePrPanel(
                     return false
                 }
             }, b.cefBrowser)
+            // Theme the native Chromium view before the first load so the initial
+            // about:blank → content navigation never flashes white.
+            val prBg = ThemeUtils.editorBackground()
+            b.component.isOpaque = true
+            b.component.background = prBg
+            b.setPageBackgroundColor(prBg.toCssHex())
             b.loadHTML(CreatePrHtmlBuilder.buildHtml(vm, !JBColor.isBright(), bridgeScript))
             b.component
         } catch (e: Exception) {

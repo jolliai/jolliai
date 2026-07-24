@@ -49,6 +49,7 @@ object SummaryHtmlBuilder {
         planTranslateSet: Set<String> = emptySet(),
         bridgeScript: String = "",
         readOnly: Boolean = false,
+        pageBgHex: String = "#1e1e1e",
     ): String {
         val (allTopics, sourceNodes) = collectSortedTopics(summary)
         val stats = SummaryTree.aggregateStats(summary)
@@ -71,7 +72,7 @@ object SummaryHtmlBuilder {
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Commit Memory</title>
-<style>${SummaryCssBuilder.buildCss(isDark)}${if (readOnly) """
+<style>${SummaryCssBuilder.buildCss(isDark, pageBgHex)}${if (readOnly) """
 /* Read-only mode: hide all write-action buttons but keep Copy Markdown */
 .topic-action-btn, .associate-plan-btn, .plan-actions,
 #pushJolliBtn, #shareLinkBtn, #generateE2eBtn, #editE2eBtn, #regenE2eBtn, #deleteE2eBtn,
@@ -254,32 +255,31 @@ ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
 
     // ── All Conversations Section ─────────────────────────────────────────
 
-    /** Builds the All Conversations section with an Open button and the transcript Modal skeleton. */
+    /**
+     * Builds the All Conversations section with both the "empty" and "populated" branches
+     * emitted at once — the populated branch's elements carry `hidden` when the transcript
+     * set is empty, and the empty-state paragraph carries `hidden` when the set is
+     * populated. See `SummaryPanel.loadDeferredSets` for why the deferred hydration flips
+     * `hidden` attributes in place rather than triggering a second `loadHTML`.
+     */
     private fun buildAllConversationsSection(transcriptHashSet: Set<String>): String {
         val count = transcriptHashSet.size
-        if (count == 0) {
-            return """
-<div class="private-zone">
-  <div class="private-zone-watermark">PRIVATE</div>
-  <div class="section-header">
-    <div class="section-title">&#x1F4AC; All Conversations</div>
-  </div>
-  <p class="empty">No conversation transcripts saved for this commit.</p>
-</div>"""
-        }
-
+        val hasTranscripts = count > 0
+        val emptyHidden = if (hasTranscripts) " hidden" else ""
+        val populatedHidden = if (hasTranscripts) "" else " hidden"
         return """
-<div class="private-zone" id="conversationsSection">
+<div class="private-zone" id="conversationsSection" data-transcript-count="$count">
   <div class="private-zone-watermark">PRIVATE</div>
   <div class="section-header">
     <div class="section-title">&#x1F4AC; All Conversations</div>
-    <button class="action-btn" id="openTranscriptsBtn">Manage</button>
+    <button class="action-btn" id="openTranscriptsBtn"$populatedHidden>Manage</button>
   </div>
-  <p class="conversations-description">Raw AI conversation transcripts captured during development.</p>
-  <p class="conversations-stats" id="conversationsStats">
+  <p class="empty" id="conversationsEmpty"$emptyHidden>No conversation transcripts saved for this commit.</p>
+  <p class="conversations-description" id="conversationsDescription"$populatedHidden>Raw AI conversation transcripts captured during development.</p>
+  <p class="conversations-stats" id="conversationsStats"$populatedHidden>
     <span class="stats-loading">Loading stats...</span>
   </p>
-  <p class="conversations-privacy">&#x1F512; Your private data — stored on your machine only. Nothing is uploaded unless you choose to.</p>
+  <p class="conversations-privacy" id="conversationsPrivacy"$populatedHidden>&#x1F512; Your private data — stored on your machine only. Nothing is uploaded unless you choose to.</p>
 </div>
 ${buildTranscriptModal()}"""
     }
@@ -666,19 +666,26 @@ $listItems
 </div>"""
     }
 
-    /** Demotes conversations to a collapsible private drawer at the bottom. */
+    /**
+     * Demotes conversations to a collapsible private drawer at the bottom.
+     *
+     * The count badge (`.private-count`) is always in the DOM — hidden when the transcript
+     * set is empty — so the deferred hydration from `SummaryPanel.loadDeferredSets` can
+     * update its text and toggle its `hidden` in place instead of triggering a second
+     * `loadHTML`. The `data-transcript-count` attribute lets the JS check the initial
+     * count without re-reading the badge.
+     */
     private fun buildPrivateDrawer(transcriptHashSet: Set<String>): String {
         val count = transcriptHashSet.size
-        val countLabel = if (count > 0)
-            """<span class="private-count">$count session${if (count != 1) "s" else ""}</span>"""
-        else ""
+        val countText = "$count session${if (count != 1) "s" else ""}"
+        val countHidden = if (count > 0) "" else " hidden"
         return """
-<div class="private-drawer" id="privateDrawer">
+<div class="private-drawer" id="privateDrawer" data-transcript-count="$count">
   <div class="private-head" data-collapse="privateDrawer" role="button" tabindex="0" aria-expanded="true">
     <span class="private-lock">&#x1F512;</span>
     <span class="private-title">All Conversations</span>
     <span class="private-badge">PRIVATE</span>
-    $countLabel
+    <span class="private-count" id="privateCount"$countHidden>$countText</span>
     <span class="attach-arrow">&#x25BC;</span>
   </div>
   <div class="private-body">${buildAllConversationsSection(transcriptHashSet)}</div>
@@ -789,12 +796,14 @@ $items
 
         val planItems = planList.joinToString("\n") { p ->
             val key = p.slug
+            // Always emit the translate button — hidden when the plan isn't in the
+            // translate set — so the deferred `planTranslateAvailable` hydration can
+            // clear its `hidden` attribute in place instead of forcing a full page
+            // reload (see SummaryPanel.loadDeferredSets rationale).
             val showTranslate = planTranslateSet.contains(key)
-            val translateBtn = if (showTranslate) {
-                """<button class="topic-action-btn plan-translate-btn" title="Translate to English" data-plan-slug="$key" data-action="translatePlan">&#x1F310;</button>"""
-            } else {
-                ""
-            }
+            val translateHidden = if (showTranslate) "" else " hidden"
+            val translateBtn =
+                """<button class="topic-action-btn plan-translate-btn" title="Translate to English" data-plan-slug="$key" data-action="translatePlan"$translateHidden>&#x1F310;</button>"""
             """
   <div class="plan-item" id="plan-$key">
     <div class="plan-header">

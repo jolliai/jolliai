@@ -479,9 +479,10 @@ object CliIntegrations {
         // ran. Any local failure (daemon crashed, protocol mismatch, socket
         // broke) is logged and falls through to the legacy one-shot spawn so
         // the request still completes.
-        findDaemonForCwd(projectDir)?.let { client ->
+        val daemon = findDaemonForCwd(projectDir)
+        if (daemon != null) {
             try {
-                return client.call(action, projectDir, requestJson, timeoutSeconds)
+                return daemon.call(action, projectDir, requestJson, timeoutSeconds)
             } catch (e: CliBridgeException) {
                 throw e
             } catch (e: CliDaemonClient.CliDaemonTimeoutException) {
@@ -497,6 +498,7 @@ object CliIntegrations {
                 log.warn("CLI daemon call failed, falling back to one-shot spawn: %s", e.message)
             }
         }
+        // No daemon (or the daemon call failed): fall through to a one-shot Node spawn.
         val node = resolveNode()
             ?: throw RuntimeException("Node.js not found — it is required for Jolli Memory. Install Node.js and reopen the project.")
         val cliJs = resolveCliJs()

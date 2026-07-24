@@ -262,6 +262,7 @@ vi.mock("../core/SummaryTree.js", () => ({
 	isLeafNode: vi.fn().mockReturnValue(true),
 	computeDurationDays: vi.fn().mockReturnValue(1),
 	formatDurationLabel: vi.fn().mockReturnValue("1d"),
+	getTranscriptIds: vi.fn().mockReturnValue(["t-1"]),
 	updateTopicInTree: vi.fn().mockReturnValue({ updated: true }),
 	deleteTopicInTree: vi.fn().mockReturnValue({ deleted: true }),
 }));
@@ -1973,7 +1974,7 @@ describe("runIdeBridgeAction — summary-store", () => {
 describe("runIdeBridgeAction — summary-tree", () => {
 	it("analyzes a summary", async () => {
 		const result = await runIdeBridgeAction("summary-tree", "/r", { operation: "analyze", summary: {} });
-		expect(result).toMatchObject({ unified: true, topicCount: 3, durationLabel: "1d" });
+		expect(result).toMatchObject({ unified: true, topicCount: 3, durationLabel: "1d", transcriptIds: ["t-1"] });
 	});
 
 	it("updates a topic in the tree", async () => {

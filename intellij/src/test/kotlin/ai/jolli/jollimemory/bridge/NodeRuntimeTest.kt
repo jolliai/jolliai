@@ -172,6 +172,62 @@ class NodeRuntimeTest {
         NodeRuntime.readRecordedInfo(File(tempDir, "absent.json")).shouldBeNull()
     }
 
+    // ── node-path sibling — the shell dispatchers' plain-text fallback record ──
+
+    @Test
+    fun `writeRecordedInfo writes the bare path to the node-path sibling`() {
+        val file = File(tempDir, "node-info.json")
+        NodeRuntime.writeRecordedInfo(file, NodeInfo("/opt/homebrew/bin/node", "v22.14.0"))
+        // One line, the exact absolute path — run-hook / run-cli read it with sed,
+        // so the format must stay this trivial.
+        File(tempDir, "node-path").readText() shouldBe "/opt/homebrew/bin/node\n"
+    }
+
+    @Test
+    fun `node-path lands next to the record file even in nested dirs`() {
+        val file = File(tempDir, "nested/dir/node-info.json")
+        NodeRuntime.writeRecordedInfo(file, NodeInfo("/usr/local/bin/node", "v20.11.0"))
+        File(tempDir, "nested/dir/node-path").readText() shouldBe "/usr/local/bin/node\n"
+    }
+
+    // ── toBashPathForm — Windows native paths must be rewritten so the Git Bash
+    //    dispatchers can `-x`-check and `exec` them. POSIX paths must be untouched
+    //    so macOS / Linux node-path contents stay byte-identical to today's.
+
+    @Test
+    fun `toBashPathForm leaves POSIX absolute paths untouched`() {
+        NodeRuntime.toBashPathForm("/opt/homebrew/bin/node") shouldBe "/opt/homebrew/bin/node"
+        NodeRuntime.toBashPathForm("/usr/local/bin/node") shouldBe "/usr/local/bin/node"
+    }
+
+    @Test
+    fun `toBashPathForm rewrites Windows drive-letter native paths to MSYS2 form`() {
+        NodeRuntime.toBashPathForm("""C:\Program Files\nodejs\node.exe""") shouldBe
+            "/c/Program Files/nodejs/node.exe"
+        NodeRuntime.toBashPathForm("""D:\tools\node.exe""") shouldBe "/d/tools/node.exe"
+    }
+
+    @Test
+    fun `toBashPathForm rewrites Windows drive-letter forward-slash paths too`() {
+        NodeRuntime.toBashPathForm("C:/Program Files/nodejs/node.exe") shouldBe
+            "/c/Program Files/nodejs/node.exe"
+    }
+
+    @Test
+    fun `toBashPathForm rewrites UNC paths to the MSYS2 double-slash form`() {
+        NodeRuntime.toBashPathForm("""\\server\share\node.exe""") shouldBe "//server/share/node.exe"
+    }
+
+    @Test
+    fun `writeRecordedInfo writes MSYS2-form path for Windows native input`() {
+        val file = File(tempDir, "node-info.json")
+        NodeRuntime.writeRecordedInfo(file, NodeInfo("""C:\Program Files\nodejs\node.exe""", "v22.14.0"))
+        File(tempDir, "node-path").readText() shouldBe "/c/Program Files/nodejs/node.exe\n"
+        // The JSON record still carries the native form — JVM-side callers
+        // (verify / --version) need what Java's own File / ProcessBuilder accepts.
+        NodeRuntime.readRecordedInfo(file)?.path shouldBe """C:\Program Files\nodejs\node.exe"""
+    }
+
     // ── isNodeExecutableName — the chooser-side filename filter ─────────────
 
     @Test
@@ -229,6 +285,8 @@ class NodeRuntimeTest {
         // Persisted, tagged as a manual pick, and now the in-process detection result.
         NodeRuntime.readRecordedInfo(record) shouldBe result.info
         record.readText() shouldContain "\"source\":\"manual\""
+        // The shell dispatchers' fallback record is written alongside.
+        File(tempDir, "node-path").readText() shouldBe bin.absolutePath + "\n"
         NodeRuntime.cached() shouldBe result.info
     }
 

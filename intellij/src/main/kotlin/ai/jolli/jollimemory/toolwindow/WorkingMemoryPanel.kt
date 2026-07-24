@@ -10,6 +10,8 @@ import ai.jolli.jollimemory.core.TranscriptMessageCounter
 import ai.jolli.jollimemory.core.TranscriptSource
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliMemoryService
+import ai.jolli.jollimemory.toolwindow.views.ThemeUtils
+import ai.jolli.jollimemory.toolwindow.views.ThemeUtils.toCssHex
 import ai.jolli.jollimemory.toolwindow.views.WorkingMemoryHtmlBuilder
 import ai.jolli.jollimemory.toolwindow.views.WorkingMemoryHtmlBuilder.WmContext
 import ai.jolli.jollimemory.toolwindow.views.WorkingMemoryHtmlBuilder.WmConversation
@@ -102,6 +104,12 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
                 }
             }, b.cefBrowser)
 
+            // Theme the native Chromium view before the first load so the initial
+            // about:blank → content navigation never flashes white.
+            val wmBg = ThemeUtils.editorBackground()
+            b.component.isOpaque = true
+            b.component.background = wmBg
+            b.setPageBackgroundColor(wmBg.toCssHex())
             b.loadHTML(buildHtml())
             b.component
         } catch (e: Exception) {

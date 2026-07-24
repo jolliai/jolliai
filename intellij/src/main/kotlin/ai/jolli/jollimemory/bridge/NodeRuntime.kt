@@ -58,11 +58,16 @@ data class RejectedCandidate(val path: String, val version: String)
  * auto-attach etc.) cannot block.
  *
  * The verified result is persisted to `~/.jolli/jollimemory/node-info.json`
- * (`{path, version, source, detectedAt}`) and cached in-process. [detect] with
- * `forceRefresh = true` re-runs the full probe — used by the tool window's Retry
- * button after the user installs Node. When every automatic channel fails, the
- * blocking panel offers a file chooser; the pick goes through [adoptManualSelection],
- * which applies the exact same `--version` + minimum-version proof before adopting.
+ * (`{path, version, source, detectedAt}`) and cached in-process. Every write also
+ * records the bare absolute path in a plain-text sibling `node-path` (one line),
+ * kept in lockstep with the JSON record: the shell hook dispatchers (run-hook /
+ * run-cli) read it as a node fallback when the git process PATH has none (GUI git
+ * clients launch git with a minimal PATH), and parsing JSON in POSIX sh is fragile
+ * (Windows path escaping). [detect] with `forceRefresh = true` re-runs the full
+ * probe — used by the tool window's Retry button after the user installs Node.
+ * When every automatic channel fails, the blocking panel offers a file chooser;
+ * the pick goes through [adoptManualSelection], which applies the exact same
+ * `--version` + minimum-version proof before adopting.
  *
  * When detection returns null, callers can read [rejectedFromLastDetection] to explain
  * WHY — currently: Node installs that ran but were below [MIN_SUPPORTED_MAJOR] — so the
@@ -97,6 +102,18 @@ object NodeRuntime {
         get() = env.osName.lowercase().contains("win")
 
     internal const val INFO_FILE_NAME = "node-info.json"
+
+    /**
+     * Plain-text sibling of [INFO_FILE_NAME] holding ONLY the absolute binary path
+     * (one line). The shell hook dispatchers (run-hook / run-cli) read it as their
+     * node fallback when the git process PATH has none — GUI git clients launch git
+     * with a minimal PATH, so without this record their hooks would silently no-op
+     * on a machine that clearly has Node. Plain text (not the JSON record) because
+     * POSIX sh has no robust JSON parsing — Windows paths arrive backslash-escaped
+     * in JSON strings, which sed/grep mangling gets wrong. Written and deleted in
+     * lockstep with [INFO_FILE_NAME] so the two can never disagree.
+     */
+    internal const val PATH_FILE_NAME = "node-path"
 
     /**
      * Oldest Node major the bundled Cli.js runs on (the esbuild bundle targets Node 18;
@@ -195,12 +212,14 @@ object NodeRuntime {
             writeRecordedInfo(infoFile(), found)
         } else {
             log.warn("No usable Node runtime found (probed process/login/interactive PATH + well-known dirs)")
-            // Drop a stale record so the fast path can't resurrect a binary that just failed.
+            // Drop stale records so the fast path (and the shell hook dispatchers'
+            // node-path fallback) can't resurrect a binary that just failed.
             try {
                 infoFile().delete()
             } catch (_: Exception) {
                 // best-effort cleanup
             }
+            deletePathFile(infoFile())
         }
         finish(found)
     }
@@ -555,9 +574,17 @@ object NodeRuntime {
      * Testable seam: records a verified detection (path + version + timestamp).
      * [source] tags how the binary was found — "auto" (detection) or "manual"
      * (file-chooser pick) — for diagnostics; readers ignore it.
+     *
+     * The [PATH_FILE_NAME] sibling is written in lockstep so shell hook dispatchers
+     * can fall back to this runtime when the git process PATH has no node (GUI git
+     * clients). If the JSON write fails we also drop any pre-existing path file so
+     * the two records can never disagree — a stale path pointing at a runtime the
+     * IDE no longer trusts would let the dispatchers keep running an unverified
+     * binary. If only the path write fails, we roll back the JSON for the same
+     * reason.
      */
     internal fun writeRecordedInfo(file: File, info: NodeInfo, source: String = "auto") {
-        try {
+        val jsonOk = try {
             file.parentFile?.mkdirs()
             val o = JsonObject()
             o.addProperty("path", info.path)
@@ -565,8 +592,88 @@ object NodeRuntime {
             o.addProperty("source", source)
             o.addProperty("detectedAt", java.time.Instant.now().toString())
             file.writeText(o.toString() + "\n", Charsets.UTF_8)
+            true
         } catch (e: Exception) {
             log.warn("Failed to write %s: %s", INFO_FILE_NAME, e.message)
+            false
+        }
+        if (!jsonOk) {
+            deletePathFile(file)
+            return
+        }
+        if (!writePathFile(file, info.path)) {
+            // Roll back the JSON AND drop any stale path file so the two records
+            // can never disagree — a leftover node-path would let the shell hook
+            // dispatchers keep running a binary the IDE no longer trusts.
+            try {
+                file.delete()
+            } catch (_: Exception) {
+                // best-effort rollback
+            }
+            deletePathFile(file)
+        }
+    }
+
+    /**
+     * Writes the [PATH_FILE_NAME] sibling next to [recordFile] (one line: the bare path).
+     * Returns true when the file was written, false on any IO failure — the caller uses
+     * that signal to keep the JSON record in lockstep with the path record.
+     */
+    private fun writePathFile(recordFile: File, path: String): Boolean {
+        return try {
+            recordFile.parentFile?.mkdirs()
+            File(recordFile.parentFile, PATH_FILE_NAME).writeText(toBashPathForm(path) + "\n", Charsets.UTF_8)
+            true
+        } catch (e: Exception) {
+            log.warn("Failed to write %s: %s", PATH_FILE_NAME, e.message)
+            false
+        }
+    }
+
+    /**
+     * Rewrites an absolute path into the form the shell hook dispatchers can execute.
+     *
+     * `run-hook` / `run-cli` are POSIX shell scripts; on Windows they run under Git
+     * Bash / MSYS2. `File.absolutePath` there yields the native `C:\Program
+     * Files\nodejs\node.exe`, and both `[ -x "$RECORDED" ]` and `exec "$NODE_BIN"
+     * ...` are unreliable on that form — the backslashes double as shell escape
+     * characters and the drive-letter prefix trips exec()'s path resolution. The
+     * MSYS2 form `/c/Program Files/nodejs/node.exe` executes cleanly.
+     *
+     * Non-Windows paths (POSIX absolute like `/opt/homebrew/bin/node`) already run
+     * fine and are left untouched, which also keeps the on-disk `node-path`
+     * contents byte-for-byte stable for the existing macOS / Linux tests.
+     *
+     * Only the [PATH_FILE_NAME] sibling gets this rewrite — [NodeInfo.path] and the
+     * JSON record keep the native form so JVM-side consumers (verify, --version
+     * probes) still see a path Java's own `File` / `ProcessBuilder` accept.
+     */
+    internal fun toBashPathForm(path: String): String {
+        // Windows drive-letter path (native `C:\…` or forward-slash `C:/…`).
+        if (path.length >= 3 &&
+            path[0].isLetter() &&
+            path[1] == ':' &&
+            (path[2] == '\\' || path[2] == '/')
+        ) {
+            val drive = path[0].lowercaseChar()
+            val rest = path.substring(3).replace('\\', '/')
+            return "/$drive/$rest"
+        }
+        // UNC path `\\server\share\…` → MSYS2 `//server/share/…`.
+        if (path.startsWith("\\\\")) {
+            return "//" + path.substring(2).replace('\\', '/')
+        }
+        // Already POSIX (starts with `/`), or a relative form we would not have
+        // recorded in the first place — leave untouched.
+        return path
+    }
+
+    /** Removes the [PATH_FILE_NAME] sibling next to [recordFile] (best-effort). */
+    private fun deletePathFile(recordFile: File) {
+        try {
+            File(recordFile.parentFile, PATH_FILE_NAME).delete()
+        } catch (_: Exception) {
+            // best-effort cleanup
         }
     }
 }

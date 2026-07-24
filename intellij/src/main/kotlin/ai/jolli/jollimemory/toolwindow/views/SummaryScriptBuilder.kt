@@ -26,13 +26,14 @@ object SummaryScriptBuilder {
   // JS→Java IPC bridge (which mangles multi-byte characters like Chinese,
   // emojis, ·, −, bullets into Latin-1).
   function jmSend(msg) {
-    if (window.__jbQuery) {
+    if (!window.__jbQuery) return;
+    try {
       var json = JSON.stringify(msg);
       var bytes = new TextEncoder().encode(json);
       var binary = '';
       for (var i = 0; i < bytes.length; i++) { binary += String.fromCharCode(bytes[i]); }
       window.__jbQuery(btoa(binary));
-    }
+    } catch (_) { /* bridge send is best-effort */ }
   }
 
   // Tell the panel the user has unsaved edits (typing in any topic / E2E / plan / recap /
@@ -1049,8 +1050,47 @@ ${buildPrMessageScript()}
   // ── Transcript Stats (async load for section description) ──
 
   var conversationsStats = document.getElementById('conversationsStats');
-  if (conversationsStats) {
+  var conversationsSection = document.getElementById('conversationsSection');
+  var conversationsEmpty = document.getElementById('conversationsEmpty');
+  var conversationsDescription = document.getElementById('conversationsDescription');
+  var conversationsPrivacy = document.getElementById('conversationsPrivacy');
+  var privateDrawerEl = document.getElementById('privateDrawer');
+  var privateCountEl = document.getElementById('privateCount');
+  function currentTranscriptCount() {
+    var v = privateDrawerEl && privateDrawerEl.getAttribute('data-transcript-count');
+    var n = v ? parseInt(v, 10) : 0;
+    return isNaN(n) ? 0 : n;
+  }
+  // Only ask for stats when the initial render already carries a non-zero count.
+  // Deferred hydration below re-issues loadTranscriptStats when it flips the count
+  // from zero to non-zero.
+  if (conversationsStats && currentTranscriptCount() > 0) {
     jmSend({ command: 'loadTranscriptStats' });
+  }
+  /**
+   * Update the private-drawer + conversations section to reflect a new transcript
+   * count without re-rendering the page. Fired by the `transcriptsAvailable`
+   * message the panel sends after loadDeferredSets finishes on the background
+   * thread; the elements toggled here are the same ones the server-rendered HTML
+   * already ships (empty and populated branches coexist, hidden appropriately).
+   */
+  function applyTranscriptCount(count) {
+    var n = typeof count === 'number' ? count : parseInt(count, 10);
+    if (isNaN(n) || n < 0) n = 0;
+    var populated = n > 0;
+    if (privateDrawerEl) privateDrawerEl.setAttribute('data-transcript-count', String(n));
+    if (conversationsSection) conversationsSection.setAttribute('data-transcript-count', String(n));
+    if (privateCountEl) {
+      privateCountEl.textContent = n + ' session' + (n !== 1 ? 's' : '');
+      privateCountEl.hidden = !populated;
+    }
+    if (conversationsEmpty) conversationsEmpty.hidden = populated;
+    if (conversationsDescription) conversationsDescription.hidden = !populated;
+    if (conversationsStats) conversationsStats.hidden = !populated;
+    if (conversationsPrivacy) conversationsPrivacy.hidden = !populated;
+    var openBtn = document.getElementById('openTranscriptsBtn');
+    if (openBtn) openBtn.hidden = !populated;
+    if (populated) jmSend({ command: 'loadTranscriptStats' });
   }
 
   // ── Transcript Modal ──
@@ -1542,8 +1582,21 @@ ${buildPrMessageScript()}
         conversationsStats.innerHTML = '<strong>' + msg.totalEntries + '</strong> entries across <strong>' + totalSessions + '</strong> session' + (totalSessions !== 1 ? 's' : '') + (parts.length > 0 ? ' (' + parts.join(', ') + ')' : '');
       }
     }
+    // Deferred-hydration messages from SummaryPanel.loadDeferredSets: instead of a
+    // second loadHTML, the panel posts the new counts here so we can flip `hidden`
+    // and text in place. Avoids the second-loadHTML flash on cold start.
+    if (msg.command === 'transcriptsAvailable') {
+      applyTranscriptCount(msg.count);
+    }
+    if (msg.command === 'planTranslateAvailable') {
+      var slugs = msg.slugs || [];
+      for (var si = 0; si < slugs.length; si++) {
+        var slug = slugs[si];
+        var btn = document.querySelector('.plan-translate-btn[data-plan-slug="' + slug + '"]');
+        if (btn) btn.hidden = false;
+      }
+    }
   });
-
 """
     }
 

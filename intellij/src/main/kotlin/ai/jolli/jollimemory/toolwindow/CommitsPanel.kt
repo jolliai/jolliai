@@ -39,6 +39,7 @@ import java.awt.Cursor
 import java.awt.Dimension
 import java.awt.FlowLayout
 import java.awt.Graphics
+import java.awt.Graphics2D
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
 import java.awt.event.MouseAdapter
@@ -141,6 +142,15 @@ class CommitsPanel(
     private var hoverRow: JPanel? = null
     private var hoverShowTimer: Timer? = null
     private val hoverDismissTimer = Timer(HOVER_HIDE_GRACE_MS) { dismissHoverPopup() }.apply { isRepeats = false }
+
+    /**
+     * The commit row currently displaying the hover tint. Enforces the "only one row
+     * highlighted at a time" invariant: whenever a new row enters hover, the previous
+     * one is cleared here, so a lost mouseExited (e.g. thrown IllegalComponentStateException
+     * when a just-hidden action icon dispatches its own exit) can't leave two rows tinted.
+     */
+    private var currentHoveredCommitRow: JPanel? = null
+    private var currentHoveredCommitRowClear: (() -> Unit)? = null
     private companion object {
         val LOG: com.intellij.openapi.diagnostic.Logger = com.intellij.openapi.diagnostic.Logger.getInstance(CommitsPanel::class.java)
         val log = ai.jolli.jollimemory.core.JmLogger.create("CommitsPanel")
@@ -170,6 +180,11 @@ class CommitsPanel(
     init {
         border = JBUI.Borders.empty(8)
 
+        // Paint a visible placeholder immediately on the EDT so users don't stare at
+        // a blank panel while the initial refresh runs on a pooled thread. Replaced
+        // by updateCommitList / showDisabled when refreshFromGit completes.
+        showInitializing()
+
         service.addStatusListener(statusListener)
         // Refresh when a PR is created/updated or a memory is shared elsewhere (memory
         // summary or Create PR view), so the per-commit PR / Jolli-shared badges stay in
@@ -191,7 +206,15 @@ class CommitsPanel(
             com.intellij.openapi.vcs.VcsListener { scheduleDebouncedGitRefresh() },
         )
 
-        ApplicationManager.getApplication().executeOnPooledThread { refreshFromGit() }
+        // addStatusListener already fires an immediate callback when cachedStatus
+        // is non-null (i.e. JolliMemoryService.initialize has completed), which
+        // schedules the first refresh via statusListener. Only launch a fallback
+        // refresh when the service has not initialized yet — otherwise we would
+        // race a redundant refresh against the listener's one, wasting a full
+        // getBranchCommits round trip on a v=0 result the panel then discards.
+        if (service.getStatus() == null) {
+            ApplicationManager.getApplication().executeOnPooledThread { refreshFromGit() }
+        }
     }
 
     private fun scheduleDebouncedGitRefresh() {
@@ -231,11 +254,39 @@ class CommitsPanel(
                 val newCommits = service.getBranchCommits()
                 isMerged = newCommits.isNotEmpty() && service.isBranchMerged()
                 commits = newCommits
-                prLookup = lookupBranchPr()
+                // Paint immediately with the previous PR lookup; PR chip catches up
+                // asynchronously (same reasoning as refreshFromGit — see comment there).
                 SwingUtilities.invokeLater { updateCommitList() }
+                refreshPrLookupAsync(refreshVersion)
             } catch (_: Exception) {
                 commits = emptyList()
                 SwingUtilities.invokeLater { updateCommitList() }
+            }
+        }
+    }
+
+    /**
+     * Fetches the branch PR off the caller's pool thread, then re-paints the
+     * commit list on the EDT with the fresh [prLookup]. Skips the paint when a
+     * newer refresh has bumped [refreshVersion] past [myVersion] — the newer
+     * refresh will schedule its own PR lookup, so overwriting with our stale
+     * result would flip the PR chip back-and-forth.
+     *
+     * `gh pr list` typically takes 1-3s (a network round-trip), so this runs
+     * OUTSIDE the critical path that renders the commit list; the list is
+     * already visible by the time this returns.
+     */
+    private fun refreshPrLookupAsync(myVersion: Long) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = try {
+                lookupBranchPr()
+            } catch (_: Exception) {
+                null
+            }
+            SwingUtilities.invokeLater {
+                if (refreshVersion != myVersion) return@invokeLater
+                prLookup = result
+                updateCommitList()
             }
         }
     }
@@ -323,9 +374,15 @@ class CommitsPanel(
             isMerged = newCommits.isNotEmpty() && service.isBranchMerged()
 
             commits = newCommits
-            prLookup = lookupBranchPr()
+            // Paint the list NOW using the previous refresh's prLookup (may be null
+            // on first refresh); the PR chip / SHIPPED badge fills in a moment later
+            // once refreshPrLookupAsync finishes. lookupBranchPr talks to `gh` on
+            // the network — synchronously waiting for it here would delay list
+            // rendering by seconds for every refresh.
             SwingUtilities.invokeLater { if (refreshVersion == myVersion) updateCommitList() }
-        } catch (_: Exception) {
+            refreshPrLookupAsync(myVersion)
+        } catch (e: Exception) {
+            log.warn("refreshFromGit threw: %s", e.message ?: "<no message>")
             if (refreshVersion != myVersion) return
             commits = emptyList()
             SwingUtilities.invokeLater { if (refreshVersion == myVersion) updateCommitList() }
@@ -380,11 +437,26 @@ class CommitsPanel(
     }
 
     private fun updateCommitList() {
+        // Snapshot which rows were expanded before we tear commitRowStates down.
+        // A refresh that rebuilds every row — most commonly the async PR-lookup
+        // re-paint that arrives 1–3s after the first paint — must not silently
+        // collapse rows the user opened in the meantime.
+        val previouslyExpanded = commitRowStates.entries
+            .asSequence()
+            .filter { it.value.isExpanded }
+            .map { it.key }
+            .toSet()
+
         rowCount = commits.size
         onRowCountChanged?.invoke(rowCount)
         removeAll()
         listPanel.removeAll()
         commitRowStates.clear()
+        // The previously highlighted row (if any) is about to be discarded from the
+        // component tree. Drop the reference so a subsequent mouseEntered can't try
+        // to clear a stale row belonging to a different render.
+        currentHoveredCommitRow = null
+        currentHoveredCommitRowClear = null
 
         if (commits.isEmpty()) {
             emptyLabel.text = "<html><center>Start coding — your commit memories will appear here.<br/>" +
@@ -421,8 +493,49 @@ class CommitsPanel(
             north.add(buildTokenMeter(totals))
             north.add(listPanel)
             add(north, BorderLayout.NORTH)
+
+            if (previouslyExpanded.isNotEmpty()) {
+                restoreExpandedRows(previouslyExpanded)
+            }
         }
         revalidate(); repaint()
+    }
+
+    /**
+     * Re-applies the isExpanded UI toggles onto the freshly built row states so a
+     * rebuild driven by e.g. [refreshPrLookupAsync] doesn't collapse rows the user
+     * had already opened. When [detailCache] already holds a resolved bundle we
+     * render synchronously to avoid the "Loading..." flash a fresh
+     * [loadExpandedDetail] would show; otherwise we fall back to the async loader.
+     */
+    private fun restoreExpandedRows(previouslyExpanded: Set<String>) {
+        for (hash in previouslyExpanded) {
+            val state = commitRowStates[hash] ?: continue
+            state.isExpanded = true
+            state.arrowLabel.text = ARROW_DOWN
+            state.fileContainer.isVisible = true
+            state.detailsToggle?.isVisible = false
+
+            val cached = detailCache[hash]
+            val commit = commits.firstOrNull { it.hash == hash }
+            val cachedDetail: ExpansionDetail? = if (commit != null && cached != null && cached.isDone) {
+                try { cached.get() } catch (_: Exception) { null }
+            } else {
+                null
+            }
+            if (commit != null && cachedDetail != null) {
+                state.fileContainer.removeAll()
+                renderExpandedGroups(state.fileContainer, commit, cachedDetail)
+                state.detailsLoaded = true
+                state.fileContainer.revalidate()
+                state.fileContainer.repaint()
+            } else {
+                // Cache miss or a prior failure — take the async path. It briefly
+                // shows the "Loading..." placeholder, still better than silently
+                // collapsing the row.
+                loadExpandedDetail(hash)
+            }
+        }
     }
 
     override fun getMaximumSize(): java.awt.Dimension =
@@ -770,9 +883,28 @@ class CommitsPanel(
             // Height tracks content (the title wraps and grows topLine), so the max must
             // follow the current preferred height rather than a value fixed at build time.
             override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
+
+            // Hover tint is a translucent JBColor (see RowStyle.HOVER_BG). Swing's opaque
+            // contract fills the bounds with an alpha<255 colour once but doesn't repaint
+            // the ancestor first, so pixels not covered by children (the chips row's right
+            // padding, "Show memory details" gutter, and the row's own vertical border)
+            // read as the previous frame plus tint — visually the row's left half tints
+            // while the right half stays flat. Paint the overlay ourselves after the
+            // ancestor has drawn, and keep isOpaque=false so the base background is fresh.
+            override fun paintComponent(g: Graphics) {
+                super.paintComponent(g)
+                val bg = background ?: return
+                val g2 = g.create() as Graphics2D
+                try {
+                    g2.color = bg
+                    g2.fillRect(0, 0, width, height)
+                } finally {
+                    g2.dispose()
+                }
+            }
         }.apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
-            isOpaque = true
+            isOpaque = false
             border = JBUI.Borders.empty(2, 4)
             alignmentX = Component.LEFT_ALIGNMENT
             cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
@@ -787,21 +919,52 @@ class CommitsPanel(
         // Hover: reveal the Pin/Copy/Share actions + the sticky hover popup
         // (1s show delay, 200ms hide grace). Hiding is bounds-checked so moving
         // between the row's children doesn't flicker the icons away.
+        //
+        // Two invariants matter here:
+        //   1. isShowing check before locationOnScreen — action icons are toggled visible
+        //      only on hover, and a just-hidden icon can still dispatch a mouseExited whose
+        //      locationOnScreen throws IllegalComponentStateException. Missing this check
+        //      caused row.background to leak the HOVER_BG (two rows tinted at once).
+        //   2. currentHoveredCommitRow bookkeeping — on every enter, clear the previous
+        //      row's tint even if its own mouseExited was lost, so at most one row is tinted.
+        val clearHoverTint: () -> Unit = {
+            row.background = null
+            row.repaint()
+            rowActions.forEach { it.isVisible = false }
+        }
         val hoverListener = object : MouseAdapter() {
             override fun mouseEntered(e: MouseEvent) {
+                val prev = currentHoveredCommitRow
+                if (prev != null && prev !== row) {
+                    currentHoveredCommitRowClear?.invoke()
+                }
                 row.background = RowStyle.HOVER_BG
                 row.repaint()
                 rowActions.forEach { it.isVisible = true }
+                currentHoveredCommitRow = row
+                currentHoveredCommitRowClear = clearHoverTint
                 scheduleShowHoverPopup(row, commit)
             }
             override fun mouseExited(e: MouseEvent) {
                 val src = e.source as? Component ?: return
+                if (!src.isShowing || !row.isShowing) {
+                    clearHoverTint()
+                    if (currentHoveredCommitRow === row) {
+                        currentHoveredCommitRow = null
+                        currentHoveredCommitRowClear = null
+                    }
+                    scheduleHoverDismiss()
+                    return
+                }
                 val screen = src.locationOnScreen.apply { translate(e.x, e.y) }
                 val loc = row.locationOnScreen
-                if (!java.awt.Rectangle(loc.x, loc.y, row.width, row.height).contains(screen)) {
-                    row.background = null
-                    row.repaint()
-                    rowActions.forEach { it.isVisible = false }
+                val stillInside = java.awt.Rectangle(loc.x, loc.y, row.width, row.height).contains(screen)
+                if (!stillInside) {
+                    clearHoverTint()
+                    if (currentHoveredCommitRow === row) {
+                        currentHoveredCommitRow = null
+                        currentHoveredCommitRowClear = null
+                    }
                 }
                 scheduleHoverDismiss()
             }
@@ -1686,6 +1849,8 @@ class CommitsPanel(
         removeAll()
         listPanel.removeAll()
         commitRowStates.clear()
+        currentHoveredCommitRow = null
+        currentHoveredCommitRowClear = null
 
         if (foreignEntries.isEmpty()) {
             emptyLabel.text = "<html><center>No memories found for " +

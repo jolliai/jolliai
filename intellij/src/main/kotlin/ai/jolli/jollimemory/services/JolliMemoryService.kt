@@ -300,7 +300,8 @@ class JolliMemoryService(private val project: Project) : Disposable {
         // activity and the tool window surface a blocking "Node.js required" panel
         // with a Retry that re-runs detection and then this method. Blocking probe,
         // but cheap after the first detection (in-process + node-info.json cache).
-        if (ai.jolli.jollimemory.bridge.NodeRuntime.detect() == null) {
+        val nodeMissingProbe = ai.jolli.jollimemory.bridge.NodeRuntime.detect() == null
+        if (nodeMissingProbe) {
             nodeMissing = true
             lastError = "Node.js not found — Jolli Memory is blocked until it is installed"
             sb.appendLine("BLOCKED: no usable Node.js runtime found")
@@ -432,6 +433,28 @@ class JolliMemoryService(private val project: Project) : Disposable {
             CliIntegrations.retryPendingPushes(basePath)
         }
 
+        // Warm the CLI daemon's hot read paths on a pooled thread so the first memory
+        // click hits warm code instead of paying the cold-call penalty — the first few
+        // daemon calls after spawn cost 100-700ms (Node JIT + cold git/fs caches) vs
+        // 1-30ms warm, and opening a memory tab puts exactly these reads on the EDT.
+        // Covers the three operations a tab open performs: index, transcript-hashes
+        // and get. Fire-and-forget: every call is a read-only, idempotent round trip,
+        // so a failure only means the first click warms the path itself (old behavior).
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                val t = System.currentTimeMillis()
+                val store = ai.jolli.jollimemory.core.SummaryStore(resolvedRoot, gitOps, StorageFactory.create(gitOps, resolvedRoot))
+                val index = store.loadIndex()
+                store.getTranscriptHashes()
+                index?.entries?.firstOrNull()?.commitHash?.let { store.getSummary(it) }
+                log.info("CLI daemon warm-up done in ${System.currentTimeMillis() - t}ms (indexEntries=${index?.entries?.size ?: 0})")
+            } catch (e: Exception) {
+                log.warn("CLI daemon warm-up failed (non-fatal): ${e.message}")
+            }
+        }
+
+        warmJcefRenderPath()
+
         isInitialized = true
         initLog = sb.toString()
         log.info("Initialize complete:\n$initLog")
@@ -473,6 +496,22 @@ class JolliMemoryService(private val project: Project) : Disposable {
             logFile.writeText("=== JolliMemory IntelliJ Init Log ===\n${java.time.Instant.now()}\n\n$initLog")
             log.info("Debug log written to: ${logFile.absolutePath}")
         } catch (_: Exception) { }
+    }
+
+    /**
+     * Kicks off pool prewarm. Delegates to [ai.jolli.jollimemory.toolwindow.JcefBrowserPool]
+     * which builds one browser asynchronously on the EDT and keeps it around for the
+     * first memory tab to reuse — priming the same one-time browser-process costs the
+     * old throwaway warm-up did (libcef load, CefApp init, GPU/network subprocess
+     * spawn, render-launcher OS-cache warmth), plus keeping the browser alive so its
+     * V8 bytecode cache stays warm across every tab that follows.
+     */
+    private fun warmJcefRenderPath() {
+        try {
+            ai.jolli.jollimemory.toolwindow.JcefBrowserPool.get(project).warmUp()
+        } catch (e: Exception) {
+            log.warn("JCEF pool warm-up failed (non-fatal): ${e.message}")
+        }
     }
 
     /**
@@ -860,17 +899,15 @@ class JolliMemoryService(private val project: Project) : Disposable {
         val mergeBase = mergeBaseRaw?.takeIf { it.isNotBlank() }
 
         // If merge-base equals HEAD, we're on main or the branch is fully merged.
-        // - With a remote (baseRef = origin/*): show commits not on the remote
-        //   (origin/main..HEAD) — empty when fully synced.
-        // - Without a remote (baseRef = main / upstream/*): enter merged mode and
-        //   list the user's own commits from the reflog creation point, filtered by
-        //   author. This mirrors VS Code listBranchCommits, which shows committed
-        //   memories on main even in a repo with no remote (previously IntelliJ
-        //   returned an empty panel here).
+        // Enter merged mode: list the user's own commits from the reflog creation
+        // point, filtered by author. Mirrors VS Code listBranchCommits, which does
+        // NOT special-case a fully-synced remote base. IntelliJ previously short-
+        // circuited baseRef=origin/* to "$baseRef..HEAD", which is always empty on
+        // a fully-synced main / release branch and hid every already-pushed memory
+        // from the panel.
         var authorFilter: String? = null
         val range: String? = when {
             mergeBase == null -> null // No common ancestor
-            mergeBase == headHash && baseRef.startsWith("origin/") -> "$baseRef..HEAD"
             mergeBase == headHash -> {
                 val branch = g.getCurrentBranch()?.trim()
                 val merged = if (branch.isNullOrBlank()) null else g.resolveMergedHistory(branch)
@@ -896,21 +933,55 @@ class JolliMemoryService(private val project: Project) : Disposable {
             }
         }
 
-        // Get commits with full metadata. In merged mode an --author filter scopes
-        // the range to the current user's own commits (matching VS Code).
+        // Get commits with metadata AND shortstat in ONE git log call. Two separate
+        // calls used to race a fully-synced remote (each -20 could enumerate a
+        // different set of last-20 commits when a new commit arrived between the
+        // shell-outs) and doubled process-fork overhead. --format has NO trailing
+        // NULNUL so each commit prints its metadata on ONE line and its shortstat
+        // (plus a leading blank line git inserts) on the following lines; the
+        // parser routes each output line by whether it contains a NUL delimiter.
         val logArgs = if (range != null) {
-            val base = arrayOf("log", range, "--format=%H%x00%s%x00%an%x00%ae%x00%aI%x00%x00", "--no-merges")
-            if (authorFilter != null) base + "--author=$authorFilter" else base
+            val base = arrayOf("log", range, "--format=%H%x00%s%x00%an%x00%ae%x00%aI", "--shortstat", "--no-merges")
+            // --fixed-strings makes --author a literal substring match: git treats the
+            // pattern as a regex by default, so a user.name with metacharacters (".", "()")
+            // would error or match the wrong commits. Mirrors cli/core/BranchCommitLister.ts.
+            //
+            // ⚠ GLOBAL FLAG: --fixed-strings switches EVERY pattern operand in this git
+            // invocation to literal mode — not just --author. Adding --grep / --committer /
+            // any other regex-taking flag here without accounting for that will silently
+            // change their semantics. If you need a mix of literal + regex, split into
+            // two `git log` calls instead.
+            if (authorFilter != null) base + arrayOf("--author=$authorFilter", "--fixed-strings") else base
         } else {
-            arrayOf("log", "--format=%H%x00%s%x00%an%x00%ae%x00%aI%x00%x00", "--no-merges", "-20")
+            arrayOf("log", "--format=%H%x00%s%x00%an%x00%ae%x00%aI", "--shortstat", "--no-merges", "-20")
         }
         val output = g.exec(*logArgs) ?: return emptyList()
         if (output.isBlank()) return emptyList()
 
-        // Parse entries (split on double-NUL separator)
-        val rawEntries = output.split("\u0000\u0000\n").filter { it.isNotBlank() }
-        val parsedEntries = rawEntries.map { it.split("\u0000") }.filter { it.size >= 5 }
-        val commitHashes = parsedEntries.map { it[0] }
+        // Route each output line: metadata lines contain the NUL delimiters injected
+        // by --format; any other non-blank line is the shortstat that belongs to the
+        // most recent metadata line. Root commits — where git omits the shortstat —
+        // keep the (0, 0, 0) default seeded when the metadata is first seen.
+        val parsedEntries = mutableListOf<List<String>>()
+        val commitHashes = mutableListOf<String>()
+        val shortstatByHash = mutableMapOf<String, Triple<Int, Int, Int>>()
+        var currentHash: String? = null
+        for (rawLine in output.split("\n")) {
+            if (rawLine.contains('\u0000')) {
+                val parts = rawLine.split("\u0000")
+                if (parts.size >= 5) {
+                    val hash = parts[0]
+                    currentHash = hash
+                    parsedEntries.add(parts)
+                    commitHashes.add(hash)
+                    shortstatByHash[hash] = Triple(0, 0, 0)
+                }
+            } else if (currentHash != null && rawLine.isNotBlank()) {
+                // parseDiffStatLine tolerates non-matching lines (returns 0/0/0), so an
+                // unexpected line here would just leave the seeded default in place.
+                shortstatByHash[currentHash!!] = parseDiffStatLine(rawLine)
+            }
+        }
 
         // Batch check which commits have summaries (including tree-hash aliases)
         val projectPath = mainRepoRoot ?: ""
@@ -936,16 +1007,19 @@ class JolliMemoryService(private val project: Project) : Disposable {
             unpushedOutput.lines().filter { it.isNotBlank() }.forEach { unpushedHashes.add(it) }
         }
 
-        return parsedEntries.map { parts ->
+        // shortstatByHash was populated by the one-pass parser above (same git log call
+        // as the metadata). Per-commit loop cost is now dominated by orphan-branch reads;
+        // accumulate their total so the log shows exactly where a large branch
+        // spends its time.
+        val result = parsedEntries.map { parts ->
             val hash = parts[0]
             val message = parts[1]
             val author = parts[2]
             val email = parts[3]
             val isoDate = parts[4]
 
-            // Get diff stats per commit
-            val diffStatRaw = g.exec("diff", "--shortstat", "$hash^", hash) ?: ""
-            val (files, ins, del) = parseDiffStatLine(diffStatRaw)
+            // Read diff stats from the batched shortstat map (no per-commit shell-out).
+            val (files, ins, del) = shortstatByHash[hash] ?: Triple(0, 0, 0)
 
             // Get topic count, commit type, and memory-detail enrichment from the
             // summary (resolving aliases). The enrichment fields feed the panel's
@@ -1032,6 +1106,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
                 contextCount = contextCount,
             )
         }
+        return result
     }
 
     /** Reads the committed AI conversations for a commit (CONVERSATIONS group). */

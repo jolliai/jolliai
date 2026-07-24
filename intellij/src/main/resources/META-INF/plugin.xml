@@ -50,6 +50,13 @@
         <projectService
             serviceImplementation="ai.jolli.jollimemory.bridge.CliDaemonClient"/>
 
+        <!-- JCEF browser pool shared across memory-summary tabs. Prewarms one
+             browser at IDE-ready and reuses it across every SummaryPanel open,
+             keeping V8's bytecode cache alive so the "white → content" flash
+             collapses to "old content → new content". -->
+        <projectService
+            serviceImplementation="ai.jolli.jollimemory.toolwindow.JcefBrowserPool"/>
+
         <!-- Tool window: sidebar with collapsible STATUS, MEMORIES, PLANS & NOTES, CHANGES panels -->
         <toolWindow
             id="JOLLI"

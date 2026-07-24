@@ -25,6 +25,9 @@ import ai.jolli.jollimemory.toolwindow.views.SummaryHtmlBuilder
 import ai.jolli.jollimemory.toolwindow.views.SummaryMarkdownBuilder
 import ai.jolli.jollimemory.toolwindow.views.SummaryPrMarkdownBuilder
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils
+import ai.jolli.jollimemory.toolwindow.views.ThemeUtils
+import ai.jolli.jollimemory.toolwindow.views.ThemeUtils.isDarkByLuma
+import ai.jolli.jollimemory.toolwindow.views.ThemeUtils.toCssHex
 import ai.jolli.jollimemory.util.ForcePushUtil
 import com.google.gson.Gson
 import com.google.gson.JsonArray
@@ -35,10 +38,8 @@ import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.popup.JBPopupFactory
-import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.jcef.JBCefBrowser
-import com.intellij.ui.jcef.JBCefBrowserBase
 import com.intellij.ui.jcef.JBCefJSQuery
 import com.intellij.ide.BrowserUtil
 import org.cef.browser.CefBrowser
@@ -46,7 +47,6 @@ import org.cef.browser.CefFrame
 import org.cef.handler.CefLoadHandlerAdapter
 import org.cef.handler.CefRequestHandlerAdapter
 import org.cef.network.CefRequest
-import java.awt.Dimension
 import java.awt.Font
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
@@ -75,9 +75,69 @@ class SummaryPanel(
         private set
 
 
+    // Every field cleared in dispose() is @Volatile so an EDT reader (refreshHtml,
+    // triggerNativeRepaint, postToWebview) sees the cleared value promptly when
+    // dispose was raced onto a non-EDT thread by Disposer during project close —
+    // the disposeLock guards the write-side ordering, but the read side is
+    // lock-free (hot path) and needs the volatile happens-before edge.
+    @Volatile
     private var browser: JBCefBrowser? = null
+    @Volatile
     private var jsQuery: JBCefJSQuery? = null
     private var bridgeScript: String = ""
+
+    // Lease from JcefBrowserPool. Non-null once createContent() succeeds; released
+    // (not disposed) on dispose() so the browser goes back to the pool for the next
+    // memory tab to reuse — keeping V8's bytecode cache alive across tabs.
+    @Volatile
+    private var lease: PooledBrowserLease? = null
+
+    // Session-wide sequence number of this panel's browser (from JcefSessionProbe) —
+    // stamped on the render-complete log so the first real tab after the warm-up
+    // browser (#1) is identifiable in debug.log.
+    private var browserNumber = 0
+
+    // Set on dispose() so loadDeferredSets()'s async continuation never re-renders a
+    // torn-down webview (its pooled task can outlive a quick open-then-close).
+    @Volatile
+    private var disposed = false
+
+    // 1500ms fallback Timer scheduled from createContent (see the comment there).
+    // Held so dispose() can explicitly stop it — otherwise the Timer keeps a strong
+    // reference to this panel via its closure and delays GC.
+    @Volatile
+    private var loadFallbackTimer: javax.swing.Timer? = null
+
+    // Swing/AWT listeners registered on the pooled browser's UI component during
+    // createContent(). They are attached to `b.component`, which comes from the
+    // shared JcefBrowserPool and OUTLIVES this panel — the pool returns the same
+    // JBCefBrowser to the next tab. If dispose() didn't remove them, every
+    // open/close cycle would leave up to three stale listeners on that shared
+    // component (their disposed-check self-clean only fires on the next resize
+    // event, and componentListener / hierarchyListener don't check `disposed` at
+    // all), keeping the old panel and its HTML string strongly reachable until a
+    // later resize happens to sweep them.
+    @Volatile
+    private var postFireResizeListenerRef: java.awt.event.ComponentAdapter? = null
+    @Volatile
+    private var preFireComponentListenerRef: java.awt.event.ComponentAdapter? = null
+    @Volatile
+    private var preFireHierarchyListenerRef: java.awt.event.HierarchyListener? = null
+
+    // Snapshot of the pooled browser component the listeners above were attached
+    // to. Held separately from `browser` because we still need it AFTER the
+    // synchronized dispose block has cleared `browser` — that's the point in
+    // dispose() where we detach the listeners, and we must not read `b.component`
+    // through the JBCefBrowser after the lease was handed back to the pool.
+    @Volatile
+    private var browserComponentRef: java.awt.Component? = null
+
+    // Guards the dispose transition. dispose() may run on either the EDT (normal tab
+    // close) or a pooled thread (Disposer during project close); concurrent EDT calls
+    // like refreshHtml would otherwise observe a half-null state (browser cleared but
+    // lease still pending). One lock over the whole snapshot-and-null sequence keeps
+    // observers seeing the panel either fully alive or fully disposed.
+    private val disposeLock = Any()
 
     // Share-overlay auto-open (the Commits-list Share icon opens this editor, then asks the
     // webview to reveal its inline share modal — mirroring the VS Code showWithShareModal flow).
@@ -95,6 +155,7 @@ class SummaryPanel(
 
     @Volatile
     private var shareBranchMode = false
+
     private val gson = Gson()
     private val store: SummaryStore
     private val transcriptHashSet = mutableSetOf<String>()
@@ -107,14 +168,98 @@ class SummaryPanel(
     private val memoryStateListener: () -> Unit = { onMemoryStateChanged() }
 
     init {
+        // PERF: this constructor runs on the EDT (FileEditorProvider.createEditor is synchronous),
+        // so only JCEF construction + HTML build may stay here. The two data loads that used to
+        // run inline — transcript hashes and the plan translate set — moved to loadDeferredSets()
+        // below: they only drive cosmetic extras (the transcripts drawer and plan translate
+        // buttons), yet they put cold daemon calls (100-700ms right after IDE start, 1-30ms warm)
+        // on the UI thread for every tab open. The page now opens instantly with both sets empty
+        // and re-renders once the data lands.
+        //
+        // Panel background matches the current editor colour so any sliver the JCEF native
+        // window leaves around itself — sub-pixel size mismatch, a first-paint frame where
+        // the native surface hasn't taken over, or the brief moment before BorderLayout
+        // reaches the JCEF component — blends into the theme instead of showing Swing's
+        // default Panel background (near-white on Light themes, mid-grey on Dark). This is
+        // what caused the "1-2s white border around the content" the user reported.
+        isOpaque = true
+        background = editorBackground()
         cwd = service?.mainRepoRoot ?: project.basePath ?: ""
         val gitOps = service?.getGitOps()
         val git = gitOps ?: GitOps(cwd)
         store = SummaryStore(cwd, git, StorageFactory.create(git, cwd))
-        refreshTranscriptHashes()
-        refreshPlanTranslateSet()
         add(createContent(), BorderLayout.CENTER)
         if (!readOnly) service?.addMemoryStateListener(memoryStateListener)
+        loadDeferredSets()
+    }
+
+    /**
+     * Loads the transcript-hash and plan-translate sets OFF the EDT, then HYDRATES the
+     * existing webview in place instead of doing a second `loadHTML`.
+     *
+     * Why: on macOS a fresh JCEF (JBCefBrowser) does not always fill the whole component
+     * area on its first paint — the underlying NSView's visible rect can lag the Swing
+     * component's real size, so the top of the tab shows the wrapper's fallback background
+     * until some later resize/layout event forces the native surface to repaint. The
+     * previous "second loadHTML on deferred data" implicitly served as that repaint
+     * trigger, at the cost of a 300–400 ms visible flash. Since the HTML builder now
+     * ships both the empty and populated branches at once (with `hidden` toggling), the
+     * deferred data can be applied via a message — no second navigation, no flash.
+     *
+     * A separate one-shot call in [triggerNativeRepaint] (invoked after onLoadEnd) covers
+     * the "first-paint doesn't fill NSView" problem the old second-loadHTML used to mask.
+     *
+     * If [pageLoaded] hasn't flipped yet when we arrive here, the hydrate is parked in
+     * [deferredHydratePending] and drained from the onLoadEnd handler on the same tick
+     * as [refreshPending].
+     */
+    private fun loadDeferredSets() {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            refreshTranscriptHashes()
+            refreshPlanTranslateSet()
+            ApplicationManager.getApplication().invokeLater {
+                if (disposed) return@invokeLater
+                if (transcriptHashSet.isEmpty() && planTranslateSet.isEmpty()) return@invokeLater
+                // Arm the pending flag even when the webview is currently dirty.
+                // [maybeSendDeferredHydrate] holds it back while dirty and
+                // [postToWebview] re-fires it once a persisted-save ack clears the
+                // dirty flag, so a user who starts editing before the background
+                // scan returns still gets transcript/plan-translate controls
+                // revealed as soon as their next save lands.
+                deferredHydratePending = true
+                maybeSendDeferredHydrate()
+            }
+        }
+    }
+
+    // Armed by [loadDeferredSets] when new data is ready but the init page load may not
+    // have finished yet. Drained by [maybeSendDeferredHydrate] either immediately (if the
+    // page is already loaded) or from the false→true transition in onLoadEnd.
+    @Volatile
+    private var deferredHydratePending = false
+
+    /**
+     * Flush the deferred hydration if the page is loaded and the webview is
+     * clean. Idempotent — a call with nothing pending is a no-op. When the
+     * webview is dirty the pending flag is deliberately kept alive so a later
+     * save (which clears dirty and re-fires this from [postToWebview]) can still
+     * reveal the transcript / plan-translate controls that the initial HTML
+     * ships hidden.
+     */
+    private fun maybeSendDeferredHydrate() {
+        if (!deferredHydratePending) return
+        if (!pageLoaded) return
+        if (disposed) { deferredHydratePending = false; return }
+        // Dirty webview: keep the pending flag so the next dirty→clean transition
+        // (a persisted-save ack in postToWebview) can drain it.
+        if (webviewDirty) return
+        deferredHydratePending = false
+        if (transcriptHashSet.isNotEmpty()) {
+            postToWebview("transcriptsAvailable", mapOf("count" to transcriptHashSet.size))
+        }
+        if (planTranslateSet.isNotEmpty()) {
+            postToWebview("planTranslateAvailable", mapOf("slugs" to planTranslateSet.toList()))
+        }
     }
 
     /**
@@ -148,12 +293,29 @@ class SummaryPanel(
         }
     }
 
+    /** Shorthand for [ThemeUtils.editorBackground] — the read must stay on the EDT. */
+    private fun editorBackground(): java.awt.Color = ThemeUtils.editorBackground()
+
     private fun createContent(): JComponent {
         return try {
-            val b = JBCefBrowser()
+            // Reuse a browser from the project-scoped pool instead of building one per tab. The
+            // pool prewarms a browser at IDE-ready and returns it here in O(1); subsequent tabs
+            // hit the same browser instance so V8's bytecode cache stays warm and the native
+            // window keeps the previous page painted during the loadHTML transition — which
+            // together turn the old "white → content" flash into "old content → new content".
+            //
+            // Default (windowed) rendering: Chromium paints straight into a native view. OSR was
+            // only enabled so a Swing skeleton could overlay the browser; with the skeleton gone
+            // there is nothing to overlay, and OSR's CPU blit was the source of the white "top
+            // band" (a not-yet-blitted bitmap). Direct rendering is GPU-accelerated and repaints
+            // reliably.
+            val acquired = JcefBrowserPool.get(project).acquire("summary-tab:${currentSummary.commitHash.take(8)}")
+            lease = acquired
+            val b = acquired.browser
+            browserNumber = acquired.id
             browser = b
 
-            val query = JBCefJSQuery.create(b as JBCefBrowserBase)
+            val query = acquired.createJSQuery()
             jsQuery = query
             query.addHandler { request ->
                 try {
@@ -180,7 +342,7 @@ class SummaryPanel(
 
             // Intercept link clicks so external URLs open in the system browser
             // instead of navigating inside the JCEF panel (which has no session/cookies).
-            b.jbCefClient.addRequestHandler(object : CefRequestHandlerAdapter() {
+            acquired.addRequestHandler(object : CefRequestHandlerAdapter() {
                 override fun onBeforeBrowse(
                     browser: CefBrowser?,
                     frame: CefFrame?,
@@ -195,21 +357,236 @@ class SummaryPanel(
                     }
                     return false
                 }
-            }, b.cefBrowser)
+            })
 
             // Note page-load completion so a deferred share-open request (openShare, from the
             // Commits list) can reveal the inline overlay once the webview JS is defined.
-            b.jbCefClient.addLoadHandler(object : CefLoadHandlerAdapter() {
+            acquired.addLoadHandler(object : CefLoadHandlerAdapter() {
                 override fun onLoadEnd(browser: CefBrowser?, frame: CefFrame?, httpStatusCode: Int) {
                     if (frame?.isMain != true) return
+                    // Pool no longer primes the browser with a blank page, so there is no
+                    // sentinel URL to filter out here — the very first onLoadEnd is the
+                    // real memory page's.
+                    val wasLoaded = pageLoaded
                     pageLoaded = true
                     maybeOpenShare()
+                    // Consume any pending refresh that queued itself while init was still in
+                    // flight. Only do this on the transition false→true so the refresh's own
+                    // onLoadEnd doesn't re-trigger itself into a loop. Deferred to
+                    // invokeLater so we don't nest a loadHTML inside a Chromium load callback.
+                    if (!wasLoaded && refreshPending) {
+                        refreshPending = false
+                        ApplicationManager.getApplication().invokeLater {
+                            if (!disposed) doRefreshNow()
+                        }
+                    }
+                    // Drain the parked hydrate from loadDeferredSets on the same false→true
+                    // transition (same shape as refreshPending, just no loadHTML).
+                    if (!wasLoaded && deferredHydratePending) {
+                        ApplicationManager.getApplication().invokeLater {
+                            if (!disposed) maybeSendDeferredHydrate()
+                        }
+                    }
+                    // macOS JCEF quirk: the first paint of a freshly-primed browser doesn't
+                    // reliably fill the whole component area — the NSView's visible rect
+                    // lags the Swing component's real size, so the top strip of the tab
+                    // shows the wrapper's fallback background until some later resize/
+                    // layout event pushes the true bounds down to the native surface.
+                    // The old code masked this by doing a second `loadHTML` from
+                    // loadDeferredSets, which triggered a full compositor repaint at the
+                    // cost of a 300–400 ms visible flash. Now we hand-fire that repaint
+                    // via CEF's own `wasResized()` (the same signal a real resize would
+                    // send) plus a Swing-side revalidate/repaint as a belt-and-braces
+                    // fallback for any layer above CEF. Runs once per init load-end on
+                    // the false→true transition so subsequent same-tab reloads don't
+                    // pay for it. Never fires for the prime-page load (filtered above).
+                    if (!wasLoaded) {
+                        ApplicationManager.getApplication().invokeLater {
+                            if (!disposed) triggerNativeRepaint()
+                        }
+                    }
                 }
-            }, b.cefBrowser)
+            })
 
-            val isDark = !JBColor.isBright()
-            val html = SummaryHtmlBuilder.buildHtml(currentSummary, isDark, transcriptHashSet, planTranslateSet, bridgeScript, readOnly)
-            b.loadHTML(html)
+            // Theme background read live from the IDE so the shell + the page --bg equal the
+            // current editor colour (not a hard-coded value). The same colour on the component
+            // and in the page (--bg) keeps the load seamless — no white flash, no skeleton.
+            val pageBg = editorBackground()
+            // isDark from the page bg's luma (not JBColor.isBright()) so the text-colour
+            // vars always match --bg; the LaF and the editor colour scheme are independent.
+            val isDark = pageBg.isDarkByLuma()
+            val pageBgHex = pageBg.toCssHex()
+            val html = SummaryHtmlBuilder.buildHtml(currentSummary, isDark, transcriptHashSet, planTranslateSet, bridgeScript, readOnly, pageBgHex)
+            // Theme-coloured background BEFORE loadHTML: the Swing component background and
+            // the page-level background must both be set before the first load so the native
+            // Chromium view never shows its default white.
+            b.component.isOpaque = true
+            b.component.background = pageBg
+            // setPageBackgroundColor injects document.body.style.backgroundColor into the
+            // browser's initial about:blank page. Chromium keeps the old page visible until
+            // the new page's first frame is committed, so a themed about:blank eliminates the
+            // white flash during the about:blank → loadHTML navigation. Without this, the
+            // native view's default white background is visible for the entire HTML parse +
+            // CSS layout + first-paint window (100-500 ms for a full summary page).
+            b.setPageBackgroundColor(pageBgHex)
+            // Defer the real loadHTML to the next EDT tick. init's caller does
+            //   add(createContent(), BorderLayout.CENTER)
+            // which only assigns this component its final size AFTER createContent returns.
+            // If we loadHTML synchronously here, Chromium starts painting against the
+            // component's still-zero size — on macOS the native CEF view then paints to a
+            // stale canvas rect and slowly catches up over 1-2s, which is the white "L"
+            // gap the user sees around content on first open. By deferring, the enclosing
+            // add() + BorderLayout doLayout run first, the native view has real bounds,
+            // and Chromium paints the full tab area from the first frame.
+            //
+            // Defer the real loadHTML until this component has been ATTACHED to a
+            // shown parent and has valid bounds. The caller runs
+            //   add(createContent(), BorderLayout.CENTER)
+            // which only mark-invalidates the parent; and IntelliJ then takes
+            // several EDT ticks to actually mount the FileEditor into the tab
+            // hierarchy. `invokeLater` was tried as a fallback earlier and turned
+            // out to fire ~5ms after createContent — long before the mount ran —
+            // leaving Chromium to paint on a 0×0 canvas. That's what produced the
+            // 1-2s white "L-shaped gap around content" on first open (confirmed
+            // in debug.log: "loadHTML fired via invokeLater fallback (component=0x0)"
+            // and a later "[refresh] render complete" fixing it after loadDeferredSets).
+            //
+            // Robust signals — fire on whichever comes first:
+            //   1) componentResized: BorderLayout ran and gave the browser real bounds
+            //   2) HierarchyEvent.SHOWING_CHANGED (isShowing==true): the component
+            //      is now attached to a shown parent, which happens strictly after
+            //      IntelliJ's own mount + layout — this is the case fresh browsers
+            //      hit when no size actually changes (0×0 → real size fires (1),
+            //      but a pool-reused browser at the same size doesn't).
+            //   3) Immediate fire if the browser arrives already sized AND showing
+            //      (fast path for stable pool reuse).
+            //   4) Absolute timeout (800 ms) — never leave a browser silent even
+            //      if none of the above fire (defensive).
+            // AtomicBoolean makes all four idempotent.
+            val firedInit = java.util.concurrent.atomic.AtomicBoolean(false)
+            // Only fire when the component is BOTH attached (showing) AND sized. IntelliJ's
+            // FileEditor mount does these in two separate steps — SHOWING_CHANGED first
+            // (isShowing flips to true while width/height are still 0), doLayout later
+            // (componentResized fires and width/height become real). Firing after the
+            // first step alone reproduces the original bug: Chromium gets a 0×0 canvas,
+            // paints to it, and the resulting content ends up scrunched into the
+            // top-left with the rest of the tab white until Chromium slowly catches up.
+            val fireIfReady = Runnable {
+                if (firedInit.get()) return@Runnable
+                if (!b.component.isShowing) return@Runnable
+                if (b.component.width <= 0 || b.component.height <= 0) return@Runnable
+                if (!firedInit.compareAndSet(false, true)) return@Runnable
+                if (disposed) return@Runnable
+                b.loadHTML(html)
+            }
+            // Post-fire size watcher: once the initial loadHTML has gone through,
+            // any later size change on the component is pushed down to CEF via
+            // wasResized(w, h). This is what rescues a background tab that was
+            // fired at 0×0 by the Timer fallback below — as soon as IntelliJ
+            // mounts the tab and the layout kicks in, Chromium learns its true
+            // viewport and repaints. Without this the tab stays permanently blank.
+            val postFireResizeListener = object : java.awt.event.ComponentAdapter() {
+                override fun componentResized(e: java.awt.event.ComponentEvent) {
+                    if (disposed) { b.component.removeComponentListener(this); return }
+                    if (!firedInit.get()) return
+                    val w = b.component.width
+                    val h = b.component.height
+                    if (w <= 0 || h <= 0) return
+                    try {
+                        b.cefBrowser?.wasResized(w, h)
+                    } catch (_: Throwable) { /* best-effort */ }
+                }
+            }
+            postFireResizeListenerRef = postFireResizeListener
+            // Componentlistener: re-check on every resize; keep listening until we actually
+            // fire, then hand the seat over to postFireResizeListener.
+            val componentListener = object : java.awt.event.ComponentAdapter() {
+                override fun componentResized(e: java.awt.event.ComponentEvent) {
+                    fireIfReady.run()
+                    if (firedInit.get()) {
+                        b.component.removeComponentListener(this)
+                        b.component.addComponentListener(postFireResizeListener)
+                    }
+                }
+            }
+            preFireComponentListenerRef = componentListener
+            b.component.addComponentListener(componentListener)
+            // HierarchyListener: same policy — try, but stay wired if we can't fire yet.
+            // On success hand off to postFireResizeListener so later resizes still notify CEF.
+            val hierarchyListener = object : java.awt.event.HierarchyListener {
+                override fun hierarchyChanged(e: java.awt.event.HierarchyEvent) {
+                    if ((e.changeFlags and java.awt.event.HierarchyEvent.SHOWING_CHANGED.toLong()) != 0L) {
+                        fireIfReady.run()
+                        if (firedInit.get()) {
+                            b.component.removeHierarchyListener(this)
+                            // No duplicate add: componentListener's own success branch
+                            // already installed postFireResizeListener when the size
+                            // arrived. If SHOWING_CHANGED fired first without a matching
+                            // componentResized (rare), install it here instead.
+                            if (b.component.componentListeners.none { it === postFireResizeListener }) {
+                                b.component.addComponentListener(postFireResizeListener)
+                            }
+                        }
+                    }
+                }
+            }
+            preFireHierarchyListenerRef = hierarchyListener
+            b.component.addHierarchyListener(hierarchyListener)
+            // Snapshot the component reference for dispose(): the listeners above
+            // live on this specific pooled component and must be detached from it
+            // by name, not via `browser?.component` (browser is cleared in dispose
+            // BEFORE the detach step to keep other observers seeing a consistent
+            // torn-down state).
+            browserComponentRef = b.component
+            // Fast path: pool-reused browser that already arrives sized + showing.
+            // If this fires, the two listeners above still exist but will short-circuit;
+            // they never install postFireResizeListener because their branches run only
+            // when the event fires. Attach it here directly so future resizes still
+            // notify CEF via wasResized (belt-and-braces for a resized tool window).
+            fireIfReady.run()
+            if (firedInit.get()) {
+                b.component.removeComponentListener(componentListener)
+                b.component.removeHierarchyListener(hierarchyListener)
+                b.component.addComponentListener(postFireResizeListener)
+            }
+            // Last-resort timeout: if 1500 ms goes by without either componentResized
+            // or SHOWING_CHANGED, we're on a background tab that IntelliJ hasn't
+            // mounted yet. DO NOT fire loadHTML into a 0×0 canvas — that produces a
+            // permanently blank tab because Chromium doesn't automatically re-render
+            // when the surface size later goes non-zero. Instead:
+            //   • If the component now has real bounds, fire cleanly.
+            //   • If it's still 0×0, log a warning, install the post-fire listener
+            //     directly (so a later mount pushes wasResized(w,h) down to CEF), and
+            //     leave `firedInit` false — the first real componentResized will then
+            //     go through the normal fireIfReady path.
+            loadFallbackTimer = javax.swing.Timer(1500) {
+                if (disposed) {
+                    b.component.removeComponentListener(componentListener)
+                    b.component.removeHierarchyListener(hierarchyListener)
+                    return@Timer
+                }
+                if (firedInit.get()) return@Timer
+                val w = b.component.width
+                val h = b.component.height
+                val showing = b.component.isShowing
+                if (w > 0 && h > 0) {
+                    if (firedInit.compareAndSet(false, true)) {
+                        jmLog.warn(
+                            "loadHTML forcing fire after 1500ms (component=%dx%d, showing=%s)",
+                            w, h, showing,
+                        )
+                        b.loadHTML(html)
+                        b.component.removeComponentListener(componentListener)
+                        b.component.removeHierarchyListener(hierarchyListener)
+                        b.component.addComponentListener(postFireResizeListener)
+                    }
+                } else {
+                    jmLog.warn(
+                        "loadHTML timeout after 1500ms but component still 0×0 (showing=%s) — keeping listeners so a later mount fires cleanly",
+                        showing,
+                    )
+                }
+            }.apply { isRepeats = false; start() }
             b.component
         } catch (e: Exception) {
             LOG.info("JCEF unavailable: ${e.message}")
@@ -226,9 +603,72 @@ class SummaryPanel(
     }
 
     fun dispose() {
+        // Snapshot every field-to-clear inside a single synchronized section so a
+        // concurrent EDT call (refreshHtml / postToWebview) either sees the panel
+        // fully alive or fully torn down — never a half-null intermediate state.
+        val leaseSnapshot: PooledBrowserLease?
+        val timerSnapshot: javax.swing.Timer?
+        val browserComponentSnapshot: java.awt.Component?
+        val postFireSnapshot: java.awt.event.ComponentAdapter?
+        val preFireCompSnapshot: java.awt.event.ComponentAdapter?
+        val preFireHierarchySnapshot: java.awt.event.HierarchyListener?
+        synchronized(disposeLock) {
+            if (disposed) return
+            disposed = true
+            leaseSnapshot = lease
+            timerSnapshot = loadFallbackTimer
+            browserComponentSnapshot = browserComponentRef
+            postFireSnapshot = postFireResizeListenerRef
+            preFireCompSnapshot = preFireComponentListenerRef
+            preFireHierarchySnapshot = preFireHierarchyListenerRef
+            lease = null
+            loadFallbackTimer = null
+            jsQuery = null
+            browser = null
+            browserComponentRef = null
+            postFireResizeListenerRef = null
+            preFireComponentListenerRef = null
+            preFireHierarchyListenerRef = null
+        }
         service?.removeMemoryStateListener(memoryStateListener)
-        jsQuery?.dispose()
-        browser?.dispose()
+        // Stop the fallback loadHTML Timer explicitly. isRepeats=false only guarantees
+        // it fires at most once — the closure still pins this panel until then.
+        timerSnapshot?.stop()
+        // Detach the Swing/AWT listeners we attached to the pooled browser's component.
+        // PooledBrowserLease.release() only unhooks JCEF-layer stuff (JS queries, load /
+        // request handlers); the ComponentListener / HierarchyListener sit on the shared
+        // AWT component and would otherwise stack up across open/close cycles, keeping
+        // stale SummaryPanel closures (and the associated HTML string) reachable.
+        // Runs BEFORE the lease is returned to the pool so no other tenant can attach
+        // to the component in between.
+        val comp = browserComponentSnapshot
+        if (comp != null) {
+            val detach = Runnable {
+                try { postFireSnapshot?.let { comp.removeComponentListener(it) } } catch (_: Throwable) { /* best-effort */ }
+                try { preFireCompSnapshot?.let { comp.removeComponentListener(it) } } catch (_: Throwable) { /* best-effort */ }
+                try { preFireHierarchySnapshot?.let { comp.removeHierarchyListener(it) } } catch (_: Throwable) { /* best-effort */ }
+            }
+            if (ApplicationManager.getApplication().isDispatchThread) {
+                detach.run()
+            } else {
+                ApplicationManager.getApplication().invokeLater(detach)
+            }
+        }
+        // Release detaches the JS query and CEF handlers we attached, then returns the
+        // browser to the pool for reuse instead of disposing it. If the pool is over
+        // capacity it will LRU-evict internally — we don't decide that here.
+        //
+        // JcefBrowserPool.releaseEntry asserts EDT; FileEditor.dispose is normally
+        // called on the EDT when a tab is closed, but Disposer can tear editors down
+        // from any thread when the project itself is closing. Hop to the EDT so a
+        // late shutdown doesn't leak the lease into the leased set and starve the pool.
+        if (leaseSnapshot != null) {
+            if (ApplicationManager.getApplication().isDispatchThread) {
+                leaseSnapshot.release()
+            } else {
+                ApplicationManager.getApplication().invokeLater { leaseSnapshot.release() }
+            }
+        }
     }
 
     /**
@@ -273,35 +713,102 @@ class SummaryPanel(
     )
 
     private fun postToWebview(command: String, data: Map<String, Any?> = emptyMap()) {
-        if (command in savePersistedAcks) webviewDirty = false
+        val clearedDirty = command in savePersistedAcks
+        if (clearedDirty) webviewDirty = false
         val payload = gson.toJson(data + ("command" to command))
-        // Encode as Base64 to avoid any escaping issues with newlines, quotes, backslashes in content.
-        // Use TextDecoder on the JS side to correctly decode UTF-8 multi-byte characters
-        // (emojis, ·, −, etc.) that atob() alone would mangle into Latin-1 code points.
         val b64 = java.util.Base64.getEncoder().encodeToString(payload.toByteArray(Charsets.UTF_8))
+        val currentUrl = browser?.cefBrowser?.url ?: ""
         browser?.cefBrowser?.executeJavaScript(
             "window.dispatchEvent(new CustomEvent('jollimemory', { detail: JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('$b64'), function(c){ return c.charCodeAt(0); }))) }));",
-            browser?.cefBrowser?.url ?: "",
+            currentUrl,
             0,
         )
+        // If this ack cleared the dirty flag, drain any hydrate the background
+        // scan parked while the user was mid-edit. maybeSendDeferredHydrate is a
+        // no-op unless deferredHydratePending is set, so the call is cheap.
+        if (clearedDirty) maybeSendDeferredHydrate()
     }
 
+    @Volatile
+    private var refreshPending = false
+
     private fun refreshHtml() {
+        // Wait for the init loadHTML to finish before firing a refresh. Otherwise a
+        // refresh triggered by loadDeferredSets — which runs a pooled ide-bridge call
+        // in parallel with the init page load and typically returns 30-80 ms later —
+        // reaches loadHTML while Chromium is still parsing init's DOM (which itself
+        // takes 100-300 ms for the 144 KB summary page). Chromium then aborts init
+        // and restarts, and the user sees the tab flash (blank → init partial →
+        // blank → refresh painted).
+        //
+        // Instead of spin-retrying with invokeLater ticks (which drain 100+ ticks in
+        // milliseconds and give up long before onLoadEnd fires), latch a pending flag;
+        // the onLoadEnd handler picks it up as soon as init finishes and fires the
+        // refresh once, cleanly, against a fully-parsed page.
+        if (!pageLoaded) {
+            refreshPending = true
+            return
+        }
+        doRefreshNow()
+    }
+
+    private fun doRefreshNow() {
         // A full reload replaces the DOM, so clear the unsaved-edits flag: future
         // memory-state events may refresh again.
         webviewDirty = false
-        val isDark = !JBColor.isBright()
-        val html = SummaryHtmlBuilder.buildHtml(currentSummary, isDark, transcriptHashSet, planTranslateSet, bridgeScript, readOnly)
+        val pageBg = editorBackground()
+        val isDark = pageBg.isDarkByLuma()
+        val pageBgHex = pageBg.toCssHex()
+        val html = SummaryHtmlBuilder.buildHtml(currentSummary, isDark, transcriptHashSet, planTranslateSet, bridgeScript, readOnly, pageBgHex)
         browser?.loadHTML(html)
+    }
+
+    /**
+     * Nudge the underlying JCEF native surface into a full repaint after the first
+     * loadHTML — see the `onLoadEnd` handler for background. Three signals sent in
+     * escalating strength; every one of them is cheap and independently safe:
+     *   1. `CefBrowser.wasResized()` — the same "your viewport may have changed"
+     *      notification a real drag-resize would send. This is what usually forces
+     *      Chromium to reconcile its rendered bitmap with the NSView's visible rect
+     *      on macOS.
+     *   2. `component.revalidate()` — kicks the Swing layout manager so the wrapper
+     *      component's bounds are re-published to any child observers.
+     *   3. `component.repaint()` — asks AWT/Swing to redraw the wrapper; lightweight
+     *      for a heavyweight peer but doesn't hurt.
+     * Guarded by a try/catch because the browser can be torn down while our
+     * invokeLater is queued (project close, tab dispose).
+     */
+    private fun triggerNativeRepaint() {
+        val b = browser ?: return
+        val c = b.component
+        val w = c.width
+        val h = c.height
+        if (w <= 0 || h <= 0) return
+        try {
+            // CefBrowser.wasResized(width, height): same signal a drag-resize sends,
+            // forcing Chromium to reconcile its bitmap with the NSView's visible rect.
+            b.cefBrowser?.wasResized(w, h)
+        } catch (e: Throwable) {
+            jmLog.warn("triggerNativeRepaint: wasResized failed: %s", e.message ?: "")
+        }
+        try {
+            c.revalidate()
+            c.repaint()
+        } catch (e: Throwable) {
+            jmLog.warn("triggerNativeRepaint: swing revalidate/repaint failed: %s", e.message ?: "")
+        }
     }
 
     private fun refreshTranscriptHashes() {
         transcriptHashSet.clear()
         try {
-            val allHashes = collectTreeHashes(currentSummary)
+            // CLI-owned getTranscriptIds: v5 `summary.transcripts` UUIDs (with a
+            // v3/v4 commit-hash fallback) intersected with the transcript files
+            // actually on the orphan branch — mirroring the VS Code panel.
+            val allIds = SummaryTree.getTranscriptIds(currentSummary)
             val onBranch = store.getTranscriptHashes()
-            transcriptHashSet.addAll(allHashes.intersect(onBranch))
-            LOG.info("refreshTranscriptHashes: tree=${allHashes.size}, onBranch=${onBranch.size}, matched=${transcriptHashSet.size}")
+            transcriptHashSet.addAll(allIds.toSet().intersect(onBranch))
+            LOG.info("refreshTranscriptHashes: tree=${allIds.size}, onBranch=${onBranch.size}, matched=${transcriptHashSet.size}")
         } catch (e: Exception) {
             LOG.warn("refreshTranscriptHashes failed: ${e.message}", e)
         }
@@ -309,6 +816,8 @@ class SummaryPanel(
 
     private fun refreshPlanTranslateSet() {
         planTranslateSet.clear()
+        // PERF: each readPlanFromBranch below is one ide-bridge call — the per-plan loop makes
+        // this O(plans) calls, which is why it runs via loadDeferredSets() off the EDT.
         val cjkPattern = Regex("[\\u4E00-\\u9FFF\\u3400-\\u4DBF\\uF900-\\uFAFF]")
         val plans = SummaryUtils.collectAllPlans(currentSummary)
         for (plan in plans) {
@@ -1457,11 +1966,5 @@ class SummaryPanel(
 
         /** Writes to <projectDir>/.jolli/jollimemory/debug.log (same sink as PrService). */
         private val jmLog = ai.jolli.jollimemory.core.JmLogger.create("SummaryPanel")
-
-        fun collectTreeHashes(summary: CommitSummary): Set<String> {
-            val hashes = mutableSetOf(summary.commitHash)
-            summary.children?.forEach { hashes.addAll(collectTreeHashes(it)) }
-            return hashes
-        }
     }
 }
