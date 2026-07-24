@@ -36,7 +36,7 @@ import {
 	removeGeminiHook,
 	syncGlobalInstructions,
 } from "../../../cli/src/install/Installer.js";
-import type { JolliMemoryConfig } from "../../../cli/src/Types.js";
+import type { JolliMemoryConfig, LocalAgentToolId } from "../../../cli/src/Types.js";
 import type { AuthService } from "../services/AuthService.js";
 import { log } from "../util/Logger.js";
 import { buildSettingsHtml } from "./SettingsHtmlBuilder.js";
@@ -47,7 +47,7 @@ interface SettingsPayload {
 	readonly model: string;
 	readonly maxTokens: number | null;
 	readonly aiProvider: "anthropic" | "jolli" | "local-agent";
-	readonly localAgentTool?: "claude-code";
+	readonly localAgentTool?: LocalAgentToolId;
 	readonly jolliApiKey: string;
 	readonly claudeEnabled: boolean;
 	readonly codexEnabled: boolean;

@@ -126,7 +126,7 @@ jolli status
 | [QueueWorker.ts](src/hooks/QueueWorker.ts) | `dist/QueueWorker.js` | Background queue processor — LLM summarization for `commit` / `amend`, LLM-driven `generateSquashConsolidation` (with mechanical merge as fallback) for `squash` / `rebase-squash`, and 1:1 hash migration for `rebase-pick` |
 | [PostRewriteHook.ts](src/hooks/PostRewriteHook.ts) | `dist/PostRewriteHook.js` | Git post-rewrite hook (enqueues amend/rebase entries) |
 | [PrepareMsgHook.ts](src/hooks/PrepareMsgHook.ts) | `dist/PrepareMsgHook.js` | Git prepare-commit-msg hook (squash detection) |
-| [GeminiAfterAgentHook.ts](src/hooks/GeminiAfterAgentHook.ts) | `dist/GeminiAfterAgentHook.js` | Gemini CLI AfterAgent event handler |
+| [GeminiAfterAgentHook.ts](src/hooks/GeminiAfterAgentHook.ts) | `dist/GeminiAfterAgentHook.js` | Gemini AfterAgent event handler |
 
 ## Core Modules
 
@@ -139,10 +139,10 @@ jolli status
 | [TranscriptReader.ts](src/core/TranscriptReader.ts) | Parses Claude Code JSONL transcript files with cursor-based incremental reading |
 | [TranscriptParser.ts](src/core/TranscriptParser.ts) | Source-specific parsers (Claude, Codex, Gemini) |
 | [GeminiTranscriptReader.ts](src/core/GeminiTranscriptReader.ts) | Dedicated JSON reader for Gemini transcript format |
-| [CodexSessionDiscoverer.ts](src/core/CodexSessionDiscoverer.ts) | Discovers Codex CLI sessions by scanning the filesystem |
+| [CodexSessionDiscoverer.ts](src/core/CodexSessionDiscoverer.ts) | Discovers Codex sessions by scanning the filesystem |
 | [CodexDiscovery.ts](src/core/CodexDiscovery.ts) | Codex polling-path artifact discovery (`discoverCodexConversations`). Extracts Linear/Jira/GitHub/Notion/Slack/Zoom references **and markdown plans** from Codex rollout transcripts on the VS Code sidebar's 60s polling tick. References scan first; their safe cursor caps plan scanning so plans never re-process lines a later poll re-reads (no plans.json churn). Reuses the shared source-agnostic envelope parser ([references/TranscriptEnvelopeParser.ts](src/core/references/TranscriptEnvelopeParser.ts) → `CodexEnvelopeParser`), the per-agent plan scanner ([plans/PlanTranscriptScanner.ts](src/core/plans/PlanTranscriptScanner.ts) → `CodexPlanScanner`), and the same `discovery-cursors.json` cursor as the Claude Stop path; single-flight + dirty-rerun per cwd, never throws. |
 | [plans/](src/core/plans/) | Source-parameterized plan discovery, mirroring `references/`. [PlanTranscriptScanner.ts](src/core/plans/PlanTranscriptScanner.ts) is the per-agent interface + `getPlanScanner(source)` registry; [ClaudePlanScanner.ts](src/core/plans/ClaudePlanScanner.ts) reads plan-mode slugs + Write/Edit `.md` paths, [CodexPlanScanner.ts](src/core/plans/CodexPlanScanner.ts) reads `apply_patch` `*** Add/Update File:` / `*** Move to:` headers. [TranscriptPlanDiscovery.ts](src/core/plans/TranscriptPlanDiscovery.ts) is the source-agnostic `scanPlansFrom(…, source, toLine)` driver: shared `isExternalPlanCandidate` filter, archive guard, note dedup, `resolveUniqueSlug`, concurrent merge under `withPlansLock`. |
-| [GeminiSessionDetector.ts](src/core/GeminiSessionDetector.ts) | Detects Gemini CLI installation |
+| [GeminiSessionDetector.ts](src/core/GeminiSessionDetector.ts) | Detects Gemini installation |
 | [OpenCodeSessionDiscoverer.ts](src/core/OpenCodeSessionDiscoverer.ts) | Discovers OpenCode sessions by reading `~/.local/share/opencode/opencode.db` (Node 22.5+ `node:sqlite`, lazy-imported and feature-gated). Surfaces a typed `OpenCodeScanError` when the DB is present but unreadable (corrupt / locked / schema mismatch) so the UI can render a dedicated "unavailable" row. |
 | [OpenCodeTranscriptReader.ts](src/core/OpenCodeTranscriptReader.ts) | Reads OpenCode message rows out of `opencode.db` and converts them into the shared `TranscriptEntry` shape used by the rest of the pipeline |
 | [CursorDetector.ts](src/core/CursorDetector.ts) / [CursorSessionDiscoverer.ts](src/core/CursorSessionDiscoverer.ts) / [CursorTranscriptReader.ts](src/core/CursorTranscriptReader.ts) | Cursor IDE (Composer) integration. Detector → "is Cursor installed", discoverer scans the workspace storage, reader normalises to `TranscriptEntry`. Same lazy-import + feature-gate pattern as OpenCode. |

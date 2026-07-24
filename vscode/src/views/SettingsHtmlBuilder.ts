@@ -14,9 +14,15 @@
  *   5. Others        — exclude patterns
  */
 
+import { LOCAL_AGENT_TOOLS } from "../../../cli/src/core/localagent/ToolMeta.js";
 import { GLOBAL_INSTRUCTIONS_PROMPT } from "../../../cli/src/install/GlobalInstructionsInstaller.js";
 import { buildSettingsCss } from "./SettingsCssBuilder.js";
 import { buildSettingsScript } from "./SettingsScriptBuilder.js";
+
+/** `<option>` tags for the agent-tool dropdown, one per supported local agent tool. */
+const LOCAL_AGENT_TOOL_OPTIONS = (Object.keys(LOCAL_AGENT_TOOLS) as Array<keyof typeof LOCAL_AGENT_TOOLS>)
+	.map((id) => `<option value="${id}">${LOCAL_AGENT_TOOLS[id].label}</option>`)
+	.join("\n          ");
 
 /**
  * Builds the full HTML document for the Settings webview.
@@ -50,8 +56,8 @@ export function buildSettingsHtml(nonce: string): string {
     <section class="tab-panel" data-panel="agents" role="tabpanel">
       <p class="section-hint">Choose which AI agents to track.</p>
       ${buildToggleRow("claudeEnabled", "Claude Code", "Session tracking via Stop hook")}
-      ${buildToggleRow("codexEnabled", "Codex CLI", "Session discovery via filesystem scan")}
-      ${buildToggleRow("geminiEnabled", "Gemini CLI", "Session tracking via AfterAgent hook")}
+      ${buildToggleRow("codexEnabled", "Codex", "Session discovery via filesystem scan")}
+      ${buildToggleRow("geminiEnabled", "Gemini", "Session tracking via AfterAgent hook")}
       ${buildToggleRow("openCodeEnabled", "OpenCode", "Session discovery via ~/.local/share/opencode/opencode.db")}
       ${buildToggleRow("cursorEnabled", "Cursor", "Session discovery for Cursor's Composer IDE (local SQLite store) and the cursor-agent CLI (~/.cursor/chats + agent-transcripts JSONL)")}
       ${buildToggleRow("devinEnabled", "Devin", "Session discovery via Devin CLI's global SQLite store (~/.local/share/devin/cli/sessions.db)")}
@@ -70,7 +76,7 @@ export function buildSettingsHtml(nonce: string): string {
         <select id="aiProvider">
           <option value="anthropic">Anthropic</option>
           <option value="jolli">Jolli</option>
-          <option value="local-agent">Local Agent (subscription)</option>
+          <option value="local-agent">Local Agent</option>
         </select>
       </div>
       <p class="section-hint">Choose how AI summaries are generated for each commit.</p>
@@ -158,9 +164,9 @@ export function buildSettingsHtml(nonce: string): string {
       <div class="card-panel hidden" data-card="local-agent">
         <label class="settings-label" for="localAgentTool">Agent tool</label>
         <select id="localAgentTool">
-          <option value="claude-code">Claude Code</option>
+          ${LOCAL_AGENT_TOOL_OPTIONS}
         </select>
-        <p class="section-hint">Uses your local Claude Code login (subscription). Sign in with the claude CLI if prompted.</p>
+        <p class="section-hint">Uses your local agent's own login (subscription/BYOK). Sign in with that tool's CLI if prompted.</p>
       </div>
     </section>
 

@@ -4,8 +4,8 @@
  * Writes one byte-identical SKILL.md per skill into the cross-platform target:
  *
  *   - `<projectDir>/.agents/skills/<name>/SKILL.md`  — the cross-platform
- *     Agent Skills standard, picked up by Codex CLI, Cursor 2.4+, Windsurf,
- *     OpenCode, Gemini CLI, GitHub Copilot.
+ *     Agent Skills standard, picked up by Codex, Cursor 2.4+, Windsurf,
+ *     OpenCode, Gemini, GitHub Copilot.
  *
  * **Claude Code (`.claude/skills/`) is deliberately NOT a write target.** The
  * Claude Code plugin owns Claude Code skills as namespaced `/jolli:*`, so a full
@@ -1842,8 +1842,11 @@ guessing. This is the state-aware front door — not a static list.
 - \`enabled\` — are Jolli's git hooks installed in this repo (is memory
   generation on)?
 - \`account.signedIn\` — is the user signed in to Jolli?
-- \`account.jolliApiKeyConfigured\` / \`account.anthropicKeyConfigured\` — is a
-  generation credential present?
+- \`account.jolliApiKeyConfigured\` — is a stored Jolli API key present? Surfaced
+  ONLY when signed OUT (a sign-in already implies a Jolli credential, so the field
+  is omitted once \`account.signedIn\` is true).
+- \`account.anthropicKeyConfigured\` — is an Anthropic key present? Surfaced ONLY
+  when \`account.aiProvider === "anthropic"\`; omitted for every other provider.
 - \`account.site\` — the Jolli site host, for the snapshot line.
 - \`storedMemories\` — how many memories this repo already has.
 - \`space\` — the bound Jolli Space (\`{ name }\`) this repo's memories sync to, or
@@ -1870,16 +1873,17 @@ Derive two capabilities from Step 1, mirroring the CLI's guided front door:
 
 - **can generate memories** — provider-AWARE, NOT a blind OR of every field.
   Read \`account.aiProvider\` and decide:
-  - \`local-agent\` → **yes** (memories generate through the user's local Claude
-    subscription — no API key and no Jolli sign-in required). This is the plugin's
-    default, so a freshly-installed plugin repo can already generate.
-  - \`jolli\` → yes only if \`account.jolliApiKeyConfigured\`.
+  - \`local-agent\` → **yes** (memories generate through the user's local agent CLI
+    named by \`account.localAgentTool\` — no API key and no Jolli sign-in required).
+    This is the plugin's default, so a freshly-installed plugin repo can already
+    generate.
+  - \`jolli\` → yes if \`account.signedIn\` OR \`account.jolliApiKeyConfigured\`.
   - \`anthropic\` → yes only if \`account.anthropicKeyConfigured\`.
-  - \`null\` / unset → yes if \`account.jolliApiKeyConfigured\` OR
-    \`account.anthropicKeyConfigured\`.
+  - \`null\` / unset → yes if \`account.signedIn\` OR \`account.jolliApiKeyConfigured\`.
 
-  (\`account.signedIn\` alone does NOT count — an OAuth token is a sync credential,
-  not a generation one.)
+  (For the Jolli proxy a sign-in DOES carry a generation credential — signing in
+  mints a Jolli API key — which is why \`jolliApiKeyConfigured\` is omitted once
+  signed in. For the \`anthropic\` provider, sign-in alone does NOT count.)
 - **enabled** = the \`enabled\` flag.
 
 Then take exactly one branch:

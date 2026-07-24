@@ -6,7 +6,7 @@
  * their own modules:
  *   - ClaudeHookInstaller.ts  — Claude Code settings.local.json
  *   - GitHookInstaller.ts     — git shell hooks (post-commit, post-rewrite, prepare-commit-msg)
- *   - GeminiHookInstaller.ts  — Gemini CLI settings.json
+ *   - GeminiHookInstaller.ts  — Gemini settings.json
  *   - DispatchScripts.ts      — resolve-dist-path / run-hook / run-cli templates
  *   - DistPathResolver.ts     — per-source dist-paths registry + installDistPath
  *   - HookSettingsHelper.ts   — shared types, constants, matcher helpers
@@ -535,15 +535,15 @@ export async function install(
 			}
 		}
 
-		// Auto-detect Codex CLI and enable session discovery (saved to global config)
+		// Auto-detect Codex and enable session discovery (saved to global config)
 		if (codexDetectedOnce) {
 			if (config.codexEnabled === undefined) {
 				await saveConfig({ codexEnabled: true });
-				log.info("Codex CLI detected — enabled Codex session discovery");
+				log.info("Codex detected — enabled Codex session discovery");
 			}
 		}
 
-		// Auto-detect Gemini CLI and install AfterAgent hook in all worktrees (if enabled).
+		// Auto-detect Gemini and install AfterAgent hook in all worktrees (if enabled).
 		// The AfterAgent hook install is skipped in integrations-only mode; the config
 		// flag is still recorded so session discovery works for the caller's own hooks.
 		let geminiSettingsPath: string | undefined;
@@ -559,7 +559,7 @@ export async function install(
 			}
 			if (config.geminiEnabled === undefined) {
 				await saveConfig({ geminiEnabled: true });
-				log.info("Gemini CLI detected — enabled Gemini session tracking");
+				log.info("Gemini detected — enabled Gemini session tracking");
 			}
 		}
 

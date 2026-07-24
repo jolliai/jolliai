@@ -58,8 +58,8 @@ These hooks track which AI sessions are active. They only record session metadat
 | Agent | Mechanism | How it works |
 |-------|-----------|-------------|
 | **Claude Code** | `StopHook` + `SessionStartHook` | `StopHook` runs after each AI response and writes session info to `sessions.json`. `SessionStartHook` records new sessions at start so the cross-machine `/jolli-recall` flow can locate transcripts. |
-| **Gemini CLI** | `GeminiAfterAgentHook` | Same stdin format as Claude's StopHook; additionally outputs `{}` to stdout (Gemini hook spec). |
-| **Codex CLI** | _(no hook)_ | Sessions discovered by scanning `~/.codex/sessions/` at post-commit time. |
+| **Gemini** | `GeminiAfterAgentHook` | Same stdin format as Claude's StopHook; additionally outputs `{}` to stdout (Gemini hook spec). |
+| **Codex** | _(no hook)_ | Sessions discovered by scanning `~/.codex/sessions/` at post-commit time. |
 | **OpenCode** | _(no hook)_ | Sessions discovered by reading `~/.local/share/opencode/opencode.db` (SQLite) at post-commit time. Requires Node 22.5+ for `node:sqlite`; the discoverer is lazy-imported and feature-gated, so older hosts (e.g. VS Code's bundled Electron Node) silently skip OpenCode without breaking anything else. |
 | **Cursor IDE** (Composer) | _(no hook)_ | Sessions discovered by `CursorDetector` + `CursorSessionDiscoverer` scanning Cursor's workspace storage at post-commit time. |
 | **GitHub Copilot CLI** | _(no hook)_ | Sessions discovered by `CopilotDetector` + `CopilotSessionDiscoverer` scanning the Copilot CLI session log. |
@@ -211,7 +211,7 @@ The `services/data/` layer exists so derivation logic can be unit-tested without
 | `Cli.js` | `cli/src/Cli.ts` | The bundled CLI, invoked as a subprocess for enable/disable/status. Standalone — no global `jolli` install required. |
 | `StopHook.js` | `cli/src/hooks/StopHook.ts` | Claude Code stop hook. |
 | `SessionStartHook.js` | `cli/src/hooks/SessionStartHook.ts` | Claude Code session-start hook. |
-| `GeminiAfterAgentHook.js` | `cli/src/hooks/GeminiAfterAgentHook.ts` | Gemini CLI `AfterAgent` hook. |
+| `GeminiAfterAgentHook.js` | `cli/src/hooks/GeminiAfterAgentHook.ts` | Gemini `AfterAgent` hook. |
 | `PrepareMsgHook.js` | `cli/src/hooks/PrepareMsgHook.ts` | Git `prepare-commit-msg`. |
 | `PostCommitHook.js` | `cli/src/hooks/PostCommitHook.ts` | Git `post-commit` (enqueues + spawns Worker). |
 | `PostRewriteHook.js` | `cli/src/hooks/PostRewriteHook.ts` | Git `post-rewrite` (hash remap). |

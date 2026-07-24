@@ -68,8 +68,8 @@ These hooks track which AI sessions are active. They only record session metadat
 | Agent | Hook | How it works |
 |-------|------|-------------|
 | **Claude Code** | `StopHook` | Triggered after each AI response; writes session info to `sessions.json` |
-| **Gemini CLI** | `AfterAgent` hook | Same stdin format as Claude's StopHook; additionally outputs `{}` to stdout (Gemini hook spec) |
-| **Codex CLI** | _(no hook)_ | Sessions discovered by scanning `~/.codex/sessions/` at post-commit time |
+| **Gemini** | `AfterAgent` hook | Same stdin format as Claude's StopHook; additionally outputs `{}` to stdout (Gemini hook spec) |
+| **Codex** | _(no hook)_ | Sessions discovered by scanning `~/.codex/sessions/` at post-commit time |
 
 ### Git Hooks — Summary Generation Pipeline
 
@@ -124,7 +124,7 @@ src/main/kotlin/ai/jolli/jollimemory/
 │   ├── TranscriptParsers.kt         # Agent-specific transcript format parsers
 │   ├── SessionTracker.kt            # Active session registry (sessions.json) + global config dir resolution
 │   ├── CodexSessionDiscoverer.kt    # Auto-discover Codex sessions from filesystem
-│   ├── GeminiSupport.kt             # Gemini CLI session integration
+│   ├── GeminiSupport.kt             # Gemini session integration
 │   ├── Types.kt                     # Data classes, enums, and type definitions (incl. JolliMemoryConfig with authToken)
 │   └── JmLogger.kt                  # File-based logger for hooks (no IDE dependency)
 ├── hooks/                           # Standalone hook entry points (bundled in hooks JAR)
@@ -133,7 +133,7 @@ src/main/kotlin/ai/jolli/jollimemory/
 │   ├── PostRewriteHook.kt           # Post-rewrite: migrate summaries after rebase/amend
 │   ├── PrepareMsgHook.kt            # Prepare-commit-msg: detect squash/amend
 │   ├── StopHook.kt                  # Claude Code stop hook: track session metadata
-│   ├── GeminiAfterAgentHook.kt      # Gemini CLI after-agent hook
+│   ├── GeminiAfterAgentHook.kt      # Gemini after-agent hook
 │   └── HookUtils.kt                 # Shared hook utilities
 ├── services/                        # IntelliJ project-level services
 │   ├── JolliMemoryService.kt        # Central service: install/uninstall, status, branch ops

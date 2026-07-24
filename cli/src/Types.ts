@@ -270,6 +270,9 @@ export function isIngestOperation(op: GitOperation): op is IngestOperation {
  */
 export type LlmCredentialSource = "anthropic-config" | "anthropic-env" | "jolli-proxy" | "local-agent";
 
+/** Which local-agent CLI tool drives generation when aiProvider === "local-agent". */
+export type LocalAgentToolId = "claude-code" | "codex" | "cursor-agent" | "opencode";
+
 /** Metadata from the LLM API call that generated this summary */
 export interface LlmCallMetadata {
 	/** Actual model used (from response, may differ from requested model due to aliasing) */
@@ -293,6 +296,8 @@ export interface LlmCallMetadata {
 	 * Populated for every new call by `callLlm` in `core/LlmClient.ts`.
 	 */
 	readonly source?: LlmCredentialSource;
+	/** For source === "local-agent": which tool produced it, for footer attribution. Absent on older summaries. */
+	readonly localAgentTool?: LocalAgentToolId;
 }
 
 /**
@@ -1069,7 +1074,7 @@ export interface CommitCatalog {
  */
 export type LlmConfig = Pick<
 	JolliMemoryConfig,
-	"apiKey" | "model" | "jolliApiKey" | "aiProvider" | "localAgentTool" | "localAgentPath"
+	"apiKey" | "model" | "jolliApiKey" | "aiProvider" | "localAgentTool" | "localAgentPath" | "localAgentModel"
 >;
 
 /** Configuration stored in .jolli/jollimemory/config.json */
@@ -1106,9 +1111,9 @@ export interface JolliMemoryConfig {
 	 * replace it. The URL opened is still `https`-only regardless of this list.
 	 */
 	readonly openUrlAllowedOrigins?: ReadonlyArray<string>;
-	/** Enable Codex CLI session discovery at post-commit time (default: auto-detect) */
+	/** Enable Codex session discovery at post-commit time (default: auto-detect) */
 	readonly codexEnabled?: boolean;
-	/** Enable Gemini CLI session tracking via AfterAgent hook (default: auto-detect) */
+	/** Enable Gemini session tracking via AfterAgent hook (default: auto-detect) */
 	readonly geminiEnabled?: boolean;
 	/** Enable Claude Code session tracking via Stop hook (default: true) */
 	readonly claudeEnabled?: boolean;
@@ -1169,12 +1174,13 @@ export interface JolliMemoryConfig {
 	readonly aiProvider?: "anthropic" | "jolli" | "local-agent";
 	/**
 	 * Which local Agent CLI tool to drive when `aiProvider` is "local-agent".
-	 * v1 supports only Claude Code; the enum is reserved for future tools
-	 * (Codex, Cursor). Ignored unless `aiProvider === "local-agent"`.
+	 * Ignored unless `aiProvider === "local-agent"`.
 	 */
-	readonly localAgentTool?: "claude-code";
+	readonly localAgentTool?: LocalAgentToolId;
 	/** Optional explicit path to the local agent binary, overriding PATH discovery. */
 	readonly localAgentPath?: string;
+	/** Optional explicit model string passed to the local agent tool. Empty/absent ⇒ the tool's own default model. Ignored for claude-code (uses the action's alias). */
+	readonly localAgentModel?: string;
 	/**
 	 * Whether the post-commit hook prints live memory-capture progress to stdout
 	 * (so a `git commit` driven from a terminal or AI-agent session shows the
@@ -1327,7 +1333,7 @@ export interface InstallResult {
 	readonly postMergeHookPath?: string;
 	/** Absolute path to the git pre-push hook file (set on successful install) */
 	readonly prePushHookPath?: string;
-	/** Absolute path to the Gemini CLI settings file (set on successful install when Gemini detected) */
+	/** Absolute path to the Gemini settings file (set on successful install when Gemini detected) */
 	readonly geminiSettingsPath?: string;
 }
 
@@ -1363,13 +1369,13 @@ export interface StatusInfo {
 	readonly orphanBranch: string;
 	/** Whether Claude Code directory (~/.claude/) was detected */
 	readonly claudeDetected?: boolean;
-	/** Whether Codex CLI directory (~/.codex/) was detected */
+	/** Whether Codex directory (~/.codex/) was detected */
 	readonly codexDetected?: boolean;
 	/** Whether Codex session discovery is enabled in config (undefined = auto-detect) */
 	readonly codexEnabled?: boolean;
-	/** Whether Gemini CLI directory (~/.gemini/) was detected */
+	/** Whether Gemini directory (~/.gemini/) was detected */
 	readonly geminiDetected?: boolean;
-	/** Whether Gemini CLI session tracking is enabled in config (undefined = auto-detect) */
+	/** Whether Gemini session tracking is enabled in config (undefined = auto-detect) */
 	readonly geminiEnabled?: boolean;
 	/** Whether the global OpenCode database (~/.local/share/opencode/opencode.db) was detected */
 	readonly openCodeDetected?: boolean;

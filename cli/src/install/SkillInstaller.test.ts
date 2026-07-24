@@ -1261,11 +1261,13 @@ describe("buildPluginJolliMenuSkillTemplate", () => {
 		// plugin repo into /jolli:init even though it can already generate.
 		expect(tpl).toContain("can generate memories");
 		expect(tpl).toContain("`local-agent` → **yes**");
-		// A pinned provider is satisfied only by its own credential.
-		expect(tpl).toMatch(/`jolli` → yes only if\s+`account\.jolliApiKeyConfigured`/);
+		// The Jolli proxy is satisfied by a sign-in (which mints a Jolli key) OR a
+		// stored key — jolliApiKeyConfigured is omitted once signed in.
+		expect(tpl).toMatch(/`jolli` → yes if\s+`account\.signedIn` OR `account\.jolliApiKeyConfigured`/);
+		// Anthropic is satisfied only by its own credential.
 		expect(tpl).toMatch(/`anthropic` → yes only if `account\.anthropicKeyConfigured`/);
-		// A bare OAuth token is a sync credential, not a generation one.
-		expect(tpl).toMatch(/`account\.signedIn` alone does NOT count/);
+		// For the Anthropic provider a bare OAuth token is a sync credential, not a generation one.
+		expect(tpl).toMatch(/sign-in alone does NOT count/);
 		// The setup branch keys off generation capability, not "no credential".
 		expect(tpl).toContain("OR memories can't be generated");
 	});

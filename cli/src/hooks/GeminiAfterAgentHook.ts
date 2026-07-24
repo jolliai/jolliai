@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * GeminiAfterAgentHook — Gemini CLI AfterAgent Event Handler
+ * GeminiAfterAgentHook — Gemini AfterAgent Event Handler
  *
- * This script is invoked by Gemini CLI's hook system after each agent turn
+ * This script is invoked by Gemini's hook system after each agent turn
  * (the "AfterAgent" event). It mirrors Claude Code's StopHook behavior.
  *
  * It receives a JSON payload via stdin containing:
- *   - session_id: The current Gemini CLI session identifier
+ *   - session_id: The current Gemini session identifier
  *   - transcript_path: Path to the session JSON file
  *   - cwd: The working directory of the project
  *
@@ -29,7 +29,7 @@ import { readStdin } from "./HookUtils.js";
 const log = createLogger("GeminiAfterAgentHook");
 
 /**
- * Writes the required JSON response to stdout for Gemini CLI.
+ * Writes the required JSON response to stdout for Gemini.
  * Gemini hooks must output JSON; we return an empty object (no-op).
  */
 function writeStdout(): void {
@@ -63,7 +63,7 @@ export async function handleGeminiAfterAgentHook(): Promise<void> {
 		return;
 	}
 
-	// Gemini CLI sends the same payload format as Claude Code
+	// Gemini sends the same payload format as Claude Code
 	let hookData: ClaudeHookInput;
 	try {
 		hookData = JSON.parse(input) as ClaudeHookInput;
@@ -101,7 +101,7 @@ export async function handleGeminiAfterAgentHook(): Promise<void> {
 		log.error("Failed to save session: %s", (error as Error).message);
 	}
 
-	// Always write the required JSON response first — Gemini CLI needs it, and
+	// Always write the required JSON response first — Gemini needs it, and
 	// emitting it before the (best-effort) telemetry flush means a slow network
 	// can't delay the response Gemini is waiting on.
 	writeStdout();

@@ -900,7 +900,7 @@ private class StatusIndicatorLabel(
         val hookParts = mutableListOf<String>()
         if (status.gitHookInstalled) hookParts.add("5 Git")
         if (status.claudeHookInstalled) hookParts.add("2 Claude")
-        if (status.geminiHookInstalled) hookParts.add("1 Gemini CLI")
+        if (status.geminiHookInstalled) hookParts.add("1 Gemini")
         val hooksDesc = if (hookParts.isNotEmpty()) hookParts.joinToString(" + ") else "none installed"
         val hookColor = if (status.gitHookInstalled) "#3FB950" else "#F85149"
         sb.append("<p><span style='color:$hookColor'>\u25CF</span> <b>Hooks:</b> $hooksDesc</p>")

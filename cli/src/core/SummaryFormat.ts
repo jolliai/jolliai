@@ -7,6 +7,7 @@
  */
 
 import type { CommitSummary, LlmCredentialSource, NoteReference, PlanReference } from "../Types.js";
+import { localAgentToolLabel } from "./localagent/ToolMeta.js";
 import {
 	type DisplayableReference,
 	referenceDisplayTitle,
@@ -150,20 +151,45 @@ export function collectLlmSources(summary: CommitSummary): ReadonlyArray<LlmCred
 }
 
 /**
+ * Per-node footer label. For `source === "local-agent"` this surfaces the
+ * SPECIFIC tool (`"Local agent - Cursor"`) when `localAgentTool` was
+ * persisted on the metadata at generation time, falling back to the bare
+ * `"Local agent"` for older summaries written before that field existed.
+ * Every other source renders through the static `PROVIDER_LABELS` map,
+ * unchanged from before.
+ */
+function nodeLabel(llm: NonNullable<CommitSummary["llm"]>): string {
+	if (llm.source === "local-agent") {
+		return llm.localAgentTool ? `Local agent - ${localAgentToolLabel(llm.localAgentTool)}` : "Local agent";
+	}
+	return PROVIDER_LABELS[llm.source ?? "anthropic-config"];
+}
+
+/**
  * Footer-ready provider attribution string. Returns:
  *   - `undefined` when no node in the tree carries a `source` field — i.e.
  *     the summary was generated before this field existed; callers should
  *     omit the provider segment of the footer entirely instead of printing
  *     "via unknown".
- *   - A single label (e.g. `"Anthropic"`) for the common single-source case.
+ *   - A single label (e.g. `"Anthropic"`, `"Local agent - Cursor"`) for the
+ *     common single-source case.
  *   - `"mixed: A, B"` for cross-provider summaries (a squash whose source
- *     commits were summarized on different machines / configs).
+ *     commits were summarized on different machines / configs / local-agent
+ *     tools) — labels are deduplicated by their rendered string, so two
+ *     nodes both attributed to `"Local agent - Cursor"` collapse to one
+ *     entry even though they're distinct tree nodes.
  */
 export function formatProviderLabel(summary: CommitSummary): string | undefined {
-	const sources = collectLlmSources(summary);
-	if (sources.length === 0) return undefined;
-	if (sources.length === 1) return PROVIDER_LABELS[sources[0]];
-	return `mixed: ${sources.map((s) => PROVIDER_LABELS[s]).join(", ")}`;
+	const labels = new Set<string>();
+	const visit = (node: CommitSummary): void => {
+		if (node.llm?.source) labels.add(nodeLabel(node.llm));
+		for (const child of node.children ?? []) visit(child);
+	};
+	visit(summary);
+	const list = [...labels];
+	if (list.length === 0) return undefined;
+	if (list.length === 1) return list[0];
+	return `mixed: ${list.join(", ")}`;
 }
 
 // ─── Title builders ───────────────────────────────────────────────────────────

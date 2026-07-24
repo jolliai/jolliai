@@ -8,6 +8,7 @@
 import { join } from "node:path";
 import type { Command } from "commander";
 import { validateJolliApiKey } from "../core/JolliApiUtils.js";
+import { LOCAL_AGENT_TOOLS } from "../core/localagent/ToolMeta.js";
 import { getGlobalConfigDir, loadConfig, saveConfig } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
 import { syncGlobalInstructions } from "../install/Installer.js";
@@ -26,8 +27,10 @@ const VALID_AI_PROVIDERS: ReadonlyArray<NonNullable<JolliMemoryConfig["aiProvide
 	"local-agent",
 ];
 
-/** Valid values for the `localAgentTool` config key (v1 supports only Claude Code). */
-const VALID_LOCAL_AGENT_TOOLS: ReadonlyArray<NonNullable<JolliMemoryConfig["localAgentTool"]>> = ["claude-code"];
+/** Valid values for the `localAgentTool` config key — derived from the tool registry to avoid drift. */
+const VALID_LOCAL_AGENT_TOOLS: ReadonlyArray<NonNullable<JolliMemoryConfig["localAgentTool"]>> = Object.keys(
+	LOCAL_AGENT_TOOLS,
+) as ReadonlyArray<NonNullable<JolliMemoryConfig["localAgentTool"]>>;
 
 /** Valid values for the `globalInstructions` config key. */
 const VALID_GLOBAL_INSTRUCTIONS: ReadonlyArray<NonNullable<JolliMemoryConfig["globalInstructions"]>> = [
@@ -71,6 +74,7 @@ const VALID_CONFIG_KEYS = [
 	"syncOnPush",
 	"localAgentTool",
 	"localAgentPath",
+	"localAgentModel",
 	"slack.workspaceUrl",
 ] as const satisfies ReadonlyArray<keyof JolliMemoryConfig | "slack.workspaceUrl">;
 
@@ -196,7 +200,7 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		// reconstruction can't produce a double slash from a trailing-slash input.
 		return parsed.origin;
 	}
-	// String fields (apiKey, model, jolliApiKey, authToken, localFolder, localAgentPath)
+	// String fields (apiKey, model, jolliApiKey, authToken, localFolder, localAgentPath, localAgentModel)
 	return raw;
 }
 
@@ -207,8 +211,8 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 	{ key: "maxTokens", type: "number", description: "Token budget for LLM calls (positive integer)" },
 	{ key: "jolliApiKey", type: "string", description: "Jolli Space API key (secret, sk-jol-...)" },
 	{ key: "authToken", type: "string", description: "OAuth token from browser login (secret)" },
-	{ key: "codexEnabled", type: "boolean", description: "Enable Codex CLI session discovery (true/false)" },
-	{ key: "geminiEnabled", type: "boolean", description: "Enable Gemini CLI session tracking (true/false)" },
+	{ key: "codexEnabled", type: "boolean", description: "Enable Codex session discovery (true/false)" },
+	{ key: "geminiEnabled", type: "boolean", description: "Enable Gemini session tracking (true/false)" },
 	{ key: "claudeEnabled", type: "boolean", description: "Enable Claude Code session tracking (true/false)" },
 	{
 		key: "openCodeEnabled",
@@ -261,12 +265,17 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 	{
 		key: "localAgentTool",
 		type: "enum",
-		description: "Local agent CLI to drive when aiProvider=local-agent: claude-code (v1)",
+		description: `Local agent CLI to drive when aiProvider=local-agent: ${VALID_LOCAL_AGENT_TOOLS.join(" | ")}`,
 	},
 	{
 		key: "localAgentPath",
 		type: "string",
 		description: "Explicit path to the local agent binary, overriding PATH discovery",
+	},
+	{
+		key: "localAgentModel",
+		type: "string",
+		description: "Model name/flag to pass to the local agent CLI, overriding its default",
 	},
 	{
 		key: "globalInstructions",

@@ -4,7 +4,7 @@
  *
  * ## Verified config formats (observed from real installed app source code)
  *
- * ### Cursor & Gemini CLI (key `mcpServers`)
+ * ### Cursor & Gemini (key `mcpServers`)
  * Source: /Applications/Cursor.app/Contents/Resources/app/out/vs/workbench/workbench.desktop.main.js
  * (Cursor) and /opt/homebrew/Cellar/gemini-cli/0.38.2/libexec/.../chunk-7DZN7VCC.js (Gemini).
  *   ```json

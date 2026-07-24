@@ -26,7 +26,7 @@ import { generateTranscriptId } from "../core/TranscriptId.js";
 import { buildMultiSessionContext } from "../core/TranscriptReader.js";
 import { launchWorker } from "../hooks/QueueWorker.js";
 import { createLogger } from "../Logger.js";
-import { type CommitSummary, CURRENT_SCHEMA_VERSION, type StoredTranscript } from "../Types.js";
+import { type CommitSummary, CURRENT_SCHEMA_VERSION, type LlmConfig, type StoredTranscript } from "../Types.js";
 import { type AttributedCommit, attributeCommits } from "./CommitAttributor.js";
 import { buildCommitTargetIndex, type CommitTargetIndex } from "./CommitTargetIndex.js";
 import { cwdInRoots, scanClaudeTranscripts } from "./RawTranscriptScanner.js";
@@ -173,14 +173,7 @@ async function generateAndStore(
 	hash: string,
 	attr: AttributedCommit | null,
 	cwd: string,
-	llmConfig: {
-		apiKey?: string;
-		model?: string;
-		jolliApiKey?: string;
-		aiProvider?: "anthropic" | "jolli" | "local-agent";
-		localAgentTool?: "claude-code";
-		localAgentPath?: string;
-	},
+	llmConfig: LlmConfig,
 	storage: StorageProvider,
 ): Promise<number> {
 	const commitInfo = await getCommitInfo(hash, cwd);
@@ -296,13 +289,14 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 
 	// 4. Generate + store (unless dry-run).
 	const config = await loadConfig();
-	const llmConfig = {
+	const llmConfig: LlmConfig = {
 		apiKey: config.apiKey,
 		model: config.model,
 		jolliApiKey: config.jolliApiKey,
 		aiProvider: config.aiProvider,
 		localAgentTool: config.localAgentTool,
 		localAgentPath: config.localAgentPath,
+		localAgentModel: config.localAgentModel,
 	};
 	const credsOk = hasLlmCredentials(config);
 
