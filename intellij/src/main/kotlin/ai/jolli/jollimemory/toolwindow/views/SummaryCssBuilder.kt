@@ -22,8 +22,8 @@ object SummaryCssBuilder {
         "'JetBrains Mono', Menlo, Consolas, 'Courier New', monospace"
 
     /** Returns the complete CSS stylesheet for the summary webview. */
-    fun buildCss(isDark: Boolean): String {
-        val rootVars = buildRootVars(isDark)
+    fun buildCss(isDark: Boolean, pageBgHex: String = "#1e1e1e"): String {
+        val rootVars = buildRootVars(isDark, pageBgHex)
         return """
   /* ── Theme variables ── */
   :root {
@@ -32,6 +32,11 @@ $rootVars
 
   /* ── Base ── */
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  /* Paint the root element with the page bg so the very first painted frame (and any
+     overscroll area) is theme-coloured, never the browser's default white. Eliminates the
+     white flash on tab open; works together with the theme-coloured component background
+     set on the JCEF view in SummaryPanel. */
+  html { background: var(--bg); }
   .hidden { display: none !important; }
   body {
     font-family: $FONT_FAMILY;
@@ -1615,14 +1620,14 @@ ${ShareWebview.css()}
      * Every VS Code token (`--vscode-*`) is replaced with a self-defined
      * `--var` name whose concrete value depends on [isDark].
      */
-    private fun buildRootVars(isDark: Boolean): String {
-        return if (isDark) buildDarkVars() else buildLightVars()
+    private fun buildRootVars(isDark: Boolean, pageBgHex: String): String {
+        return if (isDark) buildDarkVars(pageBgHex) else buildLightVars(pageBgHex)
     }
 
     /** Dark theme variable block (matches `body.vscode-dark` values). */
-    private fun buildDarkVars(): String = """
+    private fun buildDarkVars(pageBgHex: String): String = """
     /* ── Core palette ── */
-    --bg: #1e1e1e;
+    --bg: $pageBgHex;
     --text-primary: #e0e0e0;
     --description-fg: #969696;
     --link-fg: #3794ff;
@@ -1697,9 +1702,9 @@ ${ShareWebview.css()}
     --ship-warn: #e0ac2b;"""
 
     /** Light theme variable block (matches `body.vscode-light` values). */
-    private fun buildLightVars(): String = """
+    private fun buildLightVars(pageBgHex: String): String = """
     /* ── Core palette ── */
-    --bg: #ffffff;
+    --bg: $pageBgHex;
     --text-primary: #1e1e1e;
     --description-fg: #6e6e6e;
     --link-fg: #0066bf;

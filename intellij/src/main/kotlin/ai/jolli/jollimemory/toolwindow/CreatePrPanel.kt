@@ -140,6 +140,12 @@ class CreatePrPanel(
                     return false
                 }
             }, b.cefBrowser)
+            // Theme the native Chromium view before the first load so the initial
+            // about:blank → content navigation never flashes white.
+            val prBg = com.intellij.openapi.editor.colors.EditorColorsManager.getInstance().globalScheme.defaultBackground
+            b.component.isOpaque = true
+            b.component.background = prBg
+            b.setPageBackgroundColor(String.format("#%02x%02x%02x", prBg.red, prBg.green, prBg.blue))
             b.loadHTML(CreatePrHtmlBuilder.buildHtml(vm, !JBColor.isBright(), bridgeScript))
             b.component
         } catch (e: Exception) {

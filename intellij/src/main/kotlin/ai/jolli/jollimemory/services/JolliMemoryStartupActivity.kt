@@ -114,9 +114,13 @@ class JolliMemoryStartupActivity : ProjectActivity {
         internal fun runPostNodeStartup(project: Project) {
             val basePath = project.basePath ?: return
 
+            val tStartup = System.currentTimeMillis()
+            log.info("[timing] runPostNodeStartup begin for $basePath")
             log.info("JolliMemory: initializing for project at $basePath")
             val service = project.getService(JolliMemoryService::class.java)
+            val tInit = System.currentTimeMillis()
             service.initialize()
+            log.info("[timing] runPostNodeStartup service.initialize took ${System.currentTimeMillis() - tInit}ms")
 
             // Slice-1 daemon channel: replaces the in-process refresh signal the retired
             // Kotlin PostCommitHook used to fire. The client spawns `jolli daemon` and
@@ -197,6 +201,7 @@ class JolliMemoryStartupActivity : ProjectActivity {
                 log.warn("Telemetry flush scheduling failed (ignored): ${e.message}")
             }
 
+            log.info("[timing] runPostNodeStartup total ${System.currentTimeMillis() - tStartup}ms for $basePath")
             log.info("JolliMemory: startup complete for project at $basePath")
         }
     }

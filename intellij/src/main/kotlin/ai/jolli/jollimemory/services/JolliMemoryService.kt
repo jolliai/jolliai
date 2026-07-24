@@ -53,6 +53,10 @@ import javax.swing.Timer
 class JolliMemoryService(private val project: Project) : Disposable {
 
     private val log = Logger.getInstance(JolliMemoryService::class.java)
+    // Diagnostic timing log routed through JmLogger so [timing] lines land in
+    // <projectDir>/.jolli/jollimemory/debug.log alongside CommitsPanel's own
+    // timing output — one file to grab when debugging cold-start latency.
+    private val timingLog = JmLogger.create("JolliMemoryService.timing")
     private var git: GitOps? = null
     private var installer: HookInstaller? = null
     private var reader: SummaryReader? = null
@@ -285,9 +289,11 @@ class JolliMemoryService(private val project: Project) : Disposable {
 
     fun initialize() {
         if (isInitialized) return
+        val tInit = System.currentTimeMillis()
         val sb = StringBuilder()
         val basePath = project.basePath
         sb.appendLine("basePath=$basePath")
+        sb.appendLine("[timing] initialize begin at ${java.time.Instant.now()}")
 
         if (basePath == null) {
             lastError = "Project has no base path"
@@ -300,7 +306,10 @@ class JolliMemoryService(private val project: Project) : Disposable {
         // activity and the tool window surface a blocking "Node.js required" panel
         // with a Retry that re-runs detection and then this method. Blocking probe,
         // but cheap after the first detection (in-process + node-info.json cache).
-        if (ai.jolli.jollimemory.bridge.NodeRuntime.detect() == null) {
+        val tNode = System.currentTimeMillis()
+        val nodeMissingProbe = ai.jolli.jollimemory.bridge.NodeRuntime.detect() == null
+        sb.appendLine("[timing] NodeRuntime.detect took ${System.currentTimeMillis() - tNode}ms missing=$nodeMissingProbe")
+        if (nodeMissingProbe) {
             nodeMissing = true
             lastError = "Node.js not found — Jolli Memory is blocked until it is installed"
             sb.appendLine("BLOCKED: no usable Node.js runtime found")
@@ -344,7 +353,9 @@ class JolliMemoryService(private val project: Project) : Disposable {
         sb.appendLine("installerDebug=${installer!!.getDebugInfo()}")
 
         try {
+            val tRefresh = System.currentTimeMillis()
             refreshStatus()
+            sb.appendLine("[timing] refreshStatus took ${System.currentTimeMillis() - tRefresh}ms")
             sb.appendLine("status=${cachedStatus}")
         } catch (e: Exception) {
             sb.appendLine("refreshStatus error: ${e.message}")
@@ -357,20 +368,24 @@ class JolliMemoryService(private val project: Project) : Disposable {
 
         // Auto-initialize KB folder with repo identity + auto-migrate
         try {
+            val tKb = System.currentTimeMillis()
             val repoName = KBPathResolver.extractRepoName(resolvedRoot)
             val remoteUrl = KBPathResolver.getRemoteUrl(resolvedRoot)
             val config = SessionTracker.loadConfig()
             val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
             KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
             sb.appendLine("KB folder initialized: $kbRoot")
+            sb.appendLine("[timing] KB folder init took ${System.currentTimeMillis() - tKb}ms")
 
             // Auto-migrate orphan-branch data into the Memory Bank folder via the
             // bundled CLI (CliIntegrations.migrateMemoryBank → `jolli migrate-memory-bank`).
             // The CLI decides whether an orphan branch exists and whether migration
             // already completed (full migration vs idempotent stale-child reconcile),
             // matching the VS Code activate path. The Kotlin MigrationEngine is gone.
+            val tMigrate = System.currentTimeMillis()
             val migration = CliIntegrations.migrateMemoryBank(resolvedRoot)
             sb.appendLine("Auto-migration: ${migration.status} (${migration.migratedEntries}/${migration.totalEntries})")
+            sb.appendLine("[timing] migrateMemoryBank took ${System.currentTimeMillis() - tMigrate}ms")
         } catch (e: Exception) {
             sb.appendLine("KB folder init/migration failed: ${e.message}")
         }
@@ -401,8 +416,12 @@ class JolliMemoryService(private val project: Project) : Disposable {
         if (hasCredentials && !isPaused && needsInstall) {
             val reason = if (cachedStatus?.enabled != true) "not yet enabled" else "claude hook missing in this worktree"
             sb.appendLine("Auto-installing hooks (configured + not paused + $reason)")
+            val tInstall = System.currentTimeMillis()
             install()
+            sb.appendLine("[timing] install took ${System.currentTimeMillis() - tInstall}ms")
+            val tRefresh2 = System.currentTimeMillis()
             refreshStatus()
+            sb.appendLine("[timing] refreshStatus (post-install) took ${System.currentTimeMillis() - tRefresh2}ms")
             sb.appendLine("status after auto-install=${cachedStatus}")
         } else if (hasCredentials && !isPaused) {
             // Plugin-upgrade catch-up: hooks are already installed (so the block above is
@@ -432,7 +451,30 @@ class JolliMemoryService(private val project: Project) : Disposable {
             CliIntegrations.retryPendingPushes(basePath)
         }
 
+        // Warm the CLI daemon's hot read paths on a pooled thread so the first memory
+        // click hits warm code instead of paying the cold-call penalty — the first few
+        // daemon calls after spawn cost 100-700ms (Node JIT + cold git/fs caches) vs
+        // 1-30ms warm, and opening a memory tab puts exactly these reads on the EDT.
+        // Covers the three operations a tab open performs: index, transcript-hashes
+        // and get. Fire-and-forget: every call is a read-only, idempotent round trip,
+        // so a failure only means the first click warms the path itself (old behavior).
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                val t = System.currentTimeMillis()
+                val store = ai.jolli.jollimemory.core.SummaryStore(resolvedRoot, gitOps, StorageFactory.create(gitOps, resolvedRoot))
+                val index = store.loadIndex()
+                store.getTranscriptHashes()
+                index?.entries?.firstOrNull()?.commitHash?.let { store.getSummary(it) }
+                log.info("CLI daemon warm-up done in ${System.currentTimeMillis() - t}ms (indexEntries=${index?.entries?.size ?: 0})")
+            } catch (e: Exception) {
+                log.warn("CLI daemon warm-up failed (non-fatal): ${e.message}")
+            }
+        }
+
+        warmJcefRenderPath()
+
         isInitialized = true
+        sb.appendLine("[timing] initialize total ${System.currentTimeMillis() - tInit}ms")
         initLog = sb.toString()
         log.info("Initialize complete:\n$initLog")
 
@@ -473,6 +515,22 @@ class JolliMemoryService(private val project: Project) : Disposable {
             logFile.writeText("=== JolliMemory IntelliJ Init Log ===\n${java.time.Instant.now()}\n\n$initLog")
             log.info("Debug log written to: ${logFile.absolutePath}")
         } catch (_: Exception) { }
+    }
+
+    /**
+     * Kicks off pool prewarm. Delegates to [ai.jolli.jollimemory.toolwindow.JcefBrowserPool]
+     * which builds one browser asynchronously on the EDT and keeps it around for the
+     * first memory tab to reuse — priming the same one-time browser-process costs the
+     * old throwaway warm-up did (libcef load, CefApp init, GPU/network subprocess
+     * spawn, render-launcher OS-cache warmth), plus keeping the browser alive so its
+     * V8 bytecode cache stays warm across every tab that follows.
+     */
+    private fun warmJcefRenderPath() {
+        try {
+            ai.jolli.jollimemory.toolwindow.JcefBrowserPool.get(project).warmUp()
+        } catch (e: Exception) {
+            log.warn("JCEF pool warm-up failed (non-fatal): ${e.message}")
+        }
     }
 
     /**
@@ -843,34 +901,37 @@ class JolliMemoryService(private val project: Project) : Disposable {
     }
 
     fun getBranchCommits(): List<CommitSummaryBrief> {
+        val tOverall = System.currentTimeMillis()
         val g = git ?: run {
             log.warn("getBranchCommits: git is null")
             return emptyList()
         }
 
         // Resolve base ref: prefer origin/main over main (matches VS Code resolveHistoryBaseRef)
+        val tBaseRef = System.currentTimeMillis()
         val baseRef = listOf("origin/main", "upstream/main", "main").firstOrNull { ref ->
             g.exec("rev-parse", "--verify", ref) != null
         } ?: "main"
+        timingLog.info("[timing] getBranchCommits: resolveBaseRef=${System.currentTimeMillis() - tBaseRef}ms baseRef=$baseRef")
 
         val headHash = g.getHeadHash()
 
         // Find merge-base (val so the else arm below smart-casts it to non-null).
+        val tMergeBase = System.currentTimeMillis()
         val mergeBaseRaw = g.exec("merge-base", "HEAD", baseRef)?.trim()
         val mergeBase = mergeBaseRaw?.takeIf { it.isNotBlank() }
+        timingLog.info("[timing] getBranchCommits: mergeBase=${System.currentTimeMillis() - tMergeBase}ms")
 
         // If merge-base equals HEAD, we're on main or the branch is fully merged.
-        // - With a remote (baseRef = origin/*): show commits not on the remote
-        //   (origin/main..HEAD) — empty when fully synced.
-        // - Without a remote (baseRef = main / upstream/*): enter merged mode and
-        //   list the user's own commits from the reflog creation point, filtered by
-        //   author. This mirrors VS Code listBranchCommits, which shows committed
-        //   memories on main even in a repo with no remote (previously IntelliJ
-        //   returned an empty panel here).
+        // Enter merged mode: list the user's own commits from the reflog creation
+        // point, filtered by author. Mirrors VS Code listBranchCommits, which does
+        // NOT special-case a fully-synced remote base. IntelliJ previously short-
+        // circuited baseRef=origin/* to "$baseRef..HEAD", which is always empty on
+        // a fully-synced main / release branch and hid every already-pushed memory
+        // from the panel.
         var authorFilter: String? = null
         val range: String? = when {
             mergeBase == null -> null // No common ancestor
-            mergeBase == headHash && baseRef.startsWith("origin/") -> "$baseRef..HEAD"
             mergeBase == headHash -> {
                 val branch = g.getCurrentBranch()?.trim()
                 val merged = if (branch.isNullOrBlank()) null else g.resolveMergedHistory(branch)
@@ -900,11 +961,17 @@ class JolliMemoryService(private val project: Project) : Disposable {
         // the range to the current user's own commits (matching VS Code).
         val logArgs = if (range != null) {
             val base = arrayOf("log", range, "--format=%H%x00%s%x00%an%x00%ae%x00%aI%x00%x00", "--no-merges")
-            if (authorFilter != null) base + "--author=$authorFilter" else base
+            // --fixed-strings makes --author a literal substring match: git treats the
+            // pattern as a regex by default, so a user.name with metacharacters (".", "()")
+            // would error or match the wrong commits. Mirrors cli/core/BranchCommitLister.ts;
+            // safe here because --author is the only pattern operand (no --grep).
+            if (authorFilter != null) base + arrayOf("--author=$authorFilter", "--fixed-strings") else base
         } else {
             arrayOf("log", "--format=%H%x00%s%x00%an%x00%ae%x00%aI%x00%x00", "--no-merges", "-20")
         }
+        val tLog = System.currentTimeMillis()
         val output = g.exec(*logArgs) ?: return emptyList()
+        timingLog.info("[timing] getBranchCommits: gitLog=${System.currentTimeMillis() - tLog}ms range=${range ?: "<last-20>"}")
         if (output.isBlank()) return emptyList()
 
         // Parse entries (split on double-NUL separator)
@@ -915,12 +982,16 @@ class JolliMemoryService(private val project: Project) : Disposable {
         // Batch check which commits have summaries (including tree-hash aliases)
         val projectPath = mainRepoRoot ?: ""
             val store = ai.jolli.jollimemory.core.SummaryStore(projectPath, g, StorageFactory.create(g, projectPath))
+        val tFilter = System.currentTimeMillis()
         var summaryHashSet = store.filterCommitsWithSummary(commitHashes)
+        timingLog.info("[timing] getBranchCommits: filterCommitsWithSummary=${System.currentTimeMillis() - tFilter}ms commits=${commitHashes.size} matched=${summaryHashSet.size}")
 
         // Scan unmatched commits for tree-hash aliases (cross-branch matching)
         val unmatchedHashes = commitHashes.filter { it !in summaryHashSet }
         if (unmatchedHashes.isNotEmpty()) {
+            val tAlias = System.currentTimeMillis()
             val aliasesFound = store.scanTreeHashAliases(unmatchedHashes)
+            timingLog.info("[timing] getBranchCommits: scanTreeHashAliases=${System.currentTimeMillis() - tAlias}ms unmatched=${unmatchedHashes.size} found=$aliasesFound")
             if (aliasesFound) {
                 // Re-check with new aliases
                 summaryHashSet = store.filterCommitsWithSummary(commitHashes)
@@ -930,22 +1001,36 @@ class JolliMemoryService(private val project: Project) : Disposable {
         // Detect pushed commits — matches VS Code resolvePushBaseRef() fallback chain:
         // 1) @{upstream}  2) origin/<branch>  3) no base (branch not published)
         val unpushedHashes = mutableSetOf<String>()
+        val tPush = System.currentTimeMillis()
         val pushBaseRef = resolvePushBaseRef(g)
         val unpushedOutput = if (pushBaseRef != null) g.exec("rev-list", "$pushBaseRef..HEAD") else null
         if (unpushedOutput != null) {
             unpushedOutput.lines().filter { it.isNotBlank() }.forEach { unpushedHashes.add(it) }
         }
+        timingLog.info("[timing] getBranchCommits: resolvePushBaseRef+revList=${System.currentTimeMillis() - tPush}ms pushBase=${pushBaseRef ?: "<none>"}")
 
-        return parsedEntries.map { parts ->
+        // Batch-collect diff shortstat for every commit in the range with ONE
+        // `git log --shortstat` invocation, rather than a per-commit
+        // `git diff --shortstat $hash^ $hash` (each shell-out was 30-50ms of
+        // process startup + git init, dominating the cold-open loop cost).
+        val tShortstat = System.currentTimeMillis()
+        val shortstatByHash = collectShortstats(g, range, authorFilter)
+        timingLog.info("[timing] getBranchCommits: batchShortstat=${System.currentTimeMillis() - tShortstat}ms rows=${shortstatByHash.size}")
+
+        // Per-commit loop cost is now dominated by orphan-branch summary reads;
+        // accumulate their total so the log shows exactly where a large branch
+        // spends its time.
+        var perSummaryMs = 0L
+        val tPerCommit = System.currentTimeMillis()
+        val result = parsedEntries.map { parts ->
             val hash = parts[0]
             val message = parts[1]
             val author = parts[2]
             val email = parts[3]
             val isoDate = parts[4]
 
-            // Get diff stats per commit
-            val diffStatRaw = g.exec("diff", "--shortstat", "$hash^", hash) ?: ""
-            val (files, ins, del) = parseDiffStatLine(diffStatRaw)
+            // Read diff stats from the batched shortstat map (no per-commit shell-out).
+            val (files, ins, del) = shortstatByHash[hash] ?: Triple(0, 0, 0)
 
             // Get topic count, commit type, and memory-detail enrichment from the
             // summary (resolving aliases). The enrichment fields feed the panel's
@@ -964,9 +1049,11 @@ class JolliMemoryService(private val project: Project) : Disposable {
             var conversationTurns: Int? = null
             var contextCount = 0
             if (hash in summaryHashSet) {
+                val tSummary = System.currentTimeMillis()
                 val resolvedHash = store.resolveAlias(hash)
                 val rootHash = store.findRootHash(resolvedHash) ?: resolvedHash
                 val summary = reader?.getSummary(rootHash)
+                perSummaryMs += System.currentTimeMillis() - tSummary
                 if (summary != null) {
                     topicCount = ai.jolli.jollimemory.core.SummaryTree.countTopics(summary)
                     if (summary.commitType != null && summary.commitType.name != "commit") {
@@ -1032,6 +1119,12 @@ class JolliMemoryService(private val project: Project) : Disposable {
                 contextCount = contextCount,
             )
         }
+        timingLog.info(
+            "[timing] getBranchCommits: perCommit loop=${System.currentTimeMillis() - tPerCommit}ms " +
+                "summaryTotal=${perSummaryMs}ms rows=${result.size}",
+        )
+        timingLog.info("[timing] getBranchCommits: overall=${System.currentTimeMillis() - tOverall}ms")
+        return result
     }
 
     /** Reads the committed AI conversations for a commit (CONVERSATIONS group). */
@@ -1111,6 +1204,51 @@ class JolliMemoryService(private val project: Project) : Disposable {
         if (insMatch != null) ins = insMatch.groupValues[1].toInt()
         if (delMatch != null) del = delMatch.groupValues[1].toInt()
         return Triple(files, ins, del)
+    }
+
+    /**
+     * Batch-collects the per-commit diff shortstat for the given range in a
+     * single `git log --shortstat` call, returning a map from commit hash to
+     * `(files, insertions, deletions)`. Missing entries (e.g. root commits
+     * whose shortstat line git omits) fall back to `(0, 0, 0)` at the call
+     * site.
+     *
+     * Replaces the previous per-commit `git diff --shortstat $hash^ $hash`
+     * shell-out — one process per commit at ~30-50ms of startup cost each
+     * was the dominant loop cost on cold tool-window open.
+     */
+    private fun collectShortstats(
+        g: GitOps,
+        range: String?,
+        authorFilter: String?,
+    ): Map<String, Triple<Int, Int, Int>> {
+        val args = mutableListOf("log", "--shortstat", "--format=%H", "--no-merges")
+        if (range != null) args.add(1, range) else args.add("-20")
+        // --fixed-strings mirrors the main log (see getBranchCommits): without it the
+        // batch and the commit list could enumerate different author sets when user.name
+        // holds regex metacharacters.
+        if (authorFilter != null) {
+            args.add("--author=$authorFilter")
+            args.add("--fixed-strings")
+        }
+        val output = g.exec(*args.toTypedArray()) ?: return emptyMap()
+        val map = mutableMapOf<String, Triple<Int, Int, Int>>()
+        var currentHash: String? = null
+        for (rawLine in output.split("\n")) {
+            val line = rawLine.trim()
+            if (line.isEmpty()) continue
+            // A hash line is exactly 40 hex chars — anything else in this
+            // output shape is a shortstat summary (leading space + "N files
+            // changed, ..."). Guarding on hex length keeps parsing robust
+            // against locale-translated shortstat prefixes.
+            if (line.length == 40 && line.all { it in '0'..'9' || it in 'a'..'f' }) {
+                currentHash = line
+                map[line] = Triple(0, 0, 0)
+            } else if (currentHash != null) {
+                map[currentHash!!] = parseDiffStatLine(line)
+            }
+        }
+        return map
     }
 
     /**
