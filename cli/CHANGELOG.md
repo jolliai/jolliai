@@ -1,10 +1,19 @@
 # Changelog
 
-<!-- Last synced commit: 9f11cdf0 | 2026-07-17 -->
+<!-- Last synced commit: 4adbd12e | 2026-07-24 -->
 
-## Unreleased
+## 0.99.9
 
+- **Four more AI agents supported** — conversations from **Cline** (both the standalone CLI and the VS Code extension), **Devin CLI**, **Antigravity**, and the **Cursor CLI** (`cursor-agent`) are now folded into your memories automatically, no hook to install — each is discovered by scanning its own on-disk session store. Toggle them with `jolli configure --set clineEnabled=… / devinEnabled=… / antigravityEnabled=…`; the Cursor CLI shares the existing `cursorEnabled` switch with Cursor's Composer IDE.
+- **Install Jolli as a Claude Code plugin** — a new Claude Code plugin packages Jolli's git hooks, MCP server, and `/jolli` skills, so you can add it from the plugin marketplace instead of wiring things up by hand (`jolli enable --repo-hooks-only` installs just the repo hooks the plugin needs). Install surfaces — CLI, VS Code, and the plugin — now compete on version instead of a hard pin, so whichever is newest wins.
+- **Run Jolli workflows and see the results** — the `/jolli-local-run` and new `/jolli-remote-run` skills run a workflow on your own machine or in the cloud, then report the resulting article, PR, and workflow-run links and offer to open them in your browser; a run-history action lists a workflow's past runs. Workflow commands now live in the separate `@jolli.ai/workflow-cli` plugin (`npm install -g @jolli.ai/workflow-cli`); `jolli --help` still lists them under **Jolli Workflows** with a one-line install hint when it's missing.
+- **More references** — Slack threads mentioned in **Codex** conversations are now captured (previously Claude-only), and **context7** library-documentation lookups are recorded as references alongside Linear, Jira, GitHub, Notion, Slack, Zoom, Confluence, Asana, and monday.com.
+- **A smoother first run** — bare `jolli` / `jolli enable` now auto-detects a working Claude Code install and skips the setup menu, offers an optional sign-in nudge rather than a permanent dismissal, and shares one repair ladder across the enable and guided flows so a missing key is fixed the same way everywhere.
 - **The `/jolli-pr` skill has been removed** — PR authoring no longer ships as a standalone skill. Turning a branch's memories into a PR title and body is still fully supported through the `get_pr_description` MCP tool and the `jolli pr-description` command — your agent can call either and open the PR with `gh` — so only the `/jolli-pr` skill itself, its entry in the `/jolli` menu, and its hint in the global agent-instructions block are gone. Upgrading removes any previously-installed `jolli-pr` skill file for you.
+- **Clearer agent memory guidance** — the "prefer Jolli" note written into your machine-global AI instruction files now describes recall/search by intent instead of hard-coding skill IDs, so plugin (`jolli:recall`) and CLI (`jolli-recall`) installs both resolve to whatever recall/search skill or `mcp__jollimemory__` tool is registered, and your agent reaches for memory proactively on why/how/prior-art/resume questions.
+- **Sharper knowledge graph** — topics that change together are now linked by co-change edges, and a knowledge unit can carry more than one kind label, so the graph reflects cross-cutting work more faithfully. The exported graph viewer also shows a dismissible notice when it loads a graph built by an older schema, so you know to regenerate it for full fidelity.
+- **Sessions in subdirectories** — sessions started in a project subdirectory are now discovered and attributed to the repo.
+- Security fixes and bug fixes.
 
 ## 0.99.8
 

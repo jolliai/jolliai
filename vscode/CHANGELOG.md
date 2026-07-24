@@ -1,6 +1,14 @@
 # Changelog
 
-<!-- Last synced commit: 9f11cdf0 | 2026-07-17 -->
+<!-- Last synced commit: 4adbd12e | 2026-07-24 -->
+
+## 0.99.9
+
+- **Four more AI agents supported** — **Cline** (the standalone CLI and the VS Code extension), **Devin CLI**, **Antigravity**, and the **Cursor CLI** (`cursor-agent`) now show up in the Status panel with their own brand badges and per-source toggles in **Settings → AI Agents**, and their conversations are folded into your memories automatically. The Cursor CLI shares the existing **Cursor** switch with the Composer IDE.
+- **More references** — Slack threads mentioned in **Codex** conversations (previously Claude-only), and **context7** library-documentation lookups, now appear on your memories alongside Linear, Jira, GitHub, Notion, Slack, Zoom, Confluence, Asana, and monday.com.
+- **Sharper knowledge graph** — the graph view now links topics that change together with co-change edges, and a node can carry more than one kind, so cross-cutting work is easier to spot. It also shows a dismissible notice when the loaded graph was built by an older schema, so you know to regenerate it for full fidelity.
+- **Clearer status rows** — when a tool has both a healthy and an errored variant (Cline, Copilot), the Status panel no longer lets one hide the other — each variant reports on its own row.
+- Security fixes and bug fixes.
 
 ## 0.99.8
 
