@@ -310,22 +310,29 @@ release cadence.**
   snapshot — it lags, it does not break. (`RELEASE.md` already documents this for
   VS Code: rebuild the CLI before packaging because the bundle inlines it.)
 
-- **The plugin soft-prefers its own dist, but competes on version.** The plugin's
-  CLI commands (`init`/`login`/`logout`/`recall`/`search`/`status`) set
-  `JOLLI_DIST_PREFER_SOURCE=claude-plugin`, so `resolve-dist-path` picks the
-  `dist-paths/claude-plugin` entry when it is present, complete, and already at the
-  top version — winning a version **tie** ahead of the global cli/vscode/cursor
-  order. But a strictly-higher-version vscode/cli dist still wins, and a missing /
-  incomplete / older plugin dist falls through to normal cross-source selection
-  (never a hard fail — the former `JOLLI_DIST_SOURCE` hard pin is gone; all sources
-  compete now). The plugin MCP server launches its own bundle directly; the
-  manifest registers only `PluginBootstrapHook`, which installs canonical
-  source-neutral Stop/SessionStart hooks through the shared `run-hook`
-  dispatcher. The `dist-paths/<source>` core version
-  (`__CLI_PKG_VERSION__`, injected by `build.mjs` from `cli/package.json`) drives
-  cross-source selection for every surface; the plugin's marketing version is
-  irrelevant — no lockstep check between `plugin.json` and `cli/package.json` is
-  needed. See the soft prefer in
+- **The plugin does NOT prefer its own dist — it competes on version, cli wins ties.**
+  The plugin's CLI commands (`init`/`login`/`logout`/`recall`/`search`/`status`)
+  invoke `run-cli` **without** setting `JOLLI_DIST_PREFER_SOURCE`, so
+  `resolve-dist-path` applies its normal selection to every plugin call: highest
+  core version wins, and among sources **tied** at the top version the global
+  `cli > vscode > cursor` order (`SOURCE_PREFERENCE_ORDER`) decides — so when an
+  equal-versioned `cli` is installed it wins over the plugin's own bundle. The
+  plugin's `dist-paths/claude-plugin` entry is only selected when it is the highest
+  version, or when none of cli/vscode/cursor is installed at the top version (then
+  it falls through to the plugin's own bundle as `resolve-dist-path`'s first-seen
+  winner). This is the team decision "same version ⇒ prefer CLI, follow
+  `SOURCE_PREFERENCE_ORDER`, and only use the bundled CLI when nothing in that order
+  is installed" — and it needs **no** CLI-side change: dropping the opt-in env var is
+  enough, because `resolve-dist-path` already prefers cli at a tie when the var is
+  unset. (`JOLLI_DIST_PREFER_SOURCE` still exists in the CLI as a general override,
+  but the plugin no longer uses it; `claude-plugin` is deliberately not in
+  `SOURCE_PREFERENCE_ORDER`.) The plugin MCP server launches its own bundle
+  directly; the manifest registers only `PluginBootstrapHook`, which installs
+  canonical source-neutral Stop/SessionStart hooks through the shared `run-hook`
+  dispatcher. The `dist-paths/<source>` core version (`__CLI_PKG_VERSION__`,
+  injected by `build.mjs` from `cli/package.json`) drives cross-source selection for
+  every surface; the plugin's marketing version is irrelevant — no lockstep check
+  between `plugin.json` and `cli/package.json` is needed. See the selection logic in
   [`DispatchScripts.ts`](../cli/src/install/DispatchScripts.ts) and
   [`DistPathWriter.ts`](../cli/src/install/DistPathWriter.ts).
 

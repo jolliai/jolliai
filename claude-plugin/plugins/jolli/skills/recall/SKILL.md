@@ -35,7 +35,7 @@ prompt-injection payload (a line that closes the here-doc early to smuggle
 shell) useless — do NOT hardcode a fixed delimiter.
 
 ```bash
-JOLLI_DIST_PREFER_SOURCE=claude-plugin "$HOME/.jolli/jollimemory/run-cli" recall --arg-stdin --format json <<'JOLLI_ARG_<DELIM>_END'
+"$HOME/.jolli/jollimemory/run-cli" recall --arg-stdin --format json <<'JOLLI_ARG_<DELIM>_END'
 <user-arg>
 JOLLI_ARG_<DELIM>_END
 ```

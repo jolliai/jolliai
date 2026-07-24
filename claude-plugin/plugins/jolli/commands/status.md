@@ -69,5 +69,5 @@ back to running the bundled CLI through its stable dispatch script (a plugin-onl
 user has no global `jolli` on PATH), then summarise its output:
 
 ```bash
-JOLLI_DIST_PREFER_SOURCE=claude-plugin "$HOME/.jolli/jollimemory/run-cli" status
+"$HOME/.jolli/jollimemory/run-cli" status
 ```

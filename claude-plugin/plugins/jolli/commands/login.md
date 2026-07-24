@@ -22,7 +22,7 @@ Jolli login page and waits on a local loopback callback while the user completes
 sign-in:
 
 ```bash
-JOLLI_DIST_PREFER_SOURCE=claude-plugin "$HOME/.jolli/jollimemory/run-cli" auth login
+"$HOME/.jolli/jollimemory/run-cli" auth login
 ```
 
 This is interactive and can take up to a minute. Wait for it to return — do not

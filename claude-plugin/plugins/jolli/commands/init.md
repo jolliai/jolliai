@@ -25,7 +25,7 @@ If the `status` MCP tool is unavailable (an older Jolli), fall back to the
 bundled CLI through its stable dispatch script and read its output:
 
 ```bash
-JOLLI_DIST_PREFER_SOURCE=claude-plugin "$HOME/.jolli/jollimemory/run-cli" status
+"$HOME/.jolli/jollimemory/run-cli" status
 ```
 
 If `run-cli` does not exist, the plugin's session bootstrap has not run yet — ask
@@ -46,7 +46,7 @@ already have a Jolli sign-in or a Jolli API key, skip this step. The login flow
 opens the browser and waits on a loopback callback:
 
 ```bash
-JOLLI_DIST_PREFER_SOURCE=claude-plugin "$HOME/.jolli/jollimemory/run-cli" auth login
+"$HOME/.jolli/jollimemory/run-cli" auth login
 ```
 
 This is interactive and can take up to a minute — wait for it to return, do not
@@ -63,7 +63,7 @@ subscription) when the user has made no explicit choice, so generation works wit
 no API key. Silent on success:
 
 ```bash
-JOLLI_DIST_PREFER_SOURCE=claude-plugin "$HOME/.jolli/jollimemory/run-cli" enable --repo-hooks-only --source-tag claude-plugin
+"$HOME/.jolli/jollimemory/run-cli" enable --repo-hooks-only --source-tag claude-plugin
 ```
 
 ## Step 4: Bind the repo to a Jolli Space
@@ -86,7 +86,7 @@ JOLLI_DIST_PREFER_SOURCE=claude-plugin "$HOME/.jolli/jollimemory/run-cli" enable
 from that list (never free-typed text):
 
 ```bash
-JOLLI_DIST_PREFER_SOURCE=claude-plugin "$HOME/.jolli/jollimemory/run-cli" bind --space <id|slug> --format json
+"$HOME/.jolli/jollimemory/run-cli" bind --space <id|slug> --format json
 ```
 
 Handle the JSON `type`: `bound` → success; `already_bound` → already set up;
