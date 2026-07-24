@@ -9,6 +9,7 @@ import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
@@ -84,6 +85,16 @@ class CommitAIAction : AnAction() {
         if (!guard.compareAndSet(false, true)) {
             log.info("performCommit ignored: a commit flow is already in progress")
             return
+        }
+
+        // Flush unsaved editor buffers before staging. The Changes panel reads
+        // IntelliJ's ChangeListManager, which reflects in-memory buffer diffs, but
+        // the `git add` below shells out and reads the disk. Without this flush an
+        // unsaved edit shows in the panel yet stages nothing — the flow then aborts
+        // with "No changes to commit — the selected files have no modifications."
+        // IntelliJ's built-in Commit tool window runs the same flush before staging.
+        ApplicationManager.getApplication().invokeAndWait {
+            FileDocumentManager.getInstance().saveAllDocuments()
         }
 
         val service = project.getService(JolliMemoryService::class.java)

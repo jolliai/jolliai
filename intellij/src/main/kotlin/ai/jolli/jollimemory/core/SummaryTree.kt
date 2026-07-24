@@ -31,6 +31,8 @@ object SummaryTree {
 		val leaf: Boolean,
 		val durationDays: Int,
 		val durationLabel: String,
+		/** v5 transcript IDs (UUIDs) — falls back to commit hashes on v3/v4 data, resolved CLI-side. */
+		val transcriptIds: List<String>? = null,
 	)
 
 	/**
@@ -62,6 +64,13 @@ object SummaryTree {
 	fun isLeafNode(node: CommitSummary): Boolean = analyze(node).leaf
 	fun computeDurationDays(node: CommitSummary): Int = analyze(node).durationDays
 	fun formatDurationLabel(node: CommitSummary): String = analyze(node).durationLabel
+
+	/**
+	 * Transcript IDs this summary references — CLI-owned `getTranscriptIds`:
+	 * the v5 `summary.transcripts` field verbatim, falling back to walking
+	 * children (legacy commit-hash filenames) on v3/v4 data.
+	 */
+	fun getTranscriptIds(node: CommitSummary): List<String> = analyze(node).transcriptIds ?: emptyList()
 
 	fun updateTopicInTree(node: CommitSummary, globalIndex: Int, updates: TopicUpdates): UpdateResult? =
 		mutation("update-topic", node, globalIndex) { add("updates", gson.toJsonTree(updates)) }

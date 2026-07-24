@@ -479,9 +479,14 @@ object CliIntegrations {
         // ran. Any local failure (daemon crashed, protocol mismatch, socket
         // broke) is logged and falls through to the legacy one-shot spawn so
         // the request still completes.
-        findDaemonForCwd(projectDir)?.let { client ->
+        // PERF DIAGNOSTICS: time both paths so debug.log shows which one served each call.
+        val startNanos = System.nanoTime()
+        val daemon = findDaemonForCwd(projectDir)
+        if (daemon != null) {
             try {
-                return client.call(action, projectDir, requestJson, timeoutSeconds)
+                val result = daemon.call(action, projectDir, requestJson, timeoutSeconds)
+                log.info("runIdeBridge action=%s path=daemon took=%dms", action, (System.nanoTime() - startNanos) / 1_000_000)
+                return result
             } catch (e: CliBridgeException) {
                 throw e
             } catch (e: CliDaemonClient.CliDaemonTimeoutException) {
@@ -496,6 +501,11 @@ object CliIntegrations {
             } catch (e: Exception) {
                 log.warn("CLI daemon call failed, falling back to one-shot spawn: %s", e.message)
             }
+        } else {
+            // Normal path when no daemon is registered for this cwd yet (e.g. a request
+            // that arrives before the daemon channel has attached, or for a worktree the
+            // daemon doesn't cover). Log at info; real failures still warn above.
+            log.info("runIdeBridge action=%s no daemon matched cwd=%s — falling back to one-shot spawn", action, projectDir)
         }
         val node = resolveNode()
             ?: throw RuntimeException("Node.js not found — it is required for Jolli Memory. Install Node.js and reopen the project.")
@@ -536,6 +546,7 @@ object CliIntegrations {
             if (proc.exitValue() != 0) {
                 throw RuntimeException("CLI bridge action '$action' failed (exit ${proc.exitValue()})")
             }
+            log.info("runIdeBridge action=%s path=one-shot took=%dms", action, (System.nanoTime() - startNanos) / 1_000_000)
             return obj.get("result") ?: com.google.gson.JsonNull.INSTANCE
         } finally {
             outFile.delete()

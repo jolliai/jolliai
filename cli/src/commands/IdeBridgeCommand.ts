@@ -763,6 +763,10 @@ async function runSummaryTreeAction(request: JsonObject): Promise<unknown> {
 				leaf: tree.isLeafNode(value),
 				durationDays: tree.computeDurationDays(value),
 				durationLabel: tree.formatDurationLabel(value),
+				// v5-compatible transcript-ID resolution (summary.transcripts with a
+				// v3/v4 commit-hash fallback) owned here so IDE clients share one
+				// implementation instead of porting the fallback rules per surface.
+				transcriptIds: tree.getTranscriptIds(value),
 			};
 		case "update-topic":
 			return tree.updateTopicInTree(

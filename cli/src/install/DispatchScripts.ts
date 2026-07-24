@@ -172,6 +172,17 @@ fi
  * `*Hook.js` in the winning dist. Does NOT re-implement path selection;
  * delegates to `resolve-dist-path`.
  *
+ * Node resolution is PATH-first with a recorded-runtime fallback: use the
+ * caller's `node` when PATH has one (interactive shells keep their own
+ * version-manager choice), otherwise fall back to the absolute path in
+ * `~/.jolli/jollimemory/node-path` — a plain-text sibling of node-info.json
+ * written by IDE detection / manual selection (already version-verified, so
+ * an -x check is enough here). GUI git clients launch git with a minimal
+ * PATH that lacks nvm/homebrew/volta locations; without the fallback the
+ * hook would silently no-op on machines that DO have Node. The fallback is
+ * deliberately NOT re-verified with `node --version`: prepare-commit-msg
+ * runs on the blocking commit path and must not pay an extra spawn.
+ *
  * Exit policy: silent exit 0 on any failure (hooks must never block git,
  * Claude, or Gemini operations). Diagnostics go to stderr.
  *
@@ -207,18 +218,39 @@ case "$HOOK_TYPE" in
 esac
 
 DIST=$("$HOME/.jolli/jollimemory/resolve-dist-path" "$SCRIPT") || exit 0
-if ! command -v node >/dev/null 2>&1; then
+
+# Resolve a usable node binary. The caller's PATH comes first so interactive
+# shells keep their own version-manager choice (nvm/volta/fnm/…). GUI git
+# clients launch git with a minimal PATH that lacks those locations, so when
+# PATH has no node, fall back to the runtime the IDE detected and recorded in
+# node-path (one absolute path per line; its writer already proved the binary
+# runs and meets the minimum version, so an -x check is enough here — never
+# spawn 'node --version' on this path: prepare-commit-msg is blocking).
+NODE_BIN=""
+if command -v node >/dev/null 2>&1; then
+  NODE_BIN="node"
+else
+  RECORDED=$(sed -n '1p' "$HOME/.jolli/jollimemory/node-path" 2>/dev/null)
+  if [ -n "$RECORDED" ] && [ -x "$RECORDED" ]; then
+    NODE_BIN="$RECORDED"
+  fi
+fi
+
+if [ -z "$NODE_BIN" ]; then
   echo "ERROR: node runtime not found. Jolli Memory hooks require Node.js." >&2
   exit 0
 fi
 
-exec node "$DIST/$SCRIPT" "$@"
+exec "$NODE_BIN" "$DIST/$SCRIPT" "$@"
 `;
 
 /**
  * `run-cli` — thin wrapper. Runs any Jolli CLI subcommand (recall/view/doctor/
  * etc.) by execing node on the winning dist's Cli.js. Used by the jolli-recall
  * SKILL.md and by power users / external scripts.
+ *
+ * Node resolution mirrors run-hook: PATH first, then the recorded runtime in
+ * `~/.jolli/jollimemory/node-path` (see the run-hook comment for rationale).
  *
  * Exit policy: exit 1 (not 0) on failure. CLI callers expect real exit codes,
  * unlike hooks that must always succeed silently.
@@ -230,12 +262,26 @@ const RUN_CLI_CONTENT = `#!/bin/bash
 # so a partial source can't win run-cli either.
 
 DIST=$("$HOME/.jolli/jollimemory/resolve-dist-path" Cli.js) || exit 1
-if ! command -v node >/dev/null 2>&1; then
+
+# Node resolution mirrors run-hook: PATH first (respects the user's own
+# version-manager choice), then the IDE-recorded runtime for GUI clients
+# whose minimal PATH lacks node. See run-hook for the full rationale.
+NODE_BIN=""
+if command -v node >/dev/null 2>&1; then
+  NODE_BIN="node"
+else
+  RECORDED=$(sed -n '1p' "$HOME/.jolli/jollimemory/node-path" 2>/dev/null)
+  if [ -n "$RECORDED" ] && [ -x "$RECORDED" ]; then
+    NODE_BIN="$RECORDED"
+  fi
+fi
+
+if [ -z "$NODE_BIN" ]; then
   echo "ERROR: node runtime not found. Jolli Memory CLI requires Node.js." >&2
   exit 1
 fi
 
-exec node "$DIST/Cli.js" "$@"
+exec "$NODE_BIN" "$DIST/Cli.js" "$@"
 `;
 
 // ─── Writer ─────────────────────────────────────────────────────────────────

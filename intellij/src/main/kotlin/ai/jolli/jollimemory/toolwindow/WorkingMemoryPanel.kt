@@ -102,6 +102,12 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
                 }
             }, b.cefBrowser)
 
+            // Theme the native Chromium view before the first load so the initial
+            // about:blank → content navigation never flashes white.
+            val wmBg = com.intellij.openapi.editor.colors.EditorColorsManager.getInstance().globalScheme.defaultBackground
+            b.component.isOpaque = true
+            b.component.background = wmBg
+            b.setPageBackgroundColor(String.format("#%02x%02x%02x", wmBg.red, wmBg.green, wmBg.blue))
             b.loadHTML(buildHtml())
             b.component
         } catch (e: Exception) {

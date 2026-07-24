@@ -33,6 +33,33 @@ object SummaryHtmlBuilder {
 
     private val gson = Gson()
 
+    /**
+     * Diagnostic probe appended after the main script: reports page-side timings back to
+     * the plugin (SummaryPanel logs them as `webview perf` lines) so debug.log shows the
+     * gap between "HTML loaded" (the Kotlin onLoadEnd) and "page actually visible".
+     * `firstPaint` is two animation frames after load — the first frame Chromium really
+     * composited; `settled` fires once the JS task queue drains. All ms are relative to
+     * the page's own navigation start (performance.now's zero), comparable to the
+     * Kotlin-side loadHTML→onLoadEnd numbers. No-ops when the jmSend bridge is absent
+     * (e.g. the start-up warm-up browser, which ships no bridge script).
+     */
+    private const val PERF_PROBE_SCRIPT = """
+(function () {
+    if (typeof jmSend !== 'function') return;
+    function report(label) {
+        try { jmSend({ command: 'perfProbe', label: label, ms: Math.round(performance.now()) }); } catch (e) { /* probe must never break the page */ }
+    }
+    if (document.readyState === 'complete') { report('load'); }
+    else { window.addEventListener('load', function () { report('load'); }); }
+    if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(function () {
+            requestAnimationFrame(function () { report('firstPaint'); });
+        });
+    }
+    setTimeout(function () { report('settled'); }, 0);
+})();
+"""
+
     // ── Main HTML builder ─────────────────────────────────────────────────
 
     /**
@@ -49,6 +76,7 @@ object SummaryHtmlBuilder {
         planTranslateSet: Set<String> = emptySet(),
         bridgeScript: String = "",
         readOnly: Boolean = false,
+        pageBgHex: String = "#1e1e1e",
     ): String {
         val (allTopics, sourceNodes) = collectSortedTopics(summary)
         val stats = SummaryTree.aggregateStats(summary)
@@ -71,7 +99,7 @@ object SummaryHtmlBuilder {
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Commit Memory</title>
-<style>${SummaryCssBuilder.buildCss(isDark)}${if (readOnly) """
+<style>${SummaryCssBuilder.buildCss(isDark, pageBgHex)}${if (readOnly) """
 /* Read-only mode: hide all write-action buttons but keep Copy Markdown */
 .topic-action-btn, .associate-plan-btn, .plan-actions,
 #pushJolliBtn, #shareLinkBtn, #generateE2eBtn, #editE2eBtn, #regenE2eBtn, #deleteE2eBtn,
@@ -95,6 +123,7 @@ ${buildFooter(summary)}
 ${buildShareModal()}
 ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
 <script>${SummaryScriptBuilder.buildScript()}</script>
+<script>$PERF_PROBE_SCRIPT</script>
 </body>
 </html>"""
     }
