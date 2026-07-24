@@ -114,6 +114,7 @@ import {
 	PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS,
 	removeClaudeLegacySkills,
 	removePluginJolliMenu,
+	removeRetiredSkills,
 	SKILL_GIT_EXCLUDE_PATHS,
 	updateSkillIfNeeded,
 } from "./SkillInstaller.js";
@@ -382,6 +383,12 @@ export async function install(
 				// standalone menu by revision) reclaims `.claude/skills/jolli/` and can't
 				// be left pointing at a skill this just removed.
 				await removeClaudeLegacySkills(wt);
+				// The plugin never calls updateSkillIfNeeded (below), which is where the
+				// `.agents/skills/` retired-skill sweep normally runs — so do it here too.
+				// Otherwise a repo that ran a full `jolli enable` before a skill was retired
+				// (e.g. `jolli-pr`) keeps exposing the dead `.agents/skills/*` copy to
+				// Codex/Cursor/Gemini after a plugin-only upgrade. Marker-guarded.
+				await removeRetiredSkills(wt);
 				// UNION (not replace): PluginBootstrapHook re-runs on every plugin
 				// SessionStart and only knows its own umbrella entry. Replacing the
 				// block would shrink a set a prior full `jolli enable` populated,

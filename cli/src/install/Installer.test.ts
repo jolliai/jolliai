@@ -369,6 +369,15 @@ describe("Installer", () => {
 			await writeFile(join(tempDir, ".claude", "skills", "my-custom-skill", "SKILL.md"), "mine", "utf-8");
 			await mkdir(join(tempDir, ".agents", "skills", "jolli-recall"), { recursive: true });
 			await writeFile(join(tempDir, ".agents", "skills", "jolli-recall", "SKILL.md"), "keep", "utf-8");
+			// A retired Jolli-owned skill (jolli-pr) a pre-removal full enable wrote to the
+			// cross-platform `.agents/` target: a plugin-only upgrade must sweep it so it
+			// stops being exposed to `.agents/` consumers (Codex/Cursor/Gemini/…).
+			await mkdir(join(tempDir, ".agents", "skills", "jolli-pr"), { recursive: true });
+			await writeFile(
+				join(tempDir, ".agents", "skills", "jolli-pr", "SKILL.md"),
+				'---\nname: jolli-pr\nmetadata:\n  vendor: "jolli.ai"\n---\nretired',
+				"utf-8",
+			);
 
 			const result = await install(tempDir, { repoHooksOnly: true, sourceTag: "claude-plugin" });
 			expect(result.success).toBe(true);
@@ -417,6 +426,10 @@ describe("Installer", () => {
 			expect(await exists(join(tempDir, ".claude", "skills", "jolli-recall", "SKILL.md"))).toBe(false);
 			expect(await exists(join(tempDir, ".agents", "skills", "jolli-recall", "SKILL.md"))).toBe(true);
 			expect(await exists(join(tempDir, ".claude", "skills", "my-custom-skill", "SKILL.md"))).toBe(true);
+			// A RETIRED Jolli-owned skill in the cross-platform target IS swept on a plugin
+			// (repo-hooks-only) upgrade — honoring the upgrade-removes-jolli-pr contract for
+			// `.agents/` consumers, not just the `.claude/` copy removeClaudeLegacySkills clears.
+			expect(await exists(join(tempDir, ".agents", "skills", "jolli-pr", "SKILL.md"))).toBe(false);
 
 			// Bare `/jolli` umbrella: a non-plugin project skill (a plugin skill could
 			// only ever be `/jolli:<name>`). Written to the Claude Code target ONLY,
