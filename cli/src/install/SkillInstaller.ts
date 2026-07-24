@@ -1602,7 +1602,7 @@ run the bundled CLI through its stable dispatch script and read the same facts
 from its printed output:
 
 \`\`\`bash
-JOLLI_DIST_PREFER_SOURCE=claude-plugin "$HOME/.jolli/jollimemory/run-cli" status
+"$HOME/.jolli/jollimemory/run-cli" status
 \`\`\`
 
 If neither the tool nor the CLI can be reached at all, skip the state-based

@@ -8,7 +8,7 @@ Clear the user's stored Jolli credentials by running the Jolli CLI through its
 stable dispatch script:
 
 ```bash
-JOLLI_DIST_PREFER_SOURCE=claude-plugin "$HOME/.jolli/jollimemory/run-cli" auth logout
+"$HOME/.jolli/jollimemory/run-cli" auth logout
 ```
 
 ## Report the outcome
