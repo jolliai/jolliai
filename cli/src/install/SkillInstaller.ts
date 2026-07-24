@@ -214,20 +214,40 @@ export async function updateSkillsIfNeeded(
 		/* v8 ignore stop */
 	}
 
+	// Sweep away skills Jolli has retired before writing the current set, so an
+	// upgrade doesn't strand a dead skill (e.g. a pre-removal `jolli-pr`) in the
+	// user's repo. Marker-guarded so a user's own same-named skill survives.
+	await removeRetiredSkills(projectDir);
+
 	for (const target of SKILL_TARGETS) {
 		// The one shipped target (`.agents/skills/`) is unconditional, so this guard
 		// never short-circuits today; it is retained as the re-gating extension point.
 		/* v8 ignore next -- single always-on target; the disabled branch is unreachable now */
 		if (!target.enabled(config)) continue;
 		const targetDir = join(projectDir, ...target.relativeDir);
-		// Sweep away skills Jolli has retired before writing the current set, so an
-		// upgrade doesn't strand a dead skill (e.g. a pre-removal `jolli-pr`) in the
-		// user's repo. Marker-guarded so a user's own same-named skill survives.
-		for (const name of REMOVED_SKILL_NAMES) {
-			await removeRetiredSkill(join(targetDir, name));
-		}
 		for (const skill of SKILLS) {
 			await upsertSkill(targetDir, skill.name, skill.build());
+		}
+	}
+}
+
+/**
+ * Sweeps Jolli's retired skills ({@link REMOVED_SKILL_NAMES}) out of every
+ * {@link SKILL_TARGETS} directory (today `.agents/skills/`), marker-guarded so a
+ * user's own same-named skill survives. Extracted from {@link updateSkillsIfNeeded}
+ * so the Claude Code plugin's repo-hooks-only bootstrap — which never calls
+ * updateSkillsIfNeeded — can still honor the upgrade-removes-retired-skills
+ * contract for the cross-platform `.agents/` consumers (Codex/Cursor/Gemini/…),
+ * not just the `.claude/skills/` copy {@link removeClaudeLegacySkills} handles.
+ *
+ * The sweep is unconditional (NOT `enabled`-gated): a retired skill should be
+ * deleted from a target regardless of whether new skills would be written there.
+ */
+export async function removeRetiredSkills(projectDir: string): Promise<void> {
+	for (const target of SKILL_TARGETS) {
+		const targetDir = join(projectDir, ...target.relativeDir);
+		for (const name of REMOVED_SKILL_NAMES) {
+			await removeRetiredSkill(join(targetDir, name));
 		}
 	}
 }
