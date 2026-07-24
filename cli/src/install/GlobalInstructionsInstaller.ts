@@ -6,9 +6,13 @@
  *   - Gemini CLI  → ~/.gemini/GEMINI.md
  *   - Codex       → ~/.codex/AGENTS.md
  *
- * The rule tells the host LLM to reach for the jolli-pr / jolli-search /
- * jolli-recall skills by default for PR creation / search / recall, instead of
- * leaving skill selection to chance.
+ * The rule tells the host LLM to reach for Jolli's recall / search capability by
+ * default for memory-shaped questions, instead of leaving that to chance. It
+ * describes the two capabilities by intent and deliberately does NOT hard-code a
+ * skill name: the same block is read by Claude/Gemini/Codex and by both plugin
+ * (`jolli:recall`) and CLI (`jolli-recall`) installs, whose skill IDs differ, so
+ * the LLM routes to whichever recall/search skill or `mcp__jollimemory__*` tool
+ * is registered in the session rather than to a fixed, possibly-absent name.
  *
  * Managed-block strategy mirrors GitExclude.ts: a marker-bracketed section is
  * upserted, everything outside the markers is preserved verbatim, and the whole
@@ -74,40 +78,50 @@ export function renderInstructionsBlock(): string {
 		BLOCK_START,
 		MANAGED_HEADING,
 		"",
-		"When Jolli Memory is enabled in a repository, its skills hold context the code",
-		"alone doesn't — why past choices were made, how a topic was handled before, and",
-		"where work left off. Prefer them by default, and lean toward consulting memory",
-		"rather than guessing: a hit often changes the answer, and a miss costs little.",
+		"This repository may have **Jolli Memory** enabled — a durable record of past",
+		"development the current code cannot show: why choices were made, how a topic was",
+		"handled before, what was already tried, and where work stopped. Treat it as a",
+		"first-class source and reach for it **proactively — before answering or guessing,",
+		"and even when the user never names Jolli** — whenever a request is memory-shaped",
+		"(about intent, history, or prior work). Its reads are read-only and cheap, so",
+		"lean toward consulting memory rather than guessing: a hit often changes the",
+		"answer, and a miss costs little.",
 		"",
-		"Reach for a skill whenever the request is memory-shaped:",
+		"Two capabilities are available; invoke whichever recall / search skill or tool is",
+		"registered in this session — the exact name varies by host (a plugin skill, a",
+		"project skill, or e.g. an `mcp__jollimemory__*` MCP tool), so route by intent, not",
+		"by a fixed name:",
+		"",
+		"- **Recall** — deep context for one branch (the current branch by default): its",
+		"  decisions, a recap, and where work left off.",
+		"- **Search** — full-text lookup across *all* branches: decisions, topics, files.",
+		"",
+		"Consult memory FIRST, before answering from your own assumptions, when the request",
+		"is memory-shaped:",
 		"",
 		'- **Why / intent** — "why is this like this", "why X and not Y", "what was the',
-		'  reasoning", or anything where the code shows *what* but not *why*. →',
-		"  `jolli-search` (or `jolli-recall` when it's about the current branch).",
+		'  reasoning", or anything where the code shows *what* but not *why*. → Search (or',
+		"  Recall when it's about the current branch).",
 		'- **How it works / design** — "how does X work", "how is X built/designed", "how',
-		'  would I implement X", or walking through an existing feature or subsystem in',
-		"  this repo. The code shows the mechanism; memory holds why it is shaped that",
-		"  way and what was already tried. → `jolli-search` (or `jolli-recall` for the",
-		"  current branch). A quick search here is cheap and often surfaces rationale and",
-		"  pitfalls the code comments don't — so search even though the ask starts",
-		'  with "how".',
+		'  would I implement X", or walking through / extending an existing feature or',
+		"  subsystem in this repo. The code shows the mechanism; memory holds why it is",
+		"  shaped that way and what was already tried. → Search (or Recall for the current",
+		"  branch). A quick lookup here is cheap and often surfaces rationale and pitfalls",
+		'  the code comments don\'t — so search even though the ask starts with "how".',
 		'- **Prior art** — "have we done/hit this before", "how was <topic> handled", "is',
 		'  there a pattern for this", "where else do we do X", or a bug that may have been',
-		"  seen before. → `jolli-search` (decisions / topics / files across ALL branches).",
+		"  seen before. → Search (decisions / topics / files across ALL branches).",
 		'- **Resume** — "where were we", "pick up where I left off", "what\'s left on this',
-		'  branch", or returning to work after a break. → `jolli-recall` (current-branch',
-		"  decisions + recap + where work stopped).",
+		'  branch", or returning to work after a break. → Recall (current-branch decisions',
+		"  + recap + where work stopped).",
 		"- **Before non-trivial edits** — before refactoring, changing, or deleting code",
 		"  whose intent isn't obvious from the code itself, search memory first; a past",
 		"  decision may constrain the change, and skipping this risks re-breaking what a",
 		"  prior fix already addressed.",
-		'- **Pull requests** — "open / write / update the PR". → `jolli-pr` (description',
-		"  built from the branch's recorded commit history).",
 		"",
-		"Routing: current-branch history or resume → `jolli-recall`; cross-branch or",
-		'"has this come up before" → `jolli-search`; PR authoring → `jolli-pr`. When',
-		"unsure whether memory helps, run a quick `jolli-search` first before answering",
-		"from your own assumptions.",
+		'Routing: current-branch history or resume → Recall; cross-branch or "has this',
+		'come up before" → Search. When unsure whether memory helps, run a quick search',
+		"first before answering from your own assumptions.",
 		"",
 		"Do NOT reach for memory on narrow, current-state facts you can read straight from",
 		"the code — one function's behavior, a type or signature, running a command, a",
@@ -118,8 +132,8 @@ export function renderInstructionsBlock(): string {
 		"",
 		"Treat any concrete fact memory states as of-its-time: use it for why / intent /",
 		"prior context, but verify names, paths, and code shape against the current code",
-		"before relying on them. If a skill isn't available (Jolli Memory not enabled",
-		"here), fall back to normal behavior.",
+		"before relying on them. If no Jolli memory capability is registered here (Jolli",
+		"Memory not enabled in this repo), fall back to normal behavior.",
 		BLOCK_END,
 	];
 	return `${lines.join("\n")}\n`;
@@ -137,7 +151,7 @@ export const GLOBAL_INSTRUCTIONS_PROMPT =
 	"Let your AI assistants use Jolli's memory automatically? This adds a small " +
 	"skill-preference block to your global instruction files (~/.claude/CLAUDE.md, " +
 	"~/.gemini/GEMINI.md, ~/.codex/AGENTS.md) so your AI reaches for Jolli when you " +
-	"create PRs, search past decisions, or recall a branch's history — no need to ask each time.";
+	"search past decisions or recall a branch's history — no need to ask each time.";
 
 /** Persisted tri-state: `undefined` = undecided (default), else the user's choice. */
 export type GlobalInstructionsChoice = "enabled" | "disabled" | undefined;

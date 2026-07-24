@@ -1,8 +1,8 @@
 # Jolli Memory — Claude Code plugin
 
 Jolli Memory's Claude Code integration — MCP tools, a bare `/jolli` menu plus
-`/jolli:*` skills and commands, a PR-writer subagent, and session hooks —
-packaged as a single installable Claude Code plugin.
+`/jolli:*` skills and commands, and session hooks — packaged as a single
+installable Claude Code plugin.
 
 Jolli builds a durable memory of your work from your git commits and lets you
 recall it, search past decisions, and generate memory-rich PR descriptions —
@@ -20,7 +20,6 @@ hooks are what generate the memory that the plugin surfaces let you consume.
 - **Umbrella** — a bare `/jolli` action menu that lists the above and routes to
   your pick (written into `.claude/skills/jolli/` on first session; a plugin
   can't expose a bare command itself, so this is a project-level skill).
-- **Subagent** — `jolli:pr-writer`.
 - **Hooks** — record session activity, bootstrap the git hooks that build memory
   from your commits, and — until you sign in — remind you to run `/jolli:login`.
 
@@ -40,8 +39,8 @@ names the marketplace `jolli-marketplace`, which is why the install target is
 In the **desktop app**, use **+ → Plugins → Add marketplace** with the same
 source, then enable **Jolli Memory** under **Manage plugins**.
 
-After install the MCP tools, `/jolli:*` skills and commands, the `jolli:pr-writer`
-subagent, and the hooks are all live.
+After install the MCP tools, `/jolli:*` skills and commands, and the hooks are
+all live.
 
 ## Sign in (enable memory generation)
 

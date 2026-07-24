@@ -2,6 +2,10 @@
 
 <!-- Last synced commit: 9f11cdf0 | 2026-07-17 -->
 
+## Unreleased
+
+- **The `/jolli-pr` skill has been removed** — PR authoring no longer ships as a standalone skill. Turning a branch's memories into a PR title and body is still fully supported through the `get_pr_description` MCP tool and the `jolli pr-description` command — your agent can call either and open the PR with `gh` — so only the `/jolli-pr` skill itself, its entry in the `/jolli` menu, and its hint in the global agent-instructions block are gone. Upgrading removes any previously-installed `jolli-pr` skill file for you.
+
 ## 0.99.8
 
 - **Generate memories with your local AI CLI** — a new `local-agent` AI provider drives a locally-installed Claude Code to write your memories, so summarization runs through the agent you already have — no API key and no Jolli proxy call. Turn it on with `jolli configure --set aiProvider=local-agent`; if the binary isn't on your `PATH`, point at it with `jolli configure --set localAgentPath=/path/to/claude`.

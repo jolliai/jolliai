@@ -132,8 +132,8 @@ class CliIntegrationsTest {
         val msg = CliIntegrations.warningFor(CliIntegrations.Result.NodeMissing)
         msg shouldNotBe null
         msg!! shouldContain "Node.js"
+        msg shouldContain "/jolli-recall"
         msg shouldContain "/jolli-search"
-        msg shouldContain "/jolli-pr"
     }
 
     @Test

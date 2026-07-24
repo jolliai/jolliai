@@ -39,7 +39,7 @@ object CliIntegrations {
     fun warningFor(result: Result): String? = when (result) {
         is Result.Ok -> null
 		is Result.NodeMissing ->
-			"Node.js 22.5 or newer was not found — CLI-backed memory, MCP, /jolli-search and /jolli-pr are unavailable. " +
+			"Node.js 22.5 or newer was not found — CLI-backed memory, MCP, /jolli-recall and /jolli-search are unavailable. " +
 				"Install Node.js and reopen the project."
         is Result.BundleMissing ->
             "MCP and skills could not be set up — the bundled CLI was not found in the plugin. " +

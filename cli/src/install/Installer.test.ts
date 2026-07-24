@@ -448,7 +448,7 @@ describe("Installer", () => {
 			expect(await exists(claudeMd)).toBe(true);
 			const after = await readFile(claudeMd, "utf-8");
 			expect(after).toContain("Keep me.");
-			expect(after).toContain("jolli-recall");
+			expect(after).toContain("memory-shaped");
 		});
 
 		it("rejects integrations-only and repo-hooks-only together", async () => {
@@ -1196,7 +1196,7 @@ describe("Installer", () => {
 				const result = await install(tempDir);
 				expect(result.success).toBe(true);
 				const block = await readFile(join(fakeHomeDir, ".claude", "CLAUDE.md"), "utf-8");
-				expect(block).toContain("jolli-recall");
+				expect(block).toContain("memory-shaped");
 			});
 
 			it("removes a previously-written block when the switch is 'disabled'", async () => {
@@ -1212,7 +1212,7 @@ describe("Installer", () => {
 				const result = await install(tempDir);
 				expect(result.success).toBe(true);
 				const after = await readFile(join(fakeHomeDir, ".claude", "CLAUDE.md"), "utf-8");
-				expect(after).not.toContain("jolli-recall");
+				expect(after).not.toContain("memory-shaped");
 			});
 		});
 

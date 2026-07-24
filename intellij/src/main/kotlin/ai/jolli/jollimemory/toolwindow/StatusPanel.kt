@@ -369,7 +369,7 @@ class StatusPanel(
                 label = "MCP & Skills",
                 description = "active",
                 tooltip = "Node.js found — the MCP tools (search / recall / decision timeline) and the " +
-                    "/jolli-recall, /jolli-search, /jolli-pr skills are active.",
+                    "/jolli-recall, /jolli-search skills are active.",
             )
             !nodeAvailable -> StatusRow(
                 icon = Icon.WARN,
@@ -377,8 +377,7 @@ class StatusPanel(
                 description = "Node.js not found",
                 tooltip = "Node.js was not detected on your PATH, so these are unavailable:\n" +
                     "  • MCP tools (search / recall / decision timeline)\n" +
-                    "  • /jolli-search\n" +
-                    "  • /jolli-pr\n" +
+                    "  • /jolli-recall, /jolli-search\n" +
                     "Memory generation is unaffected (native Java hooks). Install Node.js and reopen " +
                     "the project to activate them.",
             )

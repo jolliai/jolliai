@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **The `/jolli-pr` skill has been removed** — only `jolli-recall` and `jolli-search` are installed now. Generating a PR description from a branch's memories is still available through the `get_pr_description` MCP tool and the `jolli pr-description` command; upgrading removes any previously-installed `jolli-pr` skill file automatically.
+
 ## 0.99.8
 
 ### New Features

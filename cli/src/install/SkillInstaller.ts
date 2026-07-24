@@ -132,11 +132,21 @@ export const CLAUDE_SKILLS_DIR: ReadonlyArray<string> = [".claude", "skills"];
 const SKILLS: ReadonlyArray<SkillRegistration> = [
 	{ name: "jolli-recall", build: buildRecallSkillTemplate },
 	{ name: "jolli-search", build: buildSearchSkillTemplate },
-	{ name: "jolli-pr", build: buildPrSkillTemplate },
 	{ name: "jolli-local-run", build: buildLocalRunSkillTemplate },
 	{ name: "jolli-remote-run", build: buildRemoteRunSkillTemplate },
 	{ name: "jolli", build: buildJolliMenuSkillTemplate },
 ];
+
+/**
+ * Skill directory names Jolli USED to ship but no longer does. On every
+ * `jolli enable` these are removed from the write targets so an upgrade doesn't
+ * strand a dead skill in the user's repo. Removal is guarded by the Jolli
+ * ownership marker (see {@link isJolliOwnedSkill}), so a user's own same-named
+ * skill is never deleted. `jolli-pr` was retired once PR authoring moved off a
+ * dedicated skill; the `get_pr_description` MCP tool / `pr-description` CLI
+ * command that backed it remain.
+ */
+const REMOVED_SKILL_NAMES: ReadonlyArray<string> = ["jolli-pr"];
 
 /**
  * Skill paths recorded in `.git/info/exclude` so they don't pollute
@@ -210,10 +220,44 @@ export async function updateSkillsIfNeeded(
 		/* v8 ignore next -- single always-on target; the disabled branch is unreachable now */
 		if (!target.enabled(config)) continue;
 		const targetDir = join(projectDir, ...target.relativeDir);
+		// Sweep away skills Jolli has retired before writing the current set, so an
+		// upgrade doesn't strand a dead skill (e.g. a pre-removal `jolli-pr`) in the
+		// user's repo. Marker-guarded so a user's own same-named skill survives.
+		for (const name of REMOVED_SKILL_NAMES) {
+			await removeRetiredSkill(join(targetDir, name));
+		}
 		for (const skill of SKILLS) {
 			await upsertSkill(targetDir, skill.name, skill.build());
 		}
 	}
+}
+
+/**
+ * Deletes a single retired-skill directory, but only when its SKILL.md carries a
+ * Jolli ownership marker — so a user's own hand-authored skill of the same name
+ * is never removed. A missing directory is a no-op. Fail-soft: a read/remove
+ * error is logged and swallowed, never thrown (mirrors {@link removeClaudeLegacySkills}).
+ */
+async function removeRetiredSkill(skillDir: string): Promise<void> {
+	const skillPath = join(skillDir, "SKILL.md");
+	let content: string;
+	try {
+		content = await readFile(skillPath, "utf-8");
+	} catch {
+		return; // Not present — nothing to remove.
+	}
+	if (!isJolliOwnedSkill(content)) {
+		log.info("Keeping %s — no Jolli ownership marker (user-owned)", skillDir);
+		return;
+	}
+	try {
+		await rm(skillDir, { recursive: true, force: true });
+		log.info("Removed retired Jolli skill at %s", skillDir);
+		/* v8 ignore start -- defensive: rm with force:true rarely throws */
+	} catch (error: unknown) {
+		log.warn("Failed to remove retired skill at %s: %s", skillDir, (error as Error).message);
+	}
+	/* v8 ignore stop */
 }
 
 /**
@@ -239,7 +283,7 @@ export async function updateSkillIfNeeded(projectDir: string, config: { claudeEn
  * Written ONLY to the Claude Code target — the umbrella routes to the plugin's
  * own `jolli:*` skills, which the cross-platform `.agents/skills/` hosts (Codex,
  * Cursor, Gemini, Copilot, OpenCode) don't have. Unlike a full `jolli enable`
- * this writes just the umbrella, NOT the unnamespaced `jolli-recall|search|pr`
+ * this writes just the umbrella, NOT the unnamespaced `jolli-recall|search`
  * siblings, so the Claude `/` menu shows a single clean `/jolli` alongside the
  * plugin's `/jolli:*`. Fail-soft (delegates to the version-aware upsertSkill).
  */
@@ -326,6 +370,7 @@ export async function removePluginJolliMenu(projectDir: string): Promise<void> {
  */
 const CLAUDE_LEGACY_SKILL_DIRS: ReadonlyArray<string> = [
 	...SKILLS.filter((skill) => skill.name !== "jolli").map((skill) => skill.name),
+	...REMOVED_SKILL_NAMES,
 	...LEGACY_SKILL_DIRS,
 ];
 
@@ -496,7 +541,7 @@ security recipe and the dist resolver and will not produce valid output.`;
  * generates the random value each invocation, which is what makes pre-computed
  * prompt-injection payloads useless.
  */
-function heredocInvocation(subcommand: "recall" | "search" | "pr-description", flagSuffix: string): string {
+function heredocInvocation(subcommand: "recall" | "search", flagSuffix: string): string {
 	return `${SHELL_PREREQUISITE_BLOCK}
 
 ### Invocation
@@ -739,322 +784,6 @@ Surface the message verbatim to the user (translated into their language if
 non-English). For "no records in this repo" specifically, suggest running
 \`jolli enable\` if they expected records. Do NOT retry or fabricate a recall
 payload from nothing.
-`;
-}
-
-/**
- * PR-description skill template — instructs the host LLM to call the
- * `get_pr_description` MCP tool (exposed as `mcp__jollimemory__get_pr_description`
- * on Claude Code) and then create the PR via `gh`, without rewriting the
- * tool-returned body from the diff. Byte-identical across every
- * {@link SKILL_TARGETS} entry, spec-compliant frontmatter only.
- */
-function buildPrSkillTemplate(): string {
-	return `---
-name: jolli-pr
-description: Create or update a pull request using a Jolli Memory-generated description. Detects whether the branch already has an open PR, calls the get_pr_description MCP tool, then runs gh to open or update the PR.
-metadata:
-  version: "${SKILL_VERSION}"
-  revision: 1
-  vendor: "jolli.ai"
----
-
-# Jolli PR
-
-Create a pull request whose title and body come from Jolli Memory's structured
-commit history — not from re-reading the diff. Every sentence in the description
-is grounded in the distilled decisions and topics that were recorded when the
-commits were made.
-
-## Hard rule (read this first)
-
-The title and body MUST come from the PR-description data (the \`get_pr_description\`
-MCP tool, or its CLI fallback below — both return the identical shape).
-
-**Do NOT rewrite or replace the body from the diff.** Doing so loses the
-structured decisions and rationale that Jolli Memory captured. You MAY adjust
-only the title, and only if the user explicitly asks. Do NOT add a
-\`Co-Authored-By: Claude\` trailer or a "Generated with Claude" footer — the
-body's own "Generated by Jolli Memory" footer is the product signature and must
-remain unchanged.
-
-## Step 0: Wait for pending memory
-
-A freshly-committed change is summarized by a detached background worker that
-can take tens of seconds. If you build the PR before it finishes, those commits
-land in the "skipped" footnote instead of the body. So first make sure memory
-generation is idle.
-
-### Probe the queue
-
-Preferred (MCP): call the \`queue_status\` tool (on Claude Code
-\`mcp__jollimemory__queue_status\`) with no arguments.
-
-Fallback (CLI):
-
-\`\`\`bash
-"$HOME/.jolli/jollimemory/run-cli" queue-status --format json
-\`\`\`
-
-Both return a status object:
-
-\`\`\`json
-{ "active": 2, "workerBlocking": true, "drained": false }
-\`\`\`
-
-- If \`drained\` is \`true\` → skip straight to Step 1.
-- Otherwise tell the user "N memory summaries are still generating — waiting…"
-  (N = \`active\`), then wait for it to finish:
-
-  Preferred (MCP): call \`queue_status\` with \`{"wait": true, "timeoutMs": 120000}\`.
-
-  Fallback (CLI):
-
-  \`\`\`bash
-  "$HOME/.jolli/jollimemory/run-cli" queue-status --wait --timeout 120 --format json
-  \`\`\`
-
-- The wait call returns \`drained: true\` → continue to Step 1.
-- It returns \`drained: false\` (timed out) → **STOP and ask the user**:
-  "Memory is still generating after 120s. Keep waiting, or create the PR now
-  with what's ready?" Continue only when they answer; if they choose to keep
-  waiting, repeat the wait call.
-
-\`active\` counts only memory-summary work — Memory Bank wiki/graph rendering is
-intentionally excluded, so this never blocks on wiki generation.
-
-The wait only covers work already enqueued when you probe. If you just made a
-commit, give the \`post-commit\` hook a moment to enqueue it before probing (or
-re-probe once) so the just-committed change isn't missed by a too-early \`drained\`.
-
-## Step 1: Detect whether an open PR already exists
-
-This skill both creates and updates. First find out which: does the current
-branch already have an **open** PR?
-
-\`\`\`bash
-BRANCH="$(git branch --show-current)"
-[ -z "$BRANCH" ] && { echo "detached HEAD — check out a branch before creating a PR"; exit 1; }
-gh pr list --head "$BRANCH" --state open --json number,url,baseRefName
-\`\`\`
-
-If the block prints the detached-HEAD message (empty \`BRANCH\`), STOP and tell the
-user to check out a branch first — a PR can't be opened from a detached HEAD.
-
-This is the first \`gh\` command, so if \`gh\` is not installed, tell the user:
-"The GitHub CLI (\`gh\`) is required. Install it from https://cli.github.com/
-and authenticate with \`gh auth login\`, then retry." — then STOP.
-
-Read the JSON array it prints:
-
-- **Empty (\`[]\`)** → **create mode**. No existing PR; you will create one.
-- **One or more entries** → **update mode**. Take the first entry and remember
-  its \`number\`, \`url\`, and \`baseRefName\`. (Within a single repo a branch can
-  have at most one open PR; "take the first" only matters for the rare
-  cross-fork case.)
-
-Carry the chosen mode — and, in update mode, the \`number\` and \`baseRefName\` —
-through the remaining steps.
-
-## Step 2: Get the PR description
-
-### Preferred: MCP tool
-
-If the \`get_pr_description\` tool is available, call it. On Claude Code it is
-named \`mcp__jollimemory__get_pr_description\`; on other hosts it appears as
-\`get_pr_description\` under the \`jollimemory\` MCP server. It describes the
-current branch and compares against a base branch, defaulting to the
-repository's default branch (origin/HEAD).
-
-- **Create mode:** if the user asked for a non-default base, pass \`baseBranch\`
-  (e.g. \`{"baseBranch": "develop"}\`); otherwise call with no arguments.
-- **Update mode:** pass the existing PR's base from Step 1 —
-  \`{"baseBranch": "<baseRefName>"}\` — so the description's diff range matches the
-  PR you are about to update.
-
-### Fallback: CLI here-doc
-
-If no such tool is available, run the \`pr-description\` CLI command instead. It
-wraps the exact same engine and returns the identical JSON shape.
-
-**Common case (PR targets the default branch)** — no user input, so no here-doc
-is needed:
-
-\`\`\`bash
-"$HOME/.jolli/jollimemory/run-cli" pr-description --format json
-\`\`\`
-
-**Non-default base** — the base branch is user-supplied text, so pass it on
-stdin via the same injection-safe here-doc recipe the other Jolli skills use,
-NOT interpolated into argv:
-
-${heredocInvocation("pr-description", " --format json")}
-
-Here \`<user-arg>\` is the base branch name — in create mode the user-supplied
-base (e.g. \`develop\`), in update mode the \`baseRefName\` from Step 1. In create
-mode, remember it — Step 4 must pass the same value to \`gh pr create --base\`.
-In update mode the base is not passed to \`gh\`; an existing PR's target branch
-is left unchanged.
-
-Do NOT fall back to \`npm run\`, \`npx\`, \`node\` directly, PowerShell-native
-commands, WSL bash, or any workspace-local script.
-
-**Failure handling**:
-- If \`~/.jolli/jollimemory/run-cli\` does not exist: tell the user
-  "Jolli not installed. Please install via \`npm install -g @jolli.ai/cli && jolli enable\`
-  or install the Jolli VS Code extension." Do not attempt further processing.
-- If the command output starts with \`error:\` or contains \`unknown command 'pr-description'\`:
-  the installed CLI is older than this skill. Tell the user
-  "Your installed Jolli CLI is older than this skill — please run
-  \`npm update -g @jolli.ai/cli\` (or update your VS Code extension), then retry."
-  Do not attempt further processing.
-
-### The result (both paths return this shape)
-
-Both the MCP tool and the CLI fallback return the same JSON object:
-
-\`\`\`json
-{
-  "title": "feat(auth): add JWT refresh-token rotation",
-  "body": "## Summary\\n...",
-  "missingCount": 2,
-  "summaryCount": 8,
-  "commitCount": 10
-}
-\`\`\`
-
-### Error: no summaries
-
-If the call errors with a message containing "No JolliMemory summaries" (or
-any equivalent indicating the branch has no committed memory) — for the CLI
-fallback this arrives as \`{"type":"error","message":"…"}\` — tell the user:
-
-> "This branch has no Jolli Memory yet. Commit some changes with Jolli enabled
-> and then retry."
-
-**STOP — do not proceed.**
-
-### Warning: some commits missing memory
-
-If \`missingCount > 0\`, tell the user before proceeding:
-
-> "N of this branch's commits have no Jolli Memory. The description already
-> includes a footnote listing the skipped commits."
-
-Then continue to Step 3.
-
-## Step 3: Push the branch
-
-Check whether the current branch already has an upstream tracking branch:
-
-\`\`\`bash
-git rev-parse --abbrev-ref --symbolic-full-name @{u}
-\`\`\`
-
-- **If it prints an upstream** (e.g. \`origin/<branch>\`) and there are unpushed
-  commits, push to that existing upstream — do NOT re-point it or assume
-  \`origin\`, which would rewire tracking or push to the wrong remote:
-
-  \`\`\`bash
-  git push
-  \`\`\`
-
-- **If it errors** with "no upstream configured", create one on \`origin\`:
-
-  \`\`\`bash
-  git push -u origin "$(git branch --show-current)"
-  \`\`\`
-
-If the push fails (e.g. protected branch, no remote), surface the error to the
-user and STOP.
-
-## Step 4: Create or update the PR
-
-Write the \`body\` field from the tool response to a temporary file and pass it
-via \`--body-file\`. Using \`--body-file\` instead of \`--body\` is required so
-multi-line Markdown survives shell quoting intact. The same temp file is used
-whether you create or update.
-
-The body is generated from commit memory, which is user-controlled text. To stop
-a body line from prematurely closing the here-doc (which would let the shell
-interpret the rest of the body), generate a fresh random 16-character hex string
-(the "delimiter token") for this invocation — e.g. \`3f8a9b2c5d7e1f4a\`. Scan the
-body: if it contains a line that is exactly \`JOLLI_PR_BODY_<delimiter token>_END\`,
-regenerate the token and re-check.
-
-Pick the ONE block below that matches your mode and run it **as a single shell
-invocation** — the \`mktemp\` temp file lives only for that one invocation, so the
-write, the \`gh\` call, and the cleanup must stay in the same block. In each,
-replace the two \`<DELIM>\` occurrences with your delimiter token and paste the
-full body string verbatim between them.
-
-**Create mode** — open a new PR:
-
-\`\`\`bash
-JOLLI_PR_BODY_FILE=$(mktemp)
-cat > "$JOLLI_PR_BODY_FILE" <<'JOLLI_PR_BODY_<DELIM>_END'
-<paste the full body string from the tool here>
-JOLLI_PR_BODY_<DELIM>_END
-gh pr create --title "<title from tool>" --body-file "$JOLLI_PR_BODY_FILE"
-rm -f "$JOLLI_PR_BODY_FILE"
-\`\`\`
-
-If you passed a \`baseBranch\` to the tool in Step 2 (the PR targets a non-default
-base), add the same value as \`--base <baseBranch>\` to \`gh pr create\`. Otherwise
-\`gh\` defaults to the repository's default branch, and the PR would target a
-different base than the description was computed against:
-
-\`\`\`bash
-JOLLI_PR_BODY_FILE=$(mktemp)
-cat > "$JOLLI_PR_BODY_FILE" <<'JOLLI_PR_BODY_<DELIM>_END'
-<paste the full body string from the tool here>
-JOLLI_PR_BODY_<DELIM>_END
-gh pr create --base <baseBranch> --title "<title from tool>" --body-file "$JOLLI_PR_BODY_FILE"
-rm -f "$JOLLI_PR_BODY_FILE"
-\`\`\`
-
-**Update mode** — overwrite the existing PR's title and body with the freshly
-generated description, using the \`number\` remembered in Step 1:
-
-\`\`\`bash
-JOLLI_PR_BODY_FILE=$(mktemp)
-cat > "$JOLLI_PR_BODY_FILE" <<'JOLLI_PR_BODY_<DELIM>_END'
-<paste the full body string from the tool here>
-JOLLI_PR_BODY_<DELIM>_END
-gh pr edit <number> --title "<title from tool>" --body-file "$JOLLI_PR_BODY_FILE"
-rm -f "$JOLLI_PR_BODY_FILE"
-\`\`\`
-
-Do NOT pass \`--base\` in update mode — the existing PR's target branch is left
-unchanged. This overwrites the current title and body outright (including any
-manual edits), which is intended: the description must come from Jolli Memory.
-
-If the user explicitly asked to adjust the title, substitute their revised
-wording for the \`--title\` value only — leave \`--body-file\` unchanged. This
-applies to both create and update.
-
-## Step 5: Report the URL
-
-Both \`gh pr create\` and \`gh pr edit\` print the PR URL on success. Relay that
-URL to the user. (The \`gh\`-not-installed check happened in Step 1.)
-
-## Step 6: Push memory to Jolli (optional)
-
-After reporting the PR URL, ask the user: "Push this branch's memory to Jolli?"
-Only proceed if they say yes.
-
-Preferred (MCP): call \`push_memory\` (on Claude Code \`mcp__jollimemory__push_memory\`),
-optionally \`{"space": "<name-or-id>"}\` if the user named a space, else \`{}\`.
-Fallback (CLI): \`"$HOME/.jolli/jollimemory/run-cli" push --format json\` (add \`--space <id|slug>\` if named).
-
-- \`{ "type": "pushed", "pushed": N, "urls": [...] }\` → tell the user N memories were pushed; share the article URLs.
-- \`{ "type": "binding_required", "repoUrl": "...", "spaces": [ { "id", "name", "slug" } ], "defaultSpaceId": N }\`
-  → this repo isn't linked to a Jolli memory space yet. Present the \`spaces\` list and let the user pick one
-  (or use the space they already named). Then bind + retry:
-  MCP: \`bind_space\` with \`{"space": "<id-or-slug>"}\`, then call \`push_memory\` again.
-  CLI: \`"$HOME/.jolli/jollimemory/run-cli" bind --space <id|slug>\`, then \`... push --format json\`.
-  The binding is remembered server-side per repo, so future pushes won't ask again.
-- \`{ "type": "error", "message": "..." }\` → relay it (e.g. not signed in → sign in / \`jolli auth login\`; outdated → update). Do not retry blindly.
 `;
 }
 
@@ -1620,10 +1349,10 @@ to report the cancelled outcome (who/when + workflow URL).
 export function buildJolliMenuSkillTemplate(): string {
 	return `---
 name: jolli
-description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, pr, run a workflow local or remote, workflow history) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
+description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, run a workflow local or remote, workflow history) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 4
+  revision: 5
   vendor: "jolli.ai"
 ---
 
@@ -1633,7 +1362,7 @@ The single umbrella action menu for Jolli. It ties together the standalone Jolli
 skills and whatever Jolli MCP tools are registered in this session, and routes the
 user's choice to the right one. It is a friendly front door — it **never**
 re-implements any action, it only invokes an existing skill or an existing MCP
-tool. The standalone \`/jolli-recall\`, \`/jolli-search\`, \`/jolli-pr\` commands and
+tool. The standalone \`/jolli-recall\`, \`/jolli-search\` commands and
 the \`/mcp__jollimemory__jolli\` prompt all keep working unchanged; this is layered
 on top of them, not a replacement.
 
@@ -1652,8 +1381,6 @@ Assemble ONE combined list of actions from two sources.
   Route by invoking the \`jolli-recall\` skill.
 - **jolli-search** — Search structured commit memories across branches
   (decisions, topics, files). Route by invoking the \`jolli-search\` skill.
-- **jolli-pr** — Create or update a pull request using a Jolli Memory-generated
-  description. Route by invoking the \`jolli-pr\` skill.
 - **Run a workflow** — Run a Jolli workflow. When the user picks this, ask them
   **local vs remote**, defaulting to **local**:
   - **local (default)** — your agent executes the workflow's recipe on this
@@ -1763,16 +1490,17 @@ text-list fallback keeps \`/jolli\` usable on every host that loads skills.
  * ⚠ Revision-ordering contract with {@link buildJolliMenuSkillTemplate}: a full
  * `jolli enable` no longer writes the standalone menu to `.claude/skills/jolli/`
  * (it targets `.agents/skills/` only), so in a fresh install the two no longer
- * collide. BUT a pre-upgrade install may still have the standalone menu (revision
- * 3) sitting in `.claude/skills/jolli/`, and both carry `vendor: "jolli.ai"` so the
- * ownership guard cannot tell them apart — `upsertSkill` arbitrates purely by
- * `metadata.revision`. This variant is therefore revision **5** (above the
- * standalone's current revision 4, and above the ≤3 any legacy `.claude/` copy
- * carries) so {@link installPluginJolliMenu} RECLAIMS that legacy slot, replacing
- * a stale standalone menu that would otherwise route to the unnamespaced
- * `jolli-*` skills {@link removeClaudeLegacySkills} just deleted. Keep this note and
- * both revision literals in view when editing either template — dropping this below
- * 4 would strand the broken pre-upgrade menu.
+ * collide. BUT a pre-upgrade install may still have the standalone menu (an
+ * earlier revision) sitting in `.claude/skills/jolli/`, and both carry
+ * `vendor: "jolli.ai"` so the ownership guard cannot tell them apart —
+ * `upsertSkill` arbitrates purely by `metadata.revision`. This variant is
+ * therefore revision **6** (above the standalone's current revision 5, and above
+ * the ≤5 any legacy `.claude/` copy carries) so {@link installPluginJolliMenu}
+ * RECLAIMS that legacy slot, replacing a stale standalone menu that would
+ * otherwise route to the unnamespaced `jolli-*` skills
+ * {@link removeClaudeLegacySkills} just deleted. Keep this note and both revision
+ * literals in view when editing either template — this must stay strictly above
+ * the standalone's revision, or the broken pre-upgrade menu is stranded.
  */
 export function buildPluginJolliMenuSkillTemplate(): string {
 	return `---
@@ -1780,7 +1508,7 @@ name: jolli
 description: The Jolli front door — checks how Jolli is set up in this repo, guides first-time setup through /jolli:init when something's missing, and otherwise shows a status snapshot and routes you to the right Jolli skill or MCP tool. Use when the user types /jolli or asks for Jolli / the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 5
+  revision: 6
   vendor: "jolli.ai"
 ---
 
