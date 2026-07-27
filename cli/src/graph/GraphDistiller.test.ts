@@ -413,6 +413,95 @@ describe("distillGraph", () => {
 	});
 });
 
+// The edge phase fans out one graph-edges call per category. Under the
+// local-agent provider each call spawns a real CLI agent process, so it must
+// serialize to 1 like every other LLM fan-out; under a network provider it may
+// run categories in parallel. A tracker on the graph-edges mock records the peak
+// number of concurrently in-flight calls.
+describe("edge distillation fan-out", () => {
+	function fourCategoryInput(): DistillInput {
+		return {
+			topics: [1, 2, 3, 4].map((n) => ({
+				slug: `t${n}`,
+				title: `Topic${n}`,
+				summary: `s${n}`,
+				content: `b${n}`,
+			})),
+		};
+	}
+
+	// Each topic sits in its own category and carries two units, so every category
+	// batch has >=2 units and triggers a real graph-edges call — a genuine
+	// four-wide fan-out to observe (distillEdges skips the LLM below two units).
+	function setupFourCategories(onEdges: () => Promise<void>): void {
+		const twoUnits = (p: string) =>
+			JSON.stringify({
+				units: [
+					{ id: `${p}a`, kind: "decision", shortTitle: "A", summary: "s" },
+					{ id: `${p}b`, kind: "mechanism", shortTitle: "B", summary: "s" },
+				],
+			});
+		callLlm.mockImplementation(async (opts: { action: string; params: Record<string, string> }) => {
+			if (opts.action === "graph-categories")
+				return {
+					text: JSON.stringify({
+						categories: [1, 2, 3, 4].map((n) => ({ id: `cat${n}`, shortTitle: `C${n}`, summary: "c" })),
+						topics: [1, 2, 3, 4].map((n) => ({
+							slug: `t${n}`,
+							title: `Topic${n}`,
+							shortTitle: `T${n}`,
+							summary: "s",
+							categoryId: `cat${n}`,
+						})),
+					}),
+				};
+			if (opts.action === "graph-units") {
+				const units: Record<string, string> = {
+					Topic1: twoUnits("u1"),
+					Topic2: twoUnits("u2"),
+					Topic3: twoUnits("u3"),
+					Topic4: twoUnits("u4"),
+				};
+				return { text: units[opts.params.topicTitle] ?? '{"units":[]}' };
+			}
+			if (opts.action === "graph-edges") {
+				await onEdges();
+				return { text: '{"edges":[]}', stopReason: null };
+			}
+			throw new Error(`unexpected action ${opts.action}`);
+		});
+	}
+
+	function peakTracker(): { peak: () => number; onEdges: () => Promise<void> } {
+		let inFlight = 0;
+		let max = 0;
+		return {
+			peak: () => max,
+			onEdges: async () => {
+				inFlight++;
+				max = Math.max(max, inFlight);
+				// Yield so any sibling calls that were allowed to start can overlap.
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				inFlight--;
+			},
+		};
+	}
+
+	it("serializes edge distillation to one call under the local-agent provider", async () => {
+		const t = peakTracker();
+		setupFourCategories(t.onEdges);
+		await distillGraph(fourCategoryInput(), { ...CONFIG, aiProvider: "local-agent" });
+		expect(t.peak()).toBe(1);
+	});
+
+	it("fans edge distillation out across categories under a network provider", async () => {
+		const t = peakTracker();
+		setupFourCategories(t.onEdges);
+		await distillGraph(fourCategoryInput(), { ...CONFIG, aiProvider: "anthropic" });
+		expect(t.peak()).toBeGreaterThan(1);
+	});
+});
+
 describe("distillGraphIncremental", () => {
 	function baseline(): DistilledGraph {
 		return {

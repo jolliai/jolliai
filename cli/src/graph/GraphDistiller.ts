@@ -443,7 +443,7 @@ async function distillEdgesForCategories(
 	const targets = opts?.onlyCategories ?? [...groups.keys()];
 	const perCategory = await mapWithConcurrency(
 		targets,
-		EDGES_CONCURRENCY,
+		llmFanoutLimit(EDGES_CONCURRENCY, config),
 		(catId) => distillEdges(groups.get(catId) ?? [], config, { strict: opts?.strict }),
 		opts?.strict
 			? undefined // strict: a throw must fail the round (keep prior graph) — never swallow
