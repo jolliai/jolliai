@@ -114,9 +114,6 @@ src/main/kotlin/ai/jolli/jollimemory/
 │   ├── SkillInstaller.kt            # Installs the /jolli-recall slash command into Claude Code's skills directory
 │   └── SummaryReader.kt             # Read summaries from orphan branch
 ├── core/                            # Pure Kotlin core (no IntelliJ dependencies)
-│   ├── AnthropicClient.kt           # HTTP client for Anthropic API (Java 21 HttpClient)
-│   ├── LlmClient.kt                 # Abstraction over the LLM provider — picks Anthropic direct vs Jolli proxy by config
-│   ├── Summarizer.kt                # LLM prompt construction and response parsing
 │   ├── SummaryStore.kt              # Orphan branch read/write (git plumbing)
 │   ├── SummaryTree.kt               # Tree-structured summary index
 │   ├── PlanProgressEvaluator.kt     # Derives "active vs done" plan progress from transcript signals
@@ -168,21 +165,23 @@ src/main/kotlin/ai/jolli/jollimemory/
 
 ## Key Design Decisions
 
-### Pure Kotlin — No Node.js Dependency
+### LLM traffic delegates to the bundled CLI
 
-Unlike the VS Code extension (which bundles a Node.js CLI), the IntelliJ plugin implements everything in Kotlin:
+The plugin used to talk to Anthropic directly from Kotlin (`AnthropicClient` / `LlmClient` / `Summarizer` on top of Java 21's `HttpClient`). All of that is gone — every AI-facing feature (commit-message generation, squash-message consolidation, E2E-test guides, recap, plan translation) now spawns the plugin-bundled `Cli.js` via `CliIntegrations.generate` and reads a single-line JSON response. Provider routing (`anthropic` / `jolli-proxy` / `local-agent`) lives entirely in the CLI's `callLlm`, so the IDEs and the CLI stay behavior-identical by construction and adding a provider is a one-place change. **Node.js 22.5+ is therefore a hard requirement for AI features** (see `CliIntegrations.resolveNode` and the "Node missing" surface warnings).
+
+What stays Kotlin-side:
 
 - **Git operations** use `ProcessBuilder` to execute git plumbing commands directly
-- **HTTP calls** use Java 21's built-in `HttpClient` (for both Anthropic API and Jolli Space API)
-- **Hook installation** is pure file I/O — writes shell scripts that invoke `java -jar jollimemory-hooks.jar`
+- **Jolli Space HTTP** (Share in Jolli, push/list-spaces) still uses Java 21's built-in `HttpClient` from `JolliApiClient` / `JolliAuthService` / `TelemetryFlusher`
 - **Transcript parsing** reads JSONL line-by-line with cursor-based resumption (supports files up to 50MB)
+- **Hook installation** delegates to the bundled CLI's `enable` / `disable` (the plugin no longer writes hook bodies itself)
 
 ### Hooks as Standalone Fat JAR
 
 Git hooks must run outside the IDE (commits happen from the terminal too). The `hookJar` Gradle task (ShadowJar) produces `jollimemory-hooks.jar` — a self-contained JAR with:
 
 - All hook entry points (`PostCommitHook`, `PostRewriteHook`, `PrepareMsgHook`, `StopHook`, `GeminiAfterAgentHook`)
-- Core classes (`Summarizer`, `SummaryStore`, `TranscriptReader`, etc.)
+- Core classes (`SummaryStore`, `TranscriptReader`, etc.)
 - Gson for JSON parsing
 - Kotlin stdlib (bundled via separate `hooksRuntime` configuration)
 

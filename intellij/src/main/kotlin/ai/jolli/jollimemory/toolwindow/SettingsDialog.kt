@@ -833,10 +833,27 @@ class SettingsDialog(
             ai.jolli.jollimemory.core.telemetry.Telemetry.track("ai_provider_selected", mapOf("provider" to provider))
         }
 
-        // Check if any LLM credential is available (matches LlmClient fallback chain)
-        val hasCredentials = !config.apiKey.isNullOrBlank() ||
-            !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() ||
-            !config.jolliApiKey.isNullOrBlank()
+        // Mirrors cli/src/core/LlmClient.ts resolveLlmCredentialSource so this auto-disable
+        // decision matches what the CLI would actually be able to route with. Two subtleties
+        // the old any-key OR-check got wrong:
+        //   1. Reads `resolvedApiKey` (the key just persisted to shared config.json), NOT
+        //      `config.apiKey` — that field is force-nulled above (lines 777/788) because
+        //      Anthropic credentials live only in the shared config now. The old check
+        //      always saw null there.
+        //   2. Branches on the selected `provider`: local-agent needs no key at all (OAuth
+        //      through the agent tool itself), and Anthropic must not accept a lone Jolli
+        //      key (the CLI would fail at generation time).
+        val envAnthropicKey = System.getenv("ANTHROPIC_API_KEY")
+        val savedJolliKey = if (jolliKeyCleared) null else jolliApiKeyText.ifBlank { null }
+        val savedAnthropicKey = resolvedApiKey.ifBlank { null }
+        val hasCredentials = when (provider) {
+            "local-agent" -> true
+            "jolli" -> !savedJolliKey.isNullOrBlank()
+            "anthropic" -> !savedAnthropicKey.isNullOrBlank() || !envAnthropicKey.isNullOrBlank()
+            else -> !savedAnthropicKey.isNullOrBlank() ||
+                !envAnthropicKey.isNullOrBlank() ||
+                !savedJolliKey.isNullOrBlank()
+        }
 
         // Snapshot the inputs needed off the EDT, then close the dialog immediately. All
         // the heavy work (git subprocesses, hook install/uninstall, Memory Bank init +

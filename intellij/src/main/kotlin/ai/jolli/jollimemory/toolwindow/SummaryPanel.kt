@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.toolwindow
 
+import ai.jolli.jollimemory.bridge.CliIntegrations
 import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.bridge.GitRemoteUtils
 import ai.jolli.jollimemory.core.CommitSummary
@@ -9,7 +10,6 @@ import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.core.StorageFactory
 import ai.jolli.jollimemory.core.StoredSession
 import ai.jolli.jollimemory.core.StoredTranscript
-import ai.jolli.jollimemory.core.Summarizer
 import ai.jolli.jollimemory.core.SummaryStore
 import ai.jolli.jollimemory.core.SummaryTree
 import ai.jolli.jollimemory.core.TopicUpdates
@@ -1272,28 +1272,30 @@ class SummaryPanel(
     }
 
     /**
-     * Generates an E2E test guide for [currentSummary] via the LLM, persists it,
+     * Generates an E2E test guide for [currentSummary] via the CLI, persists it,
      * and swaps [currentSummary] to the updated copy. Runs synchronously — call
      * from a pooled thread. Shared by [handleGenerateE2eTest] and the Create PR flow.
+     *
+     * Delegates to `jolli generate e2e-test` via [CliIntegrations.generate] so
+     * provider routing, prompt assembly, and HTTP live in the CLI — the plugin
+     * only serializes the topic list, commit message, and diff.
      */
     private fun generateAndStoreE2eTest(): List<E2eTestScenario> {
         val summary = currentSummary
-        val config = SessionTracker.loadConfig(cwd)
         val (topics) = SummaryUtils.collectSortedTopics(summary)
         val diff = getDiffForCommit(summary.commitHash)
-        jmLog.info(
-            "generateAndStoreE2eTest: topics=%d, diff len=%d, provider=%s, model=%s, hasApiKey=%s, hasJolliKey=%s",
-            topics.size, diff.length, config.aiProvider ?: "<null>", config.model ?: "<null>",
-            (!config.apiKey.isNullOrBlank()).toString(), (!config.jolliApiKey.isNullOrBlank()).toString(),
-        )
+        jmLog.info("generateAndStoreE2eTest: topics=%d, diff len=%d", topics.size, diff.length)
 
-        val scenarios = Summarizer.generateE2eTest(Summarizer.E2eTestParams(
-            topics = topics.map { it.topic.topic },
-            commitMessage = summary.commitMessage, diff = diff,
-            apiKey = config.apiKey, model = config.model, jolliApiKey = config.jolliApiKey,
-            aiProvider = config.aiProvider,
+        val request = Gson().toJson(mapOf(
+            "topics" to topics.map { it.topic.topic },
+            "commitMessage" to summary.commitMessage,
+            "diff" to diff,
         ))
-        jmLog.info("generateAndStoreE2eTest: LLM returned %d scenario(s); persisting", scenarios.size)
+        val response = CliIntegrations.generate(cwd, "e2e-test", request)
+        val scenariosJson = response.getAsJsonArray("scenarios")
+            ?: throw RuntimeException("Empty response from the CLI")
+        val scenarios = parseE2eScenariosFromJson(scenariosJson)
+        jmLog.info("generateAndStoreE2eTest: CLI returned %d scenario(s); persisting", scenarios.size)
 
         val updatedSummary = summary.copy(e2eTestGuide = scenarios)
         store.storeSummary(updatedSummary, force = true)
@@ -1301,17 +1303,46 @@ class SummaryPanel(
         return scenarios
     }
 
+    /**
+     * Parses the E2E scenario array shape shared by CLI responses and webview edits.
+     * Fails loud with a clear message on any missing / mistyped field so a malformed
+     * payload surfaces as a caller-visible RuntimeException instead of an NPE deep in
+     * gson's `.asString` chain.
+     */
+    private fun parseE2eScenariosFromJson(scenariosJson: JsonArray): List<E2eTestScenario> {
+        return scenariosJson.mapIndexed { i, el ->
+            val obj = el.takeIf { it.isJsonObject }?.asJsonObject
+                ?: throw RuntimeException("E2E scenario #$i is not a JSON object")
+            E2eTestScenario(
+                title = requiredString(obj, "title", i),
+                preconditions = obj.get("preconditions")?.takeUnless { it.isJsonNull }?.asString,
+                steps = requiredStringArray(obj, "steps", i),
+                expectedResults = requiredStringArray(obj, "expectedResults", i),
+            )
+        }
+    }
+
+    private fun requiredString(obj: JsonObject, field: String, i: Int): String {
+        val el = obj.get(field)?.takeUnless { it.isJsonNull }
+            ?: throw RuntimeException("E2E scenario #$i is missing field \"$field\"")
+        return runCatching { el.asString }.getOrElse {
+            throw RuntimeException("E2E scenario #$i field \"$field\" is not a string")
+        }
+    }
+
+    private fun requiredStringArray(obj: JsonObject, field: String, i: Int): List<String> {
+        val arr = obj.get(field)?.takeIf { it.isJsonArray }?.asJsonArray
+            ?: throw RuntimeException("E2E scenario #$i field \"$field\" is missing or not an array")
+        return arr.mapIndexed { j, item ->
+            runCatching { item.asString }.getOrElse {
+                throw RuntimeException("E2E scenario #$i field \"$field\"[$j] is not a string")
+            }
+        }
+    }
+
     private fun handleEditE2eTest(scenariosJson: JsonArray) {
         ApplicationManager.getApplication().executeOnPooledThread {
-            val scenarios = scenariosJson.map { el ->
-                val obj = el.asJsonObject
-                E2eTestScenario(
-                    title = obj.get("title").asString,
-                    preconditions = obj.get("preconditions")?.asString,
-                    steps = obj.getAsJsonArray("steps").map { it.asString },
-                    expectedResults = obj.getAsJsonArray("expectedResults").map { it.asString },
-                )
-            }
+            val scenarios = parseE2eScenariosFromJson(scenariosJson)
             val updatedSummary = currentSummary.copy(e2eTestGuide = scenarios)
             store.storeSummary(updatedSummary, force = true)
             currentSummary = updatedSummary
@@ -1339,14 +1370,14 @@ class SummaryPanel(
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
                 val summary = currentSummary
-                val config = SessionTracker.loadConfig(cwd)
                 val (topics) = SummaryUtils.collectSortedTopics(summary)
 
-                val recap = Summarizer.generateRecap(Summarizer.RecapParams(
-                    topics = topics.map { it.topic.topic },
-                    commitMessage = summary.commitMessage,
-                    apiKey = config.apiKey, model = config.model, jolliApiKey = config.jolliApiKey,
+                val request = Gson().toJson(mapOf(
+                    "topics" to topics.map { it.topic.topic },
+                    "commitMessage" to summary.commitMessage,
                 ))
+                val response = CliIntegrations.generate(cwd, "recap", request)
+                val recap = response.get("recap")?.asString ?: ""
 
                 val trimmed = recap.trim()
                 if (trimmed.isEmpty()) {
@@ -1523,8 +1554,10 @@ class SummaryPanel(
                     return@executeOnPooledThread
                 }
                 ApplicationManager.getApplication().invokeLater { postToWebview("planTranslating", mapOf("slug" to slug)) }
-                val config = SessionTracker.loadConfig(cwd)
-                val translated = Summarizer.translateToEnglish(content, config.apiKey, config.model, config.jolliApiKey, config.aiProvider)
+                val request = Gson().toJson(mapOf("content" to content))
+                val response = CliIntegrations.generate(cwd, "translate", request)
+                val translated = response.get("text")?.asString
+                    ?: throw RuntimeException("Empty response from the CLI")
                 store.writePlanToBranch(slug, translated, "Translate plan $slug to English")
                 syncPlanTitle(slug, translated)
                 planTranslateSet.remove(slug)

@@ -417,9 +417,22 @@ tasks {
         onlyIf { !System.getProperty("os.name").lowercase().contains("win") }
     }
 
+    // LLM-migration gate: keeps production Kotlin off api.anthropic.com and
+    // out of java.net.http (outside the three legitimate Jolli / auth /
+    // telemetry HTTP consumers listed in the script's ALLOWLIST). Wired the
+    // same way as checkGlobalState so it runs on every test invocation with
+    // no extra CI pipeline step. See scripts/check-no-direct-llm-http.sh for
+    // the rationale.
+    val checkNoDirectLlmHttp = register<Exec>("checkNoDirectLlmHttp") {
+        group = "verification"
+        description = "Enforce that LLM traffic routes through the bundled CLI, not Kotlin"
+        commandLine("bash", "scripts/check-no-direct-llm-http.sh")
+        onlyIf { !System.getProperty("os.name").lowercase().contains("win") }
+    }
+
     test {
         useJUnitPlatform()
-        dependsOn(checkGlobalState)
+        dependsOn(checkGlobalState, checkNoDirectLlmHttp)
         // Parallelism now lives INSIDE one JVM: JUnit 5 runs test classes
         // concurrently on a work-stealing pool (src/test/resources/
         // junit-platform.properties). This is safe because tests no longer

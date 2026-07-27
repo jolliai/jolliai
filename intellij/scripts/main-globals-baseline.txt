@@ -5,7 +5,6 @@ src/main/kotlin/ai/jolli/jollimemory/bridge/GitOps.kt
 src/main/kotlin/ai/jolli/jollimemory/bridge/HookInstaller.kt
 src/main/kotlin/ai/jolli/jollimemory/core/JmLogger.kt
 src/main/kotlin/ai/jolli/jollimemory/core/KBPathResolver.kt
-src/main/kotlin/ai/jolli/jollimemory/core/LlmClient.kt
 src/main/kotlin/ai/jolli/jollimemory/core/SessionTracker.kt
 src/main/kotlin/ai/jolli/jollimemory/core/WindowsHidden.kt
 src/main/kotlin/ai/jolli/jollimemory/core/telemetry/Telemetry.kt
