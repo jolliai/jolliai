@@ -117,7 +117,7 @@ Hook installation uses dist-path indirection: hooks call `node "$($HOME/.jolli/j
 
 ### MCP server registration (multi-host)
 
-`jolli enable` wires the `jolli mcp` stdio server into every detected AI host. Registration is handled by per-host `McpHostRegistrar` implementations under [`cli/src/install/mcp/HostRegistrars.ts`](cli/src/install/mcp/HostRegistrars.ts). Each registrar carries a `scope`: **repo**-scoped hosts (config inside the worktree) are registered per-worktree via `registerRepoMcpHosts`; **global**-scoped hosts (one machine-wide file shared by every repo) are registered once via `registerGlobalMcpHosts`. Uninstall calls `removeRepoMcpHosts` — global entries are deliberately **not** removed, since a single-repo uninstall must not break MCP for other repos still using Jolli. Seven hosts are supported:
+`jolli enable` wires the `jolli mcp` stdio server into every detected AI host. Registration is handled by per-host `McpHostRegistrar` implementations under [`cli/src/install/mcp/HostRegistrars.ts`](cli/src/install/mcp/HostRegistrars.ts). Each registrar carries a `scope`: **repo**-scoped hosts (config inside the worktree) are registered per-worktree via `registerRepoMcpHosts`; **global**-scoped hosts (one machine-wide file shared by every repo) are registered once via `registerGlobalMcpHosts`. Uninstall calls `removeRepoMcpHosts` — global entries are deliberately **not** removed, since a single-repo uninstall must not break MCP for other repos still using Jolli. Ten hosts are supported:
 
 | Host | Scope | Config path | Writer |
 |------|-------|-------------|--------|
@@ -128,8 +128,11 @@ Hook installation uses dist-path indirection: hooks call `node "$($HOME/.jolli/j
 | OpenCode | global | `~/.config/opencode/opencode.json` | `JsonMcpWriter` (key `mcp`; entry needs `type:"local"` + combined command array) |
 | GitHub Copilot CLI | global | `~/.copilot/mcp-config.json` | `JsonMcpWriter` |
 | VS Code Copilot Chat | global | `<vscodeUserDataDir>/User/mcp.json` | `JsonMcpWriter` (key `servers`; entry `type:"stdio"`) |
+| Cline (VS Code ext) | global | `settings/cline_mcp_settings.json` under the ext's globalStorage, **per hosting flavor** | `JsonMcpWriter` (default key; Cline CLI has no MCP config) |
+| Devin CLI | global | `~/.config/devin/config.json` | `JsonMcpWriter` (default key; entry adds `transport:"stdio"`) |
+| Antigravity | global | `~/.gemini/config/mcp_config.json` | `JsonMcpWriter` (default key; stdio inferred from `command`, no type/transport) |
 
-Each non-Claude registrar is gated by its host's existing detector (`isCursorInstalled`, `isCodexInstalled`, …) so registration is skipped for hosts the user hasn't installed. **Claude is the exception**: its `detected` flag mirrors `config.claudeEnabled !== false` (not a filesystem detector) — but MCP registration still runs **regardless of `claudeEnabled`** (it happens before the `claudeEnabled` hook gate in the install loop), because the Claude hook and MCP registration are independent decisions. IntelliJ MCP registration is a follow-up; the IntelliJ plugin registers no MCP today.
+Each non-Claude registrar is gated by its host's existing detector (`isCursorInstalled`, `isCodexInstalled`, `isDevinInstalled`, `isAntigravityInstalled`, `isClineInstalled`/`isClineCliInstalled`, …) so registration is skipped for hosts the user hasn't installed. Each host's per-entry envelope differs (OpenCode `type:"local"`+array, Copilot Chat `type:"stdio"`, Devin `transport:"stdio"`, Antigravity none) — a shape correct for one host silently no-ops if written to another, so each was verified against the host's real on-disk config or app source. **Claude is the exception**: its `detected` flag mirrors `config.claudeEnabled !== false` (not a filesystem detector) — but MCP registration still runs **regardless of `claudeEnabled`** (it happens before the `claudeEnabled` hook gate in the install loop), because the Claude hook and MCP registration are independent decisions. IntelliJ MCP registration is a follow-up; the IntelliJ plugin registers no MCP today.
 
 ### MCP tool set and CLI↔MCP result parity
 

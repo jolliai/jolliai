@@ -14,6 +14,9 @@ const NONE = {
 	opencode: false,
 	copilot: false,
 	copilotChat: false,
+	cline: false,
+	devin: false,
+	antigravity: false,
 } as const;
 
 let dir: string;
@@ -343,6 +346,135 @@ describe("new registrars — register targets & entry shape (mocked writer)", ()
 	});
 });
 
+describe("cline/devin/antigravity registrars — structure", () => {
+	it("cline appears when detected.cline is true, with empty gitExcludePaths", () => {
+		const [r] = buildRegistrars({ ...NONE, cline: true });
+		expect(r.host).toBe("cline");
+		expect(r.gitExcludePaths()).toEqual([]);
+	});
+	it("devin appears when detected.devin is true, with empty gitExcludePaths", () => {
+		const [r] = buildRegistrars({ ...NONE, devin: true });
+		expect(r.host).toBe("devin");
+		expect(r.gitExcludePaths()).toEqual([]);
+	});
+	it("antigravity appears when detected.antigravity is true, with empty gitExcludePaths", () => {
+		const [r] = buildRegistrars({ ...NONE, antigravity: true });
+		expect(r.host).toBe("antigravity");
+		expect(r.gitExcludePaths()).toEqual([]);
+	});
+	it("all three are global-scoped — registerRepoMcpHosts writes no worktree file for them", async () => {
+		// Global hosts must be skipped by the repo pass; if they leaked through, cline
+		// would even write to a real machine-global settings file — so this also guards
+		// against that. registerRepoMcpHosts filters to scope === "repo".
+		await registerRepoMcpHosts(dir, { ...NONE, cline: true, devin: true, antigravity: true });
+		await expect(readFile(join(dir, ".mcp.json"), "utf-8")).rejects.toThrow();
+	});
+});
+
+describe("devin & antigravity registrars — register/remove targets (mocked writer)", () => {
+	const upsertMock = vi.fn().mockResolvedValue(undefined);
+	const removeMock = vi.fn().mockResolvedValue(undefined);
+	beforeEach(() => {
+		vi.resetModules();
+		vi.doMock("./JsonMcpWriter.js", () => ({ upsertJsonMcpServer: upsertMock, removeJsonMcpServer: removeMock }));
+		upsertMock.mockClear();
+		removeMock.mockClear();
+	});
+	afterEach(() => {
+		vi.doUnmock("./JsonMcpWriter.js");
+		vi.resetModules();
+	});
+
+	it("devin register() → ~/.config/devin/config.json, default key, {command,args,transport:'stdio'}", async () => {
+		const { buildRegistrars: build } = await import("./HostRegistrars.js");
+		const [r] = build({ ...NONE, devin: true });
+		await r.register("/some/wt");
+		const [path, entry, key] = upsertMock.mock.calls[0];
+		expect(path).toBe(join(homedir(), ".config", "devin", "config.json"));
+		expect(key).toBeUndefined(); // default mcpServers
+		expect(entry.transport).toBe("stdio"); // Devin's stdio envelope
+		expect(entry.args).toContain("mcp");
+	});
+
+	it("devin remove() → ~/.config/devin/config.json, default key", async () => {
+		const { buildRegistrars: build } = await import("./HostRegistrars.js");
+		await build({ ...NONE, devin: true })[0].remove("/some/wt");
+		const [path, key] = removeMock.mock.calls[0];
+		expect(path).toBe(join(homedir(), ".config", "devin", "config.json"));
+		expect(key).toBeUndefined();
+	});
+
+	it("antigravity register() → ~/.gemini/config/mcp_config.json, default key, {command,args} (no transport/type)", async () => {
+		const { buildRegistrars: build } = await import("./HostRegistrars.js");
+		const [r] = build({ ...NONE, antigravity: true });
+		await r.register("/some/wt");
+		const [path, entry, key] = upsertMock.mock.calls[0];
+		expect(path).toBe(join(homedir(), ".gemini", "config", "mcp_config.json"));
+		expect(key).toBeUndefined(); // default mcpServers
+		expect(entry.args).toContain("mcp");
+		// Antigravity infers stdio from the presence of `command`; the shipped
+		// mcp_servers.md schema uses no transport/type field for local servers.
+		expect(entry.transport).toBeUndefined();
+		expect(entry.type).toBeUndefined();
+	});
+
+	it("antigravity remove() → ~/.gemini/config/mcp_config.json, default key", async () => {
+		const { buildRegistrars: build } = await import("./HostRegistrars.js");
+		await build({ ...NONE, antigravity: true })[0].remove("/some/wt");
+		const [path, key] = removeMock.mock.calls[0];
+		expect(path).toBe(join(homedir(), ".gemini", "config", "mcp_config.json"));
+		expect(key).toBeUndefined();
+	});
+});
+
+describe("cline registrar — per-flavor settings files (mocked writer + detector)", () => {
+	const upsertMock = vi.fn().mockResolvedValue(undefined);
+	const removeMock = vi.fn().mockResolvedValue(undefined);
+	const fakeInstalled = [join("/fake", "Code", "globalStorage", "saoudrizwan.claude-dev")];
+	const fakeAll = [
+		join("/fake", "Code", "globalStorage", "saoudrizwan.claude-dev"),
+		join("/fake", "Cursor", "globalStorage", "saoudrizwan.claude-dev"),
+	];
+	beforeEach(() => {
+		vi.resetModules();
+		vi.doMock("./JsonMcpWriter.js", () => ({ upsertJsonMcpServer: upsertMock, removeJsonMcpServer: removeMock }));
+		// getInstalledClineStorageDirs / getClineStorageDirs read real disk; mock them
+		// so the test is deterministic regardless of what's installed on the machine.
+		vi.doMock("../../core/ClineDetector.js", () => ({
+			getInstalledClineStorageDirs: async () => fakeInstalled,
+			getClineStorageDirs: () => fakeAll,
+		}));
+		upsertMock.mockClear();
+		removeMock.mockClear();
+	});
+	afterEach(() => {
+		vi.doUnmock("./JsonMcpWriter.js");
+		vi.doUnmock("../../core/ClineDetector.js");
+		vi.resetModules();
+	});
+
+	it("register() writes settings/cline_mcp_settings.json for each INSTALLED flavor, default key, {command,args}", async () => {
+		const { buildRegistrars: build } = await import("./HostRegistrars.js");
+		const [r] = build({ ...NONE, cline: true });
+		await r.register("/some/wt");
+		expect(upsertMock).toHaveBeenCalledTimes(fakeInstalled.length);
+		const [path, entry, key] = upsertMock.mock.calls[0];
+		expect(path).toBe(join(fakeInstalled[0], "settings", "cline_mcp_settings.json"));
+		expect(key).toBeUndefined(); // default mcpServers
+		expect(entry.args).toContain("mcp");
+	});
+
+	it("remove() clears settings/cline_mcp_settings.json for EVERY flavor (not just installed)", async () => {
+		const { buildRegistrars: build } = await import("./HostRegistrars.js");
+		const [r] = build({ ...NONE, cline: true });
+		await r.remove("/some/wt");
+		expect(removeMock).toHaveBeenCalledTimes(fakeAll.length);
+		expect(removeMock.mock.calls.map((c) => c[0])).toEqual(
+			fakeAll.map((d) => join(d, "settings", "cline_mcp_settings.json")),
+		);
+	});
+});
+
 describe("scope filtering — global vs repo", () => {
 	const upsertMock = vi.fn().mockResolvedValue(undefined);
 	const removeMock = vi.fn().mockResolvedValue(undefined);
@@ -363,6 +495,14 @@ describe("scope filtering — global vs repo", () => {
 		const paths = upsertMock.mock.calls.map((c) => c[0] as string);
 		expect(paths).toContain(join(homedir(), ".copilot", "mcp-config.json"));
 		expect(paths.every((p) => !p.includes(".cursor"))).toBe(true);
+	});
+
+	it("registerGlobalMcpHosts writes the new global hosts (devin, antigravity)", async () => {
+		const { registerGlobalMcpHosts: regGlobal } = await import("./HostRegistrars.js");
+		await regGlobal({ ...NONE, devin: true, antigravity: true });
+		const paths = upsertMock.mock.calls.map((c) => c[0] as string);
+		expect(paths).toContain(join(homedir(), ".config", "devin", "config.json"));
+		expect(paths).toContain(join(homedir(), ".gemini", "config", "mcp_config.json"));
 	});
 
 	it("registerGlobalMcpHosts is a no-op when no global hosts detected", async () => {

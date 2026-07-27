@@ -349,6 +349,8 @@ export async function install(
 		const copilotDetectedOnce = repoHooksOnly ? false : await isCopilotInstalled();
 		const copilotChatDetectedOnce = repoHooksOnly ? false : await isCopilotChatInstalled();
 		const clineDetectedOnce = repoHooksOnly ? false : (await isClineInstalled()) || (await isClineCliInstalled());
+		const devinDetectedOnce = repoHooksOnly ? false : await isDevinInstalled();
+		const antigravityDetectedOnce = repoHooksOnly ? false : await isAntigravityInstalled();
 
 		// Install .jolli/jollimemory/ state dir (always) and Claude Code hook (if enabled)
 		let claudeResult: HookOpResult = {};
@@ -426,6 +428,9 @@ export async function install(
 				opencode: opencodeDetectedOnce,
 				copilot: copilotDetectedOnce,
 				copilotChat: copilotChatDetectedOnce,
+				cline: clineDetectedOnce,
+				devin: devinDetectedOnce,
+				antigravity: antigravityDetectedOnce,
 			};
 			// Keep the user's `git status` clean by adding Jolli-managed paths to
 			// `.git/info/exclude`. Worktree-aware: linked worktrees may have their
@@ -463,9 +468,10 @@ export async function install(
 		}
 
 		// Register the MCP server in the detected GLOBAL hosts (Codex, Gemini,
-		// OpenCode, Copilot, Copilot Chat). Their config files are machine-wide and
-		// shared across every repo, so we write them ONCE here rather than rewriting
-		// the same file on each worktree iteration above. Detection-gated only.
+		// OpenCode, Copilot, Copilot Chat, Cline, Devin, Antigravity). Their config
+		// files are machine-wide and shared across every repo, so we write them ONCE
+		// here rather than rewriting the same file on each worktree iteration above.
+		// Detection-gated only.
 		await registerGlobalMcpHosts({
 			claude: false,
 			cursor: false,
@@ -474,6 +480,9 @@ export async function install(
 			opencode: opencodeDetectedOnce,
 			copilot: copilotDetectedOnce,
 			copilotChat: copilotChatDetectedOnce,
+			cline: clineDetectedOnce,
+			devin: devinDetectedOnce,
+			antigravity: antigravityDetectedOnce,
 		});
 
 		// Prefer Jolli's skills by default: write a standing rule into each

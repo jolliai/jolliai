@@ -12,6 +12,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { getClineStorageDirs, getInstalledClineStorageDirs } from "../../core/ClineDetector.js";
 import { getGlobalConfigDir } from "../../core/SessionTracker.js";
 import { getVscodeUserDataDir } from "../../core/VscodeWorkspaceLocator.js";
 import { createLogger } from "../../Logger.js";
@@ -35,6 +36,9 @@ export interface DetectedHosts {
 	opencode: boolean;
 	copilot: boolean;
 	copilotChat: boolean;
+	cline: boolean;
+	devin: boolean;
+	antigravity: boolean;
 }
 
 export interface McpHostRegistrar {
@@ -183,6 +187,76 @@ const copilotChatRegistrar: McpHostRegistrar = {
 };
 
 /**
+ * Cline (VS Code extension `saoudrizwan.claude-dev`): global, per-flavor
+ * `<vscodeUserDataDir(flavor)>/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`.
+ * Format live-verified on a real install: top-level key `mcpServers`, entry
+ * `{ command, args }` (the settings file already ships as `{"mcpServers": {}}`).
+ * The Cline CLI (`~/.cline`) has NO MCP config file, so only the VS Code
+ * extension is an MCP host. globalStorage is machine-wide (shared by every
+ * workspace), so this is global-scoped. A user may run Cline in more than one
+ * flavor (Code, Cursor, …), each with its own settings file — so register()
+ * writes every INSTALLED flavor's file, and remove() clears every flavor's.
+ * Global config — never committed, so gitExcludePaths returns [].
+ */
+const clineRegistrar: McpHostRegistrar = {
+	host: "cline",
+	scope: "global",
+	register: async () => {
+		for (const dir of await getInstalledClineStorageDirs()) {
+			await upsertJsonMcpServer(join(dir, "settings", "cline_mcp_settings.json"), { ...jolliEntry() });
+		}
+	},
+	remove: async () => {
+		for (const dir of getClineStorageDirs()) {
+			await removeJsonMcpServer(join(dir, "settings", "cline_mcp_settings.json"));
+		}
+	},
+	gitExcludePaths: () => [],
+};
+
+/**
+ * Devin CLI: global `~/.config/devin/config.json` (the `user` scope of
+ * `devin mcp add`; `local`/`project` scopes are per-repo `.devin/config*.json`).
+ * Format live-verified via `devin mcp add <name> --scope user -- <cmd> <args>`,
+ * which writes:
+ *   { "mcpServers": { "<name>": { "command", "args": [...], "transport": "stdio" } } }
+ * Top-level key `mcpServers`; the stdio entry carries a `transport: "stdio"`
+ * field (Devin's own envelope — distinct from Antigravity's `type` and OpenCode's
+ * `type`). Global config — never committed, so gitExcludePaths returns [].
+ */
+const devinRegistrar: McpHostRegistrar = {
+	host: "devin",
+	scope: "global",
+	register: () =>
+		upsertJsonMcpServer(join(homedir(), ".config", "devin", "config.json"), {
+			...jolliEntry(),
+			transport: "stdio",
+		}),
+	remove: () => removeJsonMcpServer(join(homedir(), ".config", "devin", "config.json")),
+	gitExcludePaths: () => [],
+};
+
+/**
+ * Antigravity (Google's Gemini-powered agentic IDE/CLI): global single file
+ * `~/.gemini/config/mcp_config.json`.
+ * Format verified from Antigravity's own bundled app source (jetskiAgent /
+ * workbench.desktop.main.js: reads `{mcpServers:{}}`, upserts `mcpServers[name]`)
+ * AND its shipped docs (`agy-customizations/docs/mcp_servers.md`: "Global
+ * Configuration: ~/.gemini/config/mcp_config.json", key `mcpServers`, stdio entry
+ * `{ command, args, env? }`). Stdio needs NO `type` field — Antigravity infers
+ * it from the presence of `command`. This is the canonical file; the per-variant
+ * `~/.gemini/<variant>/mcp_config.json` are symlinks/scaffolds pointing here.
+ * Global config — never committed, so gitExcludePaths returns [].
+ */
+const antigravityRegistrar: McpHostRegistrar = {
+	host: "antigravity",
+	scope: "global",
+	register: () => upsertJsonMcpServer(join(homedir(), ".gemini", "config", "mcp_config.json"), { ...jolliEntry() }),
+	remove: () => removeJsonMcpServer(join(homedir(), ".gemini", "config", "mcp_config.json")),
+	gitExcludePaths: () => [],
+};
+
+/**
  * Return the ordered list of registrars for the detected set of hosts.
  */
 export function buildRegistrars(detected: DetectedHosts): McpHostRegistrar[] {
@@ -194,6 +268,9 @@ export function buildRegistrars(detected: DetectedHosts): McpHostRegistrar[] {
 	if (detected.opencode) out.push(opencodeRegistrar);
 	if (detected.copilot) out.push(copilotCliRegistrar);
 	if (detected.copilotChat) out.push(copilotChatRegistrar);
+	if (detected.cline) out.push(clineRegistrar);
+	if (detected.devin) out.push(devinRegistrar);
+	if (detected.antigravity) out.push(antigravityRegistrar);
 	return out;
 }
 
@@ -207,6 +284,9 @@ const ALL_DETECTED: DetectedHosts = {
 	opencode: true,
 	copilot: true,
 	copilotChat: true,
+	cline: true,
+	devin: true,
+	antigravity: true,
 };
 
 /** Run `fn` over `regs` with per-host error isolation — one failure is logged
@@ -238,9 +318,9 @@ export async function registerRepoMcpHosts(wt: string, detected: DetectedHosts):
 
 /**
  * Register the MCP server in the detected **global** hosts (Codex, Gemini,
- * OpenCode, Copilot, Copilot Chat). Their config files are machine-wide and
- * shared by every repo, so this is called ONCE per install — not per worktree —
- * to avoid rewriting the same file N times.
+ * OpenCode, Copilot, Copilot Chat, Cline, Devin, Antigravity). Their config
+ * files are machine-wide and shared by every repo, so this is called ONCE per
+ * install — not per worktree — to avoid rewriting the same file N times.
  */
 export async function registerGlobalMcpHosts(detected: DetectedHosts): Promise<void> {
 	const regs = buildRegistrars(detected).filter((r) => r.scope === "global");

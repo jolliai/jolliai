@@ -26,3 +26,25 @@ export async function isClineInstalled(home: string = homedir()): Promise<boolea
 	}
 	return false;
 }
+
+/**
+ * The Cline-extension globalStorage dirs where the extension is actually
+ * installed (its `state/taskHistory.json` exists), one per VS Code flavor that
+ * has it. Used by MCP registration to write `settings/cline_mcp_settings.json`
+ * only into the flavors that host Cline — never creating a spurious settings
+ * file under a flavor that doesn't. Unlike `isClineInstalled`, this does not
+ * short-circuit: a user may run Cline in more than one flavor (e.g. Code and
+ * Cursor), and each has its own independent MCP settings file.
+ */
+export async function getInstalledClineStorageDirs(home: string = homedir()): Promise<string[]> {
+	const out: string[] = [];
+	for (const dir of getClineStorageDirs(home)) {
+		try {
+			await access(join(dir, "state", "taskHistory.json"));
+			out.push(dir);
+		} catch {
+			// extension not present under this flavor — skip it
+		}
+	}
+	return out;
+}

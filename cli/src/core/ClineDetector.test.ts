@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { getClineStorageDirs, isClineInstalled } from "./ClineDetector.js";
+import { getClineStorageDirs, getInstalledClineStorageDirs, isClineInstalled } from "./ClineDetector.js";
 
 describe("ClineDetector", () => {
 	let home: string;
@@ -39,5 +39,22 @@ describe("ClineDetector", () => {
 		await mkdir(stateDir, { recursive: true });
 		await writeFile(join(stateDir, "taskHistory.json"), "[]", "utf8");
 		expect(await isClineInstalled(home)).toBe(true);
+	});
+
+	it("getInstalledClineStorageDirs() returns [] when no flavor has the extension", async () => {
+		expect(await getInstalledClineStorageDirs(home)).toEqual([]);
+	});
+
+	it("getInstalledClineStorageDirs() returns only the flavors that host Cline (no short-circuit)", async () => {
+		// Seed two different flavors (first and third dirs) with taskHistory.json;
+		// the helper must return BOTH, unlike isClineInstalled which stops at the first.
+		const dirs = getClineStorageDirs(home);
+		for (const idx of [0, 2]) {
+			const stateDir = join(dirs[idx], "state");
+			await mkdir(stateDir, { recursive: true });
+			await writeFile(join(stateDir, "taskHistory.json"), "[]", "utf8");
+		}
+		const installed = await getInstalledClineStorageDirs(home);
+		expect(installed).toEqual([dirs[0], dirs[2]]);
 	});
 });

@@ -32,7 +32,7 @@ During hook install or removal, the product writes (or removes) its own well-kno
 
 ### Supported hosts and their registries
 
-Seven hosts are supported. Each carries a scope that determines where its config lives and when it is written:
+Ten hosts are supported. Each carries a scope that determines where its config lives and when it is written:
 
 | Host | Scope | Registry file | Top-level key | Entry shape |
 |---|---|---|---|---|
@@ -43,6 +43,11 @@ Seven hosts are supported. Each carries a scope that determines where its config
 | OpenCode | global | user-global OpenCode config | `mcp` | `{ type: "local", command: [command, …args], enabled: true }` (single combined command array) |
 | GitHub Copilot CLI | global | user-global Copilot config | `mcpServers` | `{ command, args }` |
 | VS Code Copilot Chat | global | a file under the VS Code user-data directory | `servers` | `{ type: "stdio", command, args }` |
+| Cline (VS Code extension) | global | `settings/cline_mcp_settings.json` under the extension's globalStorage, written once per VS Code flavor that hosts the extension | `mcpServers` | `{ command, args }` |
+| Devin CLI | global | user-global Devin config (`~/.config/devin/config.json`, the `user` scope of `devin mcp add`) | `mcpServers` | `{ command, args, transport: "stdio" }` |
+| Antigravity | global | user-global Antigravity MCP config (`~/.gemini/config/mcp_config.json`) | `mcpServers` | `{ command, args }` (stdio is inferred from the presence of `command`; no transport/type field) |
+
+The Cline CLI (`~/.cline`) is deliberately **not** an MCP host — it ships no MCP config file; only the Cline VS Code extension does. Cline's registry lives per VS Code flavor (Code, Cursor, VSCodium, …), and the extension may be installed under more than one, so registration writes every flavor's settings file that hosts the extension (and removal clears every flavor's).
 
 The well-known server name / key is `jollimemory` in every registry. Other entries under the host's server map, and all other top-level properties of the document, are opaque to this topic and must round-trip untouched.
 
@@ -136,7 +141,7 @@ Transitions:
 
 ## Notable Behavior
 
-- **Registration is multi-host, split by scope.** Repo-scoped hosts (Claude, Cursor) are written per worktree; global-scoped hosts (Gemini, Codex, OpenCode, Copilot CLI, Copilot Chat) are written once per install. The split exists because a global config is shared by every repo on the machine. (Notable.)
+- **Registration is multi-host, split by scope.** Repo-scoped hosts (Claude, Cursor) are written per worktree; global-scoped hosts (Gemini, Codex, OpenCode, Copilot CLI, Copilot Chat, Cline, Devin, Antigravity) are written once per install. The split exists because a global config is shared by every repo on the machine. (Notable.)
 - **Global-scoped hosts are never removed on a single-repo uninstall.** Their `jollimemory` entry is machine-wide, so removing it would break MCP for every other repo still using Jolli. A stale global entry is harmless (idempotently refreshed on the next install) and far preferable to cross-repo breakage. Only repo-scoped hosts are cleaned up. This same removal path is the one invoked by the machine-wide uninstall command's current-repo item — see the CLI machine-wide uninstall spec — so a full machine-wide uninstall still never removes a global host's entry. (Surprising; intentional.)
 - **Each host is gated on its own detection** (Claude's detection mirrors the Claude-enabled flag), so registration is skipped for hosts the user has not installed. Repo-scoped registration runs before the Claude-enabled hook gate, so a Cursor user with Claude disabled still gets MCP registered. (Notable.)
 - **Malformed registry is never overwritten.** A parse failure on an existing file is treated fundamentally differently from a missing file: writing a fresh empty document would silently drop every other MCP server the user configured by hand, so the behavior is to log and leave the file untouched, deferring recovery to the user fixing it. (Notable.)
@@ -144,7 +149,7 @@ Transitions:
 - **Re-registration replaces, never duplicates.** Because the entry lives under a single fixed key, repeated install runs always produce a single entry whose contents are refreshed in place. (Notable.)
 - **The repo-scoped registry files must not be committed.** They contain machine-local absolute paths, so the install pipeline contributes their filenames to the worktree's git-exclude list. Uninstall leaves those exclude entries behind, intentionally — they are inert when the file is absent. (Notable.)
 - **Per-host error isolation is non-fatal at the orchestration boundary.** A read-only or unwritable registry for one host yields a logged warning but never blocks the other hosts or the surrounding install/uninstall — in particular it cannot prevent removal of the shared repository-level git hooks. (Notable.)
-- **OpenCode and Codex have distinct entry shapes.** OpenCode requires a `type: "local"` wrapper and a single combined command array (split command/args is rejected by its loader); Codex uses an underscore table key in TOML; Copilot Chat adds a `type: "stdio"` field. The well-known `jollimemory` key and the underlying command/args are the same; only the per-host envelope differs. (Notable.)
+- **Hosts differ in their per-entry envelope.** OpenCode requires a `type: "local"` wrapper and a single combined command array (split command/args is rejected by its loader); Codex uses an underscore table key in TOML; Copilot Chat adds a `type: "stdio"` field; Devin adds a `transport: "stdio"` field; Antigravity needs neither (it infers stdio from the presence of `command`). The well-known `jollimemory` key and the underlying command/args are the same across all hosts; only the per-host envelope differs, so a shape correct for one host is a silent no-op if written to another. (Notable.)
 - **Windows fallback writes a knowingly-broken descriptor.** When no active distribution is yet registered on a Windows host, the POSIX-shaped descriptor written cannot spawn; it exists purely to defer correctness to the next install/enable run. (Surprising; intentional.)
 - **Writes are full-file overwrites, not appends or patches.** No backup file and no temp-file-then-rename atomicity is used. A crash mid-write can leave a truncated registry file, which the next install treats as malformed and leaves alone — the user must repair it by hand. (Notable.)
 - **The JVM IDE plugin is a consumer of this mechanism, not a reimplementation of it.** The plugin runs its own native git hooks and generates memory without Node, so it installs **no** Node hooks — but MCP and the skills are inherently Node programs, so the plugin drives the bundled command-line tool's "enable integrations-only" as a subprocess (dispatch scripts + dist-paths + MCP registration + skills, **no** hooks) rather than writing any registry file itself. It runs that subprocess in the project directory, so the repo-scoped hosts land in the project root exactly as for a CLI-driven install; the global-scoped hosts land in their machine-wide files. Consequently, any future change to registration behavior applies to the plugin with **no plugin-side change**. This corrects the earlier assumption that the JVM plugin registers no MCP. (Notable.)
