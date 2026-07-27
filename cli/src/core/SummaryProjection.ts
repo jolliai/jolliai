@@ -25,6 +25,7 @@ import { extractBaseSlug } from "./PlanSlug.js";
 import type { SearchHit, SearchHitTopic } from "./Search.js";
 import { collectAllNotesWithHosts, collectAllPlansWithHosts } from "./SummaryFormat.js";
 import { collectDisplayTopics } from "./SummaryTree.js";
+import { normalizeTicketId } from "./TicketId.js";
 
 /**
  * Builds a {@link SearchHit} from a stored {@link CommitSummary}.
@@ -65,6 +66,10 @@ export function buildHit(summary: CommitSummary): SearchHit {
 		title: noteRef.title,
 	}));
 
+	// Whitelist-guard legacy bad ticketIds (SHA / plan slug / placeholder) at the
+	// read boundary so they never surface in search / recall output.
+	const ticketId = normalizeTicketId(summary.ticketId);
+
 	return {
 		hash: summary.commitHash.substring(0, 8),
 		fullHash: summary.commitHash,
@@ -73,7 +78,7 @@ export function buildHit(summary: CommitSummary): SearchHit {
 		commitDate: summary.commitDate,
 		branch: summary.branch,
 		...(summary.commitType !== undefined && { commitType: summary.commitType }),
-		...(summary.ticketId && { ticketId: summary.ticketId }),
+		...(ticketId && { ticketId }),
 		...(summary.diffStats !== undefined && { diffStats: summary.diffStats }),
 		...(summary.recap && { recap: summary.recap }),
 		topics,

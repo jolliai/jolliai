@@ -214,6 +214,17 @@ describe("buildPanelTitle", () => {
 		// Still has date, hash, author
 		expect(title).toContain("2026-03-01");
 	});
+
+	it("ignores a persisted invalid ticketId (plan slug) and falls back to the commit message", () => {
+		const title = buildPanelTitle(
+			leaf({
+				ticketId: "2026-07-02-memory-detail-panel-mockup-alignment",
+				commitMessage: "Closes PROJ-456: fix bug",
+			}),
+		);
+		expect(title).toContain("PROJ-456");
+		expect(title).not.toContain("2026-07-02-memory-detail-panel-mockup-alignment");
+	});
 });
 
 // ─── buildPushTitle ─────────────────────────────────────────────────────────

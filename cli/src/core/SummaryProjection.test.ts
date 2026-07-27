@@ -64,6 +64,16 @@ describe("buildHit", () => {
 		});
 	});
 
+	it("drops a persisted invalid ticketId (plan slug) from the projection", () => {
+		const hit = buildHit(leaf({ ticketId: "2026-07-02-memory-detail-panel-mockup-alignment" }));
+		expect(hit.ticketId).toBeUndefined();
+	});
+
+	it("canonicalises a lowercase ticketId in the projection", () => {
+		const hit = buildHit(leaf({ ticketId: "jira-123" }));
+		expect(hit.ticketId).toBe("JIRA-123");
+	});
+
 	it("walks v3 nested children for topics via collectDisplayTopics", () => {
 		const hit = buildHit(
 			leaf({

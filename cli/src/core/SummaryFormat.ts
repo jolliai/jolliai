@@ -13,6 +13,7 @@ import {
 	referenceSourceLabel,
 } from "./references/ReferenceDisplay.js";
 import { collectDisplayTopics, collectSourceNodes, type TopicWithDate } from "./SummaryTree.js";
+import { normalizeTicketId } from "./TicketId.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -184,7 +185,7 @@ function extractTicketFallback(commitMessage: string, branch: string): string | 
 
 /** Builds panel title: date · ticket · hash · author */
 export function buildPanelTitle(summary: CommitSummary): string {
-	const ticket = summary.ticketId ?? extractTicketFallback(summary.commitMessage, summary.branch);
+	const ticket = normalizeTicketId(summary.ticketId) ?? extractTicketFallback(summary.commitMessage, summary.branch);
 	const date = getDisplayDate(summary).substring(0, 10);
 	const author = summary.commitAuthor;
 	const hash = summary.commitHash.substring(0, 7);

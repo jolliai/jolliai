@@ -29,6 +29,7 @@ import type {
 	TopicSummary,
 } from "../Types.js";
 import { callLlm, llmCredentials } from "./LlmClient.js";
+import { normalizeTicketId } from "./TicketId.js";
 
 const log = createLogger("Summarizer");
 
@@ -659,7 +660,20 @@ export function parseTopLevelFields(text: string): {
 		const content = peeled.substring(endOfMarker, nextMatchStart).trim();
 		if (content.length > 0 && TOP_LEVEL_FIELD_NAMES.has(fieldName)) {
 			if (fieldName === "TICKETID" && fields.ticketId === undefined) {
-				fields.ticketId = content;
+				// Whitelist-validate: the LLM sometimes ignores the "omit when no
+				// ticket" rule and emits a plan slug / SHA / "(none referenced)".
+				const ticketId = normalizeTicketId(content);
+				if (ticketId !== undefined) {
+					fields.ticketId = ticketId;
+				} else {
+					// Observability: a dropped value means the LLM misclassified a
+					// non-ticket as a ticket (or the whitelist is too strict). Log it
+					// so the misclassification rate stays visible rather than silent.
+					log.debug(
+						"parseTopLevelFields: dropped non-ticket ---TICKETID--- content: %s",
+						content.slice(0, 80),
+					);
+				}
 			} else if (fieldName === "RECAP" && fields.recap === undefined) {
 				fields.recap = content;
 			}
@@ -1179,6 +1193,12 @@ export function extractTicketIdFromMessage(text: string): string | undefined {
 	return match ? match[0].toUpperCase() : undefined;
 }
 
+// normalizeTicketId lives in the dependency-free TicketId leaf module so the
+// display modules (SummaryFormat / SummaryProjection) can validate ticketIds
+// without importing this Summarizer↔LlmClient graph. Re-exported here for
+// callers that already reach for the Summarizer's ticket helpers.
+export { normalizeTicketId };
+
 /**
  * One squashed source commit fed into squash-consolidate.
  *
@@ -1309,6 +1329,21 @@ export function formatSourceCommitsForSquash(sources: ReadonlyArray<SquashConsol
  * strips children, so display still works through a single root-authoritative
  * path.
  */
+/**
+ * First source (in the given, already-sorted order) whose stored ticketId
+ * passes the whitelist. Skips legacy bad values (SHA / slug / placeholder) so a
+ * consolidated root never inherits a bad value just because it sorted first.
+ */
+function firstValidSourceTicketId(sources: ReadonlyArray<SquashConsolidationSource>): string | undefined {
+	for (const s of sources) {
+		const ticketId = normalizeTicketId(s.ticketId);
+		if (ticketId !== undefined) {
+			return ticketId;
+		}
+	}
+	return undefined;
+}
+
 export function mechanicalConsolidate(
 	sources: ReadonlyArray<SquashConsolidationSource>,
 	outerTicketId?: string,
@@ -1321,7 +1356,7 @@ export function mechanicalConsolidate(
 	const topics = sorted.flatMap((s) => s.topics);
 	const recaps = sorted.map((s) => s.recap).filter((r): r is string => !!r);
 	const recap = recaps.length > 0 ? recaps.join("\n\n") : undefined;
-	const ticketId = outerTicketId ?? sorted.find((s) => s.ticketId)?.ticketId;
+	const ticketId = outerTicketId ?? firstValidSourceTicketId(sorted);
 	return {
 		topics,
 		...(recap !== undefined && { recap }),
@@ -1369,7 +1404,7 @@ export async function generateSquashConsolidation(
 	// fall back to the OLDEST source's ticketId, not "first encountered" in
 	// caller order (which varies between callers and is non-deterministic).
 	const sortedSources = sortSourcesOldestFirst(sources);
-	const ticketLine = outerTicketId ?? sortedSources.find((s) => s.ticketId)?.ticketId ?? "No ticket associated";
+	const ticketLine = outerTicketId ?? firstValidSourceTicketId(sortedSources) ?? "No ticket associated";
 
 	const baseParams = { squashMessage: squashCommitMessage, ticketLine, sourceCommitsBlock };
 
@@ -1412,7 +1447,7 @@ export async function generateSquashConsolidation(
 		parsed: ReturnType<typeof parseSummaryResponse>,
 		llm: LlmCallMetadata,
 	): SquashConsolidationResult => {
-		const resolvedTicketId = outerTicketId ?? sortedSources.find((s) => s.ticketId)?.ticketId ?? parsed.ticketId;
+		const resolvedTicketId = outerTicketId ?? firstValidSourceTicketId(sortedSources) ?? parsed.ticketId;
 		return {
 			topics: parsed.topics,
 			...(parsed.recap !== undefined && { recap: parsed.recap }),

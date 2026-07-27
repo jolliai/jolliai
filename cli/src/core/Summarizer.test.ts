@@ -24,6 +24,7 @@ import {
 	generateSummary,
 	isFormatCompliant,
 	mechanicalConsolidate,
+	normalizeTicketId,
 	parseE2eTestResponse,
 	parseRecapResponse,
 	parseSummaryResponse,
@@ -447,7 +448,7 @@ Using \`===TOPIC===\` as the topic separator avoids JSON encoding issues.`);
 			const result = parseSummaryResponse(
 				[
 					"---TICKETID---",
-					"PROJ-FIRST",
+					"PROJ-1",
 					"---TICKETID---",
 					// Empty content between this marker and the next.
 					"---RECAP---",
@@ -464,7 +465,7 @@ Using \`===TOPIC===\` as the topic separator avoids JSON encoding issues.`);
 				].join("\n"),
 			);
 
-			expect(result.ticketId).toBe("PROJ-FIRST");
+			expect(result.ticketId).toBe("PROJ-1");
 			expect(result.recap).toBe("A recap line");
 		});
 	});
@@ -1909,6 +1910,32 @@ Test reordering
 
 	// ── Squash consolidation API ──────────────────────────────────
 
+	describe("normalizeTicketId", () => {
+		it("accepts and uppercases Jira/Linear forms", () => {
+			expect(normalizeTicketId("proj-1")).toBe("PROJ-1");
+			expect(normalizeTicketId("PROJ-123")).toBe("PROJ-123");
+			expect(normalizeTicketId("  feat-456  ")).toBe("FEAT-456");
+		});
+
+		it("accepts a bare #123 issue reference as-is", () => {
+			expect(normalizeTicketId("#789")).toBe("#789");
+		});
+
+		it("rejects plan slugs, SHAs, placeholders, and prose", () => {
+			expect(normalizeTicketId("2026-07-02-memory-detail-panel-mockup-alignment")).toBeUndefined();
+			expect(normalizeTicketId("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0")).toBeUndefined();
+			expect(normalizeTicketId("(none referenced)")).toBeUndefined();
+			expect(normalizeTicketId("No ticket in PROJ-2 repo")).toBeUndefined();
+			expect(normalizeTicketId("PROJ-FIRST")).toBeUndefined();
+		});
+
+		it("returns undefined for empty / whitespace / undefined input", () => {
+			expect(normalizeTicketId(undefined)).toBeUndefined();
+			expect(normalizeTicketId("")).toBeUndefined();
+			expect(normalizeTicketId("   ")).toBeUndefined();
+		});
+	});
+
 	describe("parseTopLevelFields", () => {
 		it("returns nothing when the text is empty", () => {
 			const out = parseTopLevelFields("");
@@ -1939,9 +1966,20 @@ Test reordering
 			expect(out.sanitizedText.trimStart()).toMatch(/^===TOPIC===/);
 		});
 
-		it("normalises lowercase ---ticketId--- (legacy responses)", () => {
+		it("normalises lowercase ---ticketId--- marker and canonicalises the value (legacy responses)", () => {
 			const out = parseTopLevelFields("---ticketId---\nproj-1\n");
-			expect(out.ticketId).toBe("proj-1");
+			expect(out.ticketId).toBe("PROJ-1");
+		});
+
+		it("drops a TICKETID whose content is not a valid ticket (plan slug / SHA / placeholder)", () => {
+			for (const bad of [
+				"2026-07-02-memory-detail-panel-mockup-alignment",
+				"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+				"(none referenced)",
+			]) {
+				const out = parseTopLevelFields(`---TICKETID---\n${bad}\n`);
+				expect(out.ticketId).toBeUndefined();
+			}
 		});
 
 		it("preserves multi-line recap content", () => {
@@ -2157,9 +2195,9 @@ Test reordering
 		});
 
 		it("falls back to the earliest source's ticketId when outerTicketId is undefined", () => {
-			const a = src("a", "2026-03-10T00:00:00Z", "x", "PER-A");
-			const b = src("b", "2026-03-15T00:00:00Z", "y", "PER-B");
-			expect(mechanicalConsolidate([b, a]).ticketId).toBe("PER-A");
+			const a = src("a", "2026-03-10T00:00:00Z", "x", "PER-1");
+			const b = src("b", "2026-03-15T00:00:00Z", "y", "PER-2");
+			expect(mechanicalConsolidate([b, a]).ticketId).toBe("PER-1");
 		});
 
 		it("returns ticketId undefined when neither outer nor any source carries one", () => {
@@ -2288,7 +2326,7 @@ Test reordering
 				),
 			);
 			const result = await generateSquashConsolidation(
-				params([sourceWithTopic("a", "2026-03-10T00:00:00Z", "PER-A")], "OUTER-99"),
+				params([sourceWithTopic("a", "2026-03-10T00:00:00Z", "PER-1")], "OUTER-99"),
 			);
 			assertOk(result);
 			expect(result.ticketId).toBe("OUTER-99");
@@ -2302,12 +2340,12 @@ Test reordering
 			);
 			const result = await generateSquashConsolidation(
 				params([
-					sourceWithTopic("a", "2026-03-10T00:00:00Z", "FROM-A"),
-					sourceWithTopic("b", "2026-03-20T00:00:00Z", "FROM-B"),
+					sourceWithTopic("a", "2026-03-10T00:00:00Z", "FROM-1"),
+					sourceWithTopic("b", "2026-03-20T00:00:00Z", "FROM-2"),
 				]),
 			);
 			assertOk(result);
-			expect(result.ticketId).toBe("FROM-A");
+			expect(result.ticketId).toBe("FROM-1");
 		});
 
 		it("returns no-content when the LLM produces no topics and no recap", async () => {
