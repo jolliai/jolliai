@@ -29,7 +29,7 @@ import {
 } from "../../../cli/src/core/SessionTracker.js";
 import type { StorageProvider } from "../../../cli/src/core/StorageProvider.js";
 import { storeNotes } from "../../../cli/src/core/SummaryStore.js";
-import { getJolliMemoryDir } from "../../../cli/src/Logger.js";
+import { getJolliMemoryDir, isManuallyDisabled } from "../../../cli/src/Logger.js";
 import type { NoteFormat, NoteReference } from "../../../cli/src/Types.js";
 import type { NoteEntry, NoteInfo } from "../Types.js";
 import { log } from "../util/Logger.js";
@@ -49,7 +49,10 @@ export async function detectNotes(cwd: string): Promise<Array<NoteInfo>> {
 	// persist the normalised registry once so plans.json is cleaned on first
 	// panel refresh after upgrade (deterministic-writeback migration).
 	const { registry, changed } = await loadPlansRegistryWithStatus(cwd);
-	if (changed) {
+	// Skipped while manually disabled — this is a read-side refresh and the
+	// write-back would touch plans.json + plans.lock; the next enabled
+	// refresh performs the same one-shot migration.
+	if (changed && !isManuallyDisabled()) {
 		// Migration writeback (rare). Take plans.lock and re-read fresh inside it
 		// so this cleanup can't clobber a concurrent write. The list below is built
 		// from the pre-lock snapshot, which is fine for a read-side refresh.

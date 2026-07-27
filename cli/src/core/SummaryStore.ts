@@ -16,7 +16,7 @@
  *   - Cached aliases (`commitAliases`) so repeated lookups skip git calls
  */
 
-import { createLogger } from "../Logger.js";
+import { createLogger, isManuallyDisabled } from "../Logger.js";
 import type {
 	CatalogEntry,
 	CatalogTopic,
@@ -241,6 +241,10 @@ export async function storeSummary(
 	storage?: StorageProvider,
 	readStorage?: StorageProvider,
 ): Promise<void> {
+	// Checked BEFORE the lock: acquiring orphan-write.lock is itself a disk
+	// write (mkdir + lock file), so the storage-level writeFiles gate alone
+	// would still leave a lock artifact behind on a manually-disabled project.
+	if (isManuallyDisabled()) return;
 	await withRequiredOrphanWriteLock(cwd, "storeSummary", async () => {
 		const writeIndex = await loadIndex(cwd, storage);
 		const writeCatalog = await loadCatalog(cwd, storage);
@@ -1320,6 +1324,8 @@ export async function saveTranscriptsBatch(
 	}
 
 	if (files.length === 0) return;
+	// Pre-lock gate — see storeSummary for why this sits before the lock.
+	if (isManuallyDisabled()) return;
 
 	const summary = [
 		writes.length > 0 ? `${writes.length} written` : "",
@@ -1698,6 +1704,12 @@ export async function scanTreeHashAliases(
 	storage?: StorageProvider,
 	readStorage?: StorageProvider,
 ): Promise<boolean> {
+	// Manually-disabled projects must not write: the alias write below would
+	// be silently dropped by the storage gate anyway, but the orphan-write
+	// lock acquisition is itself a disk write — and because the dropped write
+	// never persists, every commits-panel refresh would re-detect the same
+	// candidates and re-create the lock file in a loop.
+	if (isManuallyDisabled()) return false;
 	const effectiveReadStorage = readStorage ?? storage;
 	// ── Phase 1: preflight (no lock) ────────────────────────────────────────
 	// Compute candidate aliases against the current index. Tree-hash lookup is
@@ -2329,6 +2341,8 @@ export async function storePlans(
 	storage?: StorageProvider,
 ): Promise<void> {
 	if (planFiles.length === 0) return;
+	// Pre-lock gate — see storeSummary for why this sits before the lock.
+	if (isManuallyDisabled()) return;
 
 	const files: FileWrite[] = planFiles.map((p) => ({
 		path: `plans/${p.slug}.md`,
@@ -2415,6 +2429,8 @@ export async function storeNotes(
 	storage?: StorageProvider,
 ): Promise<void> {
 	if (noteFiles.length === 0) return;
+	// Pre-lock gate — see storeSummary for why this sits before the lock.
+	if (isManuallyDisabled()) return;
 
 	const files: FileWrite[] = noteFiles.map((n) => ({
 		path: `notes/${n.id}.md`,
@@ -2518,6 +2534,8 @@ export async function storeReferences(
 	storage?: StorageProvider,
 ): Promise<void> {
 	if (referenceFiles.length === 0) return;
+	// Pre-lock gate — see storeSummary for why this sits before the lock.
+	if (isManuallyDisabled()) return;
 
 	const files: FileWrite[] = referenceFiles.map((e) => ({
 		path: orphanPathFor(e.source, e.archivedKey),

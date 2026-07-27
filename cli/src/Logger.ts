@@ -76,6 +76,41 @@ export function resetLogDir(): void {
 	_logDirCwd = undefined;
 }
 
+/**
+ * In-memory mirror of the repo-wide manual-disable flag — RepoProfile's
+ * `manuallyDisabled` field in `<main-worktree>/.jolli/jollimemory/profile.json`.
+ * When true, `enqueueLogWrite` and the other write gates short-circuit.
+ *
+ * Why a mirror instead of reading the flag directly: the source of truth,
+ * `readManualDisableFlag` (RepoProfile), is async and resolves the main-worktree
+ * root via a `git rev-parse --git-common-dir` subprocess before reading and
+ * parsing profile.json. The gates here sit on synchronous hot paths —
+ * `enqueueLogWrite` runs on every log line, often inside a <5ms git/agent hook —
+ * where neither an `await` nor a per-call subprocess + file read is acceptable.
+ * So entry points read the flag once and cache it here: the VS Code extension's
+ * activate() seeds it synchronously via `readManualDisableFlagSync` before the
+ * first log call, and the enable/disable commands flip it in lockstep with the
+ * on-disk write. Each gate check is then a single boolean read.
+ *
+ * Process-local by design: CLI commands, hook scripts and the QueueWorker run
+ * in their own Node processes and never set it, so this in-memory gate is inert
+ * there. That is deliberate — disable uninstalls the git hooks, so no new
+ * hook/worker process starts while disabled; and those processes independently
+ * gate at their own entry on the async, disk-backed `readManualDisableFlag`
+ * (e.g. PostCommitHook, QueueWorker), which is the flag that counts there.
+ */
+let _manuallyDisabled = false;
+
+/** Sets the in-memory manually-disabled flag. */
+export function setManuallyDisabled(disabled: boolean): void {
+	_manuallyDisabled = disabled;
+}
+
+/** Reads the in-memory manually-disabled flag. */
+export function isManuallyDisabled(): boolean {
+	return _manuallyDisabled;
+}
+
 // ─── Log level filtering ─────────────────────────────────────────────────────
 
 const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
@@ -273,6 +308,7 @@ async function pathExists(p: string): Promise<boolean> {
  */
 function enqueueLogWrite(line: string): void {
 	if (process.env.VITEST || process.env.JOLLI_DISABLE_LOG_FILE) return;
+	if (_manuallyDisabled) return;
 
 	writeQueue = writeQueue.then(async () => {
 		try {

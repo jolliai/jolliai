@@ -6,7 +6,7 @@
  * are logged as warnings but never block the primary write path.
  */
 
-import { createLogger, errMsg } from "../Logger.js";
+import { createLogger, errMsg, isManuallyDisabled } from "../Logger.js";
 import type { FileWrite, SummaryIndexEntry } from "../Types.js";
 import type { HealOptions, HealResult, StorageProvider } from "./StorageProvider.js";
 import type { TopicPage } from "./TopicKBTypes.js";
@@ -43,6 +43,10 @@ export class DualWriteStorage implements StorageProvider {
 	// Shadow (folder KB) is best-effort — failures are swallowed so a flaky
 	// filesystem never blocks the critical git-based write path.
 	async writeFiles(files: FileWrite[], message: string): Promise<void> {
+		// Gated here as well as in both backends: the backend gates turn the
+		// writes into no-ops, but the `clearDirty()` below would still unlink
+		// shadow-status.json and mark a never-performed shadow write as clean.
+		if (isManuallyDisabled()) return;
 		await this.primary.writeFiles(files, message);
 		try {
 			await this.shadow.writeFiles(files, message);

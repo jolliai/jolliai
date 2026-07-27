@@ -126,6 +126,7 @@ vi.mock("node:child_process", () => ({
 
 // ─── Import under test (after mocks) ────────────────────────────────────────
 
+import { setManuallyDisabled } from "../../../cli/src/Logger.js";
 import {
 	addPlanToRegistry,
 	archivePlanForCommit,
@@ -847,6 +848,26 @@ describe("PlanService", () => {
 			expect(savePlansRegistry).not.toHaveBeenCalled();
 		});
 
+		it("skips the cleanup write-back while the project is manually disabled", async () => {
+			const entry = makeEntry();
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "test-plan": entry } });
+			loadPlansRegistryWithStatus.mockResolvedValueOnce({
+				registry: { version: 1, plans: { "test-plan": entry } },
+				changed: true,
+			});
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan");
+			mockStatSync.mockReturnValue({ mtime: new Date("2025-06-01T00:00:00.000Z") });
+
+			setManuallyDisabled(true);
+			try {
+				await detectPlans(CWD);
+				expect(savePlansRegistry).not.toHaveBeenCalled();
+			} finally {
+				setManuallyDisabled(false);
+			}
+		});
+
 		it("filters an uncommitted plan whose file vanishes between cleanup and render (L145 TOCTOU)", async () => {
 			// The cleanup pass sees the file present (survives), but toPlanInfo's
 			// re-check finds it gone → the L145 `commitHash===null && !existsSync`
@@ -1480,6 +1501,21 @@ describe("PlanService", () => {
 			await registerNewPlan("ghost-plan", CWD);
 
 			expect(savePlansRegistry).not.toHaveBeenCalled();
+		});
+
+		it("is a no-op while the project is manually disabled (the watcher keeps firing)", async () => {
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Gated Plan");
+
+			setManuallyDisabled(true);
+			try {
+				await registerNewPlan("gated-plan", CWD);
+				expect(loadPlansRegistry).not.toHaveBeenCalled();
+				expect(savePlansRegistry).not.toHaveBeenCalled();
+			} finally {
+				setManuallyDisabled(false);
+			}
 		});
 	});
 

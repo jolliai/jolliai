@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFile
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setManuallyDisabled } from "../Logger.js";
 import { FolderStorage } from "./FolderStorage.js";
 import type { ManifestEntry } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
@@ -59,6 +60,7 @@ describe("FolderStorage", () => {
 
 	afterEach(() => {
 		rmrf(rootPath);
+		setManuallyDisabled(false);
 	});
 
 	describe("exists / ensure", () => {
@@ -2457,6 +2459,7 @@ describe("FolderStorage.renderTopicWiki", () => {
 	});
 
 	afterEach(() => {
+		setManuallyDisabled(false);
 		const { rmSync } = require("node:fs");
 		try {
 			rmSync(rootPath, { recursive: true, force: true });
@@ -2687,5 +2690,26 @@ describe("FolderStorage.renderTopicWiki", () => {
 		await expect(storage.renderTopicWiki([page])).rejects.toThrow();
 		// The bogus file is still in place (wipe's readdir catch logged + returned).
 		expect(existsSync(wikiAsFile)).toBe(true);
+	});
+
+	describe("manuallyDisabled gate", () => {
+		it("skips writeFiles entirely when manuallyDisabled is true", async () => {
+			setManuallyDisabled(true);
+
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: makeSummaryJson() }], "test");
+
+			expect(existsSync(join(rootPath, ".jolli", "summaries", "abc12345deadbeef.json"))).toBe(false);
+			// Visible markdown layer must not be generated either.
+			expect(existsSync(join(rootPath, "main"))).toBe(false);
+		});
+
+		it("writes again after manuallyDisabled flips back to false", async () => {
+			setManuallyDisabled(true);
+			setManuallyDisabled(false);
+
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: makeSummaryJson() }], "test");
+
+			expect(existsSync(join(rootPath, ".jolli", "summaries", "abc12345deadbeef.json"))).toBe(true);
+		});
 	});
 });

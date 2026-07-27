@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setManuallyDisabled } from "../Logger.js";
 import { DualWriteStorage } from "./DualWriteStorage.js";
 import { FolderStorage } from "./FolderStorage.js";
 import { MetadataManager } from "./MetadataManager.js";
@@ -151,6 +152,39 @@ describe("DualWriteStorage", () => {
 
 		expect(await primary.readFile("test.txt")).toBe("hello");
 		expect(await shadow.readFile("test.txt")).toBe("hello");
+	});
+
+	it("isTopicWikiPresent falls back to false when the shadow lacks the probe", () => {
+		const dual = new DualWriteStorage(new InMemoryStorage(), new InMemoryStorage());
+		expect(dual.isTopicWikiPresent()).toBe(false);
+	});
+
+	it("skips both backends and clearDirty when manuallyDisabled is true", async () => {
+		const primary = new InMemoryStorage();
+		const shadowWriteFiles = vi.fn();
+		const shadowClearDirty = vi.fn();
+		const shadow = {
+			readFile: vi.fn(),
+			writeFiles: shadowWriteFiles,
+			clearDirty: shadowClearDirty,
+			listFiles: vi.fn(),
+			exists: vi.fn().mockResolvedValue(true),
+			ensure: vi.fn(),
+		} as unknown as StorageProvider;
+
+		const dual = new DualWriteStorage(primary, shadow);
+		setManuallyDisabled(true);
+		try {
+			await dual.writeFiles([{ path: "test.txt", content: "gated" }], "gated write");
+
+			expect(await primary.readFile("test.txt")).toBeNull();
+			expect(shadowWriteFiles).not.toHaveBeenCalled();
+			// clearDirty must not run either — it unlinks shadow-status.json and
+			// would mark a never-performed shadow write as clean.
+			expect(shadowClearDirty).not.toHaveBeenCalled();
+		} finally {
+			setManuallyDisabled(false);
+		}
 	});
 
 	it("primary succeeds even when shadow fails", async () => {

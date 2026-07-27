@@ -107,6 +107,11 @@ export class SyncRuntime {
 		 * Optional so older callers / tests don't need to inject one.
 		 */
 		private readonly statusStore?: StatusStore,
+		/**
+		 * Per-round barrier thunk for in-flight `initializeKB()` runs —
+		 * forwarded to the orchestrator. See `StatusOrchestratorOpts.kbInitBarrier`.
+		 */
+		private readonly kbInitBarrier?: () => Promise<void>,
 	) {}
 
 	/**
@@ -382,6 +387,7 @@ export class SyncRuntime {
 					workspaceFolder: folder,
 					pollIntervalSec: config.syncPollIntervalSec,
 					readyPromise: this.readyPromise,
+					kbInitBarrier: this.kbInitBarrier,
 					onRoundFinished: this.onRoundFinished,
 					lastSuccessAt: {
 						get: () => this.context.globalState.get<number>(lastSuccessKey),
@@ -527,8 +533,13 @@ export async function activateSync(
 	 * on the sidebar) keep working unchanged.
 	 */
 	statusStore?: StatusStore,
+	/**
+	 * Per-round barrier thunk for in-flight `initializeKB()` runs — see
+	 * `StatusOrchestratorOpts.kbInitBarrier`.
+	 */
+	kbInitBarrier?: () => Promise<void>,
 ): Promise<SyncActivationResult> {
-	const runtime = new SyncRuntime(context, statusBar, readyPromise, statusStore);
+	const runtime = new SyncRuntime(context, statusBar, readyPromise, statusStore, kbInitBarrier);
 
 	// Eager build for the common case where sync was already enabled when
 	// the window opened. Errors are swallowed — activation must never fail.

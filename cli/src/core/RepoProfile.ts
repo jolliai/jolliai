@@ -18,9 +18,11 @@
  * not re-prompted.
  */
 
+import { readFileSync, statSync } from "node:fs";
 import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { getJolliMemoryDir } from "../Logger.js";
+import { execFileSyncHidden } from "../util/Subprocess.js";
 import { execGit, listWorktrees } from "./GitOps.js";
 import { withStrictProfileLock } from "./Locks.js";
 
@@ -234,4 +236,51 @@ export async function readManualDisableFlag(cwd: string): Promise<boolean> {
 /** Sets (`true`) or clears (`false`) the repo-wide manual-disable flag. */
 export async function writeManualDisableFlag(cwd: string, disabled: boolean): Promise<void> {
 	await updateRepoProfile(cwd, { manuallyDisabled: disabled });
+}
+
+/**
+ * Synchronous, read-only variant of {@link readManualDisableFlag}. The VS Code
+ * extension's `activate()` calls this to seed the in-memory zero-write flag
+ * before any async work runs — a stray log line during early activation must
+ * not touch disk in a manually disabled repo, and the async reader can't be
+ * awaited that early.
+ *
+ * Best-effort by design: unlike the async reader it never migrates the legacy
+ * marker or persists a decision (the async reader does that later); it only
+ * reports the current state. It still anchors to the main worktree root via a
+ * sync `git rev-parse --git-common-dir` so a linked worktree of a disabled repo
+ * reads the shared `profile.json` rather than re-enabling on reload. Any failure
+ * (not a git repo, missing/corrupt profile) falls through to the legacy marker
+ * in `cwd`, then to `false`.
+ */
+export function readManualDisableFlagSync(cwd: string): boolean {
+	let commonDir = "";
+	try {
+		const raw = execFileSyncHidden("git", ["rev-parse", "--git-common-dir"], { cwd, encoding: "utf-8" }).trim();
+		if (raw) {
+			commonDir = isAbsolute(raw) ? raw : join(cwd, raw);
+		}
+	} catch {
+		commonDir = "";
+	}
+	const mainRoot = commonDir ? dirname(commonDir) : cwd;
+	try {
+		const parsed = JSON.parse(readFileSync(join(getJolliMemoryDir(mainRoot), PROFILE_FILE), "utf-8"));
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			const flag = (parsed as RepoProfile).manuallyDisabled;
+			if (flag !== undefined) {
+				return flag === true;
+			}
+		}
+	} catch {
+		// Missing or corrupt profile — fall through to the legacy marker.
+	}
+	// Legacy per-worktree marker, this worktree only (the async reader
+	// enumerates every worktree and migrates; this fast path stays cheap).
+	try {
+		statSync(join(getJolliMemoryDir(cwd), LEGACY_DISABLE_FILE));
+		return true;
+	} catch {
+		return false;
+	}
 }

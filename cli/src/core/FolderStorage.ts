@@ -15,7 +15,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { rmdir } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
-import { createLogger, errMsg } from "../Logger.js";
+import { createLogger, errMsg, isManuallyDisabled } from "../Logger.js";
 import { safeAtomicWriteSync } from "../sync/VaultSymlinkGuard.js";
 import type { CommitSummary, FileWrite, SummaryIndex, SummaryIndexEntry } from "../Types.js";
 import type { ManifestEntry } from "./KBTypes.js";
@@ -79,6 +79,7 @@ export class FolderStorage implements StorageProvider {
 	}
 
 	async writeFiles(files: FileWrite[], message: string): Promise<void> {
+		if (isManuallyDisabled()) return;
 		await this.ensure();
 		let written = 0;
 		let deleted = 0;

@@ -34,7 +34,7 @@ import {
 } from "../../../cli/src/core/SessionTracker.js";
 import type { StorageProvider } from "../../../cli/src/core/StorageProvider.js";
 import { storePlans } from "../../../cli/src/core/SummaryStore.js";
-import { getJolliMemoryDir } from "../../../cli/src/Logger.js";
+import { getJolliMemoryDir, isManuallyDisabled } from "../../../cli/src/Logger.js";
 import type { PlanReference } from "../../../cli/src/Types.js";
 import type { PlanEntry, PlanInfo } from "../Types.js";
 import { log } from "../util/Logger.js";
@@ -79,7 +79,12 @@ export async function detectPlans(cwd: string): Promise<Array<PlanInfo>> {
 			cleaned = true;
 		}
 	}
-	if (cleaned || changed) {
+	// The write-back is skipped while manually disabled: detectPlans runs on
+	// read-side refreshes (including the disabled-startup initialLoad before
+	// refreshStatusBar corrects the stores' enabled flags), and the cleanup
+	// would write plans.json + plans.lock. Purely a deferral — the next
+	// enabled refresh converges identically.
+	if ((cleaned || changed) && !isManuallyDisabled()) {
 		// Re-run the convergence cleanup on a fresh in-lock snapshot so it can't
 		// clobber a concurrent write (the Codex-discovery tick in this host, or a
 		// cross-process StopHook/QueueWorker). The display list uses the pre-lock
@@ -315,6 +320,12 @@ export async function registerNewPlan(
 	slug: string,
 	cwd: string,
 ): Promise<void> {
+	// The plans-dir watcher keeps firing while the project is manually
+	// disabled (Claude Code sessions can still save plan files); registering
+	// would write plans.json + plans.lock in the project dir. The plan is not
+	// lost — re-enabling and saving it again (or the StopHook once hooks are
+	// reinstalled) registers it.
+	if (isManuallyDisabled()) return;
 	const registry = await loadPlansRegistry(cwd);
 	if (slug in registry.plans) {
 		return;

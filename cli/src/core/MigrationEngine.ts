@@ -12,7 +12,7 @@
  * - Backfills missing titles on re-migration
  */
 
-import { createLogger, errMsg } from "../Logger.js";
+import { createLogger, errMsg, isManuallyDisabled } from "../Logger.js";
 import type { CommitSummary, SummaryIndex } from "../Types.js";
 import type { MigrationState } from "./KBTypes.js";
 import type { MetadataManager } from "./MetadataManager.js";
@@ -36,6 +36,10 @@ export class MigrationEngine {
 	 * @param onProgress callback with (migrated, total) counts
 	 */
 	async runMigration(onProgress?: (migrated: number, total: number) => void): Promise<MigrationState> {
+		if (isManuallyDisabled()) {
+			log.info("Skipping migration: project is manually disabled");
+			return { status: "skipped", totalEntries: 0, migratedEntries: 0 };
+		}
 		log.info("=== Migration started ===");
 
 		const indexJson = await this.orphanStorage.readFile("index.json");
@@ -63,6 +67,13 @@ export class MigrationEngine {
 		const failedHashes: string[] = [];
 
 		for (const entry of rootEntries) {
+			// The disable command can flip the flag while a long first-install
+			// migration is in flight. Abort instead of counting the storage
+			// gates' silently-dropped writes below as migrated entries.
+			if (isManuallyDisabled()) {
+				log.info("Migration aborted: project was manually disabled mid-run");
+				return { status: "skipped", totalEntries, migratedEntries: migrated };
+			}
 			const hash = entry.commitHash;
 
 			// Skip if already migrated — but backfill missing title
@@ -95,6 +106,13 @@ export class MigrationEngine {
 				failedHashes: failedHashes.length > 0 ? failedHashes : undefined,
 				lastMigratedHash: hash,
 			});
+		}
+
+		// Same mid-run check before the bulk passes: their writes are gated
+		// into no-ops, so proceeding would only record a false final state.
+		if (isManuallyDisabled()) {
+			log.info("Migration aborted: project was manually disabled mid-run");
+			return { status: "skipped", totalEntries, migratedEntries: migrated };
 		}
 
 		// Migrate all summaries (including children not covered by per-root migration)
@@ -212,6 +230,10 @@ export class MigrationEngine {
 	 * VS Code/IDE activate paths on every startup.
 	 */
 	async runStaleChildCleanup(): Promise<MigrationState & { readonly swept: number }> {
+		if (isManuallyDisabled()) {
+			log.info("Skipping stale-child cleanup: project is manually disabled");
+			return { status: "skipped", totalEntries: 0, migratedEntries: 0, swept: 0 };
+		}
 		const existing = this.metadataManager.readMigrationState();
 		const priorStamp = existing?.staleChildCleanup?.completedAt;
 
@@ -273,7 +295,9 @@ export class MigrationEngine {
 				regen.failed,
 			);
 		}
-		this.metadataManager.saveMigrationState(merged);
+		// Via the gated wrapper so a disable that flipped mid-run doesn't
+		// persist a stamp for work whose writes were silently dropped.
+		this.saveMigrationState(merged);
 		// `swept` is a transient signal for the caller (how many visible .md the
 		// run actually changed) — NOT persisted: `saveMigrationState` only writes
 		// the clean `merged` MigrationState above. It sums BOTH phases' real
@@ -466,6 +490,11 @@ export class MigrationEngine {
 	}
 
 	private saveMigrationState(state: MigrationState): MigrationState {
+		// A disable mid-run must not persist progress: the storage gates turn
+		// the actual file writes into silent no-ops, so persisting would
+		// record entries as migrated (worst case a false "completed") and
+		// block the re-enable catch-up from ever re-migrating them.
+		if (isManuallyDisabled()) return state;
 		this.metadataManager.saveMigrationState(state);
 		return state;
 	}

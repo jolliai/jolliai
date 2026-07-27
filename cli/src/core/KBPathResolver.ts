@@ -19,7 +19,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
-import { createLogger } from "../Logger.js";
+import { createLogger, isManuallyDisabled } from "../Logger.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import type { KBConfig } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
@@ -90,7 +90,9 @@ export function assertValidLocalFolder(customPath: string | undefined): void {
 /**
  * Resolves the KB root path for a repository AND claims it by writing identity
  * to `.jolli/config.json`. The returned path is guaranteed to have a
- * fully-populated config (`remoteUrl` + `repoName`) on return.
+ * fully-populated config (`remoteUrl` + `repoName`) on return — except when
+ * the project is manually disabled, in which case no identity is written and
+ * the returned path may be unclaimed (disabled mode must not touch disk).
  */
 export function resolveKBPath(repoName: string, remoteUrl: string | null, customPath?: string): string {
 	const parent = resolveKbParent(customPath);
@@ -517,6 +519,7 @@ function findAvailablePathAndClaim(parent: string, repoName: string, remoteUrl: 
  * with one that carries `remoteUrl` and `repoName`.
  */
 function writeKBIdentity(kbRoot: string, repoName: string, remoteUrl: string | null): void {
+	if (isManuallyDisabled()) return;
 	const manager = new MetadataManager(join(kbRoot, ".jolli"));
 	manager.ensure();
 	const config = manager.readConfig();

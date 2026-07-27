@@ -1,4 +1,4 @@
-import { ORPHAN_BRANCH } from "../Logger.js";
+import { isManuallyDisabled, ORPHAN_BRANCH } from "../Logger.js";
 import type { FileWrite } from "../Types.js";
 import {
 	batchReadFilesFromBranch,
@@ -22,6 +22,7 @@ export class OrphanBranchStorage implements StorageProvider {
 	}
 
 	async writeFiles(files: FileWrite[], message: string): Promise<void> {
+		if (isManuallyDisabled()) return;
 		await this.ensure();
 		await writeMultipleFilesToBranch(ORPHAN_BRANCH, files, message, this.cwd);
 	}

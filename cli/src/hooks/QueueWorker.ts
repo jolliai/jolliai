@@ -356,6 +356,17 @@ export function buildWorkerStartupBanner(info: {
  * or PostRewriteHook. It processes ALL queued entries (not just "its own"), ensuring that
  * operations queued during a previous Worker's LLM call are eventually processed.
  *
+ * Reads the repo-wide manual-disable flag once at entry (the disk-backed
+ * `readManualDisableFlag`, RepoProfile's `manuallyDisabled` in profile.json)
+ * and skips the drain when the repo is disabled. The in-memory `manuallyDisabled`
+ * mirror in Logger stays false in this separate process, so the disk flag is the
+ * one that counts here. Disabling a project uninstalls its git hooks, so normally
+ * no new worker is spawned while disabled; this entry check additionally covers
+ * the race where the user disables between postCommitEntry() spawning the worker
+ * and the worker starting. A worker that has already passed this check when the
+ * user clicks Disable keeps draining, so commits made while the project was still
+ * enabled still get their memories instead of being stranded in the queue.
+ *
  * @param cwd   - Working directory (git repo root)
  * @param force - When true, overwrites existing summaries (used by CLI `summarize` command)
  */

@@ -335,6 +335,7 @@ vi.mock("../../cli/src/Logger.js", () => ({
 		error: vi.fn(),
 	})),
 	setLogDir: vi.fn(),
+	isManuallyDisabled: () => false,
 }));
 
 vi.mock("./core/PlanService.js", () => ({

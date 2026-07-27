@@ -13,4 +13,8 @@
  * site) so existing Extension.ts imports and their test mocks stay unchanged.
  */
 
-export { readManualDisableFlag, writeManualDisableFlag } from "../../../cli/src/core/RepoProfile.js";
+export {
+	readManualDisableFlag,
+	readManualDisableFlagSync,
+	writeManualDisableFlag,
+} from "../../../cli/src/core/RepoProfile.js";

@@ -28,6 +28,7 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as joinPath } from "node:path";
+import { setManuallyDisabled } from "../Logger.js";
 import type {
 	CatalogEntry,
 	CommitCatalog,
@@ -2476,6 +2477,18 @@ describe("SummaryStore", () => {
 			await expect(scanTreeHashAliases(["hash1"])).resolves.toBe(false);
 		});
 
+		it("should return false without reading the index or taking the lock when manually disabled", async () => {
+			setManuallyDisabled(true);
+			try {
+				await expect(scanTreeHashAliases(["hash1"])).resolves.toBe(false);
+				expect(readFileFromBranch).not.toHaveBeenCalled();
+				expect(acquireOrphanWriteLock).not.toHaveBeenCalled();
+				expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+			} finally {
+				setManuallyDisabled(false);
+			}
+		});
+
 		it("should persist new aliases when tree hashes match shallow entries", async () => {
 			const index = v3Index(
 				[
@@ -4221,6 +4234,57 @@ describe("SummaryStore", () => {
 			// Write-wins on the shared row.
 			const shared = newCatalog.entries.find((e) => e.commitHash === "shared");
 			expect(shared?.recap).toBe("orphan recap");
+		});
+	});
+
+	describe("manuallyDisabled pre-lock gates", () => {
+		// The gate must fire BEFORE withRequiredOrphanWriteLock: acquiring
+		// orphan-write.lock is itself a disk write (mkdir + lock file), so the
+		// storage-level writeFiles gate alone would leave a lock artifact behind.
+		beforeEach(() => {
+			setManuallyDisabled(true);
+		});
+
+		afterEach(() => {
+			setManuallyDisabled(false);
+		});
+
+		it("storeSummary returns without taking the lock or writing", async () => {
+			await storeSummary(createMockSummary());
+
+			expect(acquireOrphanWriteLock).not.toHaveBeenCalled();
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+
+		it("saveTranscriptsBatch returns without taking the lock or writing", async () => {
+			await saveTranscriptsBatch([{ hash: "abc", data: { version: 1, messages: [] } as never }], [], undefined);
+
+			expect(acquireOrphanWriteLock).not.toHaveBeenCalled();
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+
+		it("storePlans returns without taking the lock or writing", async () => {
+			await storePlans([{ slug: "plan-1", content: "# Plan" }], "msg");
+
+			expect(acquireOrphanWriteLock).not.toHaveBeenCalled();
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+
+		it("storeNotes returns without taking the lock or writing", async () => {
+			await storeNotes([{ id: "note-1", content: "# Note" }], "msg");
+
+			expect(acquireOrphanWriteLock).not.toHaveBeenCalled();
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+
+		it("storeReferences returns without taking the lock or writing", async () => {
+			await storeReferences(
+				[{ archivedKey: "linear:ABC-1", source: "linear" as SourceId, content: "# Ref" }],
+				"msg",
+			);
+
+			expect(acquireOrphanWriteLock).not.toHaveBeenCalled();
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 	});
 });

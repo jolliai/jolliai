@@ -55,9 +55,13 @@ export interface KBConfig {
 	readonly repoName?: string;
 }
 
-/** .jolli/migration.json — tracks orphan→folder migration progress */
+/**
+ * .jolli/migration.json — tracks orphan→folder migration progress.
+ * `"skipped"` is a transient return value used when the project is manually
+ * disabled; it is never persisted to disk.
+ */
 export interface MigrationState {
-	readonly status: "pending" | "in_progress" | "completed" | "partial" | "failed";
+	readonly status: "pending" | "in_progress" | "completed" | "partial" | "failed" | "skipped";
 	readonly totalEntries: number;
 	readonly migratedEntries: number;
 	readonly failedHashes?: readonly string[];

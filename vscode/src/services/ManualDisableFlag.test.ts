@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { readManualDisableFlag, writeManualDisableFlag } from "./ManualDisableFlag.js";
+import { readManualDisableFlag, readManualDisableFlagSync, writeManualDisableFlag } from "./ManualDisableFlag.js";
 
 // The flag is CLI-owned (RepoProfile / profile.json) and repo-wide; this module
 // is a thin re-export. `git init` makes each temp dir a real repo so we exercise
@@ -44,5 +44,16 @@ describe("ManualDisableFlag (repo-wide, profile.json backed)", () => {
 		await mkdir(join(cwd, ".jolli", "jollimemory"), { recursive: true });
 		await writeFile(join(cwd, ".jolli", "jollimemory", "disabled-by-user"), new Date(0).toISOString());
 		expect(await readManualDisableFlag(cwd)).toBe(true);
+	});
+
+	describe("readManualDisableFlagSync", () => {
+		it("returns true when marker file exists", async () => {
+			await writeManualDisableFlag(cwd, true);
+			expect(readManualDisableFlagSync(cwd)).toBe(true);
+		});
+
+		it("returns false when marker file is absent", () => {
+			expect(readManualDisableFlagSync(cwd)).toBe(false);
+		});
 	});
 });

@@ -30,6 +30,7 @@ import {
 	savePlansRegistry,
 } from "../../../cli/src/core/SessionTracker.js";
 import { deleteReferenceMarkdown } from "../../../cli/src/core/references/ReferenceStore.js";
+import { isManuallyDisabled } from "../../../cli/src/Logger.js";
 import type {
 	PlansRegistry,
 	ReferenceEntry,
@@ -55,7 +56,10 @@ export async function detectReferences(
 	// persist the normalised registry once so plans.json is cleaned on first
 	// panel refresh after upgrade (deterministic-writeback migration).
 	const { registry, changed } = await loadPlansRegistryWithStatus(cwd);
-	if (changed) {
+	// Skipped while manually disabled — same contract as detectPlans /
+	// detectNotes: read-side refreshes must not write plans.json/plans.lock;
+	// the next enabled refresh performs the identical one-shot migration.
+	if (changed && !isManuallyDisabled()) {
 		// Migration writeback (rare — only after a legacy-purge on upgrade). Take
 		// plans.lock and re-read fresh inside it so this cleanup can't clobber a
 		// concurrent reference/plan/note write. The display list below is built

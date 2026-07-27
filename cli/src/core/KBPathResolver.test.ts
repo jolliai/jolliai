@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "n
 import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setManuallyDisabled } from "../Logger.js";
 import * as Subprocess from "../util/Subprocess.js";
 import {
 	archiveKBFolder,
@@ -51,6 +52,7 @@ describe("KBPathResolver", () => {
 
 	afterEach(() => {
 		rmrf(tempDir);
+		setManuallyDisabled(false);
 	});
 
 	describe("extractRepoName", () => {
@@ -911,6 +913,19 @@ esac
 			} finally {
 				nowSpy.mockRestore();
 			}
+		});
+
+		it("resolveKBPath does not write identity when manuallyDisabled is true", () => {
+			setManuallyDisabled(true);
+			const kbRoot = resolveKBPath("gated-repo", null, tempDir);
+			expect(kbRoot).toBe(join(tempDir, "gated-repo"));
+			expect(existsSync(join(kbRoot, ".jolli"))).toBe(false);
+		});
+
+		it("initializeKBFolder does not touch the filesystem when manuallyDisabled is true", () => {
+			setManuallyDisabled(true);
+			initializeKBFolder(join(tempDir, "gated-repo"), "gated-repo", null);
+			expect(existsSync(join(tempDir, "gated-repo", ".jolli"))).toBe(false);
 		});
 
 		it("matches resolveKBPath's choice on a pristine system — Migrate parity", () => {

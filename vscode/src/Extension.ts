@@ -15,6 +15,7 @@ import {
 	setExcluded,
 } from "../../cli/src/core/CommitSelectionStore.js";
 import { discoverCodexConversations } from "../../cli/src/core/CodexDiscovery.js";
+import { catchUpTranscriptDiscovery } from "../../cli/src/core/DiscoveryCatchUp.js";
 import type { FolderStorage, ForceRegenerateResult } from "../../cli/src/core/FolderStorage.js";
 import { getDefaultBranch } from "../../cli/src/core/GitOps.js";
 import {
@@ -56,7 +57,7 @@ import {
 	aggregateEstimatedCost,
 } from "../../cli/src/core/SummaryTree.js";
 import type { StorageProvider } from "../../cli/src/core/StorageProvider.js";
-import { ORPHAN_BRANCH } from "../../cli/src/Logger.js";
+import { isManuallyDisabled, ORPHAN_BRANCH, setManuallyDisabled } from "../../cli/src/Logger.js";
 import type { SourceId, StatusInfo } from "../../cli/src/Types.js";
 import { execFileSyncHidden } from "../../cli/src/util/Subprocess.js";
 import { runCopyBranchRecallPrompt, runRecallInClaudeCode } from "./commands/BranchRecallCommands.js";
@@ -101,6 +102,7 @@ import { readBackfillDismissFlag, writeBackfillDismissFlag } from "./services/Ba
 import { KbFoldersService } from "./services/KbFoldersService.js";
 import {
 	readManualDisableFlag,
+	readManualDisableFlagSync,
 	writeManualDisableFlag,
 } from "./services/ManualDisableFlag.js";
 import { MemoryFileDecorationProvider } from "./services/MemoryFileDecorationProvider.js";
@@ -444,6 +446,10 @@ export function activate(context: vscode.ExtensionContext): void {
 		return;
 	}
 
+	// MUST run before initLogger so the disabled-state path writes no debug.log.
+	// Sync read is deliberate: we cannot await here without making activate async.
+	setManuallyDisabled(readManualDisableFlagSync(workspaceRoot));
+
 	initLogger(workspaceRoot);
 	log.info("activate", "Activating JolliMemory extension", {
 		workspaceRoot,
@@ -703,11 +709,28 @@ export function activate(context: vscode.ExtensionContext): void {
 	const kbInitPromise = new Promise<void>((resolve) => {
 		resolveKbInit = resolve;
 	});
+	// Serialize every initializeKB() run. Its steps do unlocked
+	// read-modify-write on manifest.json / migration.json / index.json, so
+	// two concurrent runs (activate's fire-and-forget plus the enable
+	// command's catch-up, or a double-clicked enable) would race. All call
+	// sites go through this chain; errors are isolated per run so one
+	// failed run never wedges the chain for later callers. `initializeKB`
+	// is a function declaration further down — hoisted, so referencing it
+	// here is safe. The thunk handed to activateSync doubles as the
+	// orchestrator's per-round barrier: kbInitPromise alone cannot cover
+	// the enable command's catch-up run (it has already resolved by then).
+	let kbInitChain: Promise<void> = Promise.resolve();
+	function runInitializeKB(): Promise<void> {
+		const run = kbInitChain.then(() => initializeKB());
+		kbInitChain = run.catch(() => {});
+		return run;
+	}
 	const syncActivation = activateSync(
 		context,
 		statusBar,
 		kbInitPromise,
 		statusStore,
+		() => kbInitChain,
 	).catch((e) => {
 		log.warn("Memory Bank sync activation failed: %s", (e as Error).message);
 		return null;
@@ -1502,6 +1525,16 @@ export function activate(context: vscode.ExtensionContext): void {
 	// folder init + auto-migration) are serialized into one async function to
 	// prevent race conditions from concurrent orphan branch and config access.
 	async function initializeKB(): Promise<void> {
+		// Manually-disabled startup: skip everything — legacy migrations, the
+		// v5 schema migration, the KB-folder identity claim, full migration and
+		// the stale-child sweep. All of them write to disk, which a disabled
+		// project must never do. The enable command re-runs this function to
+		// catch up. The `.finally()` on the call site still fires, so the
+		// kbInit sync gate is released as usual.
+		if (isManuallyDisabled()) {
+			return;
+		}
+
 		// Dynamic imports are used throughout initializeKB because these cli/
 		// modules depend on Node-only APIs (fs, child_process). Static imports
 		// would cause esbuild to bundle them into the VS Code extension,
@@ -1730,7 +1763,8 @@ export function activate(context: vscode.ExtensionContext): void {
 		);
 		resolveKbInit();
 	}, 60_000);
-	initializeKB().finally(() => {
+
+	runInitializeKB().finally(() => {
 		clearTimeout(kbInitWatchdog);
 		resolveKbInit();
 		// Pre-push sync catch-up (JOLLI-1900): retry any commits left in
@@ -2031,6 +2065,16 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand(
 			"jollimemory.rebuildKnowledgeBase",
 			async (): Promise<{ ok: boolean; message: string }> => {
+				// While manually disabled, the identity write below would be
+				// silently gated but `folder.ensure()` and the Repoint
+				// `saveConfig` would not — one click would de-identify the old
+				// folder while migrating nothing. Refuse outright.
+				if (isManuallyDisabled()) {
+					return {
+						ok: false,
+						message: "Jolli Memory is disabled for this project — enable it first.",
+					};
+				}
 				try {
 					const {
 						extractRepoName,
@@ -2223,6 +2267,12 @@ export function activate(context: vscode.ExtensionContext): void {
 					log.error("cmd", "enable failed", { message: result.message });
 					vscode.window.showErrorMessage(`Jolli Memory: ${result.message}`);
 				} else {
+					// Release the in-memory flag FIRST so this session is fully
+					// functional even if clearing the on-disk marker below fails
+					// (e.g. EPERM/EBUSY on the unlink under Windows). MUST happen
+					// before initializeKB() below, otherwise the gates inside it
+					// would short-circuit again.
+					setManuallyDisabled(false);
 					// Clear the opt-out so subsequent IDE restarts auto-enable as
 					// usual. Done only on success — a failed install means the
 					// previous (manuallyDisabled) state is still the user's intent.
@@ -2236,6 +2286,25 @@ export function activate(context: vscode.ExtensionContext): void {
 								err instanceof Error ? err.message : String(err)
 							}. Run "Jolli Memory: Enable" again to clear the opt-out.`,
 						);
+					}
+					// Catch up KB folder + migrations if they were skipped during a
+					// disabled-startup activate. Safe to re-run: every step inside
+					// is idempotent (config.json / migration.json state files), and
+					// runInitializeKB serializes against any still-running
+					// activate-time run.
+					await runInitializeKB();
+					// Drain the plan/reference discovery backlog from the disabled
+					// window. The plans-dir watcher's one-shot create events were
+					// dropped while disabled, and the StopHook cursor froze (hooks
+					// were uninstalled); this re-scans each known transcript from
+					// the frozen cursor forward so plans/references authored while
+					// disabled surface even for sessions that see no further turns.
+					// Awaited before the refresh below so the panels pick up the
+					// freshly-written plans.json. Idempotent; best-effort.
+					try {
+						await catchUpTranscriptDiscovery(workspaceRoot);
+					} catch (err) {
+						handleError("enable.catchUpDiscovery")(err);
 					}
 					// JOLLI-1904 (funnel): surface enabled. Mirrors IntelliJ
 					// surface_enabled { trigger }; surface=vscode auto-injected.
@@ -2312,6 +2381,9 @@ export function activate(context: vscode.ExtensionContext): void {
 					);
 					return;
 				}
+				// Silence the in-memory flag immediately so any log/write triggered
+				// by bridge.disable() or the refresh chain below does not hit disk.
+				setManuallyDisabled(true);
 				const result = await bridge.disable();
 				if (!result.success) {
 					log.error("cmd", "disable failed", { message: result.message });
@@ -3996,8 +4068,15 @@ export function activate(context: vscode.ExtensionContext): void {
 	// (e.g. jolli.jollimemory-vscode-0.1.0 → 0.2.0). If JolliMemory is enabled
 	// and the hook scripts point to the old directory, silently re-enable to
 	// update the paths — no manual disable → enable step required.
-	bridge
-		.refreshHookPathsIfStale(context.extensionPath)
+	//
+	// Manually-disabled projects skip the refresh: `refreshHookPathsIfStale`
+	// calls `enable()` (a full hook reinstall) whenever the dist-path entry is
+	// stale — which is true after every extension upgrade — so running it here
+	// would both write to disk and silently override the user's opt-out.
+	const hookPathRefresh = isManuallyDisabled()
+		? Promise.resolve(false)
+		: bridge.refreshHookPathsIfStale(context.extensionPath);
+	hookPathRefresh
 		.then(async (mismatch) => {
 			log.debug("activate", "Hook path refresh check complete");
 

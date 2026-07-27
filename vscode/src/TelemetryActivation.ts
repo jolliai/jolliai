@@ -13,6 +13,7 @@
  * URL) are injected so this module is unit-testable without a vscode mock; the
  * CLI core functions are imported from the bundled `cli/src/**`.
  */
+import { isManuallyDisabled } from "../../cli/src/Logger.js";
 import { loadConfig, saveConfig } from "../../cli/src/core/SessionTracker.js";
 import { shutdownTelemetry, track } from "../../cli/src/core/Telemetry.js";
 import { shouldShowTelemetryNotice } from "../../cli/src/core/TelemetryConsent.js";
@@ -41,7 +42,12 @@ export async function activateExtensionTelemetry(cwd: string, deps: TelemetryAct
 	// (a real session), carrying `surface_version` in the envelope; the metric dedups
 	// on first-seen (install_id, surface_version). No-op when telemetry is off — track
 	// re-gates consent. Unlike `app_installed` (once per machine), this catches upgrades.
-	track("client_activated");
+	// Suppressed in a manually-disabled repo: this is an automatic activation write
+	// into the repo's own `.jolli/jollimemory/` buffer, so the zero-write contract
+	// applies (unlike the user-gesture funnel events surface_enabled/disabled).
+	if (!isManuallyDisabled()) {
+		track("client_activated");
+	}
 	try {
 		const config = await loadConfig();
 		if (shouldShowTelemetryNotice({ config, platformDisabled: deps.platformDisabled })) {
@@ -68,6 +74,11 @@ export async function activateExtensionTelemetry(cwd: string, deps: TelemetryAct
  * turned VS Code telemetry off. Callers pass the live signal each tick.
  */
 export function flushExtensionTelemetry(cwd: string, platformDisabled: boolean): void {
+	// Every caller (the activate-time flush, the 60s interval, and the sidebar
+	// tick) is automatic, and a partial-send flush rewrites the per-repo buffer.
+	// A manually-disabled repo must stay zero-write, so skip the flush entirely
+	// there; it resumes automatically once the live flag flips back on enable.
+	if (isManuallyDisabled()) return;
 	void flushTelemetryNow(cwd, { platformDisabled });
 }
 

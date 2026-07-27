@@ -21,9 +21,11 @@ import {
 	createLogger,
 	formatLogMessage,
 	getJolliMemoryDir,
+	isManuallyDisabled,
 	resetLogDir,
 	setLogDir,
 	setLogLevel,
+	setManuallyDisabled,
 	setSilentConsole,
 } from "./Logger.js";
 
@@ -45,6 +47,7 @@ describe("Logger", () => {
 		fsMocks.unlink.mockReset();
 		resetLogDir();
 		setSilentConsole(true);
+		setManuallyDisabled(false);
 	});
 
 	describe("formatLogMessage", () => {
@@ -428,6 +431,50 @@ describe("Logger", () => {
 
 			expect(fsMocks.stat).not.toHaveBeenCalled();
 			expect(fsMocks.appendFile).not.toHaveBeenCalled();
+		});
+
+		it("should skip log file write when manuallyDisabled is true", async () => {
+			const envSpy = vi.spyOn(process, "env", "get");
+			fsMocks.stat.mockResolvedValue({});
+			fsMocks.appendFile.mockResolvedValue(undefined);
+			envSpy.mockReturnValue({ ...process.env, VITEST: "", JOLLI_DISABLE_LOG_FILE: "" });
+			setLogDir("/tmp/project");
+			setManuallyDisabled(true);
+
+			const logger = createLogger("TestMod");
+			logger.info("should not be written");
+
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(fsMocks.stat).not.toHaveBeenCalled();
+			expect(fsMocks.appendFile).not.toHaveBeenCalled();
+		});
+
+		it("should resume log file write after manuallyDisabled flips back to false", async () => {
+			const envSpy = vi.spyOn(process, "env", "get");
+			fsMocks.stat.mockResolvedValue({});
+			fsMocks.appendFile.mockResolvedValue(undefined);
+			envSpy.mockReturnValue({ ...process.env, VITEST: "", JOLLI_DISABLE_LOG_FILE: "" });
+			setLogDir("/tmp/project");
+			setManuallyDisabled(true);
+			setManuallyDisabled(false);
+
+			const logger = createLogger("TestMod");
+			logger.info("write resumed");
+
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(fsMocks.appendFile).toHaveBeenCalledOnce();
+		});
+	});
+
+	describe("setManuallyDisabled / isManuallyDisabled", () => {
+		it("reflects the latest value set", () => {
+			expect(isManuallyDisabled()).toBe(false);
+			setManuallyDisabled(true);
+			expect(isManuallyDisabled()).toBe(true);
+			setManuallyDisabled(false);
+			expect(isManuallyDisabled()).toBe(false);
 		});
 	});
 });

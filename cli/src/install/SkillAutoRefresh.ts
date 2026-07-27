@@ -27,7 +27,13 @@
  *   - walking up from the invocation cwd finds a worktree root that already has an
  *     installed Jolli skill, so a plain `jolli` in an un-enabled repo never
  *     CREATES skills;
- *   - the marker's version differs from the running version.
+ *   - the marker's version differs from the running version;
+ *   - the repo is not manually disabled. `jolli disable` deliberately leaves the
+ *     skill files on disk (conservative cleanup), so the enabled-skills probe
+ *     still matches a disabled repo — this guard is what actually keeps a
+ *     version-bumped CLI from rewriting skills there, honoring the zero-write
+ *     contract. Checked only on the rare version-changed path so the common
+ *     already-current path stays a single marker read.
  *
  * The invoked command's own lifecycle guard (skip `enable` / `disable` /
  * `uninstall`, which own skills themselves) lives at the call site in `Api.ts`.
@@ -40,6 +46,7 @@ import { access, mkdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { VERSION } from "../commands/CliUtils.js";
 import { atomicWriteFile } from "../core/AtomicWrite.js";
+import { readManualDisableFlagSync } from "../core/RepoProfile.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createLogger, getJolliMemoryDir } from "../Logger.js";
 import { updateSkillsIfNeeded } from "./SkillInstaller.js";
@@ -66,6 +73,8 @@ export interface AutoRefreshDeps {
 	readonly loadConfig?: () => Promise<{ claudeEnabled?: boolean }>;
 	/** Skill upsert. Defaults to {@link updateSkillsIfNeeded}. */
 	readonly updateSkills?: (root: string, config: { claudeEnabled?: boolean }) => Promise<void>;
+	/** Read-only manual-disable check. Defaults to {@link readManualDisableFlagSync}. */
+	readonly readManualDisable?: (cwd: string) => boolean;
 }
 
 async function pathExists(p: string): Promise<boolean> {
@@ -120,6 +129,14 @@ export async function autoRefreshSkillsIfStale(cwd: string, deps: AutoRefreshDep
 		const markerDir = getJolliMemoryDir(root);
 		const markerPath = join(markerDir, SKILLS_REFRESH_MARKER);
 		if ((await readMarkerVersion(markerPath)) === version) return; // already reconciled for this version
+
+		// Zero-write contract: a manually-disabled repo must not have its skills
+		// rewritten by a version bump. The probe above still matches because disable
+		// leaves the skill files in place, so this flag read is the real gate.
+		// Use the READ-ONLY sync reader: the async readManualDisableFlag migrates a
+		// legacy `disabled-by-user` marker into profile.json (a disk write), which
+		// would itself violate the zero-write contract on this path.
+		if ((deps.readManualDisable ?? readManualDisableFlagSync)(root)) return;
 
 		const config = await (deps.loadConfig ?? loadConfig)();
 		await (deps.updateSkills ?? updateSkillsIfNeeded)(root, { claudeEnabled: config.claudeEnabled });

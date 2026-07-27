@@ -73,6 +73,7 @@ vi.mock("vscode", () => ({
 	},
 }));
 
+import { setManuallyDisabled } from "../../../cli/src/Logger.js";
 import type { ReferenceEntry } from "../../../cli/src/Types.js";
 import type { ReferenceInfo } from "../Types.js";
 import {
@@ -160,6 +161,20 @@ describe("detectReferences", () => {
 		await detectReferences("/repo");
 
 		expect(mockSavePlansRegistry).toHaveBeenCalledTimes(1);
+	});
+
+	it("skips the writeback when the project is manually disabled", async () => {
+		mockLoadPlansRegistryWithStatus.mockResolvedValueOnce({
+			registry: { version: 1, plans: {}, references: {} },
+			changed: true,
+		});
+		setManuallyDisabled(true);
+		try {
+			await detectReferences("/repo");
+			expect(mockSavePlansRegistry).not.toHaveBeenCalled();
+		} finally {
+			setManuallyDisabled(false);
+		}
 	});
 
 	it("skips the writeback when a concurrent process already normalised it (in-lock fresh.changed=false)", async () => {

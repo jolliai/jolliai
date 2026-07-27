@@ -185,6 +185,7 @@ vi.mock("../../../cli/src/core/KBPathResolver.js", async (importOriginal) => ({
 
 // ── Import under test ────────────────────────────────────────────────────────
 
+import { setManuallyDisabled } from "../../../cli/src/Logger.js";
 import { SettingsWebviewPanel } from "./SettingsWebviewPanel.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1669,6 +1670,40 @@ describe("SettingsWebviewPanel", () => {
 			expect(mockInstallGeminiHook).toHaveBeenCalledWith("/workspace");
 			expect(mockRemoveClaudeHook).not.toHaveBeenCalled();
 			expect(mockRemoveGeminiHook).not.toHaveBeenCalled();
+		});
+
+		it("skips hook install/removal while the project is manually disabled but still saves global config", async () => {
+			const dispatch = await setupWithLoadedConfig();
+
+			setManuallyDisabled(true);
+			try {
+				dispatch({
+					command: "applySettings",
+					maskedApiKey: "",
+					maskedJolliApiKey: "",
+					settings: {
+						apiKey: "",
+						model: "sonnet",
+						maxTokens: null,
+						jolliApiKey: "",
+						claudeEnabled: true,
+						codexEnabled: true,
+						geminiEnabled: true,
+						excludePatterns: "",
+					},
+				});
+				await flushPromises();
+			} finally {
+				setManuallyDisabled(false);
+			}
+
+			// Reinstalling per-project hooks would silently override the opt-out.
+			expect(mockInstallClaudeHook).not.toHaveBeenCalled();
+			expect(mockInstallGeminiHook).not.toHaveBeenCalled();
+			expect(mockRemoveClaudeHook).not.toHaveBeenCalled();
+			expect(mockRemoveGeminiHook).not.toHaveBeenCalled();
+			// The global ~/.jolli config write is an explicit user action — allowed.
+			expect(mockSaveConfigScoped).toHaveBeenCalled();
 		});
 
 		it("syncs hooks across all worktrees returned by listWorktrees", async () => {

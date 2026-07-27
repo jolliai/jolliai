@@ -83,6 +83,7 @@ vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 
 vi.mock("../../../cli/src/Logger.js", () => ({
 	getJolliMemoryDir: mockGetJolliMemoryDir,
+	isManuallyDisabled: () => false,
 }));
 
 vi.mock("../util/Logger.js", () => ({

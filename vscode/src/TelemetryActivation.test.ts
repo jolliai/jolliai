@@ -24,6 +24,7 @@ vi.mock("../../cli/src/core/SessionTracker.js", () => ({
 	saveConfig: (...args: unknown[]) => saveConfig(...(args as [])),
 }));
 
+import { setManuallyDisabled } from "../../cli/src/Logger.js";
 import {
 	activateExtensionTelemetry,
 	flushExtensionTelemetry,
@@ -51,6 +52,9 @@ beforeEach(() => {
 	vi.clearAllMocks();
 	shouldShowTelemetryNotice.mockReturnValue(false);
 	loadConfig.mockResolvedValue({});
+	// Reset the shared in-memory zero-write flag so a prior test's disabled state
+	// never leaks into the next (setManuallyDisabled is real module state here).
+	setManuallyDisabled(false);
 });
 
 describe("activateExtensionTelemetry", () => {
@@ -112,6 +116,16 @@ describe("activateExtensionTelemetry", () => {
 		const { deps } = makeDeps();
 		await expect(activateExtensionTelemetry("/repo", deps)).resolves.toBeUndefined();
 	});
+
+	it("suppresses the automatic client_activated write in a manually-disabled repo", async () => {
+		setManuallyDisabled(true);
+		const { deps } = makeDeps();
+		await activateExtensionTelemetry("/repo", deps);
+		// bootstrap still runs (in-memory / machine-global consent, no repo write),
+		// but the per-repo activation event must not be buffered when disabled.
+		expect(bootstrapTelemetry).toHaveBeenCalled();
+		expect(track).not.toHaveBeenCalled();
+	});
 });
 
 describe("flushExtensionTelemetry", () => {
@@ -123,6 +137,12 @@ describe("flushExtensionTelemetry", () => {
 	it("passes platformDisabled=false when the host telemetry is enabled", () => {
 		flushExtensionTelemetry("/repo", false);
 		expect(flushTelemetryNow).toHaveBeenCalledWith("/repo", { platformDisabled: false });
+	});
+
+	it("skips the flush entirely in a manually-disabled repo (no per-repo buffer rewrite)", () => {
+		setManuallyDisabled(true);
+		flushExtensionTelemetry("/repo", false);
+		expect(flushTelemetryNow).not.toHaveBeenCalled();
 	});
 });
 

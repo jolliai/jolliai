@@ -36,6 +36,7 @@ import {
 	removeGeminiHook,
 	syncGlobalInstructions,
 } from "../../../cli/src/install/Installer.js";
+import { isManuallyDisabled } from "../../../cli/src/Logger.js";
 import type { JolliMemoryConfig } from "../../../cli/src/Types.js";
 import type { AuthService } from "../services/AuthService.js";
 import { log } from "../util/Logger.js";
@@ -687,6 +688,12 @@ export class SettingsWebviewPanel {
 		repoRoot: string,
 		settings: SettingsPayload,
 	): Promise<void> {
+		// The Settings panel stays reachable while the project is manually
+		// disabled (it's the sign-in / Memory Bank entry point). Applying
+		// global settings then must not reinstall per-project agent hooks —
+		// that would silently override the opt-out. Removals are equally
+		// unnecessary: disable already uninstalled the hooks.
+		if (isManuallyDisabled()) return;
 		let worktrees: ReadonlyArray<string>;
 		try {
 			worktrees = await listWorktrees(repoRoot);

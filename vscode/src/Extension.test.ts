@@ -24,6 +24,20 @@ const {
 	dispose: vi.fn(),
 }));
 
+// In-memory mirror of the cli Logger's manuallyDisabled flag. The mock keeps
+// real setter/getter semantics so activate's flag seeding drives the
+// initializeKB gate exactly like the production module-level state does.
+const { manuallyDisabledState, setManuallyDisabledMock, isManuallyDisabledMock } = vi.hoisted(() => {
+	const state = { value: false };
+	return {
+		manuallyDisabledState: state,
+		setManuallyDisabledMock: vi.fn((disabled: boolean) => {
+			state.value = disabled;
+		}),
+		isManuallyDisabledMock: vi.fn(() => state.value),
+	};
+});
+
 const { mockNotifyApiKeySaveError } = vi.hoisted(() => ({
 	mockNotifyApiKeySaveError: vi.fn(),
 }));
@@ -647,6 +661,14 @@ vi.mock("../../cli/src/core/PinStore.js", () => ({
 	listPins: vi.fn(async () => []),
 }));
 
+const { catchUpTranscriptDiscovery } = vi.hoisted(() => ({
+	catchUpTranscriptDiscovery: vi.fn(async () => ({ scanned: 0 })),
+}));
+
+vi.mock("../../cli/src/core/DiscoveryCatchUp.js", () => ({
+	catchUpTranscriptDiscovery,
+}));
+
 // Mock the KB folder-mode dependencies so the auto-migration path in `activate`
 // and the rebuildKnowledgeBase command run with predictable, side-effect-free
 // stand-ins. Each test that exercises those paths overrides the relevant helper
@@ -738,6 +760,8 @@ vi.mock("../../cli/src/Logger.js", () => ({
 	getJolliMemoryDir: vi.fn((cwd: string) => `${cwd}/.jolli/jollimemory`),
 	errMsg: vi.fn((err: unknown) => (err instanceof Error ? err.message : String(err))),
 	isEnoent: vi.fn((err: unknown) => (err as NodeJS.ErrnoException)?.code === "ENOENT"),
+	setManuallyDisabled: setManuallyDisabledMock,
+	isManuallyDisabled: isManuallyDisabledMock,
 }));
 
 vi.mock("../../cli/src/hooks/PushCompensation.js", () => ({
@@ -1052,13 +1076,15 @@ vi.mock("./sync/VsCodeSyncBootstrap.js", () => ({
 	activateSync: activateSyncMock,
 }));
 
-const { readManualDisableFlag, writeManualDisableFlag } = vi.hoisted(() => ({
+const { readManualDisableFlag, readManualDisableFlagSync, writeManualDisableFlag } = vi.hoisted(() => ({
 	readManualDisableFlag: vi.fn(async () => false),
+	readManualDisableFlagSync: vi.fn(() => false),
 	writeManualDisableFlag: vi.fn(async () => undefined),
 }));
 
 vi.mock("./services/ManualDisableFlag.js", () => ({
 	readManualDisableFlag,
+	readManualDisableFlagSync,
 	writeManualDisableFlag,
 }));
 
@@ -1185,6 +1211,15 @@ describe("Extension", () => {
 		// Default: workspace exists and CLI is found
 		getWorkspaceRoot.mockReturnValue("/test/workspace");
 		resolveCLIPath.mockReturnValue("/mock/extension/path/dist/Cli.js");
+
+		// Default: no manually-disabled marker; reset the in-memory mirror so a
+		// prior test's disabled state never leaks into the next activate. Both the
+		// sync and async reads are reset — the async one gates the worktree
+		// auto-install / auto-enable paths, and mockResolvedValue survives
+		// clearAllMocks, so a prior disabled-state test would otherwise leak.
+		manuallyDisabledState.value = false;
+		readManualDisableFlagSync.mockReturnValue(false);
+		readManualDisableFlag.mockResolvedValue(false);
 
 		// Default: no migrations needed
 		hasV1Branch.mockResolvedValue(false);
@@ -1747,6 +1782,67 @@ describe("Extension", () => {
 		});
 	});
 
+	// ── disabled startup: zero-write gating ──────────────────────────────────
+	//
+	// When the manually-disabled marker exists, activate must (a) seed the
+	// cli-side in-memory flag BEFORE the first log call, and (b) skip the
+	// entire initializeKB body — every step in it writes to disk.
+	describe("activate — manuallyDisabled zero-write gate", () => {
+		it("seeds the in-memory flag from the sync marker read before initLogger", () => {
+			readManualDisableFlagSync.mockReturnValue(true);
+			readManualDisableFlag.mockResolvedValue(true);
+
+			activate(makeContext());
+
+			expect(setManuallyDisabledMock).toHaveBeenCalledWith(true);
+			const setIdx = setManuallyDisabledMock.mock.invocationCallOrder[0];
+			const initLoggerIdx = initLogger.mock.invocationCallOrder[0];
+			expect(setIdx).toBeLessThan(initLoggerIdx);
+		});
+
+		it("seeds the flag with false when the marker is absent", () => {
+			readManualDisableFlagSync.mockReturnValue(false);
+
+			activate(makeContext());
+
+			expect(setManuallyDisabledMock).toHaveBeenCalledWith(false);
+		});
+
+		it("skips the entire initializeKB body when manuallyDisabled is true at activate", async () => {
+			// Let any prior test's fire-and-forget initializeKB settle so its
+			// calls don't land after the mockClear below.
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			readManualDisableFlagSync.mockReturnValue(true);
+			readManualDisableFlag.mockResolvedValue(true);
+			const { resolveKBPath } = await import("../../cli/src/core/KBPathResolver.js");
+			const { readSchemaV5State } = await import("../../cli/src/core/SchemaV5Migration.js");
+			vi.mocked(resolveKBPath).mockClear();
+			vi.mocked(readSchemaV5State).mockClear();
+
+			activate(makeContext());
+			// initializeKB is fire-and-forget; give its (gated) body time to run.
+			await new Promise((resolve) => setTimeout(resolve, 10));
+
+			expect(readSchemaV5State).not.toHaveBeenCalled();
+			expect(resolveKBPath).not.toHaveBeenCalled();
+			expect(mockMigrationEngineInstance.runMigration).not.toHaveBeenCalled();
+			expect(mockMigrationEngineInstance.runStaleChildCleanup).not.toHaveBeenCalled();
+		});
+
+		it("skips refreshHookPathsIfStale when manuallyDisabled is true at activate", async () => {
+			readManualDisableFlagSync.mockReturnValue(true);
+			readManualDisableFlag.mockResolvedValue(true);
+			mockBridge.refreshHookPathsIfStale.mockClear();
+
+			activate(makeContext());
+			await new Promise((resolve) => setTimeout(resolve, 10));
+
+			// Its stale-dist-path branch performs a full hook reinstall after
+			// every extension upgrade — running it would override the opt-out.
+			expect(mockBridge.refreshHookPathsIfStale).not.toHaveBeenCalled();
+		});
+	});
+
 	// ── KB folder auto-init / v3 stale-child cleanup on activate ─────────────
 	//
 	// Regression coverage for two related bugs:
@@ -2104,6 +2200,96 @@ describe("Extension", () => {
 					false,
 				);
 			});
+
+			it("releases the in-memory flag and re-runs initializeKB after a successful enable", async () => {
+				// Let activate's own fire-and-forget initializeKB settle so its
+				// resolveKBPath call doesn't pollute the ordering assertions below.
+				await new Promise((resolve) => setTimeout(resolve, 0));
+				const { resolveKBPath } = await import("../../cli/src/core/KBPathResolver.js");
+				vi.mocked(resolveKBPath).mockClear();
+				mockBridge.enable.mockClear();
+				setManuallyDisabledMock.mockClear();
+
+				const handler = getRegisteredCommand("jollimemory.enableJolliMemory");
+				await handler();
+
+				expect(setManuallyDisabledMock).toHaveBeenCalledWith(false);
+				// initializeKB (observable via resolveKBPath) must run AFTER
+				// bridge.enable so the installer has already written the
+				// dist-paths/hook entries, and AFTER the flag release so the
+				// cli-side gates don't short-circuit it again.
+				expect(resolveKBPath).toHaveBeenCalled();
+				const enableIdx = mockBridge.enable.mock.invocationCallOrder[0];
+				const setIdx = setManuallyDisabledMock.mock.invocationCallOrder[0];
+				const kbIdx = vi.mocked(resolveKBPath).mock.invocationCallOrder[0];
+				expect(enableIdx).toBeLessThan(setIdx);
+				expect(setIdx).toBeLessThan(kbIdx);
+			});
+
+			it("tolerates a marker-unlink failure: flag released and initializeKB still runs", async () => {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+				const { resolveKBPath } = await import("../../cli/src/core/KBPathResolver.js");
+				vi.mocked(resolveKBPath).mockClear();
+				setManuallyDisabledMock.mockClear();
+				writeManualDisableFlag.mockRejectedValueOnce(new Error("EPERM: unlink"));
+
+				const handler = getRegisteredCommand("jollimemory.enableJolliMemory");
+				await handler();
+
+				// The in-memory flag is released BEFORE the marker write, so the
+				// session stays functional even when clearing the marker fails.
+				expect(setManuallyDisabledMock).toHaveBeenCalledWith(false);
+				expect(resolveKBPath).toHaveBeenCalled();
+			});
+
+			it("runs the transcript discovery catch-up after initializeKB on enable success", async () => {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+				const { resolveKBPath } = await import("../../cli/src/core/KBPathResolver.js");
+				vi.mocked(resolveKBPath).mockClear();
+				catchUpTranscriptDiscovery.mockClear();
+
+				const handler = getRegisteredCommand("jollimemory.enableJolliMemory");
+				await handler();
+
+				expect(catchUpTranscriptDiscovery).toHaveBeenCalledWith("/test/workspace");
+				// Must run AFTER initializeKB (observable via resolveKBPath) so the
+				// catch-up sees a fully-initialized KB folder.
+				const kbIdx = vi.mocked(resolveKBPath).mock.invocationCallOrder[0];
+				const catchUpIdx = catchUpTranscriptDiscovery.mock.invocationCallOrder[0];
+				expect(kbIdx).toBeLessThan(catchUpIdx);
+			});
+
+			it("does not run the discovery catch-up when enable fails", async () => {
+				catchUpTranscriptDiscovery.mockClear();
+				mockBridge.enable.mockResolvedValue({
+					success: false,
+					message: "git not found",
+				});
+
+				const handler = getRegisteredCommand("jollimemory.enableJolliMemory");
+				await handler();
+
+				expect(catchUpTranscriptDiscovery).not.toHaveBeenCalled();
+			});
+
+			it("keeps the flag and skips initializeKB catch-up when enable fails", async () => {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+				const { resolveKBPath } = await import("../../cli/src/core/KBPathResolver.js");
+				vi.mocked(resolveKBPath).mockClear();
+				setManuallyDisabledMock.mockClear();
+				writeManualDisableFlag.mockClear();
+				mockBridge.enable.mockResolvedValue({
+					success: false,
+					message: "git not found",
+				});
+
+				const handler = getRegisteredCommand("jollimemory.enableJolliMemory");
+				await handler();
+
+				expect(writeManualDisableFlag).not.toHaveBeenCalled();
+				expect(setManuallyDisabledMock).not.toHaveBeenCalled();
+				expect(resolveKBPath).not.toHaveBeenCalled();
+			});
 		});
 
 		describe("disableJolliMemory", () => {
@@ -2169,6 +2355,23 @@ describe("Extension", () => {
 				expect(showErrorMessage).toHaveBeenCalledWith(
 					expect.stringContaining("could not save the disable setting"),
 				);
+			});
+
+			it("flips the in-memory flag to true after the marker write and before bridge.disable", async () => {
+				writeManualDisableFlag.mockClear();
+				setManuallyDisabledMock.mockClear();
+				mockBridge.disable.mockClear();
+				const handler = getRegisteredCommand("jollimemory.disableJolliMemory");
+				await handler();
+
+				expect(setManuallyDisabledMock).toHaveBeenCalledWith(true);
+				// Order: writeManualDisableFlag(true) → setManuallyDisabled(true)
+				// → bridge.disable, so every write after the flip is silenced.
+				const writeIdx = writeManualDisableFlag.mock.invocationCallOrder[0];
+				const setIdx = setManuallyDisabledMock.mock.invocationCallOrder[0];
+				const disableIdx = mockBridge.disable.mock.invocationCallOrder[0];
+				expect(writeIdx).toBeLessThan(setIdx);
+				expect(setIdx).toBeLessThan(disableIdx);
 			});
 		});
 
@@ -6812,6 +7015,54 @@ describe("Extension", () => {
 				expect(mockBridge.enable).not.toHaveBeenCalled();
 			});
 
+			it("first-install path: no marker — auto-enable fires and KB init runs ungated", async () => {
+				mockBridge.getStatus.mockResolvedValue({
+					enabled: false,
+					gitHookInstalled: false,
+					worktreeHooksInstalled: false,
+				});
+				mockBridge.enable.mockClear();
+				readManualDisableFlag.mockResolvedValue(false);
+				readManualDisableFlagSync.mockReturnValue(false);
+				const { resolveKBPath } = await import("../../cli/src/core/KBPathResolver.js");
+				vi.mocked(resolveKBPath).mockClear();
+
+				const ctx = makeContext();
+				activate(ctx);
+
+				await vi.waitFor(() => {
+					expect(mockBridge.enable).toHaveBeenCalled();
+				});
+				expect(setManuallyDisabledMock).toHaveBeenCalledWith(false);
+				// initializeKB ran without gating — the KB folder claim happened.
+				await vi.waitFor(() => {
+					expect(resolveKBPath).toHaveBeenCalled();
+				});
+			});
+
+			it("disabled-startup path: marker present — neither auto-enable nor KB init runs", async () => {
+				mockBridge.getStatus.mockResolvedValue({
+					enabled: false,
+					gitHookInstalled: false,
+					worktreeHooksInstalled: false,
+				});
+				mockBridge.enable.mockClear();
+				readManualDisableFlag.mockResolvedValue(true);
+				readManualDisableFlagSync.mockReturnValue(true);
+				const { resolveKBPath } = await import("../../cli/src/core/KBPathResolver.js");
+				vi.mocked(resolveKBPath).mockClear();
+
+				const ctx = makeContext();
+				activate(ctx);
+
+				await vi.waitFor(() => {
+					expect(mockStatusStore.refresh).toHaveBeenCalled();
+				});
+				expect(setManuallyDisabledMock).toHaveBeenCalledWith(true);
+				expect(mockBridge.enable).not.toHaveBeenCalled();
+				expect(resolveKBPath).not.toHaveBeenCalled();
+			});
+
 			it("does NOT call bridge.enable when status.enabled is already true", async () => {
 				mockBridge.getStatus.mockResolvedValue({
 					enabled: true,
@@ -8181,6 +8432,23 @@ describe("Extension", () => {
 			expect(mockArchiveKBFolder).toHaveBeenCalledWith("/test/kb-2", undefined);
 			expect(mockArchiveKBFolder).toHaveBeenCalledTimes(2);
 			expect(result.message).toContain("memories migrated to /test/kb");
+		});
+
+		it("refuses outright while the project is manually disabled", async () => {
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.rebuildKnowledgeBase");
+
+			manuallyDisabledState.value = true;
+			try {
+				const result = (await handler()) as { ok: boolean; message: string };
+				expect(result.ok).toBe(false);
+				expect(result.message).toContain("disabled");
+			} finally {
+				manuallyDisabledState.value = false;
+			}
+			// Neither the migration nor the Repoint identity write may run.
+			expect(mockMigrationEngineInstance.runMigration).not.toHaveBeenCalled();
+			expect(mockMetadataManagerInstance.saveConfig).not.toHaveBeenCalled();
 		});
 
 		// Same successful-rebuild path, but with memoriesStore.hasFirstLoaded

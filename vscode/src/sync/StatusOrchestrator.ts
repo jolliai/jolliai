@@ -28,7 +28,7 @@
 
 import type * as vscode from "vscode";
 import { loadConfig } from "../../../cli/src/core/SessionTracker.js";
-import { createLogger } from "../../../cli/src/Logger.js";
+import { createLogger, isManuallyDisabled } from "../../../cli/src/Logger.js";
 import type { SyncEngine } from "../../../cli/src/sync/SyncEngine.js";
 import { isTerminalSyncError } from "../../../cli/src/sync/SyncTypes.js";
 
@@ -116,6 +116,18 @@ export interface StatusOrchestratorOpts {
 	 */
 	readonly readyPromise?: Promise<void>;
 	/**
+	 * Per-round barrier for in-flight `initializeKB()` runs. `readyPromise`
+	 * is one-shot — on a manually-disabled startup it resolves immediately
+	 * (the gated initializeKB body is skipped), so it cannot protect the
+	 * enable command's later catch-up run, which migrates for minutes while
+	 * sync is already unblocked. The thunk re-reads the extension's
+	 * serialized initializeKB chain at round start so a round never overlaps
+	 * a catch-up migration's half-written output. Awaited with a 60s cap —
+	 * mirroring the extension-side kbInit watchdog — so a hung run degrades
+	 * to the pre-barrier behavior instead of blocking sync forever.
+	 */
+	readonly kbInitBarrier?: () => Promise<void>;
+	/**
 	 * Fires after every completed round, regardless of outcome. Used by
 	 * the VS Code wiring to invalidate the Memory Bank tree-view cache and
 	 * tell the sidebar webview to re-list folders — `git pull` produces
@@ -177,6 +189,7 @@ export class StatusOrchestrator implements vscode.Disposable {
 	private readonly pollMs: number;
 	private readonly timer: NonNullable<StatusOrchestratorOpts["timer"]>;
 	private readonly readyPromise: Promise<void>;
+	private readonly kbInitBarrier?: () => Promise<void>;
 	/**
 	 * Most-recent phase the engine emitted during the in-flight round.
 	 * Used to label a sticky error visual when the round ends in failure.
@@ -228,6 +241,7 @@ export class StatusOrchestrator implements vscode.Disposable {
 		this.statusStore = opts.statusStore;
 		this.cwd = opts.workspaceFolder.uri.fsPath;
 		this.readyPromise = opts.readyPromise ?? Promise.resolve();
+		this.kbInitBarrier = opts.kbInitBarrier;
 		this.onRoundFinished = opts.onRoundFinished;
 		this.notifyError = opts.notifyError;
 		this.lastSuccessAt = opts.lastSuccessAt;
@@ -481,6 +495,52 @@ export class StatusOrchestrator implements vscode.Disposable {
 					// Drop the sidebar indicator too — the round will not run.
 					this.statusStore?.setSyncPhase(null);
 					return;
+				}
+				// Manually-disabled projects must not touch the Memory Bank
+				// vault (zero-write contract): a round would `git add --all`,
+				// commit and push in the vault and spawn a QueueWorker after.
+				// Checked per round — not at start() — so a disable mid-session
+				// silences the next tick and a re-enable resumes without a
+				// rebuild.
+				if (isManuallyDisabled()) {
+					log.info("sync round skipped: project is manually disabled");
+					this.setState(preTickState);
+					this.statusStore?.setSyncPhase(null);
+					return;
+				}
+				// Per-round barrier: wait out any in-flight initializeKB run
+				// (most notably the enable command's catch-up migration, which
+				// the one-shot readyPromise cannot cover). 60s cap so a hung
+				// run degrades to the pre-barrier behavior instead of blocking
+				// sync forever — mirrors the extension-side kbInit watchdog.
+				if (this.kbInitBarrier) {
+					let barrierCap: ReturnType<typeof setTimeout> | undefined;
+					await Promise.race([
+						this.kbInitBarrier().catch(() => {}),
+						new Promise<void>((resolve) => {
+							barrierCap = setTimeout(resolve, 60_000);
+						}),
+					]);
+					if (barrierCap !== undefined) clearTimeout(barrierCap);
+					// The await above opens the same cancellation windows the
+					// readyPromise wait does — re-check both before running.
+					// A disable clicked while we were parked here must silence
+					// this round (zero-write), and a stop() must cancel a
+					// queued poll tick (P2#2 semantics).
+					if (
+						queuedAtGeneration !== undefined &&
+						queuedAtGeneration !== this.pollGeneration
+					) {
+						this.setState(preTickState);
+						this.statusStore?.setSyncPhase(null);
+						return;
+					}
+					if (isManuallyDisabled()) {
+						log.info("sync round skipped: project was manually disabled while waiting on KB init");
+						this.setState(preTickState);
+						this.statusStore?.setSyncPhase(null);
+						return;
+					}
 				}
 				// Read `syncTranscripts` from the CLI config (where the
 				// Settings webview writes it). Pre-fix this read used

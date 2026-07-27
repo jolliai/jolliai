@@ -10,7 +10,7 @@ vi.mock("./GitOps.js", () => ({
 	writeMultipleFilesToBranch: vi.fn(),
 }));
 
-import { ORPHAN_BRANCH } from "../Logger.js";
+import { ORPHAN_BRANCH, setManuallyDisabled } from "../Logger.js";
 import {
 	batchReadFilesFromBranch,
 	ensureOrphanBranch,
@@ -110,5 +110,19 @@ describe("OrphanBranchStorage", () => {
 		await storage.ensure();
 
 		expect(mockedEnsure).toHaveBeenCalledWith(ORPHAN_BRANCH, "/tmp/repo");
+	});
+
+	it("writeFiles is a no-op when manuallyDisabled is true", async () => {
+		setManuallyDisabled(true);
+		try {
+			const storage = new OrphanBranchStorage("/tmp/repo");
+
+			await storage.writeFiles([{ path: "summaries/abc.json", content: "{}" }], "test");
+
+			expect(mockedEnsure).not.toHaveBeenCalled();
+			expect(mockedWriteFiles).not.toHaveBeenCalled();
+		} finally {
+			setManuallyDisabled(false);
+		}
 	});
 });

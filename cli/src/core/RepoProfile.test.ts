@@ -3,7 +3,13 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { readManualDisableFlag, readRepoProfile, updateRepoProfile, writeManualDisableFlag } from "./RepoProfile.js";
+import {
+	readManualDisableFlag,
+	readManualDisableFlagSync,
+	readRepoProfile,
+	updateRepoProfile,
+	writeManualDisableFlag,
+} from "./RepoProfile.js";
 
 const GIT_ENV = {
 	...process.env,
@@ -245,6 +251,46 @@ describe("RepoProfile", () => {
 			// other. Pre-lock, last-writer-wins could silently drop manuallyDisabled.
 			await Promise.all([updateRepoProfile(cwd, { backfillDismissed: true }), writeManualDisableFlag(cwd, true)]);
 			expect(await readRepoProfile(cwd)).toEqual({ backfillDismissed: true, manuallyDisabled: true });
+		});
+
+		describe("readManualDisableFlagSync", () => {
+			it("returns false when nothing is set", () => {
+				expect(readManualDisableFlagSync(cwd)).toBe(false);
+			});
+
+			it("reads an explicit profile.json value (true then false)", async () => {
+				await writeManualDisableFlag(cwd, true);
+				expect(readManualDisableFlagSync(cwd)).toBe(true);
+				await writeManualDisableFlag(cwd, false);
+				expect(readManualDisableFlagSync(cwd)).toBe(false);
+			});
+
+			it("reads the main-worktree profile from a linked worktree", async () => {
+				execFileSync("git", ["commit", "--allow-empty", "-m", "init", "-q"], { cwd, env: GIT_ENV });
+				await writeManualDisableFlag(cwd, true);
+				const wt = mkdtempSync(join(tmpdir(), "jolli-repoprofile-wt-"));
+				try {
+					execFileSync("git", ["worktree", "add", "-q", wt, "HEAD"], { cwd });
+					expect(readManualDisableFlagSync(wt)).toBe(true);
+				} finally {
+					rmSync(wt, { recursive: true, force: true });
+				}
+			});
+
+			it("falls back to the legacy cwd marker when no profile value is set", () => {
+				mkdirSync(join(cwd, ".jolli", "jollimemory"), { recursive: true });
+				writeFileSync(legacyMarker(cwd), new Date(0).toISOString());
+				expect(readManualDisableFlagSync(cwd)).toBe(true);
+			});
+
+			it("returns false for a non-git dir with no profile or marker", () => {
+				const nonGit = mkdtempSync(join(tmpdir(), "jolli-repoprofile-nogit-"));
+				try {
+					expect(readManualDisableFlagSync(nonGit)).toBe(false);
+				} finally {
+					rmSync(nonGit, { recursive: true, force: true });
+				}
+			});
 		});
 	});
 });

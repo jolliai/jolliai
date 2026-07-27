@@ -17,6 +17,7 @@ vi.mock("./SessionTracker.js", () => ({
 	saveDiscoveryCursor: vi.fn(),
 }));
 
+import { setManuallyDisabled } from "../Logger.js";
 import { discoverCodexConversations } from "./CodexDiscovery.js";
 import { discoverCodexSessions, isCodexInstalled } from "./CodexSessionDiscoverer.js";
 import { scanPlansFrom } from "./plans/TranscriptPlanDiscovery.js";
@@ -43,6 +44,18 @@ beforeEach(() => {
 });
 
 describe("discoverCodexConversations", () => {
+	it("early-returns when the project is manually disabled (no config read, no scan, no cursor write)", async () => {
+		setManuallyDisabled(true);
+		try {
+			await discoverCodexConversations("/repo/disabled");
+			expect(loadConfig).not.toHaveBeenCalled();
+			expect(discoverCodexSessions).not.toHaveBeenCalled();
+			expect(saveDiscoveryCursor).not.toHaveBeenCalled();
+		} finally {
+			setManuallyDisabled(false);
+		}
+	});
+
 	it("early-returns when codexEnabled === false (no session scan)", async () => {
 		vi.mocked(loadConfig).mockResolvedValue({ codexEnabled: false } as never);
 		await discoverCodexConversations("/repo/a");

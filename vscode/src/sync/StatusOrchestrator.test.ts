@@ -24,6 +24,7 @@ vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	loadConfig,
 }));
 
+import { setManuallyDisabled } from "../../../cli/src/Logger.js";
 import type { SyncRoundResult } from "../../../cli/src/sync/SyncTypes.js";
 import {
 	buildDetail,
@@ -252,6 +253,105 @@ describe("StatusOrchestrator", () => {
 		expect(engine.runRound).toHaveBeenCalledWith(
 			expect.objectContaining({ reason: "manual" }),
 		);
+	});
+
+	it("skips the round (manual included) when the project is manually disabled", async () => {
+		const engine = makeStubEngine();
+		const statusBar = makeStubStatusBar();
+		const orch = new StatusOrchestrator({
+			engine,
+			statusBar,
+			workspaceFolder: FAKE_WORKSPACE_FOLDER,
+			timer: makeTimer(),
+		});
+		setManuallyDisabled(true);
+		try {
+			await orch.syncNow();
+		} finally {
+			setManuallyDisabled(false);
+		}
+		expect(engine.runRound).not.toHaveBeenCalled();
+		// The pre-tick state is restored — the status bar is not stuck on "syncing".
+		const lastCall = statusBar.setSyncState.mock.calls.at(-1);
+		expect(lastCall?.[0]).not.toBe("syncing");
+		orch.dispose();
+	});
+
+	it("waits for the kbInitBarrier before running the round", async () => {
+		let release!: () => void;
+		const barrier = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const engine = makeStubEngine();
+		const orch = new StatusOrchestrator({
+			engine,
+			statusBar: makeStubStatusBar(),
+			workspaceFolder: FAKE_WORKSPACE_FOLDER,
+			timer: makeTimer(),
+			kbInitBarrier: () => barrier,
+		});
+		const round = orch.syncNow();
+		for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+		expect(engine.runRound).not.toHaveBeenCalled();
+		release();
+		await round;
+		expect(engine.runRound).toHaveBeenCalledTimes(1);
+		orch.dispose();
+	});
+
+	it("cancels a queued poll tick when stop() runs while parked on the kbInitBarrier", async () => {
+		let release!: () => void;
+		const barrier = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const engine = makeStubEngine();
+		const timer = makeTimer();
+		const orch = new StatusOrchestrator({
+			engine,
+			statusBar: makeStubStatusBar(),
+			workspaceFolder: FAKE_WORKSPACE_FOLDER,
+			timer,
+			kbInitBarrier: () => barrier,
+		});
+		orch.start();
+		timer.fire();
+		for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+		expect(engine.runRound).not.toHaveBeenCalled();
+		// stop() bumps the poll generation while the tick waits on the
+		// barrier — the post-barrier re-check must bail before the round.
+		orch.stop();
+		release();
+		for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+		expect(engine.runRound).not.toHaveBeenCalled();
+		orch.dispose();
+	});
+
+	it("skips the round when the project is disabled while parked on the kbInitBarrier", async () => {
+		let release!: () => void;
+		const barrier = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const engine = makeStubEngine();
+		const orch = new StatusOrchestrator({
+			engine,
+			statusBar: makeStubStatusBar(),
+			workspaceFolder: FAKE_WORKSPACE_FOLDER,
+			timer: makeTimer(),
+			kbInitBarrier: () => barrier,
+		});
+		const round = orch.syncNow();
+		for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+		// Disable arrives while the round is parked on the barrier — the
+		// post-barrier re-check must silence the round.
+		setManuallyDisabled(true);
+		release();
+		try {
+			await round;
+		} finally {
+			setManuallyDisabled(false);
+		}
+		expect(engine.runRound).not.toHaveBeenCalled();
+		orch.dispose();
 	});
 
 	it("propagates conflict count to the status bar when the engine reports conflicts", async () => {

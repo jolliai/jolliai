@@ -58,6 +58,7 @@ import {
 } from "../../../cli/src/core/KBRepoDiscoverer.js";
 import type { Manifest, ManifestEntry } from "../../../cli/src/core/KBTypes.js";
 import { MetadataManager } from "../../../cli/src/core/MetadataManager.js";
+import { isManuallyDisabled } from "../../../cli/src/Logger.js";
 import type { FolderFileKind, FolderNode } from "../views/SidebarMessages.js";
 
 /**
@@ -239,7 +240,9 @@ export class KbFoldersService {
 			// manifest mutation the sidebar heal can do is `updateManifest`
 			// inside regenerate, which is keyed by fileId and is idempotent
 			// under concurrent re-runs.
-			if (!this.cleanRepos.has(repo.kbRoot)) {
+			// Reconcile + heal both write (manifest rewrite, regenerated .md) —
+			// skipped while manually disabled; the tree below still lists.
+			if (!this.cleanRepos.has(repo.kbRoot) && !isManuallyDisabled()) {
 				try {
 					const mm = new MetadataManager(join(repo.kbRoot, ".jolli"));
 					mm.reconcile(repo.kbRoot);

@@ -107,6 +107,22 @@ describe("autoRefreshSkillsIfStale", () => {
 		expect(updateSkills).toHaveBeenCalledOnce();
 	});
 
+	it("is a no-op in a manually-disabled repo, even with a stale marker (zero-write contract)", async () => {
+		// disable() leaves the skill probe on disk, so the enabled-skills gate still
+		// matches; the manual-disable check is what must keep a version bump from
+		// rewriting skills (or stamping the marker) in a repo the user turned off.
+		const root = await makeEnabledRepo();
+		const updateSkills = vi.fn(async () => {});
+		await autoRefreshSkillsIfStale(root, {
+			version: "1.2.3",
+			loadConfig: async () => ({}),
+			updateSkills,
+			readManualDisable: () => true,
+		});
+		expect(updateSkills).not.toHaveBeenCalled();
+		expect(existsSync(markerPathFor(root))).toBe(false);
+	});
+
 	it("defaults to the build-stamped version when none is injected", async () => {
 		// Exercises the `deps.version ?? VERSION` default. Under the test runner VERSION
 		// is a real published version (not "dev"), so the refresh proceeds and the marker

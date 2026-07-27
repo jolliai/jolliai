@@ -23,7 +23,7 @@
  * and logged, so callers can `void`-call it without an unhandled rejection.
  */
 
-import { createLogger } from "../Logger.js";
+import { createLogger, isManuallyDisabled } from "../Logger.js";
 import { discoverCodexSessions, isCodexInstalled } from "./CodexSessionDiscoverer.js";
 import { scanPlansFrom } from "./plans/TranscriptPlanDiscovery.js";
 import { scanReferencesFrom } from "./references/TranscriptReferenceDiscovery.js";
@@ -67,6 +67,11 @@ async function runWithRerun(cwd: string, state: InFlight): Promise<void> {
 
 async function runOnce(cwd: string): Promise<void> {
 	try {
+		// A discovery pass persists cursors, plans and references into the
+		// project's .jolli/jollimemory/ — all disk writes a manually-disabled
+		// project must not receive (the sidebar's 60s tick keeps firing even
+		// while the disabled panel is shown).
+		if (isManuallyDisabled()) return;
 		const config = await loadConfig();
 		if (config.codexEnabled === false) return;
 		if (!(await isCodexInstalled())) return;

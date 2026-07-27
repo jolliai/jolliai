@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setManuallyDisabled } from "../Logger.js";
 import type { FileWrite } from "../Types.js";
 import { FolderStorage } from "./FolderStorage.js";
 import { MetadataManager } from "./MetadataManager.js";
@@ -142,6 +143,7 @@ describe("MigrationEngine", () => {
 
 	afterEach(() => {
 		rmrf(kbRoot);
+		setManuallyDisabled(false);
 	});
 
 	function createEngine(): MigrationEngine {
@@ -1168,6 +1170,65 @@ describe("MigrationEngine", () => {
 			} finally {
 				spy.mockRestore();
 			}
+		});
+	});
+
+	describe("manuallyDisabled gate", () => {
+		it("runMigration returns skipped without reading the orphan branch or persisting state", async () => {
+			seedOrphan(orphan, [{ hash: "aaa11111aaa11111" }]);
+			const readSpy = vi.spyOn(orphan, "readFile");
+			setManuallyDisabled(true);
+
+			const state = await createEngine().runMigration();
+
+			expect(state.status).toBe("skipped");
+			expect(state.totalEntries).toBe(0);
+			expect(state.migratedEntries).toBe(0);
+			expect(readSpy).not.toHaveBeenCalled();
+			// The skipped result must NOT be persisted — migration.json untouched.
+			expect(metadataManager.readMigrationState()).toBeNull();
+		});
+
+		it("runStaleChildCleanup returns skipped with swept=0 and persists nothing", async () => {
+			setManuallyDisabled(true);
+
+			const state = await createEngine().runStaleChildCleanup();
+
+			expect(state.status).toBe("skipped");
+			expect(state.swept).toBe(0);
+			expect(metadataManager.readMigrationState()).toBeNull();
+		});
+
+		it("aborts a migration mid-run when the flag flips, without persisting a final state", async () => {
+			seedOrphan(orphan, [{ hash: "aaa11111aaa11111" }, { hash: "bbb22222bbb22222" }]);
+
+			// Flip the flag after the first entry completes — the loop's
+			// per-iteration check must abort before touching the second entry.
+			const state = await createEngine().runMigration((migrated) => {
+				if (migrated === 1) setManuallyDisabled(true);
+			});
+
+			expect(state.status).toBe("skipped");
+			expect(state.migratedEntries).toBe(1);
+			// The pre-flip "in_progress" snapshot is the last persisted state —
+			// NOT "completed" — so re-enabling re-runs the migration.
+			expect(metadataManager.readMigrationState()?.status).toBe("in_progress");
+			// The second entry was never migrated.
+			expect(await folderStorage.readFile("summaries/bbb22222bbb22222.json")).toBeNull();
+		});
+
+		it("does not persist the final completed state when the flag flips during the bulk passes", async () => {
+			seedOrphan(orphan, [{ hash: "aaa11111aaa11111" }]);
+
+			// Flip after the last per-entry progress callback: the loop finishes,
+			// and the pre-bulk check must abort before index copy + final save.
+			const state = await createEngine().runMigration((migrated, total) => {
+				if (migrated === total) setManuallyDisabled(true);
+			});
+
+			expect(state.status).toBe("skipped");
+			expect(metadataManager.readMigrationState()?.status).toBe("in_progress");
+			expect(await folderStorage.readFile("index.json")).toBeNull();
 		});
 	});
 });
