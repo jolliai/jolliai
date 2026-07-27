@@ -45,9 +45,10 @@ export interface KnownPlugin {
 export const KNOWN_PLUGINS: ReadonlyArray<KnownPlugin> = [
 	{
 		// @jolli.ai/space-cli — Jolli proprietary plugin (separate repository).
-		// When missing, stubs keep the Space commands (init / space / source /
-		// impact / sync / agent) visible in `--help` and emit a one-line install
-		// hint on invocation — identical UX to site-cli below.
+		// When missing, the stub keeps the top-level `space` command (whose
+		// subcommands init / status / switch / ls / source / impact / sync / agent
+		// the plugin owns) visible in `--help` and emits a one-line install hint
+		// on invocation — identical UX to site-cli below.
 		id: "c56530c4-3f2f-467f-a4a4-db4d44c79c1c",
 		packageName: "@jolli.ai/space-cli",
 		installHint: "npm install -g @jolli.ai/space-cli",

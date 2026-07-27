@@ -685,11 +685,11 @@ describe("CLI", () => {
 			const siteHeader = helpOutput.indexOf("Jolli Site — Generate");
 			const spaceHeader = helpOutput.indexOf("Jolli Space — Sync docs");
 			const otherHeader = helpOutput.indexOf("Other commands:");
-			const syncIdx = helpOutput.indexOf("sync ");
+			const spaceCmdIdx = helpOutput.indexOf("space [args");
 
 			expect(spaceHeader).toBeGreaterThan(siteHeader);
-			// A representative Space command appears inside the Space section.
-			expect(syncIdx).toBeGreaterThan(spaceHeader);
+			// The single top-level `space` command appears inside the Space section.
+			expect(spaceCmdIdx).toBeGreaterThan(spaceHeader);
 			if (otherHeader >= 0) expect(spaceHeader).toBeLessThan(otherHeader);
 			exitSpy.mockRestore();
 		});
@@ -702,7 +702,7 @@ describe("CLI", () => {
 				throw new Error("process.exit");
 			}) as never);
 			try {
-				await main(["sync", "up"]);
+				await main(["space", "sync", "up"]);
 			} catch {
 				// stub action calls process.exit(1)
 			}
@@ -710,7 +710,7 @@ describe("CLI", () => {
 				.mocked(console.error)
 				.mock.calls.map((c) => String(c[0]))
 				.join("\n");
-			expect(stderr).toContain("Space command `sync` requires the @jolli.ai/space-cli plugin.");
+			expect(stderr).toContain("Space command `space` requires the @jolli.ai/space-cli plugin.");
 			expect(stderr).toContain("npm install -g @jolli.ai/space-cli");
 			expect(exitSpy).toHaveBeenCalledWith(1);
 			exitSpy.mockRestore();
@@ -838,12 +838,15 @@ describe("CLI", () => {
 			exitSpy.mockRestore();
 		});
 
-		it("keeps the rest of the Space stubs when one stub name is already taken", async () => {
-			// P3 regression: a single duplicate-name throw must not abort the stub
-			// batch. Pre-occupy `init` (the first Space stub) via a mocked plugin;
-			// the Jolli Space section and a later stub (`agent`) must still render.
+		it("skips the space stub gracefully when a plugin already owns `space`", async () => {
+			// Collision tolerance at the integration level: if another command
+			// already owns the top-level `space` name, `registerMissingStubs` must
+			// skip the stub rather than throw out of help rendering. The stub is the
+			// only Space-grouped command, so skipping it drops the "Jolli Space"
+			// section entirely — the colliding command still renders (untagged, so
+			// under "Other commands:"), and help must not throw.
 			vi.mocked(loadPlugins).mockImplementationOnce(async (program) => {
-				program.command("init").description("unrelated plugin init");
+				program.command("space").description("unrelated plugin space");
 				return { loaded: new Set<string>(), diagnostics: [] };
 			});
 			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
@@ -857,13 +860,10 @@ describe("CLI", () => {
 			const writes = vi.mocked(process.stdout.write).mock.calls.map((c) => String(c[0]));
 			const helpOutput = writes.join("");
 
-			const spaceHeader = helpOutput.indexOf("Jolli Space — Sync docs");
-			// Match the stub's command term ("agent [args...]") rather than the
-			// bare word, which also occurs in the Memory section's "AI-agent" prose.
-			const agentIdx = helpOutput.indexOf("agent [args");
-			expect(spaceHeader).toBeGreaterThanOrEqual(0);
-			// A stub registered after the collided `init` still appears.
-			expect(agentIdx).toBeGreaterThan(spaceHeader);
+			// The pre-existing `space` renders (proves no throw, help still built)…
+			expect(helpOutput).toContain("unrelated plugin space");
+			// …and the stub was skipped, so no dedicated Space section is emitted.
+			expect(helpOutput.indexOf("Jolli Space — Sync docs")).toBe(-1);
 			exitSpy.mockRestore();
 		});
 	});

@@ -3,14 +3,14 @@
  * `@jolli.ai/space-cli` plugin is not installed.
  *
  * Covers:
- *   - registration adds all Space stub commands (including `docs`) to a bare program
- *   - each stub is tagged with the "space" help group
- *   - invoking a stub (`docs`) prints the install hint and exits non-zero
- *   - `jolli docs pull --branch x` / `jolli docs publish --foo` forward the
+ *   - registration adds the single top-level `space` stub to a bare program
+ *   - the stub is tagged with the "space" help group
+ *   - invoking the stub (`space`) prints the install hint and exits non-zero
+ *   - `jolli space sync up` / `jolli space status --foo` forward the
  *     subcommand + unknown flags to the action (no parser error) via
  *     allowUnknownOption + [args...]
- *   - the collision-tolerant guard: a stub whose name is already occupied
- *     (by command name or by alias) is skipped rather than throwing
+ *   - the collision-tolerant guard: the `space` stub is skipped (not thrown)
+ *     when its name is already occupied by a command name or by an alias
  */
 
 import { Command } from "commander";
@@ -21,7 +21,7 @@ import { registerSpaceCommandStubs } from "./SpaceCommandStubs.js";
 // ─── Constants mirrored from the source under test ───────────────────────────
 
 /** The Space command names the stubs register, in declaration order. */
-const SPACE_NAMES = ["init", "space", "source", "impact", "sync", "docs", "agent"];
+const SPACE_NAMES = ["space"];
 
 const INSTALL_COMMAND = "npm install -g @jolli.ai/space-cli";
 
@@ -69,7 +69,7 @@ afterEach(() => {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe("registerSpaceCommandStubs", () => {
-	it("registers all Space stub commands (including docs) on a bare program", () => {
+	it("registers the single top-level `space` stub on a bare program", () => {
 		const program = new Command();
 		registerSpaceCommandStubs(program);
 		expect(program.commands.map((c) => c.name())).toEqual(SPACE_NAMES);
@@ -91,58 +91,60 @@ describe("registerSpaceCommandStubs", () => {
 		}
 	});
 
-	it("prints the install hint and exits non-zero when the docs stub is invoked", async () => {
+	it("prints the install hint and exits non-zero when the space stub is invoked", async () => {
 		const program = new Command();
 		registerSpaceCommandStubs(program);
 
-		const { output, exitCode } = await runStub(program, "docs");
+		const { output, exitCode } = await runStub(program, "space");
 		expect(exitCode).toBe(1);
-		expect(output).toContain("Space command `docs` requires the @jolli.ai/space-cli plugin.");
+		expect(output).toContain("Space command `space` requires the @jolli.ai/space-cli plugin.");
 		expect(output).toContain(INSTALL_COMMAND);
-		expect(output).toContain("Then re-run: jolli docs ...");
+		expect(output).toContain("Then re-run: jolli space ...");
 	});
 
-	it("forwards `docs pull --branch x` to the action without a parser error", async () => {
+	it("forwards `space sync up` to the action without a parser error", async () => {
 		const program = new Command();
 		registerSpaceCommandStubs(program);
 
-		// The subcommand token + the unknown --branch flag must reach the action
+		// The subcommand tokens must reach the action (install-hint exit), NOT
+		// raise Commander's "unknown command" error.
+		const { exitCode } = await runStub(program, "space", ["sync", "up"]);
+		expect(exitCode).toBe(1);
+	});
+
+	it("forwards `space status --foo` to the action without a parser error", async () => {
+		const program = new Command();
+		registerSpaceCommandStubs(program);
+
+		// The subcommand token + the unknown --foo flag must reach the action
 		// (install-hint exit), NOT raise Commander's "unknown option" error.
-		const { exitCode } = await runStub(program, "docs", ["pull", "--branch", "jolli/run-123"]);
+		const { exitCode } = await runStub(program, "space", ["status", "--foo"]);
 		expect(exitCode).toBe(1);
 	});
 
-	it("forwards `docs publish --foo` to the action without a parser error", async () => {
+	it("skips the stub whose name is already occupied by an existing command", () => {
 		const program = new Command();
+		// Pre-register a command named "space" that the stub must not clobber.
+		program.command("space").description("pre-existing space command");
 		registerSpaceCommandStubs(program);
 
-		const { exitCode } = await runStub(program, "docs", ["publish", "--foo"]);
-		expect(exitCode).toBe(1);
+		const spaceCommands = program.commands.filter((c) => c.name() === "space");
+		expect(spaceCommands).toHaveLength(1);
+		expect(spaceCommands[0].description()).toBe("pre-existing space command");
+		expect(getHelpGroup(spaceCommands[0])).toBeUndefined();
+		// Only the pre-existing `space` remains; the stub is skipped, not duplicated.
+		expect(program.commands.map((c) => c.name())).toEqual(["space"]);
 	});
 
-	it("skips a stub whose name is already occupied by an existing command", () => {
+	it("skips the stub whose name collides with an existing command's alias", () => {
 		const program = new Command();
-		// Pre-register a command named "docs" that the stub must not clobber.
-		program.command("docs").description("pre-existing docs command");
+		// An existing command aliased "space" must block the space stub.
+		program.command("spaces").alias("space").description("pre-existing spaces command");
 		registerSpaceCommandStubs(program);
 
-		const docsCommands = program.commands.filter((c) => c.name() === "docs");
-		expect(docsCommands).toHaveLength(1);
-		expect(docsCommands[0].description()).toBe("pre-existing docs command");
-		expect(getHelpGroup(docsCommands[0])).toBeUndefined();
-		// The pre-existing `docs` plus the other six stubs (docs skipped).
-		expect(program.commands.map((c) => c.name())).toEqual(["docs", ...SPACE_NAMES.filter((n) => n !== "docs")]);
-	});
-
-	it("skips a stub whose name collides with an existing command's alias", () => {
-		const program = new Command();
-		// An existing command aliased "docs" must block the docs stub.
-		program.command("documents").alias("docs").description("pre-existing documents command");
-		registerSpaceCommandStubs(program);
-
-		// No second command literally named "docs" should be added.
-		expect(program.commands.filter((c) => c.name() === "docs")).toHaveLength(0);
+		// No second command literally named "space" should be added.
+		expect(program.commands.filter((c) => c.name() === "space")).toHaveLength(0);
 		const stubNames = program.commands.map((c) => c.name()).filter((n) => SPACE_NAMES.includes(n));
-		expect(stubNames).toEqual(SPACE_NAMES.filter((n) => n !== "docs"));
+		expect(stubNames).toEqual([]);
 	});
 });
