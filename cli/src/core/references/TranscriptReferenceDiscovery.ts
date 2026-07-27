@@ -11,7 +11,6 @@
 
 import { createLogger } from "../../Logger.js";
 import type { TranscriptSource } from "../../Types.js";
-import { getCurrentBranchSafe } from "../GitBranch.js";
 import { upsertReferenceEntry } from "../SessionTracker.js";
 import { extractReferencesFromTranscript } from "./ReferenceExtractor.js";
 
@@ -38,7 +37,6 @@ export async function scanReferencesFrom(
 		return lastLineNumberScanned;
 	}
 
-	const branch = getCurrentBranchSafe(cwd);
 	const upserted: string[] = [];
 	const failed: string[] = [];
 	for (const ref of references) {
@@ -48,7 +46,7 @@ export async function scanReferencesFrom(
 		// cursor save in the caller is skipped, so the next pass re-processes the
 		// same refs and hits the same failure in a loop.
 		try {
-			await upsertReferenceEntry(ref, cwd, branch);
+			await upsertReferenceEntry(ref, cwd);
 			upserted.push(ref.mapKey);
 		} catch (err) {
 			log.warn(

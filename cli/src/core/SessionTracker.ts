@@ -958,14 +958,16 @@ async function pruneOrphanedCursors(dir: string, stalePaths: ReadonlyArray<strin
 
 /**
  * Legacy fields removed from PlanEntry (`editCount` is plan-only) and NoteEntry.
- * `branch` is intentionally NOT stripped: the CLI does not filter on it, but the
- * IntelliJ plugin shares this plans.json and branch-scopes its CONTEXT view, so
- * stripping it here would erase IntelliJ's value on every CLI write.
+ * `branch` is stripped: working-area context (plans/notes/references) is
+ * worktree-scoped, not branch-scoped — it follows the worktree across branch
+ * switches and is associated to a branch only at commit (recorded on
+ * `CommitSummary.branch`), exactly like Conversations and uncommitted code. So a
+ * `branch` on a working-area entry never persists past a load->save.
  */
-const LEGACY_PLAN_FIELDS = ["ignored", "editCount"] as const;
-const LEGACY_NOTE_FIELDS = ["ignored"] as const;
+const LEGACY_PLAN_FIELDS = ["ignored", "branch", "editCount"] as const;
+const LEGACY_NOTE_FIELDS = ["ignored", "branch"] as const;
 /** Reference committed/guard rows became dead fields (a live row is uncommitted). */
-const LEGACY_REFERENCE_FIELDS = ["ignored", "commitHash", "contentHashAtCommit"] as const;
+const LEGACY_REFERENCE_FIELDS = ["ignored", "branch", "commitHash", "contentHashAtCommit"] as const;
 
 /** Deletes `fields` from a shallow copy of `entry`; returns the copy + whether anything was dropped. */
 function stripLegacyFields<T>(entry: T, fields: ReadonlyArray<string>): { value: T; changed: boolean } {
@@ -986,15 +988,14 @@ function stripLegacyFields<T>(entry: T, fields: ReadonlyArray<string>): { value:
  *
  * Pure + idempotent — clean input returns `changed: false`. Per type:
  *   - plans / notes: drop rows with `ignored === true`; strip dead fields
- *     (`ignored` / `editCount`); keep the `commitHash` + `contentHashAtCommit`
- *     guard. `branch` is preserved (see LEGACY_PLAN_FIELDS) so IntelliJ's
- *     branch-scoping survives CLI writes to the shared plans.json.
+ *     (`ignored` / `branch` / `editCount`); keep the `commitHash` +
+ *     `contentHashAtCommit` guard. `branch` is stripped — working-area entries
+ *     are worktree-scoped, not branch-scoped (branch lives on CommitSummary).
  *   - references: also drop committed / guard rows — detected ONLY by the
  *     `commitHash` / `contentHashAtCommit` fields, deliberately NOT by a
  *     `-<8hex>` key shape (an active ticket id can legitimately end in 8 digits;
  *     see the predicate below) — a reference row is now always
- *     active/uncommitted — and strip the now-dead fields from survivors (but
- *     keep `branch`).
+ *     active/uncommitted — and strip the now-dead fields from survivors.
  *
  * `JSON.parse` keeps unknown keys and `savePlansRegistry` re-serialises the
  * whole object, so legacy fields/rows do NOT disappear on their own; this is
@@ -1258,14 +1259,10 @@ export async function detectUncommittedReferenceIds(
  * happens there). The near-write reread only overwrites our own mapKey, so a
  * concurrent writer touching other mapKeys is preserved.
  */
-export async function upsertReferenceEntry(ref: Reference, cwd: string, branch: string): Promise<void> {
+export async function upsertReferenceEntry(ref: Reference, cwd: string): Promise<void> {
 	const { sourcePath } = await writeReferenceMarkdown(ref, cwd);
 	const mapKey = `${ref.source}:${ref.nativeId}`;
 	const now = new Date().toISOString();
-	// Persist a real branch only — a failed git lookup ("unknown") is left off so
-	// the row stays branch-less (visible on every branch) rather than scoped to a
-	// non-existent "unknown" branch. The CLI never reads this; IntelliJ does.
-	const branchField = branch && branch !== "unknown" ? { branch } : {};
 
 	// Whole load→save under plans.lock so a concurrent StopHook / QueueWorker /
 	// Codex-discovery write to plans.json can't clobber this reference (and vice
@@ -1285,9 +1282,6 @@ export async function upsertReferenceEntry(ref: Reference, cwd: string, branch: 
 						sourcePath,
 						sourceToolName: ref.toolName,
 						updatedAt: now,
-						// Re-stamp to the current branch (a re-surfaced ref follows it);
-						// an "unknown" lookup keeps the existing branch via the spread.
-						...branchField,
 					}
 				: {
 						source: ref.source,
@@ -1298,7 +1292,6 @@ export async function upsertReferenceEntry(ref: Reference, cwd: string, branch: 
 						addedAt: now,
 						updatedAt: now,
 						sourceToolName: ref.toolName,
-						...branchField,
 					};
 
 		// Near-write reread — only overwrites our own mapKey, so a concurrent writer

@@ -15,7 +15,6 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../../Logger.js";
 import type { PlanEntry, TranscriptSource } from "../../Types.js";
-import { getCurrentBranchSafe } from "../GitBranch.js";
 import { withPlansLock } from "../Locks.js";
 import { normalizePathForCompare } from "../PathUtils.js";
 import { loadPlansRegistry, savePlansRegistry } from "../SessionTracker.js";
@@ -211,12 +210,6 @@ export async function scanPlansFrom(
 	const registry = await loadPlansRegistry(cwd);
 	const plans = { ...registry.plans };
 	const now = new Date().toISOString();
-	// Stamp the branch on newly-created rows so the IntelliJ plugin (which shares
-	// this plans.json) can branch-scope its CONTEXT view. Omit on an "unknown" git
-	// lookup so the row stays branch-less (visible everywhere) rather than scoped
-	// to a non-existent branch. The CLI itself does not filter on it.
-	const discoveredBranch = getCurrentBranchSafe(cwd);
-	const branchField = discoveredBranch && discoveredBranch !== "unknown" ? { branch: discoveredBranch } : {};
 	let changed = false;
 	// Tracks slugs we actually modified in this run. Used at writeback time to
 	// merge our changes onto the freshest registry snapshot per-slug rather
@@ -238,7 +231,6 @@ export async function scanPlansFrom(
 					addedAt: now,
 					updatedAt: now,
 					commitHash: null,
-					...branchField,
 				};
 				changed = true;
 				touchedSlugs.add(slug);
@@ -258,7 +250,6 @@ export async function scanPlansFrom(
 				addedAt: now,
 				updatedAt: now,
 				commitHash: null,
-				...branchField,
 			};
 			changed = true;
 			touchedSlugs.add(slug);

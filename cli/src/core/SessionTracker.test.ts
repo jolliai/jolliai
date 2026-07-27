@@ -2162,7 +2162,7 @@ describe("SessionTracker", () => {
 		}
 
 		it("returns uncommitted entries on the current branch", async () => {
-			await upsertReferenceEntry(ref(), tempDir, "main");
+			await upsertReferenceEntry(ref(), tempDir);
 			const ids = await detectUncommittedReferenceIds(tempDir, "main");
 			expect(ids.map((i) => i.mapKey)).toEqual(["linear:PROJ-1528"]);
 			expect((await getReferenceEntriesForBranch(tempDir, "main")).map((e) => e.nativeId)).toEqual(["PROJ-1528"]);
@@ -2220,32 +2220,19 @@ describe("SessionTracker", () => {
 		});
 
 		it("creates a fresh entry when none exists", async () => {
-			await upsertReferenceEntry(ref(), tempDir, "main");
+			await upsertReferenceEntry(ref(), tempDir);
 			const reg = await loadPlansRegistry(tempDir);
 			const e = linearIssuesOfReg(reg)?.["PROJ-1528"];
 			expect(e).toBeDefined();
 			expect(e?.sourcePath).toContain("PROJ-1528.md");
 			expect(e?.sourceToolName).toBe("mcp__linear__get_issue");
 			expect(e?.title).toBe("Treat referenced Linear issues");
-			// Branch is stamped so IntelliJ can branch-scope the shared plans.json.
-			expect(e?.branch).toBe("main");
-		});
-
-		it("stamps the current branch on insert and re-stamps it on update", async () => {
-			await upsertReferenceEntry(ref(), tempDir, "feature/x");
-			expect(linearIssuesOfReg(await loadPlansRegistry(tempDir))?.["PROJ-1528"]?.branch).toBe("feature/x");
-			// Re-surfaced on another branch → follows the new branch.
-			await upsertReferenceEntry(ref({ title: "v2" }), tempDir, "feature/y");
-			expect(linearIssuesOfReg(await loadPlansRegistry(tempDir))?.["PROJ-1528"]?.branch).toBe("feature/y");
-		});
-
-		it("omits branch on an unknown git lookup (stays visible on every branch)", async () => {
-			await upsertReferenceEntry(ref(), tempDir, "unknown");
-			expect(linearIssuesOfReg(await loadPlansRegistry(tempDir))?.["PROJ-1528"]?.branch).toBeUndefined();
+			// Working-area references are worktree-scoped: no `branch` is persisted.
+			expect((e as Record<string, unknown> | undefined)?.branch).toBeUndefined();
 		});
 
 		it("refreshes title/url/sourceToolName on an existing entry, preserving addedAt", async () => {
-			await upsertReferenceEntry(ref(), tempDir, "main");
+			await upsertReferenceEntry(ref(), tempDir);
 			const before = await loadPlansRegistry(tempDir);
 			const addedAt = linearIssuesOfReg(before)?.["PROJ-1528"]?.addedAt;
 
@@ -2256,7 +2243,6 @@ describe("SessionTracker", () => {
 					toolName: "mcp__linear__list_issues",
 				}),
 				tempDir,
-				"main",
 			);
 			const after = await loadPlansRegistry(tempDir);
 			const e = linearIssuesOfReg(after)?.["PROJ-1528"];
@@ -2406,7 +2392,7 @@ describe("SessionTracker", () => {
 		}
 
 		it("upserts a new entity and surfaces it from getReferenceEntriesForBranch", async () => {
-			await upsertReferenceEntry(entityRef(), tempDir, "main");
+			await upsertReferenceEntry(entityRef(), tempDir);
 			const entries = await getReferenceEntriesForBranch(tempDir, "main");
 			expect(entries).toHaveLength(1);
 			expect(entries[0]?.source).toBe("jira");
@@ -2414,18 +2400,17 @@ describe("SessionTracker", () => {
 		});
 
 		it("routes entries by source — does not mix Jira and Linear", async () => {
-			await upsertReferenceEntry(entityRef(), tempDir, "main");
+			await upsertReferenceEntry(entityRef(), tempDir);
 			await upsertReferenceEntry(
 				entityRef({ mapKey: "linear:PROJ-1", source: "linear", nativeId: "PROJ-1", title: "Linear" }),
 				tempDir,
-				"main",
 			);
 			const entries = await getReferenceEntriesForBranch(tempDir, "main");
 			expect(entries.map((e) => e.source).sort()).toEqual(["jira", "linear"]);
 		});
 
 		it("detectUncommittedReferenceIds returns {mapKey, source, sourcePath} triples", async () => {
-			await upsertReferenceEntry(entityRef(), tempDir, "main");
+			await upsertReferenceEntry(entityRef(), tempDir);
 			const ids = await detectUncommittedReferenceIds(tempDir, "main");
 			expect(ids).toHaveLength(1);
 			expect(ids[0]).toMatchObject({ mapKey: "jira:KAN-5", source: "jira" });
@@ -2436,8 +2421,8 @@ describe("SessionTracker", () => {
 			// Pins the `existing === undefined ? "new" : "updated"` ternary's
 			// "updated" arm in upsertReferenceEntry's log line, plus the
 			// canRefreshUncommitted branch above it.
-			await upsertReferenceEntry(entityRef(), tempDir, "main");
-			await upsertReferenceEntry(entityRef({ title: "renamed" }), tempDir, "main");
+			await upsertReferenceEntry(entityRef(), tempDir);
+			await upsertReferenceEntry(entityRef({ title: "renamed" }), tempDir);
 			const entries = await getReferenceEntriesForBranch(tempDir, "main");
 			expect(entries).toHaveLength(1);
 			expect(entries[0]?.title).toBe("renamed");
@@ -2544,7 +2529,6 @@ describe("SessionTracker", () => {
 					toolName: "mcp__atlassian__getJiraIssue",
 				},
 				tempDir,
-				"main",
 			);
 			const after = await loadPlansRegistry(tempDir);
 			if (after.version !== 1) return;
@@ -2567,7 +2551,6 @@ describe("SessionTracker", () => {
 					referencedAt: "x",
 				},
 				tempDir,
-				"main",
 			);
 			const after = await loadPlansRegistry(tempDir);
 			if (after.version !== 1) return;
@@ -2598,7 +2581,7 @@ describe("normalizePlansRegistry", () => {
 		...over,
 	});
 
-	it("plans: drops ignored rows, strips ignored/editCount, keeps guard and branch", () => {
+	it("plans: drops ignored rows, strips ignored/editCount/branch, keeps guard", () => {
 		const raw = {
 			version: 1,
 			plans: {
@@ -2618,15 +2601,14 @@ describe("normalizePlansRegistry", () => {
 
 		expect(changed).toBe(true);
 		expect(Object.keys(registry.plans).sort()).toEqual(["active", "guard"]);
-		expect(JSON.stringify(registry.plans)).not.toMatch(/editCount|"ignored"/);
-		// `branch` is preserved (IntelliJ branch-scopes off it via the shared plans.json).
-		expect(registry.plans.active?.branch).toBe("main");
-		expect(registry.plans.guard?.branch).toBe("main");
+		// `branch` is stripped alongside editCount/ignored — working-area entries are
+		// worktree-scoped, not branch-scoped.
+		expect(JSON.stringify(registry.plans)).not.toMatch(/editCount|"ignored"|"branch"/);
 		expect(registry.plans.guard?.commitHash).toBe("abc");
 		expect(registry.plans.guard?.contentHashAtCommit).toBe("h");
 	});
 
-	it("notes: drops ignored rows, strips ignored, keeps guard and branch", () => {
+	it("notes: drops ignored rows, strips ignored/branch, keeps guard", () => {
 		const raw = {
 			version: 1,
 			plans: {},
@@ -2656,9 +2638,8 @@ describe("normalizePlansRegistry", () => {
 
 		expect(changed).toBe(true);
 		expect(Object.keys(registry.notes ?? {})).toEqual(["keep"]);
-		expect(JSON.stringify(registry.notes)).not.toMatch(/"ignored"/);
-		// `branch` is preserved for the IntelliJ shared-plans.json branch filter.
-		expect(registry.notes?.keep?.branch).toBe("main");
+		// `branch` is stripped alongside `ignored` — notes are worktree-scoped.
+		expect(JSON.stringify(registry.notes)).not.toMatch(/"ignored"|"branch"/);
 	});
 
 	it("notes: strips a lingering `ignored: false` field (changed=true) but leaves a clean note untouched", () => {
@@ -2714,9 +2695,8 @@ describe("normalizePlansRegistry", () => {
 
 		expect(changed).toBe(true);
 		expect(Object.keys(registry.references ?? {}).sort()).toEqual(["linear:ACTIVE-1", "linear:ENG-12345678"]);
-		expect(JSON.stringify(registry.references)).not.toMatch(/"ignored"|"commitHash"|contentHashAtCommit/);
-		// `branch` is preserved on the surviving active rows.
-		expect(registry.references?.["linear:ACTIVE-1"]?.branch).toBe("main");
+		// `branch` is stripped alongside the dead fields — references are worktree-scoped.
+		expect(JSON.stringify(registry.references)).not.toMatch(/"ignored"|"commitHash"|contentHashAtCommit|"branch"/);
 	});
 
 	it("is idempotent: an already-clean registry returns changed=false and equal data", () => {

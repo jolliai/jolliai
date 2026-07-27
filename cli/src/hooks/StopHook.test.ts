@@ -1972,7 +1972,7 @@ describe("StopHook — entity discovery (multi-source)", () => {
 		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
 		await handleStopHook();
 
-		expect(upsertReferenceEntry).toHaveBeenCalledWith(REF, PROJECT_DIR, expect.any(String));
+		expect(upsertReferenceEntry).toHaveBeenCalledWith(REF, PROJECT_DIR);
 		expect(saveDiscoveryCursor).toHaveBeenCalledWith(
 			expect.objectContaining({
 				transcriptPath: `${TRANSCRIPT_PATH}`,

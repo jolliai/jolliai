@@ -46,10 +46,6 @@ const { mockGetCurrentBranch } = vi.hoisted(() => ({
 	mockGetCurrentBranch: vi.fn(() => "feature/test"),
 }));
 
-const { mockGetCurrentBranchSafe } = vi.hoisted(() => ({
-	mockGetCurrentBranchSafe: vi.fn(() => "unknown"),
-}));
-
 const { mockCreateHash, mockRandomBytes } = vi.hoisted(() => ({
 	mockCreateHash: vi.fn(() => ({
 		update: vi.fn().mockReturnThis(),
@@ -102,10 +98,6 @@ vi.mock("node:fs", () => ({
 
 vi.mock("./PlanService.js", () => ({
 	getCurrentBranch: mockGetCurrentBranch,
-}));
-
-vi.mock("../../../cli/src/core/GitBranch.js", () => ({
-	getCurrentBranchSafe: mockGetCurrentBranchSafe,
 }));
 
 vi.mock("node:crypto", () => ({
@@ -196,8 +188,6 @@ describe("NoteService", () => {
 		mockRandomBytes.mockReturnValue({ toString: () => "a1b2" });
 		mockGetCurrentBranch.mockReset();
 		mockGetCurrentBranch.mockReturnValue("main");
-		mockGetCurrentBranchSafe.mockReset();
-		mockGetCurrentBranchSafe.mockReturnValue("unknown");
 		mockUnlinkSync.mockReset();
 	});
 
@@ -960,10 +950,9 @@ describe("NoteService", () => {
 			// (id is provided, so generateNoteSlug is not called)
 		});
 
-		it("stamps the current branch on the saved entry when git resolves a real branch (L139 truthy arm)", async () => {
-			// cond-expr L139: `noteBranch && noteBranch !== "unknown" ? { branch } : {}`
-			// — the consequent arm runs only when git returns a real branch name.
-			mockGetCurrentBranchSafe.mockReturnValue("feature/branchy");
+		it("does not persist a branch field on the saved note (worktree-scoped)", async () => {
+			// Working-area notes are worktree-scoped, not branch-scoped: no `branch`
+			// is written; branch association is recorded on CommitSummary at commit.
 			mockLoadPlansRegistry.mockResolvedValue(emptyRegistry());
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("content");
@@ -971,7 +960,7 @@ describe("NoteService", () => {
 			await saveNote(undefined, "Branchy Note", "content", "snippet", CWD);
 
 			const saved = mockSavePlansRegistry.mock.calls[0][0];
-			expect(saved.notes["branchy-note-a1b2"].branch).toBe("feature/branchy");
+			expect((saved.notes["branchy-note-a1b2"] as Record<string, unknown>).branch).toBeUndefined();
 		});
 	});
 

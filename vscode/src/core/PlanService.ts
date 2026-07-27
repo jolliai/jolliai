@@ -24,7 +24,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { withPlansLock } from "../../../cli/src/core/Locks.js";
 import { isPathInside } from "../../../cli/src/core/PathUtils.js";
-import { getCurrentBranchSafe } from "../../../cli/src/core/GitBranch.js";
 import {
 	loadAllSessions,
 	loadPlansRegistry,
@@ -278,11 +277,6 @@ export async function addPlanToRegistry(
 	const existing = registry.plans[slug];
 	const now = new Date().toISOString();
 
-	// Stamp the current branch so the IntelliJ plugin (sharing this plans.json)
-	// can branch-scope its CONTEXT view; omit on an "unknown" git lookup.
-	const planBranch = getCurrentBranchSafe(cwd);
-	const branchField = planBranch && planBranch !== "unknown" ? { branch: planBranch } : {};
-
 	// Always reset to a fresh uncommitted entry — clears contentHashAtCommit
 	// and commitHash so the plan becomes visible and editable again.
 	const entry: PlanEntry = {
@@ -292,7 +286,6 @@ export async function addPlanToRegistry(
 		addedAt: existing?.addedAt ?? now,
 		updatedAt: now,
 		commitHash: null,
-		...branchField,
 	};
 
 	// plans.lock + fresh re-read so this single-plan upsert merges onto the latest
@@ -431,7 +424,6 @@ export async function archivePlanForCommit(
 		if (!existsSync(planFile)) {
 			return null;
 		}
-		const planBranch = getCurrentBranchSafe(cwd);
 		entry = {
 			slug,
 			title: extractTitle(planFile),
@@ -439,7 +431,6 @@ export async function archivePlanForCommit(
 			addedAt: new Date().toISOString(),
 			updatedAt: new Date().toISOString(),
 			commitHash: null,
-			...(planBranch && planBranch !== "unknown" ? { branch: planBranch } : {}),
 		};
 	}
 

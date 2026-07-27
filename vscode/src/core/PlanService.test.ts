@@ -486,12 +486,9 @@ describe("PlanService", () => {
 			expect(savePlansRegistry).not.toHaveBeenCalled();
 		});
 
-		it("omits the branch field when the git branch lookup is unknown (L279 ternary else)", async () => {
-			// getCurrentBranchSafe returns "unknown" when git fails → the branchField
-			// ternary takes its empty-object alternate and no `branch` is stamped.
-			mockExecFileSync.mockImplementation(() => {
-				throw new Error("not a git repo");
-			});
+		it("does not persist a branch field on a fresh plan entry (worktree-scoped)", async () => {
+			// Working-area plans are worktree-scoped, not branch-scoped: no `branch`
+			// is written; branch association is recorded on CommitSummary at commit.
 			loadPlansRegistry.mockResolvedValue(emptyRegistry());
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# Fresh Plan");
@@ -499,7 +496,7 @@ describe("PlanService", () => {
 			await addPlanToRegistry("fresh-plan", CWD);
 
 			const saved = savePlansRegistry.mock.calls[0][0];
-			expect(saved.plans["fresh-plan"].branch).toBeUndefined();
+			expect((saved.plans["fresh-plan"] as Record<string, unknown>).branch).toBeUndefined();
 		});
 
 		it("resets existing commitHash when re-adding an ignored plan", async () => {
@@ -633,12 +630,9 @@ describe("PlanService", () => {
 			expect(result?.slug).toBe("new-plan-aaaa1111");
 		});
 
-		it("omits the branch field on a freshly-created entry when git branch is unknown (L431 ternary else)", async () => {
-			// slug not in registry → a fresh entry is built; getCurrentBranchSafe
-			// returning "unknown" (git failure) takes the ternary's empty-object arm.
-			mockExecFileSync.mockImplementation(() => {
-				throw new Error("no git");
-			});
+		it("creates a fresh entry (no branch field) when slug not in registry", async () => {
+			// slug not in registry → a fresh, worktree-scoped entry is built with no
+			// `branch` field (branch association is recorded on CommitSummary at commit).
 			loadPlansRegistry.mockResolvedValue(emptyRegistry());
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# New Plan\nContent");
@@ -651,6 +645,10 @@ describe("PlanService", () => {
 
 			expect(result).not.toBeNull();
 			expect(result?.slug).toBe("new-plan-aaaa1111");
+			// The fresh guard entry (keyed by the base slug) carries no `branch`:
+			// working-area plans are worktree-scoped; branch lives on CommitSummary.
+			const saved = savePlansRegistry.mock.calls[0][0];
+			expect((saved.plans["new-plan"] as Record<string, unknown>).branch).toBeUndefined();
 		});
 
 		it("returns null when plan file does not exist and slug not in registry", async () => {
