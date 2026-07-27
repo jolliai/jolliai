@@ -2746,6 +2746,17 @@ describe("Extension", () => {
 
 				expect(mockCommitCommand.execute).toHaveBeenCalled();
 			});
+
+			it("skips execute and notifies when the repo is manually disabled", () => {
+				manuallyDisabledState.value = true;
+				const handler = getRegisteredCommand("jollimemory.commitAI");
+				handler();
+
+				expect(mockCommitCommand.execute).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					"Jolli Memory is disabled for this project — enable it first.",
+				);
+			});
 		});
 
 		describe("squash", () => {
@@ -7947,6 +7958,18 @@ describe("Extension", () => {
 			// session would re-show the dismissed card (getInitialState reads this).
 			const state = (sidebarDepsCaptured as { getInitialState: () => { backfillDismissed?: boolean } }).getInitialState();
 			expect(state.backfillDismissed).toBe(true);
+		});
+
+		it("getInitialState reports enabled=false when the repo is manually disabled (initial paint)", () => {
+			// The opt-out is folded into the sidebar's effective enabled so the first
+			// paint collapses to the Enable panel even if the git hook is still
+			// installed (status.enabled true). activate() re-reads the flag via
+			// readManualDisableFlagSync (Extension.ts sync boot), so drive it there
+			// rather than poking manuallyDisabledState directly.
+			readManualDisableFlagSync.mockReturnValue(true);
+			activate(makeContext());
+			const state = (sidebarDepsCaptured as { getInitialState: () => { enabled?: boolean } }).getInitialState();
+			expect(state.enabled).toBe(false);
 		});
 
 		it("the Settings full-scope command runs back-fill but does NOT clear the sticky dismiss flag", async () => {

@@ -1064,7 +1064,12 @@ export function activate(context: vscode.ExtensionContext): void {
 		executeCommand: (cmd, ...args) =>
 			vscode.commands.executeCommand(cmd, ...args),
 		getInitialState: () => ({
-			enabled: currentEnabled,
+			// Fold in the manual-disable opt-out so the initial paint matches the
+			// update path (SidebarWebviewProvider.notifyEnabledChanged). `currentEnabled`
+			// tracks status.enabled (git hook installed), which can be true while the
+			// repo is manually disabled (a shared core.hooksPath hook across worktrees,
+			// or a hook reinstalled out-of-band).
+			enabled: currentEnabled && !isManuallyDisabled(),
 			authenticated: currentAuthenticated,
 			configured: currentConfigured,
 			activeTab: "branch",
@@ -2468,6 +2473,17 @@ export function activate(context: vscode.ExtensionContext): void {
 
 		vscode.commands.registerCommand("jollimemory.commitAI", () => {
 			log.info("cmd", "commitAI invoked");
+			// Defence-in-depth: the sidebar collapses to the Enable panel when the
+			// repo is manually disabled, so the button isn't visible — but the command
+			// is still reachable via the palette. A disabled repo must never write, so
+			// refuse the manual commit here too.
+			if (isManuallyDisabled()) {
+				log.info("cmd", "commitAI skipped — repository manually disabled");
+				void vscode.window.showInformationMessage(
+					"Jolli Memory is disabled for this project — enable it first.",
+				);
+				return;
+			}
 			// JOLLI-1904: memory_committed engagement event (mirrors IntelliJ). Gather
 			// the counts off the click path so telemetry never delays the commit.
 			void trackMemoryCommitted({

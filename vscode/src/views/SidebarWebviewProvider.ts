@@ -24,6 +24,7 @@ import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSession
 import type { ActiveSessionsProvider } from "../services/ActiveSessionsProvider.js";
 import type { CommitFileInfo } from "../Types.js";
 import { track } from "../../../cli/src/core/Telemetry.js";
+import { isManuallyDisabled } from "../../../cli/src/Logger.js";
 import { flushExtensionTelemetry } from "../TelemetryActivation.js";
 import type { IngestPhase } from "../stores/StatusStore.js";
 import { log } from "../util/Logger.js";
@@ -1831,9 +1832,19 @@ export class SidebarWebviewProvider
 	}
 
 	/** Pushed from refreshStatusBar after enable/disable so the sidebar can show
-	 * or hide the disabled banner without an extension reload. */
+	 * or hide the disabled banner without an extension reload.
+	 *
+	 * The webview's effective "enabled" folds in the CLI-owned manual-disable
+	 * opt-out: `status.enabled` alone is the install-state signal (git hook
+	 * present), which can legitimately be true while the repo is manually
+	 * disabled (a shared `core.hooksPath` hook across git worktrees, or a hook
+	 * reinstalled out-of-band). Without this AND, a disabled repo whose hook is
+	 * still installed would render the full operable sidebar instead of the
+	 * Enable panel. All runtime-update call sites funnel through here, so this is
+	 * the single chokepoint for the update path (the initial paint mirrors it in
+	 * the sidebar shell's getInitialState). */
 	notifyEnabledChanged(enabled: boolean): void {
-		this.postMessage({ type: "enabled:changed", enabled });
+		this.postMessage({ type: "enabled:changed", enabled: enabled && !isManuallyDisabled() });
 	}
 
 	/**

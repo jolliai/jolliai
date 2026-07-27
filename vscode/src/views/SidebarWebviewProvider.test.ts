@@ -7,6 +7,7 @@ import type {
 	SidebarOutboundMsg,
 	SidebarState,
 } from "./SidebarMessages";
+import { setManuallyDisabled } from "../../../cli/src/Logger.js";
 import { SidebarWebviewProvider } from "./SidebarWebviewProvider";
 
 interface MockWebview {
@@ -2014,6 +2015,61 @@ describe("SidebarWebviewProvider", () => {
 					(m as { enabled?: unknown }).enabled === false,
 			),
 		).toBe(true);
+	});
+
+	const postedEnabled = (view: ReturnType<typeof makeMockView>): boolean | undefined => {
+		const msg = view.webview.postMessage.mock.calls
+			.map((c) => c[0])
+			.find(
+				(m): m is { type: string; enabled: boolean } =>
+					typeof m === "object" && m !== null && (m as { type?: unknown }).type === "enabled:changed",
+			);
+		return msg?.enabled;
+	};
+
+	it("notifyEnabledChanged posts enabled:true when enabled and not manually disabled", () => {
+		const view = makeMockView();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "status",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		provider.notifyEnabledChanged(true);
+		expect(postedEnabled(view)).toBe(true);
+	});
+
+	it("notifyEnabledChanged folds in the manual-disable opt-out (posts false even when enabled=true)", () => {
+		setManuallyDisabled(true);
+		try {
+			const view = makeMockView();
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "status",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			provider.notifyEnabledChanged(true);
+			expect(postedEnabled(view)).toBe(false);
+		} finally {
+			setManuallyDisabled(false);
+		}
 	});
 
 	it("toggleStatus posts status:toggle", () => {
