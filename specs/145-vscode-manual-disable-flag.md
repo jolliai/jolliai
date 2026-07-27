@@ -1,0 +1,167 @@
+# Repo-Wide Manual Disable Flag
+
+## Topic Statement
+
+A single boolean field inside a machine-local, repo-wide profile file records the user's explicit "memory capture is off for this repository" decision. The field is written and read by a canonical module that both the CLI commands and the VS Code extension call into, so the opt-out is a single source of truth across every worktree of the repository and across both surfaces. The field is not only an install-time signal: every source-control hook, both agent hooks that carry the gate, and both background workers read it at the top of their own hot path and return early, so an opted-out repository captures nothing even while its hooks remain installed and wired on disk.
+
+## Scope
+
+**In scope:**
+- The profile file's location and repo-wide anchoring (shared across worktrees).
+- The boolean field's semantics, and its priority relative to every other install/repair path.
+- Which commands and activation paths write, clear, or read the field, and the ordering/error-handling guarantees around each.
+- The **runtime capture gate**: which hook and worker entry points read the field on every invocation, where in each entry point's own sequence that read sits, and what each one therefore never does on the disabled path.
+- The per-invocation cost the runtime read adds, and the two documented performance budgets it lands inside.
+- The one-time migration from the legacy per-worktree marker file that predates this field, including what the first read persists and what it does not delete.
+- The effects and non-effects on doctor, the agent-plugin session bootstrap, and the version-upgrade / new-worktree auto-repair paths.
+
+**Out of scope:**
+- The general shape, atomic-write mechanics, and locking of the repo-wide profile file for OTHER fields it holds (the back-fill dismiss field).
+- The auto-enable substep's other preconditions and its state updates on success (owned by the auto-enable spec).
+- The machine-global user profile file of the same filename at a different location (owned by the user-profile spec) — the two are unrelated files that happen to share a filename.
+- The internal steps of the bridge-level enable and disable paths (owned by the hook-installation and enable-command specs).
+- The sidebar disabled panel and onboarding panel rendering.
+- Security controls; the flag is a UX preference only.
+
+## Data Contracts
+
+### Location and anchoring
+
+The flag lives in a JSON profile file resolved once per read/write:
+- Find the repository's shared common git directory.
+- The file lives at `<parent-of-common-dir>/.jolli/jollimemory/profile.json` — anchored to the MAIN worktree root, not the current worktree. Every linked worktree resolves to the same path, because every worktree's common-dir points at the same shared location.
+- If the current directory is not inside a git repository, the file falls back to a directory relative to the current directory (inert in practice — the disable/enable commands and activation only operate inside git repos).
+- Inside a git submodule, resolution lands inside the parent superproject's git metadata directory, shared by every submodule checkout of that superproject — a known, low-severity edge case: disabling in one submodule silently disables every sibling submodule of the same superproject.
+
+### Field
+
+| Field | Type | Meaning |
+|---|---|---|
+| `manuallyDisabled` | boolean (optional) | `true` = the user explicitly turned capture off for this repository. `false` = explicitly turned back on. Absent = no decision recorded yet (subject to legacy-marker migration). |
+
+The file is shared with an unrelated back-fill-dismiss field written and read independently; both fields' writers use the same locked read-modify-write path so one field's write can never clobber the other.
+
+### Priority
+
+The flag has two roles, and it is the HIGHEST-priority signal in both:
+
+- **Install-time** — it decides whether hooks should be installed, refreshed, or auto-repaired at all.
+- **Runtime** — it decides whether an already-installed hook or worker does any work when it fires. A repository can therefore be fully wired (source-control hooks on disk, agent hooks registered, integrations present) and still capture nothing.
+
+Once `true`, nothing except an explicit re-enable clears it — not a version upgrade, not a window/IDE reload, not the doctor auto-repair, not the agent-plugin's per-session bootstrap. Because the runtime gate is placed ahead of every other opt-out, configuration read, and input-validity check in the entry points that carry it, a `true` flag also *masks* those checks: nothing downstream of the gate is ever consulted, so no other setting can override, soften, or re-enable the opt-out.
+
+## Behavior
+
+### Writing true (explicit disable)
+
+Both the CLI disable command and the VS Code Disable command write `manuallyDisabled: true` BEFORE running the asynchronous uninstall (hook removal), so the user's intent survives even if uninstall throws partway. If the write itself fails, the command ABORTS WITHOUT UNINSTALLING: no hooks removed, an error surfaced (CLI: stderr + non-zero exit; VS Code: an error notification), the repo left in its previous coherent state. This deliberate asymmetry avoids a deceptive "hooks removed but flag unset" half-state that a later upgrade or activation could silently re-enable.
+
+Two distinct conditions produce that write failure: an unwritable state directory, and a **failure to acquire the shared profile lock within its wait budget**. The write path is strict about the lock — on a timeout it rejects with a lock-timeout error rather than proceeding unlocked — so lock contention is a first-class disable-failure mode, surfaced to the user as an uninstall failure naming the lock timeout, with the repository still fully enabled.
+
+### Clearing to false (explicit enable)
+
+The CLI enable command (default full mode, not integrations-only), the CLI guided front-door's enable path, and the VS Code Enable command all clear the flag by writing `manuallyDisabled: false` AFTER install succeeds. A failed clear here is NON-FATAL: hooks are already installed, so the command prints/logs a warning telling the user to run enable again to clear the opt-out, rather than failing the whole command. This is safe because nothing auto-retries the clear — the agent-plugin's per-session bootstrap only READS the flag, never writes it, so a stuck `true` keeps blocking reinstalls until an explicit enable succeeds.
+
+Integrations-only enable/disable (the IntelliJ MCP-only setup/teardown path) does not touch the flag at all.
+
+### Reading — general contract
+
+Every consumer, install-time or runtime, treats any error (missing file, invalid JSON, non-object value, unresolvable repository root) as if the field were absent, then falls through to the legacy-migration check below. The read is total: it never throws, so no consumer needs to guard it. A read that cannot reach a verdict at all degrades to "not disabled", which is the direction that keeps capture working rather than silently killing it.
+
+### Reading — install-time and repair consumers
+
+All of these skip, or report-and-skip, when the flag is `true`:
+
+- The CLI doctor source-control-hooks probe — reports ok ("manually disabled — run enable to re-enable") instead of failing "not installed", and attaches no re-install fixer, so the doctor auto-fix never reinstalls against the opt-out.
+- The agent-plugin's per-session repo-hook reconciliation (the narrowed install mode that writes only the repo-local hooks, agent hooks, and menu state) — silently returns without reinstalling, and never clears the flag. Note this respect is a property of *that* invocation, not of the narrowed mode itself; an explicitly-invoked narrowed enable is an explicit enable and behaves as one.
+- The VS Code activation sequence — reads the flag once alongside install status and reuses that single read to gate both the new-worktree reinstall path and the first-run auto-enable substep.
+- The VS Code version-upgrade hook-path refresh — returns immediately if set, skipping the legacy-hook migration and the version-mismatch reinstall.
+
+### Reading — the runtime capture gate
+
+Nine entry points read the flag on **every** invocation and return early when it is `true`. In each case the gate's *position* within that entry point's own sequence is load-bearing, because it determines which of that entry point's other effects, checks, and I/O never happen:
+
+| Entry point | Gate position | Consequence on the disabled path |
+|---|---|---|
+| Post-commit hook | Step zero — before operation-kind detection, before any queue write, before the worker spawn | No queue entry, no worker spawned, and — because the hook returns before it would start the interactive capture-progress watch — no capture feedback is printed at all, regardless of terminal/agent context or the feedback setting |
+| Post-merge hook | Before the merge-reflog read | No merge inspected, no topic-knowledge ingest operation enqueued |
+| Post-rewrite hook | **Before** reading the piped old-to-new rewrite mapping | The mapping supplied on standard input is **not drained**; no amend or rebase entries enqueued, no worker spawned |
+| Prepare-commit-msg hook | Before all squash detection (both the tool-driven merge-squash branch and the reset-squash detector) | No squash pending-state file is written, so no squash queue entry can ever be enqueued for a disabled repository |
+| Pre-push hook | **Before** configuration is loaded, and therefore before the unrelated sync-on-push opt-out gate | No push-pending queue write, no inline sync, no signed-out memory preview; the push still proceeds and still exits success |
+| Push-pending compensation worker | First statement of the worker entry point, before the drain engine is called | The compensation drain is a clean no-op, so every surface's spawn of it is inert on a disabled repository |
+| Source-control operation queue worker | After the log directory is set, but **before** the per-vault write lock, before the startup banner, and before storage construction | Neither the banner nor any lock activity is logged; no storage backend is constructed or registered; no entries are drained and no successor is spawned |
+| Claude agent stop hook | After the "hook triggered" log line, **before** the Claude-integration configuration gate and **before** the required-field check | No session-registry write, no transcript-discovery pass, no telemetry flush; the payload's validity is never examined |
+| Claude agent session-start hook | After the log directory is set, before context composition — and **outside** the composition deadline race | Nothing on standard output, no index/summary/plans/cache reads; and the gate's own cost is not covered by the composition deadline |
+
+The one omission is the Gemini after-agent hook: it is the only agent hook that does **not** carry the runtime gate. On a manually-disabled repository it still records a session-registry entry and still writes its required standard-output response. Nothing downstream consumes those records, because every path that would is itself gated. Whether the omission is intentional is not recorded anywhere.
+
+### Runtime cost
+
+Each gated invocation costs at minimum one source-control query to resolve the repository's shared root plus one small file read. The **first** invocation in a repository whose profile has no decision recorded costs additionally: an enumeration of every worktree (the legacy-marker migration scan) and one locked read-modify-write to persist the resulting decision. Two entry points carry a documented budget this lands inside:
+
+- The post-commit hook's "a few milliseconds" budget — the added query plus read fits inside it in the steady state; the once-per-repository first invocation is the outlier.
+- The session-start handler's hard composition deadline — the gate sits **outside** the deadline race, so the deadline does not bound it.
+
+### Migration from the legacy per-worktree marker
+
+Before this repo-wide field existed, the VS Code extension recorded the same intent as a marker file at `<worktree-root>/.jolli/jollimemory/disabled-by-user` — its mere existence was the boolean. Nothing writes that file anymore, but a read still honors it for repos that predate migration:
+
+1. If the profile file already has a `manuallyDisabled` field of EITHER value, that value wins outright and the read returns immediately — no worktree enumeration, no lock, no write.
+2. Otherwise every worktree of the repository (enumerated via the worktree list, falling back to just the current directory if enumeration fails) is checked for the legacy marker. If ANY worktree still has it, the repo is treated as disabled. Checking every worktree makes the migration correct for a repo disabled in one worktree before upgrading.
+3. The resulting verdict is then persisted back into the profile file under the shared lock — **including a confirmed absence, which is persisted as `false`**. The write re-reads the profile inside the lock, so a concurrent explicit enable/disable that landed in the meantime wins and is returned instead of the migration verdict.
+4. If the lock cannot be acquired, nothing is persisted. The migration verdict is still returned, and the whole migration path is re-attempted on the next read.
+
+Persisting a confirmed absence exists purely so the runtime capture gate stops paying for worktree enumeration on every hook invocation. Its user-visible consequence is that **the very first hook invocation in a fresh repository creates the profile file and takes the profile lock**, even though the user has made no decision at all. Every subsequent read short-circuits at step 1.
+
+The profile file's other field (the back-fill dismiss flag) has its own, separate legacy-marker migration, and that one does **delete** its legacy marker after the persist lands — the ordering is load-bearing, so a failed persist leaves the marker intact for the next read to re-migrate. This field's legacy per-worktree markers are deliberately **not** deleted: they are simply never consulted again once the field is present.
+
+### Concurrency
+
+All writes go through a shared lock file in the same anchored location, so a CLI write in one worktree and a VS Code write in a sibling worktree — or a back-fill-dismiss write racing a `manuallyDisabled` write — can't lose-update each other. The guarded section is a small read-modify-write, and the file is written via temp-file-plus-rename so a lost race can't corrupt it.
+
+The lock is **strict, not best-effort**: if it cannot be acquired within its wait budget, the guarded work does not run at all.
+
+- **Write path** — rejects with a lock-timeout error. The value is not written. Callers that treat that rejection as fatal (the explicit disable) abort; callers that swallow it (the back-fill dismiss writers) silently lose the write.
+- **Read path** — persists nothing and returns the un-persisted verdict it derived from the legacy-marker scan. The read itself never fails on lock contention; it just does not memoize.
+
+Nothing ever proceeds unlocked.
+
+## State Transitions
+
+| From | Event | To | Notes |
+|---|---|---|---|
+| Absent | Legacy marker present in any worktree, on first read, lock acquired | `true` (persisted) | The migrated value is durable; subsequent reads short-circuit on it. |
+| Absent | Legacy marker present in any worktree, on first read, lock busy | Unchanged (absent) | `true` is still *returned*; nothing is persisted; the migration is re-attempted on the next read. |
+| Absent | **No legacy marker in any worktree**, on first read, lock acquired | `false` (persisted) | A confirmed absence is recorded so the runtime gate stops enumerating worktrees. This is what makes the first hook invocation in a fresh repository create the profile file and take the lock. |
+| Absent | First read, lock acquired, but a concurrent explicit decision landed inside the lock | That concurrent value | The locked write re-reads, so an explicit enable/disable always beats a migration verdict. |
+| Absent or `false` | Explicit disable, write succeeds | `true` | Uninstall proceeds only after this write lands. |
+| Absent or `false` | Explicit disable, write fails (unwritable directory **or** lock timeout) | Unchanged | Uninstall does not run; command reports an error naming the failure. |
+| `true` | Explicit enable, full mode, install + write succeed | `false` | All consumers resume normal auto-repair, and every gated hook resumes capture, on their next read. |
+| `true` | Explicit enable, install succeeds but write fails | `true` (retry needed) | Enable still reports overall success; a warning names the stuck opt-out. Capture stays off. |
+| Any | Integrations-only enable or disable | Unchanged | This mode never touches hook installation. |
+| Any | Doctor, agent-plugin session bootstrap, sign-in/out, config edits, status refresh | Unchanged | Read-only or unrelated paths. |
+| `true` | Any gated hook or worker fires | Unchanged | The gate is read-only. A disabled repository's hooks keep firing and keep returning early forever; nothing self-heals and nothing accumulates. |
+
+## Notable Behavior
+
+- **The opt-out is repo-wide, not per-worktree.** Disabling from any worktree (or from the CLI) holds for every worktree of the repository, because all resolve to the same anchored file. The previous "two worktrees, two independent opt-outs" behavior no longer holds.
+- **Disabling does not require uninstalling.** The flag is a runtime gate as well as an install-time one, so a repository whose hooks are still fully installed captures nothing while it is set. Conversely, an uninstall that removed the hooks but failed to persist the flag is the dangerous half-state the write ordering exists to prevent. (Surprising; central design choice.)
+- **Gate placement is behavior, not style.** Each gated entry point puts the read ahead of a *specific* effect it must not have: ahead of draining the piped rewrite mapping, ahead of loading configuration (and therefore ahead of an unrelated opt-out that would otherwise be consulted), ahead of acquiring a write lock and emitting a startup banner, ahead of a required-field check, and ahead of the interactive feedback watch. Moving any one of them later would change observable behavior on a disabled repository. (Surprising; intentional.)
+- **A disabled repository consumes nothing that was handed to it.** Most notably the post-rewrite hook returns before reading the rewrite mapping the tool piped to it. The pre-push hook is the deliberate contrast: it reads its standard input at its entry point, before the gated body runs, so its pipe is always drained. (Surprising; the two hooks differ on purpose.)
+- **One agent hook has no runtime gate.** The Gemini after-agent hook still records sessions on a disabled repository. Whether that is intentional or an omission is not recorded anywhere; the behavior is documented here as-is. (Surprising.)
+- **The first read in a fresh repository is a write.** A confirmed *absence* of any decision is persisted as `false`, so the very first hook invocation creates the profile file and takes the profile lock even though the user has decided nothing. This exists solely to keep the runtime gate cheap on every later invocation. (Surprising; intentional.)
+- **A failed disable-write blocks the disable; a failed enable-write does not block the enable.** A silently-failed disable would leave a deceptive half-state a later upgrade could re-enable; a failed enable-clear leaves hooks installed and working — worth a warning, not a failure.
+- **Lock contention is a real failure mode, not a soft one.** The lock is strict: a timeout means the guarded work does not happen. The write path rejects; the read path returns its verdict without memoizing it. Nothing proceeds unlocked. (Surprising; this is the opposite of the older best-effort locking it replaced.)
+- **The agent-plugin's per-session bootstrap never clears the flag** — only an explicit enable does; a stuck failed-clear keeps blocking every session's bootstrap until enable succeeds.
+- **doctor --fix treats a manual disable as healthy, not a fault** — missing hooks under an active opt-out report ok, with no re-install fixer.
+- **Migration only moves the legacy marker's intent forward, never back** — once the field is set, the legacy per-worktree file is never consulted again for that repo, and it is never deleted either. (The profile's *other* field takes the opposite approach: it retires its legacy marker by deleting it, ordered after the persist so a failed persist leaves the marker intact.)
+- **The flag's storage file is shared with an unrelated dismiss field but the two are read/written independently** (shared physical file, lock, and atomic-write mechanics only).
+
+## Shared Behavior
+
+- The auto-enable substep consumes this flag as one of its preconditions; this spec owns the flag's storage, migration, priority, and error-handling, not what auto-enable does with the result.
+- The gated entry points each own their own remaining behavior; this spec owns only the gate, its position, and what the position rules out. They are: post-commit enqueue (spec 31), post-rewrite handling (spec 32), prepare-commit-msg squash detection (spec 33), the source-control operation queue worker (spec 34), the Claude agent stop hook (spec 26), the Claude agent session-start briefing (spec 27), the pre-push hook (spec 268), the push-pending compensation worker (spec 270), and the post-merge ingest trigger. The interactive capture feedback the post-commit gate makes unreachable is owned by the capture-progress streaming spec.
+- The Gemini after-agent hook (spec 28) records its non-participation in this gate.
+- The repo-wide profile file's other field (the back-fill dismiss flag) lives in the same file under the same lock.
+- The machine-global user profile file has the same filename but a different, machine-wide location and unrelated fields; the two files are unrelated aside from the naming coincidence.
+- CLI hook installation orchestration and the bridge-level enable/disable paths are what the flag gates.

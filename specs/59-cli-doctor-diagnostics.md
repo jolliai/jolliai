@@ -1,0 +1,122 @@
+# 59. `jolli doctor` — Health diagnostics (without `--fix`)
+
+## Topic Statement
+
+The `jolli doctor` command (without `--fix`) probes the Jolli Memory installation for faults that would impair functionality and reports each one with an `ok`, `warn`, or `fail` verdict.
+
+## Scope
+
+This spec covers the diagnostic mode of `jolli doctor`: the probes performed, their order, the per-probe verdict and message, the overall output format, and the exit code policy. The repair mode (`--fix`) is specified separately. Stale-data cleanup (handled by `jolli clean`) is explicitly out of scope here.
+
+The boundary between `doctor` and `clean` is rigid:
+
+- `doctor` reports **faults** — conditions that break or impair Jolli Memory.
+- `clean` removes **redundant data** — entries that have aged out but never break anything.
+
+The two commands have no overlapping checks.
+
+## Data Contracts (output)
+
+A multi-line report written to stdout. Lines are aligned with two-space leading indentation. The report contains:
+
+1. A header line `Jolli Memory Doctor`.
+2. A horizontal-rule separator.
+3. One line per probe, formatted as `<icon> <name padded to 16 cols> <message>`. Icons are:
+   - `✓` for `ok`,
+   - `⚠` for `warn`,
+   - `✗` for `fail`.
+4. If any probe reported `fail`, a final hint line: `Run with --fix to auto-repair issues.`
+
+The message portion may itself span multiple lines (the dist-paths probe uses an embedded newline + indented `Version:` and `Path:` sub-lines).
+
+## Behavior
+
+### Invocation forms
+
+- `jolli doctor` — run all probes in diagnostic mode. Faults are reported but not changed.
+- `jolli doctor --cwd <dir>` — operate against `<dir>` instead of the auto-resolved git repository root.
+
+### Probes (in execution order)
+
+Each probe produces exactly one line, with three exceptions: the dist-paths probe emits one line per registered source, the plugin probe emits one line per installed plugin (and none when none are installed), and the local-agent probe emits a line only when the local-agent provider is the resolved credential source.
+
+1. **Git hooks** — first checks the repo-wide manual-disable opt-out (spec 145):
+   - `ok` "manually disabled — run `jolli enable` to re-enable" if the opt-out is set (no further check runs).
+   - Otherwise checks whether the project's git hooks are installed:
+     - `ok` "installed" if present.
+     - `fail` "not installed — run `jolli enable` to install" otherwise.
+
+2. **Claude hook** — checks whether the Claude Code agent hook is installed in the user's Claude settings.
+   - `ok` "installed" if present.
+   - `warn` "not installed (optional)" otherwise. Treated as a warning because Claude Code is not required for Jolli Memory to function.
+
+3. **Gemini hook** — same shape as Claude hook, for Gemini CLI.
+   - `ok` "installed" or `warn` "not installed (optional)".
+
+4. **Orphan branch** — checks whether the summary-storage orphan branch exists in the project's git repository.
+   - `ok` "exists" if present.
+   - `warn` "not yet created (will be created on first commit)" otherwise. Treated as a warning because a fresh project legitimately has no summaries yet.
+
+5. **Lock file** — checks whether the queue worker's lock file is held but stale (older than 5 minutes implies the worker crashed without releasing it).
+   - `ok` "not stuck" if absent or fresh.
+   - `fail` "stuck (older than 5 min — Worker probably crashed) — use --fix to release" otherwise.
+
+6. **Sessions** — informational only, never fails.
+   - `ok` "<n> active". Stale sessions are not flagged here — they are handled by `jolli clean`.
+
+7. **Git queue** — checks the count of *active* (non-stale) entries in the git-operation queue.
+   - `ok` "empty" when zero.
+   - `ok` "<n> entries" when between 1 and 10 inclusive.
+   - `warn` "<n> entries (high — Worker may be stuck)" when greater than 10. (Stale entries older than 7 days are *not* counted here — they are handled by `jolli clean`.)
+
+8. **Config** — checks LLM credential availability using the same precedence rules the runtime uses to dispatch LLM calls, so the doctor never disagrees with what the live system would accept.
+   - `ok` "credentials found — Anthropic API key (config)" / "Anthropic API key (ANTHROPIC_API_KEY env)" / "Jolli proxy key", whichever applies.
+   - `warn` "no credentials — summaries will not be generated" otherwise.
+
+9. **Local agent CLI** — a **conditional** probe: it is emitted only when the Config probe above resolved the local-agent source. It exists because for that provider the "credential" is an executable rather than a stored key, so a green Config line only means the provider is *selected*. This probe therefore runs the same executable resolver the runtime would use (honouring the configured agent tool and any explicitly configured executable path — mechanics owned by spec 280) so the doctor can never report healthy while every commit silently fails to find the binary.
+   - `ok` with the resolved executable path and version.
+   - `fail` with the resolver's own error message if no usable executable was found.
+
+   This probe has **no fixer** (spec 60). Installing, upgrading, or signing in to the agent CLI is user action; the interactive repair ladder (spec 291) is the surface that offers it, and it is never reached from `doctor`.
+
+10. **dist-paths** — checks the per-source registry that hooks consult at runtime to find the bundled CLI artifact.
+   - If the registry is empty: a single `fail` line "no sources registered — run `jolli enable`".
+   - Otherwise, one line per registered source, named `dist-paths/<source>`:
+     - `ok` with the source's recorded version and absolute dist directory if the directory currently resolves on disk.
+     - `warn` with the same fields but the path suffixed `(MISSING)` if the directory is gone (a stale registry entry).
+
+11. **Installed plugins** — one line per *non-absent* known plugin package, named `plugin <package name>`. A plugin that is not installed emits no line at all.
+   - `ok` "v`<version>` (installed, compatible)" when the installed version declares no peer requirement or one the running CLI satisfies.
+   - `warn` naming the required CLI range, the running CLI version, and both remedies (upgrade the CLI, or reinstall a compatible plugin) when the declared peer range is unsatisfied.
+
+   This is a **no-load** probe: `ok` means "installed and version-compatible", **not** "loaded successfully". A plugin whose entry point is broken, whose import throws, or whose registration throws is still version-compatible and reads `ok` here — the loader rejects it separately and warns at load time. The row wording says "installed, compatible" rather than "working" precisely to avoid overstating what was verified. This probe has no fixer.
+
+### Final summary line
+
+After all probes, if at least one probe was `fail`, the command prints `Run with --fix to auto-repair issues.` This line is omitted when no failures were reported.
+
+## Exit Codes
+
+| Code | Condition |
+|------|-----------|
+| `0`  | All probes returned `ok` or `warn`. (Warnings do not fail the exit code.) |
+| `1`  | At least one probe returned `fail`. |
+
+Exit code `0` therefore means "Jolli Memory is functional", but does not promise everything is optimal — warnings can still indicate missing optional integrations or empty state.
+
+## Notable Behavior
+
+- **Faults vs. redundant data** — `doctor` deliberately ignores stale sessions, stale queue entries (older than 7 days), and stale squash-pending markers, even though these would be visible to the same code path. They are cleanup concerns, not faults, and belong to `jolli clean`.
+- **The "high queue" threshold is 10 active entries.** It is a heuristic for "the worker is stuck and entries are piling up faster than they're being drained". A queue of exactly 10 is still `ok`.
+- **The lock-file staleness threshold is 5 minutes.** A normal active worker holds the lock for less than 5 minutes; anything older is presumed crashed.
+- **Optional-hook warnings do not affect exit code.** Missing Claude or Gemini hooks emit `warn`, which is treated the same as `ok` for exit-code purposes.
+- **Empty dist-paths registry is `fail`, not `warn`.** Without it the runtime cannot locate the bundle, so this is a hard failure. Stale individual registry entries are `warn` because the other entries may still cover the active install.
+- **The Config probe alone is not sufficient for the local-agent provider.** Because that provider is selected unconditionally with no presence check (spec 10), Config reports `ok` for a machine with no agent CLI at all. The dedicated Local-agent-CLI probe is what makes that state visible, and it is the only probe here that actually spawns a subprocess.
+- **A plugin line's `ok` verdict says "compatible", not "working".** Version compatibility is all this probe checks; load failures surface separately at load time, so a green plugin line does not promise the plugin's commands will run.
+
+## Shared Behavior
+
+- The `--cwd <dir>` flag is shared with most other `jolli` sub-commands. When omitted, the project directory is auto-resolved to the enclosing git repository root.
+- The credential-precedence order used by the Config probe is the same one used by every other place in the CLI that decides which LLM endpoint to call.
+- The dist-paths registry probed here is the same one written by `jolli enable`'s installer.
+- The executable resolution behind the Local-agent-CLI probe (candidate enumeration, capability probe, newest-capable selection, success-only caching) is owned by spec 280. The interactive counterpart that *repairs* an unusable agent CLI or a provider/key mismatch is spec 291; `doctor` only reports these faults and never prompts.
