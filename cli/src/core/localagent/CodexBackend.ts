@@ -1,6 +1,6 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { LOCAL_AGENT_CHILD_ENV } from "../AgentReentry.js";
 import { LOCAL_AGENT_TMP_PREFIX } from "./ClaudeCodeBackend.js";
 import { resolveExecutable } from "./ExecutableResolver.js";
@@ -36,7 +36,9 @@ interface CodexEvent {
 const CODEX_SPEC = {
 	binName: "codex",
 	knownPaths: (home: string, platform: NodeJS.Platform) =>
-		platform === "win32" ? [join(home, ".local/bin/codex.exe")] : [join(home, ".local/bin/codex")],
+		platform === "win32"
+			? [pathWin32.join(home, ".local", "bin", "codex.exe")]
+			: [pathPosix.join(home, ".local/bin/codex")],
 	probeArgs: ["--version"] as const,
 } as const;
 

@@ -1,6 +1,6 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, win32 as pathWin32 } from "node:path";
+import { join, posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { LOCAL_AGENT_CHILD_ENV } from "../AgentReentry.js";
 import { LOCAL_AGENT_TMP_PREFIX } from "./ClaudeCodeBackend.js";
 import { type Candidate, resolveExecutable, type ShimDeps } from "./ExecutableResolver.js";
@@ -84,7 +84,7 @@ function localAppData(home: string, env: NodeJS.ProcessEnv = process.env): strin
 
 /** Install locations to check directly, for when the tool is not on the search PATH. */
 export function cursorKnownPaths(home: string, platform: NodeJS.Platform, env?: NodeJS.ProcessEnv): string[] {
-	if (platform !== "win32") return [join(home, ".local/bin/cursor-agent")];
+	if (platform !== "win32") return [pathPosix.join(home, ".local/bin/cursor-agent")];
 	return [
 		// The installer's own location. `where` finds it only when it is on PATH,
 		// which a GUI-launched editor's minimal PATH often drops.

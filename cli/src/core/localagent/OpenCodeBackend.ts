@@ -1,6 +1,6 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, win32 as pathWin32 } from "node:path";
+import { join, posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { LOCAL_AGENT_CHILD_ENV } from "../AgentReentry.js";
 import { LOCAL_AGENT_TMP_PREFIX } from "./ClaudeCodeBackend.js";
 import { type Candidate, resolveExecutable, type ShimDeps } from "./ExecutableResolver.js";
@@ -38,7 +38,7 @@ const OPENCODE_SPEC = {
 					pathWin32.join(home, ".opencode", "bin", "opencode.exe"),
 					pathWin32.join(home, ".local", "bin", "opencode.exe"),
 				]
-			: [join(home, ".local/bin/opencode")],
+			: [pathPosix.join(home, ".local/bin/opencode")],
 	probeArgs: ["--version"] as const,
 	expandShim: expandOpenCodeShim,
 } as const;

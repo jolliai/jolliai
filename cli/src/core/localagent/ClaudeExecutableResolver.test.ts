@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSyncHidden } from "../../util/Subprocess.js";
 import {
@@ -226,7 +226,9 @@ describe("resolveClaudeExecutable", () => {
 		});
 
 		it("falls through to known install locations when `which` finds nothing", () => {
-			const knownPath = join(homedir(), ".local/bin/claude");
+			// `platform: "linux"` is pinned below, so the expectation must be built with
+			// `path.posix` — the host `join` yields backslashes on a Windows dev machine.
+			const knownPath = pathPosix.join(homedir(), ".local/bin/claude");
 			mockedExecFileSync.mockImplementation((file: unknown) => {
 				if (file === "which") throw new Error("not found");
 				return "2.1.210\n";
@@ -293,7 +295,7 @@ describe("resolveClaudeExecutable", () => {
 		});
 
 		it("falls back to a known .exe install location when `where` finds nothing", () => {
-			const knownExe = join(homedir(), ".local", "bin", "claude.exe");
+			const knownExe = pathWin32.join(homedir(), ".local", "bin", "claude.exe");
 			mockedExecFileSync.mockImplementation((file: unknown) => {
 				if (file === "where") throw new Error("INFO: Could not find files for the given pattern(s).");
 				return "2.1.210\n";

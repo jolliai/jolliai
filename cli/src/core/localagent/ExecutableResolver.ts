@@ -31,6 +31,12 @@ export interface ShimDeps {
 /** Generic shape of a local-agent CLI's discovery + capability-probe rules. */
 export interface ExecutableSpec {
 	readonly binName: string;
+	/**
+	 * Install locations to stat directly, for when the tool is not on the search
+	 * PATH. Build them with `path.win32` / `path.posix` matching the `platform`
+	 * argument — never the host `path` — so a `platform`-pinned unit test yields
+	 * the same string on a Windows dev machine as it does in POSIX CI.
+	 */
 	readonly knownPaths: (home: string, platform: NodeJS.Platform) => string[];
 	readonly probeArgs: readonly string[];
 	/**

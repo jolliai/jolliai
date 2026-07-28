@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { posix as pathPosix, win32 as pathWin32 } from "node:path";
 import {
 	type Candidate,
 	type ProbeFn,
@@ -14,8 +14,11 @@ const CLAUDE_SPEC = {
 	binName: "claude",
 	knownPaths: (home: string, platform: NodeJS.Platform) =>
 		platform === "win32"
-			? [join(home, ".local/bin/claude.exe"), join(home, ".claude/local/claude.exe")]
-			: [join(home, ".local/bin/claude"), join(home, ".claude/local/claude")],
+			? [
+					pathWin32.join(home, ".local", "bin", "claude.exe"),
+					pathWin32.join(home, ".claude", "local", "claude.exe"),
+				]
+			: [pathPosix.join(home, ".local/bin/claude"), pathPosix.join(home, ".claude/local/claude")],
 	// MUST stay in sync with ClaudeCodeBackend.buildInvocation flags.
 	probeArgs: ["--permission-mode", "dontAsk", "--version"] as const,
 } as const;
