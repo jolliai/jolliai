@@ -41,6 +41,18 @@ export async function isCursorInstalled(): Promise<boolean> {
 		);
 		return false;
 	}
+	return isCursorPresent();
+}
+
+/**
+ * Pure filesystem presence check: is Cursor's DB on disk, regardless of whether
+ * THIS runtime can read it? Unlike `isCursorInstalled`, this does NOT gate on
+ * `hasNodeSqliteSupport()`. Used for MCP registration, which only writes a
+ * config file and never reads the SQLite DB — so it must work on Node-18 VS Code
+ * hosts where the transcript-readability gate (correct for session discovery)
+ * would otherwise suppress a host that is genuinely installed.
+ */
+export async function isCursorPresent(): Promise<boolean> {
 	const dbPath = getCursorGlobalDbPath();
 	try {
 		const fileStat = await stat(dbPath);

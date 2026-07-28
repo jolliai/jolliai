@@ -17,34 +17,35 @@
 import { stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { isAntigravityInstalled } from "../core/AntigravityDetector.js";
+import { isAntigravityInstalled, isAntigravityPresent } from "../core/AntigravityDetector.js";
 import { scanAntigravitySessions } from "../core/AntigravitySessionDiscoverer.js";
 import { isClaudeInstalled } from "../core/ClaudeDetector.js";
 import { isClineCliInstalled } from "../core/ClineCliDetector.js";
 import { scanClineCliSessions } from "../core/ClineCliSessionDiscoverer.js";
-import { isClineInstalled } from "../core/ClineDetector.js";
+import { isClineInstalled, isClinePresent } from "../core/ClineDetector.js";
 import { scanClineSessions } from "../core/ClineSessionDiscoverer.js";
 import type { ClineScanError } from "../core/ClineTranscriptShared.js";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
 import { isCopilotChatInstalled } from "../core/CopilotChatDetector.js";
 import { scanCopilotChatSessions } from "../core/CopilotChatSessionDiscoverer.js";
 import type { CopilotChatScanError } from "../core/CopilotChatTranscriptReader.js";
-import { isCopilotInstalled } from "../core/CopilotDetector.js";
+import { isCopilotInstalled, isCopilotPresent } from "../core/CopilotDetector.js";
 import { scanCopilotSessions } from "../core/CopilotSessionDiscoverer.js";
 import {
 	type CursorCliScanError,
 	isCursorCliInstalled,
 	scanCursorCliSessions,
 } from "../core/CursorCliSessionDiscoverer.js";
-import { isCursorInstalled } from "../core/CursorDetector.js";
+import { isCursorInstalled, isCursorPresent } from "../core/CursorDetector.js";
 import { scanCursorSessions } from "../core/CursorSessionDiscoverer.js";
-import { isDevinInstalled, scanDevinSessions } from "../core/DevinSessionDiscoverer.js";
+import { isDevinInstalled, isDevinPresent, scanDevinSessions } from "../core/DevinSessionDiscoverer.js";
 import { isGeminiInstalled } from "../core/GeminiSessionDetector.js";
 import { getProjectRootDir, isInsideGitRepo, listWorktrees, orphanBranchExists } from "../core/GitOps.js";
 import { resolveMemoryBankState } from "../core/KBPathResolver.js";
 import { acquireRepoHooksLock, type StrictLockHandle, withRuntimeRegistryLock } from "../core/Locks.js";
 import {
 	isOpenCodeInstalled,
+	isOpenCodePresent,
 	type OpenCodeScanError,
 	scanOpenCodeSessions,
 } from "../core/OpenCodeSessionDiscoverer.js";
@@ -349,8 +350,35 @@ export async function install(
 		const copilotDetectedOnce = repoHooksOnly ? false : await isCopilotInstalled();
 		const copilotChatDetectedOnce = repoHooksOnly ? false : await isCopilotChatInstalled();
 		const clineDetectedOnce = repoHooksOnly ? false : (await isClineInstalled()) || (await isClineCliInstalled());
-		const devinDetectedOnce = repoHooksOnly ? false : await isDevinInstalled();
-		const antigravityDetectedOnce = repoHooksOnly ? false : await isAntigravityInstalled();
+		// NOTE: Devin and Antigravity have no SQLite-gated auto-enable step inside
+		// install() (unlike OpenCode/Cursor/Copilot below), so their only consumer
+		// here is MCP registration — which keys off the PRESENCE flags below, not a
+		// *DetectedOnce flag. isDevinInstalled/isAntigravityInstalled are still used
+		// by getStatus() for the status tree.
+
+		// MCP-registration presence flags. Distinct from the *DetectedOnce flags
+		// above for the five SQLite-gated hosts (Cursor, OpenCode, Copilot, Devin,
+		// Antigravity): *DetectedOnce answers "is the host installed AND can THIS
+		// runtime read its transcripts" — the right gate for session discovery and
+		// the auto-enable writes below. But MCP registration only writes a config
+		// file; it never reads the DB, so it must key off raw on-disk PRESENCE
+		// instead. Otherwise a Node-18 VS Code host (no built-in node:sqlite) would
+		// silently skip MCP for a host the user genuinely has installed. Hosts that
+		// are not SQLite-gated (Codex, Gemini, Copilot Chat) already work on Node 18,
+		// so they reuse their *DetectedOnce flag directly.
+		//
+		// Cline needs its own present flag for a DIFFERENT reason: it is not
+		// SQLite-gated, but `clineDetectedOnce` above is `extension OR CLI` — and the
+		// Cline CLI ships no MCP config file, so it is not an MCP host. Feeding the
+		// broad flag to MCP would build+run clineRegistrar for a CLI-only user and
+		// write nothing, making `detected.cline` mean "some Cline" while every other
+		// field means "this MCP host is here". isClinePresent() is extension-only.
+		const cursorPresentOnce = repoHooksOnly ? false : await isCursorPresent();
+		const opencodePresentOnce = repoHooksOnly ? false : await isOpenCodePresent();
+		const copilotPresentOnce = repoHooksOnly ? false : await isCopilotPresent();
+		const clinePresentOnce = repoHooksOnly ? false : await isClinePresent();
+		const devinPresentOnce = repoHooksOnly ? false : await isDevinPresent();
+		const antigravityPresentOnce = repoHooksOnly ? false : await isAntigravityPresent();
 
 		// Install .jolli/jollimemory/ state dir (always) and Claude Code hook (if enabled)
 		let claudeResult: HookOpResult = {};
@@ -423,14 +451,14 @@ export async function install(
 			const detected: DetectedHosts = {
 				claude: config.claudeEnabled !== false,
 				codex: codexDetectedOnce,
-				cursor: cursorDetectedOnce,
+				cursor: cursorPresentOnce,
 				gemini: geminiDetectedOnce,
-				opencode: opencodeDetectedOnce,
-				copilot: copilotDetectedOnce,
+				opencode: opencodePresentOnce,
+				copilot: copilotPresentOnce,
 				copilotChat: copilotChatDetectedOnce,
-				cline: clineDetectedOnce,
-				devin: devinDetectedOnce,
-				antigravity: antigravityDetectedOnce,
+				cline: clinePresentOnce,
+				devin: devinPresentOnce,
+				antigravity: antigravityPresentOnce,
 			};
 			// Keep the user's `git status` clean by adding Jolli-managed paths to
 			// `.git/info/exclude`. Worktree-aware: linked worktrees may have their
@@ -477,12 +505,12 @@ export async function install(
 			cursor: false,
 			codex: codexDetectedOnce,
 			gemini: geminiDetectedOnce,
-			opencode: opencodeDetectedOnce,
-			copilot: copilotDetectedOnce,
+			opencode: opencodePresentOnce,
+			copilot: copilotPresentOnce,
 			copilotChat: copilotChatDetectedOnce,
-			cline: clineDetectedOnce,
-			devin: devinDetectedOnce,
-			antigravity: antigravityDetectedOnce,
+			cline: clinePresentOnce,
+			devin: devinPresentOnce,
+			antigravity: antigravityPresentOnce,
 		});
 
 		// Prefer Jolli's skills by default: write a standing rule into each

@@ -94,6 +94,18 @@ export async function isOpenCodeInstalled(): Promise<boolean> {
 		);
 		return false;
 	}
+	return isOpenCodePresent();
+}
+
+/**
+ * Pure filesystem presence check: is OpenCode's DB on disk, regardless of
+ * whether THIS runtime can read it? Unlike `isOpenCodeInstalled`, this does NOT
+ * gate on `hasNodeSqliteSupport()`. Used for MCP registration, which only writes
+ * a config file and never reads the DB — so it must work on Node-18 VS Code
+ * hosts where the SQLite gate would otherwise suppress a host that is genuinely
+ * installed.
+ */
+export async function isOpenCodePresent(): Promise<boolean> {
 	const dbPath = getOpenCodeDbPath();
 	try {
 		const fileStat = await stat(dbPath);

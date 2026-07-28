@@ -443,6 +443,7 @@ describe("cline registrar — per-flavor settings files (mocked writer + detecto
 		vi.doMock("../../core/ClineDetector.js", () => ({
 			getInstalledClineStorageDirs: async () => fakeInstalled,
 			getClineStorageDirs: () => fakeAll,
+			clineMcpSettingsPath: (dir: string) => join(dir, "settings", "cline_mcp_settings.json"),
 		}));
 		upsertMock.mockClear();
 		removeMock.mockClear();

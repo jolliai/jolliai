@@ -12,7 +12,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getClineStorageDirs, getInstalledClineStorageDirs } from "../../core/ClineDetector.js";
+import { clineMcpSettingsPath, getClineStorageDirs, getInstalledClineStorageDirs } from "../../core/ClineDetector.js";
 import { getGlobalConfigDir } from "../../core/SessionTracker.js";
 import { getVscodeUserDataDir } from "../../core/VscodeWorkspaceLocator.js";
 import { createLogger } from "../../Logger.js";
@@ -192,10 +192,13 @@ const copilotChatRegistrar: McpHostRegistrar = {
  * Format live-verified on a real install: top-level key `mcpServers`, entry
  * `{ command, args }` (the settings file already ships as `{"mcpServers": {}}`).
  * The Cline CLI (`~/.cline`) has NO MCP config file, so only the VS Code
- * extension is an MCP host. globalStorage is machine-wide (shared by every
- * workspace), so this is global-scoped. A user may run Cline in more than one
- * flavor (Code, Cursor, …), each with its own settings file — so register()
- * writes every INSTALLED flavor's file, and remove() clears every flavor's.
+ * extension is an MCP host — which is why `detected.cline` is fed by
+ * `isClinePresent()` (extension only) and not by the installer's broader
+ * `clineDetectedOnce` (extension OR CLI). globalStorage is machine-wide (shared
+ * by every workspace), so this is global-scoped. A user may run Cline in more
+ * than one flavor (Code, Cursor, …), each with its own settings file — so
+ * register() writes every PRESENT flavor's file, and remove() clears every
+ * flavor's.
  * Global config — never committed, so gitExcludePaths returns [].
  */
 const clineRegistrar: McpHostRegistrar = {
@@ -203,12 +206,12 @@ const clineRegistrar: McpHostRegistrar = {
 	scope: "global",
 	register: async () => {
 		for (const dir of await getInstalledClineStorageDirs()) {
-			await upsertJsonMcpServer(join(dir, "settings", "cline_mcp_settings.json"), { ...jolliEntry() });
+			await upsertJsonMcpServer(clineMcpSettingsPath(dir), { ...jolliEntry() });
 		}
 	},
 	remove: async () => {
 		for (const dir of getClineStorageDirs()) {
-			await removeJsonMcpServer(join(dir, "settings", "cline_mcp_settings.json"));
+			await removeJsonMcpServer(clineMcpSettingsPath(dir));
 		}
 	},
 	gitExcludePaths: () => [],
@@ -223,6 +226,17 @@ const clineRegistrar: McpHostRegistrar = {
  * Top-level key `mcpServers`; the stdio entry carries a `transport: "stdio"`
  * field (Devin's own envelope — distinct from Antigravity's `type` and OpenCode's
  * `type`). Global config — never committed, so gitExcludePaths returns [].
+ *
+ * ⚠️ Path verified on macOS/Linux only. `~/.config` is hardcoded here, while this
+ * repo's own `getDevinCliDir()` (DevinSessionDiscoverer) resolves Devin's DATA dir
+ * to `%APPDATA%\devin\cli` on win32 — so Windows Devin IS supported elsewhere and
+ * `isDevinPresent()` can return true there. Whether its CONFIG dir also moves to
+ * `%APPDATA%` is unverified (data dir ≠ config dir, and plenty of cross-platform
+ * CLIs keep `~/.config` everywhere), so we don't guess: on Windows this either
+ * lands correctly or leaves one unread file. Confirm against a real Windows
+ * install before adding a branch — the failure mode of guessing wrong is the same
+ * unread file, plus a wrong path baked into the shared helper the OpenCode /
+ * Copilot registrars would then inherit.
  */
 const devinRegistrar: McpHostRegistrar = {
 	host: "devin",
@@ -246,6 +260,9 @@ const devinRegistrar: McpHostRegistrar = {
  * `{ command, args, env? }`). Stdio needs NO `type` field — Antigravity infers
  * it from the presence of `command`. This is the canonical file; the per-variant
  * `~/.gemini/<variant>/mcp_config.json` are symlinks/scaffolds pointing here.
+ * ⚠️ Derived from Antigravity's bundled source + shipped docs; not yet confirmed
+ * by a live smoke test (same confidence tier as copilotChat above — unlike Devin,
+ * verified with a revertible real write, and Cline, verified on a real install).
  * Global config — never committed, so gitExcludePaths returns [].
  */
 const antigravityRegistrar: McpHostRegistrar = {

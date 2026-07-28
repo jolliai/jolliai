@@ -22,6 +22,7 @@ import {
 	discoverDevinSessions,
 	getDevinSessionsDbPath,
 	isDevinInstalled,
+	isDevinPresent,
 	scanDevinSessions,
 	scanDevinSessionsAt,
 } from "./DevinSessionDiscoverer.js";
@@ -124,6 +125,49 @@ describe("DevinSessionDiscoverer", () => {
 			const originalDescriptor = Object.getOwnPropertyDescriptor(process.versions, "node");
 			Object.defineProperty(process.versions, "node", { value: "20.15.0", configurable: true });
 			try {
+				expect(await isDevinInstalled()).toBe(false);
+			} finally {
+				/* v8 ignore next -- Object.getOwnPropertyDescriptor on a standard process field always returns a descriptor on supported runtimes */
+				if (originalDescriptor) Object.defineProperty(process.versions, "node", originalDescriptor);
+			}
+		});
+	});
+
+	describe("isDevinPresent", () => {
+		it("returns true when sessions.db exists", async () => {
+			const dbDir = join(fakeDataHome, "devin", "cli");
+			await mkdir(dbDir, { recursive: true });
+			await writeFile(join(dbDir, "sessions.db"), "");
+			expect(await isDevinPresent()).toBe(true);
+		});
+
+		it("returns false when Devin's data dir does not exist", async () => {
+			expect(await isDevinPresent()).toBe(false);
+		});
+
+		// The MCP gate must fire for "installed but never used": MCP registration
+		// runs only on an explicit `jolli enable` (SessionStart / plugin bootstrap
+		// short-circuits every detector via repoHooksOnly), so keying presence on
+		// sessions.db meant the natural ordering install → enable → start using
+		// silently got no MCP server.
+		it("returns true for the CLI data dir alone, before any session is stored", async () => {
+			await mkdir(join(fakeDataHome, "devin", "cli"), { recursive: true });
+			expect(await isDevinPresent()).toBe(true);
+			// …while `installed` stays false — discovery and the status tree have
+			// nothing to show without a readable DB.
+			expect(await isDevinInstalled()).toBe(false);
+		});
+
+		it("stays true on a runtime below the node:sqlite threshold (unlike isDevinInstalled)", async () => {
+			// Presence is a pure filesystem check for MCP registration, which never
+			// reads the DB — so it is independent of the transcript-readability gate.
+			const dbDir = join(fakeDataHome, "devin", "cli");
+			await mkdir(dbDir, { recursive: true });
+			await writeFile(join(dbDir, "sessions.db"), "");
+			const originalDescriptor = Object.getOwnPropertyDescriptor(process.versions, "node");
+			Object.defineProperty(process.versions, "node", { value: "20.15.0", configurable: true });
+			try {
+				expect(await isDevinPresent()).toBe(true);
 				expect(await isDevinInstalled()).toBe(false);
 			} finally {
 				/* v8 ignore next -- Object.getOwnPropertyDescriptor on a standard process field always returns a descriptor on supported runtimes */

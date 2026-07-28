@@ -21,7 +21,12 @@ vi.mock("./SqliteHelpers.js", async () => ({
 	hasNodeSqliteSupport: mockSqliteSupport,
 }));
 
-import { getCursorGlobalDbPath, getCursorWorkspaceStorageDir, isCursorInstalled } from "./CursorDetector.js";
+import {
+	getCursorGlobalDbPath,
+	getCursorWorkspaceStorageDir,
+	isCursorInstalled,
+	isCursorPresent,
+} from "./CursorDetector.js";
 
 describe("isCursorInstalled (darwin)", () => {
 	let tmpHome: string;
@@ -81,6 +86,37 @@ describe("isCursorInstalled (linux)", () => {
 		await mkdir(globalDir, { recursive: true });
 		await writeFile(join(globalDir, "state.vscdb"), "stub");
 		expect(await isCursorInstalled()).toBe(true);
+	});
+});
+
+describe("isCursorPresent (decoupled from the SQLite gate)", () => {
+	let tmpHome: string;
+
+	beforeEach(async () => {
+		tmpHome = await mkdtemp(join(tmpdir(), "cursor-present-"));
+		mockHomedir.mockReturnValue(tmpHome);
+		mockPlatform.mockReturnValue("darwin");
+	});
+
+	afterEach(async () => {
+		await rm(tmpHome, { recursive: true, force: true });
+	});
+
+	it("returns false when the DB does not exist", async () => {
+		mockSqliteSupport.mockReturnValue(false);
+		expect(await isCursorPresent()).toBe(false);
+	});
+
+	it("returns true when the DB exists EVEN ON a runtime without node:sqlite (Node 18 VS Code host)", async () => {
+		const globalDir = join(tmpHome, "Library/Application Support/Cursor/User/globalStorage");
+		await mkdir(globalDir, { recursive: true });
+		await writeFile(join(globalDir, "state.vscdb"), "stub");
+		// This is the crux of the MCP-registration fix: presence is independent of
+		// the transcript-readability gate. On the same runtime, isCursorInstalled
+		// (gated) reports false while isCursorPresent reports true.
+		mockSqliteSupport.mockReturnValue(false);
+		expect(await isCursorPresent()).toBe(true);
+		expect(await isCursorInstalled()).toBe(false);
 	});
 });
 

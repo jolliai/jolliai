@@ -30,6 +30,7 @@ import {
 	discoverOpenCodeSessions,
 	getOpenCodeDbPath,
 	isOpenCodeInstalled,
+	isOpenCodePresent,
 	scanOpenCodeSessions,
 } from "./OpenCodeSessionDiscoverer.js";
 
@@ -192,6 +193,34 @@ describe("OpenCodeSessionDiscoverer", () => {
 			const originalDescriptor = Object.getOwnPropertyDescriptor(process.versions, "node");
 			Object.defineProperty(process.versions, "node", { value: "20.15.0", configurable: true });
 			try {
+				expect(await isOpenCodeInstalled()).toBe(false);
+			} finally {
+				/* v8 ignore next -- Object.getOwnPropertyDescriptor on a standard process field always returns a descriptor on supported runtimes */
+				if (originalDescriptor) Object.defineProperty(process.versions, "node", originalDescriptor);
+			}
+		});
+	});
+
+	describe("isOpenCodePresent", () => {
+		it("returns true when opencode.db exists", async () => {
+			const dbDir = join(fakeHome, ".local", "share", "opencode");
+			await createOpenCodeDb(dbDir, []);
+			expect(await isOpenCodePresent()).toBe(true);
+		});
+
+		it("returns false when opencode.db does not exist", async () => {
+			expect(await isOpenCodePresent()).toBe(false);
+		});
+
+		it("stays true on a runtime below the node:sqlite threshold (unlike isOpenCodeInstalled)", async () => {
+			// Presence is a pure filesystem check for MCP registration, which never
+			// reads the DB — so it is independent of the transcript-readability gate.
+			const dbDir = join(fakeHome, ".local", "share", "opencode");
+			await createOpenCodeDb(dbDir, []);
+			const originalDescriptor = Object.getOwnPropertyDescriptor(process.versions, "node");
+			Object.defineProperty(process.versions, "node", { value: "20.15.0", configurable: true });
+			try {
+				expect(await isOpenCodePresent()).toBe(true);
 				expect(await isOpenCodeInstalled()).toBe(false);
 			} finally {
 				/* v8 ignore next -- Object.getOwnPropertyDescriptor on a standard process field always returns a descriptor on supported runtimes */

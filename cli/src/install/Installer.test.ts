@@ -70,13 +70,18 @@ vi.mock("./mcp/HostRegistrars.js", async (importOriginal) => {
 // Mock OpenCodeSessionDiscoverer for status/install checks
 vi.mock("../core/OpenCodeSessionDiscoverer.js", () => ({
 	isOpenCodeInstalled: vi.fn().mockResolvedValue(false),
+	isOpenCodePresent: vi.fn().mockResolvedValue(false),
 	discoverOpenCodeSessions: vi.fn().mockResolvedValue([]),
 	scanOpenCodeSessions: vi.fn().mockResolvedValue({ sessions: [] }),
 }));
 
-// Mock CursorDetector for status/install checks
+// Mock CursorDetector for status/install checks. isCursorInstalled (SQLite-gated)
+// drives session discovery / auto-enable; isCursorPresent (pure filesystem) drives
+// MCP registration — kept as separate mocks so a test can exercise the Node-18
+// case where a host is present but unreadable.
 vi.mock("../core/CursorDetector.js", () => ({
 	isCursorInstalled: vi.fn().mockResolvedValue(false),
+	isCursorPresent: vi.fn().mockResolvedValue(false),
 }));
 
 // Mock CursorSessionDiscoverer for status/install checks
@@ -87,6 +92,7 @@ vi.mock("../core/CursorSessionDiscoverer.js", () => ({
 // Mock CopilotDetector for status/install checks
 vi.mock("../core/CopilotDetector.js", () => ({
 	isCopilotInstalled: vi.fn().mockResolvedValue(false),
+	isCopilotPresent: vi.fn().mockResolvedValue(false),
 	getCopilotDbPath: vi.fn().mockReturnValue("/fake/.copilot/session-store.db"),
 }));
 
@@ -108,9 +114,21 @@ vi.mock("../core/CopilotChatSessionDiscoverer.js", () => ({
 	discoverCopilotChatSessions: vi.fn().mockResolvedValue([]),
 }));
 
-// Mock ClineDetector for status/install checks
+// Mock ClineDetector for status/install checks. isClineInstalled ("has the user
+// used Cline") drives status + auto-enable; isClinePresent ("is the VS Code
+// extension there") is the narrower MCP-registration gate — they are mocked
+// independently so a test can exercise one without implying the other.
+// `clineControl.storageDirs` lets a test point the per-flavor globalStorage dirs
+// at a temp dir so the real MCP settings write is observable.
+const { clineControl } = vi.hoisted(() => ({
+	clineControl: { storageDirs: [] as string[] },
+}));
 vi.mock("../core/ClineDetector.js", () => ({
 	isClineInstalled: vi.fn().mockResolvedValue(false),
+	isClinePresent: vi.fn().mockResolvedValue(false),
+	getInstalledClineStorageDirs: vi.fn(async () => clineControl.storageDirs),
+	getClineStorageDirs: vi.fn(() => clineControl.storageDirs),
+	clineMcpSettingsPath: (dir: string) => join(dir, "settings", "cline_mcp_settings.json"),
 }));
 
 // Mock ClineCliDetector for status/install checks
@@ -260,6 +278,8 @@ describe("Installer", () => {
 		originalCwd = process.cwd();
 		// Create .git/hooks directory to simulate a git repo
 		await mkdir(join(tempDir, ".git", "hooks"), { recursive: true });
+		// No Cline flavors by default; the MCP tests below point this at a temp dir.
+		clineControl.storageDirs = [];
 		// Reset integration detector mocks to defaults so state doesn't leak between tests
 		const { isCodexInstalled, discoverCodexSessions } = await import("../core/CodexSessionDiscoverer.js");
 		vi.mocked(isCodexInstalled).mockResolvedValue(false);
@@ -1283,12 +1303,14 @@ describe("Installer", () => {
 
 	describe("multi-host MCP registration", () => {
 		it("registers MCP across detected hosts during enable", async () => {
-			// claude=true (default), cursor=true, gemini=false, codex=false.
+			// claude=true (default), cursor present=true, gemini=false, codex=false.
 			// cursor writes to <wt>/.cursor/mcp.json (tmpdir-safe).
 			// claude writes to <wt>/.mcp.json (tmpdir-safe).
 			// gemini/codex stay false so no real ~/.gemini or ~/.codex is touched.
-			const { isCursorInstalled } = await import("../core/CursorDetector.js");
-			vi.mocked(isCursorInstalled).mockResolvedValue(true);
+			// MCP registration keys off host PRESENCE (isCursorPresent), not the
+			// SQLite-gated isCursorInstalled.
+			const { isCursorPresent } = await import("../core/CursorDetector.js");
+			vi.mocked(isCursorPresent).mockResolvedValue(true);
 
 			const result = await install(tempDir);
 			expect(result.success).toBe(true);
@@ -1309,8 +1331,8 @@ describe("Installer", () => {
 		it("registers non-Claude MCP hosts even when claudeEnabled is false", async () => {
 			// Save config with claudeEnabled=false, then install.
 			await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ claudeEnabled: false }), "utf-8");
-			const { isCursorInstalled } = await import("../core/CursorDetector.js");
-			vi.mocked(isCursorInstalled).mockResolvedValue(true);
+			const { isCursorPresent } = await import("../core/CursorDetector.js");
+			vi.mocked(isCursorPresent).mockResolvedValue(true);
 
 			const result = await install(tempDir);
 			expect(result.success).toBe(true);
@@ -1323,6 +1345,70 @@ describe("Installer", () => {
 			const cursorMcpPath = join(tempDir, ".cursor", "mcp.json");
 			const cursorMcp = JSON.parse(await readFile(cursorMcpPath, "utf-8"));
 			expect(cursorMcp.mcpServers.jollimemory).toBeDefined();
+		});
+
+		it("registers MCP for a host present on disk but unreadable on this runtime (Node-18 VS Code host)", async () => {
+			// Regression guard for the SQLite-gating bug: a VS Code extension host
+			// runs a Node without built-in node:sqlite, so isCursorInstalled (gated)
+			// is false there. MCP registration must still run — it only writes a
+			// config file and never reads the DB — so it keys off isCursorPresent.
+			const { isCursorInstalled, isCursorPresent } = await import("../core/CursorDetector.js");
+			vi.mocked(isCursorInstalled).mockResolvedValue(false); // Node 18: gated → "not installed"
+			vi.mocked(isCursorPresent).mockResolvedValue(true); // …but Cursor IS on disk
+
+			const result = await install(tempDir);
+			expect(result.success).toBe(true);
+
+			// Cursor MCP config IS written despite isCursorInstalled === false.
+			const cursorMcpPath = join(tempDir, ".cursor", "mcp.json");
+			const cursorMcp = JSON.parse(await readFile(cursorMcpPath, "utf-8"));
+			expect(cursorMcp.mcpServers.jollimemory).toBeDefined();
+
+			// …but session discovery is NOT auto-enabled: that path stays gated on
+			// isCursorInstalled, so a runtime that cannot read the DB does not flip
+			// cursorEnabled on. This proves the two concerns are decoupled.
+			// The evidence is that NO global config was persisted at all: the
+			// auto-enable write is the only thing in this flow that would create
+			// config.json, so its absence is a strictly stronger guard than reading
+			// the file behind a catch-all and asserting a missing key (which passes
+			// vacuously whether or not the file exists — verified: it does not).
+			await expect(readFile(join(emptyGlobalDir, "config.json"), "utf-8")).rejects.toThrow(/ENOENT/);
+		});
+
+		it("registers Cline MCP when the VS Code extension is present", async () => {
+			const { isClinePresent } = await import("../core/ClineDetector.js");
+			const flavor = join(fakeHomeDir, "Code", "globalStorage", "saoudrizwan.claude-dev");
+			clineControl.storageDirs = [flavor];
+			vi.mocked(isClinePresent).mockResolvedValue(true);
+
+			expect((await install(tempDir)).success).toBe(true);
+
+			const settings = JSON.parse(await readFile(join(flavor, "settings", "cline_mcp_settings.json"), "utf-8"));
+			expect(settings.mcpServers.jollimemory).toBeDefined();
+		});
+
+		it("does not register Cline MCP for a CLI-only user, even though clineEnabled is auto-enabled", async () => {
+			// The Cline CLI ships no MCP config file, so it is not an MCP host. The
+			// installer's clineDetectedOnce is `extension OR CLI` and drives
+			// auto-enable; MCP must key off the narrower extension-only presence
+			// flag, or detected.cline would mean "some Cline" rather than "this MCP
+			// host is here". Both halves are asserted together so the two flags
+			// cannot be collapsed back into one without failing here.
+			const { isClineInstalled, isClinePresent } = await import("../core/ClineDetector.js");
+			const { isClineCliInstalled } = await import("../core/ClineCliDetector.js");
+			const flavor = join(fakeHomeDir, "Code", "globalStorage", "saoudrizwan.claude-dev");
+			clineControl.storageDirs = [flavor];
+			vi.mocked(isClineInstalled).mockResolvedValue(false); // extension absent
+			vi.mocked(isClinePresent).mockResolvedValue(false); // …so not an MCP host
+			vi.mocked(isClineCliInstalled).mockResolvedValue(true); // but the CLI is there
+
+			expect((await install(tempDir)).success).toBe(true);
+
+			await expect(readFile(join(flavor, "settings", "cline_mcp_settings.json"), "utf-8")).rejects.toThrow(
+				/ENOENT/,
+			);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.clineEnabled).toBe(true);
 		});
 	});
 

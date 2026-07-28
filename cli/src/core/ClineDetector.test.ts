@@ -2,7 +2,20 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { getClineStorageDirs, getInstalledClineStorageDirs, isClineInstalled } from "./ClineDetector.js";
+import {
+	clineMcpSettingsPath,
+	getClineStorageDirs,
+	getInstalledClineStorageDirs,
+	isClineInstalled,
+	isClinePresent,
+} from "./ClineDetector.js";
+
+/** Mimic Cline's McpHub seeding its settings file on first activation. */
+async function seedMcpSettings(storageDir: string): Promise<void> {
+	const path = clineMcpSettingsPath(storageDir);
+	await mkdir(join(storageDir, "settings"), { recursive: true });
+	await writeFile(path, JSON.stringify({ mcpServers: {} }, null, 2), "utf8");
+}
 
 describe("ClineDetector", () => {
 	let home: string;
@@ -46,15 +59,46 @@ describe("ClineDetector", () => {
 	});
 
 	it("getInstalledClineStorageDirs() returns only the flavors that host Cline (no short-circuit)", async () => {
-		// Seed two different flavors (first and third dirs) with taskHistory.json;
-		// the helper must return BOTH, unlike isClineInstalled which stops at the first.
+		// Seed two different flavors (first and third dirs) with the MCP settings
+		// file; the helper must return BOTH, unlike isClineInstalled which stops at
+		// the first.
 		const dirs = getClineStorageDirs(home);
 		for (const idx of [0, 2]) {
-			const stateDir = join(dirs[idx], "state");
-			await mkdir(stateDir, { recursive: true });
-			await writeFile(join(stateDir, "taskHistory.json"), "[]", "utf8");
+			await seedMcpSettings(dirs[idx]);
 		}
 		const installed = await getInstalledClineStorageDirs(home);
 		expect(installed).toEqual([dirs[0], dirs[2]]);
+	});
+
+	// Regression: Cline's McpHub creates settings/cline_mcp_settings.json on first
+	// activation, while state/taskHistory.json only appears once the user has run a
+	// task. Gating MCP registration on taskHistory silently skipped a freshly
+	// installed, never-used Cline.
+	it("getInstalledClineStorageDirs() counts a freshly installed Cline with no task history", async () => {
+		const dirs = getClineStorageDirs(home);
+		await seedMcpSettings(dirs[0]);
+		expect(await getInstalledClineStorageDirs(home)).toEqual([dirs[0]]);
+		// …and that same install is invisible to the usage-based signal.
+		expect(await isClineInstalled(home)).toBe(false);
+	});
+
+	it("getInstalledClineStorageDirs() ignores a flavor that only has task history", async () => {
+		// Inverse guard: taskHistory alone must not be mistaken for the extension —
+		// otherwise we would create a spurious settings file under that flavor.
+		const stateDir = join(getClineStorageDirs(home)[0], "state");
+		await mkdir(stateDir, { recursive: true });
+		await writeFile(join(stateDir, "taskHistory.json"), "[]", "utf8");
+		expect(await getInstalledClineStorageDirs(home)).toEqual([]);
+	});
+
+	it("isClinePresent() is false with no extension and true once any flavor has it", async () => {
+		expect(await isClinePresent(home)).toBe(false);
+		await seedMcpSettings(getClineStorageDirs(home)[1]);
+		expect(await isClinePresent(home)).toBe(true);
+	});
+
+	it("clineMcpSettingsPath() points at the file the MCP registrar writes", () => {
+		const dir = getClineStorageDirs(home)[0];
+		expect(clineMcpSettingsPath(dir)).toBe(join(dir, "settings", "cline_mcp_settings.json"));
 	});
 });

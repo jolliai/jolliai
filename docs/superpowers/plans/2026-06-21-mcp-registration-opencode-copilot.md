@@ -366,7 +366,9 @@ Expected: PASS.
 
 **Interfaces:**
 - Consumes: `isOpenCodeInstalled()` (`../core/OpenCodeSessionDiscoverer.js`, already imported ~line 32), `isCopilotInstalled()` (`../core/CopilotDetector.js`, imported ~line 25), `isCopilotChatInstalled()` (`../core/CopilotChatDetector.js`, imported ~line 22). All three imports already exist in this file.
-- Produces: `detected` now carries all seven hosts.
+- Produces: `detected` now carries all seven hosts. (Historical: seven was the
+  count as of this plan; later work added Cline, Devin, and Antigravity, so
+  `buildRegistrars` dispatches ten today.)
 
 - [ ] **Step 1: Add the detector calls** next to the existing once-before-loop block (after line 188):
 

@@ -70,4 +70,20 @@ describe("CopilotDetector", () => {
 		const { isCopilotInstalled } = await import("./CopilotDetector.js");
 		await expect(isCopilotInstalled()).resolves.toBe(false);
 	});
+
+	it("isCopilotPresent returns true when the DB exists even on a runtime without node:sqlite", async () => {
+		// Presence is decoupled from the SQLite gate so MCP registration (which only
+		// writes a config file) still runs on Node-18 VS Code hosts.
+		vi.spyOn(process.versions, "node", "get").mockReturnValue("18.0.0");
+		vi.mocked(stat).mockResolvedValue({ isFile: () => true } as Awaited<ReturnType<typeof stat>>);
+		const { isCopilotInstalled, isCopilotPresent } = await import("./CopilotDetector.js");
+		await expect(isCopilotPresent()).resolves.toBe(true);
+		await expect(isCopilotInstalled()).resolves.toBe(false);
+	});
+
+	it("isCopilotPresent returns false when the DB is missing", async () => {
+		vi.mocked(stat).mockRejectedValue(Object.assign(new Error("no file"), { code: "ENOENT" }));
+		const { isCopilotPresent } = await import("./CopilotDetector.js");
+		await expect(isCopilotPresent()).resolves.toBe(false);
+	});
 });

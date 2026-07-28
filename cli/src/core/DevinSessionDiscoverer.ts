@@ -105,6 +105,10 @@ export function getDevinSessionsDbPath(home?: string): string {
  * Devin is "installed" when its session DB exists AND the runtime can read
  * SQLite. Gated on hasNodeSqliteSupport() so Node 18 VS Code hosts report
  * "not installed" rather than "detected but 0 sessions".
+ *
+ * Deliberately keyed on the DB rather than the looser {@link isDevinPresent}:
+ * this drives session discovery and the status tree, where a host with no
+ * readable conversations has nothing to show.
  */
 export async function isDevinInstalled(): Promise<boolean> {
 	if (!hasNodeSqliteSupport()) {
@@ -114,8 +118,38 @@ export async function isDevinInstalled(): Promise<boolean> {
 		);
 		return false;
 	}
+	return hasDevinSessionDb();
+}
+
+/** Does Devin CLI's global session DB exist on disk? */
+async function hasDevinSessionDb(): Promise<boolean> {
 	try {
 		return (await stat(getDevinSessionsDbPath())).isFile();
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Pure filesystem presence check for MCP registration: is Devin on this machine
+ * at all, regardless of whether THIS runtime can read its DB? Unlike
+ * `isDevinInstalled`, this does NOT gate on `hasNodeSqliteSupport()` — MCP
+ * registration only writes a config file, so it must work on Node-18 VS Code
+ * hosts where the SQLite gate would otherwise suppress a host the user
+ * genuinely has installed.
+ *
+ * Accepts the CLI's data DIRECTORY, not just `sessions.db`, because MCP is
+ * registered only on an explicit `jolli enable` (the SessionStart / plugin
+ * bootstrap path runs with `repoHooksOnly`, which short-circuits every detector
+ * to false and therefore never self-heals). Keying on the DB alone made the most
+ * natural ordering — install Devin, `jolli enable`, then start using it — miss
+ * MCP until the user happened to enable a second time. The directory exists from
+ * Devin's first run, before any conversation is stored.
+ */
+export async function isDevinPresent(): Promise<boolean> {
+	if (await hasDevinSessionDb()) return true;
+	try {
+		return (await stat(getDevinCliDir())).isDirectory();
 	} catch {
 		return false;
 	}
