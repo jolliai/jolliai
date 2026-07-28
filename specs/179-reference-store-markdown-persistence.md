@@ -43,7 +43,7 @@ Persist each extracted external reference as a single per-reference markdown fil
 For each persisted reference:
 
 - A root directory: the per-project jollimemory directory inside the user's working tree.
-- A per-source subdirectory under the root, named exactly by the source id. A source id is a plain string; the id space is **open** (spec 255) — eleven ids ship as built-in definitions today but the layout does not assume a fixed set.
+- A per-source subdirectory under the root, named exactly by the source id. A source id is a plain string; the id space is **open** (spec 255) — twelve ids ship as built-in definitions today but the layout does not assume a fixed set.
 - A single markdown file inside that subdirectory whose name is `<sanitized-key>.md`, where `<sanitized-key>` is the post-sanitization form of the reference's source-native identifier.
 - Parent directories are created on demand at first write; creation is recursive and idempotent.
 
@@ -155,6 +155,19 @@ Two properties of the cut are load-bearing:
 - It keys on the **sentinel text**, not on the source definition. A reference whose source has been de-registered still parses back to the same body, because the strip does not depend on the writer's registry lookup.
 - It is applied **unconditionally**, to every source, not only to flag-declaring ones.
 
+### Accumulating bodies
+
+A source definition may declare an **accumulate-body** flag (spec 154; one built-in declares it today). Its identity is an act rather than an entity, so successive writes of the same key must *collect* rather than overwrite.
+
+The body of such a source is a list of **entry lines**, one per recorded act, each carrying the act's text and the timestamp it was recorded at, with the text delimited so a text containing the delimiter character still round-trips (the split is taken at the last delimiter occurrence in the line). Entries are emitted newest-first, ordered by timestamp with the text as tie-breaker so the rendered bytes — and therefore the content hash — do not depend on scan order. The same entry text seen twice collapses onto the later timestamp.
+
+Two further properties:
+
+- **The list is capped.** Beyond a fixed maximum the oldest entries are dropped, and the drop is *announced* in the body by a notice line rather than happening silently. The notice is re-derived on every render and is sticky: a body that has ever overflowed keeps its notice even if a later merge would not itself overflow. The cap is chosen for the readability of the human-browsable markdown, not measured against a workload.
+- **Non-entry lines are preserved verbatim.** These files are the user-browsable layer, so any hand-edited line from either side of a merge is kept and hoisted above the entry list rather than discarded by the next machine write. The auto-note block is not one of these: it is cut before the merge ever sees it (see "Parse-time note truncation"), so it can never be folded into an accumulated body.
+
+Reading the newest entry back out of a body is done through the **same entry format the writer emits**, exposed as a helper alongside a source-gated variant that returns nothing for a non-accumulating source. Display surfaces (specs 187, 255) call those helpers; none of them re-derives the entry format locally, which is what keeps the surfaces from drifting apart from the writer or from each other.
+
 ### Canonical content hash
 
 A content-hash function is exposed for downstream guard use. For a given in-memory reference, it computes the SHA-256 hash, in lowercase hexadecimal, of the canonical rendered bytes of the file that the writer would emit for the same reference with the `referencedAt` scalar replaced by the empty string.
@@ -194,18 +207,20 @@ Behaviors are described in the order each call site triggers them.
 
 The caller provides an in-memory reference and the project's working-tree root.
 
+**The caller must hold the project's plans lock across this call** — see "Atomic-write is not provided" below for why this is a requirement rather than a nicety.
+
 1. Compute the sanitized filename key from the reference's source id and native id (see "Sanitized filename key" and "Defensive identity-branch guard"). If the identity-branch guard rejects the native id, the write call propagates the error to the caller and does not touch the filesystem.
 2. Compute the absolute target path `<jollimemory-dir>/references/<source>/<sanitized-key>.md`.
-3. Render the in-memory reference into the canonical bytes (see "Frontmatter format", "Body normalization rule", and — for a flag-declaring source — "Auto-generated note block", which requires a definition-registry lookup on the reference's source id). Capture those bytes and their canonical content hash (see "Canonical content hash") for the return value.
-4. Attempt to read the existing file at the target path.
-   - If the read succeeds, compare the existing bytes against the freshly rendered bytes:
-     - If they match exactly, log a "skipped" debug event and return the target path and content hash without writing.
-     - If they differ, proceed to step 5.
-   - If the read fails for any reason, treat it as "no existing file" and proceed to step 5. The failure is swallowed.
-5. Create the parent directory recursively if it does not exist. A pre-existing directory is not an error.
-6. Write the rendered bytes to the target path. Encoding is UTF-8. The write replaces the file in place (no temp-file rename dance; not atomic against external readers).
-7. Log a "wrote" debug event with the path and rendered byte count.
-8. Return the target path and the content hash.
+3. Attempt to read the existing file at the target path. If the read fails for any reason, treat it as "no existing file". The failure is swallowed.
+4. Determine the **effective reference** to render. For a source declaring the accumulate-body flag, when an existing file was read and parses, the effective reference is the incoming one with its body replaced by the merge of the existing body with the incoming body (see "Accumulating bodies"). For every other source, and for a first write, the effective reference is the incoming one unchanged.
+5. Render the effective reference into the canonical bytes (see "Frontmatter format", "Body normalization rule", and — for a flag-declaring source — "Auto-generated note block", which requires a definition-registry lookup on the reference's source id). Capture those bytes and their canonical content hash (see "Canonical content hash") for the return value.
+6. If the existing bytes match the freshly rendered bytes exactly, log a "skipped" debug event and return the target path and content hash without writing.
+7. Create the parent directory recursively if it does not exist. A pre-existing directory is not an error.
+8. Write the rendered bytes to the target path. Encoding is UTF-8. The write replaces the file in place (no temp-file rename dance; not atomic against external readers).
+9. Log a "wrote" debug event with the path and rendered byte count.
+10. Return the target path and the content hash.
+
+The read must precede the render, not follow it: for an accumulating source the rendered bytes and the returned hash have to describe the *merged* reference, and hashing the pre-merge reference would return a digest of bytes that never reach disk.
 
 ### Read a reference from a file
 
@@ -327,7 +342,7 @@ The directory `<jollimemory-dir>/references/<source>/` is created on the first t
 - **The defensive path-traversal guard never fires on legitimate input.** Real native ids for the identity sources cannot contain `/`, `\`, or `..`. The guard exists solely to defend against future or malicious inputs reaching the file path layer from untrusted-persisted markdown. The error message is intentionally generic ("Refusing unsafe …") and the throw aborts the write before any filesystem syscall.
 - **The hash-suffix on the one collision-prone source is computed over the original native id, not the post-replace form.** A pathological input where two different originals would replace to the same form is still resolved by the hash; the hash never sees the lossy replacement.
 - **Idempotent write is observable through filesystem modification time.** Callers that rely on "did anything change on disk?" by sampling mtime can trust that an unchanged reference does not perturb the mtime. The check is byte-for-byte; even a single-character difference in any persisted scalar or in the post-strip body will cause a rewrite.
-- **Atomic-write is not provided.** A reader racing the writer can see a partially written file. There is no temp-file rename, no fsync, and no advisory lock. This is intentional within this layer; serialization is the caller's responsibility.
+- **Atomic-write is not provided, and for an accumulating source the caller MUST serialize.** A reader racing the writer can see a partially written file. There is no temp-file rename, no fsync, and no advisory lock inside this layer; serialization is the caller's responsibility. For a non-accumulating source that responsibility is soft — the rendered bytes are a pure function of the incoming reference, so two interleaved writers of one key produce identical bytes and the race is harmless. The accumulate-body flag removes that property: the write becomes a read-modify-write, so two writers that both read before either writes each merge into the same pre-merge body and the later write silently drops the other's entries. This is reachable in practice, because an accumulating source's key is the *act* (the tool), not the agent — so independently-scheduled writers (an agent-stop hook and a polling discovery tick) contend for one file. The single caller therefore holds the project's plans lock across the whole write. Note what that lock does *not* cover: the plans-registry writer's per-key merge is a residual mitigation for a failed lock acquisition, and it works only because a registry row is overwritten wholesale; nothing mitigates a lost update on an accumulated body.
 - **The `referencedAt`-zeroed content hash is intentional.** It exists so that re-references of the same logical entity by a later transcript event do not trip the "this reference changed" guard that downstream code uses to decide whether to re-process. Without it, every re-reference would invalidate the guard.
 - **Render and parse share the body-edge-stripping function.** This is intentional. Any change to one MUST be applied to the other in the same change; otherwise the render → parse → render cycle is not byte-stable and the content-hash guard for any reference whose source description carries edge whitespace would mismatch on every commit forever.
 - **The auto-note sentinel is an HTML comment on purpose.** It is invisible in rendered Markdown, so a user browsing the file sees only the horizontal rule and the explanatory blockquote, while the parser still has an unambiguous machine cut-point in the raw text.
@@ -346,7 +361,7 @@ The directory `<jollimemory-dir>/references/<source>/` is created on the first t
 
 ## Shared Behavior
 
-- The source-id model is open (spec 255): a source id is a plain string, eleven built-ins ship today, and the definition registry — not a closed union — decides registered-vs-unregistered. This layer's read path uses only the lenient charset check; the strict registry-membership check lives at the path sinks. Adding a source requires registering a new definition upstream and is out of this layer's scope.
+- The source-id model is open (spec 255): a source id is a plain string, twelve built-ins ship today, and the definition registry — not a closed union — decides registered-vs-unregistered. This layer's read path uses only the lenient charset check; the strict registry-membership check lives at the path sinks. Adding a source requires registering a new definition upstream and is out of this layer's scope.
 - The two consumer flags that gate the auto-note block (track-only; arguments-derived) are declared on the source definition and contractually owned by spec 255; which built-in declares them is spec 154. This layer reads them only to decide whether to emit the note, and never changes any other aspect of its output because of them.
 - The in-memory reference shape (the input to the writer and the output of the reader) is produced by the source-definition engine (spec 255), whose built-in catalog is spec 154, and the transcript extraction pipeline (spec 153). This layer treats the field-list bag as opaque and does not interpret any individual `key`.
 - The canonical content hash produced here is consumed downstream as the "content hash at archive time" guard on the commit-summary side, which decides whether a previously-archived reference's on-disk file is still in sync with what was committed. That consumer is out of scope here.

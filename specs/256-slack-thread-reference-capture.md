@@ -12,7 +12,7 @@ Recognize a Slack thread read out of an AI agent's conversation transcript, reso
 - The one-pass, whole-transcript harvest of pasted permalinks from the user's own conversation turns, and the key used to look one up later.
 - The precedence order used to resolve a thread's shareable link at the moment its read-result is being processed: harvested pasted link, else a link reconstructed from a configured workspace base address, else no link.
 - The normalization of the thread-read result's human-readable text blob into a canonical thread record, including the title-selection rule and its length cap, the reply count, and the full body text.
-- The void-on-no-link rule and why it means no Slack reference is ever persisted without a working link, even though the generic reference record shape allows an absent link for forward compatibility.
+- The void-on-no-link rule and why it means no Slack reference is ever persisted without a working link, even though the generic reference record shape permits an absent link — a permission one source now genuinely exercises (spec 154's `jollimemory`), which is why this spec scopes the rule rather than stating it as a blanket ban.
 - How each of the two supported producers reaches this capture path today, using its own transcript wire-format to harvest pasted permalinks, and how the Codex path's normal point of delivery (the shared pipeline's fallback pairing pass) differs from the Claude path's.
 
 **Boundaries:**
@@ -129,7 +129,11 @@ A thread whose canonical record carries no `url` — because nothing was pasted 
 - Nothing is queued for on-disk persistence.
 - The failure is silent from the transcript-scan's point of view (not a logged error, not a partial/placeholder reference) — from the shared pipeline's perspective this thread-read call simply produced no reference, indistinguishable from a call the recognition layer never matched at all.
 
-This is deliberate: a reference the user can never click through to is considered to carry nothing worth keeping.
+This is deliberate, and the scope of the judgement matters. A Slack thread **has** a shareable link — the workspace it lives in serves one — so failing to resolve it means the capture is *incomplete*, not that the thread is unimportant. A reference whose destination exists but could not be resolved is considered to carry nothing worth keeping.
+
+That reasoning does **not** extend to a source with no external destination at all. `jollimemory` (spec 154) records a consultation of Jolli's own memory: there is no page anywhere to link to, so an absent url is that source's normal and complete shape rather than an unfinished resolution. Such a source declares no url field-spec, is persisted, and its consumers suppress the open-in-browser affordance instead of offering an action that cannot work (spec 153).
+
+Slack's behavior is unchanged by that distinction: its url field stays **required**, and a thread whose link cannot be resolved still voids. The two rules are distinguishable precisely because the definition states which case it is in — a required url spec that fails, versus no url spec at all.
 
 ### Reachable on both producers: the Codex fallback-pairing path
 

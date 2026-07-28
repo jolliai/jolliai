@@ -407,3 +407,132 @@ describe("ClaudeEnvelopeParser tail-rewind with an earlier abandoned call", () =
 		expect(lastLineNumberScanned).toBe(3);
 	});
 });
+
+describe("ClaudeEnvelopeParser jollimemory (self-referential, arguments-derived)", () => {
+	// Envelope shapes below are taken from real transcripts. Notably `recall` arrives
+	// with `input: {}` (it takes no arguments) and its result is ALWAYS offloaded —
+	// 72,378 chars observed, well past the tool-output cap — so the offload path is
+	// this tool's normal case, not an edge case.
+	function jmLines(toolName: string, id: string, input: Record<string, unknown>, resultText: string): string[] {
+		return [
+			JSON.stringify({
+				message: { role: "assistant", content: [{ type: "tool_use", id, name: toolName, input }] },
+			}),
+			JSON.stringify({
+				message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: resultText }] },
+			}),
+		];
+	}
+
+	/** The real offload wording for a recall result, verbatim apart from the path. */
+	function recallOffloadPointer(savedPath: string): string {
+		return `Error: result (72,378 characters across 1 line) exceeds maximum allowed tokens. Output has been saved to ${savedPath}.\nFormat: Plain text\n- For targeted searches (find a string) use \`grep\``;
+	}
+
+	const SEARCH_RESULT = JSON.stringify({
+		hits: [{ id: "commit:3b6dd021", type: "commit", title: "Add Zoom meeting and doc source references" }],
+	});
+
+	it("extracts a search reference from the arguments, ignoring the result", () => {
+		const lines = jmLines(
+			"mcp__jollimemory__search",
+			"jm1",
+			{ query: "reference SourceDefinition adding new source registry ripple", limit: 15 },
+			SEARCH_RESULT,
+		);
+		const { results } = claudeEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("jollimemory");
+		expect(results[0].payload).toEqual({
+			tool: "search",
+			title: "Search",
+			query: "reference SourceDefinition adding new source registry ripple",
+		});
+	});
+
+	it("extracts a decision-timeline reference keyed on its own tool", () => {
+		const lines = jmLines(
+			"mcp__jollimemory__get_decision_timeline",
+			"jm2",
+			{ slug: "mcp-pr-tools" },
+			JSON.stringify({ events: [] }),
+		);
+		const { results } = claudeEnvelopeParser.parse(lines, {});
+		expect(results[0].payload).toEqual({
+			tool: "get_decision_timeline",
+			title: "Decision timeline",
+			query: "mcp-pr-tools",
+		});
+	});
+
+	it("distinguishes a bare recall() from list_branches() — both have an EMPTY input", () => {
+		// THE test that proves the toolName threading. The two inputs are byte-identical,
+		// so nothing but the tool name can tell a captured tool from an ignored one.
+		const recall = claudeEnvelopeParser.parse(
+			jmLines("mcp__jollimemory__recall", "jm3", {}, JSON.stringify({ type: "recall" })),
+			{},
+		).results;
+		expect(recall).toHaveLength(1);
+		expect(recall[0].payload).toEqual({ tool: "recall", title: "Recall", query: "(current branch)" });
+
+		const listed = claudeEnvelopeParser.parse(
+			jmLines("mcp__jollimemory__list_branches", "jm4", {}, JSON.stringify({ branches: [] })),
+			{},
+		).results;
+		expect(listed).toHaveLength(0);
+	});
+
+	it("captures search but not the sibling tools whose names extend it", () => {
+		// `mcp__jollimemory__search` is a startsWith-prefix of both siblings, which is
+		// exactly why the definition declares an `exact` allow-list.
+		for (const sibling of ["search_remote_articles", "search_remote_repo"]) {
+			const { results } = claudeEnvelopeParser.parse(
+				jmLines(`mcp__jollimemory__${sibling}`, `jm-${sibling}`, { query: "x" }, JSON.stringify({ hits: [] })),
+				{},
+			);
+			expect(results).toHaveLength(0);
+		}
+		expect(
+			claudeEnvelopeParser.parse(jmLines("mcp__jollimemory__search", "jm5", { query: "x" }, SEARCH_RESULT), {})
+				.results,
+		).toHaveLength(1);
+	});
+
+	it("recovers a recall whose oversized result was offloaded to a file", () => {
+		const saved = join(freshToolResultsDir(), "mcp-jollimemory-recall-1785210714712.txt");
+		writeFileSync(saved, JSON.stringify({ type: "recall", decisions: ["…"] }));
+		const { results } = claudeEnvelopeParser.parse(
+			jmLines(
+				"mcp__jollimemory__recall",
+				"jm6",
+				{ branch: "feature/mcp-integration" },
+				recallOffloadPointer(saved),
+			),
+			{},
+		);
+		expect(results).toHaveLength(1);
+		// The recovered payload is discarded: the reference is built from the arguments,
+		// which is the whole point of not copying recalled memory back into memory.
+		expect(results[0].payload).toEqual({
+			tool: "recall",
+			title: "Recall",
+			query: "feature/mcp-integration",
+		});
+	});
+
+	it("still captures a recall whose offloaded file is gone", () => {
+		// Offload files are session-scoped temp files, so by the time post-commit
+		// extraction runs the file may well have been cleaned up. For a NON-arguments-
+		// derived source that drops the reference; here `argumentsDerived` hands the
+		// normalizer an empty payload instead, so the act is still recorded. Since every
+		// real recall result is offloaded, this is the path that decides whether recall
+		// is captured at all.
+		const missing = join(freshToolResultsDir(), "mcp-jollimemory-recall-gone.txt");
+		const { results } = claudeEnvelopeParser.parse(
+			jmLines("mcp__jollimemory__recall", "jm7", {}, recallOffloadPointer(missing)),
+			{},
+		);
+		expect(results).toHaveLength(1);
+		expect(results[0].payload).toEqual({ tool: "recall", title: "Recall", query: "(current branch)" });
+	});
+});

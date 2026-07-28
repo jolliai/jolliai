@@ -1,5 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { buildNextMemoryCss } from "./NextMemoryCssBuilder.js";
+import { getSourceMeta, NEUTRAL_SOURCE_COLOR } from "./SourceLabels.js";
+
+describe("buildNextMemoryCss — unknown-source fallback", () => {
+	// Same invariant the sidebar suite pins, asserted independently here: both
+	// webviews' ctxBadge sends an unregistered source to .mem-ctx-badge--reference,
+	// so this rule must carry getSourceMeta's neutral colour in BOTH builders or an
+	// unknown source renders differently in the two surfaces.
+	it("pins the reference fallback hue to getSourceMeta's neutral colour", () => {
+		const css = buildNextMemoryCss();
+		const neutral = getSourceMeta("definitely-not-a-registered-source").color;
+		expect(neutral).toBe(NEUTRAL_SOURCE_COLOR);
+		expect(css).toContain(`.mem-ctx-badge--reference { background: ${neutral}; }`);
+	});
+});
 
 describe("buildNextMemoryCss", () => {
 	it("defines the panel/row/badge classes used by NextMemoryScriptBuilder", () => {

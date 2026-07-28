@@ -15,6 +15,7 @@
  *   writes the bare `/jolli` umbrella there, {@link removeClaudeLegacySkills}
  *   deletes pre-plugin unnamespaced `jolli-*` copies.
  */
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -882,6 +883,53 @@ describe("search template MCP-preferred invocation (lightweight hits)", () => {
 	});
 });
 
+// ─── Per-host tool naming ────────────────────────────────────────────────────
+// One skill file serves every host (`.agents/skills/` is the only write target),
+// so it has to carry BOTH spellings. Codex models a local MCP server as a
+// namespace of bare tool names — `mcp__jollimemory__search` does not exist there
+// — and the templates used to gate the MCP branch on that Claude-only spelling
+// being "available", which sent Codex down the CLI fallback instead. These pin
+// both spellings so neither can be cleaned away as redundant.
+
+describe("skill templates name the MCP tool for every host", () => {
+	for (const [label, build, tool] of [
+		["recall", buildRecallSkillTemplate, "recall"],
+		["search", buildSearchSkillTemplate, "search"],
+	] as const) {
+		it(`${label} template carries the Claude spelling, the Codex namespace, and the bare tool`, () => {
+			const t = build();
+			expect(t).toContain(`mcp__jollimemory__${tool}`);
+			// The namespace, WITHOUT a trailing tool segment — that is the form Codex
+			// actually presents in its tool list.
+			expect(t).toMatch(/`mcp__jollimemory`/);
+			expect(t).toContain("Codex");
+			// Lazy loading is why "I don't see the tool" must not be read as "absent".
+			expect(t).toMatch(/lazil|lazy/i);
+		});
+
+		it(`${label} template gates the CLI fallback on the server, not on one tool spelling`, () => {
+			const t = build();
+			expect(t).toContain("not registered at all");
+			// The old wording keyed the fallback off a missing tool NAME, which is exactly
+			// what mis-fired on Codex.
+			expect(t).not.toContain("If no such tool is available");
+		});
+	}
+
+	it("the jolli menu explains tool DISCOVERY for both hosts, not just the prefix", () => {
+		// This one enumerates tools rather than calling a named one, so its failure mode
+		// is different: a plain `mcp__jollimemory__` prefix scan finds ZERO tools on
+		// Codex, where they are bare names inside the namespace — the menu would render
+		// empty and read as "Jolli MCP is not set up".
+		const t = buildJolliMenuSkillTemplate();
+		expect(t).toContain("mcp__jollimemory__"); // Claude: prefix match
+		expect(t).toMatch(/`mcp__jollimemory`/); // Codex: namespace, no tool segment
+		expect(t).toContain("Codex");
+		expect(t).toMatch(/lazil|lazy/i);
+		expect(t).not.toContain("Surface every tool whose name starts with");
+	});
+});
+
 // ─── No CJK leakage ─────────────────────────────────────────────────────────
 
 describe("English-only", () => {
@@ -1274,5 +1322,66 @@ describe("removeClaudeLegacySkills", () => {
 
 	it("is a no-op when nothing is present", async () => {
 		await expect(removeClaudeLegacySkills(tempDir)).resolves.toBeUndefined();
+	});
+});
+
+// ─── Revision / body lockstep ────────────────────────────────────────────────
+
+describe("skill revision is kept in lockstep with the body", () => {
+	// The installer skips a write when the disk revision EQUALS ours (see the
+	// SkillInstaller header: equal → skip, by the cross-tool lockstep contract). So
+	// editing a body WITHOUT bumping its revision ships nothing — every existing
+	// install keeps the old text forever, silently. That happened: three commits
+	// changed the recall/search/menu bodies and none of them reached disk.
+	//
+	// A content hash was rejected for the write GUARD, because byte-identical content
+	// across CLI/VS Code/IntelliJ is not something to depend on. Using one HERE is a
+	// different job: it only has to notice that a body moved, so whoever moved it is
+	// reminded to bump. The release-version line is stripped so a version bump alone
+	// does not trip it.
+	// Strips the frontmatter's `version: "<SKILL_VERSION>"` line so a routine release bump
+	// doesn't churn every fingerprint below — the point of these is to catch a BODY edit
+	// that forgot its `revision` bump.
+	//
+	// Deliberately un-anchored to the frontmatter block and NOT global: it removes the
+	// first line of that shape anywhere in the template. That is exact today (each
+	// template interpolates SKILL_VERSION once, in its frontmatter). If a body ever grows
+	// a second line of the same shape — e.g. a skill that documents its own version in
+	// prose — the first would be stripped and the second would keep the release version
+	// in the hash, so an unrelated version bump would start failing these tests. Make the
+	// match frontmatter-scoped at that point rather than adding /g, which would also strip
+	// the body's line and hide a real body change.
+	const stableFingerprint = (t: string): string =>
+		createHash("sha256")
+			.update(t.replace(/^[ \t]*version: "[^"]*"[ \t]*$/m, ""))
+			.digest("hex")
+			.slice(0, 12);
+
+	// When a body legitimately changes: bump `revision`, then update `fingerprint`
+	// here. Both, in the same change.
+	const EXPECTED = {
+		recall: { build: buildRecallSkillTemplate, revision: 2, fingerprint: "5baf6ab3b7ce" },
+		search: { build: buildSearchSkillTemplate, revision: 2, fingerprint: "2fa504d6745f" },
+		localRun: { build: buildLocalRunSkillTemplate, revision: 5, fingerprint: "81db78096bb6" },
+		remoteRun: { build: buildRemoteRunSkillTemplate, revision: 4, fingerprint: "9fd34e36c20e" },
+		menu: { build: buildJolliMenuSkillTemplate, revision: 6, fingerprint: "81cc5c34d91e" },
+		pluginMenu: { build: buildPluginJolliMenuSkillTemplate, revision: 7, fingerprint: "e39ea758cfcd" },
+	} as const;
+
+	for (const [name, want] of Object.entries(EXPECTED)) {
+		it(`${name}: body fingerprint still matches revision ${want.revision}`, () => {
+			const body = want.build();
+			expect(body.match(/revision:\s*(\d+)/)?.[1]).toBe(String(want.revision));
+			expect(stableFingerprint(body)).toBe(want.fingerprint);
+		});
+	}
+
+	it("the plugin menu variant outranks the standalone menu", () => {
+		// installPluginJolliMenu overwrites the bare `/jolli` umbrella in place and
+		// relies on its revision being STRICTLY greater — otherwise a pre-upgrade
+		// umbrella lingers, still pointing at the `jolli-*` skills the plugin deletes.
+		// Bumping the standalone menu without bumping this one silently breaks that.
+		const revOf = (t: string) => Number(t.match(/revision:\s*(\d+)/)?.[1]);
+		expect(revOf(buildPluginJolliMenuSkillTemplate())).toBeGreaterThan(revOf(buildJolliMenuSkillTemplate()));
 	});
 });

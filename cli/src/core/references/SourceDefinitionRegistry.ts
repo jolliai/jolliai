@@ -6,9 +6,11 @@
  * separately in `ClaudeEnvelopeParser`'s prefix table and `CodexEnvelopeParser`'s
  * namespace/invocation-tool tables:
  *   - claude: first definition whose `match.claude.prefixes` has a prefix the
- *     tool name starts with; if that definition also declares `acceptSuffix`,
- *     the tool name must end with it too (Notion's "notion-fetch" gate — a
- *     prefix match with the wrong suffix is not a match at all); and if it
+ *     tool name starts with; if that definition declares `exact`, the tool name
+ *     must equal one of those entries (a closed allow-list, for a namespace that
+ *     also hosts tools whose names extend a wanted one); if it declares
+ *     `acceptSuffix`, the tool name must end with it too (Notion's "notion-fetch"
+ *     gate — a prefix match with the wrong suffix is not a match at all); and if it
  *     declares `denySuffixes`, a tool name ending in any of them is rejected
  *     (enumeration tools like `list_issues` that would bulk-capture results).
  *   - codex, with a namespace (function_call path): first definition whose
@@ -16,7 +18,9 @@
  *     `functionCallNames` includes the tool name (disambiguates names like
  *     `_fetch` that are shared across sources).
  *   - codex, without a namespace (invocation-tool path): first definition
- *     whose `match.codex.invocationTools` includes the tool name.
+ *     whose `match.codex.invocationTools` includes the tool name; if that
+ *     definition declares `invocationServer`, the event's reported MCP server
+ *     must equal it (the scope a BARE tool name cannot supply on its own).
  */
 
 import { isObject } from "./guards.js";
@@ -135,10 +139,19 @@ export function validateDefinition(def: unknown): { ok: true; def: SourceDefinit
 	if (!isObject(def.render)) return { ok: false, error: "render must be an object" };
 
 	const reference = def.reference;
-	for (const key of ["nativeId", "title", "url"] as const) {
+	for (const key of ["nativeId", "title"] as const) {
 		const spec = reference[key];
 		if (!isObject(spec)) return { ok: false, error: `reference.${key} is required` };
 		const err = validateTopLevelPipe(spec.pipe, `reference.${key}.pipe`);
+		if (err !== undefined) return { ok: false, error: err };
+	}
+	// `url` is optional at the schema level: a source whose referenced system has no
+	// external destination declares no url spec at all. When declared it is validated
+	// like any other pipe. (A declared-but-unsatisfiable url still voids the reference
+	// at extraction time — that is `extractRef`'s job, not the validator's.)
+	if (reference.url !== undefined) {
+		if (!isObject(reference.url)) return { ok: false, error: "reference.url must be an object" };
+		const err = validateTopLevelPipe(reference.url.pipe, "reference.url.pipe");
 		if (err !== undefined) return { ok: false, error: err };
 	}
 	if (reference.description !== undefined) {
@@ -186,13 +199,24 @@ export class SourceDefinitionRegistry {
 	 * Resolves the definition that owns a tool invocation.
 	 * - `agent === "claude"`: prefix + optional `acceptSuffix` accept + optional `denySuffixes` reject.
 	 * - `agent === "codex"` with `namespace`: `namespaceSuffix` + `functionCallNames` match.
-	 * - `agent === "codex"` without `namespace`: `invocationTools` match.
+	 * - `agent === "codex"` without `namespace`: `invocationTools` match, additionally
+	 *   scoped by `invocationServer` when the matched definition declares one.
+	 *
+	 * `server` is the MCP server an `mcp_tool_call_end` event reported
+	 * (`invocation.server`) and is read ONLY on the no-namespace path. Passing it is
+	 * what lets a definition register BARE tool names safely; omitting it can only
+	 * ever reject (a definition demanding a server never matches a serverless
+	 * lookup), never widen a match.
 	 */
-	match(agent: SourceAgent, toolName: string, namespace?: string): SourceDefinition | undefined {
+	match(agent: SourceAgent, toolName: string, namespace?: string, server?: string): SourceDefinition | undefined {
 		if (agent === "claude") {
 			return this.definitions.find((d) => {
 				const m = d.match.claude;
 				if (m === undefined || !m.prefixes.some((prefix) => toolName.startsWith(prefix))) return false;
+				// `exact` narrows a prefix match to a closed set of tool names. It runs
+				// before the suffix rules because it is strictly stronger: a name that is
+				// not in the allow-list cannot be rescued by any suffix outcome.
+				if (m.exact !== undefined && !m.exact.includes(toolName)) return false;
 				if (m.acceptSuffix !== undefined && !toolName.endsWith(m.acceptSuffix)) return false;
 				if (m.denySuffixes?.some((suffix) => toolName.endsWith(suffix))) return false;
 				return true;
@@ -205,7 +229,15 @@ export class SourceDefinitionRegistry {
 				return m !== undefined && m.namespaceSuffix === namespace && m.functionCallNames.includes(toolName);
 			});
 		}
-		return this.definitions.find((d) => d.match.codex?.invocationTools.includes(toolName));
+		return this.definitions.find((d) => {
+			const m = d.match.codex;
+			if (m === undefined || !m.invocationTools.includes(toolName)) return false;
+			// A definition whose invocationTools are BARE names has no other scope, so
+			// it must be pinned to its server. Fails CLOSED when the event reported no
+			// server: matching a foreign tool into this source is worse than missing
+			// one, and every event this path cares about carries `invocation.server`.
+			return m.invocationServer === undefined || m.invocationServer === server;
+		});
 	}
 }
 

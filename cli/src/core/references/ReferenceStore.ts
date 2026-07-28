@@ -107,12 +107,16 @@ export interface WriteReferenceResult {
  * skips the write to avoid touching mtime.
  *
  * `key` defaults to `sanitizeNativeIdForPath(ref.source, ref.nativeId)`.
+ *
+ * **Callers must hold `withPlansLock`.** For an `accumulateBody` source this is a
+ * read-modify-write (see {@link mergeIntoExistingBody}), so two unsynchronized
+ * writers of the same key each merge into the same pre-merge body and the later
+ * write drops the earlier one's entries. `upsertReferenceEntry` — the only caller —
+ * holds the lock across this call for exactly that reason.
  */
 export async function writeReferenceMarkdown(ref: Reference, cwd: string): Promise<WriteReferenceResult> {
 	const key = sanitizeNativeIdForPath(ref.source, ref.nativeId);
 	const sourcePath = referencePath(cwd, ref.source, key);
-	const content = renderMarkdown(ref);
-	const contentHash = hashReferenceContent(ref);
 
 	let existing: string | undefined;
 	try {
@@ -120,6 +124,15 @@ export async function writeReferenceMarkdown(ref: Reference, cwd: string): Promi
 	} catch {
 		existing = undefined;
 	}
+
+	// The read has to happen BEFORE render/hash: an accumulating source folds the
+	// prior file's body into this write, so both the bytes and the hash must describe
+	// the MERGED reference. Hashing the pre-merge `ref` would return a digest of bytes
+	// that never reach disk.
+	const effective = mergeIntoExistingBody(ref, existing);
+	const content = renderMarkdown(effective);
+	const contentHash = hashReferenceContent(effective);
+
 	if (existing === content) {
 		log.debug("Reference markdown unchanged, skipping write: %s", sourcePath);
 		return { sourcePath, contentHash };
@@ -129,6 +142,27 @@ export async function writeReferenceMarkdown(ref: Reference, cwd: string): Promi
 	await writeFile(sourcePath, content, "utf-8");
 	log.debug("Wrote reference markdown: %s (%d chars)", sourcePath, content.length);
 	return { sourcePath, contentHash };
+}
+
+/**
+ * For an `accumulateBody` source, fold the body already on disk into the incoming
+ * reference; for every other source (and for a first write) return `ref` untouched.
+ *
+ * This is one of two collapse points that must accumulate. The other is
+ * `dedupeKeepLatest` in ReferenceExtractor, and neither is sufficient alone:
+ * dedupe discards same-mapKey duplicates before they ever reach this store, while
+ * the Stop hook re-scans incrementally, so each scan would otherwise overwrite the
+ * file the previous scan wrote.
+ *
+ * `readReferenceMarkdownFromString` strips the auto-note, so the sentinel and its
+ * paragraphs can never be accumulated into the merged body.
+ */
+function mergeIntoExistingBody(ref: Reference, existing: string | undefined): Reference {
+	if (existing === undefined) return ref;
+	if (getRegistry().byId(ref.source)?.accumulateBody !== true) return ref;
+	const prior = readReferenceMarkdownFromString(existing)?.description;
+	if (prior === undefined) return ref;
+	return { ...ref, description: mergeAccumulatedBody(prior, ref.description ?? "") };
 }
 
 /**
@@ -202,6 +236,189 @@ function stripReferenceNote(body: string): string {
 	return idx === -1 ? body : body.slice(0, idx);
 }
 
+// ─── Accumulating bodies (act-shaped sources) ────────────────────────────────
+
+/**
+ * Maximum entries retained in an accumulating reference body. Chosen for the
+ * readability of the human-browsable markdown, not measured against a workload —
+ * a heavy research session WILL exceed it, which is why the drop is announced in
+ * the body rather than happening silently. See {@link mergeAccumulatedBody}.
+ */
+export const ACCUMULATED_BODY_CAP = 20;
+
+/**
+ * One entry line of an accumulating body: "- `<text>` — <timestamp>".
+ *
+ * Anchored, so a hand-written line can never be mistaken for an entry. The text
+ * group is greedy on purpose: a query containing a backtick still round-trips
+ * byte-identically, because the split lands on the LAST "` — " in the line.
+ */
+const ACCUMULATED_ENTRY_RE = /^- `(.+)` — (\S+)$/;
+
+/**
+ * Recognises {@link accumulatedDropNotice} written at ANY cap, so a body that
+ * already announced a drop is re-derived rather than accumulating the notice as a
+ * stray line on every subsequent merge.
+ */
+const ACCUMULATED_DROP_NOTICE_RE = /^> _Older queries beyond the most recent \d+ were dropped\._$/;
+
+function accumulatedDropNotice(cap: number): string {
+	return `> _Older queries beyond the most recent ${cap} were dropped._`;
+}
+
+/**
+ * Render one accumulated body entry.
+ *
+ * Called at extraction time, the only point where the call's body text and its
+ * `referencedAt` are both in hand — no `FieldSpec` can produce this line, because
+ * the timestamp lives on the `Reference` and never appears in the tool payload.
+ * Lifting there (instead of at either merge site) is what lets both merge sites
+ * treat their two inputs as the same shape.
+ *
+ * Whitespace is collapsed because an entry MUST occupy exactly one line: a pasted
+ * multi-line query would otherwise break both the rendered format and the parse back.
+ */
+export function formatAccumulatedEntry(text: string, at: string): string {
+	return `- \`${text.replace(/\s+/g, " ").trim()}\` — ${at}`;
+}
+
+interface AccumulatedEntry {
+	readonly text: string;
+	readonly at: string;
+}
+
+/**
+ * The most recently asked query in an accumulating body, or undefined when the body
+ * holds no entry at all.
+ *
+ * Exists because an accumulating source's row title is its TOOL label (`Search`),
+ * which is identical on every row and every commit — the query is the only part that
+ * carries information, and it lives in the body rather than in any snapshot field.
+ * Display surfaces call this to put it back in front of the user.
+ *
+ * "Newest" is the first entry line: {@link mergeAccumulatedBody} emits them
+ * timestamp-descending, and strays (hand-edited lines) are hoisted above the list,
+ * so the scan skips non-entry lines rather than assuming line 0. Reading through the
+ * same regex the formatter writes is what keeps the pair honest — a caller
+ * re-deriving the split would drift the moment the entry format changes.
+ */
+export function latestAccumulatedQuery(body: string | undefined): string | undefined {
+	if (body === undefined) return undefined;
+	for (const line of body.split("\n")) {
+		const m = ACCUMULATED_ENTRY_RE.exec(line);
+		if (m !== null) return m[1];
+	}
+	return undefined;
+}
+
+/**
+ * {@link latestAccumulatedQuery} gated on the source actually accumulating —
+ * `undefined` for every entity-shaped source, whose body is prose rather than an
+ * entry list and whose row title already carries the information.
+ *
+ * Exists so the gate lives in ONE place: it is applied by the uncommitted tree row
+ * (which derives on the fly) and by the archive snapshot (which freezes the value
+ * onto `ReferenceCommitRef.latestQuery` for the committed view). Those two surfaces
+ * previously disagreed — the committed row showed a bare date — and re-deriving the
+ * rule per surface is how they drifted.
+ */
+export function accumulatedQueryOf(source: SourceId, body: string | undefined): string | undefined {
+	if (getRegistry().byId(source)?.accumulateBody !== true) return undefined;
+	return latestAccumulatedQuery(body);
+}
+
+interface ParsedAccumulatedBody {
+	readonly entries: ReadonlyArray<AccumulatedEntry>;
+	/**
+	 * Lines that are not entries — a hand-edit. These files are the human-browsable
+	 * layer, so a user's own text is preserved verbatim rather than discarded by the
+	 * next machine write.
+	 */
+	readonly strays: ReadonlyArray<string>;
+	readonly hadDropNotice: boolean;
+}
+
+function parseAccumulatedBody(body: string): ParsedAccumulatedBody {
+	const entries: AccumulatedEntry[] = [];
+	const strays: string[] = [];
+	let hadDropNotice = false;
+	for (const line of body.split("\n")) {
+		// Blank separators and the drop notice are re-derived on render, so neither is
+		// carried forward as content.
+		if (line.trim().length === 0) continue;
+		if (ACCUMULATED_DROP_NOTICE_RE.test(line)) {
+			hadDropNotice = true;
+			continue;
+		}
+		const m = ACCUMULATED_ENTRY_RE.exec(line);
+		if (m === null) {
+			strays.push(line);
+			continue;
+		}
+		entries.push({ text: m[1], at: m[2] });
+	}
+	return { entries, strays, hadDropNotice };
+}
+
+/**
+ * Merge two accumulating reference bodies into one, newest entry first.
+ *
+ * Both sides are expected in entry-line form (see {@link formatAccumulatedEntry}).
+ * Semantics:
+ *   - the same text asked twice is ONE entry, stamped at the later of the two times
+ *     (one query repeated is one fact; two different queries are two facts, which is
+ *     the whole reason an accumulating source does not overwrite);
+ *   - entries sort by timestamp descending, ties broken by text so the output is
+ *     deterministic regardless of input order;
+ *   - at most `cap` entries survive, and dropping any is announced in the body —
+ *     stickily, so the notice does not flicker off on a later merge that happens not
+ *     to overflow;
+ *   - non-entry lines from either side are hoisted above the list, verbatim.
+ *
+ * Timestamps compare as strings: `referencedAt` is ISO-8601 UTC throughout, where
+ * lexicographic and chronological order coincide — the same assumption
+ * `dedupeKeepLatest` already makes.
+ */
+export function mergeAccumulatedBody(
+	existingBody: string,
+	incomingBody: string,
+	cap: number = ACCUMULATED_BODY_CAP,
+): string {
+	const existing = parseAccumulatedBody(existingBody);
+	const incoming = parseAccumulatedBody(incomingBody);
+
+	const latestByText = new Map<string, string>();
+	for (const entry of [...existing.entries, ...incoming.entries]) {
+		const prior = latestByText.get(entry.text);
+		if (prior === undefined || entry.at > prior) latestByText.set(entry.text, entry.at);
+	}
+
+	const ordered = [...latestByText].sort(([textA, atA], [textB, atB]) =>
+		atA === atB ? (textA < textB ? -1 : 1) : atA < atB ? 1 : -1,
+	);
+	const kept = ordered.slice(0, cap);
+	const dropped = ordered.length - kept.length;
+	if (dropped > 0) {
+		// The body announces the drop to the human reading the file; this announces it
+		// to whoever is diagnosing why a query they remember asking isn't listed. A cap
+		// that trims silently in the log reads as "everything was kept".
+		log.debug("Accumulated reference body over cap: keeping %d of %d entries", kept.length, ordered.length);
+	}
+
+	const lines: string[] = [];
+	const strays = [...existing.strays, ...incoming.strays];
+	if (strays.length > 0) lines.push(...strays, "");
+	lines.push(...kept.map(([text, at]) => formatAccumulatedEntry(text, at)));
+	// Sticky from EITHER side: a body that already announced a drop must keep saying so
+	// even if this particular merge happens not to overflow. Reading only `existing`
+	// would lose the notice when the already-trimmed body arrives as the incoming side
+	// (the in-memory dedupe can produce one before the store folds it against disk).
+	if (existing.hadDropNotice || incoming.hadDropNotice || dropped > 0) {
+		lines.push("", accumulatedDropNotice(cap));
+	}
+	return lines.join("\n");
+}
+
 /**
  * Sentinel opening the auto-generated human note for track-only / arguments-derived
  * references. It's an HTML comment (invisible in rendered markdown) that acts as the
@@ -232,8 +449,14 @@ function referenceNote(def: SourceDefinition | undefined): string {
 	// so there is no separator branch to leave uncovered.
 	const paragraphs: string[] = [];
 	if (def.argumentsDerived === true) {
+		// A source that declares NO url spec has no external destination at all, so
+		// promising a link the user can never follow would be simply false. Keyed on the
+		// definition (not on a Reference instance) so the note stays byte-identical
+		// across renders — the property the render↔parse round-trip depends on.
+		const recorded =
+			def.reference.url === undefined ? "Only the query is" : `Only the query and the ${def.label} link are`;
 		paragraphs.push(
-			`> ℹ️ **This is a bookmark, not a full copy.** Only the query and the ${def.label} link are recorded here — ${def.label}'s full response is intentionally not saved. This is expected behaviour, not a bug.`,
+			`> ℹ️ **This is a bookmark, not a full copy.** ${recorded} recorded here — ${def.label}'s full response is intentionally not saved. This is expected behaviour, not a bug.`,
 		);
 	}
 	if (def.trackOnly === true) {

@@ -16,6 +16,7 @@ import { confluenceCodexBinding } from "./CodexConfluenceBinding.js";
 import { context7CodexBinding } from "./CodexContext7Binding.js";
 import { githubCodexBinding } from "./CodexGitHubBinding.js";
 import { jiraCodexBinding } from "./CodexJiraBinding.js";
+import { jolliMemoryCodexBinding } from "./CodexJolliMemoryBinding.js";
 import { linearCodexBinding } from "./CodexLinearBinding.js";
 import { mondayCodexBinding } from "./CodexMondayBinding.js";
 import { notionCodexBinding } from "./CodexNotionBinding.js";
@@ -36,6 +37,7 @@ const CODEX_NORMALIZERS: readonly CodexNormalizer[] = [
 	mondayCodexBinding,
 	slackCodexBinding,
 	context7CodexBinding,
+	jolliMemoryCodexBinding,
 ];
 
 const BY_ID: ReadonlyMap<SourceId, CodexNormalizer> = new Map(CODEX_NORMALIZERS.map((n) => [n.id, n]));

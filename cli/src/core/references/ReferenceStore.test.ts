@@ -1,18 +1,69 @@
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// A source flagged `accumulateBody` with NO `reference.url` — the two traits this
+// module's accumulation path branches on. Synthetic rather than the shipped
+// `jollimemory` definition on purpose: these are store-level tests, and pinning them to
+// a real source's id would make an unrelated edit to that definition fail them.
+// Extending is safe: no other test in this file references this id, and every shipped
+// definition is left exactly as loaded.
+const { ACCUMULATING_DEF } = vi.hoisted(() => ({
+	ACCUMULATING_DEF: {
+		id: "acctest",
+		label: "Acc Test",
+		icon: "history",
+		trackOnly: true,
+		argumentsDerived: true,
+		accumulateBody: true,
+		match: { claude: { prefixes: ["mcp__acctest__"] } },
+		wrapperKeys: [],
+		reference: {
+			nativeId: { pipe: [{ op: "path", path: "tool" }] },
+			title: { pipe: [{ op: "path", path: "tool" }] },
+			description: { pipe: [{ op: "path", path: "query" }], optional: true },
+		},
+		fields: [],
+		storage: { nativeIdPathSafe: true },
+		render: {
+			wrapperTag: "acc-tests",
+			itemTag: "lookup",
+			bodyTag: "queries",
+			maxCharsPerReference: 2000,
+			maxTotalChars: 6000,
+		},
+	} as unknown as import("./SourceDefinition.js").SourceDefinition,
+}));
+
+vi.mock("./SourceDefinitionRegistry.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./SourceDefinitionRegistry.js")>();
+	let patched: SourceDefinitionRegistry | undefined;
+	return {
+		...actual,
+		getRegistry: (): SourceDefinitionRegistry => {
+			patched ??= new actual.SourceDefinitionRegistry([...actual.getRegistry().all(), ACCUMULATING_DEF]);
+			return patched;
+		},
+	};
+});
 
 import type { Reference } from "../../Types.js";
 import {
+	ACCUMULATED_BODY_CAP,
+	accumulatedQueryOf,
 	deleteReferenceMarkdown,
+	formatAccumulatedEntry,
 	hashReferenceContent,
+	latestAccumulatedQuery,
+	mergeAccumulatedBody,
 	readReferenceMarkdown,
 	referenceDir,
 	referencePath,
 	sanitizeNativeIdForPath,
 	writeReferenceMarkdown,
 } from "./ReferenceStore.js";
+import type { SourceDefinitionRegistry } from "./SourceDefinitionRegistry.js";
 
 const fieldVal = (r: Reference | null | undefined, key: string): string | undefined =>
 	r?.fields?.find((f) => f.key === key)?.value;
@@ -69,6 +120,22 @@ function context7Ref(overrides: Partial<Reference> = {}): Reference {
 		...overrides,
 	};
 }
+
+/** An accumulating, url-less reference whose body is already in entry-line form. */
+function accRef(overrides: Partial<Reference> = {}): Reference {
+	return {
+		mapKey: "acctest:search",
+		source: "acctest",
+		nativeId: "search",
+		title: "Search",
+		referencedAt: "2026-07-28T08:51:40.000Z",
+		toolName: "mcp__acctest__search",
+		description: formatAccumulatedEntry("folder storage dual write", "2026-07-28T08:51:40.000Z"),
+		...overrides,
+	};
+}
+
+const entry = (text: string, at: string): string => formatAccumulatedEntry(text, at);
 
 describe("ReferenceStore", () => {
 	let tempDir: string;
@@ -639,6 +706,235 @@ describe("ReferenceStore", () => {
 			const { sourcePath: sp2 } = await writeReferenceMarkdown(back as Reference, tempDir);
 			const back2 = await readReferenceMarkdown(sp2);
 			expect((back2 as Reference).description).toBe(context7Ref().description);
+		});
+
+		it("promises a link only when the source has one to offer", async () => {
+			// context7 declares a url spec → the note may name the link.
+			const { sourcePath: withUrl } = await writeReferenceMarkdown(context7Ref(), tempDir);
+			expect(await readFile(withUrl, "utf-8")).toContain(
+				"Only the query and the Context7 link are recorded here",
+			);
+
+			// The accumulating source declares NO url spec — there is no destination at
+			// all, so claiming a link exists would simply be false.
+			const { sourcePath: noUrl } = await writeReferenceMarkdown(accRef(), tempDir);
+			const content = await readFile(noUrl, "utf-8");
+			expect(content).toContain("Only the query is recorded here");
+			expect(content).not.toContain("link are recorded here");
+			// The rest of the note is unchanged for both.
+			expect(content).toContain("bookmark, not a full copy");
+			expect(content).toContain("Track-only");
+		});
+	});
+
+	describe("mergeAccumulatedBody", () => {
+		const T1 = "2026-07-28T08:51:40.000Z";
+		const T2 = "2026-07-28T09:14:02.000Z";
+
+		it("returns the incoming body unchanged when there is nothing to merge into", () => {
+			expect(mergeAccumulatedBody("", entry("queue worker lock", T1))).toBe(entry("queue worker lock", T1));
+		});
+
+		it("keeps two distinct entries, newest first", () => {
+			const merged = mergeAccumulatedBody(entry("folder storage", T1), entry("queue worker lock", T2));
+			expect(merged).toBe([entry("queue worker lock", T2), entry("folder storage", T1)].join("\n"));
+		});
+
+		it("collapses the same query asked twice onto the later timestamp", () => {
+			const merged = mergeAccumulatedBody(entry("queue worker lock", T1), entry("queue worker lock", T2));
+			expect(merged).toBe(entry("queue worker lock", T2));
+		});
+
+		it("breaks a timestamp tie on the query text so the order is deterministic", () => {
+			// Both orderings of the same pair must render identically — otherwise the
+			// rendered bytes (and so the content hash) would depend on scan order.
+			const ab = mergeAccumulatedBody(entry("alpha", T1), entry("beta", T1));
+			const ba = mergeAccumulatedBody(entry("beta", T1), entry("alpha", T1));
+			expect(ab).toBe([entry("alpha", T1), entry("beta", T1)].join("\n"));
+			expect(ba).toBe(ab);
+		});
+
+		it("caps the list at ACCUMULATED_BODY_CAP entries, dropping the oldest", () => {
+			const older = Array.from({ length: ACCUMULATED_BODY_CAP }, (_v, i) =>
+				entry(`query ${i}`, `2026-07-28T08:${String(i).padStart(2, "0")}:00.000Z`),
+			).join("\n");
+			const merged = mergeAccumulatedBody(older, entry("newest", T2));
+			const lines = merged.split("\n").filter((l) => l.startsWith("- "));
+			expect(lines).toHaveLength(ACCUMULATED_BODY_CAP);
+			expect(lines[0]).toBe(entry("newest", T2));
+			// "query 0" is the oldest of the 21 and is the one that falls off.
+			expect(merged).not.toContain("query 0");
+			expect(merged).toContain("query 1");
+		});
+
+		it("announces a drop rather than losing entries silently", () => {
+			const older = Array.from({ length: ACCUMULATED_BODY_CAP }, (_v, i) =>
+				entry(`query ${i}`, `2026-07-28T08:${String(i).padStart(2, "0")}:00.000Z`),
+			).join("\n");
+			const merged = mergeAccumulatedBody(older, entry("newest", T2));
+			expect(merged).toContain(`> _Older queries beyond the most recent ${ACCUMULATED_BODY_CAP} were dropped._`);
+		});
+
+		it("keeps the drop notice sticky across a later merge that does not itself overflow", () => {
+			// A merge whose incoming query is a duplicate does not overflow the cap, but
+			// entries WERE dropped earlier — retracting the notice would be dishonest.
+			const capped = mergeAccumulatedBody(
+				Array.from({ length: ACCUMULATED_BODY_CAP }, (_v, i) =>
+					entry(`query ${i}`, `2026-07-28T08:${String(i).padStart(2, "0")}:00.000Z`),
+				).join("\n"),
+				entry("newest", T2),
+			);
+			const again = mergeAccumulatedBody(capped, entry("newest", T2));
+			expect(again.split("\n").filter((l) => l.startsWith("- "))).toHaveLength(ACCUMULATED_BODY_CAP);
+			expect(again).toContain("were dropped._");
+			// Announced exactly once — the notice is re-derived, never accumulated.
+			expect(again.split("were dropped._")).toHaveLength(2);
+		});
+
+		it("preserves a hand-edited line above the machine-managed list", () => {
+			const handEdited = ["my note: this one mattered", "", entry("folder storage", T1)].join("\n");
+			const merged = mergeAccumulatedBody(handEdited, entry("queue worker lock", T2));
+			expect(merged).toBe(
+				["my note: this one mattered", "", entry("queue worker lock", T2), entry("folder storage", T1)].join(
+					"\n",
+				),
+			);
+		});
+
+		it("treats a wholly non-conforming body as a hand-edit rather than discarding it", () => {
+			const merged = mergeAccumulatedBody("just some prose", entry("queue worker lock", T2));
+			expect(merged).toBe(["just some prose", "", entry("queue worker lock", T2)].join("\n"));
+		});
+
+		it("stays note-free — the auto-note is stripped before it ever reaches the merge", () => {
+			// readReferenceMarkdownFromString (used by the store seam) cuts the sentinel,
+			// so a merge never sees it; assert the helper does not reintroduce one.
+			const merged = mergeAccumulatedBody(entry("folder storage", T1), entry("queue worker lock", T2));
+			expect(merged).not.toContain("jolli:auto-note");
+			expect(merged).not.toContain("bookmark");
+		});
+
+		it("collapses whitespace so a multi-line query still occupies one entry line", () => {
+			const formatted = formatAccumulatedEntry("  queue\nworker   lock\t", "2026-07-28T09:14:02.000Z");
+			expect(formatted).toBe(entry("queue worker lock", T2));
+			// …and therefore survives a merge round-trip as a single recognised entry.
+			expect(mergeAccumulatedBody(formatted, "")).toBe(formatted);
+		});
+
+		it("round-trips a query containing a backtick", () => {
+			const merged = mergeAccumulatedBody(entry("what does `queueWorker` lock", T1), "");
+			expect(merged).toBe(entry("what does `queueWorker` lock", T1));
+		});
+	});
+
+	describe("latestAccumulatedQuery / accumulatedQueryOf", () => {
+		const T1 = "2026-07-28T08:51:40.000Z";
+		const T2 = "2026-07-28T09:14:02.000Z";
+		const body = mergeAccumulatedBody(entry("folder storage", T1), entry("queue worker lock", T2));
+
+		it("returns the newest entry, which merge emits first", () => {
+			expect(latestAccumulatedQuery(body)).toBe("queue worker lock");
+		});
+
+		it("skips hand-edited strays rather than assuming line 0", () => {
+			// Strays are hoisted ABOVE the entry list, so a line-0 read would return the
+			// user's own prose as though it were a query.
+			const handEdited = mergeAccumulatedBody(`note to self\n${body}`, "");
+			expect(handEdited.split("\n")[0]).toBe("note to self");
+			expect(latestAccumulatedQuery(handEdited)).toBe("queue worker lock");
+		});
+
+		it("returns undefined for an absent body and for one holding no entry", () => {
+			expect(latestAccumulatedQuery(undefined)).toBeUndefined();
+			expect(latestAccumulatedQuery("just some prose")).toBeUndefined();
+		});
+
+		it("survives a query containing a backtick — the split lands on the LAST '` — '", () => {
+			expect(latestAccumulatedQuery(entry("what does `queueWorker` lock", T1))).toBe(
+				"what does `queueWorker` lock",
+			);
+		});
+
+		it("accumulatedQueryOf gates on the source: derived for accumulating, undefined otherwise", () => {
+			// The gate is what keeps the two display surfaces (uncommitted tree row,
+			// archived `latestQuery` snapshot) from disagreeing about which sources
+			// show a query at all.
+			expect(accumulatedQueryOf("acctest", body)).toBe("queue worker lock");
+			// An entity-shaped source's body is prose, not an entry list — it must not be
+			// mined for something that looks like one.
+			expect(accumulatedQueryOf("linear", body)).toBeUndefined();
+		});
+	});
+
+	describe("writeReferenceMarkdown — accumulating bodies", () => {
+		const T1 = "2026-07-28T08:51:40.000Z";
+		const T2 = "2026-07-28T09:14:02.000Z";
+
+		it("merges the prior body instead of overwriting it", async () => {
+			await writeReferenceMarkdown(
+				accRef({ description: entry("folder storage", T1), referencedAt: T1 }),
+				tempDir,
+			);
+			const { sourcePath } = await writeReferenceMarkdown(
+				accRef({ description: entry("queue worker lock", T2), referencedAt: T2 }),
+				tempDir,
+			);
+			const content = await readFile(sourcePath, "utf-8");
+			expect(content).toContain("folder storage");
+			expect(content).toContain("queue worker lock");
+		});
+
+		it("round-trips the merged body through render → parse unchanged", async () => {
+			await writeReferenceMarkdown(
+				accRef({ description: entry("folder storage", T1), referencedAt: T1 }),
+				tempDir,
+			);
+			const { sourcePath, contentHash } = await writeReferenceMarkdown(
+				accRef({ description: entry("queue worker lock", T2), referencedAt: T2 }),
+				tempDir,
+			);
+			const back = await readReferenceMarkdown(sourcePath);
+			expect(back).not.toBeNull();
+			expect((back as Reference).description).toBe(
+				[entry("queue worker lock", T2), entry("folder storage", T1)].join("\n"),
+			);
+			// The returned hash must describe the bytes actually on disk — i.e. the MERGED
+			// reference, not the pre-merge one that was handed in.
+			expect(hashReferenceContent(back as Reference)).toBe(contentHash);
+		});
+
+		it("still overwrites for a non-accumulating source (regression)", async () => {
+			await writeReferenceMarkdown(context7Ref({ description: "first query" }), tempDir);
+			const { sourcePath } = await writeReferenceMarkdown(context7Ref({ description: "second query" }), tempDir);
+			const content = await readFile(sourcePath, "utf-8");
+			expect(content).toContain("second query");
+			expect(content).not.toContain("first query");
+		});
+
+		it("keeps the prior body when the incoming reference carries none", async () => {
+			await writeReferenceMarkdown(
+				accRef({ description: entry("folder storage", T1), referencedAt: T1 }),
+				tempDir,
+			);
+			const bodyless = accRef({ referencedAt: T2 });
+			delete (bodyless as { description?: string }).description;
+			const { sourcePath } = await writeReferenceMarkdown(bodyless, tempDir);
+			const back = await readReferenceMarkdown(sourcePath);
+			expect((back as Reference).description).toBe(entry("folder storage", T1));
+		});
+
+		it("writes the incoming body verbatim when the file on disk has an empty body", async () => {
+			// A prior write with no body parses back with `description: undefined`, so there
+			// is nothing to merge and the incoming entry stands alone.
+			const bodyless = accRef({ referencedAt: T1 });
+			delete (bodyless as { description?: string }).description;
+			await writeReferenceMarkdown(bodyless, tempDir);
+			const { sourcePath } = await writeReferenceMarkdown(
+				accRef({ description: entry("queue worker lock", T2), referencedAt: T2 }),
+				tempDir,
+			);
+			const back = await readReferenceMarkdown(sourcePath);
+			expect((back as Reference).description).toBe(entry("queue worker lock", T2));
 		});
 	});
 });

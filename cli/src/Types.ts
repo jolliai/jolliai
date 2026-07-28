@@ -801,7 +801,8 @@ export type KnownSourceId =
 	| "zoom-doc"
 	| "asana"
 	| "monday"
-	| "context7";
+	| "context7"
+	| "jollimemory";
 
 /**
  * ReferenceField — one displayable field produced by a `SourceDefinition`'s `fields` pipes.
@@ -838,7 +839,15 @@ export interface Reference {
 	/** Stable id native to the source (Linear ticket id, Jira key, `owner/repo#number`, 32-hex Notion page id). */
 	readonly nativeId: string;
 	readonly title: string;
-	/** Optional in the type as a forward-compat allowance for a url-optional source definition; every source shipping today marks `url` as required in its FieldSpec, so an extracted reference always carries one. */
+	/**
+	 * Absent in two distinct ways, both live today:
+	 *   - the definition declares NO `reference.url` spec at all, because the source has
+	 *     no external destination (`jollimemory` records a local memory lookup);
+	 *   - the definition declares one and it did not resolve (Slack with no permalink) —
+	 *     there the link exists and we failed to find it, which voids the reference.
+	 * Every other shipping source marks `url` required in its FieldSpec, so its extracted
+	 * references always carry one.
+	 */
 	readonly url?: string;
 	readonly description?: string;
 	/** Opaque, source-specific display fields. Built and consumed only by the adapter. */
@@ -862,7 +871,7 @@ export interface ReferenceEntry {
 	readonly source: SourceId;
 	readonly nativeId: string;
 	readonly title: string;
-	/** Absent only when the source `Reference.url` was absent (e.g. Slack with no permalink). */
+	/** Absent when the source `Reference.url` was — a url-less source (`jollimemory`) or an unresolved one (Slack with no permalink). See `Reference.url`. */
 	readonly url?: string;
 	/** Absolute path to `<jolliMemoryDir>/references/<source>/<sanitized-key>.md`. */
 	readonly sourcePath: string;
@@ -884,10 +893,22 @@ export interface ReferenceCommitRef {
 	readonly source: SourceId;
 	readonly nativeId: string;
 	readonly title: string;
-	/** Absent only when the source `Reference.url` was absent (e.g. Slack with no permalink). */
+	/** Absent when the source `Reference.url` was — a url-less source (`jollimemory`) or an unresolved one (Slack with no permalink). See `Reference.url`. */
 	readonly url?: string;
 	/** Opaque, source-specific display fields — snapshot of the Reference's `fields` at archive time. */
 	readonly fields?: ReadonlyArray<ReferenceField>;
+	/**
+	 * Newest query text of an `accumulateBody` source, snapshotted at archive time via
+	 * `accumulatedQueryOf`. Absent for every entity-shaped source.
+	 *
+	 * Needed because an accumulating source's title is its TOOL label (`Search`) —
+	 * identical on every row of every commit — while the part that carries information
+	 * lives in the markdown BODY, which is archived to the orphan branch and never
+	 * copied onto this snapshot. Without this field the committed row can only render a
+	 * date. Only the newest entry is carried, not the body: the full list stays on the
+	 * orphan branch, one click away via Preview.
+	 */
+	readonly latestQuery?: string;
 	readonly referencedAt: string;
 	readonly sourceToolName: string;
 	/** Full URL of the reference article on Jolli Space after pushing (docType `reference`); its origin keys the reuse gate (see `CommitSummary.jolliDocUrl`). */

@@ -1260,15 +1260,28 @@ export async function detectUncommittedReferenceIds(
  * concurrent writer touching other mapKeys is preserved.
  */
 export async function upsertReferenceEntry(ref: Reference, cwd: string): Promise<void> {
-	const { sourcePath } = await writeReferenceMarkdown(ref, cwd);
 	const mapKey = `${ref.source}:${ref.nativeId}`;
 	const now = new Date().toISOString();
 
-	// Whole load→save under plans.lock so a concurrent StopHook / QueueWorker /
-	// Codex-discovery write to plans.json can't clobber this reference (and vice
-	// versa). The near-write reread + per-key merge below is retained as residual
-	// mitigation for the best-effort path where the lock couldn't be acquired.
+	// Whole markdown-write + load→save under plans.lock so a concurrent StopHook /
+	// QueueWorker / Codex-discovery write can't clobber this reference (and vice versa).
+	//
+	// The markdown write MUST be inside the lock, not just the plans.json pair. For an
+	// `accumulateBody` source it is a read-modify-write: `writeReferenceMarkdown` folds
+	// the body already on disk into this write, so two interleaved writers each render
+	// from the same pre-merge body and the later `writeFile` silently drops the other's
+	// query. That is reachable — `jollimemory:search` is keyed on the TOOL, not on the
+	// agent, so the Claude Stop hook and the Codex discovery tick contend for one file.
+	// (Before accumulation existed the file was a pure function of `ref`; interleaved
+	// writers produced identical bytes and the lock-free write was harmless.)
+	//
+	// The near-write reread + per-key merge below is retained as residual mitigation for
+	// the best-effort path where the lock couldn't be acquired — but note it mitigates
+	// plans.json ONLY. It works because a registry row is overwritten wholesale (an
+	// idempotent per-key set); an accumulating markdown body is folded, so nothing here
+	// covers a lost update on the markdown if the lock is unavailable.
 	await withPlansLock(cwd, async () => {
+		const { sourcePath } = await writeReferenceMarkdown(ref, cwd);
 		const beforeRegistry = await loadPlansRegistry(cwd);
 		const beforeReferences = referencesOf(beforeRegistry);
 		const existing = beforeReferences[mapKey];

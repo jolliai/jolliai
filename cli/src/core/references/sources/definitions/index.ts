@@ -18,6 +18,7 @@ import { confluenceDefinition } from "./confluence.js";
 import { context7Definition } from "./context7.js";
 import { githubDefinition } from "./github.js";
 import { jiraDefinition } from "./jira.js";
+import { jolliMemoryDefinition } from "./jollimemory.js";
 import { linearDefinition } from "./linear.js";
 import { mondayDefinition } from "./monday.js";
 import { notionDefinition } from "./notion.js";
@@ -37,4 +38,5 @@ export const BUILTIN_DEFINITIONS = [
 	asanaDefinition,
 	mondayDefinition,
 	context7Definition,
+	jolliMemoryDefinition,
 ] as const;

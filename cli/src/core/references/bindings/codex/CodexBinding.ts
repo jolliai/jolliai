@@ -36,14 +36,35 @@ import type { SourceId } from "../../../../Types.js";
 export interface CodexNormalizeEnv {
 	readonly permalinks: Map<string, string>;
 	readonly slackWorkspaceUrl?: string;
+	/**
+	 * The raw Codex tool name that produced this call — the `function_call` name on
+	 * the primary path, the `mcp_tool_call_end` `invocation.tool` on the fallback.
+	 * Unlike the rest of this env it is PER-CALL, not per-scan, so the parser spreads
+	 * it onto the scan-wide base at each call site. A binding whose source matches a
+	 * single tool ignores it; one matching several tools of a server needs it, because
+	 * two argument-less tools produce byte-identical inputs.
+	 */
+	readonly toolName: string;
 }
 
 export interface CodexNormalizer {
 	readonly id: SourceId;
-	/** Stable synthetic tool name persisted as `Reference.toolName`/`sourceToolName`
-	 *  (the connector's real tool name is mapped to this). Not a match guard —
-	 *  the purified `SourceEngine.extractRef` no longer inspects tool names. */
-	readonly canonicalToolName: string;
+	/**
+	 * Stable synthetic tool name persisted as `Reference.toolName`/`sourceToolName`
+	 * (the connector's real tool name is mapped to this). Not a match guard —
+	 * the purified `SourceEngine.extractRef` no longer inspects tool names.
+	 *
+	 * Every binding here maps to the CLAUDE tool name, which is what makes
+	 * `sourceToolName` host-independent: the same reference captured from either
+	 * agent persists the same string.
+	 *
+	 * A plain string covers a binding that owns ONE tool. The resolver form exists
+	 * for a source matching SEVERAL tools of one server (jollimemory's three), where
+	 * a single string could not preserve that host-independence — it would collapse
+	 * all of them to one value while Claude kept them distinct. Resolve it through
+	 * {@link resolveCanonicalToolName}, never by reading this field directly.
+	 */
+	readonly canonicalToolName: string | ((rawToolName: string) => string);
 	/**
 	 * Normalize the connector business payload — a single entity OR a search/list
 	 * collection — into the shape the shared definition reads. `toolInput` is the
@@ -73,4 +94,20 @@ export interface CodexNormalizer {
 	 * Bindings without this brittle edge omit it entirely.
 	 */
 	recover?(eventPayload: unknown, rawOutput: string): unknown;
+}
+
+/**
+ * Resolves {@link CodexNormalizer.canonicalToolName} for one call.
+ *
+ * `rawToolName` is the tool string the envelope actually carried — the
+ * `function_call` name on the PRIMARY path, `invocation.tool` on the FALLBACK.
+ * Single-tool bindings ignore it (their field is a literal); a multi-tool binding
+ * maps it to that tool's Claude-side name.
+ *
+ * Every read of the field goes through here, so the union stays invisible to the
+ * three parser call sites.
+ */
+export function resolveCanonicalToolName(normalizer: CodexNormalizer, rawToolName: string): string {
+	const c = normalizer.canonicalToolName;
+	return typeof c === "function" ? c(rawToolName) : c;
 }

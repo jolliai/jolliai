@@ -196,11 +196,17 @@ export function extractRef(
 
 	const nativeIdR = evalField(def.reference.nativeId, payload);
 	const titleR = evalField(def.reference.title, payload);
-	const urlR = evalField(def.reference.url, payload);
+	// A definition that declares NO url spec has no external destination at all, so
+	// there is nothing to evaluate and nothing to void on. A definition that DOES
+	// declare one and cannot satisfy it is voided below via urlR.ok === false — the
+	// link was supposed to exist (Slack's unresolved permalink). Absent and
+	// unsatisfied are deliberately different outcomes.
+	const urlR =
+		def.reference.url !== undefined
+			? evalField(def.reference.url, payload)
+			: { ok: true as const, value: undefined };
 	if (!nativeIdR.ok || !titleR.ok || !urlR.ok) return null;
 	if (nativeIdR.value === undefined || titleR.value === undefined) return null;
-	// url may be undefined only when the definition marks it optional (Slack);
-	// evalField already voided a required-but-missing url via urlR.ok === false.
 
 	const descR = def.reference.description
 		? evalField(def.reference.description, payload)

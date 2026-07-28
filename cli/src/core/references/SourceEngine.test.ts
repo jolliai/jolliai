@@ -493,6 +493,59 @@ describe("extractRef required url", () => {
 	});
 });
 
+describe("extractRef absent url spec", () => {
+	/** A source with no external destination: it declares no `url` field-spec at all. */
+	function urllessDef(): SourceDefinition {
+		return {
+			id: "urlless",
+			label: "Urlless",
+			icon: "history",
+			match: { claude: { prefixes: ["mcp__urlless__"] } },
+			wrapperKeys: [],
+			reference: {
+				nativeId: { pipe: [{ op: "path", path: "tool" }], require: ".+" },
+				title: { pipe: [{ op: "path", path: "label" }], require: ".+" },
+				// url deliberately absent — there is no page to link to.
+				description: { pipe: [{ op: "path", path: "query" }], optional: true },
+			},
+			fields: [],
+			storage: { nativeIdPathSafe: true },
+			render: {
+				wrapperTag: "urlless-items",
+				itemTag: "item",
+				bodyTag: "content",
+				maxCharsPerReference: 500,
+				maxTotalChars: 1000,
+			},
+		};
+	}
+
+	it("builds a Reference and OMITS the url key when the definition declares no url spec", () => {
+		const ref = extractRef(urllessDef(), { tool: "recall", label: "Recall", query: "q" }, "tool", "TS");
+		expect(ref).not.toBeNull();
+		expect(ref?.mapKey).toBe("urlless:recall");
+		expect(ref?.description).toBe("q");
+		expect(ref?.url).toBeUndefined();
+		// The key must be absent, not present-and-undefined: the markdown writer and the
+		// open-in-browser affordances branch on its presence.
+		expect("url" in (ref as object)).toBe(false);
+	});
+
+	it("still voids on another failed required field when the url spec is absent", () => {
+		// nativeId missing — an absent url spec must not make the reference unvoidable.
+		expect(extractRef(urllessDef(), { label: "Recall" }, "tool", "TS")).toBeNull();
+		// title missing
+		expect(extractRef(urllessDef(), { tool: "recall" }, "tool", "TS")).toBeNull();
+	});
+
+	it("renders without a url line when the reference carries none", () => {
+		const ref = extractRef(urllessDef(), { tool: "search", label: "Search", query: "q" }, "tool", "TS");
+		const out = renderBlock(urllessDef(), [ref as Reference]);
+		expect(out).not.toContain("<url>");
+		expect(out).toContain("<title>Search</title>");
+	});
+});
+
 describe("renderBlock", () => {
 	it("renderBlock reproduces the Linear XML byte-for-byte", () => {
 		const def = miniLinearDef();

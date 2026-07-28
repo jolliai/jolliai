@@ -100,6 +100,9 @@ vi.mock("../core/references/ReferenceStore.js", () => ({
 	readReferenceMarkdownFromString: vi.fn().mockReturnValue(null),
 	writeReferenceMarkdown: vi.fn().mockResolvedValue({ sourcePath: "/x", contentHash: "fake-content-hash" }),
 	deleteReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
+	// Default: nothing accumulates. The entity-shaped sources every other test in this
+	// file uses would return undefined from the real implementation anyway.
+	accumulatedQueryOf: vi.fn().mockReturnValue(undefined),
 }));
 
 vi.mock("../core/PlanPromptFormatter.js", () => ({
@@ -1247,6 +1250,118 @@ describe("QueueWorker", () => {
 				},
 			});
 			expect(lastSave.references?.["linear:GHOST-1"]).toBeUndefined();
+		});
+
+		it("freezes the newest query onto the snapshot for an accumulating source", async () => {
+			// The markdown body (all accumulated queries) goes to the orphan branch, but
+			// ReferenceCommitRef is a value snapshot — so without this the committed row
+			// renders a bare date, identical on every commit, for a source whose title is
+			// just the tool label. Entity-shaped sources must stay unaffected.
+			const op = makeCommitOp({ commitHash: "abc12345def67890" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/jm.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{
+					mapKey: "jollimemory:search",
+					source: "jollimemory",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/jollimemory/search.md",
+				},
+			]);
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				references: {
+					"jollimemory:search": {
+						source: "jollimemory",
+						nativeId: "search",
+						title: "Search",
+						sourcePath: "/test/cwd/.jolli/jollimemory/references/jollimemory/search.md",
+						addedAt: "x",
+						updatedAt: "x",
+						sourceToolName: "mcp__jollimemory__search",
+					},
+				},
+			});
+			const { readReferenceMarkdown, accumulatedQueryOf } = await import("../core/references/ReferenceStore.js");
+			vi.mocked(readReferenceMarkdown).mockResolvedValue({
+				mapKey: "jollimemory:search",
+				source: "jollimemory",
+				nativeId: "search",
+				title: "Search",
+				description: "- `queue worker lock` — 2026-07-28T09:14:02.000Z",
+				toolName: "mcp__jollimemory__search",
+				referencedAt: "2026-07-28T09:14:02.000Z",
+			});
+			vi.mocked(accumulatedQueryOf).mockReturnValue("queue worker lock");
+			const { readFile } = await import("node:fs/promises");
+			(readFile as unknown as { mockResolvedValue: (v: string) => void }).mockResolvedValue("file content");
+
+			await runWorker("/test/cwd");
+
+			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(savedSummary.references?.[0].latestQuery).toBe("queue worker lock");
+			// Derived from the body, not re-parsed here — the gate lives in one place.
+			expect(accumulatedQueryOf).toHaveBeenCalledWith(
+				"jollimemory",
+				"- `queue worker lock` — 2026-07-28T09:14:02.000Z",
+			);
+			vi.mocked(accumulatedQueryOf).mockReturnValue(undefined);
+		});
+
+		it("omits latestQuery entirely for an entity-shaped source", async () => {
+			// The field must not appear as `undefined` on every Linear/Jira row — it is
+			// spread in conditionally so old summaries and new ones stay shape-identical.
+			const op = makeCommitOp({ commitHash: "abc12345def67890" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/li.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{
+					mapKey: "linear:PROJ-1528",
+					source: "linear",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528.md",
+				},
+			]);
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				references: {
+					"linear:PROJ-1528": {
+						source: "linear",
+						nativeId: "PROJ-1528",
+						title: "Real entry",
+						url: "https://linear.app/x/PROJ-1528",
+						sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528.md",
+						addedAt: "x",
+						updatedAt: "x",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				},
+			});
+			const { readReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+			vi.mocked(readReferenceMarkdown).mockResolvedValue({
+				mapKey: "linear:PROJ-1528",
+				source: "linear",
+				nativeId: "PROJ-1528",
+				title: "Real entry",
+				url: "https://linear.app/x/PROJ-1528",
+				toolName: "mcp__linear__get_issue",
+				referencedAt: "2026-05-14T06:06:01.123Z",
+			});
+			const { readFile } = await import("node:fs/promises");
+			(readFile as unknown as { mockResolvedValue: (v: string) => void }).mockResolvedValue("file content");
+
+			await runWorker("/test/cwd");
+
+			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(savedSummary.references?.[0]).not.toHaveProperty("latestQuery");
 		});
 	});
 

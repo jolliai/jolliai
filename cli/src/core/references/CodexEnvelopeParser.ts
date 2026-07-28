@@ -39,7 +39,7 @@
 
 import { createLogger } from "../../Logger.js";
 import { type CliBinding, matchCliCommand } from "./bindings/cli/index.js";
-import type { CodexNormalizeEnv } from "./bindings/codex/CodexBinding.js";
+import { type CodexNormalizeEnv, resolveCanonicalToolName } from "./bindings/codex/CodexBinding.js";
 import { CODEX_APPS_NAMESPACE_PREFIX, getCodexNormalizer } from "./bindings/codex/index.js";
 import { isObject } from "./guards.js";
 import { scanCodexUserPermalinks } from "./SlackPermalink.js";
@@ -74,6 +74,12 @@ interface FunctionOutputRow {
 interface ToolCallEndRow {
 	readonly callId: string | undefined;
 	readonly tool: string;
+	/** The event's `invocation.server` — the MCP server that served the call.
+	 *  Scopes the registry's invocation-tool lookup for a definition registering BARE
+	 *  tool names (`MatchCodex.invocationServer`): those carry no namespace of their
+	 *  own, so without this a generic bare `search` would match any local server's
+	 *  same-named tool. undefined when the event omits it. */
+	readonly server: string | undefined;
 	readonly text: string;
 	/** The event's own `invocation.arguments` (real codex_apps events carry the
 	 *  request pre-parsed as an object). In the exec/apps sandbox mode there is NO
@@ -102,7 +108,9 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 		// fallback — into every normalize call, exactly as the Claude parser does.
 		// Scanning from line 0 (not `fromLine`) so a permalink pasted before the
 		// cursor still resolves a thread fetched after it.
-		const slackEnv: CodexNormalizeEnv = {
+		// Scan-wide half of the normalize env. `toolName` is per-call, so each call site
+		// spreads this base and adds the tool name it has in scope.
+		const scanEnv: Omit<CodexNormalizeEnv, "toolName"> = {
 			permalinks: scanCodexUserPermalinks(lines),
 			slackWorkspaceUrl: opts.slackWorkspaceUrl,
 		};
@@ -204,7 +212,8 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 					const text = readToolCallEndText(payload.result);
 					if (tool !== undefined && text !== undefined) {
 						const args = readInvocationArguments(payload.invocation);
-						events.push({ callId, tool, text, arguments: args, lineNumber: i + 1, referencedAt });
+						const server = readInvocationServer(payload.invocation);
+						events.push({ callId, tool, server, text, arguments: args, lineNumber: i + 1, referencedAt });
 					}
 					break;
 				}
@@ -243,12 +252,15 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 			// source — leaving the call open lets the FALLBACK retry it. A re-gating
 			// normalizer (monday's itemIds gate) simply gates closed again in the
 			// fallback (see the board-browse FALLBACK tests), so this never floods.
-			const payload = normalizer.normalize(business, parseArguments(call.arguments), slackEnv);
+			const payload = normalizer.normalize(business, parseArguments(call.arguments), {
+				...scanEnv,
+				toolName: call.name,
+			});
 			if (payload === null) continue;
 			emitted.add(callId);
 			results.push({
 				def,
-				toolName: normalizer.canonicalToolName,
+				toolName: resolveCanonicalToolName(normalizer, call.name),
 				payload,
 				lineNumber: out.lineNumber,
 				referencedAt: out.referencedAt,
@@ -281,7 +293,11 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 		// FALLBACK: mcp_tool_call_end events for call_ids without a paired output.
 		for (const ev of events) {
 			if (ev.callId !== undefined && emitted.has(ev.callId)) continue;
-			const def = registry.match("codex", ev.tool);
+			// `ev.server` scopes the lookup for a definition registering BARE tool names
+			// (jollimemory's `recall` / `search`). Without it that generic name would match
+			// any other locally-registered MCP server's same-named tool and persist a
+			// foreign lookup under this source.
+			const def = registry.match("codex", ev.tool, undefined, ev.server);
 			if (def === undefined) continue;
 			const normalizer = getCodexNormalizer(def.id);
 			/* v8 ignore start -- every registry codex definition has a matching CodexBinding; guarded for totality. */
@@ -321,11 +337,11 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 			// when NEITHER is present — dropping is safer than flooding a whole board.
 			const toolInput =
 				ev.arguments ?? (ev.callId !== undefined ? parseArguments(calls.get(ev.callId)?.arguments) : undefined);
-			const payload = normalizer.normalize(business, toolInput, slackEnv);
+			const payload = normalizer.normalize(business, toolInput, { ...scanEnv, toolName: ev.tool });
 			if (payload === null) continue;
 			results.push({
 				def,
-				toolName: normalizer.canonicalToolName,
+				toolName: resolveCanonicalToolName(normalizer, ev.tool),
 				payload,
 				lineNumber: ev.lineNumber,
 				referencedAt: ev.referencedAt,
@@ -484,6 +500,21 @@ function readString(v: unknown): string | undefined {
 function readInvocationTool(invocation: unknown): string | undefined {
 	if (!isObject(invocation)) return undefined;
 	return readString(invocation.tool);
+}
+
+/**
+ * The MCP server name an `mcp_tool_call_end` event reports alongside its tool
+ * (`invocation.server`, e.g. `"jollimemory"` for a locally-registered server).
+ *
+ * Only the invocation-tool lookup reads it, and only for a definition that pins
+ * itself to a server via `MatchCodex.invocationServer`. Connector-app sources need
+ * no scope because their `invocationTools` entries are already server-qualified
+ * (`asana.get_task`); a local server's tool name is bare, so the server is the only
+ * thing separating its `search` from every other local server's `search`.
+ */
+function readInvocationServer(invocation: unknown): string | undefined {
+	if (!isObject(invocation)) return undefined;
+	return readString(invocation.server);
 }
 
 /**

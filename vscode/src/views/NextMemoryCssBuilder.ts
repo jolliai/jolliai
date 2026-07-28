@@ -12,7 +12,7 @@
  * the memory-detail bar (SummaryHtmlBuilder buildTokenMeter); all three token
  * bars now share the same exact-width, no-bucket approach.
  */
-import { SOURCE_META } from "./SourceLabels.js";
+import { NEUTRAL_SOURCE_COLOR, SOURCE_META } from "./SourceLabels.js";
 
 export function buildNextMemoryCss(): string {
 	return [
@@ -103,7 +103,7 @@ export function buildNextMemoryCss(): string {
 		// Per-source colors generated from the single ./SourceLabels.ts
 		// SOURCE_META table so a new source's color lives in one place.
 		...Object.entries(SOURCE_META).map(([id, meta]) => `.mem-ctx-badge--${id} { background: ${meta.color}; }`),
-		".mem-ctx-badge--reference { background: #6e7681; }",
+		`.mem-ctx-badge--reference { background: ${NEUTRAL_SOURCE_COLOR}; }`,
 		// Git-status letter, tinted by VS Code's own git-decoration theme colors.
 		".gs { flex-shrink: 0; font-family: ui-monospace, monospace; font-size: 11px; font-weight: 700; width: 12px; text-align: center; }",
 		".gs-M { color: var(--vscode-gitDecoration-modifiedResourceForeground); }",

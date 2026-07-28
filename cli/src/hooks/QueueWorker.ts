@@ -75,7 +75,11 @@ import { formatPlansBlock } from "../core/PlanPromptFormatter.js";
 import { estimateCostUsd, PRICES_AS_OF } from "../core/Pricing.js";
 import { triggerPushForNewSummaries } from "../core/PushExecutor.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
-import { deleteReferenceMarkdown, readReferenceMarkdown } from "../core/references/ReferenceStore.js";
+import {
+	accumulatedQueryOf,
+	deleteReferenceMarkdown,
+	readReferenceMarkdown,
+} from "../core/references/ReferenceStore.js";
 import { getRegistry } from "../core/references/SourceDefinitionRegistry.js";
 import { renderBlock } from "../core/references/SourceEngine.js";
 import {
@@ -1428,6 +1432,13 @@ async function associateReferencesWithCommit(
 		// durably written (write-ahead → a storeReferences failure is recoverable).
 		committed.push({ mapKey, sourcePath: entry.sourcePath, updatedAt: entry.updatedAt });
 
+		// Freeze the newest query for the committed view. The whole body travels to the
+		// orphan branch in `rawContent`, but `ReferenceCommitRef` is a value snapshot —
+		// without this the Review panel's row for an accumulating source renders as a
+		// bare date, identical on every commit. Gate + derivation are the source's own
+		// (`accumulatedQueryOf`), so this cannot drift from the uncommitted tree row.
+		const latestQuery = accumulatedQueryOf(source, fullRef.description);
+
 		refs.push({
 			archivedKey,
 			source,
@@ -1435,6 +1446,7 @@ async function associateReferencesWithCommit(
 			title: entry.title,
 			url: entry.url,
 			...(fullRef.fields !== undefined && fullRef.fields.length > 0 ? { fields: fullRef.fields } : {}),
+			...(latestQuery !== undefined ? { latestQuery } : {}),
 			referencedAt: fullRef.referencedAt,
 			sourceToolName: entry.sourceToolName,
 		});
@@ -1859,11 +1871,23 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	const plansBlock = await formatPlansBlock(activePlanEntries);
 	const notesBlock = await formatNotesBlock(activeNoteEntries);
 	const referenceBlocks = await assembleReferenceBlocks(activeReferenceEntries);
+	// `activeReferenceEntries` deliberately carries track-only sources so they reach
+	// archival, but assembleReferenceBlocks drops them by source before the prompt is
+	// built. Reporting one number under a "Prompt blocks" label therefore reads as a
+	// track-only leak during diagnosis — count what actually reached the prompt, and
+	// report the archived-only remainder separately. Recomputed with the same
+	// trackOnly predicate assembleReferenceBlocks uses rather than subtracting
+	// `trackOnlyReferences.length`, so the fail-open catch path (where
+	// `activeReferenceEntries` stays the full userKeptReferences) also reports truthfully.
+	const promptedReferenceCount = activeReferenceEntries.filter(
+		(e) => getRegistry().byId(e.source)?.trackOnly !== true,
+	).length;
 	log.info(
-		"Prompt blocks: plans=%d notes=%d references=%d (AI soft-excluded %d)",
+		"Prompt blocks: plans=%d notes=%d references=%d (+%d track-only archived, not prompted) (AI soft-excluded %d)",
 		activePlanEntries.length,
 		activeNoteEntries.length,
-		activeReferenceEntries.length,
+		promptedReferenceCount,
+		activeReferenceEntries.length - promptedReferenceCount,
 		excludedContext.length,
 	);
 	emitCaptureProgress(cwd, op.commitHash, "references", {

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { getRegistry, validateDefinition } from "./SourceDefinitionRegistry.js";
+import type { SourceDefinition } from "./SourceDefinition.js";
+import { getRegistry, SourceDefinitionRegistry, validateDefinition } from "./SourceDefinitionRegistry.js";
 import { linearDefinition } from "./sources/definitions/linear.js";
 
 /** Deep-cloned copy of the real Linear definition, safe to mutate per-test. */
@@ -43,7 +44,7 @@ describe("SourceDefinitionRegistry", () => {
 		expect(r.match("codex", "linear.get_issue")?.id).toBe("linear"); // invocation-tool path (no namespace)
 	});
 
-	it("all() is stable order linear,confluence,jira,github,notion,slack,zoom-meeting,zoom-doc,asana,monday,context7", () => {
+	it("all() is stable order linear,confluence,jira,github,notion,slack,zoom-meeting,zoom-doc,asana,monday,context7,jollimemory", () => {
 		expect(
 			getRegistry()
 				.all()
@@ -60,6 +61,7 @@ describe("SourceDefinitionRegistry", () => {
 			"asana",
 			"monday",
 			"context7",
+			"jollimemory",
 		]);
 	});
 
@@ -84,6 +86,28 @@ describe("SourceDefinitionRegistry", () => {
 
 	it("built-in invalid definition fails fast", () => {
 		expect(validateDefinition({ id: "x" }).ok).toBe(false);
+	});
+
+	it("accepts a definition that declares no reference.url spec", () => {
+		// A source whose referenced system has no external destination omits `url`
+		// entirely. The built-in load is fail-fast, so the validator must allow it or
+		// such a definition would throw at process start.
+		const base = structuredCloneOfLinear();
+		const urlless = {
+			...base,
+			reference: { nativeId: base.reference.nativeId, title: base.reference.title },
+		};
+		expect(validateDefinition(urlless).ok).toBe(true);
+	});
+
+	it("still rejects a declared-but-malformed reference.url, and a missing nativeId/title", () => {
+		const base = structuredCloneOfLinear();
+		expect(validateDefinition({ ...base, reference: { ...base.reference, url: "not-an-object" } }).ok).toBe(false);
+		expect(
+			validateDefinition({ ...base, reference: { ...base.reference, url: { pipe: "not-an-array" } } }).ok,
+		).toBe(false);
+		expect(validateDefinition({ ...base, reference: { title: base.reference.title } }).ok).toBe(false);
+		expect(validateDefinition({ ...base, reference: { nativeId: base.reference.nativeId } }).ok).toBe(false);
 	});
 
 	it("fields[].key charset is enforced at load", () => {
@@ -391,6 +415,71 @@ describe("SourceDefinitionRegistry", () => {
 			expect(r.match("claude", "mcp__claude_ai_monday_com__get_board_info")).toBeUndefined();
 			expect(r.match("claude", "mcp__claude_ai_monday_com__get_updates")).toBeUndefined();
 			expect(r.match("codex", "_get_board_info", "monday_com")).toBeUndefined();
+		});
+	});
+
+	describe("MatchClaude.exact", () => {
+		/**
+		 * Built with a local definition and a local registry rather than the singleton:
+		 * no shipping source uses `exact` yet, and this must not depend on one that does.
+		 * The tool names mirror the motivating collision — a namespace hosting wanted
+		 * tools alongside an unwanted one whose name EXTENDS a wanted one.
+		 */
+		function exactDef(exact?: ReadonlyArray<string>): SourceDefinition {
+			return {
+				id: "exact-src",
+				label: "Exact Source",
+				icon: "history",
+				match: { claude: { prefixes: ["mcp__ns__"], ...(exact !== undefined ? { exact } : {}) } },
+				wrapperKeys: [],
+				reference: {
+					nativeId: { pipe: [{ op: "path", path: "id" }], require: ".+" },
+					title: { pipe: [{ op: "path", path: "title" }], require: ".+" },
+				},
+				fields: [],
+				storage: { nativeIdPathSafe: true },
+				render: {
+					wrapperTag: "w",
+					itemTag: "i",
+					bodyTag: "b",
+					maxCharsPerReference: 100,
+					maxTotalChars: 200,
+				},
+			};
+		}
+
+		const ALLOWED = ["mcp__ns__recall", "mcp__ns__search"];
+
+		it("matches a tool name in the allow-list", () => {
+			const r = new SourceDefinitionRegistry([exactDef(ALLOWED)]);
+			expect(r.match("claude", "mcp__ns__recall")?.id).toBe("exact-src");
+			expect(r.match("claude", "mcp__ns__search")?.id).toBe("exact-src");
+		});
+
+		it("rejects a prefix match whose name merely EXTENDS an allowed name", () => {
+			// The whole reason `exact` exists: `startsWith("mcp__ns__")` alone captures
+			// these, and no suffix rule can separate them from `mcp__ns__search`.
+			const r = new SourceDefinitionRegistry([exactDef(ALLOWED)]);
+			expect(r.match("claude", "mcp__ns__search_remote_articles")).toBeUndefined();
+			expect(r.match("claude", "mcp__ns__search_remote_repo")).toBeUndefined();
+		});
+
+		it("rejects any other tool sharing the prefix", () => {
+			const r = new SourceDefinitionRegistry([exactDef(ALLOWED)]);
+			expect(r.match("claude", "mcp__ns__status")).toBeUndefined();
+			expect(r.match("claude", "mcp__ns__list_branches")).toBeUndefined();
+		});
+
+		it("leaves pure prefix behavior unchanged when `exact` is absent", () => {
+			const r = new SourceDefinitionRegistry([exactDef()]);
+			expect(r.match("claude", "mcp__ns__recall")?.id).toBe("exact-src");
+			expect(r.match("claude", "mcp__ns__search_remote_articles")?.id).toBe("exact-src");
+			expect(r.match("claude", "mcp__other__recall")).toBeUndefined();
+		});
+
+		it("does not affect Codex matching", () => {
+			const r = new SourceDefinitionRegistry([exactDef(ALLOWED)]);
+			expect(r.match("codex", "mcp__ns__recall")).toBeUndefined();
 		});
 	});
 });

@@ -306,8 +306,13 @@ export function buildNextMemoryScript(): string {
     else if (kind === 'note') letter = 'N';
     else if (kind === 'reference') {
       const s = source || '';
-      badgeKind = s || 'reference';
       const meta = SOURCE_META[s];
+      // Mirrors SidebarScriptBuilder's ctxBadge: a source NOT in SOURCE_META has
+      // no generated .mem-ctx-badge--<id> rule, so without this the badge falls
+      // through to the .kb-tag base's theme-derived descriptionForeground rather
+      // than the neutral grey getSourceMeta reports for that same id. Route it to
+      // the 'reference' rule, which is pinned to NEUTRAL_SOURCE_COLOR.
+      badgeKind = s && meta ? s : 'reference';
       letter = s ? (meta ? meta.letter : s.slice(0, 1).toUpperCase()) : 'R';
     }
     return el('span', { className: 'kb-tag mem-ctx-badge mem-ctx-badge--' + badgeKind, text: letter });

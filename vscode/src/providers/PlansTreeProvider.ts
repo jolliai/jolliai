@@ -12,6 +12,7 @@ import {
 	readExclusions,
 } from "../../../cli/src/core/CommitSelectionStore.js";
 import { referenceDisplayTitle } from "../../../cli/src/core/references/ReferenceDisplay.js";
+import { accumulatedQueryOf } from "../../../cli/src/core/references/ReferenceStore.js";
 import type { ReferenceField, SourceId } from "../../../cli/src/Types.js";
 import type { PlansStore } from "../stores/PlansStore.js";
 import type { NoteInfo, PlanInfo, ReferenceInfo } from "../Types.js";
@@ -360,7 +361,18 @@ function buildReferenceDescription(reference: ReferenceInfo): string {
 	// (we don't poll the upstream provider), so the row description sticks
 	// to the relative date. Status lives in the tooltip / hover card for
 	// users who explicitly inspect captured state.
-	return formatShortRelativeDate(reference.lastModified);
+	const date = formatShortRelativeDate(reference.lastModified);
+	// An ACCUMULATING source is the exception, and for the opposite reason: its title
+	// is the tool label (`Search`), identical on every row and every commit, so the
+	// date alone leaves the row carrying no information about what actually happened.
+	// The query does not drift — it is a record of what was asked — so the newest one
+	// earns the slot. Every entity-shaped source keeps the bare date.
+	//
+	// `accumulatedQueryOf` owns both the gate and the derivation so this row and the
+	// committed row (SummaryHtmlBuilder, reading the archived `latestQuery` snapshot)
+	// cannot disagree about which sources show a query or which one is newest.
+	const query = accumulatedQueryOf(reference.source, reference.description);
+	return query === undefined ? date : `${query} · ${date}`;
 }
 
 function buildReferenceTooltip(reference: ReferenceInfo): string {

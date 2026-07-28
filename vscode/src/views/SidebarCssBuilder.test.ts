@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildSidebarCss } from "./SidebarCssBuilder";
+import { getSourceMeta, NEUTRAL_SOURCE_COLOR } from "./SourceLabels.js";
 
 describe("SidebarCssBuilder", () => {
 	it("returns CSS string", () => {
@@ -550,6 +551,19 @@ describe("onboarding panel styles", () => {
 			for (const kind of ["plan", "note", "linear", "jira", "github", "notion", "reference"]) {
 				expect(css).toMatch(new RegExp(`\\.mem-ctx-badge--${kind}\\b[^{]*\\{[^}]*background:`));
 			}
+		});
+
+		// ctxBadge routes a source that is NOT in SOURCE_META to the 'reference'
+		// class (its per-source siblings are generated from SOURCE_META, so an
+		// unknown id matches no rule). That makes this rule the rendered fallback
+		// colour, and it has to agree with what getSourceMeta reports for the same
+		// unknown id — otherwise one unrecognised source renders two different
+		// greys depending on which code path a surface happens to read.
+		it("pins the reference fallback hue to getSourceMeta's neutral colour", () => {
+			const css = buildSidebarCss();
+			const neutral = getSourceMeta("definitely-not-a-registered-source").color;
+			expect(neutral).toBe(NEUTRAL_SOURCE_COLOR);
+			expect(css).toContain(`.mem-ctx-badge--reference { background: ${neutral}; }`);
 		});
 
 		// File evidence rows: two-line filename (git-status tinted) over muted dir,

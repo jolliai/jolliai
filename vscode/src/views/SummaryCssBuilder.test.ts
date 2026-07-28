@@ -6,6 +6,45 @@ vi.mock("../services/PrCommentService.js", () => ({
 }));
 
 import { buildCss } from "./SummaryCssBuilder.js";
+import { getSourceMeta, NEUTRAL_SOURCE_COLOR, SOURCE_META } from "./SourceLabels.js";
+
+describe("buildCss — per-source reference badge hues", () => {
+	// .t-ref used to hardcode #5e6ad2 — Linear's SOURCE_META colour — as a KIND
+	// level hue, so every reference source rendered as Linear blue-violet with only
+	// the letter differing. These lock the per-source hues in and, importantly, the
+	// neutral fallback, so this panel now agrees with the sidebar and the Working
+	// Memory card instead of being a third independent answer.
+	it("emits a hue per SOURCE_META entry", () => {
+		const css = buildCss();
+		for (const [id, meta] of Object.entries(SOURCE_META)) {
+			expect(css).toContain(`.kb-tag.src-${id} { background: ${meta.color}; }`);
+		}
+	});
+
+	it("keeps Linear's hue byte-identical to the old fixed .t-ref value", () => {
+		// Zero visual regression for the one source that was previously correct by
+		// accident: the literal being replaced WAS Linear's brand colour.
+		expect(SOURCE_META.linear.color).toBe("#5e6ad2");
+		expect(buildCss()).toContain(".kb-tag.src-linear { background: #5e6ad2; }");
+	});
+
+	it("gives a non-Linear source its own hue, no longer Linear's", () => {
+		const css = buildCss();
+		expect(SOURCE_META.jollimemory.color).not.toBe(SOURCE_META.linear.color);
+		expect(css).toContain(`.kb-tag.src-jollimemory { background: ${SOURCE_META.jollimemory.color}; }`);
+	});
+
+	it("leaves .t-ref as the neutral fallback for a source with no generated rule", () => {
+		const css = buildCss();
+		expect(getSourceMeta("some-phase-2-source").color).toBe(NEUTRAL_SOURCE_COLOR);
+		expect(css).toContain(`.kb-tag.t-ref  { background: ${NEUTRAL_SOURCE_COLOR}; }`);
+	});
+
+	it("orders the generated rules AFTER .t-ref so they win at equal specificity", () => {
+		const css = buildCss();
+		expect(css.indexOf(".kb-tag.t-ref")).toBeLessThan(css.indexOf(".kb-tag.src-"));
+	});
+});
 
 describe("SummaryCssBuilder", () => {
 	const css = buildCss();

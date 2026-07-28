@@ -9,8 +9,54 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 	return { ...actual, readFile: mockReadFile };
 });
 
+// A synthetic `accumulateBody` source. The real accumulating source (`jollimemory`)
+// arrives in a later step, so the registry is EXTENDED with this definition rather
+// than these tests depending on it. Extending leaves every shipped definition exactly
+// as loaded, and the new prefix is unique, so no existing expectation moves — the
+// module-load-time `CLAUDE_TOOL_PREFIXES` pre-filter simply gains one needle.
+const { ACCUMULATING_DEF } = vi.hoisted(() => ({
+	ACCUMULATING_DEF: {
+		id: "acctest",
+		label: "Acc Test",
+		icon: "history",
+		trackOnly: true,
+		argumentsDerived: true,
+		accumulateBody: true,
+		match: { claude: { prefixes: ["mcp__acctest__"] } },
+		wrapperKeys: [],
+		reference: {
+			nativeId: { pipe: [{ op: "path", path: "tool" }] },
+			title: { pipe: [{ op: "path", path: "tool" }] },
+			description: { pipe: [{ op: "path", path: "query" }], optional: true },
+		},
+		fields: [],
+		storage: { nativeIdPathSafe: true },
+		render: {
+			wrapperTag: "acc-tests",
+			itemTag: "lookup",
+			bodyTag: "queries",
+			maxCharsPerReference: 2000,
+			maxTotalChars: 6000,
+		},
+	} as unknown as import("./SourceDefinition.js").SourceDefinition,
+}));
+
+vi.mock("./SourceDefinitionRegistry.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./SourceDefinitionRegistry.js")>();
+	let patched: SourceDefinitionRegistry | undefined;
+	return {
+		...actual,
+		getRegistry: (): SourceDefinitionRegistry => {
+			patched ??= new actual.SourceDefinitionRegistry([...actual.getRegistry().all(), ACCUMULATING_DEF]);
+			return patched;
+		},
+	};
+});
+
 import type { Reference } from "../../Types.js";
 import { extractReferencesFromTranscript } from "./ReferenceExtractor.js";
+import { formatAccumulatedEntry } from "./ReferenceStore.js";
+import type { SourceDefinitionRegistry } from "./SourceDefinitionRegistry.js";
 import * as SourceEngine from "./SourceEngine.js";
 import { linearDefinition } from "./sources/definitions/linear.js";
 
@@ -1386,5 +1432,181 @@ describe("extractReferencesFromTranscript incremental argumentsDerived pairing",
 
 		expect(lastLineNumberScanned).toBe(3); // advanced to EOF, not rewound to line 0
 		expect(references.map((r) => r.mapKey)).toEqual(["linear:PROJ-1528"]);
+	});
+});
+
+// ─── Accumulating sources (act-shaped references) ────────────────────────────
+//
+// An `accumulateBody` source records ACTS, not entities: two different queries under
+// one mapKey are two facts, so `dedupeKeepLatest` merges their bodies instead of
+// letting the newest overwrite the rest. The last-wins behaviour for every other
+// (entity-shaped) source is asserted separately by the "dedupes same nativeId across
+// two get_issue results" test above — these cases only cover the exception.
+
+describe("extractReferencesFromTranscript — accumulating sources", () => {
+	const accCall = (id: string, at: string, payload: object): string[] => [
+		toolUseLine({ toolUseId: id, toolName: "mcp__acctest__search", timestamp: at, inputJson: "{}" }),
+		toolResultLine({ toolUseId: id, timestamp: at, payload }),
+	];
+
+	it("collapses three calls into one reference whose body holds all three queries", async () => {
+		mockReadFile.mockResolvedValue(
+			makeJsonl(
+				...accCall("t1", "2026-07-28T08:00:00.000Z", { tool: "search", query: "folder storage" }),
+				...accCall("t2", "2026-07-28T08:30:00.000Z", { tool: "search", query: "queue worker lock" }),
+				...accCall("t3", "2026-07-28T09:00:00.000Z", { tool: "search", query: "orphan branch" }),
+			),
+		);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
+
+		expect(references).toHaveLength(1);
+		expect(references[0].mapKey).toBe("acctest:search");
+		// Newest first, one line per query.
+		expect(references[0].description).toBe(
+			[
+				formatAccumulatedEntry("orphan branch", "2026-07-28T09:00:00.000Z"),
+				formatAccumulatedEntry("queue worker lock", "2026-07-28T08:30:00.000Z"),
+				formatAccumulatedEntry("folder storage", "2026-07-28T08:00:00.000Z"),
+			].join("\n"),
+		);
+		// Metadata still follows latest-wins — only the body accumulates.
+		expect(references[0].referencedAt).toBe("2026-07-28T09:00:00.000Z");
+	});
+
+	it("carries the call timestamp into each entry, which no FieldSpec could supply", async () => {
+		// The body is lifted at extraction precisely because `referencedAt` lives on the
+		// Reference and never appears in the tool payload.
+		mockReadFile.mockResolvedValue(
+			makeJsonl(...accCall("t1", "2026-07-28T08:00:00.000Z", { tool: "recall", query: "feature/x" })),
+		);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
+
+		expect(references[0].description).toBe(formatAccumulatedEntry("feature/x", "2026-07-28T08:00:00.000Z"));
+	});
+
+	it("keeps the accumulated body when a later call carries no query at all", async () => {
+		mockReadFile.mockResolvedValue(
+			makeJsonl(
+				...accCall("t1", "2026-07-28T08:00:00.000Z", { tool: "search", query: "folder storage" }),
+				...accCall("t2", "2026-07-28T09:00:00.000Z", { tool: "search" }),
+			),
+		);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
+
+		expect(references).toHaveLength(1);
+		expect(references[0].description).toBe(formatAccumulatedEntry("folder storage", "2026-07-28T08:00:00.000Z"));
+		expect(references[0].referencedAt).toBe("2026-07-28T09:00:00.000Z");
+	});
+
+	it("merges regardless of transcript order and still reports the latest timestamp", async () => {
+		// A newer call appearing BEFORE an older one (clock skew across sessions, or a
+		// resumed transcript) must not lose either entry or regress `referencedAt`.
+		mockReadFile.mockResolvedValue(
+			makeJsonl(
+				...accCall("t1", "2026-07-28T09:00:00.000Z", { tool: "search", query: "newer" }),
+				...accCall("t2", "2026-07-28T08:00:00.000Z", { tool: "search", query: "older" }),
+			),
+		);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
+
+		expect(references).toHaveLength(1);
+		expect(references[0].description).toBe(
+			[
+				formatAccumulatedEntry("newer", "2026-07-28T09:00:00.000Z"),
+				formatAccumulatedEntry("older", "2026-07-28T08:00:00.000Z"),
+			].join("\n"),
+		);
+		expect(references[0].referencedAt).toBe("2026-07-28T09:00:00.000Z");
+	});
+
+	it("keeps distinct tools as distinct references", async () => {
+		// One reference per tool: the mapKey is `<source>:<tool>`, so `search` and
+		// `recall` accumulate independently rather than into a single blob.
+		mockReadFile.mockResolvedValue(
+			makeJsonl(
+				...accCall("t1", "2026-07-28T08:00:00.000Z", { tool: "search", query: "folder storage" }),
+				...accCall("t2", "2026-07-28T08:30:00.000Z", { tool: "recall", query: "feature/x" }),
+			),
+		);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
+
+		expect(references.map((r) => r.mapKey).sort()).toEqual(["acctest:recall", "acctest:search"]);
+	});
+});
+
+// ─── jollimemory end-to-end (the real definition, both Step-2 seams) ─────────
+
+describe("extractReferencesFromTranscript — jollimemory", () => {
+	const jmCall = (id: string, at: string, tool: string, input: object, result: object): string[] => [
+		toolUseLine({
+			toolUseId: id,
+			toolName: `mcp__jollimemory__${tool}`,
+			timestamp: at,
+			inputJson: JSON.stringify(input),
+		}),
+		toolResultLine({ toolUseId: id, timestamp: at, payload: result }),
+	];
+
+	it("collapses repeated searches into one reference holding every query asked", async () => {
+		// The Step 2 accumulation seam exercised against the REAL definition rather than
+		// the synthetic one — this is what proves the two agree.
+		mockReadFile.mockResolvedValue(
+			makeJsonl(
+				...jmCall("j1", "2026-07-28T08:00:00.000Z", "search", { query: "queue worker lock" }, { hits: [] }),
+				...jmCall(
+					"j2",
+					"2026-07-28T08:30:00.000Z",
+					"search",
+					{ query: "folder storage dual write" },
+					{ hits: [] },
+				),
+				...jmCall("j3", "2026-07-28T09:00:00.000Z", "search", { query: "orphan branch layout" }, { hits: [] }),
+			),
+		);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
+
+		expect(references).toHaveLength(1);
+		expect(references[0].mapKey).toBe("jollimemory:search");
+		expect(references[0].title).toBe("Search");
+		expect(references[0].url).toBeUndefined();
+		expect(references[0].description).toBe(
+			[
+				formatAccumulatedEntry("orphan branch layout", "2026-07-28T09:00:00.000Z"),
+				formatAccumulatedEntry("folder storage dual write", "2026-07-28T08:30:00.000Z"),
+				formatAccumulatedEntry("queue worker lock", "2026-07-28T08:00:00.000Z"),
+			].join("\n"),
+		);
+	});
+
+	it("keeps one reference per tool, and captures neither list_branches nor the search_* siblings", async () => {
+		mockReadFile.mockResolvedValue(
+			makeJsonl(
+				...jmCall("j1", "2026-07-28T08:00:00.000Z", "recall", {}, { type: "recall" }),
+				...jmCall("j2", "2026-07-28T08:10:00.000Z", "search", { query: "queue worker" }, { hits: [] }),
+				...jmCall("j3", "2026-07-28T08:20:00.000Z", "get_decision_timeline", { slug: "mcp-pr-tools" }, {}),
+				// Ignored: no query to record / name merely extends a captured one.
+				...jmCall("j4", "2026-07-28T08:30:00.000Z", "list_branches", {}, { branches: [] }),
+				...jmCall("j5", "2026-07-28T08:40:00.000Z", "search_remote_articles", { query: "x" }, { hits: [] }),
+				...jmCall("j6", "2026-07-28T08:50:00.000Z", "search_remote_repo", { query: "x" }, { hits: [] }),
+			),
+		);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
+
+		expect(references.map((r) => r.mapKey).sort()).toEqual([
+			"jollimemory:get_decision_timeline",
+			"jollimemory:recall",
+			"jollimemory:search",
+		]);
+		// A bare recall records the literal placeholder, not a resolved branch name.
+		const recall = references.find((r) => r.nativeId === "recall");
+		expect(recall?.description).toBe(formatAccumulatedEntry("(current branch)", "2026-07-28T08:00:00.000Z"));
+		expect(recall?.toolName).toBe("mcp__jollimemory__recall");
 	});
 });

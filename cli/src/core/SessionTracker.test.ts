@@ -50,6 +50,7 @@ import type {
 	SquashPendingState,
 	TranscriptCursor,
 } from "../Types.js";
+import { formatAccumulatedEntry } from "./references/ReferenceStore.js";
 import {
 	associateNoteWithCommit,
 	associatePlanWithCommit,
@@ -2250,6 +2251,42 @@ describe("SessionTracker", () => {
 			expect(e?.url).toBe("https://linear.app/x/PROJ-1528/v2");
 			expect(e?.sourceToolName).toBe("mcp__linear__list_issues");
 			expect(e?.addedAt).toBe(addedAt); // preserved
+		});
+
+		// Regression: `writeReferenceMarkdown` is a read-modify-write for an
+		// `accumulateBody` source, so it has to run INSIDE plans.lock. Called outside
+		// it, two writers of one mapKey each fold the same pre-merge body and the
+		// later write drops the other's query — a silent lost update.
+		it("does not lose a query when two writers race on one accumulating body", async () => {
+			// `description` arrives in entry-line form: ReferenceExtractor formats it
+			// via the same helper before the ref ever reaches the store.
+			const lookup = (query: string, at: string): Reference => ({
+				mapKey: "jollimemory:search",
+				source: "jollimemory",
+				nativeId: "search",
+				title: "Search",
+				description: formatAccumulatedEntry(query, at),
+				toolName: "mcp__jollimemory__search",
+				referencedAt: at,
+			});
+
+			// Seed first: with no prior body there is nothing to merge, and the racing
+			// writes would be harmless.
+			await upsertReferenceEntry(lookup("seed", "2026-07-20T00:00:00Z"), tempDir);
+
+			// The real contention — `jollimemory:search` is keyed on the TOOL, not on the
+			// agent, so the Claude Stop hook and the Codex discovery tick write this one
+			// file. Same shape as two processes: both reads land before either write.
+			await Promise.all([
+				upsertReferenceEntry(lookup("queryA", "2026-07-21T00:00:00Z"), tempDir),
+				upsertReferenceEntry(lookup("queryB", "2026-07-22T00:00:00Z"), tempDir),
+			]);
+
+			const reg = await loadPlansRegistry(tempDir);
+			const sourcePath = reg.references?.["jollimemory:search"]?.sourcePath;
+			expect(sourcePath).toBeDefined();
+			const body = await readFile(sourcePath as string, "utf-8");
+			for (const q of ["seed", "queryA", "queryB"]) expect(body).toContain(`\`${q}\``);
 		});
 	});
 

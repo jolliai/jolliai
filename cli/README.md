@@ -19,7 +19,7 @@ Turns your AI coding sessions into structured development documentation attached
 - **MCP server for AI agents** — `jolli mcp` exposes your history to Claude Code (and any MCP-aware agent) so it can search memories, recall a branch, and trace a decision's history without leaving the chat. Registered automatically on `jolli enable`.
 - **Knowledge wiki** — `jolli compile` folds the work scattered across many commits into per-topic pages and a browsable `_wiki/` folder in your Memory Bank, updated automatically after each commit.
 - **Knowledge graph** — `jolli graph` exports the wiki's topics as an interactive, self-contained HTML map of categories, knowledge units, and the typed links between them. Built incrementally alongside the wiki on every commit.
-- **Issue, page & conversation references** — Linear, Jira, GitHub, Notion, Slack, Zoom, Confluence, Asana, and monday.com items mentioned in your AI conversations are captured and attached to the relevant memory, along with context7 library-documentation lookups.
+- **Issue, page & conversation references** — Linear, Jira, GitHub, Notion, Slack, Zoom, Confluence, Asana, and monday.com items mentioned in your AI conversations are captured and attached to the relevant memory, along with context7 library-documentation lookups and Jolli's own memory lookups (`recall` / `search` / `get_decision_timeline` — the question asked is recorded, never the memory that came back). **Claude Code and Codex only:** every other supported agent's transcript format discards the tool calls this reads, so references are simply never captured there.
 - **Privacy-first** — transcripts and diff go straight to Anthropic (with your `apiKey`) or via the Jolli LLM proxy (in-memory, never persisted). Raw transcripts are never uploaded to Jolli Space.
 
 Jump to: [Jolli Memory](#jolli-memory) · [How It Works](#how-it-works) · [Installation](#installation) · [CLI Commands](#cli-commands) · [Session Context Recall](#session-context-recall) · [Configuration](#configuration) · [Privacy](#privacy)
@@ -82,7 +82,7 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | -- | -- |
 | **Claude Code** | A lightweight `StopHook` fires after each AI response; a `SessionStartHook` injects a mini-briefing at session start |
 | **Gemini** | An `AfterAgent` hook fires after each agent completion |
-| **Codex** | No hook needed — sessions are discovered automatically by scanning the filesystem. Linear/Jira/GitHub/Notion/Slack/Zoom/Confluence/Asana/monday.com references in Codex MCP calls are extracted on the VS Code sidebar's 60s polling tick (not at commit time) |
+| **Codex** | No hook needed — sessions are discovered automatically by scanning the filesystem. Linear/Jira/GitHub/Notion/Slack/Zoom/Confluence/Asana/monday.com/Jolli-Memory references in Codex MCP calls are extracted on the VS Code sidebar's 60s polling tick (not at commit time) |
 | **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database at `~/.local/share/opencode/opencode.db` (requires Node 22.5+) |
 | **Cursor IDE** (Composer) | No hook needed — sessions are discovered automatically by reading Cursor's local SQLite stores (`globalStorage/state.vscdb` plus per-workspace `workspaceStorage/` databases under your platform's Cursor user-data directory) |
 | **GitHub Copilot CLI** | No hook needed — sessions are discovered automatically by scanning Copilot CLI's session log |

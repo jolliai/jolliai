@@ -190,9 +190,13 @@ function toReferenceInfo(mapKey: string, entry: ReferenceEntry): ReferenceInfo {
 		nativeId: entry.nativeId,
 		mapKey,
 		title: entry.title,
-		// entry.url is optional in the model, but every shipping source requires
-		// it, so it is effectively always present; ReferenceInfo.url stays a
-		// required string end-to-end (empty = "no url") as a defensive default.
+		// entry.url is optional in the model, and an empty result here is now a
+		// real state rather than a defensive default: `jollimemory` records a
+		// local memory lookup with no upstream page. ReferenceInfo.url stays a
+		// required string end-to-end (empty = "no url"); display code tests that
+		// emptiness to decide whether to offer an open-in-browser affordance at
+		// all, so the scheme guard in openReferenceInBrowser is never reached
+		// with an empty URL through a UI path.
 		url: entry.url ?? "",
 		sourcePath: entry.sourcePath,
 		...(frontmatter.fields !== undefined ? { fields: frontmatter.fields } : {}),
@@ -282,6 +286,16 @@ function readFrontmatter(sourcePath: string): ParsedFrontmatter {
 		}
 	}
 	if (refFields.length > 0) out.fields = refFields;
+	// A PREVIEW, not the body: enough for the hover card, bounded so a long body
+	// doesn't ride along on every tree refresh.
+	//
+	// One consumer reads structure out of this string rather than just displaying it:
+	// `accumulatedQueryOf` (via PlansTreeProvider) pulls the newest `- \`query\` — <ts>`
+	// entry line out of it. That line is normally first, but the cut can still land
+	// mid-line — a query over ~180 chars, or hand-edited strays (hoisted ABOVE the
+	// entry list) eating the budget first. The regex then simply doesn't match and the
+	// row falls back to a bare date, which is why this is a preview cap rather than a
+	// contract: widen it if the fallback starts showing up, don't parse around it.
 	if (body.length > 0) out.description = body.slice(0, 200);
 	return out;
 }

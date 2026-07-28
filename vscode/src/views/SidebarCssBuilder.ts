@@ -12,7 +12,7 @@
  * generated-rules expression below uses plain string concatenation for the
  * same reason.
  */
-import { SOURCE_META } from "./SourceLabels.js";
+import { NEUTRAL_SOURCE_COLOR, SOURCE_META } from "./SourceLabels.js";
 
 export function buildSidebarCss(): string {
 	return `
@@ -1213,7 +1213,7 @@ export function buildSidebarCss(): string {
 		// biome-ignore lint/style/useTemplate: must stay backtick-free (see file header re: the backtick trap)
 		.map(([id, meta]) => "  .mem-ctx-badge--" + id + " { background: " + meta.color + "; }")
 		.join("\n  ")}
-  .mem-ctx-badge--reference { background: #6e7681; }
+  .mem-ctx-badge--reference { background: ${NEUTRAL_SOURCE_COLOR}; }
   /* Conversation evidence: trailing "N msgs" count. The leading glyph is the
      shared per-source brand icon (.conv-source-icon), so the agent identity
      reads identically here, on the live CONVERSATIONS rows, and on Pinned. */

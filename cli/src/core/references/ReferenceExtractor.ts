@@ -20,6 +20,10 @@
  * latest `referencedAt`. If timestamps tie, the later-seen entry wins
  * (preserves get→list resolution order from the transcript) — which is why the
  * parser must emit results in transcript order and the driver must not reorder.
+ * An `accumulateBody` source is the one exception: its bodies MERGE instead of the
+ * newest overwriting the rest, because its references record acts rather than
+ * entities. Bodies are lifted into entry-line form here, at extraction, since the
+ * timestamp each entry needs lives on the `Reference` and never in the payload.
  *
  * Defense-in-depth: every payload walk is wrapped in try/catch so a single
  * pathologically deep payload (attacker-influenceable MCP output) can't abort
@@ -31,7 +35,9 @@ import { createLogger } from "../../Logger.js";
 import type { Reference } from "../../Types.js";
 import { loadConfig } from "../SessionTracker.js";
 import { isObject } from "./guards.js";
+import { formatAccumulatedEntry, mergeAccumulatedBody } from "./ReferenceStore.js";
 import type { SourceDefinition } from "./SourceDefinition.js";
+import { getRegistry } from "./SourceDefinitionRegistry.js";
 import * as SourceEngine from "./SourceEngine.js";
 import { type ExtractOptions, getEnvelopeParser } from "./TranscriptEnvelopeParser.js";
 
@@ -136,7 +142,7 @@ function walkPayload(
 
 	const ref = SourceEngine.extractRef(def, obj, toolName, referencedAt);
 	if (ref !== null) {
-		out.push(ref);
+		out.push(def.accumulateBody === true ? liftAccumulatedBody(ref) : ref);
 		return; // identified as a reference — stop descending
 	}
 
@@ -155,12 +161,59 @@ function walkPayload(
 	}
 }
 
+/**
+ * Rewrite an accumulating source's body into one timestamped entry line, at the
+ * single point where the body text and the call's `referencedAt` are both in hand.
+ *
+ * Doing it here rather than at either merge site is what keeps the merges simple:
+ * every accumulating `Reference` downstream — deduped, stored, rendered, parsed
+ * back — carries the same entry-line shape, so neither collapse point has to work
+ * out whether the body it was handed is a raw query or an already-merged list.
+ *
+ * A body with no text (absent, or whitespace only) has no act to record, so its
+ * `description` is cleared rather than passed through: leaving whitespace in place
+ * would be the one un-lifted body the merge sites are documented never to see, and
+ * both would silently discard it a step later anyway.
+ */
+function liftAccumulatedBody(ref: Reference): Reference {
+	const text = bodyOf(ref).trim();
+	if (text.length === 0) {
+		const { description: _dropped, ...rest } = ref;
+		return rest;
+	}
+	return { ...ref, description: formatAccumulatedEntry(text, ref.referencedAt) };
+}
+
+/** A reference's body as a mergeable string — absent and empty mean the same here. */
+function bodyOf(ref: Reference): string {
+	return ref.description ?? "";
+}
+
+/**
+ * Collapse two same-mapKey references from an accumulating source into one.
+ *
+ * Metadata still follows latest-wins (title / url / toolName describe whichever
+ * call is newer); only the body accumulates.
+ */
+function mergeAccumulatedRefs(existing: Reference, incoming: Reference): Reference {
+	const newest = incoming.referencedAt >= existing.referencedAt ? incoming : existing;
+	return { ...newest, description: mergeAccumulatedBody(bodyOf(existing), bodyOf(incoming)) };
+}
+
 function dedupeKeepLatest(refs: ReadonlyArray<Reference>): Reference[] {
 	const byMapKey = new Map<string, Reference>();
 	for (const ref of refs) {
 		const existing = byMapKey.get(ref.mapKey);
 		if (existing === undefined) {
 			byMapKey.set(ref.mapKey, ref);
+			continue;
+		}
+		// An accumulating source's identity is an ACT, not an entity: two memory queries
+		// sharing a mapKey are two distinct facts, so keeping only the newer would
+		// discard the record. Every other source describes an entity, where a second
+		// fetch of the same entity legitimately supersedes the first.
+		if (getRegistry().byId(ref.source)?.accumulateBody === true) {
+			byMapKey.set(ref.mapKey, mergeAccumulatedRefs(existing, ref));
 			continue;
 		}
 		if (ref.referencedAt >= existing.referencedAt) {

@@ -157,6 +157,7 @@ vi.mock("../core/SessionTracker.js", () => ({
 }));
 
 vi.mock("../core/references/ReferenceStore.js", () => ({
+	accumulatedQueryOf: vi.fn().mockReturnValue(undefined),
 	referencePath: vi.fn(
 		(c: string, source: string, key: string) => `${c}/.jolli/jollimemory/references/${source}/${key}.md`,
 	),

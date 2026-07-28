@@ -34,6 +34,7 @@ import type { SourceDefinition } from "./SourceDefinition.js";
 import { getRegistry } from "./SourceDefinitionRegistry.js";
 import { normalizeConfluence } from "./sources/ConfluenceNormalize.js";
 import { normalizeContext7 } from "./sources/Context7Normalize.js";
+import { normalizeJolliMemory } from "./sources/JolliMemoryNormalize.js";
 import { normalizeMonday, readItemIds } from "./sources/MondayNormalize.js";
 import { normalizeSlackThread } from "./sources/SlackNormalize.js";
 import { normalizeZoomDoc } from "./sources/ZoomDocNormalize.js";
@@ -299,6 +300,14 @@ function readZoomDocToolInput(input: unknown): { fileId: string } | undefined {
 interface ContextNormalizeEnv {
 	readonly permalinks: Map<string, string>;
 	readonly opts: ExtractOptions;
+	/**
+	 * The MCP tool name that produced this call. A source matching a SINGLE tool can
+	 * ignore it (every source here does today). A source matching several tools of one
+	 * server cannot always recover which one fired from the arguments alone — two tools
+	 * may take no arguments at all, making their inputs byte-identical — so the name
+	 * has to be threaded rather than inferred.
+	 */
+	readonly toolName: string;
 }
 
 /**
@@ -341,6 +350,10 @@ const CONTEXT_NORMALIZERS: Record<
 	confluence: (payload) => normalizeConfluence(payload),
 	monday: (payload, toolInput) => normalizeMonday(payload, { itemIds: readItemIds(toolInput) }),
 	context7: (_payload, toolInput) => normalizeContext7(toolInput),
+	// The only normalizer that reads `env.toolName`: this source matches three tools,
+	// and a bare `recall()` arrives with the same empty input as the tools it must NOT
+	// capture, so the name is the only thing that can distinguish them.
+	jollimemory: (_payload, toolInput, env) => normalizeJolliMemory(toolInput, env.toolName),
 };
 
 /**
@@ -438,7 +451,11 @@ function collectToolResults(
 			? CONTEXT_NORMALIZERS[pendingEntry.def.id]
 			: undefined;
 		if (contextNormalize !== undefined) {
-			const canonical = contextNormalize(parsedPayload, pendingEntry.toolInput, { permalinks, opts });
+			const canonical = contextNormalize(parsedPayload, pendingEntry.toolInput, {
+				permalinks,
+				opts,
+				toolName: pendingEntry.toolName,
+			});
 			if (canonical === null) {
 				pending.delete(b.tool_use_id);
 				continue;

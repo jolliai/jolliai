@@ -38,6 +38,39 @@ const log = createLogger("SearchIndex");
 const INDEX_FILE = "search-index.json";
 const MANIFEST_FILE = "search-index.manifest.json";
 
+/**
+ * Whether persisting the freshly built index to disk is required or best-effort.
+ *
+ * `required` — an EXPLICIT reindex (`rebuild`, driven by `jolli compile`'s warm-up).
+ * Landing the file IS the point there: it is what lets a later MCP server process
+ * skip the rebuild. Swallowing a write failure would report a warm-up that did not
+ * actually warm anything.
+ *
+ * `best-effort` — an IMPLICIT rebuild behind a read (`open` / `openCached`, i.e. a
+ * search whose cache went stale). The caller wants results; the cache is an
+ * optimization for next time, so a write failure must not fail the search — but
+ * only a PERMISSION failure, see {@link isCacheWriteDenied}.
+ */
+type CachingMode = "required" | "best-effort";
+
+/**
+ * Whether a failed cache write is the sandbox's "you may not write here" — the one
+ * failure a read is allowed to shrug off.
+ *
+ * Scoped deliberately narrowly. The condition this exists for is an agent sandbox
+ * denying writes to the Memory Bank (which `resolveIndexDir` roots folder-backed
+ * storage at, outside the writable workspace): nothing about the request is wrong,
+ * so degrading to "no cache this time" is right. A disk-full, a missing parent
+ * because the Memory Bank folder was moved, or a corrupt directory is a real
+ * misconfiguration; swallowing those would turn every subsequent search into a
+ * silent full rebuild with nothing but a debug-log line to show for it. Those
+ * propagate so the caller can surface them.
+ */
+function isCacheWriteDenied(err: unknown): boolean {
+	const code = (err as NodeJS.ErrnoException | undefined)?.code;
+	return code === "EPERM" || code === "EACCES" || code === "EROFS";
+}
+
 /** The concrete Orama db type for our schema — lets `insertMultiple`/`search` stay type-clean. */
 type SearchDb = Orama<typeof SEARCH_SCHEMA>;
 
@@ -83,7 +116,7 @@ export class SearchIndex {
 
 		// Build with the signature we already computed — don't recompute it (each
 		// recompute re-reads index + catalog + topic index off disk).
-		const { index } = await SearchIndex.build(cwd, storage, sig);
+		const { index } = await SearchIndex.build(cwd, storage, sig, "best-effort");
 		return index;
 	}
 
@@ -101,7 +134,9 @@ export class SearchIndex {
 		if (hit && hit.sig === sig) return hit.index;
 
 		const restored = await tryRestore(dir, sig);
-		const index = restored ? new SearchIndex(restored) : (await SearchIndex.build(cwd, storage, sig)).index;
+		const index = restored
+			? new SearchIndex(restored)
+			: (await SearchIndex.build(cwd, storage, sig, "best-effort")).index;
 		SearchIndex.cache.set(dir, { sig, index });
 		return index;
 	}
@@ -130,11 +165,41 @@ export class SearchIndex {
 		cwd: string,
 		storage: StorageProvider | undefined,
 		sig: string,
+		caching: CachingMode = "required",
 	): Promise<{ index: SearchIndex; docCount: number }> {
 		const docs = await collectSearchDocs(cwd, storage);
 		const db: SearchDb = create({ schema: SEARCH_SCHEMA, components: { tokenizer: createSearchTokenizer() } });
 		await insertMultiple(db, docs);
-		await persistTo(resolveIndexDir(cwd, storage), db, sig);
+		const dir = resolveIndexDir(cwd, storage);
+		if (caching === "required") {
+			await persistTo(dir, db, sig);
+		} else {
+			try {
+				await persistTo(dir, db, sig);
+			} catch (err) {
+				// The persisted copy is a CACHE; `db` above is already a complete, usable
+				// index. So on a search-triggered rebuild a PERMISSION failure degrades to
+				// "no cache this time" rather than failing the read that triggered it.
+				//
+				// This is what lets `search` work inside a sandboxed agent. Folder-backed
+				// storage roots the index at the Memory Bank (see resolveIndexDir), which
+				// sits outside the workspace an agent sandbox makes writable, so persisting
+				// raises EPERM there. It only surfaces when the cache is STALE — a fresh
+				// cache never reaches this path — which is why it looks intermittent: any
+				// commit changes the source signature and forces the rebuild.
+				//
+				// Anything else (disk full, a Memory Bank folder that moved out from under
+				// us, a corrupt index dir) is a real fault, not a sandbox: rethrow rather
+				// than convert it into a permanently un-cached search whose only trace is
+				// a debug-log line.
+				if (!isCacheWriteDenied(err)) throw err;
+				log.warn(
+					"Search index built but not cached to %s: %s — serving from memory; the next search rebuilds it",
+					dir,
+					(err as Error).message,
+				);
+			}
+		}
 		log.info("Built search index: %d docs", docs.length);
 		return { index: new SearchIndex(db), docCount: docs.length };
 	}

@@ -49,10 +49,40 @@ export const SOURCE_META: Record<KnownSourceId, SourceMeta> = {
 	asana: { label: "Asana", letter: "A", icon: "checklist", color: "#f06a6a" },
 	monday: { label: "monday.com", letter: "M", icon: "table", color: "#ff3d57" },
 	context7: { label: "Context7", letter: "7", icon: "book", color: "#0b7285" },
+	// Jolli's own memory — `#9B5CFF` is the primary from `vscode/assets/icon.svg`. The
+	// letter collides with Jira's, as zoom-meeting/zoom-doc already collide on Z; the
+	// badge colors differ, and Jolli is the first-party brand here.
+	jollimemory: { label: "Jolli Memory", letter: "J", icon: "history", color: "#9B5CFF" },
 };
 
-/** Neutral badge color for a source outside {@link SOURCE_META} (matches the prior `.mem-ctx-badge--reference` fallback hue). */
-const NEUTRAL_SOURCE_COLOR = "#6e7681";
+/**
+ * Neutral badge color for a source outside {@link SOURCE_META}.
+ *
+ * Exported because it must be the SAME hue in three places, and the agreement
+ * used to rest on a comment: this constant (used by {@link getSourceMeta}'s
+ * fallback), and the `.mem-ctx-badge--reference` rule in both
+ * `SidebarCssBuilder` and `NextMemoryCssBuilder`. Both webviews' `ctxBadge`
+ * routes an unknown source to that CSS class — its per-source siblings are
+ * generated from `SOURCE_META`, so an unknown id matches no rule — which makes
+ * this the actual rendered fallback color. Import it rather than re-typing the
+ * literal so the three stay locked together.
+ */
+export const NEUTRAL_SOURCE_COLOR = "#6e7681";
+
+/**
+ * The per-source CSS class token for a source id: `src-<id>`, with every byte
+ * outside `[A-Za-z0-9_-]` collapsed to `-`.
+ *
+ * A source id is a plain string from disk, not a closed enum, so it can in
+ * principle carry a byte that is not a legal CSS identifier — a space would end the
+ * token and inject a second class, a `.` or `#` would break the generated selector.
+ * The generated rules and every consumer both go through here, so a sanitized id
+ * still lands on its own rule and an id with no rule keeps the kind marker's
+ * neutral hue (which is the correct outcome for an unknown source anyway).
+ */
+export function sourceClassToken(id: string): string {
+	return `src-${id.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+}
 
 /**
  * Resolves display metadata for any `SourceId`, falling back to a derived

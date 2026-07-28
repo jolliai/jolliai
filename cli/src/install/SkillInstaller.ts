@@ -599,7 +599,7 @@ name: jolli-recall
 description: Recall prior development context from Jolli for the current branch. Use when the user wants to recall, remember, or resume prior work on a branch.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 1
+  revision: 2
   vendor: "jolli.ai"
 ---
 
@@ -618,13 +618,20 @@ user's prompt about that branch.
 
 ### Preferred: MCP tool
 
-If \`mcp__jollimemory__recall\` is available, call it with \`{ "branch": "<user-arg>" }\`
-(omit \`branch\` when \`<user-arg>\` is empty). It returns a \`type\`-tagged object —
-\`recall\` / \`catalog\` / \`error\` — identical to the CLI fallback below.
+If the \`recall\` tool from the \`jollimemory\` MCP server is available, call it with
+\`{ "branch": "<user-arg>" }\` (omit \`branch\` when \`<user-arg>\` is empty). It
+returns a \`type\`-tagged object — \`recall\` / \`catalog\` / \`error\` — identical to
+the CLI fallback below.
+
+Match that tool by what it DOES, not by one host's spelling of it: Claude Code
+prefixes it as \`mcp__jollimemory__recall\`, while Codex exposes a bare \`recall\`
+inside the \`mcp__jollimemory\` namespace and loads MCP tools lazily — so an empty
+first look is not proof it is absent.
 
 ### Fallback: CLI here-doc
 
-If no such tool is available, use:
+Only if the jollimemory MCP server is not registered at all — NOT merely because
+one spelling of the tool name is absent from your tool list. Then use:
 
 ${heredocInvocation("recall", " --format json")}
 
@@ -822,7 +829,7 @@ name: jolli-search
 description: Search structured commit memories across all branches — decisions, topics, files. Use when the user wants to find prior decisions, related commits, or how a topic was handled before.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 1
+  revision: 2
   vendor: "jolli.ai"
 ---
 
@@ -856,7 +863,7 @@ need depth.
 
 ### Preferred: MCP tool
 
-If \`mcp__jollimemory__search\` is available, call it with:
+If the \`search\` tool from the \`jollimemory\` MCP server is available, call it with:
 
 \`\`\`json
 { "query": "<query>", "limit": 20 }
@@ -865,9 +872,17 @@ If \`mcp__jollimemory__search\` is available, call it with:
 Returns \`{ "hits": [ { type, title, snippet, branch, commitDate, slug, hash, score } ] }\`,
 relevance-ranked (BM25). Proceed to Step 3 with these hits.
 
+Match that tool by what it DOES, not by one host's spelling of it: Claude Code
+prefixes it as \`mcp__jollimemory__search\`, while Codex exposes a bare \`search\`
+inside the \`mcp__jollimemory\` namespace and loads MCP tools lazily — so an empty
+first look is not proof it is absent.
+
 ### Fallback: CLI here-doc
 
-If no such tool is available, use:
+Only if the jollimemory MCP server is not registered at all — NOT merely because
+one spelling of the tool name is absent from your tool list. Prefer the MCP tool:
+in a sandboxed agent this CLI path cannot write its search index cache, so it
+rebuilds the whole index on every call. Then use:
 
 ${heredocInvocation("search", " --format json")}
 
@@ -1372,7 +1387,7 @@ name: jolli
 description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, run a workflow local or remote, workflow history) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 5
+  revision: 6
   vendor: "jolli.ai"
 ---
 
@@ -1446,10 +1461,16 @@ the Workflow history action runs its \`run-cli\` commands directly as shown abov
 
 ### Jolli MCP tools (whatever is registered this session)
 
-Surface every tool whose name starts with \`mcp__jollimemory__\` that is available
-in the current session — for example \`recall\`, \`search\`, \`get_pr_description\`,
-\`queue_status\`, and any manifest-driven platform tools (space, article, and the
-like). Route a choice by calling the matching \`mcp__jollimemory__*\` tool.
+Surface every jollimemory MCP tool registered in the current session — for example
+\`recall\`, \`search\`, \`get_pr_description\`, \`queue_status\`, and any
+manifest-driven platform tools (space, article, and the like). Route a choice by
+calling the matching tool.
+
+**How to find them depends on the host.** On Claude Code they are prefixed, so
+match names starting with \`mcp__jollimemory__\`. On Codex the same tools are BARE
+names inside the \`mcp__jollimemory\` namespace, so a prefix match finds nothing —
+look for the namespace instead, and note that Codex loads MCP tools lazily, so
+search your available tools before concluding none are registered.
 
 **Exclusions — do NOT surface these as standalone menu items:**
 
@@ -1528,7 +1549,7 @@ name: jolli
 description: The Jolli front door — checks how Jolli is set up in this repo, guides first-time setup through /jolli:init when something's missing, and otherwise shows a status snapshot and routes you to the right Jolli skill or MCP tool. Use when the user types /jolli or asks for Jolli / the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 6
+  revision: 7
   vendor: "jolli.ai"
 ---
 

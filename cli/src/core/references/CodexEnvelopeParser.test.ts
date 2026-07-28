@@ -1354,3 +1354,139 @@ describe("context7 codex_apps connector (PRIMARY path, prose result)", () => {
 		expect(results[0].payload).toEqual({ libraryId: "/vercel/next.js", query: "middleware in the app router" });
 	});
 });
+
+// ─── jollimemory local MCP (fallback path, arguments-derived, three tools) ────
+// Captured verbatim from a live Codex rollout 2026-07-28 (plan Step 5 Task 1).
+// Jolli is a LOCAL MCP server, which Codex shapes differently from BOTH Claude
+// and its own codex_apps connectors: `invocation.tool` is the BARE tool name,
+// undotted — contrast context7's local `query-docs` and Rovo's dotted
+// `atlassian_rovo.getJiraIssue`.
+//
+// Every case below deliberately supplies ONLY the mcp_tool_call_end row. That is
+// not a shortcut: the paired `function_call` row carries no namespace and a bare
+// name, so it matches none of the parser's four line needles and is dropped
+// before parsing. The FALLBACK is the only path that can see this server, and
+// `invocation` carries server + tool + parsed arguments together, so nothing is
+// lost. `result` is present but never read (argumentsDerived).
+
+describe("jollimemory local MCP (fallback path, three bare tool names)", () => {
+	function jolliEnd(tool: string, args: unknown, callId = "calljm", server: unknown = "jollimemory"): string {
+		return JSON.stringify({
+			timestamp: "2026-07-28T12:44:08.079Z",
+			type: "event_msg",
+			payload: {
+				type: "mcp_tool_call_end",
+				call_id: callId,
+				// server is "jollimemory", not "codex_apps" — faithful to the capture, and
+				// load-bearing: these `invocationTools` are BARE names, so the definition
+				// pins itself to this server (`MatchCodex.invocationServer`) and the registry
+				// reads `invocation.server` to enforce it. `server` is parameterized so the
+				// foreign-server cases below can vary exactly that one field.
+				invocation: { server, tool, arguments: args },
+				result: { Ok: { content: [{ type: "text", text: '{"ignored":"never read"}' }] } },
+			},
+		});
+	}
+
+	it("extracts a recall reference, defaulting the branchless call to the literal", () => {
+		const { results } = codexEnvelopeParser.parse([jolliEnd("recall", {})], {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("jollimemory");
+		expect(results[0].payload).toEqual({ tool: "recall", title: "Recall", query: "(current branch)" });
+	});
+
+	it("extracts a search reference from the captured query/limit arguments", () => {
+		const { results } = codexEnvelopeParser.parse([jolliEnd("search", { query: "oauth", limit: 10 })], {});
+		expect(results).toHaveLength(1);
+		expect(results[0].payload).toEqual({ tool: "search", title: "Search", query: "oauth" });
+	});
+
+	it("extracts a get_decision_timeline reference from the captured slug", () => {
+		const line = jolliEnd("get_decision_timeline", { slug: "ide-sign-in-support" });
+		const { results } = codexEnvelopeParser.parse([line], {});
+		expect(results).toHaveLength(1);
+		expect(results[0].payload).toEqual({
+			tool: "get_decision_timeline",
+			title: "Decision timeline",
+			query: "ide-sign-in-support",
+		});
+	});
+
+	it("persists each tool's CLAUDE spelling so sourceToolName is host-independent", () => {
+		// The point of the canonicalToolName resolver: one binding, three tools, and
+		// the stored name must equal what the Claude path stores for the same lookup.
+		// A single literal string could not do this.
+		const lines = [
+			jolliEnd("recall", {}, "c1"),
+			jolliEnd("search", { query: "oauth" }, "c2"),
+			jolliEnd("get_decision_timeline", { slug: "ide-sign-in-support" }, "c3"),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.map((r) => r.toolName)).toEqual([
+			"mcp__jollimemory__recall",
+			"mcp__jollimemory__search",
+			"mcp__jollimemory__get_decision_timeline",
+		]);
+	});
+
+	it("ignores sibling tools of the same server", () => {
+		// `invocationTools` is matched with Array.includes, so this exclusion is exact
+		// by construction — no `denySuffixes`/`exact` equivalent is needed on Codex.
+		const lines = [
+			jolliEnd("search_remote_articles", { query: "oauth" }, "s1"),
+			jolliEnd("list_branches", {}, "s2"),
+			jolliEnd("status", {}, "s3"),
+		];
+		expect(codexEnvelopeParser.parse(lines, {}).results).toHaveLength(0);
+	});
+
+	it("voids a search whose required argument is unreadable", () => {
+		// recall defaults (the act is the fact worth recording) but search/timeline
+		// have nothing to describe without their argument.
+		expect(codexEnvelopeParser.parse([jolliEnd("search", {})], {}).results).toHaveLength(0);
+		expect(codexEnvelopeParser.parse([jolliEnd("get_decision_timeline", {})], {}).results).toHaveLength(0);
+	});
+
+	it("does not capture another local MCP server's identically-named bare tool", () => {
+		// The bare names this source registers — `search`, `recall` — are names ANY
+		// locally-registered server may expose, and the invocation path is one flat scan
+		// across every definition. Only `invocation.server` separates them, so a foreign
+		// server's search must produce nothing rather than a Jolli Memory reference
+		// carrying that server's query text.
+		const lines = [
+			jolliEnd("search", { query: "someone else's query" }, "f1", "some-docs-server"),
+			jolliEnd("recall", {}, "f2", "claude-mem"),
+			jolliEnd("get_decision_timeline", { slug: "x" }, "f3", "codex_apps"),
+		];
+		expect(codexEnvelopeParser.parse(lines, {}).results).toHaveLength(0);
+	});
+
+	it("fails closed on an event whose invocation carries no usable server", () => {
+		// Non-string: unattributable, so dropped. Mis-attributing a foreign lookup is
+		// worse than missing one, and every real event carries the field as a string.
+		// (`undefined` is deliberately NOT in this list — passing it would trigger
+		// jolliEnd's default and silently re-test the happy path. The truly-absent key
+		// is covered by the case below.)
+		for (const server of [null, 42, { name: "jollimemory" }]) {
+			const line = jolliEnd("search", { query: "oauth" }, "n1", server);
+			expect(codexEnvelopeParser.parse([line], {}).results).toHaveLength(0);
+		}
+	});
+
+	it("fails closed on an event whose invocation omits the server key entirely", () => {
+		// Built inline rather than through jolliEnd: JSON.stringify drops an explicit
+		// `undefined`, but passing `undefined` as the helper's argument would take its
+		// default instead, so absence cannot be expressed through the helper.
+		const line = JSON.stringify({
+			timestamp: "2026-07-28T12:44:08.079Z",
+			type: "event_msg",
+			payload: {
+				type: "mcp_tool_call_end",
+				call_id: "n2",
+				invocation: { tool: "search", arguments: { query: "oauth" } },
+				result: { Ok: { content: [{ type: "text", text: '{"ignored":"never read"}' }] } },
+			},
+		});
+		expect(codexEnvelopeParser.parse([line], {}).results).toHaveLength(0);
+	});
+});

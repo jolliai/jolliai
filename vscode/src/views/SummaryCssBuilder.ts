@@ -6,6 +6,7 @@
  */
 
 import { buildPrSectionCss } from "../services/PrCommentService.js";
+import { NEUTRAL_SOURCE_COLOR, SOURCE_META, sourceClassToken } from "./SourceLabels.js";
 
 /** Returns the full CSS stylesheet for the Notion-like Clean design. */
 export function buildCss(): string {
@@ -1325,7 +1326,20 @@ export function buildCss(): string {
   }
   .kb-tag.t-plan { background: var(--vscode-charts-green,  #388a34); }
   .kb-tag.t-note { background: var(--vscode-charts-orange, #d18616); }
-  .kb-tag.t-ref  { background: #5e6ad2; }
+  /* .t-ref is the KIND marker (layout rules below select on it) and now carries
+     only the unknown-source fallback hue. It used to hardcode #5e6ad2, which is
+     Linear's brand colour from SOURCE_META — a leftover from when Linear was the
+     only reference source. Every other source silently inherited it, so eleven
+     providers rendered as Linear blue-violet with only the letter differing.
+     Per-source hues are generated below from the same SOURCE_META the sidebar
+     uses, and must stay AFTER this rule: equal specificity, so source order
+     decides. An id with no generated rule keeps this neutral grey, matching what
+     getSourceMeta reports and what both other webviews render. */
+  .kb-tag.t-ref  { background: ${NEUTRAL_SOURCE_COLOR}; }
+${Object.entries(SOURCE_META)
+		// biome-ignore lint/style/useTemplate: must stay backtick-free — this file is one big template literal
+		.map(([id, meta]) => "  .kb-tag." + sourceClassToken(id) + " { background: " + meta.color + "; }")
+		.join("\n")}
 
   /* ── Conversations panel (inline rows, mockup) ── */
   /* Count after the panel title (Conversations / Files / Context share it).

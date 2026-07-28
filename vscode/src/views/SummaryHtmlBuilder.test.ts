@@ -1304,14 +1304,111 @@ describe("SummaryHtmlBuilder", () => {
 				expect(html).toContain('data-action="translateReference"');
 			});
 
-			it("renders a reference with no url (defensive — no shipping source emits one) with an empty data-reference-url", () => {
-				// ReferenceCommitRef.url is optional in the type but every shipping
-				// source requires it, so this is a defensive case — buildReferenceRow
-				// must not blow up or emit the literal string "undefined" into the
-				// Open-in-<Source> button's data attribute.
+			it("omits the open-in-source button entirely for a reference with no url", () => {
+				// `jollimemory` made this a real shipping state rather than a defensive
+				// edge: it records a local memory lookup, so there is no upstream page.
+				// Emitting the button with an empty data-reference-url would only reach
+				// openReferenceInBrowser's scheme guard and raise a warning toast worded
+				// for a tampered URL. The button is omitted upstream instead; the guard
+				// itself stays as the defense against a hand-edited plans.json.
 				const html = buildHtml(makeSummary({ references: [makeLinear({ url: undefined })] }));
-				expect(html).toContain('data-reference-url=""');
+				expect(html).not.toContain('data-action="openReferenceExternal"');
+				expect(html).not.toContain("data-reference-url=");
 				expect(html).not.toContain('data-reference-url="undefined"');
+				// The rest of the row is untouched — preview / edit / remove survive, so
+				// a url-less reference is still fully usable, just not navigable.
+				expect(html).toContain('data-action="previewReference"');
+				expect(html).toContain('data-action="loadReferenceContent"');
+				expect(html).toContain('data-action="removeReference"');
+			});
+
+			it("renders a relative-date chip on reference rows, matching the plan row", () => {
+				// The reference row never rendered one, so its date column sat empty next
+				// to plan rows that showed "N minutes ago". Same .plan-date chip, same
+				// leftmost slot in .r-actions, sourced from the required referencedAt.
+				const html = buildHtml(makeSummary({ references: [makeLinear()] }));
+				expect(html).toContain(`<span class="plan-date">${timeAgo("2026-01-15T10:00:00Z")}</span>`);
+				expect(html).not.toContain('<span class="plan-date">undefined</span>');
+				expect(html).not.toContain("NaN");
+			});
+
+			it("renders the archived latestQuery in the sub-line slot for an accumulating source", () => {
+				// An accumulating source's title is its TOOL label, identical on every row
+				// of every commit, so the date chip alone left the committed row saying
+				// nothing about what happened — the exact gap the uncommitted tree row
+				// closes with `<query> · <date>`. The nativeId sub-line is unused for a
+				// non-tracker source, so the snapshotted query claims that slot.
+				const html = buildHtml(
+					makeSummary({
+						references: [
+							{
+								archivedKey: "jollimemory:search-aaaa1111",
+								source: "jollimemory",
+								nativeId: "search",
+								title: "Search",
+								latestQuery: "queue worker lock",
+								referencedAt: "2026-01-15T10:00:00Z",
+								sourceToolName: "mcp__jollimemory__search",
+							},
+						],
+					}),
+				);
+				expect(html).toContain('<div class="r-sub plan-meta">queue worker lock</div>');
+				// The date chip stays — the query is additive, not a replacement.
+				expect(html).toContain(`<span class="plan-date">${timeAgo("2026-01-15T10:00:00Z")}</span>`);
+			});
+
+			it("routes the latestQuery through escHtml — it is verbatim user-typed text", () => {
+				// The query is whatever the user typed into a recall/search call, so it
+				// reaches this row unfiltered. escHtml is identity-mocked here (see the
+				// SummaryUtils mock), so the assertion is on the call, as elsewhere.
+				buildHtml(
+					makeSummary({
+						references: [
+							{
+								archivedKey: "jollimemory:search-aaaa1111",
+								source: "jollimemory",
+								nativeId: "search",
+								title: "Search",
+								latestQuery: '<img src=x onerror="alert(1)">',
+								referencedAt: "2026-01-15T10:00:00Z",
+								sourceToolName: "mcp__jollimemory__search",
+							},
+						],
+					}),
+				);
+				expect(escHtml).toHaveBeenCalledWith('<img src=x onerror="alert(1)">');
+			});
+
+			it("emits no sub-line for a non-tracker source with no latestQuery", () => {
+				// The fallback arm: a machine-id source (Notion) still omits the metaline
+				// rather than rendering its opaque id as noise.
+				const html = buildHtml(
+					makeSummary({
+						references: [
+							{
+								archivedKey: "notion:abcdef12-aaaa1111",
+								source: "notion",
+								nativeId: "abcdef12",
+								title: "Notion page",
+								url: "https://notion.so/abcdef12",
+								referencedAt: "2026-01-15T10:00:00Z",
+								sourceToolName: "mcp__claude_ai_Notion__notion-fetch",
+							},
+						],
+					}),
+				);
+				expect(html).not.toContain('class="r-sub plan-meta"');
+			});
+
+			it("still renders the open-in-source button for a reference that has a url", () => {
+				// Regression guard for the omission above: every url-bearing source must
+				// keep its globe action.
+				const html = buildHtml(makeSummary({ references: [makeLinear()] }));
+				expect(html).toContain('data-action="openReferenceExternal"');
+				expect(html).toContain(
+					'data-reference-url="https://linear.app/jolliai/issue/PROJ-1/test-linear-issue"',
+				);
 			});
 
 			it("does not render a plansCard or sourceCard wrapper id", () => {
@@ -1372,7 +1469,7 @@ describe("SummaryHtmlBuilder", () => {
 				expect(html).not.toContain("No plans or notes associated with this commit yet");
 			});
 
-			it("excluded reference rows derive their badge letter from the key's source segment", () => {
+			it("excluded reference rows derive their badge letter AND hue from the key's source segment", () => {
 				const html = buildContextPanel(
 					makeSummary({
 						excludedContext: [
@@ -1380,7 +1477,10 @@ describe("SummaryHtmlBuilder", () => {
 						],
 					}),
 				);
-				expect(html).toContain('class="kb-tag t-ref"');
+				// t-ref stays the kind marker (layout rules select on it); src-<id> adds
+				// the per-source hue, so an excluded jira row no longer renders in
+				// Linear's brand colour the way the old fixed .t-ref hue made it.
+				expect(html).toContain('class="kb-tag t-ref src-linear"');
 			});
 
 			it("omits AI rows entirely when there is no excludedContext", () => {

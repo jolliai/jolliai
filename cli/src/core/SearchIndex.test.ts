@@ -9,6 +9,14 @@ vi.mock("./SearchIndexSource.js", () => ({
 	computeSourceSignature: vi.fn(),
 }));
 
+// Spy-through, NOT a stub: the restore-from-disk tests below need real writes to
+// have happened. Individual tests use mockRejectedValueOnce to fail one write.
+vi.mock("./AtomicWrite.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./AtomicWrite.js")>();
+	return { ...actual, atomicWriteFile: vi.fn(actual.atomicWriteFile) };
+});
+
+import { atomicWriteFile } from "./AtomicWrite.js";
 import { SearchIndex } from "./SearchIndex.js";
 import { collectSearchDocs, computeSourceSignature } from "./SearchIndexSource.js";
 
@@ -334,5 +342,69 @@ describe("SearchIndex", () => {
 		vi.mocked(collectSearchDocs).mockClear();
 		await SearchIndex.open(dir);
 		expect(collectSearchDocs).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("SearchIndex caching mode", () => {
+	// Folder-backed storage roots the index at the Memory Bank, which is outside the
+	// workspace an agent sandbox makes writable — so persisting raises EPERM there.
+	// A read must not die because its cache write failed; an explicit warm-up must.
+	const eperm = () =>
+		Object.assign(new Error("EPERM: operation not permitted, open 'search-index.json.tmp'"), { code: "EPERM" });
+
+	it("still returns search results when the cache write fails (read path)", async () => {
+		vi.mocked(atomicWriteFile).mockRejectedValueOnce(eperm());
+		const index = await SearchIndex.openCached(dir);
+		const hits = await index.search({ query: "timeout" });
+		expect(hits.length).toBeGreaterThan(0);
+	});
+
+	it("rebuilds again on the next search after a failed cache write", async () => {
+		// Degrading means NOT caching, so the following search must rebuild rather
+		// than silently serve a half-written index.
+		vi.mocked(atomicWriteFile).mockRejectedValueOnce(eperm());
+		await SearchIndex.open(dir);
+		const firstBuilds = vi.mocked(collectSearchDocs).mock.calls.length;
+		SearchIndex.clearCache();
+		await SearchIndex.open(dir);
+		expect(vi.mocked(collectSearchDocs).mock.calls.length).toBe(firstBuilds + 1);
+	});
+
+	it("propagates the failure for an explicit rebuild (warm-up path)", async () => {
+		// `jolli compile`'s warm-up exists to LAND the file so a later MCP process can
+		// skip the rebuild. Reporting success without it would be a lie.
+		vi.mocked(atomicWriteFile).mockRejectedValueOnce(eperm());
+		await expect(SearchIndex.rebuild(dir)).rejects.toThrow(/EPERM/);
+	});
+
+	it("tolerates every permission-shaped code, not just EPERM", async () => {
+		// EACCES and EROFS are the same "you may not write here" as EPERM — a read-only
+		// mount or a differently-reported sandbox denial must degrade identically.
+		for (const code of ["EACCES", "EROFS"]) {
+			vi.mocked(atomicWriteFile).mockRejectedValueOnce(Object.assign(new Error(`${code}: denied`), { code }));
+			SearchIndex.clearCache();
+			const index = await SearchIndex.openCached(dir);
+			expect((await index.search({ query: "timeout" })).length).toBeGreaterThan(0);
+		}
+	});
+
+	it("propagates a non-permission cache-write failure even on the read path", async () => {
+		// A disk-full or a Memory Bank folder that moved out from under us is a real
+		// fault, not a sandbox. Swallowing it would make every later search silently
+		// pay a full rebuild with only a debug-log line to show for it, so the read
+		// path shrugs off ONLY permission errors.
+		for (const code of ["ENOSPC", "ENOENT", "EISDIR"]) {
+			vi.mocked(atomicWriteFile).mockRejectedValueOnce(Object.assign(new Error(`${code}: boom`), { code }));
+			SearchIndex.clearCache();
+			await expect(SearchIndex.openCached(dir)).rejects.toThrow(new RegExp(code));
+		}
+	});
+
+	it("propagates a failure carrying no errno code at all", async () => {
+		// An unrecognisable failure is not a sandbox denial; defaulting to tolerance
+		// would make the narrow allow-list pointless.
+		vi.mocked(atomicWriteFile).mockRejectedValueOnce(new Error("something else entirely"));
+		SearchIndex.clearCache();
+		await expect(SearchIndex.openCached(dir)).rejects.toThrow(/something else entirely/);
 	});
 });

@@ -50,6 +50,17 @@ describe("buildNextMemoryScript", () => {
 		expect(js).not.toContain("ctxBadge(item.contextValue, item.iconKey)");
 	});
 
+	it("ctxBadge sends a source outside SOURCE_META to the neutral 'reference' hue", () => {
+		// Complements the test above: that one keeps a KNOWN source from missing its
+		// metadata, this one makes a genuinely unknown source degrade identically in
+		// both webviews. The class must not become .mem-ctx-badge--<unknown-id>, which
+		// matches no generated rule and inherits the .kb-tag base's theme colour
+		// instead of NEUTRAL_SOURCE_COLOR. Mirrors SidebarScriptBuilder's ctxBadge.
+		const js = buildNextMemoryScript();
+		expect(js).toContain("badgeKind = s && meta ? s : 'reference';");
+		expect(js).toContain("letter = s ? (meta ? meta.letter : s.slice(0, 1).toUpperCase()) : 'R';");
+	});
+
 	it("renders file rows with the git-status letter", () => {
 		const js = buildNextMemoryScript();
 		expect(js).toContain("'gs gs-' + item.gitStatus");

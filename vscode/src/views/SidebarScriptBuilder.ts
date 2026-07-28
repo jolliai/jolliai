@@ -2524,8 +2524,18 @@ export function buildSidebarScript(): string {
     else if (kind === 'note') letter = 'N';
     else if (kind === 'reference') {
       const s = source || '';
-      badgeKind = s || 'reference';
       const meta = SOURCE_META[s];
+      // Colour class falls back to 'reference' for a source NOT in SOURCE_META
+      // (a phase-2 provider, or one whose stored data predates this bundle).
+      // The per-source rules are generated from SOURCE_META, so an unknown id
+      // matches no rule and the badge silently inherits the base class's
+      // theme-derived descriptionForeground instead of the neutral grey that
+      // getSourceMeta hands every other consumer for the same id. Routing the
+      // unknown case to the 'reference' rule pins it to NEUTRAL_SOURCE_COLOR,
+      // so an unrecognised source looks the same here, in the Working Memory
+      // card, and anywhere reading getSourceMeta().color.
+      // The LETTER still derives from the id, which is more informative than 'R'.
+      badgeKind = s && meta ? s : 'reference';
       letter = s ? (meta ? meta.letter : s.slice(0, 1).toUpperCase()) : 'R';
     }
     return el('span', { className: 'mem-ctx-badge mem-ctx-badge--' + badgeKind, text: letter });
@@ -2994,26 +3004,50 @@ export function buildSidebarScript(): string {
     }
     // Description preview is intentionally not surfaced — see PlansTreeProvider
     // ReferenceItem comment for the rationale.
-    kids.push(el('hr'));
-    // Single action row: Open in <Source>. Remove lives as the row's inline
-    // 🗑 button and Preview / Edit Markdown in the context menu, so the card
-    // stays focused on jumping to the upstream record.
-    const openLabel = SOURCE_TITLES[h.source]
-      ? 'Open in ' + SOURCE_TITLES[h.source]
-      : 'Open in Browser';
-    const openLink = attachTextTip(
-      el('span', {
-        className: 'hc-link',
-        'data-cmd': 'jollimemory.openReferenceInBrowser',
-        'data-hash': mapKey,
-      }, [
-        el('i', { className: 'codicon codicon-link-external' }),
-        el('span', { text: openLabel }),
-      ]),
-      openLabel,
-    );
-    appendAiReasonRow(kids, mapKey);
-    kids.push(el('div', { className: 'hc-actions' }, [openLink]));
+    //
+    // Everything below the rule is built into 'tail' first so the rule itself
+    // stays conditional: a track-only source with no upstream page (jollimemory)
+    // has no open action, and appendAiReasonRow early-returns on a normal row,
+    // so an unconditional rule would leave a bare line dangling under the
+    // fields with nothing beneath it.
+    const tail = [];
+    appendAiReasonRow(tail, mapKey);
+    if (h.url) {
+      // Single action row: Open in <Source>. Remove lives as the row's inline
+      // 🗑 button and Preview / Edit Markdown in the context menu, so the card
+      // stays focused on jumping to the upstream record. Suppressed entirely
+      // when the source has no external page — 'openReferenceInBrowser' would
+      // reject the empty URL at its scheme guard and surface a warning toast
+      // written for tampered URLs, not for an intentionally link-less source.
+      const openLabel = SOURCE_TITLES[h.source]
+        ? 'Open in ' + SOURCE_TITLES[h.source]
+        : 'Open in Browser';
+      tail.push(el('div', { className: 'hc-actions' }, [
+        attachTextTip(
+          el('span', {
+            className: 'hc-link',
+            'data-cmd': 'jollimemory.openReferenceInBrowser',
+            'data-hash': mapKey,
+          }, [
+            el('i', { className: 'codicon codicon-link-external' }),
+            el('span', { text: openLabel }),
+          ]),
+          openLabel,
+        ),
+      ]));
+    } else if (tail.length && tail[tail.length - 1].tagName === 'HR') {
+      // appendAiReasonRow closes its block with a trailing rule on the assumption
+      // that an action row follows. With no action row that rule is the last child
+      // and would dangle, so drop it — but only after confirming it IS the rule.
+      // The unguarded pop() coupled this branch to appendAiReasonRow's last emit
+      // ~160 lines away: if that block ever stops closing with a rule, popping
+      // blind would silently swallow the reason row itself.
+      tail.pop();
+    }
+    if (tail.length) {
+      kids.push(el('hr'));
+      for (let i = 0; i < tail.length; i++) kids.push(tail[i]);
+    }
     return kids;
   }
 
@@ -5988,13 +6022,29 @@ export function buildSidebarScript(): string {
       return;
     }
     if (ctx === 'reference') {
-      showContextMenu(e.clientX, e.clientY, [
+      // 'Open in Browser' is omitted for sources with no upstream page
+      // (jollimemory records a local memory lookup, not a navigable artifact).
+      // The serialized referenceHover carries the url, so the same emptiness
+      // test drives this menu and the hover card's action row.
+      //
+      // Suppress only on a RESOLVED empty url. lookupBranchHoverById scans
+      // branchData.plans and returns null for a row that isn't there (or whose
+      // referenceHover wasn't serialized) — treating that as "no url" would hide
+      // the action for every source, including a Linear row with a perfectly good
+      // link. An unresolvable projection is ignorance, not absence, so it keeps
+      // the item and lets openReferenceInBrowser's own guard have the last word.
+      const refHover = lookupBranchHoverById(id);
+      const refResolved = refHover && refHover.kind === 'reference' && refHover.hover;
+      const refItems = [
         { label: 'Preview',         rawMessage: { type: 'branch:openReferencePreview',  mapKey: id } },
         { label: 'Edit Markdown',   rawMessage: { type: 'branch:openReferenceMarkdown', mapKey: id } },
-        { label: 'Open in Browser', rawMessage: { type: 'branch:openReference',         mapKey: id } },
-        { separator: true },
-        { label: 'Remove',          rawMessage: { type: 'branch:ignoreReference',       mapKey: id } },
-      ]);
+      ];
+      if (!refResolved || refResolved.url) {
+        refItems.push({ label: 'Open in Browser', rawMessage: { type: 'branch:openReference', mapKey: id } });
+      }
+      refItems.push({ separator: true });
+      refItems.push({ label: 'Remove', rawMessage: { type: 'branch:ignoreReference', mapKey: id } });
+      showContextMenu(e.clientX, e.clientY, refItems);
       return;
     }
     if (ctx === 'file' || ctx === 'fileChange') {

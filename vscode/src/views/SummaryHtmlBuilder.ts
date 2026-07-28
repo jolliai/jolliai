@@ -30,7 +30,7 @@ import type {
 	TopicCategory,
 } from "../../../cli/src/Types.js";
 import { annotatePlans } from "../util/PlanGrouping.js";
-import { getSourceMeta } from "./SourceLabels.js";
+import { getSourceMeta, sourceClassToken } from "./SourceLabels.js";
 import { buildCss } from "./SummaryCssBuilder.js";
 import { buildScript } from "./SummaryScriptBuilder.js";
 import { buildSummaryErrorBanner } from "./SummaryErrorBanner.js";
@@ -805,7 +805,11 @@ function buildExcludedRow(e: ExcludedContextItem): string {
 	if (e.kind === "note") tag = `<span class="kb-tag t-note">N</span>`;
 	else if (e.kind === "reference") {
 		const source = e.key.includes(":") ? e.key.slice(0, e.key.indexOf(":")) : e.key;
-		tag = `<span class="kb-tag t-ref">${escHtml(getSourceMeta(source).letter)}</span>`;
+		// src-<id> carries the per-source hue; t-ref stays the kind marker and
+		// supplies the neutral fallback when the id has no generated rule.
+		// sourceClassToken (not raw interpolation) because a source id comes from disk:
+		// an id with a space would end the class token and inject a second class.
+		tag = `<span class="kb-tag t-ref ${escAttr(sourceClassToken(source))}">${escHtml(getSourceMeta(source).letter)}</span>`;
 	}
 	// The "Excluded" chip renders ALWAYS (even with an empty reason) — the ✨ note
 	// is the only optional part. A low-tier item can reach here with no reason
@@ -1320,22 +1324,45 @@ function buildReferenceRow(
 	// Slack / phase-2) it is a meaningless blob already dropped from the title,
 	// and the source is conveyed by the left badge + "Open in <Source>" button —
 	// so the whole metaline is omitted rather than rendered as noise.
+	//
+	// An accumulating source claims that free slot instead: its title is the TOOL
+	// label (`Search`), identical on every row of every commit, so the snapshotted
+	// newest query is the only part that says what happened. This is the committed
+	// analogue of the `<query> · <date>` the uncommitted tree row renders — same
+	// value, same derivation (`accumulatedQueryOf` at archive time), different slot
+	// because this row already carries its own date chip. Only the newest query is
+	// shown; the full list is one Preview click away on the orphan-branch snapshot.
 	const subLine = labelLeadsWithNativeId(e.source)
 		? `\n      <div class="r-sub plan-meta">${escHtml(e.nativeId)} (${escHtml(sourceLabel)})</div>`
-		: "";
+		: e.latestQuery
+			? `\n      <div class="r-sub plan-meta">${escHtml(e.latestQuery)}</div>`
+			: "";
 	const showTranslate = referenceTranslateSet?.has(e.archivedKey) ?? false;
 	const translateBtn = showTranslate
 		? `<button class="topic-action-btn reference-translate-btn" title="Translate to English" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="translateReference">&#x1F310;</button>`
 		: "";
+	// The globe action is omitted for sources with no upstream page (jollimemory
+	// records a local memory lookup, not a navigable artifact). Mirrors the
+	// sidebar hover-card and context-menu suppression; the sink's scheme guard
+	// in openReferenceInBrowser stays untouched as the tampered-URL defense.
+	const openExternalBtn = e.url
+		? `<button class="icon-btn topic-action-btn" title="Open in ${escAttr(sourceLabel)}" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-url="${escAttr(e.url)}" data-action="openReferenceExternal">&#x1F30D;</button>`
+		: "";
+	// Same .plan-date chip, same leftmost slot in .r-actions, as the plan row —
+	// the reference row simply never rendered one. referencedAt is required on
+	// ReferenceCommitRef, so there is no absent case to guard. It reads as "when
+	// this was last consulted", which for an accumulating track-only source is the
+	// most recent lookup rather than a creation date.
+	const dateBadge = `<span class="plan-date">${escHtml(timeAgo(e.referencedAt))}</span>`;
 	return `
   <div class="plan-item" id="reference-${escAttr(e.source)}-${escAttr(domKey)}">
     <div class="row">
-      <span class="kb-tag t-ref">${escHtml(sourceLetter)}</span>
+      <span class="kb-tag t-ref ${escAttr(sourceClassToken(e.source))}">${escHtml(sourceLetter)}</span>
       <div class="r-main">
         <a class="r-title plan-title plan-title-link" href="#" title="Click to preview" data-action="previewReference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}">${escHtml(referenceDisplayTitle(e))}</a>${subLine}
       </div>
       <span class="r-actions plan-header-actions">
-        <button class="icon-btn topic-action-btn" title="Open in ${escAttr(sourceLabel)}" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-url="${escAttr(e.url ?? "")}" data-action="openReferenceExternal">&#x1F30D;</button>
+        ${dateBadge}${openExternalBtn}
         ${translateBtn}<button class="icon-btn topic-action-btn plan-edit-btn" title="Edit ${escAttr(sourceLabel)} snapshot" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="loadReferenceContent">&#x270E;</button>
         <button class="icon-btn topic-action-btn plan-remove-btn" title="Remove ${escAttr(sourceLabel)} Reference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}" data-action="removeReference">&#x1F5D1;</button>
       </span>

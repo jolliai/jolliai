@@ -1632,6 +1632,17 @@ describe("SidebarScriptBuilder", () => {
 			);
 		});
 
+		it("ctxBadge sends a source outside SOURCE_META to the neutral 'reference' hue", () => {
+			// Guards the colour class only: the LETTER still derives from the source id
+			// (more informative than a generic 'R'). Without the meta check the class
+			// would be .mem-ctx-badge--<unknown-id>, which matches no generated rule and
+			// silently inherits the base class's theme colour instead of the neutral
+			// grey getSourceMeta reports for that same id.
+			const js = buildSidebarScript();
+			expect(js).toContain("badgeKind = s && meta ? s : 'reference';");
+			expect(js).toContain("letter = s ? (meta ? meta.letter : s.slice(0, 1).toUpperCase()) : 'R';");
+		});
+
 		it("reference context menu shows Preview / Edit Markdown / Open in Browser / Remove", () => {
 			const js = buildSidebarScript();
 			expect(js).toContain("'Edit Markdown'");
@@ -1639,6 +1650,42 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toMatch(/\{ type: 'branch:openReferencePreview',\s+mapKey: id \}/);
 			expect(js).toMatch(/\{ type: 'branch:openReferenceMarkdown',\s+mapKey: id \}/);
 			expect(js).toMatch(/\{ type: 'branch:ignoreReference',\s+mapKey: id \}/);
+		});
+
+		it("gates the reference context menu's Open in Browser on a non-empty hover url", () => {
+			// A url-less source (jollimemory records a local memory lookup) must not
+			// be offered an action that can only fail. The menu is assembled
+			// conditionally, so Open in Browser is pushed only inside the url test —
+			// Preview / Edit Markdown / Remove stay unconditional.
+			const js = buildSidebarScript();
+			expect(js).toContain("const refHover = lookupBranchHoverById(id);");
+			expect(js).toMatch(
+				/if \(!refResolved \|\| refResolved\.url\) \{\s*refItems\.push\(\{ label: 'Open in Browser'/,
+			);
+		});
+
+		it("keeps Open in Browser when the hover projection cannot be resolved at all", () => {
+			// lookupBranchHoverById scans branchData.plans and returns null for a row
+			// that isn't there. That is ignorance, not an absent url — suppressing on it
+			// would hide the action for every source, Linear included. So the guard reads
+			// a RESOLVED reference projection and only an empty url on that suppresses;
+			// the kind check is what stops a plan/note projection standing in for one.
+			const js = buildSidebarScript();
+			expect(js).toContain("refHover && refHover.kind === 'reference' && refHover.hover");
+			// Negative pin: the earlier form suppressed whenever the lookup came back
+			// empty, which is exactly the fail-closed direction this replaced.
+			expect(js).not.toContain("if (refHover && refHover.hover && refHover.hover.url)");
+		});
+
+		it("gates the reference hover-card's open action and its rule on a non-empty url", () => {
+			// Both the action row and the <hr> above it are conditional: with no
+			// action and no AI-exclusion reason, an unconditional rule would leave a
+			// bare line dangling at the bottom of the card.
+			const js = buildSidebarScript();
+			expect(js).toContain("if (h.url) {");
+			expect(js).toContain("if (tail.length) {\n      kids.push(el('hr'));");
+			// The trailing rule appendAiReasonRow adds is dropped when nothing follows.
+			expect(js).toContain("tail.pop();");
 		});
 
 		it("reference row click posts branch:openReferencePreview (click = preview, edit via menu)", () => {
@@ -3450,9 +3497,13 @@ describe("SidebarScriptBuilder", () => {
 			expect(body).toContain("el('hr')");
 			// All three renderers call it with THEIR id key (slug / noteId /
 			// mapKey) so the reason keys line up with aiExcludedIds' entries.
+			// The reference card collects everything below its rule into 'tail'
+			// before deciding whether to emit the rule at all (a url-less source
+			// has no action row beneath it), so its call targets that array — the
+			// id key is what this assertion pins, not the container name.
 			expect(js).toContain("appendAiReasonRow(kids, slug)");
 			expect(js).toContain("appendAiReasonRow(kids, noteId)");
-			expect(js).toContain("appendAiReasonRow(kids, mapKey)");
+			expect(js).toContain("appendAiReasonRow(tail, mapKey)");
 		});
 		it("exclude toggle unifies both axes: struck rows offer +, clearing user AND AI excludes", () => {
 			const js = buildSidebarScript();

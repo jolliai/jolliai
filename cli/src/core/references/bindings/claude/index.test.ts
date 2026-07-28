@@ -23,6 +23,7 @@ describe("Claude producer binding", () => {
 				"mcp__claude_ai_Asana__",
 				"mcp__claude_ai_monday_com__",
 				"mcp__context7__",
+				"mcp__jollimemory__",
 			]);
 		});
 	});
