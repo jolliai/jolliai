@@ -1,42 +1,39 @@
 package ai.jolli.jollimemory.services
 
 import ai.jolli.jollimemory.auth.JolliConfigStore
+import ai.jolli.jollimemory.bridge.CliIntegrations
 import ai.jolli.jollimemory.core.JmLogger
-import ai.jolli.jollimemory.core.TraceContext
 import com.google.gson.Gson
-import java.net.URI
-import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
-import java.time.Duration
+import com.google.gson.JsonArray
+import com.google.gson.JsonElement
+import com.google.gson.JsonObject
+import com.google.gson.JsonPrimitive
 import java.util.Base64
 
 /**
- * JolliApiClient — Kotlin port of JolliPushService.ts
+ * JolliApiClient — thin facade over the bundled CLI's `jolli ide-bridge` bridge.
  *
- * HTTP client for pushing JolliMemory commit summaries to a Jolli Space.
- * Authenticates via API key (Bearer token) and posts Markdown content
- * to the `/api/push/jollimemory` endpoint.
+ * Historically this object was a full Kotlin HTTP client for the Jolli backend
+ * (push / delete / list-spaces / bindings / live-share / org-members / LLM
+ * proxy). Every backend call now dispatches through [CliIntegrations.runIdeBridge]
+ * so the CLI is the single implementation of that HTTP contract; the same-named
+ * DTOs are kept as pass-through data classes so existing UI callers and
+ * MockK-based unit tests stay unchanged.
  *
- * Handles two URL patterns for multi-tenant support:
- * - Path-based (dev): "http://localhost:3000/acme/" -> x-tenant-slug header
- * - Subdomain-based (prod): "https://test1.jolli.ai" -> subdomain resolved by backend
+ * [parseJolliApiKey] deliberately stays a pure-Kotlin port: it is called from
+ * EDT paths (StatusPanel refresh, SettingsDialog, SummaryPanel pre-flight) and
+ * making it a bridge subprocess call would drag those UI paths through a
+ * ~5–20 ms daemon round-trip (or a ~500 ms–2 s cold Node spawn) each time.
+ * The tradeoff is a three-way lockstep with `cli/src/core/JolliApiUtils.ts`
+ * and the VS Code bundle — do not diverge without updating all three.
  *
- * Sends `x-jolli-client: intellij-plugin/<version>` on every request so the
- * server can identify the caller and apply the IntelliJ-specific minimum
- * version gate. The version is read once from the classpath resource
- * `/jollimemory-plugin-version.txt`, which `processResources` populates at
- * build time from `project.version` in build.gradle.kts. Keeping the lookup
- * inside this client preserves its "pure HTTP, no IntelliJ Platform deps"
- * shape — the same posture as the VS Code TypeScript port.
+ * The `pluginVersion` string and [serializeSummaryJson] are also Kotlin-side
+ * utilities — none of them touches the network.
  */
 object JolliApiClient {
 
     private val log = JmLogger.create("JolliApiClient")
     private val gson = Gson()
-    private val client: HttpClient = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(30))
-        .build()
 
     private const val VERSION_RESOURCE_PATH = "/jollimemory-plugin-version.txt"
 
@@ -54,6 +51,17 @@ object JolliApiClient {
      * `processResources` (see build.gradle.kts).
      */
     internal val pluginVersion: String by lazy { loadPluginVersion() }
+
+    /**
+     * `x-jolli-client` header value the CLI should stamp on every jolli-api
+     * request originated by this plugin. Without threading this through the
+     * ide-bridge the CLI would send its own bundled-build header
+     * (`cli/<cli-version>`), silently opting the plugin out of the server's
+     * per-surface min-version gate + surface-aware behavior + surface-level
+     * API attribution. Kept in lockstep with the shape enforced by
+     * `cli/src/core/ClientHeader.ts`.
+     */
+    internal val intellijClientHeader: String by lazy { "intellij-plugin/$pluginVersion" }
 
     private fun loadPluginVersion(): String {
         val raw = try {
@@ -155,24 +163,17 @@ object JolliApiClient {
     ) : RuntimeException(message)
 
     /**
-     * Parsed base URL with optional tenant slug extracted from the path.
-     *
-     * Path-based: "http://localhost:3000/acme/" -> origin "http://localhost:3000", tenantSlug "acme"
-     * Subdomain:  "https://test1.jolli.ai"      -> origin "https://test1.jolli.ai", tenantSlug null
-     */
-    private data class ParsedBaseUrl(
-        val origin: String,
-        val tenantSlug: String?,
-    )
-
-    /**
      * Parses the tenant metadata embedded in a new-format Jolli API key.
      *
      * New format: sk-jol-{base64url(JSON meta)}.{base64url(32 random bytes)}
      * Old format: sk-jol-{32 hex chars} -- returns null
      *
-     * @param key Jolli API key string
-     * @return Parsed metadata, or null if the key uses the old format or cannot be decoded
+     * Kept as pure local Kotlin (no bridge call) because EDT callers
+     * (StatusPanel refresh, SettingsDialog, SummaryPanel push pre-flight)
+     * invoke this synchronously; a subprocess round-trip here would violate
+     * IntelliJ's 300 ms slow-EDT floor. Must stay in lockstep with the
+     * canonical parser in `cli/src/core/JolliApiUtils.ts` (and the VS Code
+     * bundle).
      */
     fun parseJolliApiKey(key: String): JolliApiKeyMeta? {
         if (!key.startsWith("sk-jol-")) return null
@@ -185,8 +186,6 @@ object JolliApiClient {
         // that base64url-decodes to JSON carrying string `t` + `u`. This handles both
         // Format A (`sk-jol-<metaB64>.<secretB64>`, meta in segment 0) and Format B /
         // JWT-shaped (`sk-jol-<headerB64>.<payloadB64>.<sigB64>`, meta in segment 1).
-        // Must stay in lockstep with the canonical parser in
-        // cli/src/core/JolliApiUtils.ts (and the VS Code bundle).
         val decoder = Base64.getUrlDecoder()
         for (segment in rest.split(".")) {
             try {
@@ -205,98 +204,75 @@ object JolliApiClient {
     }
 
     /**
-     * Pushes a commit summary to a Jolli Space via the push API.
+     * Pushes a commit summary to a Jolli Space via the CLI ide-bridge.
      *
-     * @param baseUrl Jolli site base URL. If null, falls back to the URL embedded in the API key.
+     * @param baseUrl Jolli site base URL override. When null the CLI derives it from the API key metadata.
      * @param apiKey Jolli API key (sk-jol-...)
      * @param payload Summary content to push
-     * @return Push result with article URL and metadata
-     * @throws RuntimeException if the push fails (network error, non-2xx response, or missing base URL)
-     * @throws PluginOutdatedError if the server returns HTTP 426
      */
     fun pushToJolli(
         baseUrl: String?,
         apiKey: String,
         payload: JolliPushPayload,
     ): JolliPushResult {
-        val keyMeta = parseJolliApiKey(apiKey)
-        val resolvedBaseUrl = baseUrl ?: keyMeta?.u
-            ?: throw RuntimeException(
-                "Jolli site URL could not be determined. " +
-                    "Please regenerate your Jolli API Key and set it again (STATUS panel)."
-            )
-
-        val parsed = parseBaseUrl(resolvedBaseUrl)
-        val targetUri = URI.create("${parsed.origin}/api/push/jollimemory")
-
-        val body = gson.toJson(payload)
-        val requestBuilder = HttpRequest.newBuilder()
-            .uri(targetUri)
-            .header("Content-Type", "application/json")
-            .header("Authorization", "Bearer $apiKey")
-            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
-            .POST(HttpRequest.BodyPublishers.ofString(body))
-            .timeout(Duration.ofSeconds(60))
-
-        // For path-based multi-tenancy, send the tenant slug as a header
-        if (parsed.tenantSlug != null) {
-            requestBuilder.header("x-tenant-slug", parsed.tenantSlug)
+        val request = JsonObject().apply {
+            addProperty("operation", "push")
+            addProperty("apiKey", apiKey)
+            if (baseUrl != null) addProperty("baseUrl", baseUrl)
+            add("payload", pushPayloadJson(payload))
         }
-
-        // Send org slug so TenantMiddleware routes to the correct org schema
-        if (keyMeta?.o != null) {
-            requestBuilder.header("x-org-slug", keyMeta.o)
-        }
-
-        // Jolli trace context: carry the ambient operation's id (set by the
-        // withTrace scope around the action) so this request shares one id with
-        // the operation's log lines; fall back to a fresh value outside any scope.
-        requestBuilder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
-
-        val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
-        val raw = response.body() ?: ""
-        val statusCode = response.statusCode()
-
-        return parseResponse(raw, statusCode, payload.repoUrl)
+        val response = callJolliApi(request, payload.repoUrl)
+        val obj = response.asJsonObjectOrNull()
+            ?: throw RuntimeException("push endpoint returned a non-object response")
+        return parsePushResponse(obj)
     }
 
     /**
-     * Deletes an orphaned JolliMemory article from the server.
-     * Used to clean up articles from squashed/rebased commits.
+     * Serializes a push payload for the CLI `jolli-api` bridge. Marked `internal`
+     * so the wire-contract test pins each field name literally: a silent rename
+     * on either side of the bridge (Kotlin `docId` → `id`, CLI `PushPayload.docId`
+     * → `PushPayload.documentId`) makes `push` drop that value to the response
+     * default and the doc re-CREATEs on every commit instead of updating.
+     * `pushPayloadJson` must stay in lockstep with `PushPayload` in
+     * [`cli/src/core/JolliMemoryPushClient.ts`].
      */
+    internal fun pushPayloadJson(payload: JolliPushPayload): JsonObject = JsonObject().apply {
+        addProperty("title", payload.title)
+        addProperty("content", payload.content)
+        addProperty("commitHash", payload.commitHash)
+        addProperty("docType", payload.docType)
+        if (payload.branch != null) addProperty("branch", payload.branch)
+        if (payload.docId != null) addProperty("docId", payload.docId)
+        if (payload.repoUrl != null) addProperty("repoUrl", payload.repoUrl)
+        if (payload.relativePath != null) addProperty("relativePath", payload.relativePath)
+        if (payload.summaryJson != null) addProperty("summaryJson", payload.summaryJson)
+    }
+
+    /**
+     * Parses a push response into [JolliPushResult]. Split out (rather than
+     * inlined into [pushToJolli]) so the wire-contract test can pin each field
+     * name literally: a rename on either side (`docId` → `id`, `jrn` → `jolliRn`)
+     * would otherwise silently collapse the value to the default (`0` / `""`)
+     * and make the article link unusable — the same drift class [pushPayloadJson]
+     * guards against for the request direction. Must stay in lockstep with
+     * `PushResult` in [`cli/src/core/JolliMemoryPushClient.ts`].
+     */
+    internal fun parsePushResponse(obj: JsonObject): JolliPushResult = JolliPushResult(
+        url = obj.stringOrNull("url").orEmpty(),
+        docId = obj.intOrZero("docId"),
+        jrn = obj.stringOrNull("jrn").orEmpty(),
+        created = obj.boolOrFalse("created"),
+    )
+
+    /** Deletes an orphaned JolliMemory article from the server. */
     fun deleteFromJolli(baseUrl: String?, apiKey: String, docId: Int) {
-        val keyMeta = parseJolliApiKey(apiKey)
-        val resolvedBaseUrl = baseUrl ?: keyMeta?.u
-            ?: throw RuntimeException("Jolli site URL could not be determined.")
-
-        val parsed = parseBaseUrl(resolvedBaseUrl)
-        val targetUri = URI.create("${parsed.origin}/api/push/jollimemory/$docId")
-
-        val requestBuilder = HttpRequest.newBuilder()
-            .uri(targetUri)
-            .header("Authorization", "Bearer $apiKey")
-            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
-            .DELETE()
-            .timeout(Duration.ofSeconds(30))
-
-        if (parsed.tenantSlug != null) {
-            requestBuilder.header("x-tenant-slug", parsed.tenantSlug)
+        val request = JsonObject().apply {
+            addProperty("operation", "delete")
+            addProperty("apiKey", apiKey)
+            if (baseUrl != null) addProperty("baseUrl", baseUrl)
+            addProperty("docId", docId)
         }
-        if (keyMeta?.o != null) {
-            requestBuilder.header("x-org-slug", keyMeta.o)
-        }
-
-        // Jolli trace context: carry the ambient operation's id (set by the
-        // withTrace scope around the action) so this request shares one id with
-        // the operation's log lines; fall back to a fresh value outside any scope.
-        requestBuilder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
-
-        val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
-        val statusCode = response.statusCode()
-
-        if (statusCode != 200 && statusCode != 204) {
-            throw RuntimeException("Delete failed with status $statusCode")
-        }
+        callJolliApi(request)
     }
 
     /**
@@ -308,79 +284,6 @@ object JolliApiClient {
         return JolliConfigStore.loadAuthToken()
     }
 
-    // ── LLM Proxy ─────────────────────────────────────────────────────────
-
-    /** Response from the LLM proxy endpoint. */
-    data class LlmProxyResult(
-        val text: String?,
-        val inputTokens: Int,
-        val outputTokens: Int,
-    )
-
-    /** Payload sent to the LLM proxy endpoint. */
-    private data class LlmProxyPayload(
-        val action: String,
-        val params: Map<String, String>,
-    )
-
-    /**
-     * Calls the Jolli LLM proxy endpoint.
-     * The backend owns the prompt template — we just send the action key and params.
-     */
-    fun callLlmProxy(apiKey: String, action: String, params: Map<String, String>): LlmProxyResult {
-        val keyMeta = parseJolliApiKey(apiKey)
-        val resolvedBaseUrl = keyMeta?.u
-            ?: throw RuntimeException(
-                "Jolli site URL could not be determined from API key. " +
-                    "Please regenerate your Jolli API Key."
-            )
-
-        val parsed = parseBaseUrl(resolvedBaseUrl)
-        val targetUri = URI.create("${parsed.origin}/api/push/llm/complete")
-
-        val body = gson.toJson(LlmProxyPayload(action, params))
-        val requestBuilder = HttpRequest.newBuilder()
-            .uri(targetUri)
-            .header("Content-Type", "application/json")
-            .header("Authorization", "Bearer $apiKey")
-            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
-            .POST(HttpRequest.BodyPublishers.ofString(body))
-            .timeout(Duration.ofSeconds(120))
-
-        if (parsed.tenantSlug != null) {
-            requestBuilder.header("x-tenant-slug", parsed.tenantSlug)
-        }
-        if (keyMeta.o != null) {
-            requestBuilder.header("x-org-slug", keyMeta.o)
-        }
-
-        // Jolli trace context: carry the ambient operation's id (set by the
-        // withTrace scope around the action) so this request shares one id with
-        // the operation's log lines; fall back to a fresh value outside any scope.
-        requestBuilder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
-
-        val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
-        val raw = response.body() ?: ""
-        val statusCode = response.statusCode()
-
-        if (statusCode !in 200..299) {
-            log.warn("LLM proxy error %d: %s", statusCode, raw.take(500))
-            throw RuntimeException("LLM proxy error (HTTP $statusCode): ${raw.take(200)}")
-        }
-
-        return try {
-            @Suppress("UNCHECKED_CAST")
-            val json = gson.fromJson(raw, Map::class.java) as Map<String, Any?>
-            LlmProxyResult(
-                text = json["text"] as? String,
-                inputTokens = (json["inputTokens"] as? Double)?.toInt() ?: 0,
-                outputTokens = (json["outputTokens"] as? Double)?.toInt() ?: 0,
-            )
-        } catch (_: Exception) {
-            throw RuntimeException("Invalid JSON from LLM proxy (HTTP $statusCode): ${raw.take(200)}")
-        }
-    }
-
     // ── JM Space Binding endpoints (JOLLI-1335) ──────────────────────────
 
     /** Result of GET /api/jolli-memory/spaces. */
@@ -389,85 +292,43 @@ object JolliApiClient {
         val defaultSpaceId: Int?,
     )
 
-    /**
-     * GET /api/jolli-memory/spaces
-     *
-     * Lists existing JolliMemory spaces visible to the authenticated user.
-     * Accepts both a flat array body and a `{ spaces, defaultSpaceId }` envelope
-     * from the server (the flat form yields `defaultSpaceId = null`).
-     */
+    /** Lists existing JolliMemory spaces visible to the authenticated user. */
     fun listSpaces(baseUrl: String, apiKey: String): JmSpacesListResult {
-        val keyMeta = parseJolliApiKey(apiKey)
-        val parsed = parseBaseUrl(baseUrl)
-        val targetUri = URI.create("${parsed.origin}/api/jolli-memory/spaces")
-
-        val requestBuilder = HttpRequest.newBuilder()
-            .uri(targetUri)
-            .header("Authorization", "Bearer $apiKey")
-            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
-            .GET()
-            .timeout(Duration.ofSeconds(30))
-
-        if (parsed.tenantSlug != null) {
-            requestBuilder.header("x-tenant-slug", parsed.tenantSlug)
+        val request = JsonObject().apply {
+            addProperty("operation", "list-spaces")
+            addProperty("apiKey", apiKey)
+            addProperty("baseUrl", baseUrl)
         }
-        if (keyMeta?.o != null) {
-            requestBuilder.header("x-org-slug", keyMeta.o)
-        }
-
-        // Jolli trace context: carry the ambient operation's id (set by the
-        // withTrace scope around the action) so this request shares one id with
-        // the operation's log lines; fall back to a fresh value outside any scope.
-        requestBuilder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
-
-        val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
-        val raw = response.body() ?: ""
-        val statusCode = response.statusCode()
-
-        if (statusCode == 426) {
-            throw PluginOutdatedError("Plugin version is outdated. Please update to the latest version.")
-        }
-        if (statusCode !in 200..299) {
-            throw RuntimeException("Failed to list spaces (HTTP $statusCode): ${raw.take(200)}")
-        }
-
-        return try {
-            val element = gson.fromJson(raw, com.google.gson.JsonElement::class.java)
-            if (element.isJsonArray) {
-                val spaces = element.asJsonArray.map { el ->
-                    val obj = el.asJsonObject
-                    ai.jolli.jollimemory.toolwindow.JmSpaceSummary(
-                        id = obj.get("id").asInt,
-                        name = obj.get("name").asString,
-                        slug = obj.get("slug").asString,
-                    )
-                }
-                JmSpacesListResult(spaces, defaultSpaceId = null)
-            } else {
-                val obj = element.asJsonObject
-                val spacesArr = obj.getAsJsonArray("spaces") ?: com.google.gson.JsonArray()
-                val spaces = spacesArr.map { el ->
-                    val s = el.asJsonObject
-                    ai.jolli.jollimemory.toolwindow.JmSpaceSummary(
-                        id = s.get("id").asInt,
-                        name = s.get("name").asString,
-                        slug = s.get("slug").asString,
-                    )
-                }
-                val defaultId = obj.get("defaultSpaceId")?.takeIf { it.isJsonPrimitive }?.asInt
-                JmSpacesListResult(spaces, defaultSpaceId = defaultId)
-            }
-        } catch (_: Exception) {
-            throw RuntimeException("Invalid JSON from list-spaces (HTTP $statusCode): ${raw.take(200)}")
-        }
+        val obj = callJolliApi(request).asJsonObjectOrNull()
+            ?: throw RuntimeException("Invalid response from list-spaces")
+        return parseListSpacesResponse(obj)
     }
 
     /**
-     * POST /api/jolli-memory/bindings
-     *
-     * Binds a repo to a JM space. On success returns the binding info.
-     * Throws [ai.jolli.jollimemory.toolwindow.BindingAlreadyExistsException]
-     * on 409 when another user already bound the same repo (race condition).
+     * Parses the `list-spaces` response. Extracted so the wire-contract test
+     * can pin `id` / `name` / `slug` / `defaultSpaceId` literally. Must stay in
+     * lockstep with `listSpaces()` in [`cli/src/core/JolliMemoryPushClient.ts`].
+     */
+    internal fun parseListSpacesResponse(obj: JsonObject): JmSpacesListResult {
+        val spaces = obj.get("spaces")?.takeIf { it.isJsonArray }?.asJsonArray ?: JsonArray()
+        val parsed = spaces.map { el ->
+            val s = el.asJsonObject
+            ai.jolli.jollimemory.toolwindow.JmSpaceSummary(
+                id = s.intOrZero("id"),
+                name = s.stringOrNull("name").orEmpty(),
+                slug = s.stringOrNull("slug").orEmpty(),
+            )
+        }
+        val defaultSpaceId = obj.get("defaultSpaceId")
+            ?.takeIf { it.isJsonPrimitive && (it as JsonPrimitive).isNumber }
+            ?.asInt
+        return JmSpacesListResult(parsed, defaultSpaceId)
+    }
+
+    /**
+     * Binds a repo to a JM space. Throws
+     * [ai.jolli.jollimemory.toolwindow.BindingAlreadyExistsException] when the
+     * CLI reports the 409 race collision.
      */
     fun createBinding(
         baseUrl: String,
@@ -476,85 +337,94 @@ object JolliApiClient {
         repoName: String,
         jmSpaceId: Int,
     ): ai.jolli.jollimemory.toolwindow.BindingChooserResult {
-        val keyMeta = parseJolliApiKey(apiKey)
-        val parsed = parseBaseUrl(baseUrl)
-        val targetUri = URI.create("${parsed.origin}/api/jolli-memory/bindings")
-
-        val body = gson.toJson(mapOf(
-            "repoUrl" to repoUrl,
-            "repoName" to repoName,
-            "jmSpaceId" to jmSpaceId,
-        ))
-
-        val requestBuilder = HttpRequest.newBuilder()
-            .uri(targetUri)
-            .header("Content-Type", "application/json")
-            .header("Authorization", "Bearer $apiKey")
-            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
-            .POST(HttpRequest.BodyPublishers.ofString(body))
-            .timeout(Duration.ofSeconds(30))
-
-        if (parsed.tenantSlug != null) {
-            requestBuilder.header("x-tenant-slug", parsed.tenantSlug)
+        val request = JsonObject().apply {
+            addProperty("operation", "create-binding")
+            addProperty("apiKey", apiKey)
+            addProperty("baseUrl", baseUrl)
+            addProperty("repoUrl", repoUrl)
+            addProperty("repoName", repoName)
+            addProperty("jmSpaceId", jmSpaceId)
+            // Bypasses [callJolliApi] (see below), so stamp the clientHeader
+            // manually — otherwise the CLI would emit `cli/<version>` for this
+            // path only.
+            addProperty("clientHeader", intellijClientHeader)
         }
-        if (keyMeta?.o != null) {
-            requestBuilder.header("x-org-slug", keyMeta.o)
+        // Call runIdeBridge DIRECTLY, not through callJolliApi: the shared
+        // helper wraps every CliBridgeException in remapBridgeException, which
+        // routes BindingAlreadyExistsError to a plain RuntimeException — the
+        // structured `existingSpaceId` needed for the 409 race-winner banner
+        // (so the push can settle on the winning binding) would be lost
+        // before this catch could see it. See [mapCreateBindingBridgeException].
+        val obj = try {
+            CliIntegrations.runIdeBridge(
+                CliIntegrations.resolveDefaultCwd(),
+                "jolli-api",
+                gson.toJson(request),
+            ).asJsonObjectOrNull()
+                ?: throw RuntimeException("Invalid response from create-binding")
+        } catch (e: CliIntegrations.CliBridgeException) {
+            throw mapCreateBindingBridgeException(e, repoUrl, repoName)
         }
+        return parseCreateBindingResponse(obj)
+    }
 
-        // Jolli trace context: carry the ambient operation's id (set by the
-        // withTrace scope around the action) so this request shares one id with
-        // the operation's log lines; fall back to a fresh value outside any scope.
-        requestBuilder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
+    /**
+     * Parses the `create-binding` response. Extracted so the wire-contract test
+     * can pin `bindingId` / `jmSpaceId` / `repoName` literally — a rename to
+     * `id` on the Kotlin read side (matching the raw row column) or a rename
+     * to `jmSpaceId` → `jmSpaceIdx` on the CLI emit side would silently
+     * collapse to 0 and the caller would think the create succeeded against
+     * space 0. Must stay in lockstep with `createBinding()` in
+     * [`cli/src/core/JolliMemoryPushClient.ts`].
+     *
+     * `jmSpaceName` is intentionally "": the server's `POST /bindings` response
+     * (both 2xx and 409) has no space-name field. The race-winner banner in
+     * BindingChooserDialog is authored to work without a name.
+     */
+    internal fun parseCreateBindingResponse(obj: JsonObject): ai.jolli.jollimemory.toolwindow.BindingChooserResult =
+        ai.jolli.jollimemory.toolwindow.BindingChooserResult(
+            id = obj.intOrZero("bindingId"),
+            jmSpaceId = obj.intOrZero("jmSpaceId"),
+            jmSpaceName = "",
+            repoName = obj.stringOrNull("repoName").orEmpty(),
+        )
 
-        val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
-        val raw = response.body() ?: ""
-        val statusCode = response.statusCode()
-
-        if (statusCode == 426) {
-            throw PluginOutdatedError("Plugin version is outdated. Please update to the latest version.")
-        }
-
-        return try {
-            @Suppress("UNCHECKED_CAST")
-            val json = gson.fromJson(raw, Map::class.java) as Map<String, Any?>
-
-            if (statusCode == 409 && json["error"] == "binding_already_exists") {
-                throw ai.jolli.jollimemory.toolwindow.BindingAlreadyExistsException(
-                    ai.jolli.jollimemory.toolwindow.BindingChooserResult(
-                        id = (json["id"] as? Double)?.toInt() ?: 0,
-                        jmSpaceId = (json["jmSpaceId"] as? Double)?.toInt() ?: 0,
-                        jmSpaceName = json["jmSpaceName"] as? String ?: "",
-                        repoName = json["repoName"] as? String ?: "",
-                    ),
-                )
-            }
-
-            if (statusCode !in 200..299) {
-                throw RuntimeException(json["error"] as? String ?: "HTTP $statusCode")
-            }
-
-            ai.jolli.jollimemory.toolwindow.BindingChooserResult(
-                id = (json["id"] as? Double)?.toInt() ?: 0,
-                jmSpaceId = (json["jmSpaceId"] as? Double)?.toInt() ?: 0,
-                jmSpaceName = json["jmSpaceName"] as? String ?: "",
-                repoName = json["repoName"] as? String ?: "",
+    /**
+     * Maps a `CliBridgeException` raised by the `create-binding` jolli-api
+     * action. `BindingAlreadyExistsError` becomes
+     * [ai.jolli.jollimemory.toolwindow.BindingAlreadyExistsException] carrying
+     * the winning binding's `existingSpaceId` so the subsequent push settles
+     * on the correct Space; every other errorName routes through the shared
+     * [remapBridgeException]. `jmSpaceName` is not carried (server does not
+     * send it — see [createBinding]).
+     *
+     * Extracted from [createBinding] so it can be unit-tested — the actual
+     * bridge call spawns a Node subprocess and the intellij/ test rules
+     * (AGENTS.md, `check-global-state.sh`) forbid the `mockkStatic`/`mockkObject`
+     * needed to stub it.
+     */
+    internal fun mapCreateBindingBridgeException(
+        e: CliIntegrations.CliBridgeException,
+        repoUrl: String,
+        repoName: String,
+    ): RuntimeException {
+        if (e.errorName == "BindingAlreadyExistsError") {
+            val existingSpaceId = e.details.get("existingSpaceId")
+                ?.takeIf { it.isJsonPrimitive && (it as JsonPrimitive).isNumber }
+                ?.asInt ?: 0
+            return ai.jolli.jollimemory.toolwindow.BindingAlreadyExistsException(
+                ai.jolli.jollimemory.toolwindow.BindingChooserResult(
+                    id = 0,
+                    jmSpaceId = existingSpaceId,
+                    jmSpaceName = "",
+                    repoName = repoName,
+                ),
             )
-        } catch (e: ai.jolli.jollimemory.toolwindow.BindingAlreadyExistsException) {
-            throw e
-        } catch (e: PluginOutdatedError) {
-            throw e
-        } catch (e: RuntimeException) {
-            throw e
-        } catch (_: Exception) {
-            throw RuntimeException("Invalid JSON from create-binding (HTTP $statusCode): ${raw.take(200)}")
         }
+        return remapBridgeException(e, repoUrl)
     }
 
     // ── Branch share (live, Space-backed) endpoints ─────────────────────────
-    // Kotlin port of vscode/src/services/JolliShareService.ts (live-share ops).
-    // These target /api/share/branch and reference live Space docs (a `covered`
-    // allowlist via LiveRef) instead of a frozen content blob. Auth is the same
-    // Bearer + x-jolli-client + x-tenant-slug/x-org-slug + trace scheme as push.
 
     /** Thrown when a share has been revoked or expired (HTTP 410 / `revoked: true`). */
     class ShareRevokedError(message: String = "This share has been stopped.") : RuntimeException(message)
@@ -618,133 +488,104 @@ object JolliApiClient {
     /** An org member offered as a recipient candidate (name + deliverable email). */
     data class OrgMember(val name: String, val email: String)
 
-    private fun resolveShareBaseUrl(baseUrl: String?, apiKey: String): String {
-        return baseUrl ?: parseJolliApiKey(apiKey)?.u
-            ?: throw RuntimeException(
-                "Jolli site URL could not be determined. " +
-                    "Please regenerate your Jolli API Key and set it again (STATUS panel)."
-            )
-    }
-
-    /** Sends an authed request to a Jolli API path; centralizes the header + send boilerplate. */
-    private fun sendAuthed(
-        method: String,
-        resolvedBaseUrl: String,
-        apiKey: String,
-        path: String,
-        body: String?,
-        timeoutSec: Long = 60,
-    ): HttpResponse<String> {
-        val keyMeta = parseJolliApiKey(apiKey)
-        val parsed = parseBaseUrl(resolvedBaseUrl)
-        val targetUri = URI.create("${parsed.origin}$path")
-        val builder = HttpRequest.newBuilder()
-            .uri(targetUri)
-            .header("Authorization", "Bearer $apiKey")
-            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
-            .timeout(Duration.ofSeconds(timeoutSec))
-        if (body != null) builder.header("Content-Type", "application/json")
-        when (method) {
-            "POST" -> builder.POST(HttpRequest.BodyPublishers.ofString(body ?: ""))
-            "PATCH" -> builder.method("PATCH", HttpRequest.BodyPublishers.ofString(body ?: ""))
-            "DELETE" -> builder.DELETE()
-            else -> builder.GET()
-        }
-        if (parsed.tenantSlug != null) builder.header("x-tenant-slug", parsed.tenantSlug)
-        if (keyMeta?.o != null) builder.header("x-org-slug", keyMeta.o)
-        builder.header(TraceContext.HEADER_NAME, TraceContext.currentTraceHeader() ?: TraceContext.newTraceHeader())
-        return client.send(builder.build(), HttpResponse.BodyHandlers.ofString())
-    }
-
-    /** Maps a non-2xx response to the right error (426 → outdated, else detail + status). */
-    private fun shareError(status: Int, json: com.google.gson.JsonObject?, raw: String): RuntimeException {
-        if (status == 426) {
-            return PluginOutdatedError(
-                json?.get("message")?.takeIf { it.isJsonPrimitive }?.asString
-                    ?: "Plugin version is outdated. Please update to the latest version."
-            )
-        }
-        val detail = listOfNotNull(
-            json?.get("error")?.takeIf { it.isJsonPrimitive }?.asString,
-            json?.get("message")?.takeIf { it.isJsonPrimitive }?.asString,
-        ).joinToString(" — ")
-        val suffix = if (json == null) ": ${raw.take(200)}" else ""
-        return RuntimeException("${detail.ifEmpty { "request failed" }} (HTTP $status)$suffix")
-    }
-
-    private fun parseObjectOrNull(raw: String): com.google.gson.JsonObject? = try {
-        if (raw.isEmpty()) null else gson.fromJson(raw, com.google.gson.JsonElement::class.java)
-            ?.takeIf { it.isJsonObject }?.asJsonObject
-    } catch (_: Exception) {
-        null
-    }
-
-    private fun com.google.gson.JsonObject.str(key: String): String? =
-        get(key)?.takeIf { it.isJsonPrimitive }?.asString
-
-    private fun com.google.gson.JsonObject.stringList(key: String): List<String>? =
-        get(key)?.takeIf { it.isJsonArray }?.asJsonArray
-            ?.mapNotNull { it.takeIf { e -> e.isJsonPrimitive }?.asString }
-
     /** Creates a live share. Requires `shareId` + `shareUrl`; `token` only for `public`. */
     fun createLiveShare(baseUrl: String?, apiKey: String, payload: LiveSharePayload): LiveShareResult {
-        val resolved = resolveShareBaseUrl(baseUrl, apiKey)
-        val response = sendAuthed("POST", resolved, apiKey, "/api/share/branch", gson.toJson(payload))
-        val raw = response.body() ?: ""
-        val status = response.statusCode()
-        val json = parseObjectOrNull(raw)
-        if (status in 200..299) {
-            val shareId = json?.get("shareId")?.takeIf { it.isJsonPrimitive }?.asString
-            val shareUrl = json?.str("shareUrl")
-            if (shareId == null || shareUrl == null) {
-                throw RuntimeException(
-                    "Share endpoint returned an unexpected response (missing shareId/shareUrl). HTTP $status: ${raw.take(300)}"
-                )
-            }
-            return LiveShareResult(
-                shareId = shareId,
-                shareUrl = shareUrl,
-                expiresAt = json.str("expiresAt") ?: "",
-                visibility = json.str("visibility") ?: payload.visibility,
-                token = json.str("token"),
-                recipients = json.stringList("recipients"),
-            )
+        val request = JsonObject().apply {
+            addProperty("operation", "create-share")
+            addProperty("apiKey", apiKey)
+            if (baseUrl != null) addProperty("baseUrl", baseUrl)
+            add("payload", liveSharePayloadJson(payload))
         }
-        throw shareError(status, json, raw)
+        val obj = callJolliApi(request).asJsonObjectOrNull()
+            ?: throw RuntimeException("Invalid response from create-share")
+        val shareId = obj.stringOrNull("shareId")
+            ?: throw RuntimeException("Share endpoint returned an unexpected response (missing shareId).")
+        val shareUrl = obj.stringOrNull("shareUrl")
+            ?: throw RuntimeException("Share endpoint returned an unexpected response (missing shareUrl).")
+        return LiveShareResult(
+            shareId = shareId,
+            shareUrl = shareUrl,
+            expiresAt = obj.stringOrNull("expiresAt").orEmpty(),
+            visibility = obj.stringOrNull("visibility") ?: payload.visibility,
+            token = obj.stringOrNull("token"),
+            recipients = obj.stringList("recipients"),
+        )
+    }
+
+    /**
+     * Serializes a live-share create payload. Marked `internal` so the
+     * wire-contract test pins each field name literally — a rename here or
+     * on the CLI side (`LiveSharePayload` in [`cli/src/core/JolliShareClient.ts`])
+     * would silently drop the value at the wire and the server would fall back
+     * to schema defaults (public visibility, empty commit list). The two must
+     * stay in lockstep.
+     */
+    internal fun liveSharePayloadJson(payload: LiveSharePayload): JsonObject = JsonObject().apply {
+        addProperty("repoUrl", payload.repoUrl)
+        addProperty("repoName", payload.repoName)
+        addProperty("branch", payload.branch)
+        addProperty("kind", payload.kind)
+        addProperty("visibility", payload.visibility)
+        addProperty("decisionCount", payload.decisionCount)
+        addProperty("headCommitHash", payload.headCommitHash)
+        val hashes = JsonArray().apply { payload.commitHashes.forEach { add(it) } }
+        add("commitHashes", hashes)
+        if (payload.branchSlug != null) addProperty("branchSlug", payload.branchSlug)
+        add("ref", gson.toJsonTree(payload.ref))
+        if (payload.recipients != null) {
+            val arr = JsonArray().apply { payload.recipients.forEach { add(it) } }
+            add("recipients", arr)
+        }
     }
 
     /** Updates a live share (visibility / covered ref / expiry / recipients) via PATCH. */
     fun updateLiveShare(baseUrl: String?, apiKey: String, shareId: String, patch: LiveSharePatch): LiveShareUpdateResult {
-        val resolved = resolveShareBaseUrl(baseUrl, apiKey)
-        val path = "/api/share/branch/${java.net.URLEncoder.encode(shareId, Charsets.UTF_8)}"
-        val response = sendAuthed("PATCH", resolved, apiKey, path, gson.toJson(patch))
-        val raw = response.body() ?: ""
-        val status = response.statusCode()
-        val json = parseObjectOrNull(raw)
-        // A recipients-only / non-`public`-toggle PATCH legitimately returns NO `shareUrl`
-        // (the link didn't change), so accept any 2xx with a body — the caller falls back.
-        if (status in 200..299 && json != null) {
-            return LiveShareUpdateResult(
-                shareId = json.get("shareId")?.takeIf { it.isJsonPrimitive }?.asString,
-                shareUrl = json.str("shareUrl"),
-                expiresAt = json.str("expiresAt"),
-                visibility = json.str("visibility"),
-                token = json.str("token"),
-                recipients = json.stringList("recipients"),
-            )
+        val request = JsonObject().apply {
+            addProperty("operation", "update-share")
+            addProperty("apiKey", apiKey)
+            if (baseUrl != null) addProperty("baseUrl", baseUrl)
+            addProperty("shareId", shareId)
+            add("patch", liveSharePatchJson(patch))
         }
-        throw shareError(status, json, raw)
+        val obj = callJolliApi(request).asJsonObjectOrNull()
+            ?: throw RuntimeException("Invalid response from update-share")
+        return LiveShareUpdateResult(
+            shareId = obj.stringOrNull("shareId"),
+            shareUrl = obj.stringOrNull("shareUrl"),
+            expiresAt = obj.stringOrNull("expiresAt"),
+            visibility = obj.stringOrNull("visibility"),
+            token = obj.stringOrNull("token"),
+            recipients = obj.stringList("recipients"),
+        )
     }
 
-    /** Revokes a live share by id. 404 = already gone → idempotent success. */
-    fun revokeShare(baseUrl: String?, apiKey: String, shareId: String) {
-        val resolved = resolveShareBaseUrl(baseUrl, apiKey)
-        val path = "/api/share/branch/${java.net.URLEncoder.encode(shareId, Charsets.UTF_8)}"
-        val response = sendAuthed("DELETE", resolved, apiKey, path, null, timeoutSec = 30)
-        val status = response.statusCode()
-        if (status != 200 && status != 204 && status != 404) {
-            throw RuntimeException("Revoke failed with status $status")
+    /**
+     * Serializes a live-share update patch. Marked `internal` so the
+     * wire-contract test pins each field name literally — same rationale as
+     * [liveSharePayloadJson]. Fields absent from the patch are omitted so the
+     * server treats them as "unchanged"; a rename would silently drop the
+     * caller's intent (e.g. a `visibility` change fails to apply and the share
+     * stays public).
+     */
+    internal fun liveSharePatchJson(patch: LiveSharePatch): JsonObject = JsonObject().apply {
+        if (patch.visibility != null) addProperty("visibility", patch.visibility)
+        if (patch.expiresAt != null) addProperty("expiresAt", patch.expiresAt)
+        if (patch.ref != null) add("ref", gson.toJsonTree(patch.ref))
+        if (patch.recipients != null) {
+            val arr = JsonArray().apply { patch.recipients.forEach { add(it) } }
+            add("recipients", arr)
         }
+    }
+
+    /** Revokes a live share by id. 404 = already gone → idempotent success (handled by the CLI client, see cli/src/core/JolliShareClient.ts). */
+    fun revokeShare(baseUrl: String?, apiKey: String, shareId: String) {
+        val request = JsonObject().apply {
+            addProperty("operation", "revoke-share")
+            addProperty("apiKey", apiKey)
+            if (baseUrl != null) addProperty("baseUrl", baseUrl)
+            addProperty("shareId", shareId)
+        }
+        callJolliApi(request)
     }
 
     /**
@@ -759,40 +600,40 @@ object JolliApiClient {
         recipients: List<String>,
         message: String? = null,
     ): ShareInviteResult {
-        val resolved = resolveShareBaseUrl(baseUrl, apiKey)
-        val path = "/api/share/branch/${java.net.URLEncoder.encode(shareId, Charsets.UTF_8)}/invite"
-        val bodyMap = HashMap<String, Any>()
-        bodyMap["recipients"] = recipients
-        if (message != null) bodyMap["message"] = message
-        val response = sendAuthed("POST", resolved, apiKey, path, gson.toJson(bodyMap))
-        val raw = response.body() ?: ""
-        val status = response.statusCode()
-        val json = parseObjectOrNull(raw)
-        if (status in 200..299) {
-            return ShareInviteResult(
-                sent = json?.stringList("sent") ?: emptyList(),
-                failed = json?.stringList("failed") ?: emptyList(),
-            )
+        val request = JsonObject().apply {
+            addProperty("operation", "invite-share")
+            addProperty("apiKey", apiKey)
+            if (baseUrl != null) addProperty("baseUrl", baseUrl)
+            addProperty("shareId", shareId)
+            val arr = JsonArray().apply { recipients.forEach { add(it) } }
+            add("recipients", arr)
+            if (message != null) addProperty("message", message)
         }
-        throw shareError(status, json, raw)
+        val obj = callJolliApi(request).asJsonObjectOrNull()
+            ?: throw RuntimeException("Invalid response from invite-share")
+        return ShareInviteResult(
+            sent = obj.stringList("sent") ?: emptyList(),
+            failed = obj.stringList("failed") ?: emptyList(),
+        )
     }
 
     /**
-     * Lists active org members as recipient candidates (name + email), via
-     * `GET /api/jolli-memory/org-members`. Best-effort: returns [] on any error.
+     * Lists active org members as recipient candidates (name + email). Best-effort:
+     * returns [] on any error.
      */
     fun listOrgMembers(baseUrl: String?, apiKey: String): List<OrgMember> {
         return try {
-            val resolved = resolveShareBaseUrl(baseUrl, apiKey)
-            val response = sendAuthed("GET", resolved, apiKey, "/api/jolli-memory/org-members", null, timeoutSec = 30)
-            val status = response.statusCode()
-            if (status !in 200..299) return emptyList()
-            val json = parseObjectOrNull(response.body() ?: "") ?: return emptyList()
-            val rows = json.get("members")?.takeIf { it.isJsonArray }?.asJsonArray ?: return emptyList()
-            rows.mapNotNull { el ->
-                val obj = el.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapNotNull null
-                val email = obj.str("email")?.trim().orEmpty()
-                if (email.isEmpty()) null else OrgMember(name = obj.str("name") ?: "", email = email)
+            val request = JsonObject().apply {
+                addProperty("operation", "list-org-members")
+                addProperty("apiKey", apiKey)
+                if (baseUrl != null) addProperty("baseUrl", baseUrl)
+            }
+            val obj = callJolliApi(request).asJsonObjectOrNull() ?: return emptyList()
+            val members = obj.get("members")?.takeIf { it.isJsonArray }?.asJsonArray ?: return emptyList()
+            members.mapNotNull { el ->
+                val m = el.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapNotNull null
+                val email = m.stringOrNull("email")?.trim().orEmpty()
+                if (email.isEmpty()) null else OrgMember(name = m.stringOrNull("name").orEmpty(), email = email)
             }
         } catch (_: Exception) {
             emptyList()
@@ -802,61 +643,66 @@ object JolliApiClient {
     // ── Internal helpers ────────────────────────────────────────────────────
 
     /**
-     * Extracts the origin and optional tenant slug from a Jolli base URL.
-     * If the URL has a non-empty path (e.g. "/test1/"), the first segment is the tenant slug.
+     * Sends one `jolli-api` bridge request and maps common typed errors back to
+     * their Kotlin exception counterparts. [payloadRepoUrl] is threaded so a
+     * `BindingRequiredError` without a `repoUrl` field in the CLI-side error
+     * detail can still fall back to the payload's own repo URL.
+     *
+     * Stamps `clientHeader` on every request so the CLI-side `x-jolli-client`
+     * identifies the plugin (`intellij-plugin/<plugin-version>`) rather than
+     * the bundled CLI build. See [intellijClientHeader].
      */
-    private fun parseBaseUrl(baseUrl: String): ParsedBaseUrl {
-        val uri = URI.create(baseUrl)
-        val pathSegments = (uri.path ?: "")
-            .trim('/')
-            .split("/")
-            .filter { it.isNotEmpty() }
-
-        val origin = "${uri.scheme}://${uri.authority}"
-        val tenantSlug = pathSegments.firstOrNull()
-
-        return ParsedBaseUrl(origin = origin, tenantSlug = tenantSlug)
-    }
-
-    /** Parses a push response, handling errors and status codes. */
-    private fun parseResponse(raw: String, statusCode: Int, payloadRepoUrl: String? = null): JolliPushResult {
+    private fun callJolliApi(request: JsonObject, payloadRepoUrl: String? = null): JsonElement {
+        request.addProperty("clientHeader", intellijClientHeader)
         return try {
-            @Suppress("UNCHECKED_CAST")
-            val json = gson.fromJson(raw, Map::class.java) as Map<String, Any?>
-
-            if (statusCode in 200..299) {
-                JolliPushResult(
-                    url = json["url"] as? String ?: "",
-                    docId = (json["docId"] as? Double)?.toInt() ?: 0,
-                    jrn = json["jrn"] as? String ?: "",
-                    created = json["created"] as? Boolean ?: false,
-                )
-            } else if (statusCode == 412 && json["error"] == "binding_required") {
-                throw BindingRequiredError(
-                    repoUrl = json["repoUrl"] as? String ?: payloadRepoUrl ?: "",
-                )
-            } else if (statusCode == 426) {
-                throw PluginOutdatedError(
-                    json["message"] as? String
-                        ?: "Plugin version is outdated. Please update to the latest version."
-                )
-            } else if (statusCode == 401 || statusCode == 403) {
-                throw UnauthorizedError(
-                    json["error"] as? String ?: "Invalid or disabled API key"
-                )
-            } else {
-                throw RuntimeException(
-                    json["error"] as? String ?: "HTTP $statusCode"
-                )
-            }
-        } catch (e: BindingRequiredError) {
-            throw e
-        } catch (e: PluginOutdatedError) {
-            throw e
-        } catch (e: RuntimeException) {
-            throw e
-        } catch (_: Exception) {
-            throw RuntimeException("Invalid JSON response (HTTP $statusCode): ${raw.take(200)}")
+            CliIntegrations.runIdeBridge(CliIntegrations.resolveDefaultCwd(), "jolli-api", gson.toJson(request))
+        } catch (e: CliIntegrations.CliBridgeException) {
+            throw remapBridgeException(e, payloadRepoUrl)
         }
     }
+
+    /**
+     * Maps the CLI's structured error envelope (see IdeBridgeCommand.ts's
+     * `copyPrimitiveErrorFields`) to the Kotlin exception the UI still branches
+     * on. Kotlin previously threw `UnauthorizedError` for both 401 and 403; both
+     * `NotAuthenticatedError` and `PermissionDeniedError` on the CLI side map to
+     * that same exception to preserve the pre-existing behavior.
+     */
+    internal fun remapBridgeException(e: CliIntegrations.CliBridgeException, payloadRepoUrl: String?): RuntimeException {
+        return when (e.errorName) {
+            "ClientOutdatedError" -> PluginOutdatedError(e.message ?: "Plugin outdated")
+            "NotAuthenticatedError", "PermissionDeniedError" -> UnauthorizedError(e.message ?: "Not authenticated")
+            "BindingRequiredError" -> {
+                val repoUrl = e.details.get("repoUrl")
+                    ?.takeIf { it.isJsonPrimitive }?.asString
+                    ?: payloadRepoUrl.orEmpty()
+                BindingRequiredError(repoUrl = repoUrl, message = e.message ?: "Binding required")
+            }
+            "ShareRevokedError" -> ShareRevokedError(e.message ?: "This share has been stopped.")
+            // Note: "BindingAlreadyExistsError" is deliberately absent here —
+            // [mapCreateBindingBridgeException] handles it before falling
+            // through, so it can read the structured `existingSpaceId` needed
+            // for the race-winner banner (so the push can settle on the
+            // winning binding). Reaching this branch with that errorName
+            // means a caller other than createBinding hit it, so the plain
+            // RuntimeException fallback is the right behavior.
+            else -> RuntimeException(e.message ?: "unknown CLI bridge error")
+        }
+    }
+
+    private fun JsonElement?.asJsonObjectOrNull(): JsonObject? =
+        this?.takeIf { !it.isJsonNull && it.isJsonObject }?.asJsonObject
+
+    private fun JsonObject.stringOrNull(key: String): String? =
+        get(key)?.takeIf { !it.isJsonNull && it.isJsonPrimitive }?.asString
+
+    private fun JsonObject.intOrZero(key: String): Int =
+        get(key)?.takeIf { it.isJsonPrimitive && (it as JsonPrimitive).isNumber }?.asInt ?: 0
+
+    private fun JsonObject.boolOrFalse(key: String): Boolean =
+        get(key)?.takeIf { it.isJsonPrimitive && (it as JsonPrimitive).isBoolean }?.asBoolean ?: false
+
+    private fun JsonObject.stringList(key: String): List<String>? =
+        get(key)?.takeIf { it.isJsonArray }?.asJsonArray
+            ?.mapNotNull { it.takeIf { e -> e.isJsonPrimitive }?.asString }
 }

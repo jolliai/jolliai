@@ -99,21 +99,22 @@ class CloudSyncAction : AnAction() {
 		}
 
 		signInButton.addActionListener {
-			signInButton.isEnabled = false
-			signInButton.text = "Signing in..."
+			// Fire-and-forget: `login()` opens the browser and returns. The
+			// popup either receives onSuccess (dispose it) or onError (surface
+			// via notification); neither path touches the button state, so
+			// the popup keeps its normal look until one of them fires.
+			// Matches VS Code's `jollimemory.signIn` command.
 			JolliAuthService.login(
 				// User-initiated sign-in: mint a fresh key so a revoked same-tenant key recovers.
 				forceFreshApiKey = true,
 				onSuccess = { _ ->
 					SwingUtilities.invokeLater {
-						// Popup will be stale after sign-in; close the parent popup
+						// Popup will be stale after sign-in; close the parent popup.
 						SwingUtilities.getWindowAncestor(panel)?.dispose()
 					}
 				},
 				onError = { msg ->
 					SwingUtilities.invokeLater {
-						signInButton.isEnabled = true
-						signInButton.text = "Sign In / Sign Up"
 						com.intellij.notification.Notifications.Bus.notify(
 							com.intellij.notification.Notification(
 								"JolliMemory",

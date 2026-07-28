@@ -1,6 +1,7 @@
 package ai.jolli.jollimemory.bridge
 
 import ai.jolli.jollimemory.core.JmLogger
+import ai.jolli.jollimemory.core.TraceContext
 import com.google.gson.JsonElement
 import com.google.gson.JsonNull
 import com.google.gson.JsonObject
@@ -96,7 +97,7 @@ class CliDaemonClient(private val project: Project) : Disposable {
 		val future = CompletableFuture<JsonElement>()
 		daemon.inFlight[id] = future
 		try {
-			val payload = buildRequestLine(id, action, cwd, requestJson)
+			val payload = buildRequestLine(id, action, cwd, requestJson, TraceContext.getCurrentTraceId())
 			try {
 				synchronized(daemon.writer) {
 					daemon.writer.write(payload)
@@ -135,8 +136,8 @@ class CliDaemonClient(private val project: Project) : Disposable {
 		}
 	}
 
-	private fun buildRequestLine(id: Long, action: String, cwd: String, requestJson: String?): String =
-		serializeRequestLine(id, action, cwd, requestJson)
+	private fun buildRequestLine(id: Long, action: String, cwd: String, requestJson: String?, traceId: String?): String =
+		serializeRequestLine(id, action, cwd, requestJson, traceId)
 
 	private fun ensureDaemonStarted(): DaemonProcess {
 		val cur = processRef.get()
@@ -426,16 +427,19 @@ class CliDaemonClient(private val project: Project) : Disposable {
 
 		/**
 		 * Formats one request as a JSON-RPC 2.0 request line — one JSON object
-		 * with `jsonrpc:"2.0"` / `id` / `method` / `params:{cwd, request}` and
-		 * no trailing newline. Exposed so unit tests can assert the wire shape
+		 * with `jsonrpc:"2.0"` / `id` / `method` / `params:{cwd, request, traceId?}`
+		 * and no trailing newline. Exposed so unit tests can assert the wire shape
 		 * without spawning a daemon. `requestJson` may be null or blank; both
-		 * mean an empty request body.
+		 * mean an empty request body. `traceId` is included in `params` only when
+		 * non-null and non-blank so the daemon adopts it via `runWithTrace`,
+		 * keeping IDE / CLI / backend logs correlated for one logical operation.
 		 */
 		internal fun serializeRequestLine(
 			id: Long,
 			action: String,
 			cwd: String,
 			requestJson: String?,
+			traceId: String? = null,
 		): String {
 			// The server contract is "request is a JSON object" — a top-level
 			// array or primitive would silently ship as `"request": [1,2,3]`
@@ -453,6 +457,7 @@ class CliDaemonClient(private val project: Project) : Disposable {
 			val params = JsonObject().apply {
 				addProperty("cwd", cwd)
 				add("request", body)
+				if (!traceId.isNullOrBlank()) addProperty("traceId", traceId)
 			}
 			val req = JsonObject().apply {
 				addProperty("jsonrpc", "2.0")

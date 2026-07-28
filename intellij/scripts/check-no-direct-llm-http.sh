@@ -37,8 +37,6 @@ PATTERN='api\.anthropic\.com|java\.net\.http'
 # under LC_ALL=C.
 ALLOWLIST=$(sort <<'EOF'
 src/main/kotlin/ai/jolli/jollimemory/core/telemetry/TelemetryFlusher.kt
-src/main/kotlin/ai/jolli/jollimemory/services/JolliApiClient.kt
-src/main/kotlin/ai/jolli/jollimemory/services/JolliAuthService.kt
 EOF
 )
 

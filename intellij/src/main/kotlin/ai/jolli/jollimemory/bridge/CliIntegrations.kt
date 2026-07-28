@@ -1,7 +1,8 @@
 package ai.jolli.jollimemory.bridge
 
-import com.google.gson.JsonParser
 import ai.jolli.jollimemory.core.JmLogger
+import ai.jolli.jollimemory.core.TraceContext
+import com.google.gson.JsonParser
 import java.io.File
 import java.util.concurrent.TimeUnit
 
@@ -16,6 +17,37 @@ object CliIntegrations {
     private val log = JmLogger.create("CliIntegrations")
 
     private const val IDE_BRIDGE_TIMEOUT_SECONDS = 300L
+
+    /**
+     * Creates an owner-only temp file (POSIX 0600) so a response containing
+     * credentials — the `handle-auth-callback` response carries `token` and
+     * `jolliApiKey` — is not readable by other local users while the process
+     * is alive. `File.createTempFile` follows the JDK's default `O_CREAT` +
+     * umask path, which on shared-`/tmp` Linux hosts (unlike macOS's per-user
+     * `$TMPDIR` at 0700) leaves the file 0644 for the delete window.
+     *
+     * The `generate` and `migrate-memory-bank` responses do not contain
+     * credentials, but they can carry private summary / transcript content —
+     * same helper for consistency and to keep the choice one place.
+     *
+     * Windows: `PosixFilePermissions` throws `UnsupportedOperationException`
+     * there — fall back to `File.createTempFile`. Windows's default temp dir
+     * (`%LOCALAPPDATA%\Temp`) is already per-user via NTFS ACLs.
+     */
+    internal fun createSecureTempFile(prefix: String, suffix: String): File {
+        return try {
+            val perms = java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+            )
+            val attr = java.nio.file.attribute.PosixFilePermissions.asFileAttribute(perms)
+            java.nio.file.Files.createTempFile(prefix, suffix, attr).toFile()
+        } catch (_: UnsupportedOperationException) {
+            // Windows or a non-POSIX filesystem — user-scoped temp dir already
+            // restricts access at the ACL layer.
+            File.createTempFile(prefix, suffix)
+        }
+    }
 
     sealed class Result {
         /** Integrations set up successfully. */
@@ -394,7 +426,7 @@ object CliIntegrations {
             ?: throw RuntimeException("The bundled CLI was not found in the plugin. Try reinstalling the Jolli Memory plugin.")
         val cliJs = File(distDir, "Cli.js")
 
-        val outFile = File.createTempFile("jolli-generate-", ".json")
+        val outFile = createSecureTempFile("jolli-generate-", ".json")
         try {
             val proc = ProcessBuilder(node, cliJs.absolutePath, "generate", action, "--cwd", projectDir)
                 .directory(File(projectDir))
@@ -503,13 +535,22 @@ object CliIntegrations {
             ?: throw RuntimeException("Node.js not found — it is required for Jolli Memory. Install Node.js and reopen the project.")
         val cliJs = resolveCliJs()
             ?: throw RuntimeException("The bundled CLI was not found in the plugin. Try reinstalling Jolli Memory.")
-        val outFile = File.createTempFile("jolli-ide-bridge-", ".json")
+        val outFile = createSecureTempFile("jolli-ide-bridge-", ".json")
         try {
-            val proc = ProcessBuilder(node, cliJs.absolutePath, "ide-bridge", action, "--cwd", projectDir)
+            val pb = ProcessBuilder(node, cliJs.absolutePath, "ide-bridge", action, "--cwd", projectDir)
                 .directory(File(projectDir))
                 .redirectOutput(outFile)
                 .redirectError(ProcessBuilder.Redirect.DISCARD)
-                .start()
+            // Forward the ambient Kotlin trace id (when inside a withTrace scope)
+            // so Cli.ts's `runWithTrace(traceIdFromEnv(), ...)` adopts it — that
+            // keeps the CLI's outbound HTTP calls sharing the IDE-scoped trace id
+            // (`x-jolli-trace`) instead of minting a fresh CLI-only one, so the
+            // IDE / CLI / backend logs remain grep-able by one id.
+            val traceId = TraceContext.getCurrentTraceId()
+            if (!traceId.isNullOrBlank()) {
+                pb.environment()["JOLLI_TRACE_ID"] = traceId
+            }
+            val proc = pb.start()
             proc.outputStream.use { stdin ->
                 if (requestJson != null) stdin.write(requestJson.toByteArray(Charsets.UTF_8))
             }
@@ -727,7 +768,7 @@ object CliIntegrations {
             ?: throw RuntimeException("The bundled CLI was not found in the plugin. Try reinstalling the Jolli Memory plugin.")
         val cliJs = File(distDir, "Cli.js")
 
-        val outFile = File.createTempFile("jolli-migrate-", ".json")
+        val outFile = createSecureTempFile("jolli-migrate-", ".json")
         try {
             val proc = ProcessBuilder(node, cliJs.absolutePath, "migrate-memory-bank", "--cwd", projectDir)
                 .directory(File(projectDir))

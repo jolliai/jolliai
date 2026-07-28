@@ -48,9 +48,21 @@ vi.mock("../daemon/DaemonWatcher.js", () => ({
 	}),
 }));
 
+// Shared logger stub used by any code that calls `createLogger("...")` — one
+// instance so tests can inspect the same warn-call history the SUT wrote to.
+// Wrapped in `vi.hoisted` because vi.mock's factory is hoisted to the top of
+// the file BEFORE plain const initializers run; a top-level const would trip
+// a "Cannot access before initialization" ReferenceError inside the factory.
+const _mockedLoggerCalls = vi.hoisted(() => ({
+	info: vi.fn(),
+	debug: vi.fn(),
+	warn: vi.fn(),
+	error: vi.fn(),
+}));
+
 vi.mock("../Logger.js", () => ({
 	setLogDir: vi.fn(),
-	createLogger: () => ({ info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+	createLogger: () => _mockedLoggerCalls,
 	getJolliMemoryDir: (cwd: string) => `${cwd}/.jolli/jollimemory`,
 }));
 
@@ -119,6 +131,12 @@ vi.mock("../auth/AuthConfig.js", () => ({
 
 vi.mock("../auth/CliExchange.js", () => ({
 	exchangeCliCode: vi.fn(),
+}));
+
+// Pinned so `device_name` assertions don't depend on the CI runner's hostname
+// (`getDeviceLabel()` sanitizes it and returns undefined when nothing survives).
+vi.mock("../auth/DeviceLabel.js", () => ({
+	getDeviceLabel: vi.fn().mockReturnValue("test-box"),
 }));
 
 vi.mock("../core/JolliApiUtils.js", () => ({
@@ -363,9 +381,19 @@ vi.mock("../core/TelemetryConsent.js", () => ({
 	shouldShowTelemetryNotice: vi.fn().mockReturnValue(false),
 }));
 
-vi.mock("./CliUtils.js", () => ({
-	readStdin: vi.fn(),
-}));
+vi.mock("./CliUtils.js", async (importActual) => {
+	// Only readStdin needs to be stubbed (test scaffolding pipes raw JSON via
+	// runIdeBridgeAction, not via stdin). Every other export — including the
+	// `IDE_BRIDGE_STDIN_MAX_BYTES` constant that the ide-bridge entry point
+	// imports at the top of IdeBridgeCommand.ts — passes through unchanged, so
+	// the mock can't drift from the source value if the constant is later
+	// resized.
+	const actual = await importActual<typeof import("./CliUtils.js")>();
+	return {
+		...actual,
+		readStdin: vi.fn(),
+	};
+});
 
 // ---------- module under test (import AFTER vi.mock declarations) ----------
 
@@ -600,6 +628,43 @@ describe("computeServeResponse", () => {
 			jsonrpc: "2.0",
 			id: 3,
 			error: { code: -32000, message: expect.stringContaining('"method"') },
+		});
+	});
+
+	it("accepts params.traceId and still dispatches the action normally", async () => {
+		// A well-formed 32-hex traceId is adopted via runWithTrace so the
+		// dispatched handler's outbound HTTP calls carry the IDE-scoped
+		// x-jolli-trace value instead of a fresh CLI-only one.
+		const envelope = await computeServeResponse(
+			JSON.stringify({
+				jsonrpc: "2.0",
+				id: 9,
+				method: "plan-grouping",
+				params: {
+					cwd: "/repo",
+					request: { operation: "base-key", slug: "s" },
+					traceId: "abc123def4567890abc123def4567890",
+				},
+			}),
+			"/fallback",
+		);
+		expect(envelope).toMatchObject({ jsonrpc: "2.0", id: 9, result: { key: "plan:s" } });
+	});
+
+	it("rejects a non-string params.traceId with a paired error envelope", async () => {
+		const envelope = await computeServeResponse(
+			JSON.stringify({
+				jsonrpc: "2.0",
+				id: 10,
+				method: "plan-grouping",
+				params: { cwd: "/repo", request: {}, traceId: 12345 },
+			}),
+			"/fallback",
+		);
+		expect(envelope).toMatchObject({
+			jsonrpc: "2.0",
+			id: 10,
+			error: { code: -32000, message: expect.stringContaining("traceId") },
 		});
 	});
 
@@ -1187,13 +1252,143 @@ describe("runIdeBridgeAction — auth", () => {
 		expect(auth.saveAuthCredentials).toHaveBeenCalledWith({ token: "tok", jolliUrl: "https://jolli.ai" });
 	});
 
-	it("saves legacy credentials with an api key", async () => {
+	it("signs out", async () => {
 		const auth = await import("../auth/AuthConfig.js");
-		vi.mocked(auth.resolveSignInJolliUrl).mockReturnValue("https://jolli.ai");
-		await runIdeBridgeAction("auth", "/r", {
-			operation: "save-legacy-credentials",
-			token: "tok",
+		await runIdeBridgeAction("auth", "/r", { operation: "sign-out" });
+		expect(auth.clearAuthCredentials).toHaveBeenCalled();
+	});
+
+	it("builds a login url carrying the top-level CSRF state param", async () => {
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "build-login-url",
 			jolliUrl: "https://jolli.ai",
+			callbackUrl: "http://localhost:1/cb",
+			state: "abc123",
+			clientVersion: "1.0.0",
+		});
+		const url = new URL((result as { url: string }).url);
+		expect(url.searchParams.get("state")).toBe("abc123");
+	});
+
+	it("omits state when not provided", async () => {
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "build-login-url",
+			jolliUrl: "https://jolli.ai",
+			callbackUrl: "http://localhost:1/cb",
+			clientVersion: "1.0.0",
+		});
+		expect(new URL((result as { url: string }).url).searchParams.has("state")).toBe(false);
+	});
+
+	it("keeps a path-based tenant prefix in the login url", async () => {
+		// `new URL("/login", "https://jolli-local.me/dev")` drops `/dev` — a
+		// root-relative path resolves against the origin. Path-based tenants
+		// would 404 on their own login page.
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "build-login-url",
+			jolliUrl: "https://jolli-local.me/dev",
+			callbackUrl: "http://localhost:1/cb",
+			clientVersion: "1.0.0",
+		});
+		expect(new URL((result as { url: string }).url).pathname).toBe("/dev/login");
+	});
+
+	it("pins the login url param order, sharing VS Code's leading six", async () => {
+		// A pinned order keeps the surfaces' URLs visually comparable in captures
+		// and server logs, and protects against silent drift when one surface is
+		// refactored in isolation. The first six match VS Code verbatim;
+		// `install_id` is appended last because VS Code sends none. The CLI emits
+		// the same params but puts `install_id` BEFORE `generate_api_key`, so
+		// this is not a three-way byte-identical order — see the note in
+		// `IdeBridgeCommand.ts`'s `build-login-url` branch before "fixing" it.
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "build-login-url",
+			jolliUrl: "https://jolli.ai",
+			callbackUrl: "http://localhost:1/cb",
+			state: "st",
+			clientVersion: "1.0.0",
+			generateApiKey: true,
+			installId: "inst",
+		});
+		expect([...new URL((result as { url: string }).url).searchParams.keys()]).toEqual([
+			"cli_callback",
+			"state",
+			"client",
+			"client_version",
+			"generate_api_key",
+			"device_name",
+			"install_id",
+		]);
+	});
+
+	it("pairs device_name with generate_api_key so a second machine keeps its own key", async () => {
+		// The server scopes its per-user idempotency key by device_name. Without
+		// it, signing in from a second machine invalidates the first machine's
+		// auto-minted API key. Only sent when we're asking for a fresh key —
+		// on a plain re-auth there is no key being minted to scope.
+		const withKey = await runIdeBridgeAction("auth", "/r", {
+			operation: "build-login-url",
+			jolliUrl: "https://jolli.ai",
+			callbackUrl: "http://localhost:1/cb",
+			clientVersion: "1.0.0",
+			generateApiKey: true,
+		});
+		expect(new URL((withKey as { url: string }).url).searchParams.get("device_name")).toBe("test-box");
+
+		const withoutKey = await runIdeBridgeAction("auth", "/r", {
+			operation: "build-login-url",
+			jolliUrl: "https://jolli.ai",
+			callbackUrl: "http://localhost:1/cb",
+			clientVersion: "1.0.0",
+		});
+		expect(new URL((withoutKey as { url: string }).url).searchParams.has("device_name")).toBe(false);
+	});
+
+	it("omits device_name when the hostname sanitizes to nothing", async () => {
+		const { getDeviceLabel } = await import("../auth/DeviceLabel.js");
+		vi.mocked(getDeviceLabel).mockReturnValueOnce(undefined);
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "build-login-url",
+			jolliUrl: "https://jolli.ai",
+			callbackUrl: "http://localhost:1/cb",
+			clientVersion: "1.0.0",
+			generateApiKey: true,
+		});
+		expect(new URL((result as { url: string }).url).searchParams.has("device_name")).toBe(false);
+	});
+
+	it("percent-encodes an unusual client_version defensively", async () => {
+		// Normal semver and the "0.0.0" sentinel are URL-safe, but a pre-release
+		// tag with `+` or whitespace would otherwise be lost in transit.
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "build-login-url",
+			jolliUrl: "https://jolli.ai",
+			callbackUrl: "http://localhost:1/cb",
+			clientVersion: "1.4.2+build 7",
+		});
+		expect((result as { url: string }).url).toContain("client_version=1.4.2%2Bbuild+7");
+	});
+
+	it("handle-auth-callback: succeeds via code exchange", async () => {
+		const { exchangeCliCode } = await import("../auth/CliExchange.js");
+		const auth = await import("../auth/AuthConfig.js");
+		vi.mocked(exchangeCliCode).mockResolvedValue({
+			token: "tok",
+			jolliApiKey: "sk-jol-x",
+			space: "sp",
+		} as never);
+		vi.mocked(auth.resolveSignInJolliUrl).mockReturnValue("https://jolli.ai");
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "handle-auth-callback",
+			jolliUrl: "https://jolli.ai",
+			queryString: "state=s1&code=c1",
+			expectedState: "s1",
+		});
+		expect(result).toEqual({
+			success: true,
+			redirectUrl: "https://jolli.ai/cli-complete",
+			token: "tok",
+			space: "sp",
 			jolliApiKey: "sk-jol-x",
 		});
 		expect(auth.saveAuthCredentials).toHaveBeenCalledWith({
@@ -1203,21 +1398,169 @@ describe("runIdeBridgeAction — auth", () => {
 		});
 	});
 
-	it("saves legacy credentials without an api key when absent", async () => {
+	it("handle-auth-callback: accepts the legacy ?token= shape without a CSRF check", async () => {
+		// Mirrors main CLI / VS Code: pre-code-exchange servers never echo
+		// `state`, so demanding it on the legacy branch would lock those
+		// tenants out of sign-in. The code-branch CSRF check is still there
+		// (covered by other tests) — this one just verifies the legacy branch
+		// is accepted end-to-end.
 		const auth = await import("../auth/AuthConfig.js");
 		vi.mocked(auth.resolveSignInJolliUrl).mockReturnValue("https://jolli.ai");
-		await runIdeBridgeAction("auth", "/r", {
-			operation: "save-legacy-credentials",
-			token: "tok",
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "handle-auth-callback",
 			jolliUrl: "https://jolli.ai",
+			queryString: "token=legacy-tok&jolli_api_key=sk-jol-y&space=sp2",
+			expectedState: "s1",
 		});
-		expect(auth.saveAuthCredentials).toHaveBeenCalledWith({ token: "tok", jolliUrl: "https://jolli.ai" });
+		expect(result).toEqual({
+			success: true,
+			redirectUrl: "https://jolli.ai/cli-complete",
+			token: "legacy-tok",
+			space: "sp2",
+			jolliApiKey: "sk-jol-y",
+		});
+		expect(auth.saveAuthCredentials).toHaveBeenCalledWith({
+			token: "legacy-tok",
+			jolliUrl: "https://jolli.ai",
+			jolliApiKey: "sk-jol-y",
+		});
 	});
 
-	it("signs out", async () => {
+	it("handle-auth-callback: names the caller's own retry path on user_denied", async () => {
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "handle-auth-callback",
+			jolliUrl: "https://jolli.ai",
+			queryString: "error=user_denied",
+			expectedState: "s1",
+			retryHint: "You can try again from Settings.",
+		});
+		expect(result).toMatchObject({
+			errorMessage: "Sign-in was cancelled. You can try again from Settings.",
+		});
+	});
+
+	it("handle-auth-callback: reports a server error code even when no state comes back", async () => {
+		// The `?error=` redirect carries no `state` either — a state check ahead
+		// of it would report a plain user cancellation as a CSRF attack.
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "handle-auth-callback",
+			jolliUrl: "https://jolli.ai",
+			queryString: "error=user_denied",
+			expectedState: "s1",
+		});
+		expect(result).toEqual({
+			success: false,
+			redirectUrl: "https://jolli.ai/cli-complete?error=user_denied",
+			errorCode: "user_denied",
+			// A code, not a sentence, is what the IDE balloon used to show.
+			errorMessage: "Sign-in was cancelled. You can try again.",
+		});
+	});
+
+	it("handle-auth-callback: rejects a code callback whose state does not match", async () => {
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "handle-auth-callback",
+			jolliUrl: "https://jolli.ai",
+			queryString: "state=wrong&code=c1",
+			expectedState: "expected",
+		});
+		expect(result).toEqual({
+			success: false,
+			redirectUrl: "https://jolli.ai/cli-complete?error=invalid_callback",
+			errorCode: "invalid_callback",
+			errorMessage: "Invalid sign-in callback (state mismatch). Please try again.",
+		});
+	});
+
+	it("handle-auth-callback: rejects a code callback with no state at all", async () => {
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "handle-auth-callback",
+			jolliUrl: "https://jolli.ai",
+			queryString: "code=c1",
+			expectedState: "expected",
+		});
+		expect(result).toMatchObject({ success: false, errorCode: "invalid_callback" });
+	});
+
+	it("handle-auth-callback: fails when neither code nor token is present", async () => {
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "handle-auth-callback",
+			jolliUrl: "https://jolli.ai",
+			queryString: "state=s1",
+			expectedState: "s1",
+		});
+		expect(result).toEqual({
+			success: false,
+			redirectUrl: "https://jolli.ai/cli-complete?error=invalid_callback",
+			errorCode: "invalid_callback",
+			errorMessage: "No authorization code or token received",
+		});
+	});
+
+	it("handle-auth-callback: keeps a path-based tenant prefix on both redirect targets", async () => {
+		const { exchangeCliCode } = await import("../auth/CliExchange.js");
 		const auth = await import("../auth/AuthConfig.js");
-		await runIdeBridgeAction("auth", "/r", { operation: "sign-out" });
-		expect(auth.clearAuthCredentials).toHaveBeenCalled();
+		vi.mocked(exchangeCliCode).mockResolvedValueOnce({ token: "tok" } as never);
+		vi.mocked(auth.resolveSignInJolliUrl).mockReturnValue("https://jolli-local.me/dev");
+		const ok = await runIdeBridgeAction("auth", "/r", {
+			operation: "handle-auth-callback",
+			jolliUrl: "https://jolli-local.me/dev",
+			queryString: "state=s1&code=c1",
+			expectedState: "s1",
+		});
+		expect(ok).toMatchObject({ redirectUrl: "https://jolli-local.me/dev/cli-complete" });
+		const failed = await runIdeBridgeAction("auth", "/r", {
+			operation: "handle-auth-callback",
+			jolliUrl: "https://jolli-local.me/dev/",
+			queryString: "state=s1",
+			expectedState: "s1",
+		});
+		expect(failed).toMatchObject({
+			redirectUrl: "https://jolli-local.me/dev/cli-complete?error=invalid_callback",
+		});
+	});
+
+	it("handle-auth-callback: reports a failed credential write instead of throwing", async () => {
+		// saveAuthCredentials rejects a malformed key, an off-allowlist origin,
+		// and a key minted for a different tenant. Those must come back as a
+		// structured failure, not as a bridge-level exception.
+		const { exchangeCliCode } = await import("../auth/CliExchange.js");
+		const auth = await import("../auth/AuthConfig.js");
+		vi.mocked(exchangeCliCode).mockResolvedValueOnce({
+			token: "tok",
+			jolliApiKey: "sk-jol-other-tenant",
+		} as never);
+		vi.mocked(auth.resolveSignInJolliUrl).mockReturnValue("https://jolli.ai");
+		vi.mocked(auth.saveAuthCredentials).mockRejectedValueOnce(new Error("Server returned a Jolli API key…"));
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "handle-auth-callback",
+			jolliUrl: "https://jolli.ai",
+			queryString: "state=s1&code=c1",
+			expectedState: "s1",
+		});
+		expect(result).toEqual({
+			success: false,
+			redirectUrl: "https://jolli.ai/cli-complete?error=failed_to_get_token",
+			errorCode: "failed_to_get_token",
+			errorMessage: "Server returned a Jolli API key…",
+		});
+	});
+
+	it("handle-auth-callback: returns failed_to_get_token when code exchange throws", async () => {
+		const { exchangeCliCode } = await import("../auth/CliExchange.js");
+		vi.mocked(exchangeCliCode).mockRejectedValue(new Error("Sign-in code expired or already used"));
+		const result = await runIdeBridgeAction("auth", "/r", {
+			operation: "handle-auth-callback",
+			jolliUrl: "https://jolli.ai",
+			queryString: "state=s1&code=bad",
+			expectedState: "s1",
+		});
+		expect(result).toEqual({
+			success: false,
+			redirectUrl: "https://jolli.ai/cli-complete?error=failed_to_get_token",
+			errorCode: "failed_to_get_token",
+			errorMessage: "Sign-in code expired or already used",
+		});
 	});
 
 	it("rejects an unknown auth operation", async () => {
@@ -1228,6 +1571,19 @@ describe("runIdeBridgeAction — auth", () => {
 });
 
 describe("runIdeBridgeAction — jolli-api", () => {
+	// `_mockedLoggerCalls` is `vi.hoisted` and shared across every jolli-api test
+	// (createLogger returns the same object every call). Without this reset a
+	// warn recorded by an earlier test would leak into a later one's
+	// "does NOT emit the drift warning" assertion — a silent false negative that
+	// still passes locally but flakes under different test ordering. beforeEach
+	// makes the reset unconditional and removes the burden from each test.
+	beforeEach(() => {
+		_mockedLoggerCalls.warn.mockClear();
+		_mockedLoggerCalls.info.mockClear();
+		_mockedLoggerCalls.debug.mockClear();
+		_mockedLoggerCalls.error.mockClear();
+	});
+
 	it("serializes a summary to JSON", async () => {
 		const { serializeSummaryJson } = await import("../core/JolliMemoryPushOrchestrator.js");
 		vi.mocked(serializeSummaryJson).mockReturnValue('{"s":1}');
@@ -1333,6 +1689,77 @@ describe("runIdeBridgeAction — jolli-api", () => {
 		await expect(runIdeBridgeAction("jolli-api", "/r", { operation: "wat", apiKey: "sk" })).rejects.toThrow(
 			/Unknown Jolli API operation/,
 		);
+	});
+
+	it("threads clientHeader into JolliMemoryPushClient's clientHeaderOverride", async () => {
+		// IntelliJ / VS Code stamp the plugin's own `x-jolli-client` value on
+		// each jolli-api request so their HTTP identifies as
+		// `intellij-plugin/<plugin-version>` rather than the bundled CLI's
+		// `cli/<cli-version>`. This asserts the runJolliApiAction wiring — a
+		// silent drop here reroutes surface identity across the whole plugin.
+		const { JolliMemoryPushClient } = await import("../core/JolliMemoryPushClient.js");
+		const mock = vi.mocked(JolliMemoryPushClient);
+		mock.mockClear();
+		await runIdeBridgeAction("jolli-api", "/r", {
+			operation: "list-spaces",
+			apiKey: "sk",
+			clientHeader: "intellij-plugin/0.99.4",
+		});
+		expect(mock).toHaveBeenCalledWith(expect.objectContaining({ clientHeaderOverride: "intellij-plugin/0.99.4" }));
+	});
+
+	it("threads clientHeader into JolliShareClient's clientHeaderOverride opt", async () => {
+		const { JolliShareClient } = await import("../core/JolliShareClient.js");
+		const mock = vi.mocked(JolliShareClient);
+		mock.mockClear();
+		await runIdeBridgeAction("jolli-api", "/r", {
+			operation: "revoke-share",
+			apiKey: "sk",
+			shareId: "s1",
+			clientHeader: "intellij-plugin/0.99.4",
+		});
+		expect(mock).toHaveBeenCalledWith(
+			expect.objectContaining({ apiKey: "sk", clientHeaderOverride: "intellij-plugin/0.99.4" }),
+		);
+	});
+
+	it("omits clientHeaderOverride when the caller sends no clientHeader (CLI-initiated call)", async () => {
+		// Bare `jolli` (no plugin) hits this same code path when we surface the
+		// jolli-api operations directly in the future. Absent → the client's
+		// default JOLLI_CLIENT_HEADER wins.
+		const { JolliMemoryPushClient } = await import("../core/JolliMemoryPushClient.js");
+		const mock = vi.mocked(JolliMemoryPushClient);
+		mock.mockClear();
+		await runIdeBridgeAction("jolli-api", "/r", { operation: "list-spaces", apiKey: "sk" });
+		const call = mock.mock.calls[0]?.[0] ?? {};
+		expect(call).not.toHaveProperty("clientHeaderOverride");
+	});
+
+	it("logs a drift warning when a network jolli-api op arrives without a clientHeader", async () => {
+		// Catches a future IDE-surface caller that forgets to stamp its plugin
+		// identity — the CLI would otherwise silently misidentify as the bundled
+		// build, evading per-surface min-version gates + skewing API attribution.
+		await runIdeBridgeAction("jolli-api", "/r", { operation: "list-spaces", apiKey: "sk" });
+		const messages = _mockedLoggerCalls.warn.mock.calls.map((c) => String(c[0]));
+		expect(messages.some((m) => m.includes("no clientHeader provided"))).toBe(true);
+	});
+
+	it("does NOT emit the drift warning for the local-only serialize-summary op", async () => {
+		// serialize-summary never hits the network — logging a warning there
+		// would false-positive on every push-preview refresh.
+		await runIdeBridgeAction("jolli-api", "/r", { operation: "serialize-summary", summary: {} });
+		const messages = _mockedLoggerCalls.warn.mock.calls.map((c) => String(c[0]));
+		expect(messages.some((m) => m.includes("no clientHeader provided"))).toBe(false);
+	});
+
+	it("does NOT emit the drift warning when clientHeader is present", async () => {
+		await runIdeBridgeAction("jolli-api", "/r", {
+			operation: "list-spaces",
+			apiKey: "sk",
+			clientHeader: "intellij-plugin/0.99.4",
+		});
+		const messages = _mockedLoggerCalls.warn.mock.calls.map((c) => String(c[0]));
+		expect(messages.some((m) => m.includes("no clientHeader provided"))).toBe(false);
 	});
 });
 
@@ -2460,8 +2887,8 @@ describe("executeIdeBridgeCommand", () => {
 		vi.mocked(cli.readStdin).mockResolvedValue(JSON.stringify({ operation: "base-key", slug: "s" }));
 		const cap = captureConsole();
 		await executeIdeBridgeCommand("plan-grouping", "/r");
-		expect(cap.consoleLog[0]).toContain('"result"');
-		expect(cap.consoleLog[0]).toContain('"key":"plan:s"');
+		expect(cap.stdout[0]).toContain('"result"');
+		expect(cap.stdout[0]).toContain('"key":"plan:s"');
 		expect(process.exitCode).not.toBe(1);
 	});
 
@@ -2470,7 +2897,7 @@ describe("executeIdeBridgeCommand", () => {
 		vi.mocked(cli.readStdin).mockResolvedValue("{}");
 		const cap = captureConsole();
 		await executeIdeBridgeCommand("no-such-action", "/r");
-		expect(cap.consoleLog[0]).toContain('"error"');
+		expect(cap.stdout[0]).toContain('"error"');
 		expect(process.exitCode).toBe(1);
 	});
 
@@ -2480,7 +2907,7 @@ describe("executeIdeBridgeCommand", () => {
 		const cap = captureConsole();
 		await executeIdeBridgeCommand("plan-grouping", "/r");
 		// plan-grouping's own error surfaces (operation required)
-		expect(cap.consoleLog[0]).toContain('"error"');
+		expect(cap.stdout[0]).toContain('"error"');
 		expect(process.exitCode).toBe(1);
 	});
 
@@ -2489,7 +2916,7 @@ describe("executeIdeBridgeCommand", () => {
 		vi.mocked(cli.readStdin).mockResolvedValue("[1,2,3]");
 		const cap = captureConsole();
 		await executeIdeBridgeCommand("plan-grouping", "/r");
-		expect(cap.consoleLog[0]).toContain("Bridge request must be a JSON object");
+		expect(cap.stdout[0]).toContain("Bridge request must be a JSON object");
 	});
 
 	it("stringifies a non-Error thrown value using String()", async () => {
@@ -2497,7 +2924,7 @@ describe("executeIdeBridgeCommand", () => {
 		vi.mocked(cli.readStdin).mockRejectedValue("stdin-fail" as never);
 		const cap = captureConsole();
 		await executeIdeBridgeCommand("plan-grouping", "/r");
-		expect(cap.consoleLog[0]).toContain("stdin-fail");
+		expect(cap.stdout[0]).toContain("stdin-fail");
 	});
 
 	it("copies primitive extras from a thrown Error into error.data", async () => {
@@ -2518,7 +2945,7 @@ describe("executeIdeBridgeCommand", () => {
 		vi.mocked(getStatus).mockRejectedValue(new MyErr());
 		const cap = captureConsole();
 		await executeIdeBridgeCommand("status", "/r");
-		const envelope = JSON.parse(cap.consoleLog[0]);
+		const envelope = JSON.parse(cap.stdout[0]);
 		expect(envelope.error.data.errorName).toBe("MyErr");
 		expect(envelope.error.data.code).toBe("E_TEST");
 		expect(envelope.error.data.retry).toBe(3);
@@ -2553,7 +2980,7 @@ describe("executeIdeBridgeCommand", () => {
 		vi.mocked(getStatus).mockRejectedValue(new LeakyErr());
 		const cap = captureConsole();
 		await executeIdeBridgeCommand("status", "/r");
-		const raw = cap.consoleLog[0];
+		const raw = cap.stdout[0];
 		expect(raw).not.toContain("sk-jol-");
 		expect(raw).not.toContain("hunter2");
 		const envelope = JSON.parse(raw);

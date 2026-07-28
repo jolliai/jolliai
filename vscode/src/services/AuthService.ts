@@ -214,6 +214,14 @@ export class AuthService {
 			log.error("AuthService", "getJolliUrl rejected mid-callback: %s", message);
 			return { success: false, error: message };
 		}
+		// Read the on-disk key BEFORE the exchange so we can pass it as the
+		// `existingKey` fallback to `resolveSignInJolliUrl`: an
+		// idempotent-replay callback with no `jolliApiKey` in the response
+		// (common on per-`device_name` backends) must not wipe a working key
+		// when the caller-supplied `jolliUrl` is a generic auth hub. Same fix
+		// as the ide-bridge `handle-auth-callback` path in
+		// `cli/src/auth/AuthCallback.ts`.
+		const existingKey = (await loadConfig()).jolliApiKey ?? undefined;
 		let credentials: { token: string; jolliApiKey?: string; jolliUrl: string };
 		if (code) {
 			try {
@@ -224,7 +232,7 @@ export class AuthService {
 					// origin — with no `JOLLI_URL` set the latter is the auth hub,
 					// which would fail `saveAuthCredentials`'s symmetry check and
 					// misdirect the routing fallback. See `resolveSignInJolliUrl`.
-					jolliUrl: resolveSignInJolliUrl(exchanged.jolliApiKey, jolliUrl),
+					jolliUrl: resolveSignInJolliUrl(exchanged.jolliApiKey, jolliUrl, existingKey),
 					...(exchanged.jolliApiKey
 						? { jolliApiKey: exchanged.jolliApiKey }
 						: {}),
@@ -244,7 +252,7 @@ export class AuthService {
 			const legacyApiKey = params.get("jolli_api_key");
 			credentials = {
 				token,
-				jolliUrl: resolveSignInJolliUrl(legacyApiKey ?? undefined, jolliUrl),
+				jolliUrl: resolveSignInJolliUrl(legacyApiKey ?? undefined, jolliUrl, existingKey),
 				...(legacyApiKey ? { jolliApiKey: legacyApiKey } : {}),
 			};
 		} else {

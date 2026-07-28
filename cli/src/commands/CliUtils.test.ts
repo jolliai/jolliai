@@ -452,6 +452,35 @@ describe("CliUtils", () => {
 			Object.defineProperty(process, "stdin", { value: stream, configurable: true });
 			await expect(readStdin()).rejects.toThrow(/exceeds .* bytes/);
 		});
+
+		it("respects a caller-supplied larger maxBytes ceiling (ide-bridge path)", async () => {
+			// The 64 KiB `--arg-stdin` cap is too small for IDE-bridge push /
+			// LLM-proxy payloads. This asserts the opt-in ceiling actually
+			// widens the limit — a regression that dropped it back to 64 KiB
+			// would routinely fail push on the one-shot spawn path.
+			const { readStdin } = await import("./CliUtils.js");
+			const { Readable } = await import("node:stream");
+			const oneMib = Buffer.alloc(1024 * 1024, 0x64); // 'd' * 1 MiB
+			const stream = Readable.from([oneMib]);
+			Object.defineProperty(process, "stdin", { value: stream, configurable: true });
+			const result = await readStdin({ maxBytes: 16 * 1024 * 1024, label: "ide-bridge request" });
+			expect(result.length).toBe(1024 * 1024);
+		});
+
+		it("emits the caller's label in the size-cap rejection message", async () => {
+			// The generic "--arg-stdin payload exceeds …" message is misleading
+			// when the caller was actually the ide-bridge entry point (the flag
+			// has nothing to do with that operation). The label lets each
+			// caller frame its own error.
+			const { readStdin } = await import("./CliUtils.js");
+			const { Readable } = await import("node:stream");
+			const tooBig = Buffer.alloc(129, 0x65);
+			const stream = Readable.from([tooBig]);
+			Object.defineProperty(process, "stdin", { value: stream, configurable: true });
+			await expect(readStdin({ maxBytes: 128, label: "ide-bridge request" })).rejects.toThrow(
+				/ide-bridge request payload exceeds/,
+			);
+		});
 	});
 
 	describe("AmbiguousHashError construction invariants", () => {

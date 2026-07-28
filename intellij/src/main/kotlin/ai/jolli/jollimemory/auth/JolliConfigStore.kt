@@ -1,6 +1,5 @@
 package ai.jolli.jollimemory.auth
 
-import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.SessionTracker
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
@@ -10,6 +9,10 @@ import java.nio.file.Path
 /**
  * Read/write store for general Jolli config files under ~/.jolli/ (shared with CLI).
  * Auth token and space are stored in ~/.jolli/jollimemory/config.json.
+ *
+ * Auth token writes (save/clear) are handled by the CLI ide-bridge
+ * `handle-auth-callback` / `sign-out` actions — this class only retains
+ * read access for the isSignedIn() fast path and space persistence.
  */
 object JolliConfigStore {
 
@@ -30,20 +33,6 @@ object JolliConfigStore {
 
         val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
         return config.authToken?.takeIf { it.isNotBlank() }
-    }
-
-    /** Save auth token to ~/.jolli/jollimemory/config.json. */
-    fun saveAuthToken(token: String) {
-        val globalDir = SessionTracker.getGlobalConfigDir()
-        val existing = SessionTracker.loadConfigFromDir(globalDir)
-        SessionTracker.saveConfigToDir(existing.copy(authToken = token), globalDir)
-    }
-
-    /** Clear auth token from ~/.jolli/jollimemory/config.json. */
-    fun clearAuthToken() {
-        val globalDir = SessionTracker.getGlobalConfigDir()
-        val existing = SessionTracker.loadConfigFromDir(globalDir)
-        SessionTracker.saveConfigToDir(existing.copy(authToken = null), globalDir)
     }
 
     /** Load space from ~/.jolli/space.json. */

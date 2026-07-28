@@ -222,6 +222,21 @@ export function isAffirmative(answer: string): boolean {
 export const STDIN_MAX_BYTES = 64 * 1024;
 
 /**
+ * Hard cap for `ide-bridge` bodies routed over stdin on the one-shot fallback
+ * (no bound daemon). Push payloads carry a full commit summary plus the
+ * enriched `summaryJson` sidecar, and the LLM proxy path carries interactive
+ * prompts that legitimately embed diffs — both routinely blow past the 64 KiB
+ * `--arg-stdin` cap, but the request is a fresh JSON DTO synthesized by an
+ * in-process IDE plugin, never user shell input, so the OOM concern that
+ * shapes the smaller cap does not apply. 16 MiB is comfortably above the
+ * server's own summary/prompt limits — an oversized body fails fast here
+ * rather than after minutes of streaming — while still bounding any
+ * pathological caller. Keep this the only stdin cap that grows: the
+ * `--arg-stdin` gate must stay tight.
+ */
+export const IDE_BRIDGE_STDIN_MAX_BYTES = 16 * 1024 * 1024;
+
+/**
  * Reads the entire contents of `process.stdin` to a string, trims one trailing
  * newline (LF or CRLF) if present, and returns the result.
  *
@@ -235,20 +250,25 @@ export const STDIN_MAX_BYTES = 64 * 1024;
  *     meaningful with piped input; calling it interactively would otherwise
  *     hang forever waiting for EOF with no prompt to the user.
  *   - Reads all chunks from stdin until EOF; binary safe (concatenates as UTF-8).
- *   - Rejects when the cumulative byte count exceeds {@link STDIN_MAX_BYTES}.
+ *   - Rejects when the cumulative byte count exceeds `maxBytes` (default
+ *     {@link STDIN_MAX_BYTES}). Passing `{ maxBytes: IDE_BRIDGE_STDIN_MAX_BYTES,
+ *     label: "ide-bridge request" }` is how the ide-bridge entry point opts
+ *     into a much larger ceiling than the `--arg-stdin` skill-template flow.
  *   - Trims a single trailing `\n` or `\r\n` (a here-doc always appends one).
  *     Inner newlines are preserved verbatim — the caller decides whether to
  *     accept a multi-line argument.
  *   - Resolves to `""` on empty stdin (the caller distinguishes that from a
  *     missing flag).
  */
-export function readStdin(): Promise<string> {
+export function readStdin(opts: { maxBytes?: number; label?: string } = {}): Promise<string> {
+	const maxBytes = opts.maxBytes ?? STDIN_MAX_BYTES;
+	const label = opts.label ?? "--arg-stdin";
 	return new Promise((resolve, reject) => {
 		const stdin = process.stdin;
 		if (stdin.isTTY) {
 			reject(
 				new Error(
-					"--arg-stdin requires piped stdin; it cannot be used interactively. Pipe the argument via a here-doc or echo.",
+					`${label} requires piped stdin; it cannot be used interactively. Pipe the argument via a here-doc or echo.`,
 				),
 			);
 			return;
@@ -260,9 +280,9 @@ export function readStdin(): Promise<string> {
 			if (rejected) return;
 			const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
 			total += buf.length;
-			if (total > STDIN_MAX_BYTES) {
+			if (total > maxBytes) {
 				rejected = true;
-				reject(new Error(`--arg-stdin payload exceeds ${STDIN_MAX_BYTES} bytes`));
+				reject(new Error(`${label} payload exceeds ${maxBytes} bytes`));
 				return;
 			}
 			chunks.push(buf);

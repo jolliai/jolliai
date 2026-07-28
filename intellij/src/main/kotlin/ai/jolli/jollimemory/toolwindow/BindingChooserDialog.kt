@@ -282,6 +282,12 @@ class BindingChooserDialog private constructor(
 	/**
 	 * Shows the race-winner banner when a 409 collision is detected.
 	 * Hides the spaces list and changes the OK button to "OK, Push Now".
+	 *
+	 * The banner intentionally omits the winning Space's name: the server-side
+	 * `POST /api/jolli-memory/bindings` response carries only the raw
+	 * `jm_repo_binding` row and has no space-name field, so `winner.jmSpaceName`
+	 * is always empty here. The subsequent push still settles on the winning
+	 * binding via `winner.jmSpaceId`.
 	 */
 	private fun showRaceWinner(winner: BindingChooserResult) {
 		outcome = BindingChooserOutcome.Selected(winner)
@@ -289,7 +295,7 @@ class BindingChooserDialog private constructor(
 		errorLabel?.isVisible = false
 		bannerPanel?.apply {
 			removeAll()
-			add(JBLabel("<html>Another teammate just bound this repo to <b>${escHtml(winner.jmSpaceName)}</b>. Using that one.</html>").apply {
+			add(JBLabel("<html>Another teammate just bound this repo. Using that one.</html>").apply {
 				alignmentX = Component.LEFT_ALIGNMENT
 			})
 			isVisible = true

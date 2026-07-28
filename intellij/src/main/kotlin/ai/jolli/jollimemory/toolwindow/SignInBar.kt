@@ -85,25 +85,17 @@ class SignInBar(
     }
 
     private fun handleSignInClicked() {
-        signInButton.isEnabled = false
-        signInButton.text = "Signing in..."
+        // Fire-and-forget: `login()` returns as soon as the browser is asked
+        // to open; the completion path is the loopback callback server that
+        // `login()` started → CLI ide-bridge → auth listener. Banner state
+        // is driven from that listener via [syncBanner], so this handler
+        // deliberately does not touch the button (no "Signing in..." state).
+        // Mirrors VS Code's `jollimemory.signIn` command in Extension.ts.
         JolliAuthService.login(
             // User-initiated sign-in: mint a fresh key so a revoked same-tenant key recovers.
             forceFreshApiKey = true,
-            onSuccess = { _ ->
-                SwingUtilities.invokeLater {
-                    signInButton.isEnabled = true
-                    signInButton.text = "Sign In"
-                    syncBanner()
-                }
-            },
-            onError = { msg ->
-                SwingUtilities.invokeLater {
-                    signInButton.isEnabled = true
-                    signInButton.text = "Sign In"
-                    onSignInError(msg)
-                }
-            },
+            onSuccess = { /* auth listener refreshes the banner */ },
+            onError = { msg -> SwingUtilities.invokeLater { onSignInError(msg) } },
         )
     }
 

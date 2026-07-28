@@ -124,6 +124,51 @@ describe("Login", () => {
 		});
 	});
 
+	it("preserves the existing key's tenant when a code-path callback returns no fresh key", async () => {
+		// Idempotent-replay callbacks (per-`device_name` reuse) do not mint a
+		// fresh `jolliApiKey`. Without the existing-key fallback below,
+		// `resolveSignInJolliUrl` would fall back to the caller-supplied
+		// `jolliUrl` — a generic hub for IntelliJ / a subdomain for the CLI —
+		// and `saveAuthCredentials` would compare that hub against the on-disk
+		// key's real subdomain tenant, decide they don't match, and silently
+		// drop a working key. Same rule as [AuthCallback.test.ts].
+		const HUB_URL = "https://auth.jolli.ai";
+		const existingKey = `sk-jol-${Buffer.from(JSON.stringify({ t: "acme", u: "https://acme.jolli.ai" })).toString(
+			"base64url",
+		)}.secret`;
+		// `mockResolvedValue` (not `Once`) — the login flow reads loadConfig at
+		// URL-build time AND again inside the callback handler for the
+		// existingKey fallback; both reads must see the key.
+		mockLoadConfig.mockResolvedValue({ jolliApiKey: existingKey });
+		mockExchangeCliCode.mockResolvedValueOnce({ token: "tk-replay" });
+
+		await new Promise<void>((resolve, reject) => {
+			server = createLoginServer({
+				port: 0,
+				jolliUrl: HUB_URL,
+				expectedState: TEST_STATE,
+				onListen() {
+					const addr = server?.address();
+					if (!addr || typeof addr === "string") {
+						reject(new Error("No address"));
+						return;
+					}
+					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-replay&state=${TEST_STATE}`);
+				},
+				onSuccess: resolve,
+				onError: reject,
+			});
+		});
+
+		// The persisted jolliUrl is the existing key's subdomain tenant, NOT
+		// the hub — so the follow-up saveAuthCredentials symmetry check holds
+		// against the on-disk key and the working key survives.
+		expect(mockSaveAuthCredentials).toHaveBeenCalledWith({
+			token: "tk-replay",
+			jolliUrl: "https://acme.jolli.ai",
+		});
+	});
+
 	it("persists the minted key's tenant as jolliUrl, not the sign-in origin", async () => {
 		// Regression guard for the default-login break: signing in at the auth
 		// hub (`auth.jolli.ai`) mints a key whose `meta.u` is the user's real

@@ -4,8 +4,10 @@ import ai.jolli.jollimemory.bridge.CliIntegrations
 import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliAuthService
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.options.Configurable
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.Disposer
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPasswordField
 import com.intellij.ui.components.JBTextField
@@ -40,6 +42,13 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
     private var savedJolliApiKey: String? = null
     private var savedSlackWorkspaceUrl: String? = null
 
+    // Auth state is refreshed reactively: signOut() now runs off the EDT and
+    // fires notifyAuthListeners() only after the ide-bridge round-trip lands,
+    // so the button handler cannot re-read isSignedIn() synchronously and see
+    // the new value (the 5 s isSignedIn cache would also mask it). Subscribe
+    // like SettingsDialog / SignInBar / OnboardingPanel do.
+    private var authListenerDisposable: Disposable? = null
+
     override fun getDisplayName(): String = "Jolli Memory"
 
     override fun createComponent(): JComponent {
@@ -54,6 +63,14 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
         // Load current values first so updateAccountUI can check the API key field
         loadFromConfig()
         updateAccountUI()
+
+        authListenerDisposable?.let(Disposer::dispose)
+        authListenerDisposable = JolliAuthService.addAuthListener {
+            SwingUtilities.invokeLater {
+                loadFromConfig()
+                updateAccountUI()
+            }
+        }
 
         val privacyNotice = JBLabel(
             "<html>By providing an API key, you consent to sending code diffs and AI session " +
@@ -96,8 +113,12 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
             accountButton?.text = "Sign Out"
             accountButton?.actionListeners?.forEach { accountButton?.removeActionListener(it) }
             accountButton?.addActionListener {
+                // `signOut()` runs off the EDT and returns immediately, so an
+                // inline `updateAccountUI()` here would read the stale
+                // (5 s cached) `isSignedIn()` value and re-render as "Signed
+                // in". The auth listener registered in `createComponent`
+                // already re-renders once the async sign-out actually lands.
                 JolliAuthService.signOut()
-                updateAccountUI()
             }
             jolliApiKeyLabel?.text = "Jolli API Key (optional — auto-managed via account):"
             jolliApiKeyField?.toolTipText = "Optional. Your account key is used automatically. Enter a manual key here to override it."
@@ -106,8 +127,10 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
             accountButton?.text = "Sign In"
             accountButton?.actionListeners?.forEach { accountButton?.removeActionListener(it) }
             accountButton?.addActionListener {
-                accountButton?.isEnabled = false
-                accountButton?.text = "Signing in..."
+                // Fire-and-forget: `login()` opens the browser and returns.
+                // The auth listener already re-runs updateAccountUI() (via
+                // the parent's status listener chain); no per-attempt button
+                // state to reset. Matches VS Code's sign-in command.
                 JolliAuthService.login(
                     // User-initiated sign-in: mint a fresh key so a revoked same-tenant key recovers.
                     forceFreshApiKey = true,
@@ -131,7 +154,6 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
                     },
                     onError = { msg ->
                         SwingUtilities.invokeLater {
-                            updateAccountUI()
                             com.intellij.openapi.ui.Messages.showErrorDialog(msg, "Jolli Sign In")
                         }
                     },
@@ -190,6 +212,11 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
 
     override fun reset() {
         loadFromConfig()
+    }
+
+    override fun disposeUIResources() {
+        authListenerDisposable?.let(Disposer::dispose)
+        authListenerDisposable = null
     }
 
     private fun loadFromConfig() {

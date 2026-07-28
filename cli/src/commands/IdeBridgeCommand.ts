@@ -8,13 +8,16 @@
  */
 
 import type { LiveSharePatch, LiveSharePayload } from "../core/JolliShareClient.js";
+import { runWithTrace } from "../core/TraceContext.js";
 import { computeWatchTargets } from "../daemon/DaemonServer.js";
 import { DaemonWatcher } from "../daemon/DaemonWatcher.js";
-import { setLogDir } from "../Logger.js";
+import { createLogger, setLogDir } from "../Logger.js";
 import type { ConflictUi, Tier3Pick } from "../sync/ConflictResolver.js";
 import type { FileWrite, JolliMemoryConfig, TranscriptSource } from "../Types.js";
 import { TRANSCRIPT_SOURCES as ALL_TRANSCRIPT_SOURCES } from "../Types.js";
-import { readStdin } from "./CliUtils.js";
+import { IDE_BRIDGE_STDIN_MAX_BYTES, readStdin } from "./CliUtils.js";
+
+const log = createLogger("IdeBridge");
 
 type JsonObject = Record<string, unknown>;
 
@@ -319,35 +322,87 @@ async function runAuthAction(request: JsonObject): Promise<unknown> {
 				),
 			};
 		case "build-login-url": {
-			const url = new URL("/login", stringField(request, "jolliUrl"));
-			url.searchParams.set("cli_callback", stringField(request, "callbackUrl"));
-			url.searchParams.set("client", "intellij");
-			url.searchParams.set("client_version", stringField(request, "clientVersion"));
-			if (request.generateApiKey === true) url.searchParams.set("generate_api_key", "true");
+			const { jolliPageUrl } = await import("../auth/AuthCallback.js");
+			// Insertion order IS the query order: cli_callback → state → client
+			// → client_version → generate_api_key → device_name → install_id.
+			// The leading six match VS Code's login URL verbatim
+			// (`AuthService.openSignInPage`); `install_id` is appended last
+			// because VS Code sends none at all. The CLI (`auth/Login.ts`) emits
+			// the same params but places `install_id` BEFORE `generate_api_key` —
+			// a pinned order per surface keeps captures and server logs
+			// comparable, but do not "fix" one surface to match another without
+			// changing all of them.
+			const params: Record<string, string> = { cli_callback: stringField(request, "callbackUrl") };
+			const state = optionalString(request, "state");
+			if (state) params.state = state;
+			params.client = "intellij";
+			params.client_version = stringField(request, "clientVersion");
+			if (request.generateApiKey === true) {
+				params.generate_api_key = "true";
+				// `device_name` scopes the server's per-user idempotency key, so
+				// signing in from a second machine mints a second key row instead
+				// of invalidating the first machine's. Only meaningful when we're
+				// asking for a fresh key — paired with generate_api_key, exactly
+				// as in `auth/Login.ts` and VS Code's `openSignInPage`.
+				//
+				// Resolved here rather than passed in from Kotlin: the ide-bridge
+				// runs on the user's machine (same-host daemon assumption), so
+				// `getDeviceLabel()` sees the same hostname the IDE would, and
+				// the sanitization stays in lockstep with the server's
+				// `sanitizeDeviceLabel` for free. If that ever changes (headless
+				// dev server, remote daemon), the label would report the
+				// daemon's host — pass it in from the caller then.
+				const { getDeviceLabel } = await import("../auth/DeviceLabel.js");
+				const deviceLabel = getDeviceLabel();
+				if (deviceLabel) params.device_name = deviceLabel;
+			}
 			const installId = optionalString(request, "installId");
-			if (installId) url.searchParams.set("install_id", installId);
-			return { url: url.toString() };
+			if (installId) params.install_id = installId;
+			return { url: jolliPageUrl(stringField(request, "jolliUrl"), "/login", params) };
 		}
 		case "exchange-and-save": {
-			const jolliUrl = stringField(request, "jolliUrl");
-			const { exchangeCliCode } = await import("../auth/CliExchange.js");
-			const exchanged = await exchangeCliCode(jolliUrl, stringField(request, "code"));
-			await auth.saveAuthCredentials({
-				token: exchanged.token,
-				jolliUrl: auth.resolveSignInJolliUrl(exchanged.jolliApiKey, jolliUrl),
-				...(exchanged.jolliApiKey ? { jolliApiKey: exchanged.jolliApiKey } : {}),
-			});
-			return exchanged;
+			const { exchangeAndPersist } = await import("../auth/AuthCallback.js");
+			return await exchangeAndPersist(stringField(request, "jolliUrl"), stringField(request, "code"));
 		}
-		case "save-legacy-credentials": {
+		case "handle-auth-callback": {
+			// Whole-callback handler for IDE surfaces that own a loopback
+			// server (IntelliJ). The IDE forwards the raw query string and gets
+			// back both the outcome and the URL to 302 the browser at, so the
+			// decision tree, the credential write, and the error wording live
+			// here rather than being re-ported per IDE.
+			const { jolliPageUrl, resolveAuthCallback } = await import("../auth/AuthCallback.js");
 			const jolliUrl = stringField(request, "jolliUrl");
-			const apiKey = optionalString(request, "jolliApiKey");
-			await auth.saveAuthCredentials({
-				token: stringField(request, "token"),
-				jolliUrl: auth.resolveSignInJolliUrl(apiKey, jolliUrl),
-				...(apiKey ? { jolliApiKey: apiKey } : {}),
+			// Built (and origin-checked) BEFORE any network work: the caller
+			// puts this straight into a `Location` header, so an off-allowlist
+			// or malformed tenant URL must fail loudly here, not reach a
+			// browser redirect.
+			const completeUrl = jolliPageUrl(jolliUrl, "/cli-complete");
+			const outcome = await resolveAuthCallback({
+				jolliUrl,
+				params: new URLSearchParams(stringField(request, "queryString")),
+				expectedState: stringField(request, "expectedState"),
+				// The IDE names its own recovery path ("…from Settings"), so the
+				// `user_denied` sentence can't be baked into the shared table.
+				retryHint: optionalString(request, "retryHint"),
 			});
-			return { ok: true };
+			if (!outcome.ok) {
+				return {
+					success: false,
+					redirectUrl: jolliPageUrl(jolliUrl, "/cli-complete", { error: outcome.code }),
+					errorCode: outcome.code,
+					errorMessage: outcome.message,
+				};
+			}
+			// Telemetry is deliberately NOT emitted here — the IDE surface
+			// tracks `signin_completed` itself, and doing it in both places
+			// would double-count the conversion event.
+			return {
+				success: true,
+				redirectUrl: completeUrl,
+				token: outcome.token,
+				space: outcome.space ?? null,
+				jolliApiKey: outcome.jolliApiKey ?? null,
+			};
 		}
 		case "sign-out":
 			await auth.clearAuthCredentials();
@@ -357,8 +412,29 @@ async function runAuthAction(request: JsonObject): Promise<unknown> {
 	}
 }
 
+// Operations that reach the network and therefore stamp `x-jolli-client`. Kept
+// out of the client-header drift warning below because they're either pure
+// local helpers (serialize-summary) or don't hit the jolli-api HTTP path.
+const JOLLI_API_LOCAL_OPERATIONS = new Set(["serialize-summary"]);
+
 async function runJolliApiAction(_cwd: string, request: JsonObject): Promise<unknown> {
 	const operation = stringField(request, "operation");
+	// The `x-jolli-client` header the bundled CLI would otherwise send
+	// identifies the CLI build (`cli/<cli-version>`), not the plugin that
+	// initiated the call. IDE surfaces pass `clientHeader` on every jolli-api
+	// request so their traffic identifies as `intellij-plugin/<plugin-version>`
+	// (etc.) — the server's per-surface min-version gate + API attribution
+	// depend on it. Absent → default `JOLLI_CLIENT_HEADER` (CLI-initiated call).
+	const clientHeader = optionalString(request, "clientHeader");
+	// Drift guard: log a warning when a network-reaching jolli-api op arrives
+	// without a `clientHeader`, so a future IDE-surface caller that forgets to
+	// stamp its plugin identity gets caught in debug.log instead of silently
+	// misidentifying as the bundled CLI (which would evade per-surface min-
+	// version gating + skew API attribution). Non-fatal to preserve the CLI-
+	// initiated path — jolli's own commands legitimately omit it.
+	if (clientHeader === undefined && !JOLLI_API_LOCAL_OPERATIONS.has(operation)) {
+		log.warn("jolli-api %s: no clientHeader provided; falling back to bundled CLI identity", operation);
+	}
 	if (operation === "serialize-summary") {
 		const { serializeSummaryJson } = await import("../core/JolliMemoryPushOrchestrator.js");
 		return { json: serializeSummaryJson(request.summary as Parameters<typeof serializeSummaryJson>[0]) ?? null };
@@ -366,7 +442,11 @@ async function runJolliApiAction(_cwd: string, request: JsonObject): Promise<unk
 	const apiKey = stringField(request, "apiKey");
 	const baseUrl = optionalString(request, "baseUrl");
 	const { JolliMemoryPushClient } = await import("../core/JolliMemoryPushClient.js");
-	const client = new JolliMemoryPushClient({ baseUrlOverride: baseUrl, apiKeyProvider: async () => apiKey });
+	const client = new JolliMemoryPushClient({
+		baseUrlOverride: baseUrl,
+		apiKeyProvider: async () => apiKey,
+		...(clientHeader ? { clientHeaderOverride: clientHeader } : {}),
+	});
 	switch (operation) {
 		case "push":
 			return client.push(request.payload as Parameters<typeof client.push>[0]);
@@ -383,23 +463,36 @@ async function runJolliApiAction(_cwd: string, request: JsonObject): Promise<unk
 			});
 		case "create-share": {
 			const { JolliShareClient } = await import("../core/JolliShareClient.js");
-			return new JolliShareClient(apiKey, baseUrl).create(request.payload as LiveSharePayload);
+			return new JolliShareClient({
+				apiKey,
+				baseUrlOverride: baseUrl,
+				...(clientHeader ? { clientHeaderOverride: clientHeader } : {}),
+			}).create(request.payload as LiveSharePayload);
 		}
 		case "update-share": {
 			const { JolliShareClient } = await import("../core/JolliShareClient.js");
-			return new JolliShareClient(apiKey, baseUrl).update(
-				stringField(request, "shareId"),
-				request.patch as LiveSharePatch,
-			);
+			return new JolliShareClient({
+				apiKey,
+				baseUrlOverride: baseUrl,
+				...(clientHeader ? { clientHeaderOverride: clientHeader } : {}),
+			}).update(stringField(request, "shareId"), request.patch as LiveSharePatch);
 		}
 		case "revoke-share": {
 			const { JolliShareClient } = await import("../core/JolliShareClient.js");
-			await new JolliShareClient(apiKey, baseUrl).revoke(stringField(request, "shareId"));
+			await new JolliShareClient({
+				apiKey,
+				baseUrlOverride: baseUrl,
+				...(clientHeader ? { clientHeaderOverride: clientHeader } : {}),
+			}).revoke(stringField(request, "shareId"));
 			return { ok: true };
 		}
 		case "invite-share": {
 			const { JolliShareClient } = await import("../core/JolliShareClient.js");
-			return new JolliShareClient(apiKey, baseUrl).invite(
+			return new JolliShareClient({
+				apiKey,
+				baseUrlOverride: baseUrl,
+				...(clientHeader ? { clientHeaderOverride: clientHeader } : {}),
+			}).invite(
 				stringField(request, "shareId"),
 				stringArrayField(request, "recipients"),
 				optionalString(request, "message"),
@@ -407,7 +500,13 @@ async function runJolliApiAction(_cwd: string, request: JsonObject): Promise<unk
 		}
 		case "list-org-members": {
 			const { JolliShareClient } = await import("../core/JolliShareClient.js");
-			return { members: await new JolliShareClient(apiKey, baseUrl).listOrgMembers() };
+			return {
+				members: await new JolliShareClient({
+					apiKey,
+					baseUrlOverride: baseUrl,
+					...(clientHeader ? { clientHeaderOverride: clientHeader } : {}),
+				}).listOrgMembers(),
+			};
 		}
 		default:
 			throw new Error(`Unknown Jolli API operation "${operation}".`);
@@ -1079,12 +1178,27 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
  * shapes match the long-lived server so the host has a single parser.
  * Note there is no `id` in the one-shot response: the process itself is the
  * correlation — one spawn = one call.
+ *
+ * Uses [writeServeLine] for the wire write so the one-shot and daemon modes
+ * share one stdout choke point and the CodeQL `js/clear-text-logging` query
+ * doesn't misread the JSON-RPC channel as a log sink for auth responses that
+ * legitimately carry `jolliApiKey`.
  */
 export async function executeIdeBridgeCommand(action: string, cwd: string): Promise<void> {
 	try {
 		setLogDir(cwd);
-		const result = await runIdeBridgeAction(action, cwd, parseRequest(await readStdin()));
-		console.log(JSON.stringify({ jsonrpc: "2.0", result }));
+		// A push payload (content + summaryJson) or an LLM-proxy prompt
+		// carrying a diff routinely exceeds the 64 KiB `--arg-stdin` cap on
+		// the one-shot spawn path (no daemon bound). This request is a fresh
+		// JSON DTO from an in-process IDE plugin, never user shell input, so
+		// the OOM concern shaping the smaller cap does not apply here — see
+		// {@link IDE_BRIDGE_STDIN_MAX_BYTES} for the rationale.
+		const result = await runIdeBridgeAction(
+			action,
+			cwd,
+			parseRequest(await readStdin({ maxBytes: IDE_BRIDGE_STDIN_MAX_BYTES, label: "ide-bridge request" })),
+		);
+		writeServeLine({ jsonrpc: "2.0", result });
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
 		const data: Record<string, unknown> = {};
@@ -1092,7 +1206,7 @@ export async function executeIdeBridgeCommand(action: string, cwd: string): Prom
 			data.errorName = error.name;
 		}
 		copyPrimitiveErrorFields(error, data);
-		console.log(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message, data } }));
+		writeServeLine({ jsonrpc: "2.0", error: { code: -32000, message, data } });
 		process.exitCode = 1;
 	}
 }
@@ -1122,6 +1236,15 @@ interface ServeRequest {
 	readonly action: string;
 	readonly cwd?: string;
 	readonly request?: JsonObject;
+	/**
+	 * IDE-supplied Jolli trace id (32-hex, no span segment). When present, the
+	 * daemon adopts it via {@link runWithTrace} for the action's duration so the
+	 * CLI's outbound HTTP calls carry the IDE-scoped trace id (`x-jolli-trace`)
+	 * instead of a fresh CLI-only one — restoring the cross-log correlation the
+	 * pre-bridge Kotlin path had. Silently ignored when the value isn't a
+	 * well-formed trace id ({@link runWithTrace} falls back to a fresh id).
+	 */
+	readonly traceId?: string;
 }
 
 /**
@@ -1168,12 +1291,17 @@ function normaliseServeRequest(parsed: unknown): ServeRequest {
 	if (request !== undefined && (typeof request !== "object" || request === null || Array.isArray(request))) {
 		throw new Error('Request field "params.request" must be a JSON object.');
 	}
+	const traceId = params.traceId;
+	if (traceId !== undefined && typeof traceId !== "string") {
+		throw new Error('Request field "params.traceId" must be a string.');
+	}
 	const id = extractRequestId(parsed);
 	return {
 		id,
 		action: method,
 		...(typeof cwd === "string" ? { cwd } : {}),
 		...(request ? { request: request as JsonObject } : {}),
+		...(typeof traceId === "string" ? { traceId } : {}),
 	};
 }
 
@@ -1236,8 +1364,10 @@ export function writeServeLine(obj: object): void {
  *     exits cleanly with code 0.
  *   - stdout is protocol-only. All logging goes through [setLogDir] to the
  *     per-project log file, and any accidental stray writer would violate the
- *     protocol; the two `console.log`s in this file are the only stdout
- *     writers, both emitting well-formed JSON envelopes.
+ *     protocol; every stdout write in this file funnels through
+ *     [writeServeLine], which emits one well-formed JSON envelope per line
+ *     (shared by both the one-shot [executeIdeBridgeCommand] and the daemon
+ *     loop below).
  */
 export async function runIdeBridgeServe(cwdDefault: string): Promise<void> {
 	setLogDir(cwdDefault);
@@ -1382,7 +1512,14 @@ export async function computeServeResponse(line: string, cwdDefault: string): Pr
 		const req = normaliseServeRequest(parsed);
 		id = req.id;
 		const cwd = req.cwd && req.cwd.length > 0 ? req.cwd : cwdDefault;
-		const result = await runIdeBridgeAction(req.action, cwd, req.request ?? {});
+		// Adopt the IDE-supplied trace id (when present) so this action's
+		// outbound HTTP calls carry the caller's x-jolli-trace, keeping IDE
+		// logs, CLI logs, and backend logs correlated. `runWithTrace` falls
+		// back to a fresh id when the value isn't a well-formed trace id.
+		// Intentionally unconditional: even without an IDE-supplied traceId,
+		// every daemon-served request gets its own trace scope so all outbound
+		// HTTP calls are correlated in backend logs.
+		const result = await runWithTrace(req.traceId, () => runIdeBridgeAction(req.action, cwd, req.request ?? {}));
 		return { jsonrpc: "2.0", id, result };
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);

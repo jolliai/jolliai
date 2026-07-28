@@ -111,6 +111,28 @@ class CliDaemonClientTest {
 		}
 	}
 
+	@Test
+	fun `serializeRequestLine includes params_traceId when a trace id is passed`() {
+		// The daemon adopts params.traceId via runWithTrace so its outbound
+		// HTTP calls carry the IDE-scoped x-jolli-trace value instead of a
+		// fresh CLI-only id — preserves cross-log correlation.
+		val line = CliDaemonClient.serializeRequestLine(1L, "status", "/tmp/x", null, "abc123def4567890abc123def4567890")
+		val params = JsonParser.parseString(line).asJsonObject.getAsJsonObject("params")
+		params.get("traceId").asString shouldBe "abc123def4567890abc123def4567890"
+	}
+
+	@Test
+	fun `serializeRequestLine omits params_traceId when the trace id is null or blank`() {
+		// A null or blank trace id means "not inside a withTrace scope" — the
+		// daemon then mints its own via runWithTrace's fallback. Absent field
+		// keeps the wire small and preserves the pre-trace-forwarding shape
+		// for older daemon builds that ignore extra params fields.
+		val nullLine = CliDaemonClient.serializeRequestLine(1L, "status", "/tmp/x", null, null)
+		val blankLine = CliDaemonClient.serializeRequestLine(1L, "status", "/tmp/x", null, "   ")
+		JsonParser.parseString(nullLine).asJsonObject.getAsJsonObject("params").has("traceId") shouldBe false
+		JsonParser.parseString(blankLine).asJsonObject.getAsJsonObject("params").has("traceId") shouldBe false
+	}
+
 	// ── unwrapResponseEnvelope — error / success mapping ──────────────────
 
 	@Test

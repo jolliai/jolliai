@@ -185,6 +185,17 @@ export interface JolliMemoryPushClientOpts {
 	readonly apiKeyProvider?: () => Promise<string | undefined>;
 	/** Default 30 s per request. */
 	readonly timeoutMs?: number;
+	/**
+	 * Override the `x-jolli-client` header for this instance. Set by the IDE
+	 * bridge when a plugin surface (IntelliJ, VS Code) proxies its own HTTP
+	 * through the CLI: without this, every proxied request would identify as
+	 * `cli/<bundled-cli-version>` (because the header is bundler-baked, and
+	 * the bundle running is the CLI's), silently rerouting the server's
+	 * per-surface min-version gate and per-surface API attribution. Values
+	 * follow the `<kind>/<version>` shape enforced by the server, e.g.
+	 * `intellij-plugin/0.99.4`. Undefined → default `JOLLI_CLIENT_HEADER`.
+	 */
+	readonly clientHeaderOverride?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -207,11 +218,22 @@ const MANIFEST_TIMEOUT_MS = 5_000;
  */
 export const SPACE_PROBE_TIMEOUT_MS = 5_000;
 
-/** Raw shape of `GET /api/jolli-memory/spaces` — validated field-by-field at parse time. */
-interface ListSpacesResponseBody {
-	readonly spaces?: ReadonlyArray<{ readonly id: number; readonly name: string; readonly slug: string }>;
-	readonly defaultSpaceId?: number | null;
-}
+/**
+ * Raw shape of `GET /api/jolli-memory/spaces` — validated field-by-field at parse time.
+ *
+ * Two shapes are accepted (spec 95, "Notable"): the envelope form used by
+ * current backends, and a raw flat-array body used by pre-default backends.
+ * Tolerating both keeps the Binding Chooser rendering Spaces from older
+ * servers instead of masking the response as an empty list; the flat form
+ * has no `defaultSpaceId`, which callers treat as `null`.
+ */
+type ListSpaceEntry = { readonly id: number; readonly name: string; readonly slug: string };
+type ListSpacesResponseBody =
+	| {
+			readonly spaces?: ReadonlyArray<ListSpaceEntry>;
+			readonly defaultSpaceId?: number | null;
+	  }
+	| ReadonlyArray<ListSpaceEntry>;
 
 /** Raw shape of `POST /api/jolli-memory/bindings` — server returns `{ binding, repoFolder }`, no top-level `jmSpaceName`. */
 interface CreateBindingResponseBody {
@@ -405,12 +427,14 @@ export class JolliMemoryPushClient {
 	private readonly baseUrlOverride?: string;
 	private readonly apiKeyProvider: () => Promise<string | undefined>;
 	private readonly timeoutMs: number;
+	private readonly clientHeaderOverride?: string;
 
 	constructor(opts: JolliMemoryPushClientOpts = {}) {
 		this.fetchImpl = opts.fetchImpl ?? fetch;
 		this.baseUrlOverride = opts.baseUrlOverride;
 		this.apiKeyProvider = opts.apiKeyProvider ?? defaultApiKeyProvider;
 		this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+		this.clientHeaderOverride = opts.clientHeaderOverride;
 	}
 
 	/** Lists the spaces the current tenant can bind a repo to, plus the tenant's configured default. */
@@ -432,8 +456,20 @@ export class JolliMemoryPushClient {
 			// JSON body is not a parse failure and still yields [].)
 			throw new Error(`Malformed (non-JSON) response from /api/jolli-memory/spaces (HTTP ${status})`);
 		}
-		const spaces = (json.spaces ?? []).map((s) => ({ id: s.id, name: s.name, slug: s.slug }));
-		return { spaces, defaultSpaceId: json.defaultSpaceId ?? null };
+		// Accept both the `{ spaces, defaultSpaceId }` envelope and a raw flat-array
+		// body (pre-default backends): spec 95 mandates this two-shape tolerance so
+		// the Binding Chooser renders Spaces from older servers instead of masking
+		// the response as an empty list. Flat form implies `defaultSpaceId = null`.
+		if (Array.isArray(json)) {
+			const spaces = json.map((s) => ({ id: s.id, name: s.name, slug: s.slug }));
+			return { spaces, defaultSpaceId: null };
+		}
+		const envelope = json as {
+			readonly spaces?: ReadonlyArray<ListSpaceEntry>;
+			readonly defaultSpaceId?: number | null;
+		};
+		const spaces = (envelope.spaces ?? []).map((s) => ({ id: s.id, name: s.name, slug: s.slug }));
+		return { spaces, defaultSpaceId: envelope.defaultSpaceId ?? null };
 	}
 
 	/**
@@ -754,7 +790,7 @@ export class JolliMemoryPushClient {
 	): Record<string, string> {
 		const headers: Record<string, string> = {
 			Authorization: `Bearer ${apiKey}`,
-			"x-jolli-client": JOLLI_CLIENT_HEADER,
+			"x-jolli-client": this.clientHeaderOverride ?? JOLLI_CLIENT_HEADER,
 		};
 		if (hasBody) {
 			headers["Content-Type"] = "application/json";

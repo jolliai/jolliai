@@ -225,4 +225,43 @@ class CliIntegrationsTest {
         File(tempDir, ".mcp.json").writeText("{ not json")
         CliIntegrations.mcpRegistrationStale(tempDir.absolutePath) shouldBe false
     }
+
+    // ── createSecureTempFile — 0600 on POSIX so `/tmp` neighbours can't
+    // read the ide-bridge JSON (which carries token + jolliApiKey on the
+    // handle-auth-callback response).
+
+    @Test
+    fun `createSecureTempFile creates an owner-read-write file on POSIX`() {
+        // Skip on non-POSIX (Windows) — the helper falls back there.
+        val fs = java.nio.file.FileSystems.getDefault()
+        org.junit.jupiter.api.Assumptions.assumeTrue(fs.supportedFileAttributeViews().contains("posix"))
+
+        val f = CliIntegrations.createSecureTempFile("jolli-secret-", ".json")
+        try {
+            f.exists() shouldBe true
+            val perms = java.nio.file.Files.getPosixFilePermissions(f.toPath())
+            // Exactly {OWNER_READ, OWNER_WRITE} — never GROUP_/OTHERS_ bits, which
+            // would let another user on /tmp read the bearer token during the
+            // finally-block delete window.
+            perms shouldBe java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+            )
+        } finally {
+            f.delete()
+        }
+    }
+
+    @Test
+    fun `createSecureTempFile does not throw on non-POSIX filesystems`() {
+        // On Windows the PosixFilePermissions API throws UnsupportedOperationException
+        // and we fall back to File.createTempFile. This test just asserts the helper
+        // never propagates that up; the permission check above only runs on POSIX.
+        val f = CliIntegrations.createSecureTempFile("jolli-fallback-", ".json")
+        try {
+            f.exists() shouldBe true
+        } finally {
+            f.delete()
+        }
+    }
 }

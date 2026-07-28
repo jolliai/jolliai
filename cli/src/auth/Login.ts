@@ -189,6 +189,17 @@ export function createLoginServer(options: LoginServerOptions): Server {
 		}
 
 		try {
+			// Read the on-disk key BEFORE the exchange so we can pass it as the
+			// `existingKey` fallback to `resolveSignInJolliUrl`: an
+			// idempotent-replay callback with no `jolliApiKey` in the response
+			// (common on per-`device_name` backends) must not wipe a working
+			// key when the caller-supplied `jolliUrl` is a generic auth hub.
+			// The read is once-per-callback (loadConfig is cheap; the OAuth
+			// flow already reads the config elsewhere) and races with nothing
+			// — no other writer touches the config while sign-in is in flight.
+			// Same fix as the ide-bridge `handle-auth-callback` path in
+			// `cli/src/auth/AuthCallback.ts`.
+			const existingKey = (await loadConfig()).jolliApiKey ?? undefined;
 			let credentials: { token: string; jolliApiKey?: string; jolliUrl: string };
 			if (code) {
 				const exchanged = await exchangeCliCode(jolliUrl, code);
@@ -201,7 +212,7 @@ export function createLoginServer(options: LoginServerOptions): Server {
 					// `saveAuthCredentials`'s same-tenant symmetry check reject every
 					// normal key and (b) leave the routing fallback pointing at the
 					// hub instead of the tenant. See `resolveSignInJolliUrl`.
-					jolliUrl: resolveSignInJolliUrl(exchanged.jolliApiKey, jolliUrl),
+					jolliUrl: resolveSignInJolliUrl(exchanged.jolliApiKey, jolliUrl, existingKey),
 					...(exchanged.jolliApiKey ? { jolliApiKey: exchanged.jolliApiKey } : {}),
 				};
 			} else if (legacyToken) {
@@ -213,7 +224,7 @@ export function createLoginServer(options: LoginServerOptions): Server {
 				const legacyApiKey = url.searchParams.get("jolli_api_key");
 				credentials = {
 					token: legacyToken,
-					jolliUrl: resolveSignInJolliUrl(legacyApiKey ?? undefined, jolliUrl),
+					jolliUrl: resolveSignInJolliUrl(legacyApiKey ?? undefined, jolliUrl, existingKey),
 					...(legacyApiKey ? { jolliApiKey: legacyApiKey } : {}),
 				};
 			} else {

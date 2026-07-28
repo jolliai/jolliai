@@ -72,12 +72,47 @@ function errorMessage(status: number, json: JsonObject | undefined, raw: string)
 	return `${detail || "request failed"} (HTTP ${status})${json ? "" : `: ${raw.slice(0, 200)}`}`;
 }
 
+/**
+ * Options for constructing a {@link JolliShareClient}.
+ *
+ * Migrated from positional args to an opts object to match the sibling
+ * {@link JolliMemoryPushClientOpts} shape. The old signature — `(apiKey,
+ * baseUrl?, fetch?)` — had no slot for the per-instance
+ * `x-jolli-client` header the ide-bridge callers need; extending it
+ * positionally would have forced every existing caller to pass `fetch`
+ * explicitly just to reach the new slot, so the opts form is the cleaner
+ * migration and callers can omit `fetchImpl` while still setting the
+ * header.
+ */
+export interface JolliShareClientOpts {
+	/** Jolli API key (`sk-jol-…`). */
+	readonly apiKey: string;
+	/** Optional Jolli site base URL override. Defaults to the tenant URL encoded in `apiKey`. */
+	readonly baseUrlOverride?: string;
+	/** Test seam — swap in a stub `fetch`. Defaults to the global `fetch`. */
+	readonly fetchImpl?: typeof fetch;
+	/**
+	 * Override the `x-jolli-client` header for this instance. Set by the IDE
+	 * bridge when a plugin surface (IntelliJ) proxies live-share HTTP through
+	 * the CLI, so the request identifies as `intellij-plugin/<version>`
+	 * instead of the bundled CLI's `cli/<version>`. See
+	 * {@link JolliMemoryPushClientOpts.clientHeaderOverride} for the same rationale.
+	 */
+	readonly clientHeaderOverride?: string;
+}
+
 export class JolliShareClient {
-	constructor(
-		private readonly apiKey: string,
-		private readonly baseUrlOverride?: string,
-		private readonly fetchImpl: typeof fetch = fetch,
-	) {}
+	private readonly apiKey: string;
+	private readonly baseUrlOverride?: string;
+	private readonly fetchImpl: typeof fetch;
+	private readonly clientHeaderOverride?: string;
+
+	constructor(opts: JolliShareClientOpts) {
+		this.apiKey = opts.apiKey;
+		this.baseUrlOverride = opts.baseUrlOverride;
+		this.fetchImpl = opts.fetchImpl ?? fetch;
+		this.clientHeaderOverride = opts.clientHeaderOverride;
+	}
 
 	async create(payload: LiveSharePayload): Promise<LiveShareResult> {
 		const { status, json, raw } = await this.request("POST", "/api/share/branch", payload);
@@ -183,7 +218,7 @@ export class JolliShareClient {
 		const keyMeta = parseJolliApiKey(this.apiKey);
 		const headers: Record<string, string> = {
 			authorization: `Bearer ${this.apiKey}`,
-			"x-jolli-client": JOLLI_CLIENT_HEADER,
+			"x-jolli-client": this.clientHeaderOverride ?? JOLLI_CLIENT_HEADER,
 			[TRACE_HEADER_NAME]: currentTraceHeader() ?? newTraceHeader(),
 		};
 		if (body !== undefined) headers["content-type"] = "application/json";

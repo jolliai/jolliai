@@ -220,15 +220,30 @@ export function shouldRequestFreshApiKey(existingKey: string | undefined, jolliU
  * to `signInOrigin` only when no key was issued or the key is legacy/hand-typed
  * and carries no `meta.u`.
  *
+ * `existingKey` is the on-disk Jolli API key from before the sign-in (may be
+ * undefined). It exists to survive an idempotent-replay callback that returns
+ * no fresh key — a common pattern on older / per-`device_name` backends and
+ * one IntelliJ hits routinely because its `signInOrigin` defaults to
+ * `https://jolli.ai`, not the user's subdomain tenant. Without this fallback,
+ * `saveAuthCredentials` would compare the existing key against the generic
+ * hub URL, decide they target different tenants, and silently clear a working
+ * key. Precedence stays "newly-minted key wins over on-disk key wins over
+ * sign-in origin" so a fresh cross-tenant key still overrides a stale one.
+ *
  * The adopted `meta.u` is origin-allowlisted here (via {@link isAllowedOrigin})
  * so this helper never emits an off-allowlist origin, even to a future caller
  * that doesn't route its result through `saveAuthCredentials`'s validation. An
  * off-allowlist tenant (a buggy/compromised server) falls back to
  * `signInOrigin`, which `getJolliUrl` has already allowlisted.
  */
-export function resolveSignInJolliUrl(jolliApiKey: string | undefined, signInOrigin: string): string {
-	if (jolliApiKey) {
-		const tenant = parseJolliApiKey(jolliApiKey)?.u;
+export function resolveSignInJolliUrl(
+	jolliApiKey: string | undefined,
+	signInOrigin: string,
+	existingKey?: string,
+): string {
+	for (const candidate of [jolliApiKey, existingKey]) {
+		if (!candidate) continue;
+		const tenant = parseJolliApiKey(candidate)?.u;
 		if (tenant && isAllowedOrigin(tenant)) return tenant;
 	}
 	return signInOrigin;

@@ -22,7 +22,11 @@ function client(response: Response | (() => Promise<Response>)) {
 		typeof response === "function" ? response : async () => response,
 	) as unknown as typeof fetch;
 	return {
-		client: new JolliShareClient("sk-jol-test", "https://jolli.dev/acme", fetchImpl),
+		client: new JolliShareClient({
+			apiKey: "sk-jol-test",
+			baseUrlOverride: "https://jolli.dev/acme",
+			fetchImpl,
+		}),
 		fetchImpl,
 	};
 }
@@ -136,7 +140,10 @@ describe("JolliShareClient", () => {
 	});
 
 	it("requires either an override or a URL-bearing API key", async () => {
-		const api = new JolliShareClient("old-key", undefined, vi.fn() as unknown as typeof fetch);
+		const api = new JolliShareClient({
+			apiKey: "old-key",
+			fetchImpl: vi.fn() as unknown as typeof fetch,
+		});
 		await expect(api.create(payload)).rejects.toThrow("Jolli site URL could not be determined");
 	});
 });

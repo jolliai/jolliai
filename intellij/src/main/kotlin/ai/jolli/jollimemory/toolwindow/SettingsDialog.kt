@@ -246,7 +246,7 @@ class SettingsDialog(
             putClientProperty("JButton.buttonType", "default")
             alignmentX = JComponent.LEFT_ALIGNMENT
             maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
-            addActionListener { handleSignIn(this) }
+            addActionListener { handleSignIn() }
         }
         val jolliSiteLabel = JBLabel().apply { alignmentX = JComponent.LEFT_ALIGNMENT }
         val jolliApiKeyField = JBTextField().apply {
@@ -370,7 +370,7 @@ class SettingsDialog(
             putClientProperty("JButton.buttonType", "default")
             alignmentX = JComponent.LEFT_ALIGNMENT
             maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
-            addActionListener { handleSignIn(this) }
+            addActionListener { handleSignIn() }
         }
 
         val syncSignedOut = JPanel().apply {
@@ -661,24 +661,21 @@ class SettingsDialog(
         syncCardPanel.repaint()
     }
 
-    private fun handleSignIn(button: JButton) {
-        button.isEnabled = false
-        button.text = "Signing in..."
+    private fun handleSignIn() {
+        // Fire-and-forget: `login()` opens the browser and returns. Success
+        // flips the panel via the auth listener; the button stays "Sign In to
+        // Jolli" until then. Matches VS Code's `jollimemory.signIn` command.
         JolliAuthService.login(
             // User-initiated sign-in: mint a fresh key so a revoked same-tenant key recovers.
             forceFreshApiKey = true,
             onSuccess = { _ ->
                 SwingUtilities.invokeLater {
-                    button.isEnabled = true
-                    button.text = "Sign In to Jolli"
                     syncProviderCard()
                     syncSyncCard()
                 }
             },
             onError = { msg ->
                 SwingUtilities.invokeLater {
-                    button.isEnabled = true
-                    button.text = "Sign In to Jolli"
                     com.intellij.notification.Notifications.Bus.notify(
                         com.intellij.notification.Notification(
                             "JolliMemory", "Sign In Failed", msg,
@@ -764,17 +761,23 @@ class SettingsDialog(
             jolliApiKeyText = preExisting.jolliApiKey ?: ""
             jolliKeyCleared = false
         }
-        if (jolliKeyCleared) {
-            JolliAuthService.signOut()
-        }
-
-        // Re-load after potential sign-out so authToken change is reflected
+        // Clearing the Jolli API key logically signs the user out. We write the
+        // sign-out (authToken = null) into the same EDT save below so it can't
+        // race the async `signOut()` call — both `signOut()` and this save do
+        // load-modify-write against the same config.json; running them
+        // concurrently produced two nondeterministic bugs (users staying signed
+        // in when clearing the key; the CLI's stale snapshot clobbering just-
+        // saved kbPath/model/sync settings). `signOut()` still fires below, but
+        // only AFTER every EDT write lands — its remaining job is telemetry,
+        // notifying auth listeners, and rolling back `aiProvider` from "jolli"
+        // when appropriate. Those are safe to run last.
         val existing = SessionTracker.loadConfigFromDir(configDir)
         val config = existing.copy(
             // apiKey / aiProvider / localAgentTool / localAgentPath live ONLY in the shared
             // config.json (one copy) — force-null here so they never leak into config-intellij.json;
             // the real save happens via saveSharedProviderConfig below.
             apiKey = null,
+            authToken = if (jolliKeyCleared) null else existing.authToken,
             jolliApiKey = if (jolliKeyCleared) null else jolliApiKeyText.ifBlank { null },
             model = (modelCombo.selectedItem as String).substringBefore(" ").let { if (it == "sonnet") null else it },
             maxTokens = maxTokens,
@@ -831,6 +834,15 @@ class SettingsDialog(
         }
         if (provider != null) {
             ai.jolli.jollimemory.core.telemetry.Telemetry.track("ai_provider_selected", mapOf("provider" to provider))
+        }
+
+        // After every EDT write to config.json has landed, fire the async
+        // sign-out. `authToken` and `jolliApiKey` are already null on disk from
+        // the save above, so `clearAuthCredentials` on the pooled thread is
+        // idempotent on those fields; its `aiProvider` rollback (if the value
+        // was "jolli") then lands last, which is the intended ordering.
+        if (jolliKeyCleared) {
+            JolliAuthService.signOut()
         }
 
         // Mirrors cli/src/core/LlmClient.ts resolveLlmCredentialSource so this auto-disable

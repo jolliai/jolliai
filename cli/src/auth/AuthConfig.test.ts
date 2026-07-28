@@ -617,5 +617,33 @@ describe("AuthConfig", () => {
 			const key = buildKey({ t: "evil", u: "https://evil.example.com" });
 			expect(resolveSignInJolliUrl(key, "https://auth.jolli.ai")).toBe("https://auth.jolli.ai");
 		});
+
+		it("falls back to the existing key's tenant when the callback returned no fresh key", () => {
+			// Idempotent-replay scenario (per-device_name reuse on older backends):
+			// no new key on the callback, but an existing on-disk key still points at
+			// the user's real tenant. Persisting the sign-in origin (`https://jolli.ai`)
+			// would make `saveAuthCredentials`'s `apiKeyMatchesTenant` check false and
+			// silently drop the working key. Prefer the existing key's `meta.u`.
+			const existing = buildKey({ t: "acme", u: "https://acme.jolli.ai" });
+			expect(resolveSignInJolliUrl(undefined, "https://jolli.ai", existing)).toBe("https://acme.jolli.ai");
+		});
+
+		it("prefers a fresh key's tenant over the existing key's when both are present", () => {
+			// Cross-tenant re-provision must still work: a caller supplying
+			// `forceFreshApiKey = true` gets a new key targeting the new tenant,
+			// and the persisted `jolliUrl` must follow the new key, not stay
+			// pinned to the old on-disk key.
+			const fresh = buildKey({ t: "new", u: "https://new.jolli.ai" });
+			const existing = buildKey({ t: "old", u: "https://old.jolli.ai" });
+			expect(resolveSignInJolliUrl(fresh, "https://auth.jolli.ai", existing)).toBe("https://new.jolli.ai");
+		});
+
+		it("skips an off-allowlist existing key and falls back to the sign-in origin", () => {
+			// The allowlist guard applies to the existing-key fallback too — a key
+			// whose `meta.u` was tampered off-allowlist must not smuggle an origin
+			// past the check just because it happened to already be on disk.
+			const existing = buildKey({ t: "evil", u: "https://evil.example.com" });
+			expect(resolveSignInJolliUrl(undefined, "https://auth.jolli.ai", existing)).toBe("https://auth.jolli.ai");
+		});
 	});
 });

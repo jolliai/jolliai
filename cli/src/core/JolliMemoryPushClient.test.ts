@@ -96,6 +96,23 @@ describe("listSpaces", () => {
 		const c = client(async () => textResponse(200, "<html>200 OK</html>"));
 		await expect(c.listSpaces()).rejects.toThrow(/Malformed/);
 	});
+	it("accepts a raw flat-array body from pre-default backends (spec 95)", async () => {
+		// Older servers return `[...]` instead of `{ spaces, defaultSpaceId }`.
+		// The chooser must render those Spaces, not report an empty list — the
+		// prior CLI-only parser silently dropped this shape.
+		const c = client(async () =>
+			jsonResponse(200, [
+				{ id: 3, name: "Eng", slug: "eng" },
+				{ id: 5, name: "Ops", slug: "ops" },
+			]),
+		);
+		const r = await c.listSpaces();
+		expect(r.spaces).toEqual([
+			{ id: 3, name: "Eng", slug: "eng" },
+			{ id: 5, name: "Ops", slug: "ops" },
+		]);
+		expect(r.defaultSpaceId).toBeNull();
+	});
 });
 
 describe("createBinding", () => {
@@ -147,6 +164,13 @@ describe("createBinding", () => {
 		await expect(c.createBinding({ repoUrl: "u", repoName: "r", jmSpaceId: 7 })).rejects.toMatchObject({
 			existingSpaceId: undefined,
 		});
+	});
+	it("resolves with the binding on the happy path", async () => {
+		const c = client(async () =>
+			jsonResponse(201, { binding: { id: 3, jmSpaceId: 7, repoName: "repo" }, repoFolder: { id: 9 } }),
+		);
+		const r = await c.createBinding({ repoUrl: "u", repoName: "repo", jmSpaceId: 7 });
+		expect(r).toEqual({ bindingId: 3, jmSpaceId: 7, repoName: "repo" });
 	});
 	it("maps 426 to ClientOutdatedError", async () => {
 		const c = client(async () => jsonResponse(426, { error: "client_outdated" }));
@@ -356,6 +380,38 @@ describe("header plumbing", () => {
 		await runWithTrace("a".repeat(32), () => c.listSpaces());
 		// x-jolli-trace value is `<traceId>-<spanId>` — starts with the adopted trace id.
 		expect(capturedHeaders["x-jolli-trace"]).toMatch(/^a{32}-/);
+	});
+	it("clientHeaderOverride replaces the default x-jolli-client for IDE-bridge callers", async () => {
+		// Without an override, IDE-bridge callers would identify as the CLI
+		// build (`cli/<cli-version>`) because JOLLI_CLIENT_HEADER is
+		// bundler-baked. The server's per-surface min-version gate + API
+		// attribution both key on this header, so a plugin surface routing
+		// its HTTP through the CLI needs to stamp its own identity here.
+		let capturedHeaders: Record<string, string> = {};
+		const c = new JolliMemoryPushClient({
+			apiKeyProvider: async () => "sk-jol-test",
+			baseUrlOverride: "https://jolli.ai",
+			clientHeaderOverride: "intellij-plugin/0.99.4",
+			fetchImpl: async (_url, init) => {
+				capturedHeaders = init?.headers as Record<string, string>;
+				return jsonResponse(200, { defaultSpaceId: null, spaces: [] });
+			},
+		});
+		await c.listSpaces();
+		expect(capturedHeaders["x-jolli-client"]).toBe("intellij-plugin/0.99.4");
+	});
+	it("defaults x-jolli-client to JOLLI_CLIENT_HEADER when no override is set", async () => {
+		let capturedHeaders: Record<string, string> = {};
+		const c = new JolliMemoryPushClient({
+			apiKeyProvider: async () => "sk-jol-test",
+			baseUrlOverride: "https://jolli.ai",
+			fetchImpl: async (_url, init) => {
+				capturedHeaders = init?.headers as Record<string, string>;
+				return jsonResponse(200, { defaultSpaceId: null, spaces: [] });
+			},
+		});
+		await c.listSpaces();
+		expect(capturedHeaders["x-jolli-client"]).toMatch(/^cli\//);
 	});
 });
 

@@ -30,10 +30,11 @@ import javax.swing.SwingUtilities
  *   1. Enter an Anthropic API key (inline field + save)
  *   2. Sign in to Jolli (OAuth flow)
  *
- * The panel manages its own sign-in button state ("Signing in..." feedback)
- * via a [JolliAuthService] listener. The actual view flip (onboarding → main)
- * is handled by the factory's auth listener — this panel only calls
- * [onApiKeySaved] for the Anthropic key path.
+ * Sign-in is fire-and-forget (matches VS Code): clicking the button opens the
+ * browser and immediately returns. The onboarding → main view flip is driven
+ * by the factory's auth listener that fires when
+ * [JolliAuthService.handleAuthCallbackViaIdeBridge] resolves. The panel only
+ * calls [onApiKeySaved] for the Anthropic key path.
  */
 class OnboardingPanel(
 	private val service: JolliMemoryService,
@@ -243,13 +244,16 @@ class OnboardingPanel(
 	}
 
 	private fun handleSignInClicked() {
-		signInButton.isEnabled = false
-		signInButton.text = "Signing in..."
+		// Fire-and-forget: `login()` opens the browser and returns; the
+		// browser redirect hits the loopback callback server that `login()`
+		// started, which delegates to the CLI ide-bridge. The button is
+		// deliberately left in its normal state — matches VS Code's
+		// `jollimemory.signIn` command, which has no "Signing in..." UI either.
 		JolliAuthService.login(
 			// User-initiated sign-in: mint a fresh key so a revoked same-tenant key recovers.
 			forceFreshApiKey = true,
 			onSuccess = { _ ->
-				// Save aiProvider to config so isConfigured() picks it up
+				// Save aiProvider to config so isConfigured() picks it up.
 				val configDir = SessionTracker.getGlobalConfigDir()
 				val existing = SessionTracker.loadConfigFromDir(configDir)
 				if (existing.aiProvider.isNullOrBlank() || existing.aiProvider == "anthropic") {
@@ -257,22 +261,15 @@ class OnboardingPanel(
 					SessionTracker.saveConfigToDir(updated, configDir)
 				}
 
-				// Auto-enable: initialize + install hooks
+				// Auto-enable: initialize + install hooks.
 				ApplicationManager.getApplication().executeOnPooledThread {
 					if (!service.isInitialized) service.initialize()
 					service.install()
 					ai.jolli.jollimemory.core.telemetry.Telemetry.track("surface_enabled", mapOf("trigger" to "onboarding"))
 					service.refreshStatus()
-					// Button state reset handled by auth listener
 				}
 			},
-			onError = { msg ->
-				SwingUtilities.invokeLater {
-					signInButton.isEnabled = true
-					signInButton.text = "Sign In / Sign Up"
-					onSignInError(msg)
-				}
-			},
+			onError = { msg -> SwingUtilities.invokeLater { onSignInError(msg) } },
 		)
 	}
 
