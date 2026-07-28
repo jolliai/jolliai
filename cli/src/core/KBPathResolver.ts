@@ -23,6 +23,7 @@ import { createLogger, isManuallyDisabled } from "../Logger.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import type { KBConfig } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
+import { normalizePathForCompare } from "./PathUtils.js";
 
 const log = createLogger("KBPathResolver");
 
@@ -93,6 +94,19 @@ export function assertValidLocalFolder(customPath: string | undefined): void {
  * fully-populated config (`remoteUrl` + `repoName`) on return — except when
  * the project is manually disabled, in which case no identity is written and
  * the returned path may be unclaimed (disabled mode must not touch disk).
+ *
+ * **Precondition: callers whose `repoName` is derived from an ambient cwd MUST
+ * first pass that cwd through {@link isClaimableProject}.** This function
+ * creates directories and writes files, so calling it from a non-project cwd
+ * permanently materializes `<localFolder>/<basename>/`. The precondition can't
+ * be enforced in here because the useful response to a non-claimable cwd is
+ * "use a different StorageProvider", which only the caller can pick. Current
+ * gated callers: `StorageFactory.createStorage`, `ReadStorageResolver`
+ * (via `createFolderStorage`), `MemoryBankScanner.tryResolveKBRoot`. Callers
+ * exempt because their path comes from the user rather than a cwd guess:
+ * `SyncCommand`, `MigrateMemoryBankCommand`, VS Code's repoint flow.
+ *
+ * Use {@link peekKBPath} when you only need the path and must not claim it.
  */
 export function resolveKBPath(repoName: string, remoteUrl: string | null, customPath?: string): string {
 	const parent = resolveKbParent(customPath);
@@ -308,6 +322,56 @@ export function extractRepoName(projectPath: string): string {
 	}
 
 	return basename(projectPath) || "unknown";
+}
+
+/**
+ * Whether `projectPath` may claim a Memory Bank folder at all.
+ *
+ * The write-boundary gate for `resolveKBPath`. That function is named like a
+ * pure resolver but *claims* the folder it returns (`writeKBIdentity` →
+ * `MetadataManager.ensure()`), and its `repoName` argument is derived by
+ * `extractRepoName` from whatever cwd the caller happened to have. So any
+ * jollimemory process running in a directory that is not a real project
+ * permanently materializes a junk `<localFolder>/<basename>/` folder — and the
+ * per-entry-point re-entrancy guards are a whack-a-mole defense that only holds
+ * while every entry point remembers to check (see AgentReentry: Codex strips the
+ * env marker, so `jolli mcp` claimed one folder per local-agent call).
+ *
+ * Two conditions, each mapping to a class of junk folders observed in the wild:
+ *
+ *  1. **Not inside a git worktree.** Covers every agent temp cwd
+ *     (`jolli-localagent-*`, `jolli-probe-*` — bare empty dirs, which is exactly
+ *     why `codex exec` needs `--skip-git-repo-check` to run there), plus
+ *     `cd /tmp && jolli …` (`tmp/`) and the empty-basename `"unknown"` fallback.
+ *  2. **At or inside the Memory Bank parent.** The Memory Bank folder is itself a
+ *     git repo (for peer sync), so condition 1 lets it through and it claims a
+ *     folder named after itself, nested one level down.
+ *
+ * Deliberately NOT gated on "under a temp root": every observed case is already
+ * covered by condition 1, while rejecting `tmpdir()` wholesale would break the
+ * legitimate case of a repo checked out under `/tmp` (and much of this repo's
+ * own real-git test suite).
+ *
+ * A `false` here means callers degrade to orphan-branch-only storage rather than
+ * touching the Memory Bank folder — no writes, no directories, nothing to clean
+ * up later.
+ */
+export function isClaimableProject(projectPath: string, customPath?: string): boolean {
+	if (!basename(projectPath)) return false;
+	if (!tryGitCommand(projectPath, ["rev-parse", "--git-dir"])) return false;
+
+	// `resolveKbParent` falls back to the default parent for a missing/unsafe
+	// customPath, matching what `resolveKBPath` would actually use.
+	let parent: string;
+	try {
+		parent = resolveKbParent(customPath);
+	} catch {
+		// An unusable parent can't be claimed into either way.
+		return false;
+	}
+	const project = normalizePathForCompare(projectPath);
+	const bank = normalizePathForCompare(parent);
+	return project !== bank && !project.startsWith(`${bank}/`);
 }
 
 // The plumbing commands this helper runs (`config --get`, `rev-parse`,

@@ -23,6 +23,7 @@
  */
 
 import { createLogger } from "../Logger.js";
+import { isClaimableProject } from "./KBPathResolver.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
 import { loadConfig } from "./SessionTracker.js";
 import { createFolderStorage } from "./StorageFactory.js";
@@ -38,10 +39,31 @@ const log = createLogger("ReadStorageResolver");
  * probes every call. VSCode's `JolliMemoryBridge` memoizes the result and
  * invalidates on settings-save; CLI call sites (one-shot compile / recall)
  * typically don't need caching because they exit after a single read pass.
+ *
+ * READ side, but still gated by `isClaimableProject`: `createFolderStorage`
+ * resolves its kbRoot through `resolveKBPath`, which *claims* the folder it
+ * returns. So a read from a non-project cwd creates the very junk folder the
+ * write-side gate exists to prevent — the gate has to sit on every caller of
+ * `createFolderStorage`, not just `StorageFactory.createStorage`. Degrading to
+ * orphan costs nothing here: in dual-write the folder probe would have missed
+ * (`index.json` absent in a folder that only just came into existence) and
+ * fallen back to orphan anyway — just after leaving the folder behind.
  */
 export async function createReadStorage(cwd: string): Promise<StorageProvider> {
 	const config = (await loadConfig()) as Record<string, unknown>;
 	const mode = (config.storageMode as string | undefined) ?? "dual-write";
+
+	// Same shape as `StorageFactory.createStorage`: skipped entirely in orphan
+	// mode (no folder is touched there, so the gate's git subprocess would be
+	// pure overhead), consulted for every mode that can reach the folder layer.
+	if (mode !== "orphan" && !isClaimableProject(cwd, config.localFolder as string | undefined)) {
+		log.warn(
+			"createReadStorage: not a claimable project (no git worktree, or inside the Memory Bank folder): %s — reading from the orphan branch instead of %s",
+			cwd,
+			mode,
+		);
+		return new OrphanBranchStorage(cwd);
+	}
 
 	switch (mode) {
 		case "orphan":

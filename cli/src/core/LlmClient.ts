@@ -13,10 +13,11 @@ import { basename } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { createLogger } from "../Logger.js";
 import type { LlmCredentialSource, LocalAgentToolId } from "../Types.js";
+import { LOCAL_AGENT_TMP_PREFIX } from "./AgentReentry.js";
 import { JOLLI_CLIENT_HEADER } from "./ClientHeader.js";
 import { parseBaseUrl, parseJolliApiKey } from "./JolliApiUtils.js";
 import { getBackend, registerBackend } from "./localagent/BackendRegistry.js";
-import { ClaudeCodeBackend, LOCAL_AGENT_TMP_PREFIX } from "./localagent/ClaudeCodeBackend.js";
+import { ClaudeCodeBackend } from "./localagent/ClaudeCodeBackend.js";
 import { CodexBackend } from "./localagent/CodexBackend.js";
 import { CursorAgentBackend } from "./localagent/CursorAgentBackend.js";
 import { describeCandidate } from "./localagent/ExecutableResolver.js";
@@ -534,11 +535,11 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 		);
 		throw err;
 	} finally {
-		// Only remove a cwd WE created (buildInvocation's mkdtemp under tmpdir with
-		// our prefix); callLocalAgent is backend-generic and tests inject stubs
+		// Only remove a cwd WE created (createLocalAgentCwd's mkdtemp under tmpdir
+		// with our prefix); callLocalAgent is backend-generic and tests inject stubs
 		// with arbitrary cwds (e.g. a bare "/tmp"), so a blind rmSync here could
 		// delete an unrelated directory. LOCAL_AGENT_TMP_PREFIX is the single
-		// source of truth shared with ClaudeCodeBackend.buildInvocation.
+		// source of truth shared with createLocalAgentCwd in AgentReentry.
 		if (invocation.cwd.startsWith(tmpdir()) && basename(invocation.cwd).startsWith(LOCAL_AGENT_TMP_PREFIX)) {
 			try {
 				rmSync(invocation.cwd, { recursive: true, force: true });

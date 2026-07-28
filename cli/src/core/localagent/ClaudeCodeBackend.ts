@@ -1,7 +1,4 @@
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { LOCAL_AGENT_CHILD_ENV } from "../AgentReentry.js";
+import { createLocalAgentCwd, LOCAL_AGENT_CHILD_ENV } from "../AgentReentry.js";
 import { resolveClaudeExecutable } from "./ClaudeExecutableResolver.js";
 import {
 	type Invocation,
@@ -46,13 +43,6 @@ const SCRUBBED_ENV_VARS = [
 	"CLAUDECODE",
 ] as const;
 
-/**
- * Prefix for the temp cwd created below. Exported so `LlmClient.callLocalAgent`
- * can recognize (and safely clean up) only directories THIS backend created,
- * without duplicating the literal string.
- */
-export const LOCAL_AGENT_TMP_PREFIX = "jolli-localagent-";
-
 export class ClaudeCodeBackend implements LocalAgentBackend {
 	readonly id = "claude-code";
 
@@ -68,12 +58,10 @@ export class ClaudeCodeBackend implements LocalAgentBackend {
 		// (SessionStart/Stop hooks, `jolli enable`, MCP storage init) no-ops
 		// instead of re-entering against this throwaway temp cwd. See AgentReentry.
 		env[LOCAL_AGENT_CHILD_ENV] = "1";
-		// Fresh empty cwd: `claude` auto-discovers a CLAUDE.md from cwd and folds
-		// it into the system prompt. Running in the repo would inject the repo's
-		// CLAUDE.md — polluting the summary and burning tokens. An empty temp dir
-		// is the clean isolation (mirrors claude-mem's cwd jail). Removed again by
-		// `LlmClient.callLocalAgent` once the run completes.
-		const cwd = mkdtempSync(join(tmpdir(), LOCAL_AGENT_TMP_PREFIX));
+		// Fresh temp cwd carrying the re-entrancy sentinel — see createLocalAgentCwd
+		// for why it must be empty of instruction files and why the env marker above
+		// is not sufficient on its own. Removed by `LlmClient.callLocalAgent`.
+		const cwd = createLocalAgentCwd();
 		return {
 			file: exe.file,
 			// `--tools <tools...>` is an ALLOW-list. Passing a single empty string

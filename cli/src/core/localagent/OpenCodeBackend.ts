@@ -1,8 +1,5 @@
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, posix as pathPosix, win32 as pathWin32 } from "node:path";
-import { LOCAL_AGENT_CHILD_ENV } from "../AgentReentry.js";
-import { LOCAL_AGENT_TMP_PREFIX } from "./ClaudeCodeBackend.js";
+import { posix as pathPosix, win32 as pathWin32 } from "node:path";
+import { createLocalAgentCwd, LOCAL_AGENT_CHILD_ENV } from "../AgentReentry.js";
 import { type Candidate, resolveExecutable, type ShimDeps } from "./ExecutableResolver.js";
 import {
 	type Invocation,
@@ -58,7 +55,7 @@ export class OpenCodeBackend implements LocalAgentBackend {
 		env[LOCAL_AGENT_CHILD_ENV] = "1";
 		// Fresh empty cwd, same rationale as ClaudeCodeBackend: isolate the run
 		// from the repo (opencode reads AGENTS.md from its cwd).
-		const cwd = mkdtempSync(join(tmpdir(), LOCAL_AGENT_TMP_PREFIX));
+		const cwd = createLocalAgentCwd();
 		// opencode run has no separate system-prompt flag, so it is prepended to
 		// the user prompt (confirmed via --help).
 		const prompt = req.systemPrompt ? `${req.systemPrompt}\n\n${req.prompt}` : req.prompt;

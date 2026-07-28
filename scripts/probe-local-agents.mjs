@@ -30,10 +30,19 @@ const TOOLS = [
 for (const t of TOOLS) {
 	const dir = join(FIX, t.id);
 	mkdirSync(dir, { recursive: true });
+	// Mirror the real backends' re-entrancy marking, BOTH channels. Without it
+	// each probed CLI boots the globally-registered `jolli mcp` in this temp cwd,
+	// which claims a permanent `<localFolder>/jolli-probe-*/` Memory Bank folder
+	// (2 such folders were left behind by an earlier run of this script). The env
+	// var alone is not enough — Codex spawns MCP servers with an 11-variable
+	// allowlist that drops it; the cwd sentinel is what actually survives.
+	// See cli/src/core/AgentReentry.ts.
 	const cwd = mkdtempSync(join(tmpdir(), "jolli-probe-"));
-	const help = spawnSync(t.bin, t.help, { encoding: "utf8" });
+	writeFileSync(join(cwd, ".jolli-local-agent-child"), "");
+	const env = { ...process.env, JOLLI_LOCAL_AGENT_CHILD: "1" };
+	const help = spawnSync(t.bin, t.help, { encoding: "utf8", env });
 	writeFileSync(join(dir, "help.txt"), `${help.stdout ?? ""}\n---STDERR---\n${help.stderr ?? ""}`);
-	const run = spawnSync(t.bin, t.run, { cwd, encoding: "utf8", timeout: 120000 });
+	const run = spawnSync(t.bin, t.run, { cwd, encoding: "utf8", timeout: 120000, env });
 	writeFileSync(join(dir, "success.json"), run.stdout ?? "");
 	writeFileSync(
 		join(dir, "meta.json"),

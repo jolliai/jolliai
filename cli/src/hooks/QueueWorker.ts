@@ -940,7 +940,18 @@ async function runIngestFromQueue(
 		return;
 	}
 	const result = await drainIngest(cwd, config, { triggeredBy: op.triggeredBy, writeGuard });
-	log.info("Ingest drained: %d batches, %d sources (%s)", result.batches, result.ingested, op.triggeredBy);
+	// Held topics are part of the outcome, not a footnote: their sources stay
+	// unprocessed and are retried on every later drain, so a drain that reports
+	// only "N sources" reads as clean while a topic silently stalls forever.
+	// `held=[]` on the happy path keeps this branch-free.
+	const held = result.topicFailures.map((f) => `${f.slug} (${f.code})`).join(", ");
+	log.info(
+		"Ingest drained: %d batches, %d sources, held=[%s] (%s)",
+		result.batches,
+		result.ingested,
+		held,
+		op.triggeredBy,
+	);
 	// Re-render when new sources landed, OR when the visible wiki is gone (the user
 	// deleted `_wiki/`): without the second clause a deleted wiki would never come
 	// back through the background path once all sources are already processed

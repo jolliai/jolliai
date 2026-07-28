@@ -47,10 +47,23 @@ export function runInvocation(inv: Invocation, opts: RunOpts = {}): Promise<stri
 	// (ClaudeCodeBackend sends the prompt via stdin below, a byte stream with no
 	// such restriction, so `inv.stdin` is deliberately left untouched.)
 	const args = inv.args.map((a) => a.replace(/\0/g, ""));
+	// `cwd` alone does NOT isolate the child: agent CLIs commonly resolve their
+	// working directory from `PWD` (the shell-maintained string, which preserves
+	// symlinked paths) instead of the kernel cwd, and every backend copies
+	// `process.env` wholesale — so a hook/worker parent whose PWD is the user's
+	// repo silently drags the agent BACK into that repo. Measured against
+	// opencode 1.18: spawned with cwd=<temp dir> but PWD=<repo>, it bound its
+	// session to the repo, read repo sources, and wrote a file there. Pin PWD to
+	// the cwd we actually chose and drop the two sibling vars that leak the
+	// parent's location (`OLDPWD` from shells, `INIT_CWD` from npm scripts).
+	// Same rationale as the NUL strip above: one spawn boundary, every backend.
+	const env: NodeJS.ProcessEnv = { ...inv.env, PWD: inv.cwd };
+	delete env.OLDPWD;
+	delete env.INIT_CWD;
 	return new Promise<string>((resolve, reject) => {
 		const child = spawnImpl(inv.file, args, {
 			cwd: inv.cwd,
-			env: inv.env,
+			env,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		// Accumulate stdout as raw Buffers and decode once at the end: a single

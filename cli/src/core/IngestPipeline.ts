@@ -169,9 +169,21 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 				log.error("Reconcile truncated for topic %s -- keeping old page, holding sources", slug);
 				return { kind: "failed", slug, refs: [...assignment.refs], code: INGEST_CODES.RECONCILE_TRUNCATED };
 			}
-			const parsed = parseReconciledPage(result.text ?? "", slug, title);
+			const text = result.text ?? "";
+			const parsed = parseReconciledPage(text, slug, title);
 			if (!parsed) {
-				log.error("Reconcile produced no topic block for %s -- keeping old page, holding sources", slug);
+				// Name the generator and quote what it actually said. An agentic
+				// local-agent CLI can "answer" a structured-output prompt by using its
+				// own tools (writing the page to a file) and replying with a one-line
+				// receipt — indistinguishable from a truncation or a model flub unless
+				// the reply itself is in the log.
+				log.error(
+					"Reconcile produced no topic block for %s (provider=%s tool=%s) -- keeping old page, holding sources; reply began: %s",
+					slug,
+					String(config.aiProvider),
+					String(config.localAgentTool),
+					JSON.stringify(text.slice(0, 200)),
+				);
 				return { kind: "failed", slug, refs: [...assignment.refs], code: INGEST_CODES.RECONCILE_PARSE_FAILED };
 			}
 

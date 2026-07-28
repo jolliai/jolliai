@@ -22,7 +22,7 @@
 import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { createLogger } from "../Logger.js";
-import { extractRepoName, getRemoteUrl, resolveKBPath } from "./KBPathResolver.js";
+import { extractRepoName, getRemoteUrl, isClaimableProject, resolveKBPath } from "./KBPathResolver.js";
 import { MetadataManager } from "./MetadataManager.js";
 import { toForwardSlash } from "./PathUtils.js";
 import { loadConfig } from "./SessionTracker.js";
@@ -311,6 +311,13 @@ async function tryResolveKBRoot(cwd: string): Promise<string | null> {
 	try {
 		const config = (await loadConfig()) as { localFolder?: string };
 		const customKBPath = config.localFolder;
+		// Same write-boundary gate as StorageFactory: `resolveKBPath` below claims
+		// the folder it returns, so scanning from a non-project cwd would create
+		// one rather than merely failing to find one.
+		if (!isClaimableProject(cwd, customKBPath)) {
+			log.debug("Memory Bank kbRoot skipped for non-claimable cwd %s", cwd);
+			return null;
+		}
 		const repoName = extractRepoName(cwd);
 		const remoteUrl = getRemoteUrl(cwd);
 		return resolveKBPath(repoName, remoteUrl, customKBPath);

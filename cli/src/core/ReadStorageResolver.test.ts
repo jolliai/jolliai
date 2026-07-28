@@ -15,10 +15,18 @@ vi.mock("./StorageFactory.js", () => ({
 	createFolderStorage: vi.fn(),
 }));
 
+// Claimable by default — the gate's own conditions (git worktree, nested bank)
+// are covered in KBPathResolver.test.ts against real git worktrees. Mocked here
+// so these tests never shell out to git.
+vi.mock("./KBPathResolver.js", () => ({
+	isClaimableProject: vi.fn().mockReturnValue(true),
+}));
+
 // Suppress console output
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 
+import { isClaimableProject } from "./KBPathResolver.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
 import { createReadStorage } from "./ReadStorageResolver.js";
 import { loadConfig } from "./SessionTracker.js";
@@ -26,6 +34,7 @@ import { createFolderStorage } from "./StorageFactory.js";
 
 const mockLoadConfig = vi.mocked(loadConfig);
 const mockCreateFolderStorage = vi.mocked(createFolderStorage);
+const mockIsClaimableProject = vi.mocked(isClaimableProject);
 
 // Minimal FolderStorage stub: only the methods ReadStorageResolver touches.
 // biome-ignore lint/suspicious/noExplicitAny: minimal StorageProvider stub for read-resolver dispatch
@@ -40,6 +49,9 @@ function makeFolderStub(opts: { index?: unknown; isDirty?: boolean | undefined }
 describe("createReadStorage", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		// `clearAllMocks` wipes recorded calls but keeps implementations, so a
+		// per-test `mockReturnValue(false)` would otherwise leak forward.
+		mockIsClaimableProject.mockReturnValue(true);
 	});
 
 	it('returns OrphanBranchStorage when storageMode is "orphan"', async () => {
@@ -143,5 +155,65 @@ describe("createReadStorage", () => {
 		expect((storage as unknown as Record<string, unknown>).type).toBe("orphan");
 		expect(warnSpy).toHaveBeenCalled();
 		expect(mockCreateFolderStorage).not.toHaveBeenCalled();
+	});
+
+	// The read side reaches `resolveKBPath` through `createFolderStorage`, which
+	// CLAIMS the folder it resolves. Without this gate a read launched from a
+	// non-project cwd (`cd /tmp && jolli generate …`, an agent's throwaway temp
+	// dir) leaves a junk `<localFolder>/<basename>/` behind — the same failure the
+	// write-side gate in StorageFactory prevents.
+	describe("non-claimable cwd degrades to orphan-only", () => {
+		it("dual-write: never constructs the FolderStorage", async () => {
+			mockLoadConfig.mockResolvedValue({ storageMode: "dual-write" } as unknown as Awaited<
+				ReturnType<typeof loadConfig>
+			>);
+			mockIsClaimableProject.mockReturnValue(false);
+
+			const storage = await createReadStorage("/var/folders/xx/jolli-localagent-abc123");
+
+			expect((storage as unknown as Record<string, unknown>).type).toBe("orphan");
+			// The assertion that pins the fix: no createFolderStorage call means no
+			// resolveKBPath call means nothing written to disk.
+			expect(mockCreateFolderStorage).not.toHaveBeenCalled();
+		});
+
+		it("folder: never constructs the FolderStorage", async () => {
+			mockLoadConfig.mockResolvedValue({ storageMode: "folder" } as unknown as Awaited<
+				ReturnType<typeof loadConfig>
+			>);
+			mockIsClaimableProject.mockReturnValue(false);
+
+			const storage = await createReadStorage("/var/folders/xx/jolli-localagent-abc123");
+
+			expect((storage as unknown as Record<string, unknown>).type).toBe("orphan");
+			expect(mockCreateFolderStorage).not.toHaveBeenCalled();
+		});
+
+		it("passes the configured localFolder to the gate so the nested-bank case is detectable", async () => {
+			mockLoadConfig.mockResolvedValue({
+				storageMode: "dual-write",
+				localFolder: "/Users/me/Documents/bank",
+			} as unknown as Awaited<ReturnType<typeof loadConfig>>);
+			mockCreateFolderStorage.mockReturnValue(makeFolderStub({ index: "{}", isDirty: false }));
+
+			await createReadStorage("/Users/me/Documents/bank/some-repo");
+
+			expect(mockIsClaimableProject).toHaveBeenCalledWith(
+				"/Users/me/Documents/bank/some-repo",
+				"/Users/me/Documents/bank",
+			);
+		});
+
+		it('does not consult the gate at all in "orphan" mode', async () => {
+			// Orphan mode never touches the Memory Bank folder, so the git
+			// subprocess the gate runs would be pure overhead on that path.
+			mockLoadConfig.mockResolvedValue({ storageMode: "orphan" } as unknown as Awaited<
+				ReturnType<typeof loadConfig>
+			>);
+
+			await createReadStorage("/project/path");
+
+			expect(mockIsClaimableProject).not.toHaveBeenCalled();
+		});
 	});
 });

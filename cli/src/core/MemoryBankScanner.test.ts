@@ -20,9 +20,13 @@ vi.mock("./KBPathResolver.js", () => ({
 	extractRepoName: vi.fn(),
 	getRemoteUrl: vi.fn(),
 	resolveKBPath: vi.fn(),
+	// Claimable by default: these fixtures stand in for a real repo cwd. The
+	// gate's own conditions are covered in KBPathResolver.test.ts against real
+	// git worktrees; here it is only wired so the scan is not short-circuited.
+	isClaimableProject: vi.fn().mockReturnValue(true),
 }));
 
-import { extractRepoName, getRemoteUrl, resolveKBPath } from "./KBPathResolver.js";
+import { extractRepoName, getRemoteUrl, isClaimableProject, resolveKBPath } from "./KBPathResolver.js";
 import { listAllUserKnowledge, listAllUserKnowledgeFromRoot, listUserKnowledge } from "./MemoryBankScanner.js";
 import { loadConfig } from "./SessionTracker.js";
 
@@ -328,6 +332,17 @@ describe("MemoryBankScanner.listUserKnowledge", () => {
 	it("listAllUserKnowledge returns [] when the Memory Bank root cannot be resolved", async () => {
 		mockLoadConfig.mockRejectedValue(new Error("config gone"));
 		expect(await listAllUserKnowledge(cwd)).toEqual([]);
+	});
+
+	it("listAllUserKnowledge skips a non-claimable cwd without resolving (and thus claiming) a folder", async () => {
+		// `resolveKBPath` CLAIMS the folder it returns, so scanning from a
+		// non-project cwd (an agent's throwaway temp dir, the Memory Bank folder
+		// itself) used to create one rather than merely find nothing.
+		vi.mocked(isClaimableProject).mockReturnValueOnce(false);
+		mockResolveKBPath.mockClear();
+
+		expect(await listAllUserKnowledge(cwd)).toEqual([]);
+		expect(mockResolveKBPath).not.toHaveBeenCalled();
 	});
 
 	it("returns global + repo + branch in one pass without duplication", async () => {

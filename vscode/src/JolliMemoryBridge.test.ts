@@ -13,10 +13,16 @@ const { discoverRepos } = vi.hoisted(() => ({
 	discoverRepos: vi.fn().mockReturnValue([]),
 }));
 
-const { extractRepoName, getRemoteUrl, resolveKbParent } = vi.hoisted(() => ({
+const { extractRepoName, getRemoteUrl, resolveKbParent, isClaimableProject } = vi.hoisted(() => ({
 	extractRepoName: vi.fn().mockReturnValue("test-repo"),
 	getRemoteUrl: vi.fn().mockReturnValue(null),
 	resolveKbParent: vi.fn().mockReturnValue("/mock/home/Documents/jolli"),
+	// StorageFactory's write-boundary gate. `TEST_CWD` is a synthetic path, so the
+	// real predicate (which probes for a git worktree on disk) would reject it and
+	// silently degrade every folder-mode path in this file to orphan-only storage.
+	// The gate has its own coverage in cli/src/core/KBPathResolver.test.ts; here it
+	// is pinned open so these tests exercise the storage wiring they are about.
+	isClaimableProject: vi.fn().mockReturnValue(true),
 }));
 
 const {
@@ -241,6 +247,7 @@ vi.mock("../../cli/src/core/KBPathResolver.js", async (importOriginal) => {
 		extractRepoName,
 		getRemoteUrl,
 		resolveKbParent,
+		isClaimableProject,
 		// Stub: identity-claiming side-effects of `resolveKBPath` /
 		// `initializeKBFolder` reach into MetadataManager, which is mocked
 		// to a class with no-op methods (see `MockMetadataManager`). The
@@ -477,6 +484,7 @@ describe("JolliMemoryBridge", () => {
 		extractRepoName.mockReturnValue("test-repo");
 		getRemoteUrl.mockReturnValue(null);
 		resolveKbParent.mockReturnValue("/mock/home/Documents/jolli");
+		isClaimableProject.mockReturnValue(true);
 		savePluginSource.mockResolvedValue(undefined);
 		saveSquashPending.mockResolvedValue(undefined);
 		installerInstall.mockResolvedValue({

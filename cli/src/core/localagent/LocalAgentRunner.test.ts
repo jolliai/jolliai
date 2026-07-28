@@ -46,6 +46,34 @@ function fakeSpawn(opts: { stdout?: string; stderr?: string; code?: number | nul
 const inv = { file: "/x/claude", args: ["-p"], stdin: "PROMPT", env: {}, cwd: "/tmp" };
 
 describe("runInvocation", () => {
+	it("pins PWD to the invocation cwd and drops the inherited shell/npm cwd vars", async () => {
+		let seenEnv: NodeJS.ProcessEnv | undefined;
+		const spawnImpl = ((_file: string, _args: string[], opts: { env?: NodeJS.ProcessEnv }) => {
+			seenEnv = opts.env;
+			const child = makeFakeChild();
+			setImmediate(() => {
+				child.stdout.end();
+				child.stderr.end();
+				child.emit("close", 0);
+			});
+			return child;
+			// biome-ignore lint/suspicious/noExplicitAny: test double for spawn's signature
+		}) as any;
+		await runInvocation(
+			{
+				...inv,
+				cwd: "/tmp/jolli-localagent-abc",
+				env: { PWD: "/repo", OLDPWD: "/repo/sub", INIT_CWD: "/repo", PATH: "/usr/bin" },
+			},
+			{ spawnImpl },
+		);
+		expect(seenEnv?.PWD).toBe("/tmp/jolli-localagent-abc");
+		expect(seenEnv?.OLDPWD).toBeUndefined();
+		expect(seenEnv?.INIT_CWD).toBeUndefined();
+		// Unrelated vars are passed through untouched.
+		expect(seenEnv?.PATH).toBe("/usr/bin");
+	});
+
 	it("resolves stdout on a clean exit", async () => {
 		const out = await runInvocation(inv, { spawnImpl: fakeSpawn({ stdout: '{"ok":true}', code: 0 }) });
 		expect(out).toBe('{"ok":true}');

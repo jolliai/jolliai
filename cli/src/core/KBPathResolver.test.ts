@@ -5,6 +5,7 @@ import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setManuallyDisabled } from "../Logger.js";
 import * as Subprocess from "../util/Subprocess.js";
+import { createLocalAgentCwd } from "./AgentReentry.js";
 import {
 	archiveKBFolder,
 	assertValidLocalFolder,
@@ -15,6 +16,7 @@ import {
 	getRemoteUrl,
 	InvalidLocalFolderError,
 	initializeKBFolder,
+	isClaimableProject,
 	isValidLocalFolder,
 	peekKBPath,
 	resolveKBPath,
@@ -1014,6 +1016,94 @@ esac
 			expect(archiveKBFolder(kbRoot, tempDir)).toBeNull();
 			// The original folder is left untouched on failure.
 			expect(existsSync(kbRoot)).toBe(true);
+		});
+	});
+
+	// The write-boundary gate. `resolveKBPath` claims a folder for whatever
+	// repoName it is handed, so every caller that derives that name from a cwd
+	// (`extractRepoName`) is a potential pollution source: a nested agent's
+	// throwaway temp cwd, a probe script, `cd /tmp && jolli …`, or the Memory
+	// Bank folder itself. This predicate is the single gate those callers pass
+	// through, so coverage no longer depends on every entry point remembering
+	// its own re-entrancy check.
+	describe("isClaimableProject", () => {
+		// Kept separate from `tempDir` (which other blocks use as the Memory Bank
+		// parent) so a repo can live *outside* the parent in the accept cases.
+		let kbParent: string;
+
+		beforeEach(() => {
+			kbParent = makeTmpDir();
+		});
+
+		afterEach(() => {
+			rmrf(kbParent);
+		});
+
+		/** A git worktree at `dir` — the only shape that may claim a folder. */
+		function initRepo(dir: string): string {
+			mkdirSync(dir, { recursive: true });
+			git(dir, ["init"]);
+			return dir;
+		}
+
+		it("accepts a real git worktree", () => {
+			const repo = initRepo(join(tempDir, "real-repo"));
+			expect(isClaimableProject(repo, kbParent)).toBe(true);
+		});
+
+		it("accepts a subdirectory of a git worktree", () => {
+			// Monorepo package dirs and `git worktree` checkouts both land here.
+			const repo = initRepo(join(tempDir, "mono"));
+			const pkg = join(repo, "packages", "web");
+			mkdirSync(pkg, { recursive: true });
+			expect(isClaimableProject(pkg, kbParent)).toBe(true);
+		});
+
+		it("rejects a directory that is not inside any git worktree", () => {
+			// This is the gate that kills `jolli-localagent-*` and `jolli-probe-*`:
+			// the local-agent temp cwd is deliberately a bare empty dir, which is
+			// exactly why `codex exec` needs --skip-git-repo-check to run there.
+			const plain = join(tempDir, "not-a-repo");
+			mkdirSync(plain, { recursive: true });
+			expect(isClaimableProject(plain, kbParent)).toBe(false);
+		});
+
+		it("rejects a local-agent temp cwd", () => {
+			const cwd = createLocalAgentCwd();
+			try {
+				expect(isClaimableProject(cwd, kbParent)).toBe(false);
+			} finally {
+				rmrf(cwd);
+			}
+		});
+
+		it("rejects the filesystem root, whose basename is empty", () => {
+			// `extractRepoName` falls back to the literal "unknown" here, which is
+			// where the stray `unknown/` folder came from.
+			expect(isClaimableProject("/", kbParent)).toBe(false);
+		});
+
+		it("rejects the Memory Bank parent itself even though it is a git repo", () => {
+			// The Memory Bank folder is itself a git repo (for peer sync), so the
+			// git gate alone lets it through and it claims a folder named after
+			// itself — the stray `memorybank-prod/` inside `memorybank-prod/`.
+			initRepo(kbParent);
+			expect(isClaimableProject(kbParent, kbParent)).toBe(false);
+		});
+
+		it("rejects a repo nested inside the Memory Bank parent", () => {
+			const nested = initRepo(join(kbParent, "some-repo"));
+			expect(isClaimableProject(nested, kbParent)).toBe(false);
+		});
+
+		it("compares the Memory Bank parent path case-insensitively on darwin/win32", () => {
+			// Guards the `/Users/x/Documents/Bank` vs `/users/x/documents/bank`
+			// mismatch that would let a nested repo slip past the parent gate.
+			const nested = initRepo(join(kbParent, "cased-repo"));
+			// Case-insensitive platforms see through the upper-cased parent and reject;
+			// case-sensitive ones treat it as an unrelated path and allow the claim.
+			const caseInsensitive = process.platform === "darwin" || process.platform === "win32";
+			expect(isClaimableProject(nested, kbParent.toUpperCase())).toBe(!caseInsensitive);
 		});
 	});
 });

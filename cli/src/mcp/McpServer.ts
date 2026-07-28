@@ -220,16 +220,20 @@ export interface StartMcpServerDeps {
 
 /** Start the stdio MCP server. Resolves when the transport closes. */
 export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {}): Promise<void> {
-	// Re-entrancy guard (JOLLI-2033): the local-agent backend spawns `claude` in a
-	// throwaway temp cwd marked JOLLI_LOCAL_AGENT_CHILD=1. When the jolli plugin is
-	// globally installed, that nested `claude` spawns `jolli mcp` here — inheriting
-	// the marker. Without this no-op, the storage init below roots a FolderStorage
-	// at <localFolder>/<tempDirName>/, claiming a spurious Memory Bank "repo" per
-	// summary call (the temp dir basename becomes the repoName). The child runs
-	// `--tools ""` (all tools denied) so it never invokes an MCP tool; no-op the
-	// whole server. Mirrors the SessionStartHook/StopHook/EnableCommand guards and
-	// honors the "MCP storage init no-ops" contract stated in AgentReentry.
-	if (isLocalAgentChild()) {
+	// Re-entrancy guard (JOLLI-2033): the local-agent backend spawns an agent CLI in
+	// a throwaway temp cwd marked JOLLI_LOCAL_AGENT_CHILD=1. That nested CLI boots
+	// the globally-registered `jolli mcp` here. Without this no-op, the storage init
+	// below roots a FolderStorage at <localFolder>/<tempDirName>/, claiming a
+	// spurious Memory Bank "repo" per summary call (the temp dir basename becomes
+	// the repoName).
+	//
+	// `cwd` is passed explicitly — unlike the hook guards, this process is spawned
+	// by the HOST rather than by our own child, so the env marker is subject to the
+	// host's env policy: Codex passes MCP servers an 11-variable allowlist that
+	// drops it, which is how 136 stray folders accumulated with the env-only guard
+	// already in place. The cwd sentinel is what actually survives that hop. See
+	// AgentReentry for the full two-channel rationale.
+	if (isLocalAgentChild(process.env, cwd)) {
 		log.info("Local-agent child detected; skipping MCP server startup to avoid a spurious Memory Bank repo");
 		return;
 	}

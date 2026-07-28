@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock dependencies before importing the module under test
 vi.mock("./SessionTracker.js", () => ({
@@ -11,6 +11,9 @@ vi.mock("./KBPathResolver.js", () => ({
 	getRemoteUrl: vi.fn().mockReturnValue("https://github.com/test/repo.git"),
 	resolveKBPath: vi.fn().mockReturnValue("/tmp/kb-test"),
 	initializeKBFolder: vi.fn(),
+	// Claimable by default; the gate's own conditions are covered in
+	// KBPathResolver.test.ts against real git worktrees.
+	isClaimableProject: vi.fn().mockReturnValue(true),
 }));
 
 vi.mock("./MetadataManager.js", () => {
@@ -118,6 +121,83 @@ describe("StorageFactory", () => {
 		expect((storage as unknown as Record<string, unknown>).type).toBe("dual-write");
 		// Verify that a warning was logged (our Logger writes to console.warn)
 		expect(warnSpy).toHaveBeenCalled();
+	});
+
+	// Write-boundary gate. Before it existed, a nested agent's throwaway temp cwd
+	// (or the Memory Bank folder itself) reached resolveKBPath and permanently
+	// claimed `<localFolder>/<tempDirBasename>/` — 136 such folders accumulated
+	// from local-agent summary calls alone.
+	describe("non-claimable project degrades to orphan-only", () => {
+		// `vi.clearAllMocks()` clears calls but keeps implementations, so a
+		// `mockReturnValue(false)` set here would leak into later tests.
+		afterEach(async () => {
+			const kbResolver = await import("./KBPathResolver.js");
+			(kbResolver.isClaimableProject as ReturnType<typeof vi.fn>).mockReturnValue(true);
+		});
+
+		async function withUnclaimable(): Promise<typeof import("./KBPathResolver.js")> {
+			const kbResolver = await import("./KBPathResolver.js");
+			(kbResolver.isClaimableProject as ReturnType<typeof vi.fn>).mockReturnValue(false);
+			return kbResolver;
+		}
+
+		it("returns OrphanBranchStorage instead of DualWriteStorage", async () => {
+			mockLoadConfig.mockResolvedValue({ storageMode: "dual-write" } as unknown as Awaited<
+				ReturnType<typeof loadConfig>
+			>);
+			const kbResolver = await withUnclaimable();
+
+			const storage = await createStorage("/var/folders/xx/jolli-localagent-abc123");
+
+			expect((storage as unknown as Record<string, unknown>).type).toBe("orphan");
+			expect(DualWriteStorage).not.toHaveBeenCalled();
+			// The claim never happens — nothing is written, so there is nothing to
+			// clean up afterwards. This is the assertion that pins the whole fix.
+			expect(kbResolver.resolveKBPath).not.toHaveBeenCalled();
+			expect(FolderStorage).not.toHaveBeenCalled();
+		});
+
+		it("returns OrphanBranchStorage instead of folder-only FolderStorage", async () => {
+			mockLoadConfig.mockResolvedValue({ storageMode: "folder" } as unknown as Awaited<
+				ReturnType<typeof loadConfig>
+			>);
+			const kbResolver = await withUnclaimable();
+
+			const storage = await createStorage("/var/folders/xx/jolli-localagent-abc123");
+
+			expect((storage as unknown as Record<string, unknown>).type).toBe("orphan");
+			expect(kbResolver.resolveKBPath).not.toHaveBeenCalled();
+		});
+
+		it('does not consult the gate at all in "orphan" mode', async () => {
+			// Orphan mode never touches the Memory Bank folder, so the git
+			// subprocess the gate runs would be pure overhead on that path.
+			mockLoadConfig.mockResolvedValue({ storageMode: "orphan" } as unknown as Awaited<
+				ReturnType<typeof loadConfig>
+			>);
+			const kbResolver = await import("./KBPathResolver.js");
+			(kbResolver.isClaimableProject as ReturnType<typeof vi.fn>).mockClear();
+
+			await createStorage("/project/path");
+
+			expect(kbResolver.isClaimableProject).not.toHaveBeenCalled();
+		});
+
+		it("passes the configured localFolder to the gate so the nested-bank case is detectable", async () => {
+			mockLoadConfig.mockResolvedValue({
+				storageMode: "dual-write",
+				localFolder: "/Users/me/Documents/bank",
+			} as unknown as Awaited<ReturnType<typeof loadConfig>>);
+			const kbResolver = await import("./KBPathResolver.js");
+			(kbResolver.isClaimableProject as ReturnType<typeof vi.fn>).mockReturnValue(true);
+
+			await createStorage("/Users/me/Documents/bank");
+
+			expect(kbResolver.isClaimableProject).toHaveBeenCalledWith(
+				"/Users/me/Documents/bank",
+				"/Users/me/Documents/bank",
+			);
+		});
 	});
 
 	it("createFolderStorageAtRoot builds a folder-only FolderStorage at the explicit kbRoot", async () => {

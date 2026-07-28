@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { createLogger } from "../Logger.js";
 import { DualWriteStorage } from "./DualWriteStorage.js";
 import { FolderStorage } from "./FolderStorage.js";
-import { extractRepoName, getRemoteUrl, resolveKBPath } from "./KBPathResolver.js";
+import { extractRepoName, getRemoteUrl, isClaimableProject, resolveKBPath } from "./KBPathResolver.js";
 import { MetadataManager } from "./MetadataManager.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
 import { loadConfig } from "./SessionTracker.js";
@@ -35,6 +35,19 @@ export async function createStorage(projectPath: string, cwd?: string): Promise<
 	const customKBPath = config.localFolder as string | undefined;
 
 	log.info("StorageFactory.create: storageMode=%s, projectPath=%s", mode, projectPath);
+
+	// Write-boundary gate: a non-project cwd (an agent's throwaway temp dir, the
+	// Memory Bank folder itself, a bare `/tmp`) must never claim a folder under
+	// `localFolder`. Degrade to orphan-only instead of materializing junk that
+	// only the user can clean up. See KBPathResolver.isClaimableProject.
+	if (mode !== "orphan" && !isClaimableProject(projectPath, customKBPath)) {
+		log.warn(
+			"Not a claimable project (no git worktree, or inside the Memory Bank folder): %s — using orphan-only storage instead of %s",
+			projectPath,
+			mode,
+		);
+		return new OrphanBranchStorage(cwd);
+	}
 
 	switch (mode) {
 		case "dual-write": {
