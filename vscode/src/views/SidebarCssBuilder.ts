@@ -1336,6 +1336,51 @@ export function buildSidebarCss(): string {
     font-size: 10px;
     opacity: 0.85;
   }
+  /* Memory reference id (JM-<docId>) prefix, shown before the commit title on
+     synced memory rows. Plain monospace + muted (no background) — a Linear-style
+     id prefix, not a filled badge. Clickable: click copies the id, the tooltip
+     hints at it. */
+  /* Deliberately NOT user-select: none — click-to-copy is one affordance, and
+     manually selecting the text to copy it is the fallback when that one fails
+     (or when the user just wants part of the id). Don't take the fallback away. */
+  .mem-ref {
+    flex: 0 0 auto;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    margin-right: 4px;
+    cursor: pointer;
+  }
+  .mem-ref:hover { color: var(--vscode-foreground); text-decoration: underline; }
+  .mem-ref:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 1px;
+    border-radius: 2px;
+  }
+
+  /* Transient "copied" toast, pinned bottom-center of the sidebar. Fades in on
+     .show (added by showCopyToast) and out ~1.5s later. */
+  .copy-toast {
+    position: fixed;
+    left: 50%;
+    bottom: 16px;
+    transform: translateX(-50%) translateY(8px);
+    background: var(--vscode-notifications-background, var(--vscode-editorWidget-background));
+    color: var(--vscode-notifications-foreground, var(--vscode-foreground));
+    border: 1px solid var(--vscode-notifications-border, var(--vscode-editorWidget-border));
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s ease, transform 0.15s ease;
+    z-index: 1000;
+  }
+  .copy-toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
   /* Middle-dot separators match the muted subline tone. */
   .mem-sub-sep {
     color: var(--vscode-descriptionForeground);

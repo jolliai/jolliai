@@ -89,6 +89,14 @@ const PIN_KIND_TELEMETRY: Readonly<Record<PinKind, string>> = {
  */
 const ALLOWED_BUILTIN_WEBVIEW_COMMANDS = new Set<string>(["vscode.open", "vscode.openFolder"]);
 
+/**
+ * Upper bound on a `copyText` payload. The only caller copies a memory reference id
+ * (`JM-<docId>` / `JM-<hash8>`), so this is generous by two orders of magnitude — it
+ * exists to bound the damage of a webview-side bug that hands over the wrong string,
+ * not to validate the format.
+ */
+const MAX_COPY_TEXT_LENGTH = 256;
+
 /** True when the webview may ask the host to run `command` (see the set above). */
 function isAllowedWebviewCommand(command: string): boolean {
 	return command.startsWith("jollimemory.") || ALLOWED_BUILTIN_WEBVIEW_COMMANDS.has(command);
@@ -799,6 +807,20 @@ export class SidebarWebviewProvider
 					void this.deps.executeCommand(msg.command, ...msg.args);
 				} else {
 					void this.deps.executeCommand(msg.command);
+				}
+				return;
+			case "copyText":
+				// Webview-supplied text (e.g. a "JM-142" reference id) → OS
+				// clipboard. Plain string, no command dispatch, so it needs no
+				// allowlist gate. The webview owns the "copied" toast.
+				//
+				// The length cap is a blast-radius bound, not a validation rule: the
+				// only intended payload is a short reference id, so anything longer is
+				// a webview-side bug, and without the cap such a bug would silently
+				// replace the user's clipboard with (say) an entire summary body.
+				if (typeof msg.text === "string" && msg.text.length > 0 && msg.text.length <= MAX_COPY_TEXT_LENGTH) {
+					void vscode.env.clipboard.writeText(msg.text);
+					track("memory_ref_id_copied", { surface_area: "list" });
 				}
 				return;
 			case "kb:expandFolder":

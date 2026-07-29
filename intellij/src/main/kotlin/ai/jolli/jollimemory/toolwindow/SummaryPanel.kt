@@ -852,6 +852,13 @@ class SummaryPanel(
         try {
             when (command) {
                 "editState" -> webviewDirty = json.get("editing")?.asBoolean == true
+                // Telemetry only — the webview already wrote the id to the clipboard
+                // itself and showed its own toast; there is nothing else to do here.
+                "trackMemoryRefIdCopied" ->
+                    ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+                        "memory_ref_id_copied",
+                        mapOf("surface_area" to "detail"),
+                    )
                 "copyMarkdown" -> handleCopyMarkdown()
                 "downloadMarkdown" -> handleDownloadMarkdown()
                 "pushToJolli" -> handlePushToJolli()

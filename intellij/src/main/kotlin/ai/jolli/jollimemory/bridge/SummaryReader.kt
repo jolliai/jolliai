@@ -45,21 +45,10 @@ class SummaryReader(private val worktreeDir: String, private val git: GitOps) {
     fun listSummaries(): List<CommitSummaryBrief> {
         val files = git.listBranchFiles(ORPHAN_BRANCH, "summaries/")
         return files.mapNotNull { path ->
-            try {
-                val json = git.readBranchFile(ORPHAN_BRANCH, path) ?: return@mapNotNull null
-                val obj = JsonParser.parseString(json).asJsonObject
-                CommitSummaryBrief(
-                    hash = obj.get("commitHash")?.asString ?: "",
-                    shortHash = (obj.get("commitHash")?.asString ?: "").take(8),
-                    message = obj.get("commitMessage")?.asString ?: "",
-                    author = obj.get("commitAuthor")?.asString ?: "",
-                    date = obj.get("commitDate")?.asString ?: "",
-                    topicCount = obj.getAsJsonArray("topics")?.size() ?: 0,
-                    hasSummary = true,
-                )
-            } catch (e: Exception) {
-                log.debug("Failed to parse summary %s: %s", path, e.message)
-                null
+            val json = git.readBranchFile(ORPHAN_BRANCH, path) ?: return@mapNotNull null
+            parseSummaryBrief(json).also {
+                // Unreadable file vs unparseable content: only the latter is worth a line.
+                if (it == null) log.debug("Failed to parse summary %s", path)
             }
         }.sortedByDescending { it.date }
     }
@@ -131,21 +120,54 @@ class SummaryReader(private val worktreeDir: String, private val git: GitOps) {
     companion object {
         const val ORPHAN_BRANCH = JmLogger.ORPHAN_BRANCH
 
+        /**
+         * Parses one stored `summaries/<hash>.json` body into a list row. Pure and
+         * tolerant — returns null for null/blank/malformed input rather than throwing,
+         * so one bad file never breaks the list.
+         *
+         * Every optional member goes through [notNull], which is load-bearing rather
+         * than defensive: Gson hands back JsonNull — a non-null JsonElement — for an
+         * explicit `"field": null`, so `obj.get(f)?.asInt` does NOT short-circuit and
+         * the `asInt` throws. Caught here, that would drop the WHOLE summary, turning
+         * one stray null field into a silently missing memory in the UI.
+         */
+        fun parseSummaryBrief(json: String?): CommitSummaryBrief? {
+            if (json.isNullOrBlank()) return null
+            return try {
+                val obj = JsonParser.parseString(json).asJsonObject
+                val commitHash = obj.notNull("commitHash")?.asString ?: ""
+                CommitSummaryBrief(
+                    hash = commitHash,
+                    shortHash = commitHash.take(8),
+                    message = obj.notNull("commitMessage")?.asString ?: "",
+                    author = obj.notNull("commitAuthor")?.asString ?: "",
+                    date = obj.notNull("commitDate")?.asString ?: "",
+                    topicCount = obj.arrayOrNull("topics")?.size() ?: 0,
+                    hasSummary = true,
+                    // Keep parity with getBranchCommits so a future UI caller of
+                    // listSummaries() still gets the clickable JM- chip.
+                    jolliDocId = obj.notNull("jolliDocId")?.asInt,
+                )
+            } catch (_: Exception) {
+                null
+            }
+        }
+
         /** Renders the matching session's entries from a stored transcript JSON as markdown. */
         private fun sessionToMarkdown(json: String?, sessionId: String): String? {
             if (json.isNullOrBlank()) return null
             return try {
                 val obj = JsonParser.parseString(json).asJsonObject
-                val sessions = obj.getAsJsonArray("sessions") ?: return null
+                val sessions = obj.arrayOrNull("sessions") ?: return null
                 val session = sessions.map { it.asJsonObject }.firstOrNull {
-                    (it.get("sessionId")?.takeIf { e -> !e.isJsonNull }?.asString ?: "") == sessionId
+                    (it.notNull("sessionId")?.asString ?: "") == sessionId
                 } ?: sessions.firstOrNull()?.asJsonObject ?: return null
-                val entries = session.getAsJsonArray("entries") ?: return null
+                val entries = session.arrayOrNull("entries") ?: return null
                 val sb = StringBuilder()
                 for (el in entries) {
                     val e = el.asJsonObject
-                    val role = e.get("role")?.takeIf { !it.isJsonNull }?.asString ?: "?"
-                    val content = e.get("content")?.takeIf { !it.isJsonNull }?.asString ?: ""
+                    val role = e.notNull("role")?.asString ?: "?"
+                    val content = e.notNull("content")?.asString ?: ""
                     val who = when (role.lowercase()) {
                         "human", "user" -> "User"
                         "assistant" -> "Assistant"
@@ -173,18 +195,18 @@ class SummaryReader(private val worktreeDir: String, private val git: GitOps) {
             if (json.isNullOrBlank()) return emptyList()
             return try {
                 val obj = JsonParser.parseString(json).asJsonObject
-                val sessions = obj.getAsJsonArray("sessions") ?: return emptyList()
+                val sessions = obj.arrayOrNull("sessions") ?: return emptyList()
                 sessions.mapNotNull { el ->
                     val session = el.asJsonObject
-                    val source = session.get("source")?.takeIf { !it.isJsonNull }?.asString ?: "ai"
-                    val entries = session.getAsJsonArray("entries")
+                    val source = session.notNull("source")?.asString ?: "ai"
+                    val entries = session.arrayOrNull("entries")
                     val messageCount = entries?.size() ?: 0
                     ConversationBrief(
                         source = source,
                         title = deriveTitle(entries, source),
                         messageCount = messageCount,
-                        sessionId = session.get("sessionId")?.takeIf { !it.isJsonNull }?.asString ?: "",
-                        transcriptPath = session.get("transcriptPath")?.takeIf { !it.isJsonNull }?.asString,
+                        sessionId = session.notNull("sessionId")?.asString ?: "",
+                        transcriptPath = session.notNull("transcriptPath")?.asString,
                     )
                 }
             } catch (_: Exception) {
@@ -193,16 +215,47 @@ class SummaryReader(private val worktreeDir: String, private val git: GitOps) {
         }
 
         private fun deriveTitle(entries: com.google.gson.JsonArray?, source: String): String {
-            val firstHuman = entries?.firstOrNull { el ->
-                val role = el.asJsonObject.get("role")?.asString
-                role == "human" || role == "user"
-            }?.asJsonObject?.get("content")?.asString
-            val firstLine = firstHuman?.lineSequence()?.firstOrNull { it.isNotBlank() }?.trim()
+            // Fall through human turns whose role or content is JSON null / blank — a single
+            // null-content turn must not shadow the first turn that actually carries text.
+            val firstLine = entries
+                ?.asSequence()
+                ?.map { it.asJsonObject }
+                ?.filter {
+                    val role = it.notNull("role")?.asString
+                    role == "human" || role == "user"
+                }
+                ?.mapNotNull { it.notNull("content")?.asString }
+                ?.mapNotNull { content -> content.lineSequence().firstOrNull { it.isNotBlank() }?.trim() }
+                ?.firstOrNull { it.isNotEmpty() }
             if (firstLine.isNullOrEmpty()) return "${source.replaceFirstChar { it.uppercase() }} session"
             return if (firstLine.length > 60) firstLine.take(57) + "…" else firstLine
         }
     }
 }
+
+/**
+ * Reads a member and returns null for BOTH "absent" and "present but JSON null".
+ *
+ * `JsonObject.get()` returns [com.google.gson.JsonNull] — a non-null JsonElement — for an
+ * explicit `"field": null`, so `obj.get("f")?.asInt` does not short-circuit and the
+ * `asInt` throws `UnsupportedOperationException`. Every accessor in this file sits inside
+ * a catch-all that degrades to null / emptyList, so one stray JSON null would silently
+ * drop an entire summary or conversation list rather than one field. Funnel optional
+ * member reads through here.
+ */
+private fun com.google.gson.JsonObject.notNull(member: String): com.google.gson.JsonElement? =
+    get(member)?.takeIf { !it.isJsonNull }
+
+/**
+ * Array counterpart of [notNull] — null for absent, JSON null, AND wrong type.
+ *
+ * Gson's own `getAsJsonArray(member)` is a bare cast (`(JsonArray) members.get(member)`), so
+ * `"topics": null` throws ClassCastException rather than returning null. Caught by the
+ * surrounding degrade-to-null handler, that would drop the whole record — the same failure
+ * mode [notNull] exists to prevent, one type over.
+ */
+private fun com.google.gson.JsonObject.arrayOrNull(member: String): com.google.gson.JsonArray? =
+    notNull(member)?.takeIf { it.isJsonArray }?.asJsonArray
 
 /** Lightweight commit info for list display — matches VS Code BranchCommit. */
 data class CommitSummaryBrief(
@@ -236,6 +289,12 @@ data class CommitSummaryBrief(
     val conversationTurns: Int? = null,
     /** Count of linked context items (plans + notes + references). */
     val contextCount: Int = 0,
+    /**
+     * Backend memory doc id used to render the `JM-<id>` reference prefix in the
+     * Committed Memories panel. Null until the memory is synced to a Jolli Space;
+     * the panel then falls back to `JM-<short hash>` so a reference is always shown.
+     */
+    val jolliDocId: Int? = null,
 ) {
     val hasE2eGuide: Boolean get() = e2eScenarioCount > 0
 }

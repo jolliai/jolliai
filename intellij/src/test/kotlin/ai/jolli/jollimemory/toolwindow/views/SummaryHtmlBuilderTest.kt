@@ -59,6 +59,35 @@ class SummaryHtmlBuilderTest {
         }
 
         @Test
+        fun `prefixes title with JM-docId reference id when the memory is synced`() {
+            val html = SummaryHtmlBuilder.buildHtml(makeSummary().copy(jolliDocId = 142))
+            html shouldContain "page-title-ref"
+            // Carries the copy affordance: the raw id (no colon) to copy.
+            html shouldContain "data-copy-memory-id=\"JM-142\""
+            html shouldContain "JM-142:"
+        }
+
+        @Test
+        fun `falls back to JM-short-hash in the title when there is no jolliDocId`() {
+            // makeSummary's commitHash starts with "abc12345".
+            val html = SummaryHtmlBuilder.buildHtml(makeSummary())
+            html shouldContain "data-copy-memory-id=\"JM-abc12345\""
+            html shouldContain "JM-abc12345:"
+        }
+
+        /**
+         * The chip is a click-to-copy control built on a <span>, so the button semantics
+         * have to be declared explicitly or keyboard users cannot reach it.
+         */
+        @Test
+        fun `makes the reference-id chip keyboard-reachable and screen-reader labelled`() {
+            val html = SummaryHtmlBuilder.buildHtml(makeSummary().copy(jolliDocId = 142))
+            html shouldContain "role=\"button\""
+            html shouldContain "tabindex=\"0\""
+            html shouldContain "aria-label=\"Copy memory ID JM-142\""
+        }
+
+        @Test
         fun `includes CSS and script`() {
             val html = SummaryHtmlBuilder.buildHtml(makeSummary())
             html shouldContain "<style>"

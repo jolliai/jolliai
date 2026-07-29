@@ -116,6 +116,44 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
     });
   });
 
+  // Memory reference-id prefix (JM-<docId>): click copies the id and flashes a
+  // bottom-center toast. clipboard is reachable in this webview (see hash-copy).
+  document.querySelectorAll('.page-title-ref').forEach(function(ref) {
+    function copyRefId() {
+      var id = ref.dataset.copyMemoryId || '';
+      if (!id) { return; }
+      // Optimistic toast — the write effectively never fails for a short plain
+      // string, matching the sidebar copy path (SidebarScriptBuilder). Swallow
+      // any rejection so we never surface an unhandled promise, and don't gate
+      // the toast on it (the old .then(done, done) also fired on failure).
+      navigator.clipboard.writeText(id).catch(function() {});
+      showMemoryCopyToast(id + ' copied');
+      // Telemetry-only ping — the clipboard write already happened here in the
+      // webview; the host just counts it (memory_ref_id_copied).
+      vscode.postMessage({ command: 'trackMemoryRefIdCopied' });
+    }
+    ref.addEventListener('click', copyRefId);
+    // The chip is role=button/tabindex=0, so it must also answer the keyboard.
+    ref.addEventListener('keydown', function(e) {
+      if (e.key !== 'Enter' && e.key !== ' ') { return; }
+      e.preventDefault();
+      copyRefId();
+    });
+  });
+  function showMemoryCopyToast(text) {
+    var t = document.getElementById('jm-copy-toast');
+    if (!t) {
+      t = document.createElement('div');
+      t.id = 'jm-copy-toast';
+      t.className = 'copy-toast';
+      document.body.appendChild(t);
+    }
+    t.textContent = text;
+    t.classList.add('show');
+    if (t._hideTimer) { clearTimeout(t._hideTimer); }
+    t._hideTimer = setTimeout(function() { t.classList.remove('show'); }, 1500);
+  }
+
   // Copy Markdown button with brief visual feedback
   var copyBtn = document.getElementById('copyMdBtn');
   if (copyBtn) {

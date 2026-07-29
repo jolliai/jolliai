@@ -114,6 +114,26 @@ object SummaryUtils {
 
     // ── Title builders ─────────────────────────────────────────────────────
 
+    /** Display prefix for a memory reference id. Mirrors cli/src/core/MemoryRefId.ts. */
+    const val MEMORY_REF_PREFIX = "JM-"
+
+    /**
+     * Formats a memory's human-facing reference id (`JM-<docId>`) from the Jolli
+     * Space doc id the web backend mints on a successful push (`jolliDocId`), or
+     * null when the memory has none — unsynced, or a non-positive id. TS port:
+     * cli/src/core/MemoryRefId.ts (keep the two in lockstep).
+     */
+    fun formatMemoryRefId(jolliDocId: Int?): String? =
+        if (jolliDocId != null && jolliDocId > 0) "$MEMORY_REF_PREFIX$jolliDocId" else null
+
+    /**
+     * Like [formatMemoryRefId] but always returns a value: when the memory has no
+     * backend doc id yet (unsynced), falls back to the first 8 chars of the commit
+     * hash — e.g. `JM-f159924c`. TS port: cli/src/core/MemoryRefId.ts.
+     */
+    fun formatMemoryRefIdWithHashFallback(jolliDocId: Int?, commitHash: String): String =
+        formatMemoryRefId(jolliDocId) ?: "$MEMORY_REF_PREFIX${commitHash.take(8)}"
+
     /** Regex fallback: extracts ticket from commit message or branch. */
     private fun extractTicketFallback(commitMessage: String, branch: String): String? {
         val pattern = Regex("[A-Z][A-Z0-9]+-\\d+")

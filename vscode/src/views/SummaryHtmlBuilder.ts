@@ -29,6 +29,7 @@ import type {
 	SourceId,
 	TopicCategory,
 } from "../../../cli/src/Types.js";
+import { formatMemoryRefIdWithHashFallback } from "../../../cli/src/core/MemoryRefId.js";
 import { annotatePlans } from "../util/PlanGrouping.js";
 import { getSourceMeta, sourceClassToken } from "./SourceLabels.js";
 import { buildCss } from "./SummaryCssBuilder.js";
@@ -467,8 +468,14 @@ function buildBackfillBadge(summary: CommitSummary): string {
  */
 export function buildPageTitleAndMetaStrip(summary: CommitSummary): string {
 	const shortHash = escHtml(summary.commitHash.substring(0, 8));
+	// Always shown: the backend doc id (JM-142) once synced, else a JM-<short
+	// hash> fallback (JM-f159924c) so every memory has a visible reference.
+	const refId = formatMemoryRefIdWithHashFallback(summary.jolliDocId, summary.commitHash);
+	// role/tabindex + the Enter-Space handler in SummaryScriptBuilder make the chip
+	// keyboard-reachable; a bare click-only <span> would strand keyboard users.
+	const refPrefix = `<span class="page-title-ref" role="button" tabindex="0" aria-label="Copy memory ID ${escAttr(refId)}" title="Memory ID — click to copy" data-copy-memory-id="${escAttr(refId)}">${escHtml(refId)}:</span> `;
 	return `
-<h1 class="page-title">${escHtml(summary.commitMessage)}</h1>
+<h1 class="page-title">${refPrefix}${escHtml(summary.commitMessage)}</h1>
 <div class="meta-strip">
   <span class="meta-hash">${shortHash}</span>
   <span class="meta-sep">&middot;</span>

@@ -982,6 +982,34 @@ describe("HistoryTreeProvider.serialize", () => {
 		expect((items[0] as { jolliDocUrl?: string }).jolliDocUrl).toBe("https://team.jolli.app/d/42");
 	});
 
+	it("serialize sets memoryRefId (JM-<docId>) from lookupSummary when the memory is synced", async () => {
+		const commit = { ...makeCommit("abcd1234efgh5678"), hasSummary: true };
+		const bridge = makeBridge(() => makeResult([commit]));
+		const store = new CommitsStore(bridge as never);
+		const provider = new HistoryTreeProvider(store, async (hash) =>
+			hash === "abcd1234efgh5678" ? { jolliDocId: 142 } : null,
+		);
+
+		await store.refresh();
+		const items = await provider.serialize();
+
+		expect((items[0] as { memoryRefId?: string }).memoryRefId).toBe("JM-142");
+	});
+
+	it("serialize omits memoryRefId when the memory has no jolliDocId", async () => {
+		const commit = { ...makeCommit("abcd1234efgh5678"), hasSummary: true };
+		const bridge = makeBridge(() => makeResult([commit]));
+		const store = new CommitsStore(bridge as never);
+		const provider = new HistoryTreeProvider(store, async (_hash) => ({
+			jolliDocUrl: "https://team.jolli.app/d/7",
+		}));
+
+		await store.refresh();
+		const items = await provider.serialize();
+
+		expect((items[0] as { memoryRefId?: string }).memoryRefId).toBeUndefined();
+	});
+
 	it("serialize omits jolliDocUrl when commit has no memory", async () => {
 		const commit = { ...makeCommit("h1"), hasSummary: false };
 		const bridge = makeBridge(() => makeResult([commit]));

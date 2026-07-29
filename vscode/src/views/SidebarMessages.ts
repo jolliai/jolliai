@@ -159,6 +159,14 @@ export interface SerializedTreeItem {
 	readonly id: string;
 	readonly label: string;
 	readonly description?: string;
+	/**
+	 * Preformatted memory reference id (e.g. `"JM-142"`), derived host-side from
+	 * the summary's `jolliDocId`. Present only for committed-memory rows that have
+	 * been synced to a Jolli Space. The webview renders it verbatim as a prefix
+	 * badge before the commit title (it cannot format it itself — the sidebar
+	 * script is a bundled string with no module imports).
+	 */
+	readonly memoryRefId?: string;
 	readonly iconKey?: string;
 	readonly iconColor?: string;
 	readonly tooltip?: string;
@@ -713,6 +721,14 @@ export type SidebarOutboundMsg =
 			readonly type: "command";
 			readonly command: string;
 			readonly args?: ReadonlyArray<unknown>;
+	  }
+	| {
+			// Copy an arbitrary short string to the OS clipboard. Used by the
+			// memory reference-id (JM-<docId>) badge — the webview can't reliably
+			// reach the clipboard itself, so the host writes it. The webview shows
+			// its own inline toast; no host response is needed.
+			readonly type: "copyText";
+			readonly text: string;
 	  }
 	| {
 			readonly type: "refresh";

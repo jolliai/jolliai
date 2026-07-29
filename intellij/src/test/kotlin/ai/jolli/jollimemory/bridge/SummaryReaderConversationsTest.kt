@@ -1,6 +1,7 @@
 package ai.jolli.jollimemory.bridge
 
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 
@@ -72,6 +73,108 @@ class SummaryReaderConversationsTest {
             rows.map { it.source } shouldBe listOf("claude", "cursor")
             rows[1].messageCount shouldBe 0
             rows[1].title shouldBe "Cursor session"
+        }
+
+        /**
+         * Gson returns JsonNull — not Kotlin null — for `"role": null`, so `?.asString`
+         * does not short-circuit and throws. Unguarded, that exception is caught by
+         * parseConversations and blanks the WHOLE list.
+         */
+        @Test
+        fun `an explicit null role or content does not blank the conversation list`() {
+            val json = """
+                {"sessions":[
+                  {"sessionId":"s1","source":"claude","entries":[
+                    {"role":null,"content":"x"},
+                    {"role":"human","content":null},
+                    {"role":"human","content":"real turn"}
+                  ]}
+                ]}
+            """.trimIndent()
+            val rows = SummaryReader.parseConversations(json)
+            rows.size shouldBe 1
+            rows[0].messageCount shouldBe 3
+            // Falls through the two null-bearing turns to the first usable human line.
+            rows[0].title shouldBe "real turn"
+        }
+
+        @Test
+        fun `an explicit null source or sessionId falls back instead of dropping the row`() {
+            val json = """{"sessions":[{"sessionId":null,"source":null,"entries":[]}]}"""
+            val rows = SummaryReader.parseConversations(json)
+            rows.size shouldBe 1
+            rows[0].source shouldBe "ai"
+            rows[0].sessionId shouldBe ""
+            rows[0].transcriptPath shouldBe null
+        }
+    }
+
+    @Nested
+    inner class ParseSummaryBrief {
+        private val full = """
+            {"commitHash":"abc12345def","commitMessage":"Fix login","commitAuthor":"Ada",
+             "commitDate":"2026-07-01","topics":[{"t":1},{"t":2}],"jolliDocId":142}
+        """.trimIndent()
+
+        @Test
+        fun `parses every field and derives the short hash`() {
+            val brief = SummaryReader.parseSummaryBrief(full)!!
+            brief.hash shouldBe "abc12345def"
+            brief.shortHash shouldBe "abc12345"
+            brief.message shouldBe "Fix login"
+            brief.author shouldBe "Ada"
+            brief.date shouldBe "2026-07-01"
+            brief.topicCount shouldBe 2
+            brief.hasSummary shouldBe true
+            brief.jolliDocId shouldBe 142
+        }
+
+        @Test
+        fun `null blank or malformed input yields null rather than throwing`() {
+            SummaryReader.parseSummaryBrief(null) shouldBe null
+            SummaryReader.parseSummaryBrief("") shouldBe null
+            SummaryReader.parseSummaryBrief("   ") shouldBe null
+            SummaryReader.parseSummaryBrief("{not json") shouldBe null
+        }
+
+        /**
+         * The regression this guards: Gson returns JsonNull for `"jolliDocId": null`, so
+         * `obj.get("jolliDocId")?.asInt` does not short-circuit and throws
+         * UnsupportedOperationException. Caught by the parse, that dropped the ENTIRE
+         * summary — one stray null field silently removed a memory from the list.
+         */
+        @Test
+        fun `an explicit null jolliDocId yields a row with no doc id, not a dropped summary`() {
+            val json = """{"commitHash":"abc12345def","commitMessage":"Fix login","jolliDocId":null}"""
+            val brief = SummaryReader.parseSummaryBrief(json)
+            brief shouldNotBe null
+            brief!!.hash shouldBe "abc12345def"
+            brief.jolliDocId shouldBe null
+        }
+
+        @Test
+        fun `an explicit null on any string field falls back to empty, not a dropped summary`() {
+            val json = """
+                {"commitHash":null,"commitMessage":null,"commitAuthor":null,
+                 "commitDate":null,"topics":null,"jolliDocId":null}
+            """.trimIndent()
+            val brief = SummaryReader.parseSummaryBrief(json)
+            brief shouldNotBe null
+            brief!!.hash shouldBe ""
+            brief.shortHash shouldBe ""
+            brief.message shouldBe ""
+            brief.author shouldBe ""
+            brief.date shouldBe ""
+            brief.topicCount shouldBe 0
+            brief.jolliDocId shouldBe null
+        }
+
+        @Test
+        fun `absent optional fields behave the same as explicit nulls`() {
+            val brief = SummaryReader.parseSummaryBrief("""{"commitHash":"abc12345def"}""")!!
+            brief.message shouldBe ""
+            brief.topicCount shouldBe 0
+            brief.jolliDocId shouldBe null
         }
     }
 }

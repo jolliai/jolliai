@@ -54,6 +54,9 @@ object TelemetryEvents {
             "memory_item_opened" to "An item inside a memory was opened. Props: item_type (discriminator: conversation/file/plan/note/reference/shipped); render (conversation only: live/stored); source (conversation only: transcript source); status (file only: git status code).",
             "session_resumed" to "A conversation session was resumed in a terminal. Props: source (discriminator).",
             "recall_prompt_copied" to "A recall prompt was copied to the clipboard. Props: none.",
+            "memory_ref_id_copied" to
+                "A memory reference id (JM-<docId>) was copied to the clipboard. " +
+                "Props: surface_area (discriminator: list/detail — which UI the chip was clicked in).",
             "memory_pinned" to "An item was pinned. Props: kind (discriminator).",
             "memory_unpinned" to "An item was unpinned. Props: kind (discriminator).",
             "repo_switched" to "User switched the active repo in the tool window's breadcrumb. Props: is_foreign (bool).",

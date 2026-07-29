@@ -17,6 +17,7 @@
 
 import { basename } from "node:path";
 import * as vscode from "vscode";
+import { formatMemoryRefId } from "../../../cli/src/core/MemoryRefId.js";
 import type { CommitsStore } from "../stores/CommitsStore.js";
 import type { BranchCommit, CommitFileInfo } from "../Types.js";
 import { formatShortRelativeDate } from "../util/FormatUtils.js";
@@ -166,13 +167,17 @@ export class HistoryTreeProvider
 	 */
 	private readonly lookupSummary?: (
 		hash: string,
-	) => Promise<{ jolliDocUrl?: string; e2eCount?: number; conversationTokens?: number } | null | undefined>;
+	) => Promise<
+		{ jolliDocUrl?: string; e2eCount?: number; conversationTokens?: number; jolliDocId?: number } | null | undefined
+	>;
 
 	constructor(
 		private readonly store: CommitsStore,
 		lookupSummary?: (
 			hash: string,
-		) => Promise<{ jolliDocUrl?: string; e2eCount?: number; conversationTokens?: number } | null | undefined>,
+		) => Promise<
+			{ jolliDocUrl?: string; e2eCount?: number; conversationTokens?: number; jolliDocId?: number } | null | undefined
+		>,
 	) {
 		this.lookupSummary = lookupSummary;
 		this.unsubscribe = store.onChange((snap) => {
@@ -274,14 +279,18 @@ export class HistoryTreeProvider
 			let jolliDocUrl: string | undefined;
 			let e2eCount: number | undefined;
 			let conversationTokens: number | undefined;
+			let memoryRefId: string | undefined;
 			if (item.commit.hasSummary && this.lookupSummary) {
 				try {
 					const s = await this.lookupSummaryMemoized(item.commit.hash, memo);
 					jolliDocUrl = s?.jolliDocUrl;
 					e2eCount = s?.e2eCount;
 					conversationTokens = s?.conversationTokens;
+					// Preformatted here (host-side) because the sidebar webview is a
+					// bundled string and cannot import formatMemoryRefId itself.
+					memoryRefId = formatMemoryRefId(s?.jolliDocId);
 				} catch {
-					// Graceful fallback — leave all three fields undefined so the row
+					// Graceful fallback — leave all four fields undefined so the row
 					// renders in a degraded-but-safe state. Matches the per-commit
 					// getChildren degradation pattern (line ~291).
 				}
@@ -294,6 +303,7 @@ export class HistoryTreeProvider
 				...(jolliDocUrl !== undefined && { jolliDocUrl }),
 				...(e2eCount !== undefined && { e2eCount }),
 				...(conversationTokens !== undefined && { conversationTokens }),
+				...(memoryRefId !== undefined && { memoryRefId }),
 			};
 		} else {
 			// CommitFileItem: surface the four fields needed to dispatch

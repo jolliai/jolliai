@@ -97,8 +97,72 @@ $rootVars
     color: var(--text-primary);
     letter-spacing: -0.01em;
   }
+  /* Memory reference id (JM-<docId>) prefixing the title — monospace + muted so
+     it reads as an identifier badge without competing with the commit message.
+     Clickable: click copies the id, the tooltip hints at it. */
+  .page-title-ref {
+    font-family: monospace;
+    font-weight: 500;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+  .page-title-ref:hover {
+    color: var(--text-primary);
+    text-decoration: underline;
+  }
+  .page-title-ref:focus-visible {
+    outline: 1px solid var(--focus-border);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+  /* Transient "copied" toast (memory-id copy), pinned bottom-center. Fades in on
+     .show (added by showMemoryCopyToast) and out ~1.5s later. Floats over arbitrary
+     page content, so it uses the OPAQUE --overlay-* tokens, not --panel-inner (see
+     the token block for why translucent surfaces don't work for floating elements). */
+  .copy-toast {
+    position: fixed;
+    left: 50%;
+    bottom: 16px;
+    transform: translateX(-50%) translateY(8px);
+    background: var(--overlay-bg);
+    color: var(--overlay-fg);
+    border: 1px solid var(--overlay-border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s ease, transform 0.15s ease;
+    z-index: 1000;
+  }
+  .copy-toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+  /* In-document tooltip: JCEF does not surface native HTML `title` tooltips, so
+     hover hints (e.g. the JM- reference id) are rendered here instead. Shown by the
+     delegated hover handler in SummaryScriptBuilder. */
+  .jm-tooltip {
+    position: fixed;
+    z-index: 2000;
+    max-width: 320px;
+    padding: 4px 8px;
+    border: 1px solid var(--tooltip-border);
+    border-radius: 4px;
+    background: var(--tooltip-bg);
+    color: var(--tooltip-fg);
+    font-size: 11px;
+    line-height: 1.4;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.1s ease;
+  }
+  .jm-tooltip.show { opacity: 1; }
   /* ── Export dropdown (Copy / Save as Markdown) ── */
   .export-menu-group { position: relative; display: inline-block; }
+  /* Also a floating overlay (absolute, over page content) → opaque --overlay-* tokens. */
   .split-menu {
     display: none;
     position: absolute;
@@ -107,9 +171,9 @@ $rootVars
     z-index: 30;
     min-width: 180px;
     padding: 4px;
-    border: 1px solid var(--border-light);
+    border: 1px solid var(--overlay-border);
     border-radius: 8px;
-    background: var(--panel-inner);
+    background: var(--overlay-bg);
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
   }
   .split-menu.open { display: block; }
@@ -774,7 +838,7 @@ $rootVars
     top: 12px;
     bottom: 12px;
     width: 2px;
-    background: var(--border-light);
+    background: var(--timeline-line);
     border-radius: 1px;
   }
   .timeline-group {
@@ -800,7 +864,7 @@ $rootVars
     width: 10px;
     height: 10px;
     border-radius: 50%;
-    background: var(--text-tertiary);
+    background: var(--timeline-dot-bg);
     border: 2px solid var(--bg);
     z-index: 1;
   }
@@ -1667,6 +1731,11 @@ ${ShareWebview.css()}
     /* ── Surface / borders ── */
     --surface-hover: rgba(255, 255, 255, 0.035);
     --border-light: rgba(255, 255, 255, 0.06);
+    /* Opaque sibling of --border-light for the timeline spine (position: absolute) — a
+       translucent background on a floating element trips the opaque-overlay guard. */
+    --timeline-line: #3a3d41;
+    /* Opaque equivalent of --text-tertiary for the absolute-positioned timeline dot. */
+    --timeline-dot-bg: #6e6e6e;
     --text-secondary: rgba(255, 255, 255, 0.45);
     --text-tertiary: rgba(255, 255, 255, 0.30);
     --prop-label: rgba(255, 255, 255, 0.40);
@@ -1699,7 +1768,23 @@ ${ShareWebview.css()}
     --panel-bg: rgba(255, 255, 255, 0.018);
     --panel-inner: rgba(255, 255, 255, 0.045);
     --ship-ok: #4ece8d;
-    --ship-warn: #e0ac2b;"""
+    --ship-warn: #e0ac2b;
+    /* ── Floating-overlay tokens (must be OPAQUE) ──
+       The surface tokens above (--panel-bg / --panel-inner / --surface-hover) are 1.5–4.5%
+       alpha. That works for elements STACKED on a known background (a card inside a panel),
+       and fails for elements FLOATING over arbitrary content (position: fixed/absolute) —
+       the page shows straight through and the overlay's own text collides with whatever
+       scrolled underneath it. Anything floating uses these instead; the criterion is
+       "does this element sit on a known background, or on unknown content?".
+       --overlay-*: theme-matched opaque surface (toast, dropdown menu) — mirrors VS Code's
+       --vscode-notifications-background. --tooltip-*: deliberately INVERTED high-contrast
+       bubble, a different job from a surface. */
+    --overlay-bg: #3c3f41;
+    --overlay-fg: #e6e6e6;
+    --overlay-border: rgba(255, 255, 255, 0.14);
+    --tooltip-bg: #3c3f41;
+    --tooltip-fg: #e6e6e6;
+    --tooltip-border: rgba(255, 255, 255, 0.14);"""
 
     /** Light theme variable block (matches `body.vscode-light` values). */
     private fun buildLightVars(pageBgHex: String): String = """
@@ -1744,6 +1829,9 @@ ${ShareWebview.css()}
     /* ── Surface / borders ── */
     --surface-hover: rgba(0, 0, 0, 0.028);
     --border-light: rgba(0, 0, 0, 0.06);
+    /* Opaque sibling of --border-light for the timeline spine — see the dark block. */
+    --timeline-line: #d0d0d0;
+    --timeline-dot-bg: #adadad;
     --text-secondary: rgba(0, 0, 0, 0.45);
     --text-tertiary: rgba(0, 0, 0, 0.32);
     --prop-label: rgba(0, 0, 0, 0.42);
@@ -1776,5 +1864,14 @@ ${ShareWebview.css()}
     --panel-bg: rgba(0, 0, 0, 0.015);
     --panel-inner: rgba(0, 0, 0, 0.035);
     --ship-ok: #1b8a4f;
-    --ship-warn: #96680e;"""
+    --ship-warn: #96680e;
+    /* Floating-overlay tokens — see the dark block for the full rationale. --overlay-* is a
+       theme-matched opaque surface (white on a light page); --tooltip-* stays an inverted
+       dark bubble, which is high-contrast and readable over light content. */
+    --overlay-bg: #ffffff;
+    --overlay-fg: #1e1e1e;
+    --overlay-border: rgba(0, 0, 0, 0.18);
+    --tooltip-bg: #2b2d30;
+    --tooltip-fg: #f5f5f5;
+    --tooltip-border: rgba(0, 0, 0, 0.25);"""
 }

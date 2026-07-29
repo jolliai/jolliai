@@ -35,6 +35,7 @@ import {
 } from "../../../cli/src/core/Summarizer.js";
 import { getRepoContributors, type RepoContributor } from "../../../cli/src/core/GitOps.js";
 import { resolveSessionTitle } from "../../../cli/src/core/SessionTitleResolver.js";
+import { track } from "../../../cli/src/core/Telemetry.js";
 import { runWithTrace } from "../../../cli/src/core/TraceContext.js";
 import {
 	getTranscriptHashes as coreGetTranscriptHashes,
@@ -301,6 +302,8 @@ type WebviewMessage =
 	| { command: "shareRemoveRecipient"; email: string; shareKind?: ShareKind }
 	| { command: "openRewrittenCommit"; hash: string }
 	| { command: "loadFiles" }
+	/** Telemetry only — the webview already did the clipboard write itself. */
+	| { command: "trackMemoryRefIdCopied" }
 	| {
 			command: "openFileDiff";
 			path: string;
@@ -369,6 +372,10 @@ const FOREIGN_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set([
 	// foreign or unreachable commit.
 	"loadFiles",
 	"openFileDiff",
+	// Telemetry-only ping for the JM- chip copy. Touches neither git nor storage,
+	// and the reference id belongs to the summary already on screen — safe to
+	// count regardless of which repo the summary came from.
+	"trackMemoryRefIdCopied",
 ]);
 
 function isForeignSafeCommand(command: WebviewMessage["command"]): boolean {
@@ -424,6 +431,9 @@ const REGENERATE_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set
 	// removePlan / translatePlan.
 	"previewReference",
 	"openReferenceExternal",
+	// Telemetry-only ping for the JM- chip copy — no summary write, so it cannot
+	// race the in-flight regenerate's storeSummary.
+	"trackMemoryRefIdCopied",
 	// regenerateSummary itself is denied while one is in flight; the
 	// handler's own `regenerateInProgress` guard short-circuits a re-entry.
 ]);
@@ -1086,6 +1096,9 @@ export class SummaryWebviewPanel {
 					this.openRewrittenCommit(message.hash),
 					"Open rewritten commit failed",
 				);
+				break;
+			case "trackMemoryRefIdCopied":
+				track("memory_ref_id_copied", { surface_area: "detail" });
 				break;
 			case "loadFiles":
 				this.handleLoadFiles().catch((err: unknown) => {

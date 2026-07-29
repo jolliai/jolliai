@@ -499,6 +499,35 @@ describe("SummaryHtmlBuilder", () => {
 			}
 		});
 
+		// Reference id (JM-<docId>) — the Jolli Space doc id the backend mints on
+		// push, surfaced as a Linear-style prefix on the memory title.
+		it("prefixes the page title with the JM-<id> reference id when the memory is synced", () => {
+			const html = buildPageTitleAndMetaStrip(makeSummary({ jolliDocId: 142 }));
+			expect(html).toContain('class="page-title-ref"');
+			// Carries the copy affordance: tooltip + the raw id (no colon) to copy.
+			expect(html).toContain('data-copy-memory-id="JM-142"');
+			expect(html).toContain("JM-142:");
+			// The prefix precedes the commit message inside the <h1>.
+			expect(html.indexOf("JM-142")).toBeLessThan(html.indexOf("feat: add new feature"));
+		});
+
+		it("falls back to JM-<short hash> in the title when the memory has no jolliDocId", () => {
+			// makeSummary's commitHash starts with "abcdef12".
+			const html = buildPageTitleAndMetaStrip(makeSummary({ jolliDocId: undefined }));
+			expect(html).toContain("page-title-ref");
+			expect(html).toContain('data-copy-memory-id="JM-abcdef12"');
+			expect(html).toContain("JM-abcdef12:");
+		});
+
+		// The chip is a click-to-copy control built on a <span>, so the button
+		// semantics have to be declared explicitly or keyboard users can't reach it.
+		it("makes the reference-id chip keyboard-reachable and screen-reader labelled", () => {
+			const html = buildPageTitleAndMetaStrip(makeSummary({ jolliDocId: 142 }));
+			expect(html).toContain('role="button"');
+			expect(html).toContain('tabindex="0"');
+			expect(html).toContain('aria-label="Copy memory ID JM-142"');
+		});
+
 		// ─── Foreign-repo read-only mode ──────────────────────────────────────
 		// When the panel renders a summary that came from a non-current repo
 		// (Memory Bank cross-repo lookup), every destructive control must be

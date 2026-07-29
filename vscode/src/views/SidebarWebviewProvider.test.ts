@@ -44,6 +44,10 @@ const mockExtensionUri = {
 // `projectDir` passed to ConversationDetailsPanel.show). The mock value is an
 // array so tests can mutate the first slot per-case without re-mocking.
 const mockWorkspaceFolders: Array<{ uri: { fsPath: string } }> = [];
+// `env.clipboard.writeText` backs the `copyText` message (JM- reference-id copy).
+const { clipboardWriteText } = vi.hoisted(() => ({
+	clipboardWriteText: vi.fn().mockResolvedValue(undefined),
+}));
 vi.mock("vscode", () => ({
 	Uri: {
 		joinPath: vi.fn((_base: unknown, ...segments: string[]) => ({
@@ -65,6 +69,7 @@ vi.mock("vscode", () => ({
 			return mockWorkspaceFolders.length > 0 ? mockWorkspaceFolders : undefined;
 		},
 	},
+	env: { clipboard: { writeText: clipboardWriteText } },
 }));
 
 // Spy on track() (funnel telemetry, JOLLI-1904) but keep every other real
@@ -147,6 +152,7 @@ describe("SidebarWebviewProvider", () => {
 
 	beforeEach(() => {
 		track.mockClear();
+		clipboardWriteText.mockClear();
 		executeCommand = vi.fn().mockResolvedValue(undefined);
 		provider = new SidebarWebviewProvider({
 			executeCommand: executeCommand as never,
@@ -202,6 +208,50 @@ describe("SidebarWebviewProvider", () => {
 			command: "jollimemory.openSettings",
 		});
 		expect(executeCommand).toHaveBeenCalledWith("jollimemory.openSettings");
+	});
+
+	// ── copyText (JM- reference-id copy from a memory row) ──
+	// Deliberately NOT routed through the command allowlist — it writes a plain
+	// string to the clipboard, it doesn't dispatch a command — so the guard on the
+	// payload is the whole security surface and each of its branches gets a test.
+
+	it("writes a `copyText` payload to the clipboard and counts it", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "copyText", text: "JM-142" });
+		expect(clipboardWriteText).toHaveBeenCalledWith("JM-142");
+		expect(track).toHaveBeenCalledWith("memory_ref_id_copied", { surface_area: "list" });
+	});
+
+	it("never dispatches a command for `copyText` (it is not a command message)", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "copyText", text: "jollimemory.enable" });
+		expect(clipboardWriteText).toHaveBeenCalledWith("jollimemory.enable");
+		expect(executeCommand).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		["an empty string", ""],
+		["a non-string payload", 42 as unknown as string],
+		["a missing payload", undefined as unknown as string],
+		// Blast-radius bound: a webview-side bug that hands over a whole summary
+		// body must not silently replace the user's clipboard with it.
+		["a payload over the 256-char cap", "J".repeat(257)],
+	])("ignores `copyText` with %s", (_label, text) => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "copyText", text } as never);
+		expect(clipboardWriteText).not.toHaveBeenCalled();
+		expect(track).not.toHaveBeenCalledWith("memory_ref_id_copied", expect.anything());
+	});
+
+	it("accepts a `copyText` payload exactly at the 256-char cap", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		const atCap = "J".repeat(256);
+		view.webview.triggerMessage({ type: "copyText", text: atCap });
+		expect(clipboardWriteText).toHaveBeenCalledWith(atCap);
 	});
 
 	// ── JOLLI-1904 funnel telemetry (mirrors IntelliJ event names + props) ──

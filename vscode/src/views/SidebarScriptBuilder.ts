@@ -95,6 +95,28 @@ export function buildSidebarScript(): string {
   }
   function clear(container) { container.replaceChildren(); }
 
+  // Copy a memory reference id (JM-<docId>) to the clipboard via the host, then
+  // flash an inline toast. The host owns the actual clipboard write (webviews
+  // can't reliably reach it); the toast is optimistic — the write effectively
+  // never fails for a short plain string.
+  function copyMemoryId(id) {
+    if (!id) return;
+    vscode.postMessage({ type: 'copyText', text: id });
+    showCopyToast(id + ' copied');
+  }
+  // Transient bottom-center toast, reused across clicks (one node, re-shown).
+  function showCopyToast(text) {
+    let t = document.getElementById('jm-copy-toast');
+    if (!t) {
+      t = el('div', { id: 'jm-copy-toast', className: 'copy-toast' });
+      document.body.appendChild(t);
+    }
+    t.textContent = text;
+    t.classList.add('show');
+    if (t._hideTimer) clearTimeout(t._hideTimer);
+    t._hideTimer = setTimeout(function() { t.classList.remove('show'); }, 1500);
+  }
+
   // Shared back-fill row-label helpers (formatBackfillMeta / formatBackfillResult) —
   // single source of truth with the Settings panel; see BackfillListRenderer.ts.
   ${backfillListRendererSource()}
@@ -5035,8 +5057,37 @@ export function buildSidebarScript(): string {
       twirl,
       leading,
       memIcon,
-      el('span', { className: 'label', text: item.label }),
     ];
+    // Reference-id badge (JM-<docId>) — preformatted host-side and carried on the
+    // serialized item. Present only for memory rows already synced to a Jolli
+    // Space. Clickable chip: hovering shows a copy hint, clicking copies the id
+    // (via the host) and shows an inline "copied" toast. stopPropagation keeps
+    // the click from also toggling / opening the surrounding commit row.
+    // role/tabIndex/Enter-Space make it reachable without a mouse — it's an
+    // interactive control, so a bare <span> + click would strand keyboard users.
+    if (item.memoryRefId) {
+      const refEl = el('span', {
+        className: 'mem-ref',
+        text: item.memoryRefId + ':',
+        title: 'Memory ID — click to copy',
+        role: 'button',
+        tabIndex: 0,
+        'aria-label': 'Copy memory ID ' + item.memoryRefId,
+      });
+      refEl.addEventListener('click', function(e) {
+        e.stopPropagation();
+        e.preventDefault();
+        copyMemoryId(item.memoryRefId);
+      });
+      refEl.addEventListener('keydown', function(e) {
+        if (e.key !== 'Enter' && e.key !== ' ') { return; }
+        e.stopPropagation();
+        e.preventDefault();
+        copyMemoryId(item.memoryRefId);
+      });
+      kids.push(refEl);
+    }
+    kids.push(el('span', { className: 'label', text: item.label }));
     // Plain commit rows show the short date (item.description) inline — it's
     // their only time cue. Committed-memory rows omit it: the relative date
     // already lives in the .mem-subline below the title, so the MM-DD here is

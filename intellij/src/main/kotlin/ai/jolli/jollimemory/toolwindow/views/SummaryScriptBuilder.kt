@@ -77,6 +77,99 @@ object SummaryScriptBuilder {
     });
   });
 
+  // Memory reference-id prefix (JM-<docId>): click copies the id and flashes a
+  // bottom-center toast. clipboard is reachable in this webview (see hash-copy).
+  document.querySelectorAll('.page-title-ref').forEach(function(ref) {
+    function copyRefId() {
+      var id = ref.dataset.copyMemoryId || '';
+      if (!id) { return; }
+      // Optimistic toast, byte-for-byte the VS Code semantics: show it immediately
+      // rather than awaiting the clipboard promise. Waiting (the old
+      // .then(done, done)) delayed the confirmation whenever the clipboard was slow
+      // and still fired on failure, so it bought nothing for the latency it cost.
+      navigator.clipboard.writeText(id).catch(function() {});
+      showMemoryCopyToast(id + ' copied');
+      // Telemetry-only ping — the clipboard write already happened here in the
+      // webview; the host just counts it (memory_ref_id_copied).
+      jmSend({ command: 'trackMemoryRefIdCopied' });
+    }
+    ref.addEventListener('click', copyRefId);
+    // The chip is role=button/tabindex=0, so it must also answer the keyboard.
+    ref.addEventListener('keydown', function(e) {
+      if (e.key !== 'Enter' && e.key !== ' ') { return; }
+      e.preventDefault();
+      copyRefId();
+    });
+  });
+  function showMemoryCopyToast(text) {
+    var t = document.getElementById('jm-copy-toast');
+    if (!t) {
+      t = document.createElement('div');
+      t.id = 'jm-copy-toast';
+      t.className = 'copy-toast';
+      document.body.appendChild(t);
+    }
+    t.textContent = text;
+    t.classList.add('show');
+    if (t._hideTimer) { clearTimeout(t._hideTimer); }
+    t._hideTimer = setTimeout(function() { t.classList.remove('show'); }, 1500);
+  }
+
+  // In-document tooltips: JCEF does not render native HTML `title` tooltips (VS Code,
+  // on Electron, does), so hovering the JM- reference id — and every other titled
+  // control in this panel — showed nothing. Re-create them in the document: lazily
+  // move each element's `title` into data-jm-tip (so no stray native tooltip competes)
+  // and show a positioned bubble after a short hover delay. Delegated so it also covers
+  // content inserted by in-place section updates.
+  (function() {
+    var tip = null, timer = null, curEl = null;
+    function bubble() {
+      if (!tip) { tip = document.createElement('div'); tip.className = 'jm-tooltip'; document.body.appendChild(tip); }
+      return tip;
+    }
+    function hide() {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (tip) { tip.classList.remove('show'); }
+      curEl = null;
+    }
+    function titled(node) {
+      var el = node && node.closest ? node.closest('[title],[data-jm-tip]') : null;
+      if (!el) return null;
+      // A live `title` always wins: cache it into data-jm-tip (refreshing any
+      // stale cache from a previous hover) and strip `title` so the native OS
+      // tooltip doesn't double up. Code that mutates `.title` at runtime (regen
+      // button, delete/restore toggle, plan links) relies on this refresh —
+      // reading data-jm-tip first would pin the first-hover text forever.
+      // Invariant: nothing else in this panel READS `.title` at runtime — once
+      // hovered, an element's hint lives in data-jm-tip, not `.title`. If a future
+      // reader needs it, read data-jm-tip (falling back to `.title`) instead.
+      var live = el.getAttribute('title');
+      if (live) { el.setAttribute('data-jm-tip', live); el.removeAttribute('title'); return el; }
+      var text = el.getAttribute('data-jm-tip');
+      return text ? el : null;
+    }
+    document.addEventListener('mouseover', function(e) {
+      var el = titled(e.target);
+      if (el === curEl) return;
+      hide();
+      if (!el) return;
+      curEl = el;
+      var text = el.getAttribute('data-jm-tip');
+      timer = setTimeout(function() {
+        var t = bubble();
+        t.textContent = text;
+        t.classList.add('show');
+        var r = el.getBoundingClientRect();
+        var left = Math.min(r.left, window.innerWidth - t.offsetWidth - 6);
+        t.style.left = Math.max(6, left) + 'px';
+        t.style.top = (r.bottom + 6) + 'px';
+      }, 350);
+    });
+    document.addEventListener('mouseout', function(e) {
+      if (!e.relatedTarget) hide();
+    });
+  })();
+
   // ── Redesign v2: Details disclosure + panel/card/drawer collapse ──
   var detailsToggle = document.getElementById('detailsToggle');
   if (detailsToggle) {

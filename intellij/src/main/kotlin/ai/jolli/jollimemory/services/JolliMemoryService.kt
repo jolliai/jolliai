@@ -1035,6 +1035,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
             var e2eScenarioCount = 0
             var isSyncedToJolli = false
             var jolliDocUrl: String? = null
+            var jolliDocId: Int? = null
             var conversationTurns: Int? = null
             var contextCount = 0
             if (hash in summaryHashSet) {
@@ -1068,6 +1069,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
                     e2eScenarioCount = summary.e2eTestGuide?.size ?: 0
                     isSyncedToJolli = summary.jolliDocId != null || summary.jolliDocUrl != null
                     jolliDocUrl = summary.jolliDocUrl
+                    jolliDocId = summary.jolliDocId
                     conversationTurns = summary.conversationTurns
                     contextCount = (summary.plans?.size ?: 0) +
                         (summary.notes?.size ?: 0) +
@@ -1102,6 +1104,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
                 e2eScenarioCount = e2eScenarioCount,
                 isSyncedToJolli = isSyncedToJolli,
                 jolliDocUrl = jolliDocUrl,
+                jolliDocId = jolliDocId,
                 conversationTurns = conversationTurns,
                 contextCount = contextCount,
             )

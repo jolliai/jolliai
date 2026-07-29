@@ -177,6 +177,82 @@ describe("SummaryCssBuilder", () => {
 		expect(css).toContain("--callout-detail-label");
 	});
 
+	// ─── Floating overlays must be opaque ─────────────────────────────────
+	// The local surface tokens here (--surface-hover, --callout-*-bg, …) are
+	// 3–10% alpha. Correct for an element STACKED on a known background — a
+	// callout inside a panel composites against the panel. Wrong for an element
+	// FLOATING over arbitrary content (position: fixed/absolute): the page shows
+	// straight through and the overlay's text collides with whatever is scrolled
+	// underneath. Sweep every declaration block rather than the ones we thought
+	// of, so the next floating element that grabs a translucent token fails here
+	// instead of in a screenshot. Mirrors SummaryCssBuilderTest.kt.
+	describe("floating overlays", () => {
+		/**
+		 * Partial alpha only — `0 < a < 1`. Fully `transparent` is deliberately NOT
+		 * flagged: that's a click-catcher scrim (`.share-overlay` is `inset: 0;
+		 * background: transparent`), which paints nothing and carries no text, so
+		 * being see-through is the entire point. The bug this guards is the opposite
+		 * intent — "I wanted a visible surface" plus a token that is almost invisible.
+		 */
+		function isTranslucent(value: string): boolean {
+			const alpha = /(?:rgba|hsla)\([^)]*,\s*([0-9.]+)\s*\)/.exec(value.trim())?.[1];
+			return alpha !== undefined && Number(alpha) > 0 && Number(alpha) < 1;
+		}
+
+		/**
+		 * Innermost declaration blocks only — a body containing `{` is a container
+		 * (`@media`, `body.vscode-dark`), so its inner rules get matched on their own
+		 * and the wrapper is skipped.
+		 */
+		function floatingBlocksWithTranslucentBackground(input: string): string[] {
+			// Strip comments so a preceding /* … */ can't end up in the reported selector.
+			const sheet = input.replace(/\/\*[\s\S]*?\*\//g, "");
+			// Every `--token: value;` in the sheet, for one level of var() resolution.
+			const tokens = new Map<string, string>();
+			for (const m of sheet.matchAll(/--([a-z0-9-]+)\s*:\s*([^;]+);/g)) {
+				tokens.set(m[1], m[2].trim());
+			}
+			const offenders: string[] = [];
+			for (const m of sheet.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+				const selector = m[1].trim();
+				const body = m[2];
+				if (!/position\s*:\s*(fixed|absolute)/.test(body)) continue;
+				const background = /\bbackground(?:-color)?\s*:\s*([^;]+)/.exec(body)?.[1];
+				if (background === undefined) continue;
+				// Only backgrounds that reach for a var(--…) surface token are the bug this
+				// guards. A deliberate inline literal — e.g. a modal backdrop's rgba(0,0,0,0.5)
+				// dimming scrim — is excluded for the same reason a fully `transparent`
+				// click-catcher is: being see-through is the entire point.
+				const ref = /var\(\s*(--[a-z0-9-]+)/.exec(background)?.[1]?.slice(2);
+				if (ref === undefined) continue;
+				const resolved = tokens.get(ref);
+				if (resolved !== undefined && isTranslucent(resolved)) offenders.push(selector);
+			}
+			return offenders;
+		}
+
+		it("no position:fixed/absolute rule paints a translucent background", () => {
+			expect(floatingBlocksWithTranslucentBackground(css)).toEqual([]);
+		});
+
+		it("the sweep flags a floating element that reaches for a translucent token", () => {
+			// Guards the guard — a vacuous sweep would let the original bug back in.
+			const regressed = `
+				:root { --panel-inner: rgba(255, 255, 255, 0.045); }
+				.copy-toast { position: fixed; bottom: 16px; background: var(--panel-inner); }
+			`;
+			expect(floatingBlocksWithTranslucentBackground(regressed)).toContain(".copy-toast");
+		});
+
+		it("the copy toast paints the opaque notifications surface", () => {
+			expect(css).toContain("--vscode-notifications-background");
+		});
+
+		it("gives the reference-id chip a visible focus ring", () => {
+			expect(css).toContain(".page-title-ref:focus-visible");
+		});
+	});
+
 	// ─── Foreign-repo read-only mode ──────────────────────────────────────
 	// SummaryHtmlBuilder marks .page with `foreign-readonly` when the loaded
 	// summary belongs to a non-current repo. The CSS below hides every

@@ -99,6 +99,33 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("Build Knowledge Wiki");
 	});
 
+	// Reference-id chip (JM-<docId>) on synced memory rows. It's a <span> with a
+	// click handler, so the button semantics and the keyboard path have to be
+	// declared explicitly — otherwise the affordance is mouse-only.
+	describe("memory reference-id chip", () => {
+		it("renders the chip with button semantics and a keyboard-reachable tabIndex", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("className: 'mem-ref'");
+			expect(js).toContain("role: 'button'");
+			expect(js).toContain("tabIndex: 0");
+			expect(js).toContain("'aria-label': 'Copy memory ID ' + item.memoryRefId");
+		});
+
+		it("copies on Enter/Space as well as click, without toggling the parent row", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("refEl.addEventListener('keydown'");
+			expect(js).toContain("e.key !== 'Enter' && e.key !== ' '");
+			// stopPropagation on both paths keeps the surrounding commit row from
+			// also opening/toggling when the chip is activated.
+			expect(js).toContain("copyMemoryId(item.memoryRefId)");
+		});
+
+		it("routes the clipboard write through the host via copyText", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("vscode.postMessage({ type: 'copyText', text: id })");
+		});
+	});
+
 	// Regression guards for the Current Branch / Knowledge review findings.
 	// These are substring assertions; the `new Function(...)` parse smoke test
 	// above is what guarantees the surrounding edits stay syntactically valid.

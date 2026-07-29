@@ -17,6 +17,7 @@ import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.escAttr
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.escHtml
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.formatDate
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.formatFullDate
+import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.formatMemoryRefIdWithHashFallback
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.padIndex
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.renderCalloutText
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.timeAgo
@@ -331,12 +332,21 @@ ${buildTranscriptModal()}"""
             """$totalFiles file$filesPlural changed, <span class="stat-add">$totalInsertions insertion$insPlural(+)</span>, <span class="stat-del">$totalDeletions deletion$delPlural(-)</span>"""
         val totalTurns = SummaryTree.aggregateTurns(summary)
         val shortHash = escHtml(summary.commitHash.take(8))
+        // Reference id (JM-<docId>) prefix — the backend doc id once synced, else a
+        // JM-<short hash> fallback so every memory shows a reference. Mirrors the VS
+        // Code detail panel.
+        // role/tabindex + the Enter-Space handler in SummaryScriptBuilder make the chip
+        // keyboard-reachable; a bare click-only <span> would strand keyboard users.
+        val refId = formatMemoryRefIdWithHashFallback(summary.jolliDocId, summary.commitHash)
+        val refPrefix =
+            """<span class="page-title-ref" role="button" tabindex="0" aria-label="Copy memory ID ${escAttr(refId)}" """ +
+                """title="Memory ID — click to copy" data-copy-memory-id="${escAttr(refId)}">${escHtml(refId)}:</span> """
 
         // Meta strip mirrors the VS Code detail view: hash · branch · date, then the
         // Details toggle and the Share link + Export actions on the same line (author,
         // line-change counts, and conversation turns live in the collapsed Details table).
         return """
-<h1 class="page-title">${escHtml(summary.commitMessage)}</h1>
+<h1 class="page-title">$refPrefix${escHtml(summary.commitMessage)}</h1>
 <div class="meta-strip">
   <span class="meta-hash">$shortHash</span>
   <span class="meta-sep">&middot;</span>

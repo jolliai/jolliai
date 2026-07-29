@@ -97,6 +97,47 @@ export function buildCss(): string {
     color: var(--vscode-foreground);
     letter-spacing: -0.01em;
   }
+  /* Memory reference id (JM-<docId>) prefixing the title — monospace + muted so
+     it reads as an identifier prefix without competing with the commit message.
+     Clickable: click copies the id, the tooltip hints at it. */
+  .page-title-ref {
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-weight: 500;
+    color: var(--vscode-descriptionForeground);
+    cursor: pointer;
+  }
+  .page-title-ref:hover {
+    color: var(--vscode-foreground);
+    text-decoration: underline;
+  }
+  .page-title-ref:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+  /* Transient "copied" toast (memory-id copy), pinned bottom-center. Fades in on
+     .show (added by showMemoryCopyToast) and out ~1.5s later. */
+  .copy-toast {
+    position: fixed;
+    left: 50%;
+    bottom: 16px;
+    transform: translateX(-50%) translateY(8px);
+    background: var(--vscode-notifications-background, var(--vscode-editorWidget-background));
+    color: var(--vscode-notifications-foreground, var(--vscode-foreground));
+    border: 1px solid var(--vscode-notifications-border, var(--vscode-editorWidget-border));
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s ease, transform 0.15s ease;
+    z-index: 1000;
+  }
+  .copy-toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
   .action-btn {
     font-family: var(--vscode-font-family);
     font-size: 0.8em;

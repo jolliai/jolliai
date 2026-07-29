@@ -133,6 +133,29 @@ describe("SummaryScriptBuilder", () => {
 		expect(script).toContain("navigator.clipboard.writeText");
 	});
 
+	// Reference-id chip (JM-<docId>) click-to-copy. The chip is a <span> carrying
+	// role=button/tabindex=0, so it must answer Enter/Space as well as click — and
+	// the toast is deliberately optimistic (not awaiting the clipboard promise), the
+	// same semantics as the sidebar path.
+	it("wires the reference-id chip to copy on click and on Enter/Space", () => {
+		expect(script).toContain("querySelectorAll('.page-title-ref')");
+		expect(script).toContain("addEventListener('click', copyRefId)");
+		expect(script).toContain("addEventListener('keydown'");
+		expect(script).toContain("e.key !== 'Enter' && e.key !== ' '");
+	});
+
+	it("shows the copy toast optimistically rather than awaiting the clipboard", () => {
+		// `.catch(…)` swallows the rejection; the toast call must NOT be chained off a
+		// .then(), which would delay confirmation whenever the clipboard is slow.
+		expect(script).toContain("navigator.clipboard.writeText(id).catch(function() {});");
+		expect(script).toContain("showMemoryCopyToast(id + ' copied')");
+		expect(script).not.toMatch(/writeText\(id\)\s*\.then\(/);
+	});
+
+	it("pings the host so the copy is counted (memory_ref_id_copied)", () => {
+		expect(script).toContain("vscode.postMessage({ command: 'trackMemoryRefIdCopied' })");
+	});
+
 	it("contains Copy Markdown button handler", () => {
 		expect(script).toContain("copyMdBtn");
 		expect(script).toContain("copyMarkdown");

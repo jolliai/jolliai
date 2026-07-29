@@ -79,6 +79,7 @@ disk **before** they are sent.
 | `memory_item_opened` | An item inside a memory was opened. Props: item_type (discriminator: conversation/file/plan/note/reference/shipped); render (conversation only: live/stored — whether the source transcript was reopened or the stored copy was shown); source (conversation only: the transcript source, e.g. claude/codex); status (file only: the git status code, e.g. A/M/D). |
 | `session_resumed` | A conversation session was resumed in a terminal. Props: source (discriminator). |
 | `recall_prompt_copied` | A recall prompt was copied to the clipboard. Props: none. |
+| `memory_ref_id_copied` | A memory reference id (JM-<docId>) was copied to the clipboard. Props: surface_area (discriminator: list/detail — which UI the chip was clicked in). |
 | `memory_pinned` | An item was pinned. Props: kind (discriminator). |
 | `memory_unpinned` | An item was unpinned. Props: kind (discriminator). |
 | `repo_switched` | User switched the active repo in the tool window's breadcrumb. Props: is_foreign (bool). |

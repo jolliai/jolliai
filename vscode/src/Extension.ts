@@ -776,6 +776,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		const tokens = aggregateConversationTokens(s);
 		return {
 			jolliDocUrl: s.jolliDocUrl,
+			jolliDocId: s.jolliDocId,
 			e2eCount: s.e2eTestGuide?.length,
 			...(tokens > 0 && { conversationTokens: tokens }),
 		};

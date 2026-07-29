@@ -12,6 +12,7 @@ import com.google.gson.Gson
 import ai.jolli.jollimemory.services.CommitFileInfo
 import ai.jolli.jollimemory.services.JolliMemoryService
 import ai.jolli.jollimemory.services.PrService
+import ai.jolli.jollimemory.toolwindow.views.SummaryUtils
 import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffManager
 import com.intellij.diff.requests.SimpleDiffRequest
@@ -773,6 +774,10 @@ class CommitsPanel(
         val displayMessage = commit.message.ifBlank { commit.shortHash }
         val pushedBadge = if (commit.isPushed) " \u2601" else ""
         val typeBadge = if (commit.commitType != null) " [${commit.commitType}]" else ""
+        // Memory rows carry a `JM-<docId>` reference prefix ONLY once the memory is synced
+        // to a Jolli Space (no short-hash fallback) \u2014 matching the VS Code sidebar/history
+        // tree, which sets memoryRefId = formatMemoryRefId(jolliDocId). Unsynced memories and
+        // code-only commits get no prefix. (The detail panel still shows the hash fallback.)
         val titleLabel = JTextArea("$displayMessage$pushedBadge$typeBadge").apply {
             // Wrapping title so long commit messages wrap and grow the row instead of
             // clipping. Styled like a label at the mockup's 12px (base − 1).
@@ -786,6 +791,39 @@ class CommitsPanel(
             font = JBUI.Fonts.label().let { it.deriveFont(it.size2D - 1f) }
             alignmentX = Component.LEFT_ALIGNMENT
             cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        }
+
+        // Memory reference id (JM-<docId>) chip — synced-only, mirroring VS Code's `.mem-ref`:
+        // a muted monospace, clickable "JM-142:" prefix that copies the id (and does NOT open
+        // the row). Only memory rows synced to a Jolli Space carry a docId; unsynced and
+        // code-only commits get no chip. Placed at the top-left of the wrapping title so
+        // continuation lines hang-indent under the first title char, like VS Code's flex row.
+        val refId = if (commit.hasSummary) SummaryUtils.formatMemoryRefId(commit.jolliDocId) else null
+        val refChip: JLabel? = refId?.let { id ->
+            JLabel("$id:").apply {
+                font = java.awt.Font(java.awt.Font.MONOSPACED, java.awt.Font.PLAIN, (JBUI.Fonts.label().size2D - 1f).toInt())
+                val dim = UIManager.getColor("Component.infoForeground") ?: Color.GRAY
+                foreground = dim
+                verticalAlignment = SwingConstants.TOP
+                toolTipText = "Memory ID — click to copy"
+                cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                border = JBUI.Borders.emptyRight(4)
+                addMouseListener(object : MouseAdapter() {
+                    override fun mouseClicked(e: MouseEvent) {
+                        // The chip is never registered with `rowClickListener` (see below), so a
+                        // click here can't open the row anyway — just copy the id.
+                        if (SwingUtilities.isLeftMouseButton(e)) {
+                            copyMemoryId(id, this@apply)
+                        }
+                    }
+                    override fun mouseEntered(e: MouseEvent) {
+                        foreground = UIManager.getColor("Component.foreground") ?: dim
+                    }
+                    override fun mouseExited(e: MouseEvent) {
+                        foreground = dim
+                    }
+                })
+            }
         }
 
         // Sub-line: "<relative time> \u00b7 <shortHash> \u00b7 <token spend>".
@@ -826,11 +864,25 @@ class CommitsPanel(
             }
         }
 
+        // Ref chip (when present) sits WEST, top-aligned, with the wrapping title in CENTER so
+        // continuation lines hang-indent under the first title char. Without a chip the title
+        // spans the full width directly.
+        val titleRow: JComponent = if (refChip != null) {
+            JPanel(BorderLayout(0, 0)).apply {
+                isOpaque = false
+                alignmentX = Component.LEFT_ALIGNMENT
+                add(refChip, BorderLayout.WEST)
+                add(titleLabel, BorderLayout.CENTER)
+            }
+        } else {
+            titleLabel
+        }
+
         val centerPanel = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = false
             alignmentX = Component.LEFT_ALIGNMENT
-            add(titleLabel)
+            add(titleRow)
             add(subLabel)
         }
 
@@ -862,7 +914,10 @@ class CommitsPanel(
                 val ins = insets
                 val cW = (w - ins.left - ins.right - leftPanel.preferredSize.width - rightPanel.preferredSize.width - 2 * 2)
                     .coerceAtLeast(JBUI.scale(20))
-                titleLabel.setSize(cW, Short.MAX_VALUE.toInt())
+                // The ref chip (if any) occupies WEST of the title row, so the wrapping title
+                // measures against the remaining width — otherwise the last line would clip.
+                val refW = refChip?.preferredSize?.width ?: 0
+                titleLabel.setSize((cW - refW).coerceAtLeast(JBUI.scale(20)), Short.MAX_VALUE.toInt())
                 val centerH = titleLabel.preferredSize.height + subLabel.preferredSize.height
                 val h = maxOf(centerH, leftPanel.preferredSize.height, rightPanel.preferredSize.height)
                 return Dimension(base.width, h + ins.top + ins.bottom)
@@ -969,7 +1024,7 @@ class CommitsPanel(
                 scheduleHoverDismiss()
             }
         }
-        for (child in listOf(arrowLabel, titleLabel, subLabel, leftPanel, rightPanel, topLine, row)) {
+        for (child in listOfNotNull(arrowLabel, titleLabel, subLabel, leftPanel, rightPanel, topLine, row, refChip)) {
             child.addMouseListener(hoverListener)
         }
         rowActions.forEach { it.addMouseListener(hoverListener) }
@@ -1988,6 +2043,31 @@ class CommitsPanel(
     }
 
     // ─── Copy recall prompt ──────────────────────────────────────────────────
+
+    /**
+     * Copies a memory reference id (e.g. "JM-142") to the system clipboard and flashes a
+     * short confirmation balloon under the clicked chip. Mirrors the VS Code sidebar's
+     * click-to-copy affordance on the JM- prefix.
+     */
+    private fun copyMemoryId(refId: String, anchor: JComponent) {
+        Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(refId), null)
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+            "memory_ref_id_copied",
+            mapOf("surface_area" to "list"),
+        )
+        com.intellij.openapi.ui.popup.JBPopupFactory.getInstance()
+            .createHtmlTextBalloonBuilder(
+                "Copied <b>${com.intellij.openapi.util.text.StringUtil.escapeXmlEntities(refId)}</b>",
+                com.intellij.openapi.ui.MessageType.INFO,
+                null,
+            )
+            .setFadeoutTime(1500)
+            .createBalloon()
+            .show(
+                com.intellij.ui.awt.RelativePoint.getSouthOf(anchor),
+                com.intellij.openapi.ui.popup.Balloon.Position.below,
+            )
+    }
 
     /**
      * Copies the recall prompt to clipboard for a commit hash.
