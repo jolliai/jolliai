@@ -6,6 +6,7 @@
 
 import type { ClineScanError } from "./core/ClineTranscriptShared.js";
 import type { CopilotChatScanError } from "./core/CopilotChatTranscriptReader.js";
+import type { MemoryBankState } from "./core/KBTypes.js";
 import type { SqliteScanError } from "./core/SqliteHelpers.js";
 
 /**
@@ -1133,6 +1134,16 @@ export interface JolliMemoryConfig {
 	/** Absolute path to the user-chosen Memory Bank folder (mirrors orphan-branch
 	 *  artifacts to disk when storageMode is "folder" or "dual-write"). */
 	readonly localFolder?: string;
+	/**
+	 * Which `StorageProvider` the factories build (default: `"dual-write"`).
+	 * Any other value degrades to orphan-only — both `StorageFactory` and
+	 * `ReadStorageResolver` fall through to `OrphanBranchStorage` on an
+	 * unrecognized mode, so `resolveMemoryBankState` reports it as such.
+	 *
+	 * Declared here (rather than read as an untyped extra) because it is now
+	 * surfaced to users through the `Memory Bank:` status row.
+	 */
+	readonly storageMode?: "orphan" | "dual-write" | "folder";
 	/** OAuth auth token from browser login (stored by `jolli auth login`) */
 	readonly authToken?: string;
 	/**
@@ -1462,6 +1473,14 @@ export interface StatusInfo {
 	 * run on next opportunity (worker startup or explicit `jolli migrate`).
 	 */
 	readonly schemaV5?: "in-progress" | "completed" | "failed";
+	/**
+	 * Where folder-layer writes land — the `Memory Bank:` row in `jolli status`,
+	 * the MCP `status` tool, and the VS Code Settings → Memory Bank tab.
+	 *
+	 * Always present (unlike `schemaV5`): the whole point is that a degraded
+	 * folder layer used to be invisible, so "no field" must not be a state.
+	 */
+	readonly memoryBank: MemoryBankState;
 }
 
 /**

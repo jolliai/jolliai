@@ -9,6 +9,7 @@ import { createLocalAgentCwd } from "./AgentReentry.js";
 import {
 	archiveKBFolder,
 	assertValidLocalFolder,
+	checkClaimable,
 	extractRepoName,
 	findFreshKBPath,
 	findRepoFolders,
@@ -20,6 +21,7 @@ import {
 	isValidLocalFolder,
 	peekKBPath,
 	resolveKBPath,
+	resolveMemoryBankState,
 } from "./KBPathResolver.js";
 
 function git(cwd: string, args: string[]): void {
@@ -1091,19 +1093,130 @@ esac
 			expect(isClaimableProject(kbParent, kbParent)).toBe(false);
 		});
 
-		it("rejects a repo nested inside the Memory Bank parent", () => {
-			const nested = initRepo(join(kbParent, "some-repo"));
-			expect(isClaimableProject(nested, kbParent)).toBe(false);
+		it("rejects a cwd inside the Memory Bank's own git repo", () => {
+			// A per-repo `<bank>/<repo>/` folder is not its own repo — it belongs to
+			// the bank's worktree, so `mainWorktreeRoot` resolves to the bank and the
+			// same overlap check catches it. Without this, `extractRepoName` would
+			// name the folder after the BANK and claim `<bank>/<bankname>/`.
+			initRepo(kbParent);
+			const perRepoFolder = join(kbParent, "some-repo");
+			mkdirSync(perRepoFolder, { recursive: true });
+			expect(isClaimableProject(perRepoFolder, kbParent)).toBe(false);
 		});
 
-		it("compares the Memory Bank parent path case-insensitively on darwin/win32", () => {
+		it("accepts a repo that merely sits under the Memory Bank parent", () => {
+			// The regression this guards: `localFolder` pointed at a directory that
+			// also holds checkouts (~/Documents, a Dropbox root) used to reject every
+			// repo beneath it — silently degrading the whole folder layer to
+			// orphan-only. The repo has its own git identity and the bank is NOT
+			// inside it, so `resolveKBPath` can give it a sibling folder safely.
+			const nested = initRepo(join(kbParent, "some-repo"));
+			expect(isClaimableProject(nested, kbParent)).toBe(true);
+		});
+
+		it("rejects a Memory Bank folder configured INSIDE the repo", () => {
+			// Not caught by the old cwd-under-parent test, and the worse failure of
+			// the two: claiming would scatter generated Markdown through the working
+			// tree of the repo being summarized.
+			const repo = initRepo(join(tempDir, "self-hosting-repo"));
+			expect(isClaimableProject(repo, join(repo, "memory-bank"))).toBe(false);
+		});
+
+		it("compares the overlap case-insensitively on darwin/win32", () => {
 			// Guards the `/Users/x/Documents/Bank` vs `/users/x/documents/bank`
-			// mismatch that would let a nested repo slip past the parent gate.
-			const nested = initRepo(join(kbParent, "cased-repo"));
-			// Case-insensitive platforms see through the upper-cased parent and reject;
+			// mismatch that would let an in-repo bank slip past the overlap check.
+			const repo = initRepo(join(tempDir, "cased-repo"));
+			const insideBank = join(repo, "bank");
+			// Case-insensitive platforms see through the upper-cased path and reject;
 			// case-sensitive ones treat it as an unrelated path and allow the claim.
 			const caseInsensitive = process.platform === "darwin" || process.platform === "win32";
-			expect(isClaimableProject(nested, kbParent.toUpperCase())).toBe(!caseInsensitive);
+			expect(isClaimableProject(repo, insideBank.toUpperCase())).toBe(!caseInsensitive);
+		});
+
+		it("reports the blocker so callers can explain the degradation", () => {
+			const plain = join(tempDir, "verdict-not-a-repo");
+			mkdirSync(plain, { recursive: true });
+			expect(checkClaimable(plain, kbParent)).toEqual({
+				claimable: false,
+				blocker: "not-a-project",
+			});
+
+			const repo = initRepo(join(tempDir, "verdict-repo"));
+			expect(checkClaimable(repo, join(repo, "bank"))).toEqual({
+				claimable: false,
+				blocker: "folder-inside-repo",
+			});
+			expect(checkClaimable(repo, kbParent)).toEqual({ claimable: true });
+		});
+	});
+
+	describe("resolveMemoryBankState", () => {
+		let kbParent: string;
+
+		beforeEach(() => {
+			kbParent = makeTmpDir();
+		});
+
+		afterEach(() => {
+			rmrf(kbParent);
+		});
+
+		function initRepo(dir: string): string {
+			mkdirSync(dir, { recursive: true });
+			git(dir, ["init"]);
+			return dir;
+		}
+
+		it("reports orphan-only for storageMode=orphan without consulting git", () => {
+			// Cheap by design: the factories skip the gate entirely in orphan mode,
+			// so status must not pay for a git subprocess either. A non-repo path
+			// still reports orphan-only rather than the not-a-project blocker.
+			const plain = join(tempDir, "mbs-not-a-repo");
+			mkdirSync(plain, { recursive: true });
+			expect(resolveMemoryBankState(plain, { storageMode: "orphan", localFolder: kbParent })).toEqual({
+				kind: "orphan-only",
+			});
+		});
+
+		it("treats an unrecognized storageMode as orphan-only", () => {
+			// Mirrors both factories, whose switch default falls through to
+			// OrphanBranchStorage — status must not claim a folder is live.
+			const repo = initRepo(join(tempDir, "mbs-typo-mode"));
+			expect(resolveMemoryBankState(repo, { storageMode: "dual-wrote", localFolder: kbParent })).toEqual({
+				kind: "orphan-only",
+			});
+		});
+
+		it("reports the resolved folder for a claimable project", () => {
+			const repo = initRepo(join(tempDir, "mbs-live-repo"));
+			expect(resolveMemoryBankState(repo, { localFolder: kbParent })).toEqual({
+				kind: "active",
+				mode: "dual-write",
+				folder: join(kbParent, "mbs-live-repo"),
+			});
+		});
+
+		it("does NOT create the folder it reports (peek, not resolve)", () => {
+			// The whole point of routing through peekKBPath: asking where the Memory
+			// Bank is must not be what brings it into existence.
+			const repo = initRepo(join(tempDir, "mbs-peek-repo"));
+			const state = resolveMemoryBankState(repo, { storageMode: "folder", localFolder: kbParent });
+			expect(state).toEqual({
+				kind: "active",
+				mode: "folder",
+				folder: join(kbParent, "mbs-peek-repo"),
+			});
+			expect(existsSync(join(kbParent, "mbs-peek-repo"))).toBe(false);
+		});
+
+		it("reports the blocker and the parent when the gate refuses", () => {
+			const plain = join(tempDir, "mbs-degraded");
+			mkdirSync(plain, { recursive: true });
+			expect(resolveMemoryBankState(plain, { localFolder: kbParent })).toEqual({
+				kind: "degraded",
+				blocker: "not-a-project",
+				parent: kbParent,
+			});
 		});
 	});
 });

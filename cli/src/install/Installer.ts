@@ -41,6 +41,7 @@ import { scanCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { isDevinInstalled, scanDevinSessions } from "../core/DevinSessionDiscoverer.js";
 import { isGeminiInstalled } from "../core/GeminiSessionDetector.js";
 import { getProjectRootDir, isInsideGitRepo, listWorktrees, orphanBranchExists } from "../core/GitOps.js";
+import { resolveMemoryBankState } from "../core/KBPathResolver.js";
 import { acquireRepoHooksLock, type StrictLockHandle, withRuntimeRegistryLock } from "../core/Locks.js";
 import {
 	isOpenCodeInstalled,
@@ -1160,6 +1161,11 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		// the status display can prompt the user to check / re-run migrate.
 	}
 
+	// Effective Memory Bank state. Resolved through `peekKBPath`, so asking
+	// `jolli status` where the folder is can never create it — the same reason
+	// the Rebuild/Migrate flow peeks instead of resolving.
+	const memoryBank = resolveMemoryBankState(projectDir, config);
+
 	const status: StatusInfo = {
 		// The extension is "enabled" when the git hook is installed.
 		// Individual integration hooks (Claude, Codex, Gemini) have their own
@@ -1206,6 +1212,7 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		antigravityScanError,
 		globalConfigDir,
 		worktreeStatePath,
+		memoryBank,
 		enabledWorktrees,
 		hookSource: activeSource?.source,
 		hookVersion: activeSource?.version,

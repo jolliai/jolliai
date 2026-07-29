@@ -193,6 +193,15 @@ export function buildSettingsHtml(nonce: string): string {
           <input type="text" id="localFolder" readonly placeholder="No folder selected" spellcheck="false" />
           <button type="button" class="browse-btn" id="browseLocalFolderBtn">Browse…</button>
         </div>
+        <!-- Effective state of the folder layer, not an echo of the input above.
+             The two differ routinely: the per-repo folder carries a -N suffix,
+             and the write-boundary gate can refuse this workspace outright, in
+             which case writes silently go to the orphan branch only. Populated
+             on settingsLoaded; starts hidden so it never flashes a stale verdict. -->
+        <div class="status-off hidden" id="memoryBankState">
+          <span class="status-icon" id="memoryBankStateIcon"></span>
+          <span id="memoryBankStateText"></span>
+        </div>
       </div>
 
       <div class="settings-row column">

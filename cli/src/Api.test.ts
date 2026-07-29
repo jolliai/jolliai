@@ -182,6 +182,10 @@ vi.mock("./install/Installer.js", () => ({
 		mostRecentSession: null,
 		summaryCount: 0,
 		orphanBranch: "jollimemory/summaries/v3",
+		// Required on StatusInfo — the real `getStatus` always resolves it, and the
+		// status renderer reads it unconditionally. Omitting it here made every
+		// test that relies on this default mock throw inside the Memory Bank row.
+		memoryBank: { kind: "orphan-only" },
 		sessionsBySource: {},
 	}),
 }));
@@ -1039,6 +1043,7 @@ describe("CLI", () => {
 
 		it("should display active session info", async () => {
 			vi.mocked(getStatus).mockResolvedValueOnce({
+				memoryBank: { kind: "orphan-only" },
 				enabled: true,
 				claudeHookInstalled: true,
 				gitHookInstalled: true,
@@ -1055,6 +1060,7 @@ describe("CLI", () => {
 
 		it("should print raw JSON when --json is passed", async () => {
 			const status = {
+				memoryBank: { kind: "orphan-only" } as const,
 				enabled: true,
 				claudeHookInstalled: true,
 				gitHookInstalled: true,
@@ -1073,6 +1079,7 @@ describe("CLI", () => {
 
 		it("should show hooks description with detected integrations", async () => {
 			vi.mocked(getStatus).mockResolvedValueOnce({
+				memoryBank: { kind: "orphan-only" },
 				enabled: true,
 				claudeHookInstalled: true,
 				gitHookInstalled: true,
@@ -1098,6 +1105,7 @@ describe("CLI", () => {
 
 		it("should show hooks as not installed when disabled", async () => {
 			vi.mocked(getStatus).mockResolvedValueOnce({
+				memoryBank: { kind: "orphan-only" },
 				enabled: false,
 				claudeHookInstalled: false,
 				gitHookInstalled: false,
@@ -1116,6 +1124,7 @@ describe("CLI", () => {
 
 		it("should show hook runtime in hooks line when hookSource is present", async () => {
 			vi.mocked(getStatus).mockResolvedValueOnce({
+				memoryBank: { kind: "orphan-only" },
 				enabled: true,
 				claudeHookInstalled: true,
 				gitHookInstalled: true,
@@ -1137,6 +1146,7 @@ describe("CLI", () => {
 		describe("integration rows", () => {
 			it("renders rows for all five integrations when detected, with session counts", async () => {
 				vi.mocked(getStatus).mockResolvedValueOnce({
+					memoryBank: { kind: "orphan-only" },
 					enabled: true,
 					claudeHookInstalled: true,
 					gitHookInstalled: true,
@@ -1179,6 +1189,7 @@ describe("CLI", () => {
 
 			it("renders 'detected but disabled' when an integration is turned off in config", async () => {
 				vi.mocked(getStatus).mockResolvedValueOnce({
+					memoryBank: { kind: "orphan-only" },
 					enabled: true,
 					claudeHookInstalled: false,
 					gitHookInstalled: true,
@@ -1208,6 +1219,7 @@ describe("CLI", () => {
 
 			it("renders 'hook not installed' for Gemini when detected+enabled but the AfterAgent hook is missing", async () => {
 				vi.mocked(getStatus).mockResolvedValueOnce({
+					memoryBank: { kind: "orphan-only" },
 					enabled: true,
 					claudeHookInstalled: false,
 					gitHookInstalled: true,
@@ -1228,6 +1240,7 @@ describe("CLI", () => {
 
 			it("renders 'unavailable — <kind>' for OpenCode when openCodeScanError is present", async () => {
 				vi.mocked(getStatus).mockResolvedValueOnce({
+					memoryBank: { kind: "orphan-only" },
 					enabled: true,
 					claudeHookInstalled: false,
 					gitHookInstalled: true,
@@ -1249,6 +1262,7 @@ describe("CLI", () => {
 
 			it("does NOT mark Cursor unavailable when only the IDE scan fails (healthy CLI must not be masked)", async () => {
 				vi.mocked(getStatus).mockResolvedValueOnce({
+					memoryBank: { kind: "orphan-only" },
 					enabled: true,
 					claudeHookInstalled: false,
 					gitHookInstalled: true,
@@ -1273,6 +1287,7 @@ describe("CLI", () => {
 
 			it("renders 'unavailable — <kind>' for Cursor only when BOTH IDE and CLI scans fail", async () => {
 				vi.mocked(getStatus).mockResolvedValueOnce({
+					memoryBank: { kind: "orphan-only" },
 					enabled: true,
 					claudeHookInstalled: false,
 					gitHookInstalled: true,
@@ -1296,6 +1311,7 @@ describe("CLI", () => {
 
 			it("does not print a row for an integration that was not detected", async () => {
 				vi.mocked(getStatus).mockResolvedValueOnce({
+					memoryBank: { kind: "orphan-only" },
 					enabled: true,
 					claudeHookInstalled: false,
 					gitHookInstalled: true,
@@ -4022,6 +4038,7 @@ describe("CLI", () => {
 
 		it("should display hook runtime without version when version is unknown", async () => {
 			vi.mocked(getStatus).mockResolvedValueOnce({
+				memoryBank: { kind: "orphan-only" },
 				enabled: true,
 				claudeHookInstalled: true,
 				gitHookInstalled: true,
@@ -4474,6 +4491,7 @@ describe("CLI", () => {
 			vi.mocked(inspectPlugins).mockReset();
 
 			vi.mocked(getStatus).mockResolvedValue({
+				memoryBank: { kind: "orphan-only" },
 				enabled: true,
 				claudeHookInstalled: overrides.claudeHookInstalled ?? true,
 				gitHookInstalled: overrides.gitHookInstalled ?? true,
@@ -6081,6 +6099,7 @@ describe("CLI", () => {
 			vi.mocked(traverseDistPaths).mockReset();
 
 			vi.mocked(getStatus).mockResolvedValue({
+				memoryBank: { kind: "orphan-only" },
 				enabled: true,
 				claudeHookInstalled: true,
 				gitHookInstalled: true,
@@ -6189,6 +6208,7 @@ describe("CLI", () => {
 	describe("status command — additional branches", () => {
 		it("should omit version suffix when hookVersion is 'unknown'", async () => {
 			vi.mocked(getStatus).mockResolvedValueOnce({
+				memoryBank: { kind: "orphan-only" },
 				enabled: true,
 				claudeHookInstalled: true,
 				gitHookInstalled: true,
@@ -6212,6 +6232,7 @@ describe("CLI", () => {
 
 		it("should show hook runtime without version when hookVersion is absent", async () => {
 			vi.mocked(getStatus).mockResolvedValueOnce({
+				memoryBank: { kind: "orphan-only" },
 				enabled: true,
 				claudeHookInstalled: true,
 				gitHookInstalled: true,

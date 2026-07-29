@@ -392,6 +392,7 @@ function makeStatus(over: Partial<StatusInfo> = {}): StatusInfo {
 		mostRecentSession: null,
 		summaryCount: 0,
 		orphanBranch: "jollimemory/summaries/v3",
+		memoryBank: { kind: "orphan-only" },
 		...over,
 	};
 }

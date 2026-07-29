@@ -271,7 +271,8 @@ export function buildSettingsCss(): string {
 
   /* ── Status indicators ── */
   .status-ok,
-  .status-warn {
+  .status-warn,
+  .status-off {
     display: flex;
     align-items: flex-start;
     gap: 6px;
@@ -284,7 +285,12 @@ export function buildSettingsCss(): string {
      two webviews render identically when a theme omits the variable. */
   .status-ok { color: var(--vscode-testing-iconPassed, #89d185); }
   .status-warn { color: var(--vscode-testing-iconQueued, #cca700); }
+  /* Valid-but-inactive (storageMode=orphan): descriptive, not a problem to fix,
+     so it takes the muted foreground rather than a warning colour. */
+  .status-off { color: var(--vscode-descriptionForeground, #8b8b8b); }
   .status-icon { font-size: 14px; flex-shrink: 0; }
+  /* Long absolute paths must wrap instead of stretching the panel. */
+  #memoryBankState { word-break: break-all; }
 
   /* ── Advanced toggle (link-style button) ── */
   .link-btn {

@@ -274,4 +274,95 @@ describe("SettingsScriptBuilder", () => {
 			/case 'settingsError':[\s\S]*pendingMigrateAfterApply = false/,
 		);
 	});
+
+	describe("Memory Bank state line", () => {
+		it("renders on BOTH entry paths (fresh load and post-save)", () => {
+			// A lazy display channel needs a trigger on every path that can change
+			// it: settingsLoaded seeds it, and settingsSaved is the only message the
+			// webview gets after Apply — where localFolder may just have changed.
+			expect(script).toMatch(/case 'settingsLoaded':[\s\S]*renderMemoryBankState\(msg\.settings\.memoryBank\)/);
+			expect(script).toMatch(/case 'settingsSaved':[\s\S]*renderMemoryBankState\(msg\.memoryBank\)/);
+		});
+
+		/**
+		 * Evaluates just `renderMemoryBankState` against fake elements. The three
+		 * elements it touches are closure variables in the real script, so they are
+		 * injected as parameters here — cheaper than standing up the whole webview,
+		 * and it exercises real behavior instead of asserting on source text.
+		 *
+		 * The `new Function` input is `buildSettingsScript()`'s own output — a
+		 * literal in this repo, with no runtime or user data reaching it. Same
+		 * technique the SidebarScriptBuilder tests use to parse built scripts.
+		 */
+		function loadRenderer() {
+			const src = script.match(/function renderMemoryBankState\(display\) \{[\s\S]*?\n {2}\}/)?.[0];
+			if (!src) throw new Error("renderMemoryBankState not found in built script");
+			const makeEl = () => {
+				const classes = new Set<string>(["status-off", "hidden"]);
+				return {
+					textContent: "",
+					classList: {
+						add: (...c: string[]): void => {
+							for (const name of c) classes.add(name);
+						},
+						remove: (...c: string[]): void => {
+							for (const name of c) classes.delete(name);
+						},
+						has: (c: string) => classes.has(c),
+					},
+				};
+			};
+			const root = makeEl();
+			const icon = makeEl();
+			const text = makeEl();
+			const fn = new Function(
+				"memoryBankState",
+				"memoryBankStateIcon",
+				"memoryBankStateText",
+				`${src}; return renderMemoryBankState;`,
+			)(root, icon, text) as (d: unknown) => void;
+			return { fn, root, icon, text };
+		}
+
+		it("shows the path with an ok icon when writes are landing", () => {
+			const { fn, root, icon, text } = loadRenderer();
+			fn({ severity: "ok", text: "/bank/widgets" });
+			expect(root.classList.has("hidden")).toBe(false);
+			expect(root.classList.has("status-ok")).toBe(true);
+			expect(root.classList.has("status-off")).toBe(false);
+			expect(icon.textContent).toBe("✓");
+			expect(text.textContent).toBe("/bank/widgets");
+		});
+
+		it("swaps the severity class rather than accumulating them", () => {
+			// Re-render after a settingsSaved that flipped the verdict: a stale
+			// status-ok left alongside status-warn would win or blend unpredictably.
+			const { fn, root } = loadRenderer();
+			fn({ severity: "ok", text: "/bank/widgets" });
+			fn({ severity: "warn", text: "Not writing — …" });
+			expect(root.classList.has("status-warn")).toBe(true);
+			expect(root.classList.has("status-ok")).toBe(false);
+		});
+
+		it("stays hidden when the host sent nothing", () => {
+			// An older host that doesn't send the field must not leave an empty
+			// coloured strip under the folder input.
+			const { fn, root } = loadRenderer();
+			fn(undefined);
+			expect(root.classList.has("hidden")).toBe(true);
+		});
+
+		it("falls back to the off severity for an unrecognized value", () => {
+			const { fn, root, icon } = loadRenderer();
+			fn({ severity: "explode", text: "x" });
+			expect(root.classList.has("status-off")).toBe(true);
+			expect(icon.textContent).toBe("○");
+		});
+
+		it("writes the path via textContent, never innerHTML", () => {
+			// The payload carries a filesystem path straight from config.
+			expect(script).toContain("memoryBankStateText.textContent = display.text");
+			expect(script).not.toContain("memoryBankStateText.innerHTML");
+		});
+	});
 });

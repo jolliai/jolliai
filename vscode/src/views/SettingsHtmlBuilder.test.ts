@@ -179,6 +179,15 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain("Browse");
 	});
 
+	it("Memory Bank tab contains the effective-state line, initially hidden", () => {
+		// Starts with the `.hidden` class (never the HTML `hidden` attribute, which
+		// `display: flex` silently overrides) so the row can't flash a verdict the
+		// host hasn't sent yet.
+		expect(html).toContain('id="memoryBankState"');
+		expect(html).toContain('id="memoryBankStateText"');
+		expect(html).toMatch(/class="status-off hidden" id="memoryBankState"/);
+	});
+
 	it("Memory Bank tab contains the Migrate to Memory Bank button", () => {
 		expect(html).toContain('id="rebuildKbBtn"');
 		expect(html).toContain("Migrate to Memory Bank");

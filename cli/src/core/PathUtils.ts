@@ -53,12 +53,16 @@ export function stripTrailingSlashes(p: string): string {
  * folding on Windows/macOS), then a directory-boundary check so that
  * `.jolli/jollimemoryX` is NOT treated as inside `.jolli/jollimemory`.
  *
- * Used to decide whether a registry entry's `sourcePath` lives inside the
- * per-project `.jolli/jollimemory/` directory: hard-delete the backing file
- * only for inside paths; external files (e.g. `~/.claude/plans/foo.md`) keep
- * their file and lose only the registry row. Like `normalizePathForCompare`
- * it does NOT call `path.resolve` (WSL POSIX-absolute rationale) — callers
- * pass absolute paths.
+ * Like `normalizePathForCompare` it does NOT call `path.resolve` (WSL
+ * POSIX-absolute rationale) — callers pass absolute paths.
+ *
+ * The single home for "is this path under that path" — used across the plan /
+ * note registries (is an entry's `sourcePath` inside `.jolli/jollimemory/`, so
+ * deleting the row should delete the file?), session→repo attribution
+ * (`SessionDirMatch`), webview path guards, and the Memory Bank write boundary
+ * (`KBPathResolver.checkClaimable`). Prefer it over an inline
+ * `c === p || c.startsWith(p + "/")`: the boundary check and the two
+ * `normalizePathForCompare` calls are exactly what open-coded copies forget.
  */
 export function isPathInside(child: string, parent: string): boolean {
 	const c = normalizePathForCompare(child);

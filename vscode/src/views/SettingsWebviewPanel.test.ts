@@ -1081,9 +1081,40 @@ describe("SettingsWebviewPanel", () => {
 			});
 			await flushPromises();
 
-			expect(postMessage).toHaveBeenCalledWith({ command: "settingsSaved" });
+			// `objectContaining`: the message also carries the refreshed Memory Bank
+			// verdict (asserted on its own below), which this case doesn't pin.
+			expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ command: "settingsSaved" }));
 			expect(onSaved).toHaveBeenCalled();
 			expect(info).toHaveBeenCalledWith("SettingsPanel", "Settings saved");
+		});
+
+		it("re-sends the Memory Bank verdict with settingsSaved", async () => {
+			// `settingsSaved` is the only message the webview gets back after Apply,
+			// and changing `localFolder` can flip the write-boundary gate either way.
+			// Without the verdict riding along, the state line would keep asserting
+			// the pre-save answer until the panel was reopened.
+			const dispatch = await setupWithLoadedConfig();
+
+			dispatch({
+				command: "applySettings",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			const saved = postMessage.mock.calls
+				.map(([msg]) => msg as { command: string; memoryBank?: { severity: string; text: string } })
+				.find((msg) => msg.command === "settingsSaved");
+			expect(saved?.memoryBank?.severity).toMatch(/^(ok|warn|off)$/);
+			expect(saved?.memoryBank?.text).toBeTruthy();
 		});
 
 		it("rejects a Jolli API key that cannot be decoded (wrong prefix), without saving", async () => {

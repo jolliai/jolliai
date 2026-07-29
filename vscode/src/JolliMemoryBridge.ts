@@ -558,6 +558,11 @@ export class JolliMemoryBridge {
 				summaryCount: 0,
 				orphanBranch: ORPHAN_BRANCH,
 				codexDetected: false,
+				// `getStatus` threw before it could resolve anything, so the folder
+				// layer's real state is unknown. Report the same shape the rest of
+				// this fallback uses — "nothing is working" — rather than guessing
+				// at an active folder we never confirmed.
+				memoryBank: { kind: "orphan-only" },
 				geminiDetected: false,
 			};
 		}

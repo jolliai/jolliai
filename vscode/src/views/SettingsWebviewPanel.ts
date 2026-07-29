@@ -23,6 +23,11 @@ import {
 	parseJolliApiKey,
 	validateJolliApiKey,
 } from "../../../cli/src/core/JolliApiUtils.js";
+import { resolveMemoryBankState } from "../../../cli/src/core/KBPathResolver.js";
+import {
+	describeMemoryBank,
+	type MemoryBankDisplay,
+} from "../../../cli/src/core/MemoryBankStatusText.js";
 import { track } from "../../../cli/src/core/Telemetry.js";
 import {
 	getGlobalConfigDir,
@@ -62,6 +67,13 @@ interface SettingsPayload {
 	/** Tri-state config switch (undecided | "enabled" | "disabled") flattened to a checkbox; see handleApplySettings for the enable/disable/preserve-undecided persistence rules. */
 	readonly globalInstructions: boolean;
 	readonly localFolder: string;
+	/**
+	 * Read-only verdict on whether folder writes are actually landing, and where.
+	 * NOT derived from `localFolder` in the webview: the effective folder carries
+	 * the `-N` suffix the resolver picked, and the write-boundary gate can refuse
+	 * this workspace entirely — a state the configured path cannot express.
+	 */
+	readonly memoryBank: MemoryBankDisplay;
 	readonly excludePatterns: string;
 	/** Comma-separated folder names (exact or `*` glob) skipped by `jolli compile`. */
 	readonly compileExcludeFolders: string;
@@ -471,6 +483,11 @@ export class SettingsWebviewPanel {
 			antigravityEnabled: config.antigravityEnabled !== false,
 			globalInstructions: config.globalInstructions === "enabled",
 			localFolder: config.localFolder ?? "",
+			// `resolveMemoryBankState` peeks (never claims), so merely opening
+			// Settings cannot materialize the folder it is reporting on.
+			memoryBank: describeMemoryBank(
+				resolveMemoryBankState(this.workspaceRoot, config),
+			),
 			excludePatterns: config.excludePatterns
 				? config.excludePatterns.join(", ")
 				: "",
@@ -675,7 +692,21 @@ export class SettingsWebviewPanel {
 
 		log.info("SettingsPanel", "Settings saved");
 
-		this.panel.webview.postMessage({ command: "settingsSaved" });
+		// Re-send the Memory Bank verdict with the save: changing `localFolder` can
+		// flip the write-boundary gate in either direction, and `settingsSaved` is
+		// the only message the webview gets back — without this the state line
+		// would keep asserting the pre-save verdict until the panel is reopened.
+		// Computed from the values just persisted (`storageMode` isn't editable
+		// here, so it comes from the config we loaded).
+		this.panel.webview.postMessage({
+			command: "settingsSaved",
+			memoryBank: describeMemoryBank(
+				resolveMemoryBankState(this.workspaceRoot, {
+					storageMode: currentConfig.storageMode,
+					localFolder: update.localFolder,
+				}),
+			),
+		});
 		this.onSavedCallback?.();
 	}
 

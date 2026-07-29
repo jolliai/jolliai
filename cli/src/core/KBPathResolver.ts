@@ -21,9 +21,9 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { createLogger, isManuallyDisabled } from "../Logger.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
-import type { KBConfig } from "./KBTypes.js";
+import type { ClaimVerdict, KBConfig, MemoryBankConfig, MemoryBankState } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
-import { normalizePathForCompare } from "./PathUtils.js";
+import { isPathInside } from "./PathUtils.js";
 
 const log = createLogger("KBPathResolver");
 
@@ -309,23 +309,41 @@ export function extractRepoName(projectPath: string): string {
 		if (m?.[1]) return m[1];
 	}
 
-	const commonDir = tryGitCommand(projectPath, ["rev-parse", "--git-common-dir"]);
-	if (commonDir) {
-		const abs = isAbsolute(commonDir) ? commonDir : join(projectPath, commonDir);
-		const mainRepoDir = dirname(abs);
-		// `mainRepoDir` is the parent of `.git` — i.e. the main repo's
-		// working tree. Skip the filesystem-root / cwd-marker cases so a
-		// `basename` of `/` or `.` doesn't slip through.
-		if (mainRepoDir && mainRepoDir !== "/" && mainRepoDir !== ".") {
-			return basename(mainRepoDir);
-		}
-	}
+	const mainRepoDir = mainWorktreeRoot(projectPath);
+	if (mainRepoDir) return basename(mainRepoDir);
 
 	return basename(projectPath) || "unknown";
 }
 
 /**
- * Whether `projectPath` may claim a Memory Bank folder at all.
+ * The **main** worktree's root directory for `projectPath`, or `null` when
+ * `projectPath` isn't inside a git worktree at all.
+ *
+ * `git rev-parse --git-common-dir` deliberately, not `--git-dir`: from a linked
+ * `git worktree` checkout the former answers the *main* repo's `.git`, so every
+ * worktree of a repo resolves to one identity — the same anchor `RepoProfile`
+ * uses for repo-wide state.
+ *
+ * The answer is relative **to the cwd** from a subdirectory (`../../.git`) and a
+ * bare `.git` at the worktree root; `join` normalizes both, and the absolute
+ * answer a linked worktree gives passes through untouched.
+ *
+ * `null` for the degenerate `/` and `.` results so a `basename` of the
+ * filesystem root can't masquerade as a repo name.
+ *
+ * Shared by `extractRepoName` (repo identity) and `checkClaimable` (write
+ * boundary) so both agree on what "this project" is.
+ */
+function mainWorktreeRoot(projectPath: string): string | null {
+	const commonDir = tryGitCommand(projectPath, ["rev-parse", "--git-common-dir"]);
+	if (!commonDir) return null;
+	const abs = isAbsolute(commonDir) ? commonDir : join(projectPath, commonDir);
+	const root = dirname(abs);
+	return root && root !== "/" && root !== "." ? root : null;
+}
+
+/**
+ * Whether `projectPath` may claim a Memory Bank folder at all, and if not, why.
  *
  * The write-boundary gate for `resolveKBPath`. That function is named like a
  * pure resolver but *claims* the folder it returns (`writeKBIdentity` →
@@ -339,26 +357,48 @@ export function extractRepoName(projectPath: string): string {
  *
  * Two conditions, each mapping to a class of junk folders observed in the wild:
  *
- *  1. **Not inside a git worktree.** Covers every agent temp cwd
- *     (`jolli-localagent-*`, `jolli-probe-*` — bare empty dirs, which is exactly
- *     why `codex exec` needs `--skip-git-repo-check` to run there), plus
+ *  1. **Not inside a git worktree** (`"not-a-project"`). Covers every agent temp
+ *     cwd (`jolli-localagent-*`, `jolli-probe-*` — bare empty dirs, which is
+ *     exactly why `codex exec` needs `--skip-git-repo-check` to run there), plus
  *     `cd /tmp && jolli …` (`tmp/`) and the empty-basename `"unknown"` fallback.
- *  2. **At or inside the Memory Bank parent.** The Memory Bank folder is itself a
- *     git repo (for peer sync), so condition 1 lets it through and it claims a
- *     folder named after itself, nested one level down.
+ *  2. **The Memory Bank folder sits at or inside this project's own working
+ *     tree** (`"folder-inside-repo"`) — i.e. claiming would write Memory Bank
+ *     content into the repo we are summarizing. The observed instance is the
+ *     Memory Bank folder being itself a git repo (for peer sync): condition 1
+ *     lets it through, `mainWorktreeRoot` resolves to the bank, and it claims a
+ *     folder named after itself nested one level down (`memorybank-prod/
+ *     memorybank-prod/`). Any cwd *inside* that bank repo — including a
+ *     `<bank>/<repo>/` per-repo folder — resolves to the same worktree root and
+ *     is caught by the same check.
+ *
+ * Condition 2 is scoped to the **project's worktree**, not to the bank parent as
+ * a bare path prefix. An earlier `projectPath` at-or-under-`parent` test read as
+ * equivalent but silently disabled the folder layer for an entire legitimate
+ * class of setup: `localFolder` pointed at a directory that also *contains*
+ * checkouts (`~/Documents`, a Dropbox/iCloud root) rejected every repo beneath
+ * it, degrading to orphan-only with nothing but a `debug.log` line to explain
+ * why the Memory Bank had stopped updating. A repo under the bank parent is
+ * fine: `resolveKBPath` gives it its own sibling `<parent>/<repoName>/` folder,
+ * and the `-N` suffix ladder handles the case where that name is already taken
+ * by the checkout itself. What is NOT fine is the bank living inside the repo,
+ * which is exactly what this check now tests — and it newly catches
+ * `localFolder` pointed *into* a source tree, which the old prefix test missed.
  *
  * Deliberately NOT gated on "under a temp root": every observed case is already
  * covered by condition 1, while rejecting `tmpdir()` wholesale would break the
  * legitimate case of a repo checked out under `/tmp` (and much of this repo's
  * own real-git test suite).
  *
- * A `false` here means callers degrade to orphan-branch-only storage rather than
- * touching the Memory Bank folder — no writes, no directories, nothing to clean
- * up later.
+ * A non-claimable verdict means callers degrade to orphan-branch-only storage
+ * rather than touching the Memory Bank folder — no writes, no directories,
+ * nothing to clean up later. Because that degradation is invisible by design,
+ * the blocker is reported to users via {@link resolveMemoryBankState}.
  */
-export function isClaimableProject(projectPath: string, customPath?: string): boolean {
-	if (!basename(projectPath)) return false;
-	if (!tryGitCommand(projectPath, ["rev-parse", "--git-dir"])) return false;
+export function checkClaimable(projectPath: string, customPath?: string): ClaimVerdict {
+	if (!basename(projectPath)) return { claimable: false, blocker: "not-a-project" };
+
+	const worktreeRoot = mainWorktreeRoot(projectPath);
+	if (!worktreeRoot) return { claimable: false, blocker: "not-a-project" };
 
 	// `resolveKbParent` falls back to the default parent for a missing/unsafe
 	// customPath, matching what `resolveKBPath` would actually use.
@@ -366,12 +406,62 @@ export function isClaimableProject(projectPath: string, customPath?: string): bo
 	try {
 		parent = resolveKbParent(customPath);
 	} catch {
-		// An unusable parent can't be claimed into either way.
-		return false;
+		// Only reachable when `homedir()` itself throws (no passwd entry for the
+		// uid): an unusable parent can't be claimed into either way.
+		return { claimable: false, blocker: "unresolvable-folder" };
 	}
-	const project = normalizePathForCompare(projectPath);
-	const bank = normalizePathForCompare(parent);
-	return project !== bank && !project.startsWith(`${bank}/`);
+
+	if (isPathInside(parent, worktreeRoot)) {
+		return { claimable: false, blocker: "folder-inside-repo" };
+	}
+	return { claimable: true };
+}
+
+/** Boolean projection of {@link checkClaimable} for the gate's call sites. */
+export function isClaimableProject(projectPath: string, customPath?: string): boolean {
+	return checkClaimable(projectPath, customPath).claimable;
+}
+
+/**
+ * Where folder-layer writes for `projectPath` will actually land — the data
+ * behind the `Memory Bank:` row in `jolli status` and the Settings → Memory Bank
+ * tab.
+ *
+ * Read-only by construction: resolves through {@link peekKBPath}, never
+ * `resolveKBPath`, so *displaying* the state cannot create the folder it is
+ * describing.
+ *
+ * `"orphan-only"` covers both an explicit `storageMode: "orphan"` and any
+ * unrecognized value, mirroring what the factories actually do — both
+ * `StorageFactory.createStorage` and `createReadStorage` fall through their
+ * switch to `OrphanBranchStorage`.
+ */
+export function resolveMemoryBankState(projectPath: string, config: MemoryBankConfig): MemoryBankState {
+	const mode = config.storageMode ?? "dual-write";
+	if (mode !== "dual-write" && mode !== "folder") return { kind: "orphan-only" };
+
+	const verdict = checkClaimable(projectPath, config.localFolder);
+	if (!verdict.claimable) {
+		return { kind: "degraded", blocker: verdict.blocker, ...safeKbParent(config.localFolder) };
+	}
+	return {
+		kind: "active",
+		mode,
+		folder: peekKBPath(extractRepoName(projectPath), getRemoteUrl(projectPath), config.localFolder),
+	};
+}
+
+/**
+ * `{ parent }` for the degraded state, or `{}` when the parent is exactly what
+ * couldn't be resolved (the `"unresolvable-folder"` blocker) — so the display
+ * omits the row rather than printing a path it had to invent.
+ */
+function safeKbParent(customPath?: string): { parent?: string } {
+	try {
+		return { parent: resolveKbParent(customPath) };
+	} catch {
+		return {};
+	}
 }
 
 // The plumbing commands this helper runs (`config --get`, `rev-parse`,

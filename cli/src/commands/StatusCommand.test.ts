@@ -93,6 +93,7 @@ const baseStatus: StatusInfo = {
 	activeSessions: 0,
 	mostRecentSession: null,
 	summaryCount: 0,
+	memoryBank: { kind: "orphan-only" },
 	orphanBranch: "jollimemory/summaries/v3",
 	sessionsBySource: {},
 };
@@ -499,6 +500,48 @@ describe("StatusCommand — Cursor integration row (merged IDE + CLI)", () => {
 		expect(out).toContain("unavailable");
 		expect(out).toContain("IDE scan failed (locked)");
 		expect(out).toContain("CLI scan failed (parse)");
+	});
+});
+
+describe("StatusCommand — Memory Bank row", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockLoadAuthToken.mockResolvedValue(null);
+		mockLoadConfigFromDir.mockResolvedValue({});
+		mockFrontDoor.mockResolvedValue({ status: "no_spaces" });
+		mockTenantOrigin.mockReturnValue(null);
+		mockLoadCache.mockResolvedValue(null);
+	});
+
+	afterEach(() => {
+		vi.clearAllMocks();
+	});
+
+	it("prints the effective folder when the folder layer is live", async () => {
+		const out = await renderStatus({
+			...baseStatus,
+			memoryBank: { kind: "active", mode: "dual-write", folder: "/bank/widgets-2" },
+		});
+		// The RESOLVED folder, suffix and all — the configured parent would not
+		// answer "where did my memories actually go".
+		expect(out).toContain("Memory Bank:      /bank/widgets-2");
+	});
+
+	it("prints the blocker when the write-boundary gate degraded us to orphan-only", async () => {
+		// The regression this row exists for: before it, this state produced a
+		// `debug.log` line and nothing else, so a Memory Bank that stopped
+		// updating had no user-reachable cause.
+		const out = await renderStatus({
+			...baseStatus,
+			memoryBank: { kind: "degraded", blocker: "folder-inside-repo", parent: "/repo/bank" },
+		});
+		expect(out).toContain("Memory Bank:      Not writing");
+		expect(out).toContain("/repo/bank");
+	});
+
+	it("always prints the row, including in orphan-only mode", async () => {
+		const out = await renderStatus(baseStatus);
+		expect(out).toContain("Memory Bank:      Off");
 	});
 });
 

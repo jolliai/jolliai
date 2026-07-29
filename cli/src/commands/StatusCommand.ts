@@ -19,6 +19,7 @@ import {
 } from "../core/JolliMemoryPushClient.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { localAgentToolLabel } from "../core/localagent/ToolMeta.js";
+import { describeMemoryBank } from "../core/MemoryBankStatusText.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import {
 	clearSpaceBindingCache,
@@ -618,6 +619,7 @@ export function registerStatusCommand(program: Command): void {
 			}
 
 			console.log(`  Stored memories:  ${status.summaryCount}`);
+			console.log(`  Memory Bank:      ${describeMemoryBank(status.memoryBank).text}`);
 			if (jolliSite) {
 				// `jolliSite` is the on-disk `jolliUrl`. Label it the live "Jolli
 				// Site" only when an on-disk credential actually backs it. We

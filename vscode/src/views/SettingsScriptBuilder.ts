@@ -43,6 +43,9 @@ export function buildSettingsScript(): string {
   const antigravityEnabledInput = document.getElementById('antigravityEnabled');
   const globalInstructionsInput = document.getElementById('globalInstructions');
   const localFolderInput = document.getElementById('localFolder');
+  const memoryBankState = document.getElementById('memoryBankState');
+  const memoryBankStateIcon = document.getElementById('memoryBankStateIcon');
+  const memoryBankStateText = document.getElementById('memoryBankStateText');
   const browseLocalFolderBtn = document.getElementById('browseLocalFolderBtn');
   const rebuildKbBtn = document.getElementById('rebuildKbBtn');
   const rebuildKbStatus = document.getElementById('rebuildKbStatus');
@@ -141,6 +144,24 @@ export function buildSettingsScript(): string {
   function updateAnthropicWarning() {
     var hasKey = apiKeyInput.value.trim().length > 0;
     anthropicMissingWarn.classList.toggle('hidden', hasKey);
+  }
+
+  // Renders the host's Memory Bank verdict. The severity picks the class the
+  // panel already uses for status lines; the row stays hidden if the host sent
+  // nothing, so an older host can never leave an empty coloured strip behind.
+  // textContent (not innerHTML) because the payload carries a filesystem path.
+  function renderMemoryBankState(display) {
+    if (!memoryBankState) return;
+    if (!display || !display.text) {
+      memoryBankState.classList.add('hidden');
+      return;
+    }
+    var severity = display.severity === 'ok' || display.severity === 'warn' ? display.severity : 'off';
+    memoryBankState.classList.remove('status-ok', 'status-warn', 'status-off');
+    memoryBankState.classList.add('status-' + severity);
+    memoryBankStateIcon.textContent = severity === 'ok' ? '✓' : severity === 'warn' ? '⚠' : '○';
+    memoryBankStateText.textContent = display.text;
+    memoryBankState.classList.remove('hidden');
   }
 
   // ── Advanced (Jolli API Key) toggles ──
@@ -593,6 +614,7 @@ export function buildSettingsScript(): string {
         antigravityEnabledInput.checked = msg.settings.antigravityEnabled;
         globalInstructionsInput.checked = !!msg.settings.globalInstructions;
         localFolderInput.value = msg.settings.localFolder || '';
+        renderMemoryBankState(msg.settings.memoryBank);
         excludePatternsInput.value = msg.settings.excludePatterns;
         compileExcludeFoldersInput.value = msg.settings.compileExcludeFolders;
         dcoSignoffInput.checked = !!msg.settings.dcoSignoff;
@@ -679,6 +701,7 @@ export function buildSettingsScript(): string {
         saveFeedback.textContent = 'Settings saved';
         saveFeedback.classList.remove('error');
         saveFeedback.classList.add('visible');
+        renderMemoryBankState(msg.memoryBank);
         setTimeout(function() { saveFeedback.classList.remove('visible'); }, 2000);
         captureInitialState();
         if (pendingMigrateAfterApply) {
