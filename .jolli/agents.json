@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jolliai/jolli-team-plugins/main/schema/agents.schema.json",
+  "version": 1,
+  "tracker": {
+    "kind": "none"
+  },
+  "verify": {
+    "gate": ["npm run all"],
+    "scope": "repo-root",
+    "coveragePolicy": "never-lower",
+    "configFilesOffLimits": ["cli/vite.config.ts", "vscode/vite.config.ts"]
+  },
+  "vcs": {
+    "forbiddenTrailers": ["Co-Authored-By", "Generated with"]
+  }
+}

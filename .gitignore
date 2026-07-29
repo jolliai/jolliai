@@ -31,7 +31,26 @@ Thumbs.db
 .env.*
 
 # Jolli / Claude
-.jolli/
+#
+# `.jolli/` holds two very different things, so it is excluded entry-by-entry rather
+# than as a directory. Everything in it is per-developer state — `jollimemory/` carries
+# sessions, cursors and queues, written per worktree with absolute local paths — and
+# none of that is a team artifact.
+#
+# The one exception is `agents.json`: a decision somebody made about *this* repository
+# (its verify gate, base branch, directory layout), which a teammate cannot regenerate
+# and therefore must be committed. The ORDER matters and so does the trailing `*`: a
+# bare `.jolli/` would stop git descending into the directory at all, and a negation
+# cannot re-include a file whose parent was never entered.
+#
+# Note the anchoring, which is the subtle half. The old `.jolli/` had no internal slash,
+# so it matched a `.jolli` directory at ANY depth — including `cli/.jolli/`, which is
+# also per-developer state. Adding `/*` anchors the rule to the root and would have
+# quietly exposed the nested ones, so they are re-excluded explicitly below.
+/.jolli/*
+!/.jolli/agents.json
+*/.jolli/
+*/**/.jolli/
 .claude/
 .kiro/
 .gemini/
